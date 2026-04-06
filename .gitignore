@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+*.js.map
+*.d.ts.map
+
+# Prisma
+backend/prisma/migrations/**/migration_lock.toml
+
+# Frontend build
+frontend/dist/
+
+# Relay config (contains tokens)
+relay/relay.config.json
+
+# OS
+.DS_Store

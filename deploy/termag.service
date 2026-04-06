@@ -1,0 +1,18 @@
+[Unit]
+Description=termag workspace manager backend
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=secorp
+WorkingDirectory=/home/secorp/src/termag/backend
+ExecStart=/usr/bin/node /home/secorp/src/termag/backend/dist/index.js
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=10
+Environment=NODE_ENV=production
+EnvironmentFile=/home/secorp/src/termag/backend/.env
+
+[Install]
+WantedBy=multi-user.target

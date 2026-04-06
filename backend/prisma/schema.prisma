@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  googleId     String    @unique
+  googleEmail  String    @unique
+  unixUsername String    @unique
+  displayName  String
+  createdAt    DateTime  @default(now())
+
+  projects      Project[]
+  workTerminals WorkTerminal[]
+
+  @@map("users")
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  color       String?   // hex color for UI differentiation
+  archived    Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  workflows   Workflow[]
+  browserTabs BrowserTab[]
+
+  @@unique([userId, name])
+  @@index([userId, archived])
+  @@map("projects")
+}
+
+model Workflow {
+  id        String       @id @default(cuid())
+  type      WorkflowType
+  server    String       @default("localhost") // future: ssh to other servers
+  createdAt DateTime     @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, type])
+  @@map("workflows")
+}
+
+enum WorkflowType {
+  agent
+  data
+}
+
+model WorkTerminal {
+  id        String   @id @default(cuid())
+  name      String   // e.g. "networking", "filesystem", "apache"
+  sortOrder Int      @default(0)
+  server    String   @default("localhost")
+  createdAt DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name])
+  @@map("work_terminals")
+}
+
+model BrowserTab {
+  id        String   @id @default(cuid())
+  url       String
+  title     String
+  favIcon   String?
+  windowId  Int?     // Chrome window ID from CDP snapshot
+  addedAt   DateTime @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@map("browser_tabs")
+}
+
+// Latest Chrome tab snapshot from the local relay, keyed by relay token
+model RelaySnapshot {
+  id          String   @id @default(cuid())
+  relayToken  String   @unique
+  snapshotAt  DateTime @default(now())
+  windows     Json     // array of { windowId, tabs: [{ url, title, favIcon }] }
+
+  @@map("relay_snapshots")
+}
