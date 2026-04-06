@@ -1,4 +1,5 @@
 import * as pty from 'node-pty';
+import { exec } from 'child_process';
 import { WebSocket } from 'ws';
 
 interface TerminalSession {
@@ -74,7 +75,7 @@ export function attachTerminal(tmuxSessionName: string, ws: WebSocket): void {
 
   ws.on('message', (raw) => {
     try {
-      const msg = JSON.parse(raw.toString()) as { type: string; data?: string; cols?: number; rows?: number };
+      const msg = JSON.parse(raw.toString()) as { type: string; data?: string; cols?: number; rows?: number; enabled?: boolean };
       const s = sessions.get(tmuxSessionName);
       if (!s) return;
 
@@ -82,6 +83,10 @@ export function attachTerminal(tmuxSessionName: string, ws: WebSocket): void {
         s.pty.write(msg.data);
       } else if (msg.type === 'resize' && msg.cols && msg.rows) {
         s.pty.resize(msg.cols, msg.rows);
+      } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
+        // Toggle tmux mouse mode for this session
+        const setting = msg.enabled ? 'on' : 'off';
+        exec(`tmux set-option -t ${tmuxSessionName.replace(/'/g, "'\\''")} mouse ${setting}`, () => {});
       }
     } catch {
       // ignore malformed messages

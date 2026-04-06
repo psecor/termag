@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Terminal as XTerm } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -14,13 +14,30 @@ interface TerminalProps {
 export function Terminal({ sessionName, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
 
-  // Focus the terminal whenever autoFocus or sessionName changes
   useEffect(() => {
     if (autoFocus && termRef.current) {
       termRef.current.focus();
     }
   }, [autoFocus, sessionName]);
+
+  // Toggle tmux mouse on/off when selectMode changes
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Send tmux command to toggle mouse
+    const cmd = selectMode
+      ? 'tmux set mouse off'
+      : 'tmux set mouse on';
+
+    // We need to send this as a command to the shell inside tmux.
+    // Instead, use the tmux command prefix (Ctrl-B :) — but that's fragile.
+    // Better: send it via a separate control message type to the backend.
+    ws.send(JSON.stringify({ type: 'mouse', enabled: !selectMode }));
+  }, [selectMode]);
 
   useEffect(() => {
     if (!active || !containerRef.current) return;
@@ -30,7 +47,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     const term = new XTerm({
       allowTransparency: true,
       theme: {
-        background: '#0d1117c0', // ~75% opaque — stars show through
+        background: '#0d1117c0',
         foreground: '#c9d1d9',
         cursor: '#58a6ff',
         selectionBackground: '#264f7880',
@@ -38,7 +55,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       fontSize: 13,
       fontFamily: 'JetBrains Mono, Fira Code, monospace',
       cursorBlink: true,
-      scrollback: 5000,
+      scrollback: 10000,
     });
 
     const fitAddon = new FitAddon();
@@ -47,7 +64,6 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     term.open(container);
     termRef.current = term;
 
-    // Wait a frame for the container to have dimensions before fitting
     let ws: WebSocket | null = null;
     let disposed = false;
 
@@ -60,6 +76,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       ws = new WebSocket(
         `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}`
       );
+      wsRef.current = ws;
 
       ws.onopen = () => {
         if (disposed) { ws?.close(); return; }
@@ -81,6 +98,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
 
       ws.onclose = () => {
         if (!disposed) term.write('\r\n[disconnected]\r\n');
+        wsRef.current = null;
       };
 
       ws.onerror = () => {
@@ -94,7 +112,6 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         if (onActivity) onActivity();
       });
 
-      // Resize observer
       const observer = new ResizeObserver(() => {
         if (disposed) return;
         fitAddon.fit();
@@ -104,7 +121,6 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       });
       observer.observe(container);
 
-      // Store cleanup refs on the term object for the outer cleanup
       (term as any)._termag = { dataDisposable, observer };
     });
 
@@ -117,10 +133,36 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         extras.observer.disconnect();
       }
       if (ws) ws.close();
+      wsRef.current = null;
       term.dispose();
       termRef.current = null;
+      setSelectMode(false);
     };
   }, [active, sessionName]);
 
-  return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
+  return (
+    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <button
+        onClick={() => setSelectMode(m => !m)}
+        title={selectMode ? 'Switch to scroll mode' : 'Switch to select mode (Cmd+C to copy)'}
+        style={{
+          position: 'absolute',
+          top: 4,
+          right: 4,
+          zIndex: 10,
+          background: selectMode ? 'rgba(88, 166, 255, 0.25)' : 'rgba(13, 17, 23, 0.7)',
+          border: `1px solid ${selectMode ? 'rgba(88, 166, 255, 0.6)' : 'rgba(48, 54, 61, 0.8)'}`,
+          borderRadius: 4,
+          color: selectMode ? '#58a6ff' : '#8b949e',
+          padding: '2px 6px',
+          fontSize: 11,
+          fontFamily: 'inherit',
+          cursor: 'pointer',
+          transition: 'all 0.15s',
+        }}
+      >
+        {selectMode ? '✂ select' : '⇕ scroll'}
+      </button>
+    </div>
+  );
 }

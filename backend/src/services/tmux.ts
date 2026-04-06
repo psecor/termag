@@ -43,7 +43,6 @@ export async function createSession(name: string, cwd: string = process.env.HOME
     `tmux new-session -d -s ${shellEscape(name)} -c ${shellEscape(cwd)} -x 120 -y 30`
   );
   await execAsync(`tmux set-option -t ${shellEscape(name)} -w window-size largest`);
-  await execAsync(`tmux set-option -t ${shellEscape(name)} mouse on`);
   await execAsync(`tmux set-option -t ${shellEscape(name)} history-limit 10000`);
 }
 

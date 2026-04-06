@@ -36,11 +36,13 @@ app.use(express.json());
 
 const sessionMiddleware = session({
   store: new PgSession({ conString: process.env.DATABASE_URL }),
+  name: 'termag.sid',
   secret: process.env.SESSION_SECRET ?? 'dev-secret',
   resave: false,
   saveUninitialized: false,
   rolling: true,
   cookie: {
+    path: '/termag',
     httpOnly: true,
     sameSite: 'lax',
     secure: process.env.NODE_ENV === 'production',
