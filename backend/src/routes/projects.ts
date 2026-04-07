@@ -2,6 +2,7 @@ import { Router, RequestHandler } from 'express';
 import { PrismaClient, WorkflowType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth';
 import * as tmux from '../services/tmux';
+import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 
 const prisma = new PrismaClient();
 
@@ -50,8 +51,12 @@ export function projectsRouter(): Router {
         return;
       }
 
-      // Create project directory
-      await tmux.ensureProjectDir(req.user!.unixUsername, name);
+      // Create project directory — via agent if connected, else direct
+      if (isAgentConnected(req.user!.id)) {
+        await sendToAgent(req.user!.id, 'mkdir', { dir: tmux.projectDir(req.user!.unixUsername, name) });
+      } else {
+        await tmux.ensureProjectDir(req.user!.unixUsername, name);
+      }
 
       const project = await prisma.project.create({
         data: { name, description, color, userId: req.user!.id },
@@ -92,12 +97,20 @@ export function projectsRouter(): Router {
 
       const username = req.user!.unixUsername;
 
-      // Kill all tmux sessions for this project
+      // Kill all tmux sessions for this project — via agent if connected
       for (const wf of project.workflows) {
         const mainRole = wf.type === 'agent' ? 'agent' as const : 'data' as const;
         const ctrlRole = wf.type === 'agent' ? 'ctrl' as const : 'data-ctrl' as const;
-        await tmux.killSession(tmux.sessionName(username, project.name, mainRole));
-        await tmux.killSession(tmux.sessionName(username, project.name, ctrlRole));
+        const mainSession = tmux.sessionName(username, project.name, mainRole);
+        const ctrlSession = tmux.sessionName(username, project.name, ctrlRole);
+
+        if (isAgentConnected(req.user!.id)) {
+          await sendToAgent(req.user!.id, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
+          await sendToAgent(req.user!.id, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
+        } else {
+          await tmux.killSession(mainSession);
+          await tmux.killSession(ctrlSession);
+        }
       }
 
       // Delete workflows from DB
@@ -136,15 +149,25 @@ export function projectsRouter(): Router {
       const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, ctrlRole);
 
       // Ensure project directory exists and (re)create tmux sessions there
-      // Ensure project directory exists, create tmux sessions only if they don't already exist
-      const projDir = await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
-      const mainCreated = await tmux.ensureSession(mainSession, projDir);
-      await tmux.ensureSession(ctrlSession, projDir);
+      // Ensure project directory and tmux sessions — via agent if connected, else direct
+      const projDir = tmux.projectDir(req.user!.unixUsername, project.name);
 
-      if (type === 'agent' && mainCreated) {
-        // Only launch claude if we created a fresh session
-        await new Promise(resolve => setTimeout(resolve, 500));
-        await tmux.sendKeys(mainSession, 'claude');
+      if (isAgentConnected(req.user!.id)) {
+        await sendToAgent(req.user!.id, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+        await sendToAgent(req.user!.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+        if (type === 'agent') {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await sendToAgent(req.user!.id, 'tmux-send-keys', { sessionName: mainSession, keys: 'claude', withEnter: true });
+        }
+      } else {
+        // Fallback: direct execution (backwards compat when no agent)
+        await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
+        const mainCreated = await tmux.ensureSession(mainSession, projDir);
+        await tmux.ensureSession(ctrlSession, projDir);
+        if (type === 'agent' && mainCreated) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await tmux.sendKeys(mainSession, 'claude');
+        }
       }
 
       res.status(201).json(workflow);

@@ -18,6 +18,7 @@ import { executeClaudeCommand, resolveWorkingDir } from './executor';
 import { StreamingMessageUpdater } from './streaming';
 import { formatResponse, formatError, formatWelcome, splitMessage } from './formatting';
 import { publishHomeView } from './homeView';
+import { resolveTermagUser } from './userMapping';
 import {
   sessionName, workSessionName, ensureSession, hasSession,
   listSessions as tmuxListSessions, sendKeys,
@@ -62,11 +63,11 @@ function isRateLimited(userId: string): boolean {
 
 /**
  * Resolve the unix username for a Slack user.
- * For now, returns 'secorp' — multi-user would need a Slack→unix mapping.
+ * Looks up the termag user via Slack ID → email → googleEmail match.
  */
-async function resolveUnixUsername(_slackUserId: string): Promise<string> {
-  // TODO: look up from users table by Slack ID
-  return 'secorp';
+async function resolveUnixUsername(slackUserId: string, slackClient?: any): Promise<string> {
+  const user = await resolveTermagUser(slackUserId, slackClient);
+  return user?.unixUsername ?? 'secorp';
 }
 
 function getActiveProjectId(userId: string): string | null {
@@ -218,7 +219,8 @@ export function registerEventHandlers(app: App): void {
     const userId = command.user_id;
     if (ALLOWED_USERS && !ALLOWED_USERS.has(userId)) return;
 
-    const username = await resolveUnixUsername(userId);
+    const termagUser = await resolveTermagUser(userId, client);
+    const username = termagUser?.unixUsername ?? 'secorp';
     const userCommand = command.text.trim();
 
     // ── /t local <subcommand> ──────────────────────────
@@ -270,7 +272,7 @@ export function registerEventHandlers(app: App): void {
     // ── /t projects ────────────────────────────────────
     if (userCommand === 'projects') {
       const projects = await prisma.project.findMany({
-        where: { archived: false },
+        where: { archived: false, ...(termagUser ? { userId: termagUser.id } : {}) },
         include: { workflows: true, user: true },
         orderBy: { name: 'asc' },
       });
@@ -456,9 +458,9 @@ export function registerEventHandlers(app: App): void {
         agentSession = `term-${userId}`;
       }
     } else {
-      // No active project — try to auto-select the first one
+      // No active project — try to auto-select the first one (user's own projects only)
       const first = await prisma.project.findFirst({
-        where: { archived: false, workflows: { some: { type: 'agent' } } },
+        where: { archived: false, workflows: { some: { type: 'agent' } }, ...(termagUser ? { userId: termagUser.id } : {}) },
         include: { user: true },
         orderBy: { name: 'asc' },
       });

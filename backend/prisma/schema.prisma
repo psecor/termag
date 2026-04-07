@@ -13,12 +13,30 @@ model User {
   googleEmail  String    @unique
   unixUsername String    @unique
   displayName  String
+  slackUserId  String?   @unique
   createdAt    DateTime  @default(now())
 
   projects      Project[]
   workTerminals WorkTerminal[]
+  agentTokens   AgentToken[]
 
   @@map("users")
+}
+
+model AgentToken {
+  id         String    @id @default(cuid())
+  name       String    // e.g. "macbook", "dev-server"
+  tokenHash  String    @unique // SHA-256 hash of the token
+  tokenPrefix String   // first 8 chars for display (e.g. "tmag_a1b2...")
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("agent_tokens")
 }
 
 model Project {

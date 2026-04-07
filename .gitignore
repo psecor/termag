@@ -13,5 +13,8 @@ frontend/dist/
 # Relay config (contains tokens)
 relay/relay.config.json
 
+# Agent config (contains tokens)
+agent/agent.config.json
+
 # OS
 .DS_Store

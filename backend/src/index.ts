@@ -14,9 +14,18 @@ import { projectsRouter } from './routes/projects';
 // import { workTerminalsRouter } from './routes/workTerminals'; // removed — work terminals feature dropped
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
+import { agentTokensRouter } from './routes/agentTokens';
 import { attachTerminal } from './services/terminal';
 import { setStatusChangeCallback, getStatus } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
+import { validateAgentToken } from './routes/agentTokens';
+import {
+  registerAgent, isAgentConnected, requestTerminalStream,
+  sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
+} from './services/agentRegistry';
+import { PrismaClient } from '@prisma/client';
+
+const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
 import { getActiveHomeViewers } from './slack/events';
@@ -62,6 +71,7 @@ app.use(`${BASE_PATH}/api/projects`, projectsRouter());
 // app.use(`${BASE_PATH}/api/work-terminals`, workTerminalsRouter()); // removed
 app.use(`${BASE_PATH}/api/status`, statusRouter());
 app.use(`${BASE_PATH}/api/browser`, browserRouter());
+app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -120,12 +130,68 @@ wss.on('connection', (ws, req) => {
 
   // Terminal WebSocket: /termag/ws/terminal?session=username-project-agent
   if (path === `${BASE_PATH}/ws/terminal`) {
-    const sessionName = url.searchParams.get('session');
-    if (!sessionName) {
+    const tmuxSession = url.searchParams.get('session');
+    if (!tmuxSession) {
       ws.close(1008, 'session param required');
       return;
     }
-    attachTerminal(sessionName, ws);
+
+    // Try to route through user-agent if one is connected
+    // Extract username from session name (format: username-project-role)
+    const dashIdx = tmuxSession.indexOf('-');
+    const username = dashIdx > 0 ? tmuxSession.substring(0, dashIdx) : null;
+
+    if (username) {
+      prismaIndex.user.findUnique({ where: { unixUsername: username } }).then(async (user) => {
+        if (user && isAgentConnected(user.id)) {
+          // Route through agent
+          console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername}`);
+          try {
+            const streamId = await requestTerminalStream(user.id, tmuxSession, (msg) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                if (msg.type === 'terminal-data') {
+                  ws.send(JSON.stringify({ type: 'output', data: msg.data }));
+                } else if (msg.type === 'terminal-exit') {
+                  ws.send(JSON.stringify({ type: 'exit' }));
+                }
+              }
+            });
+
+            ws.on('message', (raw) => {
+              try {
+                const msg = JSON.parse(raw.toString());
+                if (msg.type === 'input' && msg.data !== undefined) {
+                  sendTerminalInput(user.id, streamId, msg.data);
+                } else if (msg.type === 'resize' && msg.cols && msg.rows) {
+                  sendTerminalResize(user.id, streamId, msg.cols, msg.rows);
+                } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
+                  sendTerminalMouse(user.id, streamId, msg.enabled);
+                }
+              } catch { /* ignore */ }
+            });
+
+            ws.on('close', () => {
+              closeTerminalStream(streamId);
+              sendTerminalInput(user.id, streamId, ''); // signal close
+            });
+
+            return;
+          } catch {
+            // Agent failed — fall through to direct attach
+          }
+        }
+
+        // No agent or agent failed — direct PTY attach (backwards compat)
+        console.log(`[TERMINAL] Direct attach for ${tmuxSession} (no agent)`);
+        attachTerminal(tmuxSession, ws);
+      }).catch(() => {
+        attachTerminal(tmuxSession, ws);
+      });
+      return;
+    }
+
+    // No username in session name — direct attach
+    attachTerminal(tmuxSession, ws);
     return;
   }
 
@@ -133,6 +199,25 @@ wss.on('connection', (ws, req) => {
   if (path === `${BASE_PATH}/ws/status`) {
     statusClients.add(ws);
     ws.on('close', () => statusClients.delete(ws));
+    return;
+  }
+
+  // Agent WebSocket: /termag/ws/agent?token=tmag_xxx
+  if (path === `${BASE_PATH}/ws/agent`) {
+    const token = url.searchParams.get('token');
+    if (!token) {
+      ws.close(1008, 'token param required');
+      return;
+    }
+    validateAgentToken(token).then(user => {
+      if (!user) {
+        ws.close(1008, 'invalid or revoked token');
+        return;
+      }
+      registerAgent(user, ws);
+    }).catch(() => {
+      ws.close(1008, 'auth error');
+    });
     return;
   }
 
