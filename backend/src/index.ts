@@ -15,7 +15,7 @@ import { projectsRouter } from './routes/projects';
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
-import { attachTerminal } from './services/terminal';
+// import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
 import { validateAgentToken } from './routes/agentTokens';
@@ -141,57 +141,63 @@ wss.on('connection', (ws, req) => {
     const dashIdx = tmuxSession.indexOf('-');
     const username = dashIdx > 0 ? tmuxSession.substring(0, dashIdx) : null;
 
-    if (username) {
-      prismaIndex.user.findUnique({ where: { unixUsername: username } }).then(async (user) => {
-        if (user && isAgentConnected(user.id)) {
-          // Route through agent
-          console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername}`);
-          try {
-            const streamId = await requestTerminalStream(user.id, tmuxSession, (msg) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                if (msg.type === 'terminal-data') {
-                  ws.send(JSON.stringify({ type: 'output', data: msg.data }));
-                } else if (msg.type === 'terminal-exit') {
-                  ws.send(JSON.stringify({ type: 'exit' }));
-                }
-              }
-            });
-
-            ws.on('message', (raw) => {
-              try {
-                const msg = JSON.parse(raw.toString());
-                if (msg.type === 'input' && msg.data !== undefined) {
-                  sendTerminalInput(user.id, streamId, msg.data);
-                } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-                  sendTerminalResize(user.id, streamId, msg.cols, msg.rows);
-                } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
-                  sendTerminalMouse(user.id, streamId, msg.enabled);
-                }
-              } catch { /* ignore */ }
-            });
-
-            ws.on('close', () => {
-              closeTerminalStream(streamId);
-              sendTerminalInput(user.id, streamId, ''); // signal close
-            });
-
-            return;
-          } catch {
-            // Agent failed — fall through to direct attach
-          }
-        }
-
-        // No agent or agent failed — direct PTY attach (backwards compat)
-        console.log(`[TERMINAL] Direct attach for ${tmuxSession} (no agent)`);
-        attachTerminal(tmuxSession, ws);
-      }).catch(() => {
-        attachTerminal(tmuxSession, ws);
-      });
+    if (!username) {
+      ws.close(1008, 'invalid session name');
       return;
     }
 
-    // No username in session name — direct attach
-    attachTerminal(tmuxSession, ws);
+    prismaIndex.user.findUnique({ where: { unixUsername: username } }).then(async (user) => {
+      if (!user) {
+        console.log(`[TERMINAL] No user found for username: ${username}`);
+        ws.send(JSON.stringify({ type: 'output', data: `\r\nNo termag user "${username}"\r\n` }));
+        ws.close(1008, 'unknown user');
+        return;
+      }
+
+      if (!isAgentConnected(user.id)) {
+        console.log(`[TERMINAL] Agent not connected for ${user.unixUsername}`);
+        ws.send(JSON.stringify({ type: 'output', data: '\r\nAgent not connected. Run the termag-agent on your account first.\r\n' }));
+        ws.close(1008, 'agent not connected');
+        return;
+      }
+
+      console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername}`);
+      try {
+        const streamId = await requestTerminalStream(user.id, tmuxSession, (msg) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            if (msg.type === 'terminal-data') {
+              ws.send(JSON.stringify({ type: 'output', data: msg.data }));
+            } else if (msg.type === 'terminal-exit') {
+              ws.send(JSON.stringify({ type: 'exit' }));
+            }
+          }
+        });
+
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(raw.toString());
+            if (msg.type === 'input' && msg.data !== undefined) {
+              sendTerminalInput(user.id, streamId, msg.data);
+            } else if (msg.type === 'resize' && msg.cols && msg.rows) {
+              sendTerminalResize(user.id, streamId, msg.cols, msg.rows);
+            } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
+              sendTerminalMouse(user.id, streamId, msg.enabled);
+            }
+          } catch { /* ignore */ }
+        });
+
+        ws.on('close', () => {
+          closeTerminalStream(streamId);
+        });
+      } catch (err) {
+        console.error(`[TERMINAL] Agent routing failed for ${tmuxSession}:`, (err as Error).message);
+        ws.send(JSON.stringify({ type: 'output', data: '\r\nFailed to connect through agent.\r\n' }));
+        ws.close(1011, 'agent error');
+      }
+    }).catch((err) => {
+      console.error(`[TERMINAL] User lookup failed:`, (err as Error).message);
+      ws.close(1011, 'lookup error');
+    });
     return;
   }
 

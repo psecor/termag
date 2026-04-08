@@ -1,14 +1,26 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Project, STATUS_EMOJI } from '../types';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
-import { projectsApi } from '../services/api';
+import { projectsApi, agentTokensApi, AgentTokenInfo } from '../services/api';
 
 export function ProjectControl() {
   const { user, logout } = useAuth();
   const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
   const [error, setError] = useState('');
+
+  // Agent tokens
+  const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
+  const [newTokenName, setNewTokenName] = useState('');
+  const [createdToken, setCreatedToken] = useState<string | null>(null);
+  const [showTokens, setShowTokens] = useState(false);
+
+  useEffect(() => {
+    if (showTokens) {
+      agentTokensApi.list().then(setTokens).catch(() => {});
+    }
+  }, [showTokens]);
 
   function agentSessionName(project: Project): string {
     return `${user?.unixUsername}-${project.name}-agent`;
@@ -28,7 +40,6 @@ export function ProjectControl() {
       setNewProjectName('');
       setError('');
       await reloadProjects();
-      // Auto-add agent workflow and select
       await projectsApi.addWorkflow(project.id, 'agent');
       await reloadProjects();
       setActiveProject(project.id);
@@ -42,6 +53,26 @@ export function ProjectControl() {
     await projectsApi.archive(project.id);
     if (activeProjectId === project.id) setActiveProject(null);
     await reloadProjects();
+  }
+
+  async function createToken(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newTokenName.trim()) return;
+    try {
+      const result = await agentTokensApi.create(newTokenName.trim());
+      setCreatedToken(result.token);
+      setNewTokenName('');
+      const updated = await agentTokensApi.list();
+      setTokens(updated);
+    } catch {
+      setError('Failed to create token');
+    }
+  }
+
+  async function revokeToken(id: string) {
+    if (!confirm('Revoke this token? The agent using it will be disconnected.')) return;
+    await agentTokensApi.revoke(id);
+    setTokens(prev => prev.filter(t => t.id !== id));
   }
 
   return (
@@ -78,6 +109,45 @@ export function ProjectControl() {
           />
           <button type="submit">+</button>
         </form>
+      </section>
+
+      <section className="control-section">
+        <h3 className="clickable-header" onClick={() => setShowTokens(s => !s)}>
+          Agent {showTokens ? '▾' : '▸'}
+        </h3>
+        {showTokens && (
+          <>
+            {createdToken && (
+              <div className="token-created">
+                <div className="token-created-label">New token (copy now — shown once):</div>
+                <code className="token-value">{createdToken}</code>
+                <button className="btn-tiny" onClick={() => {
+                  navigator.clipboard.writeText(createdToken);
+                  setCreatedToken(null);
+                }}>Copy &amp; dismiss</button>
+              </div>
+            )}
+
+            <ul className="token-list">
+              {tokens.map(t => (
+                <li key={t.id} className="token-item">
+                  <span className="token-name">{t.name}</span>
+                  <span className="token-prefix">{t.tokenPrefix}</span>
+                  <button className="btn-tiny btn-danger" onClick={() => revokeToken(t.id)} title="Revoke">×</button>
+                </li>
+              ))}
+              {tokens.length === 0 && <li className="token-empty">No active tokens</li>}
+            </ul>
+            <form className="inline-form" onSubmit={createToken}>
+              <input
+                value={newTokenName}
+                onChange={e => setNewTokenName(e.target.value)}
+                placeholder="token name"
+              />
+              <button type="submit">+</button>
+            </form>
+          </>
+        )}
       </section>
     </div>
   );

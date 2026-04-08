@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ProjectProvider } from './contexts/ProjectContext';
@@ -47,6 +47,7 @@ function MainLayout() {
   const isActive = workingCount > 0 || typing;
   const warpStr = warpSpeed < 10 ? warpSpeed.toFixed(1) : Math.floor(warpSpeed).toString();
 
+
   return (
     <div className="app-layout">
       <div className="app-hyperspace-bg">
@@ -60,7 +61,7 @@ function MainLayout() {
           <ProjectControl />
         </div>
       </div>
-      <div className="app-agent">
+      <div className="app-agent" id="terminal-agent">
         {activeProject && hasAgent ? (
           <Terminal
             sessionName={`${username}-${activeProject.name}-agent`}
@@ -75,7 +76,7 @@ function MainLayout() {
           </div>
         )}
       </div>
-      <div className="app-ctrl">
+      <div className="app-ctrl" id="terminal-ctrl">
         {activeProject && hasAgent ? (
           <Terminal
             sessionName={`${username}-${activeProject.name}-ctrl`}

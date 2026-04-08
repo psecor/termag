@@ -33,6 +33,25 @@ export const workTerminalsApi = {
   remove: (id: string) => api.delete(`/api/work-terminals/${id}`).then(r => r.data),
 };
 
+export interface AgentTokenInfo {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+export interface AgentTokenCreated extends AgentTokenInfo {
+  token: string; // raw token, shown once
+}
+
+export const agentTokensApi = {
+  list: (): Promise<AgentTokenInfo[]> => api.get('/api/agent-tokens').then(r => r.data),
+  create: (name: string): Promise<AgentTokenCreated> =>
+    api.post('/api/agent-tokens', { name }).then(r => r.data),
+  revoke: (id: string) => api.delete(`/api/agent-tokens/${id}`).then(r => r.data),
+};
+
 export const browserApi = {
   getSnapshot: (): Promise<{ windows: ChromeWindow[]; snapshotAt: string | null }> =>
     api.get('/api/browser/snapshot').then(r => r.data),

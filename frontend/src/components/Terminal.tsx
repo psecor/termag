@@ -16,6 +16,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
   const termRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const [selectMode, setSelectMode] = useState(false);
+  const [focused, setFocused] = useState(false);
 
   useEffect(() => {
     if (autoFocus && termRef.current) {
@@ -64,13 +65,24 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     term.open(container);
     termRef.current = term;
 
+    const onFocus = () => setFocused(true);
+    const onBlur = () => setFocused(false);
+
     let ws: WebSocket | null = null;
     let disposed = false;
+    let textarea: HTMLElement | null = null;
 
     const initTimer = requestAnimationFrame(() => {
       if (disposed) return;
 
       fitAddon.fit();
+
+      // Attach focus listeners now that xterm.js has rendered its DOM
+      textarea = container.querySelector('.xterm-helper-textarea') as HTMLElement | null;
+      if (textarea) {
+        textarea.addEventListener('focus', onFocus);
+        textarea.addEventListener('blur', onBlur);
+      }
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(
@@ -132,16 +144,22 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         extras.dataDisposable.dispose();
         extras.observer.disconnect();
       }
+      if (textarea) { textarea.removeEventListener('focus', onFocus); textarea.removeEventListener('blur', onBlur); }
       if (ws) ws.close();
       wsRef.current = null;
       term.dispose();
+      setFocused(false);
       termRef.current = null;
       setSelectMode(false);
     };
   }, [active, sessionName]);
 
   return (
-    <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div
+      ref={containerRef}
+      className={focused ? undefined : 'terminal-dimmed'}
+      style={{ width: '100%', height: '100%', position: 'relative' }}
+    >
       <button
         onClick={() => setSelectMode(m => !m)}
         title={selectMode ? 'Switch to scroll mode' : 'Switch to select mode (Cmd+C to copy)'}

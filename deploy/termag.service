@@ -12,6 +12,8 @@ RestartSec=10
 KillMode=mixed
 TimeoutStopSec=10
 Environment=NODE_ENV=production
+Environment="PATH=/home/secorp/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/home/secorp"
 EnvironmentFile=/home/secorp/src/termag/backend/.env
 
 [Install]
