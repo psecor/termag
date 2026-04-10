@@ -36,27 +36,36 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     reloadProjects();
   }, [user, reloadProjects]);
 
-  // Status WebSocket
+  // Status WebSocket with auto-reconnect
   useEffect(() => {
     if (!user) return;
+    let disposed = false;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${window.location.host}/termag/ws/status`);
-    wsRef.current = ws;
+    function connect() {
+      if (disposed) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${window.location.host}/termag/ws/status`);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data as string) as {
-          type: string; session: string; status: AgentStatusValue; updatedAt: string; message?: string;
-        };
-        if (msg.type === 'status') {
-          setStatusMap(prev => ({ ...prev, [msg.session]: { status: msg.status, updatedAt: msg.updatedAt, message: msg.message } }));
-        }
-      } catch { /* ignore */ }
-    };
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as {
+            type: string; session: string; status: AgentStatusValue; updatedAt: string; message?: string;
+          };
+          if (msg.type === 'status') {
+            setStatusMap(prev => ({ ...prev, [msg.session]: { status: msg.status, updatedAt: msg.updatedAt, message: msg.message } }));
+          }
+        } catch { /* ignore */ }
+      };
 
-    ws.onclose = () => { setTimeout(() => wsRef.current?.close(), 3000); };
-    return () => ws.close();
+      ws.onclose = () => {
+        wsRef.current = null;
+        if (!disposed) setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+    return () => { disposed = true; wsRef.current?.close(); };
   }, [user]);
 
   return (

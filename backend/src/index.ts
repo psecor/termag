@@ -204,7 +204,11 @@ wss.on('connection', (ws, req) => {
   // Status WebSocket: /termag/ws/status — receives status push events
   if (path === `${BASE_PATH}/ws/status`) {
     statusClients.add(ws);
-    ws.on('close', () => statusClients.delete(ws));
+    console.log(`[STATUS] Client connected (total: ${statusClients.size})`);
+    ws.on('close', () => {
+      statusClients.delete(ws);
+      console.log(`[STATUS] Client disconnected (total: ${statusClients.size})`);
+    });
     return;
   }
 
@@ -237,6 +241,7 @@ setStatusChangeCallback((sessionName: string) => {
     session: sessionName,
     ...getStatus(sessionName),
   });
+  console.log(`[STATUS] Push ${sessionName} to ${statusClients.size} clients`);
   for (const client of statusClients) {
     if (client.readyState === WebSocket.OPEN) {
       client.send(payload);
