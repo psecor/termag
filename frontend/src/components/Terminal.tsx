@@ -11,11 +11,18 @@ interface TerminalProps {
   onActivity?: () => void;
 }
 
+// Regex to match mouse tracking enable/disable escape sequences
+const MOUSE_TRACKING_RE = /\x1b\[\?(9|1000|1002|1003|1004|1005|1006|1015|1016)[hl]/g;
+
+// Sequences to disable all mouse tracking modes in xterm.js
+const DISABLE_MOUSE = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+
 export function Terminal({ sessionName, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const [selectMode, setSelectMode] = useState(false);
+  const selectModeRef = useRef(false);
   const [focused, setFocused] = useState(false);
 
   useEffect(() => {
@@ -24,20 +31,22 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     }
   }, [autoFocus, sessionName]);
 
-  // Toggle tmux mouse on/off when selectMode changes
+  // Toggle select mode: strip mouse tracking so xterm.js allows native selection
   useEffect(() => {
+    selectModeRef.current = selectMode;
+    const term = termRef.current;
+    if (!term) return;
+
+    if (selectMode) {
+      // Disable mouse tracking in xterm.js so clicks trigger text selection
+      term.write(DISABLE_MOUSE);
+    }
+
+    // Also toggle tmux mouse as before
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    // Send tmux command to toggle mouse
-    const cmd = selectMode
-      ? 'tmux set mouse off'
-      : 'tmux set mouse on';
-
-    // We need to send this as a command to the shell inside tmux.
-    // Instead, use the tmux command prefix (Ctrl-B :) — but that's fragile.
-    // Better: send it via a separate control message type to the backend.
-    ws.send(JSON.stringify({ type: 'mouse', enabled: !selectMode }));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'mouse', enabled: !selectMode }));
+    }
   }, [selectMode]);
 
   useEffect(() => {
@@ -101,7 +110,13 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         try {
           const msg = JSON.parse(event.data as string) as { type: string; data?: string };
           if (msg.type === 'output' && msg.data) {
-            term.write(msg.data);
+            if (selectModeRef.current) {
+              // Strip mouse tracking sequences so xterm.js stays in selection mode
+              const filtered = msg.data.replace(MOUSE_TRACKING_RE, '');
+              term.write(filtered);
+            } else {
+              term.write(msg.data);
+            }
           } else if (msg.type === 'exit') {
             term.write('\r\n[session ended]\r\n');
           }
@@ -145,6 +160,10 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         extras.observer.disconnect();
       }
       if (textarea) { textarea.removeEventListener('focus', onFocus); textarea.removeEventListener('blur', onBlur); }
+      // Restore tmux mouse before closing
+      if (ws && ws.readyState === WebSocket.OPEN && selectModeRef.current) {
+        ws.send(JSON.stringify({ type: 'mouse', enabled: true }));
+      }
       if (ws) ws.close();
       wsRef.current = null;
       term.dispose();
