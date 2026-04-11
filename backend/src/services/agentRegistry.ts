@@ -21,8 +21,8 @@ interface ConnectedAgent {
 // userId → connected agent
 const agents = new Map<string, ConnectedAgent>();
 
-// Terminal data subscribers: requestId → callback for streaming PTY data
-const terminalStreams = new Map<string, (msg: any) => void>();
+// Terminal data subscribers: streamId → { callback, userId }
+const terminalStreams = new Map<string, { onData: (msg: any) => void; userId: string }>();
 
 let requestCounter = 0;
 
@@ -60,8 +60,8 @@ export function registerAgent(user: User, ws: WebSocket): void {
 
       // Streaming terminal data from agent
       if (msg.type === 'terminal-data' && msg.streamId) {
-        const handler = terminalStreams.get(msg.streamId);
-        if (handler) handler(msg);
+        const stream = terminalStreams.get(msg.streamId);
+        if (stream) stream.onData(msg);
         return;
       }
     } catch {
@@ -126,7 +126,7 @@ export async function requestTerminalStream(
   onData: (msg: any) => void,
 ): Promise<string> {
   const streamId = `stream_${nextRequestId()}`;
-  terminalStreams.set(streamId, onData);
+  terminalStreams.set(streamId, { onData, userId });
 
   try {
     await sendToAgent(userId, 'terminal-attach', { tmuxSessionName, streamId });
@@ -165,10 +165,18 @@ export function sendTerminalMouse(userId: string, streamId: string, enabled: boo
 }
 
 /**
- * Close a terminal stream.
+ * Close a terminal stream — removes the handler and tells the agent to kill the PTY.
  */
 export function closeTerminalStream(streamId: string): void {
+  const stream = terminalStreams.get(streamId);
   terminalStreams.delete(streamId);
+
+  if (stream) {
+    const agent = getAgent(stream.userId);
+    if (agent) {
+      agent.ws.send(JSON.stringify({ type: 'terminal-close', streamId }));
+    }
+  }
 }
 
 /**

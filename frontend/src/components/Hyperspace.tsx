@@ -53,7 +53,7 @@ export function Hyperspace({ activeCount, typingBoost, onWarpChange }: Hyperspac
       const count = activeCountRef.current;
 
       const baseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
-      const speed = baseSpeed + (typingRef.current ? baseSpeed * 0.5 : 0);
+      const speed = baseSpeed + (typingRef.current ? Math.max(0.8, baseSpeed * 0.5) : 0);
 
       // Map speed to a "warp factor" in units of c
       // idle=0.4→0.1c, typing=0.6→0.3c, 1 agent=2.4→1.2c, 1 agent+typing=3.6→1.8c
@@ -94,11 +94,11 @@ export function Hyperspace({ activeCount, typingBoost, onWarpChange }: Hyperspac
         const depth = 1 - star.z / 1000;
 
         // Bigger stars, thicker lines when active
-        const baseSize = count === 0 ? 3 : 3.5 + count * 0.5;
+        const baseSize = count === 0 ? 5.5 : 6.5 + count * 0.8;
         const size = depth * baseSize;
 
         // Brighter base, even brighter when active
-        const baseBright = count === 0 ? 100 : 140;
+        const baseBright = count === 0 ? 160 : 200;
         const brightness = Math.floor(depth * 255) + baseBright;
 
         const r = Math.min(255, brightness);
@@ -114,11 +114,11 @@ export function Hyperspace({ activeCount, typingBoost, onWarpChange }: Hyperspac
         ctx!.stroke();
 
         // Add a glow dot at the head of close stars
-        if (depth > 0.6) {
-          const glowAlpha = (depth - 0.6) * 2; // 0→1 for the closest 40%
-          ctx!.fillStyle = `rgba(${r}, ${g}, ${b}, ${glowAlpha * 0.6})`;
+        if (depth > 0.5) {
+          const glowAlpha = (depth - 0.5) * 2; // 0→1 for the closest 50%
+          ctx!.fillStyle = `rgba(${r}, ${g}, ${b}, ${glowAlpha * 0.7})`;
           ctx!.beginPath();
-          ctx!.arc(sx, sy, size * 1.5, 0, Math.PI * 2);
+          ctx!.arc(sx, sy, size * 2, 0, Math.PI * 2);
           ctx!.fill();
         }
       }

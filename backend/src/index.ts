@@ -16,7 +16,7 @@ import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
-import { setStatusChangeCallback, getStatus } from './services/status';
+import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
 import { validateAgentToken } from './routes/agentTokens';
 import {
@@ -42,6 +42,28 @@ const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
 app.set('trust proxy', 1);
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
+
+// --- LTS API (mounted before session/passport — uses its own bearer auth) ---
+let slackClient: import('@slack/web-api').WebClient | null = null;
+let slackApp: ReturnType<typeof createSlackApp> | null = null;
+
+if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+  slackApp = createSlackApp();
+  slackClient = slackApp.client;
+
+  if (process.env.CAPTURE_API_SECRET) {
+    const refreshAllHomeViews = async () => {
+      const viewers = getActiveHomeViewers();
+      await Promise.all([...viewers].map(uid => publishHomeView(slackApp!.client, uid).catch(() => {})));
+    };
+
+    app.use('/lts', ltsRouter(
+      slackApp.client,
+      (userId: string) => publishHomeView(slackApp!.client, userId),
+      refreshAllHomeViews,
+    ));
+  }
+}
 
 const sessionMiddleware = session({
   store: new PgSession({ conString: process.env.DATABASE_URL }),
@@ -77,28 +99,8 @@ app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-// --- Slack Bot + LTS ---
-let slackClient: import('@slack/web-api').WebClient | null = null;
-
-if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
-  const slackApp = createSlackApp();
-  slackClient = slackApp.client;
-
-  const refreshAllHomeViews = async () => {
-    const viewers = getActiveHomeViewers();
-    await Promise.all([...viewers].map(uid => publishHomeView(slackApp.client, uid).catch(() => {})));
-  };
-
-  // LTS API on the same Express app (different path prefix)
-  if (process.env.CAPTURE_API_SECRET) {
-    app.use('/lts', ltsRouter(
-      slackApp.client,
-      (userId: string) => publishHomeView(slackApp.client, userId),
-      refreshAllHomeViews,
-    ));
-  }
-
-  // Start Slack after Express is listening
+// --- Slack Bot ---
+if (slackApp) {
   startSlackApp(slackApp).catch(err => console.error('[SLACK] Failed:', err));
 }
 
@@ -205,6 +207,12 @@ wss.on('connection', (ws, req) => {
   if (path === `${BASE_PATH}/ws/status`) {
     statusClients.add(ws);
     console.log(`[STATUS] Client connected (total: ${statusClients.size})`);
+
+    // Send all current statuses so the client starts with the right state
+    for (const [session, status] of getAllStatuses()) {
+      ws.send(JSON.stringify({ type: 'status', session, ...status }));
+    }
+
     ws.on('close', () => {
       statusClients.delete(ws);
       console.log(`[STATUS] Client disconnected (total: ${statusClients.size})`);

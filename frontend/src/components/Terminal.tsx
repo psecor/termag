@@ -139,16 +139,22 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         if (onActivity) onActivity();
       });
 
+      let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       const observer = new ResizeObserver(() => {
         if (disposed) return;
-        fitAddon.fit();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-        }
+        // Debounce resize to avoid flooding PTY during window drag
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          if (disposed) return;
+          fitAddon.fit();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          }
+        }, 150);
       });
       observer.observe(container);
 
-      (term as any)._termag = { dataDisposable, observer };
+      (term as any)._termag = { dataDisposable, observer, resizeTimer };
     });
 
     return () => {
@@ -158,6 +164,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       if (extras) {
         extras.dataDisposable.dispose();
         extras.observer.disconnect();
+        if (extras.resizeTimer) clearTimeout(extras.resizeTimer);
       }
       if (textarea) { textarea.removeEventListener('focus', onFocus); textarea.removeEventListener('blur', onBlur); }
       // Restore tmux mouse before closing

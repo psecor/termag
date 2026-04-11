@@ -302,6 +302,7 @@ export function registerEventHandlers(app: App): void {
         return;
       }
       setActiveProjectId(userId, project.id);
+      clearActiveLocalSession(userId);
       const agentSession = sessionName(username, project.name, 'agent');
       setNotificationTarget(agentSession, { channel: command.channel_id, userId });
       const pane = await capturePaneForSlack(agentSession);
@@ -334,6 +335,7 @@ export function registerEventHandlers(app: App): void {
       const projects = await prisma.project.findMany({ where: { archived: false }, include: { user: true } });
       const match = projects.find(p => sessionName(p.user.unixUsername, p.name, 'agent') === target);
       if (match) setActiveProjectId(userId, match.id);
+      clearActiveLocalSession(userId);
 
       setNotificationTarget(target, { channel: command.channel_id, userId });
       const pane = await capturePaneForSlack(target);

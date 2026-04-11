@@ -12,6 +12,10 @@ export function getStatus(sessionName: string): AgentStatus {
   return statusMap.get(sessionName) ?? { status: 'not_running', updatedAt: new Date() };
 }
 
+export function getAllStatuses(): Map<string, AgentStatus> {
+  return statusMap;
+}
+
 export function setStatus(
   sessionName: string,
   status: AgentStatus['status'],
