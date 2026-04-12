@@ -66,9 +66,38 @@ body {
   overflow-y: auto;
 }
 
-.app-agent {
+.app-terminals {
   position: relative;
   z-index: 1;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.app-project-bar {
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+  background: rgba(22, 27, 34, 0.92);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-panes {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.app-agent {
+  position: relative;
   flex: 1;
   overflow: hidden;
   border-right: 1px solid var(--border);
@@ -76,7 +105,6 @@ body {
 
 .app-ctrl {
   position: relative;
-  z-index: 1;
   flex: 1;
   overflow: hidden;
 }

@@ -61,34 +61,41 @@ function MainLayout() {
           <ProjectControl />
         </div>
       </div>
-      <div className="app-agent" id="terminal-agent">
-        {activeProject && hasAgent ? (
-          <Terminal
-            sessionName={`${username}-${activeProject.name}-agent`}
-            active={true}
-            autoFocus={true}
-            onActivity={onActivity}
-            key={`${activeProject.id}-agent`}
-          />
-        ) : (
-          <div className="empty-pane">
-            {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+      <div className="app-terminals">
+        <div className="app-project-bar">
+          {activeProject ? activeProject.name : '—'}
+        </div>
+        <div className="app-panes">
+          <div className="app-agent" id="terminal-agent">
+            {activeProject && hasAgent ? (
+              <Terminal
+                sessionName={`${username}-${activeProject.name}-agent`}
+                active={true}
+                autoFocus={true}
+                onActivity={onActivity}
+                key={`${activeProject.id}-agent`}
+              />
+            ) : (
+              <div className="empty-pane">
+                {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+              </div>
+            )}
           </div>
-        )}
-      </div>
-      <div className="app-ctrl" id="terminal-ctrl">
-        {activeProject && hasAgent ? (
-          <Terminal
-            sessionName={`${username}-${activeProject.name}-ctrl`}
-            active={true}
-            onActivity={onActivity}
-            key={`${activeProject.id}-ctrl`}
-          />
-        ) : (
-          <div className="empty-pane">
-            {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+          <div className="app-ctrl" id="terminal-ctrl">
+            {activeProject && hasAgent ? (
+              <Terminal
+                sessionName={`${username}-${activeProject.name}-ctrl`}
+                active={true}
+                onActivity={onActivity}
+                key={`${activeProject.id}-ctrl`}
+              />
+            ) : (
+              <div className="empty-pane">
+                {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+              </div>
+            )}
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
