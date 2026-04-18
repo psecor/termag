@@ -5,6 +5,7 @@ import { ProjectProvider } from './contexts/ProjectContext';
 import { ProjectControl } from './components/ProjectControl';
 import { Terminal } from './components/Terminal';
 import { Hyperspace } from './components/Hyperspace';
+import { UsageMini } from './components/UsageMini';
 import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
 
@@ -53,6 +54,7 @@ function MainLayout() {
       <div className="app-hyperspace-bg">
         <Hyperspace activeCount={workingCount} typingBoost={typing} onWarpChange={setWarpSpeed} />
       </div>
+      <UsageMini />
       <div className="warp-indicator" data-active={isActive || undefined}>
         {warpStr}<em>c</em>
       </div>

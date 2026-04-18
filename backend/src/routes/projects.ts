@@ -3,6 +3,8 @@ import { PrismaClient, WorkflowType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth';
 import * as tmux from '../services/tmux';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
+import { deleteStatus, setStatus, notifyStatusChange } from '../services/status';
+import { rename } from 'fs/promises';
 
 const prisma = new PrismaClient();
 
@@ -199,9 +201,75 @@ export function projectsRouter(): Router {
     }
   };
 
+  const renameProject: RequestHandler = async (req, res) => {
+    try {
+      const { name: newName } = req.body;
+      if (!newName) { res.status(400).json({ error: 'name required' }); return; }
+
+      if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+        res.status(400).json({ error: 'name must be alphanumeric with dashes/underscores only' });
+        return;
+      }
+
+      const project = await prisma.project.findFirst({
+        where: { id: req.params.id, userId: req.user!.id },
+        include: { workflows: true },
+      });
+      if (!project) { res.status(404).json({ error: 'Not found' }); return; }
+
+      const oldName = project.name;
+      if (oldName === newName) { res.json({ ok: true }); return; }
+
+      const username = req.user!.unixUsername;
+
+      // Rename tmux sessions
+      for (const wf of project.workflows) {
+        const roles: Array<'agent' | 'ctrl' | 'data' | 'data-ctrl'> = wf.type === 'agent'
+          ? ['agent', 'ctrl'] : ['data', 'data-ctrl'];
+        for (const role of roles) {
+          const oldSession = tmux.sessionName(username, oldName, role);
+          const newSession = tmux.sessionName(username, newName, role);
+          try {
+            await tmux.renameSession(oldSession, newSession);
+          } catch { /* session may not exist */ }
+          // Migrate status entry
+          deleteStatus(oldSession);
+          setStatus(newSession, 'idle');
+          notifyStatusChange(newSession);
+        }
+      }
+
+      // Rename project directory
+      const oldDir = tmux.projectDir(username, oldName);
+      const newDir = tmux.projectDir(username, newName);
+      try {
+        await rename(oldDir, newDir);
+      } catch { /* dir may not exist yet */ }
+
+      // Update DB
+      await prisma.project.update({
+        where: { id: project.id },
+        data: { name: newName },
+      });
+
+      const updated = await prisma.project.findUnique({
+        where: { id: project.id },
+        include: { workflows: true },
+      });
+      res.json(updated);
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code === 'P2002') {
+        res.status(409).json({ error: 'A project with that name already exists' });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to rename project' });
+    }
+  };
+
   router.get('/', requireAuth, list);
   router.post('/', requireAuth, create);
   router.put('/:id', requireAuth, update);
+  router.post('/:id/rename', requireAuth, renameProject);
   router.post('/:id/archive', requireAuth, archive);
   router.post('/:id/workflows', requireAuth, addWorkflow);
   router.delete('/:id/workflows/:type', requireAuth, removeWorkflow);

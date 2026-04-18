@@ -105,6 +105,10 @@ export async function listSessions(): Promise<string[]> {
   }
 }
 
+export async function renameSession(oldName: string, newName: string): Promise<void> {
+  await execAsync(`tmux rename-session -t ${shellEscape(oldName)} ${shellEscape(newName)}`);
+}
+
 export async function killSession(name: string): Promise<void> {
   try {
     await execAsync(`tmux kill-session -t ${shellEscape(name)}`);

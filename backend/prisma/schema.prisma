@@ -106,6 +106,16 @@ model BrowserTab {
   @@map("browser_tabs")
 }
 
+// Slack notification targets — which channel to notify when a tmux session needs input
+model NotificationTarget {
+  tmuxSession String   @id        // e.g. "secorp-mommo-site-agent"
+  channel     String              // Slack channel ID
+  userId      String              // Slack user ID
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@map("notification_targets")
+}
+
 // Latest Chrome tab snapshot from the local relay, keyed by relay token
 model RelaySnapshot {
   id          String   @id @default(cuid())

@@ -1,5 +1,14 @@
 # termag setup
 
+## Prerequisites
+
+- Node.js 18+
+- PostgreSQL
+- Apache with mod_proxy (or another reverse proxy)
+- tmux
+- Google OAuth credentials (for web login)
+- Slack app (optional, for /t commands and notifications)
+
 ## 1. Database
 
 ```bash
@@ -43,7 +52,9 @@ ProxyPass        /termag     http://localhost:3040/termag
 ProxyPassReverse /termag     http://localhost:3040/termag
 ```
 
-## 4. Systemd
+## 4. Systemd services
+
+### Main server (runs as root or a service user)
 
 ```bash
 sudo cp deploy/termag.service /etc/systemd/system/
@@ -51,29 +62,85 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now termag
 ```
 
+### Per-user agent (runs as each user)
+
+The agent handles tmux, PTY, and filesystem operations on behalf of each user.
+Set up as a systemd user service:
+
+```bash
+# As the target user:
+mkdir -p ~/.config/systemd/user
+cp deploy/termag-agent.service ~/.config/systemd/user/
+# Edit the service file to set correct paths and config
+systemctl --user daemon-reload
+systemctl --user enable --now termag-agent
+
+# Enable lingering so the agent runs without an active login session
+sudo loginctl enable-linger <username>
+```
+
+The agent connects to the main server via WebSocket using a bearer token.
+Create a token in the termag UI (sidebar > Agent Tokens).
+
+Agent config (`agent.config.json`):
+```json
+{
+  "server_url": "ws://localhost:3040/termag/ws/agent",
+  "token": "tmag_..."
+}
+```
+
 ## 5. Claude Code hooks
 
 Add termag as a status hook target in `~/.claude/settings.json`.
-Each hook event should POST to `http://localhost:3040/termag/api/status` with
-`{ "session": "<tmux-session-name>", "status": "working|idle|waiting" }`.
+Each hook event should POST to `http://localhost:3040/termag/api/status`.
 See `deploy/claude-hooks.md` for the full configuration.
 
 ## 6. Slack bot
 
-The Slack bot runs in the same process. Set these env vars in `.env`:
+The Slack bot runs in the same process as the main server. Set these env vars in `.env`:
 - `SLACK_BOT_TOKEN` (xoxb-)
 - `SLACK_APP_TOKEN` (xapp-)
 - `SLACK_SIGNING_SECRET`
 - `CAPTURE_API_SECRET` (for LTS relay)
 
-The old `claude-code-proxy-bot` service should be stopped/disabled.
-LTS relay endpoints are now at `localhost:3040/lts/` (was port 3100).
+### Slack app setup
+
+1. Create a Slack app at https://api.slack.com/apps
+2. Enable Socket Mode
+3. Add Bot Token Scopes: `chat:write`, `commands`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`
+4. Subscribe to bot events: `app_home_opened`, `message.im`, `reaction_added`
+5. Add slash command: `/t`
+6. Install to workspace
+
+### Slack commands
+
+- `/t` — capture and post the active agent's terminal pane
+- `/t <command>` — send a command to the agent terminal, then poll for output
+- `/t !<keys>` — send keystrokes without Enter (e.g. `/t !2` for numbered prompts)
+- `/t switch <project>` — switch active project
+- `/t attach <session>` — attach to a specific tmux session
+- `/t ctrl` — capture the ctrl terminal pane
+- `/t ctrl <command>` — send a command to the ctrl terminal
+
+### Emoji reactions
+
+When a pane screenshot is posted, termag detects numbered prompts and adds
+emoji hints (:one: :two: etc.). Reacting with one of these emojis sends that
+keystroke to the terminal. This chains — the response pane will also get hints
+if it contains new prompts.
+
+Additional reactions:
+- :white_check_mark: — sends `y` + Enter
+- :x: — sends `n` + Enter
+- :leftwards_arrow_with_hook: — sends Enter
+- :arrows_counterclockwise: — refreshes the pane (no keystroke)
 
 ## 7. Google OAuth
 
 1. Go to https://console.cloud.google.com/
 2. Create or reuse OAuth 2.0 credentials (Web application)
-3. Add authorized redirect URI: `https://secorp.net/termag/auth/google/callback`
+3. Add authorized redirect URI: `https://your-domain/termag/auth/google/callback`
 4. Copy Client ID and Secret into backend `.env`
 
 ## 8. Adding users
@@ -100,7 +167,10 @@ Chrome must be launched with `--remote-debugging-port=9222`.
 cd frontend && npm run build
 cd ../backend && npm run build
 sudo systemctl restart termag
+# Also restart agent if agent.js changed:
+systemctl --user restart termag-agent
 ```
 
-Frontend-only changes (CSS, React components) can be tested with a hard refresh
-without restarting the service, since the backend serves static files.
+Frontend-only changes (CSS, React components) take effect with a hard refresh
+without restarting the service, since the backend serves static files from
+`frontend/dist/`.

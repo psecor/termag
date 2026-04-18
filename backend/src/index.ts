@@ -15,6 +15,7 @@ import { projectsRouter } from './routes/projects';
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
+import { usageRouter } from './routes/usage';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -94,6 +95,7 @@ app.use(`${BASE_PATH}/api/projects`, projectsRouter());
 app.use(`${BASE_PATH}/api/status`, statusRouter());
 app.use(`${BASE_PATH}/api/browser`, browserRouter());
 app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());
+app.use(`${BASE_PATH}/api/usage`, usageRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -163,9 +165,12 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername}`);
+      const initCols = parseInt(url.searchParams.get('cols') || '', 10) || 80;
+      const initRows = parseInt(url.searchParams.get('rows') || '', 10) || 24;
+
+      console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername} (${initCols}x${initRows})`);
       try {
-        const streamId = await requestTerminalStream(user.id, tmuxSession, (msg) => {
+        const streamId = await requestTerminalStream(user.id, tmuxSession, initCols, initRows, (msg) => {
           if (ws.readyState === WebSocket.OPEN) {
             if (msg.type === 'terminal-data') {
               ws.send(JSON.stringify({ type: 'output', data: msg.data }));

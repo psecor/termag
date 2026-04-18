@@ -123,13 +123,15 @@ export function sendToAgent(userId: string, type: string, payload: Record<string
 export async function requestTerminalStream(
   userId: string,
   tmuxSessionName: string,
+  cols: number,
+  rows: number,
   onData: (msg: any) => void,
 ): Promise<string> {
   const streamId = `stream_${nextRequestId()}`;
   terminalStreams.set(streamId, { onData, userId });
 
   try {
-    await sendToAgent(userId, 'terminal-attach', { tmuxSessionName, streamId });
+    await sendToAgent(userId, 'terminal-attach', { tmuxSessionName, streamId, cols, rows });
     return streamId;
   } catch (err) {
     terminalStreams.delete(streamId);

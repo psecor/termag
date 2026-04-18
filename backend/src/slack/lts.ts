@@ -6,9 +6,12 @@
  */
 
 import { Router, RequestHandler } from 'express';
+import { PrismaClient } from '@prisma/client';
 import { formatPaneForSlack } from '../services/tmux';
 import { setStatus, notifyStatusChange } from '../services/status';
 import type { WebClient } from '@slack/web-api';
+
+const prismaClient = new PrismaClient();
 
 // In-memory state
 const registry = new Map<string, {
@@ -69,6 +72,29 @@ export function clearActiveLocalSession(userId: string): void { activeLocalSessi
 
 export function setNotificationTarget(tmuxName: string, target: { channel: string; userId: string }): void {
   notificationTargets.set(tmuxName, target);
+  // Persist to DB (fire-and-forget)
+  prismaClient.notificationTarget.upsert({
+    where: { tmuxSession: tmuxName },
+    update: { channel: target.channel, userId: target.userId },
+    create: { tmuxSession: tmuxName, channel: target.channel, userId: target.userId },
+  }).catch(err => console.error('[LTS] Failed to persist notification target:', err.message));
+}
+
+export async function getNotificationTarget(tmuxName: string): Promise<{ channel: string; userId: string } | undefined> {
+  // Check in-memory first, fall back to DB
+  const cached = notificationTargets.get(tmuxName);
+  if (cached) return cached;
+  try {
+    const row = await prismaClient.notificationTarget.findUnique({ where: { tmuxSession: tmuxName } });
+    if (row) {
+      const target = { channel: row.channel, userId: row.userId };
+      notificationTargets.set(tmuxName, target); // warm the cache
+      return target;
+    }
+  } catch (err) {
+    console.error('[LTS] Failed to read notification target:', (err as Error).message);
+  }
+  return undefined;
 }
 
 export function listLocalSessions(): Array<{ name: string; userId: string; hasContent: boolean; claudeStatus: string | null; lastStatusAt: number | null }> {

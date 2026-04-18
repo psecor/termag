@@ -177,6 +177,19 @@ body {
 
 .project-actions { display: flex; gap: 2px; }
 
+.project-rename-input {
+  flex: 1;
+  font-size: 12px;
+  font-family: inherit;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  padding: 1px 4px;
+  outline: none;
+  min-width: 0;
+}
+
 /* ── Agent Token Management ────────────────────────────────── */
 .clickable-header { cursor: pointer; user-select: none; }
 .clickable-header:hover { color: var(--text-secondary); }
@@ -385,6 +398,204 @@ body {
 
 .warp-indicator em {
   font-style: italic;
+}
+
+/* ── Usage Thermometer (collapsed) ─────────────────────────── */
+.usage-thermo {
+  position: fixed;
+  bottom: 56px;
+  left: 12px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.usage-thermo-tube {
+  position: relative;
+  width: 20px;
+  height: 120px;
+  background: rgba(13, 17, 23, 0.92);
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.usage-thermo-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: 0 0 9px 9px;
+  transition: height 0.5s ease, background 0.5s ease;
+}
+
+.usage-thermo-mark {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 2px;
+  background: rgba(139, 148, 158, 0.4);
+  border-radius: 1px;
+}
+
+.usage-thermo-mark-100 {
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: rgba(201, 209, 217, 0.8);
+}
+
+.usage-thermo-mark span {
+  position: absolute;
+  right: -28px;
+  top: -5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 7px;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.usage-thermo-mark-100 span {
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 8px;
+}
+
+.usage-thermo-pct {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  font-weight: 700;
+  color: rgba(51, 255, 51, 0.9);
+  white-space: nowrap;
+}
+
+.usage-thermo-cost {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  font-weight: 700;
+  color: white;
+  white-space: nowrap;
+}
+
+/* ── Usage Overlay (expanded) ──────────────────────────────── */
+.usage-overlay-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.usage-overlay {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  width: 480px;
+  max-height: 80vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-primary);
+}
+
+.usage-overlay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.usage-overlay-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.usage-overlay-close:hover { color: var(--text-primary); }
+
+.usage-overlay-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.usage-overlay-section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.usage-overlay-section-header > span:first-child {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.usage-overlay-pct {
+  margin-left: auto;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.usage-overlay-pct.usage-hot {
+  color: var(--warning);
+}
+
+.usage-overlay-tokens {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-overlay-token-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.usage-overlay-token-label {
+  min-width: 90px;
+  color: var(--text-secondary);
+}
+
+.usage-overlay-footer {
+  text-align: center;
+  font-size: 11px;
+}
+
+.usage-dim { color: var(--text-muted); }
+
+.usage-legend {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.usage-legend i {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 3px;
+  vertical-align: middle;
 }
 
 /* ── Scrollbars ─────────────────────────────────────────────── */

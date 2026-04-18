@@ -60,6 +60,15 @@ export async function resolveStoplight(sessionName: string): Promise<string> {
   return exists ? '🔴' : '💤';
 }
 
+export function deleteStatus(sessionName: string): void {
+  statusMap.delete(sessionName);
+  const timer = autoIdleTimers.get(sessionName);
+  if (timer) {
+    clearTimeout(timer);
+    autoIdleTimers.delete(sessionName);
+  }
+}
+
 // Hook for pushing status changes to WebSocket clients
 let onStatusChange: ((sessionName: string) => void) | null = null;
 

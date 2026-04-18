@@ -94,15 +94,20 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       }
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const initCols = term.cols;
+      const initRows = term.rows;
       ws = new WebSocket(
-        `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}`
+        `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}&cols=${initCols}&rows=${initRows}`
       );
       wsRef.current = ws;
 
       ws.onopen = () => {
         if (disposed) { ws?.close(); return; }
         fitAddon.fit();
-        ws!.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        // Send resize in case fit changed dimensions after the URL was built
+        if (term.cols !== initCols || term.rows !== initRows) {
+          ws!.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
         if (autoFocus) term.focus();
       };
 

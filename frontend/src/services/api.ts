@@ -18,6 +18,8 @@ export const projectsApi = {
     api.post('/api/projects', data).then(r => r.data),
   update: (id: string, data: Partial<{ name: string; description: string; color: string }>) =>
     api.put(`/api/projects/${id}`, data).then(r => r.data),
+  rename: (id: string, name: string): Promise<Project> =>
+    api.post(`/api/projects/${id}/rename`, { name }).then(r => r.data),
   archive: (id: string) =>
     api.post(`/api/projects/${id}/archive`).then(r => r.data),
   addWorkflow: (projectId: string, type: WorkflowType) =>
@@ -50,6 +52,19 @@ export const agentTokensApi = {
   create: (name: string): Promise<AgentTokenCreated> =>
     api.post('/api/agent-tokens', { name }).then(r => r.data),
   revoke: (id: string) => api.delete(`/api/agent-tokens/${id}`).then(r => r.data),
+};
+
+export interface UsageDayData {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreate: number;
+  calls: number;
+}
+
+export const usageApi = {
+  get: (): Promise<{ days: Record<string, UsageDayData> }> =>
+    api.get('/api/usage').then(r => r.data),
 };
 
 export const browserApi = {

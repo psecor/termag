@@ -46,6 +46,72 @@ const sessionMessageCount = new Map<string, number>();
 const followedThreads = new Set<string>(); // "channel:ts"
 const followedChannels = new Set<string>();
 
+// ── Emoji reaction → terminal command system ─────────────────
+// Maps Slack emoji names to keystrokes sent to the terminal
+const EMOJI_KEYS: Record<string, { keys: string; withEnter: boolean }> = {
+  one:   { keys: '1', withEnter: false },
+  two:   { keys: '2', withEnter: false },
+  three: { keys: '3', withEnter: false },
+  four:  { keys: '4', withEnter: false },
+  five:  { keys: '5', withEnter: false },
+  white_check_mark: { keys: 'y', withEnter: true },
+  x:     { keys: 'n', withEnter: true },
+  leftwards_arrow_with_hook: { keys: '', withEnter: true },
+  arrows_counterclockwise: { keys: '', withEnter: false }, // refresh only
+};
+
+const NUMBER_EMOJIS = ['one', 'two', 'three', 'four', 'five'];
+
+// Track pane messages so reactions can route to the right session
+// Key: "channelId:messageTs" → session info
+interface ReactionTarget {
+  sessionName: string;
+  userId: string;
+  channelId: string;
+  expiresAt: number;
+}
+const reactionTargets = new Map<string, ReactionTarget>();
+const REACTION_TTL = 60 * 60 * 1000; // 1 hour
+
+export function trackPaneMessage(channelId: string, messageTs: string, tmuxSession: string, userId: string): void {
+  // Prune expired entries lazily
+  const now = Date.now();
+  for (const [key, val] of reactionTargets) {
+    if (val.expiresAt < now) reactionTargets.delete(key);
+  }
+  reactionTargets.set(`${channelId}:${messageTs}`, {
+    sessionName: tmuxSession,
+    userId,
+    channelId,
+    expiresAt: now + REACTION_TTL,
+  });
+}
+
+// Detect numbered prompts in pane content (e.g. "  1. Allow once")
+function detectNumberedPrompts(paneContent: string): number {
+  const lines = paneContent.split('\n').slice(-15); // check last 15 lines
+  let maxNum = 0;
+  for (const line of lines) {
+    const match = line.match(/^\s*(\d+)[\.\)]\s/);
+    if (match) {
+      const n = parseInt(match[1], 10);
+      if (n > 0 && n <= 5) maxNum = Math.max(maxNum, n);
+    }
+  }
+  return maxNum;
+}
+
+// Add hint emojis to a pane message if numbered prompts are detected
+export async function addReactionHints(client: any, channelId: string, messageTs: string, paneContent: string): Promise<void> {
+  const count = detectNumberedPrompts(paneContent);
+  if (count === 0) return;
+  for (let i = 0; i < count; i++) {
+    try {
+      await client.reactions.add({ channel: channelId, timestamp: messageTs, name: NUMBER_EMOJIS[i] });
+    } catch { /* ignore — may already have the reaction */ }
+  }
+}
+
 // Rate limiting
 const userLastRequest = new Map<string, number>();
 const RATE_LIMIT_MS = (parseInt(process.env.RATE_LIMIT_SECONDS ?? '2', 10)) * 1000;
@@ -306,10 +372,12 @@ export function registerEventHandlers(app: App): void {
       const agentSession = sessionName(username, project.name, 'agent');
       setNotificationTarget(agentSession, { channel: command.channel_id, userId });
       const pane = await capturePaneForSlack(agentSession);
-      await client.chat.postMessage({
+      const switchMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, agentSession, 'idle'),
       });
+      trackPaneMessage(command.channel_id, switchMsg.ts, agentSession, userId);
+      await addReactionHints(client, command.channel_id, switchMsg.ts, pane);
       return;
     }
 
@@ -339,10 +407,12 @@ export function registerEventHandlers(app: App): void {
 
       setNotificationTarget(target, { channel: command.channel_id, userId });
       const pane = await capturePaneForSlack(target);
-      await client.chat.postMessage({
+      const attachMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, target, 'idle'),
       });
+      trackPaneMessage(command.channel_id, attachMsg.ts, target, userId);
+      await addReactionHints(client, command.channel_id, attachMsg.ts, pane);
       return;
     }
 
@@ -365,18 +435,24 @@ export function registerEventHandlers(app: App): void {
 
       if (!ctrlCmd) {
         const pane = await capturePaneForSlack(ctrlSession);
-        await client.chat.postMessage({ channel: command.channel_id, ...formatPaneForSlack(pane, null, ctrlSession, 'idle') });
+        const ctrlPaneMsg = await client.chat.postMessage({ channel: command.channel_id, ...formatPaneForSlack(pane, null, ctrlSession, 'idle') });
+        trackPaneMessage(command.channel_id, ctrlPaneMsg.ts, ctrlSession, userId);
+        await addReactionHints(client, command.channel_id, ctrlPaneMsg.ts, pane);
         return;
       }
 
       const pane = await capturePaneForSlack(ctrlSession);
-      const msg = await client.chat.postMessage({
+      const ctrlCmdMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, ctrlCmd, ctrlSession, 'running'),
       });
+      trackPaneMessage(command.channel_id, ctrlCmdMsg.ts, ctrlSession, userId);
       const noEnter = ctrlCmd.startsWith('!');
       await sendKeys(ctrlSession, noEnter ? ctrlCmd.slice(1) : ctrlCmd, !noEnter);
-      await pollUntilStable(client, command.channel_id, msg.ts, ctrlSession, ctrlCmd, 30);
+      await pollUntilStable(client, command.channel_id, ctrlCmdMsg.ts, ctrlSession, ctrlCmd, 30);
+      // Re-check for hints after poll settles
+      const ctrlFinalPane = await capturePaneForSlack(ctrlSession);
+      await addReactionHints(client, command.channel_id, ctrlCmdMsg.ts, ctrlFinalPane);
       return;
     }
 
@@ -480,10 +556,12 @@ export function registerEventHandlers(app: App): void {
     // /t (no args) — pane screenshot
     if (!userCommand) {
       const pane = await capturePaneForSlack(agentSession);
-      await client.chat.postMessage({
+      const paneMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, agentSession, 'idle'),
       });
+      trackPaneMessage(command.channel_id, paneMsg.ts, agentSession, userId);
+      await addReactionHints(client, command.channel_id, paneMsg.ts, pane);
       return;
     }
 
@@ -496,9 +574,14 @@ export function registerEventHandlers(app: App): void {
       channel: command.channel_id,
       ...formatPaneForSlack(pane, userCommand, agentSession, 'running'),
     });
+    trackPaneMessage(command.channel_id, msg.ts, agentSession, userId);
 
     await sendKeys(agentSession, keysToSend, !noEnter);
     await pollUntilStable(client, command.channel_id, msg.ts, agentSession, userCommand, 30);
+
+    // Add reaction hints after polling completes (final pane state)
+    const finalPane = await capturePaneForSlack(agentSession);
+    await addReactionHints(client, command.channel_id, msg.ts, finalPane);
   });
 
   // App Home
@@ -524,6 +607,50 @@ export function registerEventHandlers(app: App): void {
     if (isLocalSession(action.value)) {
       setActiveLocalSession(body.user.id, action.value);
       await publishHomeView(client, body.user.id);
+    }
+  });
+
+  // ── Emoji reactions → terminal commands ────────────────────
+  app.event('reaction_added', async ({ event, client }: any) => {
+    try {
+      const emoji = event.reaction;
+      const mapping = EMOJI_KEYS[emoji];
+      if (!mapping) return; // not a recognized emoji
+
+      const key = `${event.item.channel}:${event.item.ts}`;
+      const target = reactionTargets.get(key);
+      if (!target) return; // not a tracked pane message
+      if (target.expiresAt < Date.now()) {
+        reactionTargets.delete(key);
+        return;
+      }
+
+      // Only respond to the user who created the original /t command
+      if (event.user !== target.userId) return;
+
+      // Send keystroke (unless refresh-only)
+      if (mapping.keys || mapping.withEnter) {
+        await sendKeys(target.sessionName, mapping.keys, mapping.withEnter);
+      }
+
+      // Post initial pane, then poll until stable (picks up follow-up prompts)
+      const label = emoji === 'arrows_counterclockwise' ? null : `(${emoji})`;
+      const pane = await capturePaneForSlack(target.sessionName);
+      const msg = await client.chat.postMessage({
+        channel: target.channelId,
+        ...formatPaneForSlack(pane, label, target.sessionName, 'running'),
+      });
+
+      // Track immediately so chained reactions work even during polling
+      trackPaneMessage(target.channelId, msg.ts, target.sessionName, target.userId);
+
+      await pollUntilStable(client, target.channelId, msg.ts, target.sessionName, label, 30);
+
+      // Add reaction hints on the final stable pane
+      const finalPane = await capturePaneForSlack(target.sessionName);
+      await addReactionHints(client, target.channelId, msg.ts, finalPane);
+    } catch (error) {
+      console.error('[REACTION] Error:', error);
     }
   });
 }

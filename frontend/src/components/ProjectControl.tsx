@@ -9,6 +9,8 @@ export function ProjectControl() {
   const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
   const [error, setError] = useState('');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
 
   // Agent tokens
   const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
@@ -45,6 +47,21 @@ export function ProjectControl() {
       setActiveProject(project.id);
     } catch {
       setError('Failed to create project');
+    }
+  }
+
+  async function renameProject(project: Project) {
+    const newName = renameValue.trim();
+    if (!newName || newName === project.name) { setRenamingId(null); return; }
+    try {
+      await projectsApi.rename(project.id, newName);
+      setRenamingId(null);
+      setRenameValue('');
+      await reloadProjects();
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setError(msg || 'Failed to rename project');
+      setRenamingId(null);
     }
   }
 
@@ -94,7 +111,29 @@ export function ProjectControl() {
               onClick={() => setActiveProject(p.id)}
             >
               <span className="project-status">{statusEmoji(p)}</span>
-              <span className="project-name">{p.name}</span>
+              {renamingId === p.id ? (
+                <input
+                  className="project-rename-input"
+                  value={renameValue}
+                  onChange={e => setRenameValue(e.target.value)}
+                  onBlur={() => renameProject(p)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') renameProject(p);
+                    if (e.key === 'Escape') setRenamingId(null);
+                  }}
+                  onClick={e => e.stopPropagation()}
+                  autoFocus
+                />
+              ) : (
+                <span
+                  className="project-name"
+                  onDoubleClick={e => {
+                    e.stopPropagation();
+                    setRenamingId(p.id);
+                    setRenameValue(p.name);
+                  }}
+                >{p.name}</span>
+              )}
               <span className="project-actions" onClick={e => e.stopPropagation()}>
                 <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
               </span>

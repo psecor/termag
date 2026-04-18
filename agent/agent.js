@@ -43,6 +43,62 @@ if (!termag_url || !token) {
   process.exit(1);
 }
 
+// ── Usage scanner ──────────────────────────────────────────────────────────
+const { readdir, readFile, stat } = require('fs/promises');
+
+async function scanUsage() {
+  const claudeDir = path.join(process.env.HOME || '/home', '.claude', 'projects');
+  const days = {}; // date string → { input, output, cacheRead, cacheCreate, calls }
+
+  let projectDirs;
+  try {
+    projectDirs = await readdir(claudeDir);
+  } catch {
+    return { days: {} };
+  }
+
+  for (const dir of projectDirs) {
+    const projectPath = path.join(claudeDir, dir);
+    let files;
+    try {
+      const s = await stat(projectPath);
+      if (!s.isDirectory()) continue;
+      files = await readdir(projectPath);
+    } catch { continue; }
+
+    for (const file of files) {
+      if (!file.endsWith('.jsonl')) continue;
+      try {
+        const content = await readFile(path.join(projectPath, file), 'utf8');
+        for (const line of content.split('\n')) {
+          if (!line) continue;
+          let entry;
+          try { entry = JSON.parse(line); } catch { continue; }
+          const msg = entry.message;
+          if (!msg || typeof msg !== 'object' || !msg.usage) continue;
+
+          const ts = entry.timestamp;
+          if (!ts) continue;
+          const date = new Date(ts).toISOString().slice(0, 10);
+
+          const u = msg.usage;
+          if (!days[date]) {
+            days[date] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
+          }
+          const d = days[date];
+          d.input += u.input_tokens || 0;
+          d.output += u.output_tokens || 0;
+          d.cacheRead += u.cache_read_input_tokens || 0;
+          d.cacheCreate += u.cache_creation_input_tokens || 0;
+          d.calls += 1;
+        }
+      } catch { continue; }
+    }
+  }
+
+  return { days };
+}
+
 // Active PTY streams: streamId → { pty, tmuxSessionName }
 const streams = new Map();
 
@@ -131,11 +187,11 @@ function connect() {
         }
 
         case 'terminal-attach': {
-          const { tmuxSessionName, streamId } = msg;
+          const { tmuxSessionName, streamId, cols: initCols, rows: initRows } = msg;
           const term = pty.spawn('tmux', ['attach-session', '-t', tmuxSessionName], {
             name: 'xterm-256color',
-            cols: 80,
-            rows: 24,
+            cols: initCols || 80,
+            rows: initRows || 24,
             cwd: process.env.HOME || '/home',
             env: {
               HOME: process.env.HOME || '/home',
@@ -186,6 +242,12 @@ function connect() {
             const setting = msg.enabled ? 'on' : 'off';
             exec(`tmux set-option -t ${shellEscape(stream.tmuxSessionName)} mouse ${setting}`, () => {});
           }
+          break;
+        }
+
+        case 'usage-scan': {
+          const result = await scanUsage();
+          respond(ws, requestId, result);
           break;
         }
 
