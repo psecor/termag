@@ -16,9 +16,8 @@ model User {
   slackUserId  String?   @unique
   createdAt    DateTime  @default(now())
 
-  projects      Project[]
-  workTerminals WorkTerminal[]
-  agentTokens   AgentToken[]
+  projects    Project[]
+  agentTokens AgentToken[]
 
   @@map("users")
 }
@@ -77,19 +76,6 @@ enum WorkflowType {
   data
 }
 
-model WorkTerminal {
-  id        String   @id @default(cuid())
-  name      String   // e.g. "networking", "filesystem", "apache"
-  sortOrder Int      @default(0)
-  server    String   @default("localhost")
-  createdAt DateTime @default(now())
-
-  userId String
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, name])
-  @@map("work_terminals")
-}
 
 model BrowserTab {
   id        String   @id @default(cuid())

@@ -23,11 +23,7 @@ export interface Project {
   workflows: Workflow[];
 }
 
-export interface WorkTerminal {
-  id: string;
-  name: string;
-  sortOrder: number;
-}
+
 
 export interface BrowserTab {
   id: string;

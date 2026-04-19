@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, WorkTerminal, BrowserTab, ChromeWindow, WorkflowType } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -28,12 +28,6 @@ export const projectsApi = {
     api.delete(`/api/projects/${projectId}/workflows/${type}`).then(r => r.data),
 };
 
-export const workTerminalsApi = {
-  list: (): Promise<WorkTerminal[]> => api.get('/api/work-terminals').then(r => r.data),
-  create: (name: string, sortOrder?: number) =>
-    api.post('/api/work-terminals', { name, sortOrder }).then(r => r.data),
-  remove: (id: string) => api.delete(`/api/work-terminals/${id}`).then(r => r.data),
-};
 
 export interface AgentTokenInfo {
   id: string;

@@ -11,7 +11,6 @@ import { parse as parseCookie } from 'querystring';
 
 import { configurePassport, authRouter } from './routes/auth';
 import { projectsRouter } from './routes/projects';
-// import { workTerminalsRouter } from './routes/workTerminals'; // removed — work terminals feature dropped
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
@@ -91,7 +90,6 @@ configurePassport();
 // --- Routes ---
 app.use(`${BASE_PATH}/auth`, authRouter());
 app.use(`${BASE_PATH}/api/projects`, projectsRouter());
-// app.use(`${BASE_PATH}/api/work-terminals`, workTerminalsRouter()); // removed
 app.use(`${BASE_PATH}/api/status`, statusRouter());
 app.use(`${BASE_PATH}/api/browser`, browserRouter());
 app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());

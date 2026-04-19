@@ -25,10 +25,6 @@ export function sessionName(username: string, project: string, role: 'agent' | '
   return `${username}-${project}-${role}`;
 }
 
-export function workSessionName(username: string, terminalName: string): string {
-  return `${username}-work-${terminalName}`;
-}
-
 export async function hasSession(name: string): Promise<boolean> {
   try {
     await execAsync(`tmux has-session -t ${shellEscape(name)}`);

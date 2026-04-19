@@ -20,7 +20,7 @@ import { formatResponse, formatError, formatWelcome, splitMessage } from './form
 import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
 import {
-  sessionName, workSessionName, ensureSession, hasSession,
+  sessionName, ensureSession, hasSession,
   listSessions as tmuxListSessions, sendKeys,
   capturePaneForSlack, formatPaneForSlack, pollUntilStable,
 } from '../services/tmux';
@@ -453,36 +453,6 @@ export function registerEventHandlers(app: App): void {
       // Re-check for hints after poll settles
       const ctrlFinalPane = await capturePaneForSlack(ctrlSession);
       await addReactionHints(client, command.channel_id, ctrlCmdMsg.ts, ctrlFinalPane);
-      return;
-    }
-
-    // ── /t work <name> <command> ───────────────────────
-    if (userCommand.startsWith('work ')) {
-      const rest = userCommand.slice(5).trim();
-      const spaceIdx = rest.indexOf(' ');
-      const termName = spaceIdx > 0 ? rest.substring(0, spaceIdx) : rest;
-      const workCmd = spaceIdx > 0 ? rest.substring(spaceIdx + 1).trim() : '';
-
-      const workSession = workSessionName(username, termName);
-      if (!await hasSession(workSession)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No work terminal \`${termName}\`. Create one in the termag UI.` });
-        return;
-      }
-
-      if (!workCmd) {
-        const pane = await capturePaneForSlack(workSession);
-        await client.chat.postMessage({ channel: command.channel_id, ...formatPaneForSlack(pane, null, workSession, 'idle') });
-        return;
-      }
-
-      const pane = await capturePaneForSlack(workSession);
-      const msg = await client.chat.postMessage({
-        channel: command.channel_id,
-        ...formatPaneForSlack(pane, workCmd, workSession, 'running'),
-      });
-      const noEnter = workCmd.startsWith('!');
-      await sendKeys(workSession, noEnter ? workCmd.slice(1) : workCmd, !noEnter);
-      await pollUntilStable(client, command.channel_id, msg.ts, workSession, workCmd, 30);
       return;
     }
 
