@@ -136,7 +136,7 @@ async function resolveUnixUsername(slackUserId: string, slackClient?: any): Prom
   return user?.unixUsername ?? 'secorp';
 }
 
-function getActiveProjectId(userId: string): string | null {
+export function getActiveProjectId(userId: string): string | null {
   return activeProjectMap.get(userId) ?? null;
 }
 

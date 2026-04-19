@@ -8,6 +8,7 @@ import { PrismaClient } from '@prisma/client';
 import { execSync } from 'child_process';
 import type { WebClient } from '@slack/web-api';
 import { getClaudeSessionStatus, listLocalSessions, getActiveLocalSession } from './lts';
+import { getActiveProjectId } from './events';
 import { sessionName } from '../services/tmux';
 import { getStatus } from '../services/status';
 import { resolveTermagUser } from './userMapping';
@@ -91,20 +92,24 @@ async function buildHomeView(slackUserId: string, client?: WebClient) {
         return { project, statusInfo, claudeRunning };
       }));
 
+      const activeId = getActiveProjectId(slackUserId);
+
       for (const { project, statusInfo, claudeRunning } of rows) {
         const light = stoplightEmoji(statusInfo, claudeRunning);
         const hasAgent = project.workflows.some(w => w.type === 'agent');
-        const label = `${light}  ${project.name}${hasAgent ? '' : ' _(no agent)_'}`;
+        const isActive = project.id === activeId;
+        const name = isActive ? `:white_check_mark: *${project.name}*` : project.name;
+        const label = `${light}  ${name}${hasAgent ? '' : ' _(no agent)_'}`;
 
         blocks.push({
           type: 'section',
           text: { type: 'mrkdwn', text: `${label}\n\`/home/${project.user.unixUsername}/termag/projects/${project.name}\`` },
           accessory: {
             type: 'button',
-            text: { type: 'plain_text', text: 'Attach', emoji: false },
+            text: { type: 'plain_text', text: isActive ? 'Active' : 'Attach', emoji: false },
             action_id: 'home_attach_project',
             value: project.id,
-            style: 'primary',
+            ...(isActive ? {} : { style: 'primary' as const }),
           },
         });
       }

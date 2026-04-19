@@ -145,8 +145,8 @@ export function UsageMini() {
 
   useEffect(() => {
     const load = () => usageApi.get()
-      .then(r => setData(r.days))
-      .catch(() => {});
+      .then(r => { console.log('[UsageMini] loaded', Object.keys(r.days || {}).length, 'days'); setData(r.days); })
+      .catch(e => console.warn('[UsageMini] fetch failed:', e?.response?.status, e?.message));
     load();
     const interval = setInterval(load, 5 * 60 * 1000);
     return () => clearInterval(interval);
