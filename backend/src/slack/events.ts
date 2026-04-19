@@ -140,7 +140,7 @@ export function getActiveProjectId(userId: string): string | null {
   return activeProjectMap.get(userId) ?? null;
 }
 
-function setActiveProjectId(userId: string, projectId: string): void {
+export function setActiveProjectId(userId: string, projectId: string): void {
   activeProjectMap.set(userId, projectId);
 }
 

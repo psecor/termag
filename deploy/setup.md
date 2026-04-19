@@ -8,6 +8,7 @@
 - tmux
 - Google OAuth credentials (for web login)
 - Slack app (optional, for /t commands and notifications)
+- Discord bot (optional, mirrors Slack /t commands)
 
 ## 1. Database
 
@@ -136,20 +137,60 @@ Additional reactions:
 - :leftwards_arrow_with_hook: — sends Enter
 - :arrows_counterclockwise: — refreshes the pane (no keystroke)
 
-## 7. Google OAuth
+## 7. Discord bot
+
+The Discord bot runs in the same process as the main server. Set these env vars in `.env`:
+- `DISCORD_TOKEN` — Bot token from Discord Developer Portal
+- `DISCORD_APP_ID` — Application ID
+- `DISCORD_USER_MAP` — Maps Discord user IDs to unix usernames: `discordId:unixUser,discordId2:unixUser2`
+
+### Discord app setup
+
+1. Create an application at https://discord.com/developers/applications
+2. Go to Bot → enable **Message Content Intent** under Privileged Gateway Intents
+3. Copy the bot token into `DISCORD_TOKEN`
+4. Copy the Application ID into `DISCORD_APP_ID`
+5. Generate an invite URL: OAuth2 → URL Generator → scopes: `bot`, `applications.commands` → permissions: `Send Messages`, `Add Reactions`, `Read Message History`
+6. Invite the bot to your server
+
+### Discord commands
+
+The `/t` slash command mirrors all Slack subcommands:
+
+- `/t` — capture and post the active agent's terminal pane
+- `/t <command>` — send a command to the agent terminal, then poll for output
+- `/t !<keys>` — send keystrokes without Enter
+- `/t switch <project>` — switch active project
+- `/t attach <session>` — attach to a specific tmux session
+- `/t ctrl` — capture the ctrl terminal pane
+- `/t ctrl <command>` — send a command to the ctrl terminal
+- `/t projects` — list projects
+- `/t ls` — list tmux sessions
+
+### Discord emoji reactions
+
+Works the same as Slack — numbered prompts get reaction hints, and reacting sends keystrokes.
+
+### Cross-platform notifications
+
+When a session has notification targets registered for both Slack and Discord,
+both platforms receive notifications when the agent needs input or finishes a task.
+Use `/t switch <project>` on each platform to register notification targets.
+
+## 8. Google OAuth
 
 1. Go to https://console.cloud.google.com/
 2. Create or reuse OAuth 2.0 credentials (Web application)
 3. Add authorized redirect URI: `https://your-domain/termag/auth/google/callback`
 4. Copy Client ID and Secret into backend `.env`
 
-## 8. Adding users
+## 9. Adding users
 
 Add to `ALLOWED_USERS` in `.env`: `email@gmail.com:unixuser`
 Create their project directory: `mkdir -p /home/<unixuser>/termag/projects`
 Restart: `sudo systemctl restart termag`
 
-## 9. Chrome relay (optional, runs on your laptop)
+## 10. Chrome relay (optional, runs on your laptop)
 
 ```bash
 cd relay

@@ -12,9 +12,10 @@ model User {
   googleId     String    @unique
   googleEmail  String    @unique
   unixUsername String    @unique
-  displayName  String
-  slackUserId  String?   @unique
-  createdAt    DateTime  @default(now())
+  displayName    String
+  slackUserId    String?   @unique
+  discordUserId  String?   @unique
+  createdAt      DateTime  @default(now())
 
   projects    Project[]
   agentTokens AgentToken[]
@@ -92,13 +93,16 @@ model BrowserTab {
   @@map("browser_tabs")
 }
 
-// Slack notification targets — which channel to notify when a tmux session needs input
+// Notification targets — which channels to notify when a tmux session needs input
+// Supports both Slack and Discord; one entry per session+platform pair
 model NotificationTarget {
-  tmuxSession String   @id        // e.g. "secorp-mommo-site-agent"
-  channel     String              // Slack channel ID
-  userId      String              // Slack user ID
+  tmuxSession String              // e.g. "secorp-mommo-site-agent"
+  platform    String              // "slack" or "discord"
+  channel     String              // platform channel ID
+  userId      String              // platform user ID
   updatedAt   DateTime @default(now()) @updatedAt
 
+  @@id([tmuxSession, platform])
   @@map("notification_targets")
 }
 

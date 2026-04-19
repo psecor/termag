@@ -70,31 +70,60 @@ export function getActiveLocalSession(userId: string): string | null {
 }
 export function clearActiveLocalSession(userId: string): void { activeLocalSessions.delete(userId); }
 
-export function setNotificationTarget(tmuxName: string, target: { channel: string; userId: string }): void {
-  notificationTargets.set(tmuxName, target);
+export interface NotificationTargetInfo {
+  platform: 'slack' | 'discord';
+  channel: string;
+  userId: string;
+}
+
+// Cache key: "tmuxSession:platform"
+function cacheKey(tmuxName: string, platform: string): string {
+  return `${tmuxName}:${platform}`;
+}
+
+export function setNotificationTarget(tmuxName: string, target: { channel: string; userId: string }, platform: 'slack' | 'discord' = 'slack'): void {
+  notificationTargets.set(cacheKey(tmuxName, platform), target);
   // Persist to DB (fire-and-forget)
   prismaClient.notificationTarget.upsert({
-    where: { tmuxSession: tmuxName },
+    where: { tmuxSession_platform: { tmuxSession: tmuxName, platform } },
     update: { channel: target.channel, userId: target.userId },
-    create: { tmuxSession: tmuxName, channel: target.channel, userId: target.userId },
+    create: { tmuxSession: tmuxName, platform, channel: target.channel, userId: target.userId },
   }).catch(err => console.error('[LTS] Failed to persist notification target:', err.message));
 }
 
-export async function getNotificationTarget(tmuxName: string): Promise<{ channel: string; userId: string } | undefined> {
-  // Check in-memory first, fall back to DB
-  const cached = notificationTargets.get(tmuxName);
+export async function getNotificationTarget(tmuxName: string, platform: 'slack' | 'discord' = 'slack'): Promise<{ channel: string; userId: string } | undefined> {
+  const key = cacheKey(tmuxName, platform);
+  const cached = notificationTargets.get(key);
   if (cached) return cached;
   try {
-    const row = await prismaClient.notificationTarget.findUnique({ where: { tmuxSession: tmuxName } });
+    const row = await prismaClient.notificationTarget.findUnique({
+      where: { tmuxSession_platform: { tmuxSession: tmuxName, platform } },
+    });
     if (row) {
       const target = { channel: row.channel, userId: row.userId };
-      notificationTargets.set(tmuxName, target); // warm the cache
+      notificationTargets.set(key, target);
       return target;
     }
   } catch (err) {
     console.error('[LTS] Failed to read notification target:', (err as Error).message);
   }
   return undefined;
+}
+
+export async function getAllNotificationTargets(tmuxName: string): Promise<NotificationTargetInfo[]> {
+  try {
+    const rows = await prismaClient.notificationTarget.findMany({
+      where: { tmuxSession: tmuxName },
+    });
+    return rows.map(r => ({
+      platform: r.platform as 'slack' | 'discord',
+      channel: r.channel,
+      userId: r.userId,
+    }));
+  } catch (err) {
+    console.error('[LTS] Failed to read notification targets:', (err as Error).message);
+    return [];
+  }
 }
 
 export function listLocalSessions(): Array<{ name: string; userId: string; hasContent: boolean; claudeStatus: string | null; lastStatusAt: number | null }> {

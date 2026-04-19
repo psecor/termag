@@ -18,6 +18,7 @@ import { usageRouter } from './routes/usage';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
+import { createDiscordClient, startDiscordClient } from './discord/app';
 import { validateAgentToken } from './routes/agentTokens';
 import {
   registerAgent, isAgentConnected, requestTerminalStream,
@@ -102,6 +103,12 @@ app.get(`${BASE_PATH}/health`, (_req, res) => {
 // --- Slack Bot ---
 if (slackApp) {
   startSlackApp(slackApp).catch(err => console.error('[SLACK] Failed:', err));
+}
+
+// --- Discord Bot ---
+if (process.env.DISCORD_TOKEN) {
+  const discordClient = createDiscordClient();
+  startDiscordClient(discordClient).catch(err => console.error('[DISCORD] Failed:', err));
 }
 
 // Serve built frontend (production)

@@ -1,9 +1,11 @@
 import { Router, RequestHandler } from 'express';
 import { setStatus, getStatus, notifyStatusChange } from '../services/status';
 import { AgentStatus } from '../types/index';
-import { getNotificationTarget } from '../slack/lts';
+import { getAllNotificationTargets } from '../slack/lts';
 import { getSlackApp } from '../slack/app';
+import { getDiscordClient } from '../discord/app';
 import { capturePaneForSlack, formatPaneForSlack } from '../services/tmux';
+import { formatPaneForDiscord } from '../discord/formatting';
 
 // Track working start time and last notification per session
 const statusTracking = new Map<string, {
@@ -57,39 +59,56 @@ export function statusRouter(): Router {
       existing.workingStartedAt = null;
     }
 
-    // Slack notifications
+    // Notifications to all registered platforms
     if (notify) {
-      const target = await getNotificationTarget(session);
-      const slackApp = getSlackApp();
-      console.log(`[STATUS] Notify check: target=${target ? target.channel : 'none'} slackApp=${!!slackApp}`);
+      const targets = await getAllNotificationTargets(session);
+      const timeSinceNotify = existing.lastNotifiedAt ? now - existing.lastNotifiedAt : Infinity;
 
-      if (target && slackApp) {
-        const timeSinceNotify = existing.lastNotifiedAt ? now - existing.lastNotifiedAt : Infinity;
+      if (targets.length > 0 && timeSinceNotify > NOTIFY_COOLDOWN) {
+        const pane = await capturePaneForSlack(session);
 
-        if (status === 'waiting' && timeSinceNotify > NOTIFY_COOLDOWN) {
-          existing.lastNotifiedAt = now;
+        for (const target of targets) {
           try {
-            // Capture pane and send as a rich message with reaction hints
-            const pane = await capturePaneForSlack(session);
-            const { trackPaneMessage, addReactionHints } = await import('../slack/events');
-            const msg = await slackApp.client.chat.postMessage({
-              channel: target.channel,
-              ...formatPaneForSlack(pane, message || null, session, 'idle'),
-            });
-            trackPaneMessage(target.channel, msg.ts, session, target.userId);
-            await addReactionHints(slackApp.client, target.channel, msg.ts, pane);
+            if (target.platform === 'slack') {
+              const slackApp = getSlackApp();
+              if (!slackApp) continue;
+
+              if (status === 'waiting') {
+                existing.lastNotifiedAt = now;
+                const { trackPaneMessage, addReactionHints } = await import('../slack/events');
+                const msg = await slackApp.client.chat.postMessage({
+                  channel: target.channel,
+                  ...formatPaneForSlack(pane, message || null, session, 'idle'),
+                });
+                trackPaneMessage(target.channel, msg.ts, session, target.userId);
+                await addReactionHints(slackApp.client, target.channel, msg.ts, pane);
+              } else if (status === 'idle' && workingDuration > MIN_WORKING_DURATION) {
+                existing.lastNotifiedAt = now;
+                await slackApp.client.chat.postMessage({
+                  channel: target.channel,
+                  text: `Done — \`${session}\``,
+                });
+              }
+            } else if (target.platform === 'discord') {
+              const discord = getDiscordClient();
+              if (!discord) continue;
+
+              const channel = await discord.channels.fetch(target.channel);
+              if (!channel?.isTextBased() || !('send' in channel)) continue;
+
+              if (status === 'waiting') {
+                existing.lastNotifiedAt = now;
+                const { trackDiscordPaneMessage, addDiscordReactionHints } = await import('../discord/events');
+                const msg = await (channel as any).send(formatPaneForDiscord(pane, message || null, session));
+                trackDiscordPaneMessage(target.channel, msg.id, session, target.userId);
+                await addDiscordReactionHints(msg, pane);
+              } else if (status === 'idle' && workingDuration > MIN_WORKING_DURATION) {
+                existing.lastNotifiedAt = now;
+                await (channel as any).send(`Done — \`${session}\``);
+              }
+            }
           } catch (err) {
-            console.error('[STATUS] Slack notification failed:', (err as Error).message);
-          }
-        } else if (status === 'idle' && workingDuration > MIN_WORKING_DURATION) {
-          existing.lastNotifiedAt = now;
-          try {
-            await slackApp.client.chat.postMessage({
-              channel: target.channel,
-              text: `Done — \`${session}\``,
-            });
-          } catch (err) {
-            console.error('[STATUS] Slack notification failed:', (err as Error).message);
+            console.error(`[STATUS] ${target.platform} notification failed:`, (err as Error).message);
           }
         }
       }
