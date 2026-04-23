@@ -9,11 +9,12 @@ import { PrismaClient } from '@prisma/client';
 import { resolveDiscordUser } from './userMapping';
 import { formatPaneForDiscord } from './formatting';
 import {
-  sessionName, hasSession, sendKeys,
+  sessionName, projectDir, hasSession, sendKeys,
   capturePaneForSlack, listSessions as tmuxListSessions,
 } from '../services/tmux';
 import { setNotificationTarget } from '../slack/lts';
 import { getActiveProjectId, setActiveProjectId } from '../slack/events';
+import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 
 const prisma = new PrismaClient();
 
@@ -120,6 +121,53 @@ export function registerDiscordEvents(client: Client): void {
 
     const username = termagUser.unixUsername;
     const userCommand = (interaction.options.getString('command') ?? '').trim();
+
+    // /t create <project-name>
+    if (userCommand.startsWith('create ')) {
+      const projectName = userCommand.slice(7).trim();
+      if (!/^[a-zA-Z0-9_-]+$/.test(projectName)) {
+        await interaction.reply('Project name must be alphanumeric with dashes/underscores only.');
+        return;
+      }
+      try {
+        const projDir = projectDir(username, projectName);
+        if (isAgentConnected(termagUser.id)) {
+          await sendToAgent(termagUser.id, 'mkdir', { dir: projDir });
+        }
+
+        const project = await prisma.project.create({
+          data: { name: projectName, userId: termagUser.id },
+        });
+
+        await prisma.workflow.create({
+          data: { projectId: project.id, type: 'agent' },
+        });
+        const agentSession = sessionName(username, projectName, 'agent');
+        const ctrlSession = sessionName(username, projectName, 'ctrl');
+
+        if (isAgentConnected(termagUser.id)) {
+          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: agentSession, cwd: projDir });
+          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await sendToAgent(termagUser.id, 'tmux-send-keys', { sessionName: agentSession, keys: 'claude', withEnter: true });
+        } else {
+          await interaction.reply(`Project \`${projectName}\` created but agent is not connected — tmux sessions not started.`);
+          return;
+        }
+
+        setActiveProjectId(discordUserId, project.id);
+        setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord');
+        await interaction.reply(`Project \`${projectName}\` created with agent workflow. Switched to it.`);
+      } catch (err: unknown) {
+        if ((err as { code?: string }).code === 'P2002') {
+          await interaction.reply(`Project \`${projectName}\` already exists.`);
+        } else {
+          console.error('[DISCORD] /t create failed:', (err as Error).message);
+          await interaction.reply(`Failed to create project: ${(err as Error).message}`);
+        }
+      }
+      return;
+    }
 
     // /t projects
     if (userCommand === 'projects') {

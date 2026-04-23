@@ -8,6 +8,7 @@ import { Hyperspace } from './components/Hyperspace';
 import { UsageMini } from './components/UsageMini';
 import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
+import { Project } from './types';
 
 function Login() {
   return (
@@ -19,6 +20,18 @@ function Login() {
       </div>
     </div>
   );
+}
+
+function useIsNarrow(breakpoint = 1600) {
+  const [narrow, setNarrow] = useState(window.innerWidth < breakpoint);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint - 1}px)`);
+    const handler = (e: MediaQueryListEvent) => setNarrow(e.matches);
+    mq.addEventListener('change', handler);
+    setNarrow(mq.matches);
+    return () => mq.removeEventListener('change', handler);
+  }, [breakpoint]);
+  return narrow;
 }
 
 function MainLayout() {
@@ -48,9 +61,18 @@ function MainLayout() {
   const isActive = workingCount > 0 || typing;
   const warpStr = warpSpeed < 10 ? warpSpeed.toFixed(1) : Math.floor(warpSpeed).toString();
 
+  // Responsive layout
+  const isNarrow = useIsNarrow();
+  const [activePane, setActivePane] = useState<'agent' | 'ctrl'>('agent');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth < 1600);
+
+  // Auto-collapse when crossing the breakpoint
+  useEffect(() => {
+    setSidebarCollapsed(isNarrow);
+  }, [isNarrow]);
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${sidebarCollapsed ? 'sidebar-is-collapsed' : ''}`}>
       <div className="app-hyperspace-bg">
         <Hyperspace activeCount={workingCount} typingBoost={typing} onWarpChange={setWarpSpeed} />
       </div>
@@ -58,47 +80,119 @@ function MainLayout() {
       <div className="warp-indicator" data-active={isActive || undefined}>
         {warpStr}<em>c</em>
       </div>
-      <div className="app-sidebar">
-        <div className="app-control">
-          <ProjectControl />
-        </div>
+      <div className={`app-sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
+        <button
+          className="sidebar-toggle"
+          onClick={() => setSidebarCollapsed(s => !s)}
+          title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          {sidebarCollapsed ? '›' : '‹'}
+        </button>
+        {sidebarCollapsed ? (
+          <SidebarCollapsed
+            projects={projects}
+            activeProjectId={activeProjectId}
+            statusMap={statusMap}
+            username={username}
+          />
+        ) : (
+          <div className="app-control">
+            <ProjectControl />
+          </div>
+        )}
       </div>
       <div className="app-terminals">
         <div className="app-project-bar">
           {activeProject ? activeProject.name : '—'}
+          {isNarrow && activeProject && hasAgent && (
+            <div className="pane-tabs">
+              <button
+                className={`pane-tab ${activePane === 'agent' ? 'active' : ''}`}
+                onClick={() => setActivePane('agent')}
+              >agent</button>
+              <button
+                className={`pane-tab ${activePane === 'ctrl' ? 'active' : ''}`}
+                onClick={() => setActivePane('ctrl')}
+              >ctrl</button>
+            </div>
+          )}
         </div>
         <div className="app-panes">
-          <div className="app-agent" id="terminal-agent">
-            {activeProject && hasAgent ? (
-              <Terminal
-                sessionName={`${username}-${activeProject.name}-agent`}
-                active={true}
-                autoFocus={true}
-                onActivity={onActivity}
-                key={`${activeProject.id}-agent`}
-              />
-            ) : (
-              <div className="empty-pane">
-                {activeProject ? 'Add an agent workflow →' : 'Select a project'}
-              </div>
-            )}
-          </div>
-          <div className="app-ctrl" id="terminal-ctrl">
-            {activeProject && hasAgent ? (
-              <Terminal
-                sessionName={`${username}-${activeProject.name}-ctrl`}
-                active={true}
-                onActivity={onActivity}
-                key={`${activeProject.id}-ctrl`}
-              />
-            ) : (
-              <div className="empty-pane">
-                {activeProject ? 'Add an agent workflow →' : 'Select a project'}
-              </div>
-            )}
-          </div>
+          {(!isNarrow || activePane === 'agent') && (
+            <div className="app-agent" id="terminal-agent">
+              {activeProject && hasAgent ? (
+                <Terminal
+                  sessionName={`${username}-${activeProject.name}-agent`}
+                  active={true}
+                  autoFocus={!isNarrow || activePane === 'agent'}
+                  onActivity={onActivity}
+                  key={`${activeProject.id}-agent${isNarrow ? `-${activePane}` : ''}`}
+                />
+              ) : (
+                <div className="empty-pane">
+                  {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+                </div>
+              )}
+            </div>
+          )}
+          {(!isNarrow || activePane === 'ctrl') && (
+            <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
+              {activeProject && hasAgent ? (
+                <Terminal
+                  sessionName={`${username}-${activeProject.name}-ctrl`}
+                  active={true}
+                  autoFocus={isNarrow && activePane === 'ctrl'}
+                  onActivity={onActivity}
+                  key={`${activeProject.id}-ctrl${isNarrow ? `-${activePane}` : ''}`}
+                />
+              ) : (
+                <div className="empty-pane">
+                  {activeProject ? 'Add an agent workflow →' : 'Select a project'}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function getInitials(name: string): string {
+  // Split on dashes/underscores, take first char of each word, max 3
+  const parts = name.split(/[-_]+/).filter(Boolean);
+  if (parts.length >= 2) return parts.slice(0, 3).map(w => w[0]).join('').toUpperCase();
+  // Single word: first 2 chars
+  return name.slice(0, 2).toUpperCase();
+}
+
+function SidebarCollapsed({
+  projects, activeProjectId, statusMap, username,
+}: {
+  projects: Project[];
+  activeProjectId: string | null;
+  statusMap: Record<string, { status: string } | undefined>;
+  username: string;
+}) {
+  const { setActiveProject } = useProjects();
+  return (
+    <div className="sidebar-collapsed-list">
+      {projects.map(p => {
+        const agentSession = `${username}-${p.name}-agent`;
+        const s = statusMap[agentSession]?.status ?? 'not_running';
+        const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
+        return (
+          <div
+            key={p.id}
+            className={`sidebar-collapsed-item ${activeProjectId === p.id ? 'active' : ''}`}
+            title={p.name}
+            onClick={() => setActiveProject(p.id)}
+          >
+            <span className="sidebar-dot-light" style={{ background: color }} />
+            <span className="sidebar-collapsed-initials">{getInitials(p.name)}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }

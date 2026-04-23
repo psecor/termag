@@ -20,10 +20,11 @@ import { formatResponse, formatError, formatWelcome, splitMessage } from './form
 import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
 import {
-  sessionName, ensureSession, hasSession,
+  sessionName, projectDir, ensureSession, hasSession,
   listSessions as tmuxListSessions, sendKeys,
   capturePaneForSlack, formatPaneForSlack, pollUntilStable,
 } from '../services/tmux';
+import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import {
   registerLocalSession, queueLocalCommand, isLocalSession,
   removeLocalSession, listLocalSessions, updateLocalSessionMessage,
@@ -332,6 +333,60 @@ export function registerEventHandlers(app: App): void {
       });
       registerLocalSession(localName, { channel: command.channel_id, messageTs: initMsg.ts, userId });
       setActiveLocalSession(userId, localName);
+      return;
+    }
+
+    // ── /t create <project-name> ─────────────────────────
+    if (userCommand.startsWith('create ')) {
+      if (!termagUser) {
+        await client.chat.postMessage({ channel: command.channel_id, text: 'Your Slack account is not linked to a termag user.' });
+        return;
+      }
+      const projectName = userCommand.slice(7).trim();
+      if (!/^[a-zA-Z0-9_-]+$/.test(projectName)) {
+        await client.chat.postMessage({ channel: command.channel_id, text: 'Project name must be alphanumeric with dashes/underscores only.' });
+        return;
+      }
+      try {
+        // Create project directory
+        const projDir = projectDir(termagUser.unixUsername, projectName);
+        if (isAgentConnected(termagUser.id)) {
+          await sendToAgent(termagUser.id, 'mkdir', { dir: projDir });
+        }
+
+        // Create project in DB
+        const project = await prisma.project.create({
+          data: { name: projectName, userId: termagUser.id },
+        });
+
+        // Add agent workflow + tmux sessions
+        await prisma.workflow.create({
+          data: { projectId: project.id, type: 'agent' },
+        });
+        const agentSession = sessionName(termagUser.unixUsername, projectName, 'agent');
+        const ctrlSession = sessionName(termagUser.unixUsername, projectName, 'ctrl');
+
+        if (isAgentConnected(termagUser.id)) {
+          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: agentSession, cwd: projDir });
+          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          await new Promise(resolve => setTimeout(resolve, 500));
+          await sendToAgent(termagUser.id, 'tmux-send-keys', { sessionName: agentSession, keys: 'claude', withEnter: true });
+        } else {
+          await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created but agent is not connected — tmux sessions not started.` });
+          return;
+        }
+
+        setActiveProjectId(userId, project.id);
+        setNotificationTarget(agentSession, { channel: command.channel_id, userId });
+        await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created with agent workflow. Switched to it.` });
+      } catch (err: unknown) {
+        if ((err as { code?: string }).code === 'P2002') {
+          await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` already exists.` });
+        } else {
+          console.error('[SLACK] /t create failed:', (err as Error).message);
+          await client.chat.postMessage({ channel: command.channel_id, text: `Failed to create project: ${(err as Error).message}` });
+        }
+      }
       return;
     }
 
