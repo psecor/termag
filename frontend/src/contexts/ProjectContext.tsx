@@ -50,10 +50,33 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data as string) as {
-            type: string; session: string; status: AgentStatusValue; updatedAt: string; message?: string;
+            type: string;
+            session: string;
+            status: AgentStatusValue;
+            updatedAt: string;
+            message?: string;
+            source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback';
+            waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
+            activityScore?: number;
+            tokenBurst?: number;
+            activeTurn?: boolean;
+            threadId?: string;
           };
           if (msg.type === 'status') {
-            setStatusMap(prev => ({ ...prev, [msg.session]: { status: msg.status, updatedAt: msg.updatedAt, message: msg.message } }));
+            setStatusMap(prev => ({
+              ...prev,
+              [msg.session]: {
+                status: msg.status,
+                updatedAt: msg.updatedAt,
+                message: msg.message,
+                source: msg.source,
+                waitingReason: msg.waitingReason,
+                activityScore: msg.activityScore,
+                tokenBurst: msg.tokenBurst,
+                activeTurn: msg.activeTurn,
+                threadId: msg.threadId,
+              },
+            }));
           }
         } catch { /* ignore */ }
       };

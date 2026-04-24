@@ -21,6 +21,14 @@ npm install
 npm run db:migrate:dev
 ```
 
+If you are upgrading an existing install rather than creating a fresh database,
+apply migrations and regenerate Prisma before restarting:
+
+```bash
+cd backend
+npx prisma generate
+```
+
 Create the session table for connect-pg-simple:
 ```sql
 psql -U secorp -d termag -c "
@@ -91,13 +99,27 @@ Agent config (`agent.config.json`):
 }
 ```
 
-## 5. Claude Code hooks
+The per-user agent must be restarted whenever `agent/agent.js` changes. This is
+also where Codex bridge lifecycle management now lives.
+
+## 5. Agent providers
+
+`termag` supports multiple agent runtimes per project.
+
+- `Codex` projects use the per-user agent to launch a managed Codex bridge plus
+  `codex --remote` in the `*-agent` tmux pane
+- `Claude` projects use the existing `claude` startup path
+
+The selected provider is persisted on each `agent` workflow, and each user also
+has a saved default provider used by the create-project form.
+
+## 6. Claude Code hooks
 
 Add termag as a status hook target in `~/.claude/settings.json`.
 Each hook event should POST to `http://localhost:3040/termag/api/status`.
 See `deploy/claude-hooks.md` for the full configuration.
 
-## 6. Slack bot
+## 7. Slack bot
 
 The Slack bot runs in the same process as the main server. Set these env vars in `.env`:
 - `SLACK_BOT_TOKEN` (xoxb-)
@@ -137,7 +159,7 @@ Additional reactions:
 - :leftwards_arrow_with_hook: — sends Enter
 - :arrows_counterclockwise: — refreshes the pane (no keystroke)
 
-## 7. Discord bot
+## 8. Discord bot
 
 The Discord bot runs in the same process as the main server. Set these env vars in `.env`:
 - `DISCORD_TOKEN` — Bot token from Discord Developer Portal
@@ -177,20 +199,20 @@ When a session has notification targets registered for both Slack and Discord,
 both platforms receive notifications when the agent needs input or finishes a task.
 Use `/t switch <project>` on each platform to register notification targets.
 
-## 8. Google OAuth
+## 9. Google OAuth
 
 1. Go to https://console.cloud.google.com/
 2. Create or reuse OAuth 2.0 credentials (Web application)
 3. Add authorized redirect URI: `https://your-domain/termag/auth/google/callback`
 4. Copy Client ID and Secret into backend `.env`
 
-## 9. Adding users
+## 10. Adding users
 
 Add to `ALLOWED_USERS` in `.env`: `email@gmail.com:unixuser`
 Create their project directory: `mkdir -p /home/<unixuser>/termag/projects`
 Restart: `sudo systemctl restart termag`
 
-## 10. Chrome relay (optional, runs on your laptop)
+## 11. Chrome relay (optional, runs on your laptop)
 
 ```bash
 cd relay
@@ -207,8 +229,9 @@ Chrome must be launched with `--remote-debugging-port=9222`.
 ```bash
 cd frontend && npm run build
 cd ../backend && npm run build
+npx prisma generate
 sudo systemctl restart termag
-# Also restart agent if agent.js changed:
+# Also restart the per-user agent if agent.js changed:
 systemctl --user restart termag-agent
 ```
 

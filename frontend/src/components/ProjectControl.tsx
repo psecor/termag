@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Project, STATUS_EMOJI } from '../types';
+import { AgentProvider, Project, STATUS_EMOJI } from '../types';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { projectsApi, agentTokensApi, AgentTokenInfo } from '../services/api';
 
 export function ProjectControl() {
-  const { user, logout } = useAuth();
+  const { user, logout, updateDefaultAgentProvider } = useAuth();
   const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectProvider, setNewProjectProvider] = useState<AgentProvider>('codex');
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -24,6 +25,12 @@ export function ProjectControl() {
     }
   }, [showTokens]);
 
+  useEffect(() => {
+    if (user?.defaultAgentProvider) {
+      setNewProjectProvider(user.defaultAgentProvider);
+    }
+  }, [user?.defaultAgentProvider]);
+
   function agentSessionName(project: Project): string {
     return `${user?.unixUsername}-${project.name}-agent`;
   }
@@ -34,19 +41,40 @@ export function ProjectControl() {
     return STATUS_EMOJI[s?.status ?? 'not_running'];
   }
 
+  function persistedAgentProvider(project: Project): AgentProvider | null {
+    return project.workflows.find(w => w.type === 'agent')?.provider ?? null;
+  }
+
+  function displayAgentProvider(project: Project): AgentProvider | null {
+    const status = statusMap[agentSessionName(project)];
+    if (status?.source === 'codex-app-server' || status?.source === 'codex-jsonl') {
+      return 'codex';
+    }
+    return persistedAgentProvider(project);
+  }
+
+  function providerBadge(project: Project): string | null {
+    const provider = displayAgentProvider(project);
+    if (provider === 'codex') return 'CX';
+    if (provider === 'claude') return 'CL';
+    return null;
+  }
+
   async function createProject(e: React.FormEvent) {
     e.preventDefault();
     if (!newProjectName.trim()) return;
     try {
-      const project = await projectsApi.create({ name: newProjectName.trim() });
+      const project = await projectsApi.create({
+        name: newProjectName.trim(),
+        initialAgent: { enabled: true, provider: newProjectProvider },
+      });
       setNewProjectName('');
       setError('');
       await reloadProjects();
-      await projectsApi.addWorkflow(project.id, 'agent');
-      await reloadProjects();
       setActiveProject(project.id);
-    } catch {
-      setError('Failed to create project');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setError(msg || 'Failed to create project');
     }
   }
 
@@ -92,6 +120,16 @@ export function ProjectControl() {
     setTokens(prev => prev.filter(t => t.id !== id));
   }
 
+  async function saveDefaultAgent(provider: AgentProvider) {
+    try {
+      await updateDefaultAgentProvider(provider);
+      setNewProjectProvider(provider);
+      setError('');
+    } catch {
+      setError('Failed to save default agent');
+    }
+  }
+
   return (
     <div className="project-control">
       <div className="project-control-header">
@@ -125,14 +163,24 @@ export function ProjectControl() {
                   autoFocus
                 />
               ) : (
-                <span
-                  className="project-name"
-                  onDoubleClick={e => {
-                    e.stopPropagation();
-                    setRenamingId(p.id);
-                    setRenameValue(p.name);
-                  }}
-                >{p.name}</span>
+                <>
+                  <span
+                    className="project-name"
+                    onDoubleClick={e => {
+                      e.stopPropagation();
+                      setRenamingId(p.id);
+                      setRenameValue(p.name);
+                    }}
+                  >{p.name}</span>
+                  {providerBadge(p) && (
+                    <span
+                      className="project-provider-badge"
+                      title={`runtime: ${displayAgentProvider(p) ?? 'unknown'}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
+                    >
+                      {providerBadge(p)}
+                    </span>
+                  )}
+                </>
               )}
               <span className="project-actions" onClick={e => e.stopPropagation()}>
                 <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
@@ -146,6 +194,15 @@ export function ProjectControl() {
             onChange={e => setNewProjectName(e.target.value)}
             placeholder="new project"
           />
+          <select
+            className="inline-form-select"
+            value={newProjectProvider}
+            onChange={e => setNewProjectProvider(e.target.value as AgentProvider)}
+            title="Agent provider"
+          >
+            <option value="codex">Codex</option>
+            <option value="claude">Claude</option>
+          </select>
           <button type="submit">+</button>
         </form>
       </section>
@@ -185,6 +242,18 @@ export function ProjectControl() {
               />
               <button type="submit">+</button>
             </form>
+            <div className="inline-form" style={{ marginTop: 12 }}>
+              <label htmlFor="default-agent-provider">Default agent</label>
+              <select
+                className="inline-form-select"
+                id="default-agent-provider"
+                value={user?.defaultAgentProvider ?? 'codex'}
+                onChange={e => saveDefaultAgent(e.target.value as AgentProvider)}
+              >
+                <option value="codex">Codex</option>
+                <option value="claude">Claude</option>
+              </select>
+            </div>
           </>
         )}
       </section>

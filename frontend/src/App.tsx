@@ -9,6 +9,7 @@ import { UsageMini } from './components/UsageMini';
 import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
 import { Project } from './types';
+import { computeWarpWithFallback } from './utils/warp';
 
 function Login() {
   return (
@@ -38,16 +39,6 @@ function MainLayout() {
   const { user } = useAuthHook();
   const { projects, activeProjectId, statusMap } = useProjects();
 
-  const activeProject = projects.find(p => p.id === activeProjectId);
-  const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
-  const username = user?.unixUsername ?? '';
-
-  // Count how many agents are currently working
-  const workingCount = projects.filter(p => {
-    const agentSession = `${username}-${p.name}-agent`;
-    return statusMap[agentSession]?.status === 'working';
-  }).length;
-
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
   const [warpSpeed, setWarpSpeed] = useState(0.1);
@@ -58,7 +49,22 @@ function MainLayout() {
     typingTimer.current = setTimeout(() => setTyping(false), 1500);
   }, []);
 
-  const isActive = workingCount > 0 || typing;
+  const activeProject = projects.find(p => p.id === activeProjectId);
+  const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
+  const username = user?.unixUsername ?? '';
+
+  const projectAgentStatuses = Object.fromEntries(projects
+    .filter(p => p.workflows.some(w => w.type === 'agent'))
+    .map(p => {
+      const agentSession = `${username}-${p.name}-agent`;
+      return [agentSession, statusMap[agentSession]];
+    })
+    .filter(([, status]) => Boolean(status)));
+
+  const warpModel = computeWarpWithFallback(projectAgentStatuses, typing);
+  const activeCount = warpModel.workingCount + warpModel.waitingCount;
+
+  const isActive = warpModel.isActive;
   const warpStr = warpSpeed < 10 ? warpSpeed.toFixed(1) : Math.floor(warpSpeed).toString();
 
   // Responsive layout
@@ -74,7 +80,12 @@ function MainLayout() {
   return (
     <div className={`app-layout ${sidebarCollapsed ? 'sidebar-is-collapsed' : ''}`}>
       <div className="app-hyperspace-bg">
-        <Hyperspace activeCount={workingCount} typingBoost={typing} onWarpChange={setWarpSpeed} />
+        <Hyperspace
+          activeCount={activeCount}
+          typingBoost={typing}
+          targetWarp={warpModel.targetWarp}
+          onWarpChange={setWarpSpeed}
+        />
       </div>
       <UsageMini />
       <div className="warp-indicator" data-active={isActive || undefined}>

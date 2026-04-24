@@ -1,16 +1,17 @@
 # termag
 
-A workspace manager for running multiple AI coding agents in parallel. Provides a web UI for managing projects, viewing agent terminals, and monitoring usage, with Slack integration for remote control.
+A workspace manager for running multiple AI coding agents in parallel. Provides a web UI for managing projects, viewing agent terminals, choosing an agent runtime per project, and monitoring usage, with Slack integration for remote control.
 
 ## What it does
 
-Each project gets a paired set of tmux sessions — an **agent** pane (where Claude Code or other agents run) and a **ctrl** pane (a regular terminal for commands the agent can't run, like sudo or interactive auth). The web UI renders both terminals side-by-side with xterm.js and shows real-time agent status via Claude Code hooks.
+Each project gets a paired set of tmux sessions — an **agent** pane (where Codex, Claude Code, or other agents run) and a **ctrl** pane (a regular terminal for commands the agent can't run, like sudo or interactive auth). The web UI renders both terminals side-by-side with xterm.js and shows real-time agent status.
 
 ### Key features
 
 - **Multi-project management** — create, rename, archive projects; each gets its own tmux sessions and working directory
 - **Live terminal streaming** — xterm.js terminals connected via WebSocket to server-side PTYs attached to tmux
-- **Agent status tracking** — Claude Code hooks report working/waiting/idle status; shown as green/yellow/red indicators and a hyperspace animation that speeds up with activity
+- **Per-project agent choice** — choose `Codex` or `Claude` when creating a project, with a persisted per-user default
+- **Agent status tracking** — Claude Code hooks and Codex app-server status report working/waiting/idle state; shown as green/yellow/red indicators and a hyperspace animation that speeds up with activity
 - **Usage dashboard** — tracks API token usage and cost with a thermometer gauge (today vs 14-day trailing median) and expandable 30-day/7-day histograms
 - **Slack integration** — `/t` commands to view and control terminals from Slack; emoji reactions to respond to numbered prompts (e.g. react with :one: to send `1`)
 - **Slack notifications** — automatic pane capture posted to Slack when an agent needs input, with reaction hints for quick response
@@ -29,7 +30,8 @@ Express server (port 3040)
   └── PostgreSQL (Prisma ORM)
   ↕ WebSocket
 Per-user agent (node agent.js)
-  └── node-pty → tmux attach
+  ├── node-pty → tmux attach
+  └── Codex bridge processes (per Codex-backed agent session)
 ```
 
 ## Project structure
@@ -76,3 +78,16 @@ Key variables:
 - `SESSION_SECRET` — Express session secret
 - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — Slack bot
 - `ALLOWED_USERS` — comma-separated `email:unixuser` pairs
+
+## Agent providers
+
+`termag` now persists the selected agent provider on each `agent` workflow.
+
+- `codex` projects launch the managed Codex bridge and start `codex --remote` in the `*-agent` tmux pane
+- `claude` projects keep the existing Claude startup path
+- each user also has a saved `defaultAgentProvider`, used to initialize the create-project form
+
+The UI lets you:
+- choose `Codex` or `Claude` when creating a new project
+- change your default agent provider in the sidebar
+- see the current provider in the project list (`CX` / `CL`)

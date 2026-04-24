@@ -12,10 +12,11 @@ model User {
   googleId     String    @unique
   googleEmail  String    @unique
   unixUsername String    @unique
-  displayName    String
-  slackUserId    String?   @unique
-  discordUserId  String?   @unique
-  createdAt      DateTime  @default(now())
+  displayName   String
+  defaultAgentProvider AgentProvider @default(codex)
+  slackUserId   String?   @unique
+  discordUserId String?   @unique
+  createdAt     DateTime  @default(now())
 
   projects    Project[]
   agentTokens AgentToken[]
@@ -40,13 +41,14 @@ model AgentToken {
 }
 
 model Project {
-  id          String    @id @default(cuid())
-  name        String
-  description String?
-  color       String?   // hex color for UI differentiation
-  archived    Boolean   @default(false)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id             String    @id @default(cuid())
+  name           String
+  description    String?
+  color          String?   // hex color for UI differentiation
+  slackChannelId String?   // Slack channel ID (proj-<name>)
+  archived       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   userId    String
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -62,6 +64,7 @@ model Project {
 model Workflow {
   id        String       @id @default(cuid())
   type      WorkflowType
+  provider  AgentProvider?
   server    String       @default("localhost") // future: ssh to other servers
   createdAt DateTime     @default(now())
 
@@ -75,6 +78,11 @@ model Workflow {
 enum WorkflowType {
   agent
   data
+}
+
+enum AgentProvider {
+  claude
+  codex
 }
 
 

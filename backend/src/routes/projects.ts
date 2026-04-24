@@ -1,15 +1,22 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient, WorkflowType } from '@prisma/client';
+import { AgentProvider, PrismaClient, WorkflowType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth';
 import * as tmux from '../services/tmux';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { deleteStatus, setStatus, notifyStatusChange } from '../services/status';
+import { createProjectChannel } from '../slack/channels';
 import { rename } from 'fs/promises';
+import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
 
 const prisma = new PrismaClient();
 
 export function projectsRouter(): Router {
   const router = Router();
+
+  function normalizeProvider(provider?: AgentProvider | null, fallback?: AgentProvider | null): AgentProvider {
+    if (provider === 'claude' || provider === 'codex') return provider;
+    return resolveAgentProvider(undefined, fallback);
+  }
 
   const list: RequestHandler = async (req, res) => {
     try {
@@ -26,7 +33,12 @@ export function projectsRouter(): Router {
 
   const create: RequestHandler = async (req, res) => {
     try {
-      const { name, description, color } = req.body;
+      const { name, description, color, initialAgent } = req.body as {
+        name?: string;
+        description?: string;
+        color?: string;
+        initialAgent?: { enabled?: boolean; provider?: AgentProvider };
+      };
       if (!name) { res.status(400).json({ error: 'name required' }); return; }
 
       // Validate project name — safe for filesystem and tmux
@@ -45,6 +57,19 @@ export function projectsRouter(): Router {
           where: { id: archived.id },
           data: { archived: false, description, color },
         });
+        if (initialAgent?.enabled && !archived.workflows.some(w => w.type === 'agent')) {
+          const provider = normalizeProvider(initialAgent.provider, req.user!.defaultAgentProvider);
+          await prisma.workflow.create({
+            data: { projectId: archived.id, type: 'agent', provider },
+          });
+          await ensureAgentSessionsAndLaunch({
+            userId: req.user!.id,
+            unixUsername: req.user!.unixUsername,
+            projectName: name,
+            provider,
+          });
+        }
+
         const restored = await prisma.project.findUnique({
           where: { id: archived.id },
           include: { workflows: true },
@@ -60,10 +85,47 @@ export function projectsRouter(): Router {
         await tmux.ensureProjectDir(req.user!.unixUsername, name);
       }
 
+      const provider = initialAgent?.enabled
+        ? normalizeProvider(initialAgent.provider, req.user!.defaultAgentProvider)
+        : null;
+
       const project = await prisma.project.create({
-        data: { name, description, color, userId: req.user!.id },
+        data: {
+          name,
+          description,
+          color,
+          userId: req.user!.id,
+          workflows: initialAgent?.enabled
+            ? { create: { type: 'agent', provider: provider! } }
+            : undefined,
+        },
         include: { workflows: true },
       });
+
+      try {
+        if (provider) {
+          await ensureAgentSessionsAndLaunch({
+            userId: req.user!.id,
+            unixUsername: req.user!.unixUsername,
+            projectName: name,
+            provider,
+          });
+        }
+      } catch (err) {
+        await prisma.project.delete({ where: { id: project.id } }).catch(() => {});
+        throw err;
+      }
+
+      // Create Slack channel (fire-and-forget, non-blocking)
+      createProjectChannel(name, req.user!.slackUserId ?? undefined).then(channelId => {
+        if (channelId) {
+          prisma.project.update({
+            where: { id: project.id },
+            data: { slackChannelId: channelId },
+          }).catch(err => console.error('[PROJECTS] Failed to save channel ID:', err.message));
+        }
+      });
+
       res.status(201).json(project);
     } catch (err: unknown) {
       if ((err as { code?: string }).code === 'P2002') {
@@ -101,17 +163,16 @@ export function projectsRouter(): Router {
 
       // Kill all tmux sessions for this project — via agent if connected
       for (const wf of project.workflows) {
-        const mainRole = wf.type === 'agent' ? 'agent' as const : 'data' as const;
-        const ctrlRole = wf.type === 'agent' ? 'ctrl' as const : 'data-ctrl' as const;
-        const mainSession = tmux.sessionName(username, project.name, mainRole);
-        const ctrlSession = tmux.sessionName(username, project.name, ctrlRole);
-
-        if (isAgentConnected(req.user!.id)) {
-          await sendToAgent(req.user!.id, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
-          await sendToAgent(req.user!.id, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
+        if (wf.type === 'agent') {
+          await stopAgentSessions({
+            userId: req.user!.id,
+            unixUsername: username,
+            projectName: project.name,
+            provider: resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider),
+          });
         } else {
-          await tmux.killSession(mainSession);
-          await tmux.killSession(ctrlSession);
+          await tmux.killSession(tmux.sessionName(username, project.name, 'data'));
+          await tmux.killSession(tmux.sessionName(username, project.name, 'data-ctrl'));
         }
       }
 
@@ -132,44 +193,55 @@ export function projectsRouter(): Router {
 
   const addWorkflow: RequestHandler = async (req, res) => {
     try {
-      const { type } = req.body as { type: WorkflowType };
+      const { type, provider: providerInput } = req.body as {
+        type: WorkflowType;
+        provider?: AgentProvider;
+      };
       if (!['agent', 'data'].includes(type)) {
         res.status(400).json({ error: 'type must be agent or data' });
+        return;
+      }
+      if (type === 'data' && providerInput) {
+        res.status(400).json({ error: 'provider is only valid for agent workflows' });
         return;
       }
 
       const project = await prisma.project.findFirst({ where: { id: req.params.id, userId: req.user!.id } });
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
 
+      const provider = type === 'agent'
+        ? normalizeProvider(providerInput, req.user!.defaultAgentProvider)
+        : null;
+
       const workflow = await prisma.workflow.create({
-        data: { projectId: project.id, type },
+        data: { projectId: project.id, type, provider },
       });
 
-      const mainRole = type === 'agent' ? 'agent' as const : 'data' as const;
-      const ctrlRole = type === 'agent' ? 'ctrl' as const : 'data-ctrl' as const;
-      const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, mainRole);
-      const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, ctrlRole);
-
-      // Ensure project directory exists and (re)create tmux sessions there
-      // Ensure project directory and tmux sessions — via agent if connected, else direct
-      const projDir = tmux.projectDir(req.user!.unixUsername, project.name);
-
-      if (isAgentConnected(req.user!.id)) {
-        await sendToAgent(req.user!.id, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-        await sendToAgent(req.user!.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+      try {
         if (type === 'agent') {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await sendToAgent(req.user!.id, 'tmux-send-keys', { sessionName: mainSession, keys: 'claude', withEnter: true });
+          await ensureAgentSessionsAndLaunch({
+            userId: req.user!.id,
+            unixUsername: req.user!.unixUsername,
+            projectName: project.name,
+            provider: provider!,
+          });
+        } else {
+          const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data');
+          const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl');
+          const projDir = tmux.projectDir(req.user!.unixUsername, project.name);
+
+          if (isAgentConnected(req.user!.id)) {
+            await sendToAgent(req.user!.id, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+            await sendToAgent(req.user!.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          } else {
+            await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
+            await tmux.ensureSession(mainSession, projDir);
+            await tmux.ensureSession(ctrlSession, projDir);
+          }
         }
-      } else {
-        // Fallback: direct execution (backwards compat when no agent)
-        await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
-        const mainCreated = await tmux.ensureSession(mainSession, projDir);
-        await tmux.ensureSession(ctrlSession, projDir);
-        if (type === 'agent' && mainCreated) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await tmux.sendKeys(mainSession, 'claude');
-        }
+      } catch (err) {
+        await prisma.workflow.delete({ where: { id: workflow.id } }).catch(() => {});
+        throw err;
       }
 
       res.status(201).json(workflow);
@@ -185,15 +257,27 @@ export function projectsRouter(): Router {
   const removeWorkflow: RequestHandler = async (req, res) => {
     try {
       const type = req.params.type as WorkflowType;
-      const project = await prisma.project.findFirst({ where: { id: req.params.id, userId: req.user!.id } });
+      const project = await prisma.project.findFirst({
+        where: { id: req.params.id, userId: req.user!.id },
+        include: { workflows: true },
+      });
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      const workflow = project.workflows.find(w => w.type === type);
+      const provider = normalizeProvider(workflow?.provider, req.user!.defaultAgentProvider);
 
       await prisma.workflow.deleteMany({ where: { projectId: project.id, type } });
 
-      const mainRole = type === 'agent' ? 'agent' as const : 'data' as const;
-      const ctrlRole = type === 'agent' ? 'ctrl' as const : 'data-ctrl' as const;
-      await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, mainRole));
-      await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, ctrlRole));
+      if (type === 'agent') {
+        await stopAgentSessions({
+          userId: req.user!.id,
+          unixUsername: req.user!.unixUsername,
+          projectName: project.name,
+          provider,
+        });
+      } else {
+        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data'));
+        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl'));
+      }
 
       res.json({ ok: true });
     } catch {
@@ -221,11 +305,18 @@ export function projectsRouter(): Router {
       if (oldName === newName) { res.json({ ok: true }); return; }
 
       const username = req.user!.unixUsername;
+      const providerRestarts: Array<{ projectName: string; provider: AgentProvider }> = [];
 
       // Rename tmux sessions
       for (const wf of project.workflows) {
         const roles: Array<'agent' | 'ctrl' | 'data' | 'data-ctrl'> = wf.type === 'agent'
           ? ['agent', 'ctrl'] : ['data', 'data-ctrl'];
+        const provider = resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider);
+        if (wf.type === 'agent' && provider === 'codex' && isAgentConnected(req.user!.id)) {
+          await sendToAgent(req.user!.id, 'codex-session-stop', {
+            sessionName: tmux.sessionName(username, oldName, 'agent'),
+          }).catch(() => {});
+        }
         for (const role of roles) {
           const oldSession = tmux.sessionName(username, oldName, role);
           const newSession = tmux.sessionName(username, newName, role);
@@ -236,6 +327,12 @@ export function projectsRouter(): Router {
           deleteStatus(oldSession);
           setStatus(newSession, 'idle');
           notifyStatusChange(newSession);
+        }
+        if (wf.type === 'agent' && isAgentConnected(req.user!.id)) {
+          providerRestarts.push({
+            projectName: newName,
+            provider,
+          });
         }
       }
 
@@ -256,6 +353,16 @@ export function projectsRouter(): Router {
         where: { id: project.id },
         include: { workflows: true },
       });
+      for (const restart of providerRestarts) {
+        if (restart.provider === 'codex') {
+          await ensureAgentSessionsAndLaunch({
+            userId: req.user!.id,
+            unixUsername: username,
+            projectName: restart.projectName,
+            provider: restart.provider,
+          }).catch(() => {});
+        }
+      }
       res.json(updated);
     } catch (err: unknown) {
       if ((err as { code?: string }).code === 'P2002') {

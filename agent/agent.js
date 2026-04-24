@@ -19,6 +19,7 @@ const { mkdir } = require('fs/promises');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 
 const execAsync = promisify(exec);
 
@@ -101,9 +102,90 @@ async function scanUsage() {
 
 // Active PTY streams: streamId → { pty, tmuxSessionName }
 const streams = new Map();
+const codexBridges = new Map();
 
 function shellEscape(str) {
   return `'${str.replace(/'/g, "'\\''")}'`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getStatusEndpoint() {
+  try {
+    const wsUrl = new URL(termag_url);
+    wsUrl.protocol = wsUrl.protocol === 'wss:' ? 'https:' : 'http:';
+    wsUrl.pathname = wsUrl.pathname.replace(/\/ws\/agent$/, '/api/status');
+    wsUrl.search = '';
+    return wsUrl.toString();
+  } catch {
+    return 'http://127.0.0.1:3040/termag/api/status';
+  }
+}
+
+async function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : null;
+      server.close((err) => {
+        if (err) reject(err);
+        else if (!port) reject(new Error('Failed to allocate a free port'));
+        else resolve(port);
+      });
+    });
+  });
+}
+
+function stopCodexBridge(sessionName) {
+  const bridge = codexBridges.get(sessionName);
+  if (!bridge) return;
+  codexBridges.delete(sessionName);
+  try { bridge.child.kill('SIGTERM'); } catch { /* ignore */ }
+}
+
+async function startCodexSession(sessionName, cwd) {
+  stopCodexBridge(sessionName);
+
+  const port = await getFreePort();
+  const remoteUrl = `ws://127.0.0.1:${port}`;
+  const bridgePath = path.join(__dirname, 'codex-status-bridge.js');
+  const child = exec(
+    [
+      'node',
+      shellEscape(bridgePath),
+      '--session',
+      shellEscape(sessionName),
+      '--cwd',
+      shellEscape(cwd),
+      '--listen-port',
+      String(port),
+      '--listen-only',
+      '--status-endpoint',
+      shellEscape(getStatusEndpoint()),
+    ].join(' '),
+    { cwd, env: process.env },
+  );
+
+  codexBridges.set(sessionName, { child, port, remoteUrl });
+  child.on('exit', () => {
+    const current = codexBridges.get(sessionName);
+    if (current?.child === child) {
+      codexBridges.delete(sessionName);
+    }
+  });
+
+  await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} C-c`);
+  await wait(200);
+  await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${shellEscape('clear')} Enter`);
+  await wait(200);
+  const codexCmd = `codex --remote ${remoteUrl} --no-alt-screen -C ${shellEscape(cwd)} -a on-request`;
+  await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${shellEscape(codexCmd)} Enter`);
+  return { ok: true, remoteUrl, port };
 }
 
 function connect() {
@@ -152,6 +234,7 @@ function connect() {
 
         case 'tmux-kill': {
           const { sessionName } = msg;
+          stopCodexBridge(sessionName);
           try {
             await execAsync(`tmux kill-session -t ${shellEscape(sessionName)}`);
           } catch { /* may not exist */ }
@@ -182,6 +265,22 @@ function connect() {
         case 'mkdir': {
           const { dir } = msg;
           await mkdir(dir, { recursive: true });
+          respond(ws, requestId, { ok: true });
+          break;
+        }
+
+        case 'codex-session-start': {
+          const { sessionName, cwd } = msg;
+          if (!sessionName || !cwd) throw new Error('sessionName and cwd are required');
+          const result = await startCodexSession(sessionName, cwd);
+          respond(ws, requestId, result);
+          break;
+        }
+
+        case 'codex-session-stop': {
+          const { sessionName } = msg;
+          if (!sessionName) throw new Error('sessionName is required');
+          stopCodexBridge(sessionName);
           respond(ws, requestId, { ok: true });
           break;
         }
@@ -280,6 +379,9 @@ function connect() {
       stream.pty.kill();
     }
     streams.clear();
+    for (const sessionName of codexBridges.keys()) {
+      stopCodexBridge(sessionName);
+    }
     setTimeout(connect, reconnect_interval_seconds * 1000);
   });
 
@@ -307,6 +409,9 @@ process.on('SIGTERM', () => {
   for (const [, stream] of streams) {
     stream.pty.kill();
   }
+  for (const sessionName of codexBridges.keys()) {
+    stopCodexBridge(sessionName);
+  }
   process.exit(0);
 });
 
@@ -314,6 +419,9 @@ process.on('SIGINT', () => {
   console.log('[AGENT] Shutting down...');
   for (const [, stream] of streams) {
     stream.pty.kill();
+  }
+  for (const sessionName of codexBridges.keys()) {
+    stopCodexBridge(sessionName);
   }
   process.exit(0);
 });

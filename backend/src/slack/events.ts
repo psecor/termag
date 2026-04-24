@@ -25,6 +25,7 @@ import {
   capturePaneForSlack, formatPaneForSlack, pollUntilStable,
 } from '../services/tmux';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
+import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import {
   registerLocalSession, queueLocalCommand, isLocalSession,
   removeLocalSession, listLocalSessions, updateLocalSessionMessage,
@@ -361,22 +362,34 @@ export function registerEventHandlers(app: App): void {
 
         // Add agent workflow + tmux sessions
         await prisma.workflow.create({
-          data: { projectId: project.id, type: 'agent' },
+          data: { projectId: project.id, type: 'agent', provider: termagUser.defaultAgentProvider },
         });
-        const agentSession = sessionName(termagUser.unixUsername, projectName, 'agent');
-        const ctrlSession = sessionName(termagUser.unixUsername, projectName, 'ctrl');
 
         if (isAgentConnected(termagUser.id)) {
-          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: agentSession, cwd: projDir });
-          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await sendToAgent(termagUser.id, 'tmux-send-keys', { sessionName: agentSession, keys: 'claude', withEnter: true });
+          await ensureAgentSessionsAndLaunch({
+            userId: termagUser.id,
+            unixUsername: termagUser.unixUsername,
+            projectName,
+            provider: termagUser.defaultAgentProvider,
+          });
         } else {
           await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created but agent is not connected — tmux sessions not started.` });
           return;
         }
 
+        // Create Slack channel
+        const { createProjectChannel } = await import('./channels');
+        createProjectChannel(projectName, userId).then(channelId => {
+          if (channelId) {
+            prisma.project.update({
+              where: { id: project.id },
+              data: { slackChannelId: channelId },
+            }).catch(err => console.error('[SLACK] Failed to save channel ID:', err.message));
+          }
+        });
+
         setActiveProjectId(userId, project.id);
+        const agentSession = sessionName(termagUser.unixUsername, projectName, 'agent');
         setNotificationTarget(agentSession, { channel: command.channel_id, userId });
         await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created with agent workflow. Switched to it.` });
       } catch (err: unknown) {
@@ -474,12 +487,17 @@ export function registerEventHandlers(app: App): void {
     // ── /t ctrl <command> ──────────────────────────────
     if (userCommand.startsWith('ctrl')) {
       const ctrlCmd = userCommand.slice(4).trim();
-      const projectId = getActiveProjectId(userId);
+      // Resolve project: channel-based first, then active project
+      const channelProject = await prisma.project.findFirst({
+        where: { slackChannelId: command.channel_id, archived: false },
+        include: { user: true },
+      });
+      const projectId = channelProject?.id ?? getActiveProjectId(userId);
       if (!projectId) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <name>` first.' });
+        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <name>` or run from a project channel.' });
         return;
       }
-      const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+      const project = channelProject ?? await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
       if (!project) { await client.chat.postMessage({ channel: command.channel_id, text: 'Project not found.' }); return; }
 
       const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl');
@@ -550,29 +568,38 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── Default: send to active project's agent session ─
-    const projectId = getActiveProjectId(userId);
+    // Resolve project: channel-based first, then active project, then auto-select
+    const channelProject = await prisma.project.findFirst({
+      where: { slackChannelId: command.channel_id, archived: false },
+      include: { user: true },
+    });
     let agentSession: string;
 
-    if (projectId) {
-      const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
-      if (project) {
-        agentSession = sessionName(project.user.unixUsername, project.name, 'agent');
-      } else {
-        agentSession = `term-${userId}`;
-      }
+    if (channelProject) {
+      agentSession = sessionName(channelProject.user.unixUsername, channelProject.name, 'agent');
     } else {
-      // No active project — try to auto-select the first one (user's own projects only)
-      const first = await prisma.project.findFirst({
-        where: { archived: false, workflows: { some: { type: 'agent' } }, ...(termagUser ? { userId: termagUser.id } : {}) },
-        include: { user: true },
-        orderBy: { name: 'asc' },
-      });
-      if (first) {
-        setActiveProjectId(userId, first.id);
-        agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
+      const projectId = getActiveProjectId(userId);
+      if (projectId) {
+        const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+        if (project) {
+          agentSession = sessionName(project.user.unixUsername, project.name, 'agent');
+        } else {
+          agentSession = `term-${userId}`;
+        }
       } else {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No projects with agent workflows. Create one in the termag UI.' });
-        return;
+        // No active project — try to auto-select the first one (user's own projects only)
+        const first = await prisma.project.findFirst({
+          where: { archived: false, workflows: { some: { type: 'agent' } }, ...(termagUser ? { userId: termagUser.id } : {}) },
+          include: { user: true },
+          orderBy: { name: 'asc' },
+        });
+        if (first) {
+          setActiveProjectId(userId, first.id);
+          agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
+        } else {
+          await client.chat.postMessage({ channel: command.channel_id, text: 'No projects with agent workflows. Create one in the termag UI.' });
+          return;
+        }
       }
     }
 

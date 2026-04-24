@@ -1,7 +1,7 @@
 import { Router, RequestHandler } from 'express';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
-import { PrismaClient } from '@prisma/client';
+import { AgentProvider, PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -105,11 +105,41 @@ export function authRouter(): Router {
       email: req.user.googleEmail,
       displayName: req.user.displayName,
       unixUsername: req.user.unixUsername,
+      defaultAgentProvider: req.user.defaultAgentProvider,
+    });
+  };
+
+  const updatePreferences: RequestHandler = async (req, res) => {
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { defaultAgentProvider } = req.body as { defaultAgentProvider?: AgentProvider };
+    if (!defaultAgentProvider || !['claude', 'codex'].includes(defaultAgentProvider)) {
+      res.status(400).json({ error: 'defaultAgentProvider must be claude or codex' });
+      return;
+    }
+
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { defaultAgentProvider },
+    });
+
+    req.user.defaultAgentProvider = user.defaultAgentProvider;
+
+    res.json({
+      id: user.id,
+      email: user.googleEmail,
+      displayName: user.displayName,
+      unixUsername: user.unixUsername,
+      defaultAgentProvider: user.defaultAgentProvider,
     });
   };
 
   router.post('/logout', logout);
   router.get('/me', me);
+  router.put('/me/preferences', updatePreferences);
 
   return router;
 }

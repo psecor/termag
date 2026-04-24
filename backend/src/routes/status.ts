@@ -20,11 +20,17 @@ export function statusRouter(): Router {
   const router = Router();
 
   const postStatus: RequestHandler = async (req, res) => {
-    const { session, status, message, notify } = req.body as {
+    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId } = req.body as {
       session?: string;
       status?: AgentStatus['status'];
       message?: string;
       notify?: boolean;
+      source?: AgentStatus['source'];
+      waitingReason?: AgentStatus['waitingReason'];
+      activityScore?: number;
+      tokenBurst?: number;
+      activeTurn?: boolean;
+      threadId?: string;
     };
 
     if (!session || !status) {
@@ -38,9 +44,17 @@ export function statusRouter(): Router {
       return;
     }
 
-    console.log(`[STATUS] POST session=${session} status=${status} notify=${notify} message=${message?.slice(0, 50)}`);
+    console.log(`[STATUS] POST session=${session} status=${status} notify=${notify} source=${source ?? 'unknown'} waitingReason=${waitingReason ?? 'null'} message=${message?.slice(0, 50)}`);
 
-    const updated = setStatus(session, status, message);
+    const updated = setStatus(session, status, {
+      message,
+      source,
+      waitingReason,
+      activityScore,
+      tokenBurst,
+      activeTurn,
+      threadId,
+    });
     notifyStatusChange(session);
 
     // Track working duration

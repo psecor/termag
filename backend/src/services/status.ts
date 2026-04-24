@@ -8,6 +8,8 @@ const statusMap: StatusMap = new Map();
 const AUTO_IDLE_MS = 5 * 60 * 1000;
 const autoIdleTimers = new Map<string, NodeJS.Timeout>();
 
+type AgentStatusMeta = Omit<Partial<AgentStatus>, 'status' | 'updatedAt'>;
+
 export function getStatus(sessionName: string): AgentStatus {
   return statusMap.get(sessionName) ?? { status: 'not_running', updatedAt: new Date() };
 }
@@ -19,9 +21,24 @@ export function getAllStatuses(): Map<string, AgentStatus> {
 export function setStatus(
   sessionName: string,
   status: AgentStatus['status'],
-  message?: string
+  messageOrMeta?: string | AgentStatusMeta,
+  metaMaybe?: AgentStatusMeta,
 ): AgentStatus {
-  const entry: AgentStatus = { status, updatedAt: new Date(), message };
+  const meta = typeof messageOrMeta === 'string'
+    ? { ...(metaMaybe || {}), message: messageOrMeta }
+    : (messageOrMeta || {});
+
+  const entry: AgentStatus = {
+    status,
+    updatedAt: new Date(),
+    message: meta.message,
+    source: meta.source,
+    waitingReason: meta.waitingReason,
+    activityScore: meta.activityScore,
+    tokenBurst: meta.tokenBurst,
+    activeTurn: meta.activeTurn,
+    threadId: meta.threadId,
+  };
   statusMap.set(sessionName, entry);
 
   // Clear previous auto-idle timer
@@ -33,7 +50,17 @@ export function setStatus(
     const timer = setTimeout(() => {
       const current = statusMap.get(sessionName);
       if (current?.status === 'working') {
-        statusMap.set(sessionName, { status: 'idle', updatedAt: new Date() });
+        statusMap.set(sessionName, {
+          status: 'idle',
+          updatedAt: new Date(),
+          message: 'Auto-idled after inactivity',
+          source: current.source,
+          waitingReason: null,
+          activityScore: 0,
+          tokenBurst: current.tokenBurst,
+          activeTurn: false,
+          threadId: current.threadId,
+        });
         onStatusChange?.(sessionName);
       }
     }, AUTO_IDLE_MS);

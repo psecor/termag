@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, BrowserTab, ChromeWindow, WorkflowType } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -7,14 +7,21 @@ const api = axios.create({
 });
 
 export const authApi = {
-  me: () => api.get('/auth/me').then(r => r.data),
+  me: (): Promise<User> => api.get('/auth/me').then(r => r.data),
   logout: () => api.post('/auth/logout').then(r => r.data),
+  updatePreferences: (data: { defaultAgentProvider: AgentProvider }): Promise<User> =>
+    api.put('/auth/me/preferences', data).then(r => r.data),
   loginUrl: () => '/termag/auth/google',
 };
 
 export const projectsApi = {
   list: (): Promise<Project[]> => api.get('/api/projects').then(r => r.data),
-  create: (data: { name: string; description?: string; color?: string }) =>
+  create: (data: {
+    name: string;
+    description?: string;
+    color?: string;
+    initialAgent?: { enabled: boolean; provider: AgentProvider };
+  }) =>
     api.post('/api/projects', data).then(r => r.data),
   update: (id: string, data: Partial<{ name: string; description: string; color: string }>) =>
     api.put(`/api/projects/${id}`, data).then(r => r.data),
@@ -22,8 +29,8 @@ export const projectsApi = {
     api.post(`/api/projects/${id}/rename`, { name }).then(r => r.data),
   archive: (id: string) =>
     api.post(`/api/projects/${id}/archive`).then(r => r.data),
-  addWorkflow: (projectId: string, type: WorkflowType) =>
-    api.post(`/api/projects/${projectId}/workflows`, { type }).then(r => r.data),
+  addWorkflow: (projectId: string, type: WorkflowType, provider?: AgentProvider) =>
+    api.post(`/api/projects/${projectId}/workflows`, { type, provider }).then(r => r.data),
   removeWorkflow: (projectId: string, type: WorkflowType) =>
     api.delete(`/api/projects/${projectId}/workflows/${type}`).then(r => r.data),
 };

@@ -15,6 +15,7 @@ import {
 import { setNotificationTarget } from '../slack/lts';
 import { getActiveProjectId, setActiveProjectId } from '../slack/events';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
+import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 
 const prisma = new PrismaClient();
 
@@ -140,20 +141,32 @@ export function registerDiscordEvents(client: Client): void {
         });
 
         await prisma.workflow.create({
-          data: { projectId: project.id, type: 'agent' },
+          data: { projectId: project.id, type: 'agent', provider: termagUser.defaultAgentProvider },
         });
         const agentSession = sessionName(username, projectName, 'agent');
-        const ctrlSession = sessionName(username, projectName, 'ctrl');
 
         if (isAgentConnected(termagUser.id)) {
-          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: agentSession, cwd: projDir });
-          await sendToAgent(termagUser.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
-          await new Promise(resolve => setTimeout(resolve, 500));
-          await sendToAgent(termagUser.id, 'tmux-send-keys', { sessionName: agentSession, keys: 'claude', withEnter: true });
+          await ensureAgentSessionsAndLaunch({
+            userId: termagUser.id,
+            unixUsername: username,
+            projectName,
+            provider: termagUser.defaultAgentProvider,
+          });
         } else {
           await interaction.reply(`Project \`${projectName}\` created but agent is not connected — tmux sessions not started.`);
           return;
         }
+
+        // Create Slack channel (if Slack is configured)
+        const { createProjectChannel } = await import('../slack/channels');
+        createProjectChannel(projectName, termagUser.slackUserId ?? undefined).then(channelId => {
+          if (channelId) {
+            prisma.project.update({
+              where: { id: project.id },
+              data: { slackChannelId: channelId },
+            }).catch(err => console.error('[DISCORD] Failed to save channel ID:', err.message));
+          }
+        });
 
         setActiveProjectId(discordUserId, project.id);
         setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord');

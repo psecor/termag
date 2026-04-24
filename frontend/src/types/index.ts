@@ -3,13 +3,16 @@ export interface User {
   email: string;
   displayName: string;
   unixUsername: string;
+  defaultAgentProvider: AgentProvider;
 }
 
 export type WorkflowType = 'agent' | 'data';
+export type AgentProvider = 'codex' | 'claude';
 
 export interface Workflow {
   id: string;
   type: WorkflowType;
+  provider?: AgentProvider | null;
   server: string;
   projectId: string;
 }
@@ -44,6 +47,12 @@ export interface AgentStatus {
   status: AgentStatusValue;
   updatedAt: string;
   message?: string;
+  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback';
+  waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
+  activityScore?: number;
+  tokenBurst?: number;
+  activeTurn?: boolean;
+  threadId?: string;
 }
 
 // Keyed by tmux session name

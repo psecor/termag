@@ -3,15 +3,18 @@ import React, { useEffect, useRef } from 'react';
 interface HyperspaceProps {
   activeCount: number;
   typingBoost?: boolean;
+  targetWarp?: number;
   onWarpChange?: (warp: number) => void;
 }
 
-export function Hyperspace({ activeCount, typingBoost, onWarpChange }: HyperspaceProps) {
+export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange }: HyperspaceProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const activeCountRef = useRef(activeCount);
   activeCountRef.current = activeCount;
   const typingRef = useRef(typingBoost ?? false);
   typingRef.current = typingBoost ?? false;
+  const targetWarpRef = useRef(targetWarp);
+  targetWarpRef.current = targetWarp;
   const warpRef = useRef(0.1);
   const onWarpChangeRef = useRef(onWarpChange);
   onWarpChangeRef.current = onWarpChange;
@@ -52,13 +55,13 @@ export function Hyperspace({ activeCount, typingBoost, onWarpChange }: Hyperspac
       const h = canvas!.height;
       const count = activeCountRef.current;
 
-      const baseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
-      const speed = baseSpeed + (typingRef.current ? Math.max(0.8, baseSpeed * 0.5) : 0);
+      const fallbackBaseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
+      const fallbackSpeed = fallbackBaseSpeed + (typingRef.current ? Math.max(0.8, fallbackBaseSpeed * 0.5) : 0);
+      const fallbackWarp = fallbackSpeed <= 0.4 ? 0.1 : fallbackSpeed * 0.5;
+      const requestedWarp = typeof targetWarpRef.current === 'number' ? targetWarpRef.current : fallbackWarp;
+      const speed = requestedWarp <= 0.1 ? 0.4 : requestedWarp * 2;
 
-      // Map speed to a "warp factor" in units of c
-      // idle=0.4→0.1c, typing=0.6→0.3c, 1 agent=2.4→1.2c, 1 agent+typing=3.6→1.8c
-      const targetWarp = speed <= 0.4 ? 0.1 : speed * 0.5;
-      warpRef.current += (targetWarp - warpRef.current) * 0.15;
+      warpRef.current += (requestedWarp - warpRef.current) * 0.15;
 
       // Push warp to parent at ~10fps
       const now = Date.now();
