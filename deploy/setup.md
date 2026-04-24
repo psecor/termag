@@ -131,8 +131,8 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 
 1. Create a Slack app at https://api.slack.com/apps
 2. Enable Socket Mode
-3. Add Bot Token Scopes: `chat:write`, `commands`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`
-4. Subscribe to bot events: `app_home_opened`, `message.im`, `reaction_added`
+3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `channels:manage`, `channels:read`, `commands`, `im:history`, `im:read`, `im:write`, `files:read`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`
+4. Subscribe to bot events: `app_home_opened`, `app_mention`, `message.im`, `reaction_added`
 5. Add slash command: `/t`
 6. Install to workspace
 
@@ -141,10 +141,20 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 - `/t` — capture and post the active agent's terminal pane
 - `/t <command>` — send a command to the agent terminal, then poll for output
 - `/t !<keys>` — send keystrokes without Enter (e.g. `/t !2` for numbered prompts)
+- `/t create <name>` — create a new project with agent workflow, tmux sessions, and Slack channel
 - `/t switch <project>` — switch active project
 - `/t attach <session>` — attach to a specific tmux session
 - `/t ctrl` — capture the ctrl terminal pane
 - `/t ctrl <command>` — send a command to the ctrl terminal
+- `/t projects` — list projects
+- `/t ls` — list tmux sessions
+
+### Slack channel routing
+
+Projects automatically get a `#proj-<name>` Slack channel on creation. When you
+run `/t` commands inside a project channel, termag routes to that project
+automatically — no `/t switch` needed. The `switch` and `attach` commands remain
+for use in DMs or non-project channels.
 
 ### Emoji reactions
 
@@ -182,6 +192,7 @@ The `/t` slash command mirrors all Slack subcommands:
 - `/t` — capture and post the active agent's terminal pane
 - `/t <command>` — send a command to the agent terminal, then poll for output
 - `/t !<keys>` — send keystrokes without Enter
+- `/t create <name>` — create a new project with agent workflow and tmux sessions
 - `/t switch <project>` — switch active project
 - `/t attach <session>` — attach to a specific tmux session
 - `/t ctrl` — capture the ctrl terminal pane

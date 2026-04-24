@@ -57,6 +57,7 @@ export function ProjectControl() {
     const provider = displayAgentProvider(project);
     if (provider === 'codex') return 'CX';
     if (provider === 'claude') return 'CL';
+    if (provider === 'cursor') return 'CR';
     return null;
   }
 
@@ -202,6 +203,7 @@ export function ProjectControl() {
           >
             <option value="codex">Codex</option>
             <option value="claude">Claude</option>
+            <option value="cursor">Cursor</option>
           </select>
           <button type="submit">+</button>
         </form>

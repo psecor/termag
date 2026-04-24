@@ -55,9 +55,12 @@ export async function recreateSession(name: string, cwd: string): Promise<void> 
 }
 
 export async function sendKeys(name: string, command: string, withEnter: boolean = true): Promise<void> {
+  const target = shellEscape(name);
   const escaped = shellEscape(command.replace(/'/g, "'\\''"));
-  const keys = withEnter ? `${escaped} Enter` : escaped;
-  await execAsync(`tmux send-keys -t ${shellEscape(name)} ${keys}`);
+  await execAsync(`tmux send-keys -t ${target} -l ${escaped}`);
+  if (withEnter) {
+    await execAsync(`tmux send-keys -t ${target} Enter`);
+  }
 }
 
 export async function capturePaneText(name: string): Promise<string> {
@@ -87,9 +90,9 @@ export async function foregroundCommand(name: string): Promise<string | null> {
 export async function isAgentRunning(name: string): Promise<boolean> {
   const cmd = await foregroundCommand(name);
   if (!cmd) return false;
-  return ['claude', 'codex', 'auggie', 'node', 'python'].some(a =>
-    cmd.toLowerCase().includes(a)
-  );
+  const lc = cmd.toLowerCase();
+  return ['claude', 'codex', 'auggie', 'node', 'python'].some(a => lc.includes(a))
+    || lc === 'agent';
 }
 
 export async function listSessions(): Promise<string[]> {

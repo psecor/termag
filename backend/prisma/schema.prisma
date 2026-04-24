@@ -83,6 +83,7 @@ enum WorkflowType {
 enum AgentProvider {
   claude
   codex
+  cursor
 }
 
 

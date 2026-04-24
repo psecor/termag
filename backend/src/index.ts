@@ -25,6 +25,7 @@ import {
   sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
 } from './services/agentRegistry';
 import { PrismaClient } from '@prisma/client';
+import { startCursorPoller } from './services/cursorStatus';
 
 const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
@@ -270,6 +271,7 @@ setStatusChangeCallback((sessionName: string) => {
 // --- Start ---
 server.listen(PORT, () => {
   console.log(`termag backend running on port ${PORT} at ${BASE_PATH}`);
+  startCursorPoller().catch(err => console.error('[CURSOR-POLLER] Failed to start:', err));
 });
 
 function shutdown() {

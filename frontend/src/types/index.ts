@@ -7,7 +7,7 @@ export interface User {
 }
 
 export type WorkflowType = 'agent' | 'data';
-export type AgentProvider = 'codex' | 'claude';
+export type AgentProvider = 'codex' | 'claude' | 'cursor';
 
 export interface Workflow {
   id: string;
@@ -47,7 +47,7 @@ export interface AgentStatus {
   status: AgentStatusValue;
   updatedAt: string;
   message?: string;
-  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback';
+  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback' | 'tmux-poller';
   waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
   activityScore?: number;
   tokenBurst?: number;

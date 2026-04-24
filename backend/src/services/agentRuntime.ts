@@ -1,6 +1,7 @@
 import { AgentProvider } from '@prisma/client';
 import * as tmux from './tmux';
 import { isAgentConnected, sendToAgent } from './agentRegistry';
+import { registerCursorSession, unregisterCursorSession } from './cursorStatus';
 
 export function resolveAgentProvider(
   workflowProvider?: AgentProvider | null,
@@ -34,7 +35,12 @@ export async function ensureAgentSessionsAndLaunch({
     if (provider === 'codex') {
       await sendToAgent(userId, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
     } else {
-      await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: 'claude', withEnter: true });
+      const cmd = provider === 'cursor' ? 'agent' : 'claude';
+      await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: cmd, withEnter: true });
+    }
+
+    if (provider === 'cursor') {
+      registerCursorSession(mainSession);
     }
     return;
   }
@@ -48,8 +54,14 @@ export async function ensureAgentSessionsAndLaunch({
   await new Promise(resolve => setTimeout(resolve, 500));
   if (provider === 'codex') {
     await tmux.sendKeys(mainSession, 'codex --no-alt-screen -a on-request');
+  } else if (provider === 'cursor') {
+    await tmux.sendKeys(mainSession, 'agent');
   } else {
     await tmux.sendKeys(mainSession, 'claude');
+  }
+
+  if (provider === 'cursor') {
+    registerCursorSession(mainSession);
   }
 }
 
@@ -61,6 +73,10 @@ export async function stopAgentSessions({
 }: AgentRuntimeContext): Promise<void> {
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
+
+  if (provider === 'cursor') {
+    unregisterCursorSession(mainSession);
+  }
 
   if (isAgentConnected(userId)) {
     if (provider === 'codex') {

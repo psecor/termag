@@ -14,7 +14,7 @@ export function projectsRouter(): Router {
   const router = Router();
 
   function normalizeProvider(provider?: AgentProvider | null, fallback?: AgentProvider | null): AgentProvider {
-    if (provider === 'claude' || provider === 'codex') return provider;
+    if (provider === 'claude' || provider === 'codex' || provider === 'cursor') return provider;
     return resolveAgentProvider(undefined, fallback);
   }
 

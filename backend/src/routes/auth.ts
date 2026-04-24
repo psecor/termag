@@ -116,8 +116,8 @@ export function authRouter(): Router {
     }
 
     const { defaultAgentProvider } = req.body as { defaultAgentProvider?: AgentProvider };
-    if (!defaultAgentProvider || !['claude', 'codex'].includes(defaultAgentProvider)) {
-      res.status(400).json({ error: 'defaultAgentProvider must be claude or codex' });
+    if (!defaultAgentProvider || !['claude', 'codex', 'cursor'].includes(defaultAgentProvider)) {
+      res.status(400).json({ error: 'defaultAgentProvider must be claude, codex, or cursor' });
       return;
     }
 

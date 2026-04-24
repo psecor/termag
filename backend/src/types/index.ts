@@ -9,7 +9,7 @@ declare global {
       googleEmail: string;
       unixUsername: string;
       displayName: string;
-      defaultAgentProvider: 'claude' | 'codex';
+      defaultAgentProvider: 'claude' | 'codex' | 'cursor';
       slackUserId: string | null;
       discordUserId: string | null;
       createdAt: Date;
@@ -28,7 +28,7 @@ export interface AgentStatus {
   status: 'working' | 'waiting' | 'idle' | 'not_running';
   updatedAt: Date;
   message?: string;
-  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback';
+  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback' | 'tmux-poller';
   waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
   activityScore?: number;
   tokenBurst?: number;
