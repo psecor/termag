@@ -131,15 +131,30 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
+function sessionUserId(req: import('http').IncomingMessage): string | null {
+  const sessionUser = (req as any).session?.passport?.user;
+  return typeof sessionUser === 'string' && sessionUser ? sessionUser : null;
+}
+
+function sessionBelongsToUser(sessionName: string, unixUsername: string): boolean {
+  return sessionName === unixUsername || sessionName.startsWith(`${unixUsername}-`);
+}
+
 // Status push: track all connected status clients
-const statusClients = new Set<WebSocket>();
+const statusClients = new Map<WebSocket, { unixUsername: string }>();
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url ?? '', `http://localhost`);
   const path = url.pathname;
+  const loggedInUserId = sessionUserId(req);
 
   // Terminal WebSocket: /termag/ws/terminal?session=username-project-agent
   if (path === `${BASE_PATH}/ws/terminal`) {
+    if (!loggedInUserId) {
+      ws.close(1008, 'login required');
+      return;
+    }
+
     const tmuxSession = url.searchParams.get('session');
     if (!tmuxSession) {
       ws.close(1008, 'session param required');
@@ -161,6 +176,11 @@ wss.on('connection', (ws, req) => {
         console.log(`[TERMINAL] No user found for username: ${username}`);
         ws.send(JSON.stringify({ type: 'output', data: `\r\nNo termag user "${username}"\r\n` }));
         ws.close(1008, 'unknown user');
+        return;
+      }
+
+      if (user.id !== loggedInUserId) {
+        ws.close(1008, 'session forbidden');
         return;
       }
 
@@ -216,13 +236,30 @@ wss.on('connection', (ws, req) => {
 
   // Status WebSocket: /termag/ws/status — receives status push events
   if (path === `${BASE_PATH}/ws/status`) {
-    statusClients.add(ws);
-    console.log(`[STATUS] Client connected (total: ${statusClients.size})`);
-
-    // Send all current statuses so the client starts with the right state
-    for (const [session, status] of getAllStatuses()) {
-      ws.send(JSON.stringify({ type: 'status', session, ...status }));
+    if (!loggedInUserId) {
+      ws.close(1008, 'login required');
+      return;
     }
+
+    prismaIndex.user.findUnique({ where: { id: loggedInUserId } }).then((user) => {
+      if (!user) {
+        ws.close(1008, 'unknown user');
+        return;
+      }
+
+      statusClients.set(ws, { unixUsername: user.unixUsername });
+      console.log(`[STATUS] Client connected for ${user.unixUsername} (total: ${statusClients.size})`);
+
+      // Send current statuses for this user so the client starts with the right state
+      for (const [session, status] of getAllStatuses()) {
+        if (sessionBelongsToUser(session, user.unixUsername)) {
+          ws.send(JSON.stringify({ type: 'status', session, ...status }));
+        }
+      }
+    }).catch(() => {
+      ws.close(1008, 'auth error');
+    });
+
 
     ws.on('close', () => {
       statusClients.delete(ws);
@@ -261,9 +298,11 @@ setStatusChangeCallback((sessionName: string) => {
     ...getStatus(sessionName),
   });
   console.log(`[STATUS] Push ${sessionName} to ${statusClients.size} clients`);
-  for (const client of statusClients) {
+  for (const [client, clientInfo] of statusClients) {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
+      if (sessionBelongsToUser(sessionName, clientInfo.unixUsername)) {
+        client.send(payload);
+      }
     }
   }
 });
