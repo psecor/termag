@@ -1,23 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { usageApi, UsageDayData } from '../services/api';
+import { usageApi, UsageDayData, UsageResponse } from '../services/api';
 
-// Opus pricing per million tokens
-const PRICE_INPUT = 15;
-const PRICE_OUTPUT = 75;
-const PRICE_CACHE_READ = 1.875;
-const PRICE_CACHE_CREATE = 3.75;
-
-function dayCost(d: UsageDayData): number {
-  return (
-    (d.input * PRICE_INPUT +
-      d.output * PRICE_OUTPUT +
-      d.cacheRead * PRICE_CACHE_READ +
-      d.cacheCreate * PRICE_CACHE_CREATE) / 1_000_000
-  );
-}
-
-function fmt$(n: number): string {
-  return n < 10 ? `$${n.toFixed(2)}` : `$${Math.round(n)}`;
+function dayTokens(d: UsageDayData): number {
+  return d.input + d.output + d.cacheRead + d.cacheCreate;
 }
 
 function fmtK(n: number): string {
@@ -54,26 +39,27 @@ const EMPTY: UsageDayData = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0,
 // Gradation marks for the thermometer (bottom to top)
 const GRAD_MARKS = [25, 50, 75, 100, 125, 150, 200];
 
-// Fill gradient: dark blue below 100%, brighter blue above
-function fillGradient(pct: number): string {
+// Provider colors
+const CLAUDE_COLOR = { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' };
+const CODEX_COLOR = { base: 'rgba(35, 170, 100, 0.6)', bright: 'rgba(72, 220, 140, 0.9)' };
+
+function fillGradient(pct: number, color: { base: string; bright: string }): string {
   const fillPct = Math.min(200, pct);
-  const midPoint = (100 / fillPct) * 100; // where 100% mark sits in the fill
-  if (fillPct <= 100) {
-    return 'rgba(31, 111, 235, 0.6)';
-  }
-  // Gradient from dark blue at bottom to bright blue at top
-  return `linear-gradient(to top, rgba(31, 111, 235, 0.5) 0%, rgba(31, 111, 235, 0.6) ${midPoint}%, rgba(88, 166, 255, 0.9) 100%)`;
+  const midPoint = (100 / fillPct) * 100;
+  if (fillPct <= 100) return color.base;
+  return `linear-gradient(to top, ${color.base} 0%, ${color.base} ${midPoint}%, ${color.bright} 100%)`;
 }
 
 // ── Bar Chart (used in expanded overlay) ─────────────────────
 
 interface BarChartProps {
   days: string[];
-  data: Record<string, UsageDayData>;
+  claudeData: Record<string, UsageDayData>;
+  codexData: Record<string, UsageDayData>;
   height: number;
 }
 
-function BarChart({ days, data, height }: BarChartProps) {
+function BarChart({ days, claudeData, codexData, height }: BarChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -89,17 +75,12 @@ function BarChart({ days, data, height }: BarChartProps) {
     canvas.height = h * dpr;
     ctx.scale(dpr, dpr);
 
-    const costs = days.map(d => {
-      const dd = data[d] || EMPTY;
-      return {
-        output: (dd.output * PRICE_OUTPUT) / 1_000_000,
-        input: (dd.input * PRICE_INPUT) / 1_000_000,
-        cacheRead: (dd.cacheRead * PRICE_CACHE_READ) / 1_000_000,
-        cacheCreate: (dd.cacheCreate * PRICE_CACHE_CREATE) / 1_000_000,
-      };
-    });
+    const perDay = days.map(d => ({
+      claude: dayTokens(claudeData[d] || EMPTY),
+      codex: dayTokens(codexData[d] || EMPTY),
+    }));
 
-    const maxCost = Math.max(1, ...costs.map(c => c.output + c.input + c.cacheRead + c.cacheCreate));
+    const maxTok = Math.max(1, ...perDay.map(t => t.claude + t.codex));
     const gap = 2;
     const barW = Math.max(2, (w - gap * (days.length - 1)) / days.length);
 
@@ -107,16 +88,15 @@ function BarChart({ days, data, height }: BarChartProps) {
 
     for (let i = 0; i < days.length; i++) {
       const x = i * (barW + gap);
-      const c = costs[i];
-      const total = c.cacheRead + c.cacheCreate + c.input + c.output;
-      const barH = (total / maxCost) * (h - 1);
+      const t = perDay[i];
+      const total = t.claude + t.codex;
+      const barH = (total / maxTok) * (h - 1);
 
       let y = h;
+      // Codex on bottom (green), Claude on top (blue)
       const segments = [
-        { val: c.cacheRead, color: 'rgba(88, 166, 255, 0.25)' },
-        { val: c.cacheCreate, color: 'rgba(88, 166, 255, 0.4)' },
-        { val: c.input, color: 'rgba(88, 166, 255, 0.6)' },
-        { val: c.output, color: 'rgba(88, 166, 255, 0.9)' },
+        { val: t.codex, color: CODEX_COLOR.base },
+        { val: t.claude, color: CLAUDE_COLOR.base },
       ];
 
       for (const seg of segments) {
@@ -127,7 +107,7 @@ function BarChart({ days, data, height }: BarChartProps) {
         ctx.fillRect(x, y, barW, segH);
       }
     }
-  }, [days, data]);
+  }, [days, claudeData, codexData]);
 
   return (
     <canvas
@@ -137,19 +117,50 @@ function BarChart({ days, data, height }: BarChartProps) {
   );
 }
 
+// ── Thermometer Tube ─────────────────────────────────────────
+
+interface ThermoTubeProps {
+  pct: number;
+  color: { base: string; bright: string };
+  label: string;
+}
+
+function ThermoTube({ pct, color, label }: ThermoTubeProps) {
+  const fillPct = Math.min(200, pct);
+  return (
+    <div className="usage-thermo-tube">
+      <div className="usage-thermo-fill" style={{
+        height: `${(fillPct / 200) * 100}%`,
+        background: fillGradient(pct, color),
+      }} />
+      <div className="usage-thermo-tube-label">{label}</div>
+    </div>
+  );
+}
+
 // ── Main Component ───────────────────────────────────────────
 
 export function UsageMini() {
-  const [data, setData] = useState<Record<string, UsageDayData> | null>(null);
+  const [response, setResponse] = useState<UsageResponse | null>(null);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const load = () => usageApi.get()
-      .then(r => { console.log('[UsageMini] loaded', Object.keys(r.days || {}).length, 'days'); setData(r.days); })
-      .catch(e => console.warn('[UsageMini] fetch failed:', e?.response?.status, e?.message));
+      .then(r => {
+        console.log('[UsageMini] loaded', Object.keys(r.days || {}).length, 'days');
+        setResponse(r);
+      })
+      .catch(e => {
+        console.warn('[UsageMini] fetch failed:', e?.response?.status, e?.message);
+        // Retry sooner if we have no data yet (agent might not be connected)
+        if (!retryTimer) {
+          retryTimer = setTimeout(() => { retryTimer = null; load(); }, 15_000);
+        }
+      });
     load();
     const interval = setInterval(load, 5 * 60 * 1000);
-    return () => clearInterval(interval);
+    return () => { clearInterval(interval); if (retryTimer) clearTimeout(retryTimer); };
   }, []);
 
   // Escape closes overlay and refocuses agent terminal
@@ -158,7 +169,6 @@ export function UsageMini() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setExpanded(false);
-        // Refocus the agent terminal
         const agentPane = document.querySelector<HTMLElement>('#terminal-agent .xterm-helper-textarea');
         if (agentPane) agentPane.focus();
       }
@@ -167,47 +177,57 @@ export function UsageMini() {
     return () => window.removeEventListener('keydown', onKey);
   }, [expanded]);
 
-  if (!data) return null;
+  if (!response) return null;
+
+  const data = response.days;
+  const claudeData = response.providers?.claude || {};
+  const codexData = response.providers?.codex || {};
 
   const today = todayStr();
   const month = lastNDays(30);
   const week = lastNDays(7);
 
   const todayData = data[today] || EMPTY;
-  const todayCost = dayCost(todayData);
+  const todayTok = dayTokens(todayData);
+  const todayClaudeTok = dayTokens(claudeData[today] || EMPTY);
+  const todayCodexTok = dayTokens(codexData[today] || EMPTY);
 
-  // Trailing 14-day p50 (excluding today)
+  // Trailing 14-day p50 (excluding today) — shared baseline for both tubes
   const trailingDays = lastNDays(15).slice(0, 14);
-  const trailingCosts = trailingDays.map(d => dayCost(data[d] || EMPTY));
-  const p50 = median(trailingCosts);
+  const combinedP50 = median(trailingDays.map(d => dayTokens(data[d] || EMPTY)));
 
-  const pct = p50 > 0 ? Math.round((todayCost / p50) * 100) : 0;
-  const fillPct = Math.min(200, pct); // cap fill at 200%
+  // Both tubes use the same combined p50 so they're directly comparable
+  const claudePct = combinedP50 > 0 ? Math.round((todayClaudeTok / combinedP50) * 100) : 0;
+  const codexPct = combinedP50 > 0 ? Math.round((todayCodexTok / combinedP50) * 100) : 0;
+  const combinedPct = combinedP50 > 0 ? Math.round((todayTok / combinedP50) * 100) : 0;
 
-  const weekCost = week.reduce((sum, d) => sum + dayCost(data[d] || EMPTY), 0);
-  const monthCost = month.reduce((sum, d) => sum + dayCost(data[d] || EMPTY), 0);
+  const weekTok = week.reduce((sum, d) => sum + dayTokens(data[d] || EMPTY), 0);
+  const monthTok = month.reduce((sum, d) => sum + dayTokens(data[d] || EMPTY), 0);
+
+  const hasCodex = Object.keys(codexData).length > 0;
 
   return (
     <>
-      {/* Thermometer gauge — always visible */}
+      {/* Thermometer gauges — always visible */}
       <div className="usage-thermo" onClick={() => setExpanded(!expanded)}>
-        <div className="usage-thermo-pct">{pct}%</div>
-        <div className="usage-thermo-tube">
-          <div className="usage-thermo-fill" style={{
-            height: `${(fillPct / 200) * 100}%`,
-            background: fillGradient(pct),
-          }} />
-          {GRAD_MARKS.map(mark => (
-            <div
-              key={mark}
-              className={`usage-thermo-mark ${mark === 100 ? 'usage-thermo-mark-100' : ''}`}
-              style={{ bottom: `${(mark / 200) * 100}%` }}
-            >
-              <span>{mark}</span>
-            </div>
-          ))}
+        <div className="usage-thermo-pct">{combinedPct}%</div>
+        <div className="usage-thermo-tubes">
+          <ThermoTube pct={claudePct} color={CLAUDE_COLOR} label="CL" />
+          {hasCodex && <ThermoTube pct={codexPct} color={CODEX_COLOR} label="CX" />}
+          {/* Shared grad marks overlay */}
+          <div className="usage-thermo-marks">
+            {GRAD_MARKS.map(mark => (
+              <div
+                key={mark}
+                className={`usage-thermo-mark ${mark === 100 ? 'usage-thermo-mark-100' : ''}`}
+                style={{ bottom: `${(mark / 200) * 100}%` }}
+              >
+                <span>{mark}</span>
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="usage-thermo-cost">{fmt$(todayCost)}</div>
+        <div className="usage-thermo-cost">{fmtK(todayTok)}</div>
       </div>
 
       {/* Expanded overlay */}
@@ -222,59 +242,50 @@ export function UsageMini() {
             <div className="usage-overlay-section">
               <div className="usage-overlay-section-header">
                 <span>30 days</span>
-                <span>{fmt$(monthCost)}</span>
-                <span className="usage-dim">avg {fmt$(monthCost / 30)}/d</span>
+                <span>{fmtK(monthTok)} tokens</span>
+                <span className="usage-dim">avg {fmtK(Math.round(monthTok / 30))}/d</span>
               </div>
-              <BarChart days={month} data={data} height={80} />
+              <BarChart days={month} claudeData={claudeData} codexData={codexData} height={80} />
             </div>
 
             <div className="usage-overlay-section">
               <div className="usage-overlay-section-header">
                 <span>7 days</span>
-                <span>{fmt$(weekCost)}</span>
-                <span className="usage-dim">avg {fmt$(weekCost / 7)}/d</span>
+                <span>{fmtK(weekTok)} tokens</span>
+                <span className="usage-dim">avg {fmtK(Math.round(weekTok / 7))}/d</span>
               </div>
-              <BarChart days={week} data={data} height={60} />
+              <BarChart days={week} claudeData={claudeData} codexData={codexData} height={60} />
             </div>
 
             <div className="usage-overlay-section">
               <div className="usage-overlay-section-header">
                 <span>Today</span>
-                <span>{fmt$(todayCost)}</span>
-                <span className={`usage-overlay-pct ${pct > 120 ? 'usage-hot' : ''}`}>{pct}% of p50</span>
+                <span>{fmtK(todayTok)} tokens</span>
+                <span className={`usage-overlay-pct ${combinedPct > 120 ? 'usage-hot' : ''}`}>{combinedPct}% of p50</span>
               </div>
               <div className="usage-overlay-tokens">
                 <div className="usage-overlay-token-row">
-                  <span className="usage-overlay-token-label">Output</span>
-                  <span>{fmtK(todayData.output)} tokens</span>
-                  <span className="usage-dim">{fmt$((todayData.output * PRICE_OUTPUT) / 1_000_000)}</span>
+                  <span className="usage-overlay-token-label" style={{ color: CLAUDE_COLOR.bright }}>Claude</span>
+                  <span>{fmtK(todayClaudeTok)}</span>
+                  <span className="usage-dim">{claudePct}%</span>
                 </div>
-                <div className="usage-overlay-token-row">
-                  <span className="usage-overlay-token-label">Input</span>
-                  <span>{fmtK(todayData.input)} tokens</span>
-                  <span className="usage-dim">{fmt$((todayData.input * PRICE_INPUT) / 1_000_000)}</span>
-                </div>
-                <div className="usage-overlay-token-row">
-                  <span className="usage-overlay-token-label">Cache read</span>
-                  <span>{fmtK(todayData.cacheRead)} tokens</span>
-                  <span className="usage-dim">{fmt$((todayData.cacheRead * PRICE_CACHE_READ) / 1_000_000)}</span>
-                </div>
-                <div className="usage-overlay-token-row">
-                  <span className="usage-overlay-token-label">Cache write</span>
-                  <span>{fmtK(todayData.cacheCreate)} tokens</span>
-                  <span className="usage-dim">{fmt$((todayData.cacheCreate * PRICE_CACHE_CREATE) / 1_000_000)}</span>
-                </div>
+                {hasCodex && (
+                  <div className="usage-overlay-token-row">
+                    <span className="usage-overlay-token-label" style={{ color: CODEX_COLOR.bright }}>Codex</span>
+                    <span>{fmtK(todayCodexTok)}</span>
+                    <span className="usage-dim">{codexPct}%</span>
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="usage-overlay-footer">
-              <span className="usage-dim">p50 (14d trailing): {fmt$(p50)}/day</span>
+              <span className="usage-dim">p50 (14d): {fmtK(combinedP50)} combined</span>
             </div>
 
             <div className="usage-legend">
-              <span><i style={{ background: 'rgba(88, 166, 255, 0.9)' }} />out</span>
-              <span><i style={{ background: 'rgba(88, 166, 255, 0.6)' }} />in</span>
-              <span><i style={{ background: 'rgba(88, 166, 255, 0.25)' }} />cache</span>
+              <span><i style={{ background: CLAUDE_COLOR.base }} />Claude</span>
+              <span><i style={{ background: CODEX_COLOR.base }} />Codex</span>
             </div>
           </div>
         </div>

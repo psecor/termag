@@ -63,8 +63,16 @@ export interface UsageDayData {
   calls: number;
 }
 
+export interface UsageResponse {
+  days: Record<string, UsageDayData>;
+  providers?: {
+    claude: Record<string, UsageDayData>;
+    codex: Record<string, UsageDayData>;
+  };
+}
+
 export const usageApi = {
-  get: (): Promise<{ days: Record<string, UsageDayData> }> =>
+  get: (): Promise<UsageResponse> =>
     api.get('/api/usage').then(r => r.data),
 };
 

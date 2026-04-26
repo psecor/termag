@@ -47,15 +47,21 @@ if (!termag_url || !token) {
 // ── Usage scanner ──────────────────────────────────────────────────────────
 const { readdir, readFile, stat } = require('fs/promises');
 
-async function scanUsage() {
+function ensureDay(days, date) {
+  if (!days[date]) {
+    days[date] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
+  }
+  return days[date];
+}
+
+async function scanClaudeUsage(days) {
   const claudeDir = path.join(process.env.HOME || '/home', '.claude', 'projects');
-  const days = {}; // date string → { input, output, cacheRead, cacheCreate, calls }
 
   let projectDirs;
   try {
     projectDirs = await readdir(claudeDir);
   } catch {
-    return { days: {} };
+    return;
   }
 
   for (const dir of projectDirs) {
@@ -83,10 +89,7 @@ async function scanUsage() {
           const date = new Date(ts).toISOString().slice(0, 10);
 
           const u = msg.usage;
-          if (!days[date]) {
-            days[date] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
-          }
-          const d = days[date];
+          const d = ensureDay(days, date);
           d.input += u.input_tokens || 0;
           d.output += u.output_tokens || 0;
           d.cacheRead += u.cache_read_input_tokens || 0;
@@ -96,8 +99,88 @@ async function scanUsage() {
       } catch { continue; }
     }
   }
+}
 
-  return { days };
+async function scanCodexUsage(days) {
+  const sessionsDir = path.join(process.env.HOME || '/home', '.codex', 'sessions');
+
+  let years;
+  try {
+    years = await readdir(sessionsDir);
+  } catch {
+    return;
+  }
+
+  for (const year of years) {
+    const yearPath = path.join(sessionsDir, year);
+    let months;
+    try { months = await readdir(yearPath); } catch { continue; }
+
+    for (const month of months) {
+      const monthPath = path.join(yearPath, month);
+      let dayDirs;
+      try { dayDirs = await readdir(monthPath); } catch { continue; }
+
+      for (const dayDir of dayDirs) {
+        const dayPath = path.join(monthPath, dayDir);
+        let files;
+        try {
+          const s = await stat(dayPath);
+          if (!s.isDirectory()) continue;
+          files = await readdir(dayPath);
+        } catch { continue; }
+
+        for (const file of files) {
+          if (!file.endsWith('.jsonl')) continue;
+          try {
+            const content = await readFile(path.join(dayPath, file), 'utf8');
+            for (const line of content.split('\n')) {
+              if (!line) continue;
+              let entry;
+              try { entry = JSON.parse(line); } catch { continue; }
+              if (entry.type !== 'event_msg') continue;
+              const payload = entry.payload;
+              if (!payload || payload.type !== 'token_count') continue;
+              const u = payload.info?.last_token_usage;
+              if (!u) continue;
+
+              const ts = entry.timestamp;
+              if (!ts) continue;
+              const date = new Date(ts).toISOString().slice(0, 10);
+
+              const d = ensureDay(days, date);
+              d.input += u.input_tokens || 0;
+              d.output += u.output_tokens || 0;
+              d.cacheRead += u.cached_input_tokens || 0;
+              d.calls += 1;
+            }
+          } catch { continue; }
+        }
+      }
+    }
+  }
+}
+
+async function scanUsage() {
+  const claude = {};
+  const codex = {};
+  await Promise.all([
+    scanClaudeUsage(claude),
+    scanCodexUsage(codex),
+  ]);
+  // Merge into combined totals
+  const days = {};
+  for (const src of [claude, codex]) {
+    for (const [date, d] of Object.entries(src)) {
+      const t = ensureDay(days, date);
+      t.input += d.input;
+      t.output += d.output;
+      t.cacheRead += d.cacheRead;
+      t.cacheCreate += d.cacheCreate;
+      t.calls += d.calls;
+    }
+  }
+  return { days, providers: { claude, codex } };
 }
 
 // Active PTY streams: streamId → { pty, tmuxSessionName }

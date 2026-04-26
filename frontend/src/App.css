@@ -486,13 +486,19 @@ html {
   user-select: none;
 }
 
+.usage-thermo-tubes {
+  position: relative;
+  display: flex;
+  gap: 3px;
+}
+
 .usage-thermo-tube {
   position: relative;
-  width: 20px;
+  width: 14px;
   height: 120px;
   background: rgba(13, 17, 23, 0.92);
   border: 1px solid rgba(139, 148, 158, 0.3);
-  border-radius: 10px;
+  border-radius: 8px;
   overflow: hidden;
 }
 
@@ -501,29 +507,49 @@ html {
   bottom: 0;
   left: 0;
   right: 0;
-  border-radius: 0 0 9px 9px;
+  border-radius: 0 0 7px 7px;
   transition: height 0.5s ease, background 0.5s ease;
+}
+
+.usage-thermo-tube-label {
+  position: absolute;
+  bottom: 2px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 6px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1;
+  z-index: 1;
+}
+
+.usage-thermo-marks {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 100%;
+  pointer-events: none;
 }
 
 .usage-thermo-mark {
   position: absolute;
-  left: 2px;
-  right: 2px;
-  height: 2px;
-  background: rgba(139, 148, 158, 0.4);
-  border-radius: 1px;
+  left: -2px;
+  right: -2px;
+  height: 1px;
+  background: rgba(139, 148, 158, 0.3);
 }
 
 .usage-thermo-mark-100 {
-  left: 0;
-  right: 0;
-  height: 3px;
-  background: rgba(201, 209, 217, 0.8);
+  height: 2px;
+  background: rgba(201, 209, 217, 0.6);
 }
 
 .usage-thermo-mark span {
   position: absolute;
-  right: -28px;
+  right: -24px;
   top: -5px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 7px;
