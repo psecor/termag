@@ -67,6 +67,14 @@ function MainLayout() {
   const isActive = warpModel.isActive;
   const warpStr = warpSpeed < 10 ? warpSpeed.toFixed(1) : Math.floor(warpSpeed).toString();
 
+  useEffect(() => {
+    if (!('BroadcastChannel' in window)) return;
+
+    const channel = new BroadcastChannel('termag-warp-speed');
+    channel.postMessage({ warpSpeed });
+    return () => channel.close();
+  }, [warpSpeed]);
+
   // Responsive layout
   const isNarrow = useIsNarrow();
   const [activePane, setActivePane] = useState<'agent' | 'ctrl'>('agent');
