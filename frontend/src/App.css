@@ -198,14 +198,14 @@ html {
 .project-item:hover  { background: var(--bg-elevated); }
 .project-item.active { background: var(--bg-active); border-color: var(--border); }
 .project-item.status-flash-working {
-  animation: flash-working 4s ease-out;
+  animation: flash-working 15s ease-out;
 }
 .project-item.status-flash-waiting {
-  animation: flash-waiting 4s ease-out;
+  animation: flash-waiting 15s ease-out;
 }
 .project-item.status-flash-idle,
 .project-item.status-flash-not_running {
-  animation: flash-idle 4s ease-out;
+  animation: flash-idle 15s ease-out;
 }
 @keyframes flash-working {
   0%   { background: rgba(50, 205, 50, 0.30); }

@@ -48,7 +48,7 @@ export function ProjectControl() {
           newFlashes.forEach((_status, id) => next.delete(id));
           return next;
         });
-      }, 4000);
+      }, 15000);
       return () => clearTimeout(timer);
     }
   }, [statusMap, projects, user?.unixUsername]);
