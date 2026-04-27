@@ -9,7 +9,7 @@ declare global {
       googleEmail: string;
       unixUsername: string;
       displayName: string;
-      defaultAgentProvider: 'claude' | 'codex' | 'cursor';
+      defaultAgentProvider: string;
       slackUserId: string | null;
       discordUserId: string | null;
       createdAt: Date;
@@ -28,12 +28,14 @@ export interface AgentStatus {
   status: 'working' | 'waiting' | 'idle' | 'not_running';
   updatedAt: Date;
   message?: string;
-  source?: 'claude-hooks' | 'codex-app-server' | 'codex-jsonl' | 'tmux-fallback' | 'tmux-poller';
+  source?: string;
   waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
   activityScore?: number;
   tokenBurst?: number;
   activeTurn?: boolean;
   threadId?: string;
+  /** Arbitrary metadata from tmux poller (e.g. cursor's model, context %, files edited) */
+  pollerMeta?: Record<string, any>;
 }
 
 // Keyed by tmux session name: {username}-{project}-agent

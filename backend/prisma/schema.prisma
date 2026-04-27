@@ -13,7 +13,7 @@ model User {
   googleEmail  String    @unique
   unixUsername String    @unique
   displayName   String
-  defaultAgentProvider AgentProvider @default(codex)
+  defaultAgentProvider String @default("codex")
   slackUserId   String?   @unique
   discordUserId String?   @unique
   createdAt     DateTime  @default(now())
@@ -64,7 +64,7 @@ model Project {
 model Workflow {
   id        String       @id @default(cuid())
   type      WorkflowType
-  provider  AgentProvider?
+  provider  String?
   server    String       @default("localhost") // future: ssh to other servers
   createdAt DateTime     @default(now())
 
@@ -80,11 +80,9 @@ enum WorkflowType {
   data
 }
 
-enum AgentProvider {
-  claude
-  codex
-  cursor
-}
+// AgentProvider is now a plain String validated at the application layer
+// via PROVIDER_IDS from backend/src/providers/registry.ts.
+// This avoids a DB migration every time a new provider is added.
 
 
 model BrowserTab {
@@ -113,6 +111,22 @@ model NotificationTarget {
 
   @@id([tmuxSession, platform])
   @@map("notification_targets")
+}
+
+// Working time accumulated from status transitions (working → idle/waiting)
+model WorkTimeEntry {
+  id        String   @id @default(cuid())
+  username  String
+  project   String
+  provider  String
+  date      String   // YYYY-MM-DD
+  totalMs   Int      @default(0)
+  sessions  Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@unique([username, project, provider, date])
+  @@index([username, date])
+  @@map("work_time_entries")
 }
 
 // Latest Chrome tab snapshot from the local relay, keyed by relay token

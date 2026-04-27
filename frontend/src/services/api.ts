@@ -65,15 +65,26 @@ export interface UsageDayData {
 
 export interface UsageResponse {
   days: Record<string, UsageDayData>;
-  providers?: {
-    claude: Record<string, UsageDayData>;
-    codex: Record<string, UsageDayData>;
-  };
+  providers?: Record<string, Record<string, UsageDayData>>;
 }
 
 export const usageApi = {
   get: (): Promise<UsageResponse> =>
     api.get('/api/usage').then(r => r.data),
+};
+
+export interface WorktimeDay {
+  totalMs: number;
+  sessions: number;
+}
+
+export interface WorktimeResponse {
+  days: Record<string, Record<string, WorktimeDay>>;
+}
+
+export const worktimeApi = {
+  get: (days = 30): Promise<WorktimeResponse> =>
+    api.get('/api/worktime', { params: { days } }).then(r => r.data),
 };
 
 export const browserApi = {

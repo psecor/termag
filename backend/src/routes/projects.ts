@@ -1,5 +1,6 @@
 import { Router, RequestHandler } from 'express';
-import { AgentProvider, PrismaClient, WorkflowType } from '@prisma/client';
+import { PrismaClient, WorkflowType } from '@prisma/client';
+import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth } from '../middleware/auth';
 import * as tmux from '../services/tmux';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
@@ -13,8 +14,8 @@ const prisma = new PrismaClient();
 export function projectsRouter(): Router {
   const router = Router();
 
-  function normalizeProvider(provider?: AgentProvider | null, fallback?: AgentProvider | null): AgentProvider {
-    if (provider === 'claude' || provider === 'codex' || provider === 'cursor') return provider;
+  function normalizeProvider(provider?: string | null, fallback?: string | null): string {
+    if (provider && PROVIDER_IDS.includes(provider)) return provider;
     return resolveAgentProvider(undefined, fallback);
   }
 
@@ -37,7 +38,7 @@ export function projectsRouter(): Router {
         name?: string;
         description?: string;
         color?: string;
-        initialAgent?: { enabled?: boolean; provider?: AgentProvider };
+        initialAgent?: { enabled?: boolean; provider?: string };
       };
       if (!name) { res.status(400).json({ error: 'name required' }); return; }
 
@@ -195,7 +196,7 @@ export function projectsRouter(): Router {
     try {
       const { type, provider: providerInput } = req.body as {
         type: WorkflowType;
-        provider?: AgentProvider;
+        provider?: string;
       };
       if (!['agent', 'data'].includes(type)) {
         res.status(400).json({ error: 'type must be agent or data' });
@@ -305,7 +306,7 @@ export function projectsRouter(): Router {
       if (oldName === newName) { res.json({ ok: true }); return; }
 
       const username = req.user!.unixUsername;
-      const providerRestarts: Array<{ projectName: string; provider: AgentProvider }> = [];
+      const providerRestarts: Array<{ projectName: string; provider: string }> = [];
 
       // Rename tmux sessions
       for (const wf of project.workflows) {

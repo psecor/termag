@@ -1,12 +1,12 @@
-import { AgentProvider } from '@prisma/client';
 import * as tmux from './tmux';
 import { isAgentConnected, sendToAgent } from './agentRegistry';
-import { registerCursorSession, unregisterCursorSession } from './cursorStatus';
+import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
+import { PROVIDERS } from '../providers/registry';
 
 export function resolveAgentProvider(
-  workflowProvider?: AgentProvider | null,
-  userDefaultProvider?: AgentProvider | null,
-): AgentProvider {
+  workflowProvider?: string | null,
+  userDefaultProvider?: string | null,
+): string {
   return workflowProvider ?? userDefaultProvider ?? 'claude';
 }
 
@@ -14,7 +14,7 @@ interface AgentRuntimeContext {
   userId: string;
   unixUsername: string;
   projectName: string;
-  provider: AgentProvider;
+  provider: string;
 }
 
 export async function ensureAgentSessionsAndLaunch({
@@ -23,6 +23,9 @@ export async function ensureAgentSessionsAndLaunch({
   projectName,
   provider,
 }: AgentRuntimeContext): Promise<void> {
+  const config = PROVIDERS[provider];
+  if (!config) throw new Error(`Unknown provider: ${provider}`);
+
   const projDir = tmux.projectDir(unixUsername, projectName);
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
@@ -32,15 +35,14 @@ export async function ensureAgentSessionsAndLaunch({
     await sendToAgent(userId, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
     await new Promise(resolve => setTimeout(resolve, 500));
 
-    if (provider === 'codex') {
+    if (config.needsBridge) {
       await sendToAgent(userId, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
     } else {
-      const cmd = provider === 'cursor' ? 'agent' : 'claude';
-      await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: cmd, withEnter: true });
+      await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: config.launchCommand, withEnter: true });
     }
 
-    if (provider === 'cursor') {
-      registerCursorSession(mainSession);
+    if (config.needsPoller) {
+      registerPollerSession(mainSession, provider);
     }
     return;
   }
@@ -52,16 +54,14 @@ export async function ensureAgentSessionsAndLaunch({
   if (!mainCreated) return;
 
   await new Promise(resolve => setTimeout(resolve, 500));
-  if (provider === 'codex') {
-    await tmux.sendKeys(mainSession, 'codex --no-alt-screen -a on-request');
-  } else if (provider === 'cursor') {
-    await tmux.sendKeys(mainSession, 'agent');
+  if (config.needsBridge) {
+    await tmux.sendKeys(mainSession, config.launchCommand);
   } else {
-    await tmux.sendKeys(mainSession, 'claude');
+    await tmux.sendKeys(mainSession, config.launchCommand);
   }
 
-  if (provider === 'cursor') {
-    registerCursorSession(mainSession);
+  if (config.needsPoller) {
+    registerPollerSession(mainSession, provider);
   }
 }
 
@@ -71,15 +71,16 @@ export async function stopAgentSessions({
   projectName,
   provider,
 }: AgentRuntimeContext): Promise<void> {
+  const config = PROVIDERS[provider];
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
 
-  if (provider === 'cursor') {
-    unregisterCursorSession(mainSession);
+  if (config?.needsPoller) {
+    unregisterPollerSession(mainSession);
   }
 
   if (isAgentConnected(userId)) {
-    if (provider === 'codex') {
+    if (config?.needsBridge) {
       await sendToAgent(userId, 'codex-session-stop', { sessionName: mainSession }).catch(() => {});
     }
     await sendToAgent(userId, 'tmux-kill', { sessionName: mainSession }).catch(() => {});

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { AgentProvider, Project, STATUS_EMOJI } from '../types';
+import { Project, STATUS_EMOJI } from '../types';
+import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { projectsApi, agentTokensApi, AgentTokenInfo } from '../services/api';
@@ -8,7 +9,7 @@ export function ProjectControl() {
   const { user, logout, updateDefaultAgentProvider } = useAuth();
   const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
-  const [newProjectProvider, setNewProjectProvider] = useState<AgentProvider>('codex');
+  const [newProjectProvider, setNewProjectProvider] = useState(user?.defaultAgentProvider ?? 'codex');
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -41,24 +42,17 @@ export function ProjectControl() {
     return STATUS_EMOJI[s?.status ?? 'not_running'];
   }
 
-  function persistedAgentProvider(project: Project): AgentProvider | null {
+  function persistedAgentProvider(project: Project): string | null {
     return project.workflows.find(w => w.type === 'agent')?.provider ?? null;
   }
 
-  function displayAgentProvider(project: Project): AgentProvider | null {
+  function displayAgentProvider(project: Project): string | null {
     const status = statusMap[agentSessionName(project)];
-    if (status?.source === 'codex-app-server' || status?.source === 'codex-jsonl') {
-      return 'codex';
+    if (status?.source) {
+      const fromSource = providerForSource(status.source);
+      if (fromSource) return fromSource;
     }
     return persistedAgentProvider(project);
-  }
-
-  function providerBadge(project: Project): string | null {
-    const provider = displayAgentProvider(project);
-    if (provider === 'codex') return 'CX';
-    if (provider === 'claude') return 'CL';
-    if (provider === 'cursor') return 'CR';
-    return null;
   }
 
   async function createProject(e: React.FormEvent) {
@@ -121,7 +115,7 @@ export function ProjectControl() {
     setTokens(prev => prev.filter(t => t.id !== id));
   }
 
-  async function saveDefaultAgent(provider: AgentProvider) {
+  async function saveDefaultAgent(provider: string) {
     try {
       await updateDefaultAgentProvider(provider);
       setNewProjectProvider(provider);
@@ -143,51 +137,59 @@ export function ProjectControl() {
       <section className="control-section">
         <h3>Projects</h3>
         <ul className="project-list">
-          {projects.map(p => (
-            <li
-              key={p.id}
-              className={`project-item ${activeProjectId === p.id ? 'active' : ''}`}
-              onClick={() => setActiveProject(p.id)}
-            >
-              <span className="project-status">{statusEmoji(p)}</span>
-              {renamingId === p.id ? (
-                <input
-                  className="project-rename-input"
-                  value={renameValue}
-                  onChange={e => setRenameValue(e.target.value)}
-                  onBlur={() => renameProject(p)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') renameProject(p);
-                    if (e.key === 'Escape') setRenamingId(null);
-                  }}
-                  onClick={e => e.stopPropagation()}
-                  autoFocus
-                />
-              ) : (
-                <>
-                  <span
-                    className="project-name"
-                    onDoubleClick={e => {
-                      e.stopPropagation();
-                      setRenamingId(p.id);
-                      setRenameValue(p.name);
+          {projects.map(p => {
+            const provider = displayAgentProvider(p);
+            const config = provider ? PROVIDERS[provider] : null;
+            return (
+              <li
+                key={p.id}
+                className={`project-item ${activeProjectId === p.id ? 'active' : ''}`}
+                onClick={() => setActiveProject(p.id)}
+              >
+                <span className="project-status">{statusEmoji(p)}</span>
+                {renamingId === p.id ? (
+                  <input
+                    className="project-rename-input"
+                    value={renameValue}
+                    onChange={e => setRenameValue(e.target.value)}
+                    onBlur={() => renameProject(p)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') renameProject(p);
+                      if (e.key === 'Escape') setRenamingId(null);
                     }}
-                  >{p.name}</span>
-                  {providerBadge(p) && (
+                    onClick={e => e.stopPropagation()}
+                    autoFocus
+                  />
+                ) : (
+                  <>
                     <span
-                      className="project-provider-badge"
-                      title={`runtime: ${displayAgentProvider(p) ?? 'unknown'}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
-                    >
-                      {providerBadge(p)}
-                    </span>
-                  )}
-                </>
-              )}
-              <span className="project-actions" onClick={e => e.stopPropagation()}>
-                <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
-              </span>
-            </li>
-          ))}
+                      className="project-name"
+                      onDoubleClick={e => {
+                        e.stopPropagation();
+                        setRenamingId(p.id);
+                        setRenameValue(p.name);
+                      }}
+                    >{p.name}</span>
+                    {config && (
+                      <span
+                        className="project-provider-badge"
+                        style={{
+                          borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
+                          background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
+                        }}
+                        title={`runtime: ${config.displayName}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
+                      >
+                        {config.badge}
+                      </span>
+                    )}
+                  </>
+                )}
+                <span className="project-actions" onClick={e => e.stopPropagation()}>
+                  <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
+                </span>
+              </li>
+            );
+          })}
         </ul>
         <form className="inline-form" onSubmit={createProject}>
           <input
@@ -198,12 +200,12 @@ export function ProjectControl() {
           <select
             className="inline-form-select"
             value={newProjectProvider}
-            onChange={e => setNewProjectProvider(e.target.value as AgentProvider)}
+            onChange={e => setNewProjectProvider(e.target.value)}
             title="Agent provider"
           >
-            <option value="codex">Codex</option>
-            <option value="claude">Claude</option>
-            <option value="cursor">Cursor</option>
+            {PROVIDER_IDS.map(pid => (
+              <option key={pid} value={pid}>{PROVIDERS[pid].displayName}</option>
+            ))}
           </select>
           <button type="submit">+</button>
         </form>
@@ -250,10 +252,11 @@ export function ProjectControl() {
                 className="inline-form-select"
                 id="default-agent-provider"
                 value={user?.defaultAgentProvider ?? 'codex'}
-                onChange={e => saveDefaultAgent(e.target.value as AgentProvider)}
+                onChange={e => saveDefaultAgent(e.target.value)}
               >
-                <option value="codex">Codex</option>
-                <option value="claude">Claude</option>
+                {PROVIDER_IDS.map(pid => (
+                  <option key={pid} value={pid}>{PROVIDERS[pid].displayName}</option>
+                ))}
               </select>
             </div>
           </>

@@ -1,7 +1,8 @@
 import { Router, RequestHandler } from 'express';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
-import { AgentProvider, PrismaClient } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
+import { PROVIDER_IDS } from '../providers/registry';
 
 const prisma = new PrismaClient();
 
@@ -115,9 +116,9 @@ export function authRouter(): Router {
       return;
     }
 
-    const { defaultAgentProvider } = req.body as { defaultAgentProvider?: AgentProvider };
-    if (!defaultAgentProvider || !['claude', 'codex', 'cursor'].includes(defaultAgentProvider)) {
-      res.status(400).json({ error: 'defaultAgentProvider must be claude, codex, or cursor' });
+    const { defaultAgentProvider } = req.body as { defaultAgentProvider?: string };
+    if (!defaultAgentProvider || !PROVIDER_IDS.includes(defaultAgentProvider)) {
+      res.status(400).json({ error: `defaultAgentProvider must be one of: ${PROVIDER_IDS.join(', ')}` });
       return;
     }
 

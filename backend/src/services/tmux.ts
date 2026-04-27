@@ -1,6 +1,7 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { mkdir } from 'fs/promises';
+import { ALL_PROCESS_NAMES } from '../providers/registry';
 
 const execAsync = promisify(exec);
 
@@ -91,8 +92,8 @@ export async function isAgentRunning(name: string): Promise<boolean> {
   const cmd = await foregroundCommand(name);
   if (!cmd) return false;
   const lc = cmd.toLowerCase();
-  return ['claude', 'codex', 'auggie', 'node', 'python'].some(a => lc.includes(a))
-    || lc === 'agent';
+  return ALL_PROCESS_NAMES.some(a => lc.includes(a))
+    || ['node', 'python'].some(a => lc.includes(a));
 }
 
 export async function listSessions(): Promise<string[]> {

@@ -15,6 +15,7 @@ import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
 import { usageRouter } from './routes/usage';
+import { worktimeRouter } from './routes/worktime';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -25,7 +26,7 @@ import {
   sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
 } from './services/agentRegistry';
 import { PrismaClient } from '@prisma/client';
-import { startCursorPoller } from './services/cursorStatus';
+import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
 
 const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
@@ -96,6 +97,7 @@ app.use(`${BASE_PATH}/api/status`, statusRouter());
 app.use(`${BASE_PATH}/api/browser`, browserRouter());
 app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());
 app.use(`${BASE_PATH}/api/usage`, usageRouter());
+app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -310,11 +312,12 @@ setStatusChangeCallback((sessionName: string) => {
 // --- Start ---
 server.listen(PORT, () => {
   console.log(`termag backend running on port ${PORT} at ${BASE_PATH}`);
-  startCursorPoller().catch(err => console.error('[CURSOR-POLLER] Failed to start:', err));
+  startTmuxPoller().catch(err => console.error('[TMUX-POLLER] Failed to start:', err));
 });
 
 function shutdown() {
   console.log('termag shutting down...');
+  stopTmuxPoller();
   // Close all WebSocket connections so the process can exit
   for (const client of wss.clients) {
     client.close(1001, 'server shutting down');
