@@ -48,7 +48,7 @@ if (!termag_url || !token) {
 const { readFile: readFileAsync, writeFile } = require('fs/promises');
 
 const WIKI_TEMPLATE_PATH = path.join(
-  process.env.HOME || '/home', 'termag', 'projects', 'agent-wiki', 'spec', 'template.md'
+  process.env.HOME || '/home', 'termag', 'projects', 'agent-wiki', 'spec', 'initial-AGENTS.md'
 );
 
 async function initWikiFiles(dir, slug, username) {
@@ -60,7 +60,6 @@ async function initWikiFiles(dir, slug, username) {
     return { ok: true, skipped: true };
   }
 
-  // Read and extract template content from between ```markdown and ``` fences
   let templateRaw;
   try {
     templateRaw = await readFileAsync(WIKI_TEMPLATE_PATH, 'utf8');
@@ -69,19 +68,12 @@ async function initWikiFiles(dir, slug, username) {
     return { ok: false, error: 'Template not found' };
   }
 
-  const fenceMatch = templateRaw.match(/```markdown\n([\s\S]*?)```/);
-  if (!fenceMatch) {
-    return { ok: false, error: 'No markdown fence found in template' };
-  }
-
   const today = new Date().toISOString().slice(0, 10);
-  const content = fenceMatch[1]
+  const content = templateRaw
     .replace(/<slug>/g, slug)
     .replace(/<project name>/g, slug)
     .replace(/YYYY-MM-DD/g, today)
-    .replace(/^\s*- agent:<model-id>.*\n/m, '')
-    .replace(/<handle>/g, username)
-    .replace(/^(\s*- (?:human|agent):\S+)\s+#.*$/gm, '$1');
+    .replace(/<handle>/g, username);
 
   const created = [];
 

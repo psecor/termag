@@ -27,7 +27,7 @@ export async function ensureProjectDir(username: string, projectName: string): P
 }
 
 const WIKI_TEMPLATE_PATH = join(
-  '/home', 'secorp', 'termag', 'projects', 'agent-wiki', 'spec', 'template.md'
+  '/home', 'secorp', 'termag', 'projects', 'agent-wiki', 'spec', 'initial-AGENTS.md'
 );
 
 async function initWikiFiles(dir: string, slug: string, username: string): Promise<void> {
@@ -41,17 +41,12 @@ async function initWikiFiles(dir: string, slug: string, username: string): Promi
     return; // Template not available — skip silently
   }
 
-  const fenceMatch = templateRaw.match(/```markdown\n([\s\S]*?)```/);
-  if (!fenceMatch) return;
-
   const today = new Date().toISOString().slice(0, 10);
-  const content = fenceMatch[1]
+  const content = templateRaw
     .replace(/<slug>/g, slug)
     .replace(/<project name>/g, slug)
     .replace(/YYYY-MM-DD/g, today)
-    .replace(/^\s*- agent:<model-id>.*\n/m, '')
-    .replace(/<handle>/g, username)
-    .replace(/^(\s*- (?:human|agent):\S+)\s+#.*$/gm, '$1');
+    .replace(/<handle>/g, username);
 
   await writeFile(agentsPath, content, 'utf8');
 
