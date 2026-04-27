@@ -16,36 +16,39 @@ export function ProjectControl() {
 
   // Track status transitions for highlight flash
   const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
-  const [flashingProjects, setFlashingProjects] = useState<Set<string>>(new Set());
+  const mountedAtRef = useRef(Date.now());
+  // Map of project id → status it transitioned to (for coloring the flash)
+  const [flashingProjects, setFlashingProjects] = useState<Map<string, AgentStatusValue>>(new Map());
 
   useEffect(() => {
     const prev = prevStatusRef.current;
-    const newFlashes = new Set<string>();
+    const newFlashes = new Map<string, AgentStatusValue>();
+    // Skip flashes during initial WebSocket state sync (first 3s after mount)
+    const settled = Date.now() - mountedAtRef.current > 3000;
 
     for (const p of projects) {
       const session = `${user?.unixUsername}-${p.name}-agent`;
       const currentStatus = statusMap[session]?.status ?? 'not_running';
       const prevStatus = prev[session];
-      if (prevStatus !== undefined && prevStatus !== currentStatus) {
-        newFlashes.add(p.id);
+      if (settled && prevStatus !== undefined && prevStatus !== currentStatus) {
+        newFlashes.set(p.id, currentStatus);
       }
       prev[session] = currentStatus;
     }
 
     if (newFlashes.size > 0) {
       setFlashingProjects(f => {
-        const merged = new Set(f);
-        newFlashes.forEach(id => merged.add(id));
+        const merged = new Map(f);
+        newFlashes.forEach((status, id) => merged.set(id, status));
         return merged;
       });
-      // Clear flashes after animation completes
       const timer = setTimeout(() => {
         setFlashingProjects(f => {
-          const next = new Set(f);
-          newFlashes.forEach(id => next.delete(id));
+          const next = new Map(f);
+          newFlashes.forEach((_status, id) => next.delete(id));
           return next;
         });
-      }, 3000);
+      }, 4000);
       return () => clearTimeout(timer);
     }
   }, [statusMap, projects, user?.unixUsername]);
@@ -179,7 +182,7 @@ export function ProjectControl() {
             return (
               <li
                 key={p.id}
-                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? 'status-flash' : ''}`}
+                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''}`}
                 onClick={() => setActiveProject(p.id)}
               >
                 <span className="project-status">{statusEmoji(p)}</span>

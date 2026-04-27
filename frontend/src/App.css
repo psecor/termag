@@ -197,12 +197,29 @@ html {
 
 .project-item:hover  { background: var(--bg-elevated); }
 .project-item.active { background: var(--bg-active); border-color: var(--border); }
-.project-item.status-flash {
-  animation: status-flash 3s ease-out;
+.project-item.status-flash-working {
+  animation: flash-working 4s ease-out;
 }
-@keyframes status-flash {
-  0%   { background: rgba(255, 255, 255, 0.12); }
-  15%  { background: rgba(255, 255, 255, 0.12); }
+.project-item.status-flash-waiting {
+  animation: flash-waiting 4s ease-out;
+}
+.project-item.status-flash-idle,
+.project-item.status-flash-not_running {
+  animation: flash-idle 4s ease-out;
+}
+@keyframes flash-working {
+  0%   { background: rgba(50, 205, 50, 0.30); }
+  30%  { background: rgba(50, 205, 50, 0.20); }
+  100% { background: transparent; }
+}
+@keyframes flash-waiting {
+  0%   { background: rgba(255, 200, 50, 0.30); }
+  30%  { background: rgba(255, 200, 50, 0.20); }
+  100% { background: transparent; }
+}
+@keyframes flash-idle {
+  0%   { background: rgba(255, 80, 80, 0.25); }
+  30%  { background: rgba(255, 80, 80, 0.18); }
   100% { background: transparent; }
 }
 
