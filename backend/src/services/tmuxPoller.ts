@@ -200,14 +200,22 @@ function inferRawStatus(
   const tailText = tail.join('\n');
   const hasPrompt = pollerCfg.idlePattern.test(tailText);
 
+  // Check for waiting-on-user patterns (e.g. permission prompts) — highest priority
+  if (pollerCfg.waitingPatterns?.length) {
+    const hasWaiting = tail.some(line =>
+      pollerCfg.waitingPatterns!.some(p => p.test(line))
+    );
+    if (hasWaiting) return 'waiting';
+  }
+
+  // Activity/spinner beats the prompt (some TUIs like vibe always show the
+  // input box, so the prompt alone doesn't mean idle).
   if (hasActivity) return 'working';
 
   const contentChanged = previousContent !== undefined && previousContent !== '' && paneContent !== previousContent;
   if (contentChanged && !hasPrompt) return 'working';
 
   if (!hasPrompt && now - lastChangeAt < 3000) return 'working';
-
-  if (hasPrompt) return 'idle';
 
   return 'idle';
 }

@@ -11,6 +11,8 @@ export interface PollerPattern {
   idlePattern: RegExp;
   /** Activity indicator keywords on short lines while working */
   activityPatterns: RegExp[];
+  /** Patterns indicating the agent is waiting for user input (e.g. permission prompts) */
+  waitingPatterns?: RegExp[];
   /** Animated spinner characters (e.g. Braille block chars) */
   spinnerPattern?: RegExp;
   /** Parse the status bar at the bottom of the pane. Return arbitrary metadata. */
@@ -194,8 +196,14 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     pollerConfig: {
       idlePattern: /│\s*>\s/m,
       activityPatterns: [
-        /^\s*✓\s*(Thought|Ran|Read|Created|Updated|Deleted|Wrote|Edited)\b/,
         /Running command/,
+        /Reading file/,
+        /Writing file/,
+        /^\s*■\s/,
+      ],
+      waitingPatterns: [
+        /↑↓ navigate\s+Enter select/,
+        /› \d+\.\s*(Yes|No)/,
       ],
       spinnerPattern: /[\u2800-\u28FF]/,
       statusBarParser: parseVibeStatusBar,
