@@ -221,7 +221,7 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 **Topics:** none yet.
 
 <!-- agent-wiki:backlinks-start -->
-- [agent-wiki](../agent-wiki/AGENTS.md) — Status, Related
+- [agent-wiki](../agent-wiki/AGENTS.md) — Related
 - [claude-code-proxy-bot](../claude-code-proxy-bot/AGENTS.md) — Related
 - [sound-garden](../sound-garden/AGENTS.md) — Related
 - [typing-lag](../typing-lag/AGENTS.md) — Related
