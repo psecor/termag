@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Project, STATUS_EMOJI } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { Project, STATUS_EMOJI, AgentStatusValue } from '../types';
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -13,6 +13,42 @@ export function ProjectControl() {
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+
+  // Track status transitions for highlight flash
+  const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
+  const [flashingProjects, setFlashingProjects] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    const newFlashes = new Set<string>();
+
+    for (const p of projects) {
+      const session = `${user?.unixUsername}-${p.name}-agent`;
+      const currentStatus = statusMap[session]?.status ?? 'not_running';
+      const prevStatus = prev[session];
+      if (prevStatus !== undefined && prevStatus !== currentStatus) {
+        newFlashes.add(p.id);
+      }
+      prev[session] = currentStatus;
+    }
+
+    if (newFlashes.size > 0) {
+      setFlashingProjects(f => {
+        const merged = new Set(f);
+        newFlashes.forEach(id => merged.add(id));
+        return merged;
+      });
+      // Clear flashes after animation completes
+      const timer = setTimeout(() => {
+        setFlashingProjects(f => {
+          const next = new Set(f);
+          newFlashes.forEach(id => next.delete(id));
+          return next;
+        });
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [statusMap, projects, user?.unixUsername]);
 
   // Agent tokens
   const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
@@ -143,7 +179,7 @@ export function ProjectControl() {
             return (
               <li
                 key={p.id}
-                className={`project-item ${activeProjectId === p.id ? 'active' : ''}`}
+                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? 'status-flash' : ''}`}
                 onClick={() => setActiveProject(p.id)}
               >
                 <span className="project-status">{statusEmoji(p)}</span>

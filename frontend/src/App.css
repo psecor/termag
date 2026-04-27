@@ -197,6 +197,14 @@ html {
 
 .project-item:hover  { background: var(--bg-elevated); }
 .project-item.active { background: var(--bg-active); border-color: var(--border); }
+.project-item.status-flash {
+  animation: status-flash 3s ease-out;
+}
+@keyframes status-flash {
+  0%   { background: rgba(255, 255, 255, 0.12); }
+  15%  { background: rgba(255, 255, 255, 0.12); }
+  100% { background: transparent; }
+}
 
 .project-status { font-size: 10px; flex-shrink: 0; }
 .project-name   { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
