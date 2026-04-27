@@ -52,11 +52,13 @@ function MainLayout() {
   const activeProject = projects.find(p => p.id === activeProjectId);
   const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
   const username = user?.unixUsername ?? '';
+  const sessionOwner = activeProject?.ownerUsername ?? username;
 
   const projectAgentStatuses = Object.fromEntries(projects
     .filter(p => p.workflows.some(w => w.type === 'agent'))
     .map(p => {
-      const agentSession = `${username}-${p.name}-agent`;
+      const owner = p.ownerUsername ?? username;
+      const agentSession = `${owner}-${p.name}-agent`;
       return [agentSession, statusMap[agentSession]];
     })
     .filter(([, status]) => Boolean(status)));
@@ -141,7 +143,7 @@ function MainLayout() {
             <div className="app-agent" id="terminal-agent">
               {activeProject && hasAgent ? (
                 <Terminal
-                  sessionName={`${username}-${activeProject.name}-agent`}
+                  sessionName={`${sessionOwner}-${activeProject.name}-agent`}
                   active={true}
                   autoFocus={!isNarrow || activePane === 'agent'}
                   onActivity={onActivity}
@@ -158,7 +160,7 @@ function MainLayout() {
             <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
               {activeProject && hasAgent ? (
                 <Terminal
-                  sessionName={`${username}-${activeProject.name}-ctrl`}
+                  sessionName={`${sessionOwner}-${activeProject.name}-ctrl`}
                   active={true}
                   autoFocus={isNarrow && activePane === 'ctrl'}
                   onActivity={onActivity}
@@ -197,7 +199,8 @@ function SidebarCollapsed({
   return (
     <div className="sidebar-collapsed-list">
       {projects.map(p => {
-        const agentSession = `${username}-${p.name}-agent`;
+        const owner = p.ownerUsername ?? username;
+        const agentSession = `${owner}-${p.name}-agent`;
         const s = statusMap[agentSession]?.status ?? 'not_running';
         const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
         return (

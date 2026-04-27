@@ -20,6 +20,9 @@ model User {
 
   projects    Project[]
   agentTokens AgentToken[]
+  sharedWithMe  ProjectShare[]  @relation("sharedWithMe")
+  sentInvites   ProjectInvite[] @relation("sentInvites")
+  receivedInvites ProjectInvite[] @relation("receivedInvites")
 
   @@map("users")
 }
@@ -55,6 +58,8 @@ model Project {
 
   workflows   Workflow[]
   browserTabs BrowserTab[]
+  shares      ProjectShare[]
+  invites     ProjectInvite[]
 
   @@unique([userId, name])
   @@index([userId, archived])
@@ -127,6 +132,36 @@ model WorkTimeEntry {
   @@unique([username, project, provider, date])
   @@index([username, date])
   @@map("work_time_entries")
+}
+
+// Project sharing — grants another user access to a project's tmux sessions
+model ProjectShare {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String   // the collaborator (invitee)
+  user      User     @relation("sharedWithMe", fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_shares")
+}
+
+// Pending invitations to share a project
+model ProjectInvite {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  inviterId String
+  inviter   User     @relation("sentInvites", fields: [inviterId], references: [id])
+  inviteeId String
+  invitee   User     @relation("receivedInvites", fields: [inviteeId], references: [id])
+  status    String   @default("pending") // pending | accepted | declined
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, inviteeId])
+  @@map("project_invites")
 }
 
 // Latest Chrome tab snapshot from the local relay, keyed by relay token

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -85,6 +85,23 @@ export interface WorktimeResponse {
 export const worktimeApi = {
   get: (days = 30): Promise<WorktimeResponse> =>
     api.get('/api/worktime', { params: { days } }).then(r => r.data),
+};
+
+export const sharingApi = {
+  invite: (projectId: string, inviteeEmail: string) =>
+    api.post(`/api/projects/${projectId}/invite`, { inviteeEmail }).then(r => r.data),
+  listInvites: (): Promise<ProjectInvite[]> =>
+    api.get('/api/invites').then(r => r.data),
+  acceptInvite: (inviteId: string) =>
+    api.post(`/api/invites/${inviteId}/accept`).then(r => r.data),
+  declineInvite: (inviteId: string) =>
+    api.post(`/api/invites/${inviteId}/decline`).then(r => r.data),
+  listShares: (projectId: string): Promise<ProjectShareInfo[]> =>
+    api.get(`/api/projects/${projectId}/shares`).then(r => r.data),
+  revokeShare: (projectId: string, shareId: string) =>
+    api.delete(`/api/projects/${projectId}/shares/${shareId}`).then(r => r.data),
+  leaveProject: (projectId: string) =>
+    api.delete(`/api/projects/${projectId}/leave`).then(r => r.data),
 };
 
 export const browserApi = {

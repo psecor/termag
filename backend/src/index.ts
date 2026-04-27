@@ -16,6 +16,7 @@ import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
 import { usageRouter } from './routes/usage';
 import { worktimeRouter } from './routes/worktime';
+import { sharingRouter } from './routes/sharing';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -98,6 +99,7 @@ app.use(`${BASE_PATH}/api/browser`, browserRouter());
 app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());
 app.use(`${BASE_PATH}/api/usage`, usageRouter());
 app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
+app.use(`${BASE_PATH}/api`, sharingRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -143,7 +145,7 @@ function sessionBelongsToUser(sessionName: string, unixUsername: string): boolea
 }
 
 // Status push: track all connected status clients
-const statusClients = new Map<WebSocket, { unixUsername: string }>();
+const statusClients = new Map<WebSocket, { unixUsername: string; sharedOwnerUsernames: string[] }>();
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url ?? '', `http://localhost`);
@@ -181,9 +183,31 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      // Allow owner directly; for others, check if they have a share on the project
       if (user.id !== loggedInUserId) {
-        ws.close(1008, 'session forbidden');
-        return;
+        // Parse projectName from session: username-projectName-role
+        const afterUsername = tmuxSession.substring(dashIdx + 1);
+        const lastDash = afterUsername.lastIndexOf('-');
+        const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
+
+        let allowed = false;
+        if (projectName) {
+          const project = await prismaIndex.project.findFirst({
+            where: { userId: user.id, name: projectName },
+          });
+          if (project) {
+            const share = await prismaIndex.projectShare.findUnique({
+              where: { projectId_userId: { projectId: project.id, userId: loggedInUserId } },
+            });
+            if (share) allowed = true;
+          }
+        }
+
+        if (!allowed) {
+          ws.close(1008, 'session forbidden');
+          return;
+        }
+        console.log(`[TERMINAL] Shared access: routing ${tmuxSession} for collaborator`);
       }
 
       if (!isAgentConnected(user.id)) {
@@ -243,18 +267,26 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    prismaIndex.user.findUnique({ where: { id: loggedInUserId } }).then((user) => {
+    prismaIndex.user.findUnique({ where: { id: loggedInUserId } }).then(async (user) => {
       if (!user) {
         ws.close(1008, 'unknown user');
         return;
       }
 
-      statusClients.set(ws, { unixUsername: user.unixUsername });
-      console.log(`[STATUS] Client connected for ${user.unixUsername} (total: ${statusClients.size})`);
+      // Find owner usernames for projects shared with this user
+      const shares = await prismaIndex.projectShare.findMany({
+        where: { userId: user.id },
+        include: { project: { include: { user: { select: { unixUsername: true } } } } },
+      });
+      const sharedOwnerUsernames = [...new Set(shares.map(s => s.project.user.unixUsername))];
+
+      statusClients.set(ws, { unixUsername: user.unixUsername, sharedOwnerUsernames });
+      console.log(`[STATUS] Client connected for ${user.unixUsername} (shared owners: [${sharedOwnerUsernames.join(',')}], total: ${statusClients.size})`);
 
       // Send current statuses for this user so the client starts with the right state
       for (const [session, status] of getAllStatuses()) {
-        if (sessionBelongsToUser(session, user.unixUsername)) {
+        if (sessionBelongsToUser(session, user.unixUsername) ||
+            sharedOwnerUsernames.some(owner => sessionBelongsToUser(session, owner))) {
           ws.send(JSON.stringify({ type: 'status', session, ...status }));
         }
       }
@@ -302,7 +334,8 @@ setStatusChangeCallback((sessionName: string) => {
   console.log(`[STATUS] Push ${sessionName} to ${statusClients.size} clients`);
   for (const [client, clientInfo] of statusClients) {
     if (client.readyState === WebSocket.OPEN) {
-      if (sessionBelongsToUser(sessionName, clientInfo.unixUsername)) {
+      if (sessionBelongsToUser(sessionName, clientInfo.unixUsername) ||
+          clientInfo.sharedOwnerUsernames.some(owner => sessionBelongsToUser(sessionName, owner))) {
         client.send(payload);
       }
     }

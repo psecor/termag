@@ -24,6 +24,24 @@ export interface Project {
   color?: string;
   archived: boolean;
   workflows: Workflow[];
+  ownerUsername?: string;
+  role?: 'owner' | 'collaborator';
+}
+
+export interface ProjectInvite {
+  id: string;
+  projectName: string;
+  inviterName: string;
+  inviterUsername: string;
+  createdAt: string;
+}
+
+export interface ProjectShareInfo {
+  id: string;
+  userName: string;
+  userEmail: string;
+  unixUsername: string;
+  createdAt: string;
 }
 
 

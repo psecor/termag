@@ -21,12 +21,42 @@ export function projectsRouter(): Router {
 
   const list: RequestHandler = async (req, res) => {
     try {
-      const projects = await prisma.project.findMany({
+      // Owned projects
+      const owned = await prisma.project.findMany({
         where: { userId: req.user!.id, archived: false },
-        include: { workflows: true },
+        include: { workflows: true, user: { select: { unixUsername: true } } },
         orderBy: { name: 'asc' },
       });
-      res.json(projects);
+
+      // Shared projects (via ProjectShare)
+      const shares = await prisma.projectShare.findMany({
+        where: { userId: req.user!.id },
+        include: {
+          project: {
+            include: { workflows: true, user: { select: { unixUsername: true } } },
+          },
+        },
+      });
+
+      const result = [
+        ...owned.map(p => ({
+          id: p.id, name: p.name, description: p.description, color: p.color,
+          archived: p.archived, createdAt: p.createdAt, updatedAt: p.updatedAt,
+          userId: p.userId, workflows: p.workflows,
+          ownerUsername: p.user.unixUsername, role: 'owner' as const,
+        })),
+        ...shares
+          .filter(s => !s.project.archived)
+          .map(s => ({
+            id: s.project.id, name: s.project.name, description: s.project.description,
+            color: s.project.color, archived: s.project.archived,
+            createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
+            userId: s.project.userId, workflows: s.project.workflows,
+            ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
+          })),
+      ];
+
+      res.json(result);
     } catch {
       res.status(500).json({ error: 'Failed to list projects' });
     }

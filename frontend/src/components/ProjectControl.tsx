@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Project, STATUS_EMOJI, AgentStatusValue } from '../types';
+import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue } from '../types';
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
-import { projectsApi, agentTokensApi, AgentTokenInfo } from '../services/api';
+import { projectsApi, agentTokensApi, sharingApi, AgentTokenInfo } from '../services/api';
 
 export function ProjectControl() {
   const { user, logout, updateDefaultAgentProvider } = useAuth();
@@ -27,7 +27,8 @@ export function ProjectControl() {
     const settled = Date.now() - mountedAtRef.current > 3000;
 
     for (const p of projects) {
-      const session = `${user?.unixUsername}-${p.name}-agent`;
+      const owner = p.ownerUsername ?? user?.unixUsername ?? '';
+      const session = `${owner}-${p.name}-agent`;
       const currentStatus = statusMap[session]?.status ?? 'not_running';
       const prevStatus = prev[session];
       if (settled && prevStatus !== undefined && prevStatus !== currentStatus) {
@@ -53,6 +54,41 @@ export function ProjectControl() {
     }
   }, [statusMap, projects, user?.unixUsername]);
 
+  // Sharing / invites
+  const [invites, setInvites] = useState<ProjectInvite[]>([]);
+  const [shareProjectId, setShareProjectId] = useState<string | null>(null);
+  const [shareEmail, setShareEmail] = useState('');
+  const [shares, setShares] = useState<ProjectShareInfo[]>([]);
+
+  // Load pending invites on mount
+  useEffect(() => {
+    if (user) sharingApi.listInvites().then(data => {
+      if (Array.isArray(data)) setInvites(data);
+    }).catch(() => {});
+  }, [user]);
+
+  // Track which owned projects have active shares
+  const [sharedProjectIds, setSharedProjectIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!user) return;
+    const ownedProjects = projects.filter(p => p.role !== 'collaborator');
+    Promise.all(ownedProjects.map(p =>
+      sharingApi.listShares(p.id).then(data => Array.isArray(data) && data.length > 0 ? p.id : null).catch(() => null)
+    )).then(results => {
+      setSharedProjectIds(new Set(results.filter(Boolean) as string[]));
+    });
+  }, [projects, user]);
+
+  // Load shares when share panel opens
+  useEffect(() => {
+    if (shareProjectId) {
+      sharingApi.listShares(shareProjectId).then(data => {
+        if (Array.isArray(data)) setShares(data); else setShares([]);
+      }).catch(() => setShares([]));
+    }
+  }, [shareProjectId]);
+
   // Agent tokens
   const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
   const [newTokenName, setNewTokenName] = useState('');
@@ -72,7 +108,8 @@ export function ProjectControl() {
   }, [user?.defaultAgentProvider]);
 
   function agentSessionName(project: Project): string {
-    return `${user?.unixUsername}-${project.name}-agent`;
+    const owner = project.ownerUsername ?? user?.unixUsername ?? '';
+    return `${owner}-${project.name}-agent`;
   }
 
   function statusEmoji(project: Project): string {
@@ -92,6 +129,58 @@ export function ProjectControl() {
       if (fromSource) return fromSource;
     }
     return persistedAgentProvider(project);
+  }
+
+  async function acceptInvite(inviteId: string) {
+    try {
+      await sharingApi.acceptInvite(inviteId);
+      setInvites(prev => prev.filter(i => i.id !== inviteId));
+      await reloadProjects();
+    } catch { setError('Failed to accept invite'); }
+  }
+
+  async function declineInvite(inviteId: string) {
+    try {
+      await sharingApi.declineInvite(inviteId);
+      setInvites(prev => prev.filter(i => i.id !== inviteId));
+    } catch { setError('Failed to decline invite'); }
+  }
+
+  async function sendInvite(e: React.FormEvent) {
+    e.preventDefault();
+    if (!shareProjectId || !shareEmail.trim()) return;
+    try {
+      await sharingApi.invite(shareProjectId, shareEmail.trim());
+      setShareEmail('');
+      setError('');
+      // Refresh shares list
+      const updated = await sharingApi.listShares(shareProjectId);
+      setShares(updated);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setError(msg || 'Failed to send invite');
+    }
+  }
+
+  async function revokeShare(shareId: string) {
+    if (!shareProjectId) return;
+    try {
+      await sharingApi.revokeShare(shareProjectId, shareId);
+      const remaining = shares.filter(s => s.id !== shareId);
+      setShares(remaining);
+      if (remaining.length === 0) {
+        setSharedProjectIds(prev => { const next = new Set(prev); next.delete(shareProjectId!); return next; });
+      }
+    } catch { setError('Failed to revoke share'); }
+  }
+
+  async function leaveProject(projectId: string) {
+    if (!confirm('Leave this shared project?')) return;
+    try {
+      await sharingApi.leaveProject(projectId);
+      if (activeProjectId === projectId) setActiveProject(null);
+      await reloadProjects();
+    } catch { setError('Failed to leave project'); }
   }
 
   async function createProject(e: React.FormEvent) {
@@ -173,6 +262,25 @@ export function ProjectControl() {
 
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
 
+      {invites.length > 0 && (
+        <section className="control-section invite-section">
+          <h3>Invites</h3>
+          <ul className="invite-list">
+            {invites.map(inv => (
+              <li key={inv.id} className="invite-item">
+                <span className="invite-info">
+                  <strong>{inv.projectName}</strong> from {inv.inviterName}
+                </span>
+                <span className="invite-actions">
+                  <button className="btn-tiny btn-success" onClick={() => acceptInvite(inv.id)}>accept</button>
+                  <button className="btn-tiny btn-danger" onClick={() => declineInvite(inv.id)}>decline</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="control-section">
         <h3>Projects</h3>
         <ul className="project-list">
@@ -203,12 +311,19 @@ export function ProjectControl() {
                   <>
                     <span
                       className="project-name"
-                      onDoubleClick={e => {
+                      onDoubleClick={p.role !== 'collaborator' ? (e => {
                         e.stopPropagation();
                         setRenamingId(p.id);
                         setRenameValue(p.name);
-                      }}
-                    >{p.name}</span>
+                      }) : undefined}
+                    >
+                      {p.name}
+                      {p.role === 'collaborator' && (
+                        <span className="shared-label" title={`Shared by ${p.ownerUsername}`}>
+                          {` (${p.ownerUsername})`}
+                        </span>
+                      )}
+                    </span>
                     {config && (
                       <span
                         className="project-provider-badge"
@@ -224,7 +339,14 @@ export function ProjectControl() {
                   </>
                 )}
                 <span className="project-actions" onClick={e => e.stopPropagation()}>
-                  <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
+                  {p.role === 'collaborator' ? (
+                    <button className="btn-tiny btn-danger" onClick={() => leaveProject(p.id)} title="Leave shared project">×</button>
+                  ) : (
+                    <>
+                      <button className={`btn-tiny btn-share${sharedProjectIds.has(p.id) ? ' active' : ''}`} onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); }} title="Share">sh</button>
+                      <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
+                    </>
+                  )}
                 </span>
               </li>
             );
@@ -248,6 +370,30 @@ export function ProjectControl() {
           </select>
           <button type="submit">+</button>
         </form>
+
+        {shareProjectId && (
+          <div className="share-panel">
+            <h4>Share: {projects.find(p => p.id === shareProjectId)?.name}</h4>
+            <form className="inline-form" onSubmit={sendInvite}>
+              <input
+                value={shareEmail}
+                onChange={e => setShareEmail(e.target.value)}
+                placeholder="user email"
+              />
+              <button type="submit">invite</button>
+            </form>
+            {shares.length > 0 && (
+              <ul className="share-list">
+                {shares.map(s => (
+                  <li key={s.id} className="share-item">
+                    <span>{s.userName} ({s.unixUsername})</span>
+                    <button className="btn-tiny btn-danger" onClick={() => revokeShare(s.id)}>revoke</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </section>
 
       <section className="control-section">
