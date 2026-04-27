@@ -134,6 +134,9 @@ export function registerDiscordEvents(client: Client): void {
         const projDir = projectDir(username, projectName);
         if (isAgentConnected(termagUser.id)) {
           await sendToAgent(termagUser.id, 'mkdir', { dir: projDir });
+          sendToAgent(termagUser.id, 'init-wiki', {
+            dir: projDir, slug: projectName, username,
+          }).catch(() => {});
         }
 
         const project = await prisma.project.create({

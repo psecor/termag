@@ -44,6 +44,59 @@ if (!termag_url || !token) {
   process.exit(1);
 }
 
+// ── Wiki init ─────────────────────────────────────────────────────────────
+const { readFile: readFileAsync, writeFile } = require('fs/promises');
+
+const WIKI_TEMPLATE_PATH = path.join(
+  process.env.HOME || '/home', 'termag', 'projects', 'agent-wiki', 'spec', 'template.md'
+);
+
+async function initWikiFiles(dir, slug, username) {
+  const agentsPath = path.join(dir, 'AGENTS.md');
+  const claudePath = path.join(dir, 'CLAUDE.md');
+
+  // Idempotent: skip if AGENTS.md already exists
+  if (fs.existsSync(agentsPath)) {
+    return { ok: true, skipped: true };
+  }
+
+  // Read and extract template content from between ```markdown and ``` fences
+  let templateRaw;
+  try {
+    templateRaw = await readFileAsync(WIKI_TEMPLATE_PATH, 'utf8');
+  } catch (err) {
+    console.error('[INIT-WIKI] Cannot read template:', err.message);
+    return { ok: false, error: 'Template not found' };
+  }
+
+  const fenceMatch = templateRaw.match(/```markdown\n([\s\S]*?)```/);
+  if (!fenceMatch) {
+    return { ok: false, error: 'No markdown fence found in template' };
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const content = fenceMatch[1]
+    .replace(/<slug>/g, slug)
+    .replace(/<project name>/g, slug)
+    .replace(/YYYY-MM-DD/g, today)
+    .replace(/^\s*- agent:<model-id>.*\n/m, '')
+    .replace(/<handle>/g, username)
+    .replace(/^(\s*- (?:human|agent):\S+)\s+#.*$/gm, '$1');
+
+  const created = [];
+
+  await writeFile(agentsPath, content, 'utf8');
+  created.push('AGENTS.md');
+
+  if (!fs.existsSync(claudePath)) {
+    await writeFile(claudePath, '@AGENTS.md\n', 'utf8');
+    created.push('CLAUDE.md');
+  }
+
+  console.log(`[INIT-WIKI] Initialized ${created.join(', ')} for ${slug}`);
+  return { ok: true, created };
+}
+
 // ── Usage scanner ──────────────────────────────────────────────────────────
 const { readdir, readFile, stat } = require('fs/promises');
 
@@ -349,6 +402,13 @@ function connect() {
           const { dir } = msg;
           await mkdir(dir, { recursive: true });
           respond(ws, requestId, { ok: true });
+          break;
+        }
+
+        case 'init-wiki': {
+          const { dir, slug, username } = msg;
+          const result = await initWikiFiles(dir, slug, username);
+          respond(ws, requestId, result);
           break;
         }
 

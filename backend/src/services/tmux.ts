@@ -1,6 +1,8 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
+import { mkdir, readFile, writeFile } from 'fs/promises';
+import { join } from 'path';
 import { ALL_PROCESS_NAMES } from '../providers/registry';
 
 const execAsync = promisify(exec);
@@ -19,7 +21,44 @@ export async function ensureProjectDir(username: string, projectName: string): P
   } catch {
     await execAsync(`git init ${shellEscape(dir)}`);
   }
+  // Seed AGENTS.md + CLAUDE.md if absent
+  await initWikiFiles(dir, projectName, username);
   return dir;
+}
+
+const WIKI_TEMPLATE_PATH = join(
+  '/home', 'secorp', 'termag', 'projects', 'agent-wiki', 'spec', 'template.md'
+);
+
+async function initWikiFiles(dir: string, slug: string, username: string): Promise<void> {
+  const agentsPath = join(dir, 'AGENTS.md');
+  if (existsSync(agentsPath)) return;
+
+  let templateRaw: string;
+  try {
+    templateRaw = await readFile(WIKI_TEMPLATE_PATH, 'utf8');
+  } catch {
+    return; // Template not available — skip silently
+  }
+
+  const fenceMatch = templateRaw.match(/```markdown\n([\s\S]*?)```/);
+  if (!fenceMatch) return;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const content = fenceMatch[1]
+    .replace(/<slug>/g, slug)
+    .replace(/<project name>/g, slug)
+    .replace(/YYYY-MM-DD/g, today)
+    .replace(/^\s*- agent:<model-id>.*\n/m, '')
+    .replace(/<handle>/g, username)
+    .replace(/^(\s*- (?:human|agent):\S+)\s+#.*$/gm, '$1');
+
+  await writeFile(agentsPath, content, 'utf8');
+
+  const claudePath = join(dir, 'CLAUDE.md');
+  if (!existsSync(claudePath)) {
+    await writeFile(claudePath, '@AGENTS.md\n', 'utf8');
+  }
 }
 
 export function sessionName(username: string, project: string, role: 'agent' | 'ctrl' | 'data' | 'data-ctrl'): string {

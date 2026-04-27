@@ -353,6 +353,9 @@ export function registerEventHandlers(app: App): void {
         const projDir = projectDir(termagUser.unixUsername, projectName);
         if (isAgentConnected(termagUser.id)) {
           await sendToAgent(termagUser.id, 'mkdir', { dir: projDir });
+          sendToAgent(termagUser.id, 'init-wiki', {
+            dir: projDir, slug: projectName, username: termagUser.unixUsername,
+          }).catch(() => {});
         }
 
         // Create project in DB

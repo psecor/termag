@@ -79,9 +79,14 @@ export function projectsRouter(): Router {
         return;
       }
 
-      // Create project directory — via agent if connected, else direct
+      // Create project directory + seed AGENTS.md — via agent if connected, else direct
+      const projDir = tmux.projectDir(req.user!.unixUsername, name);
       if (isAgentConnected(req.user!.id)) {
-        await sendToAgent(req.user!.id, 'mkdir', { dir: tmux.projectDir(req.user!.unixUsername, name) });
+        await sendToAgent(req.user!.id, 'mkdir', { dir: projDir });
+        // Fire-and-forget: seed wiki files (agent handles idempotency)
+        sendToAgent(req.user!.id, 'init-wiki', {
+          dir: projDir, slug: name, username: req.user!.unixUsername,
+        }).catch(() => {});
       } else {
         await tmux.ensureProjectDir(req.user!.unixUsername, name);
       }
