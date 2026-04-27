@@ -61,6 +61,21 @@ function parseCursorStatusBar(lines: string[]): Record<string, any> {
   return {};
 }
 
+const VIBE_STATUS_BAR = /(\d+)%\s*of\s*(\d+)k\s*tokens/;
+
+function parseVibeStatusBar(lines: string[]): Record<string, any> {
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+    const m = VIBE_STATUS_BAR.exec(lines[i]);
+    if (m) {
+      return {
+        vibeTokenPct: parseInt(m[1], 10),
+        vibeTokenBudgetK: parseInt(m[2], 10),
+      };
+    }
+  }
+  return {};
+}
+
 // ── Provider definitions ────────────────────────────────────
 
 export const PROVIDERS: Record<string, ProviderConfig> = {
@@ -162,6 +177,28 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
       activityPatterns: [
         /^\s*(Thinking|Reading|Writing|Editing|Searching|Running|Executing)\b/i,
       ],
+    },
+    usageMethod: 'none',
+    usagePrecision: 'estimated',
+  },
+
+  mistral: {
+    id: 'mistral',
+    displayName: 'Mistral',
+    badge: 'MI',
+    color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
+    launchCommand: 'vibe',
+    processNames: ['vibe'],
+    statusSources: ['tmux-poller'],
+    needsPoller: true,
+    pollerConfig: {
+      idlePattern: /│\s*>\s/m,
+      activityPatterns: [
+        /^\s*✓\s*(Thought|Ran|Read|Created|Updated|Deleted|Wrote|Edited)\b/,
+        /Running command/,
+      ],
+      spinnerPattern: /[\u2800-\u28FF]/,
+      statusBarParser: parseVibeStatusBar,
     },
     usageMethod: 'none',
     usagePrecision: 'estimated',

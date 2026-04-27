@@ -70,6 +70,15 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     usagePrecision: 'estimated',
     statusSources: ['tmux-poller'],
   },
+
+  mistral: {
+    id: 'mistral',
+    displayName: 'Mistral',
+    badge: 'MI',
+    color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
+    usagePrecision: 'estimated',
+    statusSources: ['tmux-poller'],
+  },
 };
 
 export const PROVIDER_IDS = Object.keys(PROVIDERS);
