@@ -114,12 +114,13 @@ function activeWtProviders(wt: WorktimeResponse): ProviderConfig[] {
 // ── Visual constants ────────────────────────────────────────────
 
 const EMPTY: UsageDayData = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
-const GRAD_MARKS = [25, 50, 75, 100, 125, 150, 200];
+const THERMO_MAX_MS = 8 * 3_600_000; // 8 hours
+const THERMO_MID_MS = 4 * 3_600_000; // 4 hours
+const GRAD_MARKS = [1, 2, 3, 4, 5, 6, 7, 8]; // hours
 
 function fillGradient(pct: number, color: { base: string; bright: string }): string {
-  const fillPct = Math.min(200, pct);
-  if (fillPct <= 100) return color.base;
-  const midPoint = (100 / fillPct) * 100;
+  if (pct <= 50) return color.base;
+  const midPoint = (50 / pct) * 100;
   return `linear-gradient(to top, ${color.base} 0%, ${color.base} ${midPoint}%, ${color.bright} 100%)`;
 }
 
@@ -263,17 +264,18 @@ function TokenBarChart({ days, providerData, providers, height }: TokenBarChartP
 // ── Thermometer Tube ────────────────────────────────────────────
 
 interface ThermoTubeProps {
-  pct: number;
+  ms: number;
   color: { base: string; bright: string };
   label: string;
 }
 
-function ThermoTube({ pct, color, label }: ThermoTubeProps) {
-  const fillPct = Math.min(200, pct);
+function ThermoTube({ ms, color, label }: ThermoTubeProps) {
+  const pct = THERMO_MAX_MS > 0 ? (ms / THERMO_MAX_MS) * 100 : 0;
+  const clampedPct = Math.min(100, pct);
   return (
     <div className="usage-thermo-tube">
       <div className="usage-thermo-fill" style={{
-        height: `${(fillPct / 200) * 100}%`,
+        height: `${clampedPct}%`,
         background: fillGradient(pct, color),
       }} />
       <div className="usage-thermo-tube-label">{label}</div>
@@ -337,13 +339,11 @@ export function UsageMini() {
   const trailingUTC = lastNDaysUTC(15).slice(0, 14);
   const wtP50 = median(trailingUTC.map(d => dayMs(worktime.days[d])));
 
-  // Per-provider % of p50
-  const wtPctByProvider: Record<string, number> = {};
+  // Per-provider ms for tube fill
+  const wtMsByProvider: Record<string, number> = {};
   for (const p of wtProviders) {
-    const provMs = todayWt[p.id]?.totalMs || 0;
-    wtPctByProvider[p.id] = wtP50 > 0 ? Math.round((provMs / wtP50) * 100) : 0;
+    wtMsByProvider[p.id] = todayWt[p.id]?.totalMs || 0;
   }
-  const combinedWtPct = wtP50 > 0 ? Math.round((todayTotalMs / wtP50) * 100) : 0;
 
   // Working time over longer periods
   const allWtDates = Object.keys(worktime.days);
@@ -369,19 +369,19 @@ export function UsageMini() {
     <>
       {/* Thermometer — working time */}
       <div className="usage-thermo" onClick={() => setExpanded(!expanded)}>
-        <div className="usage-thermo-pct">{combinedWtPct > 0 ? `${combinedWtPct}%` : '--'}</div>
+        <div className="usage-thermo-pct">{todayTotalMs > 0 ? fmtDurationShort(todayTotalMs) : '--'}</div>
         <div className="usage-thermo-tubes">
           {wtProviders.map(p => (
-            <ThermoTube key={p.id} pct={wtPctByProvider[p.id]} color={p.color} label={p.badge} />
+            <ThermoTube key={p.id} ms={wtMsByProvider[p.id]} color={p.color} label={p.badge} />
           ))}
           <div className="usage-thermo-marks">
             {GRAD_MARKS.map(mark => (
               <div
                 key={mark}
-                className={`usage-thermo-mark ${mark === 100 ? 'usage-thermo-mark-100' : ''}`}
-                style={{ bottom: `${(mark / 200) * 100}%` }}
+                className={`usage-thermo-mark ${mark === 4 ? 'usage-thermo-mark-100' : ''}`}
+                style={{ bottom: `${(mark / 8) * 100}%` }}
               >
-                <span>{mark}</span>
+                <span>{mark}h</span>
               </div>
             ))}
           </div>
@@ -427,8 +427,8 @@ export function UsageMini() {
               <div className="usage-overlay-section-header">
                 <span>Today</span>
                 <span>{fmtDuration(todayTotalMs)}</span>
-                <span className={`usage-overlay-pct ${combinedWtPct > 120 ? 'usage-hot' : ''}`}>
-                  {wtP50 > 0 ? `${combinedWtPct}% of p50` : 'building baseline'}
+                <span className={`usage-overlay-pct ${todayTotalMs > THERMO_MID_MS ? 'usage-hot' : ''}`}>
+                  {todayTotalMs > 0 ? `${Math.round((todayTotalMs / THERMO_MAX_MS) * 100)}% of 8h` : ''}
                 </span>
               </div>
               <div className="usage-overlay-tokens">
