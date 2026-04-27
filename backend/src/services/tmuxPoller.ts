@@ -223,20 +223,21 @@ function inferRawStatus(
 // ── Poll loop ───────────────────────────────────────────────
 
 async function pollSession(tmuxSession: string): Promise<void> {
+  const state = polledSessions.get(tmuxSession)!;
+  const config = PROVIDERS[state.provider];
+  const pollerSource = `tmux-poller:${state.provider}`;
+
   const running = await isAgentRunning(tmuxSession);
   if (!running) {
     const current = getStatus(tmuxSession);
-    if (current.source === 'tmux-poller' || current.status === 'not_running') {
+    if ((current.source && current.source.startsWith('tmux-poller')) || current.status === 'not_running') {
       if (current.status !== 'not_running') {
-        setStatus(tmuxSession, 'not_running', { source: 'tmux-poller' });
+        setStatus(tmuxSession, 'not_running', { source: pollerSource });
         notifyStatusChange(tmuxSession);
       }
     }
     return;
   }
-
-  const state = polledSessions.get(tmuxSession)!;
-  const config = PROVIDERS[state.provider];
   if (!config) return;
 
   const rawContent = await capturePaneText(tmuxSession);
@@ -251,7 +252,7 @@ async function pollSession(tmuxSession: string): Promise<void> {
 
   // Don't override status from non-poller sources
   const current = getStatus(tmuxSession);
-  if (current.source && current.source !== 'tmux-poller' && current.source !== 'tmux-fallback') {
+  if (current.source && !current.source.startsWith('tmux-poller') && current.source !== 'tmux-fallback') {
     return;
   }
 
@@ -276,7 +277,7 @@ async function pollSession(tmuxSession: string): Promise<void> {
   if (raw === 'working') {
     state.lastWorkingAt = now;
     if (current.status !== 'working' || metaChanged) {
-      setStatus(tmuxSession, 'working', { source: 'tmux-poller', pollerMeta });
+      setStatus(tmuxSession, 'working', { source: pollerSource, pollerMeta });
       notifyStatusChange(tmuxSession);
     }
     return;
@@ -288,7 +289,7 @@ async function pollSession(tmuxSession: string): Promise<void> {
   }
 
   if (current.status !== raw || metaChanged) {
-    setStatus(tmuxSession, raw, { source: 'tmux-poller', pollerMeta });
+    setStatus(tmuxSession, raw, { source: pollerSource, pollerMeta });
     notifyStatusChange(tmuxSession);
   }
 }

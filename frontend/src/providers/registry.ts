@@ -41,7 +41,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     badge: 'CR',
     color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller', 'tmux-poller:cursor'],
   },
 
   gemini: {
@@ -50,7 +50,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     badge: 'GE',
     color: { base: 'rgba(66, 133, 244, 0.6)', bright: 'rgba(120, 170, 255, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:gemini'],
   },
 
   augment: {
@@ -59,7 +59,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     badge: 'AG',
     color: { base: 'rgba(255, 152, 0, 0.6)', bright: 'rgba(255, 183, 77, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:augment'],
   },
 
   deepseek: {
@@ -68,7 +68,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     badge: 'DS',
     color: { base: 'rgba(0, 150, 136, 0.6)', bright: 'rgba(77, 208, 195, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:deepseek'],
   },
 
   mistral: {
@@ -77,7 +77,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     badge: 'MI',
     color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:mistral'],
   },
 };
 

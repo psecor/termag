@@ -113,7 +113,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
     launchCommand: 'agent',
     processNames: ['agent'],
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller', 'tmux-poller:cursor'],
     needsPoller: true,
     pollerConfig: {
       idlePattern: /^\s*→\s/m,
@@ -134,7 +134,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(66, 133, 244, 0.6)', bright: 'rgba(120, 170, 255, 0.9)' },
     launchCommand: 'gemini',
     processNames: ['gemini'],
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:gemini'],
     needsPoller: true,
     pollerConfig: {
       idlePattern: /^\s*>\s/m,
@@ -153,7 +153,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(255, 152, 0, 0.6)', bright: 'rgba(255, 183, 77, 0.9)' },
     launchCommand: 'auggie',
     processNames: ['auggie'],
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:augment'],
     needsPoller: true,
     pollerConfig: {
       idlePattern: /^\s*>\s/m,
@@ -172,7 +172,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(0, 150, 136, 0.6)', bright: 'rgba(77, 208, 195, 0.9)' },
     launchCommand: 'deepseek',
     processNames: ['deepseek'],
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:deepseek'],
     needsPoller: true,
     pollerConfig: {
       idlePattern: /^\s*>\s/m,
@@ -191,7 +191,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
     launchCommand: 'vibe',
     processNames: ['vibe'],
-    statusSources: ['tmux-poller'],
+    statusSources: ['tmux-poller:mistral'],
     needsPoller: true,
     pollerConfig: {
       idlePattern: /│\s*>\s/m,
