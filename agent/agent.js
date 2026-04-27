@@ -206,16 +206,49 @@ async function scanCodexUsage(days) {
   }
 }
 
+async function scanVibeUsage(days) {
+  const sessionDir = path.join(process.env.HOME || '/home', '.vibe', 'logs', 'session');
+
+  let sessionDirs;
+  try {
+    sessionDirs = await readdir(sessionDir);
+  } catch {
+    return;
+  }
+
+  for (const dir of sessionDirs) {
+    // Directory name format: session_YYYYMMDD_HHMMSS_<id>
+    const dateMatch = dir.match(/^session_(\d{4})(\d{2})(\d{2})_/);
+    if (!dateMatch) continue;
+    const date = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+
+    const metaPath = path.join(sessionDir, dir, 'meta.json');
+    try {
+      const content = await readFile(metaPath, 'utf8');
+      const meta = JSON.parse(content);
+      const s = meta.stats;
+      if (!s) continue;
+
+      const d = ensureDay(days, date);
+      d.input += s.session_prompt_tokens || 0;
+      d.output += s.session_completion_tokens || 0;
+      d.calls += s.steps || 1;
+    } catch { continue; }
+  }
+}
+
 async function scanUsage() {
   const claude = {};
   const codex = {};
+  const mistral = {};
   await Promise.all([
     scanClaudeUsage(claude),
     scanCodexUsage(codex),
+    scanVibeUsage(mistral),
   ]);
   // Merge into combined totals
   const days = {};
-  for (const src of [claude, codex]) {
+  for (const src of [claude, codex, mistral]) {
     for (const [date, d] of Object.entries(src)) {
       const t = ensureDay(days, date);
       t.input += d.input;
@@ -225,7 +258,7 @@ async function scanUsage() {
       t.calls += d.calls;
     }
   }
-  return { days, providers: { claude, codex } };
+  return { days, providers: { claude, codex, mistral } };
 }
 
 // Active PTY streams: streamId → { pty, tmuxSessionName }
