@@ -28,6 +28,7 @@ import {
 } from './services/agentRegistry';
 import { PrismaClient } from '@prisma/client';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
+import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
 
 const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
@@ -346,11 +347,13 @@ setStatusChangeCallback((sessionName: string) => {
 server.listen(PORT, () => {
   console.log(`termag backend running on port ${PORT} at ${BASE_PATH}`);
   startTmuxPoller().catch(err => console.error('[TMUX-POLLER] Failed to start:', err));
+  startHumanActivityTracker();
 });
 
 function shutdown() {
   console.log('termag shutting down...');
   stopTmuxPoller();
+  stopHumanActivityTracker();
   // Close all WebSocket connections so the process can exit
   for (const client of wss.clients) {
     client.close(1001, 'server shutting down');

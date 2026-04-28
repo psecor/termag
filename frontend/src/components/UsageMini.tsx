@@ -124,6 +124,44 @@ function fillGradient(pct: number, color: { base: string; bright: string }): str
   return `linear-gradient(to top, ${color.base} 0%, ${color.base} ${midPoint}%, ${color.bright} 100%)`;
 }
 
+// ── Stacked Horizontal Bar (single day) ────────────────────────
+
+interface WtStackedBarProps {
+  data: WtDayData;
+  providers: ProviderConfig[];
+  maxMs: number;
+  height: number;
+}
+
+function WtStackedBar({ data, providers, maxMs, height }: WtStackedBarProps) {
+  const segments = providers
+    .map(p => ({ provider: p, ms: data[p.id]?.totalMs || 0 }))
+    .filter(s => s.ms > 0);
+  const total = segments.reduce((s, seg) => s + seg.ms, 0);
+  if (total === 0) return null;
+  const fillPct = Math.min(100, (total / maxMs) * 100);
+
+  return (
+    <div className="wt-stacked-bar" style={{ height }}>
+      <div className="wt-stacked-bar-track">
+        <div className="wt-stacked-bar-fill" style={{ width: `${fillPct}%` }}>
+          {segments.map(seg => (
+            <div
+              key={seg.provider.id}
+              className="wt-stacked-bar-seg"
+              style={{
+                width: `${(seg.ms / total) * 100}%`,
+                background: seg.provider.color.base,
+              }}
+              title={`${seg.provider.displayName}: ${fmtDuration(seg.ms)}`}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Working Time Bar Chart ──────────────────────────────────────
 
 interface WtBarChartProps {
@@ -329,28 +367,43 @@ export function UsageMini() {
 
   const today = localToday();
   const tDates = todayDates();
-  const wtProviders = activeWtProviders(worktime);
+  const allWtProviders = activeWtProviders(worktime);
+  const agentProviders = allWtProviders.filter(p => p.id !== 'human');
+  const humanConfig = PROVIDERS['human'];
 
   // Today's working time (merged across local/UTC date)
   const todayWt = mergeWtDays(worktime, tDates);
-  const todayTotalMs = Object.values(todayWt).reduce((s, v) => s + v.totalMs, 0);
+  const todayAgentWt: WtDayData = {};
+  const todayHumanMs = todayWt['human']?.totalMs || 0;
+  for (const [pid, v] of Object.entries(todayWt)) {
+    if (pid !== 'human') todayAgentWt[pid] = v;
+  }
+  const todayAgentMs = Object.values(todayAgentWt).reduce((s, v) => s + v.totalMs, 0);
 
   // Trailing 14-day p50 working time (use UTC days since server stores UTC)
   const trailingUTC = lastNDaysUTC(15).slice(0, 14);
   const wtP50 = median(trailingUTC.map(d => dayMs(worktime.days[d])));
 
-  // Per-provider ms for tube fill
+  // Per-provider ms for tube fill (agents only)
   const wtMsByProvider: Record<string, number> = {};
-  for (const p of wtProviders) {
+  for (const p of agentProviders) {
     wtMsByProvider[p.id] = todayWt[p.id]?.totalMs || 0;
   }
 
-  // Working time over longer periods
+  // Working time over longer periods (agents only)
   const allWtDates = Object.keys(worktime.days);
   const weekUTC = lastNDaysUTC(7);
   const monthUTC = lastNDaysUTC(30);
-  const weekMs = weekUTC.reduce((s, d) => s + dayMs(worktime.days[d]), 0);
-  const monthMs = monthUTC.reduce((s, d) => s + dayMs(worktime.days[d]), 0);
+  const weekAgentMs = weekUTC.reduce((s, d) => {
+    const dw = worktime.days[d] || {};
+    return s + Object.entries(dw).filter(([k]) => k !== 'human').reduce((a, [, v]) => a + v.totalMs, 0);
+  }, 0);
+  const monthAgentMs = monthUTC.reduce((s, d) => {
+    const dw = worktime.days[d] || {};
+    return s + Object.entries(dw).filter(([k]) => k !== 'human').reduce((a, [, v]) => a + v.totalMs, 0);
+  }, 0);
+  const weekHumanMs = weekUTC.reduce((s, d) => (worktime.days[d]?.['human']?.totalMs || 0) + s, 0);
+  const monthHumanMs = monthUTC.reduce((s, d) => (worktime.days[d]?.['human']?.totalMs || 0) + s, 0);
 
   // Token data (secondary, for overlay detail)
   const tokenData = tokenResponse?.days ?? {};
@@ -369,11 +422,38 @@ export function UsageMini() {
     <>
       {/* Thermometer — working time */}
       <div className="usage-thermo" onClick={() => setExpanded(!expanded)}>
-        <div className="usage-thermo-pct">{todayTotalMs > 0 ? fmtDurationShort(todayTotalMs) : '--'}</div>
+        <div className="usage-thermo-header">
+          <span className="usage-thermo-pct">{todayAgentMs > 0 ? `${Math.round((todayAgentMs / THERMO_MID_MS) * 100)}%` : '--'}</span>
+          <span className="usage-thermo-pct usage-thermo-pct-human">{todayHumanMs > 0 ? `${Math.round((todayHumanMs / THERMO_MID_MS) * 100)}%` : '--'}</span>
+        </div>
         <div className="usage-thermo-tubes">
-          {wtProviders.map(p => (
-            <ThermoTube key={p.id} ms={wtMsByProvider[p.id]} color={p.color} label={p.badge} />
-          ))}
+          <div className="usage-thermo-tube usage-thermo-tube-stacked">
+            {agentProviders.map(p => {
+              const ms = wtMsByProvider[p.id] || 0;
+              if (ms <= 0) return null;
+              const segPct = (ms / THERMO_MAX_MS) * 100;
+              return (
+                <div
+                  key={p.id}
+                  className="usage-thermo-stack-seg"
+                  style={{ height: `${Math.min(segPct, 100)}%`, background: p.color.base }}
+                  title={`${p.displayName}: ${fmtDurationShort(ms)}`}
+                />
+              );
+            })}
+          </div>
+          <div className="usage-thermo-tube usage-thermo-tube-stacked">
+            {todayHumanMs > 0 && (
+              <div
+                className="usage-thermo-stack-seg"
+                style={{
+                  height: `${Math.min((todayHumanMs / THERMO_MAX_MS) * 100, 100)}%`,
+                  background: humanConfig.color.base,
+                }}
+                title={`You: ${fmtDurationShort(todayHumanMs)}`}
+              />
+            )}
+          </div>
           <div className="usage-thermo-marks">
             {GRAD_MARKS.map(mark => (
               <div
@@ -386,7 +466,10 @@ export function UsageMini() {
             ))}
           </div>
         </div>
-        <div className="usage-thermo-cost">{todayTotalMs > 0 ? fmtDurationShort(todayTotalMs) : '--'}</div>
+        <div className="usage-thermo-footer">
+          <span className="usage-thermo-cost">{todayAgentMs > 0 ? fmtDurationShort(todayAgentMs) : '--'}</span>
+          <span className="usage-thermo-cost usage-thermo-cost-human">{todayHumanMs > 0 ? fmtDurationShort(todayHumanMs) : '--'}</span>
+        </div>
       </div>
 
       {/* Expanded overlay */}
@@ -398,41 +481,42 @@ export function UsageMini() {
               <button className="usage-overlay-close" onClick={() => setExpanded(false)}>×</button>
             </div>
 
-            {/* Working time — 30 day chart */}
+            {/* Agent working time — 30 day chart */}
             {allWtDates.length > 0 && (
               <div className="usage-overlay-section">
                 <div className="usage-overlay-section-header">
-                  <span>30 days</span>
-                  <span>{fmtDuration(monthMs)}</span>
-                  <span className="usage-dim">avg {fmtDuration(Math.round(monthMs / 30))}/d</span>
+                  <span>Agents — 30d</span>
+                  <span>{fmtDuration(monthAgentMs)}</span>
+                  <span className="usage-dim">avg {fmtDuration(Math.round(monthAgentMs / 30))}/d</span>
                 </div>
-                <WtBarChart days={monthUTC} wt={worktime} providers={wtProviders} height={80} />
+                <WtBarChart days={monthUTC} wt={worktime} providers={agentProviders} height={80} />
               </div>
             )}
 
-            {/* Working time — 7 day chart */}
+            {/* Agent working time — 7 day chart */}
             {allWtDates.length > 0 && (
               <div className="usage-overlay-section">
                 <div className="usage-overlay-section-header">
-                  <span>7 days</span>
-                  <span>{fmtDuration(weekMs)}</span>
-                  <span className="usage-dim">avg {fmtDuration(Math.round(weekMs / 7))}/d</span>
+                  <span>Agents — 7d</span>
+                  <span>{fmtDuration(weekAgentMs)}</span>
+                  <span className="usage-dim">avg {fmtDuration(Math.round(weekAgentMs / 7))}/d</span>
                 </div>
-                <WtBarChart days={weekUTC} wt={worktime} providers={wtProviders} height={60} />
+                <WtBarChart days={weekUTC} wt={worktime} providers={agentProviders} height={60} />
               </div>
             )}
 
-            {/* Today working time breakdown */}
+            {/* Agent today breakdown */}
             <div className="usage-overlay-section">
               <div className="usage-overlay-section-header">
-                <span>Today</span>
-                <span>{fmtDuration(todayTotalMs)}</span>
-                <span className={`usage-overlay-pct ${todayTotalMs > THERMO_MID_MS ? 'usage-hot' : ''}`}>
-                  {todayTotalMs > 0 ? `${Math.round((todayTotalMs / THERMO_MAX_MS) * 100)}% of 8h` : ''}
+                <span>Agents — today</span>
+                <span>{fmtDuration(todayAgentMs)}</span>
+                <span className={`usage-overlay-pct ${todayAgentMs > THERMO_MID_MS ? 'usage-hot' : ''}`}>
+                  {todayAgentMs > 0 ? `${Math.round((todayAgentMs / THERMO_MAX_MS) * 100)}% of 8h` : ''}
                 </span>
               </div>
+              <WtStackedBar data={todayAgentWt} providers={agentProviders} maxMs={THERMO_MAX_MS} height={16} />
               <div className="usage-overlay-tokens">
-                {Object.entries(todayWt).map(([pid, v]) => {
+                {Object.entries(todayAgentWt).map(([pid, v]) => {
                   const config = PROVIDERS[pid];
                   return (
                     <div key={pid} className="usage-overlay-token-row">
@@ -444,8 +528,33 @@ export function UsageMini() {
                     </div>
                   );
                 })}
-                {Object.keys(todayWt).length === 0 && (
-                  <div className="usage-dim">No working time recorded yet today</div>
+                {Object.keys(todayAgentWt).length === 0 && (
+                  <div className="usage-dim">No agent working time today</div>
+                )}
+              </div>
+            </div>
+
+            {/* Your activity — separate from agents */}
+            <div className="usage-overlay-section">
+              <div className="usage-overlay-section-header">
+                <span>You — today</span>
+                <span>{todayHumanMs > 0 ? fmtDuration(todayHumanMs) : '--'}</span>
+                <span className="usage-dim">
+                  {weekHumanMs > 0 ? `${fmtDuration(weekHumanMs)} 7d` : ''}
+                </span>
+              </div>
+              {todayHumanMs > 0 && (
+                <WtStackedBar data={{ human: todayWt['human'] }} providers={[humanConfig]} maxMs={THERMO_MAX_MS} height={16} />
+              )}
+              <div className="usage-overlay-tokens">
+                {todayHumanMs > 0 ? (
+                  <div className="usage-overlay-token-row">
+                    <span className="usage-overlay-token-label" style={{ color: humanConfig.color.bright }}>Active time</span>
+                    <span>{fmtDuration(todayHumanMs)}</span>
+                    <span className="usage-dim">{todayWt['human']?.sessions || 0} ses</span>
+                  </div>
+                ) : (
+                  <div className="usage-dim">No activity recorded yet today</div>
                 )}
               </div>
             </div>
@@ -491,7 +600,7 @@ export function UsageMini() {
             </div>
 
             <div className="usage-legend">
-              {wtProviders.map(p => (
+              {allWtProviders.map((p: ProviderConfig) => (
                 <span key={p.id}><i style={{ background: p.color.base }} />{p.displayName}</span>
               ))}
             </div>

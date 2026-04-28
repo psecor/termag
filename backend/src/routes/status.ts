@@ -6,6 +6,8 @@ import { getSlackApp } from '../slack/app';
 import { getDiscordClient } from '../discord/app';
 import { capturePaneForSlack, formatPaneForSlack } from '../services/tmux';
 import { formatPaneForDiscord } from '../discord/formatting';
+import { recordHeartbeat } from '../services/humanActivity';
+import { requireAuth } from '../middleware/auth';
 
 // Track working start time and last notification per session
 const statusTracking = new Map<string, {
@@ -138,7 +140,18 @@ export function statusRouter(): Router {
     res.json(status);
   };
 
+  const heartbeat: RequestHandler = (req, res) => {
+    const { project } = req.body as { project?: string };
+    if (!project || typeof project !== 'string') {
+      res.status(400).json({ error: 'project required' });
+      return;
+    }
+    recordHeartbeat(req.user!.unixUsername, project);
+    res.json({ ok: true });
+  };
+
   router.post('/', postStatus);
+  router.post('/heartbeat', requireAuth, heartbeat);
   router.get('/:session', getStatusHandler);
 
   return router;

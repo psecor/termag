@@ -10,6 +10,7 @@ import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
 import { Project } from './types';
 import { computeWarpWithFallback } from './utils/warp';
+import { activityApi } from './services/api';
 
 function Login() {
   return (
@@ -39,6 +40,11 @@ function MainLayout() {
   const { user } = useAuthHook();
   const { projects, activeProjectId, statusMap } = useProjects();
 
+  const activeProject = projects.find(p => p.id === activeProjectId);
+  const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
+  const username = user?.unixUsername ?? '';
+  const sessionOwner = activeProject?.ownerUsername ?? username;
+
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
   const [warpSpeed, setWarpSpeed] = useState(0.1);
@@ -49,10 +55,17 @@ function MainLayout() {
     typingTimer.current = setTimeout(() => setTyping(false), 1500);
   }, []);
 
-  const activeProject = projects.find(p => p.id === activeProjectId);
-  const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
-  const username = user?.unixUsername ?? '';
-  const sessionOwner = activeProject?.ownerUsername ?? username;
+  // Heartbeat for human activity tracking — send every 30s while typing
+  useEffect(() => {
+    if (!typing || !activeProject) return;
+    activityApi.heartbeat(activeProject.name).catch(() => {});
+    const interval = setInterval(() => {
+      if (activeProject) {
+        activityApi.heartbeat(activeProject.name).catch(() => {});
+      }
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [typing, activeProject]);
 
   const projectAgentStatuses = Object.fromEntries(projects
     .filter(p => p.workflows.some(w => w.type === 'agent'))

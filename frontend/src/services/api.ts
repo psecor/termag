@@ -68,6 +68,11 @@ export interface UsageResponse {
   providers?: Record<string, Record<string, UsageDayData>>;
 }
 
+export const activityApi = {
+  heartbeat: (project: string) =>
+    api.post('/api/status/heartbeat', { project }).then(r => r.data),
+};
+
 export const usageApi = {
   get: (): Promise<UsageResponse> =>
     api.get('/api/usage').then(r => r.data),
