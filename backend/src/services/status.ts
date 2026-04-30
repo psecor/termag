@@ -98,6 +98,13 @@ export function getAllStatuses(): Map<string, AgentStatus> {
   return statusMap;
 }
 
+/** Update metadata fields without changing the status itself */
+export function updateStatusMeta(sessionName: string, meta: Partial<AgentStatusMeta>): void {
+  const existing = statusMap.get(sessionName);
+  if (!existing) return; // no status to update — ignore
+  statusMap.set(sessionName, { ...existing, ...meta, updatedAt: new Date() });
+}
+
 export function setStatus(
   sessionName: string,
   status: AgentStatus['status'],
@@ -121,6 +128,8 @@ export function setStatus(
     activeTurn: meta.activeTurn,
     threadId: meta.threadId,
     pollerMeta: meta.pollerMeta,
+    // Preserve contextTokens from previous state unless explicitly provided
+    contextTokens: meta.contextTokens ?? previous?.contextTokens,
   };
   statusMap.set(sessionName, entry);
 

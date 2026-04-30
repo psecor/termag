@@ -36,6 +36,8 @@ export interface AgentStatus {
   threadId?: string;
   /** Arbitrary metadata from tmux poller (e.g. cursor's model, context %, files edited) */
   pollerMeta?: Record<string, any>;
+  /** Total input tokens in the active conversation (for context size warning) */
+  contextTokens?: number;
 }
 
 // Keyed by tmux session name: {username}-{project}-agent

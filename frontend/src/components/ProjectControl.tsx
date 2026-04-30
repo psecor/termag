@@ -118,6 +118,19 @@ export function ProjectControl() {
     return STATUS_EMOJI[s?.status ?? 'not_running'];
   }
 
+  function contextWarning(project: Project): { level: 'ok' | 'warn' | 'danger'; tokens: number } | null {
+    if (!project.workflows.some(w => w.type === 'agent')) return null;
+    const s = statusMap[agentSessionName(project)];
+    const t = s?.contextTokens;
+    if (!t || t < 500_000) return null;
+    return { level: t >= 1_000_000 ? 'danger' : 'warn', tokens: t };
+  }
+
+  function fmtTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    return `${Math.round(n / 1000)}K`;
+  }
+
   function persistedAgentProvider(project: Project): string | null {
     return project.workflows.find(w => w.type === 'agent')?.provider ?? null;
   }
@@ -287,13 +300,22 @@ export function ProjectControl() {
           {projects.map(p => {
             const provider = displayAgentProvider(p);
             const config = provider ? PROVIDERS[provider] : null;
+            const ctxWarn = contextWarning(p);
             return (
               <li
                 key={p.id}
                 className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''}`}
                 onClick={() => setActiveProject(p.id)}
               >
-                <span className="project-status">{statusEmoji(p)}</span>
+                <span className="project-status">
+                  {statusEmoji(p)}
+                  {ctxWarn && (
+                    <span
+                      className={`ctx-warn ctx-warn-${ctxWarn.level}`}
+                      title={`Context: ${fmtTokens(ctxWarn.tokens)} — consider /clear`}
+                    />
+                  )}
+                </span>
                 {renamingId === p.id ? (
                   <input
                     className="project-rename-input"

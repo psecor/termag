@@ -1,9 +1,10 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator at https://secorp.net/termag. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, Codex/Claude per-project agent choice, Slack + Discord integration. In active daily use as the harness for everything else under ~/termag/projects/."
-last_updated: 2026-04-27
+status_description: "Multi-user workspace orchestrator at https://secorp.net/termag. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, and two-tube thermometer UI tracking both agent working time and human activity. In active daily use as the harness for everything else under ~/termag/projects/."
+last_updated: 2026-04-30
 last_updated_by:
+  - agent:claude-opus-4-6
   - agent:claude-opus-4-7
   - human:secorp
   - agent:sweeper-claude-opus-4-7
@@ -20,16 +21,18 @@ A multi-user workspace manager for running AI coding agents in parallel. Each pr
 
 ## Status
 
-Production. Daily use as the harness for every other project under `~/termag/projects/`. Stable enough that the rest of the workspace's CLAUDE.md guidance assumes termag is running. Active: Codex + Claude provider selection per-project, Slack/Discord channels, usage dashboard.
+Production. Daily use as the harness for every other project under `~/termag/projects/`. Stable enough that the rest of the workspace's CLAUDE.md guidance assumes termag is running. Active development continues: provider registry now covers Codex, Claude, and Mistral (vibe); per-project working-time and human-activity tracking feed a two-tube thermometer UI; project sharing lets owners invite collaborators with terminal access; new projects get seeded `AGENTS.md` and `CLAUDE.md`.
 
 ## Domain Model
 
-- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation.
+- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub.
 - **Paired tmux sessions** — `secorp-<project>-agent` (where the AI runs) and `secorp-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket.
-- **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, …) and their metadata: display name, launch command shape, status normalization rules, UI affordances. `agentProvider` is now a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
+- **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
 - **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean.
-- **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. Status drives the green/yellow/red indicators, the project-list transition flash (color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting).
-- **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Served from `/termag/api/worktime`.
+- **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting).
+- **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Provider-specific poller sources ensure correct attribution. Served from `/termag/api/worktime`.
+- **Human activity tracking** — `backend/src/services/humanActivity.ts` tracks human keystrokes/interactions per project, separate from agent working time. Powers the second tube of the two-tube thermometer in the UI (agent work vs. human work).
+- **Project sharing** — owners can invite collaborators by email. Shared users get terminal access to the project's tmux sessions through the same per-user-agent path. Routes in `backend/src/routes/sharing.ts`.
 - **Status WebSocket** — `/termag/ws/status` pushes status events to anyone subscribed (the UI itself, plus opt-in consumers like `sound-garden`).
 
 ## Repository Layout
@@ -38,14 +41,14 @@ Production. Daily use as the harness for every other project under `~/termag/pro
 ~/src/termag/                       (canonical; ~/termag/projects/termag is a symlink to here)
 ├── backend/                        Express + TS server, port 3040
 │   ├── src/
-│   │   ├── routes/                 REST: projects, status, usage, worktime, auth
+│   │   ├── routes/                 REST: projects, status, usage, worktime, sharing, auth
 │   │   ├── providers/registry.ts   Provider registry — adding a provider lives here
-│   │   ├── services/               tmux, tmuxPoller, status, agent registry, usage tracking
+│   │   ├── services/               tmux, tmuxPoller, status, humanActivity, agent registry, usage tracking
 │   │   └── middleware/auth.ts      Google OAuth gate + email→unixuser mapping
 │   └── prisma/                     schema + migrations
 ├── frontend/                       React 18 + Vite, basename /termag
 │   └── src/
-│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini, Hyperspace
+│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini (two-tube thermometers), Hyperspace
 │       ├── providers/registry.ts   Mirror of backend provider registry — must stay in sync
 │       ├── contexts/               AuthContext, ProjectContext
 │       └── services/               REST + WebSocket clients
@@ -55,6 +58,7 @@ Production. Daily use as the harness for every other project under `~/termag/pro
 │   └── codex-status-normalizer.js
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
 ├── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough
+│   └── initial-AGENTS.md           template seeded into new projects on creation
 └── service-files/                  staged copies of systemd units
 ```
 
@@ -100,14 +104,16 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | Model | Purpose |
 |-------|---------|
 | `User` | Google identity + mapped unix user. Holds `defaultAgentProvider` (string), agent token records, usage rollups. |
-| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag. |
+| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag, owner. |
+| `ProjectShare` | Collaborator grants on a project — `(projectId, userId)` with role. Backs the sharing routes; lets a non-owner reach the owner's tmux sessions through their own agent. |
 | `AgentToken` | Bearer token for a per-user agent connection. Issued from the UI sidebar. |
 | `StatusEvent` | Append-only log of `working/waiting/idle` events; backs the status WebSocket, the "hyperspace" activity score, the project-list transition flash, and worktime rollups. |
 | `WorkTime` | Per-project rollup of time spent in `working` state, derived from `StatusEvent`. Powers `/termag/api/worktime`. |
-| `UsageEvent` | Per-call API usage (tokens, cost) for the dashboard. |
+| `HumanActivity` | Per-project rollup of human keystroke/interaction time, derived from terminal input events. Powers the human tube of the two-tube thermometer. |
+| `UsageEvent` | Per-call API usage (tokens, cost) for the dashboard. Provider-specific scanners populate this (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`). |
 | `session` | Managed by `connect-pg-simple`, NOT in `schema.prisma`. Created by the SQL block in `deploy/setup.md`. |
 
-`agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Existing values continue to work; new providers no longer require a schema change.
+`agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Project sharing landed in `20260427100000_project_sharing`. Existing values continue to work; new providers no longer require a schema change.
 
 `prisma migrate dev` is fine here (the box is interactive); the rest of the workspace prefers `db push` because some boxes aren't.
 
@@ -163,11 +169,16 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /termag/api/projects` | List projects |
-| `POST /termag/api/projects` | Create project (also creates tmux sessions + Slack channel) |
+| `GET /termag/api/projects` | List projects (own + shared) |
+| `POST /termag/api/projects` | Create project (also creates tmux sessions, Slack channel, seeds AGENTS.md + CLAUDE.md) |
 | `POST /termag/api/status` | Status update from Claude hooks / Codex bridge — primary write path |
-| `GET /termag/api/usage/...` | Token + cost rollups for the dashboard |
-| `GET /termag/api/worktime/...` | Working-time rollups (time spent in `working` state, derived from `StatusEvent`) |
+| `GET /termag/api/usage/...` | Token + cost rollups for the dashboard (provider-specific scanners) |
+| `GET /termag/api/worktime` | Working-time rollups by provider (agent + human), derived from `StatusEvent` and heartbeats; thermometers use an absolute 8h scale |
+| `POST /termag/api/status/heartbeat` | Human activity heartbeat from the UI (fires every 30s while typing); 3-min decay banks to `work_time_entries` with `provider: "human"` |
+| `POST /termag/api/projects/:id/invite` | Invite a collaborator by email |
+| `GET /termag/api/invites` | List pending invites for the logged-in user |
+| `POST /termag/api/invites/:id/accept` | Accept a project invite |
+| `DELETE /termag/api/projects/:id/shares/:shareId` | Revoke a collaborator's access |
 | `WS /termag/ws/terminal/<sessionId>` | PTY stream (bidirectional) |
 | `WS /termag/ws/status` | Status push fan-out — consumed by the UI and by `sound-garden` |
 | `WS /termag/ws/agent` | Per-user agent connection (bearer-token auth) |
@@ -209,6 +220,14 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 10. **Provider registry lives in two files and must stay in sync** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts`. Adding a provider on one side only produces a project that the backend will accept but the UI can't render (or vice versa). There's no shared package; the symmetry is by hand.
 
 11. **`agentProvider` is a string, not an enum** — Prisma will happily persist arbitrary garbage. The registry is the validation boundary; route handlers should reject providers not in the registry before writing.
+
+12. **tmux poller patterns are provider-specific** — TUIs with a persistent input box (vibe/Mistral) look "working" to a naive idle/working detector forever. The registry's poller config has to match the actual TUI's render; if a new provider's working-time looks pinned at 100% or 0%, the regex in its registry entry is wrong before anything else.
+
+13. **Working-time attribution is per-provider source** — Codex pulls from JSONL session files, Claude from hook events, vibe from `~/.vibe/logs/session/meta.json`. Mixing sources (e.g. counting a Claude project's hook events as if they were poller-derived) double-counts; each provider entry declares its single source of truth.
+
+14. **Thermometers use an absolute 8h scale, not p50-relative** — when reading the UI, a half-full tube means ~4 hours of work that day, not "average for this project". This was a deliberate switch; don't "fix" it back to relative without thinking about what the tube means at a glance.
+
+15. **Project sharing routes terminal access through the *owner's* per-user agent** — a collaborator's browser hits the backend, but the PTY lives in the owner's tmux. If a shared project's terminal won't connect, the owner's `termag-agent` is the thing to check, not the collaborator's.
 
 ## Related
 

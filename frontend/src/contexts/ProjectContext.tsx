@@ -76,6 +76,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
                 activeTurn: msg.activeTurn,
                 threadId: msg.threadId,
                 pollerMeta: (msg as any).pollerMeta,
+                contextTokens: (msg as any).contextTokens,
               },
             }));
           }

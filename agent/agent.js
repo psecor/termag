@@ -261,6 +261,132 @@ async function scanUsage() {
   return { days, providers: { claude, codex, mistral } };
 }
 
+// ── Context token scanner ─────────────────────────────────────────────────
+// Periodically reads the most recent JSONL entry per active Claude conversation
+// and POSTs contextTokens to the status endpoint so the UI can warn about bloated contexts.
+
+const CONTEXT_SCAN_INTERVAL_MS = 60_000;
+let contextScanTimer = null;
+
+async function scanContextTokens() {
+  const username = process.env.USER || require('os').userInfo().username;
+  const claudeDir = path.join(process.env.HOME || '/home', '.claude', 'projects');
+
+  // Discover active agent sessions from tmux
+  let sessions;
+  try {
+    const { stdout } = await execAsync('tmux list-sessions -F "#{session_name}" 2>/dev/null');
+    sessions = stdout.trim().split('\n')
+      .filter(s => s.startsWith(`${username}-`) && s.endsWith('-agent'));
+  } catch { return; }
+
+  if (sessions.length === 0) return;
+
+  // Build project name → session name map
+  const projectSessions = new Map();
+  for (const s of sessions) {
+    // Session format: username-projectName-agent
+    const afterUser = s.substring(username.length + 1);
+    const projectName = afterUser.replace(/-agent$/, '');
+    if (projectName) projectSessions.set(projectName, s);
+  }
+
+  // Read JSONL dirs and match to projects
+  let projectDirs;
+  try { projectDirs = await readdir(claudeDir); } catch { return; }
+
+  const statusEndpoint = getStatusEndpoint();
+
+  for (const dir of projectDirs) {
+    // Dir names are paths with / replaced by -, e.g. "-home-secorp-termag-projects-card-depot"
+    // Match against known project names
+    let matchedSession = null;
+    for (const [projName, sessName] of projectSessions) {
+      if (dir.endsWith('-' + projName) || dir.endsWith(projName)) {
+        matchedSession = sessName;
+        break;
+      }
+    }
+    if (!matchedSession) continue;
+
+    const dirPath = path.join(claudeDir, dir);
+    let files;
+    try { files = await readdir(dirPath); } catch { continue; }
+
+    // Find most recently modified .jsonl
+    const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+    if (jsonlFiles.length === 0) continue;
+
+    let newest = null, newestMtime = 0;
+    for (const f of jsonlFiles) {
+      try {
+        const s = await stat(path.join(dirPath, f));
+        if (s.mtimeMs > newestMtime) { newestMtime = s.mtimeMs; newest = f; }
+      } catch { continue; }
+    }
+    if (!newest) continue;
+
+    // Only scan if modified in last 10 minutes (active conversation)
+    if (Date.now() - newestMtime > 10 * 60 * 1000) continue;
+
+    // Read last ~8KB to find the last usage entry
+    const filePath = path.join(dirPath, newest);
+    try {
+      const fileSize = (await stat(filePath)).size;
+      const readSize = Math.min(8192, fileSize);
+      const buf = Buffer.alloc(readSize);
+      const fd = fs.openSync(filePath, 'r');
+      fs.readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
+      fs.closeSync(fd);
+
+      const lines = buf.toString('utf8').split('\n').reverse();
+      let contextTokens = null;
+      for (const line of lines) {
+        if (!line) continue;
+        try {
+          const entry = JSON.parse(line);
+          const u = entry.message?.usage;
+          if (u) {
+            contextTokens = (u.input_tokens || 0)
+              + (u.cache_read_input_tokens || 0)
+              + (u.cache_creation_input_tokens || 0);
+            break;
+          }
+        } catch { continue; }
+      }
+
+      if (contextTokens === null) continue;
+
+      // POST context tokens to status endpoint (metadata-only, no status change)
+      const payload = JSON.stringify({
+        session: matchedSession,
+        contextTokens,
+      });
+      const url = new URL(statusEndpoint);
+      const http = require(url.protocol === 'https:' ? 'https' : 'http');
+      const req = http.request(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      });
+      req.on('error', () => {});
+      req.end(payload);
+    } catch { continue; }
+  }
+}
+
+function startContextScanner() {
+  if (contextScanTimer) return;
+  // Initial scan after 5s, then every 60s
+  setTimeout(() => {
+    scanContextTokens().catch(() => {});
+    contextScanTimer = setInterval(() => scanContextTokens().catch(() => {}), CONTEXT_SCAN_INTERVAL_MS);
+  }, 5000);
+}
+
+function stopContextScanner() {
+  if (contextScanTimer) { clearInterval(contextScanTimer); contextScanTimer = null; }
+}
+
 // Active PTY streams: streamId → { pty, tmuxSessionName }
 const streams = new Map();
 const codexBridges = new Map();
@@ -357,6 +483,7 @@ function connect() {
 
   ws.on('open', () => {
     console.log('[AGENT] Connected to termag');
+    startContextScanner();
   });
 
   ws.on('message', async (raw) => {
@@ -542,6 +669,7 @@ function connect() {
 
   ws.on('close', (code, reason) => {
     console.log(`[AGENT] Disconnected (${code}). Reconnecting in ${reconnect_interval_seconds}s...`);
+    stopContextScanner();
     // Kill all active PTY streams
     for (const [id, stream] of streams) {
       stream.pty.kill();

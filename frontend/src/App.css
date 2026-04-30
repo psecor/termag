@@ -27,8 +27,8 @@ body {
   color: var(--text-primary);
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   font-size: 13px;
-  height: 100dvh;
-  height: 100vh; /* fallback for older browsers */
+  height: 100vh;
+  height: 100dvh; /* dynamic viewport — shrinks with keyboard */
   overflow: hidden;
   /* Prevent pull-to-refresh and bounce on mobile */
   overscroll-behavior: none;
@@ -42,11 +42,14 @@ html {
 }
 
 /* Block touch scroll/zoom on layout chrome, but not inside terminals */
-.app-sidebar,
 .app-project-bar,
 .sidebar-toggle,
 .pane-tabs {
   touch-action: none;
+}
+/* Sidebar itself blocks horizontal swipe but allows vertical scroll */
+.app-sidebar {
+  touch-action: pan-y;
 }
 
 /* ── App Layout (single row) ───────────────────────────────── */
@@ -83,7 +86,9 @@ html {
 
 .app-control {
   flex: 1;
+  min-height: 0;       /* allow flex shrink so overflow-y activates */
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .app-terminals {
@@ -150,7 +155,6 @@ html {
 .project-control {
   display: flex;
   flex-direction: column;
-  height: 100%;
   padding: 8px;
   gap: 8px;
 }
@@ -223,7 +227,51 @@ html {
   100% { background: transparent; }
 }
 
-.project-status { font-size: 10px; flex-shrink: 0; }
+.project-status { font-size: 10px; flex-shrink: 0; position: relative; }
+
+/* Context token warning dot — overlaid on status emoji */
+.ctx-warn {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--bg-surface);
+}
+.ctx-warn-warn  { background: var(--warning); }
+.ctx-warn-danger { background: var(--danger); animation: ctx-pulse 2s ease-in-out infinite; }
+
+@keyframes ctx-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+/* Context ring on collapsed sidebar dots */
+.ctx-ring-warn  { box-shadow: 0 0 0 2px var(--warning); }
+.ctx-ring-danger { box-shadow: 0 0 0 2px var(--danger); animation: ctx-pulse 2s ease-in-out infinite; }
+
+/* Context badge in project bar */
+.ctx-bar-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: 8px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.ctx-bar-warn {
+  color: var(--warning);
+  background: rgba(210, 153, 34, 0.15);
+  border: 1px solid rgba(210, 153, 34, 0.3);
+}
+.ctx-bar-danger {
+  color: var(--danger);
+  background: rgba(248, 81, 73, 0.15);
+  border: 1px solid rgba(248, 81, 73, 0.3);
+  animation: ctx-pulse 2s ease-in-out infinite;
+}
 .project-name   { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-provider-badge {
   flex-shrink: 0;

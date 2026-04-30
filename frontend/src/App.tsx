@@ -138,6 +138,18 @@ function MainLayout() {
       <div className="app-terminals">
         <div className="app-project-bar">
           {activeProject ? activeProject.name : '—'}
+          {activeProject && (() => {
+            const agentSession = `${sessionOwner}-${activeProject.name}-agent`;
+            const ctx = statusMap[agentSession]?.contextTokens;
+            if (!ctx || ctx < 500_000) return null;
+            const level = ctx >= 1_000_000 ? 'danger' : 'warn';
+            const label = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(1)}M` : `${Math.round(ctx / 1000)}K`;
+            return (
+              <span className={`ctx-bar-badge ctx-bar-${level}`} title="Context tokens — consider /clear">
+                {label}
+              </span>
+            );
+          })()}
           {isNarrow && activeProject && hasAgent && (
             <div className="pane-tabs">
               <button
@@ -205,7 +217,7 @@ function SidebarCollapsed({
 }: {
   projects: Project[];
   activeProjectId: string | null;
-  statusMap: Record<string, { status: string } | undefined>;
+  statusMap: Record<string, { status: string; contextTokens?: number } | undefined>;
   username: string;
 }) {
   const { setActiveProject } = useProjects();
@@ -215,6 +227,8 @@ function SidebarCollapsed({
         const owner = p.ownerUsername ?? username;
         const agentSession = `${owner}-${p.name}-agent`;
         const s = statusMap[agentSession]?.status ?? 'not_running';
+        const ctx = statusMap[agentSession]?.contextTokens;
+        const ctxLevel = ctx && ctx >= 1_000_000 ? 'danger' : ctx && ctx >= 500_000 ? 'warn' : null;
         const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
         return (
           <div
@@ -223,7 +237,7 @@ function SidebarCollapsed({
             title={p.name}
             onClick={() => setActiveProject(p.id)}
           >
-            <span className="sidebar-dot-light" style={{ background: color }} />
+            <span className={`sidebar-dot-light ${ctxLevel ? `ctx-ring-${ctxLevel}` : ''}`} style={{ background: color }} />
             <span className="sidebar-collapsed-initials">{getInitials(p.name)}</span>
           </div>
         );

@@ -1,5 +1,5 @@
 import { Router, RequestHandler } from 'express';
-import { setStatus, getStatus, notifyStatusChange } from '../services/status';
+import { setStatus, getStatus, updateStatusMeta, notifyStatusChange } from '../services/status';
 import { AgentStatus } from '../types/index';
 import { getAllNotificationTargets } from '../slack/lts';
 import { getSlackApp } from '../slack/app';
@@ -22,7 +22,7 @@ export function statusRouter(): Router {
   const router = Router();
 
   const postStatus: RequestHandler = async (req, res) => {
-    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId } = req.body as {
+    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId, contextTokens } = req.body as {
       session?: string;
       status?: AgentStatus['status'];
       message?: string;
@@ -33,10 +33,24 @@ export function statusRouter(): Router {
       tokenBurst?: number;
       activeTurn?: boolean;
       threadId?: string;
+      contextTokens?: number;
     };
 
-    if (!session || !status) {
-      res.status(400).json({ error: 'session and status required' });
+    if (!session) {
+      res.status(400).json({ error: 'session required' });
+      return;
+    }
+
+    // Metadata-only update (e.g. contextTokens from agent scanner)
+    if (!status && contextTokens !== undefined) {
+      updateStatusMeta(session, { contextTokens });
+      notifyStatusChange(session);
+      res.json({ ok: true, status: getStatus(session) });
+      return;
+    }
+
+    if (!status) {
+      res.status(400).json({ error: 'status required' });
       return;
     }
 
@@ -56,6 +70,7 @@ export function statusRouter(): Router {
       tokenBurst,
       activeTurn,
       threadId,
+      contextTokens,
     });
     notifyStatusChange(session);
 

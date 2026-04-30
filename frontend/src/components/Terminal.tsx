@@ -159,7 +159,21 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       });
       observer.observe(container);
 
-      (term as any)._termag = { dataDisposable, observer, resizeTimer };
+      // Mobile: re-fit when virtual keyboard opens/closes
+      let vvHandler: (() => void) | null = null;
+      const vv = window.visualViewport;
+      if (vv) {
+        vvHandler = () => {
+          if (disposed) return;
+          fitAddon.fit();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          }
+        };
+        vv.addEventListener('resize', vvHandler);
+      }
+
+      (term as any)._termag = { dataDisposable, observer, resizeTimer, vvHandler };
     });
 
     return () => {
@@ -170,6 +184,9 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         extras.dataDisposable.dispose();
         extras.observer.disconnect();
         if (extras.resizeTimer) clearTimeout(extras.resizeTimer);
+        if (extras.vvHandler && window.visualViewport) {
+          window.visualViewport.removeEventListener('resize', extras.vvHandler);
+        }
       }
       if (textarea) { textarea.removeEventListener('focus', onFocus); textarea.removeEventListener('blur', onBlur); }
       // Restore tmux mouse before closing
