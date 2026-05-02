@@ -77,6 +77,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
                 threadId: msg.threadId,
                 pollerMeta: (msg as any).pollerMeta,
                 contextTokens: (msg as any).contextTokens,
+                rateLimited: (msg as any).rateLimited,
               },
             }));
           }

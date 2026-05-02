@@ -89,6 +89,7 @@ html {
   min-height: 0;       /* allow flex shrink so overflow-y activates */
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
+  padding-bottom: 200px; /* clear fixed thermometer + warp indicator */
 }
 
 .app-terminals {
@@ -271,6 +272,43 @@ html {
   background: rgba(248, 81, 73, 0.15);
   border: 1px solid rgba(248, 81, 73, 0.3);
   animation: ctx-pulse 2s ease-in-out infinite;
+}
+
+/* ── Rate Limit Warning ─────────────────────────────────────── */
+.rate-limited {
+  background: rgba(248, 81, 73, 0.08) !important;
+  border-color: rgba(248, 81, 73, 0.4) !important;
+  animation: rate-limit-flash 1.5s ease-in-out infinite;
+}
+.rate-limit-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: rate-limit-flash 1.5s ease-in-out infinite;
+  box-shadow: 0 0 6px rgba(248, 81, 73, 0.8);
+}
+.rate-limit-ring {
+  box-shadow: 0 0 0 2px var(--danger), 0 0 8px rgba(248, 81, 73, 0.6);
+  animation: rate-limit-flash 1.5s ease-in-out infinite;
+}
+.rate-limit-bar-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 8px;
+  color: #fff;
+  background: var(--danger);
+  animation: rate-limit-flash 1.5s ease-in-out infinite;
+  letter-spacing: 0.05em;
+}
+@keyframes rate-limit-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 .project-name   { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-provider-badge {
@@ -826,6 +864,10 @@ html {
   flex-direction: column;
   gap: 2px;
   padding: 4px;
+  padding-bottom: 200px; /* clear fixed thermometer + warp indicator */
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 
 .sidebar-collapsed-item {

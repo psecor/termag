@@ -73,6 +73,7 @@ export interface AgentStatus {
   threadId?: string;
   pollerMeta?: Record<string, any>;
   contextTokens?: number;
+  rateLimited?: string | null;
 }
 
 // Keyed by tmux session name

@@ -22,7 +22,7 @@ export function statusRouter(): Router {
   const router = Router();
 
   const postStatus: RequestHandler = async (req, res) => {
-    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId, contextTokens } = req.body as {
+    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId, contextTokens, rateLimited } = req.body as {
       session?: string;
       status?: AgentStatus['status'];
       message?: string;
@@ -34,6 +34,7 @@ export function statusRouter(): Router {
       activeTurn?: boolean;
       threadId?: string;
       contextTokens?: number;
+      rateLimited?: string | null;
     };
 
     if (!session) {
@@ -41,9 +42,9 @@ export function statusRouter(): Router {
       return;
     }
 
-    // Metadata-only update (e.g. contextTokens from agent scanner)
-    if (!status && contextTokens !== undefined) {
-      updateStatusMeta(session, { contextTokens });
+    // Metadata-only update (e.g. contextTokens from agent scanner, rateLimited from pane scanner)
+    if (!status && (contextTokens !== undefined || rateLimited !== undefined)) {
+      updateStatusMeta(session, { ...(contextTokens !== undefined && { contextTokens }), ...(rateLimited !== undefined && { rateLimited }) });
       notifyStatusChange(session);
       res.json({ ok: true, status: getStatus(session) });
       return;
@@ -71,6 +72,7 @@ export function statusRouter(): Router {
       activeTurn,
       threadId,
       contextTokens,
+      rateLimited,
     });
     notifyStatusChange(session);
 

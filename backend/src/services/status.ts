@@ -130,6 +130,8 @@ export function setStatus(
     pollerMeta: meta.pollerMeta,
     // Preserve contextTokens from previous state unless explicitly provided
     contextTokens: meta.contextTokens ?? previous?.contextTokens,
+    // Preserve rateLimited unless explicitly provided (null clears it)
+    rateLimited: meta.rateLimited !== undefined ? meta.rateLimited : previous?.rateLimited,
   };
   statusMap.set(sessionName, entry);
 

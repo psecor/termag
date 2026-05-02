@@ -140,7 +140,15 @@ function MainLayout() {
           {activeProject ? activeProject.name : '—'}
           {activeProject && (() => {
             const agentSession = `${sessionOwner}-${activeProject.name}-agent`;
-            const ctx = statusMap[agentSession]?.contextTokens;
+            const st = statusMap[agentSession];
+            if (st?.rateLimited) {
+              return (
+                <span className="rate-limit-bar-badge" title={st.rateLimited}>
+                  RATE LIMITED
+                </span>
+              );
+            }
+            const ctx = st?.contextTokens;
             if (!ctx || ctx < 500_000) return null;
             const level = ctx >= 1_000_000 ? 'danger' : 'warn';
             const label = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(1)}M` : `${Math.round(ctx / 1000)}K`;
@@ -217,7 +225,7 @@ function SidebarCollapsed({
 }: {
   projects: Project[];
   activeProjectId: string | null;
-  statusMap: Record<string, { status: string; contextTokens?: number } | undefined>;
+  statusMap: Record<string, { status: string; contextTokens?: number; rateLimited?: string | null } | undefined>;
   username: string;
 }) {
   const { setActiveProject } = useProjects();
@@ -226,18 +234,21 @@ function SidebarCollapsed({
       {projects.map(p => {
         const owner = p.ownerUsername ?? username;
         const agentSession = `${owner}-${p.name}-agent`;
-        const s = statusMap[agentSession]?.status ?? 'not_running';
-        const ctx = statusMap[agentSession]?.contextTokens;
+        const st = statusMap[agentSession];
+        const s = st?.status ?? 'not_running';
+        const ctx = st?.contextTokens;
+        const rateLimit = st?.rateLimited;
         const ctxLevel = ctx && ctx >= 1_000_000 ? 'danger' : ctx && ctx >= 500_000 ? 'warn' : null;
         const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
+        const ringClass = rateLimit ? 'rate-limit-ring' : ctxLevel ? `ctx-ring-${ctxLevel}` : '';
         return (
           <div
             key={p.id}
-            className={`sidebar-collapsed-item ${activeProjectId === p.id ? 'active' : ''}`}
-            title={p.name}
+            className={`sidebar-collapsed-item ${activeProjectId === p.id ? 'active' : ''} ${rateLimit ? 'rate-limited' : ''}`}
+            title={rateLimit ? `⚠ ${rateLimit}` : p.name}
             onClick={() => setActiveProject(p.id)}
           >
-            <span className={`sidebar-dot-light ${ctxLevel ? `ctx-ring-${ctxLevel}` : ''}`} style={{ background: color }} />
+            <span className={`sidebar-dot-light ${ringClass}`} style={{ background: color }} />
             <span className="sidebar-collapsed-initials">{getInitials(p.name)}</span>
           </div>
         );

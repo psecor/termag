@@ -126,6 +126,12 @@ export function ProjectControl() {
     return { level: t >= 1_000_000 ? 'danger' : 'warn', tokens: t };
   }
 
+  function rateLimitWarning(project: Project): string | null {
+    if (!project.workflows.some(w => w.type === 'agent')) return null;
+    const s = statusMap[agentSessionName(project)];
+    return s?.rateLimited ?? null;
+  }
+
   function fmtTokens(n: number): string {
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
     return `${Math.round(n / 1000)}K`;
@@ -301,15 +307,21 @@ export function ProjectControl() {
             const provider = displayAgentProvider(p);
             const config = provider ? PROVIDERS[provider] : null;
             const ctxWarn = contextWarning(p);
+            const rateLimit = rateLimitWarning(p);
             return (
               <li
                 key={p.id}
-                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''}`}
+                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
                 onClick={() => setActiveProject(p.id)}
               >
                 <span className="project-status">
                   {statusEmoji(p)}
-                  {ctxWarn && (
+                  {rateLimit ? (
+                    <span
+                      className="rate-limit-badge"
+                      title={rateLimit}
+                    />
+                  ) : ctxWarn && (
                     <span
                       className={`ctx-warn ctx-warn-${ctxWarn.level}`}
                       title={`Context: ${fmtTokens(ctxWarn.tokens)} — consider /clear`}

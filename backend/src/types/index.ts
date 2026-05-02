@@ -38,6 +38,8 @@ export interface AgentStatus {
   pollerMeta?: Record<string, any>;
   /** Total input tokens in the active conversation (for context size warning) */
   contextTokens?: number;
+  /** Rate limit message if the session has hit a usage cap (e.g. "resets 3:45pm") */
+  rateLimited?: string | null;
 }
 
 // Keyed by tmux session name: {username}-{project}-agent

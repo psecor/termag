@@ -387,6 +387,110 @@ function stopContextScanner() {
   if (contextScanTimer) { clearInterval(contextScanTimer); contextScanTimer = null; }
 }
 
+// ── Rate limit scanner ────────────────────────────────────────────────────
+// Periodically captures the last lines of agent tmux panes and checks for
+// rate limit messages like "You've hit your ... limit · resets ..."
+
+const RATE_LIMIT_SCAN_INTERVAL_MS = 30_000;
+let rateLimitScanTimer = null;
+// Track which sessions are currently flagged so we only POST on transitions
+const rateLimitedSessions = new Map(); // session → message
+
+async function scanRateLimits() {
+  const username = process.env.USER || require('os').userInfo().username;
+
+  let sessions;
+  try {
+    const { stdout } = await execAsync('tmux list-sessions -F "#{session_name}" 2>/dev/null');
+    sessions = stdout.trim().split('\n')
+      .filter(s => s.startsWith(`${username}-`) && s.endsWith('-agent'));
+  } catch { return; }
+
+  if (sessions.length === 0) return;
+
+  const statusEndpoint = getStatusEndpoint();
+
+  for (const session of sessions) {
+    try {
+      // Get pane ID for reliable capture
+      const { stdout: paneId } = await execAsync(
+        `tmux list-panes -t ${shellEscape(session)} -F '#{pane_id}' 2>/dev/null`
+      );
+      const pid = paneId.trim().split('\n')[0];
+      if (!pid) continue;
+
+      // Capture last 10 visible lines — rate limit messages appear near the prompt,
+      // not buried in scrollback output which could contain false positives
+      const { stdout: paneContent } = await execAsync(
+        `tmux capture-pane -t ${shellEscape(pid)} -p -S -10 2>/dev/null`
+      );
+
+      // Check for rate limit patterns — must match actual CLI error messages,
+      // not arbitrary content that mentions "rate limit" as a concept
+      const rateLimitPatterns = [
+        /(?:hit your|reached your).*?limit.*?resets?\s+(.+)/i,
+        /usage limit.*?resets?\s+(.+)/i,
+        /Credit balance is too low/i,
+        /temporarily limiting requests/i,
+      ];
+
+      let limitMessage = null;
+      for (const line of paneContent.split('\n').reverse()) {
+        for (const pattern of rateLimitPatterns) {
+          const match = line.match(pattern);
+          if (match) {
+            limitMessage = line.trim().slice(0, 100);
+            break;
+          }
+        }
+        if (limitMessage) break;
+      }
+
+      const wasLimited = rateLimitedSessions.get(session);
+
+      if (limitMessage && !wasLimited) {
+        // Newly rate-limited — POST to status
+        rateLimitedSessions.set(session, limitMessage);
+        const payload = JSON.stringify({ session, rateLimited: limitMessage });
+        const url = new URL(statusEndpoint);
+        const http = require(url.protocol === 'https:' ? 'https' : 'http');
+        const req = http.request(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        });
+        req.on('error', () => {});
+        req.end(payload);
+        console.log(`[RATE-LIMIT] Detected for ${session}: ${limitMessage}`);
+      } else if (!limitMessage && wasLimited) {
+        // No longer rate-limited (user cleared or limit reset) — clear it
+        rateLimitedSessions.delete(session);
+        const payload = JSON.stringify({ session, rateLimited: null });
+        const url = new URL(statusEndpoint);
+        const http = require(url.protocol === 'https:' ? 'https' : 'http');
+        const req = http.request(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        });
+        req.on('error', () => {});
+        req.end(payload);
+        console.log(`[RATE-LIMIT] Cleared for ${session}`);
+      }
+    } catch { continue; }
+  }
+}
+
+function startRateLimitScanner() {
+  if (rateLimitScanTimer) return;
+  setTimeout(() => {
+    scanRateLimits().catch(() => {});
+    rateLimitScanTimer = setInterval(() => scanRateLimits().catch(() => {}), RATE_LIMIT_SCAN_INTERVAL_MS);
+  }, 10000);
+}
+
+function stopRateLimitScanner() {
+  if (rateLimitScanTimer) { clearInterval(rateLimitScanTimer); rateLimitScanTimer = null; }
+}
+
 // Active PTY streams: streamId → { pty, tmuxSessionName }
 const streams = new Map();
 const codexBridges = new Map();
@@ -484,6 +588,7 @@ function connect() {
   ws.on('open', () => {
     console.log('[AGENT] Connected to termag');
     startContextScanner();
+    startRateLimitScanner();
   });
 
   ws.on('message', async (raw) => {
@@ -670,6 +775,7 @@ function connect() {
   ws.on('close', (code, reason) => {
     console.log(`[AGENT] Disconnected (${code}). Reconnecting in ${reconnect_interval_seconds}s...`);
     stopContextScanner();
+    stopRateLimitScanner();
     // Kill all active PTY streams
     for (const [id, stream] of streams) {
       stream.pty.kill();
