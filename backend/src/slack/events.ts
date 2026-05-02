@@ -208,6 +208,7 @@ async function processMessage(opts: {
   // Claude execution via executor (clean formatted response)
   const projectId = getActiveProjectId(userId);
   const workingDir = await resolveWorkingDir(userId, projectId);
+  console.log(`[EXECUTOR] Running for user=${userId} projectId=${projectId} workingDir=${workingDir} message="${message.slice(0, 80)}"`);
   const msgCount = sessionMessageCount.get(userId) ?? 0;
 
   const reactionEmoji = 'hourglass_flowing_sand';
@@ -246,6 +247,7 @@ export function registerEventHandlers(app: App): void {
 
   // @mentions → executor
   app.event('app_mention', async ({ event, say, client, context }: any) => {
+    console.log(`[APP_MENTION] Received: user=${event.user} channel=${event.channel} text="${(event.text || '').slice(0, 80)}"`);
     try {
       await processMessage({
         userId: event.user, channelId: event.channel, text: event.text,

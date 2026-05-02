@@ -2,7 +2,7 @@
 project: termag
 status: production
 status_description: "Multi-user workspace orchestrator at https://secorp.net/termag. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, and two-tube thermometer UI tracking both agent working time and human activity. In active daily use as the harness for everything else under ~/termag/projects/."
-last_updated: 2026-04-30
+last_updated: 2026-05-01
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -30,6 +30,7 @@ Production. Daily use as the harness for every other project under `~/termag/pro
 - **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
 - **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean.
 - **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting).
+- **Context-token warnings** — the per-user agent scrapes provider-specific "context remaining" strings out of the agent pane and forwards them through the status pipeline as a separate signal alongside working/waiting/idle. The UI surfaces this on the project tile and inside the terminal chrome so a session that's about to run out of context gets a visible warning before it hard-fails.
 - **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Provider-specific poller sources ensure correct attribution. Served from `/termag/api/worktime`.
 - **Human activity tracking** — `backend/src/services/humanActivity.ts` tracks human keystrokes/interactions per project, separate from agent working time. Powers the second tube of the two-tube thermometer in the UI (agent work vs. human work).
 - **Project sharing** — owners can invite collaborators by email. Shared users get terminal access to the project's tmux sessions through the same per-user-agent path. Routes in `backend/src/routes/sharing.ts`.
@@ -228,6 +229,8 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 14. **Thermometers use an absolute 8h scale, not p50-relative** — when reading the UI, a half-full tube means ~4 hours of work that day, not "average for this project". This was a deliberate switch; don't "fix" it back to relative without thinking about what the tube means at a glance.
 
 15. **Project sharing routes terminal access through the *owner's* per-user agent** — a collaborator's browser hits the backend, but the PTY lives in the owner's tmux. If a shared project's terminal won't connect, the owner's `termag-agent` is the thing to check, not the collaborator's.
+
+16. **Context-token warnings are parsed from agent pane text, not a structured signal** — the per-user agent scans tmux pane content for provider-specific "context left" / token-budget strings and surfaces them via the status pipeline so the UI can flash a warning on the project tile. If a provider changes its wording, the warning silently stops appearing; the parsing lives in `agent/agent.js` and is the place to update.
 
 ## Related
 

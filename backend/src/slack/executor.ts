@@ -68,7 +68,7 @@ export async function executeClaudeCommand(
 
     const proc = spawn('claude', args, {
       cwd: workingDir,
-      env: { ...process.env },
+      env: { ...process.env, ANTHROPIC_API_KEY: undefined },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -119,6 +119,7 @@ export async function executeClaudeCommand(
 
     proc.on('close', (code) => {
       clearTimeout(timeoutId);
+      console.log(`[EXECUTOR] claude exited code=${code} timedOut=${timedOut} accumulatedText=${accumulatedText.length}chars stderr="${errorOutput.slice(0, 200)}"`);
 
       if (timedOut) {
         reject(new Error(`Request timed out after ${CLAUDE_TIMEOUT / 1000} seconds.`));
@@ -134,6 +135,7 @@ export async function executeClaudeCommand(
 
     proc.on('error', (error) => {
       clearTimeout(timeoutId);
+      console.error(`[EXECUTOR] spawn error: ${error.message}`);
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         reject(new Error('Claude CLI not found. Make sure `claude` is installed and in PATH.'));
       } else {
