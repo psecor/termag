@@ -432,6 +432,7 @@ async function scanRateLimits() {
         /usage limit.*?resets?\s+(.+)/i,
         /Credit balance is too low/i,
         /temporarily limiting requests/i,
+        /Now using extra usage/i,
       ];
 
       let limitMessage = null;

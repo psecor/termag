@@ -1,4 +1,5 @@
 import { Router, RequestHandler } from 'express';
+import { PrismaClient } from '@prisma/client';
 import { setStatus, getStatus, updateStatusMeta, notifyStatusChange } from '../services/status';
 import { AgentStatus } from '../types/index';
 import { getAllNotificationTargets } from '../slack/lts';
@@ -8,6 +9,8 @@ import { capturePaneForSlack, formatPaneForSlack } from '../services/tmux';
 import { formatPaneForDiscord } from '../discord/formatting';
 import { recordHeartbeat } from '../services/humanActivity';
 import { requireAuth } from '../middleware/auth';
+
+const prisma = new PrismaClient();
 
 // Track working start time and last notification per session
 const statusTracking = new Map<string, {
@@ -75,6 +78,18 @@ export function statusRouter(): Router {
       rateLimited,
     });
     notifyStatusChange(session);
+
+    // Touch lastActiveAt when agent starts working (for project sort order)
+    if (status === 'working') {
+      const sessionMatch = session.match(/^(.+?)-(.+)-agent$/);
+      if (sessionMatch) {
+        const [, username, projectName] = sessionMatch;
+        prisma.project.updateMany({
+          where: { name: projectName, user: { unixUsername: username } },
+          data: { lastActiveAt: new Date() },
+        }).catch(() => {});
+      }
+    }
 
     // Track working duration
     const now = Date.now();
@@ -157,13 +172,18 @@ export function statusRouter(): Router {
     res.json(status);
   };
 
-  const heartbeat: RequestHandler = (req, res) => {
+  const heartbeat: RequestHandler = async (req, res) => {
     const { project } = req.body as { project?: string };
     if (!project || typeof project !== 'string') {
       res.status(400).json({ error: 'project required' });
       return;
     }
     recordHeartbeat(req.user!.unixUsername, project);
+    // Touch lastActiveAt for sort ordering
+    prisma.project.updateMany({
+      where: { userId: req.user!.id, name: project },
+      data: { lastActiveAt: new Date() },
+    }).catch(() => {});
     res.json({ ok: true });
   };
 

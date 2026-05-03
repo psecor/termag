@@ -13,6 +13,7 @@ export function ProjectControl() {
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
 
   // Track status transitions for highlight flash
   const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
@@ -242,6 +243,11 @@ export function ProjectControl() {
     await reloadProjects();
   }
 
+  async function togglePin(project: Project) {
+    await projectsApi.togglePin(project.id);
+    await reloadProjects();
+  }
+
   async function createToken(e: React.FormEvent) {
     e.preventDefault();
     if (!newTokenName.trim()) return;
@@ -373,13 +379,31 @@ export function ProjectControl() {
                   </>
                 )}
                 <span className="project-actions" onClick={e => e.stopPropagation()}>
-                  {p.role === 'collaborator' ? (
-                    <button className="btn-tiny btn-danger" onClick={() => leaveProject(p.id)} title="Leave shared project">×</button>
-                  ) : (
-                    <>
-                      <button className={`btn-tiny btn-share${sharedProjectIds.has(p.id) ? ' active' : ''}`} onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); }} title="Share">sh</button>
-                      <button className="btn-tiny btn-danger" onClick={() => archiveProject(p)} title="Archive">×</button>
-                    </>
+                  <button
+                    className="btn-tiny btn-overflow"
+                    onClick={() => setMenuOpenId(menuOpenId === p.id ? null : p.id)}
+                  >⋮</button>
+                  {menuOpenId === p.id && (
+                    <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
+                      {p.role === 'collaborator' ? (
+                        <button onClick={() => { leaveProject(p.id); setMenuOpenId(null); }}>Leave project</button>
+                      ) : (
+                        <>
+                          <button onClick={() => { togglePin(p); setMenuOpenId(null); }}>
+                            {p.pinned ? '◆ Unpin' : '◇ Pin to top'}
+                          </button>
+                          <button onClick={() => { setRenamingId(p.id); setRenameValue(p.name); setMenuOpenId(null); }}>
+                            Rename
+                          </button>
+                          <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
+                            {sharedProjectIds.has(p.id) ? '● Sharing' : 'Share'}
+                          </button>
+                          <button className="menu-danger" onClick={() => { archiveProject(p); setMenuOpenId(null); }}>
+                            Archive
+                          </button>
+                        </>
+                      )}
+                    </div>
                   )}
                 </span>
               </li>

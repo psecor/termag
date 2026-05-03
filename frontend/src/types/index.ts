@@ -23,6 +23,8 @@ export interface Project {
   description?: string;
   color?: string;
   archived: boolean;
+  pinned?: boolean;
+  lastActiveAt?: string;
   workflows: Workflow[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';

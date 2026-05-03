@@ -50,6 +50,8 @@ model Project {
   color          String?   // hex color for UI differentiation
   slackChannelId String?   // Slack channel ID (proj-<name>)
   archived       Boolean   @default(false)
+  pinned         Boolean   @default(false)
+  lastActiveAt   DateTime  @default(now())
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 

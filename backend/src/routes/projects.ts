@@ -21,11 +21,11 @@ export function projectsRouter(): Router {
 
   const list: RequestHandler = async (req, res) => {
     try {
-      // Owned projects
+      // Owned projects: pinned first, then by most recently active
       const owned = await prisma.project.findMany({
         where: { userId: req.user!.id, archived: false },
         include: { workflows: true, user: { select: { unixUsername: true } } },
-        orderBy: { name: 'asc' },
+        orderBy: [{ pinned: 'desc' }, { lastActiveAt: 'desc' }],
       });
 
       // Shared projects (via ProjectShare)
@@ -41,7 +41,8 @@ export function projectsRouter(): Router {
       const result = [
         ...owned.map(p => ({
           id: p.id, name: p.name, description: p.description, color: p.color,
-          archived: p.archived, createdAt: p.createdAt, updatedAt: p.updatedAt,
+          archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
+          createdAt: p.createdAt, updatedAt: p.updatedAt,
           userId: p.userId, workflows: p.workflows,
           ownerUsername: p.user.unixUsername, role: 'owner' as const,
         })),
@@ -50,6 +51,7 @@ export function projectsRouter(): Router {
           .map(s => ({
             id: s.project.id, name: s.project.name, description: s.project.description,
             color: s.project.color, archived: s.project.archived,
+            pinned: s.project.pinned, lastActiveAt: s.project.lastActiveAt,
             createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
             userId: s.project.userId, workflows: s.project.workflows,
             ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
@@ -409,10 +411,30 @@ export function projectsRouter(): Router {
     }
   };
 
+  const togglePin: RequestHandler = async (req, res) => {
+    try {
+      const project = await prisma.project.findFirst({
+        where: { id: req.params.id, userId: req.user!.id },
+      });
+      if (!project) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      const updated = await prisma.project.update({
+        where: { id: project.id },
+        data: { pinned: !project.pinned },
+      });
+      res.json({ pinned: updated.pinned });
+    } catch {
+      res.status(500).json({ error: 'Failed to toggle pin' });
+    }
+  };
+
   router.get('/', requireAuth, list);
   router.post('/', requireAuth, create);
   router.put('/:id', requireAuth, update);
   router.post('/:id/rename', requireAuth, renameProject);
+  router.post('/:id/pin', requireAuth, togglePin);
   router.post('/:id/archive', requireAuth, archive);
   router.post('/:id/workflows', requireAuth, addWorkflow);
   router.delete('/:id/workflows/:type', requireAuth, removeWorkflow);
