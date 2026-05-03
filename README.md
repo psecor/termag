@@ -55,9 +55,17 @@ relay/            Chrome tab capture relay (runs on laptop)
 deploy/           Systemd units, setup docs, hook configs
 ```
 
+## Prerequisites
+
+- **Node.js** 20+
+- **PostgreSQL** 14+
+- **tmux** 3.0+
+- **Apache** 2.4+ with `mod_proxy`, `mod_proxy_http`, `mod_proxy_wstunnel` (or another reverse proxy supporting WebSockets)
+- A **public HTTPS domain** — Google OAuth and Slack callbacks both require it. For local-only use you can run without auth, but the Slack/Discord features won't work.
+
 ## Quick start
 
-See [deploy/setup.md](deploy/setup.md) for full setup instructions.
+See [deploy/setup.md](deploy/setup.md) for full setup instructions, including reverse-proxy config and how to wire up Slack and Discord apps.
 
 ```bash
 # Build
@@ -68,6 +76,16 @@ cd ../frontend && npm install && npm run build
 sudo systemctl start termag          # main server
 systemctl --user start termag-agent  # per-user agent
 ```
+
+## Claude Code hooks integration
+
+termag tracks live agent status (working / waiting / idle) by receiving
+status events from Claude Code's `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, and `Stop` hooks. When a Claude session inside a termag
+project pane goes idle and needs input, termag posts the captured pane to
+your Slack channel automatically.
+
+Hook configuration is documented in [deploy/claude-hooks.md](deploy/claude-hooks.md).
 
 ## Configuration
 

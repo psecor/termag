@@ -6,6 +6,7 @@
  */
 
 import { spawn } from 'child_process';
+import { homedir } from 'os';
 import { PrismaClient } from '@prisma/client';
 import { projectDir, ensureProjectDir } from '../services/tmux';
 
@@ -32,7 +33,7 @@ export async function resolveWorkingDir(slackUserId: string, activeProjectId: st
       return await ensureProjectDir(project.user.unixUsername, project.name);
     }
   }
-  return process.env.HOME ?? '/home/secorp';
+  return process.env.HOME ?? homedir();
 }
 
 /**

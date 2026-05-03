@@ -1,5 +1,5 @@
 {
-  "termag_url": "wss://secorp.net/termag/ws/agent",
+  "termag_url": "wss://example.com/termag/ws/agent",
   "token": "paste-your-agent-token-here",
   "reconnect_interval_seconds": 5
 }

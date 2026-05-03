@@ -1,12 +1,11 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator at https://secorp.net/termag. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, and two-tube thermometer UI tracking both agent working time and human activity. In active daily use as the harness for everything else under ~/termag/projects/."
-last_updated: 2026-05-01
+status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, and two-tube thermometer UI tracking both agent working time and human activity."
+last_updated: 2026-05-03
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
-  - human:secorp
   - agent:sweeper-claude-opus-4-7
 wiki_schema_version: 1
 ---
@@ -17,29 +16,30 @@ wiki_schema_version: 1
 
 A multi-user workspace manager for running AI coding agents in parallel. Each project gets a paired set of tmux sessions — an **agent** pane (Codex, Claude Code, or other agents) and a **ctrl** pane (regular terminal for sudo / interactive auth / things the agent can't run). The web UI renders both terminals side-by-side with xterm.js, shows real-time agent status (working/waiting/idle from Claude hooks + Codex app-server), and exposes per-project usage and a Slack `/t` command surface.
 
-**Live:** `https://secorp.net/termag` — Google OAuth, multi-user (`ALLOWED_USERS` maps `email:unixuser`).
+Auth is Google OAuth with an `ALLOWED_USERS` allowlist mapping `email:unixuser`.
 
 ## Status
 
-Production. Daily use as the harness for every other project under `~/termag/projects/`. Stable enough that the rest of the workspace's CLAUDE.md guidance assumes termag is running. Active development continues: provider registry now covers Codex, Claude, and Mistral (vibe); per-project working-time and human-activity tracking feed a two-tube thermometer UI; project sharing lets owners invite collaborators with terminal access; new projects get seeded `AGENTS.md` and `CLAUDE.md`.
+Production-ready. Provider registry covers Codex, Claude, and Mistral (vibe); per-project working-time and human-activity tracking feed a two-tube thermometer UI; project sharing lets owners invite collaborators with terminal access; new projects get seeded `AGENTS.md` and `CLAUDE.md`.
 
 ## Domain Model
 
 - **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub.
-- **Paired tmux sessions** — `secorp-<project>-agent` (where the AI runs) and `secorp-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket.
+- **Paired tmux sessions** — `<unixuser>-<project>-agent` (where the AI runs) and `<unixuser>-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket.
 - **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
 - **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean.
 - **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting).
 - **Context-token warnings** — the per-user agent scrapes provider-specific "context remaining" strings out of the agent pane and forwards them through the status pipeline as a separate signal alongside working/waiting/idle. The UI surfaces this on the project tile and inside the terminal chrome so a session that's about to run out of context gets a visible warning before it hard-fails.
+- **Rate-limit detection** — same shape as context-token warnings: the per-user agent (`agent/agent.js`) watches the agent pane for provider-specific rate-limit / quota-exhausted messages and forwards a `rateLimited` signal through the status pipeline. The backend persists it on the project's status record and the UI surfaces it on the project tile and in `ProjectControl` so a stuck session is visually distinguishable from a merely-idle one.
 - **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Provider-specific poller sources ensure correct attribution. Served from `/termag/api/worktime`.
 - **Human activity tracking** — `backend/src/services/humanActivity.ts` tracks human keystrokes/interactions per project, separate from agent working time. Powers the second tube of the two-tube thermometer in the UI (agent work vs. human work).
 - **Project sharing** — owners can invite collaborators by email. Shared users get terminal access to the project's tmux sessions through the same per-user-agent path. Routes in `backend/src/routes/sharing.ts`.
-- **Status WebSocket** — `/termag/ws/status` pushes status events to anyone subscribed (the UI itself, plus opt-in consumers like `sound-garden`).
+- **Status WebSocket** — `/termag/ws/status` pushes status events to anyone subscribed (the UI itself, plus opt-in external consumers).
 
 ## Repository Layout
 
 ```
-~/src/termag/                       (canonical; ~/termag/projects/termag is a symlink to here)
+termag/
 ├── backend/                        Express + TS server, port 3040
 │   ├── src/
 │   │   ├── routes/                 REST: projects, status, usage, worktime, sharing, auth
@@ -58,9 +58,8 @@ Production. Daily use as the harness for every other project under `~/termag/pro
 │   ├── codex-status-bridge.js      Codex app-server status normalization
 │   └── codex-status-normalizer.js
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
-├── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough
-│   └── initial-AGENTS.md           template seeded into new projects on creation
-└── service-files/                  staged copies of systemd units
+└── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough
+    └── initial-AGENTS.md           template seeded into new projects on creation
 ```
 
 ## Architecture
@@ -92,7 +91,7 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 
 **Trade-off: single backend + per-user agents vs single multi-user backend** — chose split. The backend can run as root or a service user without inheriting any one user's filesystem permissions; tmux/PTY/filesystem ops happen as the actual user via the agent. Cost: every user must run their own systemd `--user` agent and `loginctl enable-linger`.
 
-**Trade-off: Slack Socket Mode vs HTTPS webhooks** — chose Socket Mode. No public ingress for Slack; reuses the same outbound TCP that the backend already maintains. Same call as `claude-code-proxy-bot` and `reactji-image`.
+**Trade-off: Slack Socket Mode vs HTTPS webhooks** — chose Socket Mode. No public ingress for Slack; reuses the same outbound TCP that the backend already maintains.
 
 **Trade-off: Codex bridge as a managed subprocess vs in-pane only** — chose managed. The agent process owns the bridge lifecycle so termag can normalize Codex's app-server status into the same `working/waiting/idle` shape as Claude Code hooks, without each user wiring it up.
 
@@ -116,7 +115,7 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 
 `agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Project sharing landed in `20260427100000_project_sharing`. Existing values continue to work; new providers no longer require a schema change.
 
-`prisma migrate dev` is fine here (the box is interactive); the rest of the workspace prefers `db push` because some boxes aren't.
+`prisma migrate dev` is fine here (this is an interactive box); on non-interactive deploy targets prefer `db push`.
 
 ## Configuration
 
@@ -129,7 +128,7 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth |
 | `ALLOWED_USERS` | comma-separated `email:unixuser` pairs (the auth gate) |
 | `SLACK_BOT_TOKEN` (`xoxb-`), `SLACK_APP_TOKEN` (`xapp-`), `SLACK_SIGNING_SECRET` | Slack Socket Mode |
-| `CAPTURE_API_SECRET` | LTS relay shared secret (used by `claude-code-proxy-bot`) |
+| `CAPTURE_API_SECRET` | shared secret used by external pane-capture relays |
 | `PORT` | `3040` |
 
 Per-user agent: `~/.config/termag/agent.config.json` with `server_url` (`ws://localhost:3040/termag/ws/agent`) and `token` (created in the UI sidebar → Agent Tokens).
@@ -154,7 +153,7 @@ sudo loginctl enable-linger <username>     # so it runs without an active login
 # add the JSON block from deploy/claude-hooks.md to ~/.claude/settings.json
 ```
 
-Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical first-time walkthrough; `deploy/claude-hooks.md` for the hook config.
+Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough; `deploy/claude-hooks.md` for the hook config.
 
 ## Observability & Maintenance
 
@@ -181,7 +180,7 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 | `POST /termag/api/invites/:id/accept` | Accept a project invite |
 | `DELETE /termag/api/projects/:id/shares/:shareId` | Revoke a collaborator's access |
 | `WS /termag/ws/terminal/<sessionId>` | PTY stream (bidirectional) |
-| `WS /termag/ws/status` | Status push fan-out — consumed by the UI and by `sound-garden` |
+| `WS /termag/ws/status` | Status push fan-out — consumed by the UI and any opt-in external listener |
 | `WS /termag/ws/agent` | Per-user agent connection (bearer-token auth) |
 
 **Slack `/t` commands** (in any channel the bot is in; auto-routes by `#proj-<name>` channel):
@@ -195,8 +194,6 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 | `/t create <name>` | New project + tmux sessions + Slack channel |
 | `/t switch <project>` | Switch active project |
 | `/t projects`, `/t ls` | Listing helpers |
-
-**LTS** — `claude-code-proxy-bot` runs an `:3100` LTS API for its mac-capture daemon. The Apache `/lts/` route in `secorp.conf` currently proxies to `:3040` (this server), not `:3100` — see [claude-code-proxy-bot](../claude-code-proxy-bot/AGENTS.md) Gotcha #3.
 
 ## Gotchas
 
@@ -212,7 +209,7 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 
 6. **`ALLOWED_USERS` maps email→unixuser** — both columns matter. A typo in the unixuser half doesn't fail OAuth; it fails later when the per-user agent can't be reached because no such systemd user service is running.
 
-7. **The `~/termag/projects/` dirs are symlinks** to `~/src/<project>/` for everything except agent-wiki itself. When writing tooling that walks projects (the agent-wiki indexer, the sweeper, etc.), `readlink -f` to get the canonical path before doing anything path-sensitive.
+7. **Project working dirs may be symlinks** — when writing tooling that walks projects, `readlink -f` to get the canonical path before doing anything path-sensitive.
 
 8. **Claude Code hooks fire `curl ... &` (background)** — the `&` is load-bearing. Without it, every tool use blocks on the localhost POST and feels visibly slower. Don't "clean up" the trailing `&` from `deploy/claude-hooks.md`.
 
@@ -232,19 +229,13 @@ Apache snippet already in `secorp.conf`. See `deploy/setup.md` for the canonical
 
 16. **Context-token warnings are parsed from agent pane text, not a structured signal** — the per-user agent scans tmux pane content for provider-specific "context left" / token-budget strings and surfaces them via the status pipeline so the UI can flash a warning on the project tile. If a provider changes its wording, the warning silently stops appearing; the parsing lives in `agent/agent.js` and is the place to update.
 
+17. **Rate-limit detection is also pane-text parsing** — same caveat as context warnings. The `rateLimited` flag is inferred from provider-specific quota/rate-limit phrases in the agent pane. If a provider rewords its rate-limit message, the project tile silently stops showing the rate-limit state; update the patterns in `agent/agent.js`.
+
+18. **Slack `/t` executor strips `ANTHROPIC_API_KEY` from the spawned env** — `backend/src/slack/executor.ts` deliberately removes any inherited `ANTHROPIC_API_KEY` before spawning `claude`, so the subprocess uses the user's own auth (Claude Code login / subscription) instead of a stale workspace key. Don't "helpfully" add it back; doing so silently routes Slack-driven sessions onto the wrong account and burns the wrong quota.
+
 ## Related
 
 **Other projects:**
-- [agent-wiki](../agent-wiki/AGENTS.md) — this project's docs spec; consumes nothing from termag at runtime
-- [sound-garden](../sound-garden/AGENTS.md) — subscribes to `/termag/ws/status` to turn agent state into ambient audio
-- [claude-code-proxy-bot](../claude-code-proxy-bot/AGENTS.md) — different Slack bot; shares the box; LTS API on `:3100` (the `/lts/` route in Apache currently mis-points to `:3040`)
-- [reactji-image](../reactji-image/AGENTS.md), [meeting-slack-app](../meeting-slack-app/AGENTS.md) — same Slack workspace; different shapes
+- [agent-wiki](https://github.com/secorp-net/agent-wiki) — the docs spec this project's `AGENTS.md` follows; consumes nothing from termag at runtime
 
 **Topics:** none yet.
-
-<!-- agent-wiki:backlinks-start -->
-- [agent-wiki](../agent-wiki/AGENTS.md) — Related
-- [claude-code-proxy-bot](../claude-code-proxy-bot/AGENTS.md) — Related
-- [sound-garden](../sound-garden/AGENTS.md) — Related
-- [typing-lag](../typing-lag/AGENTS.md) — Related
-<!-- agent-wiki:backlinks-end -->

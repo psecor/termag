@@ -1,5 +1,5 @@
 {
-  "termag_url": "https://secorp.net/termag",
+  "termag_url": "https://example.com/termag",
   "relay_token": "paste-the-RELAY_TOKEN-from-backend-.env-here",
   "chrome_debug_port": 9222,
   "push_interval_seconds": 30
