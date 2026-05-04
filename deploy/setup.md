@@ -1,11 +1,24 @@
 # termag setup
 
+> **Just want to add a user to a running termag instance?** Skip this whole
+> document and read [§ Per-user agent against an existing instance](#per-user-agent-against-an-existing-instance) below.
+> You don't need Postgres, Apache, OAuth, or any of the build steps — just the
+> agent piece.
+
+## Where to clone the repo
+
+Clone termag into `~/src/termag/` (or any path you like) — **not into
+`~/termag/`**. Termag creates project working dirs at
+`~/termag/projects/<name>/` for each user, and putting the repo at
+`~/termag/` will nest those projects inside the repo's git tree (breaks
+git-init for new projects, plus general path confusion).
+
 ## Prerequisites
 
-- Node.js 18+
-- PostgreSQL
+- Node.js 20+
+- PostgreSQL 14+
 - Apache with mod_proxy (or another reverse proxy)
-- tmux
+- tmux 3.0+
 - Google OAuth credentials (for web login)
 - Slack app (optional, for /t commands and notifications)
 - Discord bot (optional, mirrors Slack /t commands)
@@ -13,7 +26,7 @@
 ## 1. Database
 
 ```bash
-createdb -U secorp termag
+createdb -U <db-user> termag
 cd backend
 cp .env.example .env
 # fill in .env (see .env.example for all variables)
@@ -31,7 +44,7 @@ npx prisma generate
 
 Create the session table for connect-pg-simple:
 ```sql
-psql -U secorp -d termag -c "
+psql -U <db-user> -d termag -c "
 CREATE TABLE \"session\" (
   \"sid\" varchar NOT NULL COLLATE \"default\",
   \"sess\" json NOT NULL,
@@ -73,34 +86,72 @@ sudo systemctl enable --now termag
 
 ### Per-user agent (runs as each user)
 
-The agent handles tmux, PTY, and filesystem operations on behalf of each user.
-Set up as a systemd user service:
+The agent handles tmux, PTY, and filesystem operations on behalf of each
+user. Each user runs their own agent under `systemctl --user`. Detailed
+walkthrough in the next section.
+
+## Per-user agent against an existing instance
+
+Use this path when the backend is already deployed (by you or someone
+else) and you just want to add a new user to it. You skip Postgres,
+Apache, OAuth, frontend builds, and Slack/Discord — everything except
+the per-user agent.
+
+### Operator setup (admin of the running instance)
+
+1. Add the new user to `ALLOWED_USERS` in `backend/.env` —
+   `email@example.com:unixuser` — and restart the main server:
+   ```bash
+   sudo systemctl restart termag
+   ```
+2. Enable lingering for that unix user so their agent runs without an
+   active login:
+   ```bash
+   sudo loginctl enable-linger <unixuser>
+   ```
+
+### What the new user does
+
+Replace `<termag-host>` with the public domain (e.g.
+`termag.example.com`) and use `wss://` for remote, or `ws://localhost:3040`
+if running on the same host as the backend.
 
 ```bash
-# As the target user:
+# 1. Sign into https://<termag-host>/termag in a browser, then
+#    sidebar → Agent Tokens → create one, copy it.
+
+# 2. Clone the repo. NOT into ~/termag/ — pick anywhere else.
+git clone https://github.com/psecor/termag.git ~/src/termag
+
+# 3. Install only the agent dependencies (node-pty has a native build).
+cd ~/src/termag/agent
+npm install
+
+# 4. Config file.
+cp agent.config.example.json agent.config.json
+# Edit agent.config.json — set termag_url and token.
+#   termag_url: ws://localhost:3040/termag/ws/agent  (same host)
+#               wss://<termag-host>/termag/ws/agent   (remote)
+
+# 5. Install the systemd user unit.
 mkdir -p ~/.config/systemd/user
-cp deploy/termag-agent.service ~/.config/systemd/user/
-# Edit the service file to set correct paths and config
+cp ~/src/termag/deploy/termag-agent.service ~/.config/systemd/user/
+# The unit uses %h (home) and assumes the clone at ~/src/termag/. Edit
+# ExecStart if you cloned somewhere else.
 systemctl --user daemon-reload
 systemctl --user enable --now termag-agent
-
-# Enable lingering so the agent runs without an active login session
-sudo loginctl enable-linger <username>
+journalctl --user -u termag-agent -f   # confirm it connects
 ```
 
-The agent connects to the main server via WebSocket using a bearer token.
-Create a token in the termag UI (sidebar > Agent Tokens).
+### Verify
 
-Agent config (`agent.config.json`):
-```json
-{
-  "server_url": "ws://localhost:3040/termag/ws/agent",
-  "token": "tmag_..."
-}
-```
+In the browser, create a project. The terminals should connect, and
+`AGENTS.md` + `CLAUDE.md` should appear in the project working dir
+(`~/termag/projects/<name>/`), which should also be a fresh git repo.
+If status indicators stay grey, finish §6 (Claude Code hooks) below.
 
-The per-user agent must be restarted whenever `agent/agent.js` changes. This is
-also where Codex bridge lifecycle management now lives.
+The per-user agent must be restarted whenever `agent/agent.js` changes:
+`systemctl --user restart termag-agent`.
 
 ## 5. Agent providers
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Termag per-user agent
+After=network.target
+
+[Service]
+# %h = invoking user's $HOME. Adjust the agent/ path if you cloned termag
+# somewhere other than ~/src/termag. Avoid ~/termag/, since termag's project
+# dirs live at ~/termag/projects/<name>/ and a clone there will collide.
+ExecStart=/usr/bin/node %h/src/termag/agent/agent.js %h/src/termag/agent/agent.config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

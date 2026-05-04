@@ -47,9 +47,10 @@ if (!termag_url || !token) {
 // ── Wiki init ─────────────────────────────────────────────────────────────
 const { readFile: readFileAsync, writeFile } = require('fs/promises');
 
-const WIKI_TEMPLATE_PATH = path.join(
-  process.env.HOME || '/home', 'termag', 'projects', 'agent-wiki', 'spec', 'initial-AGENTS.md'
-);
+// Bundled template ships next to this file. Override with TERMAG_WIKI_TEMPLATE_PATH
+// to point at a different one (e.g. an agent-wiki checkout that gets curated centrally).
+const WIKI_TEMPLATE_PATH = process.env.TERMAG_WIKI_TEMPLATE_PATH
+  || path.join(__dirname, 'initial-AGENTS.md');
 
 async function initWikiFiles(dir, slug, username) {
   const agentsPath = path.join(dir, 'AGENTS.md');
@@ -64,8 +65,12 @@ async function initWikiFiles(dir, slug, username) {
   try {
     templateRaw = await readFileAsync(WIKI_TEMPLATE_PATH, 'utf8');
   } catch (err) {
-    console.error('[INIT-WIKI] Cannot read template:', err.message);
-    return { ok: false, error: 'Template not found' };
+    console.error(
+      `[INIT-WIKI] Cannot read template at ${WIKI_TEMPLATE_PATH}: ${err.message}. ` +
+      `Set TERMAG_WIKI_TEMPLATE_PATH to override, or restore the bundled file at agent/initial-AGENTS.md. ` +
+      `Project ${slug} will be created without AGENTS.md/CLAUDE.md.`
+    );
+    return { ok: false, error: 'Template not found', path: WIKI_TEMPLATE_PATH };
   }
 
   const today = new Date().toISOString().slice(0, 10);
@@ -607,10 +612,19 @@ function connect() {
         case 'tmux-create': {
           const { sessionName, cwd } = msg;
           await mkdir(cwd, { recursive: true });
-          // git init if not already a repo
+          // git init unless cwd is itself the toplevel of a git repo. Using
+          // --show-toplevel (and comparing) avoids the false positive where the
+          // project dir is *nested inside* an existing repo (e.g. someone
+          // cloned termag into ~/termag/ so projects under ~/termag/projects/
+          // walk up and find termag's own .git).
+          let alreadyRepo = false;
           try {
-            await execAsync(`git -C ${shellEscape(cwd)} rev-parse --git-dir 2>/dev/null`);
-          } catch {
+            const { stdout } = await execAsync(`git -C ${shellEscape(cwd)} rev-parse --show-toplevel 2>/dev/null`);
+            const realCwd = await fs.promises.realpath(cwd);
+            const realTop = await fs.promises.realpath(stdout.trim());
+            alreadyRepo = realTop === realCwd;
+          } catch { /* not in a repo */ }
+          if (!alreadyRepo) {
             await execAsync(`git init ${shellEscape(cwd)}`);
           }
           // Create tmux session
