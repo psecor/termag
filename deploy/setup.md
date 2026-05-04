@@ -141,6 +141,13 @@ cp ~/src/termag/deploy/termag-agent.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now termag-agent
 journalctl --user -u termag-agent -f   # confirm it connects
+
+# 6. Wire up Claude Code hooks. REQUIRED for status indicators to work
+#    with the Claude provider — without this, project status dots stay
+#    grey forever even though the agent and terminals are fine.
+#    Add termag as a status hook target in ~/.claude/settings.json so
+#    each hook event POSTs to http://localhost:3040/termag/api/status.
+#    See deploy/claude-hooks.md for the full snippet to paste in.
 ```
 
 ### Verify
@@ -148,7 +155,8 @@ journalctl --user -u termag-agent -f   # confirm it connects
 In the browser, create a project. The terminals should connect, and
 `AGENTS.md` + `CLAUDE.md` should appear in the project working dir
 (`~/termag/projects/<name>/`), which should also be a fresh git repo.
-If status indicators stay grey, finish §6 (Claude Code hooks) below.
+Status indicators should go live as soon as Claude starts running
+(if they stay grey, step 6 didn't take — re-check `~/.claude/settings.json`).
 
 The per-user agent must be restarted whenever `agent/agent.js` changes:
 `systemctl --user restart termag-agent`.
@@ -166,8 +174,13 @@ has a saved default provider used by the create-project form.
 
 ## 6. Claude Code hooks
 
-Add termag as a status hook target in `~/.claude/settings.json`.
-Each hook event should POST to `http://localhost:3040/termag/api/status`.
+Required for status indicators to work with the Claude provider —
+the agent runs Claude inside tmux, but Claude itself reports
+working/idle/needs-input state via Claude Code hooks. Without this
+step, status dots stay grey.
+
+Add termag as a status hook target in `~/.claude/settings.json` so
+each hook event POSTs to `http://localhost:3040/termag/api/status`.
 See `deploy/claude-hooks.md` for the full configuration.
 
 ## 7. Slack bot
