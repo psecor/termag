@@ -1,8 +1,8 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, and two-tube thermometer UI tracking both agent working time and human activity."
-last_updated: 2026-05-03
+status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity, and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
+last_updated: 2026-05-04
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -24,11 +24,11 @@ Production-ready. Provider registry covers Codex, Claude, and Mistral (vibe); pe
 
 ## Domain Model
 
-- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub.
+- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub. Projects also carry a `pinned` flag and a `lastActiveAt` timestamp that drive the project list ordering: pinned projects float to the top, then the rest sort by recent activity. Pin/unpin and other per-project actions live in an overflow menu on each project tile.
 - **Paired tmux sessions** — `<unixuser>-<project>-agent` (where the AI runs) and `<unixuser>-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket.
 - **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
 - **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean.
-- **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting).
+- **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting). Status events also bump `Project.lastActiveAt`, which feeds the recent-activity sort.
 - **Context-token warnings** — the per-user agent scrapes provider-specific "context remaining" strings out of the agent pane and forwards them through the status pipeline as a separate signal alongside working/waiting/idle. The UI surfaces this on the project tile and inside the terminal chrome so a session that's about to run out of context gets a visible warning before it hard-fails.
 - **Rate-limit detection** — same shape as context-token warnings: the per-user agent (`agent/agent.js`) watches the agent pane for provider-specific rate-limit / quota-exhausted messages and forwards a `rateLimited` signal through the status pipeline. The backend persists it on the project's status record and the UI surfaces it on the project tile and in `ProjectControl` so a stuck session is visually distinguishable from a merely-idle one.
 - **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Provider-specific poller sources ensure correct attribution. Served from `/termag/api/worktime`.
@@ -104,16 +104,16 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | Model | Purpose |
 |-------|---------|
 | `User` | Google identity + mapped unix user. Holds `defaultAgentProvider` (string), agent token records, usage rollups. |
-| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag, owner. |
+| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag, owner, `pinned` flag and `lastActiveAt` timestamp (drive project-list ordering: pinned first, then recent activity). |
 | `ProjectShare` | Collaborator grants on a project — `(projectId, userId)` with role. Backs the sharing routes; lets a non-owner reach the owner's tmux sessions through their own agent. |
 | `AgentToken` | Bearer token for a per-user agent connection. Issued from the UI sidebar. |
-| `StatusEvent` | Append-only log of `working/waiting/idle` events; backs the status WebSocket, the "hyperspace" activity score, the project-list transition flash, and worktime rollups. |
+| `StatusEvent` | Append-only log of `working/waiting/idle` events; backs the status WebSocket, the "hyperspace" activity score, the project-list transition flash, and worktime rollups. Status writes also bump `Project.lastActiveAt`. |
 | `WorkTime` | Per-project rollup of time spent in `working` state, derived from `StatusEvent`. Powers `/termag/api/worktime`. |
 | `HumanActivity` | Per-project rollup of human keystroke/interaction time, derived from terminal input events. Powers the human tube of the two-tube thermometer. |
 | `UsageEvent` | Per-call API usage (tokens, cost) for the dashboard. Provider-specific scanners populate this (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`). |
 | `session` | Managed by `connect-pg-simple`, NOT in `schema.prisma`. Created by the SQL block in `deploy/setup.md`. |
 
-`agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Project sharing landed in `20260427100000_project_sharing`. Existing values continue to work; new providers no longer require a schema change.
+`agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Project sharing landed in `20260427100000_project_sharing`. `Project.pinned` and `Project.lastActiveAt` landed in the `20260503000000_add_project_pinned_and_lastActiveAt` migration. Existing values continue to work; new providers no longer require a schema change.
 
 `prisma migrate dev` is fine here (this is an interactive box); on non-interactive deploy targets prefer `db push`.
 
@@ -233,9 +233,11 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 
 18. **Slack `/t` executor strips `ANTHROPIC_API_KEY` from the spawned env** — `backend/src/slack/executor.ts` deliberately removes any inherited `ANTHROPIC_API_KEY` before spawning `claude`, so the subprocess uses the user's own auth (Claude Code login / subscription) instead of a stale workspace key. Don't "helpfully" add it back; doing so silently routes Slack-driven sessions onto the wrong account and burns the wrong quota.
 
+19. **Project-list ordering is `pinned DESC, lastActiveAt DESC`** — `lastActiveAt` is bumped on status writes, not on every API touch, so a project you opened in the UI but haven't run the agent in won't float up. If recent-activity sort "isn't working," check that status events are actually arriving (Claude hooks installed, agent up) before suspecting the sort.
+
 ## Related
 
 **Other projects:**
-- [agent-wiki](https://github.com/secorp-net/agent-wiki) — the docs spec this project's `AGENTS.md` follows; consumes nothing from termag at runtime
+- [agent-wiki](https://github.com/psecor/agent-wiki) — the docs spec this project's `AGENTS.md` follows; consumes nothing from termag at runtime
 
 **Topics:** none yet.
