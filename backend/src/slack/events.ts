@@ -135,7 +135,7 @@ function isRateLimited(userId: string): boolean {
  */
 async function resolveUnixUsername(slackUserId: string, slackClient?: any): Promise<string> {
   const user = await resolveTermagUser(slackUserId, slackClient);
-  return user?.unixUsername ?? 'secorp';
+  return user?.unixUsername ?? 'unknown';
 }
 
 export function getActiveProjectId(userId: string): string | null {
@@ -290,7 +290,7 @@ export function registerEventHandlers(app: App): void {
     if (ALLOWED_USERS && !ALLOWED_USERS.has(userId)) return;
 
     const termagUser = await resolveTermagUser(userId, client);
-    const username = termagUser?.unixUsername ?? 'secorp';
+    const username = termagUser?.unixUsername ?? 'unknown';
     const userCommand = command.text.trim();
 
     // ── /t local <subcommand> ──────────────────────────

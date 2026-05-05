@@ -18,7 +18,7 @@ const DETACH_GRACE_MS = 5000;
 function cleanEnv(): Record<string, string> {
   return {
     HOME: process.env.HOME ?? '/home',
-    USER: process.env.USER ?? 'secorp',
+    USER: process.env.USER ?? 'termag',
     SHELL: process.env.SHELL ?? '/bin/bash',
     TERM: 'xterm-256color',
     PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',

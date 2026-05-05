@@ -303,7 +303,7 @@ async function scanContextTokens() {
   const statusEndpoint = getStatusEndpoint();
 
   for (const dir of projectDirs) {
-    // Dir names are paths with / replaced by -, e.g. "-home-secorp-termag-projects-card-depot"
+    // Dir names are paths with / replaced by -, e.g. "-home-alice-termag-projects-foo"
     // Match against known project names
     let matchedSession = null;
     for (const [projName, sessName] of projectSessions) {

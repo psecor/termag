@@ -51,7 +51,7 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`Usage:
-  node codex-status-bridge.js --session secorp-demo-agent --cwd /path/to/project
+  node codex-status-bridge.js --session alice-demo-agent --cwd /path/to/project
 `);
 }
 

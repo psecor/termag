@@ -26,9 +26,12 @@ export async function ensureProjectDir(username: string, projectName: string): P
   return dir;
 }
 
-const WIKI_TEMPLATE_PATH = join(
-  '/home', 'secorp', 'termag', 'projects', 'agent-wiki', 'spec', 'initial-AGENTS.md'
-);
+// Fallback path for project AGENTS.md seeding when the per-user agent is not
+// connected. The agent is the primary path and bundles its own copy of the
+// template; this just reuses that bundled file. From backend/dist/services/
+// up three levels lands at the repo root, then agent/initial-AGENTS.md.
+const WIKI_TEMPLATE_PATH = process.env.TERMAG_WIKI_TEMPLATE_PATH
+  ?? join(__dirname, '../../..', 'agent', 'initial-AGENTS.md');
 
 async function initWikiFiles(dir: string, slug: string, username: string): Promise<void> {
   const agentsPath = join(dir, 'AGENTS.md');

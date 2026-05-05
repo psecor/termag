@@ -110,7 +110,7 @@ model BrowserTab {
 // Notification targets — which channels to notify when a tmux session needs input
 // Supports both Slack and Discord; one entry per session+platform pair
 model NotificationTarget {
-  tmuxSession String              // e.g. "secorp-mommo-site-agent"
+  tmuxSession String              // e.g. "alice-foo-agent"
   platform    String              // "slack" or "discord"
   channel     String              // platform channel ID
   userId      String              // platform user ID
