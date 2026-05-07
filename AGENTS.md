@@ -2,7 +2,7 @@
 project: termag
 status: production
 status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity, and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
-last_updated: 2026-05-04
+last_updated: 2026-05-06
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -56,10 +56,11 @@ termag/
 ├── agent/                          Per-user agent (plain JS, no build step)
 │   ├── agent.js                    main entry — WebSocket to backend, node-pty + tmux attach
 │   ├── codex-status-bridge.js      Codex app-server status normalization
-│   └── codex-status-normalizer.js
+│   ├── codex-status-normalizer.js
+│   ├── agent.config.example.json   sample per-user agent config
+│   └── initial-AGENTS.md           template seeded into new projects on creation
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough
-    └── initial-AGENTS.md           template seeded into new projects on creation
 ```
 
 ## Architecture

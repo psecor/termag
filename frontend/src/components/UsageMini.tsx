@@ -534,14 +534,35 @@ export function UsageMini() {
               </div>
             </div>
 
-            {/* Your activity — separate from agents */}
+            {/* Your activity — 30 day chart */}
+            {monthHumanMs > 0 && (
+              <div className="usage-overlay-section">
+                <div className="usage-overlay-section-header">
+                  <span>You — 30d</span>
+                  <span>{fmtDuration(monthHumanMs)}</span>
+                  <span className="usage-dim">avg {fmtDuration(Math.round(monthHumanMs / 30))}/d</span>
+                </div>
+                <WtBarChart days={monthUTC} wt={worktime} providers={[humanConfig]} height={80} />
+              </div>
+            )}
+
+            {/* Your activity — 7 day chart */}
+            {weekHumanMs > 0 && (
+              <div className="usage-overlay-section">
+                <div className="usage-overlay-section-header">
+                  <span>You — 7d</span>
+                  <span>{fmtDuration(weekHumanMs)}</span>
+                  <span className="usage-dim">avg {fmtDuration(Math.round(weekHumanMs / 7))}/d</span>
+                </div>
+                <WtBarChart days={weekUTC} wt={worktime} providers={[humanConfig]} height={60} />
+              </div>
+            )}
+
+            {/* Your activity — today */}
             <div className="usage-overlay-section">
               <div className="usage-overlay-section-header">
                 <span>You — today</span>
                 <span>{todayHumanMs > 0 ? fmtDuration(todayHumanMs) : '--'}</span>
-                <span className="usage-dim">
-                  {weekHumanMs > 0 ? `${fmtDuration(weekHumanMs)} 7d` : ''}
-                </span>
               </div>
               {todayHumanMs > 0 && (
                 <WtStackedBar data={{ human: todayWt['human'] }} providers={[humanConfig]} maxMs={THERMO_MAX_MS} height={16} />
