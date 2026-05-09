@@ -442,14 +442,62 @@ async function scanRateLimits() {
 
       let limitMessage = null;
       for (const line of paneContent.split('\n').reverse()) {
+        const trimmed = line.trim();
+        // Skip lines that are clearly inside tool output, JSON, quotes, or curl commands
+        if (!trimmed) continue;
+        if (trimmed.startsWith('⎿') || trimmed.startsWith('"') || trimmed.startsWith('{')
+            || trimmed.startsWith('…') || trimmed.startsWith('●') || trimmed.startsWith('-d')
+            || /^\s*curl\s/.test(line)) continue;
         for (const pattern of rateLimitPatterns) {
-          const match = line.match(pattern);
+          const match = trimmed.match(pattern);
           if (match) {
-            limitMessage = line.trim().slice(0, 100);
+            limitMessage = trimmed.slice(0, 100);
             break;
           }
         }
         if (limitMessage) break;
+      }
+
+      // ── Stale "waiting" correction ──
+      // If the status API says this session is "waiting" but the pane shows
+      // signs of active execution (elapsed time, spinner), correct it to "working".
+      // This covers the gap where no hook fires between permission approval and
+      // tool completion.
+      const activePatterns = [
+        /\(\d+[ms]\s+\d+s\s+·/,       // e.g. "(2m 49s · ↓ 653 tokens)"
+        /\(\d+s\s+·/,                   // e.g. "(15s · timeout 10m)"
+        /✢\s+\S/,                       // ✢ spinner with text
+        /⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/,       // braille spinner chars
+      ];
+      const looksActive = paneContent.split('\n').some(line =>
+        activePatterns.some(p => p.test(line))
+      );
+      if (looksActive) {
+        try {
+          const statusUrl = `${statusEndpoint}/${encodeURIComponent(session)}`;
+          const statusRes = await new Promise((resolve, reject) => {
+            const url = new URL(statusUrl);
+            const http = require(url.protocol === 'https:' ? 'https' : 'http');
+            const req = http.get(url, (res) => {
+              let body = '';
+              res.on('data', (c) => body += c);
+              res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+            });
+            req.on('error', () => resolve(null));
+          });
+          if (statusRes && statusRes.status === 'waiting') {
+            const payload = JSON.stringify({ session, status: 'working' });
+            const url = new URL(statusEndpoint);
+            const http = require(url.protocol === 'https:' ? 'https' : 'http');
+            const req = http.request(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+            });
+            req.on('error', () => {});
+            req.end(payload);
+            console.log(`[STATUS-FIX] Corrected ${session} from waiting → working (pane shows active execution)`);
+          }
+        } catch { /* ignore */ }
       }
 
       const wasLimited = rateLimitedSessions.get(session);

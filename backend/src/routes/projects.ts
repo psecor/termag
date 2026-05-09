@@ -25,7 +25,7 @@ export function projectsRouter(): Router {
       const owned = await prisma.project.findMany({
         where: { userId: req.user!.id, archived: false },
         include: { workflows: true, user: { select: { unixUsername: true } } },
-        orderBy: [{ pinned: 'desc' }, { lastActiveAt: 'desc' }],
+        orderBy: [{ pinned: 'desc' }, { name: 'asc' }],
       });
 
       // Shared projects (via ProjectShare)

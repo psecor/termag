@@ -1,9 +1,28 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue } from '../types';
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { projectsApi, agentTokensApi, sharingApi, AgentTokenInfo } from '../services/api';
+
+function ConfirmDialog({ message, onConfirm, onCancel }: {
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="confirm-backdrop" onClick={onCancel}>
+      <div className="confirm-dialog" onClick={e => e.stopPropagation()}>
+        <p className="confirm-message">{message}</p>
+        <div className="confirm-actions">
+          <button className="confirm-btn confirm-btn-cancel" onClick={onCancel}>Cancel</button>
+          <button className="confirm-btn confirm-btn-confirm" onClick={onConfirm} autoFocus>Confirm</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export function ProjectControl() {
   const { user, logout, updateDefaultAgentProvider } = useAuth();
@@ -14,6 +33,8 @@ export function ProjectControl() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  const [confirmState, setConfirmState] = useState<{ message: string; onConfirm: () => void } | null>(null);
+  const [projectFilter, setProjectFilter] = useState('');
 
   // Track status transitions for highlight flash
   const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
@@ -194,13 +215,17 @@ export function ProjectControl() {
     } catch { setError('Failed to revoke share'); }
   }
 
-  async function leaveProject(projectId: string) {
-    if (!confirm('Leave this shared project?')) return;
-    try {
-      await sharingApi.leaveProject(projectId);
-      if (activeProjectId === projectId) setActiveProject(null);
-      await reloadProjects();
-    } catch { setError('Failed to leave project'); }
+  function leaveProject(projectId: string) {
+    setConfirmState({
+      message: 'Leave this shared project?',
+      onConfirm: async () => {
+        try {
+          await sharingApi.leaveProject(projectId);
+          if (activeProjectId === projectId) setActiveProject(null);
+          await reloadProjects();
+        } catch { setError('Failed to leave project'); }
+      },
+    });
   }
 
   async function createProject(e: React.FormEvent) {
@@ -236,11 +261,15 @@ export function ProjectControl() {
     }
   }
 
-  async function archiveProject(project: Project) {
-    if (!confirm(`Archive ${project.name}? This will kill all tmux sessions for this project.`)) return;
-    await projectsApi.archive(project.id);
-    if (activeProjectId === project.id) setActiveProject(null);
-    await reloadProjects();
+  function archiveProject(project: Project) {
+    setConfirmState({
+      message: `Archive ${project.name}? This will kill all tmux sessions for this project.`,
+      onConfirm: async () => {
+        await projectsApi.archive(project.id);
+        if (activeProjectId === project.id) setActiveProject(null);
+        await reloadProjects();
+      },
+    });
   }
 
   async function togglePin(project: Project) {
@@ -262,10 +291,14 @@ export function ProjectControl() {
     }
   }
 
-  async function revokeToken(id: string) {
-    if (!confirm('Revoke this token? The agent using it will be disconnected.')) return;
-    await agentTokensApi.revoke(id);
-    setTokens(prev => prev.filter(t => t.id !== id));
+  function revokeToken(id: string) {
+    setConfirmState({
+      message: 'Revoke this token? The agent using it will be disconnected.',
+      onConfirm: async () => {
+        await agentTokensApi.revoke(id);
+        setTokens(prev => prev.filter(t => t.id !== id));
+      },
+    });
   }
 
   async function saveDefaultAgent(provider: string) {
@@ -276,6 +309,104 @@ export function ProjectControl() {
     } catch {
       setError('Failed to save default agent');
     }
+  }
+
+  function renderProjectItem(p: typeof projects[0]) {
+    const provider = displayAgentProvider(p);
+    const config = provider ? PROVIDERS[provider] : null;
+    const ctxWarn = contextWarning(p);
+    const rateLimit = rateLimitWarning(p);
+    return (
+      <li
+        key={p.id}
+        className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
+        onClick={() => setActiveProject(p.id)}
+      >
+        <span className="project-status">
+          {statusEmoji(p)}
+          {rateLimit ? (
+            <span className="rate-limit-badge" title={rateLimit} />
+          ) : ctxWarn && (
+            <span
+              className={`ctx-warn ctx-warn-${ctxWarn.level}`}
+              title={`Context: ${fmtTokens(ctxWarn.tokens)} — consider /clear`}
+            />
+          )}
+        </span>
+        {renamingId === p.id ? (
+          <input
+            className="project-rename-input"
+            value={renameValue}
+            onChange={e => setRenameValue(e.target.value)}
+            onBlur={() => renameProject(p)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') renameProject(p);
+              if (e.key === 'Escape') setRenamingId(null);
+            }}
+            onClick={e => e.stopPropagation()}
+            autoFocus
+          />
+        ) : (
+          <>
+            <span
+              className="project-name"
+              onDoubleClick={p.role !== 'collaborator' ? (e => {
+                e.stopPropagation();
+                setRenamingId(p.id);
+                setRenameValue(p.name);
+              }) : undefined}
+            >
+              {p.name}
+              {p.role === 'collaborator' && (
+                <span className="shared-label" title={`Shared by ${p.ownerUsername}`}>
+                  {` (${p.ownerUsername})`}
+                </span>
+              )}
+            </span>
+            {config && (
+              <span
+                className="project-provider-badge"
+                style={{
+                  borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
+                  background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
+                }}
+                title={`runtime: ${config.displayName}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
+              >
+                {config.badge}
+              </span>
+            )}
+          </>
+        )}
+        <span className="project-actions" onClick={e => e.stopPropagation()}>
+          <button
+            className="btn-tiny btn-overflow"
+            onClick={() => setMenuOpenId(menuOpenId === p.id ? null : p.id)}
+          >⋮</button>
+          {menuOpenId === p.id && (
+            <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
+              {p.role === 'collaborator' ? (
+                <button onClick={() => { leaveProject(p.id); setMenuOpenId(null); }}>Leave project</button>
+              ) : (
+                <>
+                  <button onClick={() => { togglePin(p); setMenuOpenId(null); }}>
+                    {p.pinned ? '◆ Unpin' : '◇ Pin to top'}
+                  </button>
+                  <button onClick={() => { setRenamingId(p.id); setRenameValue(p.name); setMenuOpenId(null); }}>
+                    Rename
+                  </button>
+                  <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
+                    {sharedProjectIds.has(p.id) ? '● Sharing' : 'Share'}
+                  </button>
+                  <button className="menu-danger" onClick={() => { archiveProject(p); setMenuOpenId(null); }}>
+                    Archive
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </span>
+      </li>
+    );
   }
 
   return (
@@ -308,107 +439,33 @@ export function ProjectControl() {
 
       <section className="control-section">
         <h3>Projects</h3>
+        {projects.length > 5 && (
+          <input
+            className="project-filter"
+            type="text"
+            placeholder="Filter…"
+            value={projectFilter}
+            onChange={e => setProjectFilter(e.target.value)}
+          />
+        )}
         <ul className="project-list">
-          {projects.map(p => {
-            const provider = displayAgentProvider(p);
-            const config = provider ? PROVIDERS[provider] : null;
-            const ctxWarn = contextWarning(p);
-            const rateLimit = rateLimitWarning(p);
-            return (
-              <li
-                key={p.id}
-                className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
-                onClick={() => setActiveProject(p.id)}
-              >
-                <span className="project-status">
-                  {statusEmoji(p)}
-                  {rateLimit ? (
-                    <span
-                      className="rate-limit-badge"
-                      title={rateLimit}
-                    />
-                  ) : ctxWarn && (
-                    <span
-                      className={`ctx-warn ctx-warn-${ctxWarn.level}`}
-                      title={`Context: ${fmtTokens(ctxWarn.tokens)} — consider /clear`}
-                    />
-                  )}
-                </span>
-                {renamingId === p.id ? (
-                  <input
-                    className="project-rename-input"
-                    value={renameValue}
-                    onChange={e => setRenameValue(e.target.value)}
-                    onBlur={() => renameProject(p)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') renameProject(p);
-                      if (e.key === 'Escape') setRenamingId(null);
-                    }}
-                    onClick={e => e.stopPropagation()}
-                    autoFocus
-                  />
-                ) : (
-                  <>
-                    <span
-                      className="project-name"
-                      onDoubleClick={p.role !== 'collaborator' ? (e => {
-                        e.stopPropagation();
-                        setRenamingId(p.id);
-                        setRenameValue(p.name);
-                      }) : undefined}
-                    >
-                      {p.name}
-                      {p.role === 'collaborator' && (
-                        <span className="shared-label" title={`Shared by ${p.ownerUsername}`}>
-                          {` (${p.ownerUsername})`}
-                        </span>
-                      )}
-                    </span>
-                    {config && (
-                      <span
-                        className="project-provider-badge"
-                        style={{
-                          borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
-                          background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
-                        }}
-                        title={`runtime: ${config.displayName}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
-                      >
-                        {config.badge}
-                      </span>
-                    )}
-                  </>
-                )}
-                <span className="project-actions" onClick={e => e.stopPropagation()}>
-                  <button
-                    className="btn-tiny btn-overflow"
-                    onClick={() => setMenuOpenId(menuOpenId === p.id ? null : p.id)}
-                  >⋮</button>
-                  {menuOpenId === p.id && (
-                    <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
-                      {p.role === 'collaborator' ? (
-                        <button onClick={() => { leaveProject(p.id); setMenuOpenId(null); }}>Leave project</button>
-                      ) : (
-                        <>
-                          <button onClick={() => { togglePin(p); setMenuOpenId(null); }}>
-                            {p.pinned ? '◆ Unpin' : '◇ Pin to top'}
-                          </button>
-                          <button onClick={() => { setRenamingId(p.id); setRenameValue(p.name); setMenuOpenId(null); }}>
-                            Rename
-                          </button>
-                          <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
-                            {sharedProjectIds.has(p.id) ? '● Sharing' : 'Share'}
-                          </button>
-                          <button className="menu-danger" onClick={() => { archiveProject(p); setMenuOpenId(null); }}>
-                            Archive
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  )}
-                </span>
-              </li>
-            );
-          })}
+          {(() => {
+            const filtered = projectFilter
+              ? projects.filter(p => p.name.toLowerCase().includes(projectFilter.toLowerCase()))
+              : projects;
+            const pinned = filtered.filter(p => p.pinned);
+            const unpinned = filtered.filter(p => !p.pinned);
+            const list: (typeof projects[0] | 'divider')[] = [
+              ...pinned,
+              ...(pinned.length > 0 && unpinned.length > 0 ? ['divider' as const] : []),
+              ...unpinned,
+            ];
+            return list.map((item) => {
+              if (item === 'divider') return <li key="__divider" className="project-list-divider" />;
+              const p = item;
+              return renderProjectItem(p);
+            });
+          })()}
         </ul>
         <form className="inline-form" onSubmit={createProject}>
           <input
@@ -505,6 +562,14 @@ export function ProjectControl() {
           </>
         )}
       </section>
+      {confirmState && createPortal(
+        <ConfirmDialog
+          message={confirmState.message}
+          onConfirm={() => { setConfirmState(null); confirmState.onConfirm(); }}
+          onCancel={() => setConfirmState(null)}
+        />,
+        document.body,
+      )}
     </div>
   );
 }

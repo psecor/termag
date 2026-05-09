@@ -1,8 +1,8 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity, and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
-last_updated: 2026-05-06
+status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity (with 7d/30d human-activity charts in the usage overlay), and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
+last_updated: 2026-05-09
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -49,7 +49,7 @@ termag/
 │   └── prisma/                     schema + migrations
 ├── frontend/                       React 18 + Vite, basename /termag
 │   └── src/
-│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini (two-tube thermometers), Hyperspace
+│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini (two-tube thermometers + 7d/30d human-activity charts in the usage overlay), Hyperspace
 │       ├── providers/registry.ts   Mirror of backend provider registry — must stay in sync
 │       ├── contexts/               AuthContext, ProjectContext
 │       └── services/               REST + WebSocket clients
