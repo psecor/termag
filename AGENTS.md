@@ -2,7 +2,7 @@
 project: termag
 status: production
 status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity (with 7d/30d human-activity charts in the usage overlay), and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
-last_updated: 2026-05-09
+last_updated: 2026-05-10
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -44,7 +44,7 @@ termag/
 │   ├── src/
 │   │   ├── routes/                 REST: projects, status, usage, worktime, sharing, auth
 │   │   ├── providers/registry.ts   Provider registry — adding a provider lives here
-│   │   ├── services/               tmux, tmuxPoller, status, humanActivity, agent registry, usage tracking
+│   │   ├── services/               tmux, tmuxPoller, status, humanActivity, agentRegistry, agentRuntime (session reconstruction on reconnect), usage tracking
 │   │   └── middleware/auth.ts      Google OAuth gate + email→unixuser mapping
 │   └── prisma/                     schema + migrations
 ├── frontend/                       React 18 + Vite, basename /termag
@@ -60,7 +60,7 @@ termag/
 │   ├── agent.config.example.json   sample per-user agent config
 │   └── initial-AGENTS.md           template seeded into new projects on creation
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
-└── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough
+└── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
 
 ## Architecture
@@ -144,7 +144,7 @@ cd ../frontend && npm install && npm run build
 # run main server
 sudo systemctl daemon-reload && sudo systemctl enable --now termag
 
-# run per-user agent (as that user)
+# run per-user agent (as that user, Linux)
 mkdir -p ~/.config/systemd/user
 cp deploy/termag-agent.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now termag-agent
@@ -154,7 +154,9 @@ sudo loginctl enable-linger <username>     # so it runs without an active login
 # add the JSON block from deploy/claude-hooks.md to ~/.claude/settings.json
 ```
 
-Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough; `deploy/claude-hooks.md` for the hook config.
+Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough (covers both Linux/systemd and macOS/launchd for the per-user agent); `deploy/claude-hooks.md` for the hook config.
+
+**macOS note** — the per-user agent runs under `launchd` instead of `systemd --user`. There's no linger equivalent; the LaunchAgent plist (`~/Library/LaunchAgents/`) handles auto-start at login. See `deploy/setup.md` for the plist template and `launchctl` commands.
 
 ## Observability & Maintenance
 
@@ -200,7 +202,7 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 
 1. **Per-user agent must be restarted on `agent/agent.js` changes** — no hot reload. Forgetting this leaves stale code running and is a common "why isn't my fix taking" debug detour.
 
-2. **`loginctl enable-linger <user>` is mandatory** — without it, the per-user agent stops the moment the user logs out, which makes everything in the UI hang the next time termag tries to talk to that user's agent.
+2. **`loginctl enable-linger <user>` is mandatory (Linux)** — without it, the per-user agent stops the moment the user logs out, which makes everything in the UI hang the next time termag tries to talk to that user's agent. macOS uses launchd LaunchAgents instead and has no linger equivalent.
 
 3. **`session` table is owned by `connect-pg-simple`, not Prisma** — don't add it to `schema.prisma`. The `CREATE TABLE` SQL is in `deploy/setup.md` and must be run once after creating the DB.
 
@@ -237,6 +239,8 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 19. **Project-list ordering is `pinned DESC, lastActiveAt DESC`** — `lastActiveAt` is bumped on status writes, not on every API touch, so a project you opened in the UI but haven't run the agent in won't float up. If recent-activity sort "isn't working," check that status events are actually arriving (Claude hooks installed, agent up) before suspecting the sort.
 
 20. **Stale `waiting` status is auto-cleared by the per-user agent** — `agent/agent.js` watches for sessions stuck in `waiting` whose pane no longer shows a prompt and demotes them back to `idle`/`working` to match reality. Hooks and bridges aren't perfectly reliable about firing the closing event (notably Claude `Notification` → no follow-up `UserPromptSubmit` if the user dismisses outside the TUI), so the agent is the safety net. If you see a project tile flicker out of `waiting` without an obvious trigger, that's this — don't chase it as a hook bug first.
+
+21. **Agent reconnect reconstructs sessions from the backend's view, not the agent's** — when a per-user agent reconnects (restart, network blip, laptop wake), `backend/src/services/agentRuntime.ts` replays the project/session state down to the agent so existing tmux sessions get reattached without the user re-clicking everything. The backend is authoritative for "what sessions should exist"; the agent is authoritative for "what tmux currently has." If they disagree after a reconnect (ghost sessions, missing reattach), the reconciliation logic in `agentRuntime.ts` is where to look — not the agent's own startup path.
 
 ## Related
 
