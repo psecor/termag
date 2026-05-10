@@ -7,6 +7,7 @@
 
 import { WebSocket } from 'ws';
 import { User } from '@prisma/client';
+import { reconstructUserSessions } from './agentRuntime';
 
 interface ConnectedAgent {
   ws: WebSocket;
@@ -83,6 +84,14 @@ export function registerAgent(user: User, ws: WebSocket): void {
   });
 
   console.log(`[AGENT] Connected: ${user.unixUsername}`);
+
+  // Reconstruct tmux sessions after a short delay (post-reboot recovery).
+  // Fire-and-forget: don't block the connection on reconstruction.
+  setTimeout(() => {
+    reconstructUserSessions(user.id, user.unixUsername).catch(err => {
+      console.error(`[AGENT] Session reconstruction failed for ${user.unixUsername}:`, err.message);
+    });
+  }, 2000);
 }
 
 export function getAgent(userId: string): ConnectedAgent | null {

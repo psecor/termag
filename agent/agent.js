@@ -37,11 +37,27 @@ if (!fs.existsSync(configPath)) {
 }
 
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const { termag_url, token, reconnect_interval_seconds = 5 } = config;
+const { termag_url, token, reconnect_interval_seconds = 5, path_remap = {} } = config;
 
 if (!termag_url || !token) {
   console.error('termag_url and token are required in agent.config.json');
   process.exit(1);
+}
+
+// Optional path remap: rewrite incoming paths (cwd/dir) so the agent can run
+// on a host where the backend's hardcoded /home/<user>/... layout doesn't
+// exist (e.g. macOS, where home dirs live under /Users/).
+//
+// Config example:
+//   "path_remap": { "/home/psecor": "/Users/psecor" }
+function remapPath(p) {
+  if (!p || typeof p !== 'string') return p;
+  for (const [from, to] of Object.entries(path_remap)) {
+    if (p === from || p.startsWith(from + '/')) {
+      return to + p.slice(from.length);
+    }
+  }
+  return p;
 }
 
 // ── Wiki init ─────────────────────────────────────────────────────────────
@@ -658,7 +674,8 @@ function connect() {
     try {
       switch (type) {
         case 'tmux-create': {
-          const { sessionName, cwd } = msg;
+          const { sessionName } = msg;
+          const cwd = remapPath(msg.cwd);
           await mkdir(cwd, { recursive: true });
           // git init unless cwd is itself the toplevel of a git repo. Using
           // --show-toplevel (and comparing) avoids the false positive where the
@@ -719,21 +736,23 @@ function connect() {
         }
 
         case 'mkdir': {
-          const { dir } = msg;
+          const dir = remapPath(msg.dir);
           await mkdir(dir, { recursive: true });
           respond(ws, requestId, { ok: true });
           break;
         }
 
         case 'init-wiki': {
-          const { dir, slug, username } = msg;
+          const { slug, username } = msg;
+          const dir = remapPath(msg.dir);
           const result = await initWikiFiles(dir, slug, username);
           respond(ws, requestId, result);
           break;
         }
 
         case 'codex-session-start': {
-          const { sessionName, cwd } = msg;
+          const { sessionName } = msg;
+          const cwd = remapPath(msg.cwd);
           if (!sessionName || !cwd) throw new Error('sessionName and cwd are required');
           const result = await startCodexSession(sessionName, cwd);
           respond(ws, requestId, result);

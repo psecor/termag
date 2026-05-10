@@ -205,7 +205,9 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
         /↑↓ navigate\s+Enter select/,
         /› \d+\.\s*(Yes|No)/,
       ],
-      spinnerPattern: /[\u2800-\u28FF]/,
+      // Single Braille char with no Braille neighbors \u2014 avoids matching the
+      // multi-glyph logo art at the top of the Mistral Vibe TUI.
+      spinnerPattern: /(?<![\u2800-\u28FF])[\u2800-\u28FF](?![\u2800-\u28FF])/,
       statusBarParser: parseVibeStatusBar,
     },
     usageMethod: 'none',

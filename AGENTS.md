@@ -236,6 +236,8 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 
 19. **Project-list ordering is `pinned DESC, lastActiveAt DESC`** — `lastActiveAt` is bumped on status writes, not on every API touch, so a project you opened in the UI but haven't run the agent in won't float up. If recent-activity sort "isn't working," check that status events are actually arriving (Claude hooks installed, agent up) before suspecting the sort.
 
+20. **Stale `waiting` status is auto-cleared by the per-user agent** — `agent/agent.js` watches for sessions stuck in `waiting` whose pane no longer shows a prompt and demotes them back to `idle`/`working` to match reality. Hooks and bridges aren't perfectly reliable about firing the closing event (notably Claude `Notification` → no follow-up `UserPromptSubmit` if the user dismisses outside the TUI), so the agent is the safety net. If you see a project tile flicker out of `waiting` without an obvious trigger, that's this — don't chase it as a hook bug first.
+
 ## Related
 
 **Other projects:**

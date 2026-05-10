@@ -133,14 +133,8 @@ cp agent.config.example.json agent.config.json
 #   termag_url: ws://localhost:3040/termag/ws/agent  (same host)
 #               wss://<termag-host>/termag/ws/agent   (remote)
 
-# 5. Install the systemd user unit.
-mkdir -p ~/.config/systemd/user
-cp ~/src/termag/deploy/termag-agent.service ~/.config/systemd/user/
-# The unit uses %h (home) and assumes the clone at ~/src/termag/. Edit
-# ExecStart if you cloned somewhere else.
-systemctl --user daemon-reload
-systemctl --user enable --now termag-agent
-journalctl --user -u termag-agent -f   # confirm it connects
+# 5. Install the persistent agent service. See platform sections below
+#    (§ Linux: systemd or § macOS: launchd) for the exact commands.
 
 # 6. Wire up Claude Code hooks. REQUIRED for status indicators to work
 #    with the Claude provider — without this, project status dots stay
@@ -149,6 +143,95 @@ journalctl --user -u termag-agent -f   # confirm it connects
 #    each hook event POSTs to http://localhost:3040/termag/api/status.
 #    See deploy/claude-hooks.md for the full snippet to paste in.
 ```
+
+### Step 5 on Linux (systemd)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/src/termag/deploy/termag-agent.service ~/.config/systemd/user/
+# The unit uses %h (home) and assumes the clone at ~/src/termag/. Edit
+# ExecStart if you cloned somewhere else.
+systemctl --user daemon-reload
+systemctl --user enable --now termag-agent
+journalctl --user -u termag-agent -f   # confirm it connects
+```
+
+The operator should also run `sudo loginctl enable-linger <unixuser>` so the
+agent keeps running without an active login session.
+
+### Step 5 on macOS (launchd)
+
+macOS doesn't have systemd. Use a `launchd` LaunchAgent — same idea,
+different config format. Lingering isn't needed: LaunchAgents run for
+the logged-in user automatically and you basically never log out of a
+personal laptop.
+
+First find your node binary path (the plist needs an absolute path):
+
+```bash
+which node
+# /opt/homebrew/bin/node   on Apple Silicon Homebrew
+# /usr/local/bin/node      on Intel Homebrew
+# If you use nvm, point at a fully resolved path or write a wrapper script.
+```
+
+Create `~/Library/LaunchAgents/io.termag.agent.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.termag.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/YOURUSER/src/termag/agent/agent.js</string>
+        <string>/Users/YOURUSER/src/termag/agent/agent.config.json</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOURUSER/Library/Logs/termag-agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURUSER/Library/Logs/termag-agent.log</string>
+</dict>
+</plist>
+```
+
+Replace `YOURUSER` with your Mac username and adjust the node path.
+`RunAtLoad=true` plus `KeepAlive=true` is the equivalent of systemd's
+`Restart=always`.
+
+Load and tail logs:
+
+```bash
+launchctl load ~/Library/LaunchAgents/io.termag.agent.plist
+tail -f ~/Library/Logs/termag-agent.log   # confirm it connects
+```
+
+Common operations:
+
+| Linux                                          | macOS                                                              |
+| ---------------------------------------------- | ------------------------------------------------------------------ |
+| `systemctl --user restart termag-agent`        | `launchctl kickstart -k gui/$(id -u)/io.termag.agent`              |
+| `systemctl --user stop termag-agent`           | `launchctl unload ~/Library/LaunchAgents/io.termag.agent.plist`    |
+| `journalctl --user -u termag-agent -f`         | `tail -f ~/Library/Logs/termag-agent.log`                          |
+
+After sleep/wake the WebSocket reconnects automatically (5s loop) and
+the backend's session-reconstruction step recreates any missing tmux
+sessions, running `claude --continue` to resume in-flight conversations.
 
 ### Verify
 
@@ -159,7 +242,8 @@ Status indicators should go live as soon as Claude starts running
 (if they stay grey, step 6 didn't take — re-check `~/.claude/settings.json`).
 
 The per-user agent must be restarted whenever `agent/agent.js` changes:
-`systemctl --user restart termag-agent`.
+`systemctl --user restart termag-agent` (Linux) or
+`launchctl kickstart -k gui/$(id -u)/io.termag.agent` (macOS).
 
 ## 5. Agent providers
 
