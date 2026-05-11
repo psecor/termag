@@ -1,10 +1,36 @@
 import * as tmux from './tmux';
 import { isAgentConnected, sendToAgent } from './agentRegistry';
 import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
-import { PROVIDERS } from '../providers/registry';
+import { PROVIDERS, ALL_PROCESS_NAMES } from '../providers/registry';
 import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
+
+/**
+ * Ask the user's agent whether an agent process is running in a given tmux
+ * session. Uses the foreground pane command — same heuristic as
+ * tmux.isAgentRunning, but routed through the agent so it queries the
+ * correct host (remote Mac, laptop, etc.) instead of the backend's local
+ * tmux server.
+ *
+ *   'running'     — foreground command looks like an agent (claude, codex, etc.)
+ *   'not-running' — session doesn't exist or pane is just a shell
+ *   'unknown'     — RPC failed; we can't tell. Callers should NOT relaunch
+ *                   into "unknown" because typing keys into a session whose
+ *                   state we can't verify could clobber an active prompt.
+ */
+async function probeAgentSession(userId: string, sessionName: string): Promise<'running' | 'not-running' | 'unknown'> {
+  try {
+    const result = await sendToAgent(userId, 'tmux-foreground-cmd', { sessionName });
+    const cmd = (result?.cmd ?? '').toLowerCase();
+    if (!cmd) return 'not-running';
+    const looksLikeAgent = ALL_PROCESS_NAMES.some(a => cmd.includes(a))
+      || ['node', 'python'].some(a => cmd.includes(a));
+    return looksLikeAgent ? 'running' : 'not-running';
+  } catch {
+    return 'unknown';
+  }
+}
 
 export function resolveAgentProvider(
   workflowProvider?: string | null,
@@ -100,12 +126,19 @@ export async function reconstructUserSessions(userId: string, unixUsername: stri
           const provider = resolveAgentProvider(wf.provider, defaultProvider);
           const mainSession = tmux.sessionName(unixUsername, project.name, 'agent');
 
-          // Check if agent is already running in this session (network blip, not reboot)
-          const alreadyRunning = await tmux.isAgentRunning(mainSession);
-          if (alreadyRunning) {
+          // Check if agent is already running in this session (network blip,
+          // sleep/wake — not a full reboot). Must route through the agent
+          // because the session lives on the user's host, not the backend's.
+          const probe = await probeAgentSession(userId, mainSession);
+          if (probe === 'running') {
             // Session survived — just re-register poller if needed
             const config = PROVIDERS[provider];
             if (config?.needsPoller) registerPollerSession(mainSession, provider);
+            continue;
+          }
+          if (probe === 'unknown') {
+            // RPC failed — don't relaunch into a session we can't see
+            console.warn(`[RECONSTRUCT] Skipping ${project.name}/${wf.type}: probe failed`);
             continue;
           }
 

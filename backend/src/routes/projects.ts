@@ -1,7 +1,7 @@
 import { Router, RequestHandler } from 'express';
 import { PrismaClient, WorkflowType } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import * as tmux from '../services/tmux';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { deleteStatus, setStatus, notifyStatusChange } from '../services/status';
@@ -10,6 +10,11 @@ import { rename } from 'fs/promises';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
 
 const prisma = new PrismaClient();
+
+const VALID_CAPTURE_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
+type CaptureRole = typeof VALID_CAPTURE_ROLES[number];
+const CAPTURE_MIN_INTERVAL_MS = 1000;
+const captureRateLimits = new Map<string, number>();
 
 export function projectsRouter(): Router {
   const router = Router();
@@ -430,6 +435,68 @@ export function projectsRouter(): Router {
     }
   };
 
+  // Capture pane content for a project session — works for projects you own
+  // OR projects shared with you. Routes through the owner's agent so the
+  // requester sees what's actually on screen for the owner's tmux.
+  // Auth: session cookie OR Bearer agent token (so an agent on a user's box
+  // can curl this directly).
+  const capture: RequestHandler = async (req, res) => {
+    const role = req.params.role as CaptureRole;
+    if (!VALID_CAPTURE_ROLES.includes(role)) {
+      res.status(400).json({ error: `role must be one of: ${VALID_CAPTURE_ROLES.join(', ')}` });
+      return;
+    }
+
+    const requestedLines = parseInt(req.query.lines as string, 10);
+    const lines = Number.isFinite(requestedLines)
+      ? Math.max(1, Math.min(1000, requestedLines))
+      : 200;
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: { user: { select: { id: true, unixUsername: true } } },
+    });
+    if (!project || project.archived) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+
+    const requesterId = req.user!.id;
+    const isOwner = project.userId === requesterId;
+    if (!isOwner) {
+      const share = await prisma.projectShare.findUnique({
+        where: { projectId_userId: { projectId: project.id, userId: requesterId } },
+      });
+      if (!share) {
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+    }
+
+    const sessionName = tmux.sessionName(project.user.unixUsername, project.name, role);
+
+    const rateKey = `${requesterId}:${sessionName}`;
+    const now = Date.now();
+    const last = captureRateLimits.get(rateKey) ?? 0;
+    if (now - last < CAPTURE_MIN_INTERVAL_MS) {
+      res.status(429).json({ error: 'Rate limited (max 1 capture/sec per session)' });
+      return;
+    }
+    captureRateLimits.set(rateKey, now);
+
+    if (!isAgentConnected(project.userId)) {
+      res.status(503).json({ error: "Owner's agent is offline" });
+      return;
+    }
+
+    try {
+      const result = await sendToAgent(project.userId, 'tmux-capture', { sessionName, lines });
+      res.json({ session: sessionName, content: result.content ?? '' });
+    } catch (err) {
+      res.status(503).json({ error: `Capture failed: ${(err as Error).message}` });
+    }
+  };
+
   router.get('/', requireAuth, list);
   router.post('/', requireAuth, create);
   router.put('/:id', requireAuth, update);
@@ -438,6 +505,7 @@ export function projectsRouter(): Router {
   router.post('/:id/archive', requireAuth, archive);
   router.post('/:id/workflows', requireAuth, addWorkflow);
   router.delete('/:id/workflows/:type', requireAuth, removeWorkflow);
+  router.get('/:id/sessions/:role/capture', requireAuthOrAgentToken, capture);
 
   return router;
 }

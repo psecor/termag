@@ -1,9 +1,33 @@
 import { Request, Response, NextFunction } from 'express';
+import { validateAgentToken } from '../routes/agentTokens';
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (req.user) {
     next();
     return;
+  }
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
+/**
+ * Accept either a session cookie (browser users) or an Authorization Bearer
+ * agent token (programmatic agent access). Used by endpoints that an agent
+ * running on a user's machine might need to call directly.
+ */
+export async function requireAuthOrAgentToken(req: Request, res: Response, next: NextFunction): Promise<void> {
+  if (req.user) { next(); return; }
+
+  const authHeader = req.headers.authorization ?? '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    try {
+      const user = await validateAgentToken(token);
+      if (user) {
+        req.user = user as Express.User;
+        next();
+        return;
+      }
+    } catch { /* fall through to 401 */ }
   }
   res.status(401).json({ error: 'Unauthorized' });
 }

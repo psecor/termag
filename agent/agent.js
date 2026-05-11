@@ -735,6 +735,39 @@ function connect() {
           break;
         }
 
+        case 'tmux-foreground-cmd': {
+          const { sessionName } = msg;
+          try {
+            const { stdout } = await execAsync(
+              `tmux list-panes -t ${shellEscape(sessionName)} -F '#{pane_current_command}'`
+            );
+            const cmd = stdout.trim().split('\n')[0] ?? null;
+            respond(ws, requestId, { cmd });
+          } catch {
+            // Session doesn't exist or tmux not available
+            respond(ws, requestId, { cmd: null });
+          }
+          break;
+        }
+
+        case 'tmux-capture': {
+          const { sessionName } = msg;
+          const requestedLines = parseInt(msg.lines, 10);
+          const lines = Number.isFinite(requestedLines)
+            ? Math.max(1, Math.min(1000, requestedLines))
+            : 200;
+          try {
+            const { stdout } = await execAsync(
+              `tmux capture-pane -t ${shellEscape(sessionName)} -p -S -${lines}`,
+              { maxBuffer: 4 * 1024 * 1024 }
+            );
+            respond(ws, requestId, { content: stdout });
+          } catch (err) {
+            respond(ws, requestId, null, err.message);
+          }
+          break;
+        }
+
         case 'mkdir': {
           const dir = remapPath(msg.dir);
           await mkdir(dir, { recursive: true });
