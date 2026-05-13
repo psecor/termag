@@ -1,6 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay } from '../services/api';
+import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats } from '../services/api';
 import { PROVIDERS, ProviderConfig } from '../providers/registry';
+
+const SWITCH_COLOR = '#5eead4'; // teal — distinct from agent orange + human yellow
 
 // ── Formatting helpers ──────────────────────────────────────────
 
@@ -299,6 +301,52 @@ function TokenBarChart({ days, providerData, providers, height }: TokenBarChartP
   );
 }
 
+// ── Plain Count Bar Chart (single colour, unsegmented) ─────────
+
+interface CountBarChartProps {
+  values: number[];
+  height: number;
+  color: string;
+}
+
+function CountBarChart({ values, height, color }: CountBarChartProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    ctx.scale(dpr, dpr);
+
+    const max = Math.max(1, ...values);
+    const gap = 2;
+    const barW = Math.max(2, (w - gap * (values.length - 1)) / values.length);
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = color;
+    for (let i = 0; i < values.length; i++) {
+      const x = i * (barW + gap);
+      const barH = (values[i] / max) * (h - 1);
+      const y = h - barH;
+      ctx.fillRect(x, y, barW, barH);
+    }
+  }, [values, color]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{ width: '100%', height, display: 'block' }}
+    />
+  );
+}
+
 // ── Thermometer Tube ────────────────────────────────────────────
 
 interface ThermoTubeProps {
@@ -326,6 +374,7 @@ function ThermoTube({ ms, color, label }: ThermoTubeProps) {
 export function UsageMini() {
   const [tokenResponse, setTokenResponse] = useState<UsageResponse | null>(null);
   const [worktime, setWorktime] = useState<WorktimeResponse | null>(null);
+  const [visits, setVisits] = useState<VisitsStats | null>(null);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -341,6 +390,9 @@ export function UsageMini() {
         });
       worktimeApi.get(30)
         .then(r => setWorktime(r))
+        .catch(() => {});
+      visitsApi.stats(30)
+        .then(r => setVisits(r))
         .catch(() => {});
     };
     load();
@@ -579,6 +631,57 @@ export function UsageMini() {
                 )}
               </div>
             </div>
+
+            {/* Project switches — 30d */}
+            {visits && visits.totalSwitches > 0 && (
+              <div className="usage-overlay-section">
+                <div className="usage-overlay-section-header">
+                  <span>Project switches — 30d</span>
+                  <span>{visits.totalSwitches}</span>
+                  <span className="usage-dim">avg {(visits.totalSwitches / 30).toFixed(1)}/d</span>
+                </div>
+                <CountBarChart
+                  values={visits.days.map(d => d.switches)}
+                  height={60}
+                  color={SWITCH_COLOR}
+                />
+              </div>
+            )}
+
+            {/* Project switches — today */}
+            {visits && (
+              <div className="usage-overlay-section">
+                <div className="usage-overlay-section-header">
+                  <span>Project switches — today</span>
+                  <span>{visits.todaySwitches}</span>
+                  <span className="usage-dim">
+                    {visits.meanDwellMs > 0
+                      ? `avg dwell ${fmtDuration(visits.meanDwellMs)}`
+                      : '--'}
+                  </span>
+                </div>
+                {visits.todaySwitches > 0 && (
+                  <CountBarChart
+                    values={visits.perHourToday}
+                    height={40}
+                    color={SWITCH_COLOR}
+                  />
+                )}
+                <div className="usage-overlay-tokens">
+                  {visits.stdevInterSwitchMs > 0 && (
+                    <div className="usage-overlay-token-row">
+                      <span className="usage-overlay-token-label" style={{ color: SWITCH_COLOR }}>
+                        σ between switches
+                      </span>
+                      <span>{fmtDuration(visits.stdevInterSwitchMs)}</span>
+                    </div>
+                  )}
+                  {visits.todaySwitches === 0 && (
+                    <div className="usage-dim">No project switches yet today</div>
+                  )}
+                </div>
+              </div>
+            )}
 
             {/* Token usage — secondary detail with charts */}
             {tokenProviders.length > 0 && (

@@ -88,6 +88,15 @@ export const warpApi = {
 // fires when the page is closing; falls back to fetch with keepalive so a
 // browser that quietly rejects the beacon (mime mismatch, disabled API)
 // still gets the event through.
+export interface VisitsStats {
+  days: Array<{ date: string; switches: number }>;
+  totalSwitches: number;
+  todaySwitches: number;
+  perHourToday: number[];     // 24 entries, index = hour (UTC)
+  meanDwellMs: number;
+  stdevInterSwitchMs: number;
+}
+
 export const visitsApi = {
   record: (body: {
     projectId: string | null;
@@ -110,6 +119,8 @@ export const visitsApi = {
       body: json,
     }).catch(() => { /* fire-and-forget */ });
   },
+  stats: (days = 30): Promise<VisitsStats> =>
+    api.get('/api/visits/stats', { params: { days } }).then(r => r.data),
 };
 
 export const usageApi = {
