@@ -659,6 +659,18 @@ function connect() {
     console.log('[AGENT] Connected to termag');
     startContextScanner();
     startRateLimitScanner();
+    let alive = true;
+    ws.on('pong', () => { alive = true; });
+    const hb = setInterval(() => {
+      if (!alive) {
+        console.log('[AGENT] Heartbeat lost, terminating socket');
+        ws.terminate();
+        return;
+      }
+      alive = false;
+      try { ws.ping(); } catch {}
+    }, 30_000);
+    ws.once('close', () => clearInterval(hb));
   });
 
   ws.on('message', async (raw) => {
