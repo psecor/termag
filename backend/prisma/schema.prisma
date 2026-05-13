@@ -23,6 +23,8 @@ model User {
   sharedWithMe  ProjectShare[]  @relation("sharedWithMe")
   sentInvites   ProjectInvite[] @relation("sentInvites")
   receivedInvites ProjectInvite[] @relation("receivedInvites")
+  visits        ProjectVisit[]
+  warpSamples   WarpSample[]
 
   @@map("users")
 }
@@ -62,6 +64,7 @@ model Project {
   browserTabs BrowserTab[]
   shares      ProjectShare[]
   invites     ProjectInvite[]
+  visits      ProjectVisit[]
 
   @@unique([userId, name])
   @@index([userId, archived])
@@ -164,6 +167,43 @@ model ProjectInvite {
 
   @@unique([projectId, inviteeId])
   @@map("project_invites")
+}
+
+// Append-only log of project context switches.
+// One row per setActiveProject() call where the project actually changed.
+// Powers switches/day, mean dwell, stdev between switches stats.
+model ProjectVisit {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId         String?
+  project           Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  previousProjectId String?
+  timestamp         DateTime @default(now())
+  sessionTag        String?  // per-browser-tab UUID
+
+  @@index([userId, timestamp])
+  @@index([projectId, timestamp])
+  @@map("project_visits")
+}
+
+// Per-minute rollup of the hyperspace targetWarp value (the synthesized
+// activity score). Frontend posts raw samples every 5s; backend aggregates
+// into per-minute buckets in-memory and flushes here.
+model WarpSample {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bucket      DateTime // truncated to minute (UTC)
+  meanWarp    Float
+  maxWarp     Float
+  p95Warp     Float
+  sampleCount Int
+  activeMs    Int      // ms in this bucket where warp > idle threshold
+
+  @@unique([userId, bucket])
+  @@index([userId, bucket])
+  @@map("warp_samples")
 }
 
 // Latest Chrome tab snapshot from the local relay, keyed by relay token
