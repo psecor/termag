@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats } from '../services/api';
+import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats, warpApi, WarpSeries } from '../services/api';
 import { PROVIDERS, ProviderConfig } from '../providers/registry';
 
 const SWITCH_COLOR = '#5eead4'; // teal — distinct from agent orange + human yellow
+const WARP_COLOR = '#a78bfa';   // purple — flow/hyperspace
 
 // ── Formatting helpers ──────────────────────────────────────────
 
@@ -375,6 +376,7 @@ export function UsageMini() {
   const [tokenResponse, setTokenResponse] = useState<UsageResponse | null>(null);
   const [worktime, setWorktime] = useState<WorktimeResponse | null>(null);
   const [visits, setVisits] = useState<VisitsStats | null>(null);
+  const [warp, setWarp] = useState<WarpSeries | null>(null);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -393,6 +395,9 @@ export function UsageMini() {
         .catch(() => {});
       visitsApi.stats(30)
         .then(r => setVisits(r))
+        .catch(() => {});
+      warpApi.series(30)
+        .then(r => setWarp(r))
         .catch(() => {});
     };
     load();
@@ -682,6 +687,69 @@ export function UsageMini() {
                 </div>
               </div>
             )}
+
+            {/* Flow speed — 30d */}
+            {warp && warp.days.some(d => d.meanWarp > 0) && (() => {
+              const totalActiveMin = warp.days.reduce((s, d) => s + d.activeMinutes, 0);
+              const daysWithData = warp.days.filter(d => d.meanWarp > 0);
+              const overallMean = daysWithData.length > 0
+                ? daysWithData.reduce((s, d) => s + d.meanWarp, 0) / daysWithData.length
+                : 0;
+              return (
+                <div className="usage-overlay-section">
+                  <div className="usage-overlay-section-header">
+                    <span>Flow speed — 30d</span>
+                    <span>mean {overallMean.toFixed(1)}c</span>
+                    <span className="usage-dim">{fmtDuration(totalActiveMin * 60_000)} in flow</span>
+                  </div>
+                  <CountBarChart
+                    values={warp.days.map(d => d.meanWarp)}
+                    height={60}
+                    color={WARP_COLOR}
+                  />
+                </div>
+              );
+            })()}
+
+            {/* Flow speed — today */}
+            {warp && (() => {
+              const todayHours = warp.hoursToday;
+              const hoursWithData = todayHours.filter(h => h.meanWarp > 0);
+              const todayMean = hoursWithData.length > 0
+                ? hoursWithData.reduce((s, h) => s + h.meanWarp, 0) / hoursWithData.length
+                : 0;
+              const todayMax = Math.max(0, ...todayHours.map(h => h.maxWarp));
+              const todayActiveMin = todayHours.reduce((s, h) => s + h.activeMinutes, 0);
+              return (
+                <div className="usage-overlay-section">
+                  <div className="usage-overlay-section-header">
+                    <span>Flow speed — today</span>
+                    <span>mean {todayMean.toFixed(1)}c</span>
+                    <span className="usage-dim">max {todayMax.toFixed(1)}c</span>
+                  </div>
+                  {hoursWithData.length > 0 && (
+                    <CountBarChart
+                      values={todayHours.map(h => h.meanWarp)}
+                      height={40}
+                      color={WARP_COLOR}
+                    />
+                  )}
+                  <div className="usage-overlay-tokens">
+                    {todayActiveMin > 0 ? (
+                      <div className="usage-overlay-token-row">
+                        <span className="usage-overlay-token-label" style={{ color: WARP_COLOR }}>
+                          In flow
+                        </span>
+                        <span>{fmtDuration(todayActiveMin * 60_000)}</span>
+                        <span className="usage-dim">{todayActiveMin} min</span>
+                      </div>
+                    ) : (
+                      <div className="usage-dim">No flow time recorded yet today</div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Token usage — secondary detail with charts */}
             {tokenProviders.length > 0 && (

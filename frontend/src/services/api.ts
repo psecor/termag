@@ -77,11 +77,29 @@ export const activityApi = {
 
 // Hyperspace targetWarp sample. Fire-and-forget; the backend rolls samples
 // into per-minute buckets, so an occasional dropped sample is fine.
+export interface WarpSeries {
+  days: Array<{
+    date: string;
+    meanWarp: number;
+    p95: number;
+    maxWarp: number;
+    activeMinutes: number;
+  }>;
+  hoursToday: Array<{
+    hour: number;
+    meanWarp: number;
+    maxWarp: number;
+    activeMinutes: number;
+  }>;
+}
+
 export const warpApi = {
   sample: (value: number) =>
     api.post('/api/warp/sample', { value, ts: Date.now() })
       .then(r => r.data)
       .catch(() => { /* fire-and-forget */ }),
+  series: (days = 30): Promise<WarpSeries> =>
+    api.get('/api/warp/series', { params: { days } }).then(r => r.data),
 };
 
 // Project context-switch logger. Uses sendBeacon first so the event still
