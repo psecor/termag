@@ -1,7 +1,9 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react';
 import { Project, StatusMap, AgentStatusValue } from '../types';
-import { projectsApi } from '../services/api';
+import { projectsApi, visitsApi } from '../services/api';
 import { useAuth } from './AuthContext';
+
+const LAST_ACTIVE_PROJECT_KEY = 'termag:lastActiveProject';
 
 interface ProjectContextValue {
   projects: Project[];
@@ -25,6 +27,34 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [statusMap, setStatusMap] = useState<StatusMap>({});
   const wsRef = useRef<WebSocket | null>(null);
+
+  // One per page load. Distinguishes "switch in tab A" from "switch in tab B"
+  // when the user has multiple tabs open.
+  const sessionTag = useMemo(() => {
+    try { return crypto.randomUUID(); } catch { return `${Date.now()}-${Math.random()}`; }
+  }, []);
+
+  // Seed from localStorage so the first switch after a page reload is logged
+  // as a real switch (prev → new) rather than a phantom (null → new).
+  const previousProjectIdRef = useRef<string | null>(
+    typeof localStorage !== 'undefined' ? localStorage.getItem(LAST_ACTIVE_PROJECT_KEY) : null
+  );
+
+  const setActiveProject = useCallback((id: string | null) => {
+    if (id !== previousProjectIdRef.current) {
+      visitsApi.record({
+        projectId: id,
+        previousProjectId: previousProjectIdRef.current,
+        sessionTag,
+      });
+      previousProjectIdRef.current = id;
+      try {
+        if (id === null) localStorage.removeItem(LAST_ACTIVE_PROJECT_KEY);
+        else localStorage.setItem(LAST_ACTIVE_PROJECT_KEY, id);
+      } catch { /* private mode etc. */ }
+    }
+    setActiveProjectId(id);
+  }, [sessionTag]);
 
   const reloadProjects = useCallback(async () => {
     const data = await projectsApi.list();
@@ -95,7 +125,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [user]);
 
   return (
-    <ProjectContext.Provider value={{ projects, activeProjectId, statusMap, setActiveProject: setActiveProjectId, reloadProjects }}>
+    <ProjectContext.Provider value={{ projects, activeProjectId, statusMap, setActiveProject, reloadProjects }}>
       {children}
     </ProjectContext.Provider>
   );

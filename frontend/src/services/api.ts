@@ -75,6 +75,34 @@ export const activityApi = {
     api.post('/api/status/heartbeat', { project }).then(r => r.data),
 };
 
+// Project context-switch logger. Uses sendBeacon first so the event still
+// fires when the page is closing; falls back to fetch with keepalive so a
+// browser that quietly rejects the beacon (mime mismatch, disabled API)
+// still gets the event through.
+export const visitsApi = {
+  record: (body: {
+    projectId: string | null;
+    previousProjectId: string | null;
+    sessionTag?: string;
+  }) => {
+    const url = '/termag/api/visits';
+    const json = JSON.stringify(body);
+    try {
+      const blob = new Blob([json], { type: 'application/json' });
+      if (typeof navigator !== 'undefined' && navigator.sendBeacon && navigator.sendBeacon(url, blob)) {
+        return;
+      }
+    } catch { /* fall through to fetch */ }
+    fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true,
+      body: json,
+    }).catch(() => { /* fire-and-forget */ });
+  },
+};
+
 export const usageApi = {
   get: (): Promise<UsageResponse> =>
     api.get('/api/usage').then(r => r.data),

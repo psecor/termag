@@ -17,6 +17,7 @@ import { agentTokensRouter } from './routes/agentTokens';
 import { usageRouter } from './routes/usage';
 import { worktimeRouter } from './routes/worktime';
 import { sharingRouter } from './routes/sharing';
+import { visitsRouter } from './routes/visits';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -101,6 +102,7 @@ app.use(`${BASE_PATH}/api/agent-tokens`, agentTokensRouter());
 app.use(`${BASE_PATH}/api/usage`, usageRouter());
 app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 app.use(`${BASE_PATH}/api`, sharingRouter());
+app.use(`${BASE_PATH}/api/visits`, visitsRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
