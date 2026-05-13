@@ -10,7 +10,7 @@ import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
 import { Project } from './types';
 import { computeWarpWithFallback } from './utils/warp';
-import { activityApi } from './services/api';
+import { activityApi, warpApi } from './services/api';
 
 function Login() {
   return (
@@ -78,6 +78,19 @@ function MainLayout() {
 
   const warpModel = computeWarpWithFallback(projectAgentStatuses, typing);
   const activeCount = warpModel.workingCount + warpModel.waitingCount;
+
+  // Per-5s sample of targetWarp posted to the backend, which rolls samples
+  // into per-minute buckets in warp_samples. Use a ref so the interval reads
+  // the current value without being torn down and rebuilt on every render.
+  const targetWarpRef = useRef(warpModel.targetWarp);
+  useEffect(() => { targetWarpRef.current = warpModel.targetWarp; });
+  useEffect(() => {
+    if (!user) return;
+    const id = setInterval(() => {
+      warpApi.sample(targetWarpRef.current);
+    }, 5000);
+    return () => clearInterval(id);
+  }, [user]);
 
   const isActive = warpModel.isActive;
   const warpStr = warpSpeed < 10 ? warpSpeed.toFixed(1) : Math.floor(warpSpeed).toString();

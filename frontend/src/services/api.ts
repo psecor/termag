@@ -75,6 +75,15 @@ export const activityApi = {
     api.post('/api/status/heartbeat', { project }).then(r => r.data),
 };
 
+// Hyperspace targetWarp sample. Fire-and-forget; the backend rolls samples
+// into per-minute buckets, so an occasional dropped sample is fine.
+export const warpApi = {
+  sample: (value: number) =>
+    api.post('/api/warp/sample', { value, ts: Date.now() })
+      .then(r => r.data)
+      .catch(() => { /* fire-and-forget */ }),
+};
+
 // Project context-switch logger. Uses sendBeacon first so the event still
 // fires when the page is closing; falls back to fetch with keepalive so a
 // browser that quietly rejects the beacon (mime mismatch, disabled API)

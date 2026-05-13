@@ -18,6 +18,7 @@ import { usageRouter } from './routes/usage';
 import { worktimeRouter } from './routes/worktime';
 import { sharingRouter } from './routes/sharing';
 import { visitsRouter } from './routes/visits';
+import { warpRouter } from './routes/warp';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -30,6 +31,7 @@ import {
 import { PrismaClient } from '@prisma/client';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
+import { startWarpSampler, stopWarpSampler } from './services/warpSampler';
 
 const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
@@ -103,6 +105,7 @@ app.use(`${BASE_PATH}/api/usage`, usageRouter());
 app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 app.use(`${BASE_PATH}/api`, sharingRouter());
 app.use(`${BASE_PATH}/api/visits`, visitsRouter());
+app.use(`${BASE_PATH}/api/warp`, warpRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -350,12 +353,14 @@ server.listen(PORT, () => {
   console.log(`termag backend running on port ${PORT} at ${BASE_PATH}`);
   startTmuxPoller().catch(err => console.error('[TMUX-POLLER] Failed to start:', err));
   startHumanActivityTracker();
+  startWarpSampler();
 });
 
 function shutdown() {
   console.log('termag shutting down...');
   stopTmuxPoller();
   stopHumanActivityTracker();
+  stopWarpSampler().catch(() => {});
   // Close all WebSocket connections so the process can exit
   for (const client of wss.clients) {
     client.close(1001, 'server shutting down');
