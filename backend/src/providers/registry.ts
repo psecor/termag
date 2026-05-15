@@ -78,6 +78,24 @@ function parseVibeStatusBar(lines: string[]): Record<string, any> {
   return {};
 }
 
+// "SWE-1.6 Fast                Context: 66k / 200k tokens (33%)"
+const DEVIN_STATUS_BAR = /^(.+?)\s{2,}Context:\s+(\d+)k\s*\/\s*(\d+)k\s+tokens\s*\((\d+)%\)/;
+
+function parseDevinStatusBar(lines: string[]): Record<string, any> {
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+    const m = DEVIN_STATUS_BAR.exec(lines[i]);
+    if (m) {
+      return {
+        devinModel: m[1].trim(),
+        devinTokensK: parseInt(m[2], 10),
+        devinTokenBudgetK: parseInt(m[3], 10),
+        devinContextPct: parseInt(m[4], 10),
+      };
+    }
+  }
+  return {};
+}
+
 // ── Provider definitions ────────────────────────────────────
 
 export const PROVIDERS: Record<string, ProviderConfig> = {
@@ -179,6 +197,30 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
       activityPatterns: [
         /^\s*(Thinking|Reading|Writing|Editing|Searching|Running|Executing)\b/i,
       ],
+    },
+    usageMethod: 'none',
+    usagePrecision: 'estimated',
+  },
+
+  devin: {
+    id: 'devin',
+    displayName: 'Devin',
+    badge: 'DV',
+    color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
+    launchCommand: 'devin',
+    processNames: ['devin'],
+    statusSources: ['tmux-poller:devin'],
+    needsPoller: true,
+    pollerConfig: {
+      idlePattern: /^❭\s/m,
+      activityPatterns: [
+        /^⏺\s+(Read|Searched|Ran|Running|Invoked|Found|Writing|Editing|Reading|Globbing|Grepping|Bash)\b/,
+        /^(I'll|Let me|I'm going to|Based on)\b/,
+      ],
+      waitingPatterns: [
+        /↑↓\s+select\s*·\s*↵\s+confirm/,
+      ],
+      statusBarParser: parseDevinStatusBar,
     },
     usageMethod: 'none',
     usagePrecision: 'estimated',

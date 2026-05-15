@@ -71,6 +71,15 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     statusSources: ['tmux-poller:deepseek'],
   },
 
+  devin: {
+    id: 'devin',
+    displayName: 'Devin',
+    badge: 'DV',
+    color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
+    usagePrecision: 'estimated',
+    statusSources: ['tmux-poller:devin'],
+  },
+
   mistral: {
     id: 'mistral',
     displayName: 'Mistral',
