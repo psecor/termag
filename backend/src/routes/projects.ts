@@ -175,6 +175,7 @@ export function projectsRouter(): Router {
         res.status(409).json({ error: 'Project name already exists' });
         return;
       }
+      console.error('[PROJECTS create]', err);
       res.status(500).json({ error: 'Failed to create project' });
     }
   };
