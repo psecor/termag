@@ -23,13 +23,15 @@ const net = require('net');
 
 const execAsync = promisify(exec);
 
-// Load config
-const configPath = path.join(__dirname, 'agent.config.json');
+// Load config. Resolution order:
+//   1. process.argv[2] (explicit path, useful for systemd unit per-user configs)
+//   2. <agent dir>/agent.config.json (default colocated config)
+//   3. ~/.termag/agent.config.json (per-user fallback for shared-binary installs)
+let configPath = process.argv[2] || path.join(__dirname, 'agent.config.json');
 if (!fs.existsSync(configPath)) {
-  // Also check ~/.termag/agent.config.json
   const homeConfig = path.join(process.env.HOME || '/home', '.termag', 'agent.config.json');
   if (fs.existsSync(homeConfig)) {
-    Object.assign(module, { configPath: homeConfig });
+    configPath = homeConfig;
   } else {
     console.error('agent.config.json not found. Copy agent.config.example.json and fill it in.');
     process.exit(1);
