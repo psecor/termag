@@ -16,5 +16,14 @@ relay/relay.config.json
 # Agent config (contains tokens)
 agent/agent.config.json
 
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
 # OS
 .DS_Store
