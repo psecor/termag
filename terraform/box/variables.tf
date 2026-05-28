@@ -55,8 +55,8 @@ variable "region" {
 
 variable "ami_id" {
   type        = string
-  description = "AMI built by packer (see packer/README.md)"
-  default     = "ami-0ec5a572c39081247"
+  description = "AMI built by packer (see packer/README.md). Required."
+  default     = ""
 }
 
 variable "instance_type" {
@@ -66,16 +66,17 @@ variable "instance_type" {
 }
 
 variable "vpc_id" {
-  type    = string
-  default = "vpc-03e804ea9dfa8b76b"
+  type        = string
+  description = "VPC to place the box in. Required."
+  default     = ""
 }
 
-// Private subnet — outbound via NAT GW. No public IP. SSM works because the
+// Private subnet — outbound via NAT GW. No public IP. SSM only works if the
 // VPC has SSM/SSMmessages/EC2messages endpoints.
 variable "subnet_id" {
   type        = string
-  description = "Default is private-subnet-a (us-east-1a). Switch to -b/-c for AZ spread."
-  default     = "subnet-0ba8faeebdad0f3d7"
+  description = "Private subnet ID. Use one with a NAT route for outbound. Required."
+  default     = ""
 }
 
 variable "iam_instance_profile" {

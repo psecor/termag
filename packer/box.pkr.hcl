@@ -32,14 +32,14 @@ variable "region" {
 
 variable "vpc_id" {
   type        = string
-  default     = "vpc-03e804ea9dfa8b76b"
-  description = "LD development VPC"
+  default     = ""
+  description = "VPC to launch the builder instance in. Required."
 }
 
 variable "subnet_id" {
   type        = string
-  default     = "subnet-0a74be64353787cf4"
-  description = "public-subnet-a in the dev VPC (has IGW route for outbound apt/npm)"
+  default     = ""
+  description = "Public subnet with IGW route for outbound apt/npm. Required."
 }
 
 variable "instance_type" {

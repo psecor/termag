@@ -38,9 +38,10 @@ packer init .
 packer build box.pkr.hcl
 ```
 
-Build runs in `us-east-1`, in the LD dev VPC (`vpc-03e804ea9dfa8b76b`),
-on `public-subnet-a`. Communication is via SSM (no inbound SSH is
-possible in this account regardless of SG).
+Build runs in `us-east-1`, in a VPC and public subnet you supply via
+`-var vpc_id=...` and `-var subnet_id=...` (or a `tfvars`-style file).
+Communication is via SSM, so the subnet needs outbound but not inbound
+network access.
 
 Successful build prints an AMI ID (`ami-...`); that gets handed to the
 Terraform module as a variable.
