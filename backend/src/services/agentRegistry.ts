@@ -22,7 +22,7 @@
 
 import { WebSocket } from 'ws';
 import { Instance, PrismaClient, User } from '@prisma/client';
-import { reconstructUserSessions } from './agentRuntime';
+import { reconstructUserSessions, reconstructInstanceSessions } from './agentRuntime';
 
 const prisma = new PrismaClient();
 
@@ -121,8 +121,14 @@ export function registerAgent(user: User, ws: WebSocket, instance: Instance | nu
     }).catch(err => {
       console.error(`[AGENT] Failed to mark instance ${instance.id} ready:`, err.message);
     });
-    // Reconstruction-on-reconnect for instance-bound agents is a Task E
-    // follow-up — needs to filter projects by instanceId.
+    // Reconstruct only this instance's projects so a box-reboot can
+    // reattach Claude/cursor/devin sessions without touching projects
+    // that live on other agents (e.g. the user's Mac).
+    setTimeout(() => {
+      reconstructInstanceSessions(instance.id, user.id, user.unixUsername).catch(err => {
+        console.error(`[AGENT] Instance reconstruction failed for ${instance.name}:`, err.message);
+      });
+    }, 2000);
   } else {
     // Legacy per-user: reconstruct tmux sessions after a short delay.
     // Fire-and-forget.
@@ -183,6 +189,29 @@ export function sendToInstanceAgent(instanceId: string, type: string, payload: R
   const agent = getInstanceAgent(instanceId);
   if (!agent) return Promise.reject(new Error('Instance agent not connected'));
   return sendOnAgent(agent, type, payload, timeoutMs);
+}
+
+/**
+ * Project-keyed routing: sends to the project's box if it lives on one,
+ * else to the user's legacy agent. The two predicates below pair with it.
+ */
+type ProjectHost = { userId: string; instanceId: string | null };
+
+export function isProjectAgentConnected(project: ProjectHost): boolean {
+  return project.instanceId
+    ? isInstanceAgentConnected(project.instanceId)
+    : isAgentConnected(project.userId);
+}
+
+export function sendForProject(
+  project: ProjectHost,
+  type: string,
+  payload: Record<string, unknown> = {},
+  timeoutMs: number = 10000,
+): Promise<any> {
+  return project.instanceId
+    ? sendToInstanceAgent(project.instanceId, type, payload, timeoutMs)
+    : sendToAgent(project.userId, type, payload, timeoutMs);
 }
 
 /**

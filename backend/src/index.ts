@@ -26,7 +26,8 @@ import { createSlackApp, startSlackApp } from './slack/app';
 import { createDiscordClient, startDiscordClient } from './discord/app';
 import { validateAgentToken } from './routes/agentTokens';
 import {
-  registerAgent, isAgentConnected, requestTerminalStream,
+  registerAgent, isAgentConnected, isInstanceAgentConnected,
+  requestTerminalStream, requestInstanceTerminalStream,
   sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
 } from './services/agentRegistry';
 import { PrismaClient } from '@prisma/client';
@@ -191,24 +192,25 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Allow owner directly; for others, check if they have a share on the project
-      if (user.id !== loggedInUserId) {
-        // Parse projectName from session: username-projectName-role
-        const afterUsername = tmuxSession.substring(dashIdx + 1);
-        const lastDash = afterUsername.lastIndexOf('-');
-        const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
+      // Parse projectName from session: username-projectName-role. Used both
+      // for share authorization (below) AND to look up the project's
+      // instanceId so we can route to the right host's agent.
+      const afterUsername = tmuxSession.substring(dashIdx + 1);
+      const lastDash = afterUsername.lastIndexOf('-');
+      const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
 
+      const project = projectName
+        ? await prismaIndex.project.findFirst({ where: { userId: user.id, name: projectName } })
+        : null;
+
+      // Allow owner directly; for others, check if they have a share on the project.
+      if (user.id !== loggedInUserId) {
         let allowed = false;
-        if (projectName) {
-          const project = await prismaIndex.project.findFirst({
-            where: { userId: user.id, name: projectName },
+        if (project) {
+          const share = await prismaIndex.projectShare.findUnique({
+            where: { projectId_userId: { projectId: project.id, userId: loggedInUserId } },
           });
-          if (project) {
-            const share = await prismaIndex.projectShare.findUnique({
-              where: { projectId_userId: { projectId: project.id, userId: loggedInUserId } },
-            });
-            if (share) allowed = true;
-          }
+          if (share) allowed = true;
         }
 
         if (!allowed) {
@@ -218,9 +220,16 @@ wss.on('connection', (ws, req) => {
         console.log(`[TERMINAL] Shared access: routing ${tmuxSession} for collaborator`);
       }
 
-      if (!isAgentConnected(user.id)) {
-        console.log(`[TERMINAL] Agent not connected for ${user.unixUsername}`);
-        ws.send(JSON.stringify({ type: 'output', data: '\r\nAgent not connected. Run the termag-agent on your account first.\r\n' }));
+      // Route via the project's box (if pinned) or the user's legacy agent.
+      const instanceId = project?.instanceId ?? null;
+      const agentConnected = instanceId
+        ? isInstanceAgentConnected(instanceId)
+        : isAgentConnected(user.id);
+
+      if (!agentConnected) {
+        const where = instanceId ? `box ${instanceId}` : user.unixUsername;
+        console.log(`[TERMINAL] Agent not connected for ${where}`);
+        ws.send(JSON.stringify({ type: 'output', data: `\r\nAgent not connected${instanceId ? ' for this box' : ''}.\r\n` }));
         ws.close(1008, 'agent not connected');
         return;
       }
@@ -228,9 +237,9 @@ wss.on('connection', (ws, req) => {
       const initCols = parseInt(url.searchParams.get('cols') || '', 10) || 80;
       const initRows = parseInt(url.searchParams.get('rows') || '', 10) || 24;
 
-      console.log(`[TERMINAL] Routing ${tmuxSession} through agent for ${user.unixUsername} (${initCols}x${initRows})`);
+      console.log(`[TERMINAL] Routing ${tmuxSession} via ${instanceId ? `instance ${instanceId}` : user.unixUsername} (${initCols}x${initRows})`);
       try {
-        const streamId = await requestTerminalStream(user.id, tmuxSession, initCols, initRows, (msg) => {
+        const onData = (msg: any) => {
           if (ws.readyState === WebSocket.OPEN) {
             if (msg.type === 'terminal-data') {
               ws.send(JSON.stringify({ type: 'output', data: msg.data }));
@@ -238,7 +247,10 @@ wss.on('connection', (ws, req) => {
               ws.send(JSON.stringify({ type: 'exit' }));
             }
           }
-        });
+        };
+        const streamId = instanceId
+          ? await requestInstanceTerminalStream(instanceId, user, tmuxSession, initCols, initRows, onData)
+          : await requestTerminalStream(user.id, tmuxSession, initCols, initRows, onData);
 
         ws.on('message', (raw) => {
           try {

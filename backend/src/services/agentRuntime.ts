@@ -1,5 +1,5 @@
 import * as tmux from './tmux';
-import { isAgentConnected, sendToAgent } from './agentRegistry';
+import { isProjectAgentConnected, sendForProject } from './agentRegistry';
 import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
 import { PROVIDERS, ALL_PROCESS_NAMES } from '../providers/registry';
 import { PrismaClient } from '@prisma/client';
@@ -7,11 +7,8 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
 /**
- * Ask the user's agent whether an agent process is running in a given tmux
- * session. Uses the foreground pane command — same heuristic as
- * tmux.isAgentRunning, but routed through the agent so it queries the
- * correct host (remote Mac, laptop, etc.) instead of the backend's local
- * tmux server.
+ * Ask the right agent (the project's box if any, else the user's legacy
+ * agent) whether an agent process is running in a given tmux session.
  *
  *   'running'     — foreground command looks like an agent (claude, codex, etc.)
  *   'not-running' — session doesn't exist or pane is just a shell
@@ -19,9 +16,12 @@ const prisma = new PrismaClient();
  *                   into "unknown" because typing keys into a session whose
  *                   state we can't verify could clobber an active prompt.
  */
-async function probeAgentSession(userId: string, sessionName: string): Promise<'running' | 'not-running' | 'unknown'> {
+async function probeAgentSession(
+  project: { userId: string; instanceId: string | null },
+  sessionName: string,
+): Promise<'running' | 'not-running' | 'unknown'> {
   try {
-    const result = await sendToAgent(userId, 'tmux-foreground-cmd', { sessionName });
+    const result = await sendForProject(project, 'tmux-foreground-cmd', { sessionName });
     const cmd = (result?.cmd ?? '').toLowerCase();
     if (!cmd) return 'not-running';
     const looksLikeAgent = ALL_PROCESS_NAMES.some(a => cmd.includes(a))
@@ -44,6 +44,8 @@ interface AgentRuntimeContext {
   unixUsername: string;
   projectName: string;
   provider: string;
+  /** The project's instanceId, or null if it lives on the user's legacy agent. */
+  instanceId: string | null;
 }
 
 export async function ensureAgentSessionsAndLaunch({
@@ -51,6 +53,7 @@ export async function ensureAgentSessionsAndLaunch({
   unixUsername,
   projectName,
   provider,
+  instanceId,
 }: AgentRuntimeContext): Promise<void> {
   const config = PROVIDERS[provider];
   if (!config) throw new Error(`Unknown provider: ${provider}`);
@@ -58,22 +61,31 @@ export async function ensureAgentSessionsAndLaunch({
   const projDir = tmux.projectDir(unixUsername, projectName);
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
+  const project = { userId, instanceId };
 
-  if (isAgentConnected(userId)) {
-    await sendToAgent(userId, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-    await sendToAgent(userId, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+  if (isProjectAgentConnected(project)) {
+    await sendForProject(project, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+    await sendForProject(project, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
     await new Promise(resolve => setTimeout(resolve, 500));
 
     if (config.needsBridge) {
-      await sendToAgent(userId, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
+      await sendForProject(project, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
     } else {
-      await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: config.launchCommand, withEnter: true });
+      await sendForProject(project, 'tmux-send-keys', { sessionName: mainSession, keys: config.launchCommand, withEnter: true });
     }
 
     if (config.needsPoller) {
       registerPollerSession(mainSession, provider);
     }
     return;
+  }
+
+  // No agent connected for this project — fall back to local tmux (orchestrator
+  // host). Only meaningful for legacy projects that live on the orchestrator
+  // itself; instance-bound projects with a disconnected agent fail loudly here
+  // because the orchestrator can't see the box's tmux server.
+  if (instanceId) {
+    throw new Error('Box agent not connected; cannot launch sessions');
   }
 
   await tmux.ensureProjectDir(unixUsername, projectName);
@@ -95,20 +107,40 @@ export async function ensureAgentSessionsAndLaunch({
 }
 
 /**
- * Reconstruct all tmux sessions for a user after their agent reconnects.
- * Called on agent WebSocket connect — handles post-reboot recovery.
- *
- * For each non-archived project with workflows:
- * - Agent workflows: creates agent + ctrl sessions, launches the provider
- *   (Claude gets --continue to resume the last conversation)
- * - Data workflows: creates data + data-ctrl sessions
- *
- * Skips sessions where the agent process is already running (handles
- * reconnects from network blips where sessions survived).
+ * Reconstruct all tmux sessions for a user's legacy agent (Mac / secorp.net).
+ * Called from agentRegistry.registerAgent when a non-instance-bound agent
+ * connects.
  */
 export async function reconstructUserSessions(userId: string, unixUsername: string): Promise<void> {
+  await reconstructAgentSessions(userId, unixUsername, null);
+}
+
+/**
+ * Reconstruct tmux sessions for one specific box's agent. Called when an
+ * instance-bound agent connects (after a box reboot / replacement). Only
+ * touches projects pinned to this instance.
+ */
+export async function reconstructInstanceSessions(
+  instanceId: string,
+  userId: string,
+  unixUsername: string,
+): Promise<void> {
+  await reconstructAgentSessions(userId, unixUsername, instanceId);
+}
+
+/**
+ * Reconstruct tmux sessions for one agent. Filters projects so the legacy
+ * agent only sees legacy projects (instanceId IS NULL) and an instance
+ * agent only sees its own projects (instanceId = X). Avoids cross-talk
+ * where one agent would try to recreate sessions belonging to another box.
+ */
+async function reconstructAgentSessions(
+  userId: string,
+  unixUsername: string,
+  instanceId: string | null,
+): Promise<void> {
   const projects = await prisma.project.findMany({
-    where: { userId, archived: false },
+    where: { userId, archived: false, instanceId },
     include: { workflows: true },
   });
 
@@ -120,33 +152,28 @@ export async function reconstructUserSessions(userId: string, unixUsername: stri
   let launched = 0;
 
   for (const project of projects) {
+    const projectHost = { userId, instanceId };
+
     for (const wf of project.workflows) {
       try {
         if (wf.type === 'agent') {
           const provider = resolveAgentProvider(wf.provider, defaultProvider);
           const mainSession = tmux.sessionName(unixUsername, project.name, 'agent');
 
-          // Check if agent is already running in this session (network blip,
-          // sleep/wake — not a full reboot). Must route through the agent
-          // because the session lives on the user's host, not the backend's.
-          const probe = await probeAgentSession(userId, mainSession);
+          const probe = await probeAgentSession(projectHost, mainSession);
           if (probe === 'running') {
-            // Session survived — just re-register poller if needed
             const config = PROVIDERS[provider];
             if (config?.needsPoller) registerPollerSession(mainSession, provider);
             continue;
           }
           if (probe === 'unknown') {
-            // RPC failed — don't relaunch into a session we can't see
             console.warn(`[RECONSTRUCT] Skipping ${project.name}/${wf.type}: probe failed`);
             continue;
           }
 
-          // Session is missing or agent isn't running — reconstruct
           const config = PROVIDERS[provider];
           let launchCmd = config?.launchCommand ?? provider;
 
-          // For Claude, use --continue to resume the last conversation
           if (provider === 'claude') {
             launchCmd = 'claude --continue';
           }
@@ -154,16 +181,15 @@ export async function reconstructUserSessions(userId: string, unixUsername: stri
           const projDir = tmux.projectDir(unixUsername, project.name);
           const ctrlSession = tmux.sessionName(unixUsername, project.name, 'ctrl');
 
-          await sendToAgent(userId, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-          await sendToAgent(userId, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+          await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
 
-          // Stagger launches so tmux doesn't get overwhelmed
           await new Promise(resolve => setTimeout(resolve, 500));
 
           if (config?.needsBridge) {
-            await sendToAgent(userId, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
+            await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
           } else {
-            await sendToAgent(userId, 'tmux-send-keys', { sessionName: mainSession, keys: launchCmd, withEnter: true });
+            await sendForProject(projectHost, 'tmux-send-keys', { sessionName: mainSession, keys: launchCmd, withEnter: true });
           }
 
           if (config?.needsPoller) {
@@ -177,17 +203,17 @@ export async function reconstructUserSessions(userId: string, unixUsername: stri
           const ctrlSession = tmux.sessionName(unixUsername, project.name, 'data-ctrl');
           const projDir = tmux.projectDir(unixUsername, project.name);
 
-          await sendToAgent(userId, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-          await sendToAgent(userId, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+          await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
         }
       } catch (err) {
         console.error(`[RECONSTRUCT] Failed for ${project.name}/${wf.type}:`, (err as Error).message);
-        // Continue with other projects — don't let one failure block everything
       }
     }
   }
 
-  console.log(`[RECONSTRUCT] ${unixUsername}: reconstructed ${launched} agent sessions across ${projects.length} projects`);
+  const scope = instanceId ? `instance ${instanceId}` : `${unixUsername} (legacy)`;
+  console.log(`[RECONSTRUCT] ${scope}: reconstructed ${launched} agent sessions across ${projects.length} projects`);
 }
 
 export async function stopAgentSessions({
@@ -195,23 +221,30 @@ export async function stopAgentSessions({
   unixUsername,
   projectName,
   provider,
+  instanceId,
 }: AgentRuntimeContext): Promise<void> {
   const config = PROVIDERS[provider];
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
+  const project = { userId, instanceId };
 
   if (config?.needsPoller) {
     unregisterPollerSession(mainSession);
   }
 
-  if (isAgentConnected(userId)) {
+  if (isProjectAgentConnected(project)) {
     if (config?.needsBridge) {
-      await sendToAgent(userId, 'codex-session-stop', { sessionName: mainSession }).catch(() => {});
+      await sendForProject(project, 'codex-session-stop', { sessionName: mainSession }).catch(() => {});
     }
-    await sendToAgent(userId, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
-    await sendToAgent(userId, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
+    await sendForProject(project, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
+    await sendForProject(project, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
     return;
   }
+
+  // Box-hosted projects with no live agent — nothing we can do; sessions die
+  // with the box. Legacy projects fall through to the orchestrator's local
+  // tmux (the original behavior).
+  if (instanceId) return;
 
   await tmux.killSession(mainSession);
   await tmux.killSession(ctrlSession);

@@ -3,7 +3,12 @@ import { PrismaClient, WorkflowType } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import * as tmux from '../services/tmux';
-import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
+import {
+  isAgentConnected,
+  isProjectAgentConnected,
+  sendForProject,
+  sendToAgent,
+} from '../services/agentRegistry';
 import { deleteStatus, setStatus, notifyStatusChange } from '../services/status';
 import { createProjectChannel } from '../slack/channels';
 import { rename } from 'fs/promises';
@@ -71,11 +76,12 @@ export function projectsRouter(): Router {
 
   const create: RequestHandler = async (req, res) => {
     try {
-      const { name, description, color, initialAgent } = req.body as {
+      const { name, description, color, initialAgent, instanceId } = req.body as {
         name?: string;
         description?: string;
         color?: string;
         initialAgent?: { enabled?: boolean; provider?: string };
+        instanceId?: string | null;
       };
       if (!name) { res.status(400).json({ error: 'name required' }); return; }
 
@@ -85,6 +91,24 @@ export function projectsRouter(): Router {
         return;
       }
 
+      // If a box was specified, confirm the caller owns it and it's live.
+      // null/undefined means a legacy project (lives on the user's Mac /
+      // secorp.net agent).
+      if (instanceId) {
+        const instance = await prisma.instance.findFirst({
+          where: { id: instanceId, userId: req.user!.id },
+        });
+        if (!instance) {
+          res.status(400).json({ error: 'instanceId not found or not owned by you' });
+          return;
+        }
+        if (instance.status === 'terminated') {
+          res.status(400).json({ error: 'cannot create a project on a terminated box' });
+          return;
+        }
+      }
+      const projectInstanceId = instanceId ?? null;
+
       // Check for archived project with same name — unarchive instead
       const archived = await prisma.project.findFirst({
         where: { userId: req.user!.id, name, archived: true },
@@ -93,7 +117,7 @@ export function projectsRouter(): Router {
       if (archived) {
         await prisma.project.update({
           where: { id: archived.id },
-          data: { archived: false, description, color },
+          data: { archived: false, description, color, instanceId: projectInstanceId },
         });
         if (initialAgent?.enabled && !archived.workflows.some(w => w.type === 'agent')) {
           const provider = normalizeProvider(initialAgent.provider, req.user!.defaultAgentProvider);
@@ -105,6 +129,7 @@ export function projectsRouter(): Router {
             unixUsername: req.user!.unixUsername,
             projectName: name,
             provider,
+            instanceId: projectInstanceId,
           });
         }
 
@@ -116,16 +141,23 @@ export function projectsRouter(): Router {
         return;
       }
 
-      // Create project directory + seed AGENTS.md — via agent if connected, else direct
+      // Create project directory + seed AGENTS.md — via the project's agent
+      // (its box if pinned, else the user's legacy agent), else direct.
       const projDir = tmux.projectDir(req.user!.unixUsername, name);
-      if (isAgentConnected(req.user!.id)) {
-        await sendToAgent(req.user!.id, 'mkdir', { dir: projDir });
+      const projectHost = { userId: req.user!.id, instanceId: projectInstanceId };
+      if (isProjectAgentConnected(projectHost)) {
+        await sendForProject(projectHost, 'mkdir', { dir: projDir });
         // Fire-and-forget: seed wiki files (agent handles idempotency)
-        sendToAgent(req.user!.id, 'init-wiki', {
+        sendForProject(projectHost, 'init-wiki', {
           dir: projDir, slug: name, username: req.user!.unixUsername,
         }).catch(() => {});
-      } else {
+      } else if (!projectInstanceId) {
+        // Legacy path: orchestrator host's own filesystem
         await tmux.ensureProjectDir(req.user!.unixUsername, name);
+      } else {
+        // Box-pinned project but the box's agent isn't connected. Fail loud.
+        res.status(503).json({ error: 'Box agent is not connected' });
+        return;
       }
 
       const provider = initialAgent?.enabled
@@ -138,6 +170,7 @@ export function projectsRouter(): Router {
           description,
           color,
           userId: req.user!.id,
+          instanceId: projectInstanceId,
           workflows: initialAgent?.enabled
             ? { create: { type: 'agent', provider: provider! } }
             : undefined,
@@ -152,6 +185,7 @@ export function projectsRouter(): Router {
             unixUsername: req.user!.unixUsername,
             projectName: name,
             provider,
+            instanceId: projectInstanceId,
           });
         }
       } catch (err) {
@@ -205,7 +239,7 @@ export function projectsRouter(): Router {
 
       const username = req.user!.unixUsername;
 
-      // Kill all tmux sessions for this project — via agent if connected
+      // Kill all tmux sessions for this project — via the project's agent.
       for (const wf of project.workflows) {
         if (wf.type === 'agent') {
           await stopAgentSessions({
@@ -213,6 +247,7 @@ export function projectsRouter(): Router {
             unixUsername: username,
             projectName: project.name,
             provider: resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider),
+            instanceId: project.instanceId,
           });
         } else {
           await tmux.killSession(tmux.sessionName(username, project.name, 'data'));
@@ -268,19 +303,23 @@ export function projectsRouter(): Router {
             unixUsername: req.user!.unixUsername,
             projectName: project.name,
             provider: provider!,
+            instanceId: project.instanceId,
           });
         } else {
           const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data');
           const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl');
           const projDir = tmux.projectDir(req.user!.unixUsername, project.name);
+          const projectHost = { userId: req.user!.id, instanceId: project.instanceId };
 
-          if (isAgentConnected(req.user!.id)) {
-            await sendToAgent(req.user!.id, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-            await sendToAgent(req.user!.id, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
-          } else {
+          if (isProjectAgentConnected(projectHost)) {
+            await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+            await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+          } else if (!project.instanceId) {
             await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
             await tmux.ensureSession(mainSession, projDir);
             await tmux.ensureSession(ctrlSession, projDir);
+          } else {
+            throw new Error('Box agent not connected');
           }
         }
       } catch (err) {
@@ -317,6 +356,7 @@ export function projectsRouter(): Router {
           unixUsername: req.user!.unixUsername,
           projectName: project.name,
           provider,
+          instanceId: project.instanceId,
         });
       } else {
         await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data'));
@@ -349,6 +389,7 @@ export function projectsRouter(): Router {
       if (oldName === newName) { res.json({ ok: true }); return; }
 
       const username = req.user!.unixUsername;
+      const projectHost = { userId: req.user!.id, instanceId: project.instanceId };
       const providerRestarts: Array<{ projectName: string; provider: string }> = [];
 
       // Rename tmux sessions
@@ -356,8 +397,8 @@ export function projectsRouter(): Router {
         const roles: Array<'agent' | 'ctrl' | 'data' | 'data-ctrl'> = wf.type === 'agent'
           ? ['agent', 'ctrl'] : ['data', 'data-ctrl'];
         const provider = resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider);
-        if (wf.type === 'agent' && provider === 'codex' && isAgentConnected(req.user!.id)) {
-          await sendToAgent(req.user!.id, 'codex-session-stop', {
+        if (wf.type === 'agent' && provider === 'codex' && isProjectAgentConnected(projectHost)) {
+          await sendForProject(projectHost, 'codex-session-stop', {
             sessionName: tmux.sessionName(username, oldName, 'agent'),
           }).catch(() => {});
         }
@@ -372,7 +413,7 @@ export function projectsRouter(): Router {
           setStatus(newSession, 'idle');
           notifyStatusChange(newSession);
         }
-        if (wf.type === 'agent' && isAgentConnected(req.user!.id)) {
+        if (wf.type === 'agent' && isProjectAgentConnected(projectHost)) {
           providerRestarts.push({
             projectName: newName,
             provider,
@@ -404,6 +445,7 @@ export function projectsRouter(): Router {
             unixUsername: username,
             projectName: restart.projectName,
             provider: restart.provider,
+            instanceId: project.instanceId,
           }).catch(() => {});
         }
       }
@@ -485,13 +527,14 @@ export function projectsRouter(): Router {
     }
     captureRateLimits.set(rateKey, now);
 
-    if (!isAgentConnected(project.userId)) {
+    const ownerHost = { userId: project.userId, instanceId: project.instanceId };
+    if (!isProjectAgentConnected(ownerHost)) {
       res.status(503).json({ error: "Owner's agent is offline" });
       return;
     }
 
     try {
-      const result = await sendToAgent(project.userId, 'tmux-capture', { sessionName, lines });
+      const result = await sendForProject(ownerHost, 'tmux-capture', { sessionName, lines });
       res.json({ session: sessionName, content: result.content ?? '' });
     } catch (err) {
       res.status(503).json({ error: `Capture failed: ${(err as Error).message}` });

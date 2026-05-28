@@ -154,6 +154,9 @@ export function registerDiscordEvents(client: Client): void {
             unixUsername: username,
             projectName,
             provider: termagUser.defaultAgentProvider,
+            // Slack/Discord-created projects always use the legacy per-user
+            // agent — there's no UI affordance to pick a box.
+            instanceId: null,
           });
         } else {
           await interaction.reply(`Project \`${projectName}\` created but agent is not connected — tmux sessions not started.`);
