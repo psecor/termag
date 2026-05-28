@@ -25,13 +25,14 @@ model User {
   receivedInvites ProjectInvite[] @relation("receivedInvites")
   visits        ProjectVisit[]
   warpSamples   WarpSample[]
+  instances     Instance[]
 
   @@map("users")
 }
 
 model AgentToken {
   id         String    @id @default(cuid())
-  name       String    // e.g. "macbook", "dev-server"
+  name       String    // e.g. "macbook", "dev-server", or instance name
   tokenHash  String    @unique // SHA-256 hash of the token
   tokenPrefix String   // first 8 chars for display (e.g. "tmag_a1b2...")
   createdAt  DateTime  @default(now())
@@ -41,7 +42,14 @@ model AgentToken {
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // When the token was minted for a specific Instance (e.g. an AWS box
+  // created via terraform), this links to it. Null for legacy per-user
+  // tokens (laptop / secorp.net) where the agent picks the host.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
   @@index([userId])
+  @@index([instanceId])
   @@map("agent_tokens")
 }
 
@@ -60,6 +68,12 @@ model Project {
   userId    String
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // The box this project lives on. Nullable so existing projects (which
+  // live on the user's Mac / secorp.net) work unchanged. New projects
+  // created via the box-CRUD UI will set this at create time.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+
   workflows   Workflow[]
   browserTabs BrowserTab[]
   shares      ProjectShare[]
@@ -68,6 +82,7 @@ model Project {
 
   @@unique([userId, name])
   @@index([userId, archived])
+  @@index([instanceId])
   @@map("projects")
 }
 
@@ -204,6 +219,48 @@ model WarpSample {
   @@unique([userId, bucket])
   @@index([userId, bucket])
   @@map("warp_samples")
+}
+
+// A per-user compute box (typically an EC2 instance provisioned by the
+// Terraform module in terraform/box/). Hosts the user's tmux sessions and
+// runs the termag agent. Replaces the legacy 1-agent-per-user model with
+// N-agents-per-user, keyed by instance.
+//
+// Non-EC2 hosts (the user's Mac, the orchestrator's own host) can be
+// represented here too with ec2InstanceId = null, but the V1 box-CRUD
+// only creates AWS-backed rows.
+model Instance {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name            String   // user-supplied, e.g. "peter-laptop", "peter-heavy"
+
+  // AWS coordinates. All nullable so the model can describe non-EC2 boxes.
+  ec2InstanceId   String?  @unique
+  region          String?
+  hostname        String?  // private DNS or private IP; mostly diagnostic
+
+  // Logical status — set by the backend's box-CRUD path. The EC2 instance
+  // has its own state ("running", "stopped", etc.) that we query on demand
+  // rather than caching here.
+  //   provisioning  — terraform applying, EC2 booting, agent not yet seen
+  //   ready         — agent has connected at least once
+  //   terminated    — instance gone (kept for history; cleanup is a sweep)
+  status          String   @default("provisioning")
+  createdAt       DateTime @default(now())
+  terminatedAt    DateTime?
+
+  // When the agent on this box was last seen connected to the orchestrator.
+  // Drives future "idle eviction" logic in the pool model.
+  lastConnectedAt DateTime?
+
+  projects     Project[]
+  agentTokens  AgentToken[]
+
+  @@unique([userId, name])
+  @@index([userId, status])
+  @@map("instances")
 }
 
 // Latest Chrome tab snapshot from the local relay, keyed by relay token
