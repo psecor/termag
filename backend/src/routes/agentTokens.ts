@@ -73,13 +73,14 @@ export function agentTokensRouter(): Router {
 
 /**
  * Validate an agent token from a WebSocket or API request.
- * Returns the user if valid, null if not.
+ * Returns { user, instance } if valid (instance may be null for legacy
+ * per-user tokens), or null if the token is bad/revoked.
  */
 export async function validateAgentToken(rawToken: string) {
   const tokenHash = hashToken(rawToken);
   const token = await prisma.agentToken.findUnique({
     where: { tokenHash },
-    include: { user: true },
+    include: { user: true, instance: true },
   });
 
   if (!token || token.revokedAt) return null;
@@ -90,5 +91,5 @@ export async function validateAgentToken(rawToken: string) {
     data: { lastUsedAt: new Date() },
   }).catch(() => {});
 
-  return token.user;
+  return { user: token.user, instance: token.instance };
 }

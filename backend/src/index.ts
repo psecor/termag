@@ -19,6 +19,7 @@ import { worktimeRouter } from './routes/worktime';
 import { sharingRouter } from './routes/sharing';
 import { visitsRouter } from './routes/visits';
 import { warpRouter } from './routes/warp';
+import { instancesRouter } from './routes/instances';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -106,6 +107,7 @@ app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 app.use(`${BASE_PATH}/api`, sharingRouter());
 app.use(`${BASE_PATH}/api/visits`, visitsRouter());
 app.use(`${BASE_PATH}/api/warp`, warpRouter());
+app.use(`${BASE_PATH}/api/instances`, instancesRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });
@@ -315,12 +317,14 @@ wss.on('connection', (ws, req) => {
       ws.close(1008, 'token param required');
       return;
     }
-    validateAgentToken(token).then(user => {
-      if (!user) {
+    validateAgentToken(token).then(result => {
+      if (!result) {
         ws.close(1008, 'invalid or revoked token');
         return;
       }
-      registerAgent(user, ws);
+      // result.instance is null for legacy per-user tokens (Mac/secorp.net),
+      // non-null for instance-bound tokens minted by POST /api/instances.
+      registerAgent(result.user, ws, result.instance);
     }).catch(() => {
       ws.close(1008, 'auth error');
     });

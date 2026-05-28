@@ -21,9 +21,9 @@ export async function requireAuthOrAgentToken(req: Request, res: Response, next:
   if (authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7);
     try {
-      const user = await validateAgentToken(token);
-      if (user) {
-        req.user = user as Express.User;
+      const result = await validateAgentToken(token);
+      if (result) {
+        req.user = result.user as Express.User;
         next();
         return;
       }
