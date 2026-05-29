@@ -15,6 +15,10 @@ relay/relay.config.json
 
 # Agent config (contains tokens)
 agent/agent.config.json
+agent/agent.config.*.json
+
+# Claude Code's local state for this repo
+.claude/
 
 # Terraform
 .terraform/

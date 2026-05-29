@@ -129,9 +129,46 @@ export function authRouter(): Router {
     });
   };
 
+  // Dev-only auth bypass — visit /termag/auth/dev-login to sign in as the
+  // first email in ALLOWED_USERS without going through Google. Disabled in
+  // production. Useful for local dev where the OAuth client doesn't have
+  // localhost registered as a redirect URI.
+  const devLogin: RequestHandler = async (req, res, next) => {
+    if (process.env.NODE_ENV === 'production') {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    const allowedUsers = parseAllowedUsers();
+    const first = allowedUsers.entries().next();
+    if (first.done) {
+      res.status(500).json({ error: 'ALLOWED_USERS is empty' });
+      return;
+    }
+    const [email, unixUsername] = first.value;
+    try {
+      const user = await prisma.user.upsert({
+        where: { googleEmail: email },
+        update: { displayName: 'Dev User', unixUsername },
+        create: {
+          googleId: `dev:${email}`,
+          googleEmail: email,
+          unixUsername,
+          displayName: 'Dev User',
+        },
+      });
+      req.login(user as Express.User, (err) => {
+        if (err) return next(err);
+        res.redirect(`${frontendUrl}${basePath}/`);
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
+
   router.post('/logout', logout);
   router.get('/me', me);
   router.put('/me/preferences', updatePreferences);
+  router.get('/dev-login', devLogin);
 
   return router;
 }
