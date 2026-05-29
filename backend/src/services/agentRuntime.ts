@@ -68,6 +68,21 @@ export async function ensureAgentSessionsAndLaunch({
     await sendForProject(project, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
     await new Promise(resolve => setTimeout(resolve, 500));
 
+    // Don't re-launch the agent CLI if it (or any known agent process) is
+    // already running in the pane. Skipping on 'unknown' too, since blindly
+    // typing into a session whose state we can't verify risks clobbering an
+    // active prompt. Same logic as reconstructAgentSessions — keeps the
+    // re-create-an-existing-project path from typing `claude` (or `devin`,
+    // `cursor`, etc.) into a pane that already has one running.
+    const probe = await probeAgentSession(project, mainSession);
+    if (probe === 'running' || probe === 'unknown') {
+      if (probe === 'unknown') {
+        console.warn(`[LAUNCH] ${projectName}: probe failed, skipping send-keys to avoid clobber`);
+      }
+      if (config.needsPoller) registerPollerSession(mainSession, provider);
+      return;
+    }
+
     if (config.needsBridge) {
       await sendForProject(project, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
     } else {
