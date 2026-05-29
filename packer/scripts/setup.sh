@@ -142,16 +142,15 @@ EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # systemd --user unit
-# Cloud-init will write ~termag/.config/termag/agent.config.json with the
-# bearer token at instance launch, then `systemctl --user enable --now
-# termag-agent`. We install the unit here so cloud-init doesn't have to.
+# Cloud-init writes ~termag/src/termag/agent/agent.config.json with the bearer
+# token at instance launch (that's the path the unit's ExecStart reads —
+# `agent.js <home>/src/termag/agent/agent.config.json`), then
+# `systemctl --user enable --now termag-agent`. We install the unit here so
+# cloud-init doesn't have to.
 # ─────────────────────────────────────────────────────────────────────────────
 sudo mkdir -p /home/termag/.config/systemd/user
 sudo cp /tmp/termag-agent.service /home/termag/.config/systemd/user/termag-agent.service
 sudo chown -R termag:termag /home/termag/.config
-
-# Ensure ~termag/.config/termag exists too (where the token lands at launch)
-sudo -u termag mkdir -p /home/termag/.config/termag
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verify SSM agent is present and enabled (Canonical's AMI ships it via snap)

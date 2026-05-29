@@ -1,20 +1,24 @@
 /**
  * Instances (boxes) — CRUD for per-user compute boxes.
  *
- * V1 design: user-driven Terraform. POST returns an instance ID + a
- * per-instance bearer token; the user runs `terraform apply` from their
- * own machine to actually provision the EC2. The orchestrator just
- * tracks the box's identity and accepts the agent's WS connection when
- * the box dials in with the token.
+ * V2 design: orchestrator-driven provisioning. POST creates the Instance row +
+ * a per-box bearer token, then kicks off async EC2 provisioning via the AWS SDK
+ * (boxProvisioner) and returns immediately with `status: provisioning`. The box
+ * boots, cloud-init starts the agent, the agent dials the WS, and
+ * agentRegistry.registerAgent flips the Instance to `ready`. DELETE actually
+ * tears the EC2 (+ SG + IAM) down via the SDK.
  *
- * Box becomes `ready` automatically when its agent first connects (see
- * agentRegistry.registerAgent). No state is updated from this router.
+ * When box provisioning isn't configured (local dev, or a deploy that hasn't
+ * surfaced the o11y-termag module outputs into the secret yet), POST falls back
+ * to the legacy manual-terraform path: it returns the raw token so the user can
+ * run `terraform apply` themselves.
  */
 
 import { Router, RequestHandler } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
+import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
 
 const prisma = new PrismaClient();
 
@@ -99,18 +103,37 @@ export function instancesRouter(): Router {
       return { instance };
     });
 
-    // Raw token shown once. The UI should copy it into the user's terraform
-    // invocation. After this response, the orchestrator can't recover it.
+    if (isBoxProvisioningConfigured()) {
+      // V2: provision the EC2 ourselves. Fire-and-forget — the box flips to
+      // `ready` when its agent dials in, or `failed` on a provisioning error.
+      // The raw token rides along in user_data, so it never leaves the server.
+      void provisionBox({
+        instance,
+        boxName: trimmed,
+        owner: req.user!.googleEmail,
+        token: rawToken,
+        remoteUnixUser: req.user!.unixUsername,
+        gitUserEmail: req.user!.googleEmail,
+        gitUserName: req.user!.displayName,
+      });
+      res.status(201).json({ instance });
+      return;
+    }
+
+    // Legacy fallback: provisioning not configured. Return the raw token once
+    // so the user can run `terraform apply` in terraform/box/ themselves.
     res.status(201).json({
       instance,
       token: rawToken,
       tokenPrefix,
+      hint: 'Box provisioning is not configured; run `terraform apply` in terraform/box/ with this token',
     });
   };
 
   // Terminate a box: archive its projects, revoke its tokens, mark
-  // terminated. Does NOT run `terraform destroy` — the user does that
-  // from their own shell.
+  // terminated, and (when provisioning is configured) actually destroy the
+  // EC2 + SG + IAM via the SDK. The teardown is fired un-awaited — it can take
+  // minutes for the instance to terminate before the SG can be deleted.
   //
   // If the box has live (non-archived) projects, returns 409 with the
   // list. The client must re-send with body { confirmed: true }.
@@ -151,6 +174,14 @@ export function instancesRouter(): Router {
         data: { status: 'terminated', terminatedAt: new Date() },
       }),
     ]);
+
+    if (isBoxProvisioningConfigured()) {
+      // Tear down the EC2 + SG + IAM. Fire-and-forget; cleanup is idempotent
+      // and tolerates a partially-provisioned box.
+      void terminateBox(instance);
+      res.json({ ok: true, archivedProjects: instance.projects.length });
+      return;
+    }
 
     res.json({
       ok: true,

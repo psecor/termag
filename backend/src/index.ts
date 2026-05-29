@@ -20,6 +20,7 @@ import { sharingRouter } from './routes/sharing';
 import { visitsRouter } from './routes/visits';
 import { warpRouter } from './routes/warp';
 import { instancesRouter } from './routes/instances';
+import { startProvisioningSweep } from './services/boxProvisioner';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
@@ -370,6 +371,7 @@ server.listen(PORT, () => {
   startTmuxPoller().catch(err => console.error('[TMUX-POLLER] Failed to start:', err));
   startHumanActivityTracker();
   startWarpSampler();
+  startProvisioningSweep();
 });
 
 function shutdown() {

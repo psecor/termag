@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue } from '../types';
+import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue, Instance } from '../types';
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
-import { projectsApi, agentTokensApi, sharingApi, AgentTokenInfo } from '../services/api';
+import { projectsApi, agentTokensApi, sharingApi, instancesApi, AgentTokenInfo } from '../services/api';
 
 function ConfirmDialog({ message, onConfirm, onCancel }: {
   message: string;
@@ -29,6 +29,7 @@ export function ProjectControl() {
   const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectProvider, setNewProjectProvider] = useState(user?.defaultAgentProvider ?? 'codex');
+  const [newProjectInstanceId, setNewProjectInstanceId] = useState<string>('');
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -110,6 +111,29 @@ export function ProjectControl() {
       }).catch(() => setShares([]));
     }
   }, [shareProjectId]);
+
+  // Boxes (compute instances)
+  const [boxes, setBoxes] = useState<Instance[]>([]);
+  const [newBoxName, setNewBoxName] = useState('');
+  const [boxError, setBoxError] = useState('');
+  const [boxMenuOpenId, setBoxMenuOpenId] = useState<string | null>(null);
+
+  const reloadBoxes = useCallback(async () => {
+    try { setBoxes(await instancesApi.list()); } catch { /* ignore */ }
+  }, []);
+
+  // Load boxes on mount.
+  useEffect(() => {
+    if (user) reloadBoxes();
+  }, [user, reloadBoxes]);
+
+  // Poll while any box is still provisioning so the spinner resolves to
+  // ready/failed without a manual refresh.
+  useEffect(() => {
+    if (!boxes.some(b => b.status === 'provisioning')) return;
+    const id = setInterval(reloadBoxes, 5000);
+    return () => clearInterval(id);
+  }, [boxes, reloadBoxes]);
 
   // Agent tokens
   const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
@@ -234,6 +258,7 @@ export function ProjectControl() {
     try {
       const project = await projectsApi.create({
         name: newProjectName.trim(),
+        instanceId: newProjectInstanceId || null,
         initialAgent: { enabled: true, provider: newProjectProvider },
       });
       setNewProjectName('');
@@ -275,6 +300,45 @@ export function ProjectControl() {
   async function togglePin(project: Project) {
     await projectsApi.togglePin(project.id);
     await reloadProjects();
+  }
+
+  async function createBox(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newBoxName.trim()) return;
+    try {
+      await instancesApi.create(newBoxName.trim());
+      setNewBoxName('');
+      setBoxError('');
+      await reloadBoxes();
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setBoxError(msg || 'Failed to create box');
+    }
+  }
+
+  function terminateBox(box: Instance) {
+    const doTerminate = async (confirmed: boolean) => {
+      try {
+        await instancesApi.terminate(box.id, confirmed);
+        await reloadBoxes();
+      } catch (err: unknown) {
+        // 409 → box has live projects; re-confirm to archive them all.
+        const resp = (err as { response?: { status?: number; data?: { projects?: Array<{ name: string }> } } })?.response;
+        if (resp?.status === 409) {
+          const names = (resp.data?.projects ?? []).map(p => p.name).join(', ');
+          setConfirmState({
+            message: `"${box.name}" has live projects (${names}). Terminate anyway? This archives them all.`,
+            onConfirm: () => doTerminate(true),
+          });
+        } else {
+          setBoxError('Failed to terminate box');
+        }
+      }
+    };
+    setConfirmState({
+      message: `Terminate box "${box.name}"? This destroys the EC2 instance.`,
+      onConfirm: () => doTerminate(false),
+    });
   }
 
   async function createToken(e: React.FormEvent) {
@@ -483,6 +547,19 @@ export function ProjectControl() {
               <option key={pid} value={pid}>{PROVIDERS[pid].displayName}</option>
             ))}
           </select>
+          {boxes.some(b => b.status === 'ready') && (
+            <select
+              className="inline-form-select"
+              value={newProjectInstanceId}
+              onChange={e => setNewProjectInstanceId(e.target.value)}
+              title="Box (host)"
+            >
+              <option value="">this host</option>
+              {boxes.filter(b => b.status === 'ready').map(b => (
+                <option key={b.id} value={b.id}>{b.name}</option>
+              ))}
+            </select>
+          )}
           <button type="submit">+</button>
         </form>
 
@@ -509,6 +586,55 @@ export function ProjectControl() {
             )}
           </div>
         )}
+      </section>
+
+      <section className="control-section">
+        <h3>Boxes</h3>
+        {boxError && <div className="error-banner">{boxError}<button onClick={() => setBoxError('')}>×</button></div>}
+        <ul className="box-list">
+          {boxes.map(b => {
+            const dotColor = b.status === 'ready' ? 'var(--success)'
+              : b.status === 'provisioning' ? 'var(--warning)'
+              : 'var(--danger)';
+            return (
+              <li key={b.id} className="box-item">
+                <span
+                  className={`box-status-dot ${b.status === 'provisioning' ? 'box-spinning' : ''}`}
+                  style={{ background: dotColor }}
+                  title={b.status === 'failed' && b.provisioningError ? b.provisioningError : b.status}
+                />
+                <span className="box-name" title={b.hostname ?? undefined}>{b.name}</span>
+                <span className="box-meta">
+                  {b.status === 'provisioning' ? 'provisioning…'
+                    : b.status === 'failed' ? 'failed'
+                    : `${b._count?.projects ?? 0} proj`}
+                </span>
+                <span className="project-actions" onClick={e => e.stopPropagation()}>
+                  <button
+                    className="btn-tiny btn-overflow"
+                    onClick={() => setBoxMenuOpenId(boxMenuOpenId === b.id ? null : b.id)}
+                  >⋮</button>
+                  {boxMenuOpenId === b.id && (
+                    <div className="project-menu" onMouseLeave={() => setBoxMenuOpenId(null)}>
+                      <button className="menu-danger" onClick={() => { terminateBox(b); setBoxMenuOpenId(null); }}>
+                        Terminate
+                      </button>
+                    </div>
+                  )}
+                </span>
+              </li>
+            );
+          })}
+          {boxes.length === 0 && <li className="box-empty">No boxes yet</li>}
+        </ul>
+        <form className="inline-form" onSubmit={createBox}>
+          <input
+            value={newBoxName}
+            onChange={e => setNewBoxName(e.target.value)}
+            placeholder="new box"
+          />
+          <button type="submit" title="Add box">+</button>
+        </form>
       </section>
 
       <section className="control-section">

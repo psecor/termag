@@ -12,6 +12,8 @@
     "db:migrate:dev": "prisma migrate dev"
   },
   "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1056.0",
+    "@aws-sdk/client-iam": "^3.1056.0",
     "@prisma/client": "^5.10.0",
     "@slack/bolt": "^3.22.0",
     "connect-pg-simple": "^9.0.1",

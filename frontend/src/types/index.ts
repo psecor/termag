@@ -30,6 +30,23 @@ export interface Project {
   role?: 'owner' | 'collaborator';
 }
 
+export type InstanceStatus = 'provisioning' | 'ready' | 'failed' | 'terminated';
+
+export interface Instance {
+  id: string;
+  name: string;
+  status: InstanceStatus;
+  ec2InstanceId?: string | null;
+  region?: string | null;
+  hostname?: string | null;
+  provisioningError?: string | null;
+  createdAt: string;
+  lastConnectedAt?: string | null;
+  _count?: { projects: number };
+  // Only present on the single-box (getOne) response, used for delete-confirm.
+  projects?: Array<{ id: string; name: string }>;
+}
+
 export interface ProjectInvite {
   id: string;
   projectName: string;

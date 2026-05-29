@@ -442,6 +442,36 @@ html {
 .token-prefix { flex: 1; color: var(--text-muted); font-family: monospace; font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
 .token-empty { color: var(--text-muted); font-size: 11px; padding: 3px 6px; }
 
+/* Boxes (compute instances) */
+.box-list {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.box-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+.box-item:hover { background: var(--bg-elevated); }
+.box-status-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.box-spinning { animation: box-pulse 1.2s ease-in-out infinite; }
+@keyframes box-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.box-name { flex: 1; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.box-meta { flex-shrink: 0; color: var(--text-muted); font-size: 10px; }
+.box-empty { color: var(--text-muted); font-size: 11px; padding: 3px 6px; }
+
 .token-created {
   background: rgba(63, 185, 80, 0.1);
   border: 1px solid var(--success);
