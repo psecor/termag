@@ -130,21 +130,34 @@ export function authRouter(): Router {
   };
 
   // Dev-only auth bypass — visit /termag/auth/dev-login to sign in as the
-  // first email in ALLOWED_USERS without going through Google. Disabled in
-  // production. Useful for local dev where the OAuth client doesn't have
+  // first identity in ALLOWED_USERS without going through Google. Disabled
+  // in production. Useful for local dev where the OAuth client doesn't have
   // localhost registered as a redirect URI.
+  //
+  // Resolution: first exact email mapping wins. If only domain rules are
+  // configured, fabricate a dev@<first-domain> identity and resolve through
+  // the normal helper so the unix username is consistent with prod.
   const devLogin: RequestHandler = async (req, res, next) => {
     if (process.env.NODE_ENV === 'production') {
       res.status(404).json({ error: 'Not found' });
       return;
     }
-    const allowedUsers = parseAllowedUsers();
-    const first = allowedUsers.entries().next();
-    if (first.done) {
-      res.status(500).json({ error: 'ALLOWED_USERS is empty' });
+    const allowed = parseAllowedUsers(process.env.ALLOWED_USERS);
+    let email: string | undefined;
+    let unixUsername: string | undefined;
+
+    const firstExact = allowed.exact.entries().next();
+    if (!firstExact.done) {
+      [email, unixUsername] = firstExact.value;
+    } else if (allowed.domains.length > 0) {
+      email = `dev@${allowed.domains[0].domain}`;
+      unixUsername = resolveUnixUsername(allowed, email);
+    }
+    if (!email || !unixUsername) {
+      res.status(500).json({ error: 'ALLOWED_USERS has no resolvable identity' });
       return;
     }
-    const [email, unixUsername] = first.value;
+
     try {
       const user = await prisma.user.upsert({
         where: { googleEmail: email },
