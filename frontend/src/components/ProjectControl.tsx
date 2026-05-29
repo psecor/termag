@@ -719,13 +719,11 @@ export function ProjectControl() {
                   style={{ background: dotColor }}
                   title={b.status === 'failed' && b.provisioningError ? b.provisioningError : b.status}
                 />
-                <span className="box-name" title={b.hostname ?? undefined}>
-                  {b.name}
-                  {b.kind === 'external' && <span className="box-kind-badge" title="self-managed host">self</span>}
-                </span>
+                <span className="box-name" title={b.hostname ?? undefined}>{b.name}</span>
+                {b.kind === 'external' && <span className="box-kind-badge" title="self-managed host">self</span>}
                 <span className="box-meta">
                   {b.status === 'provisioning' ? 'provisioning…'
-                    : b.status === 'awaiting-agent' ? 'awaiting agent…'
+                    : b.status === 'awaiting-agent' ? 'awaiting…'
                     : b.status === 'failed' ? 'failed'
                     : `${b._count?.projects ?? 0} proj`}
                 </span>
