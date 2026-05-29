@@ -237,17 +237,24 @@ model Instance {
   name            String   // user-supplied, e.g. "peter-laptop", "peter-heavy"
 
   // AWS coordinates. All nullable so the model can describe non-EC2 boxes.
+  // securityGroupId / iamRoleName are the per-box resources boxProvisioner
+  // creates via the SDK; terminateBox uses them to tear everything down.
   ec2InstanceId   String?  @unique
   region          String?
   hostname        String?  // private DNS or private IP; mostly diagnostic
+  securityGroupId String?  // per-box egress-only SG (also gets an ALB ingress rule)
+  iamRoleName     String?  // per-box role (== instance-profile name)
 
   // Logical status — set by the backend's box-CRUD path. The EC2 instance
   // has its own state ("running", "stopped", etc.) that we query on demand
   // rather than caching here.
-  //   provisioning  — terraform applying, EC2 booting, agent not yet seen
+  //   provisioning  — SDK launching, EC2 booting, agent not yet seen
   //   ready         — agent has connected at least once
+  //   failed        — provisioning errored (see provisioningError) or the box
+  //                    never dialed in within the stuck-provisioning window
   //   terminated    — instance gone (kept for history; cleanup is a sweep)
   status          String   @default("provisioning")
+  provisioningError String? // populated when status flips to failed
   createdAt       DateTime @default(now())
   terminatedAt    DateTime?
 

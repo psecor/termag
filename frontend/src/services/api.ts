@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -20,6 +20,7 @@ export const projectsApi = {
     name: string;
     description?: string;
     color?: string;
+    instanceId?: string | null;
     initialAgent?: { enabled: boolean; provider: AgentProvider };
   }) =>
     api.post('/api/projects', data).then(r => r.data),
@@ -55,6 +56,25 @@ export const agentTokensApi = {
   create: (name: string): Promise<AgentTokenCreated> =>
     api.post('/api/agent-tokens', { name }).then(r => r.data),
   revoke: (id: string) => api.delete(`/api/agent-tokens/${id}`).then(r => r.data),
+};
+
+// Boxes (compute instances). create() kicks off async EC2 provisioning and
+// returns the row at `status: provisioning`; poll list() until it goes
+// `ready`/`failed`. terminate() may return 409 with the live-projects list
+// when the box still has projects — re-send with { confirmed: true }.
+export interface InstanceTerminateConflict {
+  error: string;
+  projects: Array<{ id: string; name: string }>;
+  hint: string;
+}
+
+export const instancesApi = {
+  list: (): Promise<Instance[]> => api.get('/api/instances').then(r => r.data),
+  get: (id: string): Promise<Instance> => api.get(`/api/instances/${id}`).then(r => r.data),
+  create: (name: string): Promise<{ instance: Instance; token?: string; hint?: string }> =>
+    api.post('/api/instances', { name }).then(r => r.data),
+  terminate: (id: string, confirmed = false) =>
+    api.delete(`/api/instances/${id}`, { data: { confirmed } }).then(r => r.data),
 };
 
 export interface UsageDayData {
