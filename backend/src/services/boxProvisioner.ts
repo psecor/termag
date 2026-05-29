@@ -231,7 +231,8 @@ export async function provisionBox(args: ProvisionArgs): Promise<void> {
     // 2. Per-box egress-only SG (AWS adds the default allow-all egress rule).
     const sg = await ec2.send(new CreateSecurityGroupCommand({
       GroupName: name,
-      Description: `termag box ${args.boxName} — outbound only, no inbound`,
+      // SG descriptions must be ASCII-only — no em-dash here.
+      Description: `termag box ${args.boxName} - outbound only, no inbound`,
       VpcId: cfg.vpcId,
       TagSpecifications: [{ ResourceType: 'security-group', Tags: [...tags, { Key: 'Component', Value: 'box-sg' }] }],
     }));
