@@ -115,8 +115,12 @@ export function ProjectControl() {
   // Boxes (compute instances)
   const [boxes, setBoxes] = useState<Instance[]>([]);
   const [newBoxName, setNewBoxName] = useState('');
+  const [newBoxSelfManaged, setNewBoxSelfManaged] = useState(false);
   const [boxError, setBoxError] = useState('');
   const [boxMenuOpenId, setBoxMenuOpenId] = useState<string | null>(null);
+  // Set after creating a self-managed box: the one-time token + config to paste
+  // into agent.config.json on the user's own machine.
+  const [createdBox, setCreatedBox] = useState<{ name: string; token: string; agentWsUrl?: string } | null>(null);
 
   const reloadBoxes = useCallback(async () => {
     try { setBoxes(await instancesApi.list()); } catch { /* ignore */ }
@@ -127,10 +131,11 @@ export function ProjectControl() {
     if (user) reloadBoxes();
   }, [user, reloadBoxes]);
 
-  // Poll while any box is still provisioning so the spinner resolves to
-  // ready/failed without a manual refresh.
+  // Poll while any box is still coming up (EC2 provisioning, or an external box
+  // awaiting its agent) so the spinner resolves to ready/failed without a manual
+  // refresh.
   useEffect(() => {
-    if (!boxes.some(b => b.status === 'provisioning')) return;
+    if (!boxes.some(b => b.status === 'provisioning' || b.status === 'awaiting-agent')) return;
     const id = setInterval(reloadBoxes, 5000);
     return () => clearInterval(id);
   }, [boxes, reloadBoxes]);
@@ -306,8 +311,14 @@ export function ProjectControl() {
     e.preventDefault();
     if (!newBoxName.trim()) return;
     try {
-      await instancesApi.create(newBoxName.trim());
+      const result = await instancesApi.create(newBoxName.trim(), newBoxSelfManaged ? 'external' : 'ec2');
+      // Self-managed boxes return a one-time token to paste into the agent
+      // config on the user's own machine. EC2 boxes provision server-side.
+      if (newBoxSelfManaged && result.token) {
+        setCreatedBox({ name: result.instance.name, token: result.token, agentWsUrl: result.agentWsUrl });
+      }
       setNewBoxName('');
+      setNewBoxSelfManaged(false);
       setBoxError('');
       await reloadBoxes();
     } catch (err: unknown) {
@@ -336,7 +347,9 @@ export function ProjectControl() {
       }
     };
     setConfirmState({
-      message: `Terminate box "${box.name}"? This destroys the EC2 instance.`,
+      message: box.kind === 'external'
+        ? `Remove box "${box.name}"? This revokes its token; stop the agent on that machine.`
+        : `Terminate box "${box.name}"? This destroys the EC2 instance.`,
       onConfirm: () => doTerminate(false),
     });
   }
@@ -593,19 +606,24 @@ export function ProjectControl() {
         {boxError && <div className="error-banner">{boxError}<button onClick={() => setBoxError('')}>×</button></div>}
         <ul className="box-list">
           {boxes.map(b => {
+            const pending = b.status === 'provisioning' || b.status === 'awaiting-agent';
             const dotColor = b.status === 'ready' ? 'var(--success)'
-              : b.status === 'provisioning' ? 'var(--warning)'
+              : pending ? 'var(--warning)'
               : 'var(--danger)';
             return (
               <li key={b.id} className="box-item">
                 <span
-                  className={`box-status-dot ${b.status === 'provisioning' ? 'box-spinning' : ''}`}
+                  className={`box-status-dot ${pending ? 'box-spinning' : ''}`}
                   style={{ background: dotColor }}
                   title={b.status === 'failed' && b.provisioningError ? b.provisioningError : b.status}
                 />
-                <span className="box-name" title={b.hostname ?? undefined}>{b.name}</span>
+                <span className="box-name" title={b.hostname ?? undefined}>
+                  {b.name}
+                  {b.kind === 'external' && <span className="box-kind-badge" title="self-managed host">self</span>}
+                </span>
                 <span className="box-meta">
                   {b.status === 'provisioning' ? 'provisioning…'
+                    : b.status === 'awaiting-agent' ? 'awaiting agent…'
                     : b.status === 'failed' ? 'failed'
                     : `${b._count?.projects ?? 0} proj`}
                 </span>
@@ -627,14 +645,43 @@ export function ProjectControl() {
           })}
           {boxes.length === 0 && <li className="box-empty">No boxes yet</li>}
         </ul>
+
+        {createdBox && (
+          <div className="token-created">
+            <div className="token-created-label">
+              Self-managed box “{createdBox.name}” — add this to <code>agent.config.json</code> on that
+              machine and start the termag agent (copy now, shown once):
+            </div>
+            <code className="token-value">{JSON.stringify(
+              { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
+              null, 2,
+            )}</code>
+            <button className="btn-tiny" onClick={() => {
+              navigator.clipboard.writeText(JSON.stringify(
+                { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
+                null, 2,
+              ));
+              setCreatedBox(null);
+            }}>Copy &amp; dismiss</button>
+          </div>
+        )}
+
         <form className="inline-form" onSubmit={createBox}>
           <input
             value={newBoxName}
             onChange={e => setNewBoxName(e.target.value)}
-            placeholder="new box"
+            placeholder={newBoxSelfManaged ? 'my machine' : 'new box'}
           />
-          <button type="submit" title="Add box">+</button>
+          <button type="submit" title={newBoxSelfManaged ? 'Register self-managed box' : 'Add box (EC2)'}>+</button>
         </form>
+        <label className="box-self-toggle" title="Run the agent on your own machine instead of provisioning an EC2 box">
+          <input
+            type="checkbox"
+            checked={newBoxSelfManaged}
+            onChange={e => setNewBoxSelfManaged(e.target.checked)}
+          />
+          self-managed (run agent on my own machine)
+        </label>
       </section>
 
       <section className="control-section">

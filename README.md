@@ -110,3 +110,23 @@ The UI lets you:
 - choose `Codex` or `Claude` when creating a new project
 - change your default agent provider in the sidebar
 - see the current provider in the project list (`CX` / `CL`)
+
+## Boxes: EC2 vs self-managed
+
+A **box** is a compute instance an agent runs on. Each box gets its own
+instance-bound agent token, so a single user can run **several boxes at once** —
+projects route to a box via `Project.instanceId`. (A plain per-user agent token,
+by contrast, only holds one registry slot at a time, so two machines sharing one
+would just kick each other off.)
+
+Two kinds, both created from the **Boxes** section of the UI:
+
+- **EC2** (default) — the orchestrator provisions an AWS box for you via the SDK
+  (see [docs/box-provisioning.md](docs/box-provisioning.md)). The token rides in
+  `user_data` and never leaves the server.
+- **Self-managed** — tick *"self-managed (run agent on my own machine)"* when
+  adding a box. No AWS is touched; the UI returns a one-time `agent.config.json`
+  snippet (`termag_url` + `token`) to paste onto your own machine (laptop,
+  devbox, anything). Start the termag agent there and the box flips from
+  `awaiting agent…` to `ready`. Removing the box just revokes the token — stop
+  the agent on that machine yourself.

@@ -236,7 +236,19 @@ model Instance {
 
   name            String   // user-supplied, e.g. "peter-laptop", "peter-heavy"
 
-  // AWS coordinates. All nullable so the model can describe non-EC2 boxes.
+  // How this box is managed:
+  //   ec2       — orchestrator-provisioned EC2 box (boxProvisioner owns its
+  //               AWS lifecycle: SG, IAM, RunInstances, TerminateInstances).
+  //   external  — self-managed / BYO host (the user's own laptop, devbox, or
+  //               any machine). The orchestrator never touches AWS for these;
+  //               it just mints an instance-bound token the user drops into
+  //               their agent.config.json. Lets one user run several distinct
+  //               machines at once, each keyed by instanceId in agentRegistry
+  //               (a plain per-user token can only hold one slot at a time).
+  kind            String   @default("ec2")
+
+  // AWS coordinates. All nullable so the model can describe non-EC2 boxes
+  // (e.g. kind="external", where every AWS field stays null).
   // securityGroupId / iamRoleName are the per-box resources boxProvisioner
   // creates via the SDK; terminateBox uses them to tear everything down.
   ec2InstanceId   String?  @unique
@@ -248,11 +260,13 @@ model Instance {
   // Logical status — set by the backend's box-CRUD path. The EC2 instance
   // has its own state ("running", "stopped", etc.) that we query on demand
   // rather than caching here.
-  //   provisioning  — SDK launching, EC2 booting, agent not yet seen
-  //   ready         — agent has connected at least once
-  //   failed        — provisioning errored (see provisioningError) or the box
+  //   provisioning   — SDK launching, EC2 booting, agent not yet seen (ec2)
+  //   awaiting-agent — external box created, waiting for its self-run agent
+  //                    to dial in (external; no AWS work happens)
+  //   ready          — agent has connected at least once
+  //   failed         — provisioning errored (see provisioningError) or the box
   //                    never dialed in within the stuck-provisioning window
-  //   terminated    — instance gone (kept for history; cleanup is a sweep)
+  //   terminated     — instance gone (kept for history; cleanup is a sweep)
   status          String   @default("provisioning")
   provisioningError String? // populated when status flips to failed
   createdAt       DateTime @default(now())

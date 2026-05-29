@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -58,21 +58,31 @@ export const agentTokensApi = {
   revoke: (id: string) => api.delete(`/api/agent-tokens/${id}`).then(r => r.data),
 };
 
-// Boxes (compute instances). create() kicks off async EC2 provisioning and
-// returns the row at `status: provisioning`; poll list() until it goes
-// `ready`/`failed`. terminate() may return 409 with the live-projects list
-// when the box still has projects — re-send with { confirmed: true }.
+// Boxes (compute instances). create() with kind "ec2" (default) kicks off async
+// EC2 provisioning and returns the row at `status: provisioning`; poll list()
+// until it goes `ready`/`failed`. create() with kind "external" skips AWS and
+// returns the raw token (+ agentWsUrl) once, for a self-managed host that the
+// user runs the agent on themselves. terminate() may return 409 with the
+// live-projects list when the box still has projects — re-send with
+// { confirmed: true }.
 export interface InstanceTerminateConflict {
   error: string;
   projects: Array<{ id: string; name: string }>;
   hint: string;
 }
 
+export interface InstanceCreated {
+  instance: Instance;
+  token?: string;       // present for external (and the legacy no-AWS ec2 path)
+  agentWsUrl?: string;  // present for external — the wss://…/ws/agent URL
+  hint?: string;
+}
+
 export const instancesApi = {
   list: (): Promise<Instance[]> => api.get('/api/instances').then(r => r.data),
   get: (id: string): Promise<Instance> => api.get(`/api/instances/${id}`).then(r => r.data),
-  create: (name: string): Promise<{ instance: Instance; token?: string; hint?: string }> =>
-    api.post('/api/instances', { name }).then(r => r.data),
+  create: (name: string, kind: InstanceKind = 'ec2'): Promise<InstanceCreated> =>
+    api.post('/api/instances', { name, kind }).then(r => r.data),
   terminate: (id: string, confirmed = false) =>
     api.delete(`/api/instances/${id}`, { data: { confirmed } }).then(r => r.data),
 };
