@@ -6,15 +6,62 @@ import { PROVIDER_IDS } from '../providers/registry';
 
 const prisma = new PrismaClient();
 
-// Build allowed user map from env: "email:unixuser,email2:unixuser2"
-function parseAllowedUsers(): Map<string, string> {
-  const map = new Map<string, string>();
+// Domain wildcard rule. `unixUser` null means "derive the unix username from
+// the email's local part" (e.g. jane@launchdarkly.com -> jane).
+interface DomainRule {
+  domain: string; // lowercased, includes leading "@" stripped, e.g. "launchdarkly.com"
+  unixUser: string | null;
+}
+
+export interface AllowedUsers {
+  exact: Map<string, string>;
+  domains: DomainRule[];
+}
+
+// Build allowed users from env. Each comma-separated entry is one of:
+//   email:unixuser              exact mapping (highest priority)
+//   @domain.com                 anyone in domain; unix username = email local part
+//   @domain.com:unixuser        anyone in domain mapped to a fixed unix username
+function parseAllowedUsers(): AllowedUsers {
+  const exact = new Map<string, string>();
+  const domains: DomainRule[] = [];
   const raw = process.env.ALLOWED_USERS ?? '';
-  for (const entry of raw.split(',')) {
-    const [email, unixUser] = entry.trim().split(':');
-    if (email && unixUser) map.set(email.trim(), unixUser.trim());
+  for (const rawEntry of raw.split(',')) {
+    const entry = rawEntry.trim();
+    if (!entry) continue;
+    const [left, right] = entry.split(':');
+    const key = left.trim();
+    const unixUser = right?.trim();
+    if (key.startsWith('@')) {
+      const domain = key.slice(1).toLowerCase();
+      if (domain) domains.push({ domain, unixUser: unixUser || null });
+    } else if (key && unixUser) {
+      exact.set(key, unixUser);
+    }
   }
-  return map;
+  return { exact, domains };
+}
+
+// Resolve the unix username for an email, honoring exact matches first and then
+// domain wildcards. Returns undefined if the email is not allowed.
+export function resolveUnixUsername(
+  allowed: AllowedUsers,
+  email: string
+): string | undefined {
+  if (!email) return undefined;
+  const exact = allowed.exact.get(email);
+  if (exact) return exact;
+
+  const at = email.lastIndexOf('@');
+  if (at <= 0) return undefined;
+  const localPart = email.slice(0, at);
+  const domain = email.slice(at + 1).toLowerCase();
+  for (const rule of allowed.domains) {
+    if (rule.domain === domain) {
+      return rule.unixUser ?? localPart.toLowerCase();
+    }
+  }
+  return undefined;
 }
 
 export function configurePassport(): void {
@@ -32,7 +79,7 @@ export function configurePassport(): void {
       async (_accessToken: string, _refreshToken: string, profile: Profile, done) => {
         try {
           const email = profile.emails?.[0]?.value ?? '';
-          const unixUsername = allowedUsers.get(email);
+          const unixUsername = resolveUnixUsername(allowedUsers, email);
 
           if (!unixUsername) {
             return done(null, false);

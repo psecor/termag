@@ -96,7 +96,7 @@ Key variables:
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth credentials
 - `SESSION_SECRET` — Express session secret
 - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — Slack bot
-- `ALLOWED_USERS` — comma-separated `email:unixuser` pairs
+- `ALLOWED_USERS` — comma-separated allow-list. Each entry is `email:unixuser` (exact mapping), `@domain.com` (anyone in the domain, unix username derived from the email local part), or `@domain.com:unixuser` (anyone in the domain mapped to a fixed unix username). Exact matches take priority over domain wildcards.
 
 ## Agent providers
 
