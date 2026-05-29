@@ -621,6 +621,14 @@ html {
 
 .inline-form button:hover { border-color: var(--accent); }
 
+/* Project-create form: with both a provider and a host (box) dropdown, the
+   single row crams the name input in a narrow sidebar. Wrap instead — the name
+   input takes a full first row, the dropdowns + add button share the second. */
+.project-create-form { flex-wrap: wrap; }
+.project-create-form input { flex: 1 1 100%; }
+.project-create-form .inline-form-select { flex: 1 1 0; width: auto; }
+.project-create-form button { flex: 0 0 auto; }
+
 /* ── Error Banner ───────────────────────────────────────────── */
 .error-banner {
   background: rgba(248, 81, 73, 0.1);

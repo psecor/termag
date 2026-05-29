@@ -531,7 +531,7 @@ export function ProjectControl() {
             });
           })()}
         </ul>
-        <form className="inline-form" onSubmit={createProject}>
+        <form className="inline-form project-create-form" onSubmit={createProject}>
           <input
             value={newProjectName}
             onChange={e => setNewProjectName(e.target.value)}
