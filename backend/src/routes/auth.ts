@@ -3,22 +3,12 @@ import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
+import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 
 const prisma = new PrismaClient();
 
-// Build allowed user map from env: "email:unixuser,email2:unixuser2"
-function parseAllowedUsers(): Map<string, string> {
-  const map = new Map<string, string>();
-  const raw = process.env.ALLOWED_USERS ?? '';
-  for (const entry of raw.split(',')) {
-    const [email, unixUser] = entry.trim().split(':');
-    if (email && unixUser) map.set(email.trim(), unixUser.trim());
-  }
-  return map;
-}
-
 export function configurePassport(): void {
-  const allowedUsers = parseAllowedUsers();
+  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
   const basePath = process.env.BASE_PATH ?? '';
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
 
@@ -32,9 +22,10 @@ export function configurePassport(): void {
       async (_accessToken: string, _refreshToken: string, profile: Profile, done) => {
         try {
           const email = profile.emails?.[0]?.value ?? '';
-          const unixUsername = allowedUsers.get(email);
+          const unixUsername = resolveUnixUsername(allowedUsers, email);
 
           if (!unixUsername) {
+            console.warn(`[auth] rejected sign-in for ${email || '(no email)'}: not in ALLOWED_USERS`);
             return done(null, false);
           }
 
