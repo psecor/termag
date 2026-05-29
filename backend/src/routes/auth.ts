@@ -3,69 +3,12 @@ import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
+import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 
 const prisma = new PrismaClient();
 
-// Domain wildcard rule. `unixUser` null means "derive the unix username from
-// the email's local part" (e.g. jane@launchdarkly.com -> jane).
-interface DomainRule {
-  domain: string; // lowercased, includes leading "@" stripped, e.g. "launchdarkly.com"
-  unixUser: string | null;
-}
-
-export interface AllowedUsers {
-  exact: Map<string, string>;
-  domains: DomainRule[];
-}
-
-// Build allowed users from env. Each comma-separated entry is one of:
-//   email:unixuser              exact mapping (highest priority)
-//   @domain.com                 anyone in domain; unix username = email local part
-//   @domain.com:unixuser        anyone in domain mapped to a fixed unix username
-function parseAllowedUsers(): AllowedUsers {
-  const exact = new Map<string, string>();
-  const domains: DomainRule[] = [];
-  const raw = process.env.ALLOWED_USERS ?? '';
-  for (const rawEntry of raw.split(',')) {
-    const entry = rawEntry.trim();
-    if (!entry) continue;
-    const [left, right] = entry.split(':');
-    const key = left.trim();
-    const unixUser = right?.trim();
-    if (key.startsWith('@')) {
-      const domain = key.slice(1).toLowerCase();
-      if (domain) domains.push({ domain, unixUser: unixUser || null });
-    } else if (key && unixUser) {
-      exact.set(key, unixUser);
-    }
-  }
-  return { exact, domains };
-}
-
-// Resolve the unix username for an email, honoring exact matches first and then
-// domain wildcards. Returns undefined if the email is not allowed.
-export function resolveUnixUsername(
-  allowed: AllowedUsers,
-  email: string
-): string | undefined {
-  if (!email) return undefined;
-  const exact = allowed.exact.get(email);
-  if (exact) return exact;
-
-  const at = email.lastIndexOf('@');
-  if (at <= 0) return undefined;
-  const localPart = email.slice(0, at);
-  const domain = email.slice(at + 1).toLowerCase();
-  for (const rule of allowed.domains) {
-    if (rule.domain === domain) {
-      return rule.unixUser ?? localPart.toLowerCase();
-    }
-  }
-  return undefined;
-}
-
 export function configurePassport(): void {
-  const allowedUsers = parseAllowedUsers();
+  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
   const basePath = process.env.BASE_PATH ?? '';
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
 
@@ -82,6 +25,7 @@ export function configurePassport(): void {
           const unixUsername = resolveUnixUsername(allowedUsers, email);
 
           if (!unixUsername) {
+            console.warn(`[auth] rejected sign-in for ${email || '(no email)'}: not in ALLOWED_USERS`);
             return done(null, false);
           }
 
