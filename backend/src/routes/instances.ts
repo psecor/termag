@@ -12,6 +12,13 @@
  * surfaced the IAM-grant outputs into the secret yet), POST falls back to the
  * legacy manual-terraform path: it returns the raw token so the user can run
  * `terraform apply` themselves.
+ *
+ * External (self-managed) boxes: POST with { kind: "external" } skips AWS
+ * entirely. It creates the Instance row + an instance-bound token and returns
+ * the raw token (once) for the user to drop into agent.config.json on their own
+ * machine (laptop, devbox, anything). Because the token is keyed by instanceId,
+ * the agent gets its own registry slot — so one user can run several machines
+ * at once, unlike a plain per-user token which only ever holds a single slot.
  */
 
 import { Router, RequestHandler } from 'express';
@@ -61,12 +68,19 @@ export function instancesRouter(): Router {
 
   // Create a new box: row + per-instance agent token, atomically.
   // The raw token is returned once.
+  //
+  // body.kind:
+  //   "ec2"      (default) — orchestrator-provisioned EC2 box (or the legacy
+  //                          manual-terraform fallback when AWS isn't wired).
+  //   "external"           — self-managed host; no AWS, token returned for the
+  //                          user to run the agent themselves.
   const create: RequestHandler = async (req, res) => {
-    const { name } = req.body as { name?: string };
+    const { name, kind: rawKind } = req.body as { name?: string; kind?: string };
     if (!name || typeof name !== 'string' || !name.trim()) {
       res.status(400).json({ error: 'name required' });
       return;
     }
+    const kind = rawKind === 'external' ? 'external' : 'ec2';
     const trimmed = name.trim();
 
     // Uniqueness per user. The DB has a unique index but we surface a 409
@@ -88,7 +102,11 @@ export function instancesRouter(): Router {
         data: {
           userId: req.user!.id,
           name: trimmed,
-          status: 'provisioning',
+          kind,
+          // External boxes have no provisioning step — they sit at
+          // "awaiting-agent" until the self-run agent dials in and
+          // registerAgent flips them to "ready".
+          status: kind === 'external' ? 'awaiting-agent' : 'provisioning',
         },
       });
       await tx.agentToken.create({
@@ -102,6 +120,22 @@ export function instancesRouter(): Router {
       });
       return { instance };
     });
+
+    if (kind === 'external') {
+      // Self-managed host: no AWS work. Hand back the raw token (once) plus the
+      // WS URL so the user can fill in agent.config.json on their own machine.
+      const agentWsUrl = process.env.AGENT_WS_URL
+        || `wss://${req.get('host') ?? 'your-orchestrator'}/termag/ws/agent`;
+      res.status(201).json({
+        instance,
+        token: rawToken,
+        tokenPrefix,
+        agentWsUrl,
+        hint: 'Self-managed box. Put this token + termag_url into agent.config.json '
+          + 'on your machine and start the termag agent. Shown once.',
+      });
+      return;
+    }
 
     if (isBoxProvisioningConfigured()) {
       // V2: provision the EC2 ourselves. Fire-and-forget — the box flips to
@@ -174,6 +208,17 @@ export function instancesRouter(): Router {
         data: { status: 'terminated', terminatedAt: new Date() },
       }),
     ]);
+
+    if (instance.kind === 'external') {
+      // Self-managed host: no AWS to tear down. The token is already revoked
+      // above, which disconnects the agent; the user stops it on their machine.
+      res.json({
+        ok: true,
+        archivedProjects: instance.projects.length,
+        hint: 'Token revoked. Stop the termag agent on this machine (it will keep retrying otherwise).',
+      });
+      return;
+    }
 
     if (isBoxProvisioningConfigured()) {
       // Tear down the EC2 + SG + IAM. Fire-and-forget; cleanup is idempotent

@@ -516,6 +516,27 @@ html {
 .box-name { flex: 1; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .box-meta { flex-shrink: 0; color: var(--text-muted); font-size: 10px; }
 .box-empty { color: var(--text-muted); font-size: 11px; padding: 3px 6px; }
+.box-kind-badge {
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  vertical-align: middle;
+}
+.box-self-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.box-self-toggle input { cursor: pointer; }
 
 .token-created {
   background: rgba(63, 185, 80, 0.1);
@@ -537,6 +558,8 @@ html {
   padding: 4px 6px;
   border-radius: 3px;
   word-break: break-all;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
   user-select: all;
 }
 

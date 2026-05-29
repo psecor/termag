@@ -43,11 +43,14 @@ export interface Project {
   role?: 'owner' | 'collaborator';
 }
 
-export type InstanceStatus = 'provisioning' | 'ready' | 'failed' | 'terminated';
+export type InstanceStatus = 'provisioning' | 'awaiting-agent' | 'ready' | 'failed' | 'terminated';
+
+export type InstanceKind = 'ec2' | 'external';
 
 export interface Instance {
   id: string;
   name: string;
+  kind: InstanceKind;
   status: InstanceStatus;
   ec2InstanceId?: string | null;
   region?: string | null;
