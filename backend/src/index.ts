@@ -157,7 +157,29 @@ function sessionBelongsToUser(sessionName: string, unixUsername: string): boolea
 // Status push: track all connected status clients
 const statusClients = new Map<WebSocket, { unixUsername: string; sharedOwnerUsernames: string[] }>();
 
+// Heartbeat every 25s so idle WebSockets stay alive through intermediaries
+// (AWS ALB drops idle conns at 60s; Vite's dev proxy is similarly impatient).
+// Browsers auto-respond to ws.ping() at the protocol level, so no frontend
+// change needed. Mirrors the agent's own ping loop in agent/agent.js.
+const WS_HEARTBEAT_MS = 25_000;
+
+function startHeartbeat(ws: WebSocket): void {
+  let alive = true;
+  ws.on('pong', () => { alive = true; });
+  const hb = setInterval(() => {
+    if (!alive) {
+      try { ws.terminate(); } catch {}
+      return;
+    }
+    alive = false;
+    try { ws.ping(); } catch {}
+  }, WS_HEARTBEAT_MS);
+  ws.once('close', () => clearInterval(hb));
+}
+
 wss.on('connection', (ws, req) => {
+  startHeartbeat(ws);
+
   const url = new URL(req.url ?? '', `http://localhost`);
   const path = url.pathname;
   const loggedInUserId = sessionUserId(req);
