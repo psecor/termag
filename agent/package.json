@@ -1,0 +1,14 @@
+{
+  "name": "termag-agent",
+  "version": "1.0.0",
+  "description": "Per-user agent for termag — handles tmux, PTY, and file operations",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node agent.js",
+    "codex-bridge": "node codex-status-bridge.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.16.0"
+  }
+}

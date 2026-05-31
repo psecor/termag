@@ -1,0 +1,12 @@
+{
+  "name": "termag-relay",
+  "version": "1.0.0",
+  "description": "Local Chrome tab relay for termag — runs on your laptop",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}

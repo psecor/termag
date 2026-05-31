@@ -1,0 +1,50 @@
+#!/bin/bash
+# termag box first-boot wiring. Runs once via cloud-init.
+# Variables expanded by Terraform's templatefile():
+#   termag_url, agent_token, git_user_email, git_user_name
+set -euo pipefail
+
+# Capture everything for post-mortem debugging via SSM.
+exec > >(tee /var/log/termag-cloudinit.log) 2>&1
+echo "=== termag box cloud-init starting at $(date -Iseconds) ==="
+
+# ── Drop the agent's bearer token ─────────────────────────────────────────
+# The existing systemd unit (deploy/termag-agent.service) expects the config
+# at ~termag/src/termag/agent/agent.config.json. agent.config.json is in
+# .gitignore, so it won't fight with the cloned repo.
+CONFIG_DIR=/home/termag/src/termag/agent
+CONFIG_PATH=$CONFIG_DIR/agent.config.json
+
+install -d -o termag -g termag -m 700 "$CONFIG_DIR" 2>/dev/null || true
+
+umask 077
+cat > /tmp/agent.config.json <<'JSON'
+{
+  "termag_url": "${termag_url}",
+  "token": "${agent_token}",
+  "path_remap": {
+    "/home/${remote_unix_user}": "/home/termag"
+  }
+}
+JSON
+install -o termag -g termag -m 600 /tmp/agent.config.json "$CONFIG_PATH"
+rm -f /tmp/agent.config.json
+
+# ── Per-user git identity ─────────────────────────────────────────────────
+sudo -u termag -H git config --global user.email "${git_user_email}"
+sudo -u termag -H git config --global user.name  "${git_user_name}"
+
+# ── Enable + start the agent ──────────────────────────────────────────────
+# termag has linger enabled in the AMI, so the user-manager + /run/user/<uid>
+# already exist by the time cloud-init runs. -i (login shell) ensures
+# XDG_RUNTIME_DIR is set.
+sudo -iu termag systemctl --user daemon-reload
+sudo -iu termag systemctl --user enable --now termag-agent.service
+
+# ── Sanity check ──────────────────────────────────────────────────────────
+# Don't fail the boot if the agent doesn't immediately report connected —
+# initial DNS/WSS dial can take a moment. The systemd unit has Restart=always.
+sleep 2
+sudo -iu termag systemctl --user is-active termag-agent.service || true
+
+echo "=== termag box cloud-init complete at $(date -Iseconds) ==="

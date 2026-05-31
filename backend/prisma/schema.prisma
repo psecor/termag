@@ -1,0 +1,281 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  googleId     String    @unique
+  googleEmail  String    @unique
+  unixUsername String    @unique
+  displayName   String
+  defaultAgentProvider String @default("codex")
+  slackUserId   String?   @unique
+  discordUserId String?   @unique
+  createdAt     DateTime  @default(now())
+
+  projects    Project[]
+  agentTokens AgentToken[]
+  sharedWithMe  ProjectShare[]  @relation("sharedWithMe")
+  sentInvites   ProjectInvite[] @relation("sentInvites")
+  receivedInvites ProjectInvite[] @relation("receivedInvites")
+  visits        ProjectVisit[]
+  warpSamples   WarpSample[]
+  instances     Instance[]
+
+  @@map("users")
+}
+
+model AgentToken {
+  id         String    @id @default(cuid())
+  name       String    // e.g. "macbook", "dev-server", or instance name
+  tokenHash  String    @unique // SHA-256 hash of the token
+  tokenPrefix String   // first 8 chars for display (e.g. "tmag_a1b2...")
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // When the token was minted for a specific Instance (e.g. an AWS box
+  // created via terraform), this links to it. Null for legacy per-user
+  // tokens (legacy per-user agents) where the agent picks the host.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([instanceId])
+  @@map("agent_tokens")
+}
+
+model Project {
+  id             String    @id @default(cuid())
+  name           String
+  description    String?
+  color          String?   // hex color for UI differentiation
+  slackChannelId String?   // Slack channel ID (proj-<name>)
+  archived       Boolean   @default(false)
+  pinned         Boolean   @default(false)
+  lastActiveAt   DateTime  @default(now())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // The box this project lives on. Nullable so existing projects (which
+  // live on the user's legacy agent) work unchanged. New projects
+  // created via the box-CRUD UI will set this at create time.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+
+  workflows   Workflow[]
+  browserTabs BrowserTab[]
+  shares      ProjectShare[]
+  invites     ProjectInvite[]
+  visits      ProjectVisit[]
+
+  @@unique([userId, name])
+  @@index([userId, archived])
+  @@index([instanceId])
+  @@map("projects")
+}
+
+model Workflow {
+  id        String       @id @default(cuid())
+  type      WorkflowType
+  provider  String?
+  server    String       @default("localhost") // future: ssh to other servers
+  createdAt DateTime     @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, type])
+  @@map("workflows")
+}
+
+enum WorkflowType {
+  agent
+  data
+}
+
+// AgentProvider is now a plain String validated at the application layer
+// via PROVIDER_IDS from backend/src/providers/registry.ts.
+// This avoids a DB migration every time a new provider is added.
+
+
+model BrowserTab {
+  id        String   @id @default(cuid())
+  url       String
+  title     String
+  favIcon   String?
+  windowId  Int?     // Chrome window ID from CDP snapshot
+  addedAt   DateTime @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@map("browser_tabs")
+}
+
+// Notification targets — which channels to notify when a tmux session needs input
+// Supports both Slack and Discord; one entry per session+platform pair
+model NotificationTarget {
+  tmuxSession String              // e.g. "alice-foo-agent"
+  platform    String              // "slack" or "discord"
+  channel     String              // platform channel ID
+  userId      String              // platform user ID
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@id([tmuxSession, platform])
+  @@map("notification_targets")
+}
+
+// Working time accumulated from status transitions (working → idle/waiting)
+model WorkTimeEntry {
+  id        String   @id @default(cuid())
+  username  String
+  project   String
+  provider  String
+  date      String   // YYYY-MM-DD
+  totalMs   Int      @default(0)
+  sessions  Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@unique([username, project, provider, date])
+  @@index([username, date])
+  @@map("work_time_entries")
+}
+
+// Project sharing — grants another user access to a project's tmux sessions
+model ProjectShare {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String   // the collaborator (invitee)
+  user      User     @relation("sharedWithMe", fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_shares")
+}
+
+// Pending invitations to share a project
+model ProjectInvite {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  inviterId String
+  inviter   User     @relation("sentInvites", fields: [inviterId], references: [id])
+  inviteeId String
+  invitee   User     @relation("receivedInvites", fields: [inviteeId], references: [id])
+  status    String   @default("pending") // pending | accepted | declined
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, inviteeId])
+  @@map("project_invites")
+}
+
+// Append-only log of project context switches.
+// One row per setActiveProject() call where the project actually changed.
+// Powers switches/day, mean dwell, stdev between switches stats.
+model ProjectVisit {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId         String?
+  project           Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  previousProjectId String?
+  timestamp         DateTime @default(now())
+  sessionTag        String?  // per-browser-tab UUID
+
+  @@index([userId, timestamp])
+  @@index([projectId, timestamp])
+  @@map("project_visits")
+}
+
+// Per-minute rollup of the hyperspace targetWarp value (the synthesized
+// activity score). Frontend posts raw samples every 5s; backend aggregates
+// into per-minute buckets in-memory and flushes here.
+model WarpSample {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bucket      DateTime // truncated to minute (UTC)
+  meanWarp    Float
+  maxWarp     Float
+  p95Warp     Float
+  sampleCount Int
+  activeMs    Int      // ms in this bucket where warp > idle threshold
+
+  @@unique([userId, bucket])
+  @@index([userId, bucket])
+  @@map("warp_samples")
+}
+
+// A per-user compute box (typically an EC2 instance provisioned by the
+// Terraform module in terraform/box/). Hosts the user's tmux sessions and
+// runs the termag agent. Replaces the legacy 1-agent-per-user model with
+// N-agents-per-user, keyed by instance.
+//
+// Non-EC2 hosts (the user's Mac, the orchestrator's own host) can be
+// represented here too with ec2InstanceId = null, but the V1 box-CRUD
+// only creates AWS-backed rows.
+model Instance {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name            String   // user-supplied, e.g. "peter-laptop", "peter-heavy"
+
+  // AWS coordinates. All nullable so the model can describe non-EC2 boxes.
+  // securityGroupId / iamRoleName are the per-box resources boxProvisioner
+  // creates via the SDK; terminateBox uses them to tear everything down.
+  ec2InstanceId   String?  @unique
+  region          String?
+  hostname        String?  // private DNS or private IP; mostly diagnostic
+  securityGroupId String?  // per-box egress-only SG (also gets an ALB ingress rule)
+  iamRoleName     String?  // per-box role (== instance-profile name)
+
+  // Logical status — set by the backend's box-CRUD path. The EC2 instance
+  // has its own state ("running", "stopped", etc.) that we query on demand
+  // rather than caching here.
+  //   provisioning  — SDK launching, EC2 booting, agent not yet seen
+  //   ready         — agent has connected at least once
+  //   failed        — provisioning errored (see provisioningError) or the box
+  //                    never dialed in within the stuck-provisioning window
+  //   terminated    — instance gone (kept for history; cleanup is a sweep)
+  status          String   @default("provisioning")
+  provisioningError String? // populated when status flips to failed
+  createdAt       DateTime @default(now())
+  terminatedAt    DateTime?
+
+  // When the agent on this box was last seen connected to the orchestrator.
+  // Drives future "idle eviction" logic in the pool model.
+  lastConnectedAt DateTime?
+
+  projects     Project[]
+  agentTokens  AgentToken[]
+
+  @@unique([userId, name])
+  @@index([userId, status])
+  @@map("instances")
+}
+
+// Latest Chrome tab snapshot from the local relay, keyed by relay token
+model RelaySnapshot {
+  id          String   @id @default(cuid())
+  relayToken  String   @unique
+  snapshotAt  DateTime @default(now())
+  windows     Json     // array of { windowId, tabs: [{ url, title, favIcon }] }
+
+  @@map("relay_snapshots")
+}

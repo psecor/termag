@@ -1,0 +1,8 @@
+{
+  "_comment_termag_url": "ws://localhost:3040/termag/ws/agent for same-host; wss://your-domain/termag/ws/agent for remote (through reverse proxy)",
+  "termag_url": "wss://your-domain.example.com/termag/ws/agent",
+  "token": "paste-your-agent-token-here",
+  "reconnect_interval_seconds": 5,
+  "_comment_path_remap": "Optional. Rewrite incoming /home/<user>/... paths from the backend. Useful on macOS where home dirs live under /Users/. Example: { \"/home/psecor\": \"/Users/psecor\" }",
+  "path_remap": {}
+}
