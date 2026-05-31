@@ -1,0 +1,33 @@
+title = "termag gitleaks config"
+
+[extend]
+useDefault = true
+
+# Project-specific deny-list. These caught real leaks during the May 2026
+# public/internal split — keeping them in the rules so a future accidental
+# reference is flagged before it lands.
+
+[[rules]]
+id = "termag-ld-domain"
+description = "LaunchDarkly domain reference"
+regex = '''(?i)launchdarkly\.com'''
+tags = ["termag", "internal-ref"]
+
+[[rules]]
+id = "termag-personal-host"
+description = "Personal host (secorp.net) — orchestrator deploy"
+regex = '''(?i)secorp\.net'''
+tags = ["termag", "internal-ref"]
+
+[[rules]]
+id = "termag-ld-collaborators"
+description = "LD-internal collaborator handles"
+regex = '''(?i)(vkorolik|vadman97)'''
+tags = ["termag", "internal-ref"]
+
+[allowlist]
+description = "Files allowed to mention these strings"
+paths = [
+  # The LICENSE has the legitimate MIT copyright notice
+  '''^LICENSE$''',
+]
