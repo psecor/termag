@@ -19,6 +19,7 @@ import { StreamingMessageUpdater } from './streaming';
 import { formatResponse, formatError, formatWelcome, splitMessage } from './formatting';
 import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
+import { ensureMainWorkstream } from '../services/workstreams';
 import {
   sessionName, projectDir, ensureSession, hasSession,
   listSessions as tmuxListSessions, sendKeys,
@@ -365,9 +366,11 @@ export function registerEventHandlers(app: App): void {
           data: { name: projectName, userId: termagUser.id },
         });
 
+        const ws = await ensureMainWorkstream(project.id);
+
         // Add agent workflow + tmux sessions
         await prisma.workflow.create({
-          data: { projectId: project.id, type: 'agent', provider: termagUser.defaultAgentProvider },
+          data: { projectId: project.id, workstreamId: ws.id, type: 'agent', provider: termagUser.defaultAgentProvider },
         });
 
         if (isAgentConnected(termagUser.id)) {

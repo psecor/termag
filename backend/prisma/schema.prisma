@@ -75,15 +75,41 @@ model Project {
   instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
 
   workflows   Workflow[]
+  workstreams Workstream[]
   browserTabs BrowserTab[]
   shares      ProjectShare[]
   invites     ProjectInvite[]
   visits      ProjectVisit[]
 
-  @@unique([userId, name])
+  // Name is unique per (user, box). Two boxes can have a project named "termag"
+  // without collision. Legacy projects (instanceId NULL) treat NULL as distinct
+  // per Postgres semantics; the app enforces single legacy "termag" anyway.
+  @@unique([userId, instanceId, name])
   @@index([userId, archived])
   @@index([instanceId])
   @@map("projects")
+}
+
+// A workstream is a parallel effort inside a project — typically a git worktree
+// on a different branch. Every project has at least one (named "main"). The UI
+// collapses single-workstream projects so the user doesn't see a "main" level
+// they didn't ask for. Workflows (tmux session pairs, etc.) attach to the
+// workstream, not the project, so multi-branch parallel work is straightforward.
+model Workstream {
+  id           String     @id @default(cuid())
+  projectId    String
+  project      Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name         String     // "main" by default
+  branch       String     // git branch this worktree targets
+  archived     Boolean    @default(false)
+  lastActiveAt DateTime   @default(now())
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  workflows    Workflow[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+  @@map("workstreams")
 }
 
 model Workflow {
@@ -93,10 +119,20 @@ model Workflow {
   server    String       @default("localhost") // future: ssh to other servers
   createdAt DateTime     @default(now())
 
+  // projectId is kept during phase 1 for backward compat — phase 2 drops it
+  // and routes everything through workstream → project.
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
+  // The workstream this workflow belongs to. During phase 1 every project has
+  // exactly one workstream named "main", so projectId and workstreamId carry
+  // redundant information.
+  workstreamId String
+  workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+
   @@unique([projectId, type])
+  @@unique([workstreamId, type])
+  @@index([workstreamId])
   @@map("workflows")
 }
 

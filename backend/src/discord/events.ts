@@ -16,6 +16,7 @@ import { setNotificationTarget } from '../slack/lts';
 import { getActiveProjectId, setActiveProjectId } from '../slack/events';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
+import { ensureMainWorkstream } from '../services/workstreams';
 
 const prisma = new PrismaClient();
 
@@ -143,8 +144,10 @@ export function registerDiscordEvents(client: Client): void {
           data: { name: projectName, userId: termagUser.id },
         });
 
+        const ws = await ensureMainWorkstream(project.id);
+
         await prisma.workflow.create({
-          data: { projectId: project.id, type: 'agent', provider: termagUser.defaultAgentProvider },
+          data: { projectId: project.id, workstreamId: ws.id, type: 'agent', provider: termagUser.defaultAgentProvider },
         });
         const agentSession = sessionName(username, projectName, 'agent');
 

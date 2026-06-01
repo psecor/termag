@@ -13,6 +13,7 @@ import { deleteStatus, setStatus, notifyStatusChange } from '../services/status'
 import { createProjectChannel } from '../slack/channels';
 import { rename } from 'fs/promises';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
+import { ensureMainWorkstream } from '../services/workstreams';
 
 const prisma = new PrismaClient();
 
@@ -121,8 +122,9 @@ export function projectsRouter(): Router {
         });
         if (initialAgent?.enabled && !archived.workflows.some(w => w.type === 'agent')) {
           const provider = normalizeProvider(initialAgent.provider, req.user!.defaultAgentProvider);
+          const ws = await ensureMainWorkstream(archived.id);
           await prisma.workflow.create({
-            data: { projectId: archived.id, type: 'agent', provider },
+            data: { projectId: archived.id, workstreamId: ws.id, type: 'agent', provider },
           });
           await ensureAgentSessionsAndLaunch({
             userId: req.user!.id,
@@ -171,12 +173,16 @@ export function projectsRouter(): Router {
           color,
           userId: req.user!.id,
           instanceId: projectInstanceId,
-          workflows: initialAgent?.enabled
-            ? { create: { type: 'agent', provider: provider! } }
-            : undefined,
         },
-        include: { workflows: true },
       });
+
+      const ws = await ensureMainWorkstream(project.id);
+
+      if (initialAgent?.enabled) {
+        await prisma.workflow.create({
+          data: { projectId: project.id, workstreamId: ws.id, type: 'agent', provider: provider! },
+        });
+      }
 
       try {
         if (provider) {
@@ -203,7 +209,13 @@ export function projectsRouter(): Router {
         }
       });
 
-      res.status(201).json(project);
+      // Re-fetch with workflows so the response shape matches the existing
+      // contract (callers expect `workflows: [...]` on a freshly-created project).
+      const projectWithWorkflows = await prisma.project.findUniqueOrThrow({
+        where: { id: project.id },
+        include: { workflows: true },
+      });
+      res.status(201).json(projectWithWorkflows);
     } catch (err: unknown) {
       if ((err as { code?: string }).code === 'P2002') {
         res.status(409).json({ error: 'Project name already exists' });
@@ -292,8 +304,9 @@ export function projectsRouter(): Router {
         ? normalizeProvider(providerInput, req.user!.defaultAgentProvider)
         : null;
 
+      const ws = await ensureMainWorkstream(project.id);
       const workflow = await prisma.workflow.create({
-        data: { projectId: project.id, type, provider },
+        data: { projectId: project.id, workstreamId: ws.id, type, provider },
       });
 
       try {
