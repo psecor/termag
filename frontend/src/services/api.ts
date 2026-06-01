@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, Workstream } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -36,6 +36,26 @@ export const projectsApi = {
     api.post(`/api/projects/${projectId}/workflows`, { type, provider }).then(r => r.data),
   removeWorkflow: (projectId: string, type: WorkflowType) =>
     api.delete(`/api/projects/${projectId}/workflows/${type}`).then(r => r.data),
+};
+
+// Workstreams are returned embedded on Project, so `list` is rarely needed;
+// the create/remove helpers are what the UI actually invokes. DELETE may
+// return a `branchDeleteWarning` string when `git branch -d` was refused
+// (unmerged work) — non-fatal, the worktree is gone either way.
+export interface WorkstreamDeleteResult {
+  ok: true;
+  branchDeleteWarning: string | null;
+}
+
+export const workstreamsApi = {
+  list: (projectId: string): Promise<Workstream[]> =>
+    api.get(`/api/projects/${projectId}/workstreams`).then(r => r.data),
+  create: (projectId: string, data: { name: string; branch?: string; baseRef?: string }): Promise<Workstream> =>
+    api.post(`/api/projects/${projectId}/workstreams`, data).then(r => r.data),
+  remove: (projectId: string, workstreamId: string, force = false): Promise<WorkstreamDeleteResult> =>
+    api.delete(`/api/projects/${projectId}/workstreams/${workstreamId}`, {
+      params: force ? { force: 1 } : undefined,
+    }).then(r => r.data),
 };
 
 

@@ -4,7 +4,7 @@ import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValu
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
-import { projectsApi, agentTokensApi, sharingApi, instancesApi, AgentTokenInfo } from '../services/api';
+import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, AgentTokenInfo } from '../services/api';
 
 function ConfirmDialog({ message, onConfirm, onCancel }: {
   message: string;
@@ -26,7 +26,10 @@ function ConfirmDialog({ message, onConfirm, onCancel }: {
 
 export function ProjectControl() {
   const { user, logout, updateDefaultAgentProvider } = useAuth();
-  const { projects, activeProjectId, statusMap, setActiveProject, reloadProjects } = useProjects();
+  const {
+    projects, activeProjectId, statusMap, setActiveProject, reloadProjects,
+    getActiveWorkstream, setActiveWorkstream,
+  } = useProjects();
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectProvider, setNewProjectProvider] = useState(user?.defaultAgentProvider ?? 'codex');
   const [newProjectInstanceId, setNewProjectInstanceId] = useState<string>('');
@@ -82,6 +85,10 @@ export function ProjectControl() {
   const [shareProjectId, setShareProjectId] = useState<string | null>(null);
   const [shareEmail, setShareEmail] = useState('');
   const [shares, setShares] = useState<ProjectShareInfo[]>([]);
+
+  // Workstreams — branch-off inline form
+  const [branchOffProjectId, setBranchOffProjectId] = useState<string | null>(null);
+  const [newWorkstreamName, setNewWorkstreamName] = useState('');
 
   // Load pending invites on mount
   useEffect(() => {
@@ -302,6 +309,45 @@ export function ProjectControl() {
     await reloadProjects();
   }
 
+  async function createWorkstream(e: React.FormEvent, projectId: string) {
+    e.preventDefault();
+    const name = newWorkstreamName.trim();
+    if (!name) return;
+    try {
+      const ws = await workstreamsApi.create(projectId, { name });
+      setNewWorkstreamName('');
+      setBranchOffProjectId(null);
+      await reloadProjects();
+      // Auto-switch to the freshly-created workstream — branching off without
+      // jumping to the new line feels wrong.
+      setActiveWorkstream(projectId, ws.name);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } }).response?.data?.error;
+      setError(msg ?? 'Failed to create workstream');
+    }
+  }
+
+  function deleteWorkstream(project: Project, ws: { id: string; name: string }) {
+    setConfirmState({
+      message: `Delete workstream "${ws.name}"? Removes the worktree and its branch (refuses on unmerged work).`,
+      onConfirm: async () => {
+        try {
+          const result = await workstreamsApi.remove(project.id, ws.id);
+          if (result.branchDeleteWarning) {
+            setError(`Workstream removed, but branch cleanup warned: ${result.branchDeleteWarning}`);
+          }
+          if (getActiveWorkstream(project.id) === ws.name) {
+            setActiveWorkstream(project.id, 'main');
+          }
+          await reloadProjects();
+        } catch (err: unknown) {
+          const msg = (err as { response?: { data?: { error?: string } } }).response?.data?.error;
+          setError(msg ?? 'Failed to delete workstream');
+        }
+      },
+    });
+  }
+
   async function createBox(e: React.FormEvent) {
     e.preventDefault();
     if (!newBoxName.trim()) return;
@@ -461,6 +507,13 @@ export function ProjectControl() {
                   <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
                     {sharedProjectIds.has(p.id) ? '● Sharing' : 'Share'}
                   </button>
+                  <button onClick={() => {
+                    setBranchOffProjectId(branchOffProjectId === p.id ? null : p.id);
+                    setNewWorkstreamName('');
+                    setMenuOpenId(null);
+                  }}>
+                    Branch off…
+                  </button>
                   <button className="menu-danger" onClick={() => { archiveProject(p); setMenuOpenId(null); }}>
                     Archive
                   </button>
@@ -527,7 +580,56 @@ export function ProjectControl() {
             return list.map((item) => {
               if (item === 'divider') return <li key="__divider" className="project-list-divider" />;
               const p = item;
-              return renderProjectItem(p);
+              const branchingOff = branchOffProjectId === p.id;
+              const showWorkstreams = p.workstreams.length > 1;
+              const activeWs = getActiveWorkstream(p.id);
+              return (
+                <React.Fragment key={p.id}>
+                  {renderProjectItem(p)}
+                  {branchingOff && (
+                    <li className="project-workstream-branch-off">
+                      <form
+                        className="inline-form"
+                        onSubmit={e => createWorkstream(e, p.id)}
+                        onClick={e => e.stopPropagation()}
+                      >
+                        <input
+                          autoFocus
+                          value={newWorkstreamName}
+                          onChange={e => setNewWorkstreamName(e.target.value)}
+                          placeholder="workstream name (also branch)"
+                        />
+                        <button type="submit" title="Branch off">+</button>
+                        <button
+                          type="button"
+                          className="btn-tiny"
+                          onClick={() => { setBranchOffProjectId(null); setNewWorkstreamName(''); }}
+                        >×</button>
+                      </form>
+                    </li>
+                  )}
+                  {showWorkstreams && p.workstreams.map(ws => (
+                    <li
+                      key={ws.id}
+                      className={`project-workstream-item ${activeWs === ws.name ? 'active' : ''}`}
+                      onClick={() => { setActiveProject(p.id); setActiveWorkstream(p.id, ws.name); }}
+                      title={`branch: ${ws.branch}`}
+                    >
+                      <span className="workstream-marker">↳</span>
+                      <span className="workstream-name">{ws.name}</span>
+                      {ws.name !== 'main' && p.role !== 'collaborator' && (
+                        <span className="project-actions" onClick={e => e.stopPropagation()}>
+                          <button
+                            className="btn-tiny btn-danger"
+                            onClick={() => deleteWorkstream(p, ws)}
+                            title="Delete workstream"
+                          >×</button>
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </React.Fragment>
+              );
             });
           })()}
         </ul>

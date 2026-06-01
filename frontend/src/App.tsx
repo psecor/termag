@@ -10,6 +10,7 @@ import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
 import { Project } from './types';
 import { computeWarpWithFallback } from './utils/warp';
+import { sessionName as buildSessionName } from './utils/sessionName';
 import { activityApi, warpApi } from './services/api';
 
 function Login() {
@@ -47,12 +48,19 @@ function useIsNarrow(defaultBreakpoint = 1600) {
 
 function MainLayout() {
   const { user } = useAuthHook();
-  const { projects, activeProjectId, statusMap } = useProjects();
+  const { projects, activeProjectId, statusMap, getActiveWorkstream } = useProjects();
 
   const activeProject = projects.find(p => p.id === activeProjectId);
   const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
   const username = user?.unixUsername ?? '';
   const sessionOwner = activeProject?.ownerUsername ?? username;
+  const activeWorkstream = activeProject ? getActiveWorkstream(activeProject.id) : 'main';
+  const agentSession = activeProject
+    ? buildSessionName(sessionOwner, activeProject.name, 'agent', activeWorkstream)
+    : '';
+  const ctrlSession = activeProject
+    ? buildSessionName(sessionOwner, activeProject.name, 'ctrl', activeWorkstream)
+    : '';
 
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
@@ -159,9 +167,12 @@ function MainLayout() {
       </div>
       <div className="app-terminals">
         <div className="app-project-bar">
-          {activeProject ? activeProject.name : '—'}
+          {activeProject ? (
+            activeWorkstream === 'main'
+              ? activeProject.name
+              : <>{activeProject.name} <span className="workstream-bar-badge">{activeWorkstream}</span></>
+          ) : '—'}
           {activeProject && (() => {
-            const agentSession = `${sessionOwner}-${activeProject.name}-agent`;
             const st = statusMap[agentSession];
             if (st?.rateLimited) {
               return (
@@ -198,11 +209,11 @@ function MainLayout() {
             <div className="app-agent" id="terminal-agent">
               {activeProject && hasAgent ? (
                 <Terminal
-                  sessionName={`${sessionOwner}-${activeProject.name}-agent`}
+                  sessionName={agentSession}
                   active={true}
                   autoFocus={!isNarrow || activePane === 'agent'}
                   onActivity={onActivity}
-                  key={`${activeProject.id}-agent${isNarrow ? `-${activePane}` : ''}`}
+                  key={`${activeProject.id}-${activeWorkstream}-agent${isNarrow ? `-${activePane}` : ''}`}
                 />
               ) : (
                 <div className="empty-pane">
@@ -215,11 +226,11 @@ function MainLayout() {
             <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
               {activeProject && hasAgent ? (
                 <Terminal
-                  sessionName={`${sessionOwner}-${activeProject.name}-ctrl`}
+                  sessionName={ctrlSession}
                   active={true}
                   autoFocus={isNarrow && activePane === 'ctrl'}
                   onActivity={onActivity}
-                  key={`${activeProject.id}-ctrl${isNarrow ? `-${activePane}` : ''}`}
+                  key={`${activeProject.id}-${activeWorkstream}-ctrl${isNarrow ? `-${activePane}` : ''}`}
                 />
               ) : (
                 <div className="empty-pane">

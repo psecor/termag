@@ -416,6 +416,51 @@ html {
   min-width: 0;
 }
 
+/* ── Workstreams ───────────────────────────────────────────── */
+.project-workstream-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px 2px 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.project-workstream-item:hover  { background: var(--bg-elevated); }
+.project-workstream-item.active {
+  background: var(--bg-active);
+  border-color: var(--border);
+  color: var(--text-primary);
+}
+.workstream-marker {
+  opacity: 0.6;
+  font-size: 10px;
+}
+.workstream-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-workstream-branch-off {
+  list-style: none;
+  padding: 2px 6px 2px 22px;
+}
+
+.workstream-bar-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 11px;
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  vertical-align: 1px;
+}
+
 /* ── Agent Token Management ────────────────────────────────── */
 .clickable-header { cursor: pointer; user-select: none; }
 .clickable-header:hover { color: var(--text-secondary); }

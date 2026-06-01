@@ -11,6 +11,9 @@ interface ProjectContextValue {
   statusMap: StatusMap;
   setActiveProject: (id: string | null) => void;
   reloadProjects: () => Promise<void>;
+  // Returns the active workstream name for a project (defaults to 'main').
+  getActiveWorkstream: (projectId: string) => string;
+  setActiveWorkstream: (projectId: string, workstreamName: string) => void;
 }
 
 const ProjectContext = createContext<ProjectContextValue>({
@@ -19,6 +22,8 @@ const ProjectContext = createContext<ProjectContextValue>({
   statusMap: {},
   setActiveProject: () => {},
   reloadProjects: async () => {},
+  getActiveWorkstream: () => 'main',
+  setActiveWorkstream: () => {},
 });
 
 export function ProjectProvider({ children }: { children: ReactNode }) {
@@ -56,9 +61,35 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     setActiveProjectId(id);
   }, [sessionTag]);
 
+  // Active workstream is keyed by projectId; defaults to 'main' when unset.
+  // We don't persist this across reloads — switching back to 'main' on a
+  // page refresh is the right default for "I just opened the app."
+  const [activeWorkstreamMap, setActiveWorkstreamMap] = useState<Record<string, string>>({});
+
+  const getActiveWorkstream = useCallback((projectId: string): string => {
+    return activeWorkstreamMap[projectId] ?? 'main';
+  }, [activeWorkstreamMap]);
+
+  const setActiveWorkstream = useCallback((projectId: string, workstreamName: string) => {
+    setActiveWorkstreamMap(m => ({ ...m, [projectId]: workstreamName }));
+  }, []);
+
   const reloadProjects = useCallback(async () => {
     const data = await projectsApi.list();
     setProjects(data);
+    // Drop stale active-workstream entries for projects whose current
+    // workstream list no longer contains the selected name. Prevents the
+    // UI from chasing a session that just got deleted out from under it.
+    setActiveWorkstreamMap(m => {
+      const next: Record<string, string> = {};
+      for (const p of data) {
+        const wanted = m[p.id];
+        if (wanted && p.workstreams.some(w => w.name === wanted)) {
+          next[p.id] = wanted;
+        }
+      }
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -125,7 +156,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [user]);
 
   return (
-    <ProjectContext.Provider value={{ projects, activeProjectId, statusMap, setActiveProject, reloadProjects }}>
+    <ProjectContext.Provider value={{
+      projects, activeProjectId, statusMap, setActiveProject, reloadProjects,
+      getActiveWorkstream, setActiveWorkstream,
+    }}>
       {children}
     </ProjectContext.Provider>
   );
