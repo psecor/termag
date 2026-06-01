@@ -53,12 +53,6 @@ variable "region" {
   default = "us-east-1"
 }
 
-variable "ami_id" {
-  type        = string
-  description = "AMI built by packer (see packer/README.md). Required."
-  default     = ""
-}
-
 variable "instance_type" {
   type        = string
   description = "Default is Graviton arm64; the AMI is arm64-only"

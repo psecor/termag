@@ -1,3 +1,26 @@
+// Auto-discover the latest termag-box AMI by tag — same filter the
+// orchestrator's boxProvisioner.ts uses, so both methods resolve to the
+// same image.
+data "aws_ami" "termag_box" {
+  most_recent = true
+  owners      = ["self"]
+
+  filter {
+    name   = "tag:App"
+    values = ["termag"]
+  }
+
+  filter {
+    name   = "tag:Component"
+    values = ["box"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
 // Egress-only security group. No inbound rules — termag boxes have no
 // network services. Access happens via SSM (outbound HTTPS to AWS).
 resource "aws_security_group" "box" {
@@ -23,7 +46,7 @@ resource "aws_security_group" "box" {
 }
 
 resource "aws_instance" "box" {
-  ami           = var.ami_id
+  ami           = data.aws_ami.termag_box.id
   instance_type = var.instance_type
   subnet_id     = var.subnet_id
 

@@ -22,8 +22,10 @@ directly via `terraform apply` for manual smoke tests.
 | `git_user_email` | `git config user.email` for the termag user |
 | `git_user_name` | `git config user.name` for the termag user |
 
-Other variables (AMI, VPC, subnet, instance type, etc.) have sensible
-defaults baked from our environment investigation — see `variables.tf`.
+The AMI is auto-discovered by tag (`App=termag, Component=box`, owned by
+self, newest), matching how the orchestrator's box provisioner resolves
+it — so both paths use the same image. Other variables (VPC, subnet,
+instance type, etc.) have sensible defaults — see `variables.tf`.
 
 ## Usage
 
