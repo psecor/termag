@@ -46,6 +46,8 @@ interface AgentRuntimeContext {
   provider: string;
   /** The project's instanceId, or null if it lives on the user's legacy agent. */
   instanceId: string | null;
+  /** Workstream name — 'main' for single-workstream projects (the default). */
+  workstream: string;
 }
 
 export async function ensureAgentSessionsAndLaunch({
@@ -54,13 +56,14 @@ export async function ensureAgentSessionsAndLaunch({
   projectName,
   provider,
   instanceId,
+  workstream,
 }: AgentRuntimeContext): Promise<void> {
   const config = PROVIDERS[provider];
   if (!config) throw new Error(`Unknown provider: ${provider}`);
 
-  const projDir = tmux.projectDir(unixUsername, projectName);
-  const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
-  const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
+  const projDir = tmux.projectDir(unixUsername, projectName, workstream);
+  const mainSession = tmux.sessionName(unixUsername, projectName, 'agent', workstream);
+  const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl', workstream);
   const project = { userId, instanceId };
 
   if (isProjectAgentConnected(project)) {
@@ -103,7 +106,12 @@ export async function ensureAgentSessionsAndLaunch({
     throw new Error('Box agent not connected; cannot launch sessions');
   }
 
-  await tmux.ensureProjectDir(unixUsername, projectName);
+  // Legacy local-orchestrator path: only meaningful for the main workstream.
+  // Non-main workstreams are git worktrees layered over an existing repo and
+  // are managed by the CRUD route, not seeded here.
+  if (workstream === 'main') {
+    await tmux.ensureProjectDir(unixUsername, projectName);
+  }
   const mainCreated = await tmux.ensureSession(mainSession, projDir);
   await tmux.ensureSession(ctrlSession, projDir);
 
@@ -156,7 +164,7 @@ async function reconstructAgentSessions(
 ): Promise<void> {
   const projects = await prisma.project.findMany({
     where: { userId, archived: false, instanceId },
-    include: { workflows: true },
+    include: { workflows: { include: { workstream: true } } },
   });
 
   if (projects.length === 0) return;
@@ -170,10 +178,11 @@ async function reconstructAgentSessions(
     const projectHost = { userId, instanceId };
 
     for (const wf of project.workflows) {
+      const wsName = wf.workstream.name;
       try {
         if (wf.type === 'agent') {
           const provider = resolveAgentProvider(wf.provider, defaultProvider);
-          const mainSession = tmux.sessionName(unixUsername, project.name, 'agent');
+          const mainSession = tmux.sessionName(unixUsername, project.name, 'agent', wsName);
 
           const probe = await probeAgentSession(projectHost, mainSession);
           if (probe === 'running') {
@@ -193,8 +202,8 @@ async function reconstructAgentSessions(
             launchCmd = 'claude --continue';
           }
 
-          const projDir = tmux.projectDir(unixUsername, project.name);
-          const ctrlSession = tmux.sessionName(unixUsername, project.name, 'ctrl');
+          const projDir = tmux.projectDir(unixUsername, project.name, wsName);
+          const ctrlSession = tmux.sessionName(unixUsername, project.name, 'ctrl', wsName);
 
           await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
           await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
@@ -214,9 +223,9 @@ async function reconstructAgentSessions(
           launched++;
         } else {
           // Data workflow — just ensure sessions exist
-          const mainSession = tmux.sessionName(unixUsername, project.name, 'data');
-          const ctrlSession = tmux.sessionName(unixUsername, project.name, 'data-ctrl');
-          const projDir = tmux.projectDir(unixUsername, project.name);
+          const mainSession = tmux.sessionName(unixUsername, project.name, 'data', wsName);
+          const ctrlSession = tmux.sessionName(unixUsername, project.name, 'data-ctrl', wsName);
+          const projDir = tmux.projectDir(unixUsername, project.name, wsName);
 
           await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
           await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
@@ -237,10 +246,11 @@ export async function stopAgentSessions({
   projectName,
   provider,
   instanceId,
+  workstream,
 }: AgentRuntimeContext): Promise<void> {
   const config = PROVIDERS[provider];
-  const mainSession = tmux.sessionName(unixUsername, projectName, 'agent');
-  const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl');
+  const mainSession = tmux.sessionName(unixUsername, projectName, 'agent', workstream);
+  const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl', workstream);
   const project = { userId, instanceId };
 
   if (config?.needsPoller) {

@@ -382,6 +382,7 @@ export function registerEventHandlers(app: App): void {
             // Slack/Discord-created projects always use the legacy per-user
             // agent — there's no chat affordance to pick a box.
             instanceId: null,
+            workstream: ws.name,
           });
         } else {
           await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created but agent is not connected — tmux sessions not started.` });

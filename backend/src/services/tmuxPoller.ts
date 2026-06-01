@@ -330,12 +330,12 @@ export async function startTmuxPoller(): Promise<void> {
 
   const workflows = await prisma.workflow.findMany({
     where: { type: 'agent', provider: { in: pollerIds } },
-    include: { project: { include: { user: true } } },
+    include: { project: { include: { user: true } }, workstream: true },
   });
 
   for (const wf of workflows) {
     if (!wf.project.archived && wf.provider) {
-      const session = sessionName(wf.project.user.unixUsername, wf.project.name, 'agent');
+      const session = sessionName(wf.project.user.unixUsername, wf.project.name, 'agent', wf.workstream.name);
       registerPollerSession(session, wf.provider);
     }
   }

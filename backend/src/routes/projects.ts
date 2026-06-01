@@ -132,6 +132,7 @@ export function projectsRouter(): Router {
             projectName: name,
             provider,
             instanceId: projectInstanceId,
+            workstream: ws.name,
           });
         }
 
@@ -192,6 +193,7 @@ export function projectsRouter(): Router {
             projectName: name,
             provider,
             instanceId: projectInstanceId,
+            workstream: ws.name,
           });
         }
       } catch (err) {
@@ -245,7 +247,7 @@ export function projectsRouter(): Router {
     try {
       const project = await prisma.project.findFirst({
         where: { id: req.params.id, userId: req.user!.id },
-        include: { workflows: true },
+        include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Not found' }); return; }
 
@@ -253,6 +255,7 @@ export function projectsRouter(): Router {
 
       // Kill all tmux sessions for this project — via the project's agent.
       for (const wf of project.workflows) {
+        const wsName = wf.workstream.name;
         if (wf.type === 'agent') {
           await stopAgentSessions({
             userId: req.user!.id,
@@ -260,10 +263,11 @@ export function projectsRouter(): Router {
             projectName: project.name,
             provider: resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider),
             instanceId: project.instanceId,
+            workstream: wsName,
           });
         } else {
-          await tmux.killSession(tmux.sessionName(username, project.name, 'data'));
-          await tmux.killSession(tmux.sessionName(username, project.name, 'data-ctrl'));
+          await tmux.killSession(tmux.sessionName(username, project.name, 'data', wsName));
+          await tmux.killSession(tmux.sessionName(username, project.name, 'data-ctrl', wsName));
         }
       }
 
@@ -317,11 +321,12 @@ export function projectsRouter(): Router {
             projectName: project.name,
             provider: provider!,
             instanceId: project.instanceId,
+            workstream: ws.name,
           });
         } else {
-          const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data');
-          const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl');
-          const projDir = tmux.projectDir(req.user!.unixUsername, project.name);
+          const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data', ws.name);
+          const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl', ws.name);
+          const projDir = tmux.projectDir(req.user!.unixUsername, project.name, ws.name);
           const projectHost = { userId: req.user!.id, instanceId: project.instanceId };
 
           if (isProjectAgentConnected(projectHost)) {
@@ -355,11 +360,12 @@ export function projectsRouter(): Router {
       const type = req.params.type as WorkflowType;
       const project = await prisma.project.findFirst({
         where: { id: req.params.id, userId: req.user!.id },
-        include: { workflows: true },
+        include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
       const workflow = project.workflows.find(w => w.type === type);
       const provider = normalizeProvider(workflow?.provider, req.user!.defaultAgentProvider);
+      const wsName = workflow?.workstream.name ?? 'main';
 
       await prisma.workflow.deleteMany({ where: { projectId: project.id, type } });
 
@@ -370,10 +376,11 @@ export function projectsRouter(): Router {
           projectName: project.name,
           provider,
           instanceId: project.instanceId,
+          workstream: wsName,
         });
       } else {
-        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data'));
-        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl'));
+        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data', wsName));
+        await tmux.killSession(tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl', wsName));
       }
 
       res.json({ ok: true });
@@ -394,7 +401,7 @@ export function projectsRouter(): Router {
 
       const project = await prisma.project.findFirst({
         where: { id: req.params.id, userId: req.user!.id },
-        include: { workflows: true },
+        include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Not found' }); return; }
 
@@ -403,21 +410,22 @@ export function projectsRouter(): Router {
 
       const username = req.user!.unixUsername;
       const projectHost = { userId: req.user!.id, instanceId: project.instanceId };
-      const providerRestarts: Array<{ projectName: string; provider: string }> = [];
+      const providerRestarts: Array<{ projectName: string; provider: string; workstream: string }> = [];
 
       // Rename tmux sessions
       for (const wf of project.workflows) {
+        const wsName = wf.workstream.name;
         const roles: Array<'agent' | 'ctrl' | 'data' | 'data-ctrl'> = wf.type === 'agent'
           ? ['agent', 'ctrl'] : ['data', 'data-ctrl'];
         const provider = resolveAgentProvider(wf.provider, req.user!.defaultAgentProvider);
         if (wf.type === 'agent' && provider === 'codex' && isProjectAgentConnected(projectHost)) {
           await sendForProject(projectHost, 'codex-session-stop', {
-            sessionName: tmux.sessionName(username, oldName, 'agent'),
+            sessionName: tmux.sessionName(username, oldName, 'agent', wsName),
           }).catch(() => {});
         }
         for (const role of roles) {
-          const oldSession = tmux.sessionName(username, oldName, role);
-          const newSession = tmux.sessionName(username, newName, role);
+          const oldSession = tmux.sessionName(username, oldName, role, wsName);
+          const newSession = tmux.sessionName(username, newName, role, wsName);
           try {
             await tmux.renameSession(oldSession, newSession);
           } catch { /* session may not exist */ }
@@ -430,6 +438,7 @@ export function projectsRouter(): Router {
           providerRestarts.push({
             projectName: newName,
             provider,
+            workstream: wsName,
           });
         }
       }
@@ -459,6 +468,7 @@ export function projectsRouter(): Router {
             projectName: restart.projectName,
             provider: restart.provider,
             instanceId: project.instanceId,
+            workstream: restart.workstream,
           }).catch(() => {});
         }
       }

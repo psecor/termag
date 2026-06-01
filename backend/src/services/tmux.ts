@@ -7,9 +7,21 @@ import { ALL_PROCESS_NAMES } from '../providers/registry';
 
 const execAsync = promisify(exec);
 
-// Project directory: /home/<username>/termag/projects/<project>/
-export function projectDir(username: string, projectName: string): string {
-  return `/home/${username}/termag/projects/${projectName}`;
+// Working directory for a project's workstream.
+//   main:  /home/<username>/termag/projects/<project>/
+//   other: /home/<username>/termag/projects/<project>/.worktrees/<workstream>/
+//
+// The main workstream lives at the project root (it's the canonical git repo);
+// other workstreams are `git worktree add`-ed siblings under `.worktrees/`.
+// Path stays unchanged for the `main` default so existing single-workstream
+// callsites need no migration.
+export function projectDir(
+  username: string,
+  projectName: string,
+  workstream: string = 'main',
+): string {
+  const root = `/home/${username}/termag/projects/${projectName}`;
+  return workstream === 'main' ? root : `${root}/.worktrees/${workstream}`;
 }
 
 export async function ensureProjectDir(username: string, projectName: string): Promise<string> {
@@ -59,8 +71,22 @@ async function initWikiFiles(dir: string, slug: string, username: string): Promi
   }
 }
 
-export function sessionName(username: string, project: string, role: 'agent' | 'ctrl' | 'data' | 'data-ctrl'): string {
-  return `${username}-${project}-${role}`;
+// tmux session name for a project's workstream role.
+//   main:  <user>-<project>-<role>
+//   other: <user>-<project>-<workstream>-<role>
+//
+// `main` is collapsed to preserve historical names for single-workstream
+// projects; only when a project has additional workstreams do their session
+// names carry the extra segment.
+export function sessionName(
+  username: string,
+  project: string,
+  role: 'agent' | 'ctrl' | 'data' | 'data-ctrl',
+  workstream: string = 'main',
+): string {
+  return workstream === 'main'
+    ? `${username}-${project}-${role}`
+    : `${username}-${project}-${workstream}-${role}`;
 }
 
 export async function hasSession(name: string): Promise<boolean> {
