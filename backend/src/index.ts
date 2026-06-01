@@ -20,6 +20,7 @@ import { sharingRouter } from './routes/sharing';
 import { visitsRouter } from './routes/visits';
 import { warpRouter } from './routes/warp';
 import { instancesRouter } from './routes/instances';
+import { workstreamsRouter } from './routes/workstreams';
 import { startProvisioningSweep } from './services/boxProvisioner';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
@@ -110,6 +111,7 @@ app.use(`${BASE_PATH}/api`, sharingRouter());
 app.use(`${BASE_PATH}/api/visits`, visitsRouter());
 app.use(`${BASE_PATH}/api/warp`, warpRouter());
 app.use(`${BASE_PATH}/api/instances`, instancesRouter());
+app.use(`${BASE_PATH}/api`, workstreamsRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: 'ok' });

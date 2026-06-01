@@ -797,6 +797,43 @@ function connect() {
           break;
         }
 
+        case 'git-worktree-add': {
+          // Create a git worktree at <projectDir>/.worktrees/<worktreeName>,
+          // checked out on a new branch <branch> based at <baseRef> (defaults
+          // to HEAD). The worktree lives inside the main project dir so it
+          // travels along on rename and stays grouped with its parent.
+          const projectDir = remapPath(msg.projectDir);
+          const { worktreeName, branch, baseRef } = msg;
+          if (!projectDir || !worktreeName || !branch) {
+            throw new Error('projectDir, worktreeName, and branch are required');
+          }
+          const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
+          const ref = baseRef || 'HEAD';
+          await execAsync(
+            `git -C ${shellEscape(projectDir)} worktree add -b ${shellEscape(branch)} ${shellEscape(worktreePath)} ${shellEscape(ref)}`
+          );
+          respond(ws, requestId, { ok: true, path: worktreePath });
+          break;
+        }
+
+        case 'git-worktree-remove': {
+          // Remove the worktree at <projectDir>/.worktrees/<worktreeName>.
+          // Without `force`, git refuses if the worktree is dirty or holds
+          // unmerged changes — surface the error so the caller can prompt.
+          const projectDir = remapPath(msg.projectDir);
+          const { worktreeName, force } = msg;
+          if (!projectDir || !worktreeName) {
+            throw new Error('projectDir and worktreeName are required');
+          }
+          const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
+          const forceFlag = force ? ' --force' : '';
+          await execAsync(
+            `git -C ${shellEscape(projectDir)} worktree remove${forceFlag} ${shellEscape(worktreePath)}`
+          );
+          respond(ws, requestId, { ok: true });
+          break;
+        }
+
         case 'codex-session-start': {
           const { sessionName } = msg;
           const cwd = remapPath(msg.cwd);
