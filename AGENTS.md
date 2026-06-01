@@ -1,8 +1,8 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking both agent working time and human activity (with 7d/30d human-activity charts in the usage overlay), and a pinned/recent-activity-sorted project list with a per-tile overflow menu."
-last_updated: 2026-05-10
+status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe, Devin), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking agent working time and human activity, pinned/recent-activity-sorted project list, on-demand EC2 box provisioning via Packer AMI + Terraform module ("Add box" button) with projects routed by `Instance`, per-project git-worktree workstreams (every project starts with `main`), and visit/flow-speed telemetry (ProjectVisit + WarpSample) surfaced in the usage overlay."
+last_updated: 2026-06-01
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -20,21 +20,25 @@ Auth is Google OAuth with an `ALLOWED_USERS` allowlist mapping `email:unixuser`.
 
 ## Status
 
-Production-ready. Provider registry covers Codex, Claude, and Mistral (vibe); per-project working-time and human-activity tracking feed a two-tube thermometer UI; project sharing lets owners invite collaborators with terminal access; new projects get seeded `AGENTS.md` and `CLAUDE.md`.
+Production-ready. Provider registry covers Codex, Claude, Mistral (vibe), and Devin; per-project working-time and human-activity tracking feed a two-tube thermometer UI; project sharing lets owners invite collaborators with terminal access; new projects get seeded `AGENTS.md` and `CLAUDE.md`. The orchestrator can now provision additional EC2 "boxes" on demand (Packer-baked AMI + Terraform module, surfaced as an "Add box" button) and route projects to a specific `Instance` via `Project.instanceId`. Every project carries a `main` workstream backed by a git worktree, with CRUD routes for additional workstreams. Visit + flow-speed telemetry (`ProjectVisit` for context switches, `WarpSample` for per-minute hyperspace-speed rollups) feeds new sections in the UsageMini overlay.
 
 ## Domain Model
 
-- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub. Projects also carry a `pinned` flag and a `lastActiveAt` timestamp that drive the project list ordering: pinned projects float to the top, then the rest sort by recent activity. Pin/unpin and other per-project actions live in an overflow menu on each project tile.
-- **Paired tmux sessions** — `<unixuser>-<project>-agent` (where the AI runs) and `<unixuser>-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket.
-- **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
-- **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean.
+- **Project** — an addressable workspace. Has a name, a working directory, an `agent` workflow (the paired tmux sessions), persisted `agentProvider` (string id resolved through the provider registry), and a Slack channel `#proj-<name>` auto-created on creation. New projects are seeded with `AGENTS.md` (from the agent-wiki initial template) and a `CLAUDE.md` stub. Projects also carry a `pinned` flag and a `lastActiveAt` timestamp that drive the project list ordering: pinned projects float to the top, then the rest sort by recent activity. Pin/unpin and other per-project actions live in an overflow menu on each project tile. Each project is bound to an `Instance` (box) via `Project.instanceId`; routing decisions key off that field.
+- **Paired tmux sessions** — `<unixuser>-<project>-agent` (where the AI runs) and `<unixuser>-<project>-ctrl` (regular shell). The web UI streams both via PTY + WebSocket. Tmux helpers and the agent runtime are workstream-aware: every project gets a `main` workstream, and additional workstreams are realized as git worktrees with their own paired tmux sessions.
+- **Workstream** — a named parallel line of work inside a project, backed by a git worktree. Phase-1 invariant: every project has a `main` workstream auto-created on project creation; additional workstreams are managed through `backend/src/routes/workstreams.ts` and corresponding agent RPCs in `backend/src/services/workstreams.ts`. The tmux session naming threads the workstream id through so two workstreams on the same project don't collide.
+- **Instance ("box")** — a termag-running host. The orchestrator can provision additional boxes on AWS via the Packer AMI (`packer/`) + Terraform module (`terraform/box/`), triggered from the UI's "Add box" button. `Project.instanceId` and `AgentToken.instanceId` key off the `Instance` model so projects and per-user agent tokens are dual-keyed by host. Provisioning lives in `backend/src/services/boxProvisioner.ts`; orchestration design notes are in `docs/box-provisioning.md`.
+- **Provider registry** — `backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts` define the set of supported agent providers (codex, claude, mistral/vibe, devin, …) and their metadata: display name, launch command shape, status normalization rules, **tmux poller config** (idle/working detection patterns per provider, since e.g. vibe has a persistent input box that breaks naive polling), **usage scanner source** (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`), and UI affordances. `agentProvider` is a free-form string keyed into the registry rather than a Prisma enum, so adding a provider is a code change in two registry files (no migration). Each user also has a saved `defaultAgentProvider` for the create-project form.
+- **Per-user agent process** — `agent/agent.js` runs as the unix user (via systemd user service + lingering). It owns tmux attach, node-pty, filesystem ops, and Codex-bridge lifecycle. The main server at `:3040` is one process; each user has their own agent talking to it via WebSocket with a bearer token. This separation keeps unix permissions clean. The agent now uses heartbeat-driven dead-connection detection and accepts a config path override via `argv[2]`.
 - **Status events** — Claude Code hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`) and Codex app-server status updates POST to `:3040/termag/api/status`. For providers without a hook surface (vibe), the **tmux poller** in `backend/src/services/tmuxPoller.ts` samples pane content and infers state using provider-specific patterns. Status drives the green/yellow/red indicators, the project-list transition flash (15s, color-coded green/yellow/red by transition type — e.g. idle→working green, working→waiting yellow, anything→idle red), and the "hyperspace" animation that speeds up with activity. The `Notification` hook distinguishes `idle_prompt` (idle) from other notifications (waiting). Status events also bump `Project.lastActiveAt`, which feeds the recent-activity sort.
 - **Context-token warnings** — the per-user agent scrapes provider-specific "context remaining" strings out of the agent pane and forwards them through the status pipeline as a separate signal alongside working/waiting/idle. The UI surfaces this on the project tile and inside the terminal chrome so a session that's about to run out of context gets a visible warning before it hard-fails.
 - **Rate-limit detection** — same shape as context-token warnings: the per-user agent (`agent/agent.js`) watches the agent pane for provider-specific rate-limit / quota-exhausted messages and forwards a `rateLimited` signal through the status pipeline. The backend persists it on the project's status record and the UI surfaces it on the project tile and in `ProjectControl` so a stuck session is visually distinguishable from a merely-idle one.
 - **Working-time tracking** — derived from status transitions: time spent in `working` state is rolled up per-project for the usage dashboard. Provider-specific poller sources ensure correct attribution. Served from `/termag/api/worktime`.
 - **Human activity tracking** — `backend/src/services/humanActivity.ts` tracks human keystrokes/interactions per project, separate from agent working time. Powers the second tube of the two-tube thermometer in the UI (agent work vs. human work).
+- **Project visit telemetry** — `ProjectVisit` records when a user context-switches between projects in the UI. `backend/src/routes/visits.ts` exposes ingest + stats endpoints; the UsageMini overlay renders a visits section derived from them.
+- **Warp / flow-speed telemetry** — `WarpSample` stores per-minute rollups of the hyperspace-speed signal. `backend/src/services/warpSampler.ts` produces the samples and `backend/src/routes/warp.ts` exposes a series endpoint feeding flow-speed sections in UsageMini.
 - **Project sharing** — owners can invite collaborators by email. Shared users get terminal access to the project's tmux sessions through the same per-user-agent path. Routes in `backend/src/routes/sharing.ts`.
-- **Status WebSocket** — `/termag/ws/status` pushes status events to anyone subscribed (the UI itself, plus opt-in external consumers).
+- **Status WebSocket** — `/termag/ws/status` pushes status events to anyone subscribed (the UI itself, plus opt-in external consumers). Idle browser WebSockets are kept alive with a server-side heartbeat.
 
 ## Repository Layout
 
@@ -42,24 +46,37 @@ Production-ready. Provider registry covers Codex, Claude, and Mistral (vibe); pe
 termag/
 ├── backend/                        Express + TS server, port 3040
 │   ├── src/
-│   │   ├── routes/                 REST: projects, status, usage, worktime, sharing, auth
+│   │   ├── auth/                   ALLOWED_USERS parser (incl. domain wildcards) + tests
+│   │   ├── routes/                 REST: projects, status, usage, worktime, sharing, auth,
+│   │   │                            instances (box CRUD), workstreams, visits, warp
 │   │   ├── providers/registry.ts   Provider registry — adding a provider lives here
-│   │   ├── services/               tmux, tmuxPoller, status, humanActivity, agentRegistry, agentRuntime (session reconstruction on reconnect), usage tracking
-│   │   └── middleware/auth.ts      Google OAuth gate + email→unixuser mapping
+│   │   ├── services/               tmux, tmuxPoller, status, humanActivity, agentRegistry,
+│   │   │                            agentRuntime (session reconstruction on reconnect),
+│   │   │                            boxProvisioner (AWS box provisioning), warpSampler,
+│   │   │                            workstreams (git-worktree management), usage tracking
+│   │   └── middleware/auth.ts      Google OAuth gate + email→unixuser mapping + dev-login bypass
 │   └── prisma/                     schema + migrations
 ├── frontend/                       React 18 + Vite, basename /termag
 │   └── src/
-│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini (two-tube thermometers + 7d/30d human-activity charts in the usage overlay), Hyperspace
+│       ├── components/             Terminal (xterm.js), ProjectControl, UsageMini (two-tube
+│       │                            thermometers + 7d/30d human-activity charts + visits +
+│       │                            flow-speed sections), Hyperspace
 │       ├── providers/registry.ts   Mirror of backend provider registry — must stay in sync
 │       ├── contexts/               AuthContext, ProjectContext
 │       └── services/               REST + WebSocket clients
 ├── agent/                          Per-user agent (plain JS, no build step)
-│   ├── agent.js                    main entry — WebSocket to backend, node-pty + tmux attach
+│   ├── agent.js                    main entry — WebSocket to backend, node-pty + tmux attach,
+│   │                                heartbeat-driven dead-connection detection
 │   ├── codex-status-bridge.js      Codex app-server status normalization
 │   ├── codex-status-normalizer.js
 │   ├── agent.config.example.json   sample per-user agent config
 │   └── initial-AGENTS.md           template seeded into new projects on creation
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
+├── packer/                         AMI build for box images (Packer config + setup.sh)
+├── terraform/
+│   └── box/                        Terraform module for AWS box provisioning (AMI discovered by tag)
+├── docs/
+│   └── box-provisioning.md         Design doc for orchestrator-driven box provisioning
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
 
@@ -71,13 +88,19 @@ Browser ──https──▶ Apache (:443, /termag/*)
                     └── /termag/*       → http://localhost:3040/termag/*
 
 Backend (single process, systemd "termag", root or service user, port 3040)
-  ├── REST API     /termag/api/* (projects, status, usage, worktime, auth)
+  ├── REST API     /termag/api/* (projects, status, usage, worktime, instances, workstreams, visits, warp, auth)
   ├── WebSocket    /termag/ws/terminal/<sessionId>  PTY stream
-  │                /termag/ws/status                fan-out push
+  │                /termag/ws/status                fan-out push (+ idle heartbeat)
   │                /termag/ws/agent                 per-user agent connections
   ├── tmux poller  Periodically samples tmux session state as a fallback signal
+  ├── boxProvisioner  Drives AWS provisioning via the Terraform box module + Packer AMI
   ├── Slack Bolt   Socket Mode (no public webhook needed)
   └── Postgres     prisma schema + sessions via connect-pg-simple
+
+Orchestrator + boxes (one orchestrator, N termag-running boxes)
+  ├── Instance model in Postgres; Project.instanceId / AgentToken.instanceId route work to a box
+  └── "Add box" button → boxProvisioner → Terraform → EC2 instance from the Packer AMI,
+                          renamed to the owner's unix user during cloud-init
 
 Per-user agent (systemd --user, runs as the unix user)
   ├── WebSocket → backend /termag/ws/agent (bearer token)
@@ -98,6 +121,8 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 
 **Trade-off: provider registry as code in two files vs a single shared package** — chose duplicated registries (`backend/src/providers/registry.ts` and `frontend/src/providers/registry.ts`). Adding a provider is a small symmetric edit in both; the alternative (a shared workspace package) buys deduplication at the cost of a build-graph complication this repo otherwise avoids.
 
+**Trade-off: orchestrator-driven box provisioning vs manual `terraform apply`** — chose orchestrator-driven (`boxProvisioner.ts` shells out to Terraform with the box module). The orchestrator owns the lifecycle so the UI's "Add box" button is the only path users see, and `Instance` rows stay in sync with what actually exists in AWS. Cost: the backend needs AWS creds and Terraform on `PATH`.
+
 ## Data & Schema
 
 `backend/prisma/schema.prisma`. Key models (not exhaustive):
@@ -105,16 +130,27 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | Model | Purpose |
 |-------|---------|
 | `User` | Google identity + mapped unix user. Holds `defaultAgentProvider` (string), agent token records, usage rollups. |
-| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag, owner, `pinned` flag and `lastActiveAt` timestamp (drive project-list ordering: pinned first, then recent activity). |
+| `Project` | Name, working dir, `agentProvider` (string keyed into the provider registry, no longer an enum), Slack channel id, archived flag, owner, `pinned` flag and `lastActiveAt` timestamp (drive project-list ordering: pinned first, then recent activity), and `instanceId` (which box hosts the project). |
+| `Instance` | A termag-running host ("box"). Tracks provisioning state, AWS identifiers, and the owning unix user. Populated by `boxProvisioner` and the `/termag/api/instances` routes. |
+| `Workstream` | A named line of work inside a project, backed by a git worktree. Every project has a `main` workstream auto-created on project creation; additional workstreams are managed through `backend/src/routes/workstreams.ts`. |
 | `ProjectShare` | Collaborator grants on a project — `(projectId, userId)` with role. Backs the sharing routes; lets a non-owner reach the owner's tmux sessions through their own agent. |
-| `AgentToken` | Bearer token for a per-user agent connection. Issued from the UI sidebar. |
+| `AgentToken` | Bearer token for a per-user agent connection. Issued from the UI sidebar. Now carries `instanceId` so a token is scoped to a specific box. |
 | `StatusEvent` | Append-only log of `working/waiting/idle` events; backs the status WebSocket, the "hyperspace" activity score, the project-list transition flash, and worktime rollups. Status writes also bump `Project.lastActiveAt`. |
 | `WorkTime` | Per-project rollup of time spent in `working` state, derived from `StatusEvent`. Powers `/termag/api/worktime`. |
 | `HumanActivity` | Per-project rollup of human keystroke/interaction time, derived from terminal input events. Powers the human tube of the two-tube thermometer. |
 | `UsageEvent` | Per-call API usage (tokens, cost) for the dashboard. Provider-specific scanners populate this (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`). |
+| `ProjectVisit` | Per-user context-switch log: when the UI focus moves between projects. Feeds the visits section of the UsageMini overlay via `/termag/api/visits`. |
+| `WarpSample` | Per-minute rollups of the hyperspace-speed signal. Produced by `warpSampler` and exposed via `/termag/api/warp` for the flow-speed sections of UsageMini. |
 | `session` | Managed by `connect-pg-simple`, NOT in `schema.prisma`. Created by the SQL block in `deploy/setup.md`. |
 
-`agentProvider` migrated from a Prisma enum to a plain string in the `20260427000000_provider_string_and_worktime` migration. Project sharing landed in `20260427100000_project_sharing`. `Project.pinned` and `Project.lastActiveAt` landed in the `20260503000000_add_project_pinned_and_lastActiveAt` migration. Existing values continue to work; new providers no longer require a schema change.
+Migration history (recent):
+- `20260427000000_provider_string_and_worktime` — `agentProvider` moved from enum to string; worktime rollups added.
+- `20260427100000_project_sharing` — `ProjectShare` table.
+- `20260503000000_add_project_pinned_and_lastActiveAt` — pin + recent-activity sort fields.
+- `20260512000000_add_telemetry_visits_and_warp_samples` — `ProjectVisit` and `WarpSample`.
+- `20260528000000_add_instance_model` — `Instance`, `Project.instanceId`, `AgentToken.instanceId`.
+- `20260529000000_add_box_provisioning_columns` — provisioning-state columns on `Instance`.
+- `20260531230943_workstreams` — `Workstream` model + every-project-gets-`main` backfill.
 
 `prisma migrate dev` is fine here (this is an interactive box); on non-interactive deploy targets prefer `db push`.
 
@@ -127,12 +163,15 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | `DATABASE_URL` | Postgres |
 | `SESSION_SECRET` | random hex |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth |
-| `ALLOWED_USERS` | comma-separated `email:unixuser` pairs (the auth gate) |
+| `ALLOWED_USERS` | comma-separated `email:unixuser` pairs. Supports domain wildcards (e.g. `*@example.com:default-unixuser`). |
 | `SLACK_BOT_TOKEN` (`xoxb-`), `SLACK_APP_TOKEN` (`xapp-`), `SLACK_SIGNING_SECRET` | Slack Socket Mode |
 | `CAPTURE_API_SECRET` | shared secret used by external pane-capture relays |
+| `DEV_LOGIN_ENABLED` / `DEV_LOGIN_EMAIL` | local-development OAuth bypass — leave unset in production |
+| `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | used by `boxProvisioner` + the Terraform box module for "Add box" provisioning |
+| `BOX_AMI_TAG` | AMI tag used by `terraform/box` to discover the Packer-baked image at apply time |
 | `PORT` | `3040` |
 
-Per-user agent: `~/.config/termag/agent.config.json` with `server_url` (`ws://localhost:3040/termag/ws/agent`) and `token` (created in the UI sidebar → Agent Tokens).
+Per-user agent: `~/.config/termag/agent.config.json` with `server_url` (`ws://localhost:3040/termag/ws/agent`) and `token` (created in the UI sidebar → Agent Tokens). The agent now also accepts a config-path override as `argv[2]` and falls back to the example config if the per-user file is missing.
 
 ## Build, Run, Deploy
 
@@ -152,11 +191,19 @@ sudo loginctl enable-linger <username>     # so it runs without an active login
 
 # wire Claude Code hooks (per user)
 # add the JSON block from deploy/claude-hooks.md to ~/.claude/settings.json
+
+# build a box AMI (one-time per image refresh)
+cd packer && packer init . && packer build box.pkr.hcl
+
+# provision a box manually (UI's "Add box" button does this end-to-end)
+cd terraform/box && terraform init && terraform apply
 ```
 
-Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough (covers both Linux/systemd and macOS/launchd for the per-user agent); `deploy/claude-hooks.md` for the hook config.
+Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough (covers both Linux/systemd and macOS/launchd for the per-user agent); `deploy/claude-hooks.md` for the hook config; `docs/box-provisioning.md` for the orchestrator-driven box-provisioning design.
 
 **macOS note** — the per-user agent runs under `launchd` instead of `systemd --user`. There's no linger equivalent; the LaunchAgent plist (`~/Library/LaunchAgents/`) handles auto-start at login. See `deploy/setup.md` for the plist template and `launchctl` commands.
+
+**Pre-commit** — a `gitleaks` hook is configured in `.pre-commit-config.yaml` with rules in `.gitleaks.toml`. Run `pre-commit install` once after cloning so leaked AWS / Slack / OAuth credentials get caught before they land in history.
 
 ## Observability & Maintenance
 
@@ -173,7 +220,7 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /termag/api/projects` | List projects (own + shared) |
-| `POST /termag/api/projects` | Create project (also creates tmux sessions, Slack channel, seeds AGENTS.md + CLAUDE.md) |
+| `POST /termag/api/projects` | Create project (also creates tmux sessions, Slack channel, seeds AGENTS.md + CLAUDE.md, creates `main` workstream) |
 | `POST /termag/api/status` | Status update from Claude hooks / Codex bridge — primary write path |
 | `GET /termag/api/usage/...` | Token + cost rollups for the dashboard (provider-specific scanners) |
 | `GET /termag/api/worktime` | Working-time rollups by provider (agent + human), derived from `StatusEvent` and heartbeats; thermometers use an absolute 8h scale |
@@ -182,9 +229,13 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 | `GET /termag/api/invites` | List pending invites for the logged-in user |
 | `POST /termag/api/invites/:id/accept` | Accept a project invite |
 | `DELETE /termag/api/projects/:id/shares/:shareId` | Revoke a collaborator's access |
+| `GET/POST/DELETE /termag/api/instances` | Box CRUD — list, provision ("Add box"), decommission |
+| `GET/POST/DELETE /termag/api/projects/:id/workstreams` | Workstream CRUD; agent RPCs manage the underlying git worktrees |
+| `POST /termag/api/visits` / `GET /termag/api/visits/stats` | Project-visit ingest + stats for the UsageMini visits section |
+| `GET /termag/api/warp/series` | Per-minute warp/flow-speed rollups for the UsageMini flow-speed section |
 | `WS /termag/ws/terminal/<sessionId>` | PTY stream (bidirectional) |
-| `WS /termag/ws/status` | Status push fan-out — consumed by the UI and any opt-in external listener |
-| `WS /termag/ws/agent` | Per-user agent connection (bearer-token auth) |
+| `WS /termag/ws/status` | Status push fan-out — consumed by the UI and any opt-in external listener (idle-heartbeat keeps browser connections alive) |
+| `WS /termag/ws/agent` | Per-user agent connection (bearer-token auth, dual-keyed by `instanceId`) |
 
 **Slack `/t` commands** (in any channel the bot is in; auto-routes by `#proj-<name>` channel):
 
@@ -210,7 +261,7 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 
 5. **WebSocket upgrade ordering in Apache** — `/termag/ws/*` ProxyPass MUST come before the plain `/termag/*` ProxyPass in the vhost, otherwise socket upgrades fall through to plain HTTP and the terminal never connects.
 
-6. **`ALLOWED_USERS` maps email→unixuser** — both columns matter. A typo in the unixuser half doesn't fail OAuth; it fails later when the per-user agent can't be reached because no such systemd user service is running.
+6. **`ALLOWED_USERS` maps email→unixuser** — both columns matter. A typo in the unixuser half doesn't fail OAuth; it fails later when the per-user agent can't be reached because no such systemd user service is running. Domain-wildcard entries (`*@example.com:default-unixuser`) match any email from that domain to the same unix user — handy, but it means a typo in the wildcard half silently routes everyone to the wrong account.
 
 7. **Project working dirs may be symlinks** — when writing tooling that walks projects, `readlink -f` to get the canonical path before doing anything path-sensitive.
 
@@ -241,6 +292,18 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 20. **Stale `waiting` status is auto-cleared by the per-user agent** — `agent/agent.js` watches for sessions stuck in `waiting` whose pane no longer shows a prompt and demotes them back to `idle`/`working` to match reality. Hooks and bridges aren't perfectly reliable about firing the closing event (notably Claude `Notification` → no follow-up `UserPromptSubmit` if the user dismisses outside the TUI), so the agent is the safety net. If you see a project tile flicker out of `waiting` without an obvious trigger, that's this — don't chase it as a hook bug first.
 
 21. **Agent reconnect reconstructs sessions from the backend's view, not the agent's** — when a per-user agent reconnects (restart, network blip, laptop wake), `backend/src/services/agentRuntime.ts` replays the project/session state down to the agent so existing tmux sessions get reattached without the user re-clicking everything. The backend is authoritative for "what sessions should exist"; the agent is authoritative for "what tmux currently has." If they disagree after a reconnect (ghost sessions, missing reattach), the reconciliation logic in `agentRuntime.ts` is where to look — not the agent's own startup path.
+
+22. **`ensureAgentSessionsAndLaunch` probes before relaunching** — on reconnect / sleep-wake the runtime first probes whether the agent's tmux sessions are still alive and only relaunches the agent process when they're actually gone. If you add a code path that calls into this and it starts double-launching agents, you've skipped the probe; don't.
+
+23. **EC2 security-group descriptions must be ASCII** — `terraform/box` had to swap an em-dash out of an SG description because EC2 rejects non-ASCII characters there. Anything you add to `main.tf` / `variables.tf` describing AWS resources should stay ASCII-only.
+
+24. **Boxes are provisioned per-Unix-user** — the Packer AMI ships with a `termag` default unix user, and cloud-init renames it to the project owner's username during provisioning. Don't hardcode `termag` as the unix user anywhere on the box; reference `$USER` or the value set by cloud-init.
+
+25. **Terraform discovers the AMI by tag, not by id** — `terraform/box` looks up the latest AMI matching `BOX_AMI_TAG` at apply time instead of taking an explicit `var.ami_id`. Rebuilding the AMI with Packer is enough to roll boxes forward; bumping a variable isn't required, but a stale or missing tag will break `terraform apply` with a non-obvious "no matching AMI" error.
+
+26. **Every project has a `main` workstream by default** — phase-1 invariant. Tmux helpers and the agent runtime thread the workstream id through session naming, but legacy code paths that don't pass one will land on `main`. If you add a new code path that creates project artifacts (worktree, tmux session, status event), pass the workstream id explicitly rather than relying on the implicit `main`.
+
+27. **`DEV_LOGIN_ENABLED` is a local-development bypass** — when set, the OAuth gate is short-circuited to `DEV_LOGIN_EMAIL`. Never set it in production; the bypass deliberately doesn't check `ALLOWED_USERS` the same way the real path does. The dev-login parse path was tweaked when `parseAllowedUsers` changed shape, so if dev-login regresses, that pairing is the first thing to check.
 
 ## Related
 
