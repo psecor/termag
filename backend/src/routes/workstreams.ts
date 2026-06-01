@@ -33,16 +33,29 @@ async function gitWorktreeAddLocal(
   );
 }
 
+// Returns a warning string if the branch couldn't be deleted (e.g. unmerged
+// work without --force); null on success or when no branch was given.
 async function gitWorktreeRemoveLocal(
   projDir: string,
   worktreeName: string,
+  branch: string | null,
   force: boolean,
-): Promise<void> {
+): Promise<string | null> {
   const worktreePath = `${projDir}/.worktrees/${worktreeName}`;
   const forceFlag = force ? ' --force' : '';
   await execAsync(
     `git -C ${shellEscape(projDir)} worktree remove${forceFlag} ${shellEscape(worktreePath)}`,
   );
+  if (!branch) return null;
+  const flag = force ? '-D' : '-d';
+  try {
+    await execAsync(
+      `git -C ${shellEscape(projDir)} branch ${flag} ${shellEscape(branch)}`,
+    );
+    return null;
+  } catch (err) {
+    return (err as Error).message.trim().split('\n').pop() ?? null;
+  }
 }
 
 export function workstreamsRouter(): Router {
@@ -133,13 +146,14 @@ export function workstreamsRouter(): Router {
       });
       res.status(201).json(workstream);
     } catch (err) {
-      // DB write lost a race — try to clean up the worktree we just created.
+      // DB write lost a race — try to clean up the worktree + branch we just
+      // created so a retry isn't blocked by the half-built state.
       if (isProjectAgentConnected(projectHost)) {
         await sendForProject(projectHost, 'git-worktree-remove', {
-          projectDir: projDir, worktreeName: name, force: true,
+          projectDir: projDir, worktreeName: name, branch: branchName, force: true,
         }).catch(() => {});
       } else if (!project.instanceId) {
-        await gitWorktreeRemoveLocal(projDir, name, true).catch(() => {});
+        await gitWorktreeRemoveLocal(projDir, name, branchName, true).catch(() => {});
       }
       throw err;
     }
@@ -191,13 +205,22 @@ export function workstreamsRouter(): Router {
     // Remove the worktree from disk before the DB row so a failed `git
     // worktree remove` (typically: dirty worktree without --force) doesn't
     // leave us with an orphan DB row pointing at a still-live worktree.
+    // The agent (or local exec) also deletes the workstream's branch as a
+    // best-effort cleanup, surfacing any failure as a non-fatal warning.
+    let branchDeleteWarning: string | null = null;
     try {
       if (isProjectAgentConnected(projectHost)) {
-        await sendForProject(projectHost, 'git-worktree-remove', {
-          projectDir: projDir, worktreeName: workstream.name, force,
+        const result = await sendForProject(projectHost, 'git-worktree-remove', {
+          projectDir: projDir,
+          worktreeName: workstream.name,
+          branch: workstream.branch,
+          force,
         });
+        branchDeleteWarning = result?.branchDeleteWarning ?? null;
       } else if (!project.instanceId) {
-        await gitWorktreeRemoveLocal(projDir, workstream.name, force);
+        branchDeleteWarning = await gitWorktreeRemoveLocal(
+          projDir, workstream.name, workstream.branch, force,
+        );
       } else {
         res.status(503).json({ error: 'Box agent is not connected' });
         return;
@@ -209,7 +232,7 @@ export function workstreamsRouter(): Router {
 
     // Cascade-deletes attached workflows via the schema FK.
     await prisma.workstream.delete({ where: { id: workstream.id } });
-    res.json({ ok: true });
+    res.json({ ok: true, branchDeleteWarning });
   };
 
   router.get('/projects/:projectId/workstreams', requireAuth, list);

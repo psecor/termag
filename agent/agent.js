@@ -817,11 +817,16 @@ function connect() {
         }
 
         case 'git-worktree-remove': {
-          // Remove the worktree at <projectDir>/.worktrees/<worktreeName>.
-          // Without `force`, git refuses if the worktree is dirty or holds
-          // unmerged changes — surface the error so the caller can prompt.
+          // Remove the worktree at <projectDir>/.worktrees/<worktreeName>,
+          // then drop the branch we created alongside it (when caller supplies
+          // a `branch`). force=true maps to `worktree remove --force` *and*
+          // `branch -D`; without it, git refuses on dirty/unmerged state.
+          //
+          // The branch delete is best-effort: worktree removal is the
+          // load-bearing step. A leftover branch is surfaced as a warning so
+          // the caller can decide whether to clean up.
           const projectDir = remapPath(msg.projectDir);
-          const { worktreeName, force } = msg;
+          const { worktreeName, branch, force } = msg;
           if (!projectDir || !worktreeName) {
             throw new Error('projectDir and worktreeName are required');
           }
@@ -830,7 +835,19 @@ function connect() {
           await execAsync(
             `git -C ${shellEscape(projectDir)} worktree remove${forceFlag} ${shellEscape(worktreePath)}`
           );
-          respond(ws, requestId, { ok: true });
+          let branchDeleteWarning = null;
+          if (branch) {
+            const flag = force ? '-D' : '-d';
+            try {
+              await execAsync(
+                `git -C ${shellEscape(projectDir)} branch ${flag} ${shellEscape(branch)}`
+              );
+            } catch (err) {
+              branchDeleteWarning = err.message.trim().split('\n').pop();
+              console.error(`[AGENT] branch ${flag} ${branch} failed: ${branchDeleteWarning}`);
+            }
+          }
+          respond(ws, requestId, { ok: true, branchDeleteWarning });
           break;
         }
 
