@@ -32,21 +32,25 @@ export function projectsRouter(): Router {
 
   const list: RequestHandler = async (req, res) => {
     try {
-      // Owned projects: pinned first, then by most recently active
+      // Owned projects: pinned first, then by most recently active.
+      // Workstreams come back sorted by createdAt so `main` (created with
+      // the project) lands first; the UI can collapse single-workstream
+      // projects without re-sorting.
+      const projectInclude = {
+        workflows: true,
+        workstreams: { orderBy: { createdAt: 'asc' as const } },
+        user: { select: { unixUsername: true } },
+      };
       const owned = await prisma.project.findMany({
         where: { userId: req.user!.id, archived: false },
-        include: { workflows: true, user: { select: { unixUsername: true } } },
+        include: projectInclude,
         orderBy: [{ pinned: 'desc' }, { name: 'asc' }],
       });
 
       // Shared projects (via ProjectShare)
       const shares = await prisma.projectShare.findMany({
         where: { userId: req.user!.id },
-        include: {
-          project: {
-            include: { workflows: true, user: { select: { unixUsername: true } } },
-          },
-        },
+        include: { project: { include: projectInclude } },
       });
 
       const result = [
@@ -54,7 +58,7 @@ export function projectsRouter(): Router {
           id: p.id, name: p.name, description: p.description, color: p.color,
           archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
           createdAt: p.createdAt, updatedAt: p.updatedAt,
-          userId: p.userId, workflows: p.workflows,
+          userId: p.userId, workflows: p.workflows, workstreams: p.workstreams,
           ownerUsername: p.user.unixUsername, role: 'owner' as const,
         })),
         ...shares
@@ -65,6 +69,7 @@ export function projectsRouter(): Router {
             pinned: s.project.pinned, lastActiveAt: s.project.lastActiveAt,
             createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
             userId: s.project.userId, workflows: s.project.workflows,
+            workstreams: s.project.workstreams,
             ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
           })),
       ];
@@ -138,7 +143,7 @@ export function projectsRouter(): Router {
 
         const restored = await prisma.project.findUnique({
           where: { id: archived.id },
-          include: { workflows: true },
+          include: { workflows: true, workstreams: { orderBy: { createdAt: 'asc' } } },
         });
         res.status(200).json({ ...restored, restored: true });
         return;
@@ -215,7 +220,7 @@ export function projectsRouter(): Router {
       // contract (callers expect `workflows: [...]` on a freshly-created project).
       const projectWithWorkflows = await prisma.project.findUniqueOrThrow({
         where: { id: project.id },
-        include: { workflows: true },
+        include: { workflows: true, workstreams: { orderBy: { createdAt: 'asc' } } },
       });
       res.status(201).json(projectWithWorkflows);
     } catch (err: unknown) {
@@ -458,7 +463,7 @@ export function projectsRouter(): Router {
 
       const updated = await prisma.project.findUnique({
         where: { id: project.id },
-        include: { workflows: true },
+        include: { workflows: true, workstreams: { orderBy: { createdAt: 'asc' } } },
       });
       for (const restart of providerRestarts) {
         if (restart.provider === 'codex') {

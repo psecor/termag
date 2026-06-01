@@ -15,6 +15,18 @@ export interface Workflow {
   provider?: AgentProvider | null;
   server: string;
   projectId: string;
+  workstreamId?: string;
+}
+
+export interface Workstream {
+  id: string;
+  projectId: string;
+  name: string;
+  branch: string;
+  archived: boolean;
+  lastActiveAt: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Project {
@@ -26,6 +38,7 @@ export interface Project {
   pinned?: boolean;
   lastActiveAt?: string;
   workflows: Workflow[];
+  workstreams: Workstream[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';
 }
