@@ -130,7 +130,8 @@ model Workflow {
   workstreamId String
   workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
 
-  @@unique([projectId, type])
+  // (projectId, type) was the legacy phase-1 uniqueness — dropped so a
+  // project can carry one agent workflow per workstream.
   @@unique([workstreamId, type])
   @@index([workstreamId])
   @@map("workflows")

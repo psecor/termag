@@ -5,7 +5,7 @@ import { promisify } from 'util';
 import { requireAuth } from '../middleware/auth';
 import { isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
 import { projectDir } from '../services/tmux';
-import { stopAgentSessions, resolveAgentProvider } from '../services/agentRuntime';
+import { ensureAgentSessionsAndLaunch, stopAgentSessions, resolveAgentProvider } from '../services/agentRuntime';
 import * as tmux from '../services/tmux';
 
 const prisma = new PrismaClient();
@@ -140,11 +140,11 @@ export function workstreamsRouter(): Router {
       return;
     }
 
+    let workstream;
     try {
-      const workstream = await prisma.workstream.create({
+      workstream = await prisma.workstream.create({
         data: { projectId: project.id, name, branch: branchName },
       });
-      res.status(201).json(workstream);
     } catch (err) {
       // DB write lost a race — try to clean up the worktree + branch we just
       // created so a retry isn't blocked by the half-built state.
@@ -157,6 +157,71 @@ export function workstreamsRouter(): Router {
       }
       throw err;
     }
+
+    // Mirror main's workflows onto the new workstream so the user can
+    // immediately attach a terminal / use the agent on the new branch.
+    // Non-fatal: launch failures (agent offline, dirty pane, etc.) surface as
+    // warnings on the response; the workflow rows still get created so the
+    // poller and reconnect path can pick up later.
+    const sessionLaunchWarnings: string[] = [];
+    try {
+      const mainWs = await prisma.workstream.findUnique({
+        where: { projectId_name: { projectId: project.id, name: 'main' } },
+      });
+      if (mainWs) {
+        const mainWorkflows = await prisma.workflow.findMany({
+          where: { workstreamId: mainWs.id },
+        });
+        for (const mw of mainWorkflows) {
+          await prisma.workflow.create({
+            data: {
+              projectId: project.id,
+              workstreamId: workstream.id,
+              type: mw.type,
+              provider: mw.provider,
+            },
+          });
+
+          if (mw.type === 'agent') {
+            try {
+              await ensureAgentSessionsAndLaunch({
+                userId: project.userId,
+                unixUsername: project.user.unixUsername,
+                projectName: project.name,
+                provider: resolveAgentProvider(mw.provider, null),
+                instanceId: project.instanceId,
+                workstream: workstream.name,
+              });
+            } catch (e) {
+              sessionLaunchWarnings.push(`agent: ${(e as Error).message}`);
+            }
+          } else {
+            // data workflow — paired tmux sessions in the worktree dir
+            try {
+              const dataSession = tmux.sessionName(project.user.unixUsername, project.name, 'data', workstream.name);
+              const ctrlSession = tmux.sessionName(project.user.unixUsername, project.name, 'data-ctrl', workstream.name);
+              const wsDir = tmux.projectDir(project.user.unixUsername, project.name, workstream.name);
+              if (isProjectAgentConnected(projectHost)) {
+                await sendForProject(projectHost, 'tmux-create', { sessionName: dataSession, cwd: wsDir });
+                await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: wsDir });
+              } else if (!project.instanceId) {
+                await tmux.ensureSession(dataSession, wsDir);
+                await tmux.ensureSession(ctrlSession, wsDir);
+              }
+            } catch (e) {
+              sessionLaunchWarnings.push(`data: ${(e as Error).message}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      sessionLaunchWarnings.push(`mirror: ${(e as Error).message}`);
+    }
+
+    res.status(201).json({
+      ...workstream,
+      ...(sessionLaunchWarnings.length > 0 ? { sessionLaunchWarnings } : {}),
+    });
   };
 
   // DELETE /api/projects/:projectId/workstreams/:id
