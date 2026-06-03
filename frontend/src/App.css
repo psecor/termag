@@ -224,6 +224,10 @@ html {
   border-radius: 4px;
   cursor: pointer;
   border: 1px solid transparent;
+  /* Per-row left stripe coloring the project by its box (deterministic hue
+     from instanceId). Legacy/local projects leave --box-stripe unset and get
+     no stripe. */
+  box-shadow: inset 3px 0 0 var(--box-stripe, transparent);
 }
 
 .project-item:hover  { background: var(--bg-elevated); }
@@ -414,6 +418,21 @@ html {
   padding: 1px 4px;
   outline: none;
   min-width: 0;
+}
+
+/* Workstream count chip on project rows — mirrors the ↳ marker used in the
+   workstream sub-list, scaled down for the project header. */
+.project-workstream-count {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 14px;
+  border-radius: 3px;
+  background: rgba(139, 148, 158, 0.12);
+  color: var(--text-secondary);
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  flex-shrink: 0;
 }
 
 /* ── Workstreams ───────────────────────────────────────────── */

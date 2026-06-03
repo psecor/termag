@@ -37,6 +37,7 @@ export interface Project {
   archived: boolean;
   pinned?: boolean;
   lastActiveAt?: string;
+  instanceId?: string | null;
   workflows: Workflow[];
   workstreams: Workstream[];
   ownerUsername?: string;

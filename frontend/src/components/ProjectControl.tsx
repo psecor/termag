@@ -6,6 +6,19 @@ import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, AgentTokenInfo } from '../services/api';
 
+// Deterministic hue from a box's instance id so a project's "which box" stripe
+// stays the same across reloads. Fixed saturation/lightness keeps the visual
+// weight consistent against the dark theme. Returns null for legacy projects
+// (instanceId === null) so they render with no stripe.
+function boxStripeColor(instanceId: string | null | undefined): string | null {
+  if (!instanceId) return null;
+  let h = 0;
+  for (let i = 0; i < instanceId.length; i++) {
+    h = (h * 31 + instanceId.charCodeAt(i)) >>> 0;
+  }
+  return `hsl(${h % 360}, 55%, 58%)`;
+}
+
 function ConfirmDialog({ message, onConfirm, onCancel }: {
   message: string;
   onConfirm: () => void;
@@ -439,10 +452,15 @@ export function ProjectControl() {
     const config = provider ? PROVIDERS[provider] : null;
     const ctxWarn = contextWarning(p);
     const rateLimit = rateLimitWarning(p);
+    const stripe = boxStripeColor(p.instanceId);
+    const box = p.instanceId ? boxes.find(b => b.id === p.instanceId) : null;
+    const wsCount = p.workstreams?.length ?? 0;
     return (
       <li
         key={p.id}
         className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
+        style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
+        title={box ? `box: ${box.name}` : undefined}
         onClick={() => setActiveProject(p.id)}
       >
         <span className="project-status">
@@ -486,6 +504,12 @@ export function ProjectControl() {
                 </span>
               )}
             </span>
+            {wsCount > 1 && (
+              <span
+                className="project-workstream-count"
+                title={`${wsCount} workstreams`}
+              >↳{wsCount}</span>
+            )}
             {config && (
               <span
                 className="project-provider-badge"
@@ -624,7 +648,7 @@ export function ProjectControl() {
                   {showWorkstreams && p.workstreams.map(ws => (
                     <li
                       key={ws.id}
-                      className={`project-workstream-item ${activeWs === ws.name ? 'active' : ''}`}
+                      className={`project-workstream-item ${activeProjectId === p.id && activeWs === ws.name ? 'active' : ''}`}
                       onClick={() => { setActiveProject(p.id); setActiveWorkstream(p.id, ws.name); }}
                       title={`branch: ${ws.branch}`}
                     >
