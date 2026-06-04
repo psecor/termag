@@ -782,6 +782,80 @@ html {
   transition: opacity 0.2s;
 }
 
+/* ── Terminal reconnect UI ────────────────────────────────────
+   Pill shown in-corner during background reconnect attempts.
+   Modal shown after retries are exhausted. */
+.terminal-reconnect-pill {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 11;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 3px;
+  background: rgba(210, 153, 34, 0.2);
+  color: var(--warning);
+  border: 1px solid rgba(210, 153, 34, 0.45);
+  pointer-events: none;
+}
+
+.terminal-reconnect-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(13, 17, 23, 0.85);
+  z-index: 20;
+  padding: 16px;
+}
+
+.terminal-reconnect-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  text-align: center;
+  max-width: 360px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.terminal-reconnect-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.terminal-reconnect-message {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.terminal-reconnect-message code {
+  background: rgba(139, 148, 158, 0.15);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.terminal-reconnect-button {
+  padding: 6px 18px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.terminal-reconnect-button:hover {
+  background: var(--accent);
+}
+
 /* ── Warp Indicator ─────────────────────────────────────────── */
 .warp-indicator {
   position: fixed;

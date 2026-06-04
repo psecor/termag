@@ -17,6 +17,14 @@ const MOUSE_TRACKING_RE = /\x1b\[\?(9|1000|1002|1003|1004|1005|1006|1015|1016)[h
 // Sequences to disable all mouse tracking modes in xterm.js
 const DISABLE_MOUSE = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 
+// Reconnect schedule. Five attempts with exponential-ish backoff covers
+// most transient blips (agent restart ~10s, server restart, network hiccup)
+// before we ask the user to intervene.
+const RECONNECT_DELAYS_MS = [0, 500, 1000, 2000, 4000];
+const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
+
+type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
+
 export function Terminal({ sessionName, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -24,6 +32,13 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
   const [selectMode, setSelectMode] = useState(false);
   const selectModeRef = useRef(false);
   const [focused, setFocused] = useState(false);
+
+  // Reconnect lifecycle
+  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
+  const [retryAttempt, setRetryAttempt] = useState(0);
+  // Stable reference the modal "Try again" button can invoke. Set inside the
+  // useEffect that owns the connection lifecycle.
+  const retryRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (autoFocus && termRef.current) {
@@ -77,9 +92,10 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     const onFocus = () => setFocused(true);
     const onBlur = () => setFocused(false);
 
-    let ws: WebSocket | null = null;
     let disposed = false;
     let textarea: HTMLElement | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
 
     const initTimer = requestAnimationFrame(() => {
       if (disposed) return;
@@ -96,48 +112,99 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const initCols = term.cols;
       const initRows = term.rows;
-      ws = new WebSocket(
-        `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}&cols=${initCols}&rows=${initRows}`
-      );
-      wsRef.current = ws;
 
-      ws.onopen = () => {
-        if (disposed) { ws?.close(); return; }
-        fitAddon.fit();
-        // Send resize in case fit changed dimensions after the URL was built
-        if (term.cols !== initCols || term.rows !== initRows) {
-          ws!.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      // (Re)open the WebSocket. Called once at startup and again from the
+      // backoff loop and the modal's Try-again button. The xterm.js Terminal
+      // itself is created once and reused — only the underlying WS churns.
+      const connect = () => {
+        if (disposed) return;
+        // Clean up any prior socket reference (defensive — onclose would
+        // already have nulled it, but a Try-again click while the existing
+        // socket is mid-close could land here first).
+        if (wsRef.current) {
+          try { wsRef.current.close(); } catch { /* ignore */ }
+          wsRef.current = null;
         }
-        if (autoFocus) term.focus();
-      };
+        setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
+        setRetryAttempt(attempt);
 
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data as string) as { type: string; data?: string };
-          if (msg.type === 'output' && msg.data) {
-            if (selectModeRef.current) {
-              // Strip mouse tracking sequences so xterm.js stays in selection mode
-              const filtered = msg.data.replace(MOUSE_TRACKING_RE, '');
-              term.write(filtered);
-            } else {
-              term.write(msg.data);
-            }
-          } else if (msg.type === 'exit') {
-            term.write('\r\n[session ended]\r\n');
+        const ws = new WebSocket(
+          `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}&cols=${initCols}&rows=${initRows}`,
+        );
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (disposed) { ws.close(); return; }
+          // A successful (re)open resets the retry budget so a fresh
+          // disconnect later gets the full backoff schedule again.
+          if (attempt > 0) {
+            term.write('\r\n[reconnected]\r\n');
           }
-        } catch { /* ignore */ }
+          attempt = 0;
+          setRetryAttempt(0);
+          setConnectionState('connected');
+          fitAddon.fit();
+          if (term.cols !== initCols || term.rows !== initRows) {
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          }
+          if (autoFocus) term.focus();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data as string) as { type: string; data?: string };
+            if (msg.type === 'output' && msg.data) {
+              if (selectModeRef.current) {
+                // Strip mouse tracking sequences so xterm.js stays in selection mode
+                const filtered = msg.data.replace(MOUSE_TRACKING_RE, '');
+                term.write(filtered);
+              } else {
+                term.write(msg.data);
+              }
+            } else if (msg.type === 'exit') {
+              term.write('\r\n[session ended]\r\n');
+            }
+          } catch { /* ignore */ }
+        };
+
+        ws.onclose = () => {
+          wsRef.current = null;
+          if (disposed) return;
+          if (attempt + 1 < MAX_RECONNECT_ATTEMPTS) {
+            attempt += 1;
+            setRetryAttempt(attempt);
+            setConnectionState('reconnecting');
+            const delay = RECONNECT_DELAYS_MS[attempt] ?? RECONNECT_DELAYS_MS[RECONNECT_DELAYS_MS.length - 1];
+            retryTimer = setTimeout(() => {
+              retryTimer = null;
+              connect();
+            }, delay);
+          } else {
+            // Exhausted automatic retries — surface the modal so the user
+            // can hit "Try again" rather than staring at a dead terminal.
+            setConnectionState('failed');
+          }
+        };
+
+        ws.onerror = () => {
+          // onerror is always followed by onclose; the retry/modal logic
+          // lives there. Don't double-handle here.
+        };
       };
 
-      ws.onclose = () => {
-        if (!disposed) term.write('\r\n[disconnected]\r\n');
-        wsRef.current = null;
+      // Expose a manual retry the modal can invoke. Resets the retry
+      // budget so the user gets a fresh backoff schedule.
+      retryRef.current = () => {
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        attempt = 0;
+        setRetryAttempt(0);
+        connect();
       };
 
-      ws.onerror = () => {
-        if (!disposed) term.write('\r\n[connection error]\r\n');
-      };
+      connect();
 
       const dataDisposable = term.onData((data) => {
+        const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'input', data }));
         }
@@ -152,6 +219,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         resizeTimer = setTimeout(() => {
           if (disposed) return;
           fitAddon.fit();
+          const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
           }
@@ -166,6 +234,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         vvHandler = () => {
           if (disposed) return;
           fitAddon.fit();
+          const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
           }
@@ -179,6 +248,8 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
     return () => {
       disposed = true;
       cancelAnimationFrame(initTimer);
+      if (retryTimer) clearTimeout(retryTimer);
+      retryRef.current = null;
       const extras = (term as any)._termag;
       if (extras) {
         extras.dataDisposable.dispose();
@@ -189,6 +260,7 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         }
       }
       if (textarea) { textarea.removeEventListener('focus', onFocus); textarea.removeEventListener('blur', onBlur); }
+      const ws = wsRef.current;
       // Restore tmux mouse before closing
       if (ws && ws.readyState === WebSocket.OPEN && selectModeRef.current) {
         ws.send(JSON.stringify({ type: 'mouse', enabled: true }));
@@ -199,6 +271,8 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       setFocused(false);
       termRef.current = null;
       setSelectMode(false);
+      setConnectionState('connecting');
+      setRetryAttempt(0);
     };
   }, [active, sessionName]);
 
@@ -229,6 +303,29 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
       >
         {selectMode ? '✂ select' : '⇕ scroll'}
       </button>
+      {connectionState === 'reconnecting' && (
+        <div className="terminal-reconnect-pill" aria-live="polite">
+          Reconnecting… ({retryAttempt}/{MAX_RECONNECT_ATTEMPTS - 1})
+        </div>
+      )}
+      {connectionState === 'failed' && (
+        <div className="terminal-reconnect-overlay" role="alertdialog" aria-modal="true">
+          <div className="terminal-reconnect-panel">
+            <div className="terminal-reconnect-title">Terminal disconnected</div>
+            <div className="terminal-reconnect-message">
+              Couldn't reach the agent for <code>{sessionName}</code> after {MAX_RECONNECT_ATTEMPTS - 1} retries.
+              The tmux session is probably still alive — try again, or check that the box agent is connected.
+            </div>
+            <button
+              className="terminal-reconnect-button"
+              autoFocus
+              onClick={() => retryRef.current?.()}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
