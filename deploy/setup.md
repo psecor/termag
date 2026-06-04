@@ -201,6 +201,16 @@ Create `~/Library/LaunchAgents/io.termag.agent.plist`:
     <key>ThrottleInterval</key>
     <integer>5</integer>
 
+    <!-- Raise the file-descriptor ceiling above launchd's default 256.
+         node-pty allocates 2-3 fds per terminal stream (master PTY + kqueue
+         watcher), and short-lived dead fds can stack up briefly on WS
+         reconnect cycles. 4096 leaves a generous safety margin. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/Users/YOURUSER/Library/Logs/termag-agent.log</string>
 

@@ -898,6 +898,14 @@ function connect() {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'terminal-exit', streamId }));
             }
+            // node-pty doesn't expose a public destroy(); reach for the
+            // internal socket so the master PTY fd releases as soon as the
+            // child exits, instead of after the library's 1s grace timer
+            // (which races with bulk-kills on WS-close and leaves the fd
+            // in REVOKED state — the original cause of the posix_spawnp
+            // exhaustion). _socket is stable across all of node-pty v1.x;
+            // re-audit on any major bump.
+            try { term._socket && term._socket.destroy(); } catch {}
           });
 
           respond(ws, requestId, { ok: true, streamId });
@@ -936,7 +944,8 @@ function connect() {
         case 'terminal-close': {
           const stream = streams.get(msg.streamId);
           if (stream) {
-            stream.pty.kill();
+            try { stream.pty.kill(); } catch {}
+            try { stream.pty._socket && stream.pty._socket.destroy(); } catch {}
             streams.delete(msg.streamId);
           }
           break;
@@ -959,9 +968,12 @@ function connect() {
     console.log(`[AGENT] Disconnected (${code}). Reconnecting in ${reconnect_interval_seconds}s...`);
     stopContextScanner();
     stopRateLimitScanner();
-    // Kill all active PTY streams
+    // Kill all active PTY streams. Without the explicit socket destroy
+    // here, node-pty's internal 1s setTimeout races with the WS reconnect
+    // and the master fds end up pinned to the process in REVOKED state.
     for (const [id, stream] of streams) {
-      stream.pty.kill();
+      try { stream.pty.kill(); } catch {}
+      try { stream.pty._socket && stream.pty._socket.destroy(); } catch {}
     }
     streams.clear();
     for (const sessionName of codexBridges.keys()) {
