@@ -5,6 +5,16 @@ import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registr
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, AgentTokenInfo } from '../services/api';
+import { sessionName as buildSessionName } from '../utils/sessionName';
+
+// Aggregate priority for combining per-workstream statuses into a single
+// project-row signal: "is anything alive on this project?"
+const STATUS_PRIORITY: Record<AgentStatusValue, number> = {
+  working: 4,
+  waiting: 3,
+  idle: 2,
+  not_running: 1,
+};
 
 // Deterministic hue from a box's instance id so a project's "which box" stripe
 // stays the same across reloads. Fixed saturation/lightness keeps the visual
@@ -66,14 +76,15 @@ export function ProjectControl() {
     const settled = Date.now() - mountedAtRef.current > 3000;
 
     for (const p of projects) {
-      const owner = p.ownerUsername ?? user?.unixUsername ?? '';
-      const session = `${owner}-${p.name}-agent`;
-      const currentStatus = statusMap[session]?.status ?? 'not_running';
-      const prevStatus = prev[session];
+      // Track aggregate per-project (was per-session). Same flash UX, but the
+      // project row reflects whichever workstream is most alive rather than
+      // staying red while a non-main workstream does the work.
+      const currentStatus = aggregateStatus(p);
+      const prevStatus = prev[p.id];
       if (settled && prevStatus !== undefined && prevStatus !== currentStatus) {
         newFlashes.set(p.id, currentStatus);
       }
-      prev[session] = currentStatus;
+      prev[p.id] = currentStatus;
     }
 
     if (newFlashes.size > 0) {
@@ -178,29 +189,55 @@ export function ProjectControl() {
     }
   }, [user?.defaultAgentProvider]);
 
-  function agentSessionName(project: Project): string {
+  // List of all the agent tmux session names for a project, one per workstream
+  // (with `main` collapsing to the historical 3-segment name). Falls back to
+  // the historical single-session shape if workstreams haven't loaded yet.
+  function projectAgentSessions(project: Project): string[] {
     const owner = project.ownerUsername ?? user?.unixUsername ?? '';
-    return `${owner}-${project.name}-agent`;
+    const wsList = project.workstreams ?? [];
+    if (wsList.length === 0) return [buildSessionName(owner, project.name, 'agent')];
+    return wsList.map(ws => buildSessionName(owner, project.name, 'agent', ws.name));
+  }
+
+  // Project-row status aggregates across all workstreams: the worst-priority
+  // signal wins, so a project flips to working/waiting whenever any of its
+  // workstreams does. Per-workstream icons in the sub-list disambiguate which
+  // one is actually doing the work.
+  function aggregateStatus(project: Project): AgentStatusValue {
+    if (!project.workflows.some(w => w.type === 'agent')) return 'not_running';
+    let best: AgentStatusValue = 'not_running';
+    for (const s of projectAgentSessions(project)) {
+      const cur = statusMap[s]?.status ?? 'not_running';
+      if (STATUS_PRIORITY[cur] > STATUS_PRIORITY[best]) best = cur;
+    }
+    return best;
   }
 
   function statusEmoji(project: Project): string {
     if (!project.workflows.some(w => w.type === 'agent')) return '—';
-    const s = statusMap[agentSessionName(project)];
-    return STATUS_EMOJI[s?.status ?? 'not_running'];
+    return STATUS_EMOJI[aggregateStatus(project)];
   }
 
   function contextWarning(project: Project): { level: 'ok' | 'warn' | 'danger'; tokens: number } | null {
     if (!project.workflows.some(w => w.type === 'agent')) return null;
-    const s = statusMap[agentSessionName(project)];
-    const t = s?.contextTokens;
-    if (!t || t < 500_000) return null;
-    return { level: t >= 1_000_000 ? 'danger' : 'warn', tokens: t };
+    // Take the worst (highest tokens) across workstreams — that's the one
+    // about to bite.
+    let max = 0;
+    for (const s of projectAgentSessions(project)) {
+      const t = statusMap[s]?.contextTokens;
+      if (t && t > max) max = t;
+    }
+    if (max < 500_000) return null;
+    return { level: max >= 1_000_000 ? 'danger' : 'warn', tokens: max };
   }
 
   function rateLimitWarning(project: Project): string | null {
     if (!project.workflows.some(w => w.type === 'agent')) return null;
-    const s = statusMap[agentSessionName(project)];
-    return s?.rateLimited ?? null;
+    for (const s of projectAgentSessions(project)) {
+      const r = statusMap[s]?.rateLimited;
+      if (r) return r;
+    }
+    return null;
   }
 
   function fmtTokens(n: number): string {
@@ -213,10 +250,15 @@ export function ProjectControl() {
   }
 
   function displayAgentProvider(project: Project): string | null {
-    const status = statusMap[agentSessionName(project)];
-    if (status?.source) {
-      const fromSource = providerForSource(status.source);
-      if (fromSource) return fromSource;
+    // Pick up the live `source` from any workstream's status (the first
+    // that has one), so the badge reflects the actually-running provider
+    // when a project has mixed setups. Falls back to the persisted value.
+    for (const s of projectAgentSessions(project)) {
+      const source = statusMap[s]?.source;
+      if (source) {
+        const fromSource = providerForSource(source);
+        if (fromSource) return fromSource;
+      }
     }
     return persistedAgentProvider(project);
   }
@@ -620,6 +662,7 @@ export function ProjectControl() {
               const branchingOff = branchOffProjectId === p.id;
               const showWorkstreams = p.workstreams.length > 1;
               const activeWs = getActiveWorkstream(p.id);
+              const owner = p.ownerUsername ?? user?.unixUsername ?? '';
               return (
                 <React.Fragment key={p.id}>
                   {renderProjectItem(p)}
@@ -645,26 +688,36 @@ export function ProjectControl() {
                       </form>
                     </li>
                   )}
-                  {showWorkstreams && p.workstreams.map(ws => (
-                    <li
-                      key={ws.id}
-                      className={`project-workstream-item ${activeProjectId === p.id && activeWs === ws.name ? 'active' : ''}`}
-                      onClick={() => { setActiveProject(p.id); setActiveWorkstream(p.id, ws.name); }}
-                      title={`branch: ${ws.branch}`}
-                    >
-                      <span className="workstream-marker">↳</span>
-                      <span className="workstream-name">{ws.name}</span>
-                      {ws.name !== 'main' && p.role !== 'collaborator' && (
-                        <span className="project-actions" onClick={e => e.stopPropagation()}>
-                          <button
-                            className="btn-tiny btn-danger"
-                            onClick={() => deleteWorkstream(p, ws)}
-                            title="Delete workstream"
-                          >×</button>
+                  {showWorkstreams && p.workstreams.map(ws => {
+                    const wsSession = buildSessionName(owner, p.name, 'agent', ws.name);
+                    const wsHasAgent = p.workflows.some(
+                      w => w.workstreamId === ws.id && w.type === 'agent',
+                    );
+                    const wsStatus = statusMap[wsSession]?.status ?? 'not_running';
+                    return (
+                      <li
+                        key={ws.id}
+                        className={`project-workstream-item ${activeProjectId === p.id && activeWs === ws.name ? 'active' : ''}`}
+                        onClick={() => { setActiveProject(p.id); setActiveWorkstream(p.id, ws.name); }}
+                        title={`branch: ${ws.branch}`}
+                      >
+                        <span className="workstream-status">
+                          {wsHasAgent ? STATUS_EMOJI[wsStatus] : '—'}
                         </span>
-                      )}
-                    </li>
-                  ))}
+                        <span className="workstream-marker">↳</span>
+                        <span className="workstream-name">{ws.name}</span>
+                        {ws.name !== 'main' && p.role !== 'collaborator' && (
+                          <span className="project-actions" onClick={e => e.stopPropagation()}>
+                            <button
+                              className="btn-tiny btn-danger"
+                              onClick={() => deleteWorkstream(p, ws)}
+                              title="Delete workstream"
+                            >×</button>
+                          </span>
+                        )}
+                      </li>
+                    );
+                  })}
                 </React.Fragment>
               );
             });
