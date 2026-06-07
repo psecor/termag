@@ -789,8 +789,16 @@ export function ProjectControl() {
             const dotColor = b.status === 'ready' ? 'var(--success)'
               : pending ? 'var(--warning)'
               : 'var(--danger)';
+            // Same deterministic hue projects use for their "which box" stripe
+            // (b.id is the project's instanceId), so this box is color-matched
+            // to the project rows running on it.
+            const stripe = boxStripeColor(b.id);
             return (
-              <li key={b.id} className="box-item">
+              <li
+                key={b.id}
+                className="box-item"
+                style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
+              >
                 <span
                   className={`box-status-dot ${pending ? 'box-spinning' : ''}`}
                   style={{ background: dotColor }}

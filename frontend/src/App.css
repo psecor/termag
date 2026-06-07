@@ -528,6 +528,10 @@ html {
   padding: 3px 6px;
   font-size: 12px;
   border-radius: 4px;
+  /* Left stripe matching each project row's box stripe (same deterministic
+     hue from the instance id), so a box here is color-matched to the projects
+     running on it. */
+  box-shadow: inset 3px 0 0 var(--box-stripe, transparent);
 }
 .box-item:hover { background: var(--bg-elevated); }
 .box-status-dot {
