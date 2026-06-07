@@ -6,6 +6,11 @@ import 'xterm/css/xterm.css';
 
 interface TerminalProps {
   sessionName: string;
+  // Authoritative project routing: when provided, the backend resolves the
+  // project (owner, instanceId/box) by id instead of parsing the session
+  // string, so same-named projects on different boxes route correctly.
+  projectId?: string;
+  workstream?: string;
   active: boolean;
   autoFocus?: boolean;
   onActivity?: () => void;
@@ -25,7 +30,7 @@ const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
 
 type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
-export function Terminal({ sessionName, active, autoFocus, onActivity }: TerminalProps) {
+export function Terminal({ sessionName, projectId, workstream, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -128,8 +133,11 @@ export function Terminal({ sessionName, active, autoFocus, onActivity }: Termina
         setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
         setRetryAttempt(attempt);
 
+        const routing = projectId
+          ? `&projectId=${encodeURIComponent(projectId)}&workstream=${encodeURIComponent(workstream ?? 'main')}`
+          : '';
         const ws = new WebSocket(
-          `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}&cols=${initCols}&rows=${initRows}`,
+          `${protocol}//${window.location.host}/termag/ws/terminal?session=${encodeURIComponent(sessionName)}${routing}&cols=${initCols}&rows=${initRows}`,
         );
         wsRef.current = ws;
 

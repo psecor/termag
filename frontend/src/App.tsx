@@ -217,6 +217,8 @@ function MainLayout() {
               {activeProject && hasAgent ? (
                 <Terminal
                   sessionName={agentSession}
+                  projectId={activeProject.id}
+                  workstream={activeWorkstream}
                   active={true}
                   autoFocus={!isNarrow || activePane === 'agent'}
                   onActivity={onActivity}
@@ -234,6 +236,8 @@ function MainLayout() {
               {activeProject && hasAgent ? (
                 <Terminal
                   sessionName={ctrlSession}
+                  projectId={activeProject.id}
+                  workstream={activeWorkstream}
                   active={true}
                   autoFocus={isNarrow && activePane === 'ctrl'}
                   onActivity={onActivity}

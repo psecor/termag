@@ -34,6 +34,7 @@ import {
 } from './services/agentRegistry';
 import { PrismaClient } from '@prisma/client';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
+import { sessionName } from './services/tmux';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
 import { startWarpSampler, stopWarpSampler } from './services/warpSampler';
 
@@ -204,38 +205,67 @@ wss.on('connection', (ws, req) => {
       ws.close(1008, 'session param required');
       return;
     }
+    // Authoritative routing: the frontend sends the project id (+ workstream)
+    // so we resolve the owner/box directly. Falls back to parsing the session
+    // string (legacy clients, Slack/Discord capture) when absent.
+    const projectIdParam = url.searchParams.get('projectId');
+    const workstreamParam = url.searchParams.get('workstream') || 'main';
 
-    // Try to route through user-agent if one is connected
-    // Extract username from session name (format: username-project-role)
-    const dashIdx = tmuxSession.indexOf('-');
-    const username = dashIdx > 0 ? tmuxSession.substring(0, dashIdx) : null;
+    (async () => {
+      let project: { id: string; name: string; userId: string; instanceId: string | null } | null = null;
+      let owner: Awaited<ReturnType<typeof prismaIndex.user.findUnique>> = null;
 
-    if (!username) {
-      ws.close(1008, 'invalid session name');
-      return;
-    }
+      if (projectIdParam) {
+        // Preferred path: look the project up by id (unambiguous across boxes).
+        const p = await prismaIndex.project.findUnique({
+          where: { id: projectIdParam },
+          include: { user: true },
+        });
+        if (p) {
+          project = { id: p.id, name: p.name, userId: p.userId, instanceId: p.instanceId };
+          owner = p.user;
+        }
+      } else {
+        // Legacy fallback: derive owner + project name from the session string.
+        const dashIdx = tmuxSession.indexOf('-');
+        const username = dashIdx > 0 ? tmuxSession.substring(0, dashIdx) : null;
+        if (username) {
+          owner = await prismaIndex.user.findUnique({ where: { unixUsername: username } });
+          if (owner) {
+            const afterUsername = tmuxSession.substring(dashIdx + 1);
+            const lastDash = afterUsername.lastIndexOf('-');
+            const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
+            const p = projectName
+              ? await prismaIndex.project.findFirst({ where: { userId: owner.id, name: projectName } })
+              : null;
+            if (p) project = { id: p.id, name: p.name, userId: p.userId, instanceId: p.instanceId };
+          }
+        }
+      }
 
-    prismaIndex.user.findUnique({ where: { unixUsername: username } }).then(async (user) => {
-      if (!user) {
-        console.log(`[TERMINAL] No user found for username: ${username}`);
-        ws.send(JSON.stringify({ type: 'output', data: `\r\nNo termag user "${username}"\r\n` }));
+      if (!owner) {
+        console.log(`[TERMINAL] No owner resolved for session ${tmuxSession} (projectId=${projectIdParam ?? 'none'})`);
+        ws.send(JSON.stringify({ type: 'output', data: `\r\nUnknown session\r\n` }));
         ws.close(1008, 'unknown user');
         return;
       }
+      const ownerUser = owner; // non-null binding for use inside the closures below
 
-      // Parse projectName from session: username-projectName-role. Used both
-      // for share authorization (below) AND to look up the project's
-      // instanceId so we can route to the right host's agent.
-      const afterUsername = tmuxSession.substring(dashIdx + 1);
-      const lastDash = afterUsername.lastIndexOf('-');
-      const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
-
-      const project = projectName
-        ? await prismaIndex.project.findFirst({ where: { userId: user.id, name: projectName } })
-        : null;
+      // When routed by id, the requested session must actually belong to this
+      // project — rebuild the legitimate names so a collaborator can't target
+      // an arbitrary tmux session for a project they happen to have a share on.
+      if (projectIdParam && project) {
+        const allowedSessions = (['agent', 'ctrl', 'data', 'data-ctrl'] as const)
+          .map(role => sessionName(ownerUser.unixUsername, project!.name, role, workstreamParam));
+        if (!allowedSessions.includes(tmuxSession)) {
+          console.log(`[TERMINAL] session ${tmuxSession} does not belong to project ${project.id}`);
+          ws.close(1008, 'session/project mismatch');
+          return;
+        }
+      }
 
       // Allow owner directly; for others, check if they have a share on the project.
-      if (user.id !== loggedInUserId) {
+      if (ownerUser.id !== loggedInUserId) {
         let allowed = false;
         if (project) {
           const share = await prismaIndex.projectShare.findUnique({
@@ -251,14 +281,14 @@ wss.on('connection', (ws, req) => {
         console.log(`[TERMINAL] Shared access: routing ${tmuxSession} for collaborator`);
       }
 
-      // Route via the project's box (if pinned) or the user's legacy agent.
+      // Route via the project's box (if pinned) or the owner's legacy agent.
       const instanceId = project?.instanceId ?? null;
       const agentConnected = instanceId
         ? isInstanceAgentConnected(instanceId)
-        : isAgentConnected(user.id);
+        : isAgentConnected(ownerUser.id);
 
       if (!agentConnected) {
-        const where = instanceId ? `box ${instanceId}` : user.unixUsername;
+        const where = instanceId ? `box ${instanceId}` : ownerUser.unixUsername;
         console.log(`[TERMINAL] Agent not connected for ${where}`);
         ws.send(JSON.stringify({ type: 'output', data: `\r\nAgent not connected${instanceId ? ' for this box' : ''}.\r\n` }));
         ws.close(1008, 'agent not connected');
@@ -268,7 +298,7 @@ wss.on('connection', (ws, req) => {
       const initCols = parseInt(url.searchParams.get('cols') || '', 10) || 80;
       const initRows = parseInt(url.searchParams.get('rows') || '', 10) || 24;
 
-      console.log(`[TERMINAL] Routing ${tmuxSession} via ${instanceId ? `instance ${instanceId}` : user.unixUsername} (${initCols}x${initRows})`);
+      console.log(`[TERMINAL] Routing ${tmuxSession} via ${instanceId ? `instance ${instanceId}` : ownerUser.unixUsername} (${initCols}x${initRows})`);
       try {
         const onData = (msg: any) => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -280,18 +310,18 @@ wss.on('connection', (ws, req) => {
           }
         };
         const streamId = instanceId
-          ? await requestInstanceTerminalStream(instanceId, user, tmuxSession, initCols, initRows, onData)
-          : await requestTerminalStream(user.id, tmuxSession, initCols, initRows, onData);
+          ? await requestInstanceTerminalStream(instanceId, ownerUser, tmuxSession, initCols, initRows, onData)
+          : await requestTerminalStream(ownerUser.id, tmuxSession, initCols, initRows, onData);
 
         ws.on('message', (raw) => {
           try {
             const msg = JSON.parse(raw.toString());
             if (msg.type === 'input' && msg.data !== undefined) {
-              sendTerminalInput(user.id, streamId, msg.data);
+              sendTerminalInput(ownerUser.id, streamId, msg.data);
             } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-              sendTerminalResize(user.id, streamId, msg.cols, msg.rows);
+              sendTerminalResize(ownerUser.id, streamId, msg.cols, msg.rows);
             } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
-              sendTerminalMouse(user.id, streamId, msg.enabled);
+              sendTerminalMouse(ownerUser.id, streamId, msg.enabled);
             }
           } catch { /* ignore */ }
         });
@@ -304,8 +334,8 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'output', data: '\r\nFailed to connect through agent.\r\n' }));
         ws.close(1011, 'agent error');
       }
-    }).catch((err) => {
-      console.error(`[TERMINAL] User lookup failed:`, (err as Error).message);
+    })().catch((err) => {
+      console.error(`[TERMINAL] Terminal routing failed:`, (err as Error).message);
       ws.close(1011, 'lookup error');
     });
     return;
