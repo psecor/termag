@@ -130,17 +130,23 @@ build {
 
   provisioner "shell" {
     // Wait until cloud-init has finished its work — apt locks are otherwise
-    // a flaky failure mode early in the build.
+    // a flaky failure mode early in the build. Also pre-create the upload
+    // target for the file provisioner below: a trailing-slash source copies
+    // the directory *contents*, which requires the destination to already
+    // exist — scp won't create it and otherwise fails with
+    // "scp: /tmp/termag-src: Not a directory".
     inline = [
       "echo 'Waiting for cloud-init...'",
       "cloud-init status --wait || true",
+      "mkdir -p /tmp/termag-src",
     ]
   }
 
   provisioner "file" {
     // Ship the CI checkout itself — no clone, no PAT. The trailing slash means
-    // "copy the contents of the repo root into /tmp/termag-src". setup.sh then
-    // stages it to /opt/termag and prunes the non-runtime dirs.
+    // "copy the contents of the repo root into /tmp/termag-src" (which the
+    // shell provisioner above creates). setup.sh then stages it to /opt/termag
+    // and prunes the non-runtime dirs.
     source      = "${path.root}/../"
     destination = "/tmp/termag-src"
   }
