@@ -12,6 +12,11 @@
 set -euo pipefail
 
 exec > >(tee /var/log/termag-cloudinit.log) 2>&1
+# This script runs unattended under cloud-init, so a bare `set -e` abort is
+# otherwise invisible — you see the "starting" line and nothing else, with no
+# hint of which command died. The ERR trap logs the failing line + command so
+# a stuck box is diagnosable straight from the cloud-init log.
+trap 'rc=$?; echo "=== termag box cloud-init FAILED at line ${LINENO} (exit ${rc}): ${BASH_COMMAND} ==="' ERR
 echo "=== termag box cloud-init starting at $(date -Iseconds) ==="
 
 UNIX_USER="${remote_unix_user}"
@@ -33,21 +38,30 @@ usermod -l "$UNIX_USER" -d "/home/$UNIX_USER" -m termag
 groupmod -n "$UNIX_USER" termag
 USER_UID=$(id -u "$UNIX_USER")
 
+# Steps 3–4 are best-effort cosmetic cleanup of the `/home/termag` prefix the
+# AMI bake leaves behind. They must NEVER abort the boot — the load-bearing
+# work is Steps 5–8 (write the agent token + start the agent). So every
+# pipeline below is guarded with `|| true`: a no-match grep (exit 1), a
+# permission-denied find, or an unwritable file must not strand the box
+# without a running agent.
+
 # ── Step 3: rewrite absolute symlinks under the renamed home ─────────────
 # cursor-agent and devin installers create symlinks with /home/termag/
 # baked into the target. After usermod the home moved but symlink targets
 # didn't follow; rewrite mechanically.
-find "/home/$UNIX_USER" -type l -lname '/home/termag/*' | while read link; do
+echo "=== step 3: rewriting /home/termag symlinks ==="
+find "/home/$UNIX_USER" -type l -lname '/home/termag/*' 2>/dev/null | while read -r link; do
   target=$(readlink "$link")
   newtarget=$(echo "$target" | sed "s|/home/termag|/home/$UNIX_USER|")
   ln -sfn "$newtarget" "$link"
-done
+done || true
 
 # ── Step 4: rewrite text configs that reference /home/termag ─────────────
 # devin's config.json has the old home dir baked in. Add other paths here
-# if future agent CLIs grow the same pattern.
+# if future agent CLIs grow the same pattern. Guard each pipeline with
+# `|| true` so a missing path or no-match grep doesn't strand the boot.
 if [ -f "/home/$UNIX_USER/.config/devin/config.json" ]; then
-  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json"
+  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json" || true
 fi
 
 # ── Step 5: drop the agent's bearer token ────────────────────────────────
@@ -77,8 +91,16 @@ sleep 2
 sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user daemon-reload
 sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user enable --now termag-agent.service
 
-# ── Sanity check (don't fail the boot on a slow first dial) ──────────────
+# ── Sanity check ─────────────────────────────────────────────────────────
+# Don't fail the boot on a slow first dial, but log the *real* status (and a
+# log tail if it's not up) so a stuck agent is diagnosable from the cloud-init
+# log instead of hiding behind a cheery "complete".
 sleep 2
-sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user is-active termag-agent.service || true
+if sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user is-active --quiet termag-agent.service; then
+  echo "=== termag-agent.service is active ==="
+else
+  echo "=== WARNING: termag-agent.service not active after start — recent logs: ==="
+  sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID journalctl --user -u termag-agent.service --no-pager -n 20 2>&1 || true
+fi
 
 echo "=== termag box cloud-init complete at $(date -Iseconds) ==="
