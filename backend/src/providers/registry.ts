@@ -129,8 +129,8 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     displayName: 'Cursor',
     badge: 'CR',
     color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
-    launchCommand: 'agent',
-    processNames: ['agent'],
+    launchCommand: 'cursor-agent',
+    processNames: ['cursor-agent'],
     statusSources: ['tmux-poller', 'tmux-poller:cursor'],
     needsPoller: true,
     pollerConfig: {

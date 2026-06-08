@@ -8,7 +8,7 @@ provisions per-user boxes.
 
 - System: `git`, `tmux`, `build-essential`, `curl`, `jq`, `python3`,
   `nodejs` (LTS), `gh`, `awscli`, `postgresql-client`
-- Agent CLIs: `claude` (npm, system-wide), `cursor` (`agent` binary,
+- Agent CLIs: `claude` (npm, system-wide), `cursor` (`cursor-agent` binary,
   vendor installer run as the `termag` user), `devin` (vendor installer
   run as the `termag` user). No `codex`, `gemini`, `auggie`, or `vibe`
   in V1 (no licenses).
