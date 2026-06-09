@@ -139,9 +139,9 @@ cp agent.config.example.json agent.config.json
 # 6. Wire up Claude Code hooks. REQUIRED for status indicators to work
 #    with the Claude provider — without this, project status dots stay
 #    grey forever even though the agent and terminals are fine.
-#    Add termag as a status hook target in ~/.claude/settings.json so
-#    each hook event POSTs to http://localhost:3040/termag/api/status.
-#    See deploy/claude-hooks.md for the full snippet to paste in.
+#    AMI-provisioned boxes already have this baked into
+#    ~/.claude/settings.json (see packer/scripts/setup.sh). Only do this
+#    by hand for non-baked installs (e.g. macOS). See deploy/claude-hooks.md.
 ```
 
 ### Step 5 on Linux (systemd)
@@ -262,6 +262,10 @@ Required for status indicators to work with the Claude provider —
 the agent runs Claude inside tmux, but Claude itself reports
 working/idle/needs-input state via Claude Code hooks. Without this
 step, status dots stay grey.
+
+**AMI-provisioned boxes already have this** — `packer/scripts/setup.sh`
+bakes `deploy/claude-settings.json` into `~/.claude/settings.json`, so the
+steps below are only needed for non-baked installs (e.g. macOS).
 
 Add termag as a status hook target in `~/.claude/settings.json` so
 each hook event POSTs to `http://localhost:3040/termag/api/status`.

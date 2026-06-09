@@ -150,6 +150,13 @@ build {
     destination = "/tmp/termag-agent.service"
   }
 
+  provisioner "file" {
+    // Claude Code status hooks — baked into ~/.claude/settings.json by
+    // setup.sh so status lights work without the manual step in setup.md.
+    source      = "${path.root}/../deploy/claude-settings.json"
+    destination = "/tmp/claude-settings.json"
+  }
+
   provisioner "shell" {
     script = "${path.root}/scripts/setup.sh"
     environment_vars = [

@@ -1,16 +1,3 @@
-# Claude Code Hooks for termag
-
-Hooks let termag track agent status (working/waiting/idle) in real time.
-Each hook fires a POST to `http://localhost:3040/termag/api/status`.
-
-The canonical config is `deploy/claude-settings.json`. AMI-provisioned boxes
-get it baked into `~/.claude/settings.json` automatically by
-`packer/scripts/setup.sh` — for non-baked installs, copy that file in by hand.
-The snippet below is reproduced from `claude-settings.json`; keep them in sync.
-
-## Hook configuration
-
-```json
 {
   "hooks": {
     "UserPromptSubmit": [
@@ -67,31 +54,3 @@ The snippet below is reproduced from `claude-settings.json`; keep them in sync.
     ]
   }
 }
-```
-
-## How it works
-
-- `UserPromptSubmit`, `PreToolUse`, `PostToolUse` all post `status: "working"` (green light)
-- `Notification` parses the hook input JSON to determine status:
-  - `idle_prompt` -> `status: "idle"` (agent finished, no more work)
-  - Everything else -> `status: "waiting"` (yellow light, needs input)
-  - Sets `notify: true` so termag sends a Slack notification with the pane content
-- `Stop` posts `status: "idle"` (red light)
-- Uses `tmux display-message -p '#S'` to auto-detect the session name
-- All curls are backgrounded with `&` so they never block Claude
-
-## Slack notifications
-
-When `notify: true` is set (Notification hook only), termag will:
-1. Capture the tmux pane content
-2. Post it to the Slack channel associated with that session (set via `/t` command)
-3. Add emoji reaction hints if numbered prompts are detected (e.g. "1. Allow once")
-4. You can respond by reacting with :one:, :two:, etc. to send that keystroke
-
-Notification targets persist across service restarts (stored in the database).
-
-## LTS hooks (optional)
-
-If also running the LTS relay for remote Mac terminal capture, add a parallel
-set of hooks posting to `http://localhost:3040/lts/status` with an
-`Authorization: Bearer $SECRET` header. See the LTS section of setup.md.

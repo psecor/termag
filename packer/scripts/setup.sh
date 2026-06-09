@@ -153,6 +153,16 @@ sudo cp /tmp/termag-agent.service /home/termag/.config/systemd/user/termag-agent
 sudo chown -R termag:termag /home/termag/.config
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Claude Code status hooks. termag tracks working/waiting/idle state via hooks
+# that POST to the local agent; without them the status lights stay grey. Baked
+# from deploy/claude-settings.json (file-provisioned to /tmp) so this is no
+# longer the manual step it used to be in setup.md.
+# ─────────────────────────────────────────────────────────────────────────────
+sudo mkdir -p /home/termag/.claude
+sudo cp /tmp/claude-settings.json /home/termag/.claude/settings.json
+sudo chown -R termag:termag /home/termag/.claude
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Verify SSM agent is present and enabled (Canonical's AMI ships it via snap)
 # ─────────────────────────────────────────────────────────────────────────────
 snap list amazon-ssm-agent || sudo snap install amazon-ssm-agent --classic
