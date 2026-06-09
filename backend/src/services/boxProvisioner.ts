@@ -175,8 +175,10 @@ find "/home/$UNIX_USER" -type l -lname '/home/termag/*' | while read link; do
 done
 
 # ── Step 4: rewrite text configs that reference /home/termag ─────────────
+# Guard with || true so a missing file or no-match doesn't abort first-boot
+# under set -euo pipefail (which would strand the box before the agent starts).
 if [ -f "/home/$UNIX_USER/.config/devin/config.json" ]; then
-  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json"
+  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json" || true
 fi
 
 # ── Step 5: drop the agent's bearer token ────────────────────────────────
