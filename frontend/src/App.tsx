@@ -24,7 +24,16 @@ function Login() {
   );
 }
 
-function useIsNarrow(breakpoint = 1600) {
+// ?narrow=N in the URL overrides the default breakpoint. Lets users on
+// lower-resolution screens keep the side-by-side layout at widths where
+// it would otherwise collapse. Read once at mount; bookmark the URL with
+// the param to persist across visits.
+function useIsNarrow(defaultBreakpoint = 1600) {
+  const breakpoint = (() => {
+    const raw = new URLSearchParams(window.location.search).get('narrow');
+    const n = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : defaultBreakpoint;
+  })();
   const [narrow, setNarrow] = useState(window.innerWidth < breakpoint);
   useEffect(() => {
     const mq = window.matchMedia(`(max-width: ${breakpoint - 1}px)`);
