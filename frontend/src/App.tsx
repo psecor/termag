@@ -84,12 +84,19 @@ function MainLayout() {
     return () => clearInterval(interval);
   }, [typing, activeProject]);
 
+  // Iterate every workstream on every project so warp sees parallel work in
+  // non-`main` workstreams too. buildSessionName collapses `main` to the
+  // historical 3-segment name so single-workstream projects are unchanged.
   const projectAgentStatuses = Object.fromEntries(projects
     .filter(p => p.workflows.some(w => w.type === 'agent'))
-    .map(p => {
+    .flatMap(p => {
       const owner = p.ownerUsername ?? username;
-      const agentSession = `${owner}-${p.name}-agent`;
-      return [agentSession, statusMap[agentSession]];
+      return p.workstreams
+        .filter(ws => !ws.archived)
+        .map(ws => {
+          const agentSession = buildSessionName(owner, p.name, 'agent', ws.name);
+          return [agentSession, statusMap[agentSession]] as const;
+        });
     })
     .filter(([, status]) => Boolean(status)));
 
