@@ -9,9 +9,9 @@
  * tears the EC2 (+ SG + IAM) down via the SDK.
  *
  * When box provisioning isn't configured (local dev, or a deploy that hasn't
- * surfaced the o11y-termag module outputs into the secret yet), POST falls back
- * to the legacy manual-terraform path: it returns the raw token so the user can
- * run `terraform apply` themselves.
+ * surfaced the IAM-grant outputs into the secret yet), POST falls back to the
+ * legacy manual-terraform path: it returns the raw token so the user can run
+ * `terraform apply` themselves.
  */
 
 import { Router, RequestHandler } from 'express';

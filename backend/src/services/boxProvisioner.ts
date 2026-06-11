@@ -3,7 +3,7 @@
  *
  * This is the V2 bridge described in docs/box-provisioning.md: instead of
  * handing the user a bearer token to paste into `terraform apply`, the backend
- * launches the box itself under the o11y-termag 0.3.0 IAM grant (a locked blast
+ * launches the box itself under a locked-down IAM grant (a locked blast
  * radius — per-box role + permissions boundary, tag-scoped EC2, ALB ingress).
  *
  * The shape we re-create here mirrors terraform/box/ exactly (egress-only SG,
@@ -49,7 +49,7 @@ const prisma = new PrismaClient();
 const SSM_CORE_POLICY_ARN = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore';
 const GIT_TOKEN_INLINE_POLICY = 'termag-git-token-read';
 
-// ── Config (from backend/.env, mostly the o11y-termag module's outputs) ──────
+// ── Config (from backend/.env, mostly outputs from your IAM-grant Terraform) ─
 
 interface BoxConfig {
   region: string;
@@ -93,7 +93,7 @@ export function getBoxConfig(): BoxConfig | null {
     subnetId,
     albSecurityGroupId,
     instanceType: process.env.BOX_INSTANCE_TYPE ?? 't4g.medium',
-    managedTag: process.env.BOX_MANAGED_TAG ?? 'o11y-termag',
+    managedTag: process.env.BOX_MANAGED_TAG ?? 'termag-box',
     rootVolumeGb: parseInt(process.env.BOX_ROOT_VOLUME_GB ?? '30', 10),
     gitTokenSecretArn: process.env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
   };

@@ -21,7 +21,7 @@ stubbed as "user-driven Terraform." Most of the skeleton is already present.
 | WS auth | `backend/src/index.ts` (`/ws/agent`) | `validateAgentToken` (in `routes/agentTokens.ts`) looks up `tokenHash`, returns `{user, instance}`. **Needs no changes.** |
 | Box shape (reference) | `terraform/box/` | V1 Terraform: egress-only SG, IMDSv2 instance, `cloudinit.sh.tftpl` that writes `agent.config.json {termag_url, token, path_remap}` and starts the agent systemd user unit. |
 | Box AMI | `packer/` | Prebakes repo, agent CLIs, `termag` user + linger, the `termag-agent.service` unit. |
-| Guardrails | `terraform-modules//services/o11y-termag/iam_box_provisioning.tf` (0.3.0) | IAM grant + outputs (`box_resource_prefix`, `box_permissions_boundary_arn`, `box_managed_tag`, `agent_ws_url`) built specifically so the orchestrator can launch boxes via the SDK within a locked blast radius. |
+| Guardrails | Your IAM-grant Terraform | IAM grant + outputs (`box_resource_prefix`, `box_permissions_boundary_arn`, `box_managed_tag`, `agent_ws_url`) built specifically so the orchestrator can launch boxes via the SDK within a locked blast radius. |
 
 **The missing piece is the bridge:** a backend service that, instead of handing
 the user a token to paste into Terraform, calls the AWS SDK itself to launch the
@@ -70,7 +70,7 @@ Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
 1. `DescribeImages` filtered `tag:App=termag, tag:Component=box`, sort by
    `CreationDate`, take newest → `amiId`.
 2. `CreateSecurityGroup` `<BOX_RESOURCE_PREFIX>-<box>` in `BOX_VPC_ID`,
-   egress-only, tag-on-create `ManagedBy=o11y-termag` + `Owner`/`BoxName`.
+   egress-only, tag-on-create `ManagedBy=$BOX_MANAGED_TAG` + `Owner`/`BoxName`.
 3. `AuthorizeSecurityGroupIngress` on `ALB_SECURITY_GROUP_ID`: 443 from the new
    box SG (grant's `Ec2BoxIngressToAlb`).
 4. Per-box IAM: `CreateRole` `<BOX_RESOURCE_PREFIX>-<box>` **with
@@ -161,9 +161,8 @@ out-of-band for OAuth only).
   `AmazonSSMRoleForInstancesQuickSetup`) is **superseded** by the
   per-box-role+boundary decision. Recommendation: keep it through
   implementation as the cloud-init reference + a break-glass manual path, then
-  **delete it** once the button flow is proven — mirroring how
-  `terraform-modules` deleted the standalone `o11y-termag-box` module at 0.3.0
-  ("box lifecycle is owned by the termag backend codebase now").
+  **delete it** once the button flow is proven — a standalone terraform-managed
+  box is redundant once box lifecycle is owned by the termag backend codebase.
 
 ## Security analysis: token in `user_data`
 
