@@ -8,9 +8,9 @@ useDefault = true
 # reference is flagged before it lands.
 
 [[rules]]
-id = "termag-ld-domain"
-description = "LaunchDarkly domain reference"
-regex = '''(?i)launchdarkly\.com'''
+id = "termag-ld-name"
+description = "LaunchDarkly name / domain / GitHub org reference"
+regex = '''(?i)launchdarkly'''
 tags = ["termag", "internal-ref"]
 
 [[rules]]
@@ -25,9 +25,17 @@ description = "LD-internal collaborator handles"
 regex = '''(?i)(vkorolik|vadman97)'''
 tags = ["termag", "internal-ref"]
 
+[[rules]]
+id = "termag-internal-modules"
+description = "Internal o11y-* terraform module references"
+regex = '''(?i)o11y-(devbox|termag)'''
+tags = ["termag", "internal-ref"]
+
 [allowlist]
 description = "Files allowed to mention these strings"
 paths = [
   # The LICENSE has the legitimate MIT copyright notice
   '''^LICENSE$''',
+  # The gitleaks config itself names the strings it's looking for
+  '''^\.gitleaks\.toml$''',
 ]
