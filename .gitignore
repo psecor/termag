@@ -28,6 +28,8 @@ agent/agent.config.*.json
 *.tfstate.backup
 *.tfvars
 !*.tfvars.example
+*.tfplan
+tfplan
 
 # OS
 .DS_Store
