@@ -649,16 +649,10 @@ export function ProjectControl() {
             const filtered = projectFilter
               ? projects.filter(p => p.name.toLowerCase().includes(projectFilter.toLowerCase()))
               : projects;
-            const pinned = filtered.filter(p => p.pinned);
-            const unpinned = filtered.filter(p => !p.pinned);
-            const list: (typeof projects[0] | 'divider')[] = [
-              ...pinned,
-              ...(pinned.length > 0 && unpinned.length > 0 ? ['divider' as const] : []),
-              ...unpinned,
-            ];
-            return list.map((item) => {
-              if (item === 'divider') return <li key="__divider" className="project-list-divider" />;
-              const p = item;
+
+            // Render one project: its row, an optional branch-off form, and any
+            // workstream sub-rows. Hoisted so each box group can reuse it.
+            const renderRow = (p: typeof projects[0]) => {
               const branchingOff = branchOffProjectId === p.id;
               const showWorkstreams = p.workstreams.length > 1;
               const activeWs = getActiveWorkstream(p.id);
@@ -720,7 +714,55 @@ export function ProjectControl() {
                   })}
                 </React.Fragment>
               );
+            };
+
+            // Pinned projects float to the top of their own box group.
+            const sortPinned = (arr: typeof projects) => [
+              ...arr.filter(p => p.pinned),
+              ...arr.filter(p => !p.pinned),
+            ];
+
+            // Group projects by box: one group per box that has projects (sorted
+            // by box name), then collaborator projects on boxes I don't own, then
+            // legacy "this host" projects (no instance). Empty groups are hidden.
+            const knownBoxIds = new Set(boxes.map(b => b.id));
+            const groups: {
+              key: string; label: string; color: string | null;
+              dot?: string; rows: typeof projects;
+            }[] = [];
+
+            [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
+              const rows = sortPinned(filtered.filter(p => p.instanceId === b.id));
+              if (!rows.length) return;
+              const pending = b.status === 'provisioning' || b.status === 'awaiting-agent';
+              groups.push({
+                key: b.id,
+                label: b.name,
+                color: boxStripeColor(b.id),
+                dot: b.status === 'ready' ? 'var(--success)' : pending ? 'var(--warning)' : 'var(--danger)',
+                rows,
+              });
             });
+
+            const shared = sortPinned(filtered.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
+            if (shared.length) groups.push({ key: '__shared', label: 'Shared with me', color: null, rows: shared });
+
+            const local = sortPinned(filtered.filter(p => !p.instanceId));
+            if (local.length) groups.push({ key: '__local', label: 'This host', color: null, rows: local });
+
+            return groups.map(g => (
+              <React.Fragment key={g.key}>
+                <li
+                  className="project-group-header"
+                  style={g.color ? ({ ['--box-stripe' as any]: g.color } as React.CSSProperties) : undefined}
+                >
+                  {g.dot && <span className="project-group-dot" style={{ background: g.dot }} />}
+                  <span className="project-group-name" title={g.label}>{g.label}</span>
+                  <span className="project-group-count">{g.rows.length}</span>
+                </li>
+                {g.rows.map(renderRow)}
+              </React.Fragment>
+            ));
           })()}
         </ul>
         <form className="inline-form project-create-form" onSubmit={createProject}>

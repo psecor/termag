@@ -232,6 +232,32 @@ html {
 
 .project-item:hover  { background: var(--bg-elevated); }
 .project-item.active { background: var(--bg-active); border-color: var(--border); }
+
+/* Box group header in the project list — the "bigger grain" box marker.
+   Carries the box's color as a thicker left band (5px vs the row's 3px) so a
+   cluster of projects reads as "this box" at a glance. */
+.project-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  box-shadow: inset 5px 0 0 var(--box-stripe, var(--border));
+  border-radius: 4px;
+}
+.project-list > .project-group-header:first-child { margin-top: 0; }
+.project-group-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.project-group-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-group-count {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
 .project-item.status-flash-working {
   animation: flash-working 15s ease-out;
 }
