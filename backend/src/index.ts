@@ -93,9 +93,15 @@ const sessionMiddleware = session({
   },
 });
 
-app.use(sessionMiddleware);
-app.use(passport.initialize());
-app.use(passport.session());
+// Scope session + passport to BASE_PATH. Without this, a request outside
+// /termag (favicon.ico, dev-tools probes, anything Apache forwards) skips
+// the session middleware (cookie path mismatch — see express-session
+// index.js: "pathname mismatch") but still hits passport.session(), which
+// throws "Login sessions require session support" because req.session is
+// undefined.
+app.use(BASE_PATH || '/', sessionMiddleware);
+app.use(BASE_PATH || '/', passport.initialize());
+app.use(BASE_PATH || '/', passport.session());
 
 configurePassport();
 
