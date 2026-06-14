@@ -137,6 +137,9 @@ if (process.env.DISCORD_TOKEN) {
 
 // Serve built frontend (production)
 const frontendDist = join(__dirname, '../../frontend/dist');
+// Sound Garden static SPA, served same-origin so the status-WS session cookie works.
+// Must be registered before the BASE_PATH static mount + SPA fallback below.
+app.use(`${BASE_PATH}/sound-garden`, express.static(join(__dirname, '../../sound-garden')));
 app.use(`${BASE_PATH}/`, express.static(frontendDist));
 app.get(`${BASE_PATH}/*`, (_req, res) => {
   res.sendFile(join(frontendDist, 'index.html'));

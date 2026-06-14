@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sound Garden</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel control-panel" aria-label="Sound Garden controls">
+        <div>
+          <p class="eyebrow">status-driven audio monitor</p>
+          <h1>Sound Garden</h1>
+        </div>
+
+        <div class="connection-row">
+          <label for="ws-url">Status WebSocket</label>
+          <input id="ws-url" type="url" spellcheck="false">
+          <button id="connect" type="button">Connect</button>
+        </div>
+
+        <div class="controls-grid">
+          <button id="audio-toggle" class="primary" type="button">Enable Audio</button>
+
+          <label class="stacked" for="mode">
+            Mode
+            <select id="mode">
+              <option value="ambient">Ambient + notifications</option>
+              <option value="notifications">Notifications only</option>
+              <option value="silent">Silent monitor</option>
+            </select>
+          </label>
+
+          <label class="stacked" for="speed-sound">
+            Speed sound
+            <select id="speed-sound">
+              <option value="engine">Engine rev</option>
+              <option value="fan">Fan spin</option>
+              <option value="whoosh">Space whoosh</option>
+              <option value="xylophone">Xylophone notes</option>
+              <option value="rain">Rain density</option>
+              <option value="waves">Waves</option>
+              <option value="birds">Bird chirps</option>
+              <option value="chimes">Soft chimes</option>
+              <option value="wind">Wind wash</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+
+          <label class="stacked" for="volume">
+            Volume <span id="volume-label">45%</span>
+            <input id="volume" type="range" min="0" max="100" value="45">
+          </label>
+        </div>
+
+        <div class="tuning-grid" aria-label="Speed sound tuning">
+          <label class="stacked" for="tune-level">
+            <span id="tune-level-label">Intensity</span> <span id="tune-level-value">100%</span>
+            <input id="tune-level" type="range" min="0" max="200" value="100">
+          </label>
+
+          <label class="stacked" for="tune-brightness">
+            <span id="tune-brightness-label">Brightness</span> <span id="tune-brightness-value">100%</span>
+            <input id="tune-brightness" type="range" min="20" max="220" value="100">
+          </label>
+
+          <label class="stacked" for="tune-density">
+            <span id="tune-density-label">Density</span> <span id="tune-density-value">100%</span>
+            <input id="tune-density" type="range" min="25" max="250" value="100">
+          </label>
+        </div>
+
+        <div class="test-row" aria-label="Test sounds">
+          <button data-test-cue="start" type="button">Start</button>
+          <button data-test-cue="waiting" type="button">Waiting</button>
+          <button data-test-cue="resume" type="button">Resume</button>
+          <button data-test-cue="done" type="button">Done</button>
+        </div>
+      </section>
+
+      <section class="status-strip" aria-label="Connection status">
+        <div>
+          <span class="dot" id="connection-dot"></span>
+          <span id="connection-status">Disconnected</span>
+        </div>
+        <div id="audio-status">Audio disabled</div>
+        <div id="event-count">0 events</div>
+      </section>
+
+      <section class="sessions-section">
+        <div class="section-heading">
+          <h2>Sessions</h2>
+          <span id="session-count">0 active</span>
+        </div>
+        <div id="sessions" class="sessions"></div>
+        <p id="empty-state" class="empty-state">Connect to a compatible status WebSocket to hear state changes.</p>
+      </section>
+
+      <section class="panel log-panel" aria-label="Recent events">
+        <div class="section-heading">
+          <h2>Recent Events</h2>
+          <button id="clear-log" type="button">Clear</button>
+        </div>
+        <ol id="event-log" class="event-log"></ol>
+      </section>
+    </main>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>
