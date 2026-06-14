@@ -5,7 +5,11 @@ import { AgentStatus } from '../types/index';
 import { getAllNotificationTargets } from '../slack/lts';
 import { getSlackApp } from '../slack/app';
 import { getDiscordClient } from '../discord/app';
-import { capturePaneForSlack, formatPaneForSlack } from '../services/tmux';
+import { formatPaneForSlack } from '../services/tmux';
+// Capture must route through the per-user agent (the backend can't see the
+// user's tmux in-process), same as the /t command path. Without this, the
+// needs-input notification rendered "(unable to capture pane)".
+import { capturePaneForSlack } from '../slack/tmuxAgent';
 import { formatPaneForDiscord } from '../discord/formatting';
 import { recordHeartbeat } from '../services/humanActivity';
 import { requireAuth } from '../middleware/auth';
