@@ -390,12 +390,10 @@ html {
   font-size: 14px;
   padding: 0 4px;
   line-height: 1;
-  opacity: 0;
-  transition: opacity 0.15s;
+  /* Always visible (IDE-3308) so the overflow actions (Archive/Share/Pin/…)
+     are discoverable without hovering. Muted by default; brightens on hover. */
+  opacity: 1;
 }
-.project-item:hover .btn-overflow,
-.project-item .btn-overflow:focus,
-.project-actions:has(.project-menu) .btn-overflow { opacity: 1; }
 .btn-overflow:hover { color: var(--text-primary); }
 
 .project-menu {
