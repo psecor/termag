@@ -1,0 +1,57 @@
+# termag Slack app manifest.
+#
+# Create the app reproducibly: https://api.slack.com/apps → "Create New App" →
+# "From an app manifest" → pick the workspace → paste this YAML.
+#
+# After creating:
+#   1. Install to Workspace            → Bot User OAuth Token  (xoxb-…) → SLACK_BOT_TOKEN
+#   2. Basic Information → App-Level Token, scope connections:write (xapp-…) → SLACK_APP_TOKEN
+#   3. Basic Information → Signing Secret → SLACK_SIGNING_SECRET
+# Put those in the backend .env and restart termag. Socket mode means no public
+# request URL is needed (the backend dials out to Slack). See deploy/setup.md §7.
+#
+# Scopes/events mirror what the code uses (backend/src/slack/*).
+display_information:
+  name: termag
+  description: termag workspace manager — terminal/agent control from Slack
+  background_color: "#161b22"
+
+features:
+  bot_user:
+    display_name: termag
+    always_online: true
+  slash_commands:
+    - command: /t
+      description: termag terminal / agent control
+      usage_hint: "<cmd> | switch <project> | projects | ctrl | ls"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:manage
+      - channels:read
+      - commands
+      - im:history
+      - im:read
+      - im:write
+      - files:read
+      - reactions:read
+      - reactions:write
+      - users:read
+      - users:read.email
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_home_opened
+      - app_mention
+      - message.im
+      - reaction_added
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
