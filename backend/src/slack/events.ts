@@ -158,6 +158,48 @@ export function setActiveProjectId(userId: string, projectId: string): void {
 }
 
 /**
+ * Map a Slack channel → project. Primary: the saved slackChannelId. Fallback:
+ * a `proj-<name>` channel matched to a project by name (preferring the invoking
+ * user's, since names aren't globally unique) — then lazily backfill
+ * slackChannelId so it's a one-time self-heal. This covers projects created
+ * before Slack was enabled, which never got the channel link saved.
+ */
+async function resolveChannelProject(command: any, preferUserId?: string) {
+  const byId = await prisma.project.findFirst({
+    where: { slackChannelId: command.channel_id, archived: false },
+    include: { user: true },
+  });
+  if (byId) return byId;
+
+  const channelName: string = command.channel_name ?? '';
+  if (!channelName.startsWith('proj-')) return null;
+  const projectName = channelName.slice('proj-'.length);
+  if (!projectName) return null;
+
+  const byName =
+    (preferUserId
+      ? await prisma.project.findFirst({
+          where: { name: projectName, archived: false, userId: preferUserId },
+          include: { user: true },
+        })
+      : null) ??
+    (await prisma.project.findFirst({
+      where: { name: projectName, archived: false },
+      include: { user: true },
+    }));
+  if (!byName) return null;
+
+  // Persist the link so future lookups hit the fast path.
+  try {
+    await prisma.project.update({
+      where: { id: byName.id },
+      data: { slackChannelId: command.channel_id },
+    });
+  } catch { /* race / constraint — non-fatal, routing still works this time */ }
+  return byName;
+}
+
+/**
  * Process a DM or @mention — route to executor (clean Claude response)
  */
 async function processMessage(opts: {
@@ -512,11 +554,8 @@ export function registerEventHandlers(app: App): void {
     // ── /t ctrl <command> ──────────────────────────────
     if (userCommand.startsWith('ctrl')) {
       const ctrlCmd = userCommand.slice(4).trim();
-      // Resolve project: channel-based first, then active project
-      const channelProject = await prisma.project.findFirst({
-        where: { slackChannelId: command.channel_id, archived: false },
-        include: { user: true },
-      });
+      // Resolve project: channel-based first (with proj-<name> fallback), then active project
+      const channelProject = await resolveChannelProject(command, termagUser?.id);
       const projectId = channelProject?.id ?? getActiveProjectId(userId);
       if (!projectId) {
         await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <name>` or run from a project channel.' });
@@ -593,11 +632,8 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── Default: send to active project's agent session ─
-    // Resolve project: channel-based first, then active project, then auto-select
-    const channelProject = await prisma.project.findFirst({
-      where: { slackChannelId: command.channel_id, archived: false },
-      include: { user: true },
-    });
+    // Resolve project: channel-based first (with proj-<name> fallback), then active project, then auto-select
+    const channelProject = await resolveChannelProject(command, termagUser?.id);
     let agentSession: string;
 
     if (channelProject) {
