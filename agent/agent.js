@@ -749,6 +749,17 @@ function connect() {
           break;
         }
 
+        case 'tmux-list': {
+          try {
+            const { stdout } = await execAsync('tmux list-sessions -F "#{session_name}" 2>/dev/null');
+            const sessions = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+            respond(ws, requestId, { sessions });
+          } catch {
+            respond(ws, requestId, { sessions: [] });
+          }
+          break;
+        }
+
         case 'tmux-foreground-cmd': {
           const { sessionName } = msg;
           try {

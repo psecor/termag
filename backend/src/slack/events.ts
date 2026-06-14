@@ -20,11 +20,12 @@ import { formatResponse, formatError, formatWelcome, splitMessage } from './form
 import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
 import { ensureMainWorkstream } from '../services/workstreams';
+import { sessionName, projectDir, formatPaneForSlack } from '../services/tmux';
+// tmux ops route through the per-user agent (the backend can't see the user's
+// tmux in-process). Same signatures as the old ../services/tmux helpers.
 import {
-  sessionName, projectDir, ensureSession, hasSession,
-  listSessions as tmuxListSessions, sendKeys,
-  capturePaneForSlack, formatPaneForSlack, pollUntilStable,
-} from '../services/tmux';
+  hasSession, sendKeys, capturePaneForSlack, pollUntilStable, listSessionsViaAgent,
+} from './tmuxAgent';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import {
@@ -472,7 +473,10 @@ export function registerEventHandlers(app: App): void {
 
     // ── /t ls ──────────────────────────────────────────
     if (userCommand === 'ls' || userCommand === 'sessions') {
-      const sessions = await tmuxListSessions();
+      // List the invoking user's agent sessions (legacy/local agent).
+      const sessions = termagUser
+        ? await listSessionsViaAgent({ userId: termagUser.id, instanceId: null })
+        : [];
       if (sessions.length === 0) {
         await client.chat.postMessage({ channel: command.channel_id, text: 'No tmux sessions.' });
       } else {

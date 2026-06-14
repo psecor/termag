@@ -191,20 +191,25 @@ const MAX_CAPTURE_LINES = 100;
 /**
  * Capture pane content with ANSI stripping, suitable for Slack display.
  */
+// Normalize raw `tmux capture-pane` stdout for Slack: trim trailing blank
+// lines, cap length, strip ANSI. Shared by the in-process capture below and
+// the agent-routed capture in slack/tmuxAgent.ts.
+export function cleanPaneText(stdout: string): string {
+  let lines = stdout.split('\n').map((l: string) => l.trimEnd());
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  if (lines.length > MAX_CAPTURE_LINES) {
+    lines = ['…(output truncated)…', ...lines.slice(-MAX_CAPTURE_LINES)];
+  }
+  return lines.join('\n')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\x1b[()][A-Z0-9]/g, '')
+    .replace(/\x1b[^[\]]/g, '');
+}
+
 export async function capturePaneForSlack(sessionName: string): Promise<string> {
   try {
     const { stdout } = await execAsync(`tmux capture-pane -t ${shellEscape(sessionName)} -p`);
-    let lines = stdout.split('\n').map((l: string) => l.trimEnd());
-    // Remove trailing blank lines
-    while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-    if (lines.length > MAX_CAPTURE_LINES) {
-      lines = ['…(output truncated)…', ...lines.slice(-MAX_CAPTURE_LINES)];
-    }
-    // Strip ANSI escape sequences
-    return lines.join('\n')
-      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-      .replace(/\x1b[()][A-Z0-9]/g, '')
-      .replace(/\x1b[^[\]]/g, '');
+    return cleanPaneText(stdout);
   } catch {
     return '(unable to capture pane)';
   }

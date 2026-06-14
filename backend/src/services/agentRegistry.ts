@@ -195,7 +195,7 @@ export function sendToInstanceAgent(instanceId: string, type: string, payload: R
  * Project-keyed routing: sends to the project's box if it lives on one,
  * else to the user's legacy agent. The two predicates below pair with it.
  */
-type ProjectHost = { userId: string; instanceId: string | null };
+export type ProjectHost = { userId: string; instanceId: string | null };
 
 export function isProjectAgentConnected(project: ProjectHost): boolean {
   return project.instanceId
