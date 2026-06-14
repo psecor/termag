@@ -119,8 +119,17 @@ export async function addReactionHints(client: any, channelId: string, messageTs
 const userLastRequest = new Map<string, number>();
 const RATE_LIMIT_MS = (parseInt(process.env.RATE_LIMIT_SECONDS ?? '2', 10)) * 1000;
 
+// ALLOWED_SLACK_USERS is documented as `slackId:unixuser` pairs (see
+// .env.example / deploy/setup.md), but the gate below only matches on the bare
+// Slack user id. Strip the optional `:unixuser` so the documented format works
+// (also accepts a bare id). Actual termag-user resolution is by email in
+// resolveTermagUser, so the unixuser suffix is informational here.
 const ALLOWED_USERS = process.env.ALLOWED_SLACK_USERS
-  ? new Set(process.env.ALLOWED_SLACK_USERS.split(',').map(id => id.trim()).filter(Boolean))
+  ? new Set(
+      process.env.ALLOWED_SLACK_USERS.split(',')
+        .map(entry => entry.split(':')[0].trim())
+        .filter(Boolean),
+    )
   : null;
 
 function isRateLimited(userId: string): boolean {
