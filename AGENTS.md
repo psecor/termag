@@ -206,6 +206,23 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 
 **Pre-commit** — a `gitleaks` hook is configured in `.pre-commit-config.yaml` with rules in `.gitleaks.toml`. Run `pre-commit install` once after cloning so leaked AWS / Slack / OAuth credentials get caught before they land in history.
 
+## Testing
+
+**Changes should ship with tests.** The backend runs [vitest](https://vitest.dev):
+
+```bash
+cd backend && npm test        # vitest run — discovers src/**/*.test.ts
+```
+
+There's no HTTP/DB integration harness, so prefer **extracting logic into pure,
+side-effect-free modules** and unit-testing those — importing a route file like
+`routes/projects.ts` directly drags in a module-level `PrismaClient` plus the
+tmux/slack/agentRegistry imports. See `routes/bulkPin.ts` (+ `bulkPin.test.ts`)
+and `auth/allowedUsers.ts` (+ `allowedUsers.test.ts`) for the pattern: the route
+handler stays a thin wrapper, the testable logic lives in its own module. DB- and
+side-effect-bound behavior is covered by manual verification until an integration
+harness exists. The frontend has no test runner configured yet.
+
 ## Observability & Maintenance
 
 - `journalctl -u termag -f` — main server.
