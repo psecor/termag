@@ -63,6 +63,36 @@ export function ProjectControl() {
   const [confirmState, setConfirmState] = useState<{ message: string; onConfirm: () => void } | null>(null);
   const [projectFilter, setProjectFilter] = useState('');
 
+  // Multiselect edit mode: a "Select" toggle flips owned project rows into
+  // checkbox mode for bulk pin/unpin. Collaborator rows aren't pinnable, so
+  // they stay unselectable.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  async function bulkSetPinned(pinned: boolean) {
+    if (selectedIds.size === 0) return;
+    try {
+      await projectsApi.bulkPin([...selectedIds], pinned);
+      await reloadProjects();
+      exitSelectMode();
+    } catch {
+      setError('Failed to update pins');
+    }
+  }
+
   // Track status transitions for highlight flash
   const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
   const mountedAtRef = useRef(Date.now());
@@ -497,14 +527,34 @@ export function ProjectControl() {
     const stripe = boxStripeColor(p.instanceId);
     const box = p.instanceId ? boxes.find(b => b.id === p.instanceId) : null;
     const wsCount = p.workstreams?.length ?? 0;
+    // Only owned projects are pinnable, so only they're selectable in edit mode.
+    const selectable = p.role !== 'collaborator';
+    const selected = selectMode && selectedIds.has(p.id);
     return (
       <li
         key={p.id}
-        className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
+        className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${selectMode ? 'select-mode' : ''} ${selected ? 'selected' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
         style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
         title={box ? `box: ${box.name}` : undefined}
-        onClick={() => setActiveProject(p.id)}
+        onClick={() => {
+          if (selectMode) {
+            if (selectable) toggleSelected(p.id);
+          } else {
+            setActiveProject(p.id);
+          }
+        }}
       >
+        {selectMode && (
+          <input
+            type="checkbox"
+            className="project-select-checkbox"
+            checked={selected}
+            disabled={!selectable}
+            title={selectable ? undefined : 'Shared projects can’t be pinned'}
+            onChange={() => selectable && toggleSelected(p.id)}
+            onClick={e => e.stopPropagation()}
+          />
+        )}
         <span className="project-status">
           {statusEmoji(p)}
           {rateLimit ? (
@@ -566,6 +616,7 @@ export function ProjectControl() {
             )}
           </>
         )}
+        {!selectMode && (
         <span className="project-actions" onClick={e => e.stopPropagation()}>
           <button
             className="btn-tiny btn-overflow"
@@ -601,6 +652,7 @@ export function ProjectControl() {
             </div>
           )}
         </span>
+        )}
       </li>
     );
   }
@@ -634,7 +686,15 @@ export function ProjectControl() {
       )}
 
       <section className="control-section">
-        <h3>Projects</h3>
+        <div className="control-section-head">
+          <h3>Projects</h3>
+          <button
+            className="btn-ghost btn-select-toggle"
+            onClick={() => { setMenuOpenId(null); selectMode ? exitSelectMode() : setSelectMode(true); }}
+          >
+            {selectMode ? 'Done' : 'Select'}
+          </button>
+        </div>
         {projects.length > 5 && (
           <input
             className="project-filter"
@@ -644,6 +704,33 @@ export function ProjectControl() {
             onChange={e => setProjectFilter(e.target.value)}
           />
         )}
+        {selectMode && (() => {
+          // Select-all / clear operate on the currently filtered, owned (pinnable)
+          // projects — the same set that shows checkboxes.
+          const selectableIds = (projectFilter
+            ? projects.filter(p => p.name.toLowerCase().includes(projectFilter.toLowerCase()))
+            : projects
+          ).filter(p => p.role !== 'collaborator').map(p => p.id);
+          const allSelected = selectableIds.length > 0 && selectableIds.every(id => selectedIds.has(id));
+          return (
+            <div className="project-select-toolbar">
+              <span className="project-select-count">{selectedIds.size} selected</span>
+              <button
+                className="btn-tiny"
+                disabled={selectableIds.length === 0}
+                onClick={() => setSelectedIds(allSelected ? new Set() : new Set(selectableIds))}
+              >
+                {allSelected ? 'Clear' : 'Select all'}
+              </button>
+              <button className="btn-tiny" disabled={selectedIds.size === 0} onClick={() => bulkSetPinned(true)}>
+                ◇ Pin
+              </button>
+              <button className="btn-tiny" disabled={selectedIds.size === 0} onClick={() => bulkSetPinned(false)}>
+                ◆ Unpin
+              </button>
+            </div>
+          );
+        })()}
         <ul className="project-list">
           {(() => {
             const filtered = projectFilter

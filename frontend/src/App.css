@@ -259,6 +259,37 @@ html {
 
 .project-item:hover  { background: var(--bg-elevated); }
 .project-item.active { background: var(--bg-active); border-color: var(--border); }
+.project-item.selected { background: var(--bg-active); border-color: var(--accent-dim); }
+
+.project-select-checkbox {
+  flex: 0 0 auto;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.project-select-checkbox:disabled { cursor: not-allowed; opacity: 0.4; }
+
+/* Projects header row: title + the Select/Done toggle on the right. */
+.control-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.control-section-head h3 { margin-bottom: 6px; }
+.btn-select-toggle { font-size: 11px; padding: 2px 8px; }
+
+.project-select-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.project-select-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-right: auto;
+}
+.btn-tiny:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Box group header in the project list — the "bigger grain" box marker.
    Carries the box's color as a thicker left band (5px vs the row's 3px) so a
