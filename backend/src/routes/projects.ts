@@ -2,6 +2,7 @@ import { Router, RequestHandler } from 'express';
 import { PrismaClient, WorkflowType } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
+import { parseBulkPinBody } from './bulkPin';
 import * as tmux from '../services/tmux';
 import {
   isAgentConnected,
@@ -508,6 +509,26 @@ export function projectsRouter(): Router {
     }
   };
 
+  // Bulk pin/unpin. Unlike togglePin, the target state is explicit so a mixed
+  // selection ends up uniform. Scoped to the caller's owned projects (same guard
+  // togglePin uses), so collaborator/foreign ids are silently skipped.
+  const bulkPin: RequestHandler = async (req, res) => {
+    try {
+      const parsed = parseBulkPinBody(req.body);
+      if ('error' in parsed) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      const result = await prisma.project.updateMany({
+        where: { id: { in: parsed.projectIds }, userId: req.user!.id },
+        data: { pinned: parsed.pinned },
+      });
+      res.json({ updated: result.count });
+    } catch {
+      res.status(500).json({ error: 'Failed to update pins' });
+    }
+  };
+
   // Capture pane content for a project session — works for projects you own
   // OR projects shared with you. Routes through the owner's agent so the
   // requester sees what's actually on screen for the owner's tmux.
@@ -573,6 +594,9 @@ export function projectsRouter(): Router {
 
   router.get('/', requireAuth, list);
   router.post('/', requireAuth, create);
+  // Must precede the `/:id` routes — `/bulk/pin` would otherwise match
+  // `/:id/pin` with id="bulk".
+  router.post('/bulk/pin', requireAuth, bulkPin);
   router.put('/:id', requireAuth, update);
   router.post('/:id/rename', requireAuth, renameProject);
   router.post('/:id/pin', requireAuth, togglePin);
