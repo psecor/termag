@@ -132,7 +132,7 @@ html {
   position: relative;
   flex: 1;
   overflow: hidden;
-  border-right: 1px solid var(--border);
+  /* separation is the .pane-divider (wide mode); narrow mode shows one pane */
 }
 
 .app-ctrl {
@@ -140,6 +140,33 @@ html {
   flex: 1;
   overflow: hidden;
 }
+
+/* Draggable separator between the agent and ctrl panes (wide mode). */
+.pane-divider {
+  flex: 0 0 6px;
+  align-self: stretch;
+  cursor: col-resize;
+  background: var(--border);
+  position: relative;
+  z-index: 2;
+  transition: background 0.12s ease;
+  touch-action: none;
+}
+.pane-divider:hover,
+.pane-divider:active { background: var(--accent); }
+/* subtle grip */
+.pane-divider::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 28px;
+  border-radius: 1px;
+  background: var(--text-muted);
+}
+.pane-divider:hover::after { background: var(--bg-base); }
 
 /* ── Empty pane placeholder ────────────────────────────────── */
 .empty-pane {

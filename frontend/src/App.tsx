@@ -137,6 +137,36 @@ function MainLayout() {
     setSidebarCollapsed(isNarrow);
   }, [isNarrow]);
 
+  // Adjustable agent/ctrl split (wide mode only). Agent pane gets `agentPct`%
+  // of the width; the divider drags it (clamped 15–85), double-click resets to
+  // 50. Persisted to localStorage. The terminals' own ResizeObserver refits
+  // them as the panes resize, so nothing else to wire.
+  const [agentPct, setAgentPct] = useState<number>(() => {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('termag-pane-split') : null;
+    const n = raw ? parseFloat(raw) : NaN;
+    return Number.isFinite(n) && n >= 15 && n <= 85 ? n : 50;
+  });
+  const panesRef = useRef<HTMLDivElement>(null);
+  const draggingDivider = useRef(false);
+  useEffect(() => {
+    try { localStorage.setItem('termag-pane-split', String(agentPct)); } catch { /* private mode */ }
+  }, [agentPct]);
+  const onDividerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    draggingDivider.current = true;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, []);
+  const onDividerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!draggingDivider.current || !panesRef.current) return;
+    const rect = panesRef.current.getBoundingClientRect();
+    const pct = ((e.clientX - rect.left) / rect.width) * 100;
+    setAgentPct(Math.max(15, Math.min(85, pct)));
+  }, []);
+  const onDividerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    draggingDivider.current = false;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  }, []);
+
   return (
     <div className={`app-layout ${sidebarCollapsed ? 'sidebar-is-collapsed' : ''}`}>
       <div className="app-hyperspace-bg">
@@ -211,9 +241,13 @@ function MainLayout() {
             </div>
           )}
         </div>
-        <div className="app-panes">
+        <div className="app-panes" ref={panesRef}>
           {(!isNarrow || activePane === 'agent') && (
-            <div className="app-agent" id="terminal-agent">
+            <div
+              className="app-agent"
+              id="terminal-agent"
+              style={(!isNarrow && activeProject && hasAgent) ? { flex: `0 0 ${agentPct}%` } : undefined}
+            >
               {activeProject && hasAgent ? (
                 <Terminal
                   sessionName={agentSession}
@@ -230,6 +264,16 @@ function MainLayout() {
                 </div>
               )}
             </div>
+          )}
+          {!isNarrow && activeProject && hasAgent && (
+            <div
+              className="pane-divider"
+              onPointerDown={onDividerDown}
+              onPointerMove={onDividerMove}
+              onPointerUp={onDividerUp}
+              onDoubleClick={() => setAgentPct(50)}
+              title="Drag to resize · double-click to reset"
+            />
           )}
           {(!isNarrow || activePane === 'ctrl') && (
             <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
