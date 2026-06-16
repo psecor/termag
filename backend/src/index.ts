@@ -9,7 +9,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { parse as parseCookie } from 'querystring';
 
-import { configurePassport, authRouter } from './routes/auth';
+import { configurePassport, authRouter, albSessionBridge } from './routes/auth';
 import { projectsRouter } from './routes/projects';
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
@@ -103,6 +103,8 @@ const sessionMiddleware = session({
 app.use(BASE_PATH || '/', sessionMiddleware);
 app.use(BASE_PATH || '/', passport.initialize());
 app.use(BASE_PATH || '/', passport.session());
+// Turn the ALB's verified Okta identity (x-amzn-oidc-data) into a session.
+app.use(BASE_PATH || '/', albSessionBridge);
 
 configurePassport();
 

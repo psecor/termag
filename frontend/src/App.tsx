@@ -19,7 +19,7 @@ function Login() {
       <div className="login-card">
         <h1>termag</h1>
         <p>Workspace manager</p>
-        <a href="/termag/auth/google" className="btn-primary">Sign in with Google</a>
+        <a href="/termag/auth/login" className="btn-primary">Sign in with Okta</a>
       </div>
     </div>
   );

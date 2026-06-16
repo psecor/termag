@@ -1,53 +1,16 @@
-import { Router, RequestHandler } from 'express';
+import { Router, RequestHandler, Request, Response, NextFunction } from 'express';
 import passport from 'passport';
-import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
+import { verifyAlbIdentity } from '../auth/albOidc';
 
 const prisma = new PrismaClient();
 
 export function configurePassport(): void {
-  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
-  const basePath = process.env.BASE_PATH ?? '';
-  const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
-
-  passport.use(
-    new GoogleStrategy(
-      {
-        clientID: process.env.GOOGLE_CLIENT_ID ?? '',
-        clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
-        callbackURL: `${frontendUrl}${basePath}/auth/google/callback`,
-      },
-      async (_accessToken: string, _refreshToken: string, profile: Profile, done) => {
-        try {
-          const email = profile.emails?.[0]?.value ?? '';
-          const unixUsername = resolveUnixUsername(allowedUsers, email);
-
-          if (!unixUsername) {
-            console.warn(`[auth] rejected sign-in for ${email || '(no email)'}: not in ALLOWED_USERS`);
-            return done(null, false);
-          }
-
-          const user = await prisma.user.upsert({
-            where: { googleId: profile.id },
-            update: { displayName: profile.displayName },
-            create: {
-              googleId: profile.id,
-              googleEmail: email,
-              unixUsername,
-              displayName: profile.displayName,
-            },
-          });
-
-          return done(null, user as Express.User);
-        } catch (err) {
-          return done(err as Error);
-        }
-      }
-    )
-  );
-
+  // Identity comes from the ALB's authenticate-oidc (Okta) edge auth, verified
+  // by albSessionBridge below — there is no in-app OAuth strategy. Passport is
+  // kept only for its session (serialize/deserialize by user id).
   passport.serializeUser((user, done) => {
     done(null, (user as Express.User).id);
   });
@@ -62,23 +25,71 @@ export function configurePassport(): void {
   });
 }
 
+/**
+ * Bridge the ALB-verified Okta identity into a passport session. Runs on every
+ * request after passport.session():
+ *   - already has a session  -> pass through
+ *   - no `x-amzn-oidc-data`   -> pass through (machine/token routes that bypass
+ *                                edge auth handle their own auth; human routes
+ *                                without a session fall through to a 401)
+ *   - valid identity in ALLOWED_USERS -> upsert + establish session
+ *   - identity not allowlisted        -> 403
+ *   - present but invalid (tampered/expired) -> 401 (fail closed)
+ * Kolide device trust is enforced upstream by Okta before the ALB ever signs
+ * this header, so reaching here means the device already passed posture checks.
+ */
+export const albSessionBridge: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
+  if (req.user) return next();
+
+  let identity;
+  try {
+    identity = await verifyAlbIdentity(req);
+  } catch (err) {
+    console.warn(`[auth] rejecting request with invalid ALB identity: ${(err as Error).message}`);
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  if (!identity) return next();
+
+  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
+  const unixUsername = resolveUnixUsername(allowedUsers, identity.email);
+  if (!unixUsername) {
+    console.warn(`[auth] rejected sign-in for ${identity.email}: not in ALLOWED_USERS`);
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  try {
+    const user = await prisma.user.upsert({
+      where: { googleEmail: identity.email },
+      update: { displayName: identity.name ?? identity.email, unixUsername },
+      create: {
+        googleId: `okta:${identity.sub}`,
+        googleEmail: identity.email,
+        unixUsername,
+        displayName: identity.name ?? identity.email,
+      },
+    });
+    req.login(user as Express.User, (err) => {
+      if (err) return next(err);
+      next();
+    });
+  } catch (err) {
+    next(err as Error);
+  }
+};
+
 export function authRouter(): Router {
   const router = Router();
   const basePath = process.env.BASE_PATH ?? '';
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
 
-  router.get(
-    '/google',
-    passport.authenticate('google', { scope: ['profile', 'email'] })
-  );
-
-  router.get(
-    '/google/callback',
-    passport.authenticate('google', { failureRedirect: `${basePath}/login?error=unauthorized` }),
-    (_req, res) => {
-      res.redirect(`${frontendUrl}${basePath}/`);
-    }
-  );
+  // Login entry point. The ALB has already authenticated the user against Okta
+  // by the time any request reaches the app, so albSessionBridge has a verified
+  // identity to turn into a session — just bounce to the app root.
+  router.get('/login', (_req, res) => {
+    res.redirect(`${frontendUrl}${basePath}/`);
+  });
 
   const logout: RequestHandler = (req, res, next) => {
     req.logout((err) => {
