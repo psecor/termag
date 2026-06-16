@@ -38,4 +38,6 @@ paths = [
   '''^LICENSE$''',
   # The gitleaks config itself names the strings it's looking for
   '''^\.gitleaks\.toml$''',
+  # Maintainer doc describes the deny-list patterns by example
+  '''^docs/public-mirror-sync\.md$''',
 ]
