@@ -376,6 +376,11 @@ html {
   letter-spacing: 0;
   text-transform: none;
 }
+.ctx-bar-ok {
+  color: var(--success);
+  background: rgba(63, 185, 80, 0.15);
+  border: 1px solid rgba(63, 185, 80, 0.3);
+}
 .ctx-bar-warn {
   color: var(--warning);
   background: rgba(210, 153, 34, 0.15);

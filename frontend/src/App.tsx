@@ -219,11 +219,12 @@ function MainLayout() {
               );
             }
             const ctx = st?.contextTokens;
-            if (!ctx || ctx < 500_000) return null;
-            const level = ctx >= 1_000_000 ? 'danger' : 'warn';
+            if (ctx == null) return null;
+            const level = ctx >= 1_000_000 ? 'danger' : ctx >= 500_000 ? 'warn' : 'ok';
             const label = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(1)}M` : `${Math.round(ctx / 1000)}K`;
+            const title = level === 'ok' ? 'Context tokens' : 'Context tokens — consider /clear';
             return (
-              <span className={`ctx-bar-badge ctx-bar-${level}`} title="Context tokens — consider /clear">
+              <span className={`ctx-bar-badge ctx-bar-${level}`} title={title}>
                 {label}
               </span>
             );
