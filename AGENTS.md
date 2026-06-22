@@ -1,7 +1,7 @@
 ---
 project: termag
 status: production
-status_description: "Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe, Devin), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking agent working time and human activity, pinned/recent-activity-sorted project list, on-demand EC2 box provisioning via Packer AMI + Terraform module ("Add box" button) with projects routed by `Instance`, per-project git-worktree workstreams (every project starts with `main`), and visit/flow-speed telemetry (ProjectVisit + WarpSample) surfaced in the usage overlay."
+status_description: 'Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe, Devin), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking agent working time and human activity, pinned/recent-activity-sorted project list, on-demand EC2 box provisioning via Packer AMI + Terraform module ("Add box" button) with projects routed by `Instance`, per-project git-worktree workstreams (every project starts with `main`), and visit/flow-speed telemetry (ProjectVisit + WarpSample) surfaced in the usage overlay.'
 last_updated: 2026-06-01
 last_updated_by:
   - agent:claude-opus-4-6
