@@ -27,7 +27,7 @@ function getSessionWarpContribution(session?: AgentStatus): number {
 export function computeLegacyWarp(activeCount: number, typingBoost: boolean): number {
   const count = Number(activeCount) || 0;
   const baseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
-  const speed = baseSpeed + (typingBoost ? Math.max(0.8, baseSpeed * 0.5) : 0);
+  const speed = baseSpeed + (typingBoost ? Math.max(0.4, baseSpeed * 0.25) : 0);
   return speed <= 0.4 ? 0.1 : speed * 0.5;
 }
 
@@ -56,7 +56,7 @@ export function computeWarpWithFallback(statusMap: StatusMap, typingBoost: boole
   const sessionContribution = sessions.reduce((sum, session) => sum + getSessionWarpContribution(session), 0);
   return {
     mode: 'activity',
-    targetWarp: 0.1 + sessionContribution + (typingBoost ? 0.5 : 0),
+    targetWarp: 0.1 + sessionContribution + (typingBoost ? 0.25 : 0),
     workingCount,
     waitingCount,
     isActive: workingCount > 0 || waitingCount > 0 || typingBoost,

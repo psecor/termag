@@ -56,7 +56,7 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange 
       const count = activeCountRef.current;
 
       const fallbackBaseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
-      const fallbackSpeed = fallbackBaseSpeed + (typingRef.current ? Math.max(0.8, fallbackBaseSpeed * 0.5) : 0);
+      const fallbackSpeed = fallbackBaseSpeed + (typingRef.current ? Math.max(0.4, fallbackBaseSpeed * 0.25) : 0);
       const fallbackWarp = fallbackSpeed <= 0.4 ? 0.1 : fallbackSpeed * 0.5;
       const requestedWarp = typeof targetWarpRef.current === 'number' ? targetWarpRef.current : fallbackWarp;
       const speed = requestedWarp <= 0.1 ? 0.4 : requestedWarp * 2.75;
