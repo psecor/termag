@@ -305,13 +305,21 @@ async function scanContextTokens() {
 
   if (sessions.length === 0) return;
 
-  // Build project name → session name map
-  const projectSessions = new Map();
+  // Map each agent session to the Claude project-log dir for its working
+  // directory. Claude encodes a cwd into its ~/.claude/projects dir name by
+  // replacing both '/' and '.' with '-', so we reproduce that here. Keying on
+  // the actual cwd (not a name parsed out of the session string) is what makes
+  // non-main workstreams work: a worktree session lives in
+  // <project>/.worktrees/<ws>, whose dir bears no relation to the session name.
+  const dirToSession = new Map();
   for (const s of sessions) {
-    // Session format: username-projectName-agent
-    const afterUser = s.substring(username.length + 1);
-    const projectName = afterUser.replace(/-agent$/, '');
-    if (projectName) projectSessions.set(projectName, s);
+    let cwd;
+    try {
+      const { stdout } = await execAsync(`tmux display-message -p -t ${shellEscape(s)} '#{pane_current_path}'`);
+      cwd = stdout.trim();
+    } catch { continue; }
+    if (!cwd) continue;
+    dirToSession.set(cwd.replace(/[/.]/g, '-'), s);
   }
 
   // Read JSONL dirs and match to projects
@@ -321,15 +329,11 @@ async function scanContextTokens() {
   const statusEndpoint = getStatusEndpoint();
 
   for (const dir of projectDirs) {
-    // Dir names are paths with / replaced by -, e.g. "-home-alice-termag-projects-foo"
-    // Match against known project names
-    let matchedSession = null;
-    for (const [projName, sessName] of projectSessions) {
-      if (dir.endsWith('-' + projName) || dir.endsWith(projName)) {
-        matchedSession = sessName;
-        break;
-      }
-    }
+    // Dir names are cwds with '/' and '.' replaced by '-', e.g.
+    // "-home-alice-termag-projects-foo" (main) or
+    // "-home-alice-termag-projects-foo--worktrees-bar" (worktree "bar").
+    // Exact-match the dir to the session whose cwd encodes to it.
+    const matchedSession = dirToSession.get(dir);
     if (!matchedSession) continue;
 
     const dirPath = path.join(claudeDir, dir);
