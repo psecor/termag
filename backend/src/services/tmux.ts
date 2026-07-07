@@ -104,6 +104,11 @@ export async function createSession(name: string, cwd: string = process.env.HOME
   );
   await execAsync(`tmux set-option -t ${shellEscape(name)} -w window-size largest`);
   await execAsync(`tmux set-option -t ${shellEscape(name)} history-limit 10000`);
+  // Let tmux copy operations (copy-mode y/M-w, mouse drag-end) emit OSC 52 so
+  // selections reach the browser clipboard via xterm.js. set-clipboard is a
+  // server option; -g applies it to all sessions.
+  await execAsync(`tmux set-option -g set-clipboard on`);
+  await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
 }
 
 export async function ensureSession(name: string, cwd?: string): Promise<boolean> {

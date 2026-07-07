@@ -30,6 +30,60 @@ const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
 
 type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
+// Handle an incoming OSC 52 payload ("<selection>;<base64>") by writing the
+// decoded text to the system clipboard. This is how a copy inside tmux
+// (copy-mode `y`/`M-w` or a mouse drag-selection, with `set-clipboard on`)
+// reaches the browser clipboard: tmux emits OSC 52 into the PTY stream, which
+// flows over the WebSocket into xterm.js. xterm.js has no built-in OSC 52
+// clipboard write, so we register this handler ourselves. Returns true to mark
+// the sequence as handled.
+function handleOsc52(payload: string): boolean {
+  const sep = payload.indexOf(';');
+  if (sep === -1) return true;
+  const b64 = payload.slice(sep + 1);
+  // "?" is a clipboard *read* request; we don't expose clipboard contents back
+  // to the terminal, so just swallow it.
+  if (b64 === '?' || b64 === '') return true;
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const text = new TextDecoder().decode(bytes);
+    // navigator.clipboard requires a secure context (we're on https) and, in
+    // Chrome, the document to be focused — which it is here, since the copy is
+    // driven by the user's own mouse-up/keypress in this tab. It is NOT within
+    // a transient user-activation window (the bytes arrive async over the
+    // WebSocket), so Firefox may reject the write; that's an accepted
+    // limitation. Fall back to a hidden-textarea execCommand copy if the async
+    // API is unavailable or throws synchronously.
+    const write = () => {
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).catch(() => legacyCopy(text));
+      } else {
+        legacyCopy(text);
+      }
+    };
+    write();
+  } catch { /* malformed base64 — ignore */ }
+  return true;
+}
+
+// Last-resort clipboard write for contexts where the async Clipboard API is
+// blocked. Works only while the document is focused, which holds right after a
+// terminal interaction.
+function legacyCopy(text: string): void {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  } catch { /* clipboard blocked — nothing more we can do */ }
+}
+
 export function Terminal({ sessionName, projectId, workstream, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -92,6 +146,8 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
     term.loadAddon(fitAddon);
     term.loadAddon(new WebLinksAddon());
     term.open(container);
+    // Route OSC 52 (clipboard) sequences emitted by tmux to the browser clipboard.
+    term.parser.registerOscHandler(52, handleOsc52);
     termRef.current = term;
 
     const onFocus = () => setFocused(true);

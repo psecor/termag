@@ -718,6 +718,11 @@ function connect() {
             await execAsync(`tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(cwd)} -x 120 -y 30`);
             await execAsync(`tmux set-option -t ${shellEscape(sessionName)} -w window-size largest`);
             await execAsync(`tmux set-option -t ${shellEscape(sessionName)} history-limit 10000`);
+            // Let tmux copy operations (copy-mode y/M-w, mouse drag-end) emit
+            // OSC 52 so selections reach the browser clipboard via xterm.js.
+            // set-clipboard is a server option; -g applies it to all sessions.
+            await execAsync(`tmux set-option -g set-clipboard on`);
+            await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
           }
           respond(ws, requestId, { ok: true });
           break;
@@ -885,6 +890,16 @@ function connect() {
 
         case 'terminal-attach': {
           const { tmuxSessionName, streamId, cols: initCols, rows: initRows } = msg;
+          // Ensure OSC 52 clipboard passthrough is on for THIS attach. These are
+          // server-global options, but tmux only picks up the create-time values
+          // for freshly created sessions — a long-lived tmux server whose session
+          // predates the clipboard change never gets them. Setting them here (on
+          // every attach) is idempotent and guarantees copy-selection emits
+          // OSC 52 to the client we're about to spawn, regardless of session age.
+          try {
+            await execAsync(`tmux set-option -g set-clipboard on`);
+            await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
+          } catch { /* tmux may not support the option; harmless */ }
           const term = pty.spawn('tmux', ['attach-session', '-t', tmuxSessionName], {
             name: 'xterm-256color',
             cols: initCols || 80,
