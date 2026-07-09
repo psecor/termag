@@ -289,7 +289,20 @@ async function scanUsage() {
 // and POSTs contextTokens to the status endpoint so the UI can warn about bloated contexts.
 
 const CONTEXT_SCAN_INTERVAL_MS = 60_000;
+// Read this many bytes from the END of the JSONL when hunting for the last
+// message.usage entry. The tail of a log can be a long run of non-assistant
+// lines (tool results, user messages, resume metadata) that push the real
+// usage entry far back — an 8KB window was missing entries ~100KB deep.
+const CONTEXT_READ_BYTES = 512 * 1024;
+// A usage entry only reflects the CURRENT context if it's recent. Past this we
+// treat context as unknown and clear the badge, so a stale reading (old
+// conversation, post-/clear or /compact, or an idle resume that only bumps the
+// file mtime) is expired rather than frozen on the UI.
+const CONTEXT_FRESH_MS = 10 * 60 * 1000;
 let contextScanTimer = null;
+// Last contextTokens value POSTed per session (number or null), so we only POST
+// on change instead of re-broadcasting an unchanged reading every scan.
+const lastContextTokens = new Map();
 
 async function scanContextTokens() {
   const username = process.env.USER || require('os').userInfo().username;
@@ -353,51 +366,58 @@ async function scanContextTokens() {
     }
     if (!newest) continue;
 
-    // Only scan if modified in last 10 minutes (active conversation)
-    if (Date.now() - newestMtime > 10 * 60 * 1000) continue;
-
-    // Read last ~8KB to find the last usage entry
+    // Find the most recent usage entry by reading a large chunk from the END of
+    // the file. The tail can be a long run of non-assistant lines (tool results,
+    // user messages, resume metadata), so a small window misses the real entry.
+    // We deliberately do NOT gate on the file's mtime: an idle resume can bump
+    // mtime with no new turn. Instead we judge recency from the usage entry's
+    // own timestamp and expire (null) anything stale so it isn't frozen on the UI.
     const filePath = path.join(dirPath, newest);
+    let contextTokens = null;
     try {
       const fileSize = (await stat(filePath)).size;
-      const readSize = Math.min(8192, fileSize);
+      const readSize = Math.min(CONTEXT_READ_BYTES, fileSize);
       const buf = Buffer.alloc(readSize);
       const fd = fs.openSync(filePath, 'r');
       fs.readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
       fs.closeSync(fd);
 
       const lines = buf.toString('utf8').split('\n').reverse();
-      let contextTokens = null;
       for (const line of lines) {
         if (!line) continue;
         try {
           const entry = JSON.parse(line);
           const u = entry.message?.usage;
-          if (u) {
+          if (!u) continue;
+          // Only report if this turn is recent; otherwise leave contextTokens
+          // null so the badge expires instead of showing a stale reading.
+          const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+          if (Number.isFinite(ts) && Date.now() - ts <= CONTEXT_FRESH_MS) {
             contextTokens = (u.input_tokens || 0)
               + (u.cache_read_input_tokens || 0)
               + (u.cache_creation_input_tokens || 0);
-            break;
           }
+          break; // most recent usage entry found — stop regardless of recency
         } catch { continue; }
       }
-
-      if (contextTokens === null) continue;
-
-      // POST context tokens to status endpoint (metadata-only, no status change)
-      const payload = JSON.stringify({
-        session: matchedSession,
-        contextTokens,
-      });
-      const url = new URL(statusEndpoint);
-      const http = require(url.protocol === 'https:' ? 'https' : 'http');
-      const req = http.request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      });
-      req.on('error', () => {});
-      req.end(payload);
     } catch { continue; }
+
+    // Only POST when the value changed (including a change to null), so we don't
+    // re-broadcast an unchanged reading every scan. A null POST clears a
+    // previously-reported value on the badge.
+    if (lastContextTokens.get(matchedSession) === contextTokens) continue;
+    lastContextTokens.set(matchedSession, contextTokens);
+
+    // POST to the status endpoint (metadata-only, no status change).
+    const payload = JSON.stringify({ session: matchedSession, contextTokens });
+    const url = new URL(statusEndpoint);
+    const http = require(url.protocol === 'https:' ? 'https' : 'http');
+    const req = http.request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    });
+    req.on('error', () => {});
+    req.end(payload);
   }
 }
 
