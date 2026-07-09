@@ -10,6 +10,10 @@ backend/prisma/migrations/**/migration_lock.toml
 # Frontend build
 frontend/dist/
 
+# Local git worktrees (termag creates these under <project>/.worktrees/<name>
+# for non-main workstreams; they're embedded checkouts, never part of this repo)
+.worktrees/
+
 # Relay config (contains tokens)
 relay/relay.config.json
 
