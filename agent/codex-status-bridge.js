@@ -18,7 +18,11 @@ function parseArgs(argv) {
     developerInstructions: null,
     prompt: null,
     statusEndpoint: 'http://127.0.0.1:3040/termag/api/status',
-    statusBearerToken: null,
+    // Prefer the env var (not world-readable via /proc|ps, unlike argv). The
+    // --status-bearer-token flag stays for manual/dev use but agent.js passes
+    // the token through TERMAG_STATUS_BEARER_TOKEN so it never hits the child's
+    // command line on shared hosts.
+    statusBearerToken: process.env.TERMAG_STATUS_BEARER_TOKEN || null,
     timeoutMs: null,
     shortDecayMs: 3000,
     verboseServer: false,

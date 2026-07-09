@@ -414,7 +414,7 @@ async function scanContextTokens() {
     const http = require(url.protocol === 'https:' ? 'https' : 'http');
     const req = http.request(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
     });
     req.on('error', () => {});
     req.end(payload);
@@ -533,7 +533,7 @@ async function scanRateLimits() {
             const http = require(url.protocol === 'https:' ? 'https' : 'http');
             const req = http.request(url, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
             });
             req.on('error', () => {});
             req.end(payload);
@@ -552,7 +552,7 @@ async function scanRateLimits() {
         const http = require(url.protocol === 'https:' ? 'https' : 'http');
         const req = http.request(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
         });
         req.on('error', () => {});
         req.end(payload);
@@ -565,7 +565,7 @@ async function scanRateLimits() {
         const http = require(url.protocol === 'https:' ? 'https' : 'http');
         const req = http.request(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
         });
         req.on('error', () => {});
         req.end(payload);
@@ -655,7 +655,10 @@ async function startCodexSession(sessionName, cwd) {
       '--status-endpoint',
       shellEscape(getStatusEndpoint()),
     ].join(' '),
-    { cwd, env: process.env },
+    // Pass the bearer token via env, NOT argv: process command lines are
+    // world-readable (/proc/<pid>/cmdline, ps) on shared hosts, but environ is
+    // readable only by the owner + root. The bridge reads TERMAG_STATUS_BEARER_TOKEN.
+    { cwd, env: { ...process.env, TERMAG_STATUS_BEARER_TOKEN: token } },
   );
 
   codexBridges.set(sessionName, { child, port, remoteUrl });

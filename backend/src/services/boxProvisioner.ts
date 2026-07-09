@@ -53,13 +53,13 @@ const GIT_TOKEN_INLINE_POLICY = 'termag-git-token-read';
 
 interface BoxConfig {
   region: string;
-  agentWsUrl: string;          // wss://<host>/termag/ws/agent
+  agentWsUrl: string;          // ws://<orchestrator-private-dns>:3040/termag/ws/agent (internal, host-to-host)
   resourcePrefix: string;      // e.g. "termag-box" — SG/role/profile name prefix
   permissionsBoundaryArn: string;
   vpcId: string;
   subnetId: string;
   instanceType: string;        // MUST be arm64/Graviton — the AMI is arm64-only
-  albSecurityGroupId: string;
+  hostSecurityGroupId: string; // orchestrator host SG — box SG gets :3040 ingress here
   managedTag: string;          // ManagedBy tag value the grant scopes on
   rootVolumeGb: number;
   gitTokenSecretArn?: string;  // optional: private-repo PAT, read at boot via SSM/SM
@@ -77,10 +77,10 @@ export function getBoxConfig(): BoxConfig | null {
   const permissionsBoundaryArn = process.env.BOX_PERMISSIONS_BOUNDARY_ARN;
   const vpcId = process.env.BOX_VPC_ID;
   const subnetId = process.env.BOX_SUBNET_ID;
-  const albSecurityGroupId = process.env.ALB_SECURITY_GROUP_ID;
+  const hostSecurityGroupId = process.env.HOST_SECURITY_GROUP_ID;
 
   if (!region || !agentWsUrl || !resourcePrefix || !permissionsBoundaryArn ||
-      !vpcId || !subnetId || !albSecurityGroupId) {
+      !vpcId || !subnetId || !hostSecurityGroupId) {
     return null;
   }
 
@@ -91,7 +91,7 @@ export function getBoxConfig(): BoxConfig | null {
     permissionsBoundaryArn,
     vpcId,
     subnetId,
-    albSecurityGroupId,
+    hostSecurityGroupId,
     instanceType: process.env.BOX_INSTANCE_TYPE ?? 't4g.medium',
     managedTag: process.env.BOX_MANAGED_TAG ?? 'termag-box',
     rootVolumeGb: parseInt(process.env.BOX_ROOT_VOLUME_GB ?? '30', 10),
@@ -270,9 +270,11 @@ export async function provisionBox(args: ProvisionArgs): Promise<void> {
     }));
     const securityGroupId = sg.GroupId!;
 
-    // 3. Let the box reach the orchestrator: 443 ingress on the ALB SG from
-    //    the box SG (grant's Ec2BoxIngressToAlb).
-    await authorizeAlbIngress(ec2, cfg.albSecurityGroupId, securityGroupId, args.boxName);
+    // 3. Let the box reach the orchestrator: :3040 ingress on the host SG from
+    //    the box SG (grant's Ec2BoxIngressToHost). Boxes talk to the backend
+    //    directly over the private VPC network, not through the (human-only,
+    //    Okta-gated) ALB.
+    await authorizeHostIngress(ec2, cfg.hostSecurityGroupId, securityGroupId, args.boxName);
 
     // 4. Per-box IAM identity (role WITH the permissions boundary — denied
     //    otherwise) → SSM core → optional git-token read → instance profile.
@@ -328,13 +330,13 @@ async function discoverLatestAmi(ec2: EC2Client): Promise<string> {
   return images[0].ImageId!;
 }
 
-async function authorizeAlbIngress(ec2: EC2Client, albSgId: string, boxSgId: string, boxName: string): Promise<void> {
+async function authorizeHostIngress(ec2: EC2Client, hostSgId: string, boxSgId: string, boxName: string): Promise<void> {
   await ec2.send(new AuthorizeSecurityGroupIngressCommand({
-    GroupId: albSgId,
+    GroupId: hostSgId,
     IpPermissions: [{
       IpProtocol: 'tcp',
-      FromPort: 443,
-      ToPort: 443,
+      FromPort: 3040,
+      ToPort: 3040,
       UserIdGroupPairs: [{ GroupId: boxSgId, Description: `termag box ${boxName}` }],
     }],
   }));
@@ -482,18 +484,18 @@ export async function terminateBox(instance: Instance): Promise<void> {
     }
   }
 
-  // 2. Revoke the ALB ingress rule, then delete the box SG.
+  // 2. Revoke the host ingress rule, then delete the box SG.
   if (instance.securityGroupId) {
     try {
       await ec2.send(new RevokeSecurityGroupIngressCommand({
-        GroupId: cfg.albSecurityGroupId,
+        GroupId: cfg.hostSecurityGroupId,
         IpPermissions: [{
-          IpProtocol: 'tcp', FromPort: 443, ToPort: 443,
+          IpProtocol: 'tcp', FromPort: 3040, ToPort: 3040,
           UserIdGroupPairs: [{ GroupId: instance.securityGroupId }],
         }],
       }));
     } catch (err) {
-      console.error(`[BOX] revoke ALB ingress for ${instance.securityGroupId} failed:`, errMsg(err));
+      console.error(`[BOX] revoke host ingress for ${instance.securityGroupId} failed:`, errMsg(err));
     }
     await deleteSgWithRetry(ec2, instance.securityGroupId);
   }

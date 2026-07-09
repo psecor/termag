@@ -17,7 +17,7 @@ stubbed as "user-driven Terraform." Most of the skeleton is already present.
 | Layer | File | State |
 |-------|------|-------|
 | Backend CRUD | `backend/src/routes/instances.ts` | `POST` creates an `Instance` row (`status: provisioning`) + a per-box `AgentToken` atomically and returns the raw `tmag_` token once. `DELETE` archives projects, revokes tokens, marks `terminated`. Both currently expect the *user* to run terraform. |
-| Agent registry | `backend/src/services/agentRegistry.ts` | Dual-keyed (`instanceAgents` by `instanceId`). When a box dials `wss://<host>/termag/ws/agent?token=…`, `validateAgentToken` resolves token→`{user, instance}` and `registerAgent` flips the Instance to `ready` and reconstructs its sessions. **Needs no changes.** |
+| Agent registry | `backend/src/services/agentRegistry.ts` | Dual-keyed (`instanceAgents` by `instanceId`). When a box dials `ws://<host>:3040/termag/ws/agent?token=…`, `validateAgentToken` resolves token→`{user, instance}` and `registerAgent` flips the Instance to `ready` and reconstructs its sessions. **Needs no changes.** |
 | WS auth | `backend/src/index.ts` (`/ws/agent`) | `validateAgentToken` (in `routes/agentTokens.ts`) looks up `tokenHash`, returns `{user, instance}`. **Needs no changes.** |
 | Box shape (reference) | `terraform/box/` | V1 Terraform: egress-only SG, IMDSv2 instance, `cloudinit.sh.tftpl` that writes `agent.config.json {termag_url, token, path_remap}` and starts the agent systemd user unit. |
 | Box AMI | `packer/` | Prebakes repo, agent CLIs, `termag` user + linger, the `termag-agent.service` unit. |
@@ -51,12 +51,12 @@ just polls/streams that status. No request blocks on a multi-minute EC2 boot.
               └─ provisionBox(...)  (async, not awaited)
                     ├─ DescribeImages  (newest App=termag,Component=box)
                     ├─ CreateSecurityGroup  (egress-only, ManagedBy tag)
-                    ├─ AuthorizeSecurityGroupIngress on ALB SG (443 from box SG)
+                    ├─ AuthorizeSecurityGroupIngress on HOST SG (3040 from box SG)
                     ├─ CreateRole(+boundary) → AttachRolePolicy SSM core → InstanceProfile
                     └─ RunInstances  (AMI, arm64 type, subnet, SG, profile,
                                       IMDSv2, tags, user_data=cloud-init+token)
                           ↓ EC2 boots, cloud-init starts agent
-                          ↓ agent dials wss://<host>/termag/ws/agent?token=…
+                          ↓ agent dials ws://<host>:3040/termag/ws/agent?token=…
                        registerAgent → Instance.status = ready
 ```
 
@@ -71,8 +71,9 @@ Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
    `CreationDate`, take newest → `amiId`.
 2. `CreateSecurityGroup` `<BOX_RESOURCE_PREFIX>-<box>` in `BOX_VPC_ID`,
    egress-only, tag-on-create `ManagedBy=$BOX_MANAGED_TAG` + `Owner`/`BoxName`.
-3. `AuthorizeSecurityGroupIngress` on `ALB_SECURITY_GROUP_ID`: 443 from the new
-   box SG (grant's `Ec2BoxIngressToAlb`).
+3. `AuthorizeSecurityGroupIngress` on `HOST_SECURITY_GROUP_ID`: 3040 from the new
+   box SG (grant's `Ec2BoxIngressToHost`). The box reaches the backend directly
+   over the private VPC network, not through the ALB.
 4. Per-box IAM: `CreateRole` `<BOX_RESOURCE_PREFIX>-<box>` **with
    `PermissionsBoundary=BOX_PERMISSIONS_BOUNDARY_ARN`** (denied otherwise);
    `AttachRolePolicy` `AmazonSSMManagedInstanceCore`; if
@@ -116,7 +117,7 @@ existing `prisma db push` in cloud-init.
 
 `AWS_REGION`, `AGENT_WS_URL`, `BOX_RESOURCE_PREFIX`,
 `BOX_PERMISSIONS_BOUNDARY_ARN`, `BOX_VPC_ID`, `BOX_SUBNET_ID`,
-`BOX_INSTANCE_TYPE`, `ALB_SECURITY_GROUP_ID`, optional
+`BOX_INSTANCE_TYPE`, `HOST_SECURITY_GROUP_ID`, optional
 `BOX_GIT_TOKEN_SECRET_ARN`. Most are already module outputs.
 
 ## Frontend changes (`termag/`)

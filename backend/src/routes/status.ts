@@ -12,7 +12,7 @@ import { formatPaneForSlack } from '../services/tmux';
 import { capturePaneForSlack } from '../slack/tmuxAgent';
 import { formatPaneForDiscord } from '../discord/formatting';
 import { recordHeartbeat } from '../services/humanActivity';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { resolveSessionProject } from '../services/sessionResolver';
 import { recordContextSample } from '../services/contextSampler';
 
@@ -26,6 +26,23 @@ const statusTracking = new Map<string, {
 
 const NOTIFY_COOLDOWN = 30_000; // 30s between notifications
 const MIN_WORKING_DURATION = 30_000; // only notify "finished" if worked > 30s
+
+// Status writes: same-host callers (the Claude Code hooks curl localhost:3040)
+// are trusted as they always have been — the orchestrator host is the local
+// trust boundary. Remote callers (e.g. a box, which now reaches :3040 directly
+// over the private VPC rather than only through the Okta-gated ALB) must present
+// a valid agent token or browser session; postStatus then scopes them to their
+// own sessions. Uses the real TCP peer (req.socket.remoteAddress), not a
+// spoofable X-Forwarded-For.
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const authStatusWrite: RequestHandler = (req, res, next) => {
+  const remote = req.socket.remoteAddress ?? '';
+  if (LOOPBACK.has(remote)) {
+    next();
+    return;
+  }
+  void requireAuthOrAgentToken(req, res, next);
+};
 
 export function statusRouter(): Router {
   const router = Router();
@@ -49,6 +66,27 @@ export function statusRouter(): Router {
     if (!session) {
       res.status(400).json({ error: 'session required' });
       return;
+    }
+
+    // Scope authenticated (remote) callers to their OWN sessions. Session names
+    // are "<unixuser>-<project>-agent"; the leading segment is the owning unix
+    // user, which must match the agent token's / session's user. Loopback
+    // writers (same-host Claude hooks — see authStatusWrite) carry no req.user
+    // and keep their prior trust. This stops a compromised box, which now
+    // reaches :3040 directly over the VPC, from forging status + notifications
+    // for another user's sessions across projects.
+    if (req.user) {
+      // Session names are "<unixUsername>-<project>[-<workstream>]-<role>" and a
+      // unixUsername may itself contain hyphens, so match the FULL username as a
+      // prefix — mirroring sessionBelongsToUser() in index.ts. Parsing the first
+      // hyphen segment instead would both 403 hyphenated users on their own
+      // sessions and let a prefix name ("alice") satisfy "alice-smith-…".
+      const u = req.user.unixUsername;
+      const owns = session === u || session.startsWith(`${u}-`);
+      if (!owns) {
+        res.status(403).json({ error: 'forbidden: session not owned by caller' });
+        return;
+      }
     }
 
     // Metadata-only update (e.g. contextTokens from agent scanner, rateLimited from pane scanner)
@@ -202,7 +240,7 @@ export function statusRouter(): Router {
     res.json({ ok: true });
   };
 
-  router.post('/', postStatus);
+  router.post('/', authStatusWrite, postStatus);
   router.post('/heartbeat', requireAuth, heartbeat);
   router.get('/:session', getStatusHandler);
 
