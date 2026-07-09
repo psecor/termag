@@ -80,6 +80,7 @@ model Project {
   shares      ProjectShare[]
   invites     ProjectInvite[]
   visits      ProjectVisit[]
+  contextSamples ContextSample[]
 
   // Name is unique per (user, box). Two boxes can have a project named "termag"
   // without collision. Legacy projects (instanceId NULL) treat NULL as distinct
@@ -88,6 +89,26 @@ model Project {
   @@index([userId, archived])
   @@index([instanceId])
   @@map("projects")
+}
+
+// Per-minute samples of a project/workstream's Claude context-window occupancy
+// (the badge gauge), persisted for the "context usage over time" reporting.
+// Mirrors WarpSample: an in-memory sampler (services/contextSampler.ts) buckets
+// contextTokens reports per minute and upserts one row per (project, workstream,
+// minute). meanTokens/maxTokens summarize the minute.
+model ContextSample {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workstream  String   // workstream name ("main", etc.)
+  bucket      DateTime // truncated to the minute (UTC)
+  meanTokens  Int
+  maxTokens   Int
+  sampleCount Int
+
+  @@unique([projectId, workstream, bucket])
+  @@index([projectId, bucket])
+  @@map("context_samples")
 }
 
 // A workstream is a parallel effort inside a project — typically a git worktree

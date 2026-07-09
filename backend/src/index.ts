@@ -19,6 +19,7 @@ import { worktimeRouter } from './routes/worktime';
 import { sharingRouter } from './routes/sharing';
 import { visitsRouter } from './routes/visits';
 import { warpRouter } from './routes/warp';
+import { contextRouter } from './routes/context';
 import { instancesRouter } from './routes/instances';
 import { workstreamsRouter } from './routes/workstreams';
 import { startProvisioningSweep } from './services/boxProvisioner';
@@ -37,6 +38,7 @@ import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
 import { sessionName } from './services/tmux';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
 import { startWarpSampler, stopWarpSampler } from './services/warpSampler';
+import { startContextSampler, stopContextSampler } from './services/contextSampler';
 
 const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
@@ -119,6 +121,7 @@ app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 app.use(`${BASE_PATH}/api`, sharingRouter());
 app.use(`${BASE_PATH}/api/visits`, visitsRouter());
 app.use(`${BASE_PATH}/api/warp`, warpRouter());
+app.use(`${BASE_PATH}/api/context`, contextRouter());
 app.use(`${BASE_PATH}/api/instances`, instancesRouter());
 app.use(`${BASE_PATH}/api`, workstreamsRouter());
 
@@ -436,6 +439,7 @@ server.listen(PORT, () => {
   startTmuxPoller().catch(err => console.error('[TMUX-POLLER] Failed to start:', err));
   startHumanActivityTracker();
   startWarpSampler();
+  startContextSampler();
   startProvisioningSweep();
 });
 
@@ -444,6 +448,7 @@ function shutdown() {
   stopTmuxPoller();
   stopHumanActivityTracker();
   stopWarpSampler().catch(() => {});
+  stopContextSampler().catch(() => {});
   // Close all WebSocket connections so the process can exit
   for (const client of wss.clients) {
     client.close(1001, 'server shutting down');

@@ -11,55 +11,19 @@
  * termag user → project's instanceId), cached briefly so poll loops don't
  * re-query the DB on every tick.
  */
-import { PrismaClient } from '@prisma/client';
 import { sendForProject, ProjectHost } from '../services/agentRegistry';
-import { sessionName as buildSessionName, cleanPaneText, formatPaneForSlack } from '../services/tmux';
-
-const prisma = new PrismaClient();
-
-const ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
-
-// sessionName → resolved host. Short TTL keeps poll loops from hammering the DB
-// while still picking up new projects within a minute.
-const hostCache = new Map<string, { host: ProjectHost | null; at: number }>();
-const HOST_TTL_MS = 60_000;
+import { cleanPaneText, formatPaneForSlack } from '../services/tmux';
+import { resolveSessionProject } from '../services/sessionResolver';
 
 /**
- * Resolve which agent owns a tmux session. Session names are
- * `<owner>-<project>-<role>` / `<owner>-<project>-<workstream>-<role>`; rather
- * than parse (roles like `data-ctrl` contain dashes), we match against names
- * rebuilt from the owner's projects. Falls back to the owner's legacy agent for
- * sessions that don't map to a known project (e.g. `/t attach <arbitrary>`).
+ * Resolve which agent owns a tmux session — thin wrapper over the shared
+ * session resolver (rebuilds candidate names from the owner's projects to avoid
+ * dash-parsing ambiguity, and caches). Falls back to the owner's legacy agent
+ * (instanceId null) for sessions that don't map to a known project.
  */
 async function hostForSession(session: string): Promise<ProjectHost | null> {
-  const cached = hostCache.get(session);
-  if (cached && Date.now() - cached.at < HOST_TTL_MS) return cached.host;
-
-  let host: ProjectHost | null = null;
-  const owner = session.split('-')[0];
-  if (owner) {
-    const user = await prisma.user.findUnique({ where: { unixUsername: owner } });
-    if (user) {
-      const projects = await prisma.project.findMany({
-        where: { userId: user.id },
-        include: { workstreams: true },
-      });
-      outer: for (const p of projects) {
-        const wsNames = p.workstreams.length ? p.workstreams.map(w => w.name) : ['main'];
-        for (const ws of wsNames) {
-          for (const role of ROLES) {
-            if (session === buildSessionName(owner, p.name, role, ws)) {
-              host = { userId: user.id, instanceId: p.instanceId };
-              break outer;
-            }
-          }
-        }
-      }
-      if (!host) host = { userId: user.id, instanceId: null };
-    }
-  }
-  hostCache.set(session, { host, at: Date.now() });
-  return host;
+  const r = await resolveSessionProject(session);
+  return r ? { userId: r.userId, instanceId: r.instanceId } : null;
 }
 
 /** Capture a pane's text via the owning agent. Mirrors tmux.capturePaneForSlack. */

@@ -154,6 +154,24 @@ export const warpApi = {
     api.get('/api/warp/series', { params: { days } }).then(r => r.data),
 };
 
+// Per-project context-window occupancy over time. `peakTokens` is the max
+// context reached in that day/hour (rolled up across the project's workstreams).
+export interface ContextSeries {
+  dateAxis: string[]; // 'YYYY-MM-DD', oldest → newest
+  projects: Array<{
+    projectId: string;
+    name: string;
+    color: string | null;
+    days: Array<{ date: string; peakTokens: number }>;
+    hoursToday: Array<{ hour: number; peakTokens: number }>;
+  }>;
+}
+
+export const contextApi = {
+  series: (days = 30): Promise<ContextSeries> =>
+    api.get('/api/context/series', { params: { days } }).then(r => r.data),
+};
+
 // Project context-switch logger. Uses sendBeacon first so the event still
 // fires when the page is closing; falls back to fetch with keepalive so a
 // browser that quietly rejects the beacon (mime mismatch, disabled API)

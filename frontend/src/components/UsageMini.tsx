@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats, warpApi, WarpSeries } from '../services/api';
+import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats, warpApi, WarpSeries, contextApi, ContextSeries } from '../services/api';
 import { PROVIDERS, ProviderConfig } from '../providers/registry';
 
 const SWITCH_COLOR = '#5eead4'; // teal — distinct from agent orange + human yellow
 const WARP_COLOR = '#a78bfa';   // purple — flow/hyperspace
+const CTX_COLOR = '#58a6ff';    // blue — context-window occupancy (fallback when a project has no color)
 
 // ── Formatting helpers ──────────────────────────────────────────
 
@@ -377,6 +378,7 @@ export function UsageMini() {
   const [worktime, setWorktime] = useState<WorktimeResponse | null>(null);
   const [visits, setVisits] = useState<VisitsStats | null>(null);
   const [warp, setWarp] = useState<WarpSeries | null>(null);
+  const [ctx, setCtx] = useState<ContextSeries | null>(null);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -398,6 +400,9 @@ export function UsageMini() {
         .catch(() => {});
       warpApi.series(30)
         .then(r => setWarp(r))
+        .catch(() => {});
+      contextApi.series(30)
+        .then(r => setCtx(r))
         .catch(() => {});
     };
     load();
@@ -786,6 +791,32 @@ export function UsageMini() {
                 </div>
               </>
             )}
+
+            {/* Context usage — peak context-window occupancy per project over 30d */}
+            {ctx && (() => {
+              const rows = ctx.projects
+                .map(p => ({ p, peak: p.days.reduce((m, d) => Math.max(m, d.peakTokens), 0) }))
+                .filter(x => x.peak > 0)
+                .sort((a, b) => b.peak - a.peak);
+              if (rows.length === 0) return null;
+              return (
+                <div className="usage-overlay-section">
+                  <div className="usage-overlay-section-header">
+                    <span>Context — 30d</span>
+                    <span className="usage-dim">peak/day per project</span>
+                  </div>
+                  {rows.map(({ p, peak }) => (
+                    <div key={p.projectId} style={{ marginTop: 6 }}>
+                      <div className="usage-overlay-section-header">
+                        <span className="usage-overlay-token-label" style={{ color: p.color || CTX_COLOR }}>{p.name}</span>
+                        <span>{fmtK(peak)}</span>
+                      </div>
+                      <CountBarChart values={p.days.map(d => d.peakTokens)} height={28} color={p.color || CTX_COLOR} />
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
 
             <div className="usage-overlay-footer">
               {wtP50 > 0 && <span className="usage-dim">p50 (14d): {fmtDuration(wtP50)} working time</span>}

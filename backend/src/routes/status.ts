@@ -13,6 +13,8 @@ import { capturePaneForSlack } from '../slack/tmuxAgent';
 import { formatPaneForDiscord } from '../discord/formatting';
 import { recordHeartbeat } from '../services/humanActivity';
 import { requireAuth } from '../middleware/auth';
+import { resolveSessionProject } from '../services/sessionResolver';
+import { recordContextSample } from '../services/contextSampler';
 
 const prisma = new PrismaClient();
 
@@ -53,6 +55,15 @@ export function statusRouter(): Router {
     if (!status && (contextTokens !== undefined || rateLimited !== undefined)) {
       updateStatusMeta(session, { ...(contextTokens !== undefined && { contextTokens }), ...(rateLimited !== undefined && { rateLimited }) });
       notifyStatusChange(session);
+      // Persist context occupancy over time (fire-and-forget; never block the
+      // response). null tokens = expired context → recordContextSample gaps it.
+      if (contextTokens !== undefined) {
+        resolveSessionProject(session).then(r => {
+          if (r?.projectId && r.workstream) {
+            recordContextSample(r.projectId, r.workstream, contextTokens as number | null);
+          }
+        }).catch(() => {});
+      }
       res.json({ ok: true, status: getStatus(session) });
       return;
     }
