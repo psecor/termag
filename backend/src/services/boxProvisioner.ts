@@ -42,7 +42,8 @@ import {
   DeleteInstanceProfileCommand,
   DeleteRoleCommand,
 } from '@aws-sdk/client-iam';
-import { Instance, PrismaClient } from '@prisma/client';
+import { Instance, Prisma, PrismaClient } from '@prisma/client';
+import { createHash, randomBytes } from 'crypto';
 
 const prisma = new PrismaClient();
 
@@ -455,6 +456,172 @@ async function markFailed(instanceId: string, error: string): Promise<void> {
     where: { id: instanceId },
     data: { status: 'failed', provisioningError: error.slice(0, 1000) },
   }).catch(e => console.error(`[BOX] Failed to mark instance ${instanceId} failed:`, e.message));
+}
+
+// ── Auto-provision first box on first login ──────────────────────────────────
+
+/**
+ * Env gate for the auto-provision feature. Off by default so existing deploys
+ * are unaffected — set AUTO_PROVISION_FIRST_BOX=true to enable.
+ */
+export function isAutoProvisionFirstBoxEnabled(): boolean {
+  const v = (process.env.AUTO_PROVISION_FIRST_BOX ?? '').trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes';
+}
+
+/**
+ * Given the set of names ALL of a user's instances already hold — including
+ * terminated ones, which still occupy the (userId, name) unique index — return
+ * a free name: the base if unused, else base-2, base-3, … .
+ *
+ * Pure so it can be unit-tested; resolveFreeBoxName supplies the taken set.
+ */
+export function pickFreeBoxName(taken: Set<string>, base: string): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 1000; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  // Astronomically unlikely (1000 terminated boxes on one name); a random
+  // suffix guarantees we never loop and never trip the unique index.
+  return `${base}-${randomBytes(3).toString('hex')}`;
+}
+
+/**
+ * Pick a box name that is free across ALL of the user's instances, including
+ * terminated ones. Without this, a user who terminated their auto box (say
+ * "default") would, on every later login, pass the zero-active-boxes pre-check,
+ * attempt to re-create "default", and trip P2002 forever — never getting a
+ * replacement box despite an empty dashboard.
+ *
+ * Reads inside the caller's transaction (`tx`) so the name is resolved from the
+ * same snapshot as the zero-active-boxes check — see autoProvisionFirstBox for
+ * why that consistency matters for concurrent first logins.
+ */
+async function resolveFreeBoxName(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  base: string,
+): Promise<string> {
+  const taken = new Set(
+    (await tx.instance.findMany({ where: { userId }, select: { name: true } })).map((i) => i.name),
+  );
+  return pickFreeBoxName(taken, base);
+}
+
+// Only the fields autoProvisionFirstBox needs — decoupled from Express.User /
+// the full Prisma User so the login path can pass either.
+interface AutoProvisionUser {
+  id: string;
+  googleEmail: string;
+  unixUsername: string;
+  displayName: string;
+}
+
+/**
+ * Fired un-awaited from the login path: if the feature is enabled, provisioning
+ * is configured, and this user has zero boxes, create exactly one Instance (+
+ * per-box token) the same way POST /api/instances does and kick off async EC2
+ * provisioning. Never throws — a failed auto-provision must never break login.
+ *
+ * Idempotency / concurrency: the zero-active-boxes check, the name resolution,
+ * and the create all run inside ONE serializable transaction, so the name is
+ * derived from the same snapshot that saw zero active boxes. Two concurrent
+ * first logins therefore both resolve the *same* name and collide on the
+ * (userId, name) unique index (P2002) — exactly one create wins. Resolving the
+ * name outside that snapshot was unsafe: a login could observe zero active
+ * boxes yet see a just-committed base-name row, pick a *suffixed* name, and
+ * create a second box. A user who already has (or is mid-provisioning) a box is
+ * skipped by the in-transaction check (and the cheap pre-check short-circuits
+ * the common returning-user path with no writes).
+ */
+export async function autoProvisionFirstBox(user: AutoProvisionUser): Promise<void> {
+  try {
+    if (!isAutoProvisionFirstBoxEnabled()) return;
+    if (!isBoxProvisioningConfigured()) {
+      console.warn('[BOX] AUTO_PROVISION_FIRST_BOX is set but box provisioning is not configured; skipping');
+      return;
+    }
+
+    // Cheap pre-check so the common (returning-user) path does no writes. The
+    // in-transaction check below is the authoritative guard.
+    const existing = await prisma.instance.count({
+      where: { userId: user.id, status: { not: 'terminated' } },
+    });
+    if (existing > 0) return;
+
+    const baseName = process.env.AUTO_PROVISION_BOX_NAME?.trim() || 'default';
+    const rawToken = 'tmag_' + randomBytes(32).toString('hex');
+    const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+    const tokenPrefix = rawToken.substring(0, 13) + '...';
+
+    let result: { instance: Instance; boxName: string } | null;
+    try {
+      result = await prisma.$transaction(
+        async (tx) => {
+          // Authoritative re-check inside the snapshot: bail if the user gained
+          // a box between the pre-check and here.
+          const active = await tx.instance.count({
+            where: { userId: user.id, status: { not: 'terminated' } },
+          });
+          if (active > 0) return null;
+
+          // Resolve a name that dodges terminated rows still holding the
+          // (userId, name) unique index, so a user who terminated their auto
+          // box gets a fresh one (base-2, …) instead of a silent P2002 on every
+          // login. Read in-transaction so it shares the count's snapshot.
+          const boxName = await resolveFreeBoxName(tx, user.id, baseName);
+          const inst = await tx.instance.create({
+            data: { userId: user.id, name: boxName, kind: 'ec2', status: 'provisioning' },
+          });
+          await tx.agentToken.create({
+            data: {
+              userId: user.id,
+              instanceId: inst.id,
+              name: `box: ${boxName}`,
+              tokenHash,
+              tokenPrefix,
+            },
+          });
+          return { instance: inst, boxName };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    } catch (err) {
+      // A concurrent first login won the race: it either committed the same
+      // box name first (P2002 on the unique index) or forced a serialization
+      // failure (P2034). Either way exactly one box exists — skip. Anything
+      // else: log and bail — never break login.
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        (err.code === 'P2002' || err.code === 'P2034')
+      ) {
+        console.log(`[BOX] Auto-provision skipped for ${user.googleEmail}: box already exists (concurrent login)`);
+      } else {
+        console.error(`[BOX] Auto-provision persistence failed for ${user.googleEmail}:`, errMsg(err));
+      }
+      return;
+    }
+
+    // User already had a box by the time the transaction ran — nothing to do.
+    if (!result) return;
+    const { instance, boxName } = result;
+
+    console.log(`[BOX] Auto-provisioning first box "${boxName}" for ${user.googleEmail}`);
+    // Fire-and-forget the slow EC2 launch (provisionBox marks the box `failed`
+    // on any error and never throws).
+    void provisionBox({
+      instance,
+      boxName,
+      owner: user.googleEmail,
+      token: rawToken,
+      remoteUnixUser: user.unixUsername,
+      gitUserEmail: user.googleEmail,
+      gitUserName: user.displayName,
+    });
+  } catch (err) {
+    console.error('[BOX] Auto-provision unexpected error:', errMsg(err));
+  }
 }
 
 // ── Termination ──────────────────────────────────────────────────────────────

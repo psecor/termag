@@ -5,6 +5,7 @@ import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 import { verifyAlbIdentity } from '../auth/albOidc';
+import { autoProvisionFirstBox } from '../services/boxProvisioner';
 
 const prisma = new PrismaClient();
 
@@ -135,6 +136,9 @@ export const albSessionBridge: RequestHandler = async (req: Request, res: Respon
     });
     req.login(user as Express.User, (err) => {
       if (err) return next(err);
+      // First-login auto-provision (env-gated, no-op unless enabled). Fired
+      // un-awaited so a slow/failed box spin-up never blocks or breaks login.
+      void autoProvisionFirstBox(user);
       next();
     });
   } catch (err) {
@@ -267,6 +271,7 @@ export function authRouter(): Router {
       });
       req.login(user as Express.User, (err) => {
         if (err) return next(err);
+        void autoProvisionFirstBox(user);
         res.redirect(`${frontendUrl}${basePath}/`);
       });
     } catch (err) {
