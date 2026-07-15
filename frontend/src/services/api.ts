@@ -6,12 +6,19 @@ const api = axios.create({
   withCredentials: true,
 });
 
+export type AuthMode = 'google' | 'okta';
+
 export const authApi = {
   me: (): Promise<User> => api.get('/auth/me').then(r => r.data),
   logout: () => api.post('/auth/logout').then(r => r.data),
   updatePreferences: (data: { defaultAgentProvider: AgentProvider }): Promise<User> =>
     api.put('/auth/me/preferences', data).then(r => r.data),
-  loginUrl: () => '/termag/auth/google',
+  // Which sign-in mechanism the backend is configured for (AUTH_MODE). Drives
+  // the login page's provider label. Reachable unauthenticated.
+  config: (): Promise<{ mode: AuthMode }> => api.get('/auth/config').then(r => r.data),
+  // Mode-agnostic entry point; the backend routes to Google OAuth or the Okta
+  // edge depending on AUTH_MODE.
+  loginUrl: () => '/termag/auth/login',
 };
 
 export const projectsApi = {

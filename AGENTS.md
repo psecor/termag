@@ -163,7 +163,8 @@ Migration history (recent):
 |-----|-------|
 | `DATABASE_URL` | Postgres |
 | `SESSION_SECRET` | random hex |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth |
+| `AUTH_MODE` | `google` (default, in-app Google OAuth) or `okta` (identity from the ALB `authenticate-oidc` edge via `x-amzn-oidc-data`). |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth (required when `AUTH_MODE=google`) |
 | `ALLOWED_USERS` | comma-separated `email:unixuser` pairs. Supports domain wildcards (e.g. `*@example.com:default-unixuser`). |
 | `SLACK_BOT_TOKEN` (`xoxb-`), `SLACK_APP_TOKEN` (`xapp-`), `SLACK_SIGNING_SECRET` | Slack Socket Mode |
 | `CAPTURE_API_SECRET` | shared secret used by external pane-capture relays |

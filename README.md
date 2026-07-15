@@ -93,7 +93,8 @@ All configuration is via environment variables in `backend/.env`. See `.env.exam
 
 Key variables:
 - `DATABASE_URL` — PostgreSQL connection string
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth credentials
+- `AUTH_MODE` — sign-in mechanism: `google` (default) uses in-app Google OAuth; `okta` trusts the identity established at the ALB edge by an `authenticate-oidc` (Okta) action, read from the `x-amzn-oidc-data` header. Use `okta` only once the ALB actually performs that edge auth.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth credentials (required when `AUTH_MODE=google`)
 - `SESSION_SECRET` — Express session secret
 - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — Slack bot
 - `ALLOWED_USERS` — comma-separated allow-list. Each entry is `email:unixuser` (exact mapping), `@domain.com` (anyone in the domain, unix username derived from the email local part), or `@domain.com:unixuser` (anyone in the domain mapped to a fixed unix username). Exact matches take priority over domain wildcards.

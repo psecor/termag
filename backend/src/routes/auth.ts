@@ -1,5 +1,6 @@
 import { Router, RequestHandler, Request, Response, NextFunction } from 'express';
 import passport from 'passport';
+import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
@@ -7,10 +8,69 @@ import { verifyAlbIdentity } from '../auth/albOidc';
 
 const prisma = new PrismaClient();
 
+export type AuthMode = 'google' | 'okta';
+
+/**
+ * Which sign-in mechanism the app uses, controlled by the AUTH_MODE env var:
+ *   - 'google' (default): in-app Google OAuth via passport-google-oauth20.
+ *   - 'okta': identity is established at the edge by the ALB's authenticate-oidc
+ *     (Okta) action and read from the `x-amzn-oidc-data` header by
+ *     albSessionBridge; there is no in-app OAuth strategy.
+ *
+ * Defaults to 'google' so the app keeps working on deployments whose ALB does
+ * not (yet) perform Okta edge auth. Set AUTH_MODE=okta once the ALB
+ * authenticate-oidc gate is in place.
+ */
+export function authMode(): AuthMode {
+  return process.env.AUTH_MODE === 'okta' ? 'okta' : 'google';
+}
+
 export function configurePassport(): void {
-  // Identity comes from the ALB's authenticate-oidc (Okta) edge auth, verified
-  // by albSessionBridge below — there is no in-app OAuth strategy. Passport is
-  // kept only for its session (serialize/deserialize by user id).
+  // In google mode, identity comes from Google OAuth. In okta mode, identity is
+  // established at the ALB edge (see albSessionBridge) and no OAuth strategy is
+  // registered — passport is kept only for its session (serialize/deserialize).
+  if (authMode() === 'google') {
+    const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
+    const basePath = process.env.BASE_PATH ?? '';
+    const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
+
+    passport.use(
+      new GoogleStrategy(
+        {
+          clientID: process.env.GOOGLE_CLIENT_ID ?? '',
+          clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? '',
+          callbackURL: `${frontendUrl}${basePath}/auth/google/callback`,
+        },
+        async (_accessToken: string, _refreshToken: string, profile: Profile, done) => {
+          try {
+            const email = profile.emails?.[0]?.value ?? '';
+            const unixUsername = resolveUnixUsername(allowedUsers, email);
+
+            if (!unixUsername) {
+              console.warn(`[auth] rejected sign-in for ${email || '(no email)'}: not in ALLOWED_USERS`);
+              return done(null, false);
+            }
+
+            const user = await prisma.user.upsert({
+              where: { googleId: profile.id },
+              update: { displayName: profile.displayName },
+              create: {
+                googleId: profile.id,
+                googleEmail: email,
+                unixUsername,
+                displayName: profile.displayName,
+              },
+            });
+
+            return done(null, user as Express.User);
+          } catch (err) {
+            return done(err as Error);
+          }
+        }
+      )
+    );
+  }
+
   passport.serializeUser((user, done) => {
     done(null, (user as Express.User).id);
   });
@@ -39,6 +99,9 @@ export function configurePassport(): void {
  * this header, so reaching here means the device already passed posture checks.
  */
 export const albSessionBridge: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
+  // Only the ALB/Okta edge model consults this header. In google mode the bridge
+  // is a no-op so the header (if ever present) can't be used to bypass OAuth.
+  if (authMode() !== 'okta') return next();
   if (req.user) return next();
 
   let identity;
@@ -84,12 +147,34 @@ export function authRouter(): Router {
   const basePath = process.env.BASE_PATH ?? '';
   const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:3040';
 
-  // Login entry point. The ALB has already authenticated the user against Okta
-  // by the time any request reaches the app, so albSessionBridge has a verified
-  // identity to turn into a session — just bounce to the app root.
-  router.get('/login', (_req, res) => {
-    res.redirect(`${frontendUrl}${basePath}/`);
+  // Public: lets the login page render the right provider label and know which
+  // entry point to hit. Reachable unauthenticated (albSessionBridge passes
+  // through without a session/identity).
+  router.get('/config', (_req, res) => {
+    res.json({ mode: authMode() });
   });
+
+  // Login entry point. `/auth/login` is the single, mode-agnostic URL the
+  // frontend links to:
+  //   - google mode: kick off the Google OAuth flow.
+  //   - okta mode: the ALB has already authenticated the user against Okta by
+  //     the time any request reaches the app, so albSessionBridge has a verified
+  //     identity to turn into a session — just bounce to the app root.
+  if (authMode() === 'google') {
+    router.get('/login', passport.authenticate('google', { scope: ['profile', 'email'] }));
+    router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+    router.get(
+      '/google/callback',
+      passport.authenticate('google', { failureRedirect: `${basePath}/login?error=unauthorized` }),
+      (_req, res) => {
+        res.redirect(`${frontendUrl}${basePath}/`);
+      }
+    );
+  } else {
+    router.get('/login', (_req, res) => {
+      res.redirect(`${frontendUrl}${basePath}/`);
+    });
+  }
 
   const logout: RequestHandler = (req, res, next) => {
     req.logout((err) => {

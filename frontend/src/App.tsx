@@ -11,15 +11,26 @@ import { useAuth as useAuthHook } from './contexts/AuthContext';
 import { Project } from './types';
 import { computeWarpWithFallback } from './utils/warp';
 import { sessionName as buildSessionName } from './utils/sessionName';
-import { activityApi, warpApi } from './services/api';
+import { activityApi, warpApi, authApi, AuthMode } from './services/api';
 
 function Login() {
+  // The backend decides the sign-in mechanism (AUTH_MODE); fetch it so the
+  // button label matches reality instead of hardcoding a provider. The entry
+  // point is mode-agnostic — the backend routes /auth/login accordingly.
+  const [mode, setMode] = useState<AuthMode | null>(null);
+  useEffect(() => {
+    authApi.config().then(c => setMode(c.mode)).catch(() => {});
+  }, []);
+  const label = mode === 'okta' ? 'Sign in with Okta'
+    : mode === 'google' ? 'Sign in with Google'
+    : 'Sign in';
+
   return (
     <div className="login-page">
       <div className="login-card">
         <h1>termag</h1>
         <p>Workspace manager</p>
-        <a href="/termag/auth/login" className="btn-primary">Sign in with Okta</a>
+        <a href="/termag/auth/login" className="btn-primary">{label}</a>
       </div>
     </div>
   );
