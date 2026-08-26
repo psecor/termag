@@ -135,6 +135,27 @@ npm run build
 EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
+# nginx gateway — owns :3040 and fans out by path prefix: /termag to the
+# backend on 127.0.0.1:3100, everything else to hosted apps registered under
+# /srv/termag/apps (see docs/hosted-apps.md). Installed + configured here but
+# left DISABLED: whether nginx owns :3040 (and the backend moves to :3100) is
+# decided by cloud-init when it renders .env — the o11y-termag module enables
+# nginx and runs termag-apps-boot when the AMI ships them. An instance
+# launched from this AMI with an older cloud-init still works: nginx stays
+# off and the backend binds :3040 directly, exactly as before.
+# ─────────────────────────────────────────────────────────────────────────────
+apt_get install -y nginx
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo install -m 644 /opt/termag/deploy/nginx/termag-gateway.conf /etc/nginx/sites-available/termag-gateway.conf
+sudo ln -sf ../sites-available/termag-gateway.conf /etc/nginx/sites-enabled/termag-gateway.conf
+sudo install -m 644 /opt/termag/deploy/nginx/termag-proxy.conf /etc/nginx/snippets/termag-proxy.conf
+sudo install -m 755 /opt/termag/deploy/termag-apps-boot /usr/local/bin/termag-apps-boot
+sudo install -m 644 /opt/termag/deploy/termag-apps.service /etc/systemd/system/termag-apps.service
+sudo nginx -t
+sudo systemctl disable --now nginx
+sudo systemctl enable termag-apps.service
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Verify SSM agent is present and enabled (Canonical's AMI ships it via snap)
 # ─────────────────────────────────────────────────────────────────────────────
 snap list amazon-ssm-agent || sudo snap install amazon-ssm-agent --classic

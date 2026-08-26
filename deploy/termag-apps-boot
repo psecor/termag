@@ -1,0 +1,48 @@
+#!/bin/bash
+# Registers termag hosted apps from the persistent volume after boot or
+# instance replacement.
+#
+# Apps live at /srv/termag/apps/<name>/ (persistent EBS — survives instance
+# replacement) and provide:
+#   <name>.service  systemd unit, linked + enabled here (the root volume's
+#                   /etc/systemd/system is fresh after a replacement, so links
+#                   must be re-created every time)
+#   nginx.conf      route snippet, picked up by the gateway's wildcard include
+#
+# Invoked from two places:
+#   * termag-apps.service on ordinary reboots (fstab has /srv/termag by then)
+#   * cloud-init on first boot of a replacement instance (which is what mounts
+#     /srv/termag, after which the systemd unit's ConditionPathIsDirectory
+#     would have already been evaluated as false)
+#
+# Idempotent and tolerant of a broken app: one bad unit or snippet must not
+# take down the others, so per-app failures warn instead of aborting.
+
+set -uo pipefail
+
+APPS_DIR=/srv/termag/apps
+
+mkdir -p "$APPS_DIR"
+
+# Keep the on-box docs pointer fresh from the baked checkout.
+if [ -f /opt/termag/docs/hosted-apps.md ]; then
+    ln -sf /opt/termag/docs/hosted-apps.md "$APPS_DIR/README.md"
+fi
+
+shopt -s nullglob
+for unit in "$APPS_DIR"/*/*.service; do
+    # `enable` on an absolute path links the unit into /etc/systemd/system
+    # and is a no-op when the link already exists.
+    if ! systemctl enable --now "$unit"; then
+        echo "termag-apps-boot: WARNING: failed to enable $unit" >&2
+    fi
+done
+
+# Pick up route snippets. On a config error keep whatever nginx is currently
+# serving rather than dying with a broken config.
+if nginx -t; then
+    systemctl reload-or-restart nginx
+else
+    echo "termag-apps-boot: WARNING: nginx config test failed; routes not reloaded" >&2
+    exit 1
+fi

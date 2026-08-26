@@ -13,6 +13,7 @@ import { capturePaneForSlack } from '../slack/tmuxAgent';
 import { formatPaneForDiscord } from '../discord/formatting';
 import { recordHeartbeat } from '../services/humanActivity';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
+import { isLocalPeer } from '../auth/peerAddress';
 import { resolveSessionProject } from '../services/sessionResolver';
 import { recordContextSample } from '../services/contextSampler';
 
@@ -31,12 +32,13 @@ const MIN_WORKING_DURATION = 30_000; // only notify "finished" if worked > 30s
 // trust boundary. Remote callers (e.g. a box, which now reaches :3040 directly
 // over the private VPC rather than only through the Okta-gated ALB) must present
 // a valid agent token or browser session; postStatus then scopes them to their
-// own sessions. Uses the real TCP peer (req.socket.remoteAddress), not a
-// spoofable X-Forwarded-For.
-const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+// own sessions.
+//
+// isLocalPeer() is what makes "same host" survive the nginx gateway: once nginx
+// fronts the backend every socket peer is loopback, so the socket alone would
+// hand this trust to every ALB and VPC client. See auth/peerAddress.ts.
 const authStatusWrite: RequestHandler = (req, res, next) => {
-  const remote = req.socket.remoteAddress ?? '';
-  if (LOOPBACK.has(remote)) {
+  if (isLocalPeer(req)) {
     next();
     return;
   }

@@ -3,7 +3,10 @@
 // Builds an Ubuntu 24.04 arm64 image with everything the shared termag host
 // needs at runtime, pre-installed and pre-built: system packages, Node 20,
 // Docker (for the Postgres container), the AWS CLI, the `termag` service user,
-// and the termag backend + frontend already compiled at /opt/termag.
+// the termag backend + frontend already compiled at /opt/termag, and the nginx
+// gateway that owns :3040 and routes /termag to the backend plus suburl-hosted
+// apps registered under /srv/termag/apps (docs/hosted-apps.md). nginx is baked
+// disabled; cloud-init enables it together with moving the backend to :3100.
 //
 // Unlike the box build, the orchestrator source is NOT cloned from GitHub at
 // bake time — it's shipped straight from the CI checkout via a `file`

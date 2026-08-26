@@ -1,0 +1,16 @@
+[Unit]
+Description=Register termag hosted apps (systemd units + nginx routes) from /srv/termag/apps
+# On ordinary reboots /srv/termag is mounted from fstab by local-fs.target.
+# On the FIRST boot of a fresh instance the mount doesn't exist yet (cloud-init
+# creates it), the condition below fails, and cloud-init runs termag-apps-boot
+# directly instead.
+After=local-fs.target network.target nginx.service docker.service
+ConditionPathIsDirectory=/srv/termag/apps
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/termag-apps-boot
+
+[Install]
+WantedBy=multi-user.target

@@ -79,7 +79,8 @@ termag/
 ├── terraform/
 │   └── box/                        Terraform module for AWS box provisioning (AMI discovered by tag)
 ├── docs/
-│   └── box-provisioning.md         Design doc for orchestrator-driven box provisioning
+│   ├── box-provisioning.md         Design doc for orchestrator-driven box provisioning
+│   └── hosted-apps.md              How to host extra apps on ALB suburls via the nginx gateway
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
 
@@ -216,6 +217,8 @@ docker run --rm -p 3040:3040 --env-file backend/.env termag-orchestrator        
 **Container deployment** — `Dockerfile` + `docs/container-deploy.md` (runtime contract: `/public/status` health, env, DB, auth modes, agent-endpoint requirements, single-replica constraint, EC2→container cutover runbook). `shepherd/default.yaml` sketches the Shepherd service definition; it is not live — the doc lists the platform gaps. CI for the TypeScript + image is `.github/workflows/container-ci.yml`; `publish-image.yml` pushes to ECR.
 
 Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough (covers both Linux/systemd and macOS/launchd for the per-user agent); `deploy/claude-hooks.md` for the hook config; `docs/box-provisioning.md` for the orchestrator-driven box-provisioning design.
+
+**Suburl apps on the orchestrator** — the orchestrator AMI ships an nginx gateway on :3040 that routes `/termag` to the backend (:3100) and any other path prefix to apps registered under `/srv/termag/apps/<name>/` (an nginx snippet + a systemd unit on the persistent volume, re-registered at every boot by `termag-apps-boot`). Never hand-create ALB target groups or listener rules for an app — see `docs/hosted-apps.md`.
 
 **macOS note** — the per-user agent runs under `launchd` instead of `systemd --user`. There's no linger equivalent; the LaunchAgent plist (`~/Library/LaunchAgents/`) handles auto-start at login. See `deploy/setup.md` for the plist template and `launchctl` commands.
 
