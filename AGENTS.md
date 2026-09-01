@@ -2,11 +2,12 @@
 project: termag
 status: production
 status_description: 'Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe, Devin), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking agent working time and human activity, pinned/recent-activity-sorted project list, on-demand EC2 box provisioning via Packer AMI + Terraform module ("Add box" button) with projects routed by `Instance`, per-project git-worktree workstreams (every project starts with `main`), and visit/flow-speed telemetry (ProjectVisit + WarpSample) surfaced in the usage overlay.'
-last_updated: 2026-06-01
+last_updated: 2026-09-01
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
   - agent:sweeper-claude-opus-4-7
+  - agent:claude-opus-5
 wiki_schema_version: 1
 ---
 
@@ -212,8 +213,15 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 **Changes should ship with tests.** The backend runs [vitest](https://vitest.dev):
 
 ```bash
-cd backend && npm test        # vitest run — discovers src/**/*.test.ts
+cd backend && npm test                       # vitest run — discovers src/**/*.test.ts
+npm test -- src/auth/allowedUsers.test.ts    # one file
+npm test -- -t 'domain wildcard'             # one test by name
+npm run test:watch
 ```
+
+**No linter or formatter is configured for the TS/JS here** — `npm run build` (`tsc`)
+is the only static check on backend/frontend code. CI covers shell + HCL only
+(`packer/**`, `terraform/box/**`, `deploy/**`); see `.github/workflows/box-ami-ci.yml`.
 
 There's no HTTP/DB integration harness, so prefer **extracting logic into pure,
 side-effect-free modules** and unit-testing those — importing a route file like
@@ -323,6 +331,8 @@ harness exists. The frontend has no test runner configured yet.
 26. **Every project has a `main` workstream by default**. Tmux helpers and the agent runtime thread the workstream id through session naming, but legacy code paths that don't pass one will land on `main`. If you add a new code path that creates project artifacts (worktree, tmux session, status event), pass the workstream id explicitly rather than relying on the implicit `main`. Creating a non-`main` workstream auto-mirrors the project's main `Workflow` rows onto it and launches sessions; failures are returned as a non-fatal `sessionLaunchWarnings` array on the 201 response.
 
 27. **`DEV_LOGIN_ENABLED` is a local-development bypass** — when set, the OAuth gate is short-circuited to `DEV_LOGIN_EMAIL`. Never set it in production; the bypass deliberately doesn't check `ALLOWED_USERS` the same way the real path does. The dev-login parse path was tweaked when `parseAllowedUsers` changed shape, so if dev-login regresses, that pairing is the first thing to check.
+
+28. **`backend/.env.example` has drifted from the code on auth** — it documents an Okta/ALB-only deployment ("there is no in-app OAuth client"), but `authMode()` in `backend/src/routes/auth.ts` defaults to `google` and registers the passport Google strategy unless `AUTH_MODE=okta` is set explicitly. Treat `routes/auth.ts` as the source of truth for which sign-in paths exist; read `.env.example` for the variable list, not for the behavior.
 
 ## Related
 
