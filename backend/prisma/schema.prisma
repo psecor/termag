@@ -337,7 +337,12 @@ model Instance {
   projects     Project[]
   agentTokens  AgentToken[]
 
-  @@unique([userId, name])
+  // Uniqueness on (userId, name) is enforced by a PARTIAL unique index that
+  // EXCLUDES terminated boxes, so a terminated box's name can be reused. Prisma
+  // can't express partial uniques in the schema, so the index is created in the
+  // migration 20260902000000_instance_name_partial_unique instead of via
+  // @@unique here. (`prisma migrate dev` will report this index as drift — it's
+  // intentionally managed by that migration; `migrate deploy` applies it as-is.)
   @@index([userId, status])
   @@map("instances")
 }

@@ -22,7 +22,7 @@
  */
 
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
@@ -97,71 +97,85 @@ export function instancesRouter(): Router {
     const tokenHash = hashToken(rawToken);
     const tokenPrefix = rawToken.substring(0, 13) + '...';
 
-    const { instance } = await prisma.$transaction(async (tx) => {
-      const instance = await tx.instance.create({
-        data: {
-          userId: req.user!.id,
-          name: trimmed,
-          kind,
-          // External boxes have no provisioning step — they sit at
-          // "awaiting-agent" until the self-run agent dials in and
-          // registerAgent flips them to "ready".
-          status: kind === 'external' ? 'awaiting-agent' : 'provisioning',
-        },
+    try {
+      const instance = await prisma.$transaction(async (tx) => {
+        const created = await tx.instance.create({
+          data: {
+            userId: req.user!.id,
+            name: trimmed,
+            kind,
+            // External boxes have no provisioning step — they sit at
+            // "awaiting-agent" until the self-run agent dials in and
+            // registerAgent flips them to "ready".
+            status: kind === 'external' ? 'awaiting-agent' : 'provisioning',
+          },
+        });
+        await tx.agentToken.create({
+          data: {
+            userId: req.user!.id,
+            instanceId: created.id,
+            name: `box: ${trimmed}`,
+            tokenHash,
+            tokenPrefix,
+          },
+        });
+        return created;
       });
-      await tx.agentToken.create({
-        data: {
-          userId: req.user!.id,
-          instanceId: instance.id,
-          name: `box: ${trimmed}`,
-          tokenHash,
-          tokenPrefix,
-        },
-      });
-      return { instance };
-    });
 
-    if (kind === 'external') {
-      // Self-managed host: no AWS work. Hand back the raw token (once) plus the
-      // WS URL so the user can fill in agent.config.json on their own machine.
-      const agentWsUrl = process.env.AGENT_WS_URL
-        || `wss://${req.get('host') ?? 'your-orchestrator'}/termag/ws/agent`;
+      if (kind === 'external') {
+        // Self-managed host: no AWS work. Hand back the raw token (once) plus the
+        // WS URL so the user can fill in agent.config.json on their own machine.
+        const agentWsUrl = process.env.AGENT_WS_URL
+          || `wss://${req.get('host') ?? 'your-orchestrator'}/termag/ws/agent`;
+        res.status(201).json({
+          instance,
+          token: rawToken,
+          tokenPrefix,
+          agentWsUrl,
+          hint: 'Self-managed box. Put this token + termag_url into agent.config.json '
+            + 'on your machine and start the termag agent. Shown once.',
+        });
+        return;
+      }
+
+      if (isBoxProvisioningConfigured()) {
+        // V2: provision the EC2 ourselves. Fire-and-forget — the box flips to
+        // `ready` when its agent dials in, or `failed` on a provisioning error.
+        // The raw token rides along in user_data, so it never leaves the server.
+        void provisionBox({
+          instance,
+          boxName: trimmed,
+          owner: req.user!.googleEmail,
+          token: rawToken,
+          remoteUnixUser: req.user!.unixUsername,
+          gitUserEmail: req.user!.googleEmail,
+          gitUserName: req.user!.displayName,
+        });
+        res.status(201).json({ instance });
+        return;
+      }
+
+      // Legacy fallback: provisioning not configured. Return the raw token once
+      // so the user can run `terraform apply` in terraform/box/ themselves.
       res.status(201).json({
         instance,
         token: rawToken,
         tokenPrefix,
-        agentWsUrl,
-        hint: 'Self-managed box. Put this token + termag_url into agent.config.json '
-          + 'on your machine and start the termag agent. Shown once.',
+        hint: 'Box provisioning is not configured; run `terraform apply` in terraform/box/ with this token',
       });
-      return;
+    } catch (err) {
+      // Defense-in-depth for the (userId, name) unique: the pre-check above
+      // already 409s on an active duplicate, but a concurrent create could still
+      // race into a P2002. Surface it as a clean 409 rather than letting it
+      // escape as an unhandled rejection (which is what left the UI showing a
+      // generic "Failed to create box" with no response).
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        res.status(409).json({ error: `A box named "${trimmed}" already exists` });
+        return;
+      }
+      console.error('[BOX] create failed:', err instanceof Error ? err.message : String(err));
+      res.status(500).json({ error: 'Failed to create box' });
     }
-
-    if (isBoxProvisioningConfigured()) {
-      // V2: provision the EC2 ourselves. Fire-and-forget — the box flips to
-      // `ready` when its agent dials in, or `failed` on a provisioning error.
-      // The raw token rides along in user_data, so it never leaves the server.
-      void provisionBox({
-        instance,
-        boxName: trimmed,
-        owner: req.user!.googleEmail,
-        token: rawToken,
-        remoteUnixUser: req.user!.unixUsername,
-        gitUserEmail: req.user!.googleEmail,
-        gitUserName: req.user!.displayName,
-      });
-      res.status(201).json({ instance });
-      return;
-    }
-
-    // Legacy fallback: provisioning not configured. Return the raw token once
-    // so the user can run `terraform apply` in terraform/box/ themselves.
-    res.status(201).json({
-      instance,
-      token: rawToken,
-      tokenPrefix,
-      hint: 'Box provisioning is not configured; run `terraform apply` in terraform/box/ with this token',
-    });
   };
 
   // Terminate a box: archive its projects, revoke its tokens, mark
