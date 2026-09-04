@@ -1,5 +1,6 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient, WorkflowType } from '@prisma/client';
+import { WorkflowType } from '@prisma/client';
+import { prisma } from '../db';
 import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { parseBulkPinBody } from './bulkPin';
@@ -16,7 +17,6 @@ import { rename } from 'fs/promises';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
 
-const prisma = new PrismaClient();
 
 const VALID_CAPTURE_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
 type CaptureRole = typeof VALID_CAPTURE_ROLES[number];

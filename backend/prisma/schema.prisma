@@ -1,5 +1,9 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  // driverAdapters lets backend/src/db.ts hand Prisma a node-postgres pool
+  // whose password is minted per connection (RDS IAM auth). Without
+  // PG_IAM_AUTH the default engine + DATABASE_URL path is used unchanged.
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -355,4 +359,18 @@ model RelaySnapshot {
   windows     Json     // array of { windowId, tabs: [{ url, title, favIcon }] }
 
   @@map("relay_snapshots")
+}
+
+/// connect-pg-simple's session store. Declared here ONLY so `prisma db push`
+/// creates it (as the migration user) and stops dropping it as an unknown
+/// table on every schema sync — the app never queries it through Prisma.
+/// Shape mirrors connect-pg-simple/table.sql (varchar sid PK, json sess,
+/// timestamp(6) expire, index on expire).
+model Session {
+  sid    String   @id @db.VarChar
+  sess   Json     @db.Json
+  expire DateTime @db.Timestamp(6)
+
+  @@index([expire], map: "IDX_session_expire")
+  @@map("session")
 }

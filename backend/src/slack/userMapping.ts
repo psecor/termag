@@ -5,10 +5,10 @@
  * Caches the mapping in the DB (slackUserId field) after first lookup.
  */
 
-import { PrismaClient, User } from '@prisma/client';
+import { User } from '@prisma/client';
+import { prisma } from '../db';
 import type { WebClient } from '@slack/web-api';
 
-const prisma = new PrismaClient();
 
 // In-memory cache: slackUserId → termag User
 const cache = new Map<string, User | null>();

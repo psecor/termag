@@ -1,8 +1,7 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 
-const prisma = new PrismaClient();
 
 export function sharingRouter(): Router {
   const router = Router();

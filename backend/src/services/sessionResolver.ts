@@ -11,10 +11,9 @@
  * Results are cached briefly so hot callers (the status-route context sampler,
  * Slack poll loops) don't re-query the DB on every tick.
  */
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { sessionName as buildSessionName } from './tmux';
 
-const prisma = new PrismaClient();
 
 const ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
 

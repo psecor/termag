@@ -1,9 +1,9 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../db';
 import { requireAuth, requireRelayToken } from '../middleware/auth';
 import { ChromeWindow } from '../types/index';
 
-const prisma = new PrismaClient();
 
 export function browserRouter(): Router {
   const router = Router();

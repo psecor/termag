@@ -1,5 +1,5 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { setStatus, getStatus, updateStatusMeta, notifyStatusChange } from '../services/status';
 import { AgentStatus } from '../types/index';
 import { getAllNotificationTargets } from '../slack/lts';
@@ -16,7 +16,6 @@ import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { resolveSessionProject } from '../services/sessionResolver';
 import { recordContextSample } from '../services/contextSampler';
 
-const prisma = new PrismaClient();
 
 // Track working start time and last notification per session
 const statusTracking = new Map<string, {

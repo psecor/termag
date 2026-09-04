@@ -1,5 +1,5 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { requireAuth } from '../middleware/auth';
@@ -8,7 +8,6 @@ import { projectDir } from '../services/tmux';
 import { ensureAgentSessionsAndLaunch, stopAgentSessions, resolveAgentProvider } from '../services/agentRuntime';
 import * as tmux from '../services/tmux';
 
-const prisma = new PrismaClient();
 const execAsync = promisify(exec);
 
 const NAME_REGEX = /^[a-zA-Z0-9_-]+$/;

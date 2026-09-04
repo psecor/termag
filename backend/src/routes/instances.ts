@@ -22,13 +22,13 @@
  */
 
 import { Router, RequestHandler } from 'express';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../db';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
 
-const prisma = new PrismaClient();
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');

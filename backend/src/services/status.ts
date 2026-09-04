@@ -1,9 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { AgentStatus, StatusMap } from '../types/index';
 import { isAgentRunning } from './tmux';
 import { providerForSource } from '../providers/registry';
 
-const prisma = new PrismaClient();
 
 // In-memory status map. Keyed by tmux session name.
 const statusMap: StatusMap = new Map();

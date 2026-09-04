@@ -1,8 +1,7 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 
-const prisma = new PrismaClient();
 
 function dayKey(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;

@@ -1,9 +1,8 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 
-const prisma = new PrismaClient();
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');

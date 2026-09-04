@@ -7,7 +7,13 @@
 # backend provisions via the AWS SDK; see docs/container-deploy.md for the
 # runtime contract (env, ports, health, DB, auth modes, IAM).
 #
+# Targets:
+#   runtime     (default) the server.
+#   migrations  the same image with a shim so Shepherd's fixed Alembic command
+#               runs our schema sync instead (see backend/scripts/opentelemetry-instrument).
+#
 # Build:   docker build -t termag-orchestrator .
+#          docker build --target migrations -t termag-orchestrator-migrations .
 # Run:     docker run --rm -p 3040:3040 --env-file backend/.env termag-orchestrator
 # Schema:  docker run --rm --env-file backend/.env termag-orchestrator npm --prefix backend run db:push
 #
@@ -59,6 +65,10 @@ RUN apt-get update \
  && groupadd --gid 10001 termag \
  && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/termag --shell /usr/sbin/nologin termag
 WORKDIR /app
+# Amazon's RDS certificate bundle so IAM-auth connections (which RDS requires to
+# be TLS) verify the server certificate. backend/src/config/env.ts picks this
+# path up by default; PG_SSL_CA_FILE overrides it.
+ADD --chown=10001:10001 --chmod=0644 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem certs/rds-global-bundle.pem
 # Layout mirrors the source tree because the backend resolves the frontend
 # bundle, the Sound Garden SPA and the AGENTS.md seed template relative to
 # its own dist/ directory (../../frontend/dist, ../../sound-garden,
@@ -74,3 +84,13 @@ USER 10001:10001
 EXPOSE 3040
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "backend/dist/index.js"]
+
+# ── migrations: Shepherd's pre-deploy migration container ──
+# Shepherd runs `opentelemetry-instrument alembic upgrade head` here as UID
+# 65534 with PG_HOST/PG_DATABASE/PG_USER=migration/PG_PORT and no password; the
+# shim ignores its arguments and runs the IAM-authenticated schema sync.
+FROM runtime AS migrations
+COPY --chmod=0755 backend/scripts/opentelemetry-instrument /usr/local/bin/opentelemetry-instrument
+ENV PG_IAM_AUTH=true
+USER 65534:65534
+CMD ["opentelemetry-instrument", "alembic", "upgrade", "head"]

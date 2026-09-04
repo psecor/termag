@@ -1,8 +1,7 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 
-const prisma = new PrismaClient();
 
 export function worktimeRouter(): Router {
   const router = Router();

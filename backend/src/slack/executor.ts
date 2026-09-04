@@ -7,10 +7,9 @@
 
 import { spawn } from 'child_process';
 import { homedir } from 'os';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { projectDir, ensureProjectDir } from '../services/tmux';
 
-const prisma = new PrismaClient();
 const CLAUDE_TIMEOUT = (parseInt(process.env.CLAUDE_TIMEOUT_SECONDS ?? '120', 10)) * 1000;
 
 export interface StreamChunk {

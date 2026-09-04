@@ -16,9 +16,8 @@
  * so they can be unit-tested without a database; the exported record/sweep
  * wrappers apply their decisions and do the prisma writes.
  */
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
-const prisma = new PrismaClient();
 
 const SWEEP_INTERVAL_MS = 20_000;      // roll/flush completed minutes this often
 const STALE_AFTER_MS = 12 * 60 * 1000; // backstop evict if no report in 12 min

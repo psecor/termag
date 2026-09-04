@@ -1,9 +1,8 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { recordWarpSample } from '../services/warpSampler';
 import { requireAuth } from '../middleware/auth';
 
-const prisma = new PrismaClient();
 
 export function warpRouter(): Router {
   const router = Router();

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Shim for Shepherd's migration step.
+#
+# Shepherd runs a fixed command in the migrations container:
+#   opentelemetry-instrument alembic upgrade head
+# (dedicated_migration_container: true). There is no Alembic here — the schema
+# sync is `node dist/scripts/dbPush.js` — so the `migrations` image target puts
+# this script on PATH under that name. Arguments are ignored on purpose; the
+# OTEL_* variables Shepherd sets are left for a future OTel SDK hook-up.
+set -eu
+exec node /app/backend/dist/scripts/dbPush.js

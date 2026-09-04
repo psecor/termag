@@ -62,10 +62,10 @@ import {
   DeleteRoleCommand,
 } from '@aws-sdk/client-iam';
 import { fromTemporaryCredentials } from '@aws-sdk/credential-providers';
-import { Instance, Prisma, PrismaClient } from '@prisma/client';
+import { Instance, Prisma } from '@prisma/client';
+import { prisma } from '../db';
 import { createHash, randomBytes } from 'crypto';
 
-const prisma = new PrismaClient();
 
 const SSM_CORE_POLICY_ARN = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore';
 const GIT_TOKEN_INLINE_POLICY = 'termag-git-token-read';

@@ -1,11 +1,10 @@
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { getPollerUsage } from '../services/tmuxPoller';
 import { serverSideUsageProviderIds } from '../providers/registry';
 
-const prisma = new PrismaClient();
 
 // Cache usage data per user for 5 minutes
 const cache = new Map<string, { data: any; fetchedAt: number }>();

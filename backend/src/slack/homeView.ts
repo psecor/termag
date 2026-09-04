@@ -4,7 +4,7 @@
  * Shows the logged-in user's termag projects with stoplights, plus local terminal sessions.
  */
 
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { execSync } from 'child_process';
 import type { WebClient } from '@slack/web-api';
 import { getClaudeSessionStatus, listLocalSessions, getActiveLocalSession } from './lts';
@@ -13,7 +13,6 @@ import { sessionName } from '../services/tmux';
 import { getStatus } from '../services/status';
 import { resolveTermagUser } from './userMapping';
 
-const prisma = new PrismaClient();
 const STALE_MS = 10 * 60 * 1000;
 
 function checkClaudeInSession(tmuxName: string): boolean | null {

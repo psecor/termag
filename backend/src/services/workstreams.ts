@@ -1,9 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { projectDir } from './tmux';
 
-const prisma = new PrismaClient();
 const execAsync = promisify(exec);
 
 async function detectDefaultBranch(dir: string): Promise<string> {

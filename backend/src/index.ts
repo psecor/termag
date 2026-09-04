@@ -36,14 +36,13 @@ import {
   requestTerminalStream, requestInstanceTerminalStream,
   sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
 } from './services/agentRegistry';
-import { PrismaClient } from '@prisma/client';
+import { prisma as prismaIndex, getPool } from './db';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
 import { sessionName } from './services/tmux';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
 import { startWarpSampler, stopWarpSampler } from './services/warpSampler';
 import { startContextSampler, stopContextSampler } from './services/contextSampler';
 
-const prismaIndex = new PrismaClient();
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
 import { getActiveHomeViewers } from './slack/events';
@@ -84,11 +83,20 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
 }
 
 const sessionMiddleware = session({
-  // The `session` table is owned by connect-pg-simple, not Prisma, so nothing
-  // else creates it — and `prisma db push` drops it as an unknown table on
-  // every schema sync. Let the store recreate it on boot instead of relying on
-  // a hand-run SQL block in the deploy tooling.
-  store: new PgSession({ conString: process.env.DATABASE_URL, createTableIfMissing: true }),
+  // connect-pg-simple's `session` table is declared in prisma/schema.prisma
+  // (model Session) purely so `prisma db push` creates and keeps it during the
+  // migration step — on Shepherd that step runs as the `migration` DB user,
+  // while the server's `application` user may not be allowed to CREATE TABLE.
+  // createTableIfMissing stays as a fallback for deployments that never run
+  // `db push`; the app itself never reads the table through Prisma.
+  //
+  // With RDS IAM auth there is no DATABASE_URL to hand over; share the IAM-token
+  // pool Prisma runs on instead (db.ts) so sessions get the same credentials.
+  store: new PgSession(
+    getPool()
+      ? { pool: getPool()!, createTableIfMissing: true }
+      : { conString: process.env.DATABASE_URL, createTableIfMissing: true },
+  ),
   name: 'termag.sid',
   secret: process.env.SESSION_SECRET ?? 'dev-secret',
   resave: false,

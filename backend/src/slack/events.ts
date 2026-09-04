@@ -8,7 +8,7 @@
 
 // App type used loosely — Bolt's CJS export doesn't play well with TS imports
 type App = any;
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFile } from 'fs/promises';
@@ -35,7 +35,6 @@ import {
   setNotificationTarget,
 } from './lts';
 
-const prisma = new PrismaClient();
 const execAsync = promisify(exec);
 
 // Track users who have the App Home tab open

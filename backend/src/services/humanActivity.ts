@@ -6,9 +6,8 @@
  * and the accumulated time is banked into work_time_entries with provider="human".
  */
 
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
-const prisma = new PrismaClient();
 
 const DECAY_MS = 3 * 60 * 1000; // 3 minutes
 const CHECK_INTERVAL_MS = 30_000; // check for decay every 30s

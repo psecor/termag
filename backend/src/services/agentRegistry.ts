@@ -21,10 +21,10 @@
  */
 
 import { WebSocket } from 'ws';
-import { Instance, PrismaClient, User } from '@prisma/client';
+import { Instance, User } from '@prisma/client';
+import { prisma } from '../db';
 import { reconstructUserSessions, reconstructInstanceSessions } from './agentRuntime';
 
-const prisma = new PrismaClient();
 
 interface ConnectedAgent {
   ws: WebSocket;

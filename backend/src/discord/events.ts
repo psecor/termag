@@ -5,7 +5,7 @@
  */
 
 import { Client, ChatInputCommandInteraction, Message } from 'discord.js';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { resolveDiscordUser } from './userMapping';
 import { formatPaneForDiscord } from './formatting';
 import {
@@ -18,7 +18,6 @@ import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
 
-const prisma = new PrismaClient();
 
 // Emoji → keystroke mapping (matches Slack)
 const EMOJI_KEYS: Record<string, { keys: string; withEnter: boolean }> = {

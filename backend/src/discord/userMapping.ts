@@ -7,9 +7,9 @@
  * or manually in the database.
  */
 
-import { PrismaClient, User } from '@prisma/client';
+import { User } from '@prisma/client';
+import { prisma } from '../db';
 
-const prisma = new PrismaClient();
 const cache = new Map<string, User | null>();
 
 /**

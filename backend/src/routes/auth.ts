@@ -1,7 +1,7 @@
 import { Router, RequestHandler, Request, Response, NextFunction } from 'express';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { PROVIDER_IDS } from '../providers/registry';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 import { verifyAlbIdentity } from '../auth/albOidc';
@@ -10,7 +10,6 @@ import {
 } from '../auth/oidc';
 import { autoProvisionFirstBox } from '../services/boxProvisioner';
 
-const prisma = new PrismaClient();
 
 export type AuthMode = 'google' | 'okta' | 'oidc';
 

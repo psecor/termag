@@ -142,7 +142,7 @@ Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrit
 | `UsageEvent` | Per-call API usage (tokens, cost) for the dashboard. Provider-specific scanners populate this (Codex JSONL, Claude logs, vibe `~/.vibe/logs/session/meta.json`). |
 | `ProjectVisit` | Per-user context-switch log: when the UI focus moves between projects. Feeds the visits section of the UsageMini overlay via `/termag/api/visits`. |
 | `WarpSample` | Per-minute rollups of the hyperspace-speed signal. Produced by `warpSampler` and exposed via `/termag/api/warp` for the flow-speed sections of UsageMini. |
-| `session` | Managed by `connect-pg-simple`, NOT in `schema.prisma`. Created by the SQL block in `deploy/setup.md`. |
+| `session` | `connect-pg-simple`'s session store. Declared in `schema.prisma` as model `Session` (`@@map("session")`) ONLY so `prisma db push` creates/keeps it under the migration DB user; the app never reads or writes it through Prisma. |
 
 Migration history (recent):
 - `20260427000000_provider_string_and_worktime` — `agentProvider` moved from enum to string; worktime rollups added.
@@ -163,6 +163,7 @@ Migration history (recent):
 | Var | Notes |
 |-----|-------|
 | `DATABASE_URL` | Postgres. Composed from `PG_HOST`/`PG_PORT`/`PG_DATABASE`/`PG_USERNAME`/`PG_PASSWORD`/`PG_SSLMODE` at startup when unset (`config/env.ts`). |
+| `PG_IAM_AUTH` | `true` → RDS IAM auth: Prisma runs through a node-postgres pool (`db.ts`, `driverAdapters`) whose password is a fresh IAM token per connection; region from `PG_IAM_REGION`/`AWS_REGION`/the RDS hostname; TLS verified against the baked RDS CA (`PG_SSL_CA_FILE`). Every module imports the shared `prisma` from `db.ts` — never `new PrismaClient()` elsewhere. |
 | `SESSION_SECRET` | random hex |
 | `AUTH_MODE` | `google` (default, in-app Google OAuth), `okta` (identity from the ALB `authenticate-oidc` edge via `x-amzn-oidc-data`), or `oidc` (in-app OpenID Connect code flow, `auth/oidc.ts` — for the container behind a non-ALB ingress). |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth (required when `AUTH_MODE=google`) |
@@ -292,7 +293,7 @@ harness exists. The frontend has no test runner configured yet.
 
 2. **`loginctl enable-linger <user>` is mandatory (Linux)** — without it, the per-user agent stops the moment the user logs out, which makes everything in the UI hang the next time termag tries to talk to that user's agent. macOS uses launchd LaunchAgents instead and has no linger equivalent.
 
-3. **`session` table is owned by `connect-pg-simple`, not Prisma** — don't add it to `schema.prisma`. The `CREATE TABLE` SQL is in `deploy/setup.md` and must be run once after creating the DB.
+3. **`session` table is `connect-pg-simple`'s, but it IS declared in `schema.prisma`** — model `Session`, mapped to `session`, mirroring connect-pg-simple's `table.sql`. It is there purely so schema syncs (`prisma db push`, which drops unknown tables) create and keep it under the migration DB user; on Shepherd the server's `application` user may not be allowed to `CREATE TABLE`, so `createTableIfMissing` in `backend/src/index.ts` is only a fallback. The app never touches the table through Prisma: don't add relations to it or query `prisma.session`.
 
 4. **Slack scopes are large** — the bot needs `app_mentions:read`, `chat:write`, `channels:manage`, `channels:read`, `commands`, `im:history`, `im:read`, `im:write`, `files:read`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`. Re-add any you remove and reinstall the app or `/t create` will silently fail to create channels.
 

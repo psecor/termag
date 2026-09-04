@@ -8,9 +8,8 @@
  * or when a user has gone quiet for a while).
  */
 
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
-const prisma = new PrismaClient();
 
 const CHECK_INTERVAL_MS = 30_000;     // sweep for stale buckets every 30s
 const STALE_AFTER_MS = 2 * 60 * 1000; // flush a bucket if no sample in 2 min

@@ -15,12 +15,11 @@
  */
 
 import * as fs from 'fs';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 import { capturePaneText, isAgentRunning, sessionName } from './tmux';
 import { getStatus, setStatus, notifyStatusChange } from './status';
 import { PROVIDERS, pollerProviderIds, ProviderConfig } from '../providers/registry';
 
-const prisma = new PrismaClient();
 
 const POLL_INTERVAL_MS = 2000;
 const WORKING_COOLDOWN_MS = 4000;

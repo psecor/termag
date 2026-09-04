@@ -2,9 +2,8 @@ import * as tmux from './tmux';
 import { isProjectAgentConnected, sendForProject } from './agentRegistry';
 import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
 import { PROVIDERS, ALL_PROCESS_NAMES } from '../providers/registry';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../db';
 
-const prisma = new PrismaClient();
 
 /**
  * Ask the right agent (the project's box if any, else the user's legacy

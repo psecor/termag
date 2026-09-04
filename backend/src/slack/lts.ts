@@ -6,12 +6,11 @@
  */
 
 import { Router, RequestHandler } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma as prismaClient } from '../db';
 import { formatPaneForSlack } from '../services/tmux';
 import { setStatus, notifyStatusChange } from '../services/status';
 import type { WebClient } from '@slack/web-api';
 
-const prismaClient = new PrismaClient();
 
 // In-memory state
 const registry = new Map<string, {
