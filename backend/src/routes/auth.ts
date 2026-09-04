@@ -5,11 +5,14 @@ import { PrismaClient } from '@prisma/client';
 import { PROVIDER_IDS } from '../providers/registry';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 import { verifyAlbIdentity } from '../auth/albOidc';
+import {
+  oidcConfigFromEnv, getOidcClient, newTransaction, authorizationUrl, completeLogin, type OidcIdentity,
+} from '../auth/oidc';
 import { autoProvisionFirstBox } from '../services/boxProvisioner';
 
 const prisma = new PrismaClient();
 
-export type AuthMode = 'google' | 'okta';
+export type AuthMode = 'google' | 'okta' | 'oidc';
 
 /**
  * Which sign-in mechanism the app uses, controlled by the AUTH_MODE env var:
@@ -17,13 +20,45 @@ export type AuthMode = 'google' | 'okta';
  *   - 'okta': identity is established at the edge by the ALB's authenticate-oidc
  *     (Okta) action and read from the `x-amzn-oidc-data` header by
  *     albSessionBridge; there is no in-app OAuth strategy.
+ *   - 'oidc': in-app OpenID Connect authorization-code flow (auth/oidc.ts) for
+ *     deployments with no ALB edge auth — e.g. the containerised orchestrator
+ *     behind a Kubernetes ingress. Needs OIDC_ISSUER_URL/CLIENT_ID/CLIENT_SECRET.
  *
  * Defaults to 'google' so the app keeps working on deployments whose ALB does
  * not (yet) perform Okta edge auth. Set AUTH_MODE=okta once the ALB
- * authenticate-oidc gate is in place.
+ * authenticate-oidc gate is in place, or AUTH_MODE=oidc where the app must
+ * talk to the identity provider itself.
  */
 export function authMode(): AuthMode {
-  return process.env.AUTH_MODE === 'okta' ? 'okta' : 'google';
+  const mode = process.env.AUTH_MODE;
+  return mode === 'okta' || mode === 'oidc' ? mode : 'google';
+}
+
+/**
+ * Turn an externally-verified identity (Okta via the ALB header, or the in-app
+ * OIDC flow) into a termag user: enforce ALLOWED_USERS, upsert by email, and
+ * return null when the identity is not allowlisted. Shared by both identity
+ * paths so their user shape can't drift. `idPrefix` only matters on first
+ * creation — the upsert is keyed by email.
+ */
+async function upsertAllowlistedUser(identity: OidcIdentity, idPrefix: 'okta' | 'oidc'): Promise<Express.User | null> {
+  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
+  const unixUsername = resolveUnixUsername(allowedUsers, identity.email);
+  if (!unixUsername) {
+    console.warn(`[auth] rejected sign-in for ${identity.email}: not in ALLOWED_USERS`);
+    return null;
+  }
+  const user = await prisma.user.upsert({
+    where: { googleEmail: identity.email },
+    update: { displayName: identity.name ?? identity.email, unixUsername },
+    create: {
+      googleId: `${idPrefix}:${identity.sub}`,
+      googleEmail: identity.email,
+      unixUsername,
+      displayName: identity.name ?? identity.email,
+    },
+  });
+  return user as Express.User;
 }
 
 export function configurePassport(): void {
@@ -115,26 +150,13 @@ export const albSessionBridge: RequestHandler = async (req: Request, res: Respon
   }
   if (!identity) return next();
 
-  const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
-  const unixUsername = resolveUnixUsername(allowedUsers, identity.email);
-  if (!unixUsername) {
-    console.warn(`[auth] rejected sign-in for ${identity.email}: not in ALLOWED_USERS`);
-    res.status(403).json({ error: 'Forbidden' });
-    return;
-  }
-
   try {
-    const user = await prisma.user.upsert({
-      where: { googleEmail: identity.email },
-      update: { displayName: identity.name ?? identity.email, unixUsername },
-      create: {
-        googleId: `okta:${identity.sub}`,
-        googleEmail: identity.email,
-        unixUsername,
-        displayName: identity.name ?? identity.email,
-      },
-    });
-    req.login(user as Express.User, (err) => {
+    const user = await upsertAllowlistedUser(identity, 'okta');
+    if (!user) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    req.login(user, (err) => {
       if (err) return next(err);
       // First-login auto-provision (env-gated, no-op unless enabled). Fired
       // un-awaited so a slow/failed box spin-up never blocks or breaks login.
@@ -161,10 +183,75 @@ export function authRouter(): Router {
   // Login entry point. `/auth/login` is the single, mode-agnostic URL the
   // frontend links to:
   //   - google mode: kick off the Google OAuth flow.
+  //   - oidc mode: kick off the in-app OpenID Connect code flow.
   //   - okta mode: the ALB has already authenticated the user against Okta by
   //     the time any request reaches the app, so albSessionBridge has a verified
   //     identity to turn into a session — just bounce to the app root.
-  if (authMode() === 'google') {
+  if (authMode() === 'oidc') {
+    // Fail fast at startup on a misconfigured deployment rather than 500-ing
+    // the first login attempt.
+    const cfg = oidcConfigFromEnv(process.env);
+
+    const start: RequestHandler = async (req, res, next) => {
+      try {
+        const client = await getOidcClient(cfg);
+        const tx = newTransaction();
+        req.session.oidc = tx;
+        // Persist the PKCE state/nonce/verifier BEFORE redirecting. express-session
+        // only auto-saves when the response ends, and connect-pg-simple writes
+        // asynchronously, so a synchronous res.redirect() can put the 302 on the
+        // wire before the row exists. The browser then round-trips the IdP and
+        // hits /callback against a session with no `oidc` transaction, which
+        // surfaces to the user as `session_expired`. Waiting on save() closes
+        // that race.
+        req.session.save((err) => {
+          if (err) return next(err);
+          res.redirect(authorizationUrl(client, cfg, tx));
+        });
+      } catch (err) {
+        next(err);
+      }
+    };
+
+    const callback: RequestHandler = async (req, res, next) => {
+      const tx = req.session.oidc;
+      delete req.session.oidc;
+      if (!tx) {
+        // No pending transaction: expired session, replayed callback, or a
+        // cross-site redirect. Start over rather than accept anything.
+        res.redirect(`${basePath}/login?error=session_expired`);
+        return;
+      }
+
+      let identity: OidcIdentity;
+      try {
+        identity = await completeLogin(await getOidcClient(cfg), cfg, req, tx);
+      } catch (err) {
+        console.warn(`[auth] OIDC callback rejected: ${(err as Error).message}`);
+        res.redirect(`${basePath}/login?error=unauthorized`);
+        return;
+      }
+
+      try {
+        const user = await upsertAllowlistedUser(identity, 'oidc');
+        if (!user) {
+          res.redirect(`${basePath}/login?error=unauthorized`);
+          return;
+        }
+        req.login(user, (err) => {
+          if (err) return next(err);
+          void autoProvisionFirstBox(user);
+          res.redirect(`${frontendUrl}${basePath}/`);
+        });
+      } catch (err) {
+        next(err as Error);
+      }
+    };
+
+    router.get('/login', start);
+    router.get('/oidc', start);
+    router.get('/oidc/callback', callback);
+  } else if (authMode() === 'google') {
     router.get('/login', passport.authenticate('google', { scope: ['profile', 'email'] }));
     router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
     router.get(

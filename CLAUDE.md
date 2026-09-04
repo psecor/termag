@@ -18,7 +18,8 @@ touching:
 - **`agent/agent.js`** — the per-user agent has no hot reload and must be restarted after every change
 
 Deeper docs, all still current: `deploy/setup.md` (first-time setup), `deploy/claude-hooks.md`,
-`docs/box-provisioning.md`, `docs/hosted-apps.md`, `docs/public-mirror-sync.md`.
+`docs/box-provisioning.md`, `docs/hosted-apps.md`, `docs/container-deploy.md` (running the
+orchestrator as a container), `docs/public-mirror-sync.md`.
 
 ## What AGENTS.md can't say about itself
 

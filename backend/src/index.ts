@@ -1,4 +1,7 @@
 import 'dotenv/config';
+// Must run before any module constructs a PrismaClient: derives DATABASE_URL
+// from platform-injected PG_* variables when it is not set explicitly.
+import './config/bootstrap';
 import express from 'express';
 import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
@@ -24,7 +27,6 @@ import { instancesRouter } from './routes/instances';
 import { apiErrorHandler } from './middleware/errors';
 import { workstreamsRouter } from './routes/workstreams';
 import { startProvisioningSweep } from './services/boxProvisioner';
-// import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
 import { setStatusChangeCallback, getStatus, getAllStatuses } from './services/status';
 import { createSlackApp, startSlackApp } from './slack/app';
 import { createDiscordClient, startDiscordClient } from './discord/app';
@@ -82,7 +84,11 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
 }
 
 const sessionMiddleware = session({
-  store: new PgSession({ conString: process.env.DATABASE_URL }),
+  // The `session` table is owned by connect-pg-simple, not Prisma, so nothing
+  // else creates it — and `prisma db push` drops it as an unknown table on
+  // every schema sync. Let the store recreate it on boot instead of relying on
+  // a hand-run SQL block in the deploy tooling.
+  store: new PgSession({ conString: process.env.DATABASE_URL, createTableIfMissing: true }),
   name: 'termag.sid',
   secret: process.env.SESSION_SECRET ?? 'dev-secret',
   resave: false,
@@ -127,6 +133,14 @@ app.use(`${BASE_PATH}/api/instances`, instancesRouter());
 app.use(`${BASE_PATH}/api`, workstreamsRouter());
 
 app.get(`${BASE_PATH}/health`, (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// Root-level liveness/readiness probe for container platforms whose default
+// health check path is fixed and sits outside BASE_PATH. Unauthenticated and
+// session-free by construction (the session middleware is mounted under
+// BASE_PATH). Same body as /health so either can be pointed at.
+app.get('/public/status', (_req, res) => {
   res.json({ status: 'ok' });
 });
 

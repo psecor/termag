@@ -6,7 +6,9 @@ const api = axios.create({
   withCredentials: true,
 });
 
-export type AuthMode = 'google' | 'okta';
+// Mirrors backend routes/auth.ts AuthMode: 'okta' = identity from the ALB edge,
+// 'oidc' = in-app OpenID Connect flow (container deployments).
+export type AuthMode = 'google' | 'okta' | 'oidc';
 
 export const authApi = {
   me: (): Promise<User> => api.get('/auth/me').then(r => r.data),

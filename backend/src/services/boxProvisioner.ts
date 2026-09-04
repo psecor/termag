@@ -15,6 +15,24 @@
  * `provisioning` immediately and the box flips to `ready` on its own when its
  * agent dials the WS (see agentRegistry.registerAgent). On any SDK error the
  * Instance is marked `failed` with provisioningError set.
+ *
+ * Deployment shapes. The orchestrator may run (a) on an EC2 host in the same
+ * account as the boxes, using its instance role, or (b) as a container (k8s)
+ * whose pod identity lives in another account. Two knobs cover both:
+ *   - BOX_PROVISIONER_ROLE_ARN: when set, every AWS call is made with
+ *     credentials from sts:AssumeRole on that role (the box account's
+ *     provisioner role) on top of the ambient credential chain. Unset = use the
+ *     ambient credentials directly (the EC2 instance-role shape).
+ *   - HOST_SECURITY_GROUP_ID: the SG fronting the agent endpoint boxes dial
+ *     back to. On EC2 it is the host's own SG and gets a :3040 ingress rule per
+ *     box SG. Off-host (k8s ingress / internal LB with its own reachability
+ *     rules) leave it unset and no SG rules are written at provision time.
+ *     Teardown does NOT rely on it: terminateBox asks EC2 which SGs still
+ *     reference the box SG in an ingress rule and revokes from every one of
+ *     them, so boxes created by the EC2-hosted orchestrator are cleaned up by a
+ *     container orchestrator that has RevokeSecurityGroupIngress on the old
+ *     host SG (the terraform module exposes that grant separately from the
+ *     box-SG permissions).
  */
 
 import {
@@ -27,6 +45,7 @@ import {
   RunInstancesCommand,
   TerminateInstancesCommand,
   DescribeInstancesCommand,
+  DescribeSecurityGroupsCommand,
   type Tag,
 } from '@aws-sdk/client-ec2';
 import {
@@ -42,6 +61,7 @@ import {
   DeleteInstanceProfileCommand,
   DeleteRoleCommand,
 } from '@aws-sdk/client-iam';
+import { fromTemporaryCredentials } from '@aws-sdk/credential-providers';
 import { Instance, Prisma, PrismaClient } from '@prisma/client';
 import { createHash, randomBytes } from 'crypto';
 
@@ -52,15 +72,16 @@ const GIT_TOKEN_INLINE_POLICY = 'termag-git-token-read';
 
 // ── Config (from backend/.env, mostly outputs from your IAM-grant Terraform) ─
 
-interface BoxConfig {
+export interface BoxConfig {
   region: string;
-  agentWsUrl: string;          // ws://<orchestrator-private-dns>:3040/termag/ws/agent (internal, host-to-host)
+  agentWsUrl: string;          // URL the box agent dials: ws(s)://<orchestrator>/termag/ws/agent
   resourcePrefix: string;      // e.g. "termag-box" — SG/role/profile name prefix
   permissionsBoundaryArn: string;
   vpcId: string;
   subnetId: string;
   instanceType: string;        // MUST be arm64/Graviton — the AMI is arm64-only
-  hostSecurityGroupId: string; // orchestrator host SG — box SG gets :3040 ingress here
+  hostSecurityGroupId?: string; // optional: SG fronting the agent endpoint — box SG gets :3040 ingress here
+  assumeRoleArn?: string;      // optional: cross-account provisioner role to assume for every AWS call
   managedTag: string;          // ManagedBy tag value the grant scopes on
   rootVolumeGb: number;
   gitTokenSecretArn?: string;  // optional: private-repo PAT, read at boot via SSM/SM
@@ -71,17 +92,15 @@ interface BoxConfig {
  * configured (local dev, or a deploy that hasn't surfaced the module outputs
  * into the secret yet) so callers can fall back to the manual-terraform path.
  */
-export function getBoxConfig(): BoxConfig | null {
-  const region = process.env.AWS_REGION;
-  const agentWsUrl = process.env.AGENT_WS_URL;
-  const resourcePrefix = process.env.BOX_RESOURCE_PREFIX;
-  const permissionsBoundaryArn = process.env.BOX_PERMISSIONS_BOUNDARY_ARN;
-  const vpcId = process.env.BOX_VPC_ID;
-  const subnetId = process.env.BOX_SUBNET_ID;
-  const hostSecurityGroupId = process.env.HOST_SECURITY_GROUP_ID;
+export function getBoxConfig(env: NodeJS.ProcessEnv = process.env): BoxConfig | null {
+  const region = env.AWS_REGION;
+  const agentWsUrl = env.AGENT_WS_URL;
+  const resourcePrefix = env.BOX_RESOURCE_PREFIX;
+  const permissionsBoundaryArn = env.BOX_PERMISSIONS_BOUNDARY_ARN;
+  const vpcId = env.BOX_VPC_ID;
+  const subnetId = env.BOX_SUBNET_ID;
 
-  if (!region || !agentWsUrl || !resourcePrefix || !permissionsBoundaryArn ||
-      !vpcId || !subnetId || !hostSecurityGroupId) {
+  if (!region || !agentWsUrl || !resourcePrefix || !permissionsBoundaryArn || !vpcId || !subnetId) {
     return null;
   }
 
@@ -92,16 +111,49 @@ export function getBoxConfig(): BoxConfig | null {
     permissionsBoundaryArn,
     vpcId,
     subnetId,
-    hostSecurityGroupId,
-    instanceType: process.env.BOX_INSTANCE_TYPE ?? 't4g.medium',
-    managedTag: process.env.BOX_MANAGED_TAG ?? 'termag-box',
-    rootVolumeGb: parseInt(process.env.BOX_ROOT_VOLUME_GB ?? '30', 10),
-    gitTokenSecretArn: process.env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
+    // Optional: only the EC2-hosted orchestrator has a host SG to open. A
+    // containerised orchestrator reaches boxes' agents through its ingress or
+    // an internal LB whose reachability is managed in terraform, not here.
+    hostSecurityGroupId: env.HOST_SECURITY_GROUP_ID?.trim() || undefined,
+    // Optional: cross-account role chaining for an orchestrator whose ambient
+    // identity (e.g. an EKS pod identity) lives outside the box account.
+    assumeRoleArn: env.BOX_PROVISIONER_ROLE_ARN?.trim() || undefined,
+    instanceType: env.BOX_INSTANCE_TYPE ?? 't4g.medium',
+    managedTag: env.BOX_MANAGED_TAG ?? 'termag-box',
+    // Must be >= the AMI snapshot size (50GB — the baked devbox toolset). A
+    // smaller value is rejected by EC2 at RunInstances.
+    rootVolumeGb: parseInt(env.BOX_ROOT_VOLUME_GB ?? '50', 10),
+    gitTokenSecretArn: env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
   };
 }
 
 export function isBoxProvisioningConfigured(): boolean {
   return getBoxConfig() !== null;
+}
+
+/**
+ * SDK client config for the box account. With BOX_PROVISIONER_ROLE_ARN set,
+ * credentials come from sts:AssumeRole on that role (refreshed automatically by
+ * the provider); otherwise the default chain (instance role, pod identity, env)
+ * is used as-is. `region` may differ from cfg.region for boxes recorded in
+ * another region.
+ */
+export function awsClientConfig(cfg: Pick<BoxConfig, 'region' | 'assumeRoleArn'>, region: string = cfg.region): {
+  region: string;
+  credentials?: ReturnType<typeof fromTemporaryCredentials>;
+} {
+  if (!cfg.assumeRoleArn) return { region };
+  return {
+    region,
+    credentials: fromTemporaryCredentials({
+      params: {
+        RoleArn: cfg.assumeRoleArn,
+        RoleSessionName: 'termag-box-provisioner',
+        DurationSeconds: 3600,
+      },
+      clientConfig: { region },
+    }),
+  };
 }
 
 // ── Cloud-init (TS port of terraform/box/cloudinit.sh.tftpl) ─────────────────
@@ -246,8 +298,8 @@ export async function provisionBox(args: ProvisionArgs): Promise<void> {
   // matches the grant's `<prefix>-*` resource condition. Human-readable detail
   // lives in the Owner/BoxName tags.
   const name = `${cfg.resourcePrefix}-${args.instance.id}`;
-  const ec2 = new EC2Client({ region: cfg.region });
-  const iam = new IAMClient({ region: cfg.region });
+  const ec2 = new EC2Client(awsClientConfig(cfg));
+  const iam = new IAMClient(awsClientConfig(cfg));
 
   const tags: Tag[] = [
     { Key: 'Name', Value: name },
@@ -272,10 +324,14 @@ export async function provisionBox(args: ProvisionArgs): Promise<void> {
     const securityGroupId = sg.GroupId!;
 
     // 3. Let the box reach the orchestrator: :3040 ingress on the host SG from
-    //    the box SG (grant's Ec2BoxIngressToHost). Boxes talk to the backend
-    //    directly over the private VPC network, not through the (human-only,
-    //    Okta-gated) ALB.
-    await authorizeHostIngress(ec2, cfg.hostSecurityGroupId, securityGroupId, args.boxName);
+    //    the box SG (grant's Ec2BoxIngressToHost). Only the EC2-hosted
+    //    orchestrator has such an SG; off-host deployments expose the agent
+    //    endpoint through an ingress/LB whose reachability terraform owns.
+    if (cfg.hostSecurityGroupId) {
+      await authorizeHostIngress(ec2, cfg.hostSecurityGroupId, securityGroupId, args.boxName);
+    } else {
+      console.log(`[BOX] HOST_SECURITY_GROUP_ID unset; relying on the agent endpoint's own ingress rules for ${args.boxName}`);
+    }
 
     // 4. Per-box IAM identity (role WITH the permissions boundary — denied
     //    otherwise) → SSM core → optional git-token read → instance profile.
@@ -636,8 +692,8 @@ export async function terminateBox(instance: Instance): Promise<void> {
   if (!cfg) return;
 
   const region = instance.region ?? cfg.region;
-  const ec2 = new EC2Client({ region });
-  const iam = new IAMClient({ region });
+  const ec2 = new EC2Client(awsClientConfig(cfg, region));
+  const iam = new IAMClient(awsClientConfig(cfg, region));
   const name = instance.iamRoleName ?? `${cfg.resourcePrefix}-${instance.id}`;
 
   // 1. Terminate the EC2 instance and wait for it to go away — the SG can't be
@@ -651,20 +707,40 @@ export async function terminateBox(instance: Instance): Promise<void> {
     }
   }
 
-  // 2. Revoke the host ingress rule, then delete the box SG.
+  // 2. Revoke every :3040 ingress rule that still points at the box SG, then
+  //    delete the box SG. EC2 refuses to delete a SG another SG's rule
+  //    references (DependencyViolation), and that referencing SG is not
+  //    necessarily this deployment's HOST_SECURITY_GROUP_ID: a box provisioned
+  //    by the EC2-hosted orchestrator carries a rule on the old host SG, while
+  //    the container orchestrator runs with the env var intentionally unset.
+  //    So rather than trust the static config we ask EC2 which SGs reference
+  //    the box SG and revoke from each of them (plus the configured host SG,
+  //    if any — also the fallback when the lookup itself fails). Best effort:
+  //    a failed revoke is logged and the SG delete still gets its retries.
+  //    Requires the provisioner's IAM grant to allow RevokeSecurityGroupIngress
+  //    on those SGs — the terraform module exposes that separately.
   if (instance.securityGroupId) {
+    const boxSgId = instance.securityGroupId;
+    let referencing: string[] = [];
     try {
-      await ec2.send(new RevokeSecurityGroupIngressCommand({
-        GroupId: cfg.hostSecurityGroupId,
-        IpPermissions: [{
-          IpProtocol: 'tcp', FromPort: 3040, ToPort: 3040,
-          UserIdGroupPairs: [{ GroupId: instance.securityGroupId }],
-        }],
-      }));
+      referencing = await findSecurityGroupsReferencing(ec2, boxSgId);
     } catch (err) {
-      console.error(`[BOX] revoke host ingress for ${instance.securityGroupId} failed:`, errMsg(err));
+      console.error(`[BOX] describe SGs referencing ${boxSgId} failed; falling back to HOST_SECURITY_GROUP_ID:`, errMsg(err));
     }
-    await deleteSgWithRetry(ec2, instance.securityGroupId);
+    for (const groupId of revokeTargets(cfg.hostSecurityGroupId, referencing, boxSgId)) {
+      try {
+        await ec2.send(new RevokeSecurityGroupIngressCommand({
+          GroupId: groupId,
+          IpPermissions: [{
+            IpProtocol: 'tcp', FromPort: 3040, ToPort: 3040,
+            UserIdGroupPairs: [{ GroupId: boxSgId }],
+          }],
+        }));
+      } catch (err) {
+        console.error(`[BOX] revoke :3040 ingress from ${groupId} for ${boxSgId} failed:`, errMsg(err));
+      }
+    }
+    await deleteSgWithRetry(ec2, boxSgId);
   }
 
   // 3. Detach/delete the role + instance profile.
@@ -679,6 +755,35 @@ export async function terminateBox(instance: Instance): Promise<void> {
   }
 
   console.log(`[BOX] Terminated box resources for ${instance.name}`);
+}
+
+/**
+ * Security groups that still hold an ingress rule referencing `boxSgId`. The
+ * `ip-permission.group-id` filter matches any ingress UserIdGroupPair, which is
+ * exactly the shape authorizeHostIngress writes. The box SG itself is excluded
+ * (a self-referencing rule is not what blocks deletion).
+ */
+async function findSecurityGroupsReferencing(ec2: EC2Client, boxSgId: string): Promise<string[]> {
+  const res = await ec2.send(new DescribeSecurityGroupsCommand({
+    Filters: [{ Name: 'ip-permission.group-id', Values: [boxSgId] }],
+  }));
+  return (res.SecurityGroups ?? [])
+    .map((sg) => sg.GroupId)
+    .filter((id): id is string => !!id && id !== boxSgId);
+}
+
+/**
+ * The SGs terminateBox revokes the box's :3040 ingress rule from: the
+ * configured host SG (if any) plus every SG EC2 reports as still referencing
+ * the box SG, de-duplicated and never the box SG itself. Pure so the policy
+ * can be unit-tested without an EC2 client.
+ */
+export function revokeTargets(hostSecurityGroupId: string | undefined, referencing: string[], boxSgId: string): string[] {
+  const targets = new Set<string>();
+  if (hostSecurityGroupId) targets.add(hostSecurityGroupId);
+  for (const id of referencing) targets.add(id);
+  targets.delete(boxSgId);
+  return [...targets];
 }
 
 async function waitForTerminated(ec2: EC2Client, instanceId: string): Promise<void> {

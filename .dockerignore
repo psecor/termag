@@ -1,0 +1,20 @@
+# Only the orchestrator runtime inputs go into the build context.
+**/node_modules
+**/dist
+.git
+.github
+.claude
+.worktrees
+packer
+terraform
+relay
+docs
+deploy
+shepherd
+backend/.env
+backend/.env.*
+!backend/.env.example
+agent/agent.config.json
+agent/agent.config.*.json
+**/*.md
+!agent/initial-AGENTS.md

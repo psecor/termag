@@ -67,6 +67,13 @@ deploy/           Systemd units, setup docs, hook configs
 
 See [deploy/setup.md](deploy/setup.md) for full setup instructions, including reverse-proxy config and how to wire up Slack and Discord apps.
 
+To run the orchestrator as a **container** instead (Kubernetes, ECS, or plain
+Docker) build the root `Dockerfile` and follow
+[docs/container-deploy.md](docs/container-deploy.md) for the runtime contract —
+health endpoint, env, database, the in-app OIDC sign-in mode, and how boxes
+reach the control plane. The container runs no agents; every project must live
+on a box or a self-managed agent.
+
 ```bash
 # Build
 cd backend && npm install && npm run build
@@ -93,7 +100,7 @@ All configuration is via environment variables in `backend/.env`. See `.env.exam
 
 Key variables:
 - `DATABASE_URL` — PostgreSQL connection string
-- `AUTH_MODE` — sign-in mechanism: `google` (default) uses in-app Google OAuth; `okta` trusts the identity established at the ALB edge by an `authenticate-oidc` (Okta) action, read from the `x-amzn-oidc-data` header. Use `okta` only once the ALB actually performs that edge auth.
+- `AUTH_MODE` — sign-in mechanism: `google` (default) uses in-app Google OAuth; `okta` trusts the identity established at the ALB edge by an `authenticate-oidc` (Okta) action, read from the `x-amzn-oidc-data` header (use only once the ALB actually performs that edge auth); `oidc` runs the OpenID Connect code flow in-app against `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` — for deployments with no ALB edge auth, such as the container behind a Kubernetes ingress.
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth credentials (required when `AUTH_MODE=google`)
 - `SESSION_SECRET` — Express session secret
 - `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` — Slack bot

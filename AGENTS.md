@@ -162,10 +162,13 @@ Migration history (recent):
 
 | Var | Notes |
 |-----|-------|
-| `DATABASE_URL` | Postgres |
+| `DATABASE_URL` | Postgres. Composed from `PG_HOST`/`PG_PORT`/`PG_DATABASE`/`PG_USERNAME`/`PG_PASSWORD`/`PG_SSLMODE` at startup when unset (`config/env.ts`). |
 | `SESSION_SECRET` | random hex |
-| `AUTH_MODE` | `google` (default, in-app Google OAuth) or `okta` (identity from the ALB `authenticate-oidc` edge via `x-amzn-oidc-data`). |
+| `AUTH_MODE` | `google` (default, in-app Google OAuth), `okta` (identity from the ALB `authenticate-oidc` edge via `x-amzn-oidc-data`), or `oidc` (in-app OpenID Connect code flow, `auth/oidc.ts` — for the container behind a non-ALB ingress). |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth (required when `AUTH_MODE=google`) |
+| `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_SCOPE` | required when `AUTH_MODE=oidc`; redirect URI is `<FRONTEND_URL><BASE_PATH>/auth/oidc/callback` |
+| `LOCAL_SESSIONS_ENABLED` | default `true`. `false` (baked into the container image) makes the in-process tmux fallbacks for box-less projects throw `LocalSessionsDisabledError` instead of hitting a non-existent tmux. |
+| `BOX_PROVISIONER_ROLE_ARN` | optional; box-account role the provisioner assumes for every EC2/IAM call when the orchestrator's identity lives in another account (container). `HOST_SECURITY_GROUP_ID` is optional for the same reason. |
 | `ALLOWED_USERS` | comma-separated `email:unixuser` pairs. Supports domain wildcards (e.g. `*@example.com:default-unixuser`). |
 | `SLACK_BOT_TOKEN` (`xoxb-`), `SLACK_APP_TOKEN` (`xapp-`), `SLACK_SIGNING_SECRET` | Slack Socket Mode |
 | `CAPTURE_API_SECRET` | shared secret used by external pane-capture relays |
@@ -200,7 +203,14 @@ cd packer && packer init . && packer build box.pkr.hcl
 
 # provision a box manually (UI's "Add box" button does this end-to-end)
 cd terraform/box && terraform init && terraform apply
+
+# run the orchestrator as a container (control plane only; boxes stay EC2)
+docker build -t termag-orchestrator .
+docker run --rm --env-file backend/.env termag-orchestrator npm --prefix backend run db:push   # schema sync
+docker run --rm -p 3040:3040 --env-file backend/.env termag-orchestrator                       # serve
 ```
+
+**Container deployment** — `Dockerfile` + `docs/container-deploy.md` (runtime contract: `/public/status` health, env, DB, auth modes, agent-endpoint requirements, single-replica constraint, EC2→container cutover runbook). `shepherd/default.yaml` sketches the Shepherd service definition; it is not live — the doc lists the platform gaps. CI for the TypeScript + image is `.github/workflows/container-ci.yml`; `publish-image.yml` pushes to ECR.
 
 Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical first-time walkthrough (covers both Linux/systemd and macOS/launchd for the per-user agent); `deploy/claude-hooks.md` for the hook config; `docs/box-provisioning.md` for the orchestrator-driven box-provisioning design.
 
@@ -332,7 +342,9 @@ harness exists. The frontend has no test runner configured yet.
 
 27. **`DEV_LOGIN_ENABLED` is a local-development bypass** — when set, the OAuth gate is short-circuited to `DEV_LOGIN_EMAIL`. Never set it in production; the bypass deliberately doesn't check `ALLOWED_USERS` the same way the real path does. The dev-login parse path was tweaked when `parseAllowedUsers` changed shape, so if dev-login regresses, that pairing is the first thing to check.
 
-28. **`backend/.env.example` has drifted from the code on auth** — it documents an Okta/ALB-only deployment ("there is no in-app OAuth client"), but `authMode()` in `backend/src/routes/auth.ts` defaults to `google` and registers the passport Google strategy unless `AUTH_MODE=okta` is set explicitly. Treat `routes/auth.ts` as the source of truth for which sign-in paths exist; read `.env.example` for the variable list, not for the behavior.
+28. **`routes/auth.ts` is the source of truth for sign-in modes** — `authMode()` defaults to `google` and only switches to `okta` (ALB header) or `oidc` (in-app code flow) when `AUTH_MODE` says so explicitly. `.env.example` now describes all three, but read the code for behavior and the example for the variable list.
+
+29. **The container has no local tmux — `LOCAL_SESSIONS_ENABLED=false`** — the in-process fallbacks in `services/tmux.ts` (used by `routes/projects.ts` / `services/agentRuntime.ts` only for projects with `instanceId == null`) throw `LocalSessionsDisabledError` there. A "legacy" project can therefore not be created or launched on a containerised orchestrator; pin it to a box. Don't "fix" this by installing tmux in the image — the container also has no engineer home directories or unix users.
 
 ## Related
 

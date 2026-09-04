@@ -7,6 +7,38 @@ import { ALL_PROCESS_NAMES } from '../providers/registry';
 
 const execAsync = promisify(exec);
 
+// ── Local (in-process) sessions ──────────────────────────────
+//
+// Historically the orchestrator host also ran tmux for "legacy" projects with
+// no box (Project.instanceId == null). A containerised orchestrator has no
+// tmux, no engineer home directories and a read-only filesystem, so those code
+// paths must fail fast with an actionable message instead of a confusing
+// ENOENT/EACCES. Set LOCAL_SESSIONS_ENABLED=false on such deployments; every
+// project there must be pinned to a box (or a self-managed agent).
+//
+// Read-only probes (hasSession, capturePaneText, listSessions, ...) degrade to
+// "nothing here" so status/poller code keeps working; anything that would
+// create or drive a local session throws LocalSessionsDisabledError.
+
+export class LocalSessionsDisabledError extends Error {
+  constructor(operation: string) {
+    super(
+      `${operation}: this orchestrator has no local tmux sessions (LOCAL_SESSIONS_ENABLED=false). ` +
+      'Pin the project to a box or run a self-managed agent instead.',
+    );
+    this.name = 'LocalSessionsDisabledError';
+  }
+}
+
+export function localSessionsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.LOCAL_SESSIONS_ENABLED ?? 'true').trim().toLowerCase();
+  return !['false', '0', 'no', 'off'].includes(raw);
+}
+
+function assertLocalSessions(operation: string): void {
+  if (!localSessionsEnabled()) throw new LocalSessionsDisabledError(operation);
+}
+
 // Working directory for a project's workstream.
 //   main:  /home/<username>/termag/projects/<project>/
 //   other: /home/<username>/termag/projects/<project>/.worktrees/<workstream>/
@@ -25,6 +57,7 @@ export function projectDir(
 }
 
 export async function ensureProjectDir(username: string, projectName: string): Promise<string> {
+  assertLocalSessions('ensureProjectDir');
   const dir = projectDir(username, projectName);
   await mkdir(dir, { recursive: true });
   // Initialize git repo if not already one
@@ -90,6 +123,7 @@ export function sessionName(
 }
 
 export async function hasSession(name: string): Promise<boolean> {
+  if (!localSessionsEnabled()) return false;
   try {
     await execAsync(`tmux has-session -t ${shellEscape(name)}`);
     return true;
@@ -99,6 +133,7 @@ export async function hasSession(name: string): Promise<boolean> {
 }
 
 export async function createSession(name: string, cwd: string = process.env.HOME ?? '/home'): Promise<void> {
+  assertLocalSessions('createSession');
   await execAsync(
     `tmux new-session -d -s ${shellEscape(name)} -c ${shellEscape(cwd)} -x 120 -y 30`
   );
@@ -124,6 +159,7 @@ export async function recreateSession(name: string, cwd: string): Promise<void> 
 }
 
 export async function sendKeys(name: string, command: string, withEnter: boolean = true): Promise<void> {
+  assertLocalSessions('sendKeys');
   const target = shellEscape(name);
   const escaped = shellEscape(command.replace(/'/g, "'\\''"));
   await execAsync(`tmux send-keys -t ${target} -l ${escaped}`);
@@ -133,6 +169,7 @@ export async function sendKeys(name: string, command: string, withEnter: boolean
 }
 
 export async function capturePaneText(name: string): Promise<string> {
+  if (!localSessionsEnabled()) return '(unable to capture pane)';
   try {
     const { stdout } = await execAsync(`tmux capture-pane -t ${shellEscape(name)} -p`);
     return stdout
@@ -146,6 +183,7 @@ export async function capturePaneText(name: string): Promise<string> {
 }
 
 export async function foregroundCommand(name: string): Promise<string | null> {
+  if (!localSessionsEnabled()) return null;
   try {
     const { stdout } = await execAsync(
       `tmux list-panes -t ${shellEscape(name)} -F '#{pane_current_command}'`
@@ -165,6 +203,7 @@ export async function isAgentRunning(name: string): Promise<boolean> {
 }
 
 export async function listSessions(): Promise<string[]> {
+  if (!localSessionsEnabled()) return [];
   try {
     const { stdout } = await execAsync('tmux ls -F "#{session_name}"');
     return stdout.trim().split('\n').filter(Boolean);
@@ -174,10 +213,12 @@ export async function listSessions(): Promise<string[]> {
 }
 
 export async function renameSession(oldName: string, newName: string): Promise<void> {
+  assertLocalSessions('renameSession');
   await execAsync(`tmux rename-session -t ${shellEscape(oldName)} ${shellEscape(newName)}`);
 }
 
 export async function killSession(name: string): Promise<void> {
+  if (!localSessionsEnabled()) return; // nothing local to kill
   try {
     await execAsync(`tmux kill-session -t ${shellEscape(name)}`);
   } catch {
@@ -212,6 +253,7 @@ export function cleanPaneText(stdout: string): string {
 }
 
 export async function capturePaneForSlack(sessionName: string): Promise<string> {
+  if (!localSessionsEnabled()) return '(unable to capture pane)';
   try {
     const { stdout } = await execAsync(`tmux capture-pane -t ${shellEscape(sessionName)} -p`);
     return cleanPaneText(stdout);

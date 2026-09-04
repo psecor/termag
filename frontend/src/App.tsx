@@ -22,6 +22,7 @@ function Login() {
     authApi.config().then(c => setMode(c.mode)).catch(() => {});
   }, []);
   const label = mode === 'okta' ? 'Sign in with Okta'
+    : mode === 'oidc' ? 'Sign in with SSO'
     : mode === 'google' ? 'Sign in with Google'
     : 'Sign in';
 
