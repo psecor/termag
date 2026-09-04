@@ -25,6 +25,7 @@ import { Router, RequestHandler } from 'express';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
+import { asyncHandler } from '../middleware/errors';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
 
 const prisma = new PrismaClient();
@@ -249,10 +250,14 @@ export function instancesRouter(): Router {
     });
   };
 
-  router.get('/', requireAuth, list);
-  router.get('/:id', requireAuth, getOne);
-  router.post('/', requireAuth, create);
-  router.delete('/:id', requireAuth, terminate);
+  // asyncHandler: Express 4 drops async rejections on the floor, so a DB error
+  // in any of these would otherwise hang the request until the proxy's timeout
+  // (that was the 504 on POST before #59 added create's own try/catch). With
+  // the wrapper they reach apiErrorHandler and answer with JSON.
+  router.get('/', requireAuth, asyncHandler(list));
+  router.get('/:id', requireAuth, asyncHandler(getOne));
+  router.post('/', requireAuth, asyncHandler(create));
+  router.delete('/:id', requireAuth, asyncHandler(terminate));
 
   return router;
 }

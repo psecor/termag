@@ -21,6 +21,7 @@ import { visitsRouter } from './routes/visits';
 import { warpRouter } from './routes/warp';
 import { contextRouter } from './routes/context';
 import { instancesRouter } from './routes/instances';
+import { apiErrorHandler } from './middleware/errors';
 import { workstreamsRouter } from './routes/workstreams';
 import { startProvisioningSweep } from './services/boxProvisioner';
 // import { attachTerminal } from './services/terminal'; // removed — all terminals route through agent
@@ -149,6 +150,12 @@ app.use(`${BASE_PATH}/`, express.static(frontendDist));
 app.get(`${BASE_PATH}/*`, (_req, res) => {
   res.sendFile(join(frontendDist, 'index.html'));
 });
+
+// Final error middleware: anything forwarded via next(err) — asyncHandler-wrapped
+// routes, body-parser rejecting malformed JSON — becomes a JSON { error }
+// response instead of Express's HTML page or, for async rejections, a request
+// that never completes. Must stay after every route/static mount above.
+app.use(apiErrorHandler);
 
 // --- WebSocket server for terminal streams and status push ---
 const wss = new WebSocketServer({ noServer: true });
