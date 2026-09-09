@@ -267,6 +267,14 @@ export function sendTerminalInput(userId: string, streamId: string, data: string
   agent.ws.send(JSON.stringify({ type: 'terminal-input', streamId, data }));
 }
 
+export function sendTerminalPasteImage(userId: string, streamId: string, data: string): void {
+  const stream = terminalStreams.get(streamId);
+  if (!stream) return;
+  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(userId);
+  if (!agent) return;
+  agent.ws.send(JSON.stringify({ type: 'terminal-paste-image', streamId, data }));
+}
+
 export function sendTerminalResize(userId: string, streamId: string, cols: number, rows: number): void {
   const stream = terminalStreams.get(streamId);
   if (!stream) return;

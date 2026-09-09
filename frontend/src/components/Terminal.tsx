@@ -84,6 +84,46 @@ function legacyCopy(text: string): void {
   } catch { /* clipboard blocked — nothing more we can do */ }
 }
 
+// Largest image we'll ship to the box, matching the cap the per-user agent
+// enforces before it writes the clipboard mailbox.
+const MAX_PASTE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+// The box only ever reads PNG out of the clipboard mailbox, so anything else
+// (JPEG from a screenshot tool, WebP from a browser copy) is re-encoded here.
+async function blobToPngBase64(blob: Blob): Promise<string> {
+  if (blob.type === 'image/png') {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('no 2d canvas context');
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, '');
+}
+
+function imageFromClipboardData(dt: DataTransfer | null): File | null {
+  if (!dt) return null;
+  for (const file of Array.from(dt.files)) {
+    if (file.type.startsWith('image/')) return file;
+  }
+  for (const item of Array.from(dt.items)) {
+    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file) return file;
+  }
+  return null;
+}
+
 export function Terminal({ sessionName, projectId, workstream, active, autoFocus, onActivity }: TerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -275,6 +315,74 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         if (onActivity) onActivity();
       });
 
+      const sendPasteImage = async (blob: Blob) => {
+        if (blob.size > MAX_PASTE_IMAGE_BYTES) {
+          term.write('\r\n[image too large to paste]\r\n');
+          return;
+        }
+        try {
+          const data = await blobToPngBase64(blob);
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'paste-image', data }));
+          }
+        } catch {
+          term.write('\r\n[could not read pasted image]\r\n');
+          return;
+        }
+        if (onActivity) onActivity();
+      };
+
+      // Capture phase: xterm's own listener on the helper textarea reads
+      // text/plain and drops images, so an image paste has to be claimed
+      // before that listener sees the event.
+      const onPaste = (ev: ClipboardEvent) => {
+        const file = imageFromClipboardData(ev.clipboardData);
+        if (!file) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        void sendPasteImage(file);
+      };
+      container.addEventListener('paste', onPaste, true);
+
+      const sendPasteByte = () => {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', data: '\x16' }));
+        }
+      };
+
+      const pasteFromSystemClipboard = async () => {
+        try {
+          if (!navigator.clipboard?.read) { sendPasteByte(); return; }
+          const items = await navigator.clipboard.read();
+          for (const item of items) {
+            const type = item.types.find(t => t.startsWith('image/'));
+            if (type) {
+              await sendPasteImage(await item.getType(type));
+              return;
+            }
+          }
+          sendPasteByte();
+        } catch {
+          // No permission, no image item, or an insecure context: behave like
+          // xterm would have and let the raw byte through.
+          sendPasteByte();
+        }
+      };
+
+      // Plain Ctrl+V fires no paste event; xterm just sends \x16, which would
+      // reach Claude Code before the image reached the box. Claim the key so
+      // the byte is sent by the agent after the image lands, or here when the
+      // clipboard holds no image.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== 'keydown' || ev.key.toLowerCase() !== 'v') return true;
+        if (!ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return true;
+        ev.preventDefault();
+        void pasteFromSystemClipboard();
+        return false;
+      });
+
       let resizeTimer: ReturnType<typeof setTimeout> | null = null;
       const observer = new ResizeObserver(() => {
         if (disposed) return;
@@ -306,7 +414,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         vv.addEventListener('resize', vvHandler);
       }
 
-      (term as any)._termag = { dataDisposable, observer, resizeTimer, vvHandler };
+      (term as any)._termag = { dataDisposable, observer, resizeTimer, vvHandler, onPaste };
     });
 
     return () => {
@@ -319,6 +427,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         extras.dataDisposable.dispose();
         extras.observer.disconnect();
         if (extras.resizeTimer) clearTimeout(extras.resizeTimer);
+        if (extras.onPaste) container.removeEventListener('paste', extras.onPaste, true);
         if (extras.vvHandler && window.visualViewport) {
           window.visualViewport.removeEventListener('resize', extras.vvHandler);
         }

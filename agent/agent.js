@@ -587,6 +587,29 @@ function stopRateLimitScanner() {
   if (rateLimitScanTimer) { clearInterval(rateLimitScanTimer); rateLimitScanTimer = null; }
 }
 
+// ── Browser clipboard mailbox ─────────────────────────────────────────────
+// One-shot drop point for an image pasted in the browser. Written here, read
+// (and deleted) by agent/xclip-shim.sh on Claude Code's behalf.
+const CLIPBOARD_DIR = path.join(process.env.HOME || '/home', '.cache', 'termag');
+const CLIPBOARD_SLOT = path.join(CLIPBOARD_DIR, 'clipboard.png');
+const CLIPBOARD_MAX_BYTES = 20 * 1024 * 1024;
+
+function ensureClipboardShim() {
+  const shim = fs.readFileSync(path.join(__dirname, 'xclip-shim.sh'), 'utf8');
+  const binDir = path.join(process.env.HOME || '/home', '.local', 'bin');
+  const dest = path.join(binDir, 'xclip');
+  let installed = null;
+  try {
+    installed = fs.readFileSync(dest, 'utf8');
+  } catch { /* not installed yet */ }
+  if (installed === shim) return;
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(dest, shim, { mode: 0o755 });
+  // writeFileSync's mode only applies when it creates the file.
+  fs.chmodSync(dest, 0o755);
+  console.log(`[CLIPBOARD] installed xclip shim at ${dest}`);
+}
+
 // Active PTY streams: streamId → { pty, tmuxSessionName }
 const streams = new Map();
 const codexBridges = new Map();
@@ -971,6 +994,25 @@ function connect() {
           break;
         }
 
+        case 'terminal-paste-image': {
+          const stream = streams.get(msg.streamId);
+          if (!stream) break;
+          const image = Buffer.from(msg.data || '', 'base64');
+          if (image.length === 0) break;
+          if (image.length > CLIPBOARD_MAX_BYTES) {
+            console.error(`[CLIPBOARD] dropping ${image.length}-byte paste (limit ${CLIPBOARD_MAX_BYTES})`);
+            break;
+          }
+          await mkdir(CLIPBOARD_DIR, { recursive: true });
+          const tmpSlot = `${CLIPBOARD_SLOT}.tmp-${process.pid}`;
+          await writeFile(tmpSlot, image);
+          await fs.promises.rename(tmpSlot, CLIPBOARD_SLOT);
+          // Ctrl+V makes Claude Code read the mailbox immediately, so the
+          // keystroke only goes out once the file is fully in place.
+          stream.pty.write('\x16');
+          break;
+        }
+
         case 'terminal-resize': {
           const stream = streams.get(msg.streamId);
           if (stream && msg.cols && msg.rows) {
@@ -1051,6 +1093,13 @@ function respond(ws, requestId, data, error) {
 }
 
 console.log(`[AGENT] termag user-agent starting as ${process.env.USER || 'unknown'}`);
+if (process.platform === 'linux') {
+  try {
+    ensureClipboardShim();
+  } catch (err) {
+    console.error(`[CLIPBOARD] could not install xclip shim: ${err.message}`);
+  }
+}
 connect();
 
 // Graceful shutdown

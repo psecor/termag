@@ -70,6 +70,8 @@ termag/
 │   │                                heartbeat-driven dead-connection detection
 │   ├── codex-status-bridge.js      Codex app-server status normalization
 │   ├── codex-status-normalizer.js
+│   ├── xclip-shim.sh               fake xclip installed at ~/.local/bin/xclip so Claude Code's
+│   │                                Ctrl+V image paste finds the browser's image (+ .test.sh)
 │   ├── agent.config.example.json   sample per-user agent config
 │   └── initial-AGENTS.md           template seeded into new projects on creation
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
@@ -346,6 +348,8 @@ harness exists. The frontend has no test runner configured yet.
 28. **`routes/auth.ts` is the source of truth for sign-in modes** — `authMode()` defaults to `google` and only switches to `okta` (ALB header) or `oidc` (in-app code flow) when `AUTH_MODE` says so explicitly. `.env.example` now describes all three, but read the code for behavior and the example for the variable list.
 
 29. **The container has no local tmux — `LOCAL_SESSIONS_ENABLED=false`** — the in-process fallbacks in `services/tmux.ts` (used by `routes/projects.ts` / `services/agentRuntime.ts` only for projects with `instanceId == null`) throw `LocalSessionsDisabledError` there. A "legacy" project can therefore not be created or launched on a containerised orchestrator; pin it to a box. Don't "fix" this by installing tmux in the image — the container also has no engineer home directories or unix users.
+
+30. **`~/.local/bin/xclip` is a termag shim, not X11 xclip** — the per-user agent installs `agent/xclip-shim.sh` there on Linux (idempotent, content-compared, on every startup) so Claude Code's Ctrl+V image paste has something to read on a box with no display. A browser paste sends the PNG over the terminal WebSocket, the agent writes `~/.cache/termag/clipboard.png` and only then types `\x16`. The shim answers exactly two invocations — `-t TARGETS -o` (prints `image/png`) and `-t image/png -o` (streams the file, then deletes it) — ignores a mailbox older than 60s, and fails like an empty clipboard for text and every other target. It shadows a real xclip if one is later apt-installed, since `~/.local/bin` usually precedes `/usr/bin` on `PATH`; rename or remove it if a box ever needs the real thing. `agent/xclip-shim.test.sh` covers the probe/read/staleness contract.
 
 ## Related
 

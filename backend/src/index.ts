@@ -34,7 +34,7 @@ import { validateAgentToken } from './routes/agentTokens';
 import {
   registerAgent, isAgentConnected, isInstanceAgentConnected,
   requestTerminalStream, requestInstanceTerminalStream,
-  sendTerminalInput, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
+  sendTerminalInput, sendTerminalPasteImage, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
 } from './services/agentRegistry';
 import { prisma as prismaIndex, getPool } from './db';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
@@ -209,6 +209,10 @@ const statusClients = new Map<WebSocket, { unixUsername: string; sharedOwnerUser
 // change needed. Mirrors the agent's own ping loop in agent/agent.js.
 const WS_HEARTBEAT_MS = 25_000;
 
+// Base64 of the 20 MiB image the per-user agent is willing to write to its
+// clipboard mailbox. Anything larger is dropped before it reaches the agent.
+const MAX_PASTE_IMAGE_B64_CHARS = 28 * 1024 * 1024;
+
 function startHeartbeat(ws: WebSocket): void {
   let alive = true;
   ws.on('pong', () => { alive = true; });
@@ -355,6 +359,10 @@ wss.on('connection', (ws, req) => {
             const msg = JSON.parse(raw.toString());
             if (msg.type === 'input' && msg.data !== undefined) {
               sendTerminalInput(ownerUser.id, streamId, msg.data);
+            } else if (msg.type === 'paste-image' && typeof msg.data === 'string') {
+              if (msg.data.length <= MAX_PASTE_IMAGE_B64_CHARS) {
+                sendTerminalPasteImage(ownerUser.id, streamId, msg.data);
+              }
             } else if (msg.type === 'resize' && msg.cols && msg.rows) {
               sendTerminalResize(ownerUser.id, streamId, msg.cols, msg.rows);
             } else if (msg.type === 'mouse' && msg.enabled !== undefined) {
