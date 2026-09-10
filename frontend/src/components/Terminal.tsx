@@ -84,9 +84,10 @@ function legacyCopy(text: string): void {
   } catch { /* clipboard blocked — nothing more we can do */ }
 }
 
-// Largest image we'll ship to the box, matching the cap the per-user agent
-// enforces before it writes the clipboard mailbox.
-const MAX_PASTE_IMAGE_BYTES = 20 * 1024 * 1024;
+// Same cap the backend applies to the base64 payload (20 MiB of PNG). Checked
+// after the PNG re-encode, since a JPEG or WebP can grow well past its source
+// size on the way through the canvas.
+const MAX_PASTE_IMAGE_B64_CHARS = 28 * 1024 * 1024;
 
 // The box only ever reads PNG out of the clipboard mailbox, so anything else
 // (JPEG from a screenshot tool, WebP from a browser copy) is re-encoded here.
@@ -316,12 +317,12 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       });
 
       const sendPasteImage = async (blob: Blob) => {
-        if (blob.size > MAX_PASTE_IMAGE_BYTES) {
-          term.write('\r\n[image too large to paste]\r\n');
-          return;
-        }
         try {
           const data = await blobToPngBase64(blob);
+          if (data.length > MAX_PASTE_IMAGE_B64_CHARS) {
+            term.write('\r\n[image too large to paste]\r\n');
+            return;
+          }
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'paste-image', data }));
@@ -379,7 +380,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         if (ev.type !== 'keydown' || ev.key.toLowerCase() !== 'v') return true;
         if (!ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return true;
         ev.preventDefault();
-        void pasteFromSystemClipboard();
+        if (!ev.repeat) void pasteFromSystemClipboard();
         return false;
       });
 
