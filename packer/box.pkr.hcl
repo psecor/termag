@@ -157,6 +157,11 @@ build {
     destination = "/tmp/claude-settings.json"
   }
 
+  provisioner "file" {
+    source      = "${path.root}/../deploy/termag-status"
+    destination = "/tmp/termag-status"
+  }
+
   provisioner "shell" {
     script = "${path.root}/scripts/setup.sh"
     environment_vars = [

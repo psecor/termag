@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SESSION=$(tmux display-message -p '#S' 2>/dev/null); [ -n \"$SESSION\" ] && curl -sf -X POST http://localhost:3040/termag/api/status -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$SESSION\\\",\\\"status\\\":\\\"working\\\"}\" >/dev/null 2>&1 &"
+            "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SESSION=$(tmux display-message -p '#S' 2>/dev/null); [ -n \"$SESSION\" ] && curl -sf -X POST http://localhost:3040/termag/api/status -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$SESSION\\\",\\\"status\\\":\\\"working\\\"}\" >/dev/null 2>&1 &"
+            "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SESSION=$(tmux display-message -p '#S' 2>/dev/null); [ -n \"$SESSION\" ] && curl -sf -X POST http://localhost:3040/termag/api/status -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$SESSION\\\",\\\"status\\\":\\\"working\\\"}\" >/dev/null 2>&1 &"
+            "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); SESSION=$(tmux display-message -p '#S' 2>/dev/null); export SESSION; PAYLOAD=$(printf '%s' \"$INPUT\" | python3 -c \"import sys,json,os; d=json.load(sys.stdin); ntype=d.get('notification_type','unknown'); msg=d.get('message','')[:200]; status='idle' if ntype=='idle_prompt' else 'waiting'; print(json.dumps({'session':os.environ.get('SESSION',''),'status':status,'notify':True,'message':msg}))\" 2>/dev/null); [ -n \"$SESSION\" ] && [ -n \"$PAYLOAD\" ] && curl -sf -X POST http://localhost:3040/termag/api/status -H 'Content-Type: application/json' -d \"$PAYLOAD\" >/dev/null 2>&1 &"
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" notification >/dev/null 2>&1 &"
           }
         ]
       }
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "SESSION=$(tmux display-message -p '#S' 2>/dev/null); [ -n \"$SESSION\" ] && curl -sf -X POST http://localhost:3040/termag/api/status -H 'Content-Type: application/json' -d \"{\\\"session\\\":\\\"$SESSION\\\",\\\"status\\\":\\\"idle\\\"}\" >/dev/null 2>&1 &"
+            "command": "\"$HOME/.local/bin/termag-status\" idle >/dev/null 2>&1 &"
           }
         ]
       }

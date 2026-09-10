@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# termag-status — report Claude Code agent status to the termag server.
+#
+# Called from the hooks in ~/.claude/settings.json (see deploy/claude-settings.json).
+#
+# Why this exists: the hooks used to POST to a hardcoded
+# http://localhost:3040/termag/api/status. That is only correct when the termag
+# server is co-located with the agent. On a provisioned box the server lives
+# elsewhere, so every POST failed — silently, because the hooks background their
+# curl and discard output. Status lights stayed grey and needs-input Slack
+# notifications never fired, with nothing in any log to say why.
+#
+# This resolves the endpoint from the per-user agent's own termag_url, mirroring
+# getStatusEndpoint() in agent/agent.js, so co-located and remote boxes both work
+# with no per-box configuration.
+#
+# Usage:
+#   termag-status working|idle|not_running
+#   termag-status notification        # Claude Code hook JSON on stdin
+#   termag-status --print-endpoint    # resolve and print, POST nothing
+#
+# Env:
+#   TERMAG_AGENT_CONFIG    override the config path
+#   TERMAG_STATUS_DEBUG=1  dump the last notification payload to
+#                          ~/.cache/termag-status/last-notification.json
+
+set -u
+PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+
+MODE=${1:-}
+[ -n "$MODE" ] || exit 0
+
+# --- resolve the endpoint ---------------------------------------------------
+# Config search order follows agent/agent.js, plus the path the systemd unit
+# passes explicitly.
+find_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" \
+           "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" \
+           "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+resolve_endpoint() {
+  # agent.js's own fallback, for a co-located server with no readable config.
+  local endpoint='http://127.0.0.1:3040/termag/api/status' config url
+  config=$(find_config) || config=
+  if [ -n "$config" ]; then
+    url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
+    if [ -n "$url" ]; then
+      url=${url%%\?*}                                   # strip query (token etc.)
+      case $url in
+        ws://*)  url="http://${url#ws://}"   ;;
+        wss://*) url="https://${url#wss://}" ;;
+      esac
+      case $url in
+        */ws/agent) endpoint="${url%/ws/agent}/api/status" ;;
+        *)          endpoint="$url"                        ;;
+      esac
+    fi
+  fi
+  printf '%s' "$endpoint"
+}
+
+if [ "$MODE" = "--print-endpoint" ]; then
+  resolve_endpoint; echo
+  exit 0
+fi
+
+# The server keys status on the tmux session name; no session means no context.
+SESSION=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
+[ -n "$SESSION" ] || exit 0
+
+ENDPOINT=$(resolve_endpoint)
+
+# --- build the payload ------------------------------------------------------
+case $MODE in
+  working|idle|not_running)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --arg st "$MODE" '{session:$s,status:$st}')
+    ;;
+  notification)
+    # Read stdin in the foreground: the caller backgrounds the POST, not this
+    # read, or Claude Code can close the pipe before we get the payload.
+    INPUT=$(cat)
+    if [ -n "${TERMAG_STATUS_DEBUG:-}" ]; then
+      mkdir -p "$HOME/.cache/termag-status"
+      printf '%s\n' "$INPUT" > "$HOME/.cache/termag-status/last-notification.json"
+    fi
+    # idle_prompt means the agent finished; anything else means it needs input.
+    PAYLOAD=$(printf '%s' "$INPUT" | jq -c --arg s "$SESSION" '
+      { session: $s,
+        status:  (if (.notification_type // "") == "idle_prompt" then "idle" else "waiting" end),
+        notify:  true,
+        message: ((.message // "") | .[0:200]) }' 2>/dev/null) || PAYLOAD=
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+[ -n "$PAYLOAD" ] || exit 0
+
+# -m 5 so an unreachable server can't leave hook processes hanging around.
+curl -sf -m 5 -X POST "$ENDPOINT" \
+  -H 'Content-Type: application/json' \
+  -d "$PAYLOAD" >/dev/null 2>&1
+
+exit 0

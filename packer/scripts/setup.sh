@@ -158,9 +158,13 @@ sudo chown -R termag:termag /home/termag/.config
 # from deploy/claude-settings.json (file-provisioned to /tmp) so this is no
 # longer the manual step it used to be in setup.md.
 # ─────────────────────────────────────────────────────────────────────────────
-sudo mkdir -p /home/termag/.claude
+sudo mkdir -p /home/termag/.claude /home/termag/.local/bin
 sudo cp /tmp/claude-settings.json /home/termag/.claude/settings.json
-sudo chown -R termag:termag /home/termag/.claude
+# The hooks call termag-status, which resolves the server endpoint from the
+# agent's own termag_url. Hardcoding localhost here breaks every box whose
+# server is not co-located, and does so silently.
+sudo install -m 755 /tmp/termag-status /home/termag/.local/bin/termag-status
+sudo chown -R termag:termag /home/termag/.claude /home/termag/.local
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verify SSM agent is present and enabled (Canonical's AMI ships it via snap)
