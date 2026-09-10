@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 interface HyperspaceProps {
   activeCount: number;
@@ -7,7 +7,35 @@ interface HyperspaceProps {
   onWarpChange?: (warp: number) => void;
 }
 
+const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+
+/**
+ * Tracks the OS/browser reduced-motion preference, and follows changes to it.
+ *
+ * A full-screen starfield that accelerates with activity is exactly the kind of
+ * motion this setting exists to suppress, and users with vestibular sensitivity
+ * have no other way to turn it off today.
+ */
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(REDUCED_MOTION_QUERY).matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia(REDUCED_MOTION_QUERY);
+    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  return reduced;
+}
+
 export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange }: HyperspaceProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const activeCountRef = useRef(activeCount);
   activeCountRef.current = activeCount;
@@ -126,7 +154,9 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange 
         }
       }
 
-      animId = requestAnimationFrame(draw);
+      // Reduced motion: render one static frame and stop. Skipping the loop
+      // also stops the per-frame warp sampling that posts to the backend.
+      if (!prefersReducedMotion) animId = requestAnimationFrame(draw);
     }
 
     draw();
@@ -135,7 +165,7 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange 
       cancelAnimationFrame(animId);
       resizeObs.disconnect();
     };
-  }, []);
+  }, [prefersReducedMotion]);
 
   return (
     <canvas
