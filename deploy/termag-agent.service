@@ -10,5 +10,23 @@ ExecStart=/usr/bin/node %h/src/termag/agent/agent.js %h/src/termag/agent/agent.c
 Restart=always
 RestartSec=5
 
+# Do not take the user's tmux server down with the agent.
+#
+# agent.js starts tmux sessions with `tmux new-session`. tmux daemonises, so it
+# reparents to the systemd user manager and `ps` makes it look independent -- but
+# it stays in this unit's *cgroup*, and the default KillMode=control-group
+# SIGKILLs the entire cgroup on stop. So `systemctl --user restart termag-agent`
+# destroys the tmux server and every pane with it: any build, test run or
+# interactive login in any project dies, and scrollback is lost. The agent then
+# recreates empty sessions on reconnect, so the panes come back looking healthy,
+# which makes the data loss easy to miss.
+#
+# KillMode=process signals only the main process and leaves the rest of the
+# cgroup alone, so the tmux server survives a restart and the agent reattaches to
+# the existing sessions (see AGENTS.md on reconnect reconstructing session state).
+# Trade-off: leftover `tmux attach-session` clients are no longer force-killed.
+# They exit when their PTY closes, so they are transient rather than leaked.
+KillMode=process
+
 [Install]
 WantedBy=default.target
