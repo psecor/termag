@@ -45,7 +45,7 @@ describe('getBoxConfig', () => {
     const cfg = getBoxConfig(REQUIRED)!;
     expect(cfg.instanceType).toBe('t4g.medium');
     expect(cfg.managedTag).toBe('termag-box');
-    expect(cfg.rootVolumeGb).toBe(50);
+    expect(cfg.rootVolumeGb).toBe(120);
   });
 });
 
