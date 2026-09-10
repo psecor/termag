@@ -122,7 +122,7 @@ export function getBoxConfig(env: NodeJS.ProcessEnv = process.env): BoxConfig | 
     managedTag: env.BOX_MANAGED_TAG ?? 'termag-box',
     // Must be >= the AMI snapshot size (50GB — the baked devbox toolset). A
     // smaller value is rejected by EC2 at RunInstances.
-    rootVolumeGb: parseInt(env.BOX_ROOT_VOLUME_GB ?? '50', 10),
+    rootVolumeGb: parseInt(env.BOX_ROOT_VOLUME_GB ?? '120', 10),
     gitTokenSecretArn: env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
   };
 }

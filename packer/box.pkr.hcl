@@ -101,10 +101,14 @@ source "amazon-ebs" "termag_box" {
   vpc_id    = var.vpc_id
   subnet_id = var.subnet_id
 
-  // Larger root volume so npm/agent installs don't run out of space.
+  // Root volume must hold the full devbox toolset baked under /home/termag:
+  // Go + Python + Rust toolchains, Docker, Chromium, node, and several CLIs.
+  // 120GB because the baked toolset plus a real workload does not fit in 50:
+  // a full dev stack on a box (docker images ~13GB, a bazel cache ~13GB, a
+  // large monorepo checkout ~5GB) exhausts a 50GB volume outright.
   launch_block_device_mappings {
     device_name           = "/dev/sda1"
-    volume_size           = 20
+    volume_size           = 120
     volume_type           = "gp3"
     delete_on_termination = true
   }
