@@ -15,14 +15,36 @@ The histories forked at `86cb06e chore: scrub LD-specific and personal-host refe
 
 ## What the public mirror must not contain
 
-The `.gitleaks.toml` deny-list is the canonical reference. As of this writing:
+**The two lineages ship different `.gitleaks.toml` files, and that is deliberate.**
+Whichever branch you have checked out determines which rules the pre-commit hook
+enforces, so check there rather than trusting this list:
 
-- `(?i)launchdarkly` — name / domain / GitHub org references (catches `launchdarkly.com`, `launchdarkly-labs`, `github.com/launchdarkly/`, bare "LaunchDarkly" mentions)
-- `(?i)secorp\.net` — personal host name used for orchestrator deploy
-- `(?i)(vkorolik|vadman97)` — internal collaborator handle fragments
-- `(?i)o11y-(devbox|termag)` — internal terraform module names
+| Rule | `origin/main` (public mirror) | `labs/main` (canonical) |
+|---|---|---|
+| `(?i)launchdarkly` — name / domain / org refs (catches `launchdarkly.com`, `launchdarkly-labs`, `github.com/launchdarkly/`, bare mentions) | ✅ `termag-ld-name` | ❌ absent |
+| `(?i)o11y-(devbox\|termag)` — internal terraform module names | ✅ `termag-internal-modules` | ❌ absent |
+| `(?i)launchdarkly\.com` — domain only | via the rule above | ✅ `termag-ld-domain` |
+| `(?i)secorp\.net` — personal host used for orchestrator deploy | ✅ | ✅ |
+| `(?i)(vkorolik|vadman97)` — collaborator handle fragments | ✅ | ✅ |
+
+The public mirror needs the aggressive list; canonical is private and legitimately
+contains LD names, so it only guards the genuinely sensitive strings. The
+consequence worth internalising: **`pre-commit install` on `labs/main` is not a
+backstop against pushing to the mirror.** A bare `launchdarkly-labs` mention
+commits cleanly there. If you work on a box where `origin` still points at the
+public mirror, disable the push URL — that is the only real protection:
+
+```bash
+git remote set-url --push origin DISABLED
+```
 
 `LICENSE` and `.gitleaks.toml` itself are allowlisted (the LICENSE has a legitimate copyright line; the gitleaks rules name the strings they're looking for).
+
+**If you write a doc that describes these patterns, quoting them trips them.**
+This file is allowlisted for exactly that reason. Anything new either needs its
+own `[allowlist] paths` entry — which hands that file a permanent free pass, so
+prefer not to — or should paraphrase: "the company domain", "two collaborator
+handles".
 
 The pre-commit hook (`.pre-commit-config.yaml`) wires `gitleaks` so any commit attempting to add these strings is blocked before it lands. The hook scans staged file content, not commit messages — see "Author rewrite" for the message-side trade-off.
 
