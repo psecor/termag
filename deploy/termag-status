@@ -18,6 +18,7 @@
 #   termag-status working|idle|not_running
 #   termag-status notification        # Claude Code hook JSON on stdin
 #   termag-status --print-endpoint    # resolve and print, POST nothing
+#   termag-status --print-auth        # 'token: present|absent', never the token
 #
 # Env:
 #   TERMAG_AGENT_CONFIG    override the config path
@@ -44,6 +45,12 @@ find_config() {
   return 1
 }
 
+resolve_token() {
+  local config
+  config=$(find_config) || return 0
+  jq -r '.token // empty' "$config" 2>/dev/null || true
+}
+
 resolve_endpoint() {
   # agent.js's own fallback, for a co-located server with no readable config.
   local endpoint='http://127.0.0.1:3040/termag/api/status' config url
@@ -67,6 +74,13 @@ resolve_endpoint() {
 
 if [ "$MODE" = "--print-endpoint" ]; then
   resolve_endpoint; echo
+  exit 0
+fi
+
+if [ "$MODE" = "--print-auth" ]; then
+  # Deliberately reports presence only -- printing the token would defeat the
+  # care taken to keep it out of argv and logs.
+  if [ -n "$(resolve_token)" ]; then echo "token: present"; else echo "token: absent"; fi
   exit 0
 fi
 
@@ -103,9 +117,29 @@ esac
 
 [ -n "$PAYLOAD" ] || exit 0
 
+# Status writes from a remote host require the agent token: the server trusts
+# same-host callers (isLocalPeer) but a box reaches :3040 over the private VPC,
+# where requireAuthOrAgentToken applies. Without this a provisioned box 401s and,
+# because the hooks discard output, fails silently -- the exact failure mode this
+# script exists to remove. agent.js sends the same token on the same path.
+#
+# Passed via `curl -K -` (config on stdin), never as -H on the command line:
+# process command lines are world-readable, and this token can write status for
+# any of the owner's sessions. agent.js takes the same care (see its comment on
+# passing the bearer token via env rather than argv).
+TOKEN=$(resolve_token)
+
 # -m 5 so an unreachable server can't leave hook processes hanging around.
-curl -sf -m 5 -X POST "$ENDPOINT" \
-  -H 'Content-Type: application/json' \
-  -d "$PAYLOAD" >/dev/null 2>&1
+if [ -n "$TOKEN" ]; then
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+    | curl -sf -m 5 -K - -X POST "$ENDPOINT" \
+        -H 'Content-Type: application/json' \
+        -d "$PAYLOAD" >/dev/null 2>&1
+else
+  # No token in the agent config: only a same-host server will accept this.
+  curl -sf -m 5 -X POST "$ENDPOINT" \
+    -H 'Content-Type: application/json' \
+    -d "$PAYLOAD" >/dev/null 2>&1
+fi
 
 exit 0

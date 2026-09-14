@@ -78,8 +78,45 @@ check 'malformed json' \
   'not json at all' \
   'http://127.0.0.1:3040/termag/api/status'
 
+
+# ── auth ────────────────────────────────────────────────────────────────────
+# Remote status writes require the agent token: the server trusts same-host
+# callers (isLocalPeer) but a box reaches :3040 over the private VPC, where
+# requireAuthOrAgentToken applies. Without the token a provisioned box 401s and,
+# because the hooks discard output, fails silently.
+
+auth_of() {
+  cfg="$WORK/auth.json"
+  printf '%s' "$1" > "$cfg"
+  TERMAG_AGENT_CONFIG="$cfg" HOME="$WORK/empty-home" "$SCRIPT" --print-auth
+}
+
+got="$(auth_of '{"termag_url":"ws://h:3040/termag/ws/agent","token":"tmag_abc"}')"
+[ "$got" = "token: present" ] || fail 'token present' 'token: present' "$got"
+
+got="$(auth_of '{"termag_url":"ws://h:3040/termag/ws/agent"}')"
+[ "$got" = "token: absent" ] || fail 'token absent when config has none' 'token: absent' "$got"
+
+got="$(auth_of 'not json')"
+[ "$got" = "token: absent" ] || fail 'token absent on malformed config' 'token: absent' "$got"
+
+# --print-auth must never print the token itself.
+out="$(auth_of '{"termag_url":"ws://h/termag/ws/agent","token":"tmag_SECRET"}')"
+case "$out" in
+  *tmag_SECRET*) fail '--print-auth leaks the token' 'presence only' "$out" ;;
+esac
+
+# The token must reach curl via `-K -` (config on stdin), never as a -H
+# argument: process command lines are world-readable and this token can write
+# status for any of the owner's sessions. agent.js takes the same care.
+grep -q 'curl -sf -m 5 -K -' "$SCRIPT" \
+  || fail 'token not passed via curl -K' 'curl -sf -m 5 -K -' 'not found'
+if grep -E "\-H ['\"]?Authorization" "$SCRIPT" >/dev/null 2>&1; then
+  fail 'Authorization passed on the command line' 'no -H Authorization' 'found one'
+fi
+
 if [ "$failures" -eq 0 ]; then
-  echo "PASS: all endpoint-resolution cases"
+  echo "PASS: endpoint resolution + auth handling"
   exit 0
 fi
 echo "$failures failure(s)"

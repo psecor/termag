@@ -40,6 +40,26 @@ never arrive, with nothing in any log explaining why.
 Co-located boxes keep working unchanged — they are just the case where the derived
 host happens to be localhost.
 
+## Authentication
+
+Status writes are only unauthenticated for **same-host** callers. `authStatusWrite`
+in `backend/src/routes/status.ts` lets `isLocalPeer()` through and sends everyone
+else to `requireAuthOrAgentToken` — and a box is "everyone else", since it reaches
+`:3040` directly over the private VPC.
+
+So `termag-status` sends the agent token from `agent.config.json` as
+`Authorization: Bearer …`, exactly as `agent.js` does on the same path. Without it
+a provisioned box gets `401` and, because the hooks discard output, fails silently
+— the same invisible failure this script exists to remove.
+
+The token is passed via `curl -K -` (config on stdin), **never** as a `-H`
+argument: process command lines are world-readable, and this token can write
+status for any of the owner's sessions. `agent.js` takes the same care with its
+own bearer token, passing it via env rather than argv.
+
+If the config has no `token`, the request is sent unauthenticated — which only a
+same-host server will accept.
+
 ## Hook configuration
 
 ```json
@@ -88,8 +108,9 @@ processes accumulating.
 ## Verifying
 
 ```bash
-# which endpoint will the hooks use?
+# which endpoint will the hooks use, and will they authenticate?
 ~/.local/bin/termag-status --print-endpoint
+~/.local/bin/termag-status --print-auth        # "token: present" | "token: absent"
 
 # end-to-end: set a sentinel, make one tool call in Claude Code, read it back
 ENDPOINT=$(~/.local/bin/termag-status --print-endpoint)
@@ -102,8 +123,10 @@ curl -sS "$ENDPOINT/$SESSION"     # expect status: working
 
 A session the server has never heard from reports `not_running`.
 
-Endpoint resolution is covered by `deploy/termag-status.test.sh`
-(`sh deploy/termag-status.test.sh`) — no network, tmux or server required.
+Endpoint resolution and auth handling are covered by
+`deploy/termag-status.test.sh` (`sh deploy/termag-status.test.sh`) — no network,
+tmux or server required. It also asserts the token reaches curl via `-K` rather
+than the command line.
 
 ## Troubleshooting
 
@@ -111,6 +134,7 @@ Endpoint resolution is covered by `deploy/termag-status.test.sh`
 |---|---|
 | Status lights stay grey | `termag-status --print-endpoint`, then curl that server's `/termag/health` |
 | Endpoint is `127.0.0.1:3040` on a remote box | the agent config wasn't found — check `~/src/termag/agent/agent.config.json`, or set `TERMAG_AGENT_CONFIG` |
+| Lights grey on a remote box, endpoint correct | `--print-auth`. `token: absent` means the config has no `token`, so remote writes will 401 |
 | `Notification` never fires | `TERMAG_STATUS_DEBUG=1`, then inspect `~/.cache/termag-status/last-notification.json` |
 | Stale `waiting` | expected — `agent/agent.js` sweeps these back to reality |
 
