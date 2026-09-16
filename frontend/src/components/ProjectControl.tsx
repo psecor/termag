@@ -4,7 +4,7 @@ import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValu
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
-import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, AgentTokenInfo } from '../services/api';
+import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, metatermApi, AgentTokenInfo } from '../services/api';
 import { sessionName as buildSessionName } from '../utils/sessionName';
 
 // Aggregate priority for combining per-workstream statuses into a single
@@ -349,6 +349,25 @@ export function ProjectControl() {
     });
   }
 
+  // MetaTerm: idempotent open — creates the pinned singleton on first use,
+  // then just focuses it. Mirrors createProject's create-then-open sequence.
+  const [metatermBusy, setMetatermBusy] = useState(false);
+  async function openMetaTerm() {
+    if (metatermBusy) return;
+    setMetatermBusy(true);
+    try {
+      const { project } = await metatermApi.open();
+      setError('');
+      await reloadProjects();
+      setActiveProject(project.id);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setError(msg || 'Failed to open MetaTerm');
+    } finally {
+      setMetatermBusy(false);
+    }
+  }
+
   async function createProject(e: React.FormEvent) {
     e.preventDefault();
     if (!newProjectName.trim()) return;
@@ -616,7 +635,7 @@ export function ProjectControl() {
             )}
           </>
         )}
-        {!selectMode && (
+        {!selectMode && p.kind !== 'metaterm' && (
         <span className="project-actions" onClick={e => e.stopPropagation()}>
           <button
             className="btn-tiny btn-overflow"
@@ -812,6 +831,11 @@ export function ProjectControl() {
             // Group projects by box: one group per box that has projects (sorted
             // by box name), then collaborator projects on boxes I don't own, then
             // legacy "this host" projects (no instance). Empty groups are hidden.
+            // MetaTerm — the per-user control tower — is pinned above every box
+            // group. Pull it out so it doesn't also land under "This host".
+            const metaterm = filtered.find(p => p.kind === 'metaterm');
+            const filteredRest = metaterm ? filtered.filter(p => p.id !== metaterm.id) : filtered;
+
             const knownBoxIds = new Set(boxes.map(b => b.id));
             const groups: {
               key: string; label: string; color: string | null;
@@ -819,7 +843,7 @@ export function ProjectControl() {
             }[] = [];
 
             [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
-              const rows = sortPinned(filtered.filter(p => p.instanceId === b.id));
+              const rows = sortPinned(filteredRest.filter(p => p.instanceId === b.id));
               if (!rows.length) return;
               const pending = b.status === 'provisioning' || b.status === 'awaiting-agent';
               groups.push({
@@ -831,13 +855,27 @@ export function ProjectControl() {
               });
             });
 
-            const shared = sortPinned(filtered.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
+            const shared = sortPinned(filteredRest.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
             if (shared.length) groups.push({ key: '__shared', label: 'Shared with me', color: null, rows: shared });
 
-            const local = sortPinned(filtered.filter(p => !p.instanceId));
+            const local = sortPinned(filteredRest.filter(p => !p.instanceId));
             if (local.length) groups.push({ key: '__local', label: 'This host', color: null, rows: local });
 
-            return groups.map(g => (
+            if (metaterm) groups.unshift({ key: '__metaterm', label: 'MetaTerm', color: 'var(--accent)', rows: [metaterm] });
+
+            return (
+              <>
+                {!metaterm && !projectFilter && (
+                  <li
+                    className="project-item project-metaterm-entry"
+                    onClick={openMetaTerm}
+                    title="Open MetaTerm — a Claude that can see (and, with confirmation, drive) every session you can reach"
+                  >
+                    <span className="project-name">⚡ MetaTerm</span>
+                    <span className="project-group-count">{metatermBusy ? '…' : 'open'}</span>
+                  </li>
+                )}
+                {groups.map(g => (
               <React.Fragment key={g.key}>
                 <li
                   className="project-group-header"
@@ -849,7 +887,9 @@ export function ProjectControl() {
                 </li>
                 {g.rows.map(renderRow)}
               </React.Fragment>
-            ));
+                ))}
+              </>
+            );
           })()}
         </ul>
         <form className="inline-form project-create-form" onSubmit={createProject}>

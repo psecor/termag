@@ -108,6 +108,7 @@ export function workstreamsRouter(): Router {
       include: { user: { select: { unixUsername: true } } },
     });
     if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+    if (project.kind === 'metaterm') { res.status(400).json({ error: 'MetaTerm cannot branch off' }); return; }
 
     const existing = await prisma.workstream.findUnique({
       where: { projectId_name: { projectId: project.id, name } },

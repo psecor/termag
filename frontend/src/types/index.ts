@@ -42,6 +42,8 @@ export interface Project {
   workstreams: Workstream[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';
+  // 'metaterm' = the per-user pinned control-tower singleton; absent/'normal' otherwise.
+  kind?: 'normal' | 'metaterm';
 }
 
 export type InstanceStatus = 'provisioning' | 'awaiting-agent' | 'ready' | 'failed' | 'terminated';

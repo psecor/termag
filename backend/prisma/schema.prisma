@@ -65,6 +65,12 @@ model Project {
   slackChannelId String?   // Slack channel ID (proj-<name>)
   archived       Boolean   @default(false)
   pinned         Boolean   @default(false)
+  // "normal" for ordinary projects; "metaterm" marks the per-user singleton
+  // control-tower project (pinned, lives on the orchestrator, refuses
+  // rename/archive/share/branch-off). String-not-enum, like Instance.kind.
+  // One MetaTerm per user is enforced by a partial unique index in the
+  // 20260916000000_project_kind migration (NULL instanceId defeats @@unique).
+  kind           String    @default("normal")
   lastActiveAt   DateTime  @default(now())
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt

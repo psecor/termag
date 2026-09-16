@@ -1438,3 +1438,13 @@ html {
   font-size: 12px;
   color: var(--text-primary);
 }
+
+/* MetaTerm entry point — sits above the box groups until the singleton exists */
+.project-metaterm-entry {
+  cursor: pointer;
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(31, 111, 235, 0.08);
+  margin-bottom: 6px;
+}
+.project-metaterm-entry:hover { background: rgba(31, 111, 235, 0.16); }

@@ -785,10 +785,21 @@ function connect() {
         }
 
         case 'tmux-send-keys': {
-          const { sessionName, keys, withEnter } = msg;
-          const enter = withEnter ? ' Enter' : '';
+          // `literal` (opt-in) types `keys` VERBATIM via `-l`, so a string like
+          // "C-c" is text, not Ctrl-C. Without it — the historical default that
+          // Slack /t and the Claude launch rely on — tmux parses key names.
+          // `-l` applies to every argument in an invocation, so Enter must be a
+          // separate send (matches backend/src/services/tmux.ts sendKeys).
+          const { sessionName, keys, withEnter, literal } = msg;
+          const target = shellEscape(sessionName);
           const escaped = shellEscape(keys.replace(/'/g, "'\\''"));
-          await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${escaped}${enter}`);
+          if (literal) {
+            await execAsync(`tmux send-keys -t ${target} -l ${escaped}`);
+            if (withEnter) await execAsync(`tmux send-keys -t ${target} Enter`);
+          } else {
+            const enter = withEnter ? ' Enter' : '';
+            await execAsync(`tmux send-keys -t ${target} ${escaped}${enter}`);
+          }
           respond(ws, requestId, { ok: true });
           break;
         }

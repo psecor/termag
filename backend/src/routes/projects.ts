@@ -4,6 +4,7 @@ import { prisma } from '../db';
 import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { parseBulkPinBody } from './bulkPin';
+import { isReservedProjectName, RESERVED_NAME_ERROR } from './projectNames';
 import * as tmux from '../services/tmux';
 import {
   isAgentConnected,
@@ -16,10 +17,9 @@ import { createProjectChannel } from '../slack/channels';
 import { rename } from 'fs/promises';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
+import { assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
 
 
-const VALID_CAPTURE_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
-type CaptureRole = typeof VALID_CAPTURE_ROLES[number];
 const CAPTURE_MIN_INTERVAL_MS = 1000;
 const captureRateLimits = new Map<string, number>();
 
@@ -59,7 +59,7 @@ export function projectsRouter(): Router {
           id: p.id, name: p.name, description: p.description, color: p.color,
           archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
           createdAt: p.createdAt, updatedAt: p.updatedAt,
-          userId: p.userId, instanceId: p.instanceId,
+          userId: p.userId, instanceId: p.instanceId, kind: p.kind,
           workflows: p.workflows, workstreams: p.workstreams,
           ownerUsername: p.user.unixUsername, role: 'owner' as const,
         })),
@@ -70,7 +70,7 @@ export function projectsRouter(): Router {
             color: s.project.color, archived: s.project.archived,
             pinned: s.project.pinned, lastActiveAt: s.project.lastActiveAt,
             createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
-            userId: s.project.userId, instanceId: s.project.instanceId,
+            userId: s.project.userId, instanceId: s.project.instanceId, kind: s.project.kind,
             workflows: s.project.workflows,
             workstreams: s.project.workstreams,
             ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
@@ -99,6 +99,8 @@ export function projectsRouter(): Router {
         res.status(400).json({ error: 'name must be alphanumeric with dashes/underscores only' });
         return;
       }
+
+      if (isReservedProjectName(name)) { res.status(400).json({ error: RESERVED_NAME_ERROR }); return; }
 
       // If a box was specified, confirm the caller owns it and it's live.
       // null/undefined means a legacy project (lives on the user's
@@ -239,11 +241,23 @@ export function projectsRouter(): Router {
   const update: RequestHandler = async (req, res) => {
     try {
       const { name, description, color, archived } = req.body;
-      const project = await prisma.project.updateMany({
-        where: { id: req.params.id, userId: req.user!.id },
+      const existing = await prisma.project.findFirst({ where: { id: req.params.id, userId: req.user!.id } });
+      if (!existing) { res.status(404).json({ error: 'Not found' }); return; }
+      // MetaTerm is a managed singleton: only cosmetic fields may change here.
+      // Its name is what its tmux sessions are keyed on, and archiving must go
+      // through the guarded archive route (which refuses it too).
+      if (existing.kind === 'metaterm' && (name !== undefined || archived !== undefined)) {
+        res.status(400).json({ error: 'MetaTerm cannot be renamed or archived' });
+        return;
+      }
+      if (name !== undefined && isReservedProjectName(String(name))) {
+        res.status(400).json({ error: RESERVED_NAME_ERROR });
+        return;
+      }
+      await prisma.project.update({
+        where: { id: existing.id },
         data: { name, description, color, archived },
       });
-      if (project.count === 0) { res.status(404).json({ error: 'Not found' }); return; }
       res.json({ ok: true });
     } catch {
       res.status(500).json({ error: 'Failed to update project' });
@@ -258,6 +272,7 @@ export function projectsRouter(): Router {
         include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Not found' }); return; }
+      if (project.kind === 'metaterm') { res.status(400).json({ error: 'MetaTerm cannot be archived' }); return; }
 
       const username = req.user!.unixUsername;
 
@@ -311,6 +326,7 @@ export function projectsRouter(): Router {
 
       const project = await prisma.project.findFirst({ where: { id: req.params.id, userId: req.user!.id } });
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      if (project.kind === 'metaterm') { res.status(400).json({ error: 'MetaTerm workflows are managed automatically' }); return; }
 
       const provider = type === 'agent'
         ? normalizeProvider(providerInput, req.user!.defaultAgentProvider)
@@ -371,6 +387,7 @@ export function projectsRouter(): Router {
         include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      if (project.kind === 'metaterm') { res.status(400).json({ error: 'MetaTerm workflows are managed automatically' }); return; }
       const workflow = project.workflows.find(w => w.type === type);
       const provider = normalizeProvider(workflow?.provider, req.user!.defaultAgentProvider);
       const wsName = workflow?.workstream.name ?? 'main';
@@ -406,12 +423,14 @@ export function projectsRouter(): Router {
         res.status(400).json({ error: 'name must be alphanumeric with dashes/underscores only' });
         return;
       }
+      if (isReservedProjectName(newName)) { res.status(400).json({ error: RESERVED_NAME_ERROR }); return; }
 
       const project = await prisma.project.findFirst({
         where: { id: req.params.id, userId: req.user!.id },
         include: { workflows: { include: { workstream: true } } },
       });
       if (!project) { res.status(404).json({ error: 'Not found' }); return; }
+      if (project.kind === 'metaterm') { res.status(400).json({ error: 'MetaTerm cannot be renamed' }); return; }
 
       const oldName = project.name;
       if (oldName === newName) { res.json({ ok: true }); return; }
@@ -535,39 +554,26 @@ export function projectsRouter(): Router {
   // Auth: session cookie OR Bearer agent token (so an agent on a user's box
   // can curl this directly).
   const capture: RequestHandler = async (req, res) => {
-    const role = req.params.role as CaptureRole;
-    if (!VALID_CAPTURE_ROLES.includes(role)) {
-      res.status(400).json({ error: `role must be one of: ${VALID_CAPTURE_ROLES.join(', ')}` });
-      return;
-    }
-
     const requestedLines = parseInt(req.query.lines as string, 10);
     const lines = Number.isFinite(requestedLines)
       ? Math.max(1, Math.min(1000, requestedLines))
       : 200;
+    const workstream = typeof req.query.workstream === 'string' && req.query.workstream
+      ? req.query.workstream
+      : 'main';
 
-    const project = await prisma.project.findUnique({
-      where: { id: req.params.id },
-      include: { user: { select: { id: true, unixUsername: true } } },
-    });
-    if (!project || project.archived) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
+    // Owner-or-share + allowlist-by-reconstruction live in assertSessionAccess,
+    // shared with the MetaTerm list / send-keys routes. 404 on any denial.
+    let access;
+    try {
+      access = await assertSessionAccess(req.user!.id, req.params.id, req.params.role, workstream);
+    } catch (err) {
+      if (err instanceof SessionAccessError) { res.status(err.status).json({ error: err.message }); return; }
+      throw err;
     }
-
     const requesterId = req.user!.id;
-    const isOwner = project.userId === requesterId;
-    if (!isOwner) {
-      const share = await prisma.projectShare.findUnique({
-        where: { projectId_userId: { projectId: project.id, userId: requesterId } },
-      });
-      if (!share) {
-        res.status(404).json({ error: 'Project not found' });
-        return;
-      }
-    }
-
-    const sessionName = tmux.sessionName(project.user.unixUsername, project.name, role);
+    const sessionName = access.session;
+    const ownerHost = access.host;
 
     const rateKey = `${requesterId}:${sessionName}`;
     const now = Date.now();
@@ -578,7 +584,6 @@ export function projectsRouter(): Router {
     }
     captureRateLimits.set(rateKey, now);
 
-    const ownerHost = { userId: project.userId, instanceId: project.instanceId };
     if (!isProjectAgentConnected(ownerHost)) {
       res.status(503).json({ error: "Owner's agent is offline" });
       return;
@@ -592,7 +597,7 @@ export function projectsRouter(): Router {
     }
   };
 
-  router.get('/', requireAuth, list);
+  router.get('/', requireAuthOrAgentToken, list);
   router.post('/', requireAuth, create);
   // Must precede the `/:id` routes — `/bulk/pin` would otherwise match
   // `/:id/pin` with id="bulk".

@@ -49,6 +49,14 @@ export const projectsApi = {
     api.delete(`/api/projects/${projectId}/workflows/${type}`).then(r => r.data),
 };
 
+// MetaTerm — the pinned per-user "control tower" project on the orchestrator.
+// open() is idempotent: creates the singleton on first call (201), then just
+// ensures it's up and returns it (200).
+export const metatermApi = {
+  open: (): Promise<{ project: Project; created: boolean }> =>
+    api.post('/api/metaterm').then(r => r.data),
+};
+
 // Workstreams are returned embedded on Project, so `list` is rarely needed;
 // the create/remove helpers are what the UI actually invokes. DELETE may
 // return a `branchDeleteWarning` string when `git branch -d` was refused

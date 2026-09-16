@@ -23,6 +23,10 @@ export function sharingRouter(): Router {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
+    if (project.kind === 'metaterm') {
+      res.status(400).json({ error: 'MetaTerm cannot be shared yet' });
+      return;
+    }
 
     // Find invitee
     const invitee = await prisma.user.findUnique({
