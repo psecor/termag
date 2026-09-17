@@ -17,6 +17,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises';
 import { WorkflowType } from '@prisma/client';
 import { prisma } from '../db';
 import * as tmux from './tmux';
+import { isProjectAgentConnected, sendForProject, ProjectHost } from './agentRegistry';
 import { ensureMainWorkstream } from './workstreams';
 import { ensureAgentSessionsAndLaunch } from './agentRuntime';
 
@@ -73,23 +74,58 @@ Refer to the target project's own \`AGENTS.md\` (capture its ctrl pane and
 \`cat\` it) before making assumptions about how that project works.
 `;
 
-async function writeIfNeeded(path: string, content: string, opts: { always?: boolean } = {}): Promise<void> {
+/**
+ * The handful of filesystem ops seeding needs, abstracted so they can run either
+ * on this process's own filesystem (dev: backend runs as the user) or through
+ * the user's per-user agent (prod: the backend is the `termag` service user and
+ * has no write access to /home/<user> — the agent runs AS the user).
+ */
+export interface SeedFs {
+  mkdir(dir: string): Promise<void>;
+  /** null when the file doesn't exist. */
+  readFile(path: string): Promise<string | null>;
+  writeFile(path: string, content: string): Promise<void>;
+}
+
+export const localSeedFs: SeedFs = {
+  mkdir: async (dir) => { await mkdir(dir, { recursive: true }); },
+  readFile: async (path) => {
+    try { return await readFile(path, 'utf8'); } catch { return null; }
+  },
+  writeFile: (path, content) => writeFile(path, content, 'utf8'),
+};
+
+export function agentSeedFs(host: ProjectHost): SeedFs {
+  return {
+    mkdir: async (dir) => { await sendForProject(host, 'mkdir', { dir }); },
+    readFile: async (path) => {
+      const r = await sendForProject(host, 'read-file', { path });
+      return typeof r?.content === 'string' ? r.content : null;
+    },
+    writeFile: async (path, content) => { await sendForProject(host, 'write-file', { path, content }); },
+  };
+}
+
+/** Thrown when neither the agent nor the local filesystem can seed the project dir. */
+export class MetaTermUnavailableError extends Error {
+  status = 503;
+}
+
+async function writeIfNeeded(fs: SeedFs, path: string, content: string, opts: { always?: boolean } = {}): Promise<void> {
   if (!opts.always) {
-    try {
-      const existing = await readFile(path, 'utf8');
-      // Keep user edits; only replace a missing file or the generic wiki pointer.
-      if (existing.trim() && !existing.startsWith('@AGENTS.md')) return;
-    } catch { /* missing — write it */ }
+    const existing = await fs.readFile(path);
+    // Keep user edits; only replace a missing file or the generic wiki pointer.
+    if (existing !== null && existing.trim() && !existing.startsWith('@AGENTS.md')) return;
   }
-  await writeFile(path, content, 'utf8');
+  await fs.writeFile(path, content);
 }
 
 /** Seed the files that turn a plain Claude Code session into MetaTerm. Idempotent. */
-export async function seedMetaTermFiles(dir: string): Promise<void> {
-  await mkdir(join(dir, '.claude'), { recursive: true });
+export async function seedMetaTermFiles(dir: string, fs: SeedFs = localSeedFs): Promise<void> {
+  await fs.mkdir(join(dir, '.claude'));
   // Config we own: always rewrite so a redeploy that moves the MCP server path
   // or the API URL takes effect on the next open.
-  await writeIfNeeded(join(dir, '.mcp.json'), JSON.stringify({
+  await writeIfNeeded(fs, join(dir, '.mcp.json'), JSON.stringify({
     mcpServers: {
       metaterm: {
         command: 'node',
@@ -100,10 +136,24 @@ export async function seedMetaTermFiles(dir: string): Promise<void> {
   }, null, 2) + '\n', { always: true });
   // Pre-approve the read tools only. send_keys is deliberately absent so
   // Claude Code prompts for it — that prompt IS the "confirm before driving".
-  await writeIfNeeded(join(dir, '.claude', 'settings.json'), JSON.stringify({
+  await writeIfNeeded(fs, join(dir, '.claude', 'settings.json'), JSON.stringify({
     permissions: { allow: READ_TOOLS.map(t => `mcp__metaterm__${t}`) },
   }, null, 2) + '\n', { always: true });
-  await writeIfNeeded(join(dir, 'CLAUDE.md'), CLAUDE_MD);
+  await writeIfNeeded(fs, join(dir, 'CLAUDE.md'), CLAUDE_MD);
+}
+
+async function ensureLocalDirOrExplain(unixUsername: string): Promise<void> {
+  try {
+    await tmux.ensureProjectDir(unixUsername, METATERM_NAME);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'EACCES' || code === 'EPERM') {
+      throw new MetaTermUnavailableError(
+        'your termag-agent on the orchestrator is not connected, and the backend cannot create files in your home on its own. Start the agent and try again.',
+      );
+    }
+    throw err;
+  }
 }
 
 export interface EnsureMetaTermResult {
@@ -123,11 +173,25 @@ export async function ensureMetaTerm(user: { id: string; unixUsername: string })
     project = await prisma.project.update({ where: { id: project.id }, data: { archived: false, pinned: true } });
   }
 
+  // MetaTerm always lives on the orchestrator (instanceId null), i.e. in the
+  // user's home on this host. The backend runs as the `termag` service user
+  // and cannot write there, so every filesystem step goes through the user's
+  // per-user agent — exactly like the project-create route. The local
+  // fallback only works where the backend runs as the user (dev).
+  const host: ProjectHost = { userId: user.id, instanceId: null };
+  const viaAgent = isProjectAgentConnected(host);
+  const dir = tmux.projectDir(user.unixUsername, METATERM_NAME);
+  const seedFs = viaAgent ? agentSeedFs(host) : localSeedFs;
+
   if (!project) {
-    // Orchestrator-hosted (instanceId null): the dir lives on this host's
-    // filesystem, so create it locally. Seeds AGENTS.md/CLAUDE.md; we replace
-    // CLAUDE.md with the MetaTerm rules below.
-    await tmux.ensureProjectDir(user.unixUsername, METATERM_NAME);
+    // Seeds AGENTS.md + the generic CLAUDE.md pointer; we replace CLAUDE.md
+    // with the MetaTerm rules below.
+    if (viaAgent) {
+      await sendForProject(host, 'mkdir', { dir });
+      await sendForProject(host, 'init-wiki', { dir, slug: METATERM_NAME, username: user.unixUsername });
+    } else {
+      await ensureLocalDirOrExplain(user.unixUsername);
+    }
     project = await prisma.project.create({
       data: {
         name: METATERM_NAME,
@@ -155,7 +219,7 @@ export async function ensureMetaTerm(user: { id: string; unixUsername: string })
     });
   }
 
-  await seedMetaTermFiles(tmux.projectDir(user.unixUsername, METATERM_NAME));
+  await seedMetaTermFiles(dir, seedFs);
 
   // Probes before relaunching (see the AGENTS.md gotcha) — idempotent.
   await ensureAgentSessionsAndLaunch({

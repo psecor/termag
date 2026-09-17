@@ -874,6 +874,31 @@ function connect() {
           break;
         }
 
+        // Small text-file primitives for orchestrator-driven seeding inside
+        // the user's home (MetaTerm's .mcp.json / CLAUDE.md / .claude/settings.json).
+        // The backend runs as its own service user and can't write into
+        // /home/<user>; this agent runs AS the user, so it does the write.
+        // Not a permission boundary — the backend gates who asks for what.
+        case 'read-file': {
+          const p = remapPath(msg.path);
+          try {
+            respond(ws, requestId, { ok: true, content: await readFileAsync(p, 'utf8') });
+          } catch (err) {
+            if (err.code !== 'ENOENT') throw err;
+            respond(ws, requestId, { ok: true, content: null });
+          }
+          break;
+        }
+
+        case 'write-file': {
+          const p = remapPath(msg.path);
+          if (typeof msg.content !== 'string') throw new Error('write-file: content must be a string');
+          await mkdir(path.dirname(p), { recursive: true });
+          await writeFile(p, msg.content, 'utf8');
+          respond(ws, requestId, { ok: true });
+          break;
+        }
+
         case 'git-worktree-add': {
           // Create a git worktree at <projectDir>/.worktrees/<worktreeName>,
           // checked out on a new branch <branch> based at <baseRef> (defaults
