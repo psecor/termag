@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { usageApi, UsageDayData, UsageResponse, worktimeApi, WorktimeResponse, WorktimeDay, visitsApi, VisitsStats, warpApi, WarpSeries, contextApi, ContextSeries } from '../services/api';
 import { PROVIDERS, ProviderConfig } from '../providers/registry';
 
@@ -534,8 +535,10 @@ export function UsageMini() {
         </div>
       </div>
 
-      {/* Expanded overlay */}
-      {expanded && (
+      {/* Expanded overlay — portaled to <body>: the thermometer lives inside
+          the sidebar, whose z-index creates a stacking context that would
+          otherwise trap this full-screen backdrop beneath the terminals. */}
+      {expanded && createPortal(
         <div className="usage-overlay-backdrop" onClick={() => setExpanded(false)}>
           <div className="usage-overlay" onClick={e => e.stopPropagation()}>
             <div className="usage-overlay-header">
@@ -828,7 +831,8 @@ export function UsageMini() {
               ))}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </>
   );

@@ -189,10 +189,6 @@ function MainLayout() {
           onWarpChange={setWarpSpeed}
         />
       </div>
-      <UsageMini />
-      <div className="warp-indicator" data-active={isActive || undefined}>
-        {warpStr}<em>c</em>
-      </div>
       <div className={`app-sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <button
           className="sidebar-toggle"
@@ -213,6 +209,14 @@ function MainLayout() {
             <ProjectControl />
           </div>
         )}
+        {/* Indicators own the sidebar's bottom edge: the project list above
+            scrolls to a hard stop here instead of sliding underneath them. */}
+        <div className="app-sidebar-footer">
+          <UsageMini />
+          <div className="warp-indicator" data-active={isActive || undefined}>
+            {warpStr}<em>c</em>
+          </div>
+        </div>
       </div>
       <div className="app-terminals">
         <div className="app-project-bar">
