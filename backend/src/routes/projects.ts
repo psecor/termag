@@ -4,6 +4,7 @@ import { prisma } from '../db';
 import { PROVIDER_IDS } from '../providers/registry';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { parseBulkPinBody } from './bulkPin';
+import { planUnarchiveLaunches } from './unarchive';
 import { isReservedProjectName, RESERVED_NAME_ERROR } from './projectNames';
 import * as tmux from '../services/tmux';
 import {
@@ -29,6 +30,32 @@ export function projectsRouter(): Router {
   function normalizeProvider(provider?: string | null, fallback?: string | null): string {
     if (provider && PROVIDER_IDS.includes(provider)) return provider;
     return resolveAgentProvider(undefined, fallback);
+  }
+
+  // Make sure a data workflow's two tmux sessions exist on the project's
+  // host: via the box / legacy agent when connected, else directly on the
+  // orchestrator for legacy projects. Box-pinned projects with no connected
+  // agent fail loudly — the orchestrator can't see the box's tmux server.
+  async function ensureDataSessions(
+    projectHost: { userId: string; instanceId: string | null },
+    unixUsername: string,
+    projectName: string,
+    workstream: string,
+  ): Promise<void> {
+    const mainSession = tmux.sessionName(unixUsername, projectName, 'data', workstream);
+    const ctrlSession = tmux.sessionName(unixUsername, projectName, 'data-ctrl', workstream);
+    const projDir = tmux.projectDir(unixUsername, projectName, workstream);
+
+    if (isProjectAgentConnected(projectHost)) {
+      await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
+      await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
+    } else if (!projectHost.instanceId) {
+      await tmux.ensureProjectDir(unixUsername, projectName);
+      await tmux.ensureSession(mainSession, projDir);
+      await tmux.ensureSession(ctrlSession, projDir);
+    } else {
+      throw new Error('Box agent not connected');
+    }
   }
 
   const list: RequestHandler = async (req, res) => {
@@ -123,27 +150,105 @@ export function projectsRouter(): Router {
       // Check for archived project with same name — unarchive instead
       const archived = await prisma.project.findFirst({
         where: { userId: req.user!.id, name, archived: true },
-        include: { workflows: true },
+        include: { workflows: { include: { workstream: true } } },
       });
       if (archived) {
+        // Un-archiving may move the project to a different box, and archiving
+        // killed its sessions anyway, so every workflow it already has must get
+        // its tmux sessions (re)created on the chosen host — not just a newly
+        // requested agent workflow. Without this an old project re-created on
+        // a new box rendered tmux's "no sessions" in the terminal pane.
+        const plan = planUnarchiveLaunches({
+          existingWorkflows: archived.workflows.map(w => ({
+            type: w.type, provider: w.provider, workstream: w.workstream.name,
+          })),
+          initialAgentEnabled: !!initialAgent?.enabled,
+        });
+
+        // Same up-front check as the fresh-create path below: a box-pinned
+        // project whose box agent isn't connected can't get sessions, so fail
+        // with the same 503 before touching the row rather than 500 after.
+        const projectHost = { userId: req.user!.id, instanceId: projectInstanceId };
+        const needsHost = plan.createAgentWorkflow || plan.relaunch.length > 0;
+        if (needsHost && projectInstanceId && !isProjectAgentConnected(projectHost)) {
+          res.status(503).json({ error: 'Box agent is not connected' });
+          return;
+        }
+
         await prisma.project.update({
           where: { id: archived.id },
           data: { archived: false, description, color, instanceId: projectInstanceId },
         });
-        if (initialAgent?.enabled && !archived.workflows.some(w => w.type === 'agent')) {
-          const provider = normalizeProvider(initialAgent.provider, req.user!.defaultAgentProvider);
-          const ws = await ensureMainWorkstream(archived.id);
-          await prisma.workflow.create({
-            data: { projectId: archived.id, workstreamId: ws.id, type: 'agent', provider },
-          });
-          await ensureAgentSessionsAndLaunch({
-            userId: req.user!.id,
-            unixUsername: req.user!.unixUsername,
-            projectName: name,
-            provider,
-            instanceId: projectInstanceId,
-            workstream: ws.name,
-          });
+
+        // Make sure the project dir exists on the (possibly new) host and seed
+        // AGENTS.md / CLAUDE.md there, as fresh-create does. init-wiki skips
+        // when AGENTS.md already exists, so a same-box un-archive is a no-op.
+        const projDir = tmux.projectDir(req.user!.unixUsername, name);
+        if (isProjectAgentConnected(projectHost)) {
+          await sendForProject(projectHost, 'mkdir', { dir: projDir });
+          sendForProject(projectHost, 'init-wiki', {
+            dir: projDir, slug: name, username: req.user!.unixUsername,
+          }).catch(() => {});
+        } else if (!projectInstanceId) {
+          await tmux.ensureProjectDir(req.user!.unixUsername, name);
+        }
+
+        // Launches run in order and stop at the first failure. Sessions already
+        // created for earlier workflows are left on the host as idle shells;
+        // the rollback below only touches the DB. That's harmless — a retry or
+        // the agent's reconnect reconstruction converges on the same names.
+        let createdWorkflowId: string | null = null;
+        try {
+          if (plan.createAgentWorkflow) {
+            const provider = normalizeProvider(initialAgent?.provider, req.user!.defaultAgentProvider);
+            const ws = await ensureMainWorkstream(archived.id);
+            const created = await prisma.workflow.create({
+              data: { projectId: archived.id, workstreamId: ws.id, type: 'agent', provider },
+            });
+            createdWorkflowId = created.id;
+            await ensureAgentSessionsAndLaunch({
+              userId: req.user!.id,
+              unixUsername: req.user!.unixUsername,
+              projectName: name,
+              provider,
+              instanceId: projectInstanceId,
+              workstream: ws.name,
+            });
+          }
+
+          for (const wf of plan.relaunch) {
+            if (wf.type === 'agent') {
+              // ensureAgentSessionsAndLaunch probes the pane first, so a
+              // project un-archived onto the same box with the agent still
+              // running is left alone rather than re-typing the launch command.
+              await ensureAgentSessionsAndLaunch({
+                userId: req.user!.id,
+                unixUsername: req.user!.unixUsername,
+                projectName: name,
+                provider: normalizeProvider(wf.provider, req.user!.defaultAgentProvider),
+                instanceId: projectInstanceId,
+                workstream: wf.workstream,
+              });
+            } else {
+              await ensureDataSessions(projectHost, req.user!.unixUsername, name, wf.workstream);
+            }
+          }
+        } catch (err) {
+          // Don't leave the project un-archived but pointing at a host with
+          // no sessions — that is exactly the state this path is fixing.
+          if (createdWorkflowId) {
+            await prisma.workflow.delete({ where: { id: createdWorkflowId } }).catch(() => {});
+          }
+          await prisma.project.update({
+            where: { id: archived.id },
+            data: {
+              archived: true,
+              description: archived.description,
+              color: archived.color,
+              instanceId: archived.instanceId,
+            },
+          }).catch(() => {});
+          throw err;
         }
 
         const restored = await prisma.project.findUnique({
@@ -348,21 +453,12 @@ export function projectsRouter(): Router {
             workstream: ws.name,
           });
         } else {
-          const mainSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data', ws.name);
-          const ctrlSession = tmux.sessionName(req.user!.unixUsername, project.name, 'data-ctrl', ws.name);
-          const projDir = tmux.projectDir(req.user!.unixUsername, project.name, ws.name);
-          const projectHost = { userId: req.user!.id, instanceId: project.instanceId };
-
-          if (isProjectAgentConnected(projectHost)) {
-            await sendForProject(projectHost, 'tmux-create', { sessionName: mainSession, cwd: projDir });
-            await sendForProject(projectHost, 'tmux-create', { sessionName: ctrlSession, cwd: projDir });
-          } else if (!project.instanceId) {
-            await tmux.ensureProjectDir(req.user!.unixUsername, project.name);
-            await tmux.ensureSession(mainSession, projDir);
-            await tmux.ensureSession(ctrlSession, projDir);
-          } else {
-            throw new Error('Box agent not connected');
-          }
+          await ensureDataSessions(
+            { userId: req.user!.id, instanceId: project.instanceId },
+            req.user!.unixUsername,
+            project.name,
+            ws.name,
+          );
         }
       } catch (err) {
         await prisma.workflow.delete({ where: { id: workflow.id } }).catch(() => {});
