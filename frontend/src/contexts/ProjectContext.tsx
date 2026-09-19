@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { Project, StatusMap, AgentStatusValue } from '../types';
 import { projectsApi, visitsApi } from '../services/api';
 import { useAuth } from './AuthContext';
+import { connectionTracker } from '../utils/connectionTracker';
 
 const LAST_ACTIVE_PROJECT_KEY = 'termag:lastActiveProject';
 
@@ -168,8 +169,20 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${window.location.host}/termag/ws/status`);
       wsRef.current = ws;
+      // Let the ConnectionProvider force-close this socket when it has been
+      // silent past the stale threshold (half-open after a VPN drop).
+      connectionTracker.closeSocket = () => { try { ws.close(); } catch { /* ignore */ } };
+
+      ws.onopen = () => {
+        connectionTracker.setSocketOpen(true);
+        connectionTracker.contact();
+      };
 
       ws.onmessage = (event) => {
+        // Every frame — status pushes and the server's periodic heartbeat —
+        // is proof the backend is reachable. Record before parsing so a
+        // malformed frame still counts.
+        connectionTracker.contact();
         try {
           const msg = JSON.parse(event.data as string) as {
             type: string;
@@ -208,12 +221,17 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
       ws.onclose = () => {
         wsRef.current = null;
+        connectionTracker.setSocketOpen(false);
         if (!disposed) setTimeout(connect, 3000);
       };
     }
 
     connect();
-    return () => { disposed = true; wsRef.current?.close(); };
+    return () => {
+      disposed = true;
+      connectionTracker.closeSocket = null;
+      wsRef.current?.close();
+    };
   }, [user]);
 
   return (

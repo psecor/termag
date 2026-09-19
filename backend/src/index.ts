@@ -421,6 +421,18 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'status', session, ...status }));
         }
       }
+
+      // Application-level heartbeat. The protocol-level ping above keeps the
+      // connection alive and lets the SERVER notice a dead browser, but browser
+      // JavaScript cannot observe pings, so a page whose network silently died
+      // (VPN drop = half-open TCP, no FIN ever arrives) sees an open, quiet
+      // socket forever and keeps rendering stale statuses. A visible message on
+      // the same cadence gives the client something to time out on.
+      const appHb = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try { ws.send(JSON.stringify({ type: 'heartbeat', ts: Date.now() })); } catch {}
+      }, WS_HEARTBEAT_MS);
+      ws.once('close', () => clearInterval(appHb));
     }).catch(() => {
       ws.close(1008, 'auth error');
     });

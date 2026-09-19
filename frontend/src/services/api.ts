@@ -1,10 +1,25 @@
 import axios from 'axios';
+import { connectionTracker } from '../utils/connectionTracker';
 import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, Workstream } from '../types';
 
 const api = axios.create({
   baseURL: '/termag',
   withCredentials: true,
 });
+
+// Every REST round-trip is evidence about reachability. An HTTP response of
+// any status (even 401/500) proves a termag server answered; only a
+// network-level failure — no response object — counts against us. This is
+// what makes an outage show up the moment the user does anything, and it
+// turns the existing 5s warp sample into a passive liveness probe for free.
+api.interceptors.response.use(
+  (res) => { connectionTracker.contact(); return res; },
+  (err) => {
+    if (err?.response) connectionTracker.contact();
+    else connectionTracker.failure();
+    return Promise.reject(err);
+  },
+);
 
 // Mirrors backend routes/auth.ts AuthMode: 'okta' = identity from the ALB edge,
 // 'oidc' = in-app OpenID Connect flow (container deployments).

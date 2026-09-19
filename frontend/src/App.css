@@ -1562,3 +1562,65 @@ a.pb-row:hover { background: var(--bg-elevated); }
 a.ctx-panel:hover { border-color: var(--text-muted); }
 .dash-card-value.ctx-warn { color: var(--warning); }
 .dash-card-value.ctx-danger { color: var(--danger); }
+
+/* ── Connection state (backend reachability) ─────────────────
+   Companion to the starfield's offline/degraded look: the speed readout slot
+   in the sidebar footer and a one-line banner over the terminals. */
+.warp-indicator.connection-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.1;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: auto;
+}
+.warp-indicator.connection-indicator small {
+  font-size: 11px;
+  font-weight: normal;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.8;
+}
+.warp-indicator[data-connection="degraded"] {
+  color: rgba(255, 176, 60, 0.95);
+  border-color: rgba(255, 176, 60, 0.5);
+}
+.warp-indicator[data-connection="offline"] {
+  color: rgba(200, 196, 204, 0.9);
+  border-color: rgba(220, 80, 80, 0.6);
+  animation: connection-offline-pulse 2.4s ease-in-out infinite;
+}
+@keyframes connection-offline-pulse {
+  0%, 100% { border-color: rgba(220, 80, 80, 0.35); }
+  50%      { border-color: rgba(220, 80, 80, 0.85); }
+}
+
+.connection-banner {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 12px;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+.connection-banner[data-connection="degraded"] {
+  color: #1a1200;
+  background: rgba(255, 176, 60, 0.85);
+}
+.connection-banner[data-connection="offline"] {
+  color: #f0e6e6;
+  background: rgba(160, 50, 50, 0.85);
+}
+
+/* Status glyphs are stale while offline: grey them so a frozen green dot
+   can't pass for a live one. */
+.project-status.stale,
+.workstream-status.stale {
+  filter: grayscale(1);
+  opacity: 0.45;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warp-indicator[data-connection="offline"] { animation: none; }
+}

@@ -4,6 +4,8 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { contextLevel } from './utils/thresholds';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ProjectProvider } from './contexts/ProjectContext';
+import { ConnectionProvider, useConnection } from './contexts/ConnectionContext';
+import { formatSince } from './utils/connection';
 import { ProjectControl } from './components/ProjectControl';
 import { Terminal } from './components/Terminal';
 import { Hyperspace } from './components/Hyperspace';
@@ -63,6 +65,7 @@ function useIsNarrow(defaultBreakpoint = 1600) {
 function MainLayout() {
   const { user } = useAuthHook();
   const { projects, activeProjectId, statusMap, getActiveWorkstream } = useProjects();
+  const connection = useConnection();
 
   const activeProject = projects.find(p => p.id === activeProjectId);
   const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
@@ -122,9 +125,16 @@ function MainLayout() {
   // the current value without being torn down and rebuilt on every render.
   const targetWarpRef = useRef(warpModel.targetWarp);
   useEffect(() => { targetWarpRef.current = warpModel.targetWarp; });
+  // Skip samples while offline: they fail anyway (and the failures are
+  // already counted by the axios interceptor via the probe loop), and once
+  // reconnected a burst of queued values would record activity that never
+  // happened. Degraded still samples — that traffic doubles as evidence.
+  const connectionRef = useRef(connection.state);
+  useEffect(() => { connectionRef.current = connection.state; });
   useEffect(() => {
     if (!user) return;
     const id = setInterval(() => {
+      if (connectionRef.current === 'offline') return;
       warpApi.sample(targetWarpRef.current);
     }, 5000);
     return () => clearInterval(id);
@@ -189,6 +199,7 @@ function MainLayout() {
           typingBoost={typing}
           targetWarp={warpModel.targetWarp}
           onWarpChange={setWarpSpeed}
+          connection={connection.state}
         />
       </div>
       <div className={`app-sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
@@ -215,12 +226,37 @@ function MainLayout() {
             scrolls to a hard stop here instead of sliding underneath them. */}
         <div className="app-sidebar-footer">
           <UsageMini />
-          <div className="warp-indicator" data-active={isActive || undefined}>
-            {warpStr}<em>c</em>
-          </div>
+          {connection.state === 'online' ? (
+            <div className="warp-indicator" data-active={isActive || undefined}>
+              {warpStr}<em>c</em>
+            </div>
+          ) : (
+            // The speed readout is meaningless without live statuses; use its
+            // slot for the connection state so the sidebar says what the
+            // starfield is showing.
+            <div
+              className="warp-indicator connection-indicator"
+              data-connection={connection.state}
+              title={connection.lastContactAt
+                ? `Last contact with termag: ${new Date(connection.lastContactAt).toLocaleTimeString()}`
+                : 'No contact with termag yet'}
+            >
+              {connection.state === 'offline' ? 'offline' : 'reconnecting'}
+              {connection.lastContactAt != null && (
+                <small>{formatSince(connection.now - connection.lastContactAt)}</small>
+              )}
+            </div>
+          )}
         </div>
       </div>
       <div className="app-terminals">
+        {connection.state !== 'online' && (
+          <div className="connection-banner" data-connection={connection.state} role="status" aria-live="polite">
+            {connection.state === 'offline'
+              ? <>Connection to termag lost{connection.lastContactAt != null && <> · last contact {formatSince(connection.now - connection.lastContactAt)} ago</>} · statuses below are stale · retrying</>
+              : <>Reconnecting to termag…</>}
+          </div>
+        )}
         <div className="app-project-bar">
           {activeProject ? (
             activeWorkstream === 'main'
@@ -398,9 +434,11 @@ export default function App() {
           path="/*"
           element={
             <RequireAuth>
-              <ProjectProvider>
-                <MainLayout />
-              </ProjectProvider>
+              <ConnectionProvider>
+                <ProjectProvider>
+                  <MainLayout />
+                </ProjectProvider>
+              </ConnectionProvider>
             </RequireAuth>
           }
         />

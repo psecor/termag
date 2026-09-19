@@ -3,6 +3,7 @@ import { Terminal as XTerm } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import 'xterm/css/xterm.css';
+import { useConnection } from '../contexts/ConnectionContext';
 
 interface TerminalProps {
   sessionName: string;
@@ -22,11 +23,13 @@ const MOUSE_TRACKING_RE = /\x1b\[\?(9|1000|1002|1003|1004|1005|1006|1015|1016)[h
 // Sequences to disable all mouse tracking modes in xterm.js
 const DISABLE_MOUSE = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 
-// Reconnect schedule. Five attempts with exponential-ish backoff covers
-// most transient blips (agent restart ~10s, server restart, network hiccup)
-// before we ask the user to intervene.
-const RECONNECT_DELAYS_MS = [0, 500, 1000, 2000, 4000];
-const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
+// Reconnect schedule. The first five attempts (~7.5s total) cover transient
+// blips — agent restart, server restart, network hiccup — after which we
+// surface the overlay. Retries then CONTINUE indefinitely at the capped
+// delay, so a pane left open through a longer outage (VPN drop, laptop
+// sleep) comes back on its own instead of sitting dead behind a modal.
+const RECONNECT_DELAYS_MS = [0, 500, 1000, 2000, 4000, 8000, 15_000, 30_000];
+const FAILED_AFTER_ATTEMPTS = 5;
 
 type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
@@ -139,6 +142,18 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
   // Stable reference the modal "Try again" button can invoke. Set inside the
   // useEffect that owns the connection lifecycle.
   const retryRef = useRef<(() => void) | null>(null);
+
+  // App-level reachability. When the backend comes back, kick this pane's
+  // reconnect immediately instead of waiting out a 30s backoff slot.
+  const { state: globalConnection } = useConnection();
+  const prevGlobalRef = useRef(globalConnection);
+  useEffect(() => {
+    const was = prevGlobalRef.current;
+    prevGlobalRef.current = globalConnection;
+    if (was !== 'online' && globalConnection === 'online' && connectionState !== 'connected') {
+      retryRef.current?.();
+    }
+  }, [globalConnection, connectionState]);
 
   useEffect(() => {
     if (autoFocus && termRef.current) {
@@ -275,20 +290,17 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         ws.onclose = () => {
           wsRef.current = null;
           if (disposed) return;
-          if (attempt + 1 < MAX_RECONNECT_ATTEMPTS) {
-            attempt += 1;
-            setRetryAttempt(attempt);
-            setConnectionState('reconnecting');
-            const delay = RECONNECT_DELAYS_MS[attempt] ?? RECONNECT_DELAYS_MS[RECONNECT_DELAYS_MS.length - 1];
-            retryTimer = setTimeout(() => {
-              retryTimer = null;
-              connect();
-            }, delay);
-          } else {
-            // Exhausted automatic retries — surface the modal so the user
-            // can hit "Try again" rather than staring at a dead terminal.
-            setConnectionState('failed');
-          }
+          attempt += 1;
+          setRetryAttempt(attempt);
+          // Past the quick-retry budget, surface the overlay so the user can
+          // force a retry — but keep the automatic loop going at the capped
+          // delay so recovery doesn't depend on them noticing.
+          setConnectionState(attempt >= FAILED_AFTER_ATTEMPTS ? 'failed' : 'reconnecting');
+          const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            connect();
+          }, delay);
         };
 
         ws.onerror = () => {
@@ -479,16 +491,26 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       </button>
       {connectionState === 'reconnecting' && (
         <div className="terminal-reconnect-pill" aria-live="polite">
-          Reconnecting… ({retryAttempt}/{MAX_RECONNECT_ATTEMPTS - 1})
+          Reconnecting… ({retryAttempt}/{FAILED_AFTER_ATTEMPTS - 1})
         </div>
       )}
-      {connectionState === 'failed' && (
+      {/* When the whole backend is unreachable the app-level banner and the
+          starfield already say so; one modal per pane on top of that is
+          noise, and its "check the box agent" advice is wrong. Show a quiet
+          pill instead and let the global recovery re-trigger the connect. */}
+      {connectionState === 'failed' && globalConnection !== 'online' && (
+        <div className="terminal-reconnect-pill" aria-live="polite">
+          {globalConnection === 'offline' ? 'offline' : 'reconnecting…'}
+        </div>
+      )}
+      {connectionState === 'failed' && globalConnection === 'online' && (
         <div className="terminal-reconnect-overlay" role="alertdialog" aria-modal="true">
           <div className="terminal-reconnect-panel">
             <div className="terminal-reconnect-title">Terminal disconnected</div>
             <div className="terminal-reconnect-message">
-              Couldn't reach the agent for <code>{sessionName}</code> after {MAX_RECONNECT_ATTEMPTS - 1} retries.
+              Couldn't reach the agent for <code>{sessionName}</code> after {retryAttempt} retries.
               The tmux session is probably still alive — try again, or check that the box agent is connected.
+              Retrying automatically in the background.
             </div>
             <button
               className="terminal-reconnect-button"

@@ -5,6 +5,7 @@ import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValu
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
+import { useConnection } from '../contexts/ConnectionContext';
 import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, metatermApi, AgentTokenInfo } from '../services/api';
 import { sessionName as buildSessionName } from '../utils/sessionName';
 
@@ -134,6 +135,11 @@ export function ProjectControl() {
       return () => clearTimeout(timer);
     }
   }, [statusMap, projects, user?.unixUsername]);
+
+  // While the backend is unreachable every status glyph is a frozen snapshot;
+  // grey them so a stale green can't pass for a live one.
+  const { state: connectionState } = useConnection();
+  const statusesStale = connectionState === 'offline';
 
   // Sharing / invites
   const [invites, setInvites] = useState<ProjectInvite[]>([]);
@@ -576,7 +582,7 @@ export function ProjectControl() {
             onClick={e => e.stopPropagation()}
           />
         )}
-        <span className="project-status">
+        <span className={`project-status${statusesStale ? ' stale' : ''}`}>
           {statusEmoji(p)}
           {rateLimit ? (
             <span className="rate-limit-badge" title={rateLimit} />
@@ -803,7 +809,7 @@ export function ProjectControl() {
                         onClick={() => { setActiveProject(p.id); setActiveWorkstream(p.id, ws.name); }}
                         title={`branch: ${ws.branch}`}
                       >
-                        <span className="workstream-status">
+                        <span className={`workstream-status${statusesStale ? ' stale' : ''}`}>
                           {wsHasAgent ? STATUS_EMOJI[wsStatus] : '—'}
                         </span>
                         <span className="workstream-marker">↳</span>
