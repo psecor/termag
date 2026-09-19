@@ -13,8 +13,8 @@
 // provisioner. That means no GitHub PAT is ever needed (at bake OR at boot),
 // and the running instance never clones or `npm`-builds anything: cloud-init
 // only does per-instance runtime config (mount EBS, render .env, start
-// Postgres + the service). Your own Terraform module is expected to supply
-// the per-instance cloud-init template.
+// Postgres + the service). See the orchestrator Terraform module's cloud-init
+// template.
 //
 // The image is SSM-only — same VPC/SSM-tunnel story as box.pkr.hcl.
 //
@@ -25,8 +25,8 @@
 //     -var termag_baked_sha=$(git rev-parse HEAD) \
 //     orchestrator.pkr.hcl
 //
-// The resulting AMI is tagged App=termag, Component=orchestrator — the
-// expected discovery key for your launching Terraform.
+// The resulting AMI is tagged App=termag, Component=orchestrator — which is how
+// the orchestrator Terraform module discovers the latest image to launch.
 
 packer {
   required_plugins {
