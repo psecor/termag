@@ -55,7 +55,11 @@ variable "region" {
 
 variable "instance_type" {
   type        = string
-  description = "Default is Graviton arm64; the AMI is arm64-only"
+  description = <<-EOT
+    Default is Graviton arm64; the AMI is arm64-only. Must be a
+    NitroTPM-supported type so the baked TPM 2.0 device is available — all
+    current Graviton families qualify (t4g, m6g/m7g/m8g/m9g, c6g–c8g, r6g–r8g).
+  EOT
   default     = "t4g.medium"
 }
 

@@ -3,10 +3,15 @@ Description=Termag per-user agent
 After=network.target
 
 [Service]
-# %h = invoking user's $HOME. Adjust the agent/ path if you cloned termag
-# somewhere other than ~/src/termag. Avoid ~/termag/, since termag's project
-# dirs live at ~/termag/projects/<name>/ and a clone there will collide.
-ExecStart=/usr/bin/node %h/src/termag/agent/agent.js %h/src/termag/agent/agent.config.json
+# nvm-only: there is no system node. Source nvm so `node` (and `codex`, which
+# agent.js spawns directly) resolve from the user's nvm install. The default
+# alias is set at bake time (`nvm alias default lts/*`). $HOME is set by the
+# systemd user manager, so this works under any owner after the box rename.
+#
+# Adjust the agent/ path if you cloned termag somewhere other than ~/src/termag.
+# Avoid ~/termag/, since termag's project dirs live at ~/termag/projects/<name>/
+# and a clone there will collide.
+ExecStart=/bin/bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; exec node "$HOME/src/termag/agent/agent.js" "$HOME/src/termag/agent/agent.config.json"'
 Restart=always
 RestartSec=5
 

@@ -16,7 +16,8 @@ exec > >(tee /var/log/termag-cloudinit.log) 2>&1
 # otherwise invisible — you see the "starting" line and nothing else, with no
 # hint of which command died. The ERR trap logs the failing line + command so
 # a stuck box is diagnosable straight from the cloud-init log.
-trap 'rc=$?; echo "=== termag box cloud-init FAILED at line ${LINENO} (exit ${rc}): ${BASH_COMMAND} ==="' ERR
+# $$ escapes the templatefile interpolation so these reach bash as shell vars.
+trap 'rc=$?; echo "=== termag box cloud-init FAILED at line $${LINENO} (exit $${rc}): $${BASH_COMMAND} ==="' ERR
 echo "=== termag box cloud-init starting at $(date -Iseconds) ==="
 
 UNIX_USER="${remote_unix_user}"
@@ -38,6 +39,14 @@ usermod -l "$UNIX_USER" -d "/home/$UNIX_USER" -m termag
 groupmod -n "$UNIX_USER" termag
 USER_UID=$(id -u "$UNIX_USER")
 
+# ── Step 2b: re-assert passwordless sudo for the renamed owner ───────────
+# The AMI bakes `termag` into the `sudo` group + a group-keyed NOPASSWD policy
+# (/etc/sudoers.d/90-termag-box) so the box owner can install their own tooling.
+# usermod -l doesn't reliably carry supplementary-group membership across the
+# rename, so add the final username back to the `sudo` group explicitly. The
+# sudoers policy itself is group-keyed, so it needs no edit here.
+usermod -aG sudo "$UNIX_USER"
+
 # Steps 3–4 are best-effort cosmetic cleanup of the `/home/termag` prefix the
 # AMI bake leaves behind. They must NEVER abort the boot — the load-bearing
 # work is Steps 5–8 (write the agent token + start the agent). So every
@@ -56,13 +65,53 @@ find "/home/$UNIX_USER" -type l -lname '/home/termag/*' 2>/dev/null | while read
   ln -sfn "$newtarget" "$link"
 done || true
 
-# ── Step 4: rewrite text configs that reference /home/termag ─────────────
-# devin's config.json has the old home dir baked in. Add other paths here
-# if future agent CLIs grow the same pattern. Guard each pipeline with
-# `|| true` so a missing path or no-match grep doesn't strand the boot.
-if [ -f "/home/$UNIX_USER/.config/devin/config.json" ]; then
-  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json" || true
-fi
+# ── Step 4: rewrite /home/termag baked into text files ───────────────────
+# The AMI bakes the full devbox toolset under /home/termag: pyenv/goenv
+# shims, nvm npm-global shebangs, uv tool wrappers, poetry, the devin
+# config, etc. all hardcode that path. After the rename, sweep the toolchain
+# dirs and rewrite the prefix. `grep -I` skips binaries so we only touch
+# scripts/configs; the dirs are scoped so the sweep stays fast.
+#
+# `grep` exits 1 when a dir has no match — a binaries-only ~/.cargo, or *any*
+# dir on an AMI built before the toolset was baked in (the dirs may not even
+# exist). Without the `|| true` guard that 1 propagates through `pipefail`
+# and `set -e` aborts the whole boot before the agent is ever started,
+# silently stranding the box (it shows `provisioning → failed` after the
+# orchestrator's 15-minute sweep). Guard so a no-match is a clean no-op.
+echo "=== step 4: rewriting /home/termag in toolchain dirs ==="
+for d in .pyenv .goenv .nvm .local .cargo .config; do
+  dir="/home/$UNIX_USER/$d"
+  [ -d "$dir" ] || continue
+  { grep -rIl --null '/home/termag' "$dir" 2>/dev/null || true; } \
+    | xargs -0 -r sed -i "s|/home/termag|/home/$UNIX_USER|g" || true
+done
+
+# ── Step 4b: make the renamed pyenv libs findable ────────────────────────
+# Step 4 only rewrites *text* files -- `grep -I` deliberately skips binaries.
+# But CPython built with --enable-shared records the bake-time library path in
+# its ELF RUNPATH, and that path (/home/termag/.pyenv/...) no longer exists
+# after the rename. The result is a python3 that cannot start at all:
+#
+#   libpython3.13.so.1.0: cannot open shared object file
+#
+# which then silently breaks anything shelling out to python3 -- including the
+# Claude Code Notification hook. Point the dynamic linker at the real location
+# instead of trying to rewrite the RUNPATH. Version-agnostic on purpose: it
+# picks up whatever pyenv versions the AMI happens to carry.
+#
+# Guarded like Steps 3-4: cosmetic relative to Steps 5-8, so it must never
+# abort the boot and strand the box without a running agent.
+echo "=== step 4b: registering pyenv lib dirs with the dynamic linker ==="
+{
+  : > /etc/ld.so.conf.d/pyenv.conf
+  for libdir in /home/"$UNIX_USER"/.pyenv/versions/*/lib; do
+    [ -d "$libdir" ] || continue
+    ls "$libdir"/libpython*.so* >/dev/null 2>&1 || continue
+    echo "$libdir" >> /etc/ld.so.conf.d/pyenv.conf
+    echo "  + $libdir"
+  done
+  ldconfig
+} || echo "WARNING: step 4b failed; python3 may not start (non-fatal)"
 
 # ── Step 5: drop the agent's bearer token ────────────────────────────────
 # The baked systemd unit reads $HOME/src/termag/agent/agent.config.json

@@ -1,11 +1,12 @@
 // Packer template for the termag box AMI.
 //
 // Builds an Ubuntu 24.04 arm64 image with everything a termag box needs at
-// runtime: system packages, agent CLIs (claude/cursor/devin), termag-agent
-// code pre-cloned, agent-wiki pre-cloned, the termag unix user with linger.
+// runtime: system packages, agent CLIs (claude/cursor/devin), this checkout's
+// termag source (the agent runs from it), agent-wiki pre-cloned, the termag
+// unix user with linger.
 //
-// The image is SSM-only. We deliberately don't open inbound SSH — LD's dev
-// VPC NACL blocks it anyway. Provisioning happens through SSM Session
+// The image is SSM-only. We deliberately don't open inbound SSH — a locked-down
+// dev VPC's NACL blocks it anyway. Provisioning happens through SSM Session
 // Manager (ssh_interface = "session_manager"), so the build instance never
 // needs a public SG rule.
 //
@@ -13,8 +14,18 @@
 //   packer init .
 //   packer build box.pkr.hcl
 //
-// The resulting AMI is tagged App=termag, Component=box, plus the git commit
-// the install script cloned.
+// The resulting AMI is tagged App=termag, Component=box, plus TermagSha: the
+// commit of this checkout that was shipped into it.
+//
+// NitroTPM: every box gets a TPM 2.0 device so on-box utilities (LUKS via
+// systemd-cryptenroll, Vault attestation, IMA, sealed secrets) can use it.
+// NitroTPM is an *AMI attribute* (TpmSupport=v2.0 + BootMode=uefi), not a
+// launch-time flag — instances inherit it automatically, so terraform/box and
+// the SDK box provisioner need no change. The amazon-ebs builder creates the
+// image via the CreateImage API, which can't set TpmSupport (only RegisterImage
+// can), so the `enable-nitrotpm` post-processor re-registers the baked snapshot
+// with NitroTPM enabled and hands it the Component=box discovery tag. See
+// scripts/enable-nitrotpm.sh.
 
 packer {
   required_plugins {
@@ -52,15 +63,23 @@ variable "ami_name_prefix" {
   default = "termag-box"
 }
 
-variable "termag_repo_url" {
-  type    = string
-  default = "https://github.com/psecor/termag.git"
+variable "termag_baked_sha" {
+  type        = string
+  default     = "unknown"
+  description = "git SHA of this repo's checkout the image was baked from. The build ships a git bundle of that checkout, cloned to ~termag/src/termag (the agent runs from it), alongside this template, scripts/setup.sh and the deploy/ files, so the image content is exactly this commit; setup.sh fails the bake if the bundle's HEAD disagrees. Set by CI to github.sha and recorded on the AMI's TermagSha tag, which the scheduled staleness check compares against main. Without it that check cannot tell a current image from a stale one."
 }
 
-variable "termag_ref" {
+locals {
+  // Where scripts/bundle-source.sh writes the git bundle of the checkout being
+  // baked (plus a "<bundle>.origin" sidecar with the checkout's remote URL).
+  // Gitignored; the file provisioners below ship both.
+  termag_bundle = "${path.root}/termag.bundle"
+}
+
+variable "final_component_tag" {
   type        = string
-  default     = "master"
-  description = "git ref to clone for the baked termag source"
+  default     = "box"
+  description = "Component tag the NitroTPM post-processor puts on the finished AMI. \"box\" is the discovery tag the box provisioner and terraform/box look up, so the image becomes what new boxes launch from. Anything else (CI uses \"box-candidate\") bakes a real image that discovery ignores, for validating a branch without shipping it."
 }
 
 variable "agent_wiki_repo_url" {
@@ -113,11 +132,21 @@ source "amazon-ebs" "termag_box" {
     delete_on_termination = true
   }
 
+  // Intermediate, NitroTPM-less image. The enable-nitrotpm post-processor
+  // re-registers this with TpmSupport=v2.0 and moves the Component=box
+  // discovery tag onto the NitroTPM AMI, then deregisters this one. Tagging it
+  // "box-base" (not "box") guarantees newest-by-tag discovery can only ever
+  // resolve to a NitroTPM image — if the re-register step fails, no Component=box
+  // AMI is produced for this build and discovery falls back to the last good one.
+  //
+  // TermagSha is what the Publish AMI schedule diffs against main to decide
+  // whether a bake is due. The NitroTPM post-processor copies every tag except
+  // Component onto the final image, so it survives onto the discoverable AMI.
   tags = {
     App         = "termag"
-    Component   = "box"
+    Component   = "box-base"
     BaseImage   = "ubuntu-24.04-arm64"
-    TermagRef   = var.termag_ref
+    TermagSha   = var.termag_baked_sha
     BuiltBy     = "packer"
   }
 
@@ -166,14 +195,77 @@ build {
     destination = "/tmp/termag-status"
   }
 
+  // The termag source itself: a git bundle of the checkout being baked, with
+  // its full history and nothing else (a bundle is objects + refs: no
+  // credentials, no node_modules, nothing untracked). What lands on the box is
+  // exactly the commit TermagSha names, so a merge to main reaches new boxes
+  // through the scheduled bake with no remote clone and no PAT. Cut on the
+  // host running packer; the file provisioners ship the bundle and its origin
+  // sidecar, and setup.sh clones it to ~termag/src/termag.
+  //
+  // `generated = true`: the files do not exist at `packer validate` time.
+  provisioner "shell-local" {
+    environment_vars = ["BUNDLE=${local.termag_bundle}"]
+    scripts          = ["${path.root}/scripts/bundle-source.sh"]
+  }
+
+  provisioner "file" {
+    source      = local.termag_bundle
+    destination = "/tmp/termag.bundle"
+    generated   = true
+  }
+
+  provisioner "file" {
+    source      = "${local.termag_bundle}.origin"
+    destination = "/tmp/termag.bundle.origin"
+    generated   = true
+  }
+
+  provisioner "file" {
+    // Reconciles the installed box artifacts against the checkout on every
+    // boot, so a merged fix in deploy/ reaches a running box without a bake.
+    source      = "${path.root}/../deploy/termag-reconcile"
+    destination = "/tmp/termag-reconcile"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/../deploy/termag-reconcile.service"
+    destination = "/tmp/termag-reconcile.service"
+  }
+
   provisioner "shell" {
     script = "${path.root}/scripts/setup.sh"
     environment_vars = [
-      "TERMAG_REPO_URL=${var.termag_repo_url}",
-      "TERMAG_REF=${var.termag_ref}",
+      "TERMAG_BAKED_SHA=${var.termag_baked_sha}",
       "AGENT_WIKI_REPO_URL=${var.agent_wiki_repo_url}",
     ]
-    // Long install — apt/snap/npm chains can take a while.
-    timeout = "30m"
+    // Long install — the full devbox toolset (apt/snap/npm + Go/Python/Rust
+    // toolchain builds + cargo-building rtk) can take a while.
+    timeout = "45m"
+  }
+
+  // NitroTPM re-register. amazon-ebs bakes the image via CreateImage (no
+  // TpmSupport support); this re-registers its root snapshot via RegisterImage
+  // with --boot-mode uefi --tpm-support v2.0, then tags the NitroTPM AMI
+  // Component=<final_component_tag> (box = discoverable, anything else = a
+  // candidate discovery ignores) and retires the intermediate. Runs on
+  // the host running packer — needs the AWS CLI v2 + jq (same creds as the
+  // build).
+  post-processors {
+    post-processor "manifest" {
+      output     = "${path.root}/packer-manifest.json"
+      strip_path = true
+    }
+    post-processor "shell-local" {
+      environment_vars = [
+        "AWS_REGION=${var.region}",
+        "MANIFEST=${path.root}/packer-manifest.json",
+        "FINAL_COMPONENT_TAG=${var.final_component_tag}",
+        // The post-processor writes the published AMI id here so CI's verify
+        // step can wait on that exact image. Gitignored.
+        "NITROTPM_AMI_ID_FILE=${path.root}/nitrotpm-ami-id",
+      ]
+      scripts = ["${path.root}/scripts/enable-nitrotpm.sh"]
+    }
   }
 }

@@ -227,12 +227,44 @@ find "/home/$UNIX_USER" -type l -lname '/home/termag/*' | while read link; do
   ln -sfn "$newtarget" "$link"
 done
 
-# ── Step 4: rewrite text configs that reference /home/termag ─────────────
-# Guard with || true so a missing file or no-match doesn't abort first-boot
-# under set -euo pipefail (which would strand the box before the agent starts).
-if [ -f "/home/$UNIX_USER/.config/devin/config.json" ]; then
-  sed -i "s|/home/termag|/home/$UNIX_USER|g" "/home/$UNIX_USER/.config/devin/config.json" || true
-fi
+# ── Step 4: rewrite /home/termag baked into text files ───────────────────
+# The AMI bakes the full devbox toolset under /home/termag: pyenv/goenv
+# shims, nvm npm-global shebangs, uv tool wrappers, poetry, the devin
+# config, etc. all hardcode that path. After the rename, sweep the toolchain
+# dirs and rewrite the prefix. \`grep -I\` skips binaries so we only touch
+# scripts/configs; the dirs are scoped so the sweep stays fast.
+for d in .pyenv .goenv .nvm .local .cargo .config; do
+  dir="/home/$UNIX_USER/$d"
+  [ -d "$dir" ] || continue
+  # grep exits 1 when a scoped dir has no /home/termag references (common on a
+  # box AMI without the full toolset baked, e.g. .local/.config). Guard it so
+  # set -euo pipefail doesn't abort the whole first-boot before the agent ever
+  # starts (which surfaces as "Box never connected within 15 minutes").
+  { grep -rIl --null '/home/termag' "$dir" 2>/dev/null || true; } \\
+    | xargs -0 -r sed -i "s|/home/termag|/home/$UNIX_USER|g" || true
+done
+
+# ── Step 4b: make the renamed pyenv libs findable ────────────────────────
+# Step 4 only rewrites *text* files -- \`grep -I\` deliberately skips binaries.
+# But CPython built with --enable-shared records the bake-time library path in
+# its ELF RUNPATH, and /home/termag/.pyenv/... no longer exists after the
+# rename, so python3 cannot start at all:
+#
+#   libpython3.13.so.1.0: cannot open shared object file
+#
+# Anything shelling out to python3 fails with it, including the Claude Code
+# Notification hook. Point the dynamic linker at the real location rather than
+# rewriting RUNPATHs. Guarded like Steps 3-4: never abort the boot.
+echo "=== step 4b: registering pyenv lib dirs with the dynamic linker ==="
+{
+  : > /etc/ld.so.conf.d/pyenv.conf
+  for libdir in /home/"$UNIX_USER"/.pyenv/versions/*/lib; do
+    [ -d "$libdir" ] || continue
+    ls "$libdir"/libpython*.so* >/dev/null 2>&1 || continue
+    echo "$libdir" >> /etc/ld.so.conf.d/pyenv.conf
+  done
+  ldconfig
+} || echo "WARNING: step 4b failed; python3 may not start (non-fatal)"
 
 # ── Step 5: drop the agent's bearer token ────────────────────────────────
 CONFIG_PATH="/home/$UNIX_USER/src/termag/agent/agent.config.json"

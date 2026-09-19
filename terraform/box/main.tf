@@ -45,6 +45,11 @@ resource "aws_security_group" "box" {
   }, var.extra_tags)
 }
 
+// NitroTPM (TPM 2.0) is baked into the AMI (TpmSupport=v2.0 + BootMode=uefi);
+// instances launched from it expose /dev/tpm0 + /dev/tpmrm0 automatically — no
+// launch-time flag here. The only constraint is that instance_type must be a
+// NitroTPM-supported type (all current Graviton M/C/R/T families qualify,
+// including the t4g default and m8g); see variables.tf.
 resource "aws_instance" "box" {
   ami           = data.aws_ami.termag_box.id
   instance_type = var.instance_type

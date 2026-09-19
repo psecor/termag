@@ -21,7 +21,7 @@ stubbed as "user-driven Terraform." Most of the skeleton is already present.
 | WS auth | `backend/src/index.ts` (`/ws/agent`) | `validateAgentToken` (in `routes/agentTokens.ts`) looks up `tokenHash`, returns `{user, instance}`. **Needs no changes.** |
 | Box shape (reference) | `terraform/box/` | V1 Terraform: egress-only SG, IMDSv2 instance, `cloudinit.sh.tftpl` that writes `agent.config.json {termag_url, token, path_remap}` and starts the agent systemd user unit. |
 | Box AMI | `packer/` | Prebakes repo, agent CLIs, `termag` user + linger, the `termag-agent.service` unit. |
-| Guardrails | Your IAM-grant Terraform | IAM grant + outputs (`box_resource_prefix`, `box_permissions_boundary_arn`, `box_managed_tag`, `agent_ws_url`) built specifically so the orchestrator can launch boxes via the SDK within a locked blast radius. |
+| Guardrails | your IAM-grant Terraform (the orchestrator module's box-provisioning grant) | IAM grant + outputs (`box_resource_prefix`, `box_permissions_boundary_arn`, `box_managed_tag`, `agent_ws_url`) built specifically so the orchestrator can launch boxes via the SDK within a locked blast radius. |
 
 **The missing piece is the bridge:** a backend service that, instead of handing
 the user a token to paste into Terraform, calls the AWS SDK itself to launch the
@@ -145,16 +145,35 @@ out-of-band for OAuth only).
 - **`packer/` is load-bearing — keep it.** It builds the AMI that "discover
   newest by tag" finds and that `RunInstances` boots. It prebakes everything
   slow/stable: system packages, AWS CLI v2, Node LTS, `gh`, the `termag` user
-  **with linger**, the agent CLIs (claude/cursor/devin), the repo clone at
-  `~termag/src/termag` + the agent's `npm install`, and the
+  **with linger**, the agent CLIs (claude/cursor/devin), the termag checkout
+  being baked cloned (full history) to `~termag/src/termag` + the agent's
+  `npm install`, and the
   `termag-agent.service` user unit. The SDK only injects per-box runtime config
   on top.
   - The **tag contract is now an API** — don't change `App=termag,
-    Component=box` casually.
+    Component=box` casually. Note `amazon-ebs` now tags its raw output
+    `Component=box-base`; a post-processor re-registers it with NitroTPM and
+    moves `Component=box` onto the NitroTPM image (see below). Discovery
+    (`Component=box`) is unchanged — it just resolves to the NitroTPM AMI.
+  - **NitroTPM (TPM 2.0) is baked into the AMI** (`TpmSupport=v2.0` +
+    `BootMode=uefi`). Instances inherit it automatically — `RunInstances`/the
+    SDK provisioner needs **no** TPM flag. Just keep `BOX_INSTANCE_TYPE` on a
+    NitroTPM-supported type (all current Graviton families qualify). See
+    `packer/README.md` → "NitroTPM" and `scripts/enable-nitrotpm.sh`.
   - AMI is **arm64-only** → `BOX_INSTANCE_TYPE` must be Graviton.
-  - packer defaults clone `psecor/termag`; point it at the deployed fork/ref.
-  - Today it's a manual `packer build`; eventually automate rebuilds so the
-    newest-by-tag AMI tracks master.
+  - The termag source on a box is **this checkout, not a remote clone**:
+    `packer/scripts/bundle-source.sh` bundles the commit being baked (full
+    history, no credentials) and `setup.sh` clones it, refusing to bake if
+    HEAD is not the commit the AMI's `TermagSha` tag will name (also written
+    to `~/.termag-baked-sha`). The clone's `origin` is the checkout's own
+    remote URL, so nothing here hardcodes an org.
+  - Rebuilds are automatic on `main`: `publish-ami.yml`'s hourly
+    `check-box-ami` job diffs the published AMI's `TermagSha` against `main`
+    over the inputs that land in the image (`box.pkr.hcl`, the files and
+    scripts it ships, `agent/`, the workflow) and bakes on a difference, or
+    when the image is older than 14 days. After a bake, `build-box` fails
+    unless the published AMI carries `Component=box` and that run's
+    `TermagSha`.
 
 - **`terraform/box/` is the spec, then vestigial.** Everything it declares is
   what `boxProvisioner` re-creates via the SDK; its `cloudinit.sh.tftpl` is the
@@ -162,17 +181,27 @@ out-of-band for OAuth only).
   `AmazonSSMRoleForInstancesQuickSetup`) is **superseded** by the
   per-box-role+boundary decision. Recommendation: keep it through
   implementation as the cloud-init reference + a break-glass manual path, then
-  **delete it** once the button flow is proven — a standalone terraform-managed
-  box is redundant once box lifecycle is owned by the termag backend codebase.
+  **delete it** once the button flow is proven — mirroring how
+  the internal Terraform deleted its standalone box module
+  ("box lifecycle is owned by the termag backend codebase now").
 
 ## Security analysis: token in `user_data`
 
 **What's in `user_data`:** only the per-box agent bearer token
 (`tmag_<64 hex>`, SHA-256-hashed in `agent_tokens`, linked to one `Instance` →
 one `userId`), plus `termag_url`, git name/email, and `remote_unix_user`. **No
-OAuth secrets, no DB password, no git PAT.** (Private-repo clone, if enabled,
-pulls its PAT from `BOX_GIT_TOKEN_SECRET_ARN` via Secrets Manager at boot —
-deliberately not in `user_data`.)
+OAuth secrets, no DB password, no git PAT.**
+
+> **`BOX_GIT_TOKEN_SECRET_ARN` is a grant with no consumer.** This section used
+> to say a private-repo clone "pulls its PAT from `BOX_GIT_TOKEN_SECRET_ARN` via
+> Secrets Manager at boot". `boxProvisioner.ts` does attach the inline read
+> policy for it, but **nothing reads the secret** — neither
+> `cloudinit.sh.tftpl`, nor the TS port of it, nor `packer/scripts/setup.sh`. Nor
+> is it configured in the current deployment: a `secretsmanager:GetSecretValue`
+> call from a live box returns `AccessDeniedException`, which is what an unset
+> `BOX_GIT_TOKEN_SECRET_ARN` (hence no inline policy) looks like. Treat the
+> capability as designed-but-unbuilt; see
+> [Deferred options](#deferred-options-for-unattended-setup).
 
 **What the token grants:** authenticate a WebSocket as *that box's* agent
 (replacing any existing agent for the same `instanceId`). It is a pure
@@ -206,6 +235,62 @@ only narrows the thin edge of a *non-`termag`* principal reading via IMDS
 
 Action item: add a one-line comment in the cloud-init generator noting what's in
 `user_data` and that the boundary is the real control.
+
+## What the box role can actually do
+
+Probed from a live box (`i-0980a62a7c29206dd`, role
+`development-termag-box-*`) rather than read off the policy, because the
+role cannot introspect itself — `iam:ListRolePolicies` on its own role is denied.
+
+| Call | Result | Consequence |
+|---|---|---|
+| `ssm:GetParameter --with-decryption` on `/development/catfood/dev-server-api-key` | **allowed**, returns the value | the dev-server token needs **no new IAM grant** |
+| `ssm:GetParameter` on an arbitrary name | `ParameterNotFound`, not `AccessDenied` | the SSM read is **broad, not parameter-scoped** |
+| `ecr:GetAuthorizationToken` | `AccessDenied` | image pulls cannot move to boot time |
+| `secretsmanager:GetSecretValue` | `AccessDenied` | `BOX_GIT_TOKEN_SECRET_ARN` is unset here |
+
+The SSM grant is not something termag adds. The only policies
+`createBoxRole` attaches are `AmazonSSMManagedInstanceCore` and — when
+configured — the git-token inline policy, which is demonstrably absent, so the
+parameter read arrives with the managed policy or the permissions boundary.
+
+**This retires a planned change.** An earlier proposal was to grant the box role
+`ssm:GetParameter` on the catfood token so bring-up needed no human auth. That
+grant already exists, so there is nothing to add.
+
+## Deferred options for unattended setup
+
+Three things would each remove a human step. All are deliberately **not** being
+done yet; they are recorded here so the reasoning is not re-derived.
+
+1. **Fetch the dev-server token at boot.** Possible today with no IAM change (see
+   above). Not done because it puts a credential on disk at boot on a box whose
+   whole point is running attacker-influenced AI agents — the same reasoning the
+   `user_data` analysis above applies to the agent token. Fetching it on demand,
+   as `make` already does, keeps the exposure window narrow for no real cost.
+
+2. **Configure and consume `BOX_GIT_TOKEN_SECRET_ARN`.** This is the one lever
+   that would let the repo clones move into cloud-init, because it is the only
+   proposed path to git credentials that does not need the owner present. It
+   needs a PAT provisioned into Secrets Manager, the env var set, and a consumer
+   in both cloud-init paths. Worth weighing against handing every box a
+   long-lived org-scoped PAT.
+
+3. **Seed `~/.ssh/authorized_keys` from the owner's GitHub keys.**
+   `https://github.com/<handle>.keys` serves a user's public keys over plain
+   HTTPS with no authentication — verified returning 200 and two keys for a real
+   handle. If cloud-init received a GitHub username it could seed
+   `authorized_keys` at first boot, and SSH-over-SSM (so `scp`, `rsync`, `ssh -L`
+   port forwarding) would work on a fresh box with no interaction and no secret
+   anywhere.
+
+   This is a cheaper variant of the `User.sshPublicKey` column that step 4c was
+   reverted for (`2393f6f`): a handle is far easier to supply than a key, and
+   `cloudinit.sh.tftpl` already takes owner identity, so it is one more template
+   variable. The trade-off is that it installs **every** key on the GitHub
+   account, which may be broader than the owner intends for box access, and it
+   makes GitHub an authority over box login. Until then, the owner adds the
+   key by hand after first connect.
 
 ## Known issues to fix alongside
 
