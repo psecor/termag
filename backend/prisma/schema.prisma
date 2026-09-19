@@ -29,6 +29,7 @@ model User {
   receivedInvites ProjectInvite[] @relation("receivedInvites")
   visits        ProjectVisit[]
   warpSamples   WarpSample[]
+  tokenUsage    TokenUsageDay[]
   instances     Instance[]
 
   @@map("users")
@@ -91,6 +92,7 @@ model Project {
   invites     ProjectInvite[]
   visits      ProjectVisit[]
   contextSamples ContextSample[]
+  tokenUsage  TokenUsageDay[]
 
   // Name is unique per (user, box). Two boxes can have a project named "termag"
   // without collision. Legacy projects (instanceId NULL) treat NULL as distinct
@@ -106,6 +108,41 @@ model Project {
 // Mirrors WarpSample: an in-memory sampler (services/contextSampler.ts) buckets
 // contextTokens reports per minute and upserts one row per (project, workstream,
 // minute). meanTokens/maxTokens summarize the minute.
+// Daily token totals per (user, host, provider, raw source bucket). Written by
+// services/tokenUsageSampler.ts from the agents' `usage-scan` responses (one
+// row per Claude log directory / Codex cwd / etc.) as ABSOLUTE day totals from
+// an authoritative rescan — so the upsert is idempotent. projectId/workstream
+// are resolved server-side from cwdHint/sourceKey against projectDir(); null =
+// unattributed, kept so user totals stay right. Uniqueness is on the RAW bucket
+// (not the resolved project) so rows can be re-resolved later.
+model TokenUsageDay {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hostKey     String   // Instance.id for a box agent, "legacy" for the per-user agent, "poller" for tmux-poller estimates
+  provider    String   // claude | codex | mistral | cursor | ...
+  date        String   // YYYY-MM-DD. UTC for claude/codex; vibe = local day at session start; poller = server-local
+  sourceKey   String   // claude: encoded log dir; codex: cwd hint or ""; vibe / schema-1 agents: ""
+  cwdHint     String?
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  workstream  String?
+  input       BigInt   @default(0)
+  output      BigInt   @default(0)
+  cacheRead   BigInt   @default(0)
+  cacheCreate BigInt   @default(0)
+  calls       Int      @default(0)
+  estimated   Boolean  @default(false) // poller rows (context-% × window guess), not real counts
+  agentSchema Int      @default(1)     // 1 = schema-1 agent (unattributable), 2 = per-directory buckets
+  scannedAt   DateTime
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, hostKey, provider, date, sourceKey])
+  @@index([userId, date])
+  @@index([projectId, date])
+  @@map("token_usage_days")
+}
+
 model ContextSample {
   id          String   @id @default(cuid())
   projectId   String

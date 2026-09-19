@@ -44,6 +44,7 @@ import { sessionName } from './services/tmux';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
 import { startWarpSampler, stopWarpSampler } from './services/warpSampler';
 import { startContextSampler, stopContextSampler } from './services/contextSampler';
+import { startTokenUsageSampler, stopTokenUsageSampler } from './services/tokenUsageSampler';
 
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
@@ -481,6 +482,7 @@ server.listen(PORT, () => {
   startHumanActivityTracker();
   startWarpSampler();
   startContextSampler();
+  startTokenUsageSampler();
   startProvisioningSweep();
 });
 
@@ -490,6 +492,7 @@ function shutdown() {
   stopHumanActivityTracker();
   stopWarpSampler().catch(() => {});
   stopContextSampler().catch(() => {});
+  stopTokenUsageSampler().catch(() => {});
   // Close all WebSocket connections so the process can exit
   for (const client of wss.clients) {
     client.close(1001, 'server shutting down');
