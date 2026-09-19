@@ -164,21 +164,35 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     if (!user) return;
     let disposed = false;
 
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
     function connect() {
       if (disposed) return;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      // Retire any prior socket with its handlers detached, so its eventual
+      // onclose can't schedule a second reconnect on top of this one.
+      const prev = wsRef.current;
+      if (prev) {
+        prev.onopen = null; prev.onmessage = null; prev.onclose = null; prev.onerror = null;
+        wsRef.current = null;
+        try { prev.close(); } catch { /* ignore */ }
+      }
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${window.location.host}/termag/ws/status`);
       wsRef.current = ws;
+      const isCurrent = () => wsRef.current === ws;
       // Let the ConnectionProvider force-close this socket when it has been
       // silent past the stale threshold (half-open after a VPN drop).
       connectionTracker.closeSocket = () => { try { ws.close(); } catch { /* ignore */ } };
 
       ws.onopen = () => {
+        if (!isCurrent()) { try { ws.close(); } catch { /* ignore */ } return; }
         connectionTracker.setSocketOpen(true);
         connectionTracker.contact();
       };
 
       ws.onmessage = (event) => {
+        if (!isCurrent()) return;
         // Every frame — status pushes and the server's periodic heartbeat —
         // is proof the backend is reachable. Record before parsing so a
         // malformed frame still counts.
@@ -220,15 +234,19 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       };
 
       ws.onclose = () => {
+        if (!isCurrent()) return;
         wsRef.current = null;
         connectionTracker.setSocketOpen(false);
-        if (!disposed) setTimeout(connect, 3000);
+        if (disposed) return;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
       };
     }
 
     connect();
     return () => {
       disposed = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       connectionTracker.closeSocket = null;
       wsRef.current?.close();
     };

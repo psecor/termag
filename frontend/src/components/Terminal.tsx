@@ -235,12 +235,24 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       // itself is created once and reused — only the underlying WS churns.
       const connect = () => {
         if (disposed) return;
-        // Clean up any prior socket reference (defensive — onclose would
-        // already have nulled it, but a Try-again click while the existing
-        // socket is mid-close could land here first).
-        if (wsRef.current) {
-          try { wsRef.current.close(); } catch { /* ignore */ }
+        // Exactly one pending connect at a time. A retry timer and a global
+        // "back online" kick can both want to connect; whichever runs second
+        // must not open a second socket into the same pane.
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        // Retire any prior socket. Detach its handlers FIRST: closing a
+        // socket (even one still CONNECTING) fires its onclose later, and if
+        // that handler were still wired it would null wsRef (clobbering the
+        // new socket) and schedule yet another connect — which is how a
+        // reconnect fanned out into many live attaches to one tmux session,
+        // each writing into the same xterm (output "printed twice").
+        const prev = wsRef.current;
+        if (prev) {
+          prev.onopen = null;
+          prev.onmessage = null;
+          prev.onclose = null;
+          prev.onerror = null;
           wsRef.current = null;
+          try { prev.close(); } catch { /* ignore */ }
         }
         setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
         setRetryAttempt(attempt);
@@ -253,8 +265,12 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         );
         wsRef.current = ws;
 
+        // Belt and braces for the detach above: a socket that is no longer
+        // the current one must never drive state or write to the terminal.
+        const isCurrent = () => wsRef.current === ws;
+
         ws.onopen = () => {
-          if (disposed) { ws.close(); return; }
+          if (disposed || !isCurrent()) { try { ws.close(); } catch { /* ignore */ } return; }
           // A successful (re)open resets the retry budget so a fresh
           // disconnect later gets the full backoff schedule again.
           if (attempt > 0) {
@@ -271,6 +287,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         };
 
         ws.onmessage = (event) => {
+          if (!isCurrent()) return;
           try {
             const msg = JSON.parse(event.data as string) as { type: string; data?: string };
             if (msg.type === 'output' && msg.data) {
@@ -288,6 +305,8 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         };
 
         ws.onclose = () => {
+          // Only the current socket's close means "we lost the connection".
+          if (!isCurrent()) return;
           wsRef.current = null;
           if (disposed) return;
           attempt += 1;
@@ -297,6 +316,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           // delay so recovery doesn't depend on them noticing.
           setConnectionState(attempt >= FAILED_AFTER_ATTEMPTS ? 'failed' : 'reconnecting');
           const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+          if (retryTimer) clearTimeout(retryTimer);
           retryTimer = setTimeout(() => {
             retryTimer = null;
             connect();
