@@ -202,8 +202,9 @@ sudo loginctl enable-linger <username>     # so it runs without an active login
 # wire Claude Code hooks (per user)
 # add the JSON block from deploy/claude-hooks.md to ~/.claude/settings.json
 
-# build a box AMI (one-time per image refresh)
-cd packer && packer init . && packer build box.pkr.hcl
+# build a box AMI (per-template init — `packer init .` errors on dup vars;
+# see packer/README.md for the tag-based discovery new boxes use)
+cd packer && packer init box.pkr.hcl && packer build box.pkr.hcl
 
 # provision a box manually (UI's "Add box" button does this end-to-end)
 cd terraform/box && terraform init && terraform apply
@@ -236,8 +237,8 @@ npm run test:watch
 ```
 
 **No linter or formatter is configured for the TS/JS here** — `npm run build` (`tsc`)
-is the only static check on backend/frontend code. CI covers shell + HCL only
-(`packer/**`, `terraform/box/**`, `deploy/**`); see `.github/workflows/box-ami-ci.yml`.
+is the only static check on backend/frontend code. For `packer/**`, `terraform/box/**`
+and `deploy/**` the checks are `packer validate` and the `deploy/*.test.sh` scripts.
 
 There's no HTTP/DB integration harness, so prefer **extracting logic into pure,
 side-effect-free modules** and unit-testing those — importing a route file like
@@ -353,6 +354,8 @@ harness exists. The frontend has no test runner configured yet.
 29. **The container has no local tmux — `LOCAL_SESSIONS_ENABLED=false`** — the in-process fallbacks in `services/tmux.ts` (used by `routes/projects.ts` / `services/agentRuntime.ts` only for projects with `instanceId == null`) throw `LocalSessionsDisabledError` there. A "legacy" project can therefore not be created or launched on a containerised orchestrator; pin it to a box. Don't "fix" this by installing tmux in the image — the container also has no engineer home directories or unix users.
 
 30. **`~/.local/bin/xclip` is a termag shim, not X11 xclip** — the per-user agent installs `agent/xclip-shim.sh` there on Linux (idempotent, content-compared, on every startup) so Claude Code's Ctrl+V image paste has something to read on a box with no display. A browser paste sends the PNG over the terminal WebSocket, the agent writes `~/.cache/termag/clipboard.png` and only then types `\x16`. The shim answers exactly two invocations — `-t TARGETS -o` (prints `image/png`) and `-t image/png -o` (streams the file, then deletes it) — ignores a mailbox older than 60s, and fails like an empty clipboard for text and every other target. It shadows a real xclip if one is later apt-installed, since `~/.local/bin` usually precedes `/usr/bin` on `PATH`; rename or remove it if a box ever needs the real thing. `agent/xclip-shim.test.sh` covers the probe/read/staleness contract.
+
+31. **`deploy/` is the source of truth, but only `termag-reconcile` makes it true on a running box** — nothing else installs `deploy/` onto the live paths outside an AMI bake, so a box whose checkout is current can still be *running* artifacts from the image it launched from. This is not hypothetical: a live box had the merged `KillMode=process` fix in `~/src/termag/deploy/termag-agent.service` while `~/.config/systemd/user/termag-agent.service` was the baked copy without it, and a 95-line `~/.local/bin/termag-status` that predated the endpoint-resolution fix — two merged fixes, neither in effect. `termag-reconcile.service` now content-compares and installs on every boot, ordered `Before=termag-agent.service` so the agent starts from the reconciled unit and nothing needs restarting. If you add a box-side artifact to `deploy/`, add it to the table in `deploy/termag-reconcile` too, or it will only ever reach boxes through a bake. `claude-settings.json` is deliberately excluded because owners edit it. `termag-reconcile --check` reports drift without changing anything, which is the quickest way to tell whether a box is actually running what you think it is.
 
 ## Related
 
