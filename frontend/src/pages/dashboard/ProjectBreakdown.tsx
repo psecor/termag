@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { SessionRow, WorktimeProjectRow, ContextSeries } from '../../services/api';
+import type { SessionRow, WorktimeProjectRow, ContextSeries, UsageResponse } from '../../services/api';
+import { projectTokensInRange, unattributedInRange } from './usageProjects';
+import { CTX_COLOR } from '../../utils/worktime';
 import type { Project } from '../../types';
 import { PROVIDERS } from '../../providers/registry';
 import { fmtAge, fmtDurationShort, fmtK } from '../../utils/format';
@@ -17,6 +19,7 @@ interface Props {
   sessions: SessionRow[] | null;
   projects: Project[] | null;
   ctx: ContextSeries | null;
+  usage: UsageResponse | null;
   keys: RangeKeys;
   now: number;
   stale: boolean;
@@ -31,6 +34,7 @@ interface Line {
   byProvider: Record<string, number>;
   agentMs: number;
   humanMs: number;
+  tokens: number;
   workstreams: Set<string>;
   // live
   status: SessionRow['status'] | null;
@@ -52,7 +56,7 @@ const SHOW = 12;
  * provider, your time) joined with what's happening right now (live status,
  * current + peak context, last activity). Every row links to the project.
  */
-export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, stale }: Props) {
+export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, now, stale }: Props) {
   const [all, setAll] = useState(false);
 
   const lines = useMemo(() => {
@@ -65,7 +69,7 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
         const p = projectId ? byId.get(projectId) : undefined;
         l = {
           key, projectId, name: p?.name ?? name, color: p?.color ?? null, kind: p?.kind ?? 'normal',
-          byProvider: {}, agentMs: 0, humanMs: 0, workstreams: new Set(),
+          byProvider: {}, agentMs: 0, humanMs: 0, tokens: 0, workstreams: new Set(),
           status: null, waiting: 0, working: 0, alive: 0, ctxNow: 0, ctxPeak: 0, lastActiveAt: p?.lastActiveAt ?? null,
         };
         map.set(key, l);
@@ -101,10 +105,19 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
         : Math.max(0, ...p.days.filter(d => keys.utc.includes(d.date)).map(d => d.peakTokens));
       l.ctxPeak = Math.max(l.ctxPeak, peak);
     }
-    const out = [...map.values()].filter(l => l.agentMs > 0 || l.humanMs > 0 || l.alive > 0 || l.ctxNow > 0);
-    out.sort((a, b) => b.agentMs - a.agentMs || b.humanMs - a.humanMs || (b.lastActiveAt ?? '').localeCompare(a.lastActiveAt ?? ''));
+    // Tokens in range (all workstreams summed); a project that only burned tokens still gets a row.
+    const tokens = projectTokensInRange(usage, keys.utc);
+    for (const [projectId, t] of tokens) {
+      const p = byId.get(projectId);
+      const l = line(projectId, p?.name ?? projectId);
+      l.tokens = t;
+    }
+    const out = [...map.values()].filter(l => l.agentMs > 0 || l.humanMs > 0 || l.alive > 0 || l.ctxNow > 0 || l.tokens > 0);
+    out.sort((a, b) => b.agentMs - a.agentMs || b.tokens - a.tokens || b.humanMs - a.humanMs || (b.lastActiveAt ?? '').localeCompare(a.lastActiveAt ?? ''));
     return out;
-  }, [rows, sessions, projects, ctx, keys]);
+  }, [rows, sessions, projects, ctx, usage, keys]);
+  const unattributedTokens = unattributedInRange(usage, keys.utc);
+  const maxTokens = Math.max(1, ...lines.map(l => l.tokens));
 
   const providersUsed = Object.values(PROVIDERS).filter(p => p.id !== HUMAN && lines.some(l => (l.byProvider[p.id] ?? 0) > 0));
   const series = providersUsed.map(p => ({ id: p.id, label: p.displayName, color: opaque(p.color.base) }));
@@ -113,10 +126,10 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
   const totalAgent = lines.reduce((s, l) => s + l.agentMs, 0);
 
   const table = {
-    columns: ['project', 'agent', ...providersUsed.map(p => p.displayName), 'you', 'status', 'ctx now', 'ctx peak', 'last active'],
+    columns: ['project', 'agent', ...providersUsed.map(p => p.displayName), 'you', 'tokens', 'status', 'ctx now', 'ctx peak', 'last active'],
     rows: lines.map(l => [
       l.name, fmtDurationShort(l.agentMs), ...providersUsed.map(p => fmtDurationShort(l.byProvider[p.id] ?? 0)),
-      fmtDurationShort(l.humanMs), l.status ?? '—', l.ctxNow ? fmtK(l.ctxNow) : '—', l.ctxPeak ? fmtK(l.ctxPeak) : '—',
+      fmtDurationShort(l.humanMs), l.tokens ? fmtK(l.tokens) : '—', l.status ?? '—', l.ctxNow ? fmtK(l.ctxNow) : '—', l.ctxPeak ? fmtK(l.ctxPeak) : '—',
       l.lastActiveAt ? fmtAge(now - Date.parse(l.lastActiveAt)) : '—',
     ]),
   };
@@ -128,7 +141,7 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
       ) : (
         <div className="pb-table" role="table">
           <div className="pb-head" role="row">
-            <span>project</span><span>agents</span><span>you</span><span>now</span><span>ctx</span><span>last active</span>
+            <span>project</span><span>agents</span><span>you</span><span>tokens</span><span>now</span><span>ctx</span><span>last active</span>
           </div>
           {shown.map(l => {
             const lvl = contextLevel(l.ctxNow);
@@ -157,6 +170,12 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
                   </span>
                   <span className="pb-val">{l.humanMs > 0 ? fmtDurationShort(l.humanMs) : '—'}</span>
                 </span>
+                <span className="pb-bar" title={l.tokens ? `${fmtK(l.tokens)} tokens ${keys.label}` : 'no tokens attributed in range'}>
+                  <span className="pb-track">
+                    {l.tokens > 0 && <i style={{ width: `${(l.tokens / maxTokens) * 100}%`, background: l.color ?? CTX_COLOR }} />}
+                  </span>
+                  <span className="pb-val">{l.tokens > 0 ? fmtK(l.tokens) : '—'}</span>
+                </span>
                 <span className="pb-now" title={l.status ?? 'no live session'}>
                   {l.status ? <i className="attn-dot" style={{ background: STATUS_DOT[l.status] }} /> : <i className="attn-dot" style={{ background: 'transparent', border: '1px solid var(--border)' }} />}
                   <span className="usage-dim">{l.status === 'waiting' && l.waiting > 1 ? `${l.waiting} waiting` : l.status === 'working' && l.working > 1 ? `${l.working} working` : (l.status ?? '').replace('_', ' ')}</span>
@@ -176,6 +195,11 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, keys, now, sta
               {all ? 'show fewer' : `+${lines.length - SHOW} more projects`}
             </button>
           )}
+        </div>
+      )}
+      {unattributedTokens > 0 && (
+        <div className="usage-dim dash-card-note">
+          Unattributed tokens {keys.label}: {fmtK(unattributedTokens)} — Claude launched outside a project dir, or a host still on the old agent.
         </div>
       )}
       <SeriesLegend series={series} />

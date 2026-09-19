@@ -134,9 +134,36 @@ export interface UsageDayData {
   calls: number;
 }
 
+// Per-project token usage (server-attributed from each agent's usage-scan). One
+// entry per project × workstream. `unattributed` = tokens the backend couldn't
+// map to a project (Claude launched outside a project dir, or a host still on
+// the old agent — see hosts[].schema === 1). `staleSince` is set when no host
+// has reported for a while; the numbers are last-known, not live.
+export interface UsageProjectSeries {
+  projectId: string;
+  name: string;
+  color: string | null;
+  kind?: string;
+  workstream: string;
+  days: Record<string, UsageDayData>;
+}
+export interface UsageHost {
+  hostKey: string;
+  instanceId: string | null;
+  name: string;
+  connected: boolean;
+  lastScanAt: string | null;
+  schema: 1 | 2 | null;
+  error?: string;
+}
 export interface UsageResponse {
   days: Record<string, UsageDayData>;
   providers?: Record<string, Record<string, UsageDayData>>;
+  projects?: UsageProjectSeries[];
+  unattributed?: Record<string, UsageDayData>;
+  hosts?: UsageHost[];
+  staleSince?: string | null;
+  generatedAt?: string;
 }
 
 export const activityApi = {
@@ -231,6 +258,10 @@ export const visitsApi = {
 export const usageApi = {
   get: (): Promise<UsageResponse> =>
     api.get('/api/usage').then(r => r.data),
+  // Ask the backend to scan every connected agent now (throttled server-side)
+  // and return the fresh payload.
+  rescan: (): Promise<UsageResponse & { throttled?: boolean; agentConnected?: boolean }> =>
+    api.post('/api/usage/rescan').then(r => r.data),
 };
 
 export interface WorktimeDay {

@@ -1520,7 +1520,7 @@ a.attn-item:hover { background: var(--bg-elevated); }
 .pb-table { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
 .pb-head, .pb-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1.4fr) minmax(120px, 2fr) minmax(90px, 1.2fr) 96px 64px 64px;
+  grid-template-columns: minmax(140px, 1.4fr) minmax(120px, 2fr) minmax(80px, 1fr) minmax(90px, 1.2fr) 96px 64px 64px;
   gap: 10px; align-items: center;
   padding: 4px 6px; border-radius: 6px;
   color: inherit; text-decoration: none; min-width: 0;
@@ -1541,9 +1541,20 @@ a.pb-row:hover { background: var(--bg-elevated); }
 .pb-age { text-align: right; white-space: nowrap; font-size: 11px; }
 .pb-more { align-self: flex-start; margin-top: 4px; }
 @media (max-width: 720px) {
-  .pb-head, .pb-row { grid-template-columns: minmax(120px, 1.4fr) minmax(100px, 2fr) 72px 56px; }
-  .pb-head > :nth-child(3), .pb-row > :nth-child(3), .pb-head > :nth-child(6), .pb-row > :nth-child(6) { display: none; }
+  .pb-head, .pb-row { grid-template-columns: minmax(120px, 1.4fr) minmax(100px, 2fr) minmax(70px, 1fr) 72px 56px; }
+  .pb-head > :nth-child(3), .pb-row > :nth-child(3), .pb-head > :nth-child(7), .pb-row > :nth-child(7) { display: none; }
 }
+
+/* Small segmented toggle inside a card (tokens: by project | by provider) */
+.dash-toggle { display: flex; gap: 4px; align-items: center; }
+.dash-toggle button {
+  background: none; border: 1px solid transparent; color: var(--text-secondary);
+  font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+}
+.dash-toggle button:hover { color: var(--text-primary); background: var(--bg-elevated); }
+.dash-toggle button[aria-pressed="true"] { color: var(--text-primary); background: var(--bg-elevated); border-color: var(--border); }
+.dash-toggle .dash-toggle-action { margin-left: auto; color: var(--accent); }
+.dash-toggle .dash-toggle-action:disabled { color: var(--text-muted); cursor: default; }
 
 /* Context small multiples */
 .ctx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }

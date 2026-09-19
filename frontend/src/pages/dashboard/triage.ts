@@ -11,6 +11,7 @@ import type { Project } from '../../types';
 import { dayTokens, fmtAge, fmtDurationShort, fmtK } from '../../utils/format';
 import { median } from '../../utils/dates';
 import { HUMAN } from '../../utils/worktime';
+import { dominantProjectToday } from './usageProjects';
 import {
   CONTEXT_WARN_TOKENS, CONTEXT_DANGER_TOKENS,
   WAITING_WARN_MS, WAITING_CRIT_MS,
@@ -142,7 +143,9 @@ export function buildAttentionItems(input: TriageInput, now: number): AttentionI
     });
   }
 
-  // 6. Token burn today vs typical day (user-wide — tokens are not attributed per project yet).
+  // 6. Token burn today vs typical day. Detection is user-wide (the total is
+  // what the thermometer trained you on); when one project owns most of today's
+  // attributed tokens the item deep-links to it.
   if (input.usage) {
     const days = input.usage.days;
     const today = dayTokens(days[input.todayUTC] ?? { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 });
@@ -152,18 +155,29 @@ export function buildAttentionItems(input: TriageInput, now: number): AttentionI
       const base = median(baseline);
       const ratio = base > 0 ? today / base : Infinity;
       if (ratio >= TOKEN_BURN_WARN_RATIO) {
+        const dom = dominantProjectToday(input.usage, input.todayUTC);
         items.push({
           id: 'tokens:today', kind: 'token_burn', severity: ratio >= TOKEN_BURN_CRIT_RATIO ? 'critical' : 'warning',
           title: `${fmtK(today)} tokens today — ${ratio === Infinity ? '∞' : ratio.toFixed(1)}× your typical day`,
-          detail: `Typical active day: ${fmtK(base)} (median of the last ${baseline.length} active days).`,
-          action: 'see which pane is burning', metric: today,
+          detail: `Typical active day: ${fmtK(base)} (median of the last ${baseline.length} active days).`
+            + (dom ? ` ${Math.round(dom.share * 100)}% of today's attributed tokens are on ${dom.name}.` : ''),
+          action: dom ? 'open the project' : 'see which pane is burning', metric: today,
+          ...(dom ? { projectId: dom.projectId, projectName: dom.name, projectColor: dom.color } : {}),
         });
       }
+    }
+    if (input.usage.staleSince && !offline.has('legacy')) {
+      items.push({
+        id: 'tokens:stale', kind: 'usage_unavailable', severity: 'notice',
+        title: `Token data is stale — last scan ${fmtAge(now - Date.parse(input.usage.staleSince))} ago`,
+        detail: 'No connected agent has reported usage recently; totals are last-known.',
+        action: 'check the agents', metric: 0,
+      });
     }
   } else if (input.usageUnavailable && !offline.has('legacy')) {
     items.push({
       id: 'tokens:unavailable', kind: 'usage_unavailable', severity: 'notice',
-      title: 'Token data unavailable', detail: 'The usage scan needs your orchestrator agent connected.',
+      title: 'Token data unavailable', detail: 'No agent is connected and nothing has been recorded yet.',
       action: 'check the agent', metric: 0,
     });
   }

@@ -118,6 +118,24 @@ describe('token burn (user-wide)', () => {
     const items = buildAttentionItems(input({ usageUnavailable: true, sessions: [row({ connected: false })] }), NOW);
     expect(kinds(items)).toEqual(['agent_offline']);
   });
+  it('deep-links to the project owning ≥50% of today\'s attributed tokens; stays user-wide otherwise', () => {
+    const proj = (id: string, t: number) => ({ projectId: id, name: id, color: null, workstream: 'main', days: { '2026-09-18': day(t) } });
+    const base = usageWith(3_000_000, [1_000_000, 1_000_000, 1_000_000]);
+    const dominant = buildAttentionItems(input({ usage: { ...base, projects: [proj('big', 2_000_000), proj('small', 1_000_000)] } }), NOW)[0];
+    expect(dominant).toMatchObject({ kind: 'token_burn', projectId: 'big', projectName: 'big', action: 'open the project' });
+    expect(dominant.detail).toMatch(/67% of today's attributed tokens are on big/);
+    const split = buildAttentionItems(input({ usage: { ...base, projects: [proj('a', 1_000_000), proj('b', 1_000_000), proj('c', 1_000_000)] } }), NOW)[0];
+    expect(split.projectId).toBeUndefined();
+    expect(split.action).toBe('see which pane is burning');
+    const noProjects = buildAttentionItems(input({ usage: base }), NOW)[0];
+    expect(noProjects.projectId).toBeUndefined();
+  });
+  it('staleSince → a stale notice (suppressed when the legacy host is offline)', () => {
+    const stale = { days: {}, staleSince: iso(3 * H) };
+    expect(buildAttentionItems(input({ usage: stale }), NOW)[0]).toMatchObject({ kind: 'usage_unavailable', id: 'tokens:stale' });
+    expect(buildAttentionItems(input({ usage: stale }), NOW)[0].title).toMatch(/3h ago/);
+    expect(kinds(buildAttentionItems(input({ usage: stale, sessions: [row({ connected: false })] }), NOW))).toEqual(['agent_offline']);
+  });
 });
 
 describe('effort', () => {

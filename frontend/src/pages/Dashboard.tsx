@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useDashboardData } from './dashboard/useDashboardData';
+import { usageApi } from '../services/api';
 import { buildAttentionItems, liveSummary } from './dashboard/triage';
 import { AttentionSection } from './dashboard/AttentionSection';
 import { RangePicker } from './dashboard/RangePicker';
@@ -82,7 +83,8 @@ export default function Dashboard() {
     const tokPrior = usage ? priorOf(d => dayTokens(usage.days[d] ?? EMPTY_USAGE_DAY), keys.priorUtc) : NaN;
     out.push({
       id: 'tokens', label: 'Tokens', value: usage ? fmtK(tok) : data.usageUnavailable ? 'unavailable' : '…',
-      deltaPct: deltaPct(tok, tokPrior), upIsGood: false, vs, note: data.usageUnavailable ? 'agent offline' : undefined,
+      deltaPct: deltaPct(tok, tokPrior), upIsGood: false, vs,
+      note: usage?.staleSince ? `last scan ${fmtAge(Date.now() - Date.parse(usage.staleSince))} ago` : data.usageUnavailable ? 'no agent connected' : undefined,
     });
 
     const sw = visits ? (keys.isToday ? visits.todaySwitches : visits.days.filter(d => keys.utc.includes(d.date)).reduce((s, d) => s + d.switches, 0)) : NaN;
@@ -127,6 +129,7 @@ export default function Dashboard() {
           sessions={data.sessions.data}
           projects={data.projects.data}
           ctx={data.ctx.data}
+          usage={data.usage.data}
           keys={keys}
           now={now}
           stale={data.worktimeByProject.loading}
@@ -136,7 +139,14 @@ export default function Dashboard() {
 
         <WorktimeCharts wt={data.worktime.data} keys={keys} stale={data.worktime.loading} />
 
-        <TokensChart usage={data.usage.data} unavailable={data.usageUnavailable} keys={keys} stale={data.usage.loading} />
+        <TokensChart
+          usage={data.usage.data}
+          unavailable={data.usageUnavailable}
+          keys={keys}
+          stale={data.usage.loading}
+          now={now}
+          onRescan={async () => { try { await usageApi.rescan(); } catch { /* payload refresh below still runs */ } data.usage.refresh(); }}
+        />
 
         <RhythmCharts visits={data.visits.data} warp={data.warp.data} keys={keys} stale={data.visits.loading || data.warp.loading} />
 

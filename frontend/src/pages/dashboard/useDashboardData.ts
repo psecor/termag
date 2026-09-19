@@ -70,8 +70,8 @@ const MIN = 60_000;
 export interface DashboardData {
   sessions: Polled<SessionRow[]>;
   projects: Polled<Project[]>;
-  usage: Polled<UsageResponse>;
-  /** true when the last usage fetch was a 503 (agent offline) */
+  usage: Polled<UsageResponse> & { refresh: () => void };
+  /** true when tokens are not live: a 503 (no agent, nothing recorded) or `staleSince` set. */
   usageUnavailable: boolean;
   worktime: Polled<WorktimeResponse>;
   worktimeByProject: Polled<WorktimeProjectsResponse>;
@@ -99,7 +99,7 @@ export function useDashboardData(): DashboardData {
 
   return {
     sessions, projects, usage,
-    usageUnavailable: !usage.loading && httpStatus(usage.error) === 503,
+    usageUnavailable: (!usage.loading && httpStatus(usage.error) === 503) || !!usage.data?.staleSince,
     worktime, worktimeByProject, visits, warp, ctx,
     checkedAt: sessions.fetchedAt,
   };
