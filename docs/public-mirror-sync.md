@@ -101,10 +101,37 @@ git rebase origin/main --exec /tmp/rewrite-author.sh
 | Peter Secor `<psecor@launchdarkly.com>` | `secorp <secorp@gmail.com>` | none |
 | Vadim Korolik `<vkorolik@gmail.com>` | `secorp <secorp@gmail.com>` | `Co-Authored-By: Vadim Korolik <vkorolik@launchdarkly.com>` |
 | Ramon Niebla `<rniebla@ip-*.ec2.internal>` | `secorp <secorp@gmail.com>` | `Co-Authored-By: Ramon Niebla <rniebla@launchdarkly.com>` |
+| Fabian Feldberg `<ffeldberg@launchdarkly.com>` (some commits carry a personal address; map both) | `secorp <secorp@gmail.com>` | `Co-Authored-By: Fabian Feldberg <ffeldberg@launchdarkly.com>` |
+| Henry Barrow `<hbarrow@launchdarkly.com>` | `secorp <secorp@gmail.com>` | `Co-Authored-By: Henry Barrow <hbarrow@launchdarkly.com>` |
 
 Per-author Co-Authored-By trailers are added during the rebase script (extend the script to look at the original author email and append the appropriate trailer if not already present).
 
+The same script should also scrub **commit messages**: internal terraform module
+names and the company dev-stack repo names turn up in PR bodies. The September
+2026 batch used a `sed` pass in the rewrite script for exactly the three
+messages that needed it (`git log origin/main..HEAD --format=%B | grep -i -E
+'<deny patterns>'` finds them; check before rebasing, not after). Set
+`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` to the public identity too, or the
+committer field carries the work email.
+
 **Known trade-off:** Co-Authored-By trailers with LD work emails put `launchdarkly.com` strings into commit message bodies on origin. The pre-commit gitleaks hook only scans staged file diffs (not commit messages), so it passes — but a full `gitleaks detect` against the repo would flag them. This is an accepted exception so contributions stay attributed to their authors. Don't extend gitleaks to scan messages without adding an allowlist for `Co-Authored-By:.*launchdarkly\.com` first.
+
+### Verify before pushing
+
+The orchestrator box has no `gitleaks` or `pre-commit` binary, so the hook is not
+a backstop there. Two checks replace it:
+
+```bash
+# 1. deny-list over the whole tree (the public rules, not the canonical ones)
+git grep -n -i -E 'launchdarkly|o11y-(devbox|termag)|<personal host>|<handles>' HEAD \
+  -- . ':!LICENSE' ':!.gitleaks.toml' ':!docs/public-mirror-sync.md'
+# 2. residual diff vs canonical: must list ONLY the permanently excluded
+#    surfaces below plus scrub-only wording deltas in shared files
+git diff --stat port-from-labs labs/main
+```
+
+Also build: `tsc --noEmit` + `vitest run` in backend and frontend, `vite build`,
+`node --test` in agent/, `bash deploy/*.test.sh`, `bash -n packer/scripts/*.sh`.
 
 ### Push
 
@@ -115,6 +142,54 @@ git branch -D port-from-labs
 ```
 
 Fast-forward only — `origin/main` should always be reachable from the post-rebase branch tip.
+
+**From the orchestrator box the push cannot happen at all**: its `gh` login is the
+work account (403 on the personal fork) and a Claude-session push of internal
+content to the public repo is blocked as a trust-boundary crossing regardless of
+permission rules. Build the branch there, then bridge it to a machine with the
+personal credentials as a bundle:
+
+```bash
+git bundle create ~/termag-public-port-<date>.bundle port-from-labs ^origin/main
+git bundle verify ~/termag-public-port-<date>.bundle
+# on the laptop: git fetch <bundle> port-from-labs:public-port && git push origin public-port:main
+```
+
+## Permanently excluded surfaces
+
+These never port. After a full sync `git diff --stat port-from-labs labs/main`
+should list exactly these (plus scrub-only deltas in shared files):
+
+| Surface | Why |
+|---|---|
+| `.github/workflows/*` | OIDC audiences, ECR repos and the deploy platform are all internal |
+| `shepherd/` | internal deploy-platform service definition |
+| `backend/src/{routes,services}/launchdarkly*.ts`, `services/ldContext*`, `frontend/src/{flags.ts,contexts/LaunchDarklyProvider.tsx}` and the SDK deps in both `package.json`s | the feature-flag integration; `App.tsx` on origin has no provider wrapper, `index.ts` no init/close |
+| `deploy/termag-setup`, `termag-setup-prepare.service`, `termag-setup.test.sh` | first-connect flow hard-codes SSO URLs and AWS account IDs |
+| `USAGE.md` | box-user onboarding written around the SSO/SAML setup |
+| the "company dev-stack toolchain" block in `packer/scripts/setup.sh` (musl, qemu-user-static, bazelisk), `GOPRIVATE` + git `insteadOf` for the company orgs, the `ldcli` install, and every `termag-setup` hook in `setup.sh` / `box.pkr.hcl` / `termag-reconcile`'s artifact table | tied to the surfaces above |
+| `.gitleaks.toml` | deliberately different per lineage (see top) |
+
+**The box-image surface is synced by snapshot, not cherry-pick.** `packer/`,
+`terraform/box/`, `cloudinit.sh.tftpl`, `boxProvisioner.ts` and the `deploy/`
+box scripts change together in almost every infra commit, so after the first
+few cherry-picks every one conflicts in the same regions. Instead: `git checkout
+labs/main -- <those paths>`, cut the excluded blocks listed above, commit once
+with `Co-Authored-By` trailers for the internal authors. The September 2026 sync
+did this; the cut points are discrete comment-delimited blocks, so it is a
+few minutes of editing, not a re-derivation.
+
+> Follow-up owed on the public image: no `packer validate` or bake has run on the
+> ported `setup.sh` (the box has no packer). Whoever next builds the public box
+> AMI is the first to exercise it.
+
+## Sync log
+
+| Date | Public tip | Canonical tip ported through | Notes |
+|---|---|---|---|
+| 2026-05-31 | `86cb06e` | (squashed initial) | original scrub |
+| 2026-06-22 | `a20678b` | `b54a3f4` | June batch; skipped #23 flags, #26 ALB auth, #24 toolset bake |
+| 2026-09-19 | `a66544a` → `05a4550` | `a7165b6` | two batches: 32 product commits (incl. #26/#50 auth, #60/#62 container minus shepherd) + box-image snapshot |
 
 ## Reverse direction (origin → labs)
 
