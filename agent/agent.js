@@ -113,176 +113,11 @@ async function initWikiFiles(dir, slug, username) {
 }
 
 // ── Usage scanner ──────────────────────────────────────────────────────────
+// Lives in usage-scanner.js (deduped, incrementally cached; schema 2 with
+// per-directory buckets so the backend can attribute tokens to projects).
 const { readdir, readFile, stat } = require('fs/promises');
-
-function ensureDay(days, date) {
-  if (!days[date]) {
-    days[date] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
-  }
-  return days[date];
-}
-
-async function scanClaudeUsage(days) {
-  const claudeDir = path.join(process.env.HOME || '/home', '.claude', 'projects');
-
-  let projectDirs;
-  try {
-    projectDirs = await readdir(claudeDir);
-  } catch {
-    return;
-  }
-
-  for (const dir of projectDirs) {
-    const projectPath = path.join(claudeDir, dir);
-    let files;
-    try {
-      const s = await stat(projectPath);
-      if (!s.isDirectory()) continue;
-      files = await readdir(projectPath);
-    } catch { continue; }
-
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue;
-      try {
-        const content = await readFile(path.join(projectPath, file), 'utf8');
-        for (const line of content.split('\n')) {
-          if (!line) continue;
-          let entry;
-          try { entry = JSON.parse(line); } catch { continue; }
-          const msg = entry.message;
-          if (!msg || typeof msg !== 'object' || !msg.usage) continue;
-
-          const ts = entry.timestamp;
-          if (!ts) continue;
-          const date = new Date(ts).toISOString().slice(0, 10);
-
-          const u = msg.usage;
-          const d = ensureDay(days, date);
-          d.input += u.input_tokens || 0;
-          d.output += u.output_tokens || 0;
-          d.cacheRead += u.cache_read_input_tokens || 0;
-          d.cacheCreate += u.cache_creation_input_tokens || 0;
-          d.calls += 1;
-        }
-      } catch { continue; }
-    }
-  }
-}
-
-async function scanCodexUsage(days) {
-  const sessionsDir = path.join(process.env.HOME || '/home', '.codex', 'sessions');
-
-  let years;
-  try {
-    years = await readdir(sessionsDir);
-  } catch {
-    return;
-  }
-
-  for (const year of years) {
-    const yearPath = path.join(sessionsDir, year);
-    let months;
-    try { months = await readdir(yearPath); } catch { continue; }
-
-    for (const month of months) {
-      const monthPath = path.join(yearPath, month);
-      let dayDirs;
-      try { dayDirs = await readdir(monthPath); } catch { continue; }
-
-      for (const dayDir of dayDirs) {
-        const dayPath = path.join(monthPath, dayDir);
-        let files;
-        try {
-          const s = await stat(dayPath);
-          if (!s.isDirectory()) continue;
-          files = await readdir(dayPath);
-        } catch { continue; }
-
-        for (const file of files) {
-          if (!file.endsWith('.jsonl')) continue;
-          try {
-            const content = await readFile(path.join(dayPath, file), 'utf8');
-            for (const line of content.split('\n')) {
-              if (!line) continue;
-              let entry;
-              try { entry = JSON.parse(line); } catch { continue; }
-              if (entry.type !== 'event_msg') continue;
-              const payload = entry.payload;
-              if (!payload || payload.type !== 'token_count') continue;
-              const u = payload.info?.last_token_usage;
-              if (!u) continue;
-
-              const ts = entry.timestamp;
-              if (!ts) continue;
-              const date = new Date(ts).toISOString().slice(0, 10);
-
-              const d = ensureDay(days, date);
-              d.input += u.input_tokens || 0;
-              d.output += u.output_tokens || 0;
-              d.cacheRead += u.cached_input_tokens || 0;
-              d.calls += 1;
-            }
-          } catch { continue; }
-        }
-      }
-    }
-  }
-}
-
-async function scanVibeUsage(days) {
-  const sessionDir = path.join(process.env.HOME || '/home', '.vibe', 'logs', 'session');
-
-  let sessionDirs;
-  try {
-    sessionDirs = await readdir(sessionDir);
-  } catch {
-    return;
-  }
-
-  for (const dir of sessionDirs) {
-    // Directory name format: session_YYYYMMDD_HHMMSS_<id>
-    const dateMatch = dir.match(/^session_(\d{4})(\d{2})(\d{2})_/);
-    if (!dateMatch) continue;
-    const date = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
-
-    const metaPath = path.join(sessionDir, dir, 'meta.json');
-    try {
-      const content = await readFile(metaPath, 'utf8');
-      const meta = JSON.parse(content);
-      const s = meta.stats;
-      if (!s) continue;
-
-      const d = ensureDay(days, date);
-      d.input += s.session_prompt_tokens || 0;
-      d.output += s.session_completion_tokens || 0;
-      d.calls += s.steps || 1;
-    } catch { continue; }
-  }
-}
-
-async function scanUsage() {
-  const claude = {};
-  const codex = {};
-  const mistral = {};
-  await Promise.all([
-    scanClaudeUsage(claude),
-    scanCodexUsage(codex),
-    scanVibeUsage(mistral),
-  ]);
-  // Merge into combined totals
-  const days = {};
-  for (const src of [claude, codex, mistral]) {
-    for (const [date, d] of Object.entries(src)) {
-      const t = ensureDay(days, date);
-      t.input += d.input;
-      t.output += d.output;
-      t.cacheRead += d.cacheRead;
-      t.cacheCreate += d.cacheCreate;
-      t.calls += d.calls;
-    }
-  }
-  return { days, providers: { claude, codex, mistral } };
-}
+const { createScanner } = require('./usage-scanner');
+const usageScanner = createScanner({ home: process.env.HOME || '/home', pathRemap: path_remap });
 
 // ── Context token scanner ─────────────────────────────────────────────────
 // Periodically reads the most recent JSONL entry per active Claude conversation
@@ -1067,7 +902,9 @@ function connect() {
         }
 
         case 'usage-scan': {
-          const result = await scanUsage();
+          // `since` (YYYY-MM-DD) trims the response, never the cache. Older
+          // backends send {} and get everything, as before.
+          const result = await usageScanner.scan({ since: msg.since });
           respond(ws, requestId, result);
           break;
         }

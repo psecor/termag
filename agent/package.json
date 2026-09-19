@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node agent.js",
-    "codex-bridge": "node codex-status-bridge.js"
+    "codex-bridge": "node codex-status-bridge.js",
+    "test": "node --test"
   },
   "dependencies": {
     "node-pty": "^1.0.0",
