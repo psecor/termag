@@ -1,5 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { lazy, Suspense } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
+import { contextLevel } from './utils/thresholds';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ProjectProvider } from './contexts/ProjectContext';
 import { ProjectControl } from './components/ProjectControl';
@@ -236,7 +238,7 @@ function MainLayout() {
             }
             const ctx = st?.contextTokens;
             if (ctx == null) return null;
-            const level = ctx >= 1_000_000 ? 'danger' : ctx >= 500_000 ? 'warn' : 'ok';
+            const level = contextLevel(ctx);
             const label = ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(1)}M` : `${Math.round(ctx / 1000)}K`;
             const title = level === 'ok' ? 'Context tokens' : 'Context tokens — consider /clear';
             return (
@@ -343,7 +345,7 @@ function SidebarCollapsed({
         const s = st?.status ?? 'not_running';
         const ctx = st?.contextTokens;
         const rateLimit = st?.rateLimited;
-        const ctxLevel = ctx && ctx >= 1_000_000 ? 'danger' : ctx && ctx >= 500_000 ? 'warn' : null;
+        const ctxLevel = ctx ? (contextLevel(ctx) === 'ok' ? null : contextLevel(ctx)) : null;
         const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
         const ringClass = rateLimit ? 'rate-limit-ring' : ctxLevel ? `ctx-ring-${ctxLevel}` : '';
         return (
@@ -369,11 +371,29 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+
 export default function App() {
   return (
     <AuthProvider>
       <Routes>
         <Route path="/login" element={<Login />} />
+        {/* Dashboard: its own route, deliberately outside
+            ProjectProvider / MainLayout — no status WebSocket, no terminals, no
+            hyperspace canvas, and no human heartbeat (reading the dashboard must
+            not count as working time). Lazy so Recharts stays out of the
+            workspace bundle. Suspense sits INSIDE RequireAuth so a logged-out
+            visitor never downloads the chunk. */}
+        <Route
+          path="/dashboard"
+          element={
+            <RequireAuth>
+              <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                <Dashboard />
+              </Suspense>
+            </RequireAuth>
+          }
+        />
         <Route
           path="/*"
           element={

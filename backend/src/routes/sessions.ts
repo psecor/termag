@@ -4,7 +4,8 @@ import { requireAuthOrAgentToken } from '../middleware/auth';
 import { sendForProject, isProjectAgentConnected, type ProjectHost } from '../services/agentRegistry';
 import { assertSessionAccess, SessionAccessError, SESSION_ROLES } from '../services/sessionAccess';
 import { sessionName } from '../services/tmux';
-import { getStatus } from '../services/status';
+import { getAllStatuses } from '../services/status';
+import { providerForSource } from '../providers/registry';
 
 // Permissioned, token-friendly session surface for non-browser callers — built
 // for the MetaTerm MCP server, usable by anything holding a Bearer agent token.
@@ -27,6 +28,9 @@ export function sessionsRouter(): Router {
     const include = {
       user: { select: { unixUsername: true } },
       workstreams: { where: { archived: false }, select: { name: true } },
+      // Fallback provider for rows whose status carries no `source` (hook-driven
+      // Claude sends none) — the project's agent workflow says what runs there.
+      workflows: { where: { type: 'agent' as const }, select: { provider: true } },
     };
     const owned = await prisma.project.findMany({ where: { userId: requesterId, archived: false }, include });
     const shares = await prisma.projectShare.findMany({
@@ -53,6 +57,10 @@ export function sessionsRouter(): Router {
       return set;
     }
 
+    // Read the raw map, not getStatus(): that helper fabricates a
+    // `not_running` entry stamped `updatedAt: now` for unknown sessions, which
+    // would make every never-seen session look freshly updated.
+    const statuses = getAllStatuses();
     const out: Array<Record<string, unknown>> = [];
     for (const { p, access } of projects) {
       const host: ProjectHost = { userId: p.userId, instanceId: p.instanceId };
@@ -65,11 +73,19 @@ export function sessionsRouter(): Router {
           const alive = live ? live.has(session) : false;
           // agent/ctrl exist for every project; data roles only if actually live.
           if ((role === 'data' || role === 'data-ctrl') && !alive) continue;
-          const st = getStatus(session) as { status?: string; contextTokens?: number | null } | undefined;
+          const raw = statuses.get(session);
           out.push({
             projectId: p.id, projectName: p.name, owner: p.user.unixUsername, access,
             workstream: ws, role, session, instanceId: p.instanceId,
-            connected, alive, status: st?.status ?? null, contextTokens: st?.contextTokens ?? null,
+            connected, alive, status: raw?.status ?? 'not_running', contextTokens: raw?.contextTokens ?? null,
+            // Triage fields (additive). updatedAt is the last status WRITE — metadata
+            // pushes (context tokens, rate-limit gauge) bump it too, so "waiting since"
+            // derived from it is a lower bound. null = no status ever recorded.
+            updatedAt: raw ? raw.updatedAt.toISOString() : null,
+            waitingReason: raw?.waitingReason ?? null,
+            rateLimited: raw?.rateLimited ?? null,
+            provider: (raw?.source ? providerForSource(raw.source) : undefined) ?? p.workflows[0]?.provider ?? null,
+            lastActiveAt: p.lastActiveAt.toISOString(),
           });
         }
       }

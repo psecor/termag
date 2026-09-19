@@ -242,9 +242,55 @@ export interface WorktimeResponse {
   days: Record<string, Record<string, WorktimeDay>>;
 }
 
+// Per-project rows behind /api/worktime. `projectId` is null when the banked
+// name no longer resolves to a project (renamed/archived). Dates server-local.
+export interface WorktimeProjectRow {
+  projectId: string | null;
+  projectName: string;
+  workstream: string;
+  provider: string; // provider id, or 'human'
+  date: string;
+  totalMs: number;
+  sessions: number;
+}
+
+export interface WorktimeProjectsResponse {
+  days: number;
+  rows: WorktimeProjectRow[];
+}
+
 export const worktimeApi = {
   get: (days = 30): Promise<WorktimeResponse> =>
     api.get('/api/worktime', { params: { days } }).then(r => r.data),
+  byProject: (days = 30): Promise<WorktimeProjectsResponse> =>
+    api.get('/api/worktime/projects', { params: { days } }).then(r => r.data),
+};
+
+// One row per reachable tmux session (own + shared projects × live workstreams
+// × roles) with agent connectivity, tmux liveness and the live status. The
+// triage fields are lower-bound signals: `updatedAt` is the last status WRITE.
+export interface SessionRow {
+  projectId: string;
+  projectName: string;
+  owner: string;
+  access: 'owner' | 'collaborator';
+  workstream: string;
+  role: 'agent' | 'ctrl' | 'data' | 'data-ctrl';
+  session: string;
+  instanceId: string | null;
+  connected: boolean;
+  alive: boolean;
+  status: 'working' | 'waiting' | 'idle' | 'not_running';
+  contextTokens: number | null;
+  updatedAt: string | null;
+  waitingReason: 'approval' | 'user_input' | 'unknown' | null;
+  rateLimited: string | null;
+  provider: string | null;
+  lastActiveAt: string;
+}
+
+export const sessionsApi = {
+  list: (): Promise<SessionRow[]> => api.get('/api/sessions').then(r => r.data),
 };
 
 export const sharingApi = {

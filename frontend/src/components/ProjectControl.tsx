@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { contextLevel } from '../utils/thresholds';
 import { createPortal } from 'react-dom';
 import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue, Instance } from '../types';
 import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
@@ -257,8 +258,9 @@ export function ProjectControl() {
       const t = statusMap[s]?.contextTokens;
       if (t && t > max) max = t;
     }
-    if (max < 500_000) return null;
-    return { level: max >= 1_000_000 ? 'danger' : 'warn', tokens: max };
+    const level = contextLevel(max);
+    if (level === 'ok') return null;
+    return { level, tokens: max };
   }
 
   function rateLimitWarning(project: Project): string | null {
