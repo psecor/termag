@@ -1,0 +1,34 @@
+[Unit]
+Description=termag: reconcile installed box artifacts with the checkout
+After=network.target
+
+# Ordered before the agent on purpose. The agent unit is one of the artifacts
+# being reconciled, so running first means systemd starts the agent from the
+# reconciled unit and nothing has to be restarted -- which matters because
+# restarting termag-agent on a box that has not yet picked up KillMode=process
+# destroys every tmux pane, and such a box is exactly what this repairs.
+Before=termag-agent.service
+
+[Service]
+# `deploy/` is the single source of truth for the agent unit and the per-user
+# scripts, but nothing installs it onto the live paths outside an AMI bake. A box
+# whose checkout is current can therefore still be running artifacts baked weeks
+# earlier; observed on a live box carrying the merged KillMode=process fix in
+# ~/src/termag while the installed unit predated it.
+#
+# Content-compared, so a reconciled boot writes nothing and logs nothing.
+Type=oneshot
+RemainAfterExit=yes
+
+# From the checkout, so `git -C ~/src/termag pull` is enough to change what this
+# installs. %h is the owner's home, so it survives the cloud-init user rename.
+ExecStart=%h/src/termag/deploy/termag-reconcile
+
+# Reconciliation failing must never keep the box from booting or the agent from
+# starting. The worst case is that the box keeps running its baked artifacts,
+# which is the status quo this improves on.
+SuccessExitStatus=0 1
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

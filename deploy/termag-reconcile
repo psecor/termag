@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# termag-reconcile — install the box-side artifacts from the termag checkout over
+# their installed paths, on every boot.
+#
+# Why this exists: `deploy/` is the single source of truth for the agent unit and
+# the per-user scripts, but nothing copies it onto the installed paths outside an
+# AMI bake. So a box whose checkout is perfectly current can still be *running*
+# artifacts baked weeks earlier.
+#
+# That is not hypothetical. On a live box, `~/src/termag` was current with
+# `main` and carried the merged `KillMode=process` fix, while
+# `~/.config/systemd/user/termag-agent.service` was still the baked copy without
+# it -- so restarting the agent there continued to destroy every tmux pane, with
+# the fix sitting on disk three directories away.
+#
+# Content-compared rather than copied blindly: nothing is written unless it
+# actually differs, so a reconciled boot is silent and mtimes stay stable. This
+# is the same approach ensureClipboardShim() takes in agent/agent.js.
+#
+# Ordered Before=termag-agent.service (see termag-reconcile.service), so on every
+# boot the agent starts from the reconciled unit and no restart is needed. This
+# script deliberately does NOT restart the agent: that restart is precisely what
+# destroys panes on a box which has not yet picked up KillMode=process -- exactly
+# the box this is meant to repair. Writing the unit plus a daemon-reload is
+# enough; systemd starts the agent from the new unit moments later.
+#
+# Usage:
+#   termag-reconcile           reconcile, reporting only what changed
+#   termag-reconcile --check   report drift and un-enabled units, change nothing
+#                              (exit 1 if there is anything to do)
+#   termag-reconcile --list    print the artifact table and exit
+#
+# Env:
+#   TERMAG_CHECKOUT   override the checkout path (default $HOME/src/termag)
+
+set -u
+
+CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+DEPLOY="$CHECKOUT/deploy"
+
+MODE=reconcile
+case "${1:-}" in
+  --check) MODE=check ;;
+  --list)  MODE=list ;;
+  '')      ;;
+  -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) printf 'unknown flag: %s (try --help)\n' "${1}" >&2; exit 2 ;;
+esac
+
+# source-in-deploy : installed path : mode : kind : enablement
+#
+# kind=unit marks the files whose change warrants a `systemctl --user
+# daemon-reload`; kind=bin is a plain executable.
+#
+# enable=enable means this script also ensures the default.target.wants symlink,
+# i.e. it enables the unit itself. That is what lets the mechanism reach a box
+# that predates it: without it, a box could have every unit *file* installed and
+# still never run them, because the symlinks were only ever created by the AMI
+# bake -- so the reconciler could not bootstrap onto exactly the boxes that
+# needed reconciling.
+#
+# termag-agent.service is deliberately enable=noenable. cloud-init owns enabling
+# it (`systemctl --user enable --now termag-agent`), and silently re-enabling an
+# agent somebody had deliberately stopped would be a surprise. Its *content*
+# still gets reconciled.
+#
+# claude-settings.json is deliberately absent entirely. Box owners add their own
+# hooks to it, and overwriting it every boot would silently discard that. The
+# bake seeds it once and it is the user's thereafter.
+artifacts() {
+  cat <<TABLE
+termag-agent.service:$HOME/.config/systemd/user/termag-agent.service:644:unit:noenable
+termag-reconcile.service:$HOME/.config/systemd/user/termag-reconcile.service:644:unit:enable
+termag-status:$HOME/.local/bin/termag-status:755:bin:noenable
+termag-reconcile:$HOME/.local/bin/termag-reconcile:755:bin:noenable
+TABLE
+}
+
+WANTS="$HOME/.config/systemd/user/default.target.wants"
+
+# Is the unit enabled, i.e. does the wants symlink point where it should?
+unit_enabled() {
+  [ "$(readlink "$WANTS/$1" 2>/dev/null)" = "../$1" ]
+}
+
+# Equivalent of `systemctl --user enable`, done with a symlink so it works with
+# no running user manager (the AMI bake has none, and neither does a --check run
+# over SSH). Returns 0 only when it actually changed something.
+enable_unit() {
+  unit_enabled "$1" && return 1
+  mkdir -p "$WANTS" || return 1
+  ln -sfn "../$1" "$WANTS/$1" || return 1
+  return 0
+}
+
+if [ "$MODE" = list ]; then artifacts; exit 0; fi
+
+if [ ! -d "$DEPLOY" ]; then
+  printf 'termag-reconcile: no checkout at %s; nothing to reconcile\n' "$CHECKOUT" >&2
+  exit 0
+fi
+
+changed=0
+reload=0
+
+while IFS=: read -r name dest mode kind enable; do
+  [ -n "${name:-}" ] || continue
+  src="$DEPLOY/$name"
+  # A source that isn't in this checkout yet is not an error: an older checkout
+  # legitimately has fewer artifacts than a newer script knows about.
+  [ -f "$src" ] || continue
+
+  # Enablement is checked independently of content: a box can already have the
+  # right unit file and still not have the symlink, which is precisely the state
+  # every box built before this script existed is in.
+  if [ "${enable:-noenable}" = enable ] && ! unit_enabled "$name"; then
+    if [ "$MODE" = check ]; then
+      printf 'NOT-ENABLED: %s (would link into %s)\n' "$name" "$WANTS"
+      changed=$((changed + 1))
+    elif enable_unit "$name"; then
+      printf 'enabled: %s\n' "$name"
+      changed=$((changed + 1))
+      reload=1
+    else
+      printf 'termag-reconcile: failed to enable %s\n' "$name" >&2
+    fi
+  fi
+
+  if cmp -s "$src" "$dest" 2>/dev/null; then
+    continue
+  fi
+
+  if [ "$MODE" = check ]; then
+    if [ -e "$dest" ]; then
+      printf 'DRIFT: %s differs from %s\n' "$dest" "$src"
+    else
+      printf 'MISSING: %s (would install from %s)\n' "$dest" "$src"
+    fi
+    changed=$((changed + 1))
+    continue
+  fi
+
+  mkdir -p "$(dirname "$dest")" || continue
+  # install(1) writes to a temp name and renames, so a concurrent reader never
+  # sees a half-written file. Reconciling this script while it is itself running
+  # is safe for the same reason: the running process keeps the old inode.
+  if install -m "$mode" "$src" "$dest"; then
+    printf 'reconciled: %s\n' "$dest"
+    changed=$((changed + 1))
+    [ "$kind" = unit ] && reload=1
+  else
+    printf 'termag-reconcile: failed to install %s\n' "$dest" >&2
+  fi
+done <<EOF
+$(artifacts)
+EOF
+
+if [ "$MODE" = check ]; then
+  [ "$changed" -eq 0 ] || exit 1
+  exit 0
+fi
+
+if [ "$reload" = 1 ]; then
+  # Reload only. Restarting termag-agent here is what this script exists to
+  # avoid; the unit is ordered before it, so systemd will start it from the
+  # reconciled unit without any restart.
+  systemctl --user daemon-reload 2>/dev/null \
+    && printf 'reconciled: systemd user daemon-reload\n' \
+    || printf 'termag-reconcile: daemon-reload failed (no user manager?)\n' >&2
+fi
+
+exit 0
