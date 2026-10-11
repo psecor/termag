@@ -1,0 +1,44 @@
+# Ships the orchestrator's logs over OTLP/HTTP: the termag units'
+# and host agents' journal, /var/log/cloudinit-termag.log and nginx's logs
+# (deploy/termag-otelcol.yaml). They live on the root volume, which every
+# deploy replaces, so this is what keeps the previous host's logs readable.
+#
+# Installed and enabled by packer/scripts/orchestrator-setup.sh. On a fresh
+# instance it starts before cloud-init has written the backend .env, and
+# termag-otelcol-env fails fast until it has; the unit retries with backoff.
+# Never make that script wait for the .env instead: cloud-final.service, which
+# writes it, is ordered after multi-user.target, which waits for this unit's
+# start job. It reads every source from the beginning with its read positions
+# under StateDirectory, so nothing from the first boot is missed and a restart
+# sends nothing twice. An .env that can't say where to ship keeps it retrying
+# (at most every 10 minutes) and saying why in its own journal.
+[Unit]
+Description=Termag: ship orchestrator logs over OTLP (OpenTelemetry Collector)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=termag-otelcol
+Group=termag-otelcol
+SupplementaryGroups=systemd-journal adm
+StateDirectory=termag-otelcol
+StateDirectoryMode=0700
+RuntimeDirectory=termag-otelcol
+ExecStartPre=+/usr/local/lib/termag/termag-otelcol-env
+ExecStart=/usr/local/lib/termag/otelcol/otelcol-contrib --config=/usr/local/lib/termag/otelcol/termag-otelcol.yaml --config=/run/termag-otelcol/destination.yaml
+Restart=always
+RestartSec=10
+RestartSteps=6
+RestartMaxDelaySec=10min
+KillMode=mixed
+TimeoutStopSec=20
+MemoryMax=300M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

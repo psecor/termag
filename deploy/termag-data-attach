@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# termag-data-attach -- bring the orchestrator's host data volume to this
+# instance, then mark host storage ready.
+#
+# The volume (500 GB, Terraform's aws_ebs_volume.data) holds every host
+# account's home. It is attached to one orchestrator at a time, and during a
+# deploy that is blue until the ASG terminates it, after green is already
+# serving. So green boots without it, and this script, run by
+# termag-data-attach.service, waits for the volume to be `available`, attaches
+# it, mounts it at /srv/termag, bind-mounts /srv/termag/home over /home,
+# re-adopts the host accounts and starts their agents, and only then writes
+# /run/termag/host-storage-ready. That file is what the backend
+# (services/hostSetup.ts) and termag-host-setup check before they create or
+# change any host account: an account made before the mount would land on the
+# root disk and take a UID a home on the volume already uses.
+#
+# It never detaches the volume from another instance. A volume that stays
+# attached elsewhere is waited for, forever, with the other instance logged
+# once a minute; the runbook covers the stuck case.
+#
+# /etc/termag/data-volume (written by cloud-init) names the volume:
+#   VOLUME_ID=vol-...
+#   REGION=us-east-1
+# Before that file exists the script waits for it. If cloud-init finishes
+# without writing it, the host is on the older cloud-init that mounts the
+# volume itself: once /home is the volume's bind, the script only writes the
+# ready file (cloud-init already adopted the accounts); with no volume at all
+# it exits 0 and host storage never becomes ready.
+#
+# Exit 2 = configuration error (bad config, volume in another AZ): the unit
+# does not restart. Any other failure restarts it.
+set -euo pipefail
+
+# Tests only: prefix for every path this script reads or writes.
+ROOT="${TERMAG_DATA_ATTACH_ROOT:-}"
+CONF="$ROOT/etc/termag/data-volume"
+BOOT_FINISHED="$ROOT/var/lib/cloud/instance/boot-finished"
+READY_DIR="$ROOT/run/termag"
+READY="$READY_DIR/host-storage-ready"
+BY_ID="$ROOT/dev/disk/by-id"
+MNT=/srv/termag
+DATA="$ROOT$MNT"
+READY_TAG=TermagHostStorageReady
+MAX_BACKOFF=30
+
+log() { echo "termag-data-attach: $*"; }
+die() { log "$*" >&2; exit 2; }
+
+# /srv/termag is mounted and /home is the bind of its home directory.
+volume_mounted() {
+  local srv home
+  srv="$(findmnt -n -o SOURCE --mountpoint "$MNT" 2>/dev/null)" || return 1
+  home="$(findmnt -n -o SOURCE --mountpoint /home 2>/dev/null)" || return 1
+  [ -n "$srv" ] && [ "$home" = "${srv}[/home]" ]
+}
+
+imds() {
+  local token
+  token="$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" || return 1
+  curl -sf -H "X-aws-ec2-metadata-token: $token" "http://169.254.169.254/latest/meta-data/$1"
+}
+
+backoff=5
+last_log=-60
+pause() { # pause <message>: log at most once a minute, then sleep with backoff
+  if ((SECONDS - last_log >= 60)); then
+    log "$1"
+    last_log=$SECONDS
+  fi
+  sleep "$backoff"
+  backoff=$((backoff * 2 > MAX_BACKOFF ? MAX_BACKOFF : backoff * 2))
+}
+
+mark_ready() {
+  install -d -m 0755 "$READY_DIR"
+  : >"$READY"
+  chmod 0644 "$READY"
+  log "host storage ready"
+}
+
+# Everything after the mount. Idempotent, so a restart after a partial run, or
+# a reboot, repeats it safely.
+adopt_accounts() {
+  local bound=0 adopted=" "
+  mkdir -p "$DATA/home"
+  if ! volume_mounted; then
+    # Copy in what the image has and the volume doesn't (a fresh volume, or an
+    # account new to the image). Never overwrite: the volume is the record.
+    rsync -aXS --ignore-existing "$ROOT/home/" "$DATA/home/"
+    mount --bind "$MNT/home" /home
+    bound=1
+  fi
+
+  # /etc/passwd is on the root disk, the homes on the volume: recreate each
+  # account with the UID its home already uses, or the next useradd could hand
+  # that UID to someone else, who would silently inherit the home. Lingering
+  # brings each user's manager and termag-agent-host unit up.
+  local home name uid gid
+  for home in "$DATA"/home/*; do
+    [ -d "$home" ] || continue
+    name="$(basename "$home")"
+    if id -u "$name" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! [[ "$name" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      log "WARNING: skipping $home: not a valid username"
+      continue
+    fi
+    uid="$(stat -c %u "$home")"
+    gid="$(stat -c %g "$home")"
+    if ((uid < 1000 || uid >= 60000)) || getent passwd "$uid" >/dev/null; then
+      log "WARNING: skipping $home: uid $uid is not a free regular uid"
+      continue
+    fi
+    getent group "$gid" >/dev/null || groupadd -g "$gid" "$name"
+    useradd -M -s /bin/bash -d "/home/$name" -u "$uid" -g "$gid" "$name"
+    loginctl enable-linger "$name" || log "WARNING: enable-linger $name failed"
+    adopted+="$name "
+    log "adopted $name (uid $uid)"
+  done
+
+  # After a reboot the accounts already exist, and logind started each
+  # lingering user's manager at boot, before this bind: it runs against the
+  # root disk's /home and never saw termag-agent-host. Restart those once the
+  # volume's homes are in place. Only lingering accounts, so an admin's SSM
+  # session is left alone, and not the ones just adopted, which started after.
+  if ((bound)); then
+    for home in "$DATA"/home/*; do
+      [ -d "$home" ] || continue
+      name="$(basename "$home")"
+      [[ "$adopted" == *" $name "* ]] && continue
+      [ -e "$ROOT/var/lib/systemd/linger/$name" ] || continue
+      uid="$(id -u "$name" 2>/dev/null)" || continue
+      log "restarting $name's user manager on the volume's home"
+      systemctl try-restart "user@$uid.service" || log "WARNING: restarting user@$uid.service failed"
+    done
+  fi
+
+  # The backend's own user keeps the image's UID (files under /opt/termag are
+  # owned by it), so re-own anything in its home on the volume that an older
+  # image's UID left behind.
+  if [ -d "$DATA/home/termag" ] && id -u termag >/dev/null 2>&1; then
+    local tuid tgid
+    tuid="$(id -u termag)"
+    tgid="$(id -g termag)"
+    if [ -n "$(find "$DATA/home/termag" ! \( -uid "$tuid" -gid "$tgid" \) -print -quit)" ]; then
+      log "re-owning /home/termag stragglers to uid $tuid"
+      find "$DATA/home/termag" ! \( -uid "$tuid" -gid "$tgid" \) -exec chown -h "$tuid:$tgid" {} +
+    fi
+  fi
+}
+
+# ── wait for a configuration ─────────────────────────────────────────────────
+while [ ! -f "$CONF" ]; do
+  if [ -f "$BOOT_FINISHED" ]; then
+    if volume_mounted; then
+      log "no $CONF; cloud-init mounted the volume itself"
+      mark_ready
+    else
+      log "no $CONF and no volume mounted; this host has no host storage"
+    fi
+    exit 0
+  fi
+  sleep 5
+done
+
+VOLUME_ID="$(sed -n 's/^VOLUME_ID=//p' "$CONF")"
+REGION="$(sed -n 's/^REGION=//p' "$CONF")"
+[[ "$VOLUME_ID" =~ ^vol-[0-9a-f]{8,17}$ ]] || die "bad VOLUME_ID in $CONF: '$VOLUME_ID'"
+[[ "$REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || die "bad REGION in $CONF: '$REGION'"
+export AWS_REGION="$REGION"
+
+until INSTANCE_ID="$(imds instance-id)" && AZ="$(imds placement/availability-zone)"; do
+  pause "instance metadata not answering yet"
+done
+log "volume $VOLUME_ID, instance $INSTANCE_ID in $AZ"
+
+# ── attach ───────────────────────────────────────────────────────────────────
+while :; do
+  if ! desc="$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" \
+    --query 'Volumes[0].[AvailabilityZone,State,Attachments[0].InstanceId,Attachments[0].State]' \
+    --output text 2>&1)"; then
+    pause "describe-volumes failed: $desc"
+    continue
+  fi
+  read -r vol_az vol_state att_instance att_state <<<"$desc"
+  [ "$vol_az" = "$AZ" ] || die "volume $VOLUME_ID is in $vol_az, this instance in $AZ"
+
+  if [ "$att_instance" = "$INSTANCE_ID" ] && [ "$att_state" = attached ]; then
+    break
+  fi
+  case "$vol_state" in
+    available)
+      log "attaching $VOLUME_ID"
+      if ! out="$(aws ec2 attach-volume --volume-id "$VOLUME_ID" --instance-id "$INSTANCE_ID" \
+        --device /dev/sdf 2>&1)"; then
+        pause "attach-volume failed: $out"
+      fi
+      ;;
+    in-use)
+      if [ "$att_instance" = "$INSTANCE_ID" ]; then
+        pause "attachment to this instance is $att_state"
+      else
+        pause "waiting for $VOLUME_ID: $att_state to $att_instance"
+      fi
+      ;;
+    *)
+      pause "waiting for $VOLUME_ID: volume is $vol_state"
+      ;;
+  esac
+done
+backoff=5
+
+# ── mount ────────────────────────────────────────────────────────────────────
+if volume_mounted; then
+  log "already mounted"
+else
+  link="$BY_ID/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID/-/}"
+  for _ in $(seq 1 60); do
+    [ -e "$link" ] && break
+    sleep 1
+  done
+  [ -e "$link" ] || { log "attached, but no $link" >&2; exit 1; }
+  dev="$(readlink -f "$link")"
+  if ! findmnt -n --mountpoint "$MNT" >/dev/null 2>&1; then
+    if [ -z "$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)" ]; then
+      log "formatting the empty volume $dev"
+      mkfs.ext4 -L termag-data "$dev"
+    fi
+    mkdir -p "$DATA"
+    mount "$dev" "$MNT"
+  fi
+fi
+
+adopt_accounts
+volume_mounted || { log "/home is not the volume's bind after mounting" >&2; exit 1; }
+mark_ready
+# termag-apps.service's ConditionPathIsDirectory=/srv/termag/apps was checked
+# at boot, before this mount, so hosted apps register only if it starts now.
+# --no-block: it is ordered after units that may still be starting. A no-op
+# once it is active.
+systemctl start --no-block termag-apps.service ||
+  log "WARNING: could not start termag-apps.service; hosted apps are not registered"
+aws ec2 create-tags --resources "$VOLUME_ID" --tags "Key=$READY_TAG,Value=$INSTANCE_ID" >/dev/null 2>&1 ||
+  log "WARNING: could not tag $VOLUME_ID $READY_TAG=$INSTANCE_ID (the deploy job's readiness check reads it)"

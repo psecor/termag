@@ -1,0 +1,36 @@
+[Unit]
+Description=termag: pull the checkout, reconcile, restart the agent when safe
+After=network-online.target termag-reconcile.service
+Wants=network-online.target
+
+[Service]
+# Box-side code runs from ~/src/termag, and until this unit nothing moved a
+# running box forward: termag-reconcile.service installs from the checkout at
+# boot only and never restarts the agent, and the checkout changed only when
+# somebody pulled it. deploy/termag-box-update does the three steps an owner
+# used to do by hand (pull --ff-only, termag-reconcile, restart termag-agent),
+# each gated on being safe. Nothing on the box starts this unit on its own:
+# the orchestrator starts it over the agent's box-update RPC when the
+# box-auto-update-enabled flag is on for the owner and the box runs an older
+# commit than the current box image, and the owner can start it by hand. No
+# [Install] section: termag-reconcile lists it as noenable.
+Type=oneshot
+
+# From the checkout, so a pull is enough to change what the next run does. %h
+# survives the cloud-init user rename. --when-enabled: the run first asks the
+# orchestrator whether automatic updates are on for this box (the
+# box-auto-update-enabled flag for its owner, GET /api/box-update/policy with
+# the agent token) and does nothing unless it says yes; no answer is a no. The
+# flag is the fleet-wide kill switch, and a box never updates itself until it
+# is on for its owner. A run by hand (`termag-box-update`, no flag) asks nobody.
+ExecStart=%h/src/termag/deploy/termag-box-update --when-enabled
+
+# An update failing must never break the box: the script exits 0 and logs, and
+# the worst case is a box that keeps running what it ran before, which is the
+# status quo this unit improves on. A fetch and an npm ci are both bounded by
+# the script; this is the ceiling for the whole run.
+SuccessExitStatus=0 1
+TimeoutStartSec=20min
+
+# Behind the owner's own work: a build in a pane should not notice this.
+Nice=10

@@ -1,0 +1,38 @@
+[Unit]
+Description=termag warm-pool on-warm hook scripts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The slow half of getting a box ready (clones, image pulls, toolchain warm-up)
+# run while the box is still unowned, so claiming one is fast.
+#
+# Deliberately NOT enabled at boot, and deliberately without an [Install]
+# section so nothing can enable it by accident. The backend starts it through
+# the agent, once the agent has connected. That ordering is what lets the
+# GitHub token the scripts will need reach a connected agent instead of riding
+# in user_data, and it is why termag-reconcile lists this unit as noenable.
+#
+# Type=oneshot + RemainAfterExit=yes makes a repeated `systemctl --user start`
+# a no-op rather than a second concurrent run, so the backend needs no lock of
+# its own if it retries.
+Type=oneshot
+RemainAfterExit=yes
+
+# On a pool box this unit is started long after boot, so cloud-init has
+# finished. It is still worth waiting: a warm run racing cloud-init would run
+# the scripts against a home directory cloud-init is about to rename. `-`: a
+# host without cloud-init must not fail the unit.
+ExecStartPre=-/usr/bin/cloud-init status --wait
+
+# Run from the checkout rather than ~/.local/bin, so `git -C ~/src/termag pull` picks up a newer
+# runner without waiting for an AMI bake. %h survives the cloud-init rename.
+ExecStart=%h/src/termag/deploy/termag-hook-run warm
+
+# The default start timeout is 90 s, which would kill the very first slow
+# script this unit exists to run. 45 min is the backend's own stuck-sweep
+# window for a warming box, so systemd gives up at the same moment the backend
+# does rather than either side waiting on the other. The runner traps the
+# resulting SIGTERM and records it, so a box killed here still reports a
+# reason instead of going silent.
+TimeoutStartSec=45min

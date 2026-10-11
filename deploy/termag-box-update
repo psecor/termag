@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# termag-box-update — bring a running box up to date with its termag checkout:
+# pull `main`, reconcile the installed artifacts, and restart the agent when
+# that is safe.
+#
+# Why this exists: box-side code lives in each box's ~/src/termag checkout (the
+# per-user agent, run by termag-agent.service with no hot reload, and the
+# deploy/ artifacts termag-reconcile installs). Nothing moved a *running* box
+# forward on its own: termag-reconcile.service installs from the checkout at
+# boot only and deliberately never restarts the agent, and the checkout changed
+# only when somebody ran `git pull` in it. So a merged change reached a running
+# box by hand, per box, as its owner -- or not at all, and a box that had not
+# been updated answered every Claude Code cloud session with "agent too old".
+#
+# Nothing on the box runs this on its own. The orchestrator starts
+# termag-box-update.service (deploy/termag-box-update.service, installed by
+# termag-reconcile so it reaches boxes that predate it) over the agent's
+# box-update RPC when the box-auto-update-enabled flag is on for the owner and
+# the box runs an older commit than the current box image; an owner runs it by
+# hand.
+#
+# What one run does, in order:
+#   1. Pull.      `git fetch origin main` + `merge --ff-only`, only when the
+#                 checkout is on `main`, clean, not detached, writable, and has
+#                 an origin. A developer's branch is left alone and logged, and
+#                 "left alone" covers steps 3 to 5 too: nothing from a checkout
+#                 this script would not pull is installed, built or restarted
+#                 (npm lifecycle scripts included). Only step 2 still runs,
+#                 as it does at every boot.
+#   2. Reconcile. termag-reconcile --check, termag-reconcile, --check again.
+#                 Content-compared, so a current box writes nothing.
+#   3. Deps.      `npm ci --omit=dev` for agent/ when a package at the top of
+#                 agent/node_modules is missing or not at the version
+#                 agent/package-lock.json locks. Checked against the installed
+#                 tree, not a stamp or the pull, so a lockfile pulled by hand
+#                 is caught too. Installed beside the live tree and swapped in
+#                 whole, so a failed install leaves the agent's modules as they
+#                 were.
+#   4. Restart.   termag-agent.service, only when all of these hold:
+#                   * something it runs changed since the process started: a
+#                     tracked file under agent/ (tests aside), the loaded unit
+#                     file, or the agent/node_modules directory (step 3's swap,
+#                     this run's or an earlier one's, or an install by hand) is
+#                     newer than ExecMainStartTimestamp. Read from the files,
+#                     not remembered, so it survives a pull done by hand without
+#                     a restart and a restart this script deferred last time.
+#                   * the checkout is on `main` (a developer's box restarts its
+#                     agent when its owner says so)
+#                   * the agent's dependencies installed
+#                   * the LOADED unit has KillMode=process, so the tmux server
+#                     and every pane survive. On a unit without it the restart
+#                     is left to the next boot, which starts the agent from the
+#                     reconciled unit anyway.
+#                   * no Claude Code cloud session is live on the box (a tmux
+#                     session named <user>-claude-runner-s<slot>-<order>-r).
+#                     The next run retries.
+#   5. TUI.       Rebuilt when one was built here (tui/dist exists). The CLI is
+#                 reconcile's job already.
+#
+# It never fails the box: every step logs and carries on, the exit status is 0,
+# and the unit has SuccessExitStatus=0 1 like termag-reconcile.service. Two
+# runs never overlap (a lock under the state dir).
+#
+# Usage:
+#   termag-box-update                 update
+#   termag-box-update --check         say what an update would do and exit 1 if
+#                                     anything; writes nothing but the fetch
+#   termag-box-update --when-enabled  first ask the orchestrator whether
+#                                     automatic updates are on for this box,
+#                                     and do nothing unless it says yes. What
+#                                     the service unit runs.
+#
+# The unit's run is gated on the orchestrator (--when-enabled): the box asks
+# GET <orchestrator>/api/box-update/policy with its agent token, the way
+# termag-status posts status, and the answer is the box-auto-update-enabled
+# flag evaluated there for the box's owner. Anything but a 200 saying enabled
+# is a no: an orchestrator that is unreachable, older than that endpoint or
+# refusing the token leaves the box as it is. The orchestrator checks the same
+# flag before it starts the unit; this is the box's own check, so the flag is
+# a kill switch for the whole fleet whatever started the run, no state is kept
+# on the box, and a box never updates itself until somebody turns the flag on
+# for its owner. A run by hand asks nobody: that is the owner's own decision.
+#
+# Opt out on a box used to develop termag itself:
+#   touch ~/.config/termag/no-auto-update
+# (the on-main guard covers a checked-out branch already; the marker covers a
+# box whose owner wants `main` left alone too)
+#
+# Env:
+#   TERMAG_CHECKOUT         the checkout (default $HOME/src/termag)
+#   TERMAG_STATE_DIR        lock and scratch (default $HOME/.termag)
+#   TERMAG_NO_AUTO_UPDATE   the opt-out marker (default $HOME/.config/termag/no-auto-update)
+#   TERMAG_RECONCILE        the reconcile script (default <checkout>/deploy/termag-reconcile)
+#   TERMAG_AGENT_UNIT       the agent unit (default termag-agent.service)
+#   TERMAG_GIT_TIMEOUT      seconds for the fetch (default 120)
+#   TERMAG_NPM_TIMEOUT      seconds for npm ci and the TUI build (default 300)
+#   TERMAG_AGENT_CONFIG     the agent config with the orchestrator URL and token
+#                           (default: the agent's own search order)
+#   TERMAG_POLICY_TIMEOUT   seconds for asking the orchestrator (default 20)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$PATH:/usr/local/bin:/usr/bin:/bin"
+
+CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+MARKER="${TERMAG_NO_AUTO_UPDATE:-$HOME/.config/termag/no-auto-update}"
+RECONCILE="${TERMAG_RECONCILE:-$CHECKOUT/deploy/termag-reconcile}"
+UNIT="${TERMAG_AGENT_UNIT:-termag-agent.service}"
+GIT_TIMEOUT="${TERMAG_GIT_TIMEOUT:-120}"
+NPM_TIMEOUT="${TERMAG_NPM_TIMEOUT:-300}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+
+MODE=update
+WHEN_ENABLED=0
+for arg in "$@"; do
+  case "$arg" in
+    --check)        MODE=check ;;
+    --when-enabled) WHEN_ENABLED=1 ;;
+    -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'unknown flag: %s (try --help)\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'termag-box-update: %s\n' "$*" >&2; }
+# In --check mode: something an update would do.
+todo=0
+
+# What each step did, for the one-line outcome report the orchestrator gets at
+# the end of an update (report_outcome below; routes/boxUpdatePolicy.ts takes
+# it): short tokens, never free text from the box, so the admin Fleet table
+# can sort on them and the journal line stays one line.
+R_PULL=skipped R_RECONCILE=none R_DEPS=unchanged R_AGENT=unchanged
+
+# Nothing here may wait on a person. A fetch that needs a credential nobody is
+# there to type fails at once instead of holding the unit open.
+export GIT_TERMINAL_PROMPT=0
+: "${GIT_SSH_COMMAND:=ssh -o BatchMode=yes}"
+export GIT_SSH_COMMAND
+
+if [ -e "$MARKER" ]; then
+  log "opted out: $MARKER exists; nothing done"
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR/box-update" 2>/dev/null || true
+# The agent's box-update RPC starts the unit, which systemd serializes, but the
+# script can also be run by hand. Never two at once.
+exec 9>"$STATE_DIR/box-update/lock" || exit 0
+if ! flock -n 9; then
+  log 'another termag-box-update is running; nothing done'
+  exit 0
+fi
+
+# ── 0. the orchestrator's say ───────────────────────────────────────────────
+
+# Config search order follows agent/agent.js and deploy/termag-status.
+find_agent_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" \
+           "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" \
+           "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# api_url PATH: the orchestrator's API from the agent config's termag_url
+# (ws(s)://host/termag/ws/agent -> http(s)://host/termag/api/<PATH>), or
+# failure with the reason on stdout.
+api_url() {
+  local url=$1 path=$2
+  url=${url%%\?*}                                    # strip query (token etc.)
+  case $url in
+    ws://*)  url="http://${url#ws://}"   ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}/api/$path" ;;
+    *) printf 'termag_url %s does not end in /ws/agent' "$url"; return 1 ;;
+  esac
+}
+
+# policy_refusal: why the orchestrator's answer is not a yes, or nothing when
+# it is. Every failure mode is a no.
+policy_refusal() {
+  local config token url body enabled reason
+  config=$(find_agent_config) || { printf 'no agent config; cannot ask the orchestrator'; return; }
+  token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+  url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
+  if [ -z "$token" ] || [ -z "$url" ]; then printf '%s has no token or no termag_url' "$config"; return; fi
+  url=$(api_url "$url" box-update/policy) || { printf '%s' "$url"; return; }
+  # The token goes in through `curl -K -` (config on stdin), never as -H on the
+  # command line, which is world-readable; termag-status takes the same care.
+  body=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -sf -m "$POLICY_TIMEOUT" -K - "$url" 2>/dev/null) || { printf 'could not ask %s (curl exit %s)' "$url" "$?"; return; }
+  enabled=$(printf '%s' "$body" | jq -r 'if .enabled == true then "yes" else "no" end' 2>/dev/null) || enabled=unreadable
+  case $enabled in
+    yes) ;;
+    no)  reason=$(printf '%s' "$body" | jq -r '.reason // empty' 2>/dev/null) || reason=
+         printf 'the orchestrator says no%s' "${reason:+ ($reason)}" ;;
+    *)   printf 'unreadable answer from %s' "$url" ;;
+  esac
+}
+
+if [ "$WHEN_ENABLED" = 1 ]; then
+  gate=$(policy_refusal)
+  if [ -n "$gate" ]; then
+    log "not enabled for this box: $gate; nothing done"
+    exit 0
+  fi
+  log 'enabled: the orchestrator says automatic updates are on for this box'
+fi
+
+# ── the outcome report ──────────────────────────────────────────────────────
+
+# One POST per update run, at exit, whatever happened: {event: box-update,
+# outcome, from, to, pull, reconcile, deps, agent, at} to
+# /api/box-update/report with the agent token on curl's stdin. The
+# orchestrator writes it on the box row and logs one line, which is how an
+# admin sees that a box pulled and did not restart, without this box's
+# journal. Best effort, 5 s, never retried, nothing in --check mode; an older
+# orchestrator answers 404 and nothing else changes. The outcome is the one
+# word the Fleet table sorts on: updated (the agent restarted), deferred (a
+# restart is due but held: a live cloud session, a unit without
+# KillMode=process), failed (a fetch, reconcile, install or restart failed),
+# skipped (the checkout is not one this script pulls), current (nothing to do).
+# One word for the run. A failed step wins: the steps run independently, so a
+# restart can follow a failed fetch, and "updated" would hide the failure.
+outcome_word() {
+  case "$R_PULL" in fetch-failed|diverged) printf failed; return ;; esac
+  case "$R_RECONCILE" in failed|drift-remains|missing) printf failed; return ;; esac
+  case "$R_DEPS" in failed) printf failed; return ;; esac
+  case "$R_AGENT" in restart-failed) printf failed; return ;; esac
+  case "$R_AGENT" in restarted) printf updated; return ;; deferred:*|blocked:*) printf deferred; return ;; esac
+  case "$R_PULL" in refused:*) printf skipped; return ;; esac
+  printf current
+}
+report_outcome() {
+  local config token url body code outcome
+  [ "$MODE" = update ] || return 0
+  command -v curl >/dev/null 2>&1 || { log 'report: not posted: curl not installed'; return 0; }
+  config=$(find_agent_config) || { log 'report: not posted: no agent config'; return 0; }
+  token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+  url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
+  if [ -z "$token" ] || [ -z "$url" ]; then log "report: not posted: $config has no token or no termag_url"; return 0; fi
+  url=$(api_url "$url" box-update/report) || { log "report: not posted: $url"; return 0; }
+  outcome=$(outcome_word)
+  body=$(jq -nc --arg o "$outcome" --arg from "${before:-}" --arg to "${after:-}" \
+    --arg pull "$R_PULL" --arg rec "$R_RECONCILE" --arg deps "$R_DEPS" --arg agent "$R_AGENT" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{event: "box-update", outcome: $o, pull: $pull, reconcile: $rec, deps: $deps, agent: $agent, at: $at}
+     + (if $from != "" then {from: $from} else {} end) + (if $to != "" then {to: $to} else {} end)')
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -s -m 5 -K - -o /dev/null -w '%{http_code}' -X POST "$url" -H 'Content-Type: application/json' -d "$body" 2>/dev/null) || code=
+  case "$code" in
+    204) log "report: posted ($outcome)" ;;
+    ''|000) log "report: not posted: $url unreachable" ;;
+    404) log "report: not posted: $url answered 404 (the orchestrator predates the report)" ;;
+    *) log "report: not posted: $url answered HTTP $code" ;;
+  esac
+}
+# From here every exit, including a step's `exit`, reports; the opt-out, the
+# lock and the policy gate above exit before this is armed and report nothing.
+before='' after=''
+trap report_outcome EXIT
+
+bounded() {  # bounded SECONDS cmd...: run with timeout(1) when there is one
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+}
+
+short() { printf '%s' "${1:0:12}"; }
+
+# ── 1. pull ─────────────────────────────────────────────────────────────────
+
+# Why the checkout is not pulled, or nothing when it is. These are states of
+# the checkout, not of the network: a failed fetch is reported separately and
+# does not stop the agent restart below.
+pull_refusal() {
+  local branch
+  if [ ! -d "$CHECKOUT/.git" ] && [ ! -f "$CHECKOUT/.git" ]; then
+    printf 'no git checkout at %s' "$CHECKOUT"; return
+  fi
+  if [ ! -w "$CHECKOUT/.git" ]; then
+    printf '%s is not writable by %s; the image owns it and updates it' "$CHECKOUT" "$(id -un)"; return
+  fi
+  if ! branch=$(git -C "$CHECKOUT" symbolic-ref --quiet --short HEAD 2>/dev/null); then
+    printf 'detached HEAD'; return
+  fi
+  if [ "$branch" != main ]; then
+    printf "on branch '%s', not main; a developer's checkout is left alone" "$branch"; return
+  fi
+  if [ -n "$(git -C "$CHECKOUT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    printf 'the working tree has local changes'; return
+  fi
+  if ! git -C "$CHECKOUT" remote get-url origin >/dev/null 2>&1; then
+    printf 'no origin remote'; return
+  fi
+}
+
+before=$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+after=$before
+refusal=$(pull_refusal)
+# The refusal as a token for the report, from the text (pull_refusal runs in a subshell).
+refusal_code() {
+  case "$1" in
+    *'no git checkout'*) printf no-checkout ;; *'not writable'*) printf not-writable ;; *detached*) printf detached ;;
+    *'on branch'*) printf branch ;; *'local changes'*) printf dirty ;; *'no origin'*) printf no-origin ;; *) printf other ;;
+  esac
+}
+
+if [ -n "$refusal" ]; then
+  log "pull: skipped: $refusal"
+  R_PULL="refused:$(refusal_code "$refusal")"
+else
+  if ! out=$(bounded "$GIT_TIMEOUT" git -C "$CHECKOUT" fetch --quiet origin main 2>&1); then
+    warn "pull: fetch failed: ${out:-timed out after ${GIT_TIMEOUT}s}"
+    R_PULL=fetch-failed
+  else
+    behind=$(git -C "$CHECKOUT" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo '?')
+    if [ "$behind" = 0 ]; then
+      log "pull: current at $(short "$before")"
+      R_PULL=current
+    elif [ "$MODE" = check ]; then
+      log "pull: would fast-forward $(short "$before")..$(short "$(git -C "$CHECKOUT" rev-parse FETCH_HEAD)") ($behind commits)"
+      todo=1
+      R_PULL=would-pull
+    elif out=$(git -C "$CHECKOUT" merge --ff-only --quiet FETCH_HEAD 2>&1); then
+      after=$(git -C "$CHECKOUT" rev-parse HEAD)
+      log "pull: $(short "$before")..$(short "$after") ($behind commits)"
+      R_PULL="pulled:$behind"
+    else
+      warn "pull: main has diverged from origin/main; not pulling: $out"
+      R_PULL=diverged
+    fi
+  fi
+fi
+
+# ── 2. reconcile ────────────────────────────────────────────────────────────
+
+indent() { sed 's/^/  /'; }
+
+if [ ! -x "$RECONCILE" ]; then
+  warn "reconcile: no termag-reconcile at $RECONCILE"
+  R_RECONCILE=missing
+else
+  if out=$("$RECONCILE" --check 2>&1); then
+    log 'reconcile: installed artifacts match the checkout'
+    R_RECONCILE=clean
+  else
+    log 'reconcile: drift:'
+    printf '%s\n' "$out" | indent
+    todo=1
+    R_RECONCILE=would-reconcile
+    if [ "$MODE" = update ]; then
+      if out=$("$RECONCILE" 2>&1); then
+        [ -z "$out" ] || printf '%s\n' "$out" | indent
+        R_RECONCILE=reconciled
+      else
+        warn "reconcile: termag-reconcile exited $?"
+        [ -z "$out" ] || printf '%s\n' "$out" | indent >&2
+        R_RECONCILE=failed
+      fi
+      if out=$("$RECONCILE" --check 2>&1); then
+        log 'reconcile: clean'
+      else
+        warn 'reconcile: drift remains after reconciling:'
+        printf '%s\n' "$out" | indent >&2
+        R_RECONCILE=drift-remains
+      fi
+    fi
+  fi
+fi
+
+# ── 3. agent dependencies ───────────────────────────────────────────────────
+
+# The Node the agent's dependencies are installed with. Under systemd there is
+# no nvm on PATH, so it is found the way the agent unit finds it; a checkout
+# that carries its own Node wins, as in termag-reconcile.
+find_node() {
+  if [ -x "$CHECKOUT/node/bin/node" ]; then
+    printf '%s\n' "$CHECKOUT/node/bin/node"
+    return 0
+  fi
+  command -v node 2>/dev/null && return 0
+  [ -s "$HOME/.nvm/nvm.sh" ] || return 1
+  # shellcheck disable=SC1091
+  (set +u; . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 && nvm which default 2>/dev/null)
+}
+
+deps_ok=1
+# Set in --check when step 3 would install the dependencies: the restart that
+# would follow is reported too. In an update the swapped-in node_modules
+# directory is newer than the process, which agent_changed_since reads from
+# disk, so a restart deferred this time is still due next time.
+deps_installed=0
+
+# What agent/package-lock.json says sits at the top of agent/node_modules,
+# against what is there: a package missing or at another version is stale.
+# Dev packages are not installed (--omit=dev) and an optional one may be
+# absent on this platform; both are skipped. One line per stale package on
+# stdout, exit 1 when there is any. Reads only package.json files, so it costs
+# nothing worth measuring and runs on every pass.
+stale_agent_deps() {  # stale_agent_deps NODE
+  "$1" - "$CHECKOUT/agent" <<'JS'
+const fs = require('fs'), path = require('path');
+const dir = process.argv[2];
+const lock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json'), 'utf8'));
+let stale = 0;
+for (const [key, want] of Object.entries(lock.packages || {})) {
+  const m = /^node_modules\/((?:@[^/]+\/)?[^/]+)$/.exec(key);
+  if (!m || want.dev) continue;
+  let have = null;
+  try { have = JSON.parse(fs.readFileSync(path.join(dir, key, 'package.json'), 'utf8')).version; } catch {}
+  if (have === null && want.optional) continue;
+  if (have !== want.version) {
+    console.log(`${m[1]}: ${have ? `${have} installed` : 'missing'}, ${want.version} locked`);
+    stale++;
+  }
+}
+process.exit(stale ? 1 : 0);
+JS
+}
+
+# `npm ci`, never `npm install`: install can rewrite package-lock.json, which
+# would dirty the tree and refuse every later pull. Run in a staging copy of
+# agent/'s files, then the finished node_modules is moved into place whole:
+# `npm ci` empties node_modules before it installs, and a download that fails
+# half-way in the live tree would leave an agent that cannot start again after
+# its next crash or reboot.
+ensure_agent_deps() {
+  local agent="$CHECKOUT/agent" node npm bin stale stage out
+  [ -f "$agent/package-lock.json" ] || return 0
+  if ! node=$(find_node) || [ -z "$node" ]; then
+    warn 'deps: no Node.js found; the agent dependencies were not checked'
+    R_DEPS=unchecked
+    return 0
+  fi
+  if stale=$(stale_agent_deps "$node" 2>&1); then
+    return 0
+  fi
+  todo=1
+  log 'deps: agent dependencies differ from agent/package-lock.json:'
+  printf '%s\n' "$stale" | indent
+  if [ "$MODE" = check ]; then
+    log 'deps: would install them (npm ci)'
+    deps_installed=1
+    R_DEPS=would-install
+    return 0
+  fi
+  bin=$(dirname "$node")
+  npm="$bin/npm"
+  if [ ! -x "$npm" ] && ! npm=$(command -v npm 2>/dev/null); then
+    warn "deps: no npm next to $node or on PATH; dependencies not installed"
+    deps_ok=0
+    R_DEPS=failed
+    return 0
+  fi
+  if ! stage=$(mktemp -d "$STATE_DIR/box-update/agent-deps.XXXXXX"); then
+    warn "deps: could not make a staging directory under $STATE_DIR/box-update; dependencies not installed"
+    deps_ok=0
+    R_DEPS=failed
+    return 0
+  fi
+  # Every file at the top of agent/ (package.json, the lockfile, the
+  # postinstall script it names); never node_modules or the config.
+  find "$agent" -maxdepth 1 -type f ! -name 'agent.config*.json' -exec cp -p {} "$stage/" \;
+  if out=$(cd "$stage" && PATH="$bin:$PATH" bounded "$NPM_TIMEOUT" "$npm" ci --omit=dev --no-audit --no-fund --loglevel=error 2>&1) \
+     && [ -d "$stage/node_modules" ]; then
+    rm -rf "$agent/node_modules.prev"
+    if { [ ! -e "$agent/node_modules" ] || mv "$agent/node_modules" "$agent/node_modules.prev"; } \
+       && mv "$stage/node_modules" "$agent/node_modules"; then
+      rm -rf "$agent/node_modules.prev"
+      log 'deps: agent dependencies installed (npm ci)'
+      deps_installed=1
+      R_DEPS=installed
+    else
+      [ -e "$agent/node_modules" ] || mv "$agent/node_modules.prev" "$agent/node_modules" 2>/dev/null
+      warn 'deps: could not put the new agent dependencies in place; the agent keeps its current ones'
+      deps_ok=0
+      R_DEPS=failed
+    fi
+  else
+    warn 'deps: npm ci failed; the agent keeps its current dependencies:'
+    printf '%s\n' "${out:-timed out after ${NPM_TIMEOUT}s}" | tail -n 5 | indent >&2
+    deps_ok=0
+    R_DEPS=failed
+  fi
+  rm -rf "$stage"
+}
+
+if [ -n "$refusal" ]; then
+  log "deps: left alone: $refusal"
+  R_DEPS=left
+else
+  ensure_agent_deps
+fi
+
+# ── 4. agent restart ────────────────────────────────────────────────────────
+
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' "$1"; }
+
+# Epoch seconds the agent process started, or failure when systemd cannot say.
+agent_started() {
+  local ts
+  ts=$(systemctl --user show -p ExecMainStartTimestamp --value "$UNIT" 2>/dev/null) || return 1
+  [ -n "$ts" ] || return 1
+  date -d "$ts" +%s 2>/dev/null
+}
+
+# Prints the first thing the agent runs that is newer than $1 (epoch seconds):
+# the unit file systemd loaded, the agent/node_modules directory, or a tracked
+# file under agent/ other than its tests. Tracked files otherwise, so an
+# agent.config.json does not count; a pull touches only the files it changes,
+# so a bundle clone's files from the bake stay older than the agent that
+# started after it. node_modules is read as one directory: step 3 swaps it in
+# whole (the directory keeps the mtime of its install) and an `npm install`
+# by hand writes into it, and either way the process has the old modules
+# loaded until it restarts.
+agent_changed_since() {
+  local since=$1 f m
+  f=$(systemctl --user show -p FragmentPath --value "$UNIT" 2>/dev/null)
+  if [ -n "$f" ] && m=$(stat -c %Y "$f" 2>/dev/null) && [ "$m" -gt "$since" ]; then
+    printf '%s' "$f"
+    return 0
+  fi
+  if m=$(stat -c %Y "$CHECKOUT/agent/node_modules" 2>/dev/null) && [ "$m" -gt "$since" ]; then
+    printf 'agent/node_modules'
+    return 0
+  fi
+  while IFS= read -r -d '' f; do
+    case "$f" in *.test.js|*.test.sh|*.test.mjs) continue ;; esac
+    m=$(stat -c %Y "$CHECKOUT/$f" 2>/dev/null) || continue
+    if [ "$m" -gt "$since" ]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done < <(git -C "$CHECKOUT" ls-files -z -- agent 2>/dev/null)
+  return 1
+}
+
+live_runner_sessions() {
+  tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-claude-runner-s[0-9]+-[A-Za-z0-9][A-Za-z0-9_-]*-r$' || true
+}
+
+maybe_restart_agent() {
+  local state started changed killmode runners
+  state=$(systemctl --user is-active "$UNIT" 2>/dev/null || true)
+  if [ "$state" != active ]; then
+    log "agent: $UNIT is ${state:-not loaded}; nothing to restart"
+    R_AGENT="inactive:${state:-unloaded}"
+    return 0
+  fi
+  if ! started=$(agent_started) || [ -z "$started" ]; then
+    warn "agent: cannot tell when $UNIT started; not restarting"
+    R_AGENT=unknown-start
+    return 0
+  fi
+  if ! changed=$(agent_changed_since "$started"); then
+    if [ "$deps_installed" = 1 ]; then
+      changed='agent/node_modules'
+    else
+      log "agent: nothing it runs changed since it started ($(iso "$started")); not restarting"
+      R_AGENT=unchanged
+      return 0
+    fi
+  fi
+  if [ -n "$refusal" ]; then
+    log "agent: $changed changed since it started, but $refusal; leaving the restart to the owner"
+    R_AGENT=left:checkout
+    return 0
+  fi
+  if [ "$deps_ok" != 1 ]; then
+    warn "agent: $changed changed since it started, but its dependencies did not install; not restarting"
+    R_AGENT=blocked:deps
+    return 0
+  fi
+  killmode=$(systemctl --user show -p KillMode --value "$UNIT" 2>/dev/null)
+  if [ "$killmode" != process ]; then
+    warn "agent: $changed changed since it started, but the loaded unit has KillMode=${killmode:-unknown}, so a restart would kill the tmux server and every pane; it takes effect at the next boot"
+    R_AGENT=blocked:killmode
+    return 0
+  fi
+  runners=$(live_runner_sessions)
+  if [ -n "$runners" ]; then
+    log "agent: $changed changed since it started; deferring the restart while a Claude Code cloud session is live ($(printf '%s' "$runners" | tr '\n' ' '))"
+    R_AGENT=deferred:runner
+    return 0
+  fi
+  todo=1
+  if [ "$MODE" = check ]; then
+    log "agent: would restart $UNIT ($changed changed since it started, $(iso "$started"))"
+    R_AGENT=would-restart
+    return 0
+  fi
+  if systemctl --user restart "$UNIT" 2>&1; then
+    log "agent: restarted $UNIT ($changed changed since it started, $(iso "$started"))"
+    R_AGENT=restarted
+  else
+    warn "agent: restart of $UNIT failed"
+    R_AGENT=restart-failed
+  fi
+}
+
+maybe_restart_agent
+
+# ── 5. TUI ──────────────────────────────────────────────────────────────────
+
+# `termag tui` runs the build next to cli/ when somebody made one (make
+# install-tui). Only that case is rebuilt here: nobody asked for a TUI on a
+# box without one. The installer checks the Node version itself.
+rebuild_tui() {
+  local installer="$CHECKOUT/tui/install.sh" node out
+  [ -f "$installer" ] && [ -f "$CHECKOUT/tui/dist/index.js" ] || return 0
+  if ! node=$(find_node) || [ -z "$node" ]; then
+    warn 'tui: no Node.js found; not rebuilt'
+    return 0
+  fi
+  if sh "$installer" --check --node "$node" >/dev/null 2>&1; then
+    return 0
+  fi
+  todo=1
+  if [ "$MODE" = check ]; then
+    log 'tui: would rebuild'
+    return 0
+  fi
+  if out=$(bounded "$NPM_TIMEOUT" sh "$installer" --quiet --node "$node" 2>&1); then
+    log 'tui: rebuilt'
+  else
+    warn "tui: rebuild failed: $(printf '%s\n' "$out" | tail -n 1)"
+  fi
+}
+
+if [ -n "$refusal" ]; then
+  log "tui: left alone: $refusal"
+else
+  rebuild_tui
+fi
+
+if [ "$MODE" = check ]; then
+  [ "$todo" = 0 ] || exit 1
+fi
+exit 0

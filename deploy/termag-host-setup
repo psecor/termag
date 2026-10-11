@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# termag-host-setup <unixuser> -- give a termag user a host account and host agent
+# on the orchestrator. The agent token arrives on stdin.
+#
+# The backend (backend/src/services/hostSetup.ts) runs this through exactly one
+# sudoers rule, the only root action the `termag` service user has:
+#
+#   termag ALL=(root) NOPASSWD: /usr/local/sbin/termag-host-setup
+#
+# It mints the user's host agent token first and passes the raw value on stdin,
+# never argv (argv is world-readable through ps). This script then:
+#
+#   1. creates the unix account if it doesn't exist (no sudo, no extra groups),
+#   2. writes ~/.termag/agent.config.json with the token -- AS THE USER, so root
+#      never writes through paths the user controls,
+#   3. installs the Claude Code status hooks (deploy/claude-hooks.md), also as
+#      the user: ~/.local/bin/termag-status links to the image's root-owned
+#      copy, so it is never stale; ~/.claude/settings.json is created only if
+#      the user has none -- the rule termag-reconcile follows on boxes, since
+#      people add their own hooks,
+#   4. enables lingering and (re)starts the user's termag-agent-host unit,
+#      which runs the image's root-owned /usr/local/lib/termag/agent.
+#
+# Accounts get a regular uid (1000-59999), the range termag-imds-guard.service
+# blocks from instance metadata. user@.service requires that unit and reloads
+# its rules before starting, so step 4 fails, with nothing of the user's
+# running, when the guard didn't load. A manager that is already running
+# doesn't start again, so step 4 reloads the rules itself before the agent.
+#
+# It refuses to replace an agent config it didn't write, so a hand-installed
+# agent is never clobbered. Exit 2 = refused (bad input).
+#
+# It also refuses, with exit 3 and before touching any account, unless host
+# storage is in place: /run/termag/host-storage-ready exists and /home is the
+# bind of the data volume mounted at /srv/termag (deploy/termag-data-attach).
+# An account created on the root disk's /home
+# would take a UID a home on the volume uses and vanish under the mount. The
+# backend checks the ready file too; this is the check that holds if it is
+# ever bypassed. Anything else non-zero failed.
+set -euo pipefail
+
+# Tests only: prefix for the home directory and the image's files. sudo's
+# env_reset drops it, so the backend's call can't set it.
+ROOT="${TERMAG_HOST_SETUP_ROOT:-}"
+# Root-owned copies the image installs (orchestrator-setup.sh); never
+# /opt/termag, which the termag service user can rewrite.
+LIB="$ROOT/usr/local/lib/termag"
+
+AGENT_URL="ws://127.0.0.1:3040/termag/ws/agent"
+UNIT="termag-agent-host.service"
+MARKER="termag-host-setup"
+
+refuse() { echo "termag-host-setup: $*" >&2; exit 2; }
+
+[ $# -eq 1 ] || refuse "usage: termag-host-setup <unixuser> (agent token on stdin)"
+user="$1"
+
+# The derived name is the lowercased email local part; allow what useradd does
+# on Ubuntu and nothing more. Keep these checks mirrored in
+# backend/src/services/hostUnixUsername.ts so API callers fail before sudo.
+[[ "$user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || refuse "invalid username: $user"
+case "$user" in
+  root | termag | ubuntu | ssm-user | nobody | admin | sudo | adm | docker | postgres | \
+    www-data | lxd | sync | daemon | bin | sys | games | man | mail | news | backup | \
+    systemd-* | _*)
+    refuse "reserved username: $user" ;;
+esac
+
+token=""
+IFS= read -r token || true
+[[ "$token" =~ ^tmag_[0-9a-f]{64}$ ]] || refuse "expected a tmag_ agent token on stdin"
+
+no_storage() { echo "termag-host-setup: host storage is not mounted: $*" >&2; exit 3; }
+[ -f "$ROOT/run/termag/host-storage-ready" ] || no_storage "no /run/termag/host-storage-ready"
+srv_src="$(findmnt -n -o SOURCE --mountpoint /srv/termag 2>/dev/null)" || no_storage "/srv/termag is not a mount"
+home_src="$(findmnt -n -o SOURCE --mountpoint /home 2>/dev/null)" || no_storage "/home is not a mount"
+[ -n "$srv_src" ] && [ "$home_src" = "${srv_src}[/home]" ] ||
+  no_storage "/home is $home_src, not the bind of /srv/termag ($srv_src)"
+
+if uid="$(id -u "$user" 2>/dev/null)"; then
+  # Only regular accounts: never a system or service account that happens to
+  # share a derived name.
+  if ((uid < 1000 || uid >= 60000)); then
+    refuse "not a regular account: $user (uid $uid)"
+  fi
+else
+  useradd --create-home --shell /bin/bash --user-group -K UID_MAX=59999 "$user"
+  uid="$(id -u "$user")"
+fi
+
+home="$(getent passwd "$user" | cut -d: -f6)"
+[ "$home" = "/home/$user" ] || refuse "unexpected home for $user: $home"
+
+# Everything in the home is written as the user. The token rides stdin again.
+printf '%s\n' "$token" | runuser -u "$user" -- env \
+  HOMEDIR="$ROOT$home" LIB="$LIB" MARKER="$MARKER" AGENT_URL="$AGENT_URL" \
+  bash -c '
+    set -euo pipefail
+    umask 077
+    IFS= read -r token
+    CFGDIR="$HOMEDIR/.termag"
+    cfg="$CFGDIR/agent.config.json"
+    if [ -e "$cfg" ] && ! grep -q "\"managed_by\": \"$MARKER\"" "$cfg"; then
+      echo "termag-host-setup: refusing to replace a hand-made $cfg" >&2
+      exit 2
+    fi
+    mkdir -p "$CFGDIR"
+    tmp="$(mktemp "$CFGDIR/.agent.config.XXXXXX")"
+    printf "{\n  \"managed_by\": \"%s\",\n  \"termag_url\": \"%s\",\n  \"token\": \"%s\",\n  \"reconnect_interval_seconds\": 5\n}\n" \
+      "$MARKER" "$AGENT_URL" "$token" >"$tmp"
+    mv -f "$tmp" "$cfg"
+
+    # Claude Code status hooks. termag-status is a symlink into the image, not a
+    # copy: a copied one goes stale when the image moves on (AGENTS.md, the
+    # termag-reconcile gotcha), and nothing re-runs this on a healthy host.
+    mkdir -p "$HOMEDIR/.local/bin" "$HOMEDIR/.claude"
+    ln -sfn "$LIB/termag-status" "$HOMEDIR/.local/bin/termag-status"
+    # settings.json only when absent; mv -n so a file the user creates in the
+    # meantime still wins. Some coreutils exit non-zero when -n skips, which
+    # is the outcome we want here, not a failure.
+    if [ ! -e "$HOMEDIR/.claude/settings.json" ]; then
+      tmp="$(mktemp "$HOMEDIR/.claude/.settings.XXXXXX")"
+      cp "$LIB/claude-settings.json" "$tmp"
+      mv -n "$tmp" "$HOMEDIR/.claude/settings.json" || true
+      rm -f "$tmp"
+    fi
+  '
+
+# Lingering keeps the user's manager (and the agent) running with nobody logged
+# in. Restart, not start, so a replaced token is picked up.
+loginctl enable-linger "$user"
+systemctl start "user@${uid}.service"
+systemctl --user -M "${user}@" daemon-reload
+systemctl --user -M "${user}@" enable "$UNIT"
+# The rules may have been flushed since the manager started.
+systemctl reload termag-imds-guard.service
+systemctl --user -M "${user}@" restart "$UNIT"
+echo "termag-host-setup: $user ready"

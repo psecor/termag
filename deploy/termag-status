@@ -15,13 +15,68 @@
 # with no per-box configuration.
 #
 # Usage:
-#   termag-status working|idle|not_running
+#   termag-status working|idle|not_running|waiting [options]
+#   termag-status meta [options]      # metadata-only (contextTokens / rateLimited)
 #   termag-status notification        # Claude Code hook JSON on stdin
+#   termag-status prompt-submit       # UserPromptSubmit hook JSON on stdin:
+#                                     # posts `working`; inside a Claude Code
+#                                     # cloud session on a termag box, also
+#                                     # posts the first prompt's first line
+#                                     # once as the session's title (the
+#                                     # once-marker is claimed before posting)
+#   termag-status post-tool           # PostToolUse hook JSON on stdin: posts
+#                                     # `working`, plus a milestone when the
+#                                     # tool was a Bash `gh pr create|merge`
+#   termag-status stop                # Stop hook JSON on stdin: posts `idle`;
+#                                     # inside a Claude Code cloud session on a
+#                                     # termag box, also posts the session's
+#                                     # cumulative token usage, summed from the
+#                                     # transcript the payload names
+#   termag-status usage [--transcript <jsonl>]...
+#                                     # the usage post alone, from the given
+#                                     # transcripts (or the hook JSON on stdin);
+#                                     # no tmux session needed: the runner's
+#                                     # post-session hook calls it once more at
+#                                     # the end
+#   termag-status --classify          # hook JSON on stdin → "<kind> <url>" when
+#                                     # the call opened/merged a PR (the URL in
+#                                     # the output is the proof it succeeded),
+#                                     # else nothing; POSTs nothing (tests)
 #   termag-status --print-endpoint    # resolve and print, POST nothing
 #   termag-status --print-auth        # 'token: present|absent', never the token
 #
+# Options (after the mode; all optional, unknown ones are ignored):
+#   --source <id>            status source, e.g. pi-ext:pi. Omitted =
+#                            the historical payload, which the server books as
+#                            Claude -- the Claude hooks rely on exactly that.
+#   --reason approval|user_input   waitingReason for `waiting`
+#   --message <text>         trimmed to 200 chars
+#   --notify                 ask the server to notify (Slack/Discord needs-input)
+#   --context-tokens <n|null>, --rate-limited <text|null>
+#                            metadata; `null` clears. Valid on `meta` and on a
+#                            status post.
+#   --print-payload          print the JSON that would be sent, POST nothing
+#
+#   termag-status --print-mirrors     # one resolved mirror endpoint per line, POST nothing
+#
+# Mirrors: every post also goes to each endpoint listed in
+#   ~/.config/termag/status-mirrors   (TERMAG_STATUS_MIRRORS overrides the path)
+# one agent-config path per line, `#` comments and blank lines ignored, unreadable
+# paths skipped. Each config resolves to its own endpoint + token exactly as the
+# primary does; a mirror that resolves to the primary's endpoint is skipped, so a
+# caller that already targets a mirror never double-posts. A file reaches the
+# hooks AND pi's status extension in already-running panes, which an environment
+# variable cannot -- this is how the staging stack (scripts/stage/stage.sh) gets a
+# copy of every status event without duplicating hook entries per provider.
+#
 # Env:
 #   TERMAG_AGENT_CONFIG    override the config path
+#   TERMAG_STATUS_MIRRORS  override the mirrors file path
+#   TERMAG_CLAUDE_RUNNER_ORDER, TERMAG_CLAUDE_RUNNER_DIR, CLAUDE_CODE_REMOTE_SESSION_ID
+#                          set by termag-claude-runner and the runner inside a
+#                          cloud session: the order the title post names, where
+#                          the once-only marker goes, and the session id
+#   TERMAG_STATUS_SESSION  override the tmux session name (tests, non-tmux callers)
 #   TERMAG_STATUS_DEBUG=1  dump the last notification payload to
 #                          ~/.cache/termag-status/last-notification.json
 
@@ -30,6 +85,24 @@ PATH=/usr/local/bin:/usr/bin:/bin:$PATH
 
 MODE=${1:-}
 [ -n "$MODE" ] || exit 0
+[ $# -gt 0 ] && shift
+
+# --- options ----------------------------------------------------------------
+SOURCE='' REASON='' MESSAGE='' NOTIFY='' CTX_TOKENS='' RATE_LIMITED='' PRINT_PAYLOAD=''
+TRANSCRIPTS=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --source)         SOURCE=${2:-};       shift 2 2>/dev/null || shift ;;
+    --reason)         REASON=${2:-};       shift 2 2>/dev/null || shift ;;
+    --message)        MESSAGE=${2:-};      shift 2 2>/dev/null || shift ;;
+    --notify)         NOTIFY=1;            shift ;;
+    --context-tokens) CTX_TOKENS=${2:-};   shift 2 2>/dev/null || shift ;;
+    --rate-limited)   RATE_LIMITED=${2:-}; shift 2 2>/dev/null || shift ;;
+    --print-payload)  PRINT_PAYLOAD=1;     shift ;;
+    --transcript)     [ -n "${2:-}" ] && TRANSCRIPTS+=("$2"); shift 2 2>/dev/null || shift ;;
+    *)                shift ;;   # forward compatible: unknown options are ignored
+  esac
+done
 
 # --- resolve the endpoint ---------------------------------------------------
 # Config search order follows agent/agent.js, plus the path the systemd unit
@@ -45,16 +118,18 @@ find_config() {
   return 1
 }
 
+# Both resolvers take an optional config path (a mirror); without one they use
+# the primary config from find_config.
 resolve_token() {
-  local config
-  config=$(find_config) || return 0
+  local config=${1:-}
+  [ -n "$config" ] || config=$(find_config) || return 0
   jq -r '.token // empty' "$config" 2>/dev/null || true
 }
 
 resolve_endpoint() {
   # agent.js's own fallback, for a co-located server with no readable config.
-  local endpoint='http://127.0.0.1:3040/termag/api/status' config url
-  config=$(find_config) || config=
+  local endpoint='http://127.0.0.1:3040/termag/api/status' config=${1:-} url
+  [ -n "$config" ] || config=$(find_config) || config=
   if [ -n "$config" ]; then
     url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
     if [ -n "$url" ]; then
@@ -77,6 +152,38 @@ if [ "$MODE" = "--print-endpoint" ]; then
   exit 0
 fi
 
+# Mirror configs: readable paths from the mirrors file, in file order.
+mirror_configs() {
+  local file=${TERMAG_STATUS_MIRRORS:-$HOME/.config/termag/status-mirrors} line
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$line" ] || continue
+    # shellcheck disable=SC2088  # a literal "~/" typed into the mirrors file; expanded to $HOME here
+    case $line in "~/"*) line="$HOME/${line#"~/"}" ;; esac
+    [ -r "$line" ] && printf '%s\n' "$line"
+  done <"$file"
+}
+
+# Mirror endpoints that differ from the primary and from each other, one per
+# line as "<endpoint>\t<config>", so the posting loop can fetch each token.
+mirror_targets() {
+  local primary=$1 config endpoint seen=$'\n'
+  while IFS= read -r config; do
+    endpoint=$(resolve_endpoint "$config")
+    [ "$endpoint" != "$primary" ] || continue
+    case $seen in *$'\n'"$endpoint"$'\n'*) continue ;; esac
+    seen="$seen$endpoint"$'\n'
+    printf '%s\t%s\n' "$endpoint" "$config"
+  done < <(mirror_configs)
+}
+
+if [ "$MODE" = "--print-mirrors" ]; then
+  mirror_targets "$(resolve_endpoint)" | cut -f1
+  exit 0
+fi
+
 if [ "$MODE" = "--print-auth" ]; then
   # Deliberately reports presence only -- printing the token would defeat the
   # care taken to keep it out of argv and logs.
@@ -84,16 +191,224 @@ if [ "$MODE" = "--print-auth" ]; then
   exit 0
 fi
 
+# Remove heredoc bodies from a shell command: after a line containing
+# <<WORD / <<-WORD / <<'WORD' / <<"WORD", skip lines up to and including the
+# terminator (leading whitespace tolerated, as with <<-). Portable awk: the
+# regex is built from strings so no \x escapes are needed.
+strip_heredocs() {
+  awk -v q="'" '
+    BEGIN { term = ""; re = "<<-?[[:space:]]*[\"" q "]?[A-Za-z_][A-Za-z0-9_]*[\"" q "]?" }
+    term != "" {
+      line = $0; sub(/^[[:space:]]+/, "", line)
+      if (line == term) term = ""
+      next
+    }
+    {
+      if (match($0, re)) {
+        t = substr($0, RSTART, RLENGTH); sub(/^<<-?[[:space:]]*/, "", t); gsub(/["\047]/, "", t); term = t
+      }
+      print
+    }'
+}
+
+# --- milestone classification -------------------------------------------------
+# A PostToolUse payload describes one tool call. The only ones we care about
+# are Bash commands that open or merge a PR; the PR URL is in the tool output.
+# Prints "<kind> <url>" (url may be "-") or nothing. Only the classification
+# and URL ever leave the box -- never the command text itself.
+classify_tool() {
+  local input=$1 tool cmd out kind url
+  tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || return 0
+  [ "$tool" = "Bash" ] || return 0
+  cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null) || return 0
+  [ -n "$cmd" ] || return 0
+  # grep's ^ is line-anchored, so a heredoc BODY that merely documents
+  # "gh pr create" on its own line (cat <<EOF ... EOF) would match. Drop
+  # heredoc bodies first; the line carrying the << operator itself is kept, so
+  # `gh pr create --body-file - <<'EOF'` still counts.
+  cmd=$(printf '%s\n' "$cmd" | strip_heredocs)
+  # Match the gh subcommand as a word at a command boundary, so "echo gh pr create"
+  # inside a string does not count but "cd x && gh pr create ..." does.
+  if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\|\||&&)[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)'; then
+    kind=pr_created
+  elif printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\|\||&&)[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'; then
+    kind=pr_merged
+  else
+    return 0
+  fi
+  # tool_response is a string for Bash (stdout+stderr) in current Claude Code,
+  # but tolerate an object with .stdout. Take the first PR URL. The URL is also
+  # the evidence the command SUCCEEDED (gh prints it on create and merge; a
+  # failed run prints an error and no URL), so without one there is no
+  # milestone -- better to miss a prompt than to announce a PR that doesn't exist.
+  out=$(printf '%s' "$input" | jq -r '
+    (.tool_response // "") | if type == "object" then (.stdout // .output // "" | tostring) else tostring end' 2>/dev/null) || out=
+  url=$(printf '%s' "$out" | grep -oE 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+' | head -n1)
+  [ -n "$url" ] || return 0
+  printf '%s %s\n' "$kind" "$url"
+}
+
+if [ "$MODE" = "--classify" ]; then
+  classify_tool "$(cat)"
+  exit 0
+fi
+
+# --- cloud session token usage --------
+# The session's own transcript, summed the way agent/usage-scanner.js sums the
+# owner's: one JSONL line per content block repeats the same message.usage, so
+# lines are deduped on (requestId, message.id), falling back to message.id and
+# uuid. Reads lines raw (-R) and skips one that does not parse (a truncated
+# tail). Prints the event body for the order in TERMAG_CLAUDE_RUNNER_ORDER, or
+# nothing when there is no order, no readable transcript or no usage at all.
+usage_payload() {  # usage_payload <jsonl>...
+  local order=${TERMAG_CLAUDE_RUNNER_ORDER:-} f files=()
+  [ -n "$order" ] || return 0
+  for f in "$@"; do [ -r "$f" ] && files+=("$f"); done
+  [ "${#files[@]}" -gt 0 ] || return 0
+  jq -n -R -c --arg o "$order" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    reduce (inputs | fromjson? // empty) as $e
+      ({seen: {}, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0, models: {}};
+       ($e.message // null) as $m
+       | if ($m | type) != "object" or (($m.usage // null) | type) != "object" then .
+         else
+           (($e.requestId // "") | tostring) as $r | (($m.id // "") | tostring) as $mid
+           | (if $r != "" and $mid != "" then $r + "|" + $mid
+              elif $mid != "" then "msg|" + $mid
+              elif (($e.uuid // "") | tostring) != "" then "uuid|" + ($e.uuid | tostring)
+              else null end) as $k
+           | if $k != null and .seen[$k] then .
+             else (if $k != null then .seen[$k] = true else . end)
+               | .input += ($m.usage.input_tokens // 0)
+               | .output += ($m.usage.output_tokens // 0)
+               | .cacheRead += ($m.usage.cache_read_input_tokens // 0)
+               | .cacheCreate += ($m.usage.cache_creation_input_tokens // 0)
+               | .calls += 1
+               | if (($m.model // "") | tostring) != "" then .models[$m.model | tostring] += 1 else . end
+             end
+         end)
+    | select(.calls > 0)
+    | {event: "usage", orderId: $o, input, output, cacheRead, cacheCreate, calls,
+       model: ((.models | to_entries | sort_by(-.value) | .[0].key) // null), at: $at}' "${files[@]}" 2>/dev/null
+}
+# Where a usage post goes: the event route beside the status route, primary only
+# (the order exists on the orchestrator that launched the run, not on a mirror).
+usage_endpoint() { printf '%s' "${1%/api/status}/api/claude-runner/event"; }
+
+if [ "$MODE" = usage ]; then
+  if [ "${#TRANSCRIPTS[@]}" -eq 0 ]; then
+    # The hook payload names the transcript (Claude Code's documented hook stdin).
+    T=$(jq -r '.transcript_path // empty' 2>/dev/null) || T=
+    [ -n "$T" ] && TRANSCRIPTS+=("$T")
+  fi
+  USAGE_PAYLOAD=$(usage_payload "${TRANSCRIPTS[@]}")
+  [ -n "$USAGE_PAYLOAD" ] || exit 0
+  if [ -n "$PRINT_PAYLOAD" ]; then printf '%s\n' "$USAGE_PAYLOAD"; exit 0; fi
+  ENDPOINT=$(resolve_endpoint)
+  post_usage() {  # defined again below for the status modes; here for the bare mode
+    local url=$1 body=$2 token=$3
+    if [ -n "$token" ]; then
+      printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        | curl -sf -m 5 -K - -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1
+    else
+      curl -sf -m 5 -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1
+    fi
+  }
+  post_usage "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$(resolve_token)"
+  exit 0
+fi
+
 # The server keys status on the tmux session name; no session means no context.
-SESSION=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
+SESSION=${TERMAG_STATUS_SESSION:-}
+[ -n "$SESSION" ] || SESSION=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
 [ -n "$SESSION" ] || exit 0
 
 ENDPOINT=$(resolve_endpoint)
 
 # --- build the payload ------------------------------------------------------
+MILESTONE_PAYLOAD=
+TITLE_PAYLOAD=
+TITLE_ENDPOINT=
+TITLE_MARKER=
+USAGE_PAYLOAD=
+# Optional fields are added only when given, so a plain `termag-status working`
+# still sends exactly {session,status} -- the payload the Claude hooks have
+# always sent, which the server attributes to Claude by the absence of `source`.
+extras() {
+  jq -nc --arg src "$SOURCE" --arg r "$REASON" --arg m "$MESSAGE" --arg n "$NOTIFY" \
+         --arg ct "$CTX_TOKENS" --arg rl "$RATE_LIMITED" '
+    {}
+    + (if $src != "" then {source:$src} else {} end)
+    + (if $r   != "" then {waitingReason:$r} else {} end)
+    + (if $m   != "" then {message:($m|.[0:200])} else {} end)
+    + (if $n   != "" then {notify:true} else {} end)
+    + (if $ct == "null" then {contextTokens:null}
+       elif ($ct|test("^[0-9]+$")) then {contextTokens:($ct|tonumber)} else {} end)
+    + (if $rl == "null" then {rateLimited:null} elif $rl != "" then {rateLimited:$rl} else {} end)'
+}
+
 case $MODE in
-  working|idle|not_running)
-    PAYLOAD=$(jq -nc --arg s "$SESSION" --arg st "$MODE" '{session:$s,status:$st}')
+  working|idle|not_running|waiting)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --arg st "$MODE" --argjson x "$(extras)" '{session:$s,status:$st} + $x')
+    ;;
+  meta)
+    # Metadata-only update (routes/status.ts: no `status`, but contextTokens
+    # and/or rateLimited). Nothing to send is not an error.
+    [ -n "$CTX_TOKENS$RATE_LIMITED" ] || exit 0
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s} + $x')
+    # e.g. a non-numeric --context-tokens leaves only {session}: nothing to send.
+    [ "$(printf '%s' "$PAYLOAD" | jq 'del(.session, .source) | length')" -gt 0 ] || exit 0
+    ;;
+  post-tool)
+    # Read stdin in the foreground (see `notification` below for why). Always
+    # post `working`, as the old PostToolUse line did; additionally post a
+    # milestone when the tool call opened or merged a PR.
+    INPUT=$(cat)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"working"}')
+    CLASS=$(classify_tool "$INPUT")
+    if [ -n "$CLASS" ]; then
+      KIND=${CLASS%% *}; URL=${CLASS#* }
+      MILESTONE_PAYLOAD=$(jq -nc --arg s "$SESSION" --arg k "$KIND" --arg u "$URL" '{session:$s, kind:$k, url:$u}')
+    fi
+    ;;
+  prompt-submit)
+    # The UserPromptSubmit payload, read in the foreground (see `notification`).
+    # Always `working`, as the old UserPromptSubmit line posted. Inside a Claude
+    # Code cloud session on a termag box, the
+    # first prompt's first line becomes the session's title: one POST to the
+    # event route, once per run (a marker file in the runner's state dir), with
+    # the order id the runner wrapper exported. The server cuts the line to
+    # 120 characters and keeps the first title it gets. Never a status payload
+    # field: prompt text belongs on the run row only.
+    INPUT=$(cat)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"working"}')
+    if [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] && [ -n "${TERMAG_CLAUDE_RUNNER_ORDER:-}" ]; then
+      TITLE_MARKER=${TERMAG_CLAUDE_RUNNER_DIR:-$HOME/.termag/claude-runner}/$TERMAG_CLAUDE_RUNNER_ORDER.titled
+      if [ ! -e "$TITLE_MARKER" ]; then
+        TITLE_LINE=$(printf '%s' "$INPUT" | jq -r '(.prompt // "") | split("\n") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | .[0] // ""' 2>/dev/null | cut -c1-400)
+        # Claim the marker before any network call, atomically (noclobber is
+        # O_EXCL): two prompts whose hooks overlap would otherwise both post
+        # and the server would keep whichever arrived first. The claim stands
+        # whatever the POST answers, so a prompt is never re-sent.
+        if [ -n "$TITLE_LINE" ] && mkdir -p "$(dirname "$TITLE_MARKER")" 2>/dev/null && ( set -C; : > "$TITLE_MARKER" ) 2>/dev/null; then
+          TITLE_PAYLOAD=$(jq -nc --arg o "$TERMAG_CLAUDE_RUNNER_ORDER" --arg t "$TITLE_LINE" '{event:"title", orderId:$o, title:$t}')
+          TITLE_ENDPOINT=${ENDPOINT%/api/status}/api/claude-runner/event
+        fi
+      fi
+    fi
+    ;;
+  stop)
+    # The Stop payload, read in the foreground (see `notification`). Posts
+    # `idle`, as the old Stop line did. Inside a Claude Code cloud session on a
+    # termag box, also sums the transcript the payload names into the run's
+    # cumulative usage (usage_payload): once per turn, newest post wins on the
+    # server, so a lost post costs nothing; the runner's post-session hook
+    # posts once more at the end.
+    INPUT=$(cat)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"idle"}')
+    if [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] && [ -n "${TERMAG_CLAUDE_RUNNER_ORDER:-}" ]; then
+      T=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null) || T=
+      [ -n "$T" ] && USAGE_PAYLOAD=$(usage_payload "$T")
+    fi
     ;;
   notification)
     # Read stdin in the foreground: the caller backgrounds the POST, not this
@@ -117,6 +432,13 @@ esac
 
 [ -n "$PAYLOAD" ] || exit 0
 
+if [ -n "$PRINT_PAYLOAD" ]; then
+  printf '%s\n' "$PAYLOAD"
+  [ -n "$TITLE_PAYLOAD" ] && printf '%s\n' "$TITLE_PAYLOAD"
+  [ -n "$USAGE_PAYLOAD" ] && printf '%s\n' "$USAGE_PAYLOAD"
+  exit 0
+fi
+
 # Status writes from a remote host require the agent token: the server trusts
 # same-host callers (isLocalPeer) but a box reaches :3040 over the private VPC,
 # where requireAuthOrAgentToken applies. Without this a provisioned box 401s and,
@@ -127,19 +449,45 @@ esac
 # process command lines are world-readable, and this token can write status for
 # any of the owner's sessions. agent.js takes the same care (see its comment on
 # passing the bearer token via env rather than argv).
-TOKEN=$(resolve_token)
-
 # -m 5 so an unreachable server can't leave hook processes hanging around.
-if [ -n "$TOKEN" ]; then
-  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
-    | curl -sf -m 5 -K - -X POST "$ENDPOINT" \
-        -H 'Content-Type: application/json' \
-        -d "$PAYLOAD" >/dev/null 2>&1
-else
-  # No token in the agent config: only a same-host server will accept this.
-  curl -sf -m 5 -X POST "$ENDPOINT" \
-    -H 'Content-Type: application/json' \
-    -d "$PAYLOAD" >/dev/null 2>&1
-fi
+post_json() {
+  local url=$1 body=$2 token=$3
+  if [ -n "$token" ]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$token" \
+      | curl -sf -m 5 -K - -X POST "$url" \
+          -H 'Content-Type: application/json' \
+          -d "$body" >/dev/null 2>&1
+  else
+    # No token in the agent config: only a same-host server will accept this.
+    curl -sf -m 5 -X POST "$url" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null 2>&1
+  fi
+}
+
+post_all() {  # post_all <endpoint> <token>: the status, and the milestone if any
+  post_json "$1" "$PAYLOAD" "$2"
+  [ -n "$MILESTONE_PAYLOAD" ] && post_json "$1/milestone" "$MILESTONE_PAYLOAD" "$2"
+  return 0
+}
+
+PRIMARY_TOKEN=$(resolve_token)
+post_all "$ENDPOINT" "$PRIMARY_TOKEN"
+# The title: once per run (the marker was claimed above); an older server
+# (400) simply never gets one. Primary only: it names a claude-runner order,
+# which exists on the orchestrator that launched the run, not on a mirror.
+[ -n "$TITLE_PAYLOAD" ] && post_json "$TITLE_ENDPOINT" "$TITLE_PAYLOAD" "$PRIMARY_TOKEN"
+# The usage, when a cloud session's Stop summed it: primary only, like the title.
+[ -n "$USAGE_PAYLOAD" ] && post_json "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$PRIMARY_TOKEN"
+
+# Mirrors get the same status/milestone payloads with their own token. The
+# primary is posted first and each mirror in the background, so a slow or dead
+# mirror (a staging stack that is down) never delays the primary or holds up
+# the caller's hook.
+while IFS=$'\t' read -r m_endpoint m_config; do
+  [ -n "$m_endpoint" ] || continue
+  post_all "$m_endpoint" "$(resolve_token "$m_config")" &
+done < <(mirror_targets "$ENDPOINT")
+wait
 
 exit 0

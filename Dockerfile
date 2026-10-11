@@ -9,7 +9,7 @@
 #
 # Targets:
 #   runtime     (default) the server.
-#   migrations  the same image with a shim so Shepherd's fixed Alembic command
+#   migrations  the same image with a shim so a deploy platform's fixed Alembic command
 #               runs our schema sync instead (see backend/scripts/opentelemetry-instrument).
 #
 # Build:   docker build -t termag-orchestrator .
@@ -85,8 +85,8 @@ EXPOSE 3040
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "backend/dist/index.js"]
 
-# ── migrations: Shepherd's pre-deploy migration container ──
-# Shepherd runs `opentelemetry-instrument alembic upgrade head` here as UID
+# ── migrations: a deploy platform's pre-deploy migration container ──
+# A deploy platform that runs `opentelemetry-instrument alembic upgrade head` here as UID
 # 65534 with PG_HOST/PG_DATABASE/PG_USER=migration/PG_PORT and no password; the
 # shim ignores its arguments and runs the IAM-authenticated schema sync.
 FROM runtime AS migrations

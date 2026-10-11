@@ -15,6 +15,20 @@ ExecStart=/bin/bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; exec n
 Restart=always
 RestartSec=5
 
+# the repository's boot telemetry labels where a boot ran from TERMAG_BOX (its
+# internal/pkg/devtelemetry and dev-stack/bin/dev-telemetry); without it a box
+# in 10.98.x.x was recorded as `linux`, because only the 10.50.x.x hostname
+# prefix was known. tmux daemonises out of this unit but keeps its environment,
+# and every pane and Claude runner session the agent creates inherits the
+# server's, so one line here reaches `make dev` from a project pane, the runner
+# and a detached launcher alike. A server that outlived an agent restart
+# (KillMode=process below) keeps its old environment, so the agent also sets
+# the variable on each session it creates (`-e`, agent/tmux-args.js). Login
+# shells outside tmux get it from /etc/profile.d/termag-box.sh (bash) and
+# /etc/zsh/zshenv (zsh, the box user's shell); both from box-lib.sh,
+# install_box_marker.
+Environment=TERMAG_BOX=1
+
 # Do not take the user's tmux server down with the agent.
 #
 # agent.js starts tmux sessions with `tmux new-session`. tmux daemonises, so it

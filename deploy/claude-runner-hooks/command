@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# command -- the runner's `command` lifecycle hook on a termag box
+#. The Claude Code self-hosted
+# runner runs it once per session in place of its own child spawn, with the
+# child's argv and environment (https://code.claude.com/docs/en/self-hosted-environments-configuration#command).
+#
+# It does two things and nothing else:
+#
+#   1. Tells the orchestrator the session is being served: a POST of
+#      {event: "started", orderId, sessionId, at, clientPlatform} to
+#      /termag/api/claude-runner/event with the box's agent token, in the
+#      background, 5 s, never retried. The UI turns a "starting" session into a
+#      "running" one on it. Best effort: an older orchestrator answers 400 and
+#      nothing else changes.
+#   2. Execs the session's Claude Code: the repository's own session wrapper when the
+#      box has the repository's runner install (~/.config/claude-runner/
+#      session-wrapper.sh), else the runner's pinned binary
+#      ($CLAUDE_RUNNER_CLAUDE_BIN). `exec`, so the child keeps stdin (the
+#      runner's control channel: token refreshes, the end signal) and file
+#      descriptor 3 (the activity channel) exactly as the runner opened them.
+#      The background POST closes both in its own subshell first.
+#
+# Env from the runner: CLAUDE_CODE_REMOTE_SESSION_ID (cse_...),
+# CLAUDE_RUNNER_CLIENT_PLATFORM (web_claude_ai, desktop_app, ios, ...),
+# CLAUDE_RUNNER_CLAUDE_BIN. From termag-claude-runner: TERMAG_CLAUDE_RUNNER_ORDER
+# (the order id), TERMAG_AGENT_CONFIG (optional, the agent config to read).
+#
+# Never logs the token; the order and session ids are the whole log line.
+set -u
+
+order=${TERMAG_CLAUDE_RUNNER_ORDER:-}
+session=${CLAUDE_CODE_REMOTE_SESSION_ID:-}
+platform=${CLAUDE_RUNNER_CLIENT_PLATFORM:-}
+log() { printf 'claude-runner-hooks/command[%s]: %s\n' "${order:-?}" "$*" >&2; }
+
+find_agent_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+# ws(s)://host/termag/ws/agent -> http(s)://host/termag/api/claude-runner/event
+event_endpoint() {
+  local url=${1%%\?*}
+  case $url in
+    ws://*)  url="http://${url#ws://}" ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}/api/claude-runner/event" ;;
+    *) return 1 ;;
+  esac
+}
+report_started() {
+  local config token url endpoint body
+  command -v jq >/dev/null 2>&1 || { log 'started not reported: jq not installed'; return 0; }
+  command -v curl >/dev/null 2>&1 || { log 'started not reported: curl not installed'; return 0; }
+  config=$(find_agent_config) || { log 'started not reported: no agent config'; return 0; }
+  token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+  url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
+  if [ -z "$token" ] || [ -z "$url" ]; then log "started not reported: $config has no token or termag_url"; return 0; fi
+  endpoint=$(event_endpoint "$url") || { log "started not reported: $url is not an agent URL"; return 0; }
+  # `at` is when this hook ran: a report delayed past a relaunch of the order
+  # is then ignored by the server as stale (routes/claudeRunnerEvents.ts).
+  body=$(jq -cn --arg o "$order" --arg s "$session" --arg p "$platform" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{event: "started", orderId: $o, sessionId: $s, at: $at} + (if $p != "" then {clientPlatform: $p} else {} end)')
+  # Detached: the exec below must not wait on the network, and the subshell
+  # closes the runner's channels so it cannot hold them open. The token goes
+  # in curl's config on stdin, never on the command line.
+  (
+    exec 3<&- </dev/null
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+      | curl -s -m 5 -K - -o /dev/null -w '%{http_code}' -X POST "$endpoint" \
+          -H 'Content-Type: application/json' -d "$body" 2>/dev/null) || code=
+    case "$code" in
+      204) log "started reported (session $session${platform:+, $platform})" ;;
+      ''|000) log "started not reported: $endpoint unreachable" ;;
+      400) log "started not reported: $endpoint answered 400 (the orchestrator predates the started event)" ;;
+      *) log "started not reported: $endpoint answered HTTP $code" ;;
+    esac
+  ) &
+}
+
+if [ -n "$order" ] && [ -n "$session" ]; then
+  report_started
+else
+  log "started not reported: TERMAG_CLAUDE_RUNNER_ORDER or CLAUDE_CODE_REMOTE_SESSION_ID unset"
+fi
+
+wrapper=${TERMAG_CLAUDE_RUNNER_SESSION_WRAPPER:-$HOME/.config/claude-runner/session-wrapper.sh}
+if [ -x "$wrapper" ]; then
+  exec "$wrapper" "$@"
+fi
+[ -n "${CLAUDE_RUNNER_CLAUDE_BIN:-}" ] || { log 'CLAUDE_RUNNER_CLAUDE_BIN unset; not started by the runner?'; exit 2; }
+exec "$CLAUDE_RUNNER_CLAUDE_BIN" "$@"

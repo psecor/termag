@@ -169,6 +169,7 @@ apt_get install -y \
     python3-pip \
     postgresql-client \
     rsync \
+    nftables \
     apparmor-utils
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,7 +233,7 @@ sudo rm -rf /opt/termag
 sudo mv /tmp/termag-src /opt/termag
 sudo rm -rf /opt/termag/.git /opt/termag/packer /opt/termag/terraform /opt/termag/relay
 # Drop any node_modules that rode along from a local checkout — we install clean.
-sudo rm -rf /opt/termag/backend/node_modules /opt/termag/frontend/node_modules
+sudo rm -rf /opt/termag/backend/node_modules /opt/termag/frontend/node_modules /opt/termag/agent/node_modules
 sudo chown -R termag:termag /opt/termag
 
 echo "${TERMAG_BAKED_SHA}" | sudo -u termag tee /opt/termag/.termag-baked-sha >/dev/null
@@ -252,7 +253,104 @@ npm run build
 cd /opt/termag/frontend
 npm ci
 npm run build
+# Each user's host agent runs this checkout's agent (deploy/termag-agent-host.service).
+cd /opt/termag/agent
+npm ci --omit=dev
 EOF
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Host accounts on demand (backend/src/services/hostSetup.ts). The one thing the
+# backend may run as root is the helper that creates a user's account and
+# installs their host agent. Both it and the agent unit are installed
+# root-owned, outside /opt/termag (which the termag user owns), so the backend
+# can't rewrite what it is allowed to sudo. Inert unless cloud-init sets
+# HOST_AUTOSETUP=true in the backend's .env.
+# ─────────────────────────────────────────────────────────────────────────────
+sudo install -m 0755 -o root -g root /opt/termag/deploy/termag-host-setup /usr/local/sbin/termag-host-setup
+# What host users execute -- their termag-agent and the Claude hooks'
+# termag-status -- runs from a root-owned copy. /opt/termag belongs to the
+# termag service user, and anything it can rewrite would run as every host user
+# on the next restart or hook (Cursor security review on #114). Only a bake
+# changes these; termag-agent-host.service and termag-host-setup point here.
+sudo rm -rf /usr/local/lib/termag
+sudo install -d -m 0755 -o root -g root /usr/local/lib/termag
+sudo cp -a /opt/termag/agent /usr/local/lib/termag/agent
+sudo chown -R root:root /usr/local/lib/termag/agent
+sudo chmod -R go-w /usr/local/lib/termag/agent
+sudo install -m 0755 -o root -g root /opt/termag/deploy/termag-status /usr/local/lib/termag/termag-status
+sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-settings.json /usr/local/lib/termag/claude-settings.json
+# MetaTerm's MCP server (dependency-free), which Claude runs as the user;
+# backend/src/services/metaterm.ts prefers this copy when it exists.
+sudo install -d -m 0755 -o root -g root /usr/local/lib/termag/metaterm
+sudo install -m 0644 -o root -g root /opt/termag/metaterm/mcp-server.mjs /usr/local/lib/termag/metaterm/mcp-server.mjs
+sudo install -d -m 0755 /etc/systemd/user
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-agent-host.service /etc/systemd/user/termag-agent-host.service
+# The host data volume (every host home) moves to a new orchestrator only once
+# the previous one lets go, so this unit attaches and mounts it after boot and
+# marks host storage ready. Enabled, not
+# started: it waits for cloud-init's /etc/termag/data-volume.
+sudo install -m 0755 -o root -g root /opt/termag/deploy/termag-data-attach /usr/local/sbin/termag-data-attach
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-data-attach.service /etc/systemd/system/termag-data-attach.service
+# Host accounts must not reach IMDS (the host role can read the .env secret).
+# Rules are runtime state, so the unit reloads them on every boot. nftables.service
+# stays off: its /etc/nftables.conf flushes the whole ruleset, Docker's too.
+sudo systemctl disable nftables.service
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-imds-guard.nft /usr/local/lib/termag/termag-imds-guard.nft
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-imds-guard.service /etc/systemd/system/termag-imds-guard.service
+# Fail closed: no host account's user manager (lingering included) or SSH login
+# starts unless the guard started. Ubuntu 24.04's sshd is ssh.service (sshd.service
+# is only its alias), socket-activated through ssh.socket.
+for unit in user@.service ssh.service; do
+  sudo install -d -m 0755 "/etc/systemd/system/$unit.d"
+  sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-imds-guard-required.conf "/etc/systemd/system/$unit.d/termag-imds-guard.conf"
+done
+sudo systemctl daemon-reload
+sudo systemctl enable termag-data-attach.service
+sudo systemctl enable --now termag-imds-guard.service
+sudo nft list chain inet termag_imds output
+for unit in user@1000.service ssh.service; do
+  systemctl show -p Requires --value "$unit" | grep -qw termag-imds-guard.service ||
+    { echo "$unit does not require termag-imds-guard.service" >&2; exit 1; }
+done
+echo 'termag ALL=(root) NOPASSWD: /usr/local/sbin/termag-host-setup' | sudo tee /etc/sudoers.d/91-termag-host-setup >/dev/null
+sudo chmod 0440 /etc/sudoers.d/91-termag-host-setup
+sudo visudo -cf /etc/sudoers.d/91-termag-host-setup
+
+# Aurora: Amazon's RDS CA bundle, which the backend
+# verifies the cluster's certificate against (PG_SSL_CA_FILE), the cutover tool
+# and the one-time role bootstrap. Inert until cloud-init renders the RDS .env.
+sudo install -d -m 0755 -o root -g root /usr/local/share/termag
+curl -fsSL --retry 3 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /tmp/rds-global-bundle.pem
+grep -q 'BEGIN CERTIFICATE' /tmp/rds-global-bundle.pem
+sudo install -m 0644 -o root -g root /tmp/rds-global-bundle.pem /usr/local/share/termag/rds-global-bundle.pem
+rm -f /tmp/rds-global-bundle.pem
+sudo install -m 0755 -o root -g root /opt/termag/deploy/termag-rds-cutover /usr/local/sbin/termag-rds-cutover
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-rds-bootstrap.sql /usr/local/share/termag/termag-rds-bootstrap.sql
+
+# Claude Code cloud sessions on boxes: the
+# self-hosted runner ORCHESTRATOR runs on this host and asks the backend to
+# start one-shot runners on boxes. It runs the `claude` every host user already
+# gets, which terraform's cloud-init installs from npm at boot (/usr/bin/claude);
+# nothing here installs a second one. The hook and the unit are root-owned,
+# outside /opt/termag for the same reason as the agent copy above; the unit is
+# installed disabled and cloud-init enables it only once the environment key
+# parameter is populated and that claude has the self-hosted-runner subcommand.
+sudo install -d -m 0755 -o root -g root /usr/local/lib/termag/claude-hooks
+sudo install -m 0755 -o root -g root /opt/termag/deploy/claude-spawn-runner /usr/local/lib/termag/claude-hooks/spawn-runner
+sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-runner-orchestrator.service /etc/systemd/system/claude-runner-orchestrator.service
+sudo install -d -m 0755 -o root -g root /etc/claude
+# The backend stops this unit when it drains for an overlapping deploy and
+# starts it when it serves; that stop
+# and start, and nothing else, are what this rule lets termag sudo.
+sudo install -m 0440 -o root -g root /opt/termag/deploy/claude-runner-orchestrator.sudoers /etc/sudoers.d/92-termag-claude-runner
+sudo visudo -cf /etc/sudoers.d/92-termag-claude-runner
+
+# Key-only SSH: keys are what gate Session Manager SSH.
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' | sudo tee /etc/ssh/sshd_config.d/10-termag-keys-only.conf >/dev/null
+sudo chmod 0644 /etc/ssh/sshd_config.d/10-termag-keys-only.conf
+# sshd -t needs /run/sshd, which socket-activated sshd creates lazily.
+sudo install -d -m 0755 /run/sshd
+sudo sshd -t
 
 # ─────────────────────────────────────────────────────────────────────────────
 # nginx gateway — owns :3040 and fans out by path prefix: /termag to the
@@ -268,12 +366,55 @@ apt_get install -y nginx
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo install -m 644 /opt/termag/deploy/nginx/termag-gateway.conf /etc/nginx/sites-available/termag-gateway.conf
 sudo ln -sf ../sites-available/termag-gateway.conf /etc/nginx/sites-enabled/termag-gateway.conf
+# :3041 serves only the Claude gateway's check routes, for terraform's internal
+# checks ALB. It needs no certificate: the ALB terminates TLS.
+sudo install -m 644 /opt/termag/deploy/nginx/termag-checks.conf /etc/nginx/sites-available/termag-checks.conf
+sudo ln -sf ../sites-available/termag-checks.conf /etc/nginx/sites-enabled/termag-checks.conf
 sudo install -m 644 /opt/termag/deploy/nginx/termag-proxy.conf /etc/nginx/snippets/termag-proxy.conf
 sudo install -m 755 /opt/termag/deploy/termag-apps-boot /usr/local/bin/termag-apps-boot
 sudo install -m 644 /opt/termag/deploy/termag-apps.service /etc/systemd/system/termag-apps.service
 sudo nginx -t
 sudo systemctl disable --now nginx
 sudo systemctl enable termag-apps.service
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log shipping over OTLP/HTTP (deploy/termag-otelcol.yaml). The
+# journal, the cloud-init log and nginx's logs are on the root volume, which
+# every deploy replaces. The upstream contrib build, checksum-pinned, under a
+# system user that can read the journal (systemd-journal) and nginx's logs
+# (adm). Enabled, not started: termag-otelcol-env reads the backend .env, which
+# only cloud-init writes. Bump OTELCOL_VERSION and OTELCOL_SHA256 together
+# (the release's otelcol-contrib_<v>_linux_arm64.tar.gz.sha256).
+# ─────────────────────────────────────────────────────────────────────────────
+OTELCOL_VERSION=0.161.0
+OTELCOL_SHA256=cd5de93213a0dbb90e4998b3b9e4e15ed691ec635cf7cf4147f95799fb16b676
+curl -fsSL --retry 3 -o /tmp/otelcol-contrib.tar.gz \
+    "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_arm64.tar.gz"
+echo "${OTELCOL_SHA256}  /tmp/otelcol-contrib.tar.gz" | sha256sum -c -
+sudo install -d -m 0755 -o root -g root /usr/local/lib/termag/otelcol
+sudo tar -xzf /tmp/otelcol-contrib.tar.gz -C /usr/local/lib/termag/otelcol otelcol-contrib
+sudo chown root:root /usr/local/lib/termag/otelcol/otelcol-contrib
+rm -f /tmp/otelcol-contrib.tar.gz
+/usr/local/lib/termag/otelcol/otelcol-contrib --version
+if ! id -u termag-otelcol >/dev/null 2>&1; then
+    sudo useradd -r -M -d /nonexistent -s /usr/sbin/nologin termag-otelcol
+fi
+sudo usermod -aG systemd-journal,adm termag-otelcol
+sudo install -m 0755 -o root -g root /opt/termag/deploy/termag-otelcol-env /usr/local/lib/termag/termag-otelcol-env
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-otelcol.yaml /usr/local/lib/termag/otelcol/termag-otelcol.yaml
+sudo install -m 0644 -o root -g root /opt/termag/deploy/termag-otelcol.service /etc/systemd/system/termag-otelcol.service
+# Validate the baked config against a stand-in for what the env script renders.
+otelcol_check=$(mktemp -d)
+printf 'OBSERVABILITY_PROJECT=bakecheck\nOBSERVABILITY_OTLP_ENDPOINT=https://otel.example.com\n' >"$otelcol_check/env"
+TERMAG_OTELCOL_BACKEND_ENV="$otelcol_check/env" TERMAG_OTELCOL_OUT="$otelcol_check/destination.yaml" \
+    /usr/local/lib/termag/termag-otelcol-env
+printf 'extensions:\n  file_storage:\n    directory: %s\n' "$otelcol_check" >"$otelcol_check/state.yaml"
+/usr/local/lib/termag/otelcol/otelcol-contrib validate \
+    --config=/usr/local/lib/termag/otelcol/termag-otelcol.yaml \
+    --config="$otelcol_check/destination.yaml" --config="$otelcol_check/state.yaml"
+rm -rf "$otelcol_check"
+sudo systemctl daemon-reload
+sudo systemctl enable termag-otelcol.service
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verify SSM agent is present and enabled (Canonical's AMI ships it via snap)
@@ -288,6 +429,12 @@ apt_get autoremove -y
 apt_get clean
 sudo rm -rf /var/lib/apt/lists/*
 sudo rm -rf /tmp/* /var/tmp/* || true
+
+# termag-otelcol ships the journal and nginx's logs from the beginning, so an
+# instance would otherwise re-send the builder's on its first boot.
+sudo journalctl --rotate
+sudo journalctl --vacuum-time=1s
+sudo find /var/log/nginx -type f -name '*.log' -exec truncate -s 0 {} +
 
 # Truncate machine-id so each EC2 launched from this AMI gets a fresh one.
 sudo truncate -s 0 /etc/machine-id

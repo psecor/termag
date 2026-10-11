@@ -1,0 +1,729 @@
+#!/usr/bin/env bash
+# termag-claude-runner -- run ONE Claude Code cloud session on this box.
+#
+# The orchestrator's spawn path (backend/src/services/claudeRunnerSpawn.ts)
+# writes the single-use work order to ~/.termag/claude-runner/<order>.work-order
+# (mode 0600) through the agent and creates a tmux session whose only process
+# is
+#   termag-claude-runner <order> <slot> [--otel-project <id> --otel-endpoint <url> [--user-key <id> --box-key <id>]]
+# (no shell, nothing typed). This script gives the session its own checkout
+# and dev-stack instance, starts a one-shot self-hosted runner bound to that
+# work order, and removes both the checkout and the work order when the runner
+# exits. With --capacity 1 and --drain-grace-sec 0 the runner serves exactly
+# that session and exits, and the tmux session ends with this script, so a
+# runner session exists exactly while its runner runs. A signal (tmux
+# kill-session hangs up the pane) is passed on to the runner, and the script
+# exits once the runner has.
+#
+# Slot: the dev-stack instance this session runs (DEV_INSTANCE, 2..8; the box
+# owner keeps instance 1), chosen by the backend from the box's live runner
+# sessions, at most MAX_RUNNERS_PER_BOX at once. The checkout lives at
+#   ~/ccr/sessions/<order>/<repo>   (CLAUDE_RUNNER_REPO, owner/name)
+# seeded with `git clone --local` (hardlinked objects, seconds, no network)
+# from the canonical clone at ~/ccr/<repo> when that exists,
+# with origin pointed back at GitHub so the runner's fetch and the outcome
+# push go where they should; a checkout of the same repository under ~/src
+# is the fallback seed. Without either the runner
+# does its own cold clone. Untracked state (node_modules, .rspack-cache) is not seeded:
+# the first `make dev` in a session installs it; pnpm's store keeps that short.
+#
+# If the repository's runner install is present (~/.config/claude-runner/
+# session-wrapper.sh, hooks/, ~/.claude-runner/config), the runner uses it:
+# same wrapper, hooks and host config (a copy, see below) as the resident-runner playbook. The
+# wrapper reads WEBAPP_RUNNER_DEV_INSTANCE; DEV_INSTANCE is exported too for
+# a session without the wrapper.
+#
+# The seeded checkout's dev-stack/.env.override carries DEV_INSTANCE=<slot>, so a make started in a tmux pane (which does
+# not inherit this environment) stays on the session's instance.
+#
+# Files under ~/.termag/claude-runner/: <order>.work-order (the JWT as the
+# backend wrote it), moved to <order>.work-order.<pid> the moment this launch
+# has it and removed on exit, so a relaunch of the same order (the backend
+# killed this session and placed the order again) writes a fresh
+# <order>.work-order that this launch never touches; <order>.log (the runner's
+# log). The checkout directory carries a .launcher marker with the pid that
+# seeded it. A relaunch that finds that pid still alive (the earlier runner may
+# be pushing its outcome) takes <order>.<pid> as its own directory instead of
+# replacing the other, and a cleanup that finds another pid in a directory's
+# marker leaves it alone. A checkout is removed on exit
+# unless it holds work GitHub does not have (the outcome push failed, for
+# example while the GitHub broker's check fails closed during an orchestrator
+# outage): then it moves to ~/ccr/kept/<order>-<time> and the log says so.
+# Leftovers of a runner that never got to clean up (box rebooted, SIGKILL) are
+# swept on the next start: work orders and checkouts after a day (a session
+# lives at most 12 h), kept checkouts and logs after a week.
+#
+# When the launch ends, however it ends, the orchestrator is told: a POST to
+# /termag/api/claude-runner/event with the box's agent token, reached the way
+# termag-status reaches the server, which stamps the session's row and logs
+# the owner's `ended ... after Ns` line, after the checkout is removed or kept, so the recorded
+# end is when the slot is free. Best effort, 5 s, never retried; an
+# orchestrator without the route answers 404 and the log says so.
+#
+# With --otel-project and --otel-endpoint (both from the orchestrator, neither a
+# secret) the session's own OpenTelemetry goes to that collector and project:
+# cost, tokens, active time, tool and API events per owner and session, and
+# metadata only. With --user-key and --box-key too, its resource carries the
+# owner's and the box's ids as termag.user.id and termag.box.id, so the
+# session's telemetry can be joined to both.
+#
+# Runner lifecycle hooks: when
+# termag-reconcile has installed deploy/claude-runner-hooks under
+# ~/.local/lib/termag/claude-runner-hooks, the runner gets that directory as
+# --hooks-dir. Its `command` hook posts `started` (the session id and client
+# platform) to the orchestrator and execs the session's Claude Code, the repository's
+# session-wrapper.sh when that install is present, so --exec-path is no longer
+# passed; its `post-session` hook writes the runner's exit reason (completed,
+# failed, interrupted) to ~/.termag/claude-runner/<order>.exit-reason.<launch pid>,
+# which the exit trap below reads into the one `ended` report and removes. Without the
+# termag hooks (a box not yet reconciled) the earlier shape is kept: the repository's
+# wrapper by --exec-path and its hooks dir, if either exists.
+#
+# Bazel output bases. Bazel keys a workspace's output base on the md5 of the
+# workspace path (~/.cache/bazel/_bazel_<user>/<md5>), so every session
+# checkout that built the repository leaves about 12 GB behind when the checkout is
+# removed, and nothing else ever removes it. When a checkout goes (released on
+# exit, swept after a day) or moves (kept under ~/ccr/kept: a new path is a new
+# output base to Bazel, so the old one is dead weight), its output base goes
+# too, in the background, when its DO_NOT_BUILD_HERE names that checkout and no
+# bazel server is live in it. The start-up sweep also removes any output base
+# whose workspace no longer exists (a worktree removed by hand). The shared
+# disk cache and repo contents cache live elsewhere and are never touched.
+#
+# Usage: termag-claude-runner <order-id> [slot] [--otel-project <id> --otel-endpoint <url> [--user-key <id> --box-key <id>]]
+#        (slot defaults to 2)
+# Env:
+#   TERMAG_STATE_DIR          default $HOME/.termag
+#   CLAUDE_RUNNER_ROOT        default $HOME/ccr (sessions/<order> goes under it)
+#   CLAUDE_RUNNER_REPO        the repository sessions run in, owner/name (default: a placeholder)
+#   CLAUDE_RUNNER_CANONICAL   seed source; default: $CLAUDE_RUNNER_ROOT/<repo>
+#                             if it is a repo, else $WEBAPP_DIR ($HOME/src/<name>)
+#   CLAUDE_BIN                override the claude binary
+#   TERMAG_AGENT_CONFIG       the agent config (token, termag_url) the end report uses
+#   TERMAG_CLAUDE_RUNNER_HOOKS  the termag hooks dir; default $HOME/.local/lib/termag/claude-runner-hooks
+#   TERMAG_BAZEL_OUTPUT_USER_ROOT  where output bases live; default $HOME/.cache/bazel/_bazel_<user>
+#
+# Exit codes: 2 bad usage, missing work order or unusable claude; 128+n after
+# signal n; otherwise the runner's own.
+set -u
+
+order=${1:-}
+case "$order" in
+  ''|*[!A-Za-z0-9._-]*) printf 'termag-claude-runner: usage: termag-claude-runner <order-id> [slot 2..8] [--otel-project <id> --otel-endpoint <url>]\n' >&2; exit 2 ;;
+esac
+shift
+# The slot is optional and the flags may follow the order directly: the next
+# argument is the slot only when it is not a flag.
+slot=2
+if [ $# -gt 0 ] && [ -n "$1" ] && [ "${1#--}" = "$1" ]; then slot=$1; shift; fi
+case "$slot" in
+  2|3|4|5|6|7|8) ;;
+  *) printf 'termag-claude-runner: slot must be 2..8, got %s\n' "$slot" >&2; exit 2 ;;
+esac
+# The session's telemetry destination, when the orchestrator ships telemetry
+# (routes/claudeRunner.ts hands both). Checked and
+# exported with the rest of the environment below; anything else past the
+# slot is ignored, as a script from before these flags ignored them.
+otel_project=
+otel_endpoint=
+user_key=
+box_key=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --otel-project) otel_project=${2:-}; shift ;;
+    --otel-endpoint) otel_endpoint=${2:-}; shift ;;
+    --user-key) user_key=${2:-}; shift ;;
+    --box-key) box_key=${2:-}; shift ;;
+  esac
+  [ $# -gt 0 ] && shift
+done
+
+# Started by tmux, not a login shell: put the user's own bin dir first, as
+# ~/.profile does (termag's tools and a native claude install live there).
+export PATH="$HOME/.local/bin:$PATH"
+# The version managers ~/.zshrc wires up are absent here too, and they do not
+# come back inside the session: Claude Code's Bash tool runs $SHELL
+# non-interactively, which never reads ~/.zshrc, so the first live session
+# found no `go` on a box with two goenv versions installed. Same remedy as
+# other box scripts that run outside a login shell: the goenv dirs by
+# hand (bin has `goenv`, shims has `go`/`gofmt`/`modd`), pyenv the same way,
+# cargo's bin, and nvm sourced so node and pnpm resolve, each only where it
+# exists. The session inherits this PATH, so every tool shell sees the
+# toolchain without sourcing anyone's dotfiles.
+if [ -d "${GOENV_ROOT:-$HOME/.goenv}" ]; then
+  export GOENV_ROOT="${GOENV_ROOT:-$HOME/.goenv}"
+  PATH="$GOENV_ROOT/bin:$GOENV_ROOT/shims:$PATH"
+fi
+if [ -d "${PYENV_ROOT:-$HOME/.pyenv}" ]; then
+  export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+  PATH="$PYENV_ROOT/bin:$PYENV_ROOT/shims:$PATH"
+fi
+[ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+# $SHELL is what the Bash tool runs; a tmux server the agent started may not
+# carry it. bash fills it in from the passwd entry then, but does not export it.
+export SHELL="${SHELL:-/bin/bash}"
+
+state_dir=${TERMAG_STATE_DIR:-$HOME/.termag}
+runner_dir=$state_dir/claude-runner
+work_order=$runner_dir/$order.work-order
+# This launch's own copy of the work order (see the header): what the runner
+# reads and what cleanup removes.
+launch_order=$work_order.$$
+log_file=$runner_dir/$order.log
+root=${CLAUDE_RUNNER_ROOT:-$HOME/ccr}
+# The repository sessions run in, as owner/name. The default is a placeholder:
+# set CLAUDE_RUNNER_REPO to the repository your cloud environment checks out.
+repo=${CLAUDE_RUNNER_REPO:-example-org/webapp}
+# Seed source, first that is a git repo: the runner's canonical clone, else a
+# checkout of the same repository under ~/src, so a box seeds locally instead
+# of cloning cold.
+canonical=${CLAUDE_RUNNER_CANONICAL:-}
+if [ -z "$canonical" ]; then
+  for candidate in "$root/$repo" "${WEBAPP_DIR:-$HOME/src/${repo##*/}}"; do
+    if [ -d "$candidate/.git" ]; then canonical=$candidate; break; fi
+  done
+  canonical=${canonical:-$root/$repo}
+fi
+base_dir=$root/sessions/$order
+checkout=$base_dir/$repo
+kept_dir=$root/kept
+cfg_dir=$HOME/.config/claude-runner
+hooks_dir=${TERMAG_CLAUDE_RUNNER_HOOKS:-$HOME/.local/lib/termag/claude-runner-hooks}
+bazel_user_root=${TERMAG_BAZEL_OUTPUT_USER_ROOT:-$HOME/.cache/bazel/_bazel_$(id -un)}
+
+log() { printf 'termag-claude-runner[%s s%s]: %s\n' "$order" "$slot" "$*" >&2; }
+
+mkdir -p "$runner_dir" "$root/sessions"
+chmod 700 "$runner_dir" 2>/dev/null || true
+
+# ── bazel output bases (see the header) ─────────────────────────────────────
+md5_of() { if command -v md5sum >/dev/null 2>&1; then printf '%s' "$1" | md5sum | cut -d' ' -f1; else printf '%s' "$1" | md5 -q; fi; }
+# The output base Bazel would use for a workspace path: as Bazel derives it,
+# from the path string, so the same path a `make` ran in.
+bazel_output_base() { printf '%s/%s' "$bazel_user_root" "$(md5_of "$1")"; }
+# A live bazel server in this output base? (server.pid.txt is the server's own.)
+bazel_server_live() {
+  local pid; pid=$(cat "$1/server/server.pid.txt" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+# Remove one output base, detached: bazel marks its trees read-only, and a
+# 12 GB tree takes a while, which must hold up neither the exit trap (the slot
+# is free the moment this script exits) nor a start. First the base is moved
+# aside, atomically, to <base>.rm.<pid>: a relaunch of the order that reuses
+# the checkout path hashes to the same base, and a bazel it starts must find
+# the path free rather than a tree being deleted under it. The subshell is its
+# own session so a tmux kill of this pane cannot stop it halfway. A leftover
+# <base>.rm.* from a deleter that died (a reboot) is picked up by the sweep.
+remove_output_base_async() {
+  local base=$1 gone
+  case "$base" in "$bazel_user_root"/??????????*) ;; *) log "refusing to remove $base: not an output base"; return 0 ;; esac
+  case "$base" in *.rm.*) gone=$base ;; *) gone=$base.rm.$$; mv "$base" "$gone" 2>/dev/null || { log "could not move $base aside; left in place"; return 0; } ;; esac
+  log "removing bazel output base $base in the background"
+  setsid sh -c 'chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"' sh "$gone" </dev/null >/dev/null 2>&1 &
+}
+# The output base of a workspace that is going away. Only when the base says it
+# is that workspace's (DO_NOT_BUILD_HERE) and no server is live in it; a
+# workspace that never built has no base and nothing happens.
+release_output_base() {
+  local ws=$1 base owner
+  base=$(bazel_output_base "$ws")
+  [ -f "$base/DO_NOT_BUILD_HERE" ] || return 0
+  owner=$(cat "$base/DO_NOT_BUILD_HERE" 2>/dev/null)
+  if [ "$owner" != "$ws" ]; then log "left $base alone: it belongs to $owner, not $ws"; return 0; fi
+  if bazel_server_live "$base"; then log "left $base alone: a bazel server is live in it"; return 0; fi
+  remove_output_base_async "$base"
+}
+# Output bases whose workspace is gone (a worktree removed by hand, a session
+# directory swept before this script knew to follow it): nobody will ever use
+# them again, and each holds about 12 GB.
+sweep_orphan_output_bases() {
+  local base owner
+  [ -d "$bazel_user_root" ] || return 0
+  for base in "$bazel_user_root"/*/; do
+    base=${base%/}
+    case "$base" in *.rm.*)
+      # Moved aside by an earlier launch whose deleter did not finish.
+      if ! bazel_server_live "$base"; then remove_output_base_async "$base"; fi
+      continue ;;
+    esac
+    [ -f "$base/DO_NOT_BUILD_HERE" ] || continue
+    owner=$(cat "$base/DO_NOT_BUILD_HERE" 2>/dev/null)
+    [ -n "$owner" ] && [ ! -d "$owner" ] || continue
+    if bazel_server_live "$base"; then continue; fi
+    log "bazel output base $base belongs to $owner, which no longer exists"
+    remove_output_base_async "$base"
+  done
+}
+sweep_orphan_output_bases
+
+# Leftovers no live runner can own: --kill-session-after-min 720 ends every
+# session within 12 h of its start, so a day-old work order or checkout is from
+# a runner that died without its cleanup.
+find "$runner_dir" -maxdepth 1 -type f \( -name '*.work-order*' -o -name '*.exit-reason*' -o -name '*.checkout-bytes*' -o -name '*.titled' \) -mtime +0 -delete 2>/dev/null
+find "$runner_dir" -maxdepth 1 -type f -name '*.log' -mtime +6 -delete 2>/dev/null
+# A day-old session directory that something still runs from is left alone: a
+# `make dev` left running in a tmux session keeps its stack's compose project,
+# its bazel server and its file watchers inside the checkout, and deleting the
+# tree under them wedges all of them. "In use" means a live
+# process has its working directory in there; /proc is Linux-only, and without
+# it the check finds nothing and the sweep behaves as before. /proc reports
+# canonical paths, so the directory is canonicalized first: a symlink in the
+# runner root (or in $HOME) must not hide a live session from the check.
+in_use() {
+  local dir=$1 p cwd
+  dir=$(readlink -f -- "$dir" 2>/dev/null) || return 1
+  for p in /proc/[0-9]*; do
+    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case "$cwd" in "$dir"|"$dir"/*) return 0 ;; esac
+  done
+  return 1
+}
+find "$root/sessions" -mindepth 1 -maxdepth 1 -type d -mtime +0 2>/dev/null | while IFS= read -r dir; do
+  if in_use "$dir"; then log "left $dir alone: a process still runs from it"; else release_output_base "$dir/$repo"; rm -rf "$dir"; fi
+done
+if [ -d "$kept_dir" ]; then
+  find "$kept_dir" -mindepth 1 -maxdepth 1 -type d -mtime +6 -exec rm -rf {} + 2>/dev/null
+fi
+
+if [ ! -s "$work_order" ]; then
+  log "no work order at $work_order"
+  exit 2
+fi
+# The agent writes it 0600; an older agent wrote its default mode.
+chmod 600 "$work_order"
+# Whether the checkout holds work GitHub does not have: uncommitted changes, or
+# a branch tip (or HEAD) that no remote-tracking ref reaches and that is not the
+# tip of a branch on origin either (the runner may push by URL, which updates
+# no tracking ref). When origin cannot be asked, an unpushed tip counts as
+# unpushed. A clone that was never checked out (no index) holds no work.
+has_unpushed_work() {
+  [ -f "$checkout/.git/index" ] || return 1
+  [ -n "$(git -C "$checkout" status --porcelain 2>/dev/null)" ] && return 0
+  local tip remote='' asked=0
+  for tip in $( { git -C "$checkout" for-each-ref --format='%(objectname)' refs/heads; git -C "$checkout" rev-parse -q --verify HEAD; } 2>/dev/null | sort -u); do
+    [ -n "$(git -C "$checkout" rev-list -1 "$tip" --not --remotes 2>/dev/null)" ] || continue
+    if [ "$asked" = 0 ]; then
+      remote=$(timeout 60 git -C "$checkout" ls-remote --heads origin 2>/dev/null) || return 0
+      asked=1
+    fi
+    printf '%s\n' "$remote" | grep -q "^${tip}[[:space:]]" || return 0
+  done
+  return 1
+}
+# ── the end report ──────────────────────────────────────────────────────────
+# Token and server come from the agent config, searched as agent.js and
+# termag-status do; the token goes in curl's config on stdin, never on the
+# command line. A relaunch of an order whose first launch is still winding
+# down reports its own end to a row the first one already stamped: the server
+# answers 204 and logs nothing more.
+find_agent_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+# The event route from the agent's own URL (termag-status, resolve_endpoint):
+# ws(s)://host/termag/ws/agent -> http(s)://host/termag/api/claude-runner/event.
+event_endpoint() {
+  local url=${1%%\?*}
+  case $url in
+    ws://*)  url="http://${url#ws://}" ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}/api/claude-runner/event" ;;
+    *) return 1 ;;
+  esac
+}
+# Whether the checkout was kept (unpushed work) and how big the session
+# directory was, for the `ended` report: the post-session hook measures the directory into
+# <order>.checkout-bytes.<launch> before the release, so the report carries
+# the size without a du of its own delaying the slot's release.
+kept_checkout=0
+checkout_bytes=
+report_end() {
+  local status=$1 reason=$2 config token url endpoint body code extra=""
+  command -v jq >/dev/null 2>&1 || { log "end not reported: jq not installed"; return 0; }
+  config=$(find_agent_config) || { log "end not reported: no agent config"; return 0; }
+  token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+  url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || url=
+  if [ -z "$token" ] || [ -z "$url" ]; then log "end not reported: $config has no token or termag_url"; return 0; fi
+  endpoint=$(event_endpoint "$url") || { log "end not reported: $url is not an agent URL"; return 0; }
+  extra=",\"kept\":$([ "$kept_checkout" = 1 ] && printf true || printf false)"
+  case "$checkout_bytes" in ''|*[!0-9]*) ;; *) extra="$extra,\"checkoutBytes\":$checkout_bytes" ;; esac
+  body=$(printf '{"event":"ended","orderId":"%s","exitStatus":%s,"endedAt":"%s"%s%s}' \
+    "$order" "$status" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${reason:+,\"exitReason\":\"$reason\"}" "$extra")
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -s -m 5 -K - -o /dev/null -w '%{http_code}' -X POST "$endpoint" \
+        -H 'Content-Type: application/json' -d "$body" 2>/dev/null) || code=
+  case "$code" in
+    204) log "end reported (exit $status${reason:+, $reason})" ;;
+    ''|000) log "end not reported: $endpoint unreachable" ;;
+    404) log "end not reported: $endpoint answered 404 (the orchestrator predates the event route)" ;;
+    *) log "end not reported: $endpoint answered HTTP $code" ;;
+  esac
+}
+exit_reason=
+
+# What the EXIT trap does with the checkout: removed when GitHub has all of
+# its work, kept under ~/ccr/kept otherwise (see the header).
+release_checkout() {
+  [ -n "$base_dir" ] && [ "$base_dir" != "/" ] && [ -e "$base_dir" ] || return 0
+  # A relaunch of this order replaced the directory and marked it as its own
+  # while this launcher was still winding its runner down.
+  if [ -f "$base_dir/.launcher" ] && [ "$(cat "$base_dir/.launcher" 2>/dev/null)" != "$$" ]; then
+    log "left $base_dir alone: a newer launch of this order owns it"
+    return 0
+  fi
+  # The runner pushed the outcome branch and the post-session hook rescued
+  # anything uncommitted before we get here, unless that push failed.
+  if has_unpushed_work; then
+    local kept
+    kept=$kept_dir/$order-$(date -u +%Y%m%dT%H%M%SZ)
+    # The move changes the path Bazel keys the output base on, so the base
+    # cannot serve the kept checkout; a build there starts a new one.
+    release_output_base "$checkout"
+    kept_checkout=1
+    if mkdir -p "$kept_dir" && mv "$base_dir" "$kept"; then
+      touch "$kept"
+      log "kept $kept: its checkout has work that is not on GitHub (did the outcome push fail?); removed after 7 days"
+    else
+      # Never delete what was just judged worth keeping.
+      log "kept $base_dir in place (could not move it to $kept_dir): its checkout has work that is not on GitHub; removed after a day"
+    fi
+    return 0
+  fi
+  release_output_base "$checkout"
+  rm -rf "$base_dir"
+}
+# Another live launch of this order on this box: the backend placed the order
+# again while this launch wound down (see the directory takeover below), so
+# the order's record is that launch's now, and the end it reports is its own.
+# Prints the pid when there is one.
+newer_launch_of_order() {
+  local d pid
+  for d in "$root/sessions/$order" "$root/sessions/$order".*; do
+    [ -f "$d/.launcher" ] || continue
+    pid=$(cat "$d/.launcher" 2>/dev/null) || continue
+    if [ -n "$pid" ] && [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null; then printf '%s' "$pid"; return 0; fi
+  done
+  return 1
+}
+cleanup() {
+  local status=$? newer reason_file=$runner_dir/$order.exit-reason.$$ bytes_file=$runner_dir/$order.checkout-bytes.$$
+  rm -f "$launch_order"
+  # The session directory's size, as the post-session hook measured it (S5).
+  if [ -s "$bytes_file" ]; then
+    case "$(head -n1 "$bytes_file" 2>/dev/null)" in ''|*[!0-9]*) ;; *) checkout_bytes=$(head -n1 "$bytes_file") ;; esac
+  fi
+  rm -f "$bytes_file"
+  # The post-session hook's word on why the session ended (completed, failed,
+  # interrupted) beats this script's own (signal), when it got to write it.
+  # Per launch (this pid): a relaunch of the order winding up while this one
+  # winds down has its own file and its own report.
+  if [ -s "$reason_file" ]; then
+    case "$(head -n1 "$reason_file" 2>/dev/null)" in
+      ''|*[!a-z0-9-]*) ;;
+      *) exit_reason=$(head -n1 "$reason_file") ;;
+    esac
+  fi
+  rm -f "$reason_file"
+  release_checkout
+  # Reported last: the slot is held until this script exits, and the
+  # keep-or-remove check above can wait a minute on an unreachable origin, so
+  # the end the orchestrator records is when the slot is actually free. Not
+  # reported at all while a newer launch of the order runs here: this end is
+  # not that session's.
+  if newer=$(newer_launch_of_order); then
+    log "end not reported: a newer launch of this order (pid $newer) runs on this box and reports its own end"
+  else
+    report_end "$status" "$exit_reason"
+  fi
+}
+trap cleanup EXIT
+# A trapped signal must end the script (an untrapped one would kill it before
+# the cleanup), and must reach the runner: killing the tmux session hangs up
+# only the pane's own process, this script.
+runner_pid=
+on_signal() {
+  trap '' HUP INT TERM
+  exit_reason=signal
+  if [ -n "$runner_pid" ]; then
+    kill -TERM "$runner_pid" 2>/dev/null
+    wait "$runner_pid" 2>/dev/null
+  fi
+  exit "$1"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+# From here on the work order is this launch's: same directory, so the move is
+# atomic and keeps the 0600.
+if ! mv -f "$work_order" "$launch_order"; then
+  log "could not take the work order $work_order"
+  exit 2
+fi
+
+# claude: the native install (~/.local/bin) first, then PATH, then the nvm global.
+claude_bin=${CLAUDE_BIN:-}
+if [ -z "$claude_bin" ]; then
+  if [ -x "$HOME/.local/bin/claude" ]; then
+    claude_bin=$HOME/.local/bin/claude
+  elif command -v claude >/dev/null 2>&1; then
+    claude_bin=$(command -v claude)
+  else
+    export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+    claude_bin=$(command -v claude 2>/dev/null || true)
+  fi
+fi
+if [ -z "$claude_bin" ] || ! "$claude_bin" self-hosted-runner --help >/dev/null 2>&1; then
+  log 'no claude with the self-hosted-runner subcommand on this box'
+  exit 2
+fi
+
+# The session's slot, written where the repository's make reads it. The environment
+# this wrapper exports reaches the runner and its Bash tool, but not a tmux
+# server the agent starts (it keeps the environment of whoever launched it),
+# so a `make dev` run from a tmux pane would silently take the owner's
+# instance 1. dev-stack/.env.override is read by every make in the checkout.
+# Called after seeding: it skips an existing file, and its log line
+# says whether credentials arrived.
+pin_slot() {
+  local dst=$checkout/dev-stack/.env.override
+  mkdir -p "$checkout/dev-stack"
+  (
+    umask 077
+    { grep -v '^DEV_INSTANCE=' "$dst" 2>/dev/null || true; printf 'DEV_INSTANCE=%s\n' "$slot"; } >"$dst.tmp" &&
+      mv "$dst.tmp" "$dst"
+  ) || log "could not pin DEV_INSTANCE=$slot in $dst; a make run outside this session's environment will use instance 1"
+}
+
+# Per-session checkout, seeded from the canonical clone when there is one. A
+# directory left by an earlier launch of this order is replaced, unless that
+# launch is still winding its runner down (the backend killed its session and
+# placed the order again; the runner may still be pushing an outcome): then
+# this launch takes a directory of its own and leaves the other to its owner's
+# cleanup, or to the day-old sweep.
+if [ -e "$base_dir" ]; then
+  owner=$(cat "$base_dir/.launcher" 2>/dev/null || true)
+  if [ -n "$owner" ] && [ "$owner" != "$$" ] && kill -0 "$owner" 2>/dev/null; then
+    log "an earlier launch of this order (pid $owner) still winds down in $base_dir; using $base_dir.$$"
+    base_dir=$base_dir.$$
+    checkout=$base_dir/$repo
+  else
+    log "stale $base_dir from an earlier attempt of this order; replacing it"
+    rm -rf "$base_dir"
+  fi
+fi
+mkdir -p "$(dirname "$checkout")"
+printf '%s\n' "$$" >"$base_dir/.launcher"
+if [ -d "$canonical/.git" ]; then
+  origin=$(git -C "$canonical" remote get-url origin 2>/dev/null || true)
+  if git clone --quiet --local --no-checkout "$canonical" "$checkout" 2>>"$log_file"; then
+    [ -n "$origin" ] && git -C "$checkout" remote set-url origin "$origin"
+    log "seeded $checkout from $canonical"
+    pin_slot
+  else
+    log "seeding from $canonical failed; the runner will clone cold"
+    rm -rf "$checkout"
+  fi
+else
+  log "no canonical clone at $canonical; the runner will clone cold"
+fi
+
+# Inference: the session's Claude Code uses the token Anthropic issues with it,
+# never the termag Claude gateway (Bedrock). The gateway's settings live in the
+# owner's ~/.claude/settings.json (termag-credentials), which the session never
+# reads: the runner gives it its own CLAUDE_CONFIG_DIR, seeded from the host
+# config below. Nor may a stray provider setting or key from this environment
+# take the token's place.
+unset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BEDROCK_BASE_URL CLAUDE_CODE_SKIP_BEDROCK_AUTH \
+  ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY AWS_BEARER_TOKEN_BEDROCK
+export DISABLE_AUTOUPDATER=1
+export CLAUDE_CODE_DISABLE_ARTIFACT=1
+export WEBAPP_CLOUD_ENV=${WEBAPP_CLOUD_ENV:-termag}
+export WEBAPP_RUNNER_DEV_INSTANCE=$slot
+export DEV_INSTANCE=$slot
+# For the termag runner hooks (deploy/claude-runner-hooks): the order they
+# report on and where post-session leaves the exit reason. Sessions inherit
+# these too, which is how termag-status learns the order for the title post.
+export TERMAG_CLAUDE_RUNNER_ORDER=$order
+export TERMAG_CLAUDE_RUNNER_DIR=$runner_dir
+export TERMAG_CLAUDE_RUNNER_LAUNCH=$$
+# The post-session hook finds the session's transcripts under here for its
+# final usage post.
+export TERMAG_CLAUDE_RUNNER_BASE_DIR=$base_dir
+# the repository's dev-up picks an AWS profile for the ECR pull when this is unset,
+# finds none on a box and falls back to the images already there (STACK_PULL=
+# never), so a fresh box cannot start. Set but empty, it pulls through the
+# default credential chain, which on a box is its instance role. A value the
+# owner or the launching environment set stays.
+export STACK_AWS_PROFILE=${STACK_AWS_PROFILE-}
+
+# The session's own OpenTelemetry: metrics and events to the project the
+# orchestrator named, over OTLP/HTTP. Sessions inherit this environment, and a launcher's
+# telemetry variables pin the destination like managed settings (Claude Code
+# 2.1.251+). Metadata only, whatever the owner's shell or settings say: prompt
+# text, assistant responses, tool parameters and API bodies stay off here, and
+# the host-config copy below drops the same keys.
+unset OTEL_LOG_USER_PROMPTS OTEL_LOG_ASSISTANT_RESPONSES OTEL_LOG_TOOL_DETAILS OTEL_LOG_TOOL_CONTENT OTEL_LOG_RAW_API_BODIES
+telemetry_pinned=0
+if [ -n "$otel_project$otel_endpoint" ]; then
+  # A routing key is letters, digits, . _ -; the endpoint an https origin, no path.
+  case "$otel_project" in ''|*[!A-Za-z0-9._-]*) otel_project= ;; esac
+  case "$otel_endpoint" in https://*) case "${otel_endpoint#https://}" in ''|*[!A-Za-z0-9.:-]*) otel_endpoint= ;; esac ;; *) otel_endpoint= ;; esac
+  if [ -n "$otel_project" ] && [ -n "$otel_endpoint" ]; then
+    # Nothing of the owner's exporter setup may ride on the pinned export: not
+    # a collector credential (headers, client key and certificate, generic or
+    # per signal), not a per-signal endpoint or protocol. Claude Code strips
+    # developer per-signal headers only when the launcher sets the generic
+    # header itself, so it is set, empty, rather than left unset.
+    for _v in $(env | sed -n 's/^\(OTEL_EXPORTER_OTLP_[A-Z_]*\)=.*/\1/p'); do unset "$_v"; done
+    unset _v
+    export OTEL_EXPORTER_OTLP_HEADERS=
+    telemetry_pinned=1
+    export CLAUDE_CODE_ENABLE_TELEMETRY=1
+    export OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_TRACES_EXPORTER=none
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    export OTEL_EXPORTER_OTLP_ENDPOINT=$otel_endpoint
+    export OTEL_METRICS_INCLUDE_SESSION_ID=true
+    box_name=$(hostname -s 2>/dev/null) || box_name=unknown
+    export OTEL_RESOURCE_ATTRIBUTES="telemetry.project_id=$otel_project,service.name=termag-claude-session,termag.box=${box_name:-unknown},termag.slot=$slot"
+    # The owner's and the box's ids, both or neither, so the session's
+    # telemetry can be joined to both. Ids
+    # only (letters, digits, - and _), so no value needs OTEL escaping.
+    case "$user_key$box_key" in
+      '') ;;
+      *)
+        case "$user_key" in ''|*[!A-Za-z0-9_-]*) user_key= ;; esac
+        case "$box_key" in ''|*[!A-Za-z0-9_-]*) box_key= ;; esac
+        if [ -n "$user_key" ] && [ -n "$box_key" ]; then
+          OTEL_RESOURCE_ATTRIBUTES="$OTEL_RESOURCE_ATTRIBUTES,termag.user.id=$user_key,termag.box.id=$box_key"
+        else
+          log "session telemetry without context keys: --user-key and --box-key must both be ids"
+        fi
+        ;;
+    esac
+    log "session telemetry to $otel_endpoint (project $otel_project)"
+  else
+    log "session telemetry off: --otel-project must be a routing key and --otel-endpoint an https origin, both given"
+  fi
+fi
+
+# Host config, which the runner copies into each session's CLAUDE_CONFIG_DIR:
+# always a copy made here, never ~/.claude itself (the runner's default), with
+# the gateway keys termag-credentials merged into settings.json taken out
+# (~/.config/termag/claude-gateway.json records them) and the telemetry
+# content gates (env.OTEL_LOG_*) dropped, as above. With the export pinned,
+# the owner's whole OpenTelemetry setup goes too (every env.OTEL_*
+# key, the CLAUDE_CODE_ENABLE_TELEMETRY switch and otelHeadersHelper): user
+# settings outrank the launcher's environment for everything but the
+# destination, so an owner's exporter, resource attributes or collector
+# credential would otherwise reach the pinned export, and an owner's "0" would
+# switch the export off (opting out is a deployment decision, not a settings key). From the repository's runner
+# install's ~/.claude-runner/config when present, all of it; else from
+# ~/.claude, its settings, CLAUDE.md, agents, skills and commands only, not its
+# runtime state or plugins.
+host_cfg=$base_dir/host-config
+# termag's canonical hook entries (deploy/claude-settings.json: the status
+# posts, the title, the usage) merged into the staged settings.json whichever
+# source it was copied from, by termag-hooks-update, which replaces the
+# entries that invoke termag-status and keeps every other hook. The repository's
+# runner install's config is a file termag never updates otherwise, so a box
+# with it would run sessions on hooks from whenever it was installed
+#. A missing settings.json gets the
+# canonical file. Best effort: without the updater or its canonical file the
+# copied hooks stand and the log says so.
+merge_termag_hooks() {
+  local upd
+  for upd in "${TERMAG_HOOKS_UPDATE:-}" "$HOME/.local/bin/termag-hooks-update" "$HOME/src/termag/deploy/termag-hooks-update"; do
+    [ -n "$upd" ] && [ -x "$upd" ] && break
+    upd=
+  done
+  [ -n "$upd" ] || { log "termag-hooks-update not found; the session keeps the copied hooks"; return 0; }
+  if TERMAG_CLAUDE_SETTINGS="$host_cfg/settings.json" "$upd" >/dev/null 2>&1; then
+    rm -f "$host_cfg"/settings.json.bak.* 2>/dev/null
+  else
+    log "could not merge termag's hooks into the host config; the session keeps the copied hooks"
+  fi
+}
+stage_host_config() {
+  local src=$HOME/.claude-runner/config mine=$HOME/.config/termag/claude-gateway.json entry
+  rm -rf "$host_cfg" && mkdir -p "$host_cfg" && chmod 700 "$host_cfg" || return 1
+  if [ -d "$src" ]; then
+    cp -RL "$src/." "$host_cfg/" || return 1
+  else
+    for entry in settings.json CLAUDE.md agents skills commands; do
+      if [ -e "$HOME/.claude/$entry" ]; then cp -RL "$HOME/.claude/$entry" "$host_cfg/" || return 1; fi
+    done
+  fi
+  merge_termag_hooks
+  [ -f "$host_cfg/settings.json" ] || return 0
+  [ -s "$mine" ] || mine=/dev/null
+  # As termag-credentials' remove: a recorded key goes only while it holds the
+  # recorded value. Our token helper goes whatever the record says.
+  jq --slurpfile mine "$mine" --argjson pinned "$telemetry_pinned" '
+    def pairs: [(if has("apiKeyHelper") then [["apiKeyHelper"], .apiKeyHelper] else empty end),
+                ((.env // {}) | to_entries[] | [["env", .key], .value])];
+    reduce (($mine[0] // {}) | pairs[]) as $p (.; if getpath($p[0]) == $p[1] then delpaths([$p[0]]) else . end)
+    | if (.apiKeyHelper // "" | test("/termag-claude-token(\u0027|$)")) then del(.apiKeyHelper) else . end
+    | if .env then .env |= with_entries(select(.key | test(if $pinned == 1 then "^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_ENHANCED_TELEMETRY_BETA$)" else "^OTEL_LOG_" end) | not)) else . end
+    | if $pinned == 1 then del(.otelHeadersHelper) else . end
+    | if .env == {} then del(.env) else . end' "$host_cfg/settings.json" > "$host_cfg/settings.json.tmp" \
+    && mv -f "$host_cfg/settings.json.tmp" "$host_cfg/settings.json"
+}
+if stage_host_config; then
+  export SELF_HOSTED_RUNNER_HOST_CONFIG_DIR=$host_cfg
+else
+  # Never fall back to ~/.claude: it would carry the gateway into the session.
+  log "could not stage the host config in $host_cfg; the session starts without host config"
+  rm -rf "$host_cfg"; mkdir -p "$host_cfg"
+  export SELF_HOSTED_RUNNER_HOST_CONFIG_DIR=$host_cfg
+fi
+
+set -- \
+  --environment-secret-file "$launch_order" \
+  --base-dir "$base_dir" \
+  --capacity 1 \
+  --drain-grace-sec 0 \
+  --release-idle-session-min 120 \
+  --kill-session-after-min 720 \
+  --drain-wait-sec 600 \
+  --post-session-hook-timeout-sec 120 \
+  --remove-session-state \
+  --push-outcome-on-release \
+  --git-ssh-rewrite github.com \
+  --confine-repo-settings warn \
+  --trust-workspace true \
+  --client-label "termag-$(hostname -s 2>/dev/null || hostname)-s$slot" \
+  --health-port 0 \
+  --log-file "$log_file"
+if [ -x "$hooks_dir/command" ]; then
+  # termag's hooks (see the header): the command hook execs the repository's wrapper
+  # itself when present, so no --exec-path, which would take precedence over
+  # the hook and skip the started report.
+  set -- "$@" --hooks-dir "$hooks_dir"
+else
+  [ -x "$cfg_dir/session-wrapper.sh" ] && set -- "$@" --exec-path "$cfg_dir/session-wrapper.sh"
+  [ -d "$cfg_dir/hooks" ] && set -- "$@" --hooks-dir "$cfg_dir/hooks"
+fi
+
+log "starting one-shot runner, DEV_INSTANCE=$slot, checkout $checkout, log $log_file"
+# In the background and waited for, not exec'd and not in the foreground: bash
+# runs a trap only once a foreground child returns, but interrupts `wait` at
+# once, so a signal reaches on_signal (and the runner) immediately. The EXIT
+# trap still removes the work order and the checkout (or keeps it) afterwards.
+"$claude_bin" self-hosted-runner "$@" </dev/null &
+runner_pid=$!
+wait "$runner_pid"
+status=$?
+runner_pid=
+exit "$status"

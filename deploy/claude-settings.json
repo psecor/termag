@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &"
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" prompt-submit >/dev/null 2>&1 &"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &"
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool >/dev/null 2>&1 &"
           }
         ]
       }
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.local/bin/termag-status\" idle >/dev/null 2>&1 &"
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" stop >/dev/null 2>&1 &"
           }
         ]
       }

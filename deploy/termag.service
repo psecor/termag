@@ -9,6 +9,9 @@ After=network.target postgresql.service
 Type=simple
 User=termag
 WorkingDirectory=/opt/termag/backend
+# Refuses to start on the wrong database: the stale local copy after an RDS
+# cutover, or an RDS database that was never restored (backend/src/config/dbGuard.ts).
+ExecStartPre=/usr/bin/node /opt/termag/backend/dist/scripts/dbGuard.js
 ExecStart=/usr/bin/node /opt/termag/backend/dist/index.js
 Restart=on-failure
 RestartSec=10

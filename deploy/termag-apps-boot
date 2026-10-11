@@ -9,11 +9,13 @@
 #                   must be re-created every time)
 #   nginx.conf      route snippet, picked up by the gateway's wildcard include
 #
-# Invoked from two places:
+# Invoked from three places:
 #   * termag-apps.service on ordinary reboots (fstab has /srv/termag by then)
 #   * cloud-init on first boot of a replacement instance (which is what mounts
 #     /srv/termag, after which the systemd unit's ConditionPathIsDirectory
 #     would have already been evaluated as false)
+#   * termag-apps.service again, started by termag-data-attach once it has
+#     mounted a late-attached volume
 #
 # Idempotent and tolerant of a broken app: one bad unit or snippet must not
 # take down the others, so per-app failures warn instead of aborting.

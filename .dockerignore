@@ -10,7 +10,6 @@ terraform
 relay
 docs
 deploy
-shepherd
 backend/.env
 backend/.env.*
 !backend/.env.example

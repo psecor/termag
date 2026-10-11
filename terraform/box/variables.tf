@@ -85,9 +85,13 @@ variable "iam_instance_profile" {
 
 variable "root_volume_gb" {
   type = number
-  # Must be >= the AMI snapshot size (120GB — the baked devbox toolset).
-  # 50 was not enough for a full dev stack: docker images ~13GB, a bazel cache
-  # ~13GB and a large monorepo checkout ~5GB fill it before any work happens.
+  # A floor, not the final size: main.tf raises it to the AMI snapshot's size
+  # when the image is bigger (local.root_volume_gb), so this never has to track
+  # the bake.
+  #
+  # 50 was not enough to run a large repository's dev stack: docker images
+  # ~13GB, a bazel cache ~13GB and the checkout ~5GB fill it before any work
+  # happens.
   default = 120
 }
 

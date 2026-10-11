@@ -1,0 +1,24 @@
+# Blocks host accounts from the EC2 instance metadata service on the
+# orchestrator (deploy/termag-imds-guard.nft). Installed and enabled by
+# packer/scripts/orchestrator-setup.sh, which also makes user@.service and
+# ssh.service require it (deploy/termag-imds-guard-required.conf): if this unit
+# fails, no host account's user manager or SSH login starts.
+#
+# Reload it to reapply the rules; a restart also restarts those units.
+[Unit]
+Description=Termag: block host accounts from EC2 instance metadata
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+# In place before any network is up or any host account's session or lingering
+# user manager starts.
+Before=network-pre.target systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /usr/local/lib/termag/termag-imds-guard.nft
+ExecReload=/usr/sbin/nft -f /usr/local/lib/termag/termag-imds-guard.nft
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# termag-hooks-update — bring an existing ~/.claude/settings.json up to the
+# current termag hook lines.
+#
+# Why: deploy/claude-settings.json is installed only when the file is ABSENT
+# (termag-host-setup), and termag-reconcile deliberately never touches it, since
+# owners add their own hooks. So a hook-line change (e.g. PostToolUse now piping
+# its payload into `termag-status post-tool`) never reaches a box that already
+# has the file. This script applies exactly that change, in place, keeping every
+# other hook the owner added.
+#
+# What it does: for each hook event in deploy/claude-settings.json, any hook
+# entry whose command invokes termag-status is replaced by the canonical entry
+# for that event; entries that do not invoke termag-status are left alone;
+# events missing entirely are added. A timestamped backup is written first.
+#
+# Usage:
+#   termag-hooks-update            # apply (idempotent; prints what changed)
+#   termag-hooks-update --check    # exit 1 if an update is needed, 0 if current
+#
+# Env: TERMAG_CHECKOUT        the box's termag checkout (default $HOME/src/termag,
+#                             same as termag-reconcile) — the canonical file is
+#                             read from its deploy/ directory
+#      TERMAG_CLAUDE_SETTINGS override the settings path (tests)
+#      TERMAG_CANONICAL_HOOKS override the canonical file (tests)
+set -euo pipefail
+PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+
+MODE=${1:-}
+SETTINGS=${TERMAG_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}
+canonical_default() {
+  local here checkout
+  checkout="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+  # termag-reconcile installs a COPY of this script into ~/.local/bin (install(1),
+  # not a symlink), so the checkout is the normal source of the canonical file;
+  # the script's own directory only matters when it is run from the repo.
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+  for c in "$checkout/deploy/claude-settings.json" "$here/claude-settings.json"; do
+    [ -r "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+CANONICAL=${TERMAG_CANONICAL_HOOKS:-$(canonical_default || true)}
+[ -n "$CANONICAL" ] && [ -r "$CANONICAL" ] || { echo "termag-hooks-update: canonical claude-settings.json not found" >&2; exit 2; }
+command -v jq >/dev/null || { echo "termag-hooks-update: jq is required" >&2; exit 2; }
+
+# Build the merged document. For every event in the canonical file:
+#   keep := existing entries of that event that do NOT invoke termag-status
+#   result := keep + canonical entries for that event
+# Events only in the existing file pass through untouched.
+merge() {
+  jq --slurpfile canon "$CANONICAL" '
+    def invokes_termag: ((.hooks // []) | map(.command // "") | any(test("termag-status")));
+    ($canon[0].hooks // {}) as $ch
+    | .hooks = ((.hooks // {}) as $eh
+        | reduce ($ch | keys[]) as $ev ($eh;
+            .[$ev] = ((($eh[$ev] // []) | map(select(invokes_termag | not))) + $ch[$ev])))
+  ' "$1"
+}
+
+if [ ! -e "$SETTINGS" ]; then
+  if [ "$MODE" = "--check" ]; then echo "no settings file at $SETTINGS (would install canonical)"; exit 1; fi
+  mkdir -p "$(dirname "$SETTINGS")"
+  cp "$CANONICAL" "$SETTINGS"
+  echo "installed $SETTINGS from canonical hooks"
+  exit 0
+fi
+
+jq -e . "$SETTINGS" >/dev/null 2>&1 || { echo "termag-hooks-update: $SETTINGS is not valid JSON; not touching it" >&2; exit 2; }
+
+MERGED=$(merge "$SETTINGS")
+if [ "$(jq -S . "$SETTINGS")" = "$(printf '%s' "$MERGED" | jq -S .)" ]; then
+  echo "hooks already current: $SETTINGS"
+  exit 0
+fi
+
+if [ "$MODE" = "--check" ]; then
+  echo "hooks out of date: $SETTINGS (run termag-hooks-update)"
+  exit 1
+fi
+
+BACKUP="$SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
+cp -p "$SETTINGS" "$BACKUP"
+TMP=$(mktemp "$(dirname "$SETTINGS")/.settings.XXXXXX")
+printf '%s\n' "$MERGED" > "$TMP"
+chmod --reference="$SETTINGS" "$TMP" 2>/dev/null || true
+mv "$TMP" "$SETTINGS"
+echo "updated $SETTINGS (backup: $BACKUP)"
+echo "Claude Code reads hooks at session start: restart running claude sessions to pick this up."

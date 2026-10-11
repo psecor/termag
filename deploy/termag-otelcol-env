@@ -1,0 +1,77 @@
+#!/bin/sh
+# Renders the per-instance half of the orchestrator's log-shipping config
+# (termag-otelcol.service, deploy/termag-otelcol.yaml): which project the logs
+# belong to and which OTLP endpoint takes them.
+#
+# Both come from the backend .env cloud-init writes:
+#   OBSERVABILITY_PROJECT        -> telemetry.project_id, the routing key the
+#                                   collector files these logs under (letters,
+#                                   digits, . _ -; not a secret).
+#   OBSERVABILITY_OTLP_ENDPOINT  -> the exporter endpoint, https://<host>[:port].
+# With either unset it refuses rather than guess. The same two settings, and
+# the same rules, decide where Claude cloud sessions send their telemetry
+# (backend/src/config/env.ts, otlpDestinationFromEnv).
+#
+# Exit 1 while the .env does not exist yet (first boot, cloud-init still
+# running), at once rather than waiting for it (see termag-otelcol.service).
+# Exit 78 (EX_CONFIG) when the .env can't say where to ship. Either way the
+# unit retries with backoff and writes nothing.
+#
+# Run as root (the .env is the termag user's, mode 600); writes only $OUT.
+set -eu
+
+ENV_FILE="${TERMAG_OTELCOL_BACKEND_ENV:-/opt/termag/backend/.env}"
+OUT="${TERMAG_OTELCOL_OUT:-/run/termag-otelcol/destination.yaml}"
+
+say() { echo "termag-otelcol: $*" >&2; }
+
+# The last KEY= line wins, as it would for `set -a; . ./.env`. One pair of
+# surrounding quotes is dropped; the file is never sourced.
+env_value() {
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+if [ ! -r "$ENV_FILE" ]; then
+  say "$ENV_FILE is not there yet (cloud-init still running?); retrying"
+  exit 1
+fi
+
+project_id=$(env_value OBSERVABILITY_PROJECT)
+if [ -z "$project_id" ]; then
+  say "OBSERVABILITY_PROJECT is empty in $ENV_FILE, so the logs have no project; not shipping them"
+  exit 78
+fi
+case "$project_id" in
+  *[!A-Za-z0-9._-]*)
+    say "OBSERVABILITY_PROJECT in $ENV_FILE is not a routing key (letters, digits, . _ -); not shipping logs"
+    exit 78 ;;
+esac
+
+endpoint=$(env_value OBSERVABILITY_OTLP_ENDPOINT)
+if [ -z "$endpoint" ]; then
+  say "OBSERVABILITY_OTLP_ENDPOINT is empty in $ENV_FILE; not shipping logs"
+  exit 78
+fi
+endpoint=${endpoint%/}
+if ! printf '%s\n' "$endpoint" | grep -Eqx 'https://[A-Za-z0-9.-]+(:[0-9]+)?'; then
+  say "OTLP endpoint $endpoint is not https://<host>[:port]; not shipping logs"
+  exit 78
+fi
+
+mkdir -p "$(dirname "$OUT")"
+tmp="$OUT.tmp.$$"
+umask 022
+cat >"$tmp" <<YAML
+# Rendered by termag-otelcol-env from $ENV_FILE; merged over termag-otelcol.yaml.
+processors:
+  resource/destination:
+    attributes:
+      - key: telemetry.project_id
+        value: "$project_id"
+        action: upsert
+exporters:
+  otlphttp/destination:
+    endpoint: "$endpoint"
+YAML
+mv -f "$tmp" "$OUT"
+say "shipping logs to $endpoint for project $project_id"

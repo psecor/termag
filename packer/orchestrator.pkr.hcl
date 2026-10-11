@@ -54,6 +54,12 @@ variable "subnet_id" {
   description = "Subnet with outbound internet (IGW or NAT) for apt/npm. Required."
 }
 
+variable "iam_instance_profile" {
+  type        = string
+  default     = "AmazonSSMRoleForInstancesQuickSetup"
+  description = "Instance profile for the builder; its role only needs AmazonSSMManagedInstanceCore so the SSM agent registers. The default is the Quick Setup profile the development account has; the Termag account uses termag-ami-builder."
+}
+
 variable "instance_type" {
   type        = string
   default     = "t4g.large"
@@ -92,7 +98,7 @@ source "amazon-ebs" "termag_orchestrator" {
   // Communicate via SSM Session Manager (no inbound SSH possible in this VPC).
   ssh_username         = "ubuntu"
   ssh_interface        = "session_manager"
-  iam_instance_profile = "AmazonSSMRoleForInstancesQuickSetup"
+  iam_instance_profile = var.iam_instance_profile
   // Public IP so the build instance can reach apt mirrors + npm registry. The
   // temporary SG Packer creates has no inbound rules — SSM still tunnels out.
   associate_public_ip_address = true
@@ -109,6 +115,14 @@ source "amazon-ebs" "termag_orchestrator" {
   }
 
   tags = {
+    App       = "termag"
+    Component = "orchestrator"
+    BaseImage = "ubuntu-24.04-arm64"
+    TermagSha = var.termag_baked_sha
+    BuiltBy   = "packer"
+  }
+
+  snapshot_tags = {
     App       = "termag"
     Component = "orchestrator"
     BaseImage = "ubuntu-24.04-arm64"
@@ -162,4 +176,5 @@ build {
     // Long install — apt + two npm builds can take a while.
     timeout = "30m"
   }
+
 }

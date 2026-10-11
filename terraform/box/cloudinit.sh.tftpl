@@ -35,8 +35,20 @@ if pgrep -u termag >/dev/null; then
 fi
 
 # ── Step 2: rename user + group, move home ───────────────────────────────
-usermod -l "$UNIX_USER" -d "/home/$UNIX_USER" -m termag
-groupmod -n "$UNIX_USER" termag
+# Move the directory ourselves and let usermod update only the passwd record.
+# `usermod -m` does the same rename(2) and then walks the whole home, one stat
+# per file, to fix ownership that does not change here (measured: 100,377
+# newfstatat calls for 100,003 files). On a box that walk hits a root volume
+# EBS restores lazily from the snapshot, and on the quick-start image it took
+# 4 minutes (2026-09-25 box: user manager stopped 16:21:01, next step 16:25:04).
+# mv is one rename(2). Ownership is untouched because the UID and GID stay the
+# same; the baked-path fix-up is Steps 3+4. An owner literally named termag
+# needs no rename at all.
+if [ "$UNIX_USER" != termag ]; then
+  mv /home/termag "/home/$UNIX_USER"
+  usermod -l "$UNIX_USER" -d "/home/$UNIX_USER" termag
+  groupmod -n "$UNIX_USER" termag
+fi
 USER_UID=$(id -u "$UNIX_USER")
 
 # ── Step 2b: re-assert passwordless sudo for the renamed owner ───────────
@@ -47,47 +59,29 @@ USER_UID=$(id -u "$UNIX_USER")
 # sudoers policy itself is group-keyed, so it needs no edit here.
 usermod -aG sudo "$UNIX_USER"
 
-# Steps 3–4 are best-effort cosmetic cleanup of the `/home/termag` prefix the
-# AMI bake leaves behind. They must NEVER abort the boot — the load-bearing
-# work is Steps 5–8 (write the agent token + start the agent). So every
-# pipeline below is guarded with `|| true`: a no-match grep (exit 1), a
-# permission-denied find, or an unwritable file must not strand the box
-# without a running agent.
+# Steps 3–4 are cosmetic cleanup of the `/home/termag` prefix the AMI bake
+# leaves behind. They must NEVER abort the boot — the load-bearing work is
+# Steps 5–8 (write the agent token + start the agent). So the call below is
+# guarded: a missing script, a missing index or an unwritable file must not
+# strand the box without a running agent.
 
-# ── Step 3: rewrite absolute symlinks under the renamed home ─────────────
-# cursor-agent and devin installers create symlinks with /home/termag/
-# baked into the target. After usermod the home moved but symlink targets
-# didn't follow; rewrite mechanically.
-echo "=== step 3: rewriting /home/termag symlinks ==="
-find "/home/$UNIX_USER" -type l -lname '/home/termag/*' 2>/dev/null | while read -r link; do
-  target=$(readlink "$link")
-  newtarget=$(echo "$target" | sed "s|/home/termag|/home/$UNIX_USER|")
-  ln -sfn "$newtarget" "$link"
-done || true
-
-# ── Step 4: rewrite /home/termag baked into text files ───────────────────
-# The AMI bakes the full devbox toolset under /home/termag: pyenv/goenv
-# shims, nvm npm-global shebangs, uv tool wrappers, poetry, the devin
-# config, etc. all hardcode that path. After the rename, sweep the toolchain
-# dirs and rewrite the prefix. `grep -I` skips binaries so we only touch
-# scripts/configs; the dirs are scoped so the sweep stays fast.
-#
-# `grep` exits 1 when a dir has no match — a binaries-only ~/.cargo, or *any*
-# dir on an AMI built before the toolset was baked in (the dirs may not even
-# exist). Without the `|| true` guard that 1 propagates through `pipefail`
-# and `set -e` aborts the whole boot before the agent is ever started,
-# silently stranding the box (it shows `provisioning → failed` after the
-# orchestrator's 15-minute sweep). Guard so a no-match is a clean no-op.
-echo "=== step 4: rewriting /home/termag in toolchain dirs ==="
-for d in .pyenv .goenv .nvm .local .cargo .config; do
-  dir="/home/$UNIX_USER/$d"
-  [ -d "$dir" ] || continue
-  { grep -rIl --null '/home/termag' "$dir" 2>/dev/null || true; } \
-    | xargs -0 -r sed -i "s|/home/termag|/home/$UNIX_USER|g" || true
-done
+# ── Steps 3+4: rewrite the baked /home/termag path (symlink targets + text files)
+# The bake indexes every symlink and text file under the baked home that embeds
+# /home/termag (packer/scripts/index-home-paths.sh) and installs the rewrite as
+# /usr/local/sbin/termag-rewrite-home-paths; only the indexed entries are
+# touched. Walking the home here instead cost 4.5 to 15.5 minutes, because a
+# box's root volume is restored lazily from the snapshot and every first read
+# is an S3 round trip -- and the orchestrator marks a box failed at 15.
+echo "=== steps 3+4: rewriting baked /home/termag paths at $(date -Iseconds) ==="
+if [ -x /usr/local/sbin/termag-rewrite-home-paths ]; then
+  /usr/local/sbin/termag-rewrite-home-paths /home/termag "/home/$UNIX_USER" \
+    || echo "WARNING: path rewrite reported a problem (non-fatal)"
+else
+  echo "WARNING: /usr/local/sbin/termag-rewrite-home-paths is missing; this AMI predates the home-path index, so baked /home/termag paths were not rewritten"
+fi
 
 # ── Step 4b: make the renamed pyenv libs findable ────────────────────────
-# Step 4 only rewrites *text* files -- `grep -I` deliberately skips binaries.
+# The index only lists *text* files -- its `grep -I` deliberately skips binaries.
 # But CPython built with --enable-shared records the bake-time library path in
 # its ELF RUNPATH, and that path (/home/termag/.pyenv/...) no longer exists
 # after the rename. The result is a python3 that cannot start at all:

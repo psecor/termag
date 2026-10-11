@@ -2,9 +2,9 @@
 # Provisions a termag box AMI. Runs once at AMI bake time.
 #
 # Goal: bake a box with a full devbox toolset, so an agent on a box has the
-# same capabilities a human gets on a workstation: full language toolchains (Go, Python, Rust, Node),
-# the agent CLIs (Claude Code, Codex, cursor, devin), and the dev tooling
-# (Docker, terraform, uv, ripgrep, neovim, zsh, …).
+# same capabilities a human gets on a workstation: full language toolchains
+# (Go, Python, Rust, Node), the agent CLIs (Claude Code, Codex, cursor, devin,
+# pi), and the dev tooling (Docker, terraform, uv, ripgrep, neovim, zsh, …).
 #
 # Everything user-scoped is installed under /home/termag. At launch,
 # cloudinit.sh.tftpl renames `termag` → the box owner's Unix username and
@@ -14,10 +14,16 @@
 #   TERMAG_BAKED_SHA     commit of the checkout shipped as /tmp/termag.bundle
 #                        ("unknown" on a hand-run build)
 #   AGENT_WIKI_REPO_URL
+#   BAKE_MODE            full (default) | incremental: exit at once
 
 set -euo pipefail
 
 log() { echo "[packer] $*"; }
+
+if [ "${BAKE_MODE:-full}" = incremental ]; then
+    log "incremental bake: the toolchain is on the source image; skipping setup.sh"
+    exit 0
+fi
 
 # Echo every command so the packer build log is debuggable when something
 # changes upstream and an install command starts failing.
@@ -261,6 +267,9 @@ sudo snap install chromium || true
 if ! id termag >/dev/null 2>&1; then
     sudo useradd -m -s /bin/zsh -c "termag agent runtime" termag
 fi
+# Assert the shell, in case an earlier step created the user before zsh was
+# installed (useradd then warns and keeps going).
+sudo usermod -s /bin/zsh termag
 sudo usermod -aG docker termag
 # Passwordless sudo for the box owner. The box is single-tenant (one user per
 # box), the account is created without a password, and users need to install
@@ -272,6 +281,13 @@ sudo usermod -aG sudo termag
 printf '%%sudo ALL=(ALL:ALL) NOPASSWD:ALL\n' | sudo tee /etc/sudoers.d/90-termag-box >/dev/null
 sudo chmod 0440 /etc/sudoers.d/90-termag-box
 sudo visudo -cf /etc/sudoers.d/90-termag-box
+# Key-only SSH: keys are what gate Session Manager SSH.
+printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' | sudo tee /etc/ssh/sshd_config.d/10-termag-keys-only.conf >/dev/null
+sudo chmod 0644 /etc/ssh/sshd_config.d/10-termag-keys-only.conf
+# sshd -t needs /run/sshd, which socket-activated sshd creates lazily.
+sudo install -d -m 0755 /run/sshd
+sudo sshd -t
+
 # Allow termag's systemd --user to keep running without an interactive session.
 sudo loginctl enable-linger termag
 
@@ -292,10 +308,17 @@ corepack prepare yarn@stable --activate
 corepack prepare pnpm@latest --activate
 # Agent CLIs that live on the Node toolchain:
 npm install -g @anthropic-ai/claude-code @openai/codex
+# pi (@earendil-works/pi-coding-agent) is the pi provider's agent. A new
+# third-party publisher on the image, so unlike the two above it is PINNED and
+# installed without lifecycle scripts (its optional native helpers -- esbuild
+# etc. -- are not needed; 1.0.2 was verified working this way on a box).
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
+command -v pi >/dev/null || { echo "[packer] pi missing after npm install -g -- failing build"; exit 1; }
+[ "$(pi --version 2>/dev/null)" = "1.0.2" ] || { echo "[packer] pi is not the pinned 1.0.2 -- failing build"; exit 1; }
 NVM_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
-# goenv + Go (1.26.1)
+# goenv + Go (1.26.1) + telemetry off
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<'GOENV_INSTALL'
 set -euo pipefail
@@ -305,32 +328,14 @@ export PATH="$GOENV_ROOT/bin:$PATH"
 eval "$(goenv init -)"
 goenv install 1.26.1
 goenv global 1.26.1
+# Telemetry off on every image. Non-fatal: `go telemetry` is a 1.23+ subcommand and its absence is not a
+# reason to fail a bake.
+go telemetry off || echo "[packer/setup] go telemetry off failed (non-fatal)"
 GOENV_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
-# pyenv + Python + poetry
-# ─────────────────────────────────────────────────────────────────────────────
-sudo -u termag -H bash <<'PYENV_INSTALL'
-set -euo pipefail
-git clone https://github.com/pyenv/pyenv.git "$HOME/.pyenv"
-export PYENV_ROOT="$HOME/.pyenv"
-export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init -)"
-pyenv install 3.13
-pyenv global 3.13
-pip install poetry
-PYENV_INSTALL
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Rust (rustup) — cargo for building rtk and Rust projects
-# ─────────────────────────────────────────────────────────────────────────────
-sudo -u termag -H bash <<'RUST_INSTALL'
-set -euo pipefail
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-RUST_INSTALL
-
-# ─────────────────────────────────────────────────────────────────────────────
-# uv (Astral) — Python package/tool manager; also installs browser-harness
+# uv (Astral) — Python package/tool manager. Fetches the prebuilt CPython for
+# pyenv below, and installs browser-harness.
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<'UV_INSTALL'
 set -euo pipefail
@@ -342,14 +347,63 @@ uv tool install "git+https://github.com/browser-use/browser-harness" || echo "[p
 UV_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
-# rtk (Rust Token Killer) — public repo, built with cargo into ~/.cargo/bin
+# pyenv + Python (a python-build-standalone build fetched by uv) + poetry.
+# pyenv treats any directory under versions/ as an installed version, so the
+# symlink to uv's managed interpreter works with `pyenv global` and the shims.
 # ─────────────────────────────────────────────────────────────────────────────
-sudo -u termag -H bash <<'RTK_INSTALL'
+sudo -u termag -H bash <<'PYENV_INSTALL'
 set -euo pipefail
-export PATH="$HOME/.cargo/bin:$PATH"
-git clone --depth 1 https://github.com/rtk-ai/rtk.git /tmp/rtk
-( cd /tmp/rtk && cargo install --path . ) || echo "[packer] rtk build failed (non-fatal)"
-rm -rf /tmp/rtk
+git clone https://github.com/pyenv/pyenv.git "$HOME/.pyenv"
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$HOME/.local/bin:$PATH"
+eval "$(pyenv init -)"
+uv python install 3.13
+py_prefix=$("$(uv python find --managed-python 3.13)" -c 'import sys; print(sys.prefix)')
+py_version=$("$py_prefix/bin/python3" -c 'import platform; print(platform.python_version())')
+mkdir -p "$PYENV_ROOT/versions"
+ln -sfn "$py_prefix" "$PYENV_ROOT/versions/$py_version"
+pyenv global "$py_version"
+pyenv rehash
+uv tool install poetry
+# Precompile every uv-managed stdlib, as CPython's `make install` did for the
+# old pyenv build: python-build-standalone ships no stdlib bytecode, so the
+# first import after the bake writes __pycache__ into the interpreter, which
+# a later step's home-write guard would fail. Levels 0-2 and the
+# excludes match `make install`; test/ holds files that never compile.
+for py in "$(uv python dir)"/*/bin/python3; do
+    "$py" -m compileall -q -j0 -o 0 -o 1 -o 2 \
+        -x '/(test|idlelib/idle_test|lib2to3/tests)/|/site-packages/' \
+        "$("$py" -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" >/dev/null
+done
+echo "[packer] Python $py_version (python-build-standalone via uv) registered with pyenv at $py_prefix"
+PYENV_INSTALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rust (rustup) — cargo for Rust projects
+# ─────────────────────────────────────────────────────────────────────────────
+sudo -u termag -H bash <<'RUST_INSTALL'
+set -euo pipefail
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+RUST_INSTALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rtk (Rust Token Killer) — pinned release binary into ~/.local/bin
+# ─────────────────────────────────────────────────────────────────────────────
+RTK_VERSION=v0.50.0
+RTK_SHA256=d1cc49dfa2cd443fc32625444b59fe616b6c80478cca210985118347174dd758
+sudo -u termag -H env RTK_VERSION="$RTK_VERSION" RTK_SHA256="$RTK_SHA256" bash <<'RTK_INSTALL'
+set -euo pipefail
+mkdir -p "$HOME/.local/bin"
+url="https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz"
+if curl -fsSL "$url" -o /tmp/rtk.tgz \
+   && [ "$(sha256sum /tmp/rtk.tgz | cut -d' ' -f1)" = "$RTK_SHA256" ]; then
+    tar -xzf /tmp/rtk.tgz -C "$HOME/.local/bin" rtk
+    chmod 755 "$HOME/.local/bin/rtk"
+    echo "[packer] rtk $RTK_VERSION installed (digest verified)"
+else
+    echo "[packer] rtk $RTK_VERSION download failed or digest mismatch; not installed (non-fatal)"
+fi
+rm -f /tmp/rtk.tgz
 RTK_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,6 +585,12 @@ cd termag/agent
 npm install --omit=dev
 cd /home/termag/src
 
+# The termag CLI, built in the checkout with a launcher at ~/.local/bin/termag
+# that pins this nvm Node. termag-reconcile runs the same installer on every
+# boot; the launcher's /home/termag paths are rewritten at first boot like the
+# other text files under ~/.local.
+sh termag/cli/install.sh --bin-dir "\$HOME/.local/bin"
+
 git clone "${AGENT_WIKI_REPO_URL}" agent-wiki || true
 
 # Record the baked commit so a live box can be checked against the TermagSha
@@ -544,9 +604,10 @@ EOF
 # then `systemctl --user enable --now termag-agent`. The unit sources nvm to
 # locate node (nvm-only — no system node).
 # ─────────────────────────────────────────────────────────────────────────────
-sudo mkdir -p /home/termag/.config/systemd/user
-sudo cp /tmp/termag-agent.service /home/termag/.config/systemd/user/termag-agent.service
-sudo chown -R termag:termag /home/termag/.config
+# shellcheck source=box-lib.sh
+. /var/lib/termag-bake/box-lib.sh
+install_deploy_artifacts
+install_box_marker
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code status hooks. termag tracks working/waiting/idle state via hooks
@@ -554,13 +615,9 @@ sudo chown -R termag:termag /home/termag/.config
 # from deploy/claude-settings.json (file-provisioned to /tmp) so this is no
 # longer the manual step it used to be in setup.md.
 # ─────────────────────────────────────────────────────────────────────────────
-sudo mkdir -p /home/termag/.claude /home/termag/.local/bin
-sudo cp /tmp/claude-settings.json /home/termag/.claude/settings.json
 # The hooks call termag-status, which resolves the server endpoint from the
 # agent's own termag_url. Hardcoding localhost here breaks every box whose
 # server is not co-located, and does so silently.
-sudo install -m 755 /tmp/termag-status /home/termag/.local/bin/termag-status
-sudo chown -R termag:termag /home/termag/.claude /home/termag/.local
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Artifact reconciliation. `deploy/` is the source of truth for the agent unit
@@ -579,12 +636,6 @@ sudo chown -R termag:termag /home/termag/.claude /home/termag/.local
 # other units' symlinks itself from then on, but it cannot enable itself on a box
 # that never had it -- there, one manual run of `termag-reconcile` does that.
 # ─────────────────────────────────────────────────────────────────────────────
-sudo install -m 755 /tmp/termag-reconcile /home/termag/.local/bin/termag-reconcile
-sudo cp /tmp/termag-reconcile.service \
-    /home/termag/.config/systemd/user/termag-reconcile.service
-sudo ln -sf ../termag-reconcile.service \
-    /home/termag/.config/systemd/user/default.target.wants/termag-reconcile.service
-
 sudo chown -R termag:termag /home/termag/.local /home/termag/.config
 
 # ─────────────────────────────────────────────────────────────────────────────

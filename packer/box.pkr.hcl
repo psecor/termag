@@ -1,31 +1,4 @@
 // Packer template for the termag box AMI.
-//
-// Builds an Ubuntu 24.04 arm64 image with everything a termag box needs at
-// runtime: system packages, agent CLIs (claude/cursor/devin), this checkout's
-// termag source (the agent runs from it), agent-wiki pre-cloned, the termag
-// unix user with linger.
-//
-// The image is SSM-only. We deliberately don't open inbound SSH — a locked-down
-// dev VPC's NACL blocks it anyway. Provisioning happens through SSM Session
-// Manager (ssh_interface = "session_manager"), so the build instance never
-// needs a public SG rule.
-//
-// Build:
-//   packer init .
-//   packer build box.pkr.hcl
-//
-// The resulting AMI is tagged App=termag, Component=box, plus TermagSha: the
-// commit of this checkout that was shipped into it.
-//
-// NitroTPM: every box gets a TPM 2.0 device so on-box utilities (LUKS via
-// systemd-cryptenroll, Vault attestation, IMA, sealed secrets) can use it.
-// NitroTPM is an *AMI attribute* (TpmSupport=v2.0 + BootMode=uefi), not a
-// launch-time flag — instances inherit it automatically, so terraform/box and
-// the SDK box provisioner need no change. The amazon-ebs builder creates the
-// image via the CreateImage API, which can't set TpmSupport (only RegisterImage
-// can), so the `enable-nitrotpm` post-processor re-registers the baked snapshot
-// with NitroTPM enabled and hands it the Component=box discovery tag. See
-// scripts/enable-nitrotpm.sh.
 
 packer {
   required_plugins {
@@ -53,6 +26,12 @@ variable "subnet_id" {
   description = "Public subnet with IGW route for outbound apt/npm. Required."
 }
 
+variable "iam_instance_profile" {
+  type        = string
+  default     = "AmazonSSMRoleForInstancesQuickSetup"
+  description = "Instance profile for the builder; its role needs AmazonSSMManagedInstanceCore so the SSM agent registers. The default is the profile AWS Systems Manager Quick Setup creates."
+}
+
 variable "instance_type" {
   type    = string
   default = "t4g.medium"
@@ -74,6 +53,9 @@ locals {
   // baked (plus a "<bundle>.origin" sidecar with the checkout's remote URL).
   // Gitignored; the file provisioners below ship both.
   termag_bundle = "${path.root}/termag.bundle"
+
+  base_termag_sha = var.bake_mode == "incremental" && var.base_termag_sha != "" ? var.base_termag_sha : var.termag_baked_sha
+  base_baked_at   = var.base_baked_at != "" ? var.base_baked_at : formatdate("YYYY-MM-DD'T'hh:mm:ss'Z'", timestamp())
 }
 
 variable "final_component_tag" {
@@ -87,22 +69,67 @@ variable "agent_wiki_repo_url" {
   default = "https://github.com/psecor/agent-wiki.git"
 }
 
+variable "bake_mode" {
+  type        = string
+  default     = "full"
+  description = "full: start from Canonical's Ubuntu image and run setup.sh. incremental: start from source_ami (a published termag box image), skip setup.sh, and refresh the termag checkout and deploy/ artifacts (scripts/refresh-box.sh); the snapshot then holds only the blocks that changed since that image."
+  validation {
+    condition     = contains(["full", "incremental"], var.bake_mode)
+    error_message = "Set bake_mode to \"full\" or \"incremental\"."
+  }
+}
+
+variable "hibernation" {
+  type        = bool
+  default     = false
+  description = "Bake EC2 hibernation support: ec2-hibinit-agent and KASLR off (scripts/enable-hibernation.sh, which fails the bake if the kernel can't hibernate). Tags the AMI Hibernation=supported, which is what makes the orchestrator launch boxes from it with HibernationOptions when BOX_HIBERNATION_ENABLED=true; false tags it Hibernation=unsupported. Publish AMI sets it from its `hibernation` input or the BOX_HIBERNATION_BAKE repo Variable."
+}
+
+variable "source_ami" {
+  type        = string
+  default     = ""
+  description = "Incremental bakes only: the published box AMI (Component=box, NitroTPM) to start from. Ignored by a full bake, which uses the Ubuntu filter. scripts/refresh-box.sh refuses an image that is not a termag box."
+}
+
+variable "base_termag_sha" {
+  type        = string
+  default     = ""
+  description = "Incremental bakes only: the TermagSha of the full bake at the root of this image's chain, read off the source image's BaseTermagSha tag and carried onto this one. A full bake records its own termag_baked_sha. Publish AMI diffs the toolchain inputs against it to decide when the next full bake is due."
+}
+
+variable "base_baked_at" {
+  type        = string
+  default     = ""
+  description = "Incremental bakes only: when the full bake at the root of the chain ran (RFC 3339 UTC), read off the source image's BaseBakedAt tag. Empty = now, which is right for a full bake. Publish AMI's age rule reads this tag, so a chain of incremental bakes still re-roots on a fresh Ubuntu image every BOX_AMI_MAX_AGE_DAYS."
+}
+
+variable "scratch_volume_size" {
+  type        = number
+  default     = 60
+  description = "GB for the builder's scratch volume (bazel output root, apt archives), which the AMI omits."
+}
+
 source "amazon-ebs" "termag_box" {
   region        = var.region
   ami_name      = "${var.ami_name_prefix}-{{timestamp}}"
   instance_type = var.instance_type
 
-  // Canonical's latest Ubuntu 24.04 LTS arm64 server image.
-  source_ami_filter {
-    filters = {
-      name                = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
-      architecture        = "arm64"
-      "root-device-type"  = "ebs"
-      "virtualization-type" = "hvm"
-      state               = "available"
+  // Exclusive on purpose: with both set, the amazon plugin ANDs the filter
+  // onto the image id and finds nothing.
+  source_ami = var.bake_mode == "incremental" ? var.source_ami : ""
+  dynamic "source_ami_filter" {
+    for_each = var.bake_mode == "full" ? ["ubuntu"] : []
+    content {
+      filters = {
+        name                  = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
+        architecture          = "arm64"
+        "root-device-type"    = "ebs"
+        "virtualization-type" = "hvm"
+        state                 = "available"
+      }
+      owners      = ["099720109477"] // Canonical
+      most_recent = true
     }
-    owners      = ["099720109477"] // Canonical
-    most_recent = true
   }
 
   // Communicate via SSM Session Manager (no inbound SSH possible in this VPC).
@@ -110,7 +137,7 @@ source "amazon-ebs" "termag_box" {
   // the protocol-level identity.
   ssh_username             = "ubuntu"
   ssh_interface            = "session_manager"
-  iam_instance_profile     = "AmazonSSMRoleForInstancesQuickSetup"
+  iam_instance_profile     = var.iam_instance_profile
   // Public IP required so the build instance can reach apt mirrors via the
   // subnet's IGW. The VPC has SSM endpoints (which is why our smoke test
   // worked without a public IP), but there's no apt endpoint. The temporary
@@ -119,6 +146,17 @@ source "amazon-ebs" "termag_box" {
 
   vpc_id    = var.vpc_id
   subnet_id = var.subnet_id
+
+  // IMDSv2 only, one hop. A bake may build docker images on this instance; a
+  // hop limit of 1 means nothing behind
+  // the docker bridge can obtain a metadata token, so a Dockerfile step or a
+  // container cannot reach the builder's instance role. The AWS CLI, the SSM
+  // agent and packer's session-manager connection all speak IMDSv2.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
 
   // Root volume must hold the full devbox toolset baked under /home/termag:
   // Go + Python + Rust toolchains, Docker, Chromium, node, and several CLIs.
@@ -132,22 +170,55 @@ source "amazon-ebs" "termag_box" {
     delete_on_termination = true
   }
 
+  // EBS snapshots every block ever written to a volume, deleted files
+  // included; the no_device entry below keeps this one out of CreateImage.
+  launch_block_device_mappings {
+    device_name           = "/dev/sdf"
+    volume_size           = var.scratch_volume_size
+    volume_type           = "gp3"
+    delete_on_termination = true
+  }
+  ami_block_device_mappings {
+    device_name = "/dev/sdf"
+    no_device   = true
+  }
+
+  // CreateImage of a well-filled 120G volume can exceed the plugin's default
+  // ImageAvailable wait (seen at ~30m after the image was created, with every
+  // provisioner already passed). 15s * 360 = 90m.
+  aws_polling {
+    delay_seconds = 15
+    max_attempts  = 360
+  }
+
   // Intermediate, NitroTPM-less image. The enable-nitrotpm post-processor
   // re-registers this with TpmSupport=v2.0 and moves the Component=box
   // discovery tag onto the NitroTPM AMI, then deregisters this one. Tagging it
   // "box-base" (not "box") guarantees newest-by-tag discovery can only ever
   // resolve to a NitroTPM image — if the re-register step fails, no Component=box
   // AMI is produced for this build and discovery falls back to the last good one.
-  //
-  // TermagSha is what the Publish AMI schedule diffs against main to decide
-  // whether a bake is due. The NitroTPM post-processor copies every tag except
-  // Component onto the final image, so it survives onto the discoverable AMI.
   tags = {
-    App         = "termag"
-    Component   = "box-base"
-    BaseImage   = "ubuntu-24.04-arm64"
-    TermagSha   = var.termag_baked_sha
-    BuiltBy     = "packer"
+    App           = "termag"
+    Component     = "box-base"
+    BaseImage     = "ubuntu-24.04-arm64"
+    TermagSha     = var.termag_baked_sha
+    BuiltBy       = "packer"
+    BakeMode      = var.bake_mode
+    SourceAmi     = "{{ .SourceAMI }}"
+    SourceAmiName = "{{ .SourceAMIName }}"
+    BaseTermagSha = local.base_termag_sha
+    BaseBakedAt   = local.base_baked_at
+    // Copied onto the NitroTPM AMI by enable-nitrotpm.sh with the rest;
+    // boxProvisioner reads it (AMI_HIBERNATION_TAG).
+    Hibernation = var.hibernation ? "supported" : "unsupported"
+  }
+
+  snapshot_tags = {
+    App       = "termag"
+    Component = "box-base"
+    BaseImage = "ubuntu-24.04-arm64"
+    TermagSha = var.termag_baked_sha
+    BuiltBy   = "packer"
   }
 
   // Tag the temporary build instance + its volume too, so it's findable while
@@ -173,6 +244,24 @@ build {
     inline = [
       "echo 'Waiting for cloud-init...'",
       "cloud-init status --wait || true",
+    ]
+  }
+
+  provisioner "shell" {
+    script = "${path.root}/scripts/prepare-scratch.sh"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/scripts/box-lib.sh"
+    destination = "/tmp/box-lib.sh"
+  }
+
+  // Keep the shared provisioner functions where later steps source them:
+  // setup.sh and refresh-box.sh wipe /tmp at their end.
+  provisioner "shell" {
+    inline = [
+      "sudo install -d -m 755 /var/lib/termag-bake",
+      "sudo install -m 644 /tmp/box-lib.sh /var/lib/termag-bake/box-lib.sh",
     ]
   }
 
@@ -233,15 +322,74 @@ build {
     destination = "/tmp/termag-reconcile.service"
   }
 
+  provisioner "file" {
+    // Warm-pool lifecycle hooks. The runner and its unit are baked so a pool
+    // box can run them before it has an owner; the scripts they run come from
+    // the checkout, inside the git bundle above.
+    source      = "${path.root}/../deploy/termag-hook-run"
+    destination = "/tmp/termag-hook-run"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/../deploy/termag-on-warm.service"
+    destination = "/tmp/termag-on-warm.service"
+  }
+
   provisioner "shell" {
-    script = "${path.root}/scripts/setup.sh"
+    script = "${path.root}/scripts/refresh-box.sh"
     environment_vars = [
+      "BAKE_MODE=${var.bake_mode}",
       "TERMAG_BAKED_SHA=${var.termag_baked_sha}",
       "AGENT_WIKI_REPO_URL=${var.agent_wiki_repo_url}",
     ]
-    // Long install — the full devbox toolset (apt/snap/npm + Go/Python/Rust
-    // toolchain builds + cargo-building rtk) can take a while.
+    timeout = "20m"
+  }
+
+  provisioner "shell" {
+    script = "${path.root}/scripts/setup.sh"
+    environment_vars = [
+      "BAKE_MODE=${var.bake_mode}",
+      "TERMAG_BAKED_SHA=${var.termag_baked_sha}",
+      "AGENT_WIKI_REPO_URL=${var.agent_wiki_repo_url}",
+    ]
     timeout = "45m"
+  }
+
+  // EC2 hibernation support. After setup.sh in both bake modes: an
+  // incremental bake's source image may predate it, and it is idempotent.
+  // Writes nothing under /home/termag, so its place relative to the home-path
+  // index doesn't matter, but it stays ahead of it like every other step.
+  provisioner "shell" {
+    script = "${path.root}/scripts/enable-hibernation.sh"
+    environment_vars = [
+      "HIBERNATION=${var.hibernation}",
+    ]
+    timeout = "15m"
+  }
+
+  provisioner "shell" {
+    script = "${path.root}/scripts/detach-scratch.sh"
+  }
+
+  // First-boot path rewrite, bake half. cloud-init renames /home/termag to the
+  // owner and must then fix every symlink target and text file that embeds the
+  // old path. Finding them at boot walked the whole home on a lazily-restored
+  // EBS volume: 15 minutes on the quick-start image, against the orchestrator's
+  // 15-minute stuck-provisioning sweep. index-home-paths.sh takes that walk
+  // here, on a warm volume, and installs the boot half
+  // (scripts/rewrite-home-paths.sh) as /usr/local/sbin/termag-rewrite-home-paths.
+  // The script is uploaded here rather than with the deploy/ files above
+  // because setup.sh clears /tmp when it finishes. This MUST stay the last
+  // provisioner that runs on the instance: anything written under /home/termag
+  // afterwards is not rewritten at boot. scripts/home-paths.test.sh checks the
+  // order.
+  provisioner "file" {
+    source      = "${path.root}/scripts/rewrite-home-paths.sh"
+    destination = "/tmp/rewrite-home-paths.sh"
+  }
+  provisioner "shell" {
+    script  = "${path.root}/scripts/index-home-paths.sh"
+    timeout = "10m"
   }
 
   // NitroTPM re-register. amazon-ebs bakes the image via CreateImage (no

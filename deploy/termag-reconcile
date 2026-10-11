@@ -24,6 +24,14 @@
 # the box this is meant to repair. Writing the unit plus a daemon-reload is
 # enough; systemd starts the agent from the new unit moments later.
 #
+# Between boots, termag-box-update (deploy/termag-box-update, installed from
+# the table below with its oneshot service) pulls the checkout, runs this
+# script, and restarts the agent only once it has checked that is safe.
+# Nothing on the box starts that service on its own: the orchestrator starts
+# it over the agent's box-update RPC when the box-auto-update-enabled flag is
+# on for the owner and the box is behind, and the owner can run the script by
+# hand.
+#
 # Usage:
 #   termag-reconcile           reconcile, reporting only what changed
 #   termag-reconcile --check   report drift and un-enabled units, change nothing
@@ -64,16 +72,143 @@ esac
 # agent somebody had deliberately stopped would be a surprise. Its *content*
 # still gets reconciled.
 #
+# termag-on-warm.service is enable=noenable: the backend starts it once the
+# agent has connected. termag-on-claim.service is the same shape, started by
+# box-claim, and it carries no GitHub credential.
+#
+# termag-box-update.service is noenable: nothing on the box starts it on its
+# own. The orchestrator starts it over the agent's box-update RPC, the owner
+# by hand; enabling it would run an update at every login.
+#
 # claude-settings.json is deliberately absent entirely. Box owners add their own
 # hooks to it, and overwriting it every boot would silently discard that. The
-# bake seeds it once and it is the user's thereafter.
+# bake seeds it once and it is the user's thereafter. The only thing this script
+# does to the installed ~/.claude/settings.json is append MetaTerm's read-tool
+# approvals when they are missing (reconcile_claude_config below), and it never
+# removes or reorders anything.
+#
+# kind=file is a plain non-executable file, like the MetaTerm skill.
 artifacts() {
   cat <<TABLE
 termag-agent.service:$HOME/.config/systemd/user/termag-agent.service:644:unit:noenable
 termag-reconcile.service:$HOME/.config/systemd/user/termag-reconcile.service:644:unit:enable
+termag-on-warm.service:$HOME/.config/systemd/user/termag-on-warm.service:644:unit:noenable
+termag-on-claim.service:$HOME/.config/systemd/user/termag-on-claim.service:644:unit:noenable
+termag-box-update.service:$HOME/.config/systemd/user/termag-box-update.service:644:unit:noenable
 termag-status:$HOME/.local/bin/termag-status:755:bin:noenable
+termag-hooks-update:$HOME/.local/bin/termag-hooks-update:755:bin:noenable
 termag-reconcile:$HOME/.local/bin/termag-reconcile:755:bin:noenable
+termag-box-update:$HOME/.local/bin/termag-box-update:755:bin:noenable
+termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable
+termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable
+termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable
+termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable
+termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable
+claude-runner-hooks/command:$HOME/.local/lib/termag/claude-runner-hooks/command:755:bin:noenable
+claude-runner-hooks/post-session:$HOME/.local/lib/termag/claude-runner-hooks/post-session:755:bin:noenable
+pi-ext/termag-status.ts:$HOME/.local/share/termag/pi-ext/termag-status.ts:644:file:noenable
+pi-ext/termag-status-core.ts:$HOME/.local/share/termag/pi-ext/termag-status-core.ts:644:file:noenable
+claude-skills/metaterm/SKILL.md:$HOME/.claude/skills/metaterm/SKILL.md:644:file:noenable
 TABLE
+}
+
+# MetaTerm's user-scope registration in ~/.claude.json. No absolute path: the
+# bake writes this under /home/termag and cloud-init renames the home, which
+# ~/.claude.json is outside the rewrite index for. The box default is read-only
+# tools; send_keys is opted into per project or per session (see the skill).
+# shellcheck disable=SC2016  # $HOME is expanded by sh when Claude starts the server
+METATERM_MCP='{"type":"stdio","command":"sh","args":["-c","exec \"$HOME/.local/bin/termag-metaterm-mcp\""],"env":{"METATERM_SEND_KEYS_DEFAULT":"off"}}'
+METATERM_READ_TOOLS='["mcp__metaterm__list_sessions","mcp__metaterm__capture_pane","mcp__metaterm__session_status"]'
+
+# merge_json FILE LABEL VALUE FILTER — apply a jq FILTER (VALUE bound to $v) to
+# FILE, treating a missing or empty file as {}. Writes only on a real
+# difference, keeps the file's mode (0600 when new), and leaves a file jq cannot
+# parse alone rather than replacing an owner's config.
+merge_json() {
+  local file=$1 label=$2 value=$3 filter=$4 cur want tmp
+  if [ -s "$file" ]; then cur=$(cat "$file") || return 0; else cur='{}'; fi
+  if ! want=$(printf '%s' "$cur" | jq --argjson v "$value" "$filter" 2>/dev/null); then
+    printf 'termag-reconcile: %s is not valid JSON; not adding %s\n' "$file" "$label" >&2
+    return 0
+  fi
+  if [ -s "$file" ] && [ "$(printf '%s' "$cur" | jq -S .)" = "$(printf '%s' "$want" | jq -S .)" ]; then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    if [ -s "$file" ]; then printf 'DRIFT: %s missing from %s\n' "$label" "$file"
+    else printf 'MISSING: %s (would create with %s)\n' "$file" "$label"; fi
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")" || return 0
+  tmp=$(mktemp "$file.XXXXXX") || return 0
+  if [ -e "$file" ]; then chmod --reference="$file" "$tmp"; else chmod 600 "$tmp"; fi
+  if printf '%s\n' "$want" > "$tmp" && mv -f "$tmp" "$file"; then
+    printf 'reconciled: %s in %s\n' "$label" "$file"
+  else
+    rm -f "$tmp"
+    printf 'termag-reconcile: failed to write %s\n' "$file" >&2
+  fi
+}
+
+reconcile_claude_config() {
+  # An older checkout without the server has nothing to register.
+  [ -f "$CHECKOUT/metaterm/mcp-server.mjs" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'termag-reconcile: jq not found; skipping the MetaTerm Claude Code config\n' >&2
+    return 0
+  fi
+  merge_json "$HOME/.claude.json" 'MetaTerm MCP server' "$METATERM_MCP" \
+    '.mcpServers.metaterm = $v'
+  merge_json "$HOME/.claude/settings.json" 'MetaTerm read-tool approvals' "$METATERM_READ_TOOLS" \
+    'reduce $v[] as $t (.; if any((.permissions.allow // [])[]; . == $t) then . else .permissions.allow = ((.permissions.allow // []) + [$t]) end)'
+}
+
+# The Node the termag CLI is built with and pinned to. Under systemd there is no
+# nvm on PATH, so it is found the way the agent unit finds it. A checkout that
+# carries its own Node (an image that runs the agent on a pinned one, at
+# $CHECKOUT/node) wins, so the CLI and the agent share it.
+cli_node() {
+  if [ -x "$CHECKOUT/node/bin/node" ]; then
+    printf '%s\n' "$CHECKOUT/node/bin/node"
+    return 0
+  fi
+  command -v node 2>/dev/null && return 0
+  [ -s "$HOME/.nvm/nvm.sh" ] || return 1
+  # shellcheck disable=SC1091
+  (set +u; . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 && nvm which default 2>/dev/null)
+}
+
+# The termag CLI is a build rather than a copy, so it is not a table row:
+# cli/install.sh builds it in the checkout and writes the ~/.local/bin/termag
+# launcher. Its --check is the same content comparison as the table's, so a box
+# that is current runs no build and writes nothing. It never replaces a
+# `termag` it did not write.
+reconcile_cli() {
+  local installer="$CHECKOUT/cli/install.sh" node out
+  [ -f "$installer" ] || return 0
+  if ! node=$(cli_node) || [ -z "$node" ]; then
+    printf 'termag-reconcile: no Node.js found; not installing the termag CLI\n' >&2
+    return 0
+  fi
+  set -- --node "$node" --bin-dir "$HOME/.local/bin"
+  if out=$(sh "$installer" --check "$@" 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  # Bounded so a slow `npm ci` cannot hold the agent's start for long; an
+  # interrupted install is retried on the next run.
+  local runner=()
+  command -v timeout >/dev/null 2>&1 && runner=(timeout 45)
+  if out=$("${runner[@]}" sh "$installer" --quiet "$@" 2>&1); then
+    printf 'reconciled: termag CLI (%s/.local/bin/termag)\n' "$HOME"
+  else
+    printf 'termag-reconcile: the termag CLI did not install:\n%s\n' "$out" >&2
+  fi
 }
 
 WANTS="$HOME/.config/systemd/user/default.target.wants"
@@ -154,6 +289,9 @@ while IFS=: read -r name dest mode kind enable; do
 done <<EOF
 $(artifacts)
 EOF
+
+reconcile_claude_config
+reconcile_cli
 
 if [ "$MODE" = check ]; then
   [ "$changed" -eq 0 ] || exit 1

@@ -9,7 +9,11 @@ to `<server>/termag/api/status`.
 
 AMI-provisioned boxes get both files automatically via `packer/scripts/setup.sh` —
 `deploy/claude-settings.json` lands at `~/.claude/settings.json` and
-`termag-status` at `~/.local/bin/termag-status`. For a non-baked install:
+`termag-status` at `~/.local/bin/termag-status`. Orchestrator host accounts
+provisioned by `deploy/termag-host-setup` get both too: `termag-status` as a
+symlink to the image's root-owned copy in `/usr/local/lib/termag` (so it
+follows image updates but can't be rewritten by the `termag` service user), and `settings.json` only
+if the user has none. For a non-baked install:
 
 ```bash
 install -m 755 deploy/termag-status ~/.local/bin/termag-status
@@ -72,7 +76,7 @@ same-host server will accept.
       { "matcher": ".*", "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &" } ] }
     ],
     "PostToolUse": [
-      { "matcher": ".*", "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &" } ] }
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool >/dev/null 2>&1 &" } ] }
     ],
     "Notification": [
       { "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" notification >/dev/null 2>&1 &" } ] }
@@ -84,9 +88,28 @@ same-host server will accept.
 }
 ```
 
+### Updating an existing box
+
+`~/.claude/settings.json` is installed only when absent and is never rewritten
+by `termag-reconcile` (owners add their own hooks). When a termag hook line
+changes — as `PostToolUse` did when it started piping its payload into
+`termag-status post-tool` — bring an existing file up to date with:
+
+```bash
+termag-hooks-update --check   # exit 1 if your hooks are behind
+termag-hooks-update           # replace only the termag entries; keeps your own hooks; writes a .bak
+```
+
+Claude Code reads hooks at session start, so restart running `claude` sessions.
+
 ## How it works
 
-- `UserPromptSubmit`, `PreToolUse`, `PostToolUse` post `status: "working"` (green)
+- `UserPromptSubmit`, `PreToolUse` post `status: "working"` (green)
+- `PostToolUse` reads the hook JSON on stdin: posts `working`, and when the tool
+  was a Bash `gh pr create` / `gh pr merge` that succeeded (the PR URL in its
+  output is the proof) also posts a **milestone** (`/api/status/milestone`,
+  `{kind, url}` only — never the command text), which the UI turns into
+  "PR opened — Compact / Clear / Keep" once the agent is back at its prompt
 - `Notification` reads the hook JSON on stdin: `idle_prompt` -> `idle`, anything
   else -> `waiting` (yellow), with `notify: true` so termag posts the captured
   pane to Slack

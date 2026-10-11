@@ -21,6 +21,26 @@ data "aws_ami" "termag_box" {
   }
 }
 
+// Root volume sizing, mirroring boxProvisioner.ts's resolveRootDevice so both
+// provisioning paths behave the same.
+//
+// EC2 rejects a launch whose root volume is smaller than the AMI's snapshot
+// ("Volume of size 50GB is smaller than snapshot '...', expect size >= 120GB").
+// Taking the floor from the image means growing the AMI never needs a matching
+// change here, and var.root_volume_gb only ever raises it.
+//
+// block_device_mappings is a set whose `ebs` is map(string), hence tonumber;
+// try() keeps an unexpected AMI shape from failing the plan outright, falling
+// back to the variable alone.
+locals {
+  ami_root_volume_gb = try(tonumber(one([
+    for m in data.aws_ami.termag_box.block_device_mappings : m.ebs["volume_size"]
+    if m.device_name == data.aws_ami.termag_box.root_device_name
+  ])), 0)
+
+  root_volume_gb = max(var.root_volume_gb, local.ami_root_volume_gb)
+}
+
 // Egress-only security group. No inbound rules — termag boxes have no
 // network services. Access happens via SSM (outbound HTTPS to AWS).
 resource "aws_security_group" "box" {
@@ -74,7 +94,7 @@ resource "aws_instance" "box" {
   user_data_replace_on_change = true
 
   root_block_device {
-    volume_size = var.root_volume_gb
+    volume_size = local.root_volume_gb
     volume_type = "gp3"
     encrypted   = true
   }

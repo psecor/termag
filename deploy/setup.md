@@ -92,6 +92,12 @@ walkthrough in the next section.
 
 ## Per-user agent against an existing instance
 
+> On an orchestrator with `HOST_AUTOSETUP=true` (the Termag-account deployment)
+> none of this is manual: the backend creates each user's unix account and
+> host agent the first time they need the orchestrator
+> (`backend/src/services/hostSetup.ts`, `deploy/termag-host-setup`). The steps
+> below are for hosts without it.
+
 Use this path when the backend is already deployed (by you or someone
 else) and you just want to add a new user to it. You skip Postgres,
 Apache, OAuth, frontend builds, and Slack/Discord — everything except
@@ -262,6 +268,9 @@ The per-user agent must be restarted whenever `agent/agent.js` changes:
 - `Codex` projects use the per-user agent to launch a managed Codex bridge plus
   `codex --remote` in the `*-agent` tmux pane
 - `Claude` projects use the existing `claude` startup path
+- `pi` projects run the pi coding agent with whatever model provider the box
+  owner has configured for it; status comes from a pi extension rather than
+  hooks
 
 The selected provider is persisted on each `agent` workflow, and each user also
 has a saved default provider used by the create-project form.
@@ -304,7 +313,7 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 - `/t <command>` — send a command to the agent terminal, then poll for output
 - `/t !<keys>` — send keystrokes without Enter (e.g. `/t !2` for numbered prompts)
 - `/t create <name>` — create a new project with agent workflow, tmux sessions, and Slack channel
-- `/t switch <project>` — switch active project
+- `/t switch <project>[/<workstream>]` — switch active project (and workstream)
 - `/t attach <session>` — attach to a specific tmux session
 - `/t ctrl` — capture the ctrl terminal pane
 - `/t ctrl <command>` — send a command to the ctrl terminal
@@ -313,10 +322,21 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 
 ### Slack channel routing
 
-Projects automatically get a `#proj-<name>` Slack channel on creation. When you
-run `/t` commands inside a project channel, termag routes to that project
-automatically — no `/t switch` needed. The `switch` and `attach` commands remain
-for use in DMs or non-project channels.
+Projects automatically get a `#proj-<user>-<project>` Slack channel on creation,
+and every additional workstream (git worktree) gets `#proj-<user>-<project>-<workstream>`.
+The names mirror the tmux session names minus the role, and include the unix
+username because project names are only unique per user. When you run `/t`
+commands inside one of these channels, termag routes to that workstream's tmux
+pair automatically — no `/t switch` needed.
+
+Channels created by hand work too: termag matches the channel name against the
+canonical names of every live project/workstream (no dash parsing), then falls
+back to the legacy `#proj-<project>` form, preferring your own project. A match
+is saved on the row so later lookups are direct. Deleting a workstream archives
+its channel.
+
+In DMs or non-project channels use `/t switch <project>[/<workstream>]` to pick
+a target, or `/t attach <tmux-session>` to capture a specific session.
 
 ### Emoji reactions
 
@@ -355,7 +375,7 @@ The `/t` slash command mirrors all Slack subcommands:
 - `/t <command>` — send a command to the agent terminal, then poll for output
 - `/t !<keys>` — send keystrokes without Enter
 - `/t create <name>` — create a new project with agent workflow and tmux sessions
-- `/t switch <project>` — switch active project
+- `/t switch <project>[/<workstream>]` — switch active project (and workstream)
 - `/t attach <session>` — attach to a specific tmux session
 - `/t ctrl` — capture the ctrl terminal pane
 - `/t ctrl <command>` — send a command to the ctrl terminal
@@ -381,7 +401,7 @@ Use `/t switch <project>` on each platform to register notification targets.
 
 ## 10. Adding users
 
-Add to `ALLOWED_USERS` in `.env`: `email@gmail.com:unixuser`
+Add to `ALLOWED_USERS` in `.env`: `email@example.com:unixuser`
 Create their project directory: `mkdir -p /home/<unixuser>/termag/projects`
 Restart: `sudo systemctl restart termag`
 
