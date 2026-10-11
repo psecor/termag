@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stand-in gh CLI for the e2e boxes (E2E_FAKE_GITHUB=1). Keeps a delivered
+# token in ~/.config/gh/token and records every other call in ~/.config/gh/calls.
+# A call aimed at another host (--hostname/-h, or GH_HOST) goes to the real gh
+# (E2E_REAL_GH), which can only reach that host: github.com stays stubbed.
+if [ -n "${E2E_REAL_GH:-}" ]; then
+  host=${GH_HOST:-github.com}
+  prev=
+  for a in "$@"; do
+    case $prev in --hostname|-h) host=$a ;; esac
+    case $a in --hostname=*) host=${a#--hostname=} ;; esac
+    prev=$a
+  done
+  [ "$host" != github.com ] && exec "$E2E_REAL_GH" "$@"
+fi
+d="$HOME/.config/gh"; mkdir -p "$d"
+case "$*" in
+  'auth token -h github.com'|'auth token') [ -s "$d/token" ] && cat "$d/token" || exit 1 ;;
+  'auth login --hostname github.com --with-token'|'auth login --with-token') cat > "$d/token"; echo "auth login (stub)" >> "$d/calls" ;;
+  'auth logout -h github.com'|'auth logout') : > "$d/token"; echo "auth logout (stub)" >> "$d/calls" ;;
+  'auth status') if [ -s "$d/token" ]; then echo "github.com: logged in (stub)"; else echo 'not logged in to github.com (stub)'; exit 1; fi ;;
+  *) echo "gh $*" >> "$d/calls" ;;
+esac

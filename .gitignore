@@ -1,5 +1,7 @@
-node_modules/
+node_modules
 dist/
+# cli/install.sh's scratch build, renamed to dist/ once it succeeds
+.dist-build/
 .env
 *.js.map
 *.d.ts.map
