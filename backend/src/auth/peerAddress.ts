@@ -24,6 +24,10 @@ import { Request } from 'express';
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
+export function isLoopbackAddress(addr: string): boolean {
+  return LOOPBACK.has(addr);
+}
+
 export const PEER_HEADER = 'x-termag-peer-addr';
 
 /**
@@ -46,5 +50,5 @@ export function peerAddress(req: Request): string {
 
 /** True when the caller is genuinely on this host. */
 export function isLocalPeer(req: Request): boolean {
-  return LOOPBACK.has(peerAddress(req));
+  return isLoopbackAddress(peerAddress(req));
 }

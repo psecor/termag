@@ -22,6 +22,7 @@ describe('seedMetaTermFiles', () => {
     const mcp = JSON.parse(files.get('/home/u/termag/projects/MetaTerm/.mcp.json')!);
     expect(mcp.mcpServers.metaterm.command).toBe('node');
     expect(mcp.mcpServers.metaterm.args[0]).toMatch(/metaterm\/mcp-server\.mjs$/);
+    expect(mcp.mcpServers.metaterm.env.METATERM_SEND_KEYS_DEFAULT).toBe('on');
     const settings = JSON.parse(files.get('/home/u/termag/projects/MetaTerm/.claude/settings.json')!);
     expect(settings.permissions.allow).toContain('mcp__metaterm__list_sessions');
     expect(settings.permissions.allow).not.toContain('mcp__metaterm__send_keys');

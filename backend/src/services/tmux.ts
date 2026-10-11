@@ -1,11 +1,13 @@
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { ALL_PROCESS_NAMES } from '../providers/registry';
+import { projectDirUnder, resolveProjectRoot } from './projectPaths';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ── Local (in-process) sessions ──────────────────────────────
 //
@@ -39,24 +41,42 @@ function assertLocalSessions(operation: string): void {
   if (!localSessionsEnabled()) throw new LocalSessionsDisabledError(operation);
 }
 
-// Working directory for a project's workstream.
-//   main:  /home/<username>/termag/projects/<project>/
-//   other: /home/<username>/termag/projects/<project>/.worktrees/<workstream>/
-//
-// The main workstream lives at the project root (it's the canonical git repo);
-// other workstreams are `git worktree add`-ed siblings under `.worktrees/`.
-// Path stays unchanged for the `main` default so existing single-workstream
-// callsites need no migration.
+// Working directory for a project's workstream under the historical
+// /home/<username> root. Layout itself lives in ./projectPaths.
 export function projectDir(
   username: string,
   projectName: string,
   workstream: string = 'main',
 ): string {
-  const root = `/home/${username}/termag/projects/${projectName}`;
-  return workstream === 'main' ? root : `${root}/.worktrees/${workstream}`;
+  return projectDirUnder(resolveProjectRoot({ ownerUnixUser: username }), projectName, workstream);
 }
 
-export async function ensureProjectDir(username: string, projectName: string): Promise<string> {
+export interface ProjectPathProject {
+  name: string;
+  user: { unixUsername: string };
+  instance?: { hostHome: string | null } | null;
+}
+
+// Same as projectDir, but honours the home directory the project's box
+// reported in its `hello`. With no instance, or an instance that has not
+// reported one, resolveProjectRoot falls back to /home/<unixUsername> and the
+// result is byte-identical to projectDir(project.user.unixUsername, ...).
+export function projectDirFor(
+  project: ProjectPathProject,
+  workstream: string = 'main',
+): string {
+  const root = resolveProjectRoot({
+    ownerUnixUser: project.user.unixUsername,
+    hostHome: project.instance?.hostHome,
+  });
+  return projectDirUnder(root, project.name, workstream);
+}
+
+export async function ensureProjectDir(
+  username: string,
+  projectName: string,
+  opts: { seedWiki?: boolean } = {},
+): Promise<string> {
   assertLocalSessions('ensureProjectDir');
   const dir = projectDir(username, projectName);
   await mkdir(dir, { recursive: true });
@@ -66,8 +86,10 @@ export async function ensureProjectDir(username: string, projectName: string): P
   } catch {
     await execAsync(`git init ${shellEscape(dir)}`);
   }
-  // Seed AGENTS.md + CLAUDE.md if absent
-  await initWikiFiles(dir, projectName, username);
+  // Seed AGENTS.md + CLAUDE.md if absent. Not for a project that starts as a
+  // repo clone: the checkout brings its own, and untracked files here would
+  // make `git checkout` refuse (services/projectTemplates.ts).
+  if (opts.seedWiki !== false) await initWikiFiles(dir, projectName, username);
   return dir;
 }
 
@@ -104,28 +126,47 @@ async function initWikiFiles(dir: string, slug: string, username: string): Promi
   }
 }
 
+// tmux replaces `.` and `:` in a new session's name with `_`, so
+// `new-session -s first.last-x-agent` creates `first_last-x-agent`.
+// Names are built already in that form, or an exact `=name` target misses.
+export function tmuxSafeName(name: string): string {
+  return name.replace(/[.:]/g, '_');
+}
+
 // tmux session name for a project's workstream role.
 //   main:  <user>-<project>-<role>
 //   other: <user>-<project>-<workstream>-<role>
 //
 // `main` is collapsed to preserve historical names for single-workstream
 // projects; only when a project has additional workstreams do their session
-// names carry the extra segment.
+// names carry the extra segment. Keep in sync with
+// frontend/src/utils/sessionName.ts.
 export function sessionName(
   username: string,
   project: string,
-  role: 'agent' | 'ctrl' | 'data' | 'data-ctrl',
+  role: 'agent' | 'ctrl' | 'data' | 'data-ctrl' | 'review',
   workstream: string = 'main',
 ): string {
-  return workstream === 'main'
+  return tmuxSafeName(workstream === 'main'
     ? `${username}-${project}-${role}`
-    : `${username}-${project}-${workstream}-${role}`;
+    : `${username}-${project}-${workstream}-${role}`);
+}
+
+// Session names are "<unixUsername>-<project>[-<workstream>]-<role>" and a
+// unixUsername may itself contain hyphens, so match the FULL username as a
+// prefix. Parsing the first hyphen segment instead would both reject
+// hyphenated users on their own sessions and let a prefix name ("alice")
+// satisfy "alice-smith-…".
+export function sessionBelongsToUser(session: string, unixUsername: string): boolean {
+  const owner = tmuxSafeName(unixUsername);
+  return session === owner || session.startsWith(`${owner}-`);
 }
 
 export async function hasSession(name: string): Promise<boolean> {
   if (!localSessionsEnabled()) return false;
   try {
-    await execAsync(`tmux has-session -t ${shellEscape(name)}`);
+    // `=name` is an exact match; bare names prefix-match (gotcha: #220).
+    await execAsync(`tmux has-session -t ${shellEscape(`=${name}`)}`);
     return true;
   } catch {
     return false;
@@ -158,13 +199,20 @@ export async function recreateSession(name: string, cwd: string): Promise<void> 
   await createSession(name, cwd);
 }
 
+/** Pure argv for `tmux send-keys -l` — exported for tests. */
+export function sendKeysArgv(name: string, text: string): string[] {
+  return ['send-keys', '-t', name, '-l', '--', text];
+}
+
 export async function sendKeys(name: string, command: string, withEnter: boolean = true): Promise<void> {
   assertLocalSessions('sendKeys');
-  const target = shellEscape(name);
-  const escaped = shellEscape(command.replace(/'/g, "'\\''"));
-  await execAsync(`tmux send-keys -t ${target} -l ${escaped}`);
+  // argv via execFile, never a shell string: the shell version escaped `'`
+  // twice and typed `'\''` for every apostrophe. `--` ends tmux
+  // option parsing so text starting with `-` is typed too; `-l` applies to
+  // every argument, so Enter is a separate call.
+  await execFileAsync('tmux', sendKeysArgv(name, command));
   if (withEnter) {
-    await execAsync(`tmux send-keys -t ${target} Enter`);
+    await execFileAsync('tmux', ['send-keys', '-t', name, 'Enter']);
   }
 }
 
@@ -214,7 +262,7 @@ export async function listSessions(): Promise<string[]> {
 
 export async function renameSession(oldName: string, newName: string): Promise<void> {
   assertLocalSessions('renameSession');
-  await execAsync(`tmux rename-session -t ${shellEscape(oldName)} ${shellEscape(newName)}`);
+  await execAsync(`tmux rename-session -t ${shellEscape(`=${oldName}`)} ${shellEscape(newName)}`);
 }
 
 export async function killSession(name: string): Promise<void> {

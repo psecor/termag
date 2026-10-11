@@ -2,7 +2,7 @@
  * The one PrismaClient (and, for IAM auth, the one node-postgres pool).
  *
  * Every module used to construct its own `new PrismaClient()`. That was fine
- * when the only input was DATABASE_URL, but Aurora behind RDS Proxy (Shepherd)
+ * when the only input was DATABASE_URL, but Aurora behind RDS Proxy
  * issues no password: each connection authenticates with a 15-minute IAM token
  * minted by the client. Prisma's engine cannot do that from a static URL, so in
  * that mode Prisma runs through a node-postgres pool (`driverAdapters`) whose
@@ -27,7 +27,7 @@ import { iamAuthEnabled, iamSigningRegion, pgConnectionFromEnv, pgSslConfig } fr
 
 let pool: Pool | null = null;
 
-function iamPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
+export function iamPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
   const conn = pgConnectionFromEnv(env);
   if (!conn) {
     throw new Error('PG_IAM_AUTH=true requires PG_HOST, PG_DATABASE and PG_USERNAME (or PG_USER)');

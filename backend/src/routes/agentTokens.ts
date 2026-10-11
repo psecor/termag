@@ -2,13 +2,18 @@ import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
+import { ValidatedAgentToken } from '../services/instanceLifecycle';
 
+/** validateAgentToken's result: the identity plus the token row's own metadata, for scope checks. */
+export interface ValidatedAgentTokenWithMeta extends ValidatedAgentToken {
+  token: { id: string; scope: string; name: string };
+}
 
-function hashToken(token: string): string {
+export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function generateToken(): string {
+export function generateToken(): string {
   return 'tmag_' + randomBytes(32).toString('hex');
 }
 
@@ -18,7 +23,7 @@ export function agentTokensRouter(): Router {
   // List all tokens for the current user (token value not included, just metadata)
   const list: RequestHandler = async (req, res) => {
     const tokens = await prisma.agentToken.findMany({
-      where: { userId: req.user!.id, revokedAt: null },
+      where: { userId: req.user!.id, revokedAt: null, scope: 'agent' },
       select: { id: true, name: true, tokenPrefix: true, createdAt: true, lastUsedAt: true },
       orderBy: { createdAt: 'desc' },
     });
@@ -72,10 +77,14 @@ export function agentTokensRouter(): Router {
 
 /**
  * Validate an agent token from a WebSocket or API request.
- * Returns { user, instance } if valid (instance may be null for legacy
- * per-user tokens), or null if the token is bad/revoked.
+ * Returns { user, instance, token } if valid, or null if the token is bad,
+ * revoked or expired. `instance` is null for legacy per-user tokens; `user` is
+ * null for a warm-pool token whose box has no owner yet; `token` carries
+ * id/scope/name so callers can enforce scope. Scope is NOT checked here:
+ * /ws/agent, the agent-facing REST routes and /api/cli/v1 accept only
+ * 'agent', requireAdmin accepts only 'admin'.
  */
-export async function validateAgentToken(rawToken: string) {
+export async function validateAgentToken(rawToken: string): Promise<ValidatedAgentTokenWithMeta | null> {
   const tokenHash = hashToken(rawToken);
   const token = await prisma.agentToken.findUnique({
     where: { tokenHash },
@@ -83,6 +92,7 @@ export async function validateAgentToken(rawToken: string) {
   });
 
   if (!token || token.revokedAt) return null;
+  if (token.expiresAt && token.expiresAt.getTime() <= Date.now()) return null;
 
   // Update lastUsedAt (fire and forget)
   prisma.agentToken.update({
@@ -90,5 +100,9 @@ export async function validateAgentToken(rawToken: string) {
     data: { lastUsedAt: new Date() },
   }).catch(() => {});
 
-  return { user: token.user, instance: token.instance };
+  return {
+    user: token.user,
+    instance: token.instance,
+    token: { id: token.id, scope: token.scope, name: token.name },
+  };
 }

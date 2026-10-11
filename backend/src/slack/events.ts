@@ -21,6 +21,9 @@ import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { sessionName, projectDir, formatPaneForSlack } from '../services/tmux';
+import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
+import { matchChannelTarget, createProjectChannel } from './channels';
+import type { Project, User } from '@prisma/client';
 // tmux ops route through the per-user agent (the backend can't see the user's
 // tmux in-process). Same signatures as the old ../services/tmux helpers.
 import {
@@ -28,6 +31,7 @@ import {
 } from './tmuxAgent';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
+import { isAdminUser } from '../services/admin/adminAccess';
 import {
   registerLocalSession, queueLocalCommand, isLocalSession,
   removeLocalSession, listLocalSessions, updateLocalSessionMessage,
@@ -41,8 +45,9 @@ const execAsync = promisify(exec);
 const activeHomeViewers = new Set<string>();
 export function getActiveHomeViewers() { return activeHomeViewers; }
 
-// In-memory: userId → active termag project ID
-const activeProjectMap = new Map<string, string>();
+// In-memory: Slack userId → active termag target (project + workstream).
+// Used in DMs / non-project channels, where there is no channel to route by.
+const activeTargetMap = new Map<string, { projectId: string; workstream: string }>();
 // In-memory: userId → session message count (for --continue)
 const sessionMessageCount = new Map<string, number>();
 // In-memory: channel following
@@ -71,13 +76,19 @@ interface ReactionTarget {
   sessionName: string;
   userId: string;
   channelId: string;
+  instanceId?: string | null;
   expiresAt: number;
 }
 const reactionTargets = new Map<string, ReactionTarget>();
 const REACTION_TTL = 60 * 60 * 1000; // 1 hour
 
-export function trackPaneMessage(channelId: string, messageTs: string, tmuxSession: string, userId: string): void {
-  // Prune expired entries lazily
+export function trackPaneMessage(
+  channelId: string,
+  messageTs: string,
+  tmuxSession: string,
+  userId: string,
+  instanceId?: string | null,
+): void {
   const now = Date.now();
   for (const [key, val] of reactionTargets) {
     if (val.expiresAt < now) reactionTargets.delete(key);
@@ -86,8 +97,13 @@ export function trackPaneMessage(channelId: string, messageTs: string, tmuxSessi
     sessionName: tmuxSession,
     userId,
     channelId,
+    instanceId,
     expiresAt: now + REACTION_TTL,
   });
+}
+
+export function trackedPaneInstance(channelId: string, messageTs: string): string | null | undefined {
+  return reactionTargets.get(`${channelId}:${messageTs}`)?.instanceId;
 }
 
 // Detect numbered prompts in pane content (e.g. "  1. Allow once")
@@ -149,53 +165,74 @@ async function resolveUnixUsername(slackUserId: string, slackClient?: any): Prom
 }
 
 export function getActiveProjectId(userId: string): string | null {
-  return activeProjectMap.get(userId) ?? null;
+  return activeTargetMap.get(userId)?.projectId ?? null;
 }
 
-export function setActiveProjectId(userId: string, projectId: string): void {
-  activeProjectMap.set(userId, projectId);
+export function getActiveWorkstream(userId: string): string {
+  return activeTargetMap.get(userId)?.workstream ?? 'main';
 }
+
+/** Set the active target. Omitting `workstream` resets it to `main`. */
+export function setActiveProjectId(userId: string, projectId: string, workstream: string = 'main'): void {
+  activeTargetMap.set(userId, { projectId, workstream });
+}
+
+type ChannelTarget = { project: Project & { user: User }; workstream: string };
 
 /**
- * Map a Slack channel → project. Primary: the saved slackChannelId. Fallback:
- * a `proj-<name>` channel matched to a project by name (preferring the invoking
- * user's, since names aren't globally unique) — then lazily backfill
- * slackChannelId so it's a one-time self-heal. This covers projects created
- * before Slack was enabled, which never got the channel link saved.
+ * Map a Slack channel → (project, workstream).
+ *
+ * Primary: a saved slackChannelId on a Workstream (non-main) or on the Project
+ * (main). Fallback: rebuild the canonical `#proj-<user>-<project>[-<ws>]`
+ * name for every live tuple and compare (never parses dashes), then the legacy
+ * `#proj-<project>` form preferring the invoking user's project. On a name
+ * match the id is backfilled so it's a one-time self-heal — covers channels
+ * created by hand or before Slack was enabled.
  */
-async function resolveChannelProject(command: any, preferUserId?: string) {
+async function resolveChannelTarget(command: any, preferUserId?: string): Promise<ChannelTarget | null> {
+  const byWs = await prisma.workstream.findFirst({
+    where: { slackChannelId: command.channel_id, archived: false, project: { archived: false } },
+    include: { project: { include: { user: true } } },
+  });
+  if (byWs) return { project: byWs.project, workstream: byWs.name };
+
   const byId = await prisma.project.findFirst({
     where: { slackChannelId: command.channel_id, archived: false },
     include: { user: true },
   });
-  if (byId) return byId;
+  if (byId) return { project: byId, workstream: 'main' };
 
   const channelName: string = command.channel_name ?? '';
   if (!channelName.startsWith('proj-')) return null;
-  const projectName = channelName.slice('proj-'.length);
-  if (!projectName) return null;
 
-  const byName =
-    (preferUserId
-      ? await prisma.project.findFirst({
-          where: { name: projectName, archived: false, userId: preferUserId },
-          include: { user: true },
-        })
-      : null) ??
-    (await prisma.project.findFirst({
-      where: { name: projectName, archived: false },
-      include: { user: true },
-    }));
-  if (!byName) return null;
+  const projects = await prisma.project.findMany({
+    where: { archived: false },
+    include: { user: true, workstreams: { where: { archived: false }, select: { name: true } } },
+  });
+  const m = matchChannelTarget(channelName, projects, preferUserId);
+  if (!m) return null;
+  const project = projects.find(p => p.id === m.projectId)!;
 
   // Persist the link so future lookups hit the fast path.
   try {
-    await prisma.project.update({
-      where: { id: byName.id },
-      data: { slackChannelId: command.channel_id },
-    });
+    if (m.workstream === 'main') {
+      await prisma.project.update({ where: { id: project.id }, data: { slackChannelId: command.channel_id } });
+    } else {
+      await prisma.workstream.update({
+        where: { projectId_name: { projectId: project.id, name: m.workstream } },
+        data: { slackChannelId: command.channel_id },
+      });
+    }
   } catch { /* race / constraint — non-fatal, routing still works this time */ }
-  return byName;
+  return { project, workstream: m.workstream };
+}
+
+/** Active (DM) target as a ChannelTarget, or null. */
+async function activeTarget(userId: string): Promise<ChannelTarget | null> {
+  const projectId = getActiveProjectId(userId);
+  if (!projectId) return null;
+  const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+  return project ? { project, workstream: getActiveWorkstream(userId) } : null;
 }
 
 /**
@@ -259,8 +296,8 @@ async function processMessage(opts: {
 
   // Claude execution via executor (clean formatted response)
   const projectId = getActiveProjectId(userId);
-  const workingDir = await resolveWorkingDir(userId, projectId);
-  console.log(`[EXECUTOR] Running for user=${userId} projectId=${projectId} workingDir=${workingDir} message="${message.slice(0, 80)}"`);
+  const workingDir = await resolveWorkingDir(userId, projectId, getActiveWorkstream(userId));
+  console.log(`[EXECUTOR] Running for user=${userId} projectId=${projectId} workstream=${getActiveWorkstream(userId)} workingDir=${workingDir} message="${message.slice(0, 80)}"`);
   const msgCount = sessionMessageCount.get(userId) ?? 0;
 
   const reactionEmoji = 'hourglass_flowing_sand';
@@ -402,6 +439,12 @@ export function registerEventHandlers(app: App): void {
         await client.chat.postMessage({ channel: command.channel_id, text: 'Project name must be alphanumeric with dashes/underscores only.' });
         return;
       }
+      // Chat-created projects run on this host (there's no box picker here),
+      // which is admin-only — same rule as POST /api/projects.
+      if (!isAdminUser(termagUser)) {
+        await client.chat.postMessage({ channel: command.channel_id, text: 'Projects must run on a box — create this one from the termag web UI.' });
+        return;
+      }
       try {
         // Create project directory
         const projDir = projectDir(termagUser.unixUsername, projectName);
@@ -440,9 +483,8 @@ export function registerEventHandlers(app: App): void {
           return;
         }
 
-        // Create Slack channel
-        const { createProjectChannel } = await import('./channels');
-        createProjectChannel(projectName, userId).then(channelId => {
+        // Create Slack channel (#proj-<user>-<project>)
+        createProjectChannel(termagUser.unixUsername, projectName, userId).then(channelId => {
           if (channelId) {
             prisma.project.update({
               where: { id: project.id },
@@ -453,7 +495,7 @@ export function registerEventHandlers(app: App): void {
 
         setActiveProjectId(userId, project.id);
         const agentSession = sessionName(termagUser.unixUsername, projectName, 'agent');
-        setNotificationTarget(agentSession, { channel: command.channel_id, userId });
+        setNotificationTarget(agentSession, { channel: command.channel_id, userId }, 'slack', null);
         await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created with agent workflow. Switched to it.` });
       } catch (err: unknown) {
         if ((err as { code?: string }).code === 'P2002') {
@@ -470,7 +512,7 @@ export function registerEventHandlers(app: App): void {
     if (userCommand === 'projects') {
       const projects = await prisma.project.findMany({
         where: { archived: false, ...(termagUser ? { userId: termagUser.id } : {}) },
-        include: { workflows: true, user: true },
+        include: { workflows: true, user: true, workstreams: { where: { archived: false }, orderBy: { createdAt: 'asc' } } },
         orderBy: { name: 'asc' },
       });
       if (projects.length === 0) {
@@ -478,36 +520,54 @@ export function registerEventHandlers(app: App): void {
         return;
       }
       const activeId = getActiveProjectId(userId);
-      const lines = projects.map(p => {
-        const active = p.id === activeId ? ' ✅' : '';
+      const activeWs = getActiveWorkstream(userId);
+      const lines = projects.flatMap(p => {
+        const isActiveProject = p.id === activeId;
+        const active = isActiveProject && activeWs === 'main' ? ' ✅' : '';
         const hasAgent = p.workflows.some(w => w.type === 'agent') ? '🤖' : '  ';
-        return `${hasAgent} \`${p.name}\`${active}`;
+        const extra = p.workstreams.filter(w => w.name !== 'main');
+        return [
+          `${hasAgent} \`${p.name}\`${active}`,
+          ...extra.map(w => `      ↳ \`${p.name}/${w.name}\`${isActiveProject && activeWs === w.name ? ' ✅' : ''}`),
+        ];
       }).join('\n');
-      await client.chat.postMessage({ channel: command.channel_id, text: `*Projects*\n${lines}\n\nUse \`/t switch <name>\` to change.` });
+      await client.chat.postMessage({ channel: command.channel_id, text: `*Projects*\n${lines}\n\nUse \`/t switch <project>[/<workstream>]\` to change.` });
       return;
     }
 
-    // ── /t switch <project-name> ───────────────────────
+    // ── /t switch <project>[/<workstream>] ─────────────
     if (userCommand.startsWith('switch ')) {
-      const projectName = userCommand.slice(7).trim();
-      const project = await prisma.project.findFirst({
-        where: { name: projectName, archived: false },
-        include: { workflows: true },
-      });
-      if (!project) {
+      const [projectName, wsName = 'main'] = userCommand.slice(7).trim().split('/');
+      const include = { user: true, workstreams: { where: { archived: false }, select: { name: true } } };
+      const owned = termagUser
+        ? await prisma.project.findMany({ where: { name: projectName, archived: false, userId: termagUser.id }, include })
+        : [];
+      const named = owned.length > 0
+        ? owned
+        : await prisma.project.findMany({ where: { name: projectName, archived: false }, include });
+      if (named.length === 0) {
         await client.chat.postMessage({ channel: command.channel_id, text: `No project \`${projectName}\`. Use \`/t projects\` to list.` });
         return;
       }
-      setActiveProjectId(userId, project.id);
+      if (named.length > 1) {
+        await client.chat.postMessage({ channel: command.channel_id, text: `More than one project named \`${projectName}\`. Open the one you want from the project list.` });
+        return;
+      }
+      const project = named[0];
+      if (wsName !== 'main' && !project.workstreams.some(w => w.name === wsName)) {
+        await client.chat.postMessage({ channel: command.channel_id, text: `No workstream \`${wsName}\` in \`${project.name}\`. Use \`/t projects\` to list.` });
+        return;
+      }
+      setActiveProjectId(userId, project.id, wsName);
       clearActiveLocalSession(userId);
-      const agentSession = sessionName(username, project.name, 'agent');
-      setNotificationTarget(agentSession, { channel: command.channel_id, userId });
-      const pane = await capturePaneForSlack(agentSession);
+      const agentSession = sessionName(project.user.unixUsername, project.name, 'agent', wsName);
+      setNotificationTarget(agentSession, { channel: command.channel_id, userId }, 'slack', project.instanceId);
+      const pane = await capturePaneForSlack(agentSession, 200, project.instanceId);
       const switchMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, agentSession, 'idle'),
       });
-      trackPaneMessage(command.channel_id, switchMsg.ts, agentSession, userId);
+      trackPaneMessage(command.channel_id, switchMsg.ts, agentSession, userId, project.instanceId);
       await addReactionHints(client, command.channel_id, switchMsg.ts, pane);
       return;
     }
@@ -529,23 +589,26 @@ export function registerEventHandlers(app: App): void {
     // ── /t attach <session-name> ───────────────────────
     if (userCommand.startsWith('attach ')) {
       const target = userCommand.slice(7).trim();
-      if (!await hasSession(target)) {
+      const resolved = await resolveSessionProject(target);
+      if (isAmbiguousSession(resolved)) {
+        await client.chat.postMessage({ channel: command.channel_id, text: `\`${target}\` matches more than one project.` });
+        return;
+      }
+      const opScope = resolved ? operationScopeForResolvedSession(resolved) : undefined;
+      if (!resolved || !await hasSession(target, opScope)) {
         await client.chat.postMessage({ channel: command.channel_id, text: `No tmux session \`${target}\`.` });
         return;
       }
-      // Try to find matching termag project
-      const projects = await prisma.project.findMany({ where: { archived: false }, include: { user: true } });
-      const match = projects.find(p => sessionName(p.user.unixUsername, p.name, 'agent') === target);
-      if (match) setActiveProjectId(userId, match.id);
+      if (resolved.projectId) setActiveProjectId(userId, resolved.projectId, resolved.workstream ?? 'main');
       clearActiveLocalSession(userId);
 
-      setNotificationTarget(target, { channel: command.channel_id, userId });
-      const pane = await capturePaneForSlack(target);
+      setNotificationTarget(target, { channel: command.channel_id, userId }, 'slack', resolved.instanceId);
+      const pane = await capturePaneForSlack(target, 200, opScope);
       const attachMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, target, 'idle'),
       });
-      trackPaneMessage(command.channel_id, attachMsg.ts, target, userId);
+      trackPaneMessage(command.channel_id, attachMsg.ts, target, userId, opScope);
       await addReactionHints(client, command.channel_id, attachMsg.ts, pane);
       return;
     }
@@ -553,41 +616,39 @@ export function registerEventHandlers(app: App): void {
     // ── /t ctrl <command> ──────────────────────────────
     if (userCommand.startsWith('ctrl')) {
       const ctrlCmd = userCommand.slice(4).trim();
-      // Resolve project: channel-based first (with proj-<name> fallback), then active project
-      const channelProject = await resolveChannelProject(command, termagUser?.id);
-      const projectId = channelProject?.id ?? getActiveProjectId(userId);
-      if (!projectId) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <name>` or run from a project channel.' });
+      // Resolve target: channel-based first (with #proj-… name fallback), then active target
+      const target = await resolveChannelTarget(command, termagUser?.id) ?? await activeTarget(userId);
+      if (!target) {
+        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <project>[/<workstream>]` or run from a project channel.' });
         return;
       }
-      const project = channelProject ?? await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
-      if (!project) { await client.chat.postMessage({ channel: command.channel_id, text: 'Project not found.' }); return; }
+      const { project, workstream } = target;
 
-      const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl');
-      if (!await hasSession(ctrlSession)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No ctrl session for \`${project.name}\`.` });
+      const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl', workstream);
+      const ctrlHost = project.instanceId;
+      if (!await hasSession(ctrlSession, ctrlHost)) {
+        await client.chat.postMessage({ channel: command.channel_id, text: `No ctrl session for \`${project.name}${workstream === 'main' ? '' : '/' + workstream}\`.` });
         return;
       }
 
       if (!ctrlCmd) {
-        const pane = await capturePaneForSlack(ctrlSession);
+        const pane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
         const ctrlPaneMsg = await client.chat.postMessage({ channel: command.channel_id, ...formatPaneForSlack(pane, null, ctrlSession, 'idle') });
-        trackPaneMessage(command.channel_id, ctrlPaneMsg.ts, ctrlSession, userId);
+        trackPaneMessage(command.channel_id, ctrlPaneMsg.ts, ctrlSession, userId, ctrlHost);
         await addReactionHints(client, command.channel_id, ctrlPaneMsg.ts, pane);
         return;
       }
 
-      const pane = await capturePaneForSlack(ctrlSession);
+      const pane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
       const ctrlCmdMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, ctrlCmd, ctrlSession, 'running'),
       });
-      trackPaneMessage(command.channel_id, ctrlCmdMsg.ts, ctrlSession, userId);
+      trackPaneMessage(command.channel_id, ctrlCmdMsg.ts, ctrlSession, userId, ctrlHost);
       const noEnter = ctrlCmd.startsWith('!');
-      await sendKeys(ctrlSession, noEnter ? ctrlCmd.slice(1) : ctrlCmd, !noEnter);
-      await pollUntilStable(client, command.channel_id, ctrlCmdMsg.ts, ctrlSession, ctrlCmd, 30);
-      // Re-check for hints after poll settles
-      const ctrlFinalPane = await capturePaneForSlack(ctrlSession);
+      await sendKeys(ctrlSession, noEnter ? ctrlCmd.slice(1) : ctrlCmd, !noEnter, ctrlHost);
+      await pollUntilStable(client, command.channel_id, ctrlCmdMsg.ts, ctrlSession, ctrlCmd, 30, ctrlHost);
+      const ctrlFinalPane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
       await addReactionHints(client, command.channel_id, ctrlCmdMsg.ts, ctrlFinalPane);
       return;
     }
@@ -630,24 +691,26 @@ export function registerEventHandlers(app: App): void {
       return;
     }
 
-    // ── Default: send to active project's agent session ─
-    // Resolve project: channel-based first (with proj-<name> fallback), then active project, then auto-select
-    const channelProject = await resolveChannelProject(command, termagUser?.id);
+    // ── Default: send to the target's agent session ─────
+    // Resolve target: channel-based first (with #proj-… name fallback), then active target, then auto-select
+    const channelTarget = await resolveChannelTarget(command, termagUser?.id);
     let agentSession: string;
+    let hostInstance: string | null = null;
 
-    if (channelProject) {
-      agentSession = sessionName(channelProject.user.unixUsername, channelProject.name, 'agent');
+    if (channelTarget) {
+      agentSession = sessionName(channelTarget.project.user.unixUsername, channelTarget.project.name, 'agent', channelTarget.workstream);
+      hostInstance = channelTarget.project.instanceId;
     } else {
       const projectId = getActiveProjectId(userId);
       if (projectId) {
-        const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
-        if (project) {
-          agentSession = sessionName(project.user.unixUsername, project.name, 'agent');
+        const active = await activeTarget(userId);
+        if (active) {
+          agentSession = sessionName(active.project.user.unixUsername, active.project.name, 'agent', active.workstream);
+          hostInstance = active.project.instanceId;
         } else {
           agentSession = `term-${userId}`;
         }
       } else {
-        // No active project — try to auto-select the first one (user's own projects only)
         const first = await prisma.project.findFirst({
           where: { archived: false, workflows: { some: { type: 'agent' } }, ...(termagUser ? { userId: termagUser.id } : {}) },
           include: { user: true },
@@ -656,6 +719,7 @@ export function registerEventHandlers(app: App): void {
         if (first) {
           setActiveProjectId(userId, first.id);
           agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
+          hostInstance = first.instanceId;
         } else {
           await client.chat.postMessage({ channel: command.channel_id, text: 'No projects with agent workflows. Create one in the termag UI.' });
           return;
@@ -663,16 +727,15 @@ export function registerEventHandlers(app: App): void {
       }
     }
 
-    setNotificationTarget(agentSession, { channel: command.channel_id, userId });
+    setNotificationTarget(agentSession, { channel: command.channel_id, userId }, 'slack', hostInstance);
 
-    // /t (no args) — pane screenshot
     if (!userCommand) {
-      const pane = await capturePaneForSlack(agentSession);
+      const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
       const paneMsg = await client.chat.postMessage({
         channel: command.channel_id,
         ...formatPaneForSlack(pane, null, agentSession, 'idle'),
       });
-      trackPaneMessage(command.channel_id, paneMsg.ts, agentSession, userId);
+      trackPaneMessage(command.channel_id, paneMsg.ts, agentSession, userId, hostInstance);
       await addReactionHints(client, command.channel_id, paneMsg.ts, pane);
       return;
     }
@@ -681,18 +744,17 @@ export function registerEventHandlers(app: App): void {
     const noEnter = userCommand.startsWith('!');
     const keysToSend = noEnter ? userCommand.slice(1) : userCommand;
 
-    const pane = await capturePaneForSlack(agentSession);
+    const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
     const msg = await client.chat.postMessage({
       channel: command.channel_id,
       ...formatPaneForSlack(pane, userCommand, agentSession, 'running'),
     });
-    trackPaneMessage(command.channel_id, msg.ts, agentSession, userId);
+    trackPaneMessage(command.channel_id, msg.ts, agentSession, userId, hostInstance);
 
-    await sendKeys(agentSession, keysToSend, !noEnter);
-    await pollUntilStable(client, command.channel_id, msg.ts, agentSession, userCommand, 30);
+    await sendKeys(agentSession, keysToSend, !noEnter, hostInstance);
+    await pollUntilStable(client, command.channel_id, msg.ts, agentSession, userCommand, 30, hostInstance);
 
-    // Add reaction hints after polling completes (final pane state)
-    const finalPane = await capturePaneForSlack(agentSession);
+    const finalPane = await capturePaneForSlack(agentSession, 200, hostInstance);
     await addReactionHints(client, command.channel_id, msg.ts, finalPane);
   });
 
@@ -742,24 +804,21 @@ export function registerEventHandlers(app: App): void {
 
       // Send keystroke (unless refresh-only)
       if (mapping.keys || mapping.withEnter) {
-        await sendKeys(target.sessionName, mapping.keys, mapping.withEnter);
+        await sendKeys(target.sessionName, mapping.keys, mapping.withEnter, target.instanceId);
       }
 
-      // Post initial pane, then poll until stable (picks up follow-up prompts)
       const label = emoji === 'arrows_counterclockwise' ? null : `(${emoji})`;
-      const pane = await capturePaneForSlack(target.sessionName);
+      const pane = await capturePaneForSlack(target.sessionName, 200, target.instanceId);
       const msg = await client.chat.postMessage({
         channel: target.channelId,
         ...formatPaneForSlack(pane, label, target.sessionName, 'running'),
       });
 
-      // Track immediately so chained reactions work even during polling
-      trackPaneMessage(target.channelId, msg.ts, target.sessionName, target.userId);
+      trackPaneMessage(target.channelId, msg.ts, target.sessionName, target.userId, target.instanceId);
 
-      await pollUntilStable(client, target.channelId, msg.ts, target.sessionName, label, 30);
+      await pollUntilStable(client, target.channelId, msg.ts, target.sessionName, label, 30, target.instanceId);
 
-      // Add reaction hints on the final stable pane
-      const finalPane = await capturePaneForSlack(target.sessionName);
+      const finalPane = await capturePaneForSlack(target.sessionName, 200, target.instanceId);
       await addReactionHints(client, target.channelId, msg.ts, finalPane);
     } catch (error) {
       console.error('[REACTION] Error:', error);

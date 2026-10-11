@@ -13,7 +13,7 @@
  */
 import { sendForProject, ProjectHost } from '../services/agentRegistry';
 import { cleanPaneText, formatPaneForSlack } from '../services/tmux';
-import { resolveSessionProject } from '../services/sessionResolver';
+import { isAmbiguousSession, resolveSessionProject } from '../services/sessionResolver';
 
 /**
  * Resolve which agent owns a tmux session — thin wrapper over the shared
@@ -21,14 +21,19 @@ import { resolveSessionProject } from '../services/sessionResolver';
  * dash-parsing ambiguity, and caches). Falls back to the owner's legacy agent
  * (instanceId null) for sessions that don't map to a known project.
  */
-async function hostForSession(session: string): Promise<ProjectHost | null> {
-  const r = await resolveSessionProject(session);
-  return r ? { userId: r.userId, instanceId: r.instanceId } : null;
+async function hostForSession(session: string, instanceId?: string | null): Promise<ProjectHost | null> {
+  const r = await resolveSessionProject(session, instanceId);
+  if (!r || isAmbiguousSession(r)) return null;
+  return { userId: r.userId, instanceId: r.instanceId };
 }
 
 /** Capture a pane's text via the owning agent. Mirrors tmux.capturePaneForSlack. */
-export async function capturePaneForSlack(session: string, lines = 200): Promise<string> {
-  const host = await hostForSession(session);
+export async function capturePaneForSlack(
+  session: string,
+  lines = 200,
+  instanceId?: string | null,
+): Promise<string> {
+  const host = await hostForSession(session, instanceId);
   if (!host) return '(unable to capture pane)';
   try {
     const r = await sendForProject(host, 'tmux-capture', { sessionName: session, lines });
@@ -39,8 +44,8 @@ export async function capturePaneForSlack(session: string, lines = 200): Promise
 }
 
 /** Mirrors tmux.hasSession. */
-export async function hasSession(session: string): Promise<boolean> {
-  const host = await hostForSession(session);
+export async function hasSession(session: string, instanceId?: string | null): Promise<boolean> {
+  const host = await hostForSession(session, instanceId);
   if (!host) return false;
   try {
     const r = await sendForProject(host, 'tmux-has-session', { sessionName: session });
@@ -51,8 +56,13 @@ export async function hasSession(session: string): Promise<boolean> {
 }
 
 /** Mirrors tmux.sendKeys. */
-export async function sendKeys(session: string, command: string, withEnter = true): Promise<void> {
-  const host = await hostForSession(session);
+export async function sendKeys(
+  session: string,
+  command: string,
+  withEnter = true,
+  instanceId?: string | null,
+): Promise<void> {
+  const host = await hostForSession(session, instanceId);
   if (!host) return;
   try {
     await sendForProject(host, 'tmux-send-keys', { sessionName: session, keys: command, withEnter });
@@ -82,6 +92,7 @@ export async function pollUntilStable(
   session: string,
   command: string | null,
   maxSeconds = 30,
+  instanceId?: string | null,
 ): Promise<void> {
   const POLL_MS = 1500;
   const MIN_UPDATE_MS = 1100;
@@ -95,7 +106,7 @@ export async function pollUntilStable(
 
   for (let i = 0; i < MAX_POLLS; i++) {
     await new Promise(resolve => setTimeout(resolve, POLL_MS));
-    const pane = await capturePaneForSlack(session);
+    const pane = await capturePaneForSlack(session, 200, instanceId);
 
     if (pane !== lastContent) {
       lastContent = pane;
@@ -132,7 +143,7 @@ export async function pollUntilStable(
   }
 
   try {
-    const pane = await capturePaneForSlack(session);
+    const pane = await capturePaneForSlack(session, 200, instanceId);
     await client.chat.update({
       channel: channelId,
       ts: messageTs,

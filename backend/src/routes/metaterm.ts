@@ -1,6 +1,7 @@
 import { Router, RequestHandler } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { ensureMetaTerm, MetaTermUnavailableError } from '../services/metaterm';
+import { HostUnixUsernameError } from '../services/hostUnixUsername';
 
 // POST /api/metaterm — the UI entry point. Idempotent: creates the caller's
 // pinned MetaTerm singleton on first use, otherwise just ensures it's up and
@@ -15,7 +16,9 @@ export function metatermRouter(): Router {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[METATERM] open failed:', msg);
-      const status = err instanceof MetaTermUnavailableError ? err.status : 500;
+      const status = err instanceof MetaTermUnavailableError || err instanceof HostUnixUsernameError
+        ? err.status
+        : 500;
       res.status(status).json({ error: `Failed to open MetaTerm: ${msg}` });
     }
   };

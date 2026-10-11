@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { matchSession, ProjectLike } from './sessionResolver';
+import {
+  isAmbiguousSession,
+  matchSession,
+  operationScopeForResolvedSession,
+  ownerProjectsWhere,
+  resolveSessionMatch,
+  ProjectLike,
+} from './sessionResolver';
 
 const owner = 'alice';
 function proj(over: Partial<ProjectLike>): ProjectLike {
@@ -57,5 +64,73 @@ describe('matchSession', () => {
     const projects = [proj({ id: 'p1', name: 'termag', instanceId: 'box-1', workstreams: [{ name: 'main' }] })];
     expect(matchSession('alice-termag-agent', owner, projects))
       .toEqual({ projectId: 'p1', workstream: 'main', instanceId: 'box-1' });
+  });
+
+  it('fails an ambiguous match of two cx projects on different instances', () => {
+    const projects = [
+      proj({ id: 'cx-a', name: 'cx', instanceId: 'box-a', workstreams: [{ name: 'main' }] }),
+      proj({ id: 'cx-b', name: 'cx', instanceId: 'box-b', workstreams: [{ name: 'main' }] }),
+    ];
+    expect(matchSession('alice-cx-agent', owner, projects)).toBeNull();
+    expect(matchSession('alice-cx-agent', owner, projects, 'box-a'))
+      .toEqual({ projectId: 'cx-a', workstream: 'main', instanceId: 'box-a' });
+    expect(matchSession('alice-cx-agent', owner, projects, 'box-b'))
+      .toEqual({ projectId: 'cx-b', workstream: 'main', instanceId: 'box-b' });
+    expect(matchSession('alice-cx-agent', owner, projects, null)).toBeNull();
+  });
+
+  it('uses a null instanceId to select the orchestrator row', () => {
+    const projects = [
+      proj({ id: 'host', name: 'cx', instanceId: null, workstreams: [{ name: 'main' }] }),
+      proj({ id: 'box', name: 'cx', instanceId: 'box-a', workstreams: [{ name: 'main' }] }),
+    ];
+    expect(matchSession('alice-cx-agent', owner, projects)).toBeNull();
+    expect(matchSession('alice-cx-agent', owner, projects, null))
+      .toEqual({ projectId: 'host', workstream: 'main', instanceId: null });
+    expect(matchSession('alice-cx-agent', owner, projects, 'box-a'))
+      .toEqual({ projectId: 'box', workstream: 'main', instanceId: 'box-a' });
+  });
+
+  it('does not fall back to the orchestrator when two cx projects match', () => {
+    const projects = [
+      proj({ id: 'cx-a', name: 'cx', instanceId: 'box-a', workstreams: [{ name: 'main' }] }),
+      proj({ id: 'cx-b', name: 'cx', instanceId: 'box-b', workstreams: [{ name: 'main' }] }),
+    ];
+    expect(resolveSessionMatch('u1', 'alice-cx-agent', owner, projects)).toEqual({ ambiguous: true });
+    expect(resolveSessionMatch('u1', 'alice-cx-agent', owner, projects, 'box-a')).toEqual({
+      userId: 'u1', projectId: 'cx-a', workstream: 'main', instanceId: 'box-a',
+    });
+    expect(resolveSessionMatch('u1', 'alice-cx-agent', owner, projects, null)).toBeNull();
+  });
+
+  it('keeps the orchestrator fallback only when an unscoped lookup matches nothing', () => {
+    const projects = [proj({ id: 'p1', name: 'termag', workstreams: [{ name: 'main' }] })];
+    const legacy = resolveSessionMatch('u1', 'alice-other-agent', owner, projects);
+    expect(legacy).toEqual({
+      userId: 'u1', instanceId: null, projectId: null, workstream: null,
+    });
+    expect(legacy && !isAmbiguousSession(legacy) ? operationScopeForResolvedSession(legacy) : 'wrong').toBeUndefined();
+    expect(resolveSessionMatch('u1', 'alice-other-agent', owner, projects, 'box-a')).toBeNull();
+  });
+
+  it('preserves explicit scope for project-backed sessions', () => {
+    expect(operationScopeForResolvedSession({
+      userId: 'u1', projectId: 'host', workstream: 'main', instanceId: null,
+    })).toBe(null);
+    expect(operationScopeForResolvedSession({
+      userId: 'u1', projectId: 'box', workstream: 'main', instanceId: 'box-a',
+    })).toBe('box-a');
+  });
+
+  it('treats an unknown owner as missing and a double match as ambiguous', () => {
+    expect(isAmbiguousSession(null)).toBe(false);
+    expect(isAmbiguousSession({ ambiguous: true })).toBe(true);
+    expect(isAmbiguousSession({
+      userId: 'u1', instanceId: null, projectId: null, workstream: null,
+    })).toBe(false);
+  });
+
+  it('does not let an archived project join the session lookup', () => {
+    expect(ownerProjectsWhere('u1')).toEqual({ userId: 'u1', archived: false });
   });
 });

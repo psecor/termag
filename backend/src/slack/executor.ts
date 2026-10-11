@@ -22,14 +22,21 @@ export interface StreamChunk {
  * Resolve the working directory for a Slack user.
  * Uses the user's active termag project directory, or falls back to home dir.
  */
-export async function resolveWorkingDir(slackUserId: string, activeProjectId: string | null): Promise<string> {
+export async function resolveWorkingDir(
+  slackUserId: string,
+  activeProjectId: string | null,
+  workstream: string = 'main',
+): Promise<string> {
   if (activeProjectId) {
     const project = await prisma.project.findUnique({
       where: { id: activeProjectId },
       include: { user: true },
     });
     if (project) {
-      return await ensureProjectDir(project.user.unixUsername, project.name);
+      const root = await ensureProjectDir(project.user.unixUsername, project.name);
+      // Non-main workstreams are git worktrees under <root>/.worktrees/<name>;
+      // they exist iff the workstream does, so no ensure step.
+      return workstream === 'main' ? root : projectDir(project.user.unixUsername, project.name, workstream);
     }
   }
   return process.env.HOME ?? homedir();

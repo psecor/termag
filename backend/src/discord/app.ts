@@ -30,13 +30,14 @@ export function createDiscordClient(): Client {
   return client;
 }
 
-export async function startDiscordClient(client: Client): Promise<void> {
+/** Logs in and registers the slash command; false when Discord is disabled or the login failed. */
+export async function startDiscordClient(client: Client): Promise<boolean> {
   const token = process.env.DISCORD_TOKEN;
   const appId = process.env.DISCORD_APP_ID;
 
   if (!token) {
     console.log('[DISCORD] Missing DISCORD_TOKEN — Discord bot disabled');
-    return;
+    return false;
   }
 
   try {
@@ -49,9 +50,21 @@ export async function startDiscordClient(client: Client): Promise<void> {
     } else {
       console.warn('[DISCORD] Missing DISCORD_APP_ID — slash commands not registered');
     }
+    return true;
   } catch (error) {
     console.error('[DISCORD] Failed to start:', (error as Error).message);
+    return false;
   }
+}
+
+/**
+ * Leaves the gateway. Notifications need the logged-in client, so a draining
+ * process skips its Discord ones (getDiscordClient() is null until the next
+ * createDiscordClient()).
+ */
+export async function stopDiscordClient(client: Client): Promise<void> {
+  if (discordClient === client) discordClient = null;
+  await client.destroy();
 }
 
 export function getDiscordClient(): Client | null {

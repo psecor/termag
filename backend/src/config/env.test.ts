@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   databaseUrlFromEnv, applyDerivedDatabaseUrl, pgConnectionFromEnv, buildDatabaseUrl,
   isTruthy, iamAuthEnabled, regionFromRdsHost, iamSigningRegion, pgSslConfig, prismaSslParams,
+  warmPoolConfigFromEnv, otlpDestinationFromEnv,
   DEFAULT_RDS_CA_FILE,
 } from './env';
 
@@ -135,5 +136,74 @@ describe('prismaSslParams', () => {
     expect(prismaSslParams({ mode: 'off' })).toEqual({});
     expect(prismaSslParams({ mode: 'encrypt-only' })).toEqual({ sslmode: 'require', sslaccept: 'accept_invalid_certs' });
     expect(prismaSslParams({ mode: 'verify', caFile: '/ca.pem' })).toEqual({ sslmode: 'require', sslcert: '/ca.pem', sslaccept: 'strict' });
+  });
+});
+
+describe('warmPoolConfigFromEnv', () => {
+  it('holds no pool at all on an unconfigured deployment', () => {
+    expect(warmPoolConfigFromEnv({})).toEqual({
+      targetSize: 0,
+      maxInFlight: 2,
+      reconcileMs: 60_000,
+      maxAgeMs: 86_400_000,
+    });
+  });
+
+  it('reads all four knobs and converts the two duration ones', () => {
+    expect(warmPoolConfigFromEnv({
+      WARM_POOL_TARGET_SIZE: '2',
+      WARM_POOL_MAX_INFLIGHT: '4',
+      WARM_POOL_RECONCILE_SECONDS: '30',
+      WARM_POOL_MAX_AGE_HOURS: '12',
+    })).toEqual({
+      targetSize: 2,
+      maxInFlight: 4,
+      reconcileMs: 30_000,
+      maxAgeMs: 43_200_000,
+    });
+  });
+
+  it('accepts a padded value', () => {
+    expect(warmPoolConfigFromEnv({ WARM_POOL_TARGET_SIZE: ' 3 ' }).targetSize).toBe(3);
+  });
+
+  it('honours zero in-flight as a kill switch but never as a tick interval', () => {
+    const cfg = warmPoolConfigFromEnv({ WARM_POOL_MAX_INFLIGHT: '0', WARM_POOL_RECONCILE_SECONDS: '0' });
+    expect(cfg.maxInFlight).toBe(0);
+    expect(cfg.reconcileMs).toBe(60_000);
+  });
+
+  it('falls back to the default for anything that is not a whole number', () => {
+    for (const raw of ['', 'two', '2.5', '-1', '2 boxes', '1e3', 'NaN']) {
+      expect(warmPoolConfigFromEnv({
+        WARM_POOL_TARGET_SIZE: raw,
+        WARM_POOL_MAX_INFLIGHT: raw,
+        WARM_POOL_RECONCILE_SECONDS: raw,
+        WARM_POOL_MAX_AGE_HOURS: raw,
+      })).toEqual({ targetSize: 0, maxInFlight: 2, reconcileMs: 60_000, maxAgeMs: 86_400_000 });
+    }
+  });
+});
+
+describe('otlpDestinationFromEnv', () => {
+  const project = 'termag-prod';
+
+  it('takes both variables, trimmed, trailing slash dropped', () => {
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: ` ${project} `, OBSERVABILITY_OTLP_ENDPOINT: 'https://otel.example.test:4318/' }))
+      .toEqual({ project, endpoint: 'https://otel.example.test:4318' });
+  });
+
+  it('answers null rather than guess: either one missing or blank', () => {
+    expect(otlpDestinationFromEnv({})).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: project })).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_OTLP_ENDPOINT: 'https://otel.example.test' })).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: '  ', OBSERVABILITY_OTLP_ENDPOINT: 'https://otel.example.test' })).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: project, OBSERVABILITY_OTLP_ENDPOINT: '   ' })).toBeNull();
+  });
+
+  it('agrees with the host collector: a malformed key or endpoint ships nothing', () => {
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: 'not a key!', OBSERVABILITY_OTLP_ENDPOINT: 'https://otel.example.test' })).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: project, OBSERVABILITY_OTLP_ENDPOINT: 'http://otel.example.test' })).toBeNull();
+    expect(otlpDestinationFromEnv({ OBSERVABILITY_PROJECT: project, OBSERVABILITY_OTLP_ENDPOINT: 'https://otel.example.test/v1/logs' })).toBeNull();
   });
 });

@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { legalSessions, isSessionRole, SESSION_ROLES } from './sessionAccess';
+import { legalSessions, isSessionRole, isOnCallerHost, SESSION_ROLES } from './sessionAccess';
 
 describe('legalSessions', () => {
   it('builds every role for main, collapsing the workstream segment', () => {
     expect(legalSessions('alice', 'termag', ['main'])).toEqual([
-      'alice-termag-agent', 'alice-termag-ctrl', 'alice-termag-data', 'alice-termag-data-ctrl',
+      'alice-termag-agent', 'alice-termag-ctrl', 'alice-termag-data', 'alice-termag-data-ctrl', 'alice-termag-review',
     ]);
   });
   it('threads non-main workstreams through the name', () => {
@@ -29,5 +29,21 @@ describe('isSessionRole', () => {
     expect(isSessionRole('shell')).toBe(false);
     expect(isSessionRole('')).toBe(false);
     expect(isSessionRole(undefined)).toBe(false);
+  });
+});
+
+describe('isOnCallerHost', () => {
+  it('matches a box token to projects on that box only', () => {
+    expect(isOnCallerHost('box-1', 'box-1')).toBe(true);
+    expect(isOnCallerHost('box-2', 'box-1')).toBe(false);
+    expect(isOnCallerHost(null, 'box-1')).toBe(false);
+  });
+  it('matches a per-user token to box-less projects', () => {
+    expect(isOnCallerHost(null, null)).toBe(true);
+    expect(isOnCallerHost('box-1', null)).toBe(false);
+  });
+  it('is false for a browser session, which has no host', () => {
+    expect(isOnCallerHost(null, undefined)).toBe(false);
+    expect(isOnCallerHost('box-1', undefined)).toBe(false);
   });
 });

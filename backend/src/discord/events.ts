@@ -8,15 +8,15 @@ import { Client, ChatInputCommandInteraction, Message } from 'discord.js';
 import { prisma } from '../db';
 import { resolveDiscordUser } from './userMapping';
 import { formatPaneForDiscord } from './formatting';
-import {
-  sessionName, projectDir, hasSession, sendKeys,
-  capturePaneForSlack, listSessions as tmuxListSessions,
-} from '../services/tmux';
+import { sessionName, projectDir, listSessions as tmuxListSessions } from '../services/tmux';
+import { hasSession, sendKeys, capturePaneForSlack } from '../slack/tmuxAgent';
+import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
 import { setNotificationTarget } from '../slack/lts';
 import { getActiveProjectId, setActiveProjectId } from '../slack/events';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
+import { isAdminUser } from '../services/admin/adminAccess';
 
 
 // Emoji → keystroke mapping (matches Slack)
@@ -39,12 +39,19 @@ interface ReactionTarget {
   sessionName: string;
   userId: string;
   channelId: string;
+  instanceId?: string | null;
   expiresAt: number;
 }
 const reactionTargets = new Map<string, ReactionTarget>();
 const REACTION_TTL = 60 * 60 * 1000;
 
-export function trackDiscordPaneMessage(channelId: string, messageId: string, tmuxSession: string, userId: string): void {
+export function trackDiscordPaneMessage(
+  channelId: string,
+  messageId: string,
+  tmuxSession: string,
+  userId: string,
+  instanceId?: string | null,
+): void {
   const now = Date.now();
   for (const [key, val] of reactionTargets) {
     if (val.expiresAt < now) reactionTargets.delete(key);
@@ -53,8 +60,13 @@ export function trackDiscordPaneMessage(channelId: string, messageId: string, tm
     sessionName: tmuxSession,
     userId,
     channelId,
+    instanceId,
     expiresAt: now + REACTION_TTL,
   });
+}
+
+export function trackedDiscordPaneInstance(channelId: string, messageId: string): string | null | undefined {
+  return reactionTargets.get(`${channelId}:${messageId}`)?.instanceId;
 }
 
 function detectNumberedPrompts(paneContent: string): number {
@@ -86,13 +98,14 @@ async function pollUntilStable(
   tmuxSession: string,
   command: string | null,
   maxPolls: number,
+  instanceId?: string | null,
 ): Promise<void> {
   let lastContent = '';
   let stableCount = 0;
 
   for (let i = 0; i < maxPolls; i++) {
     await new Promise(r => setTimeout(r, 1500));
-    const pane = await capturePaneForSlack(tmuxSession);
+    const pane = await capturePaneForSlack(tmuxSession, 200, instanceId);
 
     if (pane === lastContent) {
       stableCount++;
@@ -128,6 +141,12 @@ export function registerDiscordEvents(client: Client): void {
       const projectName = userCommand.slice(7).trim();
       if (!/^[a-zA-Z0-9_-]+$/.test(projectName)) {
         await interaction.reply('Project name must be alphanumeric with dashes/underscores only.');
+        return;
+      }
+      // Chat-created projects run on this host (there's no box picker here),
+      // which is admin-only — same rule as POST /api/projects.
+      if (!isAdminUser(termagUser)) {
+        await interaction.reply('Projects must run on a box — create this one from the termag web UI.');
         return;
       }
       try {
@@ -168,7 +187,7 @@ export function registerDiscordEvents(client: Client): void {
 
         // Create Slack channel (if Slack is configured)
         const { createProjectChannel } = await import('../slack/channels');
-        createProjectChannel(projectName, termagUser.slackUserId ?? undefined).then(channelId => {
+        createProjectChannel(termagUser.unixUsername, projectName, termagUser.slackUserId ?? undefined).then(channelId => {
           if (channelId) {
             prisma.project.update({
               where: { id: project.id },
@@ -178,7 +197,7 @@ export function registerDiscordEvents(client: Client): void {
         });
 
         setActiveProjectId(discordUserId, project.id);
-        setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord');
+        setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord', null);
         await interaction.reply(`Project \`${projectName}\` created with agent workflow. Switched to it.`);
       } catch (err: unknown) {
         if ((err as { code?: string }).code === 'P2002') {
@@ -215,20 +234,25 @@ export function registerDiscordEvents(client: Client): void {
     // /t switch <project>
     if (userCommand.startsWith('switch ')) {
       const projectName = userCommand.slice(7).trim();
-      const project = await prisma.project.findFirst({
+      const named = await prisma.project.findMany({
         where: { name: projectName, userId: termagUser.id, archived: false },
         include: { workflows: true },
       });
-      if (!project) {
+      if (named.length === 0) {
         await interaction.reply(`No project \`${projectName}\`. Use \`/t projects\` to list.`);
         return;
       }
+      if (named.length > 1) {
+        await interaction.reply(`More than one project named \`${projectName}\`. Open the one you want from the project list.`);
+        return;
+      }
+      const project = named[0];
       setActiveProjectId(discordUserId, project.id);
       const agentSession = sessionName(username, project.name, 'agent');
-      setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord');
-      const pane = await capturePaneForSlack(agentSession);
+      setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord', project.instanceId);
+      const pane = await capturePaneForSlack(agentSession, 200, project.instanceId);
       const msg = await interaction.reply({ ...formatPaneForDiscord(pane, null, agentSession), fetchReply: true });
-      trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId);
+      trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId, project.instanceId);
       await addDiscordReactionHints(msg, pane);
       return;
     }
@@ -247,18 +271,22 @@ export function registerDiscordEvents(client: Client): void {
     // /t attach <session>
     if (userCommand.startsWith('attach ')) {
       const target = userCommand.slice(7).trim();
-      if (!await hasSession(target)) {
+      const resolved = await resolveSessionProject(target);
+      if (isAmbiguousSession(resolved)) {
+        await interaction.reply(`\`${target}\` matches more than one project.`);
+        return;
+      }
+      const opScope = resolved ? operationScopeForResolvedSession(resolved) : undefined;
+      if (!resolved || !await hasSession(target, opScope)) {
         await interaction.reply(`No tmux session \`${target}\`.`);
         return;
       }
-      const projects = await prisma.project.findMany({ where: { archived: false }, include: { user: true } });
-      const match = projects.find(p => sessionName(p.user.unixUsername, p.name, 'agent') === target);
-      if (match) setActiveProjectId(discordUserId, match.id);
+      if (resolved.projectId) setActiveProjectId(discordUserId, resolved.projectId);
 
-      setNotificationTarget(target, { channel: interaction.channelId, userId: discordUserId }, 'discord');
-      const pane = await capturePaneForSlack(target);
+      setNotificationTarget(target, { channel: interaction.channelId, userId: discordUserId }, 'discord', resolved.instanceId);
+      const pane = await capturePaneForSlack(target, 200, opScope);
       const msg = await interaction.reply({ ...formatPaneForDiscord(pane, null, target), fetchReply: true });
-      trackDiscordPaneMessage(interaction.channelId, msg.id, target, discordUserId);
+      trackDiscordPaneMessage(interaction.channelId, msg.id, target, discordUserId, opScope);
       await addDiscordReactionHints(msg, pane);
       return;
     }
@@ -275,26 +303,27 @@ export function registerDiscordEvents(client: Client): void {
       if (!project) { await interaction.reply('Project not found.'); return; }
 
       const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl');
-      if (!await hasSession(ctrlSession)) {
+      const ctrlHost = project.instanceId;
+      if (!await hasSession(ctrlSession, ctrlHost)) {
         await interaction.reply(`No ctrl session for \`${project.name}\`.`);
         return;
       }
 
       if (!ctrlCmd) {
-        const pane = await capturePaneForSlack(ctrlSession);
+        const pane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
         const msg = await interaction.reply({ ...formatPaneForDiscord(pane, null, ctrlSession), fetchReply: true });
-        trackDiscordPaneMessage(interaction.channelId, msg.id, ctrlSession, discordUserId);
+        trackDiscordPaneMessage(interaction.channelId, msg.id, ctrlSession, discordUserId, ctrlHost);
         await addDiscordReactionHints(msg, pane);
         return;
       }
 
-      const pane = await capturePaneForSlack(ctrlSession);
+      const pane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
       const msg = await interaction.reply({ ...formatPaneForDiscord(pane, ctrlCmd, ctrlSession), fetchReply: true });
-      trackDiscordPaneMessage(interaction.channelId, msg.id, ctrlSession, discordUserId);
+      trackDiscordPaneMessage(interaction.channelId, msg.id, ctrlSession, discordUserId, ctrlHost);
       const noEnter = ctrlCmd.startsWith('!');
-      await sendKeys(ctrlSession, noEnter ? ctrlCmd.slice(1) : ctrlCmd, !noEnter);
-      await pollUntilStable(msg, ctrlSession, ctrlCmd, 30);
-      const finalPane = await capturePaneForSlack(ctrlSession);
+      await sendKeys(ctrlSession, noEnter ? ctrlCmd.slice(1) : ctrlCmd, !noEnter, ctrlHost);
+      await pollUntilStable(msg, ctrlSession, ctrlCmd, 30, ctrlHost);
+      const finalPane = await capturePaneForSlack(ctrlSession, 200, ctrlHost);
       await addDiscordReactionHints(msg, finalPane);
       return;
     }
@@ -302,11 +331,13 @@ export function registerDiscordEvents(client: Client): void {
     // Default: send to active project's agent session
     const projectId = getActiveProjectId(discordUserId);
     let agentSession: string;
+    let hostInstance: string | null = null;
 
     if (projectId) {
       const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
       if (project) {
         agentSession = sessionName(project.user.unixUsername, project.name, 'agent');
+        hostInstance = project.instanceId;
       } else {
         agentSession = `term-${discordUserId}`;
       }
@@ -319,19 +350,19 @@ export function registerDiscordEvents(client: Client): void {
       if (first) {
         setActiveProjectId(discordUserId, first.id);
         agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
+        hostInstance = first.instanceId;
       } else {
         await interaction.reply('No projects with agent workflows. Create one in the termag web UI.');
         return;
       }
     }
 
-    setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord');
+    setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord', hostInstance);
 
-    // /t (no args) — pane screenshot
     if (!userCommand) {
-      const pane = await capturePaneForSlack(agentSession);
+      const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
       const msg = await interaction.reply({ ...formatPaneForDiscord(pane, null, agentSession), fetchReply: true });
-      trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId);
+      trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId, hostInstance);
       await addDiscordReactionHints(msg, pane);
       return;
     }
@@ -342,13 +373,13 @@ export function registerDiscordEvents(client: Client): void {
 
     // Defer reply since polling takes time
     await interaction.deferReply();
-    const pane = await capturePaneForSlack(agentSession);
+    const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
     const msg = await interaction.editReply(formatPaneForDiscord(pane, userCommand, agentSession));
-    trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId);
+    trackDiscordPaneMessage(interaction.channelId, msg.id, agentSession, discordUserId, hostInstance);
 
-    await sendKeys(agentSession, keysToSend, !noEnter);
-    await pollUntilStable(msg, agentSession, userCommand, 30);
-    const finalPane = await capturePaneForSlack(agentSession);
+    await sendKeys(agentSession, keysToSend, !noEnter, hostInstance);
+    await pollUntilStable(msg, agentSession, userCommand, 30, hostInstance);
+    const finalPane = await capturePaneForSlack(agentSession, 200, hostInstance);
     await addDiscordReactionHints(msg, finalPane);
   });
 
@@ -380,22 +411,20 @@ export function registerDiscordEvents(client: Client): void {
 
     // Send keystroke
     if (mapping.keys || mapping.withEnter) {
-      await sendKeys(target.sessionName, mapping.keys, mapping.withEnter);
+      await sendKeys(target.sessionName, mapping.keys, mapping.withEnter, target.instanceId);
     }
 
-    // Post updated pane
     const label = emoji === '🔄' ? null : `(${emoji})`;
-    const pane = await capturePaneForSlack(target.sessionName);
+    const pane = await capturePaneForSlack(target.sessionName, 200, target.instanceId);
     const channel = reaction.message.channel;
     if (!channel.isTextBased() || !('send' in channel)) return;
 
     try {
       const msg = await (channel as any).send(formatPaneForDiscord(pane, label, target.sessionName));
-      trackDiscordPaneMessage(target.channelId, msg.id, target.sessionName, target.userId);
+      trackDiscordPaneMessage(target.channelId, msg.id, target.sessionName, target.userId, target.instanceId);
 
-      // Poll for stability then add hints
-      await pollUntilStable(msg, target.sessionName, label, 30);
-      const finalPane = await capturePaneForSlack(target.sessionName);
+      await pollUntilStable(msg, target.sessionName, label, 30, target.instanceId);
+      const finalPane = await capturePaneForSlack(target.sessionName, 200, target.instanceId);
       await addDiscordReactionHints(msg, finalPane);
     } catch (err) {
       console.error('[DISCORD] Reaction handler error:', (err as Error).message);

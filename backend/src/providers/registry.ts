@@ -27,10 +27,17 @@ export interface ProviderConfig {
 
   /** Shell command to launch the agent in a tmux pane */
   launchCommand: string;
+  /** Command used instead of launchCommand when relaunching into a pane whose
+   *  agent exited (reconnect reconstruction): resume the last session in that
+   *  cwd. Absent = launchCommand. */
+  resumeCommand?: string;
   /** Process names for isAgentRunning() detection (matched case-insensitive) */
   processNames: string[];
   /** Status source values that map back to this provider */
   statusSources: string[];
+  /** Offered in the create-project / default-agent pickers. false = kept only so
+   *  existing projects and historical usage still render (hide, never delete). */
+  selectable: boolean;
 
   /** Codex-style: needs a bridge subprocess for status */
   needsBridge?: boolean;
@@ -102,9 +109,11 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   claude: {
     id: 'claude',
     displayName: 'Claude',
+    selectable: true,
     badge: 'CL',
     color: { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' },
     launchCommand: 'claude',
+    resumeCommand: 'claude --continue',
     processNames: ['claude'],
     statusSources: ['claude-hooks'],
     usageMethod: 'jsonl-scan',
@@ -114,6 +123,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   codex: {
     id: 'codex',
     displayName: 'Codex',
+    selectable: false,
     badge: 'CX',
     color: { base: 'rgba(35, 170, 100, 0.6)', bright: 'rgba(72, 220, 140, 0.9)' },
     launchCommand: 'codex --no-alt-screen -a on-request',
@@ -127,6 +137,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   cursor: {
     id: 'cursor',
     displayName: 'Cursor',
+    selectable: true,
     badge: 'CR',
     color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
     launchCommand: 'cursor-agent',
@@ -148,6 +159,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   gemini: {
     id: 'gemini',
     displayName: 'Gemini',
+    selectable: false,
     badge: 'GE',
     color: { base: 'rgba(66, 133, 244, 0.6)', bright: 'rgba(120, 170, 255, 0.9)' },
     launchCommand: 'gemini',
@@ -167,6 +179,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   augment: {
     id: 'augment',
     displayName: 'Augment',
+    selectable: false,
     badge: 'AG',
     color: { base: 'rgba(255, 152, 0, 0.6)', bright: 'rgba(255, 183, 77, 0.9)' },
     launchCommand: 'auggie',
@@ -186,6 +199,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   deepseek: {
     id: 'deepseek',
     displayName: 'DeepSeek',
+    selectable: false,
     badge: 'DS',
     color: { base: 'rgba(0, 150, 136, 0.6)', bright: 'rgba(77, 208, 195, 0.9)' },
     launchCommand: 'deepseek',
@@ -205,6 +219,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
   devin: {
     id: 'devin',
     displayName: 'Devin',
+    selectable: true,
     badge: 'DV',
     color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
     launchCommand: 'devin',
@@ -226,9 +241,31 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     usagePrecision: 'estimated',
   },
 
+  // pi: the pi coding agent, on whatever model provider the box owner has
+  // configured for it. The launch loads deploy/pi-ext/termag-status.ts (which
+  // termag-reconcile installs), and that extension posts status with source
+  // `pi-ext:pi` -- hooks-style like Claude, no poller (the tmux poller is
+  // orchestrator-only and this runs on boxes). pi runs tools without approval
+  // prompts.
+  pi: {
+    id: 'pi',
+    displayName: 'pi',
+    selectable: true,
+    badge: 'PI',
+    color: { base: 'rgba(217, 119, 6, 0.6)', bright: 'rgba(251, 191, 36, 0.9)' },
+    launchCommand: 'pi -e ~/.local/share/termag/pi-ext/termag-status.ts',
+    resumeCommand: 'pi -e ~/.local/share/termag/pi-ext/termag-status.ts --continue',
+    processNames: ['pi'],
+    statusSources: ['pi-ext:pi'],
+    // usage-scanner reads ~/.pi/agent/sessions/**.jsonl (exact per-call usage)
+    usageMethod: 'jsonl-scan',
+    usagePrecision: 'exact',
+  },
+
   mistral: {
     id: 'mistral',
     displayName: 'Mistral',
+    selectable: false,
     badge: 'MI',
     color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
     launchCommand: 'vibe',
@@ -252,12 +289,20 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
       spinnerPattern: /(?<![\u2800-\u28FF])[\u2800-\u28FF](?![\u2800-\u28FF])/,
       statusBarParser: parseVibeStatusBar,
     },
-    usageMethod: 'none',
-    usagePrecision: 'estimated',
+    // usage-scanner reads ~/.vibe/logs/session/*/meta.json (the CLI's own
+    // session totals); dates are local day at session start, not UTC.
+    usageMethod: 'jsonl-scan',
+    usagePrecision: 'exact',
   },
 };
 
 export const PROVIDER_IDS = Object.keys(PROVIDERS);
+/** Providers a user may pick for a NEW project or as their default. Existing
+ *  projects may carry any PROVIDER_IDS entry. */
+export const SELECTABLE_PROVIDER_IDS = Object.values(PROVIDERS).filter(p => p.selectable).map(p => p.id);
+export function isSelectableProvider(id: string | null | undefined): boolean {
+  return !!id && SELECTABLE_PROVIDER_IDS.includes(id);
+}
 export type AgentProvider = string;
 
 /** All process names across all providers, for isAgentRunning() */

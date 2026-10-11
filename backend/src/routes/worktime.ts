@@ -56,7 +56,7 @@ export function worktimeRouter(): Router {
           where: { username: req.user!.unixUsername, date: { gte: startStr } },
           orderBy: { date: 'asc' },
         }),
-        prisma.project.findMany({ where: { userId: req.user!.id }, select: { id: true, name: true } }),
+        prisma.project.findMany({ where: { userId: req.user!.id }, select: { id: true, name: true, instanceId: true } }),
       ]);
       res.json({ days: daysBack, rows: toWorktimeProjectRows(entries, projects) });
     } catch {

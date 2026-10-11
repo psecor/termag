@@ -6,6 +6,7 @@ import {
   buildUsageResponse, hostStatuses, pollerEstimates, runUserScan, lastSuccessfulRun,
   RESCAN_THROTTLE_MS, UsageRowAgg,
 } from '../services/tokenUsageSampler';
+import { tokenSourceSql } from '../services/admin/tokenSource';
 
 // GET /api/usage — token usage from token_usage_days (written by the sampler),
 // plus live poller estimates. Never 503s once rows exist: an offline agent
@@ -20,19 +21,26 @@ async function payloadFor(userId: string, unixUsername: string) {
   const since = new Date(Date.now() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10);
   const raw = await prisma.$queryRaw<Array<{
     projectId: string | null; workstream: string | null; provider: string; date: string; estimated: boolean;
-    input: number; output: number; cacheRead: number; cacheCreate: number; calls: number;
+    input: number; output: number; cacheRead: number; cacheCreate: number; reasoning: number; calls: number;
   }>>`
     SELECT "projectId", "workstream", "provider", "date", "estimated",
            SUM("input")::float8 AS "input", SUM("output")::float8 AS "output",
            SUM("cacheRead")::float8 AS "cacheRead", SUM("cacheCreate")::float8 AS "cacheCreate",
+           SUM("reasoning")::float8 AS "reasoning",
            SUM("calls")::int AS "calls"
-    FROM token_usage_days
-    WHERE "userId" = ${userId} AND "date" >= ${since}
+    FROM ${tokenSourceSql(since, '9999-12-31', userId)} t
     GROUP BY "projectId", "workstream", "provider", "date", "estimated"
   `;
   const rows: UsageRowAgg[] = raw.map(r => ({
     projectId: r.projectId, workstream: r.workstream, provider: r.provider, date: r.date, estimated: r.estimated,
-    day: { input: Number(r.input), output: Number(r.output), cacheRead: Number(r.cacheRead), cacheCreate: Number(r.cacheCreate), calls: Number(r.calls) },
+    // Reasoning tokens (pi; Claude folds thinking into output
+    // already) are reported inside `output` but kept tagged in `reasoning` so
+    // they can be broken out later.
+    day: {
+      input: Number(r.input), output: Number(r.output) + Number(r.reasoning),
+      cacheRead: Number(r.cacheRead), cacheCreate: Number(r.cacheCreate),
+      reasoning: Number(r.reasoning), calls: Number(r.calls),
+    },
   }));
   const [projects, instances, newest] = await Promise.all([
     prisma.project.findMany({ where: { userId }, select: { id: true, name: true, color: true, kind: true } }),

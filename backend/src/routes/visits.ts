@@ -1,17 +1,26 @@
 import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
+import { sessionName } from '../services/tmux';
+import { getAllStatuses } from '../services/status';
+import { statusKey } from '../services/statusKey';
+import { providerForSource } from '../providers/registry';
 
 
 export function visitsRouter(): Router {
   const router = Router();
 
   const record: RequestHandler = async (req, res) => {
-    const { projectId, previousProjectId, sessionTag } = req.body as {
+    const { projectId, previousProjectId, sessionTag, workstream } = req.body as {
       projectId?: string | null;
       previousProjectId?: string | null;
       sessionTag?: string;
+      workstream?: string | null;
     };
+    if (workstream !== undefined && workstream !== null && typeof workstream !== 'string') {
+      res.status(400).json({ error: 'workstream must be string or null' });
+      return;
+    }
 
     // Both ids may be null (e.g. switching to "no project"), but if present
     // must be strings. Reject obvious garbage.
@@ -54,10 +63,92 @@ export function visitsRouter(): Router {
         projectId: projectId ?? null,
         previousProjectId: previousProjectId ?? null,
         sessionTag: sessionTag ?? null,
+        workstream: projectId ? (workstream ?? 'main') : null,
       },
     });
 
     res.json({ ok: true });
+  };
+
+  // GET /api/visits/recent?limit=10|all — the sessions (project × workstream)
+  // this user most recently opened, newest first, joined with what the row
+  // needs to be useful at a glance: live agent status and the agent's own
+  // last-active time. Archived projects are included and flagged (the
+  // dashboard shows them dimmed; the sidebar switcher drops them); projects
+  // the user can no longer reach (deleted, share revoked) are dropped.
+  const recent: RequestHandler = async (req, res) => {
+    const userId = req.user!.id;
+    const rawLimit = String(req.query.limit ?? '10');
+    const limit = rawLimit === 'all' ? 500 : Math.max(1, Math.min(500, parseInt(rawLimit, 10) || 10));
+
+    // Latest visit per (project, workstream). Legacy rows have a null
+    // workstream and read as "main".
+    const latest = await prisma.$queryRaw<Array<{ projectId: string; workstream: string; ts: Date }>>`
+      SELECT DISTINCT ON ("projectId", COALESCE(workstream, 'main'))
+             "projectId", COALESCE(workstream, 'main') AS workstream, timestamp AS ts
+      FROM project_visits
+      WHERE "userId" = ${userId} AND "projectId" IS NOT NULL
+      ORDER BY "projectId", COALESCE(workstream, 'main'), timestamp DESC
+    `;
+    latest.sort((a, b) => b.ts.getTime() - a.ts.getTime());
+
+    const ids = [...new Set(latest.map(r => r.projectId))];
+    if (ids.length === 0) { res.json([]); return; }
+
+    const projects = await prisma.project.findMany({
+      where: { id: { in: ids } },
+      include: {
+        user: { select: { unixUsername: true } },
+        workstreams: { select: { name: true, archived: true } },
+        // Workflow rows are per-workstream; keep the name so the provider
+        // fallback below matches the row's own workstream, not an arbitrary one.
+        workflows: { where: { type: 'agent' }, select: { provider: true, workstream: { select: { name: true } } } },
+      },
+    });
+    const shares = await prisma.projectShare.findMany({
+      where: { userId, projectId: { in: ids } },
+      select: { projectId: true },
+    });
+    const shared = new Set(shares.map(s => s.projectId));
+    const byId = new Map(projects.map(p => [p.id, p]));
+    const statuses = getAllStatuses();
+
+    const out: Array<Record<string, unknown>> = [];
+    for (const r of latest) {
+      if (out.length >= limit) break;
+      const p = byId.get(r.projectId);
+      if (!p) continue;
+      const access = p.userId === userId ? 'owner' : shared.has(p.id) ? 'collaborator' : null;
+      if (!access) continue;
+      // A workstream that has since been removed/archived is no longer a
+      // session you can open; drop it (main always exists).
+      if (r.workstream !== 'main') {
+        const ws = p.workstreams.find(w => w.name === r.workstream);
+        if (!ws || ws.archived) continue;
+      }
+      const session = sessionName(p.user.unixUsername, p.name, 'agent', r.workstream);
+      const raw = statuses.get(statusKey(p.instanceId, session));
+      out.push({
+        projectId: p.id,
+        projectName: p.name,
+        workstream: r.workstream,
+        owner: p.user.unixUsername,
+        access,
+        instanceId: p.instanceId,
+        archived: p.archived,
+        kind: p.kind,
+        color: p.color,
+        lastVisitedAt: r.ts.toISOString(),
+        status: raw?.status ?? 'not_running',
+        statusUpdatedAt: raw ? raw.updatedAt.toISOString() : null,
+        lastActiveAt: p.lastActiveAt.toISOString(),
+        provider: (raw?.source ? providerForSource(raw.source) : undefined)
+          ?? p.workflows.find(w => w.workstream.name === r.workstream)?.provider
+          ?? p.workflows[0]?.provider
+          ?? null,
+      });
+    }
+    res.json(out);
   };
 
   const stats: RequestHandler = async (req, res) => {
@@ -76,6 +167,7 @@ export function visitsRouter(): Router {
       FROM project_visits
       WHERE "userId" = ${userId}
         AND timestamp >= ${since}
+        AND "previousProjectId" IS DISTINCT FROM "projectId"
       GROUP BY day
       ORDER BY day
     `;
@@ -91,6 +183,7 @@ export function visitsRouter(): Router {
                EXTRACT(EPOCH FROM (timestamp - LAG(timestamp) OVER (ORDER BY timestamp))) AS dwell_seconds
         FROM project_visits
         WHERE "userId" = ${userId} AND timestamp >= ${since}
+          AND "previousProjectId" IS DISTINCT FROM "projectId"
       )
       SELECT
         AVG(dwell_seconds) AS mean_dwell_seconds,
@@ -106,6 +199,7 @@ export function visitsRouter(): Router {
       FROM project_visits
       WHERE "userId" = ${userId}
         AND timestamp >= ${todayStartUtc}
+        AND "previousProjectId" IS DISTINCT FROM "projectId"
       GROUP BY hour
       ORDER BY hour
     `;
@@ -152,6 +246,7 @@ export function visitsRouter(): Router {
 
   router.post('/', requireAuth, record);
   router.get('/stats', requireAuth, stats);
+  router.get('/recent', requireAuth, recent);
 
   return router;
 }

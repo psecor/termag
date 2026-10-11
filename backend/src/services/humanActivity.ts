@@ -7,6 +7,7 @@
  */
 
 import { prisma } from '../db';
+import { workTimeIdentity } from './worktimeProjects';
 
 
 const DECAY_MS = 3 * 60 * 1000; // 3 minutes
@@ -17,9 +18,10 @@ interface ActiveSession {
   lastHeartbeat: number;
   username: string;
   project: string;
+  instanceId: string | null;
 }
 
-const activeSessions = new Map<string, ActiveSession>(); // key: `${username}:${project}`
+const activeSessions = new Map<string, ActiveSession>();
 let checkTimer: NodeJS.Timeout | null = null;
 
 function todayStr(): string {
@@ -27,8 +29,8 @@ function todayStr(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function sessionKey(username: string, project: string): string {
-  return `${username}:${project}`;
+export function humanActivityKey(username: string, project: string, instanceId: string | null): string {
+  return `${username}:${instanceId ?? ''}:${project}`;
 }
 
 function bankTime(session: ActiveSession): void {
@@ -36,24 +38,15 @@ function bankTime(session: ActiveSession): void {
   if (durationMs < 5000) return; // ignore trivial blips
 
   const date = todayStr();
+  const identity = workTimeIdentity(session.username, session.project, 'human', date, session.instanceId);
   prisma.workTimeEntry.upsert({
-    where: {
-      username_project_provider_date: {
-        username: session.username,
-        project: session.project,
-        provider: 'human',
-        date,
-      },
-    },
+    where: { username_project_provider_date_instanceId: identity },
     update: {
       totalMs: { increment: durationMs },
       sessions: { increment: 1 },
     },
     create: {
-      username: session.username,
-      project: session.project,
-      provider: 'human',
-      date,
+      ...identity,
       totalMs: durationMs,
       sessions: 1,
     },
@@ -73,8 +66,8 @@ function checkDecay(): void {
 }
 
 /** Called on each frontend heartbeat */
-export function recordHeartbeat(username: string, project: string): void {
-  const key = sessionKey(username, project);
+export function recordHeartbeat(username: string, project: string, instanceId: string | null = null): void {
+  const key = humanActivityKey(username, project, instanceId);
   const now = Date.now();
   const existing = activeSessions.get(key);
 
@@ -82,12 +75,12 @@ export function recordHeartbeat(username: string, project: string): void {
     // If decayed and restarting, bank the old session first
     if (now - existing.lastHeartbeat >= DECAY_MS) {
       bankTime(existing);
-      activeSessions.set(key, { startedAt: now, lastHeartbeat: now, username, project });
+      activeSessions.set(key, { startedAt: now, lastHeartbeat: now, username, project, instanceId });
     } else {
       existing.lastHeartbeat = now;
     }
   } else {
-    activeSessions.set(key, { startedAt: now, lastHeartbeat: now, username, project });
+    activeSessions.set(key, { startedAt: now, lastHeartbeat: now, username, project, instanceId });
   }
 }
 

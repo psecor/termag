@@ -32,10 +32,12 @@ const HISTORY_DAYS = 400;
 const STALE_AFTER_MS = 15 * 60_000;
 export const RESCAN_THROTTLE_MS = 30_000;
 
-export interface UsageDay { input: number; output: number; cacheRead: number; cacheCreate: number; calls: number }
-export const emptyDay = (): UsageDay => ({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 });
+// `reasoning` stays tagged separately (only pi reports it) so it can
+// be broken out later; routes/usage.ts folds it into `output` for reporting.
+export interface UsageDay { input: number; output: number; cacheRead: number; cacheCreate: number; reasoning: number; calls: number }
+export const emptyDay = (): UsageDay => ({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 0 });
 export function addDay(t: UsageDay, d: UsageDay): void {
-  t.input += d.input; t.output += d.output; t.cacheRead += d.cacheRead; t.cacheCreate += d.cacheCreate; t.calls += d.calls;
+  t.input += d.input; t.output += d.output; t.cacheRead += d.cacheRead; t.cacheCreate += d.cacheCreate; t.reasoning += d.reasoning; t.calls += d.calls;
 }
 
 export interface RowInput {
@@ -59,7 +61,7 @@ export interface NormalizedScan {
 function toDay(v: unknown): UsageDay {
   const d = (v && typeof v === 'object' ? v : {}) as Partial<UsageDay>;
   const n = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? x : 0);
-  return { input: n(d.input), output: n(d.output), cacheRead: n(d.cacheRead), cacheCreate: n(d.cacheCreate), calls: n(d.calls) };
+  return { input: n(d.input), output: n(d.output), cacheRead: n(d.cacheRead), cacheCreate: n(d.cacheCreate), reasoning: n(d.reasoning), calls: n(d.calls) };
 }
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 
@@ -226,13 +228,13 @@ async function persistHost(userId: string, hostKey: string, norm: NormalizedScan
     update: {
       cwdHint: r.cwdHint, projectId: r.projectId, workstream: r.workstream,
       input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
-      calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
+      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
     },
     create: {
       userId, hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey,
       cwdHint: r.cwdHint, projectId: r.projectId, workstream: r.workstream,
       input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
-      calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
+      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
     },
   }));
   for (let i = 0; i < ops.length; i += 200) await prisma.$transaction(ops.slice(i, i + 200));
@@ -308,6 +310,26 @@ export function hostStatuses(userId: string, instanceNames: Map<string, string>)
       ...(r?.lastError ? { error: r.lastError } : {}),
     };
   });
+}
+
+/**
+ * Every host's scan health, org-wide (admin fleet view). hostRuns is in-memory,
+ * so a host nobody has scanned since the last backend restart is simply absent.
+ */
+export function allHostStatuses(): Array<HostStatus & { userId: string; durationMs: number; rows: number }> {
+  const connected = new Set(getConnectedAgents().map(a => `${a.userId}:${hostKeyOf(a.instanceId)}`));
+  const out: Array<HostStatus & { userId: string; durationMs: number; rows: number }> = [];
+  for (const [hostKey, r] of hostRuns) {
+    const instanceId = hostKey === LEGACY_HOST ? null : hostKey;
+    out.push({
+      hostKey, instanceId, userId: r.userId, name: instanceId ?? 'orchestrator',
+      connected: connected.has(`${r.userId}:${hostKey}`),
+      lastScanAt: r.lastScanAt ? new Date(r.lastScanAt).toISOString() : null,
+      schema: r.schema, durationMs: r.durationMs, rows: r.rows,
+      ...(r.lastError ? { error: r.lastError } : {}),
+    });
+  }
+  return out;
 }
 
 /** Live (un-persisted) poller estimates for the response. */

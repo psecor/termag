@@ -21,15 +21,35 @@
  */
 
 import { WebSocket } from 'ws';
+import { forgetBoxOwner, rememberBoxOwner } from './boxOwners';
+import { hostSampleData } from './hostSamples';
 import { Instance, User } from '@prisma/client';
 import { prisma } from '../db';
 import { reconstructUserSessions, reconstructInstanceSessions } from './agentRuntime';
+import { parseAgentHello } from './agentHello';
+import {
+  AgentConnection,
+  connectUpdate,
+  parseAgentConnection,
+  registryKeyOf,
+  warmCompletionUpdate,
+} from './instanceLifecycle';
+import { describeOnWarmRun, onWarmRunUpdate, parseOnWarmReport, promotesToWarm } from './onWarmStatus';
+import { deliverToInstance, CREDENTIALS_CAPABILITY } from './credentialDelivery';
+import { onClaimRunUpdate, parseOnClaimReport } from './onClaimStatus';
+import { syncBoxAuthorizedKeys } from './sshKeySync';
+import { clearsPowerErrorOnConnect } from './boxPowerPolicy';
 
 
 interface ConnectedAgent {
   ws: WebSocket;
-  user: User;
-  instanceId: string | null;
+  conn: AgentConnection;
+  capabilities: string[];
+  // From the hello (agentHello.ts); null until it arrives or from an older agent.
+  agentCommit: string | null;
+  agentCommitAt: Date | null;
+  // Until the hello, empty capabilities mean "not said yet", not "can't".
+  helloReceived: boolean;
   pendingRequests: Map<string, {
     resolve: (data: any) => void;
     reject: (err: Error) => void;
@@ -40,19 +60,78 @@ interface ConnectedAgent {
 const userAgents = new Map<string, ConnectedAgent>();      // userId → agent (legacy)
 const instanceAgents = new Map<string, ConnectedAgent>();  // instanceId → agent (V1+)
 
+export interface ConnectedOwnedBox {
+  instance: Instance;
+  user: User;
+  agentCommit: string | null;
+  capabilities: string[];
+}
+
+/** What an owned box's agent said about itself on connect, for listeners outside this module. */
+export interface BoxAgentHelloEvent extends ConnectedOwnedBox {
+  /**
+   * Resolves once the hello's host identity write and credential delivery
+   * have finished, whether or not they succeeded: hostHome decides the
+   * project dir, and the GitHub broker has to be in place before a clone.
+   */
+  settled: Promise<void>;
+}
+
+/** A frame an owned box's agent sent unprompted, with the box the socket is bound to. */
+export interface BoxAgentFrame {
+  instance: Instance;
+  user: User;
+  msg: Record<string, unknown>;
+}
+
+// Listeners on owned boxes' agents (services/boxUpdate, services/projectClone).
+// Listeners rather than imports: those modules send through this one, and
+// this module importing them back would be a cycle.
+const boxHelloListeners = new Set<(ev: BoxAgentHelloEvent) => void>();
+const boxFrameListeners = new Map<string, Set<(frame: BoxAgentFrame) => void>>();
+
+/** Called after an owned box's agent has said hello and its fields are recorded. Returns the unsubscribe. */
+export function onBoxAgentHello(listener: (ev: BoxAgentHelloEvent) => void): () => void {
+  boxHelloListeners.add(listener);
+  return () => { boxHelloListeners.delete(listener); };
+}
+
+/** Called for each frame of this type from an owned box's agent. Returns the unsubscribe. */
+export function onBoxAgentFrame(type: string, listener: (frame: BoxAgentFrame) => void): () => void {
+  let listeners = boxFrameListeners.get(type);
+  if (!listeners) boxFrameListeners.set(type, listeners = new Set());
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
 // Terminal data subscribers: streamId → { callback, userId, instanceId }
-const terminalStreams = new Map<string, { onData: (msg: any) => void; userId: string; instanceId: string | null }>();
+type TerminalStream = { onData: (msg: any) => void; userId: string; instanceId: string | null };
+const terminalStreams = new Map<string, TerminalStream>();
 
 let requestCounter = 0;
+
+// A process draining for a deploy hands its agents to the new one. Their close
+// here is not a disconnect: stamping agentDisconnectedAt could land after the
+// new process recorded the reconnect, and the warm pool would read it as down.
+let draining = false;
+
+export function setAgentRegistryDraining(value: boolean): void {
+  draining = value;
+}
 
 function nextRequestId(): string {
   return `req_${++requestCounter}_${Date.now()}`;
 }
 
-export function registerAgent(user: User, ws: WebSocket, instance: Instance | null): void {
-  const targetMap = instance ? instanceAgents : userAgents;
-  const targetKey = instance ? instance.id : user.id;
-  const label = instance ? `instance ${instance.name}` : user.unixUsername;
+export function registerAgent(user: User | null, ws: WebSocket, instance: Instance | null): void {
+  const conn = parseAgentConnection({ user, instance });
+  if (!conn) {
+    ws.close(1008, 'agent token must carry a user or an instance');
+    return;
+  }
+
+  const { scope, key: targetKey, label } = registryKeyOf(conn);
+  const targetMap = scope === 'instance' ? instanceAgents : userAgents;
 
   // Replace any existing agent for the SAME key. Other agents (e.g. the
   // user's Mac while we're connecting an instance) stay put.
@@ -63,8 +142,11 @@ export function registerAgent(user: User, ws: WebSocket, instance: Instance | nu
 
   const agent: ConnectedAgent = {
     ws,
-    user,
-    instanceId: instance?.id ?? null,
+    conn,
+    capabilities: [],
+    agentCommit: null,
+    agentCommitAt: null,
+    helloReceived: false,
     pendingRequests: new Map(),
   };
   targetMap.set(targetKey, agent);
@@ -87,11 +169,136 @@ export function registerAgent(user: User, ws: WebSocket, instance: Instance | nu
         return;
       }
 
+      // Agent identifying itself on connect
+      if (msg.type === 'hello') {
+        const hello = parseAgentHello(msg);
+        if (!hello) return;
+        agent.capabilities = hello.capabilities;
+        agent.agentCommit = hello.agentCommit;
+        agent.agentCommitAt = hello.agentCommitAt;
+        agent.helloReceived = true;
+        console.log(
+          `[AGENT] Hello: ${label} unixUser=${hello.unixUser} home=${hello.home} ` +
+          `hostname=${hello.hostname ?? 'unknown'} agentVersion=${hello.agentVersion ?? 'unknown'} ` +
+          `agentCommit=${hello.agentCommit?.slice(0, 12) ?? 'unknown'} warm=${hello.warm}` +
+          (hello.capabilities.length ? ` capabilities=${hello.capabilities.join(',')}` : ''),
+        );
+        let credentials: Promise<void> = Promise.resolve();
+        if (conn.kind === 'owned-box' && hello.capabilities.includes(CREDENTIALS_CAPABILITY)) {
+          credentials = deliverToInstance(conn.instance.id, conn.user.id).catch(err => {
+            console.error(`[CRED] delivery to ${label} failed:`, err.message);
+          });
+        }
+        let hostIdentity: Promise<unknown> = Promise.resolve();
+        // Only an instance-bound connection has a row to record this on; a
+        // per-user token names no host, so there is nothing to write.
+        if (instance) {
+          hostIdentity = prisma.instance.update({
+            where: { id: instance.id },
+            data: { hostUnixUser: hello.unixUser, hostHome: hello.home, ...hostSampleData(hello.host) },
+          }).catch(err => {
+            console.error(`[AGENT] Failed to record host identity for instance ${instance.id}:`, err.message);
+          });
+          // Catches up a box that was offline when its owner's keys changed.
+          if (instance.userId && instance.kind === 'ec2') {
+            syncBoxAuthorizedKeys(instance.id, instance.userId, hello.home).catch(err => {
+              console.error(`[SSH-KEYS] instance ${instance.name}: sync on connect failed:`, err.message);
+            });
+          }
+          // The backend starts the warm run rather than cloud-init, so the
+          // GitHub token this RPC carries once the on-warm scripts need one is
+          // handed to a connected agent and never rides in user_data. Re-sent
+          // on every reconnect while the box is still warming, which is how a
+          // run interrupted by an agent restart resumes reporting; the agent's
+          // start is idempotent.
+          if (hello.warm && instance.status === 'warming') {
+            console.log(`[POOL] instance ${instance.name} agent connected, starting the on-warm run`);
+            sendToInstanceAgent(instance.id, 'on-warm-start', {}).catch(err => {
+              // Not fatal to the socket. The stuck sweep fails a box whose warm
+              // run never reports, and the next reconnect tries again.
+              console.error(`[POOL] instance ${instance.name} on-warm-start failed:`, err.message);
+            });
+          }
+        }
+        if (conn.kind === 'owned-box') {
+          // The worktime accumulator banks runner sessions under this owner (services/boxOwners.ts).
+          rememberBoxOwner(conn.instance.id, conn.user.unixUsername);
+          const event: BoxAgentHelloEvent = {
+            instance: conn.instance, user: conn.user, agentCommit: hello.agentCommit, capabilities: hello.capabilities,
+            settled: Promise.all([hostIdentity, credentials]).then(() => undefined),
+          };
+          for (const listener of boxHelloListeners) {
+            try {
+              listener(event);
+            } catch (err) {
+              console.error(`[AGENT] a hello listener failed for ${label}:`, (err as Error).message);
+            }
+          }
+        }
+        return;
+      }
+
+      if (msg.type === 'on-warm-status') {
+        // Only an instance-bound connection owns these columns; a per-user
+        // token names no box to write them on.
+        if (!instance) return;
+        const report = parseOnWarmReport(msg);
+        if (!report) {
+          console.warn(`[POOL] instance ${instance.name} sent an unreadable on-warm status`);
+          return;
+        }
+        console.log(`[POOL] instance ${instance.name} on-warm ${describeOnWarmRun(report)}`);
+        // updateMany rather than update because the where clause is guarded on
+        // `warming`, so a box the sweep already failed, or one terminated
+        // mid-run, reports its last state into nothing instead of throwing or
+        // rewriting a settled outcome.
+        prisma.instance.updateMany(onWarmRunUpdate(instance.id, report))
+          .then(() => promotesToWarm(report) ? markWarmIfComplete(instance.id) : undefined)
+          .catch(err => {
+            console.error(`[POOL] Failed to record on-warm status for instance ${instance.id}:`, err.message);
+          });
+        return;
+      }
+
+      if (msg.type === 'on-claim-status') {
+        if (!instance) return;
+        const report = parseOnClaimReport(msg);
+        if (!report) {
+          console.warn(`[CLAIM] instance ${instance.name} sent an unreadable on-claim status`);
+          return;
+        }
+        console.log(`[CLAIM] instance ${instance.name} personalization ${report.state}`);
+        prisma.instance.updateMany(onClaimRunUpdate(instance.id, report)).catch(err => {
+          console.error(`[CLAIM] Failed to record on-claim status for instance ${instance.id}:`, err.message);
+        });
+        return;
+      }
+
       // Streaming terminal data from agent
       if (msg.type === 'terminal-data' && msg.streamId) {
         const stream = terminalStreams.get(msg.streamId);
-        if (stream) stream.onData(msg);
+        // Stream ids are guessable, so only the agent that holds a stream may feed it.
+        if (stream && streamAgent(stream) === agent) {
+          stream.onData(msg);
+        } else {
+          // Nobody here reads this stream, e.g. the agent spawned it after the
+          // attach RPC timed out. Only the backend knows that, so it closes it.
+          ws.send(JSON.stringify({ type: 'terminal-close', streamId: msg.streamId }));
+        }
         return;
+      }
+
+      const frameListeners = typeof msg.type === 'string' ? boxFrameListeners.get(msg.type) : undefined;
+      // agent.conn rather than conn: a warm box claimed while connected is owned without a reconnect.
+      const owner = agent.conn;
+      if (frameListeners && owner.kind === 'owned-box') {
+        for (const listener of frameListeners) {
+          try {
+            listener({ instance: owner.instance, user: owner.user, msg });
+          } catch (err) {
+            console.error(`[AGENT] a ${msg.type} listener failed for ${label}:`, (err as Error).message);
+          }
+        }
       }
     } catch {
       // ignore malformed messages
@@ -99,45 +306,199 @@ export function registerAgent(user: User, ws: WebSocket, instance: Instance | nu
   });
 
   ws.on('close', () => {
-    // Only remove if this is still the current agent for the key.
+    // Only remove if this is still the current agent for the key. Without
+    // that guard a replaced socket's close would stamp over the live agent.
     if (targetMap.get(targetKey)?.ws === ws) {
       for (const [, pending] of agent.pendingRequests) {
         clearTimeout(pending.timer);
         pending.reject(new Error('Agent disconnected'));
       }
       targetMap.delete(targetKey);
+      if (conn.kind !== 'user-agent' && !draining) {
+        prisma.instance.update({
+          where: { id: conn.instance.id },
+          data: { agentDisconnectedAt: new Date() },
+        }).catch(err => {
+          console.error(`[AGENT] Failed to stamp disconnect for instance ${conn.instance.id}:`, err.message);
+        });
+      }
       console.log(`[AGENT] Disconnected: ${label}`);
     }
   });
 
   console.log(`[AGENT] Connected: ${label}`);
 
-  if (instance) {
-    // Mark Instance ready + bump lastConnectedAt. Fire-and-forget; the
-    // connection is good regardless of whether this DB write lands.
-    prisma.instance.update({
-      where: { id: instance.id },
-      data: { status: 'ready', lastConnectedAt: new Date() },
-    }).catch(err => {
-      console.error(`[AGENT] Failed to mark instance ${instance.id} ready:`, err.message);
+  if (conn.kind !== 'user-agent') {
+    const box = conn.instance;
+    const connectedAt = new Date();
+    // Fire-and-forget; the connection is good regardless of whether these DB
+    // writes land. Their order is load-bearing at both steps. The guarded
+    // readyAt write has to land before the status flip clears its own
+    // `provisioning` predicate, and that guard is what keeps the cold baseline
+    // honest: it skips boxes that were already ready before the column
+    // existed, external boxes whose agent the orchestrator never launched, and
+    // pool boxes, whose equivalent measurement is warmedAt. The promotion then
+    // has to follow the connect update rather than race it, because
+    // connectUpdate's status comes from the row as read at auth time and would
+    // write a stale "warming" back over a promotion that already landed. Every
+    // write runs after the map insert, so the liveness lookup inside
+    // markWarmIfComplete sees this socket.
+    prisma.instance.updateMany({
+      where: { id: box.id, status: 'provisioning', readyAt: null },
+      data: { readyAt: connectedAt },
+    }).then(() => prisma.instance.updateMany(connectUpdate(box, connectedAt)))
+      .then(applied => {
+        if (applied.count === 0) {
+          // The status moved under us, so its write was declined. The agent is
+          // still connected, and the pool's liveness predicate reads this column
+          // against agentDisconnectedAt, so it is recorded either way.
+          return prisma.instance.updateMany({
+            where: { id: box.id },
+            data: { lastConnectedAt: connectedAt },
+          });
+        }
+        if (!clearsPowerErrorOnConnect(box.status)) return undefined;
+        return prisma.instance.updateMany({
+          where: { id: box.id, status: 'ready' },
+          data: { provisioningError: null },
+        });
+      })
+      .then(() => markWarmIfComplete(box.id)).catch(err => {
+      console.error(`[AGENT] Failed to record connect for instance ${box.id}:`, err.message);
     });
-    // Reconstruct only this instance's projects so a box-reboot can
-    // reattach Claude/cursor/devin sessions without touching projects
-    // that live on other agents (e.g. the user's Mac).
-    setTimeout(() => {
-      reconstructInstanceSessions(instance.id, user.id, user.unixUsername).catch(err => {
-        console.error(`[AGENT] Instance reconstruction failed for ${instance.name}:`, err.message);
-      });
-    }, 2000);
-  } else {
-    // Legacy per-user: reconstruct tmux sessions after a short delay.
-    // Fire-and-forget.
-    setTimeout(() => {
-      reconstructUserSessions(user.id, user.unixUsername).catch(err => {
-        console.error(`[AGENT] Session reconstruction failed for ${user.unixUsername}:`, err.message);
-      });
-    }, 2000);
   }
+
+  switch (conn.kind) {
+    case 'user-agent': {
+      const owner = conn.user;
+      // Legacy per-user: reconstruct tmux sessions after a short delay.
+      // Fire-and-forget.
+      setTimeout(() => {
+        reconstructUserSessions(owner.id, owner.unixUsername).catch(err => {
+          console.error(`[AGENT] Session reconstruction failed for ${owner.unixUsername}:`, err.message);
+        });
+      }, 2000);
+      break;
+    }
+    case 'owned-box': {
+      const { user: owner, instance: box } = conn;
+      // Reconstruct only this instance's projects so a box-reboot can
+      // reattach Claude/cursor/devin sessions without touching projects
+      // that live on other agents (e.g. the user's Mac).
+      setTimeout(() => {
+        reconstructInstanceSessions(box.id, owner.id, owner.unixUsername).catch(err => {
+          console.error(`[AGENT] Instance reconstruction failed for ${box.name}:`, err.message);
+        });
+      }, 2000);
+      break;
+    }
+    case 'warm-box':
+      // No owner and no projects yet; reconstruction happens when the claim
+      // path assigns an owner.
+      break;
+    default: {
+      const unreachable: never = conn;
+      return unreachable;
+    }
+  }
+}
+
+/**
+ * Promote a warming box to warm once both halves have landed: its agent is
+ * connected and its on-warm run succeeded. Safe to call from either side, in
+ * either order, any number of times — the guards live in the where clause.
+ */
+export async function markWarmIfComplete(instanceId: string): Promise<void> {
+  const update = warmCompletionUpdate(instanceId, isInstanceAgentConnected(instanceId), new Date());
+  if (!update) return;
+  await prisma.instance.updateMany(update);
+}
+
+/**
+ * Give a connected warm box's agent an owner, in place.
+ *
+ * A pool box registers as `{kind: 'warm-box'}` with nobody attached, and the
+ * claim makes it somebody's. Rewriting the connection here is what lets
+ * `sendForProject`, status routing and `getConnectedAgents` work on the box
+ * the moment the claim returns, instead of after a reconnect picks the owner
+ * up from the token. The registry key does not change: it was already the
+ * instance id, which the claim does not touch.
+ *
+ * Returns an undo, or null when no live agent holds this instance.
+ */
+export function rebindInstanceOwner(instance: Instance, user: User): (() => void) | null {
+  // A warm box claimed while its agent stays connected gets no new hello: the worktime accumulator learns its owner here.
+  rememberBoxOwner(instance.id, user.unixUsername);
+  const agent = getInstanceAgent(instance.id);
+  if (!agent) return null;
+  const previous = agent.conn;
+  const owned: AgentConnection = { kind: 'owned-box', user, instance };
+  agent.conn = owned;
+  // Undo for a claim whose RPC failed: the row goes back to ownerless, so the
+  // socket must too, or getConnectedAgents keeps listing the box as the
+  // claimer's. A no-op once anything else has rebound or replaced the agent.
+  return () => {
+    if (instanceAgents.get(instance.id) === agent && agent.conn === owned) agent.conn = previous;
+  };
+}
+
+/**
+ * Take the owner off whatever agent holds this instance now, as a redial with
+ * its now-ownerless token would. For a claim that is abandoned after its row
+ * reverted: the rebind's own undo only covers the socket it rebound, and the
+ * box may have redialled with the claimer's token while the RPC was in flight.
+ */
+export function disownInstanceAgent(instanceId: string): void {
+  forgetBoxOwner(instanceId);
+  const agent = instanceAgents.get(instanceId);
+  if (agent && agent.conn.kind === 'owned-box') {
+    agent.conn = { kind: 'warm-box', instance: agent.conn.instance };
+  }
+}
+
+/**
+ * Close a box's agent socket from this end. For a hibernating box: a hibernate
+ * freezes the agent with its socket, which can come back still established on
+ * resume, and an agent that never redials never moves its box from `starting`
+ * to `ready`. Closed here, the agent finds it dead on its first heartbeat after
+ * waking and dials in again. Nothing pings agents from this side, so without
+ * this a hibernated box would also keep reading as connected.
+ */
+export function dropInstanceAgent(instanceId: string, reason: string): boolean {
+  const agent = instanceAgents.get(instanceId);
+  if (!agent) return false;
+  console.log(`[AGENT] Dropping instance ${instanceId}'s socket: ${reason}`);
+  agent.ws.terminate();
+  return true;
+}
+
+/** Instances whose agent socket this process holds open right now. */
+export function connectedInstanceIds(): string[] {
+  const ids: string[] = [];
+  for (const [id, agent] of instanceAgents) {
+    if (agent.ws.readyState === WebSocket.OPEN) ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * Every host that has a live agent socket right now, in ProjectHost shape:
+ * owned boxes (their owner's id is what project discovery needs; ownerless
+ * warm boxes have nothing to discover yet) and legacy per-user agents as
+ * `{instanceId: null}`. Saves callers a project-list query just to find out
+ * which hosts even have agents (the review sweep's quiet ticks).
+ */
+export function connectedProjectHosts(): ProjectHost[] {
+  const out: ProjectHost[] = [];
+  for (const [id, agent] of instanceAgents) {
+    if (agent.ws.readyState === WebSocket.OPEN && agent.conn.kind === 'owned-box') {
+      out.push({ userId: agent.conn.user.id, instanceId: id });
+    }
+  }
+  for (const [userId, agent] of userAgents) {
+    if (agent.ws.readyState === WebSocket.OPEN) out.push({ userId, instanceId: null });
+  }
+  return out;
 }
 
 export function getAgent(userId: string): ConnectedAgent | null {
@@ -150,6 +511,40 @@ export function getInstanceAgent(instanceId: string): ConnectedAgent | null {
   const agent = instanceAgents.get(instanceId);
   if (!agent || agent.ws.readyState !== WebSocket.OPEN) return null;
   return agent;
+}
+
+/** The agent holding a stream's PTY: the project's box agent, or the owner's legacy agent. */
+function streamAgent(stream: TerminalStream): ConnectedAgent | null {
+  return stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(stream.userId);
+}
+
+/** Who a box's agent is, what it can do, and the commit it runs: for credential delivery, box updates and clones. */
+export function instanceAgentTransport(instanceId: string): {
+  conn: AgentConnection; capabilities: string[]; agentCommit: string | null; agentCommitAt: Date | null; helloReceived: boolean;
+} | null {
+  const agent = getInstanceAgent(instanceId);
+  return agent
+    ? { conn: agent.conn, capabilities: agent.capabilities, agentCommit: agent.agentCommit, agentCommitAt: agent.agentCommitAt, helloReceived: agent.helloReceived }
+    : null;
+}
+
+/** Every connected agent of a box somebody owns, with what its hello said: for the box-update sweep. */
+export function connectedOwnedBoxes(): ConnectedOwnedBox[] {
+  const out: ConnectedOwnedBox[] = [];
+  for (const a of instanceAgents.values()) {
+    if (a.conn.kind !== 'owned-box' || a.ws.readyState !== WebSocket.OPEN) continue;
+    out.push({ instance: a.conn.instance, user: a.conn.user, agentCommit: a.agentCommit, capabilities: a.capabilities });
+  }
+  return out;
+}
+
+/** The connected boxes this user owns. */
+export function connectedOwnedBoxIds(userId: string): string[] {
+  const out: string[] = [];
+  for (const [instanceId, a] of instanceAgents) {
+    if (a.conn.kind === 'owned-box' && a.conn.user.id === userId && a.ws.readyState === WebSocket.OPEN) out.push(instanceId);
+  }
+  return out;
 }
 
 export function isAgentConnected(userId: string): boolean {
@@ -259,59 +654,52 @@ export async function requestInstanceTerminalStream(
   }
 }
 
-export function sendTerminalInput(userId: string, streamId: string, data: string): void {
+function sendToStreamAgent(streamId: string, msg: Record<string, unknown>): void {
   const stream = terminalStreams.get(streamId);
-  if (!stream) return;
-  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(userId);
+  const agent = stream && streamAgent(stream);
   if (!agent) return;
-  agent.ws.send(JSON.stringify({ type: 'terminal-input', streamId, data }));
+  agent.ws.send(JSON.stringify({ ...msg, streamId }));
 }
 
-export function sendTerminalPasteImage(userId: string, streamId: string, data: string): void {
-  const stream = terminalStreams.get(streamId);
-  if (!stream) return;
-  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(userId);
-  if (!agent) return;
-  agent.ws.send(JSON.stringify({ type: 'terminal-paste-image', streamId, data }));
+export function sendTerminalInput(streamId: string, data: string): void {
+  sendToStreamAgent(streamId, { type: 'terminal-input', data });
 }
 
-export function sendTerminalResize(userId: string, streamId: string, cols: number, rows: number): void {
-  const stream = terminalStreams.get(streamId);
-  if (!stream) return;
-  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(userId);
-  if (!agent) return;
-  agent.ws.send(JSON.stringify({ type: 'terminal-resize', streamId, cols, rows }));
+export function sendTerminalPasteImage(streamId: string, data: string): void {
+  sendToStreamAgent(streamId, { type: 'terminal-paste-image', data });
 }
 
-export function sendTerminalMouse(userId: string, streamId: string, enabled: boolean): void {
-  const stream = terminalStreams.get(streamId);
-  if (!stream) return;
-  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(userId);
-  if (!agent) return;
-  agent.ws.send(JSON.stringify({ type: 'terminal-mouse', streamId, enabled }));
+export function sendTerminalResize(streamId: string, cols: number, rows: number): void {
+  sendToStreamAgent(streamId, { type: 'terminal-resize', cols, rows });
+}
+
+export function sendTerminalMouse(streamId: string, enabled: boolean): void {
+  sendToStreamAgent(streamId, { type: 'terminal-mouse', enabled });
 }
 
 export function closeTerminalStream(streamId: string): void {
-  const stream = terminalStreams.get(streamId);
+  sendToStreamAgent(streamId, { type: 'terminal-close' });
   terminalStreams.delete(streamId);
-  if (!stream) return;
-
-  const agent = stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(stream.userId);
-  if (agent) {
-    agent.ws.send(JSON.stringify({ type: 'terminal-close', streamId }));
-  }
 }
 
 /**
  * Connected agents — for diagnostics. Includes both legacy and instance-bound.
+ *
+ * Ownerless warm-pool agents are skipped rather than widening userId to null.
+ * The only consumers are the per-user token-usage sampler and the usage route,
+ * both of which key everything by user; a warm box has nobody to attribute
+ * usage to, and a null would reach `tokenUsageSampler.runUserScan`, which
+ * reads `hosts[0].unixUsername` as a path root.
  */
 export function getConnectedAgents(): Array<{ userId: string; unixUsername: string; instanceId: string | null }> {
   const out: Array<{ userId: string; unixUsername: string; instanceId: string | null }> = [];
   for (const a of userAgents.values()) {
-    out.push({ userId: a.user.id, unixUsername: a.user.unixUsername, instanceId: null });
+    if (a.conn.kind !== 'user-agent') continue;
+    out.push({ userId: a.conn.user.id, unixUsername: a.conn.user.unixUsername, instanceId: null });
   }
   for (const a of instanceAgents.values()) {
-    out.push({ userId: a.user.id, unixUsername: a.user.unixUsername, instanceId: a.instanceId });
+    if (a.conn.kind !== 'owned-box') continue;
+    out.push({ userId: a.conn.user.id, unixUsername: a.conn.user.unixUsername, instanceId: a.conn.instance.id });
   }
   return out;
 }

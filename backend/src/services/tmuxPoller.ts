@@ -28,7 +28,7 @@ const WORKING_COOLDOWN_MS = 4000;
 const ESTIMATED_WINDOW_TOKENS = 200_000;
 const SESSION_RESET_THRESHOLD = 15;
 const PERSIST_INTERVAL_MS = 60_000;
-const USAGE_FILE = '/var/tmp/termag-poller-usage.json';
+const USAGE_FILE = process.env.TMUX_POLLER_USAGE_FILE || '/var/tmp/termag-poller-usage.json';
 
 // ── Session state ───────────────────────────────────────────
 
@@ -54,6 +54,11 @@ const sessionUsage = new Map<string, SessionUsageState>();
 const usageByUser = new Map<string, Map<string, DailyUsage>>();
 let pollTimer: NodeJS.Timeout | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
+// Leadership can come and go (services/orchestratorDrain.ts), so starts and
+// stops interleave. A start awaits the database before arming its timers: a
+// stop in that window bumps the generation, and the start then arms nothing.
+let generation = 0;
+let starting: Promise<void> | null = null;
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -114,13 +119,13 @@ function recordContextPct(tmuxSession: string, pct: number): void {
 }
 
 /** Get estimated usage data for a user from polled providers */
-export function getPollerUsage(username: string): Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number; calls: number }> {
-  const result: Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number; calls: number }> = {};
+export function getPollerUsage(username: string): Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number; reasoning: number; calls: number }> {
+  const result: Record<string, { input: number; output: number; cacheRead: number; cacheCreate: number; reasoning: number; calls: number }> = {};
 
   const userMap = usageByUser.get(username);
   if (userMap) {
     for (const [date, day] of userMap) {
-      result[date] = { input: day.completedTokens, output: 0, cacheRead: 0, cacheCreate: 0, calls: day.calls };
+      result[date] = { input: day.completedTokens, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: day.calls };
     }
   }
 
@@ -130,7 +135,7 @@ export function getPollerUsage(username: string): Record<string, { input: number
     if (state.sessionPeakPct <= 0) continue;
     const activeTokens = Math.round((state.sessionPeakPct / 100) * ESTIMATED_WINDOW_TOKENS);
     if (!result[today]) {
-      result[today] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
+      result[today] = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 0 };
     }
     result[today].input += activeTokens;
   }
@@ -320,7 +325,17 @@ export function unregisterPollerSession(tmuxSession: string): void {
   }
 }
 
-export async function startTmuxPoller(): Promise<void> {
+export function startTmuxPoller(): Promise<void> {
+  if (pollTimer) return Promise.resolve();
+  // A second start while one is in flight joins it rather than arming a
+  // second set of timers.
+  if (starting) return starting;
+  const mine = ++generation;
+  starting = runStart(mine).finally(() => { if (generation === mine) starting = null; });
+  return starting;
+}
+
+async function runStart(mine: number): Promise<void> {
   loadUsage();
 
   // Register all non-archived workflows for providers that need polling
@@ -339,10 +354,12 @@ export async function startTmuxPoller(): Promise<void> {
     }
   }
 
+  if (generation !== mine) return;
   if (polledSessions.size > 0) {
     console.log(`[TMUX-POLLER] Starting with ${polledSessions.size} session(s)`);
     await pollAll();
   }
+  if (generation !== mine) return;
 
   pollTimer = setInterval(() => {
     pollAll().catch(err => console.error('[TMUX-POLLER] Poll error:', err));
@@ -352,6 +369,8 @@ export async function startTmuxPoller(): Promise<void> {
 }
 
 export function stopTmuxPoller(): void {
+  generation++;
+  starting = null;
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   if (persistTimer) { clearInterval(persistTimer); persistTimer = null; }
   persistUsage();

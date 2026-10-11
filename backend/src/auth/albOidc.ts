@@ -1,41 +1,87 @@
-import jwt, { JwtHeader } from 'jsonwebtoken';
+import { AlbJwtVerifier } from 'aws-jwt-verify';
 import type { Request } from 'express';
+import { identityFromClaims } from './oidc';
 
 // Verifies the identity AWS ALB injects after its authenticate-oidc action.
 //
 // When the ALB's listener authenticates a user against Okta, it forwards the
-// request with an `x-amzn-oidc-data` header: a JWT (ES256) whose claims are the
-// OIDC userinfo (email, name, sub). The JWT is signed by the ALB with a
-// per-region key; we fetch the public key by `kid` from the regional endpoint
-// and verify the signature so a request that reaches the instance WITHOUT going
-// through the ALB (e.g. directly inside the VPC) cannot spoof an identity.
+// request with an `x-amzn-oidc-data` header: an ES256 JWT whose claims are the
+// OIDC userinfo (email, name, sub), signed with a per-region key the ALB
+// publishes by `kid`. Verifying it is what stops a request that reaches the
+// instance WITHOUT going through the ALB (e.g. directly inside the VPC) from
+// spoofing an identity.
+//
+// aws-jwt-verify's AlbJwtVerifier does the verification, not a generic JWT
+// library: the ALB pads its base64 segments with `=`, which jsonwebtoken/jws
+// reject outright ("not a valid JWT") and which the signature covers, so they
+// can't simply be stripped. It also enforces the three pins that make the
+// header trustworthy at all. ALB signing keys are shared by every ALB in the
+// region, so `signer` must be ours; `client` must be our Okta app; `iss` must be
+// our Okta issuer.
 //
 // Docs: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html#user-claims-encoding
 
 const HEADER = 'x-amzn-oidc-data';
 
-// kid -> PEM public key. Keys are stable per region/ALB; cache to avoid a fetch
-// on every request.
-const keyCache = new Map<string, string>();
+const REQUIRED_VARS = ['ALB_ARN', 'ALB_OIDC_ISSUER', 'ALB_OIDC_CLIENT_ID'] as const;
 
-function regionFromEnv(): string {
-  return process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? 'us-east-1';
+export interface AlbVerifierConfig {
+  albArn: string;
+  issuer: string;
+  clientId: string;
 }
 
-async function fetchPublicKey(kid: string): Promise<string> {
-  const cached = keyCache.get(kid);
-  if (cached) return cached;
-
-  const region = regionFromEnv();
-  const url = `https://public-keys.auth.elb.${region}.amazonaws.com/${kid}`;
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    throw new Error(`failed to fetch ALB OIDC public key ${kid}: HTTP ${resp.status}`);
+/** Read and validate the okta-mode verifier config; throws naming every missing variable. */
+export function albVerifierConfigFromEnv(env: NodeJS.ProcessEnv): AlbVerifierConfig {
+  const missing = REQUIRED_VARS.filter(k => !env[k]?.trim());
+  if (missing.length > 0) {
+    throw new Error(`AUTH_MODE=okta requires ${missing.join(', ')} to be set`);
   }
-  const pem = (await resp.text()).trim();
-  keyCache.set(kid, pem);
-  return pem;
+  return {
+    albArn: env.ALB_ARN!.trim(),
+    issuer: env.ALB_OIDC_ISSUER!.trim(),
+    clientId: env.ALB_OIDC_CLIENT_ID!.trim(),
+  };
 }
+
+export function createAlbVerifier(
+  cfg: AlbVerifierConfig,
+  additional?: Parameters<typeof AlbJwtVerifier.create>[1],
+) {
+  return AlbJwtVerifier.create(
+    {
+      albArn: cfg.albArn,
+      clientId: cfg.clientId,
+      // The library checks iss and exp only on the payload, and skips exp when
+      // it's absent. The ALB always sets both on the (signed) header, while the
+      // payload is built from the IdP's userinfo, so check the header and also
+      // any iss the payload carries (the library still checks a payload exp).
+      // Without the header exp check a payload-exp-less token never expires.
+      issuer: null,
+      customJwtCheck: ({ header, payload }) => {
+        if (typeof header.exp !== 'number') {
+          throw new Error('ALB JWT header has no exp');
+        }
+        if (header.exp < Date.now() / 1000) {
+          throw new Error(`ALB JWT expired at ${new Date(header.exp * 1000).toISOString()}`);
+        }
+        if (header.iss !== cfg.issuer) {
+          throw new Error(`ALB JWT header iss ${String(header.iss)} is not ${cfg.issuer}`);
+        }
+        if (payload.iss !== undefined && payload.iss !== cfg.issuer) {
+          throw new Error(`ALB JWT payload iss ${String(payload.iss)} is not ${cfg.issuer}`);
+        }
+      },
+    },
+    additional,
+  );
+}
+
+type AlbVerifier = ReturnType<typeof createAlbVerifier>;
+
+// Built on first use so google/oidc deployments never read the okta variables.
+// The verifier caches the ALB public key by kid.
+let defaultVerifier: AlbVerifier | undefined;
 
 export interface AlbIdentity {
   email: string;
@@ -46,41 +92,15 @@ export interface AlbIdentity {
 /**
  * Verify and decode the ALB `x-amzn-oidc-data` identity. Returns null when the
  * header is absent (e.g. a machine/token request that bypassed edge auth) and
- * throws when the header is present but invalid (tampered/expired) so callers
- * fail closed.
+ * throws when the header is present but invalid (tampered/expired/wrong ALB)
+ * so callers fail closed.
  */
-export async function verifyAlbIdentity(req: Request): Promise<AlbIdentity | null> {
+export async function verifyAlbIdentity(req: Request, verifier?: AlbVerifier): Promise<AlbIdentity | null> {
   const raw = req.headers[HEADER];
   const token = Array.isArray(raw) ? raw[0] : raw;
   if (!token) return null;
 
-  const decoded = jwt.decode(token, { complete: true });
-  if (!decoded || typeof decoded === 'string') {
-    throw new Error('ALB OIDC data is not a valid JWT');
-  }
-  const header = decoded.header as JwtHeader;
-  if (!header.kid || header.alg !== 'ES256') {
-    throw new Error(`unexpected ALB OIDC JWT header (alg=${header.alg}, kid=${header.kid ?? 'none'})`);
-  }
-
-  // Optionally pin the signing ALB to ours when ALB_ARN is configured.
-  const expectedSigner = process.env.ALB_ARN;
-  const signer = (header as unknown as Record<string, unknown>).signer;
-  if (expectedSigner && signer !== expectedSigner) {
-    throw new Error('ALB OIDC JWT signer does not match the configured ALB');
-  }
-
-  const pem = await fetchPublicKey(header.kid);
-  const claims = jwt.verify(token, pem, { algorithms: ['ES256'] }) as Record<string, unknown>;
-
-  const email = typeof claims.email === 'string' ? claims.email : '';
-  const sub = typeof claims.sub === 'string' ? claims.sub : '';
-  if (!email || !sub) {
-    throw new Error('ALB OIDC identity is missing email/sub claims');
-  }
-  return {
-    email,
-    sub,
-    name: typeof claims.name === 'string' ? claims.name : undefined,
-  };
+  const v = verifier ?? (defaultVerifier ??= createAlbVerifier(albVerifierConfigFromEnv(process.env)));
+  const claims = await v.verify(token);
+  return identityFromClaims(claims as Record<string, unknown>);
 }

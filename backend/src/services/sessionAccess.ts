@@ -20,7 +20,9 @@ import { prisma } from '../db';
 import { sessionName } from './tmux';
 import type { ProjectHost } from './agentRegistry';
 
-export const SESSION_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl'] as const;
+// `review` is the Devin PR-review pane the UI's Review button starts next to
+// the ctrl pane (routes/review.ts). It exists only while a review runs.
+export const SESSION_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl', 'review'] as const;
 export type SessionRole = typeof SESSION_ROLES[number];
 
 export function isSessionRole(x: unknown): x is SessionRole {
@@ -35,6 +37,15 @@ export function legalSessions(owner: string, projectName: string, workstreams: s
     for (const role of SESSION_ROLES) out.push(sessionName(owner, projectName, role, ws));
   }
   return out;
+}
+
+/**
+ * Pure: is a project's host the one the caller's agent token belongs to?
+ * `agentInstanceId` is undefined for a browser session (no host) and null for a
+ * per-user token, whose host is the one box-less (instanceId null) projects run on.
+ */
+export function isOnCallerHost(projectInstanceId: string | null, agentInstanceId: string | null | undefined): boolean {
+  return agentInstanceId !== undefined && projectInstanceId === agentInstanceId;
 }
 
 export class SessionAccessError extends Error {

@@ -3,7 +3,7 @@
  *
  * Container platforms typically inject a Postgres connection as discrete
  * PG_* variables (host, port, database, user, password) rather than a single
- * DSN — and some (Aurora behind RDS Proxy on Shepherd) hand out no password at
+ * DSN — and some (Aurora behind RDS Proxy) hand out no password at
  * all: the client mints a short-lived IAM auth token per connection instead.
  * Everything here is pure (no process.env access, no filesystem) so it is
  * unit-testable; the side-effecting bits live in ./bootstrap and ../db.
@@ -46,7 +46,7 @@ export function isTruthy(value: string | undefined): boolean {
 /**
  * The discrete connection parameters, or null when the PG_* set is incomplete.
  * PG_USERNAME is preferred; PG_USER is accepted for platforms that use libpq's
- * spelling (Shepherd's migration container sets PG_USER=migration).
+ * spelling (a migration container may set PG_USER=migration).
  */
 export function pgConnectionFromEnv(env: PgEnv): PgConnection | null {
   const host = env.PG_HOST?.trim();
@@ -158,4 +158,90 @@ export function prismaSslParams(ssl: PgSslConfig): Record<string, string> {
     case 'verify':
       return { sslmode: 'require', sslcert: ssl.caFile, sslaccept: 'strict' };
   }
+}
+
+// ── Observability: where this deployment's telemetry goes ────────────────────
+
+export interface OtlpDestinationEnv {
+  /** HTTPS origin of an OTLP/HTTP collector. */
+  OBSERVABILITY_OTLP_ENDPOINT?: string;
+  /** Routing key the collector files this deployment's telemetry under. */
+  OBSERVABILITY_PROJECT?: string;
+}
+
+/** An OTLP destination: the routing key and the collector endpoint. */
+export interface OtlpDestination {
+  project: string;
+  endpoint: string;
+}
+
+const HTTPS_ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(?::\d+)?$/;
+const PROJECT_KEY = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * The same rule as deploy/termag-otelcol-env, which ships the orchestrator's
+ * own logs: both variables must be set and well-formed, or there is no
+ * destination. No telemetry beats telemetry to a guessed collector, and the
+ * answer must agree with the host collector's, which refuses a malformed value
+ * rather than fall back. What a box's runner session is handed
+ * (services/claudeRunnerSpawn.ts).
+ */
+export function otlpDestinationFromEnv(env: OtlpDestinationEnv): OtlpDestination | null {
+  const project = env.OBSERVABILITY_PROJECT?.trim();
+  if (!project || !PROJECT_KEY.test(project)) return null;
+  const endpoint = env.OBSERVABILITY_OTLP_ENDPOINT?.trim().replace(/\/+$/, '');
+  if (!endpoint || !HTTPS_ORIGIN.test(endpoint)) return null;
+  return { project, endpoint };
+}
+
+// ── Warm pool ─────────────────────────────────────────────────────────────────
+
+export interface WarmPoolEnv {
+  WARM_POOL_TARGET_SIZE?: string;
+  WARM_POOL_MAX_INFLIGHT?: string;
+  WARM_POOL_RECONCILE_SECONDS?: string;
+  WARM_POOL_MAX_AGE_HOURS?: string;
+}
+
+export interface WarmPoolConfig {
+  /** Claimable warm boxes to hold. 0 drains the pool and sends every claim down the cold path. */
+  targetSize: number;
+  /** Concurrent `warming` launches, so a refill storm cannot starve a real cold provision. */
+  maxInFlight: number;
+  reconcileMs: number;
+  /** A warm box older than this is stale and gets replaced, then retired. */
+  maxAgeMs: number;
+}
+
+export const WARM_POOL_DEFAULTS: Readonly<WarmPoolConfig> = {
+  // Zero, so the pool costs nothing until a deployment opts in by setting
+  // the variable.
+  targetSize: 0,
+  maxInFlight: 2,
+  reconcileMs: 60_000,
+  maxAgeMs: 24 * 60 * 60 * 1000,
+};
+
+export function warmPoolConfigFromEnv(env: WarmPoolEnv): WarmPoolConfig {
+  return {
+    targetSize: wholeNumber(env.WARM_POOL_TARGET_SIZE, WARM_POOL_DEFAULTS.targetSize),
+    // 0 is honoured here and is the pool's kill switch: it holds whatever is
+    // already warm and launches nothing more.
+    maxInFlight: wholeNumber(env.WARM_POOL_MAX_INFLIGHT, WARM_POOL_DEFAULTS.maxInFlight),
+    reconcileMs: positiveNumber(env.WARM_POOL_RECONCILE_SECONDS, WARM_POOL_DEFAULTS.reconcileMs / 1000) * 1000,
+    maxAgeMs: positiveNumber(env.WARM_POOL_MAX_AGE_HOURS, WARM_POOL_DEFAULTS.maxAgeMs / 3_600_000) * 3_600_000,
+  };
+}
+
+// Anything that is not a plain run of digits falls back. parseInt would read
+// "2 boxes" as 2 and "2.9" as 2; a knob that launches EC2 instances should not
+// guess at what a typo meant.
+function wholeNumber(raw: string | undefined, fallback: number): number {
+  const trimmed = (raw ?? '').trim();
+  return /^\d+$/.test(trimmed) ? parseInt(trimmed, 10) : fallback;
+}
+
+function positiveNumber(raw: string | undefined, fallback: number): number {
+  const n = wholeNumber(raw, fallback);
+  return n > 0 ? n : fallback;
 }

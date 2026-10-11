@@ -13,6 +13,7 @@
  * services/sessionAccess.ts, which every MCP call hits.
  */
 import { join } from 'path';
+import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { WorkflowType } from '@prisma/client';
 import { prisma } from '../db';
@@ -20,6 +21,8 @@ import * as tmux from './tmux';
 import { isProjectAgentConnected, sendForProject, ProjectHost } from './agentRegistry';
 import { ensureMainWorkstream } from './workstreams';
 import { ensureAgentSessionsAndLaunch } from './agentRuntime';
+import { ensureHostSetup, hostAgentUnavailableResponse } from './hostSetup';
+import { HostUnixUsernameError } from './hostUnixUsername';
 
 export const METATERM_NAME = 'MetaTerm';
 export const METATERM_KIND = 'metaterm';
@@ -28,8 +31,14 @@ const METATERM_PROVIDER = 'claude';
 // The MCP server ships in the repo at <repo>/metaterm/mcp-server.mjs. From
 // backend/dist/services/ that is three levels up (same trick as
 // WIKI_TEMPLATE_PATH in tmux.ts). Baked into /opt/termag on the orchestrator.
+// Claude runs the MCP server as the user, with their agent token, so prefer the
+// root-owned copy the orchestrator image installs: /opt/termag (the checkout
+// fallback) belongs to the termag service user, which must not be able to
+// change what runs as everyone. .mcp.json is rewritten on every open, so the
+// path follows the image.
+const ROOT_OWNED_MCP_SERVER = '/usr/local/lib/termag/metaterm/mcp-server.mjs';
 const MCP_SERVER_PATH = process.env.METATERM_MCP_PATH
-  ?? join(__dirname, '../../..', 'metaterm', 'mcp-server.mjs');
+  ?? (existsSync(ROOT_OWNED_MCP_SERVER) ? ROOT_OWNED_MCP_SERVER : join(__dirname, '../../..', 'metaterm', 'mcp-server.mjs'));
 // Where the MCP server reaches the backend. On the orchestrator the nginx
 // gateway fronts the backend on :3040 under /termag.
 const METATERM_API_URL = process.env.METATERM_API_URL ?? 'http://localhost:3040/termag';
@@ -130,7 +139,9 @@ export async function seedMetaTermFiles(dir: string, fs: SeedFs = localSeedFs): 
       metaterm: {
         command: 'node',
         args: [MCP_SERVER_PATH],
-        env: { TERMAG_URL: METATERM_API_URL },
+        // Boxes register the same server with send_keys off by default; the
+        // orchestrator MetaTerm exists to drive sessions, so it stays on.
+        env: { TERMAG_URL: METATERM_API_URL, METATERM_SEND_KEYS_DEFAULT: 'on' },
       },
     },
   }, null, 2) + '\n', { always: true });
@@ -180,6 +191,14 @@ export async function ensureMetaTerm(user: { id: string; unixUsername: string })
   // fallback only works where the backend runs as the user (dev).
   const host: ProjectHost = { userId: user.id, instanceId: null };
   const viaAgent = isProjectAgentConnected(host);
+  const unavailable = hostAgentUnavailableResponse(user, viaAgent);
+  if (unavailable?.status === 400) {
+    throw new HostUnixUsernameError(user.unixUsername);
+  }
+  if (unavailable) {
+    void ensureHostSetup(user);
+    throw new MetaTermUnavailableError(unavailable.error);
+  }
   const dir = tmux.projectDir(user.unixUsername, METATERM_NAME);
   const seedFs = viaAgent ? agentSeedFs(host) : localSeedFs;
 

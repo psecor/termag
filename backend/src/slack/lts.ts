@@ -9,6 +9,7 @@ import { Router, RequestHandler } from 'express';
 import { prisma as prismaClient } from '../db';
 import { formatPaneForSlack } from '../services/tmux';
 import { setStatus, notifyStatusChange } from '../services/status';
+import { instanceKey, LEGACY_INSTANCE_KEY, notificationCacheKey, targetsForInstance } from './notificationTargetKey';
 import type { WebClient } from '@slack/web-api';
 
 
@@ -75,33 +76,86 @@ export interface NotificationTargetInfo {
   userId: string;
 }
 
-// Cache key: "tmuxSession:platform"
-function cacheKey(tmuxName: string, platform: string): string {
-  return `${tmuxName}:${platform}`;
-}
-
-export function setNotificationTarget(tmuxName: string, target: { channel: string; userId: string }, platform: 'slack' | 'discord' = 'slack'): void {
-  notificationTargets.set(cacheKey(tmuxName, platform), target);
-  // Persist to DB (fire-and-forget)
+export function setNotificationTarget(
+  tmuxName: string,
+  target: { channel: string; userId: string },
+  platform: 'slack' | 'discord' = 'slack',
+  instanceId: string | null = null,
+): void {
+  const storedInstance = instanceKey(instanceId);
+  notificationTargets.set(notificationCacheKey(tmuxName, platform, storedInstance), target);
   prismaClient.notificationTarget.upsert({
-    where: { tmuxSession_platform: { tmuxSession: tmuxName, platform } },
+    where: { tmuxSession_platform_instanceId: { tmuxSession: tmuxName, platform, instanceId: storedInstance } },
     update: { channel: target.channel, userId: target.userId },
-    create: { tmuxSession: tmuxName, platform, channel: target.channel, userId: target.userId },
+    create: { tmuxSession: tmuxName, platform, instanceId: storedInstance, channel: target.channel, userId: target.userId },
   }).catch(err => console.error('[LTS] Failed to persist notification target:', err.message));
 }
 
-export async function getNotificationTarget(tmuxName: string, platform: 'slack' | 'discord' = 'slack'): Promise<{ channel: string; userId: string } | undefined> {
-  const key = cacheKey(tmuxName, platform);
+/**
+ * Re-key every notification target for a tmux session after the session was
+ * renamed (workstream rename). Covers both the instance-specific rows and the
+ * legacy ''-instance rows the lookup falls back to, so Slack/Discord "needs
+ * input" routing follows the pane. Cache entries move with them.
+ */
+export async function renameNotificationTargets(
+  fromTmuxName: string,
+  toTmuxName: string,
+  instanceId: string | null = null,
+): Promise<void> {
+  const instances = new Set([instanceKey(instanceId), LEGACY_INSTANCE_KEY]);
+  for (const inst of instances) {
+    for (const platform of ['slack', 'discord'] as const) {
+      const key = notificationCacheKey(fromTmuxName, platform, inst);
+      const cached = notificationTargets.get(key);
+      if (cached) {
+        notificationTargets.delete(key);
+        notificationTargets.set(notificationCacheKey(toTmuxName, platform, inst), cached);
+      }
+    }
+  }
+  try {
+    // Two-step so a pre-existing row under the new name does not trip the PK.
+    await prismaClient.notificationTarget.deleteMany({
+      where: { tmuxSession: toTmuxName, instanceId: { in: [...instances] } },
+    });
+    await prismaClient.notificationTarget.updateMany({
+      where: { tmuxSession: fromTmuxName, instanceId: { in: [...instances] } },
+      data: { tmuxSession: toTmuxName },
+    });
+  } catch (err) {
+    console.error('[LTS] Failed to re-key notification targets:', (err as Error).message);
+  }
+}
+
+export async function getNotificationTarget(
+  tmuxName: string,
+  platform: 'slack' | 'discord' = 'slack',
+  instanceId: string | null = null,
+): Promise<{ channel: string; userId: string } | undefined> {
+  const key = notificationCacheKey(tmuxName, platform, instanceId);
   const cached = notificationTargets.get(key);
   if (cached) return cached;
   try {
     const row = await prismaClient.notificationTarget.findUnique({
-      where: { tmuxSession_platform: { tmuxSession: tmuxName, platform } },
+      where: { tmuxSession_platform_instanceId: { tmuxSession: tmuxName, platform, instanceId: instanceKey(instanceId) } },
     });
     if (row) {
       const target = { channel: row.channel, userId: row.userId };
       notificationTargets.set(key, target);
       return target;
+    }
+    if (instanceKey(instanceId) !== '') {
+      const legacyKey = notificationCacheKey(tmuxName, platform, null);
+      const cachedLegacy = notificationTargets.get(legacyKey);
+      if (cachedLegacy) return cachedLegacy;
+      const legacy = await prismaClient.notificationTarget.findUnique({
+        where: { tmuxSession_platform_instanceId: { tmuxSession: tmuxName, platform, instanceId: '' } },
+      });
+      if (legacy) {
+        const target = { channel: legacy.channel, userId: legacy.userId };
+        notificationTargets.set(legacyKey, target);
+        return target;
+      }
     }
   } catch (err) {
     console.error('[LTS] Failed to read notification target:', (err as Error).message);
@@ -109,12 +163,19 @@ export async function getNotificationTarget(tmuxName: string, platform: 'slack' 
   return undefined;
 }
 
-export async function getAllNotificationTargets(tmuxName: string): Promise<NotificationTargetInfo[]> {
+export async function getAllNotificationTargets(
+  tmuxName: string,
+  instanceId: string | null = null,
+): Promise<NotificationTargetInfo[]> {
   try {
+    const key = instanceKey(instanceId);
     const rows = await prismaClient.notificationTarget.findMany({
-      where: { tmuxSession: tmuxName },
+      where: {
+        tmuxSession: tmuxName,
+        instanceId: key === '' ? '' : { in: [key, ''] },
+      },
     });
-    return rows.map(r => ({
+    return targetsForInstance(rows, tmuxName, instanceId).map(r => ({
       platform: r.platform as 'slack' | 'discord',
       channel: r.channel,
       userId: r.userId,
@@ -254,7 +315,7 @@ export function ltsRouter(
 
     // Slack notifications
     if (notify && slackClient) {
-      const target = notificationTargets.get(name);
+      const target = notificationTargets.get(notificationCacheKey(name, 'slack', null));
       if (target) {
         const entry = sessionStatusMap.get(name)!;
         const timeSinceNotify = entry.lastNotifiedAt ? now - entry.lastNotifiedAt : Infinity;

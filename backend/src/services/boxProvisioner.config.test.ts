@@ -46,6 +46,12 @@ describe('getBoxConfig', () => {
     expect(cfg.instanceType).toBe('t4g.medium');
     expect(cfg.managedTag).toBe('termag-box');
     expect(cfg.rootVolumeGb).toBe(120);
+    expect(cfg.hibernationEnabled).toBe(false);
+  });
+
+  it('turns hibernation-capable launches on only for BOX_HIBERNATION_ENABLED=true', () => {
+    expect(getBoxConfig({ ...REQUIRED, BOX_HIBERNATION_ENABLED: 'true' })!.hibernationEnabled).toBe(true);
+    expect(getBoxConfig({ ...REQUIRED, BOX_HIBERNATION_ENABLED: '1' })!.hibernationEnabled).toBe(false);
   });
 });
 

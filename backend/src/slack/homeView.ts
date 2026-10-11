@@ -72,7 +72,7 @@ async function buildHomeView(slackUserId: string, client?: WebClient) {
         const agentSessionN = sessionName(project.user.unixUsername, project.name, 'agent');
 
         const ltsStatus = getClaudeSessionStatus(agentSessionN);
-        const webStatus = getStatus(agentSessionN);
+        const webStatus = getStatus(agentSessionN, project.instanceId);
         const statusInfo = (ltsStatus.lastStatusAt ?? 0) >= (webStatus.updatedAt?.getTime() ?? 0)
           ? ltsStatus
           : { claudeStatus: webStatus.status, lastStatusAt: webStatus.updatedAt?.getTime() ?? null };

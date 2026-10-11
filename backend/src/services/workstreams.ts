@@ -18,17 +18,36 @@ async function detectDefaultBranch(dir: string): Promise<string> {
   }
 }
 
+export function mainWorkstreamBranch(input: {
+  requested?: string | null;
+  instanceId: string | null;
+  detected: string;
+}): string {
+  const requested = input.requested?.trim();
+  if (requested) return requested;
+  if (input.instanceId) return 'main';
+  return input.detected.trim() || 'main';
+}
+
 export async function ensureMainWorkstream(
   projectId: string,
+  opts?: { branch?: string },
 ): Promise<{ id: string; name: string }> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
-    select: { name: true, user: { select: { unixUsername: true } } },
+    select: { name: true, instanceId: true, user: { select: { unixUsername: true } } },
   });
 
-  const branch = project
-    ? await detectDefaultBranch(projectDir(project.user.unixUsername, project.name))
-    : 'main';
+  const requested = opts?.branch;
+  let detected = 'main';
+  if (project && !requested?.trim() && !project.instanceId) {
+    detected = await detectDefaultBranch(projectDir(project.user.unixUsername, project.name));
+  }
+  const branch = mainWorkstreamBranch({
+    requested,
+    instanceId: project?.instanceId ?? null,
+    detected,
+  });
 
   return prisma.workstream.upsert({
     where: { projectId_name: { projectId, name: 'main' } },

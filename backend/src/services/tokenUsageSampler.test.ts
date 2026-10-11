@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeScanResponse, resolveRows, buildUsageResponse, emptyDay, UsageRowAgg } from './tokenUsageSampler';
 
-const day = (input: number, calls = 1) => ({ input, output: 0, cacheRead: 0, cacheCreate: 0, calls });
+const day = (input: number, calls = 1) => ({ input, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls });
 const tok = (d: { input: number; output: number; cacheRead: number; cacheCreate: number }) => d.input + d.output + d.cacheRead + d.cacheCreate;
 
 describe('normalizeScanResponse', () => {
@@ -39,7 +39,7 @@ describe('normalizeScanResponse', () => {
   it('ignores malformed dates and non-numeric fields', () => {
     const n = normalizeScanResponse({ providers: { claude: { nope: day(1), '2026-09-19': { input: 'x', calls: 2 } } } });
     expect(n.rows).toHaveLength(1);
-    expect(n.rows[0].day).toEqual({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 2 });
+    expect(n.rows[0].day).toEqual({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 2 });
   });
 });
 
