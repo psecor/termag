@@ -1,0 +1,28 @@
+{
+  "name": "@termag/cli",
+  "version": "0.1.0",
+  "description": "termag command line: manage termag boxes and projects",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "termag": "./bin/termag.js"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.11"
+  }
+}

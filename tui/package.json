@@ -1,0 +1,35 @@
+{
+  "name": "@termag/tui",
+  "version": "0.1.0",
+  "description": "Terminal UI for termag (run as `termag tui`): lobby, peek, send-a-line and tmux attach for your projects' agent sessions",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "termag-tui": "./bin/termag-tui.js"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.tsx",
+    "start": "node bin/termag-tui.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.2"
+  }
+}
