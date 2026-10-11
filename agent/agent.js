@@ -14,14 +14,25 @@
 
 const WebSocket = require('ws');
 const pty = require('node-pty');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const { mkdir } = require('fs/promises');
 const { promisify } = require('util');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const net = require('net');
+const { sendKeysArgv, enterArgv, captureArgv, tailLines, newSessionArgv, newSessionOptionArgvs, tmuxSessionTarget, CAPABILITIES: TMUX_CAPABILITIES } = require('./tmux-args');
+const hostSample = require('./host-sample');
+const runnerSessions = require('./runner-sessions');
+const { renameProject } = require('./project-rename');
+const { gitBranchState } = require('./git-branch-state');
+const { dialArgs, refusedForWantOfQueryToken, redialDelayMs, DRAIN_CLOSE_CODE } = require('./agent-dial');
+const credentials = require('./credentials');
+const { planOnClaim, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
+const boxUpdate = require('./box-update');
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Load config. Resolution order:
 //   1. process.argv[2] (explicit path, useful for systemd unit per-user configs)
@@ -119,6 +130,61 @@ const { readdir, readFile, stat } = require('fs/promises');
 const { createScanner } = require('./usage-scanner');
 const usageScanner = createScanner({ home: process.env.HOME || '/home', pathRemap: path_remap });
 
+// ── Background scan plumbing ──────────────────────────────────────────────
+// Every call a periodic scan makes is bounded, and the next run is armed only
+// once the previous one settles, so a wedged tmux server or an unresponsive
+// backend delays scans instead of stacking child processes and sockets.
+const TMUX_QUERY_TIMEOUT_MS = 10_000;
+const STATUS_HTTP_TIMEOUT_MS = 10_000;
+
+function tmuxQuery(args) {
+  return execFileAsync('tmux', args, { timeout: TMUX_QUERY_TIMEOUT_MS, killSignal: 'SIGKILL' });
+}
+
+function postStatus(statusEndpoint, body) {
+  const payload = JSON.stringify(body);
+  const url = new URL(statusEndpoint);
+  const http = require(url.protocol === 'https:' ? 'https' : 'http');
+  const req = http.request(url, {
+    method: 'POST',
+    timeout: STATUS_HTTP_TIMEOUT_MS,
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
+  });
+  req.on('timeout', () => req.destroy());
+  req.on('error', () => {});
+  req.end(payload);
+}
+
+// Resolves to the session's status record, or null on any failure.
+function getStatus(statusEndpoint, session) {
+  return new Promise((resolve) => {
+    const url = new URL(`${statusEndpoint}/${encodeURIComponent(session)}`);
+    const http = require(url.protocol === 'https:' ? 'https' : 'http');
+    const req = http.get(url, {
+      timeout: STATUS_HTTP_TIMEOUT_MS,
+      headers: { Authorization: `Bearer ${token}` },
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => body += c);
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
+}
+
+// Returns a stop function. A run in flight when stopped finishes but does not re-arm.
+function startScanLoop(scan, firstDelayMs, intervalMs) {
+  let stopped = false;
+  let timer = null;
+  const tick = async () => {
+    try { await scan(); } catch { /* next run retries */ }
+    if (!stopped) timer = setTimeout(tick, intervalMs);
+  };
+  timer = setTimeout(tick, firstDelayMs);
+  return () => { stopped = true; clearTimeout(timer); };
+}
+
 // ── Context token scanner ─────────────────────────────────────────────────
 // Periodically reads the most recent JSONL entry per active Claude conversation
 // and POSTs contextTokens to the status endpoint so the UI can warn about bloated contexts.
@@ -134,7 +200,7 @@ const CONTEXT_READ_BYTES = 512 * 1024;
 // conversation, post-/clear or /compact, or an idle resume that only bumps the
 // file mtime) is expired rather than frozen on the UI.
 const CONTEXT_FRESH_MS = 10 * 60 * 1000;
-let contextScanTimer = null;
+let stopContextScan = null;
 // Last contextTokens value POSTed per session (number or null), so we only POST
 // on change instead of re-broadcasting an unchanged reading every scan.
 const lastContextTokens = new Map();
@@ -143,48 +209,49 @@ async function scanContextTokens() {
   const username = process.env.USER || require('os').userInfo().username;
   const claudeDir = path.join(process.env.HOME || '/home', '.claude', 'projects');
 
-  // Discover active agent sessions from tmux
+  // Discover active agent sessions from tmux: project panes (`-agent`) and
+  // Claude Code cloud sessions' runner sessions (runner-sessions.js), whose
+  // transcripts live in the session's own config dir, not ~/.claude.
   let sessions;
   try {
-    const { stdout } = await execAsync('tmux list-sessions -F "#{session_name}" 2>/dev/null');
+    const { stdout } = await tmuxQuery(['list-sessions', '-F', '#{session_name}']);
     sessions = stdout.trim().split('\n')
-      .filter(s => s.startsWith(`${username}-`) && s.endsWith('-agent'));
+      .filter(s => (s.startsWith(`${username.replace(/[.:]/g, '_')}-`) && s.endsWith('-agent')) || runnerSessions.isRunnerSessionName(s, username));
   } catch { return; }
 
   if (sessions.length === 0) return;
 
-  // Map each agent session to the Claude project-log dir for its working
-  // directory. Claude encodes a cwd into its ~/.claude/projects dir name by
-  // replacing both '/' and '.' with '-', so we reproduce that here. Keying on
-  // the actual cwd (not a name parsed out of the session string) is what makes
-  // non-main workstreams work: a worktree session lives in
-  // <project>/.worktrees/<ws>, whose dir bears no relation to the session name.
-  const dirToSession = new Map();
+  // Map each session to the Claude project-log dir(s) for its working
+  // directory. Claude encodes a cwd into its projects dir name by replacing
+  // both '/' and '.' with '-', so we reproduce that here. Keying on the actual
+  // cwd (not a name parsed out of the session string) is what makes non-main
+  // workstreams work: a worktree session lives in <project>/.worktrees/<ws>,
+  // whose dir bears no relation to the session name. A runner session's dir
+  // is under its base dir's _sessions/<id>.claude-config/projects/, and its
+  // base dir is named by the order id in the session name.
+  const targets = [];
+  const home = process.env.HOME || '/home';
   for (const s of sessions) {
+    if (runnerSessions.isRunnerSessionName(s, username)) {
+      // The pane's cwd is the runner state dir (the backend starts it there),
+      // so the base dir comes from the order id in the name.
+      const base = runnerSessions.runnerBaseDir(home, runnerSessions.orderFromRunnerSession(s, username), process.env.CLAUDE_RUNNER_ROOT);
+      for (const dirPath of await runnerSessions.runnerProjectDirs(base)) targets.push({ session: s, dirPath });
+      continue;
+    }
     let cwd;
     try {
-      const { stdout } = await execAsync(`tmux display-message -p -t ${shellEscape(s)} '#{pane_current_path}'`);
+      const { stdout } = await tmuxQuery(['display-message', '-p', '-t', s, '#{pane_current_path}']);
       cwd = stdout.trim();
     } catch { continue; }
     if (!cwd) continue;
-    dirToSession.set(cwd.replace(/[/.]/g, '-'), s);
+    targets.push({ session: s, dirPath: path.join(claudeDir, runnerSessions.encodeClaudeDir(cwd)) });
   }
-
-  // Read JSONL dirs and match to projects
-  let projectDirs;
-  try { projectDirs = await readdir(claudeDir); } catch { return; }
 
   const statusEndpoint = getStatusEndpoint();
 
-  for (const dir of projectDirs) {
-    // Dir names are cwds with '/' and '.' replaced by '-', e.g.
-    // "-home-alice-termag-projects-foo" (main) or
-    // "-home-alice-termag-projects-foo--worktrees-bar" (worktree "bar").
-    // Exact-match the dir to the session whose cwd encodes to it.
-    const matchedSession = dirToSession.get(dir);
-    if (!matchedSession) continue;
-
-    const dirPath = path.join(claudeDir, dir);
+  for (const { session: matchedSession, dirPath } of targets) {
+    // A dir exists only once the session has written a transcript there.
     let files;
     try { files = await readdir(dirPath); } catch { continue; }
 
@@ -214,8 +281,11 @@ async function scanContextTokens() {
       const readSize = Math.min(CONTEXT_READ_BYTES, fileSize);
       const buf = Buffer.alloc(readSize);
       const fd = fs.openSync(filePath, 'r');
-      fs.readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
-      fs.closeSync(fd);
+      try {
+        fs.readSync(fd, buf, 0, readSize, Math.max(0, fileSize - readSize));
+      } finally {
+        fs.closeSync(fd);
+      }
 
       const lines = buf.toString('utf8').split('\n').reverse();
       for (const line of lines) {
@@ -244,29 +314,136 @@ async function scanContextTokens() {
     lastContextTokens.set(matchedSession, contextTokens);
 
     // POST to the status endpoint (metadata-only, no status change).
-    const payload = JSON.stringify({ session: matchedSession, contextTokens });
-    const url = new URL(statusEndpoint);
-    const http = require(url.protocol === 'https:' ? 'https' : 'http');
-    const req = http.request(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
-    });
-    req.on('error', () => {});
-    req.end(payload);
+    postStatus(statusEndpoint, { session: matchedSession, contextTokens });
   }
 }
 
 function startContextScanner() {
-  if (contextScanTimer) return;
-  // Initial scan after 5s, then every 60s
-  setTimeout(() => {
-    scanContextTokens().catch(() => {});
-    contextScanTimer = setInterval(() => scanContextTokens().catch(() => {}), CONTEXT_SCAN_INTERVAL_MS);
-  }, 5000);
+  if (stopContextScan) return;
+  stopContextScan = startScanLoop(scanContextTokens, 5000, CONTEXT_SCAN_INTERVAL_MS);
 }
 
 function stopContextScanner() {
-  if (contextScanTimer) { clearInterval(contextScanTimer); contextScanTimer = null; }
+  if (stopContextScan) { stopContextScan(); stopContextScan = null; }
+}
+
+// ── On-warm status poller ─────────────────────────────────────────────────
+// termag-on-warm.service has no way to talk to the backend itself, so it
+// publishes progress to a file (the contract is in deploy/termag-hook-run) and
+// this forwards every change. Only ever started by the backend's on-warm-start
+// RPC, because an owned box has no warm run to report.
+
+const ON_WARM_POLL_INTERVAL_MS = 2000;
+const ON_WARM_STATUS_FILE = path.join(process.env.HOME || '/home', '.termag', 'on-warm.status.json');
+let onWarmPollTimer = null;
+// The exact bytes last forwarded. The runner rewrites the file only at script
+// boundaries, so comparing raw text is both the cheapest change detector and
+// an exact one.
+let onWarmLastSent = null;
+
+function pollOnWarmStatus(ws) {
+  let raw;
+  // Absent until the unit's first write, which is normal for the first tick or
+  // two after the start job is queued.
+  try { raw = fs.readFileSync(ON_WARM_STATUS_FILE, 'utf8'); } catch { return; }
+  if (raw === onWarmLastSent) return;
+
+  let report;
+  try { report = JSON.parse(raw); } catch { return; }
+  if (ws.readyState !== WebSocket.OPEN) return;
+
+  onWarmLastSent = raw;
+  // `type` goes after the spread. A status file that carried its own `type`
+  // would otherwise redirect this frame at another backend handler.
+  ws.send(JSON.stringify({ ...report, type: 'on-warm-status' }));
+
+  if (report.state !== 'running') {
+    console.log(`[ON-WARM] run ${report.state}, stopping the poller`);
+    stopOnWarmPoller();
+  }
+}
+
+function startOnWarmPoller(ws) {
+  if (onWarmPollTimer) return;
+  // Cleared rather than kept across runs, because after a reconnect the file
+  // is usually byte-identical to what the previous socket forwarded and the
+  // new backend connection has not seen any of it.
+  onWarmLastSent = null;
+  // Interval armed before the first read, so a file that is already terminal
+  // (the reconnect case) gets forwarded once and then stops the poller instead
+  // of leaving it running against a finished run.
+  onWarmPollTimer = setInterval(() => pollOnWarmStatus(ws), ON_WARM_POLL_INTERVAL_MS);
+  pollOnWarmStatus(ws);
+}
+
+function stopOnWarmPoller() {
+  if (onWarmPollTimer) { clearInterval(onWarmPollTimer); onWarmPollTimer = null; }
+}
+
+// ── On-claim status poller ────────────────────────────────────────────────
+// Same file contract as the warm run, for the optional dotfiles oneshot.
+const ON_CLAIM_POLL_INTERVAL_MS = 2000;
+const TERMAG_STATE_DIR = path.join(process.env.HOME || '/home', '.termag');
+const ON_CLAIM_STATUS_FILE = path.join(TERMAG_STATE_DIR, 'on-claim.status.json');
+const ON_CLAIM_ENV_FILE = path.join(TERMAG_STATE_DIR, 'on-claim.env');
+const ON_CLAIM_URL_FILE = path.join(TERMAG_STATE_DIR, 'dotfiles-repo-url');
+const ON_CLAIM_UNIT = 'termag-on-claim.service';
+let onClaimTimer = null;
+let onClaimForwarder = null;
+
+// One forwarder per socket, armed on open and disarmed on close. It watches
+// the status file for as long as the socket is up, so a run that ends while
+// disconnected, and a later rerun of the claim hook, are forwarded too. A box
+// that never had a claim run has no status file and sends nothing.
+function startOnClaimForwarder(ws) {
+  stopOnClaimForwarder();
+  onClaimForwarder = createStatusForwarder({
+    read: () => fs.readFileSync(ON_CLAIM_STATUS_FILE, 'utf8'),
+    send: (frame) => ws.send(JSON.stringify(frame)),
+    isOpen: () => ws.readyState === WebSocket.OPEN,
+  });
+  const forwarder = onClaimForwarder;
+  onClaimTimer = setInterval(() => forwarder.tick(), ON_CLAIM_POLL_INTERVAL_MS);
+  forwarder.tick();
+}
+
+function stopOnClaimForwarder() {
+  if (onClaimTimer) { clearInterval(onClaimTimer); onClaimTimer = null; }
+  onClaimForwarder = null;
+}
+
+async function onClaimUnitState() {
+  try {
+    const { stdout } = await execFileAsync('systemctl', ['--user', 'is-active', ON_CLAIM_UNIT]);
+    return String(stdout).trim();
+  } catch (err) {
+    const stdout = err && err.stdout ? String(err.stdout) : '';
+    return stdout.trim() || 'unknown';
+  }
+}
+
+async function prepareOnClaim(payload) {
+  const unitState = await onClaimUnitState();
+  let existingState = null;
+  try {
+    existingState = JSON.parse(fs.readFileSync(ON_CLAIM_STATUS_FILE, 'utf8')).state;
+  } catch { /* first run */ }
+  const plan = planOnClaim({
+    unitState,
+    hasWork: Boolean(payload.dotfilesRepoUrl),
+    existingState,
+  });
+  fs.mkdirSync(TERMAG_STATE_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(TERMAG_STATE_DIR, 0o700); } catch { /* already tightened */ }
+  if (payload.dotfilesRepoUrl) {
+    fs.writeFileSync(ON_CLAIM_URL_FILE, `${payload.dotfilesRepoUrl}\n`, { mode: 0o644 });
+  }
+  if (!plan.write) return plan;
+  const tmp = `${ON_CLAIM_ENV_FILE}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, renderOnClaimEnv(payload), { mode: 0o600 });
+  fs.renameSync(tmp, ON_CLAIM_ENV_FILE);
+  try { fs.unlinkSync(ON_CLAIM_STATUS_FILE); } catch { /* none yet */ }
+  return plan;
 }
 
 // ── Rate limit scanner ────────────────────────────────────────────────────
@@ -274,7 +451,10 @@ function stopContextScanner() {
 // rate limit messages like "You've hit your ... limit · resets ..."
 
 const RATE_LIMIT_SCAN_INTERVAL_MS = 30_000;
-let rateLimitScanTimer = null;
+// Non-blank lines above the bottom of the pane that are inspected. Claude's
+// prompt box and status line take ~5 of them; the error sits just above.
+const RATE_LIMIT_SCAN_LINES = 15;
+let stopRateLimitScan = null;
 // Track which sessions are currently flagged so we only POST on transitions
 const rateLimitedSessions = new Map(); // session → message
 
@@ -283,9 +463,9 @@ async function scanRateLimits() {
 
   let sessions;
   try {
-    const { stdout } = await execAsync('tmux list-sessions -F "#{session_name}" 2>/dev/null');
+    const { stdout } = await tmuxQuery(['list-sessions', '-F', '#{session_name}']);
     sessions = stdout.trim().split('\n')
-      .filter(s => s.startsWith(`${username}-`) && s.endsWith('-agent'));
+      .filter(s => s.startsWith(`${username.replace(/[.:]/g, '_')}-`) && s.endsWith('-agent'));
   } catch { return; }
 
   if (sessions.length === 0) return;
@@ -295,17 +475,18 @@ async function scanRateLimits() {
   for (const session of sessions) {
     try {
       // Get pane ID for reliable capture
-      const { stdout: paneId } = await execAsync(
-        `tmux list-panes -t ${shellEscape(session)} -F '#{pane_id}' 2>/dev/null`
-      );
+      const { stdout: paneId } = await tmuxQuery(['list-panes', '-t', session, '-F', '#{pane_id}']);
       const pid = paneId.trim().split('\n')[0];
       if (!pid) continue;
 
-      // Capture last 10 visible lines — rate limit messages appear near the prompt,
-      // not buried in scrollback output which could contain false positives
-      const { stdout: paneContent } = await execAsync(
-        `tmux capture-pane -t ${shellEscape(pid)} -p -S -10 2>/dev/null`
-      );
+      // Only the lines next to the prompt: provider errors are printed right
+      // above it, while anything higher up is conversation that may merely
+      // *mention* a rate-limit message (an assistant quoting one flagged a
+      // session for as long as the text stayed on a tall screen).
+      // `captureArgv(..., { lines })` is "scrollback + whole visible pane",
+      // so take the tail here instead.
+      const { stdout: visible } = await tmuxQuery(captureArgv(pid, { lines: 0 }));
+      const paneContent = tailLines(visible, RATE_LIMIT_SCAN_LINES);
 
       // Check for rate limit patterns — must match actual CLI error messages,
       // not arbitrary content that mentions "rate limit" as a concept
@@ -350,31 +531,11 @@ async function scanRateLimits() {
         activePatterns.some(p => p.test(line))
       );
       if (looksActive) {
-        try {
-          const statusUrl = `${statusEndpoint}/${encodeURIComponent(session)}`;
-          const statusRes = await new Promise((resolve, reject) => {
-            const url = new URL(statusUrl);
-            const http = require(url.protocol === 'https:' ? 'https' : 'http');
-            const req = http.get(url, (res) => {
-              let body = '';
-              res.on('data', (c) => body += c);
-              res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
-            });
-            req.on('error', () => resolve(null));
-          });
-          if (statusRes && statusRes.status === 'waiting') {
-            const payload = JSON.stringify({ session, status: 'working' });
-            const url = new URL(statusEndpoint);
-            const http = require(url.protocol === 'https:' ? 'https' : 'http');
-            const req = http.request(url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
-            });
-            req.on('error', () => {});
-            req.end(payload);
-            console.log(`[STATUS-FIX] Corrected ${session} from waiting → working (pane shows active execution)`);
-          }
-        } catch { /* ignore */ }
+        const statusRes = await getStatus(statusEndpoint, session);
+        if (statusRes && statusRes.status === 'waiting') {
+          postStatus(statusEndpoint, { session, status: 'working' });
+          console.log(`[STATUS-FIX] Corrected ${session} from waiting → working (pane shows active execution)`);
+        }
       }
 
       const wasLimited = rateLimitedSessions.get(session);
@@ -382,28 +543,12 @@ async function scanRateLimits() {
       if (limitMessage && !wasLimited) {
         // Newly rate-limited — POST to status
         rateLimitedSessions.set(session, limitMessage);
-        const payload = JSON.stringify({ session, rateLimited: limitMessage });
-        const url = new URL(statusEndpoint);
-        const http = require(url.protocol === 'https:' ? 'https' : 'http');
-        const req = http.request(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
-        });
-        req.on('error', () => {});
-        req.end(payload);
+        postStatus(statusEndpoint, { session, rateLimited: limitMessage });
         console.log(`[RATE-LIMIT] Detected for ${session}: ${limitMessage}`);
       } else if (!limitMessage && wasLimited) {
         // No longer rate-limited (user cleared or limit reset) — clear it
         rateLimitedSessions.delete(session);
-        const payload = JSON.stringify({ session, rateLimited: null });
-        const url = new URL(statusEndpoint);
-        const http = require(url.protocol === 'https:' ? 'https' : 'http');
-        const req = http.request(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Authorization': `Bearer ${token}` },
-        });
-        req.on('error', () => {});
-        req.end(payload);
+        postStatus(statusEndpoint, { session, rateLimited: null });
         console.log(`[RATE-LIMIT] Cleared for ${session}`);
       }
     } catch { continue; }
@@ -411,15 +556,12 @@ async function scanRateLimits() {
 }
 
 function startRateLimitScanner() {
-  if (rateLimitScanTimer) return;
-  setTimeout(() => {
-    scanRateLimits().catch(() => {});
-    rateLimitScanTimer = setInterval(() => scanRateLimits().catch(() => {}), RATE_LIMIT_SCAN_INTERVAL_MS);
-  }, 10000);
+  if (stopRateLimitScan) return;
+  stopRateLimitScan = startScanLoop(scanRateLimits, 10000, RATE_LIMIT_SCAN_INTERVAL_MS);
 }
 
 function stopRateLimitScanner() {
-  if (rateLimitScanTimer) { clearInterval(rateLimitScanTimer); rateLimitScanTimer = null; }
+  if (stopRateLimitScan) { stopRateLimitScan(); stopRateLimitScan = null; }
 }
 
 // ── Browser clipboard mailbox ─────────────────────────────────────────────
@@ -536,14 +678,81 @@ async function startCodexSession(sessionName, cwd) {
   return { ok: true, remoteUrl, port };
 }
 
+credentials.configure({ agentConfig: path.resolve(configPath) });
+
+// The commit this process runs, read once at startup from the checkout agent/
+// is part of (agent/box-update.js). The orchestrator compares it with what a
+// current box runs and asks a box that is behind to update. A
+// checkout pulled since the agent started still runs the old code, and that
+// is what this reports, which is the point. Null outside a git checkout.
+const CHECKOUT_DIR = path.resolve(__dirname, '..');
+let agentCommit = null;
+// When that commit was made (ISO 8601), beside it in the hello: the admin
+// Fleet table sorts boxes by it.
+let agentCommitAt = null;
+// Whether termag-box-update.service is installed here; the box-update
+// capability is announced only then (agent/box-update.js).
+let boxUpdateCapable = false;
+
+// Tell the backend which host this agent is on, so it stops guessing
+// /home/<user> for the project directories it sends back.
+function sendHello(ws) {
+  try {
+    // os.userInfo() throws when the uid has no passwd entry (unnamed uid in a
+    // container), so the env fallback has to survive that.
+    let unixUser;
+    try { unixUser = os.userInfo().username; } catch {}
+    ws.send(JSON.stringify({
+      type: 'hello',
+      unixUser: unixUser || process.env.USER,
+      // Deliberately NOT remapPath(home): path_remap rewrites the backend's
+      // paths into local ones, and hello travels the other way.
+      home: os.homedir() || process.env.HOME,
+      hostname: os.hostname(),
+      agentVersion: require('./package.json').version,
+      agentCommit,
+      agentCommitAt,
+      warm: config.warm === true,
+      // Disk, memory, load and kept runner checkouts (host-sample.js); the
+      // backend writes them on the box row and refreshes them over the
+      // `host-sample` RPC.
+      host: hostSample.sampleHostSync(os.homedir() || process.env.HOME || '/'),
+      // "credentials": false in the config advertises no credential
+      // capability, so the orchestrator never sends credentials-apply/remove:
+      // for a second agent on a box whose first agent already owns the box's
+      // Claude and GitHub setup (docs/stage.md). The tmux capability
+      // is announced either way: any agent of this version runs tmux-create's
+      // `command`. box-update only where the unit it starts is installed.
+      capabilities: [
+        ...(config.credentials === false ? [] : credentials.CAPABILITIES),
+        ...TMUX_CAPABILITIES,
+        ...(boxUpdateCapable ? boxUpdate.CAPABILITIES : []),
+        ...hostSample.CAPABILITIES,
+      ],
+    }));
+  } catch (err) {
+    console.error('[AGENT] Failed to send hello:', err.message);
+  }
+}
+
+let tokenInQuery = false;
+// Drain closes in a row (agent-dial.js redialDelayMs); a connection that lasts
+// resets it.
+let drainCloses = 0;
+const DRAIN_STREAK_RESET_MS = 10_000;
+
 function connect() {
-  const url = `${termag_url}?token=${encodeURIComponent(token)}`;
-  console.log(`[AGENT] Connecting to ${termag_url.replace(/\?.*/, '')}...`);
+  const { url, options } = dialArgs(termag_url, token, { tokenInQuery });
+  console.log(`[AGENT] Connecting to ${termag_url.replace(/\?.*/, '')}${tokenInQuery ? ' (token in query, for an older orchestrator)' : ''}...`);
 
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(url, options);
 
+  let openedAt = 0;
   ws.on('open', () => {
+    openedAt = Date.now();
     console.log('[AGENT] Connected to termag');
+    sendHello(ws);
+    startOnClaimForwarder(ws);
     startContextScanner();
     startRateLimitScanner();
     let alive = true;
@@ -588,24 +797,40 @@ function connect() {
             const realTop = await fs.promises.realpath(stdout.trim());
             alreadyRepo = realTop === realCwd;
           } catch { /* not in a repo */ }
-          if (!alreadyRepo) {
+          // gitInit: false opts out (the Claude runner session lives in a
+          // state directory that must not become a repository).
+          if (!alreadyRepo && msg.gitInit !== false) {
             await execAsync(`git init ${shellEscape(cwd)}`);
           }
-          // Create tmux session
+          // `command` (argv, tmux-create-command-v1): the pane runs that
+          // program instead of a shell, and the session ends when it exits.
+          // Checked up front: tmux reports success even when the exec fails.
+          const command = Array.isArray(msg.command) && msg.command.length >= 2 && msg.command.every(a => typeof a === 'string')
+            ? [remapPath(msg.command[0]), ...msg.command.slice(1)]
+            : null;
+          if (command) await fs.promises.access(command[0], fs.constants.X_OK);
+          // Create tmux session. The name is complete, so match it exactly:
+          // `-t x-1` would also match an existing `x-10` and skip the create.
+          let created = false;
           try {
-            await execAsync(`tmux has-session -t ${shellEscape(sessionName)} 2>/dev/null`);
+            await execAsync(`tmux has-session -t ${shellEscape(tmuxSessionTarget(sessionName, true))} 2>/dev/null`);
             // Already exists
           } catch {
-            await execAsync(`tmux new-session -d -s ${shellEscape(sessionName)} -c ${shellEscape(cwd)} -x 120 -y 30`);
-            await execAsync(`tmux set-option -t ${shellEscape(sessionName)} -w window-size largest`);
-            await execAsync(`tmux set-option -t ${shellEscape(sessionName)} history-limit 10000`);
+            await execFileAsync('tmux', newSessionArgv(sessionName, cwd, command, process.env));
+            created = true;
+            // A command that exits at once takes its session with it, so for
+            // those the pane options are best effort.
+            for (const argv of newSessionOptionArgvs(sessionName)) {
+              const set = execFileAsync('tmux', argv);
+              await (command ? set.catch(() => {}) : set);
+            }
             // Let tmux copy operations (copy-mode y/M-w, mouse drag-end) emit
             // OSC 52 so selections reach the browser clipboard via xterm.js.
             // set-clipboard is a server option; -g applies it to all sessions.
             await execAsync(`tmux set-option -g set-clipboard on`);
             await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
           }
-          respond(ws, requestId, { ok: true });
+          respond(ws, requestId, { ok: true, created });
           break;
         }
 
@@ -613,7 +838,7 @@ function connect() {
           const { sessionName } = msg;
           stopCodexBridge(sessionName);
           try {
-            await execAsync(`tmux kill-session -t ${shellEscape(sessionName)}`);
+            await execAsync(`tmux kill-session -t ${shellEscape(tmuxSessionTarget(sessionName, msg.exact === true))}`);
           } catch { /* may not exist */ }
           respond(ws, requestId, { ok: true });
           break;
@@ -625,16 +850,12 @@ function connect() {
           // Slack /t and the Claude launch rely on — tmux parses key names.
           // `-l` applies to every argument in an invocation, so Enter must be a
           // separate send (matches backend/src/services/tmux.ts sendKeys).
+          //
+          // argv via execFile, never a shell string: the shell version escaped
+          // `'` twice and typed `'\''` for every apostrophe.
           const { sessionName, keys, withEnter, literal } = msg;
-          const target = shellEscape(sessionName);
-          const escaped = shellEscape(keys.replace(/'/g, "'\\''"));
-          if (literal) {
-            await execAsync(`tmux send-keys -t ${target} -l ${escaped}`);
-            if (withEnter) await execAsync(`tmux send-keys -t ${target} Enter`);
-          } else {
-            const enter = withEnter ? ' Enter' : '';
-            await execAsync(`tmux send-keys -t ${target} ${escaped}${enter}`);
-          }
+          await execFileAsync('tmux', sendKeysArgv(sessionName, keys, { literal: !!literal, withEnter: !!withEnter }));
+          if (literal && withEnter) await execFileAsync('tmux', enterArgv(sessionName));
           respond(ws, requestId, { ok: true });
           break;
         }
@@ -682,15 +903,28 @@ function connect() {
           const lines = Number.isFinite(requestedLines)
             ? Math.max(1, Math.min(1000, requestedLines))
             : 200;
+          // styled (opt-in) keeps SGR escapes (`-e`) so dimmed ghost-text can be
+          // told from typed input; default stays plain for every existing caller.
+          const styled = msg.styled === true;
           try {
-            const { stdout } = await execAsync(
-              `tmux capture-pane -t ${shellEscape(sessionName)} -p -S -${lines}`,
+            const { stdout } = await execFileAsync(
+              'tmux', captureArgv(sessionName, { lines, styled }),
               { maxBuffer: 4 * 1024 * 1024 }
             );
-            respond(ws, requestId, { content: stdout });
+            respond(ws, requestId, { content: stdout, styled });
           } catch (err) {
             respond(ws, requestId, null, err.message);
           }
+          break;
+        }
+
+        case 'project-rename': {
+          for (const { from } of msg.sessions ?? []) stopCodexBridge(from);
+          const result = await renameProject(
+            { sessions: msg.sessions, fromDir: remapPath(msg.fromDir), toDir: remapPath(msg.toDir) },
+            { execFile: execFileAsync },
+          );
+          respond(ws, requestId, result);
           break;
         }
 
@@ -728,7 +962,14 @@ function connect() {
         case 'write-file': {
           const p = remapPath(msg.path);
           if (typeof msg.content !== 'string') throw new Error('write-file: content must be a string');
+          // `mode` (optional): the file's permissions, applied before any
+          // content lands (the Claude runner's work order is written 0600).
+          const mode = Number.isInteger(msg.mode) && msg.mode >= 0 && msg.mode <= 0o777 ? msg.mode : null;
           await mkdir(path.dirname(p), { recursive: true });
+          if (mode !== null) {
+            await writeFile(p, '', { flag: 'a', mode });
+            await fs.promises.chmod(p, mode);
+          }
           await writeFile(p, msg.content, 'utf8');
           respond(ws, requestId, { ok: true });
           break;
@@ -746,10 +987,60 @@ function connect() {
           }
           const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
           const ref = baseRef || 'HEAD';
+          // Idempotent, like tmux-create: a worktree already at that path on
+          // that branch is reused rather than failed on. That is what lets a
+          // second orchestrator (docs/stage.md) adopt a workstream the first
+          // one created; a path holding anything else still fails below.
+          if (fs.existsSync(worktreePath)) {
+            try {
+              const { stdout } = await execAsync(`git -C ${shellEscape(worktreePath)} rev-parse --abbrev-ref HEAD`);
+              if (stdout.trim() === branch) {
+                respond(ws, requestId, { ok: true, path: worktreePath, existing: true });
+                break;
+              }
+            } catch { /* not a worktree: let git worktree add report it */ }
+          }
           await execAsync(
             `git -C ${shellEscape(projectDir)} worktree add -b ${shellEscape(branch)} ${shellEscape(worktreePath)} ${shellEscape(ref)}`
           );
           respond(ws, requestId, { ok: true, path: worktreePath });
+          break;
+        }
+
+        case 'git-worktree-move': {
+          // Rename a workstream: move its worktree from .worktrees/<from> to
+          // .worktrees/<to>. `git worktree move` updates git's bookkeeping
+          // (.git/worktrees/<id>/gitdir) as well as the directory, which a plain
+          // mv would not. The branch is untouched — the caller decides whether
+          // the git branch follows the workstream name.
+          const projectDir = remapPath(msg.projectDir);
+          const { from, to } = msg;
+          if (!projectDir || !from || !to) throw new Error('projectDir, from and to are required');
+          const fromPath = `${projectDir}/.worktrees/${from}`;
+          const toPath = `${projectDir}/.worktrees/${to}`;
+          await execAsync(
+            `git -C ${shellEscape(projectDir)} worktree move ${shellEscape(fromPath)} ${shellEscape(toPath)}`
+          );
+          respond(ws, requestId, { ok: true, path: toPath });
+          break;
+        }
+
+        case 'tmux-rename-session': {
+          // Rename a tmux session in place; whatever runs inside keeps running.
+          // Idempotent-ish: a missing source is reported as renamed=false rather
+          // than an error, since a workstream pair may be only partly alive.
+          const { from, to } = msg;
+          if (!from || !to) throw new Error('from and to are required');
+          // `=name` is an exact match: without it tmux prefix-matches, so a
+          // missing `foo` would silently rename `foo-bar` (same trap as #220).
+          try {
+            await execAsync(`tmux has-session -t ${shellEscape(`=${from}`)} 2>/dev/null`);
+          } catch {
+            respond(ws, requestId, { ok: true, renamed: false });
+            break;
+          }
+          await execAsync(`tmux rename-session -t ${shellEscape(`=${from}`)} ${shellEscape(to)}`);
+          respond(ws, requestId, { ok: true, renamed: true });
           break;
         }
 
@@ -768,10 +1059,22 @@ function connect() {
             throw new Error('projectDir and worktreeName are required');
           }
           const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
-          const forceFlag = force ? ' --force' : '';
-          await execAsync(
-            `git -C ${shellEscape(projectDir)} worktree remove${forceFlag} ${shellEscape(worktreePath)}`
-          );
+          // The directory may already be gone: removed by hand, or by a
+          // `git worktree remove` run outside termag. `worktree remove` then
+          // fails with "is not a working tree", and the backend turns any
+          // failure here into a 409 *before* deleting the Workstream row, so
+          // the UI could never remove the orphan. Treat "already gone" as
+          // done: drop git's stale bookkeeping and carry on to the branch.
+          let alreadyRemoved = false;
+          if (!fs.existsSync(worktreePath)) {
+            await execAsync(`git -C ${shellEscape(projectDir)} worktree prune`);
+            alreadyRemoved = true;
+          } else {
+            const forceFlag = force ? ' --force' : '';
+            await execAsync(
+              `git -C ${shellEscape(projectDir)} worktree remove${forceFlag} ${shellEscape(worktreePath)}`
+            );
+          }
           let branchDeleteWarning = null;
           if (branch) {
             const flag = force ? '-D' : '-d';
@@ -780,11 +1083,83 @@ function connect() {
                 `git -C ${shellEscape(projectDir)} branch ${flag} ${shellEscape(branch)}`
               );
             } catch (err) {
-              branchDeleteWarning = err.message.trim().split('\n').pop();
+              // The reason, not git's advice: the last `error:`/`fatal:` line
+              // when there is one, else the last non-`hint:` line. git follows
+              // "not fully merged" with "If you are sure…" (2.43) or `hint:`
+              // lines (newer), and the UI should show the reason.
+              const lines = err.message.trim().split('\n').map(l => l.trim())
+                .filter(l => l && !l.startsWith('hint:'));
+              const errors = lines.filter(l => /^(error|fatal):/.test(l));
+              branchDeleteWarning = (errors.length ? errors : lines).pop() || null;
               console.error(`[AGENT] branch ${flag} ${branch} failed: ${branchDeleteWarning}`);
             }
           }
-          respond(ws, requestId, { ok: true, branchDeleteWarning });
+          respond(ws, requestId, { ok: true, branchDeleteWarning, alreadyRemoved });
+          break;
+        }
+
+        case 'tmux-set-user-option':
+        case 'tmux-get-user-option': {
+          // termag metadata on a tmux session, as a tmux "user option"
+          // (`@termag-…`), so it lives exactly as long as the session does and
+          // survives a backend restart: the review pane records which PR it is
+          // reviewing this way (backend/src/routes/review.ts). Only `@termag-`
+          // names are accepted, so this cannot flip real tmux options.
+          const { sessionName, name } = msg;
+          if (typeof name !== 'string' || !/^@termag-[\w-]+$/.test(name)) throw new Error('name must be @termag-…');
+          if (type === 'tmux-set-user-option') {
+            const value = typeof msg.value === 'string' ? msg.value : '';
+            await execFileAsync('tmux', ['set-option', '-t', sessionName, name, value]);
+            respond(ws, requestId, { ok: true });
+          } else {
+            try {
+              const { stdout } = await execFileAsync('tmux', ['show-options', '-t', sessionName, '-v', name]);
+              respond(ws, requestId, { value: stdout.replace(/\n$/, '') });
+            } catch {
+              respond(ws, requestId, { value: null }); // unset, or no such session
+            }
+          }
+          break;
+        }
+
+        case 'git-pr-info': {
+          // Which PR is the checkout in <cwd> working on? Current branch plus
+          // `gh pr view` for that branch (gh picks the PR by branch; the box
+          // owner's gh auth applies). `pr` is gh's raw JSON or null when the
+          // branch has no PR; the backend parses and validates it
+          // (services/review.ts). Never throws for "no PR" -- only for a
+          // missing/unusable cwd.
+          const cwd = remapPath(msg.cwd);
+          if (!cwd) throw new Error('cwd is required');
+          let branch = null;
+          try {
+            const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 5000 });
+            branch = stdout.trim() || null;
+          } catch { /* not a git checkout */ }
+          let pr = null;
+          let error = null;
+          try {
+            const { stdout } = await execFileAsync(
+              'gh', ['pr', 'view', '--json', 'number,url,title,state,headRefName'],
+              { cwd, timeout: 12000, env: { ...process.env, GH_PROMPT_DISABLED: '1', NO_COLOR: '1' } }
+            );
+            pr = stdout;
+          } catch (err) {
+            // "no pull requests found for branch" is the normal miss; anything
+            // else (gh missing, not logged in) is reported so the UI can say why.
+            const text = `${err.stderr || err.message || ''}`.trim();
+            if (!/no pull requests found/i.test(text)) error = text.split('\n')[0] || 'gh pr view failed';
+          }
+          respond(ws, requestId, { branch, pr, error });
+          break;
+        }
+
+        case 'git-branch-state': {
+          // Where a workstream's checkout stands, for the PR pipeline's
+          // pre-PR lanes (git-branch-state.js). Local refs only, no fetch.
+          const cwd = remapPath(msg.cwd);
+          if (!cwd) throw new Error('cwd is required');
+          respond(ws, requestId, await gitBranchState(cwd, { execFile: execFileAsync }));
           break;
         }
 
@@ -845,14 +1220,9 @@ function connect() {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'terminal-exit', streamId }));
             }
-            // node-pty doesn't expose a public destroy(); reach for the
-            // internal socket so the master PTY fd releases as soon as the
-            // child exits, instead of after the library's 1s grace timer
-            // (which races with bulk-kills on WS-close and leaves the fd
-            // in REVOKED state — the original cause of the posix_spawnp
-            // exhaustion). _socket is stable across all of node-pty v1.x;
-            // re-audit on any major bump.
-            try { term._socket && term._socket.destroy(); } catch {}
+            // No socket cleanup here: node-pty only emits exit after its socket
+            // has closed. The leaked ptmx/kqueue/revoked fds on macOS were in
+            // node-pty 1.1.0's native spawn, fixed in the pinned 1.2.0 beta.
           });
 
           respond(ws, requestId, { ok: true, streamId });
@@ -901,6 +1271,97 @@ function connect() {
           break;
         }
 
+        case 'on-warm-start': {
+          // The on-warm scripts assume an unclaimed box. On an owned one they
+          // would run first-boot setup against a developer's live checkout, so a
+          // misrouted RPC is refused here as well as at the backend.
+          if (config.warm !== true) {
+            respond(ws, requestId, null, 'not a warm-pool agent');
+            break;
+          }
+          // --no-block because the unit is Type=oneshot, so a blocking start
+          // would not return until the whole warm run finished, tens of minutes
+          // past the backend's RPC timeout. Repeating it is safe either way, since
+          // systemd merges the start job into a run already in flight and
+          // RemainAfterExit makes a start after success a no-op, so neither
+          // repeat can produce a second writer of the status file.
+          await execAsync('systemctl --user start --no-block termag-on-warm.service');
+          console.log('[ON-WARM] started termag-on-warm.service, polling for status');
+          respond(ws, requestId, { ok: true });
+          startOnWarmPoller(ws);
+          break;
+        }
+
+        // Payloads go to deploy/termag-credentials on stdin and are never logged.
+        case 'credentials-apply': {
+          await credentials.applyCredential(msg.provider, msg.payload);
+          console.log(`[CRED] applied ${msg.provider}`);
+          respond(ws, requestId, { ok: true });
+          break;
+        }
+
+        case 'credentials-remove': {
+          await credentials.removeCredential(msg.provider, undefined, msg.reason);
+          respond(ws, requestId, { ok: true });
+          break;
+        }
+
+        case 'box-claim': {
+          // Git identity is synchronous. Optional dotfiles start in the
+          // background and never receive a GitHub token.
+          const { ownerName, ownerEmail, dotfilesRepoUrl } = msg;
+          if (!ownerName || !ownerEmail) {
+            respond(ws, requestId, null, 'box-claim: ownerName and ownerEmail are required');
+            break;
+          }
+          if (dotfilesRepoUrl != null && dotfilesRepoUrl !== '') {
+            let repo;
+            try { repo = new URL(dotfilesRepoUrl); } catch {
+              respond(ws, requestId, null, 'box-claim: invalid dotfilesRepoUrl');
+              break;
+            }
+            if (repo.protocol !== 'https:' || repo.hostname !== 'github.com') {
+              respond(ws, requestId, null, 'box-claim: dotfilesRepoUrl must use https://github.com');
+              break;
+            }
+          }
+          await execAsync(`git config --global user.name ${shellEscape(ownerName)}`);
+          await execAsync(`git config --global user.email ${shellEscape(ownerEmail)}`);
+          console.log(`[CLAIM] git identity set to ${ownerName} <${ownerEmail}>`);
+          const plan = await prepareOnClaim({
+            dotfilesRepoUrl: dotfilesRepoUrl || null,
+            ownerName,
+            ownerEmail,
+          });
+          if (plan.start) {
+            await execFileAsync('systemctl', ['--user', 'start', '--no-block', ON_CLAIM_UNIT]);
+            console.log('[CLAIM] started termag-on-claim.service');
+            if (onClaimForwarder) onClaimForwarder.tick();
+          }
+          // reportsOnClaim: with a repo to apply, this agent forwards the run's
+          // status, so the backend waits for it instead of settling the claim.
+          respond(ws, requestId, { ok: true, reportsOnClaim: Boolean(dotfilesRepoUrl) });
+          break;
+        }
+
+        case 'box-update': {
+          // Hands over to termag-box-update.service and answers at once: the
+          // update restarts this agent, so it cannot run in this process, and
+          // the unit is a oneshot systemd serializes (agent/box-update.js).
+          // `target` is the commit the orchestrator wants the box on, for the
+          // log only; the script pulls main whatever the target says.
+          const target = typeof msg.target === 'string' ? msg.target.slice(0, 12) : null;
+          const result = await boxUpdate.startBoxUpdate(execFileAsync);
+          console.log(`[BOX-UPDATE] started ${result.unit}${target ? ` (target ${target})` : ''}; this agent runs ${agentCommit ? agentCommit.slice(0, 12) : 'unknown'}`);
+          respond(ws, requestId, { ...result, agentCommit });
+          break;
+        }
+
+        case 'host-sample': {
+          respond(ws, requestId, hostSample.sampleHostSync(os.homedir() || process.env.HOME || '/'));
+          break;
+        }
+
         case 'usage-scan': {
           // `since` (YYYY-MM-DD) trims the response, never the cache. Older
           // backends send {} and get everything, as before.
@@ -933,12 +1394,24 @@ function connect() {
   });
 
   ws.on('close', (code, reason) => {
-    console.log(`[AGENT] Disconnected (${code}). Reconnecting in ${reconnect_interval_seconds}s...`);
+    const retryWithQueryToken = !tokenInQuery && refusedForWantOfQueryToken(code, reason);
+    tokenInQuery = retryWithQueryToken;
+    if (openedAt && Date.now() - openedAt > DRAIN_STREAK_RESET_MS) drainCloses = 0;
+    drainCloses = code === DRAIN_CLOSE_CODE ? drainCloses + 1 : 0;
+    const delayMs = retryWithQueryToken ? 0 : redialDelayMs(code, drainCloses, reconnect_interval_seconds);
+    if (retryWithQueryToken) {
+      console.log('[AGENT] Orchestrator wants the token in the query string; redialling that way');
+    } else {
+      console.log(`[AGENT] Disconnected (${code}). Reconnecting in ${(delayMs / 1000).toFixed(1)}s...`);
+    }
     stopContextScanner();
     stopRateLimitScanner();
-    // Kill all active PTY streams. Without the explicit socket destroy
-    // here, node-pty's internal 1s setTimeout races with the WS reconnect
-    // and the master fds end up pinned to the process in REVOKED state.
+    // The backend re-sends on-warm-start on the next hello, which is what
+    // restarts this; leaving the old socket's interval armed would double it.
+    stopOnWarmPoller();
+    stopOnClaimForwarder();
+    // Kill all active PTY streams. The socket destroy closes the master fd
+    // now rather than after node-pty's 1s grace timer.
     for (const [id, stream] of streams) {
       try { stream.pty.kill(); } catch {}
       try { stream.pty._socket && stream.pty._socket.destroy(); } catch {}
@@ -947,7 +1420,7 @@ function connect() {
     for (const sessionName of codexBridges.keys()) {
       stopCodexBridge(sessionName);
     }
-    setTimeout(connect, reconnect_interval_seconds * 1000);
+    setTimeout(connect, delayMs);
   });
 
   ws.on('error', (err) => {
@@ -973,7 +1446,20 @@ if (process.platform === 'linux') {
     console.error(`[CLIPBOARD] could not install xclip shim: ${err.message}`);
   }
 }
-connect();
+// The commit and the capability go into the first hello, so both are read
+// before the first dial. Bounded inside box-update.js, and null or false
+// rather than a failure to start.
+Promise.all([
+  boxUpdate.readCheckoutCommit(execFileAsync, CHECKOUT_DIR),
+  boxUpdate.boxUpdateUnitLoaded(execFileAsync),
+  boxUpdate.readCheckoutCommitDate(execFileAsync, CHECKOUT_DIR),
+]).then(([sha, unitLoaded, at]) => {
+  agentCommit = sha;
+  agentCommitAt = sha ? at : null;
+  boxUpdateCapable = unitLoaded;
+  console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}`);
+  connect();
+});
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

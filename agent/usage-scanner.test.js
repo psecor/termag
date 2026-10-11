@@ -139,3 +139,63 @@ test('no ~/.claude at all → empty, no errors', async () => {
   assert.deepEqual(r.sources.claude.errors, []);
   assert.equal(r.sources.claude.buckets.length, 0);
 });
+
+// ── pi (pi) ─────────────────────────────────────────
+const { parsePiFile } = require('./usage-scanner');
+
+function piSessionHeader(cwd, ts = '2026-10-04T06:04:46.038Z') {
+  return JSON.stringify({ type: 'session', version: 3, id: 's1', timestamp: ts, cwd });
+}
+function piMessage({ id = 'm1', ts = '2026-10-04T06:05:13.189Z', role = 'assistant', usage } = {}) {
+  const u = usage === undefined ? { input: 100, output: 10, cacheRead: 50, cacheWrite: 5, reasoning: 3, totalTokens: 168, cost: { total: 0 } } : usage;
+  const msg = { role, content: [] };
+  if (u) msg.usage = u;
+  return JSON.stringify({ type: 'message', id, parentId: null, timestamp: ts, message: msg });
+}
+function piUsageEntry({ id = 'u1', ts = '2026-10-04T06:08:00.000Z', input = 0, output = 0, cacheRead = 500, cacheWrite = 0, reasoning = 0 } = {}) {
+  return JSON.stringify({ type: 'usage', id, parentId: null, timestamp: ts, kind: 'cache_warm', usage: { input, output, cacheRead, cacheWrite, reasoning, totalTokens: input + output + cacheRead + cacheWrite, cost: { total: 0 } } });
+}
+function writePi(home, cwd, file, lines) {
+  const dir = path.join(home, '.pi', 'agent', 'sessions', encodeClaudeDir(cwd)); // dir name is opaque to the scanner
+  fs.mkdirSync(dir, { recursive: true });
+  const full = path.join(dir, file);
+  fs.writeFileSync(full, lines.join('\n') + '\n');
+  return full;
+}
+
+test('pi: cwdHint from the session header; usage summed with cacheWrite→cacheCreate and reasoning tagged', () => {
+  const r = parsePiFile([
+    piSessionHeader('/home/u/termag/projects/p'),
+    piMessage({ id: 'm1' }),
+    piMessage({ id: 'm2', ts: '2026-10-05T01:00:00Z' }),
+  ].join('\n'));
+  assert.equal(r.cwdHint, '/home/u/termag/projects/p');
+  assert.deepEqual(r.days['2026-10-04'], { input: 100, output: 10, cacheRead: 50, cacheCreate: 5, reasoning: 3, calls: 1 });
+  assert.equal(r.days['2026-10-05'].calls, 1);
+});
+
+test('pi: dedupe by entry id; usage entries (cache_warm) count; messages without usage do not', () => {
+  const r = parsePiFile([
+    piSessionHeader('/home/u/p'),
+    piMessage({ id: 'm1' }),
+    piMessage({ id: 'm1' }),               // duplicate id → counted once
+    piMessage({ id: 'm2', usage: null }),  // no usage → not a call
+    piUsageEntry({ id: 'w1' }),
+  ].join('\n'));
+  const d = r.days['2026-10-04'];
+  assert.equal(d.calls, 2);
+  assert.equal(d.cacheRead, 50 + 500);
+});
+
+test('pi: scan reports provider pi, buckets keyed by session cwd (not the dir name)', async () => {
+  const home = mkHome();
+  writePi(home, '/home/u/termag/projects/p', 's1.jsonl', [piSessionHeader('/home/u/termag/projects/p'), piMessage({ id: 'm1' })]);
+  writePi(home, '/home/u/termag/projects/q', 's2.jsonl', [piSessionHeader('/home/u/termag/projects/q'), piMessage({ id: 'm9' })]);
+  const r = await createScanner({ home }).scan();
+  const cwds = r.sources.pi.buckets.map(b => b.cwdHint).sort();
+  assert.deepEqual(cwds, ['/home/u/termag/projects/p', '/home/u/termag/projects/q']);
+  assert.equal(r.providers.pi['2026-10-04'].calls, 2);
+  assert.equal(r.providers.pi['2026-10-04'].reasoning, 6);
+  assert.equal(r.providers.pi['2026-10-04'].output, 20);
+  assert.deepEqual(r.sources.pi.errors, []);
+});

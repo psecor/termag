@@ -6,6 +6,7 @@
  *   claude  ~/.claude/projects/<encoded cwd>/*.jsonl   (one dir per session-origin cwd)
  *   codex   ~/.codex/sessions/YYYY/MM/DD/*.jsonl
  *   vibe    ~/.vibe/logs/session/session_YYYYMMDD_<id>/meta.json   (reported as provider `mistral`)
+ *   pi      ~/.pi/agent/sessions/<encoded cwd>/*.jsonl   (reported as provider `pi`)
  *
  * Response schema 2 (see scan()):
  *   { schema: 2, scannedAt, host, days, providers, sources }
@@ -31,9 +32,12 @@ const SCHEMA = 2;
 const MAX_KEYS_PER_FILE = 200_000;   // dedupe set bound; observed max ~1.7k. Overflow → over-count, reported.
 const MAX_CACHED_FILES = 10_000;
 
-function emptyDay() { return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 }; }
+// `reasoning` stays tagged separately from `output` all the way into
+// token_usage_days; the backend folds it into output for reporting. Claude's
+// output_tokens already includes thinking, so only pi reports it.
+function emptyDay() { return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 0 }; }
 function ensureDay(days, date) { if (!days[date]) days[date] = emptyDay(); return days[date]; }
-function addInto(t, d) { t.input += d.input; t.output += d.output; t.cacheRead += d.cacheRead; t.cacheCreate += d.cacheCreate; t.calls += d.calls; }
+function addInto(t, d) { t.input += d.input; t.output += d.output; t.cacheRead += d.cacheRead; t.cacheCreate += d.cacheCreate; t.reasoning += d.reasoning || 0; t.calls += d.calls; }
 function mergeDays(into, from) { for (const [date, d] of Object.entries(from)) addInto(ensureDay(into, date), d); }
 function cloneDays(days, since) {
   const out = {};
@@ -148,6 +152,54 @@ function parseCodexFile(content) {
     d.calls += 1;
   }
   return { days, cwdHint };
+}
+
+/**
+ * Parse one pi session file (one session per file; entries are append-only
+ * with unique ids). cwd comes from the `session` header — a real path, not an
+ * encoded dir name. Counts any message entry carrying usage (assistant always
+ * does; tool results do when a tool ran nested model work) plus `usage`
+ * entries (e.g. cache_warm), matching pi's own session totals — so `calls`
+ * counts usage-bearing entries here, not strictly model calls; a cache_warm
+ * bumps it. pi's `cost`
+ * fields are ignored: pi cost will be imputed from infrastructure
+ * spend, not from the session file. Dedupe is per-file by entry id — a forked
+ * session that copies its parent chain into a new file double-counts it, same
+ * known edge as Claude.
+ */
+function parsePiFile(content) {
+  const seen = new Set();
+  const days = {};
+  let cwdHint = null;
+  let first = true;
+  let overflow = false;
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (first) {
+      first = false;
+      if (entry.type === 'session' && typeof entry.cwd === 'string') cwdHint = entry.cwd;
+    }
+    let u = null;
+    if (entry.type === 'message' && entry.message && typeof entry.message === 'object' && entry.message.usage) u = entry.message.usage;
+    else if (entry.type === 'usage' && entry.usage) u = entry.usage;
+    if (!u) continue;
+    const date = entry.timestamp ? utcDate(entry.timestamp) : null;
+    if (!date) continue;
+    if (entry.id) {
+      if (seen.has(entry.id)) continue;
+      if (seen.size < MAX_KEYS_PER_FILE) seen.add(entry.id); else overflow = true;
+    }
+    const d = ensureDay(days, date);
+    d.input += u.input || 0;
+    d.output += u.output || 0;
+    d.cacheRead += u.cacheRead || 0;
+    d.cacheCreate += u.cacheWrite || 0;
+    d.reasoning += u.reasoning || 0;
+    d.calls += 1;
+  }
+  return { days, cwdHint, overflow };
 }
 
 function errInfo(err) { return (err && (err.code || err.message)) || String(err); }
@@ -302,12 +354,49 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
     return { buckets: [{ cwdHint: null, days }], errors, stats };
   }
 
+  /** pi sessions (pi). Buckets keyed by the session header's cwd, like codex. */
+  async function scanPi(live) {
+    const t0 = Date.now();
+    const stats = { files: 0, reparsed: 0, cached: 0, durationMs: 0 };
+    const errors = [];
+    const byCwd = new Map(); // cwdHint|'' → days
+    const sessionsDir = path.join(home, '.pi', 'agent', 'sessions');
+    let dirs = [];
+    try { dirs = await readdir(sessionsDir); } catch { /* no pi on this host */ }
+    for (const dir of dirs) {
+      const dirPath = path.join(sessionsDir, dir);
+      let files;
+      try {
+        const s = await stat(dirPath);
+        if (!s.isDirectory()) continue;
+        files = await readdir(dirPath);
+      } catch (err) { errors.push({ dir, file: null, error: errInfo(err) }); continue; }
+      for (const file of files) {
+        if (!file.endsWith('.jsonl')) continue;
+        const full = path.join(dirPath, file);
+        live.add(full);
+        const rel = `${dir}/${file}`;
+        const parsed = await cachedParse(full, parsePiFile, stats, (error) => errors.push({ dir, file: rel, error }));
+        if (!parsed) continue;
+        if (parsed.overflow) errors.push({ dir, file: rel, error: 'dedupe-overflow' });
+        const key = parsed.cwdHint ? unremapPath(parsed.cwdHint) : '';
+        if (!byCwd.has(key)) byCwd.set(key, {});
+        mergeDays(byCwd.get(key), parsed.days);
+      }
+    }
+    const buckets = [...byCwd.entries()].map(([cwd, days]) => ({ cwdHint: cwd || null, days }));
+    stats.durationMs = Date.now() - t0;
+    return { buckets, errors, stats };
+  }
+
   async function scan({ since } = {}) {
     const live = new Set();
-    const [claude, codex, mistral] = await Promise.all([scanClaude(live), scanCodex(live), scanVibe()]);
+    const [claude, codex, mistral, pi] = await Promise.all([scanClaude(live), scanCodex(live), scanVibe(), scanPi(live)]);
     evict(live);
 
-    const sources = { claude, codex, mistral };
+    // termag runs pi only as pi (pi); a pi session
+    // on another provider would still be reported as pi here.
+    const sources = { claude, codex, mistral, pi };
     const providers = {};
     const days = {};
     for (const [pid, src] of Object.entries(sources)) {
@@ -331,6 +420,6 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
 }
 
 module.exports = {
-  SCHEMA, createScanner, encodeClaudeDir, makeUnremap, dedupeKey, parseClaudeFile, parseCodexFile,
+  SCHEMA, createScanner, encodeClaudeDir, makeUnremap, dedupeKey, parseClaudeFile, parseCodexFile, parsePiFile,
   _internals: { ensureDay, mergeDays, cloneDays, utcDate, MAX_KEYS_PER_FILE, MAX_CACHED_FILES },
 };

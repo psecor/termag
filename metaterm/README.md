@@ -1,23 +1,64 @@
 # MetaTerm MCP server
 
-The tool surface for a user's **MetaTerm** project — a pinned Claude "control
-tower" on the orchestrator that can see (and, with confirmation, drive) every
-tmux session the user may reach (own projects on every box + shared projects).
+The tool surface that lets Claude see (and, with confirmation, drive) every
+tmux session the user may reach: own projects on every box, plus shared
+projects. It runs in two places:
+
+- **Boxes.** It is registered at user scope in `~/.claude.json`, so every
+  Claude session on the box has the read tools. `deploy/termag-reconcile`
+  installs the registration, the launcher `deploy/termag-metaterm-mcp`, the
+  read-tool approvals and the `metaterm` skill (`deploy/claude-skills/`). It
+  authenticates with the box's own `tmag_` token from the agent config.
+- **Orchestrator.** The pinned MetaTerm project. `backend/src/services/metaterm.ts`
+  seeds its `.mcp.json` (Claude Code auto-loads it from cwd) with `TERMAG_URL`,
+  pointing at a root-owned copy of this file.
 
 `mcp-server.mjs` is a dependency-free MCP-over-stdio server. It is a thin HTTP
-client: each tool is one call to the termag backend as the user (Bearer agent
-token from `~/.termag/agent.config.json`), and the **backend** enforces access
+client: each tool is one call to the termag backend with a Bearer agent token,
+and the **backend** enforces access
 (`backend/src/services/sessionAccess.ts`) and routes to the owning per-user agent.
-It never talks to tmux itself and never opens `/termag/ws/agent`.
+It never talks to tmux itself, except to learn its own session name for the
+self-target guard, and never opens `/termag/ws/agent`.
 
-Tools: `list_sessions`, `capture_pane`, `session_status` (pre-approved) and
-`send_keys` (prompts for approval every time — that prompt is the confirm gate).
+Tools: `list_sessions`, `capture_pane` and `session_status` are pre-approved.
+`send_keys` prompts for approval every time; that prompt is the confirm gate.
+`send_keys` is only listed when it is switched on. Highest precedence first:
 
-Seeded into a MetaTerm project dir by `backend/src/services/metaterm.ts` via
-`.mcp.json` (Claude Code auto-loads it from cwd). Env: `TERMAG_URL`
-(default `http://localhost:3040/termag`), `TERMAG_TOKEN` / `TERMAG_AGENT_CONFIG`.
+- `METATERM_SEND_KEYS=on|off`, for a session.
+- `.claude/metaterm.json` `{"sendKeys": true|false}`, in the cwd or a parent up
+  to `$HOME`, for a project.
+- `METATERM_SEND_KEYS_DEFAULT`, set by the registration: `off` on boxes, `on`
+  on the orchestrator.
+- With none of these, it is on.
 
-Smoke test without Claude:
+`send_keys` refuses to type into the session its own Claude is running in.
+
+Env:
+
+- `TERMAG_URL`: the backend base URL. If unset, it is derived from the agent
+  config's `termag_url`, else `http://localhost:3040/termag`.
+- `TERMAG_TOKEN` / `TERMAG_AGENT_CONFIG`: the token, or the config to read it
+  from. The config search order is that of `deploy/termag-status`.
+
+The URL must reach the backend without a browser sign-in. Behind an ALB with
+Okta, `/termag/api/sessions` and `/termag/api/projects/*/sessions/*` need an
+OIDC bypass for the token's source, or the server reports
+`→ 302 redirect to <idp>`. A laptop has no such path: run the server on a box
+over SSH (`ssh <box> 'exec $HOME/.local/bin/termag-metaterm-mcp'` as the MCP
+command) instead of copying a box token off it.
+
+Tests: `node --test metaterm/*.test.mjs`. Smoke test without Claude:
+
 ```
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | node metaterm/mcp-server.mjs
 ```
+
+`capture_pane` returns plain text by default. Pass `styled: true` to keep ANSI
+styling (`tmux capture-pane -e`). That is how a reader tells Claude Code's
+dimmed ghost-text suggestions on the prompt line (`ESC[2m … ESC[22m`) from text
+the user actually typed. The owner's agent must be new enough to honour the
+flag; the reply header says `styled=false` when it wasn't.
+
+`send_keys` text reaches tmux byte-for-byte (the agent spawns `tmux` with an
+argv array, never a shell string), so apostrophes, `$`, backticks and quotes
+in a prompt arrive as typed. Text beginning with `-` is fine too (`--`).

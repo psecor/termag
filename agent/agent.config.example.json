@@ -4,5 +4,7 @@
   "token": "paste-your-agent-token-here",
   "reconnect_interval_seconds": 5,
   "_comment_path_remap": "Optional. Rewrite incoming /home/<user>/... paths from the backend. Useful on macOS where home dirs live under /Users/. Example: { \"/home/psecor\": \"/Users/psecor\" }",
-  "path_remap": {}
+  "path_remap": {},
+  "_comment_warm": "Optional. True on a warm-pool box that has no owner yet; reported to the backend in the agent's hello frame. Absent means false.",
+  "warm": false
 }
