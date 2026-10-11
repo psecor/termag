@@ -44,7 +44,7 @@ container:
 | `BOX_PROVISIONER_ROLE_ARN` | role in the **box** account | The container's identity lives in another account; every EC2/IAM call assumes this role first. Unset = ambient credentials (the EC2 instance-role shape). |
 | `HOST_SECURITY_GROUP_ID` | **unset** | Only the EC2 host has a security group to punch `:3040` holes in. |
 | `AGENT_WS_URL` | `wss://<hostname>/termag/ws/agent` | Baked into each box's `agent.config.json` at provisioning time. |
-| `AWS_REGION`, `BOX_RESOURCE_PREFIX`, `BOX_PERMISSIONS_BOUNDARY_ARN`, `BOX_MANAGED_TAG`, `BOX_VPC_ID`, `BOX_SUBNET_ID`, `BOX_GIT_TOKEN_SECRET_ARN` | outputs of the `termag-box-provisioning` terraform module | Unchanged contract from the EC2 deployment; the module emits them as a `backend_env` map. |
+| `AWS_REGION`, `BOX_RESOURCE_PREFIX`, `BOX_PERMISSIONS_BOUNDARY_ARN`, `BOX_MANAGED_TAG`, `BOX_VPC_ID`, `BOX_SUBNET_ID`, `BOX_GIT_TOKEN_SECRET_ARN`, `BOX_ECR_PULL_REPOSITORY_ARNS` | outputs of the `termag-box-provisioning` terraform module | Unchanged contract from the EC2 deployment; the module emits them as a `backend_env` map. |
 
 connect-pg-simple's `session` table is declared in `schema.prisma` (model
 `Session`) so the `db:push` step creates and keeps it under the `migration`
@@ -79,6 +79,11 @@ already does.
 - Boxes need a route to the endpoint. Through the human hostname is simplest
   when boxes can resolve and reach it (VPC-internal DNS / VPN-equivalent
   routing); the token scopes each agent to one user's sessions.
+- Credential delivery doesn't depend on how an agent connects:
+  nothing it sends is a secret. The Claude gateway's checks (`/termag/internal/*`) need
+  a TLS route from the gateway to the backend; keep them off any listener boxes or
+  browsers reach (the EC2 gateway answers them with 404 on :3040). They trust only the
+  STS caller proof.
 - Outbound from the container: AWS STS/EC2/IAM (box account), the OIDC issuer,
   Slack (Socket Mode, if enabled).
 

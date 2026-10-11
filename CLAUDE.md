@@ -18,8 +18,10 @@ touching:
 - **`agent/agent.js`** — the per-user agent has no hot reload and must be restarted after every change
 
 Deeper docs, all still current: `deploy/setup.md` (first-time setup), `deploy/claude-hooks.md`,
-`docs/box-provisioning.md`, `docs/hosted-apps.md`, `docs/container-deploy.md` (running the
-orchestrator as a container), `docs/public-mirror-sync.md`.
+`docs/box-provisioning.md`, `docs/box-hibernation.md`, `docs/hosted-apps.md`,
+`docs/container-deploy.md` (running the orchestrator as a container), `docs/e2e-stack.md` (a whole
+termag on one machine, for exercising a change before a PR), `docs/stage.md` (a persistent staging
+stack on a box, mirroring its per-user agent).
 
 ## What AGENTS.md can't say about itself
 
@@ -30,12 +32,8 @@ Gotcha numbering shifts when it runs, so cite gotchas by subject, not by number.
 
 ## Before your first commit here
 
-Run `pre-commit install`. The gitleaks hook blocks the `.gitleaks.toml` deny-list (the LD domain, a
-personal orchestrator hostname, internal collaborator handles) in staged content — code, comments and
-docs alike.
+Work in a fresh worktree per PR, created from `origin/main` under `.worktrees/` — never switch
+branches inside a worktree another session may be using.
 
-This project is mirrored to a scrubbed public repo whose history deliberately diverges from the
-internal one — and the remote *names* differ between clones (some have `labs` + `origin`, some just
-`origin`). Run `git remote -v` and confirm which repo you're pushing to before you push. **Never
-force-push the internal history over the public mirror**; it would overwrite the scrub. Recipe and
-rationale: `docs/public-mirror-sync.md`.
+Run `pre-commit install`. The gitleaks hook blocks secrets and the `.gitleaks.toml` deny-list in
+staged content — code, comments and docs alike.

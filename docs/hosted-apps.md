@@ -1,7 +1,7 @@
 # Hosting apps on the termag host (suburl routing)
 
 The termag orchestrator host can serve extra web apps on path prefixes of the
-same ALB — `https://<alb-host>/org`, `/okr`, `/moonshots`, etc. This doc is for
+same ALB — `https://<alb-host>/org`, `/okr`, `/moonshots`, etc. (As of 2026-09 the host for these is moving to `tools.termag.example.com` behind an Okta-gated ALB; see `hosted-apps-migration.md`. The on-box layout below is unchanged.) This doc is for
 anyone (human or agent) working on the box who wants to add, change, or remove
 one.
 
@@ -13,6 +13,8 @@ ALB :443  ──▶  instance :3040 (nginx gateway)  ──▶  localhost:<port>
                     ├── /termag  → 127.0.0.1:3100  (termag backend)
                     └── /<app>   → 127.0.0.1:<port> (your app)
 ```
+
+> This doc covers path-prefixed apps on the main host.
 
 There is exactly **one** ALB target group, pointing at nginx on :3040. nginx
 fans out by path prefix. Routing lives on the box, on the persistent volume —
@@ -99,7 +101,10 @@ script after mounting `/srv/termag`. Nothing to re-provision by hand.
 
    Make the unit self-contained: absolute paths, explicit `User=`, everything
    it references on `/home` or `/srv/termag`. It will be started by root's
-   systemd on a box that has none of your shell state.
+   systemd on a box that has none of your shell state. A unit running as a
+   person's account (uid 1000-59999) cannot reach the instance metadata
+   service (`deploy/termag-imds-guard.nft`), so it gets no AWS credentials from
+   the host role; an app that needs them has to run as a system account.
 
 4. **Register it** (this is also what runs at every boot):
 

@@ -11,10 +11,10 @@ Each project gets a paired set of tmux sessions — an **agent** pane (where Cod
 - **Multi-project management** — create, rename, archive projects; each gets its own tmux sessions and working directory
 - **Live terminal streaming** — xterm.js terminals connected via WebSocket to server-side PTYs attached to tmux
 - **Per-project agent choice** — choose `Codex` or `Claude` when creating a project, with a persisted per-user default
-- **Agent status tracking** — Claude Code hooks and Codex app-server status report working/waiting/idle state; shown as green/yellow/red indicators and a hyperspace animation that speeds up with activity
+- **Agent status tracking** — Claude Code hooks and Codex app-server status report working/waiting/idle state; shown as green/yellow/red indicators and a hyperspace animation that speeds up with activity (or a solid background colour of your choice, under Settings → Appearance)
 - **Usage dashboard** — tracks API token usage and cost with a thermometer gauge (today vs 14-day trailing median) and expandable 30-day/7-day histograms
 - **Slack + Discord integration** — `/t` commands to view and control terminals from Slack or Discord; emoji reactions to respond to numbered prompts; `/t create` to create projects from chat
-- **Channel-based routing** — projects get a `#proj-<name>` Slack channel on creation; `/t` commands in project channels auto-route without `/t switch`
+- **Channel-based routing** — projects get a `#proj-<user>-<project>` Slack channel on creation and each workstream (git worktree) gets `#proj-<user>-<project>-<workstream>`; `/t` commands in those channels auto-route to the right tmux pair without `/t switch`
 - **Slack notifications** — automatic pane capture posted to Slack when an agent needs input, with reaction hints for quick response
 - **Per-user agent architecture** — each user's agent runs as their unix user, handling tmux and filesystem operations with proper permissions
 - **Google OAuth** — multi-user authentication mapped to unix accounts
