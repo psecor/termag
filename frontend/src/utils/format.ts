@@ -1,6 +1,6 @@
 import type { UsageDayData } from '../services/api';
 
-export const EMPTY_USAGE_DAY: UsageDayData = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
+export const EMPTY_USAGE_DAY: UsageDayData = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 0 };
 
 /** Total tokens in a usage day: input + output + cache read + cache create. */
 export function dayTokens(d: UsageDayData): number {

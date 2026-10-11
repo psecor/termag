@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildAttentionItems, liveSummary, TriageInput } from './triage';
-import type { SessionRow, UsageDayData } from '../../services/api';
+import type { PrLaneId, PrPipelineResponse, PrRow, SessionRow, UsageDayData } from '../../services/api';
 import type { Project } from '../../types';
 
 const NOW = Date.parse('2026-09-18T12:00:00Z');
@@ -25,7 +25,7 @@ function input(over: Partial<TriageInput> = {}): TriageInput {
     baselineUTC: ['2026-09-04', '2026-09-05', '2026-09-06', '2026-09-07', '2026-09-08'], ...over,
   };
 }
-const day = (tokens: number, calls = 1): UsageDayData => ({ input: tokens, output: 0, cacheRead: 0, cacheCreate: 0, calls });
+const day = (tokens: number, calls = 1): UsageDayData => ({ input: tokens, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls });
 const kinds = (items: ReturnType<typeof buildAttentionItems>) => items.map(i => i.kind);
 
 describe('buildAttentionItems — row selection', () => {
@@ -174,5 +174,128 @@ describe('liveSummary', () => {
       row({ access: 'collaborator', session: 'f' }),
     ]);
     expect(s).toEqual({ working: 1, waiting: 1, idle: 1, notRunning: 1, offlineHosts: 1 });
+  });
+});
+
+describe('buildAttentionItems — PR context prompt', () => {
+  const milestone = (msAgo = 60_000, kind: 'pr_created' | 'pr_merged' = 'pr_created', contextTokens: number | null = 180_000) =>
+    ({ kind, url: 'https://github.com/o/r/pull/1', at: iso(msAgo), contextTokens });
+
+  it('lists an idle session with a fresh milestone and enough context, as a notice', () => {
+    const items = buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 180_000, milestone: milestone() })] }), NOW);
+    expect(kinds(items)).toEqual(['pr_prompt']);
+    expect(items[0].severity).toBe('notice');
+    expect(items[0].title).toMatch(/^PR opened with 180k tokens/i);
+    expect(items[0].action).toBe('compact or clear');
+    expect(items[0].workstream).toBe('main');
+  });
+
+  it('names a merge distinctly', () => {
+    const items = buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 180_000, milestone: milestone(60_000, 'pr_merged') })] }), NOW);
+    expect(items[0].title).toMatch(/^PR merged/);
+  });
+
+  it('stays quiet while the agent is working or in a dialog, when context is small, or once expired', () => {
+    expect(kinds(buildAttentionItems(input({ sessions: [row({ status: 'working', contextTokens: 180_000, milestone: milestone() })] }), NOW))).toEqual([]);
+    // waiting (approval dialog) is excluded; the generic waiting rule needs an older updatedAt to fire, so nothing here.
+    expect(kinds(buildAttentionItems(input({ sessions: [row({ status: 'waiting', waitingReason: 'approval', contextTokens: 180_000, milestone: milestone() })] }), NOW))).toEqual([]);
+    expect(kinds(buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 50_000, milestone: milestone(60_000, 'pr_created', 50_000) })] }), NOW))).toEqual([]);
+    expect(kinds(buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 180_000, milestone: milestone(31 * 60_000) })] }), NOW))).toEqual([]);
+  });
+
+  it('survives a stale (null) live reading by using the size recorded with the milestone', () => {
+    const items = buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: null, milestone: milestone() })] }), NOW);
+    expect(kinds(items)).toEqual(['pr_prompt']);
+    expect(items[0].title).toMatch(/180k tokens/i);
+  });
+
+  it('keys by host so the same tmux name on two boxes does not cross-suppress', () => {
+    const items = buildAttentionItems(input({ sessions: [
+      row({ status: 'idle', instanceId: 'box-a', contextTokens: 180_000, milestone: milestone() }),
+      row({ status: 'idle', instanceId: 'box-b', contextTokens: 600_000, milestone: null }),
+    ] }), NOW);
+    expect(kinds(items).sort()).toEqual(['context', 'pr_prompt']);
+    expect(new Set(items.map(i => i.id)).size).toBe(2);
+  });
+
+  it('replaces the generic context-pressure item for the same session', () => {
+    // 600K would normally trip the context rule; the PR prompt is the more specific advice.
+    const items = buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 600_000, milestone: milestone() })] }), NOW);
+    expect(kinds(items)).toEqual(['pr_prompt']);
+    // Without the milestone the context item is back.
+    expect(kinds(buildAttentionItems(input({ sessions: [row({ status: 'idle', contextTokens: 600_000, milestone: null })] }), NOW))).toEqual(['context']);
+  });
+
+  it('skips rows on an offline host like every other per-row rule', () => {
+    const items = buildAttentionItems(input({ sessions: [row({ connected: false, status: 'idle', contextTokens: 180_000, milestone: milestone() })] }), NOW);
+    expect(kinds(items)).toEqual(['agent_offline']);
+  });
+});
+
+describe('cloud sessions queued', () => {
+  const cloud = (over: Partial<import('../../types').CloudSession> = {}): import('../../types').CloudSession => ({
+    key: 'cse_01Q', sessionId: 'cse_01Q', url: null, seq: 1, name: 'Claude Cloud 1', title: 'Fix the auth bug', clientPlatform: null, state: 'queued', exitReason: null,
+    queuedReason: 'every box of the session owner (1) already runs 3 cloud sessions; it is retried when one ends',
+    queuedSince: iso(6 * 60_000), current: null, runs: [], firstSeenAt: iso(10 * 60_000), lastSeenAt: iso(6 * 60_000), eventCount: 2, ...over,
+  });
+  it('under 5m nothing; 5m warning with the reason; 15m critical; running sessions never fire', () => {
+    expect(buildAttentionItems(input({ cloudSessions: [cloud({ queuedSince: iso(4 * 60_000), lastSeenAt: iso(4 * 60_000) })] }), NOW)).toEqual([]);
+    // Measured from the start of the refusals, whatever the latest retry says.
+    expect(buildAttentionItems(input({ cloudSessions: [cloud({ queuedSince: iso(16 * 60_000), lastSeenAt: iso(60_000) })] }), NOW)[0]).toMatchObject({ kind: 'cloud_queued', severity: 'critical' });
+    const w = buildAttentionItems(input({ cloudSessions: [cloud()] }), NOW);
+    expect(w[0]).toMatchObject({ kind: 'cloud_queued', severity: 'warning', title: 'Cloud session "Fix the auth bug" queued 6m', detail: expect.stringContaining('already runs 3') });
+    expect(buildAttentionItems(input({ cloudSessions: [cloud({ queuedSince: iso(15 * 60_000) })] }), NOW)[0]).toMatchObject({ kind: 'cloud_queued', severity: 'critical' });
+    expect(buildAttentionItems(input({ cloudSessions: [cloud({ state: 'running', lastSeenAt: iso(H) })] }), NOW)).toEqual([]);
+    expect(buildAttentionItems(input({ cloudSessions: null }), NOW)).toEqual([]);
+  });
+});
+
+describe('buildAttentionItems — pull requests', () => {
+  const pr = (over: Partial<PrRow>): PrRow => ({
+    kind: 'pr', lane: 'checks', repo: 'example-org/termag', number: 9, title: 'Lanes', url: 'https://github.com/example-org/termag/pull/9',
+    author: 'me', headRefName: 'feat', baseRefName: 'main', at: iso(H), badges: [], failingChecks: [], pendingChecks: [], waitingOn: [],
+    blockedBy: null, mergedAt: null, mergeCommit: null, deploy: null, workstream: null, requestedAt: null, reviewTarget: null, ...over,
+  });
+  const prs = (lanes: Partial<Record<PrLaneId, PrRow[]>>): PrPipelineResponse => ({
+    connected: true, viewer: 'me', prod: { sha: null, source: 'unknown' }, boxes: 0, fetchedAt: '', notes: [],
+    lanes: Object.entries(lanes).map(([id, rows]) => ({ id: id as PrLaneId, label: id, rows: rows! })),
+  });
+
+  it('a review request is a notice, then a warning after a day', () => {
+    const fresh = buildAttentionItems(input({ prs: prs({ needs_my_review: [pr({ lane: 'needs_my_review', author: 'alice', requestedAt: iso(2 * H) })] }) }), NOW);
+    expect(fresh).toEqual([expect.objectContaining({ kind: 'pr_needs_my_review', severity: 'notice', href: expect.stringContaining('/pull/9') })]);
+    const old = buildAttentionItems(input({ prs: prs({ needs_my_review: [pr({ lane: 'needs_my_review', requestedAt: iso(30 * H) })] }) }), NOW);
+    expect(old[0].severity).toBe('warning');
+  });
+  it('ready to merge is a notice; failing checks a warning, never for drafts', () => {
+    const items = buildAttentionItems(input({ prs: prs({
+      ready_to_merge: [pr({ lane: 'ready_to_merge', number: 1 })],
+      checks: [pr({ number: 2, failingChecks: ['Bugbot'] }), pr({ number: 3, failingChecks: ['ci'], badges: ['draft'] }), pr({ number: 4, pendingChecks: ['ci'] })],
+    }) }), NOW);
+    expect(kinds(items)).toEqual(['pr_checks_failed', 'pr_ready_to_merge']);
+  });
+  it('a linked workstream names the project', () => {
+    const items = buildAttentionItems(input({ prs: prs({
+      ready_to_merge: [pr({ lane: 'ready_to_merge', workstream: { projectId: 'p1', projectName: 'termag', workstream: 'feat' } })],
+    }) }), NOW);
+    expect(items[0]).toMatchObject({ projectName: 'termag', workstream: 'feat' });
+    expect(items[0].projectId).toBeUndefined();
+  });
+  it('more than two of a kind collapse into one item pointing at the section', () => {
+    const many = [51, 52, 96].map(n => pr({ lane: 'needs_my_review', number: n, requestedAt: iso(30 * H) }));
+    const items = buildAttentionItems(input({ prs: prs({ needs_my_review: many }) }), NOW);
+    expect(items).toEqual([expect.objectContaining({
+      kind: 'pr_needs_my_review', severity: 'warning', href: '#prs', title: '3 pull requests are waiting on your review', detail: 'termag#51, termag#52, termag#96',
+    })]);
+  });
+  it('PR items rank below session items of the same severity', () => {
+    const items = buildAttentionItems(input({
+      sessions: [row({ status: 'waiting', updatedAt: iso(40 * 60_000) })],
+      prs: prs({ checks: [pr({ failingChecks: ['Bugbot'], at: iso(400 * H) })] }),
+    }), NOW);
+    expect(kinds(items).filter(k => k === 'waiting' || k === 'pr_checks_failed')).toEqual(['waiting', 'pr_checks_failed']);
+  });
+  it('no GitHub connection, no items', () => {
+    expect(buildAttentionItems(input({ prs: { connected: false } }), NOW)).toEqual([]);
   });
 });

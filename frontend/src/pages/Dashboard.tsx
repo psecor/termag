@@ -1,9 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 import { useDashboardData } from './dashboard/useDashboardData';
 import { usageApi } from '../services/api';
 import { buildAttentionItems, liveSummary } from './dashboard/triage';
 import { AttentionSection } from './dashboard/AttentionSection';
+import { RecentsSection } from './dashboard/RecentsSection';
+import { CloudSessionsSection } from './dashboard/CloudSessionsSection';
+import { PullRequestsSection } from './dashboard/PullRequestsSection';
 import { RangePicker } from './dashboard/RangePicker';
 import { Range, rangeKeys } from './dashboard/range';
 import { KpiRow, Kpi, deltaPct } from './dashboard/KpiRow';
@@ -34,6 +38,7 @@ function useNow(everyMs: number): number {
  * heartbeat: time spent reading the dashboard must not count as working time.
  */
 export default function Dashboard() {
+  const { user } = useAuth();
   const data = useDashboardData();
   const now = useNow(15_000);
   const [range, setRange] = useState<Range>(() => (localStorage.getItem(RANGE_KEY) as Range) || '7d');
@@ -50,7 +55,9 @@ export default function Dashboard() {
     todayKeys: todayDates(),
     todayUTC: utcToday(),
     baselineUTC: previousNDaysUTC(TRAILING_MEDIAN_DAYS, 1),
-  }, now), [data.sessions.data, data.projects.data, data.usage.data, data.usageUnavailable, data.worktimeByProject.data, now]);
+    cloudSessions: data.cloudActive.data?.sessions ?? null,
+    prs: data.prs.data,
+  }, now), [data.sessions.data, data.projects.data, data.usage.data, data.usageUnavailable, data.worktimeByProject.data, data.cloudActive.data, data.prs.data, now]);
   const summary = useMemo(() => liveSummary(data.sessions.data), [data.sessions.data]);
 
   // KPI tiles for the selected range, with a delta vs the prior period
@@ -114,10 +121,23 @@ export default function Dashboard() {
         <header className="dash-header">
           <h1>Dashboard</h1>
           <Link to="/">← workspace</Link>
+          {user?.role === 'admin' && <Link to="/admin">admin →</Link>}
           <span className="dash-updated">{updated}</span>
         </header>
 
         <AttentionSection items={items} summary={summary} loaded={data.sessions.data !== null} checkedAt={data.checkedAt} now={now} />
+
+        {/* Where every pull request stands. Now, not range-bound. */}
+        <PullRequestsSection prs={data.prs.data} error={data.prs.error} now={now} />
+
+        {/* Recall, not a range-bound metric — sits above the range picker. */}
+        <RecentsSection now={now} />
+
+        {/* Claude Code cloud sessions on the owner's boxes: now, and the last 30
+            days. Not range-bound either. Shown only when there is something to
+            show: this route is outside the flags provider, so the flag
+            that gates the sidebar cannot gate this. */}
+        <CloudSessionsSection active={data.cloudActive.data?.sessions ?? null} recent={data.cloudRecent.data?.sessions ?? null} now={now} />
 
         <RangePicker value={range} onChange={setRange} />
 

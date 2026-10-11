@@ -4,6 +4,10 @@ import { Project, StatusMap, AgentStatusValue } from '../types';
 import { projectsApi, visitsApi } from '../services/api';
 import { useAuth } from './AuthContext';
 import { connectionTracker } from '../utils/connectionTracker';
+import { statusReconnectDelayMs } from '../utils/connection';
+import { statusKey } from '../utils/statusKey';
+import { cloudSessionFeed } from '../services/cloudSessionFeed';
+import { FLAGS, useFlag } from '../flags';
 
 const LAST_ACTIVE_PROJECT_KEY = 'termag:lastActiveProject';
 
@@ -49,6 +53,16 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   });
   const [statusMap, setStatusMap] = useState<StatusMap>({});
   const wsRef = useRef<WebSocket | null>(null);
+  // Claude Code cloud sessions, behind the flag.
+  // Started here, not in a layout: the workspace sidebar and the mobile inbox
+  // both sit under this provider and read the same store, and a phone visit
+  // never mounts the workspace layout.
+  const cloudSessionsOn = useFlag(FLAGS.cloudSessions, false);
+  useEffect(() => {
+    if (!user || !cloudSessionsOn) return;
+    cloudSessionFeed.start();
+    return () => cloudSessionFeed.stop();
+  }, [user, cloudSessionsOn]);
 
   // One per page load. Distinguishes "switch in tab A" from "switch in tab B"
   // when the user has multiple tabs open.
@@ -82,7 +96,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   // inflate the switch metric.
   const setActiveProject = useCallback((id: string | null) => {
     if (id !== previousProjectIdRef.current) {
-      visitsApi.record({ projectId: id, previousProjectId: previousProjectIdRef.current, sessionTag });
+      visitsApi.record({
+        projectId: id,
+        previousProjectId: previousProjectIdRef.current,
+        sessionTag,
+        workstream: id ? (activeWorkstreamMapRef.current[id] ?? 'main') : null,
+      });
       previousProjectIdRef.current = id;
       try {
         if (id === null) localStorage.removeItem(LAST_ACTIVE_PROJECT_KEY);
@@ -102,7 +121,18 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, [activeWorkstreamMap]);
 
   const setActiveWorkstream = useCallback((projectId: string, workstreamName: string) => {
+    const previous = activeWorkstreamMapRef.current[projectId] ?? 'main';
     setActiveWorkstreamMap(m => ({ ...m, [projectId]: workstreamName }));
+    // Mirror into the ref NOW, not at the next render: a caller that follows
+    // this with setActiveProject in the same tick (the Recents switcher) must
+    // see the new workstream when it records the visit and writes ?ws=.
+    activeWorkstreamMapRef.current = { ...activeWorkstreamMapRef.current, [projectId]: workstreamName };
+    // A workstream change on the active project is a session visit for
+    // "Recents" (previousProjectId === projectId marks it as NOT a project
+    // switch, so the dashboard's switch metric ignores it).
+    if (projectId === activeProjectIdRef.current && workstreamName !== previous) {
+      visitsApi.record({ projectId, previousProjectId: projectId, sessionTag, workstream: workstreamName });
+    }
     // Reflect in the URL when it's the active project, so a refresh restores the
     // exact workstream. Replace, not push — a workstream change isn't its own
     // back/forward step.
@@ -112,7 +142,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         else p.delete('ws');
       }, { replace: true });
     }
-  }, [updateParams]);
+  }, [updateParams, sessionTag]);
 
   // URL → state. Single source of truth; fires on user switches, back/forward,
   // bookmarks, and the restore below. No visit recording here (see above).
@@ -175,6 +205,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       if (prev) {
         prev.onopen = null; prev.onmessage = null; prev.onclose = null; prev.onerror = null;
         wsRef.current = null;
+        // Its onclose is detached, so report the close here — otherwise the
+        // tracker would keep claiming a socket is open across the gap.
+        connectionTracker.setSocketOpen(false);
         try { prev.close(); } catch { /* ignore */ }
       }
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -184,11 +217,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       // Let the ConnectionProvider force-close this socket when it has been
       // silent past the stale threshold (half-open after a VPN drop).
       connectionTracker.closeSocket = () => { try { ws.close(); } catch { /* ignore */ } };
+      // …and reopen it without waiting out the reconnect delay, for the cases
+      // where the delay is the whole problem: the tab coming back to the
+      // foreground, and "Retry now".
+      connectionTracker.reconnectSocket = () => { connect(); };
 
       ws.onopen = () => {
         if (!isCurrent()) { try { ws.close(); } catch { /* ignore */ } return; }
         connectionTracker.setSocketOpen(true);
-        connectionTracker.contact();
+        connectionTracker.contact('socket');
       };
 
       ws.onmessage = (event) => {
@@ -196,7 +233,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         // Every frame — status pushes and the server's periodic heartbeat —
         // is proof the backend is reachable. Record before parsing so a
         // malformed frame still counts.
-        connectionTracker.contact();
+        connectionTracker.contact('socket');
         try {
           const msg = JSON.parse(event.data as string) as {
             type: string;
@@ -210,11 +247,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
             tokenBurst?: number;
             activeTurn?: boolean;
             threadId?: string;
+            instanceId?: string | null;
           };
+          // A cloud session changed (spawn outcome, the box's report, a sweep):
+          // the feed refetches the owner's list (services/cloudSessionFeed.ts).
+          if (msg.type === 'claude-session') { void cloudSessionFeed.reload(); return; }
           if (msg.type === 'status') {
             setStatusMap(prev => ({
               ...prev,
-              [msg.session]: {
+              [statusKey(msg.instanceId, msg.session)]: {
                 status: msg.status,
                 updatedAt: msg.updatedAt,
                 message: msg.message,
@@ -227,19 +268,22 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
                 pollerMeta: (msg as any).pollerMeta,
                 contextTokens: (msg as any).contextTokens,
                 rateLimited: (msg as any).rateLimited,
+                milestone: (msg as any).milestone ?? null,
+                // The Devin review pane's state (utils/reviewRing).
+                review: (msg as any).review ?? null,
               },
             }));
           }
         } catch { /* ignore */ }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (!isCurrent()) return;
         wsRef.current = null;
         connectionTracker.setSocketOpen(false);
         if (disposed) return;
         if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
+        reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, statusReconnectDelayMs(event.code));
       };
     }
 
@@ -248,6 +292,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       disposed = true;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       connectionTracker.closeSocket = null;
+      connectionTracker.reconnectSocket = null;
       wsRef.current?.close();
     };
   }, [user]);

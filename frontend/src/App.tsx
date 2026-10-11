@@ -2,20 +2,35 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { lazy, Suspense } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { contextLevel } from './utils/thresholds';
+import { SIDEBAR_WIDTH_DEFAULT, clampSidebarWidth, effectiveSidebarWidth, readSidebarWidth, writeSidebarWidth } from './utils/sidebarWidth';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ProjectProvider } from './contexts/ProjectContext';
 import { ConnectionProvider, useConnection } from './contexts/ConnectionContext';
 import { formatSince } from './utils/connection';
+import { FeatureFlagsProvider } from './contexts/FeatureFlagsProvider';
+import { AppErrorBoundary } from './components/AppErrorBoundary';
+import { FLAGS, useFlag } from './flags';
 import { ProjectControl } from './components/ProjectControl';
 import { Terminal } from './components/Terminal';
 import { Hyperspace } from './components/Hyperspace';
+import { ConnectionOverlay } from './components/ConnectionOverlay';
+import { PrContextPrompt } from './components/PrContextPrompt';
+import { ReviewButton } from './components/ReviewButton';
+import { ReviewDock } from './components/ReviewDock';
+import { ThemeProvider, useTheme } from './theme/ThemeProvider';
+import { useEasedWarp } from './hooks/useEasedWarp';
+import { useStatusFavicon } from './hooks/useStatusFavicon';
 import { UsageMini } from './components/UsageMini';
 import { useProjects } from './contexts/ProjectContext';
 import { useAuth as useAuthHook } from './contexts/AuthContext';
-import { Project } from './types';
 import { computeWarpWithFallback } from './utils/warp';
 import { sessionName as buildSessionName } from './utils/sessionName';
-import { activityApi, warpApi, authApi, AuthMode } from './services/api';
+import { statusKey } from './utils/statusKey';
+import { rateLimitLabel } from './utils/rateLimit';
+import { activityApi, warpApi, authApi, reviewApi, AuthMode } from './services/api';
+import type { SessionReview } from './types';
+import { boxFeed } from './services/boxFeed';
+import { mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, readOptOut, shouldRedirectToMobile } from './mobile/redirect';
 
 function Login() {
   // The backend decides the sign-in mechanism (AUTH_MODE); fetch it so the
@@ -66,8 +81,25 @@ function MainLayout() {
   const { user } = useAuthHook();
   const { projects, activeProjectId, statusMap, getActiveWorkstream } = useProjects();
   const connection = useConnection();
+  useStatusFavicon();
+
+  useEffect(() => {
+    if (!user) return;
+    boxFeed.start();
+    return () => boxFeed.stop();
+  }, [user]);
+
+  // The starfield shows when the hyperspace flag allows it (defaults on) and
+  // the user's theme asks for it.
+  // The flag can only take it away. Otherwise .app-layout paints --bg-backdrop,
+  // which the theme sets (theme/ThemeProvider.tsx): the base colour, or the
+  // user's solid colour.
+  const hyperspaceAllowed = useFlag(FLAGS.hyperspaceBackground, true);
+  const { theme } = useTheme();
+  const showHyperspace = hyperspaceAllowed && theme.background.mode === 'hyperspace';
 
   const activeProject = projects.find(p => p.id === activeProjectId);
+
   const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
   const username = user?.unixUsername ?? '';
   const sessionOwner = activeProject?.ownerUsername ?? username;
@@ -78,10 +110,69 @@ function MainLayout() {
   const ctrlSession = activeProject
     ? buildSessionName(sessionOwner, activeProject.name, 'ctrl', activeWorkstream)
     : '';
+  const reviewSession = activeProject
+    ? buildSessionName(sessionOwner, activeProject.name, 'review', activeWorkstream)
+    : '';
+
+  // Devin review pane (Review button → ReviewDock under the ctrl terminal),
+  // per project+workstream. Its state rides the agent session's status
+  // (`review`, the only thing the backend's review sweep writes); the
+  // browser polls nothing. A tiny optimistic
+  // overlay bridges the POST→push gap for the pane that was just started, and
+  // hides a just-stopped one until the clearing push lands.
+  const reviewKey = activeProject ? `${activeProject.id}/${activeWorkstream}` : '';
+  const [reviewExpanded, setReviewExpanded] = useState<Record<string, boolean>>({});
+  const [reviewOverlay, setReviewOverlay] = useState<Record<string, { review: SessionReview } | 'cleared'>>({});
+  const reviewMetaRaw = statusMap[statusKey(activeProject?.instanceId, agentSession)]?.review ?? null;
+  const overlay = reviewOverlay[reviewKey];
+  const reviewMeta = overlay === 'cleared' ? null : overlay?.review ?? reviewMetaRaw;
+  // Drop the overlay once the pushed truth covers it — and on a timer in case
+  // the push never lands (offline browser, an agent that never reports).
+  useEffect(() => {
+    if (overlay === undefined) return;
+    const truthCovers = overlay === 'cleared' ? reviewMetaRaw == null : reviewMetaRaw != null;
+    if (truthCovers) {
+      setReviewOverlay(prev => { if (!(reviewKey in prev)) return prev; const next = { ...prev }; delete next[reviewKey]; return next; });
+      return;
+    }
+    const t = setTimeout(() => {
+      setReviewOverlay(prev => { if (!(reviewKey in prev)) return prev; const next = { ...prev }; delete next[reviewKey]; return next; });
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [overlay, reviewMetaRaw, reviewKey]);
+  const reviewStatus = reviewMeta
+    ? {
+        session: reviewSession,
+        // The sweep owns the truth; a lost connection greys the status glyph
+        // client-side (`.stale`) instead of an offline poller answer.
+        connected: true as const,
+        alive: true as const,
+        running: reviewMeta.state === 'reviewing' || reviewMeta.state === 'waiting' || reviewMeta.state === 'done',
+        state: reviewMeta.state,
+        pr: reviewMeta.pr,
+        url: reviewMeta.url,
+        startedAt: null,
+      }
+    : null;
+  const review = reviewStatus ? { expanded: reviewExpanded[reviewKey] ?? false, status: reviewStatus } : null;
+  const onReviewStarted = useCallback((r: { pr: number; url: string | null; session: string }) => {
+    setReviewOverlay(prev => ({
+      ...prev,
+      [reviewKey]: { review: { state: 'reviewing', pr: r.pr, url: r.url, at: new Date().toISOString(), doneAt: null, seenAt: null } },
+    }));
+    setReviewExpanded(prev => ({ ...prev, [reviewKey]: true }));
+  }, [reviewKey]);
+  const toggleReview = useCallback(() => {
+    setReviewExpanded(prev => ({ ...prev, [reviewKey]: !prev[reviewKey] }));
+  }, [reviewKey]);
+  const stopReview = useCallback(() => {
+    if (!activeProject) return;
+    setReviewOverlay(prev => ({ ...prev, [reviewKey]: 'cleared' }));
+    reviewApi.stop(activeProject.id, activeWorkstream).catch(() => {});
+  }, [activeProject, activeWorkstream, reviewKey]);
 
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
-  const [warpSpeed, setWarpSpeed] = useState(0.1);
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onActivity = useCallback(() => {
     setTyping(true);
@@ -92,10 +183,10 @@ function MainLayout() {
   // Heartbeat for human activity tracking — send every 30s while typing
   useEffect(() => {
     if (!typing || !activeProject) return;
-    activityApi.heartbeat(activeProject.name).catch(() => {});
+    activityApi.heartbeat(activeProject.name, activeProject.instanceId ?? null).catch(() => {});
     const interval = setInterval(() => {
       if (activeProject) {
-        activityApi.heartbeat(activeProject.name).catch(() => {});
+        activityApi.heartbeat(activeProject.name, activeProject.instanceId ?? null).catch(() => {});
       }
     }, 30_000);
     return () => clearInterval(interval);
@@ -112,13 +203,16 @@ function MainLayout() {
         .filter(ws => !ws.archived)
         .map(ws => {
           const agentSession = buildSessionName(owner, p.name, 'agent', ws.name);
-          return [agentSession, statusMap[agentSession]] as const;
+          return [statusKey(p.instanceId, agentSession), statusMap[statusKey(p.instanceId, agentSession)]] as const;
         });
     })
     .filter(([, status]) => Boolean(status)));
 
   const warpModel = computeWarpWithFallback(projectAgentStatuses, typing);
   const activeCount = warpModel.workingCount + warpModel.waitingCount;
+  // Sidebar speed readout, eased toward the target by a timer rather than by
+  // the canvas, so it keeps moving when the starfield is off or frozen.
+  const warpSpeed = useEasedWarp(warpModel.targetWarp);
 
   // Per-5s sample of targetWarp posted to the backend, which rolls samples
   // into per-minute buckets in warp_samples. Use a ref so the interval reads
@@ -154,12 +248,6 @@ function MainLayout() {
   // Responsive layout
   const isNarrow = useIsNarrow();
   const [activePane, setActivePane] = useState<'agent' | 'ctrl'>('agent');
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.innerWidth < 1600);
-
-  // Auto-collapse when crossing the breakpoint
-  useEffect(() => {
-    setSidebarCollapsed(isNarrow);
-  }, [isNarrow]);
 
   // Adjustable agent/ctrl split (wide mode only). Agent pane gets `agentPct`%
   // of the width; the divider drags it (clamped 15–85), double-click resets to
@@ -191,63 +279,96 @@ function MainLayout() {
     try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
   }, []);
 
+  // Adjustable sidebar width: a handle on its right edge drags it (clamped
+  // 180–480), double-click resets, remembered per browser. The project list
+  // reflows on its own; nothing else measures the sidebar.
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => readSidebarWidth(typeof localStorage !== 'undefined' ? localStorage : null));
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const draggingSidebar = useRef(false);
+  useEffect(() => { writeSidebarWidth(typeof localStorage !== 'undefined' ? localStorage : null, sidebarWidth); }, [sidebarWidth]);
+  // The saved width is capped against the live viewport so the terminals and
+  // the handle stay visible when a width saved on a desktop meets a phone.
+  const [viewportWidth, setViewportWidth] = useState<number>(() => (typeof window !== 'undefined' ? window.innerWidth : SIDEBAR_WIDTH_DEFAULT * 4));
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const sidebarPx = effectiveSidebarWidth(sidebarWidth, viewportWidth);
+  const onSidebarHandleDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    draggingSidebar.current = true;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, []);
+  const onSidebarHandleMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (!draggingSidebar.current || !sidebarRef.current) return;
+    setSidebarWidth(clampSidebarWidth(e.clientX - sidebarRef.current.getBoundingClientRect().left));
+  }, []);
+  const onSidebarHandleUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    draggingSidebar.current = false;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  }, []);
+
   return (
-    <div className={`app-layout ${sidebarCollapsed ? 'sidebar-is-collapsed' : ''}`}>
-      <div className="app-hyperspace-bg">
-        <Hyperspace
-          activeCount={activeCount}
-          typingBoost={typing}
-          targetWarp={warpModel.targetWarp}
-          onWarpChange={setWarpSpeed}
-          connection={connection.state}
-        />
-      </div>
-      <div className={`app-sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
-        <button
-          className="sidebar-toggle"
-          onClick={() => setSidebarCollapsed(s => !s)}
-          title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        >
-          {sidebarCollapsed ? '›' : '‹'}
-        </button>
-        {sidebarCollapsed ? (
-          <SidebarCollapsed
-            projects={projects}
-            activeProjectId={activeProjectId}
-            statusMap={statusMap}
-            username={username}
+    <div className="app-layout">
+      {/* Sustained-offline takeover: dims everything below (fixed, z 200). */}
+      <ConnectionOverlay />
+      {showHyperspace && (
+        <div className="app-hyperspace-bg">
+          <Hyperspace
+            activeCount={activeCount}
+            typingBoost={typing}
+            targetWarp={warpModel.targetWarp}
+            connection={connection.state}
           />
-        ) : (
-          <div className="app-control">
-            <ProjectControl />
+        </div>
+      )}
+      <div className="app-sidebar" ref={sidebarRef} style={{ ['--control-width' as string]: `${sidebarPx}px` } as React.CSSProperties}>
+        <div className="app-control">
+          <ProjectControl />
+        </div>
+        <div
+          className="app-sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          title="Drag to resize the sidebar; double-click to reset"
+          onPointerDown={onSidebarHandleDown}
+          onPointerMove={onSidebarHandleMove}
+          onPointerUp={onSidebarHandleUp}
+          onPointerCancel={onSidebarHandleUp}
+          onDoubleClick={() => setSidebarWidth(SIDEBAR_WIDTH_DEFAULT)}
+        />
+        {/* Indicators own the sidebar's bottom edge: the project list above
+            scrolls to a hard stop here instead of sliding underneath them.
+            The thermometer and warp readout are opt-in (Settings →
+            Appearance); the connection state shows here regardless. */}
+        {(theme.sidebarActivity || connection.state !== 'online') && (
+          <div className="app-sidebar-footer">
+            {theme.sidebarActivity && <UsageMini />}
+            {connection.state === 'online' ? (
+              <div className="warp-indicator" data-active={isActive || undefined}>
+                {warpStr}<em>c</em>
+              </div>
+            ) : (
+              // The speed readout is meaningless without live statuses; use its
+              // slot for the connection state so the sidebar says what the
+              // starfield is showing.
+              <div
+                className="warp-indicator connection-indicator"
+                data-connection={connection.state}
+                title={connection.lastContactAt
+                  ? `Last contact with termag: ${new Date(connection.lastContactAt).toLocaleTimeString()}`
+                  : 'No contact with termag yet'}
+              >
+                {connection.state === 'offline' ? 'offline' : 'reconnecting'}
+                {connection.lastContactAt != null && (
+                  <small>{formatSince(connection.now - connection.lastContactAt)}</small>
+                )}
+              </div>
+            )}
           </div>
         )}
-        {/* Indicators own the sidebar's bottom edge: the project list above
-            scrolls to a hard stop here instead of sliding underneath them. */}
-        <div className="app-sidebar-footer">
-          <UsageMini />
-          {connection.state === 'online' ? (
-            <div className="warp-indicator" data-active={isActive || undefined}>
-              {warpStr}<em>c</em>
-            </div>
-          ) : (
-            // The speed readout is meaningless without live statuses; use its
-            // slot for the connection state so the sidebar says what the
-            // starfield is showing.
-            <div
-              className="warp-indicator connection-indicator"
-              data-connection={connection.state}
-              title={connection.lastContactAt
-                ? `Last contact with termag: ${new Date(connection.lastContactAt).toLocaleTimeString()}`
-                : 'No contact with termag yet'}
-            >
-              {connection.state === 'offline' ? 'offline' : 'reconnecting'}
-              {connection.lastContactAt != null && (
-                <small>{formatSince(connection.now - connection.lastContactAt)}</small>
-              )}
-            </div>
-          )}
-        </div>
       </div>
       <div className="app-terminals">
         {connection.state !== 'online' && (
@@ -264,11 +385,11 @@ function MainLayout() {
               : <>{activeProject.name} <span className="workstream-bar-badge">{activeWorkstream}</span></>
           ) : '—'}
           {activeProject && (() => {
-            const st = statusMap[agentSession];
+            const st = statusMap[statusKey(activeProject.instanceId, agentSession)];
             if (st?.rateLimited) {
               return (
                 <span className="rate-limit-bar-badge" title={st.rateLimited}>
-                  RATE LIMITED
+                  {rateLimitLabel(st.rateLimited)}
                 </span>
               );
             }
@@ -304,15 +425,35 @@ function MainLayout() {
               style={(!isNarrow && activeProject && hasAgent) ? { flex: `0 0 ${agentPct}%` } : undefined}
             >
               {activeProject && hasAgent ? (
-                <Terminal
-                  sessionName={agentSession}
-                  projectId={activeProject.id}
-                  workstream={activeWorkstream}
-                  active={true}
-                  autoFocus={!isNarrow || activePane === 'agent'}
-                  onActivity={onActivity}
-                  key={`${activeProject.id}-${activeWorkstream}-agent${isNarrow ? `-${activePane}` : ''}`}
-                />
+                <>
+                  <Terminal
+                    sessionName={agentSession}
+                    projectId={activeProject.id}
+                    workstream={activeWorkstream}
+                    instanceId={activeProject.instanceId}
+                    active={true}
+                    autoFocus={!isNarrow || activePane === 'agent'}
+                    onActivity={onActivity}
+                    key={`${activeProject.id}-${activeWorkstream}-agent${isNarrow ? `-${activePane}` : ''}`}
+                  />
+                  {/* Overlay strip across the top of THIS pane (.app-agent is
+                      position: relative): "PR opened — Compact / Clear / Keep". */}
+                  <PrContextPrompt
+                    projectId={activeProject.id}
+                    instanceId={activeProject.instanceId}
+                    workstream={activeWorkstream}
+                    session={agentSession}
+                    status={statusMap[statusKey(activeProject.instanceId, agentSession)]}
+                  />
+                  {/* Lower-right overlay: start a Devin review of the PR being worked on. */}
+                  <ReviewButton
+                    projectId={activeProject.id}
+                    workstream={activeWorkstream}
+                    hasReview={!!review}
+                    onStarted={onReviewStarted}
+                    key={`${activeProject.id}-${activeWorkstream}-review-btn`}
+                  />
+                </>
               ) : (
                 <div className="empty-pane">
                   {activeProject ? 'Add an agent workflow →' : 'Select a project'}
@@ -333,15 +474,35 @@ function MainLayout() {
           {(!isNarrow || activePane === 'ctrl') && (
             <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
               {activeProject && hasAgent ? (
-                <Terminal
-                  sessionName={ctrlSession}
-                  projectId={activeProject.id}
-                  workstream={activeWorkstream}
-                  active={true}
-                  autoFocus={isNarrow && activePane === 'ctrl'}
-                  onActivity={onActivity}
-                  key={`${activeProject.id}-${activeWorkstream}-ctrl${isNarrow ? `-${activePane}` : ''}`}
-                />
+                <>
+                  <div className="app-ctrl-term">
+                    <Terminal
+                      sessionName={ctrlSession}
+                      projectId={activeProject.id}
+                      workstream={activeWorkstream}
+                      instanceId={activeProject.instanceId}
+                      active={true}
+                      autoFocus={isNarrow && activePane === 'ctrl'}
+                      onActivity={onActivity}
+                      key={`${activeProject.id}-${activeWorkstream}-ctrl${isNarrow ? `-${activePane}` : ''}`}
+                    />
+                  </div>
+                  {/* The Devin review pane docks under the ctrl terminal:
+                      a one-line bar collapsed, half the column expanded. */}
+                  {review && (
+                    <ReviewDock
+                      projectId={activeProject.id}
+                      instanceId={activeProject.instanceId}
+                      workstream={activeWorkstream}
+                      sessionName={reviewSession}
+                      status={review.status}
+                      review={reviewMeta}
+                      expanded={review.expanded}
+                      onToggle={toggleReview}
+                      onStop={stopReview}
+                    />
+                  )}
+                </>
               ) : (
                 <div className="empty-pane">
                   {activeProject ? 'Add an agent workflow →' : 'Select a project'}
@@ -355,51 +516,6 @@ function MainLayout() {
   );
 }
 
-function getInitials(name: string): string {
-  // Split on dashes/underscores, take first char of each word, max 3
-  const parts = name.split(/[-_]+/).filter(Boolean);
-  if (parts.length >= 2) return parts.slice(0, 3).map(w => w[0]).join('').toUpperCase();
-  // Single word: first 2 chars
-  return name.slice(0, 2).toUpperCase();
-}
-
-function SidebarCollapsed({
-  projects, activeProjectId, statusMap, username,
-}: {
-  projects: Project[];
-  activeProjectId: string | null;
-  statusMap: Record<string, { status: string; contextTokens?: number; rateLimited?: string | null } | undefined>;
-  username: string;
-}) {
-  const { setActiveProject } = useProjects();
-  return (
-    <div className="sidebar-collapsed-list">
-      {projects.map(p => {
-        const owner = p.ownerUsername ?? username;
-        const agentSession = `${owner}-${p.name}-agent`;
-        const st = statusMap[agentSession];
-        const s = st?.status ?? 'not_running';
-        const ctx = st?.contextTokens;
-        const rateLimit = st?.rateLimited;
-        const ctxLevel = ctx ? (contextLevel(ctx) === 'ok' ? null : contextLevel(ctx)) : null;
-        const color = s === 'working' ? 'var(--success)' : s === 'waiting' ? 'var(--warning)' : s === 'idle' ? 'var(--danger)' : 'var(--text-muted)';
-        const ringClass = rateLimit ? 'rate-limit-ring' : ctxLevel ? `ctx-ring-${ctxLevel}` : '';
-        return (
-          <div
-            key={p.id}
-            className={`sidebar-collapsed-item ${activeProjectId === p.id ? 'active' : ''} ${rateLimit ? 'rate-limited' : ''}`}
-            title={rateLimit ? `⚠ ${rateLimit}` : p.name}
-            onClick={() => setActiveProject(p.id)}
-          >
-            <span className={`sidebar-dot-light ${ringClass}`} style={{ background: color }} />
-            <span className="sidebar-collapsed-initials">{getInitials(p.name)}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
   if (loading) return <div className="loading-screen">Loading…</div>;
@@ -408,41 +524,140 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 }
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Settings = lazy(() => import('./pages/Settings'));
+const Admin = lazy(() => import('./pages/Admin'));
+const Welcome = lazy(() => import('./pages/Welcome'));
+const MobileApp = lazy(() => import('./pages/mobile/MobileApp'));
+
+/**
+ * Phone-sized viewports go to the mobile client when the
+ * `mobile-redirect-enabled` flag is on and this browser has not pressed
+ * "Full UI". Sits inside FeatureFlagsProvider (for the flag) and before
+ * MainLayout, so no terminal socket is opened for a page that is about to leave.
+ */
+function MobileRedirectGate({ children }: { children: React.ReactNode }) {
+  const flagOn = useFlag(FLAGS.mobileRedirect, false);
+  const phoneLike = typeof window !== 'undefined' && window.matchMedia(MOBILE_MEDIA_QUERY).matches;
+  const optedOut = readOptOut(typeof localStorage !== 'undefined' ? localStorage : null);
+  if (shouldRedirectToMobile({ flagOn, phoneLike, optedOut })) {
+    return <Navigate to={mobileHrefFromWorkspaceSearch(window.location.search)} replace />;
+  }
+  return <>{children}</>;
+}
+
+/**
+ * First-run gate for the workspace: a user who has never finished setup and
+ * has no projects is sent to /welcome. /welcome itself is
+ * outside this gate, and finishing/skipping clears the flag.
+ */
+function FirstRunGate({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  if (user?.needsOnboarding) return <Navigate to="/welcome" replace />;
+  return <>{children}</>;
+}
 
 export default function App() {
   return (
     <AuthProvider>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        {/* Dashboard: its own route, deliberately outside
-            ProjectProvider / MainLayout — no status WebSocket, no terminals, no
-            hyperspace canvas, and no human heartbeat (reading the dashboard must
-            not count as working time). Lazy so Recharts stays out of the
-            workspace bundle. Suspense sits INSIDE RequireAuth so a logged-out
-            visitor never downloads the chunk. */}
-        <Route
-          path="/dashboard"
-          element={
-            <RequireAuth>
-              <Suspense fallback={<div className="loading-screen">Loading…</div>}>
-                <Dashboard />
-              </Suspense>
-            </RequireAuth>
-          }
-        />
-        <Route
-          path="/*"
-          element={
-            <RequireAuth>
-              <ConnectionProvider>
-                <ProjectProvider>
-                  <MainLayout />
-                </ProjectProvider>
-              </ConnectionProvider>
-            </RequireAuth>
-          }
-        />
-      </Routes>
+      <ThemeProvider>
+        {/* Inside ThemeProvider so the error card has the theme's variables;
+            around every route so a crash anywhere shows a message, not a blank page. */}
+        <AppErrorBoundary>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          {/* Dashboard: its own route, deliberately outside FeatureFlagsProvider /
+              ProjectProvider / MainLayout — no status WebSocket, no terminals, no
+              hyperspace canvas, and no human heartbeat (reading the dashboard must
+              not count as working time). Lazy so Recharts stays out of the
+              workspace bundle. Suspense sits INSIDE RequireAuth so a logged-out
+              visitor never downloads the chunk. */}
+          <Route
+            path="/dashboard"
+            element={
+              <RequireAuth>
+                <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                  <Dashboard />
+                </Suspense>
+              </RequireAuth>
+            }
+          />
+          {/* First-run setup: its own page, outside the workspace layout. */}
+          <Route
+            path="/welcome"
+            element={
+              <RequireAuth>
+                <FeatureFlagsProvider>
+                  <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                    <Welcome />
+                  </Suspense>
+                </FeatureFlagsProvider>
+              </RequireAuth>
+            }
+          />
+          {/* Settings: mounted like the dashboard, outside the workspace layout. */}
+          <Route
+            path="/settings"
+            element={
+              <RequireAuth>
+                <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                  <Settings />
+                </Suspense>
+              </RequireAuth>
+            }
+          />
+          {/* Admin: same isolation as the dashboard. The
+              page redirects non-admins; the server 404s them regardless. */}
+          <Route
+            path="/admin/*"
+            element={
+              <RequireAuth>
+                <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                  <Admin />
+                </Suspense>
+              </RequireAuth>
+            }
+          />
+          {/* Phone client: same providers as the workspace,
+              no MainLayout — an inbox and a chat view over the agent pane. */}
+          <Route
+            path="/m/*"
+            element={
+              <RequireAuth>
+                <FirstRunGate>
+                <FeatureFlagsProvider>
+                  <ConnectionProvider>
+                    <ProjectProvider>
+                      <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                        <MobileApp />
+                      </Suspense>
+                    </ProjectProvider>
+                  </ConnectionProvider>
+                </FeatureFlagsProvider>
+                </FirstRunGate>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/*"
+            element={
+              <RequireAuth>
+                <FirstRunGate>
+                <FeatureFlagsProvider>
+                  <ConnectionProvider>
+                    <ProjectProvider>
+                      <MobileRedirectGate>
+                        <MainLayout />
+                      </MobileRedirectGate>
+                    </ProjectProvider>
+                  </ConnectionProvider>
+                </FeatureFlagsProvider>
+                </FirstRunGate>
+              </RequireAuth>
+            }
+          />
+        </Routes>
+        </AppErrorBoundary>
+      </ThemeProvider>
     </AuthProvider>
   );
 }

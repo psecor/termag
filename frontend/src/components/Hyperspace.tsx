@@ -5,7 +5,6 @@ interface HyperspaceProps {
   activeCount: number;
   typingBoost?: boolean;
   targetWarp?: number;
-  onWarpChange?: (warp: number) => void;
   /**
    * Backend reachability. The starfield is the one thing on screen that keeps
    * moving when the network silently dies, so it must carry the signal:
@@ -20,8 +19,8 @@ const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
  * Tracks the OS/browser reduced-motion preference, and follows changes to it.
  *
  * A full-screen starfield that accelerates with activity is exactly the kind of
- * motion this setting exists to suppress, and users with vestibular sensitivity
- * have no other way to turn it off today.
+ * motion this setting exists to suppress: it freezes the stars in place. To be
+ * rid of them entirely, Settings → Appearance swaps in a solid colour.
  */
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(() =>
@@ -47,7 +46,7 @@ function usePrefersReducedMotion(): boolean {
 // in step with it.
 const CONNECTION_EASE = 0.03;
 
-export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange, connection = 'online' }: HyperspaceProps) {
+export function Hyperspace({ activeCount, typingBoost, targetWarp, connection = 'online' }: HyperspaceProps) {
   const prefersReducedMotion = usePrefersReducedMotion();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const activeCountRef = useRef(activeCount);
@@ -58,9 +57,6 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange,
   targetWarpRef.current = targetWarp;
   const connectionRef = useRef<ConnectionState>(connection);
   connectionRef.current = connection;
-  const warpRef = useRef(0.1);
-  const onWarpChangeRef = useRef(onWarpChange);
-  onWarpChangeRef.current = onWarpChange;
   // Reduced-motion mode renders a single frame; expose the draw so a
   // connection change can re-render that frame with the new tint.
   const drawOnceRef = useRef<(() => void) | null>(null);
@@ -94,8 +90,6 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange,
       });
     }
 
-    let lastWarpUpdate = 0;
-
     // Eased connection look. Starts at the current state's targets so a page
     // that loads while offline doesn't animate from "healthy" first.
     const initial = starfieldTargets(connectionRef.current);
@@ -128,15 +122,6 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange,
       if (want.speedScale === 0 && speedScale < 0.005) speedScale = 0;
 
       const speed = (requestedWarp <= 0.1 ? 0.4 : requestedWarp * 2.75) * speedScale;
-
-      warpRef.current += (requestedWarp - warpRef.current) * 0.15;
-
-      // Push warp to parent at ~10fps
-      const now = Date.now();
-      if (now - lastWarpUpdate > 100) {
-        lastWarpUpdate = now;
-        try { onWarpChangeRef.current?.(warpRef.current); } catch { /* ok */ }
-      }
 
       // Slower fade = longer trails. More opacity when active for even longer streaks.
       // While stopped, fade harder so the frozen frame settles to clean dots
@@ -207,8 +192,9 @@ export function Hyperspace({ activeCount, typingBoost, targetWarp, onWarpChange,
         }
       }
 
-      // Reduced motion: render one static frame and stop. Skipping the loop
-      // also stops the per-frame warp sampling that posts to the backend.
+      // Reduced motion: render one static frame and stop. The sidebar speed
+      // readout is stepped by its own timer (hooks/useEasedWarp.ts), so
+      // nothing else depends on this loop running.
       if (!prefersReducedMotion) animId = requestAnimationFrame(draw);
     }
 

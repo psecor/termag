@@ -6,12 +6,16 @@
  * don't carry an agent's state). Rows on a host whose agent is offline are
  * skipped by every per-row rule: their `alive`/status are unreliable there.
  */
-import type { SessionRow, UsageResponse, WorktimeProjectRow } from '../../services/api';
-import type { Project } from '../../types';
+import type { PrPipelineResponse, SessionRow, UsageResponse, WorktimeProjectRow } from '../../services/api';
+import type { CloudSession, Project } from '../../types';
+import { cloudTitle } from '../../utils/cloudSessions';
 import { dayTokens, fmtAge, fmtDurationShort, fmtK } from '../../utils/format';
 import { median } from '../../utils/dates';
 import { HUMAN } from '../../utils/worktime';
 import { dominantProjectToday } from './usageProjects';
+import { promptContextTokens, shouldShowPrPrompt } from '../../utils/prPrompt';
+import { rateLimitDetail, rateLimitLabel } from '../../utils/rateLimit';
+import { lanesOf, rowLabel } from '../../utils/prPipeline';
 import {
   CONTEXT_WARN_TOKENS, CONTEXT_DANGER_TOKENS,
   WAITING_WARN_MS, WAITING_CRIT_MS,
@@ -22,8 +26,9 @@ import {
 
 export type Severity = 'critical' | 'warning' | 'notice';
 export type AttentionKind =
-  | 'agent_offline' | 'rate_limited' | 'context' | 'waiting' | 'idle'
-  | 'token_burn' | 'usage_unavailable' | 'effort';
+  | 'agent_offline' | 'rate_limited' | 'context' | 'pr_prompt' | 'waiting' | 'idle'
+  | 'token_burn' | 'usage_unavailable' | 'effort' | 'cloud_queued'
+  | 'pr_needs_my_review' | 'pr_ready_to_merge' | 'pr_checks_failed';
 
 export interface AttentionItem {
   id: string;
@@ -36,6 +41,8 @@ export interface AttentionItem {
   projectName?: string;
   workstream?: string;
   projectColor?: string | null;
+  /** An external link (a pull request on GitHub); wins over the project link. */
+  href?: string;
   /** Sort key within a severity (bigger = higher). */
   metric: number;
 }
@@ -51,7 +58,22 @@ export interface TriageInput {
   /** UTC key for today's tokens, and the trailing UTC days that form the baseline. */
   todayUTC: string;
   baselineUTC: string[];
+  /** The owner's active Claude Code cloud sessions; optional, older callers pass nothing. */
+  cloudSessions?: CloudSession[] | null;
+  /** The PR pipeline (GET /api/prs); optional, older callers pass nothing. */
+  prs?: PrPipelineResponse | null;
 }
+
+/** A review request this old turns from a notice into a warning. */
+export const PR_REVIEW_WARN_MS = 24 * 3_600_000;
+/** More PR items of one kind than this become one summary item. */
+export const PR_ITEMS_PER_KIND = 2;
+/** The dashboard's Pull requests section, which a summary item scrolls to. */
+export const PRS_ANCHOR = '#prs';
+
+/** A cloud session queued this long is worth a look; this long, worth worrying about. */
+export const CLOUD_QUEUED_WARN_MS = 5 * 60_000;
+export const CLOUD_QUEUED_CRIT_MS = 15 * 60_000;
 
 const SEVERITY_RANK: Record<Severity, number> = { critical: 0, warning: 1, notice: 2 };
 
@@ -90,14 +112,34 @@ export function buildAttentionItems(input: TriageInput, now: number): AttentionI
     if (!r.rateLimited) continue;
     items.push({
       id: `rate:${r.session}`, kind: 'rate_limited', severity: 'warning',
-      title: `Rate limited — ${r.rateLimited}`, detail: `${r.provider ?? 'agent'} is throttled in this pane.`,
-      action: 'wait or switch provider', metric: 0,
+      title: `${rateLimitLabel(r.rateLimited)} — ${r.rateLimited}`, detail: rateLimitDetail(r.rateLimited, r.provider ?? 'agent'),
+      action: rateLimitLabel(r.rateLimited) === 'RATE LIMITED' ? 'wait or switch provider' : 'check the pane', metric: 0,
+      projectId: r.projectId, projectName: r.projectName, workstream: r.workstream, projectColor: colorOf(r),
+    });
+  }
+
+  // 2b. "PR opened — compact or clear?" prompts awaiting a decision. Same gate
+  // as the in-pane card and the tile dot (shouldShowPrPrompt) so the three
+  // agree. A session with one of these skips the generic context-pressure item
+  // below: the prompt already says what to do, and more specifically.
+  // Keyed by host + session: the same tmux name can exist on two boxes.
+  const prPromptSessions = new Set<string>();
+  for (const r of live) {
+    if (!shouldShowPrPrompt({ status: r.status, milestone: r.milestone, contextTokens: r.contextTokens, now })) continue;
+    prPromptSessions.add(`${hostKey(r)}:${r.session}`);
+    const t = promptContextTokens(r.milestone, r.contextTokens) ?? 0;
+    items.push({
+      id: `pr:${hostKey(r)}:${r.session}`, kind: 'pr_prompt', severity: 'notice',
+      title: `${r.milestone!.kind === 'pr_merged' ? 'PR merged' : 'PR opened'} with ${fmtK(t)} tokens of context`,
+      detail: `${fmtAge(now - Date.parse(r.milestone!.at))} ago. A natural point to shrink the conversation before the next task.`,
+      action: 'compact or clear', metric: t,
       projectId: r.projectId, projectName: r.projectName, workstream: r.workstream, projectColor: colorOf(r),
     });
   }
 
   // 3. Context pressure
   for (const r of live) {
+    if (prPromptSessions.has(`${hostKey(r)}:${r.session}`)) continue;
     const t = r.contextTokens;
     if (t == null || t < CONTEXT_WARN_TOKENS) continue;
     const critical = t >= CONTEXT_DANGER_TOKENS;
@@ -140,6 +182,77 @@ export function buildAttentionItems(input: TriageInput, now: number): AttentionI
       detail: 'tmux is up but nothing has happened here in a while.',
       action: 'resume or stop it', metric: age,
       projectId: r.projectId, projectName: r.projectName, workstream: r.workstream, projectColor: colorOf(r),
+    });
+  }
+
+  // 5b. Cloud sessions the orchestrator could not place: no box, every slot
+  // full, GitHub not connected. The reason is what the Activity tab shows.
+  for (const s of input.cloudSessions ?? []) {
+    if (s.state !== 'queued') continue;
+    // Time queued, not time since the latest re-offer: the orchestrator retries
+    // every few minutes and each retry is an event.
+    const age = now - Date.parse(s.queuedSince ?? s.lastSeenAt);
+    if (!Number.isFinite(age) || age < CLOUD_QUEUED_WARN_MS) continue;
+    items.push({
+      id: `cloudq:${s.key}`, kind: 'cloud_queued', severity: age >= CLOUD_QUEUED_CRIT_MS ? 'critical' : 'warning',
+      title: `Cloud session "${cloudTitle(s)}" queued ${fmtAge(age)}`,
+      detail: s.queuedReason ?? 'The orchestrator has not found a box for it.',
+      action: 'start or add a box', metric: age,
+    });
+  }
+
+  // 5c. Pull requests: a review asked of me, mine ready to merge, mine with
+  // red checks. Red non-required checks count on purpose:
+  // the author ignores the suggestion or takes it, explicitly. More than
+  // PR_ITEMS_PER_KIND of one kind collapse into one item pointing at the Pull
+  // requests section, and PR items rank below session items of the same
+  // severity (metric 0): a stale review request is not more urgent than an
+  // agent waiting on you.
+  const prItems = new Map<AttentionKind, AttentionItem[]>();
+  const addPr = (it: AttentionItem) => prItems.set(it.kind, [...(prItems.get(it.kind) ?? []), it]);
+  for (const lane of lanesOf(input.prs)) {
+    for (const r of lane.rows) {
+      if (r.kind !== 'pr' || !r.url) continue;
+      const where = r.workstream ? { projectName: r.workstream.projectName, workstream: r.workstream.workstream } : {};
+      const age = now - Date.parse(r.requestedAt ?? r.at ?? '');
+      const ageMs = Number.isFinite(age) ? age : 0;
+      if (lane.id === 'needs_my_review') {
+        addPr({
+          id: `prrev:${r.repo}#${r.number}`, kind: 'pr_needs_my_review', severity: ageMs >= PR_REVIEW_WARN_MS ? 'warning' : 'notice',
+          title: `Review requested on ${rowLabel(r)}: ${r.title}`,
+          detail: `By ${r.author ?? 'someone'}${r.requestedAt ? `, asked ${fmtAge(ageMs)} ago` : ''}.`,
+          action: 'review it', href: r.url, metric: 0, ...where,
+        });
+      } else if (lane.id === 'ready_to_merge') {
+        addPr({
+          id: `prready:${r.repo}#${r.number}`, kind: 'pr_ready_to_merge', severity: 'notice',
+          title: `${rowLabel(r)} is approved and green`,
+          detail: r.blockedBy ? `${r.title} · but ${r.blockedBy}.` : r.title,
+          action: 'merge it', href: r.url, metric: 0, ...where,
+        });
+      } else if (lane.id === 'checks' && r.failingChecks.length && !r.badges.includes('draft')) {
+        addPr({
+          id: `prfail:${r.repo}#${r.number}`, kind: 'pr_checks_failed', severity: 'warning',
+          title: `Checks failing on ${rowLabel(r)}: ${r.failingChecks.join(', ')}`,
+          detail: r.title,
+          action: 'fix or dismiss', href: r.url, metric: 0, ...where,
+        });
+      }
+    }
+  }
+  const PR_SUMMARY: Partial<Record<AttentionKind, (n: number) => string>> = {
+    pr_needs_my_review: n => `${n} pull requests are waiting on your review`,
+    pr_ready_to_merge: n => `${n} of your pull requests are ready to merge`,
+    pr_checks_failed: n => `${n} of your pull requests have failing checks`,
+  };
+  for (const [kind, list] of prItems) {
+    if (list.length <= PR_ITEMS_PER_KIND) { items.push(...list); continue; }
+    const severity = list.some(i => i.severity === 'warning') ? 'warning' : 'notice';
+    items.push({
+      id: `prs:${kind}`, kind, severity,
+      title: PR_SUMMARY[kind]!(list.length),
+      detail: list.slice(0, 3).map(i => i.id.split(':')[1].replace(/^[^/]+\//, '')).join(', ') + (list.length > 3 ? ', …' : ''),
+      action: 'see pull requests', href: PRS_ANCHOR, metric: 0,
     });
   }
 

@@ -32,9 +32,12 @@ function Item({ it }: { it: AttentionItem }) {
         </span>
         <span className="attn-detail">{it.detail}</span>
       </span>
-      <span className="attn-action">{it.action} {it.projectId ? '→' : ''}</span>
+      <span className="attn-action">{it.action} {it.href?.startsWith('#') ? '↓' : it.href ? '↗' : it.projectId ? '→' : ''}</span>
     </>
   );
+  // An in-page anchor (a PR summary item) scrolls; anything else is GitHub, in a new tab.
+  if (it.href?.startsWith('#')) return <a className="attn-item" href={it.href}>{body}</a>;
+  if (it.href) return <a className="attn-item" href={it.href} target="_blank" rel="noreferrer">{body}</a>;
   return it.projectId
     ? <Link className="attn-item" to={projectHref(it.projectId, it.workstream)}>{body}</Link>
     : <div className="attn-item">{body}</div>;

@@ -124,6 +124,7 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, n
   const maxMs = Math.max(1, ...lines.map(l => Math.max(l.agentMs, l.humanMs)));
   const shown = all ? lines : lines.slice(0, SHOW);
   const totalAgent = lines.reduce((s, l) => s + l.agentMs, 0);
+  const totalHuman = lines.reduce((s, l) => s + l.humanMs, 0);
 
   const table = {
     columns: ['project', 'agent', ...providersUsed.map(p => p.displayName), 'you', 'tokens', 'status', 'ctx now', 'ctx peak', 'last active'],
@@ -135,13 +136,13 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, n
   };
 
   return (
-    <ChartCard title="By project" subtitle={`effort ${keys.label} · live state now`} value={fmtDurationShort(totalAgent)} stale={stale || rows === null} table={table}>
+    <ChartCard title="By project" subtitle={`effort ${keys.label} · live state now`} value={`${fmtDurationShort(totalAgent)} agents · ${fmtDurationShort(totalHuman)} you`} stale={stale || rows === null} table={table}>
       {lines.length === 0 ? (
         <div className="usage-dim">{rows === null ? 'loading…' : 'no activity in this range'}</div>
       ) : (
         <div className="pb-table" role="table">
           <div className="pb-head" role="row">
-            <span>project</span><span>agents</span><span>you</span><span>tokens</span><span>now</span><span>ctx</span><span>last active</span>
+            <span>project</span><span>effort — agents over you</span><span>tokens</span><span>now</span><span>ctx</span><span>last active</span>
           </div>
           {shown.map(l => {
             const lvl = contextLevel(l.ctxNow);
@@ -154,21 +155,27 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, n
                   {l.workstreams.size > 1 && <span className="usage-dim">↳{l.workstreams.size}</span>}
                   {l.kind === 'metaterm' && <span className="usage-dim">⚡</span>}
                 </span>
-                <span className="pb-bar" title={providersUsed.map(p => `${p.displayName}: ${fmtDurationShort(l.byProvider[p.id] ?? 0)}`).join(' · ')}>
-                  <span className="pb-track">
-                    {providersUsed.map(p => {
-                      const ms = l.byProvider[p.id] ?? 0;
-                      if (ms <= 0) return null;
-                      return <i key={p.id} style={{ width: `${(ms / maxMs) * 100}%`, background: opaque(p.color.base) }} />;
-                    })}
+                {/* One cell, two tracks of IDENTICAL width over the shared maxMs:
+                    agents (a segment per provider) directly over you. They used
+                    to be two grid columns of different widths, so the same
+                    percentage drew at two different physical scales. */}
+                <span className="pb-effort">
+                  <span className="pb-bar" title={providersUsed.map(p => `${p.displayName}: ${fmtDurationShort(l.byProvider[p.id] ?? 0)}`).join(' · ')}>
+                    <span className="pb-track">
+                      {providersUsed.map(p => {
+                        const ms = l.byProvider[p.id] ?? 0;
+                        if (ms <= 0) return null;
+                        return <i key={p.id} style={{ width: `${(ms / maxMs) * 100}%`, background: opaque(p.color.base) }} />;
+                      })}
+                    </span>
+                    <span className="pb-val">{l.agentMs > 0 ? fmtDurationShort(l.agentMs) : '—'}</span>
                   </span>
-                  <span className="pb-val">{l.agentMs > 0 ? fmtDurationShort(l.agentMs) : '—'}</span>
-                </span>
-                <span className="pb-bar" title={`You: ${fmtDurationShort(l.humanMs)}`}>
-                  <span className="pb-track">
-                    {l.humanMs > 0 && <i style={{ width: `${(l.humanMs / maxMs) * 100}%`, background: opaque(PROVIDERS[HUMAN].color.bright) }} />}
+                  <span className="pb-bar" title={`You: ${fmtDurationShort(l.humanMs)}`}>
+                    <span className="pb-track">
+                      {l.humanMs > 0 && <i style={{ width: `${(l.humanMs / maxMs) * 100}%`, background: opaque(PROVIDERS[HUMAN].color.bright) }} />}
+                    </span>
+                    <span className="pb-val">{l.humanMs > 0 ? fmtDurationShort(l.humanMs) : '—'}</span>
                   </span>
-                  <span className="pb-val">{l.humanMs > 0 ? fmtDurationShort(l.humanMs) : '—'}</span>
                 </span>
                 <span className="pb-bar" title={l.tokens ? `${fmtK(l.tokens)} tokens ${keys.label}` : 'no tokens attributed in range'}>
                   <span className="pb-track">

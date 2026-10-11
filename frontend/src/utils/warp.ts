@@ -62,3 +62,18 @@ export function computeWarpWithFallback(statusMap: StatusMap, typingBoost: boole
     isActive: workingCount > 0 || waitingCount > 0 || typingBoost,
   };
 }
+
+// The starfield eased its reported speed by 0.15 per frame at ~60fps. The
+// readout is now stepped by a timer (hooks/useEasedWarp.ts), so the same feel
+// is kept by scaling that per-frame factor to the elapsed time.
+const READOUT_EASE_PER_FRAME = 0.15;
+const REFERENCE_FRAME_MS = 1000 / 60;
+const READOUT_SNAP = 0.0005;
+
+export function easeWarp(current: number, target: number, elapsedMs: number): number {
+  if (!Number.isFinite(current)) return target;
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return current;
+  const frames = elapsedMs / REFERENCE_FRAME_MS;
+  const next = target + (current - target) * Math.pow(1 - READOUT_EASE_PER_FRAME, frames);
+  return Math.abs(next - target) < READOUT_SNAP ? target : next;
+}

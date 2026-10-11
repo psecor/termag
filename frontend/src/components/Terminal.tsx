@@ -4,6 +4,22 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import 'xterm/css/xterm.css';
 import { useConnection } from '../contexts/ConnectionContext';
+import { shouldKickTerminalOnGlobalRecovery, TerminalPaneState } from '../utils/connection';
+import { connectionTracker } from '../utils/connectionTracker';
+import { noteFirstTerminalData } from '../services/claimTiming';
+import { boxStatusBus } from '../utils/boxStatusBus';
+import { customKeySequence } from '../utils/terminalKeys';
+import {
+  BoxParkedNotice,
+  FAILED_AFTER_ATTEMPTS,
+  initialPaneLoop,
+  PaneEffects,
+  PaneEvent,
+  PaneLoop,
+  parseBoxParkedNotice,
+  STARTING_POLL_MS,
+  step,
+} from '../utils/terminalReconnect';
 
 interface TerminalProps {
   sessionName: string;
@@ -12,9 +28,17 @@ interface TerminalProps {
   // string, so same-named projects on different boxes route correctly.
   projectId?: string;
   workstream?: string;
+  /** The box the project lives on, so the pane can react to the box list's status changes. */
+  instanceId?: string | null;
   active: boolean;
   autoFocus?: boolean;
   onActivity?: () => void;
+  /**
+   * The pane's xterm took keyboard focus (a real click/keyboard visit, and
+   * also a programmatic one). The review dock turns this into
+   * POST /review/seen while its review is done.
+   */
+  onFocus?: () => void;
 }
 
 // Regex to match mouse tracking enable/disable escape sequences
@@ -22,16 +46,6 @@ const MOUSE_TRACKING_RE = /\x1b\[\?(9|1000|1002|1003|1004|1005|1006|1015|1016)[h
 
 // Sequences to disable all mouse tracking modes in xterm.js
 const DISABLE_MOUSE = '\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
-
-// Reconnect schedule. The first five attempts (~7.5s total) cover transient
-// blips — agent restart, server restart, network hiccup — after which we
-// surface the overlay. Retries then CONTINUE indefinitely at the capped
-// delay, so a pane left open through a longer outage (VPN drop, laptop
-// sleep) comes back on its own instead of sitting dead behind a modal.
-const RECONNECT_DELAYS_MS = [0, 500, 1000, 2000, 4000, 8000, 15_000, 30_000];
-const FAILED_AFTER_ATTEMPTS = 5;
-
-type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed';
 
 // Handle an incoming OSC 52 payload ("<selection>;<base64>") by writing the
 // decoded text to the system clipboard. This is how a copy inside tmux
@@ -128,7 +142,13 @@ function imageFromClipboardData(dt: DataTransfer | null): File | null {
   return null;
 }
 
-export function Terminal({ sessionName, projectId, workstream, active, autoFocus, onActivity }: TerminalProps) {
+export function Terminal({ sessionName, projectId, workstream, instanceId, active, autoFocus, onActivity, onFocus }: TerminalProps) {
+  const instanceIdRef = useRef(instanceId);
+  instanceIdRef.current = instanceId;
+  // Latest onFocus without re-running the effect that registers the listener
+  // (a changed callback must not rebuild the terminal).
+  const onFocusRef = useRef(onFocus);
+  onFocusRef.current = onFocus;
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -137,23 +157,32 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
   const [focused, setFocused] = useState(false);
 
   // Reconnect lifecycle
-  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
+  const [connectionState, setConnectionState] = useState<TerminalPaneState>('connecting');
   const [retryAttempt, setRetryAttempt] = useState(0);
+  // Set while the pane's box is stopping, stopped or starting; drives the
+  // parked notice, which updates in place instead of writing into the pane.
+  const [parked, setParked] = useState<BoxParkedNotice | null>(null);
+  const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   // Stable reference the modal "Try again" button can invoke. Set inside the
   // useEffect that owns the connection lifecycle.
   const retryRef = useRef<(() => void) | null>(null);
 
-  // App-level reachability. When the backend comes back, kick this pane's
-  // reconnect immediately instead of waiting out a 30s backoff slot.
+  // App-level reachability. When the backend comes back, kick a pane sitting
+  // on a backoff timer instead of waiting out a 30s slot. Skip panes that are
+  // already attaching: reconnectNow puts them in `connecting` first, and a
+  // second retry here would tear that socket down. Half-open sockets that
+  // still look connected are kicked from reconnectNow itself.
   const { state: globalConnection } = useConnection();
   const prevGlobalRef = useRef(globalConnection);
   useEffect(() => {
     const was = prevGlobalRef.current;
     prevGlobalRef.current = globalConnection;
-    if (was !== 'online' && globalConnection === 'online' && connectionState !== 'connected') {
+    if (shouldKickTerminalOnGlobalRecovery(was, globalConnection, connectionState)) {
       retryRef.current?.();
     }
   }, [globalConnection, connectionState]);
+
+  useEffect(() => connectionTracker.registerTerminalReconnect(() => retryRef.current?.()), []);
 
   useEffect(() => {
     if (autoFocus && termRef.current) {
@@ -206,13 +235,37 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
     term.parser.registerOscHandler(52, handleOsc52);
     termRef.current = term;
 
-    const onFocus = () => setFocused(true);
+    const onFocus = () => { setFocused(true); onFocusRef.current?.(); };
     const onBlur = () => setFocused(false);
 
     let disposed = false;
     let textarea: HTMLElement | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let attempt = 0;
+    let loop: PaneLoop = initialPaneLoop;
+    let connect: () => void = () => {};
+
+    const dispatch = (e: PaneEvent): PaneEffects => {
+      const { loop: next, fx } = step(loop, e);
+      loop = next;
+      if (disposed) return fx;
+      setRetryAttempt(loop.attempt);
+      setParked(loop.parked);
+      if (fx.paneState) setConnectionState(fx.paneState);
+      if (fx.announceReconnected) term.write('\r\n[reconnected]\r\n');
+      if (fx.retryInMs !== undefined) {
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          connect();
+        }, fx.retryInMs);
+      }
+      if (fx.dialNow) connect();
+      return fx;
+    };
+
+    const unsubscribeBoxStatus = boxStatusBus.subscribe((boxId, status) => {
+      dispatch({ type: 'box-status', instanceId: boxId, status, ownBox: boxId === instanceIdRef.current });
+    });
 
     const initTimer = requestAnimationFrame(() => {
       if (disposed) return;
@@ -233,7 +286,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       // (Re)open the WebSocket. Called once at startup and again from the
       // backoff loop and the modal's Try-again button. The xterm.js Terminal
       // itself is created once and reused — only the underlying WS churns.
-      const connect = () => {
+      connect = () => {
         if (disposed) return;
         // Exactly one pending connect at a time. A retry timer and a global
         // "back online" kick can both want to connect; whichever runs second
@@ -254,8 +307,8 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           wsRef.current = null;
           try { prev.close(); } catch { /* ignore */ }
         }
-        setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
-        setRetryAttempt(attempt);
+        dispatch({ type: 'dial' });
+        if (loop.parked) setLastCheckedAt(Date.now());
 
         const routing = projectId
           ? `&projectId=${encodeURIComponent(projectId)}&workstream=${encodeURIComponent(workstream ?? 'main')}`
@@ -273,12 +326,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           if (disposed || !isCurrent()) { try { ws.close(); } catch { /* ignore */ } return; }
           // A successful (re)open resets the retry budget so a fresh
           // disconnect later gets the full backoff schedule again.
-          if (attempt > 0) {
-            term.write('\r\n[reconnected]\r\n');
-          }
-          attempt = 0;
-          setRetryAttempt(0);
-          setConnectionState('connected');
+          dispatch({ type: 'open' });
           fitAddon.fit();
           if (term.cols !== initCols || term.rows !== initRows) {
             ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -290,7 +338,12 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           if (!isCurrent()) return;
           try {
             const msg = JSON.parse(event.data as string) as { type: string; data?: string };
-            if (msg.type === 'output' && msg.data) {
+            const notice = parseBoxParkedNotice(msg);
+            if (notice) {
+              dispatch({ type: 'box-power', notice });
+            } else if (msg.type === 'output' && msg.data) {
+              if (!dispatch({ type: 'output' }).write) return;
+              if (projectId) noteFirstTerminalData(projectId);
               if (selectModeRef.current) {
                 // Strip mouse tracking sequences so xterm.js stays in selection mode
                 const filtered = msg.data.replace(MOUSE_TRACKING_RE, '');
@@ -304,23 +357,15 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           } catch { /* ignore */ }
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           // Only the current socket's close means "we lost the connection".
           if (!isCurrent()) return;
           wsRef.current = null;
           if (disposed) return;
-          attempt += 1;
-          setRetryAttempt(attempt);
           // Past the quick-retry budget, surface the overlay so the user can
           // force a retry — but keep the automatic loop going at the capped
           // delay so recovery doesn't depend on them noticing.
-          setConnectionState(attempt >= FAILED_AFTER_ATTEMPTS ? 'failed' : 'reconnecting');
-          const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
-          if (retryTimer) clearTimeout(retryTimer);
-          retryTimer = setTimeout(() => {
-            retryTimer = null;
-            connect();
-          }, delay);
+          dispatch({ type: 'close', code: event.code });
         };
 
         ws.onerror = () => {
@@ -331,22 +376,20 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
 
       // Expose a manual retry the modal can invoke. Resets the retry
       // budget so the user gets a fresh backoff schedule.
-      retryRef.current = () => {
-        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-        attempt = 0;
-        setRetryAttempt(0);
-        connect();
-      };
+      retryRef.current = () => { dispatch({ type: 'retry' }); };
 
       connect();
 
-      const dataDisposable = term.onData((data) => {
+      // Everything typed goes through here, whether xterm encoded it or the
+      // custom key handler below did; both count as human activity.
+      const sendInput = (data: string) => {
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'input', data }));
         }
         if (onActivity) onActivity();
-      });
+      };
+      const dataDisposable = term.onData(sendInput);
 
       const sendPasteImage = async (blob: Blob) => {
         try {
@@ -404,11 +447,21 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
         }
       };
 
-      // Plain Ctrl+V fires no paste event; xterm just sends \x16, which would
-      // reach Claude Code before the image reached the box. Claim the key so
-      // the byte is sent by the agent after the image lands, or here when the
-      // clipboard holds no image.
+      // xterm allows one custom key handler, so every key termag claims lives
+      // here. Shift+Enter: xterm would send a bare CR, identical to Enter, so
+      // the agent CLI submits instead of inserting a newline; send the ESC CR
+      // sequence from utils/terminalKeys.ts instead. Plain Ctrl+V fires no
+      // paste event; xterm just sends \x16, which would reach Claude Code
+      // before the image reached the box. Claim the key so the byte is sent
+      // by the agent after the image lands, or here when the clipboard holds
+      // no image.
       term.attachCustomKeyEventHandler((ev) => {
+        const sequence = customKeySequence(ev);
+        if (sequence !== null) {
+          ev.preventDefault();
+          sendInput(sequence);
+          return false;
+        }
         if (ev.type !== 'keydown' || ev.key.toLowerCase() !== 'v') return true;
         if (!ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return true;
         ev.preventDefault();
@@ -452,6 +505,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
 
     return () => {
       disposed = true;
+      unsubscribeBoxStatus();
       cancelAnimationFrame(initTimer);
       if (retryTimer) clearTimeout(retryTimer);
       retryRef.current = null;
@@ -479,6 +533,7 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       setSelectMode(false);
       setConnectionState('connecting');
       setRetryAttempt(0);
+      setParked(null);
     };
   }, [active, sessionName]);
 
@@ -509,6 +564,27 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
       >
         {selectMode ? '✂ select' : '⇕ scroll'}
       </button>
+      {connectionState === 'parked' && parked && (
+        <div className="terminal-parked-notice" role="status" aria-live="polite">
+          {parked.status === 'starting' ? (
+            <>
+              <div>This box is starting. The terminal connects on its own once it is ready.</div>
+              <div className="terminal-parked-detail">
+                Checking every {STARTING_POLL_MS / 1000}s
+                {lastCheckedAt ? ` · last checked ${new Date(lastCheckedAt).toLocaleTimeString()}` : ''}
+              </div>
+            </>
+          ) : (
+            <>
+              <div>{parked.message}</div>
+              <div className="terminal-parked-detail">
+                The terminal reconnects when the box starts.{' '}
+                <button className="terminal-parked-retry" onClick={() => retryRef.current?.()}>Check now</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {connectionState === 'reconnecting' && (
         <div className="terminal-reconnect-pill" aria-live="polite">
           Reconnecting… ({retryAttempt}/{FAILED_AFTER_ATTEMPTS - 1})
@@ -518,10 +594,10 @@ export function Terminal({ sessionName, projectId, workstream, active, autoFocus
           starfield already say so; one modal per pane on top of that is
           noise, and its "check the box agent" advice is wrong. Show a quiet
           pill instead and let the global recovery re-trigger the connect. */}
-      {connectionState === 'failed' && globalConnection !== 'online' && (
-        <div className="terminal-reconnect-pill" aria-live="polite">
-          {globalConnection === 'offline' ? 'offline' : 'reconnecting…'}
-        </div>
+      {/* Offline is covered by the app-level takeover (ConnectionOverlay), so
+          only degraded still needs a per-pane hint. */}
+      {connectionState === 'failed' && globalConnection === 'degraded' && (
+        <div className="terminal-reconnect-pill" aria-live="polite">reconnecting…</div>
       )}
       {connectionState === 'failed' && globalConnection === 'online' && (
         <div className="terminal-reconnect-overlay" role="alertdialog" aria-modal="true">

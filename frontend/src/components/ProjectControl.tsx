@@ -1,13 +1,38 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
 import { contextLevel } from '../utils/thresholds';
 import { createPortal } from 'react-dom';
-import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue, Instance } from '../types';
-import { PROVIDERS, PROVIDER_IDS, providerForSource } from '../providers/registry';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { ConfirmDialog } from './ConfirmDialog';
+import { RecentsDropdown } from './RecentsDropdown';
+import { NewProjectDialog } from './NewProjectDialog';
+import { writeOptOut } from '../mobile/redirect';
+import { Project, ProjectInvite, ProjectShareInfo, STATUS_EMOJI, AgentStatusValue, Instance, Workstream, CloudSession } from '../types';
+import { PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider, runningProviderForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useConnection } from '../contexts/ConnectionContext';
-import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, metatermApi, AgentTokenInfo } from '../services/api';
+import { projectsApi, agentTokensApi, sharingApi, instancesApi, workstreamsApi, metatermApi, warmPoolApi, AgentTokenInfo, WarmPoolStatus } from '../services/api';
+import { claudeSessionsApi } from '../services/api';
+import { cloudSessionFeed } from '../services/cloudSessionFeed';
+import { cloudByBox, cloudCountLabel, cloudDotStatus, cloudElsewhere, cloudLabel, cloudStateLabel, cloudTitle, platformLabel } from '../utils/cloudSessions';
+import { FLAGS, useFlag } from '../flags';
 import { sessionName as buildSessionName } from '../utils/sessionName';
+import { statusKey } from '../utils/statusKey';
+import { shouldShowPrPrompt } from '../utils/prPrompt';
+import { aggregateReviewRing, reviewRingTooltip, ringStateFor, type RingState } from '../utils/reviewRing';
+import {
+  boxDisplay,
+  canHibernateBox,
+  canStartBox,
+  canStopBox,
+  hibernationAgeNote,
+  isBoxParked,
+  showsBoxError,
+} from '../utils/boxPower';
+import { boxFeed } from '../services/boxFeed';
+import { BOX_NAME_ERROR, isValidBoxName } from '../utils/boxNames';
+import { REPLAY_BLOCK_CLASS } from '../observability';
+import { repoPromptDue } from '../utils/repoPick';
 
 // Aggregate priority for combining per-workstream statuses into a single
 // project-row signal: "is anything alive on this project?"
@@ -31,36 +56,67 @@ function boxStripeColor(instanceId: string | null | undefined): string | null {
   return `hsl(${h % 360}, 55%, 58%)`;
 }
 
-function ConfirmDialog({ message, onConfirm, onCancel }: {
-  message: string;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="confirm-backdrop" onClick={onCancel}>
-      <div className="confirm-dialog" onClick={e => e.stopPropagation()}>
-        <p className="confirm-message">{message}</p>
-        <div className="confirm-actions">
-          <button className="confirm-btn confirm-btn-cancel" onClick={onCancel}>Cancel</button>
-          <button className="confirm-btn confirm-btn-confirm" onClick={onConfirm} autoFocus>Confirm</button>
-        </div>
-      </div>
-    </div>
-  );
+/** One-line status rollup for the collapsed boxes expander: "2 ready · 1 provisioning". */
+const BOX_SUMMARY_LABELS: Record<string, string> = {
+  ready: 'ready', provisioning: 'provisioning', 'awaiting-agent': 'awaiting agent',
+  starting: 'starting', stopping: 'stopping', stopped: 'stopped',
+  hibernating: 'hibernating', hibernated: 'hibernated', failed: 'failed',
+};
+const BOX_SUMMARY_ORDER = [
+  'ready', 'provisioning', 'awaiting-agent', 'starting', 'stopping', 'stopped', 'hibernating', 'hibernated', 'failed',
+];
+/** "3m", "2h", "1d": how long a cloud session has been where it is. */
+function fmtAgeShort(ms: number): string {
+  const m = Math.max(0, Math.round(ms / 60_000));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+export function boxSummary(boxes: Instance[], cloudSessions = 0): string {
+  if (boxes.length === 0) return '';
+  const counts = new Map<string, number>();
+  for (const b of boxes) counts.set(b.status, (counts.get(b.status) ?? 0) + 1);
+  const parts = BOX_SUMMARY_ORDER.filter(s => counts.has(s)).map(s => `${counts.get(s)} ${BOX_SUMMARY_LABELS[s]}`);
+  if (cloudSessions > 0) parts.push(cloudCountLabel(cloudSessions));
+  return parts.join(' · ');
 }
 
 export function ProjectControl() {
-  const { user, logout, updateDefaultAgentProvider } = useAuth();
+  const { user, updateDefaultAgentProvider } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const {
     projects, activeProjectId, statusMap, setActiveProject, reloadProjects,
     getActiveWorkstream, setActiveWorkstream,
   } = useProjects();
-  const [newProjectName, setNewProjectName] = useState('');
-  const [newProjectProvider, setNewProjectProvider] = useState(user?.defaultAgentProvider ?? 'codex');
-  const [newProjectInstanceId, setNewProjectInstanceId] = useState<string>('');
+  // "New project" opens the shared NewProjectForm in a dialog (NewProjectDialog).
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [repoPromptBoxId, setRepoPromptBoxId] = useState<string | undefined>();
+  const repoPickerOn = useFlag(FLAGS.repoFirstPicker, false);
+  // Settings picker: a stored default that is no longer selectable (e.g. codex) is
+  // rendered as a disabled "current" option so the select's value equals the stored
+  // value — otherwise picking Claude would equal the displayed value, never fire
+  // onChange, and the legacy default could never be changed to Claude.
+  const storedDefault = user?.defaultAgentProvider && PROVIDERS[user.defaultAgentProvider] ? user.defaultAgentProvider : 'claude';
+  const legacyDefault = isSelectableProvider(storedDefault) ? null : storedDefault;
   const [error, setError] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  // Closing the inline rename input (Enter, Escape, or a successful save)
+  // unmounts it, and the unmount fires onBlur with the stale closure. Without
+  // this guard Enter submits twice and Escape saves instead of discarding.
+  const renameSettled = useRef(false);
+  function beginRename(id: string, value: string) {
+    renameSettled.current = false;
+    setRenamingId(id);
+    setRenameValue(value);
+  }
+  function cancelRename() {
+    renameSettled.current = true;
+    setRenamingId(null);
+  }
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
   const [confirmState, setConfirmState] = useState<{ message: string; onConfirm: () => void } | null>(null);
   const [projectFilter, setProjectFilter] = useState('');
@@ -97,13 +153,17 @@ export function ProjectControl() {
 
   // Track status transitions for highlight flash
   const prevStatusRef = useRef<Record<string, AgentStatusValue>>({});
+  // Same lattice for the review ring: a transition INTO a ready review fires
+  // the tile's flash in blue.
+  const prevReviewRef = useRef<Record<string, RingState | null>>({});
   const mountedAtRef = useRef(Date.now());
-  // Map of project id → status it transitioned to (for coloring the flash)
-  const [flashingProjects, setFlashingProjects] = useState<Map<string, AgentStatusValue>>(new Map());
+  // Map of project id → status it transitioned to (for coloring the flash);
+  // 'review-ready' is the ring's blue variant.
+  const [flashingProjects, setFlashingProjects] = useState<Map<string, AgentStatusValue | 'review-ready'>>(new Map());
 
   useEffect(() => {
     const prev = prevStatusRef.current;
-    const newFlashes = new Map<string, AgentStatusValue>();
+    const newFlashes = new Map<string, AgentStatusValue | 'review-ready'>();
     // Skip flashes during initial WebSocket state sync (first 3s after mount)
     const settled = Date.now() - mountedAtRef.current > 3000;
 
@@ -117,6 +177,15 @@ export function ProjectControl() {
         newFlashes.set(p.id, currentStatus);
       }
       prev[p.id] = currentStatus;
+
+      // The review ring's own flash: once per transition into a ready review
+      // (waiting > reviewing > done aggregation), in blue.
+      const reviewRing = reviewRingFor(p).ring;
+      const prevRing = prevReviewRef.current[p.id];
+      if (settled && prevRing !== undefined && reviewRing === 'done' && prevRing !== 'done') {
+        newFlashes.set(p.id, 'review-ready');
+      }
+      prevReviewRef.current[p.id] = reviewRing;
     }
 
     if (newFlashes.size > 0) {
@@ -147,8 +216,15 @@ export function ProjectControl() {
   const [shareEmail, setShareEmail] = useState('');
   const [shares, setShares] = useState<ProjectShareInfo[]>([]);
 
-  // Workstreams — branch-off inline form
   const [branchOffProjectId, setBranchOffProjectId] = useState<string | null>(null);
+  useEffect(() => {
+    if (searchParams.get('branchOff') !== '1') return;
+    const id = searchParams.get('project');
+    if (id) setBranchOffProjectId(id);
+    const next = new URLSearchParams(searchParams);
+    next.delete('branchOff');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const [newWorkstreamName, setNewWorkstreamName] = useState('');
 
   // Load pending invites on mount
@@ -181,32 +257,91 @@ export function ProjectControl() {
   }, [shareProjectId]);
 
   // Boxes (compute instances)
-  const [boxes, setBoxes] = useState<Instance[]>([]);
+  const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
+  const boxesLoaded = useSyncExternalStore(boxFeed.subscribe, boxFeed.hasLoaded);
+  // Claude Code cloud sessions on those boxes,
+  // behind the flag; App starts the feed. Owner only.
+  const cloudSessionsOn = useFlag(FLAGS.cloudSessions, false);
+  const cloudAll = useSyncExternalStore(cloudSessionFeed.subscribe, cloudSessionFeed.getSnapshot);
+  const cloud = cloudSessionsOn ? cloudByBox(cloudAll) : { byBox: new Map<string, CloudSession[]>(), queued: [] as CloudSession[] };
+  const cloudActiveCount = cloudSessionsOn ? [...cloud.byBox.values()].reduce((n, l) => n + l.length, 0) + cloud.queued.length : 0;
+  const [cloudMenuKey, setCloudMenuKey] = useState<string | null>(null);
+  const [cloudLog, setCloudLog] = useState<{ title: string; log: string } | null>(null);
+  const [cloudError, setCloudError] = useState('');
+  // Rename: the title after the fixed "Claude Cloud N" name, edited inline.
+  // Same guard as the project rename above: closing the input fires onBlur
+  // with the stale closure, so Enter would submit twice and Escape would save.
+  const [cloudRenameKey, setCloudRenameKey] = useState<string | null>(null);
+  const [cloudRenameValue, setCloudRenameValue] = useState('');
+  const cloudRenameSettled = useRef(false);
+  /** A title lives on a run row; a queued session has none yet. */
+  const canRenameCloud = (s: CloudSession) => s.current != null || s.runs.length > 0;
+  const beginCloudRename = (s: CloudSession) => { cloudRenameSettled.current = false; setCloudRenameKey(s.key); setCloudRenameValue(s.title ?? ''); };
+  const cancelCloudRename = () => { cloudRenameSettled.current = true; setCloudRenameKey(null); };
+  const commitCloudRename = async (s: CloudSession) => {
+    if (cloudRenameSettled.current) return;
+    cloudRenameSettled.current = true;
+    const next = cloudRenameValue.trim();
+    setCloudRenameKey(null);
+    if (next === (s.title ?? '')) return;
+    try { await claudeSessionsApi.rename(s.key, next || null); await cloudSessionFeed.reload(); }
+    catch (err) { setCloudError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Could not rename the session'); }
+  };
+  const endCloudSession = (s: CloudSession) => {
+    setConfirmState({
+      message: `End ${cloudLabel(s)} on ${s.current?.boxName ?? 'its box'}? The runner releases it; it parks on claude.ai and can be resumed from there.`,
+      onConfirm: async () => {
+        setConfirmState(null);
+        try { await claudeSessionsApi.end(s.key); await cloudSessionFeed.reload(); }
+        catch (err) { setCloudError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Could not end the session'); }
+      },
+    });
+  };
+  const showCloudLog = async (s: CloudSession) => {
+    try {
+      const r = await claudeSessionsApi.runnerLog(s.key, 200);
+      setCloudLog({ title: `${cloudLabel(s)} · runner log (${r.orderId})`, log: r.log });
+    } catch (err) {
+      setCloudError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Could not read the runner log');
+    }
+  };
+  // Self-managed (external) box registration; EC2 boxes are created from the
+  // New project dialog, which waits for them (and carries the GitHub gate).
   const [newBoxName, setNewBoxName] = useState('');
-  const [newBoxSelfManaged, setNewBoxSelfManaged] = useState(false);
   const [boxError, setBoxError] = useState('');
   const [boxMenuOpenId, setBoxMenuOpenId] = useState<string | null>(null);
   // Set after creating a self-managed box: the one-time token + config to paste
   // into agent.config.json on the user's own machine.
   const [createdBox, setCreatedBox] = useState<{ name: string; token: string; agentWsUrl?: string } | null>(null);
+  const warmPoolEnabled = useFlag(FLAGS.warmPool, false);
+  const [warmPool, setWarmPool] = useState<WarmPoolStatus | null>(null);
+  const [claimLog, setClaimLog] = useState<{ boxName: string; log: string } | null>(null);
+  // The Boxes section starts collapsed (same pattern as the Agent tokens
+  // section); a fresh self-managed token or a box error must be visible
+  // immediately, so those auto-expand it.
+  const [showBoxes, setShowBoxes] = useState(false);
+  useEffect(() => { if (createdBox || boxError) setShowBoxes(true); }, [createdBox, boxError]);
 
-  const reloadBoxes = useCallback(async () => {
-    try { setBoxes(await instancesApi.list()); } catch { /* ignore */ }
-  }, []);
+  const reloadBoxes = boxFeed.reload;
 
-  // Load boxes on mount.
+  // Pool depth for the "N warm, N warming" line and the Add box hint, only with
+  // the flag on (off, nothing is fetched). Refreshed with each box feed update,
+  // as the box list's own reload used to refresh it.
   useEffect(() => {
-    if (user) reloadBoxes();
-  }, [user, reloadBoxes]);
+    if (!user || !warmPoolEnabled) {
+      setWarmPool(null);
+      return;
+    }
+    let cancelled = false;
+    warmPoolApi.get().then(p => { if (!cancelled) setWarmPool(p); }).catch(() => { /* keep the last line */ });
+    return () => { cancelled = true; };
+  }, [user, warmPoolEnabled, boxes]);
 
-  // Poll while any box is still coming up (EC2 provisioning, or an external box
-  // awaiting its agent) so the spinner resolves to ready/failed without a manual
-  // refresh.
+  // App keeps the feed polling through transitions; refresh on mount so a
+  // list reopened after the sidebar was collapsed starts current.
   useEffect(() => {
-    if (!boxes.some(b => b.status === 'provisioning' || b.status === 'awaiting-agent')) return;
-    const id = setInterval(reloadBoxes, 5000);
-    return () => clearInterval(id);
-  }, [boxes, reloadBoxes]);
+    if (user) void boxFeed.reload();
+  }, [user]);
 
   // Agent tokens
   const [tokens, setTokens] = useState<AgentTokenInfo[]>([]);
@@ -220,11 +355,6 @@ export function ProjectControl() {
     }
   }, [showTokens]);
 
-  useEffect(() => {
-    if (user?.defaultAgentProvider) {
-      setNewProjectProvider(user.defaultAgentProvider);
-    }
-  }, [user?.defaultAgentProvider]);
 
   // List of all the agent tmux session names for a project, one per workstream
   // (with `main` collapsing to the historical 3-segment name). Falls back to
@@ -244,7 +374,7 @@ export function ProjectControl() {
     if (!project.workflows.some(w => w.type === 'agent')) return 'not_running';
     let best: AgentStatusValue = 'not_running';
     for (const s of projectAgentSessions(project)) {
-      const cur = statusMap[s]?.status ?? 'not_running';
+      const cur = statusMap[statusKey(project.instanceId, s)]?.status ?? 'not_running';
       if (STATUS_PRIORITY[cur] > STATUS_PRIORITY[best]) best = cur;
     }
     return best;
@@ -255,13 +385,42 @@ export function ProjectControl() {
     return STATUS_EMOJI[aggregateStatus(project)];
   }
 
+  // Any workstream of the project with a live "PR opened — compact or clear?"
+  // prompt. Same gate as the card over the pane, so the glyph and the card
+  // appear and disappear together.
+  function prPromptPendingSession(instanceId: string | null | undefined, session: string): boolean {
+    const st = statusMap[statusKey(instanceId, session)];
+    return shouldShowPrPrompt({ status: st?.status, milestone: st?.milestone, contextTokens: st?.contextTokens, now: Date.now() });
+  }
+  function prPromptPending(project: Project): boolean {
+    if (!project.workflows.some(w => w.type === 'agent')) return false;
+    return projectAgentSessions(project).some(s => prPromptPendingSession(project.instanceId, s));
+  }
+
+  // The Devin review ring for one workstream and the
+  // tile's aggregation over them (waiting > reviewing > done). pr is the PR
+  // of whichever workstream owns the aggregated state, for the tooltip.
+  function reviewRingSession(instanceId: string | null | undefined, session: string): { ring: RingState | null; pr: number | null } {
+    const st = statusMap[statusKey(instanceId, session)];
+    const review = st?.review ?? null;
+    return { ring: ringStateFor(review), pr: review?.pr ?? null };
+  }
+  function reviewRingFor(project: Project): { ring: RingState | null; pr: number | null } {
+    if (!project.workflows.some(w => w.type === 'agent')) return { ring: null, pr: null };
+    const entries = projectAgentSessions(project).map(s => reviewRingSession(project.instanceId, s));
+    const ring = aggregateReviewRing(entries.map(e => e.ring));
+    if (!ring) return { ring: null, pr: null };
+    const pr = entries.find(e => e.ring === ring)?.pr ?? null;
+    return { ring, pr };
+  }
+
   function contextWarning(project: Project): { level: 'ok' | 'warn' | 'danger'; tokens: number } | null {
     if (!project.workflows.some(w => w.type === 'agent')) return null;
     // Take the worst (highest tokens) across workstreams — that's the one
     // about to bite.
     let max = 0;
     for (const s of projectAgentSessions(project)) {
-      const t = statusMap[s]?.contextTokens;
+      const t = statusMap[statusKey(project.instanceId, s)]?.contextTokens;
       if (t && t > max) max = t;
     }
     const level = contextLevel(max);
@@ -272,7 +431,7 @@ export function ProjectControl() {
   function rateLimitWarning(project: Project): string | null {
     if (!project.workflows.some(w => w.type === 'agent')) return null;
     for (const s of projectAgentSessions(project)) {
-      const r = statusMap[s]?.rateLimited;
+      const r = statusMap[statusKey(project.instanceId, s)]?.rateLimited;
       if (r) return r;
     }
     return null;
@@ -283,22 +442,43 @@ export function ProjectControl() {
     return `${Math.round(n / 1000)}K`;
   }
 
-  function persistedAgentProvider(project: Project): string | null {
-    return project.workflows.find(w => w.type === 'agent')?.provider ?? null;
+  // The persisted provider of one workstream's agent workflow (set at project
+  // creation / branch-off; nothing rewrites it when a different agent starts).
+  function persistedWorkstreamProvider(project: Project, workstreamId: string | undefined): string | null {
+    return project.workflows.find(w => w.type === 'agent' && (workstreamId === undefined || w.workstreamId === workstreamId))?.provider ?? null;
   }
 
+  // What one workstream is actually running: the live status `source` of its
+  // own agent session mapped back through the registry, falling back to the
+  // persisted workflow provider.
+  function workstreamAgentProvider(project: Project, ws: Workstream): string | null {
+    const owner = project.ownerUsername ?? user?.unixUsername ?? '';
+    const source = statusMap[statusKey(project.instanceId, buildSessionName(owner, project.name, 'agent', ws.name))]?.source;
+    const live = runningProviderForSource(source);
+    return live ?? persistedWorkstreamProvider(project, ws.id);
+  }
+
+  // The project badge is the main workstream's provider — deterministic,
+  // unlike taking the first live source across workstreams, which followed
+  // whichever workstream's agent reported most recently. Mixed setups carry
+  // per-workstream badges on the sub-rows.
   function displayAgentProvider(project: Project): string | null {
-    // Pick up the live `source` from any workstream's status (the first
-    // that has one), so the badge reflects the actually-running provider
-    // when a project has mixed setups. Falls back to the persisted value.
-    for (const s of projectAgentSessions(project)) {
-      const source = statusMap[s]?.source;
-      if (source) {
-        const fromSource = providerForSource(source);
-        if (fromSource) return fromSource;
-      }
+    const main = project.workstreams.find(ws => ws.name === 'main') ?? project.workstreams[0];
+    if (!main) return persistedWorkstreamProvider(project, undefined);
+    return workstreamAgentProvider(project, main);
+  }
+
+  // "also: pi on feature-x" for the project badge tooltip when
+  // workstreams run mixed providers.
+  function mixedProviderNote(project: Project, mainProvider: string | null): string {
+    const others = new Map<string, string>(); // provider → first workstream using it
+    for (const ws of project.workstreams) {
+      const prov = workstreamAgentProvider(project, ws);
+      if (prov && prov !== mainProvider && !others.has(prov)) others.set(prov, ws.name);
     }
-    return persistedAgentProvider(project);
+    if (others.size === 0) return '';
+    const parts = [...others.entries()].map(([prov, ws]) => `${PROVIDERS[prov]?.displayName ?? prov} on ${ws}`);
+    return ` · also: ${parts.join(', ')}`;
   }
 
   async function acceptInvite(inviteId: string) {
@@ -358,7 +538,7 @@ export function ProjectControl() {
   }
 
   // MetaTerm: idempotent open — creates the pinned singleton on first use,
-  // then just focuses it. Mirrors createProject's create-then-open sequence.
+  // then just focuses it. Mirrors the New project dialog's create-then-open sequence.
   const [metatermBusy, setMetatermBusy] = useState(false);
   async function openMetaTerm() {
     if (metatermBusy) return;
@@ -376,26 +556,9 @@ export function ProjectControl() {
     }
   }
 
-  async function createProject(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newProjectName.trim()) return;
-    try {
-      const project = await projectsApi.create({
-        name: newProjectName.trim(),
-        instanceId: newProjectInstanceId || null,
-        initialAgent: { enabled: true, provider: newProjectProvider },
-      });
-      setNewProjectName('');
-      setError('');
-      await reloadProjects();
-      setActiveProject(project.id);
-    } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setError(msg || 'Failed to create project');
-    }
-  }
-
   async function renameProject(project: Project) {
+    if (renameSettled.current) return;
+    renameSettled.current = true;
     const newName = renameValue.trim();
     if (!newName || newName === project.name) { setRenamingId(null); return; }
     try {
@@ -406,6 +569,27 @@ export function ProjectControl() {
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
       setError(msg || 'Failed to rename project');
+      setRenamingId(null);
+    }
+  }
+
+  // Workstream rename shares renamingId/renameValue/menuOpenId with the project
+  // menu: ids are globally unique cuids, so a workstream id never collides with
+  // a project id and the two inline editors cannot both be open.
+  async function renameWorkstream(project: Project, ws: { id: string; name: string }) {
+    if (renameSettled.current) return;
+    renameSettled.current = true;
+    const newName = renameValue.trim();
+    if (!newName || newName === ws.name) { setRenamingId(null); return; }
+    try {
+      await workstreamsApi.rename(project.id, ws.id, newName);
+      setRenamingId(null);
+      setRenameValue('');
+      if (getActiveWorkstream(project.id) === ws.name) setActiveWorkstream(project.id, newName);
+      await reloadProjects();
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setError(msg || 'Failed to rename workstream');
       setRenamingId(null);
     }
   }
@@ -465,23 +649,23 @@ export function ProjectControl() {
     });
   }
 
-  async function createBox(e: React.FormEvent) {
+  async function registerSelfManagedBox(e: React.FormEvent) {
     e.preventDefault();
     if (!newBoxName.trim()) return;
+    if (!isValidBoxName(newBoxName.trim())) { setBoxError(BOX_NAME_ERROR); return; }
     try {
-      const result = await instancesApi.create(newBoxName.trim(), newBoxSelfManaged ? 'external' : 'ec2');
+      const result = await instancesApi.create(newBoxName.trim(), 'external');
       // Self-managed boxes return a one-time token to paste into the agent
-      // config on the user's own machine. EC2 boxes provision server-side.
-      if (newBoxSelfManaged && result.token) {
+      // config on the user's own machine.
+      if (result.token) {
         setCreatedBox({ name: result.instance.name, token: result.token, agentWsUrl: result.agentWsUrl });
       }
       setNewBoxName('');
-      setNewBoxSelfManaged(false);
       setBoxError('');
       await reloadBoxes();
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setBoxError(msg || 'Failed to create box');
+      setBoxError(msg || 'Failed to register box');
     }
   }
 
@@ -512,6 +696,69 @@ export function ProjectControl() {
     });
   }
 
+  function stopBox(box: Instance) {
+    const count = box._count?.projects ?? 0;
+    setConfirmState({
+      message: `Stop box "${box.name}"? Running agents${count ? ` in its ${count} project${count === 1 ? '' : 's'}` : ''} `
+        + 'will be interrupted. Files and agent conversations stay on its disk, and its sessions are '
+        + 'recreated when you start it again. A stopped box costs only its disk.',
+      onConfirm: async () => {
+        try {
+          await instancesApi.stop(box.id);
+          setBoxError('');
+        } catch (err: unknown) {
+          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+          setBoxError(msg || 'Failed to stop box');
+        }
+        await reloadBoxes();
+      },
+    });
+  }
+
+  function hibernateBox(box: Instance) {
+    setConfirmState({
+      message: `Hibernate box "${box.name}"? Its memory is saved to disk and the instance powers off, so `
+        + 'agents, tmux sessions, dev servers and containers resume exactly where they were when you start it. '
+        + 'Network connections (port forwards, SSO and SSH sessions) drop and reconnect. '
+        + 'A hibernated box costs only its disk; after 55 days termag resumes and re-hibernates it, '
+        + "since EC2 doesn't keep a box hibernated longer than 60.",
+      onConfirm: async () => {
+        try {
+          const { status } = await instancesApi.hibernate(box.id);
+          setBoxError(status === 'stopping'
+            ? 'EC2 would not hibernate this box right now, so it was stopped instead. Its sessions are recreated when you start it.'
+            : '');
+        } catch (err: unknown) {
+          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+          setBoxError(msg || 'Failed to hibernate box');
+        }
+        await reloadBoxes();
+      },
+    });
+  }
+
+  async function dismissRepoPrompt(box: Instance) {
+    try {
+      const row = await instancesApi.dismissRepoPrompt(box.id);
+      boxFeed.upsert({ ...box, repoPromptDismissedAt: row.repoPromptDismissedAt ?? null });
+      setBoxError('');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setBoxError(msg || 'Could not dismiss the prompt');
+    }
+  }
+
+  async function startBox(box: Instance) {
+    try {
+      await instancesApi.start(box.id);
+      setBoxError('');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setBoxError(msg || 'Failed to start box');
+    }
+    await reloadBoxes();
+  }
+
   async function createToken(e: React.FormEvent) {
     e.preventDefault();
     if (!newTokenName.trim()) return;
@@ -539,20 +786,32 @@ export function ProjectControl() {
   async function saveDefaultAgent(provider: string) {
     try {
       await updateDefaultAgentProvider(provider);
-      setNewProjectProvider(provider);
       setError('');
     } catch {
       setError('Failed to save default agent');
     }
   }
 
+
+  async function openClaimLog(box: Instance) {
+    try {
+      const result = await instancesApi.onClaimLog(box.id);
+      setClaimLog({ boxName: box.name, log: result.log || '(empty log)' });
+    } catch (err: any) {
+      setBoxError(err?.response?.data?.error || 'Could not read the personalization log');
+    }
+  }
+
   function renderProjectItem(p: typeof projects[0]) {
     const provider = displayAgentProvider(p);
     const config = provider ? PROVIDERS[provider] : null;
+    const mainWs = p.workstreams?.find(ws => ws.name === 'main') ?? p.workstreams?.[0];
+    const savedProvider = persistedWorkstreamProvider(p, mainWs?.id);
     const ctxWarn = contextWarning(p);
     const rateLimit = rateLimitWarning(p);
     const stripe = boxStripeColor(p.instanceId);
     const box = p.instanceId ? boxes.find(b => b.id === p.instanceId) : null;
+    const parked = isBoxParked(box?.status);
     const wsCount = p.workstreams?.length ?? 0;
     // Only owned projects are pinnable, so only they're selectable in edit mode.
     const selectable = p.role !== 'collaborator';
@@ -560,9 +819,9 @@ export function ProjectControl() {
     return (
       <li
         key={p.id}
-        className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${selectMode ? 'select-mode' : ''} ${selected ? 'selected' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''}`}
+        className={`project-item ${activeProjectId === p.id ? 'active' : ''} ${selectMode ? 'select-mode' : ''} ${selected ? 'selected' : ''} ${flashingProjects.has(p.id) ? `status-flash-${flashingProjects.get(p.id)}` : ''} ${rateLimit ? 'rate-limited' : ''} ${parked ? 'on-parked-box' : ''}`}
         style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
-        title={box ? `box: ${box.name}` : undefined}
+        title={box ? `box: ${box.name}${parked ? ` (${box.status})` : ''}` : undefined}
         onClick={() => {
           if (selectMode) {
             if (selectable) toggleSelected(p.id);
@@ -583,8 +842,17 @@ export function ProjectControl() {
           />
         )}
         <span className={`project-status${statusesStale ? ' stale' : ''}`}>
-          {statusEmoji(p)}
-          {rateLimit ? (
+          {parked ? '⏸' : statusEmoji(p)}
+          {(() => {
+            const { ring, pr } = reviewRingFor(p);
+            return ring && !parked
+              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr)} />
+              : null;
+          })()}
+          {!parked && prPromptPending(p) && (
+            <span className="pr-prompt-dot" title="PR opened — compact or clear the agent's context?" />
+          )}
+          {parked ? null : rateLimit ? (
             <span className="rate-limit-badge" title={rateLimit} />
           ) : ctxWarn && (
             <span
@@ -601,7 +869,7 @@ export function ProjectControl() {
             onBlur={() => renameProject(p)}
             onKeyDown={e => {
               if (e.key === 'Enter') renameProject(p);
-              if (e.key === 'Escape') setRenamingId(null);
+              if (e.key === 'Escape') cancelRename();
             }}
             onClick={e => e.stopPropagation()}
             autoFocus
@@ -612,8 +880,7 @@ export function ProjectControl() {
               className="project-name"
               onDoubleClick={p.role !== 'collaborator' ? (e => {
                 e.stopPropagation();
-                setRenamingId(p.id);
-                setRenameValue(p.name);
+                beginRename(p.id, p.name);
               }) : undefined}
             >
               {p.name}
@@ -636,7 +903,7 @@ export function ProjectControl() {
                   borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
                   background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
                 }}
-                title={`runtime: ${config.displayName}${persistedAgentProvider(p) ? `, saved: ${persistedAgentProvider(p)}` : ''}`}
+                title={`runtime: ${config.displayName}${savedProvider ? `, saved: ${savedProvider}` : ''}${mixedProviderNote(p, provider)}`}
               >
                 {config.badge}
               </span>
@@ -658,7 +925,7 @@ export function ProjectControl() {
                   <button onClick={() => { togglePin(p); setMenuOpenId(null); }}>
                     {p.pinned ? '◆ Unpin' : '◇ Pin to top'}
                   </button>
-                  <button onClick={() => { setRenamingId(p.id); setRenameValue(p.name); setMenuOpenId(null); }}>
+                  <button onClick={() => { beginRename(p.id, p.name); setMenuOpenId(null); }}>
                     Rename
                   </button>
                   <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
@@ -686,13 +953,46 @@ export function ProjectControl() {
 
   return (
     <div className="project-control">
-      <div className="project-control-header">
-        <span className="project-control-title">termag</span>
-        <button className="btn-ghost" onClick={logout}>sign out</button>
+      {/* Pinned top strip: header, create form, and filter stay visible while
+          the sections below scroll inside .project-control-scroll. */}
+      <div className="project-control-pinned">
+        <div className="project-control-header">
+          <span className="project-control-title">termag</span>
+          <span className="project-control-actions">
+            {/* Sign out moved to Settings (rarely used); its slot is the Recents switcher. */}
+            <RecentsDropdown />
+            {/* The phone client. Opening it here clears a
+                "Full UI" opt-out so the redirect works again on that browser. */}
+            <button
+              className="btn-ghost"
+              onClick={() => { writeOptOut(typeof localStorage !== 'undefined' ? localStorage : null, false); navigate('/m'); }}
+              title="Phone view"
+              aria-label="Phone view"
+            >📱</button>
+            <button className="btn-ghost" onClick={() => navigate('/settings')} title="Settings" aria-label="Settings">⚙</button>
+          </span>
+        </div>
+
+        {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
+
+        <button
+          type="button"
+          className="btn-primary new-project-btn"
+          onClick={() => { setRepoPromptBoxId(undefined); setShowNewProject(true); }}
+        >New project</button>
+
+        {projects.length > 5 && (
+          <input
+            className="project-filter"
+            type="text"
+            placeholder="Filter…"
+            value={projectFilter}
+            onChange={e => setProjectFilter(e.target.value)}
+          />
+        )}
       </div>
 
-      {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
-
+      <div className="project-control-scroll">
       {invites.length > 0 && (
         <section className="control-section invite-section">
           <h3>Invites</h3>
@@ -722,15 +1022,6 @@ export function ProjectControl() {
             {selectMode ? 'Done' : 'Select'}
           </button>
         </div>
-        {projects.length > 5 && (
-          <input
-            className="project-filter"
-            type="text"
-            placeholder="Filter…"
-            value={projectFilter}
-            onChange={e => setProjectFilter(e.target.value)}
-          />
-        )}
         {selectMode && (() => {
           // Select-all / clear operate on the currently filtered, owned (pinnable)
           // projects — the same set that shows checkboxes.
@@ -766,6 +1057,74 @@ export function ProjectControl() {
 
             // Render one project: its row, an optional branch-off form, and any
             // workstream sub-rows. Hoisted so each box group can reuse it.
+            // A Claude Code cloud session on a box: no pane to open here, so the
+            // row links out to claude.ai; the dot reads the same status map a
+            // project pane does, under the runner's tmux name.
+            const renderCloudRow = (s: CloudSession) => {
+              const dot = cloudDotStatus(s, statusMap);
+              const platform = platformLabel(s.clientPlatform);
+              // A queued session's age is time queued (the start of its refusals),
+              // not time since the latest re-offer; a placed one's is its run's start.
+              const ageSince = s.state === 'queued' ? (s.queuedSince ?? s.lastSeenAt) : (s.current?.startedAt ?? s.lastSeenAt);
+              const age = fmtAgeShort(Date.now() - Date.parse(ageSince));
+              const canEnd = s.state === 'running' || s.state === 'starting';
+              // The row shows platform and age; slot and box live in the tooltip.
+              const where = s.current ? `slot ${s.current.slot} on ${s.current.boxName}` : null;
+              const rowTitle = [cloudLabel(s), s.queuedReason ?? cloudStateLabel(s), where].filter(Boolean).join(' · ');
+              const nameNode = <><span className="cloud-session-name">{s.name}</span>{s.title && <span className="cloud-session-subtitle"> {s.title}</span>}</>;
+              return (
+                <li key={`cloud:${s.key}`} className={`project-item cloud-session-item cloud-${s.state}`} title={rowTitle}>
+                  <span className={`project-status${statusesStale ? ' stale' : ''}`}>{STATUS_EMOJI[dot]}</span>
+                  <span
+                    className="project-provider-badge cloud-provider-badge"
+                    style={{
+                      borderColor: PROVIDERS.claude.color.bright.replace(/[\d.]+\)$/, '0.45)'),
+                      background: PROVIDERS.claude.color.base.replace(/[\d.]+\)$/, '0.16)'),
+                    }}
+                    title={s.state === 'queued' ? 'Claude Code cloud session (claude.ai), waiting for a box' : s.state === 'starting' ? 'Claude Code cloud session (claude.ai), starting on this box' : 'Claude Code cloud session (claude.ai), running on this box'}
+                  >{PROVIDERS.claude.badge} ☁</span>
+                  <span className="cloud-session-main">
+                    {cloudRenameKey === s.key ? (
+                      <input
+                        className="project-rename-input"
+                        value={cloudRenameValue}
+                        placeholder={`${s.name} title`}
+                        onChange={e => setCloudRenameValue(e.target.value)}
+                        onBlur={() => { void commitCloudRename(s); }}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') void commitCloudRename(s);
+                          if (e.key === 'Escape') cancelCloudRename();
+                        }}
+                        onClick={e => e.stopPropagation()}
+                        autoFocus
+                      />
+                    ) : s.url ? (
+                      <a className="project-name cloud-session-title" href={s.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} onDoubleClick={e => { e.preventDefault(); e.stopPropagation(); if (canRenameCloud(s)) beginCloudRename(s); }}>{nameNode}</a>
+                    ) : (
+                      <span className="project-name cloud-session-title" onDoubleClick={e => { e.stopPropagation(); if (canRenameCloud(s)) beginCloudRename(s); }}>{nameNode}</span>
+                    )}
+                    {s.state === 'queued'
+                      ? <span className="cloud-meta cloud-queued">queued · {age}</span>
+                      : <span className="cloud-meta">{[s.state === 'starting' ? 'starting' : null, platform, age].filter(Boolean).join(' · ')}</span>}
+                  </span>
+                  <span className="project-actions" onClick={e => e.stopPropagation()}>
+                    <button className="btn-tiny btn-overflow" onClick={() => setCloudMenuKey(cloudMenuKey === s.key ? null : s.key)}>⋮</button>
+                    {cloudMenuKey === s.key && (
+                      <div className="project-menu" onMouseLeave={() => setCloudMenuKey(null)}>
+                        {s.url && <a className="project-menu-link" href={s.url} target="_blank" rel="noreferrer" onClick={() => setCloudMenuKey(null)}>Open on claude.ai</a>}
+                        {canRenameCloud(s)
+                          ? <button onClick={() => { beginCloudRename(s); setCloudMenuKey(null); }}>Rename…</button>
+                          : <button disabled title="Rename once the session has been placed on a box">Rename…</button>}
+                        {s.current && <button onClick={() => { void showCloudLog(s); setCloudMenuKey(null); }}>Runner log</button>}
+                        {canEnd && <button className="menu-danger" onClick={() => { endCloudSession(s); setCloudMenuKey(null); }}>End session</button>}
+                      </div>
+                    )}
+                  </span>
+                  {s.state === 'queued' && s.queuedReason && <span className="box-error">{s.queuedReason}</span>}
+                </li>
+              );
+            };
+
             const renderRow = (p: typeof projects[0]) => {
               const branchingOff = branchOffProjectId === p.id;
               const showWorkstreams = p.workstreams.length > 1;
@@ -801,7 +1160,9 @@ export function ProjectControl() {
                     const wsHasAgent = p.workflows.some(
                       w => w.workstreamId === ws.id && w.type === 'agent',
                     );
-                    const wsStatus = statusMap[wsSession]?.status ?? 'not_running';
+                    const wsStatus = statusMap[statusKey(p.instanceId, wsSession)]?.status ?? 'not_running';
+                    const wsProvider = wsHasAgent ? workstreamAgentProvider(p, ws) : null;
+                    const wsConfig = wsProvider ? PROVIDERS[wsProvider] : null;
                     return (
                       <li
                         key={ws.id}
@@ -811,16 +1172,67 @@ export function ProjectControl() {
                       >
                         <span className={`workstream-status${statusesStale ? ' stale' : ''}`}>
                           {wsHasAgent ? STATUS_EMOJI[wsStatus] : '—'}
+                          {(() => {
+                            const { ring, pr } = reviewRingSession(p.instanceId, wsSession);
+                            return wsHasAgent && ring
+                              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr)} />
+                              : null;
+                          })()}
+                          {wsHasAgent && prPromptPendingSession(p.instanceId, wsSession) && (
+                            <span className="pr-prompt-dot" title="PR opened — compact or clear this workstream's context?" />
+                          )}
                         </span>
                         <span className="workstream-marker">↳</span>
-                        <span className="workstream-name">{ws.name}</span>
+                        {renamingId === ws.id ? (
+                          <input
+                            className="project-rename-input"
+                            value={renameValue}
+                            onChange={e => setRenameValue(e.target.value)}
+                            onBlur={() => renameWorkstream(p, ws)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') renameWorkstream(p, ws);
+                              if (e.key === 'Escape') cancelRename();
+                            }}
+                            onClick={e => e.stopPropagation()}
+                            autoFocus
+                          />
+                        ) : (
+                          <span
+                            className="workstream-name"
+                            onDoubleClick={ws.name !== 'main' && p.role !== 'collaborator' ? (e => {
+                              e.stopPropagation();
+                              beginRename(ws.id, ws.name);
+                            }) : undefined}
+                          >{ws.name}</span>
+                        )}
+                        {wsConfig && (
+                          <span
+                            className="project-provider-badge workstream-provider-badge"
+                            style={{
+                              borderColor: wsConfig.color.bright.replace(/[\d.]+\)$/, '0.45)'),
+                              background: wsConfig.color.base.replace(/[\d.]+\)$/, '0.16)'),
+                            }}
+                            title={`runtime: ${wsConfig.displayName}`}
+                          >
+                            {wsConfig.badge}
+                          </span>
+                        )}
                         {ws.name !== 'main' && p.role !== 'collaborator' && (
                           <span className="project-actions" onClick={e => e.stopPropagation()}>
                             <button
-                              className="btn-tiny btn-danger"
-                              onClick={() => deleteWorkstream(p, ws)}
-                              title="Delete workstream"
-                            >×</button>
+                              className="btn-tiny btn-overflow"
+                              onClick={() => setMenuOpenId(menuOpenId === ws.id ? null : ws.id)}
+                            >⋮</button>
+                            {menuOpenId === ws.id && (
+                              <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
+                                <button onClick={() => { beginRename(ws.id, ws.name); setMenuOpenId(null); }}>
+                                  Rename
+                                </button>
+                                <button className="menu-danger" onClick={() => { deleteWorkstream(p, ws); setMenuOpenId(null); }}>
+                                  Delete
+                                </button>
+                              </div>
+                            )}
                           </span>
                         )}
                       </li>
@@ -847,21 +1259,41 @@ export function ProjectControl() {
             const knownBoxIds = new Set(boxes.map(b => b.id));
             const groups: {
               key: string; label: string; color: string | null;
-              dot?: string; rows: typeof projects;
+              dot?: string; note?: string | null; rows: typeof projects;
+              /** Claude Code cloud sessions running on this box. */
+              cloud?: CloudSession[];
             }[] = [];
 
             [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
               const rows = sortPinned(filteredRest.filter(p => p.instanceId === b.id));
-              if (!rows.length) return;
-              const pending = b.status === 'provisioning' || b.status === 'awaiting-agent';
+              const cloudRows = projectFilter ? [] : (cloud.byBox.get(b.id) ?? []);
+              if (!rows.length && !cloudRows.length) return;
+              const display = boxDisplay(b.status);
               groups.push({
                 key: b.id,
                 label: b.name,
                 color: boxStripeColor(b.id),
-                dot: b.status === 'ready' ? 'var(--success)' : pending ? 'var(--warning)' : 'var(--danger)',
+                dot: display.dot,
+                note: display.label,
                 rows,
+                cloud: cloudRows,
               });
             });
+            // Runs on a box the list no longer has (terminated under a live
+            // runner, before the lost sweep ends it): still shown, as a group
+            // of their own, so the header count and the rows agree.
+            // Only once the box list has loaded: before that every box is
+            // "missing" and live sessions would flash as removed.
+            if (!projectFilter && boxesLoaded) {
+              const elsewhere = cloudElsewhere(cloud.byBox, knownBoxIds);
+              if (elsewhere.length) groups.push({ key: '__cloud_elsewhere', label: 'Cloud sessions on removed boxes', color: null, rows: [], cloud: elsewhere });
+            }
+            // Sessions the orchestrator could not place yet: no box, every slot
+            // full, GitHub not connected. The reason is the one the Activity
+            // tab shows, so the owner reads the same thing in both places.
+            if (!projectFilter && cloud.queued.length) {
+              groups.push({ key: '__cloud_queued', label: 'Queued cloud sessions', color: null, rows: [], cloud: cloud.queued });
+            }
 
             const shared = sortPinned(filteredRest.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
             if (shared.length) groups.push({ key: '__shared', label: 'Shared with me', color: null, rows: shared });
@@ -891,47 +1323,17 @@ export function ProjectControl() {
                 >
                   {g.dot && <span className="project-group-dot" style={{ background: g.dot }} />}
                   <span className="project-group-name" title={g.label}>{g.label}</span>
-                  <span className="project-group-count">{g.rows.length}</span>
+                  {g.note && <span className="project-group-note">{g.note}</span>}
+                  <span className="project-group-count">{g.rows.length + (g.cloud?.length ?? 0)}</span>
                 </li>
                 {g.rows.map(renderRow)}
+                {g.cloud?.map(renderCloudRow)}
               </React.Fragment>
                 ))}
               </>
             );
           })()}
         </ul>
-        <form className="inline-form project-create-form" onSubmit={createProject}>
-          <input
-            value={newProjectName}
-            onChange={e => setNewProjectName(e.target.value)}
-            placeholder="new project"
-          />
-          <select
-            className="inline-form-select"
-            value={newProjectProvider}
-            onChange={e => setNewProjectProvider(e.target.value)}
-            title="Agent provider"
-          >
-            {PROVIDER_IDS.map(pid => (
-              <option key={pid} value={pid}>{PROVIDERS[pid].displayName}</option>
-            ))}
-          </select>
-          {boxes.some(b => b.status === 'ready') && (
-            <select
-              className="inline-form-select"
-              value={newProjectInstanceId}
-              onChange={e => setNewProjectInstanceId(e.target.value)}
-              title="Box (host)"
-            >
-              <option value="">this host</option>
-              {boxes.filter(b => b.status === 'ready').map(b => (
-                <option key={b.id} value={b.id}>{b.name}</option>
-              ))}
-            </select>
-          )}
-          <button type="submit">+</button>
-        </form>
-
         {shareProjectId && (
           <div className="share-panel">
             <h4>Share: {projects.find(p => p.id === shareProjectId)?.name}</h4>
@@ -958,92 +1360,146 @@ export function ProjectControl() {
       </section>
 
       <section className="control-section">
-        <h3>Boxes</h3>
-        {boxError && <div className="error-banner">{boxError}<button onClick={() => setBoxError('')}>×</button></div>}
-        <ul className="box-list">
-          {boxes.map(b => {
-            const pending = b.status === 'provisioning' || b.status === 'awaiting-agent';
-            const dotColor = b.status === 'ready' ? 'var(--success)'
-              : pending ? 'var(--warning)'
-              : 'var(--danger)';
-            // Same deterministic hue projects use for their "which box" stripe
-            // (b.id is the project's instanceId), so this box is color-matched
-            // to the project rows running on it.
-            const stripe = boxStripeColor(b.id);
-            return (
-              <li
-                key={b.id}
-                className="box-item"
-                style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
-              >
-                <span
-                  className={`box-status-dot ${pending ? 'box-spinning' : ''}`}
-                  style={{ background: dotColor }}
-                  title={b.status === 'failed' && b.provisioningError ? b.provisioningError : b.status}
-                />
-                <span className="box-name" title={b.hostname ?? undefined}>{b.name}</span>
-                {b.kind === 'external' && <span className="box-kind-badge" title="self-managed host">self</span>}
-                <span className="box-meta">
-                  {b.status === 'provisioning' ? 'provisioning…'
-                    : b.status === 'awaiting-agent' ? 'awaiting…'
-                    : b.status === 'failed' ? 'failed'
-                    : `${b._count?.projects ?? 0} proj`}
-                </span>
-                <span className="project-actions" onClick={e => e.stopPropagation()}>
-                  <button
-                    className="btn-tiny btn-overflow"
-                    onClick={() => setBoxMenuOpenId(boxMenuOpenId === b.id ? null : b.id)}
-                  >⋮</button>
-                  {boxMenuOpenId === b.id && (
-                    <div className="project-menu" onMouseLeave={() => setBoxMenuOpenId(null)}>
-                      <button className="menu-danger" onClick={() => { terminateBox(b); setBoxMenuOpenId(null); }}>
-                        Terminate
-                      </button>
-                    </div>
-                  )}
-                </span>
-              </li>
-            );
-          })}
-          {boxes.length === 0 && <li className="box-empty">No boxes yet</li>}
-        </ul>
-
-        {createdBox && (
-          <div className="token-created">
-            <div className="token-created-label">
-              Self-managed box “{createdBox.name}” — add this to <code>agent.config.json</code> on that
-              machine and start the termag agent (copy now, shown once):
-            </div>
-            <code className="token-value">{JSON.stringify(
-              { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
-              null, 2,
-            )}</code>
-            <button className="btn-tiny" onClick={() => {
-              navigator.clipboard.writeText(JSON.stringify(
-                { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
-                null, 2,
-              ));
-              setCreatedBox(null);
-            }}>Copy &amp; dismiss</button>
+        <h3 className="clickable-header boxes-toggle" onClick={() => setShowBoxes(s => !s)}>
+          Boxes {showBoxes ? '▾' : '▸'}
+          {boxSummary(boxes, cloudActiveCount) && <span className="boxes-summary">{boxSummary(boxes, cloudActiveCount)}</span>}
+        </h3>
+        {/* Cloud-session results live outside the expander: the rows that open
+            them are in the project list, which stays visible when Boxes is
+            collapsed. */}
+        {cloudError && <div className="error-banner">{cloudError}<button onClick={() => setCloudError('')}>×</button></div>}
+        {cloudLog && (
+          <div className="cloud-log">
+            <div className="cloud-log-title">{cloudLog.title}<button className="btn-tiny" onClick={() => setCloudLog(null)}>×</button></div>
+            <pre className="box-claim-log">{cloudLog.log || '(empty)'}</pre>
           </div>
         )}
+        {showBoxes && (
+          <div className="boxes-expanded">
+            {warmPoolEnabled && warmPool && (
+              <div className="box-pool">{warmPool.warm} warm, {warmPool.warming} warming</div>
+            )}
+            {boxError && <div className="error-banner">{boxError}<button onClick={() => setBoxError('')}>×</button></div>}
+            <ul className="box-list">
+              {boxes.map(b => {
+                const display = boxDisplay(b.status);
+                // Same deterministic hue projects use for their "which box" stripe
+                // (b.id is the project's instanceId), so this box is color-matched
+                // to the project rows running on it.
+                const stripe = boxStripeColor(b.id);
+                return (
+                  <li
+                    key={b.id}
+                    className="box-item"
+                    style={stripe ? ({ ['--box-stripe' as any]: stripe } as React.CSSProperties) : undefined}
+                  >
+                    <span
+                      className={`box-status-dot ${display.spinning ? 'box-spinning' : ''}`}
+                      style={{ background: display.dot }}
+                      title={(b.status === 'failed' || showsBoxError(b)) && b.provisioningError ? b.provisioningError : b.status}
+                    />
+                    <span className="box-name" title={b.hostname ?? undefined}>{b.name}</span>
+                    {(b.onClaimStatus === 'pending' || b.onClaimStatus === 'running') && (
+                      <button type="button" className="box-claim-badge" title="Applying dotfiles">personalizing</button>
+                    )}
+                    {b.onClaimStatus === 'failed' && (
+                      <button type="button" className="box-claim-badge box-claim-badge-failed" title={b.onClaimError ?? 'personalization failed'} onClick={() => openClaimLog(b)}>failed</button>
+                    )}
+                    {b.onClaimStatus === 'skipped' && b.onClaimError && (
+                      <button type="button" className="box-claim-badge" title={b.onClaimError} onClick={() => openClaimLog(b)}>dotfiles later</button>
+                    )}
+                    {b.kind === 'external' && <span className="box-kind-badge" title="self-managed host">self</span>}
+                    <span className="box-meta">
+                      {display.label ?? `${b._count?.projects ?? 0} proj${cloud.byBox.get(b.id)?.length ? ` · ${cloudCountLabel(cloud.byBox.get(b.id)!.length)}` : ''}`}
+                    </span>
+                    <span className="project-actions" onClick={e => e.stopPropagation()}>
+                      <button
+                        className="btn-tiny btn-overflow"
+                        onClick={() => setBoxMenuOpenId(boxMenuOpenId === b.id ? null : b.id)}
+                      >⋮</button>
+                      {boxMenuOpenId === b.id && (
+                        <div className="project-menu" onMouseLeave={() => setBoxMenuOpenId(null)}>
+                          {canStartBox(b) && (
+                            <button onClick={() => { startBox(b); setBoxMenuOpenId(null); }}>
+                              {b.status === 'hibernated' ? 'Resume box' : 'Start box'}
+                            </button>
+                          )}
+                          {canHibernateBox(b) && (
+                            <button
+                              title="Save memory to disk and power off; start resumes where you left off"
+                              onClick={() => { hibernateBox(b); setBoxMenuOpenId(null); }}
+                            >Hibernate box</button>
+                          )}
+                          {canStopBox(b) && (
+                            <button onClick={() => { stopBox(b); setBoxMenuOpenId(null); }}>Stop box</button>
+                          )}
+                          <button className="menu-danger" onClick={() => { terminateBox(b); setBoxMenuOpenId(null); }}>
+                            Terminate
+                          </button>
+                        </div>
+                      )}
+                    </span>
+                    {repoPickerOn && repoPromptDue({
+                      kind: b.kind,
+                      dismissedAt: b.repoPromptDismissedAt ?? null,
+                      liveCount: projects.filter(p => !p.archived && p.instanceId === b.id).length,
+                    }) && (
+                      <div className="box-repo-prompt">
+                        Which repository is this box for?
+                        <button type="button" className="btn-tiny" onClick={() => { setRepoPromptBoxId(b.id); setShowNewProject(true); }}>Pick a repository…</button>
+                        <button type="button" className="btn-tiny" onClick={() => void dismissRepoPrompt(b)}>None</button>
+                      </div>
+                    )}
+                    {showsBoxError(b) && <span className="box-error">{b.provisioningError}</span>}
+                    {hibernationAgeNote(b) && <span className="box-error">{hibernationAgeNote(b)}</span>}
+                    {b.rehibernatePending && b.status !== 'hibernated' && (
+                      <span className="box-error">Resumed to restart the 60-day hibernation limit; hibernates again once ready.</span>
+                    )}
+                  </li>
+                );
+              })}
+              {boxes.length === 0 && <li className="box-empty">No boxes yet</li>}
+            </ul>
+            {claimLog && (
+              <pre className="box-claim-log" title={claimLog.boxName}>{claimLog.log}</pre>
+            )}
 
-        <form className="inline-form" onSubmit={createBox}>
-          <input
-            value={newBoxName}
-            onChange={e => setNewBoxName(e.target.value)}
-            placeholder={newBoxSelfManaged ? 'my machine' : 'new box'}
-          />
-          <button type="submit" title={newBoxSelfManaged ? 'Register self-managed box' : 'Add box (EC2)'}>+</button>
-        </form>
-        <label className="box-self-toggle" title="Run the agent on your own machine instead of provisioning an EC2 box">
-          <input
-            type="checkbox"
-            checked={newBoxSelfManaged}
-            onChange={e => setNewBoxSelfManaged(e.target.checked)}
-          />
-          self-managed (run agent on my own machine)
-        </label>
+            {createdBox && (
+              <div className={`token-created ${REPLAY_BLOCK_CLASS}`}>
+                <div className="token-created-label">
+                  Self-managed box “{createdBox.name}” — add this to <code>agent.config.json</code> on that
+                  machine and start the termag agent (copy now, shown once):
+                </div>
+                <code className="token-value">{JSON.stringify(
+                  { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
+                  null, 2,
+                )}</code>
+                <button className="btn-tiny" onClick={() => {
+                  navigator.clipboard.writeText(JSON.stringify(
+                    { termag_url: createdBox.agentWsUrl ?? 'wss://<your-orchestrator>/termag/ws/agent', token: createdBox.token },
+                    null, 2,
+                  ));
+                  setCreatedBox(null);
+                }}>Copy &amp; dismiss</button>
+              </div>
+            )}
+            {/* EC2 boxes are created from New project (which waits for them);
+                this registers a machine the user runs the agent on themselves. */}
+            <form className="inline-form box-create-form" onSubmit={registerSelfManagedBox}>
+              <input
+                value={newBoxName}
+                onChange={e => {
+                  setNewBoxName(e.target.value);
+                  const name = e.target.value.trim();
+                  setBoxError(name && !isValidBoxName(name) ? BOX_NAME_ERROR : '');
+                }}
+                placeholder="self-managed machine"
+                title={BOX_NAME_ERROR}
+              />
+              <button type="submit" title="Register a self-managed box (run the agent on your own machine)">+</button>
+            </form>
+          </div>
+        )}
       </section>
 
       <section className="control-section">
@@ -1053,7 +1509,7 @@ export function ProjectControl() {
         {showTokens && (
           <>
             {createdToken && (
-              <div className="token-created">
+              <div className={`token-created ${REPLAY_BLOCK_CLASS}`}>
                 <div className="token-created-label">New token (copy now — shown once):</div>
                 <code className="token-value">{createdToken}</code>
                 <button className="btn-tiny" onClick={() => {
@@ -1086,10 +1542,13 @@ export function ProjectControl() {
               <select
                 className="inline-form-select"
                 id="default-agent-provider"
-                value={user?.defaultAgentProvider ?? 'codex'}
+                value={storedDefault}
                 onChange={e => saveDefaultAgent(e.target.value)}
               >
-                {PROVIDER_IDS.map(pid => (
+                {legacyDefault && (
+                  <option value={legacyDefault} disabled>{PROVIDERS[legacyDefault].displayName} (current, no longer offered)</option>
+                )}
+                {SELECTABLE_PROVIDER_IDS.map(pid => (
                   <option key={pid} value={pid}>{PROVIDERS[pid].displayName}</option>
                 ))}
               </select>
@@ -1097,6 +1556,17 @@ export function ProjectControl() {
           </>
         )}
       </section>
+      </div>
+      {showNewProject && (
+        <NewProjectDialog
+          initialBoxId={repoPromptBoxId}
+          onClose={() => setShowNewProject(false)}
+          onBranchOff={projectId => {
+            setShowNewProject(false);
+            setBranchOffProjectId(projectId);
+          }}
+        />
+      )}
       {confirmState && createPortal(
         <ConfirmDialog
           message={confirmState.message}

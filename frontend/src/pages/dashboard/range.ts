@@ -31,8 +31,14 @@ export function rangeKeys(range: Range): RangeKeys {
   return { utc, priorUtc: prior, worktime: utc, priorWorktime: prior, isToday: false, label: `last ${n} days` };
 }
 
-/** "Sep 18" style tick from a 'YYYY-MM-DD' key, without timezone drift. */
+/**
+ * "Sep 18" style tick from a 'YYYY-MM-DD' key, without timezone drift.
+ * Anything that is not a day key comes back unchanged, so a row from another
+ * grouping (a username, a hostname) never renders as "undefined undefined".
+ */
 export function shortDate(key: string): string {
-  const [, m, d] = key.split('-').map(Number);
-  return `${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m - 1]} ${d}`;
+  const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(key);
+  if (!m) return key;
+  const month = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(m[1]) - 1];
+  return month ? `${month} ${Number(m[2])}` : key;
 }

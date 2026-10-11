@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { projectSeries, projectTokensInRange, dominantProjectToday, stableColor, OTHER_ID, UNATTRIBUTED_ID, oldSchemaHosts } from './usageProjects';
 import type { UsageResponse } from '../../services/api';
 
-const day = (input: number) => ({ input, output: 0, cacheRead: 0, cacheCreate: 0, calls: 1 });
+const day = (input: number) => ({ input, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls: 1 });
 const D = ['2026-09-18', '2026-09-19'];
 const proj = (id: string, ws: string, tokens: Record<string, number>, color: string | null = null) => ({
   projectId: id, name: id.toUpperCase(), color, workstream: ws,
