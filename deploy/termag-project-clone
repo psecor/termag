@@ -1,0 +1,58 @@
+#!/bin/bash
+set -eu
+id=${1:-}
+case "$id" in
+  ''|*[!A-Za-z0-9_-]*)
+    printf 'termag-project-clone: project id required\n' >&2
+    exit 1
+    ;;
+esac
+checkout=${TERMAG_CHECKOUT:-$HOME/src/termag}
+state=$HOME/.termag/clones/${id}.json
+
+mark_failed() {
+  printf 'termag-project-clone: %s\n' "$1" >&2
+  if [ -f "$state" ]; then
+    current=$(jq -r '.status // empty' "$state" 2>/dev/null || true)
+    case "$current" in
+      ready|failed) exit 1 ;;
+    esac
+    tmp=${state}.tmp.$$
+    if jq --arg error "${1:0:256}" '.status = "failed" | .error = $error' "$state" > "$tmp"; then
+      mv -f "$tmp" "$state"
+    else
+      rm -f "$tmp"
+    fi
+  fi
+  exit 1
+}
+
+if ! node=$(/bin/bash "$checkout/agent/run-node.sh" --print-node); then
+  mark_failed 'no usable Node.js found by the shared launcher'
+fi
+PATH="${node%/*}:$PATH"
+export PATH
+
+# A foreground child defers SIGTERM until it exits, so a systemd kill during
+# the wait or the clone never reaches mark_failed. wait is interrupted.
+child=
+on_term() {
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    child=
+  fi
+  mark_failed "clone unit killed before it finished"
+}
+trap on_term TERM
+
+set +e
+"$node" "$checkout/agent/project-clone.js" run "$id" &
+child=$!
+wait "$child"
+code=$?
+child=
+set -e
+if [ "$code" -ne 0 ]; then
+  mark_failed "clone exited ${code}"
+fi
+exit "$code"

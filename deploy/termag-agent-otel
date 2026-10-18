@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# termag-agent-otel — start Codex, Devin, Cursor or pi with termag's
+# OpenTelemetry, then exec the agent.
+#
+# Usage:
+#   termag-agent-otel <codex|devin|cursor|pi> [--replay <id>] -- <command> [args...]
+#
+# The orchestrator types this in front of a provider's launch command on a box
+# whose agent advertises agent-telemetry-v1 (backend/src/services/launchCommand.ts),
+# and the Codex status bridge starts `codex app-server` through it. The
+# destination is what termag-credentials recorded from the orchestrator's
+# agent-telemetry delivery; with none (off, removed, or unreadable) the command
+# runs exactly as given, so a launch never fails on telemetry.
+#
+#   codex   the export goes in as `-c otel.*` overrides on this launch only:
+#           traces and metrics over OTLP/HTTP. Codex's log exporter stays off,
+#           because its codex.tool_result log records carry tool arguments and
+#           output; its spans carry only their lengths. An owner whose
+#           ~/.codex/config.toml has an otel table of their own keeps theirs.
+#   devin   Devin reads the standard OTLP variables (metrics and logs, which
+#           carry no prompt or tool content without the OTEL_LOG_* gates).
+#   cursor  Cursor's own exporter only reaches Cursor; termag-cursor-otel-hook
+#   pi      and the pi extension termag-otel.ts send instead, reading the
+#           same record. Here they get only the replay id (TERMAG_OTEL_REPLAY_ID).
+#
+# Whenever it exports, every OTEL_EXPORTER_OTLP_* and OTEL_LOG_* variable the
+# owner's shell set is dropped first: both Rust exporters merge a shell's
+# OTEL_EXPORTER_OTLP_HEADERS into a configured exporter, which would send the
+# owner's collector credential to the telemetry backend's ingest.
+#
+# Env: TERMAG_AGENT_TELEMETRY (the record; default ~/.config/termag/agent-telemetry.json),
+# CODEX_HOME.
+set -u
+
+usage() { sed -n '5,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+agent=${1:-}; [ $# -gt 0 ] && shift
+replay=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --replay) replay=${2:-}; shift 2 || usage ;;
+    --) shift; break ;;
+    *) usage ;;
+  esac
+done
+[ $# -gt 0 ] || usage
+case $agent in codex|devin|cursor|pi) ;; *) usage ;; esac
+
+# Letters and digits only, as for Claude's telemetry-launch: it goes into
+# OTEL_RESOURCE_ATTRIBUTES unescaped.
+case $replay in *[!A-Za-z0-9]*) replay= ;; esac
+if [ ${#replay} -lt 20 ] || [ ${#replay} -gt 64 ]; then replay=; fi
+
+record=${TERMAG_AGENT_TELEMETRY:-$HOME/.config/termag/agent-telemetry.json}
+endpoint='' resource=''
+if [ -s "$record" ] && command -v jq >/dev/null 2>&1; then
+  endpoint=$(jq -r 'if (.endpoint | type) == "string" then .endpoint else empty end' "$record" 2>/dev/null)
+  resource=$(jq -r 'if (.resourceAttributes | type) == "string" then .resourceAttributes else empty end' "$record" 2>/dev/null)
+fi
+# The same checks termag-credentials made: anything else and nothing is added.
+[[ $endpoint =~ ^https://[A-Za-z0-9.:-]+$ ]] || endpoint=
+[[ $resource =~ ^[A-Za-z0-9._=,-]+$ ]] || resource=
+if [ -z "$endpoint" ] || [ -z "$resource" ]; then exec "$@"; fi
+
+[ -n "$replay" ] && export TERMAG_OTEL_REPLAY_ID=$replay
+case $agent in cursor|pi) exec "$@" ;; esac
+
+if [ "$agent" = codex ]; then
+  # An otel table of the owner's own: theirs, untouched (environment too).
+  if grep -Eq '^[[:space:]]*(\[[[:space:]]*otel[[:space:]]*[].]|otel[[:space:]]*[.=])' \
+       "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null; then
+    exec "$@"
+  fi
+fi
+
+for v in $(compgen -e); do
+  case $v in OTEL_EXPORTER_OTLP_*|OTEL_LOG_*|OTEL_SERVICE_NAME) unset "$v" ;; esac
+done
+resource="$resource,service.name=termag-$agent-session,termag.agent=$agent"
+[ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
+export OTEL_RESOURCE_ATTRIBUTES=$resource
+
+case $agent in
+  devin)
+    export OTEL_EXPORTER_OTLP_ENDPOINT=$endpoint OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    exec "$@" ;;
+  codex)
+    # Codex sets service.name itself (codex_cli_rs, codex_exec); termag.agent
+    # is the attribute to filter on.
+    prog=$1; shift
+    exec "$prog" \
+      -c 'otel.exporter="none"' \
+      -c "otel.trace_exporter={otlp-http={endpoint=\"$endpoint/v1/traces\",protocol=\"binary\"}}" \
+      -c "otel.metrics_exporter={otlp-http={endpoint=\"$endpoint/v1/metrics\",protocol=\"binary\"}}" \
+      -c 'otel.log_user_prompt=false' \
+      -c 'otel.environment="termag"' \
+      "$@" ;;
+esac

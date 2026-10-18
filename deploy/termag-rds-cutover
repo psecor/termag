@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# termag-rds-cutover: move the orchestrator's database from the host's Postgres
+# container to Aurora, and back. Run as root on the
+# orchestrator host, over Session Manager.
+#
+#   termag-rds-cutover preflight          --host <writer endpoint>
+#   termag-rds-cutover rehearse           --host <writer endpoint> [--keep]
+#   termag-rds-cutover migrate            --host <writer endpoint>
+#   termag-rds-cutover verify             --host <writer endpoint>
+#   termag-rds-cutover wipe               --host <writer endpoint> --yes
+#   termag-rds-cutover rollback-to-docker --host <writer endpoint>
+#
+#   preflight           checks both databases, the roles bootstrap made, TLS and the token.
+#   rehearse            dump the live container (read-only), restore into Aurora, compare
+#                       row counts, time each step, then empty Aurora again (--keep skips that).
+#   migrate             the cutover itself: termag must be stopped and Aurora empty. Dump,
+#                       restore, require identical row counts, then write the
+#                       DATABASE_MOVED_TO_RDS marker that db:guard checks.
+#   verify              compare row counts, table by table.
+#   wipe                drop and recreate Aurora's public schema, with the grants.
+#   rollback-to-docker  termag must be stopped: copy Aurora back over the container's
+#                       database, verify, and write ALLOW_DOCKER_ROLLBACK. On a host
+#                       already in RDS mode it first starts the container on the data
+#                       volume, as cloud-init would, so the copy-back can happen before
+#                       the switch is reverted.
+#
+# Exit status: 0 done, 2 usage, 3 a precondition failed, 4 row counts differ, 1 other.
+#
+# Credentials. Aurora gets a 15-minute IAM token for `migration`, minted with
+# the host role. The container gets its password from the data volume. Both
+# reach the client only through PGPASSWORD, never argv, and are never printed.
+#
+# Environment (defaults are the orchestrator's; the test overrides them):
+#   TERMAG_DATA_DIR              /srv/termag
+#   TERMAG_PG_CLIENT             docker (the postgres:17 image) | local (pg_* on PATH)
+#   TERMAG_PG_IMAGE              postgres:17
+#   TERMAG_SOURCE_HOST/_PORT/_DB/_USER   127.0.0.1 / 5432 / termag / termag
+#   TERMAG_SOURCE_PASSWORD_FILE  $TERMAG_DATA_DIR/secrets/db_password
+#   TERMAG_SOURCE_CONTAINER      termag-pg (empty: never start one)
+#   TERMAG_TARGET_PORT/_DB/_USER 5432 / termag / migration
+#   TERMAG_TARGET_SSLMODE        verify-full
+#   TERMAG_RDS_CA_FILE           /usr/local/share/termag/rds-global-bundle.pem
+#   TERMAG_TARGET_TOKEN_CMD      unset: aws rds generate-db-auth-token
+#   TERMAG_SERVICE_CHECK         systemd | skip
+set -euo pipefail
+
+DATA_DIR=${TERMAG_DATA_DIR:-/srv/termag}
+WORK=$DATA_DIR/cutover
+PG_CLIENT=${TERMAG_PG_CLIENT:-docker}
+PG_IMAGE=${TERMAG_PG_IMAGE:-postgres:17}
+
+SOURCE_HOST=${TERMAG_SOURCE_HOST:-127.0.0.1}
+SOURCE_PORT=${TERMAG_SOURCE_PORT:-5432}
+SOURCE_DB=${TERMAG_SOURCE_DB:-termag}
+SOURCE_USER=${TERMAG_SOURCE_USER:-termag}
+SOURCE_PASSWORD_FILE=${TERMAG_SOURCE_PASSWORD_FILE:-$DATA_DIR/secrets/db_password}
+SOURCE_CONTAINER=${TERMAG_SOURCE_CONTAINER-termag-pg}
+
+TARGET_HOST=
+TARGET_PORT=${TERMAG_TARGET_PORT:-5432}
+TARGET_DB=${TERMAG_TARGET_DB:-termag}
+TARGET_USER=${TERMAG_TARGET_USER:-migration}
+TARGET_SSLMODE=${TERMAG_TARGET_SSLMODE:-verify-full}
+CA_FILE=${TERMAG_RDS_CA_FILE:-/usr/local/share/termag/rds-global-bundle.pem}
+SERVICE_CHECK=${TERMAG_SERVICE_CHECK:-systemd}
+
+MOVED_MARKER=$DATA_DIR/DATABASE_MOVED_TO_RDS
+ROLLBACK_MARKER=$DATA_DIR/ALLOW_DOCKER_ROLLBACK
+
+REGION=
+YES=
+KEEP=
+
+log() { printf '[rds-cutover] %s\n' "$*"; }
+die() { code=$1; shift; printf '[rds-cutover] ERROR: %s\n' "$*" >&2; exit "$code"; }
+
+usage() {
+  sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'
+  exit 2
+}
+
+# --- connections --------------------------------------------------------------
+
+source_conninfo() { printf 'host=%s port=%s dbname=%s user=%s sslmode=disable' "$SOURCE_HOST" "$SOURCE_PORT" "$SOURCE_DB" "$SOURCE_USER"; }
+
+target_conninfo() {
+  local info
+  info=$(printf 'host=%s port=%s dbname=%s user=%s sslmode=%s' "$TARGET_HOST" "$TARGET_PORT" "$TARGET_DB" "$TARGET_USER" "$TARGET_SSLMODE")
+  case $TARGET_SSLMODE in verify-*) info="$info sslrootcert=$CA_FILE" ;; esac
+  printf '%s' "$info"
+}
+
+source_password() {
+  if [ -r "$SOURCE_PASSWORD_FILE" ]; then cat "$SOURCE_PASSWORD_FILE"; fi
+}
+
+region_from_host() {
+  printf '%s' "$1" | sed -nE 's/.*\.([a-z]{2}(-gov)?-[a-z]+-[0-9])\.rds\.amazonaws\.com$/\1/p'
+}
+
+target_token() {
+  if [ -n "${TERMAG_TARGET_TOKEN_CMD:-}" ]; then
+    sh -c "$TERMAG_TARGET_TOKEN_CMD"
+    return
+  fi
+  local region=${REGION:-${AWS_REGION:-$(region_from_host "$TARGET_HOST")}}
+  [ -n "$region" ] || die 2 "cannot tell the region of $TARGET_HOST; pass --region"
+  aws rds generate-db-auth-token --hostname "$TARGET_HOST" --port "$TARGET_PORT" \
+    --username "$TARGET_USER" --region "$region"
+}
+
+# pg_run <password> <pg tool> [args...]: the password goes in through PGPASSWORD.
+pg_run() {
+  local password=$1
+  shift
+  if [ "$PG_CLIENT" = local ]; then
+    PGPASSWORD=$password "$@"
+    return
+  fi
+  local mounts=(-v "$WORK:$WORK")
+  [ -r "$CA_FILE" ] && mounts+=(-v "$CA_FILE:$CA_FILE:ro")
+  PGPASSWORD=$password docker run --rm -i --network host -e PGPASSWORD "${mounts[@]}" "$PG_IMAGE" "$@"
+}
+
+psql_source() { pg_run "$(source_password)" psql -X -v ON_ERROR_STOP=1 -At "$(source_conninfo)" "$@"; }
+psql_target() { pg_run "$TARGET_TOKEN" psql -X -v ON_ERROR_STOP=1 -At "$(target_conninfo)" "$@"; }
+
+# One `table|rows` line per public base table, exact counts, sorted.
+COUNTS_SQL="SELECT table_name || '|' || (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text
+FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name"
+
+TABLES_SQL="SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+
+# Recreates what wipe drops. Same grants as termag-rds-bootstrap.sql, as migration.
+SCHEMA_SQL="DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+GRANT USAGE ON SCHEMA public TO application;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO application;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO application;"
+
+# --- checks -------------------------------------------------------------------
+
+require_host() { [ -n "$TARGET_HOST" ] || die 2 "--host <Aurora writer endpoint> is required"; }
+
+require_stopped() {
+  [ "$SERVICE_CHECK" = skip ] && return
+  if systemctl is-active --quiet termag.service; then
+    die 3 "termag.service is running; stop it first: systemctl stop termag"
+  fi
+}
+
+require_target_empty() {
+  local n
+  n=$(psql_target -c "$TABLES_SQL")
+  [ "$n" = 0 ] || die 3 "Aurora already has $n tables in public; empty it first: $0 wipe --host $TARGET_HOST --yes"
+}
+
+client_check() {
+  if [ "$PG_CLIENT" = local ]; then
+    for t in psql pg_dump pg_restore; do command -v "$t" >/dev/null || die 3 "missing $t"; done
+    return
+  fi
+  command -v docker >/dev/null || die 3 "docker is not installed"
+  docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || { log "pulling $PG_IMAGE"; docker pull -q "$PG_IMAGE" >/dev/null; }
+}
+
+preflight() {
+  require_host
+  client_check
+  case $TARGET_SSLMODE in
+    verify-*) [ -s "$CA_FILE" ] || die 3 "RDS CA bundle $CA_FILE is missing (baked by the orchestrator AMI)" ;;
+  esac
+  mkdir -p "$WORK"
+  chmod 700 "$WORK"
+
+  log "source: $SOURCE_USER@$SOURCE_HOST:$SOURCE_PORT/$SOURCE_DB"
+  psql_source -c 'SELECT 1' >/dev/null || die 3 "cannot connect to the source database"
+  log "source: $(psql_source -c "$TABLES_SQL") tables"
+
+  log "target: $TARGET_USER@$TARGET_HOST:$TARGET_PORT/$TARGET_DB (sslmode=$TARGET_SSLMODE)"
+  TARGET_TOKEN=$(target_token) || die 3 "could not mint an IAM auth token for $TARGET_USER"
+  local who
+  who=$(psql_target -c 'SELECT current_user') || die 3 "cannot connect to Aurora as $TARGET_USER: check the SCP allows rds-db:connect, the host role's policy, and the bootstrap"
+  [ "$who" = "$TARGET_USER" ] || die 3 "connected as $who, expected $TARGET_USER"
+
+  local roles
+  roles=$(psql_target -c "SELECT
+      (SELECT count(*) FROM pg_roles WHERE rolname = 'application' AND rolcanlogin)
+    || ',' || has_schema_privilege('application', 'public', 'USAGE')
+    || ',' || (SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 'public')
+    || ',' || (SELECT count(*) FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace
+               WHERE n.nspname = 'public' AND d.defaclrole = 'migration'::regrole)") \
+    || die 3 "the bootstrap roles are missing; run termag-rds-bootstrap.sql as administrator"
+  [ "$roles" = "1,true,migration,2" ] \
+    || die 3 "bootstrap incomplete (application login, USAGE, schema owner, default ACLs = $roles; want 1,true,migration,2); run termag-rds-bootstrap.sql"
+  log "target: $(psql_target -c "$TABLES_SQL") tables; roles and grants in place"
+}
+
+# --- steps --------------------------------------------------------------------
+
+dump_source() {
+  local file=$1
+  log "dumping the source to $file"
+  pg_run "$(source_password)" pg_dump -Fc --no-owner --no-privileges -f "$file" "$(source_conninfo)"
+  chmod 600 "$file"
+}
+
+# restore_sql <password> <conninfo> <dump> [pg_restore options...]
+#
+# pg_restore writes a script and psql runs it, rather than pg_restore -d. The
+# client is Postgres 17, and its scripts open with SETs an older server rejects:
+# transaction_timeout, new in 17, aborts a restore into the host's Postgres 14
+# container. Every top-level `SET <name> = ...;` naming a setting the target
+# server doesn't have is dropped, and logged. With --single-transaction the
+# script is one BEGIN ... COMMIT, and ON_ERROR_STOP aborts it on the first
+# error, so a failed restore leaves the target as it was.
+restore_sql() {
+  local password=$1 conninfo=$2 file=$3
+  shift 3
+  local known=$WORK/target-settings.txt
+  pg_run "$password" psql -X -At -c 'SELECT name FROM pg_settings' "$conninfo" >"$known"
+  pg_run "$password" pg_restore "$@" -f - "$file" \
+    | awk -v known="$known" '
+        BEGIN { while ((getline name < known) > 0) ok[name] = 1 }
+        /^SET [a-z_]+ = .*;$/ && !($2 in ok) {
+          print "[rds-cutover] dropped, unknown to the target server: " $0 > "/dev/stderr"
+          next
+        }
+        { print }' \
+    | pg_run "$password" psql -X -q -v ON_ERROR_STOP=1 "$conninfo"
+}
+
+restore_target() {
+  local file=$1
+  log "restoring $file into Aurora as $TARGET_USER"
+  restore_sql "$TARGET_TOKEN" "$(target_conninfo)" "$file" --no-owner --no-privileges --single-transaction
+}
+
+# compare_counts <exact|report>: prints the diff; with exact, a difference is exit 4.
+compare_counts() {
+  local mode=$1
+  psql_source -c "$COUNTS_SQL" >"$WORK/source.counts"
+  psql_target -c "$COUNTS_SQL" >"$WORK/target.counts"
+  if diff -u --label source "$WORK/source.counts" --label aurora "$WORK/target.counts" >"$WORK/counts.diff"; then
+    log "row counts match on all $(wc -l <"$WORK/source.counts" | tr -d ' ') tables"
+    return 0
+  fi
+  cat "$WORK/counts.diff"
+  [ "$mode" = exact ] && return 4
+  log "row counts differ (expected in a rehearsal: the source was live)"
+  return 0
+}
+
+wipe_target() {
+  log "dropping and recreating Aurora's public schema"
+  psql_target -c "$SCHEMA_SQL" >/dev/null
+}
+
+# The host's Postgres container, started the way cloud-init starts it, for a host
+# that is already in RDS mode and so runs none.
+ensure_source_container() {
+  [ -n "$SOURCE_CONTAINER" ] && [ "$PG_CLIENT" = docker ] || return 0
+  if [ "$(docker inspect -f '{{.State.Running}}' "$SOURCE_CONTAINER" 2>/dev/null)" = true ]; then
+    return 0
+  fi
+  [ -s "$SOURCE_PASSWORD_FILE" ] || die 3 "no $SOURCE_PASSWORD_FILE: the container's database cannot be started"
+  [ -d "$DATA_DIR/pgdata" ] || die 3 "no $DATA_DIR/pgdata: there is no container database to roll back to"
+  log "starting $SOURCE_CONTAINER on $DATA_DIR/pgdata"
+  if docker container inspect "$SOURCE_CONTAINER" >/dev/null 2>&1; then
+    docker start "$SOURCE_CONTAINER" >/dev/null
+  else
+    POSTGRES_PASSWORD=$(cat "$SOURCE_PASSWORD_FILE") docker run -d --name "$SOURCE_CONTAINER" --restart unless-stopped \
+      -p 127.0.0.1:5432:5432 -v "$DATA_DIR/pgdata:/var/lib/postgresql/data" \
+      -e POSTGRES_DB=termag -e POSTGRES_USER=termag -e POSTGRES_PASSWORD postgres:14 >/dev/null
+  fi
+  for _ in $(seq 1 60); do
+    docker exec "$SOURCE_CONTAINER" pg_isready -U termag -d termag >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  die 1 "$SOURCE_CONTAINER did not accept connections within 120s"
+}
+
+now() { date +%s; }
+
+cmd_preflight() { preflight; log "preflight ok"; }
+
+cmd_rehearse() {
+  preflight
+  require_target_empty
+  local t0 t1 t2 t3
+  t0=$(now); dump_source "$WORK/rehearsal.dump"
+  t1=$(now); restore_target "$WORK/rehearsal.dump"
+  t2=$(now); compare_counts report
+  t3=$(now)
+  log "timings: dump $((t1 - t0))s, restore $((t2 - t1))s, verify $((t3 - t2))s, dump size $(du -h "$WORK/rehearsal.dump" | cut -f1)"
+  if [ -n "$KEEP" ]; then
+    log "--keep: Aurora keeps the rehearsal copy; wipe it before migrate"
+  else
+    wipe_target
+  fi
+  rm -f "$WORK/rehearsal.dump"
+  log "rehearsal done"
+}
+
+cmd_migrate() {
+  require_stopped
+  preflight
+  require_target_empty
+  dump_source "$WORK/termag.dump"
+  restore_target "$WORK/termag.dump"
+  if ! compare_counts exact; then
+    die 4 "row counts differ; nothing was switched. Resume the old host with: systemctl start termag"
+  fi
+  {
+    printf 'moved_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'host=%s\n' "$TARGET_HOST"
+  } >"$MOVED_MARKER"
+  rm -f "$ROLLBACK_MARKER"
+  log "wrote $MOVED_MARKER; the container's database will now refuse to start termag"
+  log "next: merge the terraform change that sets database = \"rds\""
+}
+
+cmd_verify() {
+  preflight
+  compare_counts exact || die 4 "row counts differ"
+}
+
+cmd_wipe() {
+  [ -n "$YES" ] || die 2 "wipe drops every table in Aurora's public schema; pass --yes"
+  preflight
+  wipe_target
+  log "Aurora is empty"
+}
+
+cmd_rollback_to_docker() {
+  require_stopped
+  ensure_source_container
+  preflight
+  local file=$WORK/rds-rollback.dump
+  log "dumping Aurora to $file"
+  pg_run "$TARGET_TOKEN" pg_dump -Fc --no-owner --no-privileges -f "$file" "$(target_conninfo)"
+  chmod 600 "$file"
+  log "restoring it over the container's database"
+  restore_sql "$(source_password)" "$(source_conninfo)" "$file" --clean --if-exists --no-owner --no-privileges --single-transaction
+  compare_counts exact || die 4 "row counts differ after copying Aurora back; the container's database is not safe to start on"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$ROLLBACK_MARKER"
+  log "wrote $ROLLBACK_MARKER; db:guard will let termag start on the container's database"
+  log "next: revert the terraform change to database = \"docker\""
+}
+
+# --- main ---------------------------------------------------------------------
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+while [ $# -gt 0 ]; do
+  case $1 in
+    --host) TARGET_HOST=${2:-}; shift 2 ;;
+    --region) REGION=${2:-}; shift 2 ;;
+    --yes) YES=1; shift ;;
+    --keep) KEEP=1; shift ;;
+    -h|--help) usage ;;
+    *) die 2 "unknown argument: $1" ;;
+  esac
+done
+
+TARGET_TOKEN=
+case $cmd in
+  preflight) cmd_preflight ;;
+  rehearse) cmd_rehearse ;;
+  migrate) cmd_migrate ;;
+  verify) cmd_verify ;;
+  wipe) cmd_wipe ;;
+  rollback-to-docker) cmd_rollback_to_docker ;;
+  -h|--help|help) usage ;;
+  *) die 2 "unknown command: $cmd" ;;
+esac

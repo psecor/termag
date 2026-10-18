@@ -1,0 +1,110 @@
+import { EventEmitter } from 'events';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { sharingRouter } from './sharing';
+import { boolVariation } from '../services/featureFlags';
+import { BOX_SHARING_FLAG } from '../services/boxSharingFlag';
+import { prisma } from '../db';
+
+const ada = { id: 'u-ada', unixUsername: 'ada', googleEmail: 'ada@example.test', displayName: 'Ada', defaultAgentProvider: 'claude' };
+const bob = { id: 'u-bob', unixUsername: 'bob', googleEmail: 'bob@example.test', displayName: 'Bob', defaultAgentProvider: 'claude' };
+let caller: typeof ada = ada;
+
+vi.mock('../db', () => ({
+  prisma: {
+    project: { findFirst: vi.fn(async () => ({ id: 'p1', userId: 'u-ada', kind: 'standard' })) },
+    user: { findUnique: vi.fn(async () => ({ id: 'u-bob' })) },
+    projectShare: {
+      findUnique: vi.fn(async () => null),
+      findMany: vi.fn(async () => []),
+      create: vi.fn(async () => ({})),
+      delete: vi.fn(async () => ({})),
+      deleteMany: vi.fn(async () => ({ count: 1 })),
+    },
+    projectInvite: {
+      upsert: vi.fn(async () => ({ id: 'inv1', status: 'pending' })),
+      findFirst: vi.fn(async () => ({ id: 'inv1', projectId: 'p1', inviteeId: 'u-bob', status: 'pending' })),
+      findMany: vi.fn(async () => []),
+      update: vi.fn(async () => ({})),
+    },
+    $transaction: vi.fn(async () => []),
+  },
+}));
+vi.mock('../middleware/auth', () => ({
+  requireAuth: vi.fn((req: Request, _res: Response, next: NextFunction) => { req.user = caller as never; next(); }),
+}));
+vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
+
+interface RouteLayer { route?: { path: string; methods: Record<string, boolean>; stack: { handle: RequestHandler }[] } }
+
+/** Runs one route of the sharing router and resolves with the response once it has answered. */
+async function call(method: string, path: string, params: Record<string, string> = {}, body: unknown = {}) {
+  const layer = (sharingRouter().stack as RouteLayer[]).find(l => l.route?.path === path && l.route.methods[method])!;
+  let answered!: () => void;
+  const done = new Promise<void>(r => { answered = r; });
+  const res = Object.assign(new EventEmitter(), {
+    statusCode: 200,
+    body: undefined as unknown,
+    status: vi.fn(function (this: { statusCode: number }, code: number) { this.statusCode = code; return this; }),
+    json: vi.fn(function (this: { body: unknown }, b: unknown) { this.body = b; answered(); return this; }),
+  });
+  const req = { headers: {}, params, body } as unknown as Request;
+  for (const { handle } of layer.route!.stack) {
+    let advanced = false;
+    await handle(req, res as unknown as Response, () => { advanced = true; });
+    if (!advanced) break;
+  }
+  await done;
+  return res;
+}
+
+const refused = { error: expect.stringContaining('turned off'), code: 'sharing_disabled' };
+
+describe('sharing routes behind box-sharing-enabled', () => {
+  afterEach(() => { vi.clearAllMocks(); caller = ada; });
+
+  it('refuses a new invite while the flag is off for the inviter, before touching the database', async () => {
+    const res = await call('post', '/projects/:id/invite', { id: 'p1' }, { inviteeEmail: 'bob@example.test' });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual(refused);
+    expect(boolVariation).toHaveBeenCalledWith(BOX_SHARING_FLAG, ada, false);
+    expect(prisma.projectInvite.upsert).not.toHaveBeenCalled();
+  });
+
+  it('sends the invite once the flag is on for the inviter', async () => {
+    vi.mocked(boolVariation).mockResolvedValueOnce(true);
+    const res = await call('post', '/projects/:id/invite', { id: 'p1' }, { inviteeEmail: 'bob@example.test' });
+    expect(res.statusCode).toBe(201);
+    expect(prisma.projectInvite.upsert).toHaveBeenCalled();
+  });
+
+  it('refuses to accept a pending invite while the flag is off for the invitee', async () => {
+    caller = bob;
+    const res = await call('post', '/invites/:id/accept', { id: 'inv1' });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toEqual(refused);
+    expect(boolVariation).toHaveBeenCalledWith(BOX_SHARING_FLAG, bob, false);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts the invite once the flag is on for the invitee', async () => {
+    caller = bob;
+    vi.mocked(boolVariation).mockResolvedValueOnce(true);
+    const res = await call('post', '/invites/:id/accept', { id: 'inv1' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(prisma.$transaction).toHaveBeenCalled();
+  });
+
+  it('keeps listing, declining, revoking and leaving open with the flag off', async () => {
+    expect((await call('get', '/invites')).statusCode).toBe(200);
+    expect((await call('get', '/projects/:id/shares', { id: 'p1' })).statusCode).toBe(200);
+    expect((await call('delete', '/projects/:id/shares/:shareId', { id: 'p1', shareId: 's1' })).body).toEqual({ ok: true });
+    caller = bob;
+    expect((await call('post', '/invites/:id/decline', { id: 'inv1' })).body).toEqual({ ok: true });
+    expect((await call('delete', '/projects/:id/leave', { id: 'p1' })).body).toEqual({ ok: true });
+    expect(boolVariation).not.toHaveBeenCalled();
+    expect(prisma.projectShare.delete).toHaveBeenCalled();
+    expect(prisma.projectShare.deleteMany).toHaveBeenCalled();
+  });
+});

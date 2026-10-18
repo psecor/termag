@@ -1,0 +1,21 @@
+[Unit]
+Description=termag warm-pool on-claim personalization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Started by the box-claim RPC when the owner saved a dotfiles repository.
+# Readiness does not wait for this oneshot. There is no GitHub token on this
+# path: a public clone uses plain HTTPS, and anything else waits for the
+# owner's own gh auth login.
+Type=oneshot
+ExecStart=%h/src/termag/deploy/termag-hook-run claim
+
+# The runner enforces the ten-minute budget so it can report "timeout" in its
+# status file. The unit leaves enough room for that cleanup and final write.
+TimeoutStartSec=11min
+
+# The env file holds the owner name, email, and repo URL. The URL also lives
+# in dotfiles-repo-url, which this must not delete: a rerun after GitHub
+# login reads it.
+ExecStopPost=-/bin/rm -f %h/.termag/on-claim.env

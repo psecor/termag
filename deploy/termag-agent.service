@@ -1,0 +1,50 @@
+[Unit]
+Description=Termag per-user agent
+After=network.target
+
+[Service]
+# Resolve Node the same way as the updater: checkout, nvm default, installed
+# nvm binaries newest-first, then PATH. A refreshed lts/* may name an uninstalled
+# version. The launcher also puts the selected bin directory on the children's
+# PATH. $HOME comes from the user manager and survives a box-owner rename.
+#
+# Adjust the agent/ path if you cloned termag somewhere other than ~/src/termag.
+# Avoid ~/termag/, since termag's project dirs live at ~/termag/projects/<name>/
+# and a clone there will collide.
+ExecStart=/bin/bash -c 'exec /bin/bash "$HOME/src/termag/agent/run-node.sh" "$HOME/src/termag/agent/agent.js" "$HOME/src/termag/agent/agent.config.json"'
+Restart=always
+RestartSec=5
+
+# A project's own boot telemetry can label where a boot ran from TERMAG_BOX
+# instead of guessing from the hostname. tmux daemonises out of this unit but
+# keeps its environment,
+# and every pane and Claude runner session the agent creates inherits the
+# server's, so one line here reaches `make dev` from a project pane, the runner
+# and a detached launcher alike. A server that outlived an agent restart
+# (KillMode=process below) keeps its old environment, so the agent also sets
+# the variable on each session it creates (`-e`, agent/tmux-args.js). Login
+# shells outside tmux get it from /etc/profile.d/termag-box.sh (bash) and
+# /etc/zsh/zshenv (zsh, the box user's shell); both from box-lib.sh,
+# install_box_marker.
+Environment=TERMAG_BOX=1
+
+# Do not take the user's tmux server down with the agent.
+#
+# agent.js starts tmux sessions with `tmux new-session`. tmux daemonises, so it
+# reparents to the systemd user manager and `ps` makes it look independent -- but
+# it stays in this unit's *cgroup*, and the default KillMode=control-group
+# SIGKILLs the entire cgroup on stop. So `systemctl --user restart termag-agent`
+# destroys the tmux server and every pane with it: any build, test run or
+# interactive login in any project dies, and scrollback is lost. The agent then
+# recreates empty sessions on reconnect, so the panes come back looking healthy,
+# which makes the data loss easy to miss.
+#
+# KillMode=process signals only the main process and leaves the rest of the
+# cgroup alone, so the tmux server survives a restart and the agent reattaches to
+# the existing sessions (see AGENTS.md on reconnect reconstructing session state).
+# Trade-off: leftover `tmux attach-session` clients are no longer force-killed.
+# They exit when their PTY closes, so they are transient rather than leaked.
+KillMode=process
+
+[Install]
+WantedBy=default.target

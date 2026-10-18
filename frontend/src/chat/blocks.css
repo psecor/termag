@@ -1,0 +1,120 @@
+/* Transcript blocks shared by the chat clients (the phone's /m and the
+   desktop's /chat): what chat/Blocks.tsx renders. The class names keep the
+   phone's m- prefix because observability.ts blocks .m-block and .m-draft
+   from session replay; a rename would have to move that list too. */
+
+.m-block { max-width: 100%; }
+.m-block-who { font-size: 11px; color: var(--text-muted); margin-bottom: 2px; text-transform: lowercase; }
+.m-block-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.m-block-you {
+  align-self: flex-end;
+  max-width: 88%;
+  background: var(--accent-dim);
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+}
+.m-block-you .m-block-who { color: rgba(255, 255, 255, 0.7); }
+.m-block-agent {
+  align-self: flex-start;
+  max-width: 94%;
+  background: var(--bg-surface);
+  padding: 8px 12px;
+  border-radius: 14px 14px 14px 4px;
+  border: 1px solid var(--border);
+}
+.m-block[data-partial] { border-top: 1px dashed var(--text-muted); border-top-left-radius: 4px; border-top-right-radius: 4px; }
+.m-block-plain, .m-block-system, .m-tool-result {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Unrecognised text stays readable; only the pre-CLI shell banner recedes. */
+.m-block-system { color: var(--text-secondary); }
+.m-block-system[data-banner] { color: var(--text-muted); }
+/* Plain mode (pi, Devin, Cursor, the ctrl shell): still monospace — these
+   panes carry diffs, code and tables whose columns matter — but at a size
+   and colour that read as the conversation, not as a log. */
+.m-block-plain { color: var(--text-primary); font-size: 13px; line-height: 1.45; }
+.m-block-tool { align-self: stretch; }
+.m-block-tool[data-failed] { border-left: 2px solid var(--danger); padding-left: 6px; }
+.m-block-tool[data-failed] .m-tool-marker { color: var(--danger); }
+/* pi's reasoning: shown, readable, visibly secondary to the answer. */
+.m-block-thinking {
+  align-self: flex-start;
+  max-width: 94%;
+  padding: 2px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-secondary);
+  font-style: italic;
+}
+/* Fenced code inside prose: monospace, rows intact, upright even in reasoning. */
+.m-code {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: var(--bg-base);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  font-style: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.m-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.m-tool-marker { color: var(--success); font-size: 10px; }
+.m-tool-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-tool-count { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.m-tool-result {
+  margin-top: 4px;
+  padding: 8px 10px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  max-height: 50vh;
+  overflow: auto;
+}
+.m-block-dialog {
+  align-self: stretch;
+  background: var(--bg-surface);
+  border: 1px solid var(--warning);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.m-block-dialog .m-block-who { color: var(--warning); }
+.m-dialog-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.m-draft {
+  align-self: stretch;
+  border: 1px dashed var(--text-muted);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.m-draft-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.m-draft-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-primary); }

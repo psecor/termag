@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# termag-hook-run — run the box lifecycle hook scripts for one mode.
+#
+# Modes:
+#   warm    run deploy/on-warm.d/*.sh from the checkout while the box is still
+#           unowned, so a claimed box arrives with its slow work already done.
+#   claim   clone an optional personal dotfiles repo when it is public, or
+#           leave the saved URL for a rerun after the owner signs in.
+#           No GitHub token is read or written.
+#
+# The backend starts the warm run through the agent once the agent has
+# connected, never cloud-init, so nothing enables termag-on-warm.service at
+# boot. The agent polls the status file described below every 2 s and forwards
+# it to the backend. box-claim starts the claim run the same way.
+#
+# Usage:
+#   termag-hook-run warm
+#   termag-hook-run claim
+#
+# Env:
+#   TERMAG_CHECKOUT      checkout to take the scripts from (default
+#                        $HOME/src/termag); exported to each script too
+#   TERMAG_HOOK_TIMEOUT  per-script timeout, a timeout(1) duration (default 20m)
+#   TERMAG_STATE_DIR     where the log and status file go (default $HOME/.termag)
+#
+# ── ~/.termag/on-warm.status.json ───────────────────────────────────────────
+#
+# The contract with the agent and, through it, the backend. It is rewritten
+# before and after every script and once when the run ends, each time by
+# writing a temp file and renaming it, so a poller reading it concurrently
+# never sees a half-written file.
+#
+#   {
+#     "schema": 1,
+#     "state": "running" | "succeeded" | "failed",
+#     "script": "10-example.sh" | null,
+#     "exitCode": 124 | null,
+#     "reason": null | "script-failed" | "timeout" | "missing-scripts" | "runner-error",
+#     "startedAt": "2026-09-22T00:31:02Z",
+#     "updatedAt": "2026-09-22T00:51:47Z",
+#     "durations": [ { "script": "10-example.sh", "seconds": 812, "exitCode": 0 } ],
+#     "logTail": "..."
+#   }
+#
+# `state` is the whole answer for the backend, which marks a box warm only on
+# "succeeded". `script`, `exitCode` and `reason` all describe the single script
+# that `state` is about, and are all null on "succeeded", so there is no stale
+# script name left to mistake for a live one. While "running", `script` names
+# the script in flight and `exitCode` is null because it has not finished.
+#
+# `reason` separates the ways a warm run fails, because they need different
+# operator responses. The script returned non-zero, timeout(1) killed it at
+# TERMAG_HOOK_TIMEOUT, the checkout has no on-warm.d to run, or this runner
+# itself died mid-run. A missing script directory is deliberately a failure
+# rather than a vacuous success: a box whose image or checkout is broken has to
+# be replaced, not handed to somebody.
+#
+# `durations` appends one record per finished script, in run order, including
+# the one that failed. `logTail` is the tail of this run's slice of the log,
+# capped so it fits in a WebSocket frame.
+#
+# `schema` is versioned because a box's checkout and the orchestrator move
+# independently (which is the reason termag-reconcile exists at all), so the
+# backend will read status files written by older and newer copies of this
+# script than the one it was built against.
+
+set -euo pipefail
+
+# Byte semantics for the control-character class in json_string, and a stable
+# collation for the filename-order glob.
+export LC_ALL=C
+
+CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+HOOK_TIMEOUT="${TERMAG_HOOK_TIMEOUT:-20m}"
+
+LOG_TAIL_LINES=50
+LOG_TAIL_BYTES=4000
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+json_string() {
+  local s=${1//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\n'/\\n}
+  # The remaining control bytes are dropped rather than escaped. Only \u00xx
+  # would be valid JSON for them, and no consumer of logTail can tell a stray
+  # 0x07 from nothing.
+  s=${s//[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037'$'\177']/}
+  printf '"%s"' "$s"
+}
+
+json_string_or_null() {
+  if [ -z "${1:-}" ]; then printf 'null'; else json_string "$1"; fi
+}
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+log() {
+  printf '[termag-hook-run] %s\n' "$*" | tee -a "$LOG_FILE"
+}
+
+# Only this run's slice of the log. The file is appended to across attempts so
+# a first failure survives a restart, but a tail spanning attempts would
+# misreport which output belongs to the state being published.
+log_tail() {
+  tail -c "+$((LOG_START_BYTE + 1))" "$LOG_FILE" \
+    | tail -n "$LOG_TAIL_LINES" \
+    | tail -c "$LOG_TAIL_BYTES"
+}
+
+write_status() {
+  local tmp="$STATUS_FILE.tmp.$$"
+  {
+    printf '{\n'
+    printf '  "schema": 1,\n'
+    printf '  "state": %s,\n' "$(json_string "$STATE")"
+    printf '  "script": %s,\n' "$(json_string_or_null "$CURRENT_SCRIPT")"
+    printf '  "exitCode": %s,\n' "${CURRENT_EXIT:-null}"
+    printf '  "reason": %s,\n' "$(json_string_or_null "$REASON")"
+    printf '  "startedAt": %s,\n' "$(json_string "$STARTED_AT")"
+    printf '  "updatedAt": %s,\n' "$(json_string "$(now_iso)")"
+    printf '  "durations": [%s],\n' "$DURATIONS_JSON"
+    printf '  "logTail": %s\n' "$(json_string "$(log_tail)")"
+    printf '}\n'
+  } > "$tmp"
+  mv -f "$tmp" "$STATUS_FILE"
+}
+
+record_duration() {
+  local entry
+  entry=$(printf '{"script": %s, "seconds": %d, "exitCode": %d}' \
+    "$(json_string "$1")" "$2" "$3")
+  if [ -z "$DURATIONS_JSON" ]; then
+    DURATIONS_JSON="$entry"
+  else
+    DURATIONS_JSON="$DURATIONS_JSON, $entry"
+  fi
+}
+
+fail_run() {
+  STATE=failed
+  REASON=$1
+  log "failed: $2"
+  write_status
+  exit 1
+}
+
+# Anything that ends the run while it still claims to be running would
+# otherwise leave the backend waiting out its 45-minute stuck sweep for a
+# process that is already gone. Reached on a signal too, via the traps below
+# that turn one into an exit, because bash does not run an EXIT trap for an
+# otherwise-untrapped signal.
+on_exit() {
+  local rc=$?
+  if [ "$STATE" = running ]; then
+    STATE=failed
+    REASON=runner-error
+    write_status
+  fi
+  exit "$rc"
+}
+
+# The signal has to be passed on by hand. timeout(1) runs the script in a
+# process group of its own, so only a cgroup-wide kill reaches it, and
+# systemd's KillMode is the sort of thing that gets narrowed later.
+on_signal() {
+  if [ -n "$CHILD" ]; then
+    kill -TERM "$CHILD" 2>/dev/null || true
+  fi
+  exit "$1"
+}
+
+run_warm() {
+  local dir="$CHECKOUT/deploy/on-warm.d"
+
+  log "warm run starting, scripts from $dir"
+  [ -d "$dir" ] || fail_run missing-scripts "no script directory at $dir"
+
+  local script name started rc elapsed
+  for script in "$dir"/*.sh; do
+    # A literal "*.sh" from an empty directory, and anything that is not a
+    # plain file.
+    [ -f "$script" ] || continue
+    # An unexecutable file is skipped rather than fed to an interpreter: the
+    # bit is how a script gets parked without deleting it.
+    [ -x "$script" ] || continue
+    name=$(basename "$script")
+    # A test suite is not a warm step. deploy/ keeps its tests beside what they
+    # test, so one landing here is a mistake, and running it would let a
+    # failing assertion fail the warm run and retire a working box.
+    case "$name" in *.test.sh) continue ;; esac
+
+    CURRENT_SCRIPT=$name
+    CURRENT_EXIT=
+    write_status
+
+    log "running $name"
+    started=$(date +%s)
+    rc=0
+    # Backgrounded and waited on rather than run in the foreground, because a
+    # trap queues behind a foreground child but interrupts a wait. Without
+    # this the runner ignores a SIGTERM for as long as the script takes.
+    #
+    # -k: a script that ignores SIGTERM still dies, so a hung script cannot
+    # hold the run past its timeout and strand the box in "running".
+    # TERMAG_CHECKOUT so a script can reach the rest of the checkout it was
+    # taken from. A box's checkout and the artifacts installed from it drift
+    # (that is why termag-reconcile exists), and a hook script's siblings are
+    # the copy it was written against.
+    TERMAG_IS_WARM=1 TERMAG_CHECKOUT="$CHECKOUT" \
+      timeout -k 30s "$HOOK_TIMEOUT" "$script" \
+      >> "$LOG_FILE" 2>&1 &
+    CHILD=$!
+    wait "$CHILD" || rc=$?
+    CHILD=
+    elapsed=$(( $(date +%s) - started ))
+
+    CURRENT_EXIT=$rc
+    record_duration "$name" "$elapsed" "$rc"
+    write_status
+
+    case "$rc" in
+      0) ;;
+      # 124 is what timeout(1) reports when it had to kill the child.
+      124) fail_run timeout "$name timed out after $HOOK_TIMEOUT" ;;
+      *)   fail_run script-failed "$name exited $rc after ${elapsed}s" ;;
+    esac
+
+    log "$name ok in ${elapsed}s"
+  done
+
+  STATE=succeeded
+  CURRENT_SCRIPT=
+  CURRENT_EXIT=
+  log 'warm run succeeded'
+  write_status
+}
+
+# HEAD resolving is completeness. A leftover directory, including one with a
+# .git and no commit, is not a finished clone.
+usable_dotfiles_repo() {
+  local dir=$1
+  { [ -d "$dir/.git" ] || git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; } \
+    && git -C "$dir" rev-parse --verify HEAD >/dev/null 2>&1
+}
+
+clone_dotfiles() {
+  local dir=$1
+  if usable_dotfiles_repo "$dir"; then
+    printf '[termag-hook-run] dotfiles already cloned at %s\n' "$dir"
+    return 0
+  fi
+  if [ -e "$dir" ]; then
+    case "$dir" in
+      ''|/|"$HOME")
+        printf 'refusing to remove %s\n' "$dir"
+        return 2
+        ;;
+    esac
+    printf '[termag-hook-run] unfinished clone at %s -- removing it and cloning again\n' "$dir"
+    rm -rf -- "$dir"
+  fi
+  local -a git_env
+  # Claim time has no owner key. A neutral gitconfig keeps a public HTTPS
+  # clone from being rewritten to SSH. A rerun after gh auth login sets
+  # TERMAG_DOTFILES_USE_OWNER_GIT so the owner's own SSH config is used.
+  if [ "${TERMAG_DOTFILES_USE_OWNER_GIT:-}" = 1 ]; then
+    git_env=(GIT_TERMINAL_PROMPT=0)
+  else
+    git_env=(GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0)
+  fi
+  printf '[termag-hook-run] cloning %s\n' "$TERMAG_DOTFILES_REPO_URL"
+  env "${git_env[@]}" git clone -- "$TERMAG_DOTFILES_REPO_URL" "$dir" || return 10
+  usable_dotfiles_repo "$dir" || return 10
+  return 0
+}
+
+apply_dotfiles_tree() {
+  local dir=$1 candidate selected=
+  for candidate in install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup; do
+    if [ -f "$dir/$candidate" ]; then
+      selected=$candidate
+      break
+    fi
+  done
+  if [ -n "$selected" ]; then
+    printf '[termag-hook-run] running dotfiles entrypoint %s\n' "$selected"
+    (
+      cd "$dir"
+      TERMAG_IS_CLAIM=1 \
+      TERMAG_OWNER_EMAIL="${TERMAG_OWNER_EMAIL:-}" \
+      TERMAG_OWNER_NAME="${TERMAG_OWNER_NAME:-}" \
+      bash "./$selected"
+    )
+    return
+  fi
+  printf '[termag-hook-run] no entrypoint; linking top-level dotfiles\n'
+  local source name
+  for source in "$dir"/.[!.]* "$dir"/..?*; do
+    [ -e "$source" ] || [ -L "$source" ] || continue
+    name=$(basename "$source")
+    [ "$name" = .git ] && continue
+    # A real file or directory already there (a pool home has .config and
+    # .local) is the box's or the owner's: ln cannot replace a directory, and
+    # replacing a file would lose it. Only links are ours to repoint.
+    if [ -e "$HOME/$name" ] && [ ! -L "$HOME/$name" ]; then
+      printf '[termag-hook-run] keeping the existing ~/%s\n' "$name"
+      continue
+    fi
+    ln -sfn "$source" "$HOME/$name"
+  done
+}
+
+# Exit codes from the child: 0 applied, 10 auth/missing (skip), 2 hard failure.
+run_claim_work() {
+  local url="${TERMAG_DOTFILES_REPO_URL:-}"
+  local url_file="$STATE_DIR/dotfiles-repo-url"
+  if [ -z "$url" ] && [ -f "$url_file" ]; then
+    url=$(tr -d '\r\n' < "$url_file")
+  fi
+  if [ -z "$url" ]; then
+    printf '[termag-hook-run] no dotfiles repository configured\n'
+    return 11
+  fi
+  printf '%s\n' "$url" > "$url_file"
+  TERMAG_DOTFILES_REPO_URL=$url
+  local dir="${TERMAG_DOTFILES_DIR:-$HOME/.dotfiles}"
+  export TERMAG_DOTFILES_REPO_URL
+  clone_dotfiles "$dir" || return
+  # The owner reruns this after GitHub login; a
+  # checkout already applied at this commit is done, and running its
+  # entrypoint again could turn a succeeded claim into a failed one.
+  local head applied="$STATE_DIR/dotfiles-applied"
+  head=$(git -C "$dir" rev-parse --verify HEAD 2>/dev/null || true)
+  if [ -n "$head" ] && [ "$(cat "$applied" 2>/dev/null)" = "$head" ]; then
+    printf '[termag-hook-run] dotfiles at %s already applied\n' "$head"
+    return 0
+  fi
+  apply_dotfiles_tree "$dir" || return
+  if [ -n "$head" ]; then printf '%s\n' "$head" > "$applied"; fi
+}
+
+run_claim() {
+  log 'claim run starting'
+  unset TERMAG_GITHUB_TOKEN GIT_ASKPASS TERMAG_GIT_ASKPASS || true
+  if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090 # mode-600 file written by the local agent
+    . "$ENV_FILE"
+  fi
+  export TERMAG_DOTFILES_REPO_URL="${TERMAG_DOTFILES_REPO_URL:-}"
+  export TERMAG_OWNER_EMAIL="${TERMAG_OWNER_EMAIL:-}"
+  export TERMAG_OWNER_NAME="${TERMAG_OWNER_NAME:-}"
+  export TERMAG_DOTFILES_USE_OWNER_GIT="${TERMAG_DOTFILES_USE_OWNER_GIT:-}"
+  export STATE_DIR HOME
+  export -f run_claim_work clone_dotfiles apply_dotfiles_tree usable_dotfiles_repo
+
+  CURRENT_SCRIPT=dotfiles
+  write_status
+  local started rc elapsed
+  started=$(date +%s)
+  rc=0
+  timeout -k 30s "$HOOK_TIMEOUT" bash -c 'set -euo pipefail; run_claim_work' >> "$LOG_FILE" 2>&1 &
+  CHILD=$!
+  wait "$CHILD" || rc=$?
+  CHILD=
+  elapsed=$(( $(date +%s) - started ))
+  CURRENT_EXIT=$rc
+  record_duration dotfiles "$elapsed" "$rc"
+
+  case "$rc" in
+    0)
+      STATE=succeeded
+      REASON=
+      CURRENT_SCRIPT=
+      CURRENT_EXIT=
+      log "claim run succeeded in ${elapsed}s"
+      write_status
+      ;;
+    10)
+      STATE=skipped
+      REASON=needs-auth
+      CURRENT_SCRIPT=
+      CURRENT_EXIT=
+      log 'dotfiles clone needs the owner GitHub login; URL kept for a rerun'
+      write_status
+      ;;
+    11)
+      STATE=skipped
+      REASON=no-dotfiles
+      CURRENT_SCRIPT=
+      CURRENT_EXIT=
+      log 'no dotfiles repository configured'
+      write_status
+      ;;
+    124) fail_run timeout "dotfiles timed out after $HOOK_TIMEOUT" ;;
+    *) fail_run script-failed "dotfiles exited $rc after ${elapsed}s" ;;
+  esac
+}
+
+MODE="${1:-}"
+
+case "$MODE" in
+  warm) ;;
+  claim) HOOK_TIMEOUT="${TERMAG_CLAIM_TIMEOUT:-10m}" ;;
+  -h|--help) usage; exit 0 ;;
+  '') printf 'termag-hook-run: a mode is required (try --help)\n' >&2; exit 2 ;;
+  *) printf 'termag-hook-run: unknown mode: %s (try --help)\n' "$MODE" >&2; exit 2 ;;
+esac
+
+STATUS_FILE="$STATE_DIR/on-$MODE.status.json"
+LOG_FILE="$STATE_DIR/on-$MODE.log"
+ENV_FILE="$STATE_DIR/on-$MODE.env"
+
+# 700 so the claim env (owner email and repo URL) is not group-readable.
+# There is no GitHub token on this path.
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+touch "$LOG_FILE"
+LOG_START_BYTE=$(wc -c < "$LOG_FILE")
+
+STATE=running
+CURRENT_SCRIPT=
+CURRENT_EXIT=
+REASON=
+STARTED_AT=$(now_iso)
+DURATIONS_JSON=
+CHILD=
+
+trap on_exit EXIT
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+
+write_status
+"run_$MODE"

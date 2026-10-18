@@ -1,0 +1,16 @@
+[Unit]
+Description=termag durable clone for one project
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The wrapper resolves Node with agent/run-node.sh and records startup failures.
+ExecStart=/bin/bash -c 'exec "$HOME/src/termag/deploy/termag-project-clone" "%i"'
+Nice=10
+
+# The default start timeout is 90s. The runner waits up to 11 minutes for
+# GitHub and on-claim before it clones, so that default kills a clone that is
+# still allowed to be running. 30 min covers the wait and the clone. The
+# script's TERM trap marks the state file failed when this fires.
+TimeoutStartSec=30min

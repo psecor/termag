@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# termag-subagent-exec -- one ask run, inside its sandbox.
+#
+# termag-subagent-run starts this through systemd-run as the termag-subagent
+# user: no access to any home, the network cut to the Claude gateway, the
+# thread directory the only writable path. termag-subagent-setup installs it
+# root-owned under /var/lib/termag-subagent/bin, so a run cannot change it.
+#
+# stdin is the prompt and stdout is Claude Code's JSON result. After Claude
+# exits, the commits the thread made on top of its base go into
+# out/<run>.bundle for termag-subagent-run to upload; none, no bundle.
+#
+# Env (from termag-subagent-run): TERMAG_THREAD_DIR, TERMAG_RUN_ID,
+#   TERMAG_BASE_SHA, TERMAG_RESUME (Claude session id, may be empty),
+#   TERMAG_CLAUDE (default: claude next to this script), plus HOME,
+#   CLAUDE_CONFIG_DIR and the GIT_AUTHOR_*/GIT_COMMITTER_* identity.
+set -uo pipefail
+
+thread=${TERMAG_THREAD_DIR:?}
+run=${TERMAG_RUN_ID:?}
+base=${TERMAG_BASE_SHA:?}
+claude=${TERMAG_CLAUDE:-$(dirname "$0")/claude}
+
+cd "$thread/repo" || exit 70
+
+args=(-p --output-format json
+      --settings "$thread/settings.json"
+      --permission-mode acceptEdits
+      --append-system-prompt "$(cat "$thread/system-prompt.txt")")
+[ -n "${TERMAG_RESUME:-}" ] && args+=(--resume "$TERMAG_RESUME")
+
+"$claude" "${args[@]}"
+status=$?
+
+count=$(git rev-list --count "$base..HEAD" 2>/dev/null) || count=0
+if [ "${count:-0}" -gt 0 ]; then
+  git bundle create -q "$thread/out/$run.bundle" "$base..HEAD" >&2 && chmod 0644 "$thread/out/$run.bundle"
+fi
+exit "$status"

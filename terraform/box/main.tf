@@ -1,0 +1,130 @@
+// Auto-discover the latest termag-box AMI by tag — same filter the
+// orchestrator's boxProvisioner.ts uses, so both methods resolve to the
+// same image.
+data "aws_ami" "termag_box" {
+  most_recent = true
+  owners      = ["self"]
+
+  filter {
+    name   = "tag:App"
+    values = ["termag"]
+  }
+
+  filter {
+    name   = "tag:Component"
+    values = ["box"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
+// Root volume sizing, mirroring boxProvisioner.ts's resolveRootDevice so both
+// provisioning paths behave the same.
+//
+// EC2 rejects a launch whose root volume is smaller than the AMI's snapshot
+// ("Volume of size 50GB is smaller than snapshot '...', expect size >= 120GB").
+// Taking the floor from the image means growing the AMI never needs a matching
+// change here, and var.root_volume_gb only ever raises it.
+//
+// block_device_mappings is a set whose `ebs` is map(string), hence tonumber;
+// try() keeps an unexpected AMI shape from failing the plan outright, falling
+// back to the variable alone.
+locals {
+  ami_root_volume_gb = try(tonumber(one([
+    for m in data.aws_ami.termag_box.block_device_mappings : m.ebs["volume_size"]
+    if m.device_name == data.aws_ami.termag_box.root_device_name
+  ])), 0)
+
+  root_volume_gb = max(var.root_volume_gb, local.ami_root_volume_gb)
+}
+
+// Egress-only security group. No inbound rules — termag boxes have no
+// network services. Access happens via SSM (outbound HTTPS to AWS).
+resource "aws_security_group" "box" {
+  name        = "termag-box-${var.box_name}"
+  description = "termag box ${var.box_name} - outbound only, no inbound"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound (via NAT GW)"
+  }
+
+  tags = merge({
+    Name      = "termag-box-${var.box_name}"
+    App       = "termag"
+    Component = "box-sg"
+    Owner     = var.owner
+    BoxName   = var.box_name
+  }, var.extra_tags)
+}
+
+// NitroTPM (TPM 2.0) is baked into the AMI (TpmSupport=v2.0 + BootMode=uefi);
+// instances launched from it expose /dev/tpm0 + /dev/tpmrm0 automatically — no
+// launch-time flag here. The only constraint is that instance_type must be a
+// NitroTPM-supported type (all current Graviton M/C/R/T families qualify,
+// including the t4g default and m8g); see variables.tf.
+resource "aws_instance" "box" {
+  ami           = data.aws_ami.termag_box.id
+  instance_type = var.instance_type
+  subnet_id     = var.subnet_id
+
+  vpc_security_group_ids      = [aws_security_group.box.id]
+  iam_instance_profile        = var.iam_instance_profile
+  associate_public_ip_address = false
+
+  // First-boot wiring: drop the bearer token, set git identity, start the agent.
+  user_data = templatefile("${path.module}/cloudinit.sh.tftpl", {
+    termag_url       = var.termag_url
+    agent_token      = var.agent_bearer_token
+    git_user_email   = var.git_user_email
+    git_user_name    = var.git_user_name
+    remote_unix_user = var.remote_unix_user
+  })
+
+  // Changing user_data (e.g. rotating the token) recreates the instance.
+  // Per design: V1 doesn't support in-place token rotation; users get a
+  // fresh box if config changes. Acceptable since tmux state isn't preserved.
+  user_data_replace_on_change = true
+
+  root_block_device {
+    volume_size = local.root_volume_gb
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  // IMDSv2 only — prevents the metadata service from being abused via SSRF.
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  tags = merge({
+    Name      = "termag-${var.box_name}"
+    App       = "termag"
+    Component = "box"
+    Owner     = var.owner
+    BoxName   = var.box_name
+  }, var.extra_tags)
+
+  volume_tags = merge({
+    App       = "termag"
+    Component = "box-volume"
+    Owner     = var.owner
+    BoxName   = var.box_name
+  }, var.extra_tags)
+
+  lifecycle {
+    // Cloud-init only runs on first boot. If someone changes ami_id we DO
+    // want the replace (new image). If just the token changes, replace too
+    // (consistent with user_data_replace_on_change above).
+    ignore_changes = []
+  }
+}

@@ -1,0 +1,12 @@
+#!/bin/sh
+# termag-claude-token -- Claude Code's apiKeyHelper on a termag box
+#. Prints this box's agent token, read from the agent
+# config each time; nothing is stored. The Claude gateway checks it with the
+# orchestrator on every call and drops it before Bedrock.
+#
+# Usage (from Claude Code): termag-claude-token <agent.config.json>
+config=${1:-}
+[ -n "$config" ] || { echo 'termag-claude-token: no agent config given' >&2; exit 1; }
+token=$(jq -r '.token // empty' "$config" 2>/dev/null)
+[ -n "$token" ] || { echo "termag-claude-token: no agent token in $config" >&2; exit 1; }
+printf '%s\n' "$token"

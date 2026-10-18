@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# termag-reconcile — install the box-side artifacts from the termag checkout over
+# their installed paths, on every boot.
+#
+# Why this exists: `deploy/` is the single source of truth for the agent unit and
+# the per-user scripts, but nothing copies it onto the installed paths outside an
+# AMI bake. So a box whose checkout is perfectly current can still be *running*
+# artifacts baked weeks earlier.
+#
+# That is not hypothetical. On a live box, `~/src/termag` was current with
+# `main` and carried the merged `KillMode=process` fix, while
+# `~/.config/systemd/user/termag-agent.service` was still the baked copy without
+# it -- so restarting the agent there continued to destroy every tmux pane, with
+# the fix sitting on disk three directories away.
+#
+# Content-compared rather than copied blindly: nothing is written unless it
+# actually differs, so a reconciled boot is silent and mtimes stay stable. This
+# is the same approach ensureClipboardShim() takes in agent/agent.js.
+#
+# Ordered Before=termag-agent.service (see termag-reconcile.service), so on every
+# boot the agent starts from the reconciled unit and no restart is needed. This
+# script deliberately does NOT restart the agent: that restart is precisely what
+# destroys panes on a box which has not yet picked up KillMode=process -- exactly
+# the box this is meant to repair. Writing the unit plus a daemon-reload is
+# enough; systemd starts the agent from the new unit moments later.
+#
+# Between boots, termag-box-update (deploy/termag-box-update, installed from
+# the table below with its oneshot service) pulls the checkout, runs this
+# script, and restarts the agent only once it has checked that is safe.
+# Nothing on the box starts that service on its own: the orchestrator starts
+# it over the agent's box-update RPC when the box-auto-update-enabled flag is
+# on for the owner and the box is behind, and the owner can run the script by
+# hand.
+#
+# Usage:
+#   termag-reconcile           reconcile, reporting only what changed
+#   termag-reconcile --check   report drift and un-enabled units, change nothing
+#                              (exit 1 if there is anything to do)
+#   termag-reconcile --list    print the artifact table and exit
+#
+# Env:
+#   TERMAG_CHECKOUT   override the checkout path (default $HOME/src/termag)
+
+set -u
+
+CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+DEPLOY="$CHECKOUT/deploy"
+GIT_TEMPLATE_DIR="$HOME/.local/share/termag/git-template"
+
+MODE=reconcile
+case "${1:-}" in
+  --check) MODE=check ;;
+  --list)  MODE=list ;;
+  '')      ;;
+  -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) printf 'unknown flag: %s (try --help)\n' "${1}" >&2; exit 2 ;;
+esac
+
+# source-in-deploy : installed path : mode : kind : enablement
+#
+# kind=unit marks the files whose change warrants a `systemctl --user
+# daemon-reload`; kind=bin is a plain executable.
+#
+# enable=enable means this script also ensures the default.target.wants symlink,
+# i.e. it enables the unit itself. That is what lets the mechanism reach a box
+# that predates it: without it, a box could have every unit *file* installed and
+# still never run them, because the symlinks were only ever created by the AMI
+# bake -- so the reconciler could not bootstrap onto exactly the boxes that
+# needed reconciling.
+#
+# termag-agent.service is deliberately enable=noenable. cloud-init owns enabling
+# it (`systemctl --user enable --now termag-agent`), and silently re-enabling an
+# agent somebody had deliberately stopped would be a surprise. Its *content*
+# still gets reconciled.
+#
+# termag-on-warm.service is enable=noenable: the backend starts it once the
+# agent has connected. termag-on-claim.service is the same shape, started by
+# box-claim, and it carries no GitHub credential.
+#
+# termag-box-update.service is noenable: nothing on the box starts it on its
+# own. The orchestrator starts it over the agent's box-update RPC, the owner
+# by hand; enabling it would run an update at every login.
+#
+# claude-settings.json is deliberately absent entirely. Box owners add their own
+# hooks to it, and overwriting it every boot would silently discard that. The
+# bake seeds it once and it is the user's thereafter. The only thing this script
+# does to the installed ~/.claude/settings.json is append MetaTerm's read-tool
+# approvals when they are missing (reconcile_claude_config below), and it never
+# removes or reorders anything.
+#
+# kind=file is a plain non-executable file, like the MetaTerm skill.
+artifacts() {
+  cat <<TABLE
+termag-agent.service:$HOME/.config/systemd/user/termag-agent.service:644:unit:noenable
+termag-reconcile.service:$HOME/.config/systemd/user/termag-reconcile.service:644:unit:enable
+termag-on-warm.service:$HOME/.config/systemd/user/termag-on-warm.service:644:unit:noenable
+termag-on-claim.service:$HOME/.config/systemd/user/termag-on-claim.service:644:unit:noenable
+termag-box-update.service:$HOME/.config/systemd/user/termag-box-update.service:644:unit:noenable
+termag-project-clone@.service:$HOME/.config/systemd/user/termag-project-clone@.service:644:unit:noenable
+termag-status:$HOME/.local/bin/termag-status:755:bin:noenable
+termag-hooks-update:$HOME/.local/bin/termag-hooks-update:755:bin:noenable
+termag-reconcile:$HOME/.local/bin/termag-reconcile:755:bin:noenable
+termag-box-update:$HOME/.local/bin/termag-box-update:755:bin:noenable
+termag-project-clone:$HOME/.local/bin/termag-project-clone:755:bin:noenable
+termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable
+termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable
+termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable
+termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable
+termag-agent-otel:$HOME/.local/bin/termag-agent-otel:755:bin:noenable
+termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable
+termag-briefing:$HOME/.local/bin/termag-briefing:755:bin:noenable
+claude-runner-hooks/command:$HOME/.local/lib/termag/claude-runner-hooks/command:755:bin:noenable
+claude-runner-hooks/post-session:$HOME/.local/lib/termag/claude-runner-hooks/post-session:755:bin:noenable
+pi-ext/termag-status.ts:$HOME/.local/share/termag/pi-ext/termag-status.ts:644:file:noenable
+pi-ext/termag-status-core.ts:$HOME/.local/share/termag/pi-ext/termag-status-core.ts:644:file:noenable
+pi-ext/termag-otel.ts:$HOME/.local/share/termag/pi-ext/termag-otel.ts:644:file:noenable
+pi-ext/termag-otel-core.ts:$HOME/.local/share/termag/pi-ext/termag-otel-core.ts:644:file:noenable
+claude-skills/metaterm/SKILL.md:$HOME/.claude/skills/metaterm/SKILL.md:644:file:noenable
+termag-subagent-run:$HOME/.local/bin/termag-subagent-run:755:bin:noenable
+termag-subagent-setup:$HOME/.local/bin/termag-subagent-setup:755:bin:noenable
+termag-subagent-exec:$HOME/.local/lib/termag/termag-subagent-exec:755:bin:noenable
+claude-skills/agent-ask/SKILL.md:$HOME/.claude/skills/agent-ask/SKILL.md:644:file:noenable
+pi-skills/metaterm/SKILL.md:$HOME/.pi/agent/skills/metaterm/SKILL.md:644:file:noenable
+termag-pr-body:$HOME/.local/bin/termag-pr-body:755:bin:noenable
+termag-pr-create:$HOME/.local/bin/termag-pr-create:755:bin:noenable
+termag-commit-msg:$GIT_TEMPLATE_DIR/hooks/commit-msg:755:bin:noenable
+claude-skills/termag-pr/SKILL.md:$HOME/.claude/skills/termag-pr/SKILL.md:644:file:noenable
+pi-skills/termag-pr/SKILL.md:$HOME/.pi/agent/skills/termag-pr/SKILL.md:644:file:noenable
+claude-skills/termag-spaces/SKILL.md:$HOME/.claude/skills/termag-spaces/SKILL.md:644:file:noenable
+pi-skills/termag-spaces/SKILL.md:$HOME/.pi/agent/skills/termag-spaces/SKILL.md:644:file:noenable
+claude-skills/termag-handoff/SKILL.md:$HOME/.claude/skills/termag-handoff/SKILL.md:644:file:noenable
+pi-skills/termag-handoff/SKILL.md:$HOME/.pi/agent/skills/termag-handoff/SKILL.md:644:file:noenable
+TABLE
+}
+
+# MetaTerm's user-scope registration in ~/.claude.json. No absolute path: the
+# bake writes this under /home/termag and cloud-init renames the home, which
+# ~/.claude.json is outside the rewrite index for. The box default is read-only
+# tools; send_keys is opted into per project or per session (see the skill).
+# shellcheck disable=SC2016  # $HOME is expanded by sh when Claude starts the server
+METATERM_MCP='{"type":"stdio","command":"sh","args":["-c","exec \"$HOME/.local/bin/termag-metaterm-mcp\""],"env":{"METATERM_SEND_KEYS_DEFAULT":"off"}}'
+# The reads, plus the agent-spawn tools that only read or touch the caller's
+# own spawn records (list_spawns, report_back, spawn_budget), and slack_inbox, which reads the caller's own Slack
+# requests so the reply nudge is not stuck behind a permission prompt.
+# spawn_agent, send_keys and draft_slack_message
+# are never pre-approved.
+METATERM_READ_TOOLS='["mcp__metaterm__list_sessions","mcp__metaterm__capture_pane","mcp__metaterm__search_sessions","mcp__metaterm__session_status","mcp__metaterm__activity_ledger","mcp__metaterm__latest_briefing","mcp__metaterm__list_spawns","mcp__metaterm__report_back","mcp__metaterm__slack_inbox","mcp__metaterm__spawn_budget"]'
+
+# The same server in pi's user-scope ~/.pi/agent/mcp.json. Pi expands a leading
+# ~/ itself, so no sh wrapper and no absolute path (the bake home gets renamed,
+# as above). There is no approvals merge to mirror: pi runs tool calls without
+# prompting, so Claude's read-tool allow-list has no pi equivalent, and for the
+# same reason spawn_agent is off unless the session sets METATERM_SPAWN=on.
+PI_METATERM_MCP='{"type":"stdio","command":"~/.local/bin/termag-metaterm-mcp","env":{"METATERM_SEND_KEYS_DEFAULT":"off","METATERM_SEND_KEYS_PROJECT":"off","METATERM_SPAWN_DEFAULT":"off","METATERM_HANDOFF_DEFAULT":"off"},"description":"See the other termag sessions of this user (every project on every box): list sessions, capture panes, check session status."}'
+
+# merge_json FILE LABEL VALUE FILTER — apply a jq FILTER (VALUE bound to $v) to
+# FILE, treating a missing or empty file as {}. Writes only on a real
+# difference, keeps the file's mode (0600 when new), and leaves a file jq cannot
+# parse alone rather than replacing an owner's config.
+merge_json() {
+  local file=$1 label=$2 value=$3 filter=$4 cur want tmp
+  if [ -s "$file" ]; then cur=$(cat "$file") || return 0; else cur='{}'; fi
+  if ! want=$(printf '%s' "$cur" | jq --argjson v "$value" "$filter" 2>/dev/null); then
+    printf 'termag-reconcile: %s is not valid JSON; not adding %s\n' "$file" "$label" >&2
+    return 0
+  fi
+  if [ -s "$file" ] && [ "$(printf '%s' "$cur" | jq -S .)" = "$(printf '%s' "$want" | jq -S .)" ]; then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    if [ -s "$file" ]; then printf 'DRIFT: %s missing from %s\n' "$label" "$file"
+    else printf 'MISSING: %s (would create with %s)\n' "$file" "$label"; fi
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")" || return 0
+  tmp=$(mktemp "$file.XXXXXX") || return 0
+  if [ -e "$file" ]; then chmod --reference="$file" "$tmp"; else chmod 600 "$tmp"; fi
+  if printf '%s\n' "$want" > "$tmp" && mv -f "$tmp" "$file"; then
+    printf 'reconciled: %s in %s\n' "$label" "$file"
+  else
+    rm -f "$tmp"
+    printf 'termag-reconcile: failed to write %s\n' "$file" >&2
+  fi
+}
+
+reconcile_claude_config() {
+  # An older checkout without the server has nothing to register.
+  [ -f "$CHECKOUT/metaterm/mcp-server.mjs" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'termag-reconcile: jq not found; skipping the MetaTerm Claude Code config\n' >&2
+    return 0
+  fi
+  merge_json "$HOME/.claude.json" 'MetaTerm MCP server' "$METATERM_MCP" \
+    '.mcpServers.metaterm = $v'
+  merge_json "$HOME/.claude/settings.json" 'MetaTerm read-tool approvals' "$METATERM_READ_TOOLS" \
+    'reduce $v[] as $t (.; if any((.permissions.allow // [])[]; . == $t) then . else .permissions.allow = ((.permissions.allow // []) + [$t]) end)'
+}
+
+# Build and pin the CLI to the same runtime the agent and clones resolve.
+cli_node() {
+  /bin/bash "$CHECKOUT/agent/run-node.sh" --print-node 2>/dev/null
+}
+
+# The termag CLI is a build rather than a copy, so it is not a table row:
+# cli/install.sh builds it in the checkout and writes the ~/.local/bin/termag
+# launcher. Its --check is the same content comparison as the table's, so a box
+# that is current runs no build and writes nothing. It never replaces a
+# `termag` it did not write.
+reconcile_cli() {
+  local installer="$CHECKOUT/cli/install.sh" node out
+  [ -f "$installer" ] || return 0
+  if ! node=$(cli_node) || [ -z "$node" ]; then
+    printf 'termag-reconcile: no Node.js found; not installing the termag CLI\n' >&2
+    return 0
+  fi
+  set -- --node "$node" --bin-dir "$HOME/.local/bin"
+  if out=$(sh "$installer" --check "$@" 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  # Bounded so a slow `npm ci` cannot hold the agent's start for long; an
+  # interrupted install is retried on the next run.
+  local runner=()
+  command -v timeout >/dev/null 2>&1 && runner=(timeout 45)
+  if out=$("${runner[@]}" sh "$installer" --quiet "$@" 2>&1); then
+    printf 'reconciled: termag CLI (%s/.local/bin/termag)\n' "$HOME"
+  else
+    printf 'termag-reconcile: the termag CLI did not install:\n%s\n' "$out" >&2
+  fi
+}
+
+# The ask sandbox: the termag-subagent user and
+# /var/lib/termag-subagent, which termag-subagent-setup prepares with sudo -n
+# and installs the root-owned exec script into. Runs after the table, so the
+# setup and exec script it uses are this checkout's. A box without Claude Code
+# or systemd (setup --check exits 3) has nothing to prepare and is not drift.
+reconcile_subagent() {
+  local setup="$HOME/.local/bin/termag-subagent-setup" out rc
+  [ -x "$setup" ] || return 0
+  out=$("$setup" --check 2>&1); rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 3 ] && return 0
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if out=$("$setup" 2>&1); then
+    printf 'reconciled: ask sandbox\n%s\n' "$out"
+  else
+    printf 'termag-reconcile: the ask sandbox is not ready:\n%s\n' "$out" >&2
+  fi
+}
+
+reconcile_pi_config() {
+  # Same gate as the Claude config: an older checkout without the server has
+  # nothing to register. Pi not being installed is fine -- the file simply
+  # waits for it, as the Claude one does.
+  [ -f "$CHECKOUT/metaterm/mcp-server.mjs" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'termag-reconcile: jq not found; skipping the MetaTerm pi config\n' >&2
+    return 0
+  fi
+  # Owner-tunable pi fields survive the merge: enabled (the only durable
+  # off-switch -- `pi mcp remove` is simply re-added), exposure, toolExposure,
+  # timeout, cwd. Everything else is rewritten to the canonical value. A
+  # non-object entry (a scalar the owner or an old write left behind) is
+  # coerced to {} first, so with_entries cannot error on it.
+  merge_json "$HOME/.pi/agent/mcp.json" 'MetaTerm MCP server (pi)' "$PI_METATERM_MCP" \
+    '.mcpServers.metaterm = ($v + ((.mcpServers.metaterm // {}) | if type == "object" then . else {} end | with_entries(select(.key | IN("enabled","exposure","toolExposure","timeout","cwd")))))'
+}
+
+# The Generated-by: termag commit trailer (deploy/termag-commit-msg). The hook
+# sits in the box user's git template, which init.templateDir names in the XDG
+# global config ($XDG_CONFIG_HOME/git/config, never ~/.gitconfig, which may be an
+# owner's dotfiles symlink) as a tilde path, because the bake home is renamed at
+# first boot. Every repository inited or cloned afterwards gets a copy; the
+# termag projects that already exist get one too when they have no commit-msg
+# hook of their own, and an older copy of ours is updated. A global
+# core.hooksPath would reach every repository at once, but pre-commit refuses
+# to install while one is set. An owner's own init.templateDir is left alone,
+# and then nothing is copied into projects either.
+# shellcheck disable=SC2088  # git expands the tilde itself
+GIT_TEMPLATE_PATH='~/.local/share/termag/git-template'
+
+reconcile_git_template() {
+  local hook="$GIT_TEMPLATE_DIR/hooks/commit-msg" cur dest
+  # The file git reads as the XDG global config, so the --global read below sees it.
+  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
+  [ -x "$hook" ] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  cur=$(git config --global --type=path --get init.templateDir 2>/dev/null || true)
+  if [ -z "$cur" ]; then
+    changed=$((changed + 1))
+    if [ "$MODE" = check ]; then
+      printf 'DRIFT: no global init.templateDir (would set %s)\n' "$GIT_TEMPLATE_PATH"
+    elif mkdir -p "$(dirname "$xdg")" \
+      && git config --file "$xdg" init.templateDir "$GIT_TEMPLATE_PATH"; then
+      printf 'reconciled: init.templateDir %s in %s\n' "$GIT_TEMPLATE_PATH" "$xdg"
+    else
+      printf 'termag-reconcile: failed to set init.templateDir\n' >&2
+      return 0
+    fi
+  elif [ "$(realpath -m -- "$cur")" != "$(realpath -m -- "$GIT_TEMPLATE_DIR")" ]; then
+    return 0
+  fi
+  for dest in "$HOME"/termag/projects/*/.git/hooks; do
+    [ -d "$dest" ] || continue
+    dest="$dest/commit-msg"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      grep -q '^# termag-commit-msg ' "$dest" 2>/dev/null || continue
+      cmp -s "$hook" "$dest" && continue
+    fi
+    changed=$((changed + 1))
+    if [ "$MODE" = check ]; then
+      printf 'MISSING: %s (would install the commit trailer hook)\n' "$dest"
+    elif install -m 755 "$hook" "$dest"; then
+      printf 'reconciled: %s\n' "$dest"
+    else
+      printf 'termag-reconcile: failed to install %s\n' "$dest" >&2
+    fi
+  done
+}
+
+WANTS="$HOME/.config/systemd/user/default.target.wants"
+
+# Is the unit enabled, i.e. does the wants symlink point where it should?
+unit_enabled() {
+  [ "$(readlink "$WANTS/$1" 2>/dev/null)" = "../$1" ]
+}
+
+# Equivalent of `systemctl --user enable`, done with a symlink so it works with
+# no running user manager (the AMI bake has none, and neither does a --check run
+# over SSH). Returns 0 only when it actually changed something.
+enable_unit() {
+  unit_enabled "$1" && return 1
+  mkdir -p "$WANTS" || return 1
+  ln -sfn "../$1" "$WANTS/$1" || return 1
+  return 0
+}
+
+if [ "$MODE" = list ]; then artifacts; exit 0; fi
+
+if [ ! -d "$DEPLOY" ]; then
+  printf 'termag-reconcile: no checkout at %s; nothing to reconcile\n' "$CHECKOUT" >&2
+  exit 0
+fi
+
+changed=0
+reload=0
+
+while IFS=: read -r name dest mode kind enable; do
+  [ -n "${name:-}" ] || continue
+  src="$DEPLOY/$name"
+  # A source that isn't in this checkout yet is not an error: an older checkout
+  # legitimately has fewer artifacts than a newer script knows about.
+  [ -f "$src" ] || continue
+
+  # Enablement is checked independently of content: a box can already have the
+  # right unit file and still not have the symlink, which is precisely the state
+  # every box built before this script existed is in.
+  if [ "${enable:-noenable}" = enable ] && ! unit_enabled "$name"; then
+    if [ "$MODE" = check ]; then
+      printf 'NOT-ENABLED: %s (would link into %s)\n' "$name" "$WANTS"
+      changed=$((changed + 1))
+    elif enable_unit "$name"; then
+      printf 'enabled: %s\n' "$name"
+      changed=$((changed + 1))
+      reload=1
+    else
+      printf 'termag-reconcile: failed to enable %s\n' "$name" >&2
+    fi
+  fi
+
+  if cmp -s "$src" "$dest" 2>/dev/null; then
+    continue
+  fi
+
+  if [ "$MODE" = check ]; then
+    if [ -e "$dest" ]; then
+      printf 'DRIFT: %s differs from %s\n' "$dest" "$src"
+    else
+      printf 'MISSING: %s (would install from %s)\n' "$dest" "$src"
+    fi
+    changed=$((changed + 1))
+    continue
+  fi
+
+  mkdir -p "$(dirname "$dest")" || continue
+  # install(1) writes to a temp name and renames, so a concurrent reader never
+  # sees a half-written file. Reconciling this script while it is itself running
+  # is safe for the same reason: the running process keeps the old inode.
+  if install -m "$mode" "$src" "$dest"; then
+    printf 'reconciled: %s\n' "$dest"
+    changed=$((changed + 1))
+    [ "$kind" = unit ] && reload=1
+  else
+    printf 'termag-reconcile: failed to install %s\n' "$dest" >&2
+  fi
+done <<EOF
+$(artifacts)
+EOF
+
+reconcile_claude_config
+reconcile_cli
+reconcile_subagent
+reconcile_pi_config
+reconcile_git_template
+
+if [ "$MODE" = check ]; then
+  [ "$changed" -eq 0 ] || exit 1
+  exit 0
+fi
+
+if [ "$reload" = 1 ]; then
+  # Reload only. Restarting termag-agent here is what this script exists to
+  # avoid; the unit is ordered before it, so systemd will start it from the
+  # reconciled unit without any restart.
+  systemctl --user daemon-reload 2>/dev/null \
+    && printf 'reconciled: systemd user daemon-reload\n' \
+    || printf 'termag-reconcile: daemon-reload failed (no user manager?)\n' >&2
+fi
+
+exit 0

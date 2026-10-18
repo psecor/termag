@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# post-session -- the runner's `post-session` lifecycle hook on a termag box
+#. The self-hosted runner runs
+# it once per session after the Claude Code child has exited, with
+# CLAUDE_RUNNER_EXIT_REASON set to completed, failed or interrupted
+# (https://code.claude.com/docs/en/self-hosted-environments-configuration#post-session).
+#
+# It writes that reason to ~/.termag/claude-runner/<order>.exit-reason.<launch>
+# (0600; <launch> is the wrapper's pid, so two launches of one order that
+# overlap keep their own) and exits. It posts no end: termag-claude-runner's exit trap makes the one
+# `ended` report per run, once the slot is actually free, and reads this file
+# into its exitReason, so the orchestrator learns why the slot was given back
+# when the box can tell. Without this hook the trap knows only its own exit
+# status (and `signal` for a hangup).
+#
+# It does post the session's final token usage: the runner removes the session's state only after this hook, so the
+# transcripts under <base-dir>/_sessions/*.claude-config/projects/ are still
+# there, and `termag-status usage --transcript ...` sums them and posts the
+# cumulative total once more, catching the last turn the Stop hook may not have
+# summed (an interrupted turn, the twelve-hour kill). Best effort, in the
+# foreground, within the hook's budget.
+#
+# Env from the runner: CLAUDE_RUNNER_EXIT_REASON. From termag-claude-runner:
+# TERMAG_CLAUDE_RUNNER_ORDER, TERMAG_CLAUDE_RUNNER_DIR (the state dir),
+# TERMAG_CLAUDE_RUNNER_LAUNCH (the launch pid), TERMAG_CLAUDE_RUNNER_BASE_DIR
+# (the runner's --base-dir). TERMAG_STATUS_BIN overrides where termag-status is.
+set -u
+order=${TERMAG_CLAUDE_RUNNER_ORDER:-}
+dir=${TERMAG_CLAUDE_RUNNER_DIR:-$HOME/.termag/claude-runner}
+launch=${TERMAG_CLAUDE_RUNNER_LAUNCH:-}
+reason=${CLAUDE_RUNNER_EXIT_REASON:-}
+log() { printf 'claude-runner-hooks/post-session[%s]: %s\n' "${order:-?}" "$*" >&2; }
+case "$order" in ''|*[!A-Za-z0-9._-]*) log 'TERMAG_CLAUDE_RUNNER_ORDER unset or unsafe; nothing written'; exit 0 ;; esac
+
+# The final usage post, before anything else can exit early: the reason file
+# below is independent of it.
+report_usage() {
+  local base=${TERMAG_CLAUDE_RUNNER_BASE_DIR:-} bin=${TERMAG_STATUS_BIN:-$HOME/.local/bin/termag-status} f args=()
+  [ -n "$base" ] && [ -d "$base" ] || { log 'usage not posted: TERMAG_CLAUDE_RUNNER_BASE_DIR unset or gone'; return 0; }
+  [ -x "$bin" ] || { log "usage not posted: $bin not found"; return 0; }
+  for f in "$base"/_sessions/*.claude-config/projects/*/*.jsonl; do [ -f "$f" ] && args+=(--transcript "$f"); done
+  [ "${#args[@]}" -gt 0 ] || { log 'usage not posted: no transcript under the session base dir'; return 0; }
+  if "$bin" usage "${args[@]}" 2>/dev/null; then log "final usage posted from $((${#args[@]} / 2)) transcript(s)"; else log 'final usage post failed'; fi
+}
+report_usage
+case "$launch" in ''|*[!0-9]*) log 'TERMAG_CLAUDE_RUNNER_LAUNCH unset or not a pid; nothing written'; exit 0 ;; esac
+
+# The session directory's size, for the wrapper's `ended` report (S5): measured
+# here, before the release, so the slot's release never waits on a du. Written
+# per launch beside the exit reason; the wrapper reads and removes it.
+report_size() {
+  local base=${TERMAG_CLAUDE_RUNNER_BASE_DIR:-} kb
+  [ -n "$base" ] && [ -d "$base" ] || return 0
+  kb=$(du -sk "$base" 2>/dev/null | cut -f1) || kb=
+  case "$kb" in ''|*[!0-9]*) log 'size not measured'; return 0 ;; esac
+  mkdir -p "$dir" 2>/dev/null || return 0
+  ( umask 077; printf '%s\n' "$((kb * 1024))" > "$dir/$order.checkout-bytes.$launch" ) && log "size written ($kb kB)"
+}
+report_size
+case "$reason" in
+  ''|*[!a-z0-9-]*) log "exit reason '${reason}' is not a token; nothing written"; exit 0 ;;
+esac
+mkdir -p "$dir" 2>/dev/null || { log "cannot create $dir"; exit 0; }
+( umask 077; printf '%s\n' "$reason" > "$dir/$order.exit-reason.$launch" ) && log "exit reason $reason written"
+exit 0

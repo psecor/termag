@@ -1,0 +1,11 @@
+# /etc/sudoers.d/92-termag-claude-runner, installed by the orchestrator bake
+# (packer/scripts/orchestrator-setup.sh).
+#
+# During an overlapping deploy the
+# backend, which runs as termag, stops this host's Claude runner orchestrator
+# when it starts draining, so only the new host's runner takes sessions, and
+# starts it (when enabled) whenever it serves, so a host that takes the lease
+# back runs one again (backend/src/services/claudeRunnerUnit.ts).
+# Exactly these two command lines and nothing else; sudo matches the arguments
+# literally, so the backend must spell them the same way.
+termag ALL=(root) NOPASSWD: /usr/bin/systemctl stop claude-runner-orchestrator.service, /usr/bin/systemctl start claude-runner-orchestrator.service

@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# Keeps the orchestrator's host accounts off the EC2 instance metadata service.
+#
+# IMDS hands out the host role's credentials, which can read the backend's .env
+# secret. Host accounts are exactly the regular uids 1000-59999: the only ones
+# termag-host-setup creates or reuses, and the only ones the cloud-init loop
+# re-adopts from /home. Root, the termag service user and every other system
+# account keep IMDS. Loaded at boot by termag-imds-guard.service.
+#
+# A table of its own, so Docker's iptables rules and this never touch each
+# other. The empty declaration makes the delete safe on first load; the whole
+# file is one transaction, so a reload never leaves a gap.
+table inet termag_imds
+delete table inet termag_imds
+
+table inet termag_imds {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    ip daddr 169.254.169.254 meta skuid 1000-59999 reject
+    ip6 daddr fd00:ec2::254 meta skuid 1000-59999 reject
+  }
+}

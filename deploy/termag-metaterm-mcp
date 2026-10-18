@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# termag-metaterm-mcp — start the MetaTerm MCP server from the termag checkout.
+#
+# Claude Code runs this as a stdio MCP server; termag-reconcile registers it at
+# user scope in ~/.claude.json as `sh -c 'exec "$HOME/.local/bin/termag-metaterm-mcp"'`,
+# so the registration holds no absolute path and survives cloud-init renaming
+# the baked home.
+#
+# stdout is the JSON-RPC channel: nothing but the server may write to it.
+#
+# Env:
+#   TERMAG_CHECKOUT   override the checkout path (default $HOME/src/termag)
+
+set -u
+
+CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
+SERVER="$CHECKOUT/metaterm/mcp-server.mjs"
+
+if [ ! -f "$SERVER" ]; then
+  printf 'termag-metaterm-mcp: no MetaTerm server at %s\n' "$SERVER" >&2
+  exit 1
+fi
+
+# The same node the agent unit uses. A shell that already has node on PATH
+# keeps its own.
+if ! command -v node >/dev/null 2>&1; then
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  # shellcheck disable=SC1091
+  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >&2
+fi
+if ! command -v node >/dev/null 2>&1; then
+  printf 'termag-metaterm-mcp: node not found (PATH or %s)\n' "${NVM_DIR:-$HOME/.nvm}" >&2
+  exit 1
+fi
+
+exec node "$SERVER"

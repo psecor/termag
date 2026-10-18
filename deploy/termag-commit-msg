@@ -1,0 +1,22 @@
+#!/bin/sh
+# termag-commit-msg — the commit-msg hook that marks a commit made on a termag
+# box with a `Generated-by: termag` trailer.
+#
+# termag-reconcile installs it as hooks/commit-msg of the box user's git
+# template (init.templateDir), so every repository git inits or clones on the
+# box gets a copy, and copies it into the existing termag projects that have no
+# commit-msg hook of their own. Worktrees share their repository's hooks. A
+# repository's own commit-msg (pre-commit's, say) is never replaced, and
+# `pre-commit install --hook-type commit-msg` keeps this one as
+# commit-msg.legacy and still runs it.
+#
+# Nothing is added when:
+#   * the message is empty, so the commit still aborts as git intends
+#   * a Generated-by trailer is already there
+#   * `git config termag.trailer false` (per repository or --global)
+# `git commit --no-verify` skips commit-msg hooks, this one included.
+[ -n "${1:-}" ] && [ -f "$1" ] || exit 0
+[ "$(git config --bool termag.trailer 2>/dev/null)" != false ] || exit 0
+git stripspace --strip-comments < "$1" | grep -q . || exit 0
+git interpret-trailers --in-place --if-exists doNothing --trailer 'Generated-by: termag' "$1" || true
+exit 0

@@ -1,0 +1,223 @@
+# OpenTelemetry Collector config for the orchestrator's logs
+# (termag-otelcol.service). Ships them to an OTLP/HTTP collector so they
+# outlive the root volume, which every orchestrator deploy replaces.
+#
+# This file is baked; termag-otelcol-env renders the per-instance half (the
+# project and endpoint: resource/destination and
+# otlphttp/destination) to /run/termag-otelcol/destination.yaml, and the unit
+# passes both with --config. Neither file is valid alone.
+#
+# What ships: the journal of the termag units, of the Claude Code runner
+# orchestrator (claude-runner-orchestrator.service, whose stderr carries the
+# spawn hook's lines), of the host data volume's attach
+# (termag-data-attach.service) and of every host account's termag-agent-host
+# user unit, together with what systemd itself logs about those units (Started, Main
+# process exited, Scheduled restart job), /var/log/cloudinit-termag.log and
+# nginx's logs, plus the runner orchestrator's Prometheus series, scraped on
+# loopback, and the backend's own OpenTelemetry metrics and logs (spawn and box
+# telemetry), which it pushes to the loopback OTLP
+# receiver because this config exists. Nothing else on the
+# host. Every log record's body goes through transform/redact first, because a
+# box agent's bearer token is in its /termag/ws/agent URL and so in nginx's
+# access log.
+
+extensions:
+  file_storage:
+    directory: /var/lib/termag-otelcol
+    create_directory: false
+
+receivers:
+  journald:
+    start_at: beginning
+    storage: file_storage
+    convert_message_bytes: true
+    # Entries matching any one of these maps (the fields within a map must
+    # all match). A unit's own output carries _SYSTEMD_UNIT; what systemd
+    # says about the unit (Started, Main process exited, Scheduled restart
+    # job, restart counter is at N) is logged by PID 1 under UNIT= with its
+    # own _SYSTEMD_UNIT=init.scope, so every unit is listed both ways. The
+    # user manager logs its units' state changes under USER_UNIT=.
+    matches:
+      - _SYSTEMD_UNIT: termag.service
+      - _SYSTEMD_UNIT: nginx.service
+      - _SYSTEMD_UNIT: termag-apps.service
+      - _SYSTEMD_UNIT: termag-imds-guard.service
+      - _SYSTEMD_UNIT: claude-runner-orchestrator.service
+      - _SYSTEMD_UNIT: termag-data-attach.service
+      - _SYSTEMD_USER_UNIT: termag-agent-host.service
+      - UNIT: termag.service
+        _PID: "1"
+      - UNIT: nginx.service
+        _PID: "1"
+      - UNIT: termag-apps.service
+        _PID: "1"
+      - UNIT: termag-imds-guard.service
+        _PID: "1"
+      - UNIT: claude-runner-orchestrator.service
+        _PID: "1"
+      - UNIT: termag-data-attach.service
+        _PID: "1"
+      - USER_UNIT: termag-agent-host.service
+  filelog/cloud-init:
+    include: [/var/log/cloudinit-termag.log]
+    start_at: beginning
+    storage: file_storage
+    include_file_name: false
+    include_file_path: true
+    attributes:
+      log.source: cloud-init
+  filelog/nginx:
+    include: [/var/log/nginx/*.log]
+    start_at: beginning
+    storage: file_storage
+    include_file_name: false
+    include_file_path: true
+    attributes:
+      log.source: nginx
+  # The backend's own metrics and logs (backend/src/services/otel.ts). The
+  # backend pushes here when /run/termag-otelcol/destination.yaml exists, so
+  # it sends nothing on a host without this collector. Loopback only: nothing
+  # off the host may write into the telemetry project. HTTP only, as the
+  # backend's exporters speak OTLP/HTTP.
+  otlp/termag:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
+  # The Claude Code runner orchestrator (claude-runner-orchestrator.service;
+  # the terraform cloud-init starts it with --health-port 18081) serves its
+  # Prometheus series at /metrics on that port: control-plane connectivity,
+  # queue depth and wait, spawn-hook outcomes for the environment
+  #. Loopback only, and nothing in the series
+  # is a credential. `up` is 0 while the unit is down, which is the alert.
+  prometheus/claude-runner-orchestrator:
+    config:
+      scrape_configs:
+        - job_name: claude-runner-orchestrator
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['127.0.0.1:18081']
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 200
+    spike_limit_mib: 50
+
+  # host.id is the EC2 instance ID, host.image.id the AMI: which host and
+  # which bake a line came from, across replacements. IMDS is open to this
+  # service's system user (termag-imds-guard blocks host accounts only).
+  resourcedetection:
+    detectors: [ec2, system]
+    timeout: 5s
+    override: false
+    system:
+      hostname_sources: [os]
+
+  resource/termag:
+    attributes:
+      - key: service.name
+        value: termag-orchestrator
+        # insert, not upsert: the Prometheus receiver already names the
+        # metrics' service after the scrape job (claude-runner-orchestrator),
+        # and that is the name to keep; log records arrive without one.
+        action: insert
+
+  # Keep only the fields worth having from a journal entry, as attributes, and
+  # make MESSAGE the body. The rest (_CMDLINE, _EXE, _BOOT_ID, ...) is dropped.
+  transform/journald:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        conditions:
+          - IsMap(log.body)
+        statements:
+          - set(log.attributes["log.source"], "journald")
+          - set(log.attributes["systemd.unit"], log.body["_SYSTEMD_UNIT"]) where log.body["_SYSTEMD_UNIT"] != nil
+          - set(log.attributes["systemd.user_unit"], log.body["_SYSTEMD_USER_UNIT"]) where log.body["_SYSTEMD_USER_UNIT"] != nil
+          - set(log.attributes["user.id"], log.body["_UID"]) where log.body["_SYSTEMD_USER_UNIT"] != nil
+          # systemd's own lines about a unit name it in UNIT (PID 1) or
+          # USER_UNIT (a user manager); file them under that unit, not under
+          # init.scope or user@N.service, so a unit's search shows them.
+          - set(log.attributes["systemd.unit"], log.body["UNIT"]) where log.body["UNIT"] != nil
+          - set(log.attributes["systemd.user_unit"], log.body["USER_UNIT"]) where log.body["USER_UNIT"] != nil
+          - set(log.attributes["user.id"], log.body["_UID"]) where log.body["USER_UNIT"] != nil
+          - set(log.attributes["process.pid"], log.body["_PID"]) where log.body["_PID"] != nil
+          - set(log.severity_number, SEVERITY_NUMBER_FATAL) where log.body["PRIORITY"] == "0" or log.body["PRIORITY"] == "1" or log.body["PRIORITY"] == "2"
+          - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.body["PRIORITY"] == "3"
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.body["PRIORITY"] == "4"
+          - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.body["PRIORITY"] == "5" or log.body["PRIORITY"] == "6"
+          - set(log.severity_number, SEVERITY_NUMBER_DEBUG) where log.body["PRIORITY"] == "7"
+          - set(log.body, log.body["MESSAGE"])
+          # A MESSAGE that is still not a string would skip the redaction below.
+          - 'set(log.body, "[termag-otelcol] non-text journal message dropped") where not IsString(log.body)'
+
+  # Credentials that can reach these logs, masked before anything leaves the
+  # host. The one known case is the agent token in nginx's request line
+  # (/termag/ws/agent?token=tmag_...); the rest is defence in depth for an
+  # error message that echoes a URL, a header or a connection string.
+  transform/redact:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        conditions:
+          - IsString(log.body)
+        statements:
+          - replace_pattern(log.body, "(?i)([?&;](?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(log.body, "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_pattern(log.body, "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
+          - replace_pattern(log.body, "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
+          - replace_pattern(log.body, "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
+          - replace_pattern(log.body, "\\b(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,}", "REDACTED_SLACK_TOKEN")
+          - replace_pattern(log.body, "\\b(?:sdk|api|mob)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b", "REDACTED_SDK_KEY")
+          - replace_pattern(log.body, "\\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "REDACTED_GITHUB_TOKEN")
+          - replace_pattern(log.body, "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
+          - replace_pattern(log.body, "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
+          - replace_pattern(log.body, "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
+
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+exporters:
+  otlphttp/destination:
+    compression: gzip
+    timeout: 30s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 0s
+    # On disk, so a restart or a collector outage doesn't drop what was
+    # read but not yet sent.
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 5000
+
+service:
+  extensions: [file_storage]
+  telemetry:
+    metrics:
+      level: none
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [journald, filelog/cloud-init, filelog/nginx, otlp/termag]
+      processors:
+        - memory_limiter
+        - transform/journald
+        - transform/redact
+        - resourcedetection
+        - resource/termag
+        - resource/destination
+        - batch
+      exporters: [otlphttp/destination]
+    metrics:
+      receivers: [prometheus/claude-runner-orchestrator, otlp/termag]
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - resource/termag
+        - resource/destination
+        - batch
+      exporters: [otlphttp/destination]

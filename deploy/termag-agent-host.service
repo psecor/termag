@@ -1,0 +1,22 @@
+# The per-user termag-agent on the orchestrator, for accounts provisioned by
+# deploy/termag-host-setup. Installed to /etc/systemd/user/ by
+# packer/scripts/orchestrator-setup.sh and enabled per user by that helper.
+#
+# Runs the root-owned copy of the agent the image installs at
+# /usr/local/lib/termag/agent (not /opt/termag, which the termag service user
+# can write), with the config the helper wrote. Unlike termag-agent.service,
+# which is the hand-installed variant for a clone in ~/src/termag, nothing lives
+# in the user's home except the config.
+[Unit]
+Description=Termag per-user agent (orchestrator host)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /usr/local/lib/termag/agent/agent.js %h/.termag/agent.config.json
+Restart=always
+RestartSec=5
+# Don't take the user's tmux sessions down with a restart.
+KillMode=process
+
+[Install]
+WantedBy=default.target

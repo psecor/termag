@@ -1,0 +1,175 @@
+# Claude Code Hooks for termag
+
+Hooks let termag track agent status (working / waiting / idle) in real time, and
+are what trigger the needs-input Slack notification.
+
+Each hook shells out to **`termag-status`** (`deploy/termag-status`), which
+resolves the server endpoint from the per-user agent's own `termag_url` and POSTs
+to `<server>/termag/api/status`.
+
+AMI-provisioned boxes get both files automatically via `packer/scripts/setup.sh` —
+`deploy/claude-settings.json` lands at `~/.claude/settings.json` and
+`termag-status` at `~/.local/bin/termag-status`. Orchestrator host accounts
+provisioned by `deploy/termag-host-setup` get both too: `termag-status` as a
+symlink to the image's root-owned copy in `/usr/local/lib/termag` (so it
+follows image updates but can't be rewritten by the `termag` service user), and `settings.json` only
+if the user has none. For a non-baked install:
+
+```bash
+install -m 755 deploy/termag-status ~/.local/bin/termag-status
+mkdir -p ~/.claude && cp deploy/claude-settings.json ~/.claude/settings.json
+```
+
+`deploy/claude-settings.json` is the canonical hook config; the snippet below is
+reproduced from it, so keep them in sync.
+
+## Why not POST to localhost directly
+
+Earlier versions inlined `curl http://localhost:3040/termag/api/status` in every
+hook. That is only correct when the termag server runs on the same host as the
+agent. On a provisioned box the server is elsewhere, so every POST failed —
+**silently**, because the hooks background their curl and discard all output. The
+symptom is status lights that never leave grey and needs-input notifications that
+never arrive, with nothing in any log explaining why.
+
+`agent/agent.js` already solved this for its own posts (`getStatusEndpoint()`);
+`termag-status` applies the same derivation to the hooks:
+
+| `termag_url` | endpoint |
+|---|---|
+| `ws://localhost:3040/termag/ws/agent` | `http://localhost:3040/termag/api/status` |
+| `ws://ip-10-0-0-1.ec2.internal:3040/termag/ws/agent` | `http://ip-10-0-0-1.ec2.internal:3040/termag/api/status` |
+| `wss://termag.example.com/termag/ws/agent` | `https://termag.example.com/termag/api/status` |
+
+Co-located boxes keep working unchanged — they are just the case where the derived
+host happens to be localhost.
+
+## Authentication
+
+Status writes are only unauthenticated for **same-host** callers. `authStatusWrite`
+in `backend/src/routes/status.ts` lets `isLocalPeer()` through and sends everyone
+else to `requireAuthOrAgentToken` — and a box is "everyone else", since it reaches
+`:3040` directly over the private VPC.
+
+So `termag-status` sends the agent token from `agent.config.json` as
+`Authorization: Bearer …`, exactly as `agent.js` does on the same path. Without it
+a provisioned box gets `401` and, because the hooks discard output, fails silently
+— the same invisible failure this script exists to remove.
+
+The token is passed via `curl -K -` (config on stdin), **never** as a `-H`
+argument: process command lines are world-readable, and this token can write
+status for any of the owner's sessions. `agent.js` takes the same care with its
+own bearer token, passing it via env rather than argv.
+
+If the config has no `token`, the request is sent unauthenticated — which only a
+same-host server will accept.
+
+## Hook configuration
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool >/dev/null 2>&1 &" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" notification >/dev/null 2>&1 &" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" idle >/dev/null 2>&1 &" } ] }
+    ]
+  }
+}
+```
+
+### Updating an existing box
+
+`~/.claude/settings.json` is installed only when absent and is never rewritten
+by `termag-reconcile` (owners add their own hooks). When a termag hook line
+changes — as `PostToolUse` did when it started piping its payload into
+`termag-status post-tool` — bring an existing file up to date with:
+
+```bash
+termag-hooks-update --check   # exit 1 if your hooks are behind
+termag-hooks-update           # replace only the termag entries; keeps your own hooks; writes a .bak
+```
+
+Claude Code reads hooks at session start, so restart running `claude` sessions.
+
+A box on automatic updates does this itself: `termag-box-update` runs
+`termag-hooks-update --check`, and the update when it says the hooks are behind,
+right after reconciling (step 2b; the report's `hooks=` token says what it did).
+It still cannot restart the `claude` sessions already running, so those keep the
+old hooks until their next start. Before that step, a hook-line change reached a
+box only when its owner ran the updater by hand.
+
+## How it works
+
+- `UserPromptSubmit`, `PreToolUse` post `status: "working"` (green)
+- `PostToolUse` reads the hook JSON on stdin: posts `working`, and when the tool
+  was a Bash `gh pr create` / `gh pr merge` that succeeded (the PR URL in its
+  output is the proof) also posts a **milestone** (`/api/status/milestone`,
+  `{kind, url}` only — never the command text), which the UI turns into
+  "PR opened — Compact / Clear / Keep" once the agent is back at its prompt
+- `Notification` reads the hook JSON on stdin: `idle_prompt` -> `idle`, anything
+  else -> `waiting` (yellow), with `notify: true` so termag posts the captured
+  pane to Slack
+- `Stop` posts `status: "idle"` (red)
+- The tmux session name comes from `tmux display-message -p '#S'`; no session
+  means no context, and the hook exits without posting
+
+Two details are load-bearing:
+
+1. **The trailing `&`.** Without it every tool use blocks on the POST and feels
+   visibly slower. Don't remove it.
+2. **`Notification` reads stdin in the foreground** (`INPUT=$(cat)`) and
+   backgrounds only the pipe. Backgrounding the read races Claude Code closing
+   the pipe and the payload is intermittently lost.
+
+`termag-status` adds `curl -m 5` so an unreachable server cannot leave hook
+processes accumulating.
+
+## Verifying
+
+```bash
+# which endpoint will the hooks use, and will they authenticate?
+~/.local/bin/termag-status --print-endpoint
+~/.local/bin/termag-status --print-auth        # "token: present" | "token: absent"
+
+# end-to-end: set a sentinel, make one tool call in Claude Code, read it back
+ENDPOINT=$(~/.local/bin/termag-status --print-endpoint)
+SESSION=$(tmux display-message -p '#S')
+curl -sS -X POST "$ENDPOINT" -H 'Content-Type: application/json' \
+  -d "{\"session\":\"$SESSION\",\"status\":\"not_running\"}"
+# ... run any tool, then:
+curl -sS "$ENDPOINT/$SESSION"     # expect status: working
+```
+
+A session the server has never heard from reports `not_running`.
+
+Endpoint resolution and auth handling are covered by
+`deploy/termag-status.test.sh` (`sh deploy/termag-status.test.sh`) — no network,
+tmux or server required. It also asserts the token reaches curl via `-K` rather
+than the command line.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Status lights stay grey | `termag-status --print-endpoint`, then curl that server's `/termag/health` |
+| Endpoint is `127.0.0.1:3040` on a remote box | the agent config wasn't found — check `~/src/termag/agent/agent.config.json`, or set `TERMAG_AGENT_CONFIG` |
+| Lights grey on a remote box, endpoint correct | `--print-auth`. `token: absent` means the config has no `token`, so remote writes will 401 |
+| `Notification` never fires | `TERMAG_STATUS_DEBUG=1`, then inspect `~/.cache/termag-status/last-notification.json` |
+| Stale `waiting` | expected — `agent/agent.js` sweeps these back to reality |
+
+## LTS hooks (optional)
+
+If also running the LTS relay for remote Mac terminal capture, add a parallel set
+of hooks posting to `<server>/lts/status` with an `Authorization: Bearer $SECRET`
+header. See the LTS section of setup.md.

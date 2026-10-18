@@ -1,0 +1,72 @@
+[Unit]
+# Claude Code self-hosted runner ORCHESTRATOR for termag.
+#
+# Polls Anthropic for Claude Code cloud sessions queued on the termag
+# self-hosted environment and runs deploy/claude-spawn-runner once per
+# session, which asks the termag backend (127.0.0.1:3100 directly, not the
+# nginx gateway, which 404s /termag/internal/; loopback + bearer token) to start a
+# one-shot runner on the session owner's box. The environment key stays on this
+# host; boxes only ever see a single-use work order.
+#
+# Installed disabled by the orchestrator AMI bake (packer/scripts/
+# orchestrator-setup.sh). cloud-init enables it only when the SSM parameter
+# holding the environment key is populated, renders the three files below, and
+# finds the self-hosted-runner subcommand in /usr/bin/claude: the Claude Code
+# CLI cloud-init installs from npm at boot for every user on this host. There
+# is no second, orchestrator-only copy.
+#
+# Runs as the termag service user: the backend already runs as it, the hook
+# only talks to 127.0.0.1:3100, and host (engineer) accounts cannot read either
+# secret file. IMDS is blocked for host accounts separately (termag-imds-guard).
+Description=Claude Code self-hosted runner orchestrator (spawns runners on termag boxes)
+Documentation=https://code.claude.com/docs/en/self-hosted-environments-configuration#on-demand-runners
+After=network-online.target termag.service
+Wants=network-online.target
+ConditionPathExists=/etc/claude/environment-secret
+ConditionPathExists=/etc/claude/spawn-token
+# Holds CLAUDE_RUNNER_SPAWN_URL on the port the backend bound this boot; the
+# hook refuses to run without it rather than guess a port nginx 404s.
+ConditionPathExists=/etc/claude/orchestrator.env
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=termag
+# The orchestrator keeps its own state (Claude Code config, logs) here, not in
+# the termag user's home, which ProtectHome hides.
+StateDirectory=claude-orchestrator
+Environment=HOME=/var/lib/claude-orchestrator
+Environment=DISABLE_AUTOUPDATER=1
+Environment=CLAUDE_RUNNER_SPAWN_TOKEN_FILE=/etc/claude/spawn-token
+# --expected-spawn-seconds is the server-side lease: if no runner registers in
+# that window the session is re-offered with a fresh order. 300 s assumes the
+# target box is already running.
+# --hook-timeout 30 + 5 s kill grace stays well under it, as the runner enforces.
+Environment=CLAUDE_RUNNER_EXPECTED_SPAWN_SECONDS=300
+# Written by cloud-init: CLAUDE_RUNNER_SPAWN_URL (required by the hook) and any
+# override of the Environment= values above. EnvironmentFile values win over
+# Environment= lines. Nothing secret belongs in it.
+EnvironmentFile=/etc/claude/orchestrator.env
+ExecStart=/usr/bin/claude self-hosted-runner orchestrator \
+  --environment-secret-file /etc/claude/environment-secret \
+  --hooks-dir /usr/local/lib/termag/claude-hooks \
+  --expected-spawn-seconds ${CLAUDE_RUNNER_EXPECTED_SPAWN_SECONDS} \
+  --hook-timeout 30 \
+  --hook-concurrency 4 \
+  --health-port 18081 \
+  --log-level info
+Restart=always
+RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=300
+KillSignal=SIGTERM
+TimeoutStopSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/claude
+
+[Install]
+WantedBy=multi-user.target

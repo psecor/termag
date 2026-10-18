@@ -1,0 +1,149 @@
+#!/bin/bash
+# termag box first-boot wiring. Runs once via cloud-init.
+#
+# Variables expanded by Terraform's templatefile():
+#   termag_url, agent_token, git_user_email, git_user_name, remote_unix_user
+#
+# The AMI bakes a placeholder `termag` Unix user with the agent + CLIs
+# pre-installed. We rename it here to the box owner's actual Unix
+# username, so the agent runs as that user under /home/<user>/ — no
+# path_remap hack required, and the user owns their own dotfiles/shell
+# config going forward.
+set -euo pipefail
+
+exec > >(tee /var/log/termag-cloudinit.log) 2>&1
+# This script runs unattended under cloud-init, so a bare `set -e` abort is
+# otherwise invisible — you see the "starting" line and nothing else, with no
+# hint of which command died. The ERR trap logs the failing line + command so
+# a stuck box is diagnosable straight from the cloud-init log.
+# $$ escapes the templatefile interpolation so these reach bash as shell vars.
+trap 'rc=$?; echo "=== termag box cloud-init FAILED at line $${LINENO} (exit $${rc}): $${BASH_COMMAND} ==="' ERR
+echo "=== termag box cloud-init starting at $(date -Iseconds) ==="
+
+UNIX_USER="${remote_unix_user}"
+
+# ── Step 1: terminate any running termag processes + drop linger ─────────
+# Linger may have spawned a user-manager already (the AMI bake enabled it),
+# which blocks `usermod -l` on a user with running processes.
+loginctl terminate-user termag 2>/dev/null || true
+loginctl disable-linger termag 2>/dev/null || true
+sleep 2
+if pgrep -u termag >/dev/null; then
+  echo "ERROR: termag still has running processes after terminate:"
+  pgrep -u termag -a
+  exit 1
+fi
+
+# ── Step 2: rename user + group, move home ───────────────────────────────
+# Move the directory ourselves and let usermod update only the passwd record.
+# `usermod -m` does the same rename(2) and then walks the whole home, one stat
+# per file, to fix ownership that does not change here (measured: 100,377
+# newfstatat calls for 100,003 files). On a box that walk hits a root volume
+# EBS restores lazily from the snapshot, and on the quick-start image it took
+# 4 minutes (2026-09-25 box: user manager stopped 16:21:01, next step 16:25:04).
+# mv is one rename(2). Ownership is untouched because the UID and GID stay the
+# same; the baked-path fix-up is Steps 3+4. An owner literally named termag
+# needs no rename at all.
+if [ "$UNIX_USER" != termag ]; then
+  mv /home/termag "/home/$UNIX_USER"
+  usermod -l "$UNIX_USER" -d "/home/$UNIX_USER" termag
+  groupmod -n "$UNIX_USER" termag
+fi
+USER_UID=$(id -u "$UNIX_USER")
+
+# ── Step 2b: re-assert passwordless sudo for the renamed owner ───────────
+# The AMI bakes `termag` into the `sudo` group + a group-keyed NOPASSWD policy
+# (/etc/sudoers.d/90-termag-box) so the box owner can install their own tooling.
+# usermod -l doesn't reliably carry supplementary-group membership across the
+# rename, so add the final username back to the `sudo` group explicitly. The
+# sudoers policy itself is group-keyed, so it needs no edit here.
+usermod -aG sudo "$UNIX_USER"
+
+# Steps 3–4 are cosmetic cleanup of the `/home/termag` prefix the AMI bake
+# leaves behind. They must NEVER abort the boot — the load-bearing work is
+# Steps 5–8 (write the agent token + start the agent). So the call below is
+# guarded: a missing script, a missing index or an unwritable file must not
+# strand the box without a running agent.
+
+# ── Steps 3+4: rewrite the baked /home/termag path (symlink targets + text files)
+# The bake indexes every symlink and text file under the baked home that embeds
+# /home/termag (packer/scripts/index-home-paths.sh) and installs the rewrite as
+# /usr/local/sbin/termag-rewrite-home-paths; only the indexed entries are
+# touched. Walking the home here instead cost 4.5 to 15.5 minutes, because a
+# box's root volume is restored lazily from the snapshot and every first read
+# is an S3 round trip -- and the orchestrator marks a box failed at 15.
+echo "=== steps 3+4: rewriting baked /home/termag paths at $(date -Iseconds) ==="
+if [ -x /usr/local/sbin/termag-rewrite-home-paths ]; then
+  /usr/local/sbin/termag-rewrite-home-paths /home/termag "/home/$UNIX_USER" \
+    || echo "WARNING: path rewrite reported a problem (non-fatal)"
+else
+  echo "WARNING: /usr/local/sbin/termag-rewrite-home-paths is missing; this AMI predates the home-path index, so baked /home/termag paths were not rewritten"
+fi
+
+# ── Step 4b: make the renamed pyenv libs findable ────────────────────────
+# The index only lists *text* files -- its `grep -I` deliberately skips binaries.
+# But CPython built with --enable-shared records the bake-time library path in
+# its ELF RUNPATH, and that path (/home/termag/.pyenv/...) no longer exists
+# after the rename. The result is a python3 that cannot start at all:
+#
+#   libpython3.13.so.1.0: cannot open shared object file
+#
+# which then silently breaks anything shelling out to python3 -- including the
+# Claude Code Notification hook. Point the dynamic linker at the real location
+# instead of trying to rewrite the RUNPATH. Version-agnostic on purpose: it
+# picks up whatever pyenv versions the AMI happens to carry.
+#
+# Guarded like Steps 3-4: cosmetic relative to Steps 5-8, so it must never
+# abort the boot and strand the box without a running agent.
+echo "=== step 4b: registering pyenv lib dirs with the dynamic linker ==="
+{
+  : > /etc/ld.so.conf.d/pyenv.conf
+  for libdir in /home/"$UNIX_USER"/.pyenv/versions/*/lib; do
+    [ -d "$libdir" ] || continue
+    ls "$libdir"/libpython*.so* >/dev/null 2>&1 || continue
+    echo "$libdir" >> /etc/ld.so.conf.d/pyenv.conf
+    echo "  + $libdir"
+  done
+  ldconfig
+} || echo "WARNING: step 4b failed; python3 may not start (non-fatal)"
+
+# ── Step 5: drop the agent's bearer token ────────────────────────────────
+# The baked systemd unit reads $HOME/src/termag/agent/agent.config.json
+# (via the unit's %h). No path_remap field — paths now match the
+# orchestrator's view (/home/<user>/...) end to end.
+CONFIG_PATH="/home/$UNIX_USER/src/termag/agent/agent.config.json"
+umask 077
+cat > /tmp/agent.config.json <<'JSON'
+{
+  "termag_url": "${termag_url}",
+  "token": "${agent_token}"
+}
+JSON
+install -o "$UNIX_USER" -g "$UNIX_USER" -m 600 /tmp/agent.config.json "$CONFIG_PATH"
+rm -f /tmp/agent.config.json
+
+# ── Step 6: per-user git identity ────────────────────────────────────────
+sudo -u "$UNIX_USER" -H git config --global user.email "${git_user_email}"
+sudo -u "$UNIX_USER" -H git config --global user.name  "${git_user_name}"
+
+# ── Step 7: re-enable linger under the new name ──────────────────────────
+loginctl enable-linger "$UNIX_USER"
+sleep 2
+
+# ── Step 8: enable + start the agent ─────────────────────────────────────
+sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user daemon-reload
+sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user enable --now termag-agent.service
+
+# ── Sanity check ─────────────────────────────────────────────────────────
+# Don't fail the boot on a slow first dial, but log the *real* status (and a
+# log tail if it's not up) so a stuck agent is diagnosable from the cloud-init
+# log instead of hiding behind a cheery "complete".
+sleep 2
+if sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user is-active --quiet termag-agent.service; then
+  echo "=== termag-agent.service is active ==="
+else
+  echo "=== WARNING: termag-agent.service not active after start — recent logs: ==="
+  sudo -u "$UNIX_USER" XDG_RUNTIME_DIR=/run/user/$USER_UID journalctl --user -u termag-agent.service --no-pager -n 20 2>&1 || true
+fi
+
+echo "=== termag box cloud-init complete at $(date -Iseconds) ==="

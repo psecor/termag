@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# termag-pr-create — open a pull request whose title and body come from files.
+#
+# The title and body an agent publishes are data: repo text, commit subjects,
+# an issue it was asked to fix. Typed into a shell command they can break out
+# of their quotes or end a heredoc early, so the termag-pr skill has the agent
+# write both with its file tool and run only this fixed command:
+#
+#   termag-pr-create TITLE_FILE BODY_FILE [gh pr create flags, e.g. --draft --base main]
+#
+# It reads the title's first line, marks the body with termag-pr-body, and
+# runs `gh pr create --title <title> --body-file -`. Neither text is ever
+# parsed by a shell. Flags that would replace the title or body (--title,
+# --body, --body-file, --fill*, --template, --web) are refused.
+set -euo pipefail
+
+die() { printf 'termag-pr-create: %s\n' "$1" >&2; exit 2; }
+
+[ $# -ge 2 ] || die 'usage: termag-pr-create TITLE_FILE BODY_FILE [gh pr create flags]'
+title_file=$1 body_file=$2
+shift 2
+[ -f "$title_file" ] || die "no title file: $title_file"
+[ -f "$body_file" ] || die "no body file: $body_file"
+
+for arg in "$@"; do
+  case $arg in
+    -t|--title|--title=*|-b|--body|--body=*|-F|--body-file|--body-file=*|-f|--fill|--fill-first|--fill-verbose|-T|--template|--template=*|-w|--web)
+      die "$arg replaces the title or body from the files; drop it" ;;
+  esac
+done
+
+IFS= read -r title < "$title_file" || [ -n "$title" ] || die 'the title file is empty'
+title=${title%$'\r'}
+[ -n "${title//[[:space:]]/}" ] || die 'the title file is empty'
+
+here=$(cd "$(dirname "$0")" && pwd)
+pr_body=$here/termag-pr-body
+[ -x "$pr_body" ] || pr_body=termag-pr-body
+
+"$pr_body" -- "$body_file" | gh pr create --title "$title" --body-file - "$@"

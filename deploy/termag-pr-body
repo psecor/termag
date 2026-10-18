@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# termag-pr-body — mark a pull request body as opened from termag.
+#
+# Agents on a box pipe the body of every PR they open through this, the way
+# Cursor's cloud agents wrap theirs, so a PR opened from termag can be found
+# later without changing who opened it:
+#
+#   termag-pr-body <<'EOF' | gh pr create --title "..." --body-file -
+#   ...body...
+#   EOF
+#
+# prints
+#
+#   <!-- TERMAG_PR_BODY_BEGIN -->
+#   ...body...
+#   <!-- TERMAG_PR_BODY_END -->
+#
+#   <!-- termag: box=<id> project=<name> [ask=<thread-id>] -->
+#   <sub>Opened from termag</sub>
+#
+# A body that already carries the markers is unwrapped first, so running it
+# again (say, for `gh pr edit --body-file -`) never stacks a second footer.
+#
+# Usage:
+#   termag-pr-body [--box <id>] [--project <name>] [--ask <thread-id>] [FILE]
+#     FILE   the body; stdin when absent or `-`
+#
+# Defaults:
+#   box      TERMAG_BOX_ID, else the EC2 instance id from IMDS, else the
+#            short hostname
+#   project  TERMAG_PROJECT, else the <name> in .../termag/projects/<name>/
+#            of the working directory (a workstream's .worktrees/<ws> below
+#            it included), else the git checkout's directory name
+#
+# Values are reduced to [A-Za-z0-9._-] so nothing can close the comment.
+set -euo pipefail
+
+BEGIN='<!-- TERMAG_PR_BODY_BEGIN -->'
+END='<!-- TERMAG_PR_BODY_END -->'
+
+box=${TERMAG_BOX_ID:-}
+project=${TERMAG_PROJECT:-}
+ask=''
+file='-'
+while [ $# -gt 0 ]; do
+  case $1 in
+    --box) box=${2-}; shift 2 ;;
+    --project) project=${2-}; shift 2 ;;
+    --ask) ask=${2-}; shift 2 ;;
+    -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; [ $# -gt 0 ] && file=$1; break ;;
+    -?*) printf 'termag-pr-body: unknown option %s\n' "$1" >&2; exit 2 ;;
+    *) file=$1; shift ;;
+  esac
+done
+
+clean() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-100; }
+
+imds_instance_id() {
+  local token
+  token=$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null) || return 1
+  [ -n "$token" ] || return 1
+  curl -sf -m 1 -H "X-aws-ec2-metadata-token: $token" \
+    http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null
+}
+
+project_from_cwd() {
+  local dir=$PWD rest common
+  case $dir in
+    */termag/projects/?*)
+      rest=${dir##*/termag/projects/}
+      printf '%s' "${rest%%/*}"
+      return 0 ;;
+  esac
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  case $common in */.git) common=${common%/.git} ;; esac
+  printf '%s' "${common##*/}"
+}
+
+[ -n "$box" ] || box=$(imds_instance_id || true)
+[ -n "$box" ] || box=$(hostname -s 2>/dev/null || hostname)
+[ -n "$project" ] || project=$(project_from_cwd || true)
+[ -n "$project" ] || project=${PWD##*/}
+
+if [ "$file" = - ]; then body=$(cat); else body=$(cat -- "$file"); fi
+
+# Unwrap a body this script already marked. Text someone added on GitHub
+# before BEGIN stays before it; text after the footer stays after the new one.
+before='' after=''
+if printf '%s\n' "$body" | grep -qxF "$BEGIN" && printf '%s\n' "$body" | grep -qxF "$END"; then
+  part() {
+    printf '%s\n' "$body" | awk -v b="$BEGIN" -v e="$END" -v want="$1" '
+      state == 0 && $0 == b { state = 1; next }
+      state == 1 && $0 == e { state = 2; next }
+      state == 2 && (/^<!-- termag: .* -->$/ || $0 == "<sub>Opened from termag</sub>") { next }
+      state == 2 && !seen && /^[[:space:]]*$/ { next }
+      state == 2 { seen = 1 }
+      state == want { print }'
+  }
+  before=$(part 0)
+  after=$(part 2)
+  body=$(part 1)
+fi
+
+meta="box=$(clean "$box") project=$(clean "$project")"
+[ -z "$ask" ] || meta="$meta ask=$(clean "$ask")"
+
+[ -z "$before" ] || printf '%s\n\n' "$before"
+printf '%s\n%s\n%s\n\n<!-- termag: %s -->\n<sub>Opened from termag</sub>\n' "$BEGIN" "$body" "$END" "$meta"
+[ -z "$after" ] || printf '\n%s\n' "$after"

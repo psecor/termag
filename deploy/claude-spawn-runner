@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# spawn-runner -- the Claude Code orchestrator's spawn hook on the termag
+# orchestrator host.
+#
+# The orchestrator (deploy/claude-runner-orchestrator.service) runs this once
+# per Claude Code cloud session queued on the self-hosted environment, with the
+# contract documented at
+#   https://code.claude.com/docs/en/self-hosted-environments-configuration#the-spawn-runner-hook
+# It must submit asynchronously and return within --hook-timeout. It does one
+# thing: POST the work order to the termag backend over loopback, which finds
+# the session owner's box and starts a one-shot runner there.
+#
+# Exit codes (the contract):
+#   0  submitted (backend answered 2xx)
+#   1  retryable: backend unreachable, 5xx, 503 "no box ready"; the session
+#      backs off and is re-offered with a fresh order. Also this host's own
+#      misconfiguration, which says nothing about the session: 401 (the token
+#      files disagree) and a 404 without the backend's owner-not-found code
+#      (the route is not mounted, or the URL reaches nginx), so queued sessions
+#      wait for the fix instead of all being stopped by it
+#   2  non-retryable: no owner email (Claude Tag or pre-warming order), the
+#      email is not a termag user (404 with code owner-not-found), or the
+#      request was malformed (other 4xx). The session is blocked until an Owner
+#      retries it from the Activity tab; the tail of stderr is shown there, so
+#      say why, without secrets.
+#
+# Env (from the orchestrator):
+#   CLAUDE_RUNNER_WORK_ORDER_FILE  the signed single-use JWT; read, never printed
+#   CLAUDE_RUNNER_ORDER_ID         idempotency key (safe to log)
+#   CLAUDE_RUNNER_SESSION_ID, CLAUDE_RUNNER_ACCOUNT_EMAIL
+# Env (from the unit / orchestrator.env):
+#   CLAUDE_RUNNER_SPAWN_URL         REQUIRED; cloud-init writes it to
+#                                   /etc/claude/orchestrator.env from the port the
+#                                   backend actually bound this boot (3100 behind the
+#                                   nginx gateway, which 404s every /termag/internal/;
+#                                   3040 on an image without the gateway). No default:
+#                                   a guessed port would only ever reach nginx.
+#   CLAUDE_RUNNER_SPAWN_TOKEN_FILE  bearer token file, default /etc/claude/spawn-token
+#
+# Never logs the email or the JWT: the order ID and the HTTP status are the
+# whole log line.
+set -u
+
+url=${CLAUDE_RUNNER_SPAWN_URL:-}
+token_file=${CLAUDE_RUNNER_SPAWN_TOKEN_FILE:-/etc/claude/spawn-token}
+order=${CLAUDE_RUNNER_ORDER_ID:-}
+session=${CLAUDE_RUNNER_SESSION_ID:-}
+email=${CLAUDE_RUNNER_ACCOUNT_EMAIL:-}
+work_order_file=${CLAUDE_RUNNER_WORK_ORDER_FILE:-}
+
+log() { printf 'spawn-runner[%s]: %s\n' "${order:-?}" "$*" >&2; }
+
+for tool in curl jq; do
+  command -v "$tool" >/dev/null 2>&1 || { log "$tool not installed on the orchestrator host"; exit 2; }
+done
+[ -n "$order" ] || { log 'CLAUDE_RUNNER_ORDER_ID is unset; not started by the orchestrator?'; exit 2; }
+[ -n "$url" ] || { log 'CLAUDE_RUNNER_SPAWN_URL is unset; cloud-init writes it to /etc/claude/orchestrator.env (see claude-runner-orchestrator.service)'; exit 2; }
+[ -n "$work_order_file" ] && [ -r "$work_order_file" ] || { log 'work-order file missing or unreadable'; exit 2; }
+[ -r "$token_file" ] || { log "spawn token file $token_file missing or unreadable"; exit 2; }
+
+if [ -z "$session" ]; then
+  log 'pre-warming order (no session); this environment does not pre-warm, nothing to spawn'
+  exit 2
+fi
+if [ -z "$email" ]; then
+  log 'session has no owner email (Claude Tag or agent-owned); termag routes by owner, cannot place it'
+  exit 2
+fi
+
+# The email is read by jq from its environment ($ENV), never put on argv:
+# /proc/<pid>/cmdline is world-readable on the host. The JWT comes from the file.
+body=$(CLAUDE_RUNNER_ACCOUNT_EMAIL="$email" jq -cn \
+  --arg orderId "$order" \
+  --arg sessionId "$session" \
+  --rawfile workOrder "$work_order_file" \
+  '{orderId: $orderId, sessionId: $sessionId, accountEmail: $ENV.CLAUDE_RUNNER_ACCOUNT_EMAIL,
+    workOrder: ($workOrder | rtrimstr("\n"))}') || { log 'could not build the request body'; exit 2; }
+
+umask 077
+work=$(mktemp -d) || { log 'mktemp failed'; exit 1; }
+trap 'rm -rf "$work"' EXIT
+response=$work/response
+headers=$work/headers
+# The token and the body travel through files curl reads itself, so neither is
+# on this process's command line (/proc/<pid>/cmdline is world-readable).
+printf 'Authorization: Bearer %s\n' "$(tr -d '\n' <"$token_file")" >"$headers"
+printf '%s' "$body" >"$work/body"
+unset body
+
+status=$(curl -sS -o "$response" -w '%{http_code}' --max-time 20 \
+  -H 'Content-Type: application/json' -H "@$headers" \
+  --data-binary "@$work/body" "$url" 2>/dev/null) || status=000
+
+reason=$(jq -r '.error // .message // empty' "$response" 2>/dev/null)
+code=$(jq -r '.code // empty' "$response" 2>/dev/null)
+
+case "$status" in
+  2??)
+    log "submitted (HTTP $status)${reason:+: $reason}"
+    exit 0 ;;
+  503|000|5??)
+    log "retryable (HTTP $status)${reason:+: $reason}"
+    exit 1 ;;
+  401)
+    log 'retryable (HTTP 401): the backend refused the spawn token; /etc/claude/spawn-token and CLAUDE_RUNNER_SPAWN_TOKEN in the backend .env must match'
+    exit 1 ;;
+  404)
+    if [ "$code" = owner-not-found ]; then
+      log "not spawnable (HTTP 404)${reason:+: $reason}"
+      exit 2
+    fi
+    log 'retryable (HTTP 404): no spawn route at CLAUDE_RUNNER_SPAWN_URL; is CLAUDE_RUNNER_SPAWN_TOKEN set in the backend .env, and does the URL name the backend port, not nginx?'
+    exit 1 ;;
+  *)
+    log "not spawnable (HTTP $status)${reason:+: $reason}"
+    exit 2 ;;
+esac

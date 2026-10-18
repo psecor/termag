@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Stand-in for `systemctl --user` on a warm-pool box of the e2e stack (fakes.sh
+# installs it as <box>/bin/systemctl when E2E_WARM_POOL is on). A stand-in box
+# has no user manager, and the warm-pool units it needs are plain oneshots:
+# deploy/termag-on-warm.service and termag-on-claim.service, which the agent
+# starts over its socket. Those are run here from their unit files, with %h as
+# the box's HOME: ExecStart in its own process group (its pid in <root>/pids,
+# so down.sh stops it), then ExecStopPost. Anything else goes to the real
+# systemctl untouched.
+#
+#   systemctl --user start [--no-block] termag-on-<x>.service
+#   systemctl --user stop | is-active | status | enable | disable termag-on-<x>.service
+#   systemctl --user daemon-reload
+#
+# Env (set by the wrapper fakes.sh writes): E2E_UNIT_DIR (where the unit files
+# are, the checkout's deploy/), E2E_UNIT_STATE (per-box state dir),
+# E2E_UNIT_PIDS (the stack's pids dir), E2E_BOX (box name), E2E_REAL_SYSTEMCTL.
+set -uo pipefail
+
+real() { exec "${E2E_REAL_SYSTEMCTL:-/usr/bin/systemctl}" "$@"; }
+
+args=("$@") user='' block=1 verb='' unit=''
+for a in "$@"; do
+  case $a in
+    --user) user=1 ;;
+    --no-block) block= ;;
+    --quiet|-q|--no-pager) ;;
+    -*) ;;
+    *) if [ -z "$verb" ]; then verb=$a; elif [ -z "$unit" ]; then unit=$a; fi ;;
+  esac
+done
+[ -n "$user" ] || real "${args[@]}"
+case $verb in daemon-reload) exit 0 ;; esac
+case $unit in termag-on-*.service) ;; *) real "${args[@]}" ;; esac
+file="$E2E_UNIT_DIR/$unit"
+[ -f "$file" ] || { echo "Unit $unit not found." >&2; exit 5; }
+
+state="$E2E_UNIT_STATE/$unit"
+pidf="$E2E_UNIT_PIDS/$E2E_BOX.$unit.pid"
+mkdir -p "$E2E_UNIT_STATE"
+
+# One directive's value from the [Service] section, %h expanded and a leading
+# systemd prefix (- @ + ! :) dropped.
+directive() {
+  awk -v k="$1" -F= '
+    /^\[/ { s = ($0 == "[Service]") } s && $1 == k { sub(/^[^=]*=/, ""); print; exit }' "$file" \
+    | sed -e "s#%h#$HOME#g" -e 's/^[-@+!:]*//'
+}
+
+running() { [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; }
+
+unit_state() {
+  if running; then echo activating; return; fi
+  local rc
+  rc=$(cat "$state.exit" 2>/dev/null) || { echo inactive; return; }
+  if [ "$rc" != 0 ]; then echo failed
+  elif [ "$(directive RemainAfterExit)" = yes ]; then echo active
+  else echo inactive
+  fi
+}
+
+case $verb in
+  start)
+    # A oneshot that is running, or finished with RemainAfterExit, is started already.
+    s=$(unit_state)
+    if [ "$s" = activating ] || [ "$s" = active ]; then exit 0; fi
+    start=$(directive ExecStart) stoppost=$(directive ExecStopPost)
+    [ -n "$start" ] || { echo "$unit has no ExecStart" >&2; exit 1; }
+    rm -f "$state.exit"
+    setsid bash -c '
+      bash -c "$1"; rc=$?
+      echo "$rc" >"$3.exit"
+      [ -z "$2" ] || bash -c "$2" || true
+    ' _ "$start" "$stoppost" "$state" >>"$state.log" 2>&1 </dev/null &
+    echo $! >"$pidf"
+    if [ -n "$block" ]; then
+      while running; do sleep 0.2; done
+      [ "$(cat "$state.exit" 2>/dev/null)" = 0 ]
+    fi
+    ;;
+  stop)
+    if running; then kill -TERM -- "-$(cat "$pidf")" 2>/dev/null || true; fi
+    rm -f "$pidf"
+    ;;
+  is-active)
+    s=$(unit_state); echo "$s"
+    [ "$s" = active ]
+    ;;
+  status)
+    echo "$unit - $(unit_state) (e2e stand-in; log $state.log)"
+    ;;
+  enable|disable)
+    exit 0
+    ;;
+  *)
+    echo "e2e systemctl: $verb is not emulated for $unit" >&2; exit 1 ;;
+esac

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# termag-cursor-otel-hook — Cursor's telemetry to termag's telemetry project.
+#
+# cursor-agent's own OpenTelemetry exports only to Cursor's backend, with the
+# owner's Cursor token, so termag sends these events itself. termag-credentials
+# (apply agent-telemetry) adds this script to the owner's ~/.cursor/hooks.json
+# on sessionStart, sessionEnd, stop, postToolUse, postToolUseFailure and
+# subagentStop; Cursor runs it with the hook's JSON on stdin.
+#
+# Each event becomes one OTLP/JSON log record, `cursor.<event>`, posted to the
+# endpoint termag-credentials recorded. Metadata only: the attributes are
+# picked by name (ids, model, status, durations, token counts, tool name), so
+# no prompt, response, tool input or output, command or file path is sent. The
+# request carries only the headers named here: nothing of the owner's shell
+# exporter rides on it.
+#
+# It never gets in Cursor's way: it answers `{}` at once (no permission, no
+# follow-up) and leaves the post to a detached curl, and any failure is
+# silent. With no recorded destination it does nothing.
+#
+# Env: TERMAG_AGENT_TELEMETRY (default ~/.config/termag/agent-telemetry.json),
+# TERMAG_OTEL_REPLAY_ID (set by termag-agent-otel for a browser-started launch).
+set -u
+
+printf '{}\n'
+
+record=${TERMAG_AGENT_TELEMETRY:-$HOME/.config/termag/agent-telemetry.json}
+[ -s "$record" ] && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || exit 0
+endpoint=$(jq -r '.endpoint // empty' "$record" 2>/dev/null)
+resource=$(jq -r '.resourceAttributes // empty' "$record" 2>/dev/null)
+[[ $endpoint =~ ^https://[A-Za-z0-9.:-]+$ ]] && [[ $resource =~ ^[A-Za-z0-9._=,-]+$ ]] || exit 0
+
+replay=${TERMAG_OTEL_REPLAY_ID:-}
+case $replay in *[!A-Za-z0-9]*) replay= ;; esac
+if [ ${#replay} -lt 20 ] || [ ${#replay} -gt 64 ]; then replay=; fi
+resource="$resource,service.name=termag-cursor-session,termag.agent=cursor"
+[ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
+
+payload=$(head -c 1048576)
+body=$(printf '%s' "$payload" | jq -c --arg res "$resource" --arg now "$(date +%s%N)" '
+  def attr($k; $v):
+    if $v == null or $v == "" then empty
+    elif ($v | type) == "number" then (if ($v | floor) == $v then {key: $k, value: {intValue: ($v | tostring)}} else {key: $k, value: {doubleValue: $v}} end)
+    elif ($v | type) == "boolean" then {key: $k, value: {boolValue: $v}}
+    elif ($v | type) == "string" then {key: $k, value: {stringValue: ($v | .[0:256])}}
+    else empty end;
+  (.hook_event_name // "") as $event
+  | select($event | test("^[A-Za-z]+$"))
+  | {resourceLogs: [{
+      resource: {attributes: [$res | split(",")[] | split("=") | select(length == 2) | {key: .[0], value: {stringValue: .[1]}}]},
+      scopeLogs: [{
+        scope: {name: "termag-cursor-otel-hook"},
+        logRecords: [{
+          timeUnixNano: $now,
+          observedTimeUnixNano: $now,
+          severityNumber: 9,
+          severityText: "INFO",
+          body: {stringValue: "cursor.\($event)"},
+          attributes: [
+            attr("event.name"; "cursor.\($event)"),
+            attr("session.id"; .session_id // .conversation_id),
+            attr("conversation.id"; .conversation_id),
+            attr("generation.id"; .generation_id),
+            attr("model"; .model),
+            attr("cursor.version"; .cursor_version),
+            attr("user.email"; .user_email),
+            attr("status"; .status),
+            attr("final_status"; .final_status),
+            attr("reason"; .reason),
+            attr("composer_mode"; .composer_mode),
+            attr("is_background_agent"; .is_background_agent),
+            attr("loop_count"; .loop_count),
+            attr("input_tokens"; .input_tokens),
+            attr("output_tokens"; .output_tokens),
+            attr("cache_read_tokens"; .cache_read_tokens),
+            attr("cache_write_tokens"; .cache_write_tokens),
+            attr("duration_ms"; .duration_ms // .duration),
+            attr("tool_name"; .tool_name),
+            attr("tool_use_id"; .tool_use_id),
+            attr("success"; if $event == "postToolUse" then true elif $event == "postToolUseFailure" then false else null end),
+            attr("failure_type"; .failure_type),
+            attr("is_interrupt"; .is_interrupt),
+            attr("subagent_type"; .subagent_type),
+            attr("message_count"; .message_count),
+            attr("tool_call_count"; .tool_call_count)
+          ]
+        }]
+      }]
+    }]}' 2>/dev/null) || exit 0
+[ -n "$body" ] || exit 0
+
+# Detached and with its stdio closed, so Cursor isn't kept waiting on it.
+printf '%s' "$body" | {
+  setsid curl -sS -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' \
+    --data-binary @- "$endpoint/v1/logs" >/dev/null 2>&1 &
+} 2>/dev/null
+exit 0

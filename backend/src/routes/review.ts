@@ -1,0 +1,315 @@
+import { Router, RequestHandler } from 'express';
+import { prisma } from '../db';
+import { requireAuth } from '../middleware/auth';
+import { asyncHandler } from '../middleware/errors';
+import { powerStateError } from '../services/boxPowerPolicy';
+import { refuseUnreadySessions } from '../services/sessionGate';
+import { sendForProject, isProjectAgentConnected } from '../services/agentRegistry';
+import { noteBoxActivity } from '../services/boxActivity';
+import { assertSessionAccess, SessionAccessError, type SessionAccess } from '../services/sessionAccess';
+import { projectDirFor, sessionName } from '../services/tmux';
+import { resolveProjectRoot } from '../services/projectPaths';
+import { getAllStatuses } from '../services/status';
+import { statusKey } from '../services/statusKey';
+import {
+  chooseGuess, isPrNumber, parseGhPrView, prFromText, reviewLaunchCommand, urlForPr, probeReviewPane, PR_OPTION, encodePrOption,
+  buildReviewPrompt, parseReviewBody, reviewPromptPath, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
+  type ResolvedReviewTemplate,
+  type ReviewPaneState,
+} from '../services/review';
+import { DEFAULT_REVIEWER, REVIEWER_IDS, isReviewerId, reviewerName, reviewerNote } from '../services/reviewers';
+import { prUrlFor, reviewTarget, workstreamRepo } from '../services/reviewRepo';
+import {
+  clearReviewRecord, getReviewRecord, identityOf, markReviewSeen, registerReviewRecord, touchRecordWithProbe,
+} from '../services/reviewSweep';
+
+// The Review button (frontend/src/components/ReviewButton.tsx + ReviewDock.tsx):
+//
+//   GET    /api/projects/:id/review/guess?workstream=   which PR is being worked on
+//   GET    /api/projects/:id/review?workstream=         is a review pane alive / is the reviewer still in it
+//   POST   /api/projects/:id/review { workstream, pr, url?, prompt?, reviewer? }   start (or replace) a review
+//                                                       (reviewer: services/reviewers.ts REVIEWER_IDS, default devin;
+//                                                       a bare pr needs the workstream's GitHub remote:
+//                                                       services/reviewRepo.ts)
+//   DELETE /api/projects/:id/review?workstream=         kill the review pane
+//   POST   /api/projects/:id/review/seen { workstream }   the review terminal took focus while done
+//
+// Everything is routed to the OWNER's per-user agent via sendForProject (tmux
+// is per unix user) and gated by assertSessionAccess (owner-or-share, legal
+// session name rebuilt server-side). The review pane is the `review` role:
+// `<user>-<project>[-<ws>]-review`, created in the workstream's directory so
+// `gh` sees the right repo.
+//
+// Since the review ring the pane's live state ALSO
+// rides on the AGENT session's status (`AgentStatus.review`, written only by
+// services/reviewSweep.ts and pushed over /ws/status); the browser no longer
+// polls this GET route. It stays for a deliberate, on-demand probe (first
+// render after POST), and its probing is the sweep's probing
+// (`probeReviewPane`) so the dock and the ring can never disagree.
+//
+// Which PR a pane is reviewing is remembered in the sweep's memory and, on
+// agents that have the RPC, as a tmux user option on the session
+// (`@termag-review-pr`), which lives as long as the pane does; after a
+// backend restart the number is read back from there, or from the launch line
+// echoed in the pane's scrollback on an older agent. Launch uses only RPCs
+// every deployed agent already has; the gh-based guess needs the
+// `git-pr-info` RPC and degrades to the pane capture + milestone on an older
+// agent.
+
+/** How long the fresh shell gets before `devin …` is typed (zsh startup + the box banner). */
+const SHELL_SETTLE_MS = 700;
+
+async function accessOr404(req: Parameters<RequestHandler>[0], res: Parameters<RequestHandler>[1], role: 'agent' | 'review'): Promise<SessionAccess | null> {
+  const workstream = (typeof req.query.workstream === 'string' && req.query.workstream)
+    || (typeof req.body?.workstream === 'string' && req.body.workstream)
+    || 'main';
+  try {
+    return await assertSessionAccess(req.user!.id, req.params.id, role, workstream);
+  } catch (err) {
+    if (err instanceof SessionAccessError) { res.status(err.status).json({ error: err.message }); return null; }
+    throw err;
+  }
+}
+
+async function workstreamPaths(access: SessionAccess): Promise<{ cwd: string; home: string }> {
+  const p = await prisma.project.findUnique({
+    where: { id: access.project.id },
+    select: { name: true, user: { select: { unixUsername: true } }, instance: { select: { hostHome: true } } },
+  });
+  if (!p) throw new SessionAccessError(404, 'Project not found');
+  return {
+    cwd: projectDirFor(p, access.workstream),
+    home: resolveProjectRoot({ ownerUnixUser: p.user.unixUsername, hostHome: p.instance?.hostHome }),
+  };
+}
+
+/**
+ * The prompt template for this workstream: repo file, then the owner's home
+ * files, then the built-in one (services/review.ts chooseReviewTemplate). One
+ * read-file per candidate, in parallel; a failed read (old agent, permissions)
+ * counts as absent. read-file goes through the agent's path_remap, like the
+ * prompt file's write-file.
+ */
+async function resolveTemplate(access: SessionAccess, cwd: string, home: string): Promise<ResolvedReviewTemplate> {
+  const candidates = reviewTemplateCandidates(cwd, home);
+  const contents = await Promise.all(candidates.map(c =>
+    sendForProject(access.host, 'read-file', { path: c.path }, 5000)
+      .then(r => (typeof r?.content === 'string' ? r.content : null))
+      .catch(() => null)));
+  return chooseReviewTemplate(candidates, contents);
+}
+
+function identityFor(access: SessionAccess) {
+  return identityOf({
+    host: access.host,
+    projectId: access.project.id,
+    projectName: access.project.name,
+    ownerUsername: access.project.ownerUsername,
+    workstream: access.workstream,
+  });
+}
+
+export function reviewRouter(): Router {
+  const router = Router();
+
+  const guess: RequestHandler = async (req, res) => {
+    const access = await accessOr404(req, res, 'agent');
+    if (!access) return;
+    if (!isProjectAgentConnected(access.host)) { res.status(503).json({ error: "Owner's agent is offline" }); return; }
+
+    const { cwd, home } = await workstreamPaths(access);
+    const templateP = resolveTemplate(access, cwd, home);
+    const repoP = workstreamRepo(sendForProject, access.host, cwd);
+    let gh: ReturnType<typeof parseGhPrView> = null;
+    let branch: string | null = null;
+    let ghError: string | null = null;
+    try {
+      // Newer agents only; an older one answers "Unknown command" and we fall through.
+      const r = await sendForProject(access.host, 'git-pr-info', { cwd }, 15000);
+      branch = typeof r?.branch === 'string' ? r.branch : null;
+      gh = typeof r?.pr === 'string' ? parseGhPrView(r.pr) : null;
+      ghError = typeof r?.error === 'string' ? r.error : null;
+    } catch (err) {
+      const msg = (err as Error).message;
+      ghError = /Unknown command/.test(msg) ? 'the box agent predates the branch lookup (restart it)' : msg;
+    }
+
+    const agentSession = sessionName(access.project.ownerUsername, access.project.name, 'agent', access.workstream);
+    const milestoneUrl = getAllStatuses().get(statusKey(access.host.instanceId, agentSession))?.milestone?.url ?? null;
+
+    let pane: ReturnType<typeof prFromText> = null;
+    try {
+      const r = await sendForProject(access.host, 'tmux-capture', { sessionName: agentSession, lines: 400 }, 8000);
+      pane = prFromText(typeof r?.content === 'string' ? r.content : '');
+    } catch { /* no agent pane to read — fine */ }
+
+    let chosen = chooseGuess({ gh, branch, milestoneUrl, pane });
+    // `repo` / `repoKnown` let the dialog name the repository a typed number
+    // is in, and refuse one when the directory has no GitHub remote. A guess
+    // without a URL ("PR #12" in the pane) is in the workstream's repository.
+    const ws = await repoP;
+    if (chosen && !chosen.url && ws.repo) chosen = { ...chosen, url: prUrlFor(ws.repo, chosen.number) };
+    // The prompt body the dialog shows (and lets the user edit) before Start;
+    // `{{pr}}` / `{{url}}` are filled in for whichever PR is confirmed. The
+    // footer (attribution for anything the reviewer posts) is shown, not
+    // editable, and names the reviewer: one per entry of `reviewers`.
+    const template = await templateP;
+    res.json({
+      guess: chosen, branch, ghError, repo: ws.repo, repoKnown: ws.known,
+      promptTemplate: template.template, promptSource: template.source, promptSourceLabel: template.label,
+      promptWarnings: template.warnings, promptFooter: reviewPromptFooter(reviewerName(DEFAULT_REVIEWER)),
+      reviewers: REVIEWER_IDS.map(id => ({ id, name: reviewerName(id), note: reviewerNote(id), footer: reviewPromptFooter(reviewerName(id)) })),
+      defaultReviewer: DEFAULT_REVIEWER,
+    });
+  };
+
+  const status: RequestHandler = async (req, res) => {
+    const access = await accessOr404(req, res, 'review');
+    if (!access) return;
+    if (!isProjectAgentConnected(access.host)) {
+      // Offline is unknown, not "no pane": a 503 makes the client keep what it
+      // has, so a deploy-time agent restart does not hide a still-live review.
+      res.status(503).json({ error: "Owner's agent is offline", session: access.session, connected: false });
+      return;
+    }
+    const identity = identityFor(access);
+    let alive = false;
+    let state: ReviewPaneState | null = null;
+    let pr: number | null = null;
+    let url: string | null = null;
+    let startedAt: Date | null = null;
+    let reviewer: string | null = null;
+    try {
+      // A failed RPC is a 503, not "no pane": the client keeps what it has, and
+      // the record (and the ring) survive an agent hiccup. Only a definitive
+      // `exists: false` clears them.
+      const recBefore = getReviewRecord(access.host.instanceId, access.session);
+      const probe = await probeReviewPane(sendForProject, access.host, access.session, recBefore ? { pr: recBefore.pr, url: recBefore.url, reviewer: recBefore.reviewer } : null);
+      // Re-read AFTER the probe: a stop/clear that landed while it was in
+      // flight must not be resurrected by this detached record's result (the
+      // sweep's tick does the same re-read).
+      touchRecordWithProbe(getReviewRecord(access.host.instanceId, access.session), probe, identity, Date.now());
+      // Populate only when the pane is really there: a gone pane answers the
+      // same shape it always did, with nothing stale and running: false.
+      if (probe.exists) {
+        const after = getReviewRecord(access.host.instanceId, access.session);
+        alive = true;
+        state = probe.state ?? after?.state ?? 'reviewing';
+        pr = after?.pr ?? null;
+        url = after?.url ?? null;
+        startedAt = after?.startedAt ?? null;
+        reviewer = after?.reviewer ?? probe.reviewer;
+      }
+    } catch (err) {
+      res.status(503).json({ error: `Could not reach the owner's agent: ${(err as Error).message}` });
+      return;
+    }
+    res.json({
+      session: access.session, connected: true, alive,
+      // `running` is kept for older clients: the reviewer is still in the pane.
+      running: state === 'reviewing' || state === 'waiting' || state === 'done',
+      state, pr, url, startedAt, reviewer,
+    });
+  };
+
+  const start: RequestHandler = async (req, res) => {
+    const { pr, url, prompt, reviewer: rawReviewer } = req.body as { pr?: unknown; url?: unknown; prompt?: unknown; reviewer?: unknown };
+    if (!isPrNumber(pr)) { res.status(400).json({ error: 'pr (positive integer) required' }); return; }
+    if (rawReviewer != null && !isReviewerId(rawReviewer)) {
+      res.status(400).json({ error: `reviewer must be one of ${REVIEWER_IDS.join(', ')}` });
+      return;
+    }
+    const reviewer = rawReviewer ?? DEFAULT_REVIEWER;
+    const body = parseReviewBody(prompt);
+    if (!body.ok) { res.status(400).json({ error: body.error }); return; }
+    const access = await accessOr404(req, res, 'review');
+    if (!access) return;
+    // The checkout's remote is read while the checks below run: on an agent
+    // that is connected but slow it can take seconds (services/reviewRepo.ts).
+    // Nothing is awaited on an early return, so neither promise may reject unseen.
+    const pathsP = workstreamPaths(access);
+    const repoP = pathsP.then(p => workstreamRepo(sendForProject, access.host, p.cwd));
+    repoP.catch(() => {});
+    // Parked-box check on the PROJECT's box, whoever the caller is: the
+    // refuseParkedBox middleware only looks at the caller's own projects, and a
+    // collaborator would otherwise create a pane on a stopping box (its agent
+    // stays connected until EC2 powers it off) that dies with it.
+    const parked = await prisma.project.findUnique({
+      where: { id: access.project.id },
+      select: { id: true, setupStatus: true, instance: { select: { status: true } } },
+    });
+    const parkedError = parked?.instance ? powerStateError(parked.instance.status) : null;
+    if (parkedError) { res.status(409).json({ error: parkedError }); return; }
+    const unready = parked && refuseUnreadySessions(parked);
+    if (unready) { res.status(409).json({ error: unready.message }); return; }
+    if (!isProjectAgentConnected(access.host)) { res.status(503).json({ error: "Owner's agent is offline" }); return; }
+
+    const { cwd, home } = await pathsP;
+    const target = reviewTarget(pr, urlForPr(url, pr), await repoP);
+    if ('refuse' in target) { res.status(400).json({ error: target.refuse }); return; }
+    const cleanUrl = target.url;
+    const promptPath = reviewPromptPath(home, access.session);
+    // No edited body (unedited dialog, mobile, older client): the same
+    // template the dialog would have shown, resolved again now.
+    const template = body.body == null ? await resolveTemplate(access, cwd, home) : null;
+    noteBoxActivity(access.host.instanceId);
+    try {
+      // The prompt goes in a file Devin reads (--prompt-file), never through
+      // shell quoting, so an edited prompt may hold quotes and newlines.
+      await sendForProject(access.host, 'write-file', { path: promptPath, content: buildReviewPrompt(pr, cleanUrl, body.body ?? template!.template, reviewerName(reviewer)), mode: 0o600 }, 5000);
+      // A second Review replaces the running one: fresh shell, fresh reviewer.
+      const has = await sendForProject(access.host, 'tmux-has-session', { sessionName: access.session }, 5000);
+      if (has?.exists) await sendForProject(access.host, 'tmux-kill', { sessionName: access.session }, 5000);
+      await sendForProject(access.host, 'tmux-create', { sessionName: access.session, cwd }, 15000);
+      // Best effort: an older agent answers "Unknown command" and the launch echo covers recovery.
+      await sendForProject(access.host, 'tmux-set-user-option', { sessionName: access.session, name: PR_OPTION, value: encodePrOption(pr, cleanUrl, reviewer) }, 5000).catch(() => {});
+      await new Promise(r => setTimeout(r, SHELL_SETTLE_MS));
+      await sendForProject(access.host, 'tmux-send-keys', {
+        sessionName: access.session, keys: reviewLaunchCommand(access.session, reviewer), withEnter: true, literal: true,
+      }, 5000);
+    } catch (err) {
+      res.status(503).json({ error: `Could not start the review: ${(err as Error).message}` });
+      return;
+    }
+    const rec = registerReviewRecord(identityFor(access), { pr, url: cleanUrl, reviewer }, { startedByUserId: req.user!.id });
+    const startedAt = rec.startedAt;
+    console.log(`[REVIEW] ${access.session}: ${reviewer} review of PR #${pr} started by ${req.user!.id}${target.mismatch ? ` (checkout is ${target.mismatch})` : ''}${body.body ? ' (edited prompt)' : ` (prompt: ${template!.label ?? 'built-in'})`}`);
+    res.status(201).json({ ok: true, session: access.session, pr, url: cleanUrl, reviewer, startedAt });
+  };
+
+  const stop: RequestHandler = async (req, res) => {
+    const access = await accessOr404(req, res, 'review');
+    if (!access) return;
+    if (!isProjectAgentConnected(access.host)) { res.status(503).json({ error: "Owner's agent is offline" }); return; }
+    try {
+      await sendForProject(access.host, 'tmux-kill', { sessionName: access.session }, 5000);
+    } catch (err) {
+      res.status(503).json({ error: `Could not stop the review: ${(err as Error).message}` });
+      return;
+    }
+    // Only after the kill succeeded: a live session must keep its record.
+    clearReviewRecord(identityFor(access));
+    res.json({ ok: true, session: access.session });
+  };
+
+  const seen: RequestHandler = async (req, res) => {
+    const access = await accessOr404(req, res, 'review');
+    if (!access) return;
+    const marked = markReviewSeen(access.host.instanceId, access.session);
+    // A missing record answers 404: nothing to mark. (A pane whose agent is
+    // offline — the sweep froze its state — still marks: seen is about the
+    // viewer, not the agent.)
+    if (!marked) { res.status(404).json({ error: 'No review running for this workstream' }); return; }
+    res.json({ ok: true });
+  };
+
+  // asyncHandler: Express 4 drops async rejections (a DB error, a
+  // SessionAccessError from workstreamPaths) on the floor and the request hangs;
+  // wrapped, they reach apiErrorHandler and answer with JSON.
+  router.get('/projects/:id/review/guess', requireAuth, asyncHandler(guess));
+  router.get('/projects/:id/review', requireAuth, asyncHandler(status));
+  router.post('/projects/:id/review', requireAuth, asyncHandler(start));
+  router.delete('/projects/:id/review', requireAuth, asyncHandler(stop));
+  router.post('/projects/:id/review/seen', requireAuth, asyncHandler(seen));
+  return router;
+}

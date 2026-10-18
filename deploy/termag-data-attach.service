@@ -1,0 +1,19 @@
+[Unit]
+Description=Attach and mount the termag host data volume
+Wants=network-online.target
+After=network-online.target
+
+# Type=simple, never oneshot: the script waits for the previous orchestrator
+# to release the volume, which happens only after this host is serving. A
+# oneshot's start job would hold multi-user.target, and with it cloud-final,
+# which starts the backend -- so this host would never serve and the volume
+# would never be released.
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/termag-data-attach
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,140 @@
+# termag
+
+A workspace manager for running multiple AI coding agents in parallel. Provides a web UI for managing projects, viewing agent terminals, choosing an agent runtime per project, and monitoring usage, with Slack integration for remote control.
+
+## What it does
+
+Each project gets a paired set of tmux sessions: an **agent** pane (where Codex, Claude Code, or other agents run) and a **ctrl** pane (a regular terminal for commands the agent can't run, like sudo or interactive auth). The web UI renders both terminals side-by-side with xterm.js and shows real-time agent status.
+
+### Key features
+
+- **Multi-project management**: create, rename, archive projects; each gets its own tmux sessions and working directory
+- **Live terminal streaming**: xterm.js terminals connected via WebSocket to server-side PTYs attached to tmux
+- **Per-project agent choice**: choose `Codex` or `Claude` when creating a project, with a persisted per-user default
+- **Agent status tracking**: Claude Code hooks and Codex app-server status report working/waiting/idle state; shown as green/yellow/red indicators and a hyperspace animation that speeds up with activity (or a solid background colour of your choice, under Settings → Appearance)
+- **Usage dashboard**: tracks API token usage and cost with a thermometer gauge (today vs 14-day trailing median) and expandable 30-day/7-day histograms
+- **Slack + Discord integration**: `/t` commands to view and control terminals from Slack or Discord; emoji reactions to respond to numbered prompts; `/t create` to create projects from chat
+- **Channel-based routing**: projects get a `#proj-<user>-<project>` Slack channel on creation and each workstream (git worktree) gets `#proj-<user>-<project>-<workstream>`; `/t` commands in those channels auto-route to the right tmux pair without `/t switch`
+- **Slack notifications**: automatic pane capture posted to Slack when an agent needs input, with reaction hints for quick response
+- **Per-user agent architecture**: each user's agent runs as their unix user, handling tmux and filesystem operations with proper permissions
+- **Google OAuth**: multi-user authentication mapped to unix accounts
+
+## Architecture
+
+```
+Browser (React + xterm.js)
+  ↕ WebSocket
+Express server (port 3040)
+  ├── REST API (projects, status, usage, auth)
+  ├── WebSocket: terminal streams, status push
+  ├── Slack Bolt (Socket Mode)
+  └── PostgreSQL (Prisma ORM)
+  ↕ WebSocket
+Per-user agent (node agent.js)
+  ├── node-pty → tmux attach
+  └── Codex bridge processes (per Codex-backed agent session)
+```
+
+## Project structure
+
+```
+backend/          Express + TypeScript server
+  src/
+    routes/       REST endpoints (projects, status, usage)
+    services/     tmux, status, agent registry
+    slack/        Slack bot (events, formatting, LTS relay, home view)
+    middleware/   auth
+  prisma/         schema + migrations
+frontend/         React 18 + Vite
+  src/
+    components/   Terminal, ProjectControl, UsageMini, Hyperspace
+    contexts/     AuthContext, ProjectContext
+    services/     API client
+agent/            Per-user agent (plain JS, no build step)
+relay/            Chrome tab capture relay (runs on laptop)
+deploy/           Systemd units, setup docs, hook configs
+```
+
+## Prerequisites
+
+- **Node.js** 20+
+- **PostgreSQL** 14+
+- **tmux** 3.0+
+- **Apache** 2.4+ with `mod_proxy`, `mod_proxy_http`, `mod_proxy_wstunnel` (or another reverse proxy supporting WebSockets)
+- A **public HTTPS domain**. Google OAuth and Slack callbacks both require it. For local-only use you can run without auth, but the Slack/Discord features won't work.
+
+## Quick start
+
+See [deploy/setup.md](deploy/setup.md) for full setup instructions, including reverse-proxy config and how to wire up Slack and Discord apps.
+
+To run the orchestrator as a **container** instead (Kubernetes, ECS, or plain
+Docker) build the root `Dockerfile` and follow
+[docs/container-deploy.md](docs/container-deploy.md) for the runtime contract:
+health endpoint, env, database, the in-app OIDC sign-in mode, and how boxes
+reach the control plane. The container runs no agents; every project must live
+on a box or a self-managed agent.
+
+```bash
+# Build
+cd backend && npm install && npm run build
+cd ../frontend && npm install && npm run build
+
+# Run
+sudo systemctl start termag          # main server
+systemctl --user start termag-agent  # per-user agent
+```
+
+## Claude Code hooks integration
+
+termag tracks live agent status (working / waiting / idle) by receiving
+status events from Claude Code's `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, and `Stop` hooks. When a Claude session inside a termag
+project pane goes idle and needs input, termag posts the captured pane to
+your Slack channel automatically.
+
+Hook configuration is documented in [deploy/claude-hooks.md](deploy/claude-hooks.md).
+
+## Configuration
+
+All configuration is via environment variables in `backend/.env`. See `.env.example` for the full list.
+
+Key variables:
+- `DATABASE_URL`: PostgreSQL connection string
+- `AUTH_MODE`: the sign-in mechanism. `google` (default) uses in-app Google OAuth; `okta` trusts the identity established at the ALB edge by an `authenticate-oidc` (Okta) action, read from the `x-amzn-oidc-data` header (use only after the ALB actually performs that edge auth); `oidc` runs the OpenID Connect code flow in-app against `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`, for deployments with no ALB edge auth, such as the container behind a Kubernetes ingress.
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`: OAuth credentials (required when `AUTH_MODE=google`)
+- `SESSION_SECRET`: Express session secret
+- `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`: Slack bot
+- `ALLOWED_USERS`: comma-separated allow-list. Each entry is `email:unixuser` (exact mapping), `@domain.com` (anyone in the domain, unix username derived from the email local part), or `@domain.com:unixuser` (anyone in the domain mapped to a fixed unix username). Exact matches take priority over domain wildcards.
+
+## Agent providers
+
+`termag` now persists the selected agent provider on each `agent` workflow.
+
+- `codex` projects launch the managed Codex bridge and start `codex --remote` in the `*-agent` tmux pane
+- `claude` projects keep the existing Claude startup path
+- each user also has a saved `defaultAgentProvider`, used to initialize the create-project form
+
+The UI lets you:
+- choose `Codex` or `Claude` when creating a new project
+- change your default agent provider in the sidebar
+- check the current provider in the project list (`CX` / `CL`)
+
+## Boxes: EC2 vs self-managed
+
+A **box** is a compute instance an agent runs on. Each box gets its own
+instance-bound agent token, so a single user can run **several boxes at once**;
+projects route to a box via `Project.instanceId`. (A plain per-user agent token,
+by contrast, only holds one registry slot at a time, so two machines sharing one
+would just kick each other off.)
+
+Two kinds, both created from the **Boxes** section of the UI:
+
+- **EC2** (default): the orchestrator provisions an AWS box for you via the SDK
+  (see [docs/box-provisioning.md](docs/box-provisioning.md)). The token rides in
+  `user_data` and never leaves the server.
+- **Self-managed**: tick *"self-managed (run agent on my own machine)"* when
+  adding a box. No AWS is touched; the UI returns a one-time `agent.config.json`
+  snippet (`termag_url` + `token`) to paste onto your own machine (laptop,
+  devbox, anything). Start the termag agent there and the box flips from
+  `awaiting agent…` to `ready`. Removing the box just revokes the token; stop
+  the agent on that machine yourself.

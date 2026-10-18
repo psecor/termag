@@ -1,0 +1,358 @@
+# Orchestrator-driven box provisioning ("Add box" button)
+
+**Status:** implemented. The design below shipped as
+`backend/src/services/boxProvisioner.ts`, wired into `backend/src/routes/instances.ts`
+and the UI's "Add box" button. Steps 1 to 5 of [Implementation order](#implementation-order)
+are done. Step 6, deleting `terraform/box/`, is not.
+
+## Goal
+
+Add an **Add box** button to the orchestrator UI that bootstraps a new EC2
+compute instance via the AWS SDK and attaches it to the requesting user as an
+agent — replacing today's V1 flow where the user runs `terraform apply`
+themselves.
+
+## Background: what already exists
+
+This feature is the natural completion of the box-CRUD that is currently
+stubbed as "user-driven Terraform." Most of the skeleton is already present.
+
+| Layer | File | State |
+|-------|------|-------|
+| Backend CRUD | `backend/src/routes/instances.ts` | `POST` creates an `Instance` row (`status: provisioning`) + a per-box `AgentToken` atomically and returns the raw `tmag_` token once. `DELETE` archives projects, revokes tokens, marks `terminated`. Both currently expect the *user* to run terraform. |
+| Agent registry | `backend/src/services/agentRegistry.ts` | Dual-keyed (`instanceAgents` by `instanceId`). When a box dials `ws://<host>:3040/termag/ws/agent` with `Authorization: Bearer <token>` (older agents: `?token=…`, see `auth/agentWsToken.ts`), `validateAgentToken` resolves token→`{user, instance}` and `registerAgent` flips the Instance to `ready` and reconstructs its sessions. **Needs no changes.** |
+| WS auth | `backend/src/index.ts` (`/ws/agent`) | `validateAgentToken` (in `routes/agentTokens.ts`) looks up `tokenHash`, returns `{user, instance}`. **Needs no changes.** |
+| Box shape (reference) | `terraform/box/` | V1 Terraform: egress-only SG, IMDSv2 instance, `cloudinit.sh.tftpl` that writes `agent.config.json {termag_url, token, path_remap}` and starts the agent systemd user unit. |
+| Box AMI | `packer/` | Prebakes repo, agent CLIs, `termag` user + linger, the `termag-agent.service` unit. |
+| Guardrails | your IAM-grant Terraform (the orchestrator module's box-provisioning grant) | IAM grant + outputs (`box_resource_prefix`, `box_permissions_boundary_arn`, `box_managed_tag`, `agent_ws_url`) built specifically so the orchestrator can launch boxes via the SDK within a locked blast radius. |
+
+**The missing piece is the bridge:** a backend service that, instead of handing
+the user a token to paste into Terraform, calls the AWS SDK itself to launch the
+box. The frontend has **zero** box UI today (no button, no `instancesApi`).
+
+## Design decisions
+
+1. **Box token delivery:** baked into `user_data` (inline), matching the
+   existing `terraform/box/cloudinit.sh.tftpl`. (See Security below — this is no
+   weaker than the `agent.config.json` the agent must read anyway.)
+2. **Box IAM identity:** a **per-box role with the permissions boundary**, as
+   the 0.3.0 grant enforces (`iam:CreateRole` is denied without the boundary).
+3. **AMI selection:** **discover newest by tag** (`App=termag, Component=box`),
+   so no redeploy is needed when a new AMI is baked.
+
+## Architecture
+
+The button `POST`s to the existing `POST /api/instances`. The endpoint keeps
+doing its DB + token work, then kicks off **async** AWS provisioning and returns
+immediately with `status: provisioning`. The box boots, cloud-init starts the
+agent, the agent dials in, and `registerAgent` flips it to `ready` — the UI
+just polls/streams that status. No request blocks on a multi-minute EC2 boot.
+
+```
+[Add box] → POST /api/instances
+              ├─ tx: create Instance(provisioning) + AgentToken (existing)
+              └─ provisionBox(...)  (async, not awaited)
+                    ├─ DescribeImages  (newest App=termag,Component=box)
+                    ├─ CreateSecurityGroup  (egress-only, ManagedBy tag)
+                    ├─ AuthorizeSecurityGroupIngress on HOST SG (3040 from box SG)
+                    ├─ CreateRole(+boundary) → AttachRolePolicy SSM core → InstanceProfile
+                    └─ RunInstances  (AMI, arm64 type, subnet, SG, profile,
+                                      IMDSv2, tags, user_data=cloud-init+token)
+                          ↓ EC2 boots, cloud-init starts agent
+                          ↓ agent dials ws://<host>:3040/termag/ws/agent (Authorization: Bearer …)
+                       registerAgent → Instance.status = ready
+```
+
+## Backend changes (`termag/`)
+
+### New: `backend/src/services/boxProvisioner.ts`
+
+Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
+
+`provisionBox({ instance, boxName, owner, token, remoteUnixUser })`:
+1. `DescribeImages` filtered `tag:App=termag, tag:Component=box`, sort by
+   `CreationDate`, take newest → `amiId`.
+2. `CreateSecurityGroup` `<BOX_RESOURCE_PREFIX>-<box>` in `BOX_VPC_ID`,
+   egress-only, tag-on-create `ManagedBy=$BOX_MANAGED_TAG` + `Owner`/`BoxName`.
+3. `AuthorizeSecurityGroupIngress` on `HOST_SECURITY_GROUP_ID`: 3040 from the new
+   box SG (grant's `Ec2BoxIngressToHost`). The box reaches the backend directly
+   over the private VPC network, not through the ALB.
+4. Per-box IAM: `CreateRole` `<BOX_RESOURCE_PREFIX>-<box>` **with
+   `PermissionsBoundary=BOX_PERMISSIONS_BOUNDARY_ARN`** (denied otherwise);
+   `AttachRolePolicy` `AmazonSSMManagedInstanceCore`; if
+   `BOX_GIT_TOKEN_SECRET_ARN` set, add an inline read policy for just that ARN;
+   if `BOX_ECR_PULL_REPOSITORY_ARNS` set, add the pull-only `termag-box-ecr-pull`
+   inline policy (`services/boxEcrPolicy.ts`; existing box roles are backfilled
+   at startup by `backfillBoxEcrPullPolicies`);
+   `CreateInstanceProfile` + `AddRoleToInstanceProfile`.
+5. `RunInstances`: `amiId`, `BOX_INSTANCE_TYPE` (**must be arm64/Graviton** — the
+   AMI is arm64-only), `BOX_SUBNET_ID`, box SG, instance profile, IMDSv2
+   required, `TagSpecifications` (`Name=<prefix>-<box>`, `ManagedBy`, `Owner`,
+   `BoxName`), `UserData` = base64 of a TS port of `cloudinit.sh.tftpl` with the
+   token inlined and `termag_url=AGENT_WS_URL`.
+6. Each handle is persisted the moment its resource exists: `region` +
+   `securityGroupId` after `CreateSecurityGroup`, `iamRoleName` after
+   `CreateRole`, `iamInstanceProfileName` after `CreateInstanceProfile`,
+   `ec2InstanceId` after `RunInstances`, then `hostname` (best effort: a failed
+   write is logged and never fails a box that is already running). A launch
+   cut short (restart, SDK error) therefore leaves a row that teardown can
+   clean up from, and teardown only marks itself finished if none of these
+   handles changed while it ran.
+
+`terminateBox(instance)`: `TerminateInstances` (tag-scoped) → revoke the ALB
+ingress rule → delete SG (after the instance is gone) → detach/delete role +
+instance profile + every inline policy `ListRolePolicies` reports. (No secret
+to delete, since the token lives in `user_data`.) A resource that is already
+gone (`InvalidInstanceID.NotFound`, `InvalidGroup.NotFound`, `NoSuchEntity`)
+counts as done, so re-running a teardown costs a few NotFound answers. The
+route and pool retirement mark the row `terminated` first and tear down in
+the background, so only a run where every step succeeded stamps
+`Instance.cleanedUpAt`. The provisioning sweep re-runs teardown, a few per
+tick, for terminated ec2 rows without it once `BOX_TEARDOWN_RETRY_SECONDS`
+(10 min) have passed since both termination and the last attempt
+(`cleanupAttemptedAt`, stamped through a guarded update so one row is never
+torn down twice at once).
+
+**Cloud-init port:** copy from `terraform/box/cloudinit.sh.tftpl`, **not** from
+packer's comment. The baked `termag-agent.service` runs
+`agent.js <home>/src/termag/agent/agent.config.json` (argv), so the config must
+land at `~termag/src/termag/agent/agent.config.json` — which is what the
+`terraform/box` template does. (packer's `setup.sh` comment claiming
+`~/.config/termag/agent.config.json` is stale/wrong; see Known issues.)
+
+### `backend/src/routes/instances.ts`
+
+- `create`: after the existing `$transaction`, fire `provisionBox(...)`
+  un-awaited (returns `provisioning` instantly; on `RunInstances` error set
+  `status: failed` + the new `provisioningError` column).
+- `terminate`: call `terminateBox` (actually destroy the EC2) instead of the
+  "run `terraform destroy`" hint.
+- Add a stuck-`provisioning` sweep → `failed` after N minutes with no agent.
+
+### `backend/prisma/schema.prisma`
+
+`Instance` gains `securityGroupId String?`, `iamRoleName String?`,
+`provisioningError String?`; `status` now also takes `failed`. Picked up by the
+existing `prisma db push` in cloud-init.
+
+### `backend/.env` (via the module's Secrets Manager secret)
+
+`AWS_REGION`, `AGENT_WS_URL`, `BOX_RESOURCE_PREFIX`,
+`BOX_PERMISSIONS_BOUNDARY_ARN`, `BOX_VPC_ID`, `BOX_SUBNET_ID`,
+`BOX_INSTANCE_TYPE`, `HOST_SECURITY_GROUP_ID`, optional
+`BOX_GIT_TOKEN_SECRET_ARN`, optional `BOX_ECR_PULL_REPOSITORY_ARNS`. Most are already module outputs.
+
+## Frontend changes (`termag/`)
+
+- `instancesApi` (list/get/create/terminate) in `frontend/src/services/api.ts`.
+- A **Boxes** sidebar section in `App.tsx` with the **Add box** button → name
+  modal → `POST` → optimistic row with a `provisioning` spinner that resolves to
+  `ready`/`failed` on poll. Terminate via the existing 409-confirm flow.
+- An instance picker in project-create (`Project.instanceId` already exists).
+- Mirror the existing project-tile patterns.
+
+## Terraform changes
+
+The 0.3.0 grant already covers every SDK call above (`DescribeImages`,
+`CreateSecurityGroup`+tag, `Ec2BoxIngressToAlb`, `CreateRole`-with-boundary,
+`AttachRolePolicy`→SSM, instance-profile, `RunInstances`, `PassRole`,
+tag-scoped `TerminateInstances`). The module side is mostly **surfacing outputs
+into the `.env`** — the consumer's `termag.tf` should feed `box_resource_prefix`,
+`box_permissions_boundary_arn`, `alb_security_group_id`, the VPC/subnet, and
+`agent_ws_url` into the secret payload (today the secret is populated
+out-of-band for OAuth only).
+
+## How `packer/` and `terraform/box/` fit
+
+- **`packer/` is load-bearing — keep it.** It builds the AMI that "discover
+  newest by tag" finds and that `RunInstances` boots. It prebakes everything
+  slow/stable: system packages, AWS CLI v2, Node LTS, `gh`, the `termag` user
+  **with linger**, the agent CLIs (claude/codex/pi/cursor/devin), the termag checkout
+  being baked cloned (full history) to `~termag/src/termag` + the agent's
+  `npm install`, and the
+  `termag-agent.service` user unit. The SDK only injects per-box runtime config
+  on top.
+  - The **tag contract is now an API** — don't change `App=termag,
+    Component=box` casually. Note `amazon-ebs` now tags its raw output
+    `Component=box-base`; a post-processor re-registers it with NitroTPM and
+    moves `Component=box` onto the NitroTPM image (see below). Discovery
+    (`Component=box`) is unchanged — it just resolves to the NitroTPM AMI.
+  - **The AMI's snapshot size is the floor for a box's root volume.** Neither
+    provisioning path hardcodes it: `boxProvisioner.ts`'s `resolveRootDevice`
+    and `terraform/box`'s `local.root_volume_gb` both read the root device and
+    its size off the discovered image and launch with
+    `max(configured, AMI snapshot)`. So growing the AMI needs no matching
+    change to `BOX_ROOT_VOLUME_GB`, `terraform/box/variables.tf`, or a
+    redeploy of the orchestrator — which is what broke provisioning on
+    2026-09-16, when the image went 50 → 120GB while the running orchestrator
+    still asked for 50 and EC2 refused the launch. The device *name* comes
+    from the image too: a mapping for a device the AMI does not boot from
+    attaches an extra volume rather than resizing the root.
+  - **NitroTPM (TPM 2.0) is baked into the AMI** (`TpmSupport=v2.0` +
+    `BootMode=uefi`). Instances inherit it automatically — `RunInstances`/the
+    SDK provisioner needs **no** TPM flag. Just keep `BOX_INSTANCE_TYPE` on a
+    NitroTPM-supported type (all current Graviton families qualify). See
+    `packer/README.md` → "NitroTPM" and `scripts/enable-nitrotpm.sh`.
+  - AMI is **arm64-only** → `BOX_INSTANCE_TYPE` must be Graviton.
+  - The termag source on a box is **this checkout, not a remote clone**:
+    `packer/scripts/bundle-source.sh` bundles the commit being baked (full
+    history, no credentials) and `setup.sh` clones it, refusing to bake if
+    HEAD is not the commit the AMI's `TermagSha` tag will name (also written
+    to `~/.termag-baked-sha`). The clone's `origin` is the checkout's own
+    remote URL, so nothing here hardcodes an org.
+  - Rebuilds are automatic on `main`: `publish-ami.yml`'s hourly
+    `check-box-ami` job diffs the published AMI's `TermagSha` against `main`
+    over the inputs that land in the image (`box.pkr.hcl`, the files and
+    scripts it ships, `agent/`, the workflow) and bakes on a difference, or
+    when the image is older than 14 days. After a bake, `build-box` fails
+    unless the published AMI carries `Component=box` and that run's
+    `TermagSha`.
+  - **First boot fixes the baked `/home/termag` path from an index, not a
+    walk.** cloud-init's rename leaves symlink targets and a few text files
+    pointing at `/home/termag`. Finding them at boot (`find -lname` over the
+    home, `grep -rIl` over the toolchain dirs) walked every inode on a volume
+    that EBS restores lazily from the snapshot: 4.5 minutes on the
+    pre-quick-start image, 15.5 minutes once webapp and its caches were
+    baked — longer than the 15-minute stuck-provisioning sweep — to rewrite
+    ~200 symlinks and 3 files. `packer/scripts/index-home-paths.sh`, the last
+    provisioner in `box.pkr.hcl`, takes that walk on the warm bake volume and
+    writes `/var/lib/termag-bake/home-paths/`; cloud-init (both templates)
+    calls `/usr/local/sbin/termag-rewrite-home-paths /home/termag
+    /home/<owner>` (`packer/scripts/rewrite-home-paths.sh`), which touches only
+    the indexed entries and logs counts and elapsed time. Guarded like the
+    rest of steps 3–4: a missing script or index logs a WARNING and the boot
+    continues. `packer/scripts/home-paths.test.sh` exercises both halves.
+    The other walk was the rename itself: `usermod -m` renames the home and
+    then stats every file under it (100,377 `newfstatat` calls for 100,003
+    files, measured) to fix ownership that does not change; on the quick-start
+    image that was another 4 minutes. Step 2 now does the `mv` itself and
+    passes `usermod` no `-m`, so cold boot is the OS boot plus seconds.
+
+- **`terraform/box/` is the spec, then vestigial.** Everything it declares is
+  what `boxProvisioner` re-creates via the SDK; its `cloudinit.sh.tftpl` is the
+  reference we port to TS. Its IAM choice (shared
+  `AmazonSSMRoleForInstancesQuickSetup`) is **superseded** by the
+  per-box-role+boundary decision. Recommendation: keep it through
+  implementation as the cloud-init reference + a break-glass manual path, then
+  **delete it** once the button flow is proven — mirroring how
+  the internal Terraform deleted its standalone box module
+  ("box lifecycle is owned by the termag backend codebase now").
+
+## Security analysis: token in `user_data`
+
+**What's in `user_data`:** only the per-box agent bearer token
+(`tmag_<64 hex>`, SHA-256-hashed in `agent_tokens`, linked to one `Instance` →
+one `userId`), plus `termag_url`, git name/email, and `remote_unix_user`. **No
+OAuth secrets, no DB password, no git PAT.**
+
+> **`BOX_GIT_TOKEN_SECRET_ARN` is a grant with no consumer.** This section used
+> to say a private-repo clone "pulls its PAT from `BOX_GIT_TOKEN_SECRET_ARN` via
+> Secrets Manager at boot". `boxProvisioner.ts` does attach the inline read
+> policy for it, but **nothing reads the secret** — neither
+> `cloudinit.sh.tftpl`, nor the TS port of it, nor `packer/scripts/setup.sh`. Nor
+> is it configured in the current deployment: a `secretsmanager:GetSecretValue`
+> call from a live box returns `AccessDeniedException`, which is what an unset
+> `BOX_GIT_TOKEN_SECRET_ARN` (hence no inline policy) looks like. Treat the
+> capability as designed-but-unbuilt; see
+> [Deferred options](#deferred-options-for-unattended-setup).
+
+**What the token grants:** authenticate a WebSocket as *that box's* agent
+(replacing any existing agent for the same `instanceId`). It is a pure
+application-layer bearer token — **it cannot call any AWS API.** The box's AWS
+blast radius is governed entirely by the instance role + permissions boundary,
+a separate credential the bearer token can't touch. It also can't reach other
+boxes or other users (token→instance→userId is fixed).
+
+**Attack vector:** the box runs attacker-influenced AI agents. Any process on
+the box that does the IMDSv2 dance can read `/latest/user-data` and extract the
+token, then connect to the orchestrator off-box as that box's agent, kick the
+real agent, and MITM that one user's terminal sessions on that one box.
+
+**Why it's largely moot:** the same token already lives on the box in plaintext
+at `~termag/src/termag/agent/agent.config.json` (mode 600, owned `termag`) — the
+agent must read it to authenticate, and everything on the box runs as `termag`.
+So any code that could exfiltrate it from `user_data` can already read it from
+the config file. The per-box-Secrets-Manager alternative does **not** fix this —
+cloud-init would just write the same plaintext into the same config file; it
+only narrows the thin edge of a *non-`termag`* principal reading via IMDS
+(which doesn't really exist on a single-tenant box).
+
+**What actually bounds the risk:**
+1. The token has **zero AWS authority** — the boundary on the instance role is
+   the real ceiling and a leaked bearer token can't escalate.
+2. Scope is **one box / one user** — no lateral movement.
+3. **Replacement rotates it** (`user_data_replace_on_change`); terminate sets
+   `revokedAt`.
+4. The only real way to remove on-box plaintext exposure is **short-lived /
+   exchanged-at-boot session credentials** — a larger change, punted past V1.
+
+Action item: add a one-line comment in the cloud-init generator noting what's in
+`user_data` and that the boundary is the real control.
+
+## What the box role can actually do
+
+Probed from a live box (role
+`example-termag-box-*`) rather than read off the policy, because the
+role cannot introspect itself — `iam:ListRolePolicies` on its own role is denied.
+
+| Call | Result | Consequence |
+|---|---|---|
+| `ssm:GetParameter` on an arbitrary name | `ParameterNotFound`, not `AccessDenied` | the SSM read is **broad, not parameter-scoped** |
+| `ecr:GetAuthorizationToken` | `AccessDenied` | image pulls cannot move to boot time |
+| `secretsmanager:GetSecretValue` | `AccessDenied` | `BOX_GIT_TOKEN_SECRET_ARN` is unset here |
+
+The SSM grant is not something termag adds. The only policies
+`createBoxRole` attaches are `AmazonSSMManagedInstanceCore` and — when
+configured — the git-token inline policy, which is demonstrably absent, so the
+parameter read arrives with the managed policy or the permissions boundary.
+
+## Deferred options for unattended setup
+
+Three things would each remove a human step. All are deliberately **not** being
+done yet; they are recorded here so the reasoning is not re-derived.
+
+1. **Fetch the dev-server token at boot.** Possible today with no IAM change (see
+   above). Not done because it puts a credential on disk at boot on a box whose
+   whole point is running attacker-influenced AI agents — the same reasoning the
+   `user_data` analysis above applies to the agent token. Fetching it on demand,
+   as `make` already does, keeps the exposure window narrow for no real cost.
+
+2. **Configure and consume `BOX_GIT_TOKEN_SECRET_ARN`.** This is the one lever
+   that would let the repo clones move into cloud-init, because it is the only
+   proposed path to git credentials that does not need the owner present. It
+   needs a PAT provisioned into Secrets Manager, the env var set, and a consumer
+   in both cloud-init paths. Worth weighing against handing every box a
+   long-lived org-scoped PAT.
+
+3. **Seed `~/.ssh/authorized_keys` from the owner's GitHub keys.**
+   `https://github.com/<handle>.keys` serves a user's public keys over plain
+   HTTPS with no authentication — verified returning 200 and two keys for a real
+   handle. If cloud-init received a GitHub username it could seed
+   `authorized_keys` at first boot, and SSH-over-SSM (so `scp`, `rsync`, `ssh -L`
+   port forwarding) would work on a fresh box with no interaction and no secret
+   anywhere.
+
+   This is a cheaper variant of the `User.sshPublicKey` column that step 4c was
+   reverted for (`2393f6f`): a handle is far easier to supply than a key, and
+   `cloudinit.sh.tftpl` already takes owner identity, so it is one more template
+   variable. The trade-off is that it installs **every** key on the GitHub
+   account, which may be broader than the owner intends for box access, and it
+   makes GitHub an authority over box login. Until then, the owner adds the
+   key by hand after first connect.
+
+## Known issues to fix alongside
+
+- **packer `setup.sh` stale comment (lines ~146–154):** claims cloud-init writes
+  `~termag/.config/termag/agent.config.json` and pre-creates that dir, but the
+  baked unit's `ExecStart` reads `~/src/termag/agent/agent.config.json`. The
+  `.config/termag` mkdir + comment are dead/wrong (harmless today). Fix in the
+  same PR.
+
+## Implementation order
+
+1. `boxProvisioner.ts` (provision + terminate) + cloud-init TS port.
+2. Wire `instances.ts` create/terminate + schema columns + stuck sweep.
+3. `.env` wiring (module outputs → consumer secret payload).
+4. Frontend `instancesApi` + Boxes section + Add box modal + project picker.
+5. Fix the stale packer comment.
+6. Once proven end-to-end, delete `terraform/box/`.

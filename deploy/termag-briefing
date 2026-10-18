@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# termag-briefing <briefing-id> — compose one daily briefing on this box.
+#
+# The orchestrator starts this as the only process of a tmux session of its
+# own (tmux-create with a command, like termag-claude-runner), so the session
+# lives exactly as long as the run. It:
+#
+#   1. reads the job (prompt, allowed tools, turn cap, model) from
+#      GET <termag>/api/briefings/<id>/job with the box's agent token,
+#   2. runs `claude -p … --output-format json` from ~/.termag/briefing with only
+#      the MetaTerm read tools, METATERM_SEND_KEYS=off forced, and TMUX unset
+#      so termag-status hooks see no session and post nothing,
+#   3. posts the result to POST <termag>/api/briefings/<id>/result, once,
+#      5 seconds, never retried,
+#   4. exits with claude's status.
+#
+# Inference goes the way this box's Claude already goes (the termag gateway
+# with the box token, or the box's own login): nothing is unset for it.
+#
+# Token and server come from the agent config, searched as agent.js and
+# termag-status do; the token goes in curl's config on stdin, never on the
+# command line. TERMAG_URL overrides the server.
+#
+# Env (tests):
+#   TERMAG_AGENT_CONFIG   the agent config
+#   TERMAG_URL            the backend base URL (…/termag)
+#   CLAUDE_BIN            the claude to run
+#   TERMAG_BRIEFING_TIMEOUT  seconds before claude is stopped (default 900)
+
+set -u
+
+id=${1:-}
+case $id in
+  ''|*[!A-Za-z0-9_-]*) printf 'usage: termag-briefing <briefing-id>\n' >&2; exit 2 ;;
+esac
+[ ${#id} -le 64 ] || { printf 'termag-briefing: briefing id too long\n' >&2; exit 2; }
+
+state_dir=$HOME/.termag/briefing
+mkdir -p "$state_dir"
+log_file=$state_dir/$id.log
+find "$state_dir" -maxdepth 1 -name '*.log' -mtime +7 -delete 2>/dev/null || true
+log() { printf '%s termag-briefing[%s]: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$*" >>"$log_file"; }
+
+for tool in jq curl; do
+  command -v "$tool" >/dev/null 2>&1 || { log "$tool not installed"; exit 1; }
+done
+
+find_agent_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# ws(s)://host/termag/ws/agent[?…] -> http(s)://host/termag
+base_from_agent_url() {
+  local url=${1%%\?*}
+  case $url in
+    ws://*)  url="http://${url#ws://}" ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}" ;;
+    *) return 1 ;;
+  esac
+}
+
+config=$(find_agent_config) || { log 'no agent config'; exit 1; }
+token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+[ -n "$token" ] || { log "$config has no token"; exit 1; }
+base=${TERMAG_URL:-}
+if [ -z "$base" ]; then
+  agent_url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || agent_url=
+  base=$(base_from_agent_url "$agent_url") || { log "termag_url '$agent_url' is not an agent URL"; exit 1; }
+fi
+base=${base%/}
+api=$base/api/briefings/$id
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/termag-briefing.XXXXXX") || { log 'mktemp failed'; exit 1; }
+trap 'rm -rf "$tmp"' EXIT
+
+# curl_auth OUT_FILE ARGS… — curl with the bearer header from stdin; prints the HTTP code.
+curl_auth() {
+  local out=$1; shift
+  printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -s -K - -o "$out" -w '%{http_code}' "$@" 2>/dev/null || true
+}
+
+code=$(curl_auth "$tmp/job.json" -m 10 "$api/job")
+if [ "$code" != 200 ]; then
+  log "job not read: $api/job answered ${code:-nothing}"
+  exit 1
+fi
+prompt=$(jq -r '.prompt // empty' "$tmp/job.json" 2>/dev/null) || prompt=
+tools=$(jq -r '(.allowedTools // []) | join(",")' "$tmp/job.json" 2>/dev/null) || tools=
+max_turns=$(jq -r '.maxTurns // 30' "$tmp/job.json" 2>/dev/null) || max_turns=30
+model=$(jq -r '.model // empty' "$tmp/job.json" 2>/dev/null) || model=
+case $max_turns in ''|*[!0-9]*) max_turns=30 ;; esac
+if [ -z "$prompt" ] || [ -z "$tools" ]; then
+  log 'job has no prompt or no allowed tools'
+  exit 1
+fi
+
+# claude: the native install (~/.local/bin) first, then PATH, then the nvm global.
+claude_bin=${CLAUDE_BIN:-}
+if [ -z "$claude_bin" ]; then
+  if [ -x "$HOME/.local/bin/claude" ]; then
+    claude_bin=$HOME/.local/bin/claude
+  elif command -v claude >/dev/null 2>&1; then
+    claude_bin=$(command -v claude)
+  else
+    export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+    claude_bin=$(command -v claude 2>/dev/null || true)
+  fi
+fi
+
+# No tmux session for the hooks (termag-status exits quietly without one), and
+# never a write tool, whatever the box or a project opted into.
+unset TMUX TMUX_PANE
+export METATERM_SEND_KEYS=off
+
+# --allowedTools adds to the owner's own settings rather than replacing them,
+# so a user-scope Bash or Edit grant, or a defaultMode of bypassPermissions,
+# would otherwise carry into this unattended run, which reads untrusted pane
+# and transcript text. Closed for real: --tools "" leaves no built-in tool at
+# all (no shell, no file reads or writes), --strict-mcp-config with this one
+# server drops every other MCP server and its approvals, and dontAsk denies
+# whatever is not on the job's allow list.
+mcp_config='{"mcpServers":{"metaterm":{"type":"stdio","command":"sh","args":["-c","exec \"$HOME/.local/bin/termag-metaterm-mcp\""],"env":{"METATERM_SEND_KEYS_DEFAULT":"off","METATERM_SEND_KEYS":"off"}}}}'
+
+status=127
+if [ -n "$claude_bin" ]; then
+  args=(-p "$prompt" --output-format json --tools "" --strict-mcp-config --mcp-config "$mcp_config"
+    --permission-mode dontAsk --allowedTools "$tools" --max-turns "$max_turns")
+  [ -n "$model" ] && args+=(--model "$model")
+  log "running $claude_bin (tools: $tools, max turns $max_turns${model:+, model $model})"
+  (cd "$state_dir" && timeout "${TERMAG_BRIEFING_TIMEOUT:-900}" "$claude_bin" "${args[@]}" >"$tmp/out.json" 2>"$tmp/err" </dev/null)
+  status=$?
+  cat "$tmp/err" >>"$log_file" 2>/dev/null
+  log "claude exited $status"
+else
+  log 'no claude on this box'
+fi
+
+if jq -e '.result | type == "string"' "$tmp/out.json" >/dev/null 2>&1; then
+  jq --argjson status "$status" '{
+      result: .result,
+      exitStatus: $status,
+      isError: (.is_error // false),
+      usage: .usage,
+      model: (.model // ((.modelUsage // {}) | keys | .[0]))
+    } | with_entries(select(.value != null))' "$tmp/out.json" >"$tmp/body.json"
+else
+  last=$(grep -v '^[[:space:]]*$' "$tmp/err" 2>/dev/null | tail -n 1 | cut -c1-300)
+  case $status in
+    124) reason="timed out after ${TERMAG_BRIEFING_TIMEOUT:-900}s" ;;
+    127) reason='claude not found' ;;
+    *) reason="exited $status" ;;
+  esac
+  jq -n --argjson status "$status" --arg r "claude $reason without a result${last:+: $last}" \
+    '{result: $r, exitStatus: $status, isError: true}' >"$tmp/body.json"
+fi
+
+code=$(curl_auth /dev/null -m 5 -X POST "$api/result" -H 'Content-Type: application/json' --data-binary "@$tmp/body.json")
+case $code in
+  204) log 'result posted' ;;
+  ''|000) log "result not posted: $api/result unreachable" ;;
+  *) log "result not posted: $api/result answered HTTP $code" ;;
+esac
+exit "$status"

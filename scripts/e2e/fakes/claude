@@ -1,0 +1,47 @@
+#!/bin/bash
+# Stand-in Claude Code CLI for the e2e boxes (E2E_FAKE_CLAUDE=1). Keeps its
+# conversation where Claude does (~/.claude/projects/<encoded cwd>/<id>.jsonl),
+# honours --resume <id> and --continue, and reports status through the box's
+# termag-status as Claude's hooks do: idle at the prompt, working while it
+# handles a line. A line starting with "long" stays working, like a long tool
+# call. Re-execs so tmux shows `claude` as the pane command. `-p` runs one
+# Bedrock turn through the gateway settings instead (claude-bedrock.mjs). A
+# positional prompt starts the session on it, as `claude "<prompt>"` does.
+[ -n "${STUB_REEXEC:-}" ] || STUB_REEXEC=1 exec -a claude /bin/bash "$0" "$@"
+# `claude -p … --output-format stream-json`: the simple UI's chat runner
+# (agent/chat-runner.js); a scripted turn with tool calls (claude-stream.mjs).
+if [ "${1:-}" = -p ] || [ "${1:-}" = --print ]; then
+  for a in "$@"; do [ "$a" = stream-json ] && exec node "$(dirname "$0")/claude-stream.mjs" "$@"; done
+fi
+# `claude -p [--model <tier|id>] <prompt>`: one Bedrock turn through the box's
+# termag Claude gateway settings (~/.claude/settings.json), as Claude Code makes it.
+if [ "${1:-}" = -p ] || [ "${1:-}" = --print ]; then shift; exec node "$(dirname "$0")/claude-bedrock.mjs" "$@"; fi
+cwd=$(pwd -P); enc=$(printf '%s' "$cwd" | sed 's#[/.]#-#g'); dir="$HOME/.claude/projects/$enc"; mkdir -p "$dir"
+if [ "${1:-}" = --resume ] && [ -n "${2:-}" ]; then
+  id=$2; f="$dir/$id.jsonl"
+  if [ -f "$f" ]; then
+    echo "claude (stub): resumed conversation $id with $(wc -l < "$f") earlier messages:"
+    jq -r '"  > " + .text' "$f" | tail -5
+  else echo "claude (stub): NO conversation $id under $dir"; fi
+elif [ "${1:-}" = --continue ]; then
+  id=$(find "$dir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n1 | sed 's/^[^ ]* //; s/\.jsonl$//')
+  echo "claude (stub): continuing ${id:-nothing}"
+  [ -n "$id" ] || id=$(cat /proc/sys/kernel/random/uuid)
+else
+  id=$(cat /proc/sys/kernel/random/uuid); echo "claude (stub): new conversation $id in $cwd"
+fi
+f="$dir/$id.jsonl"
+# `claude "<prompt>"`: an interactive session that starts on that prompt (an
+# agent spawn's brief). Kept as the first message.
+if [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then
+  echo "claude (stub): starting on a $(printf '%s\n' "$1" | wc -l)-line prompt:"
+  printf '%s\n' "$1" | head -3 | sed 's/^/  > /'
+  jq -cn --arg t "$1" --arg c "$cwd" '{type:"user",cwd:$c,text:$t}' >> "$f"
+fi
+termag-status idle >/dev/null 2>&1
+while IFS= read -r -p '> ' line; do
+  [[ -z "$line" || "$line" == *$'\e'* || "$line" == *'^['* ]] && continue
+  termag-status working >/dev/null 2>&1
+  jq -cn --arg t "$line" --arg c "$cwd" '{type:"user",cwd:$c,text:$t}' >> "$f"
+  if [[ "$line" == long* ]]; then echo "working on it..."; else echo "noted: $line"; termag-status idle >/dev/null 2>&1; fi
+done

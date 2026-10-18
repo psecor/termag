@@ -1,0 +1,1504 @@
+generator client {
+  provider        = "prisma-client-js"
+  // driverAdapters lets backend/src/db.ts hand Prisma a node-postgres pool
+  // whose password is minted per connection (RDS IAM auth). Without
+  // PG_IAM_AUTH the default engine + DATABASE_URL path is used unchanged.
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String    @id @default(cuid())
+  googleId             String    @unique
+  googleEmail          String    @unique
+  unixUsername         String    @unique
+  displayName          String
+  defaultAgentProvider String    @default("claude")
+  // Boxes get Claude Code settings for the termag Bedrock gateway unless the
+  // user turns this off; off means per-box Claude login.
+  claudeGatewayEnabled Boolean   @default(true)
+  dotfilesRepoUrl      String?
+  // Per-user theme (background mode and colour), validated and defaulted by
+  // src/theme/schema.ts. A fresh row holds {} = all defaults.
+  theme                Json      @default("{}")
+  slackUserId          String?   @unique
+  discordUserId        String?   @unique
+  createdAt            DateTime  @default(now())
+  // Admin authorization. "member" | "admin". Seeded at startup from the
+  // ADMIN_USERS env list (adminSource "env", not demotable from the UI) or
+  // granted by another admin (adminSource "grant").
+  role                 String    @default("member")
+  adminSource          String?
+  userSegmentDaily     UserSegmentDaily[]
+  // Bumped by requireAuth at most once per 5 minutes; the admin directory's
+  // "last seen" column. Null for users who have not signed in since it landed.
+  lastSeenAt           DateTime?
+  // First-run setup wizard finished or skipped; offered while NULL and the user has no projects.
+  onboardedAt          DateTime?
+
+  projects             Project[]
+  agentTokens          AgentToken[]
+  sharedWithMe         ProjectShare[]        @relation("sharedWithMe")
+  sentInvites          ProjectInvite[]       @relation("sentInvites")
+  receivedInvites      ProjectInvite[]       @relation("receivedInvites")
+  visits               ProjectVisit[]
+  warpSamples          WarpSample[]
+  tokenUsage           TokenUsageDay[]
+  instances            Instance[]
+  credentials          UserCredential[]
+  sshPublicKeys        SshPublicKey[]
+  cliSessions          CliSession[]
+  claudeRunnerSessions ClaudeRunnerSession[]
+  claudeSessionEvents  ClaudeSessionEvent[]
+  agentThreads         AgentThread[]
+  agentMessages        AgentMessage[]
+  prDeferrals          PrDeferral[]
+  workstreamPrs        WorkstreamPr[]
+  agentSpawns          AgentSpawn[]
+  agentHandoffs        AgentHandoff[]
+  collabRequests       CollabRequest[]
+  /// The last "Claude Cloud N" handed to this owner; outlives the run rows' 90-day retention.
+  claudeSessionSeq     Int                   @default(0)
+  // Daily briefing schedule, validated and defaulted
+  // by services/briefing/schedule.ts. {} = off: briefings are opt-in.
+  briefingSchedule     Json                  @default("{}")
+  briefings            Briefing[]
+  spaceMemberships     SpaceMember[]
+
+  @@map("users")
+}
+
+// One daily briefing: what the user left open since
+// the previous one and what to pick up next. Composed by a one-shot headless
+// Claude on one of the user's boxes (services/briefing/runner.ts), which posts
+// the result back with the box's agent token. Holds the composed text and the
+// ledger's numbers only, never pane or transcript excerpts.
+model Briefing {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // manual | schedule | slack
+  trigger      String
+  // running | done | failed | skipped
+  status       String
+  // Why a run failed or was skipped, in words the card shows.
+  error        String?
+  // The window reviewed: since the previous done briefing, capped
+  // (services/briefing/window.ts), and the timezone its label is written in.
+  since        DateTime
+  until        DateTime
+  tz           String
+  // "Fri 9 Oct 16:00 to Mon 12 Oct 07:00 (2 days 15 hours)".
+  windowLabel  String
+  // How the window was chosen (BriefingWindow.basis): since_last | first | capped | explicit.
+  windowBasis  String    @default("since_last")
+  // The box the review ran on; null while skipped (no box ready).
+  instanceId   String?
+  // "<userId>:<local day>" for scheduled rows, so one per user per day even
+  // with two overlapping orchestrator processes; null for manual runs.
+  scheduleKey  String?   @unique
+  // Also DM the result on Slack (scheduled runs, and "Run again" from Slack).
+  deliverSlack Boolean   @default(false)
+  slackSentAt  DateTime?
+  // BriefingContent (services/briefing/content.ts) once done.
+  content      Json?
+  // LedgerTotals, for the stats strip.
+  stats        Json?
+  inputTokens  Int?
+  outputTokens Int?
+  model        String?
+  createdAt    DateTime  @default(now())
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("briefings")
+}
+
+// Laptop SSH public keys, installed in the termag-managed block of every
+// owned EC2 box's ~/.ssh/authorized_keys (services/sshKeySync.ts).
+model SshPublicKey {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  publicKey   String // canonical `type base64 [comment]` line
+  fingerprint String // SHA256:...
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, fingerprint])
+  @@map("ssh_public_keys")
+}
+
+// A `termag` CLI signed in on one device (routes/cliApi.ts). Kept apart from
+// AgentToken so /ws/agent, which only looks there, can never accept one.
+// Valid while used within 7 days and younger than 30 (services/cliAuth.ts).
+model CliSession {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceName  String
+  tokenHash   String    @unique // SHA-256 of the raw token
+  tokenPrefix String // display only, e.g. "tmcli_a1b2c3d…"
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime  @default(now())
+  revokedAt   DateTime?
+
+  @@index([userId])
+  @@map("cli_sessions")
+}
+
+// One row per Claude Code cloud session the spawn route started on a box
+// (routes/claudeRunner.ts).
+// `orderId` is Anthropic's per-spawn idempotency key. The row is written as the
+// runner is launched and completed by the box's end-of-session report
+// (routes/claudeRunnerEvents.ts), so who ran what for how long is a query over
+// this table as well as over the journal lines.
+model ClaudeRunnerSession {
+  id                String    @id @default(cuid())
+  orderId           String    @unique
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instanceId        String
+  instance          Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  // DEV_INSTANCE of the session on the box (2..), see services/claudeRunnerSpawn.ts.
+  slot              Int
+  startedAt         DateTime  @default(now())
+  // Null while the session runs, or forever when the box never reported the
+  // end (an abrupt kill, or a box whose runner script predates the report).
+  endedAt           DateTime?
+  // The runner script's exit status as the box reported it.
+  exitStatus        Int?
+  // Why the slot was given back, when the box could tell; a short lowercase
+  // token such as the runner's post-session reason. Null otherwise.
+  exitReason        String?
+  // The Anthropic session (cse_...) this run serves.
+  // One session has several runs, each its own order: a re-offer after a
+  // refusal, a resume after the idle release. Null on rows from before the column.
+  sessionId         String?
+  // The surface that created the session (web_claude_ai, desktop_app, ios, ...),
+  // reported by the runner's command hook with the `started` event.
+  clientPlatform    String?
+  // The first line of the session's first prompt, set once by the `title`
+  // event and copied to a new run of the same session; never in the event
+  // log. Owner-only: the admin view leaves it out. The owner may rename it
+  // from the UI (routes/claudeSessions.ts), which sets it on every run.
+  title             String?
+  // The session's ordinal among the owner's sessions, the "3" in "Claude
+  // Cloud 3": assigned when the session's first run is recorded, the same
+  // on every run of the session. Null on rows without a session id, and on
+  // rows from before this column until the startup backfill numbers them.
+  sessionSeq        Int?
+  // Token usage posted from inside the session: cumulative over the run, from its own transcript on every Stop hook and
+  // once more from the post-session hook; the newest post wins (usageAt). Null
+  // until the first post. Read as provider `claude-cloud` by every token report
+  // (services/admin/tokenSource.ts); the usage scanner never sees these sessions.
+  inputTokens       BigInt?
+  outputTokens      BigInt?
+  cacheReadTokens   BigInt?
+  cacheCreateTokens BigInt?
+  usageCalls        Int?
+  model             String?
+  usageAt           DateTime?
+  // From the wrapper's `ended` report (S5): the session directory's size as the
+  // post-session hook measured it, and whether the checkout was kept under
+  // ~/ccr/kept because GitHub did not have all of its work.
+  checkoutBytes     BigInt?
+  kept              Boolean?
+
+  @@index([userId, startedAt])
+  @@index([instanceId, endedAt])
+  @@index([sessionId, startedAt])
+  @@index([userId, sessionSeq])
+  @@map("claude_runner_sessions")
+}
+
+// What happened to a Claude Code cloud session, one row per signal
+//: every spawn
+// outcome, refusals included (`queued` carries the reason the Activity tab
+// shows), the box's `started` and `ended`, the reconciler's `lost`, and an end
+// requested from the UI. Keyed by the Anthropic session id so the runs of one
+// session group together; `orderId` has no foreign key because a refused order
+// never gets a run row. `detail` never holds an email, a token or prompt text.
+// Swept after 30 days (services/claudeSessions.ts).
+model ClaudeSessionEvent {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId  String
+  orderId    String
+  // Null for a refusal that never reached a box.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+  kind       String
+  detail     String?
+  at         DateTime  @default(now())
+
+  @@index([sessionId, at])
+  @@index([userId, at])
+  @@index([orderId])
+  @@map("claude_session_events")
+}
+
+model AgentToken {
+  id          String    @id @default(cuid())
+  name        String // e.g. "macbook", "dev-server", or instance name
+  tokenHash   String    @unique // SHA-256 hash of the token
+  tokenPrefix String // first 8 chars for display (e.g. "tmag_a1b2...")
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  // What the token may do. "agent" (default, every pre-existing row) may open
+  // /ws/agent and call the agent-facing REST routes. "admin" is minted from the
+  // admin UI, accepted by requireAdmin while its owner still has role=admin,
+  // and rejected on /ws/agent so it can never evict a real agent. Laptop
+  // clients (the CLI and its TUI) use cli_sessions, not this table.
+  scope       String    @default("agent")
+  // Null = never expires (agent tokens). Admin tokens default to 90 days.
+  expiresAt   DateTime?
+
+  // Null until the box is claimed: a pool box's token authenticates the box,
+  // not a person.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // When the token was minted for a specific Instance (e.g. an AWS box
+  // boxProvisioner launched), this links to it. Null for legacy per-user
+  // tokens (legacy per-user agents) where the agent picks the host.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([instanceId])
+  @@map("agent_tokens")
+}
+
+model Project {
+  id             String   @id @default(cuid())
+  name           String
+  description    String?
+  color          String? // hex color for UI differentiation
+  slackChannelId String? // Slack channel ID for the main workstream (#proj-<user>-<name>; legacy #proj-<name>)
+  archived       Boolean  @default(false)
+  pinned         Boolean  @default(false)
+  // "normal" for ordinary projects; "metaterm" marks the per-user singleton
+  // control-tower project (pinned, lives on the orchestrator, refuses
+  // rename/archive/share/branch-off). String-not-enum, like Instance.kind.
+  // One MetaTerm per user is enforced by a partial unique index in the
+  // 20260916000000_project_kind migration (NULL instanceId defeats @@unique).
+  kind           String   @default("normal")
+  lastActiveAt   DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // The box this project lives on. Nullable so existing projects (which
+  // live on the user's legacy agent) work unchanged. New projects
+  // created via the box-CRUD UI will set this at create time.
+  instanceId String?
+  instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
+
+  repoUrl           String?
+  repoDefaultBranch String?
+  // none | pending | cloning | ready | failed (services/projectSetup.ts). Only
+  // none and ready allow tmux sessions (services/sessionGate.ts).
+  setupStatus       String  @default("none")
+  setupError        String?
+  // Bumped by Retry; the clone RPC carries it and the box echoes it, so a
+  // report from an earlier attempt is recognised as stale.
+  setupAttempt      Int     @default(0)
+  // The browser session recording (its id) the browser created this
+  // project from, kept for the agent launch the box's clone defers
+  // (services/projectClone.ts), which types it into the launch so the
+  // session's Claude Code spans are filed under that replay
+  // (services/launchCommand.ts); cleared by that launch.
+  launchReplaySessionId String?
+
+  workflows      Workflow[]
+  workstreams    Workstream[]
+  browserTabs    BrowserTab[]
+  shares         ProjectShare[]
+  invites        ProjectInvite[]
+  visits         ProjectVisit[]
+  contextSamples ContextSample[]
+  tokenUsage     TokenUsageDay[]
+  agentThreads   AgentThread[]
+
+  // Name is unique per (user, box). Two boxes can have a project named "termag"
+  // without collision. Legacy projects (instanceId NULL) treat NULL as distinct
+  // per Postgres semantics; the app enforces single legacy "termag" anyway.
+  @@unique([userId, instanceId, name])
+  @@index([userId, archived])
+  @@index([instanceId])
+  @@map("projects")
+}
+
+// Per-minute samples of a project/workstream's Claude context-window occupancy
+// (the badge gauge), persisted for the "context usage over time" reporting.
+// Mirrors WarpSample: an in-memory sampler (services/contextSampler.ts) buckets
+// contextTokens reports per minute and upserts one row per (project, workstream,
+// minute). meanTokens/maxTokens summarize the minute.
+// Daily token totals per (user, host, provider, raw source bucket). Written by
+// services/tokenUsageSampler.ts from the agents' `usage-scan` responses (one
+// row per Claude log directory / Codex cwd / etc.) as ABSOLUTE day totals from
+// an authoritative rescan — so the upsert is idempotent. projectId/workstream
+// are resolved server-side from cwdHint/sourceKey against projectDir(); null =
+// unattributed, kept so user totals stay right. Uniqueness is on the RAW bucket
+// (not the resolved project) so rows can be re-resolved later.
+model TokenUsageDay {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hostKey     String // Instance.id for a box agent, "legacy" for the per-user agent, "poller" for tmux-poller estimates
+  provider    String // claude | codex | mistral | cursor | ...
+  date        String // YYYY-MM-DD. UTC for claude/codex; vibe = local day at session start; poller = server-local
+  sourceKey   String // claude: encoded log dir; codex: cwd hint or ""; vibe / schema-1 agents: ""
+  cwdHint     String?
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  workstream  String?
+  input       BigInt   @default(0)
+  output      BigInt   @default(0)
+  cacheRead   BigInt   @default(0)
+  cacheCreate BigInt   @default(0)
+  reasoning   BigInt   @default(0) // pi only; tagged separately, folded into output at reporting
+  calls       Int      @default(0)
+  estimated   Boolean  @default(false) // poller rows (context-% × window guess), not real counts
+  agentSchema Int      @default(1) // 1 = schema-1 agent (unattributable), 2 = per-directory buckets
+  scannedAt   DateTime
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, hostKey, provider, date, sourceKey])
+  @@index([userId, date])
+  @@index([projectId, date])
+  @@map("token_usage_days")
+}
+
+model ContextSample {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workstream  String // workstream name ("main", etc.)
+  bucket      DateTime // truncated to the minute (UTC)
+  meanTokens  Int
+  maxTokens   Int
+  sampleCount Int
+
+  @@unique([projectId, workstream, bucket])
+  @@index([projectId, bucket])
+  @@map("context_samples")
+}
+
+// A workstream is a parallel effort inside a project — typically a git worktree
+// on a different branch. Every project has at least one (named "main"). The UI
+// collapses single-workstream projects so the user doesn't see a "main" level
+// they didn't ask for. Workflows (tmux session pairs, etc.) attach to the
+// workstream, not the project, so multi-branch parallel work is straightforward.
+model Workstream {
+  id             String         @id @default(cuid())
+  projectId      String
+  project        Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name           String // "main" by default
+  branch         String // git branch this worktree targets
+  slackChannelId String? // Slack channel ID (#proj-<user>-<project>-<workstream>); main uses Project.slackChannelId
+  archived       Boolean        @default(false)
+  lastActiveAt   DateTime       @default(now())
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  workflows      Workflow[]
+  prs            WorkstreamPr[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+  @@map("workstreams")
+}
+
+model Workflow {
+  id        String       @id @default(cuid())
+  type      WorkflowType
+  provider  String?
+  server    String       @default("localhost") // future: ssh to other servers
+  createdAt DateTime     @default(now())
+
+  // projectId is kept during phase 1 for backward compat — phase 2 drops it
+  // and routes everything through workstream → project.
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // The workstream this workflow belongs to. During phase 1 every project has
+  // exactly one workstream named "main", so projectId and workstreamId carry
+  // redundant information.
+  workstreamId String
+  workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+
+  // (projectId, type) was the legacy phase-1 uniqueness — dropped so a
+  // project can carry one agent workflow per workstream.
+  @@unique([workstreamId, type])
+  @@index([workstreamId])
+  @@map("workflows")
+}
+
+enum WorkflowType {
+  agent
+  data
+}
+
+// AgentProvider is now a plain String validated at the application layer
+// via PROVIDER_IDS from backend/src/providers/registry.ts.
+// This avoids a DB migration every time a new provider is added.
+
+model BrowserTab {
+  id       String   @id @default(cuid())
+  url      String
+  title    String
+  favIcon  String?
+  windowId Int? // Chrome window ID from CDP snapshot
+  addedAt  DateTime @default(now())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@map("browser_tabs")
+}
+
+// Notification targets — which channels to notify when a tmux session needs input.
+// One entry per session+platform+instance. instanceId "" is the orchestrator and
+// any row written before instance identity existed.
+model NotificationTarget {
+  tmuxSession String
+  platform    String
+  instanceId  String   @default("")
+  channel     String
+  userId      String
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@id([tmuxSession, platform, instanceId])
+  @@map("notification_targets")
+}
+
+// Working time accumulated from status transitions (working → idle/waiting)
+model WorkTimeEntry {
+  id         String   @id @default(cuid())
+  username   String
+  project    String
+  provider   String
+  date       String // YYYY-MM-DD
+  totalMs    Int      @default(0)
+  sessions   Int      @default(0)
+  // "" is the orchestrator and rows written before instance identity existed.
+  instanceId String   @default("")
+  updatedAt  DateTime @updatedAt
+
+  @@unique([username, project, provider, date, instanceId])
+  @@index([username, date])
+  @@map("work_time_entries")
+}
+
+// Write-through copy of the in-memory live status (services/status.ts), so a
+// backend restart or host replacement re-reads it instead of showing every
+// pill as not_running. Written on transitions and meta changes only; rows
+// untouched for 24 h are ignored and pruned at startup (statusPersistence.ts).
+model SessionStatus {
+  // Instance.id, or "" for the orchestrator: Postgres treats NULLs as distinct
+  // in a primary key. Same convention as WorkTimeEntry.instanceId.
+  instanceKey      String
+  session          String
+  status           String
+  updatedAt        DateTime
+  // Open "working" span: the first transition out of working after a restart
+  // banks from here, so the span survives the restart.
+  workingStartedAt DateTime?
+  provider         String?
+  source           String?
+  message          String?
+  waitingReason    String?
+  threadId         String?
+  contextTokens    Int?
+  rateLimited      String?
+  // SessionMilestone: { kind, url, at (ISO), contextTokens }
+  milestone        Json?
+  // When the session last came to rest (working/waiting → idle/not_running);
+  // the sidebar's "stopped since you looked" marker reads it.
+  stoppedAt        DateTime?
+
+  @@id([instanceKey, session])
+  @@index([updatedAt])
+  @@map("session_statuses")
+}
+
+// Project sharing — grants another user access to a project's tmux sessions
+model ProjectShare {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String // the collaborator (invitee)
+  user      User     @relation("sharedWithMe", fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_shares")
+}
+
+// Pending invitations to share a project
+model ProjectInvite {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  inviterId String
+  inviter   User     @relation("sentInvites", fields: [inviterId], references: [id])
+  inviteeId String
+  invitee   User     @relation("receivedInvites", fields: [inviteeId], references: [id])
+  status    String   @default("pending") // pending | accepted | declined
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, inviteeId])
+  @@map("project_invites")
+}
+
+// Append-only log of project context switches.
+// One row per setActiveProject() call where the project actually changed.
+// Powers switches/day, mean dwell, stdev between switches stats.
+model ProjectVisit {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId         String?
+  project           Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  previousProjectId String?
+  timestamp         DateTime @default(now())
+  sessionTag        String? // per-browser-tab UUID
+  // Workstream the visit landed on; null for rows older than the column
+  // (read as "main"). A same-project row with a different workstream is a
+  // workstream switch, which the "switches" stats deliberately ignore.
+  workstream        String?
+
+  @@index([userId, timestamp])
+  @@index([projectId, timestamp])
+  @@map("project_visits")
+}
+
+// Per-minute rollup of the hyperspace targetWarp value (the synthesized
+// activity score). Frontend posts raw samples every 5s; backend aggregates
+// into per-minute buckets in-memory and flushes here.
+model WarpSample {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bucket      DateTime // truncated to minute (UTC)
+  meanWarp    Float
+  maxWarp     Float
+  p95Warp     Float
+  sampleCount Int
+  activeMs    Int // ms in this bucket where warp > idle threshold
+
+  @@unique([userId, bucket])
+  @@index([userId, bucket])
+  @@map("warp_samples")
+}
+
+// A per-user compute box (typically an EC2 instance that boxProvisioner
+// launches with the AWS SDK). Hosts the user's tmux sessions and runs the
+// termag agent. Replaces the legacy 1-agent-per-user model with
+// N-agents-per-user, keyed by instance.
+//
+// Non-EC2 hosts (the user's Mac, the orchestrator's own host) can be
+// represented here too with ec2InstanceId = null, but the V1 box-CRUD
+// only creates AWS-backed rows.
+model Instance {
+  id String @id @default(cuid())
+
+  // Null means an unclaimed warm-pool box, which belongs to nobody until it is
+  // claimed. `status` is the discriminator: "warming" and "warm" rows have no
+  // owner, every other status has one.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String // user-supplied, e.g. "peter-laptop", "peter-heavy"
+
+  // How this box is managed:
+  //   ec2       — orchestrator-provisioned EC2 box (boxProvisioner owns its
+  //               AWS lifecycle: SG, IAM, RunInstances, TerminateInstances).
+  //   external  — self-managed / BYO host (the user's own laptop, devbox, or
+  //               any machine). The orchestrator never touches AWS for these;
+  //               it just mints an instance-bound token the user drops into
+  //               their agent.config.json. Lets one user run several distinct
+  //               machines at once, each keyed by instanceId in agentRegistry
+  //               (a plain per-user token can only hold one slot at a time).
+  kind String @default("ec2")
+
+  // AWS coordinates. All nullable so the model can describe non-EC2 boxes
+  // (e.g. kind="external", where every AWS field stays null).
+  // securityGroupId / iamRoleName are the per-box resources boxProvisioner
+  // creates via the SDK; terminateBox uses them to tear everything down.
+  ec2InstanceId String? @unique
+  region        String?
+  hostname      String? // private DNS or private IP; mostly diagnostic
+
+  // Reported by the agent in its `hello` frame on connect: the unix user it
+  // runs as and that user's home directory. Both stay null for an agent old
+  // enough not to send `hello`, so every reader must fall back.
+  hostUnixUser      String?
+  hostHome          String?
+  // Host pressure from the agent (hello and the host-sample RPC): disk used under the home filesystem,
+  // memory used, the one-minute load, and the Claude runner checkouts kept
+  // under ~/ccr/kept. Null until an agent that samples has connected.
+  diskUsedPct       Int?
+  memUsedPct        Int?
+  load1             Float?
+  keptCheckouts     Int?
+  hostSampledAt     DateTime?
+  // The last run of termag-box-update on the box, as the box reported it
+  // (POST /api/box-update/report; services/boxUpdateReport.ts): when, the one
+  // outcome word (updated, deferred, failed, skipped, current), the step
+  // tokens behind it, and the commit the checkout ended on. Null until a box
+  // whose script reports has run.
+  lastUpdateAt      DateTime?
+  lastUpdateOutcome String?
+  lastUpdateDetail  String?
+  lastUpdateCommit  String?
+
+  securityGroupId        String? // per-box egress-only SG (also gets an ALB ingress rule)
+  iamRoleName            String? // per-box role (== instance-profile name)
+  // The instance profile, recorded once it exists. The role is created first,
+  // so iamRoleName alone cannot tell teardown whether the profile came after.
+  iamInstanceProfileName String?
+
+  // Logical status — set by the backend's box-CRUD path. The EC2 instance
+  // has its own state ("running", "stopped", etc.) that we query on demand
+  // rather than caching here.
+  //   provisioning   — SDK launching, EC2 booting, agent not yet seen (ec2)
+  //   awaiting-agent — external box created, waiting for its self-run agent
+  //                    to dial in (external; no AWS work happens)
+  //   warming        — ownerless pool box booting and running its on-warm steps
+  //   warm           — ownerless pool box, agent connected and on-warm
+  //                    succeeded; claimable
+  //   ready          — agent has connected at least once
+  //   stopping       — owner asked EC2 to stop the box; the power sweep
+  //                    settles it to stopped from the EC2 state (ec2)
+  //   stopped        — EC2 instance stopped; only its EBS volumes cost (ec2)
+  //   starting       — owner asked EC2 to start or resume it; the agent's
+  //                    connect makes it ready again (ec2)
+  //   hibernating    — owner asked EC2 to hibernate the box; the power sweep
+  //                    settles it to hibernated (ec2, hibernationConfigured)
+  //   hibernated     — EC2 instance stopped with its RAM saved to the root
+  //                    volume; a start resumes it rather than booting it.
+  //                    Never replaced on start, unlike stopped (ec2)
+  //   failed         — provisioning errored (see provisioningError) or the box
+  //                    never dialed in within the stuck-provisioning window
+  //   terminated     — instance gone (kept for history; cleanup is a sweep)
+  status            String    @default("provisioning")
+  provisioningError String? // populated when status flips to failed
+  createdAt         DateTime  @default(now())
+  terminatedAt      DateTime?
+
+  // Teardown of a terminated ec2 box's AWS resources (terminateBox). The route
+  // and pool retirement mark the row `terminated` first and tear down in the
+  // background, so a restart can cut a teardown short; cleanedUpAt stays null
+  // until every step has succeeded or found its resource already gone, and the
+  // provisioning sweep re-runs teardown for terminated rows still missing it.
+  // cleanupAttemptedAt is the latest start, stamped through a guarded update so
+  // a teardown already in flight is never started a second time.
+  cleanedUpAt        DateTime?
+  cleanupAttemptedAt DateTime?
+
+  // When the agent on this box was last seen connected to the orchestrator.
+  // Drives future "idle eviction" logic in the pool model.
+  lastConnectedAt DateTime?
+
+  // First time this box's agent ever dialed in, written once on the
+  // provisioning -> ready transition and never overwritten. Every reconnect
+  // overwrites lastConnectedAt, so only readyAt - createdAt measures how long
+  // cold provisioning took. A pool box never gets one: its guard is
+  // status "provisioning", and warmedAt is the equivalent warm measurement.
+  readyAt DateTime?
+
+  // Warm pool. Only pool boxes populate these.
+  poolSpecHash          String? // pool spec this box launched from, re-compared against the current hash each reconciler tick
+  warmedAt              DateTime? // when the box became claimable; claim order is oldest first
+  claimedAt             DateTime? // start of the claim latency budget
+  // Stamped on socket close, and deliberately NOT cleared on reconnect: the
+  // connect write races the close write, so a reader compares the two columns
+  // instead. A live agent is `agentDisconnectedAt IS NULL OR < lastConnectedAt`,
+  // and a warm box whose agent has been gone too long is failed, not claimed.
+  agentDisconnectedAt   DateTime?
+  onWarmStatus          String? // pending | running | succeeded | failed
+  onWarmLog             String? // last 4 KB of the on-warm runner's log, for the failure case
+  onClaimStatus         String? // pending | running | succeeded | failed | skipped
+  onClaimError          String? // one line, shown in a UI badge tooltip
+  githubDeliveredAt     DateTime?
+  repoPromptDismissedAt DateTime?
+
+  // The AMI the box was launched from, and how it was chosen
+  // (services/boxImage.ts): published, channel:<name>, pinned, or
+  // fallback:<what the owner's box-image flag asked for> when that image was
+  // unusable and the box got the published one. Null for boxes launched
+  // before these were recorded, and for external boxes.
+  imageId     String?
+  imageSource String?
+
+  // Hibernation. EC2 only accepts HibernationOptions at RunInstances, so this
+  // is written once at launch and is false forever for every box launched
+  // before it (or from an AMI without the hibernation bake).
+  hibernationConfigured Boolean   @default(false)
+  // When the box last hibernated; kept through a start so a resume that
+  // doesn't take falls back to hibernated, cleared by the next stop or
+  // hibernate request. EC2 supports at most 60 days hibernated.
+  hibernatedAt          DateTime?
+  // The power sweep resumed this box to restart the 60-day clock and will
+  // hibernate it again once its agent connects.
+  rehibernatePending    Boolean   @default(false)
+
+  // Automatic lifecycle (services/boxLifecycle.ts).
+  // Only boxes with hibernationConfigured take part. Null is off.
+  idleHibernateHours Int?
+  // Last human input or agent `working` status on the box, throttled to a
+  // write a minute (services/boxActivity.ts). System actions never bump it.
+  lastActivityAt     DateTime?
+  // When the box went to hibernated and stayed there: set on the first
+  // settle, kept through the 60-day refresh, cleared by an owner's start.
+  parkedAt           DateTime?
+  // One line the box list shows about the last automatic action.
+  lifecycleNote      String?
+  // Terminate after this many days parked (hibernated). Null is off.
+  hibernatedTerminateDays Int?
+  // The agent's `unsaved-work` scan, run just before each automatic
+  // hibernate, and when. A scan older than lastActivityAt doesn't count.
+  unsavedWork          Json?
+  unsavedWorkCheckedAt DateTime?
+  // Set when the lifecycle sweep terminated the box; the box list shows it
+  // for a week afterwards.
+  autoTerminatedAt     DateTime?
+
+  // The box whose own credentials created this one through the CLI
+  // (`termag box create` / `project create --new-box` run on a box), null for
+  // every other box. The parent may remove it.
+  parentInstanceId String?
+  parent           Instance?  @relation("InstanceParent", fields: [parentInstanceId], references: [id], onDelete: SetNull)
+  children         Instance[] @relation("InstanceParent")
+
+  projects             Project[]
+  agentTokens          AgentToken[]
+  claudeRunnerSessions ClaudeRunnerSession[]
+  claudeSessionEvents  ClaudeSessionEvent[]
+  spaceBoxes           SpaceBox[]
+
+  // Uniqueness on (userId, name) is enforced by a PARTIAL unique index that
+  // EXCLUDES terminated boxes, so a terminated box's name can be reused. Prisma
+  // can't express partial uniques in the schema, so the index is created in the
+  // migration 20260902000000_instance_name_partial_unique instead of via
+  // @@unique here. (`prisma migrate dev` will report this index as drift — it's
+  // intentionally managed by that migration; `migrate deploy` applies it as-is.)
+  // Postgres treats nulls as distinct, so ownerless pool rows never collide on
+  // that index and it needs no change.
+  @@index([userId, status])
+  @@index([parentInstanceId])
+  @@map("instances")
+}
+
+// Every request to the admin REST surface or the admin MCP server, reads
+// included. Who (actor + the admin token if one was used), which surface, what
+// action, a summary of the arguments, and how it ended. Never pruned
+// automatically.
+model AdminAuditLog {
+  id      String   @id @default(cuid())
+  at      DateTime @default(now())
+  actorId String
+  tokenId String?
+  surface String // rest | mcp
+  action  String // route (METHOD /path) or MCP tool name
+  args    Json?
+  outcome String // ok | denied | not_found | rejected | error (middleware/admin.ts auditOutcome)
+  status  Int? // HTTP status for rest; null for mcp
+
+  @@index([at])
+  @@index([actorId, at])
+  @@map("admin_audit_log")
+}
+
+// Latest Chrome tab snapshot from the local relay, keyed by relay token
+model RelaySnapshot {
+  id         String   @id @default(cuid())
+  relayToken String   @unique
+  snapshotAt DateTime @default(now())
+  windows    Json // array of { windowId, tabs: [{ url, title, favIcon }] }
+
+  @@map("relay_snapshots")
+}
+
+/// connect-pg-simple's session store. Declared here ONLY so `prisma db push`
+/// creates it (as the migration user) and stops dropping it as an unknown
+/// table on every schema sync — the app never queries it through Prisma.
+/// Shape mirrors connect-pg-simple/table.sql (varchar sid PK, json sess,
+/// timestamp(6) expire, index on expire).
+model Session {
+  sid    String   @id @db.VarChar
+  sess   Json     @db.Json
+  expire DateTime @db.Timestamp(6)
+
+  @@index([expire], map: "IDX_session_expire")
+  @@map("session")
+}
+
+// One stored credential per user and provider (services/credentialStore.ts).
+// Listing reads only the label, so it needs no KMS call.
+model UserCredential {
+  userId     String
+  provider   String // "github"
+  label      String // e.g. "@octocat"; never any part of the value
+  // AWS Encryption SDK message: the KMS-encrypted data key and the AES-GCM
+  // ciphertext, bound to (purpose, userId, provider) by its encryption context.
+  ciphertext Bytes
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, provider])
+  @@map("user_credentials")
+}
+
+// Which orchestrator process does the singleton work (services/orchestratorLease.ts).
+// One row. Only processes started with ORCHESTRATOR_LEASE=true touch it; the
+// newest claimer wins, and the one it displaced drains for the deploy.
+model OrchestratorLease {
+  id          String   @id
+  holderId    String
+  holderLabel String
+  claimedAt   DateTime
+  heartbeatAt DateTime
+
+  @@map("orchestrator_leases")
+}
+
+// Agent-to-agent asks. A thread is one conversation
+// with a target project's workstream: its Claude session id on the target box,
+// the commit its sandbox clone started from, and the draft PR it publishes to.
+// Metadata only: prompts and replies are never stored. A reply goes from the
+// box's result straight to the asker's waiting poll (Postgres NOTIFY between
+// orchestrators, services/askReplyBus.ts) and is dropped if nobody waits.
+model AgentThread {
+  id              String         @id @default(cuid())
+  originUserId    String
+  originUser      User           @relation(fields: [originUserId], references: [id], onDelete: Cascade)
+  projectId       String
+  project         Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workstream      String         @default("main")
+  // The box the thread runs on; no foreign key, so a removed box leaves its log.
+  instanceId      String
+  claudeSessionId String?
+  baseSha         String?
+  // owner/name on github.com, from the target checkout's origin.
+  repo            String?
+  branch          String?
+  prNumber        Int?
+  prUrl           String?
+  // Messages on the thread so far; no cap (each message records its own hop).
+  hopCount        Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  messages        AgentMessage[]
+
+  @@index([originUserId, updatedAt])
+  @@index([projectId])
+  @@map("agent_threads")
+}
+
+// One ask: who sent it from where, which project ran it, and how it ended.
+model AgentMessage {
+  id               String      @id @default(cuid())
+  threadId         String
+  thread           AgentThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  senderUserId     String
+  sender           User        @relation(fields: [senderUserId], references: [id], onDelete: Cascade)
+  // The box whose token sent it; null for a laptop sign-in or a browser.
+  senderInstanceId String?
+  projectId        String
+  workstream       String
+  instanceId       String
+  hop              Int
+  // A2A's TaskState names: submitted | working | completed | failed | canceled
+  status           String      @default("submitted")
+  error            String?
+  promptBytes      Int
+  replyBytes       Int?
+  numTurns         Int?
+  // none | published | refused | failed, with a reason that never holds a token.
+  publish          String?
+  publishDetail    String?
+  createdAt        DateTime    @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+  // When the box reported the run's end; publishing may still follow.
+  resultAt         DateTime?
+  // When a poll first got the reply; null on a finished message means it was dropped.
+  readAt           DateTime?
+  // An ask to a parked box waits here for the box's agent: the only time a
+  // prompt is stored, cleared the moment the run is sent or the wait ends.
+  queuedPrompt     String?
+  // While queued, when the wait ends; once sent, when it was sent.
+  queuedUntil      DateTime?
+
+  @@index([senderUserId, status, readAt])
+  @@index([threadId, createdAt])
+  @@index([queuedUntil])
+  @@map("agent_messages")
+}
+
+// The commits a run made, as the git bundle its box uploaded, until the
+// orchestrator has published them (or an hour passes).
+model AgentBundle {
+  messageId String   @id
+  data      Bytes
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("agent_bundles")
+}
+
+// ── PR analytics ─────────────────────────────────────
+// Pull requests of the repos the repo groups include, ingested from GitHub
+// with one admin's stored gh token (pr_analytics_settings.tokenUserId).
+// Logins are stored lowercase; GitHub compares them case-insensitively.
+model GithubPr {
+  id             String    @id // GitHub node id
+  repo           String // owner/name, lowercase
+  repoVisibility String // public | internal | private
+  number         Int
+  authorLogin    String // '' when GitHub has no author (a deleted account)
+  authorType     String // User | Bot | Mannequin | ''
+  authorClass    String // human | agent | automation
+  /// The human the PR counts for: the author of a human PR, or the person an agent PR was done for.
+  creditedLogin  String?
+  creditSource   String // author | commit-author | co-author | body | none
+  /// An agent wrote commits on, or co-authored, this PR (any author class).
+  agentAssisted  Boolean   @default(false)
+  state          String // OPEN | CLOSED | MERGED
+  isDraft        Boolean   @default(false)
+  baseRef        String    @default("")
+  additions      Int       @default(0)
+  deletions      Int       @default(0)
+  changedFiles   Int       @default(0)
+  createdAt      DateTime
+  mergedAt       DateTime?
+  closedAt       DateTime?
+  prUpdatedAt    DateTime
+  ingestedAt     DateTime  @updatedAt
+
+  @@unique([repo, number])
+  @@index([repo, mergedAt])
+  @@index([repo, createdAt])
+  @@index([creditedLogin, mergedAt])
+  @@map("github_prs")
+}
+
+/// Per-repo ingestion state: survives restarts and feeds the ingest status.
+model GithubRepoSync {
+  repo           String    @id // owner/name, lowercase
+  visibility     String    @default("")
+  /// Next page of the first pass (newest updated first) while backfillDone is false.
+  backfillCursor String?
+  /// Newest PR updatedAt when the first pass started; becomes highWater when it ends.
+  backfillTop    DateTime?
+  backfillDone   Boolean   @default(false)
+  /// Every PR updated at or before this is in github_prs.
+  highWater      DateTime?
+  lastRunAt      DateTime?
+  lastError      String?
+  updatedAt      DateTime  @updatedAt
+
+  @@map("github_repo_sync")
+}
+
+/// A named collection of repos.
+model RepoGroup {
+  slug      String   @id
+  name      String
+  /// [{ kind: 'repo' | 'pattern' | 'topic', value: string, org?: string }]
+  members   Json     @default("[]")
+  /// owner/name repos left out despite a match.
+  excluded  Json     @default("[]")
+  sort      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("repo_groups")
+}
+
+/// Repos a group resolved to at the last discovery.
+model RepoGroupMember {
+  groupSlug  String
+  repo       String // owner/name, lowercase
+  visibility String
+  resolvedAt DateTime @default(now())
+
+  @@id([groupSlug, repo])
+  @@index([repo])
+  @@map("repo_group_members")
+}
+
+/// One row (id 'settings'): whose token ingests, and the bot / agent login lists.
+model PrAnalyticsSettings {
+  id           String   @id @default("settings")
+  tokenUserId  String?
+  /// The default groups were created once; deleting them all does not bring them back.
+  groupsSeeded Boolean  @default(false)
+  /// Logins that are bots even though GitHub types them User.
+  botLogins    Json     @default("[]")
+  /// Bot logins of AI coding agents (authorClass agent).
+  agentLogins  Json     @default("[]")
+  updatedAt    DateTime @updatedAt
+
+  @@map("pr_analytics_settings")
+}
+
+/// A row of the PR overlay the user put off (routes/prs.ts, services/prDeferrals.ts):
+/// left out of "Needs you" and the PRs tile until `until`. Keyed by the row's
+/// overlay key, `owner/name#n` for a PR or `owner/name:branch` for a branch.
+model PrDeferral {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key       String
+  until     DateTime
+  createdAt DateTime @default(now())
+
+  @@id([userId, key])
+  @@map("pr_deferrals")
+}
+
+/// Which workstream a pull request was worked on in (services/workstreamPrs.ts):
+/// recorded when the
+/// workstream's agent opens it, when the workstream's checkout is seen on its
+/// branch, or by hand from the PR overlay. One per user and PR; the PR pills
+/// and the overlay's workstream link read it.
+model WorkstreamPr {
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// GitHub owner/name, lowercased.
+  repo         String
+  number       Int
+  workstreamId String
+  workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+  /// created | branch | manual; a manual link is only replaced by hand.
+  source       String
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@id([userId, repo, number])
+  @@index([workstreamId])
+  @@map("workstream_prs")
+}
+
+/// A shared file store across boxes. The files live in S3
+/// under `<id>/`; this row is the name, the quota and the lifecycle.
+model Space {
+  id          String        @id @default(cuid())
+  /// [a-z0-9-]{2,40}, unique across termag so `space:path` is unambiguous.
+  /// A deleted space's name is released (rewritten to `deleted:<id>`).
+  name        String        @unique
+  description String?
+  createdById String
+  createdAt   DateTime      @default(now())
+  /// Set when the last owner leaves termag; a space with no owner member is
+  /// read-only even without it (services/spaceAccess.ts).
+  readOnlyAt  DateTime?
+  /// Set on delete; the spaces sweep purges the prefix, then the row.
+  deletedAt   DateTime?
+  /// Every stored version, current and noncurrent, plus unfinished multipart
+  /// parts: charged when upload URLs are signed, recounted hourly from S3.
+  usedBytes   BigInt        @default(0)
+  quotaBytes  BigInt        @default(107374182400)
+  members     SpaceMember[]
+  boxes       SpaceBox[]
+  invites     SpaceInvite[]
+  charges     SpaceCharge[]
+
+  @@map("spaces")
+}
+
+/// A quota charge for upload URLs that may not have been used yet. The hourly
+/// recount adds every charge still live to what S3 holds, so a recount can't
+/// drop bytes a signed URL may still write; the sweep deletes expired ones.
+model SpaceCharge {
+  id          String   @id
+  spaceId     String
+  bytes       BigInt
+  /// When the URLs this charge paid for stop working.
+  liveUntil   DateTime
+  createdAt   DateTime @default(now())
+  /// The object the URLs write (null for a move, whose copies finish in the
+  /// request), and for a part batch its multipart upload and part numbers; the
+  /// recount drops a charge whose object has landed or whose upload is no
+  /// longer in progress, and counts an open upload's parts no live charge covers.
+  key         String?
+  uploadId    String?
+  partNumbers Int[]    @default([])
+  space       Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@index([spaceId, liveUntil])
+  @@map("space_charges")
+}
+
+model SpaceMember {
+  id        String   @id @default(cuid())
+  spaceId   String
+  space     Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// owner | editor | viewer
+  role      String
+  addedById String
+  createdAt DateTime @default(now())
+
+  @@unique([spaceId, userId])
+  @@index([userId])
+  @@map("space_members")
+}
+
+/// An explicit box grant. The box acts with its owner's current role, and
+/// only while the owner is a member.
+model SpaceBox {
+  id         String   @id @default(cuid())
+  spaceId    String
+  space      Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  instanceId String
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  addedById  String
+  createdAt  DateTime @default(now())
+
+  @@unique([spaceId, instanceId])
+  @@index([instanceId])
+  @@map("space_boxes")
+}
+
+/// A member added by an email that has not signed in to termag yet; turned
+/// into a SpaceMember on that user's first spaces request.
+model SpaceInvite {
+  id        String   @id @default(cuid())
+  spaceId   String
+  space     Space    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  /// Lowercased.
+  email     String
+  role      String
+  addedById String
+  createdAt DateTime @default(now())
+
+  @@unique([spaceId, email])
+  @@index([email])
+  @@map("space_invites")
+}
+
+/// Append-only audit of a space: membership changes, writes, deletes, moves
+/// and download presigns. No foreign keys, so it outlives what it names;
+/// swept after 90 days.
+model SpaceEvent {
+  id              String   @id @default(cuid())
+  at              DateTime @default(now())
+  spaceId         String
+  actorUserId     String
+  /// Set when a box token acted.
+  actorInstanceId String?
+  /// The box the access was inherited through, when it was.
+  via             String?
+  /// space.* | member.* | invite.* | box.* | file.put | file.get | file.rm | file.mv
+  action          String
+  path            String?
+  bytes           BigInt?
+
+  @@index([spaceId, at])
+  @@map("space_events")
+}
+
+// ── Deployed software ───────────────────────────
+/// The latest observed version of each component on each host.
+model HostSoftware {
+  /// 'orchestrator', an instance id, or 'agent:<userId>' for a per-user agent on the orchestrator.
+  hostKey    String
+  hostKind   String // orchestrator | box | agent
+  component  String // termag, termag-checkout, image, hooks, claude, codex, …, os, kernel
+  version    String?
+  raw        String?
+  path       String?
+  ok         Boolean  @default(false)
+  source     String // agent | self | image | hello | report
+  observedAt DateTime
+
+  @@id([hostKey, component])
+  @@index([component])
+  @@map("host_software")
+}
+
+/// A component's version changed on a host (rollout history, kept 180 days).
+model SoftwareChange {
+  id        String   @id @default(cuid())
+  hostKey   String
+  component String
+  from      String?
+  to        String?
+  at        DateTime @default(now())
+
+  @@index([component, at])
+  @@index([hostKey, at])
+  @@map("software_changes")
+}
+
+/// The latest client version each user was seen with, per client kind.
+model ClientVersion {
+  userId     String
+  kind       String // web | mobile | cli | tui | metaterm
+  version    String
+  lastSeenAt DateTime
+
+  @@id([userId, kind])
+  @@map("client_versions")
+}
+
+/// One agent started by another: the parent session
+/// that asked, the workstream or project the child got, the brief it was
+/// launched on, and what it reported back. The brief is claimed (launchedAt)
+/// by the first launch of the child's agent pane.
+model AgentSpawn {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// delegate | peer
+  relationship     String
+  parentProjectId  String?
+  parentWorkstream String?
+  parentRole       String?
+  /// The parent's tmux session name at spawn time; the nudge types into it.
+  parentSession    String?
+  parentInstanceId String?
+  /// Null until a project-target create returns.
+  childProjectId   String?
+  childProjectName String
+  childWorkstream  String
+  childInstanceId  String?
+  provider         String
+  /// First line of the task.
+  title            String
+  /// The composed prompt-file content.
+  brief            String
+  depth            Int       @default(1)
+  /// starting | running | done | blocked | needs_input | failed
+  state            String    @default("starting")
+  error            String?
+  report           Json?
+  launchedAt       DateTime?
+  reportedAt       DateTime?
+  nudgedAt         DateTime?
+  /// The first spawn of this tree (itself for a root): cost and time roll up by it.
+  rootSpawnId      String?
+  /// When the child's agent pane or workstream went away.
+  endedAt          DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([rootSpawnId])
+  @@index([parentProjectId, parentWorkstream])
+  @@index([childProjectName, childWorkstream])
+  @@map("agent_spawns")
+}
+
+/// One "hand off" of an agent pane: the agent writes a
+/// handoff, its context is cleared or compacted in place or the pane is
+/// restarted (optionally on another provider), and the next agent starts on
+/// the handoff. The handoff sweep (services/agentHandoffSweep.ts) moves it.
+model AgentHandoff {
+  id                  String    @id @default(cuid())
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId           String
+  workstream          String
+  instanceId          String?
+  /// The agent pane's tmux session when it was asked.
+  session             String
+  /// clear | compact | restart, after the provider fallback (see requestedMode).
+  mode                String
+  requestedMode       String
+  fromProvider        String
+  /// restart only, and only for a real switch; null = whatever the pane runs when it restarts.
+  toProvider          String?
+  /// person | agent
+  initiator           String
+  /// web | mobile | tui | cli | slack | mcp
+  surface             String
+  /// What the person or agent added for the next agent; part of the prompt file.
+  note                String?
+  /// requested | writing | written | resetting | done | failed | aborted
+  state               String    @default("requested")
+  reason              String?
+  /// The handoff markdown, after the secret scan and size cap.
+  body                String?
+  /// Later: where the body lives if it moves out of Postgres (an S3 object).
+  storageRef          String?
+  contextTokensBefore Int?
+  /// When the "write your handoff" line was typed (person-started handoffs).
+  writeRequestedAt    DateTime?
+  writtenAt           DateTime?
+  /// When the reset (clear / compact / kill) was typed or done.
+  resetAt             DateTime?
+  /// restart only: when the old agent's pane was killed. A retry that finds it
+  /// unset (the leader died between the claim and the kill) kills again.
+  killedAt            DateTime?
+  /// When the read-in line or the prompted launch was typed.
+  launchedAt          DateTime?
+  doneAt              DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([projectId, workstream, state])
+  @@index([state])
+  @@map("agent_handoffs")
+}
+
+/// A message one person sends colleagues through Slack about their work: a
+/// typed card (kind) with one ask, posted by
+/// the termag bot on the sender's behalf. An agent can only draft one; the
+/// sender previews it in a Slack DM and sends it. Replies are CollabResponse
+/// rows, told to the sender and to the asking agent's pane.
+model CollabRequest {
+  id             String           @id @default(cuid())
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// fyi | help (phase 1); decision | review | action | handoff later.
+  kind           String
+  ask            String
+  /// string[]: 0-6 short bullets of context.
+  context        Json             @default("[]")
+  tried          String?
+  helpWanted     String?
+  /// A short excerpt (error lines, a diff hunk), posted as the first thread reply.
+  evidence       String?
+  /// string[]: PR, doc or dashboard URLs.
+  links          Json             @default("[]")
+  /// Where it is about. Null workstream = main.
+  projectId      String?
+  workstream     String?
+  /// The agent pane that drafted it, for the reply nudge. Null = written in the web UI.
+  fromSession    String?
+  fromRole       String?
+  fromInstanceId String?
+  /// "agent" (drafted by an agent, previewed in Slack) | "web" (written and sent in the UI).
+  origin         String           @default("agent")
+  /// Where it goes: "project" (the workstream's channel), a channel id, or null for a DM to people[0].
+  toChannel      String?
+  /// string[]: Slack user ids to mention (channel) or DM (one person, no channel).
+  toPeople       Json             @default("[]")
+  /// draft | sending (claimed by a Send in flight) | open | resolved | canceled
+  state          String           @default("draft")
+  previewChannel String?
+  previewTs      String?
+  slackChannel   String?
+  slackTs        String?
+  permalink      String?
+  sentAt         DateTime?
+  resolvedAt     DateTime?
+  resolvedBy     String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  responses      CollabResponse[]
+
+  @@index([userId, createdAt])
+  @@index([projectId, workstream])
+  @@index([slackChannel, slackTs])
+  @@map("collab_requests")
+}
+
+/// One reply to a CollabRequest: a thread reply or the card's Reply modal.
+/// The text is the responder's words: shown to the sender, and to the asking
+/// agent only as untrusted data.
+model CollabResponse {
+  id               String        @id @default(cuid())
+  requestId        String
+  request          CollabRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  responderSlackId String
+  responderName    String?
+  text             String
+  /// thread | modal
+  source           String
+  slackTs          String?
+  /// When the sender was DMed about it, and when the asking agent's pane was told.
+  notifiedAt       DateTime?
+  nudgedAt         DateTime?
+  createdAt        DateTime      @default(now())
+
+  @@unique([requestId, slackTs])
+  @@index([requestId, createdAt])
+  @@index([nudgedAt])
+  @@map("collab_responses")
+}
+
+/// What happened to agent spawns, refusals included.
+/// Append-only; swept after 90 days. `detail` carries counts and reasons,
+/// never brief, report or pane text.
+model SpawnEvent {
+  id         String   @id @default(cuid())
+  /// Null for a refused request: it never got a spawn row.
+  spawnId    String?
+  userId     String
+  /// requested | refused | created | launched | reported | nudged | failed | ended
+  kind       String
+  /// The refusal reason, report status or ending, as one word.
+  reason     String?
+  /// The box the child runs on (or would have).
+  instanceId String?
+  parentProjectId  String?
+  parentWorkstream String?
+  detail     Json?
+  at         DateTime @default(now())
+
+  @@index([userId, at])
+  @@index([kind, at])
+  @@index([spawnId])
+  @@map("spawn_events")
+}
+
+/// A box's five-minute host sample, kept 30 days.
+/// `Instance` keeps only the latest reading; this is the history.
+model HostSample {
+  id           String   @id @default(cuid())
+  instanceId   String
+  at           DateTime @default(now())
+  diskUsedPct  Int?
+  memUsedPct   Int?
+  load1        Float?
+  cores        Int?
+  memTotalMb   Int?
+  /// Agent-role tmux sessions alive on the box.
+  liveAgents   Int?
+  /// Of those, spawned agents that have not ended.
+  spawnedLive  Int?
+
+  @@index([instanceId, at])
+  @@index([at])
+  @@map("host_samples")
+}
+
+// Daily engagement-ladder segment per user. Written by
+// the segment tracker (services/segments/tracker.ts) once a day per user, so
+// the admin Segments tab and the history queries read precomputed rows.
+model UserSegmentDaily {
+  id          String @id @default(cuid())
+  userId      String
+  date        String // YYYY-MM-DD, UTC — one row per user per evaluated day
+  segment     String // New | Power | Active | Passive | Dormant | Service
+  agentMs     Int    @default(0) // the signals that drove the active-day flag
+  humanMs     Int    @default(0)
+  tokenRows   Int    @default(0)
+  visited     Boolean @default(false)
+  computedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([date])
+  @@map("user_segment_daily")
+}

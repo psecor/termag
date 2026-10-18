@@ -1,0 +1,79 @@
+import { AgentStatus, StatusMap } from '../types';
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeActivityScore(value?: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return clamp(value, 0, 1);
+}
+
+function getSessionWarpContribution(session?: AgentStatus): number {
+  if (!session) return 0;
+  const activity = normalizeActivityScore(session.activityScore);
+
+  if (session.status === 'working') {
+    return 1.0 + activity * 0.5;
+  }
+
+  if (session.status === 'waiting') {
+    return 0.2 + activity * 0.2;
+  }
+
+  return 0;
+}
+
+export function computeLegacyWarp(activeCount: number, typingBoost: boolean): number {
+  const count = Number(activeCount) || 0;
+  const baseSpeed = count === 0 ? 0.4 : 0.4 + count * 2;
+  const speed = baseSpeed + (typingBoost ? Math.max(0.4, baseSpeed * 0.25) : 0);
+  return speed <= 0.4 ? 0.1 : speed * 0.5;
+}
+
+export function computeWarpWithFallback(statusMap: StatusMap, typingBoost: boolean): {
+  mode: 'legacy' | 'activity';
+  targetWarp: number;
+  workingCount: number;
+  waitingCount: number;
+  isActive: boolean;
+} {
+  const sessions = Object.values(statusMap);
+  const hasActivityScores = sessions.some((session) => typeof session?.activityScore === 'number');
+  const workingCount = sessions.filter((session) => session?.status === 'working').length;
+  const waitingCount = sessions.filter((session) => session?.status === 'waiting').length;
+
+  if (!hasActivityScores) {
+    return {
+      mode: 'legacy',
+      targetWarp: computeLegacyWarp(workingCount, typingBoost),
+      workingCount,
+      waitingCount,
+      isActive: workingCount > 0 || typingBoost,
+    };
+  }
+
+  const sessionContribution = sessions.reduce((sum, session) => sum + getSessionWarpContribution(session), 0);
+  return {
+    mode: 'activity',
+    targetWarp: 0.1 + sessionContribution + (typingBoost ? 0.25 : 0),
+    workingCount,
+    waitingCount,
+    isActive: workingCount > 0 || waitingCount > 0 || typingBoost,
+  };
+}
+
+// The starfield eased its reported speed by 0.15 per frame at ~60fps. The
+// readout is now stepped by a timer (hooks/useEasedWarp.ts), so the same feel
+// is kept by scaling that per-frame factor to the elapsed time.
+const READOUT_EASE_PER_FRAME = 0.15;
+const REFERENCE_FRAME_MS = 1000 / 60;
+const READOUT_SNAP = 0.0005;
+
+export function easeWarp(current: number, target: number, elapsedMs: number): number {
+  if (!Number.isFinite(current)) return target;
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return current;
+  const frames = elapsedMs / REFERENCE_FRAME_MS;
+  const next = target + (current - target) * Math.pow(1 - READOUT_EASE_PER_FRAME, frames);
+  return Math.abs(next - target) < READOUT_SNAP ? target : next;
+}
