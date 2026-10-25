@@ -6,6 +6,10 @@ export interface FakeAskState {
   outcome: 'completed' | 'failed';
   reply: string;
   pr: { url: string; number: number; branch: string | null } | null;
+  /** The thread's PRs as an orchestrator with several per thread lists them; unset, the view has no `prs`. */
+  prs?: Array<{ key: string; url: string; number: number; branch: string | null }>;
+  /** What the finished message says about publishing, when not the plain published/none. */
+  publish?: { status: string; detail: string | null };
   messages: Map<string, FakeAskMessage>;
   asks: Array<Record<string, unknown>>;
   waits: number[];
@@ -20,8 +24,8 @@ export interface FakeAskState {
   acceptThenFail: boolean;
   /** Refuse asks as an orchestrator does when the target can't take a run; a function decides per ask. */
   reject: string | null | (() => string | null);
-  /** Take asks as an orchestrator does for a parked box it is starting. */
-  queued: boolean;
+  /** Take asks as an orchestrator does for a parked box it is starting (true, as older ones say it), or for a clone. */
+  queued: boolean | 'box' | 'setup';
   targets: unknown[];
   /** Reads of a finished message that still get the reply (the hand-off window); later ones get none. */
   handoffReads: number;
@@ -56,8 +60,9 @@ function view(s: FakeAskState, m: FakeAskMessage, consume: boolean) {
     createdAt: '2026-10-09T00:00:00.000Z', completedAt: done ? '2026-10-09T00:01:00.000Z' : null,
     error: m.status === 'failed' ? 'claude exited 1' : m.status === 'canceled' ? 'canceled by alice' : null,
     reply, replyBytes: done && m.status !== 'canceled' ? Buffer.byteLength(s.reply) : null, replyDelivered: m.delivered,
-    publish: done ? { status: s.pr ? 'published' : 'none', detail: null } : null,
+    publish: done ? s.publish ?? { status: s.pr ? 'published' : 'none', detail: null } : null,
     pr: done ? s.pr : null,
+    ...(s.prs ? { prs: done ? s.prs : [] } : {}),
   };
 }
 
@@ -83,7 +88,7 @@ export function handleAsk(s: FakeAskState, route: string, query: URLSearchParams
       s.messages.set(id, m);
     }
     if (s.failAsk > 0) { s.failAsk -= 1; gateway502(); return true; }
-    send(res, 202, { thread: m.thread, message: m.message, status: m.status, hop: 0, hops: m.hops, target: m.target, branch: `termag-alice/${m.thread}`, ...(replayed ? { replayed } : {}), ...(s.queued ? { queued: true, status: 'submitted' } : {}) });
+    send(res, 202, { thread: m.thread, message: m.message, status: m.status, hop: 0, hops: m.hops, target: m.target, branch: `termag-alice/${m.thread}`, ...(replayed ? { replayed } : {}), ...(s.queued ? { queued: true, status: 'submitted', ...(typeof s.queued === 'string' ? { queuedFor: s.queued } : {}) } : {}) });
     return true;
   }
   if (route === 'GET /ask/targets') {

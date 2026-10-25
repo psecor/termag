@@ -6,7 +6,7 @@ import { CliError, EXIT, usage, type ExitCode } from './errors.js';
 import { json } from './output.js';
 
 /**
- * Milestone 2: box create/start/stop/set/rm and project create/rename/archive.
+ * Milestone 2: box create/start/stop/set/rename/rm and project create/rename/archive.
  *
  * Boxes and projects are named on the command line and resolved here against
  * the lists, then acted on by id. A name may be a box's id too, which is how a
@@ -44,6 +44,11 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
     options: { 'auto-park': { type: 'string' }, 'terminate-after': { type: 'string' } },
     maxArgs: 1,
   },
+  'box rename': {
+    summary: 'Rename a box; its projects stay on it, now named <new-name>/<project>',
+    usage: 'termag box rename <box> <new-name>',
+    maxArgs: 2,
+  },
   'box rm': {
     summary: 'Terminate a box and archive its projects',
     usage: 'termag box rm <box> [--yes]',
@@ -69,6 +74,7 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
 
 export const LIFECYCLE_ALIASES: Record<string, string> = {
   'box terminate': 'box rm',
+  'box mv': 'box rename',
   'project new': 'project create',
   'project mv': 'project rename',
 };
@@ -348,6 +354,18 @@ async function cmdBoxSet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   return EXIT.OK;
 }
 
+async function cmdBoxRename(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
+  const ref = arg(args, 0, 'the box', 'box rename');
+  const newName = boxRef(arg(args, 1, 'the new name', 'box rename'));
+  checkName(newName, 'box');
+  const api = await lifecycleApi(ctx, args);
+  const found = await resolveBox(api, ref);
+  if (found.name === newName) return emitBox(ctx, args, found, { renamedFrom: found.name }, `${found.name} already has that name.`);
+  const { box } = await api.request<{ box: Box }>('POST', `/boxes/${encodeURIComponent(found.id)}/rename`, { name: newName });
+  if (!args.json) ctx.err(`ssh reaches it as termag-${box.name} now; re-run \`termag ssh-config --install\` if your ssh config names termag-${found.name}.`);
+  return emitBox(ctx, args, box, { renamedFrom: found.name }, `Renamed ${found.name} to ${box.name}.`);
+}
+
 async function cmdBoxRm(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const ref = arg(args, 0, 'the box', 'box rm');
   const api = await lifecycleApi(ctx, args);
@@ -513,6 +531,7 @@ export const LIFECYCLE_HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => 
   'box start': cmdBoxStart,
   'box stop': cmdBoxStop,
   'box set': cmdBoxSet,
+  'box rename': cmdBoxRename,
   'box rm': cmdBoxRm,
   'project create': cmdProjectCreate,
   'project rename': cmdProjectRename,

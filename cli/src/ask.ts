@@ -9,7 +9,7 @@ import { ownBox, startAndWait, START_WAIT_S } from './lifecycle.js';
 
 /**
  * `termag ask`: agent-to-agent asks. The
- * orchestrator runs the prompt on the target project's box in a sandboxed
+ * orchestrator runs the prompt on the target project's box, as its owner, in a
  * clone of its committed code and hands the reply to the poll waiting for it,
  * plus a draft PR for any commits. Nothing stores the reply: if no poll is
  * waiting when it arrives it is dropped, and the message only says it
@@ -58,8 +58,15 @@ export interface AskMessage {
   replyBytes: number | null;
   replyDelivered: boolean;
   publish: { status: string; detail: string | null } | null;
+  /** The thread's own PR, else its first. */
   pr: { url: string; number: number; branch: string | null } | null;
+  /** Every PR the thread opened, its own (key '') first; orchestrators from before them leave it out. */
+  prs?: AskPr[];
 }
+
+interface AskPr { key: string; url: string; number: number; branch: string | null }
+
+const prsOf = (m: AskMessage): AskPr[] => m.prs ?? (m.pr ? [{ key: '', ...m.pr }] : []);
 
 interface AskStarted {
   thread: string;
@@ -69,8 +76,10 @@ interface AskStarted {
   hops: number;
   target: string;
   branch: string;
-  /** Waiting on the orchestrator for its parked box to come up. */
+  /** Waiting on the orchestrator for its parked box to come up, or its project's clone to finish. */
   queued?: boolean;
+  /** What it waits for; orchestrators that only held asks for a box leave it out. */
+  queuedFor?: 'box' | 'setup';
 }
 
 /** The message states are A2A's TaskState names. */
@@ -96,8 +105,11 @@ export function a2aTask(m: AskMessage) {
   if (m.reply !== null) {
     artifacts.push({ artifactId: `${m.message}-reply`, name: 'reply', parts: [{ text: m.reply, mediaType: 'text/plain' }] });
   }
-  if (m.pr) {
-    artifacts.push({ artifactId: `${m.message}-pr`, name: 'pull-request', parts: [{ url: m.pr.url }], metadata: { number: m.pr.number, branch: m.pr.branch } });
+  for (const p of prsOf(m)) {
+    artifacts.push({
+      artifactId: p.key ? `${m.message}-pr-${p.key}` : `${m.message}-pr`, name: 'pull-request', parts: [{ url: p.url }],
+      metadata: { number: p.number, branch: p.branch, ...(p.key ? { key: p.key } : {}) },
+    });
   }
   const status: Record<string, unknown> = {
     state: A2A_STATE[m.status] ?? 'TASK_STATE_UNSPECIFIED',
@@ -114,7 +126,7 @@ export function a2aTask(m: AskMessage) {
     metadata: {
       termag: {
         target: m.target, status: m.status, hop: m.hop, hops: m.hops, error: m.error,
-        replyBytes: m.replyBytes, replyDelivered: m.replyDelivered, publish: m.publish, pr: m.pr,
+        replyBytes: m.replyBytes, replyDelivered: m.replyDelivered, publish: m.publish, pr: m.pr, prs: prsOf(m),
       },
     },
   };
@@ -290,9 +302,9 @@ function printMessage(ctx: Ctx, m: AskMessage): void {
   else if (m.replyDelivered) ctx.out(`The reply to ${m.message} went to an earlier poll; replies are not kept.`);
   else ctx.out(`The reply to ${m.message} was not delivered: nothing was waiting when it arrived, and replies are not stored. Ask again (\`--thread ${m.thread}\` keeps the context).`);
   if (m.status === 'failed' && m.error) ctx.err(`termag: the run failed: ${m.error}`);
-  if (m.pr) ctx.out(`pr: ${m.pr.url}${m.pr.branch ? ` (${m.pr.branch})` : ''}`);
+  for (const p of prsOf(m)) ctx.out(`pr: ${p.url}${p.branch ? ` (${p.branch})` : ''}`);
   if (m.publish && m.publish.status !== 'published' && m.publish.status !== 'none' && m.publish.detail) {
-    ctx.err(`termag: commits not published: ${m.publish.detail}`);
+    ctx.err(`termag: ${m.publish.status === 'partial' ? 'some branches not published' : 'commits not published'}: ${m.publish.detail}`);
   }
   ctx.out(`thread: ${m.thread}`);
 }
@@ -305,6 +317,12 @@ function replyState(m: AskMessage): string {
   return m.replyDelivered ? 'delivered' : 'dropped';
 }
 
+function prColumn(m: AskMessage): string {
+  const prs = prsOf(m);
+  if (!prs.length) return '-';
+  return prs.length > 1 ? `${prs[0].url} (+${prs.length - 1})` : prs[0].url;
+}
+
 async function cmdInbox(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const api = await authedApi(ctx, session(ctx, args));
   const { messages } = await api.request<{ messages: AskMessage[] }>('GET', '/ask/inbox');
@@ -312,7 +330,7 @@ async function cmdInbox(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (messages.length === 0) { ctx.out('Nothing submitted, working or finished in the last day.'); return EXIT.OK; }
   ctx.out(table(
     ['MESSAGE', 'THREAD', 'TARGET', 'STATUS', 'REPLY', 'PR'],
-    messages.map(m => [m.message, m.thread, m.target, m.status, replyState(m), m.pr?.url ?? '-']),
+    messages.map(m => [m.message, m.thread, m.target, m.status, replyState(m), prColumn(m)]),
   ));
   return EXIT.OK;
 }
@@ -330,7 +348,7 @@ async function cmdTargets(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const api = await authedApi(ctx, session(ctx, args));
   const { agents } = await api.request<{ agents: TargetCard[] }>('GET', '/ask/targets');
   if (args.json) { ctx.out(json({ agents })); return EXIT.OK; }
-  if (agents.length === 0) { ctx.out('No projects on a box to ask: create one, or have one shared with you.'); return EXIT.OK; }
+  if (agents.length === 0) { ctx.out('No projects of yours on a box of yours to ask: create one.'); return EXIT.OK; }
   ctx.out(table(
     ['TARGET', 'OWNER', 'ASKABLE', 'DESCRIPTION'],
     agents.map(a => {
@@ -403,7 +421,10 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
     return EXIT.FAILED;
   }
   if (started.queued && !args.json) {
-    ctx.err(`termag: ${target.split('/')[0]} is starting; the ask runs once it is up (the orchestrator holds it, so it runs even if this command stops)`);
+    const waitFor = started.queuedFor === 'setup'
+      ? `${started.target} is still being set up; the ask runs once its clone is done`
+      : `${target.split('/')[0]} is starting; the ask runs once it is up`;
+    ctx.err(`termag: ${waitFor} (the orchestrator holds it, so it runs even if this command stops)`);
   }
   if (args.options['no-wait'] === true) {
     if (args.json) ctx.out(json(startedTask(started)));

@@ -23,12 +23,15 @@ export function proxyCommandFor(termag: string[], host: string | null): string {
  * the first value it finds for each setting, so a later `Host *` can't
  * override it. The trailing `Host *` hands whatever follows back to every
  * host, so settings the file had before its first `Host` line stay global.
+ * `hostUsers` comes first for the same reason: a box whose agent runs as
+ * someone other than `user` (a claimed warm box stays `termag`).
  */
-export function renderBlock(opts: { proxyCommand: string; user: string }): string {
+export function renderBlock(opts: { proxyCommand: string; user: string; hostUsers?: Array<{ alias: string; user: string }> }): string {
   return [
     BEGIN_MARKER,
     '# Managed by `termag ssh-config --install`, which replaces everything between these markers.',
     '# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.',
+    ...(opts.hostUsers ?? []).flatMap(h => [`Host ${h.alias}`, `  User ${h.user}`]),
     'Host termag-*',
     `  User ${opts.user}`,
     `  ProxyCommand ${opts.proxyCommand}`,

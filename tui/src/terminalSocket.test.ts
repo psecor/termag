@@ -64,6 +64,7 @@ describe('policy helpers', () => {
   it('treats only unrecoverable 1008 reasons as fatal', () => {
     expect(isFatalClose(1008, 'login required')).toBe(true);
     expect(isFatalClose(1008, 'session forbidden')).toBe(true);
+    expect(isFatalClose(1008, 'project id required')).toBe(true);
     expect(isFatalClose(1008, 'Agent not connected for box')).toBe(false);
     expect(isFatalClose(1011, 'login required')).toBe(false);
     expect(isFatalClose(1006, '')).toBe(false);

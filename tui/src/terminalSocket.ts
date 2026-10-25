@@ -128,7 +128,7 @@ export function backoffDelay(attempt: number): number {
  * waiting are fatal; "Agent not connected" and the like are retried.
  */
 const FATAL_REASONS = [
-  'login required', 'unknown user', 'session forbidden', 'session/project mismatch', 'session param required', 'unknown path',
+  'login required', 'unknown user', 'session forbidden', 'session/project mismatch', 'session param required', 'project id required', 'unknown path',
   // The CLI socket closing on a credential that stopped being valid (backend routes/cliWs.ts).
   'termag login', 'credential revoked',
 ];

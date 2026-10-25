@@ -136,6 +136,12 @@ async function startFake(): Promise<FakeSpaces> {
       sendJson(res, 200, { url: `${fake.host}/s3/get?path=${encodeURIComponent(json.path)}`, size: file.length });
       return;
     }
+    if (rest === '/files/link') {
+      if (!fake.files.has(json.path)) { sendJson(res, 404, { error: 'No such file', code: 'file_not_found' }); return; }
+      const encoded = json.path.split('/').map(encodeURIComponent).join('/');
+      sendJson(res, 200, { url: `https://ui.example/termag/files/${space}/${encoded}`, path: json.path, size: fake.files.get(json.path)!.length });
+      return;
+    }
     if (rest === '/files/upload') {
       if (json.size <= fake.singleMax) {
         sendJson(res, 200, { kind: 'single', path: json.path, url: `${fake.host}/s3/put?path=${encodeURIComponent(json.path)}`, method: 'PUT', headers: { 'content-type': json.contentType } });
@@ -348,6 +354,17 @@ describe('termag space', () => {
     out = [];
     expect(await termag('space', 'create', 'shared')).toBe(0);
     expect(out.join('\n')).toContain('Add people with');
+  });
+
+  it('prints a file\'s browser link', async () => {
+    fake.files.set('docs/My Report.pdf', Buffer.from('pdf'));
+    expect(await termag('space', 'url', 'team:docs/My Report.pdf')).toBe(0);
+    expect(out).toEqual(['https://ui.example/termag/files/team/docs/My%20Report.pdf']);
+    out = [];
+    expect(await termag('space', 'link', 'docs/My Report.pdf', '--json')).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({ space: 'team', path: 'docs/My Report.pdf', url: 'https://ui.example/termag/files/team/docs/My%20Report.pdf' });
+    expect(await termag('space', 'url', 'team:nope.pdf')).toBe(3);
+    expect(await termag('space', 'url', 'team:docs/')).toBe(2);
   });
 
   it('reports a missing file as not found (exit 3)', async () => {

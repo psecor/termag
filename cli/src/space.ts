@@ -40,6 +40,11 @@ export const SPACE_COMMANDS: Record<string, CommandSpec> = {
     options: { recursive },
     maxArgs: 2,
   },
+  'space url': {
+    summary: 'Print a browser link to a file; it opens for anyone who can read the space',
+    usage: 'termag space url <space:path>',
+    maxArgs: 1,
+  },
   'space put': {
     summary: 'Upload a file, or a folder with -r',
     usage: 'termag space put <local> <space:path> [-r]',
@@ -281,6 +286,21 @@ export async function cmdSpaceGet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   return EXIT.OK;
 }
 
+// ---- url ----
+
+export async function cmdSpaceUrl(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
+  const raw = args.args[0];
+  if (!raw) throw usage(`Usage: ${SPACE_COMMANDS['space url'].usage}`);
+  const ref = parseRemote(raw);
+  if (!ref.path || ref.path.endsWith('/')) throw usage('Name a file, not a folder');
+  const a = await api(ctx, args);
+  const space = await spaceOf(a, ref);
+  const r = await a.request<{ url: string; path: string; size: number }>('POST', `/spaces/${enc(space)}/files/link`, { path: ref.path });
+  if (args.json) ctx.out(json({ space, path: r.path, url: r.url }));
+  else ctx.out(r.url);
+  return EXIT.OK;
+}
+
 // ---- put ----
 
 function readPart(fd: number, offset: number, length: number): Uint8Array<ArrayBuffer> {
@@ -506,6 +526,7 @@ export async function cmdSpaceBoxes(ctx: Ctx, args: ParsedArgs): Promise<ExitCod
 export const SPACE_HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Promise<ExitCode>> = {
   'space ls': cmdSpaceLs,
   'space get': cmdSpaceGet,
+  'space url': cmdSpaceUrl,
   'space put': cmdSpacePut,
   'space rm': cmdSpaceRm,
   'space mv': cmdSpaceMv,
@@ -514,4 +535,4 @@ export const SPACE_HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Prom
   'space boxes': cmdSpaceBoxes,
 };
 
-export const SPACE_ALIASES: Record<string, string> = { 'space list': 'space ls' };
+export const SPACE_ALIASES: Record<string, string> = { 'space list': 'space ls', 'space link': 'space url' };

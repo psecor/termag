@@ -38,7 +38,7 @@ export interface Project {
   workstreams: Workstream[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';
-  kind?: 'normal' | 'metaterm';
+  kind?: 'normal' | 'metaterm' | 'automation';
 }
 
 /** One row per reachable tmux session — GET /api/sessions. */

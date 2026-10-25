@@ -16,7 +16,7 @@ const CONN_GLYPH: Record<ConnectionState, { glyph: string; color: string }> = {
 
 export function Header(props: {
   me: string; source: string; conn: ConnectionState; working: number; waiting: number; reviewing: number;
-  /** PRs that need you (prs.ts prCount); null without a device sign-in or a GitHub connection. */
+  /** PRs asking you by name for a review (prs.ts prCount); null without a device sign-in or a GitHub connection. */
   prs: number | null;
   width: number;
 }) {

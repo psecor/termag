@@ -426,6 +426,20 @@ describe('termag ssh-config', () => {
     expect(existsSync(join(home, '.ssh', 'config'))).toBe(false);
   });
 
+  it('names the user of each box whose agent runs as someone else, ahead of the wildcard', async () => {
+    orch.override.set('/api/cli/v1/boxes', serve({ boxes: [
+      ...CONNECT_BOXES,
+      { ...CONNECT_BOXES[0], id: 'i4', name: 'warm', hostUnixUser: 'termag' },
+      { ...CONNECT_BOXES[0], id: 'i5', name: 'old', hostUnixUser: null },
+      { ...CONNECT_BOXES[0], id: 'i6', name: 'evil', hostUnixUser: 'x\n  ProxyCommand touch /tmp/pwned' },
+    ] }));
+    expect(await run(['ssh-config'], ctx())).toBe(0);
+    const lines = out.join('\n').split('\n');
+    expect(lines.indexOf('Host termag-warm')).toBeLessThan(lines.indexOf('Host termag-*'));
+    expect(lines[lines.indexOf('Host termag-warm') + 1]).toBe('  User termag');
+    expect(lines.filter(l => l.startsWith('Host '))).toEqual(['Host termag-warm', 'Host termag-*', 'Host *']);
+  });
+
   it('--install writes it once and is idempotent', async () => {
     mkdirSync(join(home, '.ssh'));
     writeFileSync(join(home, '.ssh', 'config'), 'Host github.com\n  User git\n');

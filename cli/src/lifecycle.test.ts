@@ -453,6 +453,42 @@ describe('termag project rename and archive', () => {
   });
 });
 
+describe('termag box rename', () => {
+  it('renames the box, and its projects follow', async () => {
+    expect(await run(['box', 'rename', 'devbox', 'laptop'], ctx())).toBe(0);
+    expect(stdout()).toBe('Renamed devbox to laptop.');
+    expect(stderr()).toContain('termag ssh-config --install');
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes/i1/rename', body: { name: 'laptop' } }]);
+    expect(orch.lifecycle.projects.map(p => p.ref)).toContain('laptop/webapp-fix');
+  });
+
+  it('box mv --json prints the box and the old name', async () => {
+    expect(await run(['box', 'mv', 'devbox', 'laptop', '--json'], ctx())).toBe(0);
+    expect(err).toEqual([]);
+    expect(lastJson()).toMatchObject({ box: { id: 'i1', name: 'laptop' }, renamedFrom: 'devbox' });
+  });
+
+  it('does nothing when the name is the one it has', async () => {
+    expect(await run(['box', 'rename', 'devbox', 'devbox'], ctx())).toBe(0);
+    expect(stdout()).toBe('devbox already has that name.');
+    expect(mutations()).toEqual([]);
+  });
+
+  it('refuses bad names, a missing name and unknown boxes before renaming', async () => {
+    expect(await run(['box', 'rename', 'devbox', 'my box'], ctx())).toBe(2);
+    expect(await run(['box', 'rename', 'devbox', 'a/b'], ctx())).toBe(2);
+    expect(await run(['box', 'rename', 'devbox'], ctx())).toBe(2);
+    expect(await run(['box', 'rename', 'nope', 'x'], ctx())).toBe(3);
+    expect(mutations()).toEqual([]);
+  });
+
+  it('passes on a name another box has', async () => {
+    orch.lifecycle.boxes.push({ ...box('devbox')!, id: 'i9', name: 'heavy', projects: [] });
+    expect(await run(['box', 'rename', 'devbox', 'heavy'], ctx())).toBe(1);
+    expect(stderr()).toContain('A box named "heavy" already exists');
+  });
+});
+
 describe('termag box set --auto-park', () => {
   it('sets the hours and turns it off', async () => {
     expect(await run(['box', 'set', 'devbox', '--auto-park', '1h'], ctx())).toBe(0);
@@ -523,7 +559,7 @@ describe('helpers and help', () => {
 
   it('lists the lifecycle commands in --help', async () => {
     expect(await run(['--help'], ctx())).toBe(0);
-    for (const c of ['box create', 'box start', 'box stop', 'box set', 'box rm', 'project create', 'project rename', 'project archive']) {
+    for (const c of ['box create', 'box start', 'box stop', 'box set', 'box rename', 'box rm', 'project create', 'project rename', 'project archive']) {
       expect(stdout()).toContain(c);
     }
   });

@@ -61,15 +61,17 @@ describe('lobbyPills', () => {
 });
 
 describe('prCount', () => {
-  it('counts what needs the user, not what waits on others, and not deferred rows', () => {
+  it('counts reviews asked of the user by name, not team-only ones, own PRs or deferred rows', () => {
     const r = res([
-      row({ number: 1, lane: 'needs_my_review' }),
+      row({ number: 1, lane: 'needs_my_review', askedYou: true }),
+      row({ number: 7, lane: 'needs_my_review', askedYou: false }),
+      row({ number: 8, lane: 'needs_my_review' }), // an older backend: no flag, counted
+      row({ number: 9, lane: 'needs_my_review', askedYou: true }),
       row({ number: 2, lane: 'ready_to_merge' }),
       row({ number: 3, failingChecks: ['ci'] }),
-      row({ number: 4, failingChecks: ['ci'], badges: ['draft'] }),
       row({ number: 5, lane: 'needs_approval' }),
       row({ number: 6, lane: 'merged_not_deployed' }),
-    ], { deferred: [{ key: 'example-org/termag#2', until: '2026-10-18T00:00:00Z' }, { key: 'example-org/termag#1', until: '2026-10-01T00:00:00Z' }] });
+    ], { deferred: [{ key: 'example-org/termag#9', until: '2026-10-18T00:00:00Z' }, { key: 'example-org/termag#1', until: '2026-10-01T00:00:00Z' }] });
     expect(prCount(r, NOW)).toBe(2);
     expect(prCount({ connected: false }, NOW)).toBe(0);
   });

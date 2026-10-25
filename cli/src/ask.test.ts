@@ -243,6 +243,14 @@ describe('termag ask', () => {
     expect(stdout()).toContain('The flag is read in server/flags.go.');
   });
 
+  it('says so when the orchestrator holds the ask for a clone still running', async () => {
+    orch.ask.queued = 'setup';
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi'], ctx())).toBe(0);
+    expect(stderr()).toContain('devbox/webapp-fix is still being set up; the ask runs once its clone is done');
+    expect(stderr()).not.toContain('is starting');
+    expect(stdout()).toContain('The flag is read in server/flags.go.');
+  });
+
   it('--targets lists the cards as a table, and as they are with --json', async () => {
     const card = (name: string, params: Record<string, unknown>, description = '') => ({
       name, description, provider: { organization: 'zane' },
@@ -282,9 +290,33 @@ describe('termag ask', () => {
           target: 'devbox/webapp-fix', status: 'completed', hop: 0, hops: 1, error: null,
           replyBytes: 36, replyDelivered: true, publish: { status: 'published', detail: null },
           pr: { url: 'https://github.com/example-org/webapp/pull/7', number: 7, branch: 'termag-alice/thread00001' },
+          prs: [{ key: '', url: 'https://github.com/example-org/webapp/pull/7', number: 7, branch: 'termag-alice/thread00001' }],
         },
       },
     });
+  });
+
+  it('prints every PR a run opened, one artifact each, and says which branches did not publish', async () => {
+    const own = { url: 'https://github.com/example-org/webapp/pull/7', number: 7, branch: 'termag-alice/thread00001' };
+    const docs = { url: 'https://github.com/example-org/webapp/pull/8', number: 8, branch: 'termag-alice/thread00001-docs' };
+    orch.ask.pr = own;
+    orch.ask.prs = [{ key: '', ...own }, { key: 'docs', ...docs }];
+    orch.ask.publish = { status: 'partial', detail: 'ask: 1 commit(s) | pr/docs: 1 commit(s) | pr/ci: the commits change protected paths (.github/workflows)' };
+    expect(await run(['ask', 'devbox/webapp-fix', 'fix it'], ctx())).toBe(0);
+    expect(stdout()).toContain([
+      'pr: https://github.com/example-org/webapp/pull/7 (termag-alice/thread00001)',
+      'pr: https://github.com/example-org/webapp/pull/8 (termag-alice/thread00001-docs)',
+    ].join('\n'));
+    expect(stderr()).toContain('termag: some branches not published: ask: 1 commit(s) | pr/docs: 1 commit(s) | pr/ci: the commits change protected paths');
+    out = [];
+    expect(await run(['ask', 'devbox/webapp-fix', 'fix it', '--json'], ctx())).toBe(0);
+    expect(lastJson().artifacts.slice(1)).toEqual([
+      { artifactId: 'message0002-pr', name: 'pull-request', parts: [{ url: own.url }], metadata: { number: 7, branch: own.branch } },
+      { artifactId: 'message0002-pr-docs', name: 'pull-request', parts: [{ url: docs.url }], metadata: { number: 8, branch: docs.branch, key: 'docs' } },
+    ]);
+    out = [];
+    expect(await run(['ask', '--inbox'], ctx())).toBe(0);
+    expect(stdout()).toContain('https://github.com/example-org/webapp/pull/7 (+1)');
   });
 
   it('--json puts a failed run\'s error in the status message', async () => {

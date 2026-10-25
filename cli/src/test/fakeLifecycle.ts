@@ -145,6 +145,20 @@ export function handleLifecycle(
     });
     return true;
   }
+  if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/rename$/))) {
+    state.calls.push({ route, body });
+    const b = box(decodeURIComponent(m[1]));
+    if (!b) { send(res, 404, { error: 'Box not found' }); return true; }
+    const name = body.name as string;
+    if (state.boxes.some(x => x !== b && x.name === name)) { send(res, 409, { error: `A box named "${name}" already exists`, code: 'conflict' }); return true; }
+    b.name = name;
+    for (const p of state.projects.filter(x => x.box.id === b.id)) {
+      p.box.name = name;
+      p.ref = `${name}/${p.name}`;
+    }
+    send(res, 200, { box: b });
+    return true;
+  }
   if (method === 'DELETE' && (m = path.match(/^\/boxes\/([^/]+)$/))) {
     state.calls.push({ route, body });
     if (isBoxToken) { send(res, 403, { error: "A box's own credentials can't terminate boxes", code: 'forbidden' }); return true; }

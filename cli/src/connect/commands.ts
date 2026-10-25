@@ -106,12 +106,22 @@ function termagCommand(ctx: Ctx): string[] {
   return onPath ? [onPath] : [process.execPath, process.argv[1]];
 }
 
+// A box reports its own unix user, so only names that can't break out of their ssh_config line go in.
+const SAFE_NAME = /^[A-Za-z0-9_-]+$/;
+const SAFE_USER = /^[a-z_][a-z0-9_.-]*$/;
+
 export async function cmdSshConfig(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const s = session(ctx, args);
+  const api = await authedApi(ctx, s);
   const user = loadLogin(s.credsPath, s.target.host)?.unixUsername
-    ?? (await (await authedApi(ctx, s)).request<WhoamiResponse>('GET', '/whoami')).user.unixUsername;
+    ?? (await api.request<WhoamiResponse>('GET', '/whoami')).user.unixUsername;
+  const { boxes } = await api.request<{ boxes: ConnectBox[] }>('GET', '/boxes');
   const block = renderBlock({
     user,
+    hostUsers: boxes
+      .filter(b => b.hostUnixUser && b.hostUnixUser !== user && SAFE_NAME.test(b.name) && SAFE_USER.test(b.hostUnixUser))
+      .map(b => ({ alias: aliasFor(b), user: b.hostUnixUser! }))
+      .sort((a, b) => a.alias.localeCompare(b.alias)),
     proxyCommand: proxyCommandFor(termagCommand(ctx), s.target.source === 'default' ? null : s.target.host),
   });
   const path = sshConfigPath(ctx.home);
@@ -124,7 +134,7 @@ export async function cmdSshConfig(ctx: Ctx, args: ParsedArgs): Promise<ExitCode
   if (args.json) { ctx.out(json(result)); return EXIT.OK; }
   const verb = { added: 'Added the termag entry to', updated: 'Updated the termag entry in', unchanged: 'The termag entry is already in' }[result.action];
   ctx.out(`${verb} ${result.path}.${result.backup ? ` The previous file is ${result.backup}.` : ''}`);
-  if (result.action !== 'unchanged') ctx.out('`ssh termag-<box>` now reaches each of your boxes.');
+  if (result.action !== 'unchanged') ctx.out('`ssh termag-<box>` now reaches each of your boxes. Re-run this after adding a box.');
   return EXIT.OK;
 }
 

@@ -30,6 +30,11 @@ describe('renderBlock', () => {
     expect(lines.at(-2)).toBe('Host *');
   });
 
+  it('puts each per-box user ahead of the wildcard, since ssh keeps the first User it finds', () => {
+    const lines = renderBlock({ user: 'alice', proxyCommand: 'p', hostUsers: [{ alias: 'termag-warm', user: 'termag' }] }).split('\n');
+    expect(lines.slice(3, 6)).toEqual(['Host termag-warm', '  User termag', 'Host termag-*']);
+  });
+
   it('names a non-default orchestrator and quotes paths for the shell', () => {
     expect(proxyCommandFor(['/Applications/My Node/node', '/x/termag.js'], 'http://localhost:3040/termag'))
       .toBe("'/Applications/My Node/node' /x/termag.js --host http://localhost:3040/termag ssh-proxy %h %p");

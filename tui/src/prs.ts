@@ -5,7 +5,7 @@
 // for the same reason as types.ts.
 
 export type PrLaneId =
-  | 'in_progress' | 'needs_pr' | 'checks' | 'needs_approval' | 'needs_my_review'
+  | 'in_progress' | 'needs_pr' | 'checks' | 'needs_approval' | 'needs_my_review' | 'team_review'
   | 'ready_to_merge' | 'merged_not_deployed' | 'deployed' | 'merged';
 
 /** The fields of the pipeline's PrRow the lobby reads. */
@@ -23,6 +23,8 @@ export interface PrRow {
   checksFailed?: boolean;
   mergedAt: string | null;
   workstream: { projectId: string; workstream: string } | null;
+  /** The review lanes: the request names the user (needs_my_review, counted) or only a team (team_review); absent from older backends. */
+  askedYou?: boolean;
 }
 
 export type PrsResponse =
@@ -47,7 +49,6 @@ export interface Pill {
 const NO_PILL: PrLaneId[] = ['in_progress'];
 const PAST_LANES: PrLaneId[] = ['deployed', 'merged'];
 const TONE_ORDER: PillTone[] = ['act', 'bad', 'good', 'wait', 'branch', 'merged', 'past'];
-const NEEDS_YOU_LANES: PrLaneId[] = ['needs_my_review', 'ready_to_merge', 'checks', 'needs_approval', 'needs_pr'];
 
 export function workstreamKey(projectId: string, workstream: string): string {
   return `${projectId}/${workstream}`;
@@ -131,14 +132,19 @@ export function lobbyPills(res: PrsResponse | null, now: number): Map<string, Pi
   return out;
 }
 
-/** What needs the user and is not deferred: the web tile's and the phone inbox's count. */
+/**
+ * Reviews asked of the user by name and not deferred: the header's count, as
+ * the web tile's and the phone inbox's (frontend utils/prPipeline.ts
+ * myReviewCount). A request only to a team they are on is not counted; an
+ * older backend's row, without the flag, is.
+ */
 export function prCount(res: PrsResponse | null, now: number): number {
   if (!res?.connected) return 0;
   const deferred = deferredKeys(res, now);
   let n = 0;
   for (const lane of res.lanes) {
-    if (!NEEDS_YOU_LANES.includes(lane.id)) continue;
-    for (const r of lane.rows) if (needsYou(r) && !deferred.has(rowKey(r))) n++;
+    if (lane.id !== 'needs_my_review') continue;
+    for (const r of lane.rows) if (r.askedYou !== false && !deferred.has(rowKey(r))) n++;
   }
   return n;
 }
