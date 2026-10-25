@@ -11,7 +11,7 @@ const { promisify } = require('util');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { ensureInitialCommit, ensureProjectRepo, hasCommits, INITIAL_COMMIT_MESSAGE } = require('./git-repo');
+const { ensureInitialCommit, ensureProjectRepo, gitInit, hasCommits, INITIAL_COMMIT_MESSAGE } = require('./git-repo');
 
 const execAsync = promisify(exec);
 
@@ -121,4 +121,19 @@ test('a repo with a remote and no commits, an abandoned clone, gets its first co
   assert.equal(await ensureProjectRepo(dir), 'created');
   assert.equal(await hasCommits(dir), true);
   await execAsync(`git -C ${dir} worktree add -b ws1 ${path.join(dir, '.worktrees', 'ws1')} HEAD`);
+});
+
+test('concurrent inits of one dir both succeed (init-wiki and tmux-create race)', async () => {
+  for (let i = 0; i < 10; i++) {
+    const dir = path.join(mkRoot(), 'proj');
+    fs.mkdirSync(dir);
+    await Promise.all([gitInit(dir), gitInit(dir), gitInit(dir)]);
+    assert.ok(fs.existsSync(path.join(dir, '.git', 'HEAD')));
+  }
+});
+
+test('gitInit still fails when the dir cannot become a repo', async () => {
+  const file = path.join(mkRoot(), 'not-a-dir');
+  fs.writeFileSync(file, 'x');
+  await assert.rejects(gitInit(file));
 });

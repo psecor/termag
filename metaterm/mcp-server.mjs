@@ -267,7 +267,7 @@ export const READ_TOOLS = [
   },
   {
     name: 'latest_briefing',
-    description: 'Your most recent composed daily briefing (summary, what was left open, what to pick up), plus one still running if any. State its window label first when you discuss it.',
+    description: 'Your most recent composed daily briefing (a headline; Worked on, Left open in the order to take them, and Work better habits; stats and charts), plus one still running if any, and the items you marked Done or deferred (`dismissals`, by key). State its window label first when you discuss it.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
 ];
@@ -412,6 +412,33 @@ export const SPAWN_TOOL = {
   },
 };
 
+export const DISMISS_TOOL = {
+  name: 'dismiss_spawn',
+  description: 'Finish with one of the agents THIS session spawned. action "park" stops its agent CLI to free box memory and keeps its worktree, branch, conversation and report (its owner can resume it). action "retire" removes its workstream (worktree, tmux pair, Slack channel, and its local branch once pushed), and is refused, with the reason, if that would lose uncommitted or unpushed work. Use park when you may want a follow-up from it, retire once its work has landed. Spawn ids come from list_spawns.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      spawnId: { type: 'string', description: 'From list_spawns' },
+      action: { type: 'string', enum: ['park', 'retire'] },
+    },
+    required: ['spawnId', 'action'],
+    additionalProperties: false,
+  },
+};
+
+export const ADOPT_TOOL = {
+  name: 'adopt_spawn',
+  description: 'Take an orphaned spawned agent as your own: one whose parent session went away and that nobody adopted. list_spawns lists them under "orphaned". From then on its reports come to THIS session (you are nudged when it reports, and can dismiss_spawn it). Only orphans of your own user; anything already adopted is refused.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      spawnId: { type: 'string', description: 'From the orphaned list in list_spawns' },
+    },
+    required: ['spawnId'],
+    additionalProperties: false,
+  },
+};
+
 export function toolsFor(sendKeys, spawn = { enabled: true }, handoff = { enabled: true }) {
   return [
     ...READ_TOOLS,
@@ -419,17 +446,20 @@ export function toolsFor(sendKeys, spawn = { enabled: true }, handoff = { enable
     ...COLLAB_TOOLS,
     HANDOFF_WRITTEN_TOOL,
     ...(sendKeys.enabled ? [SEND_KEYS_TOOL] : []),
-    ...(spawn.enabled ? [SPAWN_TOOL] : []),
+    ...(spawn.enabled ? [SPAWN_TOOL, DISMISS_TOOL, ADOPT_TOOL] : []),
     ...(handoff.enabled ? [HANDOFF_TOOL] : []),
   ];
 }
 
-export function fmtSpawn(s) {
+export function fmtSpawn(s, { withReport = true } = {}) {
   const child = `${s.child.projectName}${s.child.workstream !== 'main' ? `/${s.child.workstream}` : ''}`;
-  const lines = [`● ${child} [${s.relationship}, ${s.provider}] state=${s.state} status=${s.child.status ?? '-'}  "${s.title}"  spawnId=${s.id}`];
+  const lifecycle = s.lifecycle ? ` lifecycle=${s.lifecycle}` : '';
+  const lines = [`● ${child} [${s.relationship}, ${s.provider}] state=${s.state}${lifecycle} status=${s.child.status ?? '-'}  "${s.title}"  spawnId=${s.id}`];
   if (s.child.projectId) lines.push(`    projectId=${s.child.projectId} workstream=${s.child.workstream} session=${s.child.session}`);
+  if (s.foster) lines.push(`    adopted (${s.foster.by ?? 'owner'}): its parent ${s.parent?.session ?? 'session'} went away`);
   if (s.error) lines.push(`    error: ${s.error}`);
-  if (s.report) {
+  if (s.report && !withReport) lines.push(`    has a report (${s.report.status}): adopt it to read it`);
+  else if (s.report) {
     lines.push(`    report (${s.report.status}, ${s.reportedAt ?? s.report.at}):`);
     lines.push('    [BEGIN untrusted report text]');
     for (const l of String(s.report.summary ?? '').split('\n')) lines.push(`    ${l}`);
@@ -486,14 +516,31 @@ export function fmtBudget(b) {
   return out.join('\n');
 }
 
-export function fmtSpawns(r) {
+/** `base` is the termag URL (resolveBaseUrl): each tree's network view is linked under it. */
+export function fmtSpawns(r, base = null) {
   const out = [];
   if (r.spawnedBy) {
     const p = r.spawnedBy.parent;
-    out.push(`This session is a ${r.spawnedBy.relationship} spawned by ${p?.session ?? 'another session'} (spawnId=${r.spawnedBy.id}, state=${r.spawnedBy.state}). Report with report_back.`);
+    const adopted = r.spawnedBy.foster ? `; that session went away and you were adopted (${r.spawnedBy.foster.by ?? 'owner'}), so your reports go to the adopter` : '';
+    out.push(`This session is a ${r.spawnedBy.relationship} spawned by ${p?.session ?? 'another session'} (spawnId=${r.spawnedBy.id}, state=${r.spawnedBy.state})${adopted}. Report with report_back.`);
   }
   if (!r.children?.length) out.push('No agents spawned from this session.');
-  else out.push(`${r.children.length} spawned agent(s), newest first:`, ...r.children.map(fmtSpawn));
+  else out.push(`${r.children.length} spawned agent(s), newest first:`, ...r.children.map(s => fmtSpawn(s)));
+  if (r.orphans?.length) {
+    out.push(`${r.orphans.length} orphaned agent(s) of yours that nobody adopted (their parent went away); adopt_spawn takes one:`, ...r.orphans.map(s => fmtSpawn(s, { withReport: false })));
+  }
+  if (base) {
+    const roots = [...new Set([r.spawnedBy, ...(r.children ?? [])].map(s => s?.rootSpawnId ?? s?.id).filter(Boolean))].slice(0, 3);
+    for (const id of roots) out.push(`network view (in the browser): ${base}/spawns/${encodeURIComponent(id)}`);
+    // Every tree this session started, as one network (its own children are its trees' roots).
+    // Its own: an orphan it adopted still names the session that spawned it. Matched by project and
+    // workstream (a rename changes the stored session name); by session name from an older backend.
+    const own = r.caller
+      ? c => c.parent.projectId === r.caller.projectId && (c.parent.workstream ?? 'main') === r.caller.workstream
+      : c => c.parent.session === r.session;
+    const mine = (r.children ?? []).find(c => c?.parent?.projectId && c.depth === 1 && own(c));
+    if (mine) out.push(`every tree this session started: ${base}/spawns/session/${encodeURIComponent(mine.parent.projectId)}/${encodeURIComponent(mine.parent.workstream ?? 'main')}`);
+  }
   return out.join('\n');
 }
 
@@ -669,7 +716,8 @@ export function createServer(deps = {}) {
         const own = needOwnSession('list_spawns');
         const r = await api('GET', `/spawns?session=${q(own)}`);
         const budget = fmtBudget(r.budget);
-        return budget ? `${fmtSpawns(r)}\n${budget}` : fmtSpawns(r);
+        const text = fmtSpawns(r, resolveBaseUrl(env, loadConfig()));
+        return budget ? `${text}\n${budget}` : text;
       }
       case 'spawn_budget': {
         const own = needOwnSession('spawn_budget');
@@ -694,6 +742,20 @@ export function createServer(deps = {}) {
       case 'slack_inbox': {
         const own = needOwnSession('slack_inbox');
         return fmtCollab(await api('GET', `/collab/requests?session=${q(own)}`));
+      }
+      case 'dismiss_spawn': {
+        if (!spawn.enabled) throw new Error('dismiss_spawn is off in this session, like spawn_agent. Start the agent with METATERM_SPAWN=on to allow it.');
+        const own = needOwnSession('dismiss_spawn');
+        if (typeof a.spawnId !== 'string' || !/^[a-z0-9]+$/i.test(a.spawnId)) throw new Error('spawnId must be an id from list_spawns');
+        const r = await api('POST', `/spawns/${q(a.spawnId)}/dismiss`, { action: a.action, session: own });
+        return `${r.lifecycle} (spawnId=${r.spawn}): ${r.note}`;
+      }
+      case 'adopt_spawn': {
+        if (!spawn.enabled) throw new Error('adopt_spawn is off in this session, like spawn_agent. Start the agent with METATERM_SPAWN=on to allow it.');
+        const own = needOwnSession('adopt_spawn');
+        if (typeof a.spawnId !== 'string' || !/^[a-z0-9]+$/i.test(a.spawnId)) throw new Error('spawnId must be an id from list_spawns');
+        const r = await api('POST', `/spawns/${q(a.spawnId)}/adopt`, { session: own });
+        return `adopted (spawnId=${r.spawn}): ${r.note}`;
       }
       case 'spawn_agent': {
         if (!spawn.enabled) throw new Error('spawn_agent is off in this session. Start the agent with METATERM_SPAWN=on to allow it.');

@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   baseUrlFromAgentUrl, resolveBaseUrl, resolveToken, configCandidates, loadAgentConfig,
-  sendKeysSetting, sendKeysOffMessage, findProjectSetting, isSelfTarget, toolsFor, createServer, spawnSetting, fmtBudget, handoffSetting,
+  sendKeysSetting, sendKeysOffMessage, findProjectSetting, isSelfTarget, toolsFor, createServer, spawnSetting, fmtBudget, fmtSpawns, handoffSetting,
 } from './mcp-server.mjs';
 
 const SERVER = fileURLToPath(new URL('./mcp-server.mjs', import.meta.url));
@@ -55,13 +55,13 @@ test('config search order matches deploy/termag-status', () => {
 test('send_keys is on by default, so the orchestrator MetaTerm keeps it', () => {
   const s = sendKeysSetting({ env: {}, cwd: '/h/p', home: '/h', read: files({}) });
   assert.deepEqual(s, { enabled: true, source: 'default' });
-  assert.deepEqual(toolsFor(s).map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'send_keys', 'spawn_agent', 'handoff']);
+  assert.deepEqual(toolsFor(s).map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'send_keys', 'spawn_agent', 'dismiss_spawn', 'adopt_spawn', 'handoff']);
 });
 
 test('the box registration default turns send_keys off', () => {
   const s = sendKeysSetting({ env: { METATERM_SEND_KEYS_DEFAULT: 'off' }, cwd: '/h/p', home: '/h', read: files({}) });
   assert.equal(s.enabled, false);
-  assert.deepEqual(toolsFor(s).map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'spawn_agent', 'handoff']);
+  assert.deepEqual(toolsFor(s).map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'spawn_agent', 'dismiss_spawn', 'adopt_spawn', 'handoff']);
 });
 
 test('a project opts in with .claude/metaterm.json, found from a subdirectory', () => {
@@ -323,7 +323,7 @@ test('over stdio: a box config is enough, and a project file opts into send_keys
       ];
 
       const [list, call] = await rpc(env, project, msgs);
-      assert.deepEqual(list.result.tools.map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'spawn_agent', 'handoff']);
+      assert.deepEqual(list.result.tools.map(t => t.name), ['list_sessions', 'capture_pane', 'search_sessions', 'session_status', 'activity_ledger', 'latest_briefing', 'spawn_budget', 'list_spawns', 'report_back', 'draft_slack_message', 'slack_inbox', 'handoff_written', 'spawn_agent', 'dismiss_spawn', 'adopt_spawn', 'handoff']);
       assert.match(call.result.content[0].text, /2 session\(s\)/);
       assert.deepEqual(seen[0], { url: '/termag/api/sessions', auth: 'Bearer tmag_box' });
 
@@ -496,4 +496,63 @@ test('handoff_written posts the body for the id it was asked for', async () => {
   assert.equal(await srv.callTool('handoff_written', { handoffId: 'ck1', body: '## Goal' }), 'Saved. End your turn now.');
   assert.deepEqual(calls[0].body, { session: 'me-proj-agent', body: '## Goal' });
   await assert.rejects(srv.callTool('handoff_written', { handoffId: '../x', body: 'x' }), /handoffId must be/);
+});
+
+test('dismiss_spawn sends its own session and the action, and shows a kept refusal as is', async () => {
+  const { srv, calls } = server((p) => (p === '/termag/api/spawns/ck1/dismiss'
+    ? [200, { ok: true, spawn: 'ck1', lifecycle: 'parked', note: 'its agent CLI is stopped; the worktree and conversation are kept' }]
+    : p === '/termag/api/spawns/ck2/dismiss' ? [409, { error: 'kept: 2 commits not pushed', code: 'kept' }] : null), {
+    ownSession: () => 'me-proj-agent',
+  });
+  assert.match(await srv.callTool('dismiss_spawn', { spawnId: 'ck1', action: 'park' }), /^parked \(spawnId=ck1\): its agent CLI is stopped/);
+  assert.deepEqual(calls[0].body, { action: 'park', session: 'me-proj-agent' });
+  await assert.rejects(srv.callTool('dismiss_spawn', { spawnId: 'ck2', action: 'retire' }), /409: kept: 2 commits not pushed/);
+  await assert.rejects(srv.callTool('dismiss_spawn', { spawnId: '../x', action: 'park' }), /spawnId must be/);
+});
+
+test('list_spawns shows a child\'s lifecycle', () => {
+  const s = { id: 'ck1', relationship: 'delegate', provider: 'claude', state: 'done', title: 't', lifecycle: 'parked · kept: uncommitted changes',
+    child: { projectName: 'proj', workstream: 'ws', status: 'not_running' } };
+  assert.match(fmtSpawns({ children: [s], spawnedBy: null }), /state=done lifecycle=parked · kept: uncommitted changes status=not_running/);
+});
+
+test('adopt_spawn sends its own session, and list_spawns lists orphans without their reports', async () => {
+  const { srv, calls } = server((p) => (p === '/termag/api/spawns/ck7/adopt'
+    ? [200, { ok: true, spawn: 'ck7', foster: 'me-proj-agent', note: 'its reports now come to the foster' }]
+    : p === '/termag/api/spawns/ck8/adopt' ? [409, { error: 'it is not an orphan: its parent (or a foster) still takes its reports', code: 'not_orphan' }] : null), {
+    ownSession: () => 'me-proj-agent',
+  });
+  assert.equal(await srv.callTool('adopt_spawn', { spawnId: 'ck7' }), 'adopted (spawnId=ck7): its reports now come to the foster');
+  assert.deepEqual(calls[0].body, { session: 'me-proj-agent' });
+  await assert.rejects(srv.callTool('adopt_spawn', { spawnId: 'ck8' }), /409: it is not an orphan/);
+
+  const o = { id: 'ck7', relationship: 'delegate', provider: 'claude', state: 'done', title: 't', report: { status: 'done' },
+    child: { projectName: 'proj', workstream: 'leaf', status: 'idle' } };
+  const out = fmtSpawns({ children: [], spawnedBy: null, orphans: [o] });
+  assert.match(out, /1 orphaned agent\(s\) of yours that nobody adopted/);
+  assert.match(out, /has a report \(done\): adopt it to read it/);
+  assert.doesNotMatch(out, /untrusted report text/);
+  const adopted = { ...o, foster: { by: 'ancestor' }, parent: { session: 'me-proj-mid-agent' }, report: { status: 'done', summary: 'hi' } };
+  assert.match(fmtSpawns({ children: [], spawnedBy: { ...adopted, foster: { by: 'home' } } }), /you were adopted \(home\), so your reports go to the adopter\. Report with report_back/);
+  assert.match(fmtSpawns({ children: [adopted], spawnedBy: null }), /adopted \(ancestor\): its parent me-proj-mid-agent went away[\s\S]*BEGIN untrusted report text/);
+});
+
+test('fmtSpawns links each tree\'s network view under the termag URL, once per tree', () => {
+  const kid = (id, root) => ({ id, rootSpawnId: root, relationship: 'delegate', provider: 'claude', state: 'running', title: 't', child: { projectName: 'p', workstream: id, status: 'idle' } });
+  const out = fmtSpawns({ spawnedBy: { ...kid('me', 'r1'), parent: { session: 's' } }, children: [kid('a', 'r1'), kid('b', 'r1')] }, 'https://host/termag');
+  assert.equal(out.match(/network view/g).length, 1);
+  assert.match(out, /network view \(in the browser\): https:\/\/host\/termag\/spawns\/r1/);
+  assert.doesNotMatch(fmtSpawns({ children: [kid('a', 'r1')], spawnedBy: null }), /network view/);
+});
+
+test('fmtSpawns links the session\'s own view when it started trees', () => {
+  const kid = { id: 'r1', rootSpawnId: 'r1', depth: 1, relationship: 'delegate', provider: 'claude', state: 'running', title: 't', child: { projectName: 'p', workstream: 'a', status: 'idle' }, parent: { projectId: 'p1', workstream: 'main', session: 's' } };
+  assert.match(fmtSpawns({ session: 's', spawnedBy: null, children: [kid] }, 'https://host/termag'), /every tree this session started: https:\/\/host\/termag\/spawns\/session\/p1\/main/);
+  assert.doesNotMatch(fmtSpawns({ session: 's', spawnedBy: null, children: [{ ...kid, depth: 2 }] }, 'https://host/termag'), /every tree this session started/);
+  // An orphan this session adopted still names the session that spawned it: not this one's view.
+  const adopted = { ...kid, parent: { projectId: 'p9', workstream: 'other', session: 'someone-else' }, foster: { by: 'agent' } };
+  assert.doesNotMatch(fmtSpawns({ session: 's', spawnedBy: null, children: [adopted] }, 'https://host/termag'), /every tree this session started/);
+  // Renamed since: the stored session name is stale, but the slot matches.
+  assert.match(fmtSpawns({ session: 'renamed', caller: { projectId: 'p1', workstream: 'main' }, spawnedBy: null, children: [kid] }, 'https://host/termag'), /spawns\/session\/p1\/main/);
+  assert.doesNotMatch(fmtSpawns({ session: 's', caller: { projectId: 'p1', workstream: 'main' }, spawnedBy: null, children: [adopted] }, 'https://host/termag'), /every tree this session started/);
 });

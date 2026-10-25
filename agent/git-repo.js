@@ -70,6 +70,21 @@ async function hasCommits(dir) {
   }
 }
 
+// `git init dir`, tolerating a concurrent one. A new project's init-wiki and
+// tmux-create both init its dir, and the agent runs them at once; two inits
+// race on copying git's templates, and the loser fails with "cannot copy
+// ...: File exists" (homebrew git on macOS does, at least). The repo is there
+// either way, so a failure that leaves `dir` a repo root is not one. The
+// backend's copy (services/gitRepo.ts, services/tmux.ts) runs its inits one
+// after another, so it has no such race.
+async function gitInit(dir) {
+  try {
+    await execAsync(`git init ${shellEscape(dir)}`);
+  } catch (err) {
+    if (!(await isRepoRoot(dir))) throw err;
+  }
+}
+
 // Make `dir` a git repo with at least one commit: `git init` unless it is
 // already a repo root, then the initial commit. Idempotent.
 //
@@ -77,7 +92,7 @@ async function hasCommits(dir) {
 // so this is the only thing that makes its dir a repo at all.
 async function ensureProjectRepo(dir) {
   if (!(await isRepoRoot(dir))) {
-    await execAsync(`git init ${shellEscape(dir)}`);
+    await gitInit(dir);
   }
   return ensureInitialCommit(dir);
 }
@@ -117,6 +132,7 @@ async function ensureInitialCommit(dir) {
 }
 
 module.exports = {
+  gitInit,
   ensureProjectRepo,
   ensureInitialCommit,
   hasCommits,

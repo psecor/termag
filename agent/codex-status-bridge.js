@@ -206,7 +206,9 @@ async function main() {
   // The app server is where Codex works and exports from, so it starts with
   // termag's telemetry (deploy/termag-agent-otel),
   // which runs it unchanged when the box has none. The TUI in the pane is a
-  // --remote client of it.
+  // --remote client of it. The environment is this process's, which agent.js
+  // gave TERMAG_PROJECT / TERMAG_WORKSTREAM from the codex-session-start RPC;
+  // termag-agent-otel reads the pair onto the resource.
   const otel = path.join(__dirname, '..', 'deploy', 'termag-agent-otel');
   const appServer = ['app-server', '--listen', url];
   const [command, commandArgs] = fs.existsSync(otel)

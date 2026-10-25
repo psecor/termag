@@ -291,9 +291,22 @@ async function freeKbOf(dir, execFile) {
   }
 }
 
-function createNewFile(dirfd, name, content) {
+// The file is named through the directory fd, so a directory swapped for a
+// link after it was opened is never written through. Without /proc (macOS,
+// where only the e2e stack's stand-in boxes clone) the directory's path is
+// used instead, and only while it still is the directory the fd holds.
+function guidePath(dirfd, dir, name) {
+  if (fs.existsSync('/proc/self/fd')) return `/proc/self/fd/${dirfd}/${name}`;
+  const held = fs.fstatSync(dirfd);
+  const now = fs.lstatSync(dir);
+  if (!now.isDirectory() || now.dev !== held.dev || now.ino !== held.ino) return null;
+  return path.join(dir, name);
+}
+
+function createNewFile(dirfd, name, content, dir) {
   if (name.includes('/') || name.includes('\0')) return false;
-  const at = `/proc/self/fd/${dirfd}/${name}`;
+  const at = guidePath(dirfd, dir, name);
+  if (!at) return false;
   let existing;
   try {
     existing = fs.lstatSync(at);
@@ -329,8 +342,8 @@ function writeGuides(dir, slug, username, templatePath) {
     .replace(/<handle>/g, username);
   const dirfd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
   try {
-    if (!createNewFile(dirfd, 'AGENTS.md', content)) return;
-    createNewFile(dirfd, 'CLAUDE.md', '@AGENTS.md\n');
+    if (!createNewFile(dirfd, 'AGENTS.md', content, dir)) return;
+    createNewFile(dirfd, 'CLAUDE.md', '@AGENTS.md\n', dir);
   } finally {
     fs.closeSync(dirfd);
   }

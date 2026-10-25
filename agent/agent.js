@@ -21,22 +21,34 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
-const { sendKeysArgv, enterArgv, captureArgv, tailLines, newSessionArgv, newSessionOptionArgvs, tmuxSessionTarget, CAPABILITIES: TMUX_CAPABILITIES } = require('./tmux-args');
+const { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, CAPABILITIES: TMUX_CAPABILITIES } = require('./tmux-args');
+const worktreeFetch = require('./worktree-fetch');
 const hostSample = require('./host-sample');
 const unsavedWork = require('./unsaved-work');
 const softwareInventory = require('./software-inventory');
 const runnerSessions = require('./runner-sessions');
 const { renameProject } = require('./project-rename');
+const { writeFileRpc } = require('./write-file');
 const { gitBranchState } = require('./git-branch-state');
 const gitWorktreePr = require('./git-worktree-pr');
+const gitWorktreeOwn = require('./git-worktree-own');
 const briefing = require('./briefing-digest');
 const { dialArgs, refusedForWantOfQueryToken, redialDelayMs, DRAIN_CLOSE_CODE } = require('./agent-dial');
 const credentials = require('./credentials');
 const { planOnClaim, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
 const boxUpdate = require('./box-update');
 const askRun = require('./ask-run');
+const askChat = require('./ask-chat');
 const projectClone = require('./project-clone');
 const chatRunner = require('./chat-runner');
+const browserPane = require('./browser-pane');
+const browserGuest = require('./browser-guest');
+const { codexResourceEnv, withoutResourceEnv } = require('./codex-resource-env');
+const { CLIPBOARD_MAX_BYTES, writeClipboardMailbox, clipboardPasteImage } = require('./clipboard-mailbox');
+const readImage = require('./read-image');
+const claudeTrust = require('./claude-trust');
+const runnerWrapper = require('./claude-runner-wrapper');
+const claudeLogin = require('./claude-login');
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -82,7 +94,7 @@ function remapPath(p) {
 
 // ── Wiki init ─────────────────────────────────────────────────────────────
 const { readFile: readFileAsync, writeFile } = require('fs/promises');
-const { ensureProjectRepo } = require('./git-repo');
+const { ensureProjectRepo, gitInit } = require('./git-repo');
 
 // Bundled template ships next to this file. Override with TERMAG_WIKI_TEMPLATE_PATH
 // to point at a different one (e.g. an agent-wiki checkout that gets curated centrally).
@@ -443,6 +455,21 @@ const chats = chatRunner.createChatRunner({
   // that was only marked cancelled look stopped while Claude was still alive.
   stopSession: (name) => execFileAsync('tmux', ['kill-session', '-t', tmuxSessionTarget(name, true)]),
   log: (line) => console.log(line),
+  onTurnDone: (meta, dir) => askChats.onTurnDone(meta, dir),
+  onDropped: (jobs) => askChats.onDropped(jobs),
+});
+// An ask's thread as a chat of its target project (ask-chat.js).
+const askChats = askChat.createAskChat({
+  home: process.env.HOME || os.homedir(),
+  chats,
+  spawn,
+  log: (line) => console.log(line),
+});
+// One Claude Enterprise sign-in for this box (claude-login.js). The one-time
+// code is written to that CLI's stdin and is not logged.
+const claudeSignIn = claudeLogin.createClaudeLogin({
+  home: process.env.HOME || os.homedir(),
+  execFile: execFileAsync,
 });
 // Shut until the backend's chat-recover names which chats are archived or
 // gone. Recovering at import would reattach a turn whose project was deleted
@@ -632,11 +659,10 @@ function stopRateLimitScanner() {
 }
 
 // ── Browser clipboard mailbox ─────────────────────────────────────────────
-// One-shot drop point for an image pasted in the browser. Written here, read
-// (and deleted) by agent/xclip-shim.sh on Claude Code's behalf.
-const CLIPBOARD_DIR = path.join(process.env.HOME || '/home', '.cache', 'termag');
-const CLIPBOARD_SLOT = path.join(CLIPBOARD_DIR, 'clipboard.png');
-const CLIPBOARD_MAX_BYTES = 20 * 1024 * 1024;
+// One-shot drop point for an image pasted in the browser. Written here
+// (agent/clipboard-mailbox.js), read (and deleted) by agent/xclip-shim.sh on
+// Claude Code's behalf.
+const CLIPBOARD_SLOT = path.join(process.env.HOME || '/home', '.cache', 'termag', 'clipboard.png');
 
 function ensureClipboardShim() {
   const shim = fs.readFileSync(path.join(__dirname, 'xclip-shim.sh'), 'utf8');
@@ -702,7 +728,7 @@ function stopCodexBridge(sessionName) {
   try { bridge.child.kill('SIGTERM'); } catch { /* ignore */ }
 }
 
-async function startCodexSession(sessionName, cwd) {
+async function startCodexSession(sessionName, cwd, resourceEnv = {}) {
   stopCodexBridge(sessionName);
 
   const port = await getFreePort();
@@ -725,7 +751,11 @@ async function startCodexSession(sessionName, cwd) {
     // Pass the bearer token via env, NOT argv: process command lines are
     // world-readable (/proc/<pid>/cmdline, ps) on shared hosts, but environ is
     // readable only by the owner + root. The bridge reads TERMAG_STATUS_BEARER_TOKEN.
-    { cwd, env: { ...process.env, TERMAG_STATUS_BEARER_TOKEN: token } },
+    // TERMAG_PROJECT / TERMAG_WORKSTREAM (resourceEnv, both or neither) reach
+    // the app server the bridge starts through termag-agent-otel, which puts
+    // them on its resource as termag.project / termag.workstream;
+    // the agent's own environment never carries them.
+    { cwd, env: { ...withoutResourceEnv(process.env), ...resourceEnv, TERMAG_STATUS_BEARER_TOKEN: token } },
   );
 
   codexBridges.set(sessionName, { child, port, remoteUrl });
@@ -753,6 +783,22 @@ credentials.configure({ agentConfig: path.resolve(configPath) });
 // checkout pulled since the agent started still runs the old code, and that
 // is what this reports, which is the point. Null outside a git checkout.
 const CHECKOUT_DIR = path.resolve(__dirname, '..');
+// The browser pane runs the box's Chromium; found once
+// here, and the capability is advertised only when there is one.
+const browserBinary = browserPane.findChromium();
+console.log(`[AGENT] browser pane: ${browserBinary ? browserBinary : 'no Chromium found, capability not advertised'}`);
+// A reviewer's pane runs its Chromium as termag-guest
+// through the box's launcher: asked once whether that works here (the box
+// image or termag-reconcile installs it), and the guest capability is
+// advertised only when it does.
+const guestBrowser = browserBinary ? browserGuest.guestEnvironment() : { ok: false, reason: 'no Chromium' };
+console.log(`[AGENT] browser pane guests: ${guestBrowser.ok ? `available (${guestBrowser.profilesRoot})` : `unavailable: ${guestBrowser.reason}`}`);
+// One manager for the process: a pane's browser is parked across a socket
+// drop or a closed pane and reclaimed by the next attach with its key.
+// Kept profiles are indexed
+// in the agent's own state dir; the backend asks for one per attach.
+const browserProfiles = new browserPane.ProfileIndex(path.join(os.homedir() || process.env.HOME || '/', '.local', 'state', 'termag', 'browser-profiles.json'));
+const browsers = browserPane.createManager({ binary: browserBinary, home: os.homedir() || process.env.HOME || '/', guestEnv: guestBrowser, index: browserProfiles });
 let agentCommit = null;
 // When that commit was made (ISO 8601), beside it in the hello: the admin
 // Fleet table sorts boxes by it.
@@ -761,6 +807,9 @@ let agentCommitAt = null;
 // capability is announced only then (agent/box-update.js).
 let boxUpdateCapable = false;
 let projectCloneCapable = false;
+// Whether the installed termag-claude-runner understands the git flags; the
+// wrapper capability is announced only then (agent/claude-runner-wrapper.js).
+let wrapperFlagsCapable = false;
 
 // Tell the backend which host this agent is on, so it stops guessing
 // /home/<user> for the project directories it sends back.
@@ -797,13 +846,22 @@ function sendHello(ws) {
         ...(boxUpdateCapable ? boxUpdate.CAPABILITIES : []),
         // ask-v1 only where termag-reconcile installed termag-subagent-run.
         ...(askRun.askRunnerInstalled(os.homedir() || process.env.HOME || '/') ? askRun.CAPABILITIES : []),
+        ...(askChats.capable() ? askChat.CAPABILITIES : []),
         ...(projectCloneCapable ? projectClone.CAPABILITIES : []),
         ...hostSample.CAPABILITIES,
         ...unsavedWork.CAPABILITIES,
         ...softwareInventory.CAPABILITIES,
         ...briefing.CAPABILITIES,
         ...chatRunner.CAPABILITIES,
+        ...claudeLogin.CAPABILITIES,
         ...gitWorktreePr.CAPABILITIES,
+        ...worktreeFetch.CAPABILITIES,
+        ...readImage.CAPABILITIES,
+        ...claudeTrust.CAPABILITIES,
+        ...(browserBinary ? browserPane.CAPABILITIES : []),
+        ...(guestBrowser.ok ? [browserPane.GUEST_CAPABILITY] : []),
+        ...(browserBinary ? [browserPane.PROFILES_CAPABILITY] : []),
+        ...(wrapperFlagsCapable ? runnerWrapper.CAPABILITIES : []),
       ],
     }));
   } catch (err) {
@@ -817,6 +875,21 @@ let tokenInQuery = false;
 let drainCloses = 0;
 const DRAIN_STREAK_RESET_MS = 10_000;
 
+/**
+ * Mark a worktree made from origin's tip with nobody watching (an automation
+ * run) so the chat runner never loads its startup config, even for a later
+ * trusted follow-up (chat-runner.js turnModeFor). The write is read back and
+ * a miss is fatal: an unmarked tree would be taken for an attended one. The
+ * orchestrator caps such turns on its side too (routes/chat.ts followUpMode);
+ * this marker is the box's own half of that.
+ */
+async function markUnattended(worktreePath, branch) {
+  const key = `branch.${branch}.termagUnattended`;
+  await execFileAsync('git', ['-C', worktreePath, 'config', '--local', key, 'true'], { timeout: 5000 });
+  const { stdout } = await execFileAsync('git', ['-C', worktreePath, 'config', '--local', '--get', key], { timeout: 5000 });
+  if (String(stdout || '').trim() !== 'true') throw new Error(`could not mark ${worktreePath} unattended`);
+}
+
 function connect() {
   const { url, options } = dialArgs(termag_url, token, { tokenInQuery });
   console.log(`[AGENT] Connecting to ${termag_url.replace(/\?.*/, '')}${tokenInQuery ? ' (token in query, for an older orchestrator)' : ''}...`);
@@ -828,6 +901,12 @@ function connect() {
     openedAt = Date.now();
     console.log('[AGENT] Connected to termag');
     liveSocket = ws;
+    // Browser panes ride this socket: frames go out on
+    // it and the acks that pace Chromium read its buffer.
+    browsers.bindSocket({
+      send: (frame) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame)); },
+      bufferedAmount: () => ws.bufferedAmount,
+    });
     sendHello(ws);
     startOnClaimForwarder(ws);
     startCloneForwarder(ws);
@@ -878,7 +957,7 @@ function connect() {
           // gitInit: false opts out (the Claude runner session lives in a
           // state directory that must not become a repository).
           if (!alreadyRepo && msg.gitInit !== false) {
-            await execAsync(`git init ${shellEscape(cwd)}`);
+            await gitInit(cwd);
           }
           // `command` (argv, tmux-create-command-v1): the pane runs that
           // program instead of a shell, and the session ends when it exits.
@@ -963,14 +1042,15 @@ function connect() {
         case 'tmux-foreground-cmd': {
           const { sessionName } = msg;
           try {
+            // pane_dead first, so a pane whose process has exited is not
+            // reported as a live Claude just because the name stuck.
             const { stdout } = await execAsync(
-              `tmux list-panes -t ${shellEscape(sessionName)} -F '#{pane_current_command}'`
+              `tmux list-panes -t ${shellEscape(sessionName)} -F '#{pane_dead} #{pane_current_command}'`
             );
-            const cmd = stdout.trim().split('\n')[0] ?? null;
-            respond(ws, requestId, { cmd });
+            respond(ws, requestId, parseForeground(stdout));
           } catch {
             // Session doesn't exist or tmux not available
-            respond(ws, requestId, { cmd: null });
+            respond(ws, requestId, { cmd: null, dead: false });
           }
           break;
         }
@@ -1048,18 +1128,30 @@ function connect() {
           break;
         }
 
+        case 'read-image': {
+          // The web terminal's hover preview of an image path in a pane
+          // (agent/read-image.js). Agents from before this case answer
+          // "Unknown command", which the backend turns into a 501.
+          respond(ws, requestId, await readImage.readImageRpc(msg, { remapPath }));
+          break;
+        }
+
+        case 'claude-trust-folder': {
+          // Accept Claude Code's folder-trust prompt for a spawned agent's
+          // folder before its launch, once the folder passes the check the
+          // backend names (agent/claude-trust.js). Agents from before this
+          // case answer "Unknown command"; the backend only sends it to one
+          // announcing claude-trust-folder-v1.
+          const changed = await claudeTrust.trustFolder(remapPath(msg.path), {
+            check: msg.check,
+            ownTree: async (dir) => chatRunner.checkoutOwnTree(await chatRunner.readCheckoutFacts(dir)),
+          });
+          respond(ws, requestId, { ok: true, changed });
+          break;
+        }
+
         case 'write-file': {
-          const p = remapPath(msg.path);
-          if (typeof msg.content !== 'string') throw new Error('write-file: content must be a string');
-          // `mode` (optional): the file's permissions, applied before any
-          // content lands (the Claude runner's work order is written 0600).
-          const mode = Number.isInteger(msg.mode) && msg.mode >= 0 && msg.mode <= 0o777 ? msg.mode : null;
-          await mkdir(path.dirname(p), { recursive: true });
-          if (mode !== null) {
-            await writeFile(p, '', { flag: 'a', mode });
-            await fs.promises.chmod(p, mode);
-          }
-          await writeFile(p, msg.content, 'utf8');
+          await writeFileRpc(remapPath(msg.path), msg.content, { mode: msg.mode, dirMode: msg.dirMode });
           respond(ws, requestId, { ok: true });
           break;
         }
@@ -1070,9 +1162,18 @@ function connect() {
           // to HEAD). The worktree lives inside the main project dir so it
           // travels along on rename and stays grouped with its parent.
           const projectDir = remapPath(msg.projectDir);
-          const { worktreeName, branch, baseRef, initRepo } = msg;
+          const { worktreeName, branch, baseRef, initRepo, fetch } = msg;
           if (!projectDir || !worktreeName || !branch) {
             throw new Error('projectDir, worktreeName, and branch are required');
+          }
+          // An automation run starts from the default branch as origin has
+          // it now (agent/worktree-fetch.js): fetch it first, and say whether
+          // that worked. A failed fetch is not fatal; the add below uses the
+          // remote-tracking ref the box already had.
+          let fetched = null;
+          if (fetch !== undefined) {
+            if (!worktreeFetch.isFetchBranchName(fetch)) throw new Error('fetch must name a branch');
+            fetched = await worktreeFetch.fetchOriginBranch(execFileAsync, projectDir, fetch);
           }
           // Projects created before repo setup was automatic can still have an
           // unborn HEAD (or no repo at all), which `worktree add` can't work
@@ -1091,7 +1192,13 @@ function connect() {
             try {
               const { stdout } = await execAsync(`git -C ${shellEscape(worktreePath)} rev-parse --abbrev-ref HEAD`);
               if (stdout.trim() === branch) {
-                respond(ws, requestId, { ok: true, path: worktreePath, existing: true });
+                // A reused run worktree is as unattended as a new one (below).
+                if (fetched !== null) await markUnattended(worktreePath, branch);
+                // The fetch above ran all the same; say so, and where this tree is.
+                respond(ws, requestId, {
+                  ok: true, path: worktreePath, existing: true,
+                  ...(fetched === null ? {} : { fetched, baseSha: await worktreeFetch.headSha(execFileAsync, worktreePath) }),
+                });
                 break;
               }
             } catch { /* not a worktree: let git worktree add report it */ }
@@ -1099,7 +1206,22 @@ function connect() {
           await execAsync(
             `git -C ${shellEscape(projectDir)} worktree add -b ${shellEscape(branch)} ${shellEscape(worktreePath)} ${shellEscape(ref)}`
           );
-          respond(ws, requestId, { ok: true, path: worktreePath });
+          // The chat runner trusts a branch-off only once this proof is written,
+          // and only when `ref` is already marked own or is the main worktree's
+          // current same-repo branch. A raw commit, a pull ref, an unmarked
+          // origin/<name>, or another remote is left unmarked. An existing
+          // worktree reused above is not marked either: a missing marker stays
+          // read-only, including a pull-request checkout from before it.
+          await gitWorktreeOwn.markOwnCheckout({ worktreePath, branch, repoPath: projectDir, startPoint: ref }, { execFile: execFileAsync });
+          // A tree made from origin's tip with nobody watching (an automation
+          // run) keeps that fact: the chat runner never loads such a
+          // checkout's startup config, even for a later trusted follow-up
+          // (chat-runner.js turnModeFor).
+          if (fetched !== null) await markUnattended(worktreePath, branch);
+          respond(ws, requestId, {
+            ok: true, path: worktreePath,
+            ...(fetched === null ? {} : { fetched, baseSha: await worktreeFetch.headSha(execFileAsync, worktreePath) }),
+          });
           break;
         }
 
@@ -1265,7 +1387,9 @@ function connect() {
           // pre-PR lanes (git-branch-state.js). Local refs only, no fetch.
           const cwd = remapPath(msg.cwd);
           if (!cwd) throw new Error('cwd is required');
-          respond(ws, requestId, await gitBranchState(cwd, { execFile: execFileAsync }));
+          // verifyRemote: also ask origin whether it holds HEAD (the spawn lifecycle's retire check).
+          // base: the commit a spawned checkout was made from, counted against when there is no origin (#453).
+          respond(ws, requestId, await gitBranchState(cwd, { execFile: execFileAsync }, { verifyRemote: msg.verifyRemote === true, base: msg.base }));
           break;
         }
 
@@ -1285,7 +1409,9 @@ function connect() {
           const { sessionName } = msg;
           const cwd = remapPath(msg.cwd);
           if (!sessionName || !cwd) throw new Error('sessionName and cwd are required');
-          const result = await startCodexSession(sessionName, cwd);
+          // The pane's project and workstream, for the app server's telemetry
+          // resource (codex-resource-env.js); an older orchestrator sends none.
+          const result = await startCodexSession(sessionName, cwd, codexResourceEnv(msg));
           respond(ws, requestId, result);
           break;
         }
@@ -1310,7 +1436,7 @@ function connect() {
             await execAsync(`tmux set-option -g set-clipboard on`);
             await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
           } catch { /* tmux may not support the option; harmless */ }
-          const term = pty.spawn('tmux', ['attach-session', '-t', tmuxSessionName], {
+          const term = pty.spawn('tmux', attachSessionArgv(tmuxSessionName), {
             name: 'xterm-256color',
             cols: initCols || 80,
             rows: initRows || 24,
@@ -1362,13 +1488,21 @@ function connect() {
             console.error(`[CLIPBOARD] dropping ${image.length}-byte paste (limit ${CLIPBOARD_MAX_BYTES})`);
             break;
           }
-          await mkdir(CLIPBOARD_DIR, { recursive: true });
-          const tmpSlot = `${CLIPBOARD_SLOT}.tmp-${process.pid}`;
-          await writeFile(tmpSlot, image);
-          await fs.promises.rename(tmpSlot, CLIPBOARD_SLOT);
+          await writeClipboardMailbox(CLIPBOARD_SLOT, image);
           // Ctrl+V makes Claude Code read the mailbox immediately, so the
           // keystroke only goes out once the file is fully in place.
           stream.pty.write('\x16');
+          break;
+        }
+
+        case 'clipboard-paste-image': {
+          // The phone's "attach a photo": no PTY stream,
+          // so the mailbox is written the same way and Ctrl+V goes in with
+          // tmux send-keys (argv, exact session). Validates size and PNG magic
+          // and answers an error rather than dropping the image silently.
+          // Agents from before this case answer "Unknown command", which the
+          // backend turns into a 501.
+          respond(ws, requestId, await clipboardPasteImage(msg, { slot: CLIPBOARD_SLOT, execFile: execFileAsync }));
           break;
         }
 
@@ -1383,9 +1517,73 @@ function connect() {
         case 'terminal-mouse': {
           const stream = streams.get(msg.streamId);
           if (stream) {
-            const setting = msg.enabled ? 'on' : 'off';
-            exec(`tmux set-option -t ${shellEscape(stream.tmuxSessionName)} mouse ${setting}`, () => {});
+            execFile('tmux', mouseOptionArgv(stream.tmuxSessionName, msg.enabled), () => {});
           }
+          break;
+        }
+
+        // Browser pane. Only the attach answers; the
+        // rest are fire-and-forget like the terminal's input and resize.
+        case 'browser-attach': {
+          respond(ws, requestId, await browsers.attach(msg));
+          break;
+        }
+
+        case 'browser-input': {
+          browsers.input(msg);
+          break;
+        }
+
+        case 'browser-navigate': {
+          browsers.navigate(msg);
+          break;
+        }
+
+        case 'browser-dialog-answer': {
+          browsers.dialog(msg);
+          break;
+        }
+
+        case 'browser-history': {
+          browsers.history(msg);
+          break;
+        }
+
+        case 'browser-resize': {
+          browsers.resize(msg);
+          break;
+        }
+
+        case 'browser-close': {
+          browsers.close(msg.streamId);
+          break;
+        }
+
+        case 'browser-frame-ack': {
+          browsers.frameAck(msg);
+          break;
+        }
+
+        case 'browser-suggest': {
+          respond(ws, requestId, { items: await browsers.suggest(msg) });
+          break;
+        }
+
+        // A kept profile forgotten (a share revoked or expired) or reset by
+        // its viewer: its browser is closed and the profile deleted.
+        case 'browser-profile-forget': {
+          respond(ws, requestId, await browsers.forgetProfile(msg));
+          break;
+        }
+
+        case 'browser-profile-reset': {
+          respond(ws, requestId, await browsers.resetProfile(msg));
+          break;
+        }
+
+        // A share was extended: its guests' kept profiles are kept until the new expiry.
+        case 'browser-profile-expiry': {
+          respond(ws, requestId, browsers.profileExpiry(msg));
           break;
         }
 
@@ -1462,6 +1660,36 @@ function connect() {
           break;
         }
 
+        case 'claude-login-status': {
+          const view = await claudeSignIn.status();
+          console.log(`[CLAUDE-LOGIN] status -> ${view.phase}${view.loggedIn ? ' logged-in' : ''}`);
+          respond(ws, requestId, view);
+          break;
+        }
+
+        case 'claude-login-start': {
+          const view = await claudeSignIn.start(msg.email);
+          console.log(`[CLAUDE-LOGIN] start -> ${view.phase}${view.loggedIn ? ' logged-in' : ''}`);
+          respond(ws, requestId, view);
+          break;
+        }
+
+        case 'claude-login-submit': {
+          const code = msg.code;
+          msg.code = undefined;
+          const view = await claudeSignIn.submit(code);
+          console.log(`[CLAUDE-LOGIN] submit -> ${view.phase}${view.loggedIn ? ' logged-in' : ''}`);
+          respond(ws, requestId, view);
+          break;
+        }
+
+        case 'claude-login-cancel': {
+          const view = claudeSignIn.cancel();
+          console.log('[CLAUDE-LOGIN] cancel');
+          respond(ws, requestId, view);
+          break;
+        }
+
         case 'chat-send': {
           // A message for a simple-UI chat: start a headless Claude turn in
           // the checkout, or queue it behind the one running. Events follow
@@ -1472,18 +1700,69 @@ function connect() {
           if (msg.requireCheckout && cwd && !(await chatRunner.checkoutReady(cwd, execFileAsync))) {
             throw new Error(chatRunner.CHECKOUT_PENDING);
           }
-          respond(ws, requestId, await chats.sendMessage({ chatKey: msg.chatKey, cwd, text: msg.text, projectId: msg.projectId, workstream: msg.workstream, workstreamId: msg.workstreamId, permissionMode: msg.permissionMode }));
+          // A person's message in an ask's chat runs in the thread's clone, not in `cwd` (ask-chat.js).
+          if (msg.ask) {
+            respond(ws, requestId, await askChats.sendMessage(msg, cwd));
+            break;
+          }
+          respond(ws, requestId, await chats.sendMessage({
+            chatKey: msg.chatKey, cwd, text: msg.text, projectId: msg.projectId, workstream: msg.workstream,
+            workstreamId: msg.workstreamId, permissionMode: msg.permissionMode, paneProbe: msg.paneProbe,
+            liveInput: msg.liveInput === true, model: msg.model, images: msg.images, orchestrator: msg.orchestrator === true,
+            backend: msg.backend, fastModel: msg.fastModel, context: msg.context, titles: msg.titles === true,
+          }));
           break;
         }
 
         case 'chat-history': {
-          // resumeQueue: the backend speaks for a live chat, so a queue parked
-          // since an agent restart may go on (chat-runner.js).
-          if (msg.resumeQueue) await chats.resumeQueue(msg.chatKey);
+          // paneProbe: whether the agent pane is Claude, a shell, something
+          // else, or unreadable. A claim from Open in full UI stays until a
+          // probe has seen Claude and then a shell, so a miss does not start
+          // the parked queue. Without a probe (an older backend) the boolean
+          // stands: a live chat resumes a queue parked across an agent restart.
+          const paneProbe = msg.paneProbe;
+          const noted = paneProbe === 'claude' || paneProbe === 'shell' || paneProbe === 'other' || paneProbe === 'unknown'
+            ? await chats.notePane(msg.chatKey, paneProbe)
+            : null;
+          if (noted ? noted.resume : msg.resumeQueue) await chats.resumeQueue(msg.chatKey);
           const cwd = remapPath(msg.cwd);
           const history = await chats.history(msg.chatKey);
           const checkout = msg.requireCheckout && cwd ? await chatRunner.checkoutReady(cwd, execFileAsync) : true;
           respond(ws, requestId, { ...history, checkoutReady: checkout });
+          break;
+        }
+
+        case 'chat-note-pane': {
+          // Simple UI reclaim. A shell after Claude was seen clears the claim
+          // and a parked queue may start: that Claude is gone, so this is not
+          // a second writer on it. A miss never clears a claim.
+          const paneProbe = msg.paneProbe;
+          if (paneProbe !== 'claude' && paneProbe !== 'shell' && paneProbe !== 'other' && paneProbe !== 'unknown') {
+            throw new Error('bad paneProbe');
+          }
+          const noted = await chats.notePane(msg.chatKey, paneProbe);
+          if (noted.resume) await chats.resumeQueue(msg.chatKey);
+          respond(ws, requestId, noted);
+          break;
+        }
+
+        case 'chat-resume-claim': {
+          // Open in full UI, before it types the resume. Refused while a turn
+          // owns the session; otherwise a queued job cannot start until
+          // chat-resume-release. The reply's `line` is what to type: the same
+          // permission surface a turn would use for this checkout, never a
+          // bare `claude --resume`. cwd is remapped; the mode is the
+          // orchestrator's ceiling, and turnModeFor applies the tree.
+          respond(ws, requestId, await chats.claimResume(msg.chatKey, {
+            cwd: remapPath(msg.cwd),
+            permissionMode: msg.permissionMode,
+            backend: msg.backend, model: msg.model, fastModel: msg.fastModel, context: msg.context,
+          }));
+          break;
+        }
+
+        case 'chat-resume-release': {
+          respond(ws, requestId, await chats.releaseResume(msg.chatKey, { park: msg.park === true, seen: msg.seen === true }));
           break;
         }
 
@@ -1494,7 +1773,7 @@ function connect() {
         }
 
         case 'chat-interrupt': {
-          respond(ws, requestId, await chats.interrupt(msg.chatKey));
+          respond(ws, requestId, await chats.interrupt(msg.chatKey, { scope: msg.scope === 'turn' ? 'turn' : 'all' }));
           break;
         }
 
@@ -1508,6 +1787,7 @@ function connect() {
         case 'chat-recover': {
           const deadKeys = Array.isArray(msg.deadKeys) ? msg.deadKeys.filter(k => typeof k === 'string') : [];
           await chats.recover({ deadKeys });
+          await askChats.reconcile().catch(err => console.error(`[ASK] reconcile failed: ${err.message}`));
           respond(ws, requestId, { ok: true });
           break;
         }
@@ -1540,7 +1820,14 @@ function connect() {
         case 'ask-run': {
           // Starts deploy/termag-subagent-run detached and answers at once;
           // the runner posts the reply to the orchestrator itself
-          // (agent/ask-run.js).
+          // (agent/ask-run.js). With `chat`, the run
+          // is a turn of the thread's chat instead (agent/ask-chat.js).
+          if (msg.chat) {
+            const result = askChats.startRun(msg, remapPath(msg.cwd));
+            console.log(`[ASK] run ${msg.runId} on thread ${msg.threadId} going to chat ${result.chat}`);
+            respond(ws, requestId, result);
+            break;
+          }
           const result = askRun.startAskRun(msg, remapPath(msg.cwd), { home: os.homedir(), spawn });
           console.log(`[ASK] run ${msg.runId} on thread ${msg.threadId} started (pid ${result.pid})`);
           respond(ws, requestId, result);
@@ -1548,13 +1835,13 @@ function connect() {
         }
 
         case 'ask-run-status': {
-          respond(ws, requestId, askRun.askRunStatus(msg, { home: os.homedir() }));
+          respond(ws, requestId, askChats.status(msg));
           break;
         }
 
         case 'ask-run-cancel': {
-          const result = askRun.cancelAskRun(msg, { home: os.homedir() });
-          console.log(`[ASK] run ${msg.runId} cancel: ${result.stopped ? `sent TERM to ${result.pid}` : 'not running'}`);
+          const result = await askChats.cancel(msg);
+          console.log(`[ASK] run ${msg.runId} cancel: ${result.stopped ? (result.pid ? `sent TERM to ${result.pid}` : `stopped (${result.stage})`) : 'not running'}`);
           respond(ws, requestId, result);
           break;
         }
@@ -1640,6 +1927,10 @@ function connect() {
       try { stream.pty._socket && stream.pty._socket.destroy(); } catch {}
     }
     streams.clear();
+    // The browsers' viewers are told by the backend when this socket drops;
+    // the browsers themselves wait, parked, for the viewers to come back.
+    browsers.unbindSocket();
+    browsers.parkAll();
     for (const sessionName of codexBridges.keys()) {
       stopCodexBridge(sessionName);
     }
@@ -1683,13 +1974,31 @@ Promise.all([
   boxUpdateCapable = unitLoaded;
   projectCloneCapable = cloneUnitLoaded;
   console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}; ${projectClone.UNIT_TEMPLATE} ${cloneUnitLoaded ? 'installed' : 'not installed'}`);
+  wrapperFlagsCapable = runnerWrapper.wrapperSupportsFlags();
+  console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}; claude-runner wrapper ${wrapperFlagsCapable ? 'understands the git flags' : 'predates the git flags or is absent'}`);
   connect();
   softwareInventory.warmInventory();
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+// The unit's KillMode=process signals only this process: the browsers the
+// panes spawned would outlive it. They get up to
+// BROWSER_SHUTDOWN_MS to quit, so a kept profile's cookies reach disk
+// (Chromium writes them on a timer), and whatever is left is then killed: the
+// unit's kill timers die with this process, so nothing else would.
+// A kept owner browser's cookie-jar save (up to 4 s) and its quit, and a
+// guest's kept profile's longer quit (up to 5 s, cookies flushed), both fit;
+// a browser still there after is killed (an owner's dir is emptied before it
+// is used again, and the last saved jar stays).
+const BROWSER_SHUTDOWN_MS = 10_000;
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('[AGENT] Shutting down...');
+  claudeSignIn.cancel();
+  await Promise.race([browsers.closeAll(), new Promise((r) => setTimeout(r, BROWSER_SHUTDOWN_MS))]);
+  browsers.killAll();
   for (const [, stream] of streams) {
     stream.pty.kill();
   }
@@ -1697,15 +2006,8 @@ process.on('SIGTERM', () => {
     stopCodexBridge(sessionName);
   }
   process.exit(0);
-});
+}
 
-process.on('SIGINT', () => {
-  console.log('[AGENT] Shutting down...');
-  for (const [, stream] of streams) {
-    stream.pty.kill();
-  }
-  for (const sessionName of codexBridges.keys()) {
-    stopCodexBridge(sessionName);
-  }
-  process.exit(0);
-});
+process.on('SIGTERM', () => { shutdown(); });
+
+process.on('SIGINT', () => { shutdown(); });

@@ -51,6 +51,7 @@ test('checks out a same-repo PR on its own branch, tracking origin', async () =>
   assert.strictEqual(run(wt, 'rev-parse', '--abbrev-ref', 'HEAD'), 'feat/x');
   assert.strictEqual(run(wt, 'rev-parse', 'HEAD'), f.oid('feat/x'));
   assert.strictEqual(upstreamOf(wt), 'origin/feat/x');
+  assert.strictEqual(run(wt, 'config', '--local', '--get', 'branch.feat/x.termagCheckout'), 'pr');
   assert.deepStrictEqual(await addPrWorktree(same(f), deps), { ok: true, path: wt, existing: true });
 });
 
@@ -60,6 +61,7 @@ test('checks out a fork\'s PR from pull/<n>/head with no upstream at all (Devin 
   assert.strictEqual(got.upstream, false);
   assert.strictEqual(run(got.path, 'rev-parse', 'HEAD'), f.oid('fork-branch'));
   assert.strictEqual(upstreamOf(got.path), null);
+  assert.strictEqual(run(got.path, 'config', '--local', '--get', 'branch.fork-branch.termagCheckout'), 'fork');
 });
 
 test('refuses when origin\'s pull ref is not the PR\'s head: the wrong repository (Devin 2)', async () => {

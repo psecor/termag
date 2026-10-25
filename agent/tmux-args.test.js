@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { sendKeysArgv, enterArgv, captureArgv, newSessionArgv, newSessionOptionArgvs, tmuxSessionTarget, tmuxPaneTarget } = require('./tmux-args');
+const { sendKeysArgv, enterArgv, captureArgv, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget } = require('./tmux-args');
 
 test('literal text is passed through untouched — quotes, backslashes, $ and backticks', () => {
   const text = `psql -c "select 1 from users where name='psecor'" \\ $HOME \`x\` don't`;
@@ -13,6 +13,15 @@ test('literal text is passed through untouched — quotes, backslashes, $ and ba
 test('text starting with a dash sits after -- so tmux does not parse it as an option', () => {
   assert.deepEqual(sendKeysArgv('s', '-n foo', { literal: true }), ['send-keys', '-t', 's', '-l', '--', '-n foo']);
   assert.deepEqual(sendKeysArgv('s', '-n foo'), ['send-keys', '-t', 's', '--', '-n foo']);
+});
+
+test('foreground: a dead pane can still be named claude, and an old line has no dead flag', () => {
+  assert.deepEqual(parseForeground('0 claude\n'), { cmd: 'claude', dead: false });
+  assert.deepEqual(parseForeground('1 claude'), { cmd: 'claude', dead: true });
+  assert.deepEqual(parseForeground('0 zsh'), { cmd: 'zsh', dead: false });
+  assert.deepEqual(parseForeground('0 '), { cmd: null, dead: false });
+  assert.deepEqual(parseForeground('claude'), { cmd: 'claude', dead: false });
+  assert.deepEqual(parseForeground(''), { cmd: null, dead: false });
 });
 
 test('literal + Enter needs two invocations; key-name mode rides Enter along', () => {
@@ -85,6 +94,34 @@ test('-e reaches a session on a server that already exists without the variable'
     // A later session on that surviving server gets it from -e.
     tmux(...newSessionArgv('u-new-agent', process.cwd(), null, { TERMAG_BOX: '1' }));
     assert.equal(tmux('show-environment', '-t', '=u-new-agent', 'TERMAG_BOX').trim(), 'TERMAG_BOX=1');
+  } finally {
+    try { tmux('kill-server'); } catch { /* already gone */ }
+  }
+});
+
+test('terminal attach and its mouse toggle name the session exactly', () => {
+  assert.deepEqual(attachSessionArgv('u-p-agent'), ['attach-session', '-t', '=u-p-agent']);
+  assert.deepEqual(mouseOptionArgv('u-p-agent', true), ['set-option', '-t', '=u-p-agent:', 'mouse', 'on']);
+  assert.deepEqual(mouseOptionArgv('u-p-agent', false), ['set-option', '-t', '=u-p-agent:', 'mouse', 'off']);
+});
+
+test('the attach target is no pattern or prefix on a real tmux server', { skip: !hasTmux() && 'tmux not installed' }, () => {
+  const socket = ['-L', `termag-test-attach-${process.pid}`];
+  const tmux = (...argv) => execFileSync('tmux', [...socket, ...argv], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  // has-session takes a session target like attach-session's, without needing a terminal.
+  const reaches = (name) => { try { tmux('has-session', '-t', attachSessionArgv(name)[2]); return true; } catch { return false; } };
+  try {
+    for (const s of ['u-p-agent', 'u-p-secret-ctrl']) tmux(...newSessionArgv(s, process.cwd()));
+    // What a bare -t does with these, and what the attach no longer does.
+    tmux('has-session', '-t', 'u-p-secret?ctrl');
+    tmux('has-session', '-t', 'u-p-a');
+    assert.equal(reaches('u-p-secret?ctrl'), false);
+    assert.equal(reaches('u-p-a'), false);
+    assert.equal(reaches('u-p-secret-ctrl'), true);
+    tmux(...mouseOptionArgv('u-p-agent', true));
+    tmux(...mouseOptionArgv('u-p-secret-ctrl', false));
+    assert.equal(tmux('show-options', '-t', '=u-p-agent:', '-v', 'mouse').trim(), 'on');
+    assert.equal(tmux('show-options', '-t', '=u-p-secret-ctrl:', '-v', 'mouse').trim(), 'off');
   } finally {
     try { tmux('kill-server'); } catch { /* already gone */ }
   }

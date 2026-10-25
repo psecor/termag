@@ -32,7 +32,10 @@ backend gates it behind the `agent-spawn-enabled` flag and limits.
 `METATERM_SPAWN_DEFAULT` (pi's registration sets `off`), else it is on.
 `list_spawns`, `report_back` and `spawn_budget` (limits, usage, box load and
 hints) touch only the caller's own spawn records
-and are pre-approved on boxes. All four send the caller's own tmux session, and
+and are pre-approved on boxes. `dismiss_spawn` (park or retire one of the caller's
+own children) and `adopt_spawn` (take an orphaned spawn
+whose parent went away) are listed with `spawn_agent` and are never
+pre-approved. All of them send the caller's own tmux session, and
 `spawn_agent` also sends its `git rev-parse HEAD` as the default base.
 `send_keys` is only listed when it is switched on. Highest precedence first:
 

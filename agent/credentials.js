@@ -14,8 +14,13 @@ const path = require('path');
 // agent-telemetry-v1: the script takes the agent-telemetry provider (Codex,
 // Cursor, Devin and pi) and termag-reconcile installs
 // termag-agent-otel, so the orchestrator may type launches through it.
-const CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1'];
-const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry'];
+// mcp-broker-v1: the script takes the mcp provider (Claude Code mcpServers
+// entries pointed at the MCP broker) and termag-reconcile installs
+// termag-mcp-headers.
+// fireworks-v1: the script takes the fireworks provider (pi's provider and the
+// Claude Code settings `launch-settings` hands it).
+const CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1'];
+const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks'];
 
 const DEFAULT_SCRIPT = path.join(__dirname, '..', 'deploy', 'termag-credentials');
 

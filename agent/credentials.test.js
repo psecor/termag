@@ -16,7 +16,7 @@ function stubScript(dir, body) {
 }
 
 test('advertises credentials-v1, the GitHub broker, telemetry and its launch settings', () => {
-  assert.deepStrictEqual(CAPABILITIES, ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1']);
+  assert.deepStrictEqual(CAPABILITIES, ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1']);
 });
 
 test('the script is told where the agent config is, not given the token', async () => {

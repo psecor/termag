@@ -275,7 +275,7 @@ test('the runner clones into a sibling directory, then renames it into place wit
   assert.deepEqual(seen, seen.map(() => '/dev/null'));
   assert.equal(fs.existsSync(path.join(home, 'projects', '.clone-p1')), false);
   assert.equal(fs.readFileSync(path.join(dest, 'README'), 'utf8'), 'hello\n');
-  assert.equal(fs.existsSync(path.join(dest, 'AGENTS.md')), true);
+  assert.match(fs.readFileSync(path.join(dest, 'AGENTS.md'), 'utf8'), /`termag ask[\s\S]*`agent-ask` skill/);
   assert.equal(fs.readFileSync(path.join(dest, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
   assert.match(fs.readFileSync(path.join(dest, '.git', 'info', 'exclude'), 'utf8'), /^\/\.worktrees\/$/m);
   const state = readState(home, 'p1');

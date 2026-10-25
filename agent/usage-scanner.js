@@ -394,8 +394,8 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
     const [claude, codex, mistral, pi] = await Promise.all([scanClaude(live), scanCodex(live), scanVibe(), scanPi(live)]);
     evict(live);
 
-    // termag runs pi only as pi (pi); a pi session
-    // on another provider would still be reported as pi here.
+    // Every pi session is reported as pi here, pi on Fireworks
+    // (termag-pi-fireworks) included: the split is not built.
     const sources = { claude, codex, mistral, pi };
     const providers = {};
     const days = {};

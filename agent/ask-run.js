@@ -3,13 +3,17 @@
 // orchestrator sends `ask-run` with the message id, the target checkout and
 // the prompt; this module writes the job to a 0600 file and starts
 // ~/.local/bin/termag-subagent-run (deploy/termag-subagent-run) detached,
-// which clones the committed code, runs Claude Code as the termag-subagent
-// user and posts the reply and the commits back to the orchestrator. The RPC
-// answers as soon as the runner is started; nothing here waits for the run.
+// which clones the committed code, runs Claude Code headless as the box user
+// in that clone and posts the reply and the commits back to the orchestrator.
+// The RPC answers as soon as the runner is started; nothing here waits for
+// the run. An ask-run that names a `chat` (an orchestrator that saw
+// ask-chat-v1) runs as a turn of the thread's chat instead (agent/ask-chat.js);
+// this headless path is what an older orchestrator still gets.
 //
 // `ask-run-status` tells the orchestrator whether a run is still going, so a
 // thread whose previous turn died can take a new one. `ask-run-cancel` sends
-// the runner a TERM, on which it stops the run's unit and reports nothing.
+// the runner a TERM, on which it stops the run's process group and reports
+// nothing.
 //
 // Kept apart from agent.js so it can be tested with fakes.
 
@@ -137,4 +141,4 @@ function cancelAskRun(msg, deps) {
   return { stopped: true, pid: st.pid };
 }
 
-module.exports = { CAPABILITIES, RUNNER, runnerPath, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun };
+module.exports = { CAPABILITIES, RUNNER, runnerPath, stateDir, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun };

@@ -19,6 +19,12 @@
  *      head, untracked. A PR from the same repository then gets its upstream
  *      (origin/<branch>), so a plain `git push` updates it; a fork's never
  *      tracks anything, so a push cannot land on the shared repository.
+ *      Either way the branch records `branch.<name>.termagCheckout` (`pr` or
+ *      `fork`). That is how the chat runner knows the workstream was checked
+ *      out from a pull request after HEAD has moved on. Absence of the key
+ *      is not trust. A branch-off is `own` only when its source is already
+ *      marked own, or it is the main worktree's current same-repo branch
+ *      (git-worktree-own.js). Anything else stays unmarked.
  *
  * Every git call goes through execFile with an argument list: nothing here is
  * parsed by a shell.
@@ -69,6 +75,11 @@ async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRep
   // `a` is the same as, or an ancestor of, `b`.
   const within = (a, b, cwd) => ok(['merge-base', '--is-ancestor', a, b], cwd);
   const related = async (tip, cwd) => tip === headOid || await within(tip, headOid, cwd) || await within(headOid, tip, cwd);
+  // On the branch, not on a ref that happens to point at today's HEAD: a later
+  // commit and a fetch that moves origin/pr/<n> leave this in place, and main
+  // does not inherit it. The runner does not treat a missing key as the
+  // project's own tree; this only marks the checkouts this RPC creates.
+  const markCheckout = () => git(['config', '--local', `branch.${branch}.termagCheckout`, sameRepo ? 'pr' : 'fork']);
 
   // git's own rule for branch names (GitHub allows more than a short allowlist would).
   if (!await ok(['check-ref-format', '--branch', branch])) throw new Error('branch contains disallowed characters');
@@ -90,10 +101,16 @@ async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRep
     const at = real(holder.path) ?? holder.path;
     const tip = await oidOf('HEAD', holder.path);
     if (!await related(tip, holder.path)) throw new Error(`${branch} is checked out at ${holder.path} with work that is not this PR's`);
-    if (at === real(worktreePath)) return { ok: true, path: worktreePath, existing: true };
+    if (at === real(worktreePath)) {
+      await markCheckout();
+      return { ok: true, path: worktreePath, existing: true };
+    }
     const prefix = `${root}/.worktrees/`;
     const rel = at.startsWith(prefix) ? at.slice(prefix.length) : null;
-    if (rel && NAME.test(rel)) return { ok: true, path: holder.path, adopted: rel };
+    if (rel && NAME.test(rel)) {
+      await markCheckout();
+      return { ok: true, path: holder.path, adopted: rel };
+    }
     throw new Error(`${branch} is already checked out at ${holder.path}`);
   }
 
@@ -121,6 +138,7 @@ async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRep
     await git(['worktree', 'add', '--no-track', '-b', branch, worktreePath, headOid], projectDir, CHECKOUT_TIMEOUT_MS);
   }
   if (upstream) await git(['branch', `--set-upstream-to=origin/${branch}`, branch], worktreePath).catch(() => undefined);
+  await markCheckout();
   return { ok: true, path: worktreePath, localBranch: local, fastForwarded, upstream };
 }
 

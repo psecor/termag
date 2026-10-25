@@ -75,12 +75,27 @@ common operational tasks.>
 <Optional. APIs, webhooks, real-time events, anything other projects
 consume. Tabular: event/endpoint, payload shape, when emitted.>
 
+## Sharing files
+
+On a termag box, read the `termag-spaces` skill (`~/.claude/skills/termag-spaces/SKILL.md`) before sharing
+a file with a person, saving a plan that should outlive the session, or handing files to another agent or box.
+
 ## Gotchas
 
 1. **<Short bold lede>** — <one to three sentences. Be specific
    enough that an agent encountering the situation can recognize it.>
 
 2. **<...>** — <...>
+
+## Delegating work
+
+On a termag box, `termag ask <box>/<project>` runs a headless Claude Code turn on a clone
+of one of your own projects' pushed code, with your access, network and tools on its box (no
+sandbox), and hands back its reply and a draft PR. Run it on a new box
+(`termag project create … --new-box --from …`) unless the ask is small and mostly reads
+code; a `--thread` follow-up goes to the box and project its thread started on. Read the
+`agent-ask` skill (`~/.claude/skills/agent-ask/SKILL.md`) before spinning up a subagent or
+delegating work.
 
 ## Related
 

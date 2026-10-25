@@ -76,6 +76,23 @@ function newSessionOptionArgvs(sessionName) {
 }
 
 /**
+ * `attach-session` for terminal-attach. The backend sends only a name it
+ * rebuilt for the project (backend services/sessionAccess.ts,
+ * terminalSessionAccess); `=` stops tmux from reading it as a prefix or an
+ * fnmatch pattern all the same, so `u-p-secret?ctrl` never attaches
+ * `u-p-secret-ctrl` (verified on tmux 3.4). attach-session's -t is a SESSION
+ * target: the bare `=name` form.
+ */
+function attachSessionArgv(sessionName) {
+  return ['attach-session', '-t', tmuxSessionTarget(sessionName, true)];
+}
+
+/** The terminal's mouse toggle. `mouse` is a session option, set through a pane target like newSessionOptionArgvs. */
+function mouseOptionArgv(sessionName, enabled) {
+  return ['set-option', '-t', tmuxPaneTarget(sessionName, true), 'mouse', enabled ? 'on' : 'off'];
+}
+
+/**
  * `keys` typed into `sessionName`. literal=true → `-l` (text is text, even
  * "C-c"); literal=false → tmux key-name parsing (the historical default that
  * Slack /t and the agent launch rely on). When `withEnter` is set in literal
@@ -92,6 +109,23 @@ function sendKeysArgv(sessionName, keys, { literal = false, withEnter = false } 
 
 function enterArgv(sessionName) {
   return ['send-keys', '-t', sessionName, 'Enter'];
+}
+
+/**
+ * One pane from `tmux list-panes -F '#{pane_dead} #{pane_current_command}'`.
+ * pane_dead is 1 when that process has exited and tmux is still showing the
+ * pane; the command name can still be the program that left. A line with no
+ * dead flag (an older format, the command alone) is a live pane.
+ */
+function parseForeground(text) {
+  const line = String(text ?? '').split('\n')[0] ?? '';
+  const marked = /^([01]) (.*)$/.exec(line);
+  if (!marked) {
+    const cmd = line.trim();
+    return { cmd: cmd || null, dead: false };
+  }
+  const cmd = marked[2].trim();
+  return { cmd: cmd || null, dead: marked[1] === '1' };
 }
 
 /**
@@ -122,4 +156,4 @@ function tailLines(text, n) {
  */
 const CAPABILITIES = ['tmux-create-command-v1'];
 
-module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, newSessionArgv, newSessionOptionArgvs, tmuxSessionTarget, tmuxPaneTarget, CAPABILITIES, SESSION_ENV };
+module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, CAPABILITIES, SESSION_ENV };
