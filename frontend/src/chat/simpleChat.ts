@@ -3,16 +3,90 @@
 // show, and the links out of it.
 import type { AgentStatus, AgentStatusValue, Project } from '../types';
 import { CHAT_PROVIDER_ID } from '../providers/registry';
-import { sortHome, waitingLabel, type InboxRow } from '../mobile/inbox';
+import { sortHome, statusLabel, waitingLabel, type InboxRow } from '../mobile/inbox';
+import { repoKey } from '../utils/repoPick';
 import type { Block } from './paneChat';
+import type { ChatLiveStatus } from './chatLiveStatus';
+import { agentLabel } from './explorerAgents';
+
+/**
+ * GitHub owners whose new simple-UI sessions start trusted. Empty: every
+ * session starts read-only and trust is the owner's own tick. A deployment
+ * that wants its own orgs to start checked lists them here. Not
+ * GITHUB_REPO_ORGS, on purpose: that list is about which repos to show, not
+ * which ones to trust.
+ */
+const COMPANY_GITHUB_OWNERS: ReadonlySet<string> = new Set<string>([]);
 
 /**
  * The chats in the sidebar: project workstreams with an agent, sorted the
  * way the phone's home list is (needs you, then running, then the rest).
  * MetaTerm and cloud sessions are not conversations the simple UI drives.
+ * An automation's runs are (each is a chat-runner turn),
+ * but its `main` is not: no agent ever runs there.
  */
 export function chatRows(rows: readonly InboxRow[]): InboxRow[] {
-  return sortHome(rows.filter(r => r.kind === 'normal'));
+  return sortHome(rows.filter(r => r.kind === 'normal' || (r.kind === 'automation' && r.workstream !== 'main')));
+}
+
+export interface ChatRowName {
+  /** Claude's title for the session, when the row leads with it; null to lead with the project as before. */
+  title: string | null;
+  /** The project, and the workstream when it is not main: under the title, or the name itself without one. */
+  where: string;
+}
+
+/**
+ * What a sidebar row is called. With simple-ui-session-titles-enabled and a
+ * title Claude gave the session, the title leads and the project (and
+ * workstream) is secondary; otherwise the row is named after the project.
+ */
+export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle'>, titlesShown: boolean): ChatRowName {
+  const title = titlesShown ? row.sessionTitle?.trim() || null : null;
+  return { title, where: agentLabel(row) };
+}
+
+export interface SidebarLine {
+  /** The words for the row's state. */
+  state: string;
+  /** The second line: Claude's last words, or the status message. */
+  message: string | null;
+  /** Which glyph and colour the row takes. */
+  glyph: AgentStatusValue;
+}
+
+/**
+ * A sidebar row's state and preview. The open chat publishes its own status
+ * line and last assistant text (chat/chatLiveStatus.ts), so its row says what
+ * its header says; another chat reads the status pipeline, and one whose box
+ * or checkout is still coming up says so rather than "Not running".
+ */
+export function sidebarLine(row: InboxRow, live: ChatLiveStatus | undefined, setupStatus: string | null | undefined): SidebarLine {
+  if (live) {
+    return {
+      state: live.text,
+      message: live.preview,
+      glyph: live.tone === 'working' || live.tone === 'setup' ? 'working' : 'idle',
+    };
+  }
+  if (row.status === 'not_running' && (setupStatus === 'pending' || setupStatus === 'cloning')) {
+    return { state: 'Setting up…', message: null, glyph: 'working' };
+  }
+  return { state: statusLabel(row), message: row.message, glyph: row.status };
+}
+
+/**
+ * Which box a session runs on, in words: the box's name, or "<owner>'s box"
+ * for a shared session on a box this user can't list. Sessions with the same
+ * name, or the same workstream name, on different boxes differ by this.
+ */
+export function boxLabel(
+  row: Pick<InboxRow, 'instanceId' | 'shared' | 'owner'>,
+  boxName: string | null | undefined,
+): string | null {
+  if (!row.instanceId) return null;
+  if (boxName) return boxName;
+  return row.shared && row.owner ? `${row.owner}'s box` : null;
 }
 
 /**
@@ -88,6 +162,41 @@ export function fullUiHref(projectId: string | null | undefined, workstream = 'm
   const q = new URLSearchParams({ project: projectId });
   if (workstream !== 'main') q.set('ws', workstream);
   return `/?${q.toString()}`;
+}
+
+/**
+ * Where an automation run's conversation opens: the simple UI when this user
+ * has it (simple-ui-enabled), else the run's workstream in the workspace.
+ * /chat redirects to / without the flag, so a link there would lose the run.
+ */
+export function runConversationHref(projectId: string, workstream: string, simpleUi: boolean): string {
+  return simpleUi ? chatHref(projectId, workstream) : fullUiHref(projectId, workstream);
+}
+
+/**
+ * Whether New chat asks the user to trust this project. Every repository
+ * asks, and so does a project with no repository. The checkbox starts checked
+ * only for the owners listed in COMPANY_GITHUB_OWNERS (repoStartsTrusted); the
+ * person can clear it before this session. The backend records the tick. An owner
+ * string never trusts a session that was created with the box cleared.
+ */
+export function repoNeedsTrust(repoUrl: string | null | undefined): boolean {
+  void repoUrl;
+  return true;
+}
+
+/**
+ * Whether the new-session "Let Claude run commands" checkbox starts checked.
+ * True only for a github.com repository whose owner is in
+ * COMPANY_GITHUB_OWNERS (https or ssh, either case), none by default. Every other owner, a
+ * non-repository URL, and no repository stay unchecked: read-only until
+ * trusted from the session.
+ */
+export function repoStartsTrusted(repoUrl: string | null | undefined): boolean {
+  const key = repoUrl ? repoKey(repoUrl) : null;
+  if (!key) return false;
+  const owner = key.slice(0, key.indexOf('/'));
+  return COMPANY_GITHUB_OWNERS.has(owner);
 }
 
 /** `owner/name` for a GitHub https or ssh URL, else null. */

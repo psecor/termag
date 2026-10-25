@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { adminApi, type PrBasis, type PrContributor, type PrGroup, type PrView, type PrWindow } from '../../services/adminApi';
+import { adminApi, type PrBasis, type PrContributor, type PrGroup, type PrReviewer, type PrReviewWindow, type PrView, type PrWindow } from '../../services/adminApi';
 import { useAuth } from '../../contexts/AuthContext';
 import { ChartCard } from '../dashboard/ChartCard';
 import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { DataTable, KeyValues, fmtAgo, fmtPct, pendingText, useAdminPolled, errorText, type Column } from './shared';
-import { groupToText, textToGroup } from './prGroupText';
+import { groupSummary, groupToText, textToGroup } from './prGroupText';
 
 const VIEW_LABEL: Record<PrView, string> = { credited: 'humans + their agents', humans: 'humans only', all: 'everything (bots too)' };
 const VIEW_HELP: Record<PrView, string> = {
@@ -16,6 +16,11 @@ const VIEW_HELP: Record<PrView, string> = {
 };
 const CLASS_COLOR = { human: 'rgb(88, 166, 255)', agent: 'rgb(188, 140, 255)', automation: 'rgb(139, 148, 158)' };
 const CONTRIB_COLOR = 'rgb(246, 185, 59)';
+const APPROVAL_COLOR = { agentOnly: 'rgb(188, 140, 255)', humanApproved: 'rgb(63, 185, 80)', unapproved: 'rgb(139, 148, 158)' };
+const days = (d: number) => `${d} day${d === 1 ? '' : 's'}`;
+const fmtHours = (h: number | null): string => h == null ? '—' : h < 1 ? `${Math.round(h * 60)}m` : h < 48 ? `${h.toFixed(1)}h` : `${(h / 24).toFixed(1)}d`;
+const repos = (n: number) => `${n} repo${n === 1 ? '' : 's'}`;
+const ofMerged = (n: number, all: number) => `${n}${all ? ` (${fmtPct(n / all)})` : ''}`;
 
 function Choice<T extends string | number>({ label, value, options, onChange, render }: { label: string; value: T; options: readonly T[]; onChange: (v: T) => void; render?: (v: T) => string }) {
   return (
@@ -41,6 +46,7 @@ export function AdminPrs({ now }: { now: number }) {
   const [view, setView] = useState<PrView>('credited');
   const [basis, setBasis] = useState<PrBasis>('merged');
   const [win, setWin] = useState<PrWindow>(30);
+  const [rwin, setRwin] = useState<PrWindow>(30);
   const [err, setErr] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ slug: string; name: string; text: string; isNew: boolean } | null>(null);
 
@@ -50,6 +56,9 @@ export function AdminPrs({ now }: { now: number }) {
   const summary = useAdminPolled(useCallback(() => (group ? adminApi.prSummary(group, view, basis) : Promise.resolve(null)), [group, view, basis]), 5 * 60_000, { deps: [group, view, basis] });
   const contrib = useAdminPolled(useCallback(() => (group ? adminApi.prContributors(group, view, basis, win) : Promise.resolve(null)), [group, view, basis, win]), 5 * 60_000, { deps: [group, view, basis, win] });
   const trend = useAdminPolled(useCallback(() => (group ? adminApi.prTrend(group, view, basis) : Promise.resolve(null)), [group, view, basis]), 10 * 60_000, { deps: [group, view, basis] });
+  const reviews = useAdminPolled(useCallback(() => (group ? adminApi.prReviews(group) : Promise.resolve(null)), [group]), 5 * 60_000, { deps: [group] });
+  const reviewers = useAdminPolled(useCallback(() => (group ? adminApi.prReviewers(group, rwin) : Promise.resolve(null)), [group, rwin]), 5 * 60_000, { deps: [group, rwin] });
+  const rtrend = useAdminPolled(useCallback(() => (group ? adminApi.prReviewTrend(group) : Promise.resolve(null)), [group]), 10 * 60_000, { deps: [group] });
 
   const act = async (fn: () => Promise<unknown>, after?: () => void) => {
     setErr(null);
@@ -86,6 +95,48 @@ export function AdminPrs({ now }: { now: number }) {
     { id: 'size', label: 'median size', value: r => r.medianSize, align: 'right', title: 'additions + deletions' },
   ];
 
+  const reviewCols: Column<PrReviewWindow>[] = [
+    { id: 'days', label: 'window', value: r => r.days, render: r => days(r.days) },
+    { id: 'reviews', label: 'reviews', value: r => r.reviews, align: 'right', title: 'one person on one PR, however many rounds' },
+    { id: 'reviewers', label: 'reviewers', value: r => r.distribution.contributors, align: 'right' },
+    { id: 'p50', label: 'p50', value: r => r.distribution.p50, align: 'right', title: 'reviews per reviewer' },
+    { id: 'p95', label: 'p95', value: r => r.distribution.p95, align: 'right' },
+    { id: 'mean', label: 'mean', value: r => r.distribution.mean, align: 'right' },
+    { id: 'max', label: 'max', value: r => r.distribution.max, align: 'right' },
+    { id: 'approved', label: 'approved', value: r => r.approved, align: 'right' },
+    { id: 'changes', label: 'changes asked', value: r => r.changesRequested, align: 'right' },
+    { id: 'commentOnly', label: 'comments only', value: r => r.commentOnly, align: 'right' },
+    { id: 'inline', label: 'inline comments', value: r => r.inlineComments, align: 'right', title: 'review comments by people' },
+    { id: 'cp50', label: 'comments/PR p50', value: r => r.mergedComments.p50, align: 'right', title: 'comments by people per PR merged in the window, conversation plus inline' },
+    { id: 'cp95', label: 'p95', value: r => r.mergedComments.p95, align: 'right' },
+    { id: 'cmax', label: 'max', value: r => r.mergedComments.max, align: 'right' },
+    { id: 'bots', label: 'by bots', value: r => r.mergedComments.botShare, align: 'right', render: r => fmtPct(r.mergedComments.botShare), title: 'share of the comments on those PRs that bots wrote' },
+  ];
+  const reviewerCols: Column<PrReviewer & { rank: number }>[] = [
+    { id: 'rank', label: '#', value: r => r.rank, align: 'right' },
+    { id: 'login', label: 'reviewer', value: r => r.login, render: r => <span>{r.login}{r.termag ? <span className="workstream-bar-badge" title={`termag user ${r.termag.unixUsername}`}>termag</span> : null}</span> },
+    { id: 'reviews', label: 'reviews', value: r => r.reviews, align: 'right' },
+    { id: 'deciding', label: 'deciding approvals', value: r => r.decidingApprovals, align: 'right', title: 'merged PRs where theirs was the last human approval before the merge' },
+    { id: 'stale', label: 'stale PRs picked up', value: r => r.stalePickups, align: 'right', title: 'PRs they reviewed first, after the PR had waited 3 days or more since it was ready' },
+    { id: 'firstReview', label: 'to first review', value: r => r.medianHoursToFirstReview, align: 'right', render: r => (r.askedReviews ? `${fmtHours(r.medianHoursToFirstReview)} (${r.askedReviews})` : '—'),
+      title: 'median time from being asked by name to their first review, over the reviews they were asked for (count in brackets); team requests and unasked reviews are not timed' },
+    { id: 'authors', label: 'authors helped', value: r => r.authorsHelped, align: 'right' },
+    { id: 'approved', label: 'approved', value: r => r.approved, align: 'right' },
+    { id: 'changes', label: 'changes asked', value: r => r.changesRequested, align: 'right' },
+    { id: 'commentOnly', label: 'comments only', value: r => r.commentOnly, align: 'right' },
+    { id: 'inline', label: 'inline comments', value: r => r.inlineComments, align: 'right' },
+  ];
+  const agentCols: Column<PrReviewWindow>[] = [
+    { id: 'days', label: 'window', value: r => r.days, render: r => days(r.days) },
+    { id: 'merged', label: 'merged', value: r => r.agent.merged, align: 'right', title: 'in repos where the agent has approved' },
+    { id: 'agentOnly', label: 'agent only', value: r => r.agent.agentOnly, align: 'right', render: r => ofMerged(r.agent.agentOnly, r.agent.merged), title: 'approved by the agent, no human approval before the merge' },
+    { id: 'both', label: 'human + agent', value: r => r.agent.humanAndAgent, align: 'right', render: r => ofMerged(r.agent.humanAndAgent, r.agent.merged) },
+    { id: 'human', label: 'human only', value: r => r.agent.humanOnly, align: 'right', render: r => ofMerged(r.agent.humanOnly, r.agent.merged) },
+    { id: 'none', label: 'unapproved', value: r => r.agent.none, align: 'right', render: r => ofMerged(r.agent.none, r.agent.merged), title: 'merged with no approval before the merge' },
+    { id: 'unread', label: 'reviews not read', value: r => r.agent.unread, align: 'right', title: 'merged PRs whose reviews the backfill has not read yet, or with more than 100 reviews, left out' },
+  ];
+  const rv = reviews.data; const rs = reviewers.data; const rt = rtrend.data;
+
   const ownerIsMe = st?.tokenOwner?.id === user?.id;
   const backfilling = st && st.repos > 0 && st.backfilled < st.repos;
 
@@ -97,6 +148,7 @@ export function AdminPrs({ now }: { now: number }) {
         value={st ? `${st.prs.toLocaleString()} PRs` : undefined} stale={status.loading}>
         {st && <KeyValues items={[
           ['repos', `${st.backfilled} of ${st.repos} backfilled (${st.backfillDays} days of history)${st.neverRun ? ` · ${st.neverRun} not started` : ''}`],
+          ['reviews', `${st.reviewsBackfilled} of ${st.backfilled} backfilled repos have reviews (${st.reviewDays} days of history)`],
           ['last run', `${fmtAgo(st.lastRunAt, now)}${st.ingester.lastDiscoveryAt ? ` · groups resolved ${fmtAgo(st.ingester.lastDiscoveryAt, now)}` : ''}`],
           ['rate limit', st.ingester.rate ? `${st.ingester.rate.remaining} of ${st.ingester.rate.limit} left this hour${st.ingester.pausedUntil ? ` · paused until ${new Date(st.ingester.pausedUntil).toLocaleTimeString()}` : ''}` : '—'],
           ...(st.ingester.lastError ? [['error', st.ingester.lastError] as [string, string]] : []),
@@ -148,12 +200,46 @@ export function AdminPrs({ now }: { now: number }) {
         ]} />
       </ChartCard>
 
-      <ChartCard title="Repo groups" subtitle="one member per line: repo owner/name · topic name [org] · pattern owner/glob · exclude owner/name" stale={groups.loading}>
+      <ChartCard title="Reviews" subtitle={rv ? `${repos(rv.repos)} · every PR in the group, people as reviewers (never the author) · rolling windows ending now` : pendingText(reviews)} stale={reviews.loading}>
+        <DataTable rows={rv?.windows ?? []} columns={reviewCols} rowKey={r => String(r.days)} defaultSort="days" defaultDesc={false} dense empty={rv ? 'no reviews yet' : pendingText(reviews)} />
+      </ChartCard>
+
+      <ChartCard title="Top reviewers" subtitle={rs ? `${rs.reviewers} reviewers, ${rs.reviews} reviews in ${days(rs.days)}` : pendingText(reviewers)} stale={reviewers.loading}>
+        <Choice label="review window" value={rwin} options={[1, 7, 30] as const} onChange={setRwin} render={d => `${d}d`} />
+        <DataTable rows={(rs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={reviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense empty={rs ? 'no reviews in this window' : pendingText(reviewers)} />
+      </ChartCard>
+
+      <ChartCard title="Approval agent" subtitle={rv ? `merged PRs by how they were approved, in the ${repos(rv.windows[0]?.agent.repos ?? 0)} where ${rv.approvalAgentLogins.join(', ')} has approved` : pendingText(reviews)} stale={reviews.loading}>
+        <DataTable rows={rv?.windows ?? []} columns={agentCols} rowKey={r => String(r.days)} defaultSort="days" defaultDesc={false} dense empty={rv ? 'no merged PRs yet' : pendingText(reviews)} />
+      </ChartCard>
+
+      <ChartCard title="Weekly reviews" subtitle={rt ? 'merged PRs per week (Monday, UTC) by approval, in the agent\'s repos, and reviewers in the group' : pendingText(rtrend)} stale={rtrend.loading}
+        table={rt ? { columns: ['week', 'agent only', 'human-approved', 'unapproved', 'reviews', 'reviewers'], rows: rt.rows.map(r => [r.week, r.agentOnly, r.humanApproved, r.unapproved, r.reviews, r.reviewers]) } : undefined}>
+        <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
+          <ComposedChart data={(rt?.rows ?? []).map(r => ({ ...r, label: shortDate(r.week) }))} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barCategoryGap="20%">
+            <CartesianGrid vertical={false} stroke={GRID_STROKE} />
+            <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis yAxisId="prs" tick={TICK} tickLine={false} axisLine={false} width={36} allowDecimals={false} />
+            <YAxis yAxisId="people" orientation="right" tick={TICK} tickLine={false} axisLine={false} width={32} allowDecimals={false} />
+            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} />} />
+            <Bar yAxisId="prs" dataKey="agentOnly" name="agent only" stackId="a" fill={APPROVAL_COLOR.agentOnly} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar yAxisId="prs" dataKey="humanApproved" name="human-approved" stackId="a" fill={APPROVAL_COLOR.humanApproved} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar yAxisId="prs" dataKey="unapproved" name="unapproved" stackId="a" fill={APPROVAL_COLOR.unapproved} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Line yAxisId="people" type="monotone" dataKey="reviewers" name="reviewers" stroke={CONTRIB_COLOR} strokeWidth={2} dot={false} isAnimationActive={false} />
+          </ComposedChart>
+        </ResponsiveContainer>
+        <SeriesLegend series={[
+          { id: 'a', label: 'agent only', color: APPROVAL_COLOR.agentOnly }, { id: 'h', label: 'human-approved', color: APPROVAL_COLOR.humanApproved },
+          { id: 'u', label: 'unapproved', color: APPROVAL_COLOR.unapproved }, { id: 'r', label: 'reviewers (right axis)', color: CONTRIB_COLOR },
+        ]} />
+      </ChartCard>
+
+      <ChartCard title="Repo groups" subtitle="one member per line: repo owner/name · topic name [org] · pattern owner/glob · path owner/name file-glob (with share owner/name 20% and key owner/name AIC) · exclude owner/name" stale={groups.loading}>
         <div className="dash-rows">
           {(groups.data ?? []).map((x: PrGroup) => (
             <div className="dash-row" key={x.slug}>
               <span className="dash-row-label">{x.name}</span>
-              <span className="usage-dim">{x.repos.length} repos · {x.repos.reduce((n, r) => n + r.prs, 0).toLocaleString()} PRs · {groupToText(x).split('\n').join(' · ')}</span>
+              <span className="usage-dim">{x.repos.length} repos · {x.repos.reduce((n, r) => n + r.prs, 0).toLocaleString()} PRs · {groupSummary(x)}</span>
               <button type="button" className="btn-ghost btn-tiny" style={{ marginLeft: 'auto' }} onClick={() => setEditing({ slug: x.slug, name: x.name, text: groupToText(x), isNew: false })}>edit</button>
             </div>
           ))}

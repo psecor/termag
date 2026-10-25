@@ -3,7 +3,7 @@
  * card is in, how often it polls, how a project id becomes a link, and the
  * stats strip. No React, no fetching — see briefing.test.ts.
  */
-import type { BriefingContent, BriefingLatest, BriefingView, LedgerTotals } from '../services/api';
+import type { BriefingContent, BriefingDismissal, BriefingKind, BriefingLatest, BriefingView, LedgerTotals } from '../services/api';
 import { fmtDurationShort } from '../utils/format';
 
 export type CardState = 'loading' | 'never' | 'running' | 'ready';
@@ -101,7 +101,7 @@ export function sessionLabel(projectId: string | null, workstream: string | null
   return workstream && workstream !== 'main' ? `${p.name} · ${workstream}` : p.name;
 }
 
-export const KIND_LABEL: Record<BriefingContent['carryovers'][number]['kind'], string> = {
+export const KIND_LABEL: Record<BriefingKind, string> = {
   question: 'QUESTION',
   decision: 'DECISION',
   action: 'ACTION',
@@ -122,9 +122,96 @@ export function statTiles(stats: LedgerTotals | null): StatTile[] {
   ];
 }
 
-/** How many things the latest briefing left open, for the phone's strip. */
-export function openCount(data: BriefingLatest | null): number {
-  return data?.latest?.content?.carryovers.length ?? 0;
+/** "owner/name#123" → its GitHub URL, or null. */
+export function prHref(ref: string): string | null {
+  const m = /^([\w.-]+\/[\w.-]+)#(\d{1,9})$/.exec(ref);
+  return m ? `https://github.com/${m[1]}/pull/${m[2]}` : null;
+}
+
+/** "#123". */
+export function prLabel(ref: string): string {
+  const i = ref.lastIndexOf('#');
+  return i >= 0 ? ref.slice(i) : ref;
+}
+
+/** Marks still running, by key. */
+export function activeMarks(marks: BriefingDismissal[] | undefined, now: number = Date.now()): Map<string, BriefingDismissal> {
+  return new Map((marks ?? []).filter(m => Date.parse(m.until) > now).map(m => [m.key, m]));
+}
+
+export interface Split<T> { shown: T[]; hidden: Array<T & { mark: BriefingDismissal }> }
+
+/**
+ * Items marked Done or deferred go to `hidden`, with their mark; the rest keep
+ * their order. A Done pressed before this briefing was written does not hide
+ * it: the ledger only lets a done item back once its session did something
+ * new, so a newer briefing that lists it again means it is open again.
+ */
+export function splitMarked<T extends { key: string | null }>(
+  items: T[], marks: ReadonlyMap<string, BriefingDismissal>, briefingCreatedAt?: string,
+): Split<T> {
+  const out: Split<T> = { shown: [], hidden: [] };
+  const written = briefingCreatedAt ? Date.parse(briefingCreatedAt) : NaN;
+  for (const it of items) {
+    const m = it.key ? marks.get(it.key) : undefined;
+    // Only a session's item comes back with new activity; a PR-only item or a
+    // pattern stays done for the mark's whole span.
+    const sessionKey = !!m && m.key.startsWith('open:') && !m.key.startsWith('open:pr:');
+    const reopened = sessionKey && m.kind === 'done' && Number.isFinite(written) && Date.parse(m.createdAt) < written;
+    if (m && !reopened) out.hidden.push({ ...it, mark: m }); else out.shown.push(it);
+  }
+  return out;
+}
+
+/** A Done, Defer or Bring back pressed here and not yet seen in a poll; mark null = brought back. */
+export interface MarkOverride { key: string; mark: BriefingDismissal | null; settledAt: number | null }
+
+/**
+ * The server's marks with this tab's own changes on top, so a poll that left
+ * before a click landed cannot undo it. An override stops applying once a poll
+ * that started after its save has answered (`fetchedFrom`).
+ */
+export function overlayMarks(server: BriefingDismissal[] | undefined, overrides: MarkOverride[], fetchedFrom: number): BriefingDismissal[] {
+  const out = new Map((server ?? []).map(m => [m.key, m]));
+  for (const o of overrides) {
+    if (o.settledAt !== null && fetchedFrom >= o.settledAt) continue;
+    if (o.mark) out.set(o.key, o.mark); else out.delete(o.key);
+  }
+  return [...out.values()];
+}
+
+/**
+ * Worked on bullets grouped by project and workstream, in the order the
+ * briefing named them. Grouped by identity, not by label: two projects can
+ * share a name on different boxes.
+ */
+export function groupWorkedOn(
+  items: BriefingContent['workedOn'],
+  projects: BriefingView['projects'],
+): Array<{ label: string | null; projectId: string | null; workstream: string | null; items: BriefingContent['workedOn'] }> {
+  const groups: Array<{ id: string; label: string | null; projectId: string | null; workstream: string | null; items: BriefingContent['workedOn'] }> = [];
+  for (const it of items) {
+    const known = !!it.projectId && !!projects[it.projectId];
+    const id = known ? `${it.projectId}\u0000${it.workstream || 'main'}` : '';
+    let g = groups.find(x => x.id === id);
+    if (!g) { g = { id, label: sessionLabel(it.projectId, it.workstream, projects), projectId: it.projectId, workstream: it.workstream, items: [] }; groups.push(g); }
+    g.items.push(it);
+  }
+  return groups.map(({ id: _id, ...g }) => g);
+}
+
+/** How many things the latest briefing left open and were not marked, for the phone's strip. */
+export function openCount(data: BriefingLatest | null, now: number = Date.now()): number {
+  const items = data?.latest?.content?.leftOpen ?? [];
+  return splitMarked(items, activeMarks(data?.dismissals, now), data?.latest?.createdAt).shown.length;
+}
+
+/** When a mark lets its item back, in words: "tomorrow 09:00", "in 14 days". */
+export function markLabel(m: BriefingDismissal, now: number = Date.now()): string {
+  const ms = Date.parse(m.until) - now;
+  if (m.kind === 'done') return 'done';
+  if (ms <= 36 * 3_600_000) return `back in ${Math.max(1, Math.round(ms / 3_600_000))}h`;
+  return `back in ${Math.round(ms / 86_400_000)} days`;
 }
 
 /** The browser's IANA timezone, or UTC when the platform cannot say. */

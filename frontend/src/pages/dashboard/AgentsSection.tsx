@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LineChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, YAxis } from 'recharts';
-import type { SpawnNode, SpawnUsage } from '../../services/api';
+import { spawnsApi, type SpawnNode, type SpawnSession, type SpawnUsage } from '../../services/api';
 import { PROVIDERS } from '../../providers/registry';
 import { fmtAge, fmtK } from '../../utils/format';
+import { networkLink, sessionNetworkLink } from '../../utils/spawnNetwork';
 import {
-  childLink, hasSpawnActivity, meterFill, meterTone, nodeTokenTotal, reasonLabel, spawnStateLabel, spawnStateTone,
+  childLink, fosterNote, groupTreesByOrigin, hasSpawnActivity, meterFill, meterTone, nodeTokenTotal, pickedSession, reasonLabel, sessionKey,
+  spawnActions, spawnStateLabel, spawnStateTone,
 } from '../../utils/spawnUsage';
 
 /**
@@ -33,7 +35,7 @@ function Meter({ label, used, limit, note }: { label: string; used: number; limi
   );
 }
 
-function ProviderBadge({ id }: { id: string }) {
+export function ProviderBadge({ id }: { id: string }) {
   const p = PROVIDERS[id];
   if (!p) return <span className="usage-dim">{id}</span>;
   return (
@@ -45,18 +47,133 @@ function ProviderBadge({ id }: { id: string }) {
   );
 }
 
-function TreeRow({ n, now }: { n: SpawnNode; now: number }) {
+const errorText = (err: unknown) => (err as { response?: { data?: { error?: string } } }).response?.data?.error ?? (err as Error).message;
+
+const ACTION_LABEL = { park: 'Park', resume: 'Resume', retire: 'Retire' } as const;
+
+/** Park / Resume / Retire for one spawned agent. */
+function RowActions({ n, onChanged }: { n: SpawnNode; onChanged?: () => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const actions = spawnActions(n);
+  if (!actions.length && !error) return null;
+  const where = `${n.child.projectName}${n.child.workstream === 'main' ? '' : `/${n.child.workstream}`}`;
+  const run = async (a: 'park' | 'resume' | 'retire') => {
+    if (a === 'retire' && !window.confirm(`Retire ${where}? Its workstream, worktree and tmux pair are removed, and its local branch once pushed. It is refused if that would lose uncommitted or unpushed work.`)) return;
+    setBusy(a);
+    setError(null);
+    try {
+      if (a === 'resume') await spawnsApi.resume(n.id);
+      else await spawnsApi.dismiss(n.id, a);
+      onChanged?.();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <div className="spawn-actions">
+      {actions.map(a => (
+        <button key={a} type="button" className="recents-link" disabled={busy !== null} onClick={() => void run(a)}
+          title={a === 'park' ? 'Stop its agent CLI; keep the worktree and conversation' : a === 'resume' ? 'Start it again on its conversation' : 'Remove its workstream when nothing would be lost'}>
+          {busy === a ? '…' : ACTION_LABEL[a]}
+        </button>
+      ))}
+      {error && <span className="spawn-error" role="alert">{error}</span>}
+    </div>
+  );
+}
+
+/** A select of the owner's sessions; picking one calls onPick (the select resets after). */
+function SessionPicker({ sessions, label, placeholder, value, onPick, disabled, clearLabel }: {
+  sessions: SpawnSession[]; label: string; placeholder: string; value?: string; disabled?: boolean;
+  onPick: (to: { projectId: string; workstream: string } | null) => void; clearLabel?: string;
+}) {
+  return (
+    <select className="spawn-picker" aria-label={label} value={value ?? ''} disabled={disabled}
+      onChange={e => { const v = e.target.value; if (v === '__clear') onPick(null); else { const to = pickedSession(v); if (to) onPick(to); } }}>
+      <option value="" disabled={!value}>{placeholder}</option>
+      {clearLabel && value && <option value="__clear">{clearLabel}</option>}
+      {sessions.map(s => <option key={sessionKey(s)} value={sessionKey(s)}>{s.label}</option>)}
+    </select>
+  );
+}
+
+/** "Adopt into…" for an orphan: the picked session takes its reports from then on. */
+function AdoptInto({ n, sessions, onChanged }: { n: SpawnNode; sessions: SpawnSession[]; onChanged?: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const own = sessions.filter(s => !(s.projectId === n.child.projectId && s.workstream === n.child.workstream));
+  const pick = async (to: { projectId: string; workstream: string } | null) => {
+    if (!to) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await spawnsApi.adopt(n.id, to);
+      onChanged?.();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="spawn-actions">
+      <SessionPicker sessions={own} label={`Adopt ${n.child.projectName}/${n.child.workstream} into`} placeholder={busy ? 'Adopting…' : 'Adopt into…'} disabled={busy} onPick={to => void pick(to)} />
+      {error && <span className="spawn-error" role="alert">{error}</span>}
+    </div>
+  );
+}
+
+/** The orphan home: where orphans go when no ancestor is alive. */
+function OrphanHome({ usage, onChanged }: { usage: SpawnUsage; onChanged?: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const sessions = usage.sessions ?? [];
+  const home = usage.orphanHome ?? null;
+  const pick = async (to: { projectId: string; workstream: string } | null) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await spawnsApi.setOrphanHome(to);
+      onChanged?.();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="usage-dim spawn-limits-note spawn-orphan-home">
+      <span>Orphan home</span>
+      <SessionPicker sessions={sessions} label="Orphan home" placeholder="none: orphans wait here" value={home ? sessionKey(home) : undefined}
+        disabled={busy} onPick={to => void pick(to)} clearLabel="none: orphans wait here" />
+      <span>
+        {home && !home.label ? 'its session is gone, so orphans wait here; pick another. ' : ''}
+        When a spawned agent's parent goes away, its nearest living ancestor adopts it, else this session if its agent pane is running then.
+      </span>
+      {error && <span className="spawn-error" role="alert">{error}</span>}
+    </div>
+  );
+}
+
+export function TreeRow({ n, now, onChanged, sessions, adopt, network }: { n: SpawnNode; now: number; onChanged?: () => void; sessions?: SpawnSession[]; adopt?: boolean; network?: string }) {
   const link = childLink(n);
+  const foster = fosterNote(n, sessions);
   const where = `${n.child.projectName}${n.child.workstream === 'main' ? '' : `/${n.child.workstream}`}`;
   const tokens = nodeTokenTotal(n);
   const started = Date.parse(n.createdAt);
   const summary = n.report?.summary.split('\n').find(l => l.trim()) ?? '';
   return (
-    <tr className={`spawn-row spawn-row--${spawnStateTone(n)}`}>
+    <tr className={`spawn-row spawn-row--${spawnStateTone(n)}${n.orphanedAt ? ' spawn-row--orphan' : ''}`}>
       <td className="spawn-agent-cell" style={{ paddingLeft: 8 + n.level * 18 }}>
         {n.level > 0 && <span className="spawn-branch" aria-hidden="true">↳ </span>}
         {link ? <Link to={link} title={n.child.session}>{where}</Link> : <span title={n.child.session}>{where}</span>}
+        {network && <Link className="spawn-net-link" to={networkLink(network)} title="This tree as a network, live">network ↗</Link>}
         <div className="spawn-title usage-dim" title={n.title}>{n.title}</div>
+        {n.orphanedAt && <div className="spawn-foster spawn-foster--orphan">○ orphaned: its parent went away</div>}
+        {foster && <div className="spawn-foster usage-dim">⇢ {foster}</div>}
       </td>
       <td>{n.relationship}</td>
       <td><ProviderBadge id={n.provider} /></td>
@@ -67,9 +184,40 @@ function TreeRow({ n, now }: { n: SpawnNode; now: number }) {
       <td className="spawn-report" title={n.report ? `${n.report.status}: ${n.report.summary}` : n.error ?? ''}>
         {n.report ? <><span className="usage-dim">{n.report.status.replace(/_/g, ' ')}:</span> {summary}</> : n.error ? <span className="spawn-error">{n.error}</span> : <span className="usage-dim">—</span>}
       </td>
+      <td>
+        {adopt && sessions && <AdoptInto n={n} sessions={sessions} onChanged={onChanged} />}
+        <RowActions n={n} onChanged={onChanged} />
+      </td>
     </tr>
   );
 }
+
+/** The parent row: the session that started the trees below it. */
+function OriginRow({ g, folded, onToggle }: { g: ReturnType<typeof groupTreesByOrigin>[number]; folded: boolean; onToggle: () => void }) {
+  const label = g.origin ? g.origin.label : 'Started from the dashboard';
+  const counts = [
+    `${g.trees.length} tree${g.trees.length === 1 ? '' : 's'}`,
+    `${g.agents} agent${g.agents === 1 ? '' : 's'}`,
+    g.running ? `${g.running} running` : null,
+    g.attention ? `${g.attention} waiting on someone` : null,
+  ].filter(Boolean).join(' · ');
+  return (
+    <tbody className="spawn-origin">
+      <tr className="spawn-origin-row">
+        <td colSpan={9}>
+          <button type="button" className="spawn-origin-toggle" aria-expanded={!folded} onClick={onToggle}
+            title={folded ? 'Show its trees' : 'Fold its trees into this row'}>
+            <span aria-hidden="true">{folded ? '▸' : '▾'}</span> <strong>{label}</strong>
+          </button>
+          <span className="usage-dim">{g.origin ? ' your session · ' : ' '}{counts}</span>
+          {g.origin && <Link className="spawn-net-link" to={sessionNetworkLink(g.origin.projectId, g.origin.workstream)} title="Every tree this session started, as one network">network ↗</Link>}
+        </td>
+      </tr>
+    </tbody>
+  );
+}
+
+export const TreeHead = () => <tr><th>Agent</th><th>As</th><th>CLI</th><th>State</th><th>Pane</th><th>Started</th><th>Tokens</th><th>Last report</th><th></th></tr>;
 
 const HEAT_LABEL: Record<SpawnUsage['boxes'][number]['heat'], string> = {
   hot: '▲ running hot', warm: '△ getting busy', ok: 'ok', unknown: 'no recent sample',
@@ -118,13 +266,18 @@ function BoxCard({ b }: { b: SpawnUsage['boxes'][number] }) {
   );
 }
 
-export function AgentsSection({ usage, now }: { usage: SpawnUsage | null; now: number }) {
+export function AgentsSection({ usage, now, onChanged }: { usage: SpawnUsage | null; now: number; onChanged?: () => void }) {
   const [all, setAll] = useState(false);
+  const [folded, setFolded] = useState<Set<string>>(() => new Set());
+  const toggle = (key: string) => setFolded(f => { const next = new Set(f); if (next.has(key)) next.delete(key); else next.add(key); return next; });
   if (!hasSpawnActivity(usage)) return null;
   const { budget, trees, treesTotal, refusals, boxes, days } = usage;
   const l = budget.limits;
   const refusedTotal = refusals.reduce((s, r) => s + r.count, 0);
   const visible = all ? trees : trees.slice(0, SHOW_TREES);
+  const orphans = usage.orphans ?? [];
+  const sessions = usage.sessions;
+  const head = <TreeHead />;
   return (
     <section className="dash-section" aria-labelledby="agents-h">
       <div className="dash-section-title" id="agents-h">
@@ -166,16 +319,36 @@ export function AgentsSection({ usage, now }: { usage: SpawnUsage | null; now: n
         </ul>
       )}
 
+      {orphans.length > 0 && (
+        <div className="admin-table-wrap spawn-orphans">
+          <div className="dash-section-title spawn-orphans-title">
+            <span>Orphans</span>
+            <span className="usage-dim">{orphans.length} whose parent went away, with no living ancestor{usage.orphanHome?.label ? '' : ' or orphan home'} to take their reports</span>
+          </div>
+          <table className="admin-table admin-table--dense spawn-table">
+            <thead>{head}</thead>
+            <tbody>
+              {orphans.map(n => <TreeRow key={n.id} n={{ ...n, level: 0 }} now={now} onChanged={onChanged} sessions={sessions} adopt />)}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {sessions && <OrphanHome usage={usage} onChanged={onChanged} />}
+
       {trees.length > 0 && (
         <div className="admin-table-wrap">
           <table className="admin-table admin-table--dense spawn-table">
-            <thead>
-              <tr><th>Agent</th><th>As</th><th>CLI</th><th>State</th><th>Pane</th><th>Started</th><th>Tokens</th><th>Last report</th></tr>
-            </thead>
-            {visible.map(t => (
-              <tbody key={t.rootId} className="spawn-tree">
-                {t.nodes.map(n => <TreeRow key={n.id} n={n} now={now} />)}
-              </tbody>
+            <thead>{head}</thead>
+            {groupTreesByOrigin(visible).map(g => (
+              <React.Fragment key={g.key || 'browser'}>
+                <OriginRow g={g} folded={folded.has(g.key)} onToggle={() => toggle(g.key)} />
+                {!folded.has(g.key) && g.trees.map(t => (
+                  <tbody key={t.rootId} className="spawn-tree spawn-tree--grouped">
+                    {t.nodes.map((n, i) => <TreeRow key={n.id} n={n} now={now} onChanged={onChanged} sessions={sessions} network={i === 0 ? t.rootId : undefined} />)}
+                  </tbody>
+                ))}
+              </React.Fragment>
             ))}
           </table>
         </div>

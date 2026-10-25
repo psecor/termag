@@ -18,6 +18,12 @@ export function BoxLifecycleDialog({ box, onClose, onSaved }: {
   const [error, setError] = useState('');
   const unchanged = hours === current && days === currentDays;
   const showCannotHibernate = !!box.lifecycle && !box.lifecycle.canAutoHibernate && (hours !== null || days !== null);
+  // The server picks the sentence from box-idle-stop-enabled. The dialog can
+  // repeat it while idle hours stay unset; choosing hours keeps the flag-off sentence,
+  // which is still true for a box with its own idle setting.
+  const cannotText = hours === null && (box.lifecycle?.idleHibernateHours ?? null) === null && box.lifecycle?.warning
+    ? box.lifecycle.warning
+    : CANNOT_HIBERNATE_TEXT;
 
   async function save() {
     setSaving(true);
@@ -81,7 +87,7 @@ export function BoxLifecycleDialog({ box, onClose, onSaved }: {
               much longer (90 days by default). Terminating deletes its disk.
             </div>
           </div>
-          {showCannotHibernate && <div className="box-lifecycle-warning" role="status">{CANNOT_HIBERNATE_TEXT}</div>}
+          {showCannotHibernate && <div className="box-lifecycle-warning" role="status">{cannotText}</div>}
           {error && <div className="error-text">{error}</div>}
           <div className="npf-actions">
             <button type="button" className="btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>

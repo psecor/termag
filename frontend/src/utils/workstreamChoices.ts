@@ -30,16 +30,25 @@ const WORKSTREAM_NAME = /^[A-Za-z0-9_-]+$/;
 export const isWorkstreamName = (s: string) => WORKSTREAM_NAME.test(s) && s !== 'main';
 
 /**
- * A new workstream's name for a PR: the repository's name and the branch's
- * last segment (`feat/pr-defer` in termag → `termag-pr-defer`), the repo
- * prefix kept once, at most 48 characters.
+ * A new workstream's name for a PR: the repository's name, the PR's number and
+ * the branch's last segment (`feat/pr-defer` of #359 in termag →
+ * `termag-pr359-pr-defer`), the repo and number prefixes kept once, at most 48
+ * characters.
  */
-export function suggestWorkstreamName(repo: string, branch: string): string {
+export function suggestWorkstreamName(repo: string, number: number, branch: string): string {
   const repoName = (repo.split('/')[1] ?? repo).replace(/[^A-Za-z0-9_-]+/g, '-');
+  const prefix = `${repoName}-pr${number}`;
   const last = branch.split('/').filter(Boolean).pop() ?? branch;
-  const slug = last.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'pr';
-  const name = slug === repoName || slug.startsWith(`${repoName}-`) ? slug : `${repoName}-${slug}`;
-  return name.slice(0, 48).replace(/-$/, '');
+  const slug = last.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  let rest = slug === repoName ? '' : slug.startsWith(`${repoName}-`) ? slug.slice(repoName.length + 1) : slug;
+  if (rest === `pr${number}` || rest.startsWith(`pr${number}-`)) rest = rest.slice(`pr${number}`.length + 1);
+  return (rest ? `${prefix}-${rest}` : prefix).slice(0, 48).replace(/-$/, '');
+}
+
+/** What a new PR workstream's agent is asked first, unless the user changes it. */
+export function suggestPrPrompt(repo: string, number: number): string {
+  const repoName = repo.split('/')[1] ?? repo;
+  return `Can you give a quick description of ${repoName}#${number} and any particular key points to review carefully?`;
 }
 
 export function workstreamChoices(

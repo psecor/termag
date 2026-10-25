@@ -38,6 +38,38 @@ export function breadcrumbs(spaceName: string, prefix: string): Crumb[] {
   return out;
 }
 
+/**
+ * A file's direct browser link, `<origin><base>files/<space>/<path>`, each
+ * segment percent-encoded. Mirrors backend services/spaces/spaceLinks.ts; the
+ * backend answers it with a redirect to the file for anyone who can read the
+ * space. `base` is Vite's BASE_URL (`/termag/`).
+ */
+export function spaceFileLink(origin: string, base: string, space: string, path: string): string {
+  const root = base.endsWith('/') ? base : `${base}/`;
+  return `${origin}${root}files/${encodeURIComponent(space)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+/**
+ * The space and path a file link names, for a link on this origin under
+ * `base`; null for any other URL. The inverse of spaceFileLink, checked the
+ * way backend services/spaces/spaceLinks.ts parseSpaceFileLink checks it.
+ */
+export function parseSpaceFileLink(href: string, origin: string, base: string): { space: string; path: string } | null {
+  let url: URL;
+  try { url = new URL(href, origin); } catch { return null; }
+  if (url.origin !== origin) return null;
+  const root = `${base.endsWith('/') ? base : `${base}/`}files/`;
+  if (!url.pathname.startsWith(root)) return null;
+  const segments = url.pathname.slice(root.length).split('/');
+  if (segments.length < 2) return null;
+  let decoded: string[];
+  try { decoded = segments.map(decodeURIComponent); } catch { return null; }
+  const [space, ...rest] = decoded;
+  if (!SPACE_NAME_RE.test(space)) return null;
+  if (rest.some(s => s === '' || s === '.' || s === '..')) return null;
+  return { space, path: rest.join('/') };
+}
+
 /** The folder a path sits in: `a/b/c.txt` → `a/b/`. */
 export function parentPrefix(path: string): string {
   const bare = path.endsWith('/') ? path.slice(0, -1) : path;
@@ -156,6 +188,7 @@ export function partRanges(size: number, partBytes: number, partCount: number): 
 
 const ACTIONS: Record<string, string> = {
   'file.put': 'uploaded',
+  'file.put.signed': 'started an upload of',
   'file.get': 'downloaded',
   'file.rm': 'deleted',
   'file.mv': 'moved',

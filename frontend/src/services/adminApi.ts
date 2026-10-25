@@ -101,8 +101,8 @@ export interface ClientVersionRow { userId: string; user: string | null; kind: s
 export type PrView = 'credited' | 'humans' | 'all';
 export type PrBasis = 'merged' | 'opened';
 export type PrWindow = 1 | 7 | 30;
-export interface PrGroupMember { kind: 'repo' | 'pattern' | 'topic'; value: string; org?: string }
-export interface PrGroup { slug: string; name: string; sort: number; members: PrGroupMember[]; excluded: string[]; repos: Array<{ repo: string; visibility: string; prs: number }> }
+export interface PrGroupMember { kind: 'repo' | 'pattern' | 'topic' | 'path'; value: string; org?: string; paths?: string[]; minShare?: number; keys?: string[] }
+export interface PrGroup { slug: string; name: string; sort: number; members: PrGroupMember[]; excluded: string[]; repos: Array<{ repo: string; visibility: string; scoped?: boolean; prs: number }> }
 export interface PrDistribution { contributors: number; p50: number; p95: number; mean: number; max: number }
 export interface PrWindowSummary { days: number; prs: number; opened: number; merged: number; byClass: { human: number; agent: number; automation: number }; agentAssisted: number; distribution: PrDistribution }
 export interface PrSummary { group: string; view: PrView; basis: PrBasis; repos: number; windows: PrWindowSummary[]; generatedAt: string }
@@ -113,8 +113,26 @@ export interface PrIngestStatus {
   ingester: { state: string; lastTickAt: string | null; lastDiscoveryAt: string | null; lastError: string | null; pausedUntil: string | null; rate: { remaining: number; limit: number; resetAt: string } | null };
   tokenOwner: { id: string; unixUsername: string } | null;
   backfillDays: number; repos: number; backfilled: number; neverRun: number; prs: number; lastRunAt: string | null;
+  reviewDays: number; reviewsBackfilled: number;
   errors: Array<{ repo: string; error: string | null; at: string | null }>;
 }
+export interface PrAgentSplit { repos: number; merged: number; agentOnly: number; humanAndAgent: number; humanOnly: number; none: number; unread: number }
+export interface PrReviewWindow {
+  days: number; reviews: number;
+  /** Reviews per reviewer; contributors is the number of reviewers. */
+  distribution: PrDistribution;
+  approved: number; changesRequested: number; commentOnly: number; inlineComments: number;
+  mergedComments: { prs: number; p50: number; p95: number; max: number; botShare: number | null };
+  agent: PrAgentSplit;
+}
+export interface PrReviews { group: string; repos: number; reviewDays: number; approvalAgentLogins: string[]; windows: PrReviewWindow[]; generatedAt: string }
+export interface PrReviewer {
+  login: string; reviews: number; approved: number; changesRequested: number; commentOnly: number; inlineComments: number;
+  decidingApprovals: number; medianHoursToFirstReview: number | null; askedReviews: number; stalePickups: number; authorsHelped: number;
+  termag: { userId: string; unixUsername: string } | null;
+}
+export interface PrReviewers { group: string; days: number; reviewers: number; reviews: number; top: PrReviewer[] }
+export interface PrReviewTrend { group: string; weeks: number; rows: Array<{ week: string; reviews: number; reviewers: number; agentOnly: number; humanApproved: number; unapproved: number }> }
 export interface UserGrowth {
   bucket: GrowthBucket;
   /** key: 'YYYY-MM-DD' (day, week's Monday) or 'YYYY-MM' (month); total is the running headcount. */
@@ -273,6 +291,25 @@ export interface PipelineBox {
 }
 export interface PipelineHealth { days: number; boxes: PipelineBox[]; generatedAt: string }
 
+/** Mirrors backend services/spawnLimits.ts SpawnLimits. */
+export interface SpawnLimitValues {
+  maxDepth: number; maxOpenChildren: number; perHour: number; maxConcurrentPerUser: number; boxCapacity: number | null;
+  hot: { memPct: number; loadPerCore: number; diskPct: number };
+  parkIdleMinutes: number; retireAfterDays: number;
+}
+export interface SpawnLimitsUserRow {
+  user: { id: string; unixUsername: string; displayName: string };
+  limits: SpawnLimitValues;
+  overrides: string[];
+  usage: { lastHour: number; running: number; last30d: number };
+}
+export interface SpawnLimitsReport {
+  flag: { key: string; url: string | null };
+  defaults: SpawnLimitValues;
+  users: SpawnLimitsUserRow[];
+  generatedAt: string;
+}
+
 export interface SystemHealth {
   process: { version: string; node: string; pid: number; uptimeS: number; startedAt: string; rssMb: number; heapUsedMb: number; commit: string | null; authMode: string; localSessions: boolean };
   agents: {
@@ -302,6 +339,51 @@ export interface AdminsResponse {
 }
 export interface AuditRow { id: string; at: string; actorId: string; actor: string; tokenId: string | null; surface: string; action: string; args: Record<string, unknown> | null; outcome: string; status: number | null }
 
+// ── Spend; mirrors backend/src/services/admin/spend/model.ts ──
+export type SpendPoolKind = 'contract' | 'infra';
+export type SpendPoolShare = 'proportional' | 'usage' | 'full';
+export type SpendPoolAllocation = 'even' | 'by-tokens' | 'by-usage';
+export interface SpendPrice { provider: string; model: string; effectiveFrom: string; input: number; output: number; cacheRead: number; cacheWrite: number }
+export interface SpendPool {
+  id?: string; name: string; kind: SpendPoolKind; providers: string[];
+  annualUsd: number | null; boxes: number | null; boxCostUsd: number | null; usersPerBox: number | null;
+  share: SpendPoolShare; shareValue: number | null; populationLabel: string | null; populationSize: number | null;
+  allocation: SpendPoolAllocation; startDate: string | null; endDate: string | null; note: string | null; sort: number;
+}
+export interface SpendSettings { loadedCostUsd: number; orgHeadcount: number; modelMix: Record<string, Record<string, number>> }
+export interface SpendModel { config: SpendSettings; prices: SpendPrice[]; pools: SpendPool[]; updatedAt: string }
+export interface SpendPoolCost {
+  id: string; name: string; kind: SpendPoolKind; providers: string[]; share: SpendPoolShare; allocation: SpendPoolAllocation;
+  annualUsd: number; daysInWindow: number; shareFraction: number; populationLabel: string | null; population: number | null;
+  costUsd: number; tokens: number; usdPerMTokens: number | null; activeUsers: number; usdPerActiveUser: number | null;
+  infra: null | { boxes: number; fixedBoxes: boolean; boxCostUsd: number; usersPerBox: number; peakConcurrent: number | null; boxesNeeded: number | null; utilization: number | null; seatUsdPerMonth: number };
+  warnings: string[];
+}
+export interface SpendProviderCost {
+  provider: string; pricing: 'metered' | 'pool' | 'unpriced'; pool: string | null; users: number;
+  input: number; output: number; cacheRead: number; cacheCreate: number; reasoning: number; tokens: number;
+  costUsd: number; usdPerMTokens: number | null; usdPerMExcludingCacheReads: number | null; cacheSavingsUsd: number | null;
+  estimatedTokens: number; estimatedCostUsd: number;
+  priceUsed: { model: string; input: number; output: number; cacheRead: number; cacheWrite: number } | null;
+}
+export interface SpendPerson {
+  userId: string; name: string; active: boolean; tokens: number; meteredUsd: number; pools: Record<string, number>;
+  poolUsd: number; totalUsd: number; annualizedUsd: number; shareOfLoaded: number; topProvider: string | null;
+}
+export interface SpendReport {
+  window: { since: string; until: string; days: number };
+  denominator: { mode: 'all' | 'active'; users: number; allUsers: number; activeUsers: number };
+  config: SpendSettings;
+  totals: {
+    meteredUsd: number; poolUsd: number; totalUsd: number; perHeadUsd: number | null; perHeadMonthlyUsd: number | null;
+    annualizedUsd: number; shareOfLoaded: number | null; tokens: number; usdPerMTokens: number | null;
+    estimatedTokens: number; estimatedCostUsd: number;
+  };
+  distribution: { p50: number | null; p90: number | null; mean: number | null; max: number | null };
+  providers: SpendProviderCost[]; pools: SpendPoolCost[]; people: SpendPerson[]; unpriced: string[]; updatedAt: string;
+}
+export interface SpendWeek { week: string; days: number; metered: Record<string, number>; pools: Record<string, number>; totalUsd: number }
+
 export const adminApi = {
   overview: (range: AdminRange): Promise<AdminOverview> => api.get('/api/admin/overview', q(range)).then(r => r.data),
   instances: (all = false): Promise<AdminInstance[]> => api.get('/api/admin/fleet/instances', { params: all ? { all: 1 } : {} }).then(r => r.data),
@@ -316,6 +398,9 @@ export const adminApi = {
   prSummary: (group: string, view: PrView, basis: PrBasis): Promise<PrSummary> => api.get('/api/admin/prs/summary', { params: { group, view, basis } }).then(r => r.data),
   prContributors: (group: string, view: PrView, basis: PrBasis, window: PrWindow): Promise<PrContributors> => api.get('/api/admin/prs/contributors', { params: { group, view, basis, window } }).then(r => r.data),
   prTrend: (group: string, view: PrView, basis: PrBasis): Promise<PrTrend> => api.get('/api/admin/prs/trend', { params: { group, view, basis } }).then(r => r.data),
+  prReviews: (group: string): Promise<PrReviews> => api.get('/api/admin/prs/reviews', { params: { group } }).then(r => r.data),
+  prReviewers: (group: string, window: PrWindow): Promise<PrReviewers> => api.get('/api/admin/prs/reviewers', { params: { group, window } }).then(r => r.data),
+  prReviewTrend: (group: string): Promise<PrReviewTrend> => api.get('/api/admin/prs/reviews/trend', { params: { group } }).then(r => r.data),
   savePrGroup: (g: { slug: string; name: string; members: PrGroupMember[]; excluded: string[]; sort: number }) => api.put(`/api/admin/prs/groups/${encodeURIComponent(g.slug)}`, g).then(r => r.data),
   deletePrGroup: (slug: string) => api.delete(`/api/admin/prs/groups/${encodeURIComponent(slug)}`).then(r => r.data),
   setPrToken: (use: boolean): Promise<PrIngestStatus> => api.put('/api/admin/prs/token', { use }).then(r => r.data),
@@ -324,6 +409,11 @@ export const adminApi = {
   softwareHost: (hostKey: string): Promise<SoftwareHostDetail> => api.get(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}`).then(r => r.data),
   clientVersions: (): Promise<{ runningCommit: string | null; clients: ClientVersionRow[] }> => api.get('/api/admin/software/clients').then(r => r.data),
   refreshSoftware: () => api.post('/api/admin/software/refresh').then(r => r.data),
+  /** `from`/`to` are inclusive UTC day keys; the Spend tab picks 7, 30 or 90 days ending today. */
+  spendReport: (from: string, to: string, active: boolean): Promise<SpendReport> => api.get('/api/admin/spend/report', { params: { from, to, ...(active ? { active: 1 } : {}) } }).then(r => r.data),
+  spendTrend: (weeks = 12): Promise<{ weeks: SpendWeek[] }> => api.get('/api/admin/spend/trend', { params: { weeks } }).then(r => r.data),
+  spendModel: (): Promise<SpendModel> => api.get('/api/admin/spend/config').then(r => r.data),
+  saveSpendModel: (m: Omit<SpendModel, 'updatedAt'>): Promise<SpendModel> => api.put('/api/admin/spend/config', m).then(r => r.data),
   userGrowth: (bucket: GrowthBucket): Promise<UserGrowth> => api.get('/api/admin/users/growth', { params: { bucket } }).then(r => r.data),
   projects: (f: { userId?: string; instanceId?: string; provider?: string; archived?: boolean; staleDays?: number } = {}): Promise<AdminProject[]> =>
     api.get('/api/admin/projects', { params: { ...f, archived: f.archived ? 1 : undefined } }).then(r => r.data),
@@ -335,6 +425,7 @@ export const adminApi = {
   segmentUsers: (date?: string): Promise<SegmentUsers> => api.get('/api/admin/segments/users', date ? { params: { date } } : {}).then(r => r.data),
   signals: (): Promise<SignalsResponse> => api.get('/api/admin/signals').then(r => r.data),
   system: (): Promise<SystemHealth> => api.get('/api/admin/system').then(r => r.data),
+  spawnLimits: (): Promise<SpawnLimitsReport> => api.get('/api/admin/spawn-limits').then(r => r.data),
   orchestratorHealth: (): Promise<OrchestratorHealth> => api.get('/api/admin/claude-runner/health').then(r => r.data),
   cloudSessions: (days = 7, limit = 50): Promise<AdminCloudSessions> => api.get('/api/admin/claude-runner/sessions', { params: { days, limit } }).then(r => r.data),
   cloudReport: (range: AdminRange, groupBy: CloudReportGroup): Promise<CloudReport> => api.get('/api/admin/claude-runner/report', q(range, { groupBy })).then(r => r.data),

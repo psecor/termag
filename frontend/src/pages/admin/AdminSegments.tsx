@@ -4,7 +4,8 @@
  * the per-day user list loads on demand.
  */
 import React, { useCallback, useState } from 'react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, type TooltipContentProps } from 'recharts';
+import type { NameType, ValueType } from 'recharts/types/component/DefaultTooltipContent';
 import { adminApi, type SegmentsOverview, type SegmentName } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
 import { TICK, GRID_STROKE, BAR_MAX, CHART_HEIGHT, DashTooltip } from '../dashboard/chartTheme';
@@ -15,6 +16,9 @@ const SEGMENT_COLORS: Record<string, string> = {
   New: '#f0c674', Power: '#7c5cff', Active: '#2f95d6',
   Passive: '#58c2a9', Dormant: '#9aa5b1', Service: '#6e7681',
 };
+/** Drawn below the zero line on the ladder: users engagement has lost. */
+const BELOW: SegmentName[] = ['Dormant'];
+const count = (v: number) => String(Math.abs(Math.round(v)));
 
 export function AdminSegments() {
   const poll = useAdminPolled(useCallback(() => adminApi.segments(), []), 5 * 60_000);
@@ -26,11 +30,15 @@ export function AdminSegments() {
         subtitle={`per-user segment by day${overview ? ` (${overview.from.slice(5)} → ${overview.to.slice(5)})` : ''}`}
         value={overview ? `${overview.users} users` : '…'} stale={!overview}>
         <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
-          <BarChart data={trendRows(overview)} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barCategoryGap="20%">
+          <BarChart data={trendRows(overview)} margin={{ top: 8, right: 8, left: 0, bottom: 0 }} barCategoryGap="20%" stackOffset="sign">
             <CartesianGrid vertical={false} stroke={GRID_STROKE} />
             <XAxis dataKey="date" tick={TICK} tickLine={false} axisLine={false} minTickGap={28} />
-            <YAxis tick={TICK} tickLine={false} axisLine={false} width={26} allowDecimals={false} />
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={(v: number) => String(Math.round(v))} />} />
+            <YAxis tick={TICK} tickLine={false} axisLine={false} width={26} allowDecimals={false} tickFormatter={count} />
+            <ReferenceLine y={0} stroke="var(--text-secondary)" strokeWidth={1} strokeOpacity={0.5} />
+            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={(p: TooltipContentProps<ValueType, NameType>) => (
+              <DashTooltip active={p.active} label={p.label} fmt={count}
+                payload={p.payload?.map(r => ({ name: String(r.name), color: r.color, dataKey: r.dataKey as string, value: Math.abs(Number(r.value)) }))} />
+            )} />
             {SEGMENT_ORDER.map(k => (
               <Bar key={k} dataKey={k} stackId="l" name={k} fill={SEGMENT_COLORS[k]}
                 stroke="var(--bg-surface)" strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
@@ -63,7 +71,7 @@ export function AdminSegments() {
 function trendRows(overview: SegmentsOverview | null): Array<Record<string, string | number>> {
   return (overview?.days ?? []).map(d => {
     const row: Record<string, string | number> = { date: d.date.slice(5), total: d.total };
-    for (const s of SEGMENT_ORDER) row[s] = d.counts.find(c => c.segment === s)?.n ?? 0;
+    for (const s of SEGMENT_ORDER) row[s] = (d.counts.find(c => c.segment === s)?.n ?? 0) * (BELOW.includes(s) ? -1 : 1);
     return row;
   });
 }

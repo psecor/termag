@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { retryConnection, useConnection } from '../contexts/ConnectionContext';
+import { reauthenticate, retryConnection, useConnection } from '../contexts/ConnectionContext';
 import { TAKEOVER, formatSince, takeoverVisible } from '../utils/connection';
 
 /**
@@ -10,9 +10,12 @@ import { TAKEOVER, formatSince, takeoverVisible } from '../utils/connection';
  * click — with a "peek" escape hatch for reading or copying stale output.
  *
  * Degraded is deliberately NOT handled here; it keeps the one-line banner.
+ *
+ * An expired edge session takes over at once instead, as a sign-in prompt: the
+ * tab waits for a click or key press before going to Okta (markEdgeSignedOut).
  */
 export function ConnectionOverlay() {
-  const { state, lastContactAt, now } = useConnection();
+  const { state, lastContactAt, now, signedOut } = useConnection();
 
   // When did we enter offline? Tracked here rather than in the provider so
   // the escalation delay is a presentation concern.
@@ -44,18 +47,20 @@ export function ConnectionOverlay() {
     if (reconnectedAt != null && !showReconnected) setReconnectedAt(null);
   }, [reconnectedAt, showReconnected]);
 
-  const visible = takeoverVisible({ state, offlineSince, peekUntil, now });
+  const visible = signedOut || takeoverVisible({ state, offlineSince, peekUntil, now });
 
   // Take focus so the notice is announced and Escape works; Escape = peek.
   useEffect(() => {
     if (!visible) return;
     panelRef.current?.focus();
+    // Any key signs a signed-out tab in (the provider's listener); no peek.
+    if (signedOut) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { e.preventDefault(); setPeekUntil(Date.now() + TAKEOVER.peekMs); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [visible]);
+  }, [visible, signedOut]);
 
   const [probing, setProbing] = useState(false);
   const retryNow = async () => {
@@ -64,11 +69,24 @@ export function ConnectionOverlay() {
     try { await retryConnection(); } finally { setProbing(false); }
   };
 
-  const peeking = state === 'offline' && peekUntil != null && now < peekUntil;
+  const peeking = !signedOut && state === 'offline' && peekUntil != null && now < peekUntil;
 
   return (
     <>
-      {visible && (
+      {visible && signedOut && (
+        <div className="connection-takeover" role="alertdialog" aria-modal="true" aria-labelledby="connection-takeover-title">
+          <div className="connection-takeover-panel" ref={panelRef} tabIndex={-1}>
+            <div className="connection-takeover-title" id="connection-takeover-title">Signed out of termag</div>
+            <div className="connection-takeover-message">
+              Your sign-in expired. Click anywhere or press any key to sign in again.
+            </div>
+            <div className="connection-takeover-actions">
+              <button className="terminal-reconnect-button" onClick={reauthenticate} autoFocus>Sign in</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {visible && !signedOut && (
         <div className="connection-takeover" role="alertdialog" aria-modal="true" aria-labelledby="connection-takeover-title">
           <div className="connection-takeover-panel" ref={panelRef} tabIndex={-1}>
             <div className="connection-takeover-title" id="connection-takeover-title">Connection to termag lost</div>

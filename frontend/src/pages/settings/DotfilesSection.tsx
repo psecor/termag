@@ -48,7 +48,9 @@ export function DotfilesSection() {
           Codespaces does: the first of <code>install.sh</code>, <code>install</code>,{' '}
           <code>bootstrap.sh</code>, <code>bootstrap</code>, <code>script/bootstrap</code>,{' '}
           <code>setup.sh</code>, <code>setup</code> or <code>script/setup</code> runs. With none,
-          every top-level file or directory whose name starts with a dot (<code>.zshrc</code>,{' '}
+          a <a href="https://www.chezmoi.io/" target="_blank" rel="noreferrer">chezmoi</a> source
+          directory is applied with <code>chezmoi init --apply</code>, each prompt taking its
+          default. Otherwise every top-level file or directory whose name starts with a dot (<code>.zshrc</code>,{' '}
           <code>.gitconfig</code>, <code>.config</code>) is symlinked into your home from the clone
           at <code>~/.dotfiles</code>; a file already there is kept, and anything without a leading
           dot (a README, this list) is left alone. A public repository is cloned when the box is

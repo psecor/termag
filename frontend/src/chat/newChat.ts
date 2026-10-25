@@ -4,6 +4,8 @@
 // held until Claude can take it.
 import type { AgentStatusValue, Instance } from '../types';
 import { isValidBoxName } from '../utils/boxNames';
+import type { RepoPick } from '../utils/repoPick';
+import { isChatModel, type ChatModelId } from './composer';
 import type { Block } from './paneChat';
 
 /** `base`, else `base-2`, `base-3`, … whichever is not taken (case-insensitive). */
@@ -28,6 +30,47 @@ export function newChatNames(
   const projectName = uniqueName(base, projectNames);
   const boxBase = isValidBoxName(projectName) ? projectName : 'chat';
   return { projectName, boxName: uniqueName(boxBase, boxNames) };
+}
+
+/**
+ * Why New chat's Start is disabled, shown beside it, or '' when it is not (or
+ * while a start is under way, which the button's own label narrates).
+ */
+export function startBlocker(i: {
+  busy: boolean;
+  hasRepo: boolean;
+  name: string;
+  nameError: string;
+  spacesReady: boolean;
+  spaceError: string;
+  boxReady: boolean;
+  boxName: string;
+  boxError: string;
+}): string {
+  if (i.busy) return '';
+  if (!i.hasRepo) return 'Paste a repository URL, or pick another option';
+  if (!i.name) return 'Give the session a name under Options';
+  if (i.nameError) return `Session name: ${i.nameError}`;
+  if (!i.spacesReady) return 'Loading your spaces…';
+  if (i.spaceError) return i.spaceError;
+  if (!i.boxReady) {
+    if (!i.boxName) return 'Give the box a name under Options';
+    if (i.boxError) return `Box name: ${i.boxError}`;
+  }
+  return '';
+}
+
+/**
+ * "Act as an orchestrator" on New session (the project's chatOrchestrator; the
+ * box's chat runner tells each turn to use the agent-orchestrator skill, out
+ * of the conversation): hidden unless the provider has the
+ * skill and the form starts a chat (not a schedule); disabled until the trust
+ * box is ticked, since an untrusted turn has neither the Skill tool nor Bash
+ * for `termag ask` (agent/chat-runner.js READ_ONLY_TOOLS).
+ */
+export function orchestratorOption(i: { providerHasSkill: boolean; scheduled: boolean; trusted: boolean }): 'hidden' | 'needs-trust' | 'available' {
+  if (!i.providerHasSkill || i.scheduled) return 'hidden';
+  return i.trusted ? 'available' : 'needs-trust';
 }
 
 /**
@@ -228,4 +271,49 @@ function parseClaim(raw: string | null): { tab: string; at: number } | null {
 /** Whether a localStorage key belongs to this project's queue (for storage events from other tabs). */
 export function isQueueKey(key: string | null, projectId: string): boolean {
   return key === null || key === QUEUED_PREFIX + projectId || key === CLAIM_PREFIX + projectId;
+}
+
+// The repository, space and Claude model the last chat started with on this
+// browser, so the next New chat opens on them. Only a listed or pasted
+// repository is kept; a space is kept by name and offered again only while the
+// user can still pick it; a model no longer offered (e.g. the retired Auto)
+// reads as Sonnet.
+const LAST_START_KEY = 'termag-chat-last-start';
+
+export type RememberedPick = Extract<RepoPick, { kind: 'listed' | 'pasted' }>;
+
+export interface LastStart {
+  pick: RememberedPick | null;
+  space: string | null;
+  model: ChatModelId;
+}
+
+export function readLastStart(store: Store): LastStart {
+  const none: LastStart = { pick: null, space: null, model: 'sonnet' };
+  try {
+    const raw = store?.getItem(LAST_START_KEY);
+    if (!raw) return none;
+    const v = JSON.parse(raw) as { pick?: Record<string, unknown>; space?: unknown; model?: unknown };
+    const p = v.pick;
+    let pick: RememberedPick | null = null;
+    if (p?.kind === 'listed' && typeof p.fullName === 'string' && p.fullName && typeof p.defaultBranch === 'string') {
+      pick = { kind: 'listed', fullName: p.fullName, defaultBranch: p.defaultBranch };
+    } else if (p?.kind === 'pasted' && typeof p.url === 'string' && p.url.trim()) {
+      pick = { kind: 'pasted', url: p.url };
+    }
+    return {
+      pick,
+      space: typeof v.space === 'string' && v.space ? v.space : null,
+      model: typeof v.model === 'string' && isChatModel(v.model) ? v.model : 'sonnet',
+    };
+  } catch {
+    return none;
+  }
+}
+
+/** Record what a chat just started with. A pick that can't be remembered clears the repository. */
+export function writeLastStart(store: Store, last: { pick: RepoPick; space: string | null; model: ChatModelId }): void {
+  const { pick, space, model } = last;
+  const kept = pick.kind === 'listed' || (pick.kind === 'pasted' && pick.url.trim()) ? pick : null;
+  try { store?.setItem(LAST_START_KEY, JSON.stringify({ pick: kept, space, model })); } catch { /* ignore */ }
 }

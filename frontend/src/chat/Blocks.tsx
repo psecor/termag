@@ -5,7 +5,7 @@ import React, { useState } from 'react';
 import { Block, splitFences } from './paneChat';
 import './blocks.css';
 
-function ToolBlock({ block }: { block: Block }) {
+function ToolBlock({ block, onShare }: { block: Block; onShare?: (block: Block) => void }) {
   const [open, setOpen] = useState(false);
   const lines = block.result ? block.result.split('\n').length : 0;
   return (
@@ -15,7 +15,12 @@ function ToolBlock({ block }: { block: Block }) {
         <span className="m-tool-title">{block.text || 'tool'}</span>
         {lines > 0 && <span className="m-tool-count">{open ? '▾' : '▸'} {lines}</span>}
       </button>
-      {open && block.result && <pre className="m-tool-result">{block.result}</pre>}
+      {open && block.result && (
+        <>
+          <pre className="m-tool-result">{block.result}</pre>
+          {onShare && <button className="m-tool-share" onClick={() => onShare(block)}>Share</button>}
+        </>
+      )}
     </div>
   );
 }
@@ -31,14 +36,16 @@ function RichText({ text }: { text: string }) {
   );
 }
 
-export function BlockView({ block, agentLabel, banner, dialogHint }: {
+export function BlockView({ block, agentLabel, banner, dialogHint, onShareTool }: {
   block: Block;
   agentLabel: string;
   banner?: boolean;
   /** Where the answer keys are, for a dialog block; defaults to the phone's key bar wording. */
   dialogHint?: string;
+  /** A Share button under an opened tool result (the phone's share-out). */
+  onShareTool?: (block: Block) => void;
 }) {
-  if (block.kind === 'tool') return <ToolBlock block={block} />;
+  if (block.kind === 'tool') return <ToolBlock block={block} onShare={onShareTool} />;
   if (block.kind === 'plain') return <pre className="m-block m-block-plain">{block.text}</pre>;
   // `banner`: the shell's MOTD before the CLI started, the only text that is
   // meant to recede. Any other system block is something the grammar did not

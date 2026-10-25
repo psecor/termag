@@ -4,8 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content, viewport-fit=cover" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <!-- Installable phone client. The manifest's start_url is /termag/m. -->
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- Installable phone client. The manifest's start_url is /termag/m.
+         use-credentials: Chrome fetches a manifest without cookies otherwise, and behind the
+         ALB's authenticate-oidc rule that fetch gets the Okta redirect, so Android can't install. -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
     <meta name="theme-color" content="#161b22" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />

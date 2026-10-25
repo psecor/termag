@@ -6,6 +6,10 @@ export interface User {
   displayName: string;
   unixUsername: string;
   defaultAgentProvider: AgentProvider;
+  /** Skip Slack/Discord "waiting" posts while a push device is registered. Absent on older backends. */
+  pushMutesChat?: boolean;
+  /** Notify when a chat this user can see finishes its turn. Absent on older backends. */
+  chatTurnNotify?: boolean;
   dotfilesRepoUrl: string | null;
   theme: ThemeSettings;
   /** Effective role from /auth/me; drives the admin nav entry only (the server re-checks). */
@@ -26,6 +30,10 @@ export interface Workflow {
   id: string;
   type: WorkflowType;
   provider?: AgentProvider | null;
+  /** The model backend an agent workflow runs on; null = the harness's default. */
+  backend?: string | null;
+  /** The model it starts on (`--model`); null = the backend's default. */
+  model?: string | null;
   server: string;
   projectId: string;
   workstreamId?: string;
@@ -38,6 +46,8 @@ export interface Workstream {
   branch: string;
   slackChannelId?: string | null;
   archived: boolean;
+  /** Claude's own title for the workstream's chat session (simple-ui-session-titles-enabled); null before its first. */
+  sessionTitle?: string | null;
   lastActiveAt: string;
   createdAt: string;
   updatedAt: string;
@@ -60,8 +70,9 @@ export interface Project {
   workstreams: Workstream[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';
-  // 'metaterm' = the per-user pinned control-tower singleton; absent/'normal' otherwise.
-  kind?: 'normal' | 'metaterm';
+  // 'metaterm' = the per-user pinned control-tower singleton; 'automation' = a
+  // project whose runs a schedule starts; absent/'normal' otherwise.
+  kind?: 'normal' | 'metaterm' | 'automation';
 }
 
 export type InstanceStatus =
@@ -201,6 +212,8 @@ export interface CloudSession {
   state: CloudSessionState;
   exitReason: string | null;
   queuedReason: string | null;
+  /** The refusal's stable code behind `queuedReason` (backend REFUSAL_CODES); null for sessions queued before it existed, absent from an older backend. */
+  queuedCode?: string | null;
   /** For `queued`: when the current unbroken run of refusals began. */
   queuedSince: string | null;
   current: CloudSessionRun | null;

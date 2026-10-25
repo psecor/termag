@@ -56,4 +56,17 @@ describe('useFollowBottom', () => {
     expect(latest.current!.unseen).toBe(false);
     expect(el.scrollTop).toBe(1000);
   });
+
+  it('a send while scrolled up jumps to the bottom and follows what comes next', () => {
+    act(() => root.render(<Harness content="a1" chat="A" />));
+    const el = scroller();
+    el.scrollTop = 0;
+    act(() => { el.dispatchEvent(new Event('scroll')); });
+    act(() => latest.current!.jumpToBottom());
+    expect(el.scrollTop).toBe(1000);
+    el.scrollTop = 500;
+    act(() => root.render(<Harness content="a2 (your message)" chat="A" />));
+    expect(el.scrollTop).toBe(1000);
+    expect(latest.current!.unseen).toBe(false);
+  });
 });

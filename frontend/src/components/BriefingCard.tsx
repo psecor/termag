@@ -1,9 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { briefingsApi, BriefingLatest, BriefingView } from '../services/api';
+import { briefingsApi, BriefingDismissal, BriefingLatest, BriefingView } from '../services/api';
 import {
-  browserTz, cardState, CardState, KIND_LABEL, LinkMode, pendingProblem, pollInterval,
-  sessionHref, sessionLabel, statTiles, windowHeading, finishedLabel } from './briefing';
+  activeMarks, browserTz, cardState, CardState, groupWorkedOn, KIND_LABEL, LinkMode, markLabel, MarkOverride, overlayMarks, pendingProblem, pollInterval,
+  prHref, prLabel, sessionHref, sessionLabel, splitMarked, statTiles, windowHeading, finishedLabel } from './briefing';
+// Lazy: recharts stays on the /dashboard chunk. The workspace home view
+// mounts the compact card, which never draws charts.
+const BriefingCharts = lazy(() => import('./BriefingCharts').then(m => ({ default: m.BriefingCharts })));
 
 function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
@@ -19,15 +22,19 @@ export function useBriefingLatest(): {
   error: string | null;
   refresh: () => void;
   setData: (d: BriefingLatest) => void;
+  /** When the request behind `data` left (ms), for overlayMarks. */
+  fetchedFrom: number;
 } {
   const [data, setData] = useState<BriefingLatest | null>(null);
+  const [fetchedFrom, setFetchedFrom] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const state = cardState(data);
   useEffect(() => {
     let cancelled = false;
+    const startedAt = Date.now();
     briefingsApi.latest()
-      .then(d => { if (!cancelled) { setData(d); setError(null); } })
+      .then(d => { if (!cancelled) { setData(d); setFetchedFrom(startedAt); setError(null); } })
       .catch(err => { if (!cancelled) setError(apiError(err, 'Could not load the briefing')); });
     return () => { cancelled = true; };
   }, [tick]);
@@ -38,7 +45,7 @@ export function useBriefingLatest(): {
   }, [state, tick]);
 
   const refresh = useCallback(() => setTick(n => n + 1), []);
-  return { data, state, error, refresh, setData };
+  return { data, state, error, refresh, setData, fetchedFrom };
 }
 
 interface CardProps {
@@ -48,7 +55,8 @@ interface CardProps {
 }
 
 export function BriefingCard({ variant, linkMode = 'desktop' }: CardProps) {
-  const { data, state, error, refresh, setData } = useBriefingLatest();
+  const { data, state, error, refresh, setData, fetchedFrom } = useBriefingLatest();
+  const [overrides, setOverrides] = useState<MarkOverride[]>([]);
   const [busy, setBusy] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [history, setHistory] = useState<BriefingView[] | null>(null);
@@ -61,13 +69,42 @@ export function BriefingCard({ variant, linkMode = 'desktop' }: CardProps) {
     try {
       const row = await briefingsApi.run(browserTz());
       // Show the new row at once; the poll takes over from here.
-      setData(row.status === 'done' ? { latest: row, pending: null } : { latest: data?.latest ?? null, pending: row });
+      // Keep the marks: dropping them would bring Done and deferred items back until the next poll.
+      const dismissals = data?.dismissals;
+      setData(row.status === 'done' ? { latest: row, pending: null, dismissals } : { latest: data?.latest ?? null, pending: row, dismissals });
       setPicked('');
     } catch (err) {
       setRunError(apiError(err, 'Could not start a briefing'));
     } finally {
       setBusy(false);
       refresh();
+    }
+  }
+
+  // Done / Defer / Bring back: shown at once as an override on the polled
+  // marks, kept until a poll that left after the save answers; a failed save
+  // drops the override, which puts the item back.
+  const marks = activeMarks(overlayMarks(data?.dismissals, overrides, fetchedFrom));
+  const put = (o: MarkOverride) => setOverrides(list => [...list.filter(x => x.key !== o.key), o]);
+  const drop = (key: string) => setOverrides(list => list.filter(x => x.key !== key));
+  async function mark(key: string, action: 'done' | 'defer') {
+    const now = new Date();
+    put({ key, settledAt: null, mark: { key, kind: action, createdAt: now.toISOString(), until: new Date(now.getTime() + 86_400_000).toISOString() } });
+    try {
+      put({ key, mark: await briefingsApi.dismiss(key, action), settledAt: Date.now() });
+    } catch (err) {
+      drop(key);
+      setRunError(apiError(err, 'Could not save that'));
+    }
+  }
+  async function restore(key: string) {
+    put({ key, mark: null, settledAt: null });
+    try {
+      await briefingsApi.restore(key);
+      put({ key, mark: null, settledAt: Date.now() });
+    } catch (err) {
+      drop(key);
+      setRunError(apiError(err, 'Could not bring it back'));
     }
   }
 
@@ -140,7 +177,7 @@ export function BriefingCard({ variant, linkMode = 'desktop' }: CardProps) {
             </p>
           </div>
         )}
-        {shown && <BriefingBody view={shown} variant={variant} linkMode={linkMode} />}
+        {shown && <BriefingBody view={shown} variant={variant} linkMode={linkMode} marks={marks} onMark={mark} onRestore={restore} />}
         {variant === 'compact' && (
           <div className="briefing-foot"><Link to="/dashboard">Open dashboard →</Link></div>
         )}
@@ -153,13 +190,59 @@ function ItemLink({ href, children }: { href: string | null; children: React.Rea
   return href ? <Link className="briefing-item-link" to={href}>{children}</Link> : <div className="briefing-item-link">{children}</div>;
 }
 
-export function BriefingBody({ view, variant, linkMode }: { view: BriefingView; variant: 'full' | 'compact'; linkMode: LinkMode }) {
+function PrLink({ pr }: { pr: string }) {
+  const href = prHref(pr);
+  return href
+    ? <a className="briefing-pr" href={href} target="_blank" rel="noreferrer" title={pr}>{prLabel(pr)}</a>
+    : <span className="briefing-pr">{prLabel(pr)}</span>;
+}
+
+/** The row's right column, the same width on every row so the rows line up: its PR, then Done and Defer. */
+function RowSide({ itemKey, pr, onMark }: { itemKey: string | null; pr?: string | null; onMark?: (key: string, action: 'done' | 'defer') => void }) {
+  if (!pr && (!itemKey || !onMark)) return null;
+  return (
+    <span className="briefing-side">
+      {pr && <PrLink pr={pr} />}
+      <MarkButtons itemKey={itemKey} onMark={onMark} />
+    </span>
+  );
+}
+
+function MarkButtons({ itemKey, onMark }: { itemKey: string | null; onMark?: (key: string, action: 'done' | 'defer') => void }) {
+  if (!itemKey || !onMark) return null;
+  return (
+    <span className="briefing-marks">
+      <button type="button" className="briefing-mark" onClick={() => onMark(itemKey, 'done')} title="Done: leave it out of the next briefings">Done</button>
+      <button type="button" className="briefing-mark" onClick={() => onMark(itemKey, 'defer')} title="Leave it out for a day">Defer a day</button>
+    </span>
+  );
+}
+
+interface BodyProps {
+  view: BriefingView;
+  variant: 'full' | 'compact';
+  linkMode: LinkMode;
+  marks?: ReadonlyMap<string, BriefingDismissal>;
+  onMark?: (key: string, action: 'done' | 'defer') => void;
+  onRestore?: (key: string) => void;
+}
+
+export function BriefingBody({ view, variant, linkMode, marks = new Map(), onMark, onRestore }: BodyProps) {
   const c = view.content;
   const tiles = statTiles(view.stats);
-  const limit = variant === 'compact' ? 3 : Infinity;
-  const carry = (c?.carryovers ?? []).slice(0, limit);
-  const sugg = (c?.suggestions ?? []).slice(0, limit);
+  const compact = variant === 'compact';
   const finished = finishedLabel(view);
+  const open = splitMarked(c?.leftOpen ?? [], marks, view.createdAt);
+  const better = splitMarked(c?.workBetter ?? [], marks, view.createdAt);
+  const worked = groupWorkedOn(c?.workedOn ?? [], view.projects);
+  const hidden = [
+    ...open.hidden.map(x => ({ key: x.key!, text: x.title, mark: x.mark })),
+    ...better.hidden.map(x => ({ key: x.key, text: x.text, mark: x.mark })),
+  ];
+  const openShown = compact ? open.shown.slice(0, 3) : open.shown;
+  const workedShown = compact ? worked.slice(0, 2).map(g => ({ ...g, items: g.items.slice(0, 2) })) : worked;
+  const betterShown = compact ? better.shown.slice(0, 2) : better.shown;
+  const where = (projectId: string | null, workstream: string | null) => sessionLabel(projectId, workstream, view.projects);
 
   return (
     <div className="briefing-body">
@@ -169,7 +252,8 @@ export function BriefingBody({ view, variant, linkMode }: { view: BriefingView; 
           {[view.boxName ? `on ${view.boxName}` : null, finished ? `finished ${finished}` : null].filter(Boolean).join(' · ')}
         </div>
       )}
-      {variant === 'full' && tiles.length > 0 && (
+      {c?.headline && <p className="briefing-headline">{c.headline}</p>}
+      {!compact && tiles.length > 0 && (
         <div className="dash-kpis briefing-stats">
           {tiles.map(t => (
             <div className="dash-tile" key={t.id}>
@@ -179,56 +263,95 @@ export function BriefingBody({ view, variant, linkMode }: { view: BriefingView; 
           ))}
         </div>
       )}
-      {c?.summary && <p className="briefing-summary">{c.summary}</p>}
-      {carry.length > 0 && (
+      {!compact && view.charts && <Suspense fallback={null}><BriefingCharts charts={view.charts} /></Suspense>}
+
+      {workedShown.length > 0 && (
+        <div className="briefing-group">
+          <div className="briefing-group-label">Worked on</div>
+          <div className="briefing-worked">
+            {workedShown.map((g, gi) => {
+              const href = sessionHref(g.projectId, g.workstream, view.projects, linkMode);
+              return (
+                <div className="briefing-worked-group" key={gi}>
+                  {g.label && (href ? <Link className="attn-project" to={href}>{g.label}</Link> : <span className="attn-project">{g.label}</span>)}
+                  <ul className="briefing-bullets">
+                    {g.items.map((it, i) => (
+                      <li key={i}>
+                        {it.text}
+                        {it.prs.map(pr => <React.Fragment key={pr}> <PrLink pr={pr} /></React.Fragment>)}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {openShown.length > 0 && (
         <div className="briefing-group">
           <div className="briefing-group-label">Left open</div>
-          <ul className="attn-list briefing-list">
-            {carry.map((it, i) => {
-              const where = sessionLabel(it.projectId, it.workstream, view.projects);
+          <ol className="attn-list briefing-list">
+            {openShown.map((it, i) => {
+              const w = where(it.projectId, it.workstream);
               return (
-                <li key={i}>
+                <li key={`${it.key ?? 'x'}-${i}`} className="briefing-row">
                   <ItemLink href={sessionHref(it.projectId, it.workstream, view.projects, linkMode)}>
                     <span className={`attn-chip briefing-kind briefing-kind--${it.kind}`}>{KIND_LABEL[it.kind]}</span>
                     <span className="attn-body">
                       <span className="attn-title">
-                        {where && <span className="attn-project">{where}</span>}
+                        {w && <span className="attn-project">{w}</span>}
                         {it.title}
                       </span>
                       {it.detail && <span className="attn-detail">{it.detail}</span>}
                     </span>
                   </ItemLink>
-                </li>
-              );
-            })}
-          </ul>
-          {variant === 'compact' && (c?.carryovers.length ?? 0) > limit && (
-            <div className="usage-dim">and {(c?.carryovers.length ?? 0) - limit} more</div>
-          )}
-        </div>
-      )}
-      {sugg.length > 0 && (
-        <div className="briefing-group">
-          <div className="briefing-group-label">Pick up today</div>
-          <ol className="briefing-suggestions">
-            {sugg.map((s, i) => {
-              const where = sessionLabel(s.projectId, s.workstream, view.projects);
-              return (
-                <li key={i}>
-                  <ItemLink href={sessionHref(s.projectId, s.workstream, view.projects, linkMode)}>
-                    <span className="briefing-sugg-text">
-                      {where && <span className="attn-project">{where}</span>}
-                      {s.text}
-                    </span>
-                    {s.why && <span className="attn-detail">{s.why}</span>}
-                  </ItemLink>
+                  <RowSide itemKey={it.key} pr={it.pr} onMark={onMark} />
                 </li>
               );
             })}
           </ol>
+          {compact && open.shown.length > openShown.length && (
+            <div className="usage-dim">and {open.shown.length - openShown.length} more</div>
+          )}
         </div>
       )}
-      {c && carry.length === 0 && sugg.length === 0 && !c.summary && (
+
+      {betterShown.length > 0 && (
+        <div className="briefing-group">
+          <div className="briefing-group-label">Work better</div>
+          <ul className="attn-list briefing-list">
+            {betterShown.map(it => (
+              <li key={it.key} className="briefing-row briefing-row--plain">
+                <ItemLink href={sessionHref(it.projectId, it.workstream, view.projects, linkMode)}>
+                  <span className="attn-body">
+                    <span className="attn-title">{it.text}</span>
+                    {it.why && <span className="attn-detail">{it.why}</span>}
+                  </span>
+                </ItemLink>
+                <RowSide itemKey={it.key} onMark={onMark} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {hidden.length > 0 && onRestore && (
+        <details className="briefing-hidden">
+          <summary className="usage-dim">Done or deferred ({hidden.length})</summary>
+          <ul className="briefing-bullets">
+            {hidden.map(h => (
+              <li key={h.key}>
+                <span className="usage-dim">{h.text} · {markLabel(h.mark)}</span>
+                <button type="button" className="briefing-mark" onClick={() => onRestore(h.key)}>Bring back</button>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {c && worked.length === 0 && open.shown.length === 0 && better.shown.length === 0 && !c.headline && (
         <div className="usage-dim">Nothing was left open.</div>
       )}
     </div>

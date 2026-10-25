@@ -5,7 +5,7 @@ import { HOME_FILTERS, HomeFilter, InboxRow, matchesFilter } from '../mobile/inb
 import { useHome } from '../mobile/useHome';
 import { prsApi } from '../services/api';
 import { usePolled } from '../pages/dashboard/useDashboardData';
-import { PRS_CHANGED_EVENT, actionableCount, prsSearch, prsTileView } from '../utils/prPipeline';
+import { PRS_CHANGED_EVENT, myReviewCount, prsSearch, prsTileView } from '../utils/prPipeline';
 import { clampIndex } from '../utils/searchPalette';
 import { rowTarget } from '../utils/workspaceTarget';
 import { SessionList, useOpenTarget } from './SessionList';
@@ -14,13 +14,13 @@ import { SessionList, useOpenTarget } from './SessionList';
 /**
  * The phone's summary strip on the desktop: the
  * three home counts, each opening a popover of its sessions, and the PRs
- * count (everything that needs you, utils/prPipeline needsYou) opening the PR
+ * count (reviews asked of you by name, utils/prPipeline myReviewCount) opening the PR
  * overlay over the workspace (components/PrsOverlay.tsx).
  */
 export function StatusStrip() {
   const { rows, counts, now } = useHome();
   const openTarget = useOpenTarget();
-  // Everything that needs you, as on the phone; the backend memoizes per user,
+  // Reviews asked of you by name, as on the phone; the backend memoizes per user,
   // so this shares one GitHub read with the overlay, the dashboard and /m/prs.
   const prs = usePolled(() => prsApi.list(), 60_000);
   const location = useLocation();
@@ -29,7 +29,7 @@ export function StatusStrip() {
     window.addEventListener(PRS_CHANGED_EVENT, refreshPrs);
     return () => window.removeEventListener(PRS_CHANGED_EVENT, refreshPrs);
   }, [refreshPrs]);
-  const prTile = prsTileView(prs.data, prs.error, actionableCount(prs.data));
+  const prTile = prsTileView(prs.data, prs.error, myReviewCount(prs.data), now);
   const [open, setOpen] = useState<HomeFilter | null>(null);
   const [active, setActive] = useState(0);
   const stripRef = useRef<HTMLDivElement>(null);
@@ -82,6 +82,7 @@ export function StatusStrip() {
             type="button"
             className={`status-tile${open === t.id ? ' is-open' : ''}`}
             data-filter={t.id}
+            data-analytics={`status-tile-${t.id}`}
             data-zero={counts[t.id] === 0 || undefined}
             aria-haspopup="listbox"
             aria-expanded={open === t.id}
@@ -94,11 +95,13 @@ export function StatusStrip() {
         ))}
         {prTile.show && (
           <Link
-            className={`status-tile${prTile.failed ? ' is-failed' : ''}`}
+            className={`status-tile${prTile.failed ? ' is-failed' : ''}${prTile.stale ? ' is-stale' : ''}`}
             data-filter="prs"
+            data-analytics="pr-tile"
             data-zero={prTile.zero || undefined}
             to={{ search: prsSearch(location.search, 'needs_you') }}
             title={prTile.title}
+            aria-label={prTile.title}
           >
             <span className="status-tile-count">{prTile.text}</span>
             <span className="status-tile-label">PRs</span>

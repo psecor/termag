@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { runningProviderForSource } from '../providers/registry';
 import type { AgentStatus, Project } from '../types';
-import type { RecentRow } from '../services/api';
-import { bandFor, buildHome, conversationHref, stateSince, buildRows, matchesFilter, opensReview, parseFilter, providerFor, recentSessions, rowKey, searchRows, statusLabel } from './inbox';
+import type { RecentRow, SessionRow } from '../services/api';
+import { bandFor, buildHome, conversationHref, stateSince, buildRows, matchesFilter, opensReview, parseFilter, providerFor, recentSessions, rowKey, searchRows, statusLabel, statusMapFromSessions } from './inbox';
 import { statusKey } from '../utils/statusKey';
 
 const NOW = new Date(2026, 9, 7, 15, 0, 0).getTime();
@@ -72,6 +72,16 @@ describe('buildRows', () => {
   it('carries the status fields the row renders', () => {
     const main = rows.find(r => r.key === 'p1|main')!;
     expect(main).toMatchObject({ status: 'working', message: 'Editing App.tsx', contextTokens: 412_000, pinned: true, provider: 'claude' });
+  });
+
+  it('carries the workstream\'s session title, null where there is none', () => {
+    const titled = projects.map(p => (p.id === 'p1'
+      ? { ...p, workstreams: p.workstreams.map(w => (w.name === 'termag-tui' ? { ...w, sessionTitle: 'TUI resize bug' } : w)) }
+      : p));
+    const out = buildRows(titled, statusMap, 'psecor');
+    expect(out.find(r => r.key === 'p1|termag-tui')?.sessionTitle).toBe('TUI resize bug');
+    expect(out.find(r => r.key === 'p1|main')?.sessionTitle).toBeNull();
+    expect(out.find(r => r.key === 'p2|main')?.sessionTitle).toBeNull();
   });
 });
 
@@ -190,6 +200,12 @@ describe('search tab', () => {
     expect(searchRows(home.rows, '#312').map(r => r.key)).toEqual(['p7|main']);
     expect(searchRows(home.rows, '   ')).toEqual([]);
   });
+
+  it("matches the box's name only when it is given one", () => {
+    const boxOf = (r: { key: string }) => (r.key === 'p2|main' ? 'psecor-dev02' : null);
+    expect(searchRows(home.rows, 'dev02')).toEqual([]);
+    expect(searchRows(home.rows, 'dev02', boxOf).map(r => r.key)).toEqual(['p2|main']);
+  });
 });
 
 describe('providerFor', () => {
@@ -217,6 +233,8 @@ describe('providerFor', () => {
     // One rule for phone and desktop.
     expect(runningProviderForSource('tmux-poller')).toBeUndefined();
     expect(runningProviderForSource('tmux-poller:devin')).toBe('devin');
+    // A desktop thread's Claude runs beside the pane: the pane's provider stays the configured one.
+    expect(runningProviderForSource('t3:claude')).toBeUndefined();
     expect(runningProviderForSource(undefined)).toBeUndefined();
     expect(rowKey('p9', 'feat')).toBe('p9|feat');
   });
@@ -248,5 +266,27 @@ describe('cloud sessions', () => {
     const a = buildHome([termag], {}, 'ada');
     const b = buildHome([termag], {}, 'ada', { cloudSessions: [] });
     expect(a.rows.length).toEqual(b.rows.length);
+  });
+});
+
+describe('statusMapFromSessions', () => {
+  const session = (over: Partial<SessionRow>): SessionRow => ({
+    projectId: 'p1', projectName: 'termag', owner: 'psecor', access: 'owner', workstream: 'main', role: 'agent',
+    session: 'psecor-termag-agent', instanceId: 'box1', connected: true, alive: true, status: 'idle', contextTokens: null,
+    updatedAt: null, waitingReason: null, rateLimited: null, provider: 'claude', lastActiveAt: at(30), ...over,
+  });
+
+  it('builds the rows buildRows would from the live map, for agent panes only', () => {
+    const map = statusMapFromSessions([
+      session({ status: 'working', updatedAt: at(1), contextTokens: 412_000 }),
+      session({ session: 'psecor-termag-termag-tui-agent', workstream: 'termag-tui', status: 'waiting', waitingReason: 'user_input' }),
+      session({ session: 'psecor-termag-ctrl', role: 'ctrl', status: 'working' }),
+    ]);
+    expect(Object.keys(map)).toEqual([statusKey('box1', 'psecor-termag-agent'), statusKey('box1', 'psecor-termag-termag-tui-agent')]);
+    const rows = buildRows([termag], map, 'psecor');
+    expect(rows.map(r => [r.workstream, r.status, r.waitingReason])).toEqual([['main', 'working', null], ['termag-tui', 'waiting', 'user_input']]);
+    expect(rows[0].contextTokens).toBe(412_000);
+    // No updatedAt: the session's last activity stands in.
+    expect(rows[1].updatedAt).toBe(at(30));
   });
 });

@@ -192,3 +192,19 @@ export function catalogFromWire(body: unknown): RepoCatalog {
     }),
   };
 }
+
+/**
+ * The repositories a dropdown lists for a query: each group's repos sorted
+ * by name and filtered by the query, groups with no match dropped. A group
+ * GitHub would not list (SSO, policy) stays, so its note still shows.
+ */
+export function repoOptions(groups: readonly CatalogGroup[], query: string): CatalogGroup[] {
+  const q = query.trim().toLowerCase();
+  return groups.flatMap(group => {
+    const repos = group.repos
+      .filter(repo => !q || repo.fullName.toLowerCase().includes(q))
+      .sort((a, b) => a.fullName.localeCompare(b.fullName, undefined, { sensitivity: 'base' }));
+    if (repos.length === 0 && group.status === 'ok') return [];
+    return [{ ...group, repos }];
+  });
+}

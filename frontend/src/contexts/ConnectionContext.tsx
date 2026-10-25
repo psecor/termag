@@ -23,8 +23,8 @@ export const PROBE_PATH = '/termag/health';
  * redirect to the identity provider, which the browser reports as a network
  * failure cross-origin. Sending the cookie is what makes the probe able to
  * succeed there at all. Once that session expires the edge redirects or
- * answers 401 even with the cookie; the probe then reloads the page (see
- * `reauthenticate`) rather than following the redirect.
+ * answers 401 even with the cookie; the probe then marks the tab signed out
+ * (see `markEdgeSignedOut`) rather than following the redirect.
  *
  * A successful probe is evidence about HTTP only. It is recorded as such, so it
  * cannot vouch for the status socket — see `ConnectionSample.lastSocketContactAt`.
@@ -38,9 +38,10 @@ export async function probeBackend(): Promise<boolean> {
     // browser serving a cached 200 while the network is down.
     const res = await fetch(PROBE_PATH, { cache: 'no-store', credentials: 'include', redirect: 'manual', signal: ctrl.signal });
     if (isEdgeSessionExpired(res)) {
-      reauthenticate();
+      markEdgeSignedOut();
       return false;
     }
+    setEdgeSignedOut(false);
     connectionTracker.contact('http');
     return true;
   } catch {
@@ -59,25 +60,45 @@ export function isEdgeSessionExpired(res: Pick<Response, 'type' | 'status'>): bo
   return res.type === 'opaqueredirect' || res.status === 401;
 }
 
-const REAUTH_AT_KEY = 'termag:edge-reauth-at';
-const REAUTH_MIN_INTERVAL_MS = 60_000;
+let edgeSignedOut = false;
+const signedOutListeners = new Set<() => void>();
+
+function setEdgeSignedOut(value: boolean): void {
+  if (edgeSignedOut === value) return;
+  edgeSignedOut = value;
+  signedOutListeners.forEach(fn => fn());
+}
+
+/** True while the edge session is expired and nobody has asked to sign in yet. */
+export function isEdgeSignedOut(): boolean {
+  return edgeSignedOut;
+}
 
 /**
- * Reload once so the page navigation, not a background request, runs the
- * Okta login. Reconnect loops each starting their own login overwrite the
- * ALB's nonce cookie and fail the callback with a 401. At most once a minute
- * across ALL tabs (localStorage, not per-tab sessionStorage): every open tab
- * degrades together when the session expires, and their reloads would race
- * the same way. The other tabs pick up the new session cookie on their next
- * probe. The minute also stops an edge that keeps refusing from looping.
+ * Note the expired session and wait for the person at this tab. A tab never
+ * starts the Okta login by itself: the ALB's AWSALBAuthNonce cookie lives
+ * 15 minutes, so a login started while nobody was looking (a probe in a
+ * background tab, or a screen waking at night) parks on the Okta page, and
+ * signing in there hours later fails the callback with a 401 that no reload
+ * fixes. The provider shows the signed-out notice and calls `reauthenticate`
+ * on the next click or key press.
+ */
+export function markEdgeSignedOut(): void {
+  setEdgeSignedOut(true);
+}
+
+/**
+ * Reload so the page navigation, not a background request, runs the Okta
+ * login (background requests get a 401 from the ALB rather than a redirect,
+ * and must not start logins of their own: each overwrites the nonce cookie).
+ * Only call this for the person at the tab; see `markEdgeSignedOut`.
  */
 export function reauthenticate(): void {
-  const now = Date.now();
-  const last = Number(localStorage.getItem(REAUTH_AT_KEY) ?? 0);
-  if (now - last < REAUTH_MIN_INTERVAL_MS) return;
-  localStorage.setItem(REAUTH_AT_KEY, String(now));
-  window.location.reload();
+  edgeLogin.start();
 }
+
+/** The navigation itself; an object so a jsdom test can watch it (its location is not stubbable). */
+export const edgeLogin = { start: () => window.location.reload() };
 
 /**
  * What "Retry now" does. The probe alone never reattached anything — it only
@@ -98,12 +119,15 @@ interface ConnectionContextValue {
   lastContactAt: number | null;
   /** Current clock, re-rendered on the provider's tick so "since" readouts stay live. */
   now: number;
+  /** The edge session expired; the next click or key press signs in again. */
+  signedOut: boolean;
 }
 
 const ConnectionContext = createContext<ConnectionContextValue>({
   state: 'online',
   lastContactAt: null,
   now: Date.now(),
+  signedOut: false,
 });
 
 const TICK_MS = 2_000;
@@ -115,6 +139,26 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
 
   // Follow the tracker.
   useEffect(() => connectionTracker.subscribe(() => setSnap(connectionTracker.snapshot)), []);
+
+  // Signed out: the next click, tap or key press is the person at this tab,
+  // so it starts the login (see markEdgeSignedOut for why nothing else may).
+  const [signedOut, setSignedOut] = useState(edgeSignedOut);
+  useEffect(() => {
+    const sync = () => setSignedOut(edgeSignedOut);
+    signedOutListeners.add(sync);
+    sync();
+    return () => { signedOutListeners.delete(sync); };
+  }, []);
+  useEffect(() => {
+    if (!signedOut) return;
+    const onInteract = () => reauthenticate();
+    window.addEventListener('pointerdown', onInteract, true);
+    window.addEventListener('keydown', onInteract, true);
+    return () => {
+      window.removeEventListener('pointerdown', onInteract, true);
+      window.removeEventListener('keydown', onInteract, true);
+    };
+  }, [signedOut]);
 
   // Tick so time-based transitions (quiet socket) happen without an event.
   useEffect(() => {
@@ -175,7 +219,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   }, [state]);
 
   return (
-    <ConnectionContext.Provider value={{ state, lastContactAt: snap.lastContactAt, now }}>
+    <ConnectionContext.Provider value={{ state, lastContactAt: snap.lastContactAt, now, signedOut }}>
       {children}
     </ConnectionContext.Provider>
   );

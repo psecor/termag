@@ -14,6 +14,7 @@ import { AdminCloud } from './admin/AdminCloud';
 import { AdminSettings } from './admin/AdminSettings';
 import { AdminSoftware } from './admin/AdminSoftware';
 import { AdminPrs } from './admin/AdminPrs';
+import { AdminSpend } from './admin/AdminSpend';
 
 const RANGE_KEY = 'termag:adminRange';
 // Absolute paths: a relative `to=""` resolves to the current URL inside the
@@ -25,6 +26,7 @@ const TABS = [
   { to: '/admin/segments', label: 'Segments' },
   { to: '/admin/projects', label: 'Projects & sessions' },
   { to: '/admin/usage', label: 'Usage' },
+  { to: '/admin/spend', label: 'Spend' },
   { to: '/admin/cloud', label: 'Cloud sessions' },
   { to: '/admin/prs', label: 'PRs' },
   { to: '/admin/software', label: 'Software' },
@@ -69,12 +71,14 @@ export default function Admin() {
           <Route path="segments" element={<AdminSegments />} />
           <Route path="projects" element={<AdminProjects now={now} />} />
           <Route path="usage" element={<><RangePicker value={range} onChange={setRange} /><AdminUsage range={range} /></>} />
+          <Route path="spend" element={<AdminSpend />} />
           <Route path="cloud" element={<><RangePicker value={range} onChange={setRange} /><AdminCloud range={range} now={now} /></>} />
           <Route path="prs" element={<AdminPrs now={now} />} />
           <Route path="software" element={<AdminSoftware now={now} />} />
           <Route path="system" element={<AdminSystem now={now} />} />
           <Route path="settings" element={<AdminSettings range={range} now={now} onRange={setRange} />} />
-          <Route path="*" element={<Navigate to="." replace />} />
+          {/* Absolute, like TABS: with v7 path resolution "." inside this splat is the unknown URL itself. */}
+          <Route path="*" element={<Navigate to="/admin" replace />} />
         </Routes>
         <footer className="dash-footer usage-dim">
           Aggregates and metadata only; no terminal contents. Token days are UTC, working-time days are server-local. Every view here is audited.

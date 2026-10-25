@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PROBE_PATH, probeBackend, retryConnection } from './ConnectionContext';
+import { PROBE_PATH, isEdgeSignedOut, probeBackend, reauthenticate, retryConnection } from './ConnectionContext';
 import { connectionTracker } from '../utils/connectionTracker';
 
 function fetchMock(impl: (input: RequestInfo | URL, init?: RequestInit) => Promise<unknown>) {
@@ -50,22 +50,16 @@ describe('probeBackend', () => {
 
 describe('probeBackend on an expired edge session', () => {
   let reload: ReturnType<typeof vi.fn>;
-  let store: Map<string, string>;
 
   beforeEach(() => {
     reload = vi.fn();
-    store = new Map<string, string>();
     vi.stubGlobal('window', { location: { reload } });
-    const storage = (m: Map<string, string>) => ({
-      getItem: (k: string) => m.get(k) ?? null,
-      setItem: (k: string, v: string) => { m.set(k, v); },
-    });
-    // localStorage is shared by every tab; sessionStorage is this tab's own.
-    vi.stubGlobal('localStorage', storage(store));
-    vi.stubGlobal('sessionStorage', storage(new Map()));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Leave the module signed in for the next test.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ type: 'basic', status: 200 })));
+    await probeBackend();
     vi.unstubAllGlobals();
   });
 
@@ -80,33 +74,35 @@ describe('probeBackend on an expired edge session', () => {
   it.each([
     ['a redirect to the identity provider', { type: 'opaqueredirect', status: 0 }],
     ['a 401 from the edge', { type: 'basic', status: 401 }],
-  ])('reloads the page on %s instead of counting contact', async (_name, res) => {
+  ])('marks the tab signed out on %s, without reloading or counting contact', async (_name, res) => {
+    // A reload here starts the Okta login with nobody at the tab; the ALB's
+    // nonce cookie expires in 15 minutes and the later sign-in gets a 401.
     fetchMock(async () => res);
     const before = connectionTracker.snapshot.lastContactAt;
     await expect(probeBackend()).resolves.toBe(false);
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(isEdgeSignedOut()).toBe(true);
+    expect(reload).not.toHaveBeenCalled();
     expect(connectionTracker.snapshot.lastContactAt).toBe(before);
   });
 
-  it('reloads at most once a minute', async () => {
-    fetchMock(async () => ({ type: 'opaqueredirect', status: 0 }));
+  it('clears the signed-out mark once the edge answers again (signed in from another tab)', async () => {
+    fetchMock(async () => ({ type: 'basic', status: 401 }));
     await probeBackend();
-    await probeBackend();
-    expect(reload).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not reload when another tab reloaded within the minute', async () => {
-    // Shared storage: a second tab reloading would reset the ALB nonce again.
-    store.set('termag:edge-reauth-at', String(Date.now()));
-    fetchMock(async () => ({ type: 'opaqueredirect', status: 0 }));
-    await expect(probeBackend()).resolves.toBe(false);
-    expect(reload).not.toHaveBeenCalled();
+    fetchMock(async () => ({ type: 'basic', status: 200 }));
+    await expect(probeBackend()).resolves.toBe(true);
+    expect(isEdgeSignedOut()).toBe(false);
   });
 
   it('leaves a healthy response alone', async () => {
     fetchMock(async () => ({ type: 'basic', status: 200 }));
     await expect(probeBackend()).resolves.toBe(true);
+    expect(isEdgeSignedOut()).toBe(false);
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  it('reauthenticate reloads, so the navigation runs the login', () => {
+    reauthenticate();
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 });
 

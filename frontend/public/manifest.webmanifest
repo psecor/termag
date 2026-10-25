@@ -6,11 +6,29 @@
   "start_url": "/termag/m",
   "scope": "/termag/",
   "display": "standalone",
-  "orientation": "portrait",
   "background_color": "#0d1117",
   "theme_color": "#161b22",
+  "launch_handler": { "client_mode": "focus-existing" },
   "icons": [
-    { "src": "/termag/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "/termag/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
-  ]
+    { "src": "/termag/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/termag/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/termag/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/termag/icons/icon-monochrome-512.png", "sizes": "512x512", "type": "image/png", "purpose": "monochrome" }
+  ],
+  "shortcuts": [
+    { "name": "Needs you", "short_name": "Needs you", "url": "/termag/m?f=attention", "icons": [{ "src": "/termag/icons/shortcut-attention-96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Pull requests", "short_name": "PRs", "url": "/termag/m/prs", "icons": [{ "src": "/termag/icons/shortcut-prs-96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "Search", "short_name": "Search", "url": "/termag/m/search", "icons": [{ "src": "/termag/icons/shortcut-search-96.png", "sizes": "96x96", "type": "image/png" }] },
+    { "name": "New project", "short_name": "New", "url": "/termag/m/new", "icons": [{ "src": "/termag/icons/shortcut-new-96.png", "sizes": "96x96", "type": "image/png" }] }
+  ],
+  "screenshots": [
+    { "src": "/termag/screenshots/home.png", "sizes": "1179x1977", "type": "image/png", "form_factor": "narrow", "label": "Every session, the ones that need you first" },
+    { "src": "/termag/screenshots/search.png", "sizes": "1179x1977", "type": "image/png", "form_factor": "narrow", "label": "Search sessions and pane text" }
+  ],
+  "share_target": {
+    "action": "/termag/m/share",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": { "title": "title", "text": "text", "url": "url" }
+  }
 }

@@ -9,9 +9,13 @@ import { fmtAge } from './format';
 
 /** The phone opens on the first non-empty lane in this order: what can be done from a phone first. */
 export const PHONE_LANE_ORDER: PrLaneId[] = [
-  'needs_my_review', 'ready_to_merge', 'checks', 'needs_approval',
+  'needs_my_review', 'ready_to_merge', 'checks', 'needs_approval', 'team_review',
   'merged_not_deployed', 'in_progress', 'needs_pr', 'deployed', 'merged',
 ];
+
+/** The two lanes of review requests: asked of you by name, and asked only of a team you are on. */
+export const REVIEW_LANES: PrLaneId[] = ['needs_my_review', 'team_review'];
+export const isReviewLane = (lane: PrLaneId): boolean => REVIEW_LANES.includes(lane);
 
 /** Short labels for tabs and the lane strip. */
 export const LANE_SHORT: Record<PrLaneId, string> = {
@@ -20,6 +24,7 @@ export const LANE_SHORT: Record<PrLaneId, string> = {
   checks: 'Checks',
   needs_approval: 'Approval',
   needs_my_review: 'My review',
+  team_review: 'Team reviews',
   ready_to_merge: 'Ready',
   merged_not_deployed: 'Not deployed',
   deployed: 'Deployed',
@@ -28,6 +33,8 @@ export const LANE_SHORT: Record<PrLaneId, string> = {
 
 /** A tab's tooltip, where its name alone could mislead. */
 export const LANE_HINT: Partial<Record<PrLaneId, string>> = {
+  needs_my_review: 'Review requests that name you. These are what the PRs count counts.',
+  team_review: 'Review requests that reach you only through a team you are on. Not in Needs you or its count.',
   merged: 'Merges termag does not deploy: other repositories, and termag merges into a branch other than main. Not a total: termag merges into main are under Not deployed and Deployed.',
 };
 
@@ -139,9 +146,23 @@ export function lanesOf(res: PrPipelineResponse | null | undefined): PrLane[] {
   return res && res.connected ? res.lanes : [];
 }
 
-/** How many rows need the user (needsYou) and are not deferred: the tile's and the phone inbox's count. */
-export function actionableCount(res: PrPipelineResponse | null | undefined, now = Date.now()): number {
-  return needsYouRows(res, now).length;
+/**
+ * A review asked of the user by name (2026-10-22: what the counts count). A
+ * request only to a team they are on is listed in Needs you, not counted; an
+ * older backend's row, without the flag, counts.
+ */
+export function asksForMyReview(r: PrRow): boolean {
+  return r.lane === 'needs_my_review' && r.askedYou !== false;
+}
+
+/**
+ * How many PRs ask the user by name for a review and are not deferred: the
+ * number on the PRs tile, the phone inbox, the overlay's Needs you tab and
+ * the TUI (tui/src/prs.ts prCount). Needs you still lists everything that
+ * needs the user; only these are counted.
+ */
+export function myReviewCount(res: PrPipelineResponse | null | undefined, now = Date.now(), keep: (r: PrRow) => boolean = () => true): number {
+  return needsYouRows(res, now).filter(e => asksForMyReview(e.row) && keep(e.row)).length;
 }
 
 /** The lane to open on: the first non-empty one in `order`, else the first. */
@@ -185,6 +206,7 @@ export function rowDetail(r: PrRow, now: number): string {
     case 'needs_approval':
       return r.waitingOn.length ? `waiting on ${list(r.waitingOn)}` : 'needs an approving review';
     case 'needs_my_review':
+    case 'team_review':
       return `by ${r.author ?? 'someone'}${r.requestedAt ? ` · asked ${ago(r.requestedAt, now)}` : ''}`;
     case 'ready_to_merge':
       return r.blockedBy ?? (r.badges.includes('auto-merge') ? 'auto-merge on' : 'approved and green');
@@ -392,7 +414,7 @@ export function bakePending(startedAt: number | null, runListed: boolean, now: n
  * ones where the dialog holds the next step.
  */
 export function rowAction(r: Pick<PrRow, 'lane' | 'failingChecks' | 'checksFailed'>): { label: string; title: string; primary: boolean } {
-  if (r.lane === 'needs_my_review') return { label: 'Review', title: 'Read it and review it here', primary: true };
+  if (isReviewLane(r.lane)) return { label: 'Review', title: 'Read it and review it here', primary: true };
   if (r.lane === 'ready_to_merge') return { label: 'Merge', title: 'Merge it, or turn auto-merge on, here', primary: true };
   if (r.lane === 'checks' && checksRed(r)) return { label: 'Re-run', title: 'See what failed and re-run the failed jobs', primary: true };
   if (r.lane === 'needs_approval') return { label: 'Ping', title: 'Re-request reviews, or ping reviewers in a comment', primary: true };
@@ -406,6 +428,25 @@ export type PrsView = 'needs_you' | PrLaneId;
 export const PRS_PARAM = 'prs';
 /** `&pr=<owner/name#n>`, or `<owner/name:branch>` for a branch row, selects one row. */
 export const PR_PARAM = 'pr';
+/** `&prs_repo=<owner/name>` keeps the overlay to one repository; without it every repository shows. */
+export const PRS_REPO_PARAM = 'prs_repo';
+
+/** Whether a row passes the repo filter (null: no filter). */
+export function inRepo(r: Pick<PrRow, 'repo'>, repo: string | null): boolean {
+  return repo === null || r.repo === repo;
+}
+
+/**
+ * The search string with the overlay's repo filter set (null clears it). The
+ * selected row is dropped too, so the pane moves to the filtered view's first.
+ */
+export function prsRepoSearch(current: string, repo: string | null): string {
+  const q = new URLSearchParams(current);
+  q.delete(PR_PARAM);
+  if (repo) q.set(PRS_REPO_PARAM, repo); else q.delete(PRS_REPO_PARAM);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
 
 export function isPrsView(v: string | null): v is PrsView {
   return v === 'needs_you' || (v !== null && PHONE_LANE_ORDER.includes(v as PrLaneId));
@@ -427,12 +468,12 @@ export function rowParam(r: Pick<PrRow, 'kind' | 'repo' | 'number' | 'headRefNam
 
 /**
  * The search string that opens (or moves) the overlay, keeping the page's own
- * parameters (the workspace's project and workstream): pass the current
- * search, get the next one. `view: null` closes it.
+ * parameters (the workspace's project and workstream) and the repo filter:
+ * pass the current search, get the next one. `view: null` closes it.
  */
 export function prsSearch(current: string, view: PrsView | null, pr?: string | null): string {
   const q = new URLSearchParams(current);
-  if (view === null) { q.delete(PRS_PARAM); q.delete(PR_PARAM); }
+  if (view === null) { q.delete(PRS_PARAM); q.delete(PR_PARAM); q.delete(PRS_REPO_PARAM); }
   else {
     q.set(PRS_PARAM, view);
     if (pr) q.set(PR_PARAM, pr); else q.delete(PR_PARAM);
@@ -456,14 +497,95 @@ export function apiErrorText(err: unknown, fallback: string): string {
  * reason, because hiding it looked exactly like "not connected". After one
  * good answer a failed refresh keeps the last counts (usePolled keeps data).
  */
+/**
+ * Older than this, a PR answer is out of date. The backend reads GitHub at
+ * most a minute apart and serves its last read for up to 10 minutes while a
+ * new one fails, and the browser keeps showing the last answer it got, so a
+ * count can otherwise sit unchanged and confident long after GitHub moved on
+ * (a PR merged meanwhile, 2026-10-23).
+ */
+export const PRS_STALE_MS = 5 * 60_000;
+
+/**
+ * Why an answer that did load may be out of date, for a tile's or a link's
+ * tooltip: GitHub was last read more than PRS_STALE_MS ago, or the latest
+ * refresh failed. null when it is current.
+ */
+export function prsStale(data: { connected?: boolean; fetchedAt?: string } | null | undefined, error: unknown, now = Date.now()): string | null {
+  if (!data?.connected) return null;
+  const read = data.fetchedAt ? Date.parse(data.fetchedAt) : NaN;
+  const age = Number.isFinite(read) ? Math.max(0, now - read) : null;
+  const old = age !== null && age > PRS_STALE_MS;
+  if (!old && error == null) return null;
+  const when = age === null ? 'Last read from GitHub a while ago' : `Last read from GitHub ${fmtAge(age)} ago`;
+  const why = error != null ? `: refreshing failed (${apiErrorText(error, 'GitHub did not answer.')})` : '';
+  return `${when}${why}. This may be out of date.`;
+}
+
 export function prsTileView(
-  data: { connected?: boolean } | null | undefined, error: unknown, count: number,
-): { show: false } | { show: true; failed: boolean; text: string; zero: boolean; title: string } {
+  data: { connected?: boolean; fetchedAt?: string } | null | undefined, error: unknown, count: number, now = Date.now(),
+): { show: false } | { show: true; failed: boolean; stale: boolean; text: string; zero: boolean; title: string } {
   const failed = data == null && error != null;
   if (!failed && !data?.connected) return { show: false };
-  if (failed) return { show: true, failed, text: '!', zero: false, title: `Could not list your pull requests: ${apiErrorText(error, 'GitHub did not answer.')}` };
-  return {
-    show: true, failed, text: String(count), zero: count === 0,
-    title: 'Pull requests that need you: reviews asked of you, yours ready to merge, failing, conflicting or with changes requested, and pushed branches with no PR',
+  if (failed) return { show: true, failed, stale: false, text: '!', zero: false, title: `Could not list your pull requests: ${apiErrorText(error, 'GitHub did not answer.')}` };
+  const title = 'Pull requests asking you by name for a review. Needs you also lists team review requests and your own PRs to merge or fix.';
+  const stale = prsStale(data, error, now);
+  // Out of date: the number stays, marked with "?" and dimmed, the tooltip saying why.
+  if (stale) return { show: true, failed, stale: true, text: `${count}?`, zero: count === 0, title: `${stale} ${title}` };
+  return { show: true, failed, stale: false, text: String(count), zero: count === 0, title };
+}
+
+// ── Finding a PR (⌘K's Pull requests, components/SearchPalette.tsx) ─────────
+
+/**
+ * Every row in every lane matching `query`, best first: a number (`28280`,
+ * `#28280`) finds PRs whose number starts with it; `name#N` (`terraform#28280`,
+ * `example-org/terraform#28280`, the way rows are labelled) and a pasted
+ * pull-request URL also need the repository: its name, or with an owner its
+ * full name, starts with `name`. Other words must all appear somewhere in the
+ * row (repo, number, title, branch, author, lane, workstream). Exact number
+ * hits first, then lane order (what can be acted on first), then newest. Deferred rows are included: a search should find
+ * what was put off. `repo` (the overlay's filter) applies before the limit,
+ * so a filtered search is not cut short by matches elsewhere.
+ */
+export function searchPrRows(res: PrPipelineResponse | null | undefined, query: string, limit = 8, repo: string | null = null): PrRow[] {
+  const url = query.match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/i);
+  const q = (url ? `${url[1]}#${url[2]}` : query).trim().toLowerCase();
+  if (!q) return [];
+  // `name#N` splits into a repository to match and a number; a lone `#` says
+  // nothing (every PR's haystack holds one).
+  const words: string[] = [];
+  const repos: string[] = [];
+  for (const w of q.split(/\s+/)) {
+    const named = w.match(/^([^#\s]+)#(\d*)$/);
+    if (named) { repos.push(named[1]); if (named[2]) words.push(named[2]); }
+    else if (w && w !== '#') words.push(w);
+  }
+  if (words.length === 0 && repos.length === 0) return [];
+  const inNamedRepo = (r: PrRow) => {
+    const full = (r.repo ?? '').toLowerCase();
+    const name = full.split('/')[1] ?? full;
+    return repos.every(p => (p.includes('/') ? full : name).startsWith(p));
   };
+  const nums = words.filter(w => /^#?\d+$/.test(w)).map(w => w.replace('#', ''));
+  const seen = new Set<string>();
+  const hits: { row: PrRow; exact: boolean; lane: number; at: number }[] = [];
+  for (const l of lanesOf(res)) for (const r of l.rows) {
+    const key = rowParam(r);
+    if (seen.has(key) || !inRepo(r, repo) || !inNamedRepo(r)) continue;
+    const n = r.number != null ? String(r.number) : null;
+    const exact = n !== null && nums.includes(n);
+    const hay = [r.repo, n !== null ? `#${n}` : '', r.title, r.headRefName, r.author, LANE_SHORT[r.lane], l.label, r.workstream?.projectName, r.workstream?.workstream]
+      .filter(Boolean).join(' ').toLowerCase();
+    // A number matches the start of the PR's number (typing 2828 already finds #28280), not digits in a title or branch.
+    const ok = words.every(w => (/^#?\d+$/.test(w) ? n !== null && n.startsWith(w.replace('#', '')) : hay.includes(w)));
+    if (!ok) continue;
+    seen.add(key);
+    const at = Date.parse(r.requestedAt ?? r.mergedAt ?? r.at ?? '');
+    // A lane the order does not know yet sorts last, not first.
+    const lane = PHONE_LANE_ORDER.indexOf(r.lane);
+    hits.push({ row: r, exact, lane: lane < 0 ? PHONE_LANE_ORDER.length : lane, at: Number.isFinite(at) ? at : 0 });
+  }
+  hits.sort((a, b) => Number(b.exact) - Number(a.exact) || a.lane - b.lane || b.at - a.at);
+  return hits.slice(0, limit).map(h => h.row);
 }

@@ -9,8 +9,10 @@ export const SETTINGS_DOCS_ANCHORS = [
   'credentials-on-your-boxes',
   'claude-through-the-gateway',
   'github-token',
+  'mcp-servers',
   'dotfiles',
   'cli-sign-ins',
+  'notifications',
   'appearance',
   'account',
 ] as const;

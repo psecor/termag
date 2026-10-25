@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Dialog } from './Dialog';
+import { PersonPicker } from './PersonPicker';
+import { browserStorage, rememberPerson } from '../utils/recentPeople';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FLAGS, useFlag } from '../flags';
 import { REPLAY_BLOCK_CLASS } from '../observability';
@@ -8,7 +10,7 @@ import { downloadFile, errorMessage, UploadAborted, uploadFile } from '../servic
 import type { Instance } from '../types';
 import {
   actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, relPathError, prettyText, previewKind, roleAtLeast,
-  SPACE_NAME_HINT, SPACE_NAME_RE, SPACE_ROLES, TEXT_PREVIEW_MAX_BYTES, usageLabel,
+  SPACE_NAME_HINT, SPACE_NAME_RE, SPACE_ROLES, spaceFileLink, TEXT_PREVIEW_MAX_BYTES, usageLabel,
 } from '../utils/spaces';
 import type { DropEntry, DroppedFile } from '../utils/spaces';
 
@@ -103,6 +105,7 @@ function FilesTab({ space, canWrite, setConfirm, onChanged }: {
   const [pendingDirs, setPendingDirs] = useState<string[]>([]);
   const [newFolder, setNewFolder] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<{ path: string; value: string } | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
   const [uploads, setUploads] = useState<UploadRow[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -176,6 +179,17 @@ function FilesTab({ space, canWrite, setConfirm, onChanged }: {
 
   async function download(path: string) {
     try { await downloadFile(space.name, path); } catch (err) { setError(errorMessage(err, 'Download failed')); }
+  }
+
+  async function copyLink(path: string) {
+    const link = spaceFileLink(window.location.origin, import.meta.env.BASE_URL, space.name, path);
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(path);
+      setTimeout(() => setCopied(c => (c === path ? null : c)), 1500);
+    } catch {
+      setError(`Could not copy the link; it is ${link}`);
+    }
   }
 
   function remove(path: string, folder: boolean) {
@@ -318,6 +332,9 @@ function FilesTab({ space, canWrite, setConfirm, onChanged }: {
             <span className="space-modified">{f.modifiedAt ? new Date(f.modifiedAt).toLocaleString() : ''}</span>
             <span className="space-actions">
               <button type="button" className="btn-tiny" onClick={() => void download(f.path)}>Download</button>
+              <button type="button" className="btn-tiny" title="Copy a link that opens this file for anyone who can read the space" onClick={() => void copyLink(f.path)}>
+                {copied === f.path ? 'Copied' : 'Copy link'}
+              </button>
               {canWrite && <button type="button" className="btn-tiny" onClick={() => setRenaming({ path: f.path, value: f.name })}>Rename</button>}
               {canWrite && <button type="button" className="btn-tiny btn-danger" onClick={() => remove(f.path, false)}>Delete</button>}
             </span>
@@ -392,6 +409,7 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
   const [error, setError] = useState('');
   const [note, setNote] = useState('');
   const [email, setEmail] = useState('');
+  const [pickedName, setPickedName] = useState<string | undefined>();
   const [role, setRole] = useState<string>('editor');
   const [boxToAdd, setBoxToAdd] = useState('');
   const [newName, setNewName] = useState<string | null>(null);
@@ -476,11 +494,12 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
             const who = email.trim();
             void act(async () => {
               const r = await spacesApi.addMember(space.name, who, role);
+              rememberPerson(browserStorage(), { email: who, displayName: pickedName });
               setNote(r.invite ? `${who} becomes ${role} when they first sign in to termag.` : `${who} is now ${role}.`);
-            }, 'Could not add the member', () => setEmail(''));
+            }, 'Could not add the member', () => { setEmail(''); setPickedName(undefined); });
           }}
         >
-          <input type="email" required value={email} placeholder="teammate@example.com" aria-label="Email" onChange={e => setEmail(e.target.value)} />
+          <PersonPicker required value={email} placeholder="name or teammate@example.com" ariaLabel="Email" onChange={(next, name) => { setEmail(next); setPickedName(name); }} />
           <select aria-label="Role" value={role} onChange={e => setRole(e.target.value)}>
             {SPACE_ROLES.map(r => <option key={r} value={r}>{r}</option>)}
           </select>

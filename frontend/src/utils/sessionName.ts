@@ -13,3 +13,13 @@ export function sessionName(
     : `${username}-${project}-${workstream}-${role}`;
   return name.replace(/[.:]/g, '_');
 }
+
+/**
+ * Whether a session name is a workstream's agent pane: the `-agent` role
+ * suffix, as sessionName() puts it last. Not a substring match, so a project
+ * or workstream whose own name contains `agent` (`u-agentops-ctrl`) is
+ * still its ctrl pane.
+ */
+export function isAgentPaneSession(name: string): boolean {
+  return /-agent$/.test(name);
+}

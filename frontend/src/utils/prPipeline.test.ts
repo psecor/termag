@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { PrLane, PrRow } from '../services/api';
-import { actionableCount, hasOverview, bakePending, boxesBehindText, deferrals, deferredText, splitDeferred, viewEntries, isPrsView, needsYou, needsYouRows, prsSearch, rowParam, canSubmitReview, checksSummary, compareUrl, deployStage, firstNonEmpty, laneTabLabel, mention, mergeReadiness, PHONE_LANE_ORDER, pingText, reviewerRoster, reviewStateLabel, rowDetail, rowLabel, rowAction } from './prPipeline';
+import { myReviewCount, asksForMyReview, hasOverview, bakePending, boxesBehindText, deferrals, deferredText, splitDeferred, viewEntries, inRepo, isPrsView, needsYou, needsYouRows, prsRepoSearch, prsSearch, rowParam, canSubmitReview, checksSummary, compareUrl, deployStage, firstNonEmpty, laneTabLabel, mention, mergeReadiness, PHONE_LANE_ORDER, pingText, reviewerRoster, reviewStateLabel, rowDetail, rowLabel, rowAction, searchPrRows } from './prPipeline';
 
 const NOW = Date.parse('2026-10-09T12:00:00Z');
 
@@ -50,18 +50,31 @@ describe('labels and counts', () => {
     expect(rowLabel(row({ number: 280 }))).toBe('termag#280');
     expect(rowLabel(row({ kind: 'branch', number: null, headRefName: 'wip' }))).toBe('termag · wip');
   });
-  it('counts every row that needs you, and nothing waiting on others', () => {
+  it('counts only reviews asked of you by name; Needs you lists your own PRs too, team reviews neither', () => {
     const res = { connected: true as const, viewer: 'me', prod: { sha: null, source: 'unknown' as const }, boxes: 0, fetchedAt: '', notes: [],
       lanes: [
-        lane('needs_my_review', [row({ lane: 'needs_my_review' }), row({ lane: 'needs_my_review' })]),
+        lane('needs_my_review', [
+          row({ lane: 'needs_my_review', number: 1, askedYou: true }),
+          row({ lane: 'needs_my_review', number: 3 }), // an older backend: no flag, counted
+        ]),
+        lane('team_review', [row({ lane: 'team_review', number: 2, askedYou: false })]),
         lane('ready_to_merge', [row({ lane: 'ready_to_merge' })]),
         lane('checks', [row({}), row({ failingChecks: ['ci'] })]),
         lane('needs_approval', [row({ lane: 'needs_approval' }), row({ lane: 'needs_approval', badges: ['changes-requested'] })]),
         lane('merged_not_deployed', [row({ lane: 'merged_not_deployed' })]),
       ] };
-    expect(actionableCount(res)).toBe(5);
-    expect(actionableCount({ connected: false })).toBe(0);
-    expect(actionableCount(null)).toBe(0);
+    expect(myReviewCount(res)).toBe(2);
+    expect(myReviewCount(res, Date.now(), r => r.number === 1)).toBe(1);
+    expect(needsYouRows(res).map(e => e.why)).toEqual(['review asked of you', 'review asked of you', 'ready to merge', 'checks failing', 'changes requested']);
+    expect(needsYou(row({ lane: 'team_review' }))).toBeNull();
+    expect(rowAction(row({ lane: 'team_review' })).label).toBe('Review');
+    expect(myReviewCount({ connected: false })).toBe(0);
+    expect(myReviewCount(null)).toBe(0);
+  });
+  it('asks for my review only on a review request that names me', () => {
+    expect(asksForMyReview(row({ lane: 'needs_my_review', askedYou: true }))).toBe(true);
+    expect(asksForMyReview(row({ lane: 'team_review', askedYou: false }))).toBe(false);
+    expect(asksForMyReview(row({ lane: 'ready_to_merge' }))).toBe(false);
   });
   it('opens on the first non-empty lane in phone order', () => {
     expect(firstNonEmpty([lane('checks', [row({})]), lane('needs_my_review')], PHONE_LANE_ORDER)).toBe('checks');
@@ -234,12 +247,32 @@ describe('needsYou', () => {
   });
 });
 
+describe('the repo filter', () => {
+  it('passes every row with no filter, only that repository with one', () => {
+    expect(inRepo({ repo: null }, null)).toBe(true);
+    expect(inRepo({ repo: 'example-org/termag' }, null)).toBe(true);
+    expect(inRepo({ repo: 'example-org/termag' }, 'example-org/termag')).toBe(true);
+    expect(inRepo({ repo: 'example-org/webapp' }, 'example-org/termag')).toBe(false);
+    expect(inRepo({ repo: null }, 'example-org/termag')).toBe(false);
+  });
+});
+
 describe('the PR overlay URL', () => {
   it('opens, selects and closes, keeping the page\'s own parameters', () => {
     expect(prsSearch('?project=p1&ws=feat', 'needs_you')).toBe('?project=p1&ws=feat&prs=needs_you');
     expect(prsSearch('?project=p1&prs=needs_you', 'checks', 'example-org/termag#9')).toBe('?project=p1&prs=checks&pr=example-org%2Ftermag%239');
     expect(prsSearch('?project=p1&prs=checks&pr=x', null)).toBe('?project=p1');
     expect(prsSearch('?prs=checks', null)).toBe('');
+  });
+  it('keeps the repo filter across views and drops it on close', () => {
+    expect(prsSearch('?prs=needs_you&prs_repo=example-org%2Ftermag', 'checks')).toBe('?prs=checks&prs_repo=example-org%2Ftermag');
+    expect(prsSearch('?project=p1&prs=checks&prs_repo=example-org%2Ftermag&pr=x', null)).toBe('?project=p1');
+  });
+  it('sets and clears the repo filter, dropping the selected row', () => {
+    expect(prsRepoSearch('?project=p1&prs=checks&pr=example-org%2Ftermag%239', 'example-org/webapp'))
+      .toBe('?project=p1&prs=checks&prs_repo=example-org%2Fwebapp');
+    expect(prsRepoSearch('?prs=checks&prs_repo=example-org%2Fwebapp', null)).toBe('?prs=checks');
+    expect(prsRepoSearch('?prs_repo=a%2Fb', null)).toBe('');
   });
   it('knows its views and keys rows', () => {
     expect(isPrsView('needs_you')).toBe(true);
@@ -289,8 +322,8 @@ describe('deferring a row', () => {
   });
   it('leaves a deferred row out of Needs you and the count until its time is up', () => {
     expect(needsYouRows(res, NOW_MS).map(e => e.row.number)).toEqual([100, 101]);
-    expect(actionableCount(res, NOW_MS)).toBe(2);
-    expect(actionableCount(res, Date.parse('2026-10-15T12:00:01Z'))).toBe(3);
+    expect(myReviewCount(res, NOW_MS)).toBe(1);
+    expect(myReviewCount(res, Date.parse('2026-10-15T12:00:01Z'))).toBe(2);
   });
   it('splits a view into shown and deferred, deferred ones carrying their end', () => {
     const { shown, deferred } = splitDeferred(viewEntries('needs_my_review', res, NOW_MS), res, NOW_MS);
@@ -321,20 +354,31 @@ describe('prsTileView', () => {
   });
   it('shows the count when connected; zero marks it quiet', async () => {
     const { prsTileView } = await import('./prPipeline');
-    expect(prsTileView({ connected: true }, null, 3)).toMatchObject({ show: true, failed: false, text: '3', zero: false });
-    expect(prsTileView({ connected: true }, null, 0)).toMatchObject({ show: true, failed: false, text: '0', zero: true });
+    const fresh = { connected: true, fetchedAt: new Date(NOW - 60_000).toISOString() };
+    expect(prsTileView(fresh, null, 3, NOW)).toMatchObject({ show: true, failed: false, stale: false, text: '3', zero: false });
+    expect(prsTileView(fresh, null, 0, NOW)).toMatchObject({ show: true, failed: false, stale: false, text: '0', zero: true });
+  });
+  it('marks an answer older than five minutes out of date, keeping its number', async () => {
+    const { prsTileView } = await import('./prPipeline');
+    const old = prsTileView({ connected: true, fetchedAt: new Date(NOW - 14 * 60_000).toISOString() }, null, 2, NOW);
+    expect(old).toMatchObject({ show: true, failed: false, stale: true, text: '2?' });
+    expect(old.show && old.title).toMatch(/^Last read from GitHub 14m ago\. This may be out of date\. Pull requests asking you/);
+    expect(prsTileView({ connected: true, fetchedAt: new Date(NOW - 4 * 60_000).toISOString() }, null, 2, NOW)).toMatchObject({ stale: false, text: '2' });
   });
   it('a list that never loaded shows "!" with the reason, never as zero', async () => {
     const { prsTileView } = await import('./prPipeline');
     const err = { response: { data: { error: 'GitHub timed out listing your pull requests. It retries in a minute.' } } };
     expect(prsTileView(null, err, 0)).toEqual({
-      show: true, failed: true, text: '!', zero: false,
+      show: true, failed: true, stale: false, text: '!', zero: false,
       title: 'Could not list your pull requests: GitHub timed out listing your pull requests. It retries in a minute.',
     });
   });
-  it('after one good answer a failed refresh keeps the counts', async () => {
+  it('after one good answer a failed refresh keeps the count, marked out of date with the reason', async () => {
     const { prsTileView } = await import('./prPipeline');
-    expect(prsTileView({ connected: true }, new Error('x'), 2)).toMatchObject({ failed: false, text: '2' });
+    const err = { response: { data: { error: 'GitHub rate limit' } } };
+    const t = prsTileView({ connected: true, fetchedAt: new Date(NOW - 60_000).toISOString() }, err, 2, NOW);
+    expect(t).toMatchObject({ failed: false, stale: true, text: '2?' });
+    expect(t.show && t.title).toMatch(/^Last read from GitHub 1m ago: refreshing failed \(GitHub rate limit\)\. This may be out of date\./);
   });
 });
 
@@ -358,5 +402,61 @@ describe('hasOverview', () => {
     expect(hasOverview({ kind: 'branch', repo: 'example-org/termag', number: null })).toBe(false);
     expect(hasOverview({ kind: 'pr', repo: null, number: 425 })).toBe(false);
     expect(hasOverview({ kind: 'pr', repo: 'example-org/termag', number: null })).toBe(false);
+  });
+});
+
+describe('searchPrRows', () => {
+  const tf = row({ lane: 'needs_my_review', repo: 'example-org/terraform', number: 28280, title: 'Add the termag Envoy route', author: 'zane', headRefName: 'zane/envoy' });
+  const mine = row({ lane: 'checks', number: 451, title: 'feat: spawn lifecycle', headRefName: 'termag-spawn-l3' });
+  const old = row({ lane: 'deployed', number: 2828, title: 'fix the terraform docs', mergedAt: '2026-10-01T00:00:00Z' });
+  const res = { connected: true, viewer: 'me', lanes: [lane('checks', [mine]), lane('needs_my_review', [tf]), lane('deployed', [old])], prod: { sha: null, source: 'unknown' }, boxes: 0, checkouts: [], notes: [], fetchedAt: '' } as never;
+
+  it('finds a PR by its number, with or without #, exact first', () => {
+    expect(searchPrRows(res, '28280')).toEqual([tf]);
+    expect(searchPrRows(res, '#28280')).toEqual([tf]);
+    expect(searchPrRows(res, '2828')).toEqual([old, tf]);
+  });
+  it('finds one from a pasted pull-request URL', () => {
+    expect(searchPrRows(res, 'https://github.com/example-org/terraform/pull/28280/files')).toEqual([tf]);
+  });
+  it('matches every word across repo, title, branch, author and lane, in lane order', () => {
+    expect(searchPrRows(res, 'terraform')).toEqual([tf, old]);
+    expect(searchPrRows(res, 'Envoy zane')).toEqual([tf]);
+    expect(searchPrRows(res, 'my review')).toEqual([tf]);
+    expect(searchPrRows(res, 'spawn-l3')).toEqual([mine]);
+    expect(searchPrRows(res, 'envoy lifecycle')).toEqual([]);
+  });
+  it('reads repo#number the way rows are labelled, with or without the owner', () => {
+    expect(searchPrRows(res, 'terraform#28280')).toEqual([tf]);
+    expect(searchPrRows(res, 'example-org/terraform#28280')).toEqual([tf]);
+    expect(searchPrRows(res, 'Terra#2828')).toEqual([tf]);
+    // The repository has to match, not a title that mentions it.
+    expect(searchPrRows(res, 'termag#2828')).toEqual([old]);
+    expect(searchPrRows(res, 'terraform#451')).toEqual([]);
+    expect(searchPrRows(res, 'termag#')).toEqual([mine, old]);
+  });
+  it('applies the repo filter before the limit', () => {
+    expect(searchPrRows(res, 't', 1)).toEqual([tf]);
+    expect(searchPrRows(res, 't', 1, 'example-org/termag')).toEqual([mine]);
+  });
+  it('nothing for an empty query, a lone #, or no GitHub', () => {
+    expect(searchPrRows(res, '  ')).toEqual([]);
+    expect(searchPrRows(res, '#')).toEqual([]);
+    expect(searchPrRows({ connected: false }, '28280')).toEqual([]);
+    expect(searchPrRows(null, '28280')).toEqual([]);
+  });
+});
+
+describe('prsStale', () => {
+  it('is null for a current answer and when not connected', async () => {
+    const { prsStale } = await import('./prPipeline');
+    expect(prsStale({ connected: true, fetchedAt: new Date(NOW - 60_000).toISOString() }, null, NOW)).toBeNull();
+    expect(prsStale({ connected: false }, new Error('x'), NOW)).toBeNull();
+    expect(prsStale(null, new Error('x'), NOW)).toBeNull();
+  });
+  it('says how old, and why, when it is not', async () => {
+    const { prsStale } = await import('./prPipeline');
+    expect(prsStale({ connected: true, fetchedAt: new Date(NOW - 3 * 3_600_000).toISOString() }, null, NOW)).toBe('Last read from GitHub 3h ago. This may be out of date.');
+    expect(prsStale({ connected: true }, new Error('boom'), NOW)).toMatch(/^Last read from GitHub a while ago: refreshing failed/);
   });
 });

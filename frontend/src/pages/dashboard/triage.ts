@@ -218,6 +218,7 @@ export function buildAttentionItems(input: TriageInput, now: number): AttentionI
       const where = r.workstream ? { projectName: r.workstream.projectName, workstream: r.workstream.workstream } : {};
       const age = now - Date.parse(r.requestedAt ?? r.at ?? '');
       const ageMs = Number.isFinite(age) ? age : 0;
+      // A request only to a team you are on (team_review) is in the PR overlay, not here (2026-10-22).
       if (lane.id === 'needs_my_review') {
         addPr({
           id: `prrev:${r.repo}#${r.number}`, kind: 'pr_needs_my_review', severity: ageMs >= PR_REVIEW_WARN_MS ? 'warning' : 'notice',

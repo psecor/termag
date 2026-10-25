@@ -7,7 +7,7 @@ import { PROVIDERS } from '../../providers/registry';
 import { contextLevel } from '../../utils/thresholds';
 import { fmtAge } from '../../utils/format';
 import { conversationHref, InboxRow, opensReview, stateSince, STATUS_GLYPH, statusLabel } from '../../mobile/inbox';
-import { writeOptOut } from '../../mobile/redirect';
+import { optOutOfMobile } from '../../mobile/redirect';
 import { projectsApi } from '../../services/api';
 import { ActionSheet, ConfirmSheet, apiError } from './Sheet';
 
@@ -18,12 +18,15 @@ function ctxLabel(tokens: number): string {
 /** The glyph: the agent's, except a row whose state is its review shows the review's. */
 const REVIEW_GLYPH = '◎';
 
-export function SessionRow({ row, now, recent, onMore, onOpen }: {
+export function SessionRow({ row, now, recent, onMore, onOpen, href }: {
   row: InboxRow;
   now: number;
   /** Recent sessions: the clock is when you opened it, not the state's age. */
   recent?: boolean;
-  onMore: (row: InboxRow) => void;
+  /** The row's ⋯ sheet; without it the row has no ⋯ (the share picker). */
+  onMore?: (row: InboxRow) => void;
+  /** Where the row goes instead of its conversation (the share picker's draft link). */
+  href?: string;
   onOpen?: (row: InboxRow) => void;
 }) {
   const badge = row.provider ? PROVIDERS[row.provider]?.badge ?? row.provider.slice(0, 2).toUpperCase() : null;
@@ -42,6 +45,7 @@ export function SessionRow({ row, now, recent, onMore, onOpen }: {
         <span className="m-row-main">
           <span className="m-row-title">
             {row.kind === 'metaterm' && <span className="m-metaterm" aria-hidden>⚡ </span>}
+            {row.kind === 'automation' && <span className="m-automation" aria-label="automation run">⏱ </span>}
             {row.kind === 'cloud' && <span className="m-cloud" aria-label="cloud session">☁ </span>}
             {row.projectName}
             {row.workstream !== 'main' && <span className="m-ws"> · {row.workstream}</span>}
@@ -76,8 +80,8 @@ export function SessionRow({ row, now, recent, onMore, onOpen }: {
   }
   return (
     <li className="m-row-wrap">
-      <Link className="m-row" to={conversationHref(row)} data-status={row.status} data-band={row.band} onClick={() => onOpen?.(row)}>{body}</Link>
-      <button className="m-more" aria-label={`Actions for ${row.projectName}`} onClick={() => onMore(row)}>⋯</button>
+      <Link className="m-row" to={href ?? conversationHref(row)} data-status={row.status} data-band={row.band} onClick={() => onOpen?.(row)}>{body}</Link>
+      {onMore && <button className="m-more" aria-label={`Actions for ${row.projectName}`} onClick={() => onMore(row)}>⋯</button>}
     </li>
   );
 }
@@ -101,7 +105,7 @@ export function useRowActions(): { open: (row: InboxRow) => void; sheets: React.
     catch (err) { setError(apiError(err, 'Could not archive the project')); }
   };
   const openFull = (row: InboxRow) => {
-    writeOptOut(typeof localStorage !== 'undefined' ? localStorage : null, true);
+    optOutOfMobile();
     navigate(`/?project=${encodeURIComponent(row.projectId)}${row.workstream !== 'main' ? `&ws=${encodeURIComponent(row.workstream)}` : ''}`);
   };
   const sheets = (

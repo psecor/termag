@@ -5,7 +5,7 @@
 // the chat comes up (box, clone, Claude) it narrates the steps, and a message
 // typed before Claude is there waits and is sent once it is.
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
 import { activityApi, sessionsApi, visitsApi } from '../../services/api';
@@ -17,8 +17,10 @@ import { sessionName } from '../../utils/sessionName';
 import { statusKey } from '../../utils/statusKey';
 import { parsePane } from '../../chat/paneChat';
 import { BlockView, DraftView } from '../../chat/Blocks';
-import { flattenForSend, MAX_KEYS, sendErrorText } from '../../chat/compose';
+import { draftAfterSend, flattenForSend, MAX_KEYS, sendErrorText } from '../../chat/compose';
 import { useFollowBottom } from '../../chat/useFollowBottom';
+import { useAutoGrow } from '../../chat/useAutoGrow';
+import { useTranscriptFocus } from '../../chat/transcriptFocus';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { useCapture } from '../../chat/useCapture';
 import { conversationBlocks, fullUiHref, repoSlug, showAnswerKeys, statusLine } from '../../chat/simpleChat';
@@ -26,8 +28,17 @@ import { agentUp, bootEstimateMinutes, preLaunchTail, setupSteps, showSetup } fr
 import { SetupSteps } from '../../chat/SetupSteps';
 import { useQueuedMessage } from '../../chat/useQueuedMessage';
 import { useComposerText } from '../../chat/useHandedDraft';
+import { ClaudeLoginCard } from '../../chat/ClaudeLoginCard';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { providerFor, STATUS_GLYPH } from '../../mobile/inbox';
+import { FLAGS, useFlag } from '../../flags';
+import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { AgentIcon } from './OpenItems';
+import { ChatSpaceChip } from './SpaceSwatch';
+import { useDictation } from '../../chat/useDictation';
+import { DictationButton, DictationNote } from '../../chat/DictationButton';
+import { SendIcon } from '../../chat/ComposerIcons';
+import { ChatBoxTag } from './ChatBoxTag';
 
 // Remembered across conversations in this tab so visits carry a previous id.
 let lastVisitedProjectId: string | null = null;
@@ -35,6 +46,11 @@ let lastVisitedProjectId: string | null = null;
 export function ChatView() {
   const { projectId = '' } = useParams();
   const [params, setParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { mode: chromeMode, sidePanel } = useChatChrome();
+  // The one-row phone header ships with simple-ui-side-panel-enabled; off, it is main's.
+  const phoneHeader = useFlag(FLAGS.chatSidePanel, false);
+  const phone = chromeMode === 'drawer' && phoneHeader;
   const { user } = useAuth();
   const { projects, statusMap, settleProjectClone } = useProjects();
 
@@ -89,6 +105,11 @@ export function ChatView() {
 
   // Starts with a first message New chat handed over, if any (chat/useHandedDraft.ts).
   const [text, setText] = useComposerText(`${projectId}|${ws}`);
+  // The draft as of the last render, for a send that finishes after more typing.
+  const latestText = useRef(text);
+  latestText.current = text;
+  const composer = useAutoGrow<HTMLTextAreaElement>(text);
+  const dictation = useDictation({ text, setText, max: MAX_KEYS, chatKey: `${projectId}|${ws}` });
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
@@ -106,13 +127,13 @@ export function ChatView() {
     projectId: project?.id ?? null, workstream: ws, up, offline, send: sendQueued,
   });
 
-  const send = useCallback(async (body: { keys: string; enter: boolean; literal: boolean }, clear: boolean) => {
+  const send = useCallback(async (body: { keys: string; enter: boolean; literal: boolean }, sent: string | null) => {
     if (!project || sending) return;
     setSending(true);
     setSendError(null);
     try {
       await sessionsApi.sendKeys(project.id, 'agent', { workstream: ws, ...body });
-      if (clear) setText('');
+      if (sent !== null) setText(draftAfterSend(latestText.current, sent));
       activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
       setTimeout(capture.refresh, 500);
     } catch (err) {
@@ -123,6 +144,7 @@ export function ChatView() {
   }, [project, ws, sending, capture.refresh]);
 
   const onSend = () => {
+    dictation.detach();
     const keys = flattenForSend(text);
     if (!keys || !project) return;
     if (!up) {
@@ -130,9 +152,9 @@ export function ChatView() {
       else setSendError(`This browser would not hold the message until ${agentLabel} is up. Send it again once it is.`);
       return;
     }
-    void send({ keys, enter: true, literal: true }, true);
+    void send({ keys, enter: true, literal: true }, text);
   };
-  const onQuick = (k: QuickKey) => { void send({ keys: k.keys, enter: k.enter, literal: k.literal }, false); };
+  const onQuick = (k: QuickKey) => { void send({ keys: k.keys, enter: k.enter, literal: k.literal }, null); };
 
   // Only the last block can be a live question; an answered one stays in scrollback.
   const lastBlock = blocks?.[blocks.length - 1];
@@ -154,6 +176,9 @@ export function ChatView() {
     offline,
   });
 
+  // Opening the chat (and Claude coming up) puts the cursor in the composer.
+  useEffect(() => { composer.current?.focus(); }, [projectId, ws, project?.id, up, composer]);
+
   const liveWorkstreams = project?.workstreams.filter(w => !w.archived) ?? [];
   const setWs = (name: string) => {
     const next = new URLSearchParams(params);
@@ -161,14 +186,17 @@ export function ChatView() {
     setParams(next, { replace: true });
   };
 
-  if (projects.length > 0 && !project) {
-    return <div className="chat-home"><p>This conversation is not in your project list.</p><Link to="/chat">Back</Link></div>;
-  }
-
   const setupFailed = steps.some(s => s.state === 'failed');
   // Before Claude is up a message is queued, so the composer is open then too
   // (on the main workstream, where the queue lives).
   const canSend = Boolean(project) && hasAgent && !offline && !setupFailed && (up || ws === 'main');
+  // A click in the transcript puts the cursor in the composer (chat/transcriptFocus.ts).
+  // Above the not-found return below, like every hook here.
+  const transcriptFocus = useTranscriptFocus(composer, canSend);
+
+  if (projects.length > 0 && !project) {
+    return <div className="chat-home"><p>This session is not in your project list.</p><Link to="/chat">Back</Link></div>;
+  }
   // While Claude is not up, the box's last words: a credential prompt or a
   // failed checkout in the pane would otherwise go unseen.
   const boxSays = showSteps && !held && !up && parsed ? preLaunchTail(parsed.blocks) : [];
@@ -176,25 +204,41 @@ export function ChatView() {
   return (
     <div className="chat-view">
       <section className="chat-conv">
-        <header className="chat-header">
+        <header className={phone ? 'chat-header chat-header-agent' : 'chat-header'}>
+          <ChatHistoryButton />
           <div className="chat-title">
-            <span className="chat-glyph" data-status={status?.status ?? 'not_running'} aria-hidden="true">
-              {STATUS_GLYPH[status?.status ?? 'not_running']}
-            </span>
+            {phone ? <AgentIcon status={status?.status ?? 'not_running'} /> : (
+              <span className="chat-glyph" data-status={status?.status ?? 'not_running'} aria-hidden="true">
+                {STATUS_GLYPH[status?.status ?? 'not_running']}
+              </span>
+            )}
             <span className="chat-title-name">{project?.name ?? '…'}</span>
             {liveWorkstreams.length > 1 ? (
               <select className="chat-ws-select" value={ws} onChange={e => setWs(e.target.value)} aria-label="Workstream">
                 {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{w.name}</option>)}
               </select>
             ) : ws !== 'main' ? <span className="chat-title-ws">· {ws}</span> : null}
+            <ChatSpaceChip instanceId={project?.instanceId} />
             {repo && <span className="chat-title-repo" title={project?.repoUrl ?? undefined}>{repo}</span>}
+            {project && <ChatBoxTag project={project} box={box} />}
           </div>
           <div className="chat-header-actions">
-            <Link className="btn-ghost" to={fullUiHref(project?.id, ws)}>Open in full UI</Link>
+            {phone ? (
+              <ChatMoreButton label={`${project?.name ?? 'Session'}: actions`} actions={[
+                { label: 'Open in full UI', onSelect: () => navigate(fullUiHref(project?.id, ws)) },
+                ...(sidePanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
+              ]} />
+            ) : <>
+              <SidePanelButton />
+              <Link className="btn-ghost chat-full-ui" to={fullUiHref(project?.id, ws)}>
+                <span className="chat-full-ui-long">Open in full UI</span>
+                <span className="chat-full-ui-short">Full UI</span>
+              </Link>
+            </>}
           </div>
         </header>
 
-        <div className="chat-transcript" ref={scroller} onScroll={onScroll}>
+        <div className="chat-transcript" ref={scroller} onScroll={onScroll} {...transcriptFocus}>
           <div className="chat-transcript-inner">
             {showSteps && project && (
               <div className="chat-setup">
@@ -245,9 +289,11 @@ export function ChatView() {
             )}
           </div>
         </div>
-        {unseen && <button type="button" className="chat-jump" onClick={jumpToBottom}>↓ new output</button>}
-
         <div className="chat-bottom">
+          {unseen && <button type="button" className="chat-jump" onClick={jumpToBottom}>↓ new output</button>}
+          {project && provider === 'claude' && (
+            <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled />
+          )}
           <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite">{line.text}</div>
           {answerKeys.length > 0 && (
             <div className="chat-keys" role="toolbar" aria-label="Answer keys">
@@ -258,22 +304,37 @@ export function ChatView() {
           )}
           <form className="chat-composer" onSubmit={e => { e.preventDefault(); onSend(); }}>
             <textarea
+              ref={composer}
               className="chat-input"
               value={text}
-              onChange={e => setText(e.target.value.slice(0, MAX_KEYS))}
+              onChange={e => { dictation.onEdit(); setText(e.target.value.slice(0, MAX_KEYS)); }}
               onKeyDown={e => {
+                if (dictation.onKeyDown(e)) return;
                 // Enter sends; newlines cannot be sent into a pane (chat/compose.ts).
                 if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); onSend(); }
               }}
               placeholder={!canSend ? (setupFailed ? 'Setup failed' : 'Not available') : !up ? `Message ${agentLabel}… (sent when it is up)` : status?.status === 'working' ? `Message ${agentLabel}… (queues while it works)` : `Message ${agentLabel}…`}
-              rows={2}
+              rows={1}
               disabled={!canSend}
             />
-            <button type="submit" className="btn-primary chat-send" disabled={sending || !canSend || !text.trim()}>Send</button>
+            <div className="chat-composer-bar">
+              <div className="chat-compose-actions">
+                <DictationButton dictation={dictation} disabled={!canSend} />
+                {text.trim() && (
+                  <button type="submit" className="chat-send-btn" aria-label="Send" title="Send (Enter)" disabled={sending || !canSend}>
+                    <SendIcon />
+                  </button>
+                )}
+              </div>
+            </div>
           </form>
-          {(sendError || text.length > MAX_KEYS - 500) && (
-            <div className="chat-composer-note" data-error={sendError ? '' : undefined}>{sendError ?? `${text.length} / ${MAX_KEYS}`}</div>
-          )}
+          {/* A line kept under the composer for its notes, so one appearing doesn't push it up. */}
+          <div className="chat-composer-notes">
+            <DictationNote dictation={dictation} />
+            {(sendError || text.length > MAX_KEYS - 500) && (
+              <div className="chat-composer-note" data-error={sendError ? '' : undefined}>{sendError ?? `${text.length} / ${MAX_KEYS}`}</div>
+            )}
+          </div>
         </div>
       </section>
     </div>

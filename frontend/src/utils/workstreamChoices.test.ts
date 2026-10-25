@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Project, Workstream } from '../types';
-import { filterChoices, isWorkstreamName, linkedByText, scopedProjects, suggestWorkstreamName, workstreamChoices } from './workstreamChoices';
+import { filterChoices, isWorkstreamName, linkedByText, scopedProjects, suggestPrPrompt, suggestWorkstreamName, workstreamChoices } from './workstreamChoices';
 
 const ws = (name: string, lastActiveAt: string, over: Partial<Workstream> = {}): Workstream =>
   ({ id: name, projectId: 'p', name, branch: name, archived: false, lastActiveAt, createdAt: '', updatedAt: '', ...over });
@@ -56,12 +56,18 @@ describe('linkedByText', () => {
 });
 
 describe('a new workstream for a PR', () => {
-  it('suggests the repository\'s name and the branch\'s last segment, the prefix kept once', () => {
-    expect(suggestWorkstreamName('example-org/termag', 'feat/pr-defer')).toBe('termag-pr-defer');
-    expect(suggestWorkstreamName('example-org/termag', 'termag-worktree-pr-pills')).toBe('termag-worktree-pr-pills');
-    expect(suggestWorkstreamName('example-org/webapp', 'psecor/nova.panel fix')).toBe('webapp-nova-panel-fix');
-    expect(suggestWorkstreamName('example-org/termag', `feat/${'x'.repeat(80)}`)).toHaveLength(48);
-    expect(isWorkstreamName(suggestWorkstreamName('example-org/termag', 'feat/äö'))).toBe(true);
+  it('suggests the repository\'s name, the PR\'s number and the branch\'s last segment, the prefixes kept once', () => {
+    expect(suggestWorkstreamName('example-org/termag', 359, 'feat/pr-defer')).toBe('termag-pr359-pr-defer');
+    expect(suggestWorkstreamName('example-org/termag', 378, 'termag-worktree-pr-pills')).toBe('termag-pr378-worktree-pr-pills');
+    expect(suggestWorkstreamName('example-org/termag', 12, 'termag-pr12-again')).toBe('termag-pr12-again');
+    expect(suggestWorkstreamName('example-org/termag', 12, 'termag')).toBe('termag-pr12');
+    expect(suggestWorkstreamName('example-org/webapp', 5, 'psecor/nova.panel fix')).toBe('webapp-pr5-nova-panel-fix');
+    expect(suggestWorkstreamName('example-org/termag', 1, `feat/${'x'.repeat(80)}`)).toHaveLength(48);
+    expect(suggestWorkstreamName('example-org/termag', 1, 'feat/äö')).toBe('termag-pr1');
+    expect(isWorkstreamName(suggestWorkstreamName('example-org/termag', 1, 'feat/a-äö'))).toBe(true);
+  });
+  it('suggests a first prompt about the PR', () => {
+    expect(suggestPrPrompt('example-org/termag', 123)).toBe('Can you give a quick description of termag#123 and any particular key points to review carefully?');
   });
   it('validates names as the backend does', () => {
     expect(isWorkstreamName('termag-pr-defer')).toBe(true);

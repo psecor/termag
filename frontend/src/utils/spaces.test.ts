@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, previewKind, relPathError, roleAtLeast, SPACE_NAME_RE, type DropEntry } from './spaces';
+import { actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, parseSpaceFileLink, previewKind, relPathError, roleAtLeast, spaceFileLink, SPACE_NAME_RE, type DropEntry } from './spaces';
 
 describe('spaces helpers', () => {
   it('ranks roles', () => {
@@ -56,9 +56,18 @@ describe('spaces helpers', () => {
   it('formats sizes and labels events', () => {
     expect(formatBytes(100 * 1024 ** 3)).toBe('100 GiB');
     expect(actionLabel('file.put')).toBe('uploaded');
+    expect(actionLabel('file.put.signed')).toBe('started an upload of');
     expect(actionLabel('something.new')).toBe('something.new');
     expect(SPACE_NAME_RE.test('team-docs')).toBe(true);
     expect(SPACE_NAME_RE.test('Team')).toBe(false);
+  });
+});
+
+describe('spaceFileLink', () => {
+  it('builds the /files/ link under the base path, each segment encoded', () => {
+    expect(spaceFileLink('https://app.example', '/termag/', 'assets', 'docs/My Report #1.pdf'))
+      .toBe('https://app.example/termag/files/assets/docs/My%20Report%20%231.pdf');
+    expect(spaceFileLink('https://app.example', '/termag', 'assets', 'a.png')).toBe('https://app.example/termag/files/assets/a.png');
   });
 });
 
@@ -90,5 +99,24 @@ describe('collectDropped', () => {
   it('checks every segment of a relative path', () => {
     expect(relPathError('site/img/a.png')).toBeNull();
     expect(relPathError('site/../a.png')).toBe('That name is reserved');
+  });
+});
+
+describe('parseSpaceFileLink', () => {
+  const origin = 'https://host.example';
+  it('reads back what spaceFileLink writes', () => {
+    const link = spaceFileLink(origin, '/termag/', 'notes', 'a b/c#1.md');
+    expect(parseSpaceFileLink(link, origin, '/termag/')).toEqual({ space: 'notes', path: 'a b/c#1.md' });
+    expect(parseSpaceFileLink('/termag/files/notes/x.png', origin, '/termag')).toEqual({ space: 'notes', path: 'x.png' });
+  });
+
+  it('refuses other origins, other paths and bad names', () => {
+    expect(parseSpaceFileLink('https://evil.example/termag/files/notes/x.md', origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink(`${origin}/termag/chat/files`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink(`${origin}/termag/files/notes`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink(`${origin}/termag/files/Bad_Name/x.md`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink(`${origin}/termag/files/notes/a//b`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink(`${origin}/termag/files/notes/%E0%A4%A`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFileLink('mailto:a@b.c', origin, '/termag/')).toBeNull();
   });
 });

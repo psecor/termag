@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Instance, Project } from '../types';
 import { NewProjectForm } from './NewProjectForm';
+import { resetBackendChoicesForTests } from '../providers/useBackendChoices';
 
 const mocks = vi.hoisted(() => {
   const listeners = new Set<() => void>();
@@ -37,6 +38,7 @@ const mocks = vi.hoisted(() => {
       createBox: vi.fn(),
       credentials: vi.fn(async (): Promise<{ github: { boxGate: 'off' | 'clear' | 'blocked' } }> => ({ github: { boxGate: 'off' } })),
       repos: vi.fn(async () => ({ status: 'ok', groups: [] })),
+      models: vi.fn(async () => ({ providers: {} as Record<string, unknown> })),
     },
   };
 });
@@ -65,6 +67,7 @@ vi.mock('../services/api', () => ({
   credentialsApi: { get: mocks.api.credentials },
   githubReposApi: { list: mocks.api.repos },
   warmPoolApi: { get: vi.fn(async () => ({ warm: 0, warming: 0, target: 0 })) },
+  providersApi: { models: mocks.api.models },
 }));
 
 function makeBox(over: Partial<Instance> & Pick<Instance, 'id' | 'name'>): Instance {
@@ -83,6 +86,8 @@ beforeEach(() => {
   mocks.resetFeed();
   mocks.setBoxes([makeBox({ id: 'box-1', name: 'box-1' })]);
   mocks.api.credentials.mockResolvedValue({ github: { boxGate: 'off' } });
+  mocks.api.models.mockResolvedValue({ providers: {} });
+  resetBackendChoicesForTests();
   mocks.api.createBox.mockImplementation(async (boxName: string) => ({
     instance: makeBox({ id: 'created', name: boxName, status: 'provisioning' }),
     claimed: false,
@@ -135,6 +140,54 @@ async function clickSubmit() {
   await act(async () => { submitButton().click(); });
   await settle();
 }
+
+function choose(id: string, value: string) {
+  const el = field(id) as HTMLSelectElement;
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(el, value);
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+const KIMI = 'accounts/fireworks/models/kimi-k3';
+const MENUS = {
+  claude: [
+    { id: null, label: 'Default', models: [{ id: 'opus', label: 'Opus' }, { id: 'sonnet', label: 'Sonnet' }] },
+    { id: 'fireworks', label: 'Fireworks', models: [{ id: KIMI, label: 'kimi-k3', context: 1048576 }] },
+  ],
+  pi: [{ id: null, label: 'Default', models: [] }, { id: 'fireworks', label: 'Fireworks', models: [{ id: KIMI, label: 'kimi-k3' }] }],
+};
+const options = (id: string) => [...(field(id) as HTMLSelectElement).options].map(o => o.textContent);
+
+describe('new project form: inference and model', () => {
+  it('offers neither field when the orchestrator offers no choice, and sends neither', async () => {
+    await renderForm({ initialBoxId: 'box-1' });
+    expect(document.getElementById('npf-backend')).toBeNull();
+    expect(document.getElementById('npf-model')).toBeNull();
+    await clickSubmit();
+    expect(mocks.api.createProject).toHaveBeenCalledWith(expect.objectContaining({ initialAgent: { enabled: true, provider: 'claude' } }));
+  });
+
+  it('sends the picked backend and model, and an agent or backend change puts the model back to the default', async () => {
+    mocks.api.models.mockResolvedValue({ providers: MENUS });
+    await renderForm({ initialBoxId: 'box-1' });
+    expect(options('npf-backend')).toEqual(['Default', 'Fireworks']);
+    expect(options('npf-model')).toEqual(['Default', 'Opus', 'Sonnet']);
+    await act(async () => { choose('npf-model', 'sonnet'); });
+    await act(async () => { choose('npf-backend', 'fireworks'); });
+    expect(options('npf-model')).toEqual(['Default', 'kimi-k3 · 1M context']);
+    expect(field('npf-model').value).toBe('');
+    await act(async () => { choose('npf-model', KIMI); });
+    await clickSubmit();
+    expect(mocks.api.createProject).toHaveBeenLastCalledWith(expect.objectContaining({
+      initialAgent: { enabled: true, provider: 'claude', backend: 'fireworks', model: KIMI },
+    }));
+
+    await act(async () => { choose('npf-provider', 'cursor'); });
+    expect(document.getElementById('npf-backend')).toBeNull();
+    await act(async () => { choose('npf-provider', 'pi'); });
+    expect(field('npf-backend').value).toBe('');
+    expect(document.getElementById('npf-model')).toBeNull();
+  });
+});
 
 describe('simplified new project form', () => {
   it('opens on the repository list with the other choices collapsed', async () => {

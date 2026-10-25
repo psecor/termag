@@ -9,6 +9,7 @@ import { pushRecentSearch, readRecentSearches, removeRecentSearch, writeRecentSe
 import { useHome } from '../../mobile/useHome';
 import { SessionRow, useRowActions } from './SessionRow';
 import { TabBar } from './TabBar';
+import { PullScroll } from './PullScroll';
 
 const store = () => (typeof localStorage !== 'undefined' ? localStorage : null);
 
@@ -120,7 +121,7 @@ export function Search() {
         </form>
       </header>
       {actions.error && <div className="m-banner" data-connection="offline" role="alert" onClick={actions.clearError}>{actions.error} · tap to dismiss</div>}
-      <main className="m-scroll">
+      <PullScroll>
         {searching ? (
           <ul className="m-list">
             <li className="m-list-head" role="presentation">Sessions</li>
@@ -171,7 +172,7 @@ export function Search() {
             {history.length === 0 && recent.length === 0 && <li className="m-empty">Nothing opened recently.</li>}
           </ul>
         )}
-      </main>
+      </PullScroll>
       <TabBar attention={counts.attention} />
       {actions.sheets}
     </div>

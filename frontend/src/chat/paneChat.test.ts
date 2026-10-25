@@ -734,3 +734,28 @@ describe('scanStyled', () => {
     expect(rows[1].text).toBe(' still on 17');
   });
 });
+
+describe('parsePane: a slash command a mod ran (/reload-plugins)', () => {
+  // The terminal draws the command as typed and its output, never Claude
+  // Code's <command-name> markup: the phone shows what the pane does.
+  const pane = [
+    '❯ what changed?',
+    '',
+    '● Nothing yet.',
+    '',
+    '❯ /reload-plugins',
+    '  ⎿  Reloaded: 4 plugins · 2 skills · 0 agents · 3 hooks · 1 plugin LSP server',
+    '',
+    DIV,
+    '❯ ',
+    DIV,
+  ].join('\n');
+
+  it('is the command and its output, not a bubble of markup', () => {
+    const p = parsePane(pane, { provider: 'claude', role: 'agent' });
+    expect(p.blocks.map(b => b.kind)).toEqual(['you', 'agent', 'you', 'tool']);
+    expect(p.blocks[2]).toMatchObject({ text: '/reload-plugins' });
+    expect(p.blocks[3].result).toMatch(/^Reloaded: 4 plugins/);
+    expect(p.blocks.some(b => /<command-|<local-command-/.test(b.text))).toBe(false);
+  });
+});

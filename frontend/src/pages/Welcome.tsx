@@ -9,6 +9,7 @@ import { NewProjectForm } from '../components/NewProjectForm';
 import { boxFeed } from '../services/boxFeed';
 import { blocksManagedBox, gateArmed } from '../boxGate';
 import { credentialsApi, CredentialsStatus } from '../services/api';
+import { recordProductEvent } from '../observability';
 
 /**
  * First-run setup: /welcome. Offered when /auth/me says
@@ -41,6 +42,8 @@ export default function Welcome() {
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
+    // The top of the onboarding funnel.
+    recordProductEvent('welcome.viewed');
     return () => { mounted.current = false; };
   }, []);
   const [sshBusy, setSshBusy] = useState(false);
@@ -191,7 +194,7 @@ export default function Welcome() {
             <div className="confirm-actions">
               <button className="btn-ghost" onClick={keepEditing} autoFocus>Keep editing</button>
               <button className="btn-ghost" onClick={() => { const proceed = pendingNavigation; setPendingNavigation(null); proceed(); }}>Continue without adding</button>
-              <button className="btn-primary" onClick={() => void addAndContinue()}>Add key and continue</button>
+              <button className="btn-primary" data-analytics="sshkey-add-continue" onClick={() => void addAndContinue()}>Add key and continue</button>
             </div>
           </div>
         </div>,

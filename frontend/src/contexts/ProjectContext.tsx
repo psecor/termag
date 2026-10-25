@@ -6,17 +6,21 @@ import { useAuth } from './AuthContext';
 import { connectionTracker } from '../utils/connectionTracker';
 import { statusReconnectDelayMs } from '../utils/connection';
 import { statusKey } from '../utils/statusKey';
+import { statusFromPush } from '../utils/statusPush';
 import { cloudSessionFeed } from '../services/cloudSessionFeed';
 import { boxFeed } from '../services/boxFeed';
 import { chatEvents, type ChatFrame } from '../chat/chatEvents';
+import { workspaceChangeFromPush } from '../utils/workspacePush';
 import { FLAGS, useFlag } from '../flags';
 import { cloneInFlight } from '../utils/cloneTile';
 import { applyListRead, beginListRead, releaseListRead, settleCloneAction, type CloneAction, type CloneListState } from '../utils/cloneList';
 
-const LAST_ACTIVE_PROJECT_KEY = 'termag:lastActiveProject';
+export const LAST_ACTIVE_PROJECT_KEY = 'termag:lastActiveProject';
 
 interface ProjectContextValue {
   projects: Project[];
+  /** The project list has been read at least once, so an empty list means none. */
+  projectsLoaded: boolean;
   activeProjectId: string | null;
   statusMap: StatusMap;
   setActiveProject: (id: string | null) => void;
@@ -29,6 +33,7 @@ interface ProjectContextValue {
 
 const ProjectContext = createContext<ProjectContextValue>({
   projects: [],
+  projectsLoaded: false,
   activeProjectId: null,
   statusMap: {},
   setActiveProject: () => {},
@@ -50,6 +55,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const projectsRef = useRef<Project[]>([]);
   const listClock = useRef<CloneListState<Project>>({ generation: 0, projects: [] });
   // Initialize from the URL so a refresh restores immediately. The URL is the
@@ -208,13 +214,18 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       const next = applyListRead(listClock.current, { generation, projects: data });
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
+      // A read that finished before a newer one is held, not shown: the list on screen is still the old one.
+      if (next.applied != null) setProjectsLoaded(true);
     } catch (err) {
       const next = releaseListRead(listClock.current, generation);
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
+      if (next.applied != null) setProjectsLoaded(true);
       throw err;
     }
   }, [rememberList]);
+  const reloadProjectsRef = useRef(reloadProjects);
+  reloadProjectsRef.current = reloadProjects;
 
   const settleProjectClone = useCallback(async (projectId: string, action: CloneAction) => {
     const result = await settleCloneAction({
@@ -312,27 +323,23 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           if (msg.type === 'claude-session') { void cloudSessionFeed.reload(); return; }
           // A simple-UI chat event (services/chatRunner.ts): the open chat view folds it in.
           if (msg.type === 'chat') { chatEvents.publish(msg as unknown as ChatFrame); return; }
+          // A project or box changed outside this tab (the CLI, a spawn, a sweep, another tab).
+          const change = workspaceChangeFromPush(msg);
+          if (change === 'projects') { reloadProjectsRef.current().catch(() => {}); return; }
+          if (change === 'boxes') { void boxFeed.reload(); return; }
+          // A share revoked or left took this session out of the viewer's
+          // scope (backend services/statusAudience.ts, shareChangeFrames).
+          if (msg.type === 'status-gone') {
+            setStatusMap(prev => {
+              const { [statusKey(msg.instanceId, msg.session)]: _gone, ...rest } = prev;
+              return rest;
+            });
+            return;
+          }
           if (msg.type === 'status') {
             setStatusMap(prev => ({
               ...prev,
-              [statusKey(msg.instanceId, msg.session)]: {
-                status: msg.status,
-                updatedAt: msg.updatedAt,
-                message: msg.message,
-                source: msg.source,
-                waitingReason: msg.waitingReason,
-                activityScore: msg.activityScore,
-                tokenBurst: msg.tokenBurst,
-                activeTurn: msg.activeTurn,
-                threadId: msg.threadId,
-                pollerMeta: (msg as any).pollerMeta,
-                contextTokens: (msg as any).contextTokens,
-                rateLimited: (msg as any).rateLimited,
-                stoppedAt: (msg as any).stoppedAt,
-                milestone: (msg as any).milestone ?? null,
-                // The Devin review pane's state (utils/reviewRing).
-                review: (msg as any).review ?? null,
-              },
+              [statusKey(msg.instanceId, msg.session)]: statusFromPush(msg),
             }));
           }
         } catch { /* ignore */ }
@@ -360,7 +367,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   return (
     <ProjectContext.Provider value={{
-      projects, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
+      projects, projectsLoaded, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
       getActiveWorkstream, setActiveWorkstream,
     }}>
       {children}

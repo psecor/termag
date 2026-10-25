@@ -2,9 +2,15 @@
    variables from App.css. Prose is in the system font — monospace at phone
    widths is hard to read — and tool output / plain panes stay monospace. */
 
+/* Top and height follow the visual viewport (mobile/useVisualViewport.ts):
+   iOS overlays the keyboard instead of resizing, and scrolls the layout
+   viewport, which slid a plain `inset: 0` header off screen. */
 .m-root {
   position: fixed;
-  inset: 0;
+  left: 0;
+  right: 0;
+  top: var(--m-vvtop, 0px);
+  height: var(--m-vvh, 100%);
   display: flex;
   flex-direction: column;
   background: var(--bg-base);
@@ -411,9 +417,30 @@ a.m-row { text-decoration: none; color: inherit; }
 /* ── PRs ───────────────────────────── */
 .m-prs-link { gap: 4px; }
 .m-prs-count { background: var(--accent); color: var(--bg-base); }
+.m-prs-count.is-stale { background: var(--text-muted); opacity: 0.8; }
 .m-segment[data-act] .m-segment-count { background: var(--accent); color: var(--bg-base); }
 .m-pr-row { width: 100%; text-align: left; font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 .m-pr-row[data-deferred] { opacity: 0.6; }
+/* Review groups (PrGroups.tsx). */
+.m-prg { flex-direction: column; background: var(--bg-elevated); }
+.m-prg[data-done] { opacity: 0.75; }
+.m-prg-suggestion { background: none; border-bottom-style: dashed; }
+.m-prg-head .m-pr-glyph { color: var(--accent); }
+.m-prg-body { padding: 0 14px 12px; display: flex; flex-direction: column; gap: 10px; }
+.m-prg-members { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.m-prg-member {
+  display: flex; gap: 10px; align-items: flex-start; width: 100%; text-align: left; font: inherit; color: inherit;
+  background: none; border: none; border-top: 1px solid var(--border); padding: 8px 0; cursor: pointer;
+}
+.m-prg-member-wrap { display: flex; align-items: stretch; border-top: 1px solid var(--border); }
+.m-prg-member-wrap .m-prg-member { border-top: none; flex: 1; min-width: 0; }
+.m-prg-member[data-checked] .m-row-title { color: var(--text-muted); }
+.m-prg-mark { width: 14px; flex-shrink: 0; text-align: center; line-height: 21px; color: var(--text-muted); }
+.m-prg-member[data-checked] .m-prg-mark { color: var(--success); }
+.m-prg-member[data-next] .m-prg-mark { color: var(--accent); }
+.m-prg-actions { display: flex; flex-direction: column; gap: 8px; }
+.m-prg-pill { color: var(--text-muted); }
+.m-prg-new { display: flex; flex-direction: column; gap: 8px; padding: 0; }
 .m-pr-glyph { color: var(--text-secondary); }
 .m-pr-glyph[data-lane="needs_my_review"], .m-pr-glyph[data-lane="ready_to_merge"] { color: var(--accent); }
 .m-pr-glyph[data-lane="checks"] { color: var(--warning); }
@@ -550,3 +577,67 @@ a.m-row { text-decoration: none; color: inherit; }
 .m-summary-tile[data-filter="briefing"]:not([data-zero]) .m-summary-count { color: var(--warning); }
 .m-briefing-sheet { max-height: 70vh; overflow: auto; }
 .m-briefing-sheet .briefing-item-link { grid-template-columns: 72px minmax(0, 1fr); }
+.m-briefing-sheet .briefing-row--plain > .briefing-item-link { grid-template-columns: minmax(0, 1fr); }
+
+/* ── Installed app ───────────────────── */
+/* The keyboard covers the home indicator: drop the bottom inset while it is up. */
+.m-root[data-keyboard] .m-composer { padding-bottom: 8px; }
+.m-root[data-keyboard] .m-tabbar { display: none; }
+
+.m-pull {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: height 0.15s ease-out;
+}
+.m-pull[data-armed] { color: var(--accent); }
+.m-pull-label { padding-bottom: 8px; }
+.m-header .m-more { color: var(--accent); font-size: 22px; padding: 6px 8px; }
+
+.m-sheet-steps { margin: 4px 0 10px; padding-left: 22px; line-height: 1.6; }
+.m-check { display: flex; gap: 10px; align-items: flex-start; padding: 12px 4px 4px; font-size: 14px; color: var(--text-secondary); }
+.m-check input { width: 20px; height: 20px; margin: 0; flex-shrink: 0; accent-color: var(--accent); }
+
+.m-share-card {
+  margin: 10px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.m-attach {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.m-attach:disabled { color: var(--text-muted); }
+.m-tool-share {
+  margin: 4px 0 2px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+/* An automation run's row. */
+.m-automation { opacity: 0.85; }

@@ -106,7 +106,7 @@ export interface DashboardData {
   cloudActive: Polled<CloudSessionsResponse>;
   cloudRecent: Polled<CloudSessionsResponse>;
   /** Spawned agents, limits and box load. */
-  spawns: Polled<SpawnUsage>;
+  spawns: Polled<SpawnUsage> & { refresh: () => void };
   /** The PR pipeline; the backend memoizes per user for 60 s. */
   prs: Polled<PrPipelineResponse> & { refresh: () => void };
   /** Most recent successful sessions fetch — the "checked Xs ago" stamp. */

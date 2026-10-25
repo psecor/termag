@@ -83,9 +83,10 @@ export function terminateNoteText(
 
 /**
  * The full lifecycle sentence for a box row, or null. A setting that can't
- * fire says so first; what already happened (an automatic hibernate) and the
- * scheduled terminate show while the box is still parked; the settings
- * themselves show on a ready box.
+ * fire says so first; what already happened (an automatic hibernate, or a
+ * plain idle stop) shows while the box is still down; the scheduled
+ * terminate is added only on a hibernated box; the settings themselves
+ * show on a ready box.
  */
 export function lifecycleNoteText(
   box: Pick<Instance, 'lifecycle' | 'status'>,
@@ -94,7 +95,7 @@ export function lifecycleNoteText(
   const lc = box.lifecycle;
   if (!lc) return null;
   if (lc.warning) return lc.warning;
-  if (box.status === 'hibernated' || box.status === 'hibernating') {
+  if (box.status === 'hibernated' || box.status === 'hibernating' || box.status === 'stopped' || box.status === 'stopping') {
     const parts = [lc.note, box.status === 'hibernated' ? terminateNoteText(lc, formatDate) : null].filter(Boolean);
     return parts.length ? parts.join(' ') : null;
   }
@@ -132,6 +133,7 @@ export function lifecycleNote(
     const why = schedule.keptFor === 'unsaved' ? ' · unpushed' : schedule.keptFor === 'unknown' ? ' · unchecked' : '';
     return { text: `Terminates ${formatDate(schedule.due)}${why}`, title };
   }
+  if (box.status === 'stopped' || box.status === 'stopping') return { text: 'Auto-stopped', title };
   return { text: 'Auto-parked', title };
 }
 

@@ -4,6 +4,7 @@ import type { ThemeSettings } from '../theme/schema';
 import type { OrgAccess } from '../pages/settings/githubOrgCopy';
 import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, BoxLifecycle, AutoTerminatedBox, Workstream, CloudSession, CloudSessionEvent, HandoffMode } from '../types';
 import type { BoxGateState } from '../boxGate';
+import { chatModelWire, type ChatModelId } from '../chat/composer';
 
 const api = axios.create({
   baseURL: '/termag',
@@ -35,6 +36,10 @@ export interface PreferencesPatch {
   defaultAgentProvider?: AgentProvider;
   dotfilesRepoUrl?: string | null;
   theme?: ThemeSettings;
+  /** Skip Slack/Discord "waiting" posts while this user has a push device. */
+  pushMutesChat?: boolean;
+  /** Notify when a chat finishes its turn. */
+  chatTurnNotify?: boolean;
 }
 
 export const authApi = {
@@ -53,6 +58,21 @@ export const authApi = {
   loginUrl: () => '/termag/auth/login',
 };
 
+// Web push for the phone client.
+export interface PushConfig { enabled: boolean; publicKey: string | null }
+export interface PushDevice { id: string; userAgent: string | null; createdAt: string; lastUsedAt: string | null; failedAt: string | null }
+export interface PushSubscriptionBody { endpoint: string; keys: { p256dh: string; auth: string } }
+export const pushApi = {
+  config: (): Promise<PushConfig> => api.get('/api/push/config').then(r => r.data),
+  devices: (): Promise<{ subscriptions: PushDevice[] }> => api.get('/api/push/subscriptions').then(r => r.data),
+  subscribe: (subscription: PushSubscriptionBody, userAgent: string): Promise<{ id: string }> =>
+    api.post('/api/push/subscriptions', { subscription, userAgent }).then(r => r.data),
+  unsubscribe: (endpoint: string): Promise<void> =>
+    api.delete('/api/push/subscriptions', { data: { endpoint } }).then(() => undefined),
+  test: (): Promise<{ sent: number; failed: number }> => api.post('/api/push/test').then(r => r.data),
+};
+
+
 // The deployment's flag values (TERMAG_FLAGS), read by useFlag (flags.ts).
 export const featureFlagsApi = {
   get: (): Promise<{ flags: Record<string, unknown> }> =>
@@ -68,12 +88,20 @@ export const projectsApi = {
     description?: string;
     color?: string;
     instanceId?: string | null;
-    initialAgent?: { enabled: boolean; provider: AgentProvider };
+    initialAgent?: { enabled: boolean; provider: AgentProvider; backend?: string | null; model?: string | null };
     /** Start as a clone of this GitHub repo; the clone runs in the agent pane before the agent launches. */
     repoUrl?: string | null;
     defaultBranch?: string | null;
     /** The session replay this tab is recording (observability.ts replaySessionId); the agent launch files its Claude Code spans under it. */
     replaySessionId?: string | null;
+    /** The creator trusts the repository: its chat's Claude runs tools without asking (backend services/chatTrust.ts). */
+    chatTrusted?: boolean;
+    /** Simple-UI chat: opus, sonnet, haiku, or null for Claude's default. */
+    claudeModel?: 'opus' | 'sonnet' | 'haiku' | null;
+    /** New session's "Act as an orchestrator" (backend: kept only with chatTrusted). */
+    chatOrchestrator?: boolean;
+    /** The box this submit created came from the warm pool (telemetry only; backend services/productEvents.ts). */
+    warmClaimed?: boolean;
   }): Promise<Project> =>
     api.post('/api/projects', data).then(r => r.data),
   /** Known starter repos for "first project" (webapp, research); "custom" is any GitHub URL. */
@@ -96,6 +124,15 @@ export const projectsApi = {
     api.post(`/api/projects/${id}/clone/retry`).then(r => r.data),
   startEmpty: (id: string): Promise<Project> =>
     api.post(`/api/projects/${id}/clone/start-empty`).then(r => r.data),
+};
+
+export interface ModelChoice { id: string; label: string; context?: number }
+/** A model backend a harness can run on (null id = its default) and its models. */
+export interface BackendChoice { id: string | null; label: string; models: ModelChoice[] }
+
+export const providersApi = {
+  /** Per harness, the model backends and models this viewer may pick (backend services/modelChoices.ts). */
+  models: (): Promise<{ providers: Record<string, BackendChoice[]> }> => api.get('/api/providers/models').then(r => r.data),
 };
 
 export const githubReposApi = {
@@ -142,8 +179,8 @@ export const workstreamsApi = {
   rename: (projectId: string, workstreamId: string, name: string): Promise<Workstream> =>
     api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/rename`, { name }).then(r => r.data),
   /** Switch the agent this workstream runs: stops the one in its agent pane, starts `provider` there. */
-  switchAgent: (projectId: string, workstreamId: string, provider: string): Promise<{ ok: true; provider: string; changed: boolean; warning?: string | null }> =>
-    api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/agent`, { provider }).then(r => r.data),
+  switchAgent: (projectId: string, workstreamId: string, provider: string, backend: string | null = null, model: string | null = null): Promise<{ ok: true; provider: string; backend: string | null; model: string | null; changed: boolean; warning?: string | null }> =>
+    api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/agent`, { provider, backend, model }).then(r => r.data),
 };
 
 
@@ -229,7 +266,10 @@ export interface InstanceCreated {
 }
 
 export const instancesApi = {
-  list: (): Promise<Instance[]> => api.get('/api/instances').then(r => r.data),
+  // `poll=1` marks the workspace's periodic read so the browser's network
+  // recording can leave it out (observability.ts NETWORK_URL_BLOCKLIST) while
+  // the person-triggered /api/instances calls stay recorded; the server ignores it.
+  list: (): Promise<Instance[]> => api.get('/api/instances', { params: { poll: 1 } }).then(r => r.data),
   get: (id: string): Promise<Instance> => api.get(`/api/instances/${id}`).then(r => r.data),
   create: (name: string, kind: InstanceKind = 'ec2'): Promise<InstanceCreated> =>
     api.post('/api/instances', { name, kind }).then(r => r.data),
@@ -243,6 +283,8 @@ export const instancesApi = {
   // 'stopping' when EC2 refused the hibernate and the backend stopped it instead.
   hibernate: (id: string): Promise<{ ok: true; status: 'hibernating' | 'stopping' }> =>
     api.post(`/api/instances/${id}/hibernate`).then(r => r.data),
+  rename: (id: string, name: string): Promise<{ instance: Instance }> =>
+    api.post(`/api/instances/${id}/rename`, { name }).then(r => r.data),
   // A missing key leaves that setting alone; null turns it off.
   setLifecycle: (
     id: string,
@@ -266,6 +308,8 @@ export interface CloudSessionsResponse { state: 'active' | 'recent'; days: numbe
 export interface SpawnNode {
   id: string;
   level: number;
+  /** The node it was spawned from, in the same tree; null for a root. */
+  parentId?: string | null;
   relationship: 'delegate' | 'peer' | string;
   state: string;
   title: string;
@@ -280,7 +324,43 @@ export interface SpawnNode {
   launchedAt: string | null;
   reportedAt: string | null;
   endedAt: string | null;
+  /** parked = its CLI stopped (resumable), retired = its workstream removed. */
+  parkedAt: string | null;
+  retiredAt: string | null;
+  /** Why the last retire was refused (uncommitted changes, unpushed commits, …). */
+  keptReason: string | null;
+  lifecycle: string | null;
+  /** Who takes its reports since its parent went away. */
+  foster?: { projectId: string; workstream: string; by: 'ancestor' | 'home' | 'owner' | 'agent' | string | null; at: string | null } | null;
+  /** Its parent went away and nobody adopted it. */
+  orphanedAt?: string | null;
   tokens: { input: number; output: number; cacheRead: number; cacheCreate: number } | null;
+}
+
+/** One spawn tree (GET /api/spawns/trees/:rootId), or every tree one session started (…/sessions/:projectId/:workstream/trees). */
+export interface SpawnTreeView {
+  /** A session's view has the session at its root and its trees beneath it. */
+  scope?: 'tree' | 'session';
+  rootId: string;
+  /** Each tree's root, oldest first: the origin's own children. */
+  rootIds?: string[];
+  /** A session's view holds its newest 50 trees; true when there were more. */
+  rootsTruncated?: boolean;
+  createdAt: string;
+  /** The session that started the root (a person's own agent), with its pane status. */
+  origin: { projectId: string | null; workstream: string; session: string; label: string; status: string } | null;
+  nodes: SpawnNode[];
+  /** Oldest first: ids, kinds and reasons only. */
+  events: Array<{ spawnId: string | null; kind: string; reason: string | null; at: string; parentProjectId?: string | null; parentWorkstream?: string | null }>;
+  eventsTruncated: boolean;
+  /** How many events the server returns at most (the oldest). */
+  eventsLimit?: number;
+  /** More nodes than the server returns: the oldest are shown, and the totals count those. */
+  nodesTruncated?: boolean;
+  /** Labels for the sessions its nodes are fostered by, in the tree or not. */
+  fosters?: Array<{ projectId: string; workstream: string; label: string }>;
+  totals: { agents: number; peakRunning: number; tokens: number; cacheRead: number; secondsToLastReport: number | null; states: Record<string, number> };
+  at: string;
 }
 
 export interface SpawnLimitsView {
@@ -299,7 +379,13 @@ export interface SpawnUsage {
     finishedRunning: number;
     hints: Array<{ kind: string; message: string }>;
   };
-  trees: Array<{ rootId: string; createdAt: string; nodes: SpawnNode[] }>;
+  trees: Array<{
+    rootId: string;
+    createdAt: string;
+    /** The session that started it (the dashboard's parent row); null when it came from the browser. */
+    origin?: { projectId: string; workstream: string; session: string; label: string } | null;
+    nodes: SpawnNode[];
+  }>;
   /** How many trees there were before the response's cap. */
   treesTotal: number;
   refusals: Array<{ reason: string; count: number }>;
@@ -311,11 +397,36 @@ export interface SpawnUsage {
     samples: Array<{ at: string; memUsedPct: number | null; loadPerCore: number | null; liveAgents: number | null }>;
   }>;
   days: number;
+  /** Orphans nobody adopted, however old (absent from an older backend). */
+  orphans?: SpawnNode[];
+  /** Where orphans go when no ancestor is alive; label null when its session is gone. */
+  orphanHome?: { projectId: string; workstream: string; label: string | null } | null;
+  /** The owner's sessions an orphan can be adopted into, and the home picked from. */
+  sessions?: SpawnSession[];
 }
+
+export interface SpawnSession { projectId: string; workstream: string; label: string }
 
 /** Agent spawn. */
 export const spawnsApi = {
   usage: (): Promise<SpawnUsage> => api.get('/api/spawns/usage').then(r => r.data),
+  /** Which session started each live child (backend routes/spawns.ts parentsFor). */
+  parents: (): Promise<{ links: Array<{ projectId: string; workstream: string; parentProjectId: string; parentWorkstream: string }> }> =>
+    api.get('/api/spawns/parents').then(r => r.data),
+  tree: (rootId: string): Promise<SpawnTreeView> => api.get(`/api/spawns/trees/${encodeURIComponent(rootId)}`).then(r => r.data),
+  sessionTree: (projectId: string, workstream: string): Promise<SpawnTreeView> =>
+    api.get(`/api/spawns/sessions/${encodeURIComponent(projectId)}/${encodeURIComponent(workstream)}/trees`).then(r => r.data),
+  /** Park (stop its CLI) or retire (remove its workstream; refused with a reason when work would be lost). */
+  dismiss: (id: string, action: 'park' | 'retire'): Promise<{ ok: true; lifecycle: string; note: string }> =>
+    api.post(`/api/spawns/${encodeURIComponent(id)}/dismiss`, { action }).then(r => r.data),
+  resume: (id: string): Promise<{ ok: true; note: string }> =>
+    api.post(`/api/spawns/${encodeURIComponent(id)}/resume`).then(r => r.data),
+  /** Move a spawn to one of the owner's sessions, which then takes its reports. */
+  adopt: (id: string, to: { projectId: string; workstream: string }): Promise<{ ok: true; foster: string; note: string }> =>
+    api.post(`/api/spawns/${encodeURIComponent(id)}/adopt`, to).then(r => r.data),
+  /** Set the orphan home, or clear it with null. */
+  setOrphanHome: (to: { projectId: string; workstream: string } | null) =>
+    api.put('/api/spawns/orphan-home', to ?? { projectId: null }).then(r => r.data),
 };
 
 export const claudeSessionsApi = {
@@ -345,7 +456,8 @@ export interface WarmPoolStatus {
 
 export const warmPoolApi = {
   get: (): Promise<WarmPoolStatus> =>
-    api.get('/api/warm-pool').then(r => r.data),
+    // `poll=1`: periodic read, left out of network recording (observability.ts).
+    api.get('/api/warm-pool', { params: { poll: 1 } }).then(r => r.data),
 };
 
 export interface UsageDayData {
@@ -463,7 +575,7 @@ export interface RecentRow {
   access: 'owner' | 'collaborator';
   instanceId: string | null;
   archived: boolean;
-  kind?: 'normal' | 'metaterm';
+  kind?: 'normal' | 'metaterm' | 'automation';
   color?: string | null;
   lastVisitedAt: string;
   status: 'working' | 'waiting' | 'idle' | 'not_running';
@@ -597,24 +709,110 @@ export interface ChatHistory {
   /** A turn is running on the box now; its events arrive on the status socket. */
   running: boolean;
   queued: number;
+  /** A message sent while a turn runs goes into that turn (agent chat-live-v1); else it waits for the turn to end. */
+  liveInput?: boolean;
+  /** A message this viewer sends can go into a live turn (their chat-live-input-enabled, an agent with chat-live-v1). */
+  sendsLive?: boolean;
+  /** The box's agent can stop only a live turn's current work (chat-interrupt-v1). */
+  stopsTurn?: boolean;
+  /** This viewer's composer offers images (their chat-image-input-enabled, an agent with chat-images-v1). */
+  imageInput?: boolean;
   /** The box holds queued messages from before its agent restarted, waiting for this (live) chat to resume them. */
   parked?: boolean;
   /** A repo chat's checkout is there; its first turn waits for it (a pane clone finishes after setup). */
   checkoutReady: boolean;
+  /** The runner's record of each turn (cost, duration), oldest first; absent from an older agent. */
+  turns?: Array<{ turnId: string; prompt: string; userUuid?: string | null; costUsd: number | null; durationMs: number | null; at?: string | null; isError?: boolean }>;
+  /** Whether this chat's Claude may run tools without asking, as the backend decided it. */
+  trust?: ChatTrust;
+  /** The caller owns the project and may trust its repository. */
+  canTrust?: boolean;
+  /** The model the chat's next turn runs on unless a message picks another (backend services/claudeChatModel.ts). */
+  model?: string;
+  /** Set when that model is another backend's. */
+  backend?: 'fireworks';
   /** Claude's transcript entries ({type, message}), oldest first (chat/sdkChat.ts fromHistory). */
   entries: unknown[];
   /** The turn still running, replayed from its own log (a durable runner); its prompt is cut from `entries`. */
   turn?: { turnId: string; events: Array<{ seq: number; event: unknown }> } | null;
+  /** A live Claude in the full UI's terminal has this session. Absent on an older backend. */
+  terminalHolds?: boolean;
 }
+
+export interface ChatTrust {
+  trusted: boolean;
+  reason: 'trusted' | null;
+  mode: string;
+}
+
+export interface ArchivedChat {
+  id: string;
+  name: string;
+  repoUrl: string | null;
+  archivedAt: string;
+  // Instance['status'] keeps this off the shared types import line, so a
+  // stack merge onto main (which adds HandoffMode there) does not conflict.
+  box: { id: string; name: string; kind: string; status: Instance['status']; hibernationConfigured: boolean } | null;
+  /** Other projects on this chat's box, archived ones included. Zero means delete terminates the box. */
+  otherProjects: number;
+}
+
+/** The simple UI's chat lifecycle (backend routes/chats.ts): archive stops the box when it can. Delete terminates the box only when this chat is the last project on it. */
+export const chatsApi = {
+  archived: (): Promise<ArchivedChat[]> => api.get('/api/chats/archived').then(r => r.data),
+  archive: (id: string): Promise<{ archived: true; box: { action: string | null; status?: string | null; reason?: string; error?: string } }> =>
+    api.post(`/api/chats/${encodeURIComponent(id)}/archive`).then(r => r.data),
+  reopen: (id: string): Promise<{ reopened: boolean; pending?: boolean; box: ArchivedChat['box'] }> =>
+    api.post(`/api/chats/${encodeURIComponent(id)}/reopen`).then(r => r.data),
+  remove: (id: string): Promise<{ deleted: true }> =>
+    api.delete(`/api/chats/${encodeURIComponent(id)}`, { data: { confirmed: true } }).then(r => r.data),
+};
 
 /** The simple UI's chat on a chat-runner project (backend routes/chat.ts). */
 export const chatApi = {
+  /** The owner trusts the project's repository. The JSON body is the trust action; an empty POST is not. */
+  trust: (projectId: string): Promise<{ trust: ChatTrust }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/trust`, { trust: true }).then(r => r.data),
   history: (projectId: string, workstream: string): Promise<ChatHistory> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/chat`, { params: { workstream } }).then(r => r.data),
-  send: (projectId: string, workstream: string, text: string): Promise<{ queued: boolean; turnId?: string; position?: number }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text }).then(r => r.data),
-  interrupt: (projectId: string, workstream: string): Promise<{ interrupted: boolean; dropped?: string[] }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/interrupt`, { workstream }).then(r => r.data),
+  /**
+   * `images`: base64 PNG/JPEG/GIF/WebP (chat/chatImageData.ts), only when the history said imageInput.
+   * `model`: the chat switches to it from this message's turn on; omitted, the turn keeps the chat's model.
+   */
+  send: (projectId: string, workstream: string, text: string, images: Array<{ mediaType: string; data: string }> = [], model?: ChatModelId | null): Promise<{ queued: boolean; turnId?: string; position?: number }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}) }).then(r => r.data),
+  /** `turn` stops only a live turn's current work; `all` (the default) stops the turn and its background tasks. */
+  interrupt: (projectId: string, workstream: string, scope: 'turn' | 'all' = 'all'): Promise<{ interrupted: boolean; scope?: 'turn' | 'all'; dropped?: string[] }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/interrupt`, { workstream, scope }).then(r => r.data),
+  /** Open in full UI: continue the session in the agent pane (`claude --resume <id>`). */
+  openInTerminal: (projectId: string, workstream: string): Promise<{ resumed: boolean; reason?: string; sessionId?: string }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/terminal`, { workstream }).then(r => r.data),
+  /**
+   * The full UI's Claude has this session. Exit it when it is really there, or
+   * clear a stale hold, then send `text` (and images) if there is anything to send.
+   */
+  reclaim: (projectId: string, workstream: string, text = '', images: Array<{ mediaType: string; data: string }> = [], model?: ChatModelId | null): Promise<{ reclaimed: boolean; sent?: boolean; queued?: boolean; turnId?: string }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/reclaim`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}) }).then(r => r.data),
+};
+
+export interface ClaudeLoginView {
+  phase: 'ready' | 'needed' | 'starting' | 'needs-code' | 'submitting' | 'failed' | 'expired' | 'unavailable' | 'owner' | 'offline';
+  loggedIn: boolean;
+  authMethod?: string;
+  url?: string;
+  error?: string;
+}
+
+/** Claude Enterprise sign-in on the project's box (routes/claudeLogin.ts). The code is sent once and is not returned. */
+export const claudeLoginApi = {
+  status: (projectId: string): Promise<ClaudeLoginView> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/claude-login`).then(r => r.data),
+  start: (projectId: string): Promise<ClaudeLoginView> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/claude-login`).then(r => r.data),
+  submit: (projectId: string, code: string): Promise<ClaudeLoginView> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/claude-login/code`, { code }).then(r => r.data),
+  cancel: (projectId: string): Promise<ClaudeLoginView> =>
+    api.delete(`/api/projects/${encodeURIComponent(projectId)}/claude-login`).then(r => r.data),
 };
 
 export const sessionsApi = {
@@ -635,6 +833,12 @@ export const sessionsApi = {
    */
   sendKeys: (projectId: string, role: 'agent' | 'ctrl' | 'review', body: { workstream?: string; keys: string; enter?: boolean; literal?: boolean }): Promise<{ ok: true }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/sessions/${role}/send-keys`, body).then(r => r.data),
+  /** A photo from the phone, as a PNG, pasted into the pane like the desktop's image paste. */
+  pasteImage: (projectId: string, role: 'agent' | 'ctrl' | 'review', workstream: string | undefined, png: Blob): Promise<{ ok: true }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/sessions/${role}/paste-image`, png, {
+      params: workstream ? { workstream } : undefined,
+      headers: { 'Content-Type': 'image/png' },
+    }).then(r => r.data),
   /**
    * The last `lines` of one pane as text, routed through the owner's agent.
    * `styled` keeps SGR escapes (tmux -e) so a reader can tell dimmed ghost
@@ -688,7 +892,8 @@ export const reviewApi = {
   // No `status`: the pane's state rides the agent session's status over /ws/status
   // (written by the review sweep.md); nothing polls GET /review
   // any more. The route stays for on-demand probes and external callers.
-  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string }): Promise<{ ok: true; session: string; pr: number; url: string | null; reviewer?: string; startedAt: string }> =>
+  /** `group`: Review all with Devin, one session over a review group's members in order; `pr` is the first. */
+  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string; group?: { name: string; members: PrGroupMemberInput[] } }): Promise<{ ok: true; session: string; pr: number; url: string | null; reviewer?: string; startedAt: string }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/review`, body).then(r => r.data),
   stop: (projectId: string, workstream: string): Promise<{ ok: true }> =>
     api.delete(`/api/projects/${encodeURIComponent(projectId)}/review`, { params: { workstream } }).then(r => r.data),
@@ -720,6 +925,141 @@ export const sharingApi = {
   leaveProject: (projectId: string) =>
     api.delete(`/api/projects/${projectId}/leave`).then(r => r.data),
 };
+
+/** A preview share as its owner sees it. */
+export interface PreviewShareView {
+  id: string;
+  /** user: one named person; link: a PR's link, for anyone signed in who opens it (phase 2). Absent from older backends: user. */
+  audience?: 'user' | 'link';
+  workstream: string;
+  grantee: { id: string; email: string; name: string } | null;
+  recipe: { kind: 'webapp-dev-stack' } | { kind: 'manual'; origins: string[] };
+  expiresAt: string;
+  revokedAt: string | null;
+  endedAt: string | null;
+  endedReason: string | null;
+  lastOpenedAt: string | null;
+  createdAt: string;
+  liveViewers: number;
+  blockedOrigins: string[];
+  /** A link share's PR. */
+  pr?: PreviewSharePr | null;
+  /** A link share's link, `/p/<token>`: its owner may copy it again. */
+  linkPath?: string;
+  /** Who opened a link share, most recent first. */
+  viewers?: PreviewShareViewer[];
+}
+
+export interface PreviewSharePr { repo: string; number: number; url: string; headOid?: string | null }
+
+export interface PreviewShareViewer {
+  userId: string;
+  name: string;
+  email: string;
+  firstOpenedAt: string;
+  lastOpenedAt: string;
+  revokedAt: string | null;
+}
+
+/** A project's preview settings (GET/PUT …/preview-share-settings, 4c). */
+export interface PreviewSettingsView {
+  /** Share the PRs its owner opens automatically. */
+  prLinksEnabled: boolean;
+  /** Only PRs changing a path under one of these prefixes; empty, any. */
+  pathFilter: string[];
+  /** What reviewers sign in to the app with; null, webapp's seeded account for a webapp dev stack. */
+  reviewerAccountHint: string | null;
+  recipe: PreviewShareView['recipe'] | null;
+}
+
+/** A PR's link share as it was made or found (POST …/preview-shares/link). */
+export interface LinkShareMade {
+  id: string;
+  link: string;
+  linkPath: string;
+  expiresAt: string;
+  existing: boolean;
+  pr: PreviewSharePr;
+  comment: { state: 'posted'; url: string | null } | { state: 'kept' } | { state: 'posting' } | { state: 'failed'; error: string };
+}
+
+/** A preview share as its reviewer sees it: its state, or a 404 for anyone it isn't for. */
+export interface GuestShareView {
+  id: string;
+  owner: { name: string };
+  project: { name: string };
+  workstream: string;
+  expiresAt: string;
+  state: 'active' | 'expired' | 'revoked' | 'ended' | 'viewer-revoked' | 'workstream-gone' | 'project-archived';
+  message?: string;
+  boxStatus: string | null;
+  /** What to sign in to the app with (webapp's seeded account, or the project's own hint). */
+  signInHint?: string | null;
+  /** The share's own owner looking (Preview as guest). */
+  asOwner?: boolean;
+  /** A link share's PR, with its head commit as GitHub last said. */
+  pr?: PreviewSharePr | null;
+  /** The reviewer may wake the box (4b): the idle sweep put it to sleep, and the owner's wakes allow it. */
+  canWake?: boolean;
+}
+
+export interface SharedWithMe {
+  id: string;
+  owner: { name: string };
+  project: { name: string };
+  workstream: string;
+  expiresAt: string;
+  /** A PR's link share they opened. */
+  pr?: { repo: string; number: number } | null;
+}
+
+/** A termag user as the person picker shows them (GET /api/users/search). */
+export interface PersonMatch { email: string; displayName: string }
+
+export const usersApi = {
+  /** Up to 8 people whose email, name or username starts with `q`; [] under 2 characters. */
+  search: (q: string): Promise<PersonMatch[]> =>
+    api.get('/api/users/search', { params: { q } }).then(r => r.data.people),
+};
+
+export const previewSharesApi = {
+  create: (projectId: string, body: { email: string; workstream: string; ttlHours?: number; recipe?: PreviewShareView['recipe'] }): Promise<{ id: string; expiresAt: string; link: string; ttlHours: number; renewed?: boolean }> =>
+    api.post(`/api/projects/${projectId}/preview-shares`, body).then(r => r.data),
+  list: (projectId: string): Promise<PreviewShareView[]> =>
+    api.get(`/api/projects/${projectId}/preview-shares`).then(r => r.data.shares),
+  extend: (projectId: string, shareId: string, ttlHours: number): Promise<{ id: string; expiresAt: string }> =>
+    api.patch(`/api/projects/${projectId}/preview-shares/${shareId}`, { ttlHours }).then(r => r.data),
+  revoke: (projectId: string, shareId: string) =>
+    api.delete(`/api/projects/${projectId}/preview-shares/${shareId}`).then(r => r.data),
+  /** A PR's link share (phase 2): checked on GitHub, its link posted on the PR. */
+  createLink: (projectId: string, body: { workstream: string; repo: string; number: number }): Promise<LinkShareMade> =>
+    api.post(`/api/projects/${projectId}/preview-shares/link`, body).then(r => r.data),
+  settings: (projectId: string): Promise<PreviewSettingsView> =>
+    api.get(`/api/projects/${projectId}/preview-share-settings`).then(r => r.data),
+  saveSettings: (projectId: string, body: Partial<Omit<PreviewSettingsView, 'pathFilter'>> & { pathFilter?: string[] | string }): Promise<PreviewSettingsView> =>
+    api.put(`/api/projects/${projectId}/preview-share-settings`, body).then(r => r.data),
+  revokeViewer: (projectId: string, shareId: string, userId: string) =>
+    api.delete(`/api/projects/${projectId}/preview-shares/${shareId}/viewers/${userId}`).then(r => r.data),
+  sharedWithMe: (): Promise<SharedWithMe[]> =>
+    api.get('/api/preview-shares').then(r => r.data.shares),
+  get: (shareId: string): Promise<GuestShareView> =>
+    api.get(`/api/preview-shares/${shareId}`).then(r => r.data),
+  askWake: (shareId: string): Promise<{ ok: boolean; sent: boolean }> =>
+    api.post(`/api/preview-shares/${shareId}/ask-wake`).then(r => r.data),
+  /** Wake the box an idle sweep put to sleep (a link share's reviewer, 4b). */
+  wake: (shareId: string): Promise<{ ok: boolean; status: string }> =>
+    api.post(`/api/preview-shares/${shareId}/wake`).then(r => r.data),
+};
+
+/**
+ * The share link for a preview, as an absolute URL to paste into Slack:
+ * `/termag/p/<id>[?at=<path>]`. A link share's is its token (`linkPath`,
+ * `/p/<token>`), never its id.
+ */
+export function previewShareLink(shareId: string, at?: string | null, linkPath?: string | null): string {
+  const base = `${window.location.origin}/termag${linkPath && /^\/p\/[0-9a-f]{32}$/.test(linkPath) ? linkPath : `/p/${shareId}`}`;
+  return at ? `${base}?at=${encodeURIComponent(at)}` : base;
+}
 
 export const browserApi = {
   getSnapshot: (): Promise<{ windows: ChromeWindow[]; snapshotAt: string | null }> =>
@@ -753,10 +1093,50 @@ export const credentialsApi = {
   recheckGithub: (): Promise<void> => api.post('/api/credentials/github/recheck').then(() => undefined),
 };
 
+// MCP connectors through the termag MCP broker (backend routes/mcpConnectors.ts).
+// Every route answers 404 while mcp-broker-enabled is off.
+// Secrets are write-only: the API lists their names, never their values.
+export interface McpConnector {
+  id: string;
+  name: string;
+  upstream: string;
+  authType: 'static' | 'oauth';
+  headers: Record<string, string>;
+  // null when the stored secrets could not be read.
+  secretNames: string[] | null;
+  missingSecrets: string[];
+  brokerUrl: string | null;
+  updatedAt: string;
+  // oauth only: whether the user has signed in to the server through termag.
+  linkStatus?: 'linked' | 'needs_link';
+  linkError?: string | null;
+  oauth?: { issuer: string; scopes: string[] } | null;
+}
+export interface McpConnectorList { available: boolean; storeAvailable: boolean; connectors: McpConnector[] }
+export interface McpConnectorInput {
+  name?: string;
+  upstream?: string;
+  auth?: { type: 'static'; headers: Record<string, string> } | { type: 'oauth' };
+  // A value sets the secret; null or '' deletes it.
+  secrets?: Record<string, string | null>;
+}
+export const mcpConnectorsApi = {
+  list: (): Promise<McpConnectorList> => api.get('/api/mcp-connectors').then(r => r.data),
+  create: (input: McpConnectorInput): Promise<McpConnector> => api.post('/api/mcp-connectors', input).then(r => r.data),
+  update: (id: string, input: McpConnectorInput): Promise<McpConnector> =>
+    api.patch(`/api/mcp-connectors/${encodeURIComponent(id)}`, input).then(r => r.data),
+  remove: (id: string): Promise<void> => api.delete(`/api/mcp-connectors/${encodeURIComponent(id)}`).then(() => undefined),
+  // The server's sign-in page; the browser goes there and comes back to /settings/mcp.
+  startOAuth: (id: string): Promise<string> =>
+    api.post(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth/start`).then(r => r.data.authorizeUrl as string),
+  unlinkOAuth: (id: string): Promise<McpConnector> =>
+    api.delete(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth`).then(r => r.data),
+};
+
 // The PR pipeline (backend routes/prs.ts): the user's
 // pull requests in lanes, read from GitHub with their stored token.
 export type PrLaneId =
-  | 'in_progress' | 'needs_pr' | 'checks' | 'needs_approval' | 'needs_my_review'
+  | 'in_progress' | 'needs_pr' | 'checks' | 'needs_approval' | 'needs_my_review' | 'team_review'
   | 'ready_to_merge' | 'merged_not_deployed' | 'deployed' | 'merged';
 export interface PrWorkstreamLink { projectId: string; projectName: string; workstream: string }
 export type PrDeployState =
@@ -789,11 +1169,58 @@ export interface PrRow {
   /** How `workstream` was found: the live checkout, or a stored link (backend services/workstreamPrs.ts); absent from older backends. */
   linkedBy?: 'checkout' | 'created' | 'branch' | 'manual' | null;
   requestedAt: string | null;
+  /** The review lanes: the request names me (needs_my_review, counted) or only a team I am on (team_review); absent from older backends and other lanes. */
+  askedYou?: boolean;
   reviewTarget: PrWorkstreamLink | null;
 }
 export interface PrLane { id: PrLaneId; label: string; rows: PrRow[] }
 export interface PrCheckout { projectId: string; workstream: string; repo: string }
 export interface PrEarlier { repo: string; number: number; workstream: PrWorkstreamLink; at: string | null }
+/** A review group's member (backend services/prReviewGroups.ts GroupMember). */
+export interface PrGroupMember {
+  repo: string;
+  number: number;
+  note: string | null;
+  title: string;
+  url: string;
+  author: string | null;
+  /** unknown: GitHub could not be read; missing: no such PR the token can see. */
+  state: 'open' | 'merged' | 'closed' | 'missing' | 'unknown';
+  /** The viewer's latest submitted review: APPROVED, CHANGES_REQUESTED or COMMENTED. */
+  yourReview: string | null;
+  askedYou: boolean;
+  checked: boolean;
+  /** Its lane row when a lane lists it (inLane), else one built for the card; null when unread. */
+  row: PrRow | null;
+  inLane: boolean;
+  /** Where a review of it could run, whatever its lane (merged and yours too); absent from an older backend. */
+  pane?: PrWorkstreamLink | null;
+}
+/** A named, ordered list of PRs the user reviews together. */
+export interface PrReviewGroup {
+  id: string;
+  name: string;
+  closedAt: string | null;
+  createdAt: string;
+  members: PrGroupMember[];
+  /** Every member checked off. */
+  done: boolean;
+}
+/** A suggested review group (backend services/prGroupSuggestions.ts): PRs that look like one piece of work. */
+export interface PrGroupSuggestion {
+  /** What "Not these" sends back. */
+  key: string;
+  /** In review order. */
+  members: { repo: string; number: number; title: string; url: string; author: string | null }[];
+  /** stack: one is based on another's branch; references: their descriptions name each other. */
+  reason: 'stack' | 'references' | 'both';
+  /** Some are in this open group already: add these to it. */
+  target: { id: string; name: string } | null;
+  /** A starting name for a new group. */
+  name: string;
+}
+/** What the group routes take for a member, in review order. */
+export interface PrGroupMemberInput { repo: string; number: number; note?: string | null }
 export type PrPipelineResponse =
   | { connected: false }
   | {
@@ -814,6 +1241,12 @@ export type PrPipelineResponse =
       deferred?: PrDeferral[];
       /** Stored workstream links whose PR no lane lists (backend services/workstreamPrs.ts earlierLinks); absent from older backends. */
       earlier?: PrEarlier[];
+      /** The user's review groups, open ones first; absent from older backends. */
+      groups?: PrReviewGroup[];
+      /** Set when the groups' members could not be read from GitHub: the cards show what is stored. */
+      groupsError?: string;
+      /** Suggested review groups; absent from older backends, empty with the flag off. */
+      suggestions?: PrGroupSuggestion[];
     };
 /** A row put off until `until` (ISO): out of "Needs you" and the PRs tile till then. */
 export interface PrDeferral { key: string; until: string }
@@ -882,7 +1315,9 @@ const prPath = (repo: string, number: number) => {
   return `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${number}`;
 };
 export const prsApi = {
-  list: (): Promise<PrPipelineResponse> => api.get('/api/prs').then(r => r.data),
+  // `poll=1`: the pipeline poll, left out of network recording
+  // (observability.ts NETWORK_URL_BLOCKLIST); /api/prs/... actions stay recorded.
+  list: (): Promise<PrPipelineResponse> => api.get('/api/prs', { params: { poll: 1 } }).then(r => r.data),
   /** Bakes main's orchestrator image; the bake deploys itself (publish-ami.yml). */
   bake: (): Promise<{ ok: true; workflowUrl: string }> => api.post('/api/prs/bake').then(r => r.data),
   /** Defers a row (its rowParam key) for `days`; deferring a deferred row adds the days to its end. */
@@ -893,8 +1328,20 @@ export const prsApi = {
   link: (repo: string, number: number, projectId: string, workstream: string): Promise<{ ok: true }> =>
     api.put('/api/prs/links', { repo, number, projectId, workstream }).then(r => r.data),
   /** A new workstream on the PR's own branch, attached to it (the agent checks out pull/<n>/head, or adopts its worktree). */
-  newWorkstream: (repo: string, number: number, projectId: string, name: string): Promise<{ id: string; name: string; branch: string; sessionLaunchWarnings?: string[] }> =>
-    api.post(`${prPath(repo, number)}/workstream`, { projectId, name }, { timeout: 630_000 }).then(r => r.data),
+  newWorkstream: (repo: string, number: number, projectId: string, name: string, prompt?: string): Promise<{ id: string; name: string; branch: string; sessionLaunchWarnings?: string[] }> =>
+    api.post(`${prPath(repo, number)}/workstream`, { projectId, name, ...(prompt?.trim() ? { prompt } : {}) }, { timeout: 630_000 }).then(r => r.data),
+  /** A new review group, its members in review order (each checked against GitHub). */
+  createGroup: (name: string, members: PrGroupMemberInput[] = []): Promise<{ id: string }> =>
+    api.post('/api/prs/groups', { name, members }).then(r => r.data),
+  /** Renames, closes or reopens one of the user's groups. */
+  updateGroup: (id: string, patch: { name?: string; closed?: boolean }): Promise<{ ok: true }> =>
+    api.patch(`/api/prs/groups/${encodeURIComponent(id)}`, patch).then(r => r.data),
+  /** Replaces a group's members with this ordered list (a new one is checked against GitHub). */
+  setGroupMembers: (id: string, members: PrGroupMemberInput[]): Promise<{ ok: true }> =>
+    api.put(`/api/prs/groups/${encodeURIComponent(id)}/members`, { members }).then(r => r.data),
+  deleteGroup: (id: string): Promise<void> => api.delete(`/api/prs/groups/${encodeURIComponent(id)}`).then(() => undefined),
+  /** "Not these" on a suggested group: it stays away until its set of PRs changes. */
+  dismissSuggestion: (key: string): Promise<void> => api.post('/api/prs/group-suggestions/dismiss', { key }).then(() => undefined),
   /** Drops a PR's stored workstream link. */
   unlink: (repo: string, number: number): Promise<void> => api.delete('/api/prs/links', { params: { repo, number } }).then(() => undefined),
   overview: (repo: string, number: number): Promise<PrOverview> => api.get(prPath(repo, number)).then(r => r.data),
@@ -918,22 +1365,38 @@ export const prsApi = {
 // ── Daily briefing ──────────────────────────────────
 // Mirrors backend/src/services/briefing/types.ts.
 
+export type BriefingKind = 'question' | 'decision' | 'action' | 'blocked';
+
+/** Version 2 (the backend reads older rows as this shape too). */
 export interface BriefingContent {
-  summary: string;
-  carryovers: Array<{
+  version: 2;
+  headline: string;
+  workedOn: Array<{ projectId: string | null; workstream: string | null; text: string; prs: string[] }>;
+  leftOpen: Array<{
+    /** What Done and Defer name; null when the item names no session or PR. */
+    key: string | null;
     projectId: string | null;
     workstream: string | null;
-    kind: 'question' | 'decision' | 'action' | 'blocked';
+    kind: BriefingKind;
     title: string;
     detail: string;
     evidence: 'transcript' | 'todo' | 'status' | 'pr' | 'git' | 'cloud' | 'pane';
+    /** "owner/name#123". */
+    pr: string | null;
   }>;
-  suggestions: Array<{
-    projectId: string | null;
-    workstream: string | null;
-    text: string;
-    why: string;
-  }>;
+  workBetter: Array<{ key: string; projectId: string | null; workstream: string | null; text: string; why: string }>;
+}
+
+export interface BriefingCharts {
+  days: Array<{ day: string; humanMs: number; agentMs: number; tokens: number }>;
+  projects: Array<{ projectId: string; name: string; humanMs: number; agentMs: number }>;
+}
+
+export interface BriefingDismissal {
+  key: string;
+  kind: 'done' | 'defer';
+  until: string;
+  createdAt: string;
 }
 
 export interface LedgerTotals {
@@ -960,6 +1423,8 @@ export interface BriefingView {
   boxName: string | null;
   content: BriefingContent | null;
   stats: LedgerTotals | null;
+  /** Null on briefings written before the charts. */
+  charts: BriefingCharts | null;
   projects: Record<string, { name: string; archived: boolean }>;
   createdAt: string;
   finishedAt: string | null;
@@ -970,6 +1435,8 @@ export interface BriefingLatest {
   latest: BriefingView | null;
   /** Newest row newer than `latest` that is running, failed or skipped. */
   pending: BriefingView | null;
+  /** Done / Defer marks still running; absent from older backends. */
+  dismissals?: BriefingDismissal[];
 }
 
 export interface BriefingSchedule {
@@ -982,6 +1449,90 @@ export interface BriefingSchedule {
   slackDm: boolean;
 }
 
+// Automations (backend routes/automations.ts): a project
+// whose prompt a fresh agent runs on a cron schedule, each run a workstream
+// and one chat-runner turn. Writes answer 403 automations_disabled while the
+// automations-enabled flag is off for the owner and box.
+export interface AutomationRunView {
+  id: string;
+  automationId: string;
+  trigger: 'schedule' | 'manual' | string;
+  scheduledFor: string;
+  state: 'pending' | 'running' | 'done' | 'blocked' | 'needs_input' | 'failed' | 'skipped' | string;
+  reason: string | null;
+  reasonLabel: string | null;
+  workstreamId: string | null;
+  workstream: string | null;
+  instanceId: string | null;
+  chatSessionId: string | null;
+  summary: string | null;
+  branch: string | null;
+  prUrl: string | null;
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  commitsAhead: number | null;
+  pushed: boolean | null;
+  dirty: boolean | null;
+  changesLabel: string | null;
+  reportedAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  retiredAt: string | null;
+  createdAt: string;
+  durationSec: number | null;
+}
+export interface AutomationView {
+  id: string;
+  projectId: string;
+  projectName: string;
+  instanceId: string | null;
+  repoUrl: string | null;
+  defaultBranch: string | null;
+  schedule: string;
+  timezone: string;
+  prompt: string;
+  tier: 'full' | 'read' | string;
+  enabled: boolean;
+  prOnChange: boolean;
+  wakeBox: boolean;
+  maxRunMinutes: number;
+  keepRuns: number;
+  spaceName: string | null;
+  notifySlack: boolean;
+  pausedReason: string | null;
+  consecutiveFailures: number;
+  nextRunAt: string | null;
+  next: string[];
+  lastRun: AutomationRunView | null;
+  createdAt: string;
+  updatedAt: string;
+  owner: boolean;
+  archived: boolean;
+}
+export interface AutomationSettings {
+  schedule?: string; timezone?: string; prompt?: string; tier?: 'full' | 'read'; enabled?: boolean; prOnChange?: boolean;
+  wakeBox?: boolean; notifySlack?: boolean; maxRunMinutes?: number; keepRuns?: number; spaceName?: string | null;
+}
+export interface SchedulePreview {
+  normalised: string; timezone: string; next: string[]; minGapMinutes: number | null; tooFrequent: number | null; keepsBoxUpMinutesPerDay: number | null;
+}
+export const automationsApi = {
+  list: (): Promise<AutomationView[]> => api.get('/api/automations').then(r => r.data),
+  get: (id: string): Promise<AutomationView & { runs: AutomationRunView[] }> => api.get(`/api/automations/${encodeURIComponent(id)}`).then(r => r.data),
+  create: (data: AutomationSettings & { name: string; instanceId: string; repoUrl?: string | null; defaultBranch?: string | null; replaySessionId?: string | null; claudeModel?: 'opus' | 'sonnet' | 'haiku' | null; backend?: 'fireworks'; model?: string }):
+    Promise<{ project: Project; automation: AutomationView; next: string[] }> => api.post('/api/automations', data).then(r => r.data),
+  preview: (data: { schedule: string; timezone: string; wakeBox?: boolean; maxRunMinutes?: number }): Promise<SchedulePreview> =>
+    api.post('/api/automations/preview', data).then(r => r.data),
+  update: (id: string, data: AutomationSettings): Promise<AutomationView> => api.patch(`/api/automations/${encodeURIComponent(id)}`, data).then(r => r.data),
+  runNow: (id: string): Promise<{ run: AutomationRunView | null; decision: { kind: string; reason?: string } }> => api.post(`/api/automations/${encodeURIComponent(id)}/run`).then(r => r.data),
+  stopRun: (id: string, runId: string): Promise<{ ok: boolean }> => api.post(`/api/automations/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/stop`).then(r => r.data),
+  /** runId: the run's id, or its workstream's. */
+  retireRun: (id: string, runId: string): Promise<{ ok: boolean }> => api.post(`/api/automations/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/retire`).then(r => r.data),
+  memory: (id: string): Promise<{ path: string; content: string | null }> => api.get(`/api/automations/${encodeURIComponent(id)}/memory`).then(r => r.data),
+  remove: (id: string): Promise<unknown> => api.delete(`/api/automations/${encodeURIComponent(id)}`).then(r => r.data),
+};
+
 export const briefingsApi = {
   latest: (): Promise<BriefingLatest> => api.get('/api/briefings/latest').then(r => r.data),
   list: (limit = 20): Promise<{ briefings: BriefingView[] }> =>
@@ -990,10 +1541,13 @@ export const briefingsApi = {
   schedule: (): Promise<BriefingSchedule> => api.get('/api/briefings/schedule').then(r => r.data),
   saveSchedule: (s: BriefingSchedule): Promise<BriefingSchedule> =>
     api.put('/api/briefings/schedule', s).then(r => r.data),
+  dismiss: (key: string, action: 'done' | 'defer'): Promise<BriefingDismissal> =>
+    api.put('/api/briefings/dismissals', { key, action }).then(r => r.data),
+  restore: (key: string): Promise<void> => api.delete('/api/briefings/dismissals', { params: { key } }).then(() => undefined),
 };
 
-// Spaces: shared file stores across boxes (backend routes/spaces.ts,
-// docs/spaces.md). Every route answers 404 while the spaces-enabled flag is
+// Spaces: shared file stores across boxes (backend routes/spaces.ts).
+// Every route answers 404 while the spaces-enabled flag is
 // off for the user. Bytes never pass through here: these return presigned S3
 // URLs that the browser uses directly.
 export interface SpaceView {
@@ -1032,6 +1586,9 @@ export interface SpaceEvent {
   via: string | null;
 }
 export interface SpaceSignedUrl { url: string; expiresAt: string; size: number; contentType: string | null }
+/** How the file view shows a file (backend spacePaths.viewResponseHeaders). */
+export type SpaceViewRender = 'frame' | 'markdown' | 'html' | 'svg';
+export interface SpaceViewUrl extends SpaceSignedUrl { view: { contentType: string; render: SpaceViewRender } | null }
 export type SpaceUploadStart =
   | { kind: 'single'; path: string; method: 'PUT'; url: string; headers: Record<string, string>; expiresAt: string }
   | { kind: 'multipart'; path: string; uploadId: string; partBytes: number; partCount: number };
@@ -1063,10 +1620,13 @@ export const spacesApi = {
   removeBox: (space: string, instanceId: string): Promise<{ ok: true }> =>
     api.delete(`${sp(space)}/boxes/${encodeURIComponent(instanceId)}`).then(r => r.data),
 
-  tree: (space: string, prefix: string, cursor?: string | null): Promise<SpaceTree> =>
-    api.get(`${sp(space)}/tree`, { params: { prefix, ...(cursor ? { cursor } : {}) } }).then(r => r.data),
+  tree: (space: string, prefix: string, cursor?: string | null, recursive = false): Promise<SpaceTree> =>
+    api.get(`${sp(space)}/tree`, { params: { prefix, ...(cursor ? { cursor } : {}), ...(recursive ? { recursive: '1' } : {}) } }).then(r => r.data),
   download: (space: string, path: string, inline = false): Promise<SpaceSignedUrl> =>
     api.post(`${sp(space)}/files/download`, { path, inline }).then(r => r.data),
+  /** A 30-minute URL for the file viewer's iframe; `view` is null when the browser has no viewer for the type. */
+  view: (space: string, path: string): Promise<SpaceViewUrl> =>
+    api.post(`${sp(space)}/files/download`, { path, view: true }).then(r => r.data),
   startUpload: (space: string, path: string, size: number, contentType: string): Promise<SpaceUploadStart> =>
     api.post(`${sp(space)}/files/upload`, { path, size, contentType }).then(r => r.data),
   uploaded: (space: string, path: string): Promise<{ ok: true; size: number }> =>

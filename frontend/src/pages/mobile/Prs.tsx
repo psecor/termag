@@ -9,21 +9,31 @@
 // Review with Devin, which starts the review pane and lands on its tab. The Not deployed lane carries the dashboard's bake stage and Bake &
 // deploy now. Defer a day puts a row off as the overlay's does: it sinks to
 // the foot of its lane, marked, and leaves the inbox's PR count.
+//
+// Review groups (pr-review-groups-enabled):
+//  each open group is a folded card at the top of My review, whose
+// grouped rows then show only in it; elsewhere a grouped row's line names its
+// place ("Desktop bridge 2/5"). A row's ⋯ offers Add to group…, and the card
+// Review next and Review all with Devin.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { prsApi, reviewApi, type PrLaneId, type PrRow, type PrWorkstreamLink } from '../../services/api';
+import { prsApi, reviewApi, type PrGroupMember, type PrGroupSuggestion, type PrLaneId, type PrReviewGroup, type PrRow, type PrWorkstreamLink } from '../../services/api';
+import { FLAGS, useFlag } from '../../flags';
+import { groupKey, groupPill, groupPlaces, groupReviewBody, groupReviewPlan, memberInputs, memberLabel, openGroups, suggestionsOf } from '../../utils/prReviewGroups';
+import { AddToGroupSheet, MobileGroupCard, MobileSuggestionRow, SuggestionSheet } from './PrGroups';
 import { usePolled } from '../dashboard/useDashboardData';
 import { fmtAge } from '../../utils/format';
 import {
   ACTIONABLE, PHONE_LANE_ORDER, bakePending, compareUrl, hasOverview, deferrals, deferredText, deployStage, firstNonEmpty, laneTabLabel, lanesOf, rowAction,
-  rowDetail, rowKey, rowLabel, rowParam,
+  isReviewLane, rowDetail, rowKey, rowLabel, rowParam,
 } from '../../utils/prPipeline';
 import { PrOverviewDialog } from '../dashboard/PrOverviewDialog';
 import { ActionSheet, ConfirmSheet, apiError, type SheetAction } from './Sheet';
+import { PullScroll } from './PullScroll';
 
 // Geometric Shapes only: phone fonts lack the rarer symbols (⧗ drew as tofu).
 const LANE_GLYPH: Record<PrLaneId, string> = {
-  in_progress: '◇', needs_pr: '△', checks: '◌', needs_approval: '○', needs_my_review: '◉',
+  in_progress: '◇', needs_pr: '△', checks: '◌', needs_approval: '○', needs_my_review: '◉', team_review: '◎',
   ready_to_merge: '✓', merged_not_deployed: '▷', deployed: '●', merged: '●',
 };
 
@@ -59,6 +69,17 @@ export function Prs() {
   const closeOverview = useCallback(() => setOverview(null), []);
   const closeMenu = useCallback(() => setMenu(null), []);
   const closeConfirm = useCallback(() => setConfirm(null), []);
+  const groupsOn = useFlag(FLAGS.prReviewGroups, false);
+  const [addTo, setAddTo] = useState<PrRow | null>(null);
+  // By id: the confirm reads the group from each new answer, so a refresh that checks its last member off is seen.
+  const [confirmGroupId, setConfirmGroupId] = useState<string | null>(null);
+  // The ⋯ of a member GitHub could not read (no row, so no row action sheet).
+  const [bareMenu, setBareMenu] = useState<{ group: PrReviewGroup; member: PrGroupMember } | null>(null);
+  const closeBareMenu = useCallback(() => setBareMenu(null), []);
+  const [suggestion, setSuggestion] = useState<PrGroupSuggestion | null>(null);
+  const closeSuggestion = useCallback(() => setSuggestion(null), []);
+  const closeAddTo = useCallback(() => setAddTo(null), []);
+  const closeConfirmGroup = useCallback(() => setConfirmGroupId(null), []);
   const now = Date.now();
 
   const lanes = lanesOf(prs.data);
@@ -72,7 +93,12 @@ export function Prs() {
     next.set('lane', id);
     setParams(next, { replace: true });
   };
-  const laneRows = lanes.find(l => l.id === selected)?.rows ?? [];
+  // Review groups: their cards head My review, which then leaves grouped rows to them.
+  const places = groupsOn ? groupPlaces(prs.data) : new Map<string, never>();
+  const cards = groupsOn && selected === 'needs_my_review' ? openGroups(prs.data) : [];
+  const suggested = groupsOn && selected === 'needs_my_review' ? suggestionsOf(prs.data) : [];
+  const viewer = prs.data?.connected ? prs.data.viewer : null;
+  const laneRows = (lanes.find(l => l.id === selected)?.rows ?? []).filter(r => cards.length === 0 || !places.has(groupKey(r) ?? ''));
   // Deferred rows last, in their own order.
   const rows = [...laneRows.filter(r => !deferred.has(rowParam(r))), ...laneRows.filter(r => deferred.has(rowParam(r)))];
   // Nine tabs overflow a phone: keep the selected one on screen.
@@ -87,6 +113,39 @@ export function Prs() {
       navigate(conversationHref(t, 'review'));
     } catch (err) {
       setActionError(apiError(err, 'Could not start the review'));
+    }
+  };
+
+  const openMember = (m: PrGroupMember) => {
+    if (m.row && hasOverview(m.row)) setOverview(m.row);
+    else window.open(m.url, '_blank', 'noopener');
+  };
+  // One Devin session over the members left to review, in order, landing on its review tab.
+  const startGroupReview = async (g: PrReviewGroup) => {
+    const plan = groupReviewPlan(g, viewer);
+    if ('reason' in plan) { setActionError(plan.reason); return; }
+    const [first] = plan.members;
+    setActionError('');
+    try {
+      await reviewApi.start(plan.target.projectId, { workstream: plan.target.workstream, pr: first.number, url: first.url, group: groupReviewBody(g, plan.members) });
+      navigate(conversationHref(plan.target, 'review'));
+    } catch (err) {
+      setActionError(apiError(err, 'Could not start the review'));
+    }
+  };
+  const confirmGroup = confirmGroupId ? openGroups(prs.data).find(g => g.id === confirmGroupId) ?? null : null;
+  const confirmPlan = confirmGroup ? groupReviewPlan(confirmGroup, viewer) : confirmGroupId ? { reason: 'The group is gone' } : null;
+  // A refresh that leaves nothing to start (the last member checked off): drop the confirm and say why, not a sheet that never shows (Devin, #668).
+  const planReason = confirmPlan && 'reason' in confirmPlan ? confirmPlan.reason : null;
+  useEffect(() => {
+    if (planReason) { setConfirmGroupId(null); setActionError(planReason); }
+  }, [planReason]);
+  const takeOut = async (g: PrReviewGroup, m: PrGroupMember) => {
+    try {
+      await prsApi.setGroupMembers(g.id, memberInputs(g.members.filter(x => x !== m)));
+      prs.refresh();
+    } catch (err) {
+      setActionError(apiError(err, 'Could not take it out of the group'));
     }
   };
 
@@ -120,7 +179,11 @@ export function Prs() {
     if (compare) out.push({ label: 'Open a PR on GitHub', onClick: () => { window.open(compare, '_blank', 'noopener'); } });
     if (r.url) out.push({ label: 'Open on GitHub', onClick: () => { window.open(r.url!, '_blank', 'noopener'); } });
     if (r.workstream) out.push({ label: `Open conversation · ${wsLabel(r.workstream)}`, onClick: () => navigate(conversationHref(r.workstream!)) });
-    if (r.lane === 'needs_my_review' && r.reviewTarget) out.push({ label: 'Review with Devin…', onClick: () => setConfirm(r) });
+    if (isReviewLane(r.lane) && r.reviewTarget) out.push({ label: 'Review with Devin…', onClick: () => setConfirm(r) });
+    if (groupsOn && r.kind === 'pr') {
+      const place = places.get(groupKey(r) ?? '');
+      out.push({ label: place ? `Review group: ${groupPill(place)}…` : 'Add to group…', onClick: () => setAddTo(r) });
+    }
     const isDeferred = deferred.has(rowParam(r));
     out.push({ label: isDeferred ? 'Defer another day' : 'Defer a day', onClick: () => { void defer(r, false); } });
     if (isDeferred) out.push({ label: 'Bring back', onClick: () => { void defer(r, true); } });
@@ -168,7 +231,7 @@ export function Prs() {
           })}
         </nav>
       )}
-      <main className="m-scroll" role="tabpanel">
+      <PullScroll role="tabpanel" onRefresh={prs.refresh}>
         {notConnected && (
           <div className="m-empty">Connect GitHub in <Link className="m-link" to="/settings">Settings</Link> to list your pull requests.</div>
         )}
@@ -180,7 +243,18 @@ export function Prs() {
             {baking && ' Bake started; it shows here within a minute.'}
           </div>
         )}
-        {!notConnected && prs.data && rows.length === 0 && (
+        {suggested.length > 0 && (
+          <ul className="m-list">
+            {suggested.map(sg => <MobileSuggestionRow key={sg.key} suggestion={sg} onOpen={setSuggestion} />)}
+          </ul>
+        )}
+        {cards.length > 0 && (
+          <ul className="m-list">
+            {cards.map(g => <MobileGroupCard key={g.id} group={g} viewer={viewer} now={now} onOpen={openMember} onMenu={setMenu}
+              onBareMenu={(group, member) => setBareMenu({ group, member })} onReviewAll={g => setConfirmGroupId(g.id)} />)}
+          </ul>
+        )}
+        {!notConnected && prs.data && rows.length === 0 && cards.length === 0 && suggested.length === 0 && (
           <div className="m-empty">Nothing in {lanes.find(l => l.id === selected)?.label ?? 'this lane'}.</div>
         )}
         {rows.length > 0 && (
@@ -194,7 +268,10 @@ export function Prs() {
                     <span className="m-glyph m-pr-glyph" data-lane={r.lane} aria-hidden>{LANE_GLYPH[r.lane]}</span>
                     <span className="m-row-main">
                       <span className="m-row-title">{r.kind === 'pr' ? r.title : r.headRefName}</span>
-                      <span className="m-row-preview">{rowLabel(r)} · {until !== undefined ? deferredText(until, now) : rowDetail(r, now)}</span>
+                      <span className="m-row-preview">
+                        {rowLabel(r)} · {until !== undefined ? deferredText(until, now) : rowDetail(r, now)}
+                        {groupPill(places.get(groupKey(r) ?? '')) && <span className="m-prg-pill"> · {groupPill(places.get(groupKey(r) ?? ''))}</span>}
+                      </span>
                     </span>
                     <span className="m-row-side">
                       <span className="m-row-badges">
@@ -210,9 +287,29 @@ export function Prs() {
           </ul>
         )}
         {prs.data?.connected && prs.data.notes.map(n => <div key={n} className="m-form-note m-pr-note">{n}</div>)}
-      </main>
+      </PullScroll>
       {menu && (
         <ActionSheet title={`${rowLabel(menu)}${menu.kind === 'pr' ? ` · ${menu.title}` : ''}`} actions={actionsFor(menu)} onClose={closeMenu} />
+      )}
+      {suggestion && (
+        <SuggestionSheet suggestion={suggestion} groups={openGroups(prs.data)} onClose={closeSuggestion} onChanged={prs.refresh} onError={setActionError} />
+      )}
+      {bareMenu && (
+        <ActionSheet title={`${memberLabel(bareMenu.member)} · ${bareMenu.member.title || 'not read from GitHub'}`} onClose={closeBareMenu} actions={[
+          { label: 'Open on GitHub', onClick: () => { window.open(bareMenu.member.url, '_blank', 'noopener'); } },
+          { label: `Take it out of ${bareMenu.group.name}`, danger: true, onClick: () => { void takeOut(bareMenu.group, bareMenu.member); } },
+        ]} />
+      )}
+      {addTo && (
+        <AddToGroupSheet row={addTo} groups={openGroups(prs.data)} onClose={closeAddTo} onChanged={prs.refresh} onError={setActionError} />
+      )}
+      {confirmGroup && confirmPlan && 'members' in confirmPlan && (
+        <ConfirmSheet
+          message={<>Start one Devin review of the {confirmPlan.members.length} PR{confirmPlan.members.length === 1 ? '' : 's'} left in <strong>{confirmGroup.name}</strong> ({confirmPlan.members.map(memberLabel).join(', ')}), in order, in <strong>{wsLabel(confirmPlan.target)}</strong>? It reviews each, then what spans them. A review already running there is replaced.</>}
+          confirmLabel="Start review"
+          onConfirm={() => { void startGroupReview(confirmGroup); }}
+          onClose={closeConfirmGroup}
+        />
       )}
       {overview && <PrOverviewDialog row={overview} now={now} layout="sheet" onClose={closeOverview} onChanged={prs.refresh} />}
       {confirmBake && (

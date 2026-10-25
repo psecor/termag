@@ -2,10 +2,13 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useProjects } from '../contexts/ProjectContext';
-import { credentialsApi, instancesApi, projectsApi, warmPoolApi, ProjectTemplateInfo, WarmPoolStatus } from '../services/api';
+import { automationsApi, credentialsApi, instancesApi, projectsApi, warmPoolApi, ProjectTemplateInfo, WarmPoolStatus } from '../services/api';
+import { AutomationFields, draftBody, draftCron, emptyDraft, type AutomationDraft } from './AutomationFields';
 import { CONNECT_GITHUB_TO_ADD_BOX, blocksManagedBox, type BoxGateState } from '../boxGate';
 import type { Instance, Project } from '../types';
 import { PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider } from '../providers/registry';
+import { useBackendChoices } from '../providers/useBackendChoices';
+import { BackendModelFields, offeredChoice } from './BackendModelFields';
 import { boxFeed } from '../services/boxFeed';
 import { noteAddBoxClick, noteBoxClaimed, notePickerMounted, notePickerSubmitted, noteProjectCreated } from '../services/claimTiming';
 import { FLAGS, useFlag } from '../flags';
@@ -47,8 +50,17 @@ const CUSTOM = '__custom__';
 const NEW_BOX = '__new__';
 const THIS_HOST = '__host__';
 
+/** What the form creates: a project, or an automation, a project the scheduler runs. */
+export type NewProjectMode = 'project' | 'automation';
+
 export interface NewProjectFormProps {
   onCreated: (project: Project) => void | Promise<void>;
+  /**
+   * `automation`: the repository, name and box fields stay; the agent is
+   * fixed (Claude in the chat runner) and the schedule, prompt and run
+   * settings appear; submit posts to /api/automations.
+   */
+  mode?: NewProjectMode;
   submitLabel?: string;
   /** Rendered before the submit button: Cancel, "Finish without a project". */
   actions?: React.ReactNode;
@@ -81,7 +93,11 @@ function apiError(err: unknown, fallback: string): string {
 
 function status(s: string): string { return s.replace('-', ' '); }
 
-export function NewProjectForm({ onCreated, submitLabel = 'Create project', actions, autoFocus, onGithubRequired, initialBoxId, onBranchOff }: NewProjectFormProps) {
+export function NewProjectForm({ onCreated, submitLabel = 'Create project', actions, autoFocus, onGithubRequired, initialBoxId, onBranchOff, mode = 'project' }: NewProjectFormProps) {
+  const automation = mode === 'automation';
+  const [draft, setDraft] = useState<AutomationDraft>(emptyDraft);
+  // The full tier is the owner's trust tick (it sets chatTrustedAt): Create waits for the checkbox AutomationFields shows for it.
+  const [fullTierTicked, setFullTierTicked] = useState(false);
   const { user } = useAuth();
   const { projects: contextProjects } = useProjects();
   const isAdmin = user?.role === 'admin';
@@ -153,6 +169,13 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   // a new project: fall back to the first selectable provider.
   const [provider, setProvider] = useState<string>(() =>
     isSelectableProvider(user?.defaultAgentProvider) ? user!.defaultAgentProvider : SELECTABLE_PROVIDER_IDS[0]);
+  // The model backend the agent runs on and the model it starts on;
+  // null is the default. Both go back to the default
+  // whenever the agent changes.
+  const backendChoices = useBackendChoices(provider);
+  const [backend, setBackend] = useState<string | null>(null);
+  const [model, setModel] = useState<string | null>(null);
+  const chosen = offeredChoice(backendChoices, backend, model);
 
   // ── Box ─────────────────────────────────────────────────────────────────
   const allBoxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
@@ -238,6 +261,10 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   }, [warmPoolEnabled, choice]);
 
   /** The new box, or null with the reason shown. */
+  // Whether the box this submit created came from the warm pool, for the
+  // project.created event's warmClaimed (backend services/productEvents.ts).
+  const lastBoxClaimed = useRef<boolean | null>(null);
+
   async function createBox(boxName = newBoxName.trim()): Promise<Instance | null> {
     if (!boxName || boxBusy || boxNameError || addBoxBlocked) return null;
     setBoxBusy(true); setBoxError(''); setBoxHint('');
@@ -248,6 +275,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       // already ready and the form should say so at once; a provisioning one
       // starts the feed polling.
       if (r.claimed) noteBoxClaimed(r.instance.id);
+      lastBoxClaimed.current = !!r.claimed;
       boxFeed.upsert(r.instance);
       // Stay on this box if the project create is refused, instead of
       // provisioning another one on the next submit.
@@ -277,7 +305,9 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const body = createBody(pick);
   const newBoxOk = choice === NEW_BOX && !!newBoxName.trim() && !boxNameError && !addBoxBlocked && !conflictError && !nameError;
   const retryOk = boxAdvice === 'try-again' && !addBoxBlocked;
-  const canSubmit = !busy && !nameError && (boxReady || boxBooting || newBoxOk || retryOk) && !!name.trim() && body !== null;
+  const automationOk = !automation || (!!draft.prompt.trim() && draftCron(draft) !== null && !!draft.timezone && (draft.tier !== 'full' || fullTierTicked));
+  // An automation runs on a box (the chat runner needs one): "this host" is not offered.
+  const canSubmit = !busy && !nameError && (boxReady || boxBooting || newBoxOk || retryOk) && !!name.trim() && body !== null && automationOk && !(automation && choice === THIS_HOST);
   const matches = !choice || choice === NEW_BOX
     ? []
     : sameRepoMatches(pick, projects, choice === THIS_HOST ? null : choice);
@@ -287,25 +317,42 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
     if (!canSubmit || !body) return;
     setBusy(true); setError('');
     let instanceId = choice === THIS_HOST ? null : chosenBox?.id ?? null;
+    let warmClaimed: boolean | undefined;
     if (choice === NEW_BOX || (retryOk && chosenBox)) {
       // The box is chosen from here on, so a refused project is retried on
       // it rather than on a second new box; a failed one is launched again
       // under its own name.
+      lastBoxClaimed.current = null;
       const box = await createBox(choice === NEW_BOX ? undefined : chosenBox?.name);
       if (!box) { setBusy(false); return; }
       instanceId = box.id;
+      warmClaimed = lastBoxClaimed.current ?? undefined;
     }
     if (pickerOn && instanceId) notePickerSubmitted(instanceId);
     let project: Project;
     try {
-      project = await projectsApi.create({
-        name: name.trim(),
-        instanceId,
-        initialAgent: { enabled: true, provider },
-        // The replay this tab is recording: the Claude session's spans are filed under it.
-        replaySessionId: await replaySessionId(),
-        ...body,
-      });
+      if (automation) {
+        if (!instanceId) { setError('An automation runs on a box'); setBusy(false); return; }
+        const created = await automationsApi.create({
+          name: name.trim(),
+          instanceId,
+          repoUrl: body.repoUrl ?? null,
+          defaultBranch: 'defaultBranch' in body ? body.defaultBranch ?? null : null,
+          replaySessionId: await replaySessionId(),
+          ...draftBody(draft),
+        });
+        project = created.project;
+      } else {
+        project = await projectsApi.create({
+          name: name.trim(),
+          instanceId,
+          initialAgent: { enabled: true, provider, ...(chosen.backend && { backend: chosen.backend }), ...(chosen.model && { model: chosen.model }) },
+          // The replay this tab is recording: the Claude session's spans are filed under it.
+          replaySessionId: await replaySessionId(),
+          ...(warmClaimed !== undefined && { warmClaimed }),
+          ...body,
+        });
+      }
     } catch (err) {
       if (isBoxFailedRefusal(err)) {
         // The launch failed before the project was asked for: the box line
@@ -368,12 +415,29 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
                 />
               </div>
             )}
-            <div className="npf-field">
-              <label htmlFor="npf-provider">Agent</label>
-              <select id="npf-provider" value={provider} onChange={e => setProvider(e.target.value)}>
-                {SELECTABLE_PROVIDER_IDS.map(id => <option key={id} value={id}>{PROVIDERS[id]?.displayName ?? id}</option>)}
-              </select>
-            </div>
+            {automation ? (
+              <div className="npf-field">
+                <label>Agent</label>
+                <span className="npf-static">Claude, headless, in the chat runner</span>
+              </div>
+            ) : (
+              <div className="npf-field">
+                <label htmlFor="npf-provider">Agent</label>
+                <select id="npf-provider" value={provider} onChange={e => { setProvider(e.target.value); setBackend(null); setModel(null); }}>
+                  {SELECTABLE_PROVIDER_IDS.map(id => <option key={id} value={id}>{PROVIDERS[id]?.displayName ?? id}</option>)}
+                </select>
+              </div>
+            )}
+            {!automation && (
+              <BackendModelFields
+                idPrefix="npf"
+                choices={backendChoices}
+                backend={chosen.backend}
+                model={chosen.model}
+                onBackend={setBackend}
+                onModel={setModel}
+              />
+            )}
             <div className="npf-field">
               <label htmlFor="npf-box">Box</label>
               <select id="npf-box" value={choice} disabled={!boxesLoaded} onChange={e => { boxChoiceTouched.current = true; setBoxChoice(e.target.value); setBoxError(''); setBoxHint(''); setError(''); }}>
@@ -388,7 +452,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
                   <option value={choice}>that box is gone; pick another</option>
                 )}
                 <option value={NEW_BOX}>{boxes.length ? 'a new box…' : 'a new box (none yet)…'}</option>
-                {isAdmin && <option value={THIS_HOST}>this host (admin)</option>}
+                {isAdmin && !automation && <option value={THIS_HOST}>this host (admin)</option>}
               </select>
             </div>
             {choice === NEW_BOX && (
@@ -471,15 +535,24 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
           {onBranchOff && <button type="button" className="btn-ghost" onClick={() => onBranchOff(project.id)}>Branch off instead</button>}
         </div>
       ))}
+      {automation && <AutomationFields draft={draft} onChange={setDraft} showEnabled idPrefix="npf-af" onFullTierTick={setFullTierTicked} />}
       <div className="usage-dim npf-note">
-        {body?.repoUrl
-          ? <>The repo is fetched in the agent pane first, so you can watch it; the agent starts when the checkout is done.</>
-          : <>An empty project with a seeded AGENTS.md and CLAUDE.md.</>}
+        {automation
+          ? <>Each run gets its own branch under this project and shows up as a conversation in the simple UI. Nothing runs until the schedule's first occurrence; use Run now on the automation to try it.</>
+          : body?.repoUrl
+            ? <>The repo is fetched in the agent pane first, so you can watch it; the agent starts when the checkout is done.</>
+            : <>An empty project with a seeded AGENTS.md and CLAUDE.md.</>}
       </div>
       {error && <div className="error-text">{error}</div>}
       <div className="npf-actions">
         {actions}
-        <button type="submit" className="btn-primary" disabled={!canSubmit} title={conflictError || (choice === NEW_BOX && addBoxBlocked ? CONNECT_GITHUB_TO_ADD_BOX : undefined)}>
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={!canSubmit}
+          data-analytics={choice === NEW_BOX ? 'add-box' : 'new-project-create'}
+          title={conflictError || (choice === NEW_BOX && addBoxBlocked ? CONNECT_GITHUB_TO_ADD_BOX : undefined)}
+        >
           {boxBusy ? 'Creating box…' : busy ? 'Creating…' : retryOk ? 'Try again' : matches.length > 0 ? 'Create a second checkout' : submitLabel}
         </button>
       </div>

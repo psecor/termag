@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  agentUp, bootEstimateMinutes, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, newChatNames, preLaunchTail, readQueued,
-  releaseQueued, setupComplete, setupSteps, showSetup, uniqueName, writeQueued, type SetupInput,
+  agentUp, bootEstimateMinutes, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, newChatNames, orchestratorOption, preLaunchTail,
+  readLastStart, readQueued, releaseQueued, setupComplete, setupSteps, showSetup, startBlocker, uniqueName, writeLastStart, writeQueued,
+  type SetupInput,
 } from './newChat';
 
 describe('uniqueName', () => {
@@ -232,5 +233,82 @@ describe('showSetup', () => {
     expect(showSetup({ ...quiet, up: true })).toBe(false);
     expect(showSetup({ ...quiet, turns: 2 })).toBe(false);
     expect(showSetup({ ...quiet, captured: false })).toBe(false);
+  });
+});
+
+describe('startBlocker', () => {
+  const ok = {
+    busy: false, hasRepo: true, name: 'web', nameError: '', spacesReady: true, spaceError: '',
+    boxReady: false, boxName: 'web', boxError: '',
+  };
+
+  it('is empty when Start can go, or while a start is under way', () => {
+    expect(startBlocker(ok)).toBe('');
+    expect(startBlocker({ ...ok, busy: true, hasRepo: false })).toBe('');
+  });
+
+  it('says the first thing in the way', () => {
+    expect(startBlocker({ ...ok, hasRepo: false })).toMatch(/repository URL/);
+    expect(startBlocker({ ...ok, name: '' })).toBe('Give the session a name under Options');
+    expect(startBlocker({ ...ok, nameError: 'Letters, digits, - and _ only' })).toBe('Session name: Letters, digits, - and _ only');
+    expect(startBlocker({ ...ok, spacesReady: false })).toMatch(/spaces/);
+    expect(startBlocker({ ...ok, spaceError: 'Name the new space' })).toBe('Name the new space');
+    expect(startBlocker({ ...ok, boxName: '' })).toMatch(/box a name/);
+    expect(startBlocker({ ...ok, boxError: 'bad' })).toBe('Box name: bad');
+  });
+
+  it('ignores the box name once a box was launched for this attempt', () => {
+    expect(startBlocker({ ...ok, boxReady: true, boxName: '', boxError: 'bad' })).toBe('');
+  });
+});
+
+describe('readLastStart / writeLastStart', () => {
+  function memStore() {
+    const m = new Map<string, string>();
+    return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); }, removeItem: (k: string) => { m.delete(k); } };
+  }
+  const none = { pick: null, space: null, model: 'sonnet' };
+
+  it('remembers a listed or pasted repository, the space and the model', () => {
+    const store = memStore();
+    expect(readLastStart(store)).toEqual(none);
+    writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'opus' });
+    expect(readLastStart(store)).toEqual({ pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'opus' });
+    writeLastStart(store, { pick: { kind: 'pasted', url: 'https://github.com/acme/api' }, space: null, model: 'haiku' });
+    expect(readLastStart(store)).toEqual({ pick: { kind: 'pasted', url: 'https://github.com/acme/api' }, space: null, model: 'haiku' });
+  });
+
+  it('forgets the repository for a pick it cannot keep', () => {
+    const store = memStore();
+    writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'sonnet' });
+    writeLastStart(store, { pick: { kind: 'empty' }, space: 'notes', model: 'sonnet' });
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+  });
+
+  it('reads a model no longer offered, including the retired Auto, as Sonnet', () => {
+    const store = memStore();
+    store.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: 'notes', model: 'opus-3' }));
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+    store.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: 'notes', model: 'auto' }));
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+  });
+
+  it('reads garbage, or no storage, as nothing remembered', () => {
+    const store = memStore();
+    store.setItem('termag-chat-last-start', '{not json');
+    expect(readLastStart(store)).toEqual(none);
+    store.setItem('termag-chat-last-start', JSON.stringify({ pick: { kind: 'listed', fullName: 3 }, space: 7, model: 4 }));
+    expect(readLastStart(store)).toEqual(none);
+    expect(readLastStart(null)).toEqual(none);
+    expect(() => writeLastStart(null, { pick: { kind: 'empty' }, space: null, model: 'sonnet' })).not.toThrow();
+  });
+});
+
+describe('orchestratorOption', () => {
+  it('is hidden without the skill or for a schedule, and needs trust otherwise', () => {
+    expect(orchestratorOption({ providerHasSkill: false, scheduled: false, trusted: true })).toBe('hidden');
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: true, trusted: true })).toBe('hidden');
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: false })).toBe('needs-trust');
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: true })).toBe('available');
   });
 });

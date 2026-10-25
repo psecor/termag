@@ -6,10 +6,12 @@ import { usageApi } from '../services/api';
 import { buildAttentionItems, liveSummary } from './dashboard/triage';
 import { AttentionSection } from './dashboard/AttentionSection';
 import { RecentsSection } from './dashboard/RecentsSection';
+import { SharedPreviewsSection } from './dashboard/SharedPreviewsSection';
 import { BriefingCard } from '../components/BriefingCard';
 import { CloudSessionsSection } from './dashboard/CloudSessionsSection';
 import { AgentsSection } from './dashboard/AgentsSection';
 import { PrsOverlay } from '../components/PrsOverlay';
+import { DashboardSearch } from './dashboard/DashboardSearch';
 import { RangePicker } from './dashboard/RangePicker';
 import { Range, rangeKeys } from './dashboard/range';
 import { KpiRow, Kpi, deltaPct } from './dashboard/KpiRow';
@@ -124,6 +126,7 @@ export default function Dashboard() {
           <h1>Dashboard</h1>
           <Link to="/">← workspace</Link>
           {user?.role === 'admin' && <Link to="/admin">admin →</Link>}
+          <DashboardSearch sessions={data.sessions.data} projects={data.projects.data} now={now} />
           <span className="dash-updated">{updated}</span>
         </header>
 
@@ -136,6 +139,7 @@ export default function Dashboard() {
         <PrsOverlay />
 
         {/* Recall, not a range-bound metric — sits above the range picker. */}
+        <SharedPreviewsSection now={now} />
         <RecentsSection now={now} />
 
         {/* Claude Code cloud sessions on the owner's boxes: now, and the last 30
@@ -147,7 +151,7 @@ export default function Dashboard() {
         {/* Agents your agents started, their limits and the boxes' load.
             Not range-bound; shown only with a spawn
             or a refusal in the last week. */}
-        <AgentsSection usage={data.spawns.data} now={now} />
+        <AgentsSection usage={data.spawns.data} now={now} onChanged={data.spawns.refresh} />
 
         <RangePicker value={range} onChange={setRange} />
 

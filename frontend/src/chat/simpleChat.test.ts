@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { InboxRow } from '../mobile/inbox';
 import type { Block } from './paneChat';
-import { chatHref, chatRows, conversationBlocks, fullUiHref, isSdkChat, repoSlug, showAnswerKeys, statusLine } from './simpleChat';
+import { boxLabel, chatHref, chatRowName, chatRows, conversationBlocks, fullUiHref, isSdkChat, repoNeedsTrust, repoSlug, repoStartsTrusted, runConversationHref, showAnswerKeys, sidebarLine, statusLine } from './simpleChat';
 
 function row(over: Partial<InboxRow>): InboxRow {
   return {
@@ -76,6 +76,11 @@ describe('links', () => {
     expect(chatHref('p1', 'feature x')).toBe('/chat/p/p1?ws=feature%20x');
   });
 
+  it('sends a run\'s conversation to the simple UI only when the user has it', () => {
+    expect(runConversationHref('p1', 'run-20261020-0900', true)).toBe('/chat/p/p1?ws=run-20261020-0900');
+    expect(runConversationHref('p1', 'run-20261020-0900', false)).toBe('/?project=p1&ws=run-20261020-0900');
+  });
+
   it('builds the full-UI deep link', () => {
     expect(fullUiHref('p1')).toBe('/?project=p1');
     expect(fullUiHref('p1', 'tui')).toBe('/?project=p1&ws=tui');
@@ -137,5 +142,88 @@ describe('isSdkChat', () => {
   it('is false for a pane agent or no agent', () => {
     expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'claude')] as never }, 'main')).toBe(false);
     expect(isSdkChat({ workstreams: ws, workflows: [] }, 'main')).toBe(false);
+  });
+});
+
+describe('repoNeedsTrust', () => {
+  it('asks for every repository, including the org owners, and for no repository', () => {
+    expect(repoNeedsTrust('https://github.com/example-org/webapp.git')).toBe(true);
+    expect(repoNeedsTrust('https://github.com/Example-Team/termag')).toBe(true);
+    expect(repoNeedsTrust('https://github.com/e2e-org/sample')).toBe(true);
+    expect(repoNeedsTrust('git@github.com:someone/fork.git')).toBe(true);
+    expect(repoNeedsTrust('https://example.com/x/y.git')).toBe(true);
+    expect(repoNeedsTrust(null)).toBe(true);
+  });
+});
+
+describe('repoStartsTrusted', () => {
+  it('starts nothing trusted while no owner is listed', () => {
+    expect(repoStartsTrusted('https://github.com/example-org/webapp.git')).toBe(false);
+    expect(repoStartsTrusted('git@github.com:example-team/termag.git')).toBe(false);
+  });
+
+  it('stays opt-in for every other owner, a lookalike host, and no repository', () => {
+    expect(repoStartsTrusted('https://github.com/e2e-org/sample')).toBe(false);
+    expect(repoStartsTrusted('https://github.com/example-org-evil/x')).toBe(false);
+    expect(repoStartsTrusted('https://github.com/not-example-org/x')).toBe(false);
+    expect(repoStartsTrusted('https://github.com/example-team-extra/x')).toBe(false);
+    expect(repoStartsTrusted('git@github.com:someone/fork.git')).toBe(false);
+    expect(repoStartsTrusted('https://example.com/example-org/x.git')).toBe(false);
+    expect(repoStartsTrusted('https://evilgithub.com/example-org/webapp')).toBe(false);
+    expect(repoStartsTrusted('https://github.com/example-org/webapp/tree/main')).toBe(false);
+    expect(repoStartsTrusted(null)).toBe(false);
+    expect(repoStartsTrusted(undefined)).toBe(false);
+    expect(repoStartsTrusted('')).toBe(false);
+  });
+});
+
+describe('chatRowName', () => {
+  const row = { projectName: 'termag', workstream: 'fix-auth', sessionTitle: 'Login rate limiting' };
+
+  it('leads with the title when titles are on, the project and workstream secondary', () => {
+    expect(chatRowName(row, true)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth' });
+    expect(chatRowName({ ...row, workstream: 'main' }, true)).toEqual({ title: 'Login rate limiting', where: 'termag' });
+  });
+
+  it('names the row after the project with titles off, or before Claude has titled the session', () => {
+    expect(chatRowName(row, false)).toEqual({ title: null, where: 'termag · fix-auth' });
+    expect(chatRowName({ ...row, sessionTitle: null }, true)).toEqual({ title: null, where: 'termag · fix-auth' });
+    expect(chatRowName({ ...row, sessionTitle: '   ' }, true).title).toBeNull();
+    expect(chatRowName({ projectName: 'termag', workstream: 'main' }, true).title).toBeNull();
+  });
+});
+
+describe('sidebarLine', () => {
+  it('says what the open chat\'s header says, with Claude\'s last words', () => {
+    const r = row({ status: 'working', message: 'Bash(ls -la)' });
+    expect(sidebarLine(r, { tone: 'working', text: 'Running Bash · ls -la', preview: 'Let me look.' }, 'done'))
+      .toEqual({ state: 'Running Bash · ls -la', message: 'Let me look.', glyph: 'working' });
+    expect(sidebarLine(r, { tone: 'setup', text: 'Setting up…', preview: null }, 'done').glyph).toBe('working');
+    expect(sidebarLine(r, { tone: 'error', text: 'Stopped · your turn', preview: null }, 'done').glyph).toBe('idle');
+  });
+
+  it('says a chat still coming up is setting up, not "Not running"', () => {
+    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'cloning')).toEqual({ state: 'Setting up…', message: null, glyph: 'working' });
+    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'done').state).not.toBe('Setting up…');
+  });
+
+  it('otherwise reads the status pipeline', () => {
+    expect(sidebarLine(row({ status: 'idle', message: 'All green.' }), undefined, 'done')).toMatchObject({ message: 'All green.', glyph: 'idle' });
+  });
+});
+
+describe('boxLabel', () => {
+  it('names the box a session runs on, even when it repeats the project', () => {
+    expect(boxLabel(row({ projectName: 'sysadmin' }), 'psecor-dev02')).toBe('psecor-dev02');
+    expect(boxLabel(row({ projectName: 'sysadmin' }), 'sysadmin')).toBe('sysadmin');
+  });
+
+  it("says whose box a shared session is on when the box isn't listed", () => {
+    expect(boxLabel(row({ shared: true, owner: 'ada' }), undefined)).toBe("ada's box");
+    expect(boxLabel(row({ shared: false }), undefined)).toBeNull();
+  });
+
+  it('has nothing for a session with no box', () => {
+    expect(boxLabel(row({ instanceId: null }), 'psecor-dev02')).toBeNull();
   });
 });

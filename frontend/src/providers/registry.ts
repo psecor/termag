@@ -25,6 +25,12 @@ export interface ProviderConfig {
   handoffModes?: ('clear' | 'compact' | 'restart')[];
   /** A handoff restart may start this agent (the backend's canRestartInto). */
   handoffTarget?: boolean;
+  /** The agent-orchestrator skill is installed for it (backend orchestratorSkill),
+   *  so New session can offer "Act as an orchestrator". */
+  orchestratorSkill?: boolean;
+  /** Model backends this harness can also run on (the backend registry's
+   *  `backends`). Absent = its default only. */
+  backends?: string[];
 }
 
 export const PROVIDERS: Record<string, ProviderConfig> = {
@@ -34,10 +40,13 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: true,
     handoffModes: ['clear', 'compact', 'restart'],
     handoffTarget: true,
+    orchestratorSkill: true,
     badge: 'CL',
     color: { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' },
     usagePrecision: 'exact',
-    statusSources: ['claude-hooks'],
+    // t3:claude: the desktop app's threads on a box.
+    statusSources: ['claude-hooks', 't3:claude'],
+    backends: ['fireworks'],
   },
 
   // Claude driven headless by the simple UI's chat runner (backend registry).
@@ -45,6 +54,8 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     id: 'claude-chat',
     displayName: 'Claude (chat)',
     selectable: false,
+    orchestratorSkill: true,
+    backends: ['fireworks'],
     badge: 'CC',
     color: { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' },
     usagePrecision: 'exact',
@@ -123,6 +134,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     color: { base: 'rgba(217, 119, 6, 0.6)', bright: 'rgba(251, 191, 36, 0.9)' },
     usagePrecision: 'exact',
     statusSources: ['pi-ext:pi'],
+    backends: ['fireworks'],
   },
 
   mistral: {
@@ -155,6 +167,12 @@ export function isSelectableProvider(id: string | null | undefined): boolean {
 }
 export type AgentProvider = string;
 
+/** Model backends a workstream's agent can run on besides its harness's own
+ *  default (backend MODEL_BACKENDS). */
+export const MODEL_BACKENDS: Record<string, { displayName: string; badge: string }> = {
+  fireworks: { displayName: 'Fireworks', badge: 'FW' },
+};
+
 /** The simple UI's chat provider (backend CHAT_PROVIDER_ID). */
 export const CHAT_PROVIDER_ID = 'claude-chat';
 
@@ -171,9 +189,10 @@ export function providerForSource(source: string): string | undefined {
  * picking a transcript grammar. The bare `tmux-poller` source predates the
  * per-provider poller sources and only says "some poller provider" (it is
  * listed under Cursor for history), so it proves nothing: undefined, and the
- * caller falls back to the configured provider.
+ * caller falls back to the configured provider. Nor does a desktop thread's
+ * (`t3:*`): it runs beside the pane, not in it.
  */
 export function runningProviderForSource(source: string | null | undefined): string | undefined {
-  if (!source || source === 'tmux-poller') return undefined;
+  if (!source || source === 'tmux-poller' || source.startsWith('t3:')) return undefined;
   return providerForSource(source);
 }

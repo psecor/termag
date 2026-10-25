@@ -48,6 +48,15 @@ export function searchShortcutLabel(platform: string | undefined): string {
   return /mac|iphone|ipad|ipod/i.test(platform ?? '') ? '⌘K' : 'Ctrl+Shift+K';
 }
 
+/** The search shortcut's label on this browser's platform. */
+export function currentSearchShortcut(): string {
+  return searchShortcutLabel(
+    typeof navigator === 'undefined'
+      ? undefined
+      : (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform,
+  );
+}
+
 /** The workstream to open: the named one while it is live, else main. */
 export function resolveWorkstream(workstreams: Array<{ name: string; archived?: boolean }>, name: string): string {
   return name !== 'main' && workstreams.some(ws => ws.name === name && !ws.archived) ? name : 'main';

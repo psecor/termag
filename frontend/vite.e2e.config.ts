@@ -15,6 +15,9 @@ export default mergeConfig(base, {
       '/termag/api': backend,
       '/termag/ws': { target: ws, ws: true },
       '/termag/health': backend,
+      '/termag/files': backend,
+      // Share links; the slash keeps /termag/preview/ in the SPA.
+      '/termag/p/': backend,
     },
   },
 });

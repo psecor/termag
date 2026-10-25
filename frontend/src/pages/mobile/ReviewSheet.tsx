@@ -18,18 +18,20 @@ interface Props {
   /** Jump to the running review's tab instead of starting another. */
   onOpenCurrent?: () => void;
   onStarted: (r: { pr: number; url: string | null; session: string }) => void;
+  /** A PR handed in from outside (a share): wins over the guess. */
+  initialValue?: string;
   onClose: () => void;
 }
 
-export function ReviewSheet({ projectId, projectName, workstream, hasReview, currentPr, onOpenCurrent, onStarted, onClose }: Props) {
+export function ReviewSheet({ projectId, projectName, workstream, hasReview, currentPr, onOpenCurrent, onStarted, initialValue, onClose }: Props) {
   const [guessing, setGuessing] = useState(true);
   const [guess, setGuess] = useState<PrGuess | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [ghError, setGhError] = useState<string | null>(null);
   const [repo, setRepo] = useState<{ repo: string | null; known: boolean }>({ repo: null, known: false });
-  const [value, setValue] = useState('');
+  const [value, setValue] = useState(initialValue ?? '');
   // A ref: the guess lands after the sheet opened, maybe after the user typed.
-  const touched = useRef(false);
+  const touched = useRef(initialValue != null && initialValue !== '');
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

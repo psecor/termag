@@ -267,6 +267,13 @@ describe('buildAttentionItems — pull requests', () => {
     const old = buildAttentionItems(input({ prs: prs({ needs_my_review: [pr({ lane: 'needs_my_review', requestedAt: iso(30 * H) })] }) }), NOW);
     expect(old[0].severity).toBe('warning');
   });
+  it('a review request only to one of your teams raises nothing', () => {
+    const items = buildAttentionItems(input({ prs: prs({
+      team_review: [pr({ lane: 'team_review', number: 9, author: 'alice', askedYou: false })],
+      needs_my_review: [pr({ lane: 'needs_my_review', number: 10, author: 'bob', askedYou: true })],
+    }) }), NOW);
+    expect(items.map(i => i.id)).toEqual(['prrev:example-org/termag#10']);
+  });
   it('a deferred PR raises nothing until its deferral ends', () => {
     const res = { ...prs({ needs_my_review: [pr({ lane: 'needs_my_review', requestedAt: iso(2 * H) })] }), deferred: [{ key: 'example-org/termag#9', until: new Date(NOW + H).toISOString() }] } as PrPipelineResponse;
     expect(buildAttentionItems(input({ prs: res }), NOW)).toEqual([]);

@@ -4,7 +4,7 @@
 // the ordering is unit-testable; the Inbox page feeds it ProjectContext state.
 import type { AgentStatus, AgentStatusValue, CloudSession, Project, SessionReview } from '../types';
 import { cloudDotStatus, cloudLiveStatus, isActiveCloudSession } from '../utils/cloudSessions';
-import type { RecentRow } from '../services/api';
+import type { RecentRow, SessionRow } from '../services/api';
 import { runningProviderForSource } from '../providers/registry';
 import { sessionName } from '../utils/sessionName';
 import { statusKey } from '../utils/statusKey';
@@ -21,12 +21,14 @@ export interface InboxRow {
   projectId: string;
   projectName: string;
   workstream: string;
+  /** Claude's own title for the session, from its workstream (simple-ui-session-titles-enabled); null before it has one. */
+  sessionTitle?: string | null;
   owner: string;                     // unix user whose tmux holds the session
   shared: boolean;                   // the viewer is a collaborator, not the owner
   provider: string | null;
   instanceId: string | null;
   /** 'cloud': a Claude Code cloud session on a box; projectId is its key, url its page on claude.ai. */
-  kind: 'normal' | 'metaterm' | 'cloud';
+  kind: 'normal' | 'metaterm' | 'automation' | 'cloud';
   url?: string | null;
   pinned: boolean;
   status: AgentStatusValue;
@@ -66,13 +68,33 @@ export function providerFor(project: Project, workstreamId: string | undefined, 
   return ws?.provider ?? any?.provider ?? null;
 }
 
+/**
+ * A status map (ProjectContext's shape, by statusKey) from `GET /api/sessions`
+ * rows, for a page without the status WebSocket: the dashboard's ⌘K. Agent
+ * panes only, as buildRows reads; no review state, which the route lacks.
+ */
+export function statusMapFromSessions(sessions: SessionRow[]): Record<string, AgentStatus> {
+  const out: Record<string, AgentStatus> = {};
+  for (const r of sessions) {
+    if (r.role !== 'agent') continue;
+    out[statusKey(r.instanceId, r.session)] = {
+      status: r.status,
+      updatedAt: r.updatedAt ?? r.lastActiveAt,
+      waitingReason: r.waitingReason,
+      rateLimited: r.rateLimited,
+      ...(r.contextTokens != null ? { contextTokens: r.contextTokens } : {}),
+    };
+  }
+  return out;
+}
+
 export function buildRows(projects: Project[], statusMap: Record<string, AgentStatus | undefined>, username: string): InboxRow[] {
   const rows: InboxRow[] = [];
   for (const p of projects) {
     if (p.archived || !p.workflows.some(w => w.type === 'agent')) continue;
     const owner = p.ownerUsername ?? username;
     const workstreams = p.workstreams.filter(ws => !ws.archived);
-    const list = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
+    const list: Array<{ id?: string; name: string; sessionTitle?: string | null }> = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
     for (const ws of list) {
       const session = sessionName(owner, p.name, 'agent', ws.name);
       const st = statusMap[statusKey(p.instanceId, session)];
@@ -81,6 +103,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         projectId: p.id,
         projectName: p.name,
         workstream: ws.name,
+        sessionTitle: ws.sessionTitle ?? null,
         owner,
         shared: p.role === 'collaborator',
         provider: providerFor(p, ws.id, st?.source),
@@ -216,7 +239,7 @@ export function parseFilter(f: string | null, g?: string | null): HomeFilter | n
  * carrying the live row so its status comes from statusMap, not the (older)
  * visits payload. Archived or no-longer-listed sessions are dropped.
  */
-export function recentSessions(rows: InboxRow[], recents: RecentRow[] | null | undefined, now: number, limit = 10): InboxRow[] {
+export function recentSessions(rows: readonly InboxRow[], recents: RecentRow[] | null | undefined, now: number, limit = 10): InboxRow[] {
   const byKey = new Map(rows.map(r => [r.key, r]));
   const out: InboxRow[] = [];
   for (const rr of recents ?? []) {
@@ -232,13 +255,14 @@ export function recentSessions(rows: InboxRow[], recents: RecentRow[] | null | u
 /**
  * The Search tab's instant filter: every whitespace-separated term must hit
  * the project, workstream, owner, provider, status message or review PR
- * (`312` or `#312`), case-insensitively. Keeps the home order.
+ * (`312` or `#312`), or the box's name when `boxNameOf` gives one,
+ * case-insensitively. Keeps the home order.
  */
-export function searchRows(rows: InboxRow[], query: string): InboxRow[] {
+export function searchRows(rows: readonly InboxRow[], query: string, boxNameOf?: (row: InboxRow) => string | null): InboxRow[] {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean).map(t => t.replace(/^#(?=\d)/, ''));
   if (terms.length === 0) return [];
   return rows.filter(r => {
-    const hay = [r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '']
+    const hay = [r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '', boxNameOf?.(r) ?? '']
       .join('\n').toLowerCase();
     return terms.every(t => hay.includes(t));
   });

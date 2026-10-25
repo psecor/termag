@@ -1,5 +1,5 @@
-import React from 'react';
-import { Link } from 'react-router-dom';
+import React, { useEffect } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { CredentialsSection } from './settings/CredentialsSection';
 import { SshKeysSection } from './settings/SshKeysSection';
@@ -7,7 +7,10 @@ import { DotfilesSection } from './settings/DotfilesSection';
 import { CliDevicesSection } from './settings/CliDevicesSection';
 import { AppearanceSection } from './settings/AppearanceSection';
 import { BriefingSection } from './settings/BriefingSection';
+import { McpSection } from './settings/McpSection';
+import { NotificationsSection } from './settings/NotificationsSection';
 import { DocsLink } from './settings/DocsLink';
+import { settingsBackLink } from './settings/backLink';
 
 /**
  * Account-level settings: things set once that apply to every box and project.
@@ -16,19 +19,30 @@ import { DocsLink } from './settings/DocsLink';
  */
 export default function Settings() {
   const { user, logout } = useAuth();
+  const location = useLocation();
+  const back = settingsBackLink(location.search);
+  // A link to a section (/settings#notifications, #briefing): the router does not scroll to it.
+  useEffect(() => {
+    const id = location.hash.slice(1);
+    if (!id) return;
+    const t = window.setTimeout(() => document.getElementById(id)?.scrollIntoView?.({ block: 'start' }), 50);
+    return () => window.clearTimeout(t);
+  }, [location.hash]);
   return (
     <div className="dash-root">
       <div className="dash-page settings-page">
         <header className="dash-header">
           <h1>Settings</h1>
-          <Link to="/">← workspace</Link>
+          <Link to={back.to}>{back.label}</Link>
           <span className="dash-updated">{user?.email}</span>
         </header>
         <SshKeysSection />
         <CredentialsSection />
+        <McpSection focus={location.pathname.endsWith('/settings/mcp')} search={location.search} />
         <DotfilesSection />
         <CliDevicesSection />
         <BriefingSection />
+        <NotificationsSection />
         <AppearanceSection />
         {/* Sign out lives here rather than the sidebar header: rarely used, and
             the header slot is better spent on the Recents switcher. */}

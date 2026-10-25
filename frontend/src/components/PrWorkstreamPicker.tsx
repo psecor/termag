@@ -5,7 +5,7 @@ import type { Project } from '../types';
 import { apiErrorText } from '../utils/prPipeline';
 import { useProjects } from '../contexts/ProjectContext';
 import { projectHref } from '../pages/dashboard/AttentionSection';
-import { filterChoices, isWorkstreamName, scopedProjects, suggestWorkstreamName, workstreamChoices } from '../utils/workstreamChoices';
+import { filterChoices, isWorkstreamName, scopedProjects, suggestPrPrompt, suggestWorkstreamName, workstreamChoices } from '../utils/workstreamChoices';
 
 /**
  * The PR overlay's "Attach…" control: put a PR on one of the user's workstreams by hand, so
@@ -18,8 +18,12 @@ import { filterChoices, isWorkstreamName, scopedProjects, suggestWorkstreamName,
  * "New workstream for #N…" at the foot of the list makes one on the PR's own
  * branch (POST /api/prs/…/workstream: the box fetches pull/<n>/head, or adopts
  * an agent-made worktree already on it), attaches the PR and opens it. The
- * name defaults to the repository's plus the branch's (termag-pr-defer), the
- * project to the most recently active checkout of the PR's repository.
+ * name defaults to the repository's, the PR's number and the branch's
+ * (termag-pr359-pr-defer), the project to the most recently active checkout of
+ * the PR's repository. The agent starts on a prompt about the PR, which the
+ * form shows and the user can change or clear. With no checkout of the
+ * repository known, the form warns: the box refuses a project whose origin is
+ * another repository.
  */
 export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   row: PrRow; checkouts?: PrCheckout[]; onChanged: () => void; onError: (msg: string) => void;
@@ -28,8 +32,8 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
   const [hi, setHi] = useState(0);
-  // The "New workstream" form: where, and under what name.
-  const [creating, setCreating] = useState<{ projectId: string; name: string } | null>(null);
+  // The "New workstream" form: where, under what name, and what its agent is asked first.
+  const [creating, setCreating] = useState<{ projectId: string; name: string; prompt: string } | null>(null);
   const navigate = useNavigate();
   // A no-op outside the workspace (the dashboard): the workspace loads afresh when the link opens it.
   const { reloadProjects, setActiveWorkstream } = useProjects();
@@ -71,13 +75,13 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   const targets = scopedProjects(projects, repo, checkouts);
   const startNew = () => {
     if (targets.length === 0) { onError('No project of yours to make it in.'); return; }
-    setCreating({ projectId: targets[0].id, name: suggestWorkstreamName(repo, row.headRefName) });
+    setCreating({ projectId: targets[0].id, name: suggestWorkstreamName(repo, number, row.headRefName), prompt: suggestPrPrompt(repo, number) });
   };
   const createNew = () => {
     if (!creating || busy || !isWorkstreamName(creating.name)) return;
-    const { projectId, name } = creating;
+    const { projectId, name, prompt } = creating;
     void run(async () => {
-      const ws = await prsApi.newWorkstream(repo, number, projectId, name);
+      const ws = await prsApi.newWorkstream(repo, number, projectId, name, prompt);
       await reloadProjects().catch(() => undefined);
       setActiveWorkstream(projectId, ws.name);
       navigate(projectHref(projectId, ws.name));
@@ -98,6 +102,12 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
             </select>
           )}
           {targets.length === 1 && <div className="usage-dim prs-ws-scope">in {targets[0].name}</div>}
+          {/* The box refuses a project on another repository (routes/workstreams.ts): say so before it is picked. */}
+          {!sameRepo && (
+            <div className="error-text prs-ws-scope" role="note">
+              No checkout of {repo} known: pick a project on {repo}, or make one (or un-archive it) first.
+            </div>
+          )}
           <input
             autoFocus
             className="prs-ws-search"
@@ -111,8 +121,21 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
             }}
           />
           {!valid && <div className="error-text prs-ws-scope">Letters, digits, dashes and underscores; not "main".</div>}
+          <textarea
+            className="prs-ws-search prs-ws-prompt"
+            aria-label="First prompt for the agent"
+            placeholder="First prompt for the agent (optional)"
+            rows={3}
+            value={creating.prompt}
+            disabled={busy}
+            onChange={e => setCreating({ ...creating, prompt: e.target.value })}
+            onKeyDown={e => {
+              if (e.key === 'Escape') { e.stopPropagation(); setCreating(null); }
+              else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); createNew(); }
+            }}
+          />
           <div className="usage-dim prs-ws-scope">
-            {busy ? 'Checking the branch out on the box…' : 'Checks out the PR\'s branch (or adopts a worktree already on it), attaches the PR and opens the workstream.'}
+            {busy ? 'Checking the branch out on the box…' : 'Checks out the PR\'s branch (or adopts a worktree already on it), attaches the PR and opens the workstream; its agent starts on the prompt.'}
           </div>
           <div className="prs-ws-actions">
             <button type="button" className="btn-primary btn-tiny" disabled={busy || !valid} onClick={createNew}>Create</button>

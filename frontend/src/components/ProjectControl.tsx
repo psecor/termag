@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { contextLevel } from '../utils/thresholds';
 import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -12,15 +12,17 @@ import { HandoffDialog } from './HandoffDialog';
 import { canHandOff } from '../utils/handoff';
 import { ShareToSlackDialog, type ShareDraft } from './ShareToSlackDialog';
 import { StatusDot } from './StatusDot';
+import { archiveMessage } from '../utils/archiveProject';
 import { RecentsDropdown } from './RecentsDropdown';
 import { SearchPalette } from './SearchPalette';
+import type { PaletteAction } from '../utils/searchPalette';
 import { StatusStrip } from './StatusStrip';
 import { WorktreePrPills, useWorktreePills } from './WorktreePrPills';
 import { NewProjectDialog } from './NewProjectDialog';
 import { DOCS_SITE_URL } from '../pages/settings/settingsDocs';
-import { writeOptOut } from '../mobile/redirect';
+import { optBackIntoMobile } from '../mobile/redirect';
 import { Project, ProjectInvite, ProjectShareInfo, AgentStatusValue, Instance, AutoTerminatedBox, Workstream, CloudSession, HandoffMode } from '../types';
-import { PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider, runningProviderForSource } from '../providers/registry';
+import { MODEL_BACKENDS, PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider, runningProviderForSource } from '../providers/registry';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useConnection } from '../contexts/ConnectionContext';
@@ -33,6 +35,8 @@ import { cloudByBox, cloudCountLabel, cloudDotStatus, cloudElsewhere, cloudLabel
 import { FLAGS, useFlag } from '../flags';
 import { useTheme } from '../theme/ThemeProvider';
 import { metatermVisibility } from '../utils/metatermVisibility';
+import { boxStripeColor } from '../utils/boxColor';
+import { groupRollup, pruneCollapsedGroups, readCollapsedGroups, writeCollapsedGroups } from '../utils/collapsedGroups';
 import { sessionName as buildSessionName } from '../utils/sessionName';
 import { boxImageBadge, boxNameTitle } from '../utils/boxImage';
 import { statusKey } from '../utils/statusKey';
@@ -57,6 +61,11 @@ import { BOX_NAME_ERROR, isValidBoxName } from '../utils/boxNames';
 import { REPLAY_BLOCK_CLASS } from '../observability';
 import { repoPromptDue } from '../utils/repoPick';
 import { CloneProgress } from './CloneProgress';
+import { automationsApi, type AutomationView } from '../services/api';
+import { projectKindTraits } from '../utils/projectKind';
+import { automationSubtitle, occurrenceShort, RUN_STATE_LABEL } from '../utils/automationSchedule';
+import { chatHref } from '../chat/simpleChat';
+import type { NewProjectMode } from './NewProjectForm';
 
 // Aggregate priority for combining per-workstream statuses into a single
 // project-row signal: "is anything alive on this project?"
@@ -69,19 +78,6 @@ const STATUS_PRIORITY: Record<AgentStatusValue, number> = {
   idle: 2,
   not_running: 1,
 };
-
-// Deterministic hue from a box's instance id so a project's "which box" stripe
-// stays the same across reloads. Fixed saturation/lightness keeps the visual
-// weight consistent against the dark theme. Returns null for legacy projects
-// (instanceId === null) so they render with no stripe.
-function boxStripeColor(instanceId: string | null | undefined): string | null {
-  if (!instanceId) return null;
-  let h = 0;
-  for (let i = 0; i < instanceId.length; i++) {
-    h = (h * 31 + instanceId.charCodeAt(i)) >>> 0;
-  }
-  return `hsl(${h % 360}, 55%, 58%)`;
-}
 
 /** One-line status rollup for the collapsed boxes expander: "2 ready · 1 provisioning". */
 const BOX_SUMMARY_LABELS: Record<string, string> = {
@@ -120,6 +116,20 @@ export function ProjectControl() {
   } = useProjects();
   // "New project" opens the shared NewProjectForm in a dialog (NewProjectDialog).
   const [showNewProject, setShowNewProject] = useState(false);
+  // What the New project button makes: Shift held over it (or the split
+  // button's caret) turns it into New automation.
+  const [newProjectMode, setNewProjectMode] = useState<NewProjectMode>('project');
+  const [shiftHeld, setShiftHeld] = useState(false);
+  const [overNewProject, setOverNewProject] = useState(false);
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === 'Shift') setShiftHeld(true); };
+    const up = (e: KeyboardEvent) => { if (e.key === 'Shift') setShiftHeld(false); };
+    const reset = () => setShiftHeld(false);
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', reset);
+    return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); window.removeEventListener('blur', reset); };
+  }, []);
   // Each worktree's pull requests, as pills on its row.
   const prPillsFor = useWorktreePills();
   const [repoPromptBoxId, setRepoPromptBoxId] = useState<string | undefined>();
@@ -377,6 +387,56 @@ export function ProjectControl() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
   const [newWorkstreamName, setNewWorkstreamName] = useState('');
+  // ⌘K actions: Branch off… opens the open project's branch-off form. Not
+  // for a kind that cannot branch (MetaTerm, an automation: its workstreams
+  // are the scheduler's runs) or a project shared with you, as on the phone.
+  // A form already open for the project keeps its half-typed name. Delete
+  // branch (a non-main workstream) and Archive project are the ⋮ menus'
+  // Delete and Archive, with their confirm; they run through a ref so the
+  // memo needn't track everything those read.
+  const branchable = viewedProject && projectKindTraits(viewedProject.kind).canBranchOff && viewedProject.role !== 'collaborator' ? viewedProject : null;
+  const branchId = branchable?.id ?? null;
+  const branchName = branchable?.name ?? '';
+  const deletableWs = branchable && viewedWs !== 'main' ? branchable.workstreams.find(ws => ws.name === viewedWs && !ws.archived) : undefined;
+  const deletableWsId = deletableWs?.id ?? null;
+  const deletableWsName = deletableWs?.name ?? '';
+  const paletteRun = useRef({ deleteWorkstream, archiveProject, branchable });
+  paletteRun.current = { deleteWorkstream, archiveProject, branchable };
+  const paletteActions = useMemo((): PaletteAction[] => {
+    if (!branchId) return [];
+    const out: PaletteAction[] = [{
+      id: 'branch-off',
+      label: 'Branch off…',
+      detail: branchName,
+      keywords: ['new workstream', 'worktree'],
+      run: () => {
+        if (branchOffProjectId !== branchId) setNewWorkstreamName('');
+        setBranchOffProjectId(branchId);
+      },
+    }];
+    if (deletableWsId) {
+      out.push({
+        id: 'delete-branch',
+        label: 'Delete branch',
+        detail: deletableWsName,
+        keywords: ['remove workstream', 'worktree'],
+        run: () => {
+          const { deleteWorkstream: run, branchable: p } = paletteRun.current;
+          if (p?.id === branchId) run(p, { id: deletableWsId, name: deletableWsName });
+        },
+      });
+    }
+    out.push({
+      id: 'archive-project',
+      label: 'Archive project',
+      detail: branchName,
+      run: () => {
+        const { archiveProject: run, branchable: p } = paletteRun.current;
+        if (p?.id === branchId) run(p);
+      },
+    });
+    return out;
+  }, [branchId, branchName, branchOffProjectId, deletableWsId, deletableWsName]);
 
   // Load pending invites on mount
   useEffect(() => {
@@ -410,6 +470,19 @@ export function ProjectControl() {
   // Boxes (compute instances)
   const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const boxesLoaded = useSyncExternalStore(boxFeed.subscribe, boxFeed.hasLoaded);
+  // Project-list groups folded to their header and a rollup line, per browser.
+  // Everything starts expanded; ids of boxes that are gone are dropped once the
+  // box list has loaded.
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => readCollapsedGroups(browserStorage));
+  const updateCollapsed = useCallback((next: Set<string>) => {
+    writeCollapsedGroups(browserStorage, next);
+    setCollapsedGroups(next);
+  }, [browserStorage]);
+  useEffect(() => {
+    if (!boxesLoaded) return;
+    const pruned = pruneCollapsedGroups(collapsedGroups, new Set(boxes.map(b => b.id)));
+    if (pruned !== collapsedGroups) updateCollapsed(pruned);
+  }, [boxesLoaded, boxes, collapsedGroups, updateCollapsed]);
   // Claude Code cloud sessions on those boxes,
   // behind the flag; App starts the feed. Owner only.
   const cloudSessionsOn = useFlag(FLAGS.cloudSessions, false);
@@ -468,9 +541,25 @@ export function ProjectControl() {
   const [createdBox, setCreatedBox] = useState<{ name: string; token: string; agentWsUrl?: string } | null>(null);
   const warmPoolEnabled = useFlag(FLAGS.warmPool, false);
   const autoLifecycleOn = useFlag(FLAGS.autoLifecycle, false);
+  const boxRenameOn = useFlag(FLAGS.boxRename, false);
   const boxSharingOn = useFlag(FLAGS.boxSharing, false);
   const slackCollabOn = useFlag(FLAGS.slackCollab, false);
   const handoffOn = useFlag(FLAGS.agentHandoff, false);
+  const automationsOn = useFlag(FLAGS.automations, false);
+  // The automations behind the automation projects: schedule, next run, last
+  // run, for the row's subtitle. Polled gently; the project list itself is live.
+  const [automations, setAutomations] = useState<Map<string, AutomationView>>(new Map());
+  const hasAutomationProjects = projects.some(p => p.kind === 'automation');
+  useEffect(() => {
+    if (!automationsOn && !hasAutomationProjects) return;
+    let cancelled = false;
+    const load = () => automationsApi.list()
+      .then(list => { if (!cancelled) setAutomations(new Map(list.map(a => [a.projectId, a]))); })
+      .catch(() => {});
+    load();
+    const t = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [automationsOn, hasAutomationProjects, projects.length]);
   const [lifecycleBox, setLifecycleBox] = useState<Instance | null>(null);
   const [autoTerminated, setAutoTerminated] = useState<AutoTerminatedBox[]>([]);
   const [warmPool, setWarmPool] = useState<WarmPoolStatus | null>(null);
@@ -721,14 +810,20 @@ export function ProjectControl() {
     if (!shareProjectId) return;
     try {
       await sharingApi.revokeShare(shareProjectId, shareId);
-      const remaining = shares.filter(s => s.id !== shareId);
-      setShares(remaining);
-      if (remaining.length === 0) {
-        setSharedProjectIds(prev => { const next = new Set(prev); next.delete(shareProjectId!); return next; });
-        // With new shares off the panel has nothing left to show.
-        if (!boxSharingOn) setShareProjectId(null);
+    } catch (err) {
+      // 404: the share is already gone (a second click, or they left).
+      if ((err as { response?: { status?: number } })?.response?.status !== 404) {
+        setError('Failed to revoke share');
+        return;
       }
-    } catch { setError('Failed to revoke share'); }
+    }
+    const remaining = shares.filter(s => s.id !== shareId);
+    setShares(remaining);
+    if (remaining.length === 0) {
+      setSharedProjectIds(prev => { const next = new Set(prev); next.delete(shareProjectId!); return next; });
+      // With new shares off the panel has nothing left to show.
+      if (!boxSharingOn) setShareProjectId(null);
+    }
   }
 
   function leaveProject(projectId: string) {
@@ -818,8 +913,8 @@ export function ProjectControl() {
 
   function archiveProject(project: Project) {
     setConfirmState({
-      message: `Archive ${project.name}? This will kill all tmux sessions for this project.`,
-      confirmLabel: 'Archive',
+      message: archiveMessage(project.name, project.workstreams.length),
+      confirmLabel: `Archive ${project.name}`,
       onConfirm: async () => {
         await projectsApi.archive(project.id);
         if (activeProjectId === project.id) setActiveProject(null);
@@ -858,6 +953,26 @@ export function ProjectControl() {
     return persistedWorkstreamProvider(project, ws.id) ?? user?.defaultAgentProvider ?? 'claude';
   }
 
+  // A workstream on a model backend other than its agent's default
+  // says so on its badge: CL·FW, "Claude on Fireworks".
+  function backendBadge(backend: string | null): string {
+    return backend ? `·${MODEL_BACKENDS[backend]?.badge ?? backend}` : '';
+  }
+  function backendNote(backend: string | null): string {
+    return backend ? ` on ${MODEL_BACKENDS[backend]?.displayName ?? backend}` : '';
+  }
+  function modelNote(model: string | null): string {
+    return model ? `, model ${model.split('/').pop()}` : '';
+  }
+
+  function storedWorkstreamBackend(project: Project, ws: Workstream): string | null {
+    return project.workflows.find(w => w.type === 'agent' && w.workstreamId === ws.id)?.backend ?? null;
+  }
+
+  function storedWorkstreamModel(project: Project, ws: Workstream): string | null {
+    return project.workflows.find(w => w.type === 'agent' && w.workstreamId === ws.id)?.model ?? null;
+  }
+
   function workstreamHasAgent(project: Project, ws: Workstream | undefined): ws is Workstream {
     return !!ws && project.workflows.some(w => w.workstreamId === ws.id && w.type === 'agent');
   }
@@ -878,19 +993,19 @@ export function ProjectControl() {
     }
   }
 
-  async function switchAgent(provider: string) {
+  async function switchAgent(provider: string, backend: string | null, model: string | null) {
     if (!switchTarget || switchBusy) return;
     const { project, ws } = switchTarget;
     setSwitchBusy(true);
     try {
-      const result = await workstreamsApi.switchAgent(project.id, ws.id, provider);
+      const result = await workstreamsApi.switchAgent(project.id, ws.id, provider, backend, model);
       setSwitchTarget(null);
       // Recorded, but not typed into the pane (probe failed, git busy): say so.
       if (result.warning) setError(result.warning);
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
       setSwitchTarget(null);
-      setError(msg ?? 'Failed to switch agent');
+      setError(msg ?? (workstreamHasAgent(project, ws) ? 'Failed to switch agent' : 'Failed to start the agent'));
     } finally {
       setSwitchBusy(false);
       // Reload either way: a launch that failed after the switch still recorded the new agent.
@@ -933,6 +1048,32 @@ export function ProjectControl() {
         } catch (err: unknown) {
           const msg = (err as { response?: { data?: { error?: string } } }).response?.data?.error;
           setError(msg ?? 'Failed to delete workstream');
+        }
+      },
+    });
+  }
+
+  /**
+   * An automation run's row: the run's worktree and branch go through the
+   * automation's Retire (routes/automations.ts retireRunFor), which stamps
+   * the run's retiredAt and keeps the record; a plain workstream delete
+   * would leave the run pointing at a worktree that is gone. The route
+   * takes the run's id or its workstream's, so the sidebar needs no run list.
+   */
+  function retireRun(project: Project, ws: { id: string; name: string }, auto: AutomationView) {
+    setConfirmState({
+      message: `Retire run "${runLabel(ws.name, auto.timezone)}"? Removes its worktree (and its branch, when merged); the run and its report stay.`,
+      confirmLabel: 'Retire',
+      onConfirm: async () => {
+        try {
+          await automationsApi.retireRun(auto.id, ws.id);
+          if (getActiveWorkstream(project.id) === ws.name) {
+            setActiveWorkstream(project.id, 'main');
+          }
+          await reloadProjects();
+        } catch (err: unknown) {
+          const msg = (err as { response?: { data?: { error?: string } } }).response?.data?.error;
+          setError(msg ?? 'Failed to retire the run');
         }
       },
     });
@@ -1043,6 +1184,25 @@ export function ProjectControl() {
     }
   }
 
+  // Shares renamingId/renameValue/renameSettled with the project and workstream
+  // editors; a box id is a cuid too, so it never collides with theirs.
+  async function renameBox(box: Instance) {
+    if (renameSettled.current) return;
+    renameSettled.current = true;
+    const newName = renameValue.trim();
+    setRenamingId(null);
+    if (!newName || newName === box.name) return;
+    if (!isValidBoxName(newName)) { setBoxError(BOX_NAME_ERROR); return; }
+    try {
+      const { instance } = await instancesApi.rename(box.id, newName);
+      boxFeed.upsert({ ...box, name: instance.name });
+      setBoxError('');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setBoxError(msg || 'Failed to rename box');
+    }
+  }
+
   async function startBox(box: Instance) {
     try {
       await instancesApi.start(box.id);
@@ -1098,11 +1258,23 @@ export function ProjectControl() {
     }
   }
 
+  function automationFor(p: { id: string; kind?: string }): AutomationView | null {
+    return p.kind === 'automation' ? automations.get(p.id) ?? null : null;
+  }
+  /** "Mon 09:00" for a run workstream `run-20261020-0900`; the name itself otherwise. */
+  function runLabel(name: string, timezone?: string): string {
+    const m = /^run-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(?:-(\d+))?$/.exec(name);
+    if (!m) return name;
+    const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00Z`;
+    return `${occurrenceShort(iso, timezone ?? 'UTC')}${m[6] ? ` (${m[6]})` : ''}`;
+  }
+
   function renderProjectItem(p: typeof projects[0]) {
     const provider = displayAgentProvider(p);
     const config = provider ? PROVIDERS[provider] : null;
     const mainWs = p.workstreams?.find(ws => ws.name === 'main') ?? p.workstreams?.[0];
     const savedProvider = persistedWorkstreamProvider(p, mainWs?.id);
+    const mainBackend = mainWs ? storedWorkstreamBackend(p, mainWs) : null;
     const ctxWarn = contextWarning(p);
     const rateLimit = rateLimitWarning(p);
     const stripe = boxStripeColor(p.instanceId);
@@ -1123,6 +1295,10 @@ export function ProjectControl() {
         onClick={() => {
           if (selectMode) {
             if (selectable) toggleSelected(p.id);
+          } else if (projectKindTraits(p.kind).isAutomation) {
+            // An automation's panes are shells with no conversation in them
+            // (its runs are chat-runner turns): open the automation instead.
+            navigate(`/automations/${encodeURIComponent(p.id)}`);
           } else {
             setActiveProject(p.id);
           }
@@ -1203,16 +1379,18 @@ export function ProjectControl() {
                 title={`${wsCount} workstreams`}
               >↳{wsCount}</span>
             )}
-            {config && (
+            {automationFor(p) ? (
+              <span className="automation-glyph" title={`automation: ${automationSubtitle(automationFor(p)!, automationFor(p)!.timezone)}`}>⏱</span>
+            ) : config && (
               <span
                 className="project-provider-badge"
                 style={{
                   borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
                   background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
                 }}
-                title={`runtime: ${config.displayName}${savedProvider ? `, saved: ${savedProvider}` : ''}${mixedProviderNote(p, provider)}`}
+                title={`runtime: ${config.displayName}${backendNote(mainBackend)}${modelNote(mainWs ? storedWorkstreamModel(p, mainWs) : null)}${savedProvider ? `, saved: ${savedProvider}` : ''}${mixedProviderNote(p, provider)}`}
               >
-                {config.badge}
+                {config.badge}{backendBadge(mainBackend)}
               </span>
             )}
           </>
@@ -1229,24 +1407,31 @@ export function ProjectControl() {
                 <button onClick={() => { leaveProject(p.id); setMenuOpenId(null); }}>Leave project</button>
               ) : (
                 <>
-                  <button onClick={() => { togglePin(p); setMenuOpenId(null); }}>
+                  <button data-analytics={p.pinned ? 'project-unpin' : 'project-pin'} onClick={() => { togglePin(p); setMenuOpenId(null); }}>
                     {p.pinned ? '◆ Unpin' : '◇ Pin to top'}
                   </button>
                   <button onClick={() => { beginRename(p.id, p.name); setMenuOpenId(null); }}>
                     Rename
                   </button>
                   {(boxSharingOn || sharedProjectIds.has(p.id) || shareProjectId === p.id) && (
-                    <button onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
+                    <button data-analytics="project-share" onClick={() => { setShareProjectId(shareProjectId === p.id ? null : p.id); setMenuOpenId(null); }}>
                       {sharedProjectIds.has(p.id) ? '● Sharing' : 'Share'}
                     </button>
                   )}
-                  <button onClick={() => {
-                    setBranchOffProjectId(branchOffProjectId === p.id ? null : p.id);
-                    setNewWorkstreamName('');
-                    setMenuOpenId(null);
-                  }}>
-                    Branch off…
-                  </button>
+                  {projectKindTraits(p.kind).isAutomation && (
+                    <button onClick={() => { navigate(`/automations/${encodeURIComponent(p.id)}`); setMenuOpenId(null); }}>
+                      Automation…
+                    </button>
+                  )}
+                  {projectKindTraits(p.kind).canBranchOff && (
+                    <button onClick={() => {
+                      setBranchOffProjectId(branchOffProjectId === p.id ? null : p.id);
+                      setNewWorkstreamName('');
+                      setMenuOpenId(null);
+                    }}>
+                      Branch off…
+                    </button>
+                  )}
                   {slackCollabOn && (
                     <button onClick={() => {
                       const mainWs = p.workstreams.find(ws => ws.name === 'main') ?? p.workstreams[0];
@@ -1259,7 +1444,14 @@ export function ProjectControl() {
                   {(() => {
                     // The project row stands for its main workstream's agent.
                     const mainWs = p.workstreams.find(ws => ws.name === 'main') ?? p.workstreams[0];
-                    return workstreamHasAgent(p, mainWs) && (
+                    if (mainWs && !workstreamHasAgent(p, mainWs) && projectKindTraits(p.kind).canSwitchAgent) {
+                      return (
+                        <button onClick={() => { setSwitchTarget({ project: p, ws: mainWs }); setMenuOpenId(null); }}>
+                          Start agent…
+                        </button>
+                      );
+                    }
+                    return workstreamHasAgent(p, mainWs) && projectKindTraits(p.kind).canSwitchAgent && (
                       <>
                         <button onClick={() => { setSwitchTarget({ project: p, ws: mainWs }); setMenuOpenId(null); }}>
                           Switch agent…
@@ -1291,6 +1483,114 @@ export function ProjectControl() {
     );
   }
 
+
+  // Pinned projects float to the top of their own box group.
+  const sortPinned = (arr: typeof projects) => [
+    ...arr.filter(p => p.pinned),
+    ...arr.filter(p => !p.pinned),
+  ];
+
+  // Group projects by box: one group per box that has projects (sorted
+  // by box name), then collaborator projects on boxes I don't own, then
+  // legacy "this host" projects (no instance). Empty groups are hidden.
+  // MetaTerm — the per-user control tower — is pinned above every box
+  // group. Pull it out so it doesn't also land under "This host".
+  // Hidden unless opted in; still shown while it is the open project,
+  // so the sidebar never loses the session on screen.
+  const metatermProject = projects.find(p => p.kind === 'metaterm');
+  const visibility = metatermVisibility({
+    optedIn: theme.sidebarMetaTerm,
+    metatermId: metatermProject?.id ?? null,
+    activeProjectId: activeProjectId ?? null,
+  });
+  const metaterm = visibility.showRow ? metatermProject : undefined;
+  const rest = metatermProject ? projects.filter(p => p.id !== metatermProject.id) : projects;
+
+  const knownBoxIds = new Set(boxes.map(b => b.id));
+  const groups: {
+    key: string; label: string; color: string | null;
+    dot?: string; note?: string | null; rows: typeof projects;
+    /** Claude Code cloud sessions running on this box. */
+    cloud?: CloudSession[];
+  }[] = [];
+
+  [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
+    const rows = sortPinned(rest.filter(p => p.instanceId === b.id));
+    const cloudRows = cloud.byBox.get(b.id) ?? [];
+    if (!rows.length && !cloudRows.length) return;
+    const display = boxDisplay(b.status);
+    groups.push({
+      key: b.id,
+      label: b.name,
+      color: boxStripeColor(b.id),
+      dot: display.dot,
+      note: display.label,
+      rows,
+      cloud: cloudRows,
+    });
+  });
+  // Runs on a box the list no longer has (terminated under a live
+  // runner, before the lost sweep ends it): still shown, as a group
+  // of their own, so the header count and the rows agree.
+  // Only once the box list has loaded: before that every box is
+  // "missing" and live sessions would flash as removed.
+  if (boxesLoaded) {
+    const elsewhere = cloudElsewhere(cloud.byBox, knownBoxIds);
+    if (elsewhere.length) groups.push({ key: '__cloud_elsewhere', label: 'Cloud sessions on removed boxes', color: null, rows: [], cloud: elsewhere });
+  }
+  // Sessions the orchestrator could not place yet: no box, every slot
+  // full, GitHub not connected. The reason is the one the Activity
+  // tab shows, so the owner reads the same thing in both places.
+  if (cloud.queued.length) {
+    groups.push({ key: '__cloud_queued', label: 'Queued cloud sessions', color: null, rows: [], cloud: cloud.queued });
+  }
+
+  const shared = sortPinned(rest.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
+  if (shared.length) groups.push({ key: '__shared', label: 'Shared with me', color: null, rows: shared });
+
+  const local = sortPinned(rest.filter(p => !p.instanceId));
+  if (local.length) groups.push({ key: '__local', label: 'This host', color: null, rows: local });
+
+  if (metaterm) groups.unshift({ key: '__metaterm', label: 'MetaTerm', color: 'var(--accent)', rows: [metaterm] });
+
+  // MetaTerm is a single row, so the only group with nothing to fold. While
+  // selecting, every group shows expanded so no selected row is hidden.
+  const collapsibleKeys = groups.filter(g => g.key !== '__metaterm').map(g => g.key);
+  const allCollapsed = collapsibleKeys.length > 0 && collapsibleKeys.every(k => collapsedGroups.has(k));
+  // Folding a group cancels an edit open in a row it hides (the open
+  // project's row stays, and so does its branch-off form).
+  function applyCollapsed(next: Set<string>) {
+    for (const g of groups) {
+      if (!next.has(g.key) || collapsedGroups.has(g.key)) continue;
+      if (branchOffProjectId && branchOffProjectId !== activeProjectId && g.rows.some(p => p.id === branchOffProjectId)) setBranchOffProjectId(null);
+      if (cloudRenameKey && g.cloud?.some(c => c.key === cloudRenameKey)) cancelCloudRename();
+    }
+    updateCollapsed(next);
+  }
+  function toggleGroup(key: string) {
+    const next = new Set(collapsedGroups);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    applyCollapsed(next);
+  }
+  function setAllCollapsed(collapsed: boolean) {
+    const next = new Set(collapsedGroups);
+    for (const k of collapsibleKeys) if (collapsed) next.add(k); else next.delete(k);
+    applyCollapsed(next);
+  }
+  const toggleOnKey = (key: string) => (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGroup(key); }
+  };
+  // A collapsed group's rollup: one status per agent workstream session and
+  // per cloud session, and the stops nobody has looked at yet.
+  function rollupOf(g: typeof groups[number]) {
+    const statuses: AgentStatusValue[] = [
+      ...g.rows.flatMap(p => agentWorkstreamSessions(p).map(({ session }) => statusMap[statusKey(p.instanceId, session)]?.status ?? 'not_running')),
+      ...(g.cloud ?? []).map(c => cloudDotStatus(c, statusMap)),
+    ];
+    const unseen = g.rows.reduce((n, p) => n + (unseenByProject.get(p.id)?.length ?? 0), 0);
+    return groupRollup(statuses, unseen);
+  }
+
   return (
     <div className="project-control">
       {/* Pinned top strip: header, create form, and filter stay visible while
@@ -1306,7 +1606,7 @@ export function ProjectControl() {
                   "Full UI" opt-out so the redirect works again on that browser. */}
               <button
                 className="btn-ghost"
-                onClick={() => { writeOptOut(typeof localStorage !== 'undefined' ? localStorage : null, false); navigate('/m'); }}
+                onClick={() => { optBackIntoMobile(); navigate('/m'); }}
                 title="Phone view"
                 aria-label="Phone view"
               >📱</button>
@@ -1333,14 +1633,38 @@ export function ProjectControl() {
 
         {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
 
-        <button
-          type="button"
-          className="btn-primary new-project-btn"
-          onClick={() => { setRepoPromptBoxId(undefined); setShowNewProject(true); }}
-        >New project</button>
+        {(() => {
+          const asAutomation = automationsOn && shiftHeld && overNewProject;
+          const open = (mode: NewProjectMode) => { setRepoPromptBoxId(undefined); setNewProjectMode(mode); setShowNewProject(true); };
+          return (
+            <div className={`new-project-split${automationsOn ? ' has-caret' : ''}`}>
+              <button
+                type="button"
+                className={`btn-primary new-project-btn${asAutomation ? ' as-automation' : ''}`}
+                data-analytics="new-project"
+                aria-label={asAutomation ? 'New automation' : 'New project'}
+                title={automationsOn ? 'Hold Shift for a new automation' : undefined}
+                onMouseEnter={() => setOverNewProject(true)}
+                onMouseLeave={() => setOverNewProject(false)}
+                // A Shift-click makes an automation whatever the label happened
+                // to say: a key released mid-click still does what was seen.
+                onClick={e => open(automationsOn && (e.shiftKey || asAutomation) ? 'automation' : 'project')}
+              >{asAutomation ? 'New automation' : 'New project'}</button>
+              {automationsOn && (
+                <button
+                  type="button"
+                  className="btn-primary new-project-caret"
+                  aria-label="New automation"
+                  title="New automation: a prompt an agent runs on a schedule"
+                  onClick={() => open('automation')}
+                >⏱</button>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Replaces the old project-name Filter…. */}
-        <SearchPalette />
+        <SearchPalette actions={paletteActions} />
 
         {/* Pinned, not in the scroll below: a stop you haven't looked at must
             not scroll out of sight. The list scrolls
@@ -1396,6 +1720,15 @@ export function ProjectControl() {
       <section className="control-section">
         <div className="control-section-head">
           <h3>Projects</h3>
+          {collapsibleKeys.length > 0 && !selectMode && (
+            <button
+              className="btn-ghost btn-select-toggle btn-collapse-all"
+              onClick={() => setAllCollapsed(!allCollapsed)}
+              title={allCollapsed ? 'Expand every box: show all its projects' : 'Collapse every box to one summary line (click a box header to toggle one)'}
+            >
+              {allCollapsed ? '▾ Expand' : '▸ Collapse'}
+            </button>
+          )}
           <button
             className="btn-ghost btn-select-toggle"
             onClick={() => { setMenuOpenId(null); selectMode ? exitSelectMode() : setSelectMode(true); }}
@@ -1503,12 +1836,25 @@ export function ProjectControl() {
 
             const renderRow = (p: typeof projects[0]) => {
               const branchingOff = branchOffProjectId === p.id;
-              const showWorkstreams = p.workstreams.length > 1;
+              const auto = automationFor(p);
+              const isAutomation = projectKindTraits(p.kind).isAutomation;
+              // An automation's runs always show, newest first and without
+              // main (no agent ever runs there); the last few, then the page.
+              const runRows = isAutomation
+                ? [...p.workstreams.filter(ws => ws.name !== 'main')].sort((a, b) => b.name.localeCompare(a.name))
+                : p.workstreams;
+              const shownRows = isAutomation ? runRows.slice(0, 5) : runRows;
+              const showWorkstreams = isAutomation ? runRows.length > 0 : p.workstreams.length > 1;
               const activeWs = getActiveWorkstream(p.id);
               const owner = p.ownerUsername ?? user?.unixUsername ?? '';
               return (
                 <React.Fragment key={p.id}>
                   {renderProjectItem(p)}
+                  {isAutomation && (
+                    <li className="project-automation-sub" onClick={() => navigate(`/automations/${encodeURIComponent(p.id)}`)} title="Open the automation">
+                      {auto ? automationSubtitle(auto, auto.timezone) : 'automation'}
+                    </li>
+                  )}
                   {branchingOff && (
                     <li className="project-workstream-branch-off">
                       <form
@@ -1522,7 +1868,7 @@ export function ProjectControl() {
                           onChange={e => setNewWorkstreamName(e.target.value)}
                           placeholder="workstream name (also branch)"
                         />
-                        <button type="submit" title="Branch off">+</button>
+                        <button type="submit" title="Branch off" aria-label="Create workstream" data-analytics="workstream-create">+</button>
                         <button
                           type="button"
                           className="btn-tiny"
@@ -1531,7 +1877,7 @@ export function ProjectControl() {
                       </form>
                     </li>
                   )}
-                  {showWorkstreams && p.workstreams.map(ws => {
+                  {showWorkstreams && shownRows.map(ws => {
                     const wsSession = buildSessionName(owner, p.name, 'agent', ws.name);
                     const wsHasAgent = p.workflows.some(
                       w => w.workstreamId === ws.id && w.type === 'agent',
@@ -1544,8 +1890,14 @@ export function ProjectControl() {
                       <li
                         key={ws.id}
                         className={`project-workstream-item ${wsUnseen ? `unseen-${wsUnseen}` : ''} ${activeProjectId === p.id && activeWs === ws.name ? 'active' : ''}`}
-                        onClick={() => openWorkstream(p.id, ws.name)}
-                        title={`branch: ${ws.branch}`}
+                        data-analytics="workstream-switch"
+                        // A run's conversation lives only in the chat runner; its full UI
+                        // pane is a shell that cannot show it.
+                        onClick={() => {
+                          if (!isAutomation) openWorkstream(p.id, ws.name);
+                          else navigate(simpleUi ? chatHref(p.id, ws.name) : `/automations/${encodeURIComponent(p.id)}`);
+                        }}
+                        title={isAutomation ? (simpleUi ? "Open this run's conversation" : 'Open the automation') : `branch: ${ws.branch}`}
                       >
                         <span className={`workstream-status${statusesStale ? ' stale' : ''}`}>
                           {wsHasAgent ? <StatusDot status={wsStatus} /> : '—'}
@@ -1560,6 +1912,10 @@ export function ProjectControl() {
                           )}
                         </span>
                         <span className="workstream-marker">↳</span>
+                        {isAutomation && auto && (() => {
+                          const run = auto.lastRun && auto.lastRun.workstream === ws.name ? auto.lastRun : null;
+                          return run ? <span className={`run-state run-${run.state}`} title={RUN_STATE_LABEL[run.state] ?? run.state}>{RUN_STATE_LABEL[run.state] ?? run.state}</span> : null;
+                        })()}
                         {renamingId === ws.id ? (
                           <input
                             className="project-rename-input"
@@ -1576,11 +1932,11 @@ export function ProjectControl() {
                         ) : (
                           <span
                             className="workstream-name"
-                            onDoubleClick={ws.name !== 'main' && p.role !== 'collaborator' ? (e => {
+                            onDoubleClick={ws.name !== 'main' && p.role !== 'collaborator' && !isAutomation ? (e => {
                               e.stopPropagation();
                               beginRename(ws.id, ws.name);
                             }) : undefined}
-                          >{ws.name}</span>
+                          >{isAutomation ? runLabel(ws.name, auto?.timezone) : ws.name}</span>
                         )}
                         {wsUnseen && <span className={`unseen-stop-dot is-${wsUnseen}`} title="Stopped since you looked" />}
                         {p.role !== 'collaborator' && (
@@ -1593,9 +1949,9 @@ export function ProjectControl() {
                               borderColor: wsConfig.color.bright.replace(/[\d.]+\)$/, '0.45)'),
                               background: wsConfig.color.base.replace(/[\d.]+\)$/, '0.16)'),
                             }}
-                            title={`runtime: ${wsConfig.displayName}`}
+                            title={`runtime: ${wsConfig.displayName}${backendNote(storedWorkstreamBackend(p, ws))}${modelNote(storedWorkstreamModel(p, ws))}`}
                           >
-                            {wsConfig.badge}
+                            {wsConfig.badge}{backendBadge(storedWorkstreamBackend(p, ws))}
                           </span>
                         )}
                         {ws.name !== 'main' && p.role !== 'collaborator' && (
@@ -1606,26 +1962,28 @@ export function ProjectControl() {
                             >⋮</button>
                             {menuOpenId === ws.id && (
                               <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
-                                <button onClick={() => { beginRename(ws.id, ws.name); setMenuOpenId(null); }}>
-                                  Rename
-                                </button>
-                                {wsHasAgent && (
-                                  <button onClick={() => { setSwitchTarget({ project: p, ws }); setMenuOpenId(null); }}>
-                                    Switch agent…
+                                {!isAutomation && (
+                                  <button onClick={() => { beginRename(ws.id, ws.name); setMenuOpenId(null); }}>
+                                    Rename
                                   </button>
                                 )}
-                                {wsHasAgent && handoffOn && p.kind !== 'metaterm' && canHandOff(storedWorkstreamProvider(p, ws)) && (
+                                {projectKindTraits(p.kind).canSwitchAgent && (
+                                  <button onClick={() => { setSwitchTarget({ project: p, ws }); setMenuOpenId(null); }}>
+                                    {wsHasAgent ? 'Switch agent…' : 'Start agent…'}
+                                  </button>
+                                )}
+                                {wsHasAgent && handoffOn && projectKindTraits(p.kind).canHandOff && canHandOff(storedWorkstreamProvider(p, ws)) && (
                                   <button onClick={() => { setHandoffError(''); setHandoffTarget({ project: p, ws }); setMenuOpenId(null); }}>
                                     Hand off…
                                   </button>
                                 )}
                                 {slackCollabOn && (
-                                  <button onClick={() => { setShareError(''); setShareTarget({ project: p, ws }); setMenuOpenId(null); }}>
+                                  <button data-analytics="workstream-share-slack" onClick={() => { setShareError(''); setShareTarget({ project: p, ws }); setMenuOpenId(null); }}>
                                     Share to Slack…
                                   </button>
                                 )}
-                                <button className="menu-danger" onClick={() => { deleteWorkstream(p, ws); setMenuOpenId(null); }}>
-                                  Delete
+                                <button className="menu-danger" onClick={() => { if (isAutomation && auto) retireRun(p, ws, auto); else deleteWorkstream(p, ws); setMenuOpenId(null); }}>
+                                  {isAutomation ? 'Retire run' : 'Delete'}
                                 </button>
                               </div>
                             )}
@@ -1634,78 +1992,15 @@ export function ProjectControl() {
                       </li>
                     );
                   })}
+                  {isAutomation && runRows.length > shownRows.length && (
+                    <li className="project-workstream-item project-automation-more" onClick={() => navigate(`/automations/${encodeURIComponent(p.id)}`)}>
+                      <span className="workstream-marker">↳</span>
+                      <span className="workstream-name usage-dim">all {runRows.length} runs…</span>
+                    </li>
+                  )}
                 </React.Fragment>
               );
             };
-
-            // Pinned projects float to the top of their own box group.
-            const sortPinned = (arr: typeof projects) => [
-              ...arr.filter(p => p.pinned),
-              ...arr.filter(p => !p.pinned),
-            ];
-
-            // Group projects by box: one group per box that has projects (sorted
-            // by box name), then collaborator projects on boxes I don't own, then
-            // legacy "this host" projects (no instance). Empty groups are hidden.
-            // MetaTerm — the per-user control tower — is pinned above every box
-            // group. Pull it out so it doesn't also land under "This host".
-            // Hidden unless opted in; still shown while it is the open project,
-            // so the sidebar never loses the session on screen.
-            const metatermProject = projects.find(p => p.kind === 'metaterm');
-            const visibility = metatermVisibility({
-              optedIn: theme.sidebarMetaTerm,
-              metatermId: metatermProject?.id ?? null,
-              activeProjectId: activeProjectId ?? null,
-            });
-            const metaterm = visibility.showRow ? metatermProject : undefined;
-            const rest = metatermProject ? projects.filter(p => p.id !== metatermProject.id) : projects;
-
-            const knownBoxIds = new Set(boxes.map(b => b.id));
-            const groups: {
-              key: string; label: string; color: string | null;
-              dot?: string; note?: string | null; rows: typeof projects;
-              /** Claude Code cloud sessions running on this box. */
-              cloud?: CloudSession[];
-            }[] = [];
-
-            [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
-              const rows = sortPinned(rest.filter(p => p.instanceId === b.id));
-              const cloudRows = cloud.byBox.get(b.id) ?? [];
-              if (!rows.length && !cloudRows.length) return;
-              const display = boxDisplay(b.status);
-              groups.push({
-                key: b.id,
-                label: b.name,
-                color: boxStripeColor(b.id),
-                dot: display.dot,
-                note: display.label,
-                rows,
-                cloud: cloudRows,
-              });
-            });
-            // Runs on a box the list no longer has (terminated under a live
-            // runner, before the lost sweep ends it): still shown, as a group
-            // of their own, so the header count and the rows agree.
-            // Only once the box list has loaded: before that every box is
-            // "missing" and live sessions would flash as removed.
-            if (boxesLoaded) {
-              const elsewhere = cloudElsewhere(cloud.byBox, knownBoxIds);
-              if (elsewhere.length) groups.push({ key: '__cloud_elsewhere', label: 'Cloud sessions on removed boxes', color: null, rows: [], cloud: elsewhere });
-            }
-            // Sessions the orchestrator could not place yet: no box, every slot
-            // full, GitHub not connected. The reason is the one the Activity
-            // tab shows, so the owner reads the same thing in both places.
-            if (cloud.queued.length) {
-              groups.push({ key: '__cloud_queued', label: 'Queued cloud sessions', color: null, rows: [], cloud: cloud.queued });
-            }
-
-            const shared = sortPinned(rest.filter(p => p.instanceId && !knownBoxIds.has(p.instanceId)));
-            if (shared.length) groups.push({ key: '__shared', label: 'Shared with me', color: null, rows: shared });
-
-            const local = sortPinned(rest.filter(p => !p.instanceId));
-            if (local.length) groups.push({ key: '__local', label: 'This host', color: null, rows: local });
-
-            if (metaterm) groups.unshift({ key: '__metaterm', label: 'MetaTerm', color: 'var(--accent)', rows: [metaterm] });
 
             return (
               <>
@@ -1719,21 +2014,51 @@ export function ProjectControl() {
                     <span className="project-group-count">{metatermBusy ? '…' : 'open'}</span>
                   </li>
                 )}
-                {groups.map(g => (
+                {groups.map(g => {
+                  const collapsible = g.key !== '__metaterm' && !selectMode;
+                  const collapsed = collapsible && collapsedGroups.has(g.key);
+                  const stripe = g.color ? ({ ['--box-stripe' as any]: g.color } as React.CSSProperties) : undefined;
+                  const rollup = collapsed ? rollupOf(g) : null;
+                  return (
               <React.Fragment key={g.key}>
                 <li
-                  className="project-group-header"
-                  style={g.color ? ({ ['--box-stripe' as any]: g.color } as React.CSSProperties) : undefined}
+                  className={`project-group-header${collapsible ? ' collapsible' : ''}`}
+                  style={stripe}
+                  {...(collapsible ? {
+                    role: 'button',
+                    tabIndex: 0,
+                    'aria-expanded': !collapsed,
+                    title: collapsed ? `Expand ${g.label}: show its projects` : `Collapse ${g.label} to one summary line`,
+                    onClick: () => toggleGroup(g.key),
+                    onKeyDown: toggleOnKey(g.key),
+                  } : {})}
                 >
+                  {collapsible && <span className="project-group-chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>}
                   {g.dot && <span className="project-group-dot" style={{ background: g.dot }} />}
                   <span className="project-group-name" title={g.label}>{g.label}</span>
                   {g.note && <span className="project-group-note">{g.note}</span>}
                   <span className="project-group-count">{g.rows.length + (g.cloud?.length ?? 0)}</span>
                 </li>
-                {g.rows.map(renderRow)}
-                {g.cloud?.map(renderCloudRow)}
+                {rollup && (
+                  <li
+                    className="project-group-summary"
+                    style={stripe}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => toggleGroup(g.key)}
+                    onKeyDown={toggleOnKey(g.key)}
+                    title={`${rollup.label}. Click to expand.`}
+                  >
+                    <span className={`project-status${statusesStale ? ' stale' : ''}`}><StatusDot status={rollup.top} /></span>
+                    <span className="project-group-summary-text">{rollup.label}</span>
+                  </li>
+                )}
+                {/* Collapsed, the open project still shows, so the sidebar never loses the session on screen. */}
+                {(collapsed ? g.rows.filter(p => p.id === activeProjectId) : g.rows).map(renderRow)}
+                {!collapsed && g.cloud?.map(renderCloudRow)}
               </React.Fragment>
-                ))}
+                  );
+                })}
               </>
             );
           })()}
@@ -1807,7 +2132,26 @@ export function ProjectControl() {
                       style={{ background: display.dot }}
                       title={(b.status === 'failed' || showsBoxError(b)) && b.provisioningError ? b.provisioningError : b.status}
                     />
-                    <span className="box-name" title={boxNameTitle(b.hostname, b.imageId)}>{b.name}</span>
+                    {renamingId === b.id ? (
+                      <input
+                        className="project-rename-input box-rename-input"
+                        aria-label={`New name for ${b.name}`}
+                        value={renameValue}
+                        onChange={e => setRenameValue(e.target.value)}
+                        onBlur={() => renameBox(b)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') renameBox(b);
+                          if (e.key === 'Escape') cancelRename();
+                        }}
+                        autoFocus
+                      />
+                    ) : (
+                      <span
+                        className="box-name"
+                        title={boxNameTitle(b.hostname, b.imageId)}
+                        onDoubleClick={boxRenameOn ? () => beginRename(b.id, b.name) : undefined}
+                      >{b.name}</span>
+                    )}
                     {(b.onClaimStatus === 'pending' || b.onClaimStatus === 'running') && (
                       <button type="button" className="box-claim-badge" title="Applying dotfiles">personalizing</button>
                     )}
@@ -1851,6 +2195,9 @@ export function ProjectControl() {
                               title="Hibernate this box on its own after it has been idle for a while"
                               onClick={() => { setLifecycleBox(b); setBoxMenuOpenId(null); }}
                             >Auto-park…</button>
+                          )}
+                          {boxRenameOn && (
+                            <button onClick={() => { beginRename(b.id, b.name); setBoxMenuOpenId(null); }}>Rename…</button>
                           )}
                           {spacesOn && b.status !== 'terminated' && (
                             <button
@@ -2023,6 +2370,7 @@ export function ProjectControl() {
       </div>
       {showNewProject && (
         <NewProjectDialog
+          mode={newProjectMode}
           initialBoxId={repoPromptBoxId}
           onClose={() => setShowNewProject(false)}
           onBranchOff={projectId => {
@@ -2068,6 +2416,9 @@ export function ProjectControl() {
         <SwitchAgentDialog
           title={switchTarget.ws.name === 'main' ? switchTarget.project.name : `${switchTarget.project.name} / ${switchTarget.ws.name}`}
           current={storedWorkstreamProvider(switchTarget.project, switchTarget.ws)}
+          currentBackend={storedWorkstreamBackend(switchTarget.project, switchTarget.ws)}
+          currentModel={storedWorkstreamModel(switchTarget.project, switchTarget.ws)}
+          start={workstreamHasAgent(switchTarget.project, switchTarget.ws) ? undefined : storedWorkstreamProvider(switchTarget.project, switchTarget.ws)}
           busy={switchBusy}
           onSwitch={switchAgent}
           onCancel={() => { if (!switchBusy) setSwitchTarget(null); }}

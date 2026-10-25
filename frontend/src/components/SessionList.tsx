@@ -5,6 +5,7 @@ import { StatusDot } from './StatusDot';
 import { fmtAge } from '../utils/format';
 import { reviewRingTooltip } from '../utils/reviewRing';
 import { FOCUS_PANE_EVENT, FocusPaneDetail, resolveWorkstream, WorkspaceTarget } from '../utils/workspaceTarget';
+import { BoxPill } from './BoxPill';
 
 /**
  * Switch the workspace to a target: the
@@ -29,8 +30,10 @@ export function useOpenTarget(): (t: WorkspaceTarget) => void {
 }
 
 /** One row, exported for the palette's mixed lists; data-index drives keyboard highlighting. */
-export function SessionItem({ row, now, index, active, onSelect }: {
+export function SessionItem({ row, now, index, active, onSelect, box }: {
   row: InboxRow; now: number; index: number; active: boolean; onSelect: (row: InboxRow) => void;
+  /** The box's name, shown as its pill (the simple UI's ⌘K). */
+  box?: string | null;
 }) {
   const since = stateSince(row);
   const age = since ? now - Date.parse(since) : NaN;
@@ -48,6 +51,7 @@ export function SessionItem({ row, now, index, active, onSelect }: {
             {row.workstream !== 'main' && <span className="workstream-bar-badge">{row.workstream}</span>}
             {row.shared && <span className="recents-tag" title={`Owned by ${row.owner}`}>shared</span>}
             {row.kind === 'cloud' && <span className="recents-tag">cloud</span>}
+            {box && <BoxPill instanceId={row.instanceId} label={box} className="recents-box" />}
           </span>
           <span className="recents-detail session-list-detail">{detail}</span>
         </span>

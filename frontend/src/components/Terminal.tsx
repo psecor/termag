@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Terminal as XTerm } from 'xterm';
+import { Terminal as XTerm, type IBufferCell, type ILink } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import 'xterm/css/xterm.css';
@@ -7,9 +7,13 @@ import { useConnection } from '../contexts/ConnectionContext';
 import { shouldKickTerminalOnGlobalRecovery, TerminalPaneState } from '../utils/connection';
 import { connectionTracker } from '../utils/connectionTracker';
 import { noteFirstTerminalData } from '../services/claimTiming';
+import { recordProductEventOnce } from '../observability';
+import { isAgentPaneSession } from '../utils/sessionName';
 import { boxStatusBus } from '../utils/boxStatusBus';
 import { customKeySequence } from '../utils/terminalKeys';
 import { guardViewportAfterDispose, hasLayoutSize } from '../utils/xtermLifecycle';
+import { findImagePathLinks, imagePreviewUrl, RowText } from '../utils/imagePathLinks';
+import { ImagePreviewAnchor, TerminalImagePreview } from './TerminalImagePreview';
 import {
   BoxParkedNotice,
   FAILED_AFTER_ATTEMPTS,
@@ -130,6 +134,28 @@ async function blobToPngBase64(blob: Blob): Promise<string> {
   return canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, '');
 }
 
+// How long the pointer rests on an image path before its preview opens, so
+// sweeping across a pane does not read every screenshot it passes.
+const IMAGE_PREVIEW_DELAY_MS = 180;
+
+/** One buffer row as text plus the cell each UTF-16 unit sits in (wide glyphs take two). */
+function bufferRowText(term: XTerm, row: number, cell: { current?: IBufferCell }): RowText | undefined {
+  const line = term.buffer.active.getLine(row);
+  if (!line) return undefined;
+  let text = '';
+  const cells: number[] = [];
+  for (let x = 0; x < line.length; x++) {
+    const c = line.getCell(x, cell.current);
+    if (!c) break;
+    cell.current = c;
+    if (c.getWidth() === 0) continue;
+    const chars = c.getChars() || ' ';
+    for (let i = 0; i < chars.length; i++) cells.push(x);
+    text += chars;
+  }
+  return { text, cells };
+}
+
 function imageFromClipboardData(dt: DataTransfer | null): File | null {
   if (!dt) return null;
   for (const file of Array.from(dt.files)) {
@@ -156,6 +182,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
   const [selectMode, setSelectMode] = useState(false);
   const selectModeRef = useRef(false);
   const [focused, setFocused] = useState(false);
+  const [imagePreview, setImagePreview] = useState<ImagePreviewAnchor | null>(null);
 
   // Reconnect lifecycle
   const [connectionState, setConnectionState] = useState<TerminalPaneState>('connecting');
@@ -234,6 +261,37 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.loadAddon(new WebLinksAddon());
+    // Image paths an agent printed (screenshots) preview on hover and open on
+    // click; the box reads the file (utils/imagePathLinks.ts, GET /api/projects/:id/image).
+    let previewTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearPreview = () => {
+      if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
+      setImagePreview(null);
+    };
+    const imageLinks = projectId ? term.registerLinkProvider({
+      provideLinks(bufferLineNumber, callback) {
+        const cell: { current?: IBufferCell } = {};
+        const found = findImagePathLinks(r => bufferRowText(term, r, cell), bufferLineNumber - 1, term.cols);
+        callback(found.length === 0 ? undefined : found.map((l): ILink => {
+          const url = imagePreviewUrl(projectId, workstream, l.path);
+          return {
+            text: l.path,
+            range: { start: { x: l.start.col + 1, y: l.start.row + 1 }, end: { x: l.end.col + 1, y: l.end.row + 1 } },
+            decorations: { underline: true, pointerCursor: true },
+            activate: () => { clearPreview(); window.open(url, '_blank', 'noopener'); },
+            hover: (ev) => {
+              if (previewTimer) clearTimeout(previewTimer);
+              const { clientX: x, clientY: y } = ev;
+              previewTimer = setTimeout(() => {
+                previewTimer = null;
+                setImagePreview({ url, path: l.path, x, y });
+              }, IMAGE_PREVIEW_DELAY_MS);
+            },
+            leave: clearPreview,
+          };
+        }));
+      },
+    }) : null;
     term.open(container);
     guardViewportAfterDispose(term);
     // Route OSC 52 (clipboard) sequences emitted by tmux to the browser clipboard.
@@ -395,6 +453,14 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
           ws.send(JSON.stringify({ type: 'input', data }));
         }
         if (onActivity) onActivity();
+        // The first Enter keyed into an agent pane this page load (AGENTS.md
+        // "Product events"): that a prompt was sent, never what was typed. A
+        // keyed Enter arrives alone; a pasted text's line breaks are not one.
+        // The pane by its role suffix, as the mobile conversation gates on
+        // its role: a ctrl pane of a project named after agents is not it.
+        if (data === '\r' && isAgentPaneSession(sessionName)) {
+          recordProductEventOnce('first.prompt', { 'termag.pane': 'terminal' });
+        }
       };
       const dataDisposable = term.onData(sendInput);
 
@@ -513,6 +579,8 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
     return () => {
       disposed = true;
       unsubscribeBoxStatus();
+      imageLinks?.dispose();
+      clearPreview();
       cancelAnimationFrame(initTimer);
       if (retryTimer) clearTimeout(retryTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
@@ -571,6 +639,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       >
         {selectMode ? '✂ select' : '⇕ scroll'}
       </button>
+      {imagePreview && <TerminalImagePreview anchor={imagePreview} />}
       {connectionState === 'parked' && parked && (
         <div className="terminal-parked-notice" role="status" aria-live="polite">
           {parked.status === 'starting' ? (

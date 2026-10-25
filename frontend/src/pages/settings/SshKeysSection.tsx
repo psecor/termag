@@ -4,6 +4,7 @@ import { sshKeysApi, SshKeyInfo } from '../../services/api';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { sshKeyNotice, SshKeyNotice } from './sshKeyNotice';
 import { DocsLink } from './DocsLink';
+import { recordProductEvent } from '../../observability';
 
 function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
@@ -71,6 +72,8 @@ export const SshKeysSection = forwardRef<SshKeysSectionHandle, { onBusyChange?: 
     return change(async () => {
       try {
         const { boxes, ...key } = await sshKeysApi.add(draft.trim());
+        // The key's type and how many boxes took it; never the key.
+        recordProductEvent('sshkey.added', { 'termag.keyType': key.type, 'termag.boxesUpdated': boxes?.updated.length ?? 0 });
         if (mounted.current) { setKeys(prev => [...(prev ?? []), key]); setDraft(''); }
         return sshKeyNotice('added', boxes);
       } catch (err) {
@@ -160,7 +163,7 @@ export const SshKeysSection = forwardRef<SshKeysSectionHandle, { onBusyChange?: 
             aria-label="SSH public key"
             spellCheck={false}
           />
-          <button type="submit" disabled={busy || !draft.trim()}>{busy ? 'Updating boxes…' : 'Add key'}</button>
+          <button type="submit" data-analytics="sshkey-add" aria-label="Add SSH key" disabled={busy || !draft.trim()}>{busy ? 'Updating boxes…' : 'Add key'}</button>
         </form>
       </div>
       {confirming && createPortal(

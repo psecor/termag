@@ -4,15 +4,17 @@ import { useProjects } from '../../contexts/ProjectContext';
 import { useConnection } from '../../contexts/ConnectionContext';
 import { HOME_FILTERS, HomeFilter, matchesFilter, parseFilter } from '../../mobile/inbox';
 import { useHome } from '../../mobile/useHome';
-import { writeOptOut } from '../../mobile/redirect';
 import { prsApi } from '../../services/api';
 import { usePolled } from '../dashboard/useDashboardData';
-import { actionableCount } from '../../utils/prPipeline';
+import { myReviewCount, prsStale } from '../../utils/prPipeline';
 import { SessionRow, useRowActions } from './SessionRow';
 import { TabBar } from './TabBar';
 import { Sheet } from './Sheet';
 import { BriefingCard, useBriefingLatest } from '../../components/BriefingCard';
 import { openCount } from '../../components/briefing';
+import { PullScroll } from './PullScroll';
+import { AppMenu } from './AppMenu';
+import { FLAGS, useFlag } from '../../flags';
 
 const EMPTY: Record<HomeFilter, string> = {
   attention: 'Nothing is waiting on you.',
@@ -25,15 +27,17 @@ const EMPTY: Record<HomeFilter, string> = {
 // double as filters. The filter lives in the URL (?f=) so Back from a
 // conversation returns to it.
 export function Inbox() {
+  const automationsOn = useFlag(FLAGS.automations, false);
   const { projects } = useProjects();
   const connection = useConnection();
-  const navigate = useNavigate();
   const { rows, counts, now } = useHome();
   const actions = useRowActions();
-  // The PRs link counts lanes 5 + 6, the ones a phone can act on. The backend
-  // memoizes per user, so this and the PR screen share one GitHub read.
+  // The PRs link counts reviews asked of you by name, as the web tile does.
+  // The backend memoizes per user, so this and the PR screen share one GitHub read.
   const prs = usePolled(() => prsApi.list(), 60_000);
-  const prCount = actionableCount(prs.data);
+  const prCount = myReviewCount(prs.data);
+  // Out of date (utils/prPipeline prsStale): the count dims and takes a "?", the title says why.
+  const prsOld = prsStale(prs.data, prs.error, now);
   // The latest daily briefing as one strip tile; hidden until there is one.
   const briefing = useBriefingLatest();
   const [briefingOpen, setBriefingOpen] = useState(false);
@@ -56,11 +60,6 @@ export function Inbox() {
     return () => { document.title = 'termag'; };
   }, [counts.attention]);
 
-  const fullUi = () => {
-    writeOptOut(typeof localStorage !== 'undefined' ? localStorage : null, true);
-    navigate('/');
-  };
-
   // The retired Recents tab lives on as the Search tab's recent sessions.
   if (params.get('g') === 'recents') return <Navigate to="/m/search" replace />;
 
@@ -70,12 +69,13 @@ export function Inbox() {
         <span className="m-title">termag</span>
         <span className="m-header-actions">
           {prs.data?.connected && (
-            <Link className="m-link m-prs-link" to="/m/prs" title="Pull requests: reviews asked of you + yours ready to merge">
-              PRs{prCount > 0 && <span className="m-segment-count m-prs-count">{prCount}</span>}
+            <Link className="m-link m-prs-link" to="/m/prs" title={prsOld ?? 'Pull requests: reviews asked of you by name'}>
+              PRs{(prCount > 0 || prsOld) && <span className={`m-segment-count m-prs-count${prsOld ? ' is-stale' : ''}`}>{prCount}{prsOld ? '?' : ''}</span>}
             </Link>
           )}
-          <Link className="m-link" to="/m/new" title="New project">+ New</Link>
-          <button className="m-link" onClick={fullUi}>Full UI</button>
+          <Link className="m-link" to="/m/new" title="New project" aria-label="New project" data-analytics="new-project">+ New</Link>
+          {automationsOn && <Link className="m-link" to="/m/new-automation" title="New automation: a prompt an agent runs on a schedule">⏱ Automation</Link>}
+          <AppMenu />
           <Link className="m-link" to="/settings" aria-label="Settings" title="Settings">⚙</Link>
         </span>
       </header>
@@ -122,7 +122,7 @@ export function Inbox() {
         </Sheet>
       )}
       {actions.error && <div className="m-banner" data-connection="offline" role="alert" onClick={actions.clearError}>{actions.error} · tap to dismiss</div>}
-      <main className="m-scroll">
+      <PullScroll onRefresh={prs.refresh}>
         {shown.length === 0 && (
           <div className="m-empty">
             {projects.length === 0 ? 'No projects yet. Create one with + New.'
@@ -134,7 +134,7 @@ export function Inbox() {
             {shown.map(r => <SessionRow key={r.key} row={r} now={now} onMore={actions.open} />)}
           </ul>
         )}
-      </main>
+      </PullScroll>
       <TabBar attention={counts.attention} />
       {actions.sheets}
     </div>

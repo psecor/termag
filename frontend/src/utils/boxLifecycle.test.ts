@@ -50,6 +50,19 @@ describe('lifecycleNoteText', () => {
     expect(lifecycleNoteText(box('hibernating', parked), fmt)).toBe(note);
   });
 
+  it('shows the idle-stop note while the box is stopped or stopping, and not a terminate date', () => {
+    const note = 'Stopped automatically after 2 h idle. Start it to get its sessions back.';
+    const stopped = lc({
+      note, hibernatedTerminateDays: 1,
+      parkedAt: '2026-10-01T12:00:00.000Z', terminateDueAt: '2026-10-02T12:00:00.000Z',
+    });
+    expect(lifecycleNoteText(box('stopped', stopped), fmt)).toBe(note);
+    expect(lifecycleNoteText(box('stopping', stopped), fmt)).toBe(note);
+    expect(lifecycleNoteText(box('stopped', lc()))).toBeNull();
+    expect(lifecycleNote(box('stopped', lc({ note })))).toEqual({ text: 'Auto-stopped', title: note });
+    expect(lifecycleNote(box('stopping', lc({ note })))).toEqual({ text: 'Auto-stopped', title: note });
+  });
+
   it('shows what happened while the box is parked, and nothing once it is back', () => {
     const note = 'Hibernated automatically after 1 h idle. Start it to resume where you left off.';
     expect(lifecycleNoteText(box('hibernated', lc({ idleHibernateHours: 1, note })))).toBe(note);

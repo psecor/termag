@@ -1,7 +1,7 @@
 // One session as a chat: the agent pane captured and
 // parsed into turns, a key bar for the things a CLI wants pressed, and a
 // native composer that types into the pane through send-keys.
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
@@ -10,9 +10,9 @@ import { PROVIDERS } from '../../providers/registry';
 import { sessionName } from '../../utils/sessionName';
 import { statusKey } from '../../utils/statusKey';
 import { contextLevel } from '../../utils/thresholds';
-import { parsePane } from '../../chat/paneChat';
+import { Block, parsePane } from '../../chat/paneChat';
 import { BlockView, DraftView, firstTurnIndex } from '../../chat/Blocks';
-import { flattenForSend, MAX_KEYS, sendErrorText } from '../../chat/compose';
+import { draftAfterSend, flattenForSend, MAX_KEYS, sendErrorText } from '../../chat/compose';
 import { useFollowBottom } from '../../chat/useFollowBottom';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { paneKey, useCapture } from '../../chat/useCapture';
@@ -20,14 +20,20 @@ import { providerFor, STATUS_GLYPH, waitingLabel } from '../../mobile/inbox';
 import { useReview } from '../../mobile/useReview';
 import { PaneRole, reviewKeyLabel, reviewPollStatus, reviewStopCopy, reviewTabLabel, roleFromParam } from '../../mobile/review';
 import { reviewStateLabel, reviewStateText } from '../../utils/review';
+import { recordProductEventOnce } from '../../observability';
 import { ringStateFor } from '../../utils/reviewRing';
-import { writeOptOut } from '../../mobile/redirect';
+import { optOutOfMobile } from '../../mobile/redirect';
 import { ActionSheet, ConfirmSheet, Sheet, apiError } from './Sheet';
 import { HeaderPrPills } from './HeaderPrPills';
 import { ReviewSheet } from './ReviewSheet';
 import { HandoffSheet } from './HandoffSheet';
 import { FLAGS, useFlag } from '../../flags';
+import { projectKindTraits } from '../../utils/projectKind';
 import { canHandOff, handoffStateLabel, showHandoffStrip } from '../../utils/handoff';
+import { photoToPng } from '../../mobile/photo';
+import { shareText } from '../../mobile/shareOut';
+import { useWakeLock, wakeLockSupported } from '../../mobile/useWakeLock';
+import { reloadApp } from '../../mobile/useMobileRefresh';
 
 // Remembered across conversations in this tab so visits carry a previous id,
 // like the desktop's project switcher does.
@@ -111,22 +117,73 @@ export function Conversation() {
   }, [project?.id, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Follow the bottom unless the reader has scrolled up.
-  const { scroller, onScroll, unseen, jumpToBottom } = useFollowBottom(parsed, `${projectId}|${ws}|${role}`);
+  const openPane = `${projectId}|${ws}|${role}`;
+  const currentPane = useRef(openPane);
+  currentPane.current = openPane;
+  const { scroller, onScroll, unseen, jumpToBottom } = useFollowBottom(parsed, openPane);
 
   // Composer + key bar.
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  // "Image pasted into the pane" after a photo attach (below).
+  const [attachNote, setAttachNote] = useState<string | null>(null);
   // A draft belongs to the pane it was typed for; never carry it to another.
-  useEffect(() => { setText(''); setSendError(null); }, [projectId, ws, role]);
+  useEffect(() => { setText(''); setSendError(null); setAttachNote(null); }, [projectId, ws, role]);
+  // A share from another app (Share.tsx) arrives as ?draft= or ?review=. Take
+  // it once and drop it from the URL, so Back or a reload does not re-apply it.
+  // The draft is only placed in the composer; sending stays the user's tap.
+  const [sharedReview, setSharedReview] = useState<string | null>(null);
+  useEffect(() => {
+    const draft = params.get('draft');
+    const reviewUrl = params.get('review');
+    if (draft == null && reviewUrl == null) return;
+    if (draft) setText(draft.slice(0, MAX_KEYS));
+    if (reviewUrl) { setSharedReview(reviewUrl); setReviewOpen(true); }
+    const next = new URLSearchParams(params);
+    next.delete('draft'); next.delete('review');
+    setParams(next, { replace: true });
+  }, [params]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Photo attach: camera roll → PNG → the pane's clipboard mailbox.
+  const photoInput = useRef<HTMLInputElement>(null);
+  // The pane a photo is on its way to. It still lands there if the user moves
+  // on; its note or error is shown only while that pane is still the one open.
+  // One at a time on every pane: the agent's clipboard mailbox is one file per
+  // box user, so two pastes in flight could swap images (agent/clipboard-mailbox.js).
+  const [attachingTo, setAttachingTo] = useState<string | null>(null);
+  const attaching = attachingTo !== null;
+  const shareTool = useCallback((b: Block) => { void shareText(b.result ?? '', b.text || undefined); }, []);
+  const onPhoto = async (file: File | undefined) => {
+    if (!file || !project || attaching) return;
+    const target = openPane;
+    const stillHere = () => currentPane.current === target;
+    setAttachingTo(target); setSendError(null); setAttachNote(null);
+    try {
+      const png = await photoToPng(file);
+      await sessionsApi.pasteImage(project.id, role, ws, png);
+      activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
+      if (stillHere()) {
+        setAttachNote('Image pasted into the pane');
+        setTimeout(capture.refresh, 500);
+      }
+    } catch (err) {
+      const e = err as { response?: { status?: number; data?: { error?: string } }; message?: string };
+      if (stillHere()) setSendError(e.response?.data?.error ?? (e.response ? 'Could not paste the image' : e.message ?? 'Could not read the image'));
+    } finally {
+      setAttachingTo(t => (t === target ? null : t));
+      if (photoInput.current) photoInput.current.value = '';
+    }
+  };
   const offline = capture.error === 'offline';
-  const send = useCallback(async (body: { keys: string; enter: boolean; literal: boolean }, clear: boolean) => {
+  const send = useCallback(async (body: { keys: string; enter: boolean; literal: boolean }, sent: string | null) => {
     if (!project || sending) return;
     setSending(true);
     setSendError(null);
+    setAttachNote(null);
     try {
       await sessionsApi.sendKeys(project.id, role, { workstream: ws, ...body });
-      if (clear) setText('');
+      if (sent !== null) setText(t => draftAfterSend(t, sent));
       activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
       setTimeout(capture.refresh, 500);
     } catch (err) {
@@ -139,9 +196,13 @@ export function Conversation() {
   const onSend = (withEnter: boolean) => {
     const keys = flattenForSend(text);
     if (!keys) return;
-    void send({ keys, enter: withEnter, literal: true }, true);
+    // The first prompt this tab sends to an agent pane: that it was sent and from where, never the text. The agent
+    // pane only, as the desktop terminal records it; a line typed into the
+    // ctrl shell or the review pane is not a prompt.
+    if (withEnter && role === 'agent') recordProductEventOnce('first.prompt', { 'termag.pane': 'mobile' });
+    void send({ keys, enter: withEnter, literal: true }, text);
   };
-  const onQuick = (k: QuickKey) => { void send({ keys: k.keys, enter: k.enter, literal: k.literal }, false); };
+  const onQuick = (k: QuickKey) => { void send({ keys: k.keys, enter: k.enter, literal: k.literal }, null); };
   // Only the last block can be a live question: an answered one stays in
   // scrollback as a dialog block too, and must not keep its digit chips.
   const lastBlock = parsed?.blocks[parsed.blocks.length - 1];
@@ -183,11 +244,14 @@ export function Conversation() {
     return () => clearInterval(t);
   }, [handoff]);
   const [actionError, setActionError] = useState('');
+  const [keepAwake, setKeepAwake] = useState(false);
+  const awake = useWakeLock(keepAwake);
+  const lastReply = parsed ? [...parsed.blocks].reverse().find(b => b.kind === 'agent' && b.text.trim()) : undefined;
   const closeMenu = useCallback(() => setMenuOpen(false), []);
   const closeBranch = useCallback(() => { setBranchOpen(false); setActionError(''); }, []);
   const closeArchive = useCallback(() => setArchiveOpen(false), []);
   const openFull = () => {
-    writeOptOut(typeof localStorage !== 'undefined' ? localStorage : null, true);
+    optOutOfMobile();
     navigate(`/?project=${encodeURIComponent(projectId)}${ws !== 'main' ? `&ws=${encodeURIComponent(ws)}` : ''}`);
   };
   const togglePin = async () => {
@@ -274,6 +338,7 @@ export function Conversation() {
           {status?.rateLimited ? <span className="m-badge m-badge-danger" title={status.rateLimited}>RATE</span>
             : ctx != null && ctxLevel !== 'ok' ? <span className={`m-badge m-badge-${ctxLevel}`}>{ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(1)}M` : `${Math.round(ctx / 1000)}K`}</span>
             : null}
+          {awake && <span className="m-badge" title="Keeping the screen on">AWAKE</span>}
           <button className="m-more" onClick={() => setMenuOpen(true)} aria-label="Project actions">⋯</button>
         </div>
       </header>
@@ -288,15 +353,18 @@ export function Conversation() {
           title={`${project.name}${ws !== 'main' ? ` · ${ws}` : ''}`}
           onClose={closeMenu}
           actions={[
-            { label: 'Branch off a workstream…', onClick: () => setBranchOpen(true), disabled: project.kind === 'metaterm' || project.role === 'collaborator' },
-            { label: reviewAlive ? 'Review another PR with Devin…' : 'Review a PR with Devin…', onClick: () => setReviewOpen(true), disabled: !hasAgent || project.kind === 'metaterm' },
+            { label: 'Branch off a workstream…', onClick: () => setBranchOpen(true), disabled: !projectKindTraits(project.kind).canBranchOff || project.role === 'collaborator' },
+            { label: reviewAlive ? 'Review another PR with Devin…' : 'Review a PR with Devin…', onClick: () => setReviewOpen(true), disabled: !hasAgent || !projectKindTraits(project.kind).hasPaneActions },
             ...(reviewAlive ? [{ label: 'Stop the review…', onClick: () => setStopReviewOpen(true), danger: true }] : []),
-            ...(handoffOn && workstream && project.kind !== 'metaterm' && project.role !== 'collaborator' && canHandOff(provider)
+            ...(handoffOn && workstream && projectKindTraits(project.kind).canHandOff && project.role !== 'collaborator' && canHandOff(provider)
               ? [{ label: 'Hand off…', onClick: () => setHandoffOpen(true), disabled: !hasAgent }]
               : []),
             { label: project.pinned ? 'Unpin project' : 'Pin project', onClick: () => { void togglePin(); }, disabled: project.role === 'collaborator' },
-            { label: 'Archive project…', onClick: () => setArchiveOpen(true), danger: true, disabled: project.kind === 'metaterm' || project.role === 'collaborator' },
+            { label: 'Archive project…', onClick: () => setArchiveOpen(true), danger: true, disabled: !projectKindTraits(project.kind).canArchive || project.role === 'collaborator' },
+            ...(lastReply ? [{ label: 'Share the last reply…', onClick: () => { void shareText(lastReply.text, `${project.name} · ${agentLabel}`); } }] : []),
+            ...(wakeLockSupported() ? [{ label: keepAwake ? 'Let the screen sleep' : 'Keep screen on', onClick: () => setKeepAwake(k => !k) }] : []),
             { label: 'Open in full UI', onClick: openFull },
+            { label: 'Reload app', onClick: reloadApp },
           ]}
         />
       )}
@@ -329,7 +397,8 @@ export function Conversation() {
           currentPr={reviewAlive ? review.status?.pr ?? null : null}
           onOpenCurrent={() => { setReviewOpen(false); setRole('review'); }}
           onStarted={onReviewStarted}
-          onClose={() => setReviewOpen(false)}
+          initialValue={sharedReview ?? undefined}
+          onClose={() => { setReviewOpen(false); setSharedReview(null); }}
         />
       )}
       {handoffOpen && project && workstream && (
@@ -380,7 +449,7 @@ export function Conversation() {
         {capture.error === 'offline' && <div className="m-notice m-notice-warn">The box's agent is offline. Showing the last capture.</div>}
         {capture.error === 'denied' && <div className="m-notice m-notice-warn">This session is not reachable.</div>}
         {capture.error === 'failed' && <div className="m-notice">Capture failed · retrying</div>}
-        {parsed?.blocks.map((b, i) => <BlockView key={i} block={b} agentLabel={agentLabel} banner={b.kind === 'system' && firstTurn !== -1 && i < firstTurn} />)}
+        {parsed?.blocks.map((b, i) => <BlockView key={i} block={b} agentLabel={agentLabel} banner={b.kind === 'system' && firstTurn !== -1 && i < firstTurn} onShareTool={shareTool} />)}
         {parsed && parsed.blocks.length === 0 && !capture.error && <div className="m-empty">Nothing on screen yet.</div>}
         {parsed?.draft ? <DraftView draft={parsed.draft} /> : null}
       </div>
@@ -399,7 +468,7 @@ export function Conversation() {
             {reviewKey}
           </button>
         ) : (
-          <button className="m-key m-key-review" onClick={onReviewButton} disabled={!project || !hasAgent || project.kind === 'metaterm'}
+          <button className="m-key m-key-review" onClick={onReviewButton} disabled={!project || !hasAgent || !projectKindTraits(project.kind).hasPaneActions}
             title={reviewAlive ? 'Review another PR with Devin (replaces the running review)' : 'Review the PR being worked on with Devin'}>
             Review
           </button>
@@ -409,6 +478,21 @@ export function Conversation() {
         className="m-composer"
         onSubmit={e => { e.preventDefault(); onSend(true); }}
       >
+        <input
+          ref={photoInput}
+          type="file"
+          accept="image/*"
+          hidden
+          onChange={e => { void onPhoto(e.target.files?.[0]); }}
+        />
+        <button
+          type="button"
+          className="m-attach"
+          aria-label="Attach a photo"
+          title="Attach a photo (pasted into the pane as an image)"
+          disabled={attaching || offline || !project || !paneAvailable}
+          onClick={() => photoInput.current?.click()}
+        >{attachingTo === openPane ? '…' : '+'}</button>
         <textarea
           className="m-input"
           value={text}
@@ -425,11 +509,11 @@ export function Conversation() {
           spellCheck
           disabled={offline || !project || !paneAvailable}
         />
-        <button type="submit" className="m-send" disabled={sending || offline || !text.trim()} aria-label="Send">➤</button>
+        <button type="submit" className="m-send" data-analytics="mobile-send" disabled={sending || offline || !text.trim()} aria-label="Send">➤</button>
       </form>
-      {(sendError || text.length > MAX_KEYS - 500) && (
-        <div className="m-composer-note" data-error={sendError ? '' : undefined}>
-          {sendError ?? `${text.length} / ${MAX_KEYS}`}
+      {(sendError || attachNote || text.length > MAX_KEYS - 500) && (
+        <div className="m-composer-note" data-error={sendError ? '' : undefined} role={sendError ? 'alert' : 'status'}>
+          {sendError ?? (text.length > MAX_KEYS - 500 ? `${text.length} / ${MAX_KEYS}` : attachNote)}
         </div>
       )}
     </div>

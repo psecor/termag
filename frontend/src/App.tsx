@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { lazy, Suspense } from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { contextLevel } from './utils/thresholds';
 import { SIDEBAR_WIDTH_DEFAULT, clampSidebarWidth, effectiveSidebarWidth, readSidebarWidth, writeSidebarWidth } from './utils/sidebarWidth';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -11,6 +11,7 @@ import { FeatureFlagsProvider } from './contexts/FeatureFlagsProvider';
 import { AppErrorBoundary } from './components/AppErrorBoundary';
 import { PrsOverlay } from './components/PrsOverlay';
 import { FLAGS, useFlag } from './flags';
+import { projectKindTraits } from './utils/projectKind';
 import { ProjectControl } from './components/ProjectControl';
 import { Terminal } from './components/Terminal';
 import { Hyperspace } from './components/Hyperspace';
@@ -20,6 +21,10 @@ import { HandoffStrip } from './components/HandoffStrip';
 import { canHandOff } from './utils/handoff';
 import { ReviewButton } from './components/ReviewButton';
 import { ReviewDock } from './components/ReviewDock';
+import { ShareDialog } from './components/ShareDialog';
+import Preview from './pages/Preview';
+import { useBrowserShareHandoff } from './hooks/useBrowserShareHandoff';
+import { BrowserDock } from './components/BrowserDock';
 import { ThemeProvider, useTheme } from './theme/ThemeProvider';
 import { useEasedWarp } from './hooks/useEasedWarp';
 import { useStatusFavicon } from './hooks/useStatusFavicon';
@@ -37,7 +42,21 @@ import { activityApi, warpApi, authApi, reviewApi, AuthMode } from './services/a
 import type { SessionReview } from './types';
 import { boxFeed } from './services/boxFeed';
 import { BriefingCard } from './components/BriefingCard';
-import { mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, readOptOut, shouldRedirectToMobile } from './mobile/redirect';
+import { useLaunchQueue } from './mobile/launch';
+import { currentUiMode, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi } from './chat/uiMode';
+import { currentOptOut, installedAppMode, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, setInstalledAppEnabled, shouldRedirectToMobile } from './mobile/redirect';
+
+const BROWSER_EXPANDED_KEY = 'termag.browserPane.expanded';
+function readBrowserExpanded(): Record<string, boolean> {
+  try {
+    const raw = window.sessionStorage.getItem(BROWSER_EXPANDED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, boolean>) : {};
+  } catch { return {}; }
+}
+function writeBrowserExpanded(state: Record<string, boolean>): void {
+  try { window.sessionStorage.setItem(BROWSER_EXPANDED_KEY, JSON.stringify(state)); } catch { /* storage unavailable: the state is just not kept */ }
+}
 
 function Login() {
   // The backend decides the sign-in mechanism (AUTH_MODE); fetch it so the
@@ -119,13 +138,36 @@ function MainLayout() {
   // Hand off from the context card: owner only, behind agent-handoff-enabled.
   // The route takes the workstream's id.
   const handoffOn = useFlag(FLAGS.agentHandoff, false);
+  // Browser pane: a headless Chromium on the project's
+  // box, docked under the ctrl terminal, behind browser-pane-enabled. Expanded
+  // per project + workstream; collapsing closes the browser on the box.
+  const browserPaneOn = useFlag(FLAGS.browserPane, false);
+  // Preview shares: the owner's "Share…" on the dock,
+  // the default lifetime it preselects, and kept profiles' "Reset browser".
+  const previewShareOn = useFlag(FLAGS.previewShare, false);
+  const previewShareTtl = useFlag(FLAGS.previewShareTtlHours, 24);
+  const keptProfilesOn = useFlag(FLAGS.persistentProfiles, false);
+  // The share dialog, open with the page the owner's pane shows (its links open there).
+  const [sharing, setSharing] = useState<{ atPath: string | null } | null>(null);
+  // Kept in sessionStorage for this tab: Settings and the dashboard unmount
+  // the workspace, and a pane that was open should be open on the way back
+  // (the box keeps its browser parked for a minute for the same reason).
+  const [browserExpanded, setBrowserExpanded] = useState<Record<string, boolean>>(() => readBrowserExpanded());
+  const browserKey = activeProject ? `${activeProject.id}/${activeWorkstream}` : '';
+  const toggleBrowser = useCallback(() => {
+    setBrowserExpanded(prev => {
+      const next = { ...prev, [browserKey]: !prev[browserKey] };
+      writeBrowserExpanded(next);
+      return next;
+    });
+  }, [browserKey]);
   const handoffWs = activeProject?.workstreams.find(w => w.name === activeWorkstream);
   // The workstream's stored agent, as the menus read it: only one that can write a handoff gets the button.
   const handoffProvider = handoffWs
     ? activeProject?.workflows.find(w => w.type === 'agent' && w.workstreamId === handoffWs.id)?.provider ?? user?.defaultAgentProvider ?? 'claude'
     : null;
   const handoffWorkstreamId = handoffOn && activeProject && handoffWs && activeProject.role !== 'collaborator'
-    && activeProject.kind !== 'metaterm' && canHandOff(handoffProvider)
+    && projectKindTraits(activeProject.kind).canHandOff && canHandOff(handoffProvider)
     ? handoffWs.id
     : null;
   const agentSession = activeProject
@@ -273,6 +315,18 @@ function MainLayout() {
   // Responsive layout
   const isNarrow = useIsNarrow();
   const [activePane, setActivePane] = useState<'agent' | 'ctrl'>('agent');
+  // A share link's handoff to the owner's own pane: the dock opened (in the
+  // ctrl column, brought forward on a narrow viewport), and the share for
+  // its first dial only.
+  const expandDock = useCallback((key: string) => {
+    setBrowserExpanded(prev => {
+      const next = { ...prev, [key]: true };
+      writeBrowserExpanded(next);
+      return next;
+    });
+  }, []);
+  const showCtrl = useCallback(() => setActivePane('ctrl'), []);
+  const { openShare: browserOpenShare, consumeOpenShare } = useBrowserShareHandoff({ browserKey, isNarrow, expandDock, showCtrl });
 
   // A status-strip row or search hit switched here and names a pane:
   // open the review dock, or bring the ctrl pane
@@ -559,6 +613,29 @@ function MainLayout() {
                       onStop={stopReview}
                     />
                   )}
+                  {/* The browser pane docks under the review pane: a one-line
+                      bar collapsed, most of the column expanded. */}
+                  {browserPaneOn && (
+                    <BrowserDock
+                      projectId={activeProject.id}
+                      workstream={activeWorkstream}
+                      expanded={browserExpanded[browserKey] ?? false}
+                      onToggle={toggleBrowser}
+                      openShare={browserOpenShare}
+                      onOpenShareUsed={consumeOpenShare}
+                      showReset={keptProfilesOn}
+                      onShare={previewShareOn && activeProject.role !== 'collaborator' ? (atPath) => setSharing({ atPath }) : undefined}
+                    />
+                  )}
+                  {sharing && (
+                    <ShareDialog
+                      projectId={activeProject.id}
+                      workstream={activeWorkstream}
+                      defaultTtlHours={previewShareTtl}
+                      atPath={sharing.atPath}
+                      onClose={() => setSharing(null)}
+                    />
+                  )}
                 </>
               ) : (
                 <div className="empty-pane">
@@ -585,6 +662,8 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const Settings = lazy(() => import('./pages/Settings'));
 const Admin = lazy(() => import('./pages/Admin'));
+const SpawnNetwork = lazy(() => import('./pages/SpawnNetwork'));
+const Automations = lazy(() => import('./pages/Automations'));
 const Welcome = lazy(() => import('./pages/Welcome'));
 const MobileApp = lazy(() => import('./pages/mobile/MobileApp'));
 const ChatApp = lazy(() => import('./pages/chat/ChatApp'));
@@ -592,17 +671,46 @@ const ChatApp = lazy(() => import('./pages/chat/ChatApp'));
 /**
  * Phone-sized viewports go to the mobile client when the
  * `mobile-redirect-enabled` flag is on and this browser has not pressed
- * "Full UI". Sits inside FeatureFlagsProvider (for the flag) and before
- * MainLayout, so no terminal socket is opened for a page that is about to leave.
+ * "Full UI". With `mobile-installed-app-enabled`, an app installed on a touch
+ * device always does (§5.1) and its "Full UI" lasts for that window only. Sits
+ * inside FeatureFlagsProvider (for the flags) and before MainLayout, so no
+ * terminal socket is opened for a page that is about to leave.
  */
 function MobileRedirectGate({ children }: { children: React.ReactNode }) {
   const flagOn = useFlag(FLAGS.mobileRedirect, false);
   const phoneLike = typeof window !== 'undefined' && window.matchMedia(MOBILE_MEDIA_QUERY).matches;
-  const optedOut = readOptOut(typeof localStorage !== 'undefined' ? localStorage : null);
-  if (shouldRedirectToMobile({ flagOn, phoneLike, optedOut })) {
+  setInstalledAppEnabled(useFlag(FLAGS.mobileInstalledApp, false));
+  const installed = typeof window !== 'undefined' && installedAppMode(window);
+  const optedOut = currentOptOut(installed);
+  if (shouldRedirectToMobile({ flagOn, phoneLike, optedOut, installed })) {
     return <Navigate to={mobileHrefFromWorkspaceSearch(window.location.search)} replace />;
   }
   return <>{children}</>;
+}
+
+/**
+ * The workspace, or the simple UI when that is where this browser was last
+ * and the page was loaded at the bare workspace URL (chat/uiMode.ts).
+ */
+function SimpleUiReturnGate({ children }: { children: React.ReactNode }) {
+  const flagOn = useFlag(FLAGS.simpleUi, false);
+  const location = useLocation();
+  const [toSimple] = useState(() => shouldOpenSimpleUi({
+    flagOn, mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
+  }));
+  useEffect(() => {
+    leavePageEntry();
+    if (!toSimple) recordUiMode('full');
+  }, [toSimple]);
+  if (toSimple) return <Navigate to="/chat" replace />;
+  return <>{children}</>;
+}
+
+/** Forgets where the page was loaded once it navigates anywhere (chat/uiMode.ts). */
+function PageEntryTracker() {
+  const { key } = useLocation();
+  useEffect(() => { notePageLocation(key); }, [key]);
+  return null;
 }
 
 /** The simple UI at /chat exists only for users with simple-ui-enabled. */
@@ -624,12 +732,14 @@ function FirstRunGate({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  useLaunchQueue();
   return (
     <AuthProvider>
       <ThemeProvider>
         {/* Inside ThemeProvider so the error card has the theme's variables;
             around every route so a crash anywhere shows a message, not a blank page. */}
         <AppErrorBoundary>
+        <PageEntryTracker />
         <Routes>
           <Route path="/login" element={<Login />} />
           {/* Dashboard: its own route, deliberately outside FeatureFlagsProvider /
@@ -648,6 +758,17 @@ export default function App() {
               </RequireAuth>
             }
           />
+          {/* A reviewer's preview: its own page, outside
+              the workspace and every gate (first run, phone, simple UI), with no
+              flags provider: the server decides what a reviewer sees. */}
+          <Route
+            path="/preview/:shareId"
+            element={
+              <RequireAuth>
+                <Preview />
+              </RequireAuth>
+            }
+          />
           {/* First-run setup: its own page, outside the workspace layout. */}
           <Route
             path="/welcome"
@@ -661,13 +782,71 @@ export default function App() {
               </RequireAuth>
             }
           />
-          {/* Settings: mounted like the dashboard, outside the workspace layout. */}
+          {/* Settings: outside the workspace layout, inside FeatureFlagsProvider
+              for the flag-gated sections (Notifications, MCP), as /welcome is.
+              /settings/mcp?server= opens on the MCP section. */}
+          {['/settings', '/settings/mcp'].map(path => (
+            <Route
+              key={path}
+              path={path}
+              element={
+                <RequireAuth>
+                  <FeatureFlagsProvider>
+                    <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                      <Settings />
+                    </Suspense>
+                  </FeatureFlagsProvider>
+                </RequireAuth>
+              }
+            />
+          ))}
+          {/* One spawn tree as a network: mounted like
+              the dashboard, so it opens no status WebSocket and sends no heartbeat. */}
+          {/* Automations: the index and one automation's page
+              with its runs. Mounted like the dashboard (no status socket, no
+              heartbeat) but inside FeatureFlagsProvider, as /welcome is: a run's
+              conversation link reads simple-ui-enabled, and useFlag outside the
+              provider only ever returns its fallback. */}
           <Route
-            path="/settings"
+            path="/automations"
+            element={
+              <RequireAuth>
+                <FeatureFlagsProvider>
+                  <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                    <Automations />
+                  </Suspense>
+                </FeatureFlagsProvider>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/automations/:id"
+            element={
+              <RequireAuth>
+                <FeatureFlagsProvider>
+                  <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                    <Automations />
+                  </Suspense>
+                </FeatureFlagsProvider>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/spawns/:rootId"
             element={
               <RequireAuth>
                 <Suspense fallback={<div className="loading-screen">Loading…</div>}>
-                  <Settings />
+                  <SpawnNetwork />
+                </Suspense>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/spawns/session/:projectId/:workstream"
+            element={
+              <RequireAuth>
+                <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                  <SpawnNetwork />
                 </Suspense>
               </RequireAuth>
             }
@@ -735,7 +914,9 @@ export default function App() {
                   <ConnectionProvider>
                     <ProjectProvider>
                       <MobileRedirectGate>
-                        <MainLayout />
+                        <SimpleUiReturnGate>
+                          <MainLayout />
+                        </SimpleUiReturnGate>
                       </MobileRedirectGate>
                     </ProjectProvider>
                   </ConnectionProvider>

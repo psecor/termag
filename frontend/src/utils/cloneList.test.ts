@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-// @ts-expect-error node builtins are untyped in this package
 import { readFileSync } from 'node:fs';
 import { cloneInFlight, cloneTile } from './cloneTile';
 import {
@@ -33,6 +32,20 @@ describe('applyListRead', () => {
     state = applyListRead(state, { generation: first, projects: cloning });
     expect(state.projects).toEqual(ready);
     expect(cloneInFlight(state.projects[0].setupStatus)).toBe(false);
+  });
+
+  it('shows nothing yet when the first of two open reads returns first, so the list is not loaded', () => {
+    let state: CloneListState<typeof failed> = { generation: 0, projects: [] };
+    const first = beginListRead(state.generation);
+    state = { ...state, generation: first };
+    const second = beginListRead(state.generation);
+    state = { ...state, generation: second };
+    state = applyListRead(state, { generation: first, projects: [failed] });
+    expect(state.projects).toEqual([]);
+    expect(state.applied).toBeUndefined();
+    state = applyListRead(state, { generation: second, projects: [failed] });
+    expect(state.projects).toEqual([failed]);
+    expect(state.applied).toBe(second);
   });
 
   it('drops a list that started before Retry, so the row stays pending', () => {

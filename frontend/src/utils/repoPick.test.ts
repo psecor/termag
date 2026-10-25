@@ -5,9 +5,11 @@ import {
   degradedCatalog,
   githubRepoUrl,
   repoKey,
+  repoOptions,
   repoPromptDue,
   sameRepoMatches,
   suggestedName,
+  type CatalogGroup,
   type RepoProjectRef,
 } from './repoPick';
 
@@ -216,5 +218,30 @@ describe('catalogFromWire', () => {
       groups: [],
       notice: 'Could not load repositories. Starters and a pasted URL still work.',
     });
+  });
+});
+
+describe('repoOptions', () => {
+  const group = (owner: string, names: string[], status: CatalogGroup['status'] = 'ok'): CatalogGroup => ({
+    owner, kind: 'org', status, text: status === 'ok' ? '' : `${owner} needs SSO`,
+    repos: names.map(n => ({ fullName: `${owner}/${n}`, defaultBranch: 'main' })),
+  });
+
+  it('sorts each group by name, case-insensitively, without touching the catalog', () => {
+    const groups = [group('zane', ['swing', 'Chess', 'agi', 'blackjack'])];
+    expect(repoOptions(groups, '')[0].repos.map(r => r.fullName)).toEqual(['zane/agi', 'zane/blackjack', 'zane/Chess', 'zane/swing']);
+    expect(groups[0].repos[0].fullName).toBe('zane/swing');
+  });
+
+  it('narrows to the repositories matching the query and drops groups with none', () => {
+    const groups = [group('zane', ['nextjs2', 'chess', 'nextjs-boilerplate']), group('acme', ['web'])];
+    const out = repoOptions(groups, '  NEXT ');
+    expect(out.map(g => g.owner)).toEqual(['zane']);
+    expect(out[0].repos.map(r => r.fullName)).toEqual(['zane/nextjs-boilerplate', 'zane/nextjs2']);
+  });
+
+  it('keeps a group GitHub would not list, so its note still shows', () => {
+    const out = repoOptions([group('zane', ['chess']), group('locked', [], 'sso-required')], 'chess');
+    expect(out.map(g => [g.owner, g.repos.length])).toEqual([['zane', 1], ['locked', 0]]);
   });
 });

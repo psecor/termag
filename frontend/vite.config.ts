@@ -23,7 +23,7 @@ export default defineConfig({
   define: { __TERMAG_SHA__: JSON.stringify(buildSha()) },
   base: '/termag/',
   // Public sourcemaps next to each chunk (assets/<chunk>.js.map), so
-  // Browser error tooling can symbolicate browser errors by fetching them
+  // browser error tooling can symbolicate browser errors by fetching them
   // by URL. The bundle is already served unauthenticated; the map adds the
   // unminified source of the same code.
   build: { sourcemap: true },
@@ -37,6 +37,9 @@ export default defineConfig({
         ws: true,
       },
       '/termag/health': 'http://localhost:3040',
+      '/termag/files': 'http://localhost:3040',
+      // Share links; the slash keeps /termag/preview/ in the SPA.
+      '/termag/p/': 'http://localhost:3040',
     },
   },
 });
