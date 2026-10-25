@@ -73,7 +73,8 @@ export const prismaCliStore: CliStore = {
       where: { userId, archived: false },
       select: {
         id: true, name: true, instanceId: true, lastActiveAt: true,
-        instance: { select: { id: true, name: true, hostHome: true } },
+        repoUrl: true, setupStatus: true, setupError: true,
+        instance: { select: { id: true, name: true, hostHome: true, kind: true, status: true, provisioningError: true } },
         user: { select: { unixUsername: true } },
         workstreams: { where: { archived: false }, select: { name: true }, orderBy: { createdAt: 'asc' } },
         workflows: { where: { type: 'agent' }, select: { provider: true } },

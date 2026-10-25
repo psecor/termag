@@ -10,7 +10,7 @@ import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
-import { warmPoolConfigFromEnv } from '../config/env';
+import { warmPoolTargetSize } from '../services/warmPoolSize';
 import { lastWarmPoolTick } from '../services/warmPool';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -43,7 +43,7 @@ export function warmPoolRouter(): Router {
     ]);
 
     res.json({
-      target: warmPoolConfigFromEnv(process.env).targetSize,
+      target: await warmPoolTargetSize(),
       warm,
       warming,
       staleWarm,

@@ -7,9 +7,11 @@ import {
   chooseSpawnProvider,
   nudgeDecision,
   nudgeLine,
+  nudgeLines,
   parseReport,
   parseSpawnRequest,
   slugFromTask,
+  spawnFolderTrust,
   spawnLaunchCommand,
   spawnPromptPath,
   taskTitle,
@@ -51,6 +53,19 @@ describe('parseSpawnRequest', () => {
     expect(parseSpawnRequest({ task: 't', target: 'project', projectId: 'p' }).ok).toBe(false);
     expect(parseSpawnRequest({ task: 't', target: 'project', baseRef: 'main' }).ok).toBe(false);
     expect(parseSpawnRequest({ task: 't', target: 'project', boxId: 'b', repoUrl: 'example-org/x' }).ok).toBe(true);
+  });
+
+  it('takes repoUrl as owner/name or a GitHub URL, and refuses anything else before a spawn is recorded', () => {
+    const url = (repoUrl: string) => {
+      const r = parseSpawnRequest({ task: 't', target: 'project', repoUrl });
+      return r.ok ? r.value.repoUrl : `refused: ${r.error}`;
+    };
+    expect(url('example-org/termag')).toBe('https://github.com/example-org/termag');
+    expect(url('https://github.com/example-org/termag.git')).toBe('https://github.com/example-org/termag.git');
+    expect(url('git@github.com:example-org/termag.git')).toBe('git@github.com:example-org/termag.git');
+    expect(url('https://gitlab.com/a/b')).toMatch(/^refused: repoUrl must be a GitHub repository/);
+    expect(url('termag')).toMatch(/^refused/);
+    expect(url('a/b; rm -rf ~')).toMatch(/^refused/);
   });
 
   it('refuses an unknown relationship or target', () => {
@@ -197,5 +212,27 @@ describe('nudgeDecision', () => {
 
   it('types fixed text that carries no report content', () => {
     expect(nudgeLine('proj/add-tests', 'done')).toBe('[termag] delegate proj/add-tests reported done. Call list_spawns (metaterm MCP server) to read its report.');
+  });
+
+  it('folds several reports for one pane into one line, and keeps the single line as it was', () => {
+    expect(nudgeLines([{ child: 'proj/a', status: 'done' }])).toBe(nudgeLine('proj/a', 'done'));
+    expect(nudgeLines([{ child: 'proj/a', status: 'done' }, { child: 'proj/b', status: 'blocked', adopted: true }]))
+      .toBe('[termag] 2 delegates reported: proj/a done, proj/b blocked (adopted). Call list_spawns (metaterm MCP server) to read their reports.');
+  });
+});
+
+describe('spawnFolderTrust', () => {
+  const ticked = new Date('2026-10-01T00:00:00Z');
+  it('follows the owner\'s tick, never the repository owner', () => {
+    expect(spawnFolderTrust({ repoUrl: 'https://github.com/example-org/termag', chatTrustedAt: ticked })).toBe('owner');
+    expect(spawnFolderTrust({ repoUrl: null, chatTrustedAt: ticked })).toBe('owner');
+    expect(spawnFolderTrust({ repoUrl: 'https://github.com/example-org/termag', chatTrustedAt: null })).toBeNull();
+    expect(spawnFolderTrust({ repoUrl: 'https://github.com/someone/else', chatTrustedAt: null })).toBeNull();
+  });
+
+  it('asks the box to confirm an empty folder when there is no repository, and nothing without a project', () => {
+    expect(spawnFolderTrust({ repoUrl: null, chatTrustedAt: null })).toBe('empty');
+    expect(spawnFolderTrust(null)).toBeNull();
+    expect(spawnFolderTrust(undefined)).toBeNull();
   });
 });

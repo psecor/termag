@@ -71,7 +71,7 @@ async function recordHistory(instanceId: string, sample: HostSample | null, now:
   if (!sample) return;
   const [liveAgents, spawnedLive] = await Promise.all([
     sendToInstanceAgent(instanceId, 'tmux-list', {}, 5000).then(countAgentSessions).catch(() => null),
-    prisma.agentSpawn.count({ where: { childInstanceId: instanceId, launchedAt: { not: null }, endedAt: null, state: { not: 'failed' } } }).catch(() => null),
+    prisma.agentSpawn.count({ where: { childInstanceId: instanceId, launchedAt: { not: null }, endedAt: null, parkedAt: null, state: { not: 'failed' } } }).catch(() => null),
   ]);
   await prisma.hostSample.create({
     data: {

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { Session, SessionData } from 'express-session';
-import { cliReturnPath, stashPostLoginReturn, takePostLoginRedirect } from './postLoginReturn';
+import { cliReturnPath, fileLinkReturnPath, previewLinkReturnPath, stashPostLoginReturn, takePostLoginRedirect } from './postLoginReturn';
+import { spaceFileLinkPath } from '../services/spaces/spaceLinks';
 
 const AUTHORIZE = '/termag/auth/cli/authorize?port=53682&state=abcdefghijklmnop&device_name=mbp';
 
@@ -33,7 +34,75 @@ describe('cliReturnPath', () => {
   });
 });
 
+describe('fileLinkReturnPath', () => {
+  it('accepts a space file link under this base path, exactly as sent', () => {
+    expect(fileLinkReturnPath('/termag', '/termag/files/assets/docs/My%20Report.pdf')).toBe('/termag/files/assets/docs/My%20Report.pdf');
+    expect(fileLinkReturnPath('', '/files/assets/a.png')).toBe('/files/assets/a.png');
+  });
+
+  it('keeps percent-encoded filenames and nested folders unchanged', () => {
+    for (const url of [
+      '/termag/files/assets/My%20Q3%20Report.pdf',
+      '/termag/files/assets/notes%23draft%3F.txt',
+      '/termag/files/assets/a%2Fb.png',
+      '/termag/files/assets/done%E2%9C%93.png',
+      '/termag/files/assets/2026/q3/charts/final%20v2.png',
+      '/termag/files/assets/deep/er/%E2%9C%93%20%23%3F%2F.png',
+      spaceFileLinkPath('/termag', 'assets', 'a+b,c:d=e@f[g].png'),
+      spaceFileLinkPath('/termag', 'assets', 'reports/2026 Q3/résumé ✓ #1?.pdf'),
+    ]) {
+      expect(fileLinkReturnPath('/termag', url)).toBe(url);
+    }
+    expect(fileLinkReturnPath('/termag', '//evil.com/termag/files/assets/My%20Q3%20Report.pdf')).toBeNull();
+    expect(fileLinkReturnPath('/termag', 'https://evil.com/termag/files/assets/a%2Fb.png')).toBeNull();
+  });
+
+  it('refuses anything that could leave the link or be rewritten on the way', () => {
+    for (const url of [
+      'https://evil.example/termag/files/assets/a.png',
+      '//evil.example/termag/files/assets/a.png',
+      '/termag/files/../auth/logout',
+      '/termag/files/assets/../../evil',
+      '/termag/files/assets/a b.png',
+      '/termag/files/assets\\a.png',
+      '/termag/filesx/assets/a.png',
+      '/termag/files',
+      '/other/files/assets/a.png',
+      `/termag/files/${'a'.repeat(3000)}`,
+      undefined,
+    ]) {
+      expect(fileLinkReturnPath('/termag', url)).toBeNull();
+    }
+  });
+});
+
+describe('previewLinkReturnPath', () => {
+  it('accepts a preview share link under this base path, exactly as sent', () => {
+    expect(previewLinkReturnPath('/termag', '/termag/p/cshare0000000001')).toBe('/termag/p/cshare0000000001');
+    expect(previewLinkReturnPath('/termag', '/termag/p/cshare0000000001?at=%2Fdefault%2Fflags')).toBe('/termag/p/cshare0000000001?at=%2Fdefault%2Fflags');
+  });
+
+  it('refuses anything else under /p, or that could leave it', () => {
+    for (const url of ['/termag/p/', '/termag/p/a/b', '/termag/p/../files/x', '/termag/p/%2e%2e', '/termag/p/a b', '//evil.example/termag/p/x',
+      'https://evil.example/termag/p/x', '/termag/p/A-B', '/other/p/abc', '/termag/p/abc\\x', '/termag/preview/abc']) {
+      expect(previewLinkReturnPath('/termag', url), url).toBeNull();
+    }
+  });
+
+  it('is stashed and taken like the others', () => {
+    const s = session();
+    expect(stashPostLoginReturn(s, '/termag', '/termag/p/cshare0000000001?at=%2Fflags')).toBe(true);
+    expect(takePostLoginRedirect(s, '/termag', 'https://ui.example')).toBe('https://ui.example/termag/p/cshare0000000001?at=%2Fflags');
+  });
+});
+
 describe('stash and take', () => {
+  it('returns to a stashed file link', () => {
+    const s = session();
+    expect(stashPostLoginReturn(s, '/termag', '/termag/files/assets/a.png')).toBe(true);
+    expect(takePostLoginRedirect(s, '/termag', 'https://ui.example')).toBe('https://ui.example/termag/files/assets/a.png');
+  });
+
   it('returns to the stashed approval page once, then to the app root', () => {
     const s = session();
     expect(stashPostLoginReturn(s, '/termag', AUTHORIZE)).toBe(true);

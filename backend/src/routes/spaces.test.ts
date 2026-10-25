@@ -3,16 +3,19 @@ import express from 'express';
 import type { AddressInfo } from 'net';
 import type { Server } from 'http';
 import { spaceCallerFromCli, spacesRouter, SINGLE_PUT_MAX_BYTES } from './spaces';
+import { spaceFileLinkPath } from '../services/spaces/spaceLinks';
 import { SpacesUnavailableError } from '../services/spaces/spaceConfig';
 import { MemorySpaceObjects, MemorySpaceStore } from '../services/spaces/spacesTestkit';
 import { sweepSpaces } from '../services/spaces/spaceSweeper';
 import type { SpaceCaller } from '../services/spaces/spaceAccess';
+import type { PresignerIdentity } from '../services/spaces/spaceObjects';
 
 let store: MemorySpaceStore;
 let objects: MemorySpaceObjects;
 let enabled: Set<string>;
 let sharing: Set<string>;
 let unavailable = false;
+let identities: PresignerIdentity[];
 let server: Server;
 let base: string;
 
@@ -22,7 +25,11 @@ beforeAll(async () => {
   const liveStore = new Proxy({}, { get: (_t, prop) => (store as unknown as Record<string | symbol, unknown>)[prop] && ((...args: unknown[]) => (store as unknown as Record<string | symbol, (...a: unknown[]) => unknown>)[prop](...args)) });
   app.use('/api/spaces', spacesRouter({
     store: liveStore as MemorySpaceStore,
-    objects: async () => { if (unavailable) throw new SpacesUnavailableError('no identity'); return objects; },
+    objects: async identity => {
+      if (unavailable) throw new SpacesUnavailableError('no identity');
+      identities.push(identity);
+      return objects;
+    },
     enabled: async userId => enabled.has(userId),
     sharing: async userId => sharing.has(userId),
     caller: r => {
@@ -31,6 +38,7 @@ beforeAll(async () => {
       const box = r.get('x-box');
       return (box ? { kind: 'box', userId: user, instanceId: box } : { kind: 'user', userId: user }) satisfies SpaceCaller;
     },
+    fileLink: (space, path) => `https://ui.example${spaceFileLinkPath('/termag', space, path)}`,
   }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/spaces`;
@@ -44,6 +52,7 @@ beforeEach(() => {
   enabled = new Set(['alice', 'bob', 'carol']);
   sharing = new Set(['alice', 'bob', 'carol']);
   unavailable = false;
+  identities = [];
   store.addUser('alice');
   store.addUser('bob');
   store.addUser('carol');
@@ -276,6 +285,42 @@ describe('boxes', () => {
     expect((await call('GET', '/assets/tree', { as: 'bob', box: 'bobbox' })).status).toBe(404);
   });
 
+  it('gives a child box its parent\'s spaces with the owner\'s full role', async () => {
+    const s = await createSpace();
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    const listed = await call('GET', '/', { as: 'alice', box: 'askbox' });
+    expect(listed.body.spaces).toEqual([expect.objectContaining({ name: 'assets', role: 'owner', access: { kind: 'inherited', via: 'alicebox' } })]);
+    expect((await call('POST', '/assets/files/upload', { as: 'alice', box: 'askbox', body: { path: 'a', size: 1 } })).status).toBe(200);
+    objects.put(`${s.id}/a`, 1);
+    expect((await call('POST', '/assets/files/download', { as: 'alice', box: 'askbox', body: { path: 'a' } })).status).toBe(200);
+    expect(store.eventRows.at(-1)).toMatchObject({ actorInstanceId: 'askbox', via: 'alicebox' });
+    const boxes = await call('GET', '/assets/boxes', { as: 'alice' });
+    expect(boxes.body.boxes[0].children).toEqual([{ id: 'askbox', name: 'ask-box', via: 'alicebox' }]);
+  });
+
+  it('gives a child nothing through a terminated parent or another owner\'s box', async () => {
+    await createSpace();
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'editor' } });
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
+    store.addBox('bobchild', 'bob', 'bob-child', 'ready', 'alicebox');
+    expect((await call('GET', '/assets/tree', { as: 'bob', box: 'bobchild' })).status).toBe(404);
+    expect((await call('GET', '/', { as: 'bob', box: 'bobchild' })).body.spaces).toEqual([]);
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    expect((await call('GET', '/assets/tree', { as: 'alice', box: 'askbox' })).status).toBe(200);
+    store.boxes.get('alicebox')!.status = 'terminated';
+    expect((await call('GET', '/assets/tree', { as: 'alice', box: 'askbox' })).status).toBe(404);
+  });
+
+  it('never lets a child box manage the space', async () => {
+    await createSpace();
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    const r = await call('POST', '/assets/boxes', { as: 'alice', box: 'askbox', body: { box: 'ask-box' } });
+    expect(r.status).toBe(403);
+    expect(r.body.code).toBe('box_credential');
+  });
+
   it('lets the box owner or a space owner remove a box', async () => {
     await createSpace();
     await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'editor' } });
@@ -287,6 +332,18 @@ describe('boxes', () => {
 });
 
 describe('files', () => {
+  it('reaches S3 as the person, or as the box with its owner', async () => {
+    const s = await createSpace();
+    await call('POST', `/${s.name}/boxes`, { as: 'alice', body: { box: 'alice-box' } });
+    objects.put(`${s.id}/a.txt`, 3);
+    await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'a.txt' } });
+    await call('POST', '/assets/files/download', { as: 'alice', box: 'alicebox', body: { path: 'a.txt' } });
+    expect(identities).toEqual([
+      { kind: 'user', userId: 'alice', email: 'alice@example.com' },
+      { kind: 'box', instanceId: 'alicebox', name: 'alice-box', ownerUserId: 'alice', ownerEmail: 'alice@example.com' },
+    ]);
+  });
+
   it('lists one level at a time, only under the space\'s prefix', async () => {
     const s = await createSpace();
     objects.put(`${s.id}/a.txt`, 3);
@@ -315,12 +372,50 @@ describe('files', () => {
     expect(store.eventRows.filter(e => e.action === 'file.get')).toHaveLength(2);
   });
 
+  it('signs 30-minute inline viewer URLs, HTML and SVG as plain text, and says when there is no viewer', async () => {
+    const s = await createSpace();
+    objects.put(`${s.id}/r.pdf`, 10, 'application/octet-stream');
+    objects.put(`${s.id}/page.html`, 10, 'text/html');
+    objects.put(`${s.id}/logo.svg`, 10, 'image/svg+xml');
+    objects.put(`${s.id}/deck.pptx`, 10, 'application/vnd.ms-powerpoint');
+    const pdf = await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'r.pdf', view: true } });
+    expect(pdf.body.view).toEqual({ contentType: 'application/pdf', render: 'frame' });
+    expect(objects.presigned.at(-1)!.extra).toMatchObject({ contentType: 'application/pdf', contentDisposition: expect.stringMatching(/^inline/), ttlS: 30 * 60 });
+    for (const [path, render] of [['page.html', 'html'], ['logo.svg', 'svg']]) {
+      const r = await call('POST', '/assets/files/download', { as: 'alice', body: { path, view: true } });
+      expect(r.body.view).toEqual({ contentType: 'text/plain; charset=utf-8', render });
+      expect(objects.presigned.at(-1)!.extra).toMatchObject({ contentType: 'text/plain; charset=utf-8', ttlS: 30 * 60 });
+      const raw = await call('POST', '/assets/files/download', { as: 'alice', body: { path, inline: true } });
+      expect(raw.body).not.toHaveProperty('view');
+      expect(objects.presigned.at(-1)!.extra).toEqual({ contentDisposition: expect.stringMatching(/^attachment/) });
+    }
+    const deck = await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'deck.pptx', view: true } });
+    expect(deck.body.view).toBeNull();
+    expect(objects.presigned.at(-1)!.extra).toMatchObject({ contentDisposition: expect.stringMatching(/^attachment/) });
+    expect(objects.presigned.at(-1)!.extra).not.toHaveProperty('ttlS');
+  });
+
+  it('hands out a file\'s browser link to a viewer or a granted box, and 404s a missing file', async () => {
+    const s = await createSpace();
+    objects.put(`${s.id}/docs/My Report.pdf`, 12, 'application/pdf');
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'viewer' } });
+    const link = await call('POST', '/assets/files/link', { as: 'bob', body: { path: 'docs/My Report.pdf' } });
+    expect(link).toEqual({ status: 200, body: { url: 'https://ui.example/termag/files/assets/docs/My%20Report.pdf', path: 'docs/My Report.pdf', size: 12 } });
+    expect((await call('POST', '/assets/files/link', { as: 'bob', body: { path: 'nope.pdf' } })).status).toBe(404);
+    expect((await call('POST', '/assets/files/link', { as: 'carol', body: { path: 'docs/My Report.pdf' } })).status).toBe(404);
+    expect((await call('POST', '/assets/files/link', { as: 'bob', body: { path: '../x' } })).status).toBe(400);
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alicebox' } });
+    expect((await call('POST', '/assets/files/link', { as: 'alice', box: 'alicebox', body: { path: 'docs/My Report.pdf' } })).status).toBe(200);
+    expect(objects.presigned).toHaveLength(0);
+  });
+
   it('presigns a single PUT up to 64 MiB, charging it, then records the upload', async () => {
     const s = await createSpace();
     const up = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'a/b.txt', size: 5, contentType: 'text/plain' } });
     expect(up.body).toMatchObject({ kind: 'single', method: 'PUT', path: 'a/b.txt' });
     expect(objects.presigned.at(-1)).toEqual({ op: 'put', key: `${s.id}/a/b.txt`, extra: { size: 5, contentType: 'text/plain' } });
     expect(store.spaces.get(s.id)!.usedBytes).toBe(5n);
+    expect(store.eventRows.at(-1)).toMatchObject({ action: 'file.put.signed', path: 'a/b.txt', bytes: 5, actorUserId: 'alice' });
     expect((await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a/b.txt' } })).status).toBe(409);
     objects.put(`${s.id}/a/b.txt`, 5);
     expect((await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a/b.txt' } })).body.size).toBe(5);

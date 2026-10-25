@@ -14,12 +14,16 @@
  * (setCloudSessionChangeCallback, wired to the status WebSocket in index.ts).
  *
  * `detail` is a refusal reason or an exit reason: never an email, a token or
- * prompt text (the title lives on the run row, not here).
+ * prompt text (the title lives on the run row, not here). `code` is the
+ * refusal's stable key for `queued` and `agent-failed`, so a view
+ * groups on it rather than on the sentence.
  */
 import { prisma } from '../db';
 
 export const SESSION_EVENT_KINDS = [
   'queued', 'placed', 'already-running', 'agent-failed', 'started', 'ended', 'lost', 'end-requested', 'renamed',
+  // the spawn route created the owner's termag user for this session.
+  'user-created',
 ] as const;
 export type SessionEventKind = typeof SESSION_EVENT_KINDS[number];
 
@@ -36,6 +40,8 @@ export interface SessionEventInput {
   instanceId?: string | null;
   kind: SessionEventKind;
   detail?: string | null;
+  /** For `queued` and `agent-failed`: the refusal's stable code (REFUSAL_CODES in claudeRunnerSpawn.ts). */
+  code?: string | null;
   at?: Date;
 }
 
@@ -76,6 +82,7 @@ export async function recordSessionEvent(input: SessionEventInput): Promise<void
         instanceId: input.instanceId ?? null,
         kind: input.kind,
         detail: eventDetail(input.detail),
+        code: input.code ?? null,
         ...(input.at ? { at: input.at } : {}),
       },
     });

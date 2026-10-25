@@ -68,6 +68,8 @@ import {
 import { fromTemporaryCredentials } from '@aws-sdk/credential-providers';
 import { Instance, Prisma } from '@prisma/client';
 import { prisma } from '../db';
+import { OWNED_BOX_SELECT, type OwnedBoxRow } from './ownedBoxRow';
+import { createHash, randomBytes } from 'crypto';
 import { stuckWarmingReason, type StuckWarmingReason } from './warmPoolPlanner';
 import {
   AMI_CHANNEL_TAG,
@@ -1058,6 +1060,164 @@ async function markFailed(instanceId: string, error: string): Promise<void> {
   }).catch(e => console.error(`[BOX] Failed to mark instance ${instanceId} failed:`, e.message));
 }
 
+// ── Boxes created on an owner's behalf ───────────────────────────────────────
+//
+// The first-login auto-provision that lived here left with #226 (a managed box
+// now needs a stored GitHub token, through the Add box flow). What remains is
+// the create the Claude runner spawn uses for an owner with no box
+// (routes/claudeRunner.ts), behind its flag and under its per-owner lock.
+
+/**
+ * Given the set of names ALL of a user's instances already hold — including
+ * terminated ones, which still occupy the (userId, name) unique index — return
+ * a free name: the base if unused, else base-2, base-3, … .
+ *
+ * Pure so it can be unit-tested; resolveFreeBoxName supplies the taken set.
+ */
+export function pickFreeBoxName(taken: Set<string>, base: string): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 1000; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  // Astronomically unlikely (1000 terminated boxes on one name); a random
+  // suffix guarantees we never loop and never trip the unique index.
+  return `${base}-${randomBytes(3).toString('hex')}`;
+}
+
+/**
+ * Pick a box name that is free across ALL of the user's instances, including
+ * terminated ones. Without this, a user who terminated their auto box (say
+ * "default") would, on every later login, pass the zero-active-boxes pre-check,
+ * attempt to re-create "default", and trip P2002 forever — never getting a
+ * replacement box despite an empty dashboard.
+ *
+ * Reads inside the caller's transaction (`tx`) so the name is resolved from the
+ * same snapshot as the caller's `stillNeeded` re-check: two concurrent creates
+ * then resolve the same name and collide on the unique index (P2002), or
+ * conflict under serializable isolation (P2034), and exactly one wins.
+ */
+async function resolveFreeBoxName(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  base: string,
+): Promise<string> {
+  const taken = new Set(
+    (await tx.instance.findMany({ where: { userId }, select: { name: true } })).map((i) => i.name),
+  );
+  return pickFreeBoxName(taken, base);
+}
+
+// Only the fields a create needs — decoupled from Express.User / the full
+// Prisma User so any caller can pass either.
+export interface BoxOwner {
+  id: string;
+  googleEmail: string;
+  unixUsername: string;
+  displayName: string;
+}
+
+/**
+ * A new box for `user`, named `baseName` or the first free base-2, base-3, …
+ * and provisioned async like POST /api/instances. For a caller that has
+ * decided on its own that the user needs one: the Claude runner spawn
+ * (routes/claudeRunner.ts), behind its flag and under its per-owner lock,
+ * which is what keeps a burst of sessions in one process to one box.
+ *
+ * `stillNeeded` is asked again INSIDE the serializable transaction, with the
+ * owner's non-terminated boxes as that snapshot sees them. The lock covers
+ * this process only, and the free name dodges every existing row, so without
+ * the re-check a second process that had also decided to acquire would suffix
+ * the name and buy a second box instead of hitting the unique index. Two
+ * creates that both pass the re-check conflict under serializable isolation
+ * (P2034, isConcurrentCreate), which the caller treats as "one is on its way".
+ * Returns the box name; null when box provisioning is not configured or
+ * `stillNeeded` said no. Persistence errors are thrown.
+ */
+export async function provisionNewBox(
+  user: BoxOwner,
+  baseName: string,
+  stillNeeded: (owned: OwnedBoxRow[]) => boolean,
+  launch: LaunchChoices,
+): Promise<string | null> {
+  if (!isBoxProvisioningConfigured()) return null;
+  const created = await createBoxRow(user, baseName, stillNeeded);
+  if (!created) return null;
+  console.log(`[BOX] Provisioning box "${created.boxName}" for ${user.googleEmail}`);
+  launchCreatedBox(user, created, launch);
+  return created.boxName;
+}
+
+/** The owner's flags a launch needs decided (ProvisionArgs), read by the caller with its claim decision. */
+export type LaunchChoices = Pick<ProvisionArgs, 'image' | 'hibernation'>;
+
+/** P2002 (the (userId, name) unique index) or P2034 (serialization failure): another create won. */
+export function isConcurrentCreate(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && (err.code === 'P2002' || err.code === 'P2034');
+}
+
+interface CreatedBox { instance: Instance; boxName: string; rawToken: string }
+
+/**
+ * One EC2 Instance (+ per-box token) for `user`, in ONE serializable
+ * transaction. The name dodges terminated rows still holding the (userId,
+ * name) unique index, so a user who terminated a box named `baseName` gets
+ * base-2, … instead of a P2002 on every attempt; it is read in-transaction so
+ * it shares the snapshot of the `stillNeeded` re-check. Null when `stillNeeded`,
+ * asked with the owner's non-terminated boxes as this transaction sees them,
+ * says the box is no longer wanted.
+ */
+async function createBoxRow(
+  user: BoxOwner,
+  baseName: string,
+  stillNeeded: (owned: OwnedBoxRow[]) => boolean,
+): Promise<CreatedBox | null> {
+  const rawToken = 'tmag_' + randomBytes(32).toString('hex');
+  const tokenHash = createHash('sha256').update(rawToken).digest('hex');
+  const tokenPrefix = rawToken.substring(0, 13) + '...';
+  return prisma.$transaction(
+    async (tx) => {
+      // Authoritative re-check inside the snapshot: the caller's own look at
+      // the user's boxes predates this transaction.
+      const owned = await tx.instance.findMany({
+        where: { userId: user.id, status: { not: 'terminated' } },
+        select: OWNED_BOX_SELECT,
+      });
+      if (!stillNeeded(owned)) return null;
+      const boxName = await resolveFreeBoxName(tx, user.id, baseName);
+      const inst = await tx.instance.create({
+        data: { userId: user.id, name: boxName, kind: 'ec2', status: 'provisioning' },
+      });
+      await tx.agentToken.create({
+        data: {
+          userId: user.id,
+          instanceId: inst.id,
+          name: `box: ${boxName}`,
+          tokenHash,
+          tokenPrefix,
+        },
+      });
+      return { instance: inst, boxName, rawToken };
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  );
+}
+
+function launchCreatedBox(user: BoxOwner, { instance, boxName, rawToken }: CreatedBox, launch: LaunchChoices): void {
+  // Fire-and-forget the slow EC2 launch (provisionBox marks the box `failed`
+  // on any error and never throws).
+  void provisionBox({
+    instance,
+    boxName,
+    owner: user.googleEmail,
+    token: rawToken,
+    remoteUnixUser: user.unixUsername,
+    gitUserEmail: user.googleEmail,
+    gitUserName: user.displayName,
+    ...launch,
+  });
+}
+
 // ── Termination ──────────────────────────────────────────────────────────────
 
 /**
@@ -1343,7 +1503,8 @@ async function deleteSgWithRetry(ec2: EC2Client, sgId: string): Promise<boolean>
 
 // ── Stuck-provisioning sweep ─────────────────────────────────────────────────
 
-const STUCK_AFTER_MS = 15 * 60 * 1000; // 15 min with no agent → failed
+/** 15 min with no agent → failed. The Claude runner's auto-box hold assumes this window (claudeRunnerSpawn.ts). */
+export const STUCK_AFTER_MS = 15 * 60 * 1000;
 // Generous because clones and image pulls are slow. Measure and tighten.
 const WARM_INCOMPLETE_AFTER_MS = 45 * 60 * 1000;
 let sweepTimer: NodeJS.Timeout | null = null;

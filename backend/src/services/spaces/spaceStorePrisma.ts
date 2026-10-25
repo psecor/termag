@@ -35,14 +35,14 @@ function role(value: string): SpaceRole {
 }
 
 const boxSelect = {
-  id: true, userId: true, status: true, name: true, kind: true,
+  id: true, userId: true, status: true, name: true, kind: true, parentInstanceId: true,
   user: { select: { googleEmail: true } },
 } as const;
 
 type BoxRow = Prisma.InstanceGetPayload<{ select: typeof boxSelect }>;
 
 function boxInfo(row: BoxRow): SpaceBoxInfo {
-  return { id: row.id, userId: row.userId, status: row.status, name: row.name, kind: row.kind, ownerEmail: row.user?.googleEmail ?? null };
+  return { id: row.id, userId: row.userId, status: row.status, parentInstanceId: row.parentInstanceId, name: row.name, kind: row.kind, ownerEmail: row.user?.googleEmail ?? null };
 }
 
 const userSelect = { id: true, googleEmail: true, displayName: true, unixUsername: true } as const;
@@ -281,10 +281,10 @@ export const prismaSpaceStore: SpaceStore = {
     return prisma.space.findMany({ where: { deletedAt: null } });
   },
 
-  async liveCharges(spaceId, now) {
+  async chargesLiveAfter(spaceId, after) {
     return prisma.spaceCharge.findMany({
-      where: { spaceId, liveUntil: { gt: now } },
-      select: { id: true, bytes: true, createdAt: true, key: true, uploadId: true, partNumbers: true },
+      where: { spaceId, liveUntil: { gt: after } },
+      select: { id: true, bytes: true, createdAt: true, liveUntil: true, key: true, uploadId: true, partNumbers: true },
     });
   },
 

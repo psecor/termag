@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CANNOT_HIBERNATE_IDLE_STOP_WARNING,
   CANNOT_HIBERNATE_WARNING,
   canAutoHibernate,
   effectiveTerminateDays,
@@ -70,6 +71,51 @@ describe('idleHibernateDecision', () => {
   });
 });
 
+describe('idleHibernateDecision with box-idle-stop-enabled', () => {
+  const unset = (over: Partial<LifecycleBox> = {}) => box({ idleHibernateHours: null, ...over });
+  const at = (ms: number) => facts({ nowMs: t0.getTime() + ms, flagOn: false, idleStopOn: true });
+
+  it('with it off, no setting stays off and a box that cannot hibernate is never acted on', () => {
+    expect(idleHibernateDecision(unset(), facts({ nowMs: t0.getTime() + 100 * HOUR })))
+      .toEqual({ hibernate: false, reason: 'off' });
+    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), facts({ nowMs: t0.getTime() + 100 * HOUR })))
+      .toEqual({ hibernate: false, reason: 'not-eligible' });
+    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), facts({ nowMs: t0.getTime() + 100 * HOUR, idleStopOn: false })))
+      .toEqual({ hibernate: false, reason: 'not-eligible' });
+  });
+
+  it('with it on and no setting, waits 2 h, then hibernates a box that can and stops one that cannot', () => {
+    expect(idleHibernateDecision(unset(), at(2 * HOUR - 1))).toEqual({ hibernate: false, reason: 'not-idle' });
+    expect(idleHibernateDecision(unset(), at(2 * HOUR))).toEqual({ hibernate: true });
+    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), at(2 * HOUR))).toEqual({ stop: true });
+  });
+
+  it('with it on, a box with its own setting keeps that timing and box-auto-lifecycle-enabled', () => {
+    const own = box({ idleHibernateHours: 4 });
+    expect(idleHibernateDecision(own, at(2 * HOUR))).toEqual({ hibernate: false, reason: 'flag-off' });
+    expect(idleHibernateDecision(own, { ...at(2 * HOUR), flagOn: true })).toEqual({ hibernate: false, reason: 'not-idle' });
+    expect(idleHibernateDecision(own, { ...at(4 * HOUR), flagOn: true })).toEqual({ hibernate: true });
+    expect(idleHibernateDecision(box({ idleHibernateHours: 4, hibernationConfigured: false }), { ...at(10 * HOUR), flagOn: true }))
+      .toEqual({ hibernate: false, reason: 'not-eligible' });
+  });
+
+  it('keeps the guards: external or ownerless, not ready, refresh, busy, working', () => {
+    for (const over of [{ kind: 'external' }, { userId: null }, { ec2InstanceId: null }]) {
+      expect(idleHibernateDecision(unset(over), at(10 * HOUR))).toEqual({ hibernate: false, reason: 'not-eligible' });
+    }
+    expect(idleHibernateDecision(unset({ status: 'stopped' }), at(10 * HOUR))).toMatchObject({ reason: 'not-ready' });
+    expect(idleHibernateDecision(unset({ rehibernatePending: true }), at(10 * HOUR))).toMatchObject({ reason: 'refresh-pending' });
+    expect(idleHibernateDecision(unset(), { ...at(10 * HOUR), busy: true })).toMatchObject({ reason: 'busy' });
+    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), { ...at(10 * HOUR), working: true }))
+      .toMatchObject({ reason: 'working' });
+  });
+
+  it('counts from lastActivityAt, so a box started a minute ago is not due', () => {
+    const justStarted = unset({ hibernationConfigured: false, lastActivityAt: new Date(t0.getTime() + 10 * HOUR - 60_000) });
+    expect(idleHibernateDecision(justStarted, at(10 * HOUR))).toEqual({ hibernate: false, reason: 'not-idle' });
+  });
+});
+
 describe('parseLifecycleSettings', () => {
   it('accepts whole hours in range and null', () => {
     expect(parseLifecycleSettings({ idleHibernateHours: 1 })).toEqual({ settings: { idleHibernateHours: 1 } });
@@ -109,6 +155,26 @@ describe('lifecycleWarning', () => {
     expect(w({ hibernationConfigured: false, idleHibernateHours: null }, 14)).toBe(CANNOT_HIBERNATE_WARNING);
     expect(w({ hibernationConfigured: false, idleHibernateHours: null })).toBeNull();
     expect(w({}, 14)).toBeNull();
+  });
+
+  it('with box-idle-stop-enabled, a box with no idle hours is stopped, and one with its own hours is not', () => {
+    const legacy = (over: Partial<LifecycleBox> = {}, days: number | null = 14) =>
+      lifecycleWarning({ ...box({ hibernationConfigured: false, idleHibernateHours: null, ...over }), hibernatedTerminateDays: days }, { idleStopOn: true });
+    expect(legacy()).toBe(CANNOT_HIBERNATE_IDLE_STOP_WARNING);
+    expect(legacy()).not.toMatch(/never stopped/);
+    // The flag-off sentence stays when the flag is off, when the box has its own hours, and when it cannot be stopped.
+    expect(lifecycleWarning({ ...box({ hibernationConfigured: false, idleHibernateHours: null }), hibernatedTerminateDays: 14 }))
+      .toBe(CANNOT_HIBERNATE_WARNING);
+    expect(lifecycleWarning(
+      { ...box({ hibernationConfigured: false, idleHibernateHours: 4 }), hibernatedTerminateDays: 14 },
+      { idleStopOn: true },
+    )).toBe(CANNOT_HIBERNATE_WARNING);
+    expect(legacy({ kind: 'external', ec2InstanceId: null })).toBe(CANNOT_HIBERNATE_WARNING);
+    expect(lifecycleView(
+      { ...parked({ hibernationConfigured: false, idleHibernateHours: null }), lifecycleNote: null },
+      90,
+      { idleStopOn: true },
+    ).warning).toBe(CANNOT_HIBERNATE_IDLE_STOP_WARNING);
   });
 
   it('never lets the sweep act on such a box', () => {

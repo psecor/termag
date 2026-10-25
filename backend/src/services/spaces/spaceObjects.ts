@@ -10,6 +10,14 @@
  * signed it, so the session is renewed whenever less than the longest TTL
  * (plus a minute) is left.
  *
+ * There is one session per acting identity (presignerSession), so CloudTrail's
+ * S3 data events say who made each call: the session name is what acted
+ * (user-<email>, box-<name>, system-<task>) and SourceIdentity the person (a
+ * box's owner). Until the presigner's trust policy allows
+ * sts:SetSourceIdentity, AssumeRole with one answers AccessDenied; sessions are
+ * then made without it (still named per identity) and it is tried again after
+ * SOURCE_IDENTITY_RETRY_MS.
+ *
  * Every write names the KMS key: the bucket's default encryption is SSE-S3 and
  * its policy refuses any other algorithm or key on PutObject,
  * CreateMultipartUpload and CopyObject. The SSE headers are signed into a PUT
@@ -44,6 +52,8 @@ export interface AwsCredentialIdentity {
 }
 
 export const DOWNLOAD_TTL_S = 5 * 60;
+/** The PDF viewer and <video> keep sending Range requests after the first load; a 5-minute URL breaks seeking. */
+export const VIEW_TTL_S = 30 * 60;
 export const PUT_TTL_S = 15 * 60;
 export const PART_TTL_S = 30 * 60;
 export const SESSION_TTL_S = 60 * 60;
@@ -57,7 +67,14 @@ export interface PresignedPut extends PresignedUrl { method: 'PUT'; headers: Rec
 export interface SpaceObjects {
   list(prefix: string, opts?: { cursor?: string | null; delimiter?: boolean; max?: number }): Promise<ListResult>;
   head(key: string): Promise<{ size: number; contentType: string | null; lastModified: Date | null } | null>;
-  presignGet(key: string, response: { contentDisposition: string; contentType?: string }): Promise<PresignedUrl>;
+  /** `ttlS` is at most VIEW_TTL_S, which MIN_SESSION_LEFT_MS covers. */
+  presignGet(key: string, response: { contentDisposition: string; contentType?: string }, ttlS?: number): Promise<PresignedUrl>;
+  /**
+   * At most the first `maxBytes + 1` bytes of the object (a ranged GET, so the
+   * object changing after a HEAD can't make it buffer more), or null when it
+   * is gone. More than `maxBytes` back means the object is over the limit.
+   */
+  read(key: string, maxBytes: number): Promise<Buffer | null>;
   presignPut(key: string, size: number, contentType: string): Promise<PresignedPut>;
   createMultipart(key: string, contentType: string): Promise<string>;
   /** Each part URL signs its exact Content-Length, so a part can't carry more than the declared upload. */
@@ -68,7 +85,7 @@ export interface SpaceObjects {
   /** Deletes current versions (a delete marker each); returns the keys S3 refused. */
   deleteKeys(keys: string[]): Promise<string[]>;
   /** Bytes in every version under the prefix, current and noncurrent. */
-  sumVersions(prefix: string): Promise<bigint>;
+  sumVersions(prefix: string, watch: Set<string>): Promise<{ total: bigint; watched: ObjectVersion[] }>;
   /** Permanently deletes every version and delete marker under the prefix. */
   purgePrefix(prefix: string): Promise<number>;
   /**
@@ -79,6 +96,7 @@ export interface SpaceObjects {
   sweepMultipart(prefix: string, abortBefore: Date): Promise<{ aborted: number; inProgress: OpenUpload[] }>;
 }
 
+export interface ObjectVersion { key: string; size: bigint; lastModified: Date }
 export interface OpenUpload { key: string; uploadId: string; parts: Array<{ partNumber: number; bytes: bigint }> }
 
 /** The SSE-KMS headers every write carries. */
@@ -90,35 +108,179 @@ export function sseHeaders(kmsKeyId: string): Record<string, string> {
   };
 }
 
-/** Keeps one presigner session and renews it before it could cut a URL short. */
+/** Who an S3 call is made for. */
+export type PresignerIdentity =
+  | { kind: 'user'; userId: string; email: string | null }
+  | { kind: 'box'; instanceId: string; name: string | null; ownerUserId: string; ownerEmail: string | null }
+  | { kind: 'system'; task: string };
+
+export const SWEEP_IDENTITY: PresignerIdentity = { kind: 'system', task: 'sweep' };
+
+export interface PresignerSession {
+  /** Cache key: changes when the identity or either name does. */
+  key: string;
+  roleSessionName: string;
+  sourceIdentity: string | null;
+}
+
+/** STS's rule for RoleSessionName and SourceIdentity: 2-64 characters of [\w+=,.@-]. */
+export function stsName(raw: string): string {
+  const name = raw.replace(/[^\w+=,.@-]/g, '-').slice(0, 64);
+  return name.length >= 2 ? name : name.padEnd(2, '_');
+}
+
+export function presignerSession(identity: PresignerIdentity): PresignerSession {
+  let id: string;
+  let roleSessionName: string;
+  let sourceIdentity: string | null;
+  switch (identity.kind) {
+    case 'user':
+      id = `user:${identity.userId}`;
+      roleSessionName = stsName(`user-${identity.email ?? identity.userId}`);
+      sourceIdentity = stsName(identity.email ?? identity.userId);
+      break;
+    case 'box':
+      id = `box:${identity.instanceId}`;
+      roleSessionName = stsName(`box-${identity.name ?? identity.instanceId}`);
+      sourceIdentity = stsName(identity.ownerEmail ?? identity.ownerUserId);
+      break;
+    case 'system':
+      id = `system:${identity.task}`;
+      roleSessionName = stsName(`system-${identity.task}`);
+      sourceIdentity = null;
+      break;
+  }
+  return { key: `${id} ${roleSessionName} ${sourceIdentity ?? ''}`, roleSessionName, sourceIdentity };
+}
+
+export const SOURCE_IDENTITY_RETRY_MS = 15 * 60 * 1000;
+
+/**
+ * Whether to send SourceIdentity, shared by every session: after an
+ * AccessDenied with it (the trust policy predates sts:SetSourceIdentity), not
+ * for retryMs.
+ */
+export class SourceIdentityGate {
+  private deniedAt: number | null = null;
+  constructor(private readonly retryMs = SOURCE_IDENTITY_RETRY_MS) {}
+  allowed(now: number): boolean { return this.deniedAt === null || now - this.deniedAt >= this.retryMs; }
+  denied(now: number, err: Error): void {
+    if (this.deniedAt === null) console.warn(`[SPACES] AssumeRole with SourceIdentity was denied (${err.message}); signing without it until the presigner trust allows sts:SetSourceIdentity`);
+    this.deniedAt = now;
+  }
+  accepted(): void {
+    if (this.deniedAt !== null) console.log('[SPACES] AssumeRole with SourceIdentity accepted again');
+    this.deniedAt = null;
+  }
+}
+
+function isAccessDenied(err: unknown): boolean {
+  const e = err as { name?: string; Code?: string };
+  return e?.name === 'AccessDenied' || e?.Code === 'AccessDenied';
+}
+
+export type PresignerCredentialProvider = (() => Promise<AwsCredentialIdentity>) & { memoized: true };
+
+/**
+ * Keeps one presigner session and renews it before it could cut a URL short.
+ *
+ * Marked `memoized` so the SDK calls it on every request: otherwise the SDK
+ * wraps it in its own cache, which only refreshes five minutes before expiry,
+ * and a 30-minute part URL could be signed by a session with minutes left.
+ */
 export function presignerCredentials(
   roleArn: string,
-  opts: { sts?: Pick<STSClient, 'send'>; now?: () => number } = {},
-): () => Promise<AwsCredentialIdentity> {
+  opts: {
+    session?: Pick<PresignerSession, 'roleSessionName' | 'sourceIdentity'>;
+    sts?: Pick<STSClient, 'send'>;
+    gate?: SourceIdentityGate;
+    now?: () => number;
+  } = {},
+): PresignerCredentialProvider {
   const sts = opts.sts ?? new STSClient({});
   const now = opts.now ?? Date.now;
+  const gate = opts.gate ?? new SourceIdentityGate();
+  const { roleSessionName, sourceIdentity } = opts.session ?? presignerSession(SWEEP_IDENTITY);
   let current: AwsCredentialIdentity | null = null;
   let inFlight: Promise<AwsCredentialIdentity> | null = null;
 
-  return async () => {
+  const assume = (withSource: boolean) => sts.send(new AssumeRoleCommand({
+    RoleArn: roleArn,
+    RoleSessionName: roleSessionName,
+    DurationSeconds: SESSION_TTL_S,
+    ...(withSource && sourceIdentity ? { SourceIdentity: sourceIdentity } : {}),
+  }));
+
+  const provider = async () => {
     if (current?.expiration && current.expiration.getTime() - now() > MIN_SESSION_LEFT_MS) return current;
     inFlight ??= (async () => {
-      const out = await sts.send(new AssumeRoleCommand({
-        RoleArn: roleArn,
-        RoleSessionName: 'termag-spaces',
-        DurationSeconds: SESSION_TTL_S,
-      }));
+      const withSource = sourceIdentity !== null && gate.allowed(now());
+      let out;
+      try {
+        out = await assume(withSource);
+        if (withSource) gate.accepted();
+      } catch (err) {
+        if (!withSource || !isAccessDenied(err)) throw err;
+        gate.denied(now(), err as Error);
+        out = await assume(false);
+      }
       const c = out.Credentials;
       if (!c?.AccessKeyId || !c.SecretAccessKey) throw new Error('AssumeRole returned no credentials');
-      current = {
-        accessKeyId: c.AccessKeyId,
-        secretAccessKey: c.SecretAccessKey,
-        sessionToken: c.SessionToken,
-        expiration: c.Expiration ?? new Date(now() + SESSION_TTL_S * 1000),
-      };
+      const expiration = c.Expiration ?? new Date(now() + SESSION_TTL_S * 1000);
+      if (expiration.getTime() - now() <= MIN_SESSION_LEFT_MS) {
+        throw new Error(`AssumeRole returned a session that ends in ${Math.round((expiration.getTime() - now()) / 1000)}s, shorter than the longest URL`);
+      }
+      current = { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken, expiration };
       return current;
     })().finally(() => { inFlight = null; });
     return inFlight;
+  };
+  return Object.assign(provider, { memoized: true as const });
+}
+
+export const MAX_PRESIGNER_SESSIONS = 256;
+
+/**
+ * SpaceObjects per identity, each over its own presigner session, kept in a
+ * small LRU. The clients share one STS client, one SourceIdentityGate and one
+ * HTTP handler.
+ */
+export function presignerObjects(
+  resources: SpaceResources,
+  opts: {
+    sts?: Pick<STSClient, 'send'>;
+    gate?: SourceIdentityGate;
+    now?: () => number;
+    max?: number;
+    s3?: (credentials: PresignerCredentialProvider) => S3Client;
+  } = {},
+): (identity: PresignerIdentity) => SpaceObjects {
+  const sts = opts.sts ?? new STSClient({});
+  const gate = opts.gate ?? new SourceIdentityGate();
+  const max = opts.max ?? MAX_PRESIGNER_SESSIONS;
+  let shared: S3Client | null = null;
+  const s3For = opts.s3 ?? ((credentials: PresignerCredentialProvider) => {
+    const client: S3Client = new S3Client({
+      ...spacesS3ClientConfig(resources, credentials),
+      ...(shared ? { requestHandler: shared.config.requestHandler } : {}),
+    });
+    shared ??= client;
+    return client;
+  });
+  const cache = new Map<string, SpaceObjects>();
+
+  return identity => {
+    const session = presignerSession(identity);
+    let objects = cache.get(session.key);
+    if (objects) {
+      cache.delete(session.key);
+    } else {
+      const credentials = presignerCredentials(resources.roleArn, { session, sts, gate, now: opts.now });
+      objects = s3SpaceObjects(resources, { s3: s3For(credentials) });
+      if (cache.size >= max) cache.delete(cache.keys().next().value!);
+    }
+    cache.set(session.key, objects);
+    return objects;
   };
 }
 
@@ -140,7 +302,10 @@ function expiresAt(ttlS: number): string {
  * CRC32 of the request body into the URL, which for a presign is the empty
  * body, so S3 would refuse every upload made with it as a bad digest.
  */
-export function spacesS3ClientConfig(resources: SpaceResources, credentials = presignerCredentials(resources.roleArn)) {
+export function spacesS3ClientConfig(
+  resources: SpaceResources,
+  credentials: () => Promise<AwsCredentialIdentity> = presignerCredentials(resources.roleArn),
+) {
   return {
     region: resources.region,
     credentials,
@@ -190,13 +355,27 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
       }
     },
 
-    async presignGet(key, response) {
+    async read(key, maxBytes) {
+      try {
+        const out = await s3.send(new GetObjectCommand({ Bucket, Key: key, Range: `bytes=0-${maxBytes}` }));
+        return out.Body ? Buffer.from(await out.Body.transformToByteArray()) : Buffer.alloc(0);
+      } catch (err) {
+        const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+        if (status === 404 || (err as Error).name === 'NoSuchKey') return null;
+        // S3 refuses any range of an empty object.
+        if (status === 416 || (err as Error).name === 'InvalidRange') return Buffer.alloc(0);
+        throw err;
+      }
+    },
+
+    async presignGet(key, response, ttlS = DOWNLOAD_TTL_S) {
+      const expiresIn = Math.min(ttlS, VIEW_TTL_S);
       const url = await getSignedUrl(s3, new GetObjectCommand({
         Bucket, Key: key,
         ResponseContentDisposition: response.contentDisposition,
         ResponseContentType: response.contentType,
-      }), { expiresIn: DOWNLOAD_TTL_S });
-      return { url, expiresAt: expiresAt(DOWNLOAD_TTL_S) };
+      }), { expiresIn });
+      return { url, expiresAt: expiresAt(expiresIn) };
     },
 
     async presignPut(key, size, contentType) {
@@ -259,17 +438,21 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
       return failed;
     },
 
-    async sumVersions(prefix) {
+    async sumVersions(prefix, watch) {
       let total = 0n;
+      const watched: ObjectVersion[] = [];
       let KeyMarker: string | undefined;
       let VersionIdMarker: string | undefined;
       do {
         const out = await s3.send(new ListObjectVersionsCommand({ Bucket, Prefix: prefix, KeyMarker, VersionIdMarker }));
-        for (const v of out.Versions ?? []) total += BigInt(v.Size ?? 0);
+        for (const v of out.Versions ?? []) {
+          total += BigInt(v.Size ?? 0);
+          if (v.Key && v.LastModified && watch.has(v.Key)) watched.push({ key: v.Key, size: BigInt(v.Size ?? 0), lastModified: v.LastModified });
+        }
         KeyMarker = out.IsTruncated ? out.NextKeyMarker : undefined;
         VersionIdMarker = out.IsTruncated ? out.NextVersionIdMarker : undefined;
       } while (KeyMarker);
-      return total;
+      return { total, watched };
     },
 
     async purgePrefix(prefix) {

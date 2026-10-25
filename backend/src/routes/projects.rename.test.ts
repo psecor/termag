@@ -39,6 +39,7 @@ vi.mock('../services/agentRuntime', () => ({
 }));
 
 const { renameOwnedProject } = await import('./projects');
+const { setWorkspaceChangeCallback } = await import('../services/workspaceEvents');
 const user = { id: 'u1', unixUsername: 'alice', defaultAgentProvider: 'claude' } as unknown as Express.User;
 
 beforeEach(() => {
@@ -81,5 +82,26 @@ describe('renameOwnedProject on a box with a Codex agent', () => {
     await renameOwnedProject(user, 'p1', 'new');
     expect(setStatus).toHaveBeenCalledWith('alice-new-agent', 'idle', { instanceId: 'i1', stoppedAt: STOPPED_AT });
     live.clear();
+  });
+});
+
+describe('renameOwnedProject and the owner\'s tabs', () => {
+  it('tells the owner the project list changed after a rename, and not after a refusal', async () => {
+    const changed = vi.fn();
+    setWorkspaceChangeCallback(changed);
+    try {
+      sendForProject.mockImplementation(async (_host: unknown, command: string) => {
+        if (command === 'project-rename') throw new Error('Unknown command: project-rename');
+        return {};
+      });
+      expect((await renameOwnedProject(user, 'p1', 'new')).status).toBe(409);
+      expect(changed).not.toHaveBeenCalled();
+      sendForProject.mockReset();
+      sendForProject.mockResolvedValue({});
+      expect((await renameOwnedProject(user, 'p1', 'new')).status).toBe(200);
+      expect(changed.mock.calls).toEqual([['u1', 'projects']]);
+    } finally {
+      setWorkspaceChangeCallback(null);
+    }
   });
 });

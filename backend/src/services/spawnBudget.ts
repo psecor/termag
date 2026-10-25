@@ -63,7 +63,10 @@ export async function userBoxReadings(userId: string): Promise<BoxReading[]> {
 }
 
 /** Spawned agents of the user that have not ended (a failed spawn never ran). */
-const runningWhere = (userId: string) => ({ userId, endedAt: null, state: { not: 'failed' } });
+/** A parked spawn's CLI is stopped: it holds no memory and no running slot. */
+// Also what the admin spawn-limits card counts (services/admin/spawnLimitsQueries.ts).
+export const RUNNING_SPAWN_WHERE = { endedAt: null, parkedAt: null, state: { not: 'failed' } };
+const runningWhere = (userId: string) => ({ userId, ...RUNNING_SPAWN_WHERE });
 
 export async function usageCounts(
   userId: string,

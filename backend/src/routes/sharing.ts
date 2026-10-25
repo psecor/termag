@@ -1,7 +1,11 @@
 import { Router, RequestHandler, Response } from 'express';
 import { prisma } from '../db';
+import { kindRefusal, projectKindTraits } from '../services/projectKind';
+import { recheckMirror } from '../services/automations/memorySync';
 import { requireAuth } from '../middleware/auth';
 import { boxSharingEnabled, SHARING_DISABLED_CODE } from '../services/boxSharingFlag';
+import { recordProductEvent } from '../services/productEvents';
+import { notifyShareChange } from '../services/statusAudience';
 
 /**
  * The 403 for a new share while box-sharing-enabled is off for the caller.
@@ -34,8 +38,8 @@ export function sharingRouter(): Router {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    if (project.kind === 'metaterm') {
-      res.status(400).json({ error: 'MetaTerm cannot be shared yet' });
+    if (!projectKindTraits(project.kind).canShare) {
+      res.status(400).json({ error: kindRefusal(project.kind, 'be shared yet') });
       return;
     }
 
@@ -71,6 +75,9 @@ export function sharingRouter(): Router {
         inviteeId: invitee.id,
       },
     });
+
+    // The inviter's event; the invitee is a user id, never the email.
+    recordProductEvent('share.invited', { user: req.user!.id, box: project.instanceId }, { invitee: invitee.id });
 
     res.status(201).json(invite);
   };
@@ -115,6 +122,10 @@ export function sharingRouter(): Router {
         data: { projectId: invite.projectId, userId: req.user!.id },
       }),
     ]);
+    notifyShareChange({ userId: req.user!.id });
+    // A new sharee who cannot write an automation's mirrored space must not
+    // find its grant or pulled notes in the shell they now reach.
+    await recheckMirror(invite.projectId);
 
     res.json({ ok: true });
   };
@@ -171,18 +182,27 @@ export function sharingRouter(): Router {
       return;
     }
 
-    await prisma.projectShare.delete({
-      where: { id: req.params.shareId },
-    }).catch(() => {});
+    // Owning :id says nothing about :shareId, so the delete is scoped to this
+    // project's shares: a bare delete by id let any owner revoke a share on
+    // anyone's project.
+    const { count } = await prisma.projectShare.deleteMany({
+      where: { id: req.params.shareId, projectId: project.id },
+    });
+    if (count === 0) {
+      res.status(404).json({ error: 'Share not found' });
+      return;
+    }
+    notifyShareChange({ projectId: project.id });
 
     res.json({ ok: true });
   };
 
   // DELETE /api/projects/:id/leave — collaborator leaves a shared project
   const leaveProject: RequestHandler = async (req, res) => {
-    await prisma.projectShare.deleteMany({
+    const { count } = await prisma.projectShare.deleteMany({
       where: { projectId: req.params.id, userId: req.user!.id },
     });
+    if (count > 0) notifyShareChange({ userId: req.user!.id });
     res.json({ ok: true });
   };
 

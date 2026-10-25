@@ -23,9 +23,12 @@ import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { isLocalPeer } from '../auth/peerAddress';
 import { resolveSessionProject } from '../services/sessionResolver';
 import { recordContextSample } from '../services/contextSampler';
+import { debugLog } from '../services/debugLog';
 import { statusKey } from '../services/statusKey';
 import { isRunnerSessionOf } from '../services/claudeRunnerSpawn';
 import { sendResult, type RouteResult } from './routeResult';
+import { pushOnWaitingTransition, waitingChatMuted } from '../services/pushWaiting';
+import { settleTurnPost, T3_SERVER_SESSION } from '../services/sessionTurns';
 
 
 const statusTracking = new Map<string, {
@@ -68,12 +71,16 @@ function writeInstanceId(req: Request): string | null {
  * sessions of that box: a Claude Code cloud session's status hooks post under
  * the runner's tmux name, which starts with the box's unix user
  * (services/claudeRunnerSpawn.ts, isRunnerSessionOf). The box row is read
- * once per post; the hooks post a few times a minute at most.
+ * once per post; the hooks post a few times a minute at most. Also, for an
+ * instance-bound token, that box's t3 server session: a desktop thread
+ * outside every project's checkout posts there (services/sessionTurns.ts),
+ * and the key is the box's own, so it reaches no project.
  */
 async function callerMayWrite(req: Request, session: string): Promise<boolean> {
   if (!req.user) return true; // loopback: the orchestrator's own hooks
   if (sessionBelongsToUser(session, req.user.unixUsername)) return true;
   if (!req.agentInstanceId) return false;
+  if (session === T3_SERVER_SESSION) return true;
   try {
     const box = await prisma.instance.findUnique({ where: { id: req.agentInstanceId }, select: { hostUnixUser: true } });
     return isRunnerSessionOf(session, box?.hostUnixUser);
@@ -198,23 +205,40 @@ export function statusRouter(): Router {
       return;
     }
 
-    console.log(`[STATUS] POST session=${session} status=${status} notify=${notify} source=${source ?? 'unknown'} waitingReason=${waitingReason ?? 'null'} message=${message?.slice(0, 50)}`);
+    // One per status hook, so a debug line (TERMAG_DEBUG=STATUS); the
+    // transition itself is the agent.status.changed product event.
+    debugLog('STATUS', () => `POST session=${session} status=${status} notify=${notify} source=${source ?? 'unknown'} thread=${threadId ?? '-'} waitingReason=${waitingReason ?? 'null'} message=${message?.slice(0, 50)}`);
 
-    const updated = setStatus(session, status, {
-      message,
-      source,
-      waitingReason,
+    // Read before the write: the web push fires on the transition INTO waiting.
+    const previousStatus = getAllStatuses().get(statusKey(instanceId, session))?.status;
+
+    // The post reports one turn; with desktop threads in the same checkout
+    // the session's status is the busiest turn's (services/sessionTurns.ts).
+    // Anywhere else `effective` is the post itself.
+    const effective = settleTurnPost(statusKey(instanceId, session), { status, source, threadId, message, waitingReason });
+
+    const updated = setStatus(session, effective.status, {
+      message: effective.message,
+      source: effective.source,
+      waitingReason: effective.waitingReason,
       activityScore,
       tokenBurst,
       activeTurn,
-      threadId,
+      threadId: effective.threadId,
       contextTokens,
       rateLimited,
     }, undefined, instanceId);
     notifyStatusChange(session, instanceId);
 
+    // Web push to the session owner's devices (services/pushWaiting.ts). Not
+    // behind `notify` or the Slack/Discord targets; fire and forget, it never
+    // throws and never holds up this response. Like the Slack and Discord
+    // posts below, it follows the post rather than the session's settled
+    // status: a turn that needs input says so while another turn works.
+    pushOnWaitingTransition({ session, instanceId, prev: previousStatus, next: status, message, waitingReason });
+
     // Touch lastActiveAt when agent starts working (for project sort order).
-    if (status === 'working') {
+    if (effective.status === 'working') {
       const sessionMatch = session.match(/^(.+?)-(.+)-agent$/);
       if (sessionMatch) {
         const [, username, projectName] = sessionMatch;
@@ -241,8 +265,10 @@ export function statusRouter(): Router {
       existing.workingStartedAt = null;
     }
 
-    // Notifications to all registered platforms
-    if (notify) {
+    // Notifications to all registered platforms. An owner with pushMutesChat
+    // and a live push subscription gets "needs input" on the phone instead;
+    // this post is waiting-or-done, so skipping it whole keeps Done intact.
+    if (notify && !(status === 'waiting' && await waitingChatMuted(session, instanceId))) {
       const targets = await getAllNotificationTargets(session, instanceId);
       const timeSinceNotify = existing.lastNotifiedAt ? now - existing.lastNotifiedAt : Infinity;
 

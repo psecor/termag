@@ -16,6 +16,9 @@ import { configurePassport, authRouter, albSessionBridge, authMode, upgradeUserI
 import { stashPostLoginReturn } from './auth/postLoginReturn';
 import { projectsRouter } from './routes/projects';
 import { chatRouter } from './routes/chat';
+import { CHAT_MESSAGE_BODY_LIMIT } from './services/chatImages';
+import { chatsRouter } from './routes/chats';
+import { claudeLoginRouter } from './routes/claudeLogin';
 import { mayReceiveChat, setChatPushCallback, startChatRelay, startChatStatusSweep, stopChatStatusSweep } from './services/chatRunner';
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
@@ -37,19 +40,26 @@ import { isAllowedUpgradeOrigin } from './auth/wsOrigin';
 import { workstreamsRouter } from './routes/workstreams';
 import { featureFlagsRouter } from './routes/featureFlags';
 import { credentialsRouter } from './routes/credentials';
+import { mcpClientMetadataHandler, mcpConnectorsRouter } from './routes/mcpConnectors';
 import { githubReposRouter } from './routes/githubRepos';
 import { githubAuthzRouter } from './routes/githubAuthz';
 import { claudeAuthzRouter } from './routes/claudeAuthz';
+import { fireworksAuthzRouter } from './routes/fireworksAuthz';
+import { mcpAuthzRouter } from './routes/mcpAuthz';
 import { claudeRunnerRouter } from './routes/claudeRunner';
 import { claudeRunnerEventsRouter } from './routes/claudeRunnerEvents';
 import { boxUpdatePolicyRouter } from './routes/boxUpdatePolicy';
-import { isOwnRunnerSessionStatus, isRunnerSessionShaped } from './services/claudeRunnerSpawn';
+import { usersRouter } from './routes/users';
+import { isOwnRunnerSessionStatus } from './services/claudeRunnerSpawn';
 import { claudeSessionsRouter } from './routes/claudeSessions';
 import { setCloudSessionChangeCallback } from './services/claudeSessionEvents';
+import { coalesceWorkspaceChanges, setWorkspaceChangeCallback } from './services/workspaceEvents';
+import { installWorkspaceWriteNotifier } from './services/workspaceWrites';
 import { startCloudSessionSweeps, stopCloudSessionSweeps } from './services/claudeSessions';
 import { getCallerProofConfig } from './services/callerIdentity';
 import { providersRouter } from './routes/providers';
 import { prsRouter } from './routes/prs';
+import { pushRouter } from './routes/push';
 import { termagVersion } from './services/termagVersion';
 import { adminRouter } from './routes/admin';
 import { requireAdmin } from './middleware/admin';
@@ -57,12 +67,20 @@ import { rateLimit } from './middleware/rateLimit';
 import { handleAdminMcp } from './mcp/adminServer';
 import { initFeatureFlags, closeFeatureFlags } from './services/featureFlags';
 import { backfillBoxEcrPullPolicies, startProvisioningSweep, stopProvisioningSweep } from './services/boxProvisioner';
+import { moveChatModelsToWorkflows } from './services/chatModelMove';
 import { instanceStatus, startPowerSweep, stopPowerSweep } from './services/boxPower';
 import { TERMINAL_BOX_PARKED_CLOSE_CODE, terminalAttachRefusal } from './services/boxPowerPolicy';
+import { terminalSessionAccess } from './services/sessionAccess';
+import { loadSharedScope, sendThroughShare, setShareChangeCallback, shareChangeFrames, shareChangeTouches, startSharedRefresh, statusRoute, type ScopeHolder } from './services/statusAudience';
+import type { AgentStatus } from './types';
 import { startWarmPoolReconciler, stopWarmPoolReconciler } from './services/warmPool';
 import { startBoxUpdateSweep, stopBoxUpdateSweep } from './services/boxUpdate';
 import { prismaCliAsk, startAskQueue, startAskReplies, startAskSweep, stopAskQueue, stopAskReplies, stopAskSweep } from './services/askService';
 import { BRIEFING_RESULT_BODY_LIMIT, briefingsRouter } from './routes/briefings';
+import { automationsRouter } from './routes/automations';
+import { recheckMirrorsForMember } from './services/automations/memorySync';
+import { startAutomationScheduler, stopAutomationScheduler } from './services/automations/scheduler';
+import { startAutomationCompletion } from './services/automations/complete';
 import { startBriefingScheduler, stopBriefingScheduler } from './services/briefing/scheduler';
 import { registerBriefingSlackActions } from './services/briefing/slack';
 import { startLifecycleSweep, stopLifecycleSweep } from './services/boxLifecycle';
@@ -71,6 +89,7 @@ import { startSoftwareCollector, stopSoftwareCollector } from './services/softwa
 import { clientVersionMiddleware } from './services/software/clients';
 import { requireAuth } from './middleware/auth';
 import { spaStatic } from './middleware/spaStatic';
+import { handleBrowserPaneSocket } from './routes/browserWs';
 import { startPrIngester, stopPrIngester } from './services/prAnalytics/ingester';
 import { startSegmentTracker, stopSegmentTracker } from './services/segments/tracker';
 import { syncAdminBootstrap } from './services/admin/adminAccess';
@@ -87,6 +106,7 @@ import { registerCollabSlackActions } from './slack/collab';
 import { startCollabNudgeSweep, stopCollabNudgeSweep } from './services/collabSweep';
 import { initOtel, shutdownOtel } from './services/otel';
 import { registerSpawnGauges } from './services/spawnMetrics';
+import { debugLog } from './services/debugLog';
 import { parseStatusKey } from './services/statusKey';
 import { createSlackApp, startSlackApp, stopSlackApp } from './slack/app';
 import { createDiscordClient, startDiscordClient, stopDiscordClient } from './discord/app';
@@ -106,7 +126,6 @@ import type { Client as DiscordClient } from 'discord.js';
 import { prisma as prismaIndex, getPool } from './db';
 import { startTmuxPoller, stopTmuxPoller } from './services/tmuxPoller';
 import { holdFramesUntilReady } from './services/socketHandoff';
-import { sessionBelongsToUser, sessionName } from './services/tmux';
 import { cliApiRouter, cliBearer, cliDevicesRouter, type CliAuth } from './routes/cliApi';
 import { cliAuthorizeRouter } from './routes/cliAuthorize';
 import { AuthCodeStore } from './services/cliAuth';
@@ -126,7 +145,11 @@ import { startContextSampler, stopContextSampler } from './services/contextSampl
 import { startTokenUsageSampler, stopTokenUsageSampler } from './services/tokenUsageSampler';
 import { agentTokenForms, agentWsToken, QUERY_TOKEN_REFUSAL } from './auth/agentWsToken';
 import { spaceCallerFromCli, spacesRouter } from './routes/spaces';
-import { spaceObjects, spacesEnabledFor, spacesSharingEnabledFor, spacesSweeper, spaceStore } from './services/spaces/spacesRuntime';
+import { spaceFilesRouter } from './routes/spaceFiles';
+import { previewLinkRouter, previewSharesRouter, defaultPreviewShareRouteDeps, installAutoPreviewShares } from './routes/previewShares';
+import { installPreviewShareLinkHooks, startPreviewShareSweep, stopPreviewShareSweep } from './services/previewShareLinks';
+import { FILE_LINK_PREFIX, spaceFileLinkPath } from './services/spaces/spaceLinks';
+import { spaceObjects, spacesEnabledFor, spacesHtmlLinksEnabledFor, spacesSharingEnabledFor, spacesSweeper, spaceStore } from './services/spaces/spacesRuntime';
 
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
@@ -151,10 +174,16 @@ const callerProof = getCallerProofConfig();
 if (callerProof) {
   app.use(`${BASE_PATH}/internal/github-authz`, githubAuthzRouter(callerProof));
   app.use(`${BASE_PATH}/internal/claude-authz`, claudeAuthzRouter(callerProof));
+  app.use(`${BASE_PATH}/internal/fireworks-authz`, fireworksAuthzRouter(callerProof));
+  app.use(`${BASE_PATH}/internal/mcp-authz`, mcpAuthzRouter(callerProof));
 }
 // A briefing's result (the composed JSON plus the run's usage) may pass the
 // global 100kb default; parsed here first, express.json() below skips it.
 app.use(`${BASE_PATH}/api/briefings/:id/result`, express.json({ limit: BRIEFING_RESULT_BODY_LIMIT }));
+// A chat message may carry images as base64 (services/chatImages.ts).
+app.use(`${BASE_PATH}/api/projects/:id/chat/messages`, express.json({ limit: CHAT_MESSAGE_BODY_LIMIT }));
+// Returning a session to the chat can carry the same image message.
+app.use(`${BASE_PATH}/api/projects/:id/chat/reclaim`, express.json({ limit: CHAT_MESSAGE_BODY_LIMIT }));
 app.use(express.json());
 // Claude Code cloud sessions: the self-hosted orchestrator's spawn hook on this
 // host asks for a one-shot runner on the session owner's box
@@ -208,11 +237,12 @@ app.use(`${BASE_PATH}/api/cli/v1`, cliCredentialsRouter({ store: prismaCliStore,
 app.use(`${BASE_PATH}/api/cli/v1/spaces`, (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); },
   cliBearer({ store: prismaCliStore, jwt: cliJwt }),
   spacesRouter({
-    store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor,
+    store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, onMemberChanged: recheckMirrorsForMember,
     caller: (_req, res) => {
       const auth = res.locals.cliAuth as CliAuth | undefined;
       return auth ? spaceCallerFromCli(auth) : null;
     },
+    fileLink: (space, path) => `${FRONTEND_URL}${spaceFileLinkPath(BASE_PATH, space, path)}`,
   }));
 
 // --- termag CLI API (bearer-only, before session/passport/ALB bridge) ---
@@ -283,6 +313,8 @@ app.use(`${BASE_PATH}/auth/cli`, cliAuthorizeRouter({
 app.use(`${BASE_PATH}/auth`, authRouter());
 app.use(`${BASE_PATH}/api/projects`, projectsRouter());
 app.use(`${BASE_PATH}/api/projects`, chatRouter());
+app.use(`${BASE_PATH}/api/chats`, chatsRouter());
+app.use(`${BASE_PATH}/api/projects`, claudeLoginRouter());
 app.use(`${BASE_PATH}/api/status`, statusRouter());
 // A box reports the end of a Claude Code cloud session the spawn route started
 // there.
@@ -292,6 +324,8 @@ app.use(`${BASE_PATH}/api/claude-runner`, claudeRunnerEventsRouter());
 // for its owner. Anything but a yes from here, this route included when it is
 // missing, leaves the box as it is.
 app.use(`${BASE_PATH}/api/box-update`, boxUpdatePolicyRouter());
+// The person picker in the share and space dialogs (routes/users.ts).
+app.use(`${BASE_PATH}/api/users`, usersRouter());
 // The owner's view of those sessions: runs, events, runner log, end.
 app.use(`${BASE_PATH}/api/claude-sessions`, claudeSessionsRouter());
 app.use(`${BASE_PATH}/api/browser`, browserRouter());
@@ -300,6 +334,7 @@ app.use(`${BASE_PATH}/api/cli-devices`, cliDevicesRouter({ store: prismaCliStore
 app.use(`${BASE_PATH}/api/usage`, usageRouter());
 app.use(`${BASE_PATH}/api/worktime`, worktimeRouter());
 app.use(`${BASE_PATH}/api/briefings`, briefingsRouter());
+app.use(`${BASE_PATH}/api/automations`, automationsRouter());
 app.use(`${BASE_PATH}/api`, sharingRouter());
 app.use(`${BASE_PATH}/api`, sessionsRouter());
 app.use(`${BASE_PATH}/api`, reviewRouter());
@@ -309,9 +344,42 @@ app.use(`${BASE_PATH}/api/warp`, warpRouter());
 app.use(`${BASE_PATH}/api/context`, contextRouter());
 app.use(`${BASE_PATH}/api/instances`, instancesRouter());
 app.use(`${BASE_PATH}/api/spaces`, requireAuth, spacesRouter({
-  store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor,
+  store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, onMemberChanged: recheckMirrorsForMember,
   caller: req => (req.user ? { kind: 'user', userId: req.user.id } : null),
+  fileLink: (space, path) => `${FRONTEND_URL}${spaceFileLinkPath(BASE_PATH, space, path)}`,
 }));
+// Space file links, /termag/files/<space>/<path> (routes/spaceFiles.ts): a
+// navigation, so behind the session cookie and the ALB's Okta default action,
+// never under /api. Must stay ahead of the SPA fallback below.
+app.use(`${BASE_PATH}${FILE_LINK_PREFIX}`, spaceFilesRouter({
+  store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, htmlEnabled: spacesHtmlLinksEnabledFor,
+  userId: req => req.user?.id ?? null,
+  signIn: authMode() === 'okta'
+    ? undefined
+    : req => new Promise((resolve, reject) => {
+      if (!stashPostLoginReturn(req.session, BASE_PATH, req.originalUrl)) { resolve(null); return; }
+      req.session.save(err => (err ? reject(err) : resolve(`${BASE_PATH}/auth/login`)));
+    }),
+}));
+// Preview share links, /termag/p/<key> (routes/previewShares.ts):
+// a navigation like a file link, so behind the
+// session cookie and the ALB's Okta default action, ahead of the SPA fallback.
+app.use(`${BASE_PATH}/p`, previewLinkRouter(BASE_PATH, {
+  store: defaultPreviewShareRouteDeps.store,
+  isCollaborator: defaultPreviewShareRouteDeps.isCollaborator,
+  userId: req => req.user?.id ?? null,
+  signIn: authMode() === 'okta'
+    ? undefined
+    : req => new Promise((resolve, reject) => {
+      if (!stashPostLoginReturn(req.session, BASE_PATH, req.originalUrl)) { resolve(null); return; }
+      req.session.save(err => (err ? reject(err) : resolve(`${BASE_PATH}/auth/login`)));
+    }),
+}));
+app.use(`${BASE_PATH}/api`, previewSharesRouter());
+// Every end of a PR link share edits its PR comment, on whichever orchestrator ended it (services/previewShareLinks.ts).
+installPreviewShareLinkHooks();
+// A PR a session reports opening is shared when its project says so (4c).
+installAutoPreviewShares();
 app.use(`${BASE_PATH}/api/ssh-keys`, sshKeysRouter());
 app.use(`${BASE_PATH}/api/warm-pool`, warmPoolRouter());
 app.use(`${BASE_PATH}/api`, workstreamsRouter());
@@ -320,9 +388,13 @@ app.use(`${BASE_PATH}/api`, handoffsRouter());
 app.use(`${BASE_PATH}/api`, collabRouter());
 app.use(`${BASE_PATH}/api/flags`, featureFlagsRouter());
 app.use(`${BASE_PATH}/api/credentials`, credentialsRouter());
+app.use(`${BASE_PATH}/api/mcp-connectors`, mcpConnectorsRouter());
+// Fetched by MCP authorization servers, so no session.
+app.get(`${BASE_PATH}/oauth/client-metadata.json`, mcpClientMetadataHandler);
 app.use(`${BASE_PATH}/api/github`, githubReposRouter());
 app.use(`${BASE_PATH}/api/providers`, providersRouter());
 app.use(`${BASE_PATH}/api`, prsRouter());
+app.use(`${BASE_PATH}/api/push`, pushRouter());
 // Admin surface: REST under /api/admin and the
 // Streamable HTTP MCP server at /mcp/admin. Both behind requireAdmin. The MCP
 // path audits per tool call inside the server, so requireAdmin's per-request
@@ -398,6 +470,9 @@ function startLeaderWork(): void {
   if (!ecrBackfillStarted) {
     ecrBackfillStarted = true;
     backfillBoxEcrPullPolicies().catch(err => console.error('[BOX] ECR pull policy backfill failed:', err));
+    moveChatModelsToWorkflows()
+      .then(n => { if (n) console.log(`[CHAT] moved ${n} project chat model(s) onto their workstreams`); })
+      .catch(err => console.error('[CHAT] chat model move failed:', err));
   }
   startPowerSweep();
   startWarmPoolReconciler();
@@ -405,7 +480,9 @@ function startLeaderWork(): void {
   startBoxUpdateSweep();
   startAskSweep();
   startBriefingScheduler();
+  startAutomationScheduler();
   startLifecycleSweep();
+  startPreviewShareSweep();
   startHostSampling();
   startPrIngester();
   startSegmentTracker();
@@ -433,7 +510,9 @@ function stopLeaderWork(): void {
   stopBoxUpdateSweep();
   stopAskSweep();
   stopBriefingScheduler();
+  stopAutomationScheduler();
   stopLifecycleSweep();
+  stopPreviewShareSweep();
   stopHostSampling();
   stopPrIngester().catch(() => {});
   stopSegmentTracker().catch(() => {});
@@ -548,21 +627,17 @@ function sessionUserId(req: import('http').IncomingMessage): string | null {
 // Claude Code cloud sessions, which are named after the box's unix user
 // (services/claudeRunnerSpawn.ts, isOwnRunnerSessionStatus). Filled at
 // connect and completed lazily for a box created since (ownedBoxUser).
-type StatusClientInfo = { userId: string; unixUsername: string; sharedOwnerUsernames: string[]; sharedProjectIds: Set<string>; sharedCheckedAt: number; sharedRefreshing?: boolean; ownedBoxes: Map<string, string | null>; boxCheckedAt: Map<string, number> };
+// The shared scope (services/statusAudience.ts) is what reaches the client
+// through sharing: chat frames by project, statuses by (box, session).
+type StatusClientInfo = ScopeHolder & { unixUsername: string; ownedBoxes: Map<string, string | null>; boxCheckedAt: Map<string, number> };
 
-// Chat frames carry prompts and file contents, so a revoked share must stop
-// delivery without waiting for a reconnect. The shared-project set is re-read
-// in the background when a chat push finds it older than this.
-const SHARED_PROJECTS_TTL_MS = 15_000;
-
-function refreshSharedProjectsIfStale(clientInfo: StatusClientInfo): void {
-  if (clientInfo.sharedRefreshing) return;
-  if (Date.now() - clientInfo.sharedCheckedAt < SHARED_PROJECTS_TTL_MS) return;
-  clientInfo.sharedRefreshing = true;
-  prismaIndex.projectShare.findMany({ where: { userId: clientInfo.userId }, select: { projectId: true } })
-    .then(rows => { clientInfo.sharedProjectIds = new Set(rows.map(r => r.projectId)); })
-    .catch(() => { /* keep the last set; try again next push */ })
-    .finally(() => { clientInfo.sharedCheckedAt = Date.now(); clientInfo.sharedRefreshing = false; });
+/** A status as a collaborator gets it: no PR URL on the milestone or the review (see the fan-out below). */
+function sharedStatusPayload(session: string, status: AgentStatus): string {
+  return JSON.stringify({
+    type: 'status', session, ...status,
+    milestone: milestoneForSharedViewer(status.milestone),
+    review: reviewForSharedViewer(status.review),
+  });
 }
 const statusClients = new Map<WebSocket, StatusClientInfo>();
 // A box without a known unix user yet (still provisioning, or a failed
@@ -637,87 +712,34 @@ wss.on('connection', (ws, req) => {
       ws.close(1008, 'session param required');
       return;
     }
-    // Authoritative routing: the frontend sends the project id (+ workstream)
-    // so we resolve the owner/box directly. Falls back to parsing the session
-    // string (legacy clients, Slack/Discord capture) when absent.
+    // The project id says what is attached; the session string is only
+    // compared with the names rebuilt for that project (terminalSessionAccess).
+    // There is no fallback that parses owner and project out of the session
+    // string: every client has sent projectId since June 2026, and the parse
+    // let a share on one project reach another's session, tmux reading `-t`
+    // as a prefix and a pattern.
     const projectIdParam = url.searchParams.get('projectId');
+    if (!projectIdParam) {
+      ws.close(1008, 'project id required');
+      return;
+    }
     const workstreamParam = url.searchParams.get('workstream') || 'main';
 
     (async () => {
-      let project: { id: string; name: string; userId: string; instanceId: string | null; setupStatus: string } | null = null;
-      let owner: Awaited<ReturnType<typeof prismaIndex.user.findUnique>> = null;
-
-      if (projectIdParam) {
-        // Preferred path: look the project up by id (unambiguous across boxes).
-        const p = await prismaIndex.project.findUnique({
-          where: { id: projectIdParam },
-          include: { user: true },
-        });
-        if (p) {
-          project = { id: p.id, name: p.name, userId: p.userId, instanceId: p.instanceId, setupStatus: p.setupStatus };
-          owner = p.user;
-        }
-      } else {
-        // Legacy fallback: derive owner + project name from the session string.
-        const dashIdx = tmuxSession.indexOf('-');
-        const username = dashIdx > 0 ? tmuxSession.substring(0, dashIdx) : null;
-        if (username) {
-          owner = await prismaIndex.user.findUnique({ where: { unixUsername: username } });
-          if (owner) {
-            const afterUsername = tmuxSession.substring(dashIdx + 1);
-            const lastDash = afterUsername.lastIndexOf('-');
-            const projectName = lastDash > 0 ? afterUsername.substring(0, lastDash) : null;
-            const p = projectName
-              ? await prismaIndex.project.findFirst({ where: { userId: owner.id, name: projectName } })
-              : null;
-            if (p) project = { id: p.id, name: p.name, userId: p.userId, instanceId: p.instanceId, setupStatus: p.setupStatus };
-          }
-        }
-      }
-
-      if (!owner) {
-        console.log(`[TERMINAL] No owner resolved for session ${tmuxSession} (projectId=${projectIdParam ?? 'none'})`);
-        ws.send(JSON.stringify({ type: 'output', data: `\r\nUnknown session\r\n` }));
-        ws.close(1008, 'unknown user');
+      const access = await terminalSessionAccess(loggedInUserId, projectIdParam, tmuxSession, workstreamParam);
+      if ('refusal' in access) {
+        console.log(`[TERMINAL] ${access.refusal}: ${tmuxSession} for project ${projectIdParam} (${workstreamParam})`);
+        ws.close(1008, access.refusal);
         return;
       }
-      const ownerUser = owner; // non-null binding for use inside the closures below
-
-      // When routed by id, the requested session must actually belong to this
-      // project — rebuild the legitimate names so a collaborator can't target
-      // an arbitrary tmux session for a project they happen to have a share on.
-      if (projectIdParam && project) {
-        const allowedSessions = (['agent', 'ctrl', 'data', 'data-ctrl', 'review'] as const)
-          .map(role => sessionName(ownerUser.unixUsername, project!.name, role, workstreamParam));
-        if (!allowedSessions.includes(tmuxSession)) {
-          console.log(`[TERMINAL] session ${tmuxSession} does not belong to project ${project.id}`);
-          ws.close(1008, 'session/project mismatch');
-          return;
-        }
-      }
-
-      // Allow owner directly; for others, check if they have a share on the project.
-      if (ownerUser.id !== loggedInUserId) {
-        let allowed = false;
-        if (project) {
-          const share = await prismaIndex.projectShare.findUnique({
-            where: { projectId_userId: { projectId: project.id, userId: loggedInUserId } },
-          });
-          if (share) allowed = true;
-        }
-
-        if (!allowed) {
-          ws.close(1008, 'session forbidden');
-          return;
-        }
-        console.log(`[TERMINAL] Shared access: routing ${tmuxSession} for collaborator`);
-      }
+      const { project } = access;
+      if (!access.isOwner) console.log(`[TERMINAL] Shared access: routing ${tmuxSession} for collaborator`);
 
       // Route via the project's box (if pinned) or the owner's legacy agent.
-      const instanceId = project?.instanceId ?? null;
+      const instanceId = project.instanceId;
       const agentConnected = instanceId
         ? isInstanceAgentConnected(instanceId)
-        : isAgentConnected(ownerUser.id);
+        : isAgentConnected(project.userId);
 
       const refusal = terminalAttachRefusal(instanceId, await instanceStatus(instanceId), agentConnected, project);
       if (refusal?.kind === 'parked') {
@@ -731,13 +753,13 @@ wss.on('connection', (ws, req) => {
       // A plain 1008 close: today's browser backs off and reattaches, which
       // lands once the project is ready.
       if (refusal?.kind === 'setup') {
-        console.log(`[TERMINAL] Project ${project?.id} setup is ${refusal.refusal.setupStatus}; refusing ${tmuxSession}`);
+        console.log(`[TERMINAL] Project ${project.id} setup is ${refusal.refusal.setupStatus}; refusing ${tmuxSession}`);
         ws.send(JSON.stringify({ type: 'output', data: `\r\n${refusal.refusal.message}\r\n` }));
         ws.close(1008, `project setup ${refusal.refusal.setupStatus}`);
         return;
       }
       if (refusal) {
-        const where = instanceId ? `box ${instanceId}` : ownerUser.unixUsername;
+        const where = instanceId ? `box ${instanceId}` : project.ownerUsername;
         console.log(`[TERMINAL] Agent not connected for ${where}`);
         ws.send(JSON.stringify({
           type: 'output',
@@ -750,7 +772,7 @@ wss.on('connection', (ws, req) => {
       const initCols = parseInt(url.searchParams.get('cols') || '', 10) || 80;
       const initRows = parseInt(url.searchParams.get('rows') || '', 10) || 24;
 
-      console.log(`[TERMINAL] Routing ${tmuxSession} via ${instanceId ? `instance ${instanceId}` : ownerUser.unixUsername} (${initCols}x${initRows})`);
+      console.log(`[TERMINAL] Routing ${tmuxSession} via ${instanceId ? `instance ${instanceId}` : project.ownerUsername} (${initCols}x${initRows})`);
       try {
         const onData = (msg: any) => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -762,8 +784,8 @@ wss.on('connection', (ws, req) => {
           }
         };
         const streamId = instanceId
-          ? await requestInstanceTerminalStream(instanceId, ownerUser, tmuxSession, initCols, initRows, onData)
-          : await requestTerminalStream(ownerUser.id, tmuxSession, initCols, initRows, onData);
+          ? await requestInstanceTerminalStream(instanceId, { id: project.userId }, tmuxSession, initCols, initRows, onData)
+          : await requestTerminalStream(project.userId, tmuxSession, initCols, initRows, onData);
 
         // A browser that left during the attach has already fired 'close', so
         // no listener below would ever tell the agent to drop its PTY.
@@ -804,6 +826,16 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  // Browser pane WebSocket:
+  // /termag/ws/browser?projectId=&workstream=&url=&width=&height=
+  if (path === `${BASE_PATH}/ws/browser`) {
+    handleBrowserPaneSocket(ws, url, loggedInUserId).catch((err) => {
+      console.error('[BROWSER-PANE] socket failed:', (err as Error).message);
+      try { ws.close(1011, 'lookup error'); } catch { /* already closed */ }
+    });
+    return;
+  }
+
   // Status WebSocket: /termag/ws/status (the browser) or
   // /termag/api/cli/v1/ws/status (the TUI) — receives status push events
   if (path === `${BASE_PATH}/ws/status` || cliRoute === 'status') {
@@ -818,33 +850,25 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Find owner usernames for projects shared with this user
-      const shares = await prismaIndex.projectShare.findMany({
-        where: { userId: user.id },
-        include: { project: { include: { user: { select: { unixUsername: true } } } } },
-      });
-      const sharedOwnerUsernames = [...new Set(shares.map(s => s.project.user.unixUsername))];
-      const sharedProjectIds = new Set(shares.map(s => s.projectId));
+      // What reaches this user through sharing (services/statusAudience.ts).
+      const scope = await loadSharedScope(user.id);
       const boxes = await prismaIndex.instance.findMany({ where: { userId: user.id }, select: { id: true, hostUnixUser: true } });
       const ownedBoxes = new Map(boxes.map(b => [b.id, b.hostUnixUser]));
       const checkedAt = Date.now();
 
-      statusClients.set(ws, { userId: user.id, unixUsername: user.unixUsername, sharedOwnerUsernames, sharedProjectIds, sharedCheckedAt: checkedAt, ownedBoxes, boxCheckedAt: new Map(boxes.map(b => [b.id, checkedAt])) });
-      console.log(`[STATUS] Client connected for ${user.unixUsername} (shared owners: [${sharedOwnerUsernames.join(',')}], total: ${statusClients.size})`);
+      const clientInfo: StatusClientInfo = { ...scope, userId: user.id, unixUsername: user.unixUsername, sharedCheckedAt: checkedAt, ownedBoxes, boxCheckedAt: new Map(boxes.map(b => [b.id, checkedAt])) };
+      statusClients.set(ws, clientInfo);
+      console.log(`[STATUS] Client connected for ${user.unixUsername} (shared owners: [${scope.sharedOwners.join(',')}], total: ${statusClients.size})`);
 
       // Send current statuses for this user so the client starts with the right state.
       for (const [key, status] of getAllStatuses()) {
         const { session, instanceId } = parseStatusKey(key);
-        if (sessionBelongsToUser(session, user.unixUsername) || isOwnRunnerSessionStatus(session, instanceId, ownedBoxes)) {
+        const route = statusRoute(clientInfo, session, instanceId);
+        if (route === 'own' || (route === 'runner' && isOwnRunnerSessionStatus(session, instanceId, ownedBoxes))) {
           ws.send(JSON.stringify({ type: 'status', session, ...status }));
-        } else if (sharedOwnerUsernames.some(owner => sessionBelongsToUser(session, owner))) {
-          // Same stripping as the live fan-out below: no PR link for sessions
-          // the viewer only reaches through sharing (see that comment).
-          ws.send(JSON.stringify({
-            type: 'status', session, ...status,
-            milestone: milestoneForSharedViewer(status.milestone),
-            review: reviewForSharedViewer(status.review),
-          }));
+        } else if (route === 'shared') {
+          // The scope was read just now. Same stripping as the live fan-out.
+          ws.send(sharedStatusPayload(session, status));
         }
       }
 
@@ -922,35 +946,39 @@ wss.on('connection', (ws, req) => {
 setStatusChangeCallback((sessionName: string, instanceId: string | null) => {
   const status = getStatus(sessionName, instanceId);
   const payload = JSON.stringify({ type: 'status', session: sessionName, ...status });
-  // This fan-out's ACL is "shares any project with the owner", coarser than
-  // ProjectShare. The milestone's PR URL names a repo + PR, so collaborators
-  // get the milestone without the link (the prompt still works); the owner
-  // gets the full payload — and the review rides the same channel, its URL
-  // stripped the same way. GET /api/sessions, which is ProjectShare-scoped,
-  // carries the URL for the projects a collaborator actually has.
-  const sharedPayload = status.milestone || status.review
-    ? JSON.stringify({
-        type: 'status', session: sessionName, ...status,
-        milestone: milestoneForSharedViewer(status.milestone),
-        review: reviewForSharedViewer(status.review),
-      })
-    : payload;
-  console.log(`[STATUS] Push ${sessionName} to ${statusClients.size} clients`);
+  // A collaborator gets only the sessions of the projects shared with them
+  // (statusRoute, services/statusAudience.ts), and those without the
+  // milestone's PR URL (the prompt still works) or the review's: the owner
+  // gets the full payload. The stripping dates from when this fan-out went to
+  // anyone sharing any project with the owner; GET /api/sessions carries the
+  // URL for the projects a collaborator has.
+  const sharedPayload = status.milestone || status.review ? sharedStatusPayload(sessionName, status) : payload;
+  // Every fan-out, so a debug line (TERMAG_DEBUG=STATUS): it was the single
+  // largest source of journal records shipped to Observability.
+  debugLog('STATUS', () => `Push ${sessionName} to ${statusClients.size} clients`);
   for (const [client, clientInfo] of statusClients) {
-    if (client.readyState === WebSocket.OPEN) {
-      if (sessionBelongsToUser(sessionName, clientInfo.unixUsername)) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+    switch (statusRoute(clientInfo, sessionName, instanceId)) {
+      case 'own':
         client.send(payload);
-      } else if (clientInfo.sharedOwnerUsernames.some(owner => sessionBelongsToUser(sessionName, owner))) {
-        client.send(sharedPayload);
-      } else if (instanceId && isRunnerSessionShaped(sessionName)) {
+        break;
+      case 'shared':
+      case 'recheck':
+        // In the scope, or a sharer's session outside it (maybe a workstream
+        // made since it was read): either way only a fresh scope decides.
+        sendThroughShare(clientInfo, () => statusRoute(clientInfo, sessionName, instanceId) === 'shared', () => {
+          if (client.readyState === WebSocket.OPEN) client.send(sharedPayload);
+        });
+        break;
+      case 'runner':
         // A cloud session's runner on one of this client's boxes, named after
         // the box's unix user. The box map may lack a box created since the
         // client connected, or hold a null for one still provisioning; the
         // lookup fills it in, and a null is re-checked after a minute.
-        void ownedBoxUser(clientInfo, instanceId).then(hostUser => {
+        void ownedBoxUser(clientInfo, instanceId!).then(hostUser => {
           if (hostUser && isOwnRunnerSessionStatus(sessionName, instanceId, clientInfo.ownedBoxes) && client.readyState === WebSocket.OPEN) client.send(payload);
         });
-      }
+        break;
     }
   }
 });
@@ -960,18 +988,55 @@ setStatusChangeCallback((sessionName: string, instanceId: string | null) => {
 // not shared with project collaborators. The browser refetches the list.
 // Simple-UI chat events (services/chatRunner.ts) carry prompts and file
 // contents, so they go to the project's owner and the users this project is
-// shared with (mayReceiveChat), never by the session-name prefix or the
-// owner-wide share list the status pills use.
+// shared with (mayReceiveChat), never by the session-name prefix.
 setChatPushCallback(({ owner, payload }) => {
   const body = JSON.stringify(payload);
   const chat = { owner, projectId: payload.projectId };
   for (const [client, clientInfo] of statusClients) {
     if (client.readyState !== WebSocket.OPEN) continue;
-    refreshSharedProjectsIfStale(clientInfo);
-    if (mayReceiveChat(chat, clientInfo)) client.send(body);
+    if (clientInfo.unixUsername === owner) client.send(body);
+    else sendThroughShare(clientInfo, () => mayReceiveChat(chat, clientInfo), () => {
+      if (client.readyState === WebSocket.OPEN) client.send(body);
+    });
+  }
+});
+
+// A share accepted, revoked or left (routes/sharing.ts): the sockets it
+// touches re-read their scope now, after any read already in flight, and get
+// the current statuses it newly admits and a `status-gone` for each session it
+// drops (shareChangeFrames), so an accepted share shows on a page that is
+// already open and a revoked one stops, and clears, at once. Pushes in the
+// meantime wait for the read (sendThroughShare).
+setShareChangeCallback((change) => {
+  for (const [client, clientInfo] of statusClients) {
+    if (!shareChangeTouches(change, clientInfo)) continue;
+    const before = clientInfo.sharedStatusKeys;
+    void startSharedRefresh(clientInfo, clientInfo.sharedRefresh).then(() => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      const { admitted, gone } = shareChangeFrames(before, clientInfo.sharedStatusKeys, getAllStatuses());
+      for (const [key, status] of admitted) client.send(sharedStatusPayload(parseStatusKey(key).session, status));
+      for (const key of gone) client.send(JSON.stringify({ type: 'status-gone', ...parseStatusKey(key) }));
+    });
   }
 });
 startChatRelay();
+// Every process: a run's turn ends on whichever process relays its box.
+startAutomationCompletion();
+
+// One of this user's projects or boxes was made, renamed, archived, powered or
+// terminated (the browser, the CLI, a spawn, a sweep): their tabs refetch that
+// list. Owner only.
+// A burst (box, project, then workstream within seconds) is one reload per
+// half second per list, not one per write.
+setWorkspaceChangeCallback(coalesceWorkspaceChanges((ownerId, what) => {
+  const payload = JSON.stringify({ type: 'workspace', what });
+  for (const [client, clientInfo] of statusClients) {
+    if (client.readyState === WebSocket.OPEN && clientInfo.userId === ownerId) client.send(payload);
+  }
+}, 500));
+// Every project, workstream, workflow or share write that changes the list
+// tells its owner and collaborators, whichever path made it.
+installWorkspaceWriteNotifier(prismaIndex);
 
 setCloudSessionChangeCallback((owner, sessionId) => {
   const payload = JSON.stringify({ type: 'claude-session', sessionId, at: new Date().toISOString() });
@@ -1043,6 +1108,7 @@ function shutdown() {
   stopAskQueue();
   stopBriefingScheduler();
   stopLifecycleSweep();
+  stopPreviewShareSweep();
   closeFeatureFlags().catch(() => {});
   shutdownOtel().catch(() => {});
   // Close all WebSocket connections so the process can exit. A process that

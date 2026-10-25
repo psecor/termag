@@ -17,7 +17,7 @@ function handler(router: Router, path: string): RequestHandler {
 const storedUser = {
   id: 'u1', googleId: 'g1', googleEmail: 'e2e@termag.local', unixUsername: 'e2e', displayName: 'E2E',
   defaultAgentProvider: 'codex', claudeGatewayEnabled: true, dotfilesRepoUrl: null,
-  slackUserId: null, discordUserId: null, createdAt: new Date(0), theme: {},
+  slackUserId: null, discordUserId: null, createdAt: new Date(0), theme: {}, pushMutesChat: false,
 };
 
 // `user: null` means no session (a default parameter would swallow an explicit undefined).
@@ -79,6 +79,28 @@ describe('PUT /auth/me/preferences', () => {
     const { res } = await call(put, { defaultAgentProvider: 'hal9000', theme: DEFAULT_THEME });
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringMatching(/defaultAgentProvider/) });
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('serves pushMutesChat from /me and reads a row without it as false', async () => {
+    const { res } = await call(me, undefined);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ pushMutesChat: false }));
+    const { pushMutesChat: _drop, ...legacy } = storedUser;
+    const { res: res2 } = await call(me, undefined, legacy as unknown as Express.User);
+    expect(res2.json).toHaveBeenCalledWith(expect.objectContaining({ pushMutesChat: false }));
+  });
+
+  it('stores pushMutesChat, mirrors it onto the session user and returns it', async () => {
+    const { req, res } = await call(put, { pushMutesChat: true });
+    expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'u1' }, data: { pushMutesChat: true } });
+    expect(req.user?.pushMutesChat).toBe(true);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ pushMutesChat: true }));
+  });
+
+  it('rejects a non-boolean pushMutesChat and writes nothing', async () => {
+    const { res } = await call(put, { pushMutesChat: 'yes' });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringMatching(/pushMutesChat/) });
     expect(prisma.user.update).not.toHaveBeenCalled();
   });
 

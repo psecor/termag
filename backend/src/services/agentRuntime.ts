@@ -1,12 +1,22 @@
 import * as tmux from './tmux';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from './agentRegistry';
 import { launchCommandFor } from './launchCommand';
-import { claimSpawnLaunch, releaseSpawnLaunch } from './agentSpawnStore';
+import { claimSpawnLaunch, isParkedSpawn, releaseSpawnLaunch, unparkOnLaunch } from './agentSpawnStore';
+import { watchLaunchedSpawn } from './spawnStatusLog';
+import { spawnFolderTrust } from './agentSpawn';
 import { claimHandoffLaunch, releaseHandoffLaunch } from './agentHandoffStore';
 import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
-import { PROVIDERS } from '../providers/registry';
+import { PROVIDERS, isBackendFor } from '../providers/registry';
+import { isClaudeCode, isModelFor } from './modelChoices';
+import { fireworksContext, type FireworksModels } from './fireworksGateway';
+import { fireworksModelsForBox } from './fireworksFlag';
+import { refusalLine } from './launchCommand';
 import { classifyForeground } from './foregroundProbe';
 import { refuseUnreadySessions, SessionGateError, type SetupAdmission } from './sessionGate';
+import { recordProductEvent } from './productEvents';
+import { rememberUserKey } from './userKeys';
+import { firstPromptLaunchCommand, firstPromptPath } from './firstPrompt';
+import { resolveProjectRoot } from './projectPaths';
 import { prisma } from '../db';
 
 
@@ -32,6 +42,31 @@ async function probeAgentSession(
     return classifyForeground(result?.cmd);
   } catch {
     return 'unknown';
+  }
+}
+
+/** What an agent announces when it can pre-accept Claude Code's folder-trust prompt (agent/claude-trust.js). */
+const CLAUDE_TRUST_CAPABILITY = 'claude-trust-folder-v1';
+
+/**
+ * Before a spawned Claude starts on its brief: mark its folder trusted, so it
+ * does not sit at "Is this a project you trust?" with the brief unread. Only
+ * when spawnFolderTrust names a check, which the box makes against the folder
+ * on disk (an empty new project, or the owner-trusted project's own tree), and
+ * the box's agent can do it; otherwise the prompt stays for the user. Never
+ * throws: the launch goes on either way.
+ */
+async function trustSpawnFolder(
+  host: { userId: string; instanceId: string | null },
+  k: { provider: string; capabilities: readonly string[]; project: { repoUrl: string | null; chatTrustedAt: Date | null } | null | undefined; projDir: string; label: string },
+): Promise<void> {
+  const check = spawnFolderTrust(k.project);
+  if (k.provider !== 'claude' || !check || !k.capabilities.includes(CLAUDE_TRUST_CAPABILITY)) return;
+  try {
+    const r = await sendForProject(host, 'claude-trust-folder', { path: k.projDir, check }, 45_000);
+    if (r?.changed) console.log(`[SPAWN] ${k.label}: marked ${k.projDir} trusted for Claude Code (${check})`);
+  } catch (err) {
+    console.log(`[SPAWN] ${k.label}: folder left untrusted, Claude will ask (${check}):`, (err as Error).message);
   }
 }
 
@@ -68,7 +103,7 @@ export async function withPaneLock<T>(key: string, fn: () => Promise<T>, settleM
   return run;
 }
 
-function paneLockKey(instanceId: string | null, session: string): string {
+export function paneLockKey(instanceId: string | null, session: string): string {
   return `${instanceId ?? 'local'}:${session}`;
 }
 
@@ -115,6 +150,92 @@ interface AgentRuntimeContext {
   admission?: SetupAdmission;
   /** The agent spawn whose brief this launch starts on, when the caller made one (routes/spawns.ts). */
   spawnId?: string | null;
+  /**
+   * Continue the pane's last conversation (the provider's resumeCommand)
+   * instead of starting fresh: a parked spawn brought back.
+   */
+  resume?: boolean;
+  /**
+   * What the agent's first launch starts on, when the user wrote it (a new
+   * workstream for a PR, services/firstPrompt.ts). A spawn's brief or a
+   * handoff wins; a provider without promptLaunch launches bare.
+   */
+  firstPrompt?: string | null;
+  /**
+   * The model backend to start the agent on (Workflow.backend).
+   * Absent = the workstream's agent row says; null = the
+   * harness's default.
+   */
+  backend?: string | null;
+  /** The model to start on (Workflow.model); absent = the row says, null = the backend's default. */
+  model?: string | null;
+}
+
+/** What a launch starts on (launchChoice): the backend, the model, and on Fireworks its fast model and context window. */
+export interface LaunchModel {
+  backend: string | null;
+  model: string | null;
+  fastModel?: string;
+  context?: number;
+  // Typed instead of the agent: the backend cannot be used for this owner and box.
+  refusal?: string;
+}
+
+/**
+ * The backend and model a launch of this provider uses, from what the
+ * workstream's row says. A backend the provider cannot
+ * run on, or a model no longer offered, falls back to the default. On
+ * Fireworks the models are the fireworks-models flag for the owner and box:
+ * no model picked starts on its default, and with the flag off the pane says
+ * so rather than starting the agent on a model the gateway will refuse.
+ */
+export function launchChoice(
+  provider: string, backend: string | null | undefined, model: string | null | undefined, fireworks: FireworksModels | null,
+): LaunchModel {
+  const b = backend && isBackendFor(provider, backend) ? backend : null;
+  if (b !== 'fireworks') return { backend: b, model: model && isModelFor(provider, b, model, null) ? model : null };
+  if (!fireworks) {
+    return {
+      backend: b, model: null,
+      refusal: refusalLine(`termag: Fireworks models are not on for you (feature flags fireworks-enabled and fireworks-models); switch this workstream to the default backend, or ask for access`),
+    };
+  }
+  const m = model && fireworks.models.some(x => x.id === model) ? model : fireworks.defaultModel;
+  // Claude Code takes one context window for every model it does not know,
+  // its small/fast model included, so the smaller of the two.
+  const windows = (isClaudeCode(provider) ? [m, fireworks.fastModel] : [m]).map(id => fireworksContext(fireworks, id));
+  const context = windows.every(w => w !== null) ? Math.min(...(windows as number[])) : undefined;
+  return { backend: b, model: m, fastModel: fireworks.fastModel, ...(context ? { context } : {}) };
+}
+
+/** launchChoice with the flags read for the owner and box; a failed read is no Fireworks. */
+export async function resolveLaunch(
+  provider: string, backend: string | null | undefined, model: string | null | undefined, userId: string, instanceId: string | null,
+): Promise<LaunchModel> {
+  const fireworks = backend === 'fireworks' && instanceId
+    ? await fireworksModelsForBox(userId, instanceId).catch((err: Error) => {
+      console.warn(`[LAUNCH] fireworks flags for instance ${instanceId} unreadable: ${err.message}`);
+      return null;
+    })
+    : null;
+  return launchChoice(provider, backend, model, fireworks);
+}
+
+/**
+ * The workstream's agent row's backend and model. A failed read launches on
+ * the default, as a failed brief or handoff lookup launches plain.
+ */
+async function workflowChoice(projectId: string, workstream: string): Promise<{ backend: string | null; model: string | null }> {
+  try {
+    const row = await prisma.workflow.findFirst({
+      where: { projectId, type: 'agent', workstream: { name: workstream } },
+      select: { backend: true, model: true },
+    });
+    return { backend: row?.backend ?? null, model: row?.model ?? null };
+  } catch (err) {
+    console.warn(`[LAUNCH] ${workstream}: model backend lookup failed, default backend: ${(err as Error).message}`);
+    return { backend: null, model: null };
+  }
 }
 
 /** What a launch did: typed the agent, or left a pane that already had one, git, or an unreadable state. */
@@ -122,7 +243,16 @@ export type LaunchOutcome = 'launched' | 'running' | 'busy' | 'unknown';
 
 export async function ensureAgentSessionsAndLaunch(ctx: AgentRuntimeContext): Promise<LaunchOutcome> {
   const session = tmux.sessionName(ctx.unixUsername, ctx.projectName, 'agent', ctx.workstream);
-  return withPaneLock(paneLockKey(ctx.instanceId, session), () => launchUnlocked(ctx), r => (r === 'launched' ? paneLaunchSettleMs : 0));
+  // The session-name events (services/status.ts) resolve this username to the
+  // user id; seeding here keeps the common case off the database.
+  rememberUserKey(ctx.unixUsername, ctx.userId);
+  const outcome = await withPaneLock(paneLockKey(ctx.instanceId, session), () => launchUnlocked(ctx), r => (r === 'launched' ? paneLaunchSettleMs : 0));
+  if (outcome === 'launched') {
+    recordProductEvent('agent.session.started', { user: ctx.userId, box: ctx.instanceId }, {
+      provider: ctx.provider, kind: 'interactive', resume: !!ctx.resume, spawned: !!ctx.spawnId, clone: !!ctx.preLaunch,
+    });
+  }
+  return outcome;
 }
 
 async function launchUnlocked({
@@ -137,12 +267,16 @@ async function launchUnlocked({
   replaySessionId,
   admission,
   spawnId,
+  resume,
+  firstPrompt,
+  backend: backendOverride,
+  model: modelOverride,
 }: AgentRuntimeContext): Promise<LaunchOutcome> {
   // Before any RPC: tmux-create makes the dir and git-inits it, which would
   // poison a clone still in progress. A name with no live row is not gated.
   const setup = await prisma.project.findFirst({
     where: { userId, instanceId: instanceId ?? null, name: projectName, archived: false },
-    select: { id: true, setupStatus: true },
+    select: { id: true, setupStatus: true, repoUrl: true, chatTrustedAt: true },
   });
   const refusal = setup && refuseUnreadySessions(setup, admission);
   if (refusal) throw new SessionGateError(refusal);
@@ -199,12 +333,16 @@ async function launchUnlocked({
       // pre-launch command cannot be chained ahead of it. POST /api/projects
       // rejects repoUrl for bridge providers; this is the belt and braces.
       if (preLaunch) console.warn(`[LAUNCH] ${projectName}: preLaunch ignored for bridge provider ${provider}`);
-      await sendForProject(project, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
+      // The pane's project and workstream go to the bridge, which puts them in
+      // the app server's environment for termag-agent-otel (termag.project,
+      // termag.workstream on the resource, as a typed launch's env prefix does).
+      await sendForProject(project, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: projectName, workstream });
     } else {
       const capabilities = instanceId ? instanceAgentTransport(instanceId)?.capabilities ?? [] : [];
       // A spawned agent's first launch starts on its brief,
       // wrapped for telemetry like any other launch.
       const spawned = await claimSpawnLaunch({ spawnId, userId, projectId: setup?.id ?? null, workstream, provider });
+      if (spawned) await trustSpawnFolder(project, { provider, capabilities, project: setup, projDir, label: `${projectName}/${workstream}` });
       // A pane a handoff restart just killed starts on the handoff.
       const claim = spawned ? null : await claimHandoffLaunch({ userId, projectId: setup?.id ?? null, workstream, provider });
       // Another process claimed this pane's handoff between our read and our
@@ -214,8 +352,17 @@ async function launchUnlocked({
         return 'running';
       }
       const handedOff = claim;
-      const launch = launchCommandFor(spawned?.command ?? handedOff?.command ?? config.launchCommand, { replaySessionId, capabilities, provider });
+      const prompted = !spawned && !handedOff && firstPrompt ? await writeFirstPrompt(project, provider, mainSession, firstPrompt, { unixUsername, hostHome }) : null;
+      const fresh = resume ? config.resumeCommand ?? config.launchCommand : config.launchCommand;
+      const row = backendOverride !== undefined || modelOverride !== undefined
+        ? { backend: backendOverride ?? null, model: modelOverride ?? null }
+        : setup ? await workflowChoice(setup.id, workstream) : { backend: null, model: null };
+      const on = await resolveLaunch(provider, row.backend, row.model, userId, instanceId);
+      const launch = on.refusal
+        ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? prompted ?? fresh, { replaySessionId, capabilities, provider, project: projectName, workstream, ...on });
       const keys = preLaunch ? `${preLaunch} && ${launch}` : launch;
+      // A spawned child's status history from its first turn on (services/spawnStatusLog.ts).
+      await watchLaunchedSpawn({ userId, projectId: setup?.id ?? null, workstream, session: mainSession, instanceId });
       try {
         await sendForProject(project, 'tmux-send-keys', { sessionName: mainSession, keys, withEnter: true });
       } catch (err) {
@@ -223,6 +370,10 @@ async function launchUnlocked({
         if (handedOff) await releaseHandoffLaunch(handedOff.id);
         throw err;
       }
+      // Only once the launch was typed: whatever path launched it, a parked
+      // spawn's pane running again is no longer parked. Until this line the
+      // sweep's live-pane guard keeps it from being retired.
+      await unparkOnLaunch(userId, setup?.id ?? null, workstream);
     }
 
     if (config.needsPoller) {
@@ -264,6 +415,29 @@ async function launchUnlocked({
   return 'launched';
 }
 
+/** Put the first prompt in its file on the box; the launch that reads it, or null to launch bare. */
+async function writeFirstPrompt(
+  project: { userId: string; instanceId: string | null },
+  provider: string,
+  session: string,
+  prompt: string,
+  owner: { unixUsername: string; hostHome?: string | null },
+): Promise<string | null> {
+  const command = firstPromptLaunchCommand(provider, session);
+  if (!command) {
+    console.warn(`[LAUNCH] ${session}: ${provider} cannot start on a prompt, launching bare`);
+    return null;
+  }
+  const home = resolveProjectRoot({ ownerUnixUser: owner.unixUsername, hostHome: owner.hostHome });
+  try {
+    await sendForProject(project, 'write-file', { path: firstPromptPath(home, session), content: `${prompt}\n`, mode: 0o600 }, 5000);
+  } catch (err) {
+    console.warn(`[LAUNCH] ${session}: could not write the first prompt, launching bare:`, (err as Error).message);
+    return null;
+  }
+  return command;
+}
+
 /**
  * Reconstruct all tmux sessions for a user's legacy agent.
  * Called from agentRegistry.registerAgent when a non-instance-bound agent
@@ -303,7 +477,7 @@ async function reconstructAgentSessions(
   const projects = await prisma.project.findMany({
     where: { userId, archived: false, instanceId },
     include: {
-      workflows: { include: { workstream: true } },
+      workflows: { include: { workstream: { include: { askThread: { select: { id: true } } } } } },
       instance: { select: { hostHome: true } },
     },
   });
@@ -325,12 +499,19 @@ async function reconstructAgentSessions(
 
     for (const wf of project.workflows) {
       const wsName = wf.workstream.name;
+      // An ask's chat has no worktree and no pane (services/askChat.ts).
+      if (wf.workstream.askThread) continue;
       try {
         if (wf.type === 'agent') {
           const provider = resolveAgentProvider(wf.provider, defaultProvider);
           const mainSession = tmux.sessionName(unixUsername, project.name, 'agent', wsName);
 
           const didLaunch = await withPaneLock(paneLockKey(instanceId, mainSession), async (): Promise<boolean> => {
+            // A parked spawn stays parked across a reconnect: its CLI was stopped on purpose.
+            if (await isParkedSpawn(userId, project.id, wsName)) {
+              console.log(`[RECONSTRUCT] Skipping ${project.name}/${wsName}: a parked spawn`);
+              return false;
+            }
             const probe = await probeAgentSession(projectHost, mainSession);
             if (probe === 'running') {
               const config = PROVIDERS[provider];
@@ -370,6 +551,7 @@ async function reconstructAgentSessions(
             // brief instead.
             const capabilities = instanceId ? instanceAgentTransport(instanceId)?.capabilities ?? [] : [];
             const spawned = config?.needsBridge ? null : await claimSpawnLaunch({ userId, projectId: project.id, workstream: wsName, provider });
+            if (spawned) await trustSpawnFolder(projectHost, { provider, capabilities, project, projDir, label: `${project.name}/${wsName}` });
             // Likewise a pane a handoff restart killed just before the box
             // dropped: resuming would bring back the conversation it handed off.
             const claim = config?.needsBridge || spawned ? null : await claimHandoffLaunch({ userId, projectId: project.id, workstream: wsName, provider });
@@ -378,10 +560,13 @@ async function reconstructAgentSessions(
               return false;
             }
             const handedOff = claim;
-            const launchCmd = launchCommandFor(spawned?.command ?? handedOff?.command ?? config?.resumeCommand ?? config?.launchCommand ?? provider, { capabilities, provider });
+            const on = await resolveLaunch(provider, wf.backend, wf.model, userId, instanceId);
+            const launchCmd = on.refusal
+              ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? config?.resumeCommand ?? config?.launchCommand ?? provider, { capabilities, provider, project: project.name, workstream: wsName, ...on });
 
+            await watchLaunchedSpawn({ userId, projectId: project.id, workstream: wsName, session: mainSession, instanceId });
             if (config?.needsBridge) {
-              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir });
+              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: project.name, workstream: wsName });
             } else {
               try {
                 await sendForProject(projectHost, 'tmux-send-keys', { sessionName: mainSession, keys: launchCmd, withEnter: true });

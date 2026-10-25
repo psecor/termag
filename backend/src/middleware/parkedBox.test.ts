@@ -11,6 +11,7 @@ vi.mock('../db', () => ({ prisma: { project: { findUnique: lookup, findFirst: lo
 const { refuseParkedBox } = await import('./parkedBox');
 const { projectsRouter } = await import('../routes/projects');
 const { workstreamsRouter } = await import('../routes/workstreams');
+const { claudeLoginRouter } = await import('../routes/claudeLogin');
 
 async function run(handler: RequestHandler, params: Record<string, string>) {
   let status = 0; let body: any = null; let nexted = false;
@@ -65,6 +66,11 @@ describe('routes that make sessions on a box', () => {
       'POST /:id/clone/retry',
       'POST /:id/clone/start-empty',
       'POST /:id/workflows',
+    ]);
+    expect(guarded(claudeLoginRouter())).toEqual([
+      'DELETE /:id/claude-login',
+      'POST /:id/claude-login',
+      'POST /:id/claude-login/code',
     ]);
     expect(guarded(workstreamsRouter())).toEqual([
       'DELETE /projects/:projectId/workstreams/:id',

@@ -68,6 +68,8 @@ export interface EventInput {
   instanceId: string | null;
   kind: string;
   detail: string | null;
+  /** The refusal code for `queued` and `agent-failed`; null on older rows and on other kinds. */
+  code?: string | null;
   at: Date;
 }
 
@@ -109,6 +111,8 @@ export interface CloudSessionView {
   exitReason: string | null;
   /** For `queued`: why the spawn was refused, as the Activity tab shows it. */
   queuedReason: string | null;
+  /** The refusal's stable code behind `queuedReason` (REFUSAL_CODES); null for rows from before it. */
+  queuedCode: string | null;
   /**
    * For `queued`: when the current uninterrupted run of refusals began, so the
    * UI measures time queued, not time since the latest re-offer (the
@@ -171,7 +175,7 @@ function toRun(r: RunInput, alive: boolean | null): CloudSessionRun {
  * | lost       | the latest run ended with reason `lost` |
  * | ended      | the latest run ended any other way; or no run and the newest event is not a refusal |
  */
-export interface DerivedState { state: CloudSessionState; exitReason: string | null; queuedReason: string | null; queuedSince: Date | null }
+export interface DerivedState { state: CloudSessionState; exitReason: string | null; queuedReason: string | null; queuedCode: string | null; queuedSince: Date | null }
 
 /** The start of the newest unbroken run of refusals (events newest first), bounded below by `after`. */
 function queuedStreakStart(events: EventInput[], after: Date | null): Date | null {
@@ -197,20 +201,25 @@ export function isStartedFor(e: Pick<EventInput, 'kind' | 'orderId' | 'at'>, run
   return e.kind === 'started' && e.orderId === run.orderId && e.at.getTime() >= run.startedAt.getTime() - STARTED_SKEW_MS;
 }
 
-export function deriveState(latest: RunInput | null, events: EventInput[]): DerivedState {
-  const none = { exitReason: null, queuedReason: null, queuedSince: null };
+export function deriveState(latest: RunInput | null, allEvents: EventInput[]): DerivedState {
+  const none = { exitReason: null, queuedReason: null, queuedCode: null, queuedSince: null };
+  // `user-created` says what the spawn did for the owner, not what became of
+  // the session: it is written before the gate and the placement, so it must
+  // not stand as the newest event (a no-run session whose newest event is
+  // not a refusal reads as ended; Bugbot on #288). A session with nothing but
+  // it is one whose first spawn is still deciding.
+  const events = allEvents.filter(e => e.kind !== 'user-created');
   const newest = events[0] ?? null;
   const refusal = newest && QUEUED_KINDS.has(newest.kind) ? newest : null;
   if (!latest) {
-    return refusal
-      ? { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedSince: queuedStreakStart(events, null) }
-      : { state: 'ended', ...none };
+    if (refusal) return { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedCode: refusal.code ?? null, queuedSince: queuedStreakStart(events, null) };
+    return { state: events.length === 0 && allEvents.length > 0 ? 'starting' : 'ended', ...none };
   }
   if (refusal && refusal.orderId !== latest.orderId && refusal.at.getTime() > latest.startedAt.getTime()) {
-    return { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedSince: queuedStreakStart(events, latest.startedAt) };
+    return { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedCode: refusal.code ?? null, queuedSince: queuedStreakStart(events, latest.startedAt) };
   }
   if (latest.endedAt) {
-    return { state: latest.exitReason === RUN_LOST_REASON ? 'lost' : 'ended', exitReason: latest.exitReason, queuedReason: null, queuedSince: null };
+    return { state: latest.exitReason === RUN_LOST_REASON ? 'lost' : 'ended', exitReason: latest.exitReason, queuedReason: null, queuedCode: null, queuedSince: null };
   }
   const started = events.some(e => isStartedFor(e, latest));
   return { state: started ? 'running' : 'starting', ...none };
@@ -235,7 +244,7 @@ export function buildSessions(runs: RunInput[], events: EventInput[], alive: Map
     const titled = b.runs.find(r => r.title) ?? null;
     const numbered = b.runs.find(r => r.sessionSeq != null) ?? null;
     const platform = b.runs.find(r => r.clientPlatform) ?? null;
-    const { state, exitReason, queuedReason, queuedSince } = deriveState(latest, b.events);
+    const { state, exitReason, queuedReason, queuedCode, queuedSince } = deriveState(latest, b.events);
     const sessionId = latest?.sessionId ?? (key.startsWith('order:') ? null : key);
     const times = [...b.runs.map(r => r.startedAt), ...b.events.map(e => e.at)].map(d => d.getTime());
     const ends = b.runs.map(r => r.endedAt?.getTime() ?? 0);
@@ -245,7 +254,7 @@ export function buildSessions(runs: RunInput[], events: EventInput[], alive: Map
       key, sessionId, url: sessionUrl(sessionId),
       seq: numbered?.sessionSeq ?? null, name: cloudSessionName(numbered?.sessionSeq ?? null),
       title: titled?.title ?? null, clientPlatform: platform?.clientPlatform ?? null,
-      state, exitReason, queuedReason, queuedSince: queuedSince ? iso(queuedSince) : null,
+      state, exitReason, queuedReason, queuedCode, queuedSince: queuedSince ? iso(queuedSince) : null,
       current: latest ? toRun(latest, alive.get(latest.orderId) ?? null) : null,
       runs: b.runs.map(r => toRun(r, alive.get(r.orderId) ?? null)),
       firstSeenAt: iso(first), lastSeenAt: iso(last), eventCount: b.events.length,
@@ -383,7 +392,7 @@ export async function listCloudSessions(userId: string, opts: ListOptions): Prom
   const openOrders = rows.filter(r => !r.endedAt).map(r => r.orderId);
   const eventRows = await prisma.claudeSessionEvent.findMany({
     where: { userId, OR: [{ at: { gte: since } }, ...(openOrders.length ? [{ orderId: { in: openOrders } }] : [])] },
-    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, at: true },
+    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, code: true, at: true },
   });
   const runs = rows.map(toInput);
   const alive = await liveRuns(runs);
@@ -395,7 +404,7 @@ export async function listSessionEvents(userId: string, key: string): Promise<Ev
   const where = key.startsWith('order:') ? { userId, orderId: key.slice('order:'.length) } : { userId, sessionId: key };
   return prisma.claudeSessionEvent.findMany({
     where, orderBy: { at: 'desc' }, take: 200,
-    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, at: true },
+    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, code: true, at: true },
   });
 }
 
@@ -471,7 +480,10 @@ export async function sweepLostRuns(now: Date = new Date()): Promise<number> {
  * wait for the lost sweep, and so do their events: an open run's `started`
  * decides running versus starting however old it is.
  */
-export async function sweepRetention(now: Date = new Date()): Promise<{ events: number; runs: number }> {
+/** Owner notice rows (services/claudeRunnerNotices.ts) are swept after this many days; the longest dedupe window is a week. */
+export const NOTICE_RETENTION_DAYS = 30;
+
+export async function sweepRetention(now: Date = new Date()): Promise<{ events: number; runs: number; notices: number }> {
   const day = 24 * 60 * 60 * 1000;
   const open = await prisma.claudeRunnerSession.findMany({ where: { endedAt: null }, select: { orderId: true } });
   const openOrders = open.map(r => r.orderId);
@@ -479,8 +491,9 @@ export async function sweepRetention(now: Date = new Date()): Promise<{ events: 
     where: { at: { lt: new Date(now.getTime() - EVENT_RETENTION_DAYS * day) }, ...(openOrders.length ? { orderId: { notIn: openOrders } } : {}) },
   });
   const runs = await prisma.claudeRunnerSession.deleteMany({ where: { endedAt: { not: null, lt: new Date(now.getTime() - RUN_RETENTION_DAYS * day) } } });
-  if (events.count || runs.count) console.log(`[CLAUDE-RUNNER] retention: removed ${events.count} event(s), ${runs.count} run(s)`);
-  return { events: events.count, runs: runs.count };
+  const notices = await prisma.claudeSessionNotice.deleteMany({ where: { at: { lt: new Date(now.getTime() - NOTICE_RETENTION_DAYS * day) } } });
+  if (events.count || runs.count || notices.count) console.log(`[CLAUDE-RUNNER] retention: removed ${events.count} event(s), ${runs.count} run(s), ${notices.count} notice(s)`);
+  return { events: events.count, runs: runs.count, notices: notices.count };
 }
 
 let lostTimer: NodeJS.Timeout | null = null;

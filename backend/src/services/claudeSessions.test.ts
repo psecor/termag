@@ -10,6 +10,7 @@ import {
 vi.mock('../db', () => ({ prisma: {
   claudeRunnerSession: { findMany: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn(), findFirst: vi.fn() },
   claudeSessionEvent: { findMany: vi.fn(), deleteMany: vi.fn() },
+  claudeSessionNotice: { deleteMany: vi.fn(async () => ({ count: 2 })) },
 } }));
 vi.mock('./agentRegistry', () => ({ isInstanceAgentConnected: vi.fn(), sendToInstanceAgent: vi.fn() }));
 vi.mock('./claudeSessionEvents', () => ({ recordSessionEvent: vi.fn(async () => {}) }));
@@ -91,8 +92,18 @@ describe('backfillSessionSeq', () => {
 describe('deriveState', () => {
   it('is queued while only refusals exist, with the newest reason and the start of the streak', () => {
     expect(deriveState(null, [ev('queued', { detail: 'slots full', at: t('2026-10-08T10:01:00Z') }), ev('queued', { detail: 'no box' })]))
-      .toEqual({ state: 'queued', exitReason: null, queuedReason: 'slots full', queuedSince: t('2026-10-08T10:00:00Z') });
+      .toEqual({ state: 'queued', exitReason: null, queuedReason: 'slots full', queuedCode: null, queuedSince: t('2026-10-08T10:00:00Z') });
+    // The refusal's code rides along when the event has one.
+    expect(deriveState(null, [ev('queued', { detail: 'no box', code: 'no-box' })])).toMatchObject({ state: 'queued', queuedReason: 'no box', queuedCode: 'no-box' });
     expect(deriveState(null, [ev('agent-failed', { detail: 'refused the launch' })])).toMatchObject({ state: 'queued', queuedReason: 'refused the launch', queuedSince: t('2026-10-08T10:00:00Z') });
+  });
+
+  it('looks through user-created: it never stands as the newest event, and alone it means the first spawn is still deciding (Bugbot on #288)', () => {
+    expect(deriveState(null, [ev('user-created', { at: t('2026-10-08T10:00:01Z') }), ev('queued', { detail: 'no box', code: 'no-box' })]))
+      .toMatchObject({ state: 'queued', queuedReason: 'no box', queuedCode: 'no-box' });
+    expect(deriveState(null, [ev('user-created')])).toMatchObject({ state: 'starting' });
+    expect(deriveState(run(), [ev('user-created', { at: t('2026-10-08T10:00:01Z') }), ev('placed')])).toMatchObject({ state: 'starting' });
+    expect(deriveState(null, [])).toMatchObject({ state: 'ended' });
   });
 
   it('is starting until the box posts started for the run, then running', () => {
@@ -120,7 +131,7 @@ describe('deriveState', () => {
   });
 
   it('is ended or lost from the latest run', () => {
-    expect(deriveState(run({ endedAt: t('2026-10-08T11:00:00Z'), exitStatus: 0, exitReason: 'completed' }), [])).toEqual({ state: 'ended', exitReason: 'completed', queuedReason: null, queuedSince: null });
+    expect(deriveState(run({ endedAt: t('2026-10-08T11:00:00Z'), exitStatus: 0, exitReason: 'completed' }), [])).toEqual({ state: 'ended', exitReason: 'completed', queuedReason: null, queuedCode: null, queuedSince: null });
     expect(deriveState(run({ endedAt: t('2026-10-08T11:00:00Z'), exitReason: 'lost' }), [])).toMatchObject({ state: 'lost', exitReason: 'lost' });
   });
 });
@@ -246,7 +257,9 @@ describe('sweepRetention', () => {
     vi.mocked(prisma.claudeSessionEvent.deleteMany).mockResolvedValue({ count: 3 });
     vi.mocked(prisma.claudeRunnerSession.deleteMany).mockResolvedValue({ count: 1 });
     const now = t('2026-10-08T12:00:00Z');
-    expect(await sweepRetention(now)).toEqual({ events: 3, runs: 1 });
+    expect(await sweepRetention(now)).toEqual({ events: 3, runs: 1, notices: 2 });
+    // Notice rows (services/claudeRunnerNotices.ts) go after 30 days too.
+    expect(prisma.claudeSessionNotice.deleteMany).toHaveBeenCalledWith({ where: { at: { lt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000) } } });
     expect(prisma.claudeSessionEvent.deleteMany).toHaveBeenCalledWith({ where: { at: { lt: t('2026-09-08T12:00:00Z') }, orderId: { notIn: ['ord.open'] } } });
     expect(prisma.claudeRunnerSession.deleteMany).toHaveBeenCalledWith({ where: { endedAt: { not: null, lt: t('2026-07-10T12:00:00Z') } } });
   });

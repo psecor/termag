@@ -7,6 +7,7 @@
 
 import { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import { registerDiscordEvents } from './events';
+import { loadActiveTargetsOrRetry } from '../slack/activeTargets';
 
 let discordClient: Client | null = null;
 
@@ -40,6 +41,8 @@ export async function startDiscordClient(client: Client): Promise<boolean> {
     return false;
   }
 
+  // Before connecting, so the first /t already sees everyone's saved target.
+  await loadActiveTargetsOrRetry('DISCORD');
   try {
     await client.login(token);
     console.log(`[DISCORD] Bot connected as ${client.user?.tag}`);

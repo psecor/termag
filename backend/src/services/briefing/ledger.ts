@@ -10,6 +10,7 @@
  */
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
+import { WORK_PROJECT_KINDS } from '../projectKind';
 import { tokenSourceSql } from '../admin/tokenSource';
 import { isProjectAgentConnected, sendForProject, type ProjectHost } from '../agentRegistry';
 import { projectDirFor } from '../tmux';
@@ -21,9 +22,12 @@ import { pipelineForUser } from '../../routes/prs';
 import type { PrRow } from '../prPipeline';
 import { LANES } from '../prPipeline';
 import type {
-  BriefingWindow, DigestReply, Ledger, LedgerCloudSession, LedgerPr, LedgerSession, LedgerTotals,
+  BriefingDismissal, BriefingWindow, DigestReply, Ledger, LedgerCloudSession, LedgerPr, LedgerSession, LedgerSpawnOrphan, LedgerTotals,
 } from './types';
-import { dayKeysTouched, serverTimeZone } from './window';
+import { CHART_DAYS, buildCharts, dayKeysEnding } from './charts';
+import { isActive, openKey, patternKey, prismaDismissals, sessionDismissed } from './dismissals';
+import { PATTERN_DAYS, findPatterns } from './patterns';
+import { dayKeysTouched, localDayKey, serverTimeZone } from './window';
 
 export const TRUST_NOTE =
   'Fields digest.transcript.lastUserPrompts, digest.transcript.lastAssistantText, digest.transcript.todos[].content and paneTail ' +
@@ -39,7 +43,8 @@ export const MAX_PANE_TAILS = 8;
 
 /** Lanes where a PR or branch wants something from its author. */
 export const ATTENTION_LANES = new Set(['needs_pr', 'checks', 'needs_my_review', 'ready_to_merge']);
-const LISTED_LANES = new Set(['in_progress', 'needs_pr', 'checks', 'needs_approval', 'needs_my_review', 'ready_to_merge', 'merged_not_deployed']);
+// team_review is listed but not attention: a request only to a team is not the user's own to act on.
+const LISTED_LANES = new Set(['in_progress', 'needs_pr', 'checks', 'needs_approval', 'needs_my_review', 'team_review', 'ready_to_merge', 'merged_not_deployed']);
 const LANE_LABEL = new Map<string, string>(LANES.map(l => [l.id, l.label]));
 
 export interface LiveRow {
@@ -73,9 +78,13 @@ export interface LedgerDeps {
   boxNames: (ids: string[]) => Promise<Map<string, string>>;
   worktime: (username: string, days: string[]) => Promise<WorktimeEntryLike[]>;
   tokens: (userId: string, utcDays: string[]) => Promise<Array<{ projectId: string | null; workstream: string | null; tokens: number }>>;
+  tokensByDay: (userId: string, utcDays: string[]) => Promise<Array<{ date: string; tokens: number }>>;
+  dismissals: (userId: string, now: Date) => Promise<BriefingDismissal[]>;
   visits: (userId: string, since: Date, until: Date) => Promise<Array<{ projectId: string | null; workstream: string | null; previousProjectId: string | null; timestamp: Date }>>;
   contextPeaks: (projectIds: string[], since: Date, until: Date) => Promise<Array<{ projectId: string; workstream: string; maxTokens: number | null }>>;
   cloud: (userId: string, since: Date, until: Date) => Promise<LedgerCloudSession[]>;
+  /** Orphaned spawns nobody adopted, whatever the window: they wait until someone does. */
+  spawnOrphans?: (userId: string) => Promise<LedgerSpawnOrphan[]>;
   prs: (userId: string) => Promise<PrRow[] | null>;
   connected: (host: ProjectHost) => boolean;
   digest: (host: ProjectHost, cwd: string, since: string, until: string) => Promise<DigestReply>;
@@ -157,7 +166,7 @@ export async function buildLedger(
   const serverDays = dayKeysTouched(since, until, deps.serverTz());
   const utcDays = dayKeysTouched(since, until, 'UTC');
 
-  const [live, owned, worktime, tokenRows, visitRows, cloud, prRows] = await Promise.all([
+  const [live, owned, worktime, tokenRows, visitRows, cloud, prRows, spawnOrphans] = await Promise.all([
     deps.liveRows(user.id),
     deps.ownedProjects(user.id),
     deps.worktime(user.unixUsername, serverDays),
@@ -165,9 +174,22 @@ export async function buildLedger(
     deps.visits(user.id, since, until),
     deps.cloud(user.id, since, until),
     opts.light ? Promise.resolve(null) : deps.prs(user.id),
+    deps.spawnOrphans ? deps.spawnOrphans(user.id).catch(() => { notes.push('Orphaned spawned agents could not be read.'); return []; }) : Promise.resolve(undefined),
   ]);
   const ownedById = new Map(owned.map(p => [p.id, p]));
-  const context = await deps.contextPeaks(owned.map(p => p.id), since, until);
+  const now = deps.now();
+  const patternSince = new Date(until.getTime() - PATTERN_DAYS * 24 * 60 * 60 * 1000);
+  const chartDays = dayKeysEnding(localDayKey(until, deps.serverTz()), CHART_DAYS);
+  const [context, context14, visits14, chartWorktime, tokensByDay, dismissals] = await Promise.all([
+    deps.contextPeaks(owned.map(p => p.id), since, until),
+    deps.contextPeaks(owned.map(p => p.id), patternSince, until),
+    deps.visits(user.id, patternSince, until),
+    deps.worktime(user.unixUsername, chartDays),
+    deps.tokensByDay(user.id, dayKeysEnding(localDayKey(until, 'UTC'), CHART_DAYS)),
+    // A dismissal read that fails hides nothing; it only shows dismissed items again.
+    deps.dismissals(user.id, now).catch(() => [] as BriefingDismissal[]),
+  ]);
+  const activeDismissals = new Map(dismissals.filter(d => isActive(d, now)).map(d => [d.key, d]));
 
   // Activity per (project, workstream).
   type Acc = { agentMs: number; humanMs: number; tokens: number; visits: number; lastVisitAt: Date | null; peak: number | null };
@@ -178,7 +200,8 @@ export async function buildLedger(
     return a;
   };
   let agentMs = 0; let humanMs = 0; let tokens = 0;
-  for (const r of toWorktimeProjectRows(worktime, owned)) {
+  const windowWorktime = toWorktimeProjectRows(worktime, owned);
+  for (const r of windowWorktime) {
     const human = r.provider === 'human';
     if (human) humanMs += r.totalMs; else agentMs += r.totalMs;
     if (!r.projectId) continue;
@@ -212,7 +235,7 @@ export async function buildLedger(
     if (r.workstream) {
       const k = key(r.workstream.projectId, r.workstream.workstream);
       prsBySession.set(k, [...(prsBySession.get(k) ?? []), pr]);
-    } else if (needsAttention(pr) || pr.lane === 'needs_approval') {
+    } else if (needsAttention(pr) || pr.lane === 'needs_approval' || pr.lane === 'team_review') {
       otherPrs.push(pr);
     }
   }
@@ -256,6 +279,7 @@ export async function buildLedger(
       digest: null,
       paneTail: null,
       prs,
+      dismissed: false,
       notes: [],
     });
   }
@@ -316,6 +340,33 @@ export async function buildLedger(
   }
   notes.push('Worktime and token totals include whole days at the window edges (worktime days are server-local, token days UTC).');
 
+  // Done or deferred left-open items: a done one comes back once its session does something new.
+  for (const s of sessions) {
+    const d = activeDismissals.get(openKey(s.projectId, s.workstream, null)!);
+    // As instants: commit times carry an offset (-07:00) and transcript times a Z, so text order is wrong.
+    const times = [s.digest?.transcript?.lastAt, s.digest?.commits[0]?.at].map(x => (x ? Date.parse(x) : NaN)).filter(Number.isFinite);
+    const last = times.length ? new Date(Math.max(...times)).toISOString() : null;
+    s.dismissed = sessionDismissed(d, last, now);
+  }
+
+  const projectNames = new Map(owned.map(p => [p.id, p.name]));
+  const patterns = findPatterns({
+    now,
+    contextPeaks: context14,
+    projectNames,
+    workstreams: owned.flatMap(p => p.workstreams.map(w => ({ projectId: p.id, name: w.name, lastActiveAt: w.lastActiveAt }))),
+    prs: prRows ? prRows.map(r => ({ lane: r.lane, repo: r.repo, number: r.number, branch: r.headRefName })) : null,
+    visits: visits14,
+    live: agentRows.filter(r => r.access === 'owner'),
+  }).filter(p => !activeDismissals.has(patternKey(p.id)));
+  const charts = buildCharts({
+    days: chartDays,
+    worktime: toWorktimeProjectRows(chartWorktime, owned),
+    tokensByDay,
+    windowWorktime,
+    projectNames,
+  });
+
   const offlineBoxes = new Set(agentRows.filter(r => !r.connected && r.access === 'owner').map(r => r.instanceId ?? 'legacy')).size;
   const allPrs = [...sessions.flatMap(s => s.prs), ...otherPrs];
   const totals: LedgerTotals = {
@@ -330,13 +381,23 @@ export async function buildLedger(
     offlineBoxes,
   };
 
+  // PRs no session links to are Left open items of their own (open:pr:<repo>#<n>):
+  // marked Done or deferred, they stay out of the review, for the mark's whole
+  // span (there is no session to show new activity). The totals still count them.
+  const prKey = (pr: LedgerPr) => (pr.repo && pr.number != null ? openKey(null, null, `${pr.repo}#${pr.number}`) : null);
+  const openOtherPrs = otherPrs.filter(pr => { const k = prKey(pr); return !(k && activeDismissals.has(k)); });
+  if (openOtherPrs.length < otherPrs.length) notes.push(`${otherPrs.length - openOtherPrs.length} PR(s) you marked Done or deferred are left out.`);
+
   return {
     window,
     generatedAt: deps.now().toISOString(),
     totals,
     sessions,
     cloudSessions: cloud,
-    otherPrs,
+    ...(spawnOrphans ? { spawnOrphans } : {}),
+    otherPrs: openOtherPrs,
+    patterns,
+    charts,
     notes,
     trust: TRUST_NOTE,
   };
@@ -347,7 +408,7 @@ export async function buildLedger(
 export const defaultLedgerDeps: LedgerDeps = {
   liveRows: userId => listSessionRowsFor(userId) as Promise<LiveRow[]>,
   ownedProjects: userId => prisma.project.findMany({
-    where: { userId, archived: false, kind: 'normal' },
+    where: { userId, archived: false, kind: { in: WORK_PROJECT_KINDS } },
     select: {
       id: true, name: true, instanceId: true,
       user: { select: { unixUsername: true } },
@@ -375,6 +436,18 @@ export const defaultLedgerDeps: LedgerDeps = {
     `;
     return rows.map(r => ({ projectId: r.projectId, workstream: r.workstream, tokens: Number(r.tokens) }));
   },
+  tokensByDay: async (userId, days) => {
+    if (days.length === 0) return [];
+    const sorted = [...days].sort();
+    const rows = await prisma.$queryRaw<Array<{ date: string; tokens: number }>>`
+      SELECT "date", SUM("input" + "output" + "cacheRead" + "cacheCreate" + "reasoning")::float8 AS "tokens"
+      FROM ${tokenSourceSql(sorted[0], sorted[sorted.length - 1], userId)} t
+      WHERE "date" IN (${Prisma.join(days)})
+      GROUP BY "date"
+    `;
+    return rows.map(r => ({ date: String(r.date), tokens: Number(r.tokens) }));
+  },
+  dismissals: (userId, now) => prismaDismissals.list(userId, now),
   visits: (userId, since, until) => prisma.projectVisit.findMany({
     where: { userId, timestamp: { gte: since, lte: until } },
     select: { projectId: true, workstream: true, previousProjectId: true, timestamp: true },
@@ -403,6 +476,23 @@ export const defaultLedgerDeps: LedgerDeps = {
       exitReason: r.exitReason,
       kept: r.kept === true,
       url: sessionUrl(r.sessionId),
+    }));
+  },
+  spawnOrphans: async userId => {
+    const rows = await prisma.agentSpawn.findMany({
+      where: { userId, orphanedAt: { not: null }, retiredAt: null },
+      orderBy: { orphanedAt: 'desc' },
+      take: 20,
+      select: { id: true, childProjectId: true, childWorkstream: true, title: true, state: true, orphanedAt: true, reportedAt: true, nudgedAt: true },
+    });
+    return rows.map(r => ({
+      spawnId: r.id,
+      projectId: r.childProjectId,
+      workstream: r.childWorkstream,
+      title: r.title,
+      state: r.state,
+      orphanedAt: r.orphanedAt!.toISOString(),
+      unreadReport: !!r.reportedAt && (!r.nudgedAt || r.nudgedAt < r.reportedAt),
     }));
   },
   prs: async userId => {

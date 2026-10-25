@@ -62,7 +62,9 @@ describe('the GitHub broker check (ext_authz)', () => {
     expect(res.headers.get('authorization')).toBe(`Basic ${Buffer.from(`x-access-token:${OWNER_TOKEN}`).toString('base64')}`);
     expect(res.headers.get('x-termag-user')).toBe('owner1');
     expect(res.headers.get('x-termag-instance')).toBe('inst-ec2');
-    expect(logs.join('\n')).toMatch(/\[GH-AUTHZ\] user=owner1 instance=inst-ec2 git GET \/o\/r.git\/info\/refs\?service=git-upload-pack allowed/);
+    // An allow is a debug line (services/debugLog.ts; TERMAG_DEBUG unset here):
+    // one per git and gh request from every box was a third of the journal.
+    expect(logs.join('\n')).not.toMatch(/\[GH-AUTHZ\] .* allowed/);
   });
 
   it('refuses a caller without a valid proof, even over the TLS listener with a good box token', async () => {

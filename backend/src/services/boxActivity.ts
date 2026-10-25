@@ -46,6 +46,19 @@ export function boxInUseFields(instanceId: string, now: number = Date.now()) {
   return { lastActivityAt: new Date(now), parkedAt: null, lifecycleNote: null };
 }
 
+/**
+ * A reviewer woke an auto-hibernated box (a preview link share):
+ * the idle clock starts now, so the
+ * sweep doesn't put it straight back to sleep. Unlike an owner's start,
+ * `parkedAt` stays (the terminate clock is the owner's, never a guest's to
+ * move), and so does the idle note: a resume that doesn't take settles back
+ * to hibernated still marked as the sweep's, so it may be woken again.
+ */
+export function guestWakeFields(instanceId: string, now: number = Date.now()) {
+  lastWrite.set(instanceId, now);
+  return { lastActivityAt: new Date(now) };
+}
+
 /** Tests only. */
 export function resetBoxActivityThrottle(): void {
   lastWrite.clear();

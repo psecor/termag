@@ -5,13 +5,21 @@ import { connectedOwnedBoxes } from '../services/agentRegistry';
 import { githubTokenSource } from '../services/credentialStore';
 import { GithubApiError } from '../services/githubCredential';
 import {
-  TERMAG_REPO, assignLanes, branchLane, deployState, followsDeploy, groupByLane, prKey, touchesBoxes,
-  type DeployState, type MergedPr, type PrRow,
+  TERMAG_REPO, assignLanes, branchLane, deployState, followsDeploy, groupByLane, isReviewLane, linkWorkstream, prKey, reviewTarget, touchesBoxes,
+  type DeployState, type LinkableWorkstream, type MergedPr, type PrRow,
 } from '../services/prPipeline';
-import { GithubTimeoutError, MERGED_WINDOW_DAYS, commitContains, mergedHeads, searchPrs, type PrSearchResult } from '../services/prPipelineGithub';
+import {
+  GithubTimeoutError, MERGED_WINDOW_DAYS, commitContains, fetchPrLite, fetchPrsByNumber, mergedHeads, searchPrs, viewerLogin,
+  type LitePr, type NumberedPr, type PrSearchResult,
+} from '../services/prPipelineGithub';
+import {
+  bodySources, prismaSuggestionDismissals, suggestGroups, unknownRefs, type GroupSuggestion, type SuggestionDismissalStore,
+} from '../services/prGroupSuggestions';
+import { prisma } from '../db';
+import { boolVariation } from '../services/featureFlags';
 import { readBranches, type BranchSweep } from '../services/prBranches';
 import {
-  PrInputError, fetchPrHead, fetchPrOverview, mergePr, parseCommentInput, parseMergeInput, parsePrRef, parseReviewInput, parseReviewersInput,
+  PrInputError, fetchPrHead, fetchPrOverview, mergePr, parseAnyPrRef, parseCommentInput, parseMergeInput, parsePrRef, parseReviewInput, parseReviewersInput,
   postComment, requestReviewers, rerunFailedChecks, submitReview,
   type MergeInput, type MergeResult, type PrHead, type RerunResult, type ReviewersInput, type PrOverview, type PrRef, type ReviewInput, type SubmittedReview,
 } from '../services/prReview';
@@ -19,8 +27,13 @@ import { termagVersion, type TermagVersion } from '../services/termagVersion';
 import { BAKE_WORKFLOW_URL, bakeRuns, dispatchBake, newestOrchestratorImage, type BakeRun, type OrchestratorImage } from '../services/prDeploy';
 import { swrMemo } from '../services/ttlMemo';
 import { createWorkstreamFor } from './workstreams';
+import { parseFirstPrompt } from '../services/firstPrompt';
 import { sendResult, type RouteResult } from './routeResult';
 import { parseDeferInput, parseDeferKey, prismaDeferrals, type DeferralStore, type PrDeferral } from '../services/prDeferrals';
+import {
+  assembleGroups, finishedGroups, parseCreateInput, parseMembers, parsePatchInput, prismaReviewGroups,
+  type MemberInput, type ReviewGroup, type ReviewGroupStore, type StoredGroup,
+} from '../services/prReviewGroups';
 import {
   applyLinks, earlierLinks, parseAttachInput, parsePrIdent, prismaWorkstreamPrs, recordCheckoutLinks, type EarlierPr, type StoredLink, type WorkstreamPrStore,
 } from '../services/workstreamPrs';
@@ -40,6 +53,11 @@ import {
 //   DELETE /api/prs/deferrals?key=…            bring a deferred row back
 //   PUT  /api/prs/links                        attach a PR to a workstream ({ repo, number, projectId, workstream })
 //   DELETE /api/prs/links?repo=…&number=…      drop a PR's stored workstream link
+//   POST /api/prs/groups                       a new review group ({ name, members? })
+//   PATCH /api/prs/groups/:id                  rename, close or reopen it ({ name?, closed? })
+//   PUT  /api/prs/groups/:id/members           its whole ordered member list ({ members: [{ repo, number, note? }] })
+//   DELETE /api/prs/groups/:id                 delete it
+//   POST /api/prs/group-suggestions/dismiss    "Not these" on a suggested group ({ key })
 //   GET  /api/version                          the termag commit this orchestrator runs
 //
 // GitHub is read as the user, with their stored gh token; a user with none
@@ -71,6 +89,11 @@ export interface PipelineResponse {
   notes: string[];
   /** Which repository each of the user's workstreams is a checkout of, when its box said: the overlay's Attach picker offers those first. */
   checkouts: { projectId: string; workstream: string; repo: string }[];
+  /**
+   * The sweep's workstreams, for linking review group members no lane lists
+   * (a live checkout, a reviewTarget). Server-side only: GET /api/prs drops it.
+   */
+  linkable?: LinkableWorkstream[];
 }
 
 /** What GET /api/prs answers: the memoized pipeline plus the user's deferrals, read fresh. */
@@ -78,6 +101,12 @@ export type PrsResponse = PipelineResponse & {
   deferred: PrDeferral[];
   /** Stored workstream links whose PR no lane lists (services/workstreamPrs.ts earlierLinks): the sidebar's grey pills. */
   earlier: EarlierPr[];
+  /** The user's review groups (services/prReviewGroups.ts): open ones, then closed ones kept a while. */
+  groups: ReviewGroup[];
+  /** Set when the groups' members could not be read from GitHub: the cards show what is stored. */
+  groupsError?: string;
+  /** Suggested review groups (services/prGroupSuggestions.ts), for a user with the flag on; else none. */
+  suggestions: GroupSuggestion[];
 };
 
 export interface DeployPipeline {
@@ -100,6 +129,14 @@ export interface PipelineDeps {
   bakeRuns: (token: string) => Promise<BakeRun[] | null>;
   /** Stores the rows' live checkout links (services/workstreamPrs.ts); absent in tests that do not care. */
   recordLinks?: (userId: string, rows: PrRow[]) => Promise<void>;
+  /** Review group members by number (prPipelineGithub fetchPrsByNumber); absent in tests that do not care. */
+  byNumber?: (token: string, viewer: string, refs: { repo: string; number: number }[]) => Promise<NumberedPr[]>;
+  /** The token's login, for a group edit made before any list was read. */
+  viewer?: (token: string) => Promise<string>;
+  /** A few fields of PRs by number, with their descriptions when asked (suggested groups); absent in tests that do not care. */
+  lite?: (token: string, refs: { repo: string; number: number }[], withBody: boolean) => Promise<LitePr[]>;
+  /** Whether to suggest groups for the user (pr-review-groups-enabled): their descriptions are read only then. */
+  suggestionsOn?: (userId: string) => Promise<boolean>;
   now: () => Date;
 }
 
@@ -113,6 +150,15 @@ const defaultDeps: PipelineDeps = {
   orchestratorImage: newestOrchestratorImage,
   bakeRuns: token => bakeRuns(token),
   recordLinks: (userId, rows) => recordCheckoutLinks(userId, rows),
+  byNumber: (token, viewer, refs) => fetchPrsByNumber(token, viewer, refs),
+  viewer: token => viewerLogin(token),
+  lite: (token, refs, withBody) => fetchPrLite(token, refs, withBody),
+  suggestionsOn: async userId => {
+    const user = await prisma.user.findUnique({
+      where: { id: userId }, select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true },
+    });
+    return user ? boolVariation('pr-review-groups-enabled', user, false) : false;
+  },
   now: () => new Date(),
 };
 
@@ -202,6 +248,7 @@ export async function loadPipeline(userId: string, token: string, deps: Pipeline
     fetchedAt: now.toISOString(),
     notes: pipelineNotes(search, sweep, prod),
     checkouts: sweep.workstreams.filter(w => w.repo).map(w => ({ projectId: w.projectId, workstream: w.workstream, repo: w.repo! })),
+    linkable: sweep.workstreams,
   };
 }
 
@@ -235,9 +282,93 @@ export async function pipelineForUser(userId: string): Promise<PipelineResponse 
   }
 }
 
+// Review group members, read by number: memoized like the pipeline, per user,
+// for one token and one member list (an edit that changes the list reads afresh).
+const memberMemos = new Map<string, { key: string; load: () => Promise<Map<string, NumberedPr>> }>();
+
+function membersFor(userId: string, token: string, viewer: string, refs: { repo: string; number: number }[], deps: PipelineDeps): Promise<Map<string, NumberedPr>> {
+  const byNumber = deps.byNumber;
+  if (!byNumber || refs.length === 0) return Promise.resolve(new Map());
+  const key = `${token}\u0000${viewer}\u0000${refs.map(r => prKey(r.repo, r.number)).sort().join(' ')}`;
+  let memo = memberMemos.get(userId);
+  if (!memo || memo.key !== key) {
+    memo = {
+      key,
+      load: swrMemo(async () => {
+        const got = await byNumber(token, viewer, refs);
+        // Keyed as stored (lowercased): GitHub answers with the repository's own case.
+        return new Map(got.map((p, i) => [prKey(refs[i].repo, refs[i].number), p]));
+      }, FRESH_MS, MAX_STALE_MS),
+    };
+    memberMemos.set(userId, memo);
+  }
+  return memo.load();
+}
+
+/**
+ * A row built for a group member no lane lists, linked as lane rows are
+ * (Devin, #667): the live checkout on its branch (assignLanes), then a stored
+ * link over it (applyLinks), and for a review row where Review with Devin runs.
+ */
+function linkCardRow(row: PrRow, links: StoredLink[], linkable: LinkableWorkstream[]): PrRow {
+  if (!row.repo) return row;
+  const live = { ...row, workstream: linkWorkstream(row.repo, row.headRefName, row.baseRefName, linkable) };
+  const [linked] = applyLinks([live], links);
+  return isReviewLane(linked.lane) ? { ...linked, reviewTarget: reviewTarget(linked.repo!, linked.workstream, linkable) } : linked;
+}
+
+// Suggested groups read descriptions, which change rarely: memoized longer
+// than the lanes, per user, for one token and one set of review requests.
+const SUGGEST_FRESH_MS = 10 * 60_000;
+const SUGGEST_STALE_MS = 30 * 60_000;
+const suggestMemos = new Map<string, { key: string; load: () => Promise<{ bodies: Map<string, string>; others: Map<string, LitePr & { open: boolean }> }> }>();
+
+function suggestReadsFor(userId: string, token: string, laneRows: PrRow[], deps: PipelineDeps) {
+  const lite = deps.lite!;
+  const sources = bodySources(laneRows).map(r => ({ repo: r.repo!, number: r.number! }));
+  const key = `${token}\u0000${sources.map(r => prKey(r.repo.toLowerCase(), r.number)).sort().join(' ')}`;
+  let memo = suggestMemos.get(userId);
+  if (!memo || memo.key !== key) {
+    memo = {
+      key,
+      load: swrMemo(async () => {
+        const got = sources.length ? await lite(token, sources, true) : [];
+        const bodies = new Map(got.map((p, i) => [prKey(sources[i].repo.toLowerCase(), sources[i].number), p.body ?? '']));
+        // Linked PRs no lane lists: are they open (an issue, a merged PR, a missing one links nothing)?
+        const unknown = unknownRefs(laneRows, bodies);
+        const looked = unknown.length ? await lite(token, unknown, false) : [];
+        // Paired by position before the filter: lite answers in the order asked.
+        const others = new Map(looked.map((p, i) => [prKey(unknown[i].repo.toLowerCase(), unknown[i].number), p] as const).filter(([, p]) => p.found));
+        return { bodies, others };
+      }, SUGGEST_FRESH_MS, SUGGEST_STALE_MS),
+    };
+    suggestMemos.set(userId, memo);
+  }
+  return memo.load();
+}
+
+/** Every member of the user's groups, once each, in a stable order. */
+function memberRefs(groups: StoredGroup[]): { repo: string; number: number }[] {
+  const seen = new Map<string, { repo: string; number: number }>();
+  for (const g of groups) for (const m of g.members) seen.set(prKey(m.repo, m.number), { repo: m.repo, number: m.number });
+  return [...seen.values()];
+}
+
+/**
+ * After a write on GitHub: the lanes and the groups' members are read afresh
+ * on the next GET, so a merge or a review checks a member off (and can close
+ * its group) at once, not when the member memo ages out.
+ */
+function forget(userId: string): void {
+  memos.delete(userId);
+  memberMemos.delete(userId);
+}
+
 /** Test seam. */
 export function _resetPipelineMemos(): void {
   memos.clear();
+  memberMemos.clear();
+  suggestMemos.clear();
 }
 
 /** The row actions' GitHub calls (services/prReview.ts), injectable for the route tests. */
@@ -285,6 +416,8 @@ export function prsLister(
   tokenFor: (userId: string) => Promise<string | null> = githubTokenSource,
   deferrals: DeferralStore = prismaDeferrals,
   links: WorkstreamPrStore = prismaWorkstreamPrs,
+  groupStore: ReviewGroupStore = prismaReviewGroups,
+  dismissals: SuggestionDismissalStore = prismaSuggestionDismissals,
 ): (userId: string) => Promise<RouteResult> {
   // Outside the memo: a deferral shows on the next read. A database hiccup hides no PR, it only un-defers.
   const deferredFor = (userId: string): Promise<PrDeferral[]> => deferrals.list(userId, deps.now()).catch(err => {
@@ -296,14 +429,79 @@ export function prsLister(
     console.warn('[PRS] could not read workstream links:', err instanceof Error ? err.message : String(err));
     return [];
   });
+  // Outside the memo as well, so an edit shows on the next read. A database hiccup shows no groups.
+  const storedGroupsFor = (userId: string): Promise<StoredGroup[]> => groupStore.list(userId, deps.now()).catch(err => {
+    console.warn('[PRS] could not read review groups:', err instanceof Error ? err.message : String(err));
+    return [];
+  });
+  /** The groups with their members' state; a failed GitHub read keeps the cards, with what is stored. */
+  const groupsFor = async (
+    userId: string, token: string, viewer: string, stored: StoredGroup[], laneRows: PrRow[], links: StoredLink[], linkable: LinkableWorkstream[],
+  ) => {
+    if (stored.length === 0) return { groups: [] as ReviewGroup[] };
+    let fetched: Map<string, NumberedPr> | null = null;
+    let groupsError: string | undefined;
+    try {
+      fetched = await membersFor(userId, token, viewer, memberRefs(stored), deps);
+    } catch (err) {
+      if (!(err instanceof GithubApiError)) throw err;
+      console.warn(`[PRS] ${userId}: review group members: ${err.message} (HTTP ${err.status})`);
+      groupsError = 'Could not read the groups\' pull requests from GitHub: showing what is stored.';
+    }
+    const groups = assembleGroups(stored, fetched, laneRows, viewer).map(g => ({
+      ...g,
+      members: g.members.map(m => {
+        const row = m.row && !m.inLane ? linkCardRow(m.row, links, linkable) : m.row;
+        // A pane for every member, merged or yours too: Review all with Devin may run the rest there (Devin, #668).
+        const pane = row?.repo ? reviewTarget(row.repo, row.workstream, linkable) : null;
+        return { ...m, row, pane };
+      }),
+    }));
+    // Every member merged or closed: the group closes itself (once; a failure retries on the next read).
+    const finished = finishedGroups(groups);
+    if (finished.length) {
+      const at = deps.now();
+      const saved = await Promise.all(finished.map(id => groupStore.update(userId, id, { closed: true }, at).catch(() => false)));
+      // Only a close that was written shows as one: a failed write stays open, and retries on the next read (Devin, #667).
+      const closed = new Set(finished.filter((_, i) => saved[i]));
+      for (const g of groups) if (closed.has(g.id)) g.closedAt = at.toISOString();
+    }
+    return { groups, groupsError };
+  };
+  /**
+   * Suggested groups, only with the flag on (its descriptions cost a GitHub
+   * read). Never fails the list: a GitHub or database hiccup suggests nothing.
+   */
+  const suggestionsFor = async (userId: string, token: string, laneRows: PrRow[], stored: StoredGroup[]): Promise<GroupSuggestion[]> => {
+    if (!deps.lite || !deps.suggestionsOn) return [];
+    try {
+      if (!(await deps.suggestionsOn(userId))) return [];
+      const [{ bodies, others }, dismissed] = await Promise.all([suggestReadsFor(userId, token, laneRows, deps), dismissals.list(userId)]);
+      const grouped = new Map<string, { id: string; name: string; size: number }>();
+      for (const g of stored) {
+        if (!g.closedAt) for (const m of g.members) grouped.set(prKey(m.repo.toLowerCase(), m.number), { id: g.id, name: g.name, size: g.members.length });
+      }
+      return suggestGroups({ rows: laneRows, bodies, others, grouped, dismissed });
+    } catch (err) {
+      console.warn(`[PRS] ${userId}: suggested groups: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  };
   return async (userId) => {
     const token = await tokenFor(userId);
     if (!token) return { status: 200, body: { connected: false } };
     try {
-      const [pipeline, deferred, stored] = await Promise.all([pipelineFor(userId, token, deps), deferredFor(userId), linksFor(userId)]);
+      const [{ linkable = [], ...pipeline }, deferred, stored, storedGroups] = await Promise.all([
+        pipelineFor(userId, token, deps), deferredFor(userId), linksFor(userId), storedGroupsFor(userId),
+      ]);
       const lanes = pipeline.lanes.map(l => ({ ...l, rows: applyLinks(l.rows, stored) }));
-      const earlier = earlierLinks(lanes.flatMap(l => l.rows), stored, pipeline.fetchedAt);
-      return { status: 200, body: { ...pipeline, lanes, deferred, earlier } satisfies PrsResponse };
+      const laneRows = lanes.flatMap(l => l.rows);
+      const earlier = earlierLinks(laneRows, stored, pipeline.fetchedAt);
+      const [{ groups, groupsError }, suggestions] = await Promise.all([
+        groupsFor(userId, token, pipeline.viewer, storedGroups, laneRows, stored, linkable),
+        suggestionsFor(userId, token, laneRows, storedGroups),
+      ]);
+      return { status: 200, body: { ...pipeline, lanes, deferred, earlier, groups, ...(groupsError ? { groupsError } : {}), suggestions } satisfies PrsResponse };
     } catch (err) {
       if (!(err instanceof GithubApiError)) throw err;
       // Logged: the browser's sidebar tile is the only other place this shows,
@@ -325,14 +523,17 @@ export function prsRouter(
   deferrals: DeferralStore = prismaDeferrals,
   links: WorkstreamPrStore = prismaWorkstreamPrs,
   createWorkstream: typeof createWorkstreamFor = createWorkstreamFor,
+  groupStore: ReviewGroupStore = prismaReviewGroups,
+  dismissals: SuggestionDismissalStore = prismaSuggestionDismissals,
 ): Router {
   const router = Router();
 
   /** Runs a row action with the user's token, mapping bad input to 400 and GitHub's refusals through githubFailure. */
-  const withGithub = (fn: (token: string, ref: PrRef, req: Parameters<RequestHandler>[0]) => Promise<unknown>): RequestHandler => async (req, res) => {
+  // `parse`: the orgs' PRs only (parsePrRef), except for a read anyone's PR can take (parseAnyPrRef).
+  const withGithub = (fn: (token: string, ref: PrRef, req: Parameters<RequestHandler>[0]) => Promise<unknown>, parse = parsePrRef): RequestHandler => async (req, res) => {
     let ref: PrRef;
     try {
-      ref = parsePrRef(req.params.owner, req.params.repo, req.params.number);
+      ref = parse(req.params.owner, req.params.repo, req.params.number);
     } catch (err) {
       if (err instanceof PrInputError) { res.status(400).json({ error: err.message }); return; }
       throw err;
@@ -349,34 +550,35 @@ export function prsRouter(
     }
   };
 
-  const overview = withGithub((token, ref) => actions.overview(token, ref));
+  // A read with the user's own token: any repository, since a review group can hold any PR (Devin, #667).
+  const overview = withGithub((token, ref) => actions.overview(token, ref), parseAnyPrRef);
 
   const review = withGithub(async (token, ref, req) => {
     const input = parseReviewInput(req.body);
     const submitted = await actions.review(token, ref, input);
-    // The review moves the PR between lanes; the next /api/prs reads afresh.
-    memos.delete(req.user!.id);
+    // The review moves the PR between lanes, and checks it off in its group; the next /api/prs reads afresh.
+    forget(req.user!.id);
     return submitted;
   });
 
   const merge = withGithub(async (token, ref, req) => {
     const input = parseMergeInput(req.body);
     const result = await actions.merge(token, ref, input);
-    memos.delete(req.user!.id);
+    forget(req.user!.id);
     return result;
   });
 
   const rerun = withGithub(async (token, ref, req) => {
     const result = await actions.rerun(token, ref);
     // Re-run checks are pending again: the PR's row says so on the next read.
-    memos.delete(req.user!.id);
+    forget(req.user!.id);
     return result;
   });
 
   const reviewers = withGithub(async (token, ref, req) => {
     const result = await actions.reviewers(token, ref, parseReviewersInput(req.body));
     // The row's "waiting on" list changes.
-    memos.delete(req.user!.id);
+    forget(req.user!.id);
     return result;
   });
 
@@ -423,7 +625,7 @@ export function prsRouter(
     res.status(204).end();
   };
 
-  const list = prsLister(deps, tokenFor, deferrals, links);
+  const list = prsLister(deps, tokenFor, deferrals, links, groupStore, dismissals);
   const prs: RequestHandler = async (req, res) => {
     sendResult(res, await list(req.user!.id));
   };
@@ -435,11 +637,13 @@ export function prsRouter(
       if (err instanceof PrInputError) { res.status(400).json({ error: err.message }); return; }
       throw err;
     }
-    const { projectId, name } = (req.body ?? {}) as { projectId?: unknown; name?: unknown };
+    const { projectId, name, prompt } = (req.body ?? {}) as { projectId?: unknown; name?: unknown; prompt?: unknown };
     if (typeof projectId !== 'string' || !projectId || typeof name !== 'string' || !name) {
       res.status(400).json({ error: 'projectId and name required' });
       return;
     }
+    const first = parseFirstPrompt(prompt);
+    if (!first.ok) { res.status(400).json({ error: first.error }); return; }
     const token = await tokenFor(req.user!.id);
     if (!token) { res.status(409).json({ error: 'Connect GitHub in Settings first.' }); return; }
     let head: PrHead;
@@ -450,13 +654,93 @@ export function prsRouter(
       return;
     }
     if (head.state !== 'OPEN') { res.status(409).json({ error: `The pull request is ${head.state.toLowerCase()}: nothing to work on.` }); return; }
-    const result = await createWorkstream(req.user!, projectId, { name, branch: head.branch, pr: { number: ref.number, sameRepo: head.sameRepo, headOid: head.headOid } });
+    const result = await createWorkstream(req.user!, projectId, {
+      name, branch: head.branch, pr: { repo: `${ref.owner}/${ref.name}`, number: ref.number, sameRepo: head.sameRepo, headOid: head.headOid }, firstPrompt: first.prompt,
+    });
     if (result.status === 201) {
       const ws = (result.body as { name?: string }).name ?? name;
       await links.record(req.user!.id, { repo: `${ref.owner}/${ref.name}`, number: ref.number }, { projectId, workstream: ws }, 'manual')
         .catch(err => console.warn('[PRS] could not attach the new workstream:', err instanceof Error ? err.message : String(err)));
     }
     sendResult(res, result);
+  };
+
+  /**
+   * Members as stored: their titles from GitHub, which also refuses one it has
+   * no such PR for. Members already in the group keep their stored title
+   * without a read, so reordering or a note costs nothing.
+   */
+  const withTitles = async (userId: string, members: MemberInput[], known: StoredGroup['members']): Promise<(MemberInput & { title: string })[] | { error: string; status: number }> => {
+    const have = new Map(known.map(m => [prKey(m.repo, m.number), m.title]));
+    const fresh = members.filter(m => !have.has(prKey(m.repo, m.number)));
+    const titles = new Map<string, string>();
+    if (fresh.length) {
+      const token = await tokenFor(userId);
+      if (!token) return { status: 409, error: 'Connect GitHub in Settings first.' };
+      if (!deps.byNumber || !deps.viewer) return { status: 500, error: 'Cannot read pull requests from GitHub here.' };
+      let got: NumberedPr[];
+      try {
+        got = await deps.byNumber(token, await deps.viewer(token), fresh);
+      } catch (err) {
+        if (!(err instanceof GithubApiError)) throw err;
+        return githubFailure(err);
+      }
+      const missing = fresh.filter((_, i) => !got[i]?.found);
+      if (missing.length) {
+        return { status: 404, error: `GitHub has no pull request ${missing.map(m => prKey(m.repo, m.number)).join(', ')} that you can see.` };
+      }
+      fresh.forEach((m, i) => titles.set(prKey(m.repo, m.number), got[i].title));
+    }
+    return members.map(m => ({ ...m, title: titles.get(prKey(m.repo, m.number)) ?? have.get(prKey(m.repo, m.number)) ?? '' }));
+  };
+  const inputError = (res: Parameters<RequestHandler>[1], err: unknown): boolean => {
+    if (err instanceof PrInputError) { res.status(400).json({ error: err.message }); return true; }
+    return false;
+  };
+  const ownGroup = async (userId: string, id: string): Promise<StoredGroup | null> =>
+    (await groupStore.list(userId, deps.now())).find(g => g.id === id) ?? null;
+
+  const createGroup: RequestHandler = async (req, res) => {
+    let input;
+    try { input = parseCreateInput(req.body); } catch (err) { if (inputError(res, err)) return; throw err; }
+    const members = await withTitles(req.user!.id, input.members, []);
+    if (!Array.isArray(members)) { res.status(members.status).json({ error: members.error }); return; }
+    try {
+      res.status(201).json(await groupStore.create(req.user!.id, input.name, members));
+    } catch (err) { if (inputError(res, err)) return; throw err; }
+  };
+
+  const patchGroup: RequestHandler = async (req, res) => {
+    let patch;
+    try { patch = parsePatchInput(req.body); } catch (err) { if (inputError(res, err)) return; throw err; }
+    try {
+      const ok = await groupStore.update(req.user!.id, String(req.params.id), patch, deps.now());
+      if (!ok) { res.status(404).json({ error: 'No such group of yours' }); return; }
+    } catch (err) { if (inputError(res, err)) return; throw err; }
+    res.json({ ok: true });
+  };
+
+  const putMembers: RequestHandler = async (req, res) => {
+    let members;
+    try { members = parseMembers((req.body ?? {}).members); } catch (err) { if (inputError(res, err)) return; throw err; }
+    const group = await ownGroup(req.user!.id, String(req.params.id));
+    if (!group) { res.status(404).json({ error: 'No such group of yours' }); return; }
+    const titled = await withTitles(req.user!.id, members, group.members);
+    if (!Array.isArray(titled)) { res.status(titled.status).json({ error: titled.error }); return; }
+    if (!(await groupStore.setMembers(req.user!.id, group.id, titled))) { res.status(404).json({ error: 'No such group of yours' }); return; }
+    res.json({ ok: true });
+  };
+
+  const dismissSuggestion: RequestHandler = async (req, res) => {
+    const key = (req.body ?? {}).key;
+    if (typeof key !== 'string' || !key || key.length > 5000) { res.status(400).json({ error: 'key required' }); return; }
+    await dismissals.dismiss(req.user!.id, key);
+    res.status(204).end();
+  };
+
+  const deleteGroup: RequestHandler = async (req, res) => {
+    await groupStore.remove(req.user!.id, String(req.params.id));
+    res.status(204).end();
   };
 
   const version: RequestHandler = async (_req, res) => {
@@ -476,7 +760,7 @@ export function prsRouter(
       return;
     }
     // The next read shows the queued run.
-    memos.delete(req.user!.id);
+    forget(req.user!.id);
     res.status(202).json({ ok: true, workflowUrl: BAKE_WORKFLOW_URL });
   };
 
@@ -486,6 +770,11 @@ export function prsRouter(
   router.delete('/prs/deferrals', requireAuth, asyncHandler(undefer));
   router.put('/prs/links', requireAuth, asyncHandler(attach));
   router.delete('/prs/links', requireAuth, asyncHandler(detach));
+  router.post('/prs/groups', requireAuth, asyncHandler(createGroup));
+  router.patch('/prs/groups/:id', requireAuth, asyncHandler(patchGroup));
+  router.put('/prs/groups/:id/members', requireAuth, asyncHandler(putMembers));
+  router.delete('/prs/groups/:id', requireAuth, asyncHandler(deleteGroup));
+  router.post('/prs/group-suggestions/dismiss', requireAuth, asyncHandler(dismissSuggestion));
   router.get('/prs/:owner/:repo/:number', requireAuth, asyncHandler(overview));
   router.post('/prs/:owner/:repo/:number/review', requireAuth, asyncHandler(review));
   router.post('/prs/:owner/:repo/:number/merge', requireAuth, asyncHandler(merge));

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEBOUNCE_MS, SOURCE, brokerRemedy, initialState, keepalivePost, reduce, toArgv,
+  DEBOUNCE_MS, FIREWORKS, SOURCE, brokerRemedy, initialState, keepalivePost, piAgent, reduce, toArgv,
   type PiEventLike, type Post, type State,
 } from '../../../deploy/pi-ext/termag-status-core';
 
@@ -169,5 +169,31 @@ describe('toArgv', () => {
     expect(toArgv(posts[1])).toEqual(['waiting', '--source', SOURCE, '--reason', 'user_input', '--notify', '--message', 'hm?', '--rate-limited', 'pi: model endpoint HTTP 502']);
     expect(toArgv(posts[2])).toEqual(['meta', '--source', SOURCE, '--context-tokens', '1234']);
     expect(toArgv(posts[3])).toEqual(['meta', '--source', SOURCE, '--rate-limited', 'null']);
+  });
+});
+
+describe('pi on Fireworks (TERMAG_PI_AGENT=fireworks)', () => {
+  it('picks the agent by name, pi by default', () => {
+    expect(piAgent('fireworks')).toBe(FIREWORKS);
+    expect(piAgent(undefined).label).toBe('pi');
+    expect(piAgent('anything-else').label).toBe('pi');
+  });
+
+  it('posts under the harness source on any backend, so its working time stays pi\'s', () => {
+    expect(toArgv({ kind: 'status', status: 'working' })).toEqual(['working', '--source', SOURCE]);
+  });
+
+  it("names the gateway, not pi's broker or SSO, when a call fails", () => {
+    let state = initialState();
+    const posts: Post[] = [];
+    for (const ev of [{ type: 'agent_start' }, { type: 'after_provider_response', status: 403 }, { type: 'agent_end' }] as PiEventLike[]) {
+      const r = reduce(state, ev, T0, FIREWORKS);
+      state = r.state;
+      posts.push(...r.posts);
+    }
+    const last = posts.at(-1) as Extract<Post, { kind: 'status' }>;
+    expect(last).toMatchObject({ status: 'waiting', notify: true, rateLimited: 'Fireworks: gateway HTTP 403' });
+    expect(last.message).toMatch(/termag gateway refused this box.*termag-credentials status/);
+    expect(last.message).not.toMatch(/sso|pi/i);
   });
 });

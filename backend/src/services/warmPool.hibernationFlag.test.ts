@@ -21,6 +21,7 @@ vi.mock('./featureFlags', () => {
   return {
     boolVariationForContext: vi.fn(async (key: string, ctx: FlagContext, fallback: boolean) => evaluate(key, ctx, fallback)),
     boolVariation: vi.fn(async (key: string, user: { id: string }, fallback: boolean) => evaluate(key, { kind: 'user', key: user.id }, fallback)),
+    numberVariationForContext: vi.fn(async (key: string, _ctx: FlagContext, fallback: number) => (key === 'box-warm-pool-size' ? 1 : fallback)),
   };
 });
 
@@ -63,7 +64,6 @@ beforeEach(() => {
   provisionPoolBox.mockClear();
   resetPoolSpecCache();
   vi.spyOn(console, 'log').mockImplementation(() => {});
-  process.env.WARM_POOL_TARGET_SIZE = '1';
 });
 
 describe('the warm pool and box-hibernation-enabled', () => {

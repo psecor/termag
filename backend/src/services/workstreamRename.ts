@@ -10,6 +10,7 @@
 // workstream name is a label for the worktree, not the branch (`branch` is
 // shown in the row's tooltip). `main` cannot be renamed: it has no worktree
 // and its sessions carry the historical 3-segment names.
+import { isRunName } from './automations/schedule';
 import { sessionName } from './tmux';
 
 // Capped at 64 to match the chat relay's WORKSTREAM_RE (services/chatRunner.ts).
@@ -24,6 +25,10 @@ export function validateWorkstreamRename(current: string, next: unknown): { ok: 
   if (!WORKSTREAM_NAME_REGEX.test(name)) return { ok: false, error: 'name must be alphanumeric with dashes/underscores only, at most 64 characters' };
   if (current === 'main') return { ok: false, error: 'The main workstream cannot be renamed' };
   if (name === 'main') return { ok: false, error: '"main" is reserved for the project\'s primary workstream' };
+  // A run's name is its link (?ws=run-…) and the name the next occurrence
+  // would take; it is the automation scheduler's either way.
+  if (isRunName(current)) return { ok: false, error: 'An automation run cannot be renamed' };
+  if (isRunName(name)) return { ok: false, error: 'run-<date>-<time> names are the automation scheduler\'s' };
   if (name === current) return { ok: false, error: 'That is already the name' };
   return { ok: true, name };
 }

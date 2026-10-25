@@ -29,6 +29,10 @@ export interface SpawnLimits {
   /** Live agent panes on the target box; null = no cap (the default until measured). */
   boxCapacity: number | null;
   hot: HotThresholds;
+  /** A finished delegate idle this long is parked. */
+  parkIdleMinutes: number;
+  /** A parked spawn whose work is safe but not known to have landed is retired after this long. */
+  retireAfterDays: number;
 }
 
 export const DEFAULT_SPAWN_LIMITS: SpawnLimits = {
@@ -38,6 +42,8 @@ export const DEFAULT_SPAWN_LIMITS: SpawnLimits = {
   maxConcurrentPerUser: 8,
   boxCapacity: null,
   hot: { memPct: 85, loadPerCore: 1.5, diskPct: 90 },
+  parkIdleMinutes: 30,
+  retireAfterDays: 3,
 };
 
 const posInt = (v: unknown, max: number): number | undefined =>
@@ -66,6 +72,8 @@ export function parseSpawnLimits(value: unknown, defaults: SpawnLimits = DEFAULT
       loadPerCore: ratio(hot.loadPerCore) ?? defaults.hot.loadPerCore,
       diskPct: pct(hot.diskPct) ?? defaults.hot.diskPct,
     },
+    parkIdleMinutes: posInt(v.parkIdleMinutes, 7 * 24 * 60) ?? defaults.parkIdleMinutes,
+    retireAfterDays: posInt(v.retireAfterDays, 90) ?? defaults.retireAfterDays,
   };
 }
 
@@ -253,6 +261,8 @@ export interface EndInput {
   misses: number;
   /** A spawn not launched yet, made within the grace period, is left alone. */
   launched: boolean;
+  /** Parked on purpose: its pane being gone is not an end. */
+  parked?: boolean;
   ageMs: number;
 }
 
@@ -276,7 +286,25 @@ export function endDecision(e: EndInput): { end: EndHow } | { misses: number } {
   if (!e.workstreamLive) return { end: 'removed' };
   if (e.boxStatus === 'terminated' || e.boxStatus === 'failed') return { end: 'box_terminated' };
   if (!e.launched && e.ageMs < END_LAUNCH_GRACE_MS) return { misses: 0 };
+  if (e.parked) return { misses: 0 };
   if (!e.boxConnected || e.sessionLive === null) return { misses: e.misses };
   if (e.sessionLive) return { misses: 0 };
   return e.misses + 1 >= END_MISSES ? { end: 'killed' } : { misses: e.misses + 1 };
+}
+
+/**
+ * A budget after `spawned` more spawns were admitted: the counts move up, and
+ * the near-limit hint is worked out again from them, so a reply never shows
+ * the hint for the counts before it (#444). The other hints are about the box,
+ * the provider and finished agents, which one more spawn does not change.
+ */
+export function rebudget(b: Budget, spawned = 1): Budget {
+  const used = {
+    ...b.used,
+    lastHour: b.used.lastHour + spawned,
+    running: b.used.running + spawned,
+    openHere: b.used.openHere === null ? null : b.used.openHere + spawned,
+  };
+  const near = spawnHints({ limits: b.limits, used, box: null, throttledProviders: [], finishedRunning: 0, now: 0 });
+  return { ...b, used, hints: [...b.hints.filter(h => h.kind !== 'near_limit'), ...near] };
 }

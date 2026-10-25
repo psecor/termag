@@ -92,14 +92,17 @@ const view: BriefingView = {
   window: { since: '', until: '', tz: 'UTC', label: 'Fri 9 Oct 16:00 to Mon 12 Oct 07:00 (2 days 15 hours)', basis: 'since_last' },
   boxName: 'devbox',
   content: {
-    summary: 'You left <two> things & a PR.',
-    carryovers: [
-      { projectId: 'p1', workstream: 'feat', kind: 'question', title: 'Answer the agent', detail: 'It asked about panes.', evidence: 'transcript' },
-      { projectId: 'gone', workstream: null, kind: 'action', title: 'Orphan', detail: '', evidence: 'git' },
+    version: 2,
+    headline: 'You left <two> things & a PR.',
+    workedOn: [{ projectId: 'p1', workstream: 'main', text: 'Shipped SDK chat', prs: ['o/termag#400'] }],
+    leftOpen: [
+      { key: 'open:p1:feat', projectId: 'p1', workstream: 'feat', kind: 'question', title: 'Answer the agent', detail: 'It asked about panes.', evidence: 'transcript', pr: null },
+      { key: 'open:gone:main', projectId: 'gone', workstream: null, kind: 'action', title: 'Orphan', detail: '', evidence: 'git', pr: 'o/termag#12' },
     ],
-    suggestions: [{ projectId: 'p1', workstream: 'main', text: 'Merge #12', why: 'It is green.' }],
+    workBetter: [{ key: 'pattern:many-switches', projectId: null, workstream: null, text: 'Batch your reviews', why: 'You switched 40 times a day.' }],
   },
-  stats: null,
+  stats: { agentMs: 3_600_000, humanMs: 7_200_000, tokens: 1, sessionsTouched: 3, switches: 4, waitingNow: 1, prsNeedingAttention: 2, keptCheckouts: 0, offlineBoxes: 0 },
+  charts: null,
   projects: { p1: { name: 'termag', archived: false } },
   createdAt: '', finishedAt: null,
 };
@@ -122,6 +125,12 @@ describe('Slack briefing', () => {
     expect(json).toContain('&lt;two&gt; things &amp; a PR');
     expect(json).toContain('<https://x/termag/?project=p1&ws=feat|termag · feat>');
     expect(json).toContain('Orphan');
+    expect(json.indexOf('Worked on')).toBeLessThan(json.indexOf('Left open'));
+    expect(json.indexOf('Left open')).toBeLessThan(json.indexOf('Work better'));
+    expect(json).toContain('<https://github.com/o/termag/pull/400|#400>');
+    expect(json).toContain('<https://github.com/o/termag/pull/12|#12>');
+    expect(json).toContain('You 2 hours · agents 1 hour · 3 sessions · 1 waiting · 2 PRs need you');
+    expect(json).toContain('Batch your reviews');
     expect(json).toContain('briefing_run_again');
     expect(json).toContain('https://x/termag/dashboard');
     expect(text).toMatch(/^Your termag briefing: /);
@@ -167,6 +176,8 @@ describe('runner helpers', () => {
     expect(job.prompt).toMatch(/UNTRUSTED/);
     expect(job.allowedTools).toEqual(BRIEFING_ALLOWED_TOOLS);
     expect(job.allowedTools.some(t => t.includes('send_keys'))).toBe(false);
-    expect(briefingPrompt('x')).toContain('"carryovers"');
+    expect(briefingPrompt('x')).toContain('"leftOpen"');
+    expect(briefingPrompt('x')).toContain('"workBetter"');
+    expect(briefingPrompt('x')).toMatch(/dismissed true/);
   });
 });

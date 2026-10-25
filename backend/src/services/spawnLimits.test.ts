@@ -10,10 +10,12 @@ import {
   boxRefusal,
   endDecision,
   limitRefusal,
+  rebudget,
   parseSpawnLimits,
   spawnHints,
   suggestBox,
   type BoxReading,
+  type HintKind,
 } from './spawnLimits';
 
 const now = Date.parse('2026-10-17T12:00:00Z');
@@ -148,6 +150,11 @@ describe('endDecision', () => {
     expect(endDecision({ ...base, sessionLive: true, misses: 1 })).toEqual({ misses: 0 });
   });
 
+  it('does not end a parked spawn because its pane is gone, but still ends one whose workstream went', () => {
+    expect(endDecision({ ...base, parked: true, sessionLive: false, misses: 1 })).toEqual({ misses: 0 });
+    expect(endDecision({ ...base, parked: true, workstreamLive: false })).toEqual({ end: 'removed' });
+  });
+
   it('decides nothing for an offline box or a spawn still launching', () => {
     expect(endDecision({ ...base, boxConnected: false, sessionLive: null, misses: 1 })).toEqual({ misses: 1 });
     expect(endDecision({ ...base, boxStatus: 'stopped', boxConnected: false, sessionLive: null })).toEqual({ misses: 0 });
@@ -155,5 +162,27 @@ describe('endDecision', () => {
     // A slow clone an hour in is still starting, inside the brief's claim window.
     expect(endDecision({ ...base, launched: false, ageMs: 60 * 60 * 1000, sessionLive: false })).toEqual({ misses: 0 });
     expect(END_LAUNCH_GRACE_MS).toBe(SPAWN_CLAIM_WINDOW_MS);
+  });
+});
+
+describe('rebudget', () => {
+  const b = (running: number, hints: Array<{ kind: HintKind; message: string }> = []) => ({
+    limits: DEFAULT_SPAWN_LIMITS, used: { depth: 0, openHere: 1, lastHour: 3, running },
+    box: null, finishedRunning: 0, hints,
+  });
+
+  it('counts the spawn and drops a near-limit hint the new counts no longer fit', () => {
+    const r = rebudget(b(7, [{ kind: 'near_limit', message: 'close to a spawn limit: running 7/8' }]));
+    expect(r.used).toEqual({ depth: 0, openHere: 2, lastHour: 4, running: 8 });
+    expect(r.hints).toEqual([]);
+  });
+
+  it('adds the near-limit hint the spawn walked into', () => {
+    expect(rebudget(b(6)).hints).toEqual([{ kind: 'near_limit', message: 'close to a spawn limit: running 7/8' }]);
+  });
+
+  it('keeps the hints one more spawn does not change', () => {
+    const box = { kind: 'box_hot' as const, message: 'box b is running hot' };
+    expect(rebudget(b(1, [box])).hints).toEqual([box]);
   });
 });

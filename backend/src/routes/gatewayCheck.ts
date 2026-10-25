@@ -3,6 +3,7 @@ import { verifyCallerProof, type CallerProofConfig } from '../services/callerIde
 import type { AuthzBox, AuthzDecision } from '../services/gatewayAuthz';
 import { isManagedBox, parseAgentConnection } from '../services/instanceLifecycle';
 import { validateAgentToken } from './agentTokens';
+import { debugLog } from '../services/debugLog';
 
 export async function boxForToken(token: string): Promise<AuthzBox | null> {
   const validated = await validateAgentToken(token);
@@ -33,13 +34,17 @@ export interface CheckRequest {
  * checked before anything else. nginx also keeps /termag/internal/ off the
  * plain :3040 listener, but the proof is what decides. Mounted
  * before express.json(). Logs under `[tag]` the box, owner and decision; never
- * a token or a body.
+ * a token or a body. Refusals and errors always; with `quietAllow`, an allow
+ * only when TERMAG_DEBUG names the tag (services/debugLog.ts). The GitHub
+ * broker sets it: every allowed git fetch and gh call was a journal line
+ * shipped to Observability, a third of its records.
  */
 export function gatewayCheckRouter(
   cfg: CallerProofConfig,
   tag: string,
   unavailable: string,
   decide: (check: CheckRequest) => Promise<AuthzDecision>,
+  { quietAllow = false }: { quietAllow?: boolean } = {},
 ): Router {
   const router = Router();
   router.use(async (req: Request, res: Response) => {
@@ -60,7 +65,8 @@ export function gatewayCheckRouter(
         refuse(decision.status, decision.message, decision.audit, decision.headers);
         return;
       }
-      console.log(`[${tag}] ${decision.audit}`);
+      if (quietAllow) debugLog(tag, () => decision.audit);
+      else console.log(`[${tag}] ${decision.audit}`);
       res.status(200).set(decision.headers).end();
     } catch (err) {
       refuse(503, unavailable, `error ${(err as Error).message}`);

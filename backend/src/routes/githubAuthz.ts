@@ -31,11 +31,14 @@ function readBody(req: Request): Promise<string> {
  * appended.
  */
 export function githubAuthzRouter(cfg: CallerProofConfig): Router {
+  // Allowed calls are a debug line (TERMAG_DEBUG=GH-AUTHZ): one per git and
+  // gh request from every box. Refusals still log.
+  const quiet = { quietAllow: true };
   return gatewayCheckRouter(cfg, 'GH-AUTHZ', 'The termag GitHub broker could not check this request', async ({ req, path, search }) => {
     const body = req.method === 'GET' || req.method === 'HEAD' ? '' : await readBody(req);
     return decideGithubRequest(
       { method: req.method, path, search, authorization: req.headers.authorization, body },
       { boxForToken, ownerToken: githubTokenSource },
     );
-  });
+  }, quiet);
 }

@@ -15,7 +15,7 @@
  */
 
 import { prisma } from '../db';
-import { prKey, type PrRow, type WorkstreamLink } from './prPipeline';
+import { isReviewLane, prKey, type PrRow, type WorkstreamLink } from './prPipeline';
 import { PrInputError } from './prReview';
 import { isAmbiguousSession, resolveSessionProject } from './sessionResolver';
 
@@ -76,7 +76,7 @@ export function applyLinks<R extends Pick<PrRow, 'kind' | 'repo' | 'number' | 'l
       workstream: stored.workstream,
       linkedBy: stored.source,
       // Review a PR where it was worked on, as for a live link (prPipeline.ts reviewTarget).
-      reviewTarget: r.lane === 'needs_my_review' ? stored.workstream : r.reviewTarget,
+      reviewTarget: isReviewLane(r.lane) ? stored.workstream : r.reviewTarget,
     };
   });
 }
@@ -186,6 +186,27 @@ export async function recordCheckoutLinks(userId: string, rows: Pick<PrRow, 'kin
  * pr_created): stored against the session's workstream. A session that maps
  * to no workstream (a runner session, an unknown pane) records nothing.
  */
+/** A session reported opening a PR, resolved to its owner's project and workstream (the `pr_created` milestone). */
+export interface PrCreatedEvent {
+  userId: string;
+  projectId: string;
+  workstream: string;
+  pr: { repo: string; number: number };
+}
+
+const prCreatedListeners = new Set<(ev: PrCreatedEvent) => void>();
+
+/**
+ * Hear about every PR a session reports opening, once it is resolved to a
+ * workstream. The URL is the box's to choose, so a listener verifies it
+ * (on GitHub) before acting on it. Each listener runs on its own; one that
+ * throws is logged.
+ */
+export function onPrCreated(listener: (ev: PrCreatedEvent) => void): () => void {
+  prCreatedListeners.add(listener);
+  return () => { prCreatedListeners.delete(listener); };
+}
+
 export async function recordCreatedLink(
   session: string, instanceId: string | null, url: string | null,
   deps: { resolve?: typeof resolveSessionProject; store?: WorkstreamPrStore } = {},
@@ -194,5 +215,10 @@ export async function recordCreatedLink(
   if (!pr) return false;
   const resolved = await (deps.resolve ?? resolveSessionProject)(session, instanceId);
   if (!resolved || isAmbiguousSession(resolved) || !resolved.projectId || !resolved.workstream) return false;
-  return (deps.store ?? prismaWorkstreamPrs).record(resolved.userId, pr, { projectId: resolved.projectId, workstream: resolved.workstream }, 'created');
+  const recorded = await (deps.store ?? prismaWorkstreamPrs).record(resolved.userId, pr, { projectId: resolved.projectId, workstream: resolved.workstream }, 'created');
+  const ev: PrCreatedEvent = { userId: resolved.userId, projectId: resolved.projectId, workstream: resolved.workstream, pr };
+  for (const listener of [...prCreatedListeners]) {
+    try { listener(ev); } catch (err) { console.warn(`[WORKSTREAM-PR] a pr_created listener failed: ${(err as Error).message}`); }
+  }
+  return recorded;
 }

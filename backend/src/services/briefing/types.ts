@@ -100,6 +100,8 @@ export interface LedgerSession {
   /** UNTRUSTED. The agent pane's last lines, only for sessions waiting now. */
   paneTail: string | null;
   prs: LedgerPr[];
+  /** The user marked this session's left-open item done (and it has done nothing since) or deferred it. */
+  dismissed: boolean;
   notes: string[];
 }
 
@@ -113,6 +115,19 @@ export interface LedgerCloudSession {
   /** The checkout held work GitHub did not have, so it was kept on the box. */
   kept: boolean;
   url: string | null;
+}
+
+/** A spawned agent whose parent went away and that nobody adopted. Metadata only: no brief or report text. */
+export interface LedgerSpawnOrphan {
+  spawnId: string;
+  projectId: string | null;
+  workstream: string;
+  /** Owner-only, like a cloud session's title. */
+  title: string;
+  state: string;
+  orphanedAt: string;
+  /** It reported and nobody has read it. */
+  unreadReport: boolean;
 }
 
 export interface LedgerTotals {
@@ -134,30 +149,99 @@ export interface Ledger {
   /** Sessions with any sign of life in the window, or waiting now. Busiest first. */
   sessions: LedgerSession[];
   cloudSessions: LedgerCloudSession[];
-  /** Open PRs needing attention that no workstream links to. */
+  /** Orphaned spawns waiting for someone; absent when the dep is not wired. */
+  spawnOrphans?: LedgerSpawnOrphan[];
+  /** Open PRs no workstream links to: attention, waiting on approval, or team reviews. */
   otherPrs: LedgerPr[];
+  /** Habits over the last PATTERN_DAYS days, without the ones the user marked done or deferred. */
+  patterns: LedgerPattern[];
+  charts: BriefingCharts;
   /** What could not be read, in words ("2 workstreams on an offline box"). */
   notes: string[];
   trust: string;
 }
 
-/** What the composing model returns, validated by services/briefing/content.ts. */
+/**
+ * A habit worth changing, found by services/briefing/patterns.ts over the last
+ * PATTERN_DAYS days from what termag records. Deterministic: the id is stable
+ * across briefings, so Done and Defer can name it.
+ */
+export interface LedgerPattern {
+  /** "big-context:<projectId>:<workstream>", "stale-workstreams", … */
+  id: string;
+  kind: 'big-context' | 'stale-workstreams' | 'branches-without-pr' | 'undeployed-merges' | 'many-switches' | 'waiting-long';
+  /** What was seen, in plain words with the numbers ("termag · main peaked at 388k tokens of context"). */
+  finding: string;
+  projectId: string | null;
+  workstream: string | null;
+}
+
+/** Series for the card's charts (services/briefing/charts.ts). Database only, no model. */
+export interface BriefingCharts {
+  /** The last 7 local days, oldest first, ending with the window's last day. */
+  days: Array<{ day: string; humanMs: number; agentMs: number; tokens: number }>;
+  /** Time in the window per project, busiest first, at most 8. */
+  projects: Array<{ projectId: string; name: string; humanMs: number; agentMs: number }>;
+}
+
+/** One bullet's PR: "owner/name#123". */
+export type PrRef = string;
+
+/** What the composing model returns (version 2), validated by services/briefing/content.ts. */
 export interface BriefingContent {
-  summary: string;
-  carryovers: Array<{
+  version: 2;
+  /** One sentence. */
+  headline: string;
+  /** What got done, a few bullets per project. */
+  workedOn: Array<{
+    projectId: string | null;
+    workstream: string | null;
+    text: string;
+    prs: PrRef[];
+  }>;
+  /** Dangling work, decisions and actions, in the order to take them. */
+  leftOpen: Array<{
+    /** Set by the backend: what Done and Defer name ("open:<projectId>:<workstream>"); null when it names no session or PR. */
+    key: string | null;
     projectId: string | null;
     workstream: string | null;
     kind: 'question' | 'decision' | 'action' | 'blocked';
     title: string;
     detail: string;
     evidence: 'transcript' | 'todo' | 'status' | 'pr' | 'git' | 'cloud' | 'pane';
+    pr: PrRef | null;
   }>;
-  suggestions: Array<{
+  /** Habits worth changing, each from a LedgerPattern. */
+  workBetter: Array<{
+    /** "pattern:<LedgerPattern.id>". */
+    key: string;
     projectId: string | null;
     workstream: string | null;
     text: string;
     why: string;
   }>;
+}
+
+/** The first shape, still in rows written before version 2; store.ts reads it as version 2. */
+export interface BriefingContentV1 {
+  summary: string;
+  carryovers: Array<{
+    projectId: string | null;
+    workstream: string | null;
+    kind: BriefingContent['leftOpen'][number]['kind'];
+    title: string;
+    detail: string;
+    evidence: BriefingContent['leftOpen'][number]['evidence'];
+  }>;
+  suggestions: Array<{ projectId: string | null; workstream: string | null; text: string; why: string }>;
+}
+
+/** Done or Defer on one item of a briefing (services/briefing/dismissals.ts). */
+export interface BriefingDismissal {
+  key: string;
+  kind: 'done' | 'defer';
+  until: string;
+  createdAt: string;
 }
 
 /** GET /api/briefings/latest, GET /api/briefings and POST /api/briefings/run rows. */
@@ -170,6 +254,8 @@ export interface BriefingView {
   boxName: string | null;
   content: BriefingContent | null;
   stats: LedgerTotals | null;
+  /** Null on rows written before the charts. */
+  charts: BriefingCharts | null;
   /** Project names for the ids in content, so the client can render links. */
   projects: Record<string, { name: string; archived: boolean }>;
   createdAt: string;

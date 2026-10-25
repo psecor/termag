@@ -3,7 +3,8 @@
  * It keeps `<box>/<project>` unambiguous for the CLI and every box usable as
  * an SSH host name (`termag-<box>`). Mirrored in frontend/src/utils/boxNames.ts.
  *
- * Enforced on create only: boxes named before the rule keep their names.
+ * Enforced on create and rename: boxes named before the rule keep their names
+ * until they are renamed.
  */
 const BOX_NAME_RE = /^[A-Za-z0-9_-]+$/;
 

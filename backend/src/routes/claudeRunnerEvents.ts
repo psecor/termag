@@ -41,6 +41,7 @@ import { asyncHandler } from '../middleware/errors';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { parseRunnerEvent, recordRunnerEnd, recordRunnerStarted, recordRunnerTitle, recordRunnerUsage, type RunIdentity } from '../services/claudeRunnerSessions';
 import { notifyCloudSessionChange, recordSessionEvent, type SessionEventKind } from '../services/claudeSessionEvents';
+import { recordProductEvent } from '../services/productEvents';
 
 export function claudeRunnerEventsRouter(): Router {
   const router = Router();
@@ -82,6 +83,9 @@ export function claudeRunnerEventsRouter(): Router {
       }
       if (outcome.kind !== 'started') { unknownOrOtherBox(res, orderId, instanceId, outcome.kind); return; }
       console.log(`[CLAUDE-RUNNER] order ${orderId} for ${outcome.who} serving session ${outcome.sessionId} from ${outcome.clientPlatform ?? 'unknown'} on ${outcome.boxName} slot ${outcome.slot}`);
+      recordProductEvent('cloud.session.started', { user: outcome.userId, box: outcome.instanceId }, {
+        provider: 'claude', kind: 'cloud', clientPlatform: outcome.clientPlatform, slot: outcome.slot,
+      });
       await appendEvent(outcome, orderId, 'started', outcome.clientPlatform);
       res.status(204).end();
       return;
@@ -113,6 +117,9 @@ export function claudeRunnerEventsRouter(): Router {
       case 'ended': {
         const reason = outcome.exitReason ? ` (${outcome.exitReason})` : '';
         console.log(`[CLAUDE-RUNNER] order ${orderId} for ${outcome.who} ended on ${outcome.boxName} slot ${outcome.slot} after ${outcome.durationSec}s, exit ${outcome.exitStatus}${reason}`);
+        recordProductEvent('cloud.session.ended', { user: outcome.userId, box: outcome.instanceId }, {
+          provider: 'claude', kind: 'cloud', durationSec: outcome.durationSec, exitStatus: outcome.exitStatus, exitReason: outcome.exitReason, slot: outcome.slot,
+        });
         await appendEvent(outcome, orderId, 'ended', outcome.exitReason ?? `exit ${outcome.exitStatus}`);
         res.status(204).end();
         return;

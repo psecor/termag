@@ -5,7 +5,8 @@ const NOW = new Date('2026-10-09T12:00:00Z').getTime();
 
 const rows = new Map<string, Record<string, any>>();
 const runnerSessions: Array<{ instanceId: string; endedAt: Date | null }> = [];
-const matches = (row: Record<string, any>, where: Record<string, any>) => Object.entries(where).every(([k, v]) => {
+const matches = (row: Record<string, any>, where: Record<string, any>): boolean => Object.entries(where).every(([k, v]) => {
+  if (k === 'OR') return (v as Record<string, any>[]).some(w => matches(row, w));
   if (v && typeof v === 'object' && 'not' in v) return row[k] !== v.not;
   if (v && typeof v === 'object' && 'gte' in v) return row[k] != null && row[k] >= v.gte;
   if (v && typeof v === 'object' && 'in' in v) return v.in.includes(row[k]);
@@ -29,10 +30,11 @@ vi.mock('../db', () => ({
   },
 }));
 
-const flag = { on: true, asked: [] as string[] };
+const flag = { on: true, idleStop: false, asked: [] as string[] };
 vi.mock('./featureFlags', () => ({
   boolVariation: async (key: string, _user: unknown, fallback: boolean, box: { id: string }) => {
     flag.asked.push(`${key}:${box.id}`);
+    if (key === 'box-idle-stop-enabled') return flag.idleStop ?? fallback;
     return flag.on ?? fallback;
   },
 }));
@@ -49,8 +51,9 @@ vi.mock('./boxPower', () => {
     requestPower: async (box: any, action: string, opts: any) => {
       power.calls.push([box.id, action, opts]);
       if (power.refuse) throw new Error('UnsupportedOperation: not ready to hibernate yet');
-      rows.get(box.id)!.status = 'hibernating';
-      return 'hibernating';
+      const status = action === 'stop' ? 'stopping' : 'hibernating';
+      rows.get(box.id)!.status = status;
+      return status;
     },
   };
 });
@@ -70,7 +73,7 @@ vi.mock('./agentRegistry', () => ({
   },
 }));
 
-const { recentAutoTerminations, registerBoxBusyCheck, runLifecycleSweep, setBoxLifecycle } = await import('./boxLifecycle');
+const { lifecycleViewFor, recentAutoTerminations, registerBoxBusyCheck, runLifecycleSweep, setBoxLifecycle } = await import('./boxLifecycle');
 
 const terminated: string[] = [];
 const terminator = async (_user: unknown, box: { id: string }) => {
@@ -100,7 +103,7 @@ beforeEach(() => {
   rows.clear();
   runnerSessions.length = 0;
   statuses.clear();
-  Object.assign(flag, { on: true, asked: [] });
+  Object.assign(flag, { on: true, idleStop: false, asked: [] });
   Object.assign(power, { calls: [], refuse: false });
   Object.assign(agent, { capabilities: ['unsaved-work-v1'], connected: true, reply: CLEAN, fail: false, asked: [], duringScan: null });
   terminated.length = 0;
@@ -123,7 +126,9 @@ describe('runLifecycleSweep', () => {
     seed('pool', { userId: null });
     seed('down', { status: 'hibernated' });
     expect(await runLifecycleSweep(NOW)).toEqual([]);
-    expect(flag.asked).toEqual([]);
+    // Only the new flag is read, for the one box with no setting; it is off.
+    expect(flag.asked).toEqual(['box-idle-stop-enabled:off']);
+    expect(power.calls).toEqual([]);
   });
 
   it('does nothing with the flag off', async () => {
@@ -169,6 +174,135 @@ describe('runLifecycleSweep', () => {
     seed('a', { lastActivityAt: new Date(NOW - 30 * 60 * 1000) });
     const [r] = await runLifecycleSweep(NOW);
     expect(r.decision).toEqual({ hibernate: false, reason: 'not-idle' });
+  });
+});
+
+describe('box-idle-stop-enabled', () => {
+  it('with it off, a box with no setting is never touched, and one that cannot hibernate is never stopped', async () => {
+    seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
+    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
+    expect(await runLifecycleSweep(NOW)).toEqual([]);
+    expect(power.calls).toEqual([]);
+    expect(agent.asked).toEqual([]);
+    expect(flag.asked).not.toContain('box-auto-lifecycle-enabled:unset');
+  });
+
+  it('with it on and no setting, hibernates a box that can at 2 h, and not a minute sooner', async () => {
+    flag.idleStop = true;
+    flag.on = false;
+    seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 2 * HOUR + 60_000) });
+    expect((await runLifecycleSweep(NOW))[0].decision).toEqual({ hibernate: false, reason: 'not-idle' });
+    expect(power.calls).toEqual([]);
+
+    const [r] = await runLifecycleSweep(NOW + 60_000);
+    expect(r).toMatchObject({ box: 'unset', decision: { hibernate: true }, outcome: 'hibernating' });
+    expect(power.calls).toEqual([['unset', 'hibernate', { onHibernateRefused: 'throw' }]]);
+    expect(rows.get('unset')!.lifecycleNote).toMatch(/Hibernated automatically after 2 h idle/);
+    expect(agent.asked).toEqual(['unsaved-work:unset']);
+  });
+
+  it('with it on and no setting, plainly stops a box that cannot hibernate, after the unsaved-work scan', async () => {
+    flag.idleStop = true;
+    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 2 * HOUR) });
+    const [r] = await runLifecycleSweep(NOW);
+    expect(r).toEqual({ box: 'legacy', decision: { stop: true }, outcome: 'stopping' });
+    expect(power.calls).toEqual([['legacy', 'stop', undefined]]);
+    expect(agent.asked).toEqual(['unsaved-work:legacy']);
+    expect(rows.get('legacy')!.unsavedWork).toEqual(CLEAN);
+    expect(rows.get('legacy')!.lifecycleNote).toMatch(/^Stopped automatically after 2 h idle/);
+  });
+
+  it('with it on, a box with its own setting keeps that timing and is not stopped at 2 h', async () => {
+    flag.idleStop = true;
+    seed('own', { idleHibernateHours: 4, lastActivityAt: new Date(NOW - 3 * HOUR) });
+    seed('legacy-own', { hibernationConfigured: false, idleHibernateHours: 4, lastActivityAt: new Date(NOW - 10 * HOUR) });
+    expect(await runLifecycleSweep(NOW)).toEqual([{ box: 'own', decision: { hibernate: false, reason: 'not-idle' } }]);
+    const [later] = await runLifecycleSweep(NOW + HOUR);
+    expect(later).toMatchObject({ box: 'own', decision: { hibernate: true }, outcome: 'hibernating' });
+    expect(power.calls).toEqual([['own', 'hibernate', { onHibernateRefused: 'throw' }]]);
+    expect(flag.asked.filter(k => k.startsWith('box-idle-stop-enabled'))).toEqual([]);
+  });
+
+  it('with it on, a working agent, a runner session, or typing since keeps the box up', async () => {
+    flag.idleStop = true;
+    const old = new Date(NOW - 10 * HOUR);
+    seed('working', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: old });
+    seed('runner', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: old });
+    seed('typed', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * 60 * 1000) });
+    statuses.set('k', { status: 'working', instanceId: 'working' });
+    runnerSessions.push({ instanceId: 'runner', endedAt: null });
+    const out = Object.fromEntries((await runLifecycleSweep(NOW)).map(r => [r.box, r.decision]));
+    expect(out).toEqual({
+      working: { hibernate: false, reason: 'working' },
+      runner: { hibernate: false, reason: 'busy' },
+      typed: { hibernate: false, reason: 'not-idle' },
+    });
+    expect(power.calls).toEqual([]);
+  });
+
+  it("an owner's start restarts the clock, so a box stopped for idle is not due again once it is back", async () => {
+    flag.idleStop = true;
+    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
+    await runLifecycleSweep(NOW);
+    expect(rows.get('legacy')!.status).toBe('stopping');
+    // What POST /:id/start writes with `starting` (requestPower markInUse), then the agent's connect makes it ready.
+    const { boxInUseFields } = await import('./boxActivity');
+    Object.assign(rows.get('legacy')!, boxInUseFields('legacy', NOW + 5 * 60 * 1000), { status: 'ready' });
+    power.calls.length = 0;
+    const [r] = await runLifecycleSweep(NOW + 10 * 60 * 1000);
+    expect(r).toEqual({ box: 'legacy', decision: { hibernate: false, reason: 'not-idle' } });
+    expect(power.calls).toEqual([]);
+    expect(rows.get('legacy')).toMatchObject({ parkedAt: null, lifecycleNote: null });
+  });
+
+  it('with both flags on, no idle hours and a terminate limit hibernates at 2 h, then terminates once parked', async () => {
+    flag.idleStop = true;
+    flag.on = true;
+    seed('unset', {
+      idleHibernateHours: null,
+      hibernatedTerminateDays: 1,
+      lastActivityAt: new Date(NOW - 2 * HOUR),
+    });
+    const parked = await runLifecycleSweep(NOW, terminator);
+    expect(parked).toEqual([{ box: 'unset', decision: { hibernate: true }, outcome: 'hibernating' }]);
+    expect(power.calls).toEqual([['unset', 'hibernate', { onHibernateRefused: 'throw' }]]);
+    expect(terminated).toEqual([]);
+
+    // The power sweep settles hibernating to hibernated and stamps parkedAt.
+    // The scan from the hibernate is still clean, and a day later the terminate is due.
+    Object.assign(rows.get('unset')!, {
+      status: 'hibernated',
+      parkedAt: new Date(NOW),
+      unsavedWork: CLEAN,
+      unsavedWorkCheckedAt: new Date(NOW - HOUR),
+      lastActivityAt: new Date(NOW - 2 * HOUR),
+    });
+    const [gone] = await runLifecycleSweep(NOW + DAY, terminator);
+    expect(gone).toMatchObject({ box: 'unset', decision: { terminate: true, days: 1 }, outcome: 'terminated' });
+    expect(terminated).toEqual(['unset']);
+  });
+
+  it('the list warning says the box is stopped when idle-stop is on, and keeps the old sentence when it is off', async () => {
+    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, hibernatedTerminateDays: 14 });
+    const row = { ...rows.get('legacy')!, lifecycleNote: null };
+    const user = { id: 'u1' } as never;
+    flag.idleStop = false;
+    expect((await lifecycleViewFor(user, row)).warning).toMatch(/never stopped or terminated instead/);
+    flag.idleStop = true;
+    const on = (await lifecycleViewFor(user, row)).warning;
+    expect(on).toMatch(/stopped after 2 hours idle/);
+    expect(on).not.toMatch(/never stopped/);
+    expect(flag.asked).toContain('box-idle-stop-enabled:legacy');
+  });
+
+  it('with it on, keeps the box up when work starts during the scan', async () => {
+    flag.idleStop = true;
+    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
+    agent.duringScan = () => { statuses.set('k', { status: 'working', instanceId: 'legacy' }); };
+    const [r] = await runLifecycleSweep(NOW);
+    expect(r).toEqual({ box: 'legacy', decision: { hibernate: false, reason: 'working' } });
+    expect(power.calls).toEqual([]);
+    expect(rows.get('legacy')!.unsavedWorkCheckedAt).toBe(null);
   });
 });
 

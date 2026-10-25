@@ -59,10 +59,12 @@ const ledgerSessionRow = {
   projectId: 'p1', projectName: 'termag', workstream: 'main', access: 'owner', instanceId: 'box-a', boxName: 'devbox', hostOffline: false, provider: 'claude',
   status: { now: 'idle', updatedAt: null, waitingReason: null, rateLimited: null, milestone: null },
   activity: { agentMs: 0, humanMs: 0, tokens: 0, visits: 1, lastVisitAt: null, peakContextTokens: null },
-  digest: { branch: 'main', commits: [], transcript: null }, paneTail: null, prs: [], notes: [],
+  digest: { branch: 'main', commits: [], transcript: null }, paneTail: null, prs: [], dismissed: false, notes: [],
 };
 const buildLedger = vi.fn(async (_user: unknown, window: unknown) => ({
   window, generatedAt: 'g', totals: { tokens: 7 }, sessions: [ledgerSessionRow], cloudSessions: [], otherPrs: [], notes: [], trust: 't',
+  patterns: [{ id: 'many-switches', kind: 'many-switches', finding: 'f', projectId: null, workstream: null }],
+  charts: { days: [], projects: [] },
 }));
 vi.mock('../services/briefing/ledger', () => ({ buildLedger, needsAttention: () => false }));
 const deliver = vi.fn(async () => {});
@@ -72,7 +74,7 @@ const { briefingsRouter, clearLedgerCalls, pruneLedgerCalls } = await import('./
 const { recordResult, sweepStuckRuns, startBriefing, RUN_TIMEOUT_MS } = await import('../services/briefing/runner');
 const { clearLedgerCache, LEDGER_CACHE_TTL_MS } = await import('../services/briefing/ledgerCache');
 
-const CONTENT = JSON.stringify({ summary: 'You did things.', carryovers: [], suggestions: [] });
+const CONTENT = JSON.stringify({ headline: 'You did things.', workedOn: [], leftOpen: [], workBetter: [{ patternId: 'many-switches', text: 'Batch reviews' }, { patternId: 'made-up', text: 'Nap' }] });
 const running = (over: Partial<Row> = {}): Row => ({
   id: 'b1', userId: 'u1', instanceId: 'box-a', status: 'running', deliverSlack: true,
   since: new Date('2026-10-13T00:00:00Z'), until: new Date('2026-10-14T00:00:00Z'), tz: 'UTC', windowLabel: 'w',
@@ -82,15 +84,27 @@ const running = (over: Partial<Row> = {}): Row => ({
 let server: Server;
 let base: string;
 
+// Done / Defer marks, in memory.
+let marks: Array<{ key: string; kind: 'done' | 'defer'; until: string; createdAt: string }> = [];
+const dismissals = {
+  list: vi.fn(async () => marks),
+  dismiss: vi.fn(async (_u: string, input: { key: string; action: 'done' | 'defer' }) => {
+    const m = { key: input.key, kind: input.action, until: '2099-01-01T00:00:00.000Z', createdAt: '2026-10-17T00:00:00.000Z' };
+    marks = [...marks.filter(x => x.key !== input.key), m];
+    return m;
+  }),
+  restore: vi.fn(async (_u: string, key: string) => { marks = marks.filter(x => x.key !== key); }),
+};
+
 beforeAll(async () => {
   const app = express();
   app.use(express.json());
-  app.use('/api/briefings', briefingsRouter());
+  app.use('/api/briefings', briefingsRouter(dismissals));
   await new Promise<void>(r => { server = app.listen(0, '127.0.0.1', () => r()); });
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/briefings`;
 });
 afterAll(() => new Promise<void>(r => server.close(() => r())));
-beforeEach(() => { rows = [running()]; vi.clearAllMocks(); clearLedgerCache(); clearLedgerCalls(); });
+beforeEach(() => { rows = [running()]; marks = []; vi.clearAllMocks(); clearLedgerCache(); clearLedgerCalls(); });
 
 const asBox = (box: string | null, user = 'u1') => ({ 'x-test-user': user, ...(box ? { 'x-test-box': box } : {}), 'content-type': 'application/json' });
 const post = (id: string, headers: Record<string, string>, body: unknown = { result: CONTENT, exitStatus: 0 }) =>
@@ -148,30 +162,70 @@ describe('GET /ledger', () => {
   });
 
   it('rate limits builds, not cached reads', async () => {
-    expect((await get('since=2026-10-15T00:00:00Z')).status).toBe(200);
-    expect((await get('since=2026-10-15T00:00:00Z&projectId=p1')).status).toBe(200);
-    expect((await get('since=2026-10-15T01:00:00Z')).status).toBe(429);
+    // Inside the 7-day cap: a capped start moves with the clock and misses the cache.
+    const since = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 3_600_000).toISOString();
+    const first = since(24);
+    expect((await get(`since=${first}`)).status).toBe(200);
+    expect((await get(`since=${first}&projectId=p1`)).status).toBe(200);
+    expect((await get(`since=${since(23)}`)).status).toBe(429);
   });
 
   it('caches a briefing run\'s ledger for longer than the run may take', () => {
     expect(LEDGER_CACHE_TTL_MS).toBeGreaterThan(RUN_TIMEOUT_MS);
   });
 
-  it('keeps the totals on the row, for a result that misses the cache', async () => {
+  it('keeps what the result needs on the row, for a result that misses the cache', async () => {
     await get('briefing=b1');
-    expect(rows[0].stats).toEqual({ tokens: 7 });
+    expect(rows[0]).toMatchObject({ stats: { tokens: 7 }, patterns: [{ id: 'many-switches' }], charts: { days: [], projects: [] } });
     clearLedgerCache();
     rows[0].stats = { tokens: 9 };
     expect((await post('b1', asBox('box-a'))).status).toBe(204);
     expect(buildLedger).toHaveBeenCalledTimes(1);
     expect(rows[0]).toMatchObject({ status: 'done', stats: { tokens: 9 } });
+    // Work better is still checked against the patterns the review was given.
+    expect((rows[0].content as { workBetter: Array<{ key: string }> }).workBetter.map(w => w.key)).toEqual(['pattern:many-switches']);
   });
 
-  it('gives the result its review\'s ledger totals', async () => {
+  it('gives the result its review\'s ledger totals and charts, and keeps only its patterns', async () => {
     await get('briefing=b1');
     expect((await post('b1', asBox('box-a'))).status).toBe(204);
     expect(buildLedger).toHaveBeenCalledTimes(1);
-    expect(rows[0]).toMatchObject({ status: 'done', stats: { tokens: 7 } });
+    expect(rows[0]).toMatchObject({ status: 'done', stats: { tokens: 7 }, charts: { days: [], projects: [] } });
+    expect((rows[0].content as { workBetter: Array<{ key: string }> }).workBetter.map(w => w.key)).toEqual(['pattern:many-switches']);
+  });
+
+  it('flags nothing as dismissed in the index unless the ledger did', async () => {
+    const idx = await (await get('briefing=b1')).json();
+    expect(idx.sessions[0].dismissed).toBe(false);
+    expect(idx.patterns).toHaveLength(1);
+    expect(idx.charts).toBeUndefined();
+  });
+});
+
+describe('Done and Defer', () => {
+  const headers = { 'x-test-user': 'u1', 'content-type': 'application/json' };
+  const put = (body: unknown) => fetch(`${base}/dismissals`, { method: 'PUT', headers, body: JSON.stringify(body) });
+
+  it('marks an item, shows it on latest, and brings it back', async () => {
+    expect((await put({ key: 'pattern:many-switches', action: 'defer' })).status).toBe(200);
+    expect((await put({ key: 'open:p1:feat-x', action: 'done' })).status).toBe(200);
+    const latest = await (await fetch(`${base}/latest`, { headers })).json();
+    expect(latest.dismissals.map((d: { key: string }) => d.key)).toEqual(['pattern:many-switches', 'open:p1:feat-x']);
+    expect((await fetch(`${base}/dismissals?key=${encodeURIComponent('open:p1:feat-x')}`, { method: 'DELETE', headers })).status).toBe(204);
+    expect(marks.map(m => m.key)).toEqual(['pattern:many-switches']);
+  });
+
+  it('refuses keys that name no briefing item and unknown actions', async () => {
+    expect((await put({ key: 'o/termag#12', action: 'defer' })).status).toBe(400);
+    expect((await put({ key: 'pattern:x', action: 'snooze' })).status).toBe(400);
+    expect(dismissals.dismiss).not.toHaveBeenCalled();
+  });
+
+  it('still answers latest when the marks cannot be read', async () => {
+    dismissals.list.mockRejectedValueOnce(new Error('db down'));
+    const r = await fetch(`${base}/latest`, { headers });
+    expect(r.status).toBe(200);
+    expect((await r.json()).dismissals).toEqual([]);
   });
 });
 

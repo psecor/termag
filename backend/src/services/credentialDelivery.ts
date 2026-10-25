@@ -18,9 +18,13 @@ import { otlpDestinationFromEnv, type OtlpDestination } from '../config/env';
 import { connectedOwnedBoxIds, instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
 import { isManagedBox, type AgentConnection } from './instanceLifecycle';
 import { getClaudeGatewayConfig, gatewaySettings } from './claudeGateway';
+import { fireworksEnabledForBox } from './fireworksFlag';
+import { FIREWORKS_CAPABILITY, fireworksDelivery, getFireworksGatewayConfig } from './fireworksGateway';
 import { getCredentialStoreConfig, githubStoreDeps } from './credentialStore';
 import { getGithubBrokerUrl } from './githubBroker';
 import { AGENT_TELEMETRY_CAPABILITY } from './launchCommand';
+import { listConnectors, mcpBrokerEnabledForBox } from './mcpConnectorStore';
+import { getMcpBrokerUrl } from './mcpConnectors';
 
 export const CREDENTIALS_CAPABILITY = 'credentials-v1';
 // The box routes git and gh through the orchestrator's GitHub broker. An agent
@@ -35,12 +39,22 @@ export const TELEMETRY_CAPABILITY = 'telemetry-v1';
 // the launches. An agent without it gets no
 // agent-telemetry step.
 export { AGENT_TELEMETRY_CAPABILITY };
-export const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry'] as const;
+// The box writes one Claude Code mcpServers entry per connector, pointed at
+// the MCP broker with termag-mcp-headers. An agent
+// without it gets no mcp step.
+export const MCP_BROKER_CAPABILITY = 'mcp-broker-v1';
+// The box writes pi's Fireworks provider and the Claude Code settings
+// `termag-credentials launch-settings` prints. An agent without
+// it gets no fireworks step.
+export { FIREWORKS_CAPABILITY };
+export const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks'] as const;
 export type Provider = typeof PROVIDERS[number];
 
 const GATED: Partial<Record<Provider, string>> = {
   telemetry: TELEMETRY_CAPABILITY,
   'agent-telemetry': AGENT_TELEMETRY_CAPABILITY,
+  mcp: MCP_BROKER_CAPABILITY,
+  fireworks: FIREWORKS_CAPABILITY,
 };
 
 /** The providers an agent with these capabilities can be sent steps for. */
@@ -74,10 +88,16 @@ const BLANKED = Object.fromEntries([
  * traces to the configured project over OTLP/HTTP, with the owner's and the
  * box's ids. Metadata only: no OTEL_LOG_* gate is set, so spans and
  * events carry no prompt, response or tool content, and no exporter setup from
- * the owner's shell is left to ride on it (BLANKED). The box adds termag.box.
+ * the owner's shell is left to ride on it (BLANKED). The box adds termag.box,
+ * and the launch adds termag.project and termag.workstream
+ * (termag-credentials telemetry-launch, services/launchCommand.ts).
+ *
+ * Every agent's resource carries the same four: termag.agent (claude here;
+ * the other agents' pieces add theirs), termag.session.kind, termag.project
+ * and termag.workstream, so one query shape covers them all.
  */
 export function sessionTelemetrySettings(dest: OtlpDestination, keys: { user: string; box: string }): { env: Record<string, string> } {
-  const attributes = interactiveResource(dest, keys, 'service.name=termag-claude-session,');
+  const attributes = interactiveResource(dest, keys, 'service.name=termag-claude-session,termag.agent=claude,');
   return {
     env: {
       CLAUDE_CODE_ENABLE_TELEMETRY: '1',
@@ -136,6 +156,18 @@ export interface DeliveryInput {
   telemetry?: { env: Record<string, string> } | null;
   // agentTelemetrySettings, under the same condition.
   agentTelemetry?: { endpoint: string; resourceAttributes: string } | null;
+  // The broker and the owner's connectors (ids and names only) when the broker
+  // is configured and mcp-broker-enabled is on for the owner and box.
+  mcp?: { broker: string; connectors: { id: string; name: string }[] } | null;
+  mcpOffReason?: string;
+  // The connectors could not be read: no mcp step, as for githubUnknown.
+  mcpUnknown?: boolean;
+  // fireworksDelivery when the orchestrator has a Fireworks config and
+  // fireworks-enabled is on for the owner and box.
+  fireworks?: Record<string, unknown> | null;
+  fireworksOffReason?: string;
+  // The flag could not be read: no fireworks step, as for githubUnknown.
+  fireworksUnknown?: boolean;
 }
 
 export const REASONS = {
@@ -148,6 +180,10 @@ export const REASONS = {
   notConnected: 'GitHub is not connected: paste `gh auth token` on the termag Credentials page',
   noTelemetry: 'the orchestrator ships no telemetry (OBSERVABILITY_OTLP_ENDPOINT and OBSERVABILITY_PROJECT), so Claude Code here exports none',
   noAgentTelemetry: 'the orchestrator ships no telemetry (OBSERVABILITY_OTLP_ENDPOINT and OBSERVABILITY_PROJECT), so Codex, Cursor, Devin and pi here export none',
+  noMcpBroker: 'the orchestrator has no MCP broker (MCP_BROKER_URL), so termag adds no MCP servers here',
+  mcpOff: 'MCP connectors through termag are not enabled for you (feature flag mcp-broker-enabled)',
+  noFireworks: 'the orchestrator has no Fireworks gateway (FIREWORKS_GATEWAY_URL), so the Fireworks agents have no models here',
+  fireworksOff: 'Fireworks through termag is not enabled for you (feature flag fireworks-enabled)',
 };
 
 /**
@@ -182,6 +218,16 @@ export function planDelivery(input: DeliveryInput, capabilities: string[]): Deli
     steps.push(input.agentTelemetry
       ? { type: 'credentials-apply', provider: 'agent-telemetry', payload: input.agentTelemetry }
       : { type: 'credentials-remove', provider: 'agent-telemetry', reason: REASONS.noAgentTelemetry });
+  }
+  if (capabilities.includes(MCP_BROKER_CAPABILITY) && !input.mcpUnknown) {
+    steps.push(input.mcp
+      ? { type: 'credentials-apply', provider: 'mcp', payload: { broker: input.mcp.broker, connectors: input.mcp.connectors } }
+      : { type: 'credentials-remove', provider: 'mcp', reason: input.mcpOffReason ?? REASONS.noMcpBroker });
+  }
+  if (capabilities.includes(FIREWORKS_CAPABILITY) && !input.fireworksUnknown) {
+    steps.push(input.fireworks
+      ? { type: 'credentials-apply', provider: 'fireworks', payload: input.fireworks }
+      : { type: 'credentials-remove', provider: 'fireworks', reason: input.fireworksOffReason ?? REASONS.noFireworks });
   }
   return steps;
 }
@@ -218,6 +264,8 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
     }
   }
   const telemetry = otlpDestinationFromEnv(process.env);
+  const mcp = await mcpInputFor(userId, instanceId);
+  const fireworks = await fireworksInputFor(userId, instanceId);
   return {
     input: {
       claudeSettings: gateway && user?.claudeGatewayEnabled ? gatewaySettings(gateway) : null,
@@ -227,12 +275,78 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
       githubUnknown: githubError !== null,
       telemetry: telemetry && sessionTelemetrySettings(telemetry, { user: userId, box: instanceId }),
       agentTelemetry: telemetry && agentTelemetrySettings(telemetry, { user: userId, box: instanceId }),
+      ...mcp,
+      ...fireworks,
     },
     githubError,
   };
 }
 
-export async function deliverToInstance(instanceId: string, userId: string): Promise<void> {
+async function mcpInputFor(userId: string, instanceId: string): Promise<Pick<DeliveryInput, 'mcp' | 'mcpOffReason' | 'mcpUnknown'>> {
+  const broker = getMcpBrokerUrl();
+  if (!broker) return { mcp: null, mcpOffReason: REASONS.noMcpBroker };
+  try {
+    if (!await mcpBrokerEnabledForBox(userId, instanceId)) return { mcp: null, mcpOffReason: REASONS.mcpOff };
+    const connectors = (await listConnectors(userId)).map(c => ({ id: c.id, name: c.name }));
+    return { mcp: { broker, connectors } };
+  } catch (err) {
+    console.error(`[CRED] could not read MCP connectors for instance ${instanceId}:`, (err as Error).message);
+    return { mcpUnknown: true };
+  }
+}
+
+async function fireworksInputFor(userId: string, instanceId: string): Promise<Pick<DeliveryInput, 'fireworks' | 'fireworksOffReason' | 'fireworksUnknown'>> {
+  const cfg = getFireworksGatewayConfig();
+  if (!cfg) return { fireworks: null, fireworksOffReason: REASONS.noFireworks };
+  try {
+    if (!await fireworksEnabledForBox(userId, instanceId)) return { fireworks: null, fireworksOffReason: REASONS.fireworksOff };
+    return { fireworks: fireworksDelivery(cfg) };
+  } catch (err) {
+    console.error(`[CRED] could not read fireworks-enabled for instance ${instanceId}:`, (err as Error).message);
+    return { fireworksUnknown: true };
+  }
+}
+
+/**
+ * Whether this orchestrator ever delivers GitHub to a box: only through the
+ * broker, so it needs the credential store and a broker URL (deliveryInputFor).
+ * Without them a box's `githubDeliveredAt` is never stamped.
+ */
+export function deliversGithub(env: NodeJS.ProcessEnv = process.env): boolean {
+  return getCredentialStoreConfig(env) !== null && getGithubBrokerUrl(env) !== null;
+}
+
+// Deliveries still running, by box. A warm claim starts one without waiting
+// (warmPoolClaim.ts, welcomeOwner); a caller about to use the box, such as
+// the spawn route placing a runner on a box it just claimed , can
+// wait for it here instead of racing the box's settings writes.
+const inFlight = new Map<string, Set<Promise<void>>>();
+
+/**
+ * A promise for every delivery to this box still running (a claim's and, say,
+ * the owner's credential change, which can overlap), or null when none is.
+ * Settles once all of them have, however they ended; their errors are their
+ * starters' to log.
+ */
+export function deliveryInFlight(instanceId: string): Promise<void> | null {
+  const running = inFlight.get(instanceId);
+  if (!running || running.size === 0) return null;
+  return Promise.all([...running].map(p => p.then(() => undefined, () => undefined))).then(() => undefined);
+}
+
+export function deliverToInstance(instanceId: string, userId: string): Promise<void> {
+  const run = deliverToInstanceNow(instanceId, userId);
+  const running = inFlight.get(instanceId) ?? new Set<Promise<void>>();
+  running.add(run);
+  inFlight.set(instanceId, running);
+  run.finally(() => {
+    running.delete(run);
+    if (running.size === 0 && inFlight.get(instanceId) === running) inFlight.delete(instanceId);
+  }).catch(() => undefined);
+  return run;
+}
+
+async function deliverToInstanceNow(instanceId: string, userId: string): Promise<void> {
   const agent = instanceAgentTransport(instanceId);
   if (!agent || !agent.capabilities.includes(CREDENTIALS_CAPABILITY)) return;
   // A box that gets nothing is still told why.

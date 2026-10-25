@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { EVENT_RETENTION_MS, MULTIPART_MAX_AGE_MS, spacesSweep, sweepSpaces } from './spaceSweeper';
+import { CHARGE_MATCH_WINDOW_MS, EVENT_RETENTION_MS, MULTIPART_MAX_AGE_MS, spacesSweep, sweepSpaces } from './spaceSweeper';
 import { MemorySpaceObjects, MemorySpaceStore } from './spacesTestkit';
 
 describe('sweepSpaces', () => {
@@ -31,20 +31,22 @@ describe('sweepSpaces', () => {
     expect(store.spaces.get(live.id)!.usedBytes).toBe(14n);
   });
 
-  it('keeps charges whose URLs are still live on top of what S3 holds, and prunes expired ones', async () => {
+  it('keeps charges whose URLs are still live on top of what S3 holds, and prunes expired ones after the match window', async () => {
     const store = new MemorySpaceStore();
     const s3 = new MemorySpaceObjects();
     store.addUser('alice');
     const live = await store.createSpace({ name: 'live', description: null, userId: 'alice' });
     const now = Date.now();
     s3.put(`${live.id}/done`, 5);
-    await store.chargeBytes(live.id, 5n, new Date(now - 1), { key: `${live.id}/done` });
+    await store.chargeBytes(live.id, 5n, new Date(now - CHARGE_MATCH_WINDOW_MS - 1), { key: `${live.id}/done` });
     await store.chargeBytes(live.id, 40n, new Date(now + 15 * 60_000), { key: `${live.id}/pending` });
     await sweepSpaces(store, async () => s3, now);
     expect(store.spaces.get(live.id)!.usedBytes).toBe(45n);
     expect(store.charges.map(c => c.bytes)).toEqual([40n]);
     await sweepSpaces(store, async () => s3, now + 16 * 60_000);
     expect(store.spaces.get(live.id)!.usedBytes).toBe(5n);
+    expect(store.charges.map(c => c.bytes)).toEqual([40n]);
+    await sweepSpaces(store, async () => s3, now + 15 * 60_000 + CHARGE_MATCH_WINDOW_MS + 1);
     expect(store.charges).toEqual([]);
   });
 
@@ -90,6 +92,58 @@ describe('sweepSpaces', () => {
     s3.put(`${live.id}/old`, 30, 'text/plain', new Date(now - 60_000));
     await sweepSpaces(store, async () => s3, now);
     expect(store.spaces.get(live.id)!.usedBytes).toBe(10n + 20n + 30n);
+  });
+
+  it('settles one same-key PUT charge per landed version, so a second URL stays charged until its own write lands', async () => {
+    const store = new MemorySpaceStore();
+    const s3 = new MemorySpaceObjects();
+    store.addUser('alice');
+    const live = await store.createSpace({ name: 'live', description: null, userId: 'alice' });
+    const now = Date.now();
+    const key = `${live.id}/a`;
+    const liveUntil = new Date(now + 10 * 60_000);
+    await store.chargeBytes(live.id, 7n, liveUntil, { key }, new Date(now - 4 * 60_000));
+    await store.chargeBytes(live.id, 7n, liveUntil, { key }, new Date(now - 3 * 60_000));
+    s3.put(key, 7, 'text/plain', new Date(now - 2 * 60_000));
+
+    await sweepSpaces(store, async () => s3, now);
+    expect(store.spaces.get(live.id)!.usedBytes).toBe(7n + 7n);
+    s3.put(key, 7, 'text/plain', new Date(now - 60_000));
+    await sweepSpaces(store, async () => s3, now);
+    expect(store.spaces.get(live.id)!.usedBytes).toBe(7n + 7n);
+    s3.put(key, 9, 'text/plain', new Date(now - 30_000));
+    await sweepSpaces(store, async () => s3, now);
+    expect(store.spaces.get(live.id)!.usedBytes).toBe(7n + 7n + 9n);
+  });
+
+  it('matches a version an expired URL wrote to its own charge, not to a newer live one', async () => {
+    const store = new MemorySpaceStore();
+    const s3 = new MemorySpaceObjects();
+    store.addUser('alice');
+    const live = await store.createSpace({ name: 'live', description: null, userId: 'alice' });
+    const now = Date.now();
+    const key = `${live.id}/a`;
+    await store.chargeBytes(live.id, 7n, new Date(now - 60_000), { key }, new Date(now - 16 * 60_000));
+    await store.chargeBytes(live.id, 7n, new Date(now + 13 * 60_000), { key }, new Date(now - 2 * 60_000));
+    s3.put(key, 7, 'text/plain', new Date(now - 90_000));
+
+    await sweepSpaces(store, async () => s3, now);
+    expect(store.spaces.get(live.id)!.usedBytes).toBe(7n + 7n);
+  });
+
+  it('does not let an expired, unused charge claim a version written after its URL expired', async () => {
+    const store = new MemorySpaceStore();
+    const s3 = new MemorySpaceObjects();
+    store.addUser('alice');
+    const live = await store.createSpace({ name: 'live', description: null, userId: 'alice' });
+    const now = Date.now();
+    const key = `${live.id}/a`;
+    await store.chargeBytes(live.id, 7n, new Date(now - 5 * 60_000), { key }, new Date(now - 20 * 60_000));
+    await store.chargeBytes(live.id, 7n, new Date(now + 13 * 60_000), { key }, new Date(now - 2 * 60_000));
+    s3.put(key, 7, 'text/plain', new Date(now - 60_000));
+
+    await sweepSpaces(store, async () => s3, now);
+    expect(store.spaces.get(live.id)!.usedBytes).toBe(7n);
   });
 
   it('drops a part batch\'s live charge once its upload completed, and counts an open upload\'s parts no live charge covers', async () => {

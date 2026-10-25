@@ -7,6 +7,7 @@ const state = {
   connected: new Set<string>(),
   files: new Map<string, string>(),
   failWrites: new Set<string>(),
+  writes: [] as Array<Record<string, unknown>>,
 };
 
 vi.mock('../db', () => ({
@@ -23,6 +24,7 @@ vi.mock('./agentRegistry', () => ({
   sendToInstanceAgent: async (id: string, type: string, payload: { path: string; content?: string }) => {
     if (type === 'read-file') return { ok: true, content: state.files.get(`${id}:${payload.path}`) ?? null };
     if (state.failWrites.has(id)) throw new Error('EACCES: permission denied');
+    state.writes.push(payload);
     state.files.set(`${id}:${payload.path}`, payload.content!);
     return { ok: true };
   },
@@ -41,6 +43,7 @@ beforeEach(() => {
   state.connected.clear();
   state.files.clear();
   state.failWrites.clear();
+  state.writes = [];
 });
 
 describe('pushSshKeysToBoxes', () => {
@@ -68,5 +71,23 @@ describe('pushSshKeysToBoxes', () => {
     state.connected.add('box-1');
     state.files.set('box-1:/home/alice/.ssh/authorized_keys', managedBlock([KEY]));
     await expect(pushSshKeysToBoxes('u1')).resolves.toEqual({ updated: ['box-1'], pending: [] });
+  });
+
+  it('writes 0600 into a 0700 ~/.ssh, even when the keys already match', async () => {
+    state.boxes = [box('box-1')];
+    state.connected.add('box-1');
+    state.files.set('box-1:/home/alice/.ssh/authorized_keys', managedBlock([KEY]));
+    await pushSshKeysToBoxes('u1');
+    expect(state.writes).toEqual([
+      { path: '/home/alice/.ssh/authorized_keys', content: managedBlock([KEY]), mode: 0o600, dirMode: 0o700 },
+    ]);
+  });
+
+  it('creates no file for an owner with no keys', async () => {
+    state.keys = [];
+    state.boxes = [box('box-1')];
+    state.connected.add('box-1');
+    await expect(pushSshKeysToBoxes('u1')).resolves.toEqual({ updated: ['box-1'], pending: [] });
+    expect(state.writes).toEqual([]);
   });
 });

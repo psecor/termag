@@ -139,6 +139,21 @@ describe('claimWarmBox', () => {
     expect(log.takeLiveIds).toEqual([['box_1', 'box_7']]);
   });
 
+  it('takes only the live boxes the request says are eligible, and nothing when none is (B3)', async () => {
+    const { effects, log } = fakePool([claimedRow('box_7')], [], ['box_1', 'box_7']);
+
+    await claimWarmBox({ ...REQUEST, eligible: (id) => id === 'box_7' }, effects);
+    expect(log.takeLiveIds).toEqual([['box_7']]);
+
+    const dry = fakePool([claimedRow('box_1')], [], ['box_1']);
+    expect(await claimWarmBox({ ...REQUEST, eligible: () => false }, dry.effects)).toEqual({
+      claimed: false,
+      reason: 'no-warm-box',
+      candidatesTried: 0,
+    });
+    expect(dry.log.takes).toEqual([]);
+  });
+
   it("welcomes the owner onto the box handed over, after the claim settles, and no other", async () => {
     const second = claimedRow('box_2');
     const { effects, log } = fakePool([claimedRow('box_1'), second], ['box_1']);

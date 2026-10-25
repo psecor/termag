@@ -16,13 +16,19 @@
  * With no spaces at all it makes no AWS call, so a deployment that never
  * turns the flag on never needs the bucket.
  */
-import type { OpenUpload, SpaceObjects } from './spaceObjects';
+import type { ObjectVersion, OpenUpload, SpaceObjects } from './spaceObjects';
 import { spacePrefix } from './spacePaths';
 import type { LiveCharge, SpaceStore } from './spaceStore';
 
 export const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 export const EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 export const MULTIPART_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long an expired charge is kept for matching versions to charges: the
+ * longest a signed URL lives (PART_TTL_S in routes/spaces.ts), so a version an
+ * expired URL wrote is never mistaken for a live charge's.
+ */
+export const CHARGE_MATCH_WINDOW_MS = 30 * 60 * 1000;
 /** A deleted space's uploads are all aborted, however recent. */
 const ABORT_ALL = new Date(8.64e15);
 
@@ -32,7 +38,7 @@ export async function sweepSpaces(store: SpaceStore, objects: () => Promise<Spac
   const result: SweepResult = { purged: 0, recounted: 0, uploadsAborted: 0, grantsPruned: 0, eventsPruned: 0, errors: [] };
   result.grantsPruned = await store.pruneTerminatedGrants();
   result.eventsPruned = await store.pruneEvents(new Date(now - EVENT_RETENTION_MS));
-  await store.pruneCharges(new Date(now));
+  await store.pruneCharges(new Date(now - CHARGE_MATCH_WINDOW_MS));
 
   const [deleted, live] = await Promise.all([store.deletedSpaces(), store.liveSpaces()]);
   if (deleted.length === 0 && live.length === 0) return result;
@@ -50,13 +56,15 @@ export async function sweepSpaces(store: SpaceStore, objects: () => Promise<Spac
   }
   for (const space of live) {
     try {
-      // Read before listing, so every charged upload that is still open shows up in the listing.
-      const charges = await store.liveCharges(space.id, new Date(now));
+      // Read before listing, so every charged write that has landed shows up in the listings.
+      const charges = await store.chargesLiveAfter(space.id, new Date(now - CHARGE_MATCH_WINDOW_MS));
       const uploads = await s3.sweepMultipart(spacePrefix(space.id), new Date(now - MULTIPART_MAX_AGE_MS));
       result.uploadsAborted += uploads.aborted;
-      const settled = await settledCharges(s3, charges, new Set(uploads.inProgress.map(u => u.uploadId)));
-      const stored = await s3.sumVersions(spacePrefix(space.id)) + uncoveredPartBytes(uploads.inProgress, charges);
-      await store.recountUsedBytes(space.id, stored, new Date(now), settled);
+      const watch = new Set(charges.flatMap(c => c.key && !c.uploadId ? [c.key] : []));
+      const versions = await s3.sumVersions(spacePrefix(space.id), watch);
+      const settled = settledCharges(charges, new Set(uploads.inProgress.map(u => u.uploadId)), versions.watched);
+      const live = charges.filter(c => c.liveUntil.getTime() > now);
+      await store.recountUsedBytes(space.id, versions.total + uncoveredPartBytes(uploads.inProgress, live), new Date(now), settled);
       result.recounted++;
     } catch (err) {
       result.errors.push(`recount ${space.id}: ${(err as Error).message}`);
@@ -66,31 +74,41 @@ export async function sweepSpaces(store: SpaceStore, objects: () => Promise<Spac
 }
 
 /**
- * Live charges whose bytes S3 already holds, so the recount must not add them
+ * Charges whose bytes S3 already holds, so the recount must not add them
  * again: a part batch whose upload is no longer open (completed, so its parts
- * are a version now, or aborted), and a single PUT whose object has a version
- * written since the charge (S3's LastModified has whole seconds). A move's
- * charge (no key) is always kept until it expires.
+ * are a version now, or aborted), and a single PUT matched to a version of its
+ * key. A signed PUT binds its content length, so a version can only be a
+ * charge's of the same size signed before it was written and not expired by
+ * then (S3's LastModified has whole seconds); each version settles at most one charge, the earliest
+ * such, so a second URL for the same key stays charged until its own version
+ * lands. A move's charge (no key) is kept until it expires.
  */
-export async function settledCharges(s3: SpaceObjects, charges: LiveCharge[], open: Set<string>): Promise<string[]> {
+export function settledCharges(charges: LiveCharge[], open: Set<string>, versions: ObjectVersion[]): string[] {
   const settled: string[] = [];
-  const heads = new Map<string, Promise<Date | null>>();
+  const puts = new Map<string, LiveCharge[]>();
   for (const c of charges) {
     if (c.uploadId) {
       if (!open.has(c.uploadId)) settled.push(c.id);
-      continue;
+    } else if (c.key) {
+      puts.set(c.key, [...(puts.get(c.key) ?? []), c]);
     }
-    if (!c.key) continue;
-    if (!heads.has(c.key)) heads.set(c.key, s3.head(c.key).then(h => h?.lastModified ?? null));
-    const landed = await heads.get(c.key)!;
-    if (landed && landed.getTime() >= Math.floor(c.createdAt.getTime() / 1000) * 1000) settled.push(c.id);
+  }
+  for (const c of puts.values()) c.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  for (const v of [...versions].sort((a, b) => a.lastModified.getTime() - b.lastModified.getTime())) {
+    const candidates = puts.get(v.key);
+    const i = candidates?.findIndex(c => c.bytes === v.size
+      && Math.floor(c.createdAt.getTime() / 1000) * 1000 <= v.lastModified.getTime()
+      && v.lastModified.getTime() <= c.liveUntil.getTime()) ?? -1;
+    if (i < 0) continue;
+    settled.push(candidates![i].id);
+    candidates!.splice(i, 1);
   }
   return settled;
 }
 
-/** Bytes of an open upload's parts that no live charge paid for (their charge expired, or there never was one). */
-export function uncoveredPartBytes(uploads: OpenUpload[], charges: LiveCharge[]): bigint {
-  const covered = new Set(charges.flatMap(c => c.uploadId ? c.partNumbers.map(n => `${c.uploadId}:${n}`) : []));
+/** Bytes of an open upload's parts that none of `live` paid for (their charge expired, or there never was one). */
+export function uncoveredPartBytes(uploads: OpenUpload[], live: LiveCharge[]): bigint {
+  const covered = new Set(live.flatMap(c => c.uploadId ? c.partNumbers.map(n => `${c.uploadId}:${n}`) : []));
   let total = 0n;
   for (const u of uploads) for (const p of u.parts) if (!covered.has(`${u.uploadId}:${p.partNumber}`)) total += p.bytes;
   return total;

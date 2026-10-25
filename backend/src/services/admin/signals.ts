@@ -5,6 +5,7 @@
  * mirror frontend/src/utils/thresholds.ts where a personal equivalent exists.
  */
 import type { SessionRow } from '../sessionInventory';
+import { projectKindTraits } from '../projectKind';
 import type { Capacity, CloudSignalSession } from './claudeRunnerQueries';
 
 export const THRESHOLDS = {
@@ -270,7 +271,7 @@ export function buildSignals(input: SignalsInput, now: number): Signal[] {
   const staleCutoff = now - T.staleProjectDays * 86_400_000;
   const staleByUser = new Map<string, { unixUsername: string; projects: SignalProject[] }>();
   for (const p of input.projects) {
-    if (p.archived || p.kind !== 'normal' || p.lastActiveAt.getTime() > staleCutoff) continue;
+    if (p.archived || !projectKindTraits(p.kind).listedAsWork || p.lastActiveAt.getTime() > staleCutoff) continue;
     const e = staleByUser.get(p.userId) ?? { unixUsername: p.unixUsername, projects: [] };
     e.projects.push(p); staleByUser.set(p.userId, e);
   }

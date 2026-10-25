@@ -25,6 +25,12 @@ declare global {
       claudeSessionSeq: number;
       /** Daily briefing schedule, read through services/briefing/schedule.ts ({} = off). */
       briefingSchedule: Prisma.JsonValue;
+      /** Where orphaned spawns go, {projectId, workstream}; read through services/spawnOrphans.ts. */
+      spawnOrphanHome: Prisma.JsonValue;
+      /** Phone push replaces this owner's Slack/Discord "needs input" posts. */
+      pushMutesChat: boolean;
+      /** Notify when a chat this user can see finishes its turn. */
+      chatTurnNotify: boolean;
     }
 
     interface Request {
@@ -65,6 +71,15 @@ export interface AgentStatus {
    * `updatedAt` can't serve: meta writes bump it.
    */
   stoppedAt?: Date | null;
+  /**
+   * When `status` last changed to its current value. Carried unchanged by
+   * every write that keeps the status (meta writes, a repeated setStatus), so
+   * the `agent.status.changed` event's previousStatusSeconds is the status's
+   * duration, not the time since the last write. Not persisted: a hydrated
+   * working entry gets the span's start, anything else falls back to
+   * `updatedAt`.
+   */
+  statusSince?: Date;
   /**
    * The agent just reached a natural "shrink the context" point (opened or
    * merged a PR), reported by the PostToolUse hook. Cleared on dismiss, when

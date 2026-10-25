@@ -69,6 +69,9 @@ const sendForProject = vi.fn(async (_host: unknown, type: string, payload: Recor
 });
 
 vi.mock('../db', () => ({ prisma }));
+// The viewer is offered Fireworks unless a test says otherwise (services/fireworksFlag.ts fireworksOfferedTo).
+const offered = vi.hoisted(() => ({ value: { defaultModel: 'accounts/fireworks/models/kimi-k3', fastModel: 'accounts/fireworks/models/kimi-k3', models: [{ id: 'accounts/fireworks/models/kimi-k3', label: 'Kimi K3', context: null }] } as unknown }));
+vi.mock('../services/fireworksFlag', () => ({ fireworksOfferedTo: vi.fn(async () => offered.value) }));
 vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn(), requireAuthOrAgentToken: vi.fn() }));
 vi.mock('../slack/channels', () => ({ createProjectChannel: vi.fn(async () => null) }));
 vi.mock('../slack/lts', () => ({ setNotificationTarget: vi.fn() }));
@@ -274,6 +277,56 @@ describe('repo create checkout', () => {
     expect(prisma.project.findFirst.mock.calls[0][0].where).toEqual({
       userId: 'u1', name: 'notes', archived: true,
     });
+  });
+
+  it('un-archives onto the backend and model the New project form picked', async () => {
+    state.box = box('ec2');
+    for (const [backend, model] of [[null, 'sonnet'], ['fireworks', null]] as const) {
+      prisma.workflow.create.mockClear();
+      prisma.project.findFirst.mockResolvedValueOnce({
+        id: 'old', name: 'notes', archived: true, instanceId: 'box1', workflows: [], workstreams: [],
+      });
+      const result = await createProjectFor(user, {
+        name: 'notes',
+        instanceId: 'box1',
+        initialAgent: { enabled: true, provider: 'claude', backend, model },
+      });
+      expect(result.status).toBeLessThan(300);
+      expect(prisma.workflow.create.mock.calls[0][0].data).toMatchObject({ provider: 'claude', backend, model });
+    }
+  });
+
+  it("keeps a simple-UI chat's model on its agent row, not the project", async () => {
+    state.box = box('ec2');
+    const result = await createProjectFor(user, {
+      name: 'notes',
+      instanceId: 'box1',
+      initialAgent: { enabled: true, provider: 'claude-chat' },
+      claudeModel: 'haiku',
+    });
+    expect(result.status).toBe(201);
+    expect(prisma.project.create.mock.calls[0][0].data).not.toHaveProperty('claudeModel');
+    expect(prisma.workflow.create.mock.calls[0][0].data).toMatchObject({ provider: 'claude-chat', backend: null, model: 'haiku' });
+  });
+
+  it('refuses Fireworks with no model named while the creator is not offered it', async () => {
+    state.box = box('ec2');
+    const was = offered.value;
+    offered.value = null;
+    try {
+      const result = await createProjectFor(user, { name: 'notes', instanceId: 'box1', initialAgent: { enabled: true, provider: 'claude', backend: 'fireworks' } });
+      expect(result).toEqual({ status: 400, body: { error: 'Fireworks models are not on for you' } });
+      expect(prisma.project.create).not.toHaveBeenCalled();
+    } finally { offered.value = was; }
+  });
+
+  it('refuses Fireworks for a host project: only a box gets its credentials', async () => {
+    const result = await createProjectFor(user, {
+      name: 'notes',
+      initialAgent: { enabled: true, provider: 'claude', backend: 'fireworks' },
+    });
+    expect(result).toEqual({ status: 400, body: { error: 'Fireworks models run only on a box' } });
+    expect(prisma.project.create).not.toHaveBeenCalled();
   });
 
   it('refuses a repo create when that name is archived on this box', async () => {

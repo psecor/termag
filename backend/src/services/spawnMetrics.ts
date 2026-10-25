@@ -29,6 +29,7 @@ interface Instruments {
   reports: Counter;
   nudges: Counter;
   ends: Counter;
+  lifecycle: Counter;
   timeToReport: Histogram;
   nudgeDelay: Histogram;
   lifetime: Histogram;
@@ -52,6 +53,7 @@ function inst(): Instruments {
     reports: meter.createCounter('termag.spawn.reports', { description: 'report_back calls by status' }),
     nudges: meter.createCounter('termag.spawn.nudges', { description: 'Report notices typed into a parent pane' }),
     ends: meter.createCounter('termag.spawn.ends', { description: 'Spawned agents that went away, by how' }),
+    lifecycle: meter.createCounter('termag.spawn.lifecycle', { description: 'Parks, resumes, retires, refused retires, adoptions and orphanings, by who' }),
     timeToReport: meter.createHistogram('termag.spawn.time_to_report', { ...seconds, description: 'From spawn to its first report' }),
     nudgeDelay: meter.createHistogram('termag.spawn.nudge_delay', { ...seconds, description: 'From a report to the parent being told' }),
     lifetime: meter.createHistogram('termag.spawn.lifetime', { ...seconds, description: 'From spawn to end' }),
@@ -128,12 +130,20 @@ export function emitSpawnEvent(e: SpawnSignal): void {
         if (s !== undefined) i.lifetime.record(s, compact({ 'termag.spawn.end_how': str(e.reason) }));
         break;
       }
+      case 'parked':
+      case 'resumed':
+      case 'retired':
+      case 'retire_refused':
+      case 'adopted':
+      case 'orphaned':
+        i.lifecycle.add(1, compact({ ...who, 'termag.spawn.action': e.kind, 'termag.spawn.by': str(e.reason) }));
+        break;
       default:
         break;
     }
     logs.getLogger(SCOPE).emit({
       eventName: `termag.spawn.${e.kind}`,
-      severityNumber: e.kind === 'refused' || e.kind === 'failed' ? SeverityNumber.WARN : SeverityNumber.INFO,
+      severityNumber: e.kind === 'refused' || e.kind === 'failed' || e.kind === 'retire_refused' || e.kind === 'orphaned' ? SeverityNumber.WARN : SeverityNumber.INFO,
       body: `spawn ${e.kind}${e.reason ? ` (${e.reason})` : ''}`,
       attributes: compact({
         ...who,
@@ -152,7 +162,7 @@ export function emitSpawnEvent(e: SpawnSignal): void {
 }
 
 /** Time a sweep and count its failures; rethrows so callers keep their own logging. */
-export async function timedSweep<T>(sweep: 'nudge' | 'end' | 'sample' | 'gauges', fn: () => Promise<T>): Promise<T> {
+export async function timedSweep<T>(sweep: 'nudge' | 'end' | 'sample' | 'gauges' | 'lifecycle' | 'orphans', fn: () => Promise<T>): Promise<T> {
   const start = performance.now();
   try {
     return await fn();

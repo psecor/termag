@@ -13,6 +13,7 @@
  */
 
 import { prisma } from '../db';
+import { WORK_PROJECT_KINDS } from './projectKind';
 import { isProjectAgentConnected, sendForProject, type ProjectHost } from './agentRegistry';
 import { getGithubBrokerUrl } from './githubBroker';
 import type { BranchState, LinkableWorkstream } from './prPipeline';
@@ -145,7 +146,8 @@ export async function sweepBranches(
 /** Every live workstream of the user's own (non-MetaTerm) projects, with where it lives. */
 export async function workstreamTargets(userId: string): Promise<WorkstreamTarget[]> {
   const rows = await prisma.workstream.findMany({
-    where: { archived: false, project: { userId, archived: false, kind: 'normal' } },
+    // An ask's chat has no checkout of its own (services/askChat.ts).
+    where: { archived: false, askThread: null, project: { userId, archived: false, kind: { in: WORK_PROJECT_KINDS } } },
     select: {
       name: true,
       branch: true,

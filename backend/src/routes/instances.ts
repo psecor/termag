@@ -38,14 +38,14 @@ import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { PowerAction, powerRequestError } from '../services/boxPowerPolicy';
+import { recordProductEvent } from '../services/productEvents';
 import { PowerRequestConflict, requestPower } from '../services/boxPower';
-import { recentAutoTerminations, setBoxLifecycle } from '../services/boxLifecycle';
-import { lifecycleSettingsError, lifecycleView, parseLifecycleSettings } from '../services/boxLifecyclePolicy';
-import { warmPoolConfigFromEnv } from '../config/env';
+import { lifecycleViewFor, recentAutoTerminations, setBoxLifecycle } from '../services/boxLifecycle';
+import { lifecycleSettingsError, parseLifecycleSettings } from '../services/boxLifecyclePolicy';
 import { boolVariation } from '../services/featureFlags';
 import { boxImageSelectionFor, isPublished, PUBLISHED_IMAGE } from '../services/boxImage';
 import { ownerHibernationEnabled, poolHibernationEnabled } from '../services/boxHibernationFlag';
-import { currentPoolSpecHash, reconcileWarmPool } from '../services/warmPool';
+import { poolSpecHashOrNull, reconcileWarmPool } from '../services/warmPool';
 import { isInstanceAgentConnected, sendToInstanceAgent } from '../services/agentRegistry';
 import { revokeChats } from '../services/chatRevoke';
 import {
@@ -55,9 +55,11 @@ import {
   WARM_POOL_ENABLED_FLAG,
 } from '../services/warmPoolClaim';
 import { BOX_NAME_ERROR, isValidBoxName } from '../services/boxNames';
+import { boxRenameEnabled, boxTokenName, checkBoxRename, RENAME_DISABLED_CODE } from '../services/boxRename';
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { RouteResult, sendResult } from './routeResult';
 import { parseClaimTiming } from '../services/repoCreate';
+import { notifyOnSuccess } from '../services/workspaceEvents';
 
 
 function hashToken(token: string): string {
@@ -66,31 +68,6 @@ function hashToken(token: string): string {
 
 function generateToken(): string {
   return 'tmag_' + randomBytes(32).toString('hex');
-}
-
-/**
- * The hash the claim statement filters on, or null when there is no point
- * asking for one.
- *
- * Deriving it costs a DescribeImages call, so two indexed reads come first: a
- * target of 0 means the pool should not exist and every claim takes the cold
- * path (WP-2), and an empty pool has nothing for the statement to match. Both
- * are the common case on a deployment that has not opted in, and neither
- * should make a user's click wait on AWS. The cache in #104 is what makes the
- * call itself cheap once it is warranted.
- *
- * Failing soft matters more than the call: an AWS hiccup should cost the user
- * a cold box, not an error.
- */
-async function poolSpecHashOrNull(): Promise<string | null> {
-  if (warmPoolConfigFromEnv(process.env).targetSize <= 0) return null;
-  if (await prisma.instance.count({ where: { userId: null, status: 'warm' } }) === 0) return null;
-  try {
-    return await currentPoolSpecHash();
-  } catch (err) {
-    console.warn('[POOL] claim skipped, no pool spec hash:', err instanceof Error ? err.message : String(err));
-    return null;
-  }
 }
 
 /** Whether the owner's box-hibernation-enabled value is the pool's, so a pool box is what they would have launched. */
@@ -137,6 +114,14 @@ export async function createBox(
   user: Express.User,
   input: { name?: unknown; kind?: unknown },
   opts: { requestHost?: string; parentInstanceId?: string | null } = {},
+): Promise<RouteResult> {
+  return notifyOnSuccess(await createBoxRow(user, input, opts), user.id, 'boxes');
+}
+
+async function createBoxRow(
+  user: Express.User,
+  input: { name?: unknown; kind?: unknown },
+  opts: { requestHost?: string; parentInstanceId?: string | null },
 ): Promise<RouteResult> {
   const { name, kind: rawKind } = input;
   if (!name || typeof name !== 'string' || !name.trim()) {
@@ -201,6 +186,9 @@ export async function createBox(
           // Un-awaited so the refill is under way before the browser has
           // rendered the row, and never on this request's critical path.
           void reconcileWarmPool();
+          recordProductEvent('box.provisioned', { user: user.id, box: outcome.instance.id }, {
+            boxKind: 'ec2', warmClaimed: true, claimMs: Date.now() - startedAt, child: !!opts.parentInstanceId,
+          });
           return { status: 201, body: { instance: outcome.instance, claimed: true } };
         }
         console.log(`[POOL] claim fell through for ${user.unixUsername}: ${outcome.reason} after ${outcome.candidatesTried} candidate(s)`);
@@ -228,12 +216,20 @@ export async function createBox(
         data: {
           userId: user.id,
           instanceId: created.id,
-          name: `box: ${trimmed}`,
+          name: boxTokenName(trimmed),
           tokenHash,
           tokenPrefix,
         },
       });
       return created;
+    });
+
+    // "Provisioned" as in asked for: the row exists and the launch is under
+    // way (or, external, the owner's own agent is awaited). The ready
+    // transition is the agent's hello, which the box telemetry covers.
+    recordProductEvent('box.provisioned', { user: user.id, box: instance.id }, {
+      boxKind: kind, warmClaimed: false, child: !!opts.parentInstanceId,
+      provisioning: kind === 'external' ? 'external' : isBoxProvisioningConfigured() ? 'orchestrator' : 'manual',
     });
 
     if (kind === 'external') {
@@ -308,6 +304,11 @@ export async function createBox(
 // If the box has live (non-archived) projects, returns 409 with the
 // list. The client must re-send with `confirmed`.
 export async function terminateOwnedBox(user: Express.User, id: string, confirmed: boolean): Promise<RouteResult> {
+  // Its live projects are archived with it, so both lists change.
+  return notifyOnSuccess(await terminateBoxRow(user, id, confirmed), user.id, ['boxes', 'projects']);
+}
+
+async function terminateBoxRow(user: Express.User, id: string, confirmed: boolean): Promise<RouteResult> {
   const instance = await prisma.instance.findFirst({
     where: { id, userId: user.id },
     include: {
@@ -399,11 +400,15 @@ export async function terminateOwnedBox(user: Express.User, id: string, confirme
 // status; the power sweep settles `stopping` to `stopped`, and the agent's
 // connect settles `starting` to `ready`.
 export async function powerOwnedBox(user: Express.User, id: string, action: PowerAction): Promise<RouteResult> {
+  return notifyOnSuccess(await powerBoxRow(user, id, action), user.id, 'boxes');
+}
+
+async function powerBoxRow(user: Express.User, id: string, action: PowerAction): Promise<RouteResult> {
   const instance = await prisma.instance.findUnique({ where: { id } });
   const refused = powerRequestError(instance, user.id, action, isBoxProvisioningConfigured());
   if (refused) return { status: refused.status, body: { error: refused.error } };
   try {
-    const status = await requestPower(instance!, action, { markInUse: action === 'start' });
+    const status = await requestPower(instance!, action, { markInUse: action === 'start', byOwner: true });
     return { status: 202, body: { ok: true, status } };
   } catch (err) {
     if (err instanceof PowerRequestConflict) return { status: 409, body: { error: err.message } };
@@ -426,7 +431,46 @@ export async function setOwnedBoxLifecycle(user: Express.User, id: string, body:
   if (refused) return { status: 409, body: { error: refused } };
   await setBoxLifecycle(instance.id, parsed.settings);
   const row = await prisma.instance.findUniqueOrThrow({ where: { id: instance.id } });
-  return { status: 200, body: { lifecycle: lifecycleView(row) } };
+  return { status: 200, body: { lifecycle: await lifecycleViewFor(user, row) } };
+}
+
+// Rename a box (services/boxRename.ts). Owner only; another user's box answers
+// 404 like a missing one. Its agent token's label follows when it still
+// carries the old name. Project lists show box names, so both lists change.
+export async function renameOwnedBox(user: Express.User, id: string, newName: unknown): Promise<RouteResult> {
+  return notifyOnSuccess(await renameBoxRow(user, id, newName), user.id, ['boxes', 'projects']);
+}
+
+async function renameBoxRow(user: Express.User, id: string, newName: unknown): Promise<RouteResult> {
+  if (!await boxRenameEnabled(user)) {
+    return { status: 403, body: { error: 'Renaming boxes is not enabled for you', code: RENAME_DISABLED_CODE } };
+  }
+  const instance = await prisma.instance.findFirst({ where: { id, userId: user.id } });
+  const check = checkBoxRename(instance, newName);
+  if (!check.ok) return { status: check.status, body: { error: check.error } };
+  if (check.unchanged) return { status: 200, body: { instance } };
+
+  const conflict = { status: 409, body: { error: `A box named "${check.name}" already exists` } };
+  const taken = await prisma.instance.findFirst({
+    where: { userId: user.id, name: check.name, status: { not: 'terminated' }, id: { not: id } },
+    select: { id: true },
+  });
+  if (taken) return conflict;
+
+  try {
+    const [renamed] = await prisma.$transaction([
+      prisma.instance.update({ where: { id }, data: { name: check.name } }),
+      prisma.agentToken.updateMany({
+        where: { instanceId: id, name: boxTokenName(instance!.name) },
+        data: { name: boxTokenName(check.name) },
+      }),
+    ]);
+    console.log(`[BOX] ${user.unixUsername} renamed box ${id} from "${instance!.name}" to "${check.name}"`);
+    return { status: 200, body: { instance: renamed } };
+  } catch (err) {
+    if (isNameConflict(err)) return conflict;
+    throw err;
+  }
 }
 
 export function instancesRouter(): Router {
@@ -439,7 +483,7 @@ export function instancesRouter(): Router {
       include: { _count: { select: { projects: true } } },
       orderBy: { createdAt: 'desc' },
     });
-    res.json(instances.map(i => ({ ...i, lifecycle: lifecycleView(i) })));
+    res.json(await Promise.all(instances.map(async i => ({ ...i, lifecycle: await lifecycleViewFor(req.user!, i) }))));
   };
 
   // Single box. Includes project list (id+name only) for the delete-confirm UI.
@@ -556,6 +600,9 @@ export function instancesRouter(): Router {
   router.post('/:id/stop', requireAuth, asyncHandler(power('stop')));
   router.post('/:id/start', requireAuth, asyncHandler(power('start')));
   router.post('/:id/hibernate', requireAuth, asyncHandler(power('hibernate')));
+  router.post('/:id/rename', requireAuth, asyncHandler(async (req, res) => {
+    sendResult(res, await renameOwnedBox(req.user!, req.params.id, req.body?.name));
+  }));
   router.patch('/:id/lifecycle', requireAuth, asyncHandler(async (req, res) => {
     sendResult(res, await setOwnedBoxLifecycle(req.user!, req.params.id, req.body));
   }));

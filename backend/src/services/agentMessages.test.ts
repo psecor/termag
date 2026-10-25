@@ -1,7 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import {
+  ASK_CHAT_CAPABILITY,
+  askChatSendRefusal,
+  askChatWorkstreamName,
+  MAX_ACTIVE_ASKS,
   MAX_PROMPT_BYTES,
   askBranch,
+  askPrBranch,
+  askPrKeyOfRef,
+  MAX_ASK_PRS,
+  threadPrs,
+  capRefusal,
+  ownerOnlyRefusal,
   askTarget,
   cancelDecision,
   cancelShouldStop,
@@ -9,6 +19,10 @@ import {
   lostRunReason,
   START_RPC_MS,
   QUEUE_TTL_MS,
+  SETUP_QUEUE_TTL_MS,
+  isProjectSettingUp,
+  queuedDeadline,
+  queueExpiryReason,
   askRoute,
   shouldQueue,
   startFailureAction,
@@ -17,6 +31,11 @@ import {
   deadlineAfterStart,
   isParking,
   markPrBody,
+  replaceMarkedBody,
+  capDescription,
+  splitDescription,
+  commitDescription,
+  PR_DESCRIPTION_MAX,
   messageView,
   parseAskBody,
   parseAskRef,
@@ -110,11 +129,37 @@ describe('askBranch and askTarget', () => {
   });
 });
 
+describe('askPrBranch / askPrKeyOfRef', () => {
+  it("publishes the run's own branch on the thread branch and pr/<name> beside it", () => {
+    expect(askPrBranch('ada', 't1', '')).toBe(askBranch('ada', 't1'));
+    expect(askPrBranch('ada', 't1', 'docs')).toBe(`${askBranch('ada', 't1')}-docs`);
+  });
+
+  it('reads the key off a bundle ref, and nothing off any other ref', () => {
+    expect(askPrKeyOfRef('HEAD')).toBe('');
+    expect(askPrKeyOfRef('refs/heads/ask')).toBe('');
+    expect(askPrKeyOfRef('refs/heads/pr/docs-2')).toBe('docs-2');
+    for (const r of ['refs/heads/main', 'refs/heads/pr/Docs', 'refs/heads/pr/a/b', 'refs/heads/pr/-x', `refs/heads/pr/${'a'.repeat(41)}`, 'refs/tags/pr/x']) {
+      expect(askPrKeyOfRef(r)).toBeNull();
+    }
+  });
+});
+
 describe('parseRunResult', () => {
   it('keeps well-formed fields and drops the rest', () => {
     expect(parseRunResult({
-      result: 'ok', sessionId: 'bad id!', numTurns: -1, baseSha: 'xyz', repo: 'a/../b', isError: 'yes', bundle: 1,
-    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false });
+      result: 'ok', sessionId: 'bad id!', numTurns: -1, baseSha: 'xyz', repo: 'a/../b', isError: 'yes', bundle: 1, prDescription: 7,
+    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {} });
+    expect(parseRunResult({ result: 'ok', prDescription: '  \n' })).toMatchObject({ prDescription: null });
+    expect(parseRunResult({ result: 'ok', prDescription: '# T\nbody' })).toMatchObject({ prDescription: '# T\nbody' });
+  });
+
+  it('keeps a description per valid pr/<name> key, and no more than a thread has PRs', () => {
+    expect(parseRunResult({ result: 'ok', prDescriptions: { docs: '# D', 'Bad Key': 'x', empty: ' ', n: 3, '': 'own' } }).prDescriptions)
+      .toEqual({ docs: '# D' });
+    expect(parseRunResult({ result: 'ok', prDescriptions: ['x'] }).prDescriptions).toEqual({});
+    const many = Object.fromEntries(Array.from({ length: MAX_ASK_PRS + 5 }, (_, i) => [`k${i}`, 'd']));
+    expect(Object.keys(parseRunResult({ result: 'ok', prDescriptions: many }).prDescriptions)).toHaveLength(MAX_ASK_PRS);
   });
 
   it('keeps the whole reply: only the JSON body limit bounds it', () => {
@@ -143,15 +188,65 @@ describe('replyEnvelope', () => {
 });
 
 describe('runSystemPrompt', () => {
-  it('names the sender, the branch and the sharing', () => {
-    const p = runSystemPrompt({ senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t', shared: true });
+  it('names the sender and the branch, and says the run is the owner in a clone', () => {
+    const p = runSystemPrompt({ senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' });
     expect(p).toContain('Bob (bob)');
     expect(p).toContain('termag-bob/t');
-    expect(p).toContain('shared with the sender');
+    expect(p).toContain('as the box owner');
+    expect(p).toContain('Work only in this clone');
     expect(p).toContain('never push');
-    expect(p).toContain('no network access');
+    expect(p).not.toMatch(/sandbox|no network/);
   });
 
+  it('tells the run where a PR description goes, outside the git tree', () => {
+    const p = runSystemPrompt({ senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' });
+    expect(p).toContain('TERMAG_ASK_PR_BODY_FILE');
+    expect(p).toContain('never commit it');
+    expect(p).toContain('commit messages');
+  });
+
+  it('explains pr/<name> branches only when the box set TERMAG_ASK_PR_DIR', () => {
+    const p = runSystemPrompt({ senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' });
+    expect(p).toContain('TERMAG_ASK_PR_DIR');
+    expect(p).toContain('git switch -c pr/<name> termag/base');
+    expect(p).toContain('termag-bob/t-<name>');
+    expect(p).toContain(`${MAX_ASK_PRS}`);
+  });
+});
+
+describe('ownerOnlyRefusal', () => {
+  const t = { project: 'api', projectOwnerId: 'ada', box: 'devbox', boxOwnerId: 'ada' };
+
+  it('lets the owner of both the project and its box ask', () => {
+    expect(ownerOnlyRefusal(t, 'ada')).toBeNull();
+  });
+
+  it('refuses a project that is only shared with the asker', () => {
+    expect(ownerOnlyRefusal({ ...t, projectOwnerId: 'bob', boxOwnerId: 'bob' }, 'ada'))
+      .toEqual({ status: 403, code: 'not_owner', error: expect.stringContaining('api is not your project') });
+  });
+
+  it("refuses the asker's own project on somebody else's box", () => {
+    expect(ownerOnlyRefusal({ ...t, boxOwnerId: 'bob' }, 'ada'))
+      .toEqual({ status: 403, code: 'not_owner', error: expect.stringContaining('devbox is not your box') });
+    expect(ownerOnlyRefusal({ ...t, boxOwnerId: null }, 'ada')).toMatchObject({ code: 'not_owner' });
+  });
+
+  it('leaves a project with no box to the no_box refusal', () => {
+    expect(ownerOnlyRefusal({ ...t, box: null, boxOwnerId: null }, 'ada')).toBeNull();
+  });
+});
+
+describe('capRefusal', () => {
+  it(`lets an ask through below ${MAX_ACTIVE_ASKS} active asks`, () => {
+    expect(MAX_ACTIVE_ASKS).toBe(10);
+    expect(capRefusal(0)).toBeNull();
+    expect(capRefusal(MAX_ACTIVE_ASKS - 1)).toBeNull();
+  });
+
+  it('refuses one more at the cap, saying how to free a slot', () => {
+    expect(capRefusal(MAX_ACTIVE_ASKS)).toMatchObject({ code: 'too_many_asks', error: expect.stringContaining('--cancel') });
+  });
 });
 
 describe('messageView', () => {
@@ -163,6 +258,26 @@ describe('messageView', () => {
     const v = messageView(m, { id: 't', hopCount: 2, branch: 'termag-a/t', prNumber: 7, prUrl: 'https://x/7' }, 'box/p', 'hello');
     expect(v).toMatchObject({ reply: 'hello', hops: 2, pr: { number: 7, branch: 'termag-a/t' }, publish: { status: 'published' } });
     expect(messageView(m, { id: 't', hopCount: 2, branch: null, prNumber: null, prUrl: null }, 'box/p', null).pr).toBeNull();
+    expect(v.prs).toEqual([{ key: '', number: 7, url: 'https://x/7', branch: 'termag-a/t' }]);
+  });
+
+  it("lists every PR, the thread's own first, and keeps pr as the first for older CLIs", () => {
+    const m = {
+      id: 'm', threadId: 't', status: 'completed', hop: 1, error: null, numTurns: 1, replyBytes: 1,
+      publish: 'published', publishDetail: null, createdAt: new Date(0), startedAt: null, completedAt: null, readAt: null,
+    };
+    const t = {
+      id: 't', hopCount: 1, branch: 'b', prNumber: 7, prUrl: 'https://x/7',
+      prs: [
+        { key: 'docs', branch: 'b-docs', prNumber: 8, prUrl: 'https://x/8' },
+        { key: '', branch: 'b', prNumber: 7, prUrl: 'https://x/7' },
+      ],
+    };
+    const v = messageView(m, t, 'box/p', null);
+    expect(v.prs.map(p => p.key)).toEqual(['', 'docs']);
+    expect(v.pr).toMatchObject({ number: 7 });
+    expect(threadPrs({ ...t, branch: null, prNumber: null, prUrl: null, prs: [t.prs[0]] }).map(p => p.number)).toEqual([8]);
+    expect(messageView(m, { ...t, branch: null, prNumber: null, prUrl: null, prs: [t.prs[0]] }, 'box/p', null).pr).toMatchObject({ number: 8 });
   });
 
   it('says whether a poll got the reply once the text is gone', () => {
@@ -177,19 +292,49 @@ describe('messageView', () => {
 });
 
 describe('setupRefusal', () => {
-  it('refuses a project whose clone has not finished or failed', () => {
-    expect(setupRefusal({ name: 'api', setupStatus: 'pending', setupError: null })?.code).toBe('project_cloning');
-    expect(setupRefusal({ name: 'api', setupStatus: 'cloning', setupError: null })).toEqual({
-      error: 'api is still being set up (cloning); ask again once it is ready', code: 'project_cloning',
-    });
+  it('refuses a project whose clone failed', () => {
     expect(setupRefusal({ name: 'api', setupStatus: 'failed', setupError: 'Repository not found' })).toEqual({
       error: 'api failed to set up: Repository not found', code: 'project_failed',
     });
+    expect(setupRefusal({ name: 'api', setupStatus: 'failed', setupError: null })?.error).toBe('api failed to set up');
   });
 
-  it('lets a ready or plain project through', () => {
-    expect(setupRefusal({ name: 'api', setupStatus: 'ready', setupError: null })).toBeNull();
-    expect(setupRefusal({ name: 'api', setupStatus: 'none', setupError: null })).toBeNull();
+  it('lets a ready, plain or still cloning project through: an ask to a clone waits for it', () => {
+    for (const setupStatus of ['ready', 'none', 'pending', 'cloning']) {
+      expect(setupRefusal({ name: 'api', setupStatus, setupError: null })).toBeNull();
+    }
+  });
+});
+
+describe('isProjectSettingUp', () => {
+  it('is true only while the clone has not finished', () => {
+    expect(isProjectSettingUp('pending')).toBe(true);
+    expect(isProjectSettingUp('cloning')).toBe(true);
+    for (const s of ['none', 'ready', 'failed', '']) expect(isProjectSettingUp(s)).toBe(false);
+  });
+});
+
+describe('queuedDeadline', () => {
+  const now = Date.UTC(2026, 9, 21, 12, 0);
+  it('gives a parked box its window and a clone its longer one', () => {
+    expect(queuedDeadline({ box: true, setup: false }, now)).toEqual(new Date(now + QUEUE_TTL_MS));
+    expect(queuedDeadline({ box: false, setup: true }, now)).toEqual(new Date(now + SETUP_QUEUE_TTL_MS));
+    expect(SETUP_QUEUE_TTL_MS).toBeGreaterThan(QUEUE_TTL_MS);
+  });
+  it('takes the longer of the two when the ask waits for both', () => {
+    expect(queuedDeadline({ box: true, setup: true }, now)).toEqual(new Date(now + SETUP_QUEUE_TTL_MS));
+  });
+});
+
+describe('queueExpiryReason', () => {
+  it('blames the clone when the project is still being set up', () => {
+    expect(queueExpiryReason({ name: 'api', setupStatus: 'cloning' }))
+      .toBe('api was still being set up 30 minutes after the ask, so the ask never ran; check its clone and ask again');
+  });
+  it('blames the box otherwise', () => {
+    for (const p of [{ name: 'api', setupStatus: 'ready' }, { name: 'api', setupStatus: 'none' }, null]) {
+      expect(queueExpiryReason(p)).toBe('the box did not come up within 15 minutes of being started, so the ask never ran; start it and ask again');
+    }
   });
 });
 
@@ -415,14 +560,25 @@ describe('targetCard', () => {
     expect(targetAskable({ ...t, capabilities: [] })).toEqual({ askable: false, reason: expect.stringContaining("can't run asks") });
     expect(targetAskable({ ...t, connected: false, boxStatus: 'hibernated', capabilities: [], wakes: true }))
       .toEqual({ askable: true, reason: expect.stringContaining('an ask starts it') });
-    expect(targetAskable({ ...t, setupStatus: 'cloning' })).toEqual({ askable: false, reason: expect.stringContaining('still being set up (cloning)') });
     expect(targetAskable({ ...t, setupStatus: 'failed', setupError: 'clone refused' })).toEqual({ askable: false, reason: 'api failed to set up: clone refused' });
-    expect(targetAskable({ ...t, connected: false, boxStatus: 'stopped', wakes: true, setupStatus: 'cloning' }).askable).toBe(false);
+    expect(targetAskable({ ...t, connected: false, boxStatus: 'stopped', wakes: true, setupStatus: 'failed', setupError: null }).askable).toBe(false);
+  });
+
+  it('takes an ask to a project still cloning, which waits for the clone', () => {
+    expect(targetAskable({ ...t, setupStatus: 'cloning' }))
+      .toEqual({ askable: true, reason: 'api is still being set up (cloning); an ask waits for its clone and runs once it is ready (up to 30 minutes)' });
+    expect(targetAskable({ ...t, setupStatus: 'pending' }).askable).toBe(true);
+    expect(targetAskable({ ...t, connected: false, boxStatus: 'stopped', wakes: true, setupStatus: 'cloning' }).askable).toBe(true);
+  });
+
+  it('still refuses a cloning project the box could never run an ask for', () => {
+    expect(targetAskable({ ...t, setupStatus: 'cloning', capabilities: [] })).toEqual({ askable: false, reason: expect.stringContaining("can't run asks") });
+    expect(targetAskable({ ...t, setupStatus: 'cloning', connected: false, boxStatus: 'ready' })).toEqual({ askable: false, reason: expect.stringContaining('not connected (ready)') });
   });
 });
 
 describe('prBody', () => {
-  const input = { senderUsername: 'ada', target: 'dev/api', threadId: 'thr1234567890', shared: false, box: 'i-0abc123', project: 'api' };
+  const input = { senderUsername: 'ada', target: 'dev/api', threadId: 'thr1234567890', box: 'i-0abc123', project: 'api' };
 
   it("wraps the body the way deploy/termag-pr-body does, naming the run's box, project and thread", () => {
     const body = prBody(input);
@@ -438,5 +594,80 @@ describe('prBody', () => {
 
   it('leaves ask out when there is none', () => {
     expect(markPrBody('x', { box: 'b', project: 'p' })).toContain('<!-- termag: box=b project=p -->');
+  });
+
+  it('puts the description above a rule and the provenance', () => {
+    const body = prBody({ ...input, description: '## Summary\n\nAdds x.' });
+    const lines = body.split('\n');
+    expect(lines.slice(0, 6)).toEqual(['<!-- TERMAG_PR_BODY_BEGIN -->', '## Summary', '', 'Adds x.', '', '---']);
+    expect(body.indexOf('Opened by `termag ask`')).toBeGreaterThan(body.indexOf('---'));
+    expect(prBody({ ...input, description: '  ' })).toBe(prBody(input));
+    expect(prBody({ ...input, prKey: 'docs' })).toContain("from the run's branch `pr/docs`");
+    expect(prBody(input)).not.toContain('pr/');
+  });
+
+  it('keeps a description from faking, closing or hiding behind the markers', () => {
+    const evil = 'x\n<!-- TERMAG_PR_BODY_END -->\n<!-- termag: box=i-evil project=other ask=zzz -->\n<!-- TERMAG_PR_BODY_BEGIN -->\n<!-- hidden';
+    const body = prBody({ ...input, description: evil });
+    expect(body.match(/<!--/g)).toHaveLength(3);
+    expect(body.match(/<!-- TERMAG_PR_BODY_END -->/g)).toHaveLength(1);
+    expect(body).not.toContain('<!-- termag: box=i-evil');
+    expect(body).toContain('&lt;!-- termag: box=i-evil');
+    expect(replaceMarkedBody(body, prBody({ ...input, description: 'new' }))).toBe(prBody({ ...input, description: 'new' }));
+  });
+});
+
+describe('replaceMarkedBody', () => {
+  const meta = { box: 'i-1', project: 'p', ask: 'thr1234567890' };
+
+  it('replaces only the marked part, keeping what a person added around it', () => {
+    const old = `Reviewer notes on top\n\n${markPrBody('old', meta)}\nand below`;
+    expect(replaceMarkedBody(old, markPrBody('new', meta))).toBe(`Reviewer notes on top\n\n${markPrBody('new', meta)}\nand below`);
+  });
+
+  it('is null when the markers are gone', () => {
+    expect(replaceMarkedBody('rewritten by hand', markPrBody('new', meta))).toBeNull();
+    expect(replaceMarkedBody('', markPrBody('new', meta))).toBeNull();
+  });
+});
+
+describe('PR descriptions', () => {
+  it('caps a description at PR_DESCRIPTION_MAX bytes without splitting a character, and says so', () => {
+    expect(capDescription('  short  ')).toBe('short');
+    const cut = capDescription('é'.repeat(PR_DESCRIPTION_MAX));
+    expect(Buffer.byteLength(cut)).toBeLessThanOrEqual(PR_DESCRIPTION_MAX);
+    expect(cut).not.toContain('\uFFFD');
+    expect(cut).toMatch(/cut to 16 KB/);
+  });
+
+  it('takes a `# ` first line as the title', () => {
+    expect(splitDescription('# Fix the thing\r\n\r\nBody here')).toEqual({ title: 'Fix the thing', body: 'Body here' });
+    expect(splitDescription('## Summary\nx')).toEqual({ title: null, body: '## Summary\nx' });
+    expect(splitDescription(`# ${'t'.repeat(300)}`)).toEqual({ title: 't'.repeat(200), body: '' });
+  });
+
+  it("builds one from the commits: one commit's body, or subjects with bodies underneath", () => {
+    expect(commitDescription([{ subject: 'Fix x', body: 'Because y.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nGenerated-by: termag\n' }])).toBe('Because y.');
+    expect(commitDescription([{ subject: 'Fix x', body: '' }])).toBe('Fix x');
+    expect(commitDescription([{ subject: 'One', body: 'First why.' }, { subject: 'Two', body: '' }])).toBe(
+      '## Commits\n\n- One\n- Two\n\n### One\n\nFirst why.',
+    );
+    expect(commitDescription([])).toBe('');
+  });
+});
+
+describe('an ask thread\'s chat', () => {
+  const caps = [ASK_CHAT_CAPABILITY, 'chat-runner-v1'];
+  it('lives in a workstream named after its thread', () => {
+    expect(askChatWorkstreamName('cmabc123')).toBe('ask-cmabc123');
+  });
+  it('takes messages from the owner of the project and its box only', () => {
+    expect(askChatSendRefusal({ userId: 'u1', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: caps })).toBeNull();
+    expect(askChatSendRefusal({ userId: 'u2', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: caps })?.body.code).toBe('not_owner');
+    expect(askChatSendRefusal({ userId: 'u1', projectOwnerId: 'u1', boxOwnerId: 'u3', capabilities: caps })?.status).toBe(403);
+  });
+  it('needs a box agent that runs asks as chats', () => {
+    expect(askChatSendRefusal({ userId: 'u1', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: ['chat-runner-v1'] }))
+      .toMatchObject({ status: 409, body: { code: 'runner-missing' } });
   });
 });

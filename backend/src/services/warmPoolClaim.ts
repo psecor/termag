@@ -15,6 +15,7 @@
 
 import { Instance, Prisma, User } from '@prisma/client';
 import { prisma } from '../db';
+import { OWNED_BOX_SELECT, type OwnedBoxRow } from './ownedBoxRow';
 import { connectedInstanceIds, disownInstanceAgent, notifyInstanceClaimed, rebindInstanceOwner, sendToInstanceAgent, settleClaimedOwner } from './agentRegistry';
 import { syncBoxAuthorizedKeys } from './sshKeySync';
 import { deliverToInstance } from './credentialDelivery';
@@ -42,8 +43,26 @@ export interface ClaimRequest {
   owner: ClaimOwner;
   boxName: string;
   currentHash: string;
+  /**
+   * Asked again inside the claim's transaction, under serializable isolation,
+   * with the owner's non-terminated boxes as that snapshot sees them; a false
+   * answer takes no row. For a claim made on the owner's behalf
+   * (routes/claudeRunner.ts): its decision predates the transaction, and the
+   * name it picks dodges every existing row, so a unique-index clash alone
+   * would never say that another process got there first.
+   */
+  stillNeeded?: (owned: OwnedBoxRow[]) => boolean;
   /** The box whose credentials asked for this one (routes/instances.ts createBox), or null. */
   parentInstanceId: string | null;
+  /**
+   * Which of this process's live pool boxes the claim may take, by instance
+   * id; every one when absent. A pool hello carries the agent's capabilities,
+   * so a claimer that needs one (routes/claudeRunner.ts: a session owner
+   * without a termag GitHub credential needs `claude-runner-wrapper-v2`)
+   * says so here, before any row is taken,
+   * rather than owning a box it can never use.
+   */
+  eligible?: (instanceId: string) => boolean;
 }
 
 export interface ClaimEffects {
@@ -102,9 +121,11 @@ export type ClaimOutcome =
  * apart.
  */
 export async function claimWarmBox(req: ClaimRequest, effects: ClaimEffects): Promise<ClaimOutcome> {
-  const liveIds = effects.liveInstanceIds();
+  const liveIds = effects.liveInstanceIds().filter(id => req.eligible?.(id) ?? true);
   // No socket here means nothing this process could configure, whatever
-  // Postgres says, so no row is taken (and none is failed) for it.
+  // Postgres says, so no row is taken (and none is failed) for it. The same
+  // for a live box the request rules out: it stays in the pool for a claimer
+  // it suits.
   if (liveIds.length === 0) return { claimed: false, reason: 'no-warm-box', candidatesTried: 0 };
 
   for (let tried = 0; tried < MAX_CLAIM_CANDIDATES; tried++) {
@@ -186,6 +207,13 @@ export const prismaClaimEffects: ClaimEffects = {
  */
 async function takeWarmBox(req: ClaimRequest, liveIds: string[]): Promise<Instance | null> {
   return prisma.$transaction(async (tx) => {
+    if (req.stillNeeded) {
+      const owned = await tx.instance.findMany({
+        where: { userId: req.owner.id, status: { not: 'terminated' } },
+        select: OWNED_BOX_SELECT,
+      });
+      if (!req.stillNeeded(owned)) return null;
+    }
     const rows = await tx.$queryRaw<Instance[]>`
       UPDATE instances
       SET "userId" = ${req.owner.id},
@@ -219,7 +247,7 @@ async function takeWarmBox(req: ClaimRequest, liveIds: string[]): Promise<Instan
     });
 
     return claimed;
-  });
+  }, req.stillNeeded ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable } : undefined);
 }
 
 async function configureBox(instance: Instance, owner: ClaimOwner): Promise<BoxClaimAck> {

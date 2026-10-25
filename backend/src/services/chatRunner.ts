@@ -9,12 +9,54 @@
  */
 import { prisma } from '../db';
 import { onBoxAgentFrame } from './agentRegistry';
+import { classifyForeground } from './foregroundProbe';
 import { getAllStatuses, getStatus, notifyStatusChange, setStatus } from './status';
-import { parseStatusKey } from './statusKey';
+import { parseStatusKey, statusKey } from './statusKey';
+import { settleTurnPost } from './sessionTurns';
+import { TRUSTED_MODE, UNTRUSTED_MODE } from './chatTrust';
+import { pushOnChatTurn } from './chatTurnPush';
 import * as tmux from './tmux';
 
 export const CHAT_RUNNER_CAPABILITY = 'chat-runner-v1';
+/** The runner understands a trusted turn. chat-runner-v1 alone refuses any mode but dontAsk. */
+export const CHAT_TRUST_CAPABILITY = 'chat-trust-v1';
+/** The runner takes a message into the turn running (agent/chat-turn.js); without it a send queues. */
+export const CHAT_LIVE_CAPABILITY = 'chat-live-v1';
+export const CHAT_LIVE_INPUT_FLAG = 'chat-live-input-enabled';
+/** A send asks the runner for Claude's title for the session on each turn-end. */
+export const SESSION_TITLES_FLAG = 'simple-ui-session-titles-enabled';
+/** chat-interrupt takes scope 'turn': a live turn's Stop ends only Claude's current work and its background commands keep running. */
+export const CHAT_INTERRUPT_CAPABILITY = 'chat-interrupt-v1';
 export const CHAT_STATUS_SOURCE = 'chat-runner';
+/**
+ * The runner accepts `auto` (Claude Code's auto permission mode): a normal
+ * session whose classifier judges each tool call and denies instead of
+ * asking. Scheduled automation runs need it; an older runner answers mode-refused, which the scheduler reads as
+ * runner_outdated rather than quietly downgrading.
+ */
+export const CHAT_AUTO_CAPABILITY = 'chat-auto-v1';
+/** The runner appends the orchestrator system prompt to a send marked `orchestrator` (agent/chat-runner.js). */
+export const CHAT_ORCHESTRATOR_CAPABILITY = 'chat-orchestrator-v1';
+/**
+ * The runner starts a turn, and a resume, on the model backend a send or claim
+ * names (`backend`, with `fastModel` and `context`). An
+ * older runner would drop the backend and run the model on the default, so a
+ * chat on another backend is refused there instead.
+ */
+export const CHAT_BACKEND_CAPABILITY = 'chat-backend-v1';
+
+/** Where a chat's turns run (Workflow.backend), and Fireworks' fast model and window. Absent = the default backend. */
+export interface ChatBackend {
+  backend?: string | null;
+  fastModel?: string;
+  context?: number;
+}
+
+function backendFields(t: ChatBackend): Record<string, unknown> {
+  if (!t.backend) return {};
+  return { backend: t.backend, ...(t.fastModel ? { fastModel: t.fastModel } : {}), ...(t.context ? { context: t.context } : {}) };
+}
+export const AUTO_MODE = 'auto';
 export const MAX_CHAT_TEXT = 100_000;
 
 const WORKSTREAM_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -69,9 +111,9 @@ export function chatRequireCheckout(project: { repoUrl: string | null }): boolea
   return project.repoUrl != null;
 }
 
-/** The message a chat may send, or the reason it may not. */
-export function chatTextError(text: unknown): string | null {
-  if (typeof text !== 'string' || !text.trim()) return 'text is required';
+/** The message a chat may send, or the reason it may not. With images, the text may be empty (services/chatImages.ts). */
+export function chatTextError(text: unknown, hasImages = false): string | null {
+  if (typeof text !== 'string' || (!text.trim() && !hasImages)) return 'text is required';
   if (text.length > MAX_CHAT_TEXT) return `text is longer than ${MAX_CHAT_TEXT} characters`;
   return null;
 }
@@ -85,8 +127,229 @@ export function chatRpcFailure(message: string): { status: number; body: { error
   if (/Unknown command/.test(message)) return { status: 409, body: { error: "The box's agent predates the chat runner; restart it", code: 'runner-missing' } };
   if (/^checkout-pending\b/.test(message)) return { status: 409, body: { error: 'The repository is still being checked out; the message is sent when it is there', code: 'checkout-pending' } };
   if (/^queue-full\b/.test(message)) return { status: 429, body: { error: 'Too many messages are already waiting; let the current ones finish', code: 'queue-full' } };
+  if (/^chat-stopped\b/.test(message)) return { status: 409, body: { error: 'The chat was stopped before this message went in; send it again', code: 'chat-stopped' } };
   if (/^chat-clearing\b/.test(message)) return { status: 409, body: { error: 'This chat is being stopped; nothing more can be sent to it', code: 'chat-clearing' } };
+  if (/^image-refused\b/.test(message)) return { status: 400, body: { error: message.replace(/^image-refused:\s*/, ''), code: 'bad-image' } };
+  if (/^mode-refused\b/.test(message)) {
+    return { status: 409, body: { error: "This box's chat runner cannot run a trusted turn yet; it needs an update and a restart", code: 'mode-refused' } };
+  }
   return { status: 502, body: { error: message } };
+}
+
+const SESSION_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
+
+/** What Open in full UI types into the agent pane to continue a chat's session, or null for no valid id. */
+export function resumeCommandFor(sessionId: unknown): string | null {
+  return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId) ? `claude --resume ${sessionId}` : null;
+}
+
+/**
+ * Whether the agent pane's foreground command is a Claude, which then holds
+ * the chat's session: a message from the chat would start a second writer.
+ * Other foreground programs (a dev server, an editor) do not hold it.
+ */
+export function terminalHoldsChat(cmd: unknown): boolean {
+  if (typeof cmd !== 'string' || !cmd.trim()) return false;
+  return /(^|[\s/])claude(\s|$)/.test(cmd.trim());
+}
+
+/**
+ * What a foreground probe means for a parked queue (agent/chat-runner.js
+ * nextPaneClaim). `unknown` is a miss: failed, timed out, or still empty.
+ * Only `shell` is Claude having left a pane that was seen holding it.
+ */
+export type PaneProbe = 'claude' | 'shell' | 'other' | 'unknown';
+
+export function paneProbeKind(cmd: string | null): PaneProbe {
+  if (typeof cmd !== 'string' || !cmd.trim()) return 'unknown';
+  if (terminalHoldsChat(cmd)) return 'claude';
+  if (isIdleShell(cmd)) return 'shell';
+  return 'other';
+}
+
+/**
+ * A foreground probe. `dead` is tmux's pane_dead: the process has exited and
+ * the command name can still be the program that left (a stale `claude`).
+ */
+export interface PaneForeground {
+  cmd: string | null;
+  dead: boolean;
+}
+
+/** Whether this probe is a live Claude. A dead pane's leftover command name is not. */
+export function paneStillHolds(fg: PaneForeground | string | null | undefined): boolean {
+  if (fg != null && typeof fg === 'object') {
+    if (fg.dead) return false;
+    return terminalHoldsChat(fg.cmd);
+  }
+  return terminalHoldsChat(fg);
+}
+
+/**
+ * The probe kind to record. A dead pane is a shell for the claim: Claude has
+ * left, so a stale `seen` clears and a send may start. It is not a miss.
+ */
+export function probeFromForeground(fg: PaneForeground | string | null | undefined): PaneProbe {
+  if (fg != null && typeof fg === 'object' && fg.dead) return 'shell';
+  const cmd = fg == null || typeof fg === 'string' ? (fg ?? null) : fg.cmd;
+  return paneProbeKind(cmd);
+}
+
+/**
+ * What GET /chat reports for the simple UI's hold notice. `true` when a live
+ * Claude is the foreground. `false` only when a shell (or a dead pane) proves
+ * Claude has left, so the notice and a stuck refusal can clear. A miss
+ * (`unknown`) or another program is omitted: a failed probe is not proof
+ * Claude left, and clearing the notice would make Send look free while the
+ * claim still queues the message.
+ */
+export function historyTerminalHolds(fg: PaneForeground | string | null | undefined): boolean | undefined {
+  if (paneStillHolds(fg)) return true;
+  if (probeFromForeground(fg) === 'shell') return false;
+  return undefined;
+}
+
+/**
+ * Foreground names tmux reports for an idle shell (`pane_current_command` is
+ * the process name; a login shell is `-zsh`). Anything else — vim, ssh, npm —
+ * is a program the keys would land in, so Open in full UI leaves it alone.
+ */
+const IDLE_SHELLS = new Set(['sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh', 'ash']);
+
+function foregroundBase(cmd: string): string {
+  const token = cmd.trim().split(/\s+/)[0] ?? '';
+  const base = (token.split('/').pop() ?? token).replace(/^-+/, '');
+  return base.toLowerCase();
+}
+
+/** Whether the pane's foreground is an idle shell, the only place a resume may be typed. */
+export function isIdleShell(cmd: string): boolean {
+  return IDLE_SHELLS.has(foregroundBase(cmd));
+}
+
+/**
+ * Whether Open in full UI may type `claude --resume` into the agent pane,
+ * given its foreground command (`tmux-foreground-cmd`). Only an idle shell
+ * gets the keys. A running agent, a busy pane, any other program, or an
+ * unreadable probe (null/empty — unknown, not idle) is left alone, so a
+ * keystroke never lands in vim, node, another agent, or a Claude the user is in.
+ */
+export function resumeDecision(fg: string | null): 'type' | 'claude-open' | 'pane-busy' | 'pane-unknown' {
+  if (typeof fg !== 'string' || !fg.trim()) return 'pane-unknown';
+  if (terminalHoldsChat(fg)) return 'claude-open';
+  const cls = classifyForeground(fg);
+  if (cls === 'running' || cls === 'busy') return 'pane-busy';
+  return isIdleShell(fg) ? 'type' : 'pane-busy';
+}
+
+/**
+ * The mode chat-send may name. bypassPermissions only when the agent
+ * advertises chat-trust-v1. A runner that only has chat-runner-v1 treats
+ * any other mode as mode-refused and starts nothing, so a trusted project
+ * on that box stays dontAsk and the send still goes through.
+ */
+export function permissionModeForAgent(mode: string, capabilities: readonly string[]): string {
+  if (mode === TRUSTED_MODE && !capabilities.includes(CHAT_TRUST_CAPABILITY)) return UNTRUSTED_MODE;
+  if (mode === AUTO_MODE && !capabilities.includes(CHAT_AUTO_CAPABILITY)) return UNTRUSTED_MODE;
+  return mode;
+}
+
+/** One chat event as the relay saw it, for listeners that follow a chat's turns (services/automations/complete.ts). */
+export interface ChatEventSeen {
+  projectId: string;
+  workstream: string;
+  workstreamId: string;
+  instanceId: string;
+  turnId: string | null;
+  event: unknown;
+}
+
+type ChatEventListener = (seen: ChatEventSeen) => void;
+const eventListeners = new Set<ChatEventListener>();
+
+/**
+ * Hear every chat event the relay accepts (after its box check), in arrival
+ * order per project. A listener that throws is logged and dropped for that
+ * event only. Returns the unsubscribe.
+ */
+export function onChatEvent(listener: ChatEventListener): () => void {
+  eventListeners.add(listener);
+  return () => { eventListeners.delete(listener); };
+}
+
+/**
+ * What chat-send carries to the box. The permission mode is the backend's
+ * decision from the project's trust (services/chatTrust.ts), held back to
+ * dontAsk unless this agent advertises chat-trust-v1. Nothing in the
+ * request body reaches it.
+ */
+/**
+ * What chat-resume-claim carries. The permission mode is the same ceiling
+ * chat-send uses (held back without chat-trust-v1 / chat-auto-v1). The box
+ * applies turnModeFor to it. The browser does not choose the mode, and the
+ * session id stays on the box.
+ */
+export function chatResumeClaimPayload(
+  target: { chatKey: string; cwd: string; permissionMode: string; model?: string | null } & ChatBackend,
+  capabilities: readonly string[] = [],
+): Record<string, unknown> {
+  return {
+    chatKey: target.chatKey,
+    cwd: target.cwd,
+    permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
+    // The chat's backend, so Open in full UI continues there; its model with it.
+    ...(target.backend && target.model ? { model: target.model, ...backendFields(target) } : {}),
+  };
+}
+
+export function chatSendRpcPayload(
+  target: { chatKey: string; cwd: string; projectId: string; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean } & ChatBackend,
+  text: string,
+  capabilities: readonly string[] = [],
+  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean } = {},
+): Record<string, unknown> {
+  return {
+    chatKey: target.chatKey, cwd: target.cwd, text, projectId: target.projectId,
+    workstream: target.workstream, workstreamId: target.workstreamId,
+    requireCheckout: target.requireCheckout,
+    permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
+    // chat-live-input-enabled, to an agent that can take it: the turn this
+    // send starts, or the live one running, takes the message in as it runs.
+    ...(chatSendsLive(capabilities, opts.liveInput) ? { liveInput: true } : {}),
+    // Always a concrete tier (or its pinned profile id), already the launch
+    // string (services/claudeChatModel.ts); the runner drops anything else.
+    ...(target.model ? { model: target.model } : {}),
+    // Another backend's model is only that backend's; the caller checked chat-backend-v1.
+    ...backendFields(target),
+    // New session's "Act as an orchestrator". An older runner would drop it anyway.
+    ...(target.orchestrator && capabilities.includes(CHAT_ORCHESTRATOR_CAPABILITY) ? { orchestrator: true } : {}),
+    // Already checked against chat-image-input-enabled and chat-images-v1 (services/chatImages.ts).
+    ...(opts.images?.length ? { images: opts.images } : {}),
+    // simple-ui-session-titles-enabled. An older runner drops it, and its turn-ends carry no title.
+    ...(opts.titles ? { titles: true } : {}),
+  };
+}
+
+export type ChatStopScope = 'turn' | 'all';
+
+/** The stop a request asks for: only `turn` stops less than everything. */
+export function chatStopScope(raw: unknown): ChatStopScope {
+  return raw === 'turn' ? 'turn' : 'all';
+}
+
+/** Whether this agent can stop only a live turn's current work. */
+export function chatStopsTurn(capabilities: readonly string[]): boolean {
+  return capabilities.includes(CHAT_INTERRUPT_CAPABILITY);
+}
+
+/** The chat-interrupt RPC: a turn-only stop goes only to an agent that knows it; any other is the whole stop. */
+export function chatInterruptRpcPayload(chatKey: string, capabilities: readonly string[], scope: ChatStopScope): { chatKey: string; scope?: 'turn' } {
+  return { chatKey, ...(scope === 'turn' && chatStopsTurn(capabilities) ? { scope: 'turn' as const } : {}) };
+}
+
+/** Whether a send from this person can go into a running live turn: their chat-live-input-enabled, on an agent with chat-live-v1. */
+export function chatSendsLive(capabilities: readonly string[], liveInputFlag: boolean | undefined): boolean {
+  return liveInputFlag === true && capabilities.includes(CHAT_LIVE_CAPABILITY);
 }
 
 export type ChatClearResult =
@@ -124,37 +387,87 @@ export async function clearChatsOnBox(
 
 type Block = { type?: unknown; name?: unknown; input?: unknown };
 
-/** "Bash(npm test)", "Read(src/app.ts)": a tool call in a few words, for the status message. */
-export function toolCallLabel(name: string, input: unknown): string {
-  const i = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
-  const arg = [i.command, i.file_path, i.path, i.pattern, i.url, i.description]
-    .find((v): v is string => typeof v === 'string' && v.trim() !== '');
-  if (!arg) return name;
-  const short = arg.replace(/\s+/g, ' ').trim();
-  return `${name}(${short.length > 60 ? `${short.slice(0, 59)}…` : short})`;
+const THINKING = 'Thinking';
+const PREVIEW_MAX = 120;
+
+/** The first non-empty line of an assistant message's text, for a list preview. */
+function assistantPreview(blocks: readonly Block[]): string | null {
+  for (const b of blocks) {
+    if (b?.type !== 'text' || typeof (b as { text?: unknown }).text !== 'string') continue;
+    const line = ((b as { text: string }).text.split('\n').find(l => l.trim() !== '') ?? '').replace(/\s+/g, ' ').trim();
+    if (line) return line.length > PREVIEW_MAX ? `${line.slice(0, PREVIEW_MAX - 1)}…` : line;
+  }
+  return null;
 }
 
 /**
  * The status the agent session takes for one chat event, or null for an
- * event that does not move it: a turn is `working` from its start (naming
- * the tool it runs, as the hooks do) until it ends.
+ * event that does not move it: a turn is `working` from its start until
+ * Claude answers (`result`) or the turn ends. A live turn (agent
+ * chat-live-v1) stays open after an answer while a background task runs,
+ * and is `working` again when it takes in another message (its replayed
+ * `user` line) or a task's notification sets it going (`assistant`). The
+ * message is what lists preview, so it is the last thing Claude said
+ * (`prevMessage` carries it across tool calls and the turn end), never a
+ * tool call's arguments.
  */
-export function statusForChatEvent(event: unknown): { status: 'working' | 'idle'; message?: string } | null {
+export function statusForChatEvent(event: unknown, prevMessage?: string): { status: 'working' | 'idle'; message?: string } | null {
   if (!event || typeof event !== 'object') return null;
-  const ev = event as { type?: unknown; message?: { content?: unknown } };
+  const ev = event as { type?: unknown; isReplay?: unknown; message?: { content?: unknown } };
+  const kept = prevMessage && prevMessage !== THINKING ? prevMessage : undefined;
   switch (ev.type) {
     case 'turn-start':
-      return { status: 'working', message: 'Thinking' };
+      return { status: 'working', message: THINKING };
     case 'assistant': {
       const blocks = Array.isArray(ev.message?.content) ? ev.message!.content as Block[] : [];
-      const tool = blocks.find(b => b?.type === 'tool_use' && typeof b.name === 'string');
-      return tool ? { status: 'working', message: toolCallLabel(tool.name as string, tool.input) } : null;
+      const text = assistantPreview(blocks);
+      if (text) return { status: 'working', message: text };
+      const tool = blocks.some(b => b?.type === 'tool_use' && typeof b.name === 'string');
+      return tool ? { status: 'working', message: prevMessage || THINKING } : null;
     }
+    case 'user':
+      return ev.isReplay === true && typeof ev.message?.content === 'string' ? { status: 'working', message: THINKING } : null;
+    case 'result':
     case 'turn-end':
-      return { status: 'idle' };
+      return kept ? { status: 'idle', message: kept } : { status: 'idle' };
     default:
       return null;
   }
+}
+
+/** The longest session title the sidebar keeps; Claude's own are a few words. */
+export const SESSION_TITLE_MAX = 80;
+
+/**
+ * The title a chat event reports for its session: a turn-end's `title`
+ * (agent/session-title.js), on one line, without control or direction
+ * characters, cut to SESSION_TITLE_MAX. Null for any other event or a blank.
+ */
+export function sessionTitleOf(event: unknown): string | null {
+  if (!event || typeof event !== 'object') return null;
+  const ev = event as { type?: unknown; title?: unknown };
+  if (ev.type !== 'turn-end' || typeof ev.title !== 'string') return null;
+  const line = ev.title
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!line) return null;
+  const chars = Array.from(line);
+  return chars.length > SESSION_TITLE_MAX ? `${chars.slice(0, SESSION_TITLE_MAX - 1).join('')}…` : line;
+}
+
+/**
+ * Keep a chat's session title on its workstream, where the project list (and
+ * so the sidebar) reads it. Only a change writes: Claude reports the same
+ * title every turn, and an unchanged one costs no list push
+ * (services/workspaceWrites.ts watches the field).
+ */
+export async function saveSessionTitle(projectId: string, workstreamId: string, title: string): Promise<void> {
+  await prisma.workstream.updateMany({
+    where: { id: workstreamId, projectId, OR: [{ sessionTitle: null }, { sessionTitle: { not: title } }] },
+    data: { sessionTitle: title },
+  });
 }
 
 export interface ChatPush {
@@ -221,11 +534,24 @@ async function projectForBox(projectId: string, instanceId: string): Promise<{ n
   return project;
 }
 
+/**
+ * Write the chat runner's own status for its session. A desktop thread in the
+ * same checkout posts to the same key, so it goes through the turn rule like
+ * any post (services/sessionTurns.ts); elsewhere it is written as it is.
+ */
+function writeChatStatus(sessionName: string, instanceId: string | null, status: 'working' | 'idle', message?: string): void {
+  const effective = settleTurnPost(statusKey(instanceId, sessionName), { status, source: CHAT_STATUS_SOURCE, message });
+  setStatus(sessionName, effective.status, {
+    source: effective.source, message: effective.message,
+    ...(effective.waitingReason !== undefined ? { waitingReason: effective.waitingReason } : {}),
+  }, undefined, instanceId);
+}
+
 /** Return a `chat-runner` session that is stuck `working` to idle. */
 export function reconcileChatStatus(sessionName: string, instanceId: string | null): void {
   const st = getStatus(sessionName, instanceId);
   if (st.source === CHAT_STATUS_SOURCE && st.status === 'working') {
-    setStatus(sessionName, 'idle', { source: CHAT_STATUS_SOURCE }, undefined, instanceId);
+    writeChatStatus(sessionName, instanceId, 'idle');
     notifyStatusChange(sessionName, instanceId);
   }
 }
@@ -243,7 +569,7 @@ export function sweepStaleChatStatus(now: number = Date.now()): number {
     if (st.source !== CHAT_STATUS_SOURCE || st.status !== 'working') continue;
     if (now - new Date(st.updatedAt).getTime() <= CHAT_STALE_MS) continue;
     const { instanceId, session } = parseStatusKey(key);
-    setStatus(session, 'idle', { source: CHAT_STATUS_SOURCE }, undefined, instanceId);
+    writeChatStatus(session, instanceId, 'idle');
     notifyStatusChange(session, instanceId);
     swept++;
   }
@@ -276,10 +602,19 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
   // Only the box the project lives on speaks for its chat.
   if (!project || project.instanceId !== instance.id) return;
   const sessionName = tmux.sessionName(project.owner, project.name, 'agent', workstream);
-  const next = statusForChatEvent(msg.event);
+  const prev = getStatus(sessionName, instance.id);
+  const next = statusForChatEvent(msg.event, prev.message);
   if (next) {
-    setStatus(sessionName, next.status, { source: CHAT_STATUS_SOURCE, message: next.message }, undefined, instance.id);
+    writeChatStatus(sessionName, instance.id, next.status, next.message);
     notifyStatusChange(sessionName, instance.id);
+    pushOnChatTurn({ projectId, workstream, session: sessionName, prev: prev.status, next: next.status, event: msg.event });
+  }
+  // The relay checked the workstream id against the chat key; the write checks it is this project's.
+  const title = sessionTitleOf(msg.event);
+  if (title && typeof msg.workstreamId === 'string' && msg.workstreamId) {
+    void saveSessionTitle(projectId, msg.workstreamId, title).catch(err => {
+      console.error('[CHAT] session title not saved:', err instanceof Error ? err.message : String(err));
+    });
   }
   pusher?.({
     sessionName,
@@ -292,6 +627,15 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
       event: msg.event,
     },
   });
+  if (eventListeners.size) {
+    const seen: ChatEventSeen = {
+      projectId, workstream, workstreamId: typeof msg.workstreamId === 'string' ? msg.workstreamId : '',
+      instanceId: instance.id, turnId: typeof msg.turnId === 'string' ? msg.turnId : null, event: msg.event,
+    };
+    for (const l of eventListeners) {
+      try { l(seen); } catch (err) { console.error('[CHAT] event listener failed:', err instanceof Error ? err.message : String(err)); }
+    }
+  }
 }
 
 /** Relay `chat-event` frames from box agents. Returns the unsubscribe. */

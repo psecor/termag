@@ -247,7 +247,7 @@ export async function ensureMetaTerm(user: { id: string; unixUsername: string })
 
   await seedMetaTermFiles(dir, seedFs);
 
-  // Probes before relaunching (see the AGENTS.md gotcha) — idempotent.
+  // Probes before relaunching — idempotent.
   await ensureAgentSessionsAndLaunch({
     userId: user.id,
     unixUsername: user.unixUsername,

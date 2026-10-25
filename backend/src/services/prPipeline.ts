@@ -19,6 +19,7 @@ export const LANES = [
   { id: 'checks', label: 'Checks & bot review' },
   { id: 'needs_approval', label: 'Needs approval' },
   { id: 'needs_my_review', label: 'Needs my review' },
+  { id: 'team_review', label: 'Team reviews' },
   { id: 'ready_to_merge', label: 'Ready to merge' },
   { id: 'merged_not_deployed', label: 'Merged, not deployed' },
   { id: 'deployed', label: 'Deployed' },
@@ -26,6 +27,14 @@ export const LANES = [
 ] as const;
 
 export type LaneId = typeof LANES[number]['id'];
+
+/**
+ * The two lanes of review requests (2026-10-23): needs_my_review when a
+ * pending request names the viewer, team_review when GitHub's
+ * review-requested:@me matched only through a team they are on.
+ */
+export const REVIEW_LANES: readonly LaneId[] = ['needs_my_review', 'team_review'];
+export const isReviewLane = (lane: LaneId): boolean => REVIEW_LANES.includes(lane);
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
 
@@ -60,6 +69,8 @@ export interface OpenPr {
   requestedReviewers: string[];
   /** When the latest review request was made; review-requested search only. */
   requestedAt?: string | null;
+  /** A pending request names the viewer, not only one of their teams; review-requested search only. */
+  requestedYou?: boolean;
 }
 
 /** A merged pull request from the last 14 days. */
@@ -141,9 +152,15 @@ export interface PrRow {
   workstream: WorkstreamLink | null;
   /** How `workstream` was found (services/workstreamPrs.ts); set on the way out of GET /api/prs. */
   linkedBy?: 'checkout' | 'created' | 'branch' | 'manual' | null;
-  /** Lane 5: when the review of me was asked for. */
+  /** The review lanes: when the review of me (or my team) was asked for. */
   requestedAt: string | null;
-  /** Lane 5: where "Review with Devin" runs: the linked workstream, else main of a project on the PR's repo. */
+  /**
+   * The review lanes: whether the request names me (needs_my_review) or only a
+   * team I am on (team_review). The counts of what needs me take only the
+   * first. Absent elsewhere.
+   */
+  askedYou?: boolean;
+  /** The review lanes: where "Review with Devin" runs: the linked workstream, else main of a project on the PR's repo. */
   reviewTarget: WorkstreamLink | null;
 }
 
@@ -182,7 +199,7 @@ function badgesFor(pr: OpenPr): string[] {
   return out;
 }
 
-function openRow(pr: OpenPr, lane: LaneId): PrRow {
+export function openRow(pr: OpenPr, lane: LaneId): PrRow {
   return {
     kind: 'pr',
     lane,
@@ -206,7 +223,8 @@ function openRow(pr: OpenPr, lane: LaneId): PrRow {
     mergeCommit: null,
     deploy: null,
     workstream: null,
-    requestedAt: lane === 'needs_my_review' ? pr.requestedAt ?? null : null,
+    requestedAt: isReviewLane(lane) ? pr.requestedAt ?? null : null,
+    ...(isReviewLane(lane) ? { askedYou: lane === 'needs_my_review' } : {}),
     reviewTarget: null,
   };
 }
@@ -268,7 +286,7 @@ export function deployState(inProd: boolean | null, boxSide: boolean, inBox: (bo
   return { state: 'deployed', boxesUnknown, boxes };
 }
 
-function mergedRow(pr: MergedPr, deploy: DeployState | null): PrRow {
+export function mergedRow(pr: MergedPr, deploy: DeployState | null): PrRow {
   return {
     kind: 'pr',
     lane: mergedLane(pr, deploy),
@@ -417,7 +435,8 @@ export function assignLanes(input: PipelineInput): PrRow[] {
     // The search excludes the viewer's own PRs; the author check is a backstop.
     if (seen.has(key) || pr.author === input.viewer) continue;
     seen.add(key);
-    rows.push(openRow(pr, 'needs_my_review'));
+    // Unknown (no viewer login) stays mine, as the count always took it.
+    rows.push(openRow(pr, pr.requestedYou === false ? 'team_review' : 'needs_my_review'));
   }
   for (const pr of input.merged) {
     const key = prKey(pr.repo, pr.number);
@@ -429,7 +448,7 @@ export function assignLanes(input: PipelineInput): PrRow[] {
   for (const row of rows) {
     if (!row.repo) continue;
     row.workstream = linkWorkstream(row.repo, row.headRefName, row.baseRefName, input.workstreams);
-    if (row.lane === 'needs_my_review') row.reviewTarget = reviewTarget(row.repo, row.workstream, input.workstreams);
+    if (isReviewLane(row.lane)) row.reviewTarget = reviewTarget(row.repo, row.workstream, input.workstreams);
   }
 
   for (const b of input.branches) {

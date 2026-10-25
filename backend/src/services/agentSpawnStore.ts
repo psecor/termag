@@ -71,3 +71,41 @@ export async function releaseSpawnLaunch(id: string): Promise<void> {
     data: { launchedAt: null, state: 'starting' },
   }).catch(err => console.warn(`[SPAWN] could not release brief ${id}:`, (err as Error).message));
 }
+
+/** Is this workstream a parked spawn (its CLI stopped on purpose)? Never throws: an error relaunches as before. */
+export async function isParkedSpawn(userId: string, projectId: string, workstream: string): Promise<boolean> {
+  try {
+    const n = await prisma.agentSpawn.count({
+      where: { userId, childProjectId: projectId, childWorkstream: workstream, parkedAt: { not: null }, retiredAt: null },
+    });
+    return n > 0;
+  } catch (err) {
+    console.warn(`[SPAWN] parked lookup failed for ${workstream}:`, (err as Error).message);
+    return false;
+  }
+}
+
+/**
+ * A launch into a parked spawn's pane (the agent-switch route, a relaunch,
+ * anything but the lifecycle's own resume) brings it back: unpark it, so the
+ * row says what the pane does and the sweep never retires a live agent.
+ * Never throws.
+ */
+export async function unparkOnLaunch(userId: string, projectId: string | null, workstream: string): Promise<void> {
+  if (!projectId) return;
+  try {
+    const rows = await prisma.agentSpawn.findMany({
+      where: { userId, childProjectId: projectId, childWorkstream: workstream, parkedAt: { not: null }, retiredAt: null },
+      select: { id: true, parkedAt: true, rootSpawnId: true, childInstanceId: true },
+    });
+    for (const r of rows) {
+      const done = await prisma.agentSpawn.updateMany({ where: { id: r.id, parkedAt: r.parkedAt }, data: { parkedAt: null, keptReason: null, endedAt: null } });
+      if (done.count === 1) {
+        console.log(`[SPAWN] ${workstream}: launched again, unparked ${r.id}`);
+        void recordSpawnEvent({ kind: 'resumed', spawnId: r.id, rootSpawnId: r.rootSpawnId, userId, reason: 'launch', instanceId: r.childInstanceId });
+      }
+    }
+  } catch (err) {
+    console.warn(`[SPAWN] unpark on launch failed for ${workstream}:`, (err as Error).message);
+  }
+}

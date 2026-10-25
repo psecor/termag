@@ -30,8 +30,12 @@ export function syncBoxAuthorizedKeys(instanceId: string, userId: string, home: 
     const read = await sendToInstanceAgent(instanceId, 'read-file', { path });
     const existing = typeof read?.content === 'string' ? read.content : null;
     const next = rewriteAuthorizedKeys(existing, lines);
-    if (next === (existing ?? '')) return;
-    await sendToInstanceAgent(instanceId, 'write-file', { path, content: next });
+    // No keys and no file: nothing to create, as cloud-init's step 4c.
+    if (existing === null && next === '') return;
+    // Written even when unchanged: sshd's StrictModes refuses the keys while
+    // ~/.ssh or the file is group-writable, which a warm-pool box's first sync
+    // left them (the agent's umask), and the write is what fixes the modes.
+    await sendToInstanceAgent(instanceId, 'write-file', { path, content: next, mode: 0o600, dirMode: 0o700 });
     console.log(`[SSH-KEYS] instance ${instanceId}: wrote ${lines.length} managed key(s)`);
   };
   const next = (inFlight.get(instanceId) ?? Promise.resolve()).then(run);

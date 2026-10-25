@@ -53,6 +53,17 @@ describe('paneCheckoutReady', () => {
     expect(paneCheckoutReady({ ...claimed, onClaimStatus: 'running' })).toBe(false);
   });
 
+  it('does not wait for a GitHub delivery an orchestrator without the broker never makes', () => {
+    expect(paneCheckoutReady({ githubDeliveredAt: null, onClaimStatus: null }, { expectGithub: false })).toBe(true);
+    expect(paneCheckoutReady({ githubDeliveredAt: null, onClaimStatus: 'skipped' }, { expectGithub: false })).toBe(true);
+    expect(paneCheckoutReady({ githubDeliveredAt: null, onClaimStatus: null }, { expectGithub: true })).toBe(false);
+  });
+
+  it('still waits for a running claim when no GitHub delivery is expected', () => {
+    expect(paneCheckoutReady({ githubDeliveredAt: null, onClaimStatus: 'pending' }, { expectGithub: false })).toBe(false);
+    expect(paneCheckoutReady({ githubDeliveredAt: null, onClaimStatus: 'running' }, { expectGithub: false })).toBe(false);
+  });
+
   it('does not block when the instance row is gone', () => {
     expect(paneCheckoutReady(null)).toBe(true);
   });
@@ -64,6 +75,16 @@ describe('waitForPaneCheckout', () => {
     const result = await waitForPaneCheckout(
       async () => ({ githubDeliveredAt: delivered, onClaimStatus: 'succeeded' }),
       { sleep: async ms => { sleeps.push(ms); }, now: () => 0 },
+    );
+    expect(result).toBe('ready');
+    expect(sleeps).toEqual([]);
+  });
+
+  it('returns ready at once without a delivery when none is expected', async () => {
+    const sleeps: number[] = [];
+    const result = await waitForPaneCheckout(
+      async () => ({ githubDeliveredAt: null, onClaimStatus: null }),
+      { sleep: async ms => { sleeps.push(ms); }, now: () => 0, expectGithub: false },
     );
     expect(result).toBe('ready');
     expect(sleeps).toEqual([]);

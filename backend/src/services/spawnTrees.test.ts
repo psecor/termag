@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSpawnTrees, tokensBySpawn, type TreeInput } from './spawnTrees';
+import { buildSpawnTrees, tokensBySpawn, treeTotals, type TreeInput } from './spawnTrees';
 
 const t0 = Date.parse('2026-10-18T10:00:00Z');
 const s = (id: string, over: Partial<TreeInput>): TreeInput => ({
@@ -18,6 +18,7 @@ describe('buildSpawnTrees', () => {
     const [tree] = buildSpawnTrees(rows);
     expect(tree.rootId).toBe('a');
     expect(tree.nodes.map(n => [n.spawn.id, n.level])).toEqual([['a', 0], ['c', 1], ['d', 2], ['b', 1]]);
+    expect(tree.nodes.map(n => n.parentId)).toEqual([null, 'a', 'c', 'a']);
   });
 
   it('keeps separate roots apart, newest tree first, and treats a missing root id as its own tree', () => {
@@ -27,7 +28,7 @@ describe('buildSpawnTrees', () => {
 
   it('shows a node whose parent fell out of the window at the top of its tree', () => {
     const rows = [s('b', { rootSpawnId: 'a', depth: 2, parentWorkstream: 'a' })];
-    expect(buildSpawnTrees(rows)[0].nodes).toEqual([{ spawn: rows[0], level: 0 }]);
+    expect(buildSpawnTrees(rows)[0].nodes).toEqual([{ spawn: rows[0], level: 0, parentId: null }]);
   });
 });
 
@@ -44,5 +45,30 @@ describe('tokensBySpawn', () => {
     const t = tokensBySpawn(spawns, rows);
     expect(t.get('a')).toEqual({ input: 30, output: 11, cacheRead: 100, cacheCreate: 2 });
     expect(t.get('m')).toEqual({ input: 7, output: 0, cacheRead: 0, cacheCreate: 0 });
+  });
+});
+
+describe('treeTotals', () => {
+  const at = (m: number) => new Date(t0 + m * 60_000);
+  const row = (id: string, over: Partial<Parameters<typeof treeTotals>[0][number]>) => ({
+    id, createdAt: at(0), launchedAt: at(0), reportedAt: null, endedAt: null, retiredAt: null, parkedAt: null, state: 'running', ...over,
+  });
+
+  it('counts the most agents running at once, tokens, and the time to the last report', () => {
+    const rows = [
+      row('a', { endedAt: at(30), reportedAt: at(29), state: 'done' }),
+      row('b', { createdAt: at(1), launchedAt: at(2), parkedAt: at(10), reportedAt: at(9), state: 'done' }),
+      // Starts as b parks: a hand-over, not three at once.
+      row('c', { createdAt: at(9), launchedAt: at(10) }),
+      row('d', { createdAt: at(11), launchedAt: null, state: 'failed' }),
+    ];
+    const tokens = new Map([['a', { input: 10, output: 5, cacheRead: 100, cacheCreate: 0 }], ['c', { input: 1, output: 1, cacheRead: 0, cacheCreate: 0 }]]);
+    expect(treeTotals(rows, tokens, t0 + 60 * 60_000)).toEqual({
+      agents: 4, peakRunning: 2, tokens: 117, cacheRead: 100, secondsToLastReport: 29 * 60, states: { done: 2, running: 1, failed: 1 },
+    });
+  });
+
+  it('has no time to last report before any report', () => {
+    expect(treeTotals([row('a', {})], new Map(), t0).secondsToLastReport).toBeNull();
   });
 });

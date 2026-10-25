@@ -15,7 +15,7 @@ describe('recordSessionEvent', () => {
     setCloudSessionChangeCallback(changed);
     await recordSessionEvent({ owner, sessionId: 'cse_01A', orderId: 'ord.1', instanceId: 'box-a', kind: 'placed', detail: 'ada-box slot 2' });
     expect(prisma.claudeSessionEvent.create).toHaveBeenCalledWith({
-      data: { userId: 'u1', sessionId: 'cse_01A', orderId: 'ord.1', instanceId: 'box-a', kind: 'placed', detail: 'ada-box slot 2' },
+      data: { userId: 'u1', sessionId: 'cse_01A', orderId: 'ord.1', instanceId: 'box-a', kind: 'placed', detail: 'ada-box slot 2', code: null },
     });
     expect(changed).toHaveBeenCalledWith(owner, 'cse_01A');
   });

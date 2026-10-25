@@ -56,7 +56,7 @@ export class LastOwnerError extends Error {
 
 /** What a quota charge paid for: an object, and for a part batch its multipart upload and part numbers. */
 export interface ChargeRef { key: string; uploadId?: string; partNumbers?: number[] }
-export interface LiveCharge { id: string; bytes: bigint; createdAt: Date; key: string | null; uploadId: string | null; partNumbers: number[] }
+export interface LiveCharge { id: string; bytes: bigint; createdAt: Date; liveUntil: Date; key: string | null; uploadId: string | null; partNumbers: number[] }
 
 export type AddMemberResult =
   | { kind: 'member'; member: SpaceMemberRecord }
@@ -116,7 +116,8 @@ export interface SpaceStore {
   // The hourly sweep (spaceSweeper.ts).
   deletedSpaces(): Promise<SpaceRecord[]>;
   liveSpaces(): Promise<SpaceRecord[]>;
-  liveCharges(spaceId: string, now: Date): Promise<LiveCharge[]>;
+  /** Charges whose URLs work past `after`. */
+  chargesLiveAfter(spaceId: string, after: Date): Promise<LiveCharge[]>;
   /**
    * Sets usedBytes to `stored` (what S3 holds) plus every charge still live at
    * `now`, except `settled` (charges whose bytes `stored` already includes).

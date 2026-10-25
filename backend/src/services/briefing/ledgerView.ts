@@ -51,6 +51,8 @@ export interface LedgerIndexRow {
   prs: Array<{ repo: string | null; number: number | null; laneLabel: string; failingChecks: number; needsAttention: boolean }>;
   /** A detail call returns more than this row: a digest or a pane tail. */
   hasDetail: boolean;
+  /** The user marked this session's left-open item done or deferred it: leave it out of Left open. */
+  dismissed: boolean;
   notes: string[];
 }
 
@@ -61,7 +63,9 @@ export interface LedgerIndex {
   totals: Ledger['totals'];
   sessions: LedgerIndexRow[];
   cloudSessions: Ledger['cloudSessions'];
+  spawnOrphans: NonNullable<Ledger['spawnOrphans']>;
   otherPrs: Ledger['otherPrs'];
+  patterns: Ledger['patterns'];
   notes: string[];
   trust: string;
 }
@@ -106,6 +110,7 @@ export function indexRow(s: LedgerSession): LedgerIndexRow {
     lastPrompt: cut(t?.lastUserPrompts[t.lastUserPrompts.length - 1], LAST_PROMPT_MAX),
     prs: s.prs.map(p => ({ repo: p.repo, number: p.number, laneLabel: p.laneLabel, failingChecks: p.failingChecks.length, needsAttention: needsAttention(p) })),
     hasDetail: s.digest !== null || s.paneTail !== null,
+    dismissed: s.dismissed,
     notes: s.notes,
   };
 }
@@ -118,7 +123,9 @@ export function ledgerIndex(l: Ledger): LedgerIndex {
     totals: l.totals,
     sessions: l.sessions.map(indexRow),
     cloudSessions: l.cloudSessions,
+    spawnOrphans: l.spawnOrphans ?? [],
     otherPrs: l.otherPrs,
+    patterns: l.patterns,
     notes: l.notes,
     trust: INDEX_TRUST_NOTE,
   };

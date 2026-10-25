@@ -37,15 +37,25 @@ export interface PrRef { owner: string; name: string; number: number }
 
 const NAME = /^[\w.-]+$/;
 
-/** A PR the pipeline could have shown: in one of its orgs, with a sane name and number. */
-export function parsePrRef(owner: unknown, name: unknown, number: unknown): PrRef {
+/**
+ * Any repository's PR, for a read made with the user's own token (the
+ * overview of a review group member, which can be from any repository:
+ * services/prReviewGroups.ts). Writes stay with parsePrRef's orgs.
+ */
+export function parseAnyPrRef(owner: unknown, name: unknown, number: unknown): PrRef {
   const n = typeof number === 'string' && /^\d{1,9}$/.test(number) ? Number(number) : NaN;
-  if (typeof owner !== 'string' || typeof name !== 'string' || !NAME.test(name) || !Number.isInteger(n) || n < 1) {
+  if (typeof owner !== 'string' || !NAME.test(owner) || typeof name !== 'string' || !NAME.test(name) || !Number.isInteger(n) || n < 1) {
     throw new PrInputError('Not a pull request');
   }
-  const org = ORGS.find(o => o.toLowerCase() === owner.toLowerCase());
+  return { owner, name, number: n };
+}
+
+/** A PR the pipeline could have shown: in one of its orgs, with a sane name and number. */
+export function parsePrRef(owner: unknown, name: unknown, number: unknown): PrRef {
+  const { number: n } = parseAnyPrRef(owner, name, number);
+  const org = ORGS.find(o => o.toLowerCase() === (owner as string).toLowerCase());
   if (!org) throw new PrInputError(`Only pull requests in ${ORGS.join(' or ')} can be opened here`);
-  return { owner: org, name, number: n };
+  return { owner: org, name: name as string, number: n };
 }
 
 export type ReviewEvent = 'APPROVE' | 'COMMENT' | 'REQUEST_CHANGES';
@@ -449,9 +459,9 @@ export function parseCommentInput(raw: unknown): { body: string } {
   return { body };
 }
 
-async function restWrite(token: string, url: string, payload: unknown, what: string, fetchImpl: Fetch): Promise<Raw> {
+async function restWrite(token: string, url: string, payload: unknown, what: string, fetchImpl: Fetch, method: 'POST' | 'PATCH' = 'POST'): Promise<Raw> {
   const res = await fetchImpl(url, {
-    method: 'POST',
+    method,
     headers: { ...headers(token), 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
@@ -472,9 +482,68 @@ export async function requestReviewers(token: string, ref: PrRef, input: Reviewe
   return { users: logins(b.requested_reviewers, 'login'), teams: logins(b.requested_teams, 'slug') };
 }
 
-export async function postComment(token: string, ref: PrRef, body: string, fetchImpl: Fetch = fetch): Promise<{ url: string | null }> {
+export async function postComment(token: string, ref: PrRef, body: string, fetchImpl: Fetch = fetch): Promise<{ url: string | null; id: string | null }> {
   const b = await restWrite(token, `${API}/repos/${ref.owner}/${ref.name}/issues/${ref.number}/comments`, { body }, 'comment', fetchImpl);
-  return { url: typeof b.html_url === 'string' ? b.html_url : null };
+  return {
+    url: typeof b.html_url === 'string' ? b.html_url : null,
+    // The REST id, which editComment takes (a number; kept as text, as PreviewShare.prCommentId).
+    id: typeof b.id === 'number' || typeof b.id === 'string' ? String(b.id) : null,
+  };
+}
+
+/** Rewrites a comment postComment made, by its REST id (a preview share's, when the share ends). */
+export async function editComment(token: string, ref: PrRef, commentId: string, body: string, fetchImpl: Fetch = fetch): Promise<void> {
+  if (!/^\d{1,20}$/.test(commentId)) throw new PrInputError('Not a comment id');
+  await restWrite(token, `${API}/repos/${ref.owner}/${ref.name}/issues/comments/${commentId}`, { body }, 'comment edit', fetchImpl, 'PATCH');
+}
+
+// ── What a preview link share checks on a PR (services/previewShareLinks.ts) ─
+
+export interface PrFacts {
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+  isDraft: boolean;
+  /** The base repository, `owner/name` as GitHub spells it. */
+  repo: string;
+  /** PRIVATE | INTERNAL | PUBLIC. */
+  visibility: string;
+  headBranch: string;
+  headOid: string;
+  /** Whether the head branch lives in another repository (a fork). */
+  crossRepo: boolean;
+  author: { login: string | null; id: number | null };
+  /** Who the token belongs to, read now (a rename since it was stored doesn't matter). */
+  viewer: { login: string; id: number };
+}
+
+const PR_FACTS = `query PrFacts($owner: String!, $name: String!, $number: Int!) {
+  viewer { login databaseId }
+  repository(owner: $owner, name: $name) {
+    nameWithOwner visibility
+    pullRequest(number: $number) {
+      state isDraft headRefName headRefOid isCrossRepository
+      author { login ... on User { databaseId } }
+    }
+  }
+}`;
+
+/** The facts a preview link share rests on, read with the owner's token. */
+export async function fetchPrFacts(token: string, ref: PrRef, fetchImpl: Fetch = fetch): Promise<PrFacts> {
+  const data = await graphqlRead(token, PR_FACTS, { owner: ref.owner, name: ref.name, number: ref.number }, fetchImpl);
+  const repo = data.repository;
+  const pr = repo?.pullRequest;
+  if (!repo || !pr || typeof pr.headRefName !== 'string' || typeof pr.headRefOid !== 'string') throw new GithubApiError('GitHub has no such pull request', 404);
+  if (typeof data.viewer?.login !== 'string' || typeof data.viewer?.databaseId !== 'number') throw new GithubApiError('GitHub did not say whose token this is', 502);
+  return {
+    state: pr.state,
+    isDraft: pr.isDraft === true,
+    repo: String(repo.nameWithOwner),
+    visibility: String(repo.visibility ?? ''),
+    headBranch: pr.headRefName,
+    headOid: pr.headRefOid,
+    crossRepo: pr.isCrossRepository === true,
+    author: { login: typeof pr.author?.login === 'string' ? pr.author.login : null, id: typeof pr.author?.databaseId === 'number' ? pr.author.databaseId : null },
+    viewer: { login: data.viewer.login, id: data.viewer.databaseId },
+  };
 }
 
 // ── A PR's head, for a new workstream on it (routes/prs.ts) ──────────────────
@@ -500,4 +569,58 @@ export async function fetchPrHead(token: string, ref: PrRef, fetchImpl: Fetch = 
   const pr = data.repository?.pullRequest;
   if (!pr || typeof pr.headRefName !== 'string' || typeof pr.headRefOid !== 'string') throw new GithubApiError('GitHub has no such pull request', 404);
   return { state: pr.state, branch: pr.headRefName, sameRepo: pr.isCrossRepository !== true, headOid: pr.headRefOid };
+}
+
+// ── What decides an automatic preview share (services/previewShareLinks.ts, 4c) ─
+
+export interface PrScope {
+  labels: string[];
+  /** Changed paths, as many as were read (MAX_SCOPE_FILES at most). */
+  paths: string[];
+  /** Whether `paths` is every changed path. */
+  complete: boolean;
+}
+
+const MAX_SCOPE_FILES = 300;
+const SCOPE_PAGE = 100;
+
+async function restRead(token: string, url: string, fetchImpl: Fetch): Promise<unknown> {
+  const res = await fetchImpl(url, { headers: headers(token) });
+  if (!res.ok) throw new GithubApiError(`GitHub read failed (HTTP ${res.status})`, res.status);
+  return res.json();
+}
+
+/**
+ * A PR's labels and changed paths, paged up to MAX_SCOPE_FILES files. REST,
+ * not GraphQL: only REST names a renamed file's old path
+ * (`previous_filename`), and a PR that moves a file out from under the
+ * filter changed that path too. A file list GitHub doesn't give (a diff too
+ * large, a page that isn't a list) counts as incomplete, never as empty.
+ */
+export async function fetchPrScope(token: string, ref: PrRef, fetchImpl: Fetch = fetch): Promise<PrScope> {
+  const base = `${API}/repos/${ref.owner}/${ref.name}/pulls/${ref.number}`;
+  const pr = await restRead(token, base, fetchImpl) as Raw;
+  const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l: Raw) => l?.name).filter((n: unknown): n is string => typeof n === 'string');
+  const paths: string[] = [];
+  const changed = typeof pr?.changed_files === 'number' ? pr.changed_files : null;
+  // Files read, not paths: a rename adds its old path beside the new one.
+  let read = 0;
+  for (let page = 1; read < MAX_SCOPE_FILES; page++) {
+    let files: unknown;
+    try { files = await restRead(token, `${base}/files?per_page=${SCOPE_PAGE}&page=${page}`, fetchImpl); } catch (err) {
+      if (err instanceof GithubApiError && (err.status === 401 || err.status === 404)) throw err;
+      return { labels, paths, complete: false };
+    }
+    if (!Array.isArray(files)) return { labels, paths, complete: false };
+    for (const f of files as Raw[]) {
+      if (typeof f?.filename === 'string') paths.push(f.filename);
+      if (typeof f?.previous_filename === 'string') paths.push(f.previous_filename);
+    }
+    read += files.length;
+    // Every file the PR says it changed is read: complete, whatever the page's size.
+    if (changed !== null && read >= changed) return { labels, paths, complete: true };
+    // A short page is the last; without a count to check it against, it is taken as the end.
+    if (files.length < SCOPE_PAGE) return { labels, paths, complete: changed === null };
+  }
+  return { labels, paths, complete: changed !== null && read >= changed };
 }

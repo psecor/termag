@@ -222,10 +222,11 @@ describe('GET /api/prs/:owner/:repo/:number', () => {
     expect(await res.json()).toMatchObject({ repo: 'example-org/termag', number: 9 });
     expect(current.actions.overview).toHaveBeenCalledWith(TOKEN_A, { owner: 'example-org', name: 'termag', number: 9 });
   });
-  it('refuses a repository outside the pipeline orgs without calling GitHub', async () => {
+  it('reads a repository outside the pipeline orgs (a review group member), with the user\'s own token', async () => {
+    // Writes stay with the orgs: see the review and merge tests.
     const res = await get('/prs/someone/else/9');
-    expect(res.status).toBe(400);
-    expect(current.actions.overview).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(current.actions.overview).toHaveBeenCalledWith(TOKEN_A, { owner: 'someone', name: 'else', number: 9 });
   });
   it('answers 409 with no GitHub token', async () => {
     current.token = null;
@@ -571,8 +572,14 @@ describe('POST /api/prs/:owner/:repo/:number/workstream', () => {
     const res = await send('POST', url, { projectId: 'p1', name: 'termag-pr-dash' });
     expect(res.status).toBe(201);
     expect(current.createWorkstream).toHaveBeenCalledWith(expect.objectContaining({ id: 'u1' }), 'p1',
-      { name: 'termag-pr-dash', branch: 'feat/pr-defer', pr: { number: 359, sameRepo: true, headOid: 'a'.repeat(40) } });
+      { name: 'termag-pr-dash', branch: 'feat/pr-defer', pr: { repo: 'example-org/termag', number: 359, sameRepo: true, headOid: 'a'.repeat(40) }, firstPrompt: null });
     expect(current.links.rows.get('example-org/termag#359')).toMatchObject({ source: 'manual' });
+  });
+  it('passes a first prompt for the agent through, trimmed, and refuses one that is not text', async () => {
+    await send('POST', url, { projectId: 'p1', name: 'termag-pr359-pr-defer', prompt: '  Describe termag#359.\n' });
+    expect(current.createWorkstream).toHaveBeenCalledWith(expect.anything(), 'p1', expect.objectContaining({ firstPrompt: 'Describe termag#359.' }));
+    expect((await send('POST', url, { projectId: 'p1', name: 'n', prompt: 42 })).status).toBe(400);
+    expect((await send('POST', url, { projectId: 'p1', name: 'n', prompt: 'x'.repeat(9000) })).status).toBe(400);
   });
   it('attaches under the adopted name when the workstream took one', async () => {
     current.createWorkstream = vi.fn(async () => ({ status: 201, body: { id: 'w9', name: 'termag-pr-dash', branch: 'feat/pr-defer' } }));

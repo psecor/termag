@@ -1,5 +1,5 @@
 import { Router, RequestHandler, Request, Response, NextFunction } from 'express';
-import type { Prisma } from '@prisma/client';
+import type { Prisma, User } from '@prisma/client';
 import passport from 'passport';
 import { takePostLoginRedirect } from '../auth/postLoginReturn';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
@@ -17,24 +17,88 @@ import { ensureHostSetup } from '../services/hostSetup';
 import { parseDotfilesRepoUrl } from '../services/dotfilesUrl';
 import { isAdminUser } from '../services/admin/adminAccess';
 import { findUserByEmail, sameEmail } from '../services/userByEmail';
+import { ownerPlacementKey, serializeByKey } from '../services/claudeRunnerSpawn';
 
 
 export type AuthMode = 'google' | 'okta' | 'oidc' | 'local';
 
 /**
+ * The provider id prefix of a row the cloud-session spawn route made for an
+ * engineer who never signed in (services/claudeRunnerOwner.ts). The first
+ * sign-in replaces it with the real provider id.
+ */
+const PLACEHOLDER_ID_PREFIX = 'claude:';
+
+/**
  * Create-or-update by email under sameEmail. A plain upsert keyed on
  * googleEmail misses a row stored in another casing and then fails the create
  * on the unixUsername unique constraint; this updates the existing row instead,
- * keeping its stored email.
+ * keeping its stored email. A row whose provider id is a `claude:` placeholder
+ * takes the signing-in provider's id from
+ * `create`; any other existing row keeps its id.
  */
-async function upsertUserByEmail(
+export async function upsertUserByEmail(
   email: string,
   update: Prisma.UserUpdateInput,
   create: Prisma.UserCreateInput,
 ) {
-  const existing = await findUserByEmail(email);
-  if (existing) return prisma.user.update({ where: { id: existing.id }, data: update });
-  return prisma.user.create({ data: create });
+  const adoptOrUpdate = (existing: User) => {
+    const adopt = typeof existing.googleId === 'string' && existing.googleId.startsWith(PLACEHOLDER_ID_PREFIX) && typeof create.googleId === 'string' ? { googleId: create.googleId } : {};
+    return prisma.user.update({ where: { id: existing.id }, data: { ...update, ...adopt } });
+  };
+  // Under the spawn route's per-email create lock: a first cloud session for
+  // this address may be making its placeholder row at this moment. In this
+  // process the key serializes the two; across processes the unique index
+  // decides, and a lost race is recovered by reading the row the spawn made
+  // and adopting it, as the lookup above would have (Bugbot on #288).
+  return serializeByKey(newUserKey(email), async () => {
+    const existing = await findUserByEmail(email);
+    if (existing) return adoptOrUpdate(existing);
+    try {
+      return await prisma.user.create({ data: create });
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+      const made = await findUserByEmail(email);
+      if (!made) throw err;
+      return adoptOrUpdate(made);
+    }
+  });
+}
+
+/** The spawn route's lock for creating a user for an address (routes/claudeRunner.ts); sign-in's creates take it too. */
+const newUserKey = (email: string) => `claude-runner:new:${email.toLowerCase()}`;
+/** Postgres's unique violation as Prisma reports it. */
+const isUniqueViolation = (err: unknown): boolean => typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'P2002';
+
+/**
+ * A returning user signs in with an address a `claude:` placeholder holds.
+ * Under the same per-email lock the spawn route creates placeholders under
+ * and the placeholder's placement lock, which its box purchases run under
+ * (one backend process serves a host), and in one serializable transaction,
+ * so a spawn cannot recreate the placeholder between the delete and the
+ * update, nor give it a box between the count and the delete: the count,
+ * the delete and the address move see one snapshot, and a concurrent insert
+ * for the placeholder conflicts rather than being cascaded away. Any box
+ * row at all keeps the placeholder: the returning row then takes only the
+ * display name and one warning line names both unix usernames.
+ */
+async function adoptPlaceholderAddress(returning: User, holder: User, email: string, displayName: string): Promise<User> {
+  // The create key, then the placeholder's placement key: the spawn route
+  // releases the first before it buys the owner a box under the second
+  // (getOwnerABox), so the count here has to hold both to see no box arrive
+  // between it and the delete (Bugbot on #288). The spawn never holds the
+  // placement key while waiting for the create key, so the order cannot
+  // deadlock.
+  return serializeByKey(newUserKey(email), () => serializeByKey(ownerPlacementKey(holder.id), () => prisma.$transaction(async (tx) => {
+    const boxes = await tx.instance.count({ where: { userId: holder.id } });
+    if (boxes > 0) {
+      console.warn(`[auth] returning user ${returning.unixUsername} signed in with an address held by placeholder user ${holder.unixUsername}, which has ${boxes} box row(s); not merged, the row keeps its stored address`);
+      return tx.user.update({ where: { id: returning.id }, data: { displayName } });
+    }
+    await tx.user.delete({ where: { id: holder.id } });
+    console.log(`[auth] removed placeholder user ${holder.unixUsername}: its address belongs to returning user ${returning.unixUsername}`);
+    return tx.user.update({ where: { id: returning.id }, data: { displayName, googleEmail: email } });
+  }, { isolationLevel: 'Serializable' })));
 }
 
 /**
@@ -68,7 +132,7 @@ export function authMode(): AuthMode {
  * paths so their user shape can't drift. `idPrefix` only matters on first
  * creation — the upsert is keyed by email.
  */
-async function upsertAllowlistedUser(identity: OidcIdentity, idPrefix: 'okta' | 'oidc'): Promise<Express.User | null> {
+export async function upsertAllowlistedUser(identity: OidcIdentity, idPrefix: 'okta' | 'oidc'): Promise<Express.User | null> {
   const allowedUsers = parseAllowedUsers(process.env.ALLOWED_USERS);
   const unixUsername = resolveUnixUsername(allowedUsers, identity.email);
   if (!unixUsername) {
@@ -114,16 +178,53 @@ export function configurePassport(): void {
               return done(null, false);
             }
 
-            const user = await prisma.user.upsert({
-              where: { googleId: profile.id },
-              update: { displayName: profile.displayName },
-              create: {
-                googleId: profile.id,
-                googleEmail: email,
-                unixUsername,
-                displayName: profile.displayName,
-              },
-            });
+            // Main's rule, unchanged: a Google user is their subject (googleId),
+            // and a returning one takes only the current display name. The
+            // only new paths are the ones a `claude:` placeholder row opens, a
+            // row the cloud-session spawn route made for this address behind
+            // claude-runner-auto-user-enabled: a subject termag has never seen adopts the placeholder for
+            // its address instead of creating a second row, and a returning
+            // subject whose current address a placeholder holds takes the
+            // address (adoptPlaceholderAddress). Without a placeholder, both
+            // branches are the upsert by subject they were.
+            const returning = await prisma.user.findUnique({ where: { googleId: profile.id } });
+            const holder = returning && sameEmail(returning.googleEmail, email) ? returning : await findUserByEmail(email);
+            const placeholder = holder && holder.id !== returning?.id && typeof holder.googleId === 'string' && holder.googleId.startsWith(PLACEHOLDER_ID_PREFIX) ? holder : null;
+            let user;
+            if (returning && placeholder) {
+              user = await adoptPlaceholderAddress(returning, placeholder, email, profile.displayName);
+            } else if (!returning && placeholder) {
+              user = await upsertUserByEmail(
+                email,
+                { displayName: profile.displayName, unixUsername },
+                { googleId: profile.id, googleEmail: email, unixUsername, displayName: profile.displayName },
+              );
+            } else {
+              // Under the spawn route's per-email create lock, and recovering
+              // from a lost race with it: a placeholder made for this address
+              // between the lookup above and this upsert fails the create on
+              // the unique index, and the sign-in adopts that row as the
+              // branch above would rather than failing (Bugbot on #288).
+              user = await serializeByKey(newUserKey(email), async () => {
+                try {
+                  return await prisma.user.upsert({
+                    where: { googleId: profile.id },
+                    update: { displayName: profile.displayName },
+                    create: {
+                      googleId: profile.id,
+                      googleEmail: email,
+                      unixUsername,
+                      displayName: profile.displayName,
+                    },
+                  });
+                } catch (err) {
+                  if (!isUniqueViolation(err)) throw err;
+                  const made = await findUserByEmail(email);
+                  if (!made || typeof made.googleId !== 'string' || !made.googleId.startsWith(PLACEHOLDER_ID_PREFIX)) throw err;
+                  return prisma.user.update({ where: { id: made.id }, data: { googleId: profile.id, displayName: profile.displayName, unixUsername } });
+                }
+              });
+            }
 
             return done(null, user as Express.User);
           } catch (err) {
@@ -360,6 +461,10 @@ export function authRouter(): Router {
     // existing users never see the wizard without opting in from Settings.
     onboardedAt: user.onboardedAt ? user.onboardedAt.toISOString() : null,
     theme: normalizeTheme(user.theme),
+    // Phone push replaces Slack/Discord "needs input" posts.
+    pushMutesChat: user.pushMutesChat ?? false,
+    // Simple UI: notify when a chat finishes its turn.
+    chatTurnNotify: user.chatTurnNotify ?? false,
     // Effective role (users.role or an ADMIN_USERS match). Drives the admin
     // nav entry only; requireAdmin re-derives it on every admin request.
     role: isAdminUser(user) ? 'admin' : 'member',
@@ -402,8 +507,8 @@ export function authRouter(): Router {
       return;
     }
 
-    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown };
-    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue } = {};
+    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown };
+    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean } = {};
     const has = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
 
     if (has('defaultAgentProvider')) {
@@ -432,6 +537,22 @@ export function authRouter(): Router {
       data.theme = theme.theme as unknown as Prisma.InputJsonValue;
     }
 
+    if (has('pushMutesChat')) {
+      if (typeof body.pushMutesChat !== 'boolean') {
+        res.status(400).json({ error: 'pushMutesChat must be a boolean' });
+        return;
+      }
+      data.pushMutesChat = body.pushMutesChat;
+    }
+
+    if (has('chatTurnNotify')) {
+      if (typeof body.chatTurnNotify !== 'boolean') {
+        res.status(400).json({ error: 'chatTurnNotify must be a boolean' });
+        return;
+      }
+      data.chatTurnNotify = body.chatTurnNotify;
+    }
+
     if (Object.keys(data).length === 0) {
       res.status(400).json({ error: 'No supported preference supplied' });
       return;
@@ -445,6 +566,8 @@ export function authRouter(): Router {
     req.user.defaultAgentProvider = user.defaultAgentProvider;
     req.user.dotfilesRepoUrl = user.dotfilesRepoUrl;
     req.user.theme = user.theme;
+    req.user.pushMutesChat = user.pushMutesChat;
+    req.user.chatTurnNotify = user.chatTurnNotify;
 
     res.json(userPayload(user));
   };

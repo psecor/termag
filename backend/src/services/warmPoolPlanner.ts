@@ -166,6 +166,15 @@ export function planWarmPool(input: PlanInput): PoolPlan {
     terminate.push({ id: c.row.id, reason: 'surplus' });
   }
 
+  // Current-spec boxes still booting beyond what the target leaves room for,
+  // after a lowered target, would only warm up to be retired as surplus. A
+  // warming box is not claimable, so retiring it now costs no availability.
+  // Newest first: the oldest is closest to warm.
+  const room = Math.max(0, input.target - claimable.length);
+  for (const c of oldestFirst(inFlight).reverse().slice(0, Math.max(0, inFlight.length - room))) {
+    terminate.push({ id: c.row.id, reason: 'surplus' });
+  }
+
   return {
     launch: breaker.open ? 0 : Math.min(deficit, headroom),
     fail: oldestFirst(lost).map((c) => ({ id: c.row.id, reason: 'agent lost' as const })),

@@ -13,7 +13,7 @@ import { getAllStatuses } from '../services/status';
 import { statusKey } from '../services/statusKey';
 import {
   chooseGuess, isPrNumber, parseGhPrView, prFromText, reviewLaunchCommand, urlForPr, probeReviewPane, PR_OPTION, encodePrOption,
-  buildReviewPrompt, parseReviewBody, reviewPromptPath, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
+  buildGroupReviewPrompt, buildReviewPrompt, parseGroupReview, parseReviewBody, reviewPromptPath, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
   type ResolvedReviewTemplate,
   type ReviewPaneState,
 } from '../services/review';
@@ -213,8 +213,16 @@ export function reviewRouter(): Router {
   };
 
   const start: RequestHandler = async (req, res) => {
-    const { pr, url, prompt, reviewer: rawReviewer } = req.body as { pr?: unknown; url?: unknown; prompt?: unknown; reviewer?: unknown };
+    const { pr, url, prompt, reviewer: rawReviewer, group: rawGroup } = req.body as { pr?: unknown; url?: unknown; prompt?: unknown; reviewer?: unknown; group?: unknown };
     if (!isPrNumber(pr)) { res.status(400).json({ error: 'pr (positive integer) required' }); return; }
+    // Review all with Devin (a review group): one session over its members, in order; `pr` is the first.
+    const grouped = parseGroupReview(rawGroup);
+    if (!grouped.ok) { res.status(400).json({ error: grouped.error }); return; }
+    const group = grouped.group;
+    if (group && (group.members[0].number !== pr || prompt != null)) {
+      res.status(400).json({ error: 'A group review starts on its first pull request and takes no edited prompt' });
+      return;
+    }
     if (rawReviewer != null && !isReviewerId(rawReviewer)) {
       res.status(400).json({ error: `reviewer must be one of ${REVIEWER_IDS.join(', ')}` });
       return;
@@ -245,18 +253,24 @@ export function reviewRouter(): Router {
     if (!isProjectAgentConnected(access.host)) { res.status(503).json({ error: "Owner's agent is offline" }); return; }
 
     const { cwd, home } = await pathsP;
-    const target = reviewTarget(pr, urlForPr(url, pr), await repoP);
+    // A group review names its first member's own PR, whatever `url` says (Devin, #668): the record,
+    // the PR option and the review tab must name the PR the prompt opens on.
+    const asked = group ? `https://github.com/${group.members[0].repo}/pull/${group.members[0].number}` : urlForPr(url, pr);
+    const target = reviewTarget(pr, asked, await repoP);
     if ('refuse' in target) { res.status(400).json({ error: target.refuse }); return; }
     const cleanUrl = target.url;
     const promptPath = reviewPromptPath(home, access.session);
     // No edited body (unedited dialog, mobile, older client): the same
     // template the dialog would have shown, resolved again now.
-    const template = body.body == null ? await resolveTemplate(access, cwd, home) : null;
+    const template = body.body == null && !group ? await resolveTemplate(access, cwd, home) : null;
     noteBoxActivity(access.host.instanceId);
     try {
       // The prompt goes in a file Devin reads (--prompt-file), never through
       // shell quoting, so an edited prompt may hold quotes and newlines.
-      await sendForProject(access.host, 'write-file', { path: promptPath, content: buildReviewPrompt(pr, cleanUrl, body.body ?? template!.template, reviewerName(reviewer)), mode: 0o600 }, 5000);
+      const content = group
+        ? buildGroupReviewPrompt(group, reviewerName(reviewer))
+        : buildReviewPrompt(pr, cleanUrl, body.body ?? template!.template, reviewerName(reviewer));
+      await sendForProject(access.host, 'write-file', { path: promptPath, content, mode: 0o600 }, 5000);
       // A second Review replaces the running one: fresh shell, fresh reviewer.
       const has = await sendForProject(access.host, 'tmux-has-session', { sessionName: access.session }, 5000);
       if (has?.exists) await sendForProject(access.host, 'tmux-kill', { sessionName: access.session }, 5000);
@@ -273,7 +287,7 @@ export function reviewRouter(): Router {
     }
     const rec = registerReviewRecord(identityFor(access), { pr, url: cleanUrl, reviewer }, { startedByUserId: req.user!.id });
     const startedAt = rec.startedAt;
-    console.log(`[REVIEW] ${access.session}: ${reviewer} review of PR #${pr} started by ${req.user!.id}${target.mismatch ? ` (checkout is ${target.mismatch})` : ''}${body.body ? ' (edited prompt)' : ` (prompt: ${template!.label ?? 'built-in'})`}`);
+    console.log(`[REVIEW] ${access.session}: ${reviewer} review of PR #${pr} started by ${req.user!.id}${target.mismatch ? ` (checkout is ${target.mismatch})` : ''}${group ? ` (review group "${group.name}", ${group.members.length} PRs)` : body.body ? ' (edited prompt)' : ` (prompt: ${template!.label ?? 'built-in'})`}`);
     res.status(201).json({ ok: true, session: access.session, pr, url: cleanUrl, reviewer, startedAt });
   };
 

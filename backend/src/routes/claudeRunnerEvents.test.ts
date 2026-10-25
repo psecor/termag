@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
+import { logs } from '@opentelemetry/api-logs';
+import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { claudeRunnerEventsRouter } from './claudeRunnerEvents';
 import { recordRunnerEnd, recordRunnerStarted, recordRunnerTitle, recordRunnerUsage } from '../services/claudeRunnerSessions';
 import { notifyCloudSessionChange, recordSessionEvent } from '../services/claudeSessionEvents';
@@ -20,6 +22,12 @@ vi.mock('../services/claudeRunnerSessions', async (importOriginal) => ({
 }));
 vi.mock('../services/claudeSessionEvents', () => ({ recordSessionEvent: vi.fn(async () => {}), notifyCloudSessionChange: vi.fn() }));
 const who = { userId: 'u1', who: 'ada', sessionId: 'cse_01A', instanceId: 'box-a', boxName: 'ada-box', slot: 2 };
+
+// The product events the route records (services/productEvents.ts), read off
+// a log exporter as the backend sends them.
+const logExporter = new InMemoryLogRecordExporter();
+logs.setGlobalLoggerProvider(new LoggerProvider({ processors: [new SimpleLogRecordProcessor({ exporter: logExporter })] }));
+const productEvents = () => logExporter.getFinishedLogRecords().map(r => r.attributes);
 
 interface RouteLayer { route?: { path: string; stack: { handle: RequestHandler }[] } }
 const body = { event: 'ended', orderId: 'ord.1', exitStatus: 0, exitReason: 'completed' };
@@ -49,6 +57,7 @@ const lines = (fn: 'log' | 'warn') => vi.mocked(console[fn]).mock.calls.map(c =>
 describe('POST /api/claude-runner/event', () => {
   beforeEach(() => {
     agentInstanceId = 'box-a';
+    logExporter.reset();
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
   });
@@ -78,6 +87,10 @@ describe('POST /api/claude-runner/event', () => {
     expect(recordSessionEvent).toHaveBeenCalledWith({
       owner: { id: 'u1', unixUsername: 'ada' }, sessionId: 'cse_01A', orderId: 'ord.1', instanceId: 'box-a', kind: 'ended', detail: 'completed',
     });
+    expect(productEvents()).toEqual([{
+      'event.name': 'cloud.session.ended', 'termag.user.id': 'u1', 'termag.box.id': 'box-a',
+      'termag.provider': 'claude', 'termag.kind': 'cloud', 'termag.durationSec': 5000, 'termag.exitStatus': 0, 'termag.exitReason': 'completed', 'termag.slot': 2,
+    }]);
   });
 
   it('records a started report, logs the serving line and appends the event', async () => {
@@ -87,6 +100,10 @@ describe('POST /api/claude-runner/event', () => {
     expect(res.statusCode).toBe(204);
     expect(lines('log')).toEqual(['[CLAUDE-RUNNER] order ord.1 for ada serving session cse_01A from web_claude_ai on ada-box slot 2']);
     expect(recordSessionEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'started', detail: 'web_claude_ai', sessionId: 'cse_01A' }));
+    expect(productEvents()).toEqual([{
+      'event.name': 'cloud.session.started', 'termag.user.id': 'u1', 'termag.box.id': 'box-a',
+      'termag.provider': 'claude', 'termag.kind': 'cloud', 'termag.clientPlatform': 'web_claude_ai', 'termag.slot': 2,
+    }]);
   });
 
   it('sets a title without logging or storing the text, and pushes the change', async () => {
@@ -129,11 +146,12 @@ describe('POST /api/claude-runner/event', () => {
     expect(lines('warn')).toEqual([`[CLAUDE-RUNNER] order ord.1: end at ${endedAt.toISOString()} is from before the current launch at ${startedAt.toISOString()}; ignored`]);
   });
 
-  it('answers 204 without a line for a repeated report', async () => {
+  it('answers 204 without a line, and no product event, for a repeated report', async () => {
     vi.mocked(recordRunnerEnd).mockResolvedValue({ kind: 'repeat' });
     const res = await post();
     expect(res.statusCode).toBe(204);
     expect(lines('log')).toEqual([]);
+    expect(productEvents()).toEqual([]);
   });
 
   it('answers 404 for an order it never started, and 403 for another box\'s', async () => {

@@ -75,6 +75,9 @@ interface Pane {
   workflowId: string;
   /** The workflow's provider column as stored (null = the user's default). */
   storedProvider: string | null;
+  /** Its model backend and model; null = the defaults. */
+  storedBackend: string | null;
+  storedModel: string | null;
   provider: string;
 }
 
@@ -85,7 +88,7 @@ async function loadPane(row: HandoffRow): Promise<Pane | null> {
     include: {
       user: { select: { unixUsername: true, defaultAgentProvider: true } },
       instance: { select: { hostHome: true } },
-      workstreams: { where: { name: row.workstream }, include: { workflows: { select: { id: true, type: true, provider: true } } } },
+      workstreams: { where: { name: row.workstream }, include: { workflows: { select: { id: true, type: true, provider: true, backend: true, model: true } } } },
     },
   });
   const wf = project?.workstreams[0]?.workflows.find(w => w.type === 'agent');
@@ -99,6 +102,8 @@ async function loadPane(row: HandoffRow): Promise<Pane | null> {
     hostHome: project.instance?.hostHome ?? null,
     workflowId: wf.id,
     storedProvider: wf.provider,
+    storedBackend: wf.backend,
+    storedModel: wf.model,
     provider: resolveAgentProvider(wf.provider, project.user.defaultAgentProvider),
   };
 }
@@ -139,12 +144,13 @@ async function restart(row: HandoffRow, pane: Pane): Promise<void> {
     return;
   }
   const switching = to !== pane.provider;
-  if (switching) await prisma.workflow.update({ where: { id: pane.workflowId }, data: { provider: to } });
+  // Another agent starts on its own default backend and model, as a Switch agent to it would.
+  if (switching) await prisma.workflow.update({ where: { id: pane.workflowId }, data: { provider: to, backend: null, model: null } });
   try {
     await stopAgentPane({ ...runtimeContext(pane, row.workstream), provider: pane.provider });
   } catch (err) {
     if (switching) {
-      await prisma.workflow.update({ where: { id: pane.workflowId }, data: { provider: pane.storedProvider } }).catch(e =>
+      await prisma.workflow.update({ where: { id: pane.workflowId }, data: { provider: pane.storedProvider, backend: pane.storedBackend, model: pane.storedModel } }).catch(e =>
         console.error('[HANDOFF] failed to revert the workflow provider:', (e as Error).message));
     }
     await finish(row, 'failed', `could not stop ${PROVIDERS[pane.provider]?.displayName ?? pane.provider}: ${(err as Error).message}`, pane);

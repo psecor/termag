@@ -17,7 +17,7 @@
 //
 // Functional singleton like the other services: module state, plain exports.
 
-import type { BoolFlagKey, JsonFlagKey, StringFlagKey } from '../flags';
+import type { BoolFlagKey, JsonFlagKey, NumberFlagKey, StringFlagKey } from '../flags';
 
 export type FlagValues = Record<string, unknown>;
 
@@ -99,6 +99,23 @@ export async function boolVariation(key: BoolFlagKey, _user: FlagUser, fallback:
 export async function boolVariationForContext(key: BoolFlagKey, _context: FlagContext, fallback: boolean): Promise<boolean> {
   const v = values[key];
   return typeof v === 'boolean' ? v : fallback;
+}
+
+/** A number flag for a context no user is behind (or one buildFlagContext made): a configured number, else the fallback. */
+export async function numberVariationForContext(key: NumberFlagKey, _context: FlagContext, fallback: number): Promise<number> {
+  const v = values[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+/**
+ * The context a flag read for this user (and box) would use with a targeting
+ * flag source. The env-backed source ignores it; it is built so call sites read
+ * the same whichever source is wired in.
+ */
+export function buildFlagContext(user: FlagUser, box?: FlagBox | null): FlagContext {
+  return box
+    ? { kind: 'multi', key: `${user.id}:${box.id}`, user: user.id, box: box.id }
+    : { kind: 'user', key: user.id };
 }
 
 /** A JSON flag: any configured value is returned; the caller validates the shape. */

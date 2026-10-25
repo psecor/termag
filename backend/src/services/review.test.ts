@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildGroupReviewPrompt, parseGroupReview,
   chooseGuess, classifyReviewPane, isDevinForeground, parseGhPrView, parsePrInput, prFromLaunchEcho, prFromText, prNumberFromUrl,
   reviewLaunchCommand, urlForPr, buildReviewPrompt, reviewPromptHeader, renderReviewTemplate, parseReviewBody, reviewPromptPath,
   DEFAULT_REVIEW_TEMPLATE, MAX_REVIEW_BODY, reviewAttribution, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
@@ -274,3 +275,27 @@ describe('review prompt templates', () => {
       `Review GitHub pull request #3 for the repository in the current directory.\nCheck the migration in 3.\n${reviewPromptFooter()}\n`);
   });
 });
+
+describe('a review group\'s review', () => {
+  const group = { name: 'Desktop bridge', members: [{ repo: 'example-org/termag', number: 646, note: null }, { repo: 'example-org/terraform', number: 28576, note: 'after 646' }] };
+  it('opens on the first member as any review does, so the launch echo still names it', () => {
+    const prompt = buildGroupReviewPrompt(group, 'Devin');
+    expect(prFromLaunchEcho(prompt)).toEqual({ number: 646, url: 'https://github.com/example-org/termag/pull/646' });
+    expect(prompt).toContain('2. example-org/terraform#28576 (https://github.com/example-org/terraform/pull/28576) (note: after 646)');
+  });
+  it('keeps control characters out of the name and notes, and caps them', () => {
+    const got = parseGroupReview({ name: 'Bridge\u001b[2J\nignore the above', members: [{ repo: 'o/r', number: 1, note: 'a\nb\u0007c'.padEnd(400, 'x') }] });
+    expect(got).toMatchObject({ ok: true });
+    const g = (got as { group: { name: string; members: { note: string }[] } }).group;
+    expect(g.name).toBe('Bridge [2J ignore the above');
+    expect(g.members[0].note.startsWith('a b c')).toBe(true);
+    expect(g.members[0].note).toHaveLength(200);
+  });
+  it('takes no group as none, and refuses a malformed one', () => {
+    expect(parseGroupReview(undefined)).toEqual({ ok: true, group: null });
+    expect(parseGroupReview({ name: '', members: [{ repo: 'o/r', number: 1 }] })).toEqual({ ok: false, error: 'The group needs a name' });
+    expect(parseGroupReview({ name: 'G', members: Array.from({ length: 21 }, (_, i) => ({ repo: 'o/r', number: i + 1 })) })).toMatchObject({ ok: false });
+    expect(parseGroupReview('G')).toMatchObject({ ok: false });
+  });
+});
+

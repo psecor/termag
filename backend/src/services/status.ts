@@ -9,10 +9,32 @@ import { isRunnerSessionShaped } from './claudeRunnerSpawn';
 import { boxOwnerUsername, primeBoxOwners } from './boxOwners';
 import { isMilestoneExpired, MILESTONE_TTL_MS } from './milestone';
 import { noteBoxActivity } from './boxActivity';
+import { forgetTurns, moveTurns } from './sessionTurns';
 import {
   AUTO_IDLE_MESSAGE, AUTO_IDLE_MS, AUTO_IDLE_TAIL_CREDIT_MS, HYDRATE_MAX_AGE_MS, hydrateStatus, instanceKeyOf, persistRetryDelayMs, rowIsNewer, shouldPersist, toRow,
   type HydratedStatus,
 } from './statusPersistence';
+import { recordProductEvent, type ProductEventDetail, type ProductEventName } from './productEvents';
+import { userIdForUnixUsername } from './userKeys';
+
+/**
+ * A product event about a session this module knows only by name: the
+ * username in the name (or the box's owner for a cloud runner) resolves to the
+ * user id the event is keyed by (services/userKeys.ts). Fire-and-forget;
+ * a name no user is behind records nothing.
+ */
+// Hooks-based providers (claude) send no source; poller/bridge providers do.
+function providerForSourceOrNull(source: string | undefined): string | null {
+  return source ? providerForSource(source) ?? null : null;
+}
+
+function recordSessionEvent(name: ProductEventName, sessionName: string, instanceId: string | null, detail: ProductEventDetail): void {
+  const parsed = parseSessionName(sessionName, instanceId);
+  if (!parsed) return;
+  void userIdForUnixUsername(parsed.username).then(user => {
+    if (user) recordProductEvent(name, { user, box: instanceId }, detail);
+  });
+}
 
 
 // In-memory status map. Keyed by statusKey(instanceId, session) — the tmux
@@ -27,7 +49,7 @@ const autoIdleTimers = new Map<string, NodeJS.Timeout>();
 // prompt nobody acted on never lingers.
 const milestoneTimers = new Map<string, NodeJS.Timeout>();
 
-type AgentStatusMeta = Omit<Partial<AgentStatus>, 'status' | 'updatedAt'>;
+type AgentStatusMeta = Omit<Partial<AgentStatus>, 'status' | 'updatedAt' | 'statusSince'>;
 
 // ── Working-time accumulator ───────────────────────────────────
 // Tracks when sessions enter "working" and banks duration on transition out.
@@ -281,9 +303,11 @@ function armAutoIdle(sessionName: string, instanceId: string | null, delayMs: nu
       // The flush here is timer slack off `deadline`; banking uses the exact
       // deadline so the tail credit (if working resumes) starts where the cut
       // was meant to.
+      const at = new Date();
       const idled: AgentStatus = {
         status: 'idle',
-        updatedAt: new Date(),
+        updatedAt: at,
+        statusSince: at,
         instanceId,
         message: AUTO_IDLE_MESSAGE,
         source: current.source,
@@ -300,9 +324,10 @@ function armAutoIdle(sessionName: string, instanceId: string | null, delayMs: nu
         milestone: current.milestone,
         review: current.review,
         handoff: current.handoff,
-        stoppedAt: new Date(),
+        stoppedAt: at,
       };
       statusMap.set(key, idled);
+      onStatusTransition?.(sessionName, instanceId, current.status, 'idle');
       stopWorkingTimer(sessionName, instanceId, deadline, 'auto-idle');
       persistEntry(sessionName, instanceId, idled);
       onStatusChange?.(sessionName, instanceId);
@@ -497,10 +522,16 @@ export function setStatus(
   // auto-idle write itself doesn't come through here.
   if (status !== 'working') autoIdleTails.delete(key);
   const now = new Date();
+  // When the current status began: a repeat of the same status keeps it (a
+  // hook POST during a working turn is not a new status), a change starts it.
+  // An entry from before this field (hydrated, or older) counts from its
+  // last write, the best that is known.
+  const since = previous?.status === status ? previous.statusSince ?? previous.updatedAt : now;
 
   const entry: AgentStatus = {
     status,
     updatedAt: now,
+    statusSince: since,
     instanceId: resolvedInstanceId,
     message: meta.message,
     source: meta.source,
@@ -531,6 +562,20 @@ export function setStatus(
       : comesToRest(previous?.status, status) ? now : previous?.stoppedAt,
   };
   statusMap.set(key, entry);
+  if (previous?.status !== status) {
+    onStatusTransition?.(sessionName, resolvedInstanceId, previous?.status, status);
+    // The transition as a product event: the new status, why it waits, and
+    // how long the previous status lasted (from when it began, not from the
+    // last write: meta writes and repeated posts bump updatedAt). Not the message.
+    const previousSince = previous ? previous.statusSince ?? previous.updatedAt : null;
+    recordSessionEvent('agent.status.changed', sessionName, resolvedInstanceId, {
+      status,
+      previousStatus: previous?.status ?? null,
+      waitingReason: status === 'waiting' ? meta.waitingReason ?? null : null,
+      previousStatusSeconds: previousSince ? Math.max(0, Math.round((now.getTime() - previousSince.getTime()) / 1000)) : null,
+      provider: providerForSourceOrNull(meta.source) ?? providerForSourceOrNull(previous?.source) ?? 'claude',
+    });
+  }
 
   // Working-time tracking: start/stop timers on transitions
   if (status === 'working' && previous?.status !== 'working') {
@@ -582,9 +627,12 @@ export async function resolveStoplight(sessionName: string, instanceId: string |
 export function moveStatus(fromSession: string, toSession: string, instanceId: string | null = null): boolean {
   const prev = statusMap.get(statusKey(instanceId, fromSession));
   const tail = autoIdleTails.get(statusKey(instanceId, fromSession));
+  // Before deleteStatus, which forgets the old key's turns: a desktop thread
+  // still working must keep the renamed session working.
+  moveTurns(statusKey(instanceId, fromSession), statusKey(instanceId, toSession));
   deleteStatus(fromSession, instanceId);
   if (!prev || prev.status === 'not_running') return false;
-  const { status, updatedAt: _u, instanceId: _i, ...meta } = prev;
+  const { status, updatedAt: _u, statusSince: _s, instanceId: _i, ...meta } = prev;
   setStatus(toSession, status, meta, undefined, instanceId);
   // After setStatus, which drops a tail on any non-working write. Attribution
   // is by project, so the tail's identity still holds under the new name.
@@ -599,6 +647,7 @@ export function deleteStatus(sessionName: string, instanceId: string | null = nu
   const key = statusKey(instanceId, sessionName);
   stopWorkingTimer(sessionName, instanceId);
   autoIdleTails.delete(key);
+  forgetTurns(key);
   statusMap.delete(key);
   const timer = autoIdleTimers.get(key);
   if (timer) {
@@ -614,6 +663,15 @@ let onStatusChange: ((sessionName: string, instanceId: string | null) => void) |
 
 export function setStatusChangeCallback(fn: (sessionName: string, instanceId: string | null) => void): void {
   onStatusChange = fn;
+}
+
+// Hook for the spawn status history (services/spawnStatusLog.ts): every change of
+// `status` itself, not of its metadata. Kept a callback so this module imports
+// nothing of the spawn code.
+let onStatusTransition: ((sessionName: string, instanceId: string | null, from: AgentStatus['status'] | undefined, to: AgentStatus['status']) => void) | null = null;
+
+export function setStatusTransitionCallback(fn: typeof onStatusTransition): void {
+  onStatusTransition = fn;
 }
 
 export function notifyStatusChange(sessionName: string, instanceId: string | null = null): void {
@@ -632,6 +690,16 @@ export function notifyStatusChange(sessionName: string, instanceId: string | nul
  * pane's ring state stays: that pane is still running.
  */
 export function markAgentPaneStopped(sessionName: string, instanceId: string | null, meta: AgentStatusMeta = {}): void {
+  const before = statusMap.get(statusKey(instanceId, sessionName));
+  // An agent that was running is over: one ended event per stop, none for a
+  // repeat of not_running.
+  if (before && before.status !== 'not_running') {
+    recordSessionEvent('agent.session.ended', sessionName, instanceId, {
+      kind: isRunnerSessionShaped(sessionName) ? 'cloud' : 'interactive',
+      provider: providerForSourceOrNull(before.source) ?? 'claude',
+      lastStatus: before.status,
+    });
+  }
   setStatus(sessionName, 'not_running', { milestone: null, ...meta }, undefined, instanceId);
   clearMilestoneTimer(sessionName, instanceId);
   updateStatusMeta(sessionName, { contextTokens: undefined }, instanceId);

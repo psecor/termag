@@ -55,7 +55,7 @@ vi.mock('../services/boxImage', () => ({
   isPublished: () => true,
   PUBLISHED_IMAGE: { kind: 'published' },
 }));
-vi.mock('../services/warmPool', () => ({ currentPoolSpecHash: vi.fn(), reconcileWarmPool: vi.fn() }));
+vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => null), reconcileWarmPool: vi.fn() }));
 vi.mock('../services/agentRegistry', () => ({ sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []) }));
 vi.mock('../services/warmPoolClaim', () => ({
   claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',

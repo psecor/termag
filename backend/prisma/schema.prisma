@@ -43,6 +43,9 @@ model User {
   projects             Project[]
   agentTokens          AgentToken[]
   sharedWithMe         ProjectShare[]        @relation("sharedWithMe")
+  previewSharesOwned   PreviewShare[]        @relation("previewSharesOwned")
+  previewSharesGranted PreviewShare[]        @relation("previewSharesGranted")
+  previewShareViews    PreviewShareViewer[]
   sentInvites          ProjectInvite[]       @relation("sentInvites")
   receivedInvites      ProjectInvite[]       @relation("receivedInvites")
   visits               ProjectVisit[]
@@ -50,6 +53,8 @@ model User {
   tokenUsage           TokenUsageDay[]
   instances            Instance[]
   credentials          UserCredential[]
+  mcpConnectors        McpConnector[]
+  mcpOAuthStates       McpOAuthState[]
   sshPublicKeys        SshPublicKey[]
   cliSessions          CliSession[]
   claudeRunnerSessions ClaudeRunnerSession[]
@@ -58,16 +63,29 @@ model User {
   agentMessages        AgentMessage[]
   prDeferrals          PrDeferral[]
   workstreamPrs        WorkstreamPr[]
+  prReviewGroups       PrReviewGroup[]
+  prGroupSuggestionDismissals PrGroupSuggestionDismissal[]
   agentSpawns          AgentSpawn[]
+  /// The session orphaned spawns go to when no ancestor is alive: { projectId, workstream }.
+  spawnOrphanHome      Json?
   agentHandoffs        AgentHandoff[]
   collabRequests       CollabRequest[]
+  claudeSessionNotices ClaudeSessionNotice[]
   /// The last "Claude Cloud N" handed to this owner; outlives the run rows' 90-day retention.
   claudeSessionSeq     Int                   @default(0)
   // Daily briefing schedule, validated and defaulted
   // by services/briefing/schedule.ts. {} = off: briefings are opt-in.
   briefingSchedule     Json                  @default("{}")
   briefings            Briefing[]
+  briefingDismissals   BriefingDismissal[]
   spaceMemberships     SpaceMember[]
+  // Phone web push: with at least one live subscription,
+  // skip this owner's Slack/Discord "needs input" posts (Done still posts).
+  pushMutesChat        Boolean               @default(false)
+  // Simple UI: notify (push, or the open tab) when a chat this user can see
+  // finishes its turn. Off until they opt in.
+  chatTurnNotify       Boolean               @default(false)
+  pushSubscriptions    PushSubscription[]
 
   @@map("users")
 }
@@ -108,6 +126,11 @@ model Briefing {
   content      Json?
   // LedgerTotals, for the stats strip.
   stats        Json?
+  // BriefingCharts (services/briefing/charts.ts): database-only series for the card.
+  charts       Json?
+  // LedgerPattern[] the review was given, kept when it reads its ledger, so
+  // the result checks Work better on any process (runner.ts rememberLedger).
+  patterns     Json?
   inputTokens  Int?
   outputTokens Int?
   model        String?
@@ -118,6 +141,42 @@ model Briefing {
   @@index([userId, createdAt])
   @@index([status, createdAt])
   @@map("briefings")
+}
+
+// Done or "Defer a day" on a briefing item (services/briefing/dismissals.ts):
+// a Work better pattern ("pattern:<id>") or a Left open session ("open:<projectId>:<workstream>").
+model BriefingDismissal {
+  userId String
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key    String
+  // done | defer
+  kind   String
+  until  DateTime
+  // When the user last pressed it: a done session item comes back once the session does something after this.
+  at     DateTime
+
+  @@id([userId, key])
+  @@map("briefing_dismissals")
+}
+
+// A browser's Web Push subscription (routes/push.ts, services/webPush.ts).
+// `endpoint` is a URL the server POSTs to, so it is only stored after the
+// push-service allow-list (isAllowedPushEndpoint). A 404/410 from the push
+// service deletes the row; any other failure stamps failedAt.
+model PushSubscription {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  failedAt   DateTime?
+
+  @@index([userId])
+  @@map("push_subscriptions")
 }
 
 // Laptop SSH public keys, installed in the termag-managed block of every
@@ -236,12 +295,33 @@ model ClaudeSessionEvent {
   instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
   kind       String
   detail     String?
+  // For `queued` and `agent-failed`: the refusal's stable code (REFUSAL_CODES
+  // in services/claudeRunnerSpawn.ts). Null on rows from before it, and on
+  // every other kind.
+  code       String?
   at         DateTime  @default(now())
 
   @@index([sessionId, at])
   @@index([userId, at])
   @@index([orderId])
   @@map("claude_session_events")
+}
+
+// one row per owner notice (a Slack DM about a cloud session), the
+// dedupe record for services/claudeRunnerNotices.ts. A table, not an event
+// kind, so the session's event log and the admin report never see them.
+// Swept after NOTICE_RETENTION_DAYS by the cloud session retention sweep.
+model ClaudeSessionNotice {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId String
+  // The refusal code the notice was about, or `github-absent`.
+  code      String
+  at        DateTime @default(now())
+
+  @@index([userId, code, at])
+  @@map("claude_session_notices")
 }
 
 model AgentToken {
@@ -287,7 +367,9 @@ model Project {
   pinned         Boolean  @default(false)
   // "normal" for ordinary projects; "metaterm" marks the per-user singleton
   // control-tower project (pinned, lives on the orchestrator, refuses
-  // rename/archive/share/branch-off). String-not-enum, like Instance.kind.
+  // rename/archive/share/branch-off); "automation" is a project whose runs a
+  // schedule starts. String-not-enum, like Instance.kind;
+  // what each kind may do is services/projectKind.ts.
   // One MetaTerm per user is enforced by a partial unique index in the
   // 20260916000000_project_kind migration (NULL instanceId defeats @@unique).
   kind           String   @default("normal")
@@ -319,16 +401,33 @@ model Project {
   // session's Claude Code spans are filed under that replay
   // (services/launchCommand.ts); cleared by that launch.
   launchReplaySessionId String?
+  // The owner trusted this repository for the simple UI's chat: its Claude
+  // runs tools without asking (services/chatTrust.ts). Null for a repo
+  // outside the trusted GitHub owners that nobody has trusted yet.
+  chatTrustedAt DateTime?
+  // Retired: a chat's model is its workstream's Workflow.model now. The
+  // startup move (services/chatModelMove.ts) copies a value left here onto the
+  // chat rows and clears it; nothing else reads or writes it. Dropped once no
+  // deploy reads it.
+  claudeModel           String?
+  // New session's "Act as an orchestrator": every chat turn is told to use the
+  // opt-in agent-orchestrator skill (agent/chat-runner.js ORCHESTRATOR_SYSTEM_PROMPT).
+  chatOrchestrator      Boolean  @default(false)
 
   workflows      Workflow[]
   workstreams    Workstream[]
+  // The schedule and prompt of an automation project (kind "automation").
+  automation     Automation?
   browserTabs    BrowserTab[]
   shares         ProjectShare[]
   invites        ProjectInvite[]
+  previewShares  PreviewShare[]
+  previewShareSettings PreviewShareSettings?
   visits         ProjectVisit[]
   contextSamples ContextSample[]
   tokenUsage     TokenUsageDay[]
   agentThreads   AgentThread[]
+  chatActiveTargets ChatActiveTarget[]
 
   // Name is unique per (user, box). Two boxes can have a project named "termag"
   // without collision. Legacy projects (instanceId NULL) treat NULL as distinct
@@ -408,11 +507,20 @@ model Workstream {
   branch         String // git branch this worktree targets
   slackChannelId String? // Slack channel ID (#proj-<user>-<project>-<workstream>); main uses Project.slackChannelId
   archived       Boolean        @default(false)
+  /// Claude's own title for the session the workstream's chat runs (a /rename,
+  /// else the one Claude generated), from the chat runner's turn-end; what the
+  /// simple UI's sidebar leads with.
+  sessionTitle   String?
   lastActiveAt   DateTime       @default(now())
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
   workflows      Workflow[]
   prs            WorkstreamPr[]
+  /// The automation run this workstream is; null for every other workstream.
+  automationRun  AutomationRun?
+  /// The ask thread whose chat this workstream is.
+  askThread      AgentThread?   @relation("AskChat")
+  previewShares  PreviewShare[]
 
   @@unique([projectId, name])
   @@index([projectId])
@@ -423,6 +531,15 @@ model Workflow {
   id        String       @id @default(cuid())
   type      WorkflowType
   provider  String?
+  // The model backend an agent workflow's harness runs on:
+  // a backend id from the provider's `backends` in providers/registry.ts, such
+  // as "fireworks". Null is the harness's own default (Claude Code's settings,
+  // pi's own model configuration). Nullable so an overlapping deploy's old process
+  // can ignore the column.
+  backend   String?
+  // The model the agent starts on (`--model`): one of services/modelChoices.ts
+  // for this provider and backend. Null is the backend's default.
+  model     String?
   server    String       @default("localhost") // future: ssh to other servers
   createdAt DateTime     @default(now())
 
@@ -481,6 +598,23 @@ model NotificationTarget {
 
   @@id([tmuxSession, platform, instanceId])
   @@map("notification_targets")
+}
+
+// What a chat user's `/t` drives outside a project channel (`/t switch`,
+// `/t attach`, the Slack Home tab's Attach): write-through copy of the map in
+// backend/src/slack/activeTargets.ts, so a deploy keeps it. chatUserId is the
+// Slack or Discord user id, not a termag user: the bot's operators may have none.
+model ChatActiveTarget {
+  platform   String
+  chatUserId String
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workstream String   @default("main")
+  updatedAt  DateTime @default(now()) @updatedAt
+
+  @@id([platform, chatUserId])
+  @@index([projectId])
+  @@map("chat_active_targets")
 }
 
 // Working time accumulated from status transitions (working → idle/waiting)
@@ -863,6 +997,50 @@ model UserCredential {
   @@map("user_credentials")
 }
 
+// A user's MCP server, reached from their boxes through the MCP broker.
+// Secrets live in user_credentials as provider
+// "mcp-<id>"; this row holds none.
+model McpConnector {
+  id              String   @id @default(cuid())
+  userId          String
+  // The mcpServers key on the box and the mcp__<name>__ tool prefix.
+  name            String
+  // https URL, normalised (services/mcpConnectors.ts validateUpstream).
+  upstream        String
+  authType        String // "static" | "oauth"
+  // static: {headerName: template}, referencing secrets as {{secret.<name>}}.
+  headerTemplates Json?
+  // oauth: what discovery found (services/mcpOAuth.ts DiscoveredOAuth); nothing secret.
+  oauthMetadata   Json?
+  // oauth: "linked" | "needs_link"; null for static.
+  linkStatus      String?
+  // oauth: why the last link or refresh failed, shown on Settings.
+  linkError       String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  oauthStates     McpOAuthState[]
+
+  @@unique([userId, name])
+  @@map("mcp_connectors")
+}
+
+// One pending OAuth authorize per row: the state's nonce and its PKCE
+// verifier, consumed (deleted) by the callback, at most 10 minutes old.
+model McpOAuthState {
+  id           String       @id
+  userId       String
+  connectorId  String
+  codeVerifier String
+  expiresAt    DateTime
+  createdAt    DateTime     @default(now())
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connector    McpConnector @relation(fields: [connectorId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("mcp_oauth_states")
+}
+
 // Which orchestrator process does the singleton work (services/orchestratorLease.ts).
 // One row. Only processes started with ORCHESTRATOR_LEASE=true touch it; the
 // newest claimer wins, and the one it displaced drains for the deploy.
@@ -900,9 +1078,14 @@ model AgentThread {
   prUrl           String?
   // Messages on the thread so far; no cap (each message records its own hop).
   hopCount        Int            @default(0)
+  // The thread's chat on the target project (ask-chat-v1): a workstream with
+  // no worktree of its own, whose turns run in the thread's clone.
+  chatWorkstreamId String?     @unique
+  chatWorkstream   Workstream? @relation("AskChat", fields: [chatWorkstreamId], references: [id], onDelete: SetNull)
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
   messages        AgentMessage[]
+  prs             AgentThreadPr[]
 
   @@index([originUserId, updatedAt])
   @@index([projectId])
@@ -952,6 +1135,25 @@ model AgentMessage {
 
 // The commits a run made, as the git bundle its box uploaded, until the
 // orchestrator has published them (or an hour passes).
+// One draft PR an ask thread opened.
+// `key` is '' for the run's own branch (also kept on agent_threads.prNumber /
+// prUrl for older processes) or the <name> of its pr/<name> branch.
+model AgentThreadPr {
+  id        String      @id @default(cuid())
+  threadId  String
+  thread    AgentThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  key       String
+  branch    String
+  prNumber  Int
+  prUrl     String
+  headSha   String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@unique([threadId, key])
+  @@map("agent_thread_prs")
+}
+
 model AgentBundle {
   messageId String   @id
   data      Bytes
@@ -989,12 +1191,43 @@ model GithubPr {
   closedAt       DateTime?
   prUpdatedAt    DateTime
   ingestedAt     DateTime  @updatedAt
+  /// Ready for review: the last ReadyForReviewEvent, else createdAt.
+  readyAt        DateTime?
+  /// Review requests, of the last 30 timeline events: [{ who: login | 'team:<slug>', at }].
+  reviewRequests Json      @default("[]")
+  /// Conversation comments, every author.
+  comments       Int       @default(0)
+  /// Conversation comments by people, of the last 100.
+  humanComments  Int       @default(0)
+  /// GitHub's review total; more than the stored rows when a PR has over 100.
+  reviewCount    Int       @default(0)
+  /// When reviews were stored for this PR; null on rows from before reviews were read.
+  reviewsReadAt  DateTime?
+  reviews        GithubPrReview[]
 
   @@unique([repo, number])
   @@index([repo, mergedAt])
   @@index([repo, createdAt])
   @@index([creditedLogin, mergedAt])
   @@map("github_prs")
+}
+
+/// One submitted review of a PR. Replaced with the PR on each write.
+model GithubPrReview {
+  id            String   @id // GitHub node id
+  prId          String
+  pr            GithubPr @relation(fields: [prId], references: [id], onDelete: Cascade)
+  reviewerLogin String // lowercase, '' when GitHub has no author
+  reviewerClass String // human | agent | automation
+  state         String // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED
+  submittedAt   DateTime
+  /// Inline comments in this review.
+  comments      Int      @default(0)
+
+  @@index([prId])
+  @@index([submittedAt])
+  @@index([reviewerLogin, submittedAt])
+  @@map("github_pr_reviews")
 }
 
 /// Per-repo ingestion state: survives restarts and feeds the ingest status.
@@ -1008,6 +1241,10 @@ model GithubRepoSync {
   backfillDone   Boolean   @default(false)
   /// Every PR updated at or before this is in github_prs.
   highWater      DateTime?
+  /// The review backfill (PR_ANALYTICS_REVIEW_DAYS): a first pass re-reading recent PRs for their reviews.
+  reviewsCursor  String?
+  reviewsTop     DateTime?
+  reviewsDone    Boolean   @default(false)
   lastRunAt      DateTime?
   lastError      String?
   updatedAt      DateTime  @updatedAt
@@ -1035,11 +1272,27 @@ model RepoGroupMember {
   groupSlug  String
   repo       String // owner/name, lowercase
   visibility String
+  /// Set when only some of the repo's PRs count (a `path` member): { paths, minShare, keys }.
+  /// Those PRs are the group's rows in repo_group_prs.
+  scope      Json?
   resolvedAt DateTime @default(now())
 
   @@id([groupSlug, repo])
   @@index([repo])
   @@map("repo_group_members")
+}
+
+/// A PR of a path-scoped repo that counts for a group, scored at ingest (prAnalytics/groups.ts scorePr).
+model RepoGroupPr {
+  groupSlug    String
+  prId         String // github_prs.id
+  /// Changed files under the group's paths, of at most the first 100.
+  matchedFiles Int
+  scoredAt     DateTime @default(now())
+
+  @@id([groupSlug, prId])
+  @@index([prId])
+  @@map("repo_group_prs")
 }
 
 /// One row (id 'settings'): whose token ingests, and the bot / agent login lists.
@@ -1048,6 +1301,8 @@ model PrAnalyticsSettings {
   tokenUserId  String?
   /// The default groups were created once; deleting them all does not bring them back.
   groupsSeeded Boolean  @default(false)
+  /// Slugs of the seed groups created so far, each once (a deleted one stays deleted).
+  seededGroups Json     @default("[]")
   /// Logins that are bots even though GitHub types them User.
   botLogins    Json     @default("[]")
   /// Bot logins of AI coding agents (authorClass agent).
@@ -1055,6 +1310,69 @@ model PrAnalyticsSettings {
   updatedAt    DateTime @updatedAt
 
   @@map("pr_analytics_settings")
+}
+
+/// One row (id 'settings'): the spend model's assumptions. Validated by services/admin/spend/config.ts.
+model SpendSettings {
+  id            String   @id @default("settings")
+  /// Fully loaded cost of one person a year, the spend-share denominator.
+  loadedCostUsd Float    @default(500000)
+  /// Company headcount, the population of a proportional pool that names none.
+  orgHeadcount  Int      @default(626)
+  /// provider → model → weight: the assumed blend while token rows carry no model.
+  modelMix      Json     @default("{}")
+  /// The default prices and pools were created once; deleting them does not bring them back.
+  seeded        Boolean  @default(false)
+  updatedAt     DateTime @updatedAt
+
+  @@map("spend_settings")
+}
+
+/// USD per million tokens for a provider's model from a day on (services/admin/spend/model.ts priceOn). model '*' = any.
+model ModelPrice {
+  id            String   @id @default(cuid())
+  provider      String
+  model         String   @default("*")
+  /// YYYY-MM-DD; a later row for the same provider and model replaces it from its own day.
+  effectiveFrom String
+  input         Float
+  output        Float
+  cacheRead     Float
+  cacheWrite    Float
+  createdAt     DateTime @default(now())
+
+  @@unique([provider, model, effectiveFrom])
+  @@map("model_prices")
+}
+
+/// Flat-priced spend: a vendor contract or an internal inference box fleet, shared and split per model.ts computeSpend.
+model SpendPool {
+  id              String   @id @default(cuid())
+  name            String
+  /// contract | infra
+  kind            String
+  /// The termag providers it covers; they are never also metered.
+  providers       String[]
+  annualUsd       Float?
+  /// infra: boxes running (null = sized from peak concurrency), each boxCostUsd a year for usersPerBox at once.
+  boxes           Int?
+  boxCostUsd      Float?
+  usersPerBox     Int?
+  /// proportional | usage | full
+  share           String   @default("proportional")
+  shareValue      Float?
+  populationLabel String?
+  populationSize  Int?
+  /// even | by-tokens | by-usage
+  allocation      String   @default("even")
+  startDate       String?
+  endDate         String?
+  note            String?
+  sort            Int      @default(100)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("spend_pools")
 }
 
 /// A row of the PR overlay the user put off (routes/prs.ts, services/prDeferrals.ts):
@@ -1092,6 +1410,56 @@ model WorkstreamPr {
   @@id([userId, repo, number])
   @@index([workstreamId])
   @@map("workstream_prs")
+}
+
+/// A named, ordered list of pull requests the user reviews together
+/// (services/prReviewGroups.ts). The
+/// user's own: never shown to anyone else. A closed group is kept 30 days.
+model PrReviewGroup {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  /// Null while open: closed by hand, or once every member is merged or closed.
+  closedAt  DateTime?
+  createdAt DateTime            @default(now())
+  members   PrReviewGroupMember[]
+
+  @@index([userId])
+  @@map("pr_review_groups")
+}
+
+/// One pull request of a review group, in review order. A PR is in at most
+/// one of a user's open groups: the service's rule, not the schema's.
+model PrReviewGroupMember {
+  groupId  String
+  group    PrReviewGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  /// GitHub owner/name, lowercased, as workstream_prs.
+  repo     String
+  number   Int
+  position Int
+  /// One line the user keeps with it ("merge after 1 is deployed").
+  note     String?
+  /// The title when it was added: shown while GitHub cannot be read.
+  title    String        @default("")
+  addedAt  DateTime      @default(now())
+
+  @@id([groupId, repo, number])
+  @@map("pr_review_group_members")
+}
+
+/// A suggested review group the user said "Not these" to
+/// (services/prGroupSuggestions.ts). Keyed by a hash of the suggestion's
+/// key, so it stays dismissed until its set of PRs changes.
+model PrGroupSuggestionDismissal {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// sha256 hex of the suggestion key.
+  keyHash   String
+  createdAt DateTime @default(now())
+
+  @@id([userId, keyHash])
+  @@map("pr_group_suggestion_dismissals")
 }
 
 /// A shared file store across boxes. The files live in S3
@@ -1205,7 +1573,7 @@ model SpaceEvent {
   actorInstanceId String?
   /// The box the access was inherited through, when it was.
   via             String?
-  /// space.* | member.* | invite.* | box.* | file.put | file.get | file.rm | file.mv
+  /// space.* | member.* | invite.* | box.* | file.put | file.put.signed | file.get | file.rm | file.mv
   action          String
   path            String?
   bytes           BigInt?
@@ -1273,6 +1641,9 @@ model AgentSpawn {
   parentRole       String?
   /// The parent's tmux session name at spawn time; the nudge types into it.
   parentSession    String?
+  /// The commit the child's checkout was made from, when known; a local-only
+  /// project's retire check counts against it.
+  baseSha          String?
   parentInstanceId String?
   /// Null until a project-target create returns.
   childProjectId   String?
@@ -1296,6 +1667,25 @@ model AgentSpawn {
   rootSpawnId      String?
   /// When the child's agent pane or workstream went away.
   endedAt          DateTime?
+  /// Parked: its agent CLI was stopped after it finished.
+  /// Its worktree and conversation stay, and it can be resumed. Null = not parked.
+  parkedAt         DateTime?
+  /// Retired: its workstream was removed (or its project archived). Final.
+  retiredAt        DateTime?
+  /// Why the last retire was refused (dirty, unpushed, unknown), shown to the owner.
+  keptReason       String?
+  /// Foster parent: who gets this child's
+  /// reports and nudges once its own parent is gone. The parent* fields stay
+  /// as they were, for history. Null = the original parent.
+  fosterProjectId  String?
+  fosterWorkstream String?
+  fosterRole       String?
+  adoptedAt        DateTime?
+  /// ancestor | home | owner | agent
+  adoptedBy        String?
+  /// Its parent went away and nobody alive could take it: it gathers on the
+  /// dashboard and in the briefing until adopted.
+  orphanedAt       DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -1501,4 +1891,201 @@ model UserSegmentDaily {
   @@unique([userId, date])
   @@index([date])
   @@map("user_segment_daily")
+}
+
+/// An automation: a project (kind "automation") whose prompt a fresh agent runs
+/// on a cron schedule, each run in its own workstream as one chat-runner turn.
+model Automation {
+  id                  String    @id @default(cuid())
+  projectId           String    @unique
+  project             Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId              String
+  /// 5-field cron, normalised (services/automations/schedule.ts).
+  schedule            String
+  /// IANA zone the schedule is read in.
+  timezone            String
+  /// The owner's text; the brief wraps it (services/automations/brief.ts).
+  prompt              String
+  /// full | read: the turn's permission tier.
+  tier                String    @default("full")
+  enabled             Boolean   @default(true)
+  /// The brief asks the run to push and open a draft PR when it committed.
+  prOnChange          Boolean   @default(true)
+  /// Start a stopped or hibernated box for a run.
+  wakeBox             Boolean   @default(false)
+  maxRunMinutes       Int       @default(60)
+  /// Finished runs beyond this many lose their worktree; the rows stay.
+  keepRuns            Int       @default(20)
+  /// The space whose automations/<project>/memory/MEMORY.md mirrors the box's notes file (services/automations/memorySync.ts).
+  spaceName           String?
+  /// The box whose SpaceBox grant to spaceName this automation added (memorySync.ts); removed again when the mirror is unwound.
+  mirrorGrantBoxId    String?
+  /// Post each finished run's report to the project's Slack channel (services/automations/report.ts).
+  notifySlack         Boolean   @default(false)
+  /// Why the scheduler stopped starting runs; null = fine. Cleared by a PATCH.
+  pausedReason        String?
+  consecutiveFailures Int       @default(0)
+  /// Cached from the schedule on every save and after every occurrence.
+  nextRunAt           DateTime?
+  /// The newest occurrence the scheduler has enumerated (decision 7).
+  lastOccurrence      DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  runs                AutomationRun[]
+
+  @@index([userId])
+  @@index([enabled, nextRunAt])
+  @@map("automations")
+}
+
+/// One occurrence of an automation: a run (its workstream and chat turn), or
+/// why no run happened.
+model AutomationRun {
+  id            String     @id @default(cuid())
+  automationId  String
+  automation    Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  /// schedule | manual
+  trigger       String
+  /// The occurrence minute, or the click time for a manual run.
+  scheduledFor  DateTime
+  /// pending | running | done | blocked | needs_input | failed | skipped
+  state         String
+  /// skipped: previous_running | box_concurrent | box_unavailable | box_gone | missed | flag_off | budget | paused | runner_outdated | disabled
+  /// failed:  timeout | interrupted | runner-error | launch | <exit>
+  reason        String?
+  /// The run's workstream; its id is half of the chat key (services/chatRunner.ts chatKeyFor).
+  /// Set null when the worktree goes (keepRuns, Retire, a deleted workstream); the row stays.
+  workstreamId  String?    @unique
+  workstream    Workstream? @relation(fields: [workstreamId], references: [id], onDelete: SetNull)
+  instanceId    String?
+  /// Claude's session id from the turn's init event.
+  chatSessionId String?
+  /// The text after STATUS: in the run's last message.
+  summary       String?
+  branch        String?
+  prUrl         String?
+  costUsd       Float?
+  inputTokens   Int?
+  outputTokens  Int?
+  /// What the run left on its branch, read at its end (services/automations/report.ts): commits beyond the default branch, pushed, uncommitted changes.
+  commitsAhead  Int?
+  pushed        Boolean?
+  dirty         Boolean?
+  /// The Slack report was posted.
+  reportedAt    DateTime?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  /// The worktree was removed (keepRuns, or the owner's Retire); the row stays.
+  retiredAt     DateTime?
+  createdAt     DateTime   @default(now())
+
+  @@unique([automationId, scheduledFor, trigger])
+  @@index([automationId, createdAt])
+  @@index([state, startedAt])
+  @@map("automation_runs")
+}
+
+/// A preview share: one workstream's browser pane, for
+/// a named termag user (audience `user`) or, in phase 2, anyone signed in who
+/// holds the link (audience `link`). Only the browser socket's guest path reads
+/// it: nothing else treats it as access to the project, so a check forgotten
+/// elsewhere cannot widen it.
+model PreviewShare {
+  id            String               @id @default(cuid())
+  projectId     String
+  project       Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// The workstream's row; null for a project's implicit main (a project with
+  /// no workstream rows yet). An id, not a name: a rename keeps the share.
+  workstreamId  String?
+  workstream    Workstream?          @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+  ownerId       String
+  owner         User                 @relation("previewSharesOwned", fields: [ownerId], references: [id], onDelete: Cascade)
+  /// user | link
+  audience      String
+  granteeId     String?
+  grantee       User?                @relation("previewSharesGranted", fields: [granteeId], references: [id], onDelete: Cascade)
+  /// sha256 of the link's 128-bit token (audience link); the token itself is never stored.
+  linkTokenHash String?              @unique
+  /// { kind: 'webapp-dev-stack' } | { kind: 'manual', origins: [...] }; the
+  /// agent resolves it at every attach (agent/browser-guest.js).
+  originRecipe  Json
+  /// Phase 2: the PR a link share was made for, and the comment that carries it.
+  prRepo        String?
+  prNumber      Int?
+  prCommentId   String?
+  /// The PR's head commit as GitHub last said (at the share, then each sweep): the guest header's "PR head".
+  prHeadOid     String?
+  wakeAllowed   Boolean              @default(false)
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  /// Set with endedReason when the share ends for any reason; null while it is active.
+  endedAt       DateTime?
+  /// One active link share per workstream: the workstream's key (its id, or
+  /// `<projectId>:main` for an implicit main) while a link share is active,
+  /// cleared when it ends. A unique nullable column rather than a partial
+  /// index, which Prisma can't express and `db push` (how deploys sync the
+  /// schema) would never create: ended shares are null, so they never block
+  /// a new share for the same PR after a revoke or a reopen.
+  activeLinkKey String?              @unique
+  /// revoked | expired | merged | closed | superseded | workstream-removed | project-archived | token-invalid
+  endedReason   String?
+  lastOpenedAt  DateTime?
+  createdAt     DateTime             @default(now())
+  viewers       PreviewShareViewer[]
+  events        PreviewShareEvent[]
+
+  @@index([granteeId])
+  @@index([projectId])
+  @@index([workstreamId])
+  @@map("preview_shares")
+}
+
+/// Someone who opened a preview share, from their first open: their own
+/// browser profile, their audit trail, and an owner can revoke them alone.
+model PreviewShareViewer {
+  id            String       @id @default(cuid())
+  shareId       String
+  share         PreviewShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstOpenedAt DateTime     @default(now())
+  lastOpenedAt  DateTime     @default(now())
+  revokedAt     DateTime?
+
+  @@unique([shareId, userId])
+  @@index([userId])
+  @@map("preview_share_viewers")
+}
+
+/// What happened to a preview share: created | opened | refused | woke |
+/// blocked-origin | revoked | extended | ended. `reason` says why for a
+/// refusal or an end.
+model PreviewShareEvent {
+  id      String       @id @default(cuid())
+  shareId String
+  share   PreviewShare @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  actorId String?
+  kind    String
+  reason  String?
+  detail  Json?
+  at      DateTime     @default(now())
+
+  @@index([shareId, at])
+  @@map("preview_share_events")
+}
+
+/// A project's preview-share settings: PR
+/// link shares on or off, the recipe they use, and the sign-in hint shown to
+/// reviewers. Phase 1 creates the table; phase 2 reads it.
+model PreviewShareSettings {
+  projectId           String   @id
+  project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  prLinksEnabled      Boolean  @default(false)
+  originRecipe        Json?
+  reviewerAccountHint String?
+  /// Phase 2, 4c: share a PR automatically only when it changes a path under one of these prefixes; empty, any PR.
+  pathFilter          String[] @default([])
+  updatedAt           DateTime @updatedAt
+
+  @@map("preview_share_settings")
 }

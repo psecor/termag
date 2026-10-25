@@ -26,11 +26,11 @@ import {
   type SpaceAccess, type SpaceCaller, type SpaceRole,
 } from '../services/spaces/spaceAccess';
 import { SpacesUnavailableError } from '../services/spaces/spaceConfig';
-import { ancestorsOf, childBoxesOf, type InheritanceRows } from '../services/spaces/spaceInheritance';
-import { PART_TTL_S, PUT_TTL_S, type SpaceObjects } from '../services/spaces/spaceObjects';
+import { ancestorsOf, childBoxesOf } from '../services/spaces/spaceInheritance';
+import { PART_TTL_S, PUT_TTL_S, VIEW_TTL_S, type PresignerIdentity, type SpaceObjects } from '../services/spaces/spaceObjects';
 import {
   SpacePathError, downloadResponseHeaders, movedPath, normalizeFilePath, normalizePrefix, objectKey, pathOfKey,
-  uploadContentType, validateSpaceName,
+  uploadContentType, validateSpaceName, viewResponseHeaders,
 } from '../services/spaces/spacePaths';
 import { LastOwnerError, SpaceNameTakenError, type ChargeRef, type SpaceRecord, type SpaceStore } from '../services/spaces/spaceStore';
 
@@ -56,20 +56,26 @@ export function spaceCallerFromCli(auth: { user: { id: string }; credential: { k
 
 export interface SpacesRouterDeps {
   store: SpaceStore;
-  /** The S3 side; rejects with SpacesUnavailableError when the AWS identity can't be read. */
-  objects: () => Promise<SpaceObjects>;
+  /**
+   * The S3 side, over a presigner session named for who acts (CloudTrail
+   * records it); rejects with SpacesUnavailableError when the AWS identity
+   * can't be read.
+   */
+  objects: (identity: PresignerIdentity) => Promise<SpaceObjects>;
   /** The spaces-enabled flag for this user. */
   enabled: (userId: string) => Promise<boolean>;
   /** The spaces-sharing-enabled flag for this user: off, adding members and invites is refused. */
   sharing: (userId: string) => Promise<boolean>;
+  /** A member's role was lowered or they left (services/automations/memorySync.ts recheckMirrorsForMember). */
+  onMemberChanged?: (spaceName: string, userId: string) => Promise<void>;
   /** Who is calling, from whatever the mount authenticated; null is a 401. */
   caller: (req: Request, res: Response) => SpaceCaller | null;
+  /** The absolute browser link to a file (routes/spaceFiles.ts); unset, `files/link` answers 404. */
+  fileLink?: (space: string, path: string) => string;
   now?: () => number;
 }
 
 interface Loaded { space: SpaceRecord; access: SpaceAccess }
-
-const NO_ROWS: InheritanceRows = {};
 
 class HttpFailure extends Error {
   constructor(readonly status: number, message: string, readonly code: string) { super(message); }
@@ -144,6 +150,18 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     next();
   }));
 
+  async function objectsFor(res: Response): Promise<SpaceObjects> {
+    const caller = callerOf(res);
+    if (caller.kind === 'box') {
+      const box = await store.box(caller.instanceId);
+      return deps.objects({
+        kind: 'box', instanceId: caller.instanceId, name: box?.name ?? null, ownerUserId: caller.userId, ownerEmail: box?.ownerEmail ?? null,
+      });
+    }
+    const user = await store.ldUser(caller.userId);
+    return deps.objects({ kind: 'user', userId: caller.userId, email: user?.googleEmail ?? null });
+  }
+
   function personOnly(caller: SpaceCaller): void {
     if (caller.kind === 'box') {
       fail(403, 'A box cannot manage spaces; run this from your laptop after `termag login`, or in the termag UI', 'box_credential');
@@ -163,7 +181,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const [members, grantedBoxIds] = await Promise.all([store.memberRoles(space.id), store.grantedBoxIds(space.id)]);
     if (caller.kind === 'user') return resolveSpaceAccess(caller, { space, members, grantedBoxIds });
     const box = await store.box(caller.instanceId);
-    const ancestors = box ? await ancestorsOf(box, id => store.box(id), NO_ROWS) : [];
+    const ancestors = box ? await ancestorsOf(box, id => store.box(id)) : [];
     return resolveSpaceAccess(caller, { space, members, grantedBoxIds, box, ancestors });
   }
 
@@ -211,7 +229,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     }
     const box = await store.box(caller.instanceId);
     if (!box) { res.json({ spaces: [] }); return; }
-    const ancestors = await ancestorsOf(box, id => store.box(id), NO_ROWS);
+    const ancestors = await ancestorsOf(box, id => store.box(id));
     const granted = await store.spacesGrantedTo([box.id, ...ancestors.map(a => a.id)]);
     const seen = new Set<string>();
     const spaces = [];
@@ -317,6 +335,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     if (wouldRemoveLastOwner(roles, userId, role)) fail(400, 'A space needs at least one owner', 'last_owner');
     await store.setMemberRole(space.id, userId, role);
     await event(res, space, access, 'member.role', { path: `${userId} ${role}` });
+    await deps.onMemberChanged?.(space.name, userId).catch(() => {});
     res.json({ ok: true });
   }));
 
@@ -331,6 +350,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     if (wouldRemoveLastOwner(roles, userId, null)) fail(400, 'A space needs at least one owner; make someone else an owner first', 'last_owner');
     const { removedBoxes } = await store.removeMember(space.id, userId);
     await event(res, space, access, leaving ? 'member.leave' : 'member.remove', { path: userId });
+    await deps.onMemberChanged?.(space.name, userId).catch(() => {});
     res.json({ ok: true, removedBoxes });
   }));
 
@@ -352,7 +372,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const boxes = grants.map(g => ({
       id: g.box.id, name: g.box.name, kind: g.box.kind, status: g.box.status, ownerEmail: g.box.ownerEmail,
       mine: g.box.userId === caller.userId,
-      children: childBoxesOf(g.box.id, candidates, NO_ROWS).map(c => ({ id: c.id, name: c.name, via: g.box.id })),
+      children: childBoxesOf(g.box.id, candidates).map(c => ({ id: c.id, name: c.name, via: g.box.id })),
     }));
     res.json({ boxes });
   }));
@@ -391,7 +411,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const prefix = normalizePrefix(req.query.prefix);
     const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
     const recursive = req.query.recursive === '1' || req.query.recursive === 'true';
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
     const listed = await objects.list(objectKey(space.id, prefix), { cursor, delimiter: !recursive });
     res.json({
       prefix,
@@ -411,28 +431,45 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const body = bodyOf(req);
     const path = normalizeFilePath(body.path);
     throttle(caller);
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
     const key = objectKey(space.id, path);
     const head = await objects.head(key);
     if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
-    const url = await objects.presignGet(key, downloadResponseHeaders(path, body.inline === true));
+    const view = body.view === true ? viewResponseHeaders(path) : null;
+    const url = view
+      ? await objects.presignGet(key, view, VIEW_TTL_S)
+      : await objects.presignGet(key, downloadResponseHeaders(path, body.inline === true));
     await event(res, space, access, 'file.get', { path, bytes: head.size });
-    res.json({ ...url, size: head.size, contentType: head.contentType });
+    res.json({
+      ...url, size: head.size, contentType: head.contentType,
+      ...(body.view === true ? { view: view ? { contentType: view.contentType, render: view.render } : null } : {}),
+    });
+  }));
+
+  router.post('/:space/files/link', handler(async (req, res) => {
+    if (!deps.fileLink) notFound();
+    const { space } = await load(req, res, 'viewer');
+    const path = normalizeFilePath(bodyOf(req).path);
+    const head = await (await objectsFor(res)).head(objectKey(space.id, path));
+    if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+    res.json({ url: deps.fileLink(space.name, path), path, size: head.size });
   }));
 
   router.post('/:space/files/upload', handler(async (req, res) => {
     const caller = callerOf(res);
-    const { space } = await load(req, res, 'editor');
+    const { space, access } = await load(req, res, 'editor');
     const body = bodyOf(req);
     const path = normalizeFilePath(body.path);
     const size = await checkDeclaredSize(space, body.size);
     const contentType = uploadContentType(body.contentType);
     const key = objectKey(space.id, path);
     throttle(caller);
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
     if (size <= SINGLE_PUT_MAX_BYTES) {
       await charge(space, size, PUT_TTL_S, { key });
       const put = await objects.presignPut(key, size, contentType);
+      // A client may PUT and never call /uploaded, so the signing is the event that is always there.
+      await event(res, space, access, 'file.put.signed', { path, bytes: size });
       res.json({ kind: 'single', path, ...put });
       return;
     }
@@ -487,7 +524,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const loaded = await load(req, res, 'editor');
     throttle(callerOf(res));
     const path = normalizeFilePath(bodyOf(req).path);
-    const size = await recordPut(res, loaded, path, await deps.objects());
+    const size = await recordPut(res, loaded, path, await objectsFor(res));
     res.json({ ok: true, path, size });
   }));
 
@@ -507,7 +544,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const sized = (numbers as number[]).map(n => ({ partNumber: n, size: Math.min(PART_BYTES, size - (n - 1) * PART_BYTES) }));
     const batch = sized.reduce((t, p) => t + p.size, 0);
     await charge(space, batch, PART_TTL_S, { key: objectKey(space.id, path), uploadId: String(req.params.uploadId), partNumbers: numbers as number[] });
-    const parts = await (await deps.objects()).presignParts(objectKey(space.id, path), String(req.params.uploadId), sized);
+    const parts = await (await objectsFor(res)).presignParts(objectKey(space.id, path), String(req.params.uploadId), sized);
     res.json({ parts });
   }));
 
@@ -521,7 +558,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       && typeof (p as { etag?: unknown }).etag === 'string')) {
       fail(400, 'parts must be [{partNumber, etag}]', 'invalid_parts');
     }
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
     await objects.completeMultipart(objectKey(loaded.space.id, path), String(req.params.uploadId), parts as Array<{ partNumber: number; etag: string }>);
     const size = await recordPut(res, loaded, path, objects);
     res.json({ ok: true, path, size });
@@ -530,7 +567,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
   router.delete('/:space/uploads/:uploadId', handler(async (req, res) => {
     const { space } = await load(req, res, 'editor');
     const path = normalizeFilePath(req.query.path);
-    await (await deps.objects()).abortMultipart(objectKey(space.id, path), String(req.params.uploadId));
+    await (await objectsFor(res)).abortMultipart(objectKey(space.id, path), String(req.params.uploadId));
     res.json({ ok: true });
   }));
 
@@ -554,7 +591,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const to = isDir ? normalizePrefix(body.to) : normalizeFilePath(body.to);
     if (from === to) fail(400, 'from and to are the same', 'same_path');
     if (isDir && to.startsWith(from)) fail(400, 'Cannot move a folder into itself', 'invalid_move');
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
 
     let sources: Array<{ key: string; size: number }>;
     if (isDir) {
@@ -586,7 +623,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
   router.delete('/:space/files', handler(async (req, res) => {
     const { space, access } = await load(req, res, 'editor');
     const recursive = req.query.recursive === '1' || req.query.recursive === 'true';
-    const objects = await deps.objects();
+    const objects = await objectsFor(res);
     let keys: string[];
     let label: string;
     if (recursive) {

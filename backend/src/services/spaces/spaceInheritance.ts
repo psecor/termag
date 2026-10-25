@@ -1,13 +1,10 @@
 /**
  * Which box a box inherits its spaces from.
  *
- * The parent is derived, never stored: today the only derived box is the one
- * an ask spins up for its thread, and its parent is the box whose token opened
- * the thread. That link (AgentThread and its first AgentMessage's
- * senderInstanceId, #302/#307) is not on main yet, so parentBoxOf answers no
- * parent for every box and inheritance is inert. When it lands, it is one case
- * in parentBoxOf plus the rows the store loads for it; spaceAccess and the
- * Members tab already walk whatever this returns.
+ * A box's parent is Instance.parentInstanceId: the box whose credentials
+ * created it through the CLI (`termag project create --new-box`, the ask-box
+ * flow, warm-pool claims made that way). spaceAccess and the Members tab walk
+ * whatever this returns; a child acts with its owner's role, like any box.
  *
  * Pure: the caller loads the rows.
  */
@@ -18,18 +15,16 @@ export interface InheritanceBox {
   id: string;
   userId: string | null;
   status: string;
+  parentInstanceId?: string | null;
 }
 
-/** The rows parentBoxOf reads. Empty until the ask thread link exists. */
-export type InheritanceRows = Record<string, never>;
-
-export function parentBoxOf(_box: InheritanceBox, _rows: InheritanceRows): string | null {
-  return null;
+export function parentBoxOf(box: InheritanceBox): string | null {
+  return box.parentInstanceId ?? null;
 }
 
 /** The boxes whose parent is `parentId`, among `boxes`. */
-export function childBoxesOf<B extends InheritanceBox>(parentId: string, boxes: readonly B[], rows: InheritanceRows): B[] {
-  return boxes.filter(b => b.id !== parentId && parentBoxOf(b, rows) === parentId);
+export function childBoxesOf<B extends InheritanceBox>(parentId: string, boxes: readonly B[]): B[] {
+  return boxes.filter(b => b.id !== parentId && parentBoxOf(b) === parentId);
 }
 
 /**
@@ -40,13 +35,12 @@ export function childBoxesOf<B extends InheritanceBox>(parentId: string, boxes: 
 export async function ancestorsOf(
   box: InheritanceBox,
   loadBox: (id: string) => Promise<InheritanceBox | null>,
-  rows: InheritanceRows,
 ): Promise<InheritanceBox[]> {
   const out: InheritanceBox[] = [];
   const seen = new Set([box.id]);
   let current = box;
   while (out.length < MAX_INHERITANCE_HOPS) {
-    const parentId = parentBoxOf(current, rows);
+    const parentId = parentBoxOf(current);
     if (!parentId || seen.has(parentId)) break;
     const parent = await loadBox(parentId);
     if (!parent || parent.status === 'terminated' || parent.userId !== box.userId) break;

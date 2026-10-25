@@ -11,12 +11,12 @@ vi.mock('./agentRegistry', () => ({
   sendForProject: vi.fn(async () => ({ ok: true })),
   sendToInstanceAgent: vi.fn(async () => ({ sessions: [] })),
 }));
-vi.mock('./status', () => ({ getStatus: vi.fn(() => ({ status: 'idle' })) }));
+vi.mock('./status', () => ({ getStatus: vi.fn(() => ({ status: 'idle' })), setStatusTransitionCallback: vi.fn() }));
 vi.mock('./humanActivity', () => ({ lastHumanHeartbeat: vi.fn(() => null) }));
 vi.mock('./spawnGaugeSnapshot', () => ({ buildGaugeSnapshot: vi.fn() }));
 vi.mock('./spawnMetrics', () => ({ setGaugeSnapshot: vi.fn(), timedSweep: vi.fn((_s: string, fn: () => unknown) => fn()) }));
 
-import { refreshGaugeSnapshot, runSpawnEndTick, runSpawnNudgeTick, stopSpawnNudgeSweep, sweepGeneration } from './agentSpawnSweep';
+import { refreshGaugeSnapshot, runSpawnEndTick, runSpawnNudgeTick, startSpawnNudgeSweep, stopSpawnNudgeSweep, sweepGeneration, sweepStepNow } from './agentSpawnSweep';
 import { buildGaugeSnapshot } from './spawnGaugeSnapshot';
 import { setGaugeSnapshot } from './spawnMetrics';
 import { recordSpawnEvent } from './spawnEvents';
@@ -53,18 +53,65 @@ describe('runSpawnNudgeTick', () => {
     expect((args as { keys: string }).keys).toBe('[termag] delegate proj/add-tests reported done. Call list_spawns (metaterm MCP server) to read its report.');
   });
 
+  it('nudges the foster once one adopted it, and never an orphan nobody adopted', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([{ ...row, fosterProjectId: 'p2', fosterWorkstream: 'coord', fosterRole: 'agent' }]);
+    prisma.project.findFirst.mockResolvedValue({ name: 'home', instanceId: 'box1', user: { unixUsername: 'me' } });
+    expect(await runSpawnNudgeTick(now)).toBe(1);
+    expect(prisma.project.findFirst.mock.calls[0][0].where).toMatchObject({ id: 'p2' });
+    const [, , args] = vi.mocked(sendForProject).mock.calls[0];
+    expect(args).toMatchObject({ sessionName: 'me-home-coord-agent' });
+    expect((args as { keys: string }).keys).toMatch(/^\[termag\] adopted delegate proj\/add-tests reported done/);
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where).toMatchObject({ orphanedAt: null });
+  });
+
+  it('types ONE line per pane for every report it claims in a tick, so no Enter is lost to a paste', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([row, { ...row, id: 'ck2', childWorkstream: 'fix-lint', state: 'blocked' }]);
+    expect(await runSpawnNudgeTick(now)).toBe(2);
+    expect(prisma.agentSpawn.updateMany).toHaveBeenCalledTimes(2);
+    expect(sendForProject).toHaveBeenCalledTimes(1);
+    const [, , args] = vi.mocked(sendForProject).mock.calls[0];
+    expect((args as { keys: string }).keys).toBe('[termag] 2 delegates reported: proj/add-tests done, proj/fix-lint blocked. Call list_spawns (metaterm MCP server) to read their reports.');
+    expect(recordSpawnEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it('types a separate line into each pane, including same-named panes on two boxes', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([row, { ...row, id: 'ck2', parentProjectId: 'p2' }, { ...row, id: 'ck3', parentProjectId: 'p3' }]);
+    prisma.project.findFirst
+      .mockResolvedValueOnce({ name: 'proj', instanceId: 'box1', user: { unixUsername: 'me' } })
+      .mockResolvedValueOnce({ name: 'other', instanceId: 'box1', user: { unixUsername: 'me' } })
+      .mockResolvedValueOnce({ name: 'proj', instanceId: 'box2', user: { unixUsername: 'me' } });
+    expect(await runSpawnNudgeTick(now)).toBe(3);
+    const sends = vi.mocked(sendForProject).mock.calls.map(([host, , args]) => [(host as { instanceId: string }).instanceId, (args as { sessionName: string }).sessionName]);
+    expect(sends).toEqual([['box1', 'me-proj-agent'], ['box1', 'me-other-agent'], ['box2', 'me-proj-agent']]);
+  });
+
+  it('gives the claims back when the pane left idle before its line was typed', async () => {
+    vi.mocked(getStatus).mockReturnValueOnce({ status: 'idle' } as never).mockReturnValueOnce({ status: 'working' } as never);
+    expect(await runSpawnNudgeTick(now)).toBe(0);
+    expect(sendForProject).not.toHaveBeenCalled();
+    expect(prisma.agentSpawn.updateMany.mock.calls[1][0]).toEqual({ where: { id: { in: ['ck1'] }, nudgedAt: new Date(now) }, data: { nudgedAt: null } });
+  });
+
   it('types nothing when another process claimed it first', async () => {
     prisma.agentSpawn.updateMany.mockResolvedValue({ count: 0 });
     expect(await runSpawnNudgeTick(now)).toBe(0);
     expect(sendForProject).not.toHaveBeenCalled();
   });
 
-  it('leaves a busy parent for a later tick, and stamps a gone one without typing', async () => {
+  it('nudges the foster of a browser-spawned root, which has no parent', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([{ ...row, parentProjectId: null, parentWorkstream: null, parentRole: null, parentSession: null, fosterProjectId: 'p2', fosterWorkstream: 'main', fosterRole: 'agent' }]);
+    expect(await runSpawnNudgeTick(now)).toBe(1);
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where.parentProjectId).toBeUndefined();
+  });
+
+  it('leaves a busy parent for a later tick, and a gone one to the orphan sweep until the report is a day old', async () => {
     vi.mocked(getStatus).mockReturnValue({ status: 'waiting' } as never);
     await runSpawnNudgeTick(now);
     expect(prisma.agentSpawn.updateMany).not.toHaveBeenCalled();
     prisma.project.findFirst.mockResolvedValue(null);
     await runSpawnNudgeTick(now);
+    expect(prisma.agentSpawn.updateMany).not.toHaveBeenCalled();
+    await runSpawnNudgeTick(now + 25 * 60 * 60 * 1000);
     expect(prisma.agentSpawn.updateMany).toHaveBeenCalledTimes(1);
     expect(sendForProject).not.toHaveBeenCalled();
   });
@@ -150,5 +197,27 @@ describe('refreshGaugeSnapshot', () => {
     await refreshGaugeSnapshot(tickStarted);
     expect(buildGaugeSnapshot).not.toHaveBeenCalled();
     expect(setGaugeSnapshot).not.toHaveBeenCalled();
+  });
+});
+
+describe('the sweep timer (#452)', () => {
+  it('names a step that is still running after a minute, once, while the rest of the sweep waits on it', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      // The nudge step's read never answers: a stuck step.
+      prisma.agentSpawn.findMany.mockImplementation(() => new Promise(() => {}));
+      startSpawnNudgeSweep();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(sweepStepNow()?.step).toBe('nudge');
+      await vi.advanceTimersByTimeAsync(80_000);
+      const stuck = warn.mock.calls.filter(c => String(c[0]).includes('still running'));
+      expect(stuck).toHaveLength(1);
+      expect(String(stuck[0][0])).toMatch(/sweep step nudge still running after \d+ s; the rest of the sweep waits on it/);
+    } finally {
+      stopSpawnNudgeSweep();
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

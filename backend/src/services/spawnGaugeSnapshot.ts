@@ -17,7 +17,7 @@ const USER_SELECT = { id: true, googleEmail: true, displayName: true, unixUserna
 export async function buildGaugeSnapshot(now: number = Date.now()): Promise<GaugeSnapshot> {
   const [live, lastHour, boxRows] = await Promise.all([
     prisma.agentSpawn.findMany({
-      where: { endedAt: null, state: { not: 'failed' } },
+      where: { endedAt: null, parkedAt: null, state: { not: 'failed' } },
       select: { userId: true, childInstanceId: true, state: true, reportedAt: true },
       take: 10_000,
     }),

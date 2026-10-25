@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { syncRepo, pauseBelow, type PrNode, type Page, type SyncState } from './sync';
+import { syncRepo, searchSync, pauseBelow, SEARCH_CAP, type PrNode, type Page, type SearchNode, type SearchPage, type SyncState } from './sync';
 
 const node = (n: number, updatedAt: string): PrNode => ({
   id: `pr${n}`, number: n, state: 'MERGED', isDraft: false, createdAt: updatedAt, updatedAt, mergedAt: updatedAt, closedAt: updatedAt,
@@ -89,6 +89,15 @@ describe('syncRepo head pass', () => {
     expect(r.state.highWater).toEqual(new Date('2026-10-10T00:00:00Z'));
   });
 
+  it('pauses on the rate limit even when the pass is one page long', async () => {
+    const repo = fakeRepo([node(2, '2026-10-11T00:00:00Z'), node(1, '2026-10-10T00:00:00Z')], 2, 100);
+    const s = sink();
+    const done: SyncState = { backfillCursor: null, backfillTop: null, backfillDone: true, highWater: new Date('2026-10-10T00:00:00Z') };
+    const r = await syncRepo(done, new Date(0), 10, { fetchPage: a => repo.fetchPage(a), write: s.write, shouldPause: pauseBelow(0.6) });
+    expect(r).toMatchObject({ pages: 1, paused: true });
+    expect(r.state.highWater).toEqual(new Date('2026-10-11T00:00:00Z')); // the pass did reach its mark
+  });
+
   it('does not advance the mark when the budget cuts the pass short', async () => {
     const repo = fakeRepo([node(5, '2026-10-15T00:00:00Z'), node(4, '2026-10-14T00:00:00Z'), node(3, '2026-10-13T00:00:00Z'), node(2, '2026-10-01T00:00:00Z')]);
     const s = sink();
@@ -96,5 +105,69 @@ describe('syncRepo head pass', () => {
     const r = await syncRepo(done, new Date(0), 1, { fetchPage: a => repo.fetchPage(a), write: s.write, shouldPause: () => false });
     expect(r.state.highWater).toEqual(new Date('2026-10-02T00:00:00Z'));
     expect([...s.seen.keys()]).toEqual([5, 4]);
+  });
+});
+
+const hit = (n: number, repo: string, visibility = 'INTERNAL'): SearchNode => ({ ...node(n, '2026-10-21T13:00:00Z'), repository: { nameWithOwner: repo, visibility } });
+
+/** A fake search: hits served in pages by an index cursor. */
+function fakeSearch(hits: SearchNode[], pageSize = 2, remaining = 5000, issueCount = hits.length) {
+  const calls: Array<string | null> = [];
+  return {
+    calls,
+    async fetchPage(after: string | null): Promise<SearchPage> {
+      calls.push(after);
+      const i = after === null ? 0 : Number(after);
+      return { issueCount, nodes: hits.slice(i, i + pageSize), hasNextPage: i + pageSize < hits.length, endCursor: String(i + pageSize), rateLimit: { remaining, limit: 5000, resetAt: '' } };
+    },
+  };
+}
+
+function repoSink() {
+  const seen: Array<[string, number, string]> = [];
+  return { seen, write: async (repo: string, nodes: SearchNode[], visibility: string) => { for (const n of nodes) seen.push([repo, n.number, visibility]); } };
+}
+
+describe('searchSync', () => {
+  const covered = new Set(['example-org/webapp', 'example-org/js-ai-sdk']);
+  const include = (r: string) => covered.has(r);
+
+  it('reads every page and writes only the covered repos, grouped by repo', async () => {
+    const search = fakeSearch([hit(1, 'example-org/Webapp'), hit(2, 'example-org/other'), hit(3, 'example-org/js-ai-sdk', 'PUBLIC'), hit(4, 'example-org/webapp')]);
+    const s = repoSink();
+    const r = await searchSync(10, { fetchPage: a => search.fetchPage(a), write: s.write, include, shouldPause: () => false });
+    expect(r).toEqual({ pages: 2, written: 3, paused: false, complete: true, overCap: false, cursor: null });
+    expect(s.seen).toEqual([['example-org/webapp', 1, 'internal'], ['example-org/js-ai-sdk', 3, 'public'], ['example-org/webapp', 4, 'internal']]);
+  });
+
+  it('is not complete when the page budget runs out, and resumes from its cursor', async () => {
+    const search = fakeSearch([hit(1, 'example-org/webapp'), hit(2, 'example-org/webapp'), hit(3, 'example-org/webapp'), hit(4, 'example-org/webapp'), hit(5, 'example-org/webapp')]);
+    const s = repoSink();
+    const deps = { fetchPage: (a: string | null) => search.fetchPage(a), write: s.write, include, shouldPause: () => false };
+    const first = await searchSync(1, deps);
+    expect(first).toMatchObject({ pages: 1, complete: false, overCap: false, cursor: '2' });
+    const second = await searchSync(1, deps, first.cursor);
+    expect(second).toMatchObject({ complete: false, cursor: '4' });
+    const third = await searchSync(1, deps, second.cursor);
+    expect(third).toMatchObject({ complete: true, cursor: null });
+    expect(search.calls).toEqual([null, '2', '4']);
+    expect(s.seen.map(x => x[1])).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('stops on the rate limit, and still counts a last page as complete', async () => {
+    const two = fakeSearch([hit(1, 'example-org/webapp'), hit(2, 'example-org/webapp'), hit(3, 'example-org/webapp')], 2, 100);
+    expect(await searchSync(10, { fetchPage: a => two.fetchPage(a), write: repoSink().write, include, shouldPause: pauseBelow(0.6) }))
+      .toMatchObject({ pages: 1, paused: true, complete: false, cursor: '2' });
+    const one = fakeSearch([hit(1, 'example-org/webapp')], 2, 100);
+    expect(await searchSync(10, { fetchPage: a => one.fetchPage(a), write: repoSink().write, include, shouldPause: pauseBelow(0.6) }))
+      .toMatchObject({ pages: 1, paused: true, complete: true });
+  });
+
+  it('gives up after one page, writing nothing, when there are more hits than search returns', async () => {
+    const search = fakeSearch([hit(1, 'example-org/webapp')], 2, 5000, SEARCH_CAP + 1);
+    const s = repoSink();
+    const r = await searchSync(10, { fetchPage: a => search.fetchPage(a), write: s.write, include, shouldPause: () => false });
+    expect(r).toEqual({ pages: 1, written: 0, paused: false, complete: false, overCap: true, cursor: null });
+    expect(s.seen).toEqual([]);
   });
 });

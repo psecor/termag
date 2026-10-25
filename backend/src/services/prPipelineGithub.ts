@@ -236,7 +236,7 @@ const GREEN = new Set(['SUCCESS']);
  * still says failing or pending), and so does a PR the answer leaves out; the
  * count of those comes back so the page can say so. It never fails the list.
  */
-async function fillChecks(token: string, prs: Raw[], fetchImpl: Fetch): Promise<number> {
+export async function fillChecks(token: string, prs: Raw[], fetchImpl: Fetch): Promise<number> {
   const byId = new Map<string, Raw>();
   for (const pr of prs) {
     const state = pr?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state;
@@ -287,6 +287,162 @@ export async function searchPrs(token: string, now: Date, fetchImpl: Fetch = fet
   };
 }
 
+// ── Pull requests by number (review groups) ──────────────────────────────────
+
+/** Members per request: aliased `repository { pullRequest }` lookups cost a point or so each. */
+export const BY_NUMBER_BATCH = 25;
+
+/** A pull request read by its number, whatever its state: a review group's member (services/prReviewGroups.ts). */
+export interface NumberedPr {
+  repo: string;
+  number: number;
+  /** False when GitHub has no such PR the token can see: a wrong number, a private repo. */
+  found: boolean;
+  state: 'OPEN' | 'MERGED' | 'CLOSED' | null;
+  /** The open PR's fields, as the lane searches read them (with requestedYou); null unless open. */
+  open: OpenPr | null;
+  /** The merged or closed PR's fields for its row; null unless found. */
+  title: string;
+  url: string;
+  author: string | null;
+  headRefName: string;
+  baseRefName: string;
+  mergedAt: string | null;
+  closedAt: string | null;
+  /** The viewer's latest submitted review (approve, changes or comment): a draft (PENDING) or a dismissed one is not. */
+  yourReview: { state: string; submittedAt: string | null } | null;
+}
+
+// `states`: a review still being written (PENDING) has no submittedAt and must
+// not check a member off, and nor does one a maintainer dismissed.
+function byNumberQuery(n: number): string {
+  const vars = Array.from({ length: n }, (_, i) => `$o${i}: String!, $n${i}: String!, $p${i}: Int!`).join(', ');
+  const fields = Array.from({ length: n }, (_, i) => `  m${i}: repository(owner: $o${i}, name: $n${i}) { pullRequest(number: $p${i}) {
+    ...Open ...Requested state mergedAt closedAt
+    yours: reviews(author: $viewer, last: 1, states: [APPROVED, CHANGES_REQUESTED, COMMENTED]) { nodes { state submittedAt } }
+  } }`).join('\n');
+  return [`query ByNumber($viewer: String!, ${vars}) {\n${fields}\n}`, FRAGMENTS.Open, FRAGMENTS.Requested].join('\n');
+}
+
+function parseNumbered(ref: { repo: string; number: number }, node: Raw | null | undefined, viewer: string): NumberedPr {
+  const none: NumberedPr = {
+    repo: ref.repo, number: ref.number, found: false, state: null, open: null, title: '', url: '', author: null,
+    headRefName: '', baseRefName: '', mergedAt: null, closedAt: null, yourReview: null,
+  };
+  if (!node || !isPr(node)) return none;
+  const state = node.state === 'OPEN' || node.state === 'MERGED' || node.state === 'CLOSED' ? node.state : null;
+  const review = ((node.yours?.nodes ?? []) as Raw[]).at(-1);
+  return {
+    repo: node.repository.nameWithOwner,
+    number: node.number,
+    found: true,
+    state,
+    open: state === 'OPEN' ? parseOpenPr(node, viewer) : null,
+    title: str(node.title) ?? '',
+    url: str(node.url) ?? '',
+    author: str(node.author?.login),
+    headRefName: str(node.headRefName) ?? '',
+    baseRefName: str(node.baseRefName) ?? '',
+    mergedAt: str(node.mergedAt),
+    closedAt: str(node.closedAt),
+    yourReview: str(review?.state) ? { state: review!.state, submittedAt: str(review!.submittedAt) } : null,
+  };
+}
+
+/** The token's GitHub login, for a read outside the lane searches (which carry it). */
+export async function viewerLogin(token: string, fetchImpl: Fetch = fetch): Promise<string> {
+  const data = await graphql(token, 'query Viewer { viewer { login } }', {}, fetchImpl);
+  const login = str(data.viewer?.login);
+  if (!login) throw new GithubApiError('GitHub did not say who the token is', 502);
+  return login;
+}
+
+/**
+ * Pull requests by `owner/name#number`, BY_NUMBER_BATCH to a request, in
+ * parallel, with their checks as the lane searches fill them. A batch GitHub
+ * refuses fails the read (the caller keeps what it stored); a PR or repository
+ * it does not know comes back `found: false`, since GraphQL answers the rest.
+ */
+export async function fetchPrsByNumber(
+  token: string, viewer: string, refs: { repo: string; number: number }[], fetchImpl: Fetch = fetch,
+): Promise<NumberedPr[]> {
+  const batches: { repo: string; number: number }[][] = [];
+  for (let i = 0; i < refs.length; i += BY_NUMBER_BATCH) batches.push(refs.slice(i, i + BY_NUMBER_BATCH));
+  const answers = await Promise.all(batches.map(async batch => {
+    const variables: Record<string, unknown> = { viewer };
+    batch.forEach((r, i) => {
+      const [owner, name] = r.repo.split('/');
+      variables[`o${i}`] = owner;
+      variables[`n${i}`] = name;
+      variables[`p${i}`] = r.number;
+    });
+    const data = await graphql(token, byNumberQuery(batch.length), variables, fetchImpl);
+    const nodes = batch.map((_, i) => (data[`m${i}`]?.pullRequest ?? null) as Raw | null);
+    await fillChecks(token, nodes.filter((n): n is Raw => !!n && n.state === 'OPEN'), fetchImpl);
+    return batch.map((r, i) => parseNumbered(r, nodes[i], viewer));
+  }));
+  return answers.flat();
+}
+
+// ── A PR's few fields, and its description (suggested groups) ───────────────
+
+/** A PR's fields for a suggested group (services/prGroupSuggestions.ts); `body` only when asked for. */
+export interface LitePr {
+  repo: string;
+  number: number;
+  found: boolean;
+  open: boolean;
+  title: string;
+  url: string;
+  author: string | null;
+  body: string | null;
+}
+
+function liteQuery(n: number, withBody: boolean): string {
+  const vars = Array.from({ length: n }, (_, i) => `$o${i}: String!, $n${i}: String!, $p${i}: Int!`).join(', ');
+  const fields = Array.from({ length: n }, (_, i) =>
+    `  m${i}: repository(owner: $o${i}, name: $n${i}) { pullRequest(number: $p${i}) { number title url state author { login } repository { nameWithOwner }${withBody ? ' body' : ''} } }`).join('\n');
+  return `query Lite(${vars}) {\n${fields}\n}`;
+}
+
+/**
+ * A few fields of each PR by number, BY_NUMBER_BATCH to a request: whether it
+ * is open, its title, and with `withBody` its description, which only
+ * suggested groups read (for the references in it; never shown). One GitHub
+ * does not have comes back `found: false`; a batch GitHub refuses fails the read.
+ */
+export async function fetchPrLite(
+  token: string, refs: { repo: string; number: number }[], withBody: boolean, fetchImpl: Fetch = fetch,
+): Promise<LitePr[]> {
+  const batches: { repo: string; number: number }[][] = [];
+  for (let i = 0; i < refs.length; i += BY_NUMBER_BATCH) batches.push(refs.slice(i, i + BY_NUMBER_BATCH));
+  const answers = await Promise.all(batches.map(async batch => {
+    const variables: Record<string, unknown> = {};
+    batch.forEach((r, i) => {
+      const [owner, name] = r.repo.split('/');
+      variables[`o${i}`] = owner;
+      variables[`n${i}`] = name;
+      variables[`p${i}`] = r.number;
+    });
+    const data = await graphql(token, liteQuery(batch.length, withBody), variables, fetchImpl);
+    return batch.map((r, i): LitePr => {
+      const node = (data[`m${i}`]?.pullRequest ?? null) as Raw | null;
+      if (!node || !isPr(node)) return { repo: r.repo, number: r.number, found: false, open: false, title: '', url: '', author: null, body: null };
+      return {
+        repo: node.repository.nameWithOwner,
+        number: node.number,
+        found: true,
+        open: node.state === 'OPEN',
+        title: str(node.title) ?? '',
+        url: str(node.url) ?? '',
+        author: str(node.author?.login),
+        body: withBody ? (typeof node.body === 'string' ? node.body : '') : null,
+      };
+    });
+  }));
+  return answers.flat();
+}
+
 // ── Parsing ──────────────────────────────────────────────────────────────────
 
 // GitHub GraphQL nodes, read defensively field by field.
@@ -335,10 +491,12 @@ export function parseOpenPr(node: Raw, viewer?: string): OpenPr | null {
   if (!isPr(node)) return null;
   const rollup = node.commits?.nodes?.[0]?.commit?.statusCheckRollup ?? null;
   const checks = ((rollup?.contexts?.nodes ?? []) as Raw[]).map(checkState).filter((c): c is CheckState => c !== null);
-  const requestedReviewers = ((node.reviewRequests?.nodes ?? []) as Raw[])
-    .map(n => n?.requestedReviewer)
+  const requested = ((node.reviewRequests?.nodes ?? []) as Raw[]).map(n => n?.requestedReviewer);
+  const requestedReviewers = requested
     .map(r => r?.__typename === 'Team' ? str(r.slug) : str(r?.login))
     .filter((r): r is string => r !== null);
+  // No login to compare (the answer lacked viewer): leave it unknown, which counts.
+  const me = viewer ? viewer.toLowerCase() : undefined;
   return {
     repo: node.repository.nameWithOwner,
     number: node.number,
@@ -357,6 +515,8 @@ export function parseOpenPr(node: Raw, viewer?: string): OpenPr | null {
     checks,
     requestedReviewers,
     requestedAt: viewer === undefined ? null : requestedAtFor(node, viewer),
+    // By login, not by the merged list: a team slug can equal someone's login.
+    ...(me === undefined ? {} : { requestedYou: requested.some(r => r?.__typename === 'User' && str(r.login)?.toLowerCase() === me) }),
   };
 }
 

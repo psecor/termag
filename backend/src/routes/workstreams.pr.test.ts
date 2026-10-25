@@ -38,7 +38,7 @@ beforeEach(() => {
   vi.mocked(registry.projectAgentCapabilities).mockReturnValue(['worktree-pr-v1']);
 });
 
-const input = { name: 'termag-pr-defer', branch: 'feat/pr-defer', pr: { number: 359, sameRepo: true, headOid: 'b'.repeat(40) } };
+const input = { name: 'termag-pr-defer', branch: 'feat/pr-defer', pr: { repo: 'example-org/termag', number: 359, sameRepo: true, headOid: 'b'.repeat(40) } };
 
 describe('createWorkstreamFor with a pull request', () => {
   it('checks the PR\'s branch out through git-worktree-add-pr', async () => {
@@ -87,6 +87,36 @@ describe('createWorkstreamFor with a pull request', () => {
     send.mockRejectedValue(new Error('feat/pr-defer is already checked out at /home/psecor/termag/projects/termag'));
     const got = await createWorkstreamFor(USER, 'p1', input);
     expect(got).toMatchObject({ status: 500, body: { error: expect.stringContaining('already checked out') } });
+  });
+});
+
+describe('the project\'s repository', () => {
+  const origin = (url: string | null) => send.mockImplementation((async (_h: unknown, type: string) => (
+    type === 'git-branch-state' ? { origin: url } : { ok: true, path: '/x' })) as never);
+
+  it('refuses a project whose origin is another repository, before any fetch', async () => {
+    origin('https://github.com/example-org/termag.git');
+    const got = await createWorkstreamFor(USER, 'p1', { ...input, pr: { ...input.pr, repo: 'example-org/terraform', number: 28576 } });
+    expect(got.status).toBe(409);
+    expect((got.body as { error: string }).error).toBe(
+      'termag is a checkout of example-org/termag, not example-org/terraform. Make a project for example-org/terraform (or un-archive one), then try again.');
+    expect(send.mock.calls.some(c => c[1] === 'git-worktree-add-pr')).toBe(false);
+    expect(create).not.toHaveBeenCalled();
+  });
+  it('checks out when the origin is the PR\'s repository, whatever its case or form', async () => {
+    origin('git@github.com:Example-Org/Termag.git');
+    const got = await createWorkstreamFor(USER, 'p1', input);
+    expect(got.status).toBe(201);
+    expect(send).toHaveBeenCalledWith(expect.anything(), 'git-branch-state', { cwd: '/home/psecor/termag/projects/termag' }, 10_000);
+  });
+  it('leaves it to the fetch when the box cannot say', async () => {
+    origin(null);
+    expect((await createWorkstreamFor(USER, 'p1', input)).status).toBe(201);
+    send.mockImplementation((async (_h: unknown, type: string) => {
+      if (type === 'git-branch-state') throw new Error('Unknown command');
+      return { ok: true, path: '/x' };
+    }) as never);
+    expect((await createWorkstreamFor(USER, 'p1', input)).status).toBe(201);
   });
 });
 

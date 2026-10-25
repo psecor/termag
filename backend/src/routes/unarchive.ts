@@ -30,18 +30,35 @@ export interface UnarchivePlan {
    * the pane the user is about to look at comes up first.
    */
   relaunch: UnarchiveWorkflow[];
+  /**
+   * Non-main workstreams to give an agent back. Archiving deletes every
+   * workflow but keeps the workstream rows, so without this an un-archived
+   * project lists its workstreams with no agent: no status, no relaunch on
+   * reconnect, and no Switch agent. Only on the box the project was archived
+   * from, where the worktrees still are; the caller also checks each checkout.
+   */
+  restoreAgents: string[];
 }
 
 export function planUnarchiveLaunches(opts: {
   existingWorkflows: UnarchiveWorkflow[];
   initialAgentEnabled: boolean;
+  /** Names of the project's live (not archived) workstreams. */
+  workstreams?: string[];
+  /** The un-archive keeps the project on the box it was archived from. */
+  sameBox?: boolean;
 }): UnarchivePlan {
   const { existingWorkflows, initialAgentEnabled } = opts;
   const hasAgent = existingWorkflows.some(w => w.type === 'agent');
   const agents = existingWorkflows.filter(w => w.type === 'agent');
   const others = existingWorkflows.filter(w => w.type !== 'agent');
+  const withAgent = new Set(agents.map(w => w.workstream));
+  const restoreAgents = opts.sameBox
+    ? (opts.workstreams ?? []).filter(name => name !== 'main' && !withAgent.has(name))
+    : [];
   return {
     createAgentWorkflow: initialAgentEnabled && !hasAgent,
     relaunch: [...agents, ...others],
+    restoreAgents,
   };
 }

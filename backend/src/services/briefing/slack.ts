@@ -1,8 +1,9 @@
 /**
  * The briefing as a Slack DM (decided 2026-10-11, phase 2): the window label
- * first, then the summary, what was left open and what to pick up, each item
- * linking into its session when FRONTEND_URL is set, and a "Run again"
- * button. Only the composed text goes to Slack, never pane or transcript text.
+ * first, then the headline, a line of numbers, and the three bullet sections
+ * (Worked on, Left open, Work better), each item linking into its session
+ * when FRONTEND_URL is set and to its PR on GitHub, and a "Run again"
+ * button. The card's charts stay on the web. Only the composed text goes to Slack, never pane or transcript text.
  *
  * Sent with the Web API client, which stays up on a draining process too; the
  * button's action arrives through Socket Mode, i.e. on the lease holder.
@@ -13,8 +14,9 @@ import { resolveTermagUser } from '../../slack/userMapping';
 import { readSchedule } from './schedule';
 import { startBriefing } from './runner';
 import { viewById } from './store';
-import type { BriefingView } from './types';
-import { windowPrefix } from './window';
+import type { BriefingView, LedgerTotals } from './types';
+import { prUrl } from './content';
+import { fmtSpan, windowPrefix } from './window';
 
 export const RUN_AGAIN_ACTION = 'briefing_run_again';
 
@@ -37,6 +39,21 @@ export function webBase(env: NodeJS.ProcessEnv = process.env): string | null {
   return `${url.replace(/\/+$/, '')}${(env.BASE_PATH ?? '').replace(/\/+$/, '')}`;
 }
 
+/** "You 4 hours 24 min · agents 3 hours 29 min · 37 sessions · 1 waiting · 4 PRs need you". */
+export function numbersLine(t: LedgerTotals | null): string | null {
+  if (!t) return null;
+  const parts = [`You ${fmtSpan(t.humanMs)}`, `agents ${fmtSpan(t.agentMs)}`, `${t.sessionsTouched} session${t.sessionsTouched === 1 ? '' : 's'}`];
+  if (t.waitingNow) parts.push(`${t.waitingNow} waiting`);
+  if (t.prsNeedingAttention) parts.push(`${t.prsNeedingAttention} PR${t.prsNeedingAttention === 1 ? '' : 's'} need you`);
+  return parts.join(' · ');
+}
+
+const prLink = (ref: string) => {
+  const url = prUrl(ref);
+  const label = slackEscape(`#${ref.split('#')[1]}`);
+  return url ? `<${url}|${label}>` : label;
+};
+
 export function briefingBlocks(b: BriefingView, base: string | null): { text: string; blocks: unknown[] } {
   const c = b.content;
   const where = (projectId: string | null, workstream: string | null) => {
@@ -53,26 +70,27 @@ export function briefingBlocks(b: BriefingView, base: string | null): { text: st
   if (b.status !== 'done' || !c) {
     blocks.push({ type: 'section', text: { type: 'mrkdwn', text: slackEscape(b.error ?? 'The briefing did not finish.') } });
   } else {
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: slackEscape(c.summary) } });
-    if (c.carryovers.length) {
-      const lines = c.carryovers.slice(0, 10).map(x => {
-        const w = where(x.projectId, x.workstream);
-        return `• *${KIND_LABEL[x.kind] ?? 'To do'}*${w ? ` ${w}` : ''}: ${slackEscape(x.title)}${x.detail ? `\n   ${slackEscape(x.detail)}` : ''}`;
-      });
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Left open*\n${lines.join('\n')}`.slice(0, 2900) } });
-    }
-    if (c.suggestions.length) {
-      const lines = c.suggestions.slice(0, 5).map((x, i) => {
-        const w = where(x.projectId, x.workstream);
-        return `${i + 1}. ${w ? `${w}: ` : ''}${slackEscape(x.text)}${x.why ? ` _${slackEscape(x.why)}_` : ''}`;
-      });
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Pick up today*\n${lines.join('\n')}`.slice(0, 2900) } });
-    }
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${slackEscape(c.headline)}*` } });
+    const numbers = numbersLine(b.stats);
+    if (numbers) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: slackEscape(numbers) }] });
+    const section = (title: string, lines: string[]) => {
+      if (lines.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${title}*\n${lines.join('\n')}`.slice(0, 2900) } });
+    };
+    section('Worked on', c.workedOn.slice(0, 12).map(x => {
+      const w = where(x.projectId, x.workstream);
+      const prs = x.prs.length ? ` (${x.prs.map(prLink).join(', ')})` : '';
+      return `• ${w ? `${w}: ` : ''}${slackEscape(x.text)}${prs}`;
+    }));
+    section('Left open', c.leftOpen.slice(0, 10).map(x => {
+      const w = where(x.projectId, x.workstream);
+      return `• *${KIND_LABEL[x.kind] ?? 'To do'}*${w ? ` ${w}` : ''}: ${slackEscape(x.title)}${x.pr ? ` (${prLink(x.pr)})` : ''}${x.detail ? ` _${slackEscape(x.detail)}_` : ''}`;
+    }));
+    section('Work better', c.workBetter.slice(0, 3).map(x => `• ${slackEscape(x.text)}${x.why ? ` _${slackEscape(x.why)}_` : ''}`));
   }
   const actions: unknown[] = [{ type: 'button', action_id: RUN_AGAIN_ACTION, text: { type: 'plain_text', text: 'Run again' }, value: 'run' }];
   if (base) actions.push({ type: 'button', text: { type: 'plain_text', text: 'Open dashboard' }, url: `${base}/dashboard` });
   blocks.push({ type: 'actions', elements: actions });
-  const text = c ? `Your termag briefing: ${c.summary}`.slice(0, 300) : `Your termag briefing: ${b.error ?? 'did not finish'}`;
+  const text = c ? `Your termag briefing: ${c.headline}`.slice(0, 300) : `Your termag briefing: ${b.error ?? 'did not finish'}`;
   return { text, blocks };
 }
 

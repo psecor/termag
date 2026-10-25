@@ -24,7 +24,24 @@ vi.mock('./credentialStore', () => ({
   githubStoreDeps: () => ({ read: () => store.read() }),
 }));
 
-const { agentTelemetrySettings, deliverToInstance, planDelivery, providersFor, refusalFor, sessionTelemetrySettings, REASONS } = await import('./credentialDelivery');
+const mcp = vi.hoisted(() => ({ flag: true, connectors: [] as { id: string; name: string }[], fail: false }));
+vi.mock('./mcpConnectorStore', () => ({
+  mcpBrokerEnabledForBox: async () => mcp.flag,
+  listConnectors: async () => {
+    if (mcp.fail) throw new Error('db down');
+    return mcp.connectors;
+  },
+}));
+
+const fireworks = vi.hoisted(() => ({ flag: true, fail: false }));
+vi.mock('./fireworksFlag', () => ({
+  fireworksEnabledForBox: async () => {
+    if (fireworks.fail) throw new Error('ld down');
+    return fireworks.flag;
+  },
+}));
+
+const { agentTelemetrySettings, deliverToInstance, deliveryInFlight, deliversGithub, planDelivery, providersFor, refusalFor, sessionTelemetrySettings, REASONS } = await import('./credentialDelivery');
 
 const ec2Box = { kind: 'owned-box', user: { id: 'u' }, instance: { id: 'i', userId: 'u', kind: 'ec2' } } as never;
 const externalBox = { kind: 'owned-box', user: { id: 'u' }, instance: { id: 'i', userId: 'u', kind: 'external' } } as never;
@@ -62,6 +79,21 @@ describe('providersFor', () => {
   it('offers the Claude gateway and GitHub to every agent', () => {
     expect(providersFor(BOTH)).toEqual(['claude-gateway', 'github']);
     expect(providersFor(V1)).toEqual(['claude-gateway', 'github']);
+  });
+});
+
+describe('deliversGithub', () => {
+  it('needs the credential store and a broker URL, as delivery does', () => {
+    const before = store.config;
+    try {
+      store.config = { kmsKeyArn: 'arn:aws:kms:us-east-2:000000000000:key/k' };
+      expect(deliversGithub({ GITHUB_BROKER_URL: 'https://agent.termag.example.com' })).toBe(true);
+      expect(deliversGithub({})).toBe(false);
+      store.config = null;
+      expect(deliversGithub({ GITHUB_BROKER_URL: 'https://agent.termag.example.com' })).toBe(false);
+    } finally {
+      store.config = before;
+    }
   });
 });
 
@@ -242,7 +274,7 @@ describe('planDelivery: telemetry', () => {
       CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1',
       OTEL_TRACES_EXPORTER: 'otlp',
       OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.test',
-      OTEL_RESOURCE_ATTRIBUTES: 'telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.session.kind=interactive,termag.user.id=cmuser01,termag.box.id=cm_box-02',
+      OTEL_RESOURCE_ATTRIBUTES: 'telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=interactive,termag.user.id=cmuser01,termag.box.id=cm_box-02',
     });
     expect(Object.keys(TELEMETRY.env).filter(k => k.startsWith('OTEL_LOG_'))).toEqual([]);
   });
@@ -260,7 +292,12 @@ describe('planDelivery: telemetry', () => {
 
   it('leaves the context keys out rather than write one that would need escaping', () => {
     const { env } = sessionTelemetrySettings({ project: 'p1', endpoint: 'https://otel.example.test' }, { user: 'u,x=y', box: 'b1' });
-    expect(env.OTEL_RESOURCE_ATTRIBUTES).toBe('telemetry.project_id=p1,service.name=termag-claude-session,termag.session.kind=interactive');
+    expect(env.OTEL_RESOURCE_ATTRIBUTES).toBe('telemetry.project_id=p1,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=interactive');
+  });
+
+  it('names the agent on the Claude resource, as the other agents name theirs', () => {
+    const { env } = sessionTelemetrySettings({ project: 'p1', endpoint: 'https://otel.example.test' }, { user: 'u1', box: 'b1' });
+    expect(env.OTEL_RESOURCE_ATTRIBUTES).toContain(',termag.agent=claude,termag.session.kind=interactive');
   });
 
   it('removes telemetry, with the reason, when the orchestrator ships none', () => {
@@ -289,7 +326,7 @@ describe('planDelivery: agent telemetry', () => {
 
   it('shares the context keys, and their refusal, with the Claude Code resource', () => {
     const claude = sessionTelemetrySettings(DEST, { user: 'cmuser01', box: 'cm_box-02' }).env.OTEL_RESOURCE_ATTRIBUTES;
-    expect(claude).toBe(AGENTS.resourceAttributes.replace(',termag.session', ',service.name=termag-claude-session,termag.session'));
+    expect(claude).toBe(AGENTS.resourceAttributes.replace(',termag.session', ',service.name=termag-claude-session,termag.agent=claude,termag.session'));
     expect(agentTelemetrySettings(DEST, { user: 'u,x=y', box: 'b1' }).resourceAttributes)
       .toBe('telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,termag.session.kind=interactive');
   });
@@ -304,5 +341,155 @@ describe('planDelivery: agent telemetry', () => {
     expect(steps.some(s => s.provider === 'agent-telemetry')).toBe(false);
     expect(providersFor([...ALL, 'telemetry-v1'])).not.toContain('agent-telemetry');
     expect(providersFor([...ALL, 'agent-telemetry-v1'])).toContain('agent-telemetry');
+  });
+});
+
+describe('planDelivery: mcp', () => {
+  const MCP = { broker: 'https://mcp-broker.example.test', connectors: [{ id: 'c1', name: 'figma' }] };
+  const CAPS = [...ALL, 'mcp-broker-v1'];
+
+  it('sends an mcp-broker-v1 box the broker and connector ids and names, nothing secret', () => {
+    const steps = planDelivery({ ...OFF, mcp: MCP }, CAPS);
+    expect(steps).toContainEqual({ type: 'credentials-apply', provider: 'mcp', payload: MCP });
+  });
+
+  it('removes mcp with the reason when the broker is off for this box', () => {
+    expect(planDelivery({ ...OFF, mcp: null, mcpOffReason: REASONS.mcpOff }, CAPS))
+      .toContainEqual({ type: 'credentials-remove', provider: 'mcp', reason: REASONS.mcpOff });
+    expect(planDelivery(OFF, CAPS)).toContainEqual({ type: 'credentials-remove', provider: 'mcp', reason: REASONS.noMcpBroker });
+  });
+
+  it('sends no mcp step when the connectors could not be read, or to an agent without mcp-broker-v1', () => {
+    expect(planDelivery({ ...OFF, mcpUnknown: true }, CAPS).some(s => s.provider === 'mcp')).toBe(false);
+    expect(planDelivery({ ...OFF, mcp: MCP }, ALL).some(s => s.provider === 'mcp')).toBe(false);
+    expect(providersFor(ALL)).not.toContain('mcp');
+    expect(providersFor(CAPS)).toContain('mcp');
+  });
+});
+
+describe('deliverToInstance: mcp', () => {
+  const mcpSteps = () => (registry.sent as [string, string, { provider: string }][]).filter(([, , p]) => p.provider === 'mcp');
+
+  it('applies the connectors when the broker is configured and the flag is on, and removes them when it is off', async () => {
+    process.env.MCP_BROKER_URL = 'https://mcp-broker.example.test/';
+    try {
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1'] };
+      mcp.flag = true;
+      mcp.connectors = [{ id: 'c1', name: 'figma' }];
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: { broker: 'https://mcp-broker.example.test', connectors: [{ id: 'c1', name: 'figma' }] } }, 30_000]]);
+      mcp.flag = false;
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-remove', { provider: 'mcp', reason: REASONS.mcpOff }, 30_000]]);
+      mcp.flag = true;
+      mcp.fail = true;
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([]);
+    } finally {
+      delete process.env.MCP_BROKER_URL;
+      mcp.fail = false;
+    }
+  });
+});
+
+describe('planDelivery: fireworks', () => {
+  const FW = { baseUrl: 'https://claude-gateway.example.test/fireworks' };
+  const CAPS = [...ALL, 'fireworks-v1'];
+
+  it('sends a fireworks-v1 box the gateway base, nothing secret and no model list', () => {
+    expect(planDelivery({ ...OFF, fireworks: FW }, CAPS)).toContainEqual({ type: 'credentials-apply', provider: 'fireworks', payload: FW });
+  });
+
+  it('removes fireworks with the reason when the flag is off or there is no gateway', () => {
+    expect(planDelivery({ ...OFF, fireworks: null, fireworksOffReason: REASONS.fireworksOff }, CAPS))
+      .toContainEqual({ type: 'credentials-remove', provider: 'fireworks', reason: REASONS.fireworksOff });
+    expect(planDelivery(OFF, CAPS)).toContainEqual({ type: 'credentials-remove', provider: 'fireworks', reason: REASONS.noFireworks });
+  });
+
+  it('sends no fireworks step when the flag could not be read, or to an agent without fireworks-v1', () => {
+    expect(planDelivery({ ...OFF, fireworksUnknown: true }, CAPS).some(s => s.provider === 'fireworks')).toBe(false);
+    expect(planDelivery({ ...OFF, fireworks: FW }, ALL).some(s => s.provider === 'fireworks')).toBe(false);
+    expect(providersFor(ALL)).not.toContain('fireworks');
+    expect(providersFor(CAPS)).toContain('fireworks');
+  });
+});
+
+describe('deliverToInstance: fireworks', () => {
+  const steps = () => (registry.sent as [string, string, { provider: string }][]).filter(([, , p]) => p.provider === 'fireworks');
+
+  it('applies the gateway base (no model list) when it is configured and the flag is on, removes it when off, and leaves it when the flag cannot be read', async () => {
+    process.env.FIREWORKS_GATEWAY_URL = 'https://claude-gateway.example.test/fireworks/';
+    try {
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'fireworks-v1'] };
+      fireworks.flag = true;
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(steps()).toEqual([['i', 'credentials-apply', {
+        provider: 'fireworks',
+        payload: { baseUrl: 'https://claude-gateway.example.test/fireworks' },
+      }, 30_000]]);
+      fireworks.flag = false;
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(steps()).toEqual([['i', 'credentials-remove', { provider: 'fireworks', reason: REASONS.fireworksOff }, 30_000]]);
+      fireworks.fail = true;
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(steps()).toEqual([]);
+    } finally {
+      delete process.env.FIREWORKS_GATEWAY_URL;
+      fireworks.fail = false;
+    }
+  });
+});
+
+describe('deliveryInFlight', () => {
+  const tick = () => new Promise(r => setImmediate(r));
+
+  it('names the delivery to a box while it runs and forgets it once it has settled, however it ended', async () => {
+    expect(deliveryInFlight('i')).toBeNull();
+    let release!: () => void;
+    const held = new Promise<void>(r => { release = r; });
+    const { sendToInstanceAgent } = await import('./agentRegistry');
+    vi.mocked(sendToInstanceAgent).mockImplementationOnce(async () => { await held; throw new Error('box said no'); });
+    registry.agent = { conn: externalBox, capabilities: V1 };
+    registry.sent = [];
+    const run = deliverToInstance('i', 'u');
+    const waiting = deliveryInFlight('i');
+    expect(waiting).not.toBeNull();
+    release();
+    await expect(run).rejects.toThrow('box said no');
+    // The waiter settles (resolves) although the delivery failed: the failure is the starter's to log.
+    await expect(waiting).resolves.toBeUndefined();
+    await tick();
+    expect(deliveryInFlight('i')).toBeNull();
+  });
+
+  it('settles only once every overlapping delivery to the box has (a claim and a credential change at once)', async () => {
+    const pending: Array<() => void> = [];
+    const { sendToInstanceAgent } = await import('./agentRegistry');
+    vi.mocked(sendToInstanceAgent).mockImplementation(() => new Promise<void>(r => { pending.push(r); }));
+    registry.agent = { conn: externalBox, capabilities: V1 };
+    registry.sent = [];
+    const first = deliverToInstance('i', 'u');
+    const second = deliverToInstance('i', 'u');
+    let settled = false;
+    const waiting = deliveryInFlight('i')!.then(() => { settled = true; });
+    await tick();
+    // An external box gets two removes per delivery, sent one after the other.
+    expect(pending.length).toBe(2);
+    pending.shift()!(); await tick();   // first's remove 1 done, its remove 2 pending
+    pending.shift()!(); await tick();   // second's remove 1 done, its remove 2 pending
+    pending.shift()!(); await first; await tick();  // first finished entirely
+    expect(settled).toBe(false);
+    expect(deliveryInFlight('i')).not.toBeNull();
+    pending.shift()!(); await second; await waiting;
+    expect(settled).toBe(true);
+    await tick();
+    expect(deliveryInFlight('i')).toBeNull();
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (...args: unknown[]) => { registry.sent.push(args); });
   });
 });

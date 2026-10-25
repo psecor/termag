@@ -29,8 +29,10 @@ import { systemHealth } from '../services/admin/systemQueries';
 import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHealth, pipelineHealth, REPORT_GROUPS } from '../services/admin/claudeRunnerQueries';
 import { prisma } from '../db';
 import { softwareMatrix, softwareHost, clientVersions } from '../services/software/queries';
-import { prSummary, prContributors, prTrend, prGroups, prIngestStatus } from '../services/prAnalytics/queries';
+import { prSummary, prContributors, prTrend, prGroups, prIngestStatus, prReviews, prReviewers, prReviewTrend } from '../services/prAnalytics/queries';
+import { REVIEW_TREND_MAX_WEEKS } from '../services/prAnalytics/reviews';
 import { VIEWS, BASES } from '../services/prAnalytics/stats';
+import { getSpendConfig, spendReport, spendTrendReport, TREND_MAX_WEEKS } from '../services/admin/spend/queries';
 
 const rangeArgs = {
   range: z.enum(['today', '7d', '30d']).optional().describe('Preset window (UTC day keys). Default 7d.'),
@@ -57,7 +59,7 @@ const json = (v: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON
 function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
   const server = new McpServer(
     { name: 'termag-admin', version: '0.1.0' },
-    { instructions: `Read-only administrative view of one termag orchestrator: boxes, users, projects, live sessions, token usage, working time, behaviour signals, GitHub PR analytics per repo group and system health. Aggregates and metadata only — never terminal contents. This token cannot mint tokens, grant admin or take any action; those need a signed-in admin in the web UI. ${RANGE_NOTE}` },
+    { instructions: `Read-only administrative view of one termag orchestrator: boxes, users, projects, live sessions, token usage, working time, behaviour signals, GitHub PR analytics and reviews per repo group, estimated AI spend and system health. Aggregates and metadata only — never terminal contents. This token cannot mint tokens, grant admin or take any action; those need a signed-in admin in the web UI. ${RANGE_NOTE}` },
   );
 
   const tool = <A extends z.ZodRawShape>(name: string, description: string, shape: A, fn: (args: z.infer<z.ZodObject<A>>) => Promise<unknown>) => {
@@ -94,7 +96,7 @@ function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
     {
       userId: z.string().optional(), instanceId: z.string().optional().describe("Box id, or 'legacy' for projects on the orchestrator host."),
       provider: z.string().optional().describe('Any workstream of the project runs this provider.'),
-      kind: z.string().optional().describe("Project kind: 'normal' or 'metaterm'. Default: all."),
+      kind: z.string().optional().describe("Project kind: 'normal', 'metaterm' or 'automation'. Default: all."),
       archived: z.boolean().optional().describe('Default false: active projects.'),
       staleDays: z.number().int().positive().optional().describe('Only projects with no agent activity for this many days.'),
     },
@@ -143,6 +145,15 @@ function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
   tool('pr_trend', 'Weekly (Monday UTC) PRs in a repo group by author class, PRs in the chosen view and distinct contributors.',
     { ...prArgs, weeks: z.number().int().min(1).max(78).optional().describe('Default 26.') },
     async a => notFound(await prTrend(a.group, a.view ?? 'credited', a.basis ?? 'merged', a.weeks ?? 26)));
+  const groupArg = { group: prArgs.group };
+  tool('pr_reviews', 'For one repo group and the last 1, 7 and 30 days: reviews (one person on one PR, however many rounds), reviewers, reviews per reviewer p50/p95/mean/max, approvals, changes requested and comment-only reviews, inline comments by people, comments by people per merged PR (p50/p95/max) with the share bots wrote, and merged PRs split by approval: the Cursor approval agent alone, a human (with or without the agent), or unapproved, counting only repos where the agent has approved. Reviewers are people, never the PR author.',
+    groupArg, async a => notFound(await prReviews(a.group)));
+  tool('pr_reviewers', 'Top reviewers in a repo group over 1, 7 or 30 days: reviews, approvals, changes requested, comment-only, inline comments, deciding approvals (theirs was the last human approval before a merge in the window), median hours from ready to their first review, distinct authors helped, and the termag user when their GitHub is connected.',
+    { ...groupArg, window: z.union([z.literal(1), z.literal(7), z.literal(30)]).optional().describe('Days. Default 30.'), limit: z.number().int().min(1).max(100).optional().describe('Default 10.') },
+    async a => notFound(await prReviewers(a.group, a.window ?? 30, a.limit ?? 10)));
+  tool('pr_review_trend', `Weekly (Monday UTC) reviews and reviewers in a repo group, and merged PRs approved by the approval agent alone, by a human, or unapproved. Reviews are kept ${REVIEW_TREND_MAX_WEEKS} weeks back.`,
+    { ...groupArg, weeks: z.number().int().min(1).max(REVIEW_TREND_MAX_WEEKS).optional().describe(`Default ${REVIEW_TREND_MAX_WEEKS}.`) },
+    async a => notFound(await prReviewTrend(a.group, a.weeks ?? REVIEW_TREND_MAX_WEEKS)));
   tool('pr_ingest_status', 'PR ingestion health: whose GitHub token ingests, the ingester state and rate-limit headroom, repos backfilled out of total, PRs stored, and per-repo errors.', {}, () => prIngestStatus());
   tool('software_summary', 'Deployed software: per component (termag commit, image, Claude hooks, Claude Code, Codex, Cursor, Devin, pi, Node, npm, gh, AWS CLI, tmux, git, Docker, Python, nginx, Envoy, otelcol, Postgres, OS, kernel) its reference version, how many hosts are current / behind / outdated / ahead / missing / unknown, and the spread of versions. Tools compare against the newest version in the fleet; termag and images against the newest box or orchestrator image.', {},
     async () => { const m = await softwareMatrix(); return { summary: m.summary, targets: m.targets, collector: m.collector }; });
@@ -159,7 +170,18 @@ function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
   tool('software_host', 'One host\'s components with versions, paths and states, and its last 100 version changes.', { hostKey: z.string().describe("'orchestrator', an instance id, or 'agent:<userId>'.") },
     async a => (await softwareHost(a.hostKey)) ?? { error: 'no such host' });
   tool('client_versions', 'The latest client version each user was seen with, per kind (web, mobile, cli, tui, metaterm), and whether it is current: web and mobile against the running orchestrator commit, the others against the newest seen.', {}, () => clientVersions());
-  tool('system_health', 'Orchestrator process (version, uptime, memory, auth mode), connected agents, in-memory status map, usage-scan health, database size and per-table rows/bytes.', {}, () => systemHealth());
+  // Spend: estimates, tokens × dated prices plus cost pools (contracts, internal inference boxes).
+  const spendArgs = { ...rangeArgs, active: z.boolean().optional().describe('Count only users active in the window (default false: all termag users).') };
+  tool('spend_summary', `Estimated AI spend over a range: metered (tokens × dated prices; Claude priced at the assumed model mix while token rows carry no model) plus cost pools (vendor contracts at termag's share, internal inference boxes), totals, per head, annualised share of the fully loaded person cost, the per-person distribution, per-provider cost and $/M tokens, and each pool. Estimates for relative comparison, not accounting. ${RANGE_NOTE}`,
+    spendArgs, async a => { const { people: _people, ...rest } = await spendReport(rangeFrom(a), a.active ?? false); return rest; });
+  tool('spend_people', 'Estimated AI spend per person over a range: tokens, metered cost, each pool\'s share, total, annualised share of the loaded cost and top provider, most expensive first.',
+    { ...spendArgs, limit: z.number().int().min(1).max(500).optional().describe('Default 50.') },
+    async a => { const r = await spendReport(rangeFrom(a), a.active ?? false); return { window: r.window, denominator: r.denominator, people: r.people.slice(0, a.limit ?? 50) }; });
+  tool('spend_trend', 'Estimated AI spend per Monday-UTC week: metered cost by provider and each cost pool\'s termag share.',
+    { weeks: z.number().int().min(1).max(TREND_MAX_WEEKS).optional().describe('Default 12.') },
+    a => spendTrendReport(a.weeks ?? 12));
+  tool('spend_config', 'The spend model\'s assumptions: loaded cost per person, org headcount, the assumed model mix, the dated price table and the cost pools.', {}, () => getSpendConfig());
+  tool('system_health','Orchestrator process (version, uptime, memory, auth mode), connected agents, in-memory status map, usage-scan health, database size and per-table rows/bytes.', {}, () => systemHealth());
   tool('audit_log', 'Recent admin REST requests and MCP tool calls: who, what, args summary, outcome.',
     { ...rangeArgs, limit: z.number().int().min(1).max(1000).optional(), actorId: z.string().optional() },
     async a => {

@@ -72,14 +72,14 @@ describe('adminCloudSessions', () => {
     ] as never);
     vi.mocked(prisma.claudeSessionEvent.findMany).mockResolvedValue([
       { sessionId: 'cse_01A', orderId: 'ord.1', instanceId: 'box-a', kind: 'started', detail: 'web_claude_ai', at: t('2026-10-08T10:00:10Z'), user: { unixUsername: 'ada' } },
-      { sessionId: 'cse_01Q', orderId: 'ord.q', instanceId: null, kind: 'queued', detail: 'no box', at: t('2026-10-08T12:00:00Z'), user: { unixUsername: 'cat' } },
+      { sessionId: 'cse_01Q', orderId: 'ord.q', instanceId: null, kind: 'queued', detail: 'no box', code: 'no-box', at: t('2026-10-08T12:00:00Z'), user: { unixUsername: 'cat' } },
     ] as never);
     const out = await adminCloudSessions(7, t('2026-10-08T12:30:00Z'));
     expect(out.boxes.map(b => [b.boxName, b.owner, b.sessions.map(s => [s.key, s.state])])).toEqual([
       ['ada-box', 'ada', [['cse_01A', 'running']]],
       ['bob-box', 'bob', [['cse_01B', 'starting']]],
     ]);
-    expect(out.queued).toEqual([expect.objectContaining({ key: 'cse_01Q', owner: 'cat', queuedReason: 'no box' })]);
+    expect(out.queued).toEqual([expect.objectContaining({ key: 'cse_01Q', owner: 'cat', queuedReason: 'no box', queuedCode: 'no-box' })]);
     expect(out.recent).toEqual([expect.objectContaining({ key: 'cse_01C', owner: 'ada', state: 'ended', exitReason: 'completed' })]);
     expect(out.counts).toEqual({ running: 1, starting: 1, queued: 1, ended: 1, lost: 0 });
     // Open runs' events are read whatever their age, so an old running session is not shown as starting.
@@ -210,6 +210,16 @@ describe('refusalCategory', () => {
     expect(refusalCategory('agent-failed', 'the box agent refused the launch: timeout')).toBe('agent-failed');
     expect(refusalCategory('queued', 'something new')).toBe('other');
     expect(refusalCategory('queued', null)).toBe('other');
+  });
+
+  it('reads the code first when the event has one, and sorts the auto-box codes into pending and blocked', () => {
+    expect(refusalCategory('queued', 'anything', 'github')).toBe('github');
+    expect(refusalCategory('queued', 'the spawn hook stopped waiting; no box started for it', 'hook-gave-up')).toBe('hook-gave-up');
+    for (const code of ['box-wait', 'box-starting', 'box-claimed', 'box-provisioning', 'box-on-its-way']) expect(refusalCategory('queued', 'x', code)).toBe('box-pending');
+    for (const code of ['box-hold', 'box-start-failed', 'no-provisioning', 'box-creation-refused']) expect(refusalCategory('queued', 'x', code)).toBe('box-blocked');
+    expect(refusalCategory('agent-failed', 'x', 'agent-launch-failed')).toBe('agent-failed');
+    // An unknown code falls back to the text.
+    expect(refusalCategory('queued', REFUSAL_TEXTS.noBox, 'from-the-future')).toBe('no-box');
   });
 });
 

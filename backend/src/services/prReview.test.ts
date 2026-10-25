@@ -3,7 +3,7 @@ import { GithubApiError } from './githubCredential';
 import {
   fetchPrHead,
   PrInputError, fetchPrOverview, githubReason, mergePr, parseCommentInput, parseFailedSuites, parseMergeInput, parseOverview, parsePrRef,
-  parseReviewInput, parseReviewersInput, postComment, requestReviewers, rerunFailedChecks, submitReview,
+  parseReviewInput, parseReviewersInput, postComment, requestReviewers, rerunFailedChecks, submitReview, editComment, fetchPrFacts, fetchPrScope,
 } from './prReview';
 
 const TOKEN = 'gho_' + 'x'.repeat(36);
@@ -325,10 +325,50 @@ describe('requestReviewers and postComment', () => {
       .rejects.toMatchObject({ status: 422, message: 'GitHub refused the review request: Reviews may only be requested from collaborators.' });
   });
   it('posts a conversation comment on the PR\'s issue', async () => {
-    const { fetchImpl, calls } = fakeFetch(() => ({ status: 201, body: { html_url: 'https://github.com/c/1' } }));
-    expect(await postComment(TOKEN, REF, '@bob ping', fetchImpl)).toEqual({ url: 'https://github.com/c/1' });
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 201, body: { html_url: 'https://github.com/c/1', id: 4242 } }));
+    expect(await postComment(TOKEN, REF, '@bob ping', fetchImpl)).toEqual({ url: 'https://github.com/c/1', id: '4242' });
     expect(calls[0].url).toBe('https://api.github.com/repos/example-org/termag/issues/9/comments');
     expect(JSON.parse(String(calls[0].init!.body))).toEqual({ body: '@bob ping' });
+  });
+  it('edits a comment by its REST id with a PATCH, and refuses anything but an id', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { id: 4242 } }));
+    await editComment(TOKEN, REF, '4242', 'Preview ended', fetchImpl);
+    expect(calls[0].url).toBe('https://api.github.com/repos/example-org/termag/issues/comments/4242');
+    expect(calls[0].init!.method).toBe('PATCH');
+    expect(JSON.parse(String(calls[0].init!.body))).toEqual({ body: 'Preview ended' });
+    await expect(editComment(TOKEN, REF, '../../pulls', 'x', fetchImpl)).rejects.toThrow('Not a comment id');
+    expect(calls).toHaveLength(1);
+  });
+  it('carries a refused edit\'s status (a token without write access)', async () => {
+    const { fetchImpl } = fakeFetch(() => ({ status: 403, body: { message: 'Resource not accessible by personal access token' } }));
+    await expect(editComment(TOKEN, REF, '1', 'x', fetchImpl)).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe('fetchPrFacts', () => {
+  const ref = { owner: 'example-org', name: 'termag', number: 359 };
+  const data = (over: Record<string, unknown> = {}) => ({
+    viewer: { login: 'ada', databaseId: 7 },
+    repository: {
+      nameWithOwner: 'example-org/termag', visibility: 'INTERNAL',
+      pullRequest: { state: 'OPEN', isDraft: false, headRefName: 'feat/x', headRefOid: 'a'.repeat(40), isCrossRepository: false, author: { login: 'ada', databaseId: 7 }, ...over },
+    },
+  });
+  it('reads what a link share checks, and whose token it is', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ body: { data: data() } }));
+    expect(await fetchPrFacts('t', ref, fetchImpl)).toEqual({
+      state: 'OPEN', isDraft: false, repo: 'example-org/termag', visibility: 'INTERNAL', headBranch: 'feat/x', headOid: 'a'.repeat(40),
+      crossRepo: false, author: { login: 'ada', id: 7 }, viewer: { login: 'ada', id: 7 },
+    });
+    expect(JSON.parse(String(calls[0].init!.body)).variables).toEqual({ owner: 'example-org', name: 'termag', number: 359 });
+  });
+  it('keeps a bot or deleted author as unknown, and calls a missing PR a 404', async () => {
+    const { fetchImpl } = fakeFetch(() => ({ body: { data: data({ author: null }) } }));
+    expect((await fetchPrFacts('t', ref, fetchImpl)).author).toEqual({ login: null, id: null });
+    const gone = fakeFetch(() => ({ body: { data: { viewer: { login: 'ada', databaseId: 7 }, repository: { nameWithOwner: 'example-org/termag', visibility: 'PRIVATE', pullRequest: null } } } }));
+    await expect(fetchPrFacts('t', ref, gone.fetchImpl)).rejects.toMatchObject({ status: 404 });
+    const refused = fakeFetch(() => ({ status: 401, body: {} }));
+    await expect(fetchPrFacts('t', ref, refused.fetchImpl)).rejects.toMatchObject({ status: 401 });
   });
 });
 
@@ -341,5 +381,62 @@ describe('fetchPrHead', () => {
   it('is a 404 when GitHub has no such PR', async () => {
     const { fetchImpl } = fakeFetch(() => ({ body: { data: { repository: { pullRequest: null } } } }));
     await expect(fetchPrHead('t', ref, fetchImpl)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('fetchPrScope', () => {
+  const ref = { owner: 'example-org', name: 'webapp', number: 7 };
+  const files = (names: (string | [string, string])[]) => names.map(n => (Array.isArray(n) ? { filename: n[0], previous_filename: n[1] } : { filename: n }));
+  it('reads labels and every changed path, a renamed file\'s old path too, a page at a time', async () => {
+    const hundred = Array.from({ length: 100 }, (_, i) => `f${i}`);
+    const { fetchImpl, calls } = fakeFetch(url => {
+      if (url.endsWith('/pulls/7')) return { body: { labels: [{ name: 'no-preview' }], changed_files: 101 } };
+      if (url.endsWith('&page=1')) return { body: files(hundred) };
+      return { body: files([['archive/app.ts', 'static/app.ts']]) };
+    });
+    const scope = await fetchPrScope('t', ref, fetchImpl);
+    expect(scope.labels).toEqual(['no-preview']);
+    expect(scope.paths).toHaveLength(102);
+    expect(scope.paths.slice(-2)).toEqual(['archive/app.ts', 'static/app.ts']);
+    expect(scope.complete).toBe(true);
+    expect(calls.map(c => c.url)).toEqual([
+      'https://api.github.com/repos/example-org/webapp/pulls/7',
+      'https://api.github.com/repos/example-org/webapp/pulls/7/files?per_page=100&page=1',
+      'https://api.github.com/repos/example-org/webapp/pulls/7/files?per_page=100&page=2',
+    ]);
+  });
+  it('stops at 300 paths, and says it did', async () => {
+    const hundred = Array.from({ length: 100 }, (_, i) => `f${i}`);
+    const { fetchImpl, calls } = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 900 } } : { body: files(hundred) }));
+    const scope = await fetchPrScope('t', ref, fetchImpl);
+    expect(scope).toMatchObject({ complete: false });
+    expect(scope.paths).toHaveLength(300);
+    expect(calls).toHaveLength(4);
+  });
+  it('a listing that read every file the PR changed is complete, even on a full last page or at the cap', async () => {
+    const hundred = Array.from({ length: 100 }, (_, i) => `f${i}`);
+    const full = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 100 } } : { body: files(hundred) }));
+    const one = await fetchPrScope('t', ref, full.fetchImpl);
+    expect(one).toMatchObject({ complete: true });
+    expect(full.calls).toHaveLength(2);
+    const capped = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 300 } } : { body: files(hundred) }));
+    expect(await fetchPrScope('t', ref, capped.fetchImpl)).toMatchObject({ complete: true });
+    // Renames add old paths, but the cap counts files: 300 renamed files are all read.
+    const renamed = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 300 } } : { body: files(hundred.map(n => [`new/${n}`, `old/${n}`] as [string, string])) }));
+    const r = await fetchPrScope('t', ref, renamed.fetchImpl);
+    expect(r).toMatchObject({ complete: true });
+    expect(r.paths).toHaveLength(600);
+  });
+
+  it('a file list GitHub doesn\'t give is incomplete, never empty; a PR it can\'t see is a 404', async () => {
+    const failed = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 3 } } : { status: 422, body: { message: 'diff too large' } }));
+    expect(await fetchPrScope('t', ref, failed.fetchImpl)).toEqual({ labels: [], paths: [], complete: false });
+    const odd = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [] } } : { body: { message: 'not a list' } }));
+    expect((await fetchPrScope('t', ref, odd.fetchImpl)).complete).toBe(false);
+    // Fewer files than the PR says it changed: incomplete.
+    const short = fakeFetch(url => (url.endsWith('/pulls/7') ? { body: { labels: [], changed_files: 5 } } : { body: files(['a']) }));
+    expect((await fetchPrScope('t', ref, short.fetchImpl)).complete).toBe(false);
+    const gone = fakeFetch(() => ({ status: 404, body: {} }));
+    await expect(fetchPrScope('t', ref, gone.fetchImpl)).rejects.toMatchObject({ status: 404 });
   });
 });

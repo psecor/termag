@@ -17,7 +17,7 @@ import type { Instance, Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { awsClientConfig, getBoxConfig } from './boxProvisioner';
 import { dropInstanceAgent } from './agentRegistry';
-import { boxInUseFields } from './boxActivity';
+import { boxInUseFields, guestWakeFields } from './boxActivity';
 import {
   hibernateFallbackNote,
   hibernationRefreshDue,
@@ -75,6 +75,19 @@ export interface RequestPowerOptions {
    * clock it was parked with.
    */
   markInUse?: boolean;
+  /**
+   * A reviewer's wake of an auto-hibernated box (services/previewShareLinks.ts):
+   * the idle clock restarts, but `parkedAt` (the terminate clock) and the idle
+   * note stay as they were (boxActivity.guestWakeFields).
+   */
+  guestWake?: boolean;
+  /**
+   * The owner's own stop or hibernate: an idle-hibernate note left from
+   * before (a start that kept it: the scheduler's, a reviewer's) no longer
+   * says why the box is down, so it goes. That keeps the note a true mark of
+   * a box the sweep parked, the only kind a reviewer may wake.
+   */
+  byOwner?: boolean;
 }
 
 /**
@@ -94,6 +107,8 @@ export async function requestPower(instance: Instance, action: PowerAction, opts
   // hibernated; anything that powers the box down starts from a clean slate.
   if (action !== 'start') data.hibernatedAt = null;
   if (opts.markInUse) Object.assign(data, boxInUseFields(instance.id));
+  else if (opts.guestWake && action === 'start') Object.assign(data, guestWakeFields(instance.id));
+  if (opts.byOwner && action !== 'start') data.lifecycleNote = null;
   // A box the lifecycle sweep has claimed for terminate stays down: the
   // claim leaves it hibernated, so the status alone wouldn't stop a start.
   const moved = await prisma.instance.updateMany({ where: { id: instance.id, status: instance.status, autoTerminatedAt: null }, data });

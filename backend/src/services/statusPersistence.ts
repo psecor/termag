@@ -228,11 +228,14 @@ export function hydrateStatus(rows: readonly SessionStatusRow[], now: number): H
       if (deadline > now) {
         h.span = span;
         h.autoIdleInMs = deadline - now;
+        // The status began with the span (status.ts statusSince).
+        status.statusSince = new Date(span.startedAt);
       } else {
         h.status = {
           ...status,
           status: 'idle',
           updatedAt: new Date(deadline),
+          statusSince: new Date(deadline),
           message: AUTO_IDLE_MESSAGE,
           waitingReason: null,
           activityScore: 0,

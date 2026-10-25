@@ -6,6 +6,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
 import { distribution, median, WINDOWS, type Basis, type Distribution, type View } from './stats';
 import { ingesterStatus, getSettings, rowToGroup, BACKFILL_DAYS } from './ingester';
+import { APPROVAL_AGENT_LOGINS, REVIEW_DAYS, REVIEW_PAGE, reviewTrend, reviewWindow, topReviewers, type RPr, type RReview } from './reviews';
 
 /** Who a row counts for, and which rows a view includes. Fixed SQL, never user input. */
 function viewSql(view: View): { person: Prisma.Sql; where: Prisma.Sql } {
@@ -15,13 +16,29 @@ function viewSql(view: View): { person: Prisma.Sql; where: Prisma.Sql } {
 }
 const dateCol = (basis: Basis) => (basis === 'merged' ? Prisma.sql`"mergedAt"` : Prisma.sql`"createdAt"`);
 
-export async function groupRepos(slug: string): Promise<string[] | null> {
+/**
+ * A group's PRs, as a WHERE clause over github_prs: every PR of the repos it
+ * takes whole, and the scored PRs (repo_group_prs) of those it takes by path.
+ */
+export interface GroupScope { slug: string; repos: string[]; whole: string[]; scoped: string[] }
+
+export async function groupRepos(slug: string): Promise<GroupScope | null> {
   const g = await prisma.repoGroup.findUnique({ where: { slug } });
   if (!g) return null;
-  return (await prisma.repoGroupMember.findMany({ where: { groupSlug: slug }, select: { repo: true }, orderBy: { repo: 'asc' } })).map(r => r.repo);
+  const members = await prisma.repoGroupMember.findMany({ where: { groupSlug: slug }, select: { repo: true, scope: true }, orderBy: { repo: 'asc' } });
+  return {
+    slug,
+    repos: members.map(m => m.repo),
+    whole: members.filter(m => m.scope == null).map(m => m.repo),
+    scoped: members.filter(m => m.scope != null).map(m => m.repo),
+  };
 }
 
-const inRepos = (repos: string[]) => (repos.length ? Prisma.sql`"repo" IN (${Prisma.join(repos)})` : Prisma.sql`FALSE`);
+const inRepos = (g: GroupScope) => {
+  const whole = g.whole.length ? Prisma.sql`"repo" IN (${Prisma.join(g.whole)})` : Prisma.sql`FALSE`;
+  if (!g.scoped.length) return whole;
+  return Prisma.sql`(${whole} OR "id" IN (SELECT "prId" FROM repo_group_prs WHERE "groupSlug" = ${g.slug}))`;
+};
 
 export interface WindowSummary {
   days: number;
@@ -60,7 +77,7 @@ export async function prSummary(slug: string, view: View, basis: Basis, now = ne
     const counts = people.map(p => Number(p.n));
     windows.push({ days, prs: counts.reduce((s, n) => s + n, 0), opened: Number(both[0]?.opened ?? 0), merged: Number(both[0]?.merged ?? 0), byClass, agentAssisted, distribution: distribution(counts) });
   }
-  return { group: slug, view, basis, repos: repos.length, windows, generatedAt: now.toISOString() };
+  return { group: slug, view, basis, repos: repos.repos.length, windows, generatedAt: now.toISOString() };
 }
 
 /** GitHub login → termag user, from connected GitHub credentials (label '@login'). */
@@ -115,16 +132,90 @@ export async function prTrend(slug: string, view: View, basis: Basis, weeks = 26
   };
 }
 
+/**
+ * A group's PRs merged or reviewed since `since`, with every review of them
+ * (a deciding approval or a first review can predate the window), and the
+ * group's repos where the approval agent has ever approved.
+ */
+async function reviewData(repos: GroupScope, since: Date): Promise<{ prs: RPr[]; reviews: RReview[]; agentRepos: Set<string> }> {
+  const scope = Prisma.sql`${inRepos(repos)} AND ("mergedAt" >= ${since} OR "id" IN (SELECT "prId" FROM github_pr_reviews WHERE "submittedAt" >= ${since}))`;
+  const [prRows, reviewRows, agent] = await Promise.all([
+    prisma.$queryRaw<Array<{ id: string; repo: string; authorLogin: string; creditedLogin: string | null; readyAt: Date | null; createdAt: Date; mergedAt: Date | null; comments: number; humanComments: number; reviewCount: number; reviewsReadAt: Date | null; reviewRequests: unknown }>>`
+      SELECT "id", "repo", "authorLogin", "creditedLogin", "readyAt", "createdAt", "mergedAt", "comments", "humanComments", "reviewCount", "reviewsReadAt", "reviewRequests"
+      FROM github_prs WHERE ${scope}`,
+    prisma.$queryRaw<Array<{ prId: string; reviewerLogin: string; reviewerClass: string; state: string; submittedAt: Date; comments: number }>>`
+      SELECT r."prId", r."reviewerLogin", r."reviewerClass", r."state", r."submittedAt", r."comments"
+      FROM github_pr_reviews r WHERE r."prId" IN (SELECT "id" FROM github_prs WHERE ${scope})`,
+    repos.repos.length ? prisma.$queryRaw<Array<{ repo: string }>>`
+      SELECT DISTINCT p."repo" FROM github_pr_reviews r JOIN github_prs p ON p."id" = r."prId"
+      WHERE p."repo" IN (${Prisma.join(repos.repos)}) AND r."state" = 'APPROVED' AND r."reviewerClass" <> 'human'
+        AND r."reviewerLogin" IN (${Prisma.join(APPROVAL_AGENT_LOGINS)})` : Promise.resolve([]),
+  ]);
+  return {
+    prs: prRows.map(p => ({
+      id: p.id, repo: p.repo, author: p.authorLogin, credited: p.creditedLogin, readyAt: p.readyAt, createdAt: p.createdAt, mergedAt: p.mergedAt,
+      comments: Number(p.comments), humanComments: Number(p.humanComments), reviewsRead: p.reviewsReadAt != null && Number(p.reviewCount) <= REVIEW_PAGE,
+      requests: (Array.isArray(p.reviewRequests) ? p.reviewRequests as Array<{ who?: unknown; at?: unknown }> : [])
+        .filter(q => typeof q.who === 'string' && typeof q.at === 'string').map(q => ({ who: q.who as string, at: new Date(q.at as string) })),
+    })),
+    reviews: reviewRows.map(r => ({ prId: r.prId, login: r.reviewerLogin, cls: r.reviewerClass, state: r.state, submittedAt: r.submittedAt, comments: Number(r.comments) })),
+    agentRepos: new Set(agent.map(a => a.repo)),
+  };
+}
+
+/** Reviews, comments and the approval agent's share for the last 1, 7 and 30 days. */
+export async function prReviews(slug: string, now = new Date()) {
+  const repos = await groupRepos(slug);
+  if (!repos) return null;
+  const d = await reviewData(repos, new Date(now.getTime() - Math.max(...WINDOWS) * 86_400_000));
+  return {
+    group: slug, repos: repos.repos.length, reviewDays: REVIEW_DAYS, approvalAgentLogins: APPROVAL_AGENT_LOGINS,
+    windows: WINDOWS.map(days => reviewWindow(d.prs, d.reviews, new Date(now.getTime() - days * 86_400_000), now, d.agentRepos)),
+    generatedAt: now.toISOString(),
+  };
+}
+
+export async function prReviewers(slug: string, days: number, limit = 10, now = new Date()) {
+  const repos = await groupRepos(slug);
+  if (!repos) return null;
+  const since = new Date(now.getTime() - days * 86_400_000);
+  const d = await reviewData(repos, since);
+  const all = topReviewers(d.prs, d.reviews, since, now);
+  const users = await termagByLogin();
+  return {
+    group: slug, days, reviewers: all.length, reviews: all.reduce((s, r) => s + r.reviews, 0),
+    top: all.slice(0, Math.max(1, Math.min(100, limit))).map(r => ({ ...r, termag: users.get(r.login) ?? null })),
+  };
+}
+
+/** Monday-UTC weeks, the current one partial. */
+export async function prReviewTrend(slug: string, weeks: number, now = new Date()) {
+  const repos = await groupRepos(slug);
+  if (!repos) return null;
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const monday = today - ((new Date(today).getUTCDay() + 6) % 7) * 86_400_000;
+  const start = new Date(monday - (weeks - 1) * 7 * 86_400_000);
+  const d = await reviewData(repos, start);
+  return { group: slug, weeks, rows: reviewTrend(d.prs, d.reviews, start, now, d.agentRepos) };
+}
+
 export async function prGroups() {
-  const [groups, members, prCounts] = await Promise.all([
+  const [groups, members, prCounts, scopedCounts] = await Promise.all([
     prisma.repoGroup.findMany({ orderBy: [{ sort: 'asc' }, { slug: 'asc' }] }),
     prisma.repoGroupMember.findMany(),
     prisma.$queryRaw<Array<{ repo: string; n: number }>>`SELECT "repo", COUNT(*)::int AS n FROM github_prs GROUP BY 1`,
+    prisma.$queryRaw<Array<{ slug: string; repo: string; n: number }>>`
+      SELECT g."groupSlug" AS slug, p."repo", COUNT(*)::int AS n FROM repo_group_prs g JOIN github_prs p ON p."id" = g."prId" GROUP BY 1, 2`,
   ]);
   const prs = new Map(prCounts.map(r => [r.repo, Number(r.n)]));
+  const scoped = new Map(scopedCounts.map(r => [`${r.slug} ${r.repo}`, Number(r.n)]));
   return groups.map(g => {
     const repos = members.filter(m => m.groupSlug === g.slug);
-    return { ...rowToGroup(g), repos: repos.map(r => ({ repo: r.repo, visibility: r.visibility, prs: prs.get(r.repo) ?? 0 })) };
+    return {
+      ...rowToGroup(g),
+      // A path-scoped repo counts only the PRs scored into the group.
+      repos: repos.map(r => ({ repo: r.repo, visibility: r.visibility, scoped: r.scope != null, prs: r.scope != null ? scoped.get(`${g.slug} ${r.repo}`) ?? 0 : prs.get(r.repo) ?? 0 })),
+    };
   });
 }
 
@@ -140,6 +231,9 @@ export async function prIngestStatus() {
     backfillDays: BACKFILL_DAYS,
     repos: repos.length,
     backfilled: syncs.filter(s => s.backfillDone).length,
+    reviewDays: REVIEW_DAYS,
+    /** Repos whose stored PRs all carry reviews back to reviewDays (new repos read them with their PRs). */
+    reviewsBackfilled: syncs.filter(s => s.backfillDone && s.reviewsDone).length,
     neverRun: repos.length - syncs.length,
     prs,
     lastRunAt: syncs.reduce<Date | null>((m, s) => (s.lastRunAt && (!m || s.lastRunAt > m) ? s.lastRunAt : m), null),

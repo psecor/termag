@@ -197,15 +197,16 @@ export function otlpDestinationFromEnv(env: OtlpDestinationEnv): OtlpDestination
 // ── Warm pool ─────────────────────────────────────────────────────────────────
 
 export interface WarmPoolEnv {
-  WARM_POOL_TARGET_SIZE?: string;
   WARM_POOL_MAX_INFLIGHT?: string;
   WARM_POOL_RECONCILE_SECONDS?: string;
   WARM_POOL_MAX_AGE_HOURS?: string;
 }
 
+/**
+ * The pool's tuning knobs. Its size is not here: that is the
+ * box-warm-pool-size flag (services/warmPoolSize.ts).
+ */
 export interface WarmPoolConfig {
-  /** Claimable warm boxes to hold. 0 drains the pool and sends every claim down the cold path. */
-  targetSize: number;
   /** Concurrent `warming` launches, so a refill storm cannot starve a real cold provision. */
   maxInFlight: number;
   reconcileMs: number;
@@ -214,9 +215,6 @@ export interface WarmPoolConfig {
 }
 
 export const WARM_POOL_DEFAULTS: Readonly<WarmPoolConfig> = {
-  // Zero, so the pool costs nothing until a deployment opts in by setting
-  // the variable.
-  targetSize: 0,
   maxInFlight: 2,
   reconcileMs: 60_000,
   maxAgeMs: 24 * 60 * 60 * 1000,
@@ -224,7 +222,6 @@ export const WARM_POOL_DEFAULTS: Readonly<WarmPoolConfig> = {
 
 export function warmPoolConfigFromEnv(env: WarmPoolEnv): WarmPoolConfig {
   return {
-    targetSize: wholeNumber(env.WARM_POOL_TARGET_SIZE, WARM_POOL_DEFAULTS.targetSize),
     // 0 is honoured here and is the pool's kill switch: it holds whatever is
     // already warm and launches nothing more.
     maxInFlight: wholeNumber(env.WARM_POOL_MAX_INFLIGHT, WARM_POOL_DEFAULTS.maxInFlight),

@@ -18,9 +18,48 @@ describe('provider registries stay in sync (gotcha: two files, by hand)', () => 
       expect(frontend.PROVIDERS[id].selectable, id).toBe(backend.PROVIDERS[id].selectable);
       expect(frontend.PROVIDERS[id].displayName, id).toBe(backend.PROVIDERS[id].displayName);
       expect(frontend.PROVIDERS[id].badge, id).toBe(backend.PROVIDERS[id].badge);
+      expect(!!frontend.PROVIDERS[id].orchestratorSkill, id).toBe(!!backend.PROVIDERS[id].orchestratorSkill);
     }
     expect(frontend.PROVIDERS.human.selectable).toBe(false);
     expect(frontend.SELECTABLE_PROVIDER_IDS).toEqual(backend.SELECTABLE_PROVIDER_IDS);
+  });
+
+  it('statusSources agree, so a live status names the same provider on both sides', () => {
+    for (const id of backend.PROVIDER_IDS) {
+      expect(frontend.PROVIDERS[id].statusSources, id).toEqual(backend.PROVIDERS[id].statusSources);
+    }
+    // The desktop app's threads run Claude Code: their time is
+    // Claude's, but they run beside the pane, so they never say what the pane runs.
+    expect(backend.providerForSource('t3:claude')).toBe('claude');
+    expect(frontend.providerForSource('t3:claude')).toBe('claude');
+    expect(frontend.runningProviderForSource('t3:claude')).toBeUndefined();
+  });
+
+  it('the model backends agree: the same ids per harness, the same names', () => {
+    for (const id of backend.PROVIDER_IDS) {
+      expect(frontend.PROVIDERS[id].backends ?? [], id).toEqual(backend.backendsFor(id));
+    }
+    expect(frontend.MODEL_BACKENDS).toEqual(backend.MODEL_BACKENDS);
+    for (const id of backend.PROVIDER_IDS) {
+      for (const b of backend.backendsFor(id)) expect(backend.MODEL_BACKENDS[b], `${id} ${b}`).toBeDefined();
+    }
+  });
+});
+
+describe('model backends', () => {
+  it("Claude Code (a pane's and the simple UI chat's) and pi can run on Fireworks; null is every harness default", () => {
+    expect(backend.PROVIDER_IDS.filter(id => backend.backendsFor(id).length > 0)).toEqual(['claude', 'claude-chat', 'pi']);
+    expect(backend.isBackendFor('claude', 'fireworks')).toBe(true);
+    expect(backend.isBackendFor('claude', null)).toBe(true);
+    expect(backend.isBackendFor('cursor', null)).toBe(true);
+    expect(backend.isBackendFor('cursor', 'fireworks')).toBe(false);
+    expect(backend.isBackendFor('claude', 'bedrock')).toBe(false);
+  });
+});
+
+describe('orchestrator skill', () => {
+  it('is offered only for the Claude agents termag-reconcile installs it for', () => {
+    expect(backend.PROVIDER_IDS.filter(id => backend.PROVIDERS[id].orchestratorSkill)).toEqual(['claude', 'claude-chat']);
   });
 });
 

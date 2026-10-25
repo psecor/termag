@@ -140,23 +140,20 @@ describe('prismaSslParams', () => {
 });
 
 describe('warmPoolConfigFromEnv', () => {
-  it('holds no pool at all on an unconfigured deployment', () => {
+  it('uses the defaults on an unconfigured deployment', () => {
     expect(warmPoolConfigFromEnv({})).toEqual({
-      targetSize: 0,
       maxInFlight: 2,
       reconcileMs: 60_000,
       maxAgeMs: 86_400_000,
     });
   });
 
-  it('reads all four knobs and converts the two duration ones', () => {
+  it('reads all three knobs and converts the two duration ones', () => {
     expect(warmPoolConfigFromEnv({
-      WARM_POOL_TARGET_SIZE: '2',
       WARM_POOL_MAX_INFLIGHT: '4',
       WARM_POOL_RECONCILE_SECONDS: '30',
       WARM_POOL_MAX_AGE_HOURS: '12',
     })).toEqual({
-      targetSize: 2,
       maxInFlight: 4,
       reconcileMs: 30_000,
       maxAgeMs: 43_200_000,
@@ -164,7 +161,7 @@ describe('warmPoolConfigFromEnv', () => {
   });
 
   it('accepts a padded value', () => {
-    expect(warmPoolConfigFromEnv({ WARM_POOL_TARGET_SIZE: ' 3 ' }).targetSize).toBe(3);
+    expect(warmPoolConfigFromEnv({ WARM_POOL_MAX_INFLIGHT: ' 3 ' }).maxInFlight).toBe(3);
   });
 
   it('honours zero in-flight as a kill switch but never as a tick interval', () => {
@@ -176,11 +173,10 @@ describe('warmPoolConfigFromEnv', () => {
   it('falls back to the default for anything that is not a whole number', () => {
     for (const raw of ['', 'two', '2.5', '-1', '2 boxes', '1e3', 'NaN']) {
       expect(warmPoolConfigFromEnv({
-        WARM_POOL_TARGET_SIZE: raw,
         WARM_POOL_MAX_INFLIGHT: raw,
         WARM_POOL_RECONCILE_SECONDS: raw,
         WARM_POOL_MAX_AGE_HOURS: raw,
-      })).toEqual({ targetSize: 0, maxInFlight: 2, reconcileMs: 60_000, maxAgeMs: 86_400_000 });
+      })).toEqual({ maxInFlight: 2, reconcileMs: 60_000, maxAgeMs: 86_400_000 });
     }
   });
 });

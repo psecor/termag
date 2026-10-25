@@ -175,6 +175,17 @@ describe('assignLanes', () => {
     expect(rows.map(r => [r.number, r.lane])).toEqual([[5, 'needs_my_review']]);
     expect(rows[0].waitingOn).toEqual(['me', 'termag-team']);
   });
+  it('puts a request that names the viewer in needs_my_review and a team-only one in team_review, unknown counting as mine', () => {
+    const rows = assignLanes(input({
+      reviewRequested: [
+        open({ number: 5, author: 'a', requestedYou: true }), open({ number: 6, author: 'b', requestedYou: false }), open({ number: 7, author: 'c' }),
+      ],
+      authored: [open({ number: 8 })],
+    }));
+    const by = new Map(rows.map(r => [r.number, r]));
+    expect([5, 6, 7].map(n => [by.get(n)!.lane, by.get(n)!.askedYou])).toEqual([['needs_my_review', true], ['team_review', false], ['needs_my_review', true]]);
+    expect(by.get(8)).not.toHaveProperty('askedYou');
+  });
   it('a PR in two searches appears once, as authored', () => {
     const rows = assignLanes(input({ authored: [open({ number: 7 })], reviewRequested: [open({ number: 7, author: 'someone' })] }));
     expect(rows).toHaveLength(1);
@@ -217,6 +228,13 @@ describe('assignLanes', () => {
       requestedAt: '2026-10-08T00:00:00Z', reviewTarget: { projectId: 'p1', workstream: 'main' },
     });
     expect(rows.find(r => r.number === 6)?.reviewTarget).toBeNull();
+  });
+  it('team review rows carry the same review fields', () => {
+    const rows = assignLanes(input({
+      reviewRequested: [open({ number: 9, author: 'someone', requestedYou: false, requestedAt: '2026-10-08T00:00:00Z' })],
+      workstreams: [ws('main', { repo: TERMAG_REPO })],
+    }));
+    expect(rows[0]).toMatchObject({ lane: 'team_review', requestedAt: '2026-10-08T00:00:00Z', reviewTarget: { projectId: 'p1', workstream: 'main' } });
   });
   it('groupByLane returns every lane in order', () => {
     const lanes = groupByLane(assignLanes(input({ authored: [open()] })));

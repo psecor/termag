@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  MAX_RUNNERS_PER_BOX, allocateSlot, bearerToken, githubGate, parseRunnerSessions, parseSpawnBody, placeRunner,
-  runnerBoxes, runnerLaunch, runnerSessionName, serializeByKey, tmuxSafe, tokensEqual, isRunnerSessionOf, isOwnRunnerSessionStatus, isRunnerSessionShaped,
+  AUTO_BOX_FAILURE_HOLD_MS, MAX_RUNNERS_PER_BOX, PROVISIONING_FAILURE_WINDOW_MS, REFUSAL, REFUSAL_CODES, allocateSlot, autoBoxName, autoBoxPlan, bearerToken, githubGate,
+  parseRunnerSessions, parseSpawnBody, placeRunner, refusalStatus, runnerBoxes, runnerLaunch, runnerSessionName, serializeByKey,
+  tmuxSafe, tokensEqual, isRunnerSessionOf, isOwnRunnerSessionStatus, isRunnerSessionShaped,
 } from './claudeRunnerSpawn';
 
 const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcmRlciJ9.c2lnbmF0dXJl'; // gitleaks:allow
@@ -9,7 +10,15 @@ const valid = { orderId: 'ord-1a2b', sessionId: 'sess_1', accountEmail: 'Ada@Exa
 
 describe('parseSpawnBody', () => {
   it('accepts a well-formed order, trims the JWT and keeps only what the route uses', () => {
-    expect(parseSpawnBody(valid)).toEqual({ orderId: 'ord-1a2b', sessionId: 'sess_1', accountEmail: 'Ada@Example.com', workOrder: jwt });
+    expect(parseSpawnBody(valid)).toEqual({ orderId: 'ord-1a2b', sessionId: 'sess_1', accountEmail: 'Ada@Example.com', workOrder: jwt, accountId: null, attempt: 1 });
+  });
+
+  it('reads the creator account id and the attempt when the hook sends them, and treats a malformed one as absent', () => {
+    expect(parseSpawnBody({ ...valid, accountId: 'user_01HXYZ', attempt: 3 })).toMatchObject({ accountId: 'user_01HXYZ', attempt: 3 });
+    expect(parseSpawnBody({ ...valid, accountId: 'ada@example.com' })).toMatchObject({ accountId: null });
+    expect(parseSpawnBody({ ...valid, accountId: 'user_' })).toMatchObject({ accountId: null });
+    expect(parseSpawnBody({ ...valid, attempt: 'many' })).toMatchObject({ attempt: null });
+    expect(parseSpawnBody({ ...valid, attempt: undefined })).toMatchObject({ attempt: null });
   });
 
   it('rejects an order id that is not safe for a file or tmux name', () => {
@@ -90,6 +99,19 @@ describe('runnerLaunch', () => {
       '--user-key', 'u1', '--box-key', 'box-a',
     ]);
     expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, null, keys).command).toEqual(['/home/ada/.local/bin/termag-claude-runner', 'ord.1', '2']);
+  });
+
+  it('appends the git flags after the telemetry ones, only when asked, and never --github for an unknown state', () => {
+    const dest = { project: '5f0c1e2d3a4b5c6d7e8f9a0b', endpoint: 'https://otel.example.test' };
+    expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, dest, null, { anthropicGit: true, github: 'absent' }).command).toEqual([
+      '/home/ada/.local/bin/termag-claude-runner', 'ord.1', '2',
+      '--otel-project', '5f0c1e2d3a4b5c6d7e8f9a0b', '--otel-endpoint', 'https://otel.example.test',
+      '--anthropic-git', '--github', 'absent',
+    ]);
+    expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, null, null, { anthropicGit: true, github: 'connected' }).command.slice(3)).toEqual(['--anthropic-git', '--github', 'connected']);
+    expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, null, null, { anthropicGit: true, github: 'unknown' }).command.slice(3)).toEqual(['--anthropic-git']);
+    expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, null, null, { anthropicGit: false, github: 'absent' }).command.slice(3)).toEqual(['--github', 'absent']);
+    expect(runnerLaunch('/home/ada', 'ada', 'ord.1', 2, null, null, null).command.slice(3)).toEqual([]);
   });
 
   it('passes the raw order id to the runner and never starts the session in the home itself', () => {
@@ -194,6 +216,18 @@ describe('placeRunner', () => {
     expect(placeRunner([{ box: 'a', sessions: running(2, 3, 4) }, { box: 'b', sessions: running(2, 3, 4) }], 'new'))
       .toEqual({ kind: 'full', boxes: 2, max: 3 });
   });
+
+  it('places a new runner only on an eligible box, but finds an existing one anywhere (Devin on #287)', () => {
+    const onlyB = (box: string) => box === 'b';
+    expect(placeRunner([{ box: 'a', sessions: [] }, { box: 'b', sessions: [] }], 'new', 3, onlyB))
+      .toEqual({ kind: 'new', box: 'b', slot: 2 });
+    // An order already live on the ineligible box stays there: no second runner.
+    expect(placeRunner([{ box: 'a', sessions: running(2, 3) }, { box: 'b', sessions: [] }], 'o3', 3, onlyB))
+      .toEqual({ kind: 'existing', box: 'a', slot: 3 });
+    // Full counts the eligible boxes only.
+    expect(placeRunner([{ box: 'a', sessions: [] }, { box: 'b', sessions: running(2, 3, 4) }], 'new', 3, onlyB))
+      .toEqual({ kind: 'full', boxes: 1, max: 3 });
+  });
 });
 
 describe('bearer helpers', () => {
@@ -238,11 +272,61 @@ describe('serializeByKey', () => {
   });
 });
 
+describe('REFUSAL', () => {
+  // Every refusal the route can answer, built once with sample arguments.
+  const all = [
+    REFUSAL.githubNotConnected(), REFUSAL.noBox(), REFUSAL.agentOutdated(), REFUSAL.boxesFull(2, 3),
+    REFUSAL.hookGone('launch'), REFUSAL.hookGone('box'), REFUSAL.boxWait('box "p" is provisioning; retried when its agent connects'),
+    REFUSAL.boxHold('box "f" failed to provision less than an hour ago, ...'), REFUSAL.boxSettling('w1'), REFUSAL.boxStarting('starting', 'old'),
+    REFUSAL.boxStarting('resuming', 'nap'), REFUSAL.boxStartFailed('old', 'stopped', null), REFUSAL.boxStartFailed('old', 'stopped', 'not found'),
+    REFUSAL.boxClaimed('claude-20261009'), REFUSAL.boxProvisioning('claude-20261009'), REFUSAL.boxOnItsWay(), REFUSAL.noProvisioning(),
+    REFUSAL.boxCreationRefused('Connect GitHub in Settings before adding a box'), REFUSAL.agentListFailed('timeout'), REFUSAL.agentLaunchFailed('tmux-create failed'),
+  ];
+
+  it('uses every code in REFUSAL_CODES and no other', () => {
+    expect(new Set(all.map(r => r.code))).toEqual(new Set(REFUSAL_CODES));
+  });
+
+  it('keeps the texts the Activity tab, the journal and old events already carry', () => {
+    // Pinned: a reader of an event written before the code column matches on these.
+    expect(all.map(r => r.text)).toEqual([
+      'the session owner has not connected GitHub in termag; paste `gh auth token` on the termag Credentials page, then the session is retried',
+      'no ready termag box with a connected agent for the session owner; start or add a box in termag',
+      "the session owner's box runs a termag agent too old for cloud sessions; it is retried once the box's termag is updated",
+      'every box of the session owner (2) already runs 3 cloud sessions; it is retried when one ends',
+      'the spawn hook stopped waiting; not launched',
+      'the spawn hook stopped waiting; no box started for it',
+      'box "p" is provisioning; retried when its agent connects',
+      'box "f" failed to provision less than an hour ago, ...',
+      'box "w1" is still receiving its credentials; retried once they have landed',
+      'starting box "old" for this session; retried when its agent connects',
+      'resuming box "nap" for this session; retried when its agent connects',
+      'box "old" is stopped and EC2 refused to start it; start it from termag',
+      'box "old" is stopped and could not be started: not found',
+      'claimed termag box "claude-20261009" for this session; retried when its agent connects',
+      'provisioning termag box "claude-20261009" for this session (a few minutes); retried when its agent connects',
+      'a termag box is being set up for the session owner; retried when its agent connects',
+      'the session owner has no termag box and this orchestrator cannot provision one; add a box in termag',
+      'Connect GitHub in Settings before adding a box; the session is retried once GitHub is connected',
+      'a box agent did not list its sessions: timeout',
+      'the box agent refused the launch: tmux-create failed',
+    ]);
+  });
+
+  it('answers 502 only for a box agent that failed an RPC', () => {
+    expect(all.filter(r => refusalStatus(r) === 502).map(r => r.code)).toEqual(['agent-list-failed', 'agent-launch-failed']);
+  });
+});
+
 describe('githubGate', () => {
-  it('refuses an owner with no GitHub credential on a broker host, with the fix in the message', () => {
+  it('refuses an owner with no GitHub credential on a broker host, with the fix in the message and its code', () => {
     const r = githubGate({ brokerConfigured: true, credential: 'absent' });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/Credentials page/);
+    if (!r.ok) {
+      expect(r.error).toMatch(/Credentials page/);
+      expect(r.code).toBe('github');
+      expect(r.text).toBe(r.error);
+    }
   });
 
   it('lets a connected owner through', () => {
@@ -255,6 +339,63 @@ describe('githubGate', () => {
 
   it('checks nothing on a host without the broker (boxes use their own SSH keys)', () => {
     expect(githubGate({ brokerConfigured: false, credential: 'absent' })).toEqual({ ok: true });
+  });
+});
+
+describe('autoBoxPlan', () => {
+  const now = new Date('2026-10-06T12:00:00Z').getTime();
+  const box = (over: Partial<Parameters<typeof autoBoxPlan>[0][number]> & { id: string; status: string }) => ({
+    name: over.id, kind: 'ec2', ec2InstanceId: 'i-1', lastConnectedAt: null, createdAt: new Date(now - 2 * AUTO_BOX_FAILURE_HOLD_MS), ...over,
+  });
+
+  it('acquires when the owner has no usable box', () => {
+    expect(autoBoxPlan([], now)).toEqual({ kind: 'acquire' });
+    expect(autoBoxPlan([box({ id: 'gone', status: 'terminated' }), box({ id: 'old-fail', status: 'failed' })], now)).toEqual({ kind: 'acquire' });
+    expect(autoBoxPlan([box({ id: 'ext', status: 'stopped', kind: 'external' })], now)).toEqual({ kind: 'acquire' });
+  });
+
+  it('starts a stopped EC2 box rather than making a new one', () => {
+    expect(autoBoxPlan([box({ id: 'old', status: 'stopped' })], now)).toMatchObject({ kind: 'start', box: { id: 'old' } });
+  });
+
+  it('waits on a box that is already on its way, instead of starting or acquiring another', () => {
+    expect(autoBoxPlan([box({ id: 's', status: 'stopped' }), box({ id: 'p', status: 'provisioning' })], now))
+      .toMatchObject({ kind: 'wait', box: { id: 'p' }, reason: expect.stringContaining('provisioning') });
+    expect(autoBoxPlan([box({ id: 'r', status: 'ready' })], now))
+      .toMatchObject({ kind: 'wait', reason: expect.stringContaining('not connected') });
+    expect(autoBoxPlan([box({ id: 'st', status: 'starting' })], now)).toMatchObject({ kind: 'wait' });
+    expect(autoBoxPlan([box({ id: 'sp', status: 'stopping' })], now)).toMatchObject({ kind: 'wait' });
+  });
+
+  it('never starts a stopped box without an EC2 instance id', () => {
+    expect(autoBoxPlan([box({ id: 'noid', status: 'stopped', ec2InstanceId: null })], now)).toEqual({ kind: 'acquire' });
+  });
+
+  it('resumes a hibernated EC2 box instead of making one, and waits while it is still hibernating', () => {
+    expect(autoBoxPlan([box({ id: 'nap', status: 'hibernated' })], now)).toMatchObject({ kind: 'start', box: { id: 'nap' } });
+    expect(autoBoxPlan([box({ id: 'nap', status: 'hibernated' }), box({ id: 'p', status: 'provisioning' })], now))
+      .toMatchObject({ kind: 'wait', box: { id: 'p' } });
+    expect(autoBoxPlan([box({ id: 'h', status: 'hibernating' })], now))
+      .toMatchObject({ kind: 'wait', box: { id: 'h' }, reason: expect.stringContaining('hibernating') });
+    expect(autoBoxPlan([box({ id: 'noid', status: 'hibernated', ec2InstanceId: null })], now)).toEqual({ kind: 'acquire' });
+  });
+
+  it('holds off a new box for an hour after one failed, but still starts a stopped one', () => {
+    const recent = box({ id: 'claude-20261006', status: 'failed', createdAt: new Date(now - 10 * 60 * 1000) });
+    expect(autoBoxPlan([recent], now)).toMatchObject({ kind: 'hold', box: { id: 'claude-20261006' }, reason: expect.stringContaining('failed') });
+    expect(autoBoxPlan([recent, box({ id: 'mine', status: 'stopped' })], now)).toMatchObject({ kind: 'start', box: { id: 'mine' } });
+    // The row says when it was created, not when it failed (the stuck sweep fails
+    // it up to 15 minutes later), so the hold is an hour past that window.
+    const createdAgo = (ms: number) => box({ id: 'late', status: 'failed', createdAt: new Date(now - ms) });
+    expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + 1)], now)).toMatchObject({ kind: 'hold' });
+    expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + PROVISIONING_FAILURE_WINDOW_MS - 1)], now)).toMatchObject({ kind: 'hold' });
+    expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + PROVISIONING_FAILURE_WINDOW_MS + 1)], now)).toEqual({ kind: 'acquire' });
+  });
+});
+
+describe('autoBoxName', () => {
+  it('says why the box exists and when', () => {
+    expect(autoBoxName(new Date('2026-10-06T12:00:00Z'))).toBe('claude-20261006');
   });
 });
 

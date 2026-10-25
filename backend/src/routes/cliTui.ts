@@ -106,7 +106,7 @@ export function mountCliTuiRoutes(router: Router, tui: CliTui, bearer: RequestHa
   // A handoff answers with its own codes and fields (handoff_open carries the
   // open handoff's id, …), which the CLI names to the user: keep them. A box
   // credential reaches only its own box's projects: its token is readable by
-  // anything on the box (an ask's sandboxed run among them), and a handoff
+  // anything on the box (an ask's run among them), and a handoff
   // resets a pane and puts a note in the next agent's first prompt.
   router.post('/projects/:id/handoff', bearer, asyncHandler(async (req, res) => {
     const { user, credential } = cliAuth(res);

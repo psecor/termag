@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PARKED_STATUSES } from './boxPowerPolicy';
-import { boxState, isAddressableName, shapeBox, shapeDevices, shapeProject, type BoxRow, type ProjectRow } from './cliViews';
+import { boxState, isAddressableName, shapeBox, shapeClone, shapeDevices, shapeProject, type BoxRow, type ProjectRow } from './cliViews';
 
 const T = new Date('2026-10-01T12:00:00Z');
 
@@ -84,6 +84,51 @@ describe('shapeProject', () => {
     const sessions = { agent: 'zane-fix-agent', ctrl: 'zane-fix-ctrl' };
     expect(shapeProject(row, undefined, sessions)?.sessions).toEqual(sessions);
     expect(shapeProject(row, undefined)?.sessions).toBeNull();
+  });
+
+  it('carries the clone, none for an empty project already set up', () => {
+    expect(shapeProject(row, undefined)?.clone).toBeNull();
+    expect(shapeProject({ ...row, repoUrl: 'https://github.com/a/b', setupStatus: 'cloning' }, undefined)?.clone)
+      .toEqual({ state: 'cloning', setupStatus: 'cloning', error: null, repoUrl: 'https://github.com/a/b', retryable: false });
+  });
+});
+
+describe('shapeClone', () => {
+  const repoUrl = 'https://github.com/example-org/webapp';
+  const box = { id: 'i1', name: 'devbox', kind: 'ec2', status: 'ready', provisioningError: null };
+
+  it('reads setupStatus as the web UI\'s clone tile does', () => {
+    expect(shapeClone({ repoUrl, setupStatus: 'pending', instance: box })?.state).toBe('waiting');
+    expect(shapeClone({ repoUrl, setupStatus: 'cloning', instance: box })?.state).toBe('cloning');
+    expect(shapeClone({ repoUrl, setupStatus: 'ready', instance: box })).toEqual({
+      state: 'done', setupStatus: 'ready', error: null, repoUrl, retryable: false,
+    });
+  });
+
+  it('gives a failed clone its error and says it can be retried', () => {
+    expect(shapeClone({ repoUrl, setupStatus: 'failed', setupError: ' fatal: repository not found ', instance: box })).toEqual({
+      state: 'failed', setupStatus: 'failed', error: 'fatal: repository not found', repoUrl, retryable: true,
+    });
+    expect(shapeClone({ repoUrl, setupStatus: 'failed', setupError: null, instance: box })?.error).toBe('clone failed');
+    expect(shapeClone({ repoUrl: null, setupStatus: 'failed', instance: box })?.error).toBe('setup failed');
+  });
+
+  it('fails a clone waiting on a box that failed to launch, which Retry relaunches', () => {
+    expect(shapeClone({ repoUrl, setupStatus: 'pending', instance: { ...box, status: 'failed', provisioningError: 'no AMI' } })).toEqual({
+      state: 'failed', setupStatus: 'pending', error: 'The box failed to launch: no AMI. Retry launches a new one.', repoUrl, retryable: true,
+    });
+    expect(shapeClone({ repoUrl, setupStatus: 'pending', instance: { ...box, kind: 'external', status: 'failed' } })?.state).toBe('waiting');
+  });
+
+  it('cannot tell how a checkout typed into the agent pane went', () => {
+    expect(shapeClone({ repoUrl, setupStatus: 'none', instance: box })?.state).toBe('unknown');
+    expect(shapeClone({ repoUrl, setupStatus: 'something-newer', instance: box })).toMatchObject({ state: 'unknown', setupStatus: 'something-newer' });
+  });
+
+  it('has nothing to wait for on an empty project already set up, but waits with one whose box is booting', () => {
+    expect(shapeClone({ repoUrl: null, setupStatus: 'none', instance: box })).toBeNull();
+    expect(shapeClone({ instance: box })).toBeNull();
+    expect(shapeClone({ repoUrl: null, setupStatus: 'pending', instance: box })).toMatchObject({ state: 'waiting', repoUrl: null });
   });
 });
 

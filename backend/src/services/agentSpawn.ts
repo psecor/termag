@@ -6,6 +6,7 @@
  */
 import { PROVIDERS } from '../providers/registry';
 import { isBranchName } from './repoCreate';
+import { parseRepoUrl } from './projectTemplates';
 
 export const SPAWN_FLAG = 'agent-spawn-enabled';
 
@@ -57,6 +58,31 @@ function optString(body: Record<string, unknown>, key: string, max: number): Par
 }
 
 /** The body of POST /api/spawns, checked. Nothing is defaulted here that needs the database. */
+/** `owner/name`, the short form spawn_agent offers for repoUrl. */
+const OWNER_NAME = /^[\w.-]+\/[\w.-]+$/;
+
+/**
+ * Which check a spawned agent's folder must pass on the box before it is
+ * marked trusted for Claude Code (agent/claude-trust.js), or null for none:
+ * the folder-trust prompt then stays for the user. The trust bit makes Claude
+ * Code run the folder's hooks, .mcp.json servers and settings at start, so
+ * it follows the owner's own trust decision, never a repository's owner:
+ *   - "owner": the owner ticked trust for the project (chatTrustedAt, as
+ *     chatTrust), and the box confirms the folder is the project's own tree
+ *     (not a pull request or fork checkout), as the chat runner does;
+ *   - "empty": no repository, and the box confirms the folder holds only
+ *     termag's seed files. A null repoUrl alone is not enough: un-archive and
+ *     Start empty clear it and leave the old checkout on disk.
+ */
+export type SpawnFolderCheck = 'owner' | 'empty';
+
+export function spawnFolderTrust(project: { repoUrl: string | null; chatTrustedAt: Date | null } | null | undefined): SpawnFolderCheck | null {
+  if (!project) return null;
+  if (project.chatTrustedAt) return 'owner';
+  if (!project.repoUrl) return 'empty';
+  return null;
+}
+
 export function parseSpawnRequest(raw: unknown): Parsed<SpawnRequest> {
   const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
 
@@ -88,6 +114,13 @@ export function parseSpawnRequest(raw: unknown): Parsed<SpawnRequest> {
   if (target === 'workstream' && (v.boxId || v.repoUrl)) return { ok: false, error: 'boxId and repoUrl need target: "project"' };
   if (target === 'project' && v.projectId) return { ok: false, error: 'projectId is for target: "workstream"' };
   if (target === 'project' && v.baseRef) return { ok: false, error: 'baseRef is for target: "workstream"' };
+  if (v.repoUrl) {
+    // Checked here, before the spawn row and brief exist, not by the project
+    // create after them: a refused URL must leave no failed spawn behind.
+    const repo = parseRepoUrl(OWNER_NAME.test(v.repoUrl) ? `https://github.com/${v.repoUrl}` : v.repoUrl);
+    if (!repo.ok) return { ok: false, error: 'repoUrl must be a GitHub repository: owner/name, https://github.com/owner/name or git@github.com:owner/name.git' };
+    v.repoUrl = repo.url;
+  }
 
   let from: SpawnRequest['from'];
   if (body.from != null) {
@@ -254,8 +287,22 @@ export function buildBrief(b: BriefInput): string {
 
 
 /** The one line the nudge types. Fixed text: the child's report is never typed into the parent. */
-export function nudgeLine(child: string, status: string): string {
-  return `[termag] delegate ${child} reported ${status}. Call list_spawns (metaterm MCP server) to read its report.`;
+export function nudgeLine(child: string, status: string, adopted = false): string {
+  return `[termag] ${adopted ? 'adopted ' : ''}delegate ${child} reported ${status}. Call list_spawns (metaterm MCP server) to read its report.`;
+}
+
+export interface NudgeItem { child: string; status: string; adopted?: boolean }
+
+/**
+ * Every report for one pane in a tick, as ONE line. Lines typed back to back
+ * arrive as a paste in Claude Code: each Enter but the last becomes a newline
+ * or is lost, and the lot sits unsubmitted in the prompt until someone presses
+ * Enter.
+ */
+export function nudgeLines(items: NudgeItem[]): string {
+  if (items.length === 1) return nudgeLine(items[0].child, items[0].status, items[0].adopted);
+  const each = items.map(i => `${i.child} ${i.status}${i.adopted ? ' (adopted)' : ''}`).join(', ');
+  return `[termag] ${items.length} delegates reported: ${each}. Call list_spawns (metaterm MCP server) to read their reports.`;
 }
 
 export const NUDGE_HUMAN_QUIET_MS = 2 * 60 * 1000;

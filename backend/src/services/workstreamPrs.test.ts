@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db', () => ({ prisma: {} }));
 
-const { applyLinks, earlierLinks, parsePrUrl, recordCreatedLink, replaces } = await import('./workstreamPrs');
+const { applyLinks, earlierLinks, onPrCreated, parsePrUrl, recordCreatedLink, replaces } = await import('./workstreamPrs');
 type Row = Parameters<typeof applyLinks>[0][number];
 
 const MINE = { projectId: 'p1', projectName: 'termag', workstream: 'termag-pr-dash' };
@@ -70,6 +70,22 @@ describe('recordCreatedLink', () => {
     expect(await recordCreatedLink('s', null, URL, { resolve: vi.fn(async () => ({ userId: 'u1', instanceId: null, projectId: null, workstream: null })), store })).toBe(false);
     expect(await recordCreatedLink('s', null, URL, { resolve: vi.fn(async () => null), store })).toBe(false);
     expect(record).not.toHaveBeenCalled();
+  });
+
+  it('tells its listeners of a PR resolved to a workstream (an existing link too), and keeps going past one that throws', async () => {
+    const seen: unknown[] = [];
+    const off1 = onPrCreated(() => { throw new Error('boom'); });
+    const off2 = onPrCreated(ev => { seen.push(ev); });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = { record: vi.fn(async () => false), list: vi.fn(), detach: vi.fn() };
+      const resolve = vi.fn(async () => ({ userId: 'u1', instanceId: 'i1', projectId: 'p1', workstream: 'ws' }));
+      expect(await recordCreatedLink('s', 'i1', URL, { resolve, store })).toBe(false);
+      expect(seen).toEqual([{ userId: 'u1', projectId: 'p1', workstream: 'ws', pr: { repo: 'example-org/termag', number: 363 } }]);
+      // Nothing resolved, nothing told.
+      await recordCreatedLink('s', null, URL, { resolve: vi.fn(async () => null), store });
+      expect(seen).toHaveLength(1);
+    } finally { off1(); off2(); warn.mockRestore(); }
   });
 });
 

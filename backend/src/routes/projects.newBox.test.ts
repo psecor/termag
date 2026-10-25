@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { logs } from '@opentelemetry/api-logs';
+import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
 
 /**
  * A new box and its first project, asked for together: the project waits as
@@ -71,6 +73,12 @@ const prisma = {
 const createBox = vi.fn();
 const terminateBox = vi.fn(async () => true);
 
+// The product events the create records (services/productEvents.ts), read
+// off a log exporter as the backend sends them.
+const logExporter = new InMemoryLogRecordExporter();
+logs.setGlobalLoggerProvider(new LoggerProvider({ processors: [new SimpleLogRecordProcessor({ exporter: logExporter })] }));
+const productEvents = () => logExporter.getFinishedLogRecords().map(r => r.attributes);
+
 vi.mock('../db', () => ({ prisma }));
 vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn(), requireAuthOrAgentToken: vi.fn() }));
 vi.mock('../slack/channels', () => ({ createProjectChannel: vi.fn(async () => null) }));
@@ -94,7 +102,14 @@ vi.mock('../services/agentRegistry', () => ({
   sendToInstanceAgent: vi.fn(),
 }));
 
+// The CLI's create re-reads the project for its answer; the shape is cliStorePrisma's concern.
+vi.mock('../services/cliStorePrisma', () => ({
+  prismaCliStore: { listProjects: vi.fn(async () => [{ id: 'p1', name: 'notes' }]), listBoxes: vi.fn(async () => []) },
+}));
+
 const { createProjectFor, retryCloneFor } = await import('./projects');
+const { prismaCliLifecycle } = await import('./cliLifecyclePrisma');
+const { setWorkspaceChangeCallback } = await import('../services/workspaceEvents');
 const { applySetupEvent } = await import('../services/projectClone');
 const { setPaneLaunchSettleForTests } = await import('../services/agentRuntime');
 // Launches here follow one another into the same pane; the post-launch settle would only add waits.
@@ -115,6 +130,7 @@ beforeEach(() => {
   state.box = null;
   state.connected = false;
   state.sent = [];
+  logExporter.reset();
   vi.clearAllMocks();
   prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown>; select?: Record<string, unknown> }) => {
     const p = state.project;
@@ -189,6 +205,45 @@ describe('a project asked for with a new box', () => {
     expect(types()).toContain('mkdir');
   });
 
+  it('keeps "Act as an orchestrator" only for a trusted chat', async () => {
+    state.box = box('provisioning');
+    const chat = { ...empty, initialAgent: { enabled: true, provider: 'claude-chat' } };
+    const stored = () => (prisma.project.create.mock.calls.at(-1)![0] as { data: { chatOrchestrator: boolean } }).data.chatOrchestrator;
+    await createProjectFor(user, { ...chat, chatTrusted: true, chatOrchestrator: true });
+    expect(stored()).toBe(true);
+    for (const input of [
+      { ...chat, chatTrusted: false, chatOrchestrator: true },
+      { ...chat, chatTrusted: true },
+      { ...empty, chatTrusted: true, chatOrchestrator: true },
+    ]) {
+      state.project = null;
+      await createProjectFor(user, input);
+      expect(stored()).toBe(false);
+    }
+  });
+
+  it('records the create and the agent launch as product events, keyed by the user and the box', async () => {
+    state.box = box('ready');
+    state.connected = true;
+    expect((await createProjectFor(user, { ...empty, warmClaimed: true })).status).toBe(201);
+    expect(productEvents()).toEqual([
+      {
+        'event.name': 'project.created', 'termag.user.id': 'u1', 'termag.box.id': 'box1',
+        'termag.provider': 'claude', 'termag.repoSource': 'empty', 'termag.boxKind': 'box', 'termag.warmClaimed': true, 'termag.spawned': false,
+      },
+      {
+        'event.name': 'agent.session.started', 'termag.user.id': 'u1', 'termag.box.id': 'box1',
+        'termag.provider': 'claude', 'termag.kind': 'interactive', 'termag.resume': false, 'termag.spawned': false, 'termag.clone': false,
+      },
+    ]);
+  });
+
+  it('records no launch event for a project still waiting for its box', async () => {
+    state.box = box('provisioning');
+    expect((await createProjectFor(user, empty)).status).toBe(201);
+    expect(productEvents().map(a => a['event.name'])).toEqual(['project.created']);
+  });
+
   it('says the box failed, not that its agent is away, when the launch failed first', async () => {
     state.box = { ...box('failed'), provisioningError: 'No box AMI found' } as BoxRow;
     expect(await createProjectFor(user, empty)).toEqual({
@@ -231,5 +286,29 @@ describe('Retry on a project whose box failed to launch', () => {
     expect((await retryCloneFor(user, 'p1')).status).toBe(202);
     expect(terminateBox).toHaveBeenCalledOnce();
     expect(state.project?.instanceId).toBe('box3');
+  });
+});
+
+describe('termag project create <box>/<project> --new-box', () => {
+  afterEach(() => setWorkspaceChangeCallback(null));
+
+  it("tells the owner's tabs the project list changed, so /chat and the full UI show it without a reload", async () => {
+    const changed = vi.fn();
+    setWorkspaceChangeCallback(changed);
+    state.box = box('provisioning');
+    prisma.user.findUnique.mockResolvedValueOnce(user as never);
+    const result = await prismaCliLifecycle.createProject({ id: 'u1' } as never, { boxId: 'box1', name: 'notes', agent: 'claude' });
+    expect(result.status).toBe(201);
+    expect(result.body).toMatchObject({ project: { id: 'p1' }, restored: false });
+    expect(changed.mock.calls).toEqual([['u1', 'projects']]);
+  });
+
+  it('says nothing when the create is refused', async () => {
+    const changed = vi.fn();
+    setWorkspaceChangeCallback(changed);
+    prisma.user.findUnique.mockResolvedValueOnce(user as never);
+    const result = await prismaCliLifecycle.createProject({ id: 'u1' } as never, { boxId: 'box1', name: '', agent: 'claude' });
+    expect(result.status).toBe(400);
+    expect(changed).not.toHaveBeenCalled();
   });
 });

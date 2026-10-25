@@ -23,6 +23,8 @@ export interface TreeNode<T> {
   spawn: T;
   /** 0 for the root, 1 for its children, … */
   level: number;
+  /** The member it was spawned from; null for a top of the tree. */
+  parentId: string | null;
 }
 
 export interface SpawnTree<T> {
@@ -62,13 +64,13 @@ export function buildSpawnTrees<T extends TreeInput>(rows: T[]): SpawnTree<T>[] 
     const byAge = (a: T, b: T) => a.createdAt.getTime() - b.createdAt.getTime();
     const nodes: TreeNode<T>[] = [];
     const seen = new Set<string>();
-    const walk = (m: T, level: number) => {
+    const walk = (m: T, level: number, parentId: string | null) => {
       if (seen.has(m.id)) return;
       seen.add(m.id);
-      nodes.push({ spawn: m, level });
-      for (const c of (children.get(m.id) ?? []).sort(byAge)) walk(c, level + 1);
+      nodes.push({ spawn: m, level, parentId });
+      for (const c of (children.get(m.id) ?? []).sort(byAge)) walk(c, level + 1, m.id);
     };
-    for (const t of tops.sort(byAge)) walk(t, 0);
+    for (const t of tops.sort(byAge)) walk(t, 0, null);
     const first = nodes[0]?.spawn;
     trees.push({ rootId, createdAt: first ? first.createdAt : new Date(0), nodes });
   }
@@ -120,4 +122,58 @@ export function tokensBySpawn<T extends TreeInput>(spawns: T[], rows: TokenRow[]
     }
   }
   return out;
+}
+
+export interface TotalsInput {
+  createdAt: Date;
+  launchedAt: Date | null;
+  reportedAt: Date | null;
+  endedAt: Date | null;
+  retiredAt: Date | null;
+  parkedAt: Date | null;
+  state: string;
+}
+
+export interface TreeTotals {
+  agents: number;
+  /** The most agents running at once, from launch to end (or park, or retire). */
+  peakRunning: number;
+  /** All tokens (input, output, cache reads and writes), as the dashboard's rows count them. */
+  tokens: number;
+  /** Of which cache reads. */
+  cacheRead: number;
+  /** From the first spawn to the last report, in seconds; null before any report. */
+  secondsToLastReport: number | null;
+  /** By spawn state (done, running, failed, …). */
+  states: Record<string, number>;
+}
+
+/** The network view's totals for one tree. */
+export function treeTotals<T extends TotalsInput & { id: string }>(spawns: T[], tokens: Map<string, TokenTotals>, now: number): TreeTotals {
+  const edges: Array<[number, number]> = [];
+  let first = Infinity, lastReport = -Infinity, fresh = 0, cacheRead = 0;
+  const states: Record<string, number> = {};
+  for (const s of spawns) {
+    first = Math.min(first, s.createdAt.getTime());
+    if (s.reportedAt) lastReport = Math.max(lastReport, s.reportedAt.getTime());
+    states[s.state] = (states[s.state] ?? 0) + 1;
+    const t = tokens.get(s.id);
+    if (t) { fresh += t.input + t.output + t.cacheRead + t.cacheCreate; cacheRead += t.cacheRead; }
+    if (!s.launchedAt) continue;
+    const stops = [s.endedAt, s.parkedAt, s.retiredAt].filter((d): d is Date => !!d).map(d => d.getTime());
+    const stop = stops.length ? Math.min(...stops) : now;
+    edges.push([s.launchedAt.getTime(), 1], [Math.max(stop, s.launchedAt.getTime()), -1]);
+  }
+  // Stops sort before starts at the same instant, so a hand-over isn't counted as two at once.
+  edges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let running = 0, peakRunning = 0;
+  for (const [, d] of edges) { running += d; peakRunning = Math.max(peakRunning, running); }
+  return {
+    agents: spawns.length,
+    peakRunning,
+    tokens: fresh,
+    cacheRead,
+    secondsToLastReport: lastReport > -Infinity && first < Infinity ? Math.round((lastReport - first) / 1000) : null,
+    states,
+  };
 }

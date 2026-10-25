@@ -15,6 +15,7 @@ const prisma = {
   user: {
     findUnique: vi.fn(async () => ({ defaultAgentProvider: 'claude' })),
   },
+  workflow: { findFirst: vi.fn(async () => null) },
 };
 
 const sendForProject = vi.fn(async (_host: unknown, type: string, payload: Record<string, unknown> = {}) => {
@@ -69,7 +70,7 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
     expect(state.sent).toEqual([]);
     expect(prisma.project.findFirst).toHaveBeenCalledWith({
       where: { userId: 'u1', instanceId: 'box1', name: 'research', archived: false },
-      select: { id: true, setupStatus: true },
+      select: { id: true, setupStatus: true, repoUrl: true, chatTrustedAt: true },
     });
   });
 
@@ -120,7 +121,8 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
       type: 'tmux-send-keys',
       payload: {
         sessionName: 'alice-research-agent',
-        keys: `git clone x && claude --settings "$(termag-credentials telemetry-launch ${replaySessionId})"`,
+        // The pane's project and workstream ride ahead of the box script (services/launchCommand.ts).
+        keys: `git clone x && claude --settings "$(TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${replaySessionId})"`,
         withEnter: true,
       },
     }]);
@@ -132,10 +134,24 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
     expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['claude']);
   });
 
-  it('types the bare command without a replay, whatever the box can do', async () => {
+  it('types the project and workstream without a replay when the box can print them, else the bare command', async () => {
     state.capabilities = ['telemetry-replay-v1'];
     expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');
+    expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys))
+      .toEqual(['claude --settings "$(TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch -)"']);
+    state.sent = [];
+    state.capabilities = ['credentials-v1'];
+    expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');
     expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['claude']);
+  });
+
+  it("starts a Codex pane through the bridge, naming the pane's project and workstream for its resource", async () => {
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex' })).toBe('launched');
+    expect(state.sent.filter(s => s.type === 'tmux-send-keys')).toEqual([]);
+    expect(state.sent.filter(s => s.type === 'codex-session-start')).toEqual([{
+      type: 'codex-session-start',
+      payload: { sessionName: 'alice-research-agent', cwd: dir, project: 'research', workstream: 'main' },
+    }]);
   });
 
   it('reports a pane that already has git or an agent in it, and types nothing', async () => {

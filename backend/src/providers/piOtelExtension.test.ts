@@ -37,6 +37,12 @@ describe('parseDestination', () => {
     expect(parseDestination(RECORD, 'short')?.resource['termag.replay.id']).toBeUndefined();
   });
 
+  it("keeps termag.agent the harness's and adds termag.backend for pi on Fireworks", () => {
+    const fw = parseDestination(RECORD, undefined, 'fireworks')?.resource;
+    expect([fw?.['termag.agent'], fw?.['termag.backend']]).toEqual(['pi', 'fireworks']);
+    expect(parseDestination(RECORD, undefined, 'other')?.resource['termag.backend']).toBeUndefined();
+  });
+
   it('is null for anything termag-credentials would not have written', () => {
     for (const bad of [
       null, '', 'not json', '{}',

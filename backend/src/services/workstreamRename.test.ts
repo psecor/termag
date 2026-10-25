@@ -14,6 +14,12 @@ describe('validateWorkstreamRename', () => {
     expect(validateWorkstreamRename('a', 'main')).toMatchObject({ ok: false, error: expect.stringMatching(/reserved/) });
     expect(validateWorkstreamRename('a', 'a')).toMatchObject({ ok: false, error: expect.stringMatching(/already/) });
   });
+  it('refuses to rename an automation run, or to take a run name', () => {
+    expect(validateWorkstreamRename('run-20261020-0900', 'triage-monday')).toMatchObject({ ok: false, error: expect.stringMatching(/automation run/) });
+    expect(validateWorkstreamRename('run-20261020-0900-2', 'other')).toMatchObject({ ok: false, error: expect.stringMatching(/automation run/) });
+    expect(validateWorkstreamRename('feat-x', 'run-20261020-0900')).toMatchObject({ ok: false, error: expect.stringMatching(/scheduler/) });
+    expect(validateWorkstreamRename('run-x', 'runway')).toEqual({ ok: true, name: 'runway' });
+  });
 });
 
 describe('planSessionRenames', () => {

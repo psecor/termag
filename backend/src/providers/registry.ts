@@ -42,6 +42,10 @@ export interface ProviderConfig {
    *  skill for it. Only such an agent can be handed off FROM; any agent with
    *  promptLaunch can be restarted INTO. */
   handoffWriter?: boolean;
+  /** termag-reconcile installs the opt-in agent-orchestrator skill for it
+   *  (deploy/claude-skills/agent-orchestrator, into ~/.claude/skills), so the
+   *  simple UI's New session offers "Act as an orchestrator". */
+  orchestratorSkill?: boolean;
   /** Typed into the running agent to drop its conversation in place (handoff
    *  `clear` mode). Absent = a handoff restarts it. */
   clearCommand?: string;
@@ -49,6 +53,11 @@ export interface ProviderConfig {
    *  followed by focus instructions (handoff `compact` mode). Absent = a
    *  handoff restarts it. */
   compactCommand?: string;
+  /** Model backends this harness can also run on, besides its own default.
+   *  The backend is per workstream (Workflow.backend);
+   *  how a launch moves onto one is services/launchCommand.ts. Absent =
+   *  its default only. */
+  backends?: string[];
   /** Process names for isAgentRunning() detection (matched case-insensitive) */
   processNames: string[];
   /** Status source values that map back to this provider */
@@ -138,10 +147,14 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     resumeCommand: 'claude --continue',
     promptLaunch: f => `claude "$(cat ${f})"`,
     handoffWriter: true,
+    orchestratorSkill: true,
     clearCommand: '/clear',
     compactCommand: '/compact',
+    backends: ['fireworks'],
     processNames: ['claude'],
-    statusSources: ['claude-hooks'],
+    // t3:claude: the desktop app's threads, Claude Code under a box's t3
+    // server, posting through the same hooks.
+    statusSources: ['claude-hooks', 't3:claude'],
     usageMethod: 'jsonl-scan',
     usagePrecision: 'exact',
   },
@@ -159,6 +172,9 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     processNames: [],
     statusSources: ['chat-runner'],
     chatRunner: true,
+    orchestratorSkill: true,
+    // Its turns start with the backend's settings (agent/chat-runner.js).
+    backends: ['fireworks'],
     // The session transcripts are Claude Code's own; usage-scanner reads them.
     usageMethod: 'jsonl-scan',
     usagePrecision: 'exact',
@@ -309,6 +325,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     // it as idle, not not_running), /compact [instructions] summarizes.
     clearCommand: '/new',
     compactCommand: '/compact',
+    backends: ['fireworks'],
     processNames: ['pi'],
     statusSources: ['pi-ext:pi'],
     // usage-scanner reads ~/.pi/agent/sessions/**.jsonl (exact per-call usage)
@@ -363,6 +380,21 @@ export type AgentProvider = string;
 export const CHAT_PROVIDER_ID = 'claude-chat';
 export function isChatRunnerProvider(id: string | null | undefined): boolean {
   return !!id && PROVIDERS[id]?.chatRunner === true;
+}
+
+/** The model backends a harness can be switched onto, besides its default
+ *  (the harness's own: Claude Code's settings, pi's own model configuration). */
+export const MODEL_BACKENDS: Record<string, { displayName: string; badge: string }> = {
+  fireworks: { displayName: 'Fireworks', badge: 'FW' },
+};
+
+export function backendsFor(provider: string): string[] {
+  return PROVIDERS[provider]?.backends ?? [];
+}
+
+/** Null (the default) is valid for every provider; anything else must be one it lists. */
+export function isBackendFor(provider: string, backend: string | null | undefined): boolean {
+  return backend == null || backendsFor(provider).includes(backend);
 }
 
 /** All process names across all providers, for isAgentRunning() */

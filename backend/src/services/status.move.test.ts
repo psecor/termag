@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../db';
 import { deleteStatus, getStatus, moveStatus, setStatus } from './status';
 import { MILESTONE_TTL_MS } from './milestone';
+import { resetTurnsForTests, settleTurnPost } from './sessionTurns';
+import { statusKey } from './statusKey';
 
 vi.mock('../db', () => ({
   prisma: {
@@ -33,6 +35,15 @@ describe('moveStatus (workstream rename)', () => {
     expect(moved.status).toBe('waiting');
     expect(moved.contextTokens).toBe(1234);
     expect(moved.waitingReason).toBe('permission');
+  });
+
+  it('keeps a desktop thread that is still working counted under the new name', () => {
+    resetTurnsForTests();
+    settleTurnPost(statusKey('i1', 'u-p-old-agent'), { status: 'working', source: 't3:claude', threadId: 'A' });
+    setStatus('u-p-old-agent', 'working', { source: 't3:claude' }, undefined, 'i1');
+    expect(moveStatus('u-p-old-agent', 'u-p-new-agent', 'i1')).toBe(true);
+    // Another thread's Stop under the new name: A still works.
+    expect(settleTurnPost(statusKey('i1', 'u-p-new-agent'), { status: 'idle', source: 't3:claude', threadId: 'B' }).status).toBe('working');
   });
 
   it('returns false and writes nothing when the old session had no live status', () => {

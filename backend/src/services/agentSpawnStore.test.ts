@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
-  agentSpawn: { findFirst: vi.fn(), updateMany: vi.fn() },
+  agentSpawn: { findFirst: vi.fn(), updateMany: vi.fn(), findMany: vi.fn() },
 }));
 vi.mock('../db', () => ({ prisma }));
 vi.mock('./spawnEvents', () => ({ recordSpawnEvent: vi.fn(async () => {}), sweepSpawnEvents: vi.fn(async () => 0) }));
 
-import { claimSpawnLaunch, releaseSpawnLaunch } from './agentSpawnStore';
+import { claimSpawnLaunch, releaseSpawnLaunch, unparkOnLaunch } from './agentSpawnStore';
 
 const key = { userId: 'u1', projectId: 'p1', workstream: 'add-tests', provider: 'claude' };
 
@@ -60,5 +60,24 @@ describe('claimSpawnLaunch', () => {
   it('never throws: a failed lookup is a plain launch', async () => {
     prisma.agentSpawn.findFirst.mockRejectedValue(new Error('db down'));
     await expect(claimSpawnLaunch(key)).resolves.toBeNull();
+  });
+});
+
+describe('unparkOnLaunch', () => {
+  beforeEach(() => { prisma.agentSpawn.findMany.mockReset(); prisma.agentSpawn.updateMany.mockReset(); });
+  it('unparks a parked spawn whose pane is being launched by another path, compare-and-set', async () => {
+    const parkedAt = new Date();
+    prisma.agentSpawn.findMany.mockResolvedValue([{ id: 'ck3', parkedAt, rootSpawnId: 'ck3', childInstanceId: 'b1' }]);
+    prisma.agentSpawn.updateMany.mockResolvedValue({ count: 1 });
+    await unparkOnLaunch('u1', 'p1', 'ws');
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where).toMatchObject({ userId: 'u1', childProjectId: 'p1', childWorkstream: 'ws', retiredAt: null });
+    expect(prisma.agentSpawn.updateMany.mock.calls[0][0]).toEqual({ where: { id: 'ck3', parkedAt }, data: { parkedAt: null, keptReason: null, endedAt: null } });
+  });
+
+  it('does nothing without a project, and never throws', async () => {
+    await unparkOnLaunch('u1', null, 'ws');
+    expect(prisma.agentSpawn.findMany).not.toHaveBeenCalled();
+    prisma.agentSpawn.findMany.mockRejectedValue(new Error('db down'));
+    await expect(unparkOnLaunch('u1', 'p1', 'ws')).resolves.toBeUndefined();
   });
 });

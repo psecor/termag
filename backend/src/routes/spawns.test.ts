@@ -2,14 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
   agentSpawn: {
-    findFirst: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), count: vi.fn(),
+    findFirst: vi.fn(), findMany: vi.fn(), findUnique: vi.fn(), count: vi.fn(), groupBy: vi.fn(async () => []),
     create: vi.fn(), update: vi.fn(), updateMany: vi.fn(),
   },
   project: { findFirst: vi.fn(), findMany: vi.fn() },
   instance: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn() },
-  spawnEvent: { groupBy: vi.fn() },
+  spawnEvent: { groupBy: vi.fn(), findMany: vi.fn() },
   tokenUsageDay: { findMany: vi.fn() },
   hostSample: { findMany: vi.fn() },
+  user: { findUnique: vi.fn(), update: vi.fn(async () => ({})) },
 }));
 vi.mock('../db', () => ({ prisma }));
 vi.mock('../middleware/auth', () => ({ requireAuthOrAgentToken: vi.fn() }));
@@ -22,6 +23,13 @@ vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => tr
 vi.mock('../services/status', () => ({ getStatus: vi.fn(() => ({ status: 'idle' })) }));
 vi.mock('./projects', () => ({ createProjectFor: vi.fn() }));
 vi.mock('../services/spawnEvents', () => ({ recordSpawnEvent: vi.fn(async () => {}) }));
+vi.mock('../services/spawnStatusLog', () => ({ watchSpawnedSession: vi.fn() }));
+vi.mock('../services/spawnActions', () => ({
+  parkSpawn: vi.fn(async () => ({ ok: true })),
+  resumeSpawn: vi.fn(async () => ({ ok: true })),
+  retireSpawn: vi.fn(async () => ({ ok: true })),
+  checkoutCheck: vi.fn(async () => ({ ok: true, why: 'pushed' })),
+}));
 vi.mock('../services/spawnBudget', async () => {
   const { DEFAULT_SPAWN_LIMITS } = await import('../services/spawnLimits');
   return {
@@ -31,8 +39,11 @@ vi.mock('../services/spawnBudget', async () => {
   };
 });
 vi.mock('./workstreams', () => ({ createWorkstreamFor: vi.fn() }));
+vi.mock('../services/spawnOrphanSweep', () => ({ adoptSpawn: vi.fn(async () => ({ ok: true })) }));
 
-import { reportFor, spawnFor, usageFor } from './spawns';
+import { adoptFor, dismissFor, listSpawnsFor, orphanHomeFor, parentsFor, reportFor, resumeFor, sessionTreeFor, spawnFor, treeFor, usageFor } from './spawns';
+import { adoptSpawn } from '../services/spawnOrphanSweep';
+import { parkSpawn, resumeSpawn, retireSpawn } from '../services/spawnActions';
 import { resolveSessionProject } from '../services/sessionResolver';
 import { isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
 import { boolVariation } from '../services/featureFlags';
@@ -40,6 +51,7 @@ import { createProjectFor } from './projects';
 import { createWorkstreamFor } from './workstreams';
 import { buildBudget, spawnLimitsFor, userBoxReadings } from '../services/spawnBudget';
 import { recordSpawnEvent } from '../services/spawnEvents';
+import { watchSpawnedSession } from '../services/spawnStatusLog';
 import { DEFAULT_SPAWN_LIMITS, type Budget, type BoxReading } from '../services/spawnLimits';
 
 const coolBox = (over: Partial<BoxReading> = {}): BoxReading => ({
@@ -92,9 +104,13 @@ describe('spawnFor', () => {
     expect(r.status).toBe(201);
     expect(prisma.agentSpawn.create.mock.calls[0][0].data).toMatchObject({
       parentSession: 'me-proj-agent', parentRole: 'agent', childProjectId: 'p1', childWorkstream: 'add-tests', depth: 1, provider: 'claude',
+      // Where it started, for a local-only project's retire check.
+      baseSha: 'abc1234',
     });
     expect(vi.mocked(sendForProject).mock.calls[0][1]).toBe('write-file');
     expect(vi.mocked(createWorkstreamFor).mock.calls[0][2]).toEqual({ name: 'add-tests', baseRef: 'abc1234', provider: 'claude', spawnId: 'ck1' });
+    // Its status history starts with the row, not at the sweep's next refresh.
+    expect(vi.mocked(watchSpawnedSession)).toHaveBeenCalledWith({ spawnId: 'ck1', userId: 'u1', rootSpawnId: 'ck1', instanceId: BOX, session: 'me-proj-add-tests-agent' });
   });
 
   it('refuses an agent token that names no pane: the limits would have nothing to count', async () => {
@@ -203,6 +219,18 @@ describe('spawnFor', () => {
     expect((r.body as { budget: Budget }).budget.used).toMatchObject({ lastHour: 1, running: 1 });
   });
 
+  it('answers a spawn with hints for the counts it returns, not the counts before it', async () => {
+    // buildBudget's hints are for the admitted counts: running 7/8 is "close".
+    vi.mocked(buildBudget).mockResolvedValue({
+      ...budget({ running: 7 }),
+      hints: [{ kind: 'near_limit', message: 'close to a spawn limit: running 7/8' }],
+    });
+    const r = await spawnFor(user, BOX, { task: 'x', from });
+    const b = (r.body as { budget: Budget }).budget;
+    expect(b.used.running).toBe(8);
+    expect(b.hints.map(h => h.message)).not.toContain('close to a spawn limit: running 7/8');
+  });
+
   it('logs a refusal that never reached the limits with its code', async () => {
     await spawnFor(user, BOX, { task: 'x', projectId: 'p1' });
     expect(refusedReasons()).toEqual(['no_pane']);
@@ -260,7 +288,34 @@ describe('reportFor', () => {
   });
 });
 
+describe('parentsFor', () => {
+  it('names each live child\'s starter once, the newest spawn winning, for this user only', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([
+      { childProjectId: 'kid', childWorkstream: 'main', parentProjectId: 'boss', parentWorkstream: 'main' },
+      { childProjectId: 'kid', childWorkstream: 'main', parentProjectId: 'old', parentWorkstream: 'main' },
+      { childProjectId: 'boss', childWorkstream: 'fix', parentProjectId: 'boss', parentWorkstream: 'main' },
+    ]);
+    const r = await parentsFor(user);
+    expect(r).toEqual({ status: 200, body: { links: [
+      { projectId: 'kid', workstream: 'main', parentProjectId: 'boss', parentWorkstream: 'main' },
+      { projectId: 'boss', workstream: 'fix', parentProjectId: 'boss', parentWorkstream: 'main' },
+    ] } });
+    expect(prisma.agentSpawn.findMany.mock.calls.at(-1)![0].where).toMatchObject({ userId: user.id, retiredAt: null });
+  });
+
+  it('takes one row per child before the cap', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([]);
+    await parentsFor(user);
+    expect(prisma.agentSpawn.findMany.mock.calls.at(-1)![0]).toMatchObject({ distinct: ['childProjectId', 'childWorkstream'], orderBy: { createdAt: 'desc' }, take: 1000 });
+  });
+});
+
 describe('usageFor', () => {
+  beforeEach(() => {
+    prisma.project.findMany.mockResolvedValue([]);
+    prisma.user.findUnique.mockResolvedValue({ spawnOrphanHome: null });
+  });
+
   it('returns the budget, trees with tokens, refusals by reason and each box\'s day', async () => {
     vi.mocked(buildBudget).mockResolvedValue(budget({ lastHour: 3, running: 2 }));
     const created = new Date();
@@ -285,6 +340,19 @@ describe('usageFor', () => {
       boxes: Array<{ heat: string; loadPerCore: number; samples: unknown[] }>;
     };
     expect(body.trees[0]).toMatchObject({ rootId: 'r1', nodes: [{ id: 'r1', level: 0, tokens: { input: 10, output: 4, cacheRead: 100, cacheCreate: 1 } }] });
+    // A tree whose root fell out of the window has no parent row: its oldest node is mid-tree.
+    prisma.agentSpawn.findMany.mockResolvedValue([
+      { id: 'mid', rootSpawnId: 'gone', depth: 2, createdAt: created, relationship: 'delegate', state: 'running', title: 'Mid', provider: 'claude',
+        childProjectId: 'p1', childProjectName: 'proj', childWorkstream: 'mid', childInstanceId: BOX,
+        parentProjectId: 'p1', parentWorkstream: 'gone', parentSession: 'me-proj-gone-agent', report: null, error: null,
+        launchedAt: created, reportedAt: null, nudgedAt: null, endedAt: null },
+    ]);
+    const rootless = (await usageFor(user)).body as { trees: Array<{ rootId: string; origin: unknown }> };
+    expect(rootless.trees[0]).toMatchObject({ rootId: 'gone', origin: null });
+    // The parent row: the session that started it, by its project's name (looked up even when archived).
+    expect(body.trees[0]).toMatchObject({ origin: { projectId: 'p1', workstream: 'main', session: 'me-proj-agent' } });
+    const lookups = prisma.project.findMany.mock.calls.map(c => c[0].where);
+    expect(lookups).toContainEqual({ id: { in: ['p1'] }, userId: 'u1' });
     expect(body.refusals).toEqual([{ reason: 'box_busy', count: 4 }, { reason: 'rate', count: 1 }]);
     expect(body.boxes[0]).toMatchObject({ heat: 'hot', loadPerCore: 0.5 });
     // The hot box speaks up in the hint list, ahead of the user-level hints.
@@ -349,5 +417,245 @@ describe('usageFor', () => {
     expect(body.boxes.map(b => [b.name, b.hotMemPct])).toEqual([['alpha', 90], ['beta', 85]]);
     expect(body.budget.hints.map(h => h.message.split(' ')[1])).toEqual(['alpha', 'beta']);
     vi.mocked(spawnLimitsFor).mockResolvedValue(DEFAULT_SPAWN_LIMITS);
+  });
+});
+
+describe('dismissFor and resumeFor', () => {
+  const child = { id: 'ck9', userId: 'u1', parentProjectId: 'p1', parentWorkstream: 'main', rootSpawnId: 'ck9', state: 'done', parkedAt: null };
+  beforeEach(() => { prisma.agentSpawn.findFirst.mockResolvedValue(child); });
+
+  it('lets the owner park and retire from the browser', async () => {
+    expect((await dismissFor(user, undefined, 'ck9', { action: 'park' })).status).toBe(200);
+    expect(vi.mocked(parkSpawn).mock.calls[0][1]).toBe('owner');
+    expect((await dismissFor(user, undefined, 'ck9', { action: 'retire' })).status).toBe(200);
+    expect(vi.mocked(retireSpawn).mock.calls[0][1]).toBe('owner');
+  });
+
+  it('lets an agent dismiss only its own children, from its own agent pane', async () => {
+    expect((await dismissFor(user, BOX, 'ck9', { action: 'park' })).body).toMatchObject({ code: 'no_pane' });
+    expect((await dismissFor(user, BOX, 'ck9', { action: 'park', session: 'me-proj-agent' })).status).toBe(200);
+    expect(vi.mocked(parkSpawn).mock.calls.at(-1)![1]).toBe('parent');
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...child, parentWorkstream: 'other' });
+    expect((await dismissFor(user, BOX, 'ck9', { action: 'retire', session: 'me-proj-agent' })).body).toMatchObject({ code: 'not_parent' });
+  });
+
+  it('dismisses finished or parked children only: never one working or waiting on someone', async () => {
+    for (const state of ['running', 'blocked', 'needs_input', 'starting']) {
+      prisma.agentSpawn.findFirst.mockResolvedValue({ ...child, state });
+      expect((await dismissFor(user, undefined, 'ck9', { action: 'retire' })).body).toMatchObject({ code: 'not_finished' });
+    }
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...child, state: 'blocked', parkedAt: new Date() });
+    expect((await dismissFor(user, undefined, 'ck9', { action: 'retire' })).status).toBe(200);
+  });
+
+  it('lets the foster dismiss an adopted child, and no longer the parent that went away', async () => {
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...child, parentWorkstream: 'gone', fosterProjectId: 'p1', fosterWorkstream: 'main', fosterRole: 'agent' });
+    expect((await dismissFor(user, BOX, 'ck9', { action: 'park', session: 'me-proj-agent' })).status).toBe(200);
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...child, fosterProjectId: 'p9', fosterWorkstream: 'main', fosterRole: 'agent' });
+    expect((await dismissFor(user, BOX, 'ck9', { action: 'park', session: 'me-proj-agent' })).body).toMatchObject({ code: 'not_parent' });
+  });
+
+  it('answers a kept retire with what it would lose', async () => {
+    vi.mocked(retireSpawn).mockResolvedValueOnce({ ok: false, status: 409, error: 'kept: 2 commits not pushed' });
+    const r = await dismissFor(user, undefined, 'ck9', { action: 'retire' });
+    expect(r).toEqual({ status: 409, body: { error: 'kept: 2 commits not pushed', code: 'kept' } });
+  });
+
+  it('refuses an unknown action, another user\'s spawn, and resume from an agent token', async () => {
+    expect((await dismissFor(user, undefined, 'ck9', { action: 'kill' })).status).toBe(400);
+    prisma.agentSpawn.findFirst.mockResolvedValue(null);
+    expect((await dismissFor(user, undefined, 'nope', { action: 'park' })).status).toBe(404);
+    expect((await resumeFor(user, BOX, 'ck9')).status).toBe(403);
+    prisma.agentSpawn.findFirst.mockResolvedValue(child);
+    expect((await resumeFor(user, undefined, 'ck9')).status).toBe(200);
+    expect(resumeSpawn).toHaveBeenCalled();
+  });
+});
+
+describe('orphans', () => {
+  const orphan = { id: 'ck9', userId: 'u1', parentProjectId: 'p0', parentWorkstream: 'main', childProjectId: 'p1', childProjectName: 'proj', childWorkstream: 'leaf',
+    rootSpawnId: 'ck9', state: 'running', retiredAt: null, orphanedAt: new Date(), fosterProjectId: null, fosterWorkstream: null, reportedAt: null, nudgedAt: null };
+  beforeEach(() => { prisma.agentSpawn.findFirst.mockResolvedValue(orphan); });
+
+  it('lets an agent take an orphan from its own agent pane, and only an orphan', async () => {
+    expect((await adoptFor(user, BOX, 'ck9', {})).body).toMatchObject({ code: 'no_pane' });
+    const r = await adoptFor(user, BOX, 'ck9', { session: 'me-proj-agent' });
+    expect(r.status).toBe(200);
+    expect(vi.mocked(adoptSpawn).mock.calls[0].slice(1)).toEqual([{ projectId: 'p1', workstream: 'main', role: 'agent' }, 'agent']);
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...orphan, orphanedAt: null });
+    expect((await adoptFor(user, BOX, 'ck9', { session: 'me-proj-agent' })).body).toMatchObject({ code: 'not_orphan' });
+  });
+
+  it('lets the owner move any unretired spawn to one of their sessions, never into itself', async () => {
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...orphan, orphanedAt: null });
+    prisma.project.findFirst.mockResolvedValue({ id: 'p2', name: 'coord', workstreams: [] });
+    expect(await adoptFor(user, undefined, 'ck9', { projectId: 'p2' })).toMatchObject({ status: 200, body: { foster: 'coord' } });
+    expect(vi.mocked(adoptSpawn).mock.calls[0][2]).toBe('owner');
+    prisma.project.findFirst.mockResolvedValue({ id: 'p2', name: 'coord', workstreams: [] });
+    expect((await adoptFor(user, undefined, 'ck9', { projectId: 'p2', workstream: 'nope' })).status).toBe(404);
+    prisma.project.findFirst.mockResolvedValue({ id: 'p1', name: 'proj', workstreams: [{ name: 'leaf' }] });
+    expect((await adoptFor(user, undefined, 'ck9', { projectId: 'p1', workstream: 'leaf' })).status).toBe(400);
+    prisma.agentSpawn.findFirst.mockResolvedValue({ ...orphan, retiredAt: new Date() });
+    expect((await adoptFor(user, undefined, 'ck9', { projectId: 'p2' })).body).toMatchObject({ code: 'retired' });
+  });
+
+  it('answers 409 when someone else adopted it first', async () => {
+    vi.mocked(adoptSpawn).mockResolvedValueOnce({ ok: false });
+    expect((await adoptFor(user, BOX, 'ck9', { session: 'me-proj-agent' })).body).toMatchObject({ code: 'conflict' });
+  });
+
+  it('sets and clears the orphan home, owner only', async () => {
+    expect((await orphanHomeFor(user, BOX, { projectId: 'p1' })).status).toBe(403);
+    prisma.project.findFirst.mockResolvedValue({ id: 'p1', name: 'proj', workstreams: [] });
+    expect((await orphanHomeFor(user, undefined, { projectId: 'p1' })).body).toMatchObject({ orphanHome: { projectId: 'p1', workstream: 'main', label: 'proj' } });
+    expect(prisma.user.update.mock.calls[0][0].data).toEqual({ spawnOrphanHome: { projectId: 'p1', workstream: 'main' } });
+    expect((await orphanHomeFor(user, undefined, { projectId: null })).body).toEqual({ ok: true, orphanHome: null });
+  });
+
+  it('lists a session\'s own children less those fostered elsewhere, plus those it adopted', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([]);
+    const listed = await listSpawnsFor(user, BOX, 'me-proj-agent');
+    // Its own slot, for MetaTerm's link to its session view.
+    expect(listed.body).toMatchObject({ caller: { projectId: 'p1', workstream: 'main' } });
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where.OR).toEqual([
+      { parentProjectId: 'p1', parentWorkstream: 'main', fosterProjectId: null },
+      { fosterProjectId: 'p1', fosterWorkstream: 'main' },
+    ]);
+    // Orphans once, under orphans: not among the children of the foster that went away.
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where.orphanedAt).toBeNull();
+  });
+
+  it('shows an orphan whose foster went away as orphaned, not as adopted', async () => {
+    const stale = { ...orphan, fosterProjectId: 'p2', fosterWorkstream: 'main', fosterRole: 'agent', adoptedBy: 'home', adoptedAt: new Date() };
+    prisma.agentSpawn.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([stale]);
+    const r = await listSpawnsFor(user, BOX, 'me-proj-agent');
+    expect((r.body as { orphans: Array<{ foster: unknown; orphanedAt: unknown }> }).orphans[0]).toMatchObject({ foster: null, orphanedAt: orphan.orphanedAt });
+  });
+});
+
+describe('treeFor (the network view)', () => {
+  const t0 = new Date('2026-10-19T10:00:00Z');
+  const node = (id: string, over: Record<string, unknown> = {}) => ({
+    id, userId: 'u1', rootSpawnId: 'r1', depth: 1, createdAt: t0, relationship: 'delegate', state: 'running', title: id, provider: 'claude',
+    childProjectId: 'p1', childProjectName: 'proj', childWorkstream: id, childInstanceId: BOX,
+    parentProjectId: 'p1', parentWorkstream: 'main', parentSession: 'me-proj-agent', report: null, error: null,
+    launchedAt: t0, reportedAt: null, nudgedAt: null, endedAt: null, parkedAt: null, retiredAt: null,
+    fosterProjectId: null, fosterWorkstream: null, fosterRole: null, orphanedAt: null, ...over,
+  });
+  beforeEach(() => {
+    prisma.tokenUsageDay.findMany.mockResolvedValue([]);
+    prisma.spawnEvent.findMany.mockResolvedValue([{ spawnId: 'r1', kind: 'created', reason: null, at: t0 }]);
+    prisma.project.findFirst.mockResolvedValue({ name: 'proj', instanceId: BOX, user: { unixUsername: 'me' } });
+  });
+
+  it('returns the owner\'s tree with edges, the origin session, events and totals', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([
+      node('r1'),
+      node('kid', { depth: 2, parentWorkstream: 'r1', createdAt: new Date(t0.getTime() + 1000) }),
+    ]);
+    const r = await treeFor(user, 'r1', t0.getTime() + 60_000);
+    expect(r.status).toBe(200);
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where).toEqual({ userId: 'u1', OR: [{ rootSpawnId: 'r1' }, { id: 'r1' }] });
+    const body = r.body as { origin: unknown; nodes: Array<{ id: string; parentId: string | null; child: { status: string } }>; events: unknown[]; totals: { agents: number; peakRunning: number } };
+    expect(body.origin).toMatchObject({ session: 'me-proj-agent', label: 'proj', status: 'idle' });
+    expect(body.nodes.map(n => [n.id, n.parentId])).toEqual([['r1', null], ['kid', 'r1']]);
+    expect(body.nodes[0].child.status).toBe('idle');
+    expect(body.events).toHaveLength(1);
+    expect(prisma.spawnEvent.findMany.mock.calls[0][0]).toMatchObject({ where: { userId: 'u1', spawnId: { in: ['r1', 'kid'] } }, select: { spawnId: true, kind: true, reason: true, at: true, parentProjectId: true, parentWorkstream: true } });
+    expect(body.totals).toMatchObject({ agents: 2, peakRunning: 2 });
+  });
+
+  it('names fosters, and flags a tree longer than it returns', async () => {
+    const many = Array.from({ length: 501 }, (_, i) => node(i ? `k${i}` : 'r1', i ? { parentWorkstream: 'r1', createdAt: new Date(t0.getTime() + i) } : {}));
+    many[1] = { ...many[1], fosterProjectId: 'p9', fosterWorkstream: 'home', fosterRole: 'agent' };
+    prisma.agentSpawn.findMany.mockResolvedValue(many);
+    prisma.project.findMany.mockResolvedValue([{ id: 'p9', name: 'coord' }]);
+    const body = (await treeFor(user, 'r1')).body as { nodes: unknown[]; nodesTruncated: boolean; fosters: unknown[] };
+    expect(body.nodesTruncated).toBe(true);
+    expect(body.nodes).toHaveLength(500);
+    expect(body.fosters).toEqual([{ projectId: 'p9', workstream: 'home', label: 'coord/home' }]);
+    prisma.spawnEvent.findMany.mockResolvedValue(Array.from({ length: 5001 }, () => ({ spawnId: 'r1', kind: 'status', reason: 'idle', at: t0 })));
+    const more = (await treeFor(user, 'r1')).body as { events: unknown[]; eventsTruncated: boolean };
+    expect(more.eventsTruncated).toBe(true);
+    expect(more.events).toHaveLength(5000);
+  });
+
+  it('answers 404 for a tree that is not the user\'s', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValue([]);
+    expect((await treeFor(user, 'nope')).status).toBe(404);
+  });
+});
+
+describe('sessionTreeFor (every tree one session started)', () => {
+  const t0 = new Date('2026-10-19T10:00:00Z');
+  const node = (id: string, over: Record<string, unknown> = {}) => ({
+    id, userId: 'u1', rootSpawnId: id, depth: 1, createdAt: t0, relationship: 'delegate', state: 'running', title: id, provider: 'claude',
+    childProjectId: 'p1', childProjectName: 'proj', childWorkstream: id, childInstanceId: BOX,
+    parentProjectId: 'p1', parentWorkstream: 'main', parentSession: 'me-proj-agent', report: null, error: null,
+    launchedAt: t0, reportedAt: null, nudgedAt: null, endedAt: null, parkedAt: null, retiredAt: null,
+    fosterProjectId: null, fosterWorkstream: null, fosterRole: null, orphanedAt: null, ...over,
+  });
+  beforeEach(() => {
+    prisma.tokenUsageDay.findMany.mockResolvedValue([]);
+    prisma.spawnEvent.findMany.mockResolvedValue([]);
+    prisma.project.findFirst.mockResolvedValue({ name: 'proj', instanceId: BOX, user: { unixUsername: 'me' } });
+    prisma.project.findMany.mockResolvedValue([]);
+  });
+
+  it('puts every tree the session started under it, oldest first, the roots as the origin\'s children', async () => {
+    prisma.agentSpawn.findMany
+      .mockResolvedValueOnce([{ id: 'r2' }, { id: 'r1' }])
+      .mockResolvedValueOnce([
+        node('r1'),
+        node('r2', { createdAt: new Date(t0.getTime() + 60_000) }),
+        node('kid', { rootSpawnId: 'r1', depth: 2, parentWorkstream: 'r1', createdAt: new Date(t0.getTime() + 1000) }),
+      ]);
+    const r = await sessionTreeFor(user, 'p1', 'main', t0.getTime() + 120_000);
+    expect(r.status).toBe(200);
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].where).toMatchObject({ userId: 'u1', parentProjectId: 'p1', parentWorkstream: 'main', depth: 1 });
+    const body = r.body as { scope: string; rootId: string; rootIds: string[]; nodes: Array<{ id: string; parentId: string | null }>; origin: { label: string }; totals: { agents: number } };
+    expect(body).toMatchObject({ scope: 'session', rootId: 'session:p1:main', rootIds: ['r1', 'r2'], origin: { label: 'proj' } });
+    expect(body.nodes.map(n => [n.id, n.parentId])).toEqual([['r1', null], ['kid', 'r1'], ['r2', null]]);
+    expect(body.totals.agents).toBe(3);
+  });
+
+  it('keeps a still-running tree however old, caps the trees, and names the origin by its project now', async () => {
+    const roots = Array.from({ length: 51 }, (_, i) => ({ id: `r${i}` }));
+    prisma.agentSpawn.findMany.mockResolvedValueOnce(roots).mockResolvedValueOnce([node('r0')]);
+    // Renamed since: the stored parentSession is stale, the origin's is rebuilt from the project.
+    prisma.project.findFirst.mockResolvedValue({ name: 'renamed', instanceId: BOX, user: { unixUsername: 'me' } });
+    const r = await sessionTreeFor(user, 'p1', 'main', t0.getTime());
+    const where = prisma.agentSpawn.findMany.mock.calls[0][0].where;
+    expect(where.OR).toEqual([{ createdAt: { gte: new Date(t0.getTime() - 7 * 24 * 60 * 60 * 1000) } }, { endedAt: null, retiredAt: null, state: { not: 'failed' } }]);
+    expect(prisma.agentSpawn.findMany.mock.calls[0][0].take).toBe(51);
+    expect(prisma.agentSpawn.findMany.mock.calls[1][0].where.OR[0].rootSpawnId.in).toHaveLength(50);
+    expect(r.body).toMatchObject({ rootsTruncated: true, origin: { session: 'me-renamed-agent', label: 'renamed' } });
+  });
+
+  it('keeps whole trees, newest first, up to the agent cap, and the newest events', async () => {
+    // Two trees: the newer one has 300 agents, the older 201. Together they exceed 500.
+    prisma.agentSpawn.findMany.mockResolvedValueOnce([{ id: 'rNew' }, { id: 'rOld' }]).mockResolvedValueOnce([node('rNew')]);
+    prisma.agentSpawn.groupBy.mockResolvedValueOnce([{ rootSpawnId: 'rNew', _count: { _all: 300 } }, { rootSpawnId: 'rOld', _count: { _all: 201 } }]);
+    prisma.spawnEvent.findMany.mockResolvedValueOnce(Array.from({ length: 5001 }, (_, i) => ({ spawnId: 'rNew', kind: 'status', reason: 'idle', at: new Date(t0.getTime() + 5001 - i) })));
+    const body = (await sessionTreeFor(user, 'p1', 'main', t0.getTime() + 3_000_000)).body as { rootIds: string[]; events: Array<{ at: Date }>; rootsTruncated: boolean; origin: { label: string } };
+    // The older tree is left out whole: its root, its edges and the origin stay intact.
+    expect(prisma.agentSpawn.findMany.mock.calls[1][0].where.OR[0].rootSpawnId.in).toEqual(['rNew']);
+    expect(body).toMatchObject({ rootIds: ['rNew'], rootsTruncated: true, origin: { label: 'proj' } });
+    // Newest events kept, oldest first.
+    expect(prisma.spawnEvent.findMany.mock.calls[0][0].orderBy).toEqual({ at: 'desc' });
+    expect(body.events).toHaveLength(5000);
+    expect(body.events[0].at.getTime()).toBeLessThan(body.events[4999].at.getTime());
+    expect(body.events[4999].at.getTime()).toBe(t0.getTime() + 5001);
+  });
+
+  it('does not say it was cut short when every tree fits', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValueOnce([{ id: 'r2' }, { id: 'r1' }]).mockResolvedValueOnce([node('r1'), node('r2')]);
+    prisma.agentSpawn.groupBy.mockResolvedValueOnce([{ rootSpawnId: 'r1', _count: { _all: 1 } }, { rootSpawnId: 'r2', _count: { _all: 1 } }]);
+    expect((await sessionTreeFor(user, 'p1', 'main', t0.getTime())).body).toMatchObject({ rootsTruncated: false });
+  });
+
+  it('answers 404 for a session that started nothing (or is another user\'s)', async () => {
+    prisma.agentSpawn.findMany.mockResolvedValueOnce([]);
+    expect((await sessionTreeFor(user, 'p9', 'main')).status).toBe(404);
   });
 });

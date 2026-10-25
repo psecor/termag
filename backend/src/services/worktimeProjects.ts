@@ -8,7 +8,7 @@
  * splitting is ambiguous; instead we resolve against the user's real project
  * names — exact match first, else the LONGEST project name that prefixes the
  * field (`ic-sample-app-small-fixes` → `ic-sample-app` / `small-fixes`, not
- * `ic` / `okr-viewer-small-fixes`). Same reconstruct-don't-parse stance as
+ * `ic` / `sample-app-small-fixes`). Same reconstruct-don't-parse stance as
  * sessionResolver.matchSession.
  */
 

@@ -57,9 +57,13 @@ const lifecycle: CliLifecycle = {
   async powerBox(user, id, action) { calls.push(['powerBox', user.id, id, action]); return next; },
   async setBoxLifecycle(user, id, settings) { calls.push(['setBoxLifecycle', user.id, id, settings]); return next; },
   async removeBox(user, id, confirmed) { calls.push(['removeBox', user.id, id, confirmed]); return next; },
+  async renameBox(user, id, name) { calls.push(['renameBox', user.id, id, name]); return next; },
   async createProject(user, input) { calls.push(['createProject', user.id, input]); return next; },
   async renameProject(user, id, name) { calls.push(['renameProject', user.id, id, name]); return next; },
   async archiveProject(user, id) { calls.push(['archiveProject', user.id, id]); return next; },
+  async createWorkstream(user, id, input) { calls.push(['createWorkstream', user.id, id, input]); return next; },
+  async removeWorkstream(user, id, name, opts) { calls.push(['removeWorkstream', user.id, id, name, opts]); return next; },
+  async retryClone(user, id) { calls.push(['retryClone', user.id, id]); return next; },
 };
 
 let server: Server;
@@ -100,22 +104,28 @@ describe('lifecycle routes', () => {
     next = ok(202, { box: { id: 'i-devbox' } });
     expect((await call('POST', '/boxes/i-devbox/stop', DEVICE)).status).toBe(202);
     expect((await call('POST', '/boxes/i-devbox/start', DEVICE)).status).toBe(202);
+    expect((await call('POST', '/boxes/i-devbox/hibernate', DEVICE)).status).toBe(202);
     next = ok();
     await call('PATCH', '/boxes/i-devbox/lifecycle', BOX, { idleHibernateHours: 1 });
+    await call('POST', '/boxes/i-devbox/rename', DEVICE, { name: ' heavy ' });
     await call('DELETE', '/boxes/i-devbox', DEVICE, { confirmed: true });
     await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fix', agent: 'claude' });
     await call('POST', '/projects/p1/rename', DEVICE, { name: 'fix2' });
     await call('POST', '/projects/p1/archive', DEVICE);
+    await call('POST', '/projects/p1/clone/retry', BOX);
 
     expect(calls).toEqual([
       ['createBox', 'alice', 'devbox', null],
       ['powerBox', 'alice', 'i-devbox', 'stop'],
       ['powerBox', 'alice', 'i-devbox', 'start'],
+      ['powerBox', 'alice', 'i-devbox', 'hibernate'],
       ['setBoxLifecycle', 'alice', 'i-devbox', { idleHibernateHours: 1 }],
+      ['renameBox', 'alice', 'i-devbox', 'heavy'],
       ['removeBox', 'alice', 'i-devbox', true],
       ['createProject', 'alice', { boxId: 'i-devbox', name: 'fix', agent: 'claude' }],
       ['renameProject', 'alice', 'p1', 'fix2'],
       ['archiveProject', 'alice', 'p1'],
+      ['retryClone', 'alice', 'p1'],
     ]);
   });
 
@@ -134,6 +144,7 @@ describe('lifecycle routes', () => {
       ['POST', '/projects', { boxId: 'i-devbox', name: 'fix' }],
       ['POST', '/projects', { name: 'fix', agent: 'claude' }],
       ['POST', '/projects/p1/rename', { name: 7 }],
+      ['POST', '/boxes/i-devbox/rename', {}],
     ] as const) {
       const res = await call(method, path, DEVICE, body);
       expect(res.status, `${method} ${path} ${JSON.stringify(body)}`).toBe(400);
@@ -185,19 +196,72 @@ describe('lifecycle routes', () => {
   });
 });
 
+describe('workstream routes', () => {
+  it('pass the name, base, agent and startFromOrigin through', async () => {
+    next = ok(201, { workstream: { id: 'w1' }, warnings: [] });
+    const res = await call('POST', '/projects/p1/workstreams', DEVICE, { name: ' t3-0a1b2c3d ', base: 'main', agent: 'claude-chat', startFromOrigin: true });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ workstream: { id: 'w1' }, warnings: [] });
+    await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix' });
+    await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix', agent: 'claude', startFromOrigin: false });
+    expect(calls).toEqual([
+      ['createWorkstream', 'alice', 'p1', { name: 't3-0a1b2c3d', base: 'main', agent: 'claude-chat', startFromOrigin: true }],
+      ['createWorkstream', 'alice', 'p1', { name: 'fix' }],
+      ['createWorkstream', 'alice', 'p1', { name: 'fix', agent: 'claude' }],
+    ]);
+  });
+
+  it('refuse a missing name, an agent nobody offers, and fields of the wrong type', async () => {
+    for (const body of [
+      {},
+      { name: '  ' },
+      { name: 'fix', agent: 'codex' },
+      { name: 'fix', agent: '' },
+      { name: 'fix', base: 7 },
+      { name: 'fix', startFromOrigin: 'yes' },
+    ]) {
+      const res = await call('POST', '/projects/p1/workstreams', DEVICE, body);
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'invalid_request' });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('remove one by name, forced and keeping its branch only when asked', async () => {
+    await call('DELETE', '/projects/p1/workstreams/t3-0a1b2c3d', DEVICE);
+    await call('DELETE', '/projects/p1/workstreams/fix', DEVICE, { force: true, keepBranch: true });
+    await call('DELETE', '/projects/p1/workstreams/fix', DEVICE, { force: 'yes', keepBranch: 1 });
+    expect(calls).toEqual([
+      ['removeWorkstream', 'alice', 'p1', 't3-0a1b2c3d', { force: false, keepBranch: false }],
+      ['removeWorkstream', 'alice', 'p1', 'fix', { force: true, keepBranch: true }],
+      ['removeWorkstream', 'alice', 'p1', 'fix', { force: false, keepBranch: false }],
+    ]);
+  });
+
+  it('pass the handler\'s refusal through', async () => {
+    next = { status: 409, body: { error: 'A workstream with that name already exists', code: 'conflict' } };
+    const res = await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'A workstream with that name already exists', code: 'conflict' });
+  });
+});
+
 describe('box credentials', () => {
-  it('may create, start, stop, and manage projects', async () => {
+  it('may create, start, stop, rename, and manage projects and their workstreams', async () => {
     for (const [method, path, body] of [
       ['POST', '/boxes', { name: 'other' }],
+      ['POST', '/boxes/i-other/rename', { name: 'renamed' }],
       ['POST', '/boxes/i-other/start', undefined],
       ['POST', '/boxes/i-other/stop', undefined],
       ['POST', '/projects', { boxId: 'i-devbox', name: 'fix', agent: 'claude' }],
       ['POST', '/projects/p1/rename', { name: 'fix2' }],
       ['POST', '/projects/p1/archive', undefined],
+      ['POST', '/projects/p1/workstreams', { name: 'fix' }],
+      ['DELETE', '/projects/p1/workstreams/fix', undefined],
     ] as const) {
       expect((await call(method, path, BOX, body)).status, `${method} ${path}`).toBe(200);
     }
-    expect(calls).toHaveLength(6);
+    expect(calls).toHaveLength(9);
     expect(calls[0]).toEqual(['createBox', 'alice', 'other', 'i-devbox']);
   });
 

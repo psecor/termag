@@ -167,11 +167,13 @@ describe('box-only run routes', () => {
     next = { status: 202, body: { ok: true } };
     const res = await call('POST', `/ask/runs/${MSG}/result`, BOX, {
       result: 'done', sessionId: 'abc-123', numTurns: 3, baseSha: 'a'.repeat(40), repo: 'org/repo', bundle: true,
+      prDescription: '# Title\n\nWhat changed.', prDescriptions: { docs: '# Docs', 'Bad Key': 'x' },
     });
     expect(res.status).toBe(202);
     expect(calls[0]).toEqual(['recordResult', 'i-devbox', MSG, {
       result: 'done', sessionId: 'abc-123', isError: false, numTurns: 3, exitReason: null,
-      baseSha: 'a'.repeat(40), repo: 'org/repo', bundle: true,
+      baseSha: 'a'.repeat(40), repo: 'org/repo', bundle: true, prDescription: '# Title\n\nWhat changed.',
+      prDescriptions: { docs: '# Docs' },
     }]);
   });
 });

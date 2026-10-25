@@ -15,6 +15,9 @@ describe('/t handoff', () => {
     expect(isHandoffCommand('handoff please write the docs')).toBe(false);
     expect(isHandoffCommand('handoff compact')).toBe(true);
     expect(isHandoffCommand('handoff Devin')).toBe(true);
+    // Phones capitalise the first word.
+    expect(isHandoffCommand('Handoff compact')).toBe(true);
+    expect(isHandoffCommand('Handoff please write the docs')).toBe(false);
   });
 
   it('defaults to clear; naming an agent restarts on it, by id or display name', () => {

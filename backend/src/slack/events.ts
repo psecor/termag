@@ -9,29 +9,28 @@
 // App type used loosely — Bolt's CJS export doesn't play well with TS imports
 type App = any;
 import { prisma } from '../db';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { writeFile } from 'fs/promises';
-import { join } from 'path';
 
 import { executeClaudeCommand, resolveWorkingDir } from './executor';
 import { StreamingMessageUpdater } from './streaming';
-import { formatResponse, formatError, formatWelcome, splitMessage } from './formatting';
+import { formatError, formatWelcome } from './formatting';
 import { publishHomeView } from './homeView';
 import { resolveTermagUser } from './userMapping';
+import { slackChatAllowed, slackProjectAccess, slackRefusalText, slackUserRefusal, type SlackProjectAccess } from './access';
+import { clearActiveTarget, getActiveTarget, guessActiveTarget, setActiveTarget, type ChatPlatform } from './activeTargets';
 import { handleCollabThreadMessage } from './collab';
-import { isHandoffCommand, slackHandoff } from './handoffCommand';
+import { slackHandoff } from './handoffCommand';
+import { parseSlashCommand, slashHelp } from './slashCommand';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { sessionName, projectDir, formatPaneForSlack } from '../services/tmux';
 import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
 import { matchChannelTarget, createProjectChannel } from './channels';
-import type { Project, User } from '@prisma/client';
+import type { Prisma, Project, User } from '@prisma/client';
 // tmux ops route through the per-user agent (the backend can't see the user's
 // tmux in-process). Same signatures as the old ../services/tmux helpers.
 import {
   hasSession, sendKeys, capturePaneForSlack, pollUntilStable, listSessionsViaAgent,
 } from './tmuxAgent';
-import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
+import { connectedOwnedBoxIds, isAgentConnected, sendToAgent, type ProjectHost } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { isAdminUser } from '../services/admin/adminAccess';
 import {
@@ -41,20 +40,12 @@ import {
   setNotificationTarget,
 } from './lts';
 
-const execAsync = promisify(exec);
-
 // Track users who have the App Home tab open
 const activeHomeViewers = new Set<string>();
 export function getActiveHomeViewers() { return activeHomeViewers; }
 
-// In-memory: Slack userId → active termag target (project + workstream).
-// Used in DMs / non-project channels, where there is no channel to route by.
-const activeTargetMap = new Map<string, { projectId: string; workstream: string }>();
 // In-memory: userId → session message count (for --continue)
 const sessionMessageCount = new Map<string, number>();
-// In-memory: channel following
-const followedThreads = new Set<string>(); // "channel:ts"
-const followedChannels = new Set<string>();
 
 // ── Emoji reaction → terminal command system ─────────────────
 // Maps Slack emoji names to keystrokes sent to the terminal
@@ -137,19 +128,6 @@ export async function addReactionHints(client: any, channelId: string, messageTs
 const userLastRequest = new Map<string, number>();
 const RATE_LIMIT_MS = (parseInt(process.env.RATE_LIMIT_SECONDS ?? '2', 10)) * 1000;
 
-// ALLOWED_SLACK_USERS is documented as `slackId:unixuser` pairs (see
-// .env.example / deploy/setup.md), but the gate below only matches on the bare
-// Slack user id. Strip the optional `:unixuser` so the documented format works
-// (also accepts a bare id). Actual termag-user resolution is by email in
-// resolveTermagUser, so the unixuser suffix is informational here.
-const ALLOWED_USERS = process.env.ALLOWED_SLACK_USERS
-  ? new Set(
-      process.env.ALLOWED_SLACK_USERS.split(',')
-        .map(entry => entry.split(':')[0].trim())
-        .filter(Boolean),
-    )
-  : null;
-
 function isRateLimited(userId: string): boolean {
   const now = Date.now();
   if (now - (userLastRequest.get(userId) ?? 0) < RATE_LIMIT_MS) return true;
@@ -157,26 +135,24 @@ function isRateLimited(userId: string): boolean {
   return false;
 }
 
-/**
- * Resolve the unix username for a Slack user.
- * Looks up the termag user via Slack ID → email → googleEmail match.
- */
-async function resolveUnixUsername(slackUserId: string, slackClient?: any): Promise<string> {
-  const user = await resolveTermagUser(slackUserId, slackClient);
-  return user?.unixUsername ?? 'unknown';
-}
-
+// The active target: what /t drives in DMs and non-project channels, where
+// there is no channel to route by. Saved across deploys (activeTargets.ts).
 export function getActiveProjectId(userId: string): string | null {
-  return activeTargetMap.get(userId)?.projectId ?? null;
+  return getActiveTarget(userId)?.projectId ?? null;
 }
 
 export function getActiveWorkstream(userId: string): string {
-  return activeTargetMap.get(userId)?.workstream ?? 'main';
+  return getActiveTarget(userId)?.workstream ?? 'main';
+}
+
+/** A first /t's fallback target: not the person's choice, so not saved (activeTargets.ts). */
+export function guessActiveProjectId(userId: string, projectId: string): void {
+  guessActiveTarget(userId, { projectId, workstream: 'main' });
 }
 
 /** Set the active target. Omitting `workstream` resets it to `main`. */
-export function setActiveProjectId(userId: string, projectId: string, workstream: string = 'main'): void {
-  activeTargetMap.set(userId, { projectId, workstream });
+export function setActiveProjectId(userId: string, projectId: string, workstream: string = 'main', platform: ChatPlatform = 'slack'): void {
+  setActiveTarget(platform, userId, { projectId, workstream });
 }
 
 type ChannelTarget = { project: Project & { user: User }; workstream: string };
@@ -189,9 +165,11 @@ type ChannelTarget = { project: Project & { user: User }; workstream: string };
  * name for every live tuple and compare (never parses dashes), then the legacy
  * `#proj-<project>` form preferring the invoking user's project. On a name
  * match the id is backfilled so it's a one-time self-heal — covers channels
- * created by hand or before Slack was enabled.
+ * created by hand or before Slack was enabled. Only for a project the caller
+ * may reach: a channel named after someone else's project must not become
+ * that project's channel.
  */
-async function resolveChannelTarget(command: any, preferUserId?: string): Promise<ChannelTarget | null> {
+async function resolveChannelTarget(command: any, preferUserId: string | undefined, access: SlackProjectAccess): Promise<ChannelTarget | null> {
   const byWs = await prisma.workstream.findFirst({
     where: { slackChannelId: command.channel_id, archived: false, project: { archived: false } },
     include: { project: { include: { user: true } } },
@@ -214,6 +192,7 @@ async function resolveChannelTarget(command: any, preferUserId?: string): Promis
   const m = matchChannelTarget(channelName, projects, preferUserId);
   if (!m) return null;
   const project = projects.find(p => p.id === m.projectId)!;
+  if (!(await access.mayReach(project.id))) return { project, workstream: m.workstream };
 
   // Persist the link so future lookups hit the fast path.
   try {
@@ -229,12 +208,62 @@ async function resolveChannelTarget(command: any, preferUserId?: string): Promis
   return { project, workstream: m.workstream };
 }
 
-/** Active (DM) target as a ChannelTarget, or null. */
+/**
+ * `/t ls`: the tmux sessions on each of the caller's boxes with a live agent,
+ * by box name, then their legacy per-user agent's. Hosts without sessions are
+ * left out.
+ */
+async function sessionsByHost(userId: string): Promise<{ label: string; sessions: string[] }[]> {
+  const boxes = await prisma.instance.findMany({
+    where: { id: { in: connectedOwnedBoxIds(userId) } },
+    select: { id: true, name: true },
+    orderBy: { name: 'asc' },
+  });
+  const hosts: { label: string; host: ProjectHost }[] = boxes.map(b => ({ label: b.name, host: { userId, instanceId: b.id } }));
+  if (isAgentConnected(userId)) hosts.push({ label: 'per-user agent', host: { userId, instanceId: null } });
+  const listed = await Promise.all(hosts.map(async h => ({ label: h.label, sessions: await listSessionsViaAgent(h.host) })));
+  return listed.filter(h => h.sessions.length > 0);
+}
+
+/** Active (DM) target as a ChannelTarget, or null (also once its project is archived or deleted). */
 async function activeTarget(userId: string): Promise<ChannelTarget | null> {
   const projectId = getActiveProjectId(userId);
   if (!projectId) return null;
   const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
-  return project ? { project, workstream: getActiveWorkstream(userId) } : null;
+  return project && !project.archived ? { project, workstream: getActiveWorkstream(userId) } : null;
+}
+
+/**
+ * What a `/t` drives: the channel's target, else the caller's active one.
+ * 'refused' when that is a project the caller may not reach (access.ts), so
+ * someone else's project channel is refused rather than falling back to the
+ * caller's own target.
+ */
+async function slashTarget(command: any, userId: string, preferUserId: string | undefined, access: SlackProjectAccess): Promise<ChannelTarget | 'refused' | null> {
+  const target = await resolveChannelTarget(command, preferUserId, access) ?? await activeTarget(userId);
+  if (!target) return null;
+  return (await access.mayReach(target.project.id)) ? target : 'refused';
+}
+
+const NOT_YOURS = 'That project is not yours or shared with you.';
+const CHAT_OPERATORS_ONLY = 'Chat runs on the termag server itself, so for now it is only for the bot\'s operators. '
+  + '`/t` reaches your own projects: run it in a project\'s channel, or `/t switch <project>` here first. `/t help` lists the commands.';
+
+/**
+ * For a command word that took the caller's words as its argument and found
+ * nothing (`/t switch branches`): how to type them into the agent instead.
+ */
+function typeInstead(userCommand: string): string {
+  return `\n_To type \`${userCommand}\` into the agent instead: \`/t -- ${userCommand}\`_`;
+}
+
+/** The reply to a `/t` that threw. Slack's own refusals say why; anything else is in the server log. */
+function slashFailureText(error: unknown): string {
+  const code = (error as { data?: { error?: unknown } } | null)?.data?.error;
+  if (code === 'channel_not_found' || code === 'not_in_channel') {
+    return 'termag can\'t post in this conversation. Run `/t` in a project channel or in your DM with termag, or add termag here.';
+  }
+  return `\`/t\` failed${typeof code === 'string' ? ` (Slack said \`${code}\`)` : ''}. The details are in the termag server's log.`;
 }
 
 /**
@@ -243,18 +272,41 @@ async function activeTarget(userId: string): Promise<ChannelTarget | null> {
 async function processMessage(opts: {
   userId: string;
   channelId: string;
+  /** A DM with the bot (message.im); otherwise an @mention in a channel. */
+  inDM: boolean;
   text: string;
   botUserId?: string | null;
   say: (args: Record<string, unknown>) => Promise<{ ts: string }>;
-  client: { chat: { update: (a: Record<string, unknown>) => Promise<unknown>; postMessage: (a: Record<string, unknown>) => Promise<{ ts: string }> }; reactions: { add: (a: Record<string, unknown>) => Promise<unknown>; remove: (a: Record<string, unknown>) => Promise<unknown> } };
+  client: {
+    chat: {
+      update: (a: Record<string, unknown>) => Promise<unknown>;
+      postMessage: (a: Record<string, unknown>) => Promise<{ ts: string }>;
+      postEphemeral: (a: Record<string, unknown>) => Promise<unknown>;
+    };
+    reactions: { add: (a: Record<string, unknown>) => Promise<unknown>; remove: (a: Record<string, unknown>) => Promise<unknown> };
+  };
   threadTs: string;
   messageTs: string;
 }): Promise<void> {
-  const { userId, channelId, text, botUserId, say, client, threadTs, messageTs } = opts;
+  const { userId, channelId, inDM, text, botUserId, say, client, threadTs, messageTs } = opts;
+  // Seen only by the sender: any reply in a DM, an ephemeral one in a channel
+  // (in the mention's thread when it was in one).
+  const replyPrivately = (reply: string) => (inDM
+    ? say({ text: reply, thread_ts: threadTs })
+    : client.chat.postEphemeral({ channel: channelId, user: userId, text: reply, ...(threadTs !== messageTs ? { thread_ts: threadTs } : {}) }));
 
-  if (ALLOWED_USERS && !ALLOWED_USERS.has(userId)) return;
+  const refusal = await slackUserRefusal(userId, client as unknown as import('@slack/web-api').WebClient);
+  if (refusal) {
+    // Rate-limited like any message, so repeating it doesn't repeat the reply.
+    if (!isRateLimited(userId)) await replyPrivately(slackRefusalText(refusal));
+    return;
+  }
   if (isRateLimited(userId)) {
-    await say({ text: '⏳ Please wait a moment.', thread_ts: threadTs });
+    await replyPrivately('⏳ Please wait a moment.');
+    return;
+  }
+  if (!slackChatAllowed(userId)) {
+    await replyPrivately(CHAT_OPERATORS_ONLY);
     return;
   }
 
@@ -278,21 +330,6 @@ async function processMessage(opts: {
   }
   if (lower === 'help' || lower === '?') {
     await say({ text: formatWelcome(), thread_ts: threadTs });
-    return;
-  }
-  if (lower === 'follow this channel' || lower === 'follow channel') {
-    followedChannels.add(channelId);
-    await say({ text: '✅ *Now following this channel*\nI\'ll respond without @-mentions. Type `unfollow` to stop.', thread_ts: threadTs });
-    return;
-  }
-  if (lower === 'unfollow' || lower === 'stop following') {
-    if (threadTs && threadTs !== messageTs) {
-      followedThreads.delete(`${channelId}:${threadTs}`);
-      await say({ text: '✅ *Unfollowed this thread*', thread_ts: threadTs });
-    } else {
-      followedChannels.delete(channelId);
-      await say({ text: '✅ *Unfollowed this channel*', thread_ts: threadTs });
-    }
     return;
   }
 
@@ -341,17 +378,16 @@ export function registerEventHandlers(app: App): void {
     console.log(`[APP_MENTION] Received: user=${event.user} channel=${event.channel} text="${(event.text || '').slice(0, 80)}"`);
     try {
       await processMessage({
-        userId: event.user, channelId: event.channel, text: event.text,
+        userId: event.user, channelId: event.channel, inDM: false, text: event.text,
         botUserId: context.botUserId, say, client,
         threadTs: event.thread_ts || event.ts, messageTs: event.ts,
       });
-      followedThreads.add(`${event.channel}:${event.thread_ts || event.ts}`);
     } catch (error) {
       console.error('[APP_MENTION] Error:', error);
     }
   });
 
-  // DMs + followed threads/channels → executor
+  // DMs → executor
   app.event('message', async ({ event, say, client }: any) => {
     // A reply under a collaboration card is
     // stored and told to its sender, never answered by the DM executor.
@@ -362,23 +398,17 @@ export function registerEventHandlers(app: App): void {
       return;
     }
     // The message.channels subscription exists only for collaboration-card
-    // threads. Channel messages never reached the executor before it, and
-    // they must not now: an app_mention arms followedThreads, and a plain
-    // reply there would otherwise start an unattended Claude run. The
-    // executor answers DMs (and @mentions, via app_mention) only.
+    // threads. Channel messages must not reach the executor: a plain reply in
+    // a channel thread would start an unattended Claude run. The executor
+    // answers DMs (and @mentions, via app_mention) only, which is also why
+    // there is no "follow this channel".
     if (event.channel_type !== 'im') return;
-    const isDM = event.channel_type === 'im';
-    const isFollowedThread = event.thread_ts && event.thread_ts !== event.ts &&
-      followedThreads.has(`${event.channel}:${event.thread_ts}`);
-    const isFollowedChannel = !event.thread_ts && followedChannels.has(event.channel);
-
-    if (!isDM && !isFollowedThread && !isFollowedChannel) return;
     if (event.subtype || event.bot_id) return;
     if (/<@[A-Z0-9]+>/.test(event.text || '')) return;
 
     try {
       await processMessage({
-        userId: event.user, channelId: event.channel, text: event.text,
+        userId: event.user, channelId: event.channel, inDM: true, text: event.text,
         botUserId: null, say, client,
         threadTs: event.thread_ts || event.ts, messageTs: event.ts,
       });
@@ -387,22 +417,40 @@ export function registerEventHandlers(app: App): void {
     }
   });
 
-  // /t — terminal commands routed to termag projects
-  app.command('/t', async ({ command, ack, client }: any) => {
-    await ack();
-
+  // /t — terminal commands routed to termag projects. What each form means is
+  // slashCommand.ts; a command word counts only in the forms it takes.
+  const slashT = async ({ command, client, respond }: any) => {
     const userId = command.user_id;
-    if (ALLOWED_USERS && !ALLOWED_USERS.has(userId)) return;
+    // Seen only by the caller, and posted through the command's response_url,
+    // so it reaches them even where the bot can't post.
+    const reply = (text: string) => respond({ response_type: 'ephemeral', text });
+
+    const refusal = await slackUserRefusal(userId, client);
+    if (refusal) {
+      await reply(slackRefusalText(refusal));
+      return;
+    }
 
     const termagUser = await resolveTermagUser(userId, client);
-    const username = termagUser?.unixUsername ?? 'unknown';
     const userCommand = command.text.trim();
+    const access = slackProjectAccess(userId, termagUser?.id ?? null);
+    const cmd = parseSlashCommand(userCommand);
+
+    // ── /t help [command] ──────────────────────────────
+    if (cmd.kind === 'help') {
+      await reply(slashHelp(cmd.topic, { unscoped: access.unscoped }));
+      return;
+    }
 
     // ── /t local <subcommand> ──────────────────────────
-    if (userCommand.startsWith('local')) {
-      const localArgs = userCommand.slice(5).trim();
+    if (cmd.kind === 'local') {
+      if (!access.unscoped) {
+        await reply('Local sessions are only for the Slack IDs in `ALLOWED_SLACK_USERS`.');
+        return;
+      }
+      const local = cmd.local;
 
-      if (localArgs === 'ls' || localArgs === 'list' || localArgs === '') {
+      if (local.action === 'list') {
         const sessions = listLocalSessions();
         if (sessions.length === 0) {
           await client.chat.postMessage({ channel: command.channel_id, text: 'No local sessions. Use `/t local <name>` to register one.' });
@@ -413,10 +461,10 @@ export function registerEventHandlers(app: App): void {
         return;
       }
 
-      if (localArgs.startsWith('detach ')) {
-        const name = localArgs.slice(7).trim();
+      if (local.action === 'detach') {
+        const name = local.name;
         if (!isLocalSession(name)) {
-          await client.chat.postMessage({ channel: command.channel_id, text: `No local session \`${name}\`.` });
+          await reply(`No local session \`${name}\`.`);
           return;
         }
         removeLocalSession(name);
@@ -425,13 +473,13 @@ export function registerEventHandlers(app: App): void {
         return;
       }
 
-      const localName = localArgs;
-      if (!localName || !/^[a-zA-Z0-9._-]+$/.test(localName)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'Usage: `/t local <session-name>`' });
+      const localName = local.name;
+      if (!/^[a-zA-Z0-9._-]+$/.test(localName)) {
+        await reply('Usage: `/t local <session-name>`');
         return;
       }
       if (isLocalSession(localName)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `\`${localName}\` already registered.` });
+        await reply(`\`${localName}\` already registered.`);
         return;
       }
 
@@ -445,20 +493,20 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── /t create <project-name> ─────────────────────────
-    if (userCommand.startsWith('create ')) {
+    if (cmd.kind === 'create') {
       if (!termagUser) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'Your Slack account is not linked to a termag user.' });
+        await reply('Your Slack account is not linked to a termag user.');
         return;
       }
-      const projectName = userCommand.slice(7).trim();
+      const projectName = cmd.name;
       if (!/^[a-zA-Z0-9_-]+$/.test(projectName)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'Project name must be alphanumeric with dashes/underscores only.' });
+        await reply('Project name must be alphanumeric with dashes/underscores only.' + typeInstead(userCommand));
         return;
       }
       // Chat-created projects run on this host (there's no box picker here),
       // which is admin-only — same rule as POST /api/projects.
       if (!isAdminUser(termagUser)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'Projects must run on a box — create this one from the termag web UI.' });
+        await reply('Projects must run on a box — create this one from the termag web UI.' + typeInstead(userCommand));
         return;
       }
       try {
@@ -515,19 +563,23 @@ export function registerEventHandlers(app: App): void {
         await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` created with agent workflow. Switched to it.` });
       } catch (err: unknown) {
         if ((err as { code?: string }).code === 'P2002') {
-          await client.chat.postMessage({ channel: command.channel_id, text: `Project \`${projectName}\` already exists.` });
+          await reply(`Project \`${projectName}\` already exists.`);
         } else {
           console.error('[SLACK] /t create failed:', (err as Error).message);
-          await client.chat.postMessage({ channel: command.channel_id, text: `Failed to create project: ${(err as Error).message}` });
+          await reply(`Failed to create project: ${(err as Error).message}`);
         }
       }
       return;
     }
 
     // ── /t projects ────────────────────────────────────
-    if (userCommand === 'projects') {
+    if (cmd.kind === 'projects') {
+      // Owned and shared, the projects a flag user's /t may reach.
       const projects = await prisma.project.findMany({
-        where: { archived: false, ...(termagUser ? { userId: termagUser.id } : {}) },
+        where: {
+          archived: false,
+          ...(termagUser ? { OR: [{ userId: termagUser.id }, { shares: { some: { userId: termagUser.id } } }] } : {}),
+        },
         include: { workflows: true, user: true, workstreams: { where: { archived: false }, orderBy: { createdAt: 'asc' } } },
         orderBy: { name: 'asc' },
       });
@@ -542,8 +594,9 @@ export function registerEventHandlers(app: App): void {
         const active = isActiveProject && activeWs === 'main' ? ' ✅' : '';
         const hasAgent = p.workflows.some(w => w.type === 'agent') ? '🤖' : '  ';
         const extra = p.workstreams.filter(w => w.name !== 'main');
+        const owner = p.userId === termagUser?.id ? '' : ` · ${p.user.unixUsername}'s`;
         return [
-          `${hasAgent} \`${p.name}\`${active}`,
+          `${hasAgent} \`${p.name}\`${owner}${active}`,
           ...extra.map(w => `      ↳ \`${p.name}/${w.name}\`${isActiveProject && activeWs === w.name ? ' ✅' : ''}`),
         ];
       }).join('\n');
@@ -552,26 +605,29 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── /t switch <project>[/<workstream>] ─────────────
-    if (userCommand.startsWith('switch ')) {
-      const [projectName, wsName = 'main'] = userCommand.slice(7).trim().split('/');
+    if (cmd.kind === 'switch') {
+      const [projectName, wsName = 'main'] = cmd.target.split('/');
       const include = { user: true, workstreams: { where: { archived: false }, select: { name: true } } };
       const owned = termagUser
         ? await prisma.project.findMany({ where: { name: projectName, archived: false, userId: termagUser.id }, include })
         : [];
-      const named = owned.length > 0
+      const found = owned.length > 0
         ? owned
         : await prisma.project.findMany({ where: { name: projectName, archived: false }, include });
+      // Someone else's project is "No project", as on the web.
+      const named = [];
+      for (const p of found) if (await access.mayReach(p.id)) named.push(p);
       if (named.length === 0) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No project \`${projectName}\`. Use \`/t projects\` to list.` });
+        await reply(`No project \`${projectName}\`. Use \`/t projects\` to list.` + typeInstead(userCommand));
         return;
       }
       if (named.length > 1) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `More than one project named \`${projectName}\`. Open the one you want from the project list.` });
+        await reply(`More than one project named \`${projectName}\`. Open the one you want from the project list.`);
         return;
       }
       const project = named[0];
       if (wsName !== 'main' && !project.workstreams.some(w => w.name === wsName)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No workstream \`${wsName}\` in \`${project.name}\`. Use \`/t projects\` to list.` });
+        await reply(`No workstream \`${wsName}\` in \`${project.name}\`. Use \`/t projects\` to list.` + typeInstead(userCommand));
         return;
       }
       setActiveProjectId(userId, project.id, wsName);
@@ -589,30 +645,28 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── /t ls ──────────────────────────────────────────
-    if (userCommand === 'ls' || userCommand === 'sessions') {
-      // List the invoking user's agent sessions (legacy/local agent).
-      const sessions = termagUser
-        ? await listSessionsViaAgent({ userId: termagUser.id, instanceId: null })
-        : [];
-      if (sessions.length === 0) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No tmux sessions.' });
+    if (cmd.kind === 'sessions') {
+      const hosts = termagUser ? await sessionsByHost(termagUser.id) : [];
+      if (hosts.length === 0) {
+        await client.chat.postMessage({ channel: command.channel_id, text: 'No tmux sessions on your boxes.' });
       } else {
-        await client.chat.postMessage({ channel: command.channel_id, text: '```\n' + sessions.join('\n') + '\n```' });
+        const text = hosts.map(h => `*${h.label}*\n\`\`\`\n${h.sessions.join('\n')}\n\`\`\``).join('\n');
+        await client.chat.postMessage({ channel: command.channel_id, text });
       }
       return;
     }
 
     // ── /t attach <session-name> ───────────────────────
-    if (userCommand.startsWith('attach ')) {
-      const target = userCommand.slice(7).trim();
+    if (cmd.kind === 'attach') {
+      const target = cmd.session;
       const resolved = await resolveSessionProject(target);
       if (isAmbiguousSession(resolved)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `\`${target}\` matches more than one project.` });
+        await reply(`\`${target}\` matches more than one project.`);
         return;
       }
       const opScope = resolved ? operationScopeForResolvedSession(resolved) : undefined;
-      if (!resolved || !await hasSession(target, opScope)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No tmux session \`${target}\`.` });
+      if (!resolved || !(await access.mayReach(resolved.projectId)) || !await hasSession(target, opScope)) {
+        await reply(`No tmux session \`${target}\`.` + typeInstead(userCommand));
         return;
       }
       if (resolved.projectId) setActiveProjectId(userId, resolved.projectId, resolved.workstream ?? 'main');
@@ -632,14 +686,18 @@ export function registerEventHandlers(app: App): void {
     // ── /t handoff [mode] [agent] ──────────────────────
     // A handoff: the agent writes a handoff, then its context is
     // reset (or the pane restarted) and the next agent starts on it.
-    if (isHandoffCommand(userCommand)) {
+    if (cmd.kind === 'handoff') {
       if (!termagUser) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'Your Slack account is not linked to a termag user.' });
+        await reply('Your Slack account is not linked to a termag user.');
         return;
       }
-      const target = await resolveChannelTarget(command, termagUser.id) ?? await activeTarget(userId);
+      const target = await slashTarget(command, userId, termagUser.id, access);
+      if (target === 'refused') {
+        await reply(NOT_YOURS);
+        return;
+      }
       if (!target) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <project>[/<workstream>]` or run from a project channel.' });
+        await reply('No active project. Use `/t switch <project>[/<workstream>]` or run from a project channel.');
         return;
       }
       const text = await slackHandoff(termagUser, { projectId: target.project.id, projectName: target.project.name, workstream: target.workstream }, userCommand);
@@ -648,12 +706,16 @@ export function registerEventHandlers(app: App): void {
     }
 
     // ── /t ctrl <command> ──────────────────────────────
-    if (userCommand.startsWith('ctrl')) {
-      const ctrlCmd = userCommand.slice(4).trim();
+    if (cmd.kind === 'ctrl') {
+      const ctrlCmd = cmd.text;
       // Resolve target: channel-based first (with #proj-… name fallback), then active target
-      const target = await resolveChannelTarget(command, termagUser?.id) ?? await activeTarget(userId);
+      const target = await slashTarget(command, userId, termagUser?.id, access);
+      if (target === 'refused') {
+        await reply(NOT_YOURS);
+        return;
+      }
       if (!target) {
-        await client.chat.postMessage({ channel: command.channel_id, text: 'No active project. Use `/t switch <project>[/<workstream>]` or run from a project channel.' });
+        await reply('No active project. Use `/t switch <project>[/<workstream>]` or run from a project channel.');
         return;
       }
       const { project, workstream } = target;
@@ -661,7 +723,7 @@ export function registerEventHandlers(app: App): void {
       const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl', workstream);
       const ctrlHost = project.instanceId;
       if (!await hasSession(ctrlSession, ctrlHost)) {
-        await client.chat.postMessage({ channel: command.channel_id, text: `No ctrl session for \`${project.name}${workstream === 'main' ? '' : '/' + workstream}\`.` });
+        await reply(`No ctrl session for \`${project.name}${workstream === 'main' ? '' : '/' + workstream}\`.`);
         return;
       }
 
@@ -687,10 +749,17 @@ export function registerEventHandlers(app: App): void {
       return;
     }
 
+    // ── Default: type into the target ──────────────────
+    // `/t -- <text>` (literal) is typed exactly as written: a leading `!` is
+    // kept and the first word is never a local session's name. It still goes
+    // where any text goes, an active local session included: `--` changes how
+    // the text is read, not where it is typed.
+    const { text, literal } = cmd;
+
     // ── Check local sessions ───────────────────────────
-    const firstWord = userCommand.split(/\s+/)[0];
-    if (isLocalSession(firstWord)) {
-      const localCmd = userCommand.slice(firstWord.length).trim();
+    const firstWord = text.split(/\s+/)[0];
+    if (!literal && access.unscoped && isLocalSession(firstWord)) {
+      const localCmd = text.slice(firstWord.length).trim();
       if (!localCmd) {
         const msg = await client.chat.postMessage({
           channel: command.channel_id,
@@ -707,9 +776,9 @@ export function registerEventHandlers(app: App): void {
       return;
     }
 
-    const activeLocal = getActiveLocalSession(userId);
+    const activeLocal = access.unscoped ? getActiveLocalSession(userId) : null;
     if (activeLocal) {
-      if (!userCommand) {
+      if (!text) {
         const msg = await client.chat.postMessage({
           channel: command.channel_id,
           ...formatPaneForSlack('(refreshing...)', null, `local:${activeLocal}`, 'running'),
@@ -719,51 +788,52 @@ export function registerEventHandlers(app: App): void {
       }
       const msg = await client.chat.postMessage({
         channel: command.channel_id,
-        ...formatPaneForSlack('(executing...)', userCommand, `local:${activeLocal}`, 'running'),
+        ...formatPaneForSlack('(executing...)', text, `local:${activeLocal}`, 'running'),
       });
-      queueLocalCommand(activeLocal, userCommand, { messageTs: msg.ts, channel: command.channel_id });
+      queueLocalCommand(activeLocal, text, { messageTs: msg.ts, channel: command.channel_id });
       return;
     }
 
     // ── Default: send to the target's agent session ─────
     // Resolve target: channel-based first (with #proj-… name fallback), then active target, then auto-select
-    const channelTarget = await resolveChannelTarget(command, termagUser?.id);
+    const target = await slashTarget(command, userId, termagUser?.id, access);
+    if (target === 'refused') {
+      await reply(NOT_YOURS);
+      return;
+    }
     let agentSession: string;
     let hostInstance: string | null = null;
 
-    if (channelTarget) {
-      agentSession = sessionName(channelTarget.project.user.unixUsername, channelTarget.project.name, 'agent', channelTarget.workstream);
-      hostInstance = channelTarget.project.instanceId;
+    if (target) {
+      agentSession = sessionName(target.project.user.unixUsername, target.project.name, 'agent', target.workstream);
+      hostInstance = target.project.instanceId;
+    } else if (getActiveProjectId(userId)) {
+      // The active project is gone (archived or deleted): say so rather than
+      // typing into a session that no longer exists.
+      clearActiveTarget('slack', userId);
+      await reply('The project you switched to is gone. Use `/t projects` and `/t switch <project>[/<workstream>]` to pick another.');
+      return;
     } else {
-      const projectId = getActiveProjectId(userId);
-      if (projectId) {
-        const active = await activeTarget(userId);
-        if (active) {
-          agentSession = sessionName(active.project.user.unixUsername, active.project.name, 'agent', active.workstream);
-          hostInstance = active.project.instanceId;
-        } else {
-          agentSession = `term-${userId}`;
-        }
+      // The caller's own first, then one shared with them: what `/t projects` lists.
+      const firstWhere = (where: Prisma.ProjectWhereInput) => prisma.project.findFirst({
+        where: { archived: false, workflows: { some: { type: 'agent' } }, ...where }, include: { user: true }, orderBy: { name: 'asc' },
+      });
+      const first = termagUser
+        ? await firstWhere({ userId: termagUser.id }) ?? await firstWhere({ shares: { some: { userId: termagUser.id } } })
+        : await firstWhere({});
+      if (first) {
+        guessActiveProjectId(userId, first.id);
+        agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
+        hostInstance = first.instanceId;
       } else {
-        const first = await prisma.project.findFirst({
-          where: { archived: false, workflows: { some: { type: 'agent' } }, ...(termagUser ? { userId: termagUser.id } : {}) },
-          include: { user: true },
-          orderBy: { name: 'asc' },
-        });
-        if (first) {
-          setActiveProjectId(userId, first.id);
-          agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
-          hostInstance = first.instanceId;
-        } else {
-          await client.chat.postMessage({ channel: command.channel_id, text: 'No projects with agent workflows. Create one in the termag UI.' });
-          return;
-        }
+        await reply('No projects with agent workflows. Create one in the termag UI.');
+        return;
       }
     }
 
     setNotificationTarget(agentSession, { channel: command.channel_id, userId }, 'slack', hostInstance);
 
-    if (!userCommand) {
+    if (!text) {
       const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
       const paneMsg = await client.chat.postMessage({
         channel: command.channel_id,
@@ -775,21 +845,33 @@ export function registerEventHandlers(app: App): void {
     }
 
     // /t <command> — send to agent
-    const noEnter = userCommand.startsWith('!');
-    const keysToSend = noEnter ? userCommand.slice(1) : userCommand;
+    const noEnter = !literal && text.startsWith('!');
+    const keysToSend = noEnter ? text.slice(1) : text;
 
     const pane = await capturePaneForSlack(agentSession, 200, hostInstance);
     const msg = await client.chat.postMessage({
       channel: command.channel_id,
-      ...formatPaneForSlack(pane, userCommand, agentSession, 'running'),
+      ...formatPaneForSlack(pane, text, agentSession, 'running'),
     });
     trackPaneMessage(command.channel_id, msg.ts, agentSession, userId, hostInstance);
 
     await sendKeys(agentSession, keysToSend, !noEnter, hostInstance);
-    await pollUntilStable(client, command.channel_id, msg.ts, agentSession, userCommand, 30, hostInstance);
+    await pollUntilStable(client, command.channel_id, msg.ts, agentSession, text, 30, hostInstance);
 
     const finalPane = await capturePaneForSlack(agentSession, 200, hostInstance);
     await addReactionHints(client, command.channel_id, msg.ts, finalPane);
+  };
+
+  app.command('/t', async (args: any) => {
+    await args.ack();
+    try {
+      await slashT(args);
+    } catch (error) {
+      // Without this a failed post (a private channel or group DM the bot is
+      // not in) left the caller with nothing at all.
+      console.error('[SLACK] /t failed:', error);
+      try { await args.respond({ response_type: 'ephemeral', text: slashFailureText(error) }); } catch { /* response_url expired */ }
+    }
   });
 
   // App Home

@@ -17,7 +17,7 @@ import { parseBriefingContent, scrubProjectIds } from './content';
 import { buildLedger } from './ledger';
 import { ledgerCacheKey, peekLedger } from './ledgerCache';
 import { previousDone, visibleProjects } from './store';
-import type { BriefingResultBody, Ledger, LedgerTotals } from './types';
+import type { BriefingCharts, BriefingResultBody, Ledger, LedgerPattern, LedgerTotals } from './types';
 import { BRIEFING_AGENT_CAPABILITY } from './types';
 import { resolveWindow } from './window';
 
@@ -202,13 +202,45 @@ export async function recordResult(
   const usage = body.usage ?? {};
   const inputTokens = tokenCount(usage.input_tokens) + tokenCount(usage.cache_read_input_tokens) + tokenCount(usage.cache_creation_input_tokens);
   const outputTokens = tokenCount(usage.output_tokens);
+  // What the review read: this process's cached ledger, else what
+  // rememberLedger kept on the row when the review asked for it (another
+  // process took the post, or the run outlived the cache). Only a review
+  // that never read its ledger falls back to a database-only one, which has
+  // no PR counts and no PR patterns.
+  const window = {
+    since: row.since.toISOString(), until: row.until.toISOString(), tz: row.tz, label: row.windowLabel,
+    basis: 'explicit' as const, previousBriefingAt: null,
+  };
+  let read: { totals: LedgerTotals; patterns: LedgerPattern[] | null; charts: BriefingCharts | null } | null = null;
+  const cached = peekLedger(ledgerCacheKey(user.id, window, id));
+  try {
+    if (cached) {
+      const l = await cached;
+      read = { totals: l.totals, patterns: l.patterns, charts: l.charts };
+    } else if (row.stats) {
+      read = { totals: row.stats as unknown as LedgerTotals, patterns: (row.patterns as unknown as LedgerPattern[] | null) ?? null, charts: (row.charts as unknown as BriefingCharts | null) ?? null };
+    }
+  } catch (err) {
+    console.error(`[BRIEFING] ${id}: the cached ledger failed:`, (err as Error).message);
+  }
+  let light: Ledger | null = null;
+  if (!read?.charts) {
+    try {
+      light = await buildLedger(user, window, undefined, { light: true });
+    } catch (err) {
+      console.error(`[BRIEFING] ${id}: stats failed:`, (err as Error).message);
+    }
+  }
+
   let status: 'done' | 'failed' = 'failed';
   let error: string | null = null;
   let content: Prisma.InputJsonValue | undefined;
   if (body.exitStatus !== 0 || body.isError) {
     error = `The review on the box failed (exit ${body.exitStatus}): ${body.result.replace(/\s+/g, ' ').slice(0, 300)}`;
   } else {
-    const parsed = parseBriefingContent(body.result);
+    // Work better must name a pattern the review was given. Without what it
+    // read (it never asked for its ledger), any well-formed id is kept.
+    const parsed = parseBriefingContent(body.result, read?.patterns ?? null);
     if (parsed.ok) {
       const visible = new Set((await visibleProjects(user.id, null)).map(p => p.id));
       content = scrubProjectIds(parsed.content, visible) as unknown as Prisma.InputJsonValue;
@@ -217,29 +249,15 @@ export async function recordResult(
       error = parsed.error;
     }
   }
-
-  // Totals for the stats strip, from the review's own ledger (PR counts
-  // included): this process's cached copy, else what rememberLedger saved on
-  // the row when the review read it (another process, or a long run), else a
-  // database-only ledger (no box reads).
-  let stats: Prisma.InputJsonValue | undefined;
-  try {
-    const window = {
-      since: row.since.toISOString(), until: row.until.toISOString(), tz: row.tz, label: row.windowLabel,
-      basis: 'explicit' as const, previousBriefingAt: null,
-    };
-    const cached = peekLedger(ledgerCacheKey(user.id, window, id));
-    const totals = cached ? (await cached).totals
-      : (row.stats as LedgerTotals | null) ?? (await buildLedger(user, window, undefined, { light: true })).totals;
-    stats = totals as unknown as Prisma.InputJsonValue;
-  } catch (err) {
-    console.error(`[BRIEFING] ${id}: stats failed:`, (err as Error).message);
-  }
+  const totals = read?.totals ?? light?.totals;
+  const chartData = read?.charts ?? light?.charts;
+  const stats = totals ? totals as unknown as Prisma.InputJsonValue : undefined;
+  const charts = chartData ? chartData as unknown as Prisma.InputJsonValue : undefined;
 
   const updated = await prisma.briefing.updateMany({
     where: { id, status: 'running' },
     data: {
-      status, error, content, stats, inputTokens, outputTokens,
+      status, error, content, stats, charts, inputTokens, outputTokens,
       model: body.model ?? null,
       finishedAt: new Date(),
     },
@@ -251,15 +269,20 @@ export async function recordResult(
 }
 
 /**
- * Keep what the result needs from a review's ledger on its row, so the result
- * has it whichever process takes the post and however long the run took. Only
- * while the run is running; a failure only costs the PR counts.
+ * Keep what the result needs from a review's ledger on its row (totals, the
+ * patterns Work better must name, the charts), so the result has it whichever
+ * process takes the post and however long the run took. Only while the run is
+ * running; a failure costs the PR counts and the pattern check.
  */
 export async function rememberLedger(userId: string, briefingId: string, ledger: Ledger): Promise<void> {
   await prisma.briefing.updateMany({
     where: { id: briefingId, userId, status: 'running' },
-    data: { stats: ledger.totals as unknown as Prisma.InputJsonValue },
-  }).catch(err => console.warn(`[BRIEFING] ${briefingId}: could not keep the ledger totals:`, (err as Error).message));
+    data: {
+      stats: ledger.totals as unknown as Prisma.InputJsonValue,
+      patterns: ledger.patterns as unknown as Prisma.InputJsonValue,
+      charts: ledger.charts as unknown as Prisma.InputJsonValue,
+    },
+  }).catch(err => console.warn(`[BRIEFING] ${briefingId}: could not keep the ledger:`, (err as Error).message));
 }
 
 /** Mark runs that never reported as failed, and drop their tmux session if it is still there. */

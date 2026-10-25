@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { GithubApiError } from './githubCredential';
-import { FRAGMENTS, GithubRetryableError, GithubTimeoutError, MAX_PER_SEARCH, PAGE, _resetContainmentCache, commitContains, mergedHeads, parseSearch, searchPrs, searchQueries } from './prPipelineGithub';
+import { BY_NUMBER_BATCH, FRAGMENTS, GithubRetryableError, GithubTimeoutError, MAX_PER_SEARCH, PAGE, _resetContainmentCache, commitContains, fetchPrLite, fetchPrsByNumber, mergedHeads, parseSearch, searchPrs, searchQueries, viewerLogin } from './prPipelineGithub';
 
 const TOKEN = 'gho_' + 'x'.repeat(36);
 const A = 'a'.repeat(40);
@@ -190,6 +190,17 @@ describe('truncation and review-request time', () => {
       node([ev('2026-10-03T00:00:00Z', { __typename: 'User', login: 'alice' })]),
     ] } });
     expect(got.reviewRequested.map(p => p.requestedAt)).toEqual(['2026-10-01T00:00:00Z', '2026-10-02T00:00:00Z', null]);
+  });
+  it('says whether a pending request names the viewer, not only a team, comparing logins only', () => {
+    const req = (...rs: object[]) => ({ ...openNode, reviewRequests: { nodes: rs.map(r => ({ requestedReviewer: r })) } });
+    const me = { __typename: 'User', login: 'me' }; const team = { __typename: 'Team', slug: 'platform-team' };
+    const got = parseSearch({ viewer: { login: 'Me' }, review: { nodes: [
+      req(me), req(team, me), req(team), req({ __typename: 'Team', slug: 'me' }),
+    ] }, authored: { nodes: [openNode] } });
+    expect(got.reviewRequested.map(p => p.requestedYou)).toEqual([true, true, false, false]);
+    expect(got.authored[0]).not.toHaveProperty('requestedYou');
+    // No viewer login in the answer: unknown, not "not you".
+    expect(parseSearch({ review: { nodes: [req(team)] } }).reviewRequested[0]).not.toHaveProperty('requestedYou');
   });
 });
 
@@ -406,3 +417,75 @@ describe('review round 2 (Bugbot): timeouts that come with data', () => {
     expect((await searchPrs(TOKEN, new Date(), gh.fetchImpl)).authored).toHaveLength(1);
   });
 });
+
+describe('fetchPrsByNumber (review groups)', () => {
+  it('reads each PR by number with the viewer\'s latest review, fills the open ones\' checks, and says which GitHub lacks', async () => {
+    const { fetchImpl, calls } = fakeFetch((_url, init) => {
+      const { query, variables } = JSON.parse(String(init!.body));
+      if (query.includes('query Checks')) {
+        return { body: { data: { nodes: variables.ids.map((id: string) => ({ id, commits: openNode.commits })) } } };
+      }
+      return { body: {
+        data: {
+          m0: { pullRequest: { ...openNode, id: 'PR_9', state: 'OPEN', mergedAt: null, closedAt: null, yours: { nodes: [{ state: 'COMMENTED', submittedAt: '2026-10-24T10:00:00Z' }] },
+            commits: { nodes: [{ commit: { statusCheckRollup: { state: 'FAILURE' } } }] } } },
+          m1: { pullRequest: { ...mergedNode, id: 'PR_8', state: 'MERGED', closedAt: '2026-10-08T00:00:00Z', yours: { nodes: [] } } },
+          m2: { pullRequest: null },
+          m3: null,
+        },
+        errors: [{ message: 'Could not resolve to a PullRequest with the number of 404.' }, { message: 'Could not resolve to a Repository with the name \'o/gone\'.' }],
+      } };
+    });
+    const got = await fetchPrsByNumber(TOKEN, 'me', [
+      { repo: 'example-org/termag', number: 9 }, { repo: 'example-org/termag', number: 8 },
+      { repo: 'example-org/termag', number: 404 }, { repo: 'o/gone', number: 1 },
+    ], fetchImpl);
+    const first = JSON.parse(String(calls[0].init!.body));
+    expect(first.variables).toMatchObject({ viewer: 'me', o0: 'example-org', n0: 'termag', p0: 9, o3: 'o', n3: 'gone', p3: 1 });
+    expect(first.query).toContain('yours: reviews(author: $viewer, last: 1, states: [APPROVED, CHANGES_REQUESTED, COMMENTED])');
+    expect(got.map(p => [p.number, p.found, p.state])).toEqual([[9, true, 'OPEN'], [8, true, 'MERGED'], [404, false, null], [1, false, null]]);
+    expect(got[0].yourReview).toEqual({ state: 'COMMENTED', submittedAt: '2026-10-24T10:00:00Z' });
+    // The viewer is not among the requested reviewers (alice, platform-team): not asked of them.
+    expect(got[0].open?.requestedYou).toBe(false);
+    expect(got[0].open!.checks.map(c => c.name)).toEqual(['Bugbot', 'ci', 'lint', 'security']);
+    expect(got[1]).toMatchObject({ open: null, mergedAt: '2026-10-08T00:00:00Z', yourReview: null });
+  });
+  it('splits a long list into batches of BY_NUMBER_BATCH, answered in order', async () => {
+    const { fetchImpl, calls } = fakeFetch((_url, init) => {
+      const { variables } = JSON.parse(String(init!.body));
+      const data: Record<string, unknown> = {};
+      for (let i = 0; `p${i}` in variables; i++) data[`m${i}`] = { pullRequest: { ...mergedNode, number: variables[`p${i}`], state: 'MERGED', yours: { nodes: [] } } };
+      return { body: { data } };
+    });
+    const refs = Array.from({ length: BY_NUMBER_BATCH + 3 }, (_, i) => ({ repo: 'example-org/termag', number: i + 1 }));
+    const got = await fetchPrsByNumber(TOKEN, 'me', refs, fetchImpl);
+    expect(calls).toHaveLength(2);
+    expect(got.map(p => p.number)).toEqual(refs.map(r => r.number));
+  });
+  it('fails the read when GitHub refuses a batch', async () => {
+    const { fetchImpl } = fakeFetch(() => ({ status: 502, body: {} }));
+    await expect(fetchPrsByNumber(TOKEN, 'me', [{ repo: 'o/r', number: 1 }], fetchImpl)).rejects.toBeInstanceOf(GithubApiError);
+  });
+  it('reads the token\'s login', async () => {
+    const { fetchImpl } = fakeFetch(() => ({ body: { data: { viewer: { login: 'me' } } } }));
+    expect(await viewerLogin(TOKEN, fetchImpl)).toBe('me');
+  });
+});
+
+describe('fetchPrLite (suggested groups)', () => {
+  it('reads state, title and, only when asked, the description; one GitHub lacks is not found', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ body: { data: {
+      m0: { pullRequest: { number: 646, title: 'Bridge', url: 'u646', state: 'OPEN', author: { login: 'dev' }, repository: { nameWithOwner: 'example-org/termag' }, body: 'Needs #647.' } },
+      m1: { pullRequest: { number: 12, title: 'Old', url: 'u12', state: 'MERGED', author: { login: 'dev' }, repository: { nameWithOwner: 'example-org/termag' }, body: '' } },
+      m2: { pullRequest: null },
+    } } }));
+    const refs = [{ repo: 'example-org/termag', number: 646 }, { repo: 'example-org/termag', number: 12 }, { repo: 'example-org/termag', number: 999 }];
+    const got = await fetchPrLite(TOKEN, refs, true, fetchImpl);
+    expect(JSON.parse(String(calls[0].init!.body)).query).toContain(' body } }');
+    expect(got.map(p => [p.number, p.found, p.open, p.body])).toEqual([[646, true, true, 'Needs #647.'], [12, true, false, ''], [999, false, false, null]]);
+    const { fetchImpl: f2, calls: c2 } = fakeFetch(() => ({ body: { data: { m0: { pullRequest: null } } } }));
+    await fetchPrLite(TOKEN, [refs[0]], false, f2);
+    expect(JSON.parse(String(c2[0].init!.body)).query).not.toContain('body');
+  });
+});
+

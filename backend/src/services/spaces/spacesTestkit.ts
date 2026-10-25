@@ -3,7 +3,7 @@
  * imported by the app.
  */
 import type { SpaceRole } from './spaceAccess';
-import type { ListResult, OpenUpload, PresignedPut, PresignedUrl, SpaceObjects } from './spaceObjects';
+import type { ListResult, ObjectVersion, OpenUpload, PresignedPut, PresignedUrl, SpaceObjects } from './spaceObjects';
 import {
   LastOwnerError,
   SpaceNameTakenError,
@@ -28,8 +28,8 @@ export class MemorySpaceStore implements SpaceStore {
     return u;
   }
 
-  addBox(id: string, userId: string | null, name = id, status = 'ready'): SpaceBoxInfo {
-    const b = { id, userId, status, name, kind: 'ec2', ownerEmail: userId ? this.users.get(userId)?.email ?? null : null };
+  addBox(id: string, userId: string | null, name = id, status = 'ready', parentInstanceId: string | null = null): SpaceBoxInfo {
+    const b = { id, userId, status, parentInstanceId, name, kind: 'ec2', ownerEmail: userId ? this.users.get(userId)?.email ?? null : null };
     this.boxes.set(id, b);
     return b;
   }
@@ -184,7 +184,7 @@ export class MemorySpaceStore implements SpaceStore {
     return before !== this.grantRows.length;
   }
 
-  charges: Array<LiveCharge & { spaceId: string; liveUntil: Date }> = [];
+  charges: Array<LiveCharge & { spaceId: string }> = [];
 
   async chargeBytes(spaceId: string, bytes: bigint, liveUntil: Date, ref: ChargeRef | null, createdAt = new Date()) {
     const s = this.spaces.get(spaceId)!;
@@ -209,9 +209,9 @@ export class MemorySpaceStore implements SpaceStore {
 
   async deletedSpaces() { return [...this.spaces.values()].filter(s => s.deletedAt); }
   async liveSpaces() { return [...this.spaces.values()].filter(s => !s.deletedAt); }
-  async liveCharges(spaceId: string, now: Date) {
-    return this.charges.filter(c => c.spaceId === spaceId && c.liveUntil > now)
-      .map(({ id, bytes, createdAt, key, uploadId, partNumbers }) => ({ id, bytes, createdAt, key, uploadId, partNumbers }));
+  async chargesLiveAfter(spaceId: string, after: Date) {
+    return this.charges.filter(c => c.spaceId === spaceId && c.liveUntil > after)
+      .map(({ spaceId: _, ...c }) => ({ ...c, partNumbers: [...c.partNumbers] }));
   }
 
   async recountUsedBytes(spaceId: string, stored: bigint, now: Date, settled: string[]) {
@@ -242,14 +242,16 @@ export class MemorySpaceStore implements SpaceStore {
 /** Objects keyed by full S3 key; versions keep every size ever written. */
 export class MemorySpaceObjects implements SpaceObjects {
   files = new Map<string, { size: number; contentType: string; lastModified: Date }>();
-  versions = new Map<string, number[]>();
+  versions = new Map<string, Array<{ size: number; lastModified: Date }>>();
   uploads = new Map<string, { key: string; contentType: string; initiated: Date; parts: Map<number, number> }>();
+  bodies = new Map<string, Buffer>();
   presigned: Array<{ op: string; key: string; extra?: unknown }> = [];
+  reads: string[] = [];
   private uploadSeq = 0;
 
   put(key: string, size: number, contentType = 'application/octet-stream', lastModified = new Date()) {
     this.files.set(key, { size, contentType, lastModified });
-    this.versions.set(key, [...(this.versions.get(key) ?? []), size]);
+    this.versions.set(key, [...(this.versions.get(key) ?? []), { size, lastModified }]);
   }
 
   async list(prefix: string, o: { cursor?: string | null; delimiter?: boolean; max?: number } = {}): Promise<ListResult> {
@@ -274,8 +276,16 @@ export class MemorySpaceObjects implements SpaceObjects {
     return { url: `https://s3.test/${op}/${key}`, expiresAt: new Date(Date.now() + 300_000).toISOString() };
   }
 
-  async presignGet(key: string, response: { contentDisposition: string; contentType?: string }) {
-    this.presigned.push({ op: 'get', key, extra: response });
+  async read(key: string, maxBytes: number) {
+    const f = this.files.get(key);
+    if (!f) return null;
+    this.reads.push(key);
+    const body = this.bodies.get(key) ?? Buffer.alloc(f.size);
+    return body.subarray(0, maxBytes + 1);
+  }
+
+  async presignGet(key: string, response: { contentDisposition: string; contentType?: string }, ttlS?: number) {
+    this.presigned.push({ op: 'get', key, extra: ttlS === undefined ? response : { ...response, ttlS } });
     return this.url('get', key);
   }
 
@@ -315,10 +325,17 @@ export class MemorySpaceObjects implements SpaceObjects {
     return [];
   }
 
-  async sumVersions(prefix: string) {
+  async sumVersions(prefix: string, watch: Set<string>) {
     let total = 0n;
-    for (const [k, sizes] of this.versions) if (k.startsWith(prefix)) for (const s of sizes) total += BigInt(s);
-    return total;
+    const watched: ObjectVersion[] = [];
+    for (const [key, vs] of this.versions) {
+      if (!key.startsWith(prefix)) continue;
+      for (const v of vs) {
+        total += BigInt(v.size);
+        if (watch.has(key)) watched.push({ key, size: BigInt(v.size), lastModified: v.lastModified });
+      }
+    }
+    return { total, watched };
   }
 
   async purgePrefix(prefix: string) {

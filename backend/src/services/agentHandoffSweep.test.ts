@@ -164,7 +164,7 @@ describe('runHandoffTick', () => {
       return 'launched';
     });
     await runHandoffTick(now);
-    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf1' }, data: { provider: 'cursor' } });
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf1' }, data: { provider: 'cursor', backend: null, model: null } });
     expect(vi.mocked(stopAgentPane).mock.calls[0][0]).toMatchObject({ provider: 'claude', workstream: 'main', instanceId: 'box1' });
     expect(markAgentPaneStopped).toHaveBeenCalledWith('me-proj-agent', 'box1', { handoff: expect.objectContaining({ state: 'resetting', toProvider: 'cursor' }) });
     expect(vi.mocked(ensureAgentSessionsAndLaunch).mock.calls[0][0]).toMatchObject({ provider: 'cursor', projectName: 'proj' });

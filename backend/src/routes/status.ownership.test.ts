@@ -74,6 +74,23 @@ describe('status writes from a box', () => {
     expect(setStatus).toHaveBeenCalledWith('termag-claude-runner-s3-ord_d1-r', 'working', expect.anything(), undefined, 'box-a');
   });
 
+  it("accepts the box's own t3 server session, a desktop thread outside every project", async () => {
+    const res = await post('termag-t3');
+    expect(res.statusCode).toBe(200);
+    expect(prisma.instance.findUnique).not.toHaveBeenCalled();
+    expect(setStatus).toHaveBeenCalledWith('termag-t3', 'working', expect.anything(), undefined, 'box-a');
+  });
+
+  it('refuses the t3 server session to a caller with no box (a browser session)', async () => {
+    const { requireAuthOrAgentToken } = await import('../middleware/auth');
+    vi.mocked(requireAuthOrAgentToken).mockImplementationOnce(async (req: Request, _res: Response, next: () => void) => {
+      req.user = { id: 'u1', unixUsername: 'ffeldberg' } as never;
+      next();
+    });
+    expect((await post('termag-t3')).statusCode).toBe(403);
+    expect(setStatus).not.toHaveBeenCalled();
+  });
+
   it("refuses a project pane under the box user's prefix, another user's runner session, and fails closed on a lookup error", async () => {
     expect((await post('termag-webapp-agent')).statusCode).toBe(403);
     expect((await post('ada-claude-runner-s2-x-r')).statusCode).toBe(403);

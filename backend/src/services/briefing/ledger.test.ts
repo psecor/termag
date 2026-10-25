@@ -36,6 +36,8 @@ function deps(over: Partial<LedgerDeps> = {}): LedgerDeps {
     boxNames: async ids => new Map(ids.map(id => [id, `name-${id}`])),
     worktime: async () => [],
     tokens: async () => [],
+    tokensByDay: async () => [],
+    dismissals: async () => [],
     visits: async () => [],
     contextPeaks: async () => [],
     cloud: async () => [],
@@ -153,13 +155,43 @@ describe('buildLedger', () => {
         pr({ workstream: { projectId: 'p1', projectName: 'termag', workstream: 'main' } }),
         pr({ number: 2, lane: 'needs_my_review', failingChecks: [] }),
         pr({ number: 3, lane: 'deployed', failingChecks: [] }),
+        pr({ number: 4, lane: 'team_review', failingChecks: [] }),
       ] as never,
     }));
     // The session had no other activity: an attention PR alone makes it touched.
     expect(l.sessions).toHaveLength(1);
     expect(l.sessions[0].prs.map(p => p.number)).toEqual([1]);
-    expect(l.otherPrs.map(p => p.number)).toEqual([2]);
+    // A team review is listed, not counted as attention.
+    expect(l.otherPrs.map(p => p.number)).toEqual([2, 4]);
     expect(l.totals.prsNeedingAttention).toBe(2);
+  });
+
+  it('leaves out a PR-only item marked Done or deferred, for the whole mark, but still counts it', async () => {
+    const pr = (n: number) => ({
+      kind: 'pr', lane: 'needs_my_review', repo: 'o/r', number: n, title: 't', url: 'u', author: 'me', headRefName: 'h', baseRefName: 'main',
+      at: null, badges: [], failingChecks: [], pendingChecks: [], waitingOn: [], blockedBy: null, mergedAt: null,
+      mergeCommit: null, deploy: null, workstream: null, requestedAt: null, reviewTarget: null,
+    });
+    const l = await buildLedger(user, window, deps({
+      prs: async () => [pr(2), pr(3), pr(4)] as never,
+      // Done long before this run: a PR has no activity rule, so it stays out.
+      dismissals: async () => [
+        { key: 'open:pr:o/r#2', kind: 'done', until: '2026-10-18T00:00:00.000Z', createdAt: '2026-10-01T00:00:00.000Z' },
+        { key: 'open:pr:o/r#3', kind: 'defer', until: '2026-10-13T00:00:00.000Z', createdAt: '2026-10-12T00:00:00.000Z' },
+      ],
+    }));
+    expect(l.otherPrs.map(p => p.number)).toEqual([4]);
+    expect(l.totals.prsNeedingAttention).toBe(3);
+    expect(l.notes.join(' ')).toMatch(/2 PR\(s\) you marked Done or deferred are left out/);
+  });
+
+  it('carries orphaned spawns, and a note instead of failing when they cannot be read', async () => {
+    const orphan = { spawnId: 's1', projectId: 'p1', workstream: 'leaf', title: 'Add tests', state: 'done', orphanedAt: '2026-10-19T10:00:00.000Z', unreadReport: true };
+    expect((await buildLedger(user, window, deps({ spawnOrphans: async () => [orphan] }))).spawnOrphans).toEqual([orphan]);
+    const l = await buildLedger(user, window, deps({ spawnOrphans: async () => { throw new Error('db'); } }));
+    expect(l.spawnOrphans).toEqual([]);
+    expect(l.notes).toContain('Orphaned spawned agents could not be read.');
+    expect((await buildLedger(user, window, deps())).spawnOrphans).toBeUndefined();
   });
 
   it('light mode reads no boxes and no GitHub', async () => {
@@ -184,6 +216,69 @@ describe('buildLedger', () => {
     }));
     expect(digest).toHaveBeenCalledTimes(MAX_DIGESTS);
     expect(l.notes.join(' ')).toMatch(/without a digest/);
+  });
+});
+
+describe('buildLedger: patterns, charts and Done/Defer', () => {
+  const doneAt = '2026-10-11T00:00:00.000Z';
+  const mark = (key: string, kind: 'done' | 'defer') => ({ key, kind, until: '2026-10-20T00:00:00.000Z', createdAt: doneAt });
+
+  it('flags dismissed sessions until they do something new, and drops dismissed patterns', async () => {
+    const d = deps({
+      liveRows: async () => [row({}), row({ workstream: 'feat' }), row({ workstream: 'later' })],
+      ownedProjects: async () => [project({ workstreams: ['main', 'feat', 'later'].map(name => ({ name, lastActiveAt: new Date('2026-10-10T00:00:00Z') })) })],
+      digest: async (_h, cwd) => ({
+        branch: 'main', commits: [],
+        // main went quiet before the click; feat did something after it.
+        transcript: { userTurns: 1, firstAt: null, lastAt: cwd.endsWith('feat') ? '2026-10-11T05:00:00.000Z' : '2026-10-10T05:00:00.000Z', lastUserPrompts: [], lastAssistantText: null, endsWithQuestion: true, todos: [] },
+      }),
+      contextPeaks: async () => [{ projectId: 'p1', workstream: 'main', maxTokens: 400_000 }, { projectId: 'p1', workstream: 'feat', maxTokens: 500_000 }],
+      dismissals: async () => [mark('open:p1:main', 'done'), mark('open:p1:feat', 'done'), mark('open:p1:later', 'defer'), mark('pattern:big-context:p1:feat', 'defer')],
+    });
+    const l = await buildLedger(user, window, d);
+    const by = new Map(l.sessions.map(s => [s.workstream, s.dismissed]));
+    expect(Object.fromEntries(by)).toEqual({ main: true, feat: false, later: true });
+    expect(l.patterns.map(p => p.id)).toEqual(['big-context:p1:main']);
+  });
+
+  it('compares activity as instants, not text: a later commit with an offset counts', async () => {
+    const d = deps({
+      liveRows: async () => [row({ status: 'waiting' })],
+      ownedProjects: async () => [project({})],
+      // 03:30-07:00 is 10:30Z, after both the click (10:00Z) and the transcript (09:00Z),
+      // though "2026-10-11T03:30" sorts before "2026-10-11T09:00" as text.
+      digest: async () => ({
+        branch: 'main', commits: [{ sha: 'a', at: '2026-10-11T03:30:00-07:00', subject: 's' }],
+        transcript: { userTurns: 1, firstAt: null, lastAt: '2026-10-11T09:00:00.000Z', lastUserPrompts: [], lastAssistantText: null, endsWithQuestion: false, todos: [] },
+      }),
+      dismissals: async () => [{ key: 'open:p1:main', kind: 'done', until: '2026-10-20T00:00:00.000Z', createdAt: '2026-10-11T10:00:00.000Z' }],
+    });
+    const l = await buildLedger(user, window, d);
+    expect(l.sessions[0].dismissed).toBe(false);
+  });
+
+  it('shows everything when the marks cannot be read', async () => {
+    const d = deps({
+      liveRows: async () => [row({ status: 'waiting' })],
+      ownedProjects: async () => [project({})],
+      dismissals: async () => { throw new Error('db down'); },
+    });
+    const l = await buildLedger(user, window, d);
+    expect(l.sessions[0].dismissed).toBe(false);
+  });
+
+  it('charts the seven days ending with the window, and the window per project', async () => {
+    const d = deps({
+      ownedProjects: async () => [project({})],
+      worktime: async (_u, days) => days.includes('2026-10-06')
+        ? [{ project: 'termag', provider: 'human', date: '2026-10-12', totalMs: 60_000, sessions: 1, instanceId: 'box1' }]
+        : [{ project: 'termag', provider: 'claude', date: '2026-10-10', totalMs: 120_000, sessions: 1, instanceId: 'box1' }],
+      tokensByDay: async () => [{ date: '2026-10-12', tokens: 9 }],
+    });
+    const l = await buildLedger(user, window, d);
+    expect(l.charts.days.map(x => x.day)).toEqual(['2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11', '2026-10-12']);
+    expect(l.charts.days[6]).toMatchObject({ humanMs: 60_000, tokens: 9 });
+    expect(l.charts.projects).toEqual([{ projectId: 'p1', name: 'termag', humanMs: 0, agentMs: 120_000 }]);
   });
 });
 

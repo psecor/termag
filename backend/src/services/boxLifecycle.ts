@@ -14,6 +14,11 @@
  * unless that scan came back clean. Nothing but a hibernated box is ever
  * terminated. Gated per owner and box by the feature flag
  * box-auto-lifecycle-enabled, default off.
+ *
+ * A box with no `idleHibernateHours` is left alone unless box-idle-stop-enabled
+ * is on for its owner and box. Then it is parked after the default window
+ * (IDLE_STOP_DEFAULT_HOURS): hibernated when it can be, plainly stopped when
+ * it can't. The same activity clock, guards and unsaved-work scan apply.
  */
 import { Prisma } from '@prisma/client';
 import type { Instance, User } from '@prisma/client';
@@ -23,19 +28,27 @@ import { PowerRequestConflict, requestPower } from './boxPower';
 import { instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
 import {
   autoHibernateNote,
+  autoStopNote,
   autoTerminateNote,
   BOX_AUTO_LIFECYCLE_FLAG,
+  BOX_IDLE_STOP_FLAG,
+  canAutoHibernate,
+  IDLE_STOP_DEFAULT_HOURS,
   type IdleDecision,
   idleHibernateDecision,
+  isIdleSkip,
   type LifecycleSettings,
+  type LifecycleView,
+  lifecycleView,
   type TerminateDecision,
   terminateDecision,
   unsavedWorkTerminateDays,
 } from './boxLifecyclePolicy';
+import type { FlagUser } from './featureFlags';
 import { boolVariation } from './featureFlags';
 import { getAllStatuses } from './status';
 
-export { BOX_AUTO_LIFECYCLE_FLAG };
+export { BOX_AUTO_LIFECYCLE_FLAG, BOX_IDLE_STOP_FLAG };
 
 export const LIFECYCLE_SWEEP_MS = 5 * 60 * 1000;
 
@@ -103,6 +116,7 @@ const defaultTerminator: BoxTerminator = async (user, box) => {
 let lastSweepAt: Date | null = null;
 let sweeping = false;
 let autoHibernations = 0;
+let autoStops = 0;
 let autoTerminations = 0;
 
 /**
@@ -125,8 +139,13 @@ export async function runLifecycleSweep(now: number = Date.now(), terminator: Bo
 async function hibernatePass(now: number): Promise<SweepResult[]> {
   const boxes = await prisma.instance.findMany({
     where: {
-      status: 'ready', kind: 'ec2', hibernationConfigured: true,
-      idleHibernateHours: { not: null }, userId: { not: null }, ec2InstanceId: { not: null },
+      status: 'ready', kind: 'ec2', userId: { not: null }, ec2InstanceId: { not: null },
+      // A box with no setting is a candidate only for box-idle-stop-enabled,
+      // which considerBox reads before anything else happens to it.
+      OR: [
+        { hibernationConfigured: true, idleHibernateHours: { not: null } },
+        { idleHibernateHours: null },
+      ],
     },
     include: { user: true },
   });
@@ -135,7 +154,8 @@ async function hibernatePass(now: number): Promise<SweepResult[]> {
   const results: SweepResult[] = [];
   for (const box of boxes) {
     try {
-      results.push(await considerBox(box, box.user!, { nowMs: now, busy: busy.has(box.id), working: working.has(box.id) }));
+      const result = await considerBox(box, box.user!, { nowMs: now, busy: busy.has(box.id), working: working.has(box.id) });
+      if (result) results.push(result);
     } catch (err) {
       console.error(`[LIFECYCLE] ${box.name}: sweep failed:`, errMsg(err));
     }
@@ -143,14 +163,19 @@ async function hibernatePass(now: number): Promise<SweepResult[]> {
   return results;
 }
 
+/** Null for a box with no setting whose owner and box are not in box-idle-stop-enabled: nothing to report. */
 async function considerBox(
   box: Instance,
   user: User,
   facts: { nowMs: number; busy: boolean; working: boolean },
-): Promise<SweepResult> {
-  const flagOn = await boolVariation(BOX_AUTO_LIFECYCLE_FLAG, user, false, { id: box.id, name: box.name, kind: box.kind });
-  const decision = idleHibernateDecision(box, { ...facts, flagOn });
-  if (!decision.hibernate) return { box: box.name, decision };
+): Promise<SweepResult | null> {
+  const boxContext = { id: box.id, name: box.name, kind: box.kind };
+  const defaultWindow = box.idleHibernateHours == null;
+  const idleStopOn = defaultWindow && await boolVariation(BOX_IDLE_STOP_FLAG, user, false, boxContext);
+  if (defaultWindow && !idleStopOn) return null;
+  const flagOn = defaultWindow ? false : await boolVariation(BOX_AUTO_LIFECYCLE_FLAG, user, false, boxContext);
+  const decision = idleHibernateDecision(box, { ...facts, flagOn, idleStopOn });
+  if (isIdleSkip(decision)) return { box: box.name, decision };
 
   const scannedAt = await recordUnsavedWork(box);
   // The scan can take minutes; decide again on the box as it is now, so
@@ -158,27 +183,32 @@ async function considerBox(
   const fresh = await prisma.instance.findUnique({ where: { id: box.id } });
   if (!fresh) return { box: box.name, decision, outcome: 'conflict' };
   const recheck = idleHibernateDecision(fresh, {
-    nowMs: facts.nowMs, flagOn,
+    nowMs: facts.nowMs, flagOn, idleStopOn,
     busy: (await busyBoxes([box.id])).has(box.id), working: workingBoxes().has(box.id),
   });
-  if (!recheck.hibernate) {
+  if (isIdleSkip(recheck)) {
     await discardUnsavedWork(box, scannedAt);
     return { box: box.name, decision: recheck };
   }
+  const stop = 'stop' in recheck;
+  const hours = fresh.idleHibernateHours ?? IDLE_STOP_DEFAULT_HOURS;
   try {
-    const status = await requestPower(fresh, 'hibernate', { onHibernateRefused: 'throw' });
+    const status = stop
+      ? await requestPower(fresh, 'stop')
+      : await requestPower(fresh, 'hibernate', { onHibernateRefused: 'throw' });
     await prisma.instance.updateMany({
       where: { id: box.id, status },
-      data: { lifecycleNote: autoHibernateNote(box.idleHibernateHours!) },
+      data: { lifecycleNote: stop ? autoStopNote(hours) : autoHibernateNote(hours) },
     });
-    autoHibernations++;
-    console.log(`[LIFECYCLE] ${box.name} (${user.unixUsername}): idle ${box.idleHibernateHours} h; hibernating`);
-    return { box: box.name, decision, outcome: status };
+    if (stop) autoStops++;
+    else autoHibernations++;
+    console.log(`[LIFECYCLE] ${box.name} (${user.unixUsername}): idle ${hours} h; ${stop ? 'stopping' : 'hibernating'}`);
+    return { box: box.name, decision: recheck, outcome: status };
   } catch (err) {
     await discardUnsavedWork(box, scannedAt);
-    if (err instanceof PowerRequestConflict) return { box: box.name, decision, outcome: 'conflict' };
-    console.warn(`[LIFECYCLE] ${box.name}: hibernate refused; trying again next sweep:`, errMsg(err));
-    return { box: box.name, decision, outcome: 'refused' };
+    if (err instanceof PowerRequestConflict) return { box: box.name, decision: recheck, outcome: 'conflict' };
+    console.warn(`[LIFECYCLE] ${box.name}: ${stop ? 'stop' : 'hibernate'} refused; trying again next sweep:`, errMsg(err));
+    return { box: box.name, decision: recheck, outcome: 'refused' };
   }
 }
 
@@ -293,13 +323,27 @@ async function considerTerminate(
 
 /**
  * Write a box's lifecycle settings, with no owner check: the caller has done
- * that (the settings route), or owns the box itself (phase-2 sandbox boxes,
+ * that (the settings route), or owns the box itself (phase-2 ask boxes,
  * set at creation, with subagentLifecycleDefaults()). Turning auto-hibernate
  * on from off starts the idle clock now, so a box that sat unused for days
  * isn't hibernated on the next sweep; it leaves a parked box's parked state
  * and clock alone, which only an owner's start clears (a bumped clock would
  * also make its unsaved-work scan look stale).
  */
+/**
+ * The lifecycle block on the box list and the settings answer. Reads
+ * `box-idle-stop-enabled` only when the warning would otherwise claim a box
+ * is never stopped: no idle hours, a terminate limit, and it cannot hibernate.
+ */
+export async function lifecycleViewFor(
+  user: FlagUser,
+  box: Parameters<typeof lifecycleView>[0] & { id: string; name: string; kind: string },
+): Promise<LifecycleView> {
+  const idleStopOn = box.idleHibernateHours == null && box.hibernatedTerminateDays != null && !canAutoHibernate(box)
+    && await boolVariation(BOX_IDLE_STOP_FLAG, user, false, { id: box.id, name: box.name, kind: box.kind });
+  return lifecycleView(box, unsavedWorkTerminateDays(), { idleStopOn });
+}
+
 export async function setBoxLifecycle(instanceId: string, settings: Partial<LifecycleSettings>): Promise<void> {
   if (Object.keys(settings).length === 0) return;
   const before = await prisma.instance.findUnique({ where: { id: instanceId }, select: { idleHibernateHours: true, parkedAt: true } });
@@ -320,8 +364,8 @@ export async function recentAutoTerminations(userId: string, now: number = Date.
   });
 }
 
-export function lifecycleSweepStatus(): { lastSweepAt: Date | null; autoHibernations: number; autoTerminations: number } {
-  return { lastSweepAt, autoHibernations, autoTerminations };
+export function lifecycleSweepStatus(): { lastSweepAt: Date | null; autoHibernations: number; autoStops: number; autoTerminations: number } {
+  return { lastSweepAt, autoHibernations, autoStops, autoTerminations };
 }
 
 let sweepTimer: NodeJS.Timeout | null = null;

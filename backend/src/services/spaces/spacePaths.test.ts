@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_KEY_BYTES, SpacePathError, downloadResponseHeaders, movedPath, normalizeFilePath, normalizePrefix, objectKey,
-  pathOfKey, uploadContentType, validateSpaceName,
+  pathOfKey, uploadContentType, viewResponseHeaders, validateSpaceName,
 } from './spacePaths';
 
 const SPACE = 'cmabcdefghijklmnopqrstuvw';
@@ -130,19 +130,66 @@ describe('downloadResponseHeaders', () => {
     });
   });
 
-  it('never serves HTML or SVG inline', () => {
-    expect(downloadResponseHeaders('x.html', true).contentDisposition).toMatch(/^attachment;/);
-    expect(downloadResponseHeaders('x.svg', true).contentDisposition).toMatch(/^attachment;/);
-    expect(downloadResponseHeaders('x.svg', true).contentType).toBeUndefined();
+  it('serves video and audio inline with their real type', () => {
+    expect(downloadResponseHeaders('demo.webm', true)).toEqual({
+      contentDisposition: 'inline; filename="demo.webm"; filename*=UTF-8\'\'demo.webm',
+      contentType: 'video/webm',
+    });
+    expect(downloadResponseHeaders('a/clip.MOV', true).contentType).toBe('video/quicktime');
+    expect(downloadResponseHeaders('song.flac', true).contentType).toBe('audio/flac');
   });
+
+  it('serves text-like files inline as plain text', () => {
+    for (const path of ['README.md', 'x.markdown', 'x.JSON', 'x.csv', 'x.tsv', 'x.log', 'x.diff', 'x.patch', 'x.yaml', 'x.yml', 'x.toml']) {
+      expect(downloadResponseHeaders(path, true)).toMatchObject({
+        contentDisposition: expect.stringMatching(/^inline;/),
+        contentType: 'text/plain; charset=utf-8',
+      });
+    }
+  });
+
+  it.each(['x.html', 'x.htm', 'x.HTM', 'x.svg', 'x.xml', 'x.xhtml', 'x.js', 'x.mjs', 'x.json.html', 'x.svgz'])(
+    'never serves %s inline', path => {
+      const h = downloadResponseHeaders(path, true);
+      expect(h.contentDisposition).toMatch(/^attachment;/);
+      expect(h.contentType).toBeUndefined();
+    });
 
   it('is an attachment unless inline was asked for', () => {
     expect(downloadResponseHeaders('cat.png', false).contentDisposition).toMatch(/^attachment;/);
+    expect(downloadResponseHeaders('demo.webm', false)).toEqual({
+      contentDisposition: 'attachment; filename="demo.webm"; filename*=UTF-8\'\'demo.webm',
+    });
   });
 
   it('encodes non-ASCII and quote characters in the filename', () => {
     const h = downloadResponseHeaders('dir/r\u00e9sum\u00e9 "v2".pdf', false).contentDisposition;
     expect(h).toBe('attachment; filename="r_sum_ _v2_.pdf"; filename*=UTF-8\'\'r%C3%A9sum%C3%A9%20%22v2%22.pdf');
+  });
+});
+
+describe('viewResponseHeaders', () => {
+  it('frames images, PDFs, media and text inline with a type chosen from the extension', () => {
+    expect(viewResponseHeaders('a/cat.PNG')).toEqual({
+      contentDisposition: 'inline; filename="cat.PNG"; filename*=UTF-8\'\'cat.PNG', contentType: 'image/png', render: 'frame',
+    });
+    expect(viewResponseHeaders('r.pdf')).toMatchObject({ contentType: 'application/pdf', render: 'frame' });
+    expect(viewResponseHeaders('clip.mp4')).toMatchObject({ contentType: 'video/mp4', render: 'frame' });
+    expect(viewResponseHeaders('song.mp3')).toMatchObject({ contentType: 'audio/mpeg', render: 'frame' });
+    expect(viewResponseHeaders('src/main.go')).toMatchObject({ contentType: 'text/plain; charset=utf-8', render: 'frame' });
+  });
+
+  it('signs Markdown, HTML and SVG as plain text for the client to render', () => {
+    for (const [path, render] of [['README.md', 'markdown'], ['page.HTML', 'html'], ['x.htm', 'html'], ['logo.svg', 'svg']]) {
+      expect(viewResponseHeaders(path)).toMatchObject({ contentType: 'text/plain; charset=utf-8', contentDisposition: expect.stringMatching(/^inline/), render });
+    }
+  });
+
+  it('has no viewer for types the browser cannot show', () => {
+    expect(viewResponseHeaders('deck.pptx')).toBeNull();
+    expect(viewResponseHeaders('bundle.zip')).toBeNull();
+    expect(viewResponseHeaders('Makefile')).toBeNull();
+    expect(viewResponseHeaders('x.xhtml')).toBeNull();
   });
 });
 

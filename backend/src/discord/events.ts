@@ -12,11 +12,12 @@ import { sessionName, projectDir, listSessions as tmuxListSessions } from '../se
 import { hasSession, sendKeys, capturePaneForSlack } from '../slack/tmuxAgent';
 import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
 import { setNotificationTarget } from '../slack/lts';
-import { getActiveProjectId, setActiveProjectId } from '../slack/events';
+import { getActiveProjectId, guessActiveProjectId, setActiveProjectId } from '../slack/events';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { isAdminUser } from '../services/admin/adminAccess';
+import { projectSessionAccess, SessionAccessError } from '../services/sessionAccess';
 
 
 // Emoji → keystroke mapping (matches Slack)
@@ -136,6 +137,25 @@ export function registerDiscordEvents(client: Client): void {
     const username = termagUser.unixUsername;
     const userCommand = (interaction.options.getString('command') ?? '').trim();
 
+    // /t types into a project's panes, the owner's authority on the owner's
+    // box: only for projects the linked termag user owns or was shared, the
+    // web's check and Slack's (slack/access.ts). A session name, or a target
+    // saved across restarts (slack/activeTargets.ts), is not a grant.
+    const mayReach = async (projectId: string | null | undefined): Promise<boolean> => {
+      if (!projectId) return false;
+      try {
+        await projectSessionAccess(termagUser.id, projectId);
+        return true;
+      } catch (err) {
+        if (err instanceof SessionAccessError) return false;
+        throw err;
+      }
+    };
+    // Why a saved target was refused: an archived project of their own says so.
+    const unreachable = (project: { userId: string; archived: boolean }) => (project.userId === termagUser.id && project.archived
+      ? 'That project is archived. Use `/t switch <name>` to pick another.'
+      : 'That project is not yours or shared with you.');
+
     // /t create <project-name>
     if (userCommand.startsWith('create ')) {
       const projectName = userCommand.slice(7).trim();
@@ -196,7 +216,7 @@ export function registerDiscordEvents(client: Client): void {
           }
         });
 
-        setActiveProjectId(discordUserId, project.id);
+        setActiveProjectId(discordUserId, project.id, 'main', 'discord');
         setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord', null);
         await interaction.reply(`Project \`${projectName}\` created with agent workflow. Switched to it.`);
       } catch (err: unknown) {
@@ -247,7 +267,7 @@ export function registerDiscordEvents(client: Client): void {
         return;
       }
       const project = named[0];
-      setActiveProjectId(discordUserId, project.id);
+      setActiveProjectId(discordUserId, project.id, 'main', 'discord');
       const agentSession = sessionName(username, project.name, 'agent');
       setNotificationTarget(agentSession, { channel: interaction.channelId, userId: discordUserId }, 'discord', project.instanceId);
       const pane = await capturePaneForSlack(agentSession, 200, project.instanceId);
@@ -277,11 +297,12 @@ export function registerDiscordEvents(client: Client): void {
         return;
       }
       const opScope = resolved ? operationScopeForResolvedSession(resolved) : undefined;
-      if (!resolved || !await hasSession(target, opScope)) {
+      // Someone else's session is "No tmux session", as in Slack.
+      if (!resolved || !(await mayReach(resolved.projectId)) || !await hasSession(target, opScope)) {
         await interaction.reply(`No tmux session \`${target}\`.`);
         return;
       }
-      if (resolved.projectId) setActiveProjectId(discordUserId, resolved.projectId);
+      if (resolved.projectId) setActiveProjectId(discordUserId, resolved.projectId, 'main', 'discord');
 
       setNotificationTarget(target, { channel: interaction.channelId, userId: discordUserId }, 'discord', resolved.instanceId);
       const pane = await capturePaneForSlack(target, 200, opScope);
@@ -301,6 +322,7 @@ export function registerDiscordEvents(client: Client): void {
       }
       const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
       if (!project) { await interaction.reply('Project not found.'); return; }
+      if (!(await mayReach(project.id))) { await interaction.reply({ content: unreachable(project), ephemeral: true }); return; }
 
       const ctrlSession = sessionName(project.user.unixUsername, project.name, 'ctrl');
       const ctrlHost = project.instanceId;
@@ -335,6 +357,10 @@ export function registerDiscordEvents(client: Client): void {
 
     if (projectId) {
       const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+      if (project && !(await mayReach(project.id))) {
+        await interaction.reply({ content: unreachable(project), ephemeral: true });
+        return;
+      }
       if (project) {
         agentSession = sessionName(project.user.unixUsername, project.name, 'agent');
         hostInstance = project.instanceId;
@@ -348,7 +374,7 @@ export function registerDiscordEvents(client: Client): void {
         orderBy: { name: 'asc' },
       });
       if (first) {
-        setActiveProjectId(discordUserId, first.id);
+        guessActiveProjectId(discordUserId, first.id);
         agentSession = sessionName(first.user.unixUsername, first.name, 'agent');
         hostInstance = first.instanceId;
       } else {

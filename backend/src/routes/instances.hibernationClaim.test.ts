@@ -40,7 +40,7 @@ vi.mock('../db', () => ({
 }));
 vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn() }));
 vi.mock('../services/boxProvisioner', () => ({ provisionBox, terminateBox: vi.fn(), isBoxProvisioningConfigured: () => true }));
-vi.mock('../services/warmPool', () => ({ currentPoolSpecHash: vi.fn(async () => 'spec1'), reconcileWarmPool: vi.fn(async () => {}) }));
+vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => 'spec1'), reconcileWarmPool: vi.fn(async () => {}) }));
 vi.mock('../services/agentRegistry', () => ({ sendToInstanceAgent: vi.fn() }));
 vi.mock('../services/warmPoolClaim', () => ({
   claimWarmBox, isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
@@ -60,7 +60,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   claimWarmBox.mockResolvedValue({ claimed: true, instance: claimed });
   vi.spyOn(console, 'log').mockImplementation(() => {});
-  process.env.WARM_POOL_TARGET_SIZE = '2';
 });
 
 describe('claiming a warm box under box-hibernation-enabled', () => {

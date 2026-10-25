@@ -129,4 +129,57 @@ describe('review routes: which repository', () => {
     expect((await r.json()).url).toBe('https://github.com/example-org/termag/pull/342');
     expect(written[0]).toContain('Pass --repo example-org/termag to every gh command');
   });
+
+  // Review all with Devin: one session, one prompt over the members.
+  const GROUP = {
+    name: 'Desktop bridge',
+    members: [
+      { repo: 'example-org/termag', number: 646, note: 'the contract' },
+      { repo: 'example-org/terraform', number: 28576, note: 'merge after 646 is deployed' },
+      { repo: 'example-org/termag', number: 647 },
+    ],
+  };
+  it('starts one review of a group: the prompt lists every member, in order, with its repository', async () => {
+    box('https://github.com/example-org/termag.git');
+    const written: string[] = [];
+    agent.answers['write-file'] = p => { written.push(p.content as string); return { ok: true }; };
+    const r = await post({ workstream: 'main', pr: 646, url: 'https://github.com/example-org/termag/pull/646', group: GROUP });
+    expect(r.status).toBe(201);
+    expect(await r.json()).toMatchObject({ pr: 646, url: 'https://github.com/example-org/termag/pull/646' });
+    const prompt = written[0];
+    expect(prompt.startsWith('Review GitHub pull request #646 (https://github.com/example-org/termag/pull/646) first, then the rest of the review group "Desktop bridge"')).toBe(true);
+    expect(prompt).toContain('1. example-org/termag#646 (https://github.com/example-org/termag/pull/646) (note: the contract)');
+    expect(prompt).toContain('2. example-org/terraform#28576 (https://github.com/example-org/terraform/pull/28576) (note: merge after 646 is deployed)');
+    expect(prompt).toContain('3. example-org/termag#647 (https://github.com/example-org/termag/pull/647)\n');
+    expect(prompt).toContain('one short verdict per pull request');
+    expect(prompt).toContain('Do not modify files, commit, push or post anything to GitHub.');
+    expect(prompt).toContain('Reviewed by Devin');
+    // The repo template is not read: the group's instructions replace it.
+    expect(agent.calls).not.toContain('read-file');
+  });
+  it('names the first member\'s PR, whatever url says, even in a checkout with no remote (Devin)', async () => {
+    box(null);
+    const r = await post({ workstream: 'main', pr: 646, url: 'https://github.com/someone/else/pull/646', group: GROUP });
+    expect(r.status).toBe(201);
+    expect((await r.json()).url).toBe('https://github.com/example-org/termag/pull/646');
+    const opt = agent.calls.indexOf('tmux-set-user-option');
+    expect(opt).toBeGreaterThan(-1);
+  });
+  it('refuses a group listing a PR twice (Devin)', async () => {
+    box('https://github.com/example-org/termag.git');
+    const twice = { name: 'G', members: [{ repo: 'example-org/termag', number: 646 }, { repo: 'Example-Org/Termag', number: 646 }] };
+    const r = await post({ workstream: 'main', pr: 646, group: twice });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toBe('example-org/termag#646 is in the group twice');
+  });
+  it('refuses a group that does not start on pr, comes with an edited prompt, or is malformed', async () => {
+    box('https://github.com/example-org/termag.git');
+    expect((await post({ workstream: 'main', pr: 647, group: GROUP })).status).toBe(400);
+    expect((await post({ workstream: 'main', pr: 646, group: GROUP, prompt: 'x' })).status).toBe(400);
+    const bad = await post({ workstream: 'main', pr: 1, group: { name: 'G', members: [{ repo: 'nope', number: 1 }] } });
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toBe('Each pull request needs repo (owner/name) and number');
+    expect((await post({ workstream: 'main', pr: 1, group: { name: 'G', members: [] } })).status).toBe(400);
+    expect(agent.calls).not.toContain('tmux-create');
+  });
 });

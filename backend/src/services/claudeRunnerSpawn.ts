@@ -16,12 +16,22 @@
  */
 import { createHash, timingSafeEqual } from 'crypto';
 import type { OtlpDestination } from '../config/env';
+import type { OwnedBoxRow } from './ownedBoxRow';
 
 export interface SpawnRequest {
   orderId: string;
   sessionId: string;
   accountEmail: string;
   workOrder: string;
+  /**
+   * The creator's Anthropic account id (`user_...`, CLAUDE_RUNNER_ACCOUNT_ID),
+   * when the hook sent it: stable across email changes, equal to the session
+   * token's `ccr:account_id`. What an auto-created user's placeholder provider
+   * id is built from. Null from an older hook.
+   */
+  accountId: string | null;
+  /** How many spawn requests this session has had (CLAUDE_RUNNER_ATTEMPT); null from an older hook. */
+  attempt: number | null;
 }
 
 // Order IDs are documented as safe for Kubernetes resource names, which admit
@@ -33,6 +43,10 @@ export const isOrderId = (s: string): boolean => ORDER_ID.test(s);
 const EMAIL = /^[^\s@]+@[^\s@]+$/;
 // A JWT: three base64url segments. Checked for shape only, never decoded.
 const JWT = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+// A tagged Anthropic account id, as the orchestrator hands the hook.
+const ACCOUNT_ID = /^user_[A-Za-z0-9_-]{4,64}$/;
+/** Whether `s` is a tagged Anthropic account id (`user_...`). */
+export const isAccountId = (s: unknown): s is string => typeof s === 'string' && ACCOUNT_ID.test(s);
 
 export function parseSpawnBody(body: unknown): SpawnRequest | { error: string } {
   if (!body || typeof body !== 'object') return { error: 'body must be a JSON object' };
@@ -45,7 +59,12 @@ export function parseSpawnBody(body: unknown): SpawnRequest | { error: string } 
   if (!EMAIL.test(accountEmail)) return { error: 'accountEmail missing (agent-owned sessions cannot be routed to a box)' };
   const workOrder = typeof b.workOrder === 'string' ? b.workOrder.trim() : '';
   if (!JWT.test(workOrder)) return { error: 'workOrder missing or not a JWT' };
-  return { orderId, sessionId, accountEmail, workOrder };
+  // Optional, from a hook that sends them; a malformed value reads as absent
+  // rather than failing an order the four fields above fully describe.
+  const accountId = isAccountId(b.accountId) ? b.accountId : null;
+  const attempt = typeof b.attempt === 'number' && Number.isInteger(b.attempt) && b.attempt >= 0 && b.attempt < 10_000 ? b.attempt
+    : typeof b.attempt === 'string' && /^\d{1,4}$/.test(b.attempt) ? Number(b.attempt) : null;
+  return { orderId, sessionId, accountEmail, workOrder, accountId, attempt };
 }
 
 /**
@@ -54,6 +73,34 @@ export function parseSpawnBody(body: unknown): SpawnRequest | { error: string } 
  * the field and leave a bare shell holding a slot.
  */
 export const RUNNER_AGENT_CAPABILITY = 'tmux-create-command-v1';
+
+/**
+ * Anthropic-managed git for cloud sessions. Behind this feature flag, per owner, the runner on the box
+ * clones, fetches and pushes the session's repository through Anthropic with
+ * the GitHub token the owner stored in claude.ai (`--use-anthropic-git-proxy`),
+ * so the termag GitHub credential is no longer required for the session to
+ * start: the GitHub gate becomes advisory, and the launch tells the wrapper
+ * whether it is connected so the session can say what still needs it.
+ */
+export const CLAUDE_RUNNER_ANTHROPIC_GIT_FLAG = 'claude-runner-anthropic-git-enabled';
+
+/**
+ * Auto-user: behind this flag the
+ * spawn route creates the termag user for a session owner the allowlist
+ * admits but who never signed in, instead of answering the non-retryable 404.
+ * Read only when claude-runner-auto-box-enabled is on for the same identity: a user
+ * with no way to get a box would be queued forever with no signal.
+ */
+export const CLAUDE_RUNNER_AUTO_USER_FLAG = 'claude-runner-auto-user-enabled';
+
+/**
+ * What a box's agent announces when its installed `termag-claude-runner`
+ * understands `--anthropic-git` and `--github` (agent/claude-runner-wrapper.js
+ * reads the wrapper's marker line). A wrapper from before ignores unknown
+ * flags, so without this a flagged owner's box would run the fetch without
+ * the proxy and fail it: such a box behaves as if the flag were off.
+ */
+export const WRAPPER_FLAGS_CAPABILITY = 'claude-runner-wrapper-v2';
 
 export interface CandidateBox {
   id: string;
@@ -65,6 +112,8 @@ export interface CandidateBox {
   connected: boolean;
   /** The agent announced RUNNER_AGENT_CAPABILITY. */
   capable: boolean;
+  /** The agent announced WRAPPER_FLAGS_CAPABILITY: the box can run Anthropic-managed git. */
+  wrapperCapable?: boolean;
 }
 
 /**
@@ -195,18 +244,26 @@ export type Placement<T> =
  * sessions. An order already running on any of them stays there (a retry must
  * not start a second runner elsewhere); otherwise the first box with a free
  * slot takes it, so a full favourite box does not queue a session another box
- * could run now.
+ * could run now. `eligible` narrows where a NEW runner may go (a box whose
+ * wrapper cannot run Anthropic-managed git, for an owner without a termag
+ * GitHub credential), never where an existing one is looked for.
  */
-export function placeRunner<T>(listed: { box: T; sessions: RunnerSession[] }[], orderId: string, max: number = MAX_RUNNERS_PER_BOX): Placement<T> {
+export function placeRunner<T>(
+  listed: { box: T; sessions: RunnerSession[] }[],
+  orderId: string,
+  max: number = MAX_RUNNERS_PER_BOX,
+  eligible: (box: T) => boolean = () => true,
+): Placement<T> {
   for (const l of listed) {
     const d = allocateSlot(l.sessions, orderId, max);
     if (d.kind === 'existing') return { kind: 'existing', box: l.box, slot: d.slot };
   }
-  for (const l of listed) {
+  const targets = listed.filter(l => eligible(l.box));
+  for (const l of targets) {
     const d = allocateSlot(l.sessions, orderId, max);
     if (d.kind === 'new') return { kind: 'new', box: l.box, slot: d.slot };
   }
-  return { kind: 'full', boxes: listed.length, max };
+  return { kind: 'full', boxes: targets.length, max };
 }
 
 export interface RunnerLaunch {
@@ -221,7 +278,9 @@ export interface RunnerLaunch {
    * telemetry, `--otel-project <routing key> --otel-endpoint <url>`: where the
    * session's own OpenTelemetry goes, and `--user-key <user id> --box-key
    * <instance id>`, so the session's telemetry can be joined to the owner and
-   * the box. A script from before the flags reads `$1 $2` and ignores them.
+   * the box; then, for a flagged owner on
+   * a capable box, `--anthropic-git` and `--github <state>` (RunnerGitOptions).
+   * A script from before the flags reads `$1 $2` and ignores them.
    */
   command: string[];
   /**
@@ -239,18 +298,34 @@ export interface RunnerContextKeys {
   box: string;
 }
 
-export function runnerLaunch(hostHome: string, hostUnixUser: string, orderId: string, slot: number, telemetry: OtlpDestination | null = null, contextKeys: RunnerContextKeys | null = null): RunnerLaunch {
+/** The owner's termag GitHub credential, as the launch tells the wrapper (`--github`): `unknown` sends nothing. */
+export type GithubLaunchState = 'connected' | 'absent' | 'unknown';
+
+/**
+ * Git for the session: `anthropicGit`
+ * adds `--anthropic-git` (the runner uses Anthropic-managed git), `github`
+ * adds `--github <state>` so the wrapper can seed the session note when the
+ * owner has no termag credential. Sent only to a box whose agent announces
+ * WRAPPER_FLAGS_CAPABILITY; a wrapper from before would ignore them.
+ */
+export interface RunnerGitOptions {
+  anthropicGit: boolean;
+  github: GithubLaunchState;
+}
+
+export function runnerLaunch(hostHome: string, hostUnixUser: string, orderId: string, slot: number, telemetry: OtlpDestination | null = null, contextKeys: RunnerContextKeys | null = null, git: RunnerGitOptions | null = null): RunnerLaunch {
   const home = hostHome.replace(/\/+$/, '');
   const stateDir = `${home}/.termag/claude-runner`;
   const routing = telemetry ? [
     '--otel-project', telemetry.project, '--otel-endpoint', telemetry.endpoint,
     ...(contextKeys ? ['--user-key', contextKeys.user, '--box-key', contextKeys.box] : []),
   ] : [];
+  const gitFlags = git ? [...(git.anthropicGit ? ['--anthropic-git'] : []), ...(git.github !== 'unknown' ? ['--github', git.github] : [])] : [];
   return {
     workOrderPath: `${stateDir}/${orderId}.work-order`,
     workOrderMode: 0o600,
     sessionName: runnerSessionName(hostUnixUser, slot, orderId),
-    command: [`${home}/.local/bin/termag-claude-runner`, orderId, String(slot), ...routing],
+    command: [`${home}/.local/bin/termag-claude-runner`, orderId, String(slot), ...routing, ...gitFlags],
     cwd: stateDir,
     gitInit: false,
     slot,
@@ -275,6 +350,170 @@ export function serializeByKey<T>(key: string, fn: () => Promise<T>): Promise<T>
   chains.set(key, next);
   next.finally(() => { if (chains.get(key) === next) chains.delete(key); }).catch(() => undefined);
   return next;
+}
+
+/**
+ * Boxless engineers.
+ * Behind this feature flag the spawn route gets the owner a box instead
+ * of only queueing: start a stopped one, else claim a warm-pool one, else
+ * cold-provision one. Every path still answers 503 so the session retries
+ * once the box's agent connects. The route runs this under the owner's spawn
+ * lock (serializeByKey), so a burst of sessions sees the first one's box and
+ * waits instead of getting a box each.
+ */
+export const CLAUDE_RUNNER_AUTO_BOX_FLAG = 'claude-runner-auto-box-enabled';
+
+/**
+ * How long a failed box holds off another automatic one. Sessions are retried
+ * every few minutes, and a launch that failed once (quota, image, subnet)
+ * usually fails again: without the hold every retry would buy another failed
+ * box.
+ */
+export const AUTO_BOX_FAILURE_HOLD_MS = 60 * 60 * 1000;
+
+/**
+ * How long after its creation a box can still turn `failed`: the provisioner's
+ * stuck sweep fails a row that has had no agent for this long (STUCK_AFTER_MS
+ * in services/boxProvisioner.ts; a test keeps the two equal). A failed row
+ * records when it was created, not when it failed, so the hold counts from
+ * the latest moment the failure can have happened.
+ */
+export const PROVISIONING_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+
+/** The owner's box as autoBoxPlan sees it; the same rows a write's re-check reads (services/ownedBoxRow.ts). */
+export type OwnedBox = OwnedBoxRow;
+
+export type AutoBoxPlan =
+  /** A box is on its way (provisioning, starting, stopping or hibernating, or ready but its agent is not back yet): just wait. */
+  | { kind: 'wait'; box: OwnedBox; reason: string }
+  /** A stopped or hibernated EC2 box of theirs: start it (a start resumes a hibernated box). */
+  | { kind: 'start'; box: OwnedBox }
+  /** A box failed within AUTO_BOX_FAILURE_HOLD_MS: do not buy another yet. */
+  | { kind: 'hold'; box: OwnedBox; reason: string }
+  /** No usable box at all: get one (warm claim, else cold provision). */
+  | { kind: 'acquire' };
+
+/**
+ * What to do for an owner with no ready, connected box. `boxes` is every
+ * non-terminated EC2 box of theirs. Waiting beats starting beats acquiring,
+ * so one engineer never ends up with two boxes from one burst of sessions; a
+ * recent failure stops acquiring altogether.
+ */
+export function autoBoxPlan(boxes: OwnedBox[], now: number = Date.now()): AutoBoxPlan {
+  const ec2 = boxes.filter(b => b.kind === 'ec2' && b.status !== 'terminated');
+  const byRecency = (a: OwnedBox, b: OwnedBox) => (b.lastConnectedAt?.getTime() ?? 0) - (a.lastConnectedAt?.getTime() ?? 0);
+  const pending = ec2.filter(b => ['provisioning', 'starting', 'ready', 'stopping', 'hibernating'].includes(b.status)).sort(byRecency)[0];
+  if (pending) {
+    const reason = pending.status === 'ready'
+      ? `box "${pending.name}" is ready but its agent is not connected; retried when it reconnects`
+      : pending.status === 'stopping'
+        ? `box "${pending.name}" is stopping; retried once it can be started`
+        : pending.status === 'hibernating'
+          ? `box "${pending.name}" is hibernating; retried once it can be resumed`
+          : `box "${pending.name}" is ${pending.status}; retried when its agent connects`;
+    return { kind: 'wait', box: pending, reason };
+  }
+  // A start resumes a hibernated box too (boxPowerPolicy: start is valid from
+  // stopped and hibernated), so neither of them buys a new box.
+  const parked = ec2.filter(b => (b.status === 'stopped' || b.status === 'hibernated') && b.ec2InstanceId).sort(byRecency)[0];
+  if (parked) return { kind: 'start', box: parked };
+  // createdAt is not when the box failed; the failure was at most
+  // PROVISIONING_FAILURE_WINDOW_MS later, so the hold runs from there and
+  // lasts the full hour whenever in that window the failure happened.
+  const failed = ec2
+    .filter(b => b.status === 'failed' && now - b.createdAt.getTime() < PROVISIONING_FAILURE_WINDOW_MS + AUTO_BOX_FAILURE_HOLD_MS)
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+  if (failed) {
+    return {
+      kind: 'hold',
+      box: failed,
+      reason: `box "${failed.name}" failed to provision less than an hour ago, so no new box is made for this session yet; see it in termag, or add a box there`,
+    };
+  }
+  return { kind: 'acquire' };
+}
+
+/**
+ * Base name for a box created on an engineer's behalf: the date tells them why
+ * it exists. Repeats on one day get -2, -3, … from pickFreeBoxName
+ * (services/boxProvisioner.ts).
+ */
+export function autoBoxName(now: Date = new Date()): string {
+  return `claude-${now.toISOString().slice(0, 10).replace(/-/g, '')}`;
+}
+
+// ── Refusals ─────────────────────────────────────────────────────────────────
+
+/**
+ * Every way the spawn route answers "not now" (503, the hook exits 1 and the
+ * session is re-offered) or "a box agent failed" (502, same exit), as one
+ * table. The `text` is what the hook
+ * relays to stderr, so what Owners read in the environment's Activity tab,
+ * and what the `queued` event's `detail` holds; the shared ones come from
+ * REFUSAL_TEXTS below (the admin matcher reads old events by them) and
+ * a test pins every text. The `code` is the stable key: the event's `code`
+ * column, the owner's view, the admin report's category (which it extends
+ * with the auto-box codes) and the owner notice
+ * group on it, never on the text.
+ */
+export const REFUSAL_CODES = [
+  // The five admin categories, by their names.
+  'github', 'agent-too-old', 'no-box', 'boxes-full', 'hook-gave-up',
+  // The auto-box path (#191): a box is on its way, or cannot be.
+  'box-wait', 'box-hold', 'box-starting', 'box-start-failed', 'box-claimed', 'box-provisioning',
+  'box-on-its-way', 'no-provisioning', 'box-creation-refused',
+  // A box agent failed an RPC (502).
+  'agent-list-failed', 'agent-launch-failed',
+] as const;
+export type RefusalCode = typeof REFUSAL_CODES[number];
+
+export interface Refusal {
+  code: RefusalCode;
+  text: string;
+}
+
+const refusal = (code: RefusalCode, text: string): Refusal => ({ code, text });
+
+export const REFUSAL = {
+  githubNotConnected: () => refusal('github', REFUSAL_TEXTS.github),
+  noBox: () => refusal('no-box', REFUSAL_TEXTS.noBox),
+  agentOutdated: () => refusal('agent-too-old', REFUSAL_TEXTS.agentTooOld),
+  boxesFull: (boxes: number, max: number) => refusal('boxes-full', REFUSAL_TEXTS.boxesFull(boxes, max)),
+  /** The hook's curl gave up before the launch: nothing started, claimed or bought. */
+  hookGone: (what: 'launch' | 'box') => refusal('hook-gave-up',
+    what === 'launch' ? REFUSAL_TEXTS.hookGaveUp : 'the spawn hook stopped waiting; no box started for it'),
+  /** autoBoxPlan said a box is already on its way; `reason` names it. */
+  boxWait: (reason: string) => refusal('box-wait', reason),
+  /** A ready box is still receiving the credentials a claim or a change started; the runner would copy a half-written settings file. */
+  boxSettling: (name: string) => refusal('box-wait',
+    `box "${name}" is still receiving its credentials; retried once they have landed`),
+  /** autoBoxPlan said a box failed within the hour; `reason` names it. */
+  boxHold: (reason: string) => refusal('box-hold', reason),
+  boxStarting: (verb: 'starting' | 'resuming', name: string) => refusal('box-starting',
+    `${verb} box "${name}" for this session; retried when its agent connects`),
+  boxStartFailed: (name: string, status: string, why: string | null) => refusal('box-start-failed',
+    why === null
+      ? `box "${name}" is ${status} and EC2 refused to start it; start it from termag`
+      : `box "${name}" is ${status} and could not be started: ${why}`),
+  boxClaimed: (name: string) => refusal('box-claimed',
+    `claimed termag box "${name}" for this session; retried when its agent connects`),
+  boxProvisioning: (name: string) => refusal('box-provisioning',
+    `provisioning termag box "${name}" for this session (a few minutes); retried when its agent connects`),
+  /** A write's own re-check, or a concurrent create, found a box already on its way. */
+  boxOnItsWay: () => refusal('box-on-its-way',
+    'a termag box is being set up for the session owner; retried when its agent connects'),
+  noProvisioning: () => refusal('no-provisioning',
+    'the session owner has no termag box and this orchestrator cannot provision one; add a box in termag'),
+  /** The Add box flow's creation gate (services/boxCreationGate.ts) said no. */
+  boxCreationRefused: (error: string) => refusal('box-creation-refused',
+    `${error}; the session is retried once GitHub is connected`),
+  agentListFailed: (msg: string) => refusal('agent-list-failed', `a box agent did not list its sessions: ${msg}`),
+  agentLaunchFailed: (msg: string) => refusal('agent-launch-failed', `the box agent refused the launch: ${msg}`),
+} as const;
+
+/** The HTTP status a refusal answers with: 502 for a box agent that failed an RPC, 503 for everything else. */
+export function refusalStatus(r: Refusal): 502 | 503 {
+  return r.code === 'agent-list-failed' || r.code === 'agent-launch-failed' ? 502 : 503;
 }
 
 export type GithubCredentialState = 'present' | 'absent' | 'unknown';
@@ -304,9 +543,10 @@ export const REFUSAL_TEXTS = {
   hookGaveUp: 'the spawn hook stopped waiting; not launched',
 } as const;
 
-export function githubGate(input: { brokerConfigured: boolean; credential: GithubCredentialState }): { ok: true } | { ok: false; error: string } {
+export function githubGate(input: { brokerConfigured: boolean; credential: GithubCredentialState }): { ok: true } | ({ ok: false; error: string } & Refusal) {
   if (!input.brokerConfigured || input.credential !== 'absent') return { ok: true };
-  return { ok: false, error: REFUSAL_TEXTS.github };
+  const r = REFUSAL.githubNotConnected();
+  return { ok: false, error: r.text, ...r };
 }
 
 /**

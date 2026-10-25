@@ -113,19 +113,57 @@ describe('membership rules', () => {
   });
 });
 
-describe('inheritance seam', () => {
-  it('gives every box no parent until the ask thread link lands', () => {
-    expect(parentBoxOf(aliceBox, {})).toBeNull();
-    expect(childBoxesOf('b1', [aliceBox, { id: 'b2', userId: 'alice', status: 'ready' }], {})).toEqual([]);
+describe('inheritance from parentInstanceId', () => {
+  const boxes = new Map<string, InheritanceBox>();
+  const load = async (id: string) => boxes.get(id) ?? null;
+  const box = (id: string, parentInstanceId: string | null = null, extra: Partial<InheritanceBox> = {}): InheritanceBox => {
+    const b = { id, userId: 'alice', status: 'ready', parentInstanceId, ...extra };
+    boxes.set(id, b);
+    return b;
+  };
+
+  it('reads the parent off the box', () => {
+    expect(parentBoxOf(aliceBox)).toBeNull();
+    expect(parentBoxOf({ ...aliceBox, parentInstanceId: null })).toBeNull();
+    expect(parentBoxOf({ ...aliceBox, id: 'b2', parentInstanceId: 'b1' })).toBe('b1');
   });
 
-  it('walks no ancestors', async () => {
-    let loads = 0;
-    expect(await ancestorsOf(aliceBox, async () => { loads++; return null; }, {})).toEqual([]);
-    expect(loads).toBe(0);
+  it('lists a box\'s direct children, never the box itself', () => {
+    const all = [aliceBox, { ...aliceBox, id: 'b2', parentInstanceId: 'b1' }, { ...aliceBox, id: 'b3', parentInstanceId: 'b2' }, { ...aliceBox, id: 'b4', parentInstanceId: 'b4' }];
+    expect(childBoxesOf('b1', all).map(b => b.id)).toEqual(['b2']);
+    expect(childBoxesOf('b4', all)).toEqual([]);
   });
 
-  it('caps the walk at eight hops', () => {
+  it('walks ancestors nearest first', async () => {
+    boxes.clear();
+    box('root');
+    box('mid', 'root');
+    const leaf = box('leaf', 'mid');
+    expect((await ancestorsOf(leaf, load)).map(b => b.id)).toEqual(['mid', 'root']);
+  });
+
+  it('stops at a terminated, differently-owned or missing parent', async () => {
+    boxes.clear();
+    box('root');
+    box('dead', 'root', { status: 'terminated' });
+    expect(await ancestorsOf(box('a', 'dead'), load)).toEqual([]);
+    box('bobs', 'root', { userId: 'bob' });
+    expect(await ancestorsOf(box('b', 'bobs'), load)).toEqual([]);
+    expect(await ancestorsOf(box('c', 'gone'), load)).toEqual([]);
+  });
+
+  it('stops on a cycle', async () => {
+    boxes.clear();
+    box('x', 'y');
+    const y = box('y', 'x');
+    expect((await ancestorsOf(y, load)).map(b => b.id)).toEqual(['x']);
+  });
+
+  it('caps the walk at eight hops', async () => {
+    boxes.clear();
+    let prev: string | null = null;
+    for (let i = 0; i < 12; i++) { box(`h${i}`, prev); prev = `h${i}`; }
     expect(MAX_INHERITANCE_HOPS).toBe(8);
+    expect(await ancestorsOf(boxes.get('h11')!, load)).toHaveLength(8);
   });
 });

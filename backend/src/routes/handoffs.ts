@@ -18,6 +18,7 @@
  */
 import { Router } from 'express';
 import { prisma } from '../db';
+import { kindRefusal, projectKindTraits } from '../services/projectKind';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { refuseParkedBox } from '../middleware/parkedBox';
@@ -121,7 +122,7 @@ export async function startHandoff(
     },
   });
   if (!project) return { status: 404, body: { error: 'Project not found' } };
-  if (project.kind === 'metaterm') return { status: 400, body: { error: 'MetaTerm cannot be handed off' } };
+  if (!projectKindTraits(project.kind).canHandOff) return { status: 400, body: { error: kindRefusal(project.kind, 'be handed off') } };
   if (!project.instanceId || !project.instance) return { status: 400, body: { error: 'Handing off needs a box project' } };
   if (!(await boolVariation(HANDOFF_FLAG, user, false, project.instance))) {
     return { status: 403, body: { error: `agent handoff is not enabled for you on this box (feature flag ${HANDOFF_FLAG})`, code: 'handoff_disabled' } };

@@ -245,6 +245,44 @@ describe('surplus', () => {
     const rows = [warm('b', { createdAt: born }), warm('a', { createdAt: born })];
     expect(plan(rows, { target: 1 }).terminate).toEqual([{ id: 'a', reason: 'surplus' }]);
   });
+
+  // box-warm-pool-size lowered from 5 to 2 mid-refill.
+  it('retires the warming boxes a lowered target no longer has room for, newest first', () => {
+    const rows = [
+      warm('w'),
+      warming('g-old', { createdAt: ago(9 * MINUTE) }),
+      warming('g-mid', { createdAt: ago(6 * MINUTE) }),
+      warming('g-new', { createdAt: ago(3 * MINUTE) }),
+    ];
+    expect(plan(rows, { target: 2, maxInFlight: 3 })).toEqual({
+      launch: 0,
+      fail: [],
+      terminate: [
+        { id: 'g-new', reason: 'surplus' },
+        { id: 'g-mid', reason: 'surplus' },
+      ],
+      breaker: CLOSED,
+      supply: { claimable: 1, inFlight: 3 },
+    });
+  });
+
+  it('retires every warming box once the warm ones alone exceed the target', () => {
+    const rows = [warm('w1', { createdAt: ago(2 * HOUR) }), warm('w2'), warm('w3'), warming('g')];
+    expect(plan(rows, { target: 1 }).terminate).toEqual([
+      { id: 'w1', reason: 'surplus' },
+      { id: 'w2', reason: 'surplus' },
+      { id: 'g', reason: 'surplus' },
+    ]);
+  });
+
+  it('leaves a warming box alone while the pool is under target', () => {
+    expect(plan([warm('w'), warming('g')], { target: 2 }).terminate).toEqual([]);
+  });
+
+  it('never counts a stale warming box against the room, which staleness already retires', () => {
+    const rows = [warm('w'), warming('cur'), warming('old', { poolSpecHash: OLD_HASH })];
+    expect(plan(rows, { target: 2, maxInFlight: 3 }).terminate).toEqual([{ id: 'old', reason: 'stale' }]);
+  });
 });
 
 describe('staleness', () => {

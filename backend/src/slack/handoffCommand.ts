@@ -21,7 +21,7 @@ function agentNamed(word: string): string | undefined {
  */
 export function isHandoffCommand(text: string): boolean {
   const words = text.trim().split(/\s+/);
-  if (words[0] !== 'handoff') return false;
+  if (words[0].toLowerCase() !== 'handoff') return false;
   const next = words[1]?.toLowerCase();
   return !next || HANDOFF_MODES.includes(next as HandoffMode) || !!agentNamed(next);
 }

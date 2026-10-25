@@ -4,13 +4,16 @@ import { join } from 'path';
 /**
  * True for a request path (relative to the SPA's mount) that names a build
  * file rather than an app route: anything under `/assets/` (Vite's hashed
- * chunks) or ending in `.map`. A missing one of these must 404, never fall
- * through to index.html: the browser telemetry fetches
- * `assets/<chunk>.js.map` to symbolicate errors, and an HTML 200 there failed
- * every stack trace with "invalid character '<'".
+ * chunks) or `/speech/` (on-device dictation's model and runtime),
+ * or ending in `.map`. A missing one of these must 404, never fall
+ * through to index.html: a fetcher that asks for `assets/<chunk>.js.map` (a
+ * browser's devtools; browser error tooling, before the maps were
+ * uploaded to it) must get a 404 it can act on, not an
+ * HTML 200 that fails as "invalid character '<'" (or, for the speech model,
+ * as a corrupt ONNX file).
  */
 export function isBuildFilePath(path: string): boolean {
-  return path.startsWith('/assets/') || path.endsWith('.map');
+  return path.startsWith('/assets/') || path.startsWith('/speech/') || path.endsWith('.map');
 }
 
 /**

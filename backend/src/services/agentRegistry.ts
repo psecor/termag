@@ -134,6 +134,15 @@ export function onBoxAgentFrame(type: string, listener: (frame: BoxAgentFrame) =
 type TerminalStream = { onData: (msg: any) => void; userId: string; instanceId: string | null };
 const terminalStreams = new Map<string, TerminalStream>();
 
+// Browser pane subscribers: streamId → { callback, holder }.
+// A stream is bound to the agent socket that opened its browser: only that
+// socket may feed it, and its close ends the stream, whether or not another
+// agent has taken over the key by then (a box update does exactly that).
+type BrowserStream = { onEvent: (msg: any) => void; agent: ConnectedAgent; instanceId: string | null };
+const browserStreams = new Map<string, BrowserStream>();
+// browser-blocked and browser-checkout come from guest panes only.
+const BROWSER_STREAM_EVENTS: ReadonlySet<string> = new Set(['browser-frame', 'browser-nav', 'browser-exit', 'browser-blocked', 'browser-checkout', 'browser-dialog', 'browser-dialog-closed']);
+
 let requestCounter = 0;
 
 // A process draining for a deploy hands its agents to the new one. Their close
@@ -323,6 +332,20 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
         return;
       }
 
+      // A browser pane's frames, navigation and exit.
+      if (typeof msg.type === 'string' && BROWSER_STREAM_EVENTS.has(msg.type) && msg.streamId) {
+        const stream = browserStreams.get(msg.streamId);
+        if (stream && stream.agent === agent) {
+          if (msg.type === 'browser-exit') browserStreams.delete(msg.streamId);
+          stream.onEvent(msg);
+        } else if (msg.type !== 'browser-exit') {
+          // Nobody here reads this stream (the viewer left while the attach
+          // was in flight); only the backend knows that, so it closes it.
+          ws.send(JSON.stringify({ type: 'browser-close', streamId: msg.streamId }));
+        }
+        return;
+      }
+
       const frameListeners = typeof msg.type === 'string' ? boxFrameListeners.get(msg.type) : undefined;
       // agent.conn rather than conn: a warm box claimed while connected is owned without a reconnect.
       const owner = agent.conn;
@@ -341,6 +364,19 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
   });
 
   ws.on('close', () => {
+    // The browsers died with this socket; tell their viewers now rather than
+    // leaving a frozen last frame until they close the pane. This runs for a
+    // replaced socket too: its replacement holds the key by now, but not
+    // these browsers, so the guard below must not skip it.
+    for (const [streamId, stream] of browserStreams) {
+      if (stream.agent !== agent) continue;
+      browserStreams.delete(streamId);
+      try {
+        stream.onEvent({ type: 'browser-exit', streamId, reason: 'agent disconnected' });
+      } catch (err) {
+        console.error(`[BROWSER-PANE] exit listener failed for ${streamId}:`, (err as Error).message);
+      }
+    }
     // Only remove if this is still the current agent for the key. Without
     // that guard a replaced socket's close would stamp over the live agent.
     if (targetMap.get(targetKey)?.ws === ws) {
@@ -585,8 +621,8 @@ export function getInstanceAgent(instanceId: string): ConnectedAgent | null {
   return agent;
 }
 
-/** The agent holding a stream's PTY: the project's box agent, or the owner's legacy agent. */
-function streamAgent(stream: TerminalStream): ConnectedAgent | null {
+/** The agent holding a stream's PTY or browser: the project's box agent, or the owner's legacy agent. */
+function streamAgent(stream: { userId: string; instanceId: string | null }): ConnectedAgent | null {
   return stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(stream.userId);
 }
 
@@ -714,7 +750,7 @@ export async function requestTerminalStream(
  */
 export async function requestInstanceTerminalStream(
   instanceId: string,
-  user: User,
+  user: Pick<User, 'id'>,
   tmuxSessionName: string,
   cols: number,
   rows: number,
@@ -760,6 +796,74 @@ export function sendTerminalMouse(streamId: string, enabled: boolean): void {
 export function closeTerminalStream(streamId: string): void {
   sendToStreamAgent(streamId, { type: 'terminal-close' });
   terminalStreams.delete(streamId);
+}
+
+/**
+ * Ask the project's agent to open a browser pane and
+ * subscribe to its frames. Resolves to the stream id once the agent has the
+ * browser up (Chromium takes about a second to start, hence the longer wait).
+ */
+/**
+ * What `browser-attach` carries (agent/browser-pane.js attach). A guest pane
+ * adds its mode, the share's recipe, the workstream's
+ * checkout, the pool size, the share's expiry and the link's `at` path.
+ */
+export interface BrowserAttachOptions {
+  url: string;
+  width: number;
+  height: number;
+  paneKey: string;
+  persistProfile?: boolean;
+  mode?: 'guest';
+  recipe?: unknown;
+  cwd?: string;
+  maxGuestPanes?: number;
+  profileExpiresAt?: string;
+  atPath?: string;
+  /** An owner's own share link: the share's recipe, which the agent resolves to open `atPath` on the share's app. */
+  openRecipe?: unknown;
+  /** The viewer's pane can answer a page's alert, confirm or prompt; otherwise the agent answers them, as before. */
+  relayDialogs?: boolean;
+}
+
+export async function requestBrowserStream(
+  host: ProjectHost,
+  opts: BrowserAttachOptions,
+  onEvent: (msg: any) => void,
+): Promise<string> {
+  // Bound to the socket that is asked, not to whoever holds the key later.
+  const agent = streamAgent(host);
+  if (!agent) throw new Error('Agent not connected');
+  const streamId = `browser_${nextRequestId()}`;
+  browserStreams.set(streamId, { onEvent, agent, instanceId: host.instanceId });
+  try {
+    await sendOnAgent(agent, 'browser-attach', { streamId, ...opts }, 20000);
+    return streamId;
+  } catch (err) {
+    browserStreams.delete(streamId);
+    throw err;
+  }
+}
+
+/** What a viewer does to the browser that counts as using the box, like typing in a terminal. */
+const BROWSER_ACTIVITY: ReadonlySet<unknown> = new Set(['browser-input', 'browser-navigate', 'browser-history', 'browser-dialog-answer']);
+
+/** Relay a viewer's frame (input, navigate, history, resize) to the agent holding the stream. */
+export function sendBrowserMessage(streamId: string, msg: Record<string, unknown>): void {
+  const stream = browserStreams.get(streamId);
+  if (!stream || stream.agent.ws.readyState !== WebSocket.OPEN) return;
+  if (BROWSER_ACTIVITY.has(msg.type)) noteBoxActivity(stream.instanceId);
+  stream.agent.ws.send(JSON.stringify({ ...msg, streamId }));
+}
+
+export function closeBrowserStream(streamId: string): void {
+  sendBrowserMessage(streamId, { type: 'browser-close' });
+  browserStreams.delete(streamId);
+}
+
+/** Ask the project's agent which web apps listen on the box. */
+export function requestBrowserSuggestions(host: ProjectHost, cwd: string | null): Promise<unknown> {
+  return sendForProject(host, 'browser-suggest', { cwd }, 15000);
 }
 
 /**

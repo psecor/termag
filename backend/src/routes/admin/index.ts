@@ -17,11 +17,13 @@ import { tokenReport, parseTokenGroups, worktimeReport, parseWorktimeGroups } fr
 import { listProjects, projectCounts, liveSessions, summarizeSessions } from '../../services/admin/inventoryQueries';
 import { computeSignals } from '../../services/admin/signalsData';
 import { systemHealth } from '../../services/admin/systemQueries';
+import { spawnLimitsReport } from '../../services/admin/spawnLimitsQueries';
 import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHealth, parseReportGroup, pipelineHealth } from '../../services/admin/claudeRunnerQueries';
 import { manageRouter } from './manage';
 import { prsRouter } from './prs';
 import { segmentsRouter } from './segments';
 import { softwareRouter } from './software';
+import { spendRouter } from './spend';
 
 function rangeOr400(req: Request, res: Response) {
   const r = parseRange(req.query as Record<string, unknown>);
@@ -116,6 +118,8 @@ export function adminRouter(): Router {
 
   router.get('/signals', asyncHandler(async (_req, res) => { res.json(await computeSignals()); }));
   router.get('/system', asyncHandler(async (_req, res) => { res.json(await systemHealth()); }));
+  // What agent-spawn-limits serves each user, against the code defaults (read-only: tune it in TERMAG_FLAGS).
+  router.get('/spawn-limits', asyncHandler(async (_req, res) => { res.json(await spawnLimitsReport()); }));
   // Claude Code cloud sessions:
   // the orchestrator's loopback health and the org-wide runs, no titles.
   router.get('/claude-runner/health', asyncHandler(async (_req, res) => { res.json(await orchestratorHealth()); }));
@@ -136,6 +140,7 @@ export function adminRouter(): Router {
   router.use(prsRouter());
   router.use(segmentsRouter());
   router.use(softwareRouter());
+  router.use(spendRouter());
   router.use(manageRouter());
   return router;
 }

@@ -31,6 +31,7 @@ import { poolHibernationEnabled } from './boxHibernationFlag';
 import { planWarmPool, type PoolPlan, type PoolRowView } from './warmPoolPlanner';
 import { ttlMemo } from './ttlMemo';
 import { resendStalledClaims } from './warmPoolClaim';
+import { warmPoolSizeOverride, warmPoolTargetSize, WARM_POOL_SIZE_FLAG } from './warmPoolSize';
 
 /** A warm box whose agent has been gone this long is failed, not handed to anyone. */
 const AGENT_LOST_AFTER_MS = 5 * 60 * 1000;
@@ -85,9 +86,10 @@ let loggedWarmUpTo: Date | null = null;
 export function startWarmPoolReconciler(intervalMs?: number): void {
   if (reconcileTimer) return;
   const policy = warmPoolConfigFromEnv(process.env);
-  if (policy.targetSize > 0 && !getBoxConfig()) {
-    console.warn(`[POOL] WARM_POOL_TARGET_SIZE=${policy.targetSize} but box provisioning is not configured; the pool will stay empty`);
-  }
+  const override = warmPoolSizeOverride(process.env);
+  if (override.ignored) console.warn(`[POOL] ${override.ignored}`);
+  else if (override.size !== null) console.log(`[POOL] pool size ${override.size} from WARM_POOL_TARGET_SIZE (AUTH_MODE=local), not ${WARM_POOL_SIZE_FLAG}`);
+  if (!getBoxConfig()) console.log('[POOL] box provisioning is not configured; the pool will stay empty');
   reconcileTimer = setInterval(reconcileWarmPool, intervalMs ?? policy.reconcileMs);
   reconcileTimer.unref?.();
 }
@@ -107,6 +109,7 @@ export async function reconcileWarmPool(): Promise<void> {
 
   try {
     const now = new Date();
+    const target = await warmPoolTargetSize();
 
     // First, and ahead of the early return below: a claim whose RPC never
     // landed belongs to a user already, so the pool's target has no bearing on
@@ -117,14 +120,14 @@ export async function reconcileWarmPool(): Promise<void> {
 
     // The default outside staging: no pool wanted and none left over, so the
     // tick costs one indexed query and makes no AWS call at all.
-    if (policy.targetSize <= 0 && rows.every((row) => row.status === 'failed')) return;
+    if (target <= 0 && rows.every((row) => row.status === 'failed')) return;
 
     const spec = await currentPoolSpec();
     const currentHash = spec.hash;
     const plan = planWarmPool({
       rows,
       lastWarmedAt: await latestWarmedAt(),
-      target: policy.targetSize,
+      target,
       maxInFlight: policy.maxInFlight,
       currentHash,
       maxAgeMs: policy.maxAgeMs,
@@ -135,11 +138,11 @@ export async function reconcileWarmPool(): Promise<void> {
     });
     lastTick = { specHash: currentHash, breakerOpen: plan.breaker.open };
 
-    logTick(currentHash, policy.targetSize, plan);
+    logTick(currentHash, target, plan);
     logNewlyWarm(rows);
     logBreaker(plan);
     await failLostBoxes(plan);
-    await launchBoxes(plan, spec, policy);
+    await launchBoxes(plan, spec, target, policy);
     await retireBoxes(plan);
   } catch (err) {
     console.error('[POOL] Reconcile failed:', errMsg(err));
@@ -209,6 +212,31 @@ export async function currentPoolSpec(): Promise<PoolSpec> {
     }),
     hibernation,
   };
+}
+
+/**
+ * The hash the claim statement filters on, or null when there is no point
+ * asking for one.
+ *
+ * Deriving it costs a DescribeImages call, so two indexed reads come first: a
+ * target of 0 means the pool should not exist and every claim takes the cold
+ * path (WP-2), and an empty pool has nothing for the statement to match. Both
+ * are the common case on a deployment that has not opted in, and neither
+ * should make a user's click wait on AWS. The cache in #104 is what makes the
+ * call itself cheap once it is warranted.
+ *
+ * Failing soft matters more than the call: an AWS hiccup should cost the user
+ * a cold box, not an error.
+ */
+export async function poolSpecHashOrNull(): Promise<string | null> {
+  if (await warmPoolTargetSize() <= 0) return null;
+  if (await prisma.instance.count({ where: { userId: null, status: 'warm' } }) === 0) return null;
+  try {
+    return await currentPoolSpecHash();
+  } catch (err) {
+    console.warn('[POOL] claim skipped, no pool spec hash:', err instanceof Error ? err.message : String(err));
+    return null;
+  }
 }
 
 /**
@@ -308,23 +336,23 @@ async function failLostBoxes(plan: PoolPlan): Promise<void> {
     // the lifecycle hands a failed box to an operator or the cleanup sweep,
     // and the pool has already launched its replacement.
     const changed = await prisma.instance.updateMany({
-      where: { id: box.id, status: 'warm' },
+      where: { id: box.id, userId: null, status: 'warm' },
       data: { status: 'failed', provisioningError: box.reason },
     });
     if (changed.count > 0) console.log(`[POOL] fail ${box.id}: ${box.reason}`);
   }
 }
 
-async function launchBoxes(plan: PoolPlan, spec: PoolSpec, policy: WarmPoolConfig): Promise<void> {
+async function launchBoxes(plan: PoolPlan, spec: PoolSpec, target: number, policy: WarmPoolConfig): Promise<void> {
   const currentHash = spec.hash;
   for (let i = 0; i < plan.launch; i++) {
-    const launched = await insertPoolRow(currentHash, policy.targetSize, policy.maxInFlight);
+    const launched = await insertPoolRow(currentHash, target, policy.maxInFlight);
     // Null means there is no longer room to launch, either because another pod
     // took the target or the cap, or because this tick's own earlier inserts
     // did. Either way, stop.
     if (!launched) break;
 
-    console.log(`[POOL] launch ${launched.instance.id} (${launched.instance.name}) spec=${currentHash.slice(0, 12)} target=${policy.targetSize} warm=${plan.supply.claimable} warming=${plan.supply.inFlight}`);
+    console.log(`[POOL] launch ${launched.instance.id} (${launched.instance.name}) spec=${currentHash.slice(0, 12)} target=${target} warm=${plan.supply.claimable} warming=${plan.supply.inFlight}`);
     void provisionPoolBox({
       instance: launched.instance,
       token: launched.token,
@@ -393,11 +421,12 @@ async function insertPoolRow(
 
 async function retireBoxes(plan: PoolPlan): Promise<void> {
   for (const box of plan.terminate) {
-    // Guarded on the two pool statuses for the same reason as the fail path.
-    // Losing a retirement to a claim costs nothing; tearing down a box a user
-    // has just been handed costs them their session.
+    // Guarded on no owner and the two pool statuses, for the same reason as
+    // the fail path: a lowered target or a drain must never reach a box a
+    // claim has handed out. Losing a retirement to a claim costs nothing;
+    // tearing down a box a user has just been handed costs them their session.
     const changed = await prisma.instance.updateMany({
-      where: { id: box.id, status: { in: ['warming', 'warm'] } },
+      where: { id: box.id, userId: null, status: { in: ['warming', 'warm'] } },
       data: { status: 'terminated', terminatedAt: new Date() },
     });
     if (changed.count === 0) {

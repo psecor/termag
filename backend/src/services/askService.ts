@@ -1,10 +1,13 @@
 /**
  * Agent-to-agent asks: the Prisma and RPC side of routes/cliAsk.ts.
  *
- * Access is the session rule every terminal surface uses: the asker must own
- * the target project or hold a share of it (assertSessionAccess on its agent
- * session), and the workstream must exist. Only a thread's starter may add a
- * turn to it. Nothing else is limited: no run time, turn, hop or nesting cap.
+ * Access is owner-only, and that is not a flag: the asker must own both the
+ * target project and the box it is on (ownerOnlyRefusal, after the session
+ * rule's assertSessionAccess has found the workstream), because the run
+ * executes as the box user with the owner's credentials. A share of either is
+ * refused with 403 `not_owner`. Only a thread's starter may add a turn to it.
+ * A person may have at most MAX_ACTIVE_ASKS asks active at once (capRefusal);
+ * there is no run time, turn, hop or nesting cap.
  *
  * The log holds metadata only: prompts and replies are never stored. A reply
  * lives in this process's memory from the box's result to the publish, then
@@ -17,6 +20,7 @@
  */
 import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
+import { WORK_PROJECT_KINDS } from './projectKind';
 import type { CliUser } from './cliStore';
 import type { RouteResult } from '../routes/routeResult';
 import type { CliAsk } from '../routes/cliAsk';
@@ -28,18 +32,23 @@ import { PowerRequestConflict, requestPower } from './boxPower';
 import { powerRequestError } from './boxPowerPolicy';
 import { isBoxProvisioningConfigured } from './boxProvisioner';
 import { githubTokenSource } from './credentialStore';
-import { publishBundle, publishConfigFromEnv, type PublishOutcome } from './askPublish';
+import { publishBundle, publishConfigFromEnv, publishSummary, type PublishOutcome } from './askPublish';
 import { REPLY_CHANNEL, ReplyHandoff, chunkReply } from './askReplyBus';
 import { startReplyListener, stopReplyListener } from './askReplyListener';
+import { ensureAskChat, type AskChat } from './askChat';
 import {
   ACTIVE_STATES,
   ASK_AGENT_CAPABILITY,
   ASK_CANCEL_CAPABILITY,
+  ASK_CHAT_CAPABILITY,
   BUNDLE_TTL_MS,
   INBOX_WINDOW_MS,
   LOST_RUN_GRACE_MS,
   askBranch,
+  askPrBranch,
   askTarget,
+  capRefusal,
+  ownerOnlyRefusal,
   cancelDecision,
   cancelShouldStop,
   isTerminal,
@@ -60,7 +69,9 @@ import {
   wakeAction,
   deadlineAfterStart,
   isParking,
-  QUEUE_TTL_MS,
+  isProjectSettingUp,
+  queuedDeadline,
+  queueExpiryReason,
   targetCard,
   type AskRequest,
   type MessageStatus,
@@ -99,7 +110,7 @@ function waitFor(messageId: string, ms: number): Promise<void> {
 // --- reads -------------------------------------------------------------------
 
 const messageInclude = {
-  thread: { select: { id: true, hopCount: true, branch: true, prNumber: true, prUrl: true, project: { select: { name: true, userId: true, instance: { select: { name: true } } } } } },
+  thread: { select: { id: true, hopCount: true, branch: true, prNumber: true, prUrl: true, prs: { select: { key: true, branch: true, prNumber: true, prUrl: true }, orderBy: { createdAt: 'asc' as const } }, project: { select: { name: true, userId: true, instance: { select: { name: true } } } } } },
 } as const;
 
 type MessageWithThread = NonNullable<Awaited<ReturnType<typeof loadMessage>>>;
@@ -207,37 +218,52 @@ async function publishFor(messageId: string, r: RunResult): Promise<{ publish: s
   const bundle = await prisma.agentBundle.findUnique({ where: { messageId } });
   if (!bundle) return { publish: 'failed', detail: 'the box reported commits but no bundle arrived', outcome: null };
   if (!t.repo || !t.baseSha) {
-    return { publish: 'failed', detail: 'the target checkout has no GitHub origin, so the commits stay in the sandbox clone', outcome: null };
+    return { publish: 'failed', detail: "the target checkout has no GitHub origin, so the commits stay in the run's clone on the box", outcome: null };
   }
   const token = await githubTokenSource(t.originUserId).catch(() => null);
   if (!token) {
     return { publish: 'failed', detail: `${t.originUser.unixUsername} has no GitHub token stored in termag; connect GitHub in Settings to get a PR`, outcome: null };
   }
   const target = askTarget(t.project.instance?.name ?? t.instanceId, t.project.name, t.workstream);
-  const branch = askBranch(t.originUser.unixUsername, t.id);
+  const user = t.originUser.unixUsername;
   const runBox = await prisma.instance.findUnique({ where: { id: m.instanceId }, select: { ec2InstanceId: true } });
+  const rows = await prisma.agentThreadPr.findMany({ where: { threadId: t.id }, select: { key: true, prNumber: true } });
+  const prNumbers: Record<string, number> = Object.fromEntries(rows.map(p => [p.key, p.prNumber]));
+  if (prNumbers[''] == null && t.prNumber != null) prNumbers[''] = t.prNumber;
+  const prDescriptions: Record<string, string> = { ...r.prDescriptions };
+  if (r.prDescription) prDescriptions[''] = r.prDescription;
   const outcome = await publishBundle(publishConfigFromEnv(), {
     bundle: Buffer.from(bundle.data),
     baseSha: t.baseSha,
     repo: t.repo,
-    branch,
     token,
     askerEmail: t.originUser.googleEmail,
-    prTitle: '',
-    prBody: prBody({
-      senderUsername: t.originUser.unixUsername, target, threadId: t.id, shared: t.project.userId !== t.originUserId,
-      box: runBox?.ec2InstanceId ?? m.instanceId, project: t.project.name,
+    branchFor: key => askPrBranch(user, t.id, key),
+    prBody: (description, key) => prBody({
+      senderUsername: user, target, threadId: t.id,
+      box: runBox?.ec2InstanceId ?? m.instanceId, project: t.project.name, description,
+      prKey: key || undefined,
     }),
-    prNumber: t.prNumber,
+    prDescriptions,
+    prNumbers,
   });
-  if (outcome.kind === 'published') {
-    await prisma.agentThread.update({
-      where: { id: t.id },
-      data: { branch, prNumber: outcome.prNumber, prUrl: outcome.prUrl },
-    });
-    return { publish: 'published', detail: `${outcome.commits} commit(s) at ${outcome.headSha.slice(0, 12)} on ${branch}`, outcome };
+  if (outcome.kind === 'done') {
+    for (const p of outcome.prs) {
+      if (p.kind !== 'published') continue;
+      await prisma.agentThreadPr.upsert({
+        where: { threadId_key: { threadId: t.id, key: p.key } },
+        create: { threadId: t.id, key: p.key, branch: p.branch, prNumber: p.prNumber, prUrl: p.prUrl, headSha: p.headSha },
+        update: { branch: p.branch, prNumber: p.prNumber, prUrl: p.prUrl, headSha: p.headSha },
+      });
+      if (p.key === '') {
+        await prisma.agentThread.update({
+          where: { id: t.id },
+          data: { branch: p.branch, prNumber: p.prNumber, prUrl: p.prUrl },
+        });
+      }
+    }
   }
-  return { publish: outcome.kind, detail: outcome.reason, outcome };
+  return { ...publishSummary(outcome), outcome };
 }
 
 async function finishRun(messageId: string, r: RunResult): Promise<void> {
@@ -268,7 +294,7 @@ async function finishRun(messageId: string, r: RunResult): Promise<void> {
   console.log(
     `[ASK] message ${m.id} on thread ${m.threadId} (${targetOf(m)}) ${m.status} after ${secs ?? '?'}s, `
     + `${m.numTurns ?? '?'} turn(s), reply ${m.replyBytes ?? 0}B, publish ${pub.publish}`
-    + (pub.publish === 'refused' || pub.publish === 'failed' ? `: ${pub.detail}` : ''),
+    + (pub.publish === 'published' || pub.publish === 'none' ? '' : `: ${pub.detail}`),
   );
 }
 
@@ -295,6 +321,7 @@ async function agentsMdDescription(instanceId: string, projectDir: string): Prom
 
 // --- the service -------------------------------------------------------------
 
+/** Shared projects still resolve, so asking one is answered 403 `not_owner` rather than "no such project". */
 async function resolveProjectId(user: CliUser, req: AskRequest): Promise<{ projectId: string } | RouteResult> {
   if (req.projectId) return { projectId: req.projectId };
   const ref = req.ref!;
@@ -349,20 +376,22 @@ async function replayAsk(m: MessageWithThread, branchOwner: string): Promise<Rou
 const isUniqueViolation = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
 const runProjectSelect = {
-  name: true, setupStatus: true, setupError: true, user: { select: { unixUsername: true } },
+  name: true, userId: true, setupStatus: true, setupError: true, user: { select: { unixUsername: true } },
   instance: { select: { id: true, name: true, hostHome: true, status: true, userId: true, kind: true } },
 } as const;
 
 type RunProject = Prisma.ProjectGetPayload<{ select: typeof runProjectSelect }>;
 
+const ownerFacts = (p: RunProject) => ({
+  project: p.name, projectOwnerId: p.userId, box: p.instance?.name ?? null, boxOwnerId: p.instance?.userId ?? null,
+});
+
 interface RunStart {
   sender: CliUser;
   senderInstanceId: string | null;
-  isOwner: boolean;
-  ownerUsername: string;
   project: RunProject & { instance: NonNullable<RunProject['instance']> };
   instanceId: string;
-  thread: { id: string; hopCount: number; claudeSessionId: string | null; baseSha: string | null };
+  thread: { id: string; projectId: string; chatWorkstreamId: string | null; hopCount: number; claudeSessionId: string | null; baseSha: string | null };
   message: { id: string; hop: number; promptBytes: number };
   workstream: string;
   prompt: string;
@@ -377,10 +406,20 @@ async function startRun(r: RunStart): Promise<{ status: string } | { error: stri
   const target = askTarget(project.instance.name, project.name, r.workstream);
   const branch = askBranch(sender.unixUsername, thread.id);
   console.log(
-    `[ASK] ${sender.unixUsername} (${r.senderInstanceId ? `box ${r.senderInstanceId}` : 'signed-in CLI'}) asked ${target}`
-    + ` owned by ${r.ownerUsername}${r.isOwner ? '' : ' (shared)'}: thread ${thread.id}`
+    `[ASK] ${sender.unixUsername} (${r.senderInstanceId ? `box ${r.senderInstanceId}` : 'signed-in CLI'}) asked ${target}: thread ${thread.id}`
     + ` message ${message.id} hop ${message.hop}, prompt ${message.promptBytes}B`,
   );
+  // On a box that can, the run is a turn of the thread's chat on the target
+  // project (services/askChat.ts); otherwise, or if the chat cannot be made,
+  // the headless run as before.
+  let chat: AskChat | null = null;
+  if (instanceAgentTransport(instanceId)?.capabilities.includes(ASK_CHAT_CAPABILITY)) {
+    try {
+      chat = await ensureAskChat(thread);
+    } catch (e) {
+      console.warn(`[ASK] thread ${thread.id}: no chat for the run (${errMsg(e)}); running it headless`);
+    }
+  }
   try {
     await sendToInstanceAgent(instanceId, 'ask-run', {
       runId: message.id,
@@ -394,10 +433,10 @@ async function startRun(r: RunStart): Promise<{ status: string } | { error: stri
         senderDisplayName: sender.displayName,
         target,
         branch,
-        shared: !r.isOwner,
       }),
       gitName: sender.displayName || sender.unixUsername,
       gitEmail: sender.googleEmail,
+      ...(chat ? { chat } : {}),
     }, START_RPC_MS);
   } catch (e) {
     const action = startFailureAction(await runState(instanceId, message.id));
@@ -430,16 +469,18 @@ async function startRun(r: RunStart): Promise<{ status: string } | { error: stri
   return { status: now };
 }
 
-// --- asks waiting for a parked box --------------------------------------------
+// --- asks waiting for a parked box or a clone --------------------------------
 
 /**
- * An ask to the asker's own parked box is stored with its prompt and
- * `queuedUntil` (QUEUE_TTL_MS ahead) instead of being refused. Every
- * orchestrator process ticks the queue, because the box's agent connects to
- * one of them: the one holding its socket sends the run, any of them starts a
- * box that is down (requestPower's status guard makes a race harmless), and
- * a turn whose box never came fails at its expiry. The prompt is cleared the
- * moment the turn is claimed for sending, or when it ends any other way.
+ * An ask to the asker's own parked box, or to a project whose clone is still
+ * running, is stored with its prompt and `queuedUntil` (queuedDeadline)
+ * instead of being refused. Every orchestrator process ticks the queue,
+ * because the box's agent connects to one of them: the one holding its socket
+ * sends the run once the project is set up, any of them starts a box that is
+ * down (requestPower's status guard makes a race harmless), a turn whose
+ * project's setup failed fails at once, and one whose box never came or whose
+ * clone never finished fails at its expiry. The prompt is cleared the moment
+ * the turn is claimed for sending, or when it ends any other way.
  */
 const QUEUE_TICK_MS = 5_000;
 /** A box start that did not take (EC2 refused, a conflict) is asked again this often. */
@@ -472,7 +513,7 @@ async function sendQueued(id: string): Promise<void> {
   const m = await prisma.agentMessage.findUnique({
     where: { id },
     include: {
-      thread: { select: { id: true, hopCount: true, claudeSessionId: true, baseSha: true } },
+      thread: { select: { id: true, projectId: true, chatWorkstreamId: true, hopCount: true, claudeSessionId: true, baseSha: true } },
       sender: { select: { id: true, googleEmail: true, unixUsername: true, displayName: true } },
     },
   });
@@ -481,6 +522,8 @@ async function sendQueued(id: string): Promise<void> {
   if (!transport) return;
   const box = await prisma.instance.findUnique({ where: { id: m.instanceId }, select: { status: true } });
   if (!box || isParking(box.status)) return;
+  const setup = await prisma.project.findUnique({ where: { id: m.projectId }, select: { setupStatus: true } });
+  if (setup && isProjectSettingUp(setup.setupStatus)) return;
   const prompt = m.queuedPrompt;
   const claimed = await prisma.agentMessage.updateMany({
     where: { id, status: 'submitted', queuedPrompt: { not: null } },
@@ -495,22 +538,23 @@ async function sendQueued(id: string): Promise<void> {
     wake(id);
     console.warn(`[ASK] queued message ${id}: ${why}`);
   };
-  let access;
   try {
-    access = await assertSessionAccess(m.senderUserId, m.projectId, 'agent', m.workstream);
+    await assertSessionAccess(m.senderUserId, m.projectId, 'agent', m.workstream);
   } catch (e) {
     if (e instanceof SessionAccessError) return failClaimed(`the asker lost access while the box was starting: ${e.message}`);
     throw e;
   }
   const project = await prisma.project.findUnique({ where: { id: m.projectId }, select: runProjectSelect });
   if (!project?.instance || project.instance.id !== m.instanceId) return failClaimed('the project moved off the box while it was starting');
+  const notOwner = ownerOnlyRefusal(ownerFacts(project), m.senderUserId);
+  if (notOwner) return failClaimed(`the asker no longer owns the target: ${notOwner.error}`);
   if (!transport.capabilities.includes(ASK_AGENT_CAPABILITY)) {
-    return failClaimed(`${project.instance.name}'s agent can't run asks yet; it needs a newer termag agent and termag-subagent-run`);
+    return failClaimed(`${project.instance.name}'s agent can't run asks yet; it needs a newer termag agent`);
   }
   const unready = setupRefusal(project);
-  if (unready) return failClaimed(unready.error);
+  if (unready) return failClaimed(`${unready.error}, so the ask never ran`);
   await startRun({
-    sender: m.sender, senderInstanceId: m.senderInstanceId, isOwner: access.isOwner, ownerUsername: access.project.ownerUsername,
+    sender: m.sender, senderInstanceId: m.senderInstanceId,
     project: { ...project, instance: project.instance }, instanceId: m.instanceId, thread: m.thread,
     message: m, workstream: m.workstream, prompt,
   });
@@ -554,20 +598,32 @@ async function wakeBox(instanceId: string, askerId: string, ids: string[], now: 
 export async function tickQueue(now = Date.now()): Promise<void> {
   const rows = await prisma.agentMessage.findMany({
     where: { queuedUntil: { not: null }, queuedPrompt: { not: null }, status: 'submitted' },
-    select: { id: true, instanceId: true, senderUserId: true, queuedUntil: true },
+    select: { id: true, instanceId: true, senderUserId: true, queuedUntil: true, projectId: true },
   });
   const statuses = new Map((await prisma.instance.findMany({
     where: { id: { in: [...new Set(rows.map(r => r.instanceId))] } },
     select: { id: true, status: true },
   })).map(b => [b.id, b.status]));
+  const projects = new Map((await prisma.project.findMany({
+    where: { id: { in: [...new Set(rows.map(r => r.projectId))] } },
+    select: { id: true, name: true, setupStatus: true, setupError: true },
+  })).map(p => [p.id, p]));
   const waiting = new Map<string, { askerId: string; ids: string[] }>();
   for (const r of rows) {
     const parking = isParking(statuses.get(r.instanceId) ?? '');
-    if (r.queuedUntil!.getTime() < now) {
-      const mins = Math.round(QUEUE_TTL_MS / 60_000);
-      if (await failQueued(r.id, `the box did not come up within ${mins} minutes of being started, so the ask never ran; start it and ask again`, { queuedUntil: { lt: new Date(now) } })) {
-        console.log(`[ASK] queued message ${r.id} expired: its box did not connect within ${mins} minutes of being started`);
+    const project = projects.get(r.projectId) ?? null;
+    const setupFailed = project && setupRefusal(project);
+    if (setupFailed) {
+      if (await failQueued(r.id, `${setupFailed.error}, so the ask never ran`)) {
+        console.log(`[ASK] queued message ${r.id} failed: ${project.name}'s setup failed`);
       }
+    } else if (r.queuedUntil!.getTime() < now) {
+      const why = queueExpiryReason(project);
+      if (await failQueued(r.id, why, { queuedUntil: { lt: new Date(now) } })) {
+        console.log(`[ASK] queued message ${r.id} expired: ${why}`);
+      }
+    } else if (!parking && instanceAgentTransport(r.instanceId) && project && isProjectSettingUp(project.setupStatus)) {
+      // Connected and cloning: the box reports the clone's end, and a later tick sends the run.
     } else if (!parking && readyTransport(r.instanceId)) {
       await sendQueued(r.id).catch(e => console.error(`[ASK] sending queued message ${r.id} failed:`, errMsg(e)));
     } else if (parking || !instanceAgentTransport(r.instanceId)) {
@@ -614,6 +670,10 @@ export const prismaCliAsk: CliAsk = {
       if (e instanceof SessionAccessError) return fail(e.status, e.message, e.status === 404 ? 'not_found' : 'invalid_request');
       throw e;
     }
+    const project = await prisma.project.findUnique({ where: { id: access.project.id }, select: runProjectSelect });
+    if (!project) return fail(404, 'Project not found', 'not_found');
+    const notOwner = ownerOnlyRefusal(ownerFacts(project), user.id);
+    if (notOwner) return fail(notOwner.status, notOwner.error, notOwner.code);
     const promptBytes = Buffer.byteLength(req.prompt, 'utf8');
     const replayOf = async (): Promise<RouteResult | null> => {
       if (!req.messageId) return null;
@@ -627,10 +687,8 @@ export const prismaCliAsk: CliAsk = {
     const replayed = await replayOf();
     if (replayed) return replayed;
 
-    const instanceId = access.project.instanceId;
-    if (!instanceId) return rejection(409, 'That project is not on a box; asks run on boxes only', 'no_box', req);
-    const project = await prisma.project.findUnique({ where: { id: access.project.id }, select: runProjectSelect });
-    if (!project?.instance) return fail(404, 'Project not found', 'not_found');
+    const instanceId = project.instance?.id ?? null;
+    if (!instanceId || !project.instance) return rejection(409, 'That project is not on a box; asks run on boxes only', 'no_box', req);
     const target = askTarget(project.instance.name, project.name, req.workstream);
 
     const conn = instanceAgentTransport(instanceId);
@@ -645,13 +703,19 @@ export const prismaCliAsk: CliAsk = {
     if (route === 'connecting') {
       return rejection(409, `${project.instance.name}'s agent is still connecting; try again in a moment`, 'box_offline', req);
     }
-    const queued = route === 'queue';
-    const transport = queued ? null : conn;
+    const waitsForBox = route === 'queue';
+    const transport = waitsForBox ? null : conn;
     if (transport && !transport.capabilities.includes(ASK_AGENT_CAPABILITY)) {
-      return rejection(409, `${project.instance.name}'s agent can't run asks yet; it needs a newer termag agent and termag-subagent-run`, 'unsupported', req);
+      return rejection(409, `${project.instance.name}'s agent can't run asks yet; it needs a newer termag agent`, 'unsupported', req);
     }
     const unready = setupRefusal(project);
     if (unready) return rejection(409, unready.error, unready.code, req);
+    const askChat = await prisma.workstream.findFirst({
+      where: { projectId: access.project.id, name: req.workstream, askThread: { isNot: null } }, select: { id: true },
+    });
+    if (askChat) return rejection(409, `${req.workstream} is an ask's own conversation; ask the project's workstream instead`, 'invalid_request', req);
+    const waitsForSetup = isProjectSettingUp(project.setupStatus);
+    const queued = waitsForBox || waitsForSetup;
 
     let prior = null;
     if (req.threadId) {
@@ -674,10 +738,15 @@ export const prismaCliAsk: CliAsk = {
     }
 
     // The thread's hop and the message land together, so a retry racing the
-    // first POST (same id) leaves no extra hop or empty thread behind.
+    // first POST (same id) leaves no extra hop or empty thread behind. The
+    // per-person lock makes the cap hold against asks sent at the same time.
     let created;
     try {
       created = await prisma.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`ask:${user.id}`}))`;
+        const active = await tx.agentMessage.count({ where: { senderUserId: user.id, status: { in: ACTIVE_STATES } } });
+        const capped = capRefusal(active);
+        if (capped) return { capped };
         let thread;
         if (prior) {
           const bumped = await tx.agentThread.updateMany({
@@ -702,7 +771,7 @@ export const prismaCliAsk: CliAsk = {
             instanceId,
             hop: thread.hopCount,
             promptBytes,
-            ...(queued ? { queuedPrompt: req.prompt, queuedUntil: new Date(Date.now() + QUEUE_TTL_MS) } : {}),
+            ...(queued ? { queuedPrompt: req.prompt, queuedUntil: queuedDeadline({ box: waitsForBox, setup: waitsForSetup }, Date.now()) } : {}),
           },
         });
         return { thread, message };
@@ -714,22 +783,33 @@ export const prismaCliAsk: CliAsk = {
       throw e;
     }
     if (!created) return rejection(409, 'Another turn on this thread started at the same time', 'thread_busy', req);
+    if ('capped' in created && created.capped) {
+      console.log(`[ASK] ${user.unixUsername} asked ${target}: refused, ${created.capped.code}`);
+      return rejection(409, created.capped.error, created.capped.code, req);
+    }
     const { thread, message } = created;
     const branch = askBranch(user.unixUsername, thread.id);
     const reply = (status: string) => ({
       status: 202,
-      body: { thread: thread.id, message: message.id, status, hop: message.hop, hops: thread.hopCount, target, branch, ...(queued ? { queued: true } : {}) },
+      body: {
+        thread: thread.id, message: message.id, status, hop: message.hop, hops: thread.hopCount, target, branch,
+        ...(queued ? { queued: true, queuedFor: waitsForBox ? 'box' : 'setup' } : {}),
+      },
     });
     if (queued) {
+      const until = [
+        ...(waitsForBox ? [`${project.instance.name} connects (${project.instance.status})`] : []),
+        ...(waitsForSetup ? [`${project.name} is set up (${project.setupStatus})`] : []),
+      ].join(' and ');
       console.log(
         `[ASK] ${user.unixUsername} (${senderInstanceId ? `box ${senderInstanceId}` : 'signed-in CLI'}) asked ${target}: thread ${thread.id}`
-        + ` message ${message.id} hop ${message.hop}, prompt ${message.promptBytes}B, queued until ${project.instance.name} connects (${project.instance.status})`,
+        + ` message ${message.id} hop ${message.hop}, prompt ${message.promptBytes}B, queued until ${until}`,
       );
       void tickQueue().catch(e => console.error('[ASK] queue tick failed:', errMsg(e)));
       return reply('submitted');
     }
     const started = await startRun({
-      sender: user, senderInstanceId, isOwner: access.isOwner, ownerUsername: access.project.ownerUsername,
+      sender: user, senderInstanceId,
       project: { ...project, instance: project.instance }, instanceId, thread, message, workstream: req.workstream, prompt: req.prompt,
     });
     if ('error' in started) return fail(502, started.error, 'box_error');
@@ -796,7 +876,7 @@ export const prismaCliAsk: CliAsk = {
     const started = await prisma.agentMessage.findUnique({ where: { id: m.id }, select: { startedAt: true } });
     const stop = cancelShouldStop({ status: m.status, startedAt: started?.startedAt ?? null })
       ? await stopRun(m.instanceId, m.id)
-      : { stopped: false, detail: m.queuedPrompt !== null ? 'it was still waiting for its box to start' : 'the run had not started' };
+      : { stopped: false, detail: m.queuedPrompt !== null ? 'it was still waiting for its box to start or its project to be set up' : 'the run had not started' };
     console.log(`[ASK] message ${m.id} on thread ${m.threadId} (${targetOf(m)}) canceled by ${user.unixUsername}: ${stop.detail}`);
     const after = await loadMessage(m.id);
     return { status: 200, body: { ...messageView(after ?? m, m.thread, targetOf(m), null), stop } };
@@ -806,15 +886,17 @@ export const prismaCliAsk: CliAsk = {
     const projects = await prisma.project.findMany({
       where: {
         archived: false,
-        kind: 'normal',
-        instanceId: { not: null },
-        OR: [{ userId: user.id }, { shares: { some: { userId: user.id } } }],
+        kind: { in: WORK_PROJECT_KINDS },
+        // Owner-only: shared projects, and own projects on someone else's box, can't be asked.
+        userId: user.id,
+        instance: { userId: user.id },
       },
       select: {
         id: true, name: true, description: true, userId: true, setupStatus: true, setupError: true,
         user: { select: { unixUsername: true } },
         instance: { select: { id: true, name: true, status: true, hostHome: true, kind: true, userId: true } },
-        workstreams: { where: { archived: false }, select: { name: true }, orderBy: { createdAt: 'asc' } },
+        // An ask's own chat is not something to ask (services/askChat.ts).
+        workstreams: { where: { archived: false, askThread: null }, select: { name: true }, orderBy: { createdAt: 'asc' } },
       },
       orderBy: [{ instance: { name: 'asc' } }, { name: 'asc' }],
     });
@@ -828,7 +910,7 @@ export const prismaCliAsk: CliAsk = {
       const names = p.workstreams.length ? p.workstreams.map(w => w.name) : ['main'];
       return names.map(workstream => targetCard({
         projectId: p.id, box: box.name, project: p.name, workstream,
-        owner: p.user.unixUsername, shared: p.userId !== user.id, description,
+        owner: p.user.unixUsername, shared: false, description,
         boxStatus: box.status, connected: !!transport,
         capabilities: transport?.capabilities ?? [],
         wakes: !transport && shouldQueue(box, user.id, configured),

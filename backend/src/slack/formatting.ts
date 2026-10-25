@@ -24,20 +24,12 @@ I can help you with coding tasks by running Claude Code on the server.
 
 *Terminal Commands (\`/t\`):*
 • \`/t <command>\` - Send command to active project's agent
-• \`/t ctrl <command>\` - Send to control terminal
-• \`/t handoff [clear|compact|restart] [agent]\` - The agent writes a handoff, then starts fresh on it
-• \`/t work <name> <command>\` - Send to a work terminal
-• \`/t switch <project>\` - Change active project
-• \`/t projects\` - List all projects with status
-• \`/t ls\` - List all tmux sessions
 • \`/t\` - Show current agent terminal output
+• \`/t help\` - Every \`/t\` command; \`/t help <command>\` explains one
 
 *Session Commands:*
 • \`help\` - Show this message
-• \`status\` - Check your session info
 • \`new session\` - Clear context and start over
-• \`attach to <path>\` - Use a specific directory
-• \`follow this channel\` / \`unfollow\` - Auto-respond in channel
 
 _What would you like help with?_`;
 }

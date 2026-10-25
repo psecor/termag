@@ -8,7 +8,10 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { emitSpawnEvent } from './spawnMetrics';
 
-export type SpawnEventKind = 'requested' | 'refused' | 'created' | 'launched' | 'reported' | 'nudged' | 'failed' | 'ended';
+export type SpawnEventKind = 'requested' | 'refused' | 'created' | 'launched' | 'reported' | 'nudged' | 'failed' | 'ended'
+  | 'parked' | 'resumed' | 'retired' | 'retire_refused' | 'adopted' | 'orphaned'
+  /** A spawned agent's pane status changed (reason: working | waiting | idle | not_running), for replay. */
+  | 'status';
 
 export const SPAWN_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -26,8 +29,9 @@ export interface SpawnEventInput {
 }
 
 export async function recordSpawnEvent(e: SpawnEventInput): Promise<void> {
-  // The same event as OpenTelemetry signals (no-op without an exporter).
-  emitSpawnEvent(e);
+  // The same event as OpenTelemetry signals (no-op without an exporter). Not
+  // status changes: a few a turn per agent, and L3's traces carry them as span events.
+  if (e.kind !== 'status') emitSpawnEvent(e);
   await prisma.spawnEvent.create({
     data: {
       kind: e.kind,

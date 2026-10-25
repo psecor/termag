@@ -256,6 +256,72 @@ export function buildReviewPrompt(pr: number, url: string | null, body: string |
   return `${reviewPromptHeader(pr, cleanUrl)}\n${renderReviewTemplate(body ?? DEFAULT_REVIEW_TEMPLATE, pr, cleanUrl)}\n${reviewPromptFooter(reviewer)}\n`;
 }
 
+// ── A review group's review ──
+//
+// Review all with Devin: one reviewer session over the members of a review
+// group left to review, in the user's order, in one workstream's pane (the
+// pane is one per workstream, and the members usually share it). Its header
+// still opens "Review GitHub pull request #<first> (<url>)", so the launch
+// echo, the PR option and the review tab name the first member as for any
+// review.
+
+export const MAX_GROUP_REVIEW = 20;
+const GROUP_REPO = /^[\w.-]+\/[\w.-]+$/;
+
+export interface GroupReviewMember { repo: string; number: number; note: string | null }
+export interface GroupReview { name: string; members: GroupReviewMember[] }
+
+/** One line of the user's own text for the prompt: no control characters, squeezed, capped. */
+function promptLine(raw: string, max: number): string {
+  return raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+/** The group sent with POST /projects/:id/review; absent → null. */
+export function parseGroupReview(raw: unknown): { ok: true; group: GroupReview | null } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, group: null };
+  const r = raw as Record<string, unknown>;
+  if (typeof r !== 'object' || typeof r.name !== 'string' || !Array.isArray(r.members)) return { ok: false, error: 'group must be { name, members }' };
+  const name = promptLine(r.name, 80);
+  if (!name) return { ok: false, error: 'The group needs a name' };
+  if (r.members.length === 0) return { ok: false, error: 'The group has no pull requests to review' };
+  if (r.members.length > MAX_GROUP_REVIEW) return { ok: false, error: `At most ${MAX_GROUP_REVIEW} pull requests in one review` };
+  const members: GroupReviewMember[] = [];
+  const seen = new Set<string>();
+  for (const m of r.members as Record<string, unknown>[]) {
+    if (!m || typeof m.repo !== 'string' || !GROUP_REPO.test(m.repo) || m.repo.length > 200 || !isPrNumber(m.number)) {
+      return { ok: false, error: 'Each pull request needs repo (owner/name) and number' };
+    }
+    const key = `${m.repo.toLowerCase()}#${m.number}`;
+    if (seen.has(key)) return { ok: false, error: `${key} is in the group twice` };
+    seen.add(key);
+    const note = typeof m.note === 'string' ? promptLine(m.note, 200) || null : null;
+    members.push({ repo: m.repo, number: m.number as number, note });
+  }
+  return { ok: true, group: { name, members } };
+}
+
+/** The whole prompt of a group review: header on the first member, the ordered list, the instructions, the footer. */
+export function buildGroupReviewPrompt(group: GroupReview, reviewer = 'Devin'): string {
+  const [first] = group.members;
+  // As reviewRepo.ts prUrlFor, which imports this module.
+  const url = (m: GroupReviewMember) => `https://github.com/${m.repo}/pull/${m.number}`;
+  const list = group.members.map((m, i) => `${i + 1}. ${m.repo}#${m.number} (${url(m)})${m.note ? ` (note: ${m.note})` : ''}`);
+  return [
+    `Review GitHub pull request #${first.number} (${url(first)}) first, then the rest of the review group "${group.name}": these pull requests, in this order, as one piece of work.`,
+    '',
+    ...list,
+    '',
+    `Pass each pull request's own --repo to every gh command (gh pr view ${first.number} --repo ${first.repo}, gh pr diff ${first.number} --repo ${first.repo}): they can be in different repositories, and the current directory may be another one, or none.`,
+    'Read each with gh pr view and gh pr diff, in the order above, and read the surrounding code where a diff alone is not enough.',
+    'For each pull request, report correctness bugs, risky behaviour changes, security issues and missing tests, ordered by severity, each with a file and line reference and a one-line fix.',
+    'Then report what spans them: an interface one defines and another uses, the order they have to merge and deploy in, and anything one assumes that another does not do.',
+    'Finish with one short verdict per pull request: approve, approve with nits, or request changes.',
+    'Do not modify files, commit, push or post anything to GitHub.',
+    reviewPromptFooter(reviewer),
+    '',
+  ].join('\n');
+}
+
 const REVIEW_PROMPT_DIR = '.termag/review-prompts';
 const SAFE_SESSION = /^[\w.-]+$/;
 

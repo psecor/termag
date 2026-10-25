@@ -150,7 +150,7 @@ export async function adminCloudSessions(days = 7, now: Date = new Date(), recen
   const openOrders = rows.filter(r => !r.endedAt).map(r => r.orderId);
   const events = await prisma.claudeSessionEvent.findMany({
     where: { OR: [{ at: { gte: since } }, ...(openOrders.length ? [{ orderId: { in: openOrders } }] : [])] },
-    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, at: true, user: { select: { unixUsername: true } } },
+    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, code: true, at: true, user: { select: { unixUsername: true } } },
   });
   const ownerByKey = new Map<string, string>();
   const runs: RunInput[] = rows.map(r => {
@@ -164,7 +164,7 @@ export async function adminCloudSessions(days = 7, now: Date = new Date(), recen
   });
   const eventInputs: EventInput[] = events.map(e => {
     if (!ownerByKey.has(e.sessionId)) ownerByKey.set(e.sessionId, e.user.unixUsername);
-    return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, at: e.at };
+    return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, code: e.code, at: e.at };
   });
   const alive = await liveRuns(runs);
   const views = buildSessions(runs, eventInputs, alive);
@@ -472,7 +472,7 @@ export async function cloudSignalInput(now: Date = new Date()): Promise<CloudSig
   const orders = rows.map(r => r.orderId);
   const events = await prisma.claudeSessionEvent.findMany({
     where: { OR: [{ at: { gte: since } }, ...(orders.length ? [{ orderId: { in: orders } }] : [])] },
-    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, at: true, userId: true, user: { select: { unixUsername: true } } },
+    select: { sessionId: true, orderId: true, instanceId: true, kind: true, detail: true, code: true, at: true, userId: true, user: { select: { unixUsername: true } } },
   });
   const ownerByKey = new Map<string, { userId: string; owner: string }>();
   const lastCloudRunAt: Record<string, Date> = {};
@@ -488,7 +488,7 @@ export async function cloudSignalInput(now: Date = new Date()): Promise<CloudSig
   });
   const eventInputs: EventInput[] = events.map(e => {
     if (!ownerByKey.has(e.sessionId)) ownerByKey.set(e.sessionId, { userId: e.userId, owner: e.user.unixUsername });
-    return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, at: e.at };
+    return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, code: e.code, at: e.at };
   });
   const statuses = getAllStatuses();
   const views = buildSessions(runs, eventInputs, new Map());
@@ -520,15 +520,26 @@ export const LOST_REASON = RUN_LOST_REASON;
 
 // ── History ──────
 
-export const REFUSAL_CATEGORIES = ['github', 'agent-too-old', 'no-box', 'boxes-full', 'hook-gave-up', 'agent-failed', 'other'] as const;
+export const REFUSAL_CATEGORIES = ['github', 'agent-too-old', 'no-box', 'boxes-full', 'hook-gave-up', 'box-pending', 'box-blocked', 'agent-failed', 'other'] as const;
 export type RefusalCategory = typeof REFUSAL_CATEGORIES[number];
 
+/** The auto-box codes (REFUSAL_CODES): a box on its way, or one that cannot be got. */
+const CODE_CATEGORY: Record<string, RefusalCategory> = {
+  github: 'github', 'agent-too-old': 'agent-too-old', 'no-box': 'no-box', 'boxes-full': 'boxes-full', 'hook-gave-up': 'hook-gave-up',
+  'box-wait': 'box-pending', 'box-starting': 'box-pending', 'box-claimed': 'box-pending', 'box-provisioning': 'box-pending', 'box-on-its-way': 'box-pending',
+  'box-hold': 'box-blocked', 'box-start-failed': 'box-blocked', 'no-provisioning': 'box-blocked', 'box-creation-refused': 'box-blocked',
+  'agent-list-failed': 'agent-failed', 'agent-launch-failed': 'agent-failed',
+};
+
 /**
- * A refusal's category from the event's kind and the text the spawn route
- * wrote (REFUSAL_TEXTS): `agent-failed` by kind whatever its free text, the
- * `queued` texts by equality, boxes-full by prefix (it carries counts).
+ * A refusal's category: from the event's `code` when it has one
+ * (REFUSAL_CODES), else from its kind and the text the spawn route wrote
+ * (REFUSAL_TEXTS): `agent-failed` by kind whatever its free text, the
+ * `queued` texts by equality, boxes-full by prefix (it carries counts). The
+ * text path stays for rows from before the column.
  */
-export function refusalCategory(kind: string, detail: string | null): RefusalCategory {
+export function refusalCategory(kind: string, detail: string | null, code: string | null = null): RefusalCategory {
+  if (code && CODE_CATEGORY[code]) return CODE_CATEGORY[code];
   if (kind === 'agent-failed') return 'agent-failed';
   const d = detail ?? '';
   if (d === REFUSAL_TEXTS.github) return 'github';
@@ -594,7 +605,7 @@ export function percentiles(xs: number[]): Percentiles {
 
 /** The pure half of cloudReport(): grouping and aggregation over the rows the query fetched. */
 export interface ReportRunRow { orderId: string; sessionId: string | null; userId: string; owner: string; instanceId: string; boxName: string; clientPlatform: string | null; startedAt: Date; endedAt: Date | null; exitReason: string | null; /** The run's posted token total, 0 until it posts (S4). */ tokens: number }
-export interface ReportEventRow { sessionId: string; orderId: string; userId: string; owner: string; instanceId: string | null; kind: string; detail: string | null; at: Date }
+export interface ReportEventRow { sessionId: string; orderId: string; userId: string; owner: string; instanceId: string | null; kind: string; detail: string | null; code?: string | null; at: Date }
 
 /**
  * How far before a range the event log is read, so a queue streak that began
@@ -693,7 +704,7 @@ export function buildCloudReport(runs: ReportRunRow[], events: ReportEventRow[],
   const refusals: Record<string, number> = {};
   for (const e of events) {
     if (!REFUSAL_KINDS.has(e.kind) || !inRange(e.at, since, until)) continue;
-    const cat = refusalCategory(e.kind, e.detail);
+    const cat = refusalCategory(e.kind, e.detail, e.code ?? null);
     bump(refusals, cat); bump(total.refusals, cat);
     const g = groupOfEvent(e);
     if (g) bump(acc(g[0], g[1]).refusals, cat);
@@ -763,7 +774,7 @@ export async function cloudReport(range: Range, groupBy: ReportGroup, now: Date 
     prisma.claudeRunnerSession.findMany({ where: overlapping(priorSince, range.sinceTs), select: reportRunSelect }),
     prisma.claudeSessionEvent.findMany({
       where: { at: { gte: new Date(range.sinceTs.getTime() - EVENT_LOOKBACK_MS), lt: range.untilTs } },
-      select: { sessionId: true, orderId: true, userId: true, instanceId: true, kind: true, detail: true, at: true, user: { select: { unixUsername: true } } },
+      select: { sessionId: true, orderId: true, userId: true, instanceId: true, kind: true, detail: true, code: true, at: true, user: { select: { unixUsername: true } } },
     }),
   ]);
   const toRun = (r: typeof runRows[number]): ReportRunRow => ({
@@ -771,7 +782,7 @@ export async function cloudReport(range: Range, groupBy: ReportGroup, now: Date 
     clientPlatform: r.clientPlatform, startedAt: r.startedAt, endedAt: r.endedAt, exitReason: r.exitReason,
     tokens: Number((r.inputTokens ?? 0n) + (r.outputTokens ?? 0n) + (r.cacheReadTokens ?? 0n) + (r.cacheCreateTokens ?? 0n)),
   });
-  const events: ReportEventRow[] = eventRows.map(e => ({ sessionId: e.sessionId, orderId: e.orderId, userId: e.userId, owner: e.user.unixUsername, instanceId: e.instanceId, kind: e.kind, detail: e.detail, at: e.at }));
+  const events: ReportEventRow[] = eventRows.map(e => ({ sessionId: e.sessionId, orderId: e.orderId, userId: e.userId, owner: e.user.unixUsername, instanceId: e.instanceId, kind: e.kind, detail: e.detail, code: e.code, at: e.at }));
   return buildCloudReport(runRows.map(toRun), events, priorRows.map(toRun), range, groupBy, now);
 }
 

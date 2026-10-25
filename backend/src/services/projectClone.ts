@@ -26,6 +26,7 @@ import {
 } from './agentRegistry';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider } from './agentRuntime';
 import { hasGithubCredential } from './boxCreationGate';
+import { deliversGithub } from './credentialDelivery';
 import { isManagedBox } from './instanceLifecycle';
 import { shouldWaitForPaneCheckout, waitForPaneCheckout } from './paneCheckout';
 import { resolveProjectRoot } from './projectPaths';
@@ -134,7 +135,7 @@ async function waitForPaneDelivery(target: SetupTarget, event: SetupEvent): Prom
   const settled = await waitForPaneCheckout(() => prisma.instance.findUnique({
     where: { id: row.instanceId },
     select: { githubDeliveredAt: true, onClaimStatus: true },
-  }));
+  }), { expectGithub: deliversGithub() });
   if (settled === 'timeout') {
     console.warn(`[CLONE] ${row.id}: pane checkout proceeded before GitHub delivery settled`);
   }

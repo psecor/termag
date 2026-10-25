@@ -61,6 +61,7 @@ describe('isBuildFilePath', () => {
   it('names build files, not client routes', () => {
     expect(isBuildFilePath('/assets/x.js')).toBe(true);
     expect(isBuildFilePath('/x.css.map')).toBe(true);
+    expect(isBuildFilePath('/speech/models/onnx-community/whisper-base/config.json')).toBe(true);
     expect(isBuildFilePath('/projects/assets')).toBe(false);
     expect(isBuildFilePath('/projects/my.app')).toBe(false);
   });

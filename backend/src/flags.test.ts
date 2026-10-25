@@ -54,7 +54,7 @@ describe('flag registry', () => {
       // the constant's declaration alone is not one.
       const names = [...backendText.matchAll(new RegExp(`const (\\w+)\\s*=\\s*['"\`]${key}['"\`]`, 'g'))].map((m) => m[1]);
       const arg = [`['"\`]${key}['"\`]`, ...names.map((n) => `${n}\\b`)].join('|');
-      const read = new RegExp(`(?:boolVariation|boolVariationForContext|stringVariation|jsonVariation)\\(\\s*(?:${arg})`).test(backendText);
+      const read = new RegExp(`(?:boolVariation|boolVariationForContext|stringVariation|numberVariationForContext|jsonVariation)\\(\\s*(?:${arg})`).test(backendText);
       const listed = FLAG_REGISTRY[key].server.length > 0;
       expect(read, `${key}: server is ${JSON.stringify(FLAG_REGISTRY[key].server)}, but backend/src ${read ? 'reads' : 'never reads'} it`).toBe(listed);
     }

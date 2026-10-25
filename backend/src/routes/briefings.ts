@@ -3,6 +3,7 @@ import { prisma } from '../db';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { buildLedger } from '../services/briefing/ledger';
+import { DismissInputError, parseDismissInput, prismaDismissals, type DismissalStore } from '../services/briefing/dismissals';
 import { LEDGER_CACHE_LIVE_TTL_MS, LEDGER_CACHE_TTL_MS, cachedLedger, ledgerCacheKey } from '../services/briefing/ledgerCache';
 import { ledgerIndex, ledgerSession } from '../services/briefing/ledgerView';
 import { briefingJob } from '../services/briefing/prompt';
@@ -17,7 +18,10 @@ import type { BriefingWindow, Ledger } from '../services/briefing/types';
 //
 //   GET  /ledger          the ledger's index; ?projectId=&workstream= one session in full;
 //                         ?view=full all of it (cookie or agent token; MCP activity_ledger)
-//   GET  /latest          newest done briefing + a newer unfinished one (MCP latest_briefing)
+//   GET  /latest          newest done briefing + a newer unfinished one + the user's
+//                         Done/Defer marks (MCP latest_briefing)
+//   PUT  /dismissals      Done or Defer a day on an item ({ key, action })     (cookie)
+//   DELETE /dismissals?key=  bring it back
 //   GET  /                history
 //   GET  /:id             one briefing
 //   POST /run             start one now                           (cookie)
@@ -46,7 +50,7 @@ export function pruneLedgerCalls(calls: Map<string, number>, now: number): void 
   for (const [k, at] of calls) if (now - at >= LEDGER_MIN_INTERVAL_MS) calls.delete(k);
 }
 
-export function briefingsRouter(): Router {
+export function briefingsRouter(dismissals: DismissalStore = prismaDismissals): Router {
   const router = Router();
 
   const ledger: RequestHandler = async (req, res) => {
@@ -100,7 +104,26 @@ export function briefingsRouter(): Router {
   };
 
   const latest: RequestHandler = async (req, res) => {
-    res.json(await latestFor(req.user!.id));
+    const userId = req.user!.id;
+    // A failed read of the marks still answers the briefing, with nothing hidden.
+    const [views, marks] = await Promise.all([latestFor(userId), dismissals.list(userId, new Date()).catch(() => [])]);
+    res.json({ ...views, dismissals: marks });
+  };
+
+  const dismiss: RequestHandler = async (req, res) => {
+    let input;
+    try { input = parseDismissInput(req.body); } catch (err) {
+      if (err instanceof DismissInputError) { res.status(400).json({ error: err.message }); return; }
+      throw err;
+    }
+    res.json(await dismissals.dismiss(req.user!.id, input, new Date()));
+  };
+
+  const restore: RequestHandler = async (req, res) => {
+    const key = queryString(req.query.key);
+    if (!key || key.length > 300) { res.status(400).json({ error: 'key is required' }); return; }
+    await dismissals.restore(req.user!.id, key);
+    res.status(204).end();
   };
 
   const list: RequestHandler = async (req, res) => {
@@ -155,6 +178,8 @@ export function briefingsRouter(): Router {
   router.get('/latest', requireAuthOrAgentToken, asyncHandler(latest));
   router.get('/schedule', requireAuth, asyncHandler(getSchedule));
   router.put('/schedule', requireAuth, asyncHandler(putSchedule));
+  router.put('/dismissals', requireAuth, asyncHandler(dismiss));
+  router.delete('/dismissals', requireAuth, asyncHandler(restore));
   router.post('/run', requireAuth, asyncHandler(run));
   router.get('/', requireAuth, asyncHandler(list));
   router.get('/:id/job', requireAuthOrAgentToken, asyncHandler(job));

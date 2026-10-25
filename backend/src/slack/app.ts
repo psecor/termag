@@ -9,6 +9,8 @@
 const { App } = require('@slack/bolt');
 
 import { registerEventHandlers } from './events';
+import { describeSlackGate } from './access';
+import { loadActiveTargetsOrRetry } from './activeTargets';
 
 let slackApp: any = null;
 
@@ -37,9 +39,12 @@ export async function startSlackApp(app: any): Promise<boolean> {
     return false;
   }
 
+  // Before connecting, so the first /t already sees everyone's saved target.
+  await loadActiveTargetsOrRetry('SLACK');
   try {
     await app.start();
     console.log('[SLACK] Bot running in Socket Mode');
+    console.log(`[SLACK] Who may use the bot: ${describeSlackGate()}`);
     return true;
   } catch (error) {
     console.error('[SLACK] Failed to start:', (error as Error).message);

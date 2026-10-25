@@ -61,7 +61,7 @@ export interface SessionAccess {
   role: SessionRole;
   workstream: string;
   isOwner: boolean;
-  project: { id: string; name: string; userId: string; instanceId: string | null; ownerUsername: string };
+  project: { id: string; name: string; userId: string; instanceId: string | null; ownerUsername: string; setupStatus: string };
 }
 
 export async function assertSessionAccess(
@@ -120,7 +120,44 @@ export async function projectSessionAccess(
       project: {
         id: project.id, name: project.name, userId: project.userId,
         instanceId: project.instanceId, ownerUsername: project.user.unixUsername,
+        setupStatus: project.setupStatus,
       },
     };
   };
+}
+
+/** Why the terminal socket refused an attach: its close reason, which the TUI treats as final. */
+export type TerminalRefusal = 'session forbidden' | 'session/project mismatch';
+
+/**
+ * The terminal socket's check (index.ts): the caller may reach the project,
+ * and `session` is one of the names rebuilt for one of its roles in a
+ * workstream it has. The session string comes from the client, so it is only
+ * compared, never parsed or passed on unchecked: tmux reads `-t` as an exact
+ * name, then a prefix, then an fnmatch pattern, and `alice-myproj-secret?ctrl`
+ * attaches alice-myproj-secret-ctrl. The workstream is checked too, because
+ * `myproj` + workstream `secret` builds the same name as project
+ * `myproj-secret`.
+ */
+export async function terminalSessionAccess(
+  requesterId: string,
+  projectId: string,
+  session: string,
+  workstream: string = 'main',
+): Promise<SessionAccess | { refusal: TerminalRefusal }> {
+  let forPane: Awaited<ReturnType<typeof projectSessionAccess>>;
+  try {
+    forPane = await projectSessionAccess(requesterId, projectId);
+  } catch (err) {
+    if (err instanceof SessionAccessError) return { refusal: 'session forbidden' };
+    throw err;
+  }
+  try {
+    return SESSION_ROLES.map(role => forPane(role, workstream)).find(a => a.session === session)
+      ?? { refusal: 'session/project mismatch' };
+  } catch (err) {
+    // A workstream the project does not have.
+    if (err instanceof SessionAccessError) return { refusal: 'session/project mismatch' };
+    throw err;
+  }
 }

@@ -4,12 +4,12 @@ import { planUnarchiveLaunches } from './unarchive';
 describe('planUnarchiveLaunches', () => {
   it('creates an agent workflow when none exists and the caller asked for one', () => {
     expect(planUnarchiveLaunches({ existingWorkflows: [], initialAgentEnabled: true }))
-      .toEqual({ createAgentWorkflow: true, relaunch: [] });
+      .toEqual({ createAgentWorkflow: true, relaunch: [], restoreAgents: [] });
   });
 
   it('does nothing for an empty project when no initial agent was requested', () => {
     expect(planUnarchiveLaunches({ existingWorkflows: [], initialAgentEnabled: false }))
-      .toEqual({ createAgentWorkflow: false, relaunch: [] });
+      .toEqual({ createAgentWorkflow: false, relaunch: [], restoreAgents: [] });
   });
 
   it('relaunches an existing agent workflow instead of creating a second one', () => {
@@ -18,13 +18,13 @@ describe('planUnarchiveLaunches', () => {
     // new box and the terminal showed tmux's "no sessions".
     const agent = { type: 'agent', provider: 'claude', workstream: 'main' };
     expect(planUnarchiveLaunches({ existingWorkflows: [agent], initialAgentEnabled: true }))
-      .toEqual({ createAgentWorkflow: false, relaunch: [agent] });
+      .toEqual({ createAgentWorkflow: false, relaunch: [agent], restoreAgents: [] });
   });
 
   it('relaunches existing workflows even when no initial agent was requested', () => {
     const agent = { type: 'agent', provider: 'codex', workstream: 'main' };
     expect(planUnarchiveLaunches({ existingWorkflows: [agent], initialAgentEnabled: false }))
-      .toEqual({ createAgentWorkflow: false, relaunch: [agent] });
+      .toEqual({ createAgentWorkflow: false, relaunch: [agent], restoreAgents: [] });
   });
 
   it('relaunches every workstream, agent workflows first, keeping data workflows', () => {
@@ -42,6 +42,36 @@ describe('planUnarchiveLaunches', () => {
   it('still creates an agent workflow when only data workflows exist', () => {
     const dataMain = { type: 'data', provider: null, workstream: 'main' };
     expect(planUnarchiveLaunches({ existingWorkflows: [dataMain], initialAgentEnabled: true }))
-      .toEqual({ createAgentWorkflow: true, relaunch: [dataMain] });
+      .toEqual({ createAgentWorkflow: true, relaunch: [dataMain], restoreAgents: [] });
+  });
+
+  it('gives every live non-main workstream without an agent its agent back, on the same box', () => {
+    // 2026-10-19: archiving termag by mistake and re-creating it brought back
+    // 25 workstreams with no agent, so their rows showed no status at all.
+    const agentMain = { type: 'agent', provider: 'claude', workstream: 'main' };
+    const agentKept = { type: 'agent', provider: 'cursor', workstream: 'kept' };
+    const plan = planUnarchiveLaunches({
+      existingWorkflows: [agentMain, agentKept],
+      initialAgentEnabled: true,
+      workstreams: ['main', 'kept', 'feature-a', 'feature-b'],
+      sameBox: true,
+    });
+    expect(plan.restoreAgents).toEqual(['feature-a', 'feature-b']);
+    expect(plan.relaunch).toEqual([agentMain, agentKept]);
+  });
+
+  it('leaves main to the initial-agent choice, even with no workflows at all', () => {
+    const plan = planUnarchiveLaunches({
+      existingWorkflows: [], initialAgentEnabled: false, workstreams: ['main', 'feature-a'], sameBox: true,
+    });
+    expect(plan).toEqual({ createAgentWorkflow: false, relaunch: [], restoreAgents: ['feature-a'] });
+  });
+
+  it('restores no workstream agents when the project moves to another box', () => {
+    // The worktrees live on the old box; launching there would git-init empty folders.
+    const plan = planUnarchiveLaunches({
+      existingWorkflows: [], initialAgentEnabled: true, workstreams: ['main', 'feature-a'], sameBox: false,
+    });
+    expect(plan.restoreAgents).toEqual([]);
   });
 });

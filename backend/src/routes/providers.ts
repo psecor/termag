@@ -1,6 +1,8 @@
 import { Router, RequestHandler } from 'express';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { PROVIDERS, SELECTABLE_PROVIDER_IDS } from '../providers/registry';
+import { fireworksOfferedTo } from '../services/fireworksFlag';
+import { backendChoices } from '../services/modelChoices';
 
 /**
  * GET /api/providers — the agent providers a client may offer in a picker.
@@ -21,5 +23,15 @@ export function providersRouter(): Router {
     });
   };
   router.get('/', requireAuthOrAgentToken, list);
+
+  // GET /api/providers/models — per harness, the model backends this viewer
+  // may pick and each one's models (services/modelChoices.ts).
+  // Fireworks only on an orchestrator with the gateway
+  // route and while fireworks-enabled is on for them, with their
+  // fireworks-models list, which the gateway's check also reads.
+  const models: RequestHandler = async (req, res) => {
+    res.json({ providers: backendChoices(await fireworksOfferedTo(req.user!)) });
+  };
+  router.get('/models', requireAuthOrAgentToken, models);
   return router;
 }

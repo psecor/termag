@@ -7,6 +7,11 @@
  *   POST /api/spawns/report   a spawned agent reports its state
  *   GET  /api/spawns/budget   the limits, usage and hints for the caller (spawn_budget)
  *   GET  /api/spawns/usage    the dashboard's Spawned agents section (usageFor)
+ *   GET  /api/spawns/parents  which session started each live child (parentsFor; the simple UI's explorer)
+ *   POST /api/spawns/:id/dismiss  park or retire a child (dismissFor)
+ *   POST /api/spawns/:id/resume   bring a parked child back (owner only)
+ *   POST /api/spawns/:id/adopt    take an orphan as foster parent (adoptFor; "Orphans")
+ *   PUT  /api/spawns/orphan-home  where orphans go when no ancestor is alive (owner only)
  *
  * Box token or browser session (requireAuthOrAgentToken). Access is the
  * token's user throughout: the parent session the MCP server names is used
@@ -17,6 +22,7 @@
  * spawn_events.
  */
 import { Router } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
@@ -35,9 +41,14 @@ import {
 import { isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
 import { boolVariation } from '../services/featureFlags';
 import { BOX_SELECT, buildBudget, readings, spawnLimitsFor, userBoxReadings } from '../services/spawnBudget';
-import { buildSpawnTrees, tokensBySpawn } from '../services/spawnTrees';
+import { buildSpawnTrees, tokensBySpawn, treeTotals } from '../services/spawnTrees';
+import { checkoutCheck, parkSpawn, resumeSpawn, retireSpawn } from '../services/spawnActions';
+import { lifecycleLabel } from '../services/spawnLifecycle';
+import { adoptSpawn } from '../services/spawnOrphanSweep';
+import { effectiveParent, parseOrphanHome } from '../services/spawnOrphans';
 import { recordSpawnEvent } from '../services/spawnEvents';
-import { boxHeat, boxHints, boxRefusal, limitRefusal, suggestBox, type BoxReading, type Budget, type SpawnLimits } from '../services/spawnLimits';
+import { watchSpawnedSession } from '../services/spawnStatusLog';
+import { boxHeat, boxHints, boxRefusal, limitRefusal, rebudget, suggestBox, type BoxReading, type Budget, type SpawnLimits } from '../services/spawnLimits';
 import { powerStateError } from '../services/boxPowerPolicy';
 import { resolveProjectRoot } from '../services/projectPaths';
 import { isAmbiguousSession, resolveSessionProject } from '../services/sessionResolver';
@@ -255,6 +266,8 @@ async function recordAndWriteBrief(
       childProjectName: child.projectName,
       childWorkstream: child.workstream,
       childInstanceId: child.instanceId,
+      // A commit id only: a branch name moves, and the retire check needs where it started.
+      baseSha: child.baseRef && /^[0-9a-f]{7,40}$/.test(child.baseRef) ? child.baseRef : null,
       provider,
       title: taskTitle(req.task),
       brief,
@@ -265,6 +278,11 @@ async function recordAndWriteBrief(
   });
   // A root is its own tree.
   if (!lineage.rootSpawnId) await prisma.agentSpawn.update({ where: { id: row.id }, data: { rootSpawnId: row.id } });
+  // Its status history starts now, not at the sweep's next refresh: its first turn is often over by then.
+  watchSpawnedSession({
+    spawnId: row.id, userId: user.id, rootSpawnId: lineage.rootSpawnId ?? row.id, instanceId: child.instanceId,
+    session: tmux.sessionName(user.unixUsername, child.projectName, 'agent', child.workstream),
+  });
   await recordSpawnEvent({
     kind: 'created', spawnId: row.id, rootSpawnId: lineage.rootSpawnId ?? row.id, userId: user.id, instanceId: child.instanceId,
     parentProjectId: caller?.projectId ?? null, parentWorkstream: caller?.workstream ?? null,
@@ -429,8 +447,9 @@ async function created(
       session,
       instanceId,
       launched,
-      // As admitted, so counting this spawn: one more this hour and running.
-      budget: { ...budget, used: { ...budget.used, lastHour: budget.used.lastHour + 1, running: budget.used.running + 1, openHere: budget.used.openHere === null ? null : budget.used.openHere + 1 } },
+      // As admitted, so counting this spawn: one more this hour and running,
+      // with the near-limit hint for those counts.
+      budget: rebudget(budget),
       ...(notes.length ? { warnings: notes } : {}),
     },
   };
@@ -457,6 +476,12 @@ function spawnView(user: Express.User, s: SpawnRow) {
     parent: s.parentSession
       ? { projectId: s.parentProjectId, workstream: s.parentWorkstream, session: s.parentSession }
       : null,
+    // Who takes its reports when its parent went away.
+    // An orphan's foster went away too: it is shown as orphaned, not as adopted.
+    foster: s.fosterProjectId && !s.orphanedAt
+      ? { projectId: s.fosterProjectId, workstream: s.fosterWorkstream ?? 'main', by: s.adoptedBy, at: s.adoptedAt }
+      : null,
+    orphanedAt: s.orphanedAt,
     report: s.report,
     error: s.error,
     createdAt: s.createdAt,
@@ -465,6 +490,10 @@ function spawnView(user: Express.User, s: SpawnRow) {
     nudgedAt: s.nudgedAt,
     rootSpawnId: s.rootSpawnId,
     endedAt: s.endedAt,
+    parkedAt: s.parkedAt,
+    retiredAt: s.retiredAt,
+    keptReason: s.keptReason,
+    lifecycle: lifecycleLabel(s),
   };
 }
 
@@ -474,9 +503,18 @@ export async function listSpawnsFor(user: Express.User, callerInstanceId: string
     const found = await resolveCaller(user, session, callerInstanceId);
     if (!found.ok) return found.result;
     const c = found.value;
-    const [children, parent] = await Promise.all([
+    const [children, parent, orphans] = await Promise.all([
       prisma.agentSpawn.findMany({
-        where: { userId: user.id, parentProjectId: c.projectId, parentWorkstream: c.workstream },
+        // Its own children, less any fostered elsewhere, plus those it adopted.
+        // Orphans are listed once, under orphans.
+        where: {
+          userId: user.id,
+          orphanedAt: null,
+          OR: [
+            { parentProjectId: c.projectId, parentWorkstream: c.workstream, fosterProjectId: null },
+            { fosterProjectId: c.projectId, fosterWorkstream: c.workstream },
+          ],
+        },
         orderBy: { createdAt: 'desc' },
         take: 50,
       }),
@@ -484,10 +522,21 @@ export async function listSpawnsFor(user: Express.User, callerInstanceId: string
         where: { userId: user.id, childProjectId: c.projectId, childWorkstream: c.workstream },
         orderBy: { createdAt: 'desc' },
       }),
+      // The user's orphans nobody adopted, so an agent can take one (adopt_spawn).
+      prisma.agentSpawn.findMany({ where: { userId: user.id, orphanedAt: { not: null }, retiredAt: null }, orderBy: { orphanedAt: 'desc' }, take: 20 }),
     ]);
     const lineage = await lineageOf(user.id, c);
     const budget = await buildBudget(user, { projectId: c.projectId, workstream: c.workstream }, lineage.depth, c.instanceId);
-    return { status: 200, body: { session, children: children.map(s => spawnView(user, s)), spawnedBy: parent ? spawnView(user, parent) : null, budget } };
+    return {
+      status: 200,
+      body: {
+        session, children: children.map(s => spawnView(user, s)), spawnedBy: parent ? spawnView(user, parent) : null, budget,
+        // Its own project and workstream: its children's stored parent session is stale after a rename.
+        caller: { projectId: c.projectId, workstream: c.workstream },
+        // Not their reports: those are for whoever adopts them.
+        orphans: orphans.map(s => ({ ...spawnView(user, s), report: s.report ? { status: (s.report as { status?: unknown }).status } : null })),
+      },
+    };
   }
   const rows = await prisma.agentSpawn.findMany({
     where: { userId: user.id, createdAt: { gte: new Date(Date.now() - 7 * 24 * HOUR_MS) } },
@@ -495,6 +544,117 @@ export async function listSpawnsFor(user: Express.User, callerInstanceId: string
     take: 50,
   });
   return { status: 200, body: { children: rows.map(s => spawnView(user, s)), spawnedBy: null } };
+}
+
+/**
+ * Park or retire one spawn early. The owner may, in
+ * the browser; an agent token may only for its own children, from its own
+ * agent pane. A retire still has to pass the check that nothing would be
+ * lost; it just does not wait for the work to land.
+ */
+export async function dismissFor(user: Express.User, callerInstanceId: string | null | undefined, spawnId: string, raw: unknown): Promise<RouteResult> {
+  const body = (raw && typeof raw === 'object' ? raw : {}) as { action?: unknown; session?: unknown };
+  const action = body.action;
+  if (action !== 'park' && action !== 'retire') return { status: 400, body: { error: 'action must be park or retire', code: 'invalid' } };
+  const s = await prisma.agentSpawn.findFirst({ where: { id: spawnId, userId: user.id } });
+  if (!s) return { status: 404, body: { error: 'spawn not found', code: 'not_found' } };
+  // Finished or parked only: a running child is working, and a blocked or
+  // needs_input one is waiting on someone.
+  if (s.state !== 'done' && !s.parkedAt) {
+    return { status: 409, body: { error: `it is still ${s.state.replace(/_/g, ' ')}: dismiss a child once it has reported done`, code: 'not_finished' } };
+  }
+  let by: 'owner' | 'parent' = 'owner';
+  if (callerInstanceId !== undefined) {
+    if (typeof body.session !== 'string' || !body.session) return { status: 400, body: { error: 'session required: an agent dismisses from its own pane', code: 'no_pane' } };
+    const found = await resolveCaller(user, body.session, callerInstanceId);
+    if (!found.ok) return found.result;
+    const c = found.value;
+    // Its foster, once one adopted it, in place of the original parent.
+    const to = effectiveParent(s);
+    if (c.role !== 'agent' || !to || c.projectId !== to.projectId || c.workstream !== to.workstream) {
+      return { status: 403, body: { error: 'only the agent it reports to (or its owner) can dismiss it', code: 'not_parent' } };
+    }
+    by = 'parent';
+  }
+  if (action === 'park') {
+    const r = await parkSpawn(s, by);
+    return r.ok ? { status: 200, body: { ok: true, spawn: s.id, lifecycle: 'parked', note: r.detail ?? 'its agent CLI is stopped; the worktree and conversation are kept' } } : { status: r.status, body: { error: r.error } };
+  }
+  const r = await retireSpawn(s, by, await checkoutCheck(s));
+  return r.ok ? { status: 200, body: { ok: true, spawn: s.id, lifecycle: 'retired', note: r.detail ?? 'its workstream is removed; anything pushed stays on origin' } } : { status: r.status, body: { error: r.error, code: r.status === 409 ? 'kept' : undefined } };
+}
+
+/** Bring a parked spawn back on its conversation. Owner only, in the browser. */
+export async function resumeFor(user: Express.User, callerInstanceId: string | null | undefined, spawnId: string): Promise<RouteResult> {
+  if (callerInstanceId !== undefined) return { status: 403, body: { error: 'resume is the owner\'s, from the dashboard', code: 'forbidden' } };
+  const s = await prisma.agentSpawn.findFirst({ where: { id: spawnId, userId: user.id } });
+  if (!s) return { status: 404, body: { error: 'spawn not found', code: 'not_found' } };
+  const r = await resumeSpawn(s);
+  return r.ok ? { status: 200, body: { ok: true, spawn: s.id, note: r.detail ?? 'started again on its conversation' } } : { status: r.status, body: { error: r.error } };
+}
+
+/**
+ * Take a spawn as its foster parent. An
+ * agent token, from its own agent pane, may take an orphan nobody adopted;
+ * the owner, in the browser, may move any unretired spawn to one of their
+ * own sessions ({projectId, workstream}).
+ */
+export async function adoptFor(user: Express.User, callerInstanceId: string | null | undefined, spawnId: string, raw: unknown): Promise<RouteResult> {
+  const body = (raw && typeof raw === 'object' ? raw : {}) as { session?: unknown; projectId?: unknown; workstream?: unknown };
+  const s = await prisma.agentSpawn.findFirst({ where: { id: spawnId, userId: user.id } });
+  if (!s) return { status: 404, body: { error: 'spawn not found', code: 'not_found' } };
+  if (s.retiredAt) return { status: 409, body: { error: 'it is retired: nothing left to adopt', code: 'retired' } };
+  let to: { projectId: string; workstream: string; label: string };
+  let by: 'agent' | 'owner';
+  if (callerInstanceId !== undefined) {
+    if (typeof body.session !== 'string' || !body.session) return { status: 400, body: { error: 'session required: an agent adopts from its own pane', code: 'no_pane' } };
+    const found = await resolveCaller(user, body.session, callerInstanceId);
+    if (!found.ok) return found.result;
+    const c = found.value;
+    if (c.role !== 'agent') return { status: 403, body: { error: 'only an agent pane can adopt', code: 'not_agent' } };
+    if (!s.orphanedAt) return { status: 409, body: { error: 'it is not an orphan: its parent (or a foster) still takes its reports', code: 'not_orphan' } };
+    to = { projectId: c.projectId, workstream: c.workstream, label: c.session };
+    by = 'agent';
+  } else {
+    const target = await ownSession(user, body.projectId, body.workstream);
+    if (!target.ok) return target.result;
+    to = target.value;
+    by = 'owner';
+  }
+  if (to.projectId === s.childProjectId && to.workstream === s.childWorkstream) {
+    return { status: 400, body: { error: 'a spawn cannot adopt itself', code: 'invalid' } };
+  }
+  const r = await adoptSpawn(s, { projectId: to.projectId, workstream: to.workstream, role: 'agent' }, by);
+  if (!r.ok) return { status: 409, body: { error: 'it changed hands meanwhile: list it again', code: 'conflict' } };
+  return { status: 200, body: { ok: true, spawn: s.id, foster: to.label, note: s.reportedAt && !s.nudgedAt ? 'its unread report is announced to the foster when that pane is next idle' : 'its reports now come to the foster' } };
+}
+
+/** One of the user's own live sessions, by project and workstream ('main' by default). */
+async function ownSession(user: Express.User, projectId: unknown, workstream: unknown): Promise<Found<{ projectId: string; workstream: string; label: string }>> {
+  if (typeof projectId !== 'string' || !projectId) return { ok: false, result: { status: 400, body: { error: 'projectId required', code: 'invalid' } } };
+  const ws = typeof workstream === 'string' && workstream ? workstream : 'main';
+  const p = await prisma.project.findFirst({
+    where: { id: projectId, userId: user.id, archived: false },
+    select: { id: true, name: true, workstreams: { where: { name: ws, archived: false }, select: { name: true } } },
+  });
+  if (!p) return { ok: false, result: { status: 404, body: { error: 'project not found', code: 'not_found' } } };
+  if (ws !== 'main' && !p.workstreams.length) return { ok: false, result: { status: 404, body: { error: `no workstream ${ws} in ${p.name}`, code: 'not_found' } } };
+  return { ok: true, value: { projectId: p.id, workstream: ws, label: ws === 'main' ? p.name : `${p.name}/${ws}` } };
+}
+
+/** Set or clear the orphan home: {projectId, workstream} or {projectId: null}. Owner only. */
+export async function orphanHomeFor(user: Express.User, callerInstanceId: string | null | undefined, raw: unknown): Promise<RouteResult> {
+  if (callerInstanceId !== undefined) return { status: 403, body: { error: 'the orphan home is the owner\'s setting, in the browser', code: 'forbidden' } };
+  const body = (raw && typeof raw === 'object' ? raw : {}) as { projectId?: unknown; workstream?: unknown };
+  if (body.projectId === null) {
+    await prisma.user.update({ where: { id: user.id }, data: { spawnOrphanHome: Prisma.DbNull } });
+    return { status: 200, body: { ok: true, orphanHome: null } };
+  }
+  const target = await ownSession(user, body.projectId, body.workstream);
+  if (!target.ok) return target.result;
+  const home = { projectId: target.value.projectId, workstream: target.value.workstream };
+  await prisma.user.update({ where: { id: user.id }, data: { spawnOrphanHome: home } });
+  return { status: 200, body: { ok: true, orphanHome: { ...home, label: target.value.label } } };
 }
 
 /** The caller's limits, usage and hints: spawn_budget, and the dashboard later. */
@@ -512,7 +672,7 @@ const SAMPLE_HOURS = 24;
 export async function usageFor(user: Express.User): Promise<RouteResult> {
   const now = Date.now();
   const since = new Date(now - USAGE_DAYS * 24 * HOUR_MS);
-  const [recent, running, refusals, boxRows, budget] = await Promise.all([
+  const [recent, running, refusals, boxRows, budget, orphanRows, homeRow, projects] = await Promise.all([
     prisma.agentSpawn.findMany({ where: { userId: user.id, createdAt: { gte: since } }, orderBy: { createdAt: 'desc' }, take: 300 }),
     // A still-running tree shows however old it is: its own query, so a busy
     // week of newer spawns cannot crowd it out.
@@ -520,7 +680,23 @@ export async function usageFor(user: Express.User): Promise<RouteResult> {
     prisma.spawnEvent.groupBy({ by: ['reason'], where: { userId: user.id, kind: 'refused', at: { gte: since } }, _count: { _all: true } }),
     prisma.instance.findMany({ where: { userId: user.id, status: 'ready' }, select: BOX_SELECT, orderBy: { name: 'asc' } }),
     buildBudget(user, null, 0, null, now),
+    // Orphans nobody adopted, however old: they wait here for someone.
+    prisma.agentSpawn.findMany({ where: { userId: user.id, orphanedAt: { not: null }, retiredAt: null }, orderBy: { orphanedAt: 'desc' }, take: 50 }),
+    prisma.user.findUnique({ where: { id: user.id }, select: { spawnOrphanHome: true } }),
+    // The sessions an orphan can be adopted into, and the orphan home picked from.
+    prisma.project.findMany({
+      where: { userId: user.id, archived: false },
+      select: { id: true, name: true, workstreams: { where: { archived: false }, select: { name: true }, orderBy: { name: 'asc' } } },
+      orderBy: { name: 'asc' },
+      take: 200,
+    }),
   ]);
+  const sessions = projects.flatMap(p => [
+    { projectId: p.id, workstream: 'main', label: p.name },
+    ...p.workstreams.filter(w => w.name !== 'main').map(w => ({ projectId: p.id, workstream: w.name, label: `${p.name}/${w.name}` })),
+  ]);
+  const home = parseOrphanHome(homeRow?.spawnOrphanHome);
+  const homeLabel = home ? sessions.find(x => x.projectId === home.projectId && x.workstream === home.workstream)?.label ?? null : null;
 
   const rows = [...new Map([...recent, ...running].map(r => [r.id, r])).values()];
   const childProjects = [...new Set(rows.map(r => r.childProjectId).filter((id): id is string => !!id))];
@@ -533,11 +709,36 @@ export async function usageFor(user: Express.User): Promise<RouteResult> {
     : [];
   const tokens = tokensBySpawn(rows, tokenRows);
   const allTrees = buildSpawnTrees(rows);
-  const trees = allTrees.slice(0, MAX_TREES).map(t => ({
-    rootId: t.rootId,
-    createdAt: t.createdAt,
-    nodes: t.nodes.map(n => ({ level: n.level, ...spawnView(user, n.spawn), tokens: tokens.get(n.spawn.id) ?? null })),
-  }));
+  // The sessions that started the trees, archived projects included (the sessions list above leaves those out).
+  const originIds = [...new Set(allTrees.slice(0, MAX_TREES).map(t => t.nodes[0]?.spawn.parentProjectId).filter((id): id is string => !!id))];
+  const originProjects = originIds.length
+    ? await prisma.project.findMany({ where: { id: { in: originIds }, userId: user.id }, select: { id: true, name: true } })
+    : [];
+  const projectName = new Map([...projects, ...originProjects].map(p => [p.id, p.name]));
+  const trees = allTrees.slice(0, MAX_TREES).map(t => {
+    // The tree's real root only: a root older than the window is not fetched, and the oldest
+    // node then is a mid-tree agent whose parent is a spawned session, not the one that started it.
+    const first = t.nodes[0]?.spawn;
+    const root = first && first.id === t.rootId ? first : null;
+    return {
+      rootId: t.rootId,
+      createdAt: t.createdAt,
+      // The session that started it, for the dashboard's parent row; null when it came from the browser.
+      origin: root?.parentProjectId && root.parentSession
+        ? {
+          projectId: root.parentProjectId,
+          workstream: root.parentWorkstream ?? 'main',
+          session: root.parentSession,
+          label: (() => {
+            const name = projectName.get(root.parentProjectId);
+            if (!name) return root.parentSession;
+            return root.parentWorkstream && root.parentWorkstream !== 'main' ? `${name}/${root.parentWorkstream}` : name;
+          })(),
+        }
+        : null,
+      nodes: t.nodes.map(n => ({ level: n.level, parentId: n.parentId, ...spawnView(user, n.spawn), tokens: tokens.get(n.spawn.id) ?? null })),
+    };
+  });
 
   const boxReadings = await readings(boxRows);
   const samples = boxRows.length
@@ -586,6 +787,10 @@ export async function usageFor(user: Express.User): Promise<RouteResult> {
         .sort((a, b) => b.count - a.count),
       boxes,
       days: USAGE_DAYS,
+      orphans: orphanRows.map(s => spawnView(user, s)),
+      // A home whose session is gone shows as unset-but-stored (label null), so it can be changed.
+      orphanHome: home ? { ...home, label: homeLabel } : null,
+      sessions,
     },
   };
 }
@@ -601,6 +806,31 @@ export async function budgetFor(user: Express.User, callerInstanceId: string | n
   return { status: 200, body: await buildBudget(user, null, 0, callerInstanceId ?? null) };
 }
 
+/**
+ * Which session started each of the user's children that still has its
+ * workstream: the simple UI's explorer nests a child under its starter. The
+ * original parent, not a foster one: the tree is where it came from.
+ */
+export async function parentsFor(user: Express.User): Promise<RouteResult> {
+  const rows = await prisma.agentSpawn.findMany({
+    where: { userId: user.id, retiredAt: null, childProjectId: { not: null }, parentProjectId: { not: null }, parentWorkstream: { not: null } },
+    select: { childProjectId: true, childWorkstream: true, parentProjectId: true, parentWorkstream: true },
+    orderBy: { createdAt: 'desc' },
+    // Before the cap, so a child's respawns can't crowd older children out.
+    distinct: ['childProjectId', 'childWorkstream'],
+    take: 1000,
+  });
+  const seen = new Set<string>();
+  const links = [];
+  for (const r of rows) {
+    const key = `${r.childProjectId}|${r.childWorkstream}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    links.push({ projectId: r.childProjectId!, workstream: r.childWorkstream, parentProjectId: r.parentProjectId!, parentWorkstream: r.parentWorkstream! });
+  }
+  return { status: 200, body: { links } };
+}
+
 /** A spawned agent says where it stands. The latest report wins. */
 export async function reportFor(user: Express.User, callerInstanceId: string | null | undefined, raw: unknown): Promise<RouteResult> {
   const parsed = parseReport(raw);
@@ -612,7 +842,7 @@ export async function reportFor(user: Express.User, callerInstanceId: string | n
   const spawn = await prisma.agentSpawn.findFirst({
     where: { userId: user.id, childProjectId: c.projectId, childWorkstream: c.workstream, state: { not: 'failed' } },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, parentSession: true, relationship: true, provider: true, createdAt: true, reportedAt: true, rootSpawnId: true },
+    select: { id: true, parentSession: true, relationship: true, provider: true, createdAt: true, reportedAt: true, rootSpawnId: true, fosterProjectId: true, fosterWorkstream: true, orphanedAt: true },
   });
   if (!spawn) return { status: 404, body: { error: 'this session was not started by an agent spawn, so there is no one to report to' } };
   const now = new Date();
@@ -634,10 +864,169 @@ export async function reportFor(user: Express.User, callerInstanceId: string | n
       secondsSinceCreated: Math.round((now.getTime() - spawn.createdAt.getTime()) / 1000),
     },
   });
-  const nudge = spawn.relationship === 'delegate' && spawn.parentSession
-    ? 'the parent agent is told when its pane is next idle'
-    : 'the parent can read it with list_spawns';
+  const nudge = spawn.orphanedAt
+    ? 'your parent is gone and nobody has adopted you yet: the owner sees this report on the dashboard'
+    : spawn.relationship === 'delegate' && spawn.fosterProjectId
+      ? 'your parent is gone; the agent that adopted you is told when its pane is next idle'
+      : spawn.relationship === 'delegate' && spawn.parentSession
+        ? 'the parent agent is told when its pane is next idle'
+        : 'the parent can read it with list_spawns';
   return { status: 200, body: { ok: true, spawn: spawn.id, state: r.status, note: nudge } };
+}
+
+const TREE_EVENTS = 5000;
+const TREE_NODES = 500;
+
+/**
+ * One spawn tree for the network view: its nodes with their live pane status and tokens, the session that
+ * started its root (the origin), the tree's events oldest first (ids, kinds
+ * and reasons: never report or pane text), and its totals. The owner's own
+ * trees only; the page polls it.
+ */
+export async function treeFor(user: Express.User, rootId: string, now: number = Date.now()): Promise<RouteResult> {
+  const rows = await prisma.agentSpawn.findMany({
+    where: { userId: user.id, OR: [{ rootSpawnId: rootId }, { id: rootId }] },
+    orderBy: { createdAt: 'asc' },
+    take: TREE_NODES + 1,
+  });
+  const nodesTruncated = rows.length > TREE_NODES;
+  if (nodesTruncated) rows.length = TREE_NODES;
+  const trees = buildSpawnTrees(rows.map(r => ({ ...r, rootSpawnId: r.rootSpawnId ?? r.id })).filter(r => r.rootSpawnId === rootId));
+  if (!trees.length) return { status: 404, body: { error: 'spawn tree not found', code: 'not_found' } };
+  return { status: 200, body: await treeView(user, { scope: 'tree', rootId, trees, rows, nodesTruncated }, now) };
+}
+
+/** How far back a session's view reaches, besides any tree still running. */
+const SESSION_DAYS = 7;
+const SESSION_ROOTS = 50;
+
+/**
+ * Every tree one session started: a person's own session, or any other that spawned roots, as the
+ * origin with its trees beneath it, oldest first. The last week's, plus any
+ * still running. The owner's own sessions only.
+ */
+export async function sessionTreeFor(user: Express.User, projectId: string, workstream: string, now: number = Date.now()): Promise<RouteResult> {
+  const since = new Date(now - SESSION_DAYS * 24 * HOUR_MS);
+  const roots = await prisma.agentSpawn.findMany({
+    where: {
+      userId: user.id, parentProjectId: projectId, parentWorkstream: workstream, depth: 1,
+      OR: [{ createdAt: { gte: since } }, { endedAt: null, retiredAt: null, state: { not: 'failed' } }],
+    },
+    orderBy: { createdAt: 'desc' },
+    take: SESSION_ROOTS + 1,
+    select: { id: true },
+  });
+  if (!roots.length) return { status: 404, body: { error: 'no spawn trees from that session', code: 'not_found' } };
+  // Whole trees, newest first, up to the node cap: a session's view is about its recent work,
+  // and a tree cut in half would lose its root (and with it the origin and its edges). The
+  // newest tree always fits; one bigger than the cap keeps its oldest, from its root down.
+  const candidates = roots.slice(0, SESSION_ROOTS).map(r => r.id);
+  const sizes = new Map((await prisma.agentSpawn.groupBy({
+    by: ['rootSpawnId'], where: { userId: user.id, rootSpawnId: { in: candidates } }, _count: { _all: true },
+  })).map(g => [g.rootSpawnId, g._count._all]));
+  const rootIds: string[] = [];
+  let total = 0;
+  for (const id of candidates) {
+    const n = Math.max(1, sizes.get(id) ?? 1);
+    if (rootIds.length && total + n > TREE_NODES) break;
+    rootIds.push(id);
+    total += n;
+  }
+  // The page says when it holds only the newest trees: more than the 50, or older ones left out.
+  const rootsTruncated = roots.length > SESSION_ROOTS || rootIds.length < candidates.length;
+  const rows = await prisma.agentSpawn.findMany({
+    where: { userId: user.id, OR: [{ rootSpawnId: { in: rootIds } }, { id: { in: rootIds } }] },
+    orderBy: { createdAt: 'asc' },
+    take: TREE_NODES + 1,
+  });
+  const nodesTruncated = rows.length > TREE_NODES;
+  if (nodesTruncated) rows.length = TREE_NODES;
+  const wanted = new Set(rootIds);
+  // Oldest tree first, so a new tree adds rows at the bottom instead of reshuffling.
+  const trees = buildSpawnTrees(rows.map(r => ({ ...r, rootSpawnId: r.rootSpawnId ?? r.id })).filter(r => wanted.has(r.rootSpawnId)))
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  if (!trees.length) return { status: 404, body: { error: 'no spawn trees from that session', code: 'not_found' } };
+  const body = await treeView(user, { scope: 'session', rootId: `session:${projectId}:${workstream}`, trees, rows, nodesTruncated, newestEvents: true }, now);
+  return { status: 200, body: { ...body, rootsTruncated } };
+}
+
+type TreeRows = Awaited<ReturnType<typeof prisma.agentSpawn.findMany>>;
+
+/** One or more trees, with the session that started them, their events, fosters and totals, for the network view. */
+async function treeView(
+  user: Express.User,
+  t: {
+    scope: 'tree' | 'session'; rootId: string; trees: ReturnType<typeof buildSpawnTrees<TreeRows[number]>>; rows: TreeRows; nodesTruncated: boolean;
+    /** Keep the newest events when there are too many (a session's view), not the oldest (one tree's, from its start). */
+    newestEvents?: boolean;
+  },
+  now: number,
+) {
+  const nodes = t.trees.flatMap(tree => tree.nodes);
+  const ids = nodes.map(n => n.spawn.id);
+  const childProjects = [...new Set(t.rows.map(r => r.childProjectId).filter((id): id is string => !!id))];
+  const root = t.trees[0].nodes[0].spawn;
+  const first = t.trees.reduce((d, tree) => (tree.createdAt < d ? tree.createdAt : d), root.createdAt);
+  const [tokenRows, events, originProject] = await Promise.all([
+    childProjects.length
+      ? prisma.tokenUsageDay.findMany({
+        where: { userId: user.id, projectId: { in: childProjects }, date: { gte: first.toISOString().slice(0, 10) }, estimated: false },
+        select: { projectId: true, workstream: true, date: true, input: true, output: true, cacheRead: true, cacheCreate: true, reasoning: true },
+      })
+      : [],
+    prisma.spawnEvent.findMany({
+      where: { userId: user.id, spawnId: { in: ids } },
+      // An adoption's foster is in its parent fields, so replay can draw the edge from then on.
+      select: { spawnId: true, kind: true, reason: true, at: true, parentProjectId: true, parentWorkstream: true },
+      orderBy: { at: t.newestEvents ? 'desc' : 'asc' },
+      take: TREE_EVENTS + 1,
+    }).then(es => (t.newestEvents ? es.reverse() : es)),
+    root.parentProjectId
+      ? prisma.project.findFirst({ where: { id: root.parentProjectId, userId: user.id }, select: { name: true, instanceId: true, user: { select: { unixUsername: true } } } })
+      : null,
+  ]);
+  const tokens = tokensBySpawn(t.rows, tokenRows);
+  // Fosters outside the tree (an orphan home, a session the owner picked), named on their nodes.
+  const fosterIds = [...new Set(nodes.map(n => n.spawn.fosterProjectId).filter((id): id is string => !!id))];
+  const fosterProjects = fosterIds.length
+    ? await prisma.project.findMany({ where: { id: { in: fosterIds }, userId: user.id }, select: { id: true, name: true } })
+    : [];
+  const fosters = nodes.flatMap(n => {
+    const p = n.spawn.fosterProjectId ? fosterProjects.find(x => x.id === n.spawn.fosterProjectId) : undefined;
+    const ws = n.spawn.fosterWorkstream ?? 'main';
+    return p ? [{ projectId: p.id, workstream: ws, label: ws === 'main' ? p.name : `${p.name}/${ws}` }] : [];
+  });
+  // Rebuilt from the project's name now, so a renamed session still reads its live status.
+  const originSession = root.parentSession && originProject
+    ? tmux.sessionName(originProject.user.unixUsername, originProject.name, (root.parentRole ?? 'agent') as Parameters<typeof tmux.sessionName>[2], root.parentWorkstream ?? 'main')
+    : root.parentSession;
+  const origin = root.parentSession && originSession
+    ? {
+      projectId: root.parentProjectId,
+      workstream: root.parentWorkstream ?? 'main',
+      session: originSession,
+      label: originProject ? (root.parentWorkstream && root.parentWorkstream !== 'main' ? `${originProject.name}/${root.parentWorkstream}` : originProject.name) : root.parentSession,
+      status: getStatus(originSession, originProject?.instanceId ?? null).status,
+    }
+    : null;
+  return {
+    scope: t.scope,
+    rootId: t.rootId,
+    // Each tree's root, oldest first: the origin's own children.
+    rootIds: t.trees.map(tree => tree.rootId),
+    createdAt: first,
+    origin,
+    nodes: nodes.map(n => ({ level: n.level, parentId: n.parentId, ...spawnView(user, n.spawn), tokens: tokens.get(n.spawn.id) ?? null })),
+    // Oldest first either way; the cap drops the newest for one tree, the oldest for a session.
+    events: t.newestEvents ? events.slice(-TREE_EVENTS) : events.slice(0, TREE_EVENTS),
+    eventsTruncated: events.length > TREE_EVENTS,
+    eventsLimit: TREE_EVENTS,
+    // The oldest TREE_NODES only: the totals count those.
+    nodesTruncated: t.nodesTruncated,
+    fosters,
+    totals: treeTotals(nodes.map(n => n.spawn), tokens, now),
+    at: new Date(now),
+  };
 }
 
 export function spawnsRouter(): Router {
@@ -650,6 +1039,27 @@ export function spawnsRouter(): Router {
   }));
   router.get('/spawns/usage', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
     sendResult(res, await usageFor(req.user!));
+  }));
+  router.get('/spawns/parents', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await parentsFor(req.user!));
+  }));
+  router.get('/spawns/trees/:rootId', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await treeFor(req.user!, req.params.rootId));
+  }));
+  router.get('/spawns/sessions/:projectId/:workstream/trees', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await sessionTreeFor(req.user!, req.params.projectId, req.params.workstream));
+  }));
+  router.post('/spawns/:id/dismiss', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await dismissFor(req.user!, req.agentInstanceId, req.params.id, req.body));
+  }));
+  router.post('/spawns/:id/resume', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await resumeFor(req.user!, req.agentInstanceId, req.params.id));
+  }));
+  router.post('/spawns/:id/adopt', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await adoptFor(req.user!, req.agentInstanceId, req.params.id, req.body));
+  }));
+  router.put('/spawns/orphan-home', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
+    sendResult(res, await orphanHomeFor(req.user!, req.agentInstanceId, req.body));
   }));
   router.get('/spawns/budget', requireAuthOrAgentToken, asyncHandler(async (req, res) => {
     sendResult(res, await budgetFor(req.user!, req.agentInstanceId, req.query.session));

@@ -5,17 +5,18 @@
  */
 import type { Briefing } from '@prisma/client';
 import { prisma } from '../../db';
-import type { BriefingContent, BriefingView, LedgerTotals } from './types';
+import type { BriefingCharts, BriefingView, LedgerTotals } from './types';
+import { contentProjectIds, upgradeContent } from './content';
 
 export type BriefingRow = Pick<Briefing,
-  'id' | 'trigger' | 'status' | 'error' | 'since' | 'until' | 'tz' | 'windowLabel' | 'windowBasis' | 'instanceId' | 'content' | 'stats' | 'createdAt' | 'finishedAt'>;
+  'id' | 'trigger' | 'status' | 'error' | 'since' | 'until' | 'tz' | 'windowLabel' | 'windowBasis' | 'instanceId' | 'content' | 'stats' | 'charts' | 'createdAt' | 'finishedAt'>;
 
 /** Every project id a view mentions, for one names lookup. */
-export function referencedProjectIds(rows: Pick<Briefing, 'content'>[]): string[] {
+export function referencedProjectIds(rows: Pick<Briefing, 'content' | 'charts'>[]): string[] {
   const ids = new Set<string>();
   for (const r of rows) {
-    const c = r.content as BriefingContent | null;
-    for (const x of [...(c?.carryovers ?? []), ...(c?.suggestions ?? [])]) if (x.projectId) ids.add(x.projectId);
+    for (const id of contentProjectIds(upgradeContent(r.content))) ids.add(id);
+    for (const p of (r.charts as BriefingCharts | null)?.projects ?? []) ids.add(p.projectId);
   }
   return [...ids];
 }
@@ -25,11 +26,15 @@ export function toView(
   boxNames: ReadonlyMap<string, string>,
   projects: ReadonlyMap<string, { name: string; archived: boolean }>,
 ): BriefingView {
-  const content = (row.content as BriefingContent | null) ?? null;
+  const content = upgradeContent(row.content);
   const mine: BriefingView['projects'] = {};
-  for (const x of [...(content?.carryovers ?? []), ...(content?.suggestions ?? [])]) {
-    const p = x.projectId ? projects.get(x.projectId) : undefined;
-    if (x.projectId && p) mine[x.projectId] = p;
+  for (const id of contentProjectIds(content)) {
+    const p = projects.get(id);
+    if (p) mine[id] = p;
+  }
+  for (const p of (row.charts as BriefingCharts | null)?.projects ?? []) {
+    const known = projects.get(p.projectId);
+    if (known) mine[p.projectId] = known;
   }
   return {
     id: row.id,
@@ -40,6 +45,7 @@ export function toView(
     boxName: row.instanceId ? boxNames.get(row.instanceId) ?? null : null,
     content,
     stats: (row.stats as LedgerTotals | null) ?? null,
+    charts: (row.charts as BriefingCharts | null) ?? null,
     projects: mine,
     createdAt: row.createdAt.toISOString(),
     finishedAt: row.finishedAt?.toISOString() ?? null,

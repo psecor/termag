@@ -4,9 +4,10 @@
  * only decides, so the rules are unit-testable.
  *
  * A box hibernates on its own once it has been idle for its
- * `idleHibernateHours`. Only boxes launched hibernation-capable take part:
- * there is no plain-stop or terminate fallback, so a box that can't hibernate
- * keeps its setting (with a warning) and is never touched. Idle means no
+ * `idleHibernateHours`. Only boxes launched hibernation-capable take part in
+ * that setting: there is no plain-stop fallback for it, so a box that can't
+ * hibernate keeps the setting (with a warning) and the sweep does not stop
+ * it instead. The default window below is the exception. Idle means no
  * human input and no agent `working` status since `lastActivityAt`; an agent
  * waiting on its user counts as idle.
  *
@@ -14,9 +15,18 @@
  * limit is raised to the unsaved-work limit (90 days) unless the agent's scan
  * just before the hibernate found nothing; only a hibernated box is ever
  * terminated.
+ *
+ * Behind box-idle-stop-enabled only, a box with no `idleHibernateHours` gets
+ * a default window of IDLE_STOP_DEFAULT_HOURS: it hibernates when it can and
+ * is plainly stopped when it can't. A box with its own `idleHibernateHours`
+ * keeps its setting's meaning whatever that flag says.
  */
 
 export const BOX_AUTO_LIFECYCLE_FLAG = 'box-auto-lifecycle-enabled';
+export const BOX_IDLE_STOP_FLAG = 'box-idle-stop-enabled';
+
+/** The idle window box-idle-stop-enabled gives a box with no auto-park setting. */
+export const IDLE_STOP_DEFAULT_HOURS = 2;
 
 /** Bounds of `idleHibernateHours`: an hour at least, thirty days at most. */
 export const IDLE_HIBERNATE_MIN_HOURS = 1;
@@ -42,7 +52,7 @@ export function unsavedWorkTerminateDays(env: NodeJS.ProcessEnv = process.env): 
   return positiveIntEnv(env.BOX_UNSAVED_WORK_TERMINATE_DAYS, 90);
 }
 
-/** The settings a subagent sandbox box gets at creation (phase 2 of agent messaging). */
+/** The settings a box made for an ask gets at creation (phase 2 of agent messaging). */
 export function subagentLifecycleDefaults(env: NodeJS.ProcessEnv = process.env): LifecycleSettings {
   return {
     idleHibernateHours: 1,
@@ -86,12 +96,30 @@ export interface IdleFacts {
   busy: boolean;
   /** An agent on the box reports `working` right now. */
   working: boolean;
+  /** box-idle-stop-enabled for this owner and box. Only read for a box with no `idleHibernateHours`. */
+  idleStopOn?: boolean;
 }
 
 export type IdleSkip = 'not-eligible' | 'off' | 'not-ready' | 'refresh-pending' | 'flag-off' | 'busy' | 'working' | 'not-idle';
-export type IdleDecision = { hibernate: true } | { hibernate: false; reason: IdleSkip };
+/** `stop` is only ever the default window's, on a box that can't hibernate. */
+export type IdleDecision = { hibernate: true } | { stop: true } | { hibernate: false; reason: IdleSkip };
+
+export function isIdleSkip(d: IdleDecision): d is { hibernate: false; reason: IdleSkip } {
+  return 'reason' in d;
+}
+
+/** An owned EC2 box that can be plainly stopped. */
+function canIdleStop(box: Pick<LifecycleBox, 'userId' | 'kind' | 'ec2InstanceId'>): boolean {
+  return box.kind === 'ec2' && !!box.userId && !!box.ec2InstanceId;
+}
+
+/** When a box under the default window is due if nothing happens on it. */
+export function defaultIdleDueAt(box: Pick<LifecycleBox, 'lastActivityAt' | 'readyAt' | 'createdAt'>): Date {
+  return new Date(idleSince(box).getTime() + IDLE_STOP_DEFAULT_HOURS * HOUR_MS);
+}
 
 export function idleHibernateDecision(box: LifecycleBox, facts: IdleFacts): IdleDecision {
+  if (!box.idleHibernateHours && facts.idleStopOn) return defaultWindowDecision(box, facts);
   if (!canAutoHibernate(box)) return { hibernate: false, reason: 'not-eligible' };
   if (!box.idleHibernateHours) return { hibernate: false, reason: 'off' };
   if (box.status !== 'ready') return { hibernate: false, reason: 'not-ready' };
@@ -103,6 +131,21 @@ export function idleHibernateDecision(box: LifecycleBox, facts: IdleFacts): Idle
   const due = hibernateDueAt(box)!;
   if (facts.nowMs < due.getTime()) return { hibernate: false, reason: 'not-idle' };
   return { hibernate: true };
+}
+
+/**
+ * The box-idle-stop-enabled path: no `idleHibernateHours`, so the default
+ * window applies, and box-auto-lifecycle-enabled is not consulted. The same
+ * guards as the hibernate path; the action depends on whether it can hibernate.
+ */
+function defaultWindowDecision(box: LifecycleBox, facts: IdleFacts): IdleDecision {
+  if (!canIdleStop(box)) return { hibernate: false, reason: 'not-eligible' };
+  if (box.status !== 'ready') return { hibernate: false, reason: 'not-ready' };
+  if (box.rehibernatePending) return { hibernate: false, reason: 'refresh-pending' };
+  if (facts.busy) return { hibernate: false, reason: 'busy' };
+  if (facts.working) return { hibernate: false, reason: 'working' };
+  if (facts.nowMs < defaultIdleDueAt(box).getTime()) return { hibernate: false, reason: 'not-idle' };
+  return canAutoHibernate(box) ? { hibernate: true } : { stop: true };
 }
 
 export interface LifecycleSettings {
@@ -151,13 +194,31 @@ export function lifecycleSettingsError(
 export const CANNOT_HIBERNATE_WARNING =
   "This box (or its image) can't hibernate, so auto-park does nothing on it. It is never stopped or terminated instead.";
 
-/** The warning to show next to a lifecycle setting that will never fire, or null. */
+/**
+ * The same box once `box-idle-stop-enabled` applies: no `idleHibernateHours`,
+ * so the default window stops it. It is still never terminated.
+ */
+export const CANNOT_HIBERNATE_IDLE_STOP_WARNING =
+  "This box (or its image) can't hibernate, so auto-park does nothing on it. It is stopped after 2 hours idle, and it is never terminated.";
+
+/**
+ * The warning to show next to a lifecycle setting that will not park the box,
+ * or null. `idleStopOn` is `box-idle-stop-enabled` for this owner and box;
+ * omit it, or leave it false, and the warning stays the flag-off sentence.
+ */
 export function lifecycleWarning(
   box: Pick<LifecycleBox, 'userId' | 'kind' | 'ec2InstanceId' | 'hibernationConfigured' | 'idleHibernateHours'>
     & { hibernatedTerminateDays: number | null },
+  options?: { idleStopOn?: boolean },
 ): string | null {
   const on = box.idleHibernateHours != null || box.hibernatedTerminateDays != null;
-  return on && !canAutoHibernate(box) ? CANNOT_HIBERNATE_WARNING : null;
+  if (!on || canAutoHibernate(box)) return null;
+  // Own idle hours still mean "hibernate or nothing". The default window
+  // only applies when those hours are unset, and only to a box that can be stopped.
+  if (options?.idleStopOn && box.idleHibernateHours == null && canIdleStop(box)) {
+    return CANNOT_HIBERNATE_IDLE_STOP_WARNING;
+  }
+  return CANNOT_HIBERNATE_WARNING;
 }
 
 /**
@@ -240,13 +301,14 @@ export interface LifecycleView {
   /** Only for a parked box: whether its own terminate limit applies (`clean`) or the long one. */
   unsavedWork: UnsavedWorkState | null;
   note: string | null;
-  /** Set when a setting is on but the box can't hibernate, so it will never fire. */
+  /** Set when a setting is on but the box can't hibernate. */
   warning: string | null;
 }
 
 export function lifecycleView(
   box: TerminateBox & { lifecycleNote: string | null },
   unsavedLimitDays: number = unsavedWorkTerminateDays(),
+  options?: { idleStopOn?: boolean },
 ): LifecycleView {
   const due = hibernateDueAt(box);
   const terminateAt = terminateDueAt(box, unsavedLimitDays);
@@ -260,12 +322,31 @@ export function lifecycleView(
     parkedAt: box.parkedAt ? box.parkedAt.toISOString() : null,
     unsavedWork: parked ? unsavedWorkState(box) : null,
     note: box.lifecycleNote,
-    warning: lifecycleWarning(box),
+    warning: lifecycleWarning(box, options),
   };
 }
 
+const AUTO_HIBERNATE_PREFIX = 'Hibernated automatically after ';
+
 export function autoHibernateNote(hours: number): string {
-  return `Hibernated automatically after ${hours} h idle. Start it to resume where you left off.`;
+  return `${AUTO_HIBERNATE_PREFIX}${hours} h idle. Start it to resume where you left off.`;
+}
+
+/** Not the hibernate note's prefix, so a reviewer can't wake a box the sweep stopped. */
+export function autoStopNote(hours: number): string {
+  return `Stopped automatically after ${hours} h idle. Start it to get its sessions back.`;
+}
+
+/**
+ * Whether a box's note says the idle sweep hibernated it. The note is set
+ * right after the sweep's hibernate and cleared by any start that marks the
+ * box in use and by the owner's own stop or hibernate (requestPower
+ * `byOwner`), so on a hibernated box it marks one the sweep parked and its
+ * owner hasn't touched since. (A reviewer's wake keeps it, so a resume that
+ * doesn't take can be woken again; once the box is up, its status says so.)
+ */
+export function isAutoHibernateNote(note: string | null | undefined): boolean {
+  return typeof note === 'string' && note.startsWith(AUTO_HIBERNATE_PREFIX);
 }
 
 export function autoTerminateNote(days: number): string {

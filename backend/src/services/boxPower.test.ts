@@ -111,6 +111,23 @@ describe('requestPower', () => {
     expect(rows.get('inst_1')!.lastActivityAt.getTime()).toBeGreaterThan(parkedAt.getTime());
   });
 
+  it("a reviewer's wake restarts the idle clock, but keeps the box's terminate clock and its idle note", async () => {
+    const parkedAt = new Date('2026-10-01T00:00:00Z');
+    const box = seed('hibernated', { parkedAt, lifecycleNote: 'Hibernated automatically after 2 h idle.', lastActivityAt: parkedAt });
+    await expect(requestPower(box, 'start', { guestWake: true })).resolves.toBe('starting');
+    // The note stays too: a resume that doesn't take settles back still marked as the sweep's.
+    expect(rows.get('inst_1')).toMatchObject({ status: 'starting', parkedAt, lifecycleNote: 'Hibernated automatically after 2 h idle.' });
+    expect(rows.get('inst_1')!.lastActivityAt.getTime()).toBeGreaterThan(parkedAt.getTime());
+  });
+
+  it("the owner's own hibernate drops an idle note left from before; the sweep's and the refresh's keep it", async () => {
+    const note = 'Hibernated automatically after 2 h idle.';
+    await requestPower(seed('ready', { lifecycleNote: note }), 'hibernate', { byOwner: true });
+    expect(rows.get('inst_1')!.lifecycleNote).toBeNull();
+    await requestPower(seed('ready', { lifecycleNote: note }), 'hibernate', { onHibernateRefused: 'throw' });
+    expect(rows.get('inst_1')!.lifecycleNote).toBe(note);
+  });
+
   it('a refused start puts the parked state back with the status', async () => {
     const parkedAt = new Date('2026-10-01T00:00:00Z');
     ec2.refuse = 'InsufficientInstanceCapacity';
