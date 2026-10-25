@@ -23,7 +23,15 @@ for f in "$root"/pids/box-*.pid "$root"/pids/*.pid; do
   kill -TERM -- "-$(cat "$f")" 2>/dev/null || true
 done
 
-for sock in "$root"/boxes/*/tmux.sock; do
+# Floci in Docker (E2E_FLOCI=docker): its docker CLI got the TERM above and
+# passes it on, but a container outlives a killed CLI. Only the container this
+# root recorded, by its exact name and only when its label names this root.
+if [ -f "$root/floci/container" ]; then
+  bash "$here/fakes/floci.sh" docker-rm "$root" || log "warning: the Floci container in $root/floci/container may still be running"
+fi
+
+# A box whose socket path would be too long keeps it under <root>/tmux (box.sh).
+for sock in "$root"/boxes/*/tmux.sock "$root"/tmux/*; do
   [ -S "$sock" ] && { tmux -S "$sock" kill-server 2>/dev/null || true; }
 done
 

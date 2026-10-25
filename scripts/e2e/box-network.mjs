@@ -50,12 +50,35 @@ function pickUpstream() {
   return pool[next];
 }
 
+// macOS has only 127.0.0.1 on lo0 until `sudo ifconfig lo0 alias 127.0.0.2`:
+// without the alias boxes still connect, but from 127.0.0.1, so their status
+// writes are filed as the orchestrator's own (see above). Said once.
+// The retry is per dial (one that asked for the alias), not per process, so
+// dials already in flight when the first one fails redial too.
+let fromAddress = BOX_ADDRESS;
+let warned = false;
 createServer(box => {
-  const up = connect({ host: '127.0.0.1', port: pickUpstream(), localAddress: BOX_ADDRESS });
-  const close = () => { box.destroy(); up.destroy(); };
+  const port = pickUpstream();
+  let up;
+  const close = () => { box.destroy(); up?.destroy(); };
   box.on('error', close);
-  up.on('error', close);
-  box.pipe(up).pipe(box);
+  const wire = (from) => {
+    up = connect({ host: '127.0.0.1', port, ...(from ? { localAddress: from } : {}) });
+    up.on('error', (err) => {
+      if (err.code === 'EADDRNOTAVAIL' && from) {
+        fromAddress = null;
+        if (!warned) {
+          warned = true;
+          console.warn(`${BOX_ADDRESS} is not configured on this host; boxes connect from 127.0.0.1 (sudo ifconfig lo0 alias ${BOX_ADDRESS} to fix)`);
+        }
+        wire(null);
+        return;
+      }
+      close();
+    });
+    up.once('connect', () => { box.pipe(up).pipe(box); });
+  };
+  wire(fromAddress);
 }).listen(listenPort, '127.0.0.1', () => {
   console.log(`box network on 127.0.0.1:${listenPort} -> 127.0.0.1:${upstreams.join(',')} from ${BOX_ADDRESS}`);
 });

@@ -15,7 +15,8 @@ repo=$(cd "$here/../.." && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
 export E2E_PORT=${E2E_TEST_PORT:-3950} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-5984} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55449} E2E_BOXES=2 \
-  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4666} E2E_EC2_PORT=${E2E_TEST_EC2_PORT:-4667} E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1
+  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4666} E2E_EC2_PORT=${E2E_TEST_EC2_PORT:-4667} E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1 \
+  E2E_GITHUB_PORT=${E2E_TEST_GITHUB_PORT:-4668} E2E_FAKE_GITHUB=1
 trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 failures=0
@@ -182,7 +183,8 @@ wait_status() { # <box> <status>: up to 90s, for the 10s power sweep
   for i in $(seq 1 90); do [ "$(box_status "$1")" = "$2" ] && { echo "$2"; return; }; sleep 1; done
   box_status "$1"
 }
-box_tmux() { tmux -S "$ROOT/boxes/cli-box/tmux.sock" ls -F '#S' 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//'; }
+# Through the box's own tmux wrapper, which knows where box.sh put its socket.
+box_tmux() { "$ROOT/boxes/cli-box/bin/tmux" ls -F '#S' 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//'; }
 
 termag box create 'bad name' --host "$API" >/dev/null 2>&1
 check "box create: a name outside the rule is a usage error" 2 $?
@@ -255,14 +257,23 @@ check "box list no longer shows it" "" "$(termag box list --host "$API" --json |
 
 echo "--- project create --new-box: a box and its first project in one command"
 SAMPLE=https://github.com/e2e-org/sample
+# A box's git reaches the GitHub stub, and nothing hands it a credential (no
+# broker): it clones the stub's sample as a public repository, as
+# ask-box.test.sh does.
+touch "$ROOT/github/e2e-org/sample.git/termag-e2e-public"
 termag project create cli-new/app --new-box --agent claude --from "$SAMPLE" --timeout 300 --host "$API" --json \
   >"$WORK/new-box.json" 2>"$WORK/new-box.err"
 check "project create --new-box exits 0" 0 $?
+# The box clones durably, then starts the project's sessions.
+for _ in $(seq 1 60); do
+  "$ROOT/boxes/cli-new/bin/tmux" has-session -t "=$U-app-agent" 2>/dev/null && break
+  sleep 0.5
+done
 check "it created the box, waited for its agent, then created the project" "true running true true cli-new/app $SAMPLE" \
   "$(jq -r '"\(.boxCreated) \(.box.state) \(.box.agentConnected) \(.created) \(.project.ref) \(.repoUrl)"' "$WORK/new-box.json")"
 check "--json kept stderr empty" "" "$(cat "$WORK/new-box.err")"
 check "the project's sessions are on the new box" "$U-app-agent $U-app-ctrl" \
-  "$(tmux -S "$ROOT/boxes/cli-new/tmux.sock" ls -F '#S' 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')"
+  "$("$ROOT/boxes/cli-new/bin/tmux" ls -F '#S' 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')"
 termag project create cli-new/bad --agent claude --from not-a-template --host "$API" >/dev/null 2>&1
 check "project create --from an unknown template is a usage error" 2 $?
 check "box rm --yes cleans the new box up" 1 "$(termag box rm cli-new --yes --host "$API" --json | jq -r .archivedProjects)"

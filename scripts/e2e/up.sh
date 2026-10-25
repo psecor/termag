@@ -8,7 +8,8 @@
 # Env: E2E_BOXES (2), E2E_PORT (3040; the box network takes E2E_PORT+1),
 #      E2E_FRONTEND_PORT (5174),
 #      E2E_PG_PORT (55432), E2E_EMAIL (e2e@termag.local), E2E_PG_BIN, and the
-#      opt-in fakes listed in scripts/e2e/fakes/fakes.sh.
+#      opt-in fakes listed in scripts/e2e/fakes/fakes.sh. E2E_WATCH=1 restarts
+#      the backend on source changes (tsx watch).
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -33,9 +34,10 @@ if existing=$(e2e_root); then
 fi
 rm -f "$E2E_POINTER"
 
-for c in node npm tmux jq curl git setsid; do
+for c in node npm tmux jq curl git; do
   command -v "$c" >/dev/null 2>&1 || die "missing '$c' (see .cursor/install.sh for the package list)"
 done
+command -v setsid >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || die "missing 'setsid' (or perl, which stands in for it)"
 PG_BIN=$(pg_bindir)
 [ -x "$PG_BIN/initdb" ] || die "no PostgreSQL server binaries found; install postgresql or set E2E_PG_BIN"
 REAL_TMUX=$(command -v tmux)
@@ -89,6 +91,7 @@ wait_http() {
 }
 
 cat >"$ROOT/stack.env" <<EOF
+REPO=$repo
 PG_BIN=$PG_BIN
 PORT=$PORT
 BOX_NET_PORT=$BOX_NET_PORT
@@ -133,8 +136,14 @@ log "syncing the schema (npm run db:push equivalent)"
   || die "schema sync failed (logs/db-push.log)"
 fakes_after_schema
 
-log "starting the backend on 127.0.0.1:$PORT"
-start_daemon backend "$repo/backend" env -i "${backend_env[@]}" "${backend_extra[@]}" node_modules/.bin/tsx src/index.ts
+# E2E_WATCH=1: the backend restarts by itself when its source changes (tsx
+# watch), for working on it with the stack up. A restart drops the stack's
+# sockets (boxes and browsers reconnect) and, without KMS, re-keys CLI access
+# tokens, which clients refresh with their device token.
+backend_cmd=(node_modules/.bin/tsx src/index.ts)
+[ "${E2E_WATCH:-}" = 1 ] && backend_cmd=(node_modules/.bin/tsx watch --clear-screen=false src/index.ts)
+log "starting the backend on 127.0.0.1:$PORT$([ "${E2E_WATCH:-}" = 1 ] && echo ', restarting on source changes')"
+start_daemon backend "$repo/backend" env -i "${backend_env[@]}" "${backend_extra[@]}" "${backend_cmd[@]}"
 wait_http "http://127.0.0.1:$PORT/termag/health" backend
 fakes_after_backend
 
@@ -157,7 +166,8 @@ wait_http "http://localhost:$FRONTEND_PORT/termag/" frontend
 # fake starts after up.sh has exited.
 {
   declare -p ROOT REAL_TMUX EMAIL agent_ws_url base_env box_extra
-  declare -p FAKE_CLAUDE FAKE_GITHUB GITHUB_PORT TMUX_FAULTS
+  declare -p FAKE_CLAUDE FAKE_GITHUB GITHUB_PORT TMUX_FAULTS CLAUDE_BIN CLAUDE_KEYCHAINS
+  declare -p T3 PANE_CLONE GITHUB_BROKER
 } >"$ROOT/box.env"
 
 api_env=("${base_env[@]}" "E2E_API_URL=http://127.0.0.1:$PORT/termag" "E2E_AGENT_WS_URL=$agent_ws_url"
@@ -167,7 +177,8 @@ env -i "${api_env[@]}" node "$here/seed.mjs" boxes "$ROOT" "$BOXES"
 # With E2E_EC2_LAUNCH the ec2 boxes are started by the launch fake instead.
 first_box=1
 [ -z "$EC2_LAUNCH" ] || first_box=$((EC2_BOXES + 1))
-for i in $(seq "$first_box" "$BOXES"); do
+# A C-style loop: BSD seq (macOS) counts down when the range is empty.
+for ((i = first_box; i <= BOXES; i++)); do
   bash "$here/box.sh" "$ROOT" "box-$i"
 done
 fakes_after_boxes

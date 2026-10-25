@@ -2,15 +2,17 @@
 # A box for the ask: box-1's agent makes a box with
 # the CLI on its own credentials, starts a project there from box-1/sample's
 # repository, and asks it. The run is the real termag-subagent-run with a
-# stub systemd-run and claude, so this covers, against a real stack:
+# stub claude, so this covers, against a real stack:
 #
 #   * project create --new-box --from <box>/<project> on a box credential: the
 #     repository comes from the project's checkout origin, the new box records
 #     box-1 as its parent, box set takes the lifecycle defaults;
-#   * an ask refused while the project clones, and one to the stopped box held
-#     until the orchestrator has started it;
-#   * the ask runs in the same sandbox as on any box (the run's settings, the
-#     systemd-run network cut) and a follow-up resumes it;
+#   * an ask held while the project clones and run once it is set up, one
+#     failed when the clone fails, and one to the stopped box held until the
+#     orchestrator has started it;
+#   * the ask runs as on any box: claude -p as the box user in the thread's
+#     clone, bypassPermissions, outside tmux; a
+#     follow-up resumes it in the same clone;
 #   * only the parent box's credentials may remove the box.
 #
 # Runs on its own ports and TMPDIR, so it can run beside a stack that is up.
@@ -99,58 +101,28 @@ for _ in $(seq 1 120); do case $(setup_status) in ready|none|failed) break ;; es
 # A stand-in box clones in the pane (setupStatus none); a box image's agent clones durably (ready).
 check "the project's clone finished" yes "$(case $(setup_status) in ready|none) echo yes ;; *) setup_status ;; esac)"
 
-# The runner a box image carries. A stand-in box has no root, so the sandbox's
-# sudo and setup are no-ops and systemd-run is a stub that records its
-# arguments and runs the command as this user; claude is a stub that reports
-# where and with which settings it ran.
-SUB_ROOT=$ASK_HOME/subagent-root
-mkdir -p "$ASK_HOME/.local/bin" "$ASK_HOME/.local/lib/termag" "$ASK_HOME/.config/termag" "$SUB_ROOT/bin"
+# The runner a box image carries, run with a stub claude that reports where
+# and how it ran.
+mkdir -p "$ASK_HOME/.local/bin" "$ASK_HOME/.local/lib/termag" "$ASK_HOME/.config/termag" "$WORK/claudebin"
 install -m 0755 "$repo/deploy/termag-subagent-run" "$ASK_HOME/.local/lib/termag/termag-subagent-run"
-install -m 0755 "$repo/deploy/termag-subagent-exec" "$SUB_ROOT/bin/termag-subagent-exec"
-cat >"$SUB_ROOT/bin/termag-subagent-token" <<'EOF'
-#!/bin/sh
-exec cat "$CREDENTIALS_DIRECTORY/token"
-EOF
-cat >"$SUB_ROOT/bin/systemd-run" <<'EOF'
-#!/bin/sh
-echo "systemd-run $*" >>"$TERMAG_E2E_SUB_ROOT/systemd-run.log"
-envs=""; wd=.; cmd=""
-for a in "$@"; do
-  case $a in
-    --setenv=*) envs="$envs
-${a#--setenv=}" ;;
-    --working-directory=*) wd=${a#--working-directory=} ;;
-    LoadCredential=token:*) mkdir -p "$TERMAG_E2E_SUB_ROOT/creds"; cp "${a#LoadCredential=token:}" "$TERMAG_E2E_SUB_ROOT/creds/token" ;;
-    -*|*=*) ;;
-    *) cmd=$a ;;
-  esac
-done
-cd "$wd" || exit 1
-printf '%s\n' "$envs" | sed '/^$/d' >"$TERMAG_E2E_SUB_ROOT/run-env"
-set --
-while IFS= read -r kv; do set -- "$@" "$kv"; done <"$TERMAG_E2E_SUB_ROOT/run-env"
-exec env -i CREDENTIALS_DIRECTORY="$TERMAG_E2E_SUB_ROOT/creds" "$@" "$cmd"
-EOF
-cat >"$SUB_ROOT/bin/claude" <<'EOF'
+cat >"$WORK/claudebin/claude" <<'EOF'
 #!/usr/bin/env bash
-settings= resume=
+mode= resume=
 while [ $# -gt 0 ]; do
-  case $1 in --settings) settings=$2; shift ;; --resume) resume=$2; shift ;; esac
+  case $1 in --permission-mode) mode=$2; shift ;; --resume) resume=$2; shift ;; esac
   shift
 done
 prompt=$(cat)
-case $PWD in "$TERMAG_THREAD_DIR"/repo) where=thread ;; *) where="$PWD" ;; esac
-reply="sandbox-run prompt=[$prompt] where=$where readme=[$(head -n1 README.md 2>/dev/null)] bash=$(jq -c '.permissions.allow | index("Bash") != null' "$settings") curl-denied=$(jq -c '.permissions.deny | index("Bash(curl:*)") != null' "$settings") helper=$(jq -r .apiKeyHelper "$settings" | xargs basename) resume=${resume:-none}"
+case $PWD in "$HOME"/.termag/subagent/threads/*/repo) where=thread ;; *) where="$PWD" ;; esac
+reply="ask-run prompt=[$prompt] where=$where readme=[$(head -n1 README.md 2>/dev/null)] mode=$mode user=$(id -un) tmux=${TMUX:-none} resume=${resume:-none}"
 jq -n --arg r "$reply" '{result: $r, session_id: "sess-e2e", num_turns: 1, is_error: false}'
 EOF
 cat >"$ASK_HOME/.local/bin/termag-subagent-run" <<EOF
 #!/bin/sh
-export TERMAG_E2E_SUB_ROOT='$SUB_ROOT' TERMAG_SUBAGENT_ROOT='$SUB_ROOT' TERMAG_SUBAGENT_USER="\$(id -un)" \\
-  TERMAG_SUBAGENT_SUDO='' TERMAG_SUBAGENT_SYSTEMD_RUN='$SUB_ROOT/bin/systemd-run' TERMAG_SUBAGENT_SETUP=true \\
-  TERMAG_SUBAGENT_ALLOW=localhost
+export TERMAG_SUBAGENT_CLAUDE='$WORK/claudebin/claude'
 exec '$ASK_HOME/.local/lib/termag/termag-subagent-run' "\$@"
 EOF
-chmod +x "$SUB_ROOT/bin/"* "$ASK_HOME/.local/bin/termag-subagent-run"
+chmod +x "$WORK/claudebin/claude" "$ASK_HOME/.local/bin/termag-subagent-run"
 
 echo "--- asks the box can't take yet"
 
@@ -159,9 +131,9 @@ check "box stop on the parent's credentials" stopping "$(on_box1 box stop askbox
 check "the box settles to stopped" stopped "$(wait_status askbox stopped)"
 # An ask to it is held and the orchestrator starts the box itself; the CLI
 # leaves at once (--no-wait), as one that died would. The run is sent only
-# once the connect's credential delivery has finished, so it finds the
-# gateway settings (removed here first, as on a box whose gateway was off
-# while it was parked) and completes; with nobody polling, its reply is dropped.
+# once the connect's credential delivery has finished (the gateway settings
+# are removed here first, as on a box whose gateway was off while it was
+# parked) and completes; with nobody polling, its reply is dropped.
 HOME="$ASK_HOME" TERMAG_CREDENTIALS_SUDO='' TERMAG_CLAUDE_MANAGED_SETTINGS="$ROOT/boxes/askbox/etc/claude-code/managed-settings.json" \
   bash "$repo/deploy/termag-credentials" remove claude-gateway </dev/null >/dev/null 2>&1
 check "the stopped box has no gateway settings" no "$(yes_if test -s "$ASK_HOME/.config/termag/claude-gateway.json")"
@@ -190,7 +162,7 @@ fi
 check "its prompt is gone from the row" "" "$("${PSQL[@]}" -c "select 1 from agent_messages where id = '$queued_id' and (\"queuedPrompt\" is not null or \"queuedUntil\" is not null)")"
 check "box start --wait on a running box" running "$(on_box1 box start askbox --wait --timeout 300 --json 2>/dev/null | jq -r .box.state)"
 
-echo "--- the ask runs on the box in the sandbox"
+echo "--- the ask runs on the box as its owner, in a clone"
 askable=
 for _ in $(seq 1 60); do
   askable=$(on_box1 ask --targets --json 2>/dev/null \
@@ -199,29 +171,41 @@ for _ in $(seq 1 60); do
 done
 check "askbox/sample is askable" true "$askable"
 
-set_setup() { "${PSQL[@]}" -c "update projects set \"setupStatus\" = '$1' where name = 'sample' and \"instanceId\" = (select id from instances where name = 'askbox' and status <> 'terminated')" >/dev/null; }
+set_setup() { "${PSQL[@]}" -c "update projects set \"setupStatus\" = '$1', \"setupError\" = ${2:-null} where name = 'sample' and \"instanceId\" = (select id from instances where name = 'askbox' and status <> 'terminated')" >/dev/null; }
+wait_ended() {
+  local s=
+  for _ in $(seq 1 60); do
+    s=$("${PSQL[@]}" -c "select status from agent_messages where id = '$1' and status in ('completed', 'failed', 'canceled')")
+    [ -n "$s" ] && break; sleep 1
+  done
+  echo "$s"
+}
 before=$(setup_status)
+# An ask while the project clones is held until the clone is done, then runs.
 set_setup cloning
-on_box1 ask askbox/sample "too early" >"$WORK/cloning.out" 2>&1
-check "an ask while the project clones is rejected" "1 yes" "$? $(yes_if grep -q 'still being set up' "$WORK/cloning.out")"
+on_box1 ask askbox/sample "while cloning" --no-wait --json >"$WORK/cloning.json" 2>"$WORK/cloning.err"
+check "an ask while the project clones is held" "0 TASK_STATE_SUBMITTED" "$? $(jq -r .status.state "$WORK/cloning.json" 2>/dev/null)"
+cloning_id=$(jq -r .id "$WORK/cloning.json" 2>/dev/null)
+sleep 6
+check "it stays held while the clone runs" submitted "$("${PSQL[@]}" -c "select status from agent_messages where id = '$cloning_id' and \"queuedPrompt\" is not null")"
 set_setup "$before"
-
-# The orchestrator delivered the gateway's settings when the agent connected;
-# replace them with a stand-in helper the stub claude can name.
-sleep 2
-printf '#!/bin/sh\necho e2e-gateway-key\n' >"$ASK_HOME/.config/termag/api-key-helper"; chmod +x "$ASK_HOME/.config/termag/api-key-helper"
-jq -n --arg h "$ASK_HOME/.config/termag/api-key-helper" '{apiKeyHelper: $h, env: {ANTHROPIC_BASE_URL: "http://127.0.0.1:9/gateway"}}' \
-  >"$ASK_HOME/.config/termag/claude-gateway.json"
+check "it runs once the project is set up" completed "$(wait_ended "$cloning_id")"
+# A clone that fails fails the held ask with its error.
+set_setup cloning
+on_box1 ask askbox/sample "clone fails" --no-wait --json >"$WORK/clonefail.json" 2>"$WORK/clonefail.err"
+clonefail_id=$(jq -r .id "$WORK/clonefail.json" 2>/dev/null)
+set_setup failed "'Repository not found'"
+check "a failed clone fails the held ask" failed "$(wait_ended "$clonefail_id")"
+check "its error says why" yes "$(yes_if test -n "$("${PSQL[@]}" -c "select 1 from agent_messages where id = '$clonefail_id' and error like '%failed to set up: Repository not found%never ran%'")")"
+set_setup "$before"
 
 on_box1 ask askbox/sample "say hi" --timeout 120 >"$WORK/ask.out" 2>"$WORK/ask.err"
 check "the ask exits 0" 0 $?
-check "the reply came from a sandbox run in the thread's clone" yes \
-  "$(yes_if grep -qF 'sandbox-run prompt=[say hi] where=thread readme=[# e2e-org/sample] bash=false curl-denied=true helper=termag-subagent-token resume=none' "$WORK/ask.out")"
+check "the reply came from a run in the thread's clone, as the box user, outside tmux" yes \
+  "$(yes_if grep -qF "ask-run prompt=[say hi] where=thread readme=[# e2e-org/sample] mode=bypassPermissions user=$(id -un) tmux=none resume=none" "$WORK/ask.out")"
 thread=$(sed -nE 's/^thread: ([a-z0-9]+).*/\1/p' "$WORK/ask.out" | head -n1)
 check "the reply names its thread" yes "$(yes_if test -n "$thread")"
-check "the thread's clone is in the sandbox root" yes "$(yes_if test -d "$SUB_ROOT/threads/$thread/repo")"
-check "the run went through systemd-run with the network cut" yes \
-  "$(yes_if grep -q 'IPAddressDeny=any .*IPAddressAllow=localhost' "$SUB_ROOT/systemd-run.log")"
+check "the thread's clone is under the box user's home" yes "$(yes_if test -d "$ASK_HOME/.termag/subagent/threads/$thread/repo")"
 
 on_box1 ask askbox/sample "again" --thread "$thread" --timeout 120 >"$WORK/again.out" 2>"$WORK/again.err"
 check "a follow-up exits 0" 0 $?

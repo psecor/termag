@@ -27,6 +27,11 @@ if [ -n "${E2E_TEST_CLAUDE_GATEWAY:-}" ]; then
   export E2E_CLAUDE_GATEWAY=$E2E_TEST_CLAUDE_GATEWAY \
     E2E_CLAUDE_GATEWAY_PORT=$((3643 + S)) E2E_CLAUDE_GATEWAY_ENVOY_PORT=$((18080 + S)) \
     E2E_GITHUB_BROKER_PORT=$((3644 + S)) E2E_STS_PORT=$((4691 + S))
+  # The MCP broker, when the checkout's gateway has its listener.
+  if grep -q 'variable "mcp_listen_port"' "$E2E_TEST_CLAUDE_GATEWAY/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config/main.tf" 2>/dev/null; then
+    E2E_FLAGS=$(jq -c '. + {"mcp-broker-enabled": true}' <<<"${E2E_FLAGS:-{\}}") || { echo 'E2E_FLAGS is not a JSON object' >&2; exit 1; }
+    export E2E_FAKE_MCP=1 E2E_MCP_PORT=$((4693 + S)) E2E_MCP_BROKER_PORT=$((3646 + S)) E2E_FLAGS
+  fi
 fi
 trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
@@ -502,6 +507,114 @@ if [ -n "${E2E_CLAUDE_GATEWAY:-}" ]; then
   curl -s -o /dev/null -b "$JAR" -X DELETE "$API/api/credentials/github"
   check "after disconnect the broker refuses, and says why" "Connect GitHub on the termag Credentials page first" \
     "$(ghf -H "$(box_auth box-1)" "$GHF/api/v3/user" | jq -r .message)"
+fi
+
+if [ -n "${E2E_FAKE_MCP:-}" ]; then
+  echo "--- E2E_FAKE_MCP (connector -> delivery -> box's Claude Code entry -> Envoy ext_authz -> MCP server)"
+  MCPU="https://localhost:$E2E_MCP_PORT"
+  mcpc() { curl -s --cacert "$ROOT/tls/ca.pem" "$@"; }
+  conn=$(curl -s -b "$JAR" -H 'content-type: application/json' "$API/api/mcp-connectors" \
+    -d "{\"name\":\"stub\",\"upstream\":\"$MCPU/mcp\",\"auth\":{\"type\":\"static\",\"headers\":{\"authorization\":\"Bearer {{secret.token}}\"}},\"secrets\":{\"token\":\"e2e-mcp-secret\"}}")
+  cid=$(jq -r .id <<<"$conn")
+  check "a static connector is created, with its broker URL" "https://localhost:$E2E_MCP_BROKER_PORT/c/$cid" "$(jq -r .brokerUrl <<<"$conn")"
+  check "a loopback, IP or non-443 upstream is refused" "400 400 400" \
+    "$(for u in https://127.0.0.2/mcp https://localhost:1/mcp https://10.0.0.1/mcp; do curl -s -o /dev/null -w '%{http_code} ' -b "$JAR" -H 'content-type: application/json' "$API/api/mcp-connectors" \
+         -d "{\"name\":\"x\",\"upstream\":\"$u\",\"auth\":{\"type\":\"static\",\"headers\":{\"a\":\"b\"}}}"; done | sed 's/ $//')"
+  cj="$ROOT/boxes/box-1/home/.claude.json"
+  for _ in $(seq 1 40); do [ "$(jq -r '.mcpServers.stub.url // empty' "$cj" 2>/dev/null)" ] && break; sleep 0.25; done
+  check "box-1 (ec2) gets a Claude Code entry pointed at the broker" "http https://localhost:$E2E_MCP_BROKER_PORT/c/$cid" \
+    "$(jq -r '.mcpServers.stub | "\(.type) \(.url)"' "$cj" 2>&1)"
+  check "and no box file holds the connector's secret" "" "$(grep -rlF e2e-mcp-secret "$ROOT/boxes" 2>/dev/null)"
+  hdrs=$(inbox box-1 "$(jq -r .mcpServers.stub.headersHelper "$cj")")
+  check "its headersHelper prints the box token as a bearer" "Bearer $(box_tok box-1)" "$(jq -r .Authorization <<<"$hdrs")"
+  BU=$(jq -r .mcpServers.stub.url "$cj")
+  rpc() { mcpc -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' "$@"; }
+  init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'
+  check "initialize through the broker with the box token" e2e-mcp-upstream \
+    "$(rpc -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$BU" | jq -r .result.serverInfo.name)"
+  t0=$(date +%s%N)
+  first=$(rpc -N -H "Authorization: Bearer $(box_tok box-1)" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}' "$BU" \
+    | while IFS= read -r l; do case $l in data:*) echo "$(( ($(date +%s%N) - t0) / 1000000 ))"; break ;; esac; done)
+  check "a streamed tool call's first event arrives before the result is ready" yes "$([ "${first:-9999}" -lt 1000 ] && echo yes || echo "no (${first}ms)")"
+  check "the server saw the connector's credential and never a box token" "true false" \
+    "$(mcpc "$MCPU/_e2e/calls" | jq -r '[.[] | .authed] | all | tostring' ) $(mcpc "$MCPU/_e2e/calls" | jq -r '[.[] | .boxToken] | any | tostring')"
+  n=$(mcpc "$MCPU/_e2e/calls" | jq length)
+  check "box-2 (external), no token and an unknown connector are refused before the server" "403 403 404 $n" \
+    "$(rpc -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-2)" -d "$init" "$BU") $(rpc -o /dev/null -w '%{http_code}' -d "$init" "$BU") $(rpc -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "https://localhost:$E2E_MCP_BROKER_PORT/c/nosuchconnector") $(mcpc "$MCPU/_e2e/calls" | jq length)"
+  check "OAuth metadata is never served to a box" "404 $n" \
+    "$(rpc -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" "https://localhost:$E2E_MCP_BROKER_PORT/.well-known/oauth-protected-resource/c/$cid") $(mcpc "$MCPU/_e2e/calls" | jq length)"
+  mcpc -o /dev/null -d 'authorization=Bearer rotated' "$MCPU/_e2e/require"
+  rpc -D "$WORK/mcp401.h" -o "$WORK/mcp401.b" -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$BU"
+  check "an upstream 401 reaches the box without WWW-Authenticate, naming the Settings link" "no yes" \
+    "$(grep -qi '^www-authenticate' "$WORK/mcp401.h" && echo yes || echo no) $(jq -r .error.message "$WORK/mcp401.b" | grep -q "settings/mcp?server=$cid" && echo yes || echo no)"
+  mcpc -o /dev/null -d 'authorization=Bearer e2e-mcp-secret' "$MCPU/_e2e/require"
+  curl -s -o /dev/null -b "$JAR" -X PATCH -H 'content-type: application/json' -d '{"secrets":{"token":null}}' "$API/api/mcp-connectors/$cid"
+  check "with its secret unset the broker refuses, and says which" '403 MCP server "stub": secret "token" is not set. Set it on the termag Settings page' \
+    "$(rpc -o "$WORK/mcp403.b" -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$BU") $(jq -r .message "$WORK/mcp403.b")"
+  curl -s -o /dev/null -b "$JAR" -X DELETE "$API/api/mcp-connectors/$cid"
+  for _ in $(seq 1 40); do [ -z "$(jq -r '.mcpServers.stub // empty' "$cj" 2>/dev/null)" ] && break; sleep 0.25; done
+  check "deleting the connector drops box-1's entry" "" "$(jq -r '.mcpServers.stub // empty' "$cj" 2>&1)"
+  for _ in $(seq 1 60); do # Envoy flushes its access log about every 10 s
+    grep -q "\"connector\":\"$cid\"" "$ROOT/logs/claude-gateway.log" && break; sleep 0.5
+  done
+  check "Envoy's access log names the connector and holds no token or secret" "yes no" \
+    "$(grep -q "\"connector\":\"$cid\"" "$ROOT/logs/claude-gateway.log" && echo yes || echo no) $(grep -qF -e e2e-mcp-secret -e "$(box_tok box-1)" "$ROOT/logs/claude-gateway.log" && echo yes || echo no)"
+
+  echo "--- E2E_FAKE_MCP OAuth (discovery -> DCR -> authorize -> callback -> refresh rotation -> relink)"
+  asctl() { mcpc -H 'content-type: application/json' -d "$1" "$MCPU/_e2e/as"; }
+  # 30 s tokens are inside the refresh margin, so every broker request refreshes.
+  asctl '{"ttl":30}' >/dev/null
+  oac=$(curl -s -b "$JAR" -H 'content-type: application/json' "$API/api/mcp-connectors" -d "{\"name\":\"oa\",\"upstream\":\"$MCPU/mcp\",\"auth\":{\"type\":\"oauth\"}}")
+  oid=$(jq -r .id <<<"$oac")
+  check "an oauth connector is created unlinked, with its discovered issuer" "needs_link $MCPU/as" "$(jq -r '"\(.linkStatus) \(.oauth.issuer)"' <<<"$oac")"
+  check "a server without PKCE S256 is refused at create" 400 \
+    "$(asctl '{"s256":false}' >/dev/null; curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H 'content-type: application/json' "$API/api/mcp-connectors" -d "{\"name\":\"oa2\",\"upstream\":\"$MCPU/mcp\",\"auth\":{\"type\":\"oauth\"}}"; asctl '{"s256":true}' >/dev/null)"
+  for _ in $(seq 1 40); do [ "$(jq -r '.mcpServers.oa.url // empty' "$cj" 2>/dev/null)" ] && break; sleep 0.25; done
+  OU=$(jq -r .mcpServers.oa.url "$cj")
+  check "before it is linked the broker refuses with the link message" "403 yes" \
+    "$(rpc -o "$WORK/oa403.b" -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU") $(jq -r .message "$WORK/oa403.b" | grep -q "is not linked.*settings/mcp?server=$oid" && echo yes || echo no)"
+  oauth_link() {
+    local start loc q
+    start=$(curl -s -b "$JAR" -X POST "$API/api/mcp-connectors/$oid/oauth/start" | jq -r .authorizeUrl)
+    loc=$(mcpc -o /dev/null -w '%{redirect_url}' "$start")
+    q=${loc#*\?}
+    echo "$start" >"$WORK/oa-start"
+    echo "$q" >"$WORK/oa-callback-query"
+    curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -b "$JAR" "$API/api/mcp-connectors/oauth/callback?$q"
+  }
+  linked=$(oauth_link)
+  check "the authorize URL carries PKCE S256, state and the resource" "S256 yes $MCPU/mcp" \
+    "$(python3 -c 'import sys,urllib.parse as u; q=dict(u.parse_qsl(u.urlsplit(open(sys.argv[1]).read().strip()).query)); print(q["code_challenge_method"], "yes" if q.get("state") else "no", q["resource"])' "$WORK/oa-start")"
+  check "the callback links it and returns to Settings" "303 yes" "$(awk '{print $1}' <<<"$linked") $(grep -q "settings/mcp?server=$oid&linked=1" <<<"$linked" && echo yes || echo no)"
+  check "a replayed callback is refused" yes \
+    "$(curl -s -o /dev/null -w '%{redirect_url}' -b "$JAR" "$API/api/mcp-connectors/oauth/callback?$(cat "$WORK/oa-callback-query")" | grep -q 'error=' && echo yes || echo no)"
+  check "a callback without the session is refused" 401 \
+    "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/mcp-connectors/oauth/callback?$(cat "$WORK/oa-callback-query")")"
+  check "the connector reads linked" linked \
+    "$(curl -s -b "$JAR" "$API/api/mcp-connectors" | jq -r --arg id "$oid" '.connectors[] | select(.id == $id) | .linkStatus')"
+  n0=$(mcpc "$MCPU/_e2e/calls" | jq length)
+  codes=$(for _ in 1 2 3; do rpc -o /dev/null -w '%{http_code} ' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU"; done)
+  par=$( (rpc -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU" & rpc -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU"; wait) | sort | tr '\n' ' ')
+  check "three requests and two concurrent ones go through, each refreshing once, never reusing a refresh token" "200 200 200 | 200 200 | 5 0" \
+    "${codes% } | ${par% } | $(asctl '{}' | jq -r '"\(.stats.refreshes) \(.stats.reuse)"')"
+  check "the server saw the OAuth token and never a box token" "true false" \
+    "$(mcpc "$MCPU/_e2e/calls" | jq -r --argjson n "$n0" '[.[$n:][] | select(.path == "/mcp") | .authed] | all | tostring') $(mcpc "$MCPU/_e2e/calls" | jq -r --argjson n "$n0" '[.[$n:][] | .boxToken] | any | tostring')"
+  check "unlink revokes at the server and the broker asks for a link again" "1 needs_link 403" \
+    "$(curl -s -o /dev/null -b "$JAR" -X DELETE "$API/api/mcp-connectors/$oid/oauth"; asctl '{}' | jq -r .stats.revoked) $(curl -s -b "$JAR" "$API/api/mcp-connectors" | jq -r --arg id "$oid" '.connectors[] | select(.id == $id) | .linkStatus') $(rpc -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU")"
+  linked=$(oauth_link)
+  check "re-linking registers a new client, since unlink forgot the old one, and works" "303 2 200" \
+    "$(awk '{print $1}' <<<"$linked") $(asctl '{}' | jq -r .stats.registered) $(rpc -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU")"
+  asctl '{"revokeAll":true}' >/dev/null
+  check "a refresh the server refuses turns into a link request, not a retry" "403 yes needs_link" \
+    "$(rpc -o "$WORK/oa403.b" -w '%{http_code}' -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU") $(jq -r .message "$WORK/oa403.b" | grep -q 'is not linked' && echo yes || echo no) $(curl -s -b "$JAR" "$API/api/mcp-connectors" | jq -r --arg id "$oid" '.connectors[] | select(.id == $id) | .linkStatus')"
+  r0=$(asctl '{}' | jq -r '.stats.refused | length')
+  rpc -o /dev/null -H "Authorization: Bearer $(box_tok box-1)" -d "$init" "$OU"
+  check "and the next request does not go to the token endpoint" "$r0" "$(asctl '{}' | jq -r '.stats.refused | length')"
+  curl -s -o /dev/null -b "$JAR" -X DELETE "$API/api/mcp-connectors/$oid"
+  for _ in $(seq 1 40); do [ -z "$(jq -r '.mcpServers.oa // empty' "$cj" 2>/dev/null)" ] && break; sleep 0.25; done
+  check "deleting it drops box-1's entry" "" "$(jq -r '.mcpServers.oa // empty' "$cj" 2>&1)"
+  check "no OAuth token or code reaches a box, the backend log or Envoy's log" "" \
+    "$(grep -rlE '\b(at|rt|code)-[A-Za-z0-9_-]{24}\b' "$ROOT/boxes" "$ROOT/logs/backend.log" "$ROOT/logs/claude-gateway.log" 2>/dev/null)"
 fi
 
 echo "--- E2E_SSHD"

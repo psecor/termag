@@ -137,6 +137,33 @@ check "a download URL serves the file" "hello spaces" "$(curl -s "$(echo "$dl" |
 check "it downloads as an attachment" yes "$(curl -sI "$(echo "$dl" | jq -r .url)" | grep -qi '^content-disposition: attachment' && echo yes || echo no)"
 check "a path outside the space is refused" 400 "$(status POST /spaces/team/files/download '{"path":"../x"}')"
 
+echo "--- direct links"
+link_path=/termag/files/team/docs/note.txt
+check "space url prints the file's /termag/files/ link" "$link_path" \
+  "$(on_box box-1 space url team:docs/note.txt 2>/dev/null | sed -E 's#^https?://[^/]+##')"
+check "space url of a missing file is exit 3" 3 "$(on_box box-1 space url team:docs/nope.txt >/dev/null 2>&1; echo $?)"
+loc=$(curl -s -o /dev/null -w '%{redirect_url}' -b "$JAR" "$API/files/team/docs/note.txt")
+check "a signed-in link is a 302 to storage" "$AWS/$BUCKET/" "$(printf '%s' "$loc" | grep -o "^$AWS/$BUCKET/")"
+check "which serves the file" "hello spaces" "$(curl -s "$loc")"
+check "plain text opens inline" yes "$(curl -sI "$loc" | grep -qi '^content-disposition: inline' && echo yes || echo no)"
+printf '<script>alert(1)</script>' >"$WORK/box-1/page.html"
+on_box box-1 space put page.html team:docs/page.html >/dev/null 2>&1
+html_loc=$(curl -s -o /dev/null -w '%{redirect_url}' -b "$JAR" "$API/files/team/docs/page.html")
+html_head=$(curl -sI "$html_loc" | tr -d '\r')
+check "HTML downloads as an attachment" yes "$(printf '%s' "$html_head" | grep -qi '^content-disposition: attachment' && echo yes || echo no)"
+check "typed application/octet-stream" "application/octet-stream" "$(printf '%s' "$html_head" | sed -n 's/^content-type: //Ip')"
+check "a missing file is 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$API/files/team/docs/nope.txt")"
+check "an unknown space is the same 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$API/files/nope/docs/note.txt")"
+check "the link works through the frontend's proxy" 302 \
+  "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://localhost:$E2E_FRONTEND_PORT$link_path")"
+ANON="$WORK/anon-cookies"
+check "signed out, the link sends you to sign in" "/termag/auth/login" \
+  "$(curl -s -o /dev/null -w '%{redirect_url}' -c "$ANON" -b "$ANON" "$API/files/team/docs/note.txt" | sed -E 's#^https?://[^/]+##')"
+check "and signing in comes back to the link" "$link_path" \
+  "$(curl -s -o /dev/null -w '%{redirect_url}' -c "$ANON" -b "$ANON" "$API/auth/login" | sed -E 's#^https?://[^/]+##')"
+check "the link's GET is an event" true \
+  "$(browser GET /spaces/team/events | jq -r '[.events[] | select(.action == "file.get" and .path == "docs/page.html" and .actorInstanceId == null)] | length > 0')"
+
 echo "--- audit"
 events=$(browser GET /spaces/team/events)
 check "the box's puts are events, with the box as actor" true \

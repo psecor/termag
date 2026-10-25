@@ -46,6 +46,41 @@ function sigv4(auth) {
   return m ? { accessKeyId: m[1], region: m[2], service: m[3] } : null;
 }
 
+// A scripted tool turn, so a real Claude Code session can be driven through a
+// tool it was given (an MCP server's, say). A user line `call <tool> <text>`
+// gets a ToolSearch `select:<tool>` while the tool is deferred, then a
+// tool_use with {text}, then a reply quoting the tool's result.
+const blocksOf = c => (typeof c === 'string' ? [{ type: 'text', text: c }] : c ?? []);
+function textOf(content) {
+  return blocksOf(content).map(b => (b.type === 'text' ? b.text : b.content !== undefined ? textOf(b.content) : '')).join('\n');
+}
+function scriptedTurn(request) {
+  const msgs = (request.messages ?? []).filter(x => x.role !== 'system');
+  let ask = null; let askAt = -1;
+  msgs.forEach((x, i) => {
+    if (x.role !== 'user') return;
+    for (const b of blocksOf(x.content)) {
+      const m = b.type === 'text' && !b.text.startsWith('<system-reminder>') && /^call ([\w-]+)[ \t]*(.*)/m.exec(b.text);
+      if (m) { ask = m; askAt = i; }
+    }
+  });
+  const last = msgs.at(-1);
+  if (!ask || last?.role !== 'user') return null;
+  const [, name, arg] = ask;
+  const ours = msgs.slice(askAt + 1).filter(x => x.role === 'assistant').flatMap(x => blocksOf(x.content))
+    .filter(b => b.type === 'tool_use' && String(b.id).startsWith('toolu_e2e'));
+  const called = ours.find(b => b.name === name);
+  if (called) {
+    const result = blocksOf(last.content).find(b => b.type === 'tool_result' && b.tool_use_id === called.id);
+    return result ? { text: `(fake Bedrock) ${name} answered: ${textOf(result.content).slice(0, 200)}` } : null;
+  }
+  const use = (tool, input) => ({ toolUse: { type: 'tool_use', id: `toolu_e2e${randomUUID().slice(0, 8)}`, name: tool, input } });
+  const tools = (request.tools ?? []).map(t => t.name);
+  if (tools.includes(name) || ours.some(b => b.name === 'ToolSearch')) return use(name, { text: arg.trim() });
+  if (tools.includes('ToolSearch')) return use('ToolSearch', { query: `select:${name}`, max_results: 1 });
+  return null;
+}
+
 createServer((req, res) => {
   let body = '';
   req.on('data', c => { body += c; });
@@ -71,7 +106,9 @@ createServer((req, res) => {
     let request = {};
     try { request = JSON.parse(body); } catch { /* reported below */ }
     const prompt = (request.messages ?? []).map(x => (typeof x.content === 'string' ? x.content : JSON.stringify(x.content))).join(' ');
-    const text = `(fake Bedrock) ${model} says hello; you said: ${prompt.slice(0, 80)}`;
+    const scripted = scriptedTurn(request);
+    const toolUse = scripted?.toolUse;
+    const text = scripted?.text ?? (toolUse ? JSON.stringify(toolUse.input) : `(fake Bedrock) ${model} says hello; you said: ${prompt.slice(0, 80)}`);
     const inputTokens = Math.max(1, Math.ceil(prompt.length / 4));
     const outputTokens = Math.max(1, Math.ceil(text.length / 4));
     const requestId = randomUUID();
@@ -84,7 +121,7 @@ createServer((req, res) => {
     }
     const message = {
       id: `msg_${requestId.slice(0, 8)}`, type: 'message', role: 'assistant', model,
-      content: [{ type: 'text', text }], stop_reason: 'end_turn',
+      content: [toolUse ?? { type: 'text', text }], stop_reason: toolUse ? 'tool_use' : 'end_turn',
       usage: { input_tokens: inputTokens, output_tokens: outputTokens },
     };
     if (op === 'invoke') {
@@ -96,12 +133,17 @@ createServer((req, res) => {
     }
     res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream', 'x-amzn-requestid': requestId });
     res.write(frame({ type: 'message_start', message: { ...message, content: [], usage: { input_tokens: inputTokens, output_tokens: 0 } } }));
-    res.write(frame({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
-    for (const piece of text.match(/.{1,24}/g)) {
-      res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } }));
+    if (toolUse) {
+      res.write(frame({ type: 'content_block_start', index: 0, content_block: { ...toolUse, input: {} } }));
+      res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: text } }));
+    } else {
+      res.write(frame({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }));
+      for (const piece of text.match(/.{1,24}/gs)) {
+        res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } }));
+      }
     }
     res.write(frame({ type: 'content_block_stop', index: 0 }));
-    res.write(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: outputTokens } }));
+    res.write(frame({ type: 'message_delta', delta: { stop_reason: message.stop_reason }, usage: { output_tokens: outputTokens } }));
     res.end(frame({
       type: 'message_stop',
       'amazon-bedrock-invocationMetrics': { inputTokenCount: inputTokens, outputTokenCount: outputTokens },

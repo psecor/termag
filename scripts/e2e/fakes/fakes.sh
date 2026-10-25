@@ -7,6 +7,11 @@
 # docs/e2e-stack.md describes each one and what it does not cover.
 #
 #   E2E_FAKE_AWS=1     Floci (S3, SSM, KMS, Secrets Manager, STS, EC2, IAM, ...)
+#   E2E_FLOCI=native|docker
+#                      how Floci runs (fakes/floci.sh): its native Linux build, or the
+#                      floci/floci image (E2E_FLOCI_IMAGE) in one container named for the
+#                      stack root. Unset: native where there is a build (Linux), else
+#                      Docker (macOS) when it is running
 #   E2E_AWS_SEED=f     script run once Floci is up (E2E_AWS_URL set, aws.sh on PATH)
 #   E2E_SPACES=1       the spaces bucket and KMS alias in Floci, under the names the
 #                      backend derives (fakes/spaces.sh); needs FAKE_AWS. Turn the
@@ -15,7 +20,15 @@
 #                      the per-user credential store's KMS key in Floci, and its ARN
 #                      in the backend env; needs FAKE_AWS
 #   E2E_FAKE_CLAUDE=1  stand-in claude CLI on every box, reporting status
+#   E2E_T3=1           the desktop app's box bridge: every box's
+#                      agent runs a t3 server (upstream's release archive, pinned by digest
+#                      in fakes/t3.sh, downloaded once into E2E_CACHE_DIR), and
+#                      desktop-app-enabled is on
+#   E2E_T3_COMMAND=c   with E2E_T3: the t3 command boxes run instead (a fork's build, say)
+#   E2E_CLAUDE_BIN=p   a real claude binary on every box's PATH (not with E2E_FAKE_CLAUDE)
 #   E2E_FAKE_GITHUB=1  api.github.com + github.com git stub for the backend, stand-in gh on boxes
+#   E2E_PANE_CLONE=1   boxes clone a repository in the agent pane, as an agent without the
+#                      durable clone unit does, instead of through termag-project-clone@
 #   E2E_TLS=1          nginx gateway from deploy/nginx; boxes connect over wss
 #   E2E_BROKER_443=1   with E2E_CLAUDE_GATEWAY: relay 127.0.0.1:443 (from the box address) to
 #                      the gateway's GitHub broker front and point the backend's
@@ -28,6 +41,11 @@
 #                      listeners check each request through the checks ALB's stand-in
 #                      (and the real :3041 nginx listener) and prove their caller to an
 #                      STS stub that verifies SigV4
+#   E2E_FAKE_MCP=1     with E2E_CLAUDE_GATEWAY (a checkout with the MCP broker listener):
+#                      an MCP server stub over HTTPS (fakes/mcp-upstream.mjs) that wants
+#                      `Authorization: Bearer e2e-mcp-secret`, the broker listener behind
+#                      its own TLS front, and the backend's MCP_BROKER_URL; turn the
+#                      feature on with E2E_FLAGS='{"mcp-broker-enabled":true}'
 #   E2E_SSHD=1         an sshd per box whose logins land in that box's home
 #   E2E_EC2_BOXES=N    register the first N boxes as kind=ec2 instead of external
 #   E2E_EC2_LAUNCH=1   box provisioning on: a launched EC2 instance starts a box
@@ -37,7 +55,11 @@
 #                      additive db:push, db:guard (trust auth accepts the tokens)
 #   E2E_WARM_POOL=N    with E2E_EC2_LAUNCH: keep N warm-pool boxes; pool boxes get a
 #                      systemctl stand-in that runs the on-warm/on-claim units
-#   E2E_FLAGS=json     flag values for the backend's TERMAG_FLAGS, e.g. '{"warm-pool-enabled":true}'
+#   E2E_DOTFILES_SCRIPTS=1
+#                      a claim runs the dotfiles repository's install script or chezmoi;
+#                      without it every box has TERMAG_DOTFILES_NO_SCRIPTS=1, so a claim
+#                      only links the repository's top-level dotfiles
+#   E2E_FLAGS=json     flag values (TERMAG_FLAGS), e.g. '{"warm-pool-enabled":true}'
 #   E2E_BACKEND_ENV=f  extra lines appended to the backend's env file
 #   E2E_OVERLAP=1      the orchestrator lease on, with second-scale timings, a second
 #                      backend ready to start as `ctl.sh start backend-green` on
@@ -49,6 +71,7 @@ CREDENTIAL_STORE=${E2E_CREDENTIAL_STORE:-}
 SPACES=${E2E_SPACES:-}
 FAKE_CLAUDE=${E2E_FAKE_CLAUDE:-}
 FAKE_GITHUB=${E2E_FAKE_GITHUB:-}
+DOTFILES_SCRIPTS=${E2E_DOTFILES_SCRIPTS:-}
 FAKE_TLS=${E2E_TLS:-}
 BROKER_443=${E2E_BROKER_443:-}
 FAKE_BEDROCK=${E2E_FAKE_BEDROCK:-}
@@ -58,6 +81,9 @@ CLAUDE_GW_PORT=${E2E_CLAUDE_GATEWAY_PORT:-3643}
 ENVOY_PORT=${E2E_CLAUDE_GATEWAY_ENVOY_PORT:-18080}
 GITHUB_GW_PORT=${E2E_GITHUB_BROKER_PORT:-3644}
 STS_PORT=${E2E_STS_PORT:-4691}
+FAKE_MCP=${E2E_FAKE_MCP:-}
+MCP_PORT=${E2E_MCP_PORT:-4693}
+MCP_GW_PORT=${E2E_MCP_BROKER_PORT:-3646}
 # The key the harness gives Envoy, and the role the STS stub says it belongs to.
 GATEWAY_KEY_ID=AKIAE2ECLAUDEGATEWAY # gitleaks:allow (a fake key the STS stub knows)
 GATEWAY_ROLE=termag-claude-gateway-task
@@ -66,11 +92,20 @@ TMUX_FAULTS=${E2E_TMUX_FAULTS:-}
 PG_IAM=${E2E_PG_IAM:-}
 EC2_BOXES=${E2E_EC2_BOXES:-0}
 EC2_LAUNCH=${E2E_EC2_LAUNCH:-}
-EC2_PORT=${E2E_EC2_PORT:-4567}
+# 4566/4567 are where LocalStack-style emulators listen, and on a Mac (where
+# this Floci runs in Docker) one is often up already.
+if [ "$(uname -s)" = Darwin ]; then
+  aws_port_default=4586 ec2_port_default=4587
+else
+  aws_port_default=4566 ec2_port_default=4567
+fi
+EC2_PORT=${E2E_EC2_PORT:-$ec2_port_default}
 WARM_POOL=${E2E_WARM_POOL:-}
 WARM_POOL_TICK=${E2E_WARM_POOL_TICK:-5}
 FLAGS=${E2E_FLAGS:-}
-AWS_PORT=${E2E_AWS_PORT:-4566}
+AWS_PORT=${E2E_AWS_PORT:-$aws_port_default}
+FLOCI_MODE=${E2E_FLOCI:-}
+FLOCI_IMAGE=${E2E_FLOCI_IMAGE:-floci/floci:2.1.0-compat}
 AWS_REGION_E2E=${E2E_AWS_REGION:-us-east-2}
 GITHUB_PORT=${E2E_GITHUB_PORT:-4580}
 TLS_PORT=${E2E_TLS_PORT:-3443}
@@ -84,6 +119,29 @@ AWS_SEED=${E2E_AWS_SEED:+$(realpath "$E2E_AWS_SEED")}
 BACKEND_ENV_EXTRA=${E2E_BACKEND_ENV:+$(realpath "$E2E_BACKEND_ENV")}
 OVERLAP=${E2E_OVERLAP:-}
 GREEN_PORT=${E2E_GREEN_PORT:-}
+PANE_CLONE=${E2E_PANE_CLONE:-}
+# Boxes reach GitHub through a broker only with the Claude gateway (its GitHub
+# listener); without one a box's own git config is its only way to GitHub.
+GITHUB_BROKER=${E2E_CLAUDE_GATEWAY:+1}
+T3=${E2E_T3:-}
+T3_COMMAND=${E2E_T3_COMMAND:-}
+CLAUDE_BIN=${E2E_CLAUDE_BIN:-}
+# macOS finds the login keychain under $HOME, and a box has its own HOME: with
+# E2E_CLAUDE_BIN each box links ~/Library/Keychains to yours, so the real
+# claude finds your Claude login (its config and sessions stay in the box's
+# ~/.claude). Recorded here because a box the EC2 fake starts runs without
+# your HOME.
+CLAUDE_KEYCHAINS=
+if [ -n "$CLAUDE_BIN" ] && [ "$(uname -s)" = Darwin ] && [ -d "$HOME/Library/Keychains" ]; then
+  CLAUDE_KEYCHAINS=$HOME/Library/Keychains
+fi
+# The bridge's routes are behind desktop-app-enabled: E2E_T3 turns it on with
+# the other overrides.
+if [ -n "$T3" ]; then
+  FLAGS=$(node -e 'const v = process.argv[1] ? JSON.parse(process.argv[1]) : {}; v["desktop-app-enabled"] = true; process.stdout.write(JSON.stringify(v))' "$FLAGS") \
+    || { printf '[e2e] error: E2E_FLAGS must be a JSON object\n' >&2; exit 1; }
+  export E2E_FLAGS=$FLAGS
+fi
 fakes_dir="$here/fakes"
 
 # Extra environment for the backend process and for each box agent.
@@ -98,6 +156,20 @@ fakes_check() {
   if [ -n "$CREDENTIAL_STORE" ] && [ -z "$FAKE_AWS" ]; then die "E2E_CREDENTIAL_STORE needs E2E_FAKE_AWS=1"; fi
   if [ -n "$SPACES" ] && [ -z "$FAKE_AWS" ]; then die "E2E_SPACES needs E2E_FAKE_AWS=1"; fi
   if [ -n "$EC2_LAUNCH" ] && [ -z "$FAKE_AWS" ]; then die "E2E_EC2_LAUNCH needs E2E_FAKE_AWS=1"; fi
+  if [ -n "$FLOCI_MODE" ] && [ -z "$FAKE_AWS" ]; then die "E2E_FLOCI needs E2E_FAKE_AWS=1"; fi
+  if [ -n "$FAKE_AWS" ]; then
+    case $FLOCI_MODE in
+      native) bash "$fakes_dir/floci.sh" native-ok \
+        || die "E2E_FLOCI=native: Floci has no native build for $(uname -s) $(uname -m); use E2E_FLOCI=docker" ;;
+      docker) bash "$fakes_dir/floci.sh" docker-ok || die "E2E_FLOCI=docker: no Docker daemon answers (start Docker Desktop)" ;;
+      '')
+        if bash "$fakes_dir/floci.sh" native-ok; then FLOCI_MODE=native
+        elif bash "$fakes_dir/floci.sh" docker-ok; then FLOCI_MODE=docker
+        else die "E2E_FAKE_AWS=1 needs Floci, which has no native build for $(uname -s) $(uname -m) and runs in Docker there, but no Docker daemon answers: start Docker Desktop and run this again"
+        fi ;;
+      *) die "E2E_FLOCI must be native or docker, got '$FLOCI_MODE'" ;;
+    esac
+  fi
   if [ -n "$WARM_POOL" ]; then
     case $WARM_POOL in *[!0-9]*) die "E2E_WARM_POOL must be a number, got '$WARM_POOL'" ;; esac
     [ -n "$EC2_LAUNCH" ] || die "E2E_WARM_POOL needs E2E_EC2_LAUNCH=1 (and E2E_FAKE_AWS=1)"
@@ -110,6 +182,12 @@ fakes_check() {
       || die "E2E_FLAGS must be a JSON object of flag key to value, got '$FLAGS'"
   fi
   if [ -n "$AWS_SEED" ] && [ ! -r "$AWS_SEED" ]; then die "E2E_AWS_SEED: cannot read $AWS_SEED"; fi
+  if [ -n "$T3_COMMAND" ] && [ -z "$T3" ]; then die "E2E_T3_COMMAND needs E2E_T3=1"; fi
+  if [ -n "$T3_COMMAND" ] && ! command -v "$T3_COMMAND" >/dev/null 2>&1; then die "E2E_T3_COMMAND: $T3_COMMAND is not runnable"; fi
+  if [ -n "$CLAUDE_BIN" ]; then
+    [ -z "$FAKE_CLAUDE" ] || die "E2E_CLAUDE_BIN and E2E_FAKE_CLAUDE both put a claude on the boxes; pick one"
+    [ -x "$CLAUDE_BIN" ] || die "E2E_CLAUDE_BIN: $CLAUDE_BIN is not executable"
+  fi
   if [ -n "$BACKEND_ENV_EXTRA" ] && [ ! -r "$BACKEND_ENV_EXTRA" ]; then die "E2E_BACKEND_ENV: cannot read $BACKEND_ENV_EXTRA"; fi
   if [ -n "$BROKER_443" ]; then
     [ -n "$CLAUDE_GATEWAY_TF" ] && [ -n "$FAKE_GITHUB" ] || die "E2E_BROKER_443 needs E2E_CLAUDE_GATEWAY and E2E_FAKE_GITHUB=1: the broker is the gateway's"
@@ -123,11 +201,17 @@ fakes_check() {
     [ -f "$CLAUDE_GATEWAY_TF/projects/termag/root-modules/orchestrator/claude-models.json" ] \
       || die "E2E_CLAUDE_GATEWAY: $CLAUDE_GATEWAY_TF has no termag Claude gateway (claude-models.json)"
   fi
+  if [ -n "$FAKE_MCP" ]; then
+    [ -n "$CLAUDE_GATEWAY_TF" ] || die "E2E_FAKE_MCP needs E2E_CLAUDE_GATEWAY: the broker is the gateway's"
+    grep -q 'variable "mcp_listen_port"' "$CLAUDE_GATEWAY_TF/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config/main.tf" \
+      || die "E2E_FAKE_MCP: $CLAUDE_GATEWAY_TF's gateway has no MCP broker listener"
+  fi
   local ports=()
   [ -n "$BROKER_443" ] && ports+=(443)
   [ -n "$FAKE_BEDROCK" ] && ports+=("$BEDROCK_PORT")
+  [ -n "$FAKE_MCP" ] && ports+=("$MCP_PORT" "$MCP_GW_PORT")
   [ -n "$CLAUDE_GATEWAY_TF" ] && ports+=("$CLAUDE_GW_PORT" "$GITHUB_GW_PORT" "$STS_PORT" "$ENVOY_PORT" \
-    $((ENVOY_PORT + 1)) $((ENVOY_PORT + 2)) $((ENVOY_PORT + 3)) $((ENVOY_PORT + 4)) $((ENVOY_PORT + 5)))
+    $((ENVOY_PORT + 1)) $((ENVOY_PORT + 2)) $((ENVOY_PORT + 3)) $((ENVOY_PORT + 4)) $((ENVOY_PORT + 5)) $((ENVOY_PORT + 6)))
   [ -n "$FAKE_AWS" ] && ports+=("$AWS_PORT")
   [ -n "$EC2_LAUNCH" ] && ports+=("$EC2_PORT")
   [ -n "$FAKE_GITHUB" ] && ports+=("$GITHUB_PORT")
@@ -149,22 +233,57 @@ fakes_check() {
 
 fakes_record() {
   cat >>"$ROOT/stack.env" <<EOF
-FAKES="${PG_IAM:+pg-iam }${FAKE_AWS:+aws }${CREDENTIAL_STORE:+credential-store }${SPACES:+spaces }${FAKE_BEDROCK:+bedrock }${CLAUDE_GATEWAY_TF:+claude-gateway }${EC2_LAUNCH:+ec2-launch }${WARM_POOL:+warm-pool }${FLAGS:+flags }${FAKE_CLAUDE:+claude }${FAKE_GITHUB:+github }${FAKE_TLS:+tls }${FAKE_SSHD:+sshd }${TMUX_FAULTS:+tmux-faults }"
+FAKES="${PG_IAM:+pg-iam }${FAKE_AWS:+aws }${CREDENTIAL_STORE:+credential-store }${SPACES:+spaces }${FAKE_BEDROCK:+bedrock }${FAKE_MCP:+mcp }${CLAUDE_GATEWAY_TF:+claude-gateway }${EC2_LAUNCH:+ec2-launch }${WARM_POOL:+warm-pool }${FLAGS:+flags }${FAKE_CLAUDE:+claude }${CLAUDE_BIN:+real-claude }${T3:+t3 }${FAKE_GITHUB:+github }${FAKE_TLS:+tls }${FAKE_SSHD:+sshd }${TMUX_FAULTS:+tmux-faults }"
 EC2_BOXES=$EC2_BOXES
 AWS_URL=${FAKE_AWS:+http://127.0.0.1:$AWS_PORT}
+FLOCI_MODE=$FLOCI_MODE
 EC2_URL=${EC2_LAUNCH:+http://127.0.0.1:$EC2_PORT}
 AWS_REGION=${FAKE_AWS:+$AWS_REGION_E2E}
 GITHUB_URL=${FAKE_GITHUB:+http://127.0.0.1:$GITHUB_PORT}
 TLS_URL=${FAKE_TLS:+https://localhost:$TLS_PORT/termag}
 GITHUB_BROKER_FRONT=${CLAUDE_GATEWAY_TF:+https://localhost:$GITHUB_GW_PORT}
 STS_URL=${CLAUDE_GATEWAY_TF:+http://127.0.0.1:$STS_PORT}
+MCP_BROKER_FRONT=${FAKE_MCP:+https://localhost:$MCP_GW_PORT}
+MCP_UPSTREAM_URL=${FAKE_MCP:+https://localhost:$MCP_PORT}
 GATEWAY_URL=${FAKE_TLS:+http://127.0.0.1:$GATEWAY_PORT/termag}
 SSH_PORT_BASE=${FAKE_SSHD:+$SSH_PORT_BASE}
 EOF
 }
 
+# The t3 command the boxes run: E2E_T3_COMMAND, or the release fakes/t3.sh
+# pins by digest (the boxes run the extracted binary with their own state;
+# agent/t3-bridge.js passes --base-dir).
+t3_box_command() {
+  if [ -n "$T3_COMMAND" ]; then command -v "$T3_COMMAND"; return; fi
+  E2E_CACHE_DIR="$CACHE_DIR" bash "$fakes_dir/t3.sh" fetch 2>>"$ROOT/logs/t3-install.log" \
+    || die "fetching the pinned t3 release failed (logs/t3-install.log)"
+}
+
+# The stack's CA and its localhost certificate, once.
+tls_certs() {
+  local t="$ROOT/tls"
+  [ -f "$t/server.pem" ] && return 0
+  mkdir -p "$t"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=termag-e2e-ca \
+    -keyout "$t/ca.key" -out "$t/ca.pem" 2>/dev/null
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=localhost \
+    -keyout "$t/server.key" -out "$t/server.csr" 2>/dev/null
+  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' >"$t/ext.cnf"
+  openssl x509 -req -in "$t/server.csr" -CA "$t/ca.pem" -CAkey "$t/ca.key" -CAcreateserial -days 2 \
+    -extfile "$t/ext.cnf" -out "$t/server.pem" 2>/dev/null
+  chmod 600 "$t/ca.key" "$t/server.key"
+}
+
 # Before the backend starts: services it must reach, and its env.
 fakes_before_backend() {
+  if [ -n "$T3" ]; then
+    T3_BIN=$(t3_box_command) || exit 1
+    box_extra+=("TERMAG_T3_COMMAND=$T3_BIN")
+    # t3 finds claude through the login shell's PATH, which on a stand-in box
+    # is not the box's bin/: pin it to the claude the box carries, if any.
+    if [ -n "$FAKE_CLAUDE" ] || [ -n "$CLAUDE_BIN" ]; then box_extra+=(TERMAG_T3_CLAUDE_COMMAND=claude); fi
+    printf 'T3_COMMAND=%s\n' "$T3_BIN" >>"$ROOT/stack.env"
+  fi
   if [ -n "$OVERLAP" ]; then
     [ -z "$FAKE_TLS" ] || die "E2E_OVERLAP does not run with E2E_TLS"
     printf '%s\n' ORCHESTRATOR_LEASE=true ORCHESTRATOR_LEASE_HEARTBEAT_MS=1000 \
@@ -199,16 +318,36 @@ EOF
   fi
 
   if [ -n "$FAKE_AWS" ]; then
-    local floci
-    floci=$(E2E_CACHE_DIR=$CACHE_DIR bash "$fakes_dir/floci.sh" fetch) || die "could not fetch Floci"
-    mkdir -p "$ROOT/floci"
-    log "starting floci (fake AWS) on 127.0.0.1:$AWS_PORT"
-    # ec2.mock keeps the EC2 API but runs no Docker-backed instances and no
-    # metadata server, which would otherwise listen on *:9169.
-    start_daemon floci "$ROOT/floci" env -i "${base_env[@]}" "FLOCI_STORAGE_PERSISTENT_PATH=$ROOT/floci/data" \
-      "$floci" -Dquarkus.http.host=127.0.0.1 "-Dquarkus.http.port=$AWS_PORT" \
-      "-Dfloci.default-region=$AWS_REGION_E2E" "-Djava.io.tmpdir=$ROOT/tmp" \
-      -Dfloci.services.ec2.mock=true
+    mkdir -p "$ROOT/floci/data"
+    if [ "$FLOCI_MODE" = docker ]; then
+      # One container per stack, named for the root and labelled with it, so
+      # down.sh removes exactly this one (fakes/floci.sh docker-rm). Children
+      # run with the stack's HOME, which holds no Docker context: the daemon
+      # this shell's docker talks to is named outright.
+      local name="termag-e2e-floci-${ROOT##*.}" docker_host
+      docker_host=${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)}
+      printf '%s\n' "$name" >"$ROOT/floci/container"
+      { printf 'FLOCI_CONTAINER=%q\n' "$name"; printf 'FLOCI_IMAGE=%q\n' "$FLOCI_IMAGE"
+        printf 'FLOCI_PORT=%q\n' "$AWS_PORT"; printf 'FLOCI_REGION=%q\n' "$AWS_REGION_E2E"
+        printf 'DOCKER_HOST=%q\n' "$docker_host"; } >"$ROOT/floci/docker.env"
+      if ! docker image inspect "$FLOCI_IMAGE" >/dev/null 2>&1; then
+        log "pulling $FLOCI_IMAGE"
+        docker pull "$FLOCI_IMAGE" >"$ROOT/logs/floci-pull.log" 2>&1 || die "could not pull $FLOCI_IMAGE (logs/floci-pull.log)"
+      fi
+      log "starting floci (fake AWS) in Docker as $name on 127.0.0.1:$AWS_PORT"
+      start_daemon floci "$ROOT/floci" env -i "${base_env[@]}" "DOCKER_HOST=$docker_host" \
+        bash "$fakes_dir/floci.sh" docker-run "$ROOT"
+    else
+      local floci
+      floci=$(E2E_CACHE_DIR=$CACHE_DIR bash "$fakes_dir/floci.sh" fetch) || die "could not fetch Floci"
+      log "starting floci (fake AWS) on 127.0.0.1:$AWS_PORT"
+      # ec2.mock keeps the EC2 API but runs no Docker-backed instances and no
+      # metadata server, which would otherwise listen on *:9169.
+      start_daemon floci "$ROOT/floci" env -i "${base_env[@]}" "FLOCI_STORAGE_PERSISTENT_PATH=$ROOT/floci/data" \
+        "$floci" -Dquarkus.http.host=127.0.0.1 "-Dquarkus.http.port=$AWS_PORT" \
+        "-Dfloci.default-region=$AWS_REGION_E2E" "-Djava.io.tmpdir=$ROOT/tmp" \
+        -Dfloci.services.ec2.mock=true
+    fi
     wait_http "http://127.0.0.1:$AWS_PORT/_floci/health" floci
     if [ -n "$AWS_SEED" ]; then
       log "seeding floci with $AWS_SEED"
@@ -260,7 +399,19 @@ EOF
       # Where boxes reach the broker: the gateway's GitHub front on 443, which
       # gh needs, through the relay fakes_after_backend starts.
       [ -n "$BROKER_443" ] && echo "GITHUB_BROKER_URL=https://localhost"
+      # The MCP broker's own host on the same ALB, and the one loopback
+      # upstream the backend lets a connector name.
+      if [ -n "$FAKE_MCP" ]; then
+        echo "MCP_BROKER_URL=https://localhost:$MCP_GW_PORT"
+        echo "MCP_UPSTREAM_TEST_ALLOW=localhost:$MCP_PORT"
+      fi
     } >>"$ROOT/backend.env"
+  fi
+  if [ -n "$FAKE_MCP" ]; then
+    # The backend runs OAuth discovery and token calls against the stub's https,
+    # signed by the stack's CA. Process env: Node reads it before dotenv.
+    tls_certs
+    backend_extra+=("NODE_EXTRA_CA_CERTS=$ROOT/tls/ca.pem")
   fi
 
   if [ -n "$EC2_LAUNCH" ]; then
@@ -286,9 +437,18 @@ EOF
     real_gh=$(command -v gh || true)
     [ -n "$real_gh" ] && box_extra+=("E2E_REAL_GH=$real_gh")
   fi
+  # A stand-in box runs as you, on your machine: what a dotfiles repository
+  # runs on a claim is not confined to the box's HOME (deploy/termag-hook-run,
+  # TERMAG_DOTFILES_NO_SCRIPTS).
+  [ -n "$DOTFILES_SCRIPTS" ] || box_extra+=(TERMAG_DOTFILES_NO_SCRIPTS=1)
 
+  # The pool size is the box-warm-pool-size flag, which falls back to 5; the
+  # stack pins it (AUTH_MODE=local) so a launch-enabled stack holds no pool
+  # unless E2E_WARM_POOL asks for one.
   if [ -n "$WARM_POOL" ]; then
     printf 'WARM_POOL_TARGET_SIZE=%s\nWARM_POOL_RECONCILE_SECONDS=%s\n' "$WARM_POOL" "$WARM_POOL_TICK" >>"$ROOT/backend.env"
+  elif [ -n "$EC2_LAUNCH" ]; then
+    printf 'WARM_POOL_TARGET_SIZE=0\n' >>"$ROOT/backend.env"
   fi
   if [ -n "$FLAGS" ]; then printf "TERMAG_FLAGS='%s'\n" "$FLAGS" >>"$ROOT/backend.env"; fi
 
@@ -323,15 +483,8 @@ fakes_after_backend() {
   [ -n "$FAKE_TLS" ] || return 0
 
   local t="$ROOT/tls" n="$ROOT/nginx"
-  mkdir -p "$t" "$n/tmp"
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=termag-e2e-ca \
-    -keyout "$t/ca.key" -out "$t/ca.pem" 2>/dev/null
-  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=localhost \
-    -keyout "$t/server.key" -out "$t/server.csr" 2>/dev/null
-  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' >"$t/ext.cnf"
-  openssl x509 -req -in "$t/server.csr" -CA "$t/ca.pem" -CAkey "$t/ca.key" -CAcreateserial -days 2 \
-    -extfile "$t/ext.cnf" -out "$t/server.pem" 2>/dev/null
-  chmod 600 "$t/ca.key" "$t/server.key"
+  mkdir -p "$n/tmp"
+  tls_certs
 
   # The real gateway and proxy snippet, re-pointed at the e2e ports. Each
   # substitution must match, so an edit to deploy/nginx fails here loudly.
@@ -352,7 +505,7 @@ fakes_after_backend() {
       -e "s#/etc/nginx/snippets/termag-proxy.conf#$n/termag-proxy.conf#" \
       -e "s#127.0.0.1:3100#127.0.0.1:$PORT#" \
       "$repo/deploy/nginx/termag-checks.conf" >"$n/checks.conf"
-  if ! grep -q "listen 127.0.0.1:$CHECKS_PORT;" "$n/checks.conf" || [ "$(grep -c "127.0.0.1:$PORT;" "$n/checks.conf")" != 2 ] \
+  if ! grep -q "listen 127.0.0.1:$CHECKS_PORT;" "$n/checks.conf" || [ "$(grep -c "127.0.0.1:$PORT;" "$n/checks.conf")" != 4 ] \
      || grep -q '/etc/nginx/snippets' "$n/checks.conf"; then
     die "deploy/nginx/termag-checks.conf no longer matches what scripts/e2e/fakes/fakes.sh rewrites"
   fi
@@ -429,6 +582,26 @@ server {
 }
 EOF
   fi
+  if [ -n "$FAKE_MCP" ]; then
+    # The same ALB's host rule for the MCP broker; streams, as the ALB does.
+    cat >>"$n/tls.conf" <<EOF
+server {
+    listen 127.0.0.1:$MCP_GW_PORT ssl;
+    server_name localhost;
+    ssl_certificate $t/server.pem;
+    ssl_certificate_key $t/server.key;
+    client_max_body_size 0;
+    location / {
+        proxy_pass http://127.0.0.1:$((ENVOY_PORT + 6));
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 900s;
+    }
+}
+EOF
+  fi
   cat >"$n/nginx.conf" <<EOF
 daemon off;
 worker_processes 1;
@@ -463,6 +636,16 @@ EOF
       "$envoy" -c envoy.yaml --disable-hot-restart --log-level warn
     wait_http "http://127.0.0.1:$ENVOY_PORT/healthz" claude-gateway
     wait_http "http://127.0.0.1:$((ENVOY_PORT + 2))/healthz" claude-gateway
+    wait_http "http://127.0.0.1:$((ENVOY_PORT + 5))/healthz" claude-gateway
+    if [ -f "$ROOT/claude-gateway/mcp-port" ]; then wait_http "http://127.0.0.1:$((ENVOY_PORT + 6))/healthz" claude-gateway; fi
+  fi
+  if [ -n "$FAKE_MCP" ]; then
+    log "starting the MCP server stub on https://localhost:$MCP_PORT/mcp, broker front on localhost:$MCP_GW_PORT"
+    start_daemon mcp "$fakes_dir" env -i "${base_env[@]}" "E2E_MCP_PORT=$MCP_PORT" \
+      "E2E_MCP_CERT=$t/server.pem" "E2E_MCP_KEY=$t/server.key" "E2E_MCP_REQUIRE=authorization=Bearer e2e-mcp-secret" \
+      node mcp-upstream.mjs
+    for _ in $(seq 1 40); do curl -sf --cacert "$t/ca.pem" -o /dev/null "https://localhost:$MCP_PORT/_e2e/calls" && break; sleep 0.25; done
+    curl -sf --cacert "$t/ca.pem" -o /dev/null "https://localhost:$MCP_PORT/_e2e/calls" || die "the MCP server stub does not answer (logs/mcp.log)"
   fi
   if [ -n "$BROKER_443" ]; then
     log "starting the GitHub broker relay on 127.0.0.1:443 -> the gateway's GitHub front (from 127.0.0.2)"
@@ -474,9 +657,10 @@ EOF
   box_extra+=("NODE_EXTRA_CA_CERTS=$t/ca.pem" "CURL_CA_BUNDLE=$t/ca.pem" "GIT_SSL_CAINFO=$t/ca.pem" "SSL_CERT_FILE=$t/ca.pem")
 }
 
-# Per box, before its agent starts. $1 = box name, $2 = box dir.
+# Per box, before its agent starts. $1 = box name, $2 = box dir, $3 = its
+# tmux socket (box.sh picks it).
 fakes_box() {
-  local name=$1 box=$2
+  local name=$1 box=$2 sock=${3:-$2/tmux.sock}
   if [ -n "$TMUX_FAULTS" ]; then
     : >"$box/tmux-fault"
     # Modes match the agent's attach sequence: it sets set-clipboard right
@@ -488,29 +672,45 @@ case "\$mode:\$1 \$2 \$3" in
   attach-delay=*:"set-option -g set-clipboard") sleep "\${mode#attach-delay=}" ;;
   hang:capture-pane*|hang:display-message*) exec sleep 100000 ;;
 esac
-exec '$REAL_TMUX' -S '$box/tmux.sock' "\$@"
+exec '$REAL_TMUX' -S '$sock' "\$@"
 EOF
     chmod 0755 "$box/bin/tmux"
   fi
+  [ -n "$CLAUDE_BIN" ] && ln -sf "$CLAUDE_BIN" "$box/bin/claude"
+  if [ -n "$CLAUDE_KEYCHAINS" ]; then mkdir -p "$box/home/Library" && ln -sfn "$CLAUDE_KEYCHAINS" "$box/home/Library/Keychains"; fi
   [ -n "$FAKE_CLAUDE" ] && install -m 0755 "$fakes_dir/claude" "$box/bin/claude" \
     && install -m 0644 "$fakes_dir/claude-bedrock.mjs" "$box/bin/claude-bedrock.mjs" \
-    && install -m 0644 "$fakes_dir/claude-stream.mjs" "$box/bin/claude-stream.mjs"
+    && install -m 0644 "$fakes_dir/claude-stream.mjs" "$box/bin/claude-stream.mjs" \
+    && install -m 0644 "$fakes_dir/claude-sdk.mjs" "$box/bin/claude-sdk.mjs" \
+    && install -m 0644 "$fakes_dir/claude-auth.mjs" "$box/bin/claude-auth.mjs"
+  # The desktop threads' Claude (the SDK-mode stand-in under the box's t3
+  # server) runs the user's hooks as Claude Code does, so the box gets what
+  # packer/scripts/setup.sh gives a real one: deploy/claude-settings.json as
+  # ~/.claude/settings.json (credentials-apply merges into it) and
+  # termag-status where those hooks call it. Only with E2E_T3: no other
+  # stand-in mode reads hooks.
+  if [ -n "$FAKE_CLAUDE" ] && [ -n "$T3" ]; then
+    mkdir -p "$box/home/.claude" "$box/home/.local/bin"
+    [ -e "$box/home/.claude/settings.json" ] || install -m 0644 "$repo/deploy/claude-settings.json" "$box/home/.claude/settings.json"
+    install -m 0755 "$repo/deploy/termag-status" "$box/home/.local/bin/termag-status"
+  fi
   if [ -n "$FAKE_GITHUB" ]; then
     install -m 0755 "$fakes_dir/gh" "$box/bin/gh"
     git config -f "$box/etc/gitconfig" "url.http://127.0.0.1:$GITHUB_PORT/_github.com/.insteadOf" https://github.com/
   fi
-  if grep -q '"warm": true' "$box/home/.termag/agent.config.json"; then fakes_warm_box "$name" "$box"; fi
+  local warm=
+  grep -q '"warm": true' "$box/home/.termag/agent.config.json" && warm=1
+  if [ -z "$PANE_CLONE" ] || [ -n "$warm" ]; then fakes_units_box "$name" "$box"; fi
+  if [ -z "$PANE_CLONE" ]; then fakes_clone_box "$box"; fi
+  if [ -n "$warm" ]; then fakes_warm_box "$box"; fi
   return 0
 }
 
-# A warm-pool box (the launch fake saw buildWarmCloudInit's user data): what a
-# baked box image gives it and a stand-in has not. The on-warm and on-claim
-# units run through a systemctl stand-in, from a checkout at ~/src/termag whose
-# deploy/ is the repo's but whose on-warm.d is the e2e one (the real scripts
-# pull images). With the GitHub stub, github.com is the
-# stub for its git, so a claim can clone e2e-org/dotfiles.
-fakes_warm_box() {
-  local name=$1 box=$2 real_sc co
+# The termag units a box's agent starts with `systemctl --user` run through a
+# stand-in (fakes/systemctl), from a checkout at ~/src/termag whose deploy/
+# files are the repo's, as a baked box image has them.
+fakes_units_box() {
+  local name=$1 box=$2 real_sc
   real_sc=$(command -v systemctl || echo /usr/bin/systemctl)
   case $real_sc in "$box"/*) real_sc=/usr/bin/systemctl ;; esac
   {
@@ -519,7 +719,35 @@ fakes_warm_box() {
       "$repo/deploy" "$box/home/.termag/.e2e-systemctl" "$ROOT/pids" "$name" "$real_sc" "$fakes_dir/systemctl"
   } >"$box/bin/systemctl"
   chmod 0755 "$box/bin/systemctl"
-  co="$box/home/src/termag/deploy"
+  mkdir -p "$box/home/src/termag/deploy"
+}
+
+# The durable clone (termag-project-clone@.service, agent/project-clone.js):
+# the agent advertises project-clone-v1 once the unit is there, so a project
+# from a repository clones beside its directory and reports cloning, then
+# ready or failed, as on a box image, instead of being typed into the agent
+# pane. Without a GitHub broker (it is the Claude gateway's) nothing will ever
+# deliver GitHub to the box, which is what github.skip says: the box's own git
+# config (the stub, with E2E_FAKE_GITHUB) is its way to GitHub, and the clone
+# need not wait for a delivery.
+fakes_clone_box() {
+  local box=$1 co="$1/home/src/termag"
+  ln -sfn "$repo/deploy/termag-project-clone" "$co/deploy/termag-project-clone"
+  ln -sfn "$repo/agent" "$co/agent"
+  if [ -z "$GITHUB_BROKER" ]; then
+    mkdir -p "$box/home/.config/termag"
+    : >"$box/home/.config/termag/github.skip"
+  fi
+}
+
+# A warm-pool box (the launch fake saw buildWarmCloudInit's user data): what a
+# baked box image gives it and a stand-in has not. The on-warm and on-claim
+# units run from the checkout fakes_units_box made, whose on-warm.d is the e2e
+# one (a deployment's own hooks may clone and pull images). With the GitHub
+# stub, github.com is the stub for its git, so a claim can clone
+# e2e-org/dotfiles.
+fakes_warm_box() {
+  local co="$1/home/src/termag/deploy"
   mkdir -p "$co/on-warm.d"
   ln -sfn "$repo/deploy/termag-hook-run" "$co/termag-hook-run"
   install -m 0755 "$fakes_dir/on-warm.d/"*.sh "$co/on-warm.d/"
@@ -544,7 +772,8 @@ strict_modes_ok() {
 fakes_after_boxes() {
   local b
   if [ -n "$EC2_LAUNCH" ]; then
-    for b in $(seq 1 "$EC2_BOXES"); do
+    # Not seq: with E2E_EC2_BOXES=0, BSD seq (macOS) prints 1 and 0.
+    for ((b = 1; b <= EC2_BOXES; b++)); do
       for _ in $(seq 1 120); do [ -f "$ROOT/pids/box-$b.pid" ] && break; sleep 0.25; done
       [ -f "$ROOT/pids/box-$b.pid" ] || die "box-$b was not launched (logs/ec2-launch.log, logs/backend.log)"
     done
@@ -588,16 +817,20 @@ EOF
 }
 
 fakes_summary() {
-  [ -n "$FAKE_AWS" ] && echo "  aws       http://127.0.0.1:$AWS_PORT  (Floci, region $AWS_REGION_E2E; scripts/e2e/fakes/aws.sh)"
+  [ -n "$FAKE_AWS" ] && echo "  aws       http://127.0.0.1:$AWS_PORT  (Floci, region $AWS_REGION_E2E$([ "$FLOCI_MODE" = docker ] && printf ', in Docker as %s' "$(cat "$ROOT/floci/container")"); scripts/e2e/fakes/aws.sh)"
   [ -n "$FAKE_GITHUB" ] && echo "  github    http://127.0.0.1:$GITHUB_PORT  (api.github.com stub; backend fetches are redirected)"
   [ -n "$FAKE_TLS" ] && echo "  tls       wss://localhost:$TLS_PORT (boxes, through the box network), gateway http://127.0.0.1:$GATEWAY_PORT, CA $ROOT/tls/ca.pem"
   [ -n "$FAKE_SSHD" ] && echo "  sshd      box-N on 127.0.0.1:$((SSH_PORT_BASE + 1))..$((SSH_PORT_BASE + BOXES))"
   [ -n "$FAKE_CLAUDE" ] && echo "  claude    stand-in CLI on every box (claude -p: one Bedrock turn through the gateway settings)"
   [ -n "$FAKE_BEDROCK" ] && echo "  bedrock   http://127.0.0.1:$BEDROCK_PORT  (Bedrock runtime stub; invocation log logs/bedrock-invocations.jsonl)"
   [ -n "$CLAUDE_GATEWAY_TF" ] && echo "  claude-gw https://localhost:$CLAUDE_GW_PORT -> Envoy 127.0.0.1:$ENVOY_PORT (from $CLAUDE_GATEWAY_TF; access log logs/claude-gateway.log)"
+  [ -n "$FAKE_MCP" ] && echo "  mcp       broker https://localhost:$MCP_GW_PORT -> Envoy 127.0.0.1:$((ENVOY_PORT + 6)); server stub https://localhost:$MCP_PORT/mcp (Bearer e2e-mcp-secret; /_e2e/calls)"
   [ "$EC2_BOXES" -gt 0 ] && echo "  ec2 boxes box-1..box-$EC2_BOXES registered as kind=ec2${EC2_LAUNCH:+, started by the launch fake}"
   [ -n "$EC2_LAUNCH" ] && echo "  ec2       launch fake on 127.0.0.1:$EC2_PORT, so Add box works; scripts/e2e/ctl.sh ec2 bake|clear|no-agent|agent"
   [ -n "$WARM_POOL" ] && echo "  warm pool $WARM_POOL box(es), reconciled every ${WARM_POOL_TICK}s${FAKE_GITHUB:+; public dotfiles repo https://github.com/e2e-org/dotfiles}"
+  [ -z "$PANE_CLONE" ] && echo "  clones    durable, through termag-project-clone@ on each box (E2E_PANE_CLONE=1 types them into the agent pane)"
+  [ -n "$T3" ] && echo "  t3        every box's agent can run $(sed -n 's/^T3_COMMAND=//p' "$ROOT/stack.env")"
+  [ -n "$CLAUDE_BIN" ] && echo "  claude    $CLAUDE_BIN on every box's PATH (your own Claude login)"
   [ -n "$FLAGS" ] && echo "  flags     $FLAGS (TERMAG_FLAGS)"
   [ -n "$TMUX_FAULTS" ] && echo "  faults    scripts/e2e/ctl.sh fault box-N hang|attach-delay=S|off"
   [ -n "$PG_IAM" ] && echo "  pg-iam    backend as application, db:push as migration, through the IAM-token path (logs/db-push.log, logs/db-guard.log)"

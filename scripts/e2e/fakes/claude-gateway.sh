@@ -8,7 +8,9 @@
 #   claude-gateway.sh render <terraform checkout> <out dir> <envoy port> <orchestrator port> <bedrock port> <github port> <sts port> <ca file>
 #                                  Envoy's ports: Claude on <envoy port>, admin on +1,
 #                                  the GitHub broker on +2, the checks' caller-proof
-#                                  and STS signer loopback listeners on +3 and +4.
+#                                  and STS signer loopback listeners on +3 and +4,
+#                                  the MCP broker on +6 when the checkout has it
+#                                  (then <out dir>/mcp-port names it).
 #                                  Every check goes over HTTPS to <orchestrator port>
 #                                  (the checks ALB's stand-in), verified with <ca file>
 #                                  as Envoy verifies the real ALB with the system CAs.
@@ -24,6 +26,15 @@ terraform=${E2E_TERRAFORM:-terraform}
 command -v "$terraform" >/dev/null || { echo "terraform not found (set E2E_TERRAFORM)" >&2; exit 1; }
 mkdir -p "$out"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+# The MCP broker listener on +6, when the checkout has it.
+# Its upstream stub is on loopback, which every deployment denies.
+mcp_args=; rm -f "$out/mcp-port"
+if grep -q 'variable "mcp_listen_port"' "$root/modules/claude-gateway/envoy-config/main.tf"; then
+  mcp_args="  mcp_listen_port            = $((envoy_port + 6))
+  mcp_upstream_allowed_cidrs = [\"127.0.0.1/32\"]
+"
+  echo $((envoy_port + 6)) >"$out/mcp-port"
+fi
 cat >"$work/main.tf" <<TF
 locals { claude = jsondecode(file("$root/claude-models.json")) }
 module "cfg" {
@@ -45,7 +56,7 @@ module "cfg" {
   sts_signer_port    = $((envoy_port + 4))
   github             = { git_host = "127.0.0.1", api_host = "127.0.0.1", port = $github_port, tls = false, git_path_prefix = "/_github.com" }
   sts                = { host = "127.0.0.1:$sts_port", port = $sts_port, tls = false }
-}
+$mcp_args}
 locals {
   env = join("\n", [
     "CLAUDE_BEDROCK_REGION=us-east-2",

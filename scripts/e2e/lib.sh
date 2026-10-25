@@ -19,11 +19,19 @@ start_daemon() {
   launch_daemon "$ROOT" "$name"
 }
 
+# setsid(1), or perl's POSIX::setsid where there is none (macOS ships no
+# setsid). The new session leader is the command itself, so its pid is the
+# process group down.sh signals.
+run_setsid() {
+  if command -v setsid >/dev/null 2>&1; then exec setsid "$@"; fi
+  exec perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!"' -- "$@"
+}
+
 # Runs <root>/cmds/<name> as start_daemon describes, appending to its log.
 launch_daemon() {
   local root=$1 name=$2 argv
   mapfile -d '' argv <"$root/cmds/$name"
-  ( cd "${argv[0]}" && exec setsid "${argv[@]:1}" ) >>"$root/logs/$name.log" 2>&1 </dev/null &
+  ( cd "${argv[0]}" && run_setsid "${argv[@]:1}" ) >>"$root/logs/$name.log" 2>&1 </dev/null &
   echo $! >"$root/pids/$name.pid"
 }
 
@@ -48,6 +56,21 @@ e2e_root() {
 # inherit it, so this also finds anything that escaped its process group.
 e2e_pids() {
   local root=$1 p
+  if [ ! -d /proc/self ]; then
+    # No /proc (macOS), and its ps shows no other process's environment: fall
+    # back to your own processes whose command line names a path under the
+    # root (agents, tmux servers, postgres). The rest is in the process groups
+    # down.sh signals. Never this shell, its ps and awk, or anything it runs
+    # under: a caller's shell may well mention the root.
+    local self=${BASHPID:-$$}
+    ps -ww -U "$(id -u)" -o pid=,ppid=,command= 2>/dev/null | awk -v root="$root/" -v self="$self" '
+      { parent[$1] = $2; line[$1] = $0 }
+      END {
+        for (p = self; p != "" && p != 0 && !(p in skip); p = parent[p]) skip[p] = 1
+        for (p in line) if (!(p in skip) && parent[p] != self && index(line[p], root)) print p
+      }'
+    return 0
+  fi
   for p in /proc/[0-9]*; do
     [ -O "$p" ] && [ -r "$p/environ" ] || continue
     if tr '\0' '\n' 2>/dev/null <"$p/environ" | grep -qxF "TERMAG_E2E_ROOT=$root"; then
@@ -62,6 +85,14 @@ pg_bindir() {
     pg_config --bindir; return
   fi
   find /usr/lib/postgresql -maxdepth 2 -name bin -type d 2>/dev/null | sort -V | tail -n1
+}
+
+# The S256 PKCE challenge for a CLI device sign-in's verifier (RFC 7636), as
+# `termag login` and the desktop app make it. A base64url verifier starts with
+# "-" one time in 64, and node takes such an argument for one of its own
+# options unless "--" ends them.
+pkce_challenge() {
+  node -e 'process.stdout.write(require("crypto").createHash("sha256").update(process.argv[1]).digest("base64url"))' -- "$1"
 }
 
 # Files created or modified since <marker> in the places a stack could leak

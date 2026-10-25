@@ -1,6 +1,6 @@
 # Local end-to-end stack (docs/e2e-stack.md). BOXES=N sets the box count; the
 # opt-in fakes are E2E_* variables, e.g. `make e2e-up E2E_FAKE_AWS=1`.
-.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box
+.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box e2e-test-t3 e2e-test-t3-newbox
 
 # Build cli/ and put `termag` on PATH (cli/README.md). Re-run after `git pull`
 # to update. BIN_DIR=<dir> overrides where the launcher goes.
@@ -30,6 +30,17 @@ e2e-test:
 
 e2e-test-warm-pool:
 	@bash scripts/e2e/warm-pool.test.sh
+
+# The desktop app's box bridge; downloads the
+# pinned t3 release once into ~/.cache/termag-e2e. E2E_T3_COMMAND=<cmd> tests another build.
+e2e-test-t3:
+	@bash scripts/e2e/t3.test.sh
+
+# The desktop app's "New box…" flow: launch a box, a project on it from a
+# GitHub repo, its t3 server, a thread through the relay. Needs Floci:
+# native on Linux, Docker on macOS.
+e2e-test-t3-newbox:
+	@bash scripts/e2e/t3-newbox.test.sh
 
 e2e-test-cli-doctor:
 	@bash scripts/e2e/cli-doctor.test.sh

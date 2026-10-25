@@ -25,6 +25,9 @@ export E2E_PORT=$((3960 + S)) E2E_FRONTEND_PORT=$((5994 + S)) E2E_PG_PORT=$((554
   E2E_AWS_PORT=$((4866 + S)) E2E_EC2_PORT=$((4867 + S)) E2E_GITHUB_PORT=$((4881 + S)) \
   E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1 E2E_FAKE_GITHUB=1 E2E_WARM_POOL=2 E2E_WARM_POOL_TICK=2 \
   E2E_FLAGS='{"warm-pool-enabled":true}'
+# The dotfiles checks run the stub's e2e-org/dotfiles install.sh, and stand-in
+# boxes run no dotfiles script unless told to (TERMAG_DOTFILES_NO_SCRIPTS).
+export E2E_DOTFILES_SCRIPTS=1
 trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 fails=0 skips=0

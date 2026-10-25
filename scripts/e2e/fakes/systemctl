@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Stand-in for `systemctl --user` on a warm-pool box of the e2e stack (fakes.sh
-# installs it as <box>/bin/systemctl when E2E_WARM_POOL is on). A stand-in box
-# has no user manager, and the warm-pool units it needs are plain oneshots:
-# deploy/termag-on-warm.service and termag-on-claim.service, which the agent
-# starts over its socket. Those are run here from their unit files, with %h as
-# the box's HOME: ExecStart in its own process group (its pid in <root>/pids,
-# so down.sh stops it), then ExecStopPost. Anything else goes to the real
-# systemctl untouched.
+# Stand-in for `systemctl --user` on a box of the e2e stack (fakes.sh installs
+# it as <box>/bin/systemctl). A stand-in box has no user manager, and the
+# termag units its agent starts are plain oneshots: deploy/termag-on-warm.service
+# and termag-on-claim.service (warm-pool boxes), and the durable clone,
+# termag-project-clone@<project id>.service (every box, unless E2E_PANE_CLONE).
+# Those are run here from their unit files, with %h as the box's HOME and %i
+# as a template unit's instance: ExecStart in its own process group (its pid
+# in <root>/pids, so down.sh stops it), then ExecStopPost. The unit runs with
+# the agent's environment, which on a stand-in box is the box's (HOME, PATH,
+# GIT_CONFIG_SYSTEM). Anything else goes to the real systemctl untouched.
 #
-#   systemctl --user start [--no-block] termag-on-<x>.service
-#   systemctl --user stop | is-active | status | enable | disable termag-on-<x>.service
+#   systemctl --user start [--no-block] <unit>
+#   systemctl --user stop | is-active | status | reset-failed | enable | disable <unit>
+#   systemctl --user show -p LoadState|ActiveState --value <unit or template>
 #   systemctl --user daemon-reload
 #
 # Env (set by the wrapper fakes.sh writes): E2E_UNIT_DIR (where the unit files
@@ -19,32 +22,50 @@ set -uo pipefail
 
 real() { exec "${E2E_REAL_SYSTEMCTL:-/usr/bin/systemctl}" "$@"; }
 
-args=("$@") user='' block=1 verb='' unit=''
+args=("$@") user='' block=1 verb='' unit='' prop='' want_prop=''
 for a in "$@"; do
+  if [ -n "$want_prop" ]; then prop=$a; want_prop=''; continue; fi
   case $a in
     --user) user=1 ;;
     --no-block) block= ;;
-    --quiet|-q|--no-pager) ;;
+    -p|--property) want_prop=1 ;;
+    --property=*) prop=${a#--property=} ;;
+    --quiet|-q|--no-pager|--value) ;;
     -*) ;;
     *) if [ -z "$verb" ]; then verb=$a; elif [ -z "$unit" ]; then unit=$a; fi ;;
   esac
 done
 [ -n "$user" ] || real "${args[@]}"
 case $verb in daemon-reload) exit 0 ;; esac
-case $unit in termag-on-*.service) ;; *) real "${args[@]}" ;; esac
-file="$E2E_UNIT_DIR/$unit"
+instance=''
+case $unit in
+  termag-on-*.service) file="$E2E_UNIT_DIR/$unit" ;;
+  termag-project-clone@*.service)
+    # Installed on a box whose checkout has its wrapper (fakes_clone_box).
+    [ -e "$HOME/src/termag/deploy/termag-project-clone" ] || real "${args[@]}"
+    instance=${unit#termag-project-clone@}; instance=${instance%.service}
+    file="$E2E_UNIT_DIR/termag-project-clone@.service" ;;
+  *) real "${args[@]}" ;;
+esac
+# A template's own name (no instance) is what `show -p LoadState` asks about.
+if [ "$verb" = show ]; then
+  case $prop in
+    LoadState) if [ -f "$file" ]; then echo loaded; else echo not-found; fi; exit 0 ;;
+  esac
+fi
 [ -f "$file" ] || { echo "Unit $unit not found." >&2; exit 5; }
+case $unit in *@.service) echo "Unit name $unit is a template; name an instance." >&2; exit 1 ;; esac
 
 state="$E2E_UNIT_STATE/$unit"
 pidf="$E2E_UNIT_PIDS/$E2E_BOX.$unit.pid"
 mkdir -p "$E2E_UNIT_STATE"
 
-# One directive's value from the [Service] section, %h expanded and a leading
-# systemd prefix (- @ + ! :) dropped.
+# One directive's value from the [Service] section, %h and %i expanded and a
+# leading systemd prefix (- @ + ! :) dropped.
 directive() {
   awk -v k="$1" -F= '
     /^\[/ { s = ($0 == "[Service]") } s && $1 == k { sub(/^[^=]*=/, ""); print; exit }' "$file" \
-    | sed -e "s#%h#$HOME#g" -e 's/^[-@+!:]*//'
+    | sed -e "s#%h#$HOME#g" -e "s#%i#$instance#g" -e 's/^[-@+!:]*//'
 }
 
 running() { [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; }
@@ -59,6 +80,13 @@ unit_state() {
   fi
 }
 
+# A new session, so the unit is its own process group, as down.sh signals:
+# setsid(1), or perl's POSIX::setsid where there is none (macOS).
+new_session() {
+  if command -v setsid >/dev/null 2>&1; then exec setsid "$@"; fi
+  exec perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!"' -- "$@"
+}
+
 case $verb in
   start)
     # A oneshot that is running, or finished with RemainAfterExit, is started already.
@@ -67,11 +95,12 @@ case $verb in
     start=$(directive ExecStart) stoppost=$(directive ExecStopPost)
     [ -n "$start" ] || { echo "$unit has no ExecStart" >&2; exit 1; }
     rm -f "$state.exit"
-    setsid bash -c '
+    # shellcheck disable=SC2016 # expanded by the inner bash
+    ( new_session bash -c '
       bash -c "$1"; rc=$?
       echo "$rc" >"$3.exit"
       [ -z "$2" ] || bash -c "$2" || true
-    ' _ "$start" "$stoppost" "$state" >>"$state.log" 2>&1 </dev/null &
+    ' _ "$start" "$stoppost" "$state" ) >>"$state.log" 2>&1 </dev/null &
     echo $! >"$pidf"
     if [ -n "$block" ]; then
       while running; do sleep 0.2; done
@@ -88,6 +117,15 @@ case $verb in
     ;;
   status)
     echo "$unit - $(unit_state) (e2e stand-in; log $state.log)"
+    ;;
+  reset-failed)
+    running || rm -f "$state.exit"
+    ;;
+  show)
+    case $prop in
+      ActiveState) unit_state ;;
+      *) echo "e2e systemctl: show -p $prop is not emulated for $unit" >&2; exit 1 ;;
+    esac
     ;;
   enable|disable)
     exit 0

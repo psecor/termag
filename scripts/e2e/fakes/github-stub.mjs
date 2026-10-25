@@ -3,7 +3,9 @@
 // github-redirect.cjs: api.github.com at the root, github.com under
 // /_github.com/, served by `git http-backend` from bare repositories under
 // E2E_GITHUB_ROOT (e2e-org/sample is created with one commit; e2e-org/dotfiles,
-// a dotfiles repo with an install.sh, is public: clones need no token). A token
+// a dotfiles repo with an install.sh, is public: clones need no token, as is
+// example-org/e2e-demo, a public repository; chat trust is the owner's tick,
+// not the GitHub owner). A token
 // containing "_bad" gets 401; one containing "_noscope" lacks admin:public_key.
 // Logs each call with a token fingerprint (the first 8 hex of its sha256),
 // never the token. GET /_e2e/calls returns the call log. Pull requests (the
@@ -35,6 +37,12 @@ const gitRoot = process.env.E2E_GITHUB_ROOT;
 // github.com; the marker file inside the bare repo is what makes it public.
 const PUBLIC_MARKER = 'termag-e2e-public';
 const isPublic = (owner, repo) => !!gitRoot && existsSync(join(gitRoot, owner, `${repo}.git`, PUBLIC_MARKER));
+// Seconds a fetch's pack waits before it is sent, from this marker in the bare
+// repo (none: at once), so a test can see a clone while it runs.
+const SLOW_MARKER = 'termag-e2e-slow';
+const slowSeconds = (owner, repo) => {
+  try { return Math.min(60, Number(readFileSync(join(gitRoot, owner, `${repo}.git`, SLOW_MARKER), 'utf8').trim()) || 0); } catch { return 0; }
+};
 
 function seedRepo(owner, name, { files = {}, isPublicRepo = false } = {}) {
   const bare = join(gitRoot, owner, `${name}.git`);
@@ -71,6 +79,9 @@ if (gitRoot) {
       '.e2e-dotfile': { content: 'from e2e-org/dotfiles\n' },
     },
   });
+  // A public repository under a trusted GitHub owner (backend
+  // services/chatTrust.ts), so a simple-UI chat on it runs tools at once.
+  seedRepo('example-org', 'e2e-demo', { isPublicRepo: true });
 }
 
 // git sends the token as the Basic password, base64-encoded, so the markers
@@ -100,6 +111,18 @@ function serveGit(req, res, path, auth) {
     res.writeHead(401, { 'www-authenticate': 'Basic realm="GitHub"' });
     return res.end();
   }
+  const delay = service === 'git-upload-pack' && suffix === 'git-upload-pack' ? slowSeconds(owner, repo) : 0;
+  if (delay > 0) {
+    // Read the request now, hand it to http-backend later.
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => setTimeout(() => runBackend(req, res, owner, repo, suffix, service, auth, Buffer.concat(chunks)), delay * 1000));
+    return;
+  }
+  runBackend(req, res, owner, repo, suffix, service, auth, null);
+}
+
+function runBackend(req, res, owner, repo, suffix, service, auth, body) {
   const cgi = spawn('git', ['http-backend'], {
     env: {
       PATH: process.env.PATH, GIT_PROJECT_ROOT: gitRoot, GIT_HTTP_EXPORT_ALL: '1', REMOTE_USER: 'e2e-octocat',
@@ -108,7 +131,7 @@ function serveGit(req, res, path, auth) {
       HTTP_CONTENT_ENCODING: req.headers['content-encoding'] ?? '', GIT_PROTOCOL: req.headers['git-protocol'] ?? '',
     },
   });
-  req.pipe(cgi.stdin);
+  if (body) cgi.stdin.end(body); else req.pipe(cgi.stdin);
   let head = Buffer.alloc(0);
   let headerDone = false;
   let status = 200;
@@ -462,10 +485,25 @@ createServer((req, res) => {
         return send(201, view);
       }
     }
+    // Any repository: one the stub serves as it is (its visibility, its
+    // default branch), any other as a private one on main, so a lookup never
+    // reaches GitHub.
     const repoPath = /^\/repos\/([^/]+)\/([^/]+)$/.exec(path);
     if (req.method === 'GET' && repoPath) {
-      record(`GET ${path} -> 200 token=${fp(auth)}`);
-      return send(200, { full_name: `${repoPath[1]}/${repoPath[2]}`, private: true, default_branch: 'main' });
+      const [, owner, name] = repoPath;
+      const bare = gitRoot ? join(gitRoot, owner, `${name}.git`) : null;
+      const served = !!bare && existsSync(bare);
+      let defaultBranch = 'main';
+      if (served) {
+        try { defaultBranch = /^ref: refs\/heads\/(.+)$/m.exec(readFileSync(join(bare, 'HEAD'), 'utf8'))?.[1] ?? 'main'; } catch { /* main */ }
+      }
+      const priv = !(served && isPublic(owner, name));
+      record(`GET ${path} -> 200 (${served ? 'served' : 'generic'}) token=${fp(auth)}`);
+      return send(200, {
+        name, full_name: `${owner}/${name}`, owner: { login: owner }, private: priv, visibility: priv ? 'private' : 'public',
+        default_branch: defaultBranch, archived: false, html_url: `https://github.com/${owner}/${name}`,
+        clone_url: `https://github.com/${owner}/${name}.git`,
+      });
     }
     if (req.method === 'GET' && (path === '/user/repos' || /^\/orgs\/[^/]+\/repos$/.test(path))) {
       return serveRepoList(req, res, auth, path, url, send);

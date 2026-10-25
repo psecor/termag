@@ -1,13 +1,31 @@
 #!/bin/bash
 # Stand-in Claude Code CLI for the e2e boxes (E2E_FAKE_CLAUDE=1). Keeps its
 # conversation where Claude does (~/.claude/projects/<encoded cwd>/<id>.jsonl),
-# honours --resume <id> and --continue, and reports status through the box's
+# honours --resume <id> and --continue wherever they sit (Open in full UI
+# execs `claude --permission-mode … --resume <id>`), and reports status through the box's
 # termag-status as Claude's hooks do: idle at the prompt, working while it
 # handles a line. A line starting with "long" stays working, like a long tool
 # call. Re-execs so tmux shows `claude` as the pane command. `-p` runs one
 # Bedrock turn through the gateway settings instead (claude-bedrock.mjs). A
 # positional prompt starts the session on it, as `claude "<prompt>"` does.
 [ -n "${STUB_REEXEC:-}" ] || STUB_REEXEC=1 exec -a claude /bin/bash "$0" "$@"
+# What a version check reads (t3's Claude provider probes it before it
+# offers Claude); `claude auth` is claude-auth.mjs.
+case "${1:-}" in
+  --version|-v) echo "2.1.307 (Claude Code)"; exit 0 ;;
+esac
+if [ "${1:-}" = auth ]; then
+  exec node "$(dirname "$0")/claude-auth.mjs" "$@"
+fi
+# The Claude Agent SDK's long-lived mode: stream-json in and out and no -p
+# (a t3code server's Claude provider); claude-sdk.mjs.
+if [ "${1:-}" != -p ] && [ "${1:-}" != --print ]; then
+  prev=
+  for a in "$@"; do
+    [ "$prev" = --input-format ] && [ "$a" = stream-json ] && exec node "$(dirname "$0")/claude-sdk.mjs" "$@"
+    prev=$a
+  done
+fi
 # `claude -p … --output-format stream-json`: the simple UI's chat runner
 # (agent/chat-runner.js); a scripted turn with tool calls (claude-stream.mjs).
 if [ "${1:-}" = -p ] || [ "${1:-}" = --print ]; then
@@ -16,27 +34,55 @@ fi
 # `claude -p [--model <tier|id>] <prompt>`: one Bedrock turn through the box's
 # termag Claude gateway settings (~/.claude/settings.json), as Claude Code makes it.
 if [ "${1:-}" = -p ] || [ "${1:-}" = --print ]; then shift; exec node "$(dirname "$0")/claude-bedrock.mjs" "$@"; fi
+# --resume and --continue are not always argv[1]. The full-UI launcher execs
+# `claude --permission-mode <mode> [--tools …] --resume <id>`. A value-taking
+# flag is consumed so its argument (dontAsk, the settings JSON) is not read
+# as the spawn brief. A bare positional is still `claude "<prompt>"`.
+resume_id=
+do_continue=0
+prompt=
+take=
+for a in "$@"; do
+  if [ -n "$take" ]; then
+    if [ "$take" = --resume ]; then resume_id="$a"; fi
+    take=
+    continue
+  fi
+  case "$a" in
+    --resume) take=--resume ;;
+    --resume=*) resume_id="${a#--resume=}" ;;
+    --continue) do_continue=1 ;;
+    --permission-mode|--tools|--mcp-config|--setting-sources|--settings|--model|--input-format|--output-format)
+      take=$a ;;
+    -*) ;;
+    *) [ -z "$prompt" ] && prompt="$a" ;;
+  esac
+done
+# /proc on Linux; uuidgen where there is none (macOS).
+new_id() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
 cwd=$(pwd -P); enc=$(printf '%s' "$cwd" | sed 's#[/.]#-#g'); dir="$HOME/.claude/projects/$enc"; mkdir -p "$dir"
-if [ "${1:-}" = --resume ] && [ -n "${2:-}" ]; then
-  id=$2; f="$dir/$id.jsonl"
+if [ -n "$resume_id" ]; then
+  id=$resume_id; f="$dir/$id.jsonl"
   if [ -f "$f" ]; then
-    echo "claude (stub): resumed conversation $id with $(wc -l < "$f") earlier messages:"
-    jq -r '"  > " + .text' "$f" | tail -5
+    echo "claude (stub): resumed conversation $id with $(wc -l < "$f" | tr -d ' ') earlier messages:"
+    # Its own lines carry .text; a chat runner turn wrote Claude's shape (.message.content).
+    jq -r 'select(.type == "user") | "  > " + (.text // (.message.content | if type == "string" then . else ([.[]? | .text? // empty] | join(" ")) end) // "")' "$f" | grep -v '^  > $' | tail -5
   else echo "claude (stub): NO conversation $id under $dir"; fi
-elif [ "${1:-}" = --continue ]; then
-  id=$(find "$dir" -maxdepth 1 -name '*.jsonl' -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -n1 | sed 's/^[^ ]* //; s/\.jsonl$//')
+elif [ "$do_continue" = 1 ]; then
+  # The newest conversation (ls -t: GNU find's -printf is not on macOS).
+  id=$(cd "$dir" && ls -t -- *.jsonl 2>/dev/null | head -n1 | sed 's/\.jsonl$//')
   echo "claude (stub): continuing ${id:-nothing}"
-  [ -n "$id" ] || id=$(cat /proc/sys/kernel/random/uuid)
+  [ -n "$id" ] || id=$(new_id)
 else
-  id=$(cat /proc/sys/kernel/random/uuid); echo "claude (stub): new conversation $id in $cwd"
+  id=$(new_id); echo "claude (stub): new conversation $id in $cwd"
 fi
 f="$dir/$id.jsonl"
 # `claude "<prompt>"`: an interactive session that starts on that prompt (an
 # agent spawn's brief). Kept as the first message.
-if [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then
-  echo "claude (stub): starting on a $(printf '%s\n' "$1" | wc -l)-line prompt:"
-  printf '%s\n' "$1" | head -3 | sed 's/^/  > /'
-  jq -cn --arg t "$1" --arg c "$cwd" '{type:"user",cwd:$c,text:$t}' >> "$f"
+if [ -n "$prompt" ]; then
+  echo "claude (stub): starting on a $(printf '%s\n' "$prompt" | wc -l | tr -d ' ')-line prompt:"
+  printf '%s\n' "$prompt" | head -3 | sed 's/^/  > /'
+  jq -cn --arg t "$prompt" --arg c "$cwd" '{type:"user",cwd:$c,text:$t}' >> "$f"
 fi
 termag-status idle >/dev/null 2>&1
 while IFS= read -r -p '> ' line; do
