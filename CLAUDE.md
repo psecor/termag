@@ -4,10 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Read AGENTS.md
 
-`AGENTS.md` in this directory is the maintained reference for this repo: architecture, domain model,
-schema, integration surfaces, build/run/test commands, and a numbered gotcha list. It is not loaded
-into context automatically. Read it before anything beyond a trivial edit — and always before
-touching:
+`AGENTS.md` in this directory is the entry point to the maintained reference for this repo: what it
+is, the layout, the architecture, build/run/test commands, and an index of everything else. The full
+text it indexes is in `docs/agents/`: the domain model, data and schema, configuration,
+observability, integration surfaces, and the gotchas (`AGENTS.md` lists each gotcha's one-line
+rule; `docs/agents/gotchas.md` says why it holds). Neither is loaded into context automatically. Read
+`AGENTS.md` before anything beyond a trivial edit, and the matching `docs/agents/` file (above all
+the gotchas) before touching:
 
 - **status handling** (Claude hooks, Codex bridge, tmux poller, working-time attribution) — the
   densest concentration of gotchas in the repo
@@ -25,10 +28,11 @@ stack on a box, mirroring its per-user agent). Every feature flag is listed in `
 
 ## What AGENTS.md can't say about itself
 
-An external agent-wiki sweeper rewrites `AGENTS.md` periodically. Two consequences: an unexplained
-`M AGENTS.md` in `git status` is probably the sweeper rather than your edit, and its rewrites have
-previously reintroduced strings gitleaks blocks — read that diff before committing it.
-Gotcha numbering shifts when it runs, so cite gotchas by subject, not by number.
+An external agent-wiki sweeper rewrites `AGENTS.md` periodically. Three consequences: an unexplained
+`M AGENTS.md` in `git status` is probably the sweeper rather than your edit; its rewrites have
+previously reintroduced strings gitleaks blocks, so read that diff before committing it; and a rewrite that pulls `docs/agents/` text back into `AGENTS.md` undoes the split, so keep
+`AGENTS.md` an index and put the detail in `docs/agents/`. Gotcha numbering shifts when it runs, so
+cite gotchas by subject, not by number.
 
 ## Before your first commit here
 

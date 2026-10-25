@@ -9,7 +9,7 @@ the EC2 host.
 
 ## Image
 
-`Dockerfile` at the repo root, multi-stage, Node 20 on Debian slim. Runs as UID
+`Dockerfile` at the repo root, multi-stage, Node 24 on Debian slim. Runs as UID
 10001 with nothing writable under `/app`; scratch goes to `/tmp`. Two targets:
 
 | Target | Purpose |

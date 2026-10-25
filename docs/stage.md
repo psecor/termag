@@ -15,6 +15,8 @@ make stage-restart                              # backend, frontend and agent
 make stage-down                                 # stop; the database and checkout stay
 bash scripts/stage/stage.sh seed                # projects + workstreams for this box's live sessions
 bash scripts/stage/stage.sh reset-db            # empty database, re-register this box
+STAGE_PROD_PROFILE=<aws-profile> bash scripts/stage/stage.sh refresh   # production's data, as a copy
+bash scripts/stage/stage.sh refresh-schedule on # ...and again every day at 12:00 UTC
 bash scripts/stage/stage.sh uninstall --purge   # remove units, hook entries and the root
 ```
 
@@ -105,6 +107,94 @@ converges the database. A lockfile change triggers `npm ci`.
 To see an edit without going through a branch, edit in the staging checkout
 and `make stage-restart UNITS=backend` (the frontend hot-reloads on its own).
 
+## Production data
+
+`stage.sh refresh` replaces staging's database with a snapshot of
+production's, so a frontend change can be looked at against real projects,
+boxes, PRs and usage. Staging never connects to production: it gets a copy.
+Schema branches, sweeps and clicks here touch nothing there, and the copy is
+yours to break until the next refresh.
+
+```bash
+aws sso login --profile <aws-profile>
+STAGE_PROD_PROFILE=<aws-profile> bash scripts/stage/stage.sh refresh   # the profile is kept in prod.env
+bash scripts/stage/stage.sh refresh                                    # later runs
+bash scripts/stage/stage.sh refresh --file <dump>                      # restore a dump you already have
+bash scripts/stage/stage.sh refresh-schedule on [HH:MM] | off          # daily, UTC, default 12:00
+```
+
+How the snapshot travels (`scripts/stage/prod-snapshot.sh`). Production's
+database is Aurora with IAM-token auth, reachable only from the orchestrator,
+so nothing here dials it:
+
+1. SSM Run Command runs `pg_dump` as root on the orchestrator, which already
+   holds the host role's `rds-db:connect`. When the image's `pg_dump` is older
+   than the server (it refuses newer servers), `scripts/stage/pg-tools.sh`
+   unpacks the server's major from the PGDG apt repository into the dump's
+   temp directory, without installing anything. It checks what apt would:
+   the signed `InRelease` against PGDG's signing key (pinned by fingerprint,
+   the same key Ubuntu's `postgresql-common` ships), the package index against
+   `InRelease`, and each package against the index.
+2. A one-shot server bound to the orchestrator's `127.0.0.1` serves the file
+   once, under a random path, then deletes it (or after 15 minutes). The
+   orchestrator is shared with other accounts; the random path is what keeps
+   them out, so it lives in a root-only file, never in a command line (`ps`
+   shows every account's).
+3. This box pulls it through an SSM port forward, checks its sha256, and asks
+   the orchestrator to clean up again.
+
+Your SSO role needs `ssm:SendCommand` and `ssm:StartSession` on the
+orchestrator, nothing on the database.
+
+What the copy leaves out (rows only; every table's schema comes across): browser
+sessions and CLI sign-ins (a copy would be a set of live session ids), agent
+tokens, stored credentials (sealed with production's KMS key, unreadable here),
+invite codes, production's orchestrator lease, and the queues staging's sweeps
+would otherwise deliver a second time into this box's real panes: spawns,
+handoffs, asks, collaboration requests. `STAGE_PROD_EXCLUDE_DATA` overrides
+the list.
+
+What `refresh` does with it:
+
+- **Postgres version.** A dump from a newer major moves the staging cluster up
+  first (re-created, not upgraded, since its data is being replaced). If that
+  major is not installed, `pg-tools.sh` unpacks it under the root and the
+  postgres unit runs it with `LD_LIBRARY_PATH`. The old data directory stays as
+  `pg/data.<old major>`; a refresh that fails before the swap moves it back.
+- **Swap.** The dump is restored into a side database and swapped in, so a
+  failed restore leaves staging on its previous data. The previous database
+  stays as `termag_prev` until the next refresh. The backend's start converges
+  the copy to the checkout's schema, as on every start.
+- **Sign-in.** Staging signs in as the snapshot's user with your unix name
+  (`users.unixUsername` is unique, so any other email would collide with that
+  row), and keeps that email for later runs.
+- **This box.** The mirror agent is re-linked to the snapshot's record of this
+  box (matched by short hostname), with a token minted in staging, so the box's
+  projects come up live. Reconnecting recreates only sessions that are missing,
+  as production does. A snapshot without this box registers a new one.
+- **GitHub.** With a credential store configured (see `backend.local.env`),
+  your `gh auth token -h github.com` is stored again as your staging GitHub
+  credential, so the PR pipeline stays connected. `STAGE_PROD_GITHUB=0` skips it.
+- **PR analytics ingest is off.** The snapshot names production's ingest token
+  owner, often you, and with your token stored again staging would ingest the
+  same repos on the same user's GitHub GraphQL quota (5,000 points an hour)
+  as production does; on 2026-10-21 the two together exhausted it and the PR
+  overview failed with "API rate limit already exceeded". The refresh clears
+  `pr_analytics_settings.tokenUserId`, so the copied PR data stays browsable and
+  the admin PRs tab says there is no token owner. Nominate one in staging's
+  admin only for a short test, and clear it again afterwards.
+- You sign in again afterwards: the copy has no sessions.
+
+Everything else in the copy is as production had it, other people's data
+included, so treat the root (`~/.termag-stage`, mode 0700) like production
+data. Other boxes appear in their last production state but cannot be reached:
+their agents talk to production.
+
+The daily timer (`termag-stage-refresh.timer`) needs a live SSO session for the
+profile. SSO sessions expire within a day, so an unattended run often finds
+none: it fails, leaves the data it had, and says so on the `data` line of
+`stage.sh status`. A refresh you run after `aws sso login` always works.
+
 ## Reaching it from your laptop
 
 One port suffices. With SSM:
@@ -125,8 +215,9 @@ separate browser profile for a second stack.
 - **Other boxes.** `AUTH_MODE=local` requires the backend to bind loopback, so
   another box cannot reach this staging over the VPC without a tunnel or a
   TLS front; adding one is the next step when it is needed.
-- **Production data.** This is not the orchestrator's `:3050` mirror, which
-  shares the production database and forbids schema changes. Here schema
-  changes are the point, and the data is yours to drop.
+- **A live production database.** This is not the orchestrator's `:3050`
+  mirror, which shared the production database and forbade schema changes.
+  Production data arrives here only as a copy (above): schema changes are the
+  point, and the data is yours to drop.
 - **Google sign-in, Slack, the gateway.** Point `backend.local.env` at them
   if a branch needs them, or use the e2e stack's fakes ([e2e-stack.md](e2e-stack.md)).
