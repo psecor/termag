@@ -181,10 +181,10 @@ sudo /tmp/aws/install
 rm -rf /tmp/awscliv2.zip /tmp/aws
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Node.js 20 (NodeSource) — matches the version the orchestrator built against
-# when it cloned-and-built at boot.
+# Node.js 24 (NodeSource). Was 20, which reached end of life on 2026-04-30;
+# the container image (Dockerfile NODE_VERSION) and CI use the same major.
 # ─────────────────────────────────────────────────────────────────────────────
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 apt_get install -y nodejs
 node --version
 npm --version

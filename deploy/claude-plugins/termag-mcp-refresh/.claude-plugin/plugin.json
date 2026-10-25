@@ -1,0 +1,5 @@
+{
+  "name": "termag-mcp-refresh",
+  "version": "0.1.0",
+  "description": "Reload MCP servers when termag delivers new connectors"
+}

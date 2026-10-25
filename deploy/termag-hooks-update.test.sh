@@ -53,8 +53,10 @@ jq -e '.hooks.SessionStart[0].hooks[0].command == "echo hi"' "$WORK/settings.jso
 jq -e '[.hooks.PostToolUse[].hooks[].command] | any(test("prettier"))' "$WORK/settings.json" >/dev/null || fail 'owner hook within a termag event preserved' 'prettier gone'
 jq -e '[.hooks.PostToolUse[].hooks[].command] | any(test("termag-status.* post-tool"))' "$WORK/settings.json" >/dev/null || fail 'PostToolUse now pipes into termag-status post-tool' 'not found'
 jq -e '[.hooks.PostToolUse[].hooks[].command | select(test("termag-status"))] | length == 1' "$WORK/settings.json" >/dev/null || fail 'exactly one termag PostToolUse entry' 'duplicate or missing'
-want=$(jq -c '.hooks | keys' "$CANON"); got=$(jq -c '.hooks | keys - ["SessionStart"]' "$WORK/settings.json")
+want=$(jq -c '.hooks | keys' "$CANON"); got=$(jq -c '.hooks | keys' "$WORK/settings.json")
 [ "$want" = "$got" ] || fail 'all canonical events present' "want $want got $got"
+jq -e '[.hooks.SessionStart[].hooks[].command] == ["echo hi", "\"$HOME/.local/bin/termag-status\" session-start >/dev/null 2>&1 || true"]' "$WORK/settings.json" >/dev/null \
+  || fail "SessionStart gains the PATH hook after the owner's" "$(jq -c '.hooks.SessionStart' "$WORK/settings.json")"
 run --check >/dev/null || fail 'check after apply should exit 0' 'non-zero'
 
 # 4. Invalid JSON is left alone.

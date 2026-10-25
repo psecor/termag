@@ -1,8 +1,10 @@
 /**
  * termag-status — pi extension that reports the pane's status to termag.
  *
- * Loaded by `pi` with `pi -e ~/.local/share/termag/pi-ext/termag-status.ts`
- * (installed by termag-reconcile). pi runs tools without approval prompts and
+ * Loaded by the pi launch and `termag-pi-fireworks` with
+ * `pi -e ~/.local/share/termag/pi-ext/termag-status.ts` (installed by
+ * termag-reconcile); TERMAG_PI_AGENT=fireworks picks the Fireworks
+ * remedies. pi runs tools without approval prompts and
  * has no hooks file like Claude Code, so this is the pi counterpart of
  * deploy/claude-settings.json: it turns pi's lifecycle events into
  * working / waiting / idle / not_running posts plus context-token metadata.
@@ -21,7 +23,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
-  initialState, keepalivePost, reduce, toArgv, KEEPALIVE_MS,
+  initialState, keepalivePost, piAgent, reduce, toArgv, KEEPALIVE_MS,
   type PiEventLike, type Post, type State,
 } from './termag-status-core.ts';
 
@@ -32,6 +34,8 @@ const EVENTS = [
 
 export default function termagStatus(pi: ExtensionAPI): void {
   const bin = process.env.TERMAG_STATUS_BIN ?? join(homedir(), '.local', 'bin', 'termag-status');
+  // termag-pi-fireworks sets it; a plain pi launch leaves the default.
+  const backend = piAgent(process.env.TERMAG_PI_AGENT);
   let enabled = existsSync(bin);
   let state: State = initialState();
   let keepalive: ReturnType<typeof setInterval> | null = null;
@@ -46,7 +50,7 @@ export default function termagStatus(pi: ExtensionAPI): void {
 
   const handle = (ev: PiEventLike): void => {
     try {
-      const r = reduce(state, ev, Date.now());
+      const r = reduce(state, ev, Date.now(), backend);
       state = r.state;
       for (const p of r.posts) post(p);
       if (state.inRun && !keepalive) {

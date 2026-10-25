@@ -19,7 +19,10 @@
 # silent. With no recorded destination it does nothing.
 #
 # Env: TERMAG_AGENT_TELEMETRY (default ~/.config/termag/agent-telemetry.json),
-# TERMAG_OTEL_REPLAY_ID (set by termag-agent-otel for a browser-started launch).
+# TERMAG_OTEL_REPLAY_ID (set by termag-agent-otel for a browser-started launch),
+# TERMAG_PROJECT / TERMAG_WORKSTREAM (set by the orchestrator ahead of the
+# launch: the pane's project and workstream, on the resource as
+# termag.project and termag.workstream; both or neither, ids only).
 set -u
 
 printf '{}\n'
@@ -34,6 +37,9 @@ replay=${TERMAG_OTEL_REPLAY_ID:-}
 case $replay in *[!A-Za-z0-9]*) replay= ;; esac
 if [ ${#replay} -lt 20 ] || [ ${#replay} -gt 64 ]; then replay=; fi
 resource="$resource,service.name=termag-cursor-session,termag.agent=cursor"
+project=${TERMAG_PROJECT:-} workstream=${TERMAG_WORKSTREAM:-}
+[[ $project =~ ^[A-Za-z0-9_-]{1,64}$ ]] && [[ $workstream =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
+  && resource="$resource,termag.project=$project,termag.workstream=$workstream"
 [ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
 
 payload=$(head -c 1048576)

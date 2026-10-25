@@ -12,7 +12,9 @@
 #   * a plain 404 (route not mounted, or the URL reaches nginx) and a 401
 #     (token mismatch) are this host's configuration, not the session's:
 #     exit 1, so queued sessions wait for the fix
-#   * the body carries only what the backend uses
+#   * the body carries only what the backend uses; the creator's account id
+#     and the attempt count ride along when the orchestrator set them, and
+#     never reach stderr
 #   * orders with no session (pre-warming) or no owner email never call the
 #     backend and exit 2; so does a missing CLAUDE_RUNNER_SPAWN_URL (no
 #     default port: a guess that lands on nginx is a permanent 404)
@@ -97,7 +99,21 @@ grep -q "$JWT" "$WORK/err" && fail 'the JWT never reaches stderr' '(absent)' 'pr
 grep -q 'ada@example.com' "$WORK/err" && fail 'the owner email never reaches stderr' '(absent)' 'present'
 grep -q 'ord-1' "$WORK/err" || fail 'stderr names the order' 'ord-1' "$(cat "$WORK/err")"
 keys="$(jq -r '.body | fromjson | keys | join(",")' "$WORK/record" 2>/dev/null)"
-[ "$keys" = 'accountEmail,orderId,sessionId,workOrder' ] || fail 'body carries only what the backend uses' 'accountEmail,orderId,sessionId,workOrder' "$keys"
+[ "$keys" = 'accountEmail,attempt,orderId,sessionId,workOrder' ] || fail 'body carries only what the backend uses' 'accountEmail,attempt,orderId,sessionId,workOrder' "$keys"
+sent_attempt="$(jq -r '.body | fromjson | .attempt' "$WORK/record" 2>/dev/null)"
+[ "$sent_attempt" = 1 ] || fail 'the attempt count is in the body as a number' 1 "$sent_attempt"
+
+# The creator's account id rides along when the orchestrator set it.
+rm -f "$WORK/record"
+run 202 CLAUDE_RUNNER_ACCOUNT_ID=user_01HXYZ; got=$?
+[ "$got" = 0 ] || fail 'account id: submits' 0 "$got"
+sent_account="$(jq -r '.body | fromjson | .accountId' "$WORK/record" 2>/dev/null)"
+[ "$sent_account" = 'user_01HXYZ' ] || fail 'the account id is in the body when set' 'user_01HXYZ' "$sent_account"
+grep -q 'user_01HXYZ' "$WORK/err" && fail 'the account id never reaches stderr' '(absent)' 'present'
+rm -f "$WORK/record"
+run 202 CLAUDE_RUNNER_ATTEMPT=; got=$?
+keys="$(jq -r '.body | fromjson | keys | join(",")' "$WORK/record" 2>/dev/null)"
+[ "$keys" = 'accountEmail,orderId,sessionId,workOrder' ] || fail 'without an account id or attempt the body is as before' 'accountEmail,orderId,sessionId,workOrder' "$keys"
 
 run 503; got=$?
 [ "$got" = 1 ] || fail '503 (no ready box) is retryable' 1 "$got"

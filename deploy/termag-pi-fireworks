@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# termag-pi-fireworks — launch pi on Fireworks' models through the termag
+# gateway, with termag's status and telemetry extensions.
+# The launcher of the pi harness's `fireworks` backend
+# (backend/src/providers/registry.ts): the orchestrator types it in place of
+# plain pi for a workstream whose agent runs on Fireworks,
+# `--continue` on reconnect included (services/launchCommand.ts).
+#
+#   termag-pi-fireworks --model <id> [--context <n>] [pi args...]
+#
+# The orchestrator names the model (the workstream's, or the fireworks-models
+# flag's default) and its context window on every launch: the box keeps no
+# model list. `termag-credentials pi-model` adds it to the `termag-fireworks`
+# provider in pi's ~/.pi/agent/models.json, on the base `termag-credentials
+# apply fireworks` recorded from the delivery. pi sends the box's agent token,
+# which termag-claude-token reads from the agent config on each request; the
+# gateway checks it and the model, and puts Fireworks' key in its place, so no
+# Fireworks credential is on this box.
+#
+# Everything after our flags is passed to pi unchanged.
+set -u
+PATH="$HOME/.local/bin:$PATH"
+
+EXT="${TERMAG_PI_EXT:-$HOME/.local/share/termag/pi-ext/termag-status.ts}"
+
+model='' context=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --model) model=${2:-}; shift 2 2>/dev/null || shift ;;
+    --context) context=${2:-}; shift 2 2>/dev/null || shift ;;
+    *) break ;;
+  esac
+done
+
+if ! command -v pi >/dev/null 2>&1; then
+  cat >&2 <<'MSG'
+termag: `pi` is not installed on this box.
+  In this pane:  npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
+  (nvm's node is on PATH in tmux panes; new box images ship it already. Keep the
+  version in step with packer/scripts/setup.sh.)
+MSG
+  exit 127
+fi
+
+if [ -z "$model" ]; then
+  echo 'termag: no Fireworks model given (termag-pi-fireworks --model <id>); the orchestrator names one on every launch' >&2
+  exit 2
+fi
+
+# Says why, and fails, where Fireworks is not set up on this box.
+if ! termag-credentials pi-model --model "$model" ${context:+--context "$context"} </dev/null; then
+  echo '  In the ctrl pane run:  termag-credentials status' >&2
+  exit 1
+fi
+
+if [ -r "$EXT" ]; then
+  set -- -e "$EXT" "$@"
+else
+  printf 'termag: status extension missing at %s; launching without it (the status light stays grey)\n' "$EXT" >&2
+fi
+OTEL_EXT="${TERMAG_PI_OTEL_EXT:-$(dirname "$EXT")/termag-otel.ts}"
+if [ -r "$OTEL_EXT" ]; then set -- -e "$OTEL_EXT" "$@"; fi
+
+# The extensions name the gateway in their remedies and put termag.backend=fireworks on spans.
+export TERMAG_PI_AGENT=fireworks
+exec pi --provider termag-fireworks --model "$model" "$@"

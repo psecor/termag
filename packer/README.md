@@ -13,7 +13,8 @@ same capabilities a human gets on a workstation.
 - **System / dev tooling**: `git`, `mosh`, `tmux`, `build-essential`, `curl`,
   `wget`, `jq`, `htop`, `ripgrep`, `zsh`, `zoxide`, `keychain`,
   `postgresql-client`, `rsync`, `neovim` (latest), `gh`, `awscli` v2,
-  `terraform`, Doppler CLI, Docker (ce + buildx + compose), Chromium (snap).
+  `terraform`, Doppler CLI, Docker (ce + buildx + compose), Chromium (snap;
+  Playwright brings its own, below).
 - **Language toolchains (per-user, under `~termag`)**:
   - Node via **nvm** (LTS) + `corepack` (yarn, pnpm). *nvm-only — there is no
     system node; the agent service sources nvm.*
@@ -34,6 +35,37 @@ same capabilities a human gets on a workstation.
   release binary from `github.com/rtk-ai/rtk`, in `~/.local/bin`),
   `browser-harness` (uv tool — needs Chromium + per-user CDP/VNC wiring),
   `clickhousectl` (best-effort).
+- **Playwright** (pinned `PLAYWRIGHT_VERSION` in `setup.sh`, 1.64.1) with its
+  Chromium, headless shell and ffmpeg, so an agent can record a `.webm` with
+  `recordVideo` or a trace with nothing to install. The library is
+  `/opt/playwright/node_modules/playwright` (root-owned, outside nvm so a Node
+  upgrade keeps it; `playwright` CLI in `/usr/local/bin`), the browsers are in
+  `/opt/ms-playwright` (owned by the box user, so a project pinning another
+  version can `npx playwright install` its own revision beside them). Every
+  process gets `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright` and
+  `NODE_PATH=/opt/playwright/node_modules` from `/etc/environment` (pam:
+  ssh, SSM, sudo), `/etc/environment.d/60-playwright.conf` (the systemd user
+  manager, so `termag-agent.service`, its panes and `termag ask` runs) and
+  `/etc/zsh/zshenv` (every zsh). About 1 GB: 680 MB of browsers, ~300 MB of
+  the apt libraries `install-deps` pulls, 19 MB of library. Bump the version
+  alone; `playwright install` fetches the revisions it expects. NODE_PATH is
+  CommonJS only, so use `require` (a `.cjs` file) rather than ESM `import`:
+
+  ```js
+  // node rec.cjs: no npm install needed on a box
+  const { chromium } = require('playwright');
+  (async () => {
+    const browser = await chromium.launch();
+    const context = await browser.newContext({ recordVideo: { dir: 'videos' } });
+    const page = await context.newPage();
+    await page.goto('http://localhost:3000');
+    await page.click('text=Sign in');
+    const video = page.video();
+    await context.close();            // the video is written on close
+    await video.saveAs('demo.webm');
+    await browser.close();
+  })();
+  ```
 - **Dotfiles** (devbox parity): `.zshrc` (wires every toolchain onto PATH for
   interactive tmux panes), `.tmux.conf` + TPM, `.gitconfig`, Oh My Zsh, neovim config.
 - termag source — this checkout with full history, cloned from a bundle to `~termag/src/termag` (agent's `node_modules` baked in)
@@ -52,6 +84,10 @@ same capabilities a human gets on a workstation.
   for everything the agent spawns (project panes, Claude runner sessions, a
   detached `make dev`), repeated per session as `new-session -e` so a tmux
   server that outlived an agent restart is covered too (`agent/tmux-args.js`).
+  The same `install_box_marker` puts `~/.local/bin` on PATH in
+  `/etc/zsh/zshenv`, so a non-interactive zsh (`ssh box -- termag …`) finds
+  the termag CLI and the other launchers there; `~/.zshrc` only covers
+  interactive shells.
   Tools that want to know they run on a termag box read it; the hostname is
   no signal.
 - **Home-path index** (`scripts/index-home-paths.sh`, the last provisioner):
@@ -231,7 +267,10 @@ a box to move it onto the new image.
 ### Building locally (fallback / debugging)
 
 Requires Packer, valid AWS credentials (an Okta-SSO session works), and
-network access from the dev VPC's public subnet for `apt`/`npm`.
+network access for `apt`/`npm`. Use a private subnet behind the VPC's NAT:
+an org policy that limits instance credentials to the VPC denies the
+builder's role from a public IP. For a public subnet in an account without
+such a policy, add `-var associate_public_ip_address=true`.
 
 ```bash
 cd packer/
@@ -239,11 +278,11 @@ packer init box.pkr.hcl        # per-template: `packer init .` errors on
                                # duplicate vars shared with orchestrator.pkr.hcl
 packer build \
   -var vpc_id=<dev-vpc> \
-  -var subnet_id=<public-subnet> \
+  -var subnet_id=<private-subnet> \
   box.pkr.hcl
 ```
 
-Build runs in `us-east-1`, in a VPC and public subnet you supply via
+Build runs in `us-east-1`, in a VPC and private subnet you supply via
 `-var vpc_id=...` and `-var subnet_id=...` (or a `tfvars`-style file).
 Communication is via SSM, so the subnet needs outbound but not inbound
 network access.

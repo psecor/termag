@@ -133,9 +133,15 @@ for want in \
   '      receivers: [prometheus/claude-runner-orchestrator, otlp/termag]' \
   '      receivers: [journald, filelog/cloud-init, filelog/nginx, otlp/termag]' \
   '  otlp/termag:' \
-  '        endpoint: 127.0.0.1:4318'; do
+  '        endpoint: 127.0.0.1:4318' \
+  '  filter/noise:' \
+  '        - filter/noise'; do
   grep -qxF -- "$want" "$CONFIG" || fail "config: has line" "$want" "missing"
 done
+# The noise filter runs on the string body, so after transform/journald and
+# before the redaction (which it must not short-circuit).
+order="$(grep -nE '^\s+- (transform/journald|filter/noise|transform/redact)$' "$CONFIG" | head -3 | sed 's/^[0-9]*:\s*- //' | tr '\n' ' ')"
+[ "$order" = 'transform/journald filter/noise transform/redact ' ] || fail "config: filter/noise sits between transform/journald and transform/redact" 'transform/journald filter/noise transform/redact' "$order"
 
 # The backend's OTLP receiver must never listen beyond loopback.
 grep -nE '^\s+endpoint: ' "$CONFIG" | grep -vE 'endpoint: 127\.0\.0\.1:' \
@@ -180,6 +186,11 @@ EOF
 {"MESSAGE":"spawn-runner[ord.42]: retryable (HTTP 503): every box of the session owner (1) already runs 3 cloud sessions; it is retried when one ends","PRIORITY":"6","_SYSTEMD_UNIT":"claude-runner-orchestrator.service","_PID":"4344"}
 {"MESSAGE":"claude-runner-orchestrator.service: Scheduled restart job, restart counter is at 1.","PRIORITY":"6","UNIT":"claude-runner-orchestrator.service","_SYSTEMD_UNIT":"init.scope","_PID":"1","_UID":"0"}
 {"MESSAGE":"Started termag-agent-host.service - termag agent host.","PRIORITY":"6","USER_UNIT":"termag-agent-host.service","_SYSTEMD_UNIT":"user@1003.service","_UID":"1003","_PID":"1778"}
+{"MESSAGE":"[STATUS] Push ada-webapp-agent to 3 clients","PRIORITY":"6","_SYSTEMD_UNIT":"termag.service","_PID":"99"}
+{"MESSAGE":"[STATUS] POST session=ada-webapp-agent status=working notify=false source=hook waitingReason=null message=undefined","PRIORITY":"6","_SYSTEMD_UNIT":"termag.service","_PID":"99"}
+{"MESSAGE":"[GH-AUTHZ] ada box b1 GET /repos/example-org/webapp/pulls allowed","PRIORITY":"6","_SYSTEMD_UNIT":"termag.service","_PID":"99"}
+{"MESSAGE":"[GH-AUTHZ] GET /repos/x -> 403 ada box b1 cannot push","PRIORITY":"6","_SYSTEMD_UNIT":"termag.service","_PID":"99"}
+{"MESSAGE":"[STATUS] POSTed a repair for ada-webapp-agent","PRIORITY":"6","_SYSTEMD_UNIT":"termag.service","_PID":"99"}
 EOF
   printf '%s\n' "{\"MESSAGE\":\"work order $JWT_FIX refused\",\"PRIORITY\":\"4\",\"_SYSTEMD_UNIT\":\"claude-runner-orchestrator.service\",\"_PID\":\"4345\"}" >>"$WORK/log/journal.json"
   cat >"$WORK/test.yaml" <<EOF
@@ -246,7 +257,9 @@ EOF
       [ "$pushed" = 1 ] || sleep 0.2
     done
     [ "$pushed" = 1 ] || fail "collector: the backend's OTLP receiver accepts logs and metrics" "HTTP 200" "no answer on $OTLP"
-    want_records=15
+    # 15 lines plus the two noise-fixture lines that are kept (the GH-AUTHZ
+    # refusal and the near-miss STATUS line); the three dropped ones never count.
+    want_records=17
     # The first scrape comes a few seconds in and the batch processor holds
     # it for up to five more, so the metrics side needs the longer wait.
     i=0
@@ -265,6 +278,13 @@ EOF
     case "$sent" in *'"name":"up"'*) ;; *) fail "collector: the metrics pipeline scrapes the runner orchestrator" "an up series" "none: $(tail -5 "$WORK/collector.log")" ;; esac
     case "$sent" in *'"name":"termag.box.hot"'*) ;; *) fail "collector: the backend's metrics are exported" "termag.box.hot" "none" ;; esac
     case "$sent" in *'termag.spawn.refused'*) ;; *) fail "collector: the backend's log records are exported" "termag.spawn.refused" "none" ;; esac
+    # filter/noise: the per-request chatter is dropped, its neighbours kept.
+    for noise in '[STATUS] Push ada-webapp-agent to 3 clients' '[STATUS] POST session=ada-webapp-agent' '/pulls allowed'; do
+      case "$sent" in *"$noise"*) fail "collector: drops the noise line" "no '$noise'" "present" ;; esac
+    done
+    for kept in '"body":{"stringValue":"[GH-AUTHZ] GET /repos/x -> 403 ada box b1 cannot push"}' '"body":{"stringValue":"[STATUS] POSTed a repair for ada-webapp-agent"}'; do
+      case "$sent" in *"$kept"*) ;; *) fail "collector: keeps the line next to the noise" "$kept" "missing" ;; esac
+    done
     case "$sent" in *'spawn refused (box_busy) ws/agent?token=REDACTED'*) ;; *) fail "collector: the backend's log records are redacted" "token=REDACTED" "$(grep -o 'spawn refused[^"]*' "$WORK/out.json" | head -1)" ;; esac
 
     for secret in "$TOKEN" tmag_cmdline_secret s3cr3tc0de st4te hunter2pass abcdefghijklmnop.qrstuv \

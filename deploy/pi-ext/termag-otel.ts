@@ -75,7 +75,7 @@ export default function termagOtel(pi: ExtensionAPI): void {
   on('session_start', (ev, ctx) => {
     let sessionId: string | undefined;
     try {
-      dest = parseDestination(readRecord(), process.env.TERMAG_OTEL_REPLAY_ID);
+      dest = parseDestination(readRecord(), process.env.TERMAG_OTEL_REPLAY_ID, process.env.TERMAG_PI_AGENT);
       sessionId = (ctx as { sessionManager?: { getSessionId?: () => string } } | undefined)?.sessionManager?.getSessionId?.();
     } catch { dest = null; }
     return handle({ ...(ev as PiEventLike), type: 'session_start', sessionId });

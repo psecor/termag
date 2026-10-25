@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # termag-claude-runner -- run ONE Claude Code cloud session on this box.
 #
+# termag-claude-runner-flags: anthropic-git github
+# (The line above is read by agent/claude-runner-wrapper.js: the agent
+# announces `claude-runner-wrapper-v2` when the installed wrapper carries it,
+# and the orchestrator sends --anthropic-git and --github only to such a box.)
+#
 # The orchestrator's spawn path (backend/src/services/claudeRunnerSpawn.ts)
 # writes the single-use work order to ~/.termag/claude-runner/<order>.work-order
 # (mode 0600) through the agent and creates a tmux session whose only process
@@ -128,15 +133,26 @@ otel_project=
 otel_endpoint=
 user_key=
 box_key=
+# Anthropic-managed git: with
+# --anthropic-git the runner clones, fetches and pushes the session's
+# repository through Anthropic with the owner's claude.ai GitHub token
+# (--use-anthropic-git-proxy), and --github says whether the owner has a
+# termag GitHub credential (connected|absent): absent seeds the session note
+# below and makes the keep-or-remove check conservative.
+anthropic_git=0
+github_state=
 while [ $# -gt 0 ]; do
   case "$1" in
     --otel-project) otel_project=${2:-}; shift ;;
     --otel-endpoint) otel_endpoint=${2:-}; shift ;;
     --user-key) user_key=${2:-}; shift ;;
     --box-key) box_key=${2:-}; shift ;;
+    --anthropic-git) anthropic_git=1 ;;
+    --github) github_state=${2:-}; shift ;;
   esac
   [ $# -gt 0 ] && shift
 done
+case "$github_state" in connected|absent|'') ;; *) github_state= ;; esac
 
 # Started by tmux, not a login shell: put the user's own bin dir first, as
 # ~/.profile does (termag's tools and a native claude install live there).
@@ -305,6 +321,10 @@ has_unpushed_work() {
   local tip remote='' asked=0
   for tip in $( { git -C "$checkout" for-each-ref --format='%(objectname)' refs/heads; git -C "$checkout" rev-parse -q --verify HEAD; } 2>/dev/null | sort -u); do
     [ -n "$(git -C "$checkout" rev-list -1 "$tip" --not --remotes 2>/dev/null)" ] || continue
+    # Under Anthropic-managed git with no termag GitHub credential, origin
+    # cannot be asked (the proxy's token is gone with the runner, and the
+    # broker refuses the box): an unpushed-looking tip counts as unpushed.
+    if [ "$anthropic_git" = 1 ] && [ "$github_state" != connected ]; then return 0; fi
     if [ "$asked" = 0 ]; then
       remote=$(timeout 60 git -C "$checkout" ls-remote --heads origin 2>/dev/null) || return 0
       asked=1
@@ -599,9 +619,13 @@ if [ -n "$otel_project$otel_endpoint" ]; then
     export OTEL_EXPORTER_OTLP_ENDPOINT=$otel_endpoint
     export OTEL_METRICS_INCLUDE_SESSION_ID=true
     box_name=$(hostname -s 2>/dev/null) || box_name=unknown
-    export OTEL_RESOURCE_ATTRIBUTES="telemetry.project_id=$otel_project,service.name=termag-claude-session,termag.box=${box_name:-unknown},termag.slot=$slot"
-    # The owner's and the box's ids, both or neither, so the session's
-    # telemetry can be joined to both. Ids
+    # The four every agent resource carries (termag.agent, termag.session.kind,
+    # termag.project, termag.workstream):
+    # a cloud session is Claude's, of kind cloud, under the reserved cloud
+    # project the work-time rows use (backend services/worktimeProjects.ts).
+    export OTEL_RESOURCE_ATTRIBUTES="telemetry.project_id=$otel_project,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=${box_name:-unknown},termag.slot=$slot"
+    # The owner's and the box's ids, both or neither:
+    # the browser SDK stamps the same two attributes on its telemetry. Ids
     # only (letters, digits, - and _), so no value needs OTEL escaping.
     case "$user_key$box_key" in
       '') ;;
@@ -631,7 +655,9 @@ fi
 # settings outrank the launcher's environment for everything but the
 # destination, so an owner's exporter, resource attributes or collector
 # credential would otherwise reach the pinned export, and an owner's "0" would
-# switch the export off (opting out is a deployment decision, not a settings key). From the repository's runner
+# switch the export off (opting out is an operator decision, not a settings key).
+# termag-mcp-refresh leaves env.CLAUDE_CODE_PLUGIN_DIRS too: it reloads on the
+# box's MCP server set, which a session's own config never has. From the webapp runner
 # install's ~/.claude-runner/config when present, all of it; else from
 # ~/.claude, its settings, CLAUDE.md, agents, skills and commands only, not its
 # runtime state or plugins.
@@ -680,10 +706,57 @@ stage_host_config() {
     | if (.apiKeyHelper // "" | test("/termag-claude-token(\u0027|$)")) then del(.apiKeyHelper) else . end
     | if .env then .env |= with_entries(select(.key | test(if $pinned == 1 then "^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_ENHANCED_TELEMETRY_BETA$)" else "^OTEL_LOG_" end) | not)) else . end
     | if $pinned == 1 then del(.otelHeadersHelper) else . end
+    | if .env then .env |= del(.CLAUDE_CODE_USE_BEDROCK, .ANTHROPIC_BEDROCK_BASE_URL) else . end
+    | if ((.env // {}).CLAUDE_CODE_PLUGIN_DIRS | type) == "string"
+      then .env.CLAUDE_CODE_PLUGIN_DIRS |= (split(":") | map(select(. != "" and (endswith("/termag-mcp-refresh") | not))) | join(":"))
+        | if .env.CLAUDE_CODE_PLUGIN_DIRS == "" then del(.env.CLAUDE_CODE_PLUGIN_DIRS) else . end
+      else . end
     | if .env == {} then del(.env) else . end' "$host_cfg/settings.json" > "$host_cfg/settings.json.tmp" \
     && mv -f "$host_cfg/settings.json.tmp" "$host_cfg/settings.json"
 }
+# The Bedrock switch goes whatever claude-gateway.json records: a copy taken
+# while termag-credentials is mid-write (the settings merge lands before the
+# record does) would otherwise route the session through the gateway.
+#
+# The session note: with --github absent,
+# the session's CLAUDE.md says what works without a termag GitHub credential
+# and what does not, so the first reply tells the engineer. Appended once,
+# never to the owner's own file. The termag URL comes from the agent config
+# the way the end report's endpoint does: ws(s)://host/termag/ws/agent ->
+# https://host/termag/settings; without one the note names termag only.
+settings_url() {
+  local config url
+  config=$(find_agent_config) || return 1
+  url=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || return 1
+  url=${url%%\?*}
+  case $url in
+    ws://*)  url="http://${url#ws://}" ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}/settings" ;;
+    *) return 1 ;;
+  esac
+}
+seed_session_note() {
+  [ "$github_state" = absent ] || return 0
+  local where
+  where=$(settings_url) || where='termag (Settings, Credentials)'
+  [ -f "$host_cfg/CLAUDE.md" ] && grep -q '^## termag: GitHub is not connected' "$host_cfg/CLAUDE.md" && return 0
+  cat >>"$host_cfg/CLAUDE.md" <<EOF_NOTE
+
+## termag: GitHub is not connected for this box's owner
+
+Fetching and pushing this repository works (Anthropic-managed git). The \`gh\`
+CLI, other private repositories and Bazel fetches of private Go modules fail
+with authentication errors until the owner connects GitHub in termag: get
+access to termag if you have none, then $where ("Connect GitHub"). Mention this in
+your first reply, in one sentence, then carry on.
+EOF_NOTE
+  log "session note: GitHub is not connected in termag for the owner; the session's CLAUDE.md says what that means"
+}
 if stage_host_config; then
+  seed_session_note
   export SELF_HOSTED_RUNNER_HOST_CONFIG_DIR=$host_cfg
 else
   # Never fall back to ~/.claude: it would carry the gateway into the session.
@@ -703,12 +776,20 @@ set -- \
   --post-session-hook-timeout-sec 120 \
   --remove-session-state \
   --push-outcome-on-release \
-  --git-ssh-rewrite github.com \
   --confine-repo-settings warn \
   --trust-workspace true \
   --client-label "termag-$(hostname -s 2>/dev/null || hostname)-s$slot" \
   --health-port 0 \
   --log-file "$log_file"
+if [ "$anthropic_git" = 1 ]; then
+  # Anthropic-managed git: the runner's clone, fetch and outcome push go
+  # through Anthropic with the session creator's own GitHub token; the SSH
+  # rewrite would have no effect and is left out.
+  set -- "$@" --use-anthropic-git-proxy
+  log "git: anthropic-managed${github_state:+ (termag GitHub credential $github_state)}"
+else
+  set -- "$@" --git-ssh-rewrite github.com
+fi
 if [ -x "$hooks_dir/command" ]; then
   # termag's hooks (see the header): the command hook execs the repository's wrapper
   # itself when present, so no --exec-path, which would take precedence over

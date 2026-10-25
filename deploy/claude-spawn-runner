@@ -28,6 +28,7 @@
 #   CLAUDE_RUNNER_WORK_ORDER_FILE  the signed single-use JWT; read, never printed
 #   CLAUDE_RUNNER_ORDER_ID         idempotency key (safe to log)
 #   CLAUDE_RUNNER_SESSION_ID, CLAUDE_RUNNER_ACCOUNT_EMAIL
+#   CLAUDE_RUNNER_ACCOUNT_ID, CLAUDE_RUNNER_ATTEMPT   optional; forwarded when set
 # Env (from the unit / orchestrator.env):
 #   CLAUDE_RUNNER_SPAWN_URL         REQUIRED; cloud-init writes it to
 #                                   /etc/claude/orchestrator.env from the port the
@@ -69,12 +70,19 @@ fi
 
 # The email is read by jq from its environment ($ENV), never put on argv:
 # /proc/<pid>/cmdline is world-readable on the host. The JWT comes from the file.
-body=$(CLAUDE_RUNNER_ACCOUNT_EMAIL="$email" jq -cn \
+# The creator's account id and the attempt count ride along when the
+# orchestrator set them: the backend keys
+# a first-time engineer's placeholder identity on the id. Optional on both
+# sides: an older backend ignores them, an orchestrator without them sends
+# nothing, and the body stays as it was.
+body=$(CLAUDE_RUNNER_ACCOUNT_EMAIL="$email" CLAUDE_RUNNER_ACCOUNT_ID="${CLAUDE_RUNNER_ACCOUNT_ID:-}" CLAUDE_RUNNER_ATTEMPT="${CLAUDE_RUNNER_ATTEMPT:-}" jq -cn \
   --arg orderId "$order" \
   --arg sessionId "$session" \
   --rawfile workOrder "$work_order_file" \
   '{orderId: $orderId, sessionId: $sessionId, accountEmail: $ENV.CLAUDE_RUNNER_ACCOUNT_EMAIL,
-    workOrder: ($workOrder | rtrimstr("\n"))}') || { log 'could not build the request body'; exit 2; }
+    workOrder: ($workOrder | rtrimstr("\n"))}
+   + (if ($ENV.CLAUDE_RUNNER_ACCOUNT_ID // "") != "" then {accountId: $ENV.CLAUDE_RUNNER_ACCOUNT_ID} else {} end)
+   + (if ($ENV.CLAUDE_RUNNER_ATTEMPT // "") | test("^[0-9]+$") then {attempt: ($ENV.CLAUDE_RUNNER_ATTEMPT | tonumber)} else {} end)') || { log 'could not build the request body'; exit 2; }
 
 umask 077
 work=$(mktemp -d) || { log 'mktemp failed'; exit 1; }

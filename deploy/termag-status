@@ -42,6 +42,8 @@
 #                                     # the call opened/merged a PR (the URL in
 #                                     # the output is the proof it succeeded),
 #                                     # else nothing; POSTs nothing (tests)
+#   termag-status session-start       # SessionStart hook: ~/.local/bin onto
+#                                     # $CLAUDE_ENV_FILE, POSTs nothing
 #   termag-status --print-endpoint    # resolve and print, POST nothing
 #   termag-status --print-auth        # 'token: present|absent', never the token
 #
@@ -76,7 +78,17 @@
 #                          set by termag-claude-runner and the runner inside a
 #                          cloud session: the order the title post names, where
 #                          the once-only marker goes, and the session id
-#   TERMAG_STATUS_SESSION  override the tmux session name (tests, non-tmux callers)
+#   TERMAG_STATUS_SESSION  override the tmux session name (tests, non-tmux callers);
+#                          without it, a hook outside tmux ($TMUX unset) posts nothing
+#   TERMAG_T3              set in the box's t3 server (agent/t3-bridge.js): the
+#                          hook is a desktop app thread's, so the session is
+#                          the project whose checkout holds CLAUDE_PROJECT_DIR
+#                          (else the working directory), found among the box's
+#                          tmux sessions; the t3 server's own `termag-t3`
+#                          when no project's does. Such posts carry
+#                          `source: t3:claude` and the hook's session_id as
+#                          `threadId`. A t3 server an older agent started
+#                          is recognised by its tmux session instead.
 #   TERMAG_STATUS_DEBUG=1  dump the last notification payload to
 #                          ~/.cache/termag-status/last-notification.json
 
@@ -86,6 +98,20 @@ PATH=/usr/local/bin:/usr/bin:/bin:$PATH
 MODE=${1:-}
 [ -n "$MODE" ] || exit 0
 [ $# -gt 0 ] && shift
+
+# session-start: Claude Code's SessionStart hook. Its Bash tool runs every
+# command in a non-login, non-interactive shell whose PATH is the snapshot's
+# copy of the claude process's own PATH, so no startup file reaches it; what
+# does is $CLAUDE_ENV_FILE, sourced before each command. Without this,
+# ~/.local/bin (termag, termag-status, gh wrappers) is missing whenever claude
+# was started from a shell or service that didn't have it.
+LOCAL_BIN_LINE='if [ -d "$HOME/.local/bin" ]; then case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac; fi'
+if [ "$MODE" = session-start ]; then
+  f=${CLAUDE_ENV_FILE:-}
+  [ -n "$f" ] || exit 0
+  grep -qxF "$LOCAL_BIN_LINE" "$f" 2>/dev/null || printf '%s\n' "$LOCAL_BIN_LINE" >> "$f" 2>/dev/null
+  exit 0
+fi
 
 # --- options ----------------------------------------------------------------
 SOURCE='' REASON='' MESSAGE='' NOTIFY='' CTX_TOKENS='' RATE_LIMITED='' PRINT_PAYLOAD=''
@@ -229,7 +255,9 @@ classify_tool() {
   cmd=$(printf '%s\n' "$cmd" | strip_heredocs)
   # Match the gh subcommand as a word at a command boundary, so "echo gh pr create"
   # inside a string does not count but "cd x && gh pr create ..." does.
-  if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\|\||&&)[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)'; then
+  # termag-pr-create (bare or by path) is the termag-pr skill's way to open one:
+  # it runs gh pr create itself, so the hook never sees that command.
+  if printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\|\||&&)[[:space:]]*(gh[[:space:]]+pr[[:space:]]+create|([^[:space:];&|()]*/)?termag-pr-create)([[:space:]]|$)'; then
     kind=pr_created
   elif printf '%s' "$cmd" | grep -Eq '(^|[;&|(]|\|\||&&)[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]|$)'; then
     kind=pr_merged
@@ -340,9 +368,64 @@ if [ "$MODE" = usage ]; then
   exit 0
 fi
 
+# --- which session ------------------------------------------------------------
 # The server keys status on the tmux session name; no session means no context.
+# Only with $TMUX is there one: without it, display-message answers for the
+# box's tmux server anyway, naming its most recently used session, which is
+# some other project's (a claude in a t3 terminal, an ask run, the briefing).
+#
+# Inside the box's t3 server (the desktop app's threads)
+# the pane is the server's own `termag-t3`, which no project owns. There the
+# session is the one whose checkout holds the thread's project directory.
+T3_SESSION=termag-t3
+
+canon_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+
+# t3_session <dir>: the `-agent` session with the longest session_path that is
+# <dir> or one of its parents (tmux-create starts every session in its
+# checkout), never through a .worktrees/ segment (a workstream's checkout is
+# its own session's) and never the home directory itself; else termag-t3.
+# A rename moves the checkout and renames the session but leaves its
+# session_path behind, so a session_path that is gone gives way to where its
+# pane's process is now (the moved directory). Fields are split on the first
+# space (session names have none): tmux 3.4, the box image's, prints a tab in
+# a format as `_`.
+t3_session() {
+  local dir home best='' best_len=0 name path p rest
+  dir=$(canon_dir "$1") || dir=
+  home=$(canon_dir "$HOME") || home=
+  if [ -n "$dir" ]; then
+    while read -r name path; do
+      case $name in *-agent) ;; *) continue ;; esac
+      p=$(canon_dir "$path") \
+        || p=$(canon_dir "$(tmux display-message -p -t "=$name:" '#{pane_current_path}' 2>/dev/null)") \
+        || continue
+      case $p in ''|/) continue ;; esac
+      [ "$p" != "$home" ] || continue
+      case $dir in
+        "$p") rest= ;;
+        "$p"/*) rest=${dir#"$p"/} ;;
+        *) continue ;;
+      esac
+      case $rest in .worktrees|.worktrees/*) continue ;; esac
+      if [ "${#p}" -gt "$best_len" ]; then best=$name; best_len=${#p}; fi
+    done < <(tmux list-sessions -F '#{session_name} #{session_path}' 2>/dev/null)
+  fi
+  printf '%s' "${best:-$T3_SESSION}"
+}
+
 SESSION=${TERMAG_STATUS_SESSION:-}
-[ -n "$SESSION" ] || SESSION=$(tmux display-message -p '#S' 2>/dev/null) || exit 0
+IN_T3=
+if [ -z "$SESSION" ]; then
+  PANE_SESSION=
+  [ -n "${TMUX:-}" ] && PANE_SESSION=$(tmux display-message -p '#S' 2>/dev/null)
+  if [ -n "${TERMAG_T3:-}" ] || [ "$PANE_SESSION" = "$T3_SESSION" ]; then
+    IN_T3=1
+    SESSION=$(t3_session "${CLAUDE_PROJECT_DIR:-.}")
+  else
+    SESSION=$PANE_SESSION
+  fi
+fi
 [ -n "$SESSION" ] || exit 0
 
 ENDPOINT=$(resolve_endpoint)
@@ -454,6 +537,16 @@ case $MODE in
 esac
 
 [ -n "$PAYLOAD" ] || exit 0
+
+# A desktop thread's post (inside the t3 server): its source and its Claude
+# session id, so the server tells the threads of one checkout apart and keeps
+# the session working while any of them works (backend services/sessionTurns.ts).
+if [ -n "$IN_T3" ]; then
+  THREAD=
+  [ -n "${INPUT:-}" ] && THREAD=$(printf '%s' "$INPUT" | jq -r '(.session_id // empty) | tostring | select(test("^[A-Za-z0-9._:-]{1,128}$"))' 2>/dev/null)
+  PAYLOAD=$(printf '%s' "$PAYLOAD" | jq -c --arg src "${SOURCE:-t3:claude}" --arg t "${THREAD:-}" \
+    '. + {source: $src} + (if $t != "" then {threadId: $t} else {} end)') || exit 0
+fi
 
 if [ -n "$PRINT_PAYLOAD" ]; then
   printf '%s\n' "$PAYLOAD"

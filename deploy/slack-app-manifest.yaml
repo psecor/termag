@@ -23,7 +23,7 @@ features:
   slash_commands:
     - command: /t
       description: termag terminal / agent control
-      usage_hint: "<cmd> | switch <project> | projects | ctrl | ls"
+      usage_hint: "help | <text> | ctrl <text> | projects | switch <project>"
       should_escape: false
 
 oauth_config:

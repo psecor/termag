@@ -10,7 +10,8 @@
 #   2. runs `claude -p … --output-format json` from ~/.termag/briefing with only
 #      the MetaTerm read tools, METATERM_SEND_KEYS=off forced, and TMUX unset
 #      so termag-status hooks see no session and post nothing,
-#   3. posts the result to POST <termag>/api/briefings/<id>/result, once,
+#   3. posts the result (or, when the job cannot be read, the reason as an
+#      error result) to POST <termag>/api/briefings/<id>/result, once,
 #      5 seconds, never retried,
 #   4. exits with claude's status.
 #
@@ -88,10 +89,29 @@ curl_auth() {
     | curl -s -K - -o "$out" -w '%{http_code}' "$@" 2>/dev/null || true
 }
 
+# post_result BODY_FILE — the one POST to /result; logs how it went.
+post_result() {
+  local code
+  code=$(curl_auth /dev/null -m 5 -X POST "$api/result" -H 'Content-Type: application/json' --data-binary "@$1")
+  case $code in
+    204) log 'result posted' ;;
+    ''|000) log "result not posted: $api/result unreachable" ;;
+    *) log "result not posted: $api/result answered HTTP $code" ;;
+  esac
+}
+
+# fail_job MESSAGE — log, report MESSAGE as the run's error and exit 1, so the
+# card names the problem instead of the backend's 20-minute timeout.
+fail_job() {
+  log "$1"
+  jq -n --arg r "$1" '{result: $r, exitStatus: 1, isError: true}' >"$tmp/body.json"
+  post_result "$tmp/body.json"
+  exit 1
+}
+
 code=$(curl_auth "$tmp/job.json" -m 10 "$api/job")
 if [ "$code" != 200 ]; then
-  log "job not read: $api/job answered ${code:-nothing}"
-  exit 1
+  fail_job "job not read: $api/job answered ${code:-nothing}"
 fi
 prompt=$(jq -r '.prompt // empty' "$tmp/job.json" 2>/dev/null) || prompt=
 tools=$(jq -r '(.allowedTools // []) | join(",")' "$tmp/job.json" 2>/dev/null) || tools=
@@ -99,8 +119,7 @@ max_turns=$(jq -r '.maxTurns // 30' "$tmp/job.json" 2>/dev/null) || max_turns=30
 model=$(jq -r '.model // empty' "$tmp/job.json" 2>/dev/null) || model=
 case $max_turns in ''|*[!0-9]*) max_turns=30 ;; esac
 if [ -z "$prompt" ] || [ -z "$tools" ]; then
-  log 'job has no prompt or no allowed tools'
-  exit 1
+  fail_job 'job has no prompt or no allowed tools'
 fi
 
 # claude: the native install (~/.local/bin) first, then PATH, then the nvm global.
@@ -165,10 +184,5 @@ else
     '{result: $r, exitStatus: $status, isError: true}' >"$tmp/body.json"
 fi
 
-code=$(curl_auth /dev/null -m 5 -X POST "$api/result" -H 'Content-Type: application/json' --data-binary "@$tmp/body.json")
-case $code in
-  204) log 'result posted' ;;
-  ''|000) log "result not posted: $api/result unreachable" ;;
-  *) log "result not posted: $api/result answered HTTP $code" ;;
-esac
+post_result "$tmp/body.json"
 exit "$status"

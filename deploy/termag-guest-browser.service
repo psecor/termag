@@ -1,0 +1,23 @@
+# Keeps the browser pane's guest user to the agent's pane proxies
+# (deploy/termag-guest-browser.nft). Installed and enabled by
+# deploy/termag-guest-browser-setup, which also makes termag-guest's user
+# manager require it (deploy/termag-guest-browser-required.conf): if this unit
+# fails, no guest Chromium can start, because snap run needs that manager.
+#
+# Reload it to reapply the rules; a restart also restarts that user manager.
+[Unit]
+Description=Termag: keep the browser pane's guest user to the pane proxies
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+# In place before any network is up or any user's lingering manager starts.
+Before=network-pre.target systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /usr/local/lib/termag/termag-guest-browser.nft
+ExecReload=/usr/sbin/nft -f /usr/local/lib/termag/termag-guest-browser.nft
+
+[Install]
+WantedBy=multi-user.target

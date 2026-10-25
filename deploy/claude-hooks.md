@@ -23,6 +23,11 @@ mkdir -p ~/.claude && cp deploy/claude-settings.json ~/.claude/settings.json
 `deploy/claude-settings.json` is the canonical hook config; the snippet below is
 reproduced from it, so keep them in sync.
 
+Besides the hooks, the file sets `"idleCompaction": false`, so Claude Code does
+not compact a long conversation on its own while the session sits idle. Only new
+installs get it: `termag-hooks-update` merges hook entries and nothing else, so an
+existing `~/.claude/settings.json` needs the key added by hand.
+
 ## Why not POST to localhost directly
 
 Earlier versions inlined `curl http://localhost:3040/termag/api/status` in every
@@ -69,6 +74,9 @@ same-host server will accept.
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" session-start >/dev/null 2>&1 || true" } ] }
+    ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "\"$HOME/.local/bin/termag-status\" working >/dev/null 2>&1 &" } ] }
     ],
@@ -111,6 +119,17 @@ box only when its owner ran the updater by hand.
 
 ## How it works
 
+- `SessionStart` runs `termag-status session-start`, which posts nothing: it
+  appends a guarded `~/.local/bin` PATH line to `$CLAUDE_ENV_FILE`. Claude
+  Code's Bash tool runs each command in a non-login, non-interactive shell
+  whose PATH is the one the `claude` process started with (its shell snapshot
+  keeps the rc file's functions and aliases, not its PATH), so `~/.zshrc`,
+  `~/.profile` and `/etc/profile.d` never reach it; the env file is sourced
+  before every command. Without it, `termag`, `termag-pr-create` and friends
+  are "command not found" whenever `claude` was started from a shell or
+  service without `~/.local/bin`. `termag-reconcile` (boxes) and
+  `termag-host-setup` (orchestrator accounts) add this entry to an existing
+  `settings.json`; it is the only change either makes to the hooks.
 - `UserPromptSubmit`, `PreToolUse` post `status: "working"` (green)
 - `PostToolUse` reads the hook JSON on stdin: posts `working`, and when the tool
   was a Bash `gh pr create` / `gh pr merge` that succeeded (the PR URL in its
@@ -121,8 +140,13 @@ box only when its owner ran the updater by hand.
   else -> `waiting` (yellow), with `notify: true` so termag posts the captured
   pane to Slack
 - `Stop` posts `status: "idle"` (red)
-- The tmux session name comes from `tmux display-message -p '#S'`; no session
-  means no context, and the hook exits without posting
+- The tmux session name comes from `tmux display-message -p '#S'`, and only
+  inside tmux (`$TMUX`): outside it the hook exits without posting, since
+  display-message would name the tmux server's most recently used session,
+  another project's
+- Inside the box's t3 server (the desktop app's threads, `TERMAG_T3`) the
+  session is the project whose checkout holds `CLAUDE_PROJECT_DIR`, and the
+  post carries `source: t3:claude` and the hook's `session_id` as `threadId`
 
 Two details are load-bearing:
 
@@ -154,8 +178,9 @@ curl -sS "$ENDPOINT/$SESSION"     # expect status: working
 A session the server has never heard from reports `not_running`.
 
 Endpoint resolution and auth handling are covered by
-`deploy/termag-status.test.sh` (`sh deploy/termag-status.test.sh`) — no network,
-tmux or server required. It also asserts the token reaches curl via `-K` rather
+`deploy/termag-status.test.sh` (`sh deploy/termag-status.test.sh`) — no network
+or server required; the session cases start a private tmux server and are
+skipped without tmux. It also asserts the token reaches curl via `-K` rather
 than the command line.
 
 ## Troubleshooting

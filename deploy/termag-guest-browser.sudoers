@@ -1,0 +1,13 @@
+# The browser pane's guest Chromium.
+# Installed as /etc/sudoers.d/termag-guest-browser (0440) by
+# deploy/termag-guest-browser-setup.
+#
+# The agent user runs the one root-owned wrapper as termag-guest, and only
+# that. closefrom_override lets it pass `-C 5`, so fds 3 and 4 (the DevTools
+# pipe) survive; nothing else on the box gets it.
+#
+# The agent user is named by uid: cloud-init renames the box user to its
+# owner's unix name at launch (usermod -l, uid kept), so a name would go
+# stale. The setup script fills @AGENT_UID@ in when it installs this.
+Defaults!/usr/local/libexec/termag-guest-chromium closefrom_override
+#@AGENT_UID@ ALL=(termag-guest) NOPASSWD: /usr/local/libexec/termag-guest-chromium

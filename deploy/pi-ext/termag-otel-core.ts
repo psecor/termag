@@ -26,7 +26,7 @@ const REPLAY_ID = /^[A-Za-z0-9]{20,64}$/;
  * browser-started launch, the replay it came from; null for anything
  * termag-credentials would not have written.
  */
-export function parseDestination(text: string | null, replayId?: string): Destination | null {
+export function parseDestination(text: string | null, replayId?: string, backend?: string): Destination | null {
   if (!text) return null;
   let rec: unknown;
   try { rec = JSON.parse(text); } catch { return null; }
@@ -41,6 +41,8 @@ export function parseDestination(text: string | null, replayId?: string): Destin
   if (!resource['telemetry.project_id']) return null;
   resource['service.name'] = 'termag-pi-session';
   resource['termag.agent'] = 'pi';
+  // A model backend other than the harness's default (TERMAG_PI_AGENT).
+  if (backend === 'fireworks') resource['termag.backend'] = 'fireworks';
   if (replayId && REPLAY_ID.test(replayId)) resource['termag.replay.id'] = replayId;
   return { endpoint, resource };
 }

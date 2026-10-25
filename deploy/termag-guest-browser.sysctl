@@ -1,0 +1,9 @@
+# Reserves the browser pane's guest proxy ports: the one window termag-guest may reach, by
+# termag-guest-browser.nft, is TCP to 127.0.0.1:47100-47131. That range is
+# inside the kernel's ephemeral one (32768-60999), so without this any owner
+# service that binds port 0 (Codex's app-server does, with no token on its
+# socket) could be given a port in it. Reserved ports are never handed out
+# for port 0 or an outgoing connection; the agent binds them by number.
+# Installed as /etc/sysctl.d/60-termag-guest-browser.conf by
+# termag-guest-browser-setup, which also merges it into the live value.
+net.ipv4.ip_local_reserved_ports = 47100-47131

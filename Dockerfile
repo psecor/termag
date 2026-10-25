@@ -20,7 +20,7 @@
 # Runs as an unprivileged fixed UID with a read-only root filesystem in mind:
 # nothing under /app is written at runtime; scratch goes to /tmp.
 
-ARG NODE_VERSION=20
+ARG NODE_VERSION=24
 
 # ── build: compile backend (tsc) + frontend (vite) with the full dev toolchain ──
 FROM node:${NODE_VERSION}-bookworm-slim AS build

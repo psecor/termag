@@ -1,87 +1,137 @@
 #!/usr/bin/env bash
-# termag-subagent-run -- run one agent-to-agent ask on this box, sandboxed.
+# termag-subagent-run -- run one agent-to-agent ask on this box.
 #
 # The agent's ask-run RPC (agent/ask-run.js) writes a job file and starts this
-# detached, as the box user. It:
+# as the box user. In full (no flag, an agent without ask-chat-v1) it:
 #
-#   1. prepares the thread's directory under /var/lib/termag-subagent/threads/
-#      on the first turn: a clone of the target checkout's *committed* code at
+#   1. prepares the thread's directory under ~/.termag/subagent/threads/ on
+#      the first turn: a clone of the target checkout's *committed* code at
 #      the base commit (the newest commit of its branch already on the remote,
-#      so uncommitted and untracked files never reach the run), owned by the
-#      termag-subagent user; later turns reuse it and resume Claude's session
-#   2. runs Claude Code headless through `systemd-run` as termag-subagent
-#      (termag-subagent-exec): no home but its own, nothing writable outside
-#      the thread directory, no new privileges, and no network except the
-#      Claude gateway (IPAddressDeny=any; IPAddressAllow= the VPC and the
-#      gateway's addresses, which also keeps IMDS out). The box token reaches
-#      the run as a systemd credential for its unit only, read by the run's
-#      apiKeyHelper; nothing else of the owner's does
+#      so uncommitted and untracked files never reach the run, and the run
+#      never touches the live checkout); later turns reuse it and resume
+#      Claude's session
+#   2. runs Claude Code headless in that clone as the box user, with the
+#      owner's own settings, credentials, network and tools
+#      (--permission-mode bypassPermissions, as no one is there to answer a
+#      prompt). Asks are owner-only, so the run has nothing the asker lacks.
+#      TMUX is unset so the owner's status hooks post nothing for it
 #   3. uploads the commits the run made as a git bundle and posts the reply,
 #      both to the orchestrator with the box token (PUT/POST
 #      /api/cli/v1/ask/runs/<id>/{bundle,result}); the orchestrator checks the
-#      bundle and publishes it as a draft PR (backend services/askPublish.ts)
+#      bundle and publishes it as a draft PR (backend services/askPublish.ts).
+#      The run may write that PR's description to TERMAG_ASK_PR_BODY_FILE,
+#      .git/termag-pr-body.md in the clone (outside the git tree, kept across
+#      turns); it goes up with the result as prDescription, cut to
+#      PR_BODY_MAX bytes, and only when a bundle went up.
+#      A run can open several PRs: the bundle carries the clone's `ask`
+#      branch (the thread's own PR) and every `pr/<name>` branch with
+#      commits on the base (one PR each), and each pr/<name>'s description
+#      comes from TERMAG_ASK_PR_DIR/<name>.md. refs/termag/base names the
+#      base in the clone, for `git switch -c pr/<name> termag/base`
+#
+# With ask-chat-v1 the agent runs step 2 itself, as a turn of the thread's
+# chat on the target project (agent/ask-chat.js, the chat runner), and calls
+# the other steps as phases:
+#
+#   --prepare <job>          step 1 only; prints {repoDir, base, repo, fresh}.
+#                            A job without a runId (a person's message in the
+#                            ask's chat) reports nothing when it fails.
+#   --report <job> <result>  step 3, from the turn's stream-json `result`
+#                            event (the same fields -p --output-format json
+#                            prints)
+#   --fail <job> <reason>    an error reply, for a turn that never ran
 #
 # There is no time or turn limit. A failure before Claude runs is still
 # reported, as an error reply, so the asker is never left waiting.
 #
 # A TERM (the agent's ask-run-cancel, after the orchestrator marked the
-# message canceled) stops the run's unit and exits 143 without reporting.
+# message canceled) stops the run's process group and exits 143 without
+# reporting.
 #
 # Threads idle for TERMAG_SUBAGENT_THREAD_TTL_MIN minutes (default three days)
-# are removed at the start of a run; job files and logs after a week.
+# are removed, with their Claude transcripts, at the start of a run; job files
+# and logs after a week.
 #
-# Usage: termag-subagent-run <job.json>
+# Usage: termag-subagent-run [--prepare | --report | --fail] <job.json> [<result.json> | <reason>]
 #
-# Env (tests): TERMAG_SUBAGENT_ROOT, TERMAG_SUBAGENT_USER, TERMAG_SUBAGENT_SUDO,
-#   TERMAG_SUBAGENT_SYSTEMD_RUN, TERMAG_SUBAGENT_SYSTEMCTL, TERMAG_SUBAGENT_SETUP, TERMAG_SUBAGENT_ALLOW
-#   (replaces the computed IPAddressAllow list), TERMAG_SUBAGENT_IMDS,
-#   TERMAG_CLAUDE_GATEWAY_STATE, TERMAG_AGENT_CONFIG
+# Env (tests): TERMAG_SUBAGENT_ROOT (default ~/.termag/subagent),
+#   TERMAG_SUBAGENT_CLAUDE (the claude binary), TERMAG_SUBAGENT_KILL_GRACE_S,
+#   TERMAG_SUBAGENT_CHECKOUT_WAIT_S, TERMAG_SUBAGENT_LOCK_WAIT_S,
+#   TERMAG_AGENT_CONFIG
+#
+# Phases: ask-chat-v1 (agent/ask-chat.js checks for this line before it
+# announces the capability).
 set -uo pipefail
 
+mode=run
+case ${1:-} in
+  --prepare) mode=prepare; shift ;;
+  --report) mode=report; shift ;;
+  --fail) mode=fail; shift ;;
+esac
 job=${1:-}
-ROOT=${TERMAG_SUBAGENT_ROOT:-/var/lib/termag-subagent}
-SUBUSER=${TERMAG_SUBAGENT_USER:-termag-subagent}
-read -r -a SUDO <<< "${TERMAG_SUBAGENT_SUDO-sudo -n}"
-read -r -a SYSTEMD_RUN <<< "${TERMAG_SUBAGENT_SYSTEMD_RUN:-systemd-run}"
-read -r -a SYSTEMCTL <<< "${TERMAG_SUBAGENT_SYSTEMCTL:-systemctl}"
-SETUP=${TERMAG_SUBAGENT_SETUP:-$HOME/.local/bin/termag-subagent-setup}
-IMDS=${TERMAG_SUBAGENT_IMDS:-http://169.254.169.254}
-GATEWAY_STATE=${TERMAG_CLAUDE_GATEWAY_STATE:-$HOME/.config/termag/claude-gateway.json}
+arg2=${2:-}
 STATE=$HOME/.termag/subagent
+ROOT=${TERMAG_SUBAGENT_ROOT:-$STATE}
 THREAD_TTL_MIN=${TERMAG_SUBAGENT_THREAD_TTL_MIN:-4320}
+KILL_GRACE_S=${TERMAG_SUBAGENT_KILL_GRACE_S:-10}
+CHECKOUT_WAIT_S=${TERMAG_SUBAGENT_CHECKOUT_WAIT_S:-300}
+# A phase waits out another phase's prepare, which can be a long first clone;
+# under ask-chat.js's 15-minute prepare timeout.
+LOCK_WAIT_S=${TERMAG_SUBAGENT_LOCK_WAIT_S:-840}
 # The result goes through the orchestrator's JSON body limit (100 KB); the
 # reply is cut only as far as that needs.
 BODY_MAX=95000
 BUNDLE_MAX=$((25 * 1024 * 1024))
+# The orchestrator keeps 16 KB of a PR description and says it cut the rest.
+PR_BODY_MAX=20000
+# Every pr/<name> description together, so the reply keeps most of the body.
+PR_DESCS_MAX=60000
+# backend services/agentMessages.ts ASK_PR_KEY.
+PR_NAME_RE='^[a-z0-9][a-z0-9-]{0,39}$'
 
 run='?'
 log() { printf '%s termag-subagent-run[%s]: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run" "$*" >&2; }
-sudo_() { "${SUDO[@]}" "$@"; }
 
-[ -n "$job" ] && [ -r "$job" ] || { log "usage: termag-subagent-run <job.json>"; exit 2; }
+[ -n "$job" ] && [ -r "$job" ] || { log "usage: termag-subagent-run [--prepare | --report | --fail] <job.json>"; exit 2; }
+case $mode in report|fail) [ -n "$arg2" ] || { log "--$mode needs a second argument"; exit 2; } ;; esac
 command -v jq >/dev/null 2>&1 || { log 'jq is not installed'; exit 2; }
 command -v curl >/dev/null 2>&1 || { log 'curl is not installed'; exit 2; }
 
 work=$(mktemp -d) || exit 1
-trap 'rm -rf "$work"; rm -f "$job"' EXIT
+# A prepared job is the agent's until its turn is reported.
+if [ "$mode" = prepare ]; then trap 'rm -rf "$work"' EXIT
+else trap 'rm -rf "$work"; rm -f "$job"' EXIT
+fi
 
 field() { jq -r --arg k "$1" '.[$k] // empty' "$job"; }
 run=$(field runId)
 thread_id=$(field threadId)
 cwd=$(field cwd)
 id_re='^[a-z0-9]{8,40}$'
-[[ $run =~ $id_re ]] || { run='?'; log 'the job has no valid runId'; exit 2; }
+# Only --prepare may go without a run: then it is a person's message, and
+# nothing is reported.
+reports=true
+if [ "$mode" = prepare ] && [ -z "$run" ]; then run='-'; reports=false
+elif ! [[ $run =~ $id_re ]]; then run='?'; log 'the job has no valid runId'; exit 2
+fi
 [[ $thread_id =~ $id_re ]] || { log 'the job has no valid threadId'; exit 2; }
 
 # Canceled: the orchestrator has already marked the message, so nothing is
 # reported. Bash runs the trap only between commands, which is why the run
-# itself is waited for in the background.
+# itself is waited for in the background. The run leads its own process
+# group (setsid), so its tools and their children stop with it.
 child=
 cancel() {
   log 'canceled'
   if [ -n "$child" ]; then
-    sudo_ "${SYSTEMCTL[@]}" stop "termag-subagent-$run.service" >/dev/null 2>&1
-    kill "$child" 2>/dev/null
+    kill -TERM -- "-$child" 2>/dev/null
+    local i
+    for ((i = 0; i < KILL_GRACE_S * 10; i++)); do
+      kill -0 -- "-$child" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL -- "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null
   fi
   exit 143
 }
@@ -109,10 +159,14 @@ runs_endpoint() {
     *) return 1 ;;
   esac
 }
-config=$(find_agent_config) || { log 'no agent config: cannot report back'; exit 1; }
-token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
-endpoint=$(runs_endpoint "$(jq -r '.termag_url // empty' "$config" 2>/dev/null)") || endpoint=
-[ -n "$token" ] && [ -n "$endpoint" ] || { log "$config has no token or no agent termag_url: cannot report back"; exit 1; }
+token=
+endpoint=
+if [ "$reports" = true ]; then
+  config=$(find_agent_config) || { log 'no agent config: cannot report back'; exit 1; }
+  token=$(jq -r '.token // empty' "$config" 2>/dev/null) || token=
+  endpoint=$(runs_endpoint "$(jq -r '.termag_url // empty' "$config" 2>/dev/null)") || endpoint=
+  [ -n "$token" ] && [ -n "$endpoint" ] || { log "$config has no token or no agent termag_url: cannot report back"; exit 1; }
+fi
 
 # curl with the token in its config on stdin, never on the command line.
 # Retries a connection failure or a 5xx a few times. Prints the HTTP code.
@@ -134,25 +188,88 @@ is_error=false
 reason=
 bundle_sent=false
 
+# cut_utf8 <bytes> <file>: the first <bytes> of a file, without a split character.
+cut_utf8() {
+  if command -v iconv >/dev/null; then
+    head -c "$1" "$2" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null
+  else
+    head -c "$1" "$2"
+  fi
+}
+
+# The branches of the thread's clone that go up, one ref per line: `ask` (the
+# thread's own PR) and each pr/<name> (a PR of its own) that has commits on
+# the base. With neither, a HEAD with commits, as before a run could open
+# several. What stays behind is said in the reply.
+publish_refs() {
+  local dir=$thread/repo r name n head
+  local -a refs=()
+  n=$(git -C "$dir" rev-list --count "$base..refs/heads/ask" 2>/dev/null) || n=0
+  [ "${n:-0}" -gt 0 ] && refs+=(refs/heads/ask)
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name=${r#refs/heads/pr/}
+    if ! [[ $name =~ $PR_NAME_RE ]]; then
+      printf '\n\n[termag: branch pr/%s was not published: name a PR branch pr/<name>, with lowercase letters, digits and hyphens, at most 40]\n' "$name" >> "$work/reply"
+      continue
+    fi
+    n=$(git -C "$dir" rev-list --count "$base..$r" 2>/dev/null) || n=0
+    [ "${n:-0}" -gt 0 ] && refs+=("$r")
+  done < <(git -C "$dir" for-each-ref --format='%(refname)' refs/heads/pr/)
+  if [ "${#refs[@]}" -eq 0 ]; then
+    head=$(git -C "$dir" symbolic-ref -q HEAD 2>/dev/null) || head=
+    n=$(git -C "$dir" rev-list --count "$base..HEAD" 2>/dev/null) || n=0
+    case $head in refs/heads/pr/*) ;; *) [ "${n:-0}" -gt 0 ] && refs+=(HEAD) ;; esac
+  fi
+  while IFS= read -r r; do
+    case $r in refs/heads/ask|refs/heads/pr/*|'') continue ;; esac
+    n=$(git -C "$dir" rev-list --count "$r" "^$base" ${refs[@]+"${refs[@]/#/^}"} 2>/dev/null) || n=0
+    [ "${n:-0}" -gt 0 ] && printf '\n\n[termag: branch %s has %s commit(s) that were not published: only `ask` and pr/<name> branches become pull requests]\n' "${r#refs/heads/}" "$n" >> "$work/reply"
+  done < <(git -C "$dir" for-each-ref --format='%(refname)' refs/heads/)
+  [ "${#refs[@]}" -eq 0 ] || printf '%s\n' "${refs[@]}"
+}
+
+# pr_descriptions <ref>...: the pr/<name> descriptions in $pr_dir as a JSON
+# object in $work/pr-descs.json, each cut to PR_BODY_MAX and all of them to
+# PR_DESCS_MAX. Regular files only: a symlink could point the upload anywhere.
+pr_descriptions() {
+  local r name f size total=0
+  printf '{}' > "$work/pr-descs.json"
+  for r in "$@"; do
+    case $r in refs/heads/pr/*) name=${r#refs/heads/pr/} ;; *) continue ;; esac
+    f=$pr_dir/$name.md
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    cut_utf8 "$PR_BODY_MAX" "$f" > "$work/desc.cut"
+    size=$(wc -c < "$work/desc.cut")
+    if [ $((total + size)) -gt "$PR_DESCS_MAX" ]; then
+      log "PR description of pr/$name not sent: the descriptions are over $PR_DESCS_MAX bytes together"
+      continue
+    fi
+    total=$((total + size))
+    jq --arg k "$name" --rawfile v "$work/desc.cut" '. + {($k): $v}' "$work/pr-descs.json" > "$work/pr-descs.next" \
+      && mv "$work/pr-descs.next" "$work/pr-descs.json"
+  done
+  [ "$total" -eq 0 ] || log "pr/<name> descriptions sent ($total bytes)"
+}
+
 # post_result <reply-file>
 post_result() {
   local reply=$1 cap=$BODY_MAX body code
+  [ -f "$work/pr-body.cut" ] || : > "$work/pr-body.cut"
+  [ -f "$work/pr-descs.json" ] || printf '{}' > "$work/pr-descs.json"
   while :; do
     # A byte cut can split a character; iconv -c drops the partial one rather
     # than leave jq to turn it into U+FFFD.
-    if command -v iconv >/dev/null; then
-      head -c "$cap" "$reply" | iconv -c -f UTF-8 -t UTF-8 > "$work/reply.cut" 2>/dev/null
-    else
-      head -c "$cap" "$reply" > "$work/reply.cut"
-    fi
+    cut_utf8 "$cap" "$reply" > "$work/reply.cut"
     # No set -e here: a body jq could not build would go up empty and be
     # refused, so the run is reported as failed instead.
     body=$(jq -n --rawfile result "$work/reply.cut" --arg sid "$session" --argjson turns "$num_turns" \
       --argjson isError "$is_error" --arg reason "$reason" --arg base "$base" --arg repo "$repo" \
-      --argjson bundle "$bundle_sent" \
+      --argjson bundle "$bundle_sent" --rawfile prBody "$work/pr-body.cut" --slurpfile prDescs "$work/pr-descs.json" \
       'def opt: if . == "" then null else . end;
        {result: $result, sessionId: ($sid | opt), isError: $isError, numTurns: $turns,
-        exitReason: ($reason | opt), baseSha: ($base | opt), repo: ($repo | opt), bundle: $bundle}') \
+        exitReason: ($reason | opt), baseSha: ($base | opt), repo: ($repo | opt), bundle: $bundle,
+        prDescription: ($prBody | opt), prDescriptions: ($prDescs[0] // {})}') \
       || body='{"result":"","isError":true,"numTurns":null,"exitReason":"termag-subagent-run could not encode the reply","bundle":false}'
     printf '%s' "$body" > "$work/result.json"
     # Bytes, not ${#body}: that counts characters in a UTF-8 locale.
@@ -166,36 +283,61 @@ post_result() {
   esac
 }
 
-# fail <reason>: report an error reply and stop.
+# fail <reason>: report an error reply and stop. A person's message in the
+# ask's chat has no run to report to: the reason goes to stderr, where the
+# agent turns it into the send's error.
 fail() {
   is_error=true
   reason=$1
   log "failed: $reason"
+  [ "$reports" = true ] || exit 1
   printf 'termag could not run this ask on the target box: %s\n' "$reason" > "$work/reply"
   post_result "$work/reply"
   exit 1
 }
 
+if [ "$mode" = fail ]; then fail "$arg2"; fi
+
 # --- housekeeping ------------------------------------------------------------
 
-mkdir -p "$STATE/jobs" "$STATE/logs" && chmod 700 "$STATE" "$STATE/jobs" "$STATE/logs" 2>/dev/null
-find "$STATE/jobs" "$STATE/logs" -type f -mtime +7 -delete 2>/dev/null
-if [ -d "$ROOT/threads" ]; then
+# Claude Code keeps a session's transcript under
+# <config dir>/projects/<cwd, every non-alphanumeric turned to '-'>.
+transcripts_of() {
+  printf '%s/projects/%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+}
+
+thread=$ROOT/threads/$thread_id
+# Outside the git tree, so they never land in a commit; kept across the
+# thread's turns. Every phase names the same two: the turn writes them,
+# report reads them.
+pr_body_file=$thread/repo/.git/termag-pr-body.md
+pr_dir=$thread/repo/.git/termag-prs
+
+sweep() {
+  mkdir -p "$STATE/jobs" "$STATE/logs" "$ROOT/threads" && chmod 700 "$STATE" "$STATE/jobs" "$STATE/logs" "$ROOT/threads" 2>/dev/null
+  find "$STATE/jobs" "$STATE/logs" -type f -mtime +7 -delete 2>/dev/null
   find "$ROOT/threads" -mindepth 1 -maxdepth 1 -type d -mmin "+$THREAD_TTL_MIN" -print 2>/dev/null \
     | while IFS= read -r old; do
         [ "$(basename "$old")" = "$thread_id" ] && continue
-        sudo_ rm -rf -- "$old" && log "removed idle thread $(basename "$old")"
+        rm -rf -- "$(transcripts_of "$old/repo")"
+        rm -rf -- "$old" && log "removed idle thread $(basename "$old")"
       done
-fi
-
-if ! "$SETUP" --check >/dev/null 2>&1; then
-  "$SETUP" >&2 || fail "the ask sandbox is not set up on this box (termag-subagent-setup failed; see its output in ~/.termag/subagent/logs)"
-fi
+}
 
 # --- the thread's clone --------------------------------------------------------
 
-[ -n "$cwd" ] && [ -d "$cwd" ] || fail "the project checkout $cwd does not exist"
-git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || fail "$cwd is not a git checkout"
+# A pane checkout leaves the project `none` (askable) while its fetch still
+# runs, so the first ask on a new box can arrive before the dir, the repo or
+# its first commit. Give the checkout time to land before judging it.
+wait_for_checkout() {
+  local waited=0
+  until git -C "$cwd" rev-parse -q --verify 'HEAD^{commit}' >/dev/null 2>&1; do
+    [ "$waited" -ge "$CHECKOUT_WAIT_S" ] && return 0
+    [ "$waited" = 0 ] && log "waiting up to ${CHECKOUT_WAIT_S}s for the checkout in $cwd to land"
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
 
 # The newest commit of the checkout's branch that its remote already has.
 pick_base() {
@@ -222,157 +364,179 @@ github_repo() {
   [[ $url =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && printf '%s' "$url"
 }
 
-thread=$ROOT/threads/$thread_id
-mkdir -p "$thread" || fail "cannot create $thread"
-exec 9>"$thread/.lock"
-flock -n 9 || fail "another turn of thread $thread_id is running on this box"
-touch "$thread"
+# Sets base, repo, resume and fresh (true when the clone was made now). The
+# full run holds the thread's lock to the end, so a second turn on the same
+# thread is refused; a phase holds it only while it prepares, and waits for
+# another phase's prepare rather than fail.
+resume=
+fresh=false
+prepare_thread() {
+  sweep
+  # A person's message goes to a thread whose checkout is long there.
+  if [ "$(jq -r '.waitForCheckout' "$job")" != false ]; then [ -n "$cwd" ] && wait_for_checkout; fi
+  [ -n "$cwd" ] && [ -d "$cwd" ] || fail "the project checkout $cwd does not exist"
+  git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || fail "$cwd is not a git checkout"
 
-resume=$(field resumeSessionId)
-if [ -f "$thread/meta.json" ]; then
-  base=$(jq -r '.base // empty' "$thread/meta.json")
-  repo=$(jq -r '.repo // empty' "$thread/meta.json")
-else
-  base=$(field baseSha)
-  if [ -n "$base" ]; then
-    git -C "$cwd" cat-file -e "$base^{commit}" 2>/dev/null \
-      || fail "the thread's base commit ${base:0:12} is no longer in $cwd; start a new thread"
+  mkdir -p "$thread" && chmod 700 "$thread" || fail "cannot create $thread"
+  exec 9>"$thread/.lock"
+  if [ "$mode" = run ]; then
+    flock -n 9 || fail "another turn of thread $thread_id is running on this box"
   else
-    base=$(pick_base) || base=
-    if [ -z "$base" ]; then
-      base=$(git -C "$cwd" rev-parse -q --verify 'HEAD^{commit}') || fail "$cwd has no commits"
-      log "no remote branch to start from; using HEAD ${base:0:12}, and the commits will not be published"
+    flock -w "$LOCK_WAIT_S" 9 || fail "another turn of thread $thread_id is still being prepared on this box"
+  fi
+  touch "$thread"
+
+  resume=$(field resumeSessionId)
+  if [ -f "$thread/meta.json" ] && [ -d "$thread/repo/.git" ]; then
+    base=$(jq -r '.base // empty' "$thread/meta.json")
+    repo=$(jq -r '.repo // empty' "$thread/meta.json")
+  else
+    base=$(field baseSha)
+    if [ -n "$base" ]; then
+      git -C "$cwd" cat-file -e "$base^{commit}" 2>/dev/null \
+        || fail "the thread's base commit ${base:0:12} is no longer in $cwd; start a new thread"
+    else
+      base=$(pick_base) || base=
+      if [ -z "$base" ]; then
+        base=$(git -C "$cwd" rev-parse -q --verify 'HEAD^{commit}') || fail "$cwd has no commits"
+        log "no remote branch to start from; using HEAD ${base:0:12}, and the commits will not be published"
+      fi
     fi
+    repo=$(github_repo) || repo=
+    [ -n "$repo" ] || log "origin is not on github.com; the commits will not be published"
+    # A clone of one commit: the live checkout is only ever read from.
+    rm -rf -- "$thread/repo" "$thread/meta.json"
+    git init -q "$thread/repo" \
+      && git -C "$thread/repo" fetch -q --depth=1 --no-tags "file://$cwd" "$base" \
+      && git -C "$thread/repo" -c advice.detachedHead=false checkout -q -b ask FETCH_HEAD \
+      || fail "could not clone ${base:0:12} from $cwd"
+    jq -n --arg base "$base" --arg repo "$repo" '{base: $base, repo: $repo}' > "$thread/meta.json"
+    [ -n "$resume" ] && log "the thread's earlier session is not on this box; starting a new one"
+    resume=
+    fresh=true
   fi
-  repo=$(github_repo) || repo=
-  [ -n "$repo" ] || log "origin is not on github.com; the commits will not be published"
-  # A clone of one commit, by the box user, then handed to the run's user.
-  sudo_ rm -rf -- "$thread/repo" "$thread/home" "$thread/claude" "$thread/out"
-  git init -q "$thread/repo" \
-    && git -C "$thread/repo" fetch -q --depth=1 --no-tags "file://$cwd" "$base" \
-    && git -C "$thread/repo" -c advice.detachedHead=false checkout -q -b ask FETCH_HEAD \
-    || fail "could not clone ${base:0:12} from $cwd"
-  mkdir -p "$thread/home" "$thread/claude" "$thread/out"
-  sudo_ chown -R "$SUBUSER:" "$thread/repo" "$thread/home" "$thread/claude" "$thread/out" \
-    || fail "could not hand the clone to $SUBUSER"
-  jq -n --arg base "$base" --arg repo "$repo" '{base: $base, repo: $repo}' > "$thread/meta.json"
-  [ -n "$resume" ] && log "the thread's earlier session is not on this box; starting a new one"
-  resume=
-fi
-
-# --- the run's settings ----------------------------------------------------------
-
-[ -s "$GATEWAY_STATE" ] && gateway_env=$(jq -ce '.env | objects' "$GATEWAY_STATE" 2>/dev/null) \
-  || fail "this box has no Claude gateway settings ($GATEWAY_STATE); run termag-credentials"
-
-jq -n --argjson env "$gateway_env" --arg helper "$ROOT/bin/termag-subagent-token" '{
-  apiKeyHelper: $helper,
-  env: ($env + {DISABLE_AUTOUPDATER: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"}),
-  permissions: {
-    allow: ["Read", "Edit", "Write", "Glob", "Grep", "TodoWrite",
-            "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
-            "Bash(git add:*)", "Bash(git commit:*)", "Bash(git restore:*)", "Bash(git mv:*)", "Bash(git rm:*)",
-            "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(grep:*)",
-            "Bash(rg:*)", "Bash(find:*)", "Bash(make test:*)", "Bash(make lint:*)", "Bash(npm test:*)",
-            "Bash(npm run test:*)", "Bash(npm run build:*)", "Bash(npx vitest:*)", "Bash(npx tsc:*)",
-            "Bash(go test:*)", "Bash(go build:*)", "Bash(go vet:*)", "Bash(pytest:*)", "Bash(shellcheck:*)"],
-    deny: ["WebFetch", "WebSearch",
-           "Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(git fetch:*)", "Bash(git pull:*)",
-           "Bash(gh:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(scp:*)", "Bash(nc:*)",
-           "Bash(sudo:*)", "Bash(su:*)", "Bash(docker:*)", "Bash(npm publish:*)",
-           "Edit(.git/**)", "Write(.git/**)"]
-  }
-}' > "$thread/settings.json" || fail "could not write the run's settings"
-field systemPrompt > "$thread/system-prompt.txt"
-chmod 0644 "$thread/settings.json" "$thread/system-prompt.txt"
-
-# --- the network the run may reach -------------------------------------------------
-
-allow_list() {
-  if [ -n "${TERMAG_SUBAGENT_ALLOW:-}" ]; then printf '%s' "$TERMAG_SUBAGENT_ALLOW"; return; fi
-  local list=localhost imds_token mac cidrs host ips
-  if imds_token=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$IMDS/latest/api/token" 2>/dev/null) && [ -n "$imds_token" ] \
-     && mac=$(curl -sf -m 2 -H "X-aws-ec2-metadata-token: $imds_token" "$IMDS/latest/meta-data/mac" 2>/dev/null) \
-     && cidrs=$(curl -sf -m 2 -H "X-aws-ec2-metadata-token: $imds_token" "$IMDS/latest/meta-data/network/interfaces/macs/$mac/vpc-ipv4-cidr-blocks" 2>/dev/null); then
-    list="$list $(printf '%s' "$cidrs" | tr '\n' ' ')"
-  fi
-  host=$(printf '%s' "$gateway_env" | jq -r '.ANTHROPIC_BEDROCK_BASE_URL // .ANTHROPIC_BASE_URL // empty' | sed -nE 's#^https?://([^/:]+).*#\1#p')
-  if [ -n "$host" ]; then
-    ips=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
-    list="$list $ips"
-  fi
-  printf '%s' "$list" | tr -s ' ' | sed 's/ $//'
+  git -C "$thread/repo" update-ref refs/termag/base "$base" 2>/dev/null || log "could not set refs/termag/base in the clone"
+  mkdir -p "$pr_dir"
+  [ "$mode" = run ] || exec 9>&-
 }
-allow=$(allow_list)
-[ "$allow" != localhost ] || log "no VPC or gateway address found; the run can reach only this host"
 
 # --- the run ---------------------------------------------------------------------------
 
-tokfile=$STATE/jobs/$run.token
-( umask 077; printf '%s' "$token" > "$tokfile" ) || fail "could not stage the token"
-trap 'rm -rf "$work"; rm -f "$job" "$tokfile"' EXIT
+# The native install, else one on PATH, else the newest nvm global: the agent
+# runs under systemd, whose PATH has no nvm (agent/chat-runner.js resolveClaude).
+find_claude() {
+  local bin
+  if [ -n "${TERMAG_SUBAGENT_CLAUDE:-}" ]; then printf '%s' "$TERMAG_SUBAGENT_CLAUDE"; return 0; fi
+  if [ -x "$HOME/.local/bin/claude" ]; then printf '%s' "$HOME/.local/bin/claude"; return 0; fi
+  command -v claude 2>/dev/null && return 0
+  while IFS= read -r bin; do
+    [ -x "$bin" ] && { printf '%s' "$bin"; return 0; }
+  done < <(printf '%s\n' "${NVM_DIR:-$HOME/.nvm}"/versions/node/*/bin/claude | sort -rV)
+  return 1
+}
 
-git_name=$(field gitName)
-git_email=$(field gitEmail)
-log "thread $thread_id: running in $thread (base ${base:0:12}${resume:+, resuming $resume})"
-field prompt | sudo_ "${SYSTEMD_RUN[@]}" --quiet --pipe --wait --collect \
-  --unit="termag-subagent-$run" \
-  --uid="$SUBUSER" --gid="$SUBUSER" \
-  --working-directory="$thread/repo" \
-  -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes \
-  -p PrivateDevices=yes -p ProtectKernelTunables=yes -p ProtectKernelModules=yes \
-  -p ProtectControlGroups=yes -p RestrictSUIDSGID=yes -p LockPersonality=yes -p UMask=0077 \
-  -p "ReadWritePaths=$thread/repo $thread/home $thread/claude $thread/out" \
-  -p IPAddressDeny=any -p "IPAddressAllow=$allow" \
-  -p "LoadCredential=token:$tokfile" \
-  --setenv=HOME="$thread/home" --setenv=CLAUDE_CONFIG_DIR="$thread/claude" \
-  --setenv=PATH=/usr/local/bin:/usr/bin:/bin --setenv=LANG=C.UTF-8 \
-  --setenv=TERMAG_THREAD_DIR="$thread" --setenv=TERMAG_RUN_ID="$run" \
-  --setenv=TERMAG_BASE_SHA="$base" --setenv=TERMAG_RESUME="$resume" \
-  --setenv=GIT_AUTHOR_NAME="$git_name" --setenv=GIT_AUTHOR_EMAIL="$git_email" \
-  --setenv=GIT_COMMITTER_NAME="$git_name" --setenv=GIT_COMMITTER_EMAIL="$git_email" \
-  "$ROOT/bin/termag-subagent-exec" > "$work/claude.json" &
-child=$!
-status=0
-wait "$child" || status=$?
-child=
-rm -f "$tokfile"
+run_claude() {
+  local claude args git_name git_email
+  claude=$(find_claude) || fail "Claude Code is not installed on this box"
+
+  field systemPrompt > "$work/system-prompt.txt"
+  # claude -p stays up while a wakeup or cron it scheduled is pending, so a
+  # fallback wakeup left behind after the answer holds the reply until it fires
+  # (30 min). Background agents still bring the run back without them.
+  args=(-p --output-format json --permission-mode bypassPermissions
+        --disallowedTools 'ScheduleWakeup CronCreate'
+        --append-system-prompt "$(cat "$work/system-prompt.txt")")
+  [ -n "$resume" ] && args+=(--resume "$resume")
+
+  git_name=$(field gitName)
+  git_email=$(field gitEmail)
+  log "thread $thread_id: running in $thread/repo (base ${base:0:12}${resume:+, resuming $resume})"
+  field prompt > "$work/prompt"
+  (
+    cd "$thread/repo" || exit 70
+    unset TMUX TMUX_PANE
+    PATH="$(dirname "$claude"):$HOME/.local/bin:$PATH"
+    export PATH
+    export GIT_AUTHOR_NAME=$git_name GIT_AUTHOR_EMAIL=$git_email
+    export GIT_COMMITTER_NAME=$git_name GIT_COMMITTER_EMAIL=$git_email
+    export TERMAG_ASK_PR_BODY_FILE=$pr_body_file TERMAG_ASK_PR_DIR=$pr_dir
+    exec setsid "$claude" "${args[@]}" < "$work/prompt"
+  ) > "$work/claude.json" &
+  child=$!
+  status=0
+  wait "$child" || status=$?
+  child=
+}
 
 # --- report ------------------------------------------------------------------------------
 
-if jq -e 'type == "object" and has("result")' "$work/claude.json" >/dev/null 2>&1; then
-  jq -j '.result' "$work/claude.json" > "$work/reply"
-  session=$(jq -r '.session_id // empty' "$work/claude.json")
-  num_turns=$(jq -r '.num_turns // "null" | tostring' "$work/claude.json")
-  [ "$(jq -r '.is_error // false' "$work/claude.json")" = true ] && { is_error=true; reason="Claude Code ended with $(jq -r '.subtype // "an error"' "$work/claude.json")"; }
-else
-  is_error=true
-  reason="the run exited $status without a result"
-  { printf 'The ask run on the target box ended without an answer (exit %s).\n' "$status"; tail -c 2000 "$work/claude.json"; } > "$work/reply"
-fi
-[[ $num_turns =~ ^[0-9]+$ ]] || num_turns=null
-
-# The run holds the box token for the gateway and can read it back; the
-# reply goes to the asker, who may not be the box's owner.
-if [[ $token =~ ^[A-Za-z0-9_-]+$ ]] && grep -qF -- "$token" "$work/reply"; then
-  sed -i "s/$token/[termag: box token removed]/g" "$work/reply"
-  log 'removed the box token from the reply'
-fi
-
-bundle_file=$thread/out/$run.bundle
-if sudo_ test -s "$bundle_file"; then
-  sudo_ cat "$bundle_file" > "$work/run.bundle" && sudo_ rm -f "$bundle_file"
-  size=$(stat -c %s "$work/run.bundle" 2>/dev/null || echo 0)
-  if [ -z "$repo" ]; then
-    printf '\n\n[termag: the run committed changes, but the target has no GitHub origin, so they stay in the sandbox clone]\n' >> "$work/reply"
-  elif [ "$size" -gt "$BUNDLE_MAX" ]; then
-    printf '\n\n[termag: the run'\''s commits are %s bytes, over the %s-byte limit, and were not published]\n' "$size" "$BUNDLE_MAX" >> "$work/reply"
+# From $work/claude.json (claude -p's JSON, or the chat turn's result event)
+# and $status: the commits as a bundle, then the reply.
+report() {
+  if jq -e 'type == "object" and has("result")' "$work/claude.json" >/dev/null 2>&1; then
+    jq -j '.result' "$work/claude.json" > "$work/reply"
+    session=$(jq -r '.session_id // empty' "$work/claude.json")
+    num_turns=$(jq -r '.num_turns // "null" | tostring' "$work/claude.json")
+    [ "$(jq -r '.is_error // false' "$work/claude.json")" = true ] && { is_error=true; reason="Claude Code ended with $(jq -r '.subtype // "an error"' "$work/claude.json")"; }
   else
-    code=$(call -X PUT -H 'Content-Type: application/octet-stream' --data-binary "@$work/run.bundle" "$endpoint/bundle")
-    if [ "$code" = 204 ]; then bundle_sent=true; log "bundle uploaded ($size bytes)"
-    else log "bundle not uploaded: HTTP $code"; printf '\n\n[termag: the commits could not be uploaded (HTTP %s)]\n' "$code" >> "$work/reply"; fi
+    is_error=true
+    reason="the run exited $status without a result"
+    { printf 'The ask run on the target box ended without an answer (exit %s).\n' "$status"; tail -c 2000 "$work/claude.json"; } > "$work/reply"
   fi
-fi
+  [[ $num_turns =~ ^[0-9]+$ ]] || num_turns=null
 
-post_result "$work/reply" || exit 1
-exit 0
+  local count size code
+  local -a refs
+  mapfile -t refs < <(publish_refs)
+  count=0
+  [ "${#refs[@]}" -eq 0 ] || count=$(git -C "$thread/repo" rev-list --count "${refs[@]}" "^$base" 2>/dev/null) || count=0
+  if [ "${count:-0}" -gt 0 ]; then
+    if [ -z "$repo" ]; then
+      printf '\n\n[termag: the run committed changes, but the target has no GitHub origin, so they stay in %s on the box]\n' "$thread/repo" >> "$work/reply"
+    elif ! git -C "$thread/repo" bundle create -q "$work/run.bundle" "${refs[@]}" "^$base" 2>/dev/null; then
+      printf '\n\n[termag: the run'\''s commits could not be bundled, and were not published]\n' >> "$work/reply"
+    else
+      size=$(stat -c %s "$work/run.bundle" 2>/dev/null || echo 0)
+      if [ "$size" -gt "$BUNDLE_MAX" ]; then
+        printf '\n\n[termag: the run'\''s commits are %s bytes, over the %s-byte limit, and were not published]\n' "$size" "$BUNDLE_MAX" >> "$work/reply"
+      else
+        code=$(call -X PUT -H 'Content-Type: application/octet-stream' --data-binary "@$work/run.bundle" "$endpoint/bundle")
+        if [ "$code" = 204 ]; then
+          bundle_sent=true; log "bundle uploaded ($size bytes, $count commit(s) on ${#refs[@]} branch(es))"
+          pr_descriptions "${refs[@]}"
+          # A regular file only: a symlink could point the upload anywhere.
+          if [ -f "$pr_body_file" ] && [ ! -L "$pr_body_file" ]; then
+            cut_utf8 "$PR_BODY_MAX" "$pr_body_file" > "$work/pr-body.cut"
+            log "PR description sent ($(wc -c < "$work/pr-body.cut") bytes)"
+          fi
+        else log "bundle not uploaded: HTTP $code"; printf '\n\n[termag: the commits could not be uploaded (HTTP %s)]\n' "$code" >> "$work/reply"; fi
+      fi
+    fi
+  fi
+
+  post_result "$work/reply" || exit 1
+  exit 0
+}
+
+case $mode in
+  prepare)
+    prepare_thread
+    jq -cn --arg dir "$thread/repo" --arg base "$base" --arg repo "$repo" --argjson fresh "$fresh" \
+      --arg prBodyFile "$pr_body_file" --arg prDir "$pr_dir" \
+      '{repoDir: $dir, base: $base, repo: $repo, fresh: $fresh, prBodyFile: $prBodyFile, prDir: $prDir}'
+    exit 0
+    ;;
+  report)
+    status=0
+    [ -f "$thread/meta.json" ] && [ -d "$thread/repo/.git" ] || fail "the thread's clone is no longer on this box"
+    base=$(jq -r '.base // empty' "$thread/meta.json")
+    repo=$(jq -r '.repo // empty' "$thread/meta.json")
+    cp "$arg2" "$work/claude.json" 2>/dev/null || : > "$work/claude.json"
+    report
+    ;;
+  run)
+    prepare_thread
+    run_claude
+    report
+    ;;
+esac

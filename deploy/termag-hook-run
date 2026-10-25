@@ -5,7 +5,9 @@
 #   warm    run deploy/on-warm.d/*.sh from the checkout while the box is still
 #           unowned, so a claimed box arrives with its slow work already done.
 #   claim   clone an optional personal dotfiles repo when it is public, or
-#           leave the saved URL for a rerun after the owner signs in.
+#           leave the saved URL for a later run after the owner signs in,
+#           then apply it: its install script, else `chezmoi init --apply`
+#           for a chezmoi source tree, else links to its top-level dotfiles.
 #           No GitHub token is read or written.
 #
 # The backend starts the warm run through the agent once the agent has
@@ -22,6 +24,12 @@
 #                        $HOME/src/termag); exported to each script too
 #   TERMAG_HOOK_TIMEOUT  per-script timeout, a timeout(1) duration (default 20m)
 #   TERMAG_STATE_DIR     where the log and status file go (default $HOME/.termag)
+#   TERMAG_DOTFILES_NO_SCRIPTS
+#                        1: claim runs nothing from the dotfiles repository (no
+#                        install script, no chezmoi: its templates and scripts
+#                        run commands) and only links its top-level dotfiles.
+#                        The e2e stack's stand-in boxes set it: they run as you
+#                        on your own machine
 #
 # ── ~/.termag/on-warm.status.json ───────────────────────────────────────────
 #
@@ -78,7 +86,7 @@ LOG_TAIL_LINES=50
 LOG_TAIL_BYTES=4000
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 json_string() {
@@ -280,6 +288,97 @@ clone_dotfiles() {
   return 0
 }
 
+# A chezmoi source tree has no dotfile at its top: `dot_zshrc`, not `.zshrc`,
+# so the symlink fallback would link nothing useful. Every special file
+# chezmoi reads starts with `.chezmoi` (`.chezmoiroot` included, which is how
+# a repo keeps its source state in a subdirectory), and every target in the
+# home starts with `dot_` behind any of chezmoi's attribute prefixes.
+is_chezmoi_source() {
+  local dir=$1 entry name
+  for entry in "$dir"/.chezmoi* "$dir"/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=$(basename "$entry")
+    case "$name" in .chezmoi*) return 0 ;; esac
+    [[ $name =~ ^((create|empty|encrypted|exact|executable|external|literal|modify|private|readonly|remove|symlink)_)*dot_. ]] \
+      && return 0
+  done
+  return 1
+}
+
+# Prints the chezmoi to run. One already installed wins; otherwise the pinned
+# release goes into ~/.local/bin, digest-checked. The pin lives here rather
+# than in the image because incremental bakes skip setup.sh, so a binary baked
+# there would reach only some boxes, and this script reaches every box through
+# its checkout. The unit's PATH has no ~/.local/bin, hence the explicit paths.
+ensure_chezmoi() {
+  local version=2.73.2 found arch sha tmp
+  for found in "$(command -v chezmoi 2>/dev/null || true)" "$HOME/.local/bin/chezmoi" "$HOME/bin/chezmoi"; do
+    if [ -n "$found" ] && [ -x "$found" ]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  done
+  case "$(uname -s)/$(uname -m)" in
+    Linux/aarch64|Linux/arm64)
+      arch=arm64 sha=db92b343a32cade0b1d4ff5e30da54c5156f7a580349281e583a5402c57c7bcf ;;
+    Linux/x86_64|Linux/amd64)
+      arch=amd64 sha=4d7bd8072f15373d5f5c801209bac218527452c8e54f9ae46ba6c5bd4a6eca41 ;;
+    *)
+      printf '[termag-hook-run] no pinned chezmoi for %s/%s\n' "$(uname -s)" "$(uname -m)" >&2
+      return 2 ;;
+  esac
+  printf '[termag-hook-run] installing chezmoi %s into ~/.local/bin\n' "$version" >&2
+  tmp=$(mktemp -d)
+  if ! curl -fsSL --proto '=https' --retry 3 -o "$tmp/chezmoi.tar.gz" \
+      "https://github.com/twpayne/chezmoi/releases/download/v$version/chezmoi_${version}_linux_${arch}.tar.gz"; then
+    rm -rf -- "$tmp"
+    printf '[termag-hook-run] chezmoi %s download failed\n' "$version" >&2
+    return 2
+  fi
+  if [ "$(sha256sum "$tmp/chezmoi.tar.gz" | cut -d' ' -f1)" != "$sha" ]; then
+    rm -rf -- "$tmp"
+    printf '[termag-hook-run] chezmoi %s digest mismatch; not installed\n' "$version" >&2
+    return 2
+  fi
+  tar -xzf "$tmp/chezmoi.tar.gz" -C "$tmp" chezmoi
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 "$tmp/chezmoi" "$HOME/.local/bin/chezmoi"
+  rm -rf -- "$tmp"
+  printf '%s\n' "$HOME/.local/bin/chezmoi"
+}
+
+# chezmoi's default source directory is pointed at the clone, so `chezmoi
+# update`, `chezmoi edit` and the rest work on the box with no --source. A
+# source directory the owner already has is theirs and is left alone.
+#
+# Nobody answers a prompt here, even run by hand: the output goes to
+# the log. --promptDefaults lets every prompt* template call that has a
+# default answer itself; one without a default fails the run on stdin's EOF.
+# No --force: a later run over a file the owner edited stops at chezmoi's
+# "has changed" question rather than overwriting the edit.
+apply_chezmoi() {
+  local dir=$1 chezmoi default_source="$HOME/.local/share/chezmoi"
+  local -a source_args=()
+  chezmoi=$(ensure_chezmoi) || return 2
+  if [ ! -e "$default_source" ] && [ ! -L "$default_source" ]; then
+    mkdir -p "$(dirname "$default_source")"
+    ln -s "$dir" "$default_source"
+  fi
+  if [ "$(readlink -f "$default_source")" != "$(readlink -f "$dir")" ]; then
+    printf '[termag-hook-run] keeping the existing %s; applying from %s\n' "$default_source" "$dir"
+    source_args=(--source "$dir")
+  fi
+  printf '[termag-hook-run] applying chezmoi source state with %s\n' "$chezmoi"
+  if ! TERMAG_IS_CLAIM=1 \
+      TERMAG_OWNER_EMAIL="${TERMAG_OWNER_EMAIL:-}" \
+      TERMAG_OWNER_NAME="${TERMAG_OWNER_NAME:-}" \
+      GIT_TERMINAL_PROMPT=0 \
+      "$chezmoi" init --apply --no-tty --promptDefaults "${source_args[@]}" < /dev/null; then
+    printf '[termag-hook-run] chezmoi could not apply unattended: give each prompt a default, or run `chezmoi init --apply` on the box\n'
+    return 2
+  fi
+}
+
 apply_dotfiles_tree() {
   local dir=$1 candidate selected=
   for candidate in install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup; do
@@ -288,6 +387,15 @@ apply_dotfiles_tree() {
       break
     fi
   done
+  if [ "${TERMAG_DOTFILES_NO_SCRIPTS:-}" = 1 ]; then
+    if [ -n "$selected" ]; then
+      printf '[termag-hook-run] TERMAG_DOTFILES_NO_SCRIPTS: not running the entrypoint %s\n' "$selected"
+    elif is_chezmoi_source "$dir"; then
+      printf '[termag-hook-run] TERMAG_DOTFILES_NO_SCRIPTS: not applying the chezmoi source (its templates and scripts run commands)\n'
+    fi
+    link_dotfiles "$dir"
+    return
+  fi
   if [ -n "$selected" ]; then
     printf '[termag-hook-run] running dotfiles entrypoint %s\n' "$selected"
     (
@@ -299,8 +407,16 @@ apply_dotfiles_tree() {
     )
     return
   fi
+  if is_chezmoi_source "$dir"; then
+    apply_chezmoi "$dir"
+    return
+  fi
   printf '[termag-hook-run] no entrypoint; linking top-level dotfiles\n'
-  local source name
+  link_dotfiles "$dir"
+}
+
+link_dotfiles() {
+  local dir=$1 source name linked=0
   for source in "$dir"/.[!.]* "$dir"/..?*; do
     [ -e "$source" ] || [ -L "$source" ] || continue
     name=$(basename "$source")
@@ -313,7 +429,10 @@ apply_dotfiles_tree() {
       continue
     fi
     ln -sfn "$source" "$HOME/$name"
+    printf '[termag-hook-run] linked ~/%s\n' "$name"
+    linked=$((linked + 1))
   done
+  [ "$linked" -gt 0 ] || printf '[termag-hook-run] no top-level dotfiles to link\n'
 }
 
 # Exit codes from the child: 0 applied, 10 auth/missing (skip), 2 hard failure.
@@ -356,8 +475,10 @@ run_claim() {
   export TERMAG_OWNER_EMAIL="${TERMAG_OWNER_EMAIL:-}"
   export TERMAG_OWNER_NAME="${TERMAG_OWNER_NAME:-}"
   export TERMAG_DOTFILES_USE_OWNER_GIT="${TERMAG_DOTFILES_USE_OWNER_GIT:-}"
+  export TERMAG_DOTFILES_NO_SCRIPTS="${TERMAG_DOTFILES_NO_SCRIPTS:-}"
   export STATE_DIR HOME
-  export -f run_claim_work clone_dotfiles apply_dotfiles_tree usable_dotfiles_repo
+  export -f run_claim_work clone_dotfiles apply_dotfiles_tree link_dotfiles usable_dotfiles_repo \
+    is_chezmoi_source ensure_chezmoi apply_chezmoi
 
   CURRENT_SCRIPT=dotfiles
   write_status

@@ -2,8 +2,9 @@
 # Tests endpoint resolution in deploy/termag-status.
 #
 # --print-endpoint, --print-mirrors, --print-auth, --print-payload and
-# --classify are exercised: they are pure, so the tests need no network, no
-# tmux and no server.
+# --classify are exercised: they are pure, so the tests need no network and no
+# server. The session tests start a private tmux server, and are skipped where
+# tmux is not installed.
 #
 # Run: sh deploy/termag-status.test.sh
 set -u
@@ -204,6 +205,16 @@ got="$(classify '{"tool_name":"Bash","tool_input":{"command":"echo \"run gh pr c
 got="$(classify '{"tool_name":"Edit","tool_input":{"file_path":"x"},"tool_response":"ok"}')"
 [ -z "$got" ] || fail 'non-Bash tools are ignored' '' "$got"
 
+# The termag-pr skill opens PRs through termag-pr-create, which runs gh pr create itself.
+got="$(classify '{"tool_name":"Bash","tool_input":{"command":"termag-pr-create /tmp/termag-pr/title.txt /tmp/termag-pr/body.md --draft"},"tool_response":{"stdout":"https://github.com/org/repo/pull/172\n","stderr":""}}')"
+[ "$got" = "pr_created https://github.com/org/repo/pull/172" ] || fail 'classify termag-pr-create' 'pr_created <url>' "$got"
+
+got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cd repo && ~/.local/bin/termag-pr-create t.txt b.md"},"tool_response":"https://github.com/org/repo/pull/173\n"}')"
+[ "$got" = "pr_created https://github.com/org/repo/pull/173" ] || fail 'classify termag-pr-create by path' 'pr_created <url>' "$got"
+
+got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cat deploy/termag-pr-create"},"tool_response":"https://github.com/org/repo/pull/174"}')"
+[ -z "$got" ] || fail 'reading termag-pr-create is not a milestone' '' "$got"
+
 # A heredoc BODY that documents the command (and even prints a PR URL) is not a
 # milestone: grep's ^ is line-anchored, so the body is stripped before matching.
 got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cat > NOTES.md <<'"'"'EOF'"'"'\nTo ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\nEOF\ncat NOTES.md"},"tool_response":"To ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\n"}')"
@@ -347,6 +358,168 @@ case "$got" in '{"session":"termag-claude-runner-s2-ord_d1-r","status":"idle"}
 {"event":"usage","orderId":"ord.8","input":10,'*) ;; *) fail 'stop in a cloud session: idle, then the usage from the named transcript' 'idle + usage' "$got" ;; esac
 got="$(printf '{"transcript_path":"%s"}' "$TR/b.jsonl" | stop_payload)"
 [ "$got" = '{"session":"termag-claude-runner-s2-ord_d1-r","status":"idle"}' ] || fail 'stop outside a cloud session: idle only' 'idle' "$got"
+
+# ── session-start: ~/.local/bin for Claude Code's Bash tool ────────────────
+# Claude sources $CLAUDE_ENV_FILE before every Bash command, after its PATH
+# snapshot, so this is the one place a PATH change reaches that shell.
+SS_HOME="$WORK/ss-home"; mkdir -p "$SS_HOME/.local/bin"
+printf '#!/bin/sh\necho termag-cli\n' > "$SS_HOME/.local/bin/termag"; chmod 755 "$SS_HOME/.local/bin/termag"
+ENVF="$WORK/claude-env.sh"; : > "$ENVF"
+env -u TMUX HOME="$SS_HOME" CLAUDE_ENV_FILE="$ENVF" "$SCRIPT" session-start </dev/null
+got=$?
+[ "$got" = 0 ] || fail 'session-start exits 0 outside tmux' 0 "$got"
+env -u TMUX HOME="$SS_HOME" CLAUDE_ENV_FILE="$ENVF" "$SCRIPT" session-start </dev/null
+got="$(grep -c 'local/bin' "$ENVF")"
+[ "$got" = 1 ] || fail 'session-start writes the PATH line once' 1 "$got"
+for sh in sh bash; do
+  got="$(HOME="$SS_HOME" PATH=/usr/bin:/bin "$sh" -c ". '$ENVF'; . '$ENVF'; termag; printf '%s' \"\$PATH\" | tr : '\n' | grep -c local/bin")"
+  [ "$got" = "termag-cli
+1" ] || fail "$sh: the env file puts ~/.local/bin on PATH once" 'termag-cli + 1' "$got"
+done
+if command -v zsh >/dev/null 2>&1; then
+  got="$(HOME="$SS_HOME" PATH=/usr/bin:/bin zsh -f -c ". '$ENVF'; termag")"
+  [ "$got" = termag-cli ] || fail 'zsh: the env file puts ~/.local/bin on PATH' termag-cli "$got"
+fi
+got="$(HOME="$WORK/empty-home" PATH=/usr/bin:/bin sh -c ". '$ENVF'; echo \"\$PATH\"")"
+[ "$got" = /usr/bin:/bin ] || fail 'no ~/.local/bin leaves PATH alone' /usr/bin:/bin "$got"
+env -u CLAUDE_ENV_FILE -u TMUX HOME="$SS_HOME" "$SCRIPT" session-start </dev/null
+got=$?
+[ "$got" = 0 ] || fail 'session-start without CLAUDE_ENV_FILE exits 0' 0 "$got"
+
+# ── which session: tmux panes, the t3 server, no tmux at all ─────────────────
+# A private tmux server under $WORK stands in for a box's: a project with a
+# workstream, its ctrl pane, a session started in the home directory, and the
+# t3 server's own `termag-t3` (agent/t3-bridge.js). TMUX_TMPDIR keeps even the
+# "default" server inside $WORK. Skipped without tmux.
+if command -v tmux >/dev/null 2>&1; then
+  # Its own TMUX_TMPDIR: the next section starts another server while this
+  # one may still be going away.
+  TT="$WORK/tmux-t3"; mkdir -p "$TT"
+  H="$WORK/t3home"; P="$H/termag/projects/x"
+  mkdir -p "$P/src/deep" "$P/.worktrees/feat/lib" "$P/.worktrees/gone" "$H/scratch" "$H/elsewhere"
+  ln -s "$P" "$H/x-link"
+  # The default server's socket under TMUX_TMPDIR, so the no-$TMUX cases reach it too.
+  mkdir -p "$TT/tmux-$(id -u)"; chmod 700 "$TT/tmux-$(id -u)"
+  SOCK="$TT/tmux-$(id -u)/default"
+  tm() { TMUX_TMPDIR="$TT" tmux -S "$SOCK" "$@"; }
+  tm new-session -d -s psecor-x-agent -c "$P" 'sleep 600'
+  tm new-session -d -s psecor-x-ctrl -c "$P" 'sleep 600'
+  tm new-session -d -s psecor-x-feat-agent -c "$P/.worktrees/feat" 'sleep 600'
+  tm new-session -d -s psecor-home-agent -c "$H" 'sleep 600'
+  tm new-session -d -s termag-t3 -c "$H" 'sleep 600'
+  SPID=$(tm display-message -p -t '=termag-t3' '#{pid}')
+  T3PANE=$(tm list-panes -t '=termag-t3' -F '#{pane_id}')
+  XPANE=$(tm list-panes -t '=psecor-x-agent' -F '#{pane_id}')
+  # As a hook runs: env, cwd and stdin from Claude Code; never posts (--print-payload).
+  hook() {  # hook <dir> <TERMAG_T3> <TMUX_PANE> <mode> [stdin]
+    (cd "$1" && printf '%s' "${5:-}" | env -u TERMAG_STATUS_SESSION -u CLAUDE_PROJECT_DIR HOME="$H" TMUX_TMPDIR="$TT" \
+      TMUX="$SOCK,$SPID,0" TMUX_PANE="$3" ${2:+TERMAG_T3=$2} TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" \
+      "$SCRIPT" "$4" --print-payload)
+  }
+  t3hook() {  # t3hook <CLAUDE_PROJECT_DIR> <mode> [stdin]: inside the t3 server
+    (cd "$H" && printf '%s' "${3:-}" | env -u TERMAG_STATUS_SESSION HOME="$H" TMUX_TMPDIR="$TT" \
+      TMUX="$SOCK,$SPID,0" TMUX_PANE="$T3PANE" TERMAG_T3=1 CLAUDE_PROJECT_DIR="$1" \
+      TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" "$2" --print-payload)
+  }
+
+  got="$(hook "$P" '' "$XPANE" working)"
+  want='{"session":"psecor-x-agent","status":"working"}'
+  [ "$got" = "$want" ] || fail 'a project pane: its own session, payload unchanged' "$want" "$got"
+
+  got="$(t3hook "$P" working | jq -r .session)"
+  [ "$got" = psecor-x-agent ] || fail 'a desktop thread in the checkout: the project agent session' psecor-x-agent "$got"
+  got="$(t3hook "$P/src/deep" working | jq -r .session)"
+  [ "$got" = psecor-x-agent ] || fail 'a thread in a subdirectory of the checkout' psecor-x-agent "$got"
+  got="$(t3hook "$H/x-link" working | jq -r .session)"
+  [ "$got" = psecor-x-agent ] || fail 'a thread in a symlink to the checkout' psecor-x-agent "$got"
+  got="$(t3hook "$P/.worktrees/feat/lib" working | jq -r .session)"
+  [ "$got" = psecor-x-feat-agent ] || fail "a thread in a workstream's worktree: that workstream's session" psecor-x-feat-agent "$got"
+  got="$(t3hook "$P/.worktrees/gone" working | jq -r .session)"
+  [ "$got" = termag-t3 ] || fail 'a worktree with no session of its own is not filed under main' termag-t3 "$got"
+  got="$(t3hook "$H/scratch" working | jq -r .session)"
+  [ "$got" = termag-t3 ] || fail 'a thread outside every checkout: the t3 server session (a home-dir session never claims it)' termag-t3 "$got"
+  # A renamed workstream: the worktree moved and the session renamed, its
+  # session_path left behind; the pane's process moved with the directory.
+  mkdir -p "$P/.worktrees/before"
+  tm new-session -d -s psecor-x-before-agent -c "$P/.worktrees/before" 'sleep 600'
+  mv "$P/.worktrees/before" "$P/.worktrees/after"
+  tm rename-session -t '=psecor-x-before-agent' psecor-x-after-agent
+  got="$(t3hook "$P/.worktrees/after" working | jq -r .session)"
+  [ "$got" = psecor-x-after-agent ] || fail 'a renamed workstream (stale session_path): where its pane is now' psecor-x-after-agent "$got"
+  got="$(t3hook "$WORK/no-such-dir" working | jq -r .session)"
+  [ "$got" = termag-t3 ] || fail 'a directory that is not there: the t3 server session' termag-t3 "$got"
+
+  got="$(t3hook "$P" working)"
+  want='{"session":"psecor-x-agent","status":"working","source":"t3:claude"}'
+  [ "$got" = "$want" ] || fail 'a desktop post carries source t3:claude (PreToolUse: no stdin, no thread)' "$want" "$got"
+  got="$(t3hook "$P" prompt-submit '{"session_id":"8f1c2d3e-0000-4000-8000-000000000001","prompt":"hi"}')"
+  want='{"session":"psecor-x-agent","status":"working","source":"t3:claude","threadId":"8f1c2d3e-0000-4000-8000-000000000001"}'
+  [ "$got" = "$want" ] || fail "UserPromptSubmit names the thread by the hook's session_id" "$want" "$got"
+  got="$(t3hook "$P" stop '{"session_id":"8f1c2d3e-0000-4000-8000-000000000001","stop_hook_active":false}')"
+  want='{"session":"psecor-x-agent","status":"idle","source":"t3:claude","threadId":"8f1c2d3e-0000-4000-8000-000000000001"}'
+  [ "$got" = "$want" ] || fail 'Stop names the thread too' "$want" "$got"
+  got="$(t3hook "$P" stop '{"session_id":"no spaces or $hell allowed"}' | jq -c 'has("threadId")')"
+  [ "$got" = false ] || fail 'an odd session_id is left out' false "$got"
+
+  # A t3 server an older agent started has no TERMAG_T3: its own pane says so.
+  got="$(hook "$P" '' "$T3PANE" working)"
+  want='{"session":"psecor-x-agent","status":"working","source":"t3:claude"}'
+  [ "$got" = "$want" ] || fail 'inside the termag-t3 pane without TERMAG_T3' "$want" "$got"
+
+  # No $TMUX and not the t3 server: no context, nothing posted, even though
+  # display-message would name the default server's newest session.
+  got="$(cd "$P" && env -u TMUX -u TMUX_PANE -u TERMAG_T3 -u TERMAG_STATUS_SESSION HOME="$H" TMUX_TMPDIR="$TT" \
+    TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" working --print-payload)"
+  [ -z "$got" ] || fail 'no $TMUX: posts nothing (an ask run, the briefing)' '' "$got"
+  # ...while the t3 path still finds the checkout's session on the default server.
+  got="$(cd "$P" && env -u TMUX -u TMUX_PANE -u TERMAG_STATUS_SESSION -u CLAUDE_PROJECT_DIR HOME="$H" TMUX_TMPDIR="$TT" \
+    TERMAG_T3=1 TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" working --print-payload | jq -r .session)"
+  [ "$got" = psecor-x-agent ] || fail 'a t3 terminal (no $TMUX): the working directory, on the default server' psecor-x-agent "$got"
+
+  tm kill-server 2>/dev/null
+else
+  echo "skip: tmux not installed (session tests)"
+fi
+
+# ── which session: only inside tmux ─────────────────────────────────────────
+# A private tmux server under $WORK stands in for a box's. TMUX_TMPDIR keeps
+# even its default socket there, so a hook run without $TMUX reaches it, as
+# one run by termag-subagent-run or termag-briefing would. Skipped without tmux.
+if command -v tmux >/dev/null 2>&1; then
+  TT="$WORK/tmux"
+  mkdir -p "$TT/tmux-$(id -u)"; chmod 700 "$TT/tmux-$(id -u)"
+  SOCK="$TT/tmux-$(id -u)/default"
+  tm() { TMUX_TMPDIR="$TT" tmux -S "$SOCK" "$@"; }
+  tm new-session -d -s psecor-x-agent 'sleep 600'
+  tm new-session -d -s psecor-y-agent 'sleep 600'
+  SPID=$(tm display-message -p -t '=psecor-x-agent' '#{pid}')
+  XPANE=$(tm list-panes -t '=psecor-x-agent' -F '#{pane_id}')
+
+  got="$(env -u TERMAG_STATUS_SESSION HOME="$WORK/empty-home" TMUX_TMPDIR="$TT" TMUX="$SOCK,$SPID,0" TMUX_PANE="$XPANE" \
+    TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" working --print-payload)"
+  want='{"session":"psecor-x-agent","status":"working"}'
+  [ "$got" = "$want" ] || fail 'inside a tmux pane: the session of that pane' "$want" "$got"
+
+  # Without $TMUX, display-message still names a session of the default server...
+  got="$(env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$TT" tmux display-message -p '#S' 2>/dev/null)"
+  [ -n "$got" ] || fail 'precondition: display-message answers without $TMUX' '(a session name)' "$got"
+  # ...but it is not this hook's, so nothing is posted.
+  got="$(env -u TMUX -u TMUX_PANE -u TERMAG_STATUS_SESSION HOME="$WORK/empty-home" TMUX_TMPDIR="$TT" \
+    TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" working --print-payload)"
+  [ -z "$got" ] || fail 'outside tmux: posts nothing' '' "$got"
+  got="$(printf '{"hook_event_name":"Stop"}' | env -u TMUX -u TMUX_PANE -u TERMAG_STATUS_SESSION HOME="$WORK/empty-home" \
+    TMUX_TMPDIR="$TT" TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" stop --print-payload)"
+  [ -z "$got" ] || fail 'outside tmux: a Stop hook posts nothing' '' "$got"
+  # TERMAG_STATUS_SESSION still names the session outside tmux.
+  got="$(env -u TMUX -u TMUX_PANE TERMAG_STATUS_SESSION=psecor-z-agent HOME="$WORK/empty-home" TMUX_TMPDIR="$TT" \
+    TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" "$SCRIPT" working --print-payload)"
+  want='{"session":"psecor-z-agent","status":"working"}'
+  [ "$got" = "$want" ] || fail 'outside tmux, TERMAG_STATUS_SESSION still names the session' "$want" "$got"
+
+  tm kill-server 2>/dev/null
+else
+  echo "skip: tmux not installed (session tests)"
+fi
 
 if [ "$failures" -eq 0 ]; then
   echo "PASS: endpoint resolution + auth handling + payloads + milestone classification"

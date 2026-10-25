@@ -11,7 +11,8 @@
 #     and model; it exits with claude's status
 #   * a claude that fails without JSON posts an error result naming its last
 #     stderr line; a missing claude posts "claude not found"
-#   * a job that cannot be read runs nothing and posts nothing; a bad id exits 2
+#   * a job that cannot be read (or has no prompt) runs nothing and posts the
+#     reason as an error result; a bad id exits 2
 #   * TERMAG_URL overrides the server
 #
 # Run: sh deploy/termag-briefing.test.sh
@@ -144,7 +145,20 @@ run env JOB_CODE=404 "$SCRIPT" b1 >/dev/null 2>&1
 got=$?
 [ "$got" = 1 ] || fail 'an unreadable job exits 1' 1 "$got"
 [ -f "$REC/claude.argv" ] && fail 'an unreadable job runs nothing' 'no claude' 'claude ran'
-[ -f "$REC/body.json" ] && fail 'an unreadable job posts nothing' 'no post' 'posted'
+got="$(jq -c . "$REC/body.json" 2>/dev/null)"
+want='{"result":"job not read: https://orch.example/termag/api/briefings/b1/job answered 404","exitStatus":1,"isError":true}'
+[ "$got" = "$want" ] || fail 'an unreadable job posts the reason as an error result' "$want" "$got"
+
+reset
+printf '%s\n' '{"id":"b1","prompt":"","allowedTools":[]}' > "$REC/job.empty.json"
+cp "$REC/job.json" "$REC/job.saved.json"; cp "$REC/job.empty.json" "$REC/job.json"
+run "$SCRIPT" b1 >/dev/null 2>&1
+got=$?
+cp "$REC/job.saved.json" "$REC/job.json"
+[ "$got" = 1 ] || fail 'an empty job exits 1' 1 "$got"
+[ -f "$REC/claude.argv" ] && fail 'an empty job runs nothing' 'no claude' 'claude ran'
+got="$(jq -r .result "$REC/body.json" 2>/dev/null)"
+[ "$got" = 'job has no prompt or no allowed tools' ] || fail 'an empty job posts the reason' 'job has no prompt or no allowed tools' "$got"
 
 # ── TERMAG_URL and a bad id ─────────────────────────────────────────────────
 reset

@@ -7,12 +7,42 @@
  * this half pure is what lets backend/src/providers/piStatusExtension.test.ts
  * exercise the whole mapping without pi.
  *
- * Every post carries `--source pi-ext:pi`: the backend books a status
- * with no recognised source as Claude (services/status.ts), so a missing
- * source would silently credit Claude with pi's working time.
+ * Every post carries `--source pi-ext:pi`, on any model backend:
+ * the source names the harness, and the backend books a status with no
+ * recognised source as Claude (services/status.ts), so a missing source would
+ * silently credit Claude with pi's working time.
  */
 
 export const SOURCE = 'pi-ext:pi';
+
+/** Which model backend this pi runs on, for what a failed model request
+ *  tells the owner to do. The launcher names it in TERMAG_PI_AGENT. */
+export interface PiAgent {
+  label: string;
+  remedy: (status: number) => string;
+  badge: (status: number) => string;
+}
+
+export const PI: PiAgent = {
+  label: 'pi',
+  remedy: brokerRemedy,
+  badge: status => `pi: model endpoint HTTP ${status}`,
+};
+
+// Fireworks' answers come through the termag gateway: a
+// 401 or 403 is the gateway refusing this box, which `termag-credentials
+// status` explains; anything else is Fireworks or the gateway failing.
+export const FIREWORKS: PiAgent = {
+  label: 'Fireworks',
+  remedy: status => (status === 401 || status === 403
+    ? `Fireworks gateway HTTP ${status} — the termag gateway refused this box; in the ctrl pane run: termag-credentials status`
+    : `Fireworks gateway HTTP ${status} — the model request failed; in the ctrl pane run: termag-credentials status`),
+  badge: status => `Fireworks: gateway HTTP ${status}`,
+};
+
+export function piAgent(name: string | undefined): PiAgent {
+  return name === 'fireworks' ? FIREWORKS : PI;
+}
 
 /** Re-post `working` this often during a run so a single long tool call does
  *  not trip the backend's 5-minute auto-idle. */
@@ -91,7 +121,7 @@ function isBrokerFailure(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 404 || status >= 500;
 }
 
-export function reduce(state: State, ev: PiEventLike, now: number): { state: State; posts: Post[] } {
+export function reduce(state: State, ev: PiEventLike, now: number, agent: PiAgent = PI): { state: State; posts: Post[] } {
   const s: State = { ...state };
   const posts: Post[] = [];
   const status = (p: Omit<Extract<Post, { kind: 'status' }>, 'kind'>) => {
@@ -173,11 +203,11 @@ export function reduce(state: State, ev: PiEventLike, now: number): { state: Sta
       s.inRun = false;
       if (s.brokerError !== null || s.lastStopReason === 'error') {
         const code = s.brokerError ?? 0;
-        const message = code ? brokerRemedy(code) : 'pi: the model request failed — check the pane';
+        const message = code ? agent.remedy(code) : `${agent.label}: the model request failed — check the pane`;
         s.flagged = true;
         status({
           status: 'waiting', waitingReason: 'user_input', notify: true, message,
-          rateLimited: code ? `pi: model endpoint HTTP ${code}` : 'pi: model error',
+          rateLimited: code ? agent.badge(code) : `${agent.label}: model error`,
         });
       } else if (s.lastStopReason !== 'aborted' && /\?\s*$/.test(s.lastAssistantText)) {
         status({

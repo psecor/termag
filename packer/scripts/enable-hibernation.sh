@@ -141,8 +141,8 @@ swap_candidates() {
 }
 
 # Anything hibinit-agent made on the builder. A baked swap file would cost the
-# snapshot its size and first boot a lazily-restored read of every block
-# (AGENTS.md, the home-path index gotcha); a baked state dir would tell the
+# snapshot its size and first boot a lazily-restored read of every block;
+# a baked state dir would tell the
 # box's agent its setup is already done.
 remove_builder_residue() {
     local f

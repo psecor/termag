@@ -1,6 +1,6 @@
 #!/bin/sh
 # Static checks on the orchestrator's nginx check routes (deploy/nginx/termag-checks.conf):
-# :3041 serves the three gateway checks and a health check, nothing else, and
+# :3041 serves the four gateway checks and a health check, nothing else, and
 # the plain :3040 gateway keeps refusing /termag/internal/. The e2e harness
 # runs both configs for real (scripts/e2e/fakes.test.sh with E2E_TEST_CLAUDE_GATEWAY).
 #
@@ -19,11 +19,11 @@ got="$(code "$CHECKS" | grep -E '^\s*listen' | tr -s ' ' | sed 's/^ //')"
 [ "$got" = 'listen 3041;' ] || fail 'the checks listener is :3041, plain HTTP behind the ALB' 'listen 3041;' "$got"
 
 got="$(code "$CHECKS" | grep -E '^\s*location' | tr -s ' ' | sed 's/^ //' | tr '\n' '|')"
-want='location = /healthz {|location /termag/internal/claude-authz/ {|location /termag/internal/github-authz/ {|location / {|'
-[ "$got" = "$want" ] || fail 'it serves the two checks and a health check only' "$want" "$got"
+want='location = /healthz {|location /termag/internal/claude-authz/ {|location /termag/internal/github-authz/ {|location /termag/internal/mcp-authz/ {|location /termag/internal/fireworks-authz/ {|location / {|'
+[ "$got" = "$want" ] || fail 'it serves the four checks and a health check only' "$want" "$got"
 
 got="$(code "$CHECKS" | grep -c 'proxy_pass http://127.0.0.1:3100;')"
-[ "$got" = 2 ] || fail 'only the two checks reach the backend' 2 "$got"
+[ "$got" = 4 ] || fail 'only the four checks reach the backend' 4 "$got"
 
 got="$(code "$CHECKS" | sed -n '/location \/ {/,/}/p' | grep -c 'return 404;')"
 [ "$got" = 1 ] || fail 'everything else is a 404' 1 "$got"

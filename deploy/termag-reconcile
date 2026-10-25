@@ -46,6 +46,12 @@ set -u
 CHECKOUT="${TERMAG_CHECKOUT:-$HOME/src/termag}"
 DEPLOY="$CHECKOUT/deploy"
 GIT_TEMPLATE_DIR="$HOME/.local/share/termag/git-template"
+# Claude Code plugins termag ships (deploy/claude-plugins/<name>/), installed
+# rendered: @TERMAG_MCP_VERSION_FILE@ becomes the absolute path of the file
+# termag-credentials bumps (a mod cannot resolve a home directory itself).
+# termag-credentials apply mcp names the installed folder in
+# CLAUDE_CODE_PLUGIN_DIRS. Test files stay behind.
+CLAUDE_PLUGINS_DIR="$HOME/.local/share/termag/claude-plugins"
 
 MODE=reconcile
 case "${1:-}" in
@@ -85,8 +91,9 @@ esac
 # hooks to it, and overwriting it every boot would silently discard that. The
 # bake seeds it once and it is the user's thereafter. The only thing this script
 # does to the installed ~/.claude/settings.json is append MetaTerm's read-tool
-# approvals when they are missing (reconcile_claude_config below), and it never
-# removes or reorders anything.
+# approvals (reconcile_claude_config below) and the SessionStart PATH hook
+# (reconcile_claude_path_hook) when they are missing, and it never removes or
+# reorders anything.
 #
 # kind=file is a plain non-executable file, like the MetaTerm skill.
 artifacts() {
@@ -105,7 +112,9 @@ termag-project-clone:$HOME/.local/bin/termag-project-clone:755:bin:noenable
 termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable
 termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable
 termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable
+termag-mcp-headers:$HOME/.local/bin/termag-mcp-headers:755:bin:noenable
 termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable
+termag-pi-fireworks:$HOME/.local/bin/termag-pi-fireworks:755:bin:noenable
 termag-agent-otel:$HOME/.local/bin/termag-agent-otel:755:bin:noenable
 termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable
 termag-briefing:$HOME/.local/bin/termag-briefing:755:bin:noenable
@@ -117,9 +126,8 @@ pi-ext/termag-otel.ts:$HOME/.local/share/termag/pi-ext/termag-otel.ts:644:file:n
 pi-ext/termag-otel-core.ts:$HOME/.local/share/termag/pi-ext/termag-otel-core.ts:644:file:noenable
 claude-skills/metaterm/SKILL.md:$HOME/.claude/skills/metaterm/SKILL.md:644:file:noenable
 termag-subagent-run:$HOME/.local/bin/termag-subagent-run:755:bin:noenable
-termag-subagent-setup:$HOME/.local/bin/termag-subagent-setup:755:bin:noenable
-termag-subagent-exec:$HOME/.local/lib/termag/termag-subagent-exec:755:bin:noenable
 claude-skills/agent-ask/SKILL.md:$HOME/.claude/skills/agent-ask/SKILL.md:644:file:noenable
+claude-skills/agent-orchestrator/SKILL.md:$HOME/.claude/skills/agent-orchestrator/SKILL.md:644:file:noenable
 pi-skills/metaterm/SKILL.md:$HOME/.pi/agent/skills/metaterm/SKILL.md:644:file:noenable
 termag-pr-body:$HOME/.local/bin/termag-pr-body:755:bin:noenable
 termag-pr-create:$HOME/.local/bin/termag-pr-create:755:bin:noenable
@@ -157,7 +165,27 @@ PI_METATERM_MCP='{"type":"stdio","command":"~/.local/bin/termag-metaterm-mcp","e
 # FILE, treating a missing or empty file as {}. Writes only on a real
 # difference, keeps the file's mode (0600 when new), and leaves a file jq cannot
 # parse alone rather than replacing an owner's config.
+# ~/.claude.json is merged under termag-credentials' lock on it, so this and an
+# MCP delivery never write over each other.
 merge_json() {
+  local rc=0
+  if [ "$1" != "$HOME/.claude.json" ] || [ "$MODE" = check ] || ! command -v flock >/dev/null 2>&1; then
+    merge_json_unlocked "$@"
+    return
+  fi
+  mkdir -p "$HOME/.config/termag" || return 0
+  exec 9>"$HOME/.config/termag/claude-json.lock"
+  if ! flock -w "${TERMAG_CLAUDE_JSON_LOCK_WAIT:-30}" 9; then
+    exec 9>&-
+    printf 'termag-reconcile: another termag write of %s held its lock too long; not adding %s\n' "$1" "$2" >&2
+    return 0
+  fi
+  merge_json_unlocked "$@" || rc=$?
+  exec 9>&-
+  return "$rc"
+}
+
+merge_json_unlocked() {
   local file=$1 label=$2 value=$3 filter=$4 cur want tmp
   if [ -s "$file" ]; then cur=$(cat "$file") || return 0; else cur='{}'; fi
   if ! want=$(printf '%s' "$cur" | jq --argjson v "$value" "$filter" 2>/dev/null); then
@@ -197,6 +225,29 @@ reconcile_claude_config() {
     'reduce $v[] as $t (.; if any((.permissions.allow // [])[]; . == $t) then . else .permissions.allow = ((.permissions.allow // []) + [$t]) end)'
 }
 
+# The SessionStart hook from claude-settings.json that puts ~/.local/bin on the
+# Bash tool's PATH (termag-status session-start says why no startup file can).
+# The bake seeds settings.json once, so boxes and accounts older than the hook
+# get it here; an entry already calling session-start, termag's or an owner's
+# copy of it, is left as it is.
+SESSION_START_HOOK='{"hooks":[{"type":"command","command":"\"$HOME/.local/bin/termag-status\" session-start >/dev/null 2>&1 || true"}]}'
+
+reconcile_claude_path_hook() {
+  [ -f "$CHECKOUT/deploy/termag-status" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  merge_json "$HOME/.claude/settings.json" 'SessionStart PATH hook' "$SESSION_START_HOOK" \
+    'if any((.hooks.SessionStart // [])[].hooks[]?.command | strings; test("termag-status\"? session-start")) then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + [$v]) end'
+}
+
+# Claude Code's first-run screens (the theme picker) wait for a keypress, and a
+# pane launched on a fresh box, such as an ask box's, has nobody to give one.
+# Only the onboarding flag: the per-folder trust prompt is left to the owner.
+reconcile_claude_onboarding() {
+  command -v jq >/dev/null 2>&1 || return 0
+  merge_json "$HOME/.claude.json" 'Claude Code onboarding done' 'true' \
+    '.hasCompletedOnboarding = $v'
+}
+
 # Build and pin the CLI to the same runtime the agent and clones resolve.
 cli_node() {
   /bin/bash "$CHECKOUT/agent/run-node.sh" --print-node 2>/dev/null
@@ -234,25 +285,80 @@ reconcile_cli() {
   fi
 }
 
-# The ask sandbox: the termag-subagent user and
-# /var/lib/termag-subagent, which termag-subagent-setup prepares with sudo -n
-# and installs the root-owned exec script into. Runs after the table, so the
-# setup and exec script it uses are this checkout's. A box without Claude Code
-# or systemd (setup --check exits 3) has nothing to prepare and is not drift.
-reconcile_subagent() {
-  local setup="$HOME/.local/bin/termag-subagent-setup" out rc
-  [ -x "$setup" ] || return 0
-  out=$("$setup" --check 2>&1); rc=$?
-  [ "$rc" = 0 ] || [ "$rc" = 3 ] && return 0
+# Ask runs no longer have a sandbox: they run as the box user.
+# This retires what
+# the old termag-subagent-setup left: its two scripts in this home, and, when
+# sudo -n works and no process of the user is running (an old run still in
+# flight), the termag-subagent user and /var/lib/termag-subagent (old thread
+# clones and a copy of claude). Without passwordless sudo they stay, unused,
+# and are not reported as drift, since nothing here can fix them.
+ASK_SANDBOX_USER="${TERMAG_ASK_SANDBOX_USER:-termag-subagent}"
+ASK_SANDBOX_ROOT="${TERMAG_ASK_SANDBOX_ROOT:-/var/lib/termag-subagent}"
+read -r -a ASK_SANDBOX_SUDO <<< "${TERMAG_ASK_SANDBOX_SUDO-sudo -n}"
+
+retire_ask_sandbox() {
+  local f stale=() user=0 root=0
+  for f in "$HOME/.local/bin/termag-subagent-setup" "$HOME/.local/lib/termag/termag-subagent-exec"; do
+    [ -e "$f" ] && stale+=("$f")
+  done
+  id -u "$ASK_SANDBOX_USER" >/dev/null 2>&1 && user=1
+  case $ASK_SANDBOX_ROOT in /|'') ;; *) [ -d "$ASK_SANDBOX_ROOT" ] && root=1 ;; esac
+  if [ "$user" = 1 ] || [ "$root" = 1 ]; then
+    if ! "${ASK_SANDBOX_SUDO[@]}" true >/dev/null 2>&1; then
+      user=0; root=0
+    elif [ "$user" = 1 ] && { ! command -v pgrep >/dev/null 2>&1 || pgrep -u "$ASK_SANDBOX_USER" >/dev/null 2>&1; }; then
+      # A run of the old sandbox is still going; the next reconcile retires it.
+      user=0; root=0
+    fi
+  fi
+  [ "${#stale[@]}" -gt 0 ] || [ "$user" = 1 ] || [ "$root" = 1 ] || return 0
   changed=$((changed + 1))
   if [ "$MODE" = check ]; then
-    printf '%s\n' "$out"
+    for f in "${stale[@]}"; do printf 'STALE: %s (the ask sandbox is gone)\n' "$f"; done
+    [ "$user" = 1 ] && printf 'STALE: user %s (the ask sandbox is gone)\n' "$ASK_SANDBOX_USER"
+    [ "$root" = 1 ] && printf 'STALE: %s (the ask sandbox is gone)\n' "$ASK_SANDBOX_ROOT"
     return 0
   fi
-  if out=$("$setup" 2>&1); then
-    printf 'reconciled: ask sandbox\n%s\n' "$out"
+  for f in "${stale[@]}"; do rm -f -- "$f" && printf 'retired: %s\n' "$f"; done
+  if [ "$root" = 1 ]; then
+    "${ASK_SANDBOX_SUDO[@]}" rm -rf -- "$ASK_SANDBOX_ROOT" && printf 'retired: %s\n' "$ASK_SANDBOX_ROOT" \
+      || printf 'termag-reconcile: could not remove %s\n' "$ASK_SANDBOX_ROOT" >&2
+  fi
+  if [ "$user" = 1 ]; then
+    "${ASK_SANDBOX_SUDO[@]}" userdel "$ASK_SANDBOX_USER" && printf 'retired: user %s\n' "$ASK_SANDBOX_USER" \
+      || printf 'termag-reconcile: could not remove user %s\n' "$ASK_SANDBOX_USER" >&2
+  fi
+}
+
+# The browser pane's guest user:
+# deploy/termag-guest-browser-setup puts termag-guest, its Chromium wrapper,
+# sudoers entry and egress rule in place for this box user. All of it is
+# root's, so it goes through sudo -n like retire_ask_sandbox, and only on a
+# box (the marker the bake writes): a shared host has several box users and
+# no guest mode. Without passwordless sudo it is not reported as drift, since
+# nothing here can fix it; the agent then simply has no guest mode.
+GUEST_BROWSER_BOX_MARKER="${TERMAG_GUEST_BROWSER_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a GUEST_BROWSER_SUDO <<< "${TERMAG_GUEST_BROWSER_SUDO-sudo -n}"
+
+reconcile_guest_browser() {
+  local setup="$DEPLOY/termag-guest-browser-setup" out me
+  [ -f "$setup" ] || return 0
+  [ -f "$GUEST_BROWSER_BOX_MARKER" ] || return 0
+  me=$(id -un)
+  "${GUEST_BROWSER_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${GUEST_BROWSER_SUDO[@]}" bash "$setup" --agent-user "$me" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: guest browser: /'
+    return 0
+  fi
+  if out=$("${GUEST_BROWSER_SUDO[@]}" bash "$setup" --agent-user "$me" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: guest browser: /'
   else
-    printf 'termag-reconcile: the ask sandbox is not ready:\n%s\n' "$out" >&2
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the guest browser setup failed\n' >&2
   fi
 }
 
@@ -323,6 +429,45 @@ reconcile_git_template() {
     else
       printf 'termag-reconcile: failed to install %s\n' "$dest" >&2
     fi
+  done
+}
+
+# Every file of each deploy/claude-plugins/<name>/ except *.test.ts, rendered,
+# into CLAUDE_PLUGINS_DIR/<name>/; a file no longer in the checkout is removed.
+# Rendering on every boot also follows the home rename cloud-init does.
+reconcile_claude_plugins() {
+  local root="$DEPLOY/claude-plugins" plugin name rel src dest tmp
+  [ -d "$root" ] || return 0
+  for plugin in "$root"/*/; do
+    [ -d "$plugin" ] || continue
+    name=$(basename "$plugin")
+    while IFS= read -r -d '' src; do
+      rel=${src#"$plugin"}
+      dest="$CLAUDE_PLUGINS_DIR/$name/$rel"
+      tmp=$(mktemp) || return 0
+      sed "s#@TERMAG_MCP_VERSION_FILE@#$HOME/.config/termag/mcp-connectors.version#g" "$src" > "$tmp"
+      if cmp -s "$tmp" "$dest" 2>/dev/null; then rm -f "$tmp"; continue; fi
+      changed=$((changed + 1))
+      if [ "$MODE" = check ]; then
+        if [ -e "$dest" ]; then printf 'DRIFT: %s differs from %s\n' "$dest" "$src"; else printf 'MISSING: %s (would install from %s)\n' "$dest" "$src"; fi
+      elif mkdir -p "$(dirname "$dest")" && install -m 644 "$tmp" "$dest"; then
+        printf 'reconciled: %s\n' "$dest"
+      else
+        printf 'termag-reconcile: failed to install %s\n' "$dest" >&2
+      fi
+      rm -f "$tmp"
+    done < <(find "$plugin" -type f ! -name '*.test.ts' -print0)
+    [ -d "$CLAUDE_PLUGINS_DIR/$name" ] || continue
+    while IFS= read -r -d '' dest; do
+      rel=${dest#"$CLAUDE_PLUGINS_DIR/$name/"}
+      [ -f "$plugin$rel" ] && [[ "$rel" != *.test.ts ]] && continue
+      changed=$((changed + 1))
+      if [ "$MODE" = check ]; then
+        printf 'STALE: %s (would remove; not in %s)\n' "$dest" "$plugin"
+      elif rm -f "$dest"; then
+        printf 'reconciled: removed %s\n' "$dest"
+      fi
+    done < <(find "$CLAUDE_PLUGINS_DIR/$name" -type f -print0)
   done
 }
 
@@ -406,10 +551,14 @@ $(artifacts)
 EOF
 
 reconcile_claude_config
+reconcile_claude_path_hook
+reconcile_claude_onboarding
 reconcile_cli
-reconcile_subagent
+retire_ask_sandbox
+reconcile_guest_browser
 reconcile_pi_config
 reconcile_git_template
+reconcile_claude_plugins
 
 if [ "$MODE" = check ]; then
   [ "$changed" -eq 0 ] || exit 1

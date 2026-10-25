@@ -505,6 +505,40 @@ got="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["sta
 [ ! -e "$HOME_DIR/.config/.config" ] && [ ! -L "$HOME_DIR/.config/.config" ] \
   || fail 'nothing is linked inside an existing directory' '(no ~/.config/.config)' "$(ls -la "$HOME_DIR/.config" 2>&1)"
 
+# TERMAG_DOTFILES_NO_SCRIPTS: the entrypoint is named and not run, chezmoi is
+# never asked, and the top-level dotfiles are linked as without an entrypoint.
+reset_claim
+cat > "$DOTFILES_SOURCE/install.sh" <<ENTRYEOF
+#!/bin/sh
+printf ran > "$WORK/claim-ran"
+ENTRYEOF
+chmod 755 "$DOTFILES_SOURCE/install.sh"
+printf 'x\n' > "$DOTFILES_SOURCE/.vimrc"
+printf 'x\n' > "$DOTFILES_SOURCE/dot_zshrc"
+(TERMAG_DOTFILES_NO_SCRIPTS=1 run claim > /dev/null 2>&1); got=$?
+[ "$got" = 0 ] || fail 'a claim that runs no scripts succeeds' 0 "$got"
+got="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["state"])' "$CLAIM_STATUS")"
+[ "$got" = succeeded ] || fail 'a claim that runs no scripts reports succeeded' succeeded "$got"
+[ -e "$WORK/claim-ran" ] && fail 'TERMAG_DOTFILES_NO_SCRIPTS does not run the entrypoint' '(not run)' 'ran'
+[ -L "$HOME_DIR/.vimrc" ] || fail 'TERMAG_DOTFILES_NO_SCRIPTS links the top-level dotfiles' '(symlink)' "$(ls -la "$HOME_DIR/.vimrc" 2>&1)"
+grep -q 'not running the entrypoint install.sh' "$HOME_DIR/.termag/on-claim.log" \
+  || fail 'the log says which entrypoint was not run' 'not running the entrypoint install.sh' "$(tail -n 5 "$HOME_DIR/.termag/on-claim.log")"
+reset_claim
+printf 'x\n' > "$DOTFILES_SOURCE/dot_zshrc"
+rm -f "$WORK/chezmoi-asked"
+cat > "$STUB/chezmoi" <<STUBEOF
+#!/bin/sh
+: > "$WORK/chezmoi-asked"
+STUBEOF
+chmod 755 "$STUB/chezmoi"
+(TERMAG_DOTFILES_NO_SCRIPTS=1 run claim > /dev/null 2>&1)
+[ -e "$WORK/chezmoi-asked" ] && fail 'TERMAG_DOTFILES_NO_SCRIPTS never runs chezmoi' '(not run)' 'ran'
+grep -q 'not applying the chezmoi source' "$HOME_DIR/.termag/on-claim.log" \
+  || fail 'the log says the chezmoi source was not applied' 'not applying the chezmoi source' "$(tail -n 5 "$HOME_DIR/.termag/on-claim.log")"
+grep -q 'no top-level dotfiles to link' "$HOME_DIR/.termag/on-claim.log" \
+  || fail 'the log says when there was nothing to link' 'no top-level dotfiles to link' "$(tail -n 5 "$HOME_DIR/.termag/on-claim.log")"
+rm -f "$STUB/chezmoi"
+
 # Leftover .git without HEAD is fetched again.
 reset_claim
 printf 'true\n' > "$DOTFILES_SOURCE/install.sh"
@@ -536,6 +570,154 @@ case "$(cat "$WORK_GIT_LOG")" in
   *'cfg=unset'*) : ;;
   *) fail 'owner-git clone keeps the owner gitconfig' 'cfg=unset' "$(cat "$WORK_GIT_LOG")" ;;
 esac
+
+# ── a chezmoi source tree is applied with chezmoi ───────────────────────────
+# Its targets are `dot_*`, not dotfiles, so the symlink fallback would link
+# only chezmoi's own `.chezmoi*` files into the home.
+
+CHEZMOI_LOG="$WORK/chezmoi-log"
+CHEZMOI_FAIL="$WORK/chezmoi-fail"
+export CHEZMOI_LOG CHEZMOI_FAIL
+cat > "$STUB/chezmoi" <<'STUBEOF'
+#!/bin/sh
+printf 'args=%s\n' "$*" >> "$CHEZMOI_LOG"
+printf 'claim=%s email=%s stdin=%s\n' "${TERMAG_IS_CLAIM:-unset}" "${TERMAG_OWNER_EMAIL:-unset}" \
+  "$(readlink /proc/self/fd/0)" >> "$CHEZMOI_LOG"
+[ ! -e "$CHEZMOI_FAIL" ] || { echo 'chezmoi: error calling promptStringOnce: EOF'; exit 1; }
+src="$HOME/.local/share/chezmoi"
+prev=
+for arg in "$@"; do
+  [ "$prev" = --source ] && src=$arg
+  prev=$arg
+done
+[ ! -f "$src/dot_zshrc" ] || cp "$src/dot_zshrc" "$HOME/.zshrc"
+STUBEOF
+chmod 755 "$STUB/chezmoi"
+
+reset_chezmoi() {
+  reset_claim
+  rm -rf "$HOME_DIR/.local" "$HOME_DIR/.zshrc" "$HOME_DIR/.chezmoiignore"
+  rm -f "$CHEZMOI_LOG" "$CHEZMOI_FAIL"
+  printf 'export FROM=chezmoi\n' > "$DOTFILES_SOURCE/dot_zshrc"
+  printf 'README.md\n' > "$DOTFILES_SOURCE/.chezmoiignore"
+}
+
+reset_chezmoi
+printf 'baked\n' > "$HOME_DIR/.zshrc"
+run claim > /dev/null 2>&1; got=$?
+[ "$got" = 0 ] || fail 'a chezmoi repo applies' 0 "$got"
+got="$(jpy "$CLAIM_STATUS" 'd["state"]')"
+[ "$got" = succeeded ] || fail 'a chezmoi repo reports succeeded' succeeded "$got"
+case "$(cat "$CHEZMOI_LOG" 2>/dev/null)" in
+  *'args=init --apply --no-tty --promptDefaults'*) : ;;
+  *) fail 'chezmoi runs init --apply unattended' 'init --apply --no-tty --promptDefaults' "$(cat "$CHEZMOI_LOG" 2>/dev/null)" ;;
+esac
+case "$(cat "$CHEZMOI_LOG")" in
+  *--force*) fail 'chezmoi never overwrites an edited file' '(no --force)' "$(cat "$CHEZMOI_LOG")" ;;
+esac
+case "$(cat "$CHEZMOI_LOG")" in
+  *'claim=1 email=ada@example.com stdin=/dev/null'*) : ;;
+  *) fail 'chezmoi gets the claim env and no terminal' 'claim=1 email=ada@example.com stdin=/dev/null' "$(cat "$CHEZMOI_LOG")" ;;
+esac
+[ "$(cat "$HOME_DIR/.zshrc")" = 'export FROM=chezmoi' ] \
+  || fail 'chezmoi writes its targets' 'export FROM=chezmoi' "$(cat "$HOME_DIR/.zshrc")"
+got="$(readlink "$HOME_DIR/.local/share/chezmoi")"
+[ "$got" = "$HOME_DIR/.dotfiles" ] || fail "chezmoi's source directory is the clone" "$HOME_DIR/.dotfiles" "$got"
+[ -e "$HOME_DIR/.chezmoiignore" ] || [ -L "$HOME_DIR/.chezmoiignore" ] \
+  && fail 'a chezmoi repo is not symlinked into the home' '(no ~/.chezmoiignore)' 'linked'
+case "$(cat "$CHEZMOI_LOG")" in
+  *--source*) fail 'the default source directory needs no --source' '(no --source)' "$(cat "$CHEZMOI_LOG")" ;;
+esac
+# Applied once per commit, like an entrypoint.
+run claim > /dev/null 2>&1
+got="$(grep -c '^args=' "$CHEZMOI_LOG")"
+[ "$got" = 1 ] || fail 'an applied chezmoi checkout is not applied again' 1 "$got"
+
+# Each marker on its own: .chezmoiroot (source state in a subdirectory) and an
+# attribute-prefixed target, with no .chezmoiignore.
+for marker in .chezmoiroot private_dot_ssh executable_dot_local_bin_x; do
+  reset_chezmoi
+  rm -f "$DOTFILES_SOURCE/.chezmoiignore" "$DOTFILES_SOURCE/dot_zshrc"
+  : > "$DOTFILES_SOURCE/$marker"
+  run claim > /dev/null 2>&1
+  grep -q '^args=init' "$CHEZMOI_LOG" 2>/dev/null \
+    || fail "$marker marks a chezmoi repo" 'chezmoi ran' '(not run)'
+done
+
+# A name that only contains dot_ is not a chezmoi target.
+reset_claim
+rm -f "$CHEZMOI_LOG"
+printf 'x\n' > "$DOTFILES_SOURCE/.vimrc"
+: > "$DOTFILES_SOURCE/notes_dot_txt"
+run claim > /dev/null 2>&1
+[ -e "$CHEZMOI_LOG" ] && fail 'a plain dotfiles repo does not run chezmoi' '(not run)' "$(cat "$CHEZMOI_LOG")"
+[ -L "$HOME_DIR/.vimrc" ] || fail 'a plain dotfiles repo is still linked' '(symlink)' "$(ls -la "$HOME_DIR/.vimrc" 2>&1)"
+
+# An entrypoint wins: chezmoi's own docs ship an install.sh that runs chezmoi.
+reset_chezmoi
+printf 'printf ran > %s\n' "$WORK/claim-ran" > "$DOTFILES_SOURCE/install.sh"
+run claim > /dev/null 2>&1
+[ -f "$WORK/claim-ran" ] || fail 'an entrypoint in a chezmoi repo runs' 'ran' '(not run)'
+[ -e "$CHEZMOI_LOG" ] && fail 'an entrypoint in a chezmoi repo replaces chezmoi' '(not run)' "$(cat "$CHEZMOI_LOG")"
+
+# A source directory the owner already has is kept, and the clone is named.
+reset_chezmoi
+mkdir -p "$HOME_DIR/.local/share/chezmoi"
+: > "$HOME_DIR/.local/share/chezmoi/theirs"
+run claim > /dev/null 2>&1; got=$?
+[ "$got" = 0 ] || fail 'an existing chezmoi source directory still applies' 0 "$got"
+[ -f "$HOME_DIR/.local/share/chezmoi/theirs" ] && [ ! -L "$HOME_DIR/.local/share/chezmoi" ] \
+  || fail 'an existing chezmoi source directory is kept' '(real dir)' "$(ls -la "$HOME_DIR/.local/share" 2>&1)"
+case "$(cat "$CHEZMOI_LOG")" in
+  *"--source $HOME_DIR/.dotfiles"*) : ;;
+  *) fail 'chezmoi is pointed at the clone' "--source $HOME_DIR/.dotfiles" "$(cat "$CHEZMOI_LOG")" ;;
+esac
+
+# A prompt with no default fails the run, and the commit stays unapplied so
+# a later rerun tries again.
+reset_chezmoi
+touch "$CHEZMOI_FAIL"
+run claim > /dev/null 2>&1; got=$?
+[ "$got" != 0 ] || fail 'a failed chezmoi apply fails the claim' 'non-zero' "$got"
+got="$(jpy "$CLAIM_STATUS" 'd["state"] + " " + d["reason"]')"
+[ "$got" = 'failed script-failed' ] || fail 'a failed chezmoi apply is a script failure' 'failed script-failed' "$got"
+[ -e "$HOME_DIR/.termag/dotfiles-applied" ] \
+  && fail 'a failed chezmoi apply is not recorded as applied' '(no marker)' "$(cat "$HOME_DIR/.termag/dotfiles-applied")"
+grep -q 'run `chezmoi init --apply` on the box' "$HOME_DIR/.termag/on-claim.log" \
+  || fail 'a failed chezmoi apply says what to do' 'chezmoi init --apply hint' "$(tail -3 "$HOME_DIR/.termag/on-claim.log")"
+
+# No chezmoi anywhere: the pinned release is fetched and digest-checked, and
+# a download that does not match is never installed.
+mv "$STUB/chezmoi" "$WORK/chezmoi-parked"
+CURL_LOG="$WORK/curl-log"; export CURL_LOG
+cat > "$STUB/curl" <<'STUBEOF'
+#!/bin/sh
+out=
+prev=
+for arg in "$@"; do
+  [ "$prev" = -o ] && out=$arg
+  prev=$arg
+done
+printf '%s\n' "$*" >> "$CURL_LOG"
+printf 'not chezmoi\n' > "$out"
+STUBEOF
+chmod 755 "$STUB/curl"
+if ! command -v chezmoi > /dev/null 2>&1; then
+  reset_chezmoi
+  rm -f "$CURL_LOG"
+  run claim > /dev/null 2>&1; got=$?
+  [ "$got" != 0 ] || fail 'a chezmoi that fails its digest fails the claim' 'non-zero' "$got"
+  grep -qE 'releases/download/v[0-9.]+/chezmoi_[0-9.]+_linux_(arm64|amd64)\.tar\.gz' "$CURL_LOG" 2>/dev/null \
+    || fail 'the pinned chezmoi release is fetched' 'a linux release URL' "$(cat "$CURL_LOG" 2>/dev/null)"
+  [ -e "$HOME_DIR/.local/bin/chezmoi" ] \
+    && fail 'a chezmoi that fails its digest is not installed' '(no binary)' 'installed'
+  grep -q 'digest mismatch' "$HOME_DIR/.termag/on-claim.log" \
+    || fail 'a digest mismatch is logged' 'digest mismatch' "$(tail -3 "$HOME_DIR/.termag/on-claim.log")"
+else
+  echo 'SKIP: chezmoi download test (chezmoi is on PATH)'
+fi
+rm -f "$STUB/curl"
+mv "$WORK/chezmoi-parked" "$STUB/chezmoi"
 
 # ── the runner never touches the user manager ───────────────────────────────
 # It is started by one; starting or stopping units from inside it would be a

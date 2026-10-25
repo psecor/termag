@@ -9,7 +9,7 @@
 # config, the Claude Code status hooks and a started unit; an existing account
 # is reused; a config this script wrote is replaced with the new token. The
 # hooks' termag-status is a symlink into the image (so it can't go stale), and a
-# settings.json the user already has is never touched. When the user manager
+# settings.json the user already has only gains the SessionStart PATH hook. When the user manager
 # won't start (user@.service requires termag-imds-guard.service), or the
 # guard's rules won't reload before the agent restarts, it fails without
 # starting the agent. Without host storage (no ready file, or /home not the
@@ -40,7 +40,7 @@ DEPLOYDIR="$ROOTDIR/usr/local/lib/termag"
 mkdir -p "$STUB" "$WORK/users" "$ROOTDIR/home" "$DEPLOYDIR"
 printf '#!/bin/sh\necho status\n' >"$DEPLOYDIR/termag-status"
 chmod 755 "$DEPLOYDIR/termag-status"
-printf '{"hooks":{"Stop":[]}}\n' >"$DEPLOYDIR/claude-settings.json"
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"$HOME/.local/bin/termag-status\" session-start"}]}],"Stop":[]}}' >"$DEPLOYDIR/claude-settings.json"
 LOG="$WORK/calls.log"
 
 # Accounts are files in $WORK/users holding the uid.
@@ -189,7 +189,20 @@ run "$TOKEN2" alice
 [ "$rc" -eq 0 ] || fail "rerun: succeeds" "exit 0" "exit $rc ($out)"
 grep -q '^useradd' "$LOG" && fail "rerun: account reused" "no useradd" "$(tr '\n' ';' <"$LOG")"
 grep -q "\"token\": \"$TOKEN2\"" "$cfg" || fail "rerun: token replaced" "$TOKEN2" "$(cat "$cfg")"
-grep -q '"mine":true' "$settings" || fail "rerun: user's settings.json untouched" '{"mine":true}' "$(cat "$settings")"
+got="$(jq -c '[.mine, .hooks.SessionStart[0].hooks[0].command]' "$settings" 2>&1)"
+[ "$got" = '[true,"\"$HOME/.local/bin/termag-status\" session-start"]' ] \
+  || fail "rerun: user's settings.json kept, plus the SessionStart PATH hook" '[true,"…session-start"]' "$got"
+# An entry without a command (a prompt hook) doesn't stop the merge.
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"prompt","prompt":"p"}]}]}}' >"$settings"
+run "$TOKEN2" alice
+got="$(jq -c '.hooks.SessionStart | length' "$settings" 2>&1)"
+[ "$got" = 2 ] || fail "rerun: appends next to a command-less SessionStart entry" 2 "$got"
+# A file that already has it, or that jq cannot parse, is left byte for byte.
+for before in '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"~/.local/bin/termag-status session-start"}]}]},"mine":1}' 'not json'; do
+  printf '%s\n' "$before" >"$settings"
+  run "$TOKEN2" alice
+  [ "$(cat "$settings")" = "$before" ] || fail "rerun: settings.json untouched ($before)" "$before" "$(cat "$settings")"
+done
 [ -L "$status" ] && [ "$(readlink "$status")" = "$DEPLOYDIR/termag-status" ] \
   || fail "rerun: stale termag-status copy replaced by the link" "symlink" "$(ls -l "$status" 2>&1)"
 

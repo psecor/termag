@@ -292,17 +292,23 @@ sudo sshd -t
 sudo loginctl enable-linger termag
 
 # ─────────────────────────────────────────────────────────────────────────────
-# nvm + Node LTS + corepack (yarn/pnpm) + the npm-based agent CLIs.
+# nvm + Node + corepack (yarn/pnpm) + the npm-based agent CLIs.
 # nvm-only: there is no system Node. The agent's shared launcher resolves the
 # default or a working installed Node. corepack provides yarn + pnpm.
+# Node is PINNED so each image's version is known (a floating --lts silently
+# decided whether a bake had a security fix, CVE-2026-111497). Bump it for
+# Node security releases; only a full bake installs it (refresh-box.sh keeps
+# the source image's Node).
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<'NVM_INSTALL'
 set -euo pipefail
+NODE_VERSION=24.22.1
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh"
-nvm install --lts
-nvm alias default 'lts/*'
+nvm install "$NODE_VERSION"
+nvm alias default "$NODE_VERSION"
+[ "$(node -v)" = "v$NODE_VERSION" ] || { echo "[packer] node is $(node -v), not the pinned v$NODE_VERSION -- failing build"; exit 1; }
 corepack enable
 corepack prepare yarn@stable --activate
 corepack prepare pnpm@latest --activate
@@ -316,6 +322,63 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
 command -v pi >/dev/null || { echo "[packer] pi missing after npm install -g -- failing build"; exit 1; }
 [ "$(pi --version 2>/dev/null)" = "1.0.2" ] || { echo "[packer] pi is not the pinned 1.0.2 -- failing build"; exit 1; }
 NVM_INSTALL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Playwright (pinned) + its Chromium, headless shell and ffmpeg, so an agent can
+# record a page with `recordVideo` (.webm through Playwright's own ffmpeg) or a
+# trace with no per-run download. The snap Chromium above has no ffmpeg and
+# Playwright does not drive it.
+#
+# The library lives outside nvm, in /opt/playwright, so it survives a Node
+# upgrade, and NODE_PATH points there so `require('playwright')` resolves from
+# any directory (NODE_PATH is a fallback: a project's own node_modules wins;
+# ESM `import` ignores it, see packer/README.md). The browsers go to the shared
+# /opt/ms-playwright named by PLAYWRIGHT_BROWSERS_PATH. That dir is owned by
+# termag (the uid follows the rename to the box owner), so a project pinning
+# another Playwright can still `npx playwright install` its own revision there.
+#
+# Bump PLAYWRIGHT_VERSION alone: install picks the browser revisions that
+# version expects. Re-runnable: npm and `playwright install` skip what exists.
+# ─────────────────────────────────────────────────────────────────────────────
+PLAYWRIGHT_VERSION=1.64.1
+PLAYWRIGHT_PREFIX=/opt/playwright
+PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+sudo install -d -m 0755 "$PLAYWRIGHT_PREFIX"
+sudo install -d -m 0755 -o termag -g termag "$PLAYWRIGHT_BROWSERS_PATH"
+sudo -u termag -H env PLAYWRIGHT_VERSION="$PLAYWRIGHT_VERSION" PLAYWRIGHT_PREFIX="$PLAYWRIGHT_PREFIX" \
+        PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" bash <<'PLAYWRIGHT_INSTALL'
+set -euo pipefail
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+# The library and the system libraries Chromium needs as root, with termag's
+# Node (there is no system Node); then the browsers as termag.
+sudo env "PATH=$PATH" npm install --prefix "$PLAYWRIGHT_PREFIX" --no-fund --no-audit "playwright@${PLAYWRIGHT_VERSION}"
+cli="$PLAYWRIGHT_PREFIX/node_modules/playwright/cli.js"
+sudo env "PATH=$PATH" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" node "$cli" install-deps chromium
+node "$cli" install chromium ffmpeg
+[ "$(node "$cli" --version)" = "Version ${PLAYWRIGHT_VERSION}" ] \
+    || { echo "[packer] playwright is not the pinned ${PLAYWRIGHT_VERSION} -- failing build"; exit 1; }
+ls -d "$PLAYWRIGHT_BROWSERS_PATH"/chromium-* "$PLAYWRIGHT_BROWSERS_PATH"/ffmpeg-* >/dev/null \
+    || { echo "[packer] playwright chromium/ffmpeg missing from $PLAYWRIGHT_BROWSERS_PATH -- failing build"; exit 1; }
+PLAYWRIGHT_INSTALL
+sudo chmod -R a+rX "$PLAYWRIGHT_PREFIX" "$PLAYWRIGHT_BROWSERS_PATH"
+sudo ln -sfn "$PLAYWRIGHT_PREFIX/node_modules/playwright/cli.js" /usr/local/bin/playwright
+# The environment, for every way a process starts on a box:
+#   /etc/environment           pam_env: ssh, SSM sessions, su, sudo, console login
+#   /etc/environment.d/*.conf  the systemd --user manager, so termag-agent.service
+#                              and everything it spawns (panes, `termag ask` runs)
+#   /etc/zsh/zshenv            every zsh, login or not, interactive or not
+# Each write replaces its own lines, so a re-run leaves one copy.
+playwright_env="PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH
+NODE_PATH=$PLAYWRIGHT_PREFIX/node_modules"
+sudo install -d -m 0755 /etc/environment.d
+printf '%s\n' "$playwright_env" | sudo tee /etc/environment.d/60-playwright.conf >/dev/null
+sudo chmod 0644 /etc/environment.d/60-playwright.conf
+sudo sed -i '/^PLAYWRIGHT_BROWSERS_PATH=/d; /^NODE_PATH=/d' /etc/environment
+printf '%s\n' "$playwright_env" | sudo tee -a /etc/environment >/dev/null
+sudo sed -i '/# playwright (packer\/scripts\/setup.sh)$/d; /^export PLAYWRIGHT_BROWSERS_PATH=/d; /^export NODE_PATH=/d' /etc/zsh/zshenv
+printf '# playwright (packer/scripts/setup.sh)\n%s\n' "$(printf '%s\n' "$playwright_env" | sed 's/^/export /')" \
+    | sudo tee -a /etc/zsh/zshenv >/dev/null
 
 # ─────────────────────────────────────────────────────────────────────────────
 # goenv + Go (1.26.1) + telemetry off
@@ -613,6 +676,7 @@ EOF
 . /var/lib/termag-bake/box-lib.sh
 install_deploy_artifacts
 install_box_marker
+install_guest_browser
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code status hooks. termag tracks working/waiting/idle state via hooks

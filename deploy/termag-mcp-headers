@@ -1,0 +1,13 @@
+#!/bin/sh
+# termag-mcp-headers -- Claude Code's headersHelper for the MCP servers termag
+# delivers. Prints this box's agent token as an
+# Authorization header, read from the agent config each time; nothing is
+# stored. The MCP broker checks it with the orchestrator on every request and
+# replaces it with the connector's own credential before the upstream.
+#
+# Usage (from Claude Code): termag-mcp-headers <agent.config.json>
+config=${1:-}
+[ -n "$config" ] || { echo 'termag-mcp-headers: no agent config given' >&2; exit 1; }
+token=$(jq -r '.token // empty' "$config" 2>/dev/null)
+[ -n "$token" ] || { echo "termag-mcp-headers: no agent token in $config" >&2; exit 1; }
+jq -cn --arg t "$token" '{Authorization: "Bearer \($t)"}'

@@ -1,0 +1,27 @@
+#!/usr/sbin/nft -f
+# Keeps the browser pane's guest Chromium to
+# one kind of traffic: TCP to the agent's per-pane proxies on
+# 127.0.0.1:47100-47131. Everything else the termag-guest user sends is
+# rejected: UDP (WebRTC, QUIC, DNS), IPv6, every other loopback port, the VPC,
+# the internet and instance metadata.
+#
+# The proxies run as the agent user and hold each share's origins. The range
+# is reserved (termag-guest-browser.sysctl), so no other listener is given a
+# port in it for port 0. This table
+# is what still holds when Chromium itself sends around them: in review, page
+# JS sent WebRTC UDP straight past --proxy-server, and the command-line flag
+# meant to stop that did not. Loaded at boot by termag-guest-browser.service.
+#
+# A table of its own, so Docker's iptables rules and this never touch each
+# other. The empty declaration makes the delete safe on first load; the whole
+# file is one transaction, so a reload never leaves a gap.
+table inet termag_guest
+delete table inet termag_guest
+
+table inet termag_guest {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid "termag-guest" ip daddr 127.0.0.1 tcp dport 47100-47131 accept
+    meta skuid "termag-guest" counter reject
+  }
+}

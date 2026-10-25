@@ -359,10 +359,25 @@ RID=huuhcqcev124emZ9urmRjjPSNXLl
 got="$(run telemetry-launch "$RID")"; code=$?
 want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,service.name=termag-claude-session,termag.box=$BOX,termag.replay.id=$RID\"}}"
 [ "$code" = 0 ] && [ "$got" = "$want" ] || fail 'telemetry-launch repeats the resource with the replay session id' "$want" "$code $got"
-for bad in '' short 'huuhcqcev124emZ9urmRjjPSNXLl;id' 'huuhcqcev124emZ9urmRjjPSNXLl huuhcqcev124emZ9urmRjjPSNXLl' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
+for bad in '' - short 'huuhcqcev124emZ9urmRjjPSNXLl;id' 'huuhcqcev124emZ9urmRjjPSNXLl huuhcqcev124emZ9urmRjjPSNXLl' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
   got="$(run telemetry-launch "$bad")"; code=$?
   [ "$code" = 0 ] && [ "$got" = '{}' ] || fail "telemetry-launch prints {} for an id that is not 20-64 letters and digits: '$bad'" '{}' "$code $got"
 done
+# The pane's project and workstream ride in from the environment, with or
+# without a replay; a name that is not an id drops the pair, never the launch.
+got="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=feature-x run telemetry-launch "$RID")"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=feature-x,termag.replay.id=$RID\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch adds the project and workstream before the replay' "$want" "$got"
+got="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=main\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch with - as the id adds the project and workstream alone' "$want" "$got"
+for pair in 'gon falon:main' 'webapp:' ':main' 'webapp:ws,x=y' "$(printf 'a%.0s' $(seq 65)):main"; do
+  got="$(TERMAG_PROJECT="${pair%%:*}" TERMAG_WORKSTREAM="${pair#*:}" run telemetry-launch "$RID")"
+  want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,service.name=termag-claude-session,termag.box=$BOX,termag.replay.id=$RID\"}}"
+  [ "$got" = "$want" ] || fail "telemetry-launch drops a project/workstream pair that is not two ids ($pair), keeps the replay" "$want" "$got"
+done
+got="$(TERMAG_PROJECT='gon falon' TERMAG_WORKSTREAM=main run telemetry-launch -)"
+[ "$got" = '{}' ] || fail 'telemetry-launch with nothing valid to add prints {}' '{}' "$got"
 
 for bad in '{"env":{"OTEL_LOG_USER_PROMPTS":"1","OTEL_EXPORTER_OTLP_ENDPOINT":"https://otel.example.test"}}' \
            '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=x","OTEL_EXPORTER_OTLP_ENDPOINT":"https://otel.example.test"}}' \
@@ -473,11 +488,307 @@ run remove agent-telemetry </dev/null 2>/dev/null
 got="$(jq -c . "$CH")"
 [ "$got" = '{"version":1,"hooks":{}}' ] || fail 'remove leaves an empty hooks file behind it' '{"version":1,"hooks":{}}' "$got"
 
+# ── MCP servers ─────────────────────────────────────────────────────────────
+CJ="$H/.claude.json"; MSTATE="$H/.config/termag/mcp.json"; MVER="$H/.config/termag/mcp-connectors.version"
+MCPHELPER="'$(dirname "$SCRIPT")/termag-mcp-headers' '$CONFIG'"
+# Claude Code's own config: other keys, the owner's own server, and one named
+# like a connector, which stays theirs.
+printf '{"numStartups":3,"projects":{"/x":{}},"mcpServers":{"metaterm":{"command":"m"},"jira":{"type":"http","url":"https://mine.example/mcp"}}}' > "$CJ"
+chmod 600 "$CJ"
+# A first delivery of no connectors changes nothing a session reads: no version.
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | run apply mcp 2>/dev/null
+[ ! -e "$MVER" ] || fail 'apply mcp of no connectors over none does not bump the version' 'absent' 'present'
+MCP='{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"},{"id":"c2abc","name":"jira"}]}'
+printf '%s' "$MCP" | run apply mcp 2>"$WORK/mcp.err"; got=$?
+[ "$got" = 0 ] || fail 'apply mcp succeeds' 0 "$got: $(cat "$WORK/mcp.err")"
+got="$(jq -c '.mcpServers.figma' "$CJ")"
+want="$(jq -cn --arg h "$MCPHELPER" '{type:"http",url:"https://mcp-broker.example.test/c/c1abc",headersHelper:$h}')"
+[ "$got" = "$want" ] || fail 'apply mcp writes the connector entry, pointed at the broker with the headers helper' "$want" "$got"
+got="$(jq -c '[.numStartups, .projects, .mcpServers.metaterm, .mcpServers.jira]' "$CJ")"
+[ "$got" = '[3,{"/x":{}},{"command":"m"},{"type":"http","url":"https://mine.example/mcp"}]' ] \
+  || fail "apply mcp keeps the other keys and the owner's same-named server" 'unchanged' "$got"
+grep -q 'left your own MCP server jira' "$WORK/mcp.err" || fail 'apply mcp says it left the owner'"'"'s jira' 'a note' "$(cat "$WORK/mcp.err")"
+got="$(jq -c 'keys' "$MSTATE")"
+[ "$got" = '["figma"]' ] || fail 'apply mcp records only what it wrote' '["figma"]' "$got"
+got="$(stat -c %a "$CJ")"
+[ "$got" = 600 ] || fail 'apply mcp keeps ~/.claude.json mode' 600 "$got"
+! grep -q "$BOX_TOKEN" "$CJ" || fail 'the box token is never written to ~/.claude.json' 'absent' 'present'
+[ -s "$MVER" ] || fail 'apply mcp writes the version file' 'present' 'absent'
+v1="$(cat "$MVER")"
+got="$(HOME="$H" sh "$(dirname "$SCRIPT")/termag-mcp-headers" "$CONFIG")"
+[ "$got" = "{\"Authorization\":\"Bearer $BOX_TOKEN\"}" ] || fail 'termag-mcp-headers prints the box token as a Bearer header' 'Authorization: Bearer …' "$got"
+# A repeat is a no-op: same file, same version.
+cp "$CJ" "$WORK/cj.before"
+ino="$(ls -i "$CJ" | awk '{print $1}')"
+printf '%s' "$MCP" | run apply mcp 2>/dev/null
+cmp -s "$CJ" "$WORK/cj.before" || fail 'a repeated apply mcp leaves ~/.claude.json alone' 'unchanged' 'changed'
+# Not even rewritten with the same bytes: Claude Code polls the file's stat.
+[ "$(ls -i "$CJ" | awk '{print $1}')" = "$ino" ] || fail 'a repeated apply mcp does not rewrite ~/.claude.json' "inode $ino" 'a new file'
+[ "$(cat "$MVER")" = "$v1" ] || fail 'a repeated apply mcp does not bump the version' "$v1" "$(cat "$MVER")"
+# Claude Code rewrites the file in its own layout; the same servers are still no change.
+jq -c . "$CJ" > "$CJ.t" && cat "$CJ.t" > "$CJ" && rm -f "$CJ.t"
+ino="$(ls -i "$CJ" | awk '{print $1}')"
+printf '%s' "$MCP" | run apply mcp 2>/dev/null
+[ "$(ls -i "$CJ" | awk '{print $1}')" = "$ino" ] || fail 'apply mcp over a reformatted ~/.claude.json with the same servers writes nothing' "inode $ino" 'a new file'
+[ "$(cat "$MVER")" = "$v1" ] || fail 'apply mcp over a reformatted ~/.claude.json does not bump the version' "$v1" "$(cat "$MVER")"
+got="$(run status | grep '^mcp')"
+[ "$got" = 'mcp: on, figma through the termag MCP broker (https://mcp-broker.example.test)' ] || fail 'mcp status names the servers and broker' 'mcp: on, figma …' "$got"
+# A new connector is added and the version bumped; a dropped one is removed.
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c3abc","name":"linear"}]}' | run apply mcp 2>/dev/null
+got="$(jq -c '.mcpServers | keys' "$CJ")"
+[ "$got" = '["jira","linear","metaterm"]' ] || fail 'apply mcp drops a removed connector and adds a new one' '["jira","linear","metaterm"]' "$got"
+[ "$(cat "$MVER")" != "$v1" ] || fail 'a changed connector set bumps the version' 'a new version' "$v1"
+# An entry the owner edited is no longer ours: remove leaves it.
+jq '.mcpServers.linear.url = "https://elsewhere.example/mcp"' "$CJ" > "$WORK/cj" && cp "$WORK/cj" "$CJ"
+got="$(run status | grep '^mcp')"
+case "$got" in 'mcp: NOT WORKING: '*'linear'*) : ;; *) fail 'mcp status notices an entry that changed under it' 'mcp: NOT WORKING: … linear …' "$got" ;; esac
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c3abc","name":"linear"},{"id":"c4abc","name":"notion"}]}' | run apply mcp 2>/dev/null
+v2="$(cat "$MVER")"
+printf '{"reason":"MCP connectors through termag are not enabled for you"}' | run remove mcp 2>/dev/null
+got="$(jq -c '[(.mcpServers | keys), .numStartups]' "$CJ")"
+[ "$got" = '[["jira","linear","metaterm"],3]' ] || fail "remove mcp takes out only termag's entries" '[["jira","linear","metaterm"],3]' "$got"
+[ ! -e "$MSTATE" ] || fail 'remove mcp deletes its record' 'absent' 'present'
+[ "$(cat "$MVER")" != "$v2" ] || fail 'remove mcp bumps the version' 'a new version' "$v2"
+got="$(run status | grep '^mcp')"
+[ "$got" = 'mcp: off: MCP connectors through termag are not enabled for you' ] || fail "mcp status repeats the orchestrator's reason" 'mcp: off: …' "$got"
+# Bad deliveries are refused and change nothing.
+cp "$CJ" "$WORK/cj.before"
+for bad in '{"broker":"http://x","connectors":[]}' '{"broker":"https://x","connectors":[{"id":"C1","name":"a"}]}' \
+           '{"broker":"https://x","connectors":[{"id":"c1","name":"a"},{"id":"c2","name":"a"}]}' \
+           '{"broker":"https://x","connectors":[{"id":"c1","name":"a b"}]}' '{"broker":"https://x/../y","connectors":[]}'; do
+  printf '%s' "$bad" | run apply mcp >/dev/null 2>&1 && fail "apply mcp refuses $bad" 'non-zero exit' 0
+done
+cmp -s "$CJ" "$WORK/cj.before" || fail 'a refused mcp delivery leaves ~/.claude.json alone' 'unchanged' 'changed'
+# No ~/.claude.json yet: one holding only termag's entry.
+rm -f "$CJ"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"}]}' | run apply mcp 2>/dev/null
+got="$(jq -c '[(.mcpServers | keys), (keys)]' "$CJ" 2>&1)"
+[ "$got" = '[["figma"],["mcpServers"]]' ] || fail 'apply mcp creates ~/.claude.json when there is none' '[["figma"],["mcpServers"]]' "$got"
+run remove mcp </dev/null 2>/dev/null
+got="$(jq -c . "$CJ")"
+[ "$got" = '{}' ] || fail 'remove mcp leaves an empty object' '{}' "$got"
+
+# The termag-mcp-refresh mod, once termag-reconcile has installed it, is named
+# in CLAUDE_CODE_PLUGIN_DIRS beside any folder of the owner's.
+PD="$H/.local/share/termag/claude-plugins/termag-mcp-refresh"
+cp "$CS" "$WORK/cs.saved" 2>/dev/null || true
+printf '{"model":"opus","env":{"FOO":"1","CLAUDE_CODE_PLUGIN_DIRS":"/opt/mine"}}' > "$CS"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | run apply mcp 2>"$WORK/mcp.err"
+got="$(jq -c . "$CS")"
+[ "$got" = '{"model":"opus","env":{"FOO":"1","CLAUDE_CODE_PLUGIN_DIRS":"/opt/mine"}}' ] \
+  || fail 'apply mcp leaves CLAUDE_CODE_PLUGIN_DIRS alone while the mod is not installed' 'unchanged' "$got"
+grep -q 'no termag-mcp-refresh mod' "$WORK/mcp.err" || fail 'apply mcp says the mod is missing' 'a note' "$(cat "$WORK/mcp.err")"
+mkdir -p "$PD/.claude-plugin" && echo '{}' > "$PD/.claude-plugin/plugin.json"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | run apply mcp 2>/dev/null
+got="$(jq -c . "$CS")"
+want="$(jq -cn --arg d "/opt/mine:$PD" '{model:"opus",env:{FOO:"1",CLAUDE_CODE_PLUGIN_DIRS:$d}}')"
+[ "$got" = "$want" ] || fail "apply mcp adds the mod to CLAUDE_CODE_PLUGIN_DIRS after the owner's folder" "$want" "$got"
+cp "$CS" "$WORK/cs.before"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | run apply mcp 2>/dev/null
+cmp -s "$CS" "$WORK/cs.before" || fail 'a repeated apply mcp leaves settings.json alone' 'unchanged' "$(jq -c . "$CS")"
+run remove mcp </dev/null 2>/dev/null
+got="$(jq -c . "$CS")"
+[ "$got" = '{"model":"opus","env":{"FOO":"1","CLAUDE_CODE_PLUGIN_DIRS":"/opt/mine"}}' ] \
+  || fail "remove mcp takes the mod out and keeps the owner's folder" '/opt/mine only' "$got"
+printf '{"model":"opus"}' > "$CS"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | run apply mcp 2>/dev/null
+got="$(jq -r '.env.CLAUDE_CODE_PLUGIN_DIRS' "$CS")"
+[ "$got" = "$PD" ] || fail 'apply mcp sets CLAUDE_CODE_PLUGIN_DIRS when there is none' "$PD" "$got"
+run remove mcp </dev/null 2>/dev/null
+got="$(jq -c . "$CS")"
+[ "$got" = '{"model":"opus"}' ] || fail 'remove mcp leaves no empty env behind' '{"model":"opus"}' "$got"
+rm -rf "$PD"
+if [ -s "$WORK/cs.saved" ]; then cp "$WORK/cs.saved" "$CS"; else rm -f "$CS"; fi
+
+# Claude Code writes ~/.claude.json between termag's read and its write: the
+# merge runs again on the new file instead of reverting that write. The jq stub
+# makes the write right after the first merge.
+printf '{"numStartups":3}' > "$CJ"
+REALJQ="$(command -v jq)"
+cat > "$STUB/jq" <<STUBEOF
+#!/bin/sh
+"$REALJQ" "\$@"; rc=\$?
+case "\$*" in *'--slurpfile d'*)
+  if [ ! -e "$WORK/claude-wrote" ]; then : > "$WORK/claude-wrote"; printf '{"numStartups":4,"tipsShown":1}' > "$CJ"; fi ;;
+esac
+exit \$rc
+STUBEOF
+chmod 755 "$STUB/jq"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"}]}' | run apply mcp 2>"$WORK/mcp.err"; got=$?
+rm -f "$STUB/jq"
+[ -e "$WORK/claude-wrote" ] || fail 'the jq stub wrote ~/.claude.json mid-merge' 'written' 'not written'
+got="$(jq -c '[.numStartups, .tipsShown, (.mcpServers | keys)]' "$CJ")"
+[ "$got" = '[4,1,["figma"]]' ] || fail 'apply mcp keeps a write Claude Code made during the merge' '[4,1,["figma"]]' "$got $(cat "$WORK/mcp.err")"
+
+# Another writer holds termag's lock: apply waits for it, and gives up unchanged.
+if command -v flock >/dev/null 2>&1; then
+  run remove mcp </dev/null 2>/dev/null
+  cp "$CJ" "$WORK/cj.before"
+  flock "$H/.config/termag/claude-json.lock" sleep 3 &
+  holder=$!
+  sleep 0.5
+  export TERMAG_MCP_LOCK_WAIT=1
+  printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"}]}' | run apply mcp 2>"$WORK/mcp.err"; got=$?
+  unset TERMAG_MCP_LOCK_WAIT
+  [ "$got" != 0 ] || fail 'apply mcp gives up while another writer holds the lock' 'non-zero exit' 0
+  cmp -s "$CJ" "$WORK/cj.before" || fail 'apply mcp that gave up on the lock leaves ~/.claude.json alone' 'unchanged' 'changed'
+  printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"}]}' | run apply mcp 2>"$WORK/mcp.err"; got=$?
+  [ "$got" = 0 ] || fail 'apply mcp waits for the lock and then applies' 0 "$got: $(cat "$WORK/mcp.err")"
+  got="$(jq -c '.mcpServers | keys' "$CJ")"
+  [ "$got" = '["figma"]' ] || fail 'apply mcp after waiting for the lock writes the entry' '["figma"]' "$got"
+  wait "$holder"
+else
+  echo 'SKIP: flock is not installed; the MCP lock test needs it'
+fi
+
+# ── Fireworks (pi and Claude Code, through the gateway) ─────────────────────
+PIM="$WORK/pi/models.json"; FWS="$H/.config/termag/fireworks.json"; FWC="$H/.config/termag/claude-fireworks.json"
+runfw() { TERMAG_PI_MODELS="$PIM" run "$@"; }
+KIMI=accounts/fireworks/models/kimi-k3; DS=accounts/fireworks/routers/deepseek-v4p1-flash-spot
+FW='{"baseUrl":"https://gw.example/fireworks/"}'
+# The owner's pi models file, with a provider of their own; it must survive.
+mkdir -p "$(dirname "$PIM")"
+printf '{"providers":{"ollama":{"baseUrl":"http://localhost:11434/v1","api":"openai-completions","models":[{"id":"q"}]}}}' > "$PIM"
+cp "$CS" "$WORK/cs.before" 2>/dev/null || echo '{}' > "$WORK/cs.before"
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null; got=$?
+[ "$got" = 0 ] || fail 'apply fireworks succeeds' 0 "$got"
+got="$(jq -c '.env | [.ANTHROPIC_BASE_URL, .CLAUDE_CODE_USE_BEDROCK, .ANTHROPIC_MODEL]' "$FWC")"
+[ "$got" = '["https://gw.example/fireworks/inference","",null]' ] \
+  || fail "Claude Code's Fireworks settings leave Bedrock for the gateway's Anthropic route, with no model of their own" 'gw/inference, no bedrock, no model' "$got"
+got="$(jq -r .apiKeyHelper "$FWC")"
+[ "$got" = "'$HELPER' '$CONFIG'" ] || fail "Claude Code's Fireworks apiKeyHelper is the token helper" "'$HELPER' '$CONFIG'" "$got"
+got="$(jq -c '.providers | keys' "$PIM")"
+[ "$got" = '["ollama"]' ] || fail "apply adds no pi provider before a launch names a model" '["ollama"]' "$got"
+cmp -s "$CS" "$WORK/cs.before" || fail "apply fireworks leaves ~/.claude/settings.json alone" unchanged changed
+got="$(stat -c %a "$FWC")"
+[ "$got" = 600 ] || fail 'the Claude Code settings file is 0600' 600 "$got"
+out="$(printf '%s' "$FW" | runfw apply fireworks 2>&1)"
+[ -z "$out" ] || fail 'a repeated fireworks delivery is silent' '' "$out"
+for bad in '{"baseUrl":"http://gw/fireworks"}' '{"baseUrl":"https://gw/fireworks","models":[]}' '{}' '{"baseUrl":"https://gw/fire works"}'; do
+  printf '%s' "$bad" | runfw apply fireworks >/dev/null 2>&1 && fail 'apply fireworks refuses a malformed delivery' refused "applied: $bad"
+done
+got="$(jq -r .baseUrl "$FWS")"
+[ "$got" = https://gw.example/fireworks/ ] || fail 'a refused delivery leaves the last good one' https://gw.example/fireworks/ "$got"
+
+# pi-model: each model a pi launch names goes into pi's provider, with its window.
+runfw pi-model --model "$KIMI" --context 1048576 </dev/null 2>/dev/null || fail 'pi-model succeeds' 0 $?
+runfw pi-model --model "$DS" </dev/null 2>/dev/null
+runfw pi-model --model "$KIMI" --context 512000 </dev/null 2>/dev/null
+got="$(jq -c '.providers["termag-fireworks"] | [.baseUrl, .api, [.models[] | [.id, .contextWindow]]]' "$PIM")"
+[ "$got" = "[\"https://gw.example/fireworks/inference/v1\",\"openai-completions\",[[\"$DS\",null],[\"$KIMI\",512000]]]" ] \
+  || fail "pi's provider points at the gateway's OpenAI route and holds each launched model once, with its latest window" 'gw/inference/v1 + 2 models' "$got"
+got="$(jq -r '.providers.ollama.baseUrl' "$PIM")"
+[ "$got" = http://localhost:11434/v1 ] || fail "the owner's own pi provider is kept" http://localhost:11434/v1 "$got"
+got="$(sh -c "$(jq -r '.providers["termag-fireworks"].apiKey | ltrimstr("!")' "$PIM")")"
+[ "$got" = "$BOX_TOKEN" ] || fail "pi's apiKey command prints the box token" "$BOX_TOKEN" "$got"
+grep -qF "$BOX_TOKEN" "$PIM" "$FWC" "$FWS" && fail 'no Fireworks file holds the token' 'no token' 'token present'
+for bad in 'gpt-5' 'accounts/fireworks/models/x;rm' ''; do
+  runfw pi-model --model "$bad" </dev/null >/dev/null 2>&1 && fail 'pi-model refuses a model that is not a Fireworks id' refused "$bad"
+done
+runfw pi-model --model "$KIMI" --context lots </dev/null >/dev/null 2>&1 && fail 'pi-model refuses a window that is not a number' refused lots
+# A new delivery (a new gateway base) keeps the launched models.
+printf '{"baseUrl":"https://gw2.example/fireworks"}' | runfw apply fireworks 2>/dev/null
+got="$(jq -c '.providers["termag-fireworks"] | [.baseUrl, (.models | length)]' "$PIM")"
+[ "$got" = '["https://gw2.example/fireworks/inference/v1",2]' ] || fail "a new base moves pi's provider and keeps its models" '[gw2, 2]' "$got"
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
+
+# launch-settings: the one --settings a Claude Code launch on the backend gets, with the launch's model.
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --fast "$DS" --context 512000 - 2>/dev/null \
+  | jq -c '.env | [.ANTHROPIC_BASE_URL, .ANTHROPIC_MODEL, .ANTHROPIC_DEFAULT_SONNET_MODEL, .ANTHROPIC_SMALL_FAST_MODEL, .ANTHROPIC_DEFAULT_HAIKU_MODEL, .CLAUDE_CODE_MAX_CONTEXT_TOKENS]')"
+[ "$got" = "[\"https://gw.example/fireworks/inference\",\"$KIMI\",\"$KIMI\",\"$DS\",\"$DS\",\"512000\"]" ] \
+  || fail "launch-settings puts the launch's model on every tier, the fast one on haiku, and the window" 'kimi tiers, ds fast, 512000' "$got"
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>/dev/null | jq -c '.env | [.ANTHROPIC_SMALL_FAST_MODEL, .CLAUDE_CODE_MAX_CONTEXT_TOKENS]')"
+[ "$got" = "[\"$KIMI\",null]" ] || fail 'without --fast the model is the fast one too, and without --context there is no window' "[kimi,null]" "$got"
+runfw launch-settings --backend fireworks - >/dev/null 2>&1 && fail 'launch-settings on fireworks needs a model' non-zero 0
+runfw launch-settings --backend fireworks --model gpt-5 - >/dev/null 2>&1 && fail 'launch-settings refuses a model that is not a Fireworks id' non-zero 0
+# With termag's telemetry on, the launch's resource attributes ride in the same JSON.
+cp "$CS" "$WORK/cs.keep"; TSTATE="$H/.config/termag/telemetry.json"; [ -e "$TSTATE" ] && cp "$TSTATE" "$WORK/tstate.keep"
+jq '.env.OTEL_RESOURCE_ATTRIBUTES = "telemetry.project_id=abc"' "$WORK/cs.keep" > "$CS"; echo '{"env":{}}' > "$TSTATE"
+got="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main runfw launch-settings --backend fireworks --model "$KIMI" - 2>/dev/null \
+  | jq -r '[.env.OTEL_RESOURCE_ATTRIBUTES, .env.ANTHROPIC_BASE_URL, .apiKeyHelper != null] | @tsv')"
+[ "$got" = "$(printf 'telemetry.project_id=abc,termag.project=webapp,termag.workstream=main\thttps://gw.example/fireworks/inference\ttrue')" ] \
+  || fail "launch-settings merges the launch's telemetry with the Fireworks settings" 'resource + gateway + helper' "$got"
+cp "$WORK/cs.keep" "$CS"; if [ -e "$WORK/tstate.keep" ]; then cp "$WORK/tstate.keep" "$TSTATE"; else rm -f "$TSTATE"; fi
+got="$(runfw launch-settings - 2>/dev/null)"
+[ "$got" = '{}' ] || fail 'launch-settings without --backend is telemetry-launch' '{}' "$got"
+runfw launch-settings --backend bedrock - >/dev/null 2>&1 && fail 'launch-settings refuses a backend it does not know' 'non-zero' 0
+
+# remove takes out only our provider; an owner's own under our name is theirs.
+runfw remove fireworks </dev/null 2>/dev/null
+got="$(jq -c '[.providers | has("termag-fireworks"), has("ollama")]' "$PIM")"
+[ "$got" = '[false,true]' ] || fail "remove takes out only termag's pi provider" '[false,true]' "$got"
+[ ! -e "$FWC" ] && [ ! -e "$FWS" ] || fail 'remove deletes the Fireworks settings and record' absent present
+jq '.providers["termag-fireworks"] = {"baseUrl":"https://mine/v1","api":"openai-completions","models":[]}' "$PIM" > "$PIM.t" && mv "$PIM.t" "$PIM"
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
+runfw pi-model --model "$KIMI" </dev/null 2>/dev/null
+got="$(jq -r '.providers["termag-fireworks"].baseUrl' "$PIM")"
+[ "$got" = https://mine/v1 ] || fail "an owner's own termag-fireworks provider is kept" https://mine/v1 "$got"
+runfw remove fireworks </dev/null 2>/dev/null
+got="$(jq -r '.providers["termag-fireworks"].baseUrl' "$PIM")"
+[ "$got" = https://mine/v1 ] || fail "remove leaves an owner's own termag-fireworks provider" https://mine/v1 "$got"
+jq 'del(.providers["termag-fireworks"])' "$PIM" > "$PIM.t" && mv "$PIM.t" "$PIM"
+# No models file yet (pi never ran): the first pi launch makes one.
+rm -f "$PIM"
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
+runfw pi-model --model "$KIMI" </dev/null 2>/dev/null
+got="$(jq -r '.providers | keys | join(",")' "$PIM")"
+[ "$got" = termag-fireworks ] || fail 'pi-model creates pi models file when there is none' termag-fireworks "$got"
+
+# skip: nothing set up, and the next delivery stays off until unskip.
+runfw skip fireworks 2>/dev/null
+[ ! -e "$FWC" ] && ! jq -e '.providers["termag-fireworks"]' "$PIM" >/dev/null 2>&1 || fail 'skip fireworks removes both agents' removed present
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
+[ ! -e "$FWC" ] || fail 'a delivery to a skipped box sets nothing up' absent present
+case "$(runfw status | grep '^fireworks')" in 'fireworks: skipped on this box') : ;; *) fail 'status reports the fireworks skip' skipped "$(runfw status | grep '^fireworks')" ;; esac
+out="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>&1)"; code=$?
+[ "$code" != 0 ] || fail 'launch-settings fails on a skipped box, so `&& claude` does not start on Bedrock' non-zero "$code"
+case "$out" in *'skipped on this box'*) : ;; *) fail 'launch-settings says the box skipped Fireworks' 'skipped on this box' "$out" ;; esac
+runfw pi-model --model "$KIMI" </dev/null >/dev/null 2>&1 && fail 'pi-model fails on a skipped box' non-zero 0
+runfw unskip fireworks 2>/dev/null
+printf '{"reason":"Fireworks through termag is not enabled for you (feature flag fireworks-enabled)"}' | runfw remove fireworks 2>/dev/null
+got="$(runfw status | grep '^fireworks')"
+[ "$got" = 'fireworks: off: Fireworks through termag is not enabled for you (feature flag fireworks-enabled)' ] \
+  || fail "fireworks status repeats the orchestrator's reason" 'fireworks: off: ...' "$got"
+out="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>&1)"; code=$?
+[ "$code" != 0 ] || fail 'launch-settings fails where Fireworks was removed' non-zero "$code"
+case "$out" in *'not set up on this box: Fireworks through termag is not enabled for you'*) : ;;
+  *) fail "launch-settings gives the orchestrator's reason" 'not set up ...: <reason>' "$out" ;; esac
+
+# status asks <base>/auth-check with the box token as a Bearer.
+FW_PORT_FILE="$WORK/fw.port"; FW_SEEN="$WORK/fw.seen"
+node -e '
+  const [portFile, seen, want] = process.argv.slice(1);
+  const fs = require("fs");
+  const s = require("http").createServer((q, r) => {
+    fs.appendFileSync(seen, `${q.method} ${q.url} ${q.headers.authorization === `Bearer ${want}` ? "box-token" : "other"}\n`);
+    if (q.url !== "/fireworks/auth-check") { r.writeHead(404).end(); return; }
+    if (q.headers.authorization === `Bearer ${want}`) { r.writeHead(204).end(); return; }
+    r.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ message: "Fireworks through termag is not enabled for you" }));
+  }).listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(s.address().port)));
+' "$FW_PORT_FILE" "$FW_SEEN" "$BOX_TOKEN" & fw_pid=$!
+i=0; while [ ! -s "$FW_PORT_FILE" ] && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+[ -s "$FW_PORT_FILE" ] || { echo "FAIL: the stub Fireworks gateway did not start"; exit 1; }
+FWGW="http://127.0.0.1:$(cat "$FW_PORT_FILE")/fireworks"
+printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
+# apply takes https only; status reads the recorded base, so point it at the stub.
+jq --arg b "$FWGW" '.baseUrl = $b' "$FWS" > "$FWS.t" && mv "$FWS.t" "$FWS"
+got="$(runfw status | grep '^fireworks')"
+[ "$got" = "fireworks: on, pi and Claude Code on the fireworks backend reach Fireworks through the gateway at $FWGW, which accepts this box's token" ] \
+  || fail 'fireworks status says on when the gateway accepts the box token' 'fireworks: on, ...' "$got"
+[ "$(cat "$FW_SEEN")" = 'GET /fireworks/auth-check box-token' ] || fail 'fireworks status sends the box token to the auth probe only' 'GET /fireworks/auth-check box-token' "$(cat "$FW_SEEN")"
+printf '{"termag_url":"wss://b","token":"tmag_flag_off"}\n' > "$CONFIG"
+got="$(runfw status | grep '^fireworks')"
+[ "$got" = "fireworks: NOT WORKING: the gateway at $FWGW refused this box (HTTP 403): Fireworks through termag is not enabled for you" ] \
+  || fail "fireworks status repeats the gateway's refusal" 'NOT WORKING ... refused (HTTP 403): ...' "$got"
+printf '{"termag_url":"wss://b","token":"%s"}\n' "$BOX_TOKEN" > "$CONFIG"
+kill "$fw_pid"; wait "$fw_pid" 2>/dev/null
+runfw remove fireworks </dev/null 2>/dev/null
+
 run apply codex </dev/null >/dev/null 2>&1; got=$?
 [ "$got" = 2 ] || fail 'unknown providers exit 2' 2 "$got"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + legacy cleanup'
+  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + mcp apply/remove/plugin dirs + fireworks apply/skip/remove/status/launch-settings/pi-model + legacy cleanup'
   exit 0
 fi
 echo "$failures failure(s)"

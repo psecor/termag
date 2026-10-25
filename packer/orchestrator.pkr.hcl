@@ -51,7 +51,13 @@ variable "vpc_id" {
 variable "subnet_id" {
   type        = string
   default     = ""
-  description = "Subnet with outbound internet (IGW or NAT) for apt/npm. Required."
+  description = "Private subnet with a NAT route, for apt/npm/GitHub/ECR. Required. Not a public subnet: an org policy that limits instance credentials to the VPC denies the builder's instance-role calls that leave through its own public IP, so the builder could not reach the registries it needs."
+}
+
+variable "associate_public_ip_address" {
+  type        = bool
+  default     = false
+  description = "Give the builder a public IP. Off: the builder runs in a private subnet behind the VPC's NAT (see subnet_id). Only for a local build in a public subnet of an account without such a policy."
 }
 
 variable "iam_instance_profile" {
@@ -99,9 +105,10 @@ source "amazon-ebs" "termag_orchestrator" {
   ssh_username         = "ubuntu"
   ssh_interface        = "session_manager"
   iam_instance_profile = var.iam_instance_profile
-  // Public IP so the build instance can reach apt mirrors + npm registry. The
-  // temporary SG Packer creates has no inbound rules — SSM still tunnels out.
-  associate_public_ip_address = true
+  // No public IP: the builder sits in a private subnet and reaches apt and npm
+  // through the VPC's NAT gateway, and packer reaches it over the VPC's SSM
+  // endpoints (see box.pkr.hcl).
+  associate_public_ip_address = var.associate_public_ip_address
 
   vpc_id    = var.vpc_id
   subnet_id = var.subnet_id

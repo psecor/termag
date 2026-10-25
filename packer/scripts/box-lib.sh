@@ -40,6 +40,16 @@ install_deploy_artifacts() {
     sudo chown -R termag:termag /home/termag/.config /home/termag/.claude /home/termag/.local/bin
 }
 
+# The browser pane's guest user: termag-guest,
+# its Chromium wrapper and sudoers entry, and the egress rule that keeps it to
+# the agent's pane proxies. Runs from the checkout cloned above, as termag:
+# cloud-init renames that user at launch and the sudoers entry names its uid,
+# which the rename keeps. termag-reconcile runs the same script on every boot,
+# so a box baked before it converges too.
+install_guest_browser() {
+    sudo bash /home/termag/src/termag/deploy/termag-guest-browser-setup --agent-user termag
+}
+
 # Mark the box for login shells, so tooling can tell it runs on a termag box
 # (the hostname is no signal), and a shell from ssh or a bare `tmux` of the
 # owner's does not pass through termag-agent.service, which sets the same variable for
@@ -52,11 +62,24 @@ install_deploy_artifacts() {
 # reason. /etc/zsh/zshenv is read by every zsh, login or not, survives the
 # home rename at launch, and zsh is installed well before this runs. Appended
 # once, below the package's own PATH guard.
+#
+# ~/.local/bin goes on PATH there too. ~/.zshrc puts it there for interactive
+# shells only, so a non-interactive zsh (`ssh box -- termag ask …`, `zsh -c`)
+# could not find the termag CLI, termag-status or the agent CLIs installed
+# there. The termag launcher pins its own Node, so this is all the CLI needs
+# (nvm stays in ~/.zshrc). Guarded on its own line, because an image refreshed
+# from an older source already has the marker. ~/.zshrc prepends it again
+# later; a repeated PATH entry is harmless.
+ZSHENV_LOCAL_BIN='if [ -d "$HOME/.local/bin" ]; then case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac; fi'
 install_box_marker() {
     printf 'export TERMAG_BOX=1\n' | sudo tee /etc/profile.d/termag-box.sh >/dev/null
     sudo chmod 0644 /etc/profile.d/termag-box.sh
     if ! sudo grep -qxF 'export TERMAG_BOX=1' /etc/zsh/zshenv 2>/dev/null; then
         printf '\n# termag box marker (packer/scripts/box-lib.sh, install_box_marker)\nexport TERMAG_BOX=1\n' \
+            | sudo tee -a /etc/zsh/zshenv >/dev/null
+    fi
+    if ! sudo grep -qxF "$ZSHENV_LOCAL_BIN" /etc/zsh/zshenv 2>/dev/null; then
+        printf '\n# ~/.local/bin for non-interactive zsh (packer/scripts/box-lib.sh, install_box_marker)\n%s\n' "$ZSHENV_LOCAL_BIN" \
             | sudo tee -a /etc/zsh/zshenv >/dev/null
     fi
 }

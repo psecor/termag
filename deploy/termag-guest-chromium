@@ -1,0 +1,104 @@
+#!/bin/sh
+# The browser pane's guest Chromium,
+# installed root-owned as /usr/local/libexec/termag-guest-chromium. The agent
+# runs it as `sudo -n -C 5 -u termag-guest` (deploy/termag-guest-browser.sudoers),
+# so fds 3 and 4 stay open: Chromium's --remote-debugging-pipe.
+#
+#   termag-guest-chromium <chromium args>   launch; --user-data-dir must name a
+#                                           profile under the guest profile root
+#   termag-guest-chromium --termag-list     the profiles there: "<name> <mtime> <held>",
+#                                           held 1 while a live Chromium has it open
+#   termag-guest-chromium --termag-forget <name>   delete one profile; refused
+#                                           (exit 66) while a Chromium holds it
+#
+# Guest profiles live in termag-guest's 0700 home, where the agent user can't
+# reach, so creating, seeding, listing and deleting them happens here.
+#
+# A new profile is seeded with WebRTC's ip_handling_policy before Chromium
+# first reads it: the command-line flag for it has no effect on the snap's
+# Chromium (measured), and without the preference page JS sends UDP straight
+# past --proxy-server. The nftables rule rejects that UDP anyway; this keeps
+# Chromium from trying.
+#
+# snap run places Chromium in a snap scope through the running user's own
+# systemd manager and bus. termag-guest has one because it lingers
+# (deploy/termag-guest-browser-setup); without these variables snap refuses:
+# "... is not a snap cgroup for tag snap.chromium.chromium".
+set -eu
+
+CHROMIUM=/snap/bin/chromium
+if [ "$(id -un)" = termag-guest ]; then
+  HOME=$(getent passwd termag-guest | cut -d: -f6)
+elif [ -n "${TERMAG_GUEST_CHROMIUM_TEST_HOME:-}" ]; then
+  # deploy/termag-guest-browser.test.sh only. sudo resets the environment, so
+  # this can't reach a real run, and it never applies as termag-guest.
+  HOME=$TERMAG_GUEST_CHROMIUM_TEST_HOME
+  CHROMIUM=${TERMAG_GUEST_CHROMIUM_TEST_BIN:-/bin/false}
+else
+  echo "termag-guest-chromium: must run as termag-guest" >&2
+  exit 64
+fi
+PROFILES="$HOME/snap/chromium/common/termag-browser-pane/profiles"
+SEED='{"webrtc":{"ip_handling_policy":"disable_non_proxied_udp","multiple_routes_enabled":false,"nonproxied_udp_enabled":false}}'
+
+valid_name() {
+  case $1 in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  [ "${#1}" -le 64 ]
+}
+
+# Whether a live process holds a profile: Chromium's SingletonLock is a
+# symlink to "<host>-<pid>". Only this user can see into these profiles, so
+# only here can it be told; another agent sharing the agent user's HOME (the
+# staging mirror) must not delete a profile in use.
+held() {
+  target=$(readlink "$1/SingletonLock" 2>/dev/null) || return 1
+  pid=${target##*-}
+  case $pid in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+case "${1:-}" in
+  --termag-list)
+    [ -d "$PROFILES" ] || exit 0
+    for d in "$PROFILES"/*/; do
+      [ -d "$d" ] || continue
+      name=$(basename "$d")
+      if held "$d"; then h=1; else h=0; fi
+      valid_name "$name" && printf '%s %s %s\n' "$name" "$(stat -c %Y "$d")" "$h"
+    done
+    exit 0
+    ;;
+  --termag-forget)
+    name=${2:-}
+    valid_name "$name" || { echo "termag-guest-chromium: bad profile name" >&2; exit 65; }
+    if held "$PROFILES/$name"; then echo "termag-guest-chromium: $name is in use" >&2; exit 66; fi
+    rm -rf -- "${PROFILES:?}/$name"
+    [ ! -e "$PROFILES/$name" ]
+    exit
+    ;;
+esac
+
+profile=
+for arg in "$@"; do
+  case $arg in --user-data-dir=*) profile=${arg#--user-data-dir=} ;; esac
+done
+name=${profile#"$PROFILES"/}
+if [ -z "$profile" ] || [ "$name" = "$profile" ] || ! valid_name "$name"; then
+  echo "termag-guest-chromium: --user-data-dir must be $PROFILES/<name>" >&2
+  exit 65
+fi
+mkdir -p "$profile/Default"
+chmod 0700 "$PROFILES" "$profile"
+prefs="$profile/Default/Preferences"
+# Chromium keeps the preference once it has read it; a profile that lost it
+# (or never had it) is reseeded, at the cost of its other preferences.
+if ! grep -Eq '"ip_handling_policy"[[:space:]]*:[[:space:]]*"disable_non_proxied_udp"' "$prefs" 2>/dev/null; then
+  printf '%s\n' "$SEED" > "$prefs"
+fi
+
+uid=$(id -u)
+XDG_RUNTIME_DIR="/run/user/$uid"
+DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+export HOME XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+cd "$HOME"
+exec "$CHROMIUM" "$@"

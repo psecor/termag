@@ -123,6 +123,21 @@ processors:
         # and that is the name to keep; log records arrive without one.
         action: insert
 
+  # Per-request chatter the backend used to print on every status fan-out,
+  # every status hook and every allowed GitHub broker call: about a million
+  # records every three days, none of them a question anyone asks the project.
+  # The current backend prints them only with TERMAG_DEBUG (services/debugLog.ts);
+  # this drops them from an older backend's journal too, and from a host where
+  # that switch is on. Matched on the body after transform/journald made it the
+  # MESSAGE string; a non-string body is no match (error_mode ignore).
+  filter/noise:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'IsString(body) and IsMatch(body, "^\\[STATUS\\] Push .* to [0-9]+ clients")'
+        - 'IsString(body) and IsMatch(body, "^\\[STATUS\\] POST session=")'
+        - 'IsString(body) and IsMatch(body, "^\\[GH-AUTHZ\\] .* allowed$")'
+
   # Keep only the fields worth having from a journal entry, as attributes, and
   # make MESSAGE the body. The rest (_CMDLINE, _EXE, _BOOT_ID, ...) is dropped.
   transform/journald:
@@ -206,6 +221,7 @@ service:
       processors:
         - memory_limiter
         - transform/journald
+        - filter/noise
         - transform/redact
         - resourcedetection
         - resource/termag

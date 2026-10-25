@@ -60,6 +60,19 @@ env OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=abc123,termag.session.kind=int
 env TERMAG_OTEL_REPLAY_ID=$RID"
 [ "$out" = "$want" ] || fail "devin starts with termag's endpoint and resource, and none of the shell's exporter or content gates" "$want" "$out"
 
+# The pane's project and workstream, from the environment the orchestrator
+# sets ahead of the command; a pair that is not two ids is left out.
+out="$(env PATH="$STUB:$PATH" TERMAG_AGENT_TELEMETRY="$REC" TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=feature-x "$WRAP" devin --replay "$RID" -- devin)"
+case $out in
+  *"env OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=abc123,termag.session.kind=interactive,termag.box=box1,service.name=termag-devin-session,termag.agent=devin,termag.project=webapp,termag.workstream=feature-x,termag.replay.id=$RID"*) : ;;
+  *) fail 'devin carries the project and workstream from TERMAG_PROJECT / TERMAG_WORKSTREAM, before the replay' 'termag.project=webapp,termag.workstream=feature-x' "$out" ;;
+esac
+for pair in 'gon falon:main' 'webapp:' ':main' 'webapp:ws,x=y'; do
+  out="$(env PATH="$STUB:$PATH" TERMAG_AGENT_TELEMETRY="$REC" TERMAG_PROJECT="${pair%%:*}" TERMAG_WORKSTREAM="${pair#*:}" "$WRAP" devin -- devin)"
+  case $out in *termag.project*|*termag.workstream*) fail "a project/workstream pair that is not two ids is left out ($pair)" 'no termag.project' "$out" ;; esac
+  case $out in *'termag.agent=devin'*) : ;; *) fail "the telemetry stays without the pair ($pair)" 'termag.agent=devin' "$out" ;; esac
+done
+
 # ── Codex ───────────────────────────────────────────────────────────────────
 out="$(run codex -- codex app-server --listen ws://127.0.0.1:1)"
 case $out in

@@ -298,6 +298,35 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 - `SLACK_SIGNING_SECRET`
 - `CAPTURE_API_SECRET` (for LTS relay)
 
+### Who can use the bot
+
+`/t` answers people the feature flag `slack-bot-enabled` is on for, on the
+projects their termag user owns or was shared, as on the web. The flag is read
+for the termag user whose email matches the Slack account's email
+(`users:read.email`, in any casing), so a person needs a termag account and the
+same email in both. Someone else's project channel, `/t switch` to their
+project and `/t attach` to their session are refused, and `/t local` is not
+available (`slackProjectAccess` in `backend/src/slack/access.ts`). Anyone else
+who runs `/t`, DMs the bot or @mentions it gets a reply only they see, sending
+them to #termag-help for access (`SLACK_ACCESS_CHANNEL` in `access.ts`), and
+is told when no termag account has their Slack email (or to try again when
+Slack's own lookup failed, which says nothing either way). A DM or @mention gets it
+at most once per rate-limit window. The flag falls back off. A Slack account
+that matched nobody is looked up again after five minutes.
+
+DMs and @mentions are not part of the flag. They run `claude` with
+`bypassPermissions` as the backend's own user, with its environment,
+so they answer only `ALLOWED_SLACK_USERS`. Someone the flag lets in who DMs
+or @mentions the bot is pointed at `/t` instead, in a reply only they see.
+
+`ALLOWED_SLACK_USERS` is the operators' list: a comma-separated list of Slack
+user IDs (`U01ABCDEF:youruser`; the unix half is ignored) that get in whatever
+the flag says, with or without a termag account. They keep the routing the bot
+always had (any project, by channel, name or session, and the local sessions)
+and are the only ones DMs and @mentions answer. Keep it short. A deployment
+without the flag uses it alone. The backend logs both sources when the bot
+starts (`[SLACK] Who may use the bot: …`).
+
 ### Slack app setup
 
 1. Create a Slack app at https://api.slack.com/apps
@@ -312,13 +341,30 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 - `/t` — capture and post the active agent's terminal pane
 - `/t <command>` — send a command to the agent terminal, then poll for output
 - `/t !<keys>` — send keystrokes without Enter (e.g. `/t !2` for numbered prompts)
+- `/t -- <text>` — send the text exactly as written, with Enter, even when it
+  starts with a command word or `!` (an em dash works too, for iOS)
+- `/t help [<command>]` — the commands, or one in detail (`/t help routing`
+  explains which project `/t` drives); only the caller sees it
 - `/t create <name>` — create a new project with agent workflow, tmux sessions, and Slack channel
 - `/t switch <project>[/<workstream>]` — switch active project (and workstream)
 - `/t attach <session>` — attach to a specific tmux session
 - `/t ctrl` — capture the ctrl terminal pane
 - `/t ctrl <command>` — send a command to the ctrl terminal
-- `/t projects` — list projects
-- `/t ls` — list tmux sessions
+- `/t projects` — list your own and shared projects
+- `/t ls` — list the tmux sessions on each of your boxes that is up (and on a
+  per-user agent)
+
+A command word counts only in the form above (`backend/src/slack/slashCommand.ts`),
+in any casing (phones capitalise `/t Projects`). Any other text is sent to the
+agent: `/t projects` lists projects, and `/t projects ls` sends `projects ls`.
+A command word without the argument it needs (`/t switch`) shows that
+command's help, and one whose argument matched nothing (`/t switch branches`)
+says how to send the text instead (`/t -- switch branches`).
+
+Errors, refusals and help are replies only the caller sees; panes, listings
+and what a command did are posted to the channel. When the bot cannot post in
+a conversation (a private channel or group DM it isn't in), `/t` says so to
+the caller instead of failing silently.
 
 ### Slack channel routing
 
@@ -336,7 +382,8 @@ is saved on the row so later lookups are direct. Deleting a workstream archives
 its channel.
 
 In DMs or non-project channels use `/t switch <project>[/<workstream>]` to pick
-a target, or `/t attach <tmux-session>` to capture a specific session.
+a target, or `/t attach <tmux-session>` to capture a specific session. The choice
+is saved (`chat_active_targets`), so it survives restarts and deploys.
 
 ### Emoji reactions
 
@@ -369,7 +416,9 @@ The Discord bot runs in the same process as the main server. Set these env vars 
 
 ### Discord commands
 
-The `/t` slash command mirrors all Slack subcommands:
+The `/t` slash command mirrors all Slack subcommands. It reaches only the
+projects the linked termag user owns or was shared: `/t attach` treats someone
+else's session as missing, and a saved target that isn't theirs is refused.
 
 - `/t` — capture and post the active agent's terminal pane
 - `/t <command>` — send a command to the agent terminal, then poll for output

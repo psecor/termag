@@ -118,10 +118,28 @@ printf '%s\n' "$token" | runuser -u "$user" -- env \
     # settings.json only when absent; mv -n so a file the user creates in the
     # meantime still wins. Some coreutils exit non-zero when -n skips, which
     # is the outcome we want here, not a failure.
-    if [ ! -e "$HOMEDIR/.claude/settings.json" ]; then
+    settings="$HOMEDIR/.claude/settings.json"
+    if [ ! -e "$settings" ]; then
       tmp="$(mktemp "$HOMEDIR/.claude/.settings.XXXXXX")"
       cp "$LIB/claude-settings.json" "$tmp"
-      mv -n "$tmp" "$HOMEDIR/.claude/settings.json" || true
+      mv -n "$tmp" "$settings" || true
+      rm -f "$tmp"
+    elif command -v jq >/dev/null 2>&1; then
+      # The one addition to an existing file, as termag-reconcile makes on
+      # boxes: the SessionStart hook that puts ~/.local/bin on Claude Code
+      # Bash tool PATH (termag-status session-start). Appended when no entry
+      # calls session-start; a file jq cannot parse is left alone.
+      tmp="$(mktemp "$HOMEDIR/.claude/.settings.XXXXXX")"
+      if jq --slurpfile c "$LIB/claude-settings.json" '"'"'
+          ($c[0].hooks.SessionStart // []) as $add
+          | if ($add | length) == 0
+               or any((.hooks.SessionStart // [])[].hooks[]?.command | strings; test("termag-status\"? session-start"))
+            then . else .hooks.SessionStart = ((.hooks.SessionStart // []) + $add) end'"'"' \
+          "$settings" >"$tmp" 2>/dev/null \
+        && ! cmp -s "$tmp" <(jq . "$settings"); then
+        chmod --reference="$settings" "$tmp"
+        mv -f "$tmp" "$settings"
+      fi
       rm -f "$tmp"
     fi
   '

@@ -58,6 +58,12 @@
 #     base goes too (the move changes the path Bazel keys on); the start-up
 #     sweep removes a base whose workspace is gone and leaves one with a live
 #     server alone
+#   * with --anthropic-git the runner gets --use-anthropic-git-proxy and no SSH
+#     rewrite; with --github absent the staged CLAUDE.md gets the session note
+#     once, naming the termag settings URL from the agent config; the
+#     Bedrock switch is stripped from the host-config copy whatever is
+#     recorded; under the proxy without a termag credential the keep rule
+#     does not ask origin and keeps an unpushed-looking checkout
 #   * on exit, once the checkout is removed or kept, the end is reported to the
 #     orchestrator's event route with the agent config's token (stdin, not
 #     argv) and the runner's exit status, a
@@ -110,6 +116,7 @@ fi
 h=$SELF_HOSTED_RUNNER_HOST_CONFIG_DIR
 if [ -n "$h" ]; then printf '%s\n' "$h" > "$RECORD.hostdir"; ls -A "$h" > "$RECORD.hostls"; fi
 [ -f "$h/settings.json" ] && cp "$h/settings.json" "$RECORD.hostsettings"
+[ -f "$h/CLAUDE.md" ] && cp "$h/CLAUDE.md" "$RECORD.hostclaude"
 if [ -f "$co/dev-stack/.env.override" ]; then
   cp "$co/dev-stack/.env.override" "$RECORD.override"
 fi
@@ -137,6 +144,8 @@ fi
 exit "${STUB_EXIT:-0}"
 EOF
 chmod +x "$WORK/bin/claude"
+# Later cases swap the stub for one of their own; the ones at the end restore this.
+cp "$WORK/bin/claude" "$WORK/claude.stub"
 
 # Stub curl: records the command line, the config fed on stdin (-K -) and the
 # -d body; answers the status STUB_CURL_CODE (default 204), never the network.
@@ -280,7 +289,7 @@ rm -rf "$SRC"
 
 # ── host config: the owner's settings, without the Claude gateway keys ──────
 mkdir -p "$HOME_DIR/.claude/skills/s" "$HOME_DIR/.claude/projects/p" "$HOME_DIR/.config/termag"
-printf '%s' '{"hooks":{"Stop":[]},"apiKeyHelper":"\u0027/h/.local/bin/termag-claude-token\u0027 \u0027/h/cfg\u0027","env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"mine","BASH_DEFAULT_TIMEOUT_MS":"1","OTEL_LOG_USER_PROMPTS":"1"}}' > "$HOME_DIR/.claude/settings.json"
+printf '%s' '{"hooks":{"Stop":[]},"apiKeyHelper":"\u0027/h/.local/bin/termag-claude-token\u0027 \u0027/h/cfg\u0027","env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"mine","BASH_DEFAULT_TIMEOUT_MS":"1","OTEL_LOG_USER_PROMPTS":"1","CLAUDE_CODE_PLUGIN_DIRS":"/o/mine:/h/.local/share/termag/claude-plugins/termag-mcp-refresh"}}' > "$HOME_DIR/.claude/settings.json"
 printf '%s' '{"apiKeyHelper":"\u0027/h/.local/bin/termag-claude-token\u0027 \u0027/h/cfg\u0027","env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"us.anthropic.claude-opus-5-5"}}' > "$HOME_DIR/.config/termag/claude-gateway.json"
 rm -f "$WORK"/record.*
 seed_order ord-hc
@@ -288,8 +297,8 @@ run ord-hc 2
 got="$(cat "$WORK/record.hostdir" 2>/dev/null)"
 [ "$got" = "$HOME_DIR/ccr/sessions/ord-hc/host-config" ] || fail 'host config is a per-launch copy, never ~/.claude' "$HOME_DIR/ccr/sessions/ord-hc/host-config" "$got"
 got="$(jq -c . "$WORK/record.hostsettings" 2>&1)"
-[ "$got" = '{"hooks":{"Stop":[]},"env":{"ANTHROPIC_MODEL":"mine","BASH_DEFAULT_TIMEOUT_MS":"1"}}' ] \
-  || fail "the host config drops the gateway keys and the telemetry content gates, and keeps the owner's own" '{"hooks":..,"env":{"ANTHROPIC_MODEL":"mine",..}}' "$got"
+[ "$got" = '{"hooks":{"Stop":[]},"env":{"ANTHROPIC_MODEL":"mine","BASH_DEFAULT_TIMEOUT_MS":"1","CLAUDE_CODE_PLUGIN_DIRS":"/o/mine"}}' ] \
+  || fail "the host config drops the gateway keys, the telemetry content gates and termag's MCP refresh plugin, and keeps the owner's own" '{"hooks":..,"env":{"ANTHROPIC_MODEL":"mine",..,"CLAUDE_CODE_PLUGIN_DIRS":"/o/mine"}}' "$got"
 got="$(sort "$WORK/record.hostls" | tr '\n' ' ')"
 [ "$got" = 'settings.json skills ' ] || fail "from ~/.claude only settings, CLAUDE.md, agents, skills, commands are copied" 'settings.json skills ' "$got"
 jq -e '.env.CLAUDE_CODE_USE_BEDROCK == "1"' "$HOME_DIR/.claude/settings.json" >/dev/null || fail "the owner's own settings.json is untouched" 'gateway keys still there' "$(cat "$HOME_DIR/.claude/settings.json")"
@@ -299,6 +308,13 @@ seed_order ord-hc2
 run ord-hc2 2
 got="$(jq -r '.apiKeyHelper // "absent"' "$WORK/record.hostsettings" 2>&1)"
 [ "$got" = absent ] || fail "termag's token helper never reaches the host config" absent "$got"
+# termag's plugin folder alone: the key goes with it.
+printf '%s' '{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"/h/.local/share/termag/claude-plugins/termag-mcp-refresh"}}' > "$HOME_DIR/.claude/settings.json"
+rm -f "$WORK"/record.*
+seed_order ord-hc3
+run ord-hc3 2
+got="$(jq -c . "$WORK/record.hostsettings" 2>&1)"
+[ "$got" = '{}' ] || fail "termag's MCP refresh plugin never reaches the host config" '{}' "$got"
 
 # ── host config: termag's hooks merged in, whichever source was copied (S4) ──
 # termag-hooks-update (the real script) and its canonical file, as a box has
@@ -539,8 +555,9 @@ for want in 'CLAUDE_CODE_ENABLE_TELEMETRY=1' 'OTEL_METRICS_EXPORTER=otlp' 'OTEL_
   'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' 'OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.test:4318' 'OTEL_METRICS_INCLUDE_SESSION_ID=true'; do
   grep -qx -- "$want" "$WORK/record.env" || fail 'telemetry: exported to the session' "$want" "$(grep -E '^(CLAUDE_CODE_ENABLE_TELEMETRY|OTEL_)' "$WORK/record.env" | tr '\n' ' ')"
 done
-grep -qx "OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.box=$(hostname -s),termag.slot=3" "$WORK/record.env" \
-  || fail 'telemetry: resource attributes name the project, the service, the box and the slot' "telemetry.project_id=...,service.name=termag-claude-session,termag.box=$(hostname -s),termag.slot=3" "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
+RESOURCE="telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=$(hostname -s),termag.slot=3"
+grep -qx "OTEL_RESOURCE_ATTRIBUTES=$RESOURCE" "$WORK/record.env" \
+  || fail 'telemetry: resource attributes name the project, the service, the agent, the session kind, the cloud project and workstream, the box and the slot' "$RESOURCE" "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
 grep -q '^OTEL_LOG_' "$WORK/record.env" && fail "telemetry: the owner's content gates never reach the session" '(absent)' "$(grep '^OTEL_LOG_' "$WORK/record.env" | tr '\n' ' ')"
 grep -qx 'OTEL_EXPORTER_OTLP_HEADERS=' "$WORK/record.env" || fail "telemetry: the generic header is set empty, which makes Claude Code drop developer per-signal headers" 'OTEL_EXPORTER_OTLP_HEADERS=' "$(grep '^OTEL_EXPORTER_OTLP_HEADERS' "$WORK/record.env")"
 grep -qE '^OTEL_EXPORTER_OTLP_(METRICS_HEADERS|CLIENT_KEY|LOGS_ENDPOINT)=' "$WORK/record.env" && fail "telemetry: the owner's per-signal headers, client key and endpoints never reach the session" '(absent)' "$(grep -E '^OTEL_EXPORTER_OTLP_(METRICS_HEADERS|CLIENT_KEY|LOGS_ENDPOINT)' "$WORK/record.env" | tr '\n' ' ')"
@@ -553,7 +570,7 @@ rm -f "$WORK"/record.*
 seed_order ord-otelkeys
 run_flags ord-otelkeys 3 --otel-project 5f0c1e2d3a4b5c6d7e8f9a0b --otel-endpoint https://otel.example.test --user-key cmuser01 --box-key cm_box-02; got=$?
 [ "$got" = 0 ] || fail 'telemetry keys: runs' 0 "$got"
-grep -qx "OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.box=$(hostname -s),termag.slot=3,termag.user.id=cmuser01,termag.box.id=cm_box-02" "$WORK/record.env" \
+grep -qx "OTEL_RESOURCE_ATTRIBUTES=$RESOURCE,termag.user.id=cmuser01,termag.box.id=cm_box-02" "$WORK/record.env" \
   || fail 'telemetry keys: the context keys join the resource' '...,termag.user.id=cmuser01,termag.box.id=cm_box-02' "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
 for bad in '--user-key cmuser01' '--user-key cm,user=x --box-key b1' '--user-key u1 --box-key'; do
   rm -f "$WORK"/record.*
@@ -561,8 +578,8 @@ for bad in '--user-key cmuser01' '--user-key cm,user=x --box-key b1' '--user-key
   # shellcheck disable=SC2086
   run_flags ord-otelkeysbad 3 --otel-project 5f0c1e2d3a4b5c6d7e8f9a0b --otel-endpoint https://otel.example.test $bad; got=$?
   [ "$got" = 0 ] || fail "telemetry keys: a bad key ($bad) still runs the session" 0 "$got"
-  grep -qx "OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.box=$(hostname -s),termag.slot=3" "$WORK/record.env" \
-    || fail "telemetry keys: no context keys for $bad, telemetry kept" '(no ids)' "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
+  grep -qx "OTEL_RESOURCE_ATTRIBUTES=$RESOURCE" "$WORK/record.env" \
+    || fail "telemetry keys: no context keys for $bad, telemetry kept" '(no contextKeys)' "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
   grep -q 'session telemetry without context keys' "$WORK/err" || fail "telemetry keys: says why for $bad" 'session telemetry without context keys' "$(cat "$WORK/err")"
 done
 
@@ -824,6 +841,100 @@ sleep 0.3
 grep -q "left $other alone" "$WORK/err" || fail 'bazel: says why it left it' "left $other alone" "$(grep -i bazel "$WORK/err")"
 wait_gone "$BZ/0123456789abcdef0123456789abcdef.rm.424242" || fail 'bazel: a leftover moved-aside copy is swept at start' '(gone)' present
 chmod -R u+w "$BZ" 2>/dev/null
+
+# ── Anthropic-managed git ───────────────────────────────────
+cp "$WORK/claude.stub" "$WORK/bin/claude"
+# Without the flag: the SSH rewrite as before, never the proxy, no note.
+rm -f "$WORK"/record.*
+seed_order ord-git0
+run ord-git0 2; got=$?
+[ "$got" = 0 ] || fail 'git0: runs' 0 "$got"
+argv_has '--git-ssh-rewrite' || fail 'git0: SSH rewrite without the flag' '--git-ssh-rewrite github.com' "$(tr '\n' ' ' <"$WORK/record.argv")"
+argv_has '--use-anthropic-git-proxy' && fail 'git0: no proxy without the flag' '(absent)' '--use-anthropic-git-proxy'
+grep -q 'termag-claude-runner-flags: anthropic-git github' "$SCRIPT" || fail 'the flags marker line the agent looks for is in the script' 'marker present' 'absent'
+
+# With --anthropic-git and --github absent: the proxy, no rewrite, the note once,
+# with the termag URL from the agent config. (The webapp install fixture from
+# earlier cases would be the host-config source; ~/.claude is the one here.)
+rm -rf "$HOME_DIR/.claude-runner"
+mkdir -p "$HOME_DIR/.claude"
+printf '# mine\n' > "$HOME_DIR/.claude/CLAUDE.md"
+printf '{"termag_url":"wss://t.example.test/termag/ws/agent?x=1","token":"tmag_test"}\n' > "$HOME_DIR/.termag/agent.config.json"
+rm -f "$WORK"/record.*
+seed_order ord-git1
+run_flags ord-git1 2 --anthropic-git --github absent; got=$?
+[ "$got" = 0 ] || fail 'git1: runs' 0 "$got"
+argv_has '--use-anthropic-git-proxy' || fail 'git1: the runner uses Anthropic-managed git' '--use-anthropic-git-proxy' "$(tr '\n' ' ' <"$WORK/record.argv")"
+argv_has '--git-ssh-rewrite' && fail 'git1: no SSH rewrite under the proxy' '(absent)' '--git-ssh-rewrite'
+grep -q 'git: anthropic-managed (termag GitHub credential absent)' "$WORK/err" || fail 'git1: says which git it uses' 'git: anthropic-managed (termag GitHub credential absent)' "$(grep 'git:' "$WORK/err")"
+note_count=$(grep -c '^## termag: GitHub is not connected' "$WORK/record.hostclaude" 2>/dev/null || echo 0)
+[ "$note_count" = 1 ] || fail 'git1: the session note is in the staged CLAUDE.md exactly once' 1 "$note_count"
+grep -q 'https://t.example.test/termag/settings' "$WORK/record.hostclaude" 2>/dev/null || fail 'git1: the note names the termag settings URL from the agent config' 'https://t.example.test/termag/settings' "$(cat "$WORK/record.hostclaude" 2>/dev/null)"
+grep -q 'access to termag' "$WORK/record.hostclaude" 2>/dev/null || fail 'git1: the note names the access step' 'access to termag' "$(cat "$WORK/record.hostclaude" 2>/dev/null)"
+[ "$(head -1 "$WORK/record.hostclaude" 2>/dev/null)" = '# mine' ] || fail "git1: the owner's CLAUDE.md content comes first" '# mine' "$(head -1 "$WORK/record.hostclaude" 2>/dev/null)"
+[ "$(cat "$HOME_DIR/.claude/CLAUDE.md")" = '# mine' ] || fail "git1: the owner's own CLAUDE.md is untouched" '# mine' "$(cat "$HOME_DIR/.claude/CLAUDE.md")"
+grep -q 'tmag_test' "$WORK/record.hostclaude" 2>/dev/null && fail 'git1: the note carries no token' '(absent)' 'token in note'
+
+# With --github connected: the proxy, no note.
+rm -f "$WORK"/record.*
+seed_order ord-git2
+run_flags ord-git2 2 --anthropic-git --github connected; got=$?
+[ "$got" = 0 ] || fail 'git2: runs' 0 "$got"
+argv_has '--use-anthropic-git-proxy' || fail 'git2: proxy' '--use-anthropic-git-proxy' "$(tr '\n' ' ' <"$WORK/record.argv")"
+grep -q '^## termag: GitHub is not connected' "$WORK/record.hostclaude" 2>/dev/null && fail 'git2: no note when GitHub is connected' '(absent)' 'note present'
+
+# --github absent alone (an orchestrator that sends the state without the
+# proxy flag): the note, the SSH rewrite; and a note without an agent config
+# names termag only.
+rm -f "$HOME_DIR/.termag/agent.config.json"
+rm -f "$WORK"/record.*
+seed_order ord-git3
+run_flags ord-git3 2 --github absent; got=$?
+[ "$got" = 0 ] || fail 'git3: runs' 0 "$got"
+argv_has '--git-ssh-rewrite' || fail 'git3: SSH rewrite without --anthropic-git' '--git-ssh-rewrite' "$(tr '\n' ' ' <"$WORK/record.argv")"
+grep -q 'then termag (Settings, Credentials)' "$WORK/record.hostclaude" 2>/dev/null || fail 'git3: without an agent config the note names termag only' 'termag (Settings, Credentials)' "$(cat "$WORK/record.hostclaude" 2>/dev/null)"
+rm -f "$HOME_DIR/.claude/CLAUDE.md"
+
+# The Bedrock switch leaves the host-config copy whatever claude-gateway.json
+# records (a copy taken mid-delivery would otherwise route the session through
+# the gateway).
+mkdir -p "$HOME_DIR/.claude" "$HOME_DIR/.config/termag"
+printf '%s' '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_BEDROCK_BASE_URL":"https://gw.example","BASH_DEFAULT_TIMEOUT_MS":"1"}}' > "$HOME_DIR/.claude/settings.json"
+rm -f "$HOME_DIR/.config/termag/claude-gateway.json"
+rm -f "$WORK"/record.*
+seed_order ord-bed
+run ord-bed 2; got=$?
+[ "$got" = 0 ] || fail 'bedrock: runs' 0 "$got"
+jq -e '.env.CLAUDE_CODE_USE_BEDROCK == null and .env.ANTHROPIC_BEDROCK_BASE_URL == null and .env.BASH_DEFAULT_TIMEOUT_MS == "1"' "$WORK/record.hostsettings" >/dev/null 2>&1 \
+  || fail 'bedrock: the switch and the URL are stripped from the copy even with nothing recorded, the rest kept' 'no Bedrock keys, BASH_DEFAULT_TIMEOUT_MS kept' "$(cat "$WORK/record.hostsettings" 2>/dev/null)"
+rm -f "$HOME_DIR/.claude/settings.json"
+
+# The keep rule under the proxy: with the credential connected, origin is asked
+# as before (a push by URL reads as pushed); without it, origin cannot be asked
+# and an unpushed-looking tip keeps the checkout.
+run_git() {
+  o=$1; sl=$2; mode=$3; shift 3
+  env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" CLAUDE_RUNNER_CANONICAL="$GCANON" STUB_GIT="$mode" \
+    "$BASH_BIN" "$SCRIPT" "$o" "$sl" "$@" 2>"$WORK/err"
+}
+rm -f "$WORK"/record.*
+seed_order ord-gk-conn
+run_git ord-gk-conn 2 pushurl --anthropic-git --github connected; got=$?
+[ "$got" = 0 ] || fail 'gk-conn: runs' 0 "$got"
+[ -z "$(kept_for ord-gk-conn)" ] || fail 'gk-conn: a push by URL is found on origin through the broker, nothing kept' '(none)' "$(kept_for ord-gk-conn)"
+git -C "$WORK/origin.git" branch -D -q outcome 2>/dev/null
+rm -f "$WORK"/record.*
+seed_order ord-gk-abs
+run_git ord-gk-abs 2 pushurl --anthropic-git --github absent; got=$?
+[ "$got" = 0 ] || fail 'gk-abs: runs' 0 "$got"
+k=$(kept_for ord-gk-abs)
+[ -n "$k" ] && [ -d "$k/example-org/webapp/.git" ] || fail 'gk-abs: without a termag credential origin is not asked and the checkout is kept' "$HOME_DIR/ccr/kept/ord-gk-abs-*" "${k:-(none)}; err: $(cat "$WORK/err")"
+git -C "$WORK/origin.git" branch -D -q outcome 2>/dev/null
+rm -f "$WORK"/record.*
+seed_order ord-gk-clean
+run_git ord-gk-clean 2 clean --anthropic-git --github absent; got=$?
+[ "$got" = 0 ] || fail 'gk-clean: runs' 0 "$got"
+[ -z "$(kept_for ord-gk-clean)" ] || fail 'gk-clean: a clean tree is removed whatever the credential state' '(none)' "$(kept_for ord-gk-clean)"
 
 if [ "$failures" -eq 0 ]; then
   echo "ok: termag-claude-runner"

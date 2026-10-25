@@ -47,8 +47,8 @@ got="$(printf '%s' "$out" | "$NODE" -e '
     try { console.log(JSON.parse(s).result.tools.map(t => t.name).join(",")); }
     catch { console.log("NOT-JSON: " + s); }
   });')"
-[ "$got" = 'list_sessions,capture_pane,search_sessions,session_status,activity_ledger,latest_briefing,spawn_budget,list_spawns,report_back,draft_slack_message,slack_inbox,handoff_written,spawn_agent,handoff' ] \
-  || fail 'nvm-sourced node, clean stdout, send_keys off by default' 'list_sessions,capture_pane,search_sessions,session_status,activity_ledger,latest_briefing,spawn_budget,list_spawns,report_back,draft_slack_message,slack_inbox,handoff_written,spawn_agent,handoff' "$got"
+[ "$got" = 'list_sessions,capture_pane,search_sessions,session_status,activity_ledger,latest_briefing,spawn_budget,list_spawns,report_back,draft_slack_message,slack_inbox,handoff_written,spawn_agent,dismiss_spawn,adopt_spawn,handoff' ] \
+  || fail 'nvm-sourced node, clean stdout, send_keys off by default' 'list_sessions,capture_pane,search_sessions,session_status,activity_ledger,latest_briefing,spawn_budget,list_spawns,report_back,draft_slack_message,slack_inbox,handoff_written,spawn_agent,dismiss_spawn,adopt_spawn,handoff' "$got"
 grep -q 'stub nvm' "$WORK/err" || fail "nvm's output goes to stderr" 'on stderr' "$(cat "$WORK/err")"
 
 out="$(printf '%s\n' "$LIST" | env -i HOME="$WORK/home" PATH="$WORK/empty" TERMAG_CHECKOUT="$WORK/nowhere" \

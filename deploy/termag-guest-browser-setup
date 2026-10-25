@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# termag-guest-browser-setup — put the browser pane's guest user in place.
+# Run as root; idempotent.
+#
+# A reviewer's browser pane runs Chromium as termag-guest, never as the box
+# user: it can't read the owner's home (0750), and an nftables rule keeps
+# everything it sends to the agent's per-pane proxies. This script owns all
+# of that:
+#
+#   1. the termag-guest system user: no shell, no sudo, home 0700, in no
+#      group of the agent user's
+#   2. the root-owned wrapper /usr/local/libexec/termag-guest-chromium and the
+#      sudoers entry that lets the agent user run it, and only it, as
+#      termag-guest with fds 3 and 4 kept (the DevTools pipe)
+#   3. the egress rule (termag-guest-browser.nft) and its boot unit, enabled
+#      and active, and the drop-in that makes termag-guest's user manager
+#      require it
+#   4. the proxy ports reserved (termag-guest-browser.sysctl), so nothing
+#      the owner runs is given one of them for port 0
+#   5. lingering for termag-guest, last: snap run needs that user manager,
+#      and the drop-in must be in place before it first starts
+#
+# Content-compared like termag-reconcile: a current box writes nothing.
+# Called by packer/scripts/setup.sh at bake, and by termag-reconcile through
+# `sudo -n` on every boot and box update, so a box that predates it
+# converges without a bake.
+#
+# Usage:
+#   termag-guest-browser-setup [--agent-user NAME]           apply, reporting
+#                                                            only what changed
+#   termag-guest-browser-setup [--agent-user NAME] --check   report what is
+#                       missing or differs, change nothing (exit 1 if anything)
+#
+# --agent-user is the box user the agent runs as (default termag, the name at
+# bake; cloud-init renames it to the owner's at launch, uid kept, so
+# termag-reconcile passes its own name).
+#
+# Env (tests): TERMAG_GUEST_SETUP_ROOT prefixes every path this writes or
+# reads under /etc, /usr/local and /var/lib; TERMAG_GUEST_SETUP_DEPLOY is
+# where the sources are (default: this script's directory).
+set -u
+
+GUEST=termag-guest
+AGENT_USER=termag
+DEPLOY="${TERMAG_GUEST_SETUP_DEPLOY:-$(cd "$(dirname "$0")" && pwd)}"
+ROOT="${TERMAG_GUEST_SETUP_ROOT:-}"
+
+MODE=apply
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --agent-user) AGENT_USER="${2:-}"; shift ;;
+    -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+AGENT_UID=$(id -u "$AGENT_USER" 2>/dev/null) || AGENT_UID=
+case "$AGENT_UID" in
+  ''|0) printf 'termag-guest-browser-setup: no usable agent user %s\n' "$AGENT_USER" >&2; exit 2 ;;
+esac
+
+if [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
+  echo 'termag-guest-browser-setup: run as root' >&2
+  exit 1
+fi
+
+changed=0
+failed=0
+units_changed=0
+rules_changed=0
+PROXY_PORTS=47100-47131
+
+say() { printf '%s\n' "$*"; }
+drift() { changed=$((changed + 1)); [ "$MODE" = check ] && say "DRIFT: $*"; return 0; }
+broke() { failed=$((failed + 1)); printf 'termag-guest-browser-setup: %s\n' "$*" >&2; }
+
+# Owner flags only as root: a test run writes as its own user.
+install_owned() {
+  if [ "$(id -u)" = 0 ]; then install -o root -g root "$@"; else install "$@"; fi
+}
+
+# ── 1. the user ───────────────────────────────────────────────────────────────
+if ! getent passwd "$GUEST" >/dev/null 2>&1; then
+  drift "user $GUEST is missing"
+  if [ "$MODE" = apply ]; then
+    if useradd --system --create-home --home-dir "/home/$GUEST" \
+         --shell /usr/sbin/nologin --user-group "$GUEST"; then
+      say "created: user $GUEST"
+    else
+      broke "could not create user $GUEST"
+    fi
+  fi
+fi
+
+uid=$(id -u "$GUEST" 2>/dev/null || true)
+home=$(getent passwd "$GUEST" 2>/dev/null | cut -d: -f6)
+
+# The wrapper runs from the guest's home and keeps its profiles there: it must
+# exist, be the guest's, and be 0700. (Ownership only on a real run: a test
+# root has no guest to own anything.)
+if [ -n "$home" ] && [ ! -d "$home" ]; then
+  drift "$home is missing"
+  if [ "$MODE" = apply ]; then
+    if [ "$(id -u)" = 0 ] && [ -z "$ROOT" ]; then
+      install -d -m 0700 -o "$GUEST" -g "$GUEST" "$home" && say "created: $home" || broke "could not create $home"
+    else
+      install -d -m 0700 "$home" && say "created: $home" || broke "could not create $home"
+    fi
+  fi
+elif [ -n "$home" ]; then
+  if [ "$(id -u)" = 0 ] && [ -z "$ROOT" ] && [ "$(stat -c %U "$home")" != "$GUEST" ]; then
+    drift "$home is not owned by $GUEST"
+    [ "$MODE" = apply ] && { chown "$GUEST:$GUEST" "$home" && say "fixed: $home is owned by $GUEST" || broke "could not chown $home"; }
+  fi
+  if [ "$(stat -c %a "$home")" != 700 ]; then
+    drift "$home is not 0700"
+    [ "$MODE" = apply ] && { chmod 0700 "$home" && say "fixed: $home is 0700" || broke "could not chmod $home"; }
+  fi
+fi
+
+# The agent user's home is 0750: the guest must never be in its group.
+if [ -n "$uid" ] && id -nG "$GUEST" 2>/dev/null | tr ' ' '\n' | grep -qx "$AGENT_USER"; then
+  drift "$GUEST is in group $AGENT_USER"
+  [ "$MODE" = apply ] && { gpasswd -d "$GUEST" "$AGENT_USER" >/dev/null && say "fixed: $GUEST left group $AGENT_USER" || broke "could not remove $GUEST from $AGENT_USER"; }
+fi
+
+# ── 2 and 3. the files ────────────────────────────────────────────────────────
+# put <source> <installed path> <mode> <kind: unit|rules|sudoers|file>
+# A source is a file in deploy/, or an absolute path (a rendered one).
+put() {
+  local src="$1" dest="$ROOT$2" mode=$3 kind=$4 name
+  case "$src" in /*) name=$(basename "$src") ;; *) name=$src; src="$DEPLOY/$src" ;; esac
+  if [ ! -f "$src" ]; then broke "missing source $src"; return; fi
+  if cmp -s "$src" "$dest" 2>/dev/null && [ "$(stat -c %a "$dest")" = "$mode" ]; then
+    return
+  fi
+  if [ -e "$dest" ]; then drift "$2 differs from $name"; else drift "$2 is missing"; fi
+  [ "$MODE" = apply ] || return
+  if [ "$kind" = sudoers ] && ! visudo -cf "$src" >/dev/null; then
+    broke "$name does not parse; not installed"
+    return
+  fi
+  mkdir -p "$(dirname "$dest")" || { broke "could not create $(dirname "$dest")"; return; }
+  if install_owned -m "$mode" "$src" "$dest"; then
+    say "installed: $2"
+    [ "$kind" = unit ] && units_changed=1
+    [ "$kind" = rules ] && rules_changed=1
+  else
+    broke "could not install $2"
+  fi
+}
+
+RENDERED=$(mktemp -d)
+trap 'rm -rf "$RENDERED"' EXIT
+sed "s/@AGENT_UID@/$AGENT_UID/" "$DEPLOY/termag-guest-browser.sudoers" >"$RENDERED/termag-guest-browser.sudoers"
+
+put termag-guest-chromium /usr/local/libexec/termag-guest-chromium 755 file
+put "$RENDERED/termag-guest-browser.sudoers" /etc/sudoers.d/termag-guest-browser 440 sudoers
+put termag-guest-browser.nft /usr/local/lib/termag/termag-guest-browser.nft 644 rules
+put termag-guest-browser.service /etc/systemd/system/termag-guest-browser.service 644 unit
+put termag-guest-browser.sysctl /etc/sysctl.d/60-termag-guest-browser.conf 644 file
+if [ -n "$uid" ]; then
+  put termag-guest-browser-required.conf "/etc/systemd/system/user@$uid.service.d/termag-guest-browser.conf" 644 unit
+fi
+
+# ── 3. the rule, live ─────────────────────────────────────────────────────────
+# Tests stop here: the rest is systemd and the kernel's ruleset.
+if [ -n "$ROOT" ]; then
+  [ "$MODE" = check ] && [ "$changed" -gt 0 ] && exit 1
+  [ "$failed" -gt 0 ] && exit 1
+  exit 0
+fi
+
+# nftables ships with the box image's Ubuntu, but nothing here should rest on
+# that: an image without it gets it. Its own nftables.service stays off, as on
+# the orchestrator: the stock /etc/nftables.conf starts with `flush ruleset`,
+# which takes this table (and Docker's) with it.
+if ! command -v nft >/dev/null 2>&1; then
+  drift 'nftables is not installed'
+  if [ "$MODE" = apply ]; then
+    # The bake wipes /var/lib/apt/lists, so the package index is fetched first.
+    if DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null; then
+      say 'installed: nftables'
+    else
+      broke 'could not install nftables'
+    fi
+  fi
+fi
+if systemctl is-enabled --quiet nftables.service 2>/dev/null; then
+  drift 'nftables.service is enabled (its ruleset flushes this one)'
+  [ "$MODE" = apply ] && { systemctl disable nftables.service >/dev/null 2>&1 && say 'disabled: nftables.service' || broke 'could not disable nftables.service'; }
+fi
+
+if [ "$MODE" = apply ] && [ "$units_changed" = 1 ]; then
+  systemctl daemon-reload || broke 'daemon-reload failed'
+fi
+
+unit=termag-guest-browser.service
+if ! systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+  drift "$unit is not enabled"
+  [ "$MODE" = apply ] && { systemctl enable "$unit" >/dev/null 2>&1 && say "enabled: $unit" || broke "could not enable $unit"; }
+fi
+if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+  drift "$unit is not active"
+  [ "$MODE" = apply ] && { systemctl start "$unit" && say "started: $unit" || broke "could not start $unit"; }
+elif ! nft list table inet termag_guest >/dev/null 2>&1 || [ "$rules_changed" = 1 ]; then
+  # Active but its table is gone (a `nft flush ruleset`) or the rules changed:
+  # reload, never restart (a restart takes the guest's user manager with it).
+  drift 'the termag_guest table is not loaded as installed'
+  [ "$MODE" = apply ] && { systemctl reload "$unit" && say "reloaded: $unit" || broke "could not reload $unit"; }
+fi
+
+# ── 4. the proxy ports, reserved now ──────────────────────────────────────────
+# The sysctl.d file holds them from the next boot; this holds them now,
+# merged into whatever else is reserved (the setting is one list).
+reserved_file=/proc/sys/net/ipv4/ip_local_reserved_ports
+reserved=$(cat "$reserved_file" 2>/dev/null || true)
+case ",$reserved," in
+  *",$PROXY_PORTS,"*) ;;
+  *)
+    drift "ports $PROXY_PORTS are not reserved (ip_local_reserved_ports=${reserved:-empty})"
+    if [ "$MODE" = apply ]; then
+      want=${reserved:+$reserved,}$PROXY_PORTS
+      sysctl -q -w "net.ipv4.ip_local_reserved_ports=$want" && say "reserved: ports $PROXY_PORTS" || broke "could not reserve ports $PROXY_PORTS"
+    fi
+    ;;
+esac
+
+# ── 5. lingering, last ────────────────────────────────────────────────────────
+if [ -n "$uid" ] && [ ! -e "/var/lib/systemd/linger/$GUEST" ]; then
+  drift "$GUEST does not linger"
+  if [ "$MODE" = apply ]; then
+    if [ "$failed" -gt 0 ]; then
+      broke "not enabling lingering for $GUEST: an earlier step failed"
+    else
+      loginctl enable-linger "$GUEST" && say "enabled: lingering for $GUEST" || broke "could not enable lingering for $GUEST"
+    fi
+  fi
+fi
+
+[ "$MODE" = check ] && [ "$changed" -gt 0 ] && exit 1
+[ "$failed" -gt 0 ] && exit 1
+exit 0

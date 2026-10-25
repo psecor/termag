@@ -5,6 +5,13 @@
 # Usage:
 #   termag-agent-otel <codex|devin|cursor|pi> [--replay <id>] -- <command> [args...]
 #
+# TERMAG_PROJECT and TERMAG_WORKSTREAM in the environment (the orchestrator
+# sets both ahead of the command) name the pane's project and workstream on
+# the resource as termag.project and termag.workstream, the two every agent
+# resource carries beside termag.agent and termag.session.kind. Environment
+# rather than flags, so an older copy of this script ignores them. Both or
+# neither, ids only (letters, digits, - and _, at most 64).
+#
 # The orchestrator types this in front of a provider's launch command on a box
 # whose agent advertises agent-telemetry-v1 (backend/src/services/launchCommand.ts),
 # and the Codex status bridge starts `codex app-server` through it. The
@@ -77,6 +84,9 @@ for v in $(compgen -e); do
   case $v in OTEL_EXPORTER_OTLP_*|OTEL_LOG_*|OTEL_SERVICE_NAME) unset "$v" ;; esac
 done
 resource="$resource,service.name=termag-$agent-session,termag.agent=$agent"
+project=${TERMAG_PROJECT:-} workstream=${TERMAG_WORKSTREAM:-}
+[[ $project =~ ^[A-Za-z0-9_-]{1,64}$ ]] && [[ $workstream =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
+  && resource="$resource,termag.project=$project,termag.workstream=$workstream"
 [ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
 export OTEL_RESOURCE_ATTRIBUTES=$resource
 
