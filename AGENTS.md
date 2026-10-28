@@ -76,7 +76,6 @@ termag/
 │   ├── box-provisioning.md         Design doc for orchestrator-driven box provisioning
 │   ├── orchestrator-rds.md         The orchestrator's database on Aurora: design, cutover runbook
 │   ├── hosted-apps.md              How to host extra apps on ALB suburls via the nginx gateway
-│   ├── hosted-apps-migration.md    Moving those apps off the dev orchestrator host (status + plan)
 │   ├── host-storage-handoff.md     How the host data volume moves to a new orchestrator; runbook
 │   ├── project-migration.md        Design: moving a project and its workstreams between boxes
 │   └── preview-share.md            Preview shares: a reviewer's sandboxed browser pane, no project access

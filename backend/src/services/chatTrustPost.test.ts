@@ -16,7 +16,7 @@ describe('chatTrustPostRefusal', () => {
     }, env)).toBeNull();
   });
 
-  it('rejects a same-site form POST from another ldinfra host', () => {
+  it('rejects a same-site form POST from another same-site host', () => {
     expect(chatTrustPostRefusal({
       secFetchSite: 'same-site',
       origin: sibling,
@@ -62,7 +62,7 @@ describe('chatTerminalPostRefusal', () => {
     expect(chatTerminalPostRefusal({ origin: app, ...workstream }, env)).toBeNull();
   });
 
-  it('rejects a same-site form POST from another ldinfra host', () => {
+  it('rejects a same-site form POST from another same-site host', () => {
     expect(chatTerminalPostRefusal({
       secFetchSite: 'same-site',
       origin: sibling,
