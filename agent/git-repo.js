@@ -73,15 +73,27 @@ async function hasCommits(dir) {
 // `git init dir`, tolerating a concurrent one. A new project's init-wiki and
 // tmux-create both init its dir, and the agent runs them at once; two inits
 // race on copying git's templates, and the loser fails with "cannot copy
-// ...: File exists" (homebrew git on macOS does, at least). The repo is there
-// either way, so a failure that leaves `dir` a repo root is not one. The
-// backend's copy (services/gitRepo.ts, services/tmux.ts) runs its inits one
-// after another, so it has no such race.
+// ...: File exists" (Linux and homebrew git alike). The repo is there either
+// way, so a failure that leaves `dir` a repo root is not one.
+//
+// The loser usually fails while the winner is still copying templates, before
+// it has written .git/HEAD, so an immediate repo-root check fails too (on an
+// Ubuntu host, in ~80% of collisions) and the create was reported as failed
+// with the repo sitting there intact. Poll briefly for the winner to finish
+// before giving up. The backend's copy (services/gitRepo.ts, services/tmux.ts)
+// runs its inits one after another, so it has no such race.
+const GIT_INIT_SETTLE_ATTEMPTS = 20;
+const GIT_INIT_SETTLE_MS = 100;
+
 async function gitInit(dir) {
   try {
     await execAsync(`git init ${shellEscape(dir)}`);
   } catch (err) {
-    if (!(await isRepoRoot(dir))) throw err;
+    for (let i = 0; i < GIT_INIT_SETTLE_ATTEMPTS; i++) {
+      if (await isRepoRoot(dir)) return;
+      await new Promise(r => setTimeout(r, GIT_INIT_SETTLE_MS));
+    }
+    throw err;
   }
 }
 
