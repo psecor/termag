@@ -68,6 +68,13 @@ export async function listenForCallback(state: string, timeoutMs: number): Promi
         'Open the link termag login printed most recently, without editing it.'));
       return;
     }
+    if (url.searchParams.get('error') === 'not_allowed') {
+      res.writeHead(200, PAGE_HEADERS).end(page('No access to termag yet',
+        'This account doesn\'t have access to termag yet. Ask a termag admin to add it, then run termag login again.'));
+      settle.reject(new CliError('auth_required',
+        'This account doesn\'t have access to termag yet. Ask a termag admin to add it, then run termag login again'));
+      return;
+    }
     if (url.searchParams.get('error')) {
       res.writeHead(200, PAGE_HEADERS).end(page('Sign-in cancelled', 'The termag CLI was not signed in. You can close this tab.'));
       settle.reject(new CliError('auth_required', 'Sign-in was cancelled in the browser'));

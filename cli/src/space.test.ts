@@ -27,6 +27,10 @@ interface FakeSpaces {
   failParts: number;
   /** Extra paths the recursive listing returns, as a hostile server might. */
   extraPaths: string[];
+  /** Paths shared with termag; the tree marks them. */
+  shared: Set<string>;
+  /** Set, every share and unshare is a 403 with this message, as for a viewer. */
+  shareRefusal: string | null;
   calls: string[];
   close: () => Promise<void>;
 }
@@ -53,6 +57,8 @@ async function startFake(): Promise<FakeSpaces> {
     partBytes: 8,
     failParts: 0,
     extraPaths: [],
+    shared: new Set(),
+    shareRefusal: null,
     calls: [] as string[],
   } satisfies FakeSpaces as FakeSpaces;
   const server: Server = createServer(async (req, res) => {
@@ -113,11 +119,13 @@ async function startFake(): Promise<FakeSpaces> {
       const recursive = url.searchParams.get('recursive') === '1';
       const under = [...fake.files.keys(), ...fake.extraPaths].filter(k => k.startsWith(prefix)).sort();
       const dirs = new Set<string>();
-      const files: Array<{ name: string; path: string; size: number; modifiedAt: string }> = [];
+      const files: Array<{ name: string; path: string; size: number; modifiedAt: string; shared?: boolean }> = [];
       for (const k of under) {
         const tail = k.slice(prefix.length);
         if (!recursive && tail.includes('/')) { dirs.add(tail.split('/')[0]); continue; }
-        files.push({ name: tail.split('/').at(-1)!, path: k, size: fake.files.get(k)?.length ?? 0, modifiedAt: '2026-10-15T10:00:00.000Z' });
+        files.push({
+          name: tail.split('/').at(-1)!, path: k, size: fake.files.get(k)?.length ?? 0, modifiedAt: '2026-10-15T10:00:00.000Z', ...(fake.shared.has(k) ? { shared: true } : {}),
+        });
       }
       // Two files a page, so the CLI has to follow the cursor.
       const start = Number(url.searchParams.get('cursor') ?? 0);
@@ -140,6 +148,15 @@ async function startFake(): Promise<FakeSpaces> {
       if (!fake.files.has(json.path)) { sendJson(res, 404, { error: 'No such file', code: 'file_not_found' }); return; }
       const encoded = json.path.split('/').map(encodeURIComponent).join('/');
       sendJson(res, 200, { url: `https://ui.example/termag/files/${space}/${encoded}`, path: json.path, size: fake.files.get(json.path)!.length });
+      return;
+    }
+    if (rest === '/files/share') {
+      const path = req.method === 'DELETE' ? url.searchParams.get('path')! : json.path;
+      if (fake.shareRefusal) { sendJson(res, 403, { error: fake.shareRefusal, code: 'forbidden' }); return; }
+      if (req.method === 'DELETE') { fake.shared.delete(path); sendJson(res, 200, { shared: false }); return; }
+      if (!fake.files.has(path)) { sendJson(res, 404, { error: `No file ${path} in ${space}`, code: 'file_not_found' }); return; }
+      fake.shared.add(path);
+      sendJson(res, 200, { shared: true, sharedAt: '2026-11-02T10:00:00.000Z', sharedBy: { displayName: 'Me', email: 'me@example.com' } });
       return;
     }
     if (rest === '/files/upload') {
@@ -365,6 +382,40 @@ describe('termag space', () => {
     expect(JSON.parse(out.join(''))).toEqual({ space: 'team', path: 'docs/My Report.pdf', url: 'https://ui.example/termag/files/team/docs/My%20Report.pdf' });
     expect(await termag('space', 'url', 'team:nope.pdf')).toBe(3);
     expect(await termag('space', 'url', 'team:docs/')).toBe(2);
+  });
+
+  it('shares a file with termag, marks it in ls, and makes it private again', async () => {
+    fake.files.set('artifacts/x.png', Buffer.from('png'));
+    fake.files.set('notes.md', Buffer.from('md'));
+    expect(await termag('space', 'share', 'team:artifacts/x.png')).toBe(0);
+    expect(out).toEqual(['team:artifacts/x.png is shared: everyone signed in to termag can open its link (`termag space url team:artifacts/x.png`).']);
+    expect(fake.calls).toContain('PUT /termag/api/cli/v1/spaces/team/files/share');
+    out = [];
+    expect(await termag('space', 'ls', 'team:artifacts/')).toBe(0);
+    expect(out.join('\n')).toContain('x.png (shared)');
+    out = [];
+    expect(await termag('space', 'url', 'team:artifacts/x.png')).toBe(0);
+    expect(out).toEqual(['https://ui.example/termag/files/team/artifacts/x.png']);
+    out = [];
+    expect(await termag('space', 'unshare', 'artifacts/x.png', '--json')).toBe(0);
+    expect(JSON.parse(out.join(''))).toEqual({ space: 'team', path: 'artifacts/x.png', shared: false });
+    expect(fake.shared.size).toBe(0);
+    out = [];
+    expect(await termag('space', 'share', 'team:artifacts/x.png', '--json')).toBe(0);
+    expect(JSON.parse(out.join(''))).toMatchObject({ space: 'team', path: 'artifacts/x.png', shared: true, sharedBy: { email: 'me@example.com' } });
+    expect(await termag('space', 'share', 'team:notes.md')).toBe(0);
+    expect([...fake.shared].sort()).toEqual(['artifacts/x.png', 'notes.md']);
+  });
+
+  it('says why a share is refused, and refuses a folder', async () => {
+    fake.files.set('notes.md', Buffer.from('md'));
+    fake.shareRefusal = 'You are a viewer of team; this needs editor';
+    expect(await termag('space', 'share', 'team:notes.md')).toBe(1);
+    expect(err.join('\n')).toContain('You are a viewer of team; this needs editor');
+    fake.shareRefusal = null;
+    expect(await termag('space', 'share', 'team:artifacts/nope.png')).toBe(3);
+    expect(await termag('space', 'share', 'team:artifacts/')).toBe(2);
+    expect(await termag('space', 'unshare')).toBe(2);
   });
 
   it('reports a missing file as not found (exit 3)', async () => {

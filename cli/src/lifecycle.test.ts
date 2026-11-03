@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Ctx } from './context.js';
 import type { Api } from './api.js';
-import { findBox, parseProjectRef, startAndWait, waitForRunning } from './lifecycle.js';
+import { CliError } from './errors.js';
+import { autoParkLine, findBox, parseProjectRef, startAndWait, waitForRunning } from './lifecycle.js';
 import { run } from './main.js';
 import { BOXES, startFakeOrchestrator, type FakeOrchestrator } from './test/fakeOrchestrator.js';
 
@@ -61,15 +62,28 @@ describe('termag box create', () => {
   it('creates the box and returns while it provisions', async () => {
     orch.lifecycle.provisionPolls = Infinity;
     expect(await run(['box', 'create', 'newbox'], ctx())).toBe(0);
-    expect(stdout()).toContain('Creating box newbox (provisioning)');
+    expect(stdout()).toContain('Creating box newbox (provisioning, 120 GB disk)');
     expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'newbox' } }]);
+  });
+
+  it('--minimal asks for the lean image and says so', async () => {
+    orch.lifecycle.provisionPolls = Infinity;
+    expect(await run(['box', 'create', 'leanbox', '--minimal'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'leanbox', flavor: 'minimal' } }]);
+    expect(stdout()).toContain('Creating minimal box leanbox (provisioning, 120 GB disk)');
+  });
+
+  it('--minimal --wait reports it through to running', async () => {
+    orch.lifecycle.provisionPolls = 3;
+    expect(await run(['box', 'create', 'leanbox', '--minimal', '--wait'], ctx())).toBe(0);
+    expect(stdout()).toBe('Created minimal box leanbox (120 GB disk); it is running.');
   });
 
   it('--wait reports progress on stderr and ends running', async () => {
     orch.lifecycle.provisionPolls = 3;
     expect(await run(['box', 'create', 'newbox', '--wait'], ctx())).toBe(0);
     expect(stderr()).toMatch(/^newbox: provisioning \(\d+s\)$/m);
-    expect(stdout()).toBe('Created box newbox; it is running.');
+    expect(stdout()).toBe('Created box newbox (120 GB disk); it is running.');
   });
 
   it('--wait --json prints only the final box', async () => {
@@ -225,6 +239,18 @@ describe('termag box start and stop', () => {
     await expect(startAndWait(ctx(), api, hibernating, 2, true)).resolves.toMatchObject({ started: true, box: { state: 'running' } });
   });
 
+  it('--wait follows a start another client sent first, and fails on any other refusal', async () => {
+    const stopped = { ...BOXES[0], state: 'stopped', status: 'stopped', agentConnected: false };
+    const raced = (after: string) => ({
+      request: async (method: string) => {
+        if (method === 'POST') throw new CliError('conflict', "Can't start a box that is starting", 409);
+        return { boxes: [{ ...BOXES[0], state: after, status: after, agentConnected: after === 'running' }] };
+      },
+    } as unknown as Api);
+    await expect(startAndWait(ctx(), raced('running'), stopped, 2, true)).resolves.toMatchObject({ started: false, box: { state: 'running' } });
+    await expect(startAndWait(ctx(), raced('stopped'), stopped, 2, true)).rejects.toThrow("Can't start a box that is starting");
+  });
+
   it('leaves a hibernated box alone on stop', async () => {
     Object.assign(box('devbox')!, { state: 'hibernated', status: 'hibernated', agentConnected: false });
     expect(await run(['box', 'stop', 'devbox', '--json'], ctx())).toBe(0);
@@ -344,18 +370,166 @@ describe('termag project create --from', () => {
   });
 });
 
+describe('box sizes (--size)', () => {
+  const WEBAPP = 'https://github.com/example-org/webapp';
+
+  it('box create --size sends the size, and says what the box got', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.provisionPolls = Infinity;
+    expect(await run(['box', 'create', 'big', '--size', 'large'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'big', size: 'large' } }]);
+    expect(stdout()).toContain('Creating box big (provisioning, large, 120 GB disk)');
+    expect(box('big')).toMatchObject({ size: 'large', instanceType: 'm8g.2xlarge' });
+  });
+
+  it('box create without --size gets the default size', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    expect(await run(['box', 'create', 'little', '--wait', '--json'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'little' } });
+    expect(lastJson()).toMatchObject({ box: { name: 'little', size: 'small', instanceType: 'm8g.large' } });
+  });
+
+  it('refuses a size it does not know, before asking the orchestrator', async () => {
+    expect(await run(['box', 'create', 'x', '--size', 'huge'], ctx())).toBe(2);
+    expect(await run(['box', 'create', 'x', '--size'], ctx())).toBe(2);
+    expect(stderr()).toContain('--size takes small, medium, large');
+    expect(mutations()).toEqual([]);
+  });
+
+  it('accepts a size in any case', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    expect(await run(['box', 'create', 'x', '--size', 'Medium'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0].body).toEqual({ name: 'x', size: 'medium' });
+  });
+
+  it('shows the orchestrator\'s refusal while sizes are off for you', async () => {
+    expect(await run(['box', 'create', 'x', '--size', 'small'], ctx())).toBe(1);
+    expect(stderr()).toContain('Choosing a box size is not turned on for you yet');
+  });
+
+  it('project create --new-box --from a repo whose .termag/environment.json says medium makes a medium box, with no --size', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.repoFiles = { [WEBAPP]: { size: 'medium' } };
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', from: WEBAPP } });
+    expect(stderr()).toContain('Created box gbox (medium, 120 GB disk); gbox/app is set up on it once it is running.');
+    expect(box('gbox')).toMatchObject({ size: 'medium', instanceType: 'm8g.xlarge' });
+  });
+
+  it('prints what of the repository\'s environment.json the orchestrator left out, as a warning, and still makes the box', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.repoFiles = { [WEBAPP]: { warnings: ['example-org/webapp\'s .termag/environment.json: "resources" is "xl", not one of small, medium, large, so it was ignored'] } };
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
+    expect(stderr()).toContain('termag: warning: example-org/webapp\'s .termag/environment.json: "resources" is "xl"');
+    expect(box('gbox')).toMatchObject({ size: 'small' });
+  });
+
+  it('names a box sized by the repository\'s requirements by them, before EC2 says which type it got', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.provisionPolls = Infinity;
+    orch.override.set('/api/cli/v1/boxes', res => {
+      res.writeHead(201, { 'Content-Type': 'application/json' }).end(JSON.stringify({
+        box: { id: 'i-g', name: 'gbox', addressable: true, kind: 'ec2', state: 'provisioning', status: 'provisioning', agentConnected: false, error: null, projects: [], size: '4vcpu-32gib', instanceType: null },
+        claimed: false,
+      }));
+    });
+    expect(await run(['box', 'create', 'gbox'], ctx())).toBe(0);
+    expect(stdout()).toContain('Creating box gbox (provisioning, 4 vCPU, 32 GB)');
+  });
+
+  it('project create --new-box --size wins over the repository\'s size', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.repoFiles = { [WEBAPP]: { size: 'medium' } };
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--size', 'large', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', from: WEBAPP } });
+    expect(box('gbox')).toMatchObject({ size: 'large' });
+  });
+
+  it('--size without --new-box is a usage error: an existing box keeps its size', async () => {
+    expect(await run(['project', 'create', 'devbox/app', '--size', 'small', '--agent', 'claude'], ctx())).toBe(2);
+    expect(stderr()).toContain('--size goes with --new-box');
+    expect(mutations()).toEqual([]);
+  });
+});
+
+describe('box disks (--disk)', () => {
+  const WEBAPP = 'https://github.com/example-org/webapp';
+
+  it('box create --disk sends diskGiB, and says what the box got', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.provisionPolls = Infinity;
+    expect(await run(['box', 'create', 'roomy', '--disk', '200'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'roomy', diskGiB: 200 } }]);
+    expect(stdout()).toContain('Creating box roomy (provisioning, small, 200 GB disk)');
+    expect(box('roomy')).toMatchObject({ diskGiB: 200 });
+  });
+
+  it('box create without --disk gets 120 GB', async () => {
+    expect(await run(['box', 'create', 'plain', '--wait'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'plain' } });
+    expect(stdout()).toBe('Created box plain (120 GB disk); it is running.');
+  });
+
+  it.each([['49'], ['301'], ['120.5'], ['200GB'], ['big'], ['']])('refuses --disk %j before asking the orchestrator', async value => {
+    expect(await run(['box', 'create', 'x', '--disk', value], ctx())).toBe(2);
+    expect(stderr()).toContain('--disk takes a whole number of GB from 50 to 300');
+    expect(mutations()).toEqual([]);
+  });
+
+  it('project create --new-box --disk sends it with --size and --from', async () => {
+    orch.lifecycle.defaultSize = 'small';
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--size', 'large', '--disk', '300', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', diskGiB: 300, from: WEBAPP } });
+    expect(stderr()).toContain('Created box gbox (large, 300 GB disk); gbox/app is set up on it once it is running.');
+  });
+
+  it('project create --new-box --from a repo whose environment.json asks for a disk makes the box with it, with no --disk', async () => {
+    orch.lifecycle.repoFiles = { [WEBAPP]: { diskGiB: 250 } };
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
+    expect(box('gbox')).toMatchObject({ diskGiB: 250 });
+  });
+
+  it('--disk without --new-box is a usage error: an existing box keeps its disk', async () => {
+    expect(await run(['project', 'create', 'devbox/app', '--disk', '200', '--agent', 'claude'], ctx())).toBe(2);
+    expect(stderr()).toContain('--disk goes with --new-box');
+    expect(mutations()).toEqual([]);
+  });
+});
+
 describe('termag project create --new-box', () => {
   it('creates the box, the project on it while it provisions, then waits for the box', async () => {
     orch.lifecycle.provisionPolls = 3;
     expect(await run(['project', 'create', 'newbox/app', '--new-box', '--agent', 'claude', '--from', 'research'], ctx())).toBe(0);
     expect(orch.lifecycle.calls).toEqual([
-      { route: 'POST /boxes', body: { name: 'newbox' } },
+      // `from` rides along so the orchestrator can give the box the repository's default size.
+      { route: 'POST /boxes', body: { name: 'newbox', from: 'research' } },
       { route: 'POST /projects', body: { boxId: 'i-newbox', name: 'app', agent: 'claude', from: 'research' } },
     ]);
-    expect(stderr()).toContain('Created box newbox; newbox/app is set up on it once it is running.');
+    expect(stderr()).toContain('Created box newbox (120 GB disk); newbox/app is set up on it once it is running.');
     expect(stderr()).toMatch(/^newbox: provisioning \(\d+s\)$/m);
     expect(stdout()).toBe('Created box newbox. Created newbox/app (claude); its agent pane clones https://github.com/example-org/research.git first.');
     expect(orch.lifecycle.projects.map(p => p.ref)).toContain('newbox/app');
+  });
+
+  it('--for-ask, deprecated, still makes the box and the project for an ask, with a one-line note pointing at ask --new-box', async () => {
+    orch.lifecycle.defaultSize = 'large';
+    expect(await run(['project', 'create', 'askbox/termag-3', '--new-box', '--agent', 'claude', '--for-ask'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([
+      { route: 'POST /boxes', body: { name: 'askbox', createdFor: 'ask' } },
+      { route: 'POST /projects', body: { boxId: 'i-askbox', name: 'termag-3', agent: 'claude', createdFor: 'ask' } },
+    ]);
+    // Sized like any box: the owner's default.
+    expect(box('askbox')).toMatchObject({ size: 'large', createdFor: 'ask' });
+    expect(err.filter(l => l.includes('deprecated'))).toEqual([
+      'termag: --for-ask is deprecated: `termag ask --new-box <box>/<project> <prompt|->` makes the box and the project for an ask, and asks, in one command',
+    ]);
+  });
+
+  it('--for-ask on box create, and on a project on an existing box, says the same', async () => {
+    expect(await run(['box', 'create', 'askbox2', '--for-ask'], ctx())).toBe(0);
+    expect(await run(['project', 'create', 'devbox/x', '--agent', 'claude', '--for-ask'], ctx())).toBe(0);
+    expect(err.filter(l => l.includes('--for-ask is deprecated'))).toHaveLength(2);
+    expect(orch.lifecycle.calls.map(c => c.body.createdFor)).toEqual(['ask', 'ask']);
   });
 
   it('--json prints the box and the project, and nothing on stderr', async () => {
@@ -492,7 +666,7 @@ describe('termag box rename', () => {
 describe('termag box set --auto-park', () => {
   it('sets the hours and turns it off', async () => {
     expect(await run(['box', 'set', 'devbox', '--auto-park', '1h'], ctx())).toBe(0);
-    expect(stdout()).toBe('devbox hibernates after 1 h idle.');
+    expect(stdout()).toBe('devbox is stopped after 1 h idle.');
     expect(await run(['box', 'set', 'devbox', '--auto-park', 'off'], ctx())).toBe(0);
     expect(out.at(-1)).toBe('Auto-park is off for devbox.');
     expect(orch.lifecycle.calls).toEqual([
@@ -502,18 +676,49 @@ describe('termag box set --auto-park', () => {
     expect(err).toEqual([]);
   });
 
-  it('warns on a box that cannot hibernate, and still succeeds', async () => {
-    orch.lifecycle.cannotHibernate.add('i1');
+  it('warns on a box auto-park cannot run on, and still succeeds', async () => {
+    orch.lifecycle.cannotPark.add('i1');
     expect(await run(['box', 'set', 'devbox', '--auto-park', '4'], ctx())).toBe(0);
-    expect(stderr()).toMatch(/^Warning: .*can't hibernate/);
-    expect(stdout()).toBe('devbox hibernates after 4 h idle.');
+    expect(stderr()).toMatch(/^Warning: .*auto-park does nothing/);
+    expect(stdout()).toBe('devbox is stopped after 4 h idle.');
+  });
+
+  it("off clears the setting, and says when box-idle-stop-enabled's window stops the box instead", async () => {
+    expect(await run(['box', 'set', 'devbox', '--auto-park', 'off'], ctx())).toBe(0);
+    expect(stdout()).toBe('Auto-park is off for devbox.');
+    orch.lifecycle.idleStopHours = 2;
+    expect(await run(['box', 'set', 'devbox', '--auto-park', 'off'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/devbox has no idle setting of its own, so it is stopped after 2 h idle\.$/);
+  });
+
+  it('says a box that cannot hibernate is stopped and terminated once parked, with no hibernate wording', async () => {
+    orch.lifecycle.cannotHibernate.add('i1');
+    expect(await run(['box', 'set', 'devbox', '--auto-park', '1h', '--terminate-after', '1d'], ctx())).toBe(0);
+    expect(err).toEqual([]);
+    expect(out).toEqual([
+      'devbox is stopped after 1 h idle.',
+      "devbox is terminated 1 day after auto-park stops it, or 90 days by default while it has work that isn't pushed anywhere.",
+    ]);
+    expect(out.join('\n')).not.toMatch(/hibernat/);
+  });
+
+  it('box set --help speaks of parking, not hibernating', async () => {
+    expect(await run(['box', 'set', '--help'], ctx())).toBe(0);
+    const help = [...out, ...err].join('\n');
+    expect(help).toContain('--auto-park parks it after that long idle, --terminate-after terminates it after that long parked');
+    expect(help).not.toMatch(/hibernat/);
+  });
+
+  it('reads an older orchestrator that sends no limit in effect', () => {
+    expect(autoParkLine('devbox', { idleHibernateHours: 3, hibernatedTerminateDays: null, warning: null })).toBe('devbox is stopped after 3 h idle.');
+    expect(autoParkLine('devbox', { idleHibernateHours: null, hibernatedTerminateDays: null, warning: null })).toBe('Auto-park is off for devbox.');
   });
 
   it('--json carries the warning in the lifecycle', async () => {
-    orch.lifecycle.cannotHibernate.add('i1');
+    orch.lifecycle.cannotPark.add('i1');
     expect(await run(['box', 'set', 'devbox', '--auto-park', '2h', '--json'], ctx())).toBe(0);
     expect(err).toEqual([]);
-    expect(lastJson()).toMatchObject({ box: { id: 'i1', name: 'devbox' }, lifecycle: { idleHibernateHours: 2, warning: expect.stringContaining("can't hibernate") } });
+    expect(lastJson()).toMatchObject({ box: { id: 'i1', name: 'devbox' }, lifecycle: { idleHibernateHours: 2, warning: expect.stringContaining('auto-park does nothing') } });
   });
 
   it('refuses a missing or malformed value before calling the orchestrator', async () => {
@@ -525,12 +730,27 @@ describe('termag box set --auto-park', () => {
   });
 });
 
+describe('termag box keep', () => {
+  it("restarts a running box's idle clock and says how long it now has", async () => {
+    orch.lifecycle.idleStopHours = 2;
+    expect(await run(['box', 'keep', 'devbox'], ctx())).toBe(0);
+    expect(stdout()).toBe('Kept devbox running: it parks after another 2 h with no activity.');
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes/i1/keep-running', body: {} }]);
+  });
+
+  it("passes on the orchestrator's refusal for a box that isn't running", async () => {
+    expect(await run(['box', 'stop', 'devbox'], ctx())).toBe(0);
+    expect(await run(['box', 'keep', 'devbox'], ctx())).not.toBe(0);
+    expect(stderr()).toMatch(/Only a running box can be kept running/);
+  });
+});
+
 describe('termag box set --terminate-after', () => {
   it('sends only the settings given', async () => {
     expect(await run(['box', 'set', 'devbox', '--terminate-after', '7d'], ctx())).toBe(0);
-    expect(stdout()).toMatch(/^devbox is terminated after 7 days hibernated/);
+    expect(stdout()).toMatch(/^devbox is terminated 7 days after auto-park stops it/);
     expect(await run(['box', 'set', 'devbox', '--terminate-after', 'off', '--auto-park', '1'], ctx())).toBe(0);
-    expect(out.slice(-2)).toEqual(['devbox hibernates after 1 h idle.', 'devbox is never terminated automatically.']);
+    expect(out.slice(-2)).toEqual(['devbox is stopped after 1 h idle.', 'devbox is never terminated automatically.']);
     expect(orch.lifecycle.calls).toEqual([
       { route: 'PATCH /boxes/i1/lifecycle', body: { hibernatedTerminateDays: 7 } },
       { route: 'PATCH /boxes/i1/lifecycle', body: { idleHibernateHours: 1, hibernatedTerminateDays: null } },
@@ -538,10 +758,10 @@ describe('termag box set --terminate-after', () => {
     expect(err).toEqual([]);
   });
 
-  it('warns on a box that cannot hibernate, and still succeeds', async () => {
-    orch.lifecycle.cannotHibernate.add('i1');
+  it('warns on a box auto-park cannot run on, and still succeeds', async () => {
+    orch.lifecycle.cannotPark.add('i1');
     expect(await run(['box', 'set', 'devbox', '--terminate-after', '1', '--json'], ctx())).toBe(0);
-    expect(lastJson()).toMatchObject({ lifecycle: { hibernatedTerminateDays: 1, warning: expect.stringContaining("can't hibernate") } });
+    expect(lastJson()).toMatchObject({ lifecycle: { hibernatedTerminateDays: 1, warning: expect.stringContaining('auto-park does nothing') } });
   });
 });
 
@@ -559,9 +779,55 @@ describe('helpers and help', () => {
 
   it('lists the lifecycle commands in --help', async () => {
     expect(await run(['--help'], ctx())).toBe(0);
-    for (const c of ['box create', 'box start', 'box stop', 'box set', 'box rename', 'box rm', 'project create', 'project rename', 'project archive']) {
+    for (const c of ['box create', 'box start', 'box stop', 'box set', 'box rename', 'box resize', 'box rm', 'project create', 'project rename', 'project archive']) {
       expect(stdout()).toContain(c);
     }
+  });
+});
+
+describe('termag box resize', () => {
+  it('asks first, then resizes; --wait follows the phases to the new size', async () => {
+    expect(await run(['box', 'resize', 'devbox', 'large', '--wait'], ctx())).toBe(0);
+    expect(questions).toEqual(['Resize devbox to large? It stops for two to three minutes, and anything running on it stops. [y/N] ']);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes/i1/resize', body: { size: 'large' } }]);
+    expect(stderr()).toMatch(/^devbox: stopping \(\d+s\)$/m);
+    expect(stderr()).toMatch(/^devbox: changing its instance type/m);
+    expect(stderr()).toMatch(/^devbox: starting, waiting for its agent/m);
+    expect(stdout()).toBe('devbox is now large (m8g.2xlarge) and running.');
+  });
+
+  it('takes sizes only, never an instance type', async () => {
+    expect(await run(['box', 'resize', 'devbox', 'm8g.4xlarge', '--yes'], ctx())).toBe(2);
+    expect(stderr()).toMatch(/sizes only/);
+    expect(orch.lifecycle.calls).toEqual([]);
+  });
+
+  it('a stopped box stays stopped', async () => {
+    orch.lifecycle.boxes.push({ ...orch.lifecycle.boxes[0], id: 'i3', name: 'parked', state: 'stopped', status: 'stopped', agentConnected: false, size: 'small', projects: [] });
+    expect(await run(['box', 'resize', 'parked', 'medium', '--wait', '--yes'], ctx())).toBe(0);
+    expect(stdout()).toBe('parked is now medium (m8g.xlarge) and stopped; `termag box start parked` starts it.');
+  });
+
+  it('says what blocks a busy box and needs --force without a terminal', async () => {
+    orch.lifecycle.resizeBlockers = [{ check: 'working', reason: 'an agent is working on it, and its turn stops', forceable: true }];
+    expect(await run(['box', 'resize', 'devbox', 'large', '--yes'], agentless())).toBe(1);
+    expect(stderr()).toMatch(/an agent is working on it.*Pass --force/);
+    expect(await run(['box', 'resize', 'devbox', 'large', '--yes', '--force'], agentless())).toBe(0);
+    expect(orch.lifecycle.calls.at(-1)).toEqual({ route: 'POST /boxes/i1/resize', body: { size: 'large', force: true } });
+  });
+
+  it('at a terminal, a busy box is a second question, then a forced resize', async () => {
+    orch.lifecycle.resizeBlockers = [{ check: 'ask-run', reason: 'an ask is running on it, and its turn stops', forceable: true }];
+    expect(await run(['box', 'resize', 'devbox', 'small'], ctx())).toBe(0);
+    expect(questions.at(-1)).toBe('Resize devbox anyway? [y/N] ');
+    expect(mutations()).toEqual(['POST /boxes/i1/resize', 'POST /boxes/i1/resize']);
+    expect(stdout()).toMatch(/^Resizing devbox to small/);
+  });
+
+  it('a box already that size is a no-op', async () => {
+    expect(await run(['box', 'resize', 'devbox', 'medium'], ctx())).toBe(0);
+    expect(stdout()).toBe('devbox is already medium.');
+    expect(orch.lifecycle.calls).toEqual([]);
   });
 });
 

@@ -2,6 +2,7 @@ import { copyFileSync, mkdirSync, readFileSync, realpathSync, renameSync, statSy
 import { dirname, join } from 'node:path';
 import { CliError } from '../errors.js';
 import { shQuote } from './sshArgs.js';
+import { aliasFor, type ConnectBox, type ConnectProject } from './target.js';
 
 export const BEGIN_MARKER = '# >>> termag ssh-config >>>';
 export const END_MARKER = '# <<< termag ssh-config <<<';
@@ -10,12 +11,65 @@ export function sshConfigPath(home: string): string {
   return join(home, '.ssh', 'config');
 }
 
-/** The command ssh runs for a `termag-*` host: `<termag> [--host <url>] ssh-proxy %h %p`. */
-export function proxyCommandFor(termag: string[], host: string | null): string {
+/** The command ssh runs for a `termag-*` host: `<termag> [--host <url>] ssh-proxy [--wake] %h %p`. */
+export function proxyCommandFor(termag: string[], host: string | null, opts: { wake?: boolean } = {}): string {
   const words = [...termag.map(w => shQuote(w).replace(/%/g, '%%'))];
   if (host) words.push('--host', shQuote(host).replace(/%/g, '%%'));
-  words.push('ssh-proxy', '%h', '%p');
+  words.push('ssh-proxy', ...(opts.wake ? ['--wake'] : []), '%h', '%p');
   return words.join(' ');
+}
+
+// The API reports these names, so only ones that can't break out of their ssh_config line or the remote shell go in.
+const SAFE_NAME = /^[A-Za-z0-9_-]+$/;
+const SAFE_USER = /^[a-z_][a-z0-9_.-]*$/;
+
+/** A box whose agent runs as someone other than the account's unix user (a claimed warm box stays `termag`). */
+export interface HostUser { alias: string; user: string }
+
+/** `ssh <alias>` attaches to `session`, one of a project's tmux sessions, on the box named `hostName`. */
+export interface SessionHost { alias: string; hostName: string; user: string; session: string }
+
+export interface SshHosts {
+  hostUsers: HostUser[];
+  sessionHosts: SessionHost[];
+  /** `<box>/<project>` refs with no session hosts, because a name in them can't go in ssh_config. */
+  skipped: string[];
+}
+
+/**
+ * The per-box and per-project hosts for the block, from the caller's /boxes
+ * and /projects. A project gets `termag-<box>.<project>` for its main
+ * workstream's agent session and `termag-<box>.<project>.ctrl` for its ctrl
+ * shell, by the session names the orchestrator reports.
+ */
+export function sshHosts(user: string, boxes: ConnectBox[], projects: ConnectProject[]): SshHosts {
+  const named = boxes.filter(b => SAFE_NAME.test(b.name));
+  const boxUser = (b: ConnectBox) => (b.hostUnixUser && SAFE_USER.test(b.hostUnixUser) ? b.hostUnixUser : user);
+  const hostUsers = named
+    .filter(b => boxUser(b) !== user)
+    .map(b => ({ alias: aliasFor(b), user: boxUser(b) }))
+    .sort((a, b) => a.alias.localeCompare(b.alias));
+  const byId = new Map(named.map(b => [b.id, b]));
+  const sessionHosts: SessionHost[] = [];
+  const skipped: string[] = [];
+  const onBoxes = projects
+    .flatMap(p => {
+      const box = byId.get(p.box.id);
+      return box && p.sessions ? [{ p, box, ...p.sessions }] : [];
+    })
+    .sort((a, b) => a.box.name.localeCompare(b.box.name) || a.p.name.localeCompare(b.p.name));
+  for (const { p, box, agent, ctrl } of onBoxes) {
+    if (![p.name, agent, ctrl].every(n => SAFE_NAME.test(n))) {
+      skipped.push(`${box.name}/${p.name}`);
+      continue;
+    }
+    const at = { hostName: aliasFor(box), user: boxUser(box) };
+    sessionHosts.push(
+      { ...at, alias: `${at.hostName}.${p.name}`, session: agent },
+      { ...at, alias: `${at.hostName}.${p.name}.ctrl`, session: ctrl },
+    );
+  }
+  return { hostUsers, sessionHosts, skipped };
 }
 
 /**
@@ -23,15 +77,24 @@ export function proxyCommandFor(termag: string[], host: string | null): string {
  * the first value it finds for each setting, so a later `Host *` can't
  * override it. The trailing `Host *` hands whatever follows back to every
  * host, so settings the file had before its first `Host` line stay global.
- * `hostUsers` comes first for the same reason: a box whose agent runs as
- * someone other than `user` (a claimed warm box stays `termag`).
+ * `hostUsers` and `sessionHosts` come first for the same reason. A session
+ * host's own `HostName` is the box's alias, so the wildcard's ProxyCommand
+ * (`%h`) reaches that box.
  */
-export function renderBlock(opts: { proxyCommand: string; user: string; hostUsers?: Array<{ alias: string; user: string }> }): string {
+export function renderBlock(opts: { proxyCommand: string; user: string; hostUsers?: HostUser[]; sessionHosts?: SessionHost[] }): string {
   return [
     BEGIN_MARKER,
     '# Managed by `termag ssh-config --install`, which replaces everything between these markers.',
     '# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.',
+    "# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.",
     ...(opts.hostUsers ?? []).flatMap(h => [`Host ${h.alias}`, `  User ${h.user}`]),
+    ...(opts.sessionHosts ?? []).flatMap(h => [
+      `Host ${h.alias}`,
+      `  HostName ${h.hostName}`,
+      `  User ${h.user}`,
+      '  RequestTTY yes',
+      `  RemoteCommand tmux attach-session -t ${h.session}`,
+    ]),
     'Host termag-*',
     `  User ${opts.user}`,
     `  ProxyCommand ${opts.proxyCommand}`,

@@ -1,5 +1,5 @@
 import { freshAccess, expiresAtFrom } from './access.js';
-import { Api, type Box, type Project, type WhoamiResponse } from './api.js';
+import { Api, type BearerSource, type Box, type Project, type WhoamiResponse } from './api.js';
 import type { ParsedArgs } from './args.js';
 import { resolveTarget, type Target } from './config.js';
 import type { Ctx } from './context.js';
@@ -21,25 +21,38 @@ export function session(ctx: Ctx, args: ParsedArgs): Session {
   };
 }
 
-/** The login's access token, refreshed with its device token when missing or about to lapse. */
-async function accessToken(ctx: Ctx, s: Session, login: StoredLogin): Promise<string> {
-  return (await freshAccess({ host: s.target.host, credsPath: s.credsPath, fetch: ctx.fetch }, login)).accessToken;
+/** The login's access token, refreshed with its device token when missing, about to lapse, or `rejected`. */
+async function accessToken(ctx: Ctx, s: Session, login: StoredLogin, opts: { rejected?: string; validForMs?: number } = {}): Promise<string> {
+  return (await freshAccess({ host: s.target.host, credsPath: s.credsPath, fetch: ctx.fetch }, login, opts)).accessToken;
+}
+
+/**
+ * The bearer for this orchestrator, asked for before every request: a device
+ * login's access token (refreshed when about to lapse) wins over the box's own
+ * credential. Given the token the orchestrator just refused (`rejected`), it
+ * refreshes, unless another request already has; a box's credential is what
+ * it is.
+ */
+export function bearerFor(ctx: Ctx, s: Session): BearerSource {
+  const notSignedIn = () => new CliError('auth_required', `Not signed in to ${s.target.host}; run \`termag login\``);
+  const login = loadLogin(s.credsPath, s.target.host);
+  if (!login) {
+    const boxToken = s.target.box?.token;
+    if (!boxToken) throw notSignedIn();
+    return async () => boxToken;
+  }
+  // Re-read per request: a refresh saves the new access token, and a logout elsewhere removes the login.
+  return async (opts = {}) => {
+    const current = loadLogin(s.credsPath, s.target.host);
+    if (!current) throw notSignedIn();
+    return accessToken(ctx, s, current, { rejected: opts.rejected, validForMs: opts.validForMs });
+  };
 }
 
 /** A device login for this orchestrator wins over the box's own credential. */
 export async function authedApi(ctx: Ctx, s: Session, opts: { timeoutMs?: number } = {}): Promise<Api> {
-  const notSignedIn = () => new CliError('auth_required', `Not signed in to ${s.target.host}; run \`termag login\``);
   const login = loadLogin(s.credsPath, s.target.host);
-  if (!login) {
-    if (!s.target.box?.token) throw notSignedIn();
-    return new Api({ host: s.target.host, token: s.target.box.token, fetch: ctx.fetch, timeoutMs: opts.timeoutMs });
-  }
-  // Re-read per request: a refresh saves the new access token, and a logout elsewhere removes the login.
-  const token = async () => {
-    const current = loadLogin(s.credsPath, s.target.host);
-    if (!current) throw notSignedIn();
-    return accessToken(ctx, s, current);
-  };
+  const token = !login && s.target.box?.token ? s.target.box.token : bearerFor(ctx, s);
   return new Api({ host: s.target.host, token, fetch: ctx.fetch, timeoutMs: opts.timeoutMs });
 }
 
@@ -137,6 +150,41 @@ export async function cmdWhoami(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   return EXIT.OK;
 }
 
+const REQUIREMENTS_RE = /^(\d+)vcpu-(\d+)gib$/;
+
+/** `4vcpu-32gib` as "4 vCPU, 32 GB": a requirements box before EC2 has said which type it got. */
+function requirementsText(size: string): string {
+  const m = REQUIREMENTS_RE.exec(size);
+  return m ? `${m[1]} vCPU, ${m[2]} GB` : size;
+}
+
+/**
+ * A box's size in a sentence: the preset's name; for a box sized by its
+ * repo's requirements, the type it launched as, else the requirements; null
+ * for no size.
+ */
+export function boxSizeText(b: Pick<Box, 'size' | 'instanceType'>): string | null {
+  if (!b.size) return null;
+  return REQUIREMENTS_RE.test(b.size) ? b.instanceType ?? requirementsText(b.size) : b.size;
+}
+
+/** The box's size and disk, as a create says what it got: `large, 200 GB disk`; null when neither is known. */
+export function boxSpecText(b: Pick<Box, 'size' | 'instanceType' | 'diskGiB'>): string | null {
+  const parts = [boxSizeText(b), b.diskGiB ? `${b.diskGiB} GB disk` : null].filter((p): p is string => !!p);
+  return parts.length ? parts.join(', ') : null;
+}
+
+/**
+ * The SIZE column: the size and the type it got; the type alone for a box
+ * sized by its repo's .termag/environment.json requirements (recorded as
+ * `4vcpu-32gib`) and for a box with no size; `-` when neither is known.
+ */
+export function boxSizeCell(b: Pick<Box, 'size' | 'instanceType'>): string {
+  if (b.size && REQUIREMENTS_RE.test(b.size)) return b.instanceType ?? requirementsText(b.size);
+  if (b.size) return b.instanceType ? `${b.size} (${b.instanceType})` : b.size;
+  return b.instanceType ?? '-';
+}
+
 export async function cmdBoxList(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const s = session(ctx, args);
   const api = await authedApi(ctx, s);
@@ -144,10 +192,12 @@ export async function cmdBoxList(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> 
   if (args.json) { ctx.out(json({ boxes })); return EXIT.OK; }
   if (boxes.length === 0) { ctx.out('No boxes. Create one with `termag box create <name>`.'); return EXIT.OK; }
   ctx.out(table(
-    ['BOX', 'STATE', 'AGENT', 'PROJECTS'],
+    ['BOX', 'STATE', 'SIZE', 'DISK', 'AGENT', 'PROJECTS'],
     boxes.map(b => [
       b.name,
       b.state === 'failed' && b.error ? `failed: ${b.error}` : b.state,
+      b.resize?.running ? `${boxSizeCell(b)} -> ${b.resize.to} (${b.resize.phase})` : boxSizeCell(b),
+      b.diskGiB ? `${b.diskGiB} GB` : '-',
       b.agentConnected ? 'connected' : '-',
       b.projects.map(p => p.name).join(', ') || '-',
     ]),

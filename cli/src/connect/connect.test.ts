@@ -7,7 +7,7 @@ import type { Ctx } from '../context.js';
 import { run } from '../main.js';
 import { BOXES, PROJECTS, startFakeOrchestrator, type FakeOrchestrator } from '../test/fakeOrchestrator.js';
 
-// Stand-ins for aws, session-manager-plugin, ssh and termag: each logs its
+// Stand-ins for aws, session-manager-plugin, ssh, termag and infocmp: each logs its
 // argv, and files in the state directory steer what aws reports.
 const FAKE = `#!${process.execPath}
 const { appendFileSync, existsSync, rmSync } = require('node:fs');
@@ -30,6 +30,15 @@ if (name === 'aws') {
   if (cmd === 'sso login') { if (!has('sso-login-fails')) { rmSync(join(state, 'sso-expired'), { force: true }); rmSync(join(state, 'no-token'), { force: true }); } process.exit(has('sso-login-fails') ? 1 : 0); }
   process.exit(0);
 }
+if (name === 'infocmp') {
+  if (has('no-local-entry')) { process.stderr.write('infocmp: no such entry\\n'); process.exit(1); }
+  process.stdout.write(args.at(-1) + '|a terminal,\\n\\tam,\\n\\tcols#80,\\n'); process.exit(0);
+}
+if (name === 'ssh' && args.includes('-G')) {
+  process.stdout.write(has('ssh-config') ? require('node:fs').readFileSync(join(state, 'ssh-config'), 'utf8') : 'requesttty auto\\n');
+  process.exit(0);
+}
+if (name === 'ssh') require('node:fs').writeFileSync(join(state, 'ssh-env.json'), JSON.stringify({ TERM: process.env.TERM }));
 if (name === 'ssh') process.exit(Number(process.env.FAKE_SSH_EXIT || 0));
 process.exit(0);
 `;
@@ -82,7 +91,9 @@ function calls(name?: string): string[][] {
     .map(c => c.args);
 }
 
-const sshArgv = () => { const c = calls('ssh'); expect(c).toHaveLength(1); return c[0]; };
+// The session's ssh, not an `ssh -G` that only reads the configuration.
+const sshArgv = () => { const c = calls('ssh').filter(a => !a.includes('-G')); expect(c).toHaveLength(1); return c[0]; };
+const sshEnv = () => JSON.parse(readFileSync(join(state, 'ssh-env.json'), 'utf8')) as Record<string, string>;
 const flag = (name: string) => writeFileSync(join(state, name), '');
 const removeTool = (name: string) => rmSync(join(bin, name));
 
@@ -92,7 +103,7 @@ beforeEach(async () => {
   state = join(home, 'state');
   mkdirSync(bin);
   mkdirSync(state);
-  for (const tool of ['aws', 'session-manager-plugin', 'ssh', 'termag']) {
+  for (const tool of ['aws', 'session-manager-plugin', 'ssh', 'termag', 'infocmp']) {
     writeFileSync(join(bin, tool), FAKE);
     chmodSync(join(bin, tool), 0o755);
   }
@@ -103,6 +114,7 @@ beforeEach(async () => {
   err = [];
   expect(await run(['login'], ctx())).toBe(0);
   out = [];
+  err = [];
 });
 
 afterEach(async () => {
@@ -384,6 +396,101 @@ describe('termag attach', () => {
   });
 });
 
+describe('a TERM the box may not have', () => {
+  const entry = (term: string) => Buffer.from(`${term}|a terminal,\n\tam,\n\tcols#80,\n`).toString('base64');
+
+  it('leaves a TERM every box has alone', async () => {
+    expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-256color' }))).toBe(0);
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(calls('infocmp')).toEqual([]);
+    expect(err).toEqual([]);
+  });
+
+  it('installs the local entry on a box that lacks it, then attaches under it', async () => {
+    expect(await run(['attach', 'devbox/webapp-fix', '--ctrl'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+    expect(calls('infocmp')).toEqual([['-x', 'xterm-ghostty']]);
+    const argv = sshArgv();
+    expect(argv.slice(-3, -1)).toEqual(['-t', 'termag-devbox']);
+    expect(argv.at(-1)).toBe(
+      `if ! infocmp xterm-ghostty >/dev/null 2>&1; then printf %s ${entry('xterm-ghostty')} | base64 -d | tic -x -o "$HOME/.terminfo" - >/dev/null 2>&1; `
+      + `infocmp xterm-ghostty >/dev/null 2>&1 || { echo 'termag: could not install the terminfo entry for xterm-ghostty on the box; using TERM=xterm-256color' >&2; TERM=xterm-256color; export TERM; }; fi; `
+      + 'tmux attach-session -t alice-webapp-fix-ctrl');
+    expect(err).toEqual([]);
+  });
+
+  it('does the same for the shell termag ssh opens, and gives a plain ssh a login shell to precede', async () => {
+    expect(await run(['ssh', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-kitty' }))).toBe(0);
+    expect(sshArgv().at(-1)).toMatch(/^if ! infocmp xterm-kitty .*; fi; cd \/home\/alice\/termag\/projects\/webapp-fix && exec "\$\{SHELL:-\/bin\/sh\}" -l$/);
+    rmSync(join(state, 'calls.jsonl'));
+    expect(await run(['ssh', 'devbox'], ctx({}, { TERM: 'xterm-kitty' }))).toBe(0);
+    const argv = sshArgv();
+    expect(argv.slice(-3, -1)).toEqual(['-t', 'termag-devbox']);
+    expect(argv.at(-1)).toMatch(/; fi; exec "\$\{SHELL:-\/bin\/sh\}" -l$/);
+  });
+
+  it('leaves commands, -N and -T sessions alone', async () => {
+    for (const extra of [['--', 'uptime'], ['-N', '-L', '3000:localhost:3000'], ['-T']]) {
+      rmSync(join(state, 'calls.jsonl'), { force: true });
+      expect(await run(['ssh', 'devbox', ...extra], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+      expect(sshArgv().join(' ')).not.toContain('infocmp');
+    }
+    expect(calls('infocmp')).toEqual([]);
+  });
+
+  it('checks wezterm and foot too: they are in ncurses-term, which a box need not have', async () => {
+    for (const term of ['wezterm', 'foot']) {
+      rmSync(join(state, 'calls.jsonl'), { force: true });
+      expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: term }))).toBe(0);
+      const remote = sshArgv().at(-1)!;
+      expect(remote.startsWith(`if ! infocmp ${term} `)).toBe(true);
+      expect(remote.endsWith('; fi; tmux attach-session -t alice-webapp-fix-agent')).toBe(true);
+    }
+  });
+
+  it("leaves a plain shell alone when ssh's configuration asks for no pty", async () => {
+    writeFileSync(join(state, 'ssh-config'), 'user alice\nrequesttty false\n');
+    expect(await run(['ssh', 'devbox', '-o', 'RequestTTY=no'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+    expect(calls('ssh').find(a => a.includes('-G'))).toEqual(['-G', '-o', 'RequestTTY=no', 'termag-devbox']);
+    const argv = sshArgv();
+    expect(argv.at(-1)).toBe('termag-devbox');
+    expect(argv).not.toContain('-t');
+    expect(sshEnv().TERM).toBe('xterm-ghostty');
+    expect(err).toEqual([]);
+  });
+
+  it("adds no command next to ssh's own RemoteCommand, and falls back instead", async () => {
+    writeFileSync(join(state, 'ssh-config'), 'requesttty auto\nremotecommand tmux new -A\n');
+    expect(await run(['ssh', 'devbox'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+    const argv = sshArgv();
+    expect(argv.at(-1)).toBe('termag-devbox');
+    expect(argv).not.toContain('-t');
+    expect(sshEnv().TERM).toBe('xterm-256color');
+    expect(err).toEqual(["termag: TERM=xterm-ghostty may be unknown on the box and ssh's RemoteCommand leaves no command to install its terminfo entry before; using TERM=xterm-256color for this session"]);
+  });
+
+  it('falls back to xterm-256color, with a notice, when there is no local infocmp', async () => {
+    removeTool('infocmp');
+    expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(sshEnv().TERM).toBe('xterm-256color');
+    expect(err).toEqual(['termag: TERM=xterm-ghostty may be unknown on the box and there is no infocmp here to copy its terminfo entry to the box; using TERM=xterm-256color for this session']);
+  });
+
+  it('falls back when this machine has no entry either', async () => {
+    flag('no-local-entry');
+    expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
+    expect(sshEnv().TERM).toBe('xterm-256color');
+    expect(err.join('\n')).toContain('this machine has no terminfo entry for it');
+  });
+
+  it('never puts a TERM that is not a plain name into the command line', async () => {
+    expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'x;touch /tmp/pwned' }))).toBe(0);
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(calls('infocmp')).toEqual([]);
+    expect(sshEnv().TERM).toBe('xterm-256color');
+  });
+});
+
 describe('termag ssh-proxy (the ssh-config ProxyCommand)', () => {
   it('starts the TermagSSH session for termag-<box> on port 22, writing nothing to stdout', async () => {
     expect(await run(['ssh-proxy', 'termag-devbox', '22'], ctx())).toBe(0);
@@ -416,6 +523,107 @@ describe('termag ssh-proxy (the ssh-config ProxyCommand)', () => {
   });
 });
 
+describe('termag ssh-proxy --wake', () => {
+  // The `parked` box moves one step per box list, like a box the orchestrator powers.
+  let sim: { state: string; starts: number; startRace: boolean; stuck: boolean };
+  const NEXT: Record<string, string> = { stopping: 'stopped', hibernating: 'hibernated', starting: 'running' };
+  const view = () => ({ ...CONNECT_BOXES[1], state: sim.state, status: sim.state, agentConnected: sim.state === 'running' });
+
+  beforeEach(() => {
+    sim = { state: 'stopped', starts: 0, startRace: false, stuck: false };
+    orch.override.set('/api/cli/v1/boxes', (res) => {
+      const boxes = [CONNECT_BOXES[0], view(), CONNECT_BOXES[2]];
+      if (!sim.stuck && NEXT[sim.state]) sim.state = NEXT[sim.state];
+      serve({ boxes })(res);
+    });
+    orch.override.set('/api/cli/v1/boxes/i2/start', (res) => {
+      sim.starts++;
+      if (sim.startRace) sim.state = 'starting';
+      if (sim.state !== 'stopped' && sim.state !== 'hibernated') {
+        res.writeHead(409, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: `Can't start a box that is ${sim.state}` }));
+        return;
+      }
+      sim.state = 'starting';
+      res.writeHead(202, { 'Content-Type': 'application/json' }).end(JSON.stringify({ box: view() }));
+    });
+  });
+
+  const proxy = (...flags: string[]) => run(['ssh-proxy', ...flags, 'termag-parked', '22'], ctx({ pollIntervalMs: 5 }));
+  const ssmCalls = () => calls('aws').filter(a => a[0] === 'ssm');
+
+  it.each([
+    ['stopped', 1],
+    ['hibernated', 1],
+    ['stopping', 1],
+    ['hibernating', 1],
+    ['starting', 0],
+    ['running', 0],
+  ])('connects to a %s box after %i start, with nothing on stdout', async (state, starts) => {
+    sim.state = state;
+    expect(await proxy('--wake')).toBe(0);
+    expect(sim.starts).toBe(starts);
+    expect(ssmCalls()).toEqual([[
+      'ssm', 'start-session', '--target', 'i-0parked', '--document-name', 'TermagSSH',
+      '--parameters', 'portNumber=22', '--region', 'us-east-2', '--profile', 'termag-boxes',
+    ]]);
+    expect(out).toEqual([]);
+  });
+
+  it('says on stderr what it does with a parked box', async () => {
+    sim.state = 'stopping';
+    expect(await proxy('--wake')).toBe(0);
+    expect(err).toEqual([
+      'termag: parked is stopping; bringing it up before connecting (--wake)',
+      'parked: stopping, starting it once that finishes',
+      'parked: starting (0s)',
+    ]);
+  });
+
+  it('refuses a failed box as without --wake, and starts nothing', async () => {
+    sim.state = 'failed';
+    expect(await proxy('--wake')).toBe(1);
+    expect(err.join('\n')).toContain('parked failed to come up');
+    expect(sim.starts).toBe(0);
+    expect(calls('aws')).toEqual([]);
+  });
+
+  it('without --wake, refuses a stopped box before touching AWS', async () => {
+    expect(await proxy()).toBe(1);
+    expect(err.join('\n')).toContain('parked is stopped; start it (`termag box start parked` or the web UI) and try again');
+    expect(sim.starts).toBe(0);
+    expect(calls('aws')).toEqual([]);
+  });
+
+  it('waits for a start another connection sent first', async () => {
+    sim.startRace = true;
+    expect(await proxy('--wake')).toBe(0);
+    expect(sim.starts).toBe(1);
+    expect(ssmCalls()).toHaveLength(1);
+  });
+
+  it('gives up after --timeout with exit 5 and never opens the session', async () => {
+    sim.state = 'starting';
+    sim.stuck = true;
+    expect(await proxy('--wake', '--timeout', '0.1')).toBe(5);
+    expect(err.at(-1)).toMatch(/^termag: Timed out after 0s waiting for parked to be running \(it is starting\)$/);
+    expect(ssmCalls()).toEqual([]);
+    expect(out).toEqual([]);
+  });
+
+  it('takes --timeout only with --wake', async () => {
+    expect(await proxy('--timeout', '30')).toBe(2);
+  });
+
+  it('is written into the ProxyCommand by ssh-config --wake', async () => {
+    expect(await run(['ssh-config', '--wake'], ctx())).toBe(0);
+    expect(out.join('\n')).toContain(`  ProxyCommand ${join(bin, 'termag')} --host ${orch.host} ssh-proxy --wake %h %p`);
+    out = [];
+    expect(await run(['ssh-config', '--install', '--wake'], ctx())).toBe(0);
+    expect(readFileSync(join(home, '.ssh', 'config'), 'utf8')).toContain('ssh-proxy --wake %h %p');
+    expect(out.join('\n')).toContain('Re-run `termag ssh-config --install --wake` after adding a box or a project.');
+  });
+});
+
 describe('termag ssh-config', () => {
   it('prints the entry, routed through the termag on PATH and this orchestrator', async () => {
     expect(await run(['ssh-config'], ctx())).toBe(0);
@@ -437,7 +645,26 @@ describe('termag ssh-config', () => {
     const lines = out.join('\n').split('\n');
     expect(lines.indexOf('Host termag-warm')).toBeLessThan(lines.indexOf('Host termag-*'));
     expect(lines[lines.indexOf('Host termag-warm') + 1]).toBe('  User termag');
-    expect(lines.filter(l => l.startsWith('Host '))).toEqual(['Host termag-warm', 'Host termag-*', 'Host *']);
+    expect(lines.filter(l => l.startsWith('Host termag-') && !l.includes('.'))).toEqual(['Host termag-warm', 'Host termag-*']);
+  });
+
+  it("gives each project an agent and a ctrl host, and names the ones it leaves out", async () => {
+    orch.override.set('/api/cli/v1/projects', serve({ projects: [
+      ...CONNECT_PROJECTS,
+      { ...CONNECT_PROJECTS[0], id: 'p3', name: 'odd name', sessions: { agent: 'alice-odd_name-agent', ctrl: 'alice-odd_name-ctrl' } },
+    ] }));
+    expect(await run(['ssh-config'], ctx())).toBe(0);
+    const lines = out.join('\n').split('\n');
+    expect(lines.filter(l => l.startsWith('Host '))).toEqual([
+      'Host termag-devbox.flaky-test', 'Host termag-devbox.flaky-test.ctrl',
+      'Host termag-devbox.webapp-fix', 'Host termag-devbox.webapp-fix.ctrl',
+      'Host termag-*', 'Host *',
+    ]);
+    const ctrl = lines.indexOf('Host termag-devbox.webapp-fix.ctrl');
+    expect(lines.slice(ctrl + 1, ctrl + 5)).toEqual([
+      '  HostName termag-devbox', '  User alice', '  RequestTTY yes', '  RemoteCommand tmux attach-session -t alice-webapp-fix-ctrl',
+    ]);
+    expect(err.join('\n')).toContain('devbox/odd name has no termag-<box>.<project> host');
   });
 
   it('--install writes it once and is idempotent', async () => {

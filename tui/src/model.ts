@@ -15,9 +15,17 @@ export function sessionKey(projectId: string, workstream: string, role: Role): s
   return `${projectId}/${workstream}/${role}`;
 }
 
+/**
+ * Rows by project, workstream and role. A workstream can list several review
+ * rows, one per pane; the first, slot 1, is kept,
+ * as the TUI shows one review pane.
+ */
 export function indexSessions(rows: SessionRow[]): SessionMap {
   const map: SessionMap = {};
-  for (const r of rows) map[sessionKey(r.projectId, r.workstream, r.role)] = r;
+  for (const r of rows) {
+    const k = sessionKey(r.projectId, r.workstream, r.role);
+    if (!(k in map)) map[k] = r;
+  }
   return map;
 }
 

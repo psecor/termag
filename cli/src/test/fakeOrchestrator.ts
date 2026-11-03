@@ -1,9 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { handleAsk, newAskState, type FakeAskState } from './fakeAsk.js';
 import { handleHandoff, newHandoffState, type FakeHandoffState } from './fakeHandoff.js';
+import { handleAutomations, newAutomationsState, type FakeAutomationsState } from './fakeAutomations.js';
 import { handleDoctor, newDoctorState, type FakeDoctorState } from './fakeDoctor.js';
+import { handleBugs, newBugsState, type FakeBugsState } from './fakeBugs.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { advance, handleLifecycle, newLifecycleState, readJson, type FakeLifecycleState } from './fakeLifecycle.js';
 
 /**
@@ -29,14 +32,19 @@ export interface FakeOrchestrator {
   lifecycle: FakeLifecycleState;
   ask: FakeAskState;
   handoff: FakeHandoffState;
+  automations: FakeAutomationsState;
+  /** `termag bug` (fakeBugs.ts). */
+  bugs: FakeBugsState;
+  /** WebSocket upgrades (the forward socket, fakeForward.ts); unset, they are dropped. */
+  upgrade: ((req: IncomingMessage, socket: Duplex, head: Buffer) => void) | null;
   close: () => Promise<void>;
 }
 
 const USER = { email: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice' };
 
 export const BOXES = [
-  { id: 'i1', name: 'devbox', addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [{ id: 'p1', name: 'webapp-fix' }] },
-  { id: 'i2', name: 'old box', addressable: false, kind: 'ec2', state: 'stopped', status: 'stopped', agentConnected: false, error: null, projects: [] },
+  { id: 'i1', name: 'devbox', addressable: true, kind: 'ec2', flavor: 'full', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [{ id: 'p1', name: 'webapp-fix' }], size: 'medium', instanceType: 'm8g.xlarge', diskGiB: 200 },
+  { id: 'i2', name: 'old box', addressable: false, kind: 'ec2', flavor: 'full', state: 'stopped', status: 'stopped', agentConnected: false, error: null, projects: [] },
 ];
 
 export const PROJECTS = [
@@ -69,6 +77,9 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
     lifecycle: newLifecycleState(BOXES, PROJECTS),
     ask: newAskState(),
     handoff: newHandoffState(),
+    automations: newAutomationsState(),
+    bugs: newBugsState(),
+    upgrade: null as FakeOrchestrator['upgrade'],
   };
 
   const server: Server = createServer(async (req, res) => {
@@ -90,7 +101,9 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
     const route = `${req.method} ${path.slice('/api/cli/v1'.length)}`;
 
     const mintAccess = (device: string) => {
-      const accessToken = 'eyJfake.' + randomBytes(16).toString('base64url') + '.sig';
+      // JWT-shaped, with the sign-in as its `jti` as the orchestrator's are (the forward renews within one sign-in).
+      const payload = Buffer.from(JSON.stringify({ jti: createHash('sha256').update(device).digest('hex').slice(0, 12), n: randomBytes(12).toString('base64url') })).toString('base64url');
+      const accessToken = 'eyJfake.' + payload + '.sig';
       fake.accessTokens.set(accessToken, device);
       return { accessToken, accessTokenExpiresIn: fake.accessTtlS };
     };
@@ -154,10 +167,16 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
         const body = await readJson(req);
         if (handleAsk(fake.ask, route, url.searchParams, body, res)) return;
         if (handleHandoff(fake.handoff, route, body, res)) return;
+        if (handleAutomations(fake.automations, route, body, isBox, res)) return;
+        if (handleBugs(fake.bugs, route, body, isBox, res)) return;
         if (handleLifecycle(fake.lifecycle, route, body, isBox, res)) return;
         sendJson(res, 404, { error: 'No such CLI endpoint', code: 'not_found' });
       }
     }
+  });
+  server.on('upgrade', (req, socket, head) => {
+    if (fake.upgrade) fake.upgrade(req, socket, head);
+    else socket.destroy();
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
   // The same object the server reads, so a test can change accessTtlS.

@@ -10,11 +10,20 @@ export interface FakeBox {
   name: string;
   addressable: boolean;
   kind: string;
+  // Same optionality as the API's Box: the fake's own made-boxes always set it
+  // (the CLI sends the field), the hand-written fixtures may not.
+  flavor?: string;
   state: string;
   status: string;
   agentConnected: boolean;
   error: string | null;
   projects: Array<{ id: string; name: string }>;
+  size?: string | null;
+  instanceType?: string | null;
+  resize?: { to: string; from: string | null; phase: string; running: boolean; error: string | null } | null;
+  diskGiB?: number | null;
+  /** 'ask' for a box made with createdFor: 'ask', which the real orchestrator also gives the ask-box policy. */
+  createdFor?: string | null;
 }
 
 export interface FakeProject {
@@ -26,6 +35,7 @@ export interface FakeProject {
   status: string;
   waitingReason: string | null;
   rateLimited: unknown;
+  createdFor?: string | null;
   workstreams: string[];
 }
 
@@ -43,6 +53,20 @@ export interface FakeLifecycleState {
   calls: Array<{ route: string; body: Record<string, unknown> }>;
   /** Box ids launched without hibernation: their auto-park setting comes back with a warning. */
   cannotHibernate: Set<string>;
+  /** Boxes auto-park can't run on (not an EC2 box termag runs): the orchestrator's warning. */
+  cannotPark: Set<string>;
+  /** box-idle-stop-enabled's window for a box with no idle hours, or null when that flag is off. */
+  idleStopHours: number | null;
+  /** box-default-size: null is the flag off (no sizes, a size asked for refused), else the owner's default. */
+  defaultSize: string | null;
+  /** What a resize of a running box is refused for until `force` (backend boxResizePolicy blockers); empty is idle. */
+  resizeBlockers: Array<{ check: string; reason: string; forceable: boolean }>;
+  /** Each `from`'s .termag/environment.json as the orchestrator read it: its preset, and the warnings for what it left out. */
+  repoFiles: Record<string, { size?: string; diskGiB?: number; warnings?: string[] }>;
+  /** Fields a box made by POST /boxes gets as well (an EC2 instance to reach, say). */
+  newBoxFields: Record<string, unknown>;
+  /** Fields a project made by POST /projects gets as well (its directory, say). */
+  newProjectFields: Record<string, unknown>;
 }
 
 const TEMPLATES: Record<string, string> = {
@@ -55,7 +79,8 @@ const pending = new WeakMap<FakeBox, number>();
 export function newLifecycleState(boxes: FakeBox[], projects: FakeProject[]): FakeLifecycleState {
   const state: FakeLifecycleState = {
     boxes: structuredClone(boxes), projects: structuredClone(projects),
-    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(),
+    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(), cannotPark: new Set(), idleStopHours: null, defaultSize: null, resizeBlockers: [], repoFiles: {},
+    newBoxFields: {}, newProjectFields: {},
   };
   syncBoxProjects(state);
   return state;
@@ -67,9 +92,19 @@ function syncBoxProjects(state: FakeLifecycleState): void {
   }
 }
 
+const RESIZE_STEP: Record<string, string> = { stopping: 'resizing', resizing: 'starting', starting: 'ready' };
+const RESIZE_TYPES: Record<string, string> = { small: 'm8g.large', medium: 'm8g.xlarge', large: 'm8g.2xlarge' };
+
 /** One step of every box's transition, as a read of the box list sees it. */
 export function advance(state: FakeLifecycleState): void {
   for (const b of state.boxes) {
+    const r = b.resize;
+    if (r?.running) {
+      // A box that was down is retyped and left stopped; a running one goes round to ready.
+      r.phase = r.phase === 'resizing' && b.state === 'stopped' ? 'stopped' : RESIZE_STEP[r.phase] ?? r.phase;
+      if (r.phase === 'ready' || r.phase === 'stopped') { r.running = false; b.size = r.to; b.instanceType = RESIZE_TYPES[r.to]; }
+      continue;
+    }
     if (b.state === 'provisioning') {
       const left = (pending.get(b) ?? state.provisionPolls) - 1;
       pending.set(b, left);
@@ -109,13 +144,44 @@ export function handleLifecycle(
   if (route === 'POST /boxes') {
     state.calls.push({ route, body });
     const name = body.name as string;
-    if (state.boxes.some(b => b.name === name)) { send(res, 409, { error: `A box named "${name}" already exists`, code: 'conflict' }); return true; }
+    // A launch that failed is retried under its own name: the failed box is retired, unless a project waits on it
+    // (its own Retry relaunches it then), as backend routes/instances.ts createBox does.
+    const same = state.boxes.find(b => b.name === name);
+    if (same?.state === 'failed') {
+      if (state.projects.some(p => p.box.id === same.id)) {
+        send(res, 409, { error: `"${name}" failed to launch; use Retry on its project to launch it again`, code: 'conflict' });
+        return true;
+      }
+      state.boxes = state.boxes.filter(b => b !== same);
+    } else if (same) { send(res, 409, { error: `A box named "${name}" already exists`, code: 'conflict' }); return true; }
+    // The orchestrator's size order (backend services/boxSize.ts decideBoxSize), as far as the CLI sees it:
+    // with the flag on, an explicit size, else the `from` repos' environment.json (the largest), else the default; off, none.
+    const types: Record<string, string> = { small: 'm8g.large', medium: 'm8g.xlarge', large: 'm8g.2xlarge' };
+    if (body.size !== undefined && !state.defaultSize) { send(res, 403, { error: 'Choosing a box size is not turned on for you yet', code: 'box_size_disabled' }); return true; }
+    if (body.size !== undefined && !types[body.size as string]) { send(res, 400, { error: 'size must be one of small, medium, large', code: 'invalid_size' }); return true; }
+    // The disk (backend services/boxDiskSize.ts): asked for, else the largest repo file's, else 120; no flag.
+    if (body.diskGiB !== undefined && !(Number.isInteger(body.diskGiB) && (body.diskGiB as number) >= 50 && (body.diskGiB as number) <= 300)) {
+      send(res, 400, { error: 'diskGiB must be a whole number of GB from 50 to 300', code: 'invalid_disk' }); return true;
+    }
+    const forAsk = body.createdFor === 'ask';
+    const files = [body.from ?? []].flat().map(f => state.repoFiles[String(f)]).filter(Boolean);
+    const order = ['small', 'medium', 'large'];
+    const fromFile = files.map(f => f.size).filter((x): x is string => !!x).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0];
+    const size = !state.defaultSize ? null
+      : typeof body.size === 'string' ? body.size
+      : fromFile ?? state.defaultSize;
+    const fileDisks = files.map(f => f.diskGiB).filter((d): d is number => d != null);
+    const diskGiB = typeof body.diskGiB === 'number' ? body.diskGiB : fileDisks.length ? Math.max(...fileDisks) : 120;
     const b: FakeBox = {
-      id: `i-${name}`, name, addressable: true, kind: 'ec2', state: 'provisioning', status: 'provisioning',
-      agentConnected: false, error: null, projects: [],
+      id: `i-${name}`, name, addressable: true, kind: 'ec2',
+      flavor: body.flavor === 'minimal' || body.minimal === true ? 'minimal' : 'full',
+      state: 'provisioning', status: 'provisioning',
+      agentConnected: false, error: null, projects: [], size, instanceType: size ? types[size] : 't4g.medium', diskGiB,
+      ...(forAsk ? { createdFor: 'ask' } : {}), ...state.newBoxFields,
     };
     state.boxes.push(b);
-    send(res, 201, { box: b, claimed: false });
+    const warnings = state.defaultSize && body.size === undefined ? files.flatMap(f => f.warnings ?? []) : [];
+    send(res, 201, { box: b, claimed: false, ...(warnings.length ? { warnings } : {}) });
     return true;
   }
   if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/(start|stop)$/))) {
@@ -129,6 +195,32 @@ export function handleLifecycle(
     send(res, 202, { box: b });
     return true;
   }
+  if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/resize$/))) {
+    state.calls.push({ route, body });
+    const b = box(decodeURIComponent(m[1]));
+    if (!b) { send(res, 404, { error: 'Box not found' }); return true; }
+    if (!RESIZE_TYPES[body.size as string]) { send(res, 400, { error: 'size must be one of small, medium, large', code: 'invalid_size' }); return true; }
+    if (b.resize?.running) { send(res, 409, { error: 'This box is already being resized; one resize at a time', code: 'resize_running' }); return true; }
+    if (b.state === 'running' && state.resizeBlockers.length && body.force !== true) {
+      const forceable = state.resizeBlockers.every(x => x.forceable);
+      send(res, 409, {
+        error: `Resizing stops this box for two to three minutes, and ${state.resizeBlockers.map(x => x.reason).join('; ')}.`,
+        code: 'box_busy', blockers: state.resizeBlockers, forceable,
+      });
+      return true;
+    }
+    b.resize = { to: body.size as string, from: b.size ?? null, phase: b.state === 'running' ? 'stopping' : 'resizing', running: true, error: null };
+    send(res, 202, { box: b, resize: b.resize });
+    return true;
+  }
+  if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/keep-running$/))) {
+    state.calls.push({ route, body });
+    const b = box(decodeURIComponent(m[1]));
+    if (!b) { send(res, 404, { error: 'Box not found' }); return true; }
+    if (b.state !== 'running') { send(res, 409, { error: `Only a running box can be kept running; ${b.name} is ${b.status}`, code: 'conflict' }); return true; }
+    send(res, 200, { lifecycle: { idleHibernateHours: null, idleLimitHours: state.idleStopHours, idleLimitSource: state.idleStopHours ? 'default' : null, hibernatedTerminateDays: null, warning: null } });
+    return true;
+  }
   if (method === 'PATCH' && (m = path.match(/^\/boxes\/([^/]+)\/lifecycle$/))) {
     state.calls.push({ route, body });
     const b = box(decodeURIComponent(m[1]));
@@ -136,11 +228,16 @@ export function handleLifecycle(
     const hours = (body.idleHibernateHours ?? null) as number | null;
     const days = (body.hibernatedTerminateDays ?? null) as number | null;
     const canAutoHibernate = !state.cannotHibernate.has(b.id);
+    // Parking is a stop, so own hours run on a box that can't hibernate too; only cannotPark warns.
+    const ownRuns = !state.cannotPark.has(b.id);
     send(res, 200, {
       lifecycle: {
         canAutoHibernate, idleHibernateHours: hours, hibernatedTerminateDays: days, hibernateDueAt: null,
         terminateDueAt: null, parkedAt: null, unsavedWork: null, note: null,
-        warning: (hours !== null || days !== null) && !canAutoHibernate ? "This box (or its image) can't hibernate, so auto-park does nothing on it." : null,
+        idleLimitHours: hours !== null && ownRuns ? hours : hours === null ? state.idleStopHours : null,
+        idleLimitSource: hours !== null && ownRuns ? 'own' : hours === null && state.idleStopHours !== null ? 'default' : null,
+        warning: (hours !== null || days !== null) && !ownRuns ? "This box (or its image) can't hibernate, so auto-park does nothing on it." : null,
+        parkStop: true,
       },
     });
     return true;
@@ -179,19 +276,38 @@ export function handleLifecycle(
     if (b.state === 'provisioning' && !waits) { send(res, 503, { error: 'Box agent is not connected' }); return true; }
     if (b.state !== 'running' && !waits) { send(res, 409, { error: 'This box is stopped. Start it from the Boxes list first.', code: 'conflict' }); return true; }
     const name = body.name as string;
-    let repoUrl: string | null = null;
-    if (typeof body.from === 'string') {
-      repoUrl = TEMPLATES[body.from] ?? (/^(https:\/\/github\.com\/|git@github\.com:)/.test(body.from) ? body.from : null);
-      if (!repoUrl) { send(res, 400, { error: 'from must be a template (webapp, research) or a GitHub repository URL', code: 'invalid_request' }); return true; }
+    // `from`: one source, or a list of them for a multi-repo project, whose checkouts are named by repository.
+    const urls: string[] = [];
+    for (const from of [body.from ?? []].flat() as string[]) {
+      const url = TEMPLATES[from] ?? (/^(https:\/\/github\.com\/|git@github\.com:)/.test(from) ? from : null);
+      if (!url) { send(res, 400, { error: 'from must be a template (webapp, research) or a GitHub repository URL', code: 'invalid_request' }); return true; }
+      urls.push(url);
     }
+    const repoUrl = urls[0] ?? null;
+    const repos = urls.length > 1 ? urls.map(url => ({ name: url.replace(/\.git$/, '').split('/').at(-1)!, url })) : null;
     if (state.projects.some(p => p.box.id === b.id && p.name === name)) { send(res, 409, { error: 'Project name already exists', code: 'conflict' }); return true; }
     const p: FakeProject = {
       id: `p-${name}`, name, ref: `${b.name}/${name}`, box: { id: b.id, name: b.name }, provider: body.agent as string,
-      status: 'idle', waitingReason: null, rateLimited: null, workstreams: ['main'],
+      status: 'idle', waitingReason: null, rateLimited: null, workstreams: ['main'], ...state.newProjectFields,
     };
     state.projects.push(p);
     syncBoxProjects(state);
-    send(res, 201, { project: p, restored: false, repoUrl });
+    send(res, 201, { project: p, restored: false, repoUrl, ...(repos ? { repos } : {}) });
+    return true;
+  }
+  // Retry on a project whose box failed to launch: a new box of the same name and size, the project moved onto it
+  // (backend routes/projects.ts relaunchBoxFor).
+  if (method === 'POST' && (m = path.match(/^\/projects\/([^/]+)\/clone\/retry$/))) {
+    state.calls.push({ route, body });
+    const p = state.projects.find(x => x.id === decodeURIComponent(m![1]));
+    const old = p && box(p.box.id);
+    if (!p || !old) { send(res, 404, { error: 'Not found' }); return true; }
+    if (old.state !== 'failed') { send(res, 409, { error: 'Only a failed clone can be retried.', code: 'conflict' }); return true; }
+    const fresh: FakeBox = { ...old, id: `${old.id}-2`, state: 'provisioning', status: 'provisioning', agentConnected: false, error: null, projects: [] };
+    state.boxes = [...state.boxes.filter(b => b !== old), fresh];
+    p.box = { id: fresh.id, name: fresh.name };
+    syncBoxProjects(state);
+    send(res, 202, { project: p });
     return true;
   }
   if (method === 'POST' && (m = path.match(/^\/projects\/([^/]+)\/(rename|archive)$/))) {

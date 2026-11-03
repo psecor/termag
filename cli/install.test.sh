@@ -53,10 +53,34 @@ esac
 got="$(termag --version 2>&1)"
 [ "$got" = 'termag 0.1.0' ] || fail 'the launcher runs the CLI' 'termag 0.1.0' "$got"
 
+# ── a reader that goes away (`| head -1`) is not a crash ────────────────────
+# stdout is a FIFO whose only reader closed before the CLI started, so its
+# first write fails with EPIPE on every run. (A `| true` could exit after the
+# write and pass without testing anything.) fd 4 opens the FIFO read-write, so
+# fd 5's open for writing finds a reader and doesn't block; then fd 4 closes.
+mkfifo "$WORK/closed-reader"
+exec 4<>"$WORK/closed-reader" 5>"$WORK/closed-reader" 4<&-
+termag --help >&5 2>"$WORK/epipe.err"
+got=$?
+exec 5>&-
+[ "$got" = 0 ] || fail 'a closed stdout keeps the exit code' 0 "$got"
+[ -s "$WORK/epipe.err" ] && fail 'a closed stdout prints nothing on stderr' '(nothing)' "$(head -3 "$WORK/epipe.err")"
+
 # ── it pins the Node it was built with ──────────────────────────────────────
 P="$LOCAL_BIN:$SYS_PATH"
 got="$(termag --version 2>&1)"
 [ "$got" = 'termag 0.1.0' ] || fail 'runs with no node on PATH' 'termag 0.1.0' "$got"
+
+# ── the build is one bundle, with `ws` only behind import() ─────────────────
+[ -e "$CHECKOUT/cli/dist/commands.js" ] && fail 'bundles src/ into dist/main.js' 'no dist/commands.js' 'present'
+found=0
+for f in "$CHECKOUT/cli/dist"/forwarder-*.js; do [ -f "$f" ] && found=1; done
+[ "$found" = 1 ] || fail 'forwarder.ts stays its own file' 'dist/forwarder-*.js' "$(ls "$CHECKOUT/cli/dist")"
+grep -q 'from "ws"' "$CHECKOUT/cli/dist/main.js" && fail 'main.js does not load ws' 'no import of ws' 'imports ws'
+mv "$CHECKOUT/cli/node_modules/ws" "$WORK/ws"
+got="$(termag --version 2>&1)"
+[ "$got" = 'termag 0.1.0' ] || fail 'runs without ws in node_modules' 'termag 0.1.0' "$got"
+mv "$WORK/ws" "$CHECKOUT/cli/node_modules/ws"
 
 # ── a re-run with nothing changed does nothing ──────────────────────────────
 P="$NODE_DIR:$LOCAL_BIN:$SYS_PATH"
@@ -284,10 +308,11 @@ rm -rf "$CHECKOUT/tui"
 
 # ── argument handling ───────────────────────────────────────────────────────
 install_cli --nope >/dev/null 2>&1
-[ $? = 2 ] || fail 'an unknown argument exits 2' 2 "$?"
+rc=$?
+[ "$rc" = 2 ] || fail 'an unknown argument exits 2' 2 "$rc"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: install, pinned Node, no-op re-run, rebuild on change, failed build, read-only checkout, PATH hint, --bin-dir, foreign termag, Node floor, termag update (main, other branch, detached)'
+  echo 'PASS: install, pinned Node, closed stdout, one bundle, no-op re-run, rebuild on change, failed build, read-only checkout, PATH hint, --bin-dir, foreign termag, Node floor, termag update (main, other branch, detached)'
   exit 0
 fi
 echo "$failures failure(s)"

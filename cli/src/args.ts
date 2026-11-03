@@ -4,7 +4,13 @@ import { usage } from './errors.js';
 import { LIFECYCLE_ALIASES, LIFECYCLE_COMMANDS } from './lifecycle.js';
 import { ASK_COMMANDS } from './ask.js';
 import { SPACE_ALIASES, SPACE_COMMANDS } from './space.js';
+import { MEMORY_COMMANDS } from './spaceMemory.js';
+import { SYNC_COMMANDS } from './spaceSync.js';
 import { HANDOFF_COMMANDS } from './handoff.js';
+import { FORWARD_COMMANDS } from './forward/command.js';
+import { AUTOMATION_ALIASES, AUTOMATION_COMMANDS } from './automation.js';
+import { BUG_COMMANDS } from './bug.js';
+import { EVENTS_COMMANDS } from './events/command.js';
 
 type OptionSpec = NonNullable<ParseArgsConfig['options']>;
 
@@ -13,6 +19,8 @@ export interface CommandSpec {
   usage: string;
   options?: OptionSpec;
   maxArgs: number;
+  /** Notes printed under Usage in `--help`: what an option means, an example. */
+  details?: string;
   /** Everything after the command's first argument is left unparsed, in `ParsedArgs.passthrough` (ssh options). */
   passthrough?: boolean;
 }
@@ -48,9 +56,15 @@ export const COMMANDS: Record<string, CommandSpec> = {
   'project list': { summary: 'List your projects as <box>/<project>', usage: 'termag project list', maxArgs: 0 },
   ...LIFECYCLE_COMMANDS,
   ...CONNECT_COMMANDS,
+  ...FORWARD_COMMANDS,
   ...ASK_COMMANDS,
   ...SPACE_COMMANDS,
+  ...MEMORY_COMMANDS,
+  ...SYNC_COMMANDS,
   ...HANDOFF_COMMANDS,
+  ...AUTOMATION_COMMANDS,
+  ...BUG_COMMANDS,
+  ...EVENTS_COMMANDS,
   update: {
     summary: 'Pull the termag checkout this CLI was installed from and reinstall it',
     usage: 'termag update [--no-pull]',
@@ -64,9 +78,10 @@ const ALIASES: Record<string, string> = {
   'project ls': 'project list',
   ...LIFECYCLE_ALIASES,
   ...SPACE_ALIASES,
+  ...AUTOMATION_ALIASES,
 };
 
-const GROUPS = new Set(['box', 'project', 'space']);
+const GROUPS = new Set(['box', 'project', 'space', 'automation', 'bug']);
 
 export interface ParsedArgs {
   command: string | null;
@@ -77,12 +92,27 @@ export interface ParsedArgs {
   help: boolean;
   version: boolean;
   options: Record<string, string | boolean | undefined>;
+  /**
+   * Every value of an option its command takes more than once (`multiple:
+   * true` in its spec, e.g. `ask --from`), in order; `options` holds the last.
+   */
+  lists: Record<string, string[]>;
   passthrough?: string[];
 }
 
+/**
+ * Every command's options, for one parse of the whole line. Commands share
+ * option names, so an option any command takes more than once is parsed as a
+ * list for all of them; parseCommandLine refuses a repeat where the command
+ * itself takes one value.
+ */
 function allOptions(): OptionSpec {
   const out: OptionSpec = { ...GLOBAL_OPTIONS };
-  for (const spec of Object.values(COMMANDS)) Object.assign(out, spec.options ?? {});
+  for (const spec of Object.values(COMMANDS)) {
+    for (const [name, opt] of Object.entries(spec.options ?? {})) {
+      out[name] = { ...opt, ...((opt.multiple || out[name]?.multiple) && opt.type === 'string' ? { multiple: true } : {}) };
+    }
+  }
   return out;
 }
 
@@ -116,7 +146,7 @@ export function parseCommandLine(argv: string[]): ParsedArgs {
     throw usage((err as Error).message.replace(/\. To specify a positional.*$/s, ''));
   }
   const { values, positionals } = parsed;
-  const v = values as Record<string, string | boolean | undefined>;
+  const v = values as Record<string, string | boolean | string[] | undefined>;
   const base = {
     json: v.json === true,
     yes: v.yes === true,
@@ -128,13 +158,13 @@ export function parseCommandLine(argv: string[]): ParsedArgs {
   let command: string | null = null;
   let rest = positionals;
   if (positionals[0] === 'help') {
-    return { ...base, help: true, command: resolveHelpTarget(positionals.slice(1)), args: [], options: {} };
+    return { ...base, help: true, command: resolveHelpTarget(positionals.slice(1)), args: [], options: {}, lists: {} };
   }
   if (positionals.length > 0) {
     const [first, second] = positionals;
     if (GROUPS.has(first)) {
       if (!second) {
-        if (base.help) return { ...base, command: null, args: [], options: {} };
+        if (base.help) return { ...base, command: null, args: [], options: {}, lists: {} };
         throw usage(`\`termag ${first}\` needs a subcommand: ${subcommandsOf(first).join(', ')}`);
       }
       command = ALIASES[`${first} ${second}`] ?? `${first} ${second}`;
@@ -148,17 +178,25 @@ export function parseCommandLine(argv: string[]): ParsedArgs {
 
   const spec = command ? COMMANDS[command] : null;
   const options: Record<string, string | boolean | undefined> = {};
+  const lists: Record<string, string[]> = {};
   for (const name of Object.keys(v)) {
     if (name in GLOBAL_OPTIONS) continue;
     if (!spec?.options || !(name in spec.options)) {
       throw usage(`\`--${name}\` is not an option of \`termag${command ? ' ' + command : ''}\``);
     }
-    options[name] = v[name];
+    const value = v[name];
+    if (Array.isArray(value)) {
+      if (spec.options[name].multiple) lists[name] = value;
+      else if (value.length > 1) throw usage(`\`--${name}\` is given more than once; \`termag ${command}\` takes one`);
+      options[name] = value.at(-1);
+    } else {
+      options[name] = value;
+    }
   }
   if (spec && rest.length > spec.maxArgs && !base.help) {
     throw usage(`Too many arguments. Usage: ${spec.usage}`);
   }
-  return { ...base, command, args: rest, options, ...(tail ? { passthrough: tail } : {}) };
+  return { ...base, command, args: rest, options, lists, ...(tail ? { passthrough: tail } : {}) };
 }
 
 function resolveHelpTarget(words: string[]): string | null {
@@ -176,7 +214,7 @@ function subcommandsOf(group: string): string[] {
 export function helpText(command: string | null): string {
   if (command) {
     const spec = COMMANDS[command];
-    return `${spec.summary}.\n\nUsage: ${spec.usage}\n\n${GLOBAL_HELP}`;
+    return `${spec.summary}.\n\nUsage: ${spec.usage}\n\n${spec.details ? `${spec.details}\n\n` : ''}${GLOBAL_HELP}`;
   }
   const width = Math.max(...Object.keys(COMMANDS).map(c => c.length));
   const lines = Object.entries(COMMANDS).map(([name, spec]) => `  ${name.padEnd(width)}  ${spec.summary}`);

@@ -1,12 +1,41 @@
 import { describe, expect, it } from 'vitest';
-import { ssmTarget, type ConnectBox } from './target.js';
+import { parseRef, pickBox, ssmTarget, type ConnectBox } from './target.js';
 
-function box(state: string): ConnectBox {
+function box(state: string, name = 'devbox'): ConnectBox {
   return {
-    id: 'b1', name: 'devbox', addressable: true, kind: 'ec2', state, status: state,
+    id: `id-${name}`, name, addressable: true, kind: 'ec2', flavor: 'full', state, status: state,
     agentConnected: false, error: null, projects: [], ec2InstanceId: 'i-0abc', region: 'us-east-2',
   };
 }
+
+describe('parseRef', () => {
+  it('needs a box unless the command takes a default one', () => {
+    expect(() => parseRef(undefined)).toThrow('Name a box');
+    expect(parseRef(undefined, { defaultBox: true })).toEqual({ box: null, project: null });
+    expect(parseRef('devbox/fix', { defaultBox: true })).toEqual({ box: 'devbox', project: 'fix' });
+  });
+});
+
+describe('pickBox', () => {
+  it('takes the only box when none is named', () => {
+    expect(pickBox([box('running')], null).name).toBe('devbox');
+  });
+
+  it('asks for a name when there are several boxes', () => {
+    expect(() => pickBox([box('running'), box('stopped', 'other')], null))
+      .toThrow('You have 2 boxes (devbox, other); name the one to use');
+  });
+
+  it('says there is no box to default to', () => {
+    expect(() => pickBox([], null)).toThrow('You have no boxes; create one with `termag box create <name>`');
+  });
+
+  it('finds a named box by name or id', () => {
+    const boxes = [box('running'), box('stopped', 'other')];
+    expect(pickBox(boxes, 'other').name).toBe('other');
+    expect(pickBox(boxes, 'id-devbox').name).toBe('devbox');
+  });
+});
 
 describe('ssmTarget', () => {
   it('targets a running box in its own region', () => {

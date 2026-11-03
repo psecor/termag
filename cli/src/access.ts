@@ -16,14 +16,21 @@ export interface FreshAccess {
 
 /**
  * The login's access token, refreshed with its device token (and saved) when
- * missing or about to lapse.
+ * missing, about to lapse (within REFRESH_MARGIN_MS, or `validForMs` when
+ * that is longer), or `rejected`: the one the orchestrator just refused (its
+ * signing key was retired, say), which no clock can tell. Expiry is on this
+ * machine's clock (`expiresAtFrom`), so its skew from the orchestrator's
+ * doesn't count.
  */
 export async function freshAccess(
   deps: { host: string; credsPath: string; fetch: typeof fetch },
   login: StoredLogin,
+  opts: { rejected?: string; validForMs?: number } = {},
 ): Promise<FreshAccess> {
   const expiresAt = Date.parse(login.accessTokenExpiresAt ?? '');
-  if (login.accessToken && login.accessTokenExpiresAt && expiresAt - REFRESH_MARGIN_MS > Date.now()) {
+  const refused = opts.rejected !== undefined && login.accessToken === opts.rejected;
+  const margin = Math.max(REFRESH_MARGIN_MS, opts.validForMs ?? 0);
+  if (login.accessToken && login.accessTokenExpiresAt && !refused && expiresAt - margin > Date.now()) {
     return { accessToken: login.accessToken, accessTokenExpiresAt: login.accessTokenExpiresAt };
   }
   const fresh = await new Api({ host: deps.host, token: null, fetch: deps.fetch }).request<RefreshResponse>('POST', '/token', {

@@ -199,6 +199,34 @@ describe('access tokens', () => {
     expect(err.join('\n')).toContain('run `termag login`');
   });
 
+  it('an access token refused while its clock says it is good (a retired signing key) is refreshed once and the request retried', async () => {
+    await run(['login'], ctx());
+    const first = JSON.parse(readFileSync(credsFile(), 'utf8')).hosts[orch.host].accessToken;
+    const tokenPosts = () => orch.requests.filter(r => r.method === 'POST' && r.path === '/api/cli/v1/token').length;
+    const afterLogin = tokenPosts();
+    orch.accessTokens.clear();
+    expect(await run(['whoami'], ctx())).toBe(0);
+    const stored = JSON.parse(readFileSync(credsFile(), 'utf8')).hosts[orch.host];
+    expect(stored.accessToken).not.toBe(first);
+    expect(tokenPosts()).toBe(afterLogin + 1);
+    expect(orch.requests.at(-1)?.auth).toBe(`Bearer ${stored.accessToken}`);
+    // The new one is kept: the next command refreshes nothing.
+    expect(await run(['whoami'], ctx())).toBe(0);
+    expect(tokenPosts()).toBe(afterLogin + 1);
+  });
+
+  it('a refused access token whose refresh is refused too fails with exit 4, after one refresh', async () => {
+    await run(['login'], ctx());
+    const tokenPosts = () => orch.requests.filter(r => r.method === 'POST' && r.path === '/api/cli/v1/token').length;
+    const afterLogin = tokenPosts();
+    orch.accessTokens.clear();
+    for (const t of orch.tokens.values()) t.revoked = true;
+    err = [];
+    expect(await run(['whoami'], ctx())).toBe(4);
+    expect(err.join('\n')).toContain('run `termag login`');
+    expect(tokenPosts()).toBe(afterLogin + 1);
+  });
+
   it('an access token the edge refuses (HTML 401) fails with exit 4', async () => {
     await run(['login'], ctx());
     orch.override.set('/api/cli/v1/whoami', (res) => {
@@ -220,10 +248,17 @@ describe('lists', () => {
   it('box list prints a table and warns about names the CLI cannot address', async () => {
     expect(await run(['box', 'list'], ctx())).toBe(0);
     const text = out.join('\n');
-    expect(text.split('\n')[0]).toMatch(/^BOX\s+STATE\s+AGENT\s+PROJECTS$/);
-    expect(text).toMatch(/devbox\s+running\s+connected\s+webapp-fix/);
-    expect(text).toMatch(/old box\s+stopped\s+-\s+-/);
+    expect(text.split('\n')[0]).toMatch(/^BOX\s+STATE\s+SIZE\s+DISK\s+AGENT\s+PROJECTS$/);
+    expect(text).toMatch(/devbox\s+running\s+medium \(m8g\.xlarge\)\s+200 GB\s+connected\s+webapp-fix/);
+    // A box from before sizes and disks, or an orchestrator that predates them, has neither to show.
+    expect(text).toMatch(/old box\s+stopped\s+-\s+-\s+-\s+-/);
     expect(err.join('\n')).toContain('"old box"');
+  });
+
+  it('box list shows a box sized by its repo\'s requirements by its instance type alone', async () => {
+    orch.lifecycle.boxes.push({ id: 'i7', name: 'gbox', addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [], size: '4vcpu-32gib', instanceType: 'r8g.xlarge' });
+    expect(await run(['box', 'list'], ctx())).toBe(0);
+    expect(out.join('\n')).toMatch(/gbox\s+running\s+r8g\.xlarge\s+-\s+connected/);
   });
 
   it('box ls --json passes the boxes through', async () => {

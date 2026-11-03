@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CliError } from '../errors.js';
-import { BEGIN_MARKER, END_MARKER, installBlock, proxyCommandFor, renderBlock, sshConfigPath, upsertBlock } from './sshConfig.js';
+import { BEGIN_MARKER, END_MARKER, installBlock, proxyCommandFor, renderBlock, sshConfigPath, sshHosts, upsertBlock } from './sshConfig.js';
+import type { ConnectBox, ConnectProject } from './target.js';
 
 const block = renderBlock({ user: 'alice', proxyCommand: proxyCommandFor(['/usr/local/bin/termag'], null) });
 const newer = renderBlock({ user: 'alice', proxyCommand: proxyCommandFor(['/opt/homebrew/bin/termag'], null) });
@@ -32,12 +33,64 @@ describe('renderBlock', () => {
 
   it('puts each per-box user ahead of the wildcard, since ssh keeps the first User it finds', () => {
     const lines = renderBlock({ user: 'alice', proxyCommand: 'p', hostUsers: [{ alias: 'termag-warm', user: 'termag' }] }).split('\n');
-    expect(lines.slice(3, 6)).toEqual(['Host termag-warm', '  User termag', 'Host termag-*']);
+    expect(lines.slice(4, 7)).toEqual(['Host termag-warm', '  User termag', 'Host termag-*']);
+  });
+
+  it("puts each session host ahead of the wildcard, aimed at its box's alias so the ProxyCommand's %h reaches it", () => {
+    const lines = renderBlock({
+      user: 'alice', proxyCommand: 'p',
+      sessionHosts: [{ alias: 'termag-dev.api', hostName: 'termag-dev', user: 'termag', session: 'alice-api-agent' }],
+    }).split('\n');
+    expect(lines.slice(4, 10)).toEqual([
+      'Host termag-dev.api',
+      '  HostName termag-dev',
+      '  User termag',
+      '  RequestTTY yes',
+      '  RemoteCommand tmux attach-session -t alice-api-agent',
+      'Host termag-*',
+    ]);
   });
 
   it('names a non-default orchestrator and quotes paths for the shell', () => {
     expect(proxyCommandFor(['/Applications/My Node/node', '/x/termag.js'], 'http://localhost:3040/termag'))
       .toBe("'/Applications/My Node/node' /x/termag.js --host http://localhost:3040/termag ssh-proxy %h %p");
+  });
+});
+
+describe('sshHosts', () => {
+  const box = (id: string, name: string, hostUnixUser: string | null): ConnectBox => ({
+    id, name, hostUnixUser, addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [],
+  } as unknown as ConnectBox);
+  const project = (boxId: string, name: string, sessions: ConnectProject['sessions']): ConnectProject => ({
+    id: `${boxId}-${name}`, name, ref: name, box: { id: boxId, name: boxId }, provider: 'claude', status: 'idle',
+    waitingReason: null, rateLimited: null, workstreams: ['main'], sessions,
+  });
+  const sessions = (name: string) => ({ agent: `alice-${name}-agent`, ctrl: `alice-${name}-ctrl` });
+
+  it("gives each project an agent and a ctrl host as its box's own user, by the session names the API reports", () => {
+    const hosts = sshHosts('alice', [box('i1', 'warm', 'termag'), box('i2', 'dev', 'alice')], [
+      project('i1', 'web', { agent: 'alice-web-agent', ctrl: 'alice-web-ctrl' }),
+      project('i2', 'api', sessions('api')),
+    ]);
+    expect(hosts.hostUsers).toEqual([{ alias: 'termag-warm', user: 'termag' }]);
+    expect(hosts.sessionHosts).toEqual([
+      { alias: 'termag-dev.api', hostName: 'termag-dev', user: 'alice', session: 'alice-api-agent' },
+      { alias: 'termag-dev.api.ctrl', hostName: 'termag-dev', user: 'alice', session: 'alice-api-ctrl' },
+      { alias: 'termag-warm.web', hostName: 'termag-warm', user: 'termag', session: 'alice-web-agent' },
+      { alias: 'termag-warm.web.ctrl', hostName: 'termag-warm', user: 'termag', session: 'alice-web-ctrl' },
+    ]);
+    expect(hosts.skipped).toEqual([]);
+  });
+
+  it("skips, and names, a project whose name or session can't go in ssh_config; drops ones it can't reach", () => {
+    const hosts = sshHosts('alice', [box('i1', 'dev', null)], [
+      project('i1', 'my.app', sessions('my_app')),
+      project('i1', 'ok', { agent: 'alice-ok-agent', ctrl: 'x\n  ProxyCommand touch /tmp/pwned' }),
+      project('i1', 'old', null),
+      project('elsewhere', 'theirs', sessions('theirs')),
+    ]);
+    expect(hosts.sessionHosts).toEqual([]);
+    expect(hosts.skipped).toEqual(['dev/my.app', 'dev/ok']);
   });
 });
 

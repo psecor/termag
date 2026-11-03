@@ -131,8 +131,9 @@ if [ ! -e /usr/bin/node ] && [ ! -e /bin/node ]; then
   esac
 fi
 
-install_tui --nope >/dev/null 2>&1
-[ $? = 2 ] || fail 'an unknown argument exits 2' 2 "$?"
+rc=0
+install_tui --nope >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || fail 'an unknown argument exits 2' 2 "$rc"
 
 if [ "$failures" -eq 0 ]; then
   echo 'PASS: build, no-op re-run, --check, rebuild without npm ci, failed build, Node floor'

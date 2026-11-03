@@ -101,6 +101,17 @@ describe('login helpers', () => {
     }
   });
 
+  it("says so when termag refuses the account", async () => {
+    const cb = await listenForCallback('right-state-value', 5000);
+    try {
+      const page = await fetch(`http://127.0.0.1:${cb.port}/callback?error=not_allowed&state=right-state-value`);
+      expect(await page.text()).toContain('No access to termag yet');
+      await expect(cb.result).rejects.toThrow("doesn't have access to termag yet");
+    } finally {
+      cb.close();
+    }
+  });
+
   it('rejects when the browser cancels', async () => {
     const cb = await listenForCallback('right-state-value', 5000);
     try {

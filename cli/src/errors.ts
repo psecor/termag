@@ -6,6 +6,8 @@ export const EXIT = {
   NOT_FOUND: 3,
   AUTH: 4,
   TIMEOUT: 5,
+  /** A conditional write lost: the file changed since it was read (`termag space memory edit`). */
+  CHANGED: 6,
 } as const;
 
 export type ExitCode = (typeof EXIT)[keyof typeof EXIT];
@@ -21,7 +23,8 @@ export type ErrorCode =
   | 'edge_auth'
   | 'conflict'
   | 'forbidden'
-  | 'precondition';
+  | 'precondition'
+  | 'changed';
 
 const EXIT_FOR: Record<ErrorCode, ExitCode> = {
   failed: EXIT.FAILED,
@@ -35,6 +38,7 @@ const EXIT_FOR: Record<ErrorCode, ExitCode> = {
   conflict: EXIT.FAILED,
   forbidden: EXIT.FAILED,
   precondition: EXIT.FAILED,
+  changed: EXIT.CHANGED,
 };
 
 /** A failure with a one-line, user-facing reason. Never put a token in `message`. */

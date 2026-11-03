@@ -6,9 +6,10 @@
 #
 # Idempotent and content-compared: with the build current and the launcher
 # already right it changes nothing, so termag-reconcile can run it on every
-# boot. `npm ci` runs only when package-lock.json changed and tsc only when the
-# sources did; the build goes to a scratch directory and replaces dist/ only
-# once it succeeds, so a failed rebuild leaves the previous one working.
+# boot. `npm ci` runs only when package-lock.json changed and the build (tsc's
+# type check, then build.mjs's esbuild bundle) only when the sources did; the
+# build goes to a scratch directory and replaces dist/ only once it succeeds,
+# so a failed rebuild leaves the previous one working.
 #
 # The launcher is a small sh script rather than a symlink so it can pin the
 # Node it was installed with (a version manager may not be on PATH where
@@ -85,7 +86,7 @@ stamp_of() {
   "$node" -e '
     const fs = require("fs"), path = require("path"), crypto = require("crypto");
     const dir = process.argv[1], h = crypto.createHash("sha256");
-    const files = ["package.json", "package-lock.json", "tsconfig.json", "tsconfig.build.json"];
+    const files = ["package.json", "package-lock.json", "tsconfig.json", "tsconfig.build.json", "build.mjs"];
     const walk = (rel) => {
       for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : 1)) {
         const r = path.join(rel, e.name);
@@ -127,7 +128,8 @@ elif [ "$build_current" = 0 ]; then
   else
     log=$(mktemp)
     trap 'rm -f "$log"; rm -rf "$CLI_DIR/.dist-build"' EXIT
-    if [ "$want_lock" != "$have_lock" ] || [ ! -f "$CLI_DIR/node_modules/typescript/bin/tsc" ]; then
+    if [ "$want_lock" != "$have_lock" ] || [ ! -f "$CLI_DIR/node_modules/typescript/bin/tsc" ] \
+      || [ ! -f "$CLI_DIR/node_modules/esbuild/package.json" ]; then
       say "termag install: installing build dependencies (npm ci)"
       npm="$node_bin_dir/npm"
       [ -x "$npm" ] || npm=$(command -v npm 2>/dev/null) || die "npm not found next to $node or on PATH"
@@ -139,7 +141,8 @@ elif [ "$build_current" = 0 ]; then
     fi
     say "termag install: building $CLI_DIR"
     rm -rf "$CLI_DIR/.dist-build"
-    if ! (cd "$CLI_DIR" && "$node" node_modules/typescript/bin/tsc -p tsconfig.build.json --outDir .dist-build) >"$log" 2>&1; then
+    if ! (cd "$CLI_DIR" && "$node" node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit \
+      && "$node" build.mjs .dist-build) >"$log" 2>&1; then
       cat "$log" >&2
       die "the build failed; the previous build (if any) is unchanged"
     fi

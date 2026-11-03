@@ -19,14 +19,22 @@ export const CONNECT_COMMANDS: Record<string, CommandSpec> = {
   },
   'ssh-config': {
     summary: 'Print, or with --install add, the `Host termag-*` entry for ~/.ssh/config',
-    usage: 'termag ssh-config [--install]\n\n'
-      + 'Then `ssh termag-<box>`, scp, rsync and editor Remote-SSH reach every box you own.',
-    options: { install: { type: 'boolean' } },
+    usage: 'termag ssh-config [--install] [--wake]\n\n'
+      + 'Then `ssh termag-<box>`, scp, rsync and editor Remote-SSH reach every box you own, and\n'
+      + '`ssh termag-<box>.<project>` (or `.ctrl`) attaches to a project\'s agent (or ctrl shell).\n'
+      + 'Re-run it after adding a box or a project.\n'
+      + 'With --wake, connecting to a stopped or hibernated box starts it first. An editor\n'
+      + 'that reconnects on its own then keeps a parked box up, so it is off by default.',
+    options: { install: { type: 'boolean' }, wake: { type: 'boolean' } },
     maxArgs: 0,
   },
   'ssh-proxy': {
     summary: 'The ssh-config entry\'s ProxyCommand (run by ssh, not by hand)',
-    usage: 'termag ssh-proxy termag-<box> <port>',
+    usage: 'termag ssh-proxy [--wake [--timeout <seconds>]] termag-<box> <port>\n\n'
+      + '--wake starts a stopped or hibernated box (one still stopping or hibernating once it\n'
+      + 'has), as `termag box start --wait` does, then connects. Progress goes to stderr.\n'
+      + '--timeout bounds each wait (default 600).',
+    options: { wake: { type: 'boolean' }, timeout: { type: 'string' } },
     maxArgs: 2,
   },
 };

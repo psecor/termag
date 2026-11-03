@@ -45,6 +45,16 @@ describe('aggregateStatus', () => {
   });
 });
 
+describe('indexSessions', () => {
+  it('keeps slot 1 of several review rows (docs/parallel-reviews.md)', () => {
+    const map = indexSessions([
+      session({ session: 'psecor-termag-review', projectId: 'termag', workstream: 'main', role: 'review' }),
+      session({ session: 'psecor-termag-review-2', projectId: 'termag', workstream: 'main', role: 'review' }),
+    ]);
+    expect(map['termag/main/review']?.session).toBe('psecor-termag-review');
+  });
+});
+
 describe('projectBadges', () => {
   it('takes the max context and any rate limit, falling back to the workflow provider', () => {
     const p = project({ name: 'termag', workstreams: [ws('main'), ws('tui')] });
