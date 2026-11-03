@@ -1,8 +1,29 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { launchpadComponentsCss as launchpadCss } from './src/launchpad/launchpadCss';
+
+/**
+ * LaunchPad's components import one stylesheet for all of them, LaunchPad's
+ * page base (html, body, *, :root, headings) included. Serve that import as
+ * only the components' own rules (src/launchpad/launchpadCss.ts), so nothing
+ * reaches termag's own elements and every component is styled.
+ */
+const LAUNCHPAD_CSS = /[\\/]@launchpad-ui[\\/]components[\\/]dist[\\/]style\.css$/;
+
+function launchpadComponentsCss(): Plugin {
+  return {
+    name: 'termag:launchpad-components-css',
+    enforce: 'pre',
+    load(id) {
+      const file = id.split('?')[0];
+      if (!LAUNCHPAD_CSS.test(file)) return null;
+      return launchpadCss(readFileSync(file, 'utf8'));
+    },
+  };
+}
 
 /**
  * The commit this bundle is built from:
@@ -19,7 +40,7 @@ function buildSha(): string {
 }
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [launchpadComponentsCss(), react()],
   define: { __TERMAG_SHA__: JSON.stringify(buildSha()) },
   base: '/termag/',
   // Public sourcemaps next to each chunk (assets/<chunk>.js.map), so

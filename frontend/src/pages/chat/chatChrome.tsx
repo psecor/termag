@@ -3,16 +3,24 @@
 // actions under ⋮. Desktop (mode docked) renders none of this. Also the side
 // panel's toggle (chat/sidePanel.ts), on every width.
 import React, { createContext, useContext } from 'react';
-import { useContextMenu, type MenuAction } from './ContextMenu';
+import { IconButton, Tooltip, TooltipTrigger } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
+import { menuButtonKeys, useContextMenu, type MenuAction } from './ContextMenu';
 import type { ChatHistoryMode } from '../../chat/chatLayout';
+import type { SidePanelTab } from '../../chat/sidePanel';
+import type { AgentTabRef } from '../../chat/panelTabs';
 
 export interface ChatChrome {
   mode: ChatHistoryMode;
   historyOpen: boolean;
   openHistory: () => void;
   closeHistory: () => void;
-  /** The side panel, where simple-ui-side-panel-enabled is on; else absent. */
-  sidePanel?: { open: boolean; toggle: () => void };
+  /** The side panel, where simple-ui-side-panel-enabled is on; else absent. `show` opens it on a tool (the refresh's context card). */
+  /** `revealDir`, where Files can show a space: opens the panel on Files with that folder (a tree prefix, '' for the space) open and focused. */
+  /** `showAgent`, under the chrome refresh on a desktop width: opens the panel on a subagent's agent tab. */
+  sidePanel?: { open: boolean; toggle: () => void; show?: (tab: SidePanelTab) => void; revealDir?: (dir: string) => void; showAgent?: (agent: AgentTabRef) => void };
+  /** The chrome refresh (simple-ui-chrome-refresh-enabled); off or absent, the chrome is as it was. */
+  refresh?: boolean;
 }
 
 const Ctx = createContext<ChatChrome>({
@@ -49,8 +57,20 @@ export function ChatHistoryButton() {
 
 /** Opens and shuts the side panel (files, terminal, browser). Rendered only where the panel is on. */
 export function SidePanelButton() {
-  const { sidePanel } = useChatChrome();
+  const { sidePanel, refresh } = useChatChrome();
   if (!sidePanel) return null;
+  // The chrome refresh's: an icon that steps aside while the panel is open, where the
+  // panel's own collapse button (SidePanel.tsx) takes its place at the window's corner.
+  if (refresh) {
+    if (sidePanel.open) return null;
+    return (
+      <TooltipTrigger delay={300}>
+        <IconButton icon="sidebar-right-expand" variant="minimal" className="chat-side-toggle" aria-label="Show tools"
+          aria-expanded={false} aria-controls="chat-side-panel" aria-keyshortcuts="Control+Alt+B" onPress={sidePanel.toggle} />
+        <Tooltip placement="bottom" className={LP_THEME}>Show tools ⌃⌥B</Tooltip>
+      </TooltipTrigger>
+    );
+  }
   return (
     <button
       type="button"
@@ -72,7 +92,7 @@ export function ChatMoreButton({ label, actions }: { label: string; actions: Men
     <>
       <button type="button" className="btn-ghost chat-more-btn" aria-label="More actions" aria-haspopup="menu" aria-expanded={more.openKey === 'more'}
         onPointerDown={e => { e.currentTarget.dataset.pointer = e.pointerType; }}
-        onClick={e => more.open(e, label, actions, 'more')}>
+        onClick={e => more.open(e, label, actions, 'more')} onKeyDown={menuButtonKeys(e => more.open(e, label, actions, 'more'))}>
         <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
           <circle cx="8" cy="3.5" r="1.4" fill="currentColor" /><circle cx="8" cy="8" r="1.4" fill="currentColor" /><circle cx="8" cy="12.5" r="1.4" fill="currentColor" />
         </svg>

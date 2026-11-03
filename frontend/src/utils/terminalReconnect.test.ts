@@ -7,6 +7,7 @@ import {
   PaneEffects,
   PaneEvent,
   PaneLoop,
+  parkedForGood,
   parseBoxParkedNotice,
   RECONNECT_DELAYS_MS,
   STARTING_POLL_MS,
@@ -162,8 +163,8 @@ describe('parseBoxParkedNotice', () => {
     expect(parseBoxParkedNotice({ type: 'box-power', ...stopped })).toEqual(stopped);
   });
 
-  it('reads a hibernating or hibernated box as parked', () => {
-    for (const status of ['hibernating', 'hibernated'] as const) {
+  it('reads a hibernating, hibernated or quarantined box as parked', () => {
+    for (const status of ['hibernating', 'hibernated', 'quarantined'] as const) {
       expect(parseBoxParkedNotice({ type: 'box-power', ...stopped, status })?.status).toBe(status);
     }
   });
@@ -173,5 +174,12 @@ describe('parseBoxParkedNotice', () => {
     expect(parseBoxParkedNotice({ type: 'box-power', instanceId: 'b', status: 'ready', message: 'm' })).toBe(null);
     expect(parseBoxParkedNotice({ type: 'box-power', status: 'stopped', message: 'm' })).toBe(null);
     expect(parseBoxParkedNotice(null)).toBe(null);
+  });
+});
+
+describe('parkedForGood', () => {
+  it('is a quarantined box only: every other parked box can start again', () => {
+    expect(parkedForGood('quarantined')).toBe(true);
+    for (const s of ['stopping', 'stopped', 'starting', 'hibernating', 'hibernated'] as const) expect(parkedForGood(s)).toBe(false);
   });
 });

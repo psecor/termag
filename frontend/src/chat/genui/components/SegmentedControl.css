@@ -1,0 +1,19 @@
+/* SegmentedControl.tsx. LaunchPad's elevated track and its selected button
+   are both --bg-active in termag's map, so the track is a faint wash instead,
+   as the chat's view options' is (.chat-view-segment in pages/chat/chrome.css),
+   and only the chosen option lifts. A row too wide for the card wraps. */
+.genui-segmentedcontrol { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; max-width: 100%; }
+.genui-surface .genui-segmentedcontrol-group {
+  flex-wrap: wrap; max-width: 100%;
+  background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+.genui-surface .genui-segmentedcontrol-group > * { flex: 1 0 auto; }
+/* LaunchPad's elevated buttons all resolve to one grey in termag's colours, so
+   the chosen one never shows: draw them as the chat's view options do. */
+.genui-surface .genui-segmentedcontrol-group { gap: 2px; padding: 3px; border-radius: 9px; }
+.genui-surface .genui-segmentedcontrol-group > * { justify-content: center; height: 28px; padding: 0 10px; border-radius: 7px; font-size: 12.5px; }
+.genui-surface .genui-segmentedcontrol-group > [data-selected] {
+  background: var(--bg-active); color: var(--text-primary); border-color: transparent; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+.genui-surface .genui-segmentedcontrol-group > :not([data-selected]) { background: transparent; color: var(--text-secondary); border-color: transparent; box-shadow: none; }
+.genui-surface .genui-segmentedcontrol-group > :not([data-selected]):hover { background: color-mix(in srgb, var(--text-primary) 6%, transparent); color: var(--text-primary); }

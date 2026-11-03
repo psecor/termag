@@ -1,7 +1,9 @@
 // The simple UI's archived chats (backend routes/chats.ts): archiving stops or
 // hibernates the box when this chat is the only thing on it, so it costs only
-// storage; reopening starts it again with the history on its disk; deleting
-// terminates it. A box that stays up is reported back on the archive response.
+// storage; reopening starts it again with the history on its disk, or, once
+// the box is gone, opens the orchestrator's stored copy of it;
+// deleting terminates it. A box that stays up is
+// reported back on the archive response.
 import type { InstanceStatus } from '../types';
 
 /** The few words beside an archived chat saying where its box is. */
@@ -19,9 +21,59 @@ export function archivedBoxLabel(status: InstanceStatus | null | undefined): str
   }
 }
 
-/** Reopen waits while the box is still going down, and is gone with the box. */
-export function canReopen(status: InstanceStatus | null | undefined): boolean {
-  return status != null && !['stopping', 'hibernating', 'terminated', 'failed'].includes(status);
+/**
+ * The box's state in a word, at the end of an archived chat's one-line row
+ * under the chrome refresh (pages/chat/ArchivedRows.tsx). The row's tooltip and
+ * its screen-reader name keep archivedBoxLabel's words.
+ */
+export function archivedBoxWord(status: InstanceStatus | null | undefined): string {
+  switch (status) {
+    case 'stopped': return 'Stopped';
+    case 'hibernated': return 'Hibernated';
+    case 'stopping': return 'Stopping…';
+    case 'hibernating': return 'Hibernating…';
+    case 'starting': return 'Starting…';
+    case 'ready': return 'Running';
+    case 'terminated': case 'failed': return 'Gone';
+    case null: case undefined: return 'No box';
+    default: {
+      const words = status.replace(/-/g, ' ');
+      return words.charAt(0).toUpperCase() + words.slice(1);
+    }
+  }
+}
+
+/**
+ * Whether a failed GET of the archived list is worth asking again: the
+ * orchestrator was unreachable or answered 5xx (a deploy rolls it). A 4xx
+ * would answer the same again. Without this, one failed load hid the list
+ * until the page was reloaded.
+ */
+export function archivedLoadRetries(err: unknown): boolean {
+  const status = (err as { response?: { status?: number } } | null)?.response?.status;
+  return status === undefined || status >= 500;
+}
+
+/** How long to wait before asking again after `attempt` failures in a row: 5 s, doubling, at most a minute. */
+export function archivedRetryDelayMs(attempt: number): number {
+  return Math.min(60_000, 5_000 * 2 ** Math.max(0, attempt));
+}
+
+const BOX_GONE = (status: InstanceStatus | null | undefined) => status == null || status === 'terminated' || status === 'failed';
+
+/**
+ * Reopen waits while the box is still going down. Once the box is gone it
+ * reopens only from the stored transcript (`storedHistory`).
+ */
+export function canReopen(status: InstanceStatus | null | undefined, storedHistory = false): boolean {
+  if (BOX_GONE(status)) return storedHistory;
+  return status !== 'stopping' && status !== 'hibernating';
+}
+
+/** The Reopen button's tooltip. */
+export function reopenTitle(status: InstanceStatus | null | undefined, storedHistory = false): string {
+  if (BOX_GONE(status)) return storedHistory ? 'Open the saved conversation. Its box is gone, so it is read-only for now.' : 'Its box is gone, and its history with it';
+  return canReopen(status) ? 'Start the box again and open the session' : 'Wait for the box to settle';
 }
 
 /** Whether the archived list should look again soon: a box is still on its way down or up. */
@@ -358,12 +410,12 @@ export function archiveBoxNotice(box: ArchiveBoxBody): ArchiveBoxNotice {
 
 function stillRunningReason(reason: string): string {
   if (reason === 'other projects still use this box') {
-    return 'This session is archived. Its box is still running because other projects use it. Open the full UI to stop it once those projects can leave; until then it keeps billing.';
+    return 'This session is archived. Its box is still running because other projects use it. Open Lab to stop it once those projects can leave; until then it keeps billing.';
   }
   if (reason === 'a self-managed host is not powered from termag') {
     return 'This session is archived. Its host is self-managed and still running. Stop it on that machine.';
   }
-  return `This session is archived. Its box is still running (${reason}). Stop it from the full UI so it stops billing.`;
+  return `This session is archived. Its box is still running (${reason}). Stop it from Lab so it stops billing.`;
 }
 
 /**

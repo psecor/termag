@@ -90,8 +90,10 @@ export interface Column<T> {
   align?: 'left' | 'right';
   title?: string;
 }
-export function DataTable<T>({ rows, columns, rowKey, defaultSort, defaultDesc = true, empty = 'nothing to show', dense }: {
+export function DataTable<T>({ rows, columns, rowKey, defaultSort, defaultDesc = true, empty = 'nothing to show', dense, onRowClick, selectedKey }: {
   rows: T[]; columns: Column<T>[]; rowKey: (row: T) => string; defaultSort: string; defaultDesc?: boolean; empty?: string; dense?: boolean;
+  /** Rows become selectable (click, Enter or Space); the one whose key is `selectedKey` is marked. */
+  onRowClick?: (row: T) => void; selectedKey?: string | null;
 }) {
   const [sort, setSort] = useState(defaultSort);
   const [desc, setDesc] = useState(defaultDesc);
@@ -119,9 +121,16 @@ export function DataTable<T>({ rows, columns, rowKey, defaultSort, defaultDesc =
         </thead>
         <tbody>
           {sorted.length === 0 && <tr><td colSpan={columns.length} className="usage-dim">{empty}</td></tr>}
-          {sorted.map(r => (
-            <tr key={rowKey(r)}>{columns.map(c => <td key={c.id} className={c.align ?? 'left'}>{c.render ? c.render(r) : (c.value(r) ?? '—')}</td>)}</tr>
-          ))}
+          {sorted.map(r => {
+            const key = rowKey(r);
+            const select = onRowClick ? {
+              className: `admin-row--selectable${key === selectedKey ? ' admin-row--selected' : ''}`,
+              tabIndex: 0, 'aria-selected': key === selectedKey,
+              onClick: () => onRowClick(r),
+              onKeyDown: (e: React.KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRowClick(r); } },
+            } : {};
+            return <tr key={key} {...select}>{columns.map(c => <td key={c.id} className={c.align ?? 'left'}>{c.render ? c.render(r) : (c.value(r) ?? '—')}</td>)}</tr>;
+          })}
         </tbody>
       </table>
     </div>

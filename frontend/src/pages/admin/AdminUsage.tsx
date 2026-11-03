@@ -2,7 +2,7 @@ import React, { useCallback, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { adminApi, type AdminRange, type TokenGroup, type WorktimeGroup } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip } from '../dashboard/chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip } from '../dashboard/chartTheme';
 import { groupedChartRows } from './usageRows';
 import { fmtK, fmtDurationShort } from '../../utils/format';
 import { useAdminPolled, pendingText, fmtMs, fmtTok, fmtPct } from './shared';
@@ -49,11 +49,11 @@ export function AdminUsage({ range }: { range: AdminRange }) {
               <XAxis type="number" tick={TICK} tickLine={false} axisLine={false} tickFormatter={fmtK} />
               <YAxis type="category" dataKey="label" tick={TICK} tickLine={false} axisLine={false} width={120} interval={0} />
             </>}
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtK} total />} />
-            <Bar dataKey="input" name="input" stackId="t" fill="rgb(88, 166, 255)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
-            <Bar dataKey="output" name="output" stackId="t" fill="rgb(63, 185, 80)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
-            <Bar dataKey="cacheRead" name="cache read" stackId="t" fill="rgb(139, 148, 158)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
-            <Bar dataKey="cacheCreate" name="cache create" stackId="t" fill="rgb(188, 140, 255)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtK} total />} />
+            <Bar dataKey="input" name="input" stackId="t" fill={HUE.blue} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar dataKey="output" name="output" stackId="t" fill={HUE.green} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar dataKey="cacheRead" name="cache read" stackId="t" fill={HUE.gray} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar dataKey="cacheCreate" name="cache create" stackId="t" fill={HUE.purple} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
           </BarChart>
         </ResponsiveContainer>
         {tGroup !== 'day' && tRows.length > 25 && <div className="usage-dim dash-card-note">top 25 of {tRows.length} shown; the table has all</div>}
@@ -72,9 +72,9 @@ export function AdminUsage({ range }: { range: AdminRange }) {
               <XAxis type="number" tick={TICK} tickLine={false} axisLine={false} tickFormatter={hoursTick} />
               <YAxis type="category" dataKey="label" tick={TICK} tickLine={false} axisLine={false} width={120} interval={0} />
             </>}
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtDurationShort} total />} />
-            <Bar dataKey="agentMs" name="agents" fill="rgb(88, 166, 255)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
-            <Bar dataKey="humanMs" name="humans" fill="rgb(246, 185, 59)" stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtDurationShort} total />} />
+            <Bar dataKey="agentMs" name="agents" fill={HUE.blue} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
+            <Bar dataKey="humanMs" name="humans" fill={HUE.amber} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
           </BarChart>
         </ResponsiveContainer>
       </ChartCard>

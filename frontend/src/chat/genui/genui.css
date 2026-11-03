@@ -1,0 +1,238 @@
+/* Generative UI in the SDK chat.
+ *
+ * LaunchPad's components are in termag's colours and fonts through the shared
+ * map, launchpad/theme.css: the surface and LaunchPad's popovers (Select,
+ * DatePicker), which render at the end of the body outside it, both carry
+ * LP_THEME (launchpad/theme.ts). */
+
+.genui-surface {
+  container-type: inline-size;
+  margin: 0 0 10px;
+  max-width: 100%;
+  font-size: 13.5px;
+  line-height: 1.45;
+  white-space: normal;
+}
+.genui-surface[data-streaming] { opacity: 0.92; }
+
+/* The surface sits inside .md, whose paragraph, heading and list rules are for prose. */
+.md .genui-surface :is(p, h3, h4, h5, h6, ul, ol, dl, dd, hr) { margin: 0; }
+.md .genui-surface p { white-space: normal; }
+.md .genui-surface :is(h3, h4, h5, h6) { font-weight: 600; color: var(--text-primary); line-height: 1.3; }
+.md .genui-surface h3 { font-size: 17px; }
+.md .genui-surface h4 { font-size: 15px; }
+.md .genui-surface :is(h5, h6) { font-size: 13.5px; }
+.md .genui-surface :is(ul, ol).genui-list { padding-left: 20px; }
+.md .genui-surface li { margin: 0; }
+
+.genui-mono, .genui-surface code { font-family: var(--font-mono); font-size: 12px; }
+.genui-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ── Layout ──────────────────────────────────────────────────────────── */
+.genui-stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.genui-stack[data-direction="horizontal"] { flex-direction: row; flex-wrap: wrap; align-items: center; }
+.genui-stack[data-gap="none"], .genui-grid[data-gap="none"] { gap: 0; }
+.genui-stack[data-gap="small"], .genui-grid[data-gap="small"] { gap: 6px; }
+.genui-stack[data-gap="large"], .genui-grid[data-gap="large"] { gap: 20px; }
+.genui-stack[data-align="start"] { align-items: flex-start; }
+.genui-stack[data-align="center"] { align-items: center; }
+.genui-stack[data-align="end"] { align-items: flex-end; }
+.genui-stack[data-align="stretch"] { align-items: stretch; }
+.genui-stack[data-justify="center"] { justify-content: center; }
+.genui-stack[data-justify="end"] { justify-content: flex-end; }
+.genui-stack[data-justify="between"] { justify-content: space-between; }
+
+.genui-grid { --genui-cols: 2; display: grid; gap: 12px; grid-template-columns: repeat(var(--genui-cols), minmax(0, 1fr)); }
+.genui-grid[data-columns="1"] { --genui-cols: 1; }
+.genui-grid[data-columns="3"] { --genui-cols: 3; }
+.genui-grid[data-columns="4"] { --genui-cols: 4; }
+@container (max-width: 560px) { .genui-grid:is([data-columns="3"], [data-columns="4"]) { --genui-cols: 2; } }
+/* Only KPI tiles stay two abreast on a phone; cards, lists and tables need the width. */
+@container (max-width: 480px) { .genui-grid:not(:has(> .genui-stat)) { --genui-cols: 1; } }
+@container (max-width: 300px) { .genui-grid { --genui-cols: 1; } }
+
+.genui-card {
+  display: flex; flex-direction: column; gap: 12px; min-width: 0;
+  padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface);
+}
+.genui-card[data-tone="muted"] { background: var(--bg-base); }
+.genui-card[data-tone="accent"] { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.genui-card-head { display: flex; flex-direction: column; gap: 2px; }
+/* LaunchPad's Heading truncates to one line; a card title wraps. */
+.genui-surface .genui-card-title, .genui-surface .genui-heading { white-space: normal; overflow: visible; text-overflow: clip; }
+.genui-card-description, .genui-text[data-tone="muted"] { color: var(--text-secondary); }
+.genui-card-body { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+@container (max-width: 420px) { .genui-card { padding: 12px; } }
+
+.genui-text { overflow-wrap: anywhere; }
+.genui-text[data-tone="success"] { color: var(--success); }
+.genui-text[data-tone="warning"] { color: var(--warning); }
+.genui-text[data-tone="danger"] { color: var(--danger); }
+.genui-separator { border: none; border-top: 1px solid var(--border); margin: 2px 0; width: 100%; }
+
+.genui-tabs { min-width: 0; }
+.genui-tab-panel { padding-top: 12px; outline: none; }
+.genui-tab-panel[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+.genui-disclosure { border: 1px solid var(--border); border-radius: 8px; }
+.genui-disclosure-head { margin: 0; }
+.genui-disclosure-trigger { width: 100%; justify-content: flex-start; gap: 6px; font-weight: 600; }
+.genui-disclosure-panel > * { padding: 0 12px 12px; }
+
+/* ── Data display ────────────────────────────────────────────────────── */
+.genui-table-wrap { overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; }
+.genui-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.genui-table :is([role="columnheader"], [role="rowheader"], [role="gridcell"]) { padding: 7px 10px; white-space: nowrap; }
+/* Text columns wrap, so a long item doesn't push the row's actions out of view. */
+.genui-table :is([role="rowheader"], [role="gridcell"])[data-format="text"] { white-space: normal; overflow-wrap: anywhere; min-width: 14ch; }
+.genui-table [role="columnheader"] { color: var(--text-secondary); font-weight: 600; font-size: 12px; text-align: start; border-bottom: 1px solid var(--border); }
+.genui-table [role="row"] + [role="row"] :is([role="rowheader"], [role="gridcell"]) { border-top: 1px solid var(--border); }
+.genui-table [data-align="end"] { text-align: end; font-variant-numeric: tabular-nums; }
+.genui-table [data-align="end"] > div { justify-content: flex-end; }
+
+.genui-kv { display: grid; grid-template-columns: minmax(110px, max-content) 1fr; gap: 6px 16px; }
+.genui-kv-row { display: contents; }
+.genui-kv dt { color: var(--text-secondary); }
+.genui-kv dd { overflow-wrap: anywhere; }
+@container (max-width: 300px) { .genui-kv { grid-template-columns: 1fr; gap: 0; } .genui-kv dd { margin-bottom: 6px; } }
+
+.genui-stat {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface);
+}
+.genui-stat-label { font-size: 12px; color: var(--text-secondary); }
+.genui-stat-value { font-size: 24px; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.genui-stat-unit { font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-left: 3px; }
+.genui-stat-delta { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+.genui-stat[data-tone="success"] .genui-stat-delta { color: var(--success); }
+.genui-stat[data-tone="warning"] .genui-stat-delta { color: var(--warning); }
+.genui-stat[data-tone="danger"] .genui-stat-delta { color: var(--danger); }
+.genui-stat[data-tone="info"] .genui-stat-delta { color: var(--accent); }
+.genui-stat-caption { font-size: 12px; color: var(--text-muted); }
+
+.genui-badge {
+  --genui-tone: var(--text-secondary);
+  display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; width: fit-content;
+  font-size: 11.5px; font-weight: 500; line-height: 18px; white-space: nowrap;
+  color: var(--genui-tone); background: color-mix(in srgb, var(--genui-tone) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--genui-tone) 30%, transparent);
+}
+.genui-badge[data-tone="info"] { --genui-tone: var(--accent); }
+.genui-badge[data-tone="success"] { --genui-tone: var(--success); }
+.genui-badge[data-tone="warning"] { --genui-tone: var(--warning); }
+.genui-badge[data-tone="danger"] { --genui-tone: var(--danger); }
+
+.genui-status { --genui-tone: var(--text-muted); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.genui-status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--genui-tone); flex: none; }
+.genui-status[data-status="success"] { --genui-tone: var(--success); }
+.genui-status[data-status="warning"] { --genui-tone: var(--warning); }
+.genui-status[data-status="danger"] { --genui-tone: var(--danger); }
+.genui-status[data-status="info"], .genui-status[data-status="running"] { --genui-tone: var(--accent); }
+.genui-status[data-status="running"] .genui-status-dot { animation: genui-pulse 1.4s ease-in-out infinite; }
+@keyframes genui-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .genui-status[data-status="running"] .genui-status-dot { animation: none; } }
+
+.genui-progress, .genui-meter { width: 100%; }
+.genui-meter[data-tone="success"] { --fill-color: var(--success); }
+.genui-meter[data-tone="warning"] { --fill-color: var(--warning); }
+.genui-meter[data-tone="danger"] { --fill-color: var(--danger); }
+
+/* Links are the accent, as in the chat's markdown; LaunchPad's default is its interactive text colour. */
+.genui-surface .genui-link { color: var(--accent); }
+
+.genui-avatar { display: inline-flex; align-items: center; gap: 8px; }
+.genui-avatar-name { font-weight: 500; }
+
+.genui-code { margin: 0; }
+.genui-code .md-pre-head { padding: 2px 4px 2px 10px; }
+.genui-diff-line { display: block; }
+.genui-diff-line[data-diff="add"] { background: var(--code-added-bg); }
+.genui-diff-line[data-diff="del"] { background: var(--code-removed-bg); }
+.genui-diff-line[data-diff="hunk"] { color: var(--text-muted); }
+
+.genui-alert { min-width: 0; }
+
+.genui-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.genui-step { --genui-tone: var(--text-muted); display: flex; gap: 10px; align-items: flex-start; }
+.genui-step-mark {
+  flex: none; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 11px; font-weight: 700; color: var(--genui-tone); border: 1.5px solid var(--genui-tone);
+}
+.genui-step-body { display: flex; flex-direction: column; min-width: 0; padding-top: 1px; }
+.genui-step-detail { font-size: 12px; color: var(--text-secondary); }
+.genui-step[data-status="done"] { --genui-tone: var(--success); }
+.genui-step[data-status="current"] { --genui-tone: var(--accent); }
+.genui-step[data-status="current"] .genui-step-label { font-weight: 600; }
+.genui-step[data-status="failed"] { --genui-tone: var(--danger); }
+.genui-step:is([data-status="pending"], [data-status="skipped"]) .genui-step-label { color: var(--text-secondary); }
+.genui-step[data-status="skipped"] .genui-step-label { text-decoration: line-through; }
+
+/* ── Input ───────────────────────────────────────────────────────────── */
+/* LaunchPad's Form aligns its children to the start; a form here fills its card. */
+.genui-surface .genui-form { display: flex; flex-direction: column; align-items: stretch; gap: 12px; min-width: 0; }
+.genui-field { width: 100%; min-width: 0; }
+.genui-field :is(input, textarea) { width: 100%; font-family: var(--font-ui); }
+.genui-field-description { color: var(--text-secondary); }
+.genui-surface .genui-select-button { display: flex; align-items: center; width: 100%; justify-content: space-between; text-align: start; }
+.genui-number, .genui-date { display: flex; align-items: center; gap: 2px; }
+.genui-number input { flex: 1; min-width: 0; }
+.genui-group { display: flex; flex-direction: column; gap: 6px; }
+.genui-group[data-orientation="horizontal"] { flex-direction: row; flex-wrap: wrap; gap: 6px 16px; }
+.genui-option { display: inline-flex; flex-direction: column; }
+.genui-option-description { font-size: 12px; color: var(--text-secondary); }
+.genui-buttons { flex-wrap: wrap; }
+.genui-slider { width: 100%; }
+.genui-slider-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.genui-slider-value { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.genui-calendar-dialog { padding: 8px; outline: none; }
+.genui-calendar-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+
+/* ── States ──────────────────────────────────────────────────────────── */
+.genui-note { font-size: 12px; color: var(--text-muted); margin: 0 0 4px; }
+.genui-fallback { margin: 0 0 10px; }
+/* What spec.ts left out of a spec it could otherwise draw. */
+.genui-left-out { margin: 8px 0 0; overflow-wrap: anywhere; }
+.genui-fallback .md-pre { margin-bottom: 0; }
+.genui-bad {
+  font-size: 12px; color: var(--warning); padding: 4px 8px; border-radius: 6px;
+  border: 1px dashed color-mix(in srgb, var(--warning) 50%, transparent);
+}
+.genui-skeleton {
+  display: flex; flex-direction: column; gap: 8px; margin: 0 0 10px; padding: 14px 16px;
+  border: 1px dashed var(--border); border-radius: 10px; max-width: 520px;
+}
+.genui-skeleton-line { height: 10px; border-radius: 5px; background: var(--bg-active); animation: genui-pulse 1.4s ease-in-out infinite; }
+.genui-skeleton-label { font-size: 12px; color: var(--text-muted); }
+@media (prefers-reduced-motion: reduce) { .genui-skeleton-line { animation: none; } }
+
+/* ── Actions (action.ts) ─────────────────────────────────────────────── */
+.genui-sent {
+  display: flex; align-items: baseline; gap: 6px; margin-top: 8px;
+  font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere;
+}
+.genui-sent-mark { color: var(--success); font-weight: 700; }
+.genui-problem { color: var(--danger); margin: 8px 0 0; }
+/* An answered surface steps back; what went is in the line under it and the bubble below. */
+.genui-surface[data-sent] > :first-child { opacity: 0.82; }
+
+.genui-action-bubble { display: flex; flex-direction: column; gap: 2px; }
+.genui-action-from { font-size: 11px; opacity: 0.75; }
+
+.genui-confirm { font-family: var(--font-ui); color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; }
+.genui-confirm-dialog { display: flex; flex-direction: column; gap: 10px; padding: 20px; outline: none; }
+.genui-confirm-dialog p { margin: 0; color: var(--text-secondary); }
+.genui-confirm-summary { padding: 8px 10px; border-radius: 8px; background: var(--bg-base); border: 1px solid var(--border); color: var(--text-primary) !important; overflow-wrap: anywhere; }
+.genui-confirm-buttons { justify-content: flex-end; margin-top: 6px; }
+
+/* Everything an answer carries (ActionBubble SentDetails), in the bubble and in termag's confirm. */
+.genui-sent-details { font-size: 11.5px; margin-top: 4px; }
+.genui-sent-details summary { cursor: pointer; opacity: 0.85; }
+.genui-sent-details pre {
+  margin: 4px 0 0; padding: 6px 8px; max-height: 220px; overflow: auto; border-radius: 6px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--bg-base) 70%, transparent); color: var(--text-primary);
+}
+
+/* A Table's row actions (rowActions): one compact group at the row's end. */
+.genui-table .genui-row-actions { width: 1%; white-space: nowrap; padding-block: 4px; }
+.genui-row-actions .genui-buttons { flex-wrap: nowrap; justify-content: flex-end; gap: 4px; }

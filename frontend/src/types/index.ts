@@ -1,3 +1,4 @@
+import type { ResizeView } from '../utils/boxResize';
 import type { ThemeSettings } from '../theme/schema';
 
 export interface User {
@@ -18,6 +19,12 @@ export interface User {
   onboardedAt?: string | null;
   /** From /auth/me only: never onboarded AND no projects yet → send to /welcome. */
   needsOnboarding?: boolean;
+  /**
+   * Where later visits open, termag (`simple`) or Lab (`full`), kept on the
+   * user. Present only while
+   * onboarding-refresh-enabled is on for this user; null until chosen.
+   */
+  uiMode?: 'simple' | 'full' | null;
 }
 
 export type WorkflowType = 'agent' | 'data';
@@ -48,6 +55,22 @@ export interface Workstream {
   archived: boolean;
   /** Claude's own title for the workstream's chat session (simple-ui-session-titles-enabled); null before its first. */
   sessionTitle?: string | null;
+  /** Its chat has a stored transcript; absent from orchestrators before it. */
+  hasTranscript?: boolean;
+  /** On main: working time was banked for it, an agent's turns or typing in its panes; absent elsewhere and from older orchestrators. */
+  hasTurns?: boolean;
+  /** The space this chat belongs to, fixed when it started (backend services/chatSpace.ts); null for none. */
+  spaceId?: string | null;
+  /** When that was decided; unset only from an older backend, before the chat's first listing. */
+  spaceFixedAt?: string | null;
+  /** The ask thread whose chat this is; absent on every other workstream. */
+  askThread?: {
+    id: string; title: string | null;
+    /** The session that sent the thread's first ask; null on older threads and asks from outside a session. */
+    parentProjectId?: string | null; parentWorkstream?: string | null;
+    /** The workstream and repository the thread asks, which a follow-up names; absent from older orchestrators. */
+    workstream?: string; repoName?: string | null;
+  } | null;
   lastActiveAt: string;
   createdAt: string;
   updatedAt: string;
@@ -61,6 +84,9 @@ export interface Project {
   archived: boolean;
   pinned?: boolean;
   lastActiveAt?: string;
+  createdAt?: string;
+  /** What the project was made for, when its creator said: 'ask' (`termag ask --new-box`). A hint only: see chat/simpleChat.askPlaceholderProjects. */
+  createdFor?: 'ask' | null;
   instanceId?: string | null;
   repoUrl?: string | null;
   repoDefaultBranch?: string | null;
@@ -70,6 +96,8 @@ export interface Project {
   workstreams: Workstream[];
   ownerUsername?: string;
   role?: 'owner' | 'collaborator';
+  /** The owner's chat trust tick (Project.chatTrustedAt): only on the owner's own projects. */
+  chatTrusted?: boolean;
   // 'metaterm' = the per-user pinned control-tower singleton; 'automation' = a
   // project whose runs a schedule starts; absent/'normal' otherwise.
   kind?: 'normal' | 'metaterm' | 'automation';
@@ -77,7 +105,7 @@ export interface Project {
 
 export type InstanceStatus =
   | 'provisioning' | 'awaiting-agent' | 'warming' | 'warm' | 'ready'
-  | 'stopping' | 'stopped' | 'starting' | 'hibernating' | 'hibernated' | 'failed' | 'terminated';
+  | 'stopping' | 'stopped' | 'starting' | 'hibernating' | 'hibernated' | 'failed' | 'quarantined' | 'terminated';
 
 export type InstanceKind = 'ec2' | 'external';
 
@@ -97,17 +125,39 @@ export interface Instance {
   claimedAt?: string | null;
   onClaimStatus?: string | null;
   onClaimError?: string | null;
+  // A claimed pool box's update to the orchestrator's commit before its first
+  // launch (backend services/claimUpdate.ts): updating, then updated, current,
+  // skipped, failed or timed-out, with a one-line detail.
+  claimUpdateStatus?: string | null;
+  claimUpdateDetail?: string | null;
+  claimUpdateStartedAt?: string | null;
   hostUnixUser?: string | null;
   // The AMI the box launched from, and how the box-image flag chose it:
   // published, channel:<name>, pinned, or fallback:<what was asked>.
   imageId?: string | null;
   imageSource?: string | null;
-  // Fixed at launch: only boxes launched hibernation-capable can hibernate.
+  // small, medium or large (utils/boxSize.ts), and the EC2 type it launched
+  // as; size is null for a box launched as the configured type.
+  size?: string | null;
+  instanceType?: string | null;
+  // Its current or last resize, from the box's latest resize row in
+  // box_events (backend services/boxEvents.ts; utils/boxResize.ts reads it).
+  // On the list response only; null when it never had one.
+  resize?: ResizeView | null;
+  // The root disk in GB it was made with (backend services/boxDiskSize.ts);
+  // null for older and external boxes.
+  diskGiB?: number | null;
+  // Fixed at launch: only boxes launched hibernation-capable can hibernate. A
+  // resize to a type with more RAM than it launched with turns it off.
   hibernationConfigured?: boolean;
   hibernatedAt?: string | null;
   // The 60-day refresh resumed this box and will hibernate it again.
   rehibernatePending?: boolean;
   repoPromptDismissedAt?: string | null;
+  // What the box was made for, when its creator said: 'ask' from `termag ask
+  // --new-box` (or the deprecated `--for-ask`). Null for every other box,
+  // including any made before the mark existed (utils/askBoxGroups.ts).
+  createdFor?: 'ask' | null;
   // Automatic lifecycle; on the list response only.
   lifecycle?: BoxLifecycle;
   _count?: { projects: number };
@@ -127,6 +177,17 @@ export interface BoxLifecycle {
   note: string | null;
   // Set when the setting is on but the box can't hibernate, so it never fires.
   warning: string | null;
+  // When the sweep next parks it as things stand, and how: its own hours
+  // hibernate it, box-idle-stop-enabled's window stops it. An orchestrator
+  // from an older orchestrator leaves these out.
+  parkAt?: string | null;
+  parkAction?: 'hibernate' | 'stop' | null;
+  idleLimitHours?: number | null;
+  idleLimitSource?: 'own' | 'default' | null;
+  // The default window's standing warning: the row counts down to parkAt and offers Keep running.
+  warnedAt?: string | null;
+  // When the sweep last parked it, until its owner starts it.
+  autoParkedAt?: string | null;
 }
 
 // A box the lifecycle sweep terminated in the last 7 days.
@@ -258,6 +319,12 @@ export interface AgentStatus {
    */
   review?: SessionReview | null;
   /**
+   * Every review pane of the workstream, slot order, each with `session` and
+   * `slot`; `review` stays slot 1's for the clients
+   * that know one pane. Null or absent: none, or an older backend (then read `review`).
+   */
+  reviews?: SessionReview[] | null;
+  /**
    * A handoff of this agent pane in flight or just finished, written by the
    * backend's handoff route and sweep and pushed over /ws/status.
    * Null/absent = none.
@@ -310,6 +377,9 @@ export interface SessionReview {
   doneAt: string | null;
   /** When the viewer focused the review terminal while the review was done. */
   seenAt: string | null;
+  /** The pane's tmux session and slot (1 = the `review` role's own name); absent from an older backend. */
+  session?: string;
+  slot?: number;
 }
 
 /**

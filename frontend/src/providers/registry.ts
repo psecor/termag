@@ -9,7 +9,14 @@ export interface ProviderConfig {
   id: string;
   displayName: string;
   badge: string;
+  /** The dark palette's colours: `base` is the series fill, `bright` the
+   *  emphasis (a badge's border, the human series). */
   color: { base: string; bright: string };
+  /** The same pair for the light palette (html[data-palette="light"]): at
+   *  least 3:1 (`base`) and 4.5:1 (`bright`) on the light surfaces, so
+   *  `bright` is the darker one. Both registries carry it; registry.test.ts
+   *  keeps them equal. */
+  lightColor: { base: string; bright: string };
   /** Whether token usage numbers are exact or estimated */
   usagePrecision: 'exact' | 'estimated';
   /** Status source values that map back to this provider */
@@ -25,12 +32,23 @@ export interface ProviderConfig {
   handoffModes?: ('clear' | 'compact' | 'restart')[];
   /** A handoff restart may start this agent (the backend's canRestartInto). */
   handoffTarget?: boolean;
+  /** The owner's MCP connectors reach this agent on their boxes:
+   * the backend's mcpConfig is set. Claude Code's
+   *  through mcp-broker-v1, the others through mcp-broker-v2.
+   *  backend/src/providers/registry.test.ts keeps them equal. */
+  mcpConnectors?: boolean;
   /** The agent-orchestrator skill is installed for it (backend orchestratorSkill),
    *  so New session can offer "Act as an orchestrator". */
   orchestratorSkill?: boolean;
   /** Model backends this harness can also run on (the backend registry's
    *  `backends`). Absent = its default only. */
   backends?: string[];
+  /** Runs in the simple UI's chat runner, not the agent pane (backend chatRunner). */
+  chatRunner?: boolean;
+  /** The headless agent the chat runner drives for it (backend chatEngine). */
+  chatEngine?: 'claude' | 'pi';
+  /** The chatRunner provider its automations run as (backend automationChatProvider). */
+  automationChatProvider?: string;
 }
 
 export const PROVIDERS: Record<string, ProviderConfig> = {
@@ -43,10 +61,13 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     orchestratorSkill: true,
     badge: 'CL',
     color: { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' },
+    lightColor: { base: 'rgba(9, 105, 218, 0.6)', bright: 'rgba(5, 80, 174, 0.9)' },
+    automationChatProvider: 'claude-chat',
     usagePrecision: 'exact',
     // t3:claude: the desktop app's threads on a box.
     statusSources: ['claude-hooks', 't3:claude'],
     backends: ['fireworks'],
+    mcpConnectors: true,
   },
 
   // Claude driven headless by the simple UI's chat runner (backend registry).
@@ -54,12 +75,16 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     id: 'claude-chat',
     displayName: 'Claude (chat)',
     selectable: false,
+    chatRunner: true,
+    chatEngine: 'claude',
     orchestratorSkill: true,
     backends: ['fireworks'],
     badge: 'CC',
     color: { base: 'rgba(31, 111, 235, 0.6)', bright: 'rgba(88, 166, 255, 0.9)' },
+    lightColor: { base: 'rgba(9, 105, 218, 0.6)', bright: 'rgba(5, 80, 174, 0.9)' },
     usagePrecision: 'exact',
     statusSources: ['chat-runner'],
+    mcpConnectors: true,
   },
 
   codex: {
@@ -68,8 +93,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'CX',
     color: { base: 'rgba(35, 170, 100, 0.6)', bright: 'rgba(72, 220, 140, 0.9)' },
+    lightColor: { base: 'rgba(26, 127, 55, 0.6)', bright: 'rgba(17, 99, 41, 0.9)' },
     usagePrecision: 'exact',
     statusSources: ['codex-app-server', 'codex-jsonl'],
+    mcpConnectors: true,
   },
 
   cursor: {
@@ -79,8 +106,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     handoffTarget: true,
     badge: 'CR',
     color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
+    lightColor: { base: 'rgba(130, 80, 223, 0.6)', bright: 'rgba(102, 57, 186, 0.9)' },
     usagePrecision: 'estimated',
     statusSources: ['tmux-poller', 'tmux-poller:cursor'],
+    mcpConnectors: true,
   },
 
   gemini: {
@@ -89,8 +118,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'GE',
     color: { base: 'rgba(66, 133, 244, 0.6)', bright: 'rgba(120, 170, 255, 0.9)' },
+    lightColor: { base: 'rgba(26, 115, 232, 0.6)', bright: 'rgba(21, 88, 176, 0.9)' },
     usagePrecision: 'estimated',
     statusSources: ['tmux-poller:gemini'],
+    mcpConnectors: true,
   },
 
   augment: {
@@ -99,8 +130,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'AG',
     color: { base: 'rgba(255, 152, 0, 0.6)', bright: 'rgba(255, 183, 77, 0.9)' },
+    lightColor: { base: 'rgba(179, 89, 0, 0.6)', bright: 'rgba(138, 70, 0, 0.9)' },
     usagePrecision: 'estimated',
     statusSources: ['tmux-poller:augment'],
+    mcpConnectors: true,
   },
 
   deepseek: {
@@ -109,6 +142,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'DS',
     color: { base: 'rgba(0, 150, 136, 0.6)', bright: 'rgba(77, 208, 195, 0.9)' },
+    lightColor: { base: 'rgba(0, 121, 107, 0.6)', bright: 'rgba(0, 92, 82, 0.9)' },
     usagePrecision: 'estimated',
     statusSources: ['tmux-poller:deepseek'],
   },
@@ -120,8 +154,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     handoffTarget: true,
     badge: 'DV',
     color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
+    lightColor: { base: 'rgba(191, 57, 137, 0.6)', bright: 'rgba(153, 40, 110, 0.9)' },
     usagePrecision: 'estimated',
-    statusSources: ['tmux-poller:devin'],
+    statusSources: ['devin-hooks', 'tmux-poller:devin'],
+    mcpConnectors: true,
   },
 
   pi: {
@@ -132,9 +168,26 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     handoffTarget: true,
     badge: 'PI',
     color: { base: 'rgba(217, 119, 6, 0.6)', bright: 'rgba(251, 191, 36, 0.9)' },
+    lightColor: { base: 'rgba(154, 103, 0, 0.6)', bright: 'rgba(125, 78, 0, 0.9)' },
     usagePrecision: 'exact',
     statusSources: ['pi-ext:pi'],
+    mcpConnectors: true,
     backends: ['fireworks'],
+  },
+
+  // pi driven headless by the chat runner (backend registry).
+  'pi-chat': {
+    id: 'pi-chat',
+    displayName: 'pi (chat)',
+    selectable: false,
+    chatRunner: true,
+    chatEngine: 'pi',
+    badge: 'PI',
+    color: { base: 'rgba(217, 119, 6, 0.6)', bright: 'rgba(251, 191, 36, 0.9)' },
+    lightColor: { base: 'rgba(154, 103, 0, 0.6)', bright: 'rgba(125, 78, 0, 0.9)' },
+    usagePrecision: 'exact',
+    statusSources: ['chat-runner'],
+    mcpConnectors: true,
   },
 
   mistral: {
@@ -143,8 +196,10 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'MI',
     color: { base: 'rgba(230, 80, 50, 0.6)', bright: 'rgba(255, 130, 90, 0.9)' },
+    lightColor: { base: 'rgba(201, 60, 55, 0.6)', bright: 'rgba(160, 37, 31, 0.9)' },
     usagePrecision: 'exact',
     statusSources: ['tmux-poller:mistral'],
+    mcpConnectors: true,
   },
 
   human: {
@@ -153,12 +208,24 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     selectable: false,
     badge: 'ME',
     color: { base: 'rgba(255, 255, 255, 0.4)', bright: 'rgba(255, 255, 255, 0.85)' },
+    lightColor: { base: 'rgba(110, 119, 129, 0.6)', bright: 'rgba(36, 41, 47, 0.85)' },
     usagePrecision: 'estimated',
     statusSources: [],
   },
 };
 
 export const PROVIDER_IDS = Object.keys(PROVIDERS);
+
+/** A provider's colour pair for a palette (theme/usePalette.ts reads the live one). */
+export function providerColor(p: ProviderConfig, palette: 'dark' | 'light'): { base: string; bright: string } {
+  return palette === 'light' ? p.lightColor : p.color;
+}
+
+/** A provider badge's border and tint, from its colour pair. */
+export function providerBadgeStyle(p: ProviderConfig, palette: 'dark' | 'light'): { borderColor: string; background: string } {
+  const c = providerColor(p, palette);
+  return { borderColor: c.bright.replace(/[\d.]+\)$/, '0.45)'), background: c.base.replace(/[\d.]+\)$/, '0.16)') };
+}
 /** Providers a user may pick for a NEW project or as their default. Existing
  *  projects may carry any PROVIDER_IDS entry. */
 export const SELECTABLE_PROVIDER_IDS = Object.values(PROVIDERS).filter(p => p.selectable).map(p => p.id);
@@ -175,6 +242,10 @@ export const MODEL_BACKENDS: Record<string, { displayName: string; badge: string
 
 /** The simple UI's chat provider (backend CHAT_PROVIDER_ID). */
 export const CHAT_PROVIDER_ID = 'claude-chat';
+/** Whether a provider runs in the chat runner (the SDK chat), whatever its engine. */
+export function isChatRunnerProvider(id: string | null | undefined): boolean {
+  return !!id && PROVIDERS[id]?.chatRunner === true;
+}
 
 /** Reverse-map a status source to a provider ID */
 export function providerForSource(source: string): string | undefined {

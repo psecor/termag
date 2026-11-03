@@ -3,14 +3,26 @@
 // GFM's tables, task lists, strikethrough and autolinks, with inline code,
 // bold, italics and links. Rendered as React elements (chat/Markdown.tsx),
 // never as HTML, so nothing in a reply can inject markup: raw HTML stays text
-// except `<br>`, which becomes a line break. Links are http(s) or mailto only;
+// except `<br>`, which becomes a line break, and GitHub's collapsible
+// `<details>` / `<summary>` (below). Links are http(s) or mailto only;
 // any other destination keeps its label as plain text. Images are never
-// loaded (a reply could carry a tracking or exfiltration URL), only linked.
+// loaded here (a reply could carry a tracking or exfiltration URL): an image
+// keeps its raw destination (`src`) and a link only if that is http(s).
+// Only a space file's renderer may load one (chat/spaceImages.ts).
+//
+// `<details>` takes no attribute but a bare `open`, and is read in two places.
+// A line starting with it opens a block: an optional `<summary>…</summary>`
+// (inline markup) on that line or the next, then blocks up to the matching
+// `</details>` (they nest; one inside a fence doesn't count). In a table cell,
+// `<details><summary>…</summary>…</details>` on the row's line is a collapsed
+// cell with inline markup. A tag with anything else in it, a stray
+// `</details>`, or one never closed stays text.
 //
 // Mid-stream (`streaming`), the unfinished tail is read the way it will
 // most likely end: a fence still open is code up to the end, a trailing
 // `|` row is a table's header, and an unclosed `**` or backtick in the last
-// paragraph runs to the end, so the bubble doesn't flash raw markup.
+// paragraph runs to the end, and an unclosed `<details>` (block, or in the
+// last row's cell) runs to the end, so the bubble doesn't flash raw markup.
 //
 // Deliberate departures from CommonMark: a paragraph's line breaks are kept
 // (the bubble is pre-wrap), there are no indented code blocks or lazy
@@ -19,13 +31,18 @@
 
 export type Inline =
   | { t: 'text'; v: string }
+  /** A `termag-compose:` link: `text` goes into the file view's message box when clicked (composeLinkText). */
+  | { t: 'compose'; text: string; c: Inline[] }
   | { t: 'code'; v: string }
   | { t: 'b'; c: Inline[] }
   | { t: 'i'; c: Inline[] }
   | { t: 's'; c: Inline[] }
   | { t: 'a'; href: string; c: Inline[] }
-  | { t: 'img'; href: string; alt: string }
-  | { t: 'br' };
+  /** `href`: `src` when it is a safe link, else null. `src`: the destination as written, never loaded by a reply. */
+  | { t: 'img'; href: string | null; src: string; alt: string }
+  | { t: 'br' }
+  /** Only in a table cell. `summary` null is the browser's own "Details". */
+  | { t: 'details'; open: boolean; summary: Inline[] | null; c: Inline[] };
 
 export type Align = 'left' | 'center' | 'right' | null;
 
@@ -43,7 +60,8 @@ export type MdBlock =
   | { type: 'ol'; start: number; tight: boolean; items: MdItem[] }
   | { type: 'quote'; blocks: MdBlock[] }
   | { type: 'table'; align: Align[]; head: Inline[][]; rows: Inline[][][] }
-  | { type: 'hr' };
+  | { type: 'hr' }
+  | { type: 'details'; open: boolean; summary: Inline[] | null; blocks: MdBlock[] };
 
 const FENCE = /^( {0,3})(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/;
 const HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/;
@@ -55,12 +73,19 @@ const DELIM_CELL = /^:?-+:?$/;
 const TASK = /^\[([ xX])\](?:\s+|$)/;
 const PUNCT = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/;
 const BR = /^<br\s*\/?>/i;
+const DETAILS_OPEN = /^<details(\s+open)?\s*>/i;
+const DETAILS_CLOSE = /^<\/details\s*>/i;
+const SUMMARY_OPEN = /^<summary\s*>/i;
+const SUMMARY_CLOSE = /^<\/summary\s*>/i;
 const ENTITY = /^&(#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|amp|lt|gt|quot|apos|nbsp);/;
 const NAMED: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
 
 function safeHref(url: string): string | null {
   return /^(https?:\/\/[^\s]+|mailto:[^\s@]+@[^\s]+)$/i.test(url) ? url : null;
 }
+
+/** The bare fence that closes one opened by `marker`: same kind, at least as long. */
+const fenceCloser = (marker: string) => new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
 
 const blank = (line: string) => !line.trim();
 const indentOf = (line: string) => line.length - line.trimStart().length;
@@ -103,6 +128,32 @@ function readLink(src: string, i: number): { label: string; dest: string; len: n
   while (src[k] === ' ') k++;
   if (src[k] !== ')') return null;
   return { label, dest, len: k + 1 - i };
+}
+
+export const COMPOSE_SCHEME = 'termag-compose:';
+/** The most a compose link puts in the message box. */
+export const COMPOSE_MAX = 500;
+
+/**
+ * A `termag-compose:` link's text, or null for any other destination. The
+ * text is percent-decoded (`%20` for a space, `%23` for `#`), then only
+ * text is kept: control characters and line breaks become spaces, zero-width
+ * and bidi-override characters (which could hide or reorder words) go, runs
+ * of spaces close up, and it is capped at COMPOSE_MAX. It never navigates:
+ * the renderer makes it a button that fills the message box, or plain text.
+ * '' means a compose link with nothing left to put in.
+ */
+export function composeLinkText(dest: string): string | null {
+  if (dest.slice(0, COMPOSE_SCHEME.length).toLowerCase() !== COMPOSE_SCHEME) return null;
+  let raw = dest.slice(COMPOSE_SCHEME.length);
+  try { raw = decodeURIComponent(raw); } catch { /* a stray %: as written */ }
+  return raw
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, COMPOSE_MAX)
+    .trimEnd();
 }
 
 /** A bare URL's length at `src[i]`, without trailing punctuation. */
@@ -183,8 +234,7 @@ function inline(src: string, open: boolean, inLink: boolean): Inline[] {
     if (ch === '!' && src[i + 1] === '[') {
       const link = readLink(src, i + 1);
       if (link) {
-        const href = safeHref(link.dest);
-        if (href && !inLink) push({ t: 'img', href, alt: link.label });
+        if (!inLink && link.dest.trim() && composeLinkText(link.dest) === null) push({ t: 'img', href: safeHref(link.dest), src: link.dest, alt: link.label });
         else text += link.label;
         i += 1 + link.len;
         continue;
@@ -192,6 +242,13 @@ function inline(src: string, open: boolean, inLink: boolean): Inline[] {
     }
     if (ch === '[') {
       const link = readLink(src, i);
+      const compose = link ? composeLinkText(link.dest) : null;
+      if (link && compose !== null) {
+        if (compose && !inLink) push({ t: 'compose', text: compose, c: inline(link.label, false, true) });
+        else for (const node of inline(link.label, false, inLink)) { if (node.t === 'text') text += node.v; else push(node); }
+        i += link.len;
+        continue;
+      }
       if (link) {
         const href = safeHref(link.dest);
         if (href && !inLink) push({ t: 'a', href, c: inline(link.label, false, true) });
@@ -227,6 +284,87 @@ function inline(src: string, open: boolean, inLink: boolean): Inline[] {
     i++;
   }
   flush();
+  return out;
+}
+
+interface Tag { at: number; end: number; kind: 'open' | 'close' | 'summary' | 'summary-end'; open: boolean }
+
+/** The details and summary tags in `src`, outside code spans and escapes. */
+function detailTags(src: string): Tag[] {
+  const tags: Tag[] = [];
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === '\\') { i++; continue; }
+    if (c === '`') {
+      const run = /^`+/.exec(src.slice(i))![0];
+      const end = src.indexOf(run, i + run.length);
+      if (end > 0) { i = end + run.length - 1; continue; }
+      i += run.length - 1;
+      continue;
+    }
+    if (c !== '<') continue;
+    const rest = src.slice(i);
+    const m = DETAILS_OPEN.exec(rest) ?? DETAILS_CLOSE.exec(rest) ?? SUMMARY_OPEN.exec(rest) ?? SUMMARY_CLOSE.exec(rest);
+    if (!m) continue;
+    const kind = rest[1] === '/' ? (/^<\/d/i.test(rest) ? 'close' : 'summary-end') : /^<d/i.test(rest) ? 'open' : 'summary';
+    tags.push({ at: i, end: i + m[0].length, kind, open: kind === 'open' && !!m[1] });
+    i += m[0].length - 1;
+  }
+  return tags;
+}
+
+/**
+ * A `<summary>…</summary>` starting `src` (after spaces): its inline markup
+ * and what follows. `open` lets one still streaming run to the end.
+ */
+function readSummary(src: string, open: boolean): { summary: Inline[]; rest: string } | null {
+  const lead = indentOf(src);
+  const tags = detailTags(src);
+  if (tags[0]?.kind !== 'summary' || tags[0].at !== lead) return null;
+  const close = tags.find(t => t.kind === 'summary-end');
+  if (!close) return open ? { summary: parseInline(src.slice(tags[0].end).trim(), true), rest: '' } : null;
+  return { summary: parseInline(src.slice(tags[0].end, close.at).trim()), rest: src.slice(close.end) };
+}
+
+/**
+ * A table cell: inline markup, where a closed `<details>` (or, with `open`,
+ * one still streaming) is a collapsed cell. Anything else stays as text.
+ */
+export function parseCell(src: string, open = false): Inline[] {
+  const tags = detailTags(src);
+  const out: Inline[] = [];
+  let from = 0;
+  const text = (to: number) => { if (to > from) out.push(...parseInline(src.slice(from, to))); };
+  for (let k = 0; k < tags.length; k++) {
+    const tag = tags[k];
+    if (tag.kind !== 'open') continue;
+    let depth = 0;
+    let close = -1;
+    for (let j = k; j < tags.length; j++) {
+      if (tags[j].kind === 'open') depth++;
+      else if (tags[j].kind === 'close' && --depth === 0) { close = j; break; }
+    }
+    if (close < 0 && !open) continue;
+    const inner = src.slice(tag.end, close < 0 ? src.length : tags[close].at);
+    const sum = readSummary(inner, close < 0);
+    text(tag.at);
+    const body = sum ? sum.rest : inner;
+    out.push({ t: 'details', open: tag.open, summary: sum?.summary ?? null, c: parseCell(body.trim(), close < 0) });
+    if (close < 0) return out;
+    from = tags[close].end;
+    k = close;
+  }
+  text(src.length);
+  return mergeText(out);
+}
+
+function mergeText(nodes: Inline[]): Inline[] {
+  const out: Inline[] = [];
+  for (const n of nodes) {
+    const prev = out[out.length - 1];
+    if (n.t === 'text' && prev?.t === 'text') out[out.length - 1] = { t: 'text', v: prev.v + n.v };
+    else out.push(n);
+  }
   return out;
 }
 
@@ -303,11 +441,19 @@ function parseBlocks(lines: string[], atEnd: boolean): MdBlock[] {
     const line = lines[i];
     if (blank(line)) { endPara(); i++; continue; }
 
+    const details = DETAILS_OPEN.test(line.slice(indentOf(line))) && indentOf(line) <= 3 ? readDetails(lines, i, atEnd) : null;
+    if (details) {
+      endPara();
+      blocks.push(details.block, ...details.after);
+      i = details.next;
+      continue;
+    }
+
     const fence = FENCE.exec(line);
     if (fence) {
       endPara();
       const [, indent, marker, lang] = fence;
-      const closer = new RegExp(`^ {0,3}${marker[0] === '`' ? '`' : '~'}{${marker.length},}[ \\t]*$`);
+      const closer = fenceCloser(marker);
       const body: string[] = [];
       i++;
       while (i < n && !closer.test(lines[i])) {
@@ -347,10 +493,13 @@ function parseBlocks(lines: string[], atEnd: boolean): MdBlock[] {
       if ((align && align.length === head.length) || pendingHead) {
         endPara();
         const cols = head.length;
-        const fit = (cells: string[]) => Array.from({ length: cols }, (_, c) => parseInline(cells[c] ?? ''));
+        const fit = (cells: string[], open = false) => Array.from({ length: cols }, (_, c) => parseCell(cells[c] ?? '', open));
         const rows: Inline[][][] = [];
         i += next == null ? 1 : 2;
-        while (i < n && lines[i].includes('|') && !blank(lines[i]) && !QUOTE.test(lines[i]) && !FENCE.test(lines[i])) rows.push(fit(splitRow(lines[i++])));
+        while (i < n && lines[i].includes('|') && !blank(lines[i]) && !QUOTE.test(lines[i]) && !FENCE.test(lines[i])) {
+          rows.push(fit(splitRow(lines[i]), isLast(i)));
+          i++;
+        }
         blocks.push({ type: 'table', align: align && align.length === cols ? align : head.map(() => null), head: fit(head), rows });
         continue;
       }
@@ -377,6 +526,55 @@ function parseBlocks(lines: string[], atEnd: boolean): MdBlock[] {
   }
   endPara(atEnd);
   return blocks;
+}
+
+/**
+ * A `<details>` block opening at `lines[i]`: the block, any blocks after its
+ * `</details>` on the closing line, and the line after it. Null when it never
+ * closes, unless the reply is still streaming (`atEnd`): then it runs to the end.
+ */
+function readDetails(lines: string[], i: number, atEnd: boolean): { block: MdBlock; after: MdBlock[]; next: number } | null {
+  const n = lines.length;
+  const first = lines[i].trimStart();
+  const opener = detailTags(first)[0];
+  // Walk to the matching close, skipping fenced code.
+  let depth = 0;
+  let fence: RegExp | null = null;
+  let end = -1;
+  let closeAt = 0;
+  let closeEnd = 0;
+  for (let j = i; j < n && end < 0; j++) {
+    const l = j === i ? first : lines[j];
+    if (fence) { if (fence.test(l)) fence = null; continue; }
+    const f = j > i ? FENCE.exec(l) : null;
+    if (f) { fence = fenceCloser(f[2]); continue; }
+    for (const t of detailTags(l)) {
+      if (t.kind === 'open') depth++;
+      else if (t.kind === 'close' && --depth === 0) { end = j; closeAt = t.at; closeEnd = t.end; break; }
+    }
+  }
+  if (end < 0 && !atEnd) return null;
+  const last = end < 0 ? n - 1 : end;
+  const body = lines.slice(i, last + 1);
+  body[0] = first;
+  if (end >= 0) body[body.length - 1] = body[body.length - 1].slice(0, closeAt);
+  body[0] = body[0].slice(opener.end);
+  // The summary: right after the tag, or alone on the next line.
+  let summary: Inline[] | null = null;
+  const still = end < 0;
+  const onLine = readSummary(body[0], still && body.length === 1);
+  if (onLine) { summary = onLine.summary; body[0] = onLine.rest; }
+  else if (blank(body[0]) && body.length > 1) {
+    const next = readSummary(body[1], still && body.length === 2);
+    if (next && blank(next.rest)) { summary = next.summary; body.splice(0, 2); }
+  }
+  const tail = end < 0 ? '' : (end === i ? first : lines[end]).slice(closeEnd).trimStart();
+  const after = blank(tail) ? [] : parseBlocks([tail], atEnd && end === n - 1);
+  return {
+    block: { type: 'details', open: opener.open, summary, blocks: parseBlocks(body, still) },
+    after,
+    next: last + 1,
+  };
 }
 
 function parseList(lines: string[], i: number, first: ListMarker, atEnd: boolean, blocks: MdBlock[]): number {

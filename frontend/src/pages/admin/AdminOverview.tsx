@@ -4,7 +4,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { adminApi, type AdminRange } from '../../services/adminApi';
 import { KpiRow, type Kpi, deltaPct } from '../dashboard/KpiRow';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { fmtDurationShort, fmtK, fmtAge } from '../../utils/format';
 import { useAdminPolled, pendingText,SignalsList, Counts, fmtMs, fmtTok } from './shared';
@@ -12,9 +12,9 @@ import { cloudKpiNote } from '../../utils/adminCloud';
 
 const H = 3_600_000;
 const hoursTick = (ms: number) => (ms >= H ? `${Math.round(ms / H)}h` : ms > 0 ? `${Math.round(ms / 60_000)}m` : '0');
-const AGENT_COLOR = 'rgb(88, 166, 255)';
-const HUMAN_COLOR = 'rgb(246, 185, 59)';
-const TOK_COLORS = { input: 'rgb(88, 166, 255)', output: 'rgb(63, 185, 80)', cacheRead: 'rgb(139, 148, 158)', cacheCreate: 'rgb(188, 140, 255)' };
+const AGENT_COLOR = HUE.blue;
+const HUMAN_COLOR = HUE.amber;
+const TOK_COLORS = { input: HUE.blue, output: HUE.green, cacheRead: HUE.gray, cacheCreate: HUE.purple };
 
 export function AdminOverview({ range, now }: { range: AdminRange; now: number }) {
   const fetcher = useCallback(() => adminApi.overview(range), [range]);
@@ -79,7 +79,7 @@ export function AdminOverview({ range, now }: { range: AdminRange; now: number }
                 <CartesianGrid vertical={false} stroke={GRID_STROKE} />
                 <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
                 <YAxis tick={TICK} tickLine={false} axisLine={false} width={36} tickFormatter={hoursTick} />
-                <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtDurationShort} total />} />
+                <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtDurationShort} total />} />
                 <Bar dataKey="agent" name="agents" fill={AGENT_COLOR} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
                 <Bar dataKey="human" name="humans" fill={HUMAN_COLOR} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
               </BarChart>
@@ -93,7 +93,7 @@ export function AdminOverview({ range, now }: { range: AdminRange; now: number }
                 <CartesianGrid vertical={false} stroke={GRID_STROKE} />
                 <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
                 <YAxis tick={TICK} tickLine={false} axisLine={false} width={40} tickFormatter={fmtK} />
-                <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtK} total />} />
+                <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtK} total />} />
                 {(['input', 'output', 'cacheRead', 'cacheCreate'] as const).map(k => (
                   <Bar key={k} dataKey={k} name={k} stackId="t" fill={TOK_COLORS[k]} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
                 ))}

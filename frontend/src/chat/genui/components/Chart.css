@@ -1,0 +1,4 @@
+/* Chart.tsx. The tooltip and legend are the dashboard's (.dash-tip, .usage-legend in App.css). */
+.genui-chart { min-width: 0; }
+.genui-chart-placeholder { border-radius: 6px; background: var(--bg-active); opacity: 0.4; }
+.genui-chart .usage-legend { margin-top: 6px; }

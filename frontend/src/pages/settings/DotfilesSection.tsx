@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { dotfilesNotice } from './dotfilesNotice';
 import { DocsLink } from './DocsLink';
+import { FLAGS, useFlag } from '../../flags';
 
 function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || fallback;
@@ -14,6 +15,8 @@ export function DotfilesSection() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  // Under onboarding-refresh-enabled a box launched for you applies them too.
+  const newBoxes = useFlag(FLAGS.onboardingRefresh, false);
 
   useEffect(() => { setDraft(saved); }, [saved]);
 
@@ -23,7 +26,7 @@ export function DotfilesSection() {
     setNotice('');
     try {
       await updateDotfilesRepoUrl(url);
-      setNotice(dotfilesNotice(url));
+      setNotice(dotfilesNotice(url, newBoxes));
     } catch (err) {
       setError(apiError(err, 'Failed to save the dotfiles repository'));
     } finally {
@@ -44,7 +47,7 @@ export function DotfilesSection() {
       </div>
       <div className="dash-card">
         <p className="settings-hint">
-          A GitHub repository applied to every box you claim from the warm pool, as GitHub
+          A GitHub repository applied to {newBoxes ? 'every new box of yours' : 'every box you claim from the warm pool'}, as GitHub
           Codespaces does: the first of <code>install.sh</code>, <code>install</code>,{' '}
           <code>bootstrap.sh</code>, <code>bootstrap</code>, <code>script/bootstrap</code>,{' '}
           <code>setup.sh</code>, <code>setup</code> or <code>script/setup</code> runs. With none,
@@ -54,7 +57,7 @@ export function DotfilesSection() {
           <code>.gitconfig</code>, <code>.config</code>) is symlinked into your home from the clone
           at <code>~/.dotfiles</code>; a file already there is kept, and anything without a leading
           dot (a README, this list) is left alone. A public repository is cloned when the box is
-          claimed. A private one waits until you sign in to GitHub on the box with{' '}
+          {newBoxes ? ' set up' : ' claimed'}. A private one waits until you sign in to GitHub on the box with{' '}
           <code>gh auth login</code> and run <code>termag-hook-run claim</code>, which then applies it. termag never uses a shared GitHub token
           for it.
         </p>

@@ -3,7 +3,7 @@
   "short_name": "termag",
   "description": "Which agent needs you, and what does it want?",
   "id": "/termag/m",
-  "start_url": "/termag/m",
+  "start_url": "/termag/app",
   "scope": "/termag/",
   "display": "standalone",
   "background_color": "#0d1117",

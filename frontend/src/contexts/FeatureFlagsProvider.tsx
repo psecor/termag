@@ -1,7 +1,8 @@
 import { useEffect, useState, ReactNode } from 'react';
 import { useAuth } from './AuthContext';
 import { featureFlagsApi } from '../services/api';
-import { setFlagValues } from '../flags';
+import { FLAGS, setFlagValues, useFlag } from '../flags';
+import { writeRefreshHint } from '../onboarding/refreshHint';
 
 // Loads the deployment's flag values (GET /api/flags) before rendering its
 // children, so no flag flips after first paint. If the request fails, children
@@ -21,5 +22,13 @@ export function FeatureFlagsProvider({ children }: { children: ReactNode }) {
   }, [user]);
 
   if (!resolved) return <div className="loading-screen">Loading…</div>;
-  return <>{children}</>;
+  return <>{user && <RememberOnboardingRefresh />}{children}</>;
+}
+
+// Keeps what a signed-in user was served of onboarding-refresh-enabled, for
+// the sign-in page, which has no user to evaluate it for (onboarding/refreshHint.ts).
+function RememberOnboardingRefresh() {
+  const on = useFlag(FLAGS.onboardingRefresh, false);
+  useEffect(() => writeRefreshHint(on), [on]);
+  return null;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, parseSpaceFileLink, previewKind, relPathError, roleAtLeast, spaceFileLink, SPACE_NAME_RE, type DropEntry } from './spaces';
+import { actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, parseSpaceFileLink, parseSpaceFolderLink, previewKind, relPathError, roleAtLeast, spaceFileLink, SPACE_NAME_RE, type DropEntry } from './spaces';
 
 describe('spaces helpers', () => {
   it('ranks roles', () => {
@@ -118,5 +118,24 @@ describe('parseSpaceFileLink', () => {
     expect(parseSpaceFileLink(`${origin}/termag/files/notes/a//b`, origin, '/termag/')).toBeNull();
     expect(parseSpaceFileLink(`${origin}/termag/files/notes/%E0%A4%A`, origin, '/termag/')).toBeNull();
     expect(parseSpaceFileLink('mailto:a@b.c', origin, '/termag/')).toBeNull();
+  });
+});
+
+describe('parseSpaceFolderLink', () => {
+  const origin = 'https://host.example';
+  it('reads a link that ends in a slash as a folder of the space, the space\'s own as its root', () => {
+    expect(parseSpaceFolderLink(`${origin}/termag/files/improve-termag/artifacts/file-workaround-bugs/`, origin, '/termag/'))
+      .toEqual({ space: 'improve-termag', dir: 'artifacts/file-workaround-bugs/' });
+    expect(parseSpaceFolderLink('/termag/files/notes/My%20Docs/', origin, '/termag')).toEqual({ space: 'notes', dir: 'My Docs/' });
+    expect(parseSpaceFolderLink(`${origin}/termag/files/notes/`, origin, '/termag/')).toEqual({ space: 'notes', dir: '' });
+  });
+
+  it('leaves files, other origins, bad names and bad paths alone', () => {
+    expect(parseSpaceFolderLink(`${origin}/termag/files/notes/plan.md`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFolderLink(`${origin}/termag/files/notes`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFolderLink('https://evil.example/termag/files/notes/a/', origin, '/termag/')).toBeNull();
+    expect(parseSpaceFolderLink(`${origin}/termag/files/Bad_Name/a/`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFolderLink(`${origin}/termag/files/notes/a//b/`, origin, '/termag/')).toBeNull();
+    expect(parseSpaceFolderLink(`${origin}/termag/files/notes/../`, origin, '/termag/')).toBeNull();
   });
 });

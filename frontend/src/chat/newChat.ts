@@ -2,10 +2,13 @@
 // a new chat and its box get, how long a cold box usually takes, the steps
 // shown while the box, the clone and Claude come up, and the first message
 // held until Claude can take it.
-import type { AgentStatusValue, Instance } from '../types';
+import { claimUpdateLive } from '../utils/boxFeed';
+import type { AgentStatusValue, Instance, Project } from '../types';
 import { isValidBoxName } from '../utils/boxNames';
-import type { RepoPick } from '../utils/repoPick';
-import { isChatModel, type ChatModelId } from './composer';
+import { repoKey, sameRepoMatches, type RepoPick } from '../utils/repoPick';
+import { isRunName } from '../utils/workstreamChoices';
+import { isSdkChat } from './simpleChat';
+import { isChatEffort, isChatModel, type ChatEffortId, type ChatModelId } from './composer';
 import type { Block } from './paneChat';
 
 /** `base`, else `base-2`, `base-3`, … whichever is not taken (case-insensitive). */
@@ -48,13 +51,13 @@ export function startBlocker(i: {
   boxError: string;
 }): string {
   if (i.busy) return '';
-  if (!i.hasRepo) return 'Paste a repository URL, or pick another option';
-  if (!i.name) return 'Give the session a name under Options';
+  if (!i.hasRepo) return 'Choose a repository, or paste its URL';
+  if (!i.name) return 'Give the session a name in the box settings';
   if (i.nameError) return `Session name: ${i.nameError}`;
   if (!i.spacesReady) return 'Loading your spaces…';
   if (i.spaceError) return i.spaceError;
   if (!i.boxReady) {
-    if (!i.boxName) return 'Give the box a name under Options';
+    if (!i.boxName) return 'Give the box a name in the box settings';
     if (i.boxError) return `Box name: ${i.boxError}`;
   }
   return '';
@@ -102,7 +105,7 @@ export interface SetupStep {
 }
 
 export interface SetupInput {
-  box: Pick<Instance, 'name' | 'status' | 'provisioningError' | 'claimedAt'> | null;
+  box: Pick<Instance, 'name' | 'status' | 'provisioningError' | 'claimedAt' | 'claimUpdateStatus' | 'claimUpdateStartedAt'> | null;
   setupStatus: string | null | undefined;
   setupError?: string | null;
   /** `owner/name`, or null for a chat with no repository. */
@@ -113,6 +116,16 @@ export interface SetupInput {
 
 const BOOTING = ['provisioning', 'awaiting-agent', 'warming', 'warm'];
 
+/** A box just claimed from the pool is updating before its first launch (backend services/claimUpdate.ts). */
+export function boxUpdating(box: Pick<Instance, 'claimUpdateStatus' | 'claimUpdateStartedAt'> | null | undefined): boolean {
+  return claimUpdateLive(box);
+}
+
+/** The box is still launching or starting: a chat on it is being set up, not loading. */
+export function boxComingUp(status: string | null | undefined): boolean {
+  return status != null && (BOOTING.includes(status) || status === 'starting');
+}
+
 function boxStep(box: SetupInput['box'], eta: number | null): SetupStep {
   if (!box) return { id: 'box', state: 'active', text: 'Finding the box' };
   if (box.status === 'failed') {
@@ -121,6 +134,11 @@ function boxStep(box: SetupInput['box'], eta: number | null): SetupStep {
   if (BOOTING.includes(box.status)) {
     const when = eta != null ? `usually about ${eta} min` : 'usually a few minutes';
     return { id: 'box', state: 'active', text: `Launching box ${box.name} · ${when}` };
+  }
+  // A box claimed from the pool is brought up to the orchestrator's commit
+  // before anything is launched on it (backend services/claimUpdate.ts).
+  if (box.status === 'ready' && boxUpdating(box)) {
+    return { id: 'box', state: 'active', text: `Claimed a ready box, ${box.name} · Updating the box…` };
   }
   if (box.status === 'ready') {
     return { id: 'box', state: 'done', text: box.claimedAt ? `Claimed a ready box, ${box.name}` : `Box ${box.name} is up` };
@@ -187,6 +205,40 @@ export function preLaunchTail(blocks: readonly Block[], lines = 3): string[] {
  */
 export function showSetup(i: { held: boolean; queued: boolean; up: boolean; captured: boolean; turns: number }): boolean {
   return i.held || i.queued || (!i.up && i.captured && i.turns === 0);
+}
+
+/**
+ * The projects a New session can branch a worktree off instead of cloning
+ * again: the user's own chat projects on the chosen box, checked out from the
+ * picked repository (utils/repoPick.ts sameRepoMatches). Not an automation
+ * or a project someone shared with them, and nothing for a new box.
+ */
+export function worktreeTargets(pick: RepoPick, projects: readonly Project[], boxId: string | null): Project[] {
+  if (!boxId) return [];
+  return sameRepoMatches(pick, projects, boxId)
+    .filter(p => (p.kind ?? 'normal') === 'normal' && p.role !== 'collaborator' && isSdkChat(p, 'main'));
+}
+
+/**
+ * A worktree session's workstream name (and branch): the session name as the
+ * backend takes it (letters, digits, - and _, at most 64, never main), made
+ * unique among the project's workstreams, whatever their case, with -2, -3, ….
+ */
+export function worktreeName(desired: string, taken: readonly string[]): string {
+  let base = desired.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+|[-_]+$/g, '').slice(0, 40).replace(/[-_]+$/, '') || 'session';
+  if (isRunName(base)) base = `${base}-session`;
+  // Case-folded, as uniqueName is: `.worktrees/Fix` and `.worktrees/fix` are one directory on a case-insensitive disk.
+  return uniqueName(base, [...taken, 'main']);
+}
+
+/** A worktree session's name from its first message: its first few words, as worktreeName will take them. */
+export function sessionWords(message: string): string {
+  return message.toLowerCase().match(/[a-z0-9]+/g)?.slice(0, 5).join('-') ?? '';
+}
+
+/** The first-message queue's key: the project for its main workstream, project@workstream for a worktree's. */
+export function queueKey(projectId: string, workstream: string): string {
+  return workstream === 'main' ? projectId : `${projectId}@${workstream}`;
 }
 
 // The first message of a new chat, typed before Claude was there to take it.
@@ -286,14 +338,15 @@ export interface LastStart {
   pick: RememberedPick | null;
   space: string | null;
   model: ChatModelId;
+  effort: ChatEffortId;
 }
 
 export function readLastStart(store: Store): LastStart {
-  const none: LastStart = { pick: null, space: null, model: 'sonnet' };
+  const none: LastStart = { pick: null, space: null, model: 'sonnet', effort: 'default' };
   try {
     const raw = store?.getItem(LAST_START_KEY);
     if (!raw) return none;
-    const v = JSON.parse(raw) as { pick?: Record<string, unknown>; space?: unknown; model?: unknown };
+    const v = JSON.parse(raw) as { pick?: Record<string, unknown>; space?: unknown; model?: unknown; effort?: unknown };
     const p = v.pick;
     let pick: RememberedPick | null = null;
     if (p?.kind === 'listed' && typeof p.fullName === 'string' && p.fullName && typeof p.defaultBranch === 'string') {
@@ -305,15 +358,101 @@ export function readLastStart(store: Store): LastStart {
       pick,
       space: typeof v.space === 'string' && v.space ? v.space : null,
       model: typeof v.model === 'string' && isChatModel(v.model) ? v.model : 'sonnet',
+      effort: isChatEffort(v.effort) ? v.effort : 'default',
     };
   } catch {
     return none;
   }
 }
 
+const LAST_PICK_KEY = 'termag-chat-last-pick';
+
+/**
+ * The model and effort last chosen in a composer, New session's or an open
+ * session's, kept as they are picked (the last start keeps the repository and
+ * space, only once a start has worked). New session opens on them.
+ */
+export interface LastPick {
+  model: ChatModelId | null;
+  effort: ChatEffortId | null;
+}
+
+export function readLastPick(store: Store): LastPick {
+  try {
+    const v = JSON.parse(store?.getItem(LAST_PICK_KEY) ?? '{}') as { model?: unknown; effort?: unknown };
+    return {
+      model: typeof v.model === 'string' && isChatModel(v.model) ? v.model : null,
+      effort: isChatEffort(v.effort) ? v.effort : null,
+    };
+  } catch {
+    return { model: null, effort: null };
+  }
+}
+
+/** Record a pick: the model, the effort, or both; the other stays as it was. */
+export function writeLastPick(store: Store, pick: { model?: ChatModelId; effort?: ChatEffortId }): void {
+  const next = { ...readLastPick(store), ...pick };
+  try { store?.setItem(LAST_PICK_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+}
+
+const keptPick = (pick: RepoPick): RememberedPick | null =>
+  pick.kind === 'listed' || (pick.kind === 'pasted' && pick.url.trim()) ? pick : null;
+
 /** Record what a chat just started with. A pick that can't be remembered clears the repository. */
-export function writeLastStart(store: Store, last: { pick: RepoPick; space: string | null; model: ChatModelId }): void {
-  const { pick, space, model } = last;
-  const kept = pick.kind === 'listed' || (pick.kind === 'pasted' && pick.url.trim()) ? pick : null;
-  try { store?.setItem(LAST_START_KEY, JSON.stringify({ pick: kept, space, model })); } catch { /* ignore */ }
+export function writeLastStart(store: Store, last: { pick: RepoPick; space: string | null; model: ChatModelId; effort?: ChatEffortId }): void {
+  const { pick, space, model, effort = 'default' } = last;
+  try { store?.setItem(LAST_START_KEY, JSON.stringify({ pick: keptPick(pick), space, model, effort })); } catch { /* ignore */ }
+}
+
+/**
+ * The repository or space as soon as it is picked, as the model and effort
+ * are: the next New session opens on it even if this one never started.
+ * Only what is given changes; an empty or unlisted repository keeps the last one.
+ */
+export function rememberStartPick(store: Store, patch: { pick?: RepoPick; space?: string | null }): void {
+  try {
+    const raw = store?.getItem(LAST_START_KEY);
+    const prev = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+    const next = { ...prev };
+    if (patch.pick) {
+      const kept = keptPick(patch.pick);
+      if (kept) next.pick = kept;
+    }
+    if ('space' in patch) next.space = patch.space ?? null;
+    store?.setItem(LAST_START_KEY, JSON.stringify(next));
+  } catch { /* ignore */ }
+}
+
+const PERMISSIONS_KEY = 'termag-chat-permissions';
+const PERMISSIONS_KEPT = 50;
+
+/**
+ * The permission last picked for a repository on New session ('full' or
+ * 'read'), so it opens on that choice next time; null when never picked.
+ * Kept per repository, never as one global choice: Full access for one
+ * repository must not become the default for the next one opened.
+ */
+export function readPermissionPick(store: Store, repoUrl: string | null): 'full' | 'read' | null {
+  const key = repoUrl ? repoKey(repoUrl) : null;
+  if (!key) return null;
+  try {
+    const v = (JSON.parse(store?.getItem(PERMISSIONS_KEY) ?? '{}') as Record<string, unknown>)[key];
+    return v === 'full' || v === 'read' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writePermissionPick(store: Store, repoUrl: string | null, choice: 'full' | 'read'): void {
+  const key = repoUrl ? repoKey(repoUrl) : null;
+  if (!key) return;
+  try {
+    const kept = JSON.parse(store?.getItem(PERMISSIONS_KEY) ?? '{}') as Record<string, unknown>;
+    delete kept[key];
+    // Insertion order is recency: the oldest picks go first once there are too many.
+    const entries = [...Object.entries(kept), [key, choice] as const].slice(-PERMISSIONS_KEPT);
+    store?.setItem(PERMISSIONS_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    /* a full or blocked store keeps nothing */
+  }
 }

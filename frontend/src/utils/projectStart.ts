@@ -37,6 +37,25 @@ export function isBoxFailedRefusal(err: unknown): boolean {
   return (err as { response?: { data?: { code?: string } } })?.response?.data?.code === 'box-failed';
 }
 
+/** An archived project holding the name on the chosen box (backend services/repoCreate.ts ARCHIVED_NAME_TAKEN). */
+export interface ArchivedNameClash {
+  id: string;
+  name: string;
+  archivedAt: string;
+  workstreams: number;
+}
+
+/**
+ * The archived project a create was refused for, or null for any other
+ * failure. The form then offers to un-archive it or rename it aside.
+ */
+export function archivedNameClash(err: unknown): ArchivedNameClash | null {
+  const data = (err as { response?: { data?: { code?: string; archived?: Partial<ArchivedNameClash> } } })?.response?.data;
+  const a = data?.code === 'archived-name-taken' ? data.archived : undefined;
+  if (!a || typeof a.id !== 'string' || typeof a.name !== 'string' || typeof a.archivedAt !== 'string') return null;
+  return { id: a.id, name: a.name, archivedAt: a.archivedAt, workstreams: typeof a.workstreams === 'number' ? a.workstreams : 0 };
+}
+
 /** The box the form pre-selects: a ready one first, else one on its way. */
 export function pickDefaultBox<T extends Pick<Instance, 'status'>>(boxes: readonly T[]): T | null {
   return boxes.find(b => b.status === 'ready') ?? boxes.find(boxIsUsableForProject) ?? null;

@@ -24,7 +24,9 @@ export function useOpenTarget(): (t: WorkspaceTarget) => void {
     const workstream = resolveWorkstream(project.workstreams, t.workstream);
     setActiveWorkstream(t.projectId, workstream);
     setActiveProject(t.projectId);
-    const detail: FocusPaneDetail = { projectId: t.projectId, workstream, pane: t.pane };
+    // A review pane named by session is that workstream's; one resolved to main instead opens main's first.
+    const session = t.pane === 'review' && workstream === t.workstream ? t.session : undefined;
+    const detail: FocusPaneDetail = { projectId: t.projectId, workstream, pane: t.pane, ...(session ? { session } : {}) };
     setTimeout(() => window.dispatchEvent(new CustomEvent(FOCUS_PANE_EVENT, { detail })), 0);
   }, [projects, setActiveProject, setActiveWorkstream]);
 }
@@ -43,7 +45,7 @@ export function SessionItem({ row, now, index, active, onSelect, box }: {
       <button type="button" className={`recents-item${active ? ' is-active' : ''}`} onClick={() => onSelect(row)} data-index={index}>
         <span className="recents-status session-list-status" aria-hidden>
           <StatusDot status={row.status} />
-          {row.ring && <span className={`review-ring is-${row.ring}`} title={reviewRingTooltip(row.ring, row.review?.pr, row.review?.reviewer)} />}
+          {row.ring && <span className={`review-ring is-${row.ring}`} title={reviewRingTooltip(row.ring, row.review?.pr, row.review?.reviewer, row.reviewCount)} />}
         </span>
         <span className="recents-body">
           <span className="recents-title">

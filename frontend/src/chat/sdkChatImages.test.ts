@@ -10,6 +10,13 @@ describe('images in user messages', () => {
     expect(promptImages([{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'AAA' } }]))
       .toEqual([{ mediaType: 'image/jpeg', src: 'data:image/jpeg;base64,AAA' }]);
     expect(promptImages('hi')).toEqual([]);
+    expect(promptImages([
+      { type: 'document', source: { type: 'termag', media_type: 'application/pdf', path: '~/k/d.pdf' }, title: 'spec.pdf' },
+      { type: 'document', source: { type: 'base64', data: 'JVBERi0=' } },
+    ])).toEqual([
+      { mediaType: 'application/pdf', path: '~/k/d.pdf', name: 'spec.pdf' },
+      { mediaType: 'application/pdf', src: 'data:application/pdf;base64,JVBERi0=' },
+    ]);
     // A tool result's image is the tool's, not the user's.
     expect(promptImages([{ type: 'tool_result', tool_use_id: 't', content: [ref('b')] }])).toEqual([]);
   });
@@ -35,6 +42,14 @@ describe('images in user messages', () => {
     const pending = addPending(emptyChat, 'look', [{ mediaType: 'image/png', src: 'data:image/png;base64,AAA' }], 'pending:x');
     const state = applyEvent(pending, { type: 'turn-start', text: 'look', images: [{ id: 'a', mediaType: 'image/png', path: '~/p/a.png' }] });
     expect(state.items).toEqual([{ kind: 'user', key: 'pending:x', text: 'look', pending: false, images: [{ mediaType: 'image/png', src: 'data:image/png;base64,AAA' }] }]);
+  });
+
+  it('settles a pending PDF send on its turn-start, keeping its name, and does not repeat it from the replay', () => {
+    const pdf = { mediaType: 'application/pdf', src: 'data:application/pdf;base64,JVBERi0=', name: 'spec.pdf' };
+    let state = addPending(emptyChat, 'read', [pdf], 'pending:p');
+    state = applyEvent(state, { type: 'turn-start', text: 'read', images: [{ id: 'd', mediaType: 'application/pdf', path: '~/p/d.pdf', name: 'spec.pdf' }] });
+    state = applyEvent(state, { type: 'user', message: { content: [{ type: 'document', source: { type: 'termag', media_type: 'application/pdf', id: 'd', path: '~/p/d.pdf' }, title: 'spec.pdf' }, { type: 'text', text: 'read' }] } });
+    expect(state.items.filter(it => it.kind === 'user')).toEqual([{ kind: 'user', key: 'pending:p', text: 'read', pending: false, images: [pdf] }]);
   });
 
   it('does not settle a pending text message on a turn of the same text with images', () => {

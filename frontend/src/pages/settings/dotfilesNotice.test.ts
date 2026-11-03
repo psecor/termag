@@ -12,4 +12,9 @@ describe('dotfilesNotice', () => {
   it('says a cleared setting stops dotfiles on new claims', () => {
     expect(dotfilesNotice(null)).toMatch(/^Cleared\..*no dotfiles/);
   });
+
+  it('speaks of every new box under onboarding-refresh-enabled', () => {
+    expect(dotfilesNotice('https://github.com/ada/dotfiles', true)).toBe('Saved. Your new boxes apply https://github.com/ada/dotfiles; boxes you already have are not changed.');
+    expect(dotfilesNotice(null, true)).toBe('Cleared. Your new boxes get no dotfiles.');
+  });
 });

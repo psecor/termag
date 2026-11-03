@@ -89,3 +89,35 @@ describe('ClaudeLoginCard after a chat switch', () => {
     expect(host.textContent).toMatch(/Sign in to Claude Enterprise/);
   });
 });
+
+describe('ClaudeLoginCard after a turn failed on the sign-in', () => {
+  it('asks the box again and offers a fresh sign-in even while Claude reads as signed in', async () => {
+    status.mockResolvedValue(view('ready'));
+    start.mockResolvedValue(view('needs-code', { url: 'https://claude.com/cai/oauth/authorize?code_challenge=x&login_method=sso' }));
+    await act(async () => root.render(<ClaudeLoginCard projectId="A" owner enabled authFailure={null} />));
+    await flush();
+    expect(host.textContent).toBe('');
+    expect(status).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.render(<ClaudeLoginCard projectId="A" owner enabled authFailure={7} />));
+    await flush();
+    expect(status).toHaveBeenCalledTimes(2);
+    expect(host.querySelector('h2')?.textContent).toBe('Sign in to Claude Enterprise');
+    expect(host.textContent).toMatch(/expired or was revoked/);
+
+    const button = [...host.querySelectorAll('button')].find(b => b.textContent === 'Sign in')!;
+    await act(async () => { button.click(); });
+    await flush();
+    expect(start).toHaveBeenCalledWith('A', { reauth: true });
+    expect(host.querySelector('[data-mode="needs-code"]')).not.toBeNull();
+  });
+
+  it('leaves the box state to the chat when the chat already shows it', async () => {
+    status.mockResolvedValue(view('offline'));
+    await act(async () => root.render(<ClaudeLoginCard projectId="A" owner enabled box="stopped" hostShowsBox />));
+    await flush();
+    expect(host.textContent).toBe('');
+    await act(async () => root.render(<ClaudeLoginCard projectId="A" owner enabled box="stopped" />));
+    expect(host.querySelector('h2')?.textContent).toBe('Box is stopped');
+  });
+});

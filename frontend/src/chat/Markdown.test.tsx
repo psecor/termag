@@ -41,4 +41,27 @@ describe('Markdown', () => {
     expect(html('| a | b |', true)).toContain('<table><thead><tr><th>a</th><th>b</th></tr></thead></table>');
     expect(html('| a | b |')).toBe('<div class="md"><p>| a | b |</p></div>');
   });
+
+  it('renders details as native, attribute-free elements, in a block and a table cell', () => {
+    expect(html('<details open>\n<summary>Why</summary>\n\n- a\n</details>')).toBe(
+      '<div class="md"><details class="md-details" open=""><summary>Why</summary><div class="md-details-body"><ul class="md-tight"><li><p>a</p></li></ul></div></details></div>',
+    );
+    expect(html('<details>\nbody\n</details>')).toContain('<details class="md-details"><summary>Details</summary>');
+    expect(html('| x |\n|---|\n| <details><summary>**S**</summary>long<br>text</details> |')).toContain(
+      '<td><details class="md-details"><summary><strong>S</strong></summary><div class="md-details-body">long<br/>text</div></details></td>',
+    );
+  });
+
+  it('lets no other HTML through details or summary', () => {
+    const out = html([
+      '<details ontoggle=alert(1)>\nx\n</details>',
+      '<details><summary onclick=alert(1)>s</summary><img src=x onerror=alert(1)></details>',
+      '| <details open><summary><script>x</script></summary><iframe src=x></details> |\n|---|',
+    ].join('\n\n'));
+    expect(out).not.toMatch(/<(img|script|iframe)|<\w+[^>]*\son\w+=/i);
+    expect(out.match(/<details[^>]*>/g)).toEqual(['<details class="md-details">', '<details class="md-details" open="">']);
+    expect(out).toContain('&lt;details ontoggle=alert(1)&gt;');
+    expect(out).toContain('&lt;summary onclick=alert(1)&gt;s&lt;/summary&gt;&lt;img src=x onerror=alert(1)&gt;');
+    expect(out).toContain('<summary>&lt;script&gt;x&lt;/script&gt;</summary><div class="md-details-body">&lt;iframe src=x&gt;</div>');
+  });
 });

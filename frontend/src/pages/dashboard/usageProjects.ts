@@ -7,15 +7,16 @@
  */
 import type { UsageResponse, UsageDayData } from '../../services/api';
 import { dayTokens, EMPTY_USAGE_DAY } from '../../utils/format';
+import { HUE } from './chartPalette';
 
-export const OTHER_COLOR = '#6e7681';
-export const UNATTRIBUTED_COLOR = '#484f58';
+export const OTHER_COLOR = HUE.other;
+export const UNATTRIBUTED_COLOR = HUE.unattributed;
 export const OTHER_ID = '__other';
 export const UNATTRIBUTED_ID = '__unattributed';
 
-// Fallback hues for projects without a color, chosen apart in hue at a
-// mid lightness so adjacent slots stay distinguishable on the dark surface.
-const FALLBACK = ['#2f81f7', '#3fb950', '#d29922', '#db61a2', '#a371f7', '#39c5cf', '#f0883e', '#8b949e'];
+// Fallback hues for projects without a color, chosen apart in hue so adjacent
+// slots stay distinguishable; each is a series token with a value per palette.
+const FALLBACK = [HUE.blue, HUE.green, HUE.amber, HUE.pink, HUE.purple, HUE.teal, HUE.orange, HUE.gray];
 
 export function stableColor(id: string): string {
   let h = 0;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseInline, parseMarkdown, splitRow, type MdBlock } from './markdownParse';
+import { parseCell, parseInline, parseMarkdown, splitRow, type MdBlock } from './markdownParse';
 
 const text = (v: string) => ({ t: 'text', v });
 const para = (v: string) => ({ type: 'p', inline: [text(v)] });
@@ -272,8 +272,9 @@ describe('parseInline', () => {
   });
 
   it('links an image instead of loading it', () => {
-    expect(parseInline('![chart](https://x.dev/c.png)')).toEqual([{ t: 'img', href: 'https://x.dev/c.png', alt: 'chart' }]);
-    expect(parseInline('![chart](data:image/png;base64,AAA)')).toEqual([text('chart')]);
+    expect(parseInline('![chart](https://x.dev/c.png)')).toEqual([{ t: 'img', href: 'https://x.dev/c.png', src: 'https://x.dev/c.png', alt: 'chart' }]);
+    expect(parseInline('![chart](data:image/png;base64,AAA)')).toEqual([{ t: 'img', href: null, src: 'data:image/png;base64,AAA', alt: 'chart' }]);
+    expect(parseInline('![strip](../shots/strip.png)')).toEqual([{ t: 'img', href: null, src: '../shots/strip.png', alt: 'strip' }]);
   });
 
   it('reads backslash escapes and entities as text', () => {
@@ -283,5 +284,89 @@ describe('parseInline', () => {
 
   it('turns a trailing backslash into a line break', () => {
     expect(parseInline('one\\\ntwo')).toEqual([text('one\ntwo')]);
+  });
+});
+
+describe('details', () => {
+  const details = (summary: unknown, blocks: unknown[], open = false) => ({ type: 'details', open, summary, blocks });
+  const cell = (summary: unknown, c: unknown[], open = false) => ({ t: 'details', open, summary, c });
+
+  it('reads a block with its summary on the next line and markdown inside', () => {
+    const blocks = parseMarkdown([
+      'Before',
+      '<details>',
+      '<summary>Why **this**</summary>',
+      '',
+      '- one',
+      '- two',
+      '',
+      '| a | b |',
+      '|---|---|',
+      '| 1 | 2 |',
+      '',
+      '```',
+      '</details>',
+      '```',
+      '</details>',
+      'After',
+    ].join('\n'));
+    expect(blocks.map(b => b.type)).toEqual(['p', 'details', 'p']);
+    expect(blocks[1]).toMatchObject({ type: 'details', open: false, summary: [text('Why '), { t: 'b', c: [text('this')] }] });
+    expect((blocks[1] as Extract<MdBlock, { type: 'details' }>).blocks.map(b => b.type)).toEqual(['ul', 'table', 'code']);
+    expect((blocks[1] as Extract<MdBlock, { type: 'details' }>).blocks[2]).toMatchObject({ text: '</details>' });
+    expect(blocks[2]).toEqual(para('After'));
+  });
+
+  it('reads a summary on the opening line, a bare open, and a one-line block', () => {
+    expect(parseMarkdown('<details open><summary>S</summary>\nbody\n</details>')).toEqual([details([text('S')], [para('body')], true)]);
+    expect(parseMarkdown('<details><summary>S</summary>body</details>')).toEqual([details([text('S')], [para('body')])]);
+    expect(parseMarkdown('<DETAILS>\nno summary\n</DETAILS>')).toEqual([details(null, [para('no summary')])]);
+    expect(parseMarkdown('<details>\nbody\ntext</details> after')).toEqual([details(null, [para('body\ntext')]), para('after')]);
+  });
+
+  it('nests', () => {
+    const blocks = parseMarkdown('<details>\n<summary>Outer</summary>\n<details>\n<summary>Inner</summary>\ndeep\n</details>\nshallow\n</details>');
+    expect(blocks).toEqual([details([text('Outer')], [details([text('Inner')], [para('deep')]), para('shallow')])]);
+  });
+
+  it('reads a collapsed table cell with inline markup, line breaks and links', () => {
+    const blocks = parseMarkdown([
+      '| Decision | Context |',
+      '|---|---|',
+      '| Ship it | <details><summary>Short</summary>Longer with **md**,<br>a break and [a link](https://a.dev)</details> |',
+    ].join('\n'));
+    expect(blocks[0]).toMatchObject({ type: 'table' });
+    expect((blocks[0] as Extract<MdBlock, { type: 'table' }>).rows[0][1]).toEqual([cell([text('Short')], [
+      text('Longer with '), { t: 'b', c: [text('md')] }, text(','), { t: 'br' }, text('a break and '),
+      { t: 'a', href: 'https://a.dev', c: [text('a link')] },
+    ])]);
+  });
+
+  it('keeps text around a cell\'s details, nests them, and leaves code spans alone', () => {
+    expect(parseCell('see <details open><summary>x</summary>y</details> end')).toEqual([text('see '), cell([text('x')], [text('y')], true), text(' end')]);
+    expect(parseCell('<details><summary>a</summary><details><summary>b</summary>c</details></details>')).toEqual([cell([text('a')], [cell([text('b')], [text('c')])])]);
+    expect(parseCell('`<details>x</details>`')).toEqual([{ t: 'code', v: '<details>x</details>' }]);
+    expect(parseCell('<details>no summary</details>')).toEqual([cell(null, [text('no summary')])]);
+  });
+
+  it('runs an unclosed details to the end mid-stream, block or last cell', () => {
+    const s = (src: string) => parseMarkdown(src, { streaming: true });
+    expect(s('<details>\n<summary>S</summary>\n\n- a\n- b')).toEqual([details([text('S')], [{ type: 'ul', tight: true, items: [item(para('a')), item(para('b'))] }])]);
+    expect(s('<details>\n<summary>Half')).toEqual([details([text('Half')], [])]);
+    expect(s('<details>')).toEqual([details(null, [])]);
+    const table = s('| a |\n|---|\n| <details><summary>S</summary>so far') as Extract<MdBlock, { type: 'table' }>[];
+    expect(table[0].rows[0][0]).toEqual([cell([text('S')], [text('so far')])]);
+  });
+
+  it('leaves unmatched or malformed tags as text', () => {
+    expect(parseMarkdown('<details>\nnever closed')).toEqual([para('<details>\nnever closed')]);
+    expect(parseMarkdown('</details>')).toEqual([para('</details>')]);
+    expect(parseMarkdown('<details class="x">\nbody\n</details>')).toEqual([para('<details class="x">\nbody\n</details>')]);
+    expect(parseMarkdown('<details open="open">\nbody\n</details>')).toEqual([para('<details open="open">\nbody\n</details>')]);
+    expect(parseMarkdown('\\<details>\nbody\n</details>')).toEqual([para('<details>\nbody\n</details>')]);
+    expect(parseMarkdown('text <details><summary>x</summary>y</details>')).toEqual([para('text <details><summary>x</summary>y</details>')]);
+    expect(parseCell('<details><summary>x</summary>y')).toEqual([text('<details><summary>x</summary>y')]);
+    expect(parseCell('<details onclick="x">y</details>')).toEqual([text('<details onclick="x">y</details>')]);
+    expect(parseCell('<summary>x</summary>')).toEqual([text('<summary>x</summary>')]);
   });
 });

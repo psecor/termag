@@ -52,4 +52,27 @@ describe('Tooltips', () => {
     expect(bubble()).toBe('Asked you a question');
     expect(host.querySelector('.state')!.hasAttribute('title')).toBe(false);
   });
+
+  it('keeps a bubble up while the chat streams beside it, and drops it when its own list scrolls', async () => {
+    await act(async () => root.render(
+      <div className="chat-root">
+        <ul className="sidebar"><li><button type="button" className="tipped" data-tip="Options for notes">⋮</button></li></ul>
+        <div className="chat-transcript"><p>step 1</p></div>
+        <Tooltips titles />
+      </div>,
+    ));
+    hover('.tipped');
+    expect(bubble()).toBe('Options for notes');
+    // New output: the transcript grows and follows it down.
+    const transcript = host.querySelector('.chat-transcript')!;
+    for (let i = 2; i < 6; i++) {
+      act(() => {
+        transcript.append(Object.assign(document.createElement('p'), { textContent: `step ${i}` }));
+        transcript.dispatchEvent(new Event('scroll'));
+      });
+    }
+    expect(bubble()).toBe('Options for notes');
+    act(() => { host.querySelector('.sidebar')!.dispatchEvent(new Event('scroll')); });
+    expect(bubble()).toBeNull();
+  });
 });

@@ -2,15 +2,15 @@
 import React, { act } from 'react';
 import { createRoot, Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLAIM_TTL_MS, claimQueued, readQueued, releaseQueued, writeQueued } from './newChat';
+import { CLAIM_TTL_MS, claimQueued, queueKey, readQueued, releaseQueued, writeQueued } from './newChat';
 import { useQueuedMessage, type QueuedMessage } from './useQueuedMessage';
 
 const latest: { current: QueuedMessage | null } = { current: null };
 let renders = 0;
 
-function Harness(props: { projectId: string; up?: boolean; raw?: boolean; send: (p: string, w: string, k: string) => Promise<void> }) {
+function Harness(props: { projectId: string; workstream?: string; up?: boolean; raw?: boolean; send: (p: string, w: string, k: string) => Promise<void> }) {
   renders++;
-  latest.current = useQueuedMessage({ projectId: props.projectId, workstream: 'main', up: props.up ?? true, offline: false, send: props.send, raw: props.raw });
+  latest.current = useQueuedMessage({ projectId: props.projectId, workstream: props.workstream ?? 'main', up: props.up ?? true, offline: false, send: props.send, raw: props.raw });
   return null;
 }
 
@@ -34,6 +34,18 @@ afterEach(() => { act(() => root.unmount()); });
 const flush = () => act(async () => { await Promise.resolve(); });
 
 describe('useQueuedMessage', () => {
+  it("sends a worktree's first message to its project and workstream, from that workstream's own queue", async () => {
+    writeQueued(localStorage, queueKey('A', 'fix-login'), 'fix the login');
+    writeQueued(localStorage, 'A', 'for main');
+    const send = vi.fn(() => Promise.resolve());
+    await act(async () => root.render(<Harness projectId="A" workstream="fix-login" send={send} />));
+    await flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('A', 'fix-login', 'fix the login');
+    expect(readQueued(localStorage, queueKey('A', 'fix-login'))).toBeNull();
+    expect(readQueued(localStorage, 'A')).toBe('for main');
+  });
+
   it('sends the queued message once Claude is up and clears it after the send', async () => {
     writeQueued(localStorage, 'A', 'fix the bug');
     const send = vi.fn(() => Promise.resolve());

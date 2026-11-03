@@ -14,6 +14,9 @@ import { customKeySequence } from '../utils/terminalKeys';
 import { guardViewportAfterDispose, hasLayoutSize } from '../utils/xtermLifecycle';
 import { findImagePathLinks, imagePreviewUrl, RowText } from '../utils/imagePathLinks';
 import { ImagePreviewAnchor, TerminalImagePreview } from './TerminalImagePreview';
+import { documentPalette, terminalTheme, TERMINAL_ISLAND_CLASS } from './terminalTheme';
+import { terminalFontFamily } from './terminalFont';
+import { useTheme } from '../theme/ThemeProvider';
 import {
   BoxParkedNotice,
   FAILED_AFTER_ATTEMPTS,
@@ -23,6 +26,7 @@ import {
   PaneLoop,
   parseBoxParkedNotice,
   STARTING_POLL_MS,
+  parkedForGood,
   step,
 } from '../utils/terminalReconnect';
 
@@ -195,6 +199,13 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
   // useEffect that owns the connection lifecycle.
   const retryRef = useRef<(() => void) | null>(null);
 
+  // The terminal font from Settings → Appearance, read when the pane is built.
+  // Settings is a page of its own, so panes are rebuilt after a change anyway;
+  // a ref keeps a new theme object from rebuilding (and reconnecting) the pane.
+  const terminalFont = useTheme().theme.terminalFont;
+  const terminalFontRef = useRef(terminalFont);
+  terminalFontRef.current = terminalFont;
+
   // App-level reachability. When the backend comes back, kick a pane sitting
   // on a backoff timer instead of waiting out a 30s slot. Skip panes that are
   // already attaching: reconnectNow puts them in `connecting` first, and a
@@ -241,19 +252,21 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
 
     const container = containerRef.current;
 
-    // xterm paints on a canvas, so it needs the palette as values, not var()s.
-    const css = getComputedStyle(document.documentElement);
+    // Colours and font are read where the terminal is mounted (terminalTheme.ts):
+    // dark in either palette, see-through only in dark.
+    const css = getComputedStyle(container);
     const token = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+    // Maple Mono, then --font-mono's stack, or the stack alone when Appearance
+    // chooses JetBrains Mono (terminalFont.ts).
+    const fontFamily = terminalFontFamily(
+      token('--font-mono', 'JetBrains Mono Variable, JetBrains Mono, monospace'),
+      terminalFontRef.current,
+    );
     const term = new XTerm({
       allowTransparency: true,
-      theme: {
-        background: `${token('--bg-base', '#0d1117')}c0`,
-        foreground: token('--text-primary', '#c9d1d9'),
-        cursor: token('--accent', '#58a6ff'),
-        selectionBackground: '#264f7880',
-      },
+      theme: terminalTheme(css, documentPalette()),
       fontSize: 13,
-      fontFamily: token('--font-mono', 'JetBrains Mono, Fira Code, monospace'),
+      fontFamily,
       cursorBlink: true,
       scrollback: 10000,
     });
@@ -293,6 +306,12 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       },
     }) : null;
     term.open(container);
+    // A palette switch (Settings, or its preview) changes only how opaque the
+    // background is; xterm read its colours once, so give it them again.
+    const paletteObserver = new MutationObserver(() => {
+      term.options.theme = terminalTheme(getComputedStyle(container), documentPalette());
+    });
+    paletteObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-palette'] });
     guardViewportAfterDispose(term);
     // Route OSC 52 (clipboard) sequences emitted by tmux to the browser clipboard.
     term.parser.registerOscHandler(52, handleOsc52);
@@ -308,6 +327,24 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
     let connect: () => void = () => {};
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const fit = () => { if (hasLayoutSize(container)) fitAddon.fit(); };
+
+    // xterm sizes its cells from the font it measures when it opens. On a first
+    // visit the bundled JetBrains Mono may still be downloading, and cells sized
+    // for a stand-in font misplace its glyphs, so measure again once it is in.
+    // xterm measures only when fontFamily changes, hence the round trip.
+    const fontSpec = `${term.options.fontSize}px ${fontFamily}`;
+    if (document.fonts && !document.fonts.check(fontSpec)) {
+      document.fonts.load(fontSpec).then(() => {
+        if (disposed) return;
+        term.options.fontFamily = 'monospace';
+        term.options.fontFamily = fontFamily;
+        fit();
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      }, () => {});
+    }
 
     const dispatch = (e: PaneEvent): PaneEffects => {
       const { loop: next, fx } = step(loop, e);
@@ -578,6 +615,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
 
     return () => {
       disposed = true;
+      paletteObserver.disconnect();
       unsubscribeBoxStatus();
       imageLinks?.dispose();
       clearPreview();
@@ -615,7 +653,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
   return (
     <div
       ref={containerRef}
-      className={focused ? undefined : 'terminal-dimmed'}
+      className={focused ? TERMINAL_ISLAND_CLASS : `${TERMINAL_ISLAND_CLASS} terminal-dimmed`}
       style={{ width: '100%', height: '100%', position: 'relative' }}
     >
       <button
@@ -626,8 +664,8 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
           top: 4,
           right: 4,
           zIndex: 10,
-          background: selectMode ? 'rgba(88, 166, 255, 0.25)' : 'rgba(13, 17, 23, 0.7)',
-          border: `1px solid ${selectMode ? 'rgba(88, 166, 255, 0.6)' : 'rgba(48, 54, 61, 0.8)'}`,
+          background: selectMode ? 'rgba(var(--accent-rgb), 0.25)' : 'rgba(var(--bg-base-rgb), 0.7)',
+          border: `1px solid ${selectMode ? 'rgba(var(--accent-rgb), 0.6)' : 'rgba(var(--border-rgb), 0.8)'}`,
           borderRadius: 4,
           color: selectMode ? 'var(--accent)' : 'var(--text-secondary)',
           padding: '2px 6px',
@@ -642,7 +680,12 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       {imagePreview && <TerminalImagePreview anchor={imagePreview} />}
       {connectionState === 'parked' && parked && (
         <div className="terminal-parked-notice" role="status" aria-live="polite">
-          {parked.status === 'starting' ? (
+          {parkedForGood(parked.status) ? (
+            <>
+              <div>{parked.message}</div>
+              <div className="terminal-parked-detail">It won&apos;t start again, so this pane doesn&apos;t reconnect.</div>
+            </>
+          ) : parked.status === 'starting' ? (
             <>
               <div>This box is starting. The terminal connects on its own once it is ready.</div>
               <div className="terminal-parked-detail">

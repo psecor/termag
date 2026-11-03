@@ -120,7 +120,7 @@ export function NewProject() {
           <span className="m-field-label">Box</span>
           <select className="m-select" value={boxId} onChange={e => setBoxId(e.target.value)} disabled={boxes == null}>
             {boxes == null && <option value="">Loading…</option>}
-            {boxes != null && usable.length === 0 && <option value="">No usable box; add one from the full UI</option>}
+            {boxes != null && usable.length === 0 && <option value="">No usable box; add one from Lab</option>}
             {usable.map(b => <option key={b.id} value={b.id}>{boxLabel(b)}</option>)}
           </select>
           {box && !ready && <span className="m-field-hint">This box is {box.status.replace(/-/g, ' ')}; Create enables when it is ready.</span>}

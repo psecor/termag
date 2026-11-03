@@ -3,6 +3,7 @@
 // from a tap — so this module is imported by main.tsx and starts listening
 // before React (and the lazy /m chunk) exists. iOS Safari has no prompt; the
 // phone client shows how to Add to Home Screen instead.
+import { recordProductEvent } from '../observability';
 import { isAppleMobile, isStandalone } from './redirect';
 
 interface BeforeInstallPromptEvent extends Event {
@@ -20,7 +21,8 @@ if (typeof window !== 'undefined') {
     deferred = e as BeforeInstallPromptEvent;
     notify();
   });
-  window.addEventListener('appinstalled', () => { deferred = null; notify(); });
+  // From our prompt or the browser's own menu.
+  window.addEventListener('appinstalled', () => { deferred = null; notify(); recordProductEvent('app.installed'); });
 }
 
 export type InstallOption =
@@ -56,7 +58,9 @@ export async function promptInstall(): Promise<'accepted' | 'dismissed' | 'unava
   deferred = null;
   notify();
   await e.prompt();
-  return (await e.userChoice).outcome;
+  const { outcome } = await e.userChoice;
+  recordProductEvent('app.install.prompted', { 'termag.outcome': outcome });
+  return outcome;
 }
 
 export function subscribeInstall(listener: () => void): () => void {

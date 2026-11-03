@@ -1,0 +1,9 @@
+/* SelectList.tsx: LaunchPad's ListBox, made for a popover, as a bordered list in the card. */
+.genui-surface .genui-selectlist {
+  /* LaunchPad's ListBox leaves scrolling to the popover it usually sits in: here the list scrolls itself. */
+  max-height: 360px; overflow-y: auto; overscroll-behavior: contain; min-width: 0; width: 100%;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-base);
+}
+.genui-selectlist-item [slot="description"] { color: var(--text-secondary); }
+/* The keyboard's place in the list, plainer than a hover. */
+.genui-selectlist-item[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: -2px; }

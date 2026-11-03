@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { automationSubtitle, cronToPreset, describeSchedule, occurrenceShort, presetToCron, untilLabel } from './automationSchedule';
+import { automationSubtitle, boxStartFailuresLabel, cronToPreset, describeSchedule, occurrenceShort, presetToCron, untilLabel } from './automationSchedule';
 
 describe('presets', () => {
   it('turn into 5-field cron, and back', () => {
@@ -45,5 +45,16 @@ describe('labels', () => {
     expect(automationSubtitle({ nextRunAt: null, enabled: true, pausedReason: 'consecutive_failures', lastRun: null }, 'UTC', now)).toBe('paused: kept failing');
     expect(automationSubtitle({ nextRunAt: null, enabled: false, pausedReason: null, lastRun: { state: 'skipped', finishedAt: null, startedAt: null, reasonLabel: 'the box was asleep' } }, 'UTC', now))
       .toBe('off · skipped: the box was asleep');
+  });
+});
+
+describe('boxStartFailuresLabel', () => {
+  it('says how often and since when the box could not be started, and nothing while starts take', () => {
+    const now = new Date('2026-10-30T02:00:00Z');
+    expect(boxStartFailuresLabel({ count: 6, since: '2026-10-30T00:00:30Z', lastError: 'Insufficient capacity.' }, now))
+      .toBe("Couldn't start its box 6 times, first 2h ago (Insufficient capacity.)");
+    expect(boxStartFailuresLabel({ count: 1, since: null, lastError: null }, now)).toBe("Couldn't start its box once");
+    expect(boxStartFailuresLabel(null, now)).toBeNull();
+    expect(boxStartFailuresLabel(undefined, now)).toBeNull();
   });
 });

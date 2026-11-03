@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentForest, explorerAgents, searchAgents, type AgentNode, type SpawnLink } from './explorerAgents';
+import { agentForest, agentLabel, explorerAgents, searchAgents, workstreamLabel, workstreamTip, type AgentNode, type SpawnLink } from './explorerAgents';
 
 const row = (projectId: string, instanceId: string | null, workstream = 'main') => ({ projectId, workstream, projectName: projectId, instanceId });
 const link = (child: string, parent: string, childWs = 'main'): SpawnLink => ({ projectId: child, workstream: childWs, parentProjectId: parent, parentWorkstream: 'main' });
@@ -36,5 +36,31 @@ describe('explorerAgents', () => {
     expect(searchAgents(forest, 'notes').map(r => r.projectId)).toEqual(['review-notes', 'notes-kid']);
     expect(searchAgents(forest, 'kid notes').map(r => r.projectId)).toEqual(['notes-kid']);
     expect(searchAgents(forest, '  ')).toEqual([]);
+  });
+});
+
+describe('ask thread names', () => {
+  const ask = { projectName: 'termag-3', workstream: 'ask-cmvpvqxse19rwex4apfh334ld', askThreadId: 'cmvpvqxse19rwex4apfh334ld' };
+
+  it("calls an ask's chat by its thread's title, with the id in the tooltip", () => {
+    const titled = { ...ask, askTitle: 'Readable ask names' };
+    expect(workstreamLabel(titled)).toBe('Readable ask names');
+    expect(agentLabel(titled)).toBe('Readable ask names');
+    expect(workstreamTip(titled)).toBe('ask thread cmvpvqxse19rwex4apfh334ld (termag-3 · ask-cmvpvqxse19rwex4apfh334ld)');
+  });
+
+  // The person on #743: callers name their threads; an untitled one shows its id (ask-<thread id>), nothing derived.
+  it('calls an untitled ask by its thread id, and every other workstream by its name', () => {
+    expect(agentLabel({ ...ask, askTitle: '  ' })).toBe('ask-cmvpvqxse19rwex4apfh334ld');
+    expect(agentLabel({ ...ask, askTitle: null })).toBe('ask-cmvpvqxse19rwex4apfh334ld');
+    expect(workstreamLabel({ ...ask, askTitle: null })).toBe('ask-cmvpvqxse19rwex4apfh334ld');
+    expect(workstreamTip({ ...ask, askTitle: null })).toBe('ask thread cmvpvqxse19rwex4apfh334ld');
+    expect(agentLabel({ projectName: 'termag-3', workstream: 'fix' })).toBe('termag-3 · fix');
+    expect(workstreamTip({ workstream: 'fix' })).toBeNull();
+  });
+
+  it('finds an ask by its title', () => {
+    const r = { ...ask, askTitle: 'Readable ask names', projectId: 'p', instanceId: 'box' };
+    expect(searchAgents([{ row: r, children: [] }], 'readable')).toEqual([r]);
   });
 });

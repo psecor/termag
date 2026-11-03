@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, BarChart } from 'recharts';
 import { adminApi, CLOUD_REPORT_GROUPS, type AdminCloudSession, type AdminRange, type BoxCapacity, type CloudReportGroup, type OrchestratorHealth, type PipelineBox } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, HUE_ORDER, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { deltaPct } from '../dashboard/KpiRow';
 import { useAdminPolled, pendingText, DataTable, KeyValues, Counts, StatusPill, Dot, fmtAgo, fmtSeconds, type Column } from './shared';
@@ -21,10 +21,10 @@ import { fmtK } from '../../utils/format';
  * owner's first prompt), no pane contents. `?box=<id>` narrows the live and
  * recent tables to one box (the Fleet tab links here that way).
  */
-const PALETTE = ['rgb(88, 166, 255)', 'rgb(63, 185, 80)', 'rgb(246, 185, 59)', 'rgb(188, 140, 255)', 'rgb(248, 113, 113)', 'rgb(94, 234, 212)', 'rgb(139, 148, 158)', 'rgb(251, 146, 60)'];
+const PALETTE = HUE_ORDER;
 const color = (i: number) => PALETTE[i % PALETTE.length];
-const SESSIONS_COLOR = 'rgb(88, 166, 255)';
-const HOURS_COLOR = 'rgb(246, 185, 59)';
+const SESSIONS_COLOR = HUE.blue;
+const HOURS_COLOR = HUE.amber;
 const fmtHours = (h: number) => `${h}h`;
 
 function healthItems(h: OrchestratorHealth, now: number): Array<[string, React.ReactNode]> {
@@ -200,7 +200,7 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
               <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
               <YAxis yAxisId="n" tick={TICK} tickLine={false} axisLine={false} width={28} allowDecimals={false} />
               <YAxis yAxisId="h" orientation="right" tick={TICK} tickLine={false} axisLine={false} width={36} tickFormatter={fmtHours} />
-              <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} />} />
+              <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} />} />
               <Bar yAxisId="n" dataKey="sessions" name="sessions" fill={SESSIONS_COLOR} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
               <Line yAxisId="h" type="monotone" dataKey="slotHours" name="slot hours" stroke={HOURS_COLOR} strokeWidth={2} dot={false} isAnimationActive={false} />
             </ComposedChart>
@@ -232,7 +232,7 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
                 <XAxis type="number" tick={TICK} tickLine={false} axisLine={false} allowDecimals={false} />
                 <YAxis type="category" dataKey="label" tick={TICK} tickLine={false} axisLine={false} width={120} interval={0} />
               </>}
-              <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} total />} />
+              <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} total />} />
               {endKeys.map((k, i) => <Bar key={k} dataKey={k} name={k} stackId="e" fill={color(i)} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />)}
             </BarChart>
           </ResponsiveContainer>
@@ -252,7 +252,7 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
                     <XAxis type="number" tick={TICK} tickLine={false} axisLine={false} allowDecimals={false} />
                     <YAxis type="category" dataKey="label" tick={TICK} tickLine={false} axisLine={false} width={120} interval={0} />
                   </>}
-                  <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} total />} />
+                  <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} total />} />
                   {refusalKeys.map((k, i) => <Bar key={k} dataKey={k} name={k} stackId="r" fill={color(i)} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />)}
                 </BarChart>
               </ResponsiveContainer>

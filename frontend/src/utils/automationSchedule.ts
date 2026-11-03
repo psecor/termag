@@ -131,3 +131,14 @@ export function agoLabel(iso: string, now: Date = new Date()): string {
   if (h < 48) return `${h}h ago`;
   return `${Math.round(h / 24)}d ago`;
 }
+
+/**
+ * The automation's box starts EC2 refused in a row, for its page: "Couldn't
+ * start its box 6 times, first 2h ago (Insufficient capacity.)". Null while
+ * its starts take.
+ */
+export function boxStartFailuresLabel(f: { count: number; since: string | null; lastError: string | null } | null | undefined, now: Date = new Date()): string | null {
+  if (!f || f.count <= 0) return null;
+  const times = f.count === 1 ? 'once' : `${f.count} times`;
+  return `Couldn't start its box ${times}${f.since ? `, first ${agoLabel(f.since, now)}` : ''}${f.lastError ? ` (${f.lastError})` : ''}`;
+}

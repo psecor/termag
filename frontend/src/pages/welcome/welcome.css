@@ -1,0 +1,174 @@
+/* Sign-in and first-run setup under onboarding-refresh-enabled, in the
+   simple UI's refreshed look: the window in --bg-surface, one card in
+   --bg-base, LaunchPad controls in termag's colours (.lp-theme), the UI font,
+   and monospace only for code. Text is --text-primary or --text-secondary,
+   which meet WCAG AA on both surfaces; --text-muted is kept for marks. */
+
+.wel-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 16px 48px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+}
+.wel-root code {
+  font-family: var(--font-mono); font-size: 12px;
+  padding: 1px 5px; border-radius: 4px;
+  background: var(--bg-elevated); color: var(--text-primary);
+}
+
+.wel-card {
+  width: 100%;
+  max-width: 600px;
+  margin-top: 6vh;
+  padding: 28px 32px 24px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 12px 32px rgb(0 0 0 / 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+@media (max-width: 520px) { .wel-card { padding: 22px 18px 18px; margin-top: 12px; } }
+
+.wel-head { display: flex; flex-direction: column; gap: 6px; }
+.wel-title { margin: 0; font-size: 22px; line-height: 1.25; font-weight: 600; letter-spacing: -0.01em; color: var(--text-primary); }
+.wel-sub { font-size: 14px; line-height: 1.5; color: var(--text-secondary); }
+
+/* First-run setup. */
+.wel-top {
+  width: 100%;
+  max-width: 1080px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wel-brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; color: var(--text-primary); }
+.wel-brand svg { color: var(--accent); fill: currentColor; }
+
+/* Progress: a segment per step with its name, as many as the steps (two without the chat UI). */
+.wel-progress { list-style: none; margin: 0; padding: 0; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 8px; }
+.wel-progress li { display: flex; flex-direction: column; gap: 6px; }
+.wel-progress-bar { height: 3px; border-radius: 3px; background: var(--bg-active); }
+.wel-progress li.is-done .wel-progress-bar,
+.wel-progress li.is-current .wel-progress-bar { background: var(--accent); }
+.wel-progress-label { font-size: 12px; color: var(--text-secondary); }
+.wel-progress li.is-current .wel-progress-label { color: var(--text-primary); font-weight: 500; }
+
+.wel-dim { color: var(--text-secondary); font-size: 13px; }
+
+/* Fields: label, input and action on one row; the description under them. */
+.wel-root .wel-inline-form { display: flex; flex-direction: row; align-items: flex-start; gap: 8px; }
+.wel-root .wel-inline-form > .wel-field { flex: 1; min-width: 0; }
+.wel-root .wel-inline-form > button { margin-top: 26px; flex-shrink: 0; }
+.wel-field { display: flex; flex-direction: column; gap: 6px; }
+.wel-field [slot="description"] { font-size: 12.5px; line-height: 1.45; color: var(--text-secondary); }
+
+.wel-connected {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-surface);
+}
+.wel-connected-text { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.wel-ok { color: var(--success); fill: currentColor; }
+
+/* Optional extras: one quiet row until opened. */
+.wel-extras { border-top: 1px solid var(--border); padding-top: 4px; }
+.wel-extras-trigger { width: 100%; justify-content: flex-start; gap: 8px; padding-inline: 4px; color: var(--text-secondary); }
+.wel-extras-trigger:hover { color: var(--text-primary); }
+.wel-optional {
+  margin-left: auto;
+  font-size: 11.5px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-secondary);
+}
+.wel-extras-panel { display: flex; flex-direction: column; gap: 16px; padding: 12px 4px 4px; }
+
+/* How you work: two cards, each a radio. */
+.wel-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .wel-modes { grid-template-columns: 1fr; } }
+.wel-mode {
+  position: relative;
+  display: flex; flex-direction: column; align-items: stretch; gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.wel-mode:hover { border-color: var(--text-secondary); }
+.wel-mode[data-selected] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.wel-mode[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wel-root .wel-mode > [data-lp-indicator] { display: none; }
+.wel-mode-check { margin-left: auto; display: inline-flex; color: var(--accent); fill: currentColor; opacity: 0; }
+.wel-mode-check svg { fill: currentColor; }
+.wel-mode[data-selected] .wel-mode-check { opacity: 1; }
+.wel-mode-text { display: flex; flex-direction: column; gap: 4px; }
+.wel-mode-name { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 15px; color: var(--text-primary); }
+.wel-mode-blurb { font-size: 13px; line-height: 1.45; color: var(--text-secondary); }
+.wel-badge {
+  font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 999px;
+  color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* The drawings: a tiny window with a sidebar. */
+.wel-art {
+  display: flex; gap: 6px; height: 92px; padding: 8px;
+  border-radius: 8px; background: var(--bg-base); border: 1px solid var(--border);
+}
+.wel-art-side { width: 22%; display: flex; flex-direction: column; gap: 5px; padding-top: 2px; }
+.wel-art-side i { height: 5px; border-radius: 3px; background: var(--bg-active); }
+.wel-art-side i:first-child { width: 70%; background: var(--text-muted); }
+.wel-art-main { flex: 1; display: flex; flex-direction: column; gap: 6px; padding: 2px; }
+.wel-art-bubble { height: 12px; width: 70%; border-radius: 6px; background: var(--bg-elevated); }
+.wel-art-bubble.is-you { align-self: flex-end; width: 48%; background: color-mix(in srgb, var(--accent) 35%, var(--bg-elevated)); }
+.wel-art-bubble.is-short { width: 52%; }
+.wel-art-composer { margin-top: auto; height: 14px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-surface); }
+.wel-art-panes { flex-direction: row; }
+.wel-art-pane { flex: 1; display: flex; flex-direction: column; gap: 5px; padding: 6px; border-radius: 5px; background: color-mix(in srgb, var(--bg-base) 70%, black); border: 1px solid var(--border); }
+.wel-art-pane i { height: 4px; width: 80%; border-radius: 2px; background: color-mix(in srgb, var(--success) 45%, transparent); }
+.wel-art-pane i:nth-child(2) { width: 60%; background: var(--bg-active); }
+.wel-art-pane i:nth-child(3) { width: 72%; background: var(--bg-active); }
+.wel-art-pane i.is-caret { width: 7px; height: 8px; border-radius: 1px; background: var(--text-primary); }
+
+/* What happens next (termag). */
+.wel-next { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+@media (max-width: 520px) { .wel-next { grid-template-columns: 1fr; } }
+.wel-next li {
+  display: flex; flex-direction: column; gap: 10px; padding: 14px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface);
+  font-size: 13px; line-height: 1.4; color: var(--text-primary);
+}
+.wel-next li svg { color: var(--accent); fill: currentColor; }
+
+.wel-form .npf { font-family: var(--font-ui); }
+
+.wel-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+.wel-foot-note { font-size: 13px; color: var(--text-secondary); }
+
+/* Leaving the first step with an SSH key typed but not added. */
+.wel-confirm { font-family: var(--font-ui); color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; }
+.wel-confirm-dialog { display: flex; flex-direction: column; gap: 8px; padding: 20px; outline: none; }
+.wel-confirm-title { margin: 0; font-size: 16px; font-weight: 600; }
+.wel-confirm-dialog p { margin: 0; }
+.wel-confirm-buttons { justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+@media (min-width: 560px) { .wel-confirm-buttons { flex-wrap: nowrap; } }
+
+/* Sign-in. */
+.wel-login .wel-card { max-width: 400px; margin-top: 16vh; align-items: center; text-align: center; gap: 18px; padding: 36px 32px 32px; }
+.wel-login-mark {
+  width: 44px; height: 44px; border-radius: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.wel-login-mark svg { color: var(--accent); fill: currentColor; }
+.wel-login .wel-head { align-items: center; }
+.wel-login-alert { width: 100%; text-align: left; }
+.wel-login-button { width: 100%; justify-content: center; }

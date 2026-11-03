@@ -65,6 +65,18 @@ export function stripSgr(s: string): string {
   return s.replace(CSI_RE, '');
 }
 
+// OSC sequences, ended by BEL or ST (ESC \). `capture-pane -e` keeps the
+// OSC 8 hyperlinks Claude Code wraps around URLs (`ESC ]8;id=…;<url> ESC \`
+// <text> `ESC ]8;; ESC \`), one pair per row a link is wrapped over. They draw
+// nothing, so they go before anything reads or measures the rows: the text
+// they wrap is the URL itself, which the chat links as it links any URL.
+// eslint-disable-next-line no-control-regex
+const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+export function stripOsc(s: string): string {
+  return s.replace(OSC_RE, '');
+}
+
 /** Which rendering a (provider, role) gets. */
 export function chatMode(provider: string | null | undefined, role: 'agent' | 'ctrl' | 'review'): ChatMode {
   if (role === 'ctrl') return 'plain';
@@ -545,18 +557,42 @@ function parsePi(lines: string[]): ParsedPane {
 /**
  * Splits block text into prose and ``` fenced code, so a renderer can show
  * code monospace with its rows intact and prose in the reading font. The
- * fence rows themselves (and their language tag) are dropped.
+ * fence rows themselves are dropped; a code part keeps its language tag
+ * (`lang`, the info string's first word) and says when no closing fence
+ * followed (`open`: the agent is still writing it, or the capture cut it).
  */
-export function splitFences(text: string): Array<{ code: boolean; text: string }> {
-  const out: Array<{ code: boolean; text: string }> = [];
+export function splitFences(text: string): Array<{ code: boolean; text: string; lang?: string; open?: boolean }> {
+  const out: Array<{ code: boolean; text: string; lang?: string; open?: boolean }> = [];
   let buf: string[] = [];
   let code = false;
-  const flush = () => { if (buf.some(l => l.trim())) out.push({ code, text: code ? buf.join('\n') : buf.join('\n').trim() }); buf = []; };
+  let lang: string | undefined;
+  // The opening fence's length: like CommonMark, only a bare fence at least
+  // as long closes it, and its info string starts after all its backticks.
+  let marker = 0;
+  const flush = (open = false) => {
+    if (!buf.some(l => l.trim())) { buf = []; return; }
+    if (!code) out.push({ code, text: buf.join('\n').trim() });
+    else out.push({ code, text: buf.join('\n'), ...(lang && { lang }), ...(open && { open }) });
+    buf = [];
+  };
   for (const line of text.split('\n')) {
-    if (FENCE_RE.test(line)) { flush(); code = !code; continue; }
+    const fence = /^\s*(`{3,})(.*)$/.exec(line);
+    if (fence && !code) {
+      flush();
+      code = true;
+      marker = fence[1].length;
+      lang = fence[2].trim().split(/\s+/)[0] || undefined;
+      continue;
+    }
+    if (fence && fence[1].length >= marker && !fence[2].trim()) {
+      flush();
+      code = false;
+      lang = undefined;
+      continue;
+    }
     buf.push(line);
   }
-  flush();
+  flush(code);
   return out;
 }
 
@@ -564,7 +600,7 @@ export function splitFences(text: string): Array<{ code: boolean; text: string }
 
 export function parsePane(raw: string, opts: ParseOptions): ParsedPane {
   const mode = chatMode(opts.provider, opts.role);
-  const lines = (raw ?? '').replace(/\r\n?/g, '\n').split('\n');
+  const lines = stripOsc(raw ?? '').replace(/\r\n?/g, '\n').split('\n');
   // Trailing blank rows are the unused bottom of the pane, not content.
   while (lines.length > 0 && stripSgr(lines[lines.length - 1]).trim() === '') lines.pop();
 

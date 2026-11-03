@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import type { CloudSession } from '../../types';
 import { fmtAge } from '../../utils/format';
 import { cloudStateLabel, fmtDurationSec, platformLabel } from '../../utils/cloudSessions';
-import { PROVIDERS } from '../../providers/registry';
+import { PROVIDERS, providerBadgeStyle } from '../../providers/registry';
+import { usePalette } from '../../theme/usePalette';
 
 /**
  * Claude Code cloud sessions on the owner's boxes:
@@ -19,12 +20,13 @@ function Row({ s, now }: { s: CloudSession; now: number }) {
     ? <a href={s.url} target="_blank" rel="noreferrer" title="Open on claude.ai">{s.name}</a>
     : <span>{s.name}</span>;
   const claude = PROVIDERS.claude;
+  const palette = usePalette();
   return (
     <tr className={`cloud-row cloud-${s.state}`}>
       <td className="cloud-title-cell">
         <span
           className="project-provider-badge cloud-provider-badge"
-          style={{ borderColor: claude.color.bright.replace(/[\d.]+\)$/, '0.45)'), background: claude.color.base.replace(/[\d.]+\)$/, '0.16)') }}
+          style={providerBadgeStyle(claude, palette)}
           title="Claude Code cloud session (claude.ai)"
         >{claude.badge} ☁</span>
         {title}

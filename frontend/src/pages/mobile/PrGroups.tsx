@@ -6,7 +6,7 @@
 import React, { useState } from 'react';
 import { prsApi, type PrGroupMember, type PrGroupSuggestion, type PrReviewGroup, type PrRow } from '../../services/api';
 import {
-  acceptSuggestion, groupKey, groupProgress, groupReviewPlan, groupSize, memberInputs, memberLabel, memberStatus, nextMember, suggestionWhy,
+  acceptSuggestion, groupKey, groupProgress, groupReviewPlan, groupSize, memberInputs, memberBotReview, memberLabel, memberReview, memberStatus, nextMember, suggestionWhy, unreviewedCount,
 } from '../../utils/prReviewGroups';
 import { Sheet, apiError } from './Sheet';
 
@@ -31,7 +31,7 @@ export function MobileGroupCard({ group, viewer, now, onOpen, onMenu, onBareMenu
         <span className="m-glyph m-pr-glyph" aria-hidden>{group.done ? '✓' : open ? '▾' : '▸'}</span>
         <span className="m-row-main">
           <span className="m-row-title">{group.name}</span>
-          <span className="m-row-preview">{groupSize(group)} · {groupProgress(group, viewer)}</span>
+          <span className="m-row-preview">{groupSize(group)} · {groupProgress(group, viewer)}{!group.done && unreviewedCount(group, viewer) > 0 ? ` · ${unreviewedCount(group, viewer)} with no review yet` : ''}</span>
         </span>
       </button>
       {open && (
@@ -43,7 +43,7 @@ export function MobileGroupCard({ group, viewer, now, onOpen, onMenu, onBareMenu
                   <span className="m-prg-mark" aria-label={m.checked ? 'checked off' : m === next ? 'next' : undefined}>{m.checked ? '✓' : m === next ? '→' : i + 1}</span>
                   <span className="m-row-main">
                     <span className="m-row-title">{m.title || memberLabel(m)}</span>
-                    <span className="m-row-preview">{memberLabel(m)} · {memberStatus(m, viewer, now)}{m.note ? ` · ${m.note}` : ''}</span>
+                    <span className="m-row-preview">{memberLabel(m)} · {reviewPrefix(m, viewer)}{memberStatus(m, viewer, now)}{m.note ? ` · ${m.note}` : ''}</span>
                   </span>
                 </button>
                 <button className="m-more" aria-label={`Actions for ${memberLabel(m)}`} onClick={() => (m.row ? onMenu(m.row) : onBareMenu(group, m))}>⋯</button>
@@ -174,4 +174,9 @@ export function SuggestionSheet({ suggestion, groups, onClose, onChanged, onErro
       </div>
     </Sheet>
   );
+}
+
+/** A member's review pills as text on its line: "no review yet · cursor approved · ", "approved · ", or nothing. */
+function reviewPrefix(m: PrGroupMember, viewer: string | null): string {
+  return [memberReview(m, viewer), memberBotReview(m)].filter(r => r !== null).map(r => `${r.label} · `).join('');
 }

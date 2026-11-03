@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import type { InboxRow } from '../mobile/inbox';
+import type { Project } from '../types';
 import type { Block } from './paneChat';
-import { boxLabel, chatHref, chatRowName, chatRows, conversationBlocks, fullUiHref, isSdkChat, repoNeedsTrust, repoSlug, repoStartsTrusted, runConversationHref, showAnswerKeys, sidebarLine, statusLine } from './simpleChat';
+import { askPlaceholderProjects, boxLabel, chatHref, chatRowName, chatRows, isAskChatWorkstream, withoutAskPlaceholders, conversationBlocks, fullUiHref, isSdkChat, repoNeedsTrust, repoSlug, repoStartsTrusted, runConversationHref, showAnswerKeys, sidebarLine, statusLine } from './simpleChat';
 
 function row(over: Partial<InboxRow>): InboxRow {
   return {
@@ -137,6 +138,8 @@ describe('isSdkChat', () => {
     expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'claude-chat')] as never }, 'main')).toBe(true);
     expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'claude-chat')] as never }, 'tui')).toBe(true);
     expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'claude-chat'), wf('w-tui', 'claude')] as never }, 'tui')).toBe(false);
+    expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'pi-chat')] as never }, 'main')).toBe(true);
+    expect(isSdkChat({ workstreams: ws, workflows: [wf('w-main', 'pi')] as never }, 'main')).toBe(false);
   });
 
   it('is false for a pane agent or no agent', () => {
@@ -181,15 +184,25 @@ describe('chatRowName', () => {
   const row = { projectName: 'termag', workstream: 'fix-auth', sessionTitle: 'Login rate limiting' };
 
   it('leads with the title when titles are on, the project and workstream secondary', () => {
-    expect(chatRowName(row, true)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth' });
-    expect(chatRowName({ ...row, workstream: 'main' }, true)).toEqual({ title: 'Login rate limiting', where: 'termag' });
+    expect(chatRowName(row, true)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth', ask: false });
+    expect(chatRowName({ ...row, workstream: 'main' }, true)).toEqual({ title: 'Login rate limiting', where: 'termag', ask: false });
   });
 
   it('names the row after the project with titles off, or before Claude has titled the session', () => {
-    expect(chatRowName(row, false)).toEqual({ title: null, where: 'termag · fix-auth' });
-    expect(chatRowName({ ...row, sessionTitle: null }, true)).toEqual({ title: null, where: 'termag · fix-auth' });
+    expect(chatRowName(row, false)).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
+    expect(chatRowName({ ...row, sessionTitle: null }, true)).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
     expect(chatRowName({ ...row, sessionTitle: '   ' }, true).title).toBeNull();
     expect(chatRowName({ projectName: 'termag', workstream: 'main' }, true).title).toBeNull();
+  });
+
+  it("leads an ask with its title, flag or not, and puts Claude's session title second", () => {
+    const ask = { projectName: 'termag-3', workstream: 'ask-t1', askThreadId: 't1', askTitle: 'Readable names', sessionTitle: 'Rename ask rows' };
+    expect(chatRowName(ask, true)).toEqual({ title: 'Readable names', where: 'Rename ask rows', ask: true });
+    expect(chatRowName(ask, false)).toEqual({ title: 'Readable names', where: null, ask: true });
+    expect(chatRowName({ ...ask, sessionTitle: 'Readable names' }, true).where).toBeNull();
+    // An untitled thread is called by its id, never by Claude's title or anything from its prompt; that title comes second.
+    expect(chatRowName({ ...ask, askTitle: null }, true)).toEqual({ title: 'ask-t1', where: 'Rename ask rows', ask: true });
+    expect(chatRowName({ ...ask, askTitle: null }, false)).toEqual({ title: 'ask-t1', where: null, ask: true });
   });
 });
 
@@ -225,5 +238,79 @@ describe('boxLabel', () => {
 
   it('has nothing for a session with no box', () => {
     expect(boxLabel(row({ instanceId: null }), 'psecor-dev02')).toBeNull();
+  });
+});
+
+describe('ask placeholders', () => {
+  const ws = (name: string, createdAt: string, extra: Partial<Project['workstreams'][number]> = {}) => ({
+    id: name, projectId: 'p', name, branch: name, archived: false, lastActiveAt: createdAt, createdAt, updatedAt: createdAt, ...extra,
+  });
+  const project = (id: string, workstreams: ReturnType<typeof ws>[], extra: Partial<Project> = {}): Project => ({
+    id, name: 'termag-3', archived: false, createdAt: T, workflows: [], workstreams, ...extra,
+  });
+  const T = '2026-10-26T10:00:00Z';
+  const SOON = '2026-10-26T10:12:00Z';
+  const ASK = 'ask-cmvpvqxse19rwex4apfh334ld';
+  const thread = (parentProjectId: string | null) => ({ askThread: { id: 't', title: 'x', parentProjectId, parentWorkstream: parentProjectId ? 'main' : null } });
+
+  it('takes a new project, made by ask --new-box: recorded, with an ask from a session, and an unused main', () => {
+    const hosts = askPlaceholderProjects([project('new', [ws('main', T), ws(ASK, SOON, thread('orch'))], { createdFor: 'ask' })]);
+    expect([...hosts]).toEqual(['new']);
+  });
+
+  it('takes an old or unlabelled project the same way: it has asks and its main was never used, whoever made it and when', () => {
+    const hosts = askPlaceholderProjects([
+      // An old CLI's: no record, asks that name no sender.
+      project('old', [ws('main', T), ws(ASK, SOON, thread(null))]),
+      // Made by hand or by another agent, asked days later, beside work of its own.
+      project('by-hand', [ws('main', T), ws('feature', SOON), ws('ask-cmvpvqzob19srex4ak3hat0ed', '2026-10-30T10:00:00Z', thread('orch'))]),
+      // A workstream that only looks like an ask's chat counts by its name too.
+      project('named', [ws('main', T), ws('ask-cmvpvr0by19t1ex4aevd9iv3e', SOON)]),
+    ]);
+    expect([...hosts]).toEqual(['old', 'by-hand', 'named']);
+  });
+
+  it('never takes a project whose main was used: turns or typing, a session title or a stored transcript', () => {
+    const hosts = askPlaceholderProjects([
+      project('turns', [ws('main', T, { hasTurns: true }), ws(ASK, SOON, thread('orch'))]),
+      project('titled', [ws('main', T, { sessionTitle: 'Fix the flag' }), ws(ASK, SOON, thread('orch'))]),
+      project('transcript', [ws('main', T, { hasTranscript: true }), ws(ASK, SOON, thread('orch'))]),
+      project('recorded-but-used', [ws('main', T, { hasTranscript: true })], { createdFor: 'ask' }),
+    ]);
+    expect(hosts.size).toBe(0);
+  });
+
+  it('never takes a project with no asks, unless it is recorded as made for one (its first ask has no chat yet)', () => {
+    const hosts = askPlaceholderProjects([
+      project('no-asks', [ws('main', T), ws('feature', SOON)]),
+      project('archived-ask', [ws('main', T), ws(ASK, SOON, { archived: true })]),
+      project('ask-me', [ws('main', T), ws('ask-me', SOON)]),
+      project('just-made', [ws('main', T)], { createdFor: 'ask' }),
+    ]);
+    expect([...hosts]).toEqual(['just-made']);
+    expect(isAskChatWorkstream('ask-cmvpvr0by19t1ex4aevd9iv3e')).toBe(true);
+    expect(isAskChatWorkstream('ask-Fix')).toBe(false);
+  });
+
+  it("drops the main of such a project while it has never run and isn't open", () => {
+    const hosts = new Set(['p']);
+    const rows = [
+      row({ key: 'p|main', status: 'not_running' }),
+      row({ key: 'p|ask-cmvpvqxse19rwex4apfh334ld', workstream: 'ask-cmvpvqxse19rwex4apfh334ld' }),
+      row({ key: 'q|main', projectId: 'q', status: 'not_running' }),
+    ];
+    expect(withoutAskPlaceholders(rows, hosts, new Set()).map(r => r.key)).toEqual(['p|ask-cmvpvqxse19rwex4apfh334ld', 'q|main']);
+  });
+
+  it('drops it while its agent sits at its prompt, Ready, having done nothing', () => {
+    expect(withoutAskPlaceholders([row({ status: 'idle' })], new Set(['p']), new Set())).toHaveLength(0);
+  });
+
+  it('keeps it when it is working or needs you, has a title or is open', () => {
+    const hosts = new Set(['p']);
+    expect(withoutAskPlaceholders([row({ status: 'working' })], hosts, new Set())).toHaveLength(1);
+    expect(withoutAskPlaceholders([row({ status: 'waiting' })], hosts, new Set())).toHaveLength(1);
+    expect(withoutAskPlaceholders([row({ status: 'not_running', sessionTitle: 'Look at logs' })], hosts, new Set())).toHaveLength(1);
+    expect(withoutAskPlaceholders([row({ status: 'not_running' })], hosts, new Set(['p|main']))).toHaveLength(1);
   });
 });

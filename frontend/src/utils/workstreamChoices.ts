@@ -28,6 +28,22 @@ export function scopedProjects(projects: Project[], repo: string | null, checkou
 
 const WORKSTREAM_NAME = /^[A-Za-z0-9_-]+$/;
 export const isWorkstreamName = (s: string) => WORKSTREAM_NAME.test(s) && s !== 'main';
+/** The automation scheduler's run-<date>-<time> names, which the backend refuses for anything else (isRunName). */
+export const isRunName = (s: string) => /^run-\d{8}-\d{4}(-\d+)?$/.test(s);
+
+/**
+ * The workstream name Branch off suggests for a branch the user typed: every
+ * run of `/` or other characters a name cannot hold becomes one `-`
+ * (`user/ABC-123/fix-login` → `user-ABC-123-fix-login`), at most 64 characters.
+ * '' when nothing usable is left, or when it would be `main` or an automation
+ * run's name, which the backend refuses. The name is a directory and a tmux
+ * session part, so it never takes a `/`. The backend's nameFromBranch
+ * (services/agentSpawn.ts) is the same rule at a spawn's 40 characters.
+ */
+export function workstreamNameFromBranch(branch: string): string {
+  const name = branch.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 64).replace(/-$/, '');
+  return name === 'main' || isRunName(name) ? '' : name;
+}
 
 /**
  * A new workstream's name for a PR: the repository's name, the PR's number and

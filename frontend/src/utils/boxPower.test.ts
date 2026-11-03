@@ -2,18 +2,18 @@ import { describe, expect, it } from 'vitest';
 import type { InstanceStatus } from '../types';
 import {
   boxDisplay,
-  canHibernateBox,
   canStartBox,
   canStopBox,
   hibernatedDays,
   hibernationAgeNote,
   isBoxParked,
+  isQuarantined,
   showsBoxError,
 } from './boxPower';
 
 const statuses: InstanceStatus[] = [
   'provisioning', 'awaiting-agent', 'ready', 'stopping', 'stopped', 'starting', 'hibernating', 'hibernated',
-  'failed', 'terminated',
+  'failed', 'quarantined', 'terminated',
 ];
 const ec2 = (status: InstanceStatus) => ({ kind: 'ec2' as const, status, ec2InstanceId: 'i-0abc' });
 
@@ -26,17 +26,14 @@ describe('box power actions', () => {
     expect(statuses.filter(s => canStartBox(ec2(s)))).toEqual(['stopped', 'hibernated']);
   });
 
-  it('offers Hibernate box only on a ready box launched hibernation-capable', () => {
-    expect(statuses.filter(s => canHibernateBox({ ...ec2(s), hibernationConfigured: true }))).toEqual(['ready']);
-    expect(canHibernateBox({ ...ec2('ready'), hibernationConfigured: false })).toBe(false);
-    expect(canHibernateBox(ec2('ready'))).toBe(false);
+  it('still offers Resume on a hibernated box', () => {
+    expect(canStartBox(ec2('hibernated'))).toBe(true);
   });
 
   it('offers none on a self-managed box or one with no instance yet', () => {
     expect(canStopBox({ kind: 'external', status: 'ready', ec2InstanceId: null })).toBe(false);
     expect(canStopBox({ kind: 'ec2', status: 'ready', ec2InstanceId: null })).toBe(false);
     expect(canStartBox({ kind: 'ec2', status: 'stopped', ec2InstanceId: null })).toBe(false);
-    expect(canHibernateBox({ kind: 'ec2', status: 'ready', ec2InstanceId: null, hibernationConfigured: true })).toBe(false);
   });
 });
 
@@ -54,6 +51,14 @@ describe('boxDisplay', () => {
     expect(boxDisplay('hibernating')).toMatchObject({ spinning: true, label: 'hibernating…' });
   });
 
+  it('labels a quarantined box in the failure red, and offers it no power action', () => {
+    expect(boxDisplay('quarantined')).toEqual({ dot: 'var(--danger)', spinning: false, label: 'quarantined' });
+    expect(isQuarantined({ status: 'quarantined' })).toBe(true);
+    expect(isQuarantined({ status: 'stopped' })).toBe(false);
+    const box = ec2('quarantined');
+    expect([canStopBox(box), canStartBox(box)]).toEqual([false, false]);
+  });
+
   it('shows the project count for a ready box', () => {
     expect(boxDisplay('ready').label).toBe(null);
   });
@@ -69,7 +74,7 @@ describe('showsBoxError', () => {
 
 describe('isBoxParked', () => {
   it('is true only while a box is down or on its way up or down', () => {
-    expect(statuses.filter(isBoxParked)).toEqual(['stopping', 'stopped', 'starting', 'hibernating', 'hibernated']);
+    expect(statuses.filter(isBoxParked)).toEqual(['stopping', 'stopped', 'starting', 'hibernating', 'hibernated', 'quarantined']);
     expect(isBoxParked(undefined)).toBe(false);
   });
 });
@@ -89,5 +94,6 @@ describe('hibernation age', () => {
   it('warns from day 50 about the 60-day limit', () => {
     expect(hibernationAgeNote(box(49), now)).toBe(null);
     expect(hibernationAgeNote(box(52), now)).toMatch(/Hibernated 52 days\. EC2 allows 60/);
+    expect(hibernationAgeNote(box(52), now)).toMatch(/termag resumes it at 55 and stops it\.$/);
   });
 });

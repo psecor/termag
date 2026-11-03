@@ -13,22 +13,19 @@ export const SURFACE = 'var(--bg-surface)';
 export const BAR_MAX = 24;
 export const CHART_HEIGHT = 200; // plot + x-axis band; the card never gets a nested scrollbar
 
-/** `rgba(r, g, b, a)` from the provider registry → opaque `rgb(r, g, b)` for chart fills. */
+export { CURSOR, HUE, HUE_ORDER } from './chartPalette';
+
+/** `rgba(r, g, b, a)` from the provider registry → opaque `rgb(r, g, b)` for chart fills.
+ *  Anything else (a `var()` series, a hex) is already opaque and passes through. */
 export function opaque(color: string): string {
   const m = color.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
   return m ? `rgb(${m[1]}, ${m[2]}, ${m[3]})` : color;
 }
 
-/** Series hue at a wash opacity for area fills. */
+/** Series hue at a wash opacity for area fills. `color-mix`, so a `var()`
+ *  series washes too and follows the palette. */
 export function wash(color: string, alpha = 0.12): string {
-  const m = color.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  if (m) return `rgba(${m[1]}, ${m[2]}, ${m[3]}, ${alpha})`;
-  const h = color.replace('#', '');
-  if (h.length === 6) {
-    const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  }
-  return color;
+  return `color-mix(in srgb, ${opaque(color)} ${+(alpha * 100).toFixed(2)}%, transparent)`;
 }
 
 interface TooltipRow { name?: string; value?: number | string; color?: string; dataKey?: string | number }
@@ -41,11 +38,13 @@ interface DashTooltipProps {
   fmtLabel?: (l: string | number) => string;
   /** Show a total line when there are ≥2 series. */
   total?: boolean;
+  /** Keep zero (and negative) readings: a line chart's 0 is a real value, not a gap. */
+  zeros?: boolean;
 }
 
-export function DashTooltip({ active, payload, label, fmt, fmtLabel, total }: DashTooltipProps) {
+export function DashTooltip({ active, payload, label, fmt, fmtLabel, total, zeros }: DashTooltipProps) {
   if (!active || !payload || payload.length === 0) return null;
-  const rows = payload.filter(r => typeof r.value === 'number' && (r.value as number) > 0);
+  const rows = payload.filter(r => typeof r.value === 'number' && (zeros ? Number.isFinite(r.value) : (r.value as number) > 0));
   const sum = rows.reduce((s, r) => s + (r.value as number), 0);
   return (
     <div className="dash-tip" role="tooltip">

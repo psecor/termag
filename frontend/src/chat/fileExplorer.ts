@@ -59,6 +59,56 @@ export function ancestorDirs(path: string): string[] {
   return ['', ...parts.map((_, i) => `${parts.slice(0, i + 1).join('/')}/`)];
 }
 
+/** A step of the file view's breadcrumb: a folder (its tree prefix, '' for the space) or, last, the file. */
+export type FileCrumb = { label: string; dir: string } | { label: string; dir: null };
+
+/** `space / folder / … / file` for the file view's header; empty segments of a path like `a//b` are skipped. */
+export function fileCrumbs(space: string, path: string): FileCrumb[] {
+  const parts = path.split('/');
+  const name = parts.pop() ?? '';
+  const crumbs: FileCrumb[] = [{ label: space, dir: '' }];
+  let prefix = '';
+  for (const p of parts) {
+    prefix += `${p}/`;
+    if (p) crumbs.push({ label: p, dir: prefix });
+  }
+  crumbs.push({ label: name, dir: null });
+  return crumbs;
+}
+
+/**
+ * How many crumbs before the file to fold into one "…" so the breadcrumb
+ * fits on a line: `widths` are each crumb's (space first, file last, each
+ * with its separator), `ellipsis` the "…" crumb's. Folders go from the
+ * outside in, so the file's own folder is the last to fold; only when even
+ * `space / … / file` doesn't fit does the space fold too (`widths.length - 1`,
+ * `… / file`), and past that the file name is ellipsised.
+ */
+/** The least the file view's breadcrumb keeps beside the header's buttons: `… / ` and a name of about 15 characters. */
+export const FILE_CRUMB_MIN_PX = 160;
+
+/**
+ * Whether the file view's header puts its buttons under ⋮, as on a phone:
+ * beside `buttons`, the title's `room` (the header's width without them)
+ * would leave the breadcrumb less than `… / file` (`foldedFile`) or
+ * FILE_CRUMB_MIN_PX, so the menu takes over before the name is cut.
+ */
+export function headerNeedsMenu(room: number, buttons: number, foldedFile: number): boolean {
+  return room - buttons < Math.max(foldedFile, FILE_CRUMB_MIN_PX);
+}
+
+export function foldedCrumbs(widths: number[], ellipsis: number, available: number): number {
+  const folders = widths.length - 2;
+  let total = widths.reduce((a, b) => a + b, 0);
+  if (folders < 0 || total <= available) return 0;
+  total += ellipsis;
+  for (let k = 1; k <= folders; k++) {
+    total -= widths[k];
+    if (total <= available) return k;
+  }
+  return folders + 1;
+}
+
 /**
  * How the file view shows a file, as the server decided it. `frame`: the
  * signed URL goes in an iframe, unsandboxed, for the browser's own image,
@@ -74,8 +124,16 @@ export function fileShow(view: SpaceViewUrl['view']): FileShow {
 }
 
 /** Fetched as text and rendered here rather than framed. */
-export function fetchesText(show: FileShow): boolean {
-  return show.kind === 'markdown' || show.kind === 'html' || show.kind === 'svg';
+export function fetchesText(show: FileShow, contentType = ''): boolean {
+  return show.kind === 'markdown' || show.kind === 'html' || show.kind === 'svg' || showsAsCode(show, contentType);
+}
+
+/**
+ * A text file the server would have the browser frame (code, logs, JSON):
+ * shown by the file view's code view instead, in the app's colours.
+ */
+export function showsAsCode(show: FileShow, contentType: string): boolean {
+  return show.kind === 'frame' && contentType.startsWith('text/');
 }
 
 /** An `<img>` src for SVG text: a data URL has an opaque origin, and SVG in an image runs no script. */

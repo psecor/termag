@@ -1,0 +1,3 @@
+/* DateRangePicker.tsx: the start and end fields side by side, as DatePicker's one (.genui-date in genui.css). */
+.genui-daterangepicker-group { display: flex; align-items: center; gap: 2px; }
+.genui-daterangepicker-dash { padding: 0 4px; color: var(--text-muted); }

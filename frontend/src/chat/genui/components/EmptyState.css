@@ -1,0 +1,3 @@
+/* EmptyState.tsx. LaunchPad lays it out (a centred grid); this pads it for a chat card instead of a page. */
+.genui-emptystate { padding: 20px 12px; min-width: 0; overflow-wrap: anywhere; }
+.genui-emptystate-actions { flex-wrap: wrap; justify-content: center; }

@@ -64,7 +64,7 @@ export function RunningBoxRecoveryView({ recovery }: { recovery: RunningBoxRecov
             <span className="chat-title-name">{recovery.projectName}</span>
           </div>
           <div className="chat-header-actions">
-            <button type="button" className="btn-ghost" onClick={openFull}>Open in full UI</button>
+            <button type="button" className="btn-ghost" onClick={openFull}>Open in Lab</button>
           </div>
           {recovery.announced && createPortal(
             <Dialog ariaLabel="Box still running" onClose={() => dismissRunningBoxNotice(recovery.projectId)} closeDisabled={stopping}>
@@ -73,7 +73,7 @@ export function RunningBoxRecoveryView({ recovery }: { recovery: RunningBoxRecov
                 <button type="button" className="confirm-btn confirm-btn-cancel" disabled={stopping} onClick={() => dismissRunningBoxNotice(recovery.projectId)}>Keep this session open</button>
                 {canRetry
                   ? <button type="button" className="confirm-btn confirm-btn-primary" disabled={stopping} onClick={() => { void stop(); }}>{retryLabel}</button>
-                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={openFull}>Open in full UI</button>}
+                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={openFull}>Open in Lab</button>}
               </div>
             </Dialog>,
             document.body,
@@ -87,7 +87,7 @@ export function RunningBoxRecoveryView({ recovery }: { recovery: RunningBoxRecov
                 {canRetry && (
                   <button type="button" className="btn-tiny" disabled={stopping} onClick={() => { void stop(); }}>{retryLabel}</button>
                 )}
-                <button type="button" className="btn-tiny" disabled={stopping} onClick={openFull}>Open in full UI</button>
+                <button type="button" className="btn-tiny" disabled={stopping} onClick={openFull}>Open in Lab</button>
                 <button type="button" className="btn-tiny" disabled={stopping} onClick={() => navigate('/chat')}>Back to sessions</button>
               </div>
             </div>

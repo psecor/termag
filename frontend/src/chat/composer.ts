@@ -34,6 +34,11 @@ export function chatModelWire(id: ChatModelId): { model: string; backend?: 'fire
   return id.startsWith(FIREWORKS) ? { model: id.slice(FIREWORKS.length), backend: 'fireworks' } : { model: id };
 }
 
+/** The model runs on Claude's own backend (PDFs go to Claude only, backend services/chatImages.ts). */
+export function chatModelTakesPdfs(id: ChatModelId | null): boolean {
+  return !chatModelWire(id ?? '').backend;
+}
+
 /** A Fireworks chat whose model the history could not say: no option, so any pick switches it. */
 export const FIREWORKS_UNKNOWN: ChatModelId = FIREWORKS;
 
@@ -58,11 +63,73 @@ export function chatModelOptions(fireworks: ModelChoice[]): ChatModelOption[] {
   ];
 }
 
+/**
+ * Claude Code's effort levels (`--effort`), offered beside the model where the
+ * chat takes one (backend services/chatEffort.ts). Default sends nothing, so the
+ * turn runs at what Claude Code picks for the model.
+ */
+export const CHAT_EFFORTS = [
+  { id: 'default', label: 'Default', hint: 'What Claude Code picks for the model' },
+  { id: 'low', label: 'Low', hint: 'Quickest, for small asks' },
+  { id: 'medium', label: 'Medium', hint: 'Quick, with some thought' },
+  { id: 'high', label: 'High', hint: 'Thinks it through' },
+  { id: 'xhigh', label: 'Extra high', hint: 'Thinks longer, for hard problems' },
+  { id: 'max', label: 'Max', hint: 'Deepest thinking, slowest' },
+] as const;
+
+/** The slider's stops, low to max. Default is not an intensity: it has its own control. */
+export const EFFORT_LEVELS = CHAT_EFFORTS.filter((e): e is Exclude<(typeof CHAT_EFFORTS)[number], { id: 'default' }> => e.id !== 'default');
+
+export type ChatEffortId = (typeof CHAT_EFFORTS)[number]['id'];
+/** What a send carries as `effort`: a level the CLI takes. Default is no value. */
+export type ChatEffortWire = Exclude<ChatEffortId, 'default'>;
+
+export function isChatEffort(id: unknown): id is ChatEffortId {
+  return typeof id === 'string' && CHAT_EFFORTS.some(e => e.id === id);
+}
+
+export function chatEffortWire(id: ChatEffortId): ChatEffortWire | null {
+  return id === 'default' ? null : id;
+}
+
+export function chatEffortLabel(id: ChatEffortId): string {
+  return CHAT_EFFORTS.find(e => e.id === id)?.label ?? 'Default';
+}
+
+/** Fireworks' models run at their own effort: the picker offers none for them. */
+export function chatModelTakesEffort(id: ChatModelId | null): boolean {
+  return id == null || !id.startsWith(FIREWORKS);
+}
+
 export function chatModelLabel(id: ChatModelId, options: ChatModelOption[] = []): string {
   const known = options.find(o => o.id === id) ?? CHAT_MODELS.find(m => m.id === id);
   if (known) return known.label;
   if (id === FIREWORKS_UNKNOWN) return 'Fireworks';
   return id.startsWith(FIREWORKS) ? id.split('/').pop() ?? id : 'Sonnet 5.5';
+}
+
+/**
+ * A model's name without its version, for the placeholder (the picker keeps
+ * the full label): the words before the first one with a digit, "Kimi K3" →
+ * "Kimi", "DeepSeek V4.1 Flash" → "DeepSeek"; a version fused to the name
+ * comes off it, "Qwen3 Coder" → "Qwen".
+ */
+export function modelFamily(label: string): string {
+  const words = label.trim().split(/[\s_-]+/).filter(Boolean);
+  const versioned = words.findIndex(w => /\d/.test(w));
+  if (versioned !== 0) return (versioned < 0 ? words : words.slice(0, versioned)).join(' ') || label;
+  return words[0].replace(/\d[\d.]*[a-z]*$/i, '') || label;
+}
+
+/**
+ * Who the composer's placeholder addresses: Claude on its tiers, a Fireworks
+ * model by its name without the version. Null while the chat's model is
+ * unknown, so a Kimi chat never reads "Message Claude…" before its history
+ * reports.
+ */
+export function chatAgentName(id: ChatModelId | null, options: ChatModelOption[] = []): string | null {
+  if (id == null || id === FIREWORKS_UNKNOWN) return null;
+  return isClaudeTier(id) ? 'Claude' : modelFamily(chatModelLabel(id, options));
 }
 
 /** The tier a create carries as claudeModel; a Fireworks model is null. */

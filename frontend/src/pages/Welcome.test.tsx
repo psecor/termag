@@ -297,7 +297,7 @@ describe('shared SSH key form', () => {
   it('accepts a public key whose comment contains a private-key header', async () => {
     await act(async () => { root.render(<SshKeysSection />); });
     // Valid public-key fixture from the backend parser tests, with a legal comment.
-    const publicKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAbYOa2X2cb3APrq0kCH4nqKhJ7K02+SmcLB3Y5DcE2 -----BEGIN RSA PRIVATE KEY-----';
+    const publicKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBAbYOa2X2cb3APrq0kCH4nqKhJ7K02+SmcLB3Y5DcE2 -----BEGIN RSA PRIVATE KEY-----'; // gitleaks:allow (a public key with a header in its comment)
     await typeKey(publicKey);
     expect(input().value).toBe(publicKey);
     expect(document.querySelector('[role="alert"]')).toBeNull();

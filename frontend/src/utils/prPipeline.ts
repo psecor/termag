@@ -176,8 +176,9 @@ export function rowLabel(r: PrRow): string {
   return `${r.repo?.split('/')[1] ?? r.repo}#${r.number}`;
 }
 
+/** Unique among the rows: a multi-repo workstream has a branch row per repository. */
 export function rowKey(r: PrRow): string {
-  return r.kind === 'branch' ? `b:${r.workstream?.projectId}:${r.workstream?.workstream}` : `${r.repo}#${r.number}`;
+  return r.kind === 'branch' ? `b:${r.workstream?.projectId}:${r.workstream?.workstream}:${r.repo ?? ''}` : `${r.repo}#${r.number}`;
 }
 
 function list(names: string[], max = 3): string {
@@ -482,7 +483,12 @@ export function prsSearch(current: string, view: PrsView | null, pr?: string | n
   return s ? `?${s}` : '';
 }
 
-/** Fired on window after the overlay changes a PR on GitHub, so the status-strip tile re-reads at once. */
+/**
+ * Fired on window when a PR changed, so every PR view (the status-strip tile, the pills, the
+ * simple UI's context card and Pull request tab) re-reads at once: after this page changes one on
+ * GitHub, or on a `prs` push when one of the user's sessions opened or changed one
+ * (contexts/ProjectContext.tsx, backend services/prLiveUpdates.ts).
+ */
 export const PRS_CHANGED_EVENT = 'termag:prs-changed';
 
 /** The backend's `{ error }` for a failed request, else the fallback (an offline browser, a proxy page). */

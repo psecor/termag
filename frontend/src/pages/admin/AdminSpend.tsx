@@ -2,14 +2,15 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { adminApi, type SpendModel, type SpendPerson, type SpendPool, type SpendPoolCost, type SpendProviderCost } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
+import { AdminBoxCost } from './AdminBoxCost';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { DataTable, KeyValues, errorText, fmtPct, fmtTok, pendingText, useAdminPolled, type Column } from './shared';
 import { fmtShare, fmtUsd, mixToText, pricesToText, textToMix, textToPrices, windowKeys } from './spendText';
 
 const WINDOWS = [7, 30, 90] as const;
 type SpendWindow = typeof WINDOWS[number];
-const SERIES_COLORS = ['rgb(88, 166, 255)', 'rgb(63, 185, 80)', 'rgb(188, 140, 255)', 'rgb(246, 185, 59)', 'rgb(139, 148, 158)', 'rgb(248, 81, 73)'];
+const SERIES_COLORS = [HUE.blue, HUE.green, HUE.purple, HUE.amber, HUE.gray, HUE.red];
 const SHARE_TEXT: Record<SpendPoolCost['share'], string> = { proportional: 'proportional', usage: 'measured usage', full: 'all of it' };
 const SPLIT_TEXT: Record<SpendPoolCost['allocation'], string> = { even: 'split evenly', 'by-tokens': 'split by tokens', 'by-usage': 'split by agent time' };
 
@@ -124,7 +125,7 @@ export function AdminSpend() {
             <CartesianGrid vertical={false} stroke={GRID_STROKE} />
             <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
             <YAxis tick={TICK} tickLine={false} axisLine={false} width={48} tickFormatter={v => fmtUsd(v, { compact: true })} />
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => fmtUsd(v)} total />} />
+            <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => fmtUsd(v)} total />} />
             {series.map(s => <Bar key={s.id} dataKey={s.id} name={s.label} stackId="s" fill={s.color} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />)}
           </BarChart>
         </ResponsiveContainer>
@@ -134,6 +135,8 @@ export function AdminSpend() {
       <ChartCard title="People" subtitle={r ? `${r.people.length} ${r.denominator.mode === 'all' ? 'termag users' : 'active users'}; pools split per their rule · % of loaded is the window annualised` : pendingText(report)} stale={report.loading}>
         <DataTable rows={r?.people ?? []} columns={peopleCols} rowKey={x => x.userId} defaultSort="total" dense empty={r ? 'nobody in this window' : pendingText(report)} />
       </ChartCard>
+
+      <AdminBoxCost from={keys.from} to={keys.to} />
 
       <SpendModelEditor onSaved={report.refresh} />
     </>

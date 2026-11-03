@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  archiveBoxNotice, archiveSettling, archivedBoxLabel, archivedChatOpen, canReopen, deleteLeavesOpenChat, dismissRunningBox,
+  archiveBoxNotice, archiveSettling, archivedBoxLabel, archivedBoxWord, archivedChatOpen, archivedLoadRetries, archivedRetryDelayMs, canReopen, reopenTitle, deleteLeavesOpenChat, dismissRunningBox,
   droppingRecoveryShowsMissing, dropLastActiveProject, forgetRunningBox, historyComingUp, historyFailureIsSetup,
   isPowerRestart, offerRunningBox, parkedPowerError, permanentDeleteDetail, recoveryForOpen, rememberRunningBox, reopenCatchUp, reopenOpensChat,
   chatsAfterPermanentDelete,
@@ -19,6 +19,35 @@ describe('archivedBoxLabel', () => {
   });
 });
 
+describe('archivedBoxWord', () => {
+  it('says where the box is in a word, for the end of a one-line row', () => {
+    expect(archivedBoxWord('stopped')).toBe('Stopped');
+    expect(archivedBoxWord('hibernated')).toBe('Hibernated');
+    expect(archivedBoxWord('hibernating')).toBe('Hibernating…');
+    expect(archivedBoxWord('ready')).toBe('Running');
+    expect(archivedBoxWord('terminated')).toBe('Gone');
+    expect(archivedBoxWord('failed')).toBe('Gone');
+    expect(archivedBoxWord('awaiting-agent')).toBe('Awaiting agent');
+    expect(archivedBoxWord(null)).toBe('No box');
+  });
+});
+
+describe('archivedLoadRetries and archivedRetryDelayMs', () => {
+  it('asks again when the orchestrator could not answer, not when it refused', () => {
+    expect(archivedLoadRetries(new Error('Network Error'))).toBe(true);
+    expect(archivedLoadRetries({ response: { status: 502 } })).toBe(true);
+    expect(archivedLoadRetries({ response: { status: 500 } })).toBe(true);
+    expect(archivedLoadRetries({ response: { status: 401 } })).toBe(false);
+    expect(archivedLoadRetries({ response: { status: 404 } })).toBe(false);
+    expect(archivedLoadRetries(null)).toBe(true);
+  });
+
+  it('waits 5 s, doubling, and never more than a minute', () => {
+    expect([0, 1, 2, 3, 4, 9].map(archivedRetryDelayMs)).toEqual([5_000, 10_000, 20_000, 40_000, 60_000, 60_000]);
+    expect(archivedRetryDelayMs(-1)).toBe(5_000);
+  });
+});
+
 describe('canReopen', () => {
   it('reopens a parked or running box, not one still going down or gone', () => {
     expect(canReopen('stopped')).toBe(true);
@@ -28,6 +57,16 @@ describe('canReopen', () => {
     expect(canReopen('hibernating')).toBe(false);
     expect(canReopen('terminated')).toBe(false);
     expect(canReopen(null)).toBe(false);
+  });
+
+  it('reopens a chat whose box is gone when its transcript is stored', () => {
+    expect(canReopen('terminated', true)).toBe(true);
+    expect(canReopen('failed', true)).toBe(true);
+    expect(canReopen(null, true)).toBe(true);
+    expect(canReopen('stopping', true)).toBe(false);
+    expect(reopenTitle('terminated', true)).toMatch(/saved conversation/);
+    expect(reopenTitle('terminated')).toMatch(/history with it/);
+    expect(reopenTitle('stopped', true)).toBe('Start the box again and open the session');
   });
 });
 
@@ -325,7 +364,7 @@ describe('archiveBoxNotice', () => {
     if (!booting.leave) {
       expect(booting.retry).toBeNull();
       expect(booting.message).toMatch(/still running/);
-      expect(booting.message).toMatch(/full UI/);
+      expect(booting.message).toMatch(/Stop it from Lab/);
     }
   });
 });

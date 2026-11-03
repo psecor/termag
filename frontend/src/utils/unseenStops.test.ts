@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  SEEN_STOPS_KEY, UNSEEN_MAX_AGE_MS, formatStopAge, markSeen, mergeSeenStops, readSeenStops, unseenStopAge, writeSeenStops,
+  SEEN_STOPS_KEY, UNSEEN_MAX_AGE_MS, formatStopAge, markSeen, mergeSeenStops, readSeenStops, seenStopKey, unseenStopAge, writeSeenStops,
 } from './unseenStops';
 
 function memStorage(init: Record<string, string> = {}) {
@@ -13,6 +13,13 @@ const iso = (ms: number) => new Date(ms).toISOString();
 const min = 60_000;
 
 describe('unseen stops', () => {
+  it('keys a session by project and workstream id, main by name, and an unknown workstream not at all', () => {
+    expect(seenStopKey('p1', 'main', 'w0')).toBe('p1:main');
+    expect(seenStopKey('p1', 'main', undefined)).toBe('p1:main');
+    expect(seenStopKey('p1', 'fix-auth', 'w1')).toBe('p1:w1');
+    expect(seenStopKey('p1', 'fix-auth', null)).toBeNull();
+  });
+
   it('a first read sets and stores a baseline, so older stops are not marked', () => {
     const storage = memStorage();
     const store = readSeenStops(storage, T);

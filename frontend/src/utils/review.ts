@@ -68,15 +68,34 @@ export interface ReviewTargetView {
   title: string | null;
   /** Why Start is off. */
   problem: string | null;
-  /** The workstream's repository when the PR is in another one. */
+  /** The workstream's repository when the PR is in another one (its repositories, comma-separated, when `several`). */
   mismatch: string | null;
+  /** A multi-repo workstream's view: `mismatch` lists its repositories. Absent otherwise. */
+  several?: true;
+}
+
+/** The dialog's warning for a PR outside the workstream's repository, or null. */
+export function mismatchNote(t: ReviewTargetView): string | null {
+  if (!t.mismatch) return null;
+  return `Not ${t.several ? 'one of this workstream\'s repositories' : 'this workstream\'s repository'} (${t.mismatch}). Check it is the PR you mean.`;
 }
 
 export function reviewTargetView(o: {
   pr: number | null; typedUrl: string | null; guess: PrGuess | null; repo: string | null; repoKnown: boolean;
+  /** A multi-repo workstream's repositories (GET …/review/guess `repos`, behind multi-repo-projects-enabled). */
+  repos?: string[] | null;
 }): ReviewTargetView {
   if (o.pr == null) return { url: null, repo: null, title: null, problem: null, mismatch: null };
   const guessed = o.guess && o.guess.number === o.pr ? o.guess : null;
+  const several = o.repos && o.repos.length > 0 ? o.repos : null;
+  if (several) {
+    const url = o.typedUrl ?? guessed?.url ?? null;
+    const repo = repoFromPrUrl(url);
+    const problem = url ? null
+      : `This workstream holds several repositories (${several.join(', ')}), so PR #${o.pr} could be in any of them. Paste the PR's URL or type owner/repo#${o.pr}.`;
+    const mismatch = repo && !several.some(r => r.toLowerCase() === repo.toLowerCase()) ? several.join(', ') : null;
+    return { url, repo, title: guessed?.title ?? null, problem, mismatch, several: true };
+  }
   const url = o.typedUrl ?? guessed?.url ?? (o.repo ? prUrlFor(o.repo, o.pr) : null);
   const repo = repoFromPrUrl(url);
   const problem = !url && o.repoKnown
@@ -84,6 +103,16 @@ export function reviewTargetView(o: {
     : null;
   const mismatch = repo && o.repo && repo.toLowerCase() !== o.repo.toLowerCase() ? o.repo : null;
   return { url, repo, title: guessed?.title ?? null, problem, mismatch };
+}
+
+/**
+ * A multi-repo workstream's template for the PR's repository (GET …/review/guess
+ * `promptTemplates`), as Start resolves it: null for a PR of none of them, which
+ * then gets the workstream folder's (the top-level `promptTemplate`).
+ */
+export function templateForRepo<T extends { repo: string }>(repo: string | null, templates: readonly T[] | null | undefined): T | null {
+  if (!repo || !templates) return null;
+  return templates.find(t => t.repo.toLowerCase() === repo.toLowerCase()) ?? null;
 }
 
 /**

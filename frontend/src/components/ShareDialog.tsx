@@ -3,16 +3,38 @@ import { Dialog } from './Dialog';
 import { PersonPicker } from './PersonPicker';
 import { PrPreviewSettings } from './PrPreviewSettings';
 import { browserStorage, rememberPerson } from '../utils/recentPeople';
-import { previewShareLink, previewSharesApi, type PreviewShareView } from '../services/api';
+import { checkoutLabel } from '../utils/checkoutLabel';
+import { previewShareLink, previewSharesApi, type PreviewShareView, type PreviewStackCheck } from '../services/api';
+import { FLAGS, useFlag } from '../flags';
 
-interface Props {
+interface ShareProps {
   projectId: string;
   workstream: string;
   /** browser-pane-preview-share-ttl-hours: the lifetime the dialog preselects. */
   defaultTtlHours: number;
   /** The page the owner's pane shows: the links the dialog copies open there. */
   atPath?: string | null;
+  /** Switch the workspace to another of the project's workstreams: offered when its dev stack is the one running. */
+  onSwitchWorkstream?: (workstream: string) => void;
+}
+
+interface Props extends ShareProps {
   onClose: () => void;
+}
+
+interface SharePreviewProps extends ShareProps {
+  /** Focus the email field on mount: the dialog does; the side panel's tab doesn't, since a page load can restore it. */
+  autoFocus?: boolean;
+  /** A share is being made: the dialog can't be closed meanwhile. */
+  onBusyChange?: (busy: boolean) => void;
+  /** Where a PR is shared by hand, for the PR preview settings. */
+  byHand?: string;
+  /** Changing it lists the shares again: one was made or ended outside (the side panel's PR rows). */
+  reloadKey?: number;
+  /** A share was ended here (Stop sharing). */
+  onEnded?: (shareId: string) => void;
+  /** Shown above the PR preview settings: the side panel's PRs to share by hand. */
+  children?: React.ReactNode;
 }
 
 const LIFETIMES = [72, 168];
@@ -37,14 +59,28 @@ function errorText(err: unknown): string {
   return data?.error ?? (err instanceof Error ? err.message : 'Something went wrong.');
 }
 
+/** The full UI's share dialog, from "Share…" on the browser dock: SharePreview in a modal. */
+export function ShareDialog({ onClose, ...share }: Props) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Dialog title={`Share the preview of ${share.workstream}`} onClose={onClose} className="share-dialog" closeDisabled={busy}>
+      <SharePreview {...share} autoFocus onBusyChange={setBusy} />
+    </Dialog>
+  );
+}
+
 /**
- * Share this workstream's preview with a named termag user.
- * They get their own browser on this box, reaching
- * only the shared app, and nothing else of the project: no terminals, agent
- * or files. The dialog makes a share, and lists this workstream's shares with
- * who is looking now, what their browser was refused, and their links.
+ * Share this workstream's preview with a named termag user,
+ * or, with nobody named and open links on, by a
+ * link anyone signed in to termag can open. They get their own browser on
+ * this box, reaching only the shared app, and nothing else of the project:
+ * no terminals, agent or files. It makes a share, and lists this
+ * workstream's shares with who is looking now, what their browser was
+ * refused, and their links. The full UI shows it in ShareDialog; the simple
+ * UI in its side panel's Share tab.
  */
-export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = null, onClose }: Props) {
+export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = null, autoFocus = false, onBusyChange, byHand, reloadKey, onEnded, onSwitchWorkstream, children }: SharePreviewProps) {
+  const openLinks = useFlag(FLAGS.openLinkShares, false);
   const [email, setEmail] = useState('');
   // The name of the person picked from the suggestions, kept with them in this browser's recent list.
   const [pickedName, setPickedName] = useState<string | undefined>();
@@ -58,11 +94,26 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
   // Shared with them already: their share was renewed, same link.
   const [notice, setNotice] = useState<string | null>(null);
   const now = Date.now();
+  // Nobody named: an open link, for anyone signed in to termag who opens it.
+  const named = email.trim() !== '';
 
   const reload = useCallback(() => {
     previewSharesApi.list(projectId).then(all => setShares(all.filter(s => s.workstream === workstream)), () => setShares([]));
   }, [projectId, workstream]);
-  useEffect(() => { reload(); }, [reload]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { reload(); }, [reload, reloadKey]);
+  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+
+  // A share is tied to this workstream: the box says now whether a reviewer
+  // of its dev stack would get in, or whose stack would refuse them.
+  const [stack, setStack] = useState<PreviewStackCheck | null>(null);
+  useEffect(() => {
+    setStack(null);
+    if (manual) return;
+    let current = true;
+    previewSharesApi.stackCheck(projectId, workstream).then(r => { if (current) setStack(r); }, () => {});
+    return () => { current = false; };
+  }, [projectId, workstream, manual, reloadKey]);
 
   const copy = async (shareId: string, linkPath?: string | null) => {
     try {
@@ -81,12 +132,12 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
       const recipe = manual
         ? { kind: 'manual' as const, origins: origins.split(/[\s,]+/).map(o => o.trim()).filter(Boolean) }
         : undefined;
-      const made = await previewSharesApi.create(projectId, { email: email.trim(), workstream, ttlHours: ttl, ...(recipe ? { recipe } : {}) });
-      rememberPerson(browserStorage(), { email: email.trim(), displayName: pickedName });
+      const made = await previewSharesApi.create(projectId, { ...(named ? { email: email.trim() } : { audience: 'link' as const }), workstream, ttlHours: ttl, ...(recipe ? { recipe } : {}) });
+      if (named) rememberPerson(browserStorage(), { email: email.trim(), displayName: pickedName });
       setEmail('');
       setPickedName(undefined);
-      if (made.renewed) setNotice(`Already shared with ${email.trim()}: their share is renewed, same link (copied).`);
-      await copy(made.id);
+      if (made.renewed) setNotice(named ? `Already shared with ${email.trim()}: their share is renewed, same link (copied).` : 'Already shared by link: it is renewed, same link (copied).');
+      await copy(made.id, made.linkPath);
       reload();
     } catch (err) {
       setError(errorText(err));
@@ -95,9 +146,9 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
     }
   };
 
-  const act = async (fn: () => Promise<unknown>) => {
+  const act = async (fn: () => Promise<unknown>, after?: () => void) => {
     setError(null);
-    try { await fn(); } catch (err) { setError(errorText(err)); }
+    try { await fn(); after?.(); } catch (err) { setError(errorText(err)); }
     reload();
   };
 
@@ -105,7 +156,7 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
   const lifetimes = [...new Set([defaultTtlHours, ...LIFETIMES])].sort((a, b) => a - b);
 
   return (
-    <Dialog title={`Share the preview of ${workstream}`} onClose={onClose} className="share-dialog" closeDisabled={busy}>
+    <>
       <p className="share-dialog-lede">
         They get their own browser on this box, kept to the app you share, and nothing else of the project: no terminals, no agent, no files.
         What they do in the app lands in your dev stack.
@@ -113,7 +164,8 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
       <form className="share-dialog-form" onSubmit={create}>
         <label>
           <span>Their termag email</span>
-          <PersonPicker required autoFocus value={email} onChange={(next, name) => { setEmail(next); setPickedName(name); }} placeholder="name or name@example.com" />
+          <PersonPicker required={!openLinks} autoFocus={autoFocus} value={email} onChange={(next, name) => { setEmail(next); setPickedName(name); }} placeholder="name or name@example.com" />
+          {openLinks && <span className="usage-dim">Leave it empty for a link anyone signed in to termag can open.</span>}
         </label>
         <label>
           <span>For</span>
@@ -134,10 +186,20 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
               placeholder="127.0.0.1:3000 127.0.0.1:3001"
             />
           )}
+          {!manual && stack?.checked && !stack.ok && (
+            <div className="share-dialog-stack" role="status">
+              {stack.message}
+              {stack.holder?.workstream && onSwitchWorkstream && (
+                <button type="button" className="btn-tiny" onClick={() => onSwitchWorkstream(stack.holder!.workstream!)}>Share {stack.holder.workstream} instead</button>
+              )}
+            </div>
+          )}
         </fieldset>
         <div className="share-dialog-actions">
           {atPath && <span className="usage-dim share-dialog-at" title={atPath}>Links open at {atPath}</span>}
-          <button type="submit" className="btn-primary" disabled={busy || !email.trim()}>{busy ? 'Sharing…' : 'Share and copy link'}</button>
+          <button type="submit" className="btn-primary" disabled={busy || (!named && !openLinks)}>
+            {busy ? 'Sharing…' : named || !openLinks ? 'Share and copy link' : 'Share with anyone and copy link'}
+          </button>
         </div>
       </form>
       {error && <div className="share-dialog-error" role="alert">{error}</div>}
@@ -152,6 +214,12 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
                 <>
                   <strong>Link on <a href={s.pr.url} target="_blank" rel="noreferrer">{s.pr.repo.split('/')[1]}#{s.pr.number}</a></strong>
                   <span className="usage-dim"> anyone signed in to termag, until it merges or closes</span>
+                  {s.checkoutDir && <div className="usage-dim" title={s.checkoutDir}>from {checkoutLabel(s.checkoutDir)}</div>}
+                </>
+              ) : s.audience === 'link' ? (
+                <>
+                  <strong>Open link</strong>
+                  <span className="usage-dim"> anyone signed in to termag who opens it</span>
                 </>
               ) : (
                 <>
@@ -178,20 +246,27 @@ export function ShareDialog({ projectId, workstream, defaultTtlHours, atPath = n
               {s.blockedOrigins.length > 0 && (
                 <div className="share-dialog-blocked">Their browser was refused {s.blockedOrigins.join(', ')}: not part of this share.</div>
               )}
+              {s.lastRefusal && (
+                <div className="share-dialog-blocked">
+                  Refused {relative(s.lastRefusal.at, now)}: “{s.lastRefusal.message}”
+                  {s.lastRefusal.holder && <> The stack running was started from <span title={s.lastRefusal.holder}>{checkoutLabel(s.lastRefusal.holder)}</span>.</>}
+                </div>
+              )}
             </div>
             <div className="share-dialog-row-actions">
               <button type="button" onClick={() => copy(s.id, s.linkPath)}>{copied === s.id ? 'Copied' : 'Copy link'}</button>
               <button type="button" onClick={() => window.open(`/termag/preview/${s.id}?as=guest`, '_blank', 'noopener')}>Preview as guest</button>
               {/* Extending sets the end to the chosen lifetime from now: offered only when that is later. A PR's link lasts as its PR does. */}
-              {s.audience !== 'link' && now + ttl * 3_600_000 > Date.parse(s.expiresAt) && (
+              {!(s.audience === 'link' && s.pr) && now + ttl * 3_600_000 > Date.parse(s.expiresAt) && (
                 <button type="button" onClick={() => act(() => previewSharesApi.extend(projectId, s.id, ttl))}>Extend to {hoursLabel(ttl)} from now</button>
               )}
-              <button type="button" className="btn-danger" onClick={() => act(() => previewSharesApi.revoke(projectId, s.id))}>Stop sharing</button>
+              <button type="button" className="btn-danger" onClick={() => act(() => previewSharesApi.revoke(projectId, s.id), () => onEnded?.(s.id))}>Stop sharing</button>
             </div>
           </div>
         ))}
       </div>
-      <PrPreviewSettings projectId={projectId} />
-    </Dialog>
+      {children}
+      <PrPreviewSettings projectId={projectId} byHand={byHand} />
+    </>
   );
 }

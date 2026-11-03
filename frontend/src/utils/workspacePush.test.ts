@@ -5,6 +5,7 @@ describe('workspaceChangeFromPush', () => {
   it('names the list a workspace push says changed', () => {
     expect(workspaceChangeFromPush({ type: 'workspace', what: 'projects' })).toBe('projects');
     expect(workspaceChangeFromPush({ type: 'workspace', what: 'boxes' })).toBe('boxes');
+    expect(workspaceChangeFromPush({ type: 'workspace', what: 'prs' })).toBe('prs');
   });
 
   it('ignores other frames and lists it does not know', () => {

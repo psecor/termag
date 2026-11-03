@@ -10,11 +10,11 @@
   align-self: flex-end;
   max-width: 88%;
   background: var(--accent-dim);
-  color: #fff;
+  color: var(--text-on-fill);
   padding: 8px 12px;
   border-radius: 14px 14px 4px 14px;
 }
-.m-block-you .m-block-who { color: rgba(255, 255, 255, 0.7); }
+.m-block-you .m-block-who { color: color-mix(in srgb, var(--text-on-fill) 70%, transparent); }
 .m-block-agent {
   align-self: flex-start;
   max-width: 94%;
@@ -118,3 +118,15 @@
 }
 .m-draft-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
 .m-draft-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-primary); }
+/* A box-drawn table whose grid did not parse (chat/boxTable.ts): monospace,
+   rows intact, scrolled sideways rather than wrapped. One that parses is a
+   markdown table (.md-table). */
+.m-grid {
+  margin: 6px 0;
+  font-size: 12px;
+  line-height: 1.2;  /* box glyphs meet row to row */
+  font-style: normal;
+  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  white-space: pre;
+  overflow-x: auto;
+}

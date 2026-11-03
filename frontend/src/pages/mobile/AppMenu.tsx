@@ -1,6 +1,6 @@
 // The home screen's ⋯ menu: notifications (when push
 // is available to this user), install, reload (a standalone window has no
-// browser reload), and Full UI.
+// browser reload), and Lab.
 import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { optOutOfMobile } from '../../mobile/redirect';
@@ -30,7 +30,7 @@ export function AppMenu() {
   if (install === 'ios-instructions') actions.push({ label: 'Add to Home Screen…', onClick: () => setOpen('install-ios') });
   actions.push(
     { label: 'Reload app', onClick: reloadApp },
-    { label: 'Full UI', onClick: () => { optOutOfMobile(); navigate('/'); } },
+    { label: 'Lab', onClick: () => { optOutOfMobile(); navigate('/'); } },
   );
 
   return (

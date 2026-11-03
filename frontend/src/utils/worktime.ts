@@ -1,18 +1,28 @@
 import type { WorktimeResponse, WorktimeDay } from '../services/api';
 import { PROVIDERS, ProviderConfig } from '../providers/registry';
+import { localToday } from './dates';
 
 /** The pseudo-provider under which the user's own typing time is banked. */
 export const HUMAN = 'human';
+
+/**
+ * Today's worktime day: the one termag answers as the reader's (it banks
+ * working time in the zone the web UI sends), else this browser's own.
+ */
+export function worktimeToday(wt: Pick<WorktimeResponse, 'today'>): string {
+  return wt.today ?? localToday();
+}
 
 // Thermometer calibration. Fill heights use MAX (8h = full tube); the % readouts
 // divide by MID (4h = "100%"). Two denominators on purpose.
 export const THERMO_MAX_MS = 8 * 3_600_000;
 export const THERMO_MID_MS = 4 * 3_600_000;
 
-// Series colors for signals that aren't a provider.
-export const SWITCH_COLOR = '#5eead4'; // teal — project switches
-export const WARP_COLOR = '#a78bfa';   // purple — flow/hyperspace
-export const CTX_COLOR = '#58a6ff';    // blue — context fallback when a project has no color
+// Series colors for signals that aren't a provider: App.css tokens with a
+// value per palette (pages/dashboard/chartPalette.ts HUE).
+export const SWITCH_COLOR = 'var(--series-teal)';   // project switches
+export const WARP_COLOR = 'var(--series-purple)';   // flow/hyperspace
+export const CTX_COLOR = 'var(--series-blue)';      // context fallback when a project has no color
 
 export type WtDayData = Record<string, WorktimeDay>; // provider → { totalMs, sessions }
 

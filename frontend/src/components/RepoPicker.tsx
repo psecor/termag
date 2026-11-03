@@ -11,6 +11,7 @@ import {
   type RepoCatalog,
   type RepoPick,
 } from '../utils/repoPick';
+import type { ListedPick } from '../utils/multiRepo';
 
 export function RepoPicker({
   value,
@@ -18,6 +19,8 @@ export function RepoPicker({
   autoFocus,
   showPaste = true,
   dropdown = false,
+  more = [],
+  onToggle,
 }: {
   value: RepoPick;
   onChange: (next: RepoPick) => void;
@@ -26,6 +29,14 @@ export function RepoPicker({
   showPaste?: boolean;
   /** The repositories open under the search field as a list, only while it has focus (the simple UI). */
   dropdown?: boolean;
+  /** Listed repositories ticked after `value`. */
+  more?: readonly ListedPick[];
+  /**
+   * Multi-select, for the inline list only: a click on a listed repository,
+   * or on a starter that is listed, toggles it; a starter that is not listed
+   * toggles as the only pick; empty clears the selection.
+   */
+  onToggle?: (repo: ListedPick) => void;
 }) {
   const [templates, setTemplates] = useState<ProjectTemplateInfo[]>([]);
   const [catalog, setCatalog] = useState<RepoCatalog | null>(null);
@@ -54,28 +65,51 @@ export function RepoPicker({
     return group.repos.filter(repo => repo.fullName.toLowerCase().includes(q));
   }
 
+  const toggle = dropdown ? undefined : onToggle;
+
   function chooseStarter(template: ProjectTemplateInfo) {
     const key = repoKey(template.repoUrl);
     const row = key && catalog
       ? catalog.groups.flatMap(group => group.repos).find(repo => repoKey(githubRepoUrl(repo.fullName)) === key)
       : undefined;
+    if (toggle && row) {
+      toggle({ kind: 'listed', fullName: row.fullName, defaultBranch: row.defaultBranch });
+      return;
+    }
+    if (toggle && starterSelected(template)) {
+      onChange({ kind: 'empty' });
+      return;
+    }
     onChange(row
       ? { kind: 'listed', fullName: row.fullName, defaultBranch: row.defaultBranch }
       : { kind: 'starter', templateId: template.id, url: template.repoUrl });
   }
 
+  function listedSelected(fullName: string): boolean {
+    return (value.kind === 'listed' && value.fullName === fullName) || more.some(r => r.fullName === fullName);
+  }
+
   function starterSelected(template: ProjectTemplateInfo): boolean {
     if (value.kind === 'starter') return value.templateId === template.id;
-    if (value.kind !== 'listed') return false;
-    return repoKey(githubRepoUrl(value.fullName)) === repoKey(template.repoUrl);
+    const key = repoKey(template.repoUrl);
+    const ticked = value.kind === 'listed' ? [value, ...more] : more;
+    return ticked.some(r => repoKey(githubRepoUrl(r.fullName)) === key);
+  }
+
+  function chooseListed(repo: CatalogRepo) {
+    const next: ListedPick = { kind: 'listed', fullName: repo.fullName, defaultBranch: repo.defaultBranch };
+    if (toggle) toggle(next);
+    else onChange(next);
   }
 
   return (
     <div className="npf-field">
       <label htmlFor="npf-repo-search">Repository</label>
+      {toggle && <div className="npf-note usage-dim">Pick one, or several to work across them.</div>}
       <button
         type="button"
         className={value.kind === 'empty' ? 'npf-repo is-selected' : 'npf-repo'}
+        aria-pressed={toggle ? value.kind === 'empty' : undefined}
         onClick={() => onChange({ kind: 'empty' })}
       >
         empty: a fresh directory with AGENTS.md and CLAUDE.md
@@ -85,6 +119,7 @@ export function RepoPicker({
           key={template.id}
           type="button"
           className={starterSelected(template) ? 'npf-repo is-selected' : 'npf-repo'}
+          aria-pressed={toggle ? starterSelected(template) : undefined}
           onClick={() => chooseStarter(template)}
         >
           {template.label} — {template.blurb}
@@ -121,8 +156,9 @@ export function RepoPicker({
                 <button
                   key={repo.fullName}
                   type="button"
-                  className={value.kind === 'listed' && value.fullName === repo.fullName ? 'npf-repo is-selected' : 'npf-repo'}
-                  onClick={() => onChange({ kind: 'listed', fullName: repo.fullName, defaultBranch: repo.defaultBranch })}
+                  className={listedSelected(repo.fullName) ? 'npf-repo is-selected' : 'npf-repo'}
+                  aria-pressed={toggle ? listedSelected(repo.fullName) : undefined}
+                  onClick={() => chooseListed(repo)}
                 >
                   {repo.fullName}
                 </button>

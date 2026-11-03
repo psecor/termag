@@ -1,8 +1,11 @@
-// The sidebar's Archived list (Henry's option C): an archived chat's box is
+// The sidebar's Archived list (option C): an archived chat's box is
 // stopped or hibernated, so it costs only storage. Reopen starts the box again
 // with the history on its disk. Delete permanently terminates the box, and
 // the history on it, only when this chat is the last project there; a shared
-// box stays. The confirm says which of those will happen.
+// box stays. The confirm says which of those will happen. Under the chrome
+// refresh the list is drawn as the refresh's sidebar is (ArchivedRows.tsx);
+// with it off, as below. A load that fails on the orchestrator's side (a
+// deploy rolling it) is asked again, so the list doesn't stay hidden.
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useMatch, useNavigate } from 'react-router-dom';
@@ -10,8 +13,10 @@ import { useProjects } from '../../contexts/ProjectContext';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { chatsApi, type ArchivedChat } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
-import { announceChatsChanged, applyRunningBoxes, archiveSettling, archivedBoxLabel, canReopen, CHATS_CHANGED_EVENT, chatsAfterPermanentDelete, clearRunningBox, deleteLeavesOpenChat, offerRunningBox, permanentDeleteDetail, reopenCatchUp, reopenOpensChat, runningBoxSnapshot, settleRunningBoxes, subscribeRunningBoxes } from '../../chat/archive';
+import { announceChatsChanged, applyRunningBoxes, archiveSettling, archivedBoxLabel, archivedLoadRetries, archivedRetryDelayMs, canReopen, reopenTitle, CHATS_CHANGED_EVENT, chatsAfterPermanentDelete, clearRunningBox, deleteLeavesOpenChat, offerRunningBox, permanentDeleteDetail, reopenCatchUp, reopenOpensChat, runningBoxSnapshot, settleRunningBoxes, subscribeRunningBoxes } from '../../chat/archive';
 import { chatHref, repoSlug } from '../../chat/simpleChat';
+import { ArchivedDeleteConfirm, ArchivedSection } from './ArchivedRows';
+import { useChatChrome } from './chatChrome';
 
 const SETTLE_POLL_MS = 5000;
 
@@ -20,6 +25,7 @@ function apiError(err: unknown, fallback: string): string {
 }
 
 export function ArchivedChats() {
+  const { refresh } = useChatChrome();
   const navigate = useNavigate();
   // The sidebar sits beside the conversation route, so this match is the
   // chat on screen. useParams would not see :projectId from here.
@@ -41,12 +47,29 @@ export function ArchivedChats() {
   // A GET that started before a delete must not put the deleted chat, or its
   // old otherProjects, back over the recount below.
   const loadGen = useRef(0);
-  const load = useCallback(() => {
+  // A failed load is asked again after a while (archivedRetryDelayMs), until one lands or the sidebar goes.
+  const retry = useRef<{ timer: ReturnType<typeof setTimeout> | null; failures: number; gone: boolean }>({ timer: null, failures: 0, gone: false });
+  const load = useCallback(function loadArchived() {
     const gen = ++loadGen.current;
+    const again = retry.current;
+    if (again.timer) { clearTimeout(again.timer); again.timer = null; }
     chatsApi.archived().then(rows => {
       if (gen !== loadGen.current) return;
+      again.failures = 0;
       setChats(rows);
-    }).catch(() => {});
+    }).catch(err => {
+      if (gen !== loadGen.current || again.gone || !archivedLoadRetries(err)) return;
+      again.timer = setTimeout(loadArchived, archivedRetryDelayMs(again.failures++));
+    });
+  }, []);
+  useEffect(() => {
+    const again = retry.current;
+    again.gone = false;
+    return () => {
+      again.gone = true;
+      if (again.timer) clearTimeout(again.timer);
+      again.timer = null;
+    };
   }, []);
   // A recovery remembered in this tab is stale once the row says the box is parked or gone.
   useEffect(() => {
@@ -154,6 +177,20 @@ export function ArchivedChats() {
   };
 
   if (!chats || chats.length === 0) return null;
+  if (refresh) {
+    return (
+      <>
+        <ArchivedSection chats={chats} open={open} onOpenChange={setOpen} activeId={openId} busy={busy} pendingId={pendingId}
+          recoveries={recoveries} notice={notice} error={error}
+          onReopen={c => { void reopen(c); }}
+          onBoxRunning={c => navigate(chatHref(c.id, 'main'))}
+          onDelete={c => setConfirmDeleteId(c.id)} />
+        {confirmDelete && (
+          <ArchivedDeleteConfirm chat={confirmDelete} onConfirm={() => { void remove(confirmDelete); }} onCancel={() => setConfirmDeleteId(null)} />
+        )}
+      </>
+    );
+  }
   return (
     <div className="chat-archived">
       <button type="button" className="chat-archived-toggle" onClick={() => setOpen(o => !o)} aria-expanded={open}>
@@ -173,8 +210,8 @@ export function ArchivedChats() {
                     title="The box is still running. Stop or hibernate it."
                     onClick={() => navigate(chatHref(c.id, 'main'))}>Box still running</button>
                 )}
-                <button type="button" className="btn-tiny chat-archived-reopen" disabled={busy !== null || pendingId !== null || !canReopen(c.box?.status)}
-                  title={canReopen(c.box?.status) ? 'Start the box again and open the session' : 'Wait for the box to settle'}
+                <button type="button" className="btn-tiny chat-archived-reopen" disabled={busy !== null || pendingId !== null || !canReopen(c.box?.status, c.storedHistory)}
+                  title={reopenTitle(c.box?.status, c.storedHistory)}
                   onClick={() => { void reopen(c); }}>{busy === c.id || pendingId === c.id ? '…' : 'Reopen'}</button>
                 <button type="button" className="btn-tiny chat-archived-delete" disabled={busy !== null}
                   title="Delete this session and its history for good. Asks first."

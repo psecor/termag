@@ -1,20 +1,35 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { FLAGS, useFlag } from '../../flags';
 import { useTheme } from '../../theme/ThemeProvider';
-import { BASE_BACKGROUND_COLOR, DEFAULT_THEME, ThemeSettings, normalizeHexColor } from '../../theme/schema';
+import { themePalette } from '../../theme/apply';
+import { BASE_BACKGROUND_COLORS, DEFAULT_THEME, TerminalFont, ThemePalette, ThemeSettings, normalizeHexColor } from '../../theme/schema';
+import { terminalFontFamily } from '../../components/terminalFont';
 import { DocsLink } from './DocsLink';
 
-// Solid backdrops that read well under the light-on-dark text. The first is
-// the base colour the starfield fades to, so picking "Solid color" stops the
-// stars without changing the look.
-const PRESETS: { color: string; name: string }[] = [
-  { color: BASE_BACKGROUND_COLOR, name: 'Default' },
-  { color: '#000000', name: 'Black' },
-  { color: '#0b1a2e', name: 'Navy' },
-  { color: '#111827', name: 'Slate' },
-  { color: '#1a1026', name: 'Plum' },
-  { color: '#0f1f17', name: 'Forest' },
-  { color: '#1f1510', name: 'Umber' },
-];
+// Solid backdrops that read well under each palette's text. The first is the
+// palette's base (in dark, the colour the starfield fades to), so picking
+// "Solid color" changes nothing but stopping the stars. A colour the user
+// saved applies as it is in either palette; only the offer changes.
+const PRESETS: Record<ThemePalette, { color: string; name: string }[]> = {
+  dark: [
+    { color: BASE_BACKGROUND_COLORS.dark, name: 'Default' },
+    { color: '#000000', name: 'Black' },
+    { color: '#0b1a2e', name: 'Navy' },
+    { color: '#111827', name: 'Slate' },
+    { color: '#1a1026', name: 'Plum' },
+    { color: '#0f1f17', name: 'Forest' },
+    { color: '#1f1510', name: 'Umber' },
+  ],
+  light: [
+    { color: BASE_BACKGROUND_COLORS.light, name: 'Default' },
+    { color: '#f6f8fa', name: 'Paper' },
+    { color: '#eef1f5', name: 'Mist' },
+    { color: '#e7f0fa', name: 'Sky' },
+    { color: '#f0ecf8', name: 'Lavender' },
+    { color: '#e8f4ec', name: 'Mint' },
+    { color: '#f6f0e6', name: 'Sand' },
+  ],
+};
 
 // A colour-picker drag fires a change per pixel; persist once the hand stops.
 const SAVE_DEBOUNCE_MS = 400;
@@ -27,24 +42,44 @@ function sameTheme(a: ThemeSettings, b: ThemeSettings): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// Reset sends an explicit dark palette, no turkeys and Maple Mono: the server
+// fills a theme's absent optional keys from the stored one, so DEFAULT_THEME
+// alone would keep light (and the turkeys, and JetBrains Mono).
+const RESET_THEME: ThemeSettings = { ...DEFAULT_THEME, palette: 'dark', starfieldTurkeys: false, terminalFont: 'maple' };
+
+// Each choice shows a line of terminal text in its own face, italic included:
+// the italic is where the two differ most (Maple Mono's is cursive).
+const TERMINAL_FONTS: { value: TerminalFont; name: string; meta: string }[] = [
+  { value: 'maple', name: 'Maple Mono', meta: 'Rounder, with a cursive italic. The default.' },
+  { value: 'jetbrains', name: 'JetBrains Mono', meta: 'The face of code blocks and the file viewer, with a plain slanted italic.' },
+];
+
 /**
- * Settings → Appearance: the workspace background (the hyperspace starfield
- * or a solid colour), whether the sidebar footer shows the activity
- * indicators, and whether the project list offers MetaTerm. Later theme axes (palette, terminal colours) become further
- * groups in this section.
+ * Settings → Appearance: the palette (dark or light, behind
+ * light-mode-enabled), the workspace background (the hyperspace starfield
+ * or a solid colour), the font terminals are set in, whether the sidebar
+ * footer shows the activity indicators, whether the project list offers MetaTerm, and whether it leaves
+ * out the boxes and projects made for `termag ask`, and (behind
+ * thanksgiving-turkeys-enabled) whether the starfield flies turkeys. Later theme axes
+ * (terminal colours) become further groups in this section.
  */
 export function AppearanceSection() {
   const { theme, saved, preview, save, saving } = useTheme();
+  const lightModeEnabled = useFlag(FLAGS.lightMode, false);
+  const turkeysEnabled = useFlag(FLAGS.thanksgivingTurkeys, false);
   const [error, setError] = useState('');
+  const palette = themePalette(theme);
   // The colour "Solid color" returns to after a spell on the starfield. It
   // follows the colour on screen (saved or previewed) rather than each pick,
   // so a save that fails never leaves it holding a colour that was neither.
-  const [solidColor, setSolidColor] = useState(
-    saved.background.mode === 'solid' ? saved.background.color : BASE_BACKGROUND_COLOR,
+  // Null until there is one: the palette's base, which follows a palette switch.
+  const [solidColor, setSolidColor] = useState<string | null>(
+    saved.background.mode === 'solid' ? saved.background.color : null,
   );
   useEffect(() => {
     if (theme.background.mode === 'solid') setSolidColor(theme.background.color);
   }, [theme]);
+  const returnColor = solidColor ?? BASE_BACKGROUND_COLORS[palette];
   // The hex field while it is being edited; null means it mirrors the colour
   // on screen, so when a failed save drops the preview the field follows.
   const [hexDraft, setHexDraft] = useState<string | null>(null);
@@ -62,7 +97,7 @@ export function AppearanceSection() {
   }, [preview]);
 
   const mode = theme.background.mode;
-  const shownColor = theme.background.mode === 'solid' ? theme.background.color : solidColor;
+  const shownColor = theme.background.mode === 'solid' ? theme.background.color : returnColor;
 
   // Every save, Reset included, supersedes a colour drag still waiting out its
   // debounce; otherwise that timer would fire afterwards and undo this save.
@@ -76,12 +111,24 @@ export function AppearanceSection() {
     }
   }
 
+  // Sent explicitly for dark too, so the server's merge cannot keep a stored light.
+  function choosePalette(next: ThemePalette) {
+    void commit({ ...theme, palette: next });
+  }
+
+  // Sent explicitly for Maple Mono too, for the same reason. Terminals read
+  // it when they open, which is on the way back from this page (Terminal.tsx).
+  function chooseTerminalFont(next: TerminalFont) {
+    void commit({ ...theme, terminalFont: next });
+  }
+  const terminalFont: TerminalFont = theme.terminalFont ?? 'maple';
+
   function solid(color: string): ThemeSettings {
     return { ...theme, background: { mode: 'solid', color } };
   }
 
   function chooseMode(next: 'hyperspace' | 'solid') {
-    void commit(next === 'solid' ? solid(solidColor) : { ...theme, background: { mode: 'hyperspace' } });
+    void commit(next === 'solid' ? solid(returnColor) : { ...theme, background: { mode: 'hyperspace' } });
   }
 
   // `immediate` saves now (swatch, hex field); otherwise preview and save after the drag settles.
@@ -112,11 +159,40 @@ export function AppearanceSection() {
         Appearance <DocsLink anchor="appearance" topic="Appearance" />
       </div>
       <div className="dash-card">
-        <p className="settings-hint">
-          What sits behind the workspace. The sidebar and terminals are translucent, so a solid
-          color tints the whole page. Your browser's reduced-motion setting freezes the starfield;
-          a solid color removes it.
-        </p>
+        {lightModeEnabled && (
+          <div className="settings-choice" role="radiogroup" aria-label="Palette">
+            {([
+              ['dark', 'Dark', 'Light text on a dark page.'],
+              ['light', 'Light', 'Dark text on a light page.'],
+            ] as const).map(([value, name, meta]) => (
+              <label key={value} className="settings-radio" data-checked={palette === value || undefined}>
+                <input
+                  type="radio"
+                  name="palette"
+                  checked={palette === value}
+                  disabled={saving}
+                  onChange={() => choosePalette(value)}
+                />
+                <span className="settings-row-text">
+                  <span className="settings-row-name">{name}</span>
+                  <span className="settings-row-meta">{meta}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        )}
+        {palette === 'light' ? (
+          <p className="settings-hint">
+            What sits behind the workspace. The sidebar is translucent, so a solid color tints the
+            page; terminals stay dark. The starfield is drawn in the dark palette only.
+          </p>
+        ) : (
+          <p className="settings-hint">
+            What sits behind the workspace. The sidebar and terminals are translucent, so a solid
+            color tints the whole page. Your browser's reduced-motion setting freezes the starfield;
+            a solid color removes it.
+          </p>
+        )}
         {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
         <div className="settings-choice" role="radiogroup" aria-label="Background">
           <label className="settings-radio" data-checked={mode === 'hyperspace' || undefined}>
@@ -129,7 +205,11 @@ export function AppearanceSection() {
             />
             <span className="settings-row-text">
               <span className="settings-row-name">Hyperspace starfield</span>
-              <span className="settings-row-meta">Speeds up with agent activity.</span>
+              <span className="settings-row-meta">
+                {palette === 'light'
+                  ? 'Speeds up with agent activity. Dark palette only: light shows a plain backdrop.'
+                  : 'Speeds up with agent activity.'}
+              </span>
             </span>
           </label>
           <label className="settings-radio" data-checked={mode === 'solid' || undefined}>
@@ -146,6 +226,24 @@ export function AppearanceSection() {
             </span>
           </label>
         </div>
+        {mode === 'hyperspace' && turkeysEnabled && (
+          <div className="settings-choice">
+            <label className="settings-radio" data-checked={theme.starfieldTurkeys || undefined}>
+              <input
+                type="checkbox"
+                checked={theme.starfieldTurkeys === true}
+                disabled={saving}
+                onChange={e => void commit({ ...theme, starfieldTurkeys: e.target.checked })}
+              />
+              <span className="settings-row-text">
+                <span className="settings-row-name">Thanksgiving turkeys</span>
+                <span className="settings-row-meta">
+                  Swaps the starfield's stars for little turkeys, flying faster as your agents work.
+                </span>
+              </span>
+            </label>
+          </div>
+        )}
         {mode === 'solid' && (
           <div className="settings-color">
             <div className="settings-color-row">
@@ -167,7 +265,7 @@ export function AppearanceSection() {
                 onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); commitHex(); } }}
               />
               <div className="settings-swatches" role="list" aria-label="Preset colors">
-                {PRESETS.map(p => (
+                {PRESETS[palette].map(p => (
                   <button
                     key={p.color}
                     type="button"
@@ -188,6 +286,31 @@ export function AppearanceSection() {
             </div>
           </div>
         )}
+        <div className="settings-choice" role="radiogroup" aria-label="Terminal font">
+          <p className="settings-hint">The font terminals are set in. Code blocks and the file viewer stay in JetBrains Mono.</p>
+          {TERMINAL_FONTS.map(f => (
+            <label key={f.value} className="settings-radio" data-checked={terminalFont === f.value || undefined}>
+              <input
+                type="radio"
+                name="terminal-font"
+                checked={terminalFont === f.value}
+                disabled={saving}
+                onChange={() => chooseTerminalFont(f.value)}
+              />
+              <span className="settings-row-text">
+                <span className="settings-row-name">{f.name}</span>
+                <span className="settings-row-meta">{f.meta}</span>
+                <span
+                  className="settings-font-sample"
+                  aria-hidden="true"
+                  style={{ fontFamily: terminalFontFamily('var(--font-mono)', f.value) }}
+                >
+                  $ git log --oneline <i>fell back to the cache</i>
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
         <div className="settings-choice">
           <label className="settings-radio" data-checked={theme.sidebarActivity || undefined}>
             <input
@@ -220,8 +343,26 @@ export function AppearanceSection() {
             </span>
           </label>
         </div>
+        <div className="settings-choice">
+          <label className="settings-radio" data-checked={theme.sidebarHideAskBoxes || undefined}>
+            <input
+              type="checkbox"
+              checked={theme.sidebarHideAskBoxes}
+              disabled={saving}
+              onChange={e => void commit({ ...theme, sidebarHideAskBoxes: e.target.checked })}
+            />
+            <span className="settings-row-text">
+              <span className="settings-row-name">Hide ask boxes from the Projects list</span>
+              <span className="settings-row-meta">
+                Leaves out the boxes and projects <code>termag ask --new-box</code> makes, so the list shows only
+                what you started. Nothing happens to them: Boxes and search still list them, and the project you
+                have open stays.
+              </span>
+            </span>
+          </label>
+        </div>
         {!sameTheme(saved, DEFAULT_THEME) && (
-          <button type="button" className="settings-link" disabled={saving} onClick={() => void commit(DEFAULT_THEME)}>
+          <button type="button" className="settings-link" disabled={saving} onClick={() => void commit(RESET_THEME)}>
             Reset to defaults
           </button>
         )}

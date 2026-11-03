@@ -5,7 +5,7 @@ import { fmtDuration, fmtDurationShort } from '../../utils/format';
 import { utcHourToLocalLabel } from '../../utils/dates';
 import { SWITCH_COLOR, WARP_COLOR } from '../../utils/worktime';
 import { ChartCard } from './ChartCard';
-import { TICK, GRID_STROKE, BAR_MAX, CHART_HEIGHT, DashTooltip } from './chartTheme';
+import { TICK, GRID_STROKE, BAR_MAX, CHART_HEIGHT, CURSOR, DashTooltip } from './chartTheme';
 import { RangeKeys, shortDate } from './range';
 
 interface Props { visits: VisitsStats | null; warp: WarpSeries | null; keys: RangeKeys; stale: boolean }
@@ -42,7 +42,7 @@ export function RhythmCharts({ visits, warp, keys, stale }: Props) {
             <CartesianGrid vertical={false} stroke={GRID_STROKE} />
             <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
             <YAxis tick={TICK} tickLine={false} axisLine={false} width={28} allowDecimals={false} />
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} />} />
+            <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} />} />
             <Bar dataKey="switches" name="switches" fill={SWITCH_COLOR} maxBarSize={BAR_MAX} radius={[4, 4, 0, 0]} isAnimationActive={false} />
           </BarChart>
         </ResponsiveContainer>

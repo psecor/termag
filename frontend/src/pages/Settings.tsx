@@ -10,6 +10,7 @@ import { BriefingSection } from './settings/BriefingSection';
 import { McpSection } from './settings/McpSection';
 import { NotificationsSection } from './settings/NotificationsSection';
 import { DocsLink } from './settings/DocsLink';
+import { FileSharingSection } from './settings/FileSharingSection';
 import { settingsBackLink } from './settings/backLink';
 
 /**
@@ -44,6 +45,7 @@ export default function Settings() {
         <BriefingSection />
         <NotificationsSection />
         <AppearanceSection />
+        <FileSharingSection />
         {/* Sign out lives here rather than the sidebar header: rarely used, and
             the header slot is better spent on the Recents switcher. */}
         <section className="dash-section settings-account" aria-labelledby="account-h">

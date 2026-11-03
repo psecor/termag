@@ -1,0 +1,25 @@
+/* Sparkline.tsx. The line is the de-emphasis ink with the latest point in the accent, or both in a tone. */
+.genui-sparkline {
+  --genui-spark: var(--text-secondary);
+  --genui-spark-end: var(--accent);
+  display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; max-width: 100%;
+}
+.genui-sparkline[data-tone="success"] { --genui-spark: var(--success); --genui-spark-end: var(--success); }
+.genui-sparkline[data-tone="warning"] { --genui-spark: var(--warning); --genui-spark-end: var(--warning); }
+.genui-sparkline[data-tone="danger"] { --genui-spark: var(--danger); --genui-spark-end: var(--danger); }
+
+.genui-sparkline-plot { position: relative; display: inline-flex; flex: none; }
+.genui-sparkline-plot svg { display: block; overflow: visible; }
+.genui-sparkline-line { fill: none; stroke: var(--genui-spark); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+/* r=5 under a 2px surface ring: an 8px dot that stays clear of the line running into it. */
+.genui-sparkline-end, .genui-sparkline-hover { stroke: var(--bg-surface); stroke-width: 2; }
+.genui-sparkline-end { fill: var(--genui-spark-end); }
+.genui-sparkline-hover { fill: var(--genui-spark); }
+
+.genui-sparkline-tip {
+  position: absolute; bottom: calc(100% + 4px); transform: translateX(-50%);
+  white-space: nowrap; pointer-events: none; z-index: 1;
+}
+.genui-sparkline-tip .dash-tip-value { min-width: 0; }
+
+.genui-sparkline-last { font-size: 12.5px; font-weight: 600; color: var(--text-primary); white-space: nowrap; }

@@ -1,5 +1,5 @@
 // One session row, shared by the home list and the Search tab, plus the
-// row's ⋯ action sheet (pin / archive / open in full UI).
+// row's ⋯ action sheet (pin / archive / open in Lab).
 import React, { useCallback, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useProjects } from '../../contexts/ProjectContext';
@@ -9,6 +9,7 @@ import { fmtAge } from '../../utils/format';
 import { conversationHref, InboxRow, opensReview, stateSince, STATUS_GLYPH, statusLabel } from '../../mobile/inbox';
 import { optOutOfMobile } from '../../mobile/redirect';
 import { projectsApi } from '../../services/api';
+import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
 import { ActionSheet, ConfirmSheet, apiError } from './Sheet';
 
 function ctxLabel(tokens: number): string {
@@ -48,7 +49,7 @@ export function SessionRow({ row, now, recent, onMore, onOpen, href }: {
             {row.kind === 'automation' && <span className="m-automation" aria-label="automation run">⏱ </span>}
             {row.kind === 'cloud' && <span className="m-cloud" aria-label="cloud session">☁ </span>}
             {row.projectName}
-            {row.workstream !== 'main' && <span className="m-ws"> · {row.workstream}</span>}
+            {row.workstream !== 'main' && <span className="m-ws" title={workstreamTip(row) ?? undefined}> · {workstreamLabel(row)}</span>}
             {row.shared && <span className="m-owner"> ({row.owner})</span>}
           </span>
           {row.message && <span className="m-row-preview">{row.message}</span>}
@@ -117,7 +118,7 @@ export function useRowActions(): { open: (row: InboxRow) => void; sheets: React.
           actions={[
             { label: menuRow.pinned ? 'Unpin' : 'Pin', onClick: () => { void togglePin(menuRow); }, disabled: menuRow.shared },
             { label: 'Archive project…', onClick: () => setConfirmRow(menuRow), danger: true, disabled: menuRow.shared || menuRow.kind === 'metaterm' },
-            { label: 'Open in full UI', onClick: () => openFull(menuRow) },
+            { label: 'Open in Lab', onClick: () => openFull(menuRow) },
           ]}
         />
       )}

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Project, Workstream } from '../types';
-import { filterChoices, isWorkstreamName, linkedByText, scopedProjects, suggestPrPrompt, suggestWorkstreamName, workstreamChoices } from './workstreamChoices';
+import { filterChoices, isWorkstreamName, linkedByText, scopedProjects, suggestPrPrompt, suggestWorkstreamName, workstreamChoices, workstreamNameFromBranch } from './workstreamChoices';
 
 const ws = (name: string, lastActiveAt: string, over: Partial<Workstream> = {}): Workstream =>
   ({ id: name, projectId: 'p', name, branch: name, archived: false, lastActiveAt, createdAt: '', updatedAt: '', ...over });
@@ -52,6 +52,24 @@ describe('linkedByText', () => {
     expect(linkedByText('manual')).toBe('attached by you');
     expect(linkedByText('created')).toBe('opened from there');
     expect(linkedByText(undefined)).toBeNull();
+  });
+});
+
+describe('a workstream name from a branch', () => {
+  it('turns every slash and other character a name cannot hold into one dash', () => {
+    expect(workstreamNameFromBranch('skz/ABC-123/fix-login')).toBe('skz-ABC-123-fix-login');
+    expect(workstreamNameFromBranch('feat/v1.2 (draft)')).toBe('feat-v1-2-draft');
+    expect(workstreamNameFromBranch('/leading//double/')).toBe('leading-double');
+    expect(workstreamNameFromBranch('plain_name')).toBe('plain_name');
+  });
+  it('stays a name the backend takes: at most 64 characters, never a trailing dash', () => {
+    const long = workstreamNameFromBranch(`skz/${'x'.repeat(59)}/more`);
+    expect(long).toHaveLength(63);
+    expect(isWorkstreamName(long)).toBe(true);
+    expect(workstreamNameFromBranch('äö')).toBe('');
+    expect(workstreamNameFromBranch('main')).toBe('');
+    expect(workstreamNameFromBranch('run/20261020/0900')).toBe('');
+    expect(workstreamNameFromBranch('run/20261020/0900/2')).toBe('');
   });
 });
 

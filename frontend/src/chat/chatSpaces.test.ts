@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { SpaceBoxGrant, SpaceView } from '../services/api';
 import {
-  boxSpaceIndex, canStartChatIn, COLLAPSED_SPACES_KEY, ensureSpace, grantBox, groupBySpace, groupKey, initialSpaceChoice, pickableSpaces, readCollapsedSpaces, slugifySpaceName,
-  spaceChoiceError, spaceOfBox, spaceTriggerLabel, toggleCollapsedSpace, type SpaceGrantApi,
+  boxSpaceIndex, canStartChatIn, chatHeaderSpace, chatHomeSpace, COLLAPSED_SPACES_KEY, ensureSpace, grantBox, groupBySpace, groupKey, initialSpaceChoice, pickableSpaces, readCollapsedSpaces, slugifySpaceName,
+  spaceChoiceError, spaceTriggerLabel, toggleCollapsedSpace, type SpaceGrantApi,
 } from './chatSpaces';
 import { SPACE_NAME_RE } from '../utils/spaces';
 
@@ -135,36 +135,72 @@ describe('boxSpaceIndex', () => {
     expect(index.get('child')).toEqual(['mid', 'zeta']);
     expect(index.has('nobox')).toBe(false);
   });
+  it('keeps a terminated box listed in a space in it', () => {
+    const index = boxSpaceIndex([
+      { space: 'zeta', boxes: [grant('b1')], listed: [{ id: 'gone' }] },
+      { space: 'alpha', boxes: [], listed: [{ id: 'gone' }] },
+    ]);
+    expect(index.get('gone')).toEqual(['alpha', 'zeta']);
+  });
+});
+
+describe('chatHomeSpace: a chat belongs to the space fixed when it started (plan-outbox #38)', () => {
+  const spaces = [space('alpha'), space('beta')];
+  const index = new Map([['b1', ['alpha', 'beta']]]);
+
+  it('is the fixed space, whatever its box reaches first, and No space for one fixed to none, a space gone, or one the user isn\'t in', () => {
+    expect(chatHomeSpace({ instanceId: 'b1', spaceId: 'id-beta', spaceFixed: true }, spaces, index)).toBe('beta');
+    expect(chatHomeSpace({ instanceId: 'b1', spaceId: null, spaceFixed: true }, spaces, index)).toBeNull();
+    expect(chatHomeSpace({ instanceId: 'b1', spaceId: 'id-deleted', spaceFixed: true }, spaces, index)).toBeNull();
+  });
+
+  it('a box granted another space later changes nothing', () => {
+    const later = new Map([['b1', ['aaa', 'alpha', 'beta']]]);
+    expect(chatHomeSpace({ instanceId: 'b1', spaceId: 'id-beta', spaceFixed: true }, [space('aaa'), ...spaces], later)).toBe('beta');
+  });
+
+  it('only a chat an older backend never fixed falls back to its box\'s first space the user has', () => {
+    expect(chatHomeSpace({ instanceId: 'b1' }, spaces, index)).toBe('alpha');
+    expect(chatHomeSpace({ instanceId: 'b1' }, [space('beta')], index)).toBe('beta');
+    expect(chatHomeSpace({ instanceId: null }, spaces, index)).toBeNull();
+  });
+
+  it('the header names it and notes the other spaces the box reaches', () => {
+    expect(chatHeaderSpace({ instanceId: 'b1', spaceId: 'id-beta', spaceFixed: true }, spaces, index)).toEqual({ space: 'beta', alsoIn: ['alpha'] });
+    expect(chatHeaderSpace({ instanceId: 'b1', spaceId: null, spaceFixed: true }, spaces, index)).toBeNull();
+  });
 });
 
 describe('groupBySpace', () => {
+  const spaces = [space('assets'), space('notes')];
   const rows = [
-    { key: 'a', instanceId: 'b1' },
-    { key: 'b', instanceId: 'b2' },
-    { key: 'c', instanceId: null },
-    { key: 'd', instanceId: 'b1' },
-    { key: 'e', instanceId: 'b3' },
+    { key: 'a', instanceId: 'b1', spaceId: 'id-notes', spaceFixed: true },
+    { key: 'b', instanceId: 'b2', spaceId: 'id-assets', spaceFixed: true },
+    { key: 'c', instanceId: null, spaceId: null, spaceFixed: true },
+    { key: 'd', instanceId: 'b2', spaceId: 'id-notes', spaceFixed: true },
+    { key: 'e', instanceId: 'b3', spaceId: null, spaceFixed: true },
   ];
 
-  it('groups by the box\'s first space, by name, then No space, keeping row order', () => {
+  it('groups by each chat\'s own space, by name, then No space, keeping row order', () => {
     const index = new Map([['b1', ['notes']], ['b2', ['assets', 'notes']]]);
-    const groups = groupBySpace(rows, index);
+    const groups = groupBySpace(rows, spaces, index);
     expect(groups.map(g => [g.space, g.rows.map(r => r.row.key)])).toEqual([
       ['assets', ['b']],
       ['notes', ['a', 'd']],
       [null, ['c', 'e']],
     ]);
     expect(groups[0].rows[0].alsoIn).toEqual(['notes']);
+    expect(groups[1].rows[1].alsoIn).toEqual(['assets']);
   });
 
   it('is one No space group when nothing has a space', () => {
-    const groups = groupBySpace(rows, new Map());
+    const groups = groupBySpace(rows.map(r => ({ ...r, spaceId: null })), spaces, new Map());
     expect(groups).toHaveLength(1);
     expect(groups[0].space).toBeNull();
   });
 
   it('has no No space group when every chat has a space', () => {
-    expect(groupBySpace([{ instanceId: 'b1' }], new Map([['b1', ['notes']]])).map(g => g.space)).toEqual(['notes']);
+    expect(groupBySpace([{ instanceId: 'b1', spaceId: 'id-notes', spaceFixed: true }], spaces, new Map()).map(g => g.space)).toEqual(['notes']);
   });
 });
 
@@ -192,16 +228,6 @@ describe('slugifySpaceName', () => {
     const f = fakeApi();
     expect(await ensureSpace({ kind: 'new', name: 'team-' }, new Set(), f.api, () => {})).toBe('team');
     expect(f.calls).toEqual(['create team']);
-  });
-});
-
-describe('spaceOfBox', () => {
-  it('names the box\'s first space and notes the rest', () => {
-    const index = new Map([['box-a', ['mine', 'theirs']], ['box-b', []]]);
-    expect(spaceOfBox('box-a', index)).toEqual({ space: 'mine', alsoIn: ['theirs'] });
-    expect(spaceOfBox('box-b', index)).toBeNull();
-    expect(spaceOfBox('box-c', index)).toBeNull();
-    expect(spaceOfBox(null, index)).toBeNull();
   });
 });
 

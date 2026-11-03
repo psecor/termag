@@ -53,7 +53,7 @@ export interface TriageInput {
   usage: UsageResponse | null;
   usageUnavailable: boolean;
   worktimeByProject: WorktimeProjectRow[] | null;
-  /** Date keys that count as "today" for worktime rows (local + UTC). */
+  /** Date keys that count as "today" for worktime rows: the person's local day. */
   todayKeys: string[];
   /** UTC key for today's tokens, and the trailing UTC days that form the baseline. */
   todayUTC: string;

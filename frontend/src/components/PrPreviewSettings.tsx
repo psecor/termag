@@ -6,9 +6,10 @@ import { previewSharesApi, type PreviewSettingsView } from '../services/api';
  * A project's PR preview settings, in the share dialog: share the PRs its owner opens automatically, only those
  * changing a path under the filter, and what reviewers sign in to the app
  * with. A PR labelled `no-preview` is never shared automatically. The server
- * checks and saves; this only edits.
+ * checks and saves; this only edits. `byHand` says where a PR is shared by
+ * hand: the PR overlay in the full UI, the PRs above in the side panel.
  */
-export function PrPreviewSettings({ projectId }: { projectId: string }) {
+export function PrPreviewSettings({ projectId, byHand = 'from the PR overlay' }: { projectId: string; byHand?: string }) {
   const prLinks = useFlag(FLAGS.prLinkShares, false);
   const [saved, setSaved] = useState<PreviewSettingsView | null>(null);
   const [enabled, setEnabled] = useState(false);
@@ -67,10 +68,10 @@ export function PrPreviewSettings({ projectId }: { projectId: string }) {
       </label>
       <label>
         <span>Reviewers sign in to the app as</span>
-        <input type="text" value={hint} disabled={saved === null} onChange={e => setHint(e.target.value)} placeholder="the app's seeded account (reviewer@example.com / example-password)" />
+        <input type="text" value={hint} disabled={saved === null} onChange={e => setHint(e.target.value)} placeholder="webapp's seeded account (the default)" />
       </label>
       <div className="pr-preview-settings-actions">
-        <span className="usage-dim">A PR labelled <code>no-preview</code> is never shared on its own. Share any PR by hand from the PR overlay.</span>
+        <span className="usage-dim">A PR labelled <code>no-preview</code> is never shared on its own. Share any PR by hand {byHand}.</span>
         <button type="submit" disabled={busy || !dirty}>{busy ? 'Saving…' : 'Save'}</button>
       </div>
       {note && <div className="usage-dim" role="status">{note}</div>}

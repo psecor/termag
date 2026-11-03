@@ -1,7 +1,7 @@
 // One conversation in the simple UI: the workstream's agent pane captured and
 // parsed into turns (chat/paneChat.ts, as the phone does), one status line,
 // answer keys only while the agent waits, and a composer that types into the
-// pane. No terminal is shown here: Open in full UI is the way to one. While
+// pane. No terminal is shown here: Open in Lab is the way to one. While
 // the chat comes up (box, clone, Claude) it narrates the steps, and a message
 // typed before Claude is there waits and is sent once it is.
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -24,11 +24,13 @@ import { useTranscriptFocus } from '../../chat/transcriptFocus';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { useCapture } from '../../chat/useCapture';
 import { conversationBlocks, fullUiHref, repoSlug, showAnswerKeys, statusLine } from '../../chat/simpleChat';
+import { desktopSessionHref, openDesktopLink } from '../../chat/desktopLinks';
 import { agentUp, bootEstimateMinutes, preLaunchTail, setupSteps, showSetup } from '../../chat/newChat';
 import { SetupSteps } from '../../chat/SetupSteps';
 import { useQueuedMessage } from '../../chat/useQueuedMessage';
 import { useComposerText } from '../../chat/useHandedDraft';
 import { ClaudeLoginCard } from '../../chat/ClaudeLoginCard';
+import { claudeSignInApplies } from '../../chat/claudeLogin';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { providerFor, STATUS_GLYPH } from '../../mobile/inbox';
 import { FLAGS, useFlag } from '../../flags';
@@ -39,6 +41,8 @@ import { useDictation } from '../../chat/useDictation';
 import { DictationButton, DictationNote } from '../../chat/DictationButton';
 import { SendIcon } from '../../chat/ComposerIcons';
 import { ChatBoxTag } from './ChatBoxTag';
+import { useSimpleDataIfAny } from './simpleData';
+import { recordTypedChatCommand } from '../../usageEvents';
 
 // Remembered across conversations in this tab so visits carry a previous id.
 let lastVisitedProjectId: string | null = null;
@@ -56,6 +60,7 @@ export function ChatView() {
 
   const ws = params.get('ws') || 'main';
   const project = projects.find(p => p.id === projectId);
+  const desktopHref = project ? desktopSessionHref({ projectId: project.id, workstream: ws, shared: project.role === 'collaborator' }) : null;
   const owner = project?.ownerUsername ?? user?.unixUsername ?? '';
   const workstream = project?.workstreams.find(w => w.name === ws);
   const agentSession = project ? sessionName(owner, project.name, 'agent', ws) : '';
@@ -115,14 +120,17 @@ export function ChatView() {
   const [retrying, setRetrying] = useState(false);
   useEffect(() => { setSendError(null); }, [projectId, ws]);
 
+  // A message the person typed (not an answer key) puts the session's tabs on top of their space.
+  const noteSent = useSimpleDataIfAny()?.items.noteSent;
   // The message waiting for Claude: New chat's first message, or anything
   // typed here before Claude was up (chat/useQueuedMessage.ts).
   const sendQueued = useCallback(async (pid: string, workstreamName: string, keys: string) => {
     await sessionsApi.sendKeys(pid, 'agent', { workstream: workstreamName, keys, enter: true, literal: true });
+    noteSent?.({ projectId: pid, workstream: workstreamName });
     const sentFor = projects.find(p => p.id === pid);
     if (sentFor) activityApi.heartbeat(sentFor.name, sentFor.instanceId ?? null).catch(() => {});
     setTimeout(capture.refresh, 500);
-  }, [projects, capture.refresh]);
+  }, [projects, capture.refresh, noteSent]);
   const { queued, echo, error: queueError, enqueue, retry: retryQueued } = useQueuedMessage({
     projectId: project?.id ?? null, workstream: ws, up, offline, send: sendQueued,
   });
@@ -133,7 +141,10 @@ export function ChatView() {
     setSendError(null);
     try {
       await sessionsApi.sendKeys(project.id, 'agent', { workstream: ws, ...body });
-      if (sent !== null) setText(draftAfterSend(latestText.current, sent));
+      if (sent !== null) {
+        setText(draftAfterSend(latestText.current, sent));
+        noteSent?.({ projectId: project.id, workstream: ws });
+      }
       activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
       setTimeout(capture.refresh, 500);
     } catch (err) {
@@ -141,12 +152,13 @@ export function ChatView() {
     } finally {
       setSending(false);
     }
-  }, [project, ws, sending, capture.refresh]);
+  }, [project, ws, sending, capture.refresh, noteSent]);
 
   const onSend = () => {
     dictation.detach();
     const keys = flattenForSend(text);
     if (!keys || !project) return;
+    recordTypedChatCommand(keys, 'pane');
     if (!up) {
       if (enqueue(keys)) setText('');
       else setSendError(`This browser would not hold the message until ${agentLabel} is up. Send it again once it is.`);
@@ -218,22 +230,26 @@ export function ChatView() {
                 {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{w.name}</option>)}
               </select>
             ) : ws !== 'main' ? <span className="chat-title-ws">· {ws}</span> : null}
-            <ChatSpaceChip instanceId={project?.instanceId} />
+            <ChatSpaceChip place={{ instanceId: project?.instanceId ?? null, spaceId: workstream?.spaceId, spaceFixed: workstream?.spaceFixedAt != null }} />
             {repo && <span className="chat-title-repo" title={project?.repoUrl ?? undefined}>{repo}</span>}
             {project && <ChatBoxTag project={project} box={box} />}
           </div>
           <div className="chat-header-actions">
             {phone ? (
               <ChatMoreButton label={`${project?.name ?? 'Session'}: actions`} actions={[
-                { label: 'Open in full UI', onSelect: () => navigate(fullUiHref(project?.id, ws)) },
+                { label: 'Open in Lab', onSelect: () => navigate(fullUiHref(project?.id, ws)) },
+                ...(desktopHref ? [{ label: 'Open in termag desktop', onSelect: () => openDesktopLink(desktopHref) }] : []),
                 ...(sidePanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
               ]} />
             ) : <>
-              <SidePanelButton />
               <Link className="btn-ghost chat-full-ui" to={fullUiHref(project?.id, ws)}>
-                <span className="chat-full-ui-long">Open in full UI</span>
-                <span className="chat-full-ui-short">Full UI</span>
+                <span className="chat-full-ui-long">Open in Lab</span>
+                <span className="chat-full-ui-short">Lab</span>
               </Link>
+              {desktopHref && (
+                <a className="btn-ghost" href={desktopHref} title="A new thread in this project in termag desktop, with its chats to import">Desktop</a>
+              )}
+              <SidePanelButton />
             </>}
           </div>
         </header>
@@ -247,7 +263,7 @@ export function ChatView() {
                   <div className="chat-box-says">
                     <div className="chat-box-says-label">Latest from the box</div>
                     <pre className={REPLAY_BLOCK_CLASS}>{boxSays.join('\n')}</pre>
-                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, ws)}>Answer it in the full UI</Link>.</div>
+                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, ws)}>Answer it in Lab</Link>.</div>
                   </div>
                 )}
                 {project.role !== 'collaborator' && (setup.retry || setup.startEmpty) && (
@@ -264,7 +280,7 @@ export function ChatView() {
                 )}
               </div>
             )}
-            {!held && project && !hasAgent && <div className="chat-empty">This project has no agent. Open it in the full UI to add one.</div>}
+            {!held && project && !hasAgent && <div className="chat-empty">This project has no agent. Open it in Lab to add one.</div>}
             {!held && hasAgent && parsed == null && !capture.error && !echo && queued == null && <div className="chat-empty">Loading…</div>}
             {capture.error === 'denied' && <div className="chat-notice">This session is not reachable.</div>}
             {capture.error === 'failed' && <div className="chat-notice">Capture failed · retrying</div>}
@@ -291,8 +307,9 @@ export function ChatView() {
         </div>
         <div className="chat-bottom">
           {unseen && <button type="button" className="chat-jump" onClick={jumpToBottom}>↓ new output</button>}
-          {project && provider === 'claude' && (
-            <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled />
+          {project && claudeSignInApplies(provider) && (
+            <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled box={box?.status}
+              hostShowsBox={line.tone === 'offline' || line.tone === 'setup'} />
           )}
           <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite">{line.text}</div>
           {answerKeys.length > 0 && (

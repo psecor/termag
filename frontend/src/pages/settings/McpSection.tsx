@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { mcpConnectorsApi, McpConnector, McpConnectorList } from '../../services/api';
+import { mcpConnectorsApi, McpCatalogServer, McpConnector, McpConnectorList } from '../../services/api';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { FLAGS, useFlag } from '../../flags';
+import { PROVIDERS } from '../../providers/registry';
 import { DocsLink } from './DocsLink';
-import { connectorStatus, linkResult, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { connectorStatus, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
 
 function apiError(err: unknown, fallback: string): string {
   const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
@@ -149,6 +150,47 @@ function ConnectorRow({ c, focused, onChanged, onError }: {
   );
 }
 
+/**
+ * A server the orchestrator offers that the user hasn't connected yet.
+ * Connect creates their connector for it and sends them to the server's
+ * sign-in page; after that it shows under their own servers instead.
+ */
+function CatalogRow({ server, storeAvailable, onReload, onError }: {
+  server: McpCatalogServer;
+  storeAvailable: boolean;
+  // Reloads the list and keeps the error banner.
+  onReload: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  async function connect() {
+    setBusy(true);
+    try {
+      window.location.assign(await mcpConnectorsApi.connectCatalog(server.name));
+    } catch (err) {
+      onError(apiError(err, 'Could not connect the server'));
+      // Connect can create the connector and then fail to start sign-in; the
+      // reload moves the server to Your servers (not authed, with Link) rather
+      // than leaving it offered here.
+      onReload();
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li className="settings-row mcp-row">
+      <div className="settings-row-text">
+        <span className="settings-row-name">{server.name}</span>
+        <span className="settings-row-mono">{server.upstream}</span>
+      </div>
+      <div className="mcp-row-actions">
+        <button className="btn-ghost" disabled={busy || !storeAvailable} onClick={connect}>Connect</button>
+      </div>
+    </li>
+  );
+}
+
 function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }: {
   initialUpstream: string | null;
   storeAvailable: boolean;
@@ -258,6 +300,7 @@ function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }
  */
 export function McpSection({ focus, search }: { focus: boolean; search: string }) {
   const enabled = useFlag(FLAGS.mcpBroker, false);
+  const agents = mcpAgentNames(PROVIDERS);
   const [list, setList] = useState<McpConnectorList | null>(null);
   const [error, setError] = useState('');
   const ref = useRef<HTMLElement>(null);
@@ -279,15 +322,16 @@ export function McpSection({ focus, search }: { focus: boolean; search: string }
       </div>
       <div className="dash-card">
         <p className="settings-hint">
-          Claude Code on every box you own gets these servers through the termag broker, which adds your
+          {agents} on every box you own get these servers through the termag broker, which adds your
           credentials to each call. Boxes never hold them.
         </p>
-        {result.linked && <div className="settings-notice" role="status">Linked. Claude Code on your boxes can use it now.</div>}
+        {result.linked && <div className="settings-notice" role="status">Linked. Your agents can use this MCP now.</div>}
         {result.error && <div className="error-banner" role="alert">{result.error}</div>}
         {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError('')}>×</button></div>}
         {list && !list.available && (
           <div className="settings-notice warn" role="status">No MCP broker is set up on this orchestrator yet, so boxes don't get these servers.</div>
         )}
+        {list && !!list.catalog?.length && <div className="mcp-form-title">Your servers</div>}
         {list && (
           <ul className="settings-list mcp-list">
             {list.connectors.length === 0 && <li className="settings-empty">No MCP servers yet.</li>}
@@ -295,6 +339,16 @@ export function McpSection({ focus, search }: { focus: boolean; search: string }
               <ConnectorRow key={c.id} c={c} focused={c.id === param.connectorId} onChanged={() => { setError(''); void load(); }} onError={setError} />
             ))}
           </ul>
+        )}
+        {list && !!list.catalog?.length && (
+          <>
+            <div className="mcp-form-title">Available to connect</div>
+            <ul className="settings-list mcp-list" aria-label="Available to connect">
+              {list.catalog.map(s => (
+                <CatalogRow key={s.name} server={s} storeAvailable={list.storeAvailable} onReload={() => void load()} onError={setError} />
+              ))}
+            </ul>
+          </>
         )}
         {list && (
           <AddForm key={param.upstream ?? ''} initialUpstream={param.upstream} storeAvailable={list.storeAvailable}

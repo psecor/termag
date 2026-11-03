@@ -1,6 +1,7 @@
-import React, { createContext, useCallback, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useCallback, useContext, useState, useEffect, useRef, ReactNode } from 'react';
 import { AgentProvider, User } from '../types';
 import { authApi, PreferencesPatch } from '../services/api';
+import { adoptUiMode, onUiModeRecorded } from '../chat/uiMode';
 
 interface AuthContextValue {
   user: User | null;
@@ -28,12 +29,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const current = useRef<User | null>(null);
+  current.current = user;
+
   useEffect(() => {
     authApi.me()
-      .then(setUser)
+      .then(u => {
+        // A kept choice of termag or Lab wins over this browser's, and lands
+        // before the routes that read it render.
+        if (u.uiMode === 'simple' || u.uiMode === 'full') adoptUiMode(u.uiMode);
+        setUser(u);
+      })
       .catch(() => setUser(null))
       .finally(() => setLoading(false));
   }, []);
+
+  // Keep a new choice on the user, once per change. The server reports
+  // `uiMode` only while onboarding-refresh-enabled is on for this user;
+  // without it nothing is sent.
+  useEffect(() => onUiModeRecorded(mode => {
+    const u = current.current;
+    if (!u || !('uiMode' in u) || u.uiMode === mode) return;
+    current.current = { ...u, uiMode: mode };
+    authApi.updatePreferences({ uiMode: mode }).then(setUser).catch(() => {});
+  }), []);
 
   const logout = async () => {
     await authApi.logout();

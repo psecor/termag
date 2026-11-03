@@ -3,6 +3,10 @@
 // selection, copy and find-in-page work.
 import React, { useState } from 'react';
 import { Block, splitFences } from './paneChat';
+import { MermaidBlock } from './MermaidBlock';
+import { isMermaidFence } from './mermaidFence';
+import { splitBoxTables } from './boxTable';
+import { Table } from './Markdown';
 import './blocks.css';
 
 function ToolBlock({ block, onShare }: { block: Block; onShare?: (block: Block) => void }) {
@@ -25,13 +29,28 @@ function ToolBlock({ block, onShare }: { block: Block; onShare?: (block: Block) 
   );
 }
 
-/** Block prose with any ``` fenced code shown as code. */
+/** Prose outside fences, with a box-drawn table as a table, or monospace when its grid does not parse. */
+function ProseText({ text }: { text: string }) {
+  const parts = splitBoxTables(text);
+  if (parts.length === 1 && parts[0].kind === 'text') return <div>{text}</div>;
+  const cells = (row: string[]) => row.map(v => [{ t: 'text' as const, v }]);
+  return (
+    <>
+      {parts.map((p, i) => (p.kind === 'text' ? <div key={i}>{p.text}</div>
+        : p.kind === 'grid' ? <pre key={i} className="m-grid">{p.text}</pre>
+          : <Table key={i} block={{ type: 'table', align: (p.head ?? p.rows[0]).map(() => null), head: p.head ? cells(p.head) : [], rows: p.rows.map(cells) }} />))}
+    </>
+  );
+}
+
+/** Block prose with any ``` fenced code shown as code, a closed ```mermaid fence as its diagram, and a box-drawn table as a table. */
 function RichText({ text }: { text: string }) {
   const parts = splitFences(text);
-  if (parts.length <= 1 && !parts[0]?.code) return <div className="m-block-text">{text}</div>;
+  if (parts.length <= 1 && !parts[0]?.code) return <div className="m-block-text"><ProseText text={text} /></div>;
   return (
     <div className="m-block-text">
-      {parts.map((p, i) => (p.code ? <pre key={i} className="m-code">{p.text}</pre> : <div key={i}>{p.text}</div>))}
+      {parts.map((p, i) => (p.code && isMermaidFence(p.lang) && !p.open ? <MermaidBlock key={i} source={p.text} />
+        : p.code ? <pre key={i} className="m-code">{p.text}</pre> : <ProseText key={i} text={p.text} />))}
     </div>
   );
 }

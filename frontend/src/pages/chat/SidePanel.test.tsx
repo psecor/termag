@@ -7,23 +7,38 @@ import { DEFAULT_SIDE_PANEL, type SidePanelState } from '../../chat/sidePanel';
 
 vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => ({ user: { unixUsername: 'ada' } }) }));
 vi.mock('../../hooks/useSetupContext', () => ({ useSetupContext: () => ({}) }));
+const flags = vi.hoisted(() => ({ previewShare: false }));
 vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
-  return { ...actual, useFlag: (key: string, fallback: unknown) => (key === actual.FLAGS.browserPane ? true : fallback) };
+  const on = (key: string) => key === actual.FLAGS.browserPane || (key === actual.FLAGS.previewShare && flags.previewShare);
+  return { ...actual, useFlag: (key: string, fallback: unknown) => (on(key) ? true : fallback) };
 });
 vi.mock('../../components/Terminal', () => ({
   Terminal: ({ sessionName }: { sessionName: string }) => <div data-testid="terminal">{sessionName}</div>,
 }));
-vi.mock('../../components/BrowserPane', () => ({ BrowserPane: () => <div data-testid="browser" /> }));
+vi.mock('../../components/BrowserPane', () => ({
+  BrowserPane: (p: { openShare?: { shareId: string; at: string | null } | null; onOpenShareUsed?: () => void }) => (
+    <button type="button" data-testid="browser" data-share={p.openShare?.shareId ?? ''} data-at={p.openShare?.at ?? ''} onClick={p.onOpenShareUsed} />
+  ),
+}));
+vi.mock('./ShareTab', () => ({
+  ShareTab: (p: { projectId: string; workstream: string }) => <div data-testid="share" data-project={p.projectId} data-ws={p.workstream} />,
+}));
 vi.mock('./FileExplorer', () => ({
   ExplorerPanel: (p: { space: string; activePath?: string; activeAgent?: { projectId: string }; onPicked?: () => void }) => (
     <button type="button" data-testid="files" data-space={p.space} data-path={p.activePath ?? ''} data-agent={p.activeAgent?.projectId ?? ''} onClick={p.onPicked} />
   ),
 }));
+vi.mock('./AgentsExplorer', () => ({
+  AgentsPanel: (p: { activeAgent?: { projectId: string }; onPicked?: () => void }) => (
+    <button type="button" data-testid="agents" data-agent={p.activeAgent?.projectId ?? ''} onClick={p.onPicked} />
+  ),
+}));
+const spacesMock = vi.hoisted(() => ({ current: true, index: new Map<string, string[]>([['box-1', ['notes']]]), rows: [] as Array<{ instanceId: string }> }));
 vi.mock('./simpleData', () => ({
   useSimpleDataIfAny: () => ({
-    items: { state: { items: [] } }, activeTab: null,
-    spaces: { loaded: true, spaces: [{ name: 'notes' }], index: new Map([['box-1', ['notes']]]) },
+    items: { state: { items: [] } }, activeTab: null, rows: spacesMock.rows,
+    spaces: { loaded: true, current: spacesMock.current, spaces: [{ name: 'notes' }], index: spacesMock.index },
   }),
 }));
 
@@ -48,6 +63,7 @@ let mainWidth = 1200;
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  flags.previewShare = false;
   observers = [];
   globalThis.ResizeObserver = class {
     private cb: () => void;
@@ -113,6 +129,18 @@ describe('SidePanel setup hold', () => {
   });
 });
 
+describe('SidePanel Browser', () => {
+  it('hands a share link its owner opened to the browser, which says when its dial is ready', () => {
+    const used = vi.fn();
+    render(project(), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'browser' }, { openShare: { shareId: 'cshare0000000001', at: '/projects/x' }, onOpenShareUsed: used });
+    const pane = host.querySelector('[data-testid="browser"]') as HTMLButtonElement;
+    expect(pane.getAttribute('data-share')).toBe('cshare0000000001');
+    expect(pane.getAttribute('data-at')).toBe('/projects/x');
+    act(() => pane.click());
+    expect(used).toHaveBeenCalled();
+  });
+});
+
 describe('SidePanel Files', () => {
   it('beside a file offers only Files, on that file, whatever tab was remembered', () => {
     render(undefined, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'terminal' }, { files: { space: 'notes', path: 'docs/a.md' } });
@@ -132,9 +160,70 @@ describe('SidePanel Files', () => {
     expect(tabs()).toEqual(['Files', 'Terminal*', 'Browser']);
   });
 
-  it('has no Files beside an agent with no space, and shows Terminal for a remembered Files', () => {
-    const lone = project({ instanceId: 'box-9' });
+  it('has Agents, the explorer of agents in no space, beside an agent with no space', () => {
+    const lone = project({ id: 'lone', instanceId: 'box-9' });
     render(lone, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: lone } });
+    expect(tabs()).toEqual(['Agents*', 'Terminal', 'Browser']);
+    expect(host.querySelector('[data-testid="files"]')).toBeNull();
+    expect(host.querySelector('[data-testid="agents"]')!.getAttribute('data-agent')).toBe('lone');
+  });
+
+  it('waits for the spaces of a box the index doesn\'t have yet before deciding it is in no space', () => {
+    const fresh = project({ id: 'fresh', instanceId: 'box-new' });
+    spacesMock.current = false;
+    try {
+      render(fresh, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: fresh } });
+      expect(tabs()).toEqual(['Terminal*', 'Browser']);
+      expect(host.querySelector('[data-testid="agents"]')).toBeNull();
+      // The reload brings the box in a space: Files for that space, never Agents.
+      spacesMock.index = new Map([['box-1', ['notes']], ['box-new', ['notes']]]);
+      spacesMock.current = true;
+      render(fresh, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: fresh } });
+      expect(tabs()).toEqual(['Files*', 'Terminal', 'Browser']);
+      expect(host.querySelector('[data-testid="files"]')!.getAttribute('data-space')).toBe('notes');
+    } finally {
+      spacesMock.current = true;
+      spacesMock.index = new Map([['box-1', ['notes']]]);
+    }
+  });
+
+  it('keeps Agents beside an agent with no space while the spaces reload for another new box', () => {
+    const lone = project({ id: 'lone', instanceId: 'box-9' });
+    render(lone, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: lone } });
+    expect(tabs()).toEqual(['Agents*', 'Terminal', 'Browser']);
+    spacesMock.current = false;
+    try {
+      render(lone, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: lone } });
+      expect(tabs()).toEqual(['Agents*', 'Terminal', 'Browser']);
+    } finally {
+      spacesMock.current = true;
+    }
+  });
+
+  it('keeps Agents for a no-space session opened during a reload, after a session in a space was the one open', () => {
+    const inSpace = project({ id: 'in', instanceId: 'box-1' });
+    const lone = project({ id: 'lone77', instanceId: 'box-77' });
+    spacesMock.rows = [{ instanceId: 'box-1' }, { instanceId: 'box-77' }];
+    try {
+      render(inSpace, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: inSpace } });
+      expect(tabs()).toEqual(['Files*', 'Terminal', 'Browser']);
+      spacesMock.current = false;
+      render(lone, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: { agent: lone } });
+      expect(tabs()).toEqual(['Agents*', 'Terminal', 'Browser']);
+    } finally {
+      spacesMock.current = true;
+      spacesMock.rows = [];
+    }
+  });
+
+  it('has Agents alone on a new tab on the agents in no space', () => {
+    render(undefined, { ...DEFAULT_SIDE_PANEL, open: true, tab: 'terminal' }, { files: { space: '(none)' } });
+    expect(tabs()).toEqual(['Agents*']);
+    expect(host.querySelector('[data-testid="agents"]')).not.toBeNull();
+  });
+
+  it('has no Files with none given (the side panel flag off is no panel at all), and shows Terminal for a remembered Files', () => {
+    render(project(), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'files' }, { files: null });
     expect(tabs()).toEqual(['Terminal*', 'Browser']);
     expect(host.querySelector('[data-testid="terminal"]')).not.toBeNull();
   });
@@ -149,5 +238,41 @@ describe('SidePanel Files', () => {
     render(project(), { ...state, tab: 'files' }, { files: { agent: project() }, onChange, onPicked });
     act(() => (host.querySelector('[data-testid="files"]') as HTMLButtonElement).click());
     expect(onPicked).toHaveBeenCalled();
+  });
+});
+
+describe('SidePanel Share', () => {
+  beforeEach(() => { flags.previewShare = true; });
+
+  it('offers Share beside the owner\'s session, and mounts the share for its workstream', () => {
+    render(project(), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'share' }, { workstream: 'feature-x' });
+    expect(tabs()).toEqual(['Terminal', 'Browser', 'Share*']);
+    const share = host.querySelector('[data-testid="share"]')!;
+    expect(share.getAttribute('data-project')).toBe('p1');
+    expect(share.getAttribute('data-ws')).toBe('feature-x');
+    expect(host.querySelector('[data-testid="terminal"]')).toBeNull();
+  });
+
+  it('has no Share for a collaborator, or with preview shares off, and shows Terminal for a remembered Share', () => {
+    render(project({ role: 'collaborator' }), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'share' });
+    expect(tabs()).toEqual(['Terminal*', 'Browser']);
+    expect(host.querySelector('[data-testid="share"]')).toBeNull();
+    flags.previewShare = false;
+    render(project(), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'share' });
+    expect(tabs()).toEqual(['Terminal*', 'Browser']);
+  });
+
+  it('shares nothing while the session is set up', () => {
+    render(project({ setupStatus: 'cloning' }), { ...DEFAULT_SIDE_PANEL, open: true, tab: 'share' });
+    expect(host.querySelector('[data-testid="share"]')).toBeNull();
+    expect(host.textContent).toContain('Sharing opens once the session is set up.');
+  });
+
+  it('switches to Share from its tab', () => {
+    const onChange = vi.fn();
+    const state = { ...DEFAULT_SIDE_PANEL, open: true, tab: 'terminal' as const };
+    render(project(), state, { onChange });
+    act(() => ([...host.querySelectorAll('[role="tab"]')].find(t => t.textContent === 'Share') as HTMLButtonElement).click());
+    expect(onChange).toHaveBeenCalledWith({ ...state, tab: 'share' });
   });
 });

@@ -87,10 +87,10 @@ describe('the reviewer\'s preview page', () => {
   });
 
   it('tells the reviewer what to sign in to the app with', async () => {
-    api.get.mockResolvedValue({ ...active, signInHint: 'reviewer@example.com / example-password' });
+    api.get.mockResolvedValue({ ...active, signInHint: 'reviewer@example.com / testing' });
     mount('/preview/cshare0000000001');
     await flush();
-    expect(el.querySelector('.preview-header-hint')?.textContent).toBe(' · sign in as reviewer@example.com / example-password');
+    expect(el.querySelector('.preview-header-hint')?.textContent).toBe(' · sign in as reviewer@example.com / testing');
   });
 
   it('says it isn\'t shared with you for a 404, and shows a closed share\'s reason to its grantee', async () => {

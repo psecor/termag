@@ -1,0 +1,6 @@
+/* ActionMenu.tsx. LaunchPad colours a destructive menu item's text with this
+   token, and nothing else reads it (a destructive button's text is
+   --lp-color-text-interactive-primary-base); the shared map
+   (launchpad/theme.css) has it as text on a fill, which is wrong for a menu
+   item, so this menu's own popover sets it. */
+.genui-action-menu-popover.lp-theme { --lp-color-text-interactive-destructive: var(--danger); }

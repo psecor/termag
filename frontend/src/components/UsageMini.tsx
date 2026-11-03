@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { worktimeApi, WorktimeResponse } from '../services/api';
-import { PROVIDERS } from '../providers/registry';
+import { PROVIDERS, providerColor } from '../providers/registry';
+import { usePalette } from '../theme/usePalette';
 import { fmtDurationShort } from '../utils/format';
-import { todayDates } from '../utils/dates';
-import { HUMAN, mergeWtDays, activeWtProviders, THERMO_MAX_MS, THERMO_MID_MS } from '../utils/worktime';
+import { HUMAN, mergeWtDays, activeWtProviders, THERMO_MAX_MS, THERMO_MID_MS, worktimeToday } from '../utils/worktime';
 
 const GRAD_MARKS = [1, 2, 3, 4, 5, 6, 7, 8]; // hours
 
@@ -17,9 +17,10 @@ const GRAD_MARKS = [1, 2, 3, 4, 5, 6, 7, 8]; // hours
 export function UsageMini() {
   const [worktime, setWorktime] = useState<WorktimeResponse | null>(null);
   const navigate = useNavigate();
+  const palette = usePalette();
 
   useEffect(() => {
-    // Two days covers the local/UTC straddle around midnight.
+    // Today is the day termag answers as yours; it banks by the zone this sends.
     const load = () => { worktimeApi.get(2).then(setWorktime).catch(() => {}); };
     load();
     const interval = setInterval(load, 5 * 60 * 1000);
@@ -30,7 +31,7 @@ export function UsageMini() {
 
   const agentProviders = activeWtProviders(worktime).filter(p => p.id !== HUMAN);
   const humanConfig = PROVIDERS[HUMAN];
-  const todayWt = mergeWtDays(worktime, todayDates());
+  const todayWt = mergeWtDays(worktime, [worktimeToday(worktime)]);
   const todayHumanMs = todayWt[HUMAN]?.totalMs || 0;
   const todayAgentMs = Object.entries(todayWt).filter(([k]) => k !== HUMAN).reduce((s, [, v]) => s + v.totalMs, 0);
 
@@ -56,7 +57,7 @@ export function UsageMini() {
               <div
                 key={p.id}
                 className="usage-thermo-stack-seg"
-                style={{ height: `${Math.min((ms / THERMO_MAX_MS) * 100, 100)}%`, background: p.color.base }}
+                style={{ height: `${Math.min((ms / THERMO_MAX_MS) * 100, 100)}%`, background: providerColor(p, palette).base }}
                 title={`${p.displayName}: ${fmtDurationShort(ms)}`}
               />
             );
@@ -66,7 +67,7 @@ export function UsageMini() {
           {todayHumanMs > 0 && (
             <div
               className="usage-thermo-stack-seg"
-              style={{ height: `${Math.min((todayHumanMs / THERMO_MAX_MS) * 100, 100)}%`, background: humanConfig.color.base }}
+              style={{ height: `${Math.min((todayHumanMs / THERMO_MAX_MS) * 100, 100)}%`, background: providerColor(humanConfig, palette).base }}
               title={`You: ${fmtDurationShort(todayHumanMs)}`}
             />
           )}

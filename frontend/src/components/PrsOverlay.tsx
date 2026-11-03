@@ -16,7 +16,7 @@ import { SharePrPreview } from './SharePrPreview';
 import { linkedByText } from '../utils/workstreamChoices';
 import { Dialog } from './Dialog';
 import { fmtAge } from '../utils/format';
-import { currentSearchShortcut } from '../utils/workspaceTarget';
+import { currentSearchShortcut, FOCUS_PANE_EVENT, type FocusPaneDetail } from '../utils/workspaceTarget';
 import { OPEN_PALETTE_EVENT, type OpenPaletteDetail } from '../utils/searchPalette';
 import {
   LANE_HINT, PRS_CHANGED_EVENT, PRS_PARAM, PRS_REPO_PARAM, PR_PARAM, bakePending, boxesBehindText, compareUrl, deferrals, deferredText, deployStage, inRepo, isPrsView, laneTabLabel, lanesOf,
@@ -79,6 +79,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
   const [showDeferred, setShowDeferred] = useState(false);
   const [deferBusy, setDeferBusy] = useState(false);
   const groupsOn = useFlag(FLAGS.prReviewGroups, false);
+  const parallelReviewsOn = useFlag(FLAGS.parallelReviews, false);
 
   const go = useCallback((next: PrsView | null, pr?: string | null) => {
     navigate({ search: prsSearch(window.location.search, next, pr) }, { replace: next !== null });
@@ -225,14 +226,25 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
     }
   };
 
+  // The project, with the review's own pane open (several may run there).
+  const openReviewPane = (projectId: string, workstream: string, session: string) => {
+    navigate(projectHref(projectId, workstream));
+    const detail: FocusPaneDetail = { projectId, workstream, pane: 'review', session };
+    setTimeout(() => window.dispatchEvent(new CustomEvent(FOCUS_PANE_EVENT, { detail })), 0);
+  };
+  // What a start does to a review running there: with parallel reviews it gets a pane of its own.
+  const reviewThereNote = parallelReviewsOn
+    ? 'It opens in a review pane of its own beside any running there (one per PR, up to 8).'
+    : 'A review already running there is replaced.';
+
   const startDevinReview = async (r: PrRow) => {
     const t = r.reviewTarget;
     setConfirmReview(null);
     if (!t || r.number == null) return;
     setActionError('');
     try {
-      await reviewApi.start(t.projectId, { workstream: t.workstream, pr: r.number, url: r.url });
-      navigate(projectHref(t.projectId, t.workstream));
+      const started = await reviewApi.start(t.projectId, { workstream: t.workstream, pr: r.number, url: r.url });
+      openReviewPane(t.projectId, t.workstream, started.session);
     } catch (err) {
       setActionError(apiErrorText(err, 'Could not start the review.'));
     }
@@ -247,8 +259,8 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
     const [first] = plan.members;
     setActionError('');
     try {
-      await reviewApi.start(plan.target.projectId, { workstream: plan.target.workstream, pr: first.number, url: first.url, group: groupReviewBody(g, plan.members) });
-      navigate(projectHref(plan.target.projectId, plan.target.workstream));
+      const started = await reviewApi.start(plan.target.projectId, { workstream: plan.target.workstream, pr: first.number, url: first.url, group: groupReviewBody(g, plan.members) });
+      openReviewPane(plan.target.projectId, plan.target.workstream, started.session);
     } catch (err) {
       setActionError(apiErrorText(err, 'Could not start the review.'));
     }
@@ -441,7 +453,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
         <ConfirmDialog
           message={<>Start a Devin review of <strong>{rowLabel(confirmReview)}</strong> in{' '}
             <strong>{confirmReview.reviewTarget.projectName}{confirmReview.reviewTarget.workstream !== 'main' ? ` · ${confirmReview.reviewTarget.workstream}` : ''}</strong>?
-            {' '}A review already running there is replaced.</>}
+            {' '}{reviewThereNote}</>}
           confirmLabel="Start review"
           tone="primary"
           onConfirm={() => { void startDevinReview(confirmReview); }}
@@ -453,7 +465,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
           message={<>Start one Devin review of the {groupPlan.members.length} PR{groupPlan.members.length === 1 ? '' : 's'} left in <strong>{confirmGroup.name}</strong>
             {' '}({groupPlan.members.map(memberLabel).join(', ')}), in order, in{' '}
             <strong>{groupPlan.target.projectName}{groupPlan.target.workstream !== 'main' ? ` · ${groupPlan.target.workstream}` : ''}</strong>?
-            {' '}It reviews each, then what spans them. A review already running there is replaced.</>}
+            {' '}It reviews each, then what spans them. {reviewThereNote}</>}
           confirmLabel="Start review"
           tone="primary"
           onConfirm={() => { void startGroupReview(confirmGroup); }}

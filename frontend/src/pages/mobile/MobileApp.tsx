@@ -7,7 +7,9 @@ import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { ConnectionOverlay } from '../../components/ConnectionOverlay';
 import { FLAGS, useFlag } from '../../flags';
+import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
+import { boxFeed } from '../../services/boxFeed';
 import { checkTappedNotification, dropBlockedSubscription, NAVIGATE_EVENT, registerServiceWorker, routerPathFor, syncAttention } from '../../mobile/push';
 import { isStandalone, setInstalledAppEnabled } from '../../mobile/redirect';
 import { infersTaps, notificationKey } from '../../mobile/shownNotifications';
@@ -141,6 +143,14 @@ export default function MobileApp() {
   useZoomableViewport();
   useVisualViewport(root);
   useAttentionSync();
+  // The box list tells a conversation whether its box is parked, so opening
+  // one can start it (hooks/useStartParkedBoxOnOpen), as in the workspace.
+  const { user } = useAuth();
+  useEffect(() => {
+    if (!user) return;
+    boxFeed.start();
+    return () => boxFeed.stop();
+  }, [user]);
   // No fetch handler (public/sw.js), so registering on every visit is harmless
   // and keeps notification clicks and getNotifications() working. Each visit
   // also drops a subscription whose notifications were blocked meanwhile.

@@ -1,0 +1,6 @@
+/* Accordion.tsx: one bordered box, a rule between sections; the trigger and panel as the Disclosure component's (genui.css). */
+.genui-accordion { min-width: 0; border: 1px solid var(--border); border-radius: 8px; }
+.genui-accordion-section + .genui-accordion-section { border-top: 1px solid var(--border); }
+.genui-accordion-head { margin: 0; }
+.genui-accordion-trigger { width: 100%; justify-content: flex-start; gap: 6px; font-weight: 600; text-align: start; }
+.genui-accordion-panel > * { padding: 0 12px 12px; }

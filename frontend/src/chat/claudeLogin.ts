@@ -1,5 +1,10 @@
 // What the simple UI may show for Claude Enterprise sign-in. The one-time
 // code is typed into a blocked input and sent once; nothing here keeps it.
+// Only a box that says it is not signed in, or a sign-in in progress, gets
+// the sign-in title. A box that is down or a status read that failed says
+// that instead: it is no evidence that sign-in is missing.
+import { PROVIDERS } from '../providers/registry';
+import type { InstanceStatus } from '../types';
 
 export type LoginPhase =
   | 'ready'
@@ -24,7 +29,18 @@ export interface ClaudeLoginView {
 const CODE_RE = /^[A-Za-z0-9._~+/=-]{8,512}#[A-Za-z0-9._~+/=-]{8,512}$/;
 const FLOW = new Set(['starting', 'needs-code', 'submitting', 'failed', 'expired']);
 
-export type LoginTransport = 'offline' | 'missing' | 'no-box' | 'rate' | 'failed' | null;
+/**
+ * Why the last request failed. `unreachable` is no answer at all (this
+ * browser to termag); `check-failed` is a status read that failed, which is
+ * not a failed sign-in; `failed` is a start, paste or cancel that did.
+ */
+export type LoginTransport = 'offline' | 'unreachable' | 'missing' | 'no-box' | 'rate' | 'failed' | 'check-failed' | null;
+
+/** Whether a provider runs Claude, so its box can need a Claude sign-in. */
+export function claudeSignInApplies(provider: string | null | undefined): boolean {
+  if (!provider) return false;
+  return provider === 'claude' || PROVIDERS[provider]?.chatEngine === 'claude';
+}
 
 export interface LoginCardModel {
   mode: 'hidden' | 'signed-in' | 'needed' | 'starting' | 'needs-code' | 'submitting' | 'retry' | 'offline' | 'owner' | 'quiet';
@@ -33,6 +49,15 @@ export interface LoginCardModel {
   error?: string;
   url?: string;
   primary?: 'start' | 'retry';
+}
+
+// What Claude Code says when its sign-in is gone: "Invalid API key · Please
+// run /login", "OAuth token has expired…", an API 401 authentication_error.
+const AUTH_ERROR_RE = /please run \/login|oauth token (?:has )?expired|invalid api key|authentication_error|not logged in|failed to authenticate/i;
+
+/** Whether a turn's error text is Claude's sign-in failing (not a model or network error). */
+export function isClaudeAuthError(text: unknown): boolean {
+  return typeof text === 'string' && AUTH_ERROR_RE.test(text);
 }
 
 /** The SSO authorize URL, or null. Anything else is not opened. */
@@ -82,16 +107,15 @@ export function takeLoginView(
   return incoming;
 }
 
-export function loginTransport(err: unknown): LoginTransport {
+export function loginTransport(err: unknown, op: 'status' | 'action' = 'action'): LoginTransport {
   const data = (err as { response?: { status?: number; data?: { code?: string } } })?.response;
-  const code = data?.data?.code;
-  if (code === 'offline' || data?.status === 503) return 'offline';
+  if (!data) return 'unreachable';
+  const code = data.data?.code;
+  if (code === 'offline' || data.status === 503) return 'offline';
   if (code === 'login-missing') return 'missing';
   if (code === 'no-box') return 'no-box';
-  if (code === 'rate-limited' || data?.status === 429) return 'rate';
-  if (data?.status === 504 || data?.status === 502 || code === 'timeout' || code === 'login-failed') return 'failed';
-  if (!data) return 'offline';
-  return 'failed';
+  if (code === 'rate-limited' || data.status === 429) return 'rate';
+  return op === 'status' ? 'check-failed' : 'failed';
 }
 
 /** A server error the card may show. Anything that looks like a paste is dropped. */
@@ -112,6 +136,20 @@ function needed(): LoginCardModel {
   };
 }
 
+const LOST = "Claude's sign-in on this box expired or was revoked, so the last turn failed. Sign in again to continue.";
+
+/** A turn failed on the box's sign-in, and Claude may still read as signed in. */
+function lost(view: ClaudeLoginView): LoginCardModel {
+  if (view.authMethod === 'third_party') {
+    return {
+      mode: 'quiet',
+      title: "Claude couldn't authenticate",
+      body: 'This box signs in through the termag gateway, and the gateway refused the last turn. Signing in here will not fix that.',
+    };
+  }
+  return { ...needed(), body: LOST };
+}
+
 function retry(error: string | undefined, fallback: string): LoginCardModel {
   return {
     mode: 'retry',
@@ -122,6 +160,43 @@ function retry(error: string | undefined, fallback: string): LoginCardModel {
   };
 }
 
+/** The box or its agent is not answering. The box feed says which. */
+function boxDown(box: InstanceStatus | null | undefined): LoginCardModel {
+  switch (box) {
+    case 'provisioning': case 'awaiting-agent': case 'warming': case 'warm': case 'starting':
+      return { mode: 'offline', title: 'Box is starting', body: 'Waiting for this box to come online.' };
+    case 'stopping': case 'stopped':
+      return { mode: 'offline', title: 'Box is stopped', body: 'Start it from the Boxes list to use it.' };
+    case 'hibernating': case 'hibernated':
+      return { mode: 'offline', title: 'Box is hibernated', body: 'Start it from the Boxes list to use it.' };
+    case 'failed': case 'terminated':
+      return { mode: 'offline', title: 'Box is gone', body: 'This box failed or was terminated.' };
+    case 'ready':
+      return { mode: 'offline', title: "Couldn't reach the agent", body: "This box is running, but its termag agent is not connected. Waiting for it to reconnect." };
+    default:
+      return { mode: 'offline', title: 'Box is offline', body: 'Waiting for this box to come online.' };
+  }
+}
+
+const HIDDEN: LoginCardModel = { mode: 'hidden', title: '', body: '' };
+
+/**
+ * A failure that says nothing about sign-in: termag, the box or its agent.
+ * Hidden when the chat already says the box or its agent is down (its
+ * status line, beside the box's own actions): the card does not repeat it.
+ */
+function notSignIn(transport: LoginTransport, box: InstanceStatus | null | undefined, error?: string, hostShowsBox?: boolean): LoginCardModel | null {
+  if (hostShowsBox && (transport === 'offline' || transport === 'unreachable')) return HIDDEN;
+  if (transport === 'offline') return boxDown(box);
+  if (transport === 'unreachable') {
+    return { mode: 'offline', title: "Couldn't reach termag", body: 'Check your connection. This will try again.' };
+  }
+  if (transport === 'check-failed') {
+    return { mode: 'offline', title: "Couldn't reach the agent", body: error || "The box's agent did not answer. This will try again." };
+  }
+  return null;
+}
+
 /**
  * The card for one status. A box that is already signed in (the gateway, or
  * a finished login) draws nothing until this tab has been through a sign-in.
@@ -129,12 +204,29 @@ function retry(error: string | undefined, fallback: string): LoginCardModel {
  */
 export function loginCard(
   view: ClaudeLoginView | null,
-  opts: { owner: boolean; engaged: boolean; transport: LoginTransport; transportError?: string },
+  opts: {
+    owner: boolean;
+    engaged: boolean;
+    transport: LoginTransport;
+    transportError?: string;
+    box?: InstanceStatus | null;
+    /** The chat's status line already says the box or its agent is down. */
+    hostShowsBox?: boolean;
+    /** A turn in this chat failed on Claude's sign-in (sdkChat authFailure). */
+    authLost?: boolean;
+  },
 ): LoginCardModel | null {
+  const boxCard = () => (opts.hostShowsBox ? HIDDEN : boxDown(opts.box));
   if (!opts.owner) {
-    if (view?.phase === 'ready' || view?.phase === 'unavailable') return null;
     if (opts.transport === 'missing' || opts.transport === 'no-box') return null;
-    if (!view && !opts.transport) return null;
+    const down = notSignIn(opts.transport, opts.box, opts.transportError, opts.hostShowsBox);
+    if (down) return down;
+    if (view?.phase === 'offline') return boxCard();
+    if (opts.authLost && view && (view.phase === 'ready' || view.phase === 'owner')) {
+      return { mode: 'owner', title: 'Claude Enterprise', body: 'Claude on this box needs to be signed in again. The owner of this box needs to sign in to Claude Enterprise.' };
+    }
+    if (view?.phase === 'ready' || view?.phase === 'unavailable') return null;
+    if (!view) return null;
     return {
       mode: 'owner',
       title: 'Claude Enterprise',
@@ -146,16 +238,23 @@ export function loginCard(
   if (opts.transport === 'missing') {
     return { mode: 'quiet', title: 'Claude Enterprise', body: "This box's termag needs an update before sign-in can happen here." };
   }
+  // A turn failed on the sign-in, so a `ready` view is the dead seat. A
+  // failed read or Sign in since then says so; it never falls to "Signed in".
+  if (view?.phase === 'ready' && opts.authLost) {
+    if (!opts.transport) return lost(view);
+    return notSignIn(opts.transport, opts.box, opts.transportError, opts.hostShowsBox)
+      ?? (opts.transport === 'rate'
+        ? retry(opts.transportError, 'Too many sign-in attempts. Wait a few minutes and try again.')
+        : retry(opts.transportError, 'Claude sign-in failed. Try again.'));
+  }
   if (view?.phase === 'ready') {
     if (!opts.engaged) return null;
     return { mode: 'signed-in', title: 'Claude Enterprise', body: 'Signed in to Claude. You can send a message.' };
   }
-  if (opts.transport === 'offline' && (!view || view.phase === 'needed' || view.phase === 'offline')) {
-    return {
-      mode: 'offline',
-      title: 'Sign in to Claude Enterprise',
-      body: 'Waiting for this box to come online. Sign-in will be here once it is.',
-    };
+  // An open sign-in keeps its card (and its paste field) through a blip.
+  if (!view || !OPEN_LOGIN.has(view.phase)) {
+    const down = notSignIn(opts.transport, opts.box, opts.transportError, opts.hostShowsBox);
+    if (down) return down;
   }
   if (opts.transport === 'rate') return retry(opts.transportError, 'Too many sign-in attempts. Wait a few minutes and try again.');
   // A failed Sign in keeps the loaded `needed` view. That view used to win
@@ -170,10 +269,8 @@ export function loginCard(
   if (view.phase === 'owner') {
     return { mode: 'owner', title: 'Claude Enterprise', body: view.error || 'The owner of this box needs to sign in to Claude Enterprise.' };
   }
-  if (view.phase === 'offline') {
-    return { mode: 'offline', title: 'Sign in to Claude Enterprise', body: view.error || 'Waiting for this box to come online. Sign-in will be here once it is.' };
-  }
-  if (view.phase === 'needed') return needed();
+  if (view.phase === 'offline') return boxCard();
+  if (view.phase === 'needed') return opts.authLost ? { ...needed(), body: LOST } : needed();
   if (view.phase === 'starting') {
     return { mode: 'starting', title: 'Sign in to Claude Enterprise', body: 'Asking the box for a sign-in link…' };
   }

@@ -1,8 +1,9 @@
 // Spaces in the simple UI: New chat's optional space step
-// and the sidebar's grouping by space. One space per box is a simple-UI
-// convention only: New chat grants a box one space, and the backend stays
-// many-to-many, so a box the full UI gave a second space is shown under the
-// first by name with the others noted.
+// and the sidebar's grouping by space. A chat belongs to exactly one space,
+// fixed on the server when it starts (backend services/chatSpace.ts): its
+// group, header chip and memory are that space's wherever it is opened from
+// (chatHomeSpace). New chat grants a box one space, and the backend stays
+// many-to-many, so a chat's box may reach others too; they are noted.
 import type { SpaceBoxGrant, SpaceView } from '../services/api';
 import { roleAtLeast, SPACE_NAME_HINT, SPACE_NAME_RE } from '../utils/spaces';
 
@@ -106,8 +107,12 @@ export async function grantBox(space: string | null, boxId: string, api: SpaceGr
   if (space) await api.addBox(space, boxId);
 }
 
-/** Box id → names of the spaces it reaches, explicit grants first, then inherited, each by name. */
-export function boxSpaceIndex(entries: ReadonlyArray<{ space: string; boxes: readonly SpaceBoxGrant[] }>): Map<string, string[]> {
+/**
+ * Box id → names of the spaces it reaches, explicit grants first, then
+ * inherited, each by name. A terminated box whose projects stay listed in a
+ * space (`listed`) counts as granted there, so its chats keep their space.
+ */
+export function boxSpaceIndex(entries: ReadonlyArray<{ space: string; boxes: readonly SpaceBoxGrant[]; listed?: ReadonlyArray<{ id: string }> }>): Map<string, string[]> {
   const explicit = new Map<string, Set<string>>();
   const inherited = new Map<string, Set<string>>();
   const add = (m: Map<string, Set<string>>, box: string, space: string) => {
@@ -115,11 +120,12 @@ export function boxSpaceIndex(entries: ReadonlyArray<{ space: string; boxes: rea
     if (!set) m.set(box, set = new Set());
     set.add(space);
   };
-  for (const { space, boxes } of entries) {
+  for (const { space, boxes, listed = [] } of entries) {
     for (const b of boxes) {
       add(explicit, b.id, space);
       for (const c of b.children) add(inherited, c.id, space);
     }
+    for (const b of listed) add(explicit, b.id, space);
   }
   const out = new Map<string, string[]>();
   for (const id of new Set([...explicit.keys(), ...inherited.keys()])) {
@@ -130,24 +136,42 @@ export function boxSpaceIndex(entries: ReadonlyArray<{ space: string; boxes: rea
   return out;
 }
 
+/** Where a chat lives: its box, and the space the server fixed for it (Workstream.spaceId). */
+export interface ChatPlace { instanceId: string | null; spaceId?: string | null; spaceFixed?: boolean }
+
+/**
+ * The space a chat belongs to, by name: the one the server fixed when it
+ * started (New session's, else its box's first granted at its first use),
+ * while the user has that space; else null, "No space" (a chat started in
+ * none, a space deleted since, or one the user isn't in). A later grant,
+ * the tab it is open in, or Clear never changes it. Only a chat an older
+ * backend never fixed falls back to its box's first space, as before.
+ */
+export function chatHomeSpace(place: ChatPlace, spaces: ReadonlyArray<{ id: string; name: string }>, index: ReadonlyMap<string, readonly string[]>): string | null {
+  if (place.spaceFixed) return place.spaceId ? spaces.find(s => s.id === place.spaceId)?.name ?? null : null;
+  const known = new Set(spaces.map(s => s.name));
+  return (place.instanceId ? index.get(place.instanceId) ?? [] : []).find(s => known.has(s)) ?? null;
+}
+
 export interface SpaceGroupRow<R> { row: R; alsoIn: string[] }
 export interface SpaceGroup<R> { space: string | null; rows: Array<SpaceGroupRow<R>> }
 
 /**
- * The sidebar's chats grouped by their box's space: spaces by name, then
- * "No space" for chats whose box has none. Order within a group is the
- * order given. Empty spaces are left out.
+ * The sidebar's chats grouped by their own space (chatHomeSpace): spaces by
+ * name, then "No space". `alsoIn` is the other spaces the chat's box
+ * reaches. Order within a group is the order given. Empty spaces are left out.
  */
-export function groupBySpace<R extends { instanceId: string | null }>(rows: readonly R[], index: ReadonlyMap<string, readonly string[]>): Array<SpaceGroup<R>> {
+export function groupBySpace<R extends ChatPlace>(
+  rows: readonly R[], spaces: ReadonlyArray<{ id: string; name: string }>, index: ReadonlyMap<string, readonly string[]>,
+): Array<SpaceGroup<R>> {
   const bySpace = new Map<string, Array<SpaceGroupRow<R>>>();
   const ungrouped: Array<SpaceGroupRow<R>> = [];
   for (const row of rows) {
-    const spaces = row.instanceId ? index.get(row.instanceId) ?? [] : [];
-    if (spaces.length === 0) { ungrouped.push({ row, alsoIn: [] }); continue; }
-    const [first, ...rest] = spaces;
-    let list = bySpace.get(first);
-    if (!list) bySpace.set(first, list = []);
-    list.push({ row, alsoIn: rest });
+    const home = chatHomeSpace(row, spaces, index);
+    if (!home) { ungrouped.push({ row, alsoIn: [] }); continue; }
+    let list = bySpace.get(home);
+    if (!list) bySpace.set(home, list = []);
+    list.push({ row, alsoIn: (row.instanceId ? index.get(row.instanceId) ?? [] : []).filter(s => s !== home) });
   }
   const groups: Array<SpaceGroup<R>> = [...bySpace.keys()].sort().map(space => ({ space, rows: bySpace.get(space)! }));
   if (ungrouped.length > 0) groups.push({ space: null, rows: ungrouped });
@@ -155,12 +179,13 @@ export function groupBySpace<R extends { instanceId: string | null }>(rows: read
 }
 
 /**
- * The space a chat's header names: its box's first space, as the sidebar
- * groups it, with the others noted. Null when the box has none.
+ * The space a chat's header names: its own (chatHomeSpace), as the sidebar
+ * groups it, with the other spaces its box reaches noted. Null for none.
  */
-export function spaceOfBox(instanceId: string | null | undefined, index: ReadonlyMap<string, readonly string[]>): { space: string; alsoIn: string[] } | null {
-  const [space, ...alsoIn] = (instanceId && index.get(instanceId)) || [];
-  return space ? { space, alsoIn } : null;
+export function chatHeaderSpace(place: ChatPlace, spaces: ReadonlyArray<{ id: string; name: string }>, index: ReadonlyMap<string, readonly string[]>): { space: string; alsoIn: string[] } | null {
+  const space = chatHomeSpace(place, spaces, index);
+  if (!space) return null;
+  return { space, alsoIn: (place.instanceId ? index.get(place.instanceId) ?? [] : []).filter(s => s !== space) };
 }
 
 // Which sidebar groups are folded, by space name, kept in localStorage so a

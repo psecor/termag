@@ -70,6 +70,21 @@ export function parseSpaceFileLink(href: string, origin: string, base: string): 
   return { space, path: rest.join('/') };
 }
 
+/**
+ * The space and folder a link to a folder names: a file link's form ending in
+ * `/` (`<base>files/<space>/a/b/`, `dir` 'a/b/'), or the space's own
+ * (`<base>files/<space>/`, `dir` ''). Null for a file's link and anything
+ * parseSpaceFileLink refuses.
+ */
+export function parseSpaceFolderLink(href: string, origin: string, base: string): { space: string; dir: string } | null {
+  let url: URL;
+  try { url = new URL(href, origin); } catch { return null; }
+  if (!url.pathname.endsWith('/')) return null;
+  // A file link to a stand-in name in the folder, then the name dropped.
+  const file = parseSpaceFileLink(`${url.origin}${url.pathname}_`, origin, base);
+  return file ? { space: file.space, dir: file.path.slice(0, -1) } : null;
+}
+
 /** The folder a path sits in: `a/b/c.txt` → `a/b/`. */
 export function parentPrefix(path: string): string {
   const bare = path.endsWith('/') ? path.slice(0, -1) : path;
@@ -145,7 +160,7 @@ export function relPathError(rel: string): string | null {
 export type PreviewKind = 'image' | 'pdf' | 'text' | null;
 
 const IMAGE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
-const TEXT = new Set(['txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml', 'xml', 'ini', 'sh', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'rs', 'sql', 'diff', 'patch']);
+const TEXT = new Set(['txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml', 'xml', 'ini', 'sh', 'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'rs', 'sql', 'diff', 'patch', 'mmd', 'mermaid']);
 
 function extension(path: string): string {
   const name = path.slice(path.lastIndexOf('/') + 1);
@@ -156,7 +171,8 @@ function extension(path: string): string {
 /**
  * How a file previews. SVG and HTML are deliberately not images or pages
  * here: either can carry script, and a space is written by other people.
- * Text is fetched and shown as text, never rendered.
+ * Text is fetched and shown as text, never rendered, except a Mermaid file
+ * (.mmd, .mermaid), drawn as an image of its diagram (chat/mermaid.ts).
  */
 export function previewKind(path: string): PreviewKind {
   const ext = extension(path);

@@ -1,0 +1,7 @@
+/* ComboBox.tsx: the input and its chevron on one line inside the group's one
+   border, as LaunchPad draws a combo box (its own rule for the inner input
+   doesn't survive the build's cut of its stylesheet, launchpadCss.ts). */
+.genui-surface .genui-combobox-group { display: flex; align-items: center; gap: 2px; padding-block: 0; padding-inline-end: 2px; }
+.genui-surface .genui-combobox-group input {
+  flex: 1; min-width: 0; border: none; outline: none; background: transparent; padding: 6px 0;
+}

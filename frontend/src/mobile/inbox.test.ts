@@ -83,6 +83,27 @@ describe('buildRows', () => {
     expect(out.find(r => r.key === 'p1|main')?.sessionTitle).toBeNull();
     expect(out.find(r => r.key === 'p2|main')?.sessionTitle).toBeNull();
   });
+
+  it("carries an ask chat's thread title and id", () => {
+    const asked = projects.map(p => (p.id === 'p1'
+      ? { ...p, workstreams: p.workstreams.map(w => (w.name === 'termag-tui' ? { ...w, askThread: { id: 'thread00001', title: ' Readable names ' } } : w)) }
+      : p));
+    const out = buildRows(asked, statusMap, 'psecor');
+    expect(out.find(r => r.key === 'p1|termag-tui')).toMatchObject({ askTitle: 'Readable names', askThreadId: 'thread00001' });
+    expect(out.find(r => r.key === 'p1|termag-tui')?.askParent).toBeNull();
+    const parented = asked.map(p => ({ ...p, workstreams: p.workstreams.map(w => (w.askThread ? { ...w, askThread: { ...w.askThread, parentProjectId: 'p2', parentWorkstream: 'main' } } : w)) }));
+    expect(buildRows(parented, statusMap, 'psecor').find(r => r.key === 'p1|termag-tui')?.askParent).toEqual({ projectId: 'p2', workstream: 'main' });
+    expect(out.find(r => r.key === 'p1|main')?.askThreadId).toBeUndefined();
+  });
+
+  it("carries the workstream and repository an ask chat's thread asks, null from an older orchestrator", () => {
+    const asked = (thread: Record<string, unknown>) => buildRows(projects.map(p => (p.id === 'p1'
+      ? { ...p, workstreams: p.workstreams.map(w => (w.name === 'termag-tui' ? { ...w, askThread: { id: 'thread00001', title: null, ...thread } } : w)) }
+      : p)), statusMap, 'psecor').find(r => r.key === 'p1|termag-tui');
+    expect(asked({ workstream: 'fix', repoName: 'web' })?.askTarget).toEqual({ workstream: 'fix', repo: 'web' });
+    expect(asked({ workstream: 'main' })?.askTarget).toEqual({ workstream: 'main', repo: null });
+    expect(asked({})?.askTarget).toBeNull();
+  });
 });
 
 describe('buildHome', () => {
@@ -206,6 +227,12 @@ describe('search tab', () => {
     expect(searchRows(home.rows, 'dev02')).toEqual([]);
     expect(searchRows(home.rows, 'dev02', boxOf).map(r => r.key)).toEqual(['p2|main']);
   });
+
+  it('matches the name it is given for a session (its title) only when given one', () => {
+    const nameOf = (r: { key: string }) => (r.key === 'p4|main' ? 'Fix the flaky retry' : null);
+    expect(searchRows(home.rows, 'flaky')).toEqual([]);
+    expect(searchRows(home.rows, 'flaky retry', undefined, nameOf).map(r => r.key)).toEqual(['p4|main']);
+  });
 });
 
 describe('providerFor', () => {
@@ -288,5 +315,28 @@ describe('statusMapFromSessions', () => {
     expect(rows[0].contextTokens).toBe(412_000);
     // No updatedAt: the session's last activity stands in.
     expect(rows[1].updatedAt).toBe(at(30));
+  });
+});
+
+describe('a workstream with several review panes (docs/parallel-reviews.md)', () => {
+  it('shows the most urgent pane: its ring, its PR in the label', () => {
+    const map: Record<string, AgentStatus> = {
+      [statusKey('box1', 'psecor-docs-agent')]: st('idle', 20, {
+        review: review('reviewing', 20, 401),
+        reviews: [review('reviewing', 20, 401), review('waiting', 5, 402), review('done', 2, 403)],
+      }),
+    };
+    const row = buildRows([docs], map, 'psecor').find(r => r.projectId === 'p7')!;
+    expect(row.ring).toBe('waiting');
+    expect(row.review?.pr).toBe(402);
+    expect(row.band).toBe('attention');
+    expect(row.reviewCount).toBe(1);
+  });
+  it('counts the panes that share the ring, for the tooltip (Devin, #786)', () => {
+    const map: Record<string, AgentStatus> = {
+      [statusKey('box1', 'psecor-docs-agent')]: st('idle', 20, { reviews: [review('done', 9, 401), review('done', 2, 403), review('done', 1, 404, true)] }),
+    };
+    const row = buildRows([docs], map, 'psecor').find(r => r.projectId === 'p7')!;
+    expect([row.ring, row.reviewCount]).toEqual(['done', 2]);
   });
 });

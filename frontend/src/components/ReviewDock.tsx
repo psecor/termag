@@ -2,6 +2,7 @@ import React from 'react';
 import { Terminal } from './Terminal';
 import { reviewApi } from '../services/api';
 import { reviewStateLabel, reviewStateText, type ReviewStatus } from '../utils/review';
+import { panePrLabel } from '../utils/reviewPanes';
 import type { SessionReview } from '../types';
 
 interface Props {
@@ -15,18 +16,21 @@ interface Props {
   expanded: boolean;
   onToggle: () => void;
   onStop: () => void;
+  /** Shown on the first pane while two or more are open. */
+  onCollapseAll?: () => void;
 }
 
 /**
- * The review pane's home at the bottom of the ctrl column. Collapsed it is a
- * one-line bar ("Review · PR #123 · Devin reviewing… / needs an answer /
- * Review ready"); expanded it takes
- * half the column's height and attaches a terminal to the `review` tmux
- * session so Devin's output can be read and answered in place. Stop kills the
- * session and the dock goes away. Its state comes from the backend's review
- * sweep via the status channel, not from polling.
+ * A review pane's home at the bottom of the ctrl column, one per pane,
+ * stacked in slot order. Collapsed it is a
+ * one-line bar ("Review · termag#123 · Devin reviewing… / needs an answer /
+ * Review ready"); expanded it shares the column with the other open ones and
+ * attaches a terminal to its tmux session so the reviewer's output can be
+ * read and answered in place. Stop kills that session and its dock goes away.
+ * Its state comes from the backend's review sweep via the status channel,
+ * not from polling.
  */
-export function ReviewDock({ projectId, instanceId, workstream, sessionName, status, review, expanded, onToggle, onStop }: Props) {
+export function ReviewDock({ projectId, instanceId, workstream, sessionName, status, review, expanded, onToggle, onStop, onCollapseAll }: Props) {
   const label = reviewStateLabel(status);
   // Clicking into the Devin pane is what "reading the review" means: post
   // seen while the review is ready, so the ring clears.
@@ -34,8 +38,9 @@ export function ReviewDock({ projectId, instanceId, workstream, sessionName, sta
   // still running keeps its ring whatever the pane's focus does.
   const seenDue = review?.state === 'done';
   const onTerminalFocus = React.useCallback(() => {
-    if (seenDue) reviewApi.seen(projectId, workstream).catch(() => {});
-  }, [seenDue, projectId, workstream]);
+    if (seenDue) reviewApi.seen(projectId, workstream, sessionName).catch(() => {});
+  }, [seenDue, projectId, workstream, sessionName]);
+  const prLabel = panePrLabel(status.pr, status.url);
   return (
     <div className={`review-dock ${expanded ? 'is-expanded' : ''}`}>
       <div
@@ -49,13 +54,17 @@ export function ReviewDock({ projectId, instanceId, workstream, sessionName, sta
       >
         <span className="review-dock-caret" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
         <span className="review-dock-title">Review</span>
-        {status.pr != null && (
+        {prLabel != null && (
           status.url
-            ? <a className="review-dock-pr" href={status.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}>PR #{status.pr}</a>
-            : <span className="review-dock-pr">PR #{status.pr}</span>
+            ? <a className="review-dock-pr" href={status.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}>{prLabel}</a>
+            : <span className="review-dock-pr">{prLabel}</span>
         )}
         <span className={`review-dock-state is-${label}`}>{reviewStateText(label, status.reviewer)}</span>
         <span className="review-dock-spacer" />
+        {onCollapseAll && (
+          <button type="button" className="review-dock-btn" title="Collapse every review pane"
+            onClick={e => { e.stopPropagation(); onCollapseAll(); }}>Collapse all</button>
+        )}
         <button
           type="button"
           className="review-dock-btn"
@@ -82,7 +91,7 @@ export function ReviewDock({ projectId, instanceId, workstream, sessionName, sta
             active={true}
             autoFocus={false}
             onFocus={seenDue ? onTerminalFocus : undefined}
-            key={`${projectId}-${workstream}-review`}
+            key={`${projectId}-${workstream}-${sessionName}`}
           />
         </div>
       )}

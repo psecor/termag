@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chatMode, parsePane, scanStyled, splitFences, stripSgr } from './paneChat';
+import { chatMode, parsePane, scanStyled, splitFences, stripOsc, stripSgr } from './paneChat';
 
 const ESC = '\x1b';
 const DIV = '─'.repeat(100) + '�'; // tmux cuts the last glyph at the pane edge; spans the (wide) pane
@@ -391,6 +391,36 @@ const CLAUDE_PERMISSION = [
   '   3. No, and tell Claude what to do differently (esc)',
 ].join('\n');
 
+// The narrow pane's URL as tmux `capture-pane -e` keeps Claude Code's OSC 8
+// hyperlink: one open-and-close pair around each row's part of it.
+const NARROW_URL = 'https://github.com/example-team/termag/blob/termag-diagram/docs/architecture.md';
+const osc8 = (text: string) => `${ESC}]8;id=198umnd;${NARROW_URL}${ESC}\\${text}${ESC}]8;;${ESC}\\`;
+const CLAUDE_NARROW_LINKED = CLAUDE_NARROW
+  .replace('  Links are unchanged: https', `  Links are unchanged: ${osc8('https')}`)
+  .replace('  ://github.com/example-team', `  ${osc8('://github.com/example-team')}`)
+  .replace('  /termag/blob/termag-diagra', `  ${osc8('/termag/blob/termag-diagra')}`)
+  .replace('  m/docs/architecture.md and', `  ${osc8('m/docs/architecture.md')} and`);
+
+describe('parsePane · hyperlinks', () => {
+  it('drops the OSC 8 wrappers and glues a wrapped link back into its URL', () => {
+    expect(CLAUDE_NARROW_LINKED).toContain(']8;');
+    const texts = parsePane(CLAUDE_NARROW_LINKED, { provider: 'claude', role: 'agent' }).blocks.map(b => b.text);
+    expect(texts[1]).toContain(`Links are unchanged: ${NARROW_URL} and the two SVGs beside it.`);
+    expect(texts.join('\n')).not.toContain(']8;');
+  });
+
+  it('drops them from the ctrl shell too', () => {
+    const p = parsePane(`$ open ${ESC}]8;;http://localhost/${ESC}\\http://localhost/${ESC}]8;;${ESC}\\\n$ `, { provider: null, role: 'ctrl' });
+    expect(p.blocks[0].text).toBe('$ open http://localhost/\n$');
+  });
+});
+
+describe('stripOsc', () => {
+  it('removes OSC sequences ended by ST or BEL, and leaves the text they wrap', () => {
+    expect(stripOsc(`${ESC}]8;;https://x.test/${ESC}\\x.test${ESC}]8;;${ESC}\\ and ${ESC}]0;title\x07done`)).toBe('x.test and done');
+  });
+});
+
 describe('parsePane · Claude permission prompt', () => {
   it('becomes a dialog block with its options counted, not muted system text', () => {
     const p = parsePane(CLAUDE_PERMISSION, { provider: 'claude', role: 'agent' });
@@ -589,7 +619,7 @@ describe('parsePane · pi', () => {
     expect(code).toContain('```ts\nconst a = 1;\nconst b = 2;\n```');
     expect(splitFences(code)).toEqual([
       { code: false, text: 'The current code:' },
-      { code: true, text: 'const a = 1;\nconst b = 2;' },
+      { code: true, text: 'const a = 1;\nconst b = 2;', lang: 'ts' },
     ]);
   });
 

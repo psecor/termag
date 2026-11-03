@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { notePageLocation, pageEntry, readUiMode, routerEntry, shouldOpenSimpleUi, UI_MODE_KEY, writeUiMode } from './uiMode';
+import { notePageLocation, pageEntry, readUiMode, routerEntry, shouldOpenSimpleUi, simpleUiShareHandoff, UI_MODE_KEY, writeUiMode } from './uiMode';
 
 function memory(): Storage {
   const m = new Map<string, string>();
@@ -60,8 +60,8 @@ describe('shouldOpenSimpleUi', () => {
     expect(shouldOpenSimpleUi({ ...base, entry: '/settings', here: '/settings' })).toBe(false);
   });
 
-  it('never redirects in-app navigation to / (Full UI, the back button)', () => {
-    // The page was loaded at /chat and the user followed Full UI.
+  it('never redirects in-app navigation to / (Lab, the back button)', () => {
+    // The page was loaded at /chat and the user followed Lab.
     expect(shouldOpenSimpleUi({ ...base, entry: '/chat' })).toBe(false);
     // The workspace was already shown once in this page.
     expect(shouldOpenSimpleUi({ ...base, entry: null })).toBe(false);
@@ -69,8 +69,31 @@ describe('shouldOpenSimpleUi', () => {
 
   it('never redirects a / the router navigated to, even before the workspace mounted', () => {
     // Loaded at / on a phone: the mobile redirect sent it to /m first, then
-    // the inbox's Full UI pushed / again. The entry is still /, the key is not.
+    // the inbox's Lab pushed / again. The entry is still /, the key is not.
     expect(shouldOpenSimpleUi({ ...base, locationKey: 'k3x9q2' })).toBe(false);
+  });
+});
+
+describe('simpleUiShareHandoff', () => {
+  const on = { flagOn: true, sidePanelOn: true, mode: 'simple' as const };
+  const link = '?project=p1&ws=feature-x&browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx%3Fenv%3Dprod';
+
+  it('takes a share link its owner opened to the chat, with the handoff for its side panel', () => {
+    expect(simpleUiShareHandoff({ ...on, search: link }))
+      .toBe('/chat/p/p1?ws=feature-x&browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx%3Fenv%3Dprod');
+    expect(simpleUiShareHandoff({ ...on, search: '?project=p%2F1&browser=open' })).toBe('/chat/p/p%2F1?ws=main&browser=open');
+  });
+
+  it('leaves it to the workspace when the full UI was last, or either flag is off', () => {
+    expect(simpleUiShareHandoff({ ...on, mode: 'full', search: link })).toBeNull();
+    expect(simpleUiShareHandoff({ ...on, flagOn: false, search: link })).toBeNull();
+    expect(simpleUiShareHandoff({ ...on, sidePanelOn: false, search: link })).toBeNull();
+  });
+
+  it('leaves every other workspace URL alone', () => {
+    expect(simpleUiShareHandoff({ ...on, search: '' })).toBeNull();
+    expect(simpleUiShareHandoff({ ...on, search: '?project=p1&ws=feature-x' })).toBeNull();
+    expect(simpleUiShareHandoff({ ...on, search: '?browser=open&browserShare=cshare0000000001' })).toBeNull();
   });
 });
 

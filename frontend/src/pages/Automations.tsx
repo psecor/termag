@@ -2,12 +2,16 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { automationsApi, type AutomationRunView, type AutomationView } from '../services/api';
-import { AutomationFields, draftBody, draftCron, draftFrom, type AutomationDraft } from '../components/AutomationFields';
+import { AutomationFields } from '../components/AutomationFields';
+import { draftBody, draftCron, draftFrom, type AutomationDraft } from '../utils/automationDraft';
 import { runConversationHref } from '../chat/simpleChat';
 import { FLAGS, useFlag } from '../flags';
-import { RUN_STATE_LABEL, agoLabel, automationSubtitle, describeSchedule, occurrenceShort, untilLabel } from '../utils/automationSchedule';
+import { RUN_STATE_LABEL, agoLabel, automationSubtitle, boxStartFailuresLabel, describeSchedule, occurrenceShort, untilLabel } from '../utils/automationSchedule';
 import { runNowRefusal } from '../utils/automationRunNow';
 import { fmtDurationShort } from '../utils/format';
+import { automationModelBody, automationModelId, automationModelOptions } from '../utils/automationModel';
+import { useChatModelOptions } from '../chat/useChatModelOptions';
+import { chatModelLabel } from '../chat/composer';
 
 /**
  * Automations: `/automations` lists the user's own and
@@ -91,6 +95,8 @@ function AutomationDetail({ id }: { id: string }) {
   const [fullTierTicked, setFullTierTicked] = useState(false);
   const [memory, setMemory] = useState<{ path: string; content: string | null } | null | 'error'>(null);
   const [showMemory, setShowMemory] = useState(false);
+  // The model the next run starts on: New session's options, saved on change (utils/automationModel.ts).
+  const modelChoices = useChatModelOptions();
   // The page's own load failure, apart from `error`, which an action set and
   // the next successful poll must not clear before it is read.
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -193,9 +199,24 @@ function AutomationDetail({ id }: { id: string }) {
         {loadError && view && <p className="error-text">{loadError}</p>}
         <dl className="auto-facts usage-dim">
           <div><dt>Schedule</dt><dd>{describeSchedule(view.schedule, view.timezone)}{view.next[0] && <> · next {occurrenceShort(view.next[0], view.timezone)} ({untilLabel(view.next[0])})</>}</dd></div>
+          {boxStartFailuresLabel(view.boxStartFailures) && <div><dt>Box</dt><dd className="error-text">{boxStartFailuresLabel(view.boxStartFailures)}</dd></div>}
           <div><dt>Repository</dt><dd>{view.repoUrl ?? 'none'}{view.defaultBranch && <> · base {view.defaultBranch}</>}</dd></div>
           {view.spaceName && <div><dt>Notes</dt><dd>mirrored to space <code>{view.spaceName}</code> at <code>automations/{view.projectId}/memory/MEMORY.md</code></dd></div>}
           <div><dt>Permissions</dt><dd>{view.tier === 'read' ? 'read-only' : 'full, Claude in auto mode'}{view.prOnChange && view.tier !== 'read' && ' · opens a draft PR when a run committed'}</dd></div>
+          <div><dt>Model</dt><dd>{(() => {
+            const model = automationModelId(view);
+            const options = automationModelOptions(model, modelChoices);
+            if (!owner) return chatModelLabel(model, options);
+            return (
+              <select aria-label="Model" className="auto-model" value={model} onChange={e => {
+                const picked = options.find(o => o.id === e.target.value);
+                if (picked) void act(() => automationsApi.update(view.id, automationModelBody(picked.id)), `The next run starts on ${picked.label}`);
+              }}>
+                <optgroup label="Claude">{options.filter(o => !o.fireworks).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</optgroup>
+                {options.some(o => o.fireworks) && <optgroup label="Fireworks">{options.filter(o => o.fireworks).map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</optgroup>}
+              </select>
+            );
+          })()} <span className="usage-dim">· a run already going keeps its own</span></dd></div>
         </dl>
       </section>
 
@@ -215,7 +236,7 @@ function AutomationDetail({ id }: { id: string }) {
                   <td className="auto-summary" title={r.summary ?? undefined}>{r.summary ?? ''}</td>
                   <td>{r.prUrl ? <a href={r.prUrl} target="_blank" rel="noreferrer">PR</a> : r.branch ? <code>{r.branch.split('/').pop()}</code> : ''}</td>
                   <td className="auto-actions">
-                    {r.workstream && <Link to={runConversationHref(view.projectId, r.workstream, simpleUi)} title={simpleUi ? "The run's conversation in the simple UI" : "The run's conversation in the workspace"}>💬</Link>}
+                    {r.workstream && <Link to={runConversationHref(view.projectId, r.workstream, simpleUi)} title={simpleUi ? "The run's conversation in termag" : "The run's conversation in the workspace"}>💬</Link>}
                     {owner && (r.state === 'running' || r.state === 'pending') && (
                       <button type="button" className="btn-tiny" onClick={() => act(() => automationsApi.stopRun(view.id, r.id), 'Run stopped')}>Stop</button>
                     )}

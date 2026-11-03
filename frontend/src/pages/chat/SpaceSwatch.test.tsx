@@ -22,19 +22,29 @@ afterEach(() => {
   act(() => root.unmount());
 });
 
-function render(instanceId: string | null, value: Partial<SharedChatSpaces>) {
+const other: SpaceView = { ...mine, id: '2', name: 'other' };
+
+/** A chat on box `instanceId`; `spaceId` the space the server fixed for it (undefined: not fixed, an older backend). */
+function render(instanceId: string | null, value: Partial<SharedChatSpaces>, spaceId?: string | null) {
   const shared: SharedChatSpaces = { enabled: true, loaded: true, current: true, spaces: [mine], index: new Map([['box-a', ['mine', 'other']]]), colorOf: spaceColor, ...value };
-  act(() => root.render(<ChatSpacesProvider value={shared}><ChatSpaceChip instanceId={instanceId} /></ChatSpacesProvider>));
+  const place = { instanceId, ...(spaceId !== undefined ? { spaceId, spaceFixed: true } : {}) };
+  act(() => root.render(<ChatSpacesProvider value={shared}><ChatSpaceChip place={place} /></ChatSpacesProvider>));
   return host.querySelector<HTMLElement>('.chat-title-space');
 }
 
 describe('ChatSpaceChip', () => {
-  it('names the box\'s space in its colour, noting the others', () => {
-    const chip = render('box-a', { colorOf: () => SPACE_COLORS[2] })!;
+  it('names the chat\'s own space in its colour, noting the others its box reaches', () => {
+    const chip = render('box-a', { colorOf: () => SPACE_COLORS[2] }, '1')!;
     expect(chip.textContent).toBe('mine');
-    expect(chip.title).toBe('In space mine, also in other');
+    expect(chip.title).toBe('In space mine (its box also reaches other)');
     expect(chip.style.getPropertyValue('--space-color')).toBe(SPACE_COLORS[2].hex);
     expect(chip.querySelector<HTMLElement>('.space-swatch')?.style.getPropertyValue('--space-color')).toBe(SPACE_COLORS[2].hex);
+  });
+
+  it('is the space the chat was fixed to, not its box\'s first (plan-outbox #38)', () => {
+    expect(render('box-a', { spaces: [mine, other] }, '2')?.textContent).toBe('other');
+    // Fixed to none: No space, though its box reaches spaces now.
+    expect(render('box-a', { spaces: [mine, other] }, null)?.textContent).toBe('No space');
   });
 
   it('says No space, neutral, once the user has spaces', () => {
@@ -48,6 +58,8 @@ describe('ChatSpaceChip', () => {
     // A new session: its box appeared, and the reload that would place it is in flight.
     expect(render('box-new', { current: false })).toBeNull();
     expect(render('box-a', { current: false })?.textContent).toBe('mine');
+    // A fixed chat needs no index: its space is known.
+    expect(render('box-new', { current: false }, '1')?.textContent).toBe('mine');
   });
 
   it('shows nothing while spaces are off, loading, or the user has none', () => {

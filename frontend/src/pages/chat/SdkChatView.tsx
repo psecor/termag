@@ -5,87 +5,124 @@
 // markdown bubbles, tool cards and one status line. While the chat comes up
 // it narrates the box, the clone and Claude (chat/newChat.ts setupSteps), and
 // a first message waits in the same storage-backed queue the pane chat uses
-// (chat/useQueuedMessage.ts) until the runner can take it.
-import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { createPortal } from 'react-dom';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+// (chat/useQueuedMessage.ts) until the runner can take it. The chat's state
+// is useSdkChat's and its composer SdkComposer, shared with the file view.
+import { HeadingStoreContext } from '../../chat/toolGroupHeadings';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal, flushSync } from 'react-dom';
+import { Link } from 'react-router-dom';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { Dialog } from '../../components/Dialog';
-import { announceChatsChanged, archiveBoxNotice, clearRunningBox, dismissRunningBoxNotice, dropLastActiveProject, historyComingUp, historyFailureIsSetup, isPowerRestart, parkedPowerError, readRunningBox, runningBoxFromNotice, saveRunningBox, stillRunningWorkspaceHref, subscribeRunningBoxes, type ReopenNavigationState } from '../../chat/archive';
+import { announceChatsChanged, archiveBoxNotice, clearRunningBox, dismissRunningBoxNotice, dropLastActiveProject, parkedPowerError, runningBoxFromNotice, saveRunningBox, stillRunningWorkspaceHref } from '../../chat/archive';
 import { LAST_ACTIVE_PROJECT_KEY, useProjects } from '../../contexts/ProjectContext';
-import { activityApi, chatApi, chatsApi, instancesApi, visitsApi, type ChatTrust } from '../../services/api';
+import { chatsApi, instancesApi, visitsApi } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
-import { useSetupContext } from '../../hooks/useSetupContext';
-import { cloneTile } from '../../utils/cloneTile';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
-import { chatEvents } from '../../chat/chatEvents';
-import { isSendKey, MAX_KEYS } from '../../chat/compose';
-import { TerminalHoldNotice } from '../../chat/TerminalHoldNotice';
-import { reduceHold, refusalFromSend, statusBesideHold, type HoldState } from '../../chat/terminalHold';
-import { chatLiveKey, publishChatStatus } from '../../chat/chatLiveStatus';
 import { Markdown } from '../../chat/Markdown';
-import { bootEstimateMinutes, preLaunchTail, setupSteps } from '../../chat/newChat';
+import { CodeFenceContext } from '../../chat/codeFence';
+import { GenUiChatContext, GenUiItemContext, renderGenUiFence, type GenUiChat } from '../../chat/genui/SpecFence';
+import { ActionBubble } from '../../chat/genui/ActionBubble';
+import { parseActionMessage, sentSurfaces } from '../../chat/genui/action';
+import { preLaunchTail } from '../../chat/newChat';
 import { parsePane } from '../../chat/paneChat';
-import {
-  addPending, applyEvent, applyFrame, chatCostTotal, chatStatus, commandLine, emptyChat, formatCost, fromHistory, groupTurns, lastAssistantText, liveFrameAction, mergeHistory, retryMessage, sdkReadiness, seedLiveTurn, sendGoesLive, stopControl, stopTitle, turnMeta,
-  type ChatItem, type ChatState, type FrameCursor, type HistoryLoad,
-} from '../../chat/sdkChat';
+import { commandLine, formatCost, groupTurns, loadsEarlier, chatGroupKey, earlierStart, TRANSCRIPT_WINDOW, transcriptWindow, windowStart, type ChatGroup, type ChatItem, type ChatState, tasksLine } from '../../chat/sdkChat';
 import { SetupSteps } from '../../chat/SetupSteps';
 import { groupToolRuns } from '../../chat/toolRuns';
 import { SkillCard, ToolCard, ToolRun } from './ToolCards';
+import { ReplyMeta } from './ChatTimes';
 import { ChatError, UnsentMessages } from './TranscriptNotices';
-import { fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { ReadOnlyTurnNotice } from './ReadOnlyTurnNotice';
+import { chatHref, fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { desktopSessionHref, openDesktopLink } from '../../chat/desktopLinks';
 import { useCapture } from '../../chat/useCapture';
 import { useFollowBottom } from '../../chat/useFollowBottom';
-import { useAutoGrow } from '../../chat/useAutoGrow';
 import { useTranscriptFocus } from '../../chat/transcriptFocus';
-import { useComposerText } from '../../chat/useHandedDraft';
-import { useDictation } from '../../chat/useDictation';
-import { DictationButton, DictationNote } from '../../chat/DictationButton';
-import { useQueuedMessage } from '../../chat/useQueuedMessage';
-import { readModelPick, useChatModel } from '../../chat/useChatModel';
-import { ModelPicker } from '../../chat/ModelPicker';
-import { useChatModelOptions } from '../../chat/useChatModelOptions';
-import { admitImages, CHAT_IMAGE_ACCEPT, MAX_CHAT_IMAGES, dragHasFiles, imageFilesOf, prepareImage, type PreparedImage } from '../../chat/chatImageData';
-import { ComposerImages, MessageImages } from '../../chat/ChatImages';
-import { PlusIcon, SendIcon, StopIcon } from '../../chat/ComposerIcons';
-import { ClaudeLoginCard } from '../../chat/ClaudeLoginCard';
+import { MessageImages } from '../../chat/ChatImages';
 import type { Project } from '../../types';
 import { FLAGS, useFlag } from '../../flags';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { useProvideScreenCommands } from '../../chat/screenCommands';
+import { SessionHeader } from './SessionHeader';
+import { BoxResizeLaunchPad } from './BoxResizeLaunchPad';
+import { currentSizeLabel, offersResize, resizeBadge } from '../../utils/boxResize';
+import { useResizeSizes } from '../../hooks/useBoxResize';
+import { useReviewOf, useReviewsData } from './reviewsData';
+import { renderReviewFence, ReviewCardContext, type ReviewCardSession } from './ReviewCard';
+import { PostControl } from './PostReviewDialog';
+import { FollowUpCard } from './FollowUpCard';
+import { FollowUpStrip } from './FollowUpStrip';
+import { REVIEW_FORMAT_MARK, TERMAG_NOTE } from '../../chat/reviewCard';
+import { approvedSince, type PostedRound } from '../../chat/reviews';
+import type { CodeFence } from '../../chat/codeFence';
+import { SessionContextCard } from './SessionContextCard';
 import type { MenuAction } from './ContextMenu';
 import { AgentIcon } from './OpenItems';
+import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
 import { ChatSpaceChip } from './SpaceSwatch';
 import { ChatBoxTag } from './ChatBoxTag';
+import { SdkComposer } from './SdkComposer';
+import { errorOf, useSdkChat } from './useSdkChat';
+import { UserMessageText } from '../../chat/UserMessageText';
+import { formatTokens } from '../../chat/contextUsage';
+import { recentSubagents, subagentsOf, type SubagentView } from '../../chat/subagents';
+import { subagentStore, useShownSubagent } from '../../chat/subagentStore';
+import { AgentsCardSection, AgentsDrawer, SubagentsContext, type SubagentsUi } from './Subagents';
+import { AsksCardSection, AsksContext, AsksDrawer } from './Asks';
+import { useAsksUi } from '../../chat/useChatAsks';
+import { askStore, askTabId, askThreadOf } from '../../chat/askStore';
+import { recentAsks, type AskView } from '../../chat/asks';
 
 let lastVisitedProjectId: string | null = null;
 
-const HISTORY_POLL_MS = 2000;
-// A running chat with no frame for this long has lost its turn-end (the box's
-// agent socket dropped); refetch to settle it. Longer than any gap a healthy
-// streaming turn produces, so a live turn never triggers it.
-const RUNNING_STALE_MS = 15000;
-const MAX_TEXT = MAX_KEYS * 25;
-
-function errorOf(err: unknown, fallback: string): { code: string | null; text: string } {
-  const data = (err as { response?: { data?: { error?: string; code?: string } } })?.response?.data;
-  return { code: data?.code ?? null, text: data?.error ?? fallback };
+// Where an existing chat's transcript will be while its history loads: a few
+// prompt and reply shapes in the transcript's own layout, so nothing moves
+// when the real one arrives and nothing says the chat is being set up.
+function TranscriptSkeleton() {
+  return (
+    <div className="chat-skeleton" aria-hidden="true">
+      {[[62, 88, 74, 40], [48, 92, 66]].map((reply, i) => (
+        <React.Fragment key={i}>
+          <div className="sdk-user"><div className="chat-skeleton-bubble" /></div>
+          <div className="chat-skeleton-reply">
+            {reply.map((w, j) => <div key={j} className="chat-skeleton-line" style={{ width: `${w}%` }} />)}
+          </div>
+        </React.Fragment>
+      ))}
+    </div>
+  );
 }
 
-function ItemView({ item, onRetry, projectId, workstream }: { item: ChatItem; onRetry?: () => void; projectId: string; workstream: string }) {
+const NO_ASKS: ReadonlyMap<string, AskView> = new Map();
+
+/** The chip a review session's first message shows for the card format it asks for (the text after the mark). */
+function ReviewFormatChip({ text }: { text: string | null | undefined }) {
+  if (!text?.includes(REVIEW_FORMAT_MARK)) return null;
+  return <div className="rv-format-chip" title={text.split(REVIEW_FORMAT_MARK)[1]}>and the findings as a review card</div>;
+}
+
+export function ItemView({ item, onRetry, onResume, projectId, workstream }: { item: ChatItem; onRetry?: () => void; onResume?: () => void; projectId: string; workstream: string }) {
+  // With subagents on, a background agent's end is its row's to say (Subagents.tsx).
+  const agents = React.useContext(SubagentsContext);
+  // A generative-UI answer (chat/genui/action.ts) reads as what was done, not as its payload.
+  const action = React.useContext(GenUiChatContext) && item.kind === 'user' ? parseActionMessage(item.text) : null;
   switch (item.kind) {
     case 'user':
+      // termag's own note into a review session (Check the fixes) reads as an event, not as the user's words.
+      if (item.text?.startsWith(TERMAG_NOTE)) return <div className="rv-event" role="note">{item.text.slice(TERMAG_NOTE.length).split(REVIEW_FORMAT_MARK)[0]}</div>;
       return (
         <div className="sdk-user" data-pending={item.pending || undefined}>
           {item.images?.length ? <MessageImages images={item.images} projectId={projectId} workstream={workstream} /> : null}
-          {item.text && <div className="sdk-user-bubble">{item.text}</div>}
+          {action ? <ActionBubble payload={action} /> : item.text && <div className="sdk-user-bubble"><UserMessageText text={item.text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
+          <ReviewFormatChip text={item.text} />
           {item.pending && <div className="sdk-user-note">queued</div>}
         </div>
       );
     case 'text':
       return (
         <div className="sdk-text" data-streaming={item.streaming || undefined}>
-          <Markdown text={item.text} streaming={item.streaming} />
+          <GenUiItemContext.Provider value={{ key: item.key, streaming: item.streaming }}>
+            <Markdown text={item.text} streaming={item.streaming} />
+          </GenUiItemContext.Provider>
           {item.streaming && <span className="sdk-caret" aria-hidden="true" />}
         </div>
       );
@@ -97,229 +134,188 @@ function ItemView({ item, onRetry, projectId, workstream }: { item: ChatItem; on
       return <ChatError text={item.text} onRetry={onRetry} />;
     case 'note':
       return <div className="sdk-note">{item.text}</div>;
+    case 'readonly':
+      return <ReadOnlyTurnNotice reason={item.reason} fix={item.fix} />;
     case 'command':
       return <div className="sdk-note" data-command={item.name}>{commandLine(item)}</div>;
+    case 'divider': {
+      // A clear, a compact, or a clear Resume took back; the newest clear offers Resume until the next message.
+      const at = item.at ? new Date(item.at) : null;
+      const when = at && !Number.isNaN(at.getTime()) ? at.toLocaleString() : null;
+      const compacted = item.variant === 'compacted';
+      const title = compacted
+        ? `Compacted${item.preTokens != null ? ` from ${formatTokens(item.preTokens)} tokens` : ''}${when ? ` · ${when}` : ''}. Claude goes on from its summary of what is above.`
+        : item.undone ? 'This clear was undone: the context above carried on.' : when ? `Cleared ${when}` : undefined;
+      return (
+        <div className="sdk-divider" data-variant={item.variant} data-undone={item.undone || undefined} title={title}>
+          <span className="sdk-divider-label" role="separator" aria-label={compacted ? 'Context compacted' : item.undone ? 'Context cleared, then resumed' : 'Context cleared'}>
+            {compacted ? 'Context compacted' : 'Context cleared'}
+          </span>
+          {item.undone && <span>· resumed</span>}
+          {onResume && <button type="button" className="btn-tiny" onClick={onResume}>Resume previous context</button>}
+        </div>
+      );
+    }
+    case 'tasks': {
+      const ended = agents ? item.ended.filter(t => !t.agent) : item.ended;
+      if (!ended.length) return null;
+      const line = tasksLine(ended === item.ended ? item : { ...item, ended });
+      return <div className="sdk-note sdk-tasks" data-warn={line.warn || undefined} title={line.text}><span aria-hidden="true">{line.mark} </span>{line.text}</div>;
+    }
   }
 }
 
+/**
+ * One prompt, or one reply with its tool runs and cost line. Memoized: when
+ * scrolling up brings in earlier groups, or a turn streams into the last
+ * one, the groups already drawn are not drawn again (a long chat's markdown
+ * and tool cards made each load stall the page for a frame or more).
+ * `onRetry` goes to the reply's last item; only the last group gets one.
+ */
+const TranscriptGroup = React.memo(function TranscriptGroup({ group: g, projectId, workstream, cost, onRetry, onResume, open = false, asks = false }: {
+  group: ChatGroup; projectId: string; workstream: string; cost: ChatState['costs'][string] | undefined; onRetry?: () => void; onResume?: () => void;
+  /** The last group while a turn runs: its last tool run can still grow, so it isn't settled. */
+  open?: boolean;
+  /** The running turn's box asks Haiku for its tool-group headings (its turn-start's `headings`), so its runs may wait for one. */
+  asks?: boolean;
+}) {
+  if (g.kind === 'user') return <ItemView item={g.item} projectId={projectId} workstream={workstream} />;
+  if (g.kind === 'divider') return <ItemView item={g.item} projectId={projectId} workstream={workstream} onResume={onResume} />;
+  const grouped = groupToolRuns(g.items);
+  return (
+    <div className="sdk-reply">
+      {grouped.map((e, i) => (e.kind === 'tools'
+        ? <ToolRun key={e.key} runKey={e.key} tools={e.tools} leadIn={e.leadIn}
+            settled={i < grouped.length - 1 || !open} live={open} asks={asks} />
+        : <ItemView key={e.item.key} item={e.item} projectId={projectId} workstream={workstream}
+            onRetry={i === grouped.length - 1 ? onRetry : undefined} />))}
+      <ReplyMeta cost={cost} />
+    </div>
+  );
+});
+
 export function SdkChatView({ project, workstream }: { project: Project; workstream: string }) {
+  // The chat's own space (chat/chatSpaces.ts chatHomeSpace) is the header chip's, and the server loads its memory.
+  const wsRow = project.workstreams.find(w => w.name === workstream);
   const { settleProjectClone, reloadProjects } = useProjects();
-  const navigate = useNavigate();
-  const location = useLocation();
-  const setupCtx = useSetupContext(project);
-  const setup = cloneTile(project.setupStatus, setupCtx);
-  const held = setup.holdTerminal;
   const chatId = `${project.id}|${workstream}`;
   const repo = repoSlug(project.repoUrl);
-
-  const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
-  const box = project.instanceId ? boxes.find(b => b.id === project.instanceId) ?? null : null;
-  // Set when archive succeeded and the box stayed up. History and send 404
-  // an archived row, so this view shows Stop/Hibernate instead of loading.
-  const recovery = useSyncExternalStore(subscribeRunningBoxes, () => readRunningBox(project.id));
-  // A reopened chat's box is coming back from a stop: its checkout is on disk,
-  // so the narration is the box and Claude, until the runner answers. The
-  // latch stays after the box is ready so the clone step stays skipped.
-  // History treats offline as that narration while the feed says starting,
-  // or while the reopen response is ahead of a feed that still says parked.
-  // A ready chat whose agent drops shows the offline error.
-  const reopenNav = (location.state as Partial<ReopenNavigationState> | null)?.reopenStarting === true
-    ? location.state as ReopenNavigationState
-    : null;
-  const comingUp = historyComingUp(box?.status, reopenNav != null);
-  const [restart, setRestart] = useState(false);
-  const powerRestart = isPowerRestart(box?.status) || comingUp;
-  useEffect(() => { setRestart(false); }, [chatId]);
-  useEffect(() => { if (powerRestart) setRestart(true); }, [powerRestart]);
-
-  const [chat, setChat] = useState<ChatState>(emptyChat);
-  const [history, setHistory] = useState<HistoryLoad>('loading');
-  const [checkoutReady, setCheckoutReady] = useState(false);
-  const [sendsLive, setSendsLive] = useState(false);
-  const [stopsTurn, setStopsTurn] = useState(false);
-  const [imageInput, setImageInput] = useState(false);
-  const [loadError, setLoadError] = useState<{ code: string | null; text: string } | null>(null);
-  const [poll, setPoll] = useState(0);
-  // Whether Claude may run tools here, as the backend decided (services/chatTrust.ts).
-  const [trust, setTrust] = useState<ChatTrust | null>(null);
-  const trustNoun = project.repoUrl ? 'repository' : 'project';
-  const [canTrust, setCanTrust] = useState(false);
-  const [trusting, setTrusting] = useState(false);
-  // The model the next message's turn runs on (chat/useChatModel.ts).
-  const { model, pick: modelPick, ready: modelReady, choose: chooseModel, reported: reportModel, sent: modelSent } = useChatModel(chatId);
-  const [modelOpen, setModelOpen] = useState(false);
-  const modelOptions = useChatModelOptions();
-  // The last turn event folded in, decided as each frame arrives (state
-  // updaters run later, so a gap could not be read back from them).
-  const cursor = useRef<FrameCursor>({ turnId: null, seq: 0 });
-
-  // History from the box once the project is set up, again on every switch,
-  // and again every two seconds while setup or a pane clone is still running.
-  useEffect(() => {
-    setChat(emptyChat); setHistory('loading'); setCheckoutReady(false); setLoadError(null); setTrust(null);
-    setSendsLive(false);
-    setStopsTurn(false);
-    cursor.current = { turnId: null, seq: 0 };
-  }, [chatId]);
-  // Live events that arrive while a history request is out are kept and
-  // replayed on the snapshot (mergeHistory): a hard replace would drop them,
-  // and a turn that ended meanwhile would come back as running.
-  const liveDuringLoad = useRef<Array<{ turnId: string | null; seq?: number | null; event: unknown }> | null>(null);
-  useEffect(() => {
-    if (held || recovery) return;
-    let cancelled = false;
-    liveDuringLoad.current = [];
-    chatApi.history(project.id, workstream)
-      .then(h => {
-        if (cancelled) return;
-        const live = liveDuringLoad.current ?? [];
-        liveDuringLoad.current = null;
-        if (h.turn) {
-          // A durable runner replays the running turn from its log; frames
-          // that arrived during the load continue from that cursor. A frame
-          // that is a real gap asks for one more load, after this one.
-          let state = fromHistory(h.entries, h.sessionId, h.turn, h.turns ?? []);
-          let again = false;
-          for (const frame of live) {
-            if ((frame.event as { type?: unknown } | null)?.type === 'queue-parked') again = true;
-            const applied = applyFrame(state, frame);
-            if (applied.gap) again = true;
-            else state = applied.state;
-          }
-          cursor.current = state.cursor;
-          setChat(seedLiveTurn(state, h.liveInput));
-          if (again) setPoll(n => n + 1);
-        } else {
-          setChat(seedLiveTurn(mergeHistory({ entries: h.entries, sessionId: h.sessionId, running: h.running, turns: h.turns ?? [] }, live.map(f => f.event)), h.liveInput));
-          cursor.current = { turnId: null, seq: 0 };
-          if (live.some(f => (f.event as { type?: unknown } | null)?.type === 'queue-parked')) setPoll(n => n + 1);
-        }
-        setCheckoutReady(h.checkoutReady !== false);
-        setSendsLive(h.sendsLive === true);
-        setStopsTurn(h.stopsTurn === true);
-        setImageInput(h.imageInput === true);
-        setHold(prev => {
-          const next = reduceHold(prev, h.terminalHolds);
-          return { held: next.held, refused: next.refused };
-        });
-        setTrust(h.trust ?? null);
-        setCanTrust(Boolean(h.canTrust));
-        reportModel(h.model, h.backend);
-        setHistory('ok');
-        setLoadError(null);
-      })
-      .catch(err => {
-        if (cancelled) return;
-        liveDuringLoad.current = null;
-        const e = errorOf(err, 'Could not load the session');
-        // Still setting up, or a reopened chat's box still starting: keep
-        // narrating and ask again. An established chat whose agent is offline
-        // shows that error instead of a clone over the conversation.
-        if (historyFailureIsSetup(e.code, comingUp)) { setHistory('setup'); setLoadError(null); }
-        else { setHistory('error'); setLoadError(e); }
-      });
-    return () => { cancelled = true; };
-  }, [project.id, workstream, held, poll, comingUp, recovery, reportModel]);
-
-  // Live events for this chat. Each turn event is numbered: one already
-  // folded in (resent by an agent that restarted) is skipped, and a gap
-  // (frames lost while the socket was down) loads the history again, which
-  // replays the running turn exactly. An agent from before durable turns
-  // sends no seq and is folded in as before.
-  const lastFrameAt = useRef(Date.now());
-  const turnId = useRef<string | null>(null);
-  useEffect(() => chatEvents.subscribe(frame => {
-    if (frame.projectId !== project.id || frame.workstream !== workstream) return;
-    lastFrameAt.current = Date.now();
-    turnId.current = frame.turnId;
-    // While a load is out, keep the frame and do not judge its seq: the cursor
-    // is still empty, so every line past the first looks like a gap and the
-    // load would never finish.
-    const how = liveFrameAction(liveDuringLoad.current != null, cursor.current, frame);
-    if (how === 'buffer') { liveDuringLoad.current?.push(frame); return; }
-    // The box parked what queued behind a turn from before its agent restarted:
-    // this open chat is live, so ask again (GET …/chat resumes a parked queue).
-    if (how === 'parked') { setPoll(n => n + 1); return; }
-    if (how === 'skip') return;
-    if (how === 'gap') { setPoll(n => n + 1); return; }
-    if (frame.seq != null && frame.turnId != null) cursor.current = { turnId: frame.turnId, seq: frame.seq };
-    liveDuringLoad.current?.push(frame);
-    setChat(s => applyFrame(s, frame).state);
-  }), [project.id, workstream]);
-
-  // The status socket reopened: it may have missed this chat's turn-end while
-  // down, leaving the view stuck on "working". Refetch history to settle it.
-  useEffect(() => chatEvents.subscribeReconnect(() => setPoll(n => n + 1)), []);
-
-  // A turn ending while the box's agent socket was down drops the turn-end
-  // frame — which the browser socket's reconnect does not see. When a running
-  // chat has had no frame for a while, ask the box ONLY whether the turn is
-  // still running, and settle it if it is not. Claude can think well past this
-  // gap before its first token, so we never rebuild the transcript here: that
-  // would drop streamed text the JSONL does not have yet.
-  useEffect(() => {
-    if (!chat.running || recovery) return;
-    lastFrameAt.current = Date.now();
-    let cancelled = false;
-    const id = setInterval(() => {
-      if (Date.now() - lastFrameAt.current <= RUNNING_STALE_MS) return;
-      // The turn the poll is about, so a late response cannot idle a newer one.
-      const polledTurn = turnId.current;
-      chatApi.history(project.id, workstream)
-        .then(h => {
-          if (cancelled || h.running !== false || turnId.current !== polledTurn) return;
-          // Settle exactly as a turn-end would: stop the caret and close open
-          // tool cards, not just clear `running`.
-          setChat(s => (s.running ? applyEvent(s, { type: 'turn-end' }) : s));
-        })
-        .catch(() => { /* try again next interval */ });
-    }, RUNNING_STALE_MS);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [chat.running, project.id, workstream, recovery]);
+  const follow = useRef<() => void>(() => {});
+  const s = useSdkChat(project, workstream, follow);
+  const {
+    contextBusy,
+    onResumeCleared,
+    resumeKey,
+    claudeWorking,
+    navigate,
+    setup,
+    held,
+    box,
+    recovery,
+    restart,
+    chat,
+    headingStore,
+    history,
+    trust,
+    trustNoun,
+    opening,
+    queued,
+    echo,
+    queueError,
+    retryQueued,
+    runnerReady,
+    showSteps,
+    loading,
+    steps,
+    composer,
+    setSendError,
+    retrying,
+    setRetrying,
+    unsent,
+    setUnsent,
+    dragging,
+    sendUnsent,
+    openFull,
+    canSend,
+    total,
+    replies,
+    echoShown,
+    retry,
+    onRetryLast,
+    dropHandlers,
+    deliver,
+  } = s;
 
   useEffect(() => {
     visitsApi.record({ projectId: project.id, previousProjectId: lastVisitedProjectId, workstream });
     lastVisitedProjectId = project.id;
   }, [project.id, workstream]);
 
-  // The message waiting for the runner: New chat's first message, or anything
-  // typed before the runner was ready. One sender across tabs, never twice,
-  // and a failure waits for Retry.
-  const sendQueued = useCallback(async (pid: string, ws: string, text: string) => {
-    const picked = readModelPick(`${pid}|${ws}`);
-    await chatApi.send(pid, ws, text, [], picked);
-    if (picked && `${pid}|${ws}` === chatId) modelSent(picked);
-    activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
-  }, [project.name, project.instanceId, chatId, modelSent]);
-  const { mode: chromeMode, sidePanel } = useChatChrome();
+  const { mode: chromeMode, sidePanel, refresh } = useChatChrome();
   // The one-row phone header ships with simple-ui-side-panel-enabled; off, it is main's.
   const phoneHeader = useFlag(FLAGS.chatSidePanel, false);
+  // A reply's ```spec fence drawn as UI; off, it is a code block.
+  const generativeUi = useFlag(FLAGS.chatGenerativeUi, false);
+  const generativeUiOn = generativeUi;
+  // A review session: its PR is the one under review, in the panel.
+  const review = useReviewOf(project.id, workstream);
+  const reviews = useReviewsData();
+  // Its reviewer answers with a ```review fence, drawn as the review card.
+  const drawFence = useMemo(() => {
+    if (!reviews.on) return generativeUiOn ? renderGenUiFence : null;
+    return (block: CodeFence) => renderReviewFence(block) ?? (generativeUiOn ? renderGenUiFence(block) : null);
+  }, [reviews.on, generativeUiOn]);
+  const reviewSession = useMemo<ReviewCardSession | null>(() => (review ? {
+    projectId: project.id, workstream, repo: review.repo, number: review.number, viewer: reviews.queue.viewer,
+    showLine: () => sidePanel?.show?.('pr'),
+    posted: (reviews.prs && reviews.prs.connected ? (reviews.prs as { reviewRounds?: PostedRound[] }).reviewRounds ?? [] : [])
+      .find(r => r.repo.toLowerCase() === review.repo.toLowerCase() && r.number === review.number) ?? null,
+    postSlot: (findings, cardId) => <PostControl review={findings} cardId={cardId} repo={review.repo} number={review.number} viewer={reviews.queue.viewer} author={review.author} />,
+    followUp: fence => <FollowUpCard fence={fence} projectId={project.id} workstream={workstream} repo={review.repo} number={review.number} viewer={reviews.queue.viewer}
+      approvedOnServer={approvedSince((reviews.prs && reviews.prs.connected ? (reviews.prs as { reviewRounds?: PostedRound[] }).reviewRounds ?? [] : []), review.repo, review.number, fence.head)} />,
+  } : null), [review, project.id, workstream, reviews.queue.viewer, reviews.prs, sidePanel]);
   const phone = chromeMode === 'drawer' && phoneHeader;
-  const [opening, setOpening] = useState(false);
-  const openingRef = useRef(false);
-  const { queued, echo, error: queueError, enqueue, retry: retryQueued } = useQueuedMessage({
-    projectId: project.id,
-    workstream,
-    up: sdkReadiness({ held, history, checkoutReady, queued: false }).runnerReady && !opening,
-    offline: loadError?.code === 'offline',
-    send: sendQueued,
-    raw: true,
-  });
-  const { runnerReady, pollHistory, showSteps } = sdkReadiness({ held, history, checkoutReady, queued: queued != null });
+  // Subagents: an Agent call is a row that opens its transcript in the
+  // panel's agent tab, which reads them from here (chat/subagentStore.ts). Only with the panel's tabs.
+  const subagentsOn = useFlag(FLAGS.chatSubagents, false);
+  const showAgent = refresh && !phone ? sidePanel?.showAgent : undefined;
+  const subagentList = useMemo<readonly SubagentView[]>(
+    () => (subagentsOn ? subagentsOf(chat) : []),
+    [subagentsOn, chat.items, chat.subagents, chat.running],
+  );
   useEffect(() => {
-    if (!pollHistory) return;
-    const t = setTimeout(() => setPoll(n => n + 1), HISTORY_POLL_MS);
-    return () => clearTimeout(t);
-  }, [pollHistory, poll]);
-
-  const eta = useMemo(() => bootEstimateMinutes(boxes), [boxes]);
-  // A stale stopped/hibernated snapshot still narrates "Box … is starting".
-  const narratedBox = comingUp
-    ? { name: box?.name || reopenNav?.reopenBoxName || 'box', status: 'starting' as const, provisioningError: box?.provisioningError, claimedAt: box?.claimedAt }
-    : box;
-  const steps = useMemo(() => setupSteps({
-    box: narratedBox, setupStatus: project.setupStatus, setupError: project.setupError, repo: (restart || comingUp) ? null : repo, agentUp: runnerReady, etaMinutes: eta,
-  }), [narratedBox, project.setupStatus, project.setupError, repo, restart, comingUp, runnerReady, eta]);
+    if (!subagentsOn) return undefined;
+    // None until the history is in: the agent tab says it is loading, not that its subagent is gone.
+    subagentStore.publish(chatId, loading ? null : subagentList);
+    return undefined;
+  }, [subagentsOn, chatId, subagentList, loading]);
+  useEffect(() => () => subagentStore.publish(chatId, null), [chatId]);
+  const shownAgent = useShownSubagent(chatId);
+  const agentsUi = useMemo<SubagentsUi | null>(() => (subagentsOn && showAgent ? {
+    byId: new Map(subagentList.map(v => [v.id, v])),
+    open: (v: SubagentView) => showAgent({ chat: chatId, id: v.id, title: v.description }),
+    shownId: sidePanel?.open ? shownAgent : null,
+  } : null), [subagentsOn, showAgent, subagentList, chatId, shownAgent, sidePanel?.open]);
+  // Asks: a `termag ask` call is the row of the ask it sent, where
+  // subagents have theirs, read from GET …/chat/asks. A row opens its tab, an agent tab whose id names its
+  // thread, which reads the views from here (chat/askStore.ts).
+  const openAsk = useCallback((v: AskView) => {
+    if (showAgent) showAgent({ chat: chatId, id: askTabId(v.thread), title: v.title });
+    else if (v.chat) navigate(chatHref(v.chat.projectId, v.chat.workstream));
+  }, [showAgent, chatId, navigate]);
+  const asksUi = useAsksUi({
+    on: agentsUi != null, owner: project.role !== 'collaborator', projectId: project.id, workstream, items: chat.items, open: openAsk,
+    shownThread: sidePanel?.open ? askThreadOf(shownAgent) : null,
+  });
+  // None while the history loads (the tab says it is loading); once it is in, the chat's asks, none at all
+  // included, so a tab whose ask is gone says so rather than waiting.
+  useEffect(() => { askStore.publish(chatId, loading ? null : asksUi?.views ?? NO_ASKS); }, [chatId, asksUi, loading]);
+  useEffect(() => () => askStore.publish(chatId, null), [chatId]);
+  // Kept in view beside the subagents: any still going, and those its calls named since the last message.
+  const keptAsks = useMemo(() => (asksUi ? recentAsks(chat.items, asksUi.byCall, asksUi.views) : []), [asksUi, chat.items]);
+  // Those Claude started since the last message, and any still running: in the context card while it
+  // shows, else in the drawer on the composer (chrome.css hides the drawer while the card shows).
+  const keptAgents = useMemo(() => (agentsUi ? recentSubagents(chat.items, subagentList) : []), [agentsUi, chat.items, subagentList]);
 
   // A checkout still running in the pane (a box that clones there) may stop
   // on a credential prompt: its last lines show under the steps.
@@ -330,229 +326,76 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     : []), [paneClone, capture.content]);
 
   const { scroller, onScroll, unseen, jumpToBottom } = useFollowBottom(chat.items, chatId);
+  follow.current = jumpToBottom;
 
-  // Starts with a first message New chat handed over, if any (chat/useHandedDraft.ts).
-  const [text, setText] = useComposerText(chatId);
-  const composer = useAutoGrow<HTMLTextAreaElement>(text);
-  const dictation = useDictation({ text, setText, max: MAX_TEXT, chatKey: chatId });
-  const [sendError, setSendError] = useState<string | null>(null);
-  // The full UI's Claude has this session (history), or a send was refused for that (until a poll says it left).
-  const [hold, setHold] = useState<HoldState>({ held: false, refused: false });
-  const [reclaiming, setReclaiming] = useState(false);
-  const reclaimingRef = useRef(false);
-  const [retrying, setRetrying] = useState(false);
-  const sendingRef = useRef(false);
-  // Messages Stop took back before they went: shown as "Not sent" until sent or discarded.
-  const [unsent, setUnsent] = useState<string[]>([]);
-  // Images attached in the composer (chat/chatImageData.ts), sent with the next message.
-  const [images, setImages] = useState<PreparedImage[]>([]);
-  const [imageNote, setImageNote] = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const picker = useRef<HTMLInputElement>(null);
-  const imagesRef = useRef(images);
-  imagesRef.current = images;
-  useEffect(() => { setSendError(null); setUnsent([]); setImages([]); setImageNote(null); setDragging(false); setHold({ held: false, refused: false }); }, [chatId]);
-
-  // Sends one message. A failure puts it back where it came from: the
-  // composer, or the "Not sent" list. Sending always follows the transcript
-  // to the bottom, where the message shows. Nothing goes out while Open in
-  // full UI is handing the session to the pane.
-  const deliver = useCallback(async (raw: string, from: 'composer' | 'unsent' | 'retry', attached: PreparedImage[] = []) => {
-    const message = raw.trim();
-    if ((!message && !attached.length) || sendingRef.current || openingRef.current || reclaimingRef.current || recovery) return;
-    if (!runnerReady) {
-      // The pre-ready queue holds text in this browser's storage; images wait in the composer.
-      if (attached.length) { setSendError('Images can be sent once Claude is ready'); return; }
-      if (enqueue(message)) { if (from === 'composer') setText(''); }
-      else setSendError('This browser would not hold the message until Claude is ready. Send it again once it is.');
-      return;
-    }
-    sendingRef.current = true;
-    setSendError(null);
-    jumpToBottom();
-    const pendingKey = `pending:${attached.length ? attached[0].id : 'text'}:${Date.now()}`;
-    setChat(s => addPending(s, message, attached.map(i => ({ mediaType: i.mediaType, src: i.src })), pendingKey));
-    if (from === 'composer') { setText(''); setImages([]); setImageNote(null); }
-    const picked = modelPick;
-    try {
-      await chatApi.send(project.id, workstream, message, attached.map(i => ({ mediaType: i.mediaType, data: i.data })), picked);
-      if (picked) modelSent(picked);
-      activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
-    } catch (err) {
-      setChat(s => {
-        // The bubble this send added; without images, any pending one with its text, as before.
-        const i = attached.length ? s.items.findIndex(it => it.key === pendingKey)
-          : s.items.findIndex(it => it.kind === 'user' && it.pending && it.text === message);
-        return i >= 0 ? { ...s, items: [...s.items.slice(0, i), ...s.items.slice(i + 1)] } : s;
-      });
-      if (from === 'composer') { setText(message); setImages(attached); }
-      if (from === 'unsent') setUnsent(u => [...u, message]);
-      const e = errorOf(err, 'Send failed');
-      if (refusalFromSend(e.code)) setHold(h => ({ ...h, refused: true }));
-      else setSendError(e.text);
-    } finally {
-      sendingRef.current = false;
-    }
-  }, [runnerReady, enqueue, setText, jumpToBottom, project.id, project.name, project.instanceId, workstream, recovery, modelPick, modelSent]);
-  const send = () => { dictation.detach(); return deliver(text, 'composer', images); };
-
-  // The full UI's Claude has the session. Exit it when it is really there, or
-  // clear a stale hold, then send what is in the composer (images included).
-  // Nothing is typed when the pane is already a shell.
-  const returnToChat = async () => {
-    if (reclaimingRef.current || openingRef.current || recovery) return;
-    dictation.detach();
-    const message = text.trim();
-    const attached = images;
-    const drafting = Boolean(message || attached.length);
-    reclaimingRef.current = true;
-    setReclaiming(true);
-    setSendError(null);
-    const pendingKey = `pending:${attached.length ? attached[0].id : 'text'}:${Date.now()}`;
-    if (drafting) {
-      setChat(s => addPending(s, message, attached.map(i => ({ mediaType: i.mediaType, src: i.src })), pendingKey));
-      setText('');
-      setImages([]);
-      setImageNote(null);
-      jumpToBottom();
-    }
-    const restore = () => {
-      if (!drafting) return;
-      setChat(s => {
-        const i = attached.length ? s.items.findIndex(it => it.key === pendingKey)
-          : s.items.findIndex(it => it.kind === 'user' && it.pending && it.text === message);
-        return i >= 0 ? { ...s, items: [...s.items.slice(0, i), ...s.items.slice(i + 1)] } : s;
-      });
-      setText(message);
-      setImages(attached);
-    };
-    try {
-      const picked = drafting ? modelPick : null;
-      const res = await chatApi.reclaim(project.id, workstream, message, attached.map(i => ({ mediaType: i.mediaType, data: i.data })), picked);
-      if (!res.reclaimed) {
-        restore();
-        setHold({ held: true, refused: true });
-        return;
-      }
-      setHold({ held: false, refused: false });
-      if (res.sent) {
-        if (picked) modelSent(picked);
-        activityApi.heartbeat(project.name, project.instanceId ?? null).catch(() => {});
-      } else restore();
-    } catch (err) {
-      restore();
-      const e = errorOf(err, 'Could not return this chat');
-      if (refusalFromSend(e.code)) setHold({ held: true, refused: true });
-      else setSendError(e.text);
-    } finally {
-      reclaimingRef.current = false;
-      setReclaiming(false);
-    }
-  };
-
-  // Dropped, pasted or picked files: the images among them, made small enough to send.
-  const attach = useCallback(async (files: File[]) => {
-    if (!files.length) return;
-    const { take, note } = admitImages(imagesRef.current.length, files);
-    setImageNote(note);
-    const ready: PreparedImage[] = [];
-    for (const f of take) {
-      try { ready.push(await prepareImage(f)); } catch (err) { setImageNote((err as Error).message); }
-    }
-    if (ready.length) setImages(held => [...held, ...ready].slice(0, MAX_CHAT_IMAGES));
-  }, []);
-  const sendUnsent = (i: number) => {
-    const message = unsent[i];
-    setUnsent(u => u.filter((_, j) => j !== i));
-    if (message != null) void deliver(message, 'unsent');
-  };
-
-  const trustRepo = () => {
-    setTrusting(true);
-    chatApi.trust(project.id)
-      .then(r => setTrust(r.trust))
-      .catch(err => setSendError(errorOf(err, `Could not trust the ${trustNoun}`).text))
-      .finally(() => setTrusting(false));
-  };
-
-  // Stop also drops what was queued behind the turn: those bubbles come down
-  // (the box's queue-dropped event does the same for every open view) and
-  // come back as "Not sent" bubbles with Send and Discard. They never go back
-  // into the composer, where the next message would be glued onto them.
-  const stop = useCallback((scope: 'turn' | 'all' = 'all') => {
-    setChat(s => applyEvent(s, { type: 'user-stop', scope }));
-    chatApi.interrupt(project.id, workstream, scope)
-      .then(r => {
-        const dropped = r.dropped ?? [];
-        if (!dropped.length) return;
-        setChat(s => applyEvent(s, { type: 'queue-dropped', texts: dropped }));
-        setUnsent(u => [...u, ...dropped.filter(t => t.trim())]);
-      })
-      .catch(() => {});
-  }, [project.id, workstream]);
-
-  // Stopping everything ends Claude's background tasks (it kills them as it
-  // exits), and a turn-only stop still ends its subagents, so either asks
-  // first when it would end something running in the background.
-  const background = chat.background ?? [];
-  const subagents = background.filter(t => t.subagent);
-  const control = stopControl(chat, stopsTurn);
-  const [confirmStop, setConfirmStop] = useState<'turn' | 'all' | null>(null);
-  const [stopMenu, setStopMenu] = useState(false);
-  const requestStop = useCallback((scope: 'turn' | 'all') => {
-    setStopMenu(false);
-    if (scope === 'turn' ? subagents.length : background.length) setConfirmStop(scope);
-    else stop(scope);
-  }, [background.length, subagents.length, stop]);
-  const mainStop = useCallback(() => requestStop(control === 'split' ? 'turn' : 'all'), [control, requestStop]);
-
-  // Escape stops a running turn (the Stop button's own action), unless a
-  // dialog is open (Escape closes that) or the stop menu is (Escape closes it).
-  const running = chat.running && !recovery;
-  useEffect(() => { if (!running) { setConfirmStop(null); setStopMenu(false); } }, [running]);
-  useEffect(() => { if (control !== 'split') setStopMenu(false); }, [control]);
+  // Only the newest groups are drawn at first (chat/sdkChat.ts windowStart);
+  // scrolling up to the top brings in the next earlier ones (loadsEarlier),
+  // anchored so what is on screen stays where it was. The window's start is
+  // fixed to a group, so a new prompt or reply appends and never pushes the
+  // oldest drawn one out. The button above them is the fallback: for the
+  // keyboard, and for a transcript too short to scroll.
+  const groups = useMemo(() => groupTurns(chat.items), [chat.items]);
+  const groupKeys = useMemo(() => groups.map(chatGroupKey), [groups]);
+  const [windowFrom, setWindowFrom] = useState<string | null>(null);
+  useEffect(() => { setWindowFrom(null); }, [chatId]);
+  const start = windowStart(groupKeys, windowFrom);
+  const windowed = transcriptWindow(groups, start);
+  // Fix the start once there are groups, and again if its group went away.
   useEffect(() => {
-    if (!running) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
-      if (document.querySelector('[role="dialog"]')) return;
-      e.preventDefault();
-      if (stopMenu) setStopMenu(false);
-      else mainStop();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [running, mainStop, stopMenu]);
-  const stopSplit = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!stopMenu) return;
-    const onDown = (e: PointerEvent) => {
-      if (!stopSplit.current?.contains(e.target as Node)) setStopMenu(false);
-    };
-    document.addEventListener('pointerdown', onDown);
-    return () => document.removeEventListener('pointerdown', onDown);
-  }, [stopMenu]);
-
-  // Open in full UI continues this session in the agent pane, then goes
-  // there; a turn still running is refused, and says so here. One at a time,
-  // and nothing is sent from here meanwhile: the pane is about to own the session.
-  const openFull = async () => {
-    if (openingRef.current) return;
-    openingRef.current = true;
-    setOpening(true);
-    try {
-      await chatApi.openInTerminal(project.id, workstream);
-    } catch (err) {
-      const e = errorOf(err, '');
-      if (e.code === 'turn-running' || e.code === 'ask-chat') {
-        setSendError(e.text);
-        openingRef.current = false;
-        setOpening(false);
-        return;
+    if (groupKeys.length && groupKeys[start] !== windowFrom) setWindowFrom(groupKeys[start]);
+  }, [groupKeys, start, windowFrom]);
+  // Distance from the bottom while earlier groups are on their way; null otherwise.
+  const fromBottom = useRef<number | null>(null);
+  // The first group drawn before the load and its offset: the fraction of a
+  // pixel the whole-pixel scrollHeight leaves out is corrected from it.
+  const anchor = useRef<{ el: Element; top: number } | null>(null);
+  const lastScrollTop = useRef<number | null>(null);
+  const showEarlier = () => {
+    const el = scroller.current;
+    if (fromBottom.current != null) return;
+    fromBottom.current = el ? el.scrollHeight - el.scrollTop : null;
+    const first = el?.querySelector('.sdk-transcript > .sdk-user, .sdk-transcript > .sdk-reply');
+    anchor.current = first ? { el: first, top: first.getBoundingClientRect().top } : null;
+    // Drawn and anchored now, inside the scroll event: left to React's own
+    // schedule, the next frame's scroll would land between the measure above
+    // and the correction, which then took that step back (one frame stood still).
+    flushSync(() => setWindowFrom(groupKeys[earlierStart(start)] ?? null));
+  };
+  const onTranscriptScroll = () => {
+    onScroll();
+    const el = scroller.current;
+    if (!el) return;
+    const prev = lastScrollTop.current;
+    lastScrollTop.current = el.scrollTop;
+    if (loadsEarlier({ scrollTop: el.scrollTop, prevScrollTop: prev, hidden: windowed.hidden, pending: fromBottom.current != null })) showEarlier();
+  };
+  const [canScroll, setCanScroll] = useState(true);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    if (fromBottom.current != null) {
+      el.scrollTop = el.scrollHeight - fromBottom.current;
+      fromBottom.current = null;
+      const a = anchor.current;
+      anchor.current = null;
+      if (a?.el.isConnected) {
+        const off = a.el.getBoundingClientRect().top - a.top;
+        if (off !== 0 && Math.abs(off) < 2) el.scrollTop += off;
       }
     }
-    navigate(fullUiHref(project.id, workstream));
-  };
+    // The anchoring jump is not the reader scrolling: judge the next event from here.
+    lastScrollTop.current = el.scrollTop;
+    setCanScroll(el.scrollHeight > el.clientHeight + 1);
+  }, [start, groups, scroller]);
+
+  // Generative UI's answers go as messages (chat/genui/action.ts); a surface is sent once its message is in the transcript.
+  // Never into the pre-ready queue: it is this browser's only, and the surface locks from the transcript.
+  const genUiSend = useCallback((message: string) => (runnerReady ? deliver(message, 'retry') : Promise.resolve(false)), [deliver, runnerReady]);
+  const genUiSent = useMemo(() => (generativeUi ? sentSurfaces(chat.items) : null), [generativeUi, chat.items]);
+  const genUiChat = useMemo<GenUiChat | null>(
+    () => (genUiSent ? { send: genUiSend, sent: genUiSent, ready: runnerReady } : null),
+    [genUiSend, genUiSent, runnerReady],
+  );
 
   // Archive moves the chat off the live list and into Archived. The box
   // stops or hibernates when this chat is the only one on it. A box that
@@ -634,63 +477,47 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     }
   };
 
-  const setupFailed = steps.some(s => s.state === 'failed');
-  const activeStep = steps.find(s => s.state === 'active' || s.state === 'failed');
-  const showHold = (hold.held || hold.refused) && !recovery;
-  const status = statusBesideHold(showHold, chat.running, recovery
-    ? { tone: 'error' as const, text: recovery.message }
-    : showSteps && !runnerReady && !loadError
-    ? { tone: 'working' as const, text: `Setting up · ${(held ? setup.label : activeStep?.text.toLowerCase()) ?? 'starting claude'}` }
-    : loadError ? { tone: 'error' as const, text: loadError.text } : chatStatus(chat, sendsLive));
-  // Before the runner is ready a message is queued (main workstream only, where the queue lives).
-  const canSend = !opening && !reclaiming && !recovery && !setupFailed && !loadError && (runnerReady || workstream === 'main');
-  const total = chatCostTotal(chat);
-  const replies = Object.keys(chat.costs).length;
-  const echoShown = echo && !queued && !chat.items.some(it => it.kind === 'user' && it.text === echo);
-  const settingUp = showSteps && !runnerReady && !loadError && !recovery;
-  const retry = retryMessage(chat);
-  const takesImages = imageInput && runnerReady && canSend;
-  // Send shows only once there is something to send: text, or images where they are taken.
-  const hasDraft = text.trim() !== '' || (takesImages && images.length > 0);
-  const dropHandlers = takesImages ? {
-    onDragEnter: (e: React.DragEvent) => { if (dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); setDragging(true); } },
-    onDragOver: (e: React.DragEvent) => { if (dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } },
-    onDragLeave: (e: React.DragEvent) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); },
-    onDrop: (e: React.DragEvent) => {
-      if (!dragHasFiles(e.dataTransfer.types)) return;
-      e.preventDefault();
-      setDragging(false);
-      void attach(imageFilesOf(e.dataTransfer.files));
-      composer.current?.focus();
-    },
-  } : {};
-
-  // The sidebar row shows exactly this status line and Claude's last words.
-  const liveKey = chatLiveKey(project.id, workstream);
-  const preview = useMemo(() => lastAssistantText(chat.items), [chat.items]);
-  const liveTone = settingUp ? 'setup' : status.tone;
-  useEffect(() => {
-    publishChatStatus(liveKey, { tone: liveTone, text: status.text, preview });
-  }, [liveKey, liveTone, status.text, preview]);
-  useEffect(() => () => publishChatStatus(liveKey, null), [liveKey]);
-
-  // Opening the chat (and the composer opening once setup is done) puts the cursor in it.
-  useEffect(() => {
-    if (canSend) composer.current?.focus();
-  }, [chatId, canSend, composer]);
   // And so does a click in the transcript (chat/transcriptFocus.ts).
   const transcriptFocus = useTranscriptFocus(composer, canSend);
 
   const canArchive = project.role !== 'collaborator' && workstream === 'main';
+  // boxFeed lists only the person's own boxes, so a box here is theirs to resize.
+  const [resizing, setResizing] = useState(false);
+  const resizeSizes = useResizeSizes(box && project.role !== 'collaborator' ? box.id : null);
+  const resizeMenu = box && project.role !== 'collaborator' && offersResize(box) ? {
+    hint: resizeBadge(box) ?? currentSizeLabel(box, resizeSizes),
+    onOpen: () => setResizing(true),
+  } : null;
+  // An ask thread's chat is called by the thread's title; its id stays in the tooltip.
+  const askThread = project.workstreams?.find(w => w.name === workstream)?.askThread;
+  const askNamed = { workstream, askTitle: askThread?.title, askThreadId: askThread?.id };
   const archiveLabel = archiving ? 'Archiving…' : archiveNotice ? 'Archived' : 'Archive';
+  const desktopHref = desktopSessionHref({ projectId: project.id, workstream, shared: project.role === 'collaborator' });
   const phoneActions: MenuAction[] = [
+    ...(total != null ? [{ label: `${formatCost(total)} so far`, disabled: true, onSelect: () => {} }] : []),
     ...(canArchive ? [{ label: archiveLabel, disabled: archiving || chat.running || archiveNotice != null, onSelect: () => setConfirmArchive(true) }] : []),
     archiveNotice
-      ? { label: 'Open in full UI', onSelect: () => { void openRunningBox(); } }
-      : { label: opening ? 'Opening…' : 'Open in full UI', disabled: opening, onSelect: () => { void openFull(); } },
+      ? { label: 'Open in Lab', onSelect: () => { void openRunningBox(); } }
+      : { label: opening ? 'Opening…' : 'Open in Lab', disabled: opening, onSelect: () => { void openFull(); } },
+    ...(desktopHref ? [{ label: 'Open in termag desktop', onSelect: () => openDesktopLink(desktopHref) }] : []),
     ...(sidePanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
-    ...(total != null ? [{ label: `${formatCost(total)} so far`, disabled: true, onSelect: () => {} }] : []),
   ];
+  // This chat's ⌘K commands under the refresh, beside the sidebar's (chat/screenCommands.ts, chatCommands.ts).
+  useProvideScreenCommands(refresh ? [
+    {
+      id: 'open-in-lab', label: !archiveNotice && opening ? 'Opening…' : 'Open in Lab', icon: 'arrow-up-right', keywords: ['full ui', 'workspace'],
+      disabled: !archiveNotice && opening, suggested: true, run: () => { void (archiveNotice ? openRunningBox() : openFull()); },
+    },
+    ...(desktopHref ? [{
+      id: 'open-in-desktop', label: 'Open in termag desktop', icon: 'device-desktop', keywords: ['desktop', 't3'],
+      detail: 'A new thread in this project there, with its chats to import', run: () => openDesktopLink(desktopHref),
+    }] : []),
+    ...(canArchive ? [{
+      id: 'archive', label: archiving ? 'Archiving…' : 'Archive session', icon: 'archive-outline', keywords: ['close'],
+      detail: chat.running ? 'Wait for the turn to end' : archiveNotice ? 'Archived; its box is still running' : undefined,
+      disabled: archiving || chat.running || archiveNotice != null, run: () => setConfirmArchive(true),
+    }] : []),
+  ] : null);
 
   return (
     <div className="chat-view">
@@ -698,21 +525,33 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
         {dragging && <div className="chat-drop-overlay" aria-hidden="true">Drop images to attach</div>}
         <header className={phone ? 'chat-header chat-header-agent' : 'chat-header'}>
           <ChatHistoryButton />
-          <div className="chat-title">
+          {/* The chrome refresh's header on a desktop width (SessionHeader.tsx); the phone keeps its one row. */}
+          {refresh && !phone && (
+            <SessionHeader project={project} workstream={workstream} repo={repo} box={box} working={claudeWorking}
+              opening={opening} onOpenFull={() => { void (archiveNotice ? openRunningBox() : openFull()); }}
+              archive={canArchive ? {
+                label: archiveLabel,
+                disabled: archiving || chat.running || archiveNotice != null,
+                hint: chat.running ? 'Wait for the turn to end' : archiveNotice ? 'Its box is still running' : 'The box stops when this is its only session',
+                onArchive: () => setConfirmArchive(true),
+              } : null}
+              resize={resizeMenu} />
+          )}
+          {resizing && box && <BoxResizeLaunchPad box={box} onClose={() => setResizing(false)} onChanged={() => { void boxFeed.reload(); }} />}
+          {!(refresh && !phone) && <div className="chat-title">
             {phone
-              ? <AgentIcon status={chat.running ? 'working' : 'idle'} />
-              : <span className="chat-glyph" data-status={chat.running ? 'working' : 'idle'} aria-hidden="true">{chat.running ? '●' : '○'}</span>}
+              ? <AgentIcon status={claudeWorking ? 'working' : 'idle'} />
+              : <span className="chat-glyph" data-status={claudeWorking ? 'working' : 'idle'} aria-hidden="true">{claudeWorking ? '●' : '○'}</span>}
             <span className="chat-title-name">{project.name}</span>
-            {workstream !== 'main' && <span className="chat-title-ws">· {workstream}</span>}
-            <ChatSpaceChip instanceId={project.instanceId} />
+            {workstream !== 'main' && <span className="chat-title-ws" title={workstreamTip(askNamed) ?? undefined}>· {workstreamLabel(askNamed)}</span>}
+            <ChatSpaceChip place={{ instanceId: project.instanceId ?? null, spaceId: wsRow?.spaceId, spaceFixed: wsRow?.spaceFixedAt != null }} />
             {repo && <span className="chat-title-repo" title={project.repoUrl ?? undefined}>{repo}</span>}
             <ChatBoxTag project={project} box={box} />
-          </div>
-          <div className="chat-header-actions">
+          </div>}
+          {!(refresh && !phone) && <div className="chat-header-actions">
             {phone ? <ChatMoreButton label={`${project.name}: actions`} actions={phoneActions} /> : <>
-            <SidePanelButton />
             {total != null && (
-              <span className="sdk-cost-total" title={`What this session has cost so far, over ${replies} ${replies === 1 ? 'reply' : 'replies'}. Hover a reply for its own.`}>
+              <span className="sdk-cost-total" title={`What this chat has cost so far, across context clears, over ${replies} ${replies === 1 ? 'reply' : 'replies'}. Hover a reply for its own.`}>
                 {formatCost(total)} total
               </span>
             )}
@@ -725,23 +564,27 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             {archiveNotice
               ? (
                 <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openRunningBox(); }}>
-                  <span className="chat-full-ui-long">Open in full UI</span>
-                  <span className="chat-full-ui-short">Full UI</span>
+                  <span className="chat-full-ui-long">Open in Lab</span>
+                  <span className="chat-full-ui-short">Lab</span>
                 </button>
               )
               : (
                 <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openFull(); }} disabled={opening}
-                  title={chat.sessionId ? `Continues this session in the terminal (claude --resume ${chat.sessionId})` : 'Opens this session in the classic layout'}>
+                  title={chat.sessionId ? `Continues this session in the terminal (claude --resume ${chat.sessionId})` : 'Opens this session in Lab'}>
                   {opening ? 'Opening…' : (
                     <>
-                      <span className="chat-full-ui-long">Open in full UI</span>
-                      <span className="chat-full-ui-short">Full UI</span>
+                      <span className="chat-full-ui-long">Open in Lab</span>
+                      <span className="chat-full-ui-short">Lab</span>
                     </>
                   )}
                 </button>
               )}
+            {desktopHref && (
+              <a className="btn-ghost" href={desktopHref} title="A new thread in this project in termag desktop, with its chats to import">Desktop</a>
+            )}
+            <SidePanelButton />
             </>}
-          </div>
+          </div>}
           {confirmArchive && createPortal(
             <ConfirmDialog
               tone="primary"
@@ -759,14 +602,24 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                 <button type="button" className="confirm-btn confirm-btn-cancel" disabled={stoppingBox} onClick={dismissArchiveDialog}>Keep this session open</button>
                 {archiveNotice.retry
                   ? <button type="button" className="confirm-btn confirm-btn-primary" disabled={stoppingBox} onClick={() => { void retryBoxPower(); }}>{stoppingBox ? 'Stopping…' : archiveNotice.retry === 'hibernate' ? 'Hibernate box' : 'Stop box'}</button>
-                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={() => { void openRunningBox(); }}>Open in full UI</button>}
+                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={() => { void openRunningBox(); }}>Open in Lab</button>}
               </div>
             </Dialog>,
             document.body,
           )}
         </header>
 
-        <div className="chat-transcript" ref={scroller} onScroll={onScroll} {...transcriptFocus}>
+        {/* The chrome refresh's context card, in the gutter while the panel is shut (chrome.css hides it when narrow). */}
+        {refresh && !phone && sidePanel && !sidePanel.open && !review && (
+          <SessionContextCard project={project} workstream={workstream} onOpenPr={sidePanel.show ? () => sidePanel.show!('pr') : undefined}
+            agents={(agentsUi && keptAgents.length) || (asksUi && keptAsks.length) ? (
+              <>
+                {agentsUi && keptAgents.length > 0 && <AgentsCardSection list={keptAgents} ui={agentsUi} />}
+                {asksUi && keptAsks.length > 0 && <AsksCardSection list={keptAsks} ui={asksUi} />}
+              </>
+            ) : null} />
+        )}
+        <div className="chat-transcript" ref={scroller} onScroll={onTranscriptScroll} {...transcriptFocus}>
           <div className={`chat-transcript-inner sdk-transcript ${REPLAY_BLOCK_CLASS}`}>
             {archiveNotice && (
               <div className="chat-archived-error" role="alert">
@@ -777,7 +630,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                       {stoppingBox ? 'Stopping…' : archiveNotice.retry === 'hibernate' ? 'Hibernate box' : 'Stop box'}
                     </button>
                   )}
-                  <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void openRunningBox(); }}>Open in full UI</button>
+                  <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void openRunningBox(); }}>Open in Lab</button>
                   <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void leaveArchived('/chat'); }}>Back to sessions</button>
                 </div>
               </div>
@@ -789,7 +642,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                   <div className="chat-box-says">
                     <div className="chat-box-says-label">Latest from the box</div>
                     <pre className={REPLAY_BLOCK_CLASS}>{boxSays.join('\n')}</pre>
-                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, workstream)}>Answer it in the full UI</Link>.</div>
+                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, workstream)}>Answer it in Lab</Link>.</div>
                   </div>
                 )}
                 {project.role !== 'collaborator' && (setup.retry || setup.startEmpty) && (
@@ -806,6 +659,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                 )}
               </div>
             )}
+            {loading && !recovery && <TranscriptSkeleton />}
             {runnerReady && chat.items.length === 0 && !queued && !echo && (
               <div className="chat-empty">
                 Ask Claude anything about {repo ?? project.name}.{' '}
@@ -814,155 +668,61 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                   : `It can read the code and answer, but can't run commands or edit files until the ${trustNoun} is trusted.`}
               </div>
             )}
-            {groupTurns(chat.items).map((g, gi, groups) => {
-              if (g.kind === 'user') return <ItemView key={g.item.key} item={g.item} projectId={project.id} workstream={workstream} />;
-              const meta = g.userKey ? turnMeta(chat.costs[g.userKey]) : null;
-              const grouped = groupToolRuns(g.items);
-              const lastGroup = gi === groups.length - 1;
-              return (
-                <div key={g.key} className="sdk-reply">
-                  {grouped.map((e, i) => (e.kind === 'tools'
-                    ? <ToolRun key={e.key} tools={e.tools} />
-                    : <ItemView key={e.item.key} item={e.item} projectId={project.id} workstream={workstream}
-                        onRetry={retry != null && canSend && lastGroup && i === grouped.length - 1 ? () => { void deliver(retry.text, 'retry', retry.images.map((im, k) => ({ ...im, id: `retry${k}`, name: 'image' }))); } : undefined} />))}
-                  {meta && <div className="sdk-reply-meta">{meta}</div>}
-                </div>
-              );
-            })}
-            {echoShown && <div className="sdk-user"><div className="sdk-user-bubble">{echo}</div></div>}
+            {windowed.hidden > 0 && (
+              <button type="button" className="btn-tiny chat-earlier" onClick={showEarlier} data-fallback={canScroll || undefined}>
+                Show {Math.min(windowed.hidden, TRANSCRIPT_WINDOW)} earlier {Math.min(windowed.hidden, TRANSCRIPT_WINDOW) === 1 ? 'message' : 'messages'}
+              </button>
+            )}
+            <SubagentsContext.Provider value={agentsUi}>
+            <AsksContext.Provider value={asksUi}>
+            {/* Haiku's headings for runs of tool calls, pushed by the box and kept in its history (chat/toolGroupHeadings.ts). */}
+            <HeadingStoreContext.Provider value={headingStore}>
+            <GenUiChatContext.Provider value={genUiChat}>
+            <ReviewCardContext.Provider value={reviewSession}>
+            <CodeFenceContext.Provider value={drawFence}>
+            {windowed.groups.map((g, gi, groups) => (
+              <TranscriptGroup key={chatGroupKey(g)} group={g} projectId={project.id} workstream={workstream}
+                onResume={g.kind === 'divider' && g.item.key === resumeKey && contextBusy == null ? onResumeCleared : undefined}
+                cost={g.kind === 'reply' && g.userKey ? chat.costs[g.userKey] : undefined}
+                open={gi === groups.length - 1 && chat.running} asks={chat.turnHeadings === true}
+                onRetry={retry != null && canSend && gi === groups.length - 1 ? onRetryLast : undefined} />
+            ))}
+            </CodeFenceContext.Provider>
+            </ReviewCardContext.Provider>
+            </GenUiChatContext.Provider>
+            </HeadingStoreContext.Provider>
+            </AsksContext.Provider>
+            </SubagentsContext.Provider>
+            {echoShown && <div className="sdk-user"><div className="sdk-user-bubble"><UserMessageText text={(echo ?? '').split(REVIEW_FORMAT_MARK)[0]} /></div><ReviewFormatChip text={echo} /></div>}
             {queued && (
               <div className="sdk-user" data-pending="">
-                <div className="sdk-user-bubble">{queued}</div>
+                <div className="sdk-user-bubble"><UserMessageText text={queued.split(REVIEW_FORMAT_MARK)[0]} /></div>
+                <ReviewFormatChip text={queued} />
                 <div className="sdk-user-note">{queueError ? `not sent: ${queueError}` : 'sent as soon as Claude is ready'}</div>
                 {queueError && <button type="button" className="btn-tiny chat-queued-retry" onClick={retryQueued}>Retry</button>}
               </div>
             )}
+            {s.heldShown.map(m => (
+              <div key={m.id} className="sdk-user" data-pending="">
+                <div className="sdk-user-bubble">{m.text}</div>
+                <div className="sdk-user-note">{m.error ? `not sent: ${m.error}` : 'sent once the chat is back'}</div>
+              </div>
+            ))}
             <UnsentMessages texts={unsent} disabled={!canSend} onSend={sendUnsent}
               onDiscard={i => setUnsent(u => u.filter((_, j) => j !== i))} />
           </div>
         </div>
-        <div className="chat-bottom">
-          {unseen && <button type="button" className="chat-jump" onClick={jumpToBottom}>↓ new output</button>}
-          <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled />
-          {trust && !trust.trusted && (
-            <div className="chat-trust" role="note">
-              <span>Claude can read {repo ?? 'this project'} but can't run commands or edit files in this session until the {trustNoun} is trusted.</span>
-              {canTrust
-                ? <button type="button" className="btn-tiny" onClick={trustRepo} disabled={trusting}>{trusting ? 'Trusting…' : `Trust this ${trustNoun}`}</button>
-                : <span className="chat-trust-note">Only the project's owner can trust it.</span>}
+        <SdkComposer s={s} project={project} workstream={workstream} unseen={unseen} onJump={jumpToBottom}
+          drawer={agentsUi && keptAgents.length && asksUi && keptAsks.length ? (
+            // Both: one frame on the composer holding the two, a line between them (chrome.css).
+            <div className="agent-drawer-stack">
+              <AgentsDrawer list={keptAgents} ui={agentsUi} />
+              <AsksDrawer list={keptAsks} ui={asksUi} />
             </div>
-          )}
-          <div className="chat-status" data-tone={status.tone === 'idle' ? 'idle' : status.tone === 'error' ? 'offline' : showSteps && !runnerReady ? 'setup' : 'working'} role="status" aria-live="polite">
-            {!recovery && chat.running && <span className="sdk-spinner" aria-hidden="true" />}{status.text}
-          </div>
-          {/* One surface: the images, the text, and a bar with the model on the left and
-              attach, dictate and send (or stop) on the right. Send shows once there is
-              something to send. */}
-          <form className="chat-composer" onSubmit={e => { e.preventDefault(); void send(); }}>
-            {takesImages && <ComposerImages images={images} onRemove={id => setImages(held => held.filter(i => i.id !== id))} />}
-            <textarea
-              ref={composer}
-              className="chat-input"
-              value={text}
-              onChange={e => { dictation.onEdit(); setText(e.target.value.slice(0, MAX_TEXT)); }}
-              onPaste={takesImages ? e => {
-                const files = imageFilesOf(e.clipboardData.files);
-                if (!files.length) return;
-                // An image copied with its caption (a web page) pastes both; a bare image pastes nothing else.
-                if (!e.clipboardData.getData('text/plain')) e.preventDefault();
-                void attach(files);
-              } : undefined}
-              onKeyDown={e => {
-                if (dictation.onKeyDown(e)) return;
-                // Enter sends, Shift+Enter is a newline: the runner takes the message as is.
-                if (isSendKey({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing })) { e.preventDefault(); void send(); }
-              }}
-              placeholder={setupFailed ? 'Setup failed' : !runnerReady ? 'Message Claude… (sent when it is ready)' : chat.running ? (sendGoesLive(chat, sendsLive) ? 'Message Claude… (it reads this at its next step)' : 'Message Claude… (sent after this turn)') : 'Message Claude…'}
-              rows={1}
-              disabled={!canSend}
-            />
-            <div className="chat-composer-bar">
-              <ModelPicker model={model} options={modelOptions} onChange={chooseModel} open={modelOpen} onOpenChange={setModelOpen} disabled={!modelReady} />
-              {modelPick && <span className="chat-composer-note">From your next message</span>}
-              <div className="chat-compose-actions">
-                {takesImages && (
-                  <>
-                    <button type="button" className="chat-icon-btn chat-attach" aria-label="Attach images" title="Attach images (or drop or paste them)"
-                      onClick={() => picker.current?.click()}>
-                      <PlusIcon />
-                    </button>
-                    <input ref={picker} type="file" accept={CHAT_IMAGE_ACCEPT} multiple hidden
-                      onChange={e => { void attach(Array.from(e.target.files ?? [])); e.target.value = ''; }} />
-                  </>
-                )}
-                <DictationButton dictation={dictation} disabled={!canSend} />
-                {running && control === 'split' && (
-                  <div className="chat-stop-split" ref={stopSplit}>
-                    <button type="button" className="chat-stop-btn chat-stop-main" onClick={mainStop} aria-label="Stop" title={stopTitle(background, 'split')}>
-                      <StopIcon />
-                    </button>
-                    <button
-                      type="button"
-                      className="chat-stop-caret"
-                      aria-label="More ways to stop"
-                      aria-haspopup="menu"
-                      aria-expanded={stopMenu}
-                      onClick={() => setStopMenu(m => !m)}
-                    ><span className="chat-compose-caret" aria-hidden="true" /></button>
-                    {stopMenu && (
-                      <div className="chat-stop-menu" role="menu">
-                        <button type="button" role="menuitem" onClick={() => requestStop('all')}>
-                          <span className="chat-stop-menu-label">Stop everything</span>
-                          <span className="chat-stop-menu-hint">{background.length ? `Also ends ${background.length === 1 ? 'the background task' : `the ${background.length} background tasks`}` : 'Ends the turn and anything it starts in the background'}</span>
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )}
-                {running && control === 'background' && (
-                  <button type="button" className="chat-stop-btn chat-stop-wide" onClick={mainStop} title={stopTitle(background, control)}>
-                    <StopIcon /><span>Stop background work</span>
-                  </button>
-                )}
-                {running && control === 'plain' && (
-                  <button type="button" className="chat-stop-btn" onClick={mainStop} aria-label="Stop" title={stopTitle(background, control)}>
-                    <StopIcon />
-                  </button>
-                )}
-                {hasDraft && (
-                  <button type="submit" className="chat-send-btn" aria-label="Send" title="Send (Enter)" disabled={!canSend}>
-                    <SendIcon />
-                  </button>
-                )}
-              </div>
-            </div>
-          </form>
-          {confirmStop && createPortal(
-            <ConfirmDialog
-              message={confirmStop === 'turn' ? <>
-                Stop Claude? Background commands keep running, but {subagents.length === 1 ? 'the background subagent ends' : `the ${subagents.length} background subagents end`} with the stop:
-                <ul className="chat-stop-tasks">{subagents.map((t, i) => <li key={i}>{t.description}</li>)}</ul>
-              </> : <>
-                Stop Claude? This ends the turn now, and with it {background.length === 1 ? 'the background task' : `the ${background.length} background tasks`} it started:
-                <ul className="chat-stop-tasks">{background.map((t, i) => <li key={i}>{t.description}</li>)}</ul>
-                A <code>termag ask</code> among them stops waiting, but the ask keeps running on its box (its commits still open a draft PR); its reply won't come back to this session.
-              </>}
-              confirmLabel={confirmStop === 'turn' ? 'Stop' : 'Stop everything'}
-              onConfirm={() => { const scope = confirmStop; setConfirmStop(null); stop(scope); }}
-              onCancel={() => setConfirmStop(null)}
-            />,
-            document.body,
-          )}
-          {/* A line kept under the composer for its notes, so one appearing doesn't push it up. */}
-          <div className="chat-composer-notes">
-            <DictationNote dictation={dictation} />
-            {takesImages && imageNote && <div className="chat-composer-note" data-error="">{imageNote}</div>}
-            {showHold && (
-              <TerminalHoldNotice busy={reclaiming || opening} onReturn={() => { void returnToChat(); }} onFullUi={() => { void openFull(); }} />
-            )}
-            {sendError && <div className="chat-composer-note" data-error="">{sendError}</div>}
-          </div>
-        </div>
+          ) : agentsUi && keptAgents.length ? <AgentsDrawer list={keptAgents} ui={agentsUi} />
+            : asksUi && keptAsks.length ? <AsksDrawer list={keptAsks} ui={asksUi} /> : null}
+          placeholder={review ? 'Ask about this PR, or tell Claude what to change in the review…' : undefined}
+          above={review?.section === 'pushed' ? <FollowUpStrip item={review} /> : undefined} />
       </section>
     </div>
   );

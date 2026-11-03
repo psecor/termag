@@ -1,0 +1,2 @@
+/* Hint.tsx: inline, so it sits on the line of what it explains. */
+.genui-hint { display: inline-flex; align-items: center; vertical-align: middle; flex: none; }

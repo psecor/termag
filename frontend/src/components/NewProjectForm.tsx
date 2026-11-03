@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useProjects } from '../contexts/ProjectContext';
 import { automationsApi, credentialsApi, instancesApi, projectsApi, warmPoolApi, ProjectTemplateInfo, WarmPoolStatus } from '../services/api';
-import { AutomationFields, draftBody, draftCron, emptyDraft, type AutomationDraft } from './AutomationFields';
+import { AutomationFields } from './AutomationFields';
+import { draftBody, draftCron, emptyDraft, type AutomationDraft } from '../utils/automationDraft';
 import { CONNECT_GITHUB_TO_ADD_BOX, blocksManagedBox, type BoxGateState } from '../boxGate';
 import type { Instance, Project } from '../types';
 import { PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider } from '../providers/registry';
@@ -19,13 +20,20 @@ import {
   boxNameTaken,
   projectNameError,
 } from '../utils/newProjectBox';
-import { boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, pickDefaultBox, unusableBoxAdvice } from '../utils/projectStart';
+import { archivedNameClash, boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, pickDefaultBox, unusableBoxAdvice, type ArchivedNameClash } from '../utils/projectStart';
 import { nameFromRepo } from '../utils/repoName';
 import { createBody, sameRepoMatches, suggestedName, type RepoPick } from '../utils/repoPick';
-import { boxIsSettling } from '../utils/boxFeed';
+import { boxIsSettling, claimUpdateLive } from '../utils/boxFeed';
 import { showsBoxError } from '../utils/boxPower';
 import { RepoPicker } from './RepoPicker';
+import { ExtraReposField } from './MultiRepo';
+import { MULTI_REPO_MAX, selectionRepos, toggleRepo, type ExtraRepo, type ListedPick } from '../utils/multiRepo';
 import { replaySessionId } from '../observability';
+import { BoxSizeField } from './BoxSizePicker';
+import { BoxDiskField } from './BoxDiskField';
+import { useBoxDiskPick, useBoxSizePick, useBoxSizes } from '../hooks/useBoxSizes';
+import { sizeToSend } from '../utils/boxSize';
+import { diskInputError, diskNote, diskToSend } from '../utils/boxDisk';
 
 /**
  * The one "new project" form: what to start from (empty, a starter repo, or
@@ -39,7 +47,8 @@ import { replaySessionId } from '../observability';
  * With the repository picker on, the open form is the repository list and
  * Create. Name, paste, agent, and box choice sit under Advanced settings.
  * That path provisions a new managed box named after the project, unless the
- * user picked an existing box (or the dialog was opened for one).
+ * user picked an existing box, the dialog was opened for one, or the project
+ * the user is on lives on a box that can take another (defaultBoxId).
  *
  * Boxes come from the shared box feed; whoever mounts this must have the feed
  * running (MainLayout does; Welcome starts it itself).
@@ -72,7 +81,19 @@ export interface NewProjectFormProps {
    */
   onGithubRequired?: () => void;
   initialBoxId?: string;
+  /**
+   * The box of the project the user is on: preselected over the usual
+   * default when it can take a project. Unlike initialBoxId it is only a
+   * preference, so a stopped or failed box falls back to the usual default.
+   */
+  defaultBoxId?: string | null;
   onBranchOff?: (projectId: string) => void;
+  /**
+   * Leaves out the notes on how setup works (the redrawn first run says it in
+   * its own heading). Errors and box
+   * notes still show.
+   */
+  quiet?: boolean;
 }
 
 const EMPTY_PICK: RepoPick = { kind: 'empty' };
@@ -93,7 +114,17 @@ function apiError(err: unknown, fallback: string): string {
 
 function status(s: string): string { return s.replace('-', ' '); }
 
-export function NewProjectForm({ onCreated, submitLabel = 'Create project', actions, autoFocus, onGithubRequired, initialBoxId, onBranchOff, mode = 'project' }: NewProjectFormProps) {
+/**
+ * A box Create can go on now: ready, or booting (the server holds the project
+ * for it). Narrower than boxIsUsableForProject, whose starting, warming and
+ * warm boxes leave Create disabled until they get there, so a default on one
+ * would block the collapsed form (Bugbot, #497). Matches boxReady/boxBooting.
+ */
+function boxTakesProjectNow(b: Pick<Instance, 'status'>): boolean {
+  return b.status === 'ready' || b.status === 'provisioning' || b.status === 'awaiting-agent';
+}
+
+export function NewProjectForm({ onCreated, submitLabel = 'Create project', actions, autoFocus, onGithubRequired, initialBoxId, defaultBoxId, onBranchOff, mode = 'project', quiet = false }: NewProjectFormProps) {
   const automation = mode === 'automation';
   const [draft, setDraft] = useState<AutomationDraft>(emptyDraft);
   // The full tier is the owner's trust tick (it sets chatTrustedAt): Create waits for the checkbox AutomationFields shows for it.
@@ -102,6 +133,8 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const { projects: contextProjects } = useProjects();
   const isAdmin = user?.role === 'admin';
   const pickerOn = useFlag(FLAGS.repoFirstPicker, false);
+  const multiRepoOn = useFlag(FLAGS.multiRepo, false) && !automation;
+  const [extraRepos, setExtraRepos] = useState<ExtraRepo[]>([]);
   const [fetchedProjects, setFetchedProjects] = useState<Project[] | null>(null);
   useEffect(() => {
     if (!pickerOn || contextProjects.length > 0) return;
@@ -129,6 +162,11 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const [start, setStart] = useState<string>(EMPTY);
   const [customUrl, setCustomUrl] = useState('');
   const [pickerPick, setPickerPick] = useState<RepoPick>(EMPTY_PICK);
+  // Listed repositories ticked after the pick: with multi-repo-projects-enabled
+  // the list is a multi-select, and two or more make a multi-repo project.
+  const [pickerMore, setPickerMore] = useState<ListedPick[]>([]);
+  const multiSelect = multiRepoOn && pickerOn;
+  const more = multiSelect ? pickerMore : [];
   const [name, setName] = useState('');
   const [nameTouched, setNameTouched] = useState(false);
   useEffect(() => {
@@ -149,6 +187,15 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   function choosePick(next: RepoPick) {
     if (pickIdentity(pickerPick) !== pickIdentity(next)) setNameTouched(false);
     setPickerPick(next.kind === 'empty' ? EMPTY_PICK : next);
+    setPickerMore([]);
+  }
+  // The name follows the first repository, so only a new first one renames the project.
+  // Every Add another repository row holds a slot, blank or not, as ExtraReposField counts them.
+  function toggleListed(repo: ListedPick) {
+    const next = toggleRepo({ pick: pickerPick, more }, repo, MULTI_REPO_MAX - extraRepos.length);
+    if (pickIdentity(pickerPick) !== pickIdentity(next.pick)) setNameTouched(false);
+    setPickerPick(next.pick);
+    setPickerMore(next.more);
   }
   // The name follows the repo until the user edits it; an empty project gets
   // a fresh "proj-fuzzy-pants" so the field is never blank (and a different
@@ -192,16 +239,38 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   }, []);
   const boxesLoaded = feedLoaded || reloadSettled;
   const boxesUnavailable = reloadSettled && !feedLoaded;
-  const boxes = useMemo(() => allBoxes.filter(b => b.status !== 'terminated'), [allBoxes]);
+  // The mount reload failed after an earlier good one: the list is from before
+  // and can lack a box that has started since.
+  const feedFailing = useSyncExternalStore(boxFeed.subscribe, boxFeed.isFailing);
+  const boxesStale = reloadSettled && feedLoaded && feedFailing;
+  // A quarantined box is kept for an admin's investigation; nothing new goes on it.
+  const boxes = useMemo(() => allBoxes.filter(b => b.status !== 'terminated' && b.status !== 'quarantined'), [allBoxes]);
   const usable = useMemo(() => boxes.filter(boxIsUsableForProject), [boxes]);
-  // Until the user picks, the picker path starts a new box. The flag-off form
-  // still prefers a ready box, and keeps that choice across reloads. An
-  // initialBoxId (Pick a repository) is an explicit box and wins on both.
+  // Until the user picks, the box of the project the user is on is the
+  // default when Create can go on it now, so a new project skips a box's
+  // setup time. Otherwise the picker path starts a new box and the flag-off
+  // form prefers a ready box, keeping that choice across reloads. An
+  // initialBoxId (Pick a repository) is an explicit box and wins over all of
+  // these.
   const [boxChoice, setBoxChoice] = useState<string | null>(null);
+  // Whether defaultBoxId was taken, decided once on the first loaded list: a
+  // box feed poll that changes its status (provisioning to failed, stopped to
+  // ready) must not move the select while the user reads the form. It waits
+  // for a real list (feedLoaded): after a failed first load the list is empty,
+  // and deciding on it would pass on the box for good (Bugbot, #497).
+  const defaultBoxDecision = useRef<'taken' | 'passed' | null>(null);
   useEffect(() => {
     if (!boxesLoaded || boxChoiceTouched.current) return;
     if (initialBoxId && boxes.some(b => b.id === initialBoxId)) {
       setBoxChoice(initialBoxId);
+      return;
+    }
+    if (defaultBoxId && feedLoaded && defaultBoxDecision.current === null) {
+      const current = boxes.find(b => b.id === defaultBoxId);
+      defaultBoxDecision.current = current && boxTakesProjectNow(current) ? 'taken' : 'passed';
+    }
+    if (defaultBoxDecision.current === 'taken' && boxes.some(b => b.id === defaultBoxId)) {
+      setBoxChoice(defaultBoxId!);
       return;
     }
     if (pickerOn) {
@@ -209,7 +278,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       return;
     }
     setBoxChoice(prev => prev ?? (pickDefaultBox(usable)?.id ?? NEW_BOX));
-  }, [boxesLoaded, usable, boxes, initialBoxId, pickerOn]);
+  }, [boxesLoaded, feedLoaded, usable, boxes, initialBoxId, defaultBoxId, pickerOn]);
   const choice = boxChoice ?? '';
   const chosenBox = boxes.find(b => b.id === choice) ?? null;
   const boxReady = choice === THIS_HOST || chosenBox?.status === 'ready';
@@ -252,6 +321,15 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const addBoxBlocked = blocksManagedBox(boxGate);
 
   const warmPoolEnabled = useFlag(FLAGS.warmPool, false);
+  // The new box's size: the dropdown shows only while box-default-size is on, preselecting what the
+  // server says a box for the picked repository launches at (its .termag/environment.json, utils/boxSize.ts).
+  // A multi-repo project's box is sized for every repository (the server takes the largest), else the one.
+  const sizeRepos = (multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null)?.map(r => r.url) ?? createBody(pick)?.repoUrl;
+  const { sizes: boxSizes, disk: boxDisk } = useBoxSizes(choice === NEW_BOX, sizeRepos);
+  const [boxSize, setBoxSize] = useBoxSizePick(sizeRepos);
+  // The new box's disk: what the person typed, else the repository's diskGiB or 120 (utils/boxDisk.ts).
+  const [diskTyped, setDiskTyped] = useBoxDiskPick(sizeRepos);
+  const diskError = choice === NEW_BOX ? diskInputError(boxDisk, diskTyped) : null;
   const [warmPool, setWarmPool] = useState<WarmPoolStatus | null>(null);
   useEffect(() => {
     if (!warmPoolEnabled || choice !== NEW_BOX) return;
@@ -270,7 +348,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
     setBoxBusy(true); setBoxError(''); setBoxHint('');
     noteAddBoxClick();
     try {
-      const r = await instancesApi.create(boxName, 'ec2');
+      const r = await instancesApi.create(boxName, 'ec2', { size: sizeToSend(boxSizes, boxSize), diskGiB: diskToSend(boxDisk, diskTyped), repo: sizeRepos });
       // Into the list now, ahead of the feed's next poll: a claimed box is
       // already ready and the form should say so at once; a provisioning one
       // starts the feed polling.
@@ -303,19 +381,30 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const body = createBody(pick);
-  const newBoxOk = choice === NEW_BOX && !!newBoxName.trim() && !boxNameError && !addBoxBlocked && !conflictError && !nameError;
+  const workspaceRepos = multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null;
+  const newBoxOk = choice === NEW_BOX && !!newBoxName.trim() && !boxNameError && !diskError && !addBoxBlocked && !conflictError && !nameError;
   const retryOk = boxAdvice === 'try-again' && !addBoxBlocked;
   const automationOk = !automation || (!!draft.prompt.trim() && draftCron(draft) !== null && !!draft.timezone && (draft.tier !== 'full' || fullTierTicked));
   // An automation runs on a box (the chat runner needs one): "this host" is not offered.
   const canSubmit = !busy && !nameError && (boxReady || boxBooting || newBoxOk || retryOk) && !!name.trim() && body !== null && automationOk && !(automation && choice === THIS_HOST);
-  const matches = !choice || choice === NEW_BOX
+  const matches = !choice || choice === NEW_BOX || workspaceRepos
     ? []
     : sameRepoMatches(pick, projects, choice === THIS_HOST ? null : choice);
 
+  // An archived project already holds the name on the chosen box. Kept with
+  // the name and box it was refused for, so editing either drops the offer.
+  const [archivedClash, setArchivedClash] = useState<{ key: string; project: ArchivedNameClash } | null>(null);
+  const clashKey = `${name.trim()}|${choice}`;
+  const clash = archivedClash?.key === clashKey ? archivedClash.project : null;
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    await create();
+  }
+
+  async function create(archivedName?: 'unarchive' | 'rename-aside') {
     if (!canSubmit || !body) return;
-    setBusy(true); setError('');
+    setBusy(true); setError(''); setArchivedClash(null);
     let instanceId = choice === THIS_HOST ? null : chosenBox?.id ?? null;
     let warmClaimed: boolean | undefined;
     if (choice === NEW_BOX || (retryOk && chosenBox)) {
@@ -350,11 +439,15 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
           // The replay this tab is recording: the Claude session's spans are filed under it.
           replaySessionId: await replaySessionId(),
           ...(warmClaimed !== undefined && { warmClaimed }),
-          ...body,
+          ...(archivedName && { archivedName }),
+          ...(workspaceRepos ? { repos: workspaceRepos } : body),
         });
       }
     } catch (err) {
-      if (isBoxFailedRefusal(err)) {
+      const archived = archivedNameClash(err);
+      if (archived) {
+        setArchivedClash({ key: clashKey, project: archived });
+      } else if (isBoxFailedRefusal(err)) {
         // The launch failed before the project was asked for: the box line
         // says so once the list has the failed box.
         await boxFeed.reload();
@@ -378,7 +471,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   return (
     <form className="npf" onSubmit={e => void submit(e)}>
       {pickerOn ? (
-        <RepoPicker value={pickerPick} onChange={choosePick} autoFocus={autoFocus} showPaste={false} />
+        <RepoPicker value={pickerPick} onChange={choosePick} autoFocus={autoFocus} showPaste={false} more={more} onToggle={multiSelect ? toggleListed : undefined} />
       ) : (
         <>
           <div className="npf-field">
@@ -396,6 +489,9 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
             </div>
           )}
         </>
+      )}
+      {multiRepoOn && (
+        <ExtraReposField value={extraRepos} onChange={setExtraRepos} primaryCount={body?.repoUrl ? 1 + more.length : 0} />
       )}
       {(() => {
         const choices = (
@@ -466,9 +562,15 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
                   disabled={boxBusy}
                 />
                 {warmPoolEnabled && warmPool && (
-                  <span className="npf-note usage-dim">{warmPool.warm > 0 ? 'ready now' : 'a few minutes'}</span>
+                  <span className="npf-note usage-dim">{warmPool.warm > 0 && !diskNote(boxDisk, diskTyped, true) ? 'ready now' : 'a few minutes'}</span>
                 )}
               </div>
+            )}
+            {choice === NEW_BOX && boxSizes && (
+              <BoxSizeField options={boxSizes} picked={boxSize} onPick={setBoxSize} disabled={boxBusy} />
+            )}
+            {choice === NEW_BOX && boxDisk && (
+              <BoxDiskField disk={boxDisk} typed={diskTyped} onType={setDiskTyped} warmBoxReady={warmPoolEnabled && (warmPool?.warm ?? 0) > 0} disabled={boxBusy} />
             )}
           </>
         );
@@ -488,7 +590,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       )}
       {chosenBox && (
         <div className={`npf-box-status status-${chosenBox.status}`}>
-          <strong>{chosenBox.name}</strong> · {status(chosenBox.status)}
+          <strong>{chosenBox.name}</strong> · {chosenBox.status === 'ready' && claimUpdateLive(chosenBox) ? 'updating the box…' : status(chosenBox.status)}
           {/* Only states the feed keeps polling through change on their own; a
               stopped or hibernated box waits for a start. */}
           {boxIsSettling(chosenBox) && <span className="usage-dim"> · this updates on its own</span>}
@@ -516,8 +618,9 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
         </div>
       )}
       {boxesUnavailable && <div className="usage-dim npf-note">Could not load your boxes just now; you can still create a new one.</div>}
+      {boxesStale && <div className="usage-dim npf-note">Could not refresh your boxes just now, so this list may be out of date. Reload the page if a box is missing.</div>}
       {boxHint && <div className="usage-dim npf-note">{boxHint}</div>}
-      {(choice === NEW_BOX || boxBooting) && (
+      {!quiet && (choice === NEW_BOX || boxBooting) && (
         <div className="usage-dim npf-note">
           termag creates the project now and sets it up after the box is ready; it opens by itself, and the box keeps going if you close this tab.
         </div>
@@ -536,14 +639,27 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
         </div>
       ))}
       {automation && <AutomationFields draft={draft} onChange={setDraft} showEnabled idPrefix="npf-af" onFullTierTick={setFullTierTicked} />}
-      <div className="usage-dim npf-note">
+      {!quiet && <div className="usage-dim npf-note">
         {automation
-          ? <>Each run gets its own branch under this project and shows up as a conversation in the simple UI. Nothing runs until the schedule's first occurrence; use Run now on the automation to try it.</>
+          ? <>Each run gets its own branch under this project and shows up as a conversation in termag. Nothing runs until the schedule's first occurrence; use Run now on the automation to try it.</>
+          : workspaceRepos
+            ? <>{workspaceRepos.length} repositories, each cloned into its own directory; the agent starts when every checkout is done.</>
           : body?.repoUrl
             ? <>The repo is fetched in the agent pane first, so you can watch it; the agent starts when the checkout is done.</>
             : <>An empty project with a seeded AGENTS.md and CLAUDE.md.</>}
-      </div>
+      </div>}
       {error && <div className="error-text">{error}</div>}
+      {clash && (
+        <div className="npf-note">
+          You archived a project named <strong>{clash.name}</strong> on this box on {clash.archivedAt.slice(0, 10)}, so the name is taken.
+          {' '}Un-archive it to get it back as it was{clash.workstreams > 1 ? `, with its ${clash.workstreams} workstreams` : ''} (whatever is still in its folder on the box),
+          {' '}or rename it aside to {clash.name}-archived-{clash.archivedAt.slice(0, 10)} (it stays archived) and create a new {clash.name}.
+          <div className="npf-actions">
+            <button type="button" className="btn-ghost" disabled={busy} onClick={() => void create('unarchive')}>Un-archive it</button>
+            <button type="button" className="btn-primary" disabled={busy} onClick={() => void create('rename-aside')}>Rename it aside and create</button>
+          </div>
+        </div>
+      )}
       <div className="npf-actions">
         {actions}
         <button

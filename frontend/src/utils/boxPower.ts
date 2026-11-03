@@ -17,11 +17,6 @@ export function canStartBox(box: BoxLike): boolean {
   return box.kind === 'ec2' && !!box.ec2InstanceId && (box.status === 'stopped' || box.status === 'hibernated');
 }
 
-/** Only for boxes launched hibernation-capable; every other box keeps plain Stop. */
-export function canHibernateBox(box: BoxLike & Pick<Instance, 'hibernationConfigured'>): boolean {
-  return box.kind === 'ec2' && !!box.ec2InstanceId && !!box.hibernationConfigured && box.status === 'ready';
-}
-
 /** EC2 supports at most 60 days hibernated; the backend refreshes a box at 55. */
 export const HIBERNATION_LIMIT_DAYS = 60;
 export const HIBERNATION_WARN_DAYS = 50;
@@ -33,11 +28,11 @@ export function hibernatedDays(box: Pick<Instance, 'status' | 'hibernatedAt'>, n
   return Math.max(0, Math.floor((now - at) / (24 * 60 * 60 * 1000)));
 }
 
-/** A one-line note for a hibernated box nearing EC2's 60-day limit, or null. */
+/** A one-line note for a hibernated box nearing EC2's 60-day limit, or null. The refresh stops it. */
 export function hibernationAgeNote(box: Pick<Instance, 'status' | 'hibernatedAt'>, now = Date.now()): string | null {
   const days = hibernatedDays(box, now);
   if (days === null || days < HIBERNATION_WARN_DAYS) return null;
-  return `Hibernated ${days} days. EC2 allows ${HIBERNATION_LIMIT_DAYS}; termag resumes and re-hibernates it at 55.`;
+  return `Hibernated ${days} days. EC2 allows ${HIBERNATION_LIMIT_DAYS}; termag resumes it at 55 and stops it.`;
 }
 
 export interface BoxDisplay {
@@ -58,6 +53,7 @@ export function boxDisplay(status: InstanceStatus): BoxDisplay {
     case 'stopped': return { dot: 'var(--text-secondary)', spinning: false, label: 'stopped' };
     case 'hibernated': return { dot: 'var(--text-secondary)', spinning: false, label: 'hibernated' };
     case 'failed': return { dot: 'var(--danger)', spinning: false, label: 'failed' };
+    case 'quarantined': return { dot: 'var(--danger)', spinning: false, label: 'quarantined' };
     default: return { dot: 'var(--danger)', spinning: false, label: status };
   }
 }
@@ -69,7 +65,14 @@ export function boxDisplay(status: InstanceStatus): BoxDisplay {
  */
 export function isBoxParked(status: InstanceStatus | undefined): boolean {
   return status === 'stopping' || status === 'stopped' || status === 'starting'
-    || status === 'hibernating' || status === 'hibernated';
+    || status === 'hibernating' || status === 'hibernated' || status === 'quarantined';
+}
+
+/** Shown under a box an admin quarantined (backend/src/services/boxQuarantine.ts); its owner can't act on it. */
+export const QUARANTINED_BOX_NOTE = 'Quarantined by a termag admin and kept for investigation. Create a new box to keep working.';
+
+export function isQuarantined(box: Pick<Instance, 'status'>): boolean {
+  return box.status === 'quarantined';
 }
 
 /**

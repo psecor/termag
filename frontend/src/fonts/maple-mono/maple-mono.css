@@ -1,0 +1,29 @@
+/* Maple Mono v7.9 (SIL OFL 1.1, LICENSE.txt), plain cut from MapleMono-Woff2.zip. The terminal font: terminalFont.ts. */
+@font-face {
+  font-family: 'Maple Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(./MapleMono-Regular.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Maple Mono';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 400;
+  src: url(./MapleMono-Italic.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Maple Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url(./MapleMono-Bold.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Maple Mono';
+  font-style: italic;
+  font-display: swap;
+  font-weight: 700;
+  src: url(./MapleMono-BoldItalic.woff2) format('woff2');
+}

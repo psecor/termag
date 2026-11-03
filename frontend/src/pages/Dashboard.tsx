@@ -21,7 +21,7 @@ import { ProjectBreakdown } from './dashboard/ProjectBreakdown';
 import { ContextPanels } from './dashboard/ContextPanels';
 import { RhythmCharts } from './dashboard/RhythmCharts';
 import { dayTokens, fmtDurationShort, fmtK, fmtAge, EMPTY_USAGE_DAY } from '../utils/format';
-import { median, previousNDaysUTC, todayDates, utcToday } from '../utils/dates';
+import { localToday, median, previousNDaysUTC, utcToday } from '../utils/dates';
 import { HUMAN, mergeWtDays, agentDayMs } from '../utils/worktime';
 import { TRAILING_MEDIAN_DAYS } from '../utils/thresholds';
 
@@ -56,7 +56,7 @@ export default function Dashboard() {
     usage: data.usage.data,
     usageUnavailable: data.usageUnavailable,
     worktimeByProject: data.worktimeByProject.data?.rows ?? null,
-    todayKeys: todayDates(),
+    todayKeys: [localToday()],
     todayUTC: utcToday(),
     baselineUTC: previousNDaysUTC(TRAILING_MEDIAN_DAYS, 1),
     cloudSessions: data.cloudActive.data?.sessions ?? null,

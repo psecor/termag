@@ -33,6 +33,29 @@ export function ringStateFor(review: SessionReview | null | undefined): RingStat
   return seen != null && seen >= done ? null : 'done';
 }
 
+/**
+ * A workstream's review panes from its agent session's status:
+ * `reviews`, else the one `review` an older
+ * backend sends.
+ */
+export function reviewsOf(status: { review?: SessionReview | null; reviews?: SessionReview[] | null } | null | undefined): SessionReview[] {
+  if (status?.reviews) return status.reviews;
+  return status?.review ? [status.review] : [];
+}
+
+/**
+ * One ring for a workstream's panes: the most urgent (waiting > reviewing >
+ * done), the PR and reviewer of the first pane in that state, and how many
+ * panes share it.
+ */
+export function ringForReviews(reviews: SessionReview[]): { ring: RingState | null; pr: number | null; reviewer: string | null; count: number } {
+  const rings = reviews.map(ringStateFor);
+  const ring = aggregateReviewRing(rings);
+  if (!ring) return { ring: null, pr: null, reviewer: null, count: 0 };
+  const top = reviews[rings.indexOf(ring)];
+  return { ring, pr: top?.pr ?? null, reviewer: top?.reviewer ?? null, count: rings.filter(r => r === ring).length };
+}
+
 /** Tile aggregation: waiting > reviewing > done > none. */
 export function aggregateReviewRing(rings: Array<RingState | null | undefined>): RingState | null {
   if (rings.includes('waiting')) return 'waiting'; // wins over everything at the tile
@@ -40,8 +63,18 @@ export function aggregateReviewRing(rings: Array<RingState | null | undefined>):
   return rings.some(r => r === 'done') ? 'done' : null;
 }
 
-/** The tooltip for one ring. Without a recovered PR the wording carries on without the number. */
-export function reviewRingTooltip(ring: RingState, pr: number | null | undefined, reviewer?: string | null): string {
+/**
+ * The tooltip for one ring. Without a recovered PR the wording carries on
+ * without the number. `count` > 1: that many review panes share the ring.
+ */
+export function reviewRingTooltip(ring: RingState, pr: number | null | undefined, reviewer?: string | null, count: number = 1): string {
+  if (count > 1) {
+    switch (ring) {
+      case 'waiting': return `${count} reviews need an answer`;
+      case 'reviewing': return `${count} reviews running`;
+      case 'done': return `${count} reviews ready`;
+    }
+  }
   const name = reviewerDisplayName(reviewer);
   switch (ring) {
     case 'waiting': return `${name} needs an answer in the review pane`;

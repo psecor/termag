@@ -26,6 +26,7 @@ import Preview from './pages/Preview';
 import { useBrowserShareHandoff } from './hooks/useBrowserShareHandoff';
 import { BrowserDock } from './components/BrowserDock';
 import { ThemeProvider, useTheme } from './theme/ThemeProvider';
+import { showStarfield } from './theme/apply';
 import { useEasedWarp } from './hooks/useEasedWarp';
 import { useStatusFavicon } from './hooks/useStatusFavicon';
 import { UsageMini } from './components/UsageMini';
@@ -38,13 +39,15 @@ import { useSetupContext } from './hooks/useSetupContext';
 import { statusKey } from './utils/statusKey';
 import { rateLimitLabel } from './utils/rateLimit';
 import { FOCUS_PANE_EVENT, retryUntil, type FocusPaneDetail } from './utils/workspaceTarget';
-import { activityApi, warpApi, authApi, reviewApi, AuthMode } from './services/api';
-import type { SessionReview } from './types';
+import { activityApi, warpApi, authApi, AuthMode } from './services/api';
+import { useReviewPanes } from './hooks/useReviewPanes';
 import { boxFeed } from './services/boxFeed';
+import { useStartParkedBoxOnOpen } from './hooks/useStartParkedBoxOnOpen';
 import { BriefingCard } from './components/BriefingCard';
-import { useLaunchQueue } from './mobile/launch';
-import { currentUiMode, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi } from './chat/uiMode';
-import { currentOptOut, installedAppMode, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, setInstalledAppEnabled, shouldRedirectToMobile } from './mobile/redirect';
+import { APP_START_PATH, appStartTarget, useLaunchQueue } from './mobile/launch';
+import { currentUiMode, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi, simpleUiShareHandoff } from './chat/uiMode';
+import { currentOptOut, installedAppMode, isStandalone, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, setInstalledAppEnabled, shouldRedirectToMobile, TOUCH_MEDIA_QUERY } from './mobile/redirect';
+import { readRefreshHint } from './onboarding/refreshHint';
 
 const BROWSER_EXPANDED_KEY = 'termag.browserPane.expanded';
 function readBrowserExpanded(): Record<string, boolean> {
@@ -70,6 +73,11 @@ function Login() {
     : mode === 'oidc' ? 'Sign in with SSO'
     : mode === 'google' ? 'Sign in with Google'
     : 'Sign in';
+
+  // onboarding-refresh-enabled, as this browser last saw it for a signed-in
+  // user: the sign-in page has no user to evaluate it for (onboarding/refreshHint.ts).
+  const [refresh] = useState(readRefreshHint);
+  if (refresh) return <Suspense fallback={null}><SignIn label={label} /></Suspense>;
 
   return (
     <div className="login-page">
@@ -105,26 +113,39 @@ function useIsNarrow(defaultBreakpoint = 1600) {
 
 function MainLayout() {
   const { user } = useAuthHook();
-  const { projects, activeProjectId, statusMap, getActiveWorkstream } = useProjects();
+  const { projects, activeProjectId, statusMap, getActiveWorkstream, setActiveWorkstream } = useProjects();
   const connection = useConnection();
   useStatusFavicon();
 
   useEffect(() => {
     if (!user) return;
     boxFeed.start();
-    return () => boxFeed.stop();
+    // The feed polls only while a box is changing, so a tab left in the
+    // background keeps a list from before a box started elsewhere. Coming
+    // back to it refetches, unless a list landed in the last 30 s.
+    const onVisible = () => { if (document.visibilityState === 'visible') void boxFeed.reloadIfOlderThan(30_000); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      boxFeed.stop();
+    };
   }, [user]);
 
-  // The starfield shows when the hyperspace flag allows it (defaults on) and
-  // the user's theme asks for it.
+  // The starfield shows when the kill-switch flag allows it (defaults
+  // on, so behavior is unchanged without flags) and the user's theme asks for it
+  // in the dark palette (its white stars on a dark fade don't belong in light).
   // The flag can only take it away. Otherwise .app-layout paints --bg-backdrop,
-  // which the theme sets (theme/ThemeProvider.tsx): the base colour, or the
-  // user's solid colour.
+  // which the theme sets (theme/ThemeProvider.tsx): the palette's base colour,
+  // or the user's solid colour.
   const hyperspaceAllowed = useFlag(FLAGS.hyperspaceBackground, true);
   const { theme } = useTheme();
-  const showHyperspace = hyperspaceAllowed && theme.background.mode === 'hyperspace';
+  const showHyperspace = hyperspaceAllowed && showStarfield(theme);
+  // Thanksgiving: the user's turkeys, while the flag offers them.
+  const turkeysAllowed = useFlag(FLAGS.thanksgivingTurkeys, false);
+  const starfieldTurkeys = turkeysAllowed && theme.starfieldTurkeys === true;
 
   const activeProject = projects.find(p => p.id === activeProjectId);
+  useStartParkedBoxOnOpen(activeProject, activeProject ? getActiveWorkstream(activeProject.id) : 'main');
 
   const hasAgent = activeProject?.workflows.some(w => w.type === 'agent');
   const setupCtx = useSetupContext(activeProject);
@@ -176,67 +197,18 @@ function MainLayout() {
   const ctrlSession = activeProject
     ? buildSessionName(sessionOwner, activeProject.name, 'ctrl', activeWorkstream)
     : '';
-  const reviewSession = activeProject
-    ? buildSessionName(sessionOwner, activeProject.name, 'review', activeWorkstream)
-    : '';
-
-  // Devin review pane (Review button → ReviewDock under the ctrl terminal),
-  // per project+workstream. Its state rides the agent session's status
-  // (`review`, the only thing the backend's review sweep writes); the
-  // browser polls nothing. A tiny optimistic
-  // overlay bridges the POST→push gap for the pane that was just started, and
-  // hides a just-stopped one until the clearing push lands.
-  const reviewKey = activeProject ? `${activeProject.id}/${activeWorkstream}` : '';
-  const [reviewExpanded, setReviewExpanded] = useState<Record<string, boolean>>({});
-  const [reviewOverlay, setReviewOverlay] = useState<Record<string, { review: SessionReview } | 'cleared'>>({});
-  const reviewMetaRaw = statusMap[statusKey(activeProject?.instanceId, agentSession)]?.review ?? null;
-  const overlay = reviewOverlay[reviewKey];
-  const reviewMeta = overlay === 'cleared' ? null : overlay?.review ?? reviewMetaRaw;
-  // Drop the overlay once the pushed truth covers it — and on a timer in case
-  // the push never lands (offline browser, an agent that never reports).
-  useEffect(() => {
-    if (overlay === undefined) return;
-    const truthCovers = overlay === 'cleared' ? reviewMetaRaw == null : reviewMetaRaw != null;
-    if (truthCovers) {
-      setReviewOverlay(prev => { if (!(reviewKey in prev)) return prev; const next = { ...prev }; delete next[reviewKey]; return next; });
-      return;
-    }
-    const t = setTimeout(() => {
-      setReviewOverlay(prev => { if (!(reviewKey in prev)) return prev; const next = { ...prev }; delete next[reviewKey]; return next; });
-    }, 8000);
-    return () => clearTimeout(t);
-  }, [overlay, reviewMetaRaw, reviewKey]);
-  const reviewStatus = reviewMeta
-    ? {
-        session: reviewSession,
-        // The sweep owns the truth; a lost connection greys the status glyph
-        // client-side (`.stale`) instead of an offline poller answer.
-        connected: true as const,
-        alive: true as const,
-        running: reviewMeta.state === 'reviewing' || reviewMeta.state === 'waiting' || reviewMeta.state === 'done',
-        state: reviewMeta.state,
-        pr: reviewMeta.pr,
-        url: reviewMeta.url,
-        startedAt: null,
-        reviewer: reviewMeta.reviewer ?? null,
-      }
-    : null;
-  const review = reviewStatus ? { expanded: reviewExpanded[reviewKey] ?? false, status: reviewStatus } : null;
-  const onReviewStarted = useCallback((r: { pr: number; url: string | null; session: string; reviewer?: string }) => {
-    setReviewOverlay(prev => ({
-      ...prev,
-      [reviewKey]: { review: { state: 'reviewing', pr: r.pr, url: r.url, reviewer: r.reviewer, at: new Date().toISOString(), doneAt: null, seenAt: null } },
-    }));
-    setReviewExpanded(prev => ({ ...prev, [reviewKey]: true }));
-  }, [reviewKey]);
-  const toggleReview = useCallback(() => {
-    setReviewExpanded(prev => ({ ...prev, [reviewKey]: !prev[reviewKey] }));
-  }, [reviewKey]);
-  const stopReview = useCallback(() => {
-    if (!activeProject) return;
-    setReviewOverlay(prev => ({ ...prev, [reviewKey]: 'cleared' }));
-    reviewApi.stop(activeProject.id, activeWorkstream).catch(() => {});
-  }, [activeProject, activeWorkstream, reviewKey]);
+  // Review panes (Review button → a ReviewDock each under the ctrl terminal),
+  // per project+workstream: up to 8 with parallel-reviews-enabled
+  // (hooks/useReviewPanes.ts).
+  const parallelReviewsOn = useFlag(FLAGS.parallelReviews, false);
+  const reviews = useReviewPanes({
+    projectId: activeProject?.id ?? null,
+    workstream: activeWorkstream,
+    owner: sessionOwner,
+    projectName: activeProject?.name ?? null,
+    status: statusMap[statusKey(activeProject?.instanceId, agentSession)],
+  });
+  const { expandFor: expandReviewFor } = reviews;
 
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
@@ -336,10 +308,11 @@ function MainLayout() {
   useEffect(() => {
     let cancel: (() => void) | null = null;
     const onFocusPane = (e: Event) => {
-      const { projectId, workstream, pane } = (e as CustomEvent<FocusPaneDetail>).detail;
+      const { projectId, workstream, pane, session } = (e as CustomEvent<FocusPaneDetail>).detail;
       if (isNarrow) setActivePane(pane === 'agent' ? 'agent' : 'ctrl');
       if (pane === 'review') {
-        setReviewExpanded(prev => ({ ...prev, [`${projectId}/${workstream}`]: true }));
+        // The pane it names, else the first one.
+        expandReviewFor(projectId, workstream, session);
         return;
       }
       cancel?.();
@@ -351,7 +324,7 @@ function MainLayout() {
     };
     window.addEventListener(FOCUS_PANE_EVENT, onFocusPane);
     return () => { window.removeEventListener(FOCUS_PANE_EVENT, onFocusPane); cancel?.(); };
-  }, [isNarrow]);
+  }, [isNarrow, expandReviewFor]);
 
   // Adjustable agent/ctrl split (wide mode only). Agent pane gets `agentPct`%
   // of the width; the divider drags it (clamped 15–85), double-click resets to
@@ -424,6 +397,7 @@ function MainLayout() {
             typingBoost={typing}
             targetWarp={warpModel.targetWarp}
             connection={connection.state}
+            turkeys={starfieldTurkeys}
           />
         </div>
       )}
@@ -560,8 +534,9 @@ function MainLayout() {
                   <ReviewButton
                     projectId={activeProject.id}
                     workstream={activeWorkstream}
-                    hasReview={!!review}
-                    onStarted={onReviewStarted}
+                    panes={reviews.panes}
+                    parallel={parallelReviewsOn}
+                    onStarted={reviews.onStarted}
                     key={`${activeProject.id}-${activeWorkstream}-review-btn`}
                   />
                 </>
@@ -598,21 +573,25 @@ function MainLayout() {
                       key={`${activeProject.id}-${activeWorkstream}-ctrl${isNarrow ? `-${activePane}` : ''}`}
                     />
                   </div>
-                  {/* The review pane docks under the ctrl terminal:
-                      a one-line bar collapsed, half the column expanded. */}
-                  {review && (
+                  {/* The review panes dock under the ctrl terminal, slot order:
+                      a one-line bar each collapsed; the open ones share the column. */}
+                  {reviews.panes.map((p, i) => (
                     <ReviewDock
+                      key={p.session}
                       projectId={activeProject.id}
                       instanceId={activeProject.instanceId}
                       workstream={activeWorkstream}
-                      sessionName={reviewSession}
-                      status={review.status}
-                      review={reviewMeta}
-                      expanded={review.expanded}
-                      onToggle={toggleReview}
-                      onStop={stopReview}
+                      sessionName={p.session}
+                      // The sweep owns the truth; a lost connection greys the status glyph
+                      // client-side (`.stale`) instead of an offline poller answer.
+                      status={{ alive: true, state: p.state, pr: p.pr, url: p.url, reviewer: p.reviewer ?? null }}
+                      review={p}
+                      expanded={reviews.isExpanded(p, i)}
+                      onToggle={() => reviews.toggle(p, i)}
+                      onStop={() => reviews.stop(p.session)}
+                      onCollapseAll={i === 0 && reviews.openCount > 1 ? reviews.collapseAll : undefined}
                     />
-                  )}
+                  ))}
                   {/* The browser pane docks under the review pane: a one-line
                       bar collapsed, most of the column expanded. */}
                   {browserPaneOn && (
@@ -634,6 +613,8 @@ function MainLayout() {
                       defaultTtlHours={previewShareTtl}
                       atPath={sharing.atPath}
                       onClose={() => setSharing(null)}
+                      // The dev stack running is another workstream's: the dialog follows the workspace there.
+                      onSwitchWorkstream={(ws) => setActiveWorkstream(activeProject.id, ws)}
                     />
                   )}
                 </>
@@ -665,14 +646,15 @@ const Admin = lazy(() => import('./pages/Admin'));
 const SpawnNetwork = lazy(() => import('./pages/SpawnNetwork'));
 const Automations = lazy(() => import('./pages/Automations'));
 const Welcome = lazy(() => import('./pages/Welcome'));
+const SignIn = lazy(() => import('./pages/welcome/SignIn'));
 const MobileApp = lazy(() => import('./pages/mobile/MobileApp'));
 const ChatApp = lazy(() => import('./pages/chat/ChatApp'));
 
 /**
  * Phone-sized viewports go to the mobile client when the
  * `mobile-redirect-enabled` flag is on and this browser has not pressed
- * "Full UI". With `mobile-installed-app-enabled`, an app installed on a touch
- * device always does (§5.1) and its "Full UI" lasts for that window only. Sits
+ * "Lab". With `mobile-installed-app-enabled`, an app installed on a touch
+ * device always does (§5.1) and its "Lab" lasts for that window only. Sits
  * inside FeatureFlagsProvider (for the flags) and before MainLayout, so no
  * terminal socket is opened for a page that is about to leave.
  */
@@ -690,19 +672,22 @@ function MobileRedirectGate({ children }: { children: React.ReactNode }) {
 
 /**
  * The workspace, or the simple UI when that is where this browser was last
- * and the page was loaded at the bare workspace URL (chat/uiMode.ts).
+ * and the page was loaded at the bare workspace URL (chat/uiMode.ts), or for
+ * a share link its owner opened: its side panel's browser, not the dock.
  */
 function SimpleUiReturnGate({ children }: { children: React.ReactNode }) {
   const flagOn = useFlag(FLAGS.simpleUi, false);
+  const sidePanelOn = useFlag(FLAGS.chatSidePanel, false);
   const location = useLocation();
-  const [toSimple] = useState(() => shouldOpenSimpleUi({
-    flagOn, mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
-  }));
+  const [toSimple] = useState(() => simpleUiShareHandoff({ flagOn, sidePanelOn, mode: currentUiMode(), search: location.search })
+    ?? (shouldOpenSimpleUi({
+      flagOn, mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
+    }) ? '/chat' : null));
   useEffect(() => {
     leavePageEntry();
     if (!toSimple) recordUiMode('full');
   }, [toSimple]);
-  if (toSimple) return <Navigate to="/chat" replace />;
+  if (toSimple) return <Navigate to={toSimple} replace />;
   return <>{children}</>;
 }
 
@@ -711,6 +696,14 @@ function PageEntryTracker() {
   const { key } = useLocation();
   useEffect(() => { notePageLocation(key); }, [key]);
   return null;
+}
+
+/** The installed app's start_url (mobile/launch.ts): the phone client or the simple UI. */
+function AppStart() {
+  const simpleUi = useFlag(FLAGS.simpleUi, false);
+  const touch = typeof window !== 'undefined' && window.matchMedia(TOUCH_MEDIA_QUERY).matches;
+  const standalone = typeof window !== 'undefined' && isStandalone(window);
+  return <Navigate to={appStartTarget({ touch, standalone, simpleUi })} replace />;
 }
 
 /** The simple UI at /chat exists only for users with simple-ui-enabled. */
@@ -880,6 +873,17 @@ export default function App() {
                   </ConnectionProvider>
                 </FeatureFlagsProvider>
                 </FirstRunGate>
+              </RequireAuth>
+            }
+          />
+          {/* The installed app's start_url: picks /m or /chat, then gets out of the way. */}
+          <Route
+            path={APP_START_PATH}
+            element={
+              <RequireAuth>
+                <FeatureFlagsProvider>
+                  <AppStart />
+                </FeatureFlagsProvider>
               </RequireAuth>
             }
           />

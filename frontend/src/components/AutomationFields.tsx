@@ -1,9 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { automationsApi, spacesApi, type SchedulePreview, type SpaceView } from '../services/api';
 import { FLAGS, useFlag } from '../flags';
-import {
-  PRESETS, WEEKDAYS, browserTimezone, cronToPreset, occurrenceShort, presetToCron, type PresetInput,
-} from '../utils/automationSchedule';
+import { PRESETS, WEEKDAYS, occurrenceShort, type PresetInput } from '../utils/automationSchedule';
+import { draftCron, type AutomationDraft } from '../utils/automationDraft';
 
 /**
  * The fields that make a project an automation: the
@@ -11,52 +10,10 @@ import {
  * words from the server before Save), the prompt, and under Advanced the
  * tier, PR-on-change, wake-the-box with its estimate, time limit, runs to
  * keep and enabled. Shared by the New automation dialog (NewProjectForm in
- * automation mode) and the automation page's edit form, so the two cannot
- * drift.
+ * automation mode), the automation page's edit form and New session's
+ * schedule dialog (pages/chat/SchedulePicker.tsx), so they cannot drift. The
+ * draft itself, and its bodies, are utils/automationDraft.ts.
  */
-
-export interface AutomationDraft {
-  schedule: PresetInput;
-  timezone: string;
-  prompt: string;
-  tier: 'full' | 'read';
-  prOnChange: boolean;
-  wakeBox: boolean;
-  maxRunMinutes: number;
-  keepRuns: number;
-  enabled: boolean;
-  /** A space the notes file is mirrored to between runs; null = the box only. */
-  spaceName: string | null;
-  /** Post each finished run's report to the project's Slack channel. */
-  notifySlack: boolean;
-}
-
-export function emptyDraft(): AutomationDraft {
-  return {
-    schedule: { preset: 'weekdays', time: '09:00', weekday: 1, cron: '' },
-    timezone: browserTimezone(), prompt: '', tier: 'full', prOnChange: true, wakeBox: false, maxRunMinutes: 60, keepRuns: 20, enabled: true, spaceName: null, notifySlack: false,
-  };
-}
-
-export function draftFrom(a: { schedule: string; timezone: string; prompt: string; tier: string; prOnChange: boolean; wakeBox: boolean; maxRunMinutes: number; keepRuns: number; enabled: boolean; spaceName?: string | null; notifySlack?: boolean }): AutomationDraft {
-  return {
-    schedule: cronToPreset(a.schedule), timezone: a.timezone, prompt: a.prompt, tier: a.tier === 'read' ? 'read' : 'full',
-    prOnChange: a.prOnChange, wakeBox: a.wakeBox, maxRunMinutes: a.maxRunMinutes, keepRuns: a.keepRuns, enabled: a.enabled, spaceName: a.spaceName ?? null, notifySlack: a.notifySlack ?? false,
-  };
-}
-
-/** The cron a draft means, or null while its schedule fields are incomplete. */
-export function draftCron(d: AutomationDraft): string | null {
-  return presetToCron(d.schedule);
-}
-
-/** What the create and PATCH bodies carry for a draft. */
-export function draftBody(d: AutomationDraft) {
-  return {
-    schedule: draftCron(d) ?? '', timezone: d.timezone, prompt: d.prompt, tier: d.tier, prOnChange: d.prOnChange,
-    wakeBox: d.wakeBox, maxRunMinutes: d.maxRunMinutes, keepRuns: d.keepRuns, enabled: d.enabled, spaceName: d.spaceName, notifySlack: d.notifySlack,
-  };
-}
 
 const TIMEZONES: string[] = (() => {
   try {
@@ -70,7 +27,45 @@ export const TIER_HELP: Record<'full' | 'read', string> = {
   read: 'Read-only: Claude can read the repository and report, nothing else.',
 };
 
-export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix = 'af', onValidity, onFullTierTick }: {
+/** The server's reading of a draft's schedule: its next occurrences, or why it cannot run. */
+export interface ScheduleCheck {
+  preview: SchedulePreview | null;
+  error: string | null;
+  /** A preview came back and it is not too frequent: the schedule can be saved. */
+  valid: boolean;
+}
+
+/**
+ * Asks /preview about a draft's schedule, 300 ms after its last change. A
+ * parent whose fields come and go (New session's schedule dialog) holds the
+ * check itself, so it keeps up while the fields are closed; off, it asks
+ * nothing and keeps its last answer.
+ */
+export function useScheduleCheck(draft: AutomationDraft, on = true): ScheduleCheck {
+  const cron = draftCron(draft);
+  const [preview, setPreview] = useState<SchedulePreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewKey = `${cron}|${draft.timezone}|${draft.wakeBox}|${draft.maxRunMinutes}`;
+  useEffect(() => {
+    if (!on) return;
+    if (!cron || !draft.timezone) { setPreview(null); setPreviewError(cron ? null : 'Fill in the time'); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      automationsApi.preview({ schedule: cron, timezone: draft.timezone, wakeBox: draft.wakeBox, maxRunMinutes: draft.maxRunMinutes })
+        .then(p => { if (!cancelled) { setPreview(p); setPreviewError(null); } })
+        .catch(err => {
+          if (cancelled) return;
+          setPreview(null);
+          setPreviewError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Could not read that schedule');
+        });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewKey, on]);
+  return { preview, error: previewError, valid: !!preview && !previewError && preview.tooFrequent === null };
+}
+
+export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix = 'af', onValidity, onFullTierTick, check, showPrompt = true, tierElsewhere = false }: {
   draft: AutomationDraft;
   onChange: (next: AutomationDraft) => void;
   /** The create form has no "enabled" switch beside the create button; the page does. */
@@ -85,6 +80,15 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
    * again when the tier changes.
    */
   onFullTierTick?: (ticked: boolean) => void;
+  /** The parent's useScheduleCheck for this draft, when it holds one; else the fields ask themselves. */
+  check?: ScheduleCheck;
+  /** New session types the prompt as its message. */
+  showPrompt?: boolean;
+  /**
+   * The tier is picked outside these fields (New session's permission pill),
+   * and the draft carries that pick: its warning stays in view, its select goes.
+   */
+  tierElsewhere?: boolean;
 }) {
   const [fullTick, setFullTick] = useState(false);
   useEffect(() => { setFullTick(false); }, [draft.tier]);
@@ -92,25 +96,8 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
   const set = <K extends keyof AutomationDraft>(k: K, v: AutomationDraft[K]) => onChange({ ...draft, [k]: v });
   const setSchedule = (patch: Partial<PresetInput>) => onChange({ ...draft, schedule: { ...draft.schedule, ...patch } });
   const cron = draftCron(draft);
-  const [preview, setPreview] = useState<SchedulePreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const previewKey = `${cron}|${draft.timezone}|${draft.wakeBox}|${draft.maxRunMinutes}`;
-  useEffect(() => {
-    if (!cron || !draft.timezone) { setPreview(null); setPreviewError(cron ? null : 'Fill in the time'); return; }
-    let cancelled = false;
-    const t = setTimeout(() => {
-      automationsApi.preview({ schedule: cron, timezone: draft.timezone, wakeBox: draft.wakeBox, maxRunMinutes: draft.maxRunMinutes })
-        .then(p => { if (!cancelled) { setPreview(p); setPreviewError(null); } })
-        .catch(err => {
-          if (cancelled) return;
-          setPreview(null);
-          setPreviewError((err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? 'Could not read that schedule');
-        });
-    }, 300);
-    return () => { cancelled = true; clearTimeout(t); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewKey]);
-  const scheduleValid = !!preview && !previewError && preview.tooFrequent === null;
+  const ownCheck = useScheduleCheck(draft, !check);
+  const { preview, error: previewError, valid: scheduleValid } = check ?? ownCheck;
   useEffect(() => { onValidity?.(scheduleValid); }, [scheduleValid, onValidity]);
   const tzOptions = useMemo(() => (TIMEZONES.length && !TIMEZONES.includes(draft.timezone) ? [draft.timezone, ...TIMEZONES] : TIMEZONES), [draft.timezone]);
   // The spaces the owner can write to, for mirroring the notes file (only with spaces on).
@@ -175,21 +162,25 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
             ) : cron ? 'Checking the schedule…' : null}
         </div>
       </fieldset>
-      <div className="npf-field af-prompt">
-        <label htmlFor={id('prompt')}>Prompt</label>
-        <textarea
-          id={id('prompt')} value={draft.prompt} onChange={e => set('prompt', e.target.value)} rows={6}
-          placeholder="What each run should do. It starts on a fresh branch from the default branch, with notes from earlier runs."
-        />
-      </div>
+      {showPrompt && (
+        <div className="npf-field af-prompt">
+          <label htmlFor={id('prompt')}>Prompt</label>
+          <textarea
+            id={id('prompt')} value={draft.prompt} onChange={e => set('prompt', e.target.value)} rows={6}
+            placeholder="What each run should do. It starts on a fresh branch from the default branch, with notes from earlier runs."
+          />
+        </div>
+      )}
       {/* The tier is the one choice with a security consequence: it and its warning stay in view, never behind Run settings. */}
-      <div className="npf-field">
-        <label htmlFor={id('tier')}>Permissions</label>
-        <select id={id('tier')} value={draft.tier} onChange={e => set('tier', e.target.value as 'full' | 'read')}>
-          <option value="full">Full: Claude in auto mode</option>
-          <option value="read">Read-only</option>
-        </select>
-      </div>
+      {!tierElsewhere && (
+        <div className="npf-field">
+          <label htmlFor={id('tier')}>Permissions</label>
+          <select id={id('tier')} value={draft.tier} onChange={e => set('tier', e.target.value as 'full' | 'read')}>
+            <option value="full">Full: Claude in auto mode</option>
+            <option value="read">Read-only</option>
+          </select>
+        </div>
+      )}
       <div className={`npf-note ${draft.tier === 'full' ? 'af-warn' : 'usage-dim'}`}>{TIER_HELP[draft.tier]}</div>
       {draft.tier === 'full' && onFullTierTick && (
         <label className="npf-check af-warn"><input type="checkbox" checked={fullTick} onChange={e => setFullTick(e.target.checked)} /> <strong>I trust this repository.</strong> Runs get the full tier with nobody watching; this is the project's trust tick.</label>

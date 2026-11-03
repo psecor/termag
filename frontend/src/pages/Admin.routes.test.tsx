@@ -18,6 +18,13 @@ vi.mock('./admin/AdminSettings', () => ({ AdminSettings: tab('settings') }));
 vi.mock('./admin/AdminSoftware', () => ({ AdminSoftware: tab('software') }));
 vi.mock('./admin/AdminPrs', () => ({ AdminPrs: tab('prs') }));
 vi.mock('./admin/AdminSpend', () => ({ AdminSpend: tab('spend') }));
+vi.mock('./admin/AdminBugs', async () => {
+  const { useParams } = await import('react-router-dom');
+  return {
+    AdminBugs: () => { const { id } = useParams(); return <div data-testid="tab">{id ? `bug ${id}` : 'bugs'}</div>; },
+    BugsBadge: () => <span className="admin-badge">3</span>,
+  };
+});
 vi.mock('./dashboard/RangePicker', () => ({ RangePicker: () => null }));
 const auth = vi.hoisted(() => ({ user: { role: 'admin' } as { role: string } | null }));
 vi.mock('../contexts/AuthContext', () => ({ useAuth: () => auth }));
@@ -95,6 +102,18 @@ describe('Admin routes (v7 path resolution)', () => {
     expect(active).toEqual(['Spend']);
     click('Overview');
     expect([...el.querySelectorAll('nav a.active')].map(a => a.textContent)).toEqual(['Overview']);
+  });
+
+  it('opens the bug list from its URL, with the new-report badge on the tab', () => {
+    mount('/admin/bugs?status=new');
+    expect(shown()).toBe('bugs');
+    expect([...el.querySelectorAll('nav a.active')].map(a => a.textContent)).toEqual(['Bugs3']);
+  });
+
+  it('opens one bug report from its URL', () => {
+    mount('/admin/bugs/cmbug123');
+    expect(shown()).toBe('bug cmbug123');
+    expect(where()).toBe('/admin/bugs/cmbug123');
   });
 
   it('sends a non-admin to the dashboard', () => {

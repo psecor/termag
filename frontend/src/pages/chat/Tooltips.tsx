@@ -8,6 +8,7 @@
 // `data-tip` is shown and every `title` stays the browser's, as on main.
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { scrollMoves } from '../../utils/scrollMoves';
 
 const DELAY_MS = 450;
 
@@ -58,11 +59,13 @@ export function Tooltips({ titles }: { titles: boolean }) {
       if (el && focusVisible(el)) show(el, true);
     };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') hide(); };
+    // Only a scroll that moves the element: the chat streaming beside it leaves its tip up.
+    const onScroll = (e: Event) => { if (scrollMoves(e, current)) hide(); };
     document.addEventListener('pointerover', onOver);
     document.addEventListener('focusin', onFocus);
     document.addEventListener('focusout', hide);
     document.addEventListener('pointerdown', hide);
-    document.addEventListener('scroll', hide, true);
+    document.addEventListener('scroll', onScroll, true);
     document.addEventListener('dragstart', hide);
     window.addEventListener('keydown', onKey);
     return () => {
@@ -71,7 +74,7 @@ export function Tooltips({ titles }: { titles: boolean }) {
       document.removeEventListener('focusin', onFocus);
       document.removeEventListener('focusout', hide);
       document.removeEventListener('pointerdown', hide);
-      document.removeEventListener('scroll', hide, true);
+      document.removeEventListener('scroll', onScroll, true);
       document.removeEventListener('dragstart', hide);
       window.removeEventListener('keydown', onKey);
     };

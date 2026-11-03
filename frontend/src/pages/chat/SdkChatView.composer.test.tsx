@@ -8,12 +8,13 @@ import type { Project } from '../../types';
 const mocks = vi.hoisted(() => ({
   history: vi.fn(),
   send: vi.fn(),
+  interrupt: vi.fn(),
   noBoxes: [] as unknown[],
 }));
 
 vi.mock('../../services/api', async importOriginal => ({
   ...(await importOriginal<typeof import('../../services/api')>()),
-  chatApi: { history: mocks.history, send: mocks.send, reclaim: vi.fn(), interrupt: vi.fn(), openInTerminal: vi.fn(), trust: vi.fn() },
+  chatApi: { history: mocks.history, send: mocks.send, reclaim: vi.fn(), interrupt: mocks.interrupt, openInTerminal: vi.fn(), trust: vi.fn() },
   activityApi: { heartbeat: () => Promise.resolve() },
   visitsApi: { record: () => Promise.resolve() },
 }));
@@ -35,10 +36,16 @@ vi.mock('../../chat/chatEvents', () => ({
 }));
 vi.mock('../../chat/ClaudeLoginCard', () => ({ ClaudeLoginCard: () => null }));
 
+// React Aria's popover reads a CSP nonce through CSS.escape, which jsdom lacks.
+const css = globalThis as { CSS?: { escape?: (s: string) => string } };
+css.CSS ??= {};
+css.CSS.escape ??= (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, c => `\\${c}`);
+
 import { SdkChatView } from './SdkChatView';
+import { ChatChromeProvider } from './chatChrome';
 
 const project = {
-  id: 'p1', name: 'web', instanceId: null, repoUrl: null, setupStatus: 'ready', setupError: null, role: 'owner',
+  id: 'p1', name: 'web', instanceId: null, repoUrl: null, setupStatus: 'ready', setupError: null, role: 'owner', workflows: [], workstreams: [],
 } as unknown as Project;
 
 function historyOn(model: string) {
@@ -55,12 +62,15 @@ async function flush() {
   await act(async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); });
 }
 
-async function render() {
+async function render(refresh = false) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
+  const view = <MemoryRouter><SdkChatView project={project} workstream="main" /></MemoryRouter>;
   await act(async () => {
-    root.render(<MemoryRouter><SdkChatView project={project} workstream="main" /></MemoryRouter>);
+    root.render(refresh
+      ? <ChatChromeProvider value={{ mode: 'docked', historyOpen: false, openHistory: () => {}, closeHistory: () => {}, refresh: true }}>{view}</ChatChromeProvider>
+      : view);
   });
   await flush();
 }
@@ -79,7 +89,8 @@ async function type(text: string) {
 }
 
 const send = () => document.querySelector('form.chat-composer button[aria-label="Send"]') as HTMLButtonElement | null;
-const actions = () => [...document.querySelectorAll('form.chat-composer .chat-compose-actions > button')].map(b => b.getAttribute('aria-label'));
+// Stop and Send sit in their own slot at the end (.chat-compose-end), so the ring before them never moves.
+const actions = () => [...document.querySelectorAll('form.chat-composer .chat-compose-actions > button, form.chat-composer .chat-compose-actions > .chat-compose-end > button')].map(b => b.getAttribute('aria-label'));
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -88,6 +99,8 @@ beforeEach(() => {
   mocks.history.mockReset();
   mocks.send.mockReset();
   mocks.send.mockResolvedValue({ queued: false, turnId: 't1' });
+  mocks.interrupt.mockReset();
+  mocks.interrupt.mockResolvedValue({});
 });
 
 afterEach(() => { if (container?.isConnected) unmount(); });
@@ -120,5 +133,89 @@ describe('SdkChatView composer', () => {
     expect(actions()).toEqual(['Stop']);
     await type('and then this');
     expect(actions()).toEqual(['Stop', 'Send']);
+  });
+
+  it('keeps Stop and Send in one slot as wide as a button, after the ring', async () => {
+    mocks.history.mockResolvedValue({ ...historyOn('sonnet') });
+    await render();
+    const end = document.querySelector('form.chat-composer .chat-compose-actions > .chat-compose-end');
+    expect(end).not.toBeNull();
+    expect(end?.children.length).toBe(0);
+    expect(end?.previousElementSibling?.classList.contains('chat-ring') || [...(end?.parentElement?.children ?? [])].some(c => c.classList.contains('chat-ring'))).toBe(true);
+  });
+});
+
+// A live turn (the box takes a turn-only stop) with these background tasks running.
+function runningWith(tasks: Array<{ description: string; subagent?: boolean }>) {
+  return {
+    ...historyOn('sonnet'), running: true, liveInput: true, stopsTurn: true,
+    turn: {
+      turnId: 't1',
+      events: [
+        { seq: 1, event: { type: 'turn-start', text: 'go', live: true } },
+        { seq: 2, event: { type: 'system', subtype: 'background_tasks_changed', tasks: tasks.map((t, i) => ({ task_id: `b${i}`, task_type: t.subagent ? 'local_agent' : 'local_bash', description: t.description })) } },
+      ],
+    },
+  };
+}
+
+describe('SdkChatView composer, with the chrome refresh', () => {
+  const stopButton = () => document.querySelector('form.chat-composer button[aria-label="Stop"]') as HTMLButtonElement | null;
+  // A bare click is React Aria's virtual press (jsdom has no PointerEvent).
+  const press = async (el: Element) => {
+    await act(async () => { (el as HTMLElement).click(); });
+    await flush();
+  };
+
+  it('holds no room for Stop or Send while neither shows', async () => {
+    mocks.history.mockResolvedValue(historyOn('sonnet'));
+    await render(true);
+    expect(document.querySelector('form.chat-composer .chat-compose-end')?.children.length).toBe(0);
+  });
+
+  it('keeps one round Stop, with no split, that stops at once when nothing runs in the background', async () => {
+    mocks.history.mockResolvedValue(runningWith([]));
+    await render(true);
+    expect(document.querySelector('.chat-stop-split, .chat-stop-caret, .chat-stop-wide')).toBeNull();
+    await press(stopButton()!);
+    expect(mocks.interrupt).toHaveBeenCalledWith('p1', 'main', 'turn');
+    expect(document.querySelector('[role="menu"], [role="alertdialog"], [role="dialog"]')).toBeNull();
+  });
+
+  it('asks which stop when background commands run, and does the one picked', async () => {
+    mocks.history.mockResolvedValue(runningWith([{ description: 'Run the test suite' }, { description: 'Review the diff', subagent: true }]));
+    await render(true);
+    await press(stopButton()!);
+    expect(mocks.interrupt).not.toHaveBeenCalled();
+    const items = [...document.querySelectorAll('[role="menuitem"]')];
+    expect(items.map(i => i.querySelector('[slot="label"]')?.textContent)).toEqual(['Stop Claude', 'Stop Claude and background tasks']);
+    expect(items[0].querySelector('[slot="description"]')?.textContent).toBe('Its background task keeps running; the background subagent ends');
+    await press(items[1]);
+    expect(mocks.interrupt).toHaveBeenCalledWith('p1', 'main', 'all');
+  });
+
+  it('opens the same menu on Escape, rather than stopping', async () => {
+    mocks.history.mockResolvedValue(runningWith([{ description: 'Run the test suite' }]));
+    await render(true);
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); });
+    await flush();
+    expect(document.querySelectorAll('[role="menuitem"]')).toHaveLength(2);
+    expect(mocks.interrupt).not.toHaveBeenCalled();
+  });
+
+  it('puts its notes above the composer, and keeps no line under it', async () => {
+    mocks.history.mockResolvedValue(historyOn('sonnet'));
+    await render(true);
+    const above = document.querySelector('.chat-bottom > .chat-composer-notes[data-above]');
+    expect(above).not.toBeNull();
+    expect(above!.compareDocumentPosition(document.querySelector('form.chat-composer')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(document.querySelectorAll('.chat-composer-notes')).toHaveLength(1);
+  });
+
+  it('is unchanged without it: the notes under the composer', async () => {
+    mocks.history.mockResolvedValue(historyOn('sonnet'));
+    await render();
+    expect(document.querySelector('.chat-composer-notes[data-above]')).toBeNull();
+    expect(document.querySelector('form.chat-composer + .chat-composer-notes')).not.toBeNull();
   });
 });

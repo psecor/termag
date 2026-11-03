@@ -1,0 +1,129 @@
+/* The What's new dialog (WhatsNewDialog.tsx) and the dot on its buttons.
+   Portaled to the body, so keyed on its own classes; termag's colours, UI font. */
+.lp-theme .whats-new {
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(680px, calc(100dvh - 48px));
+  display: flex;
+  font-family: var(--font-ui);
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0;
+}
+.lp-theme .whats-new-dialog { display: flex; flex-direction: column; flex: 1; min-height: 0; width: 100%; padding: 0; outline: none; }
+.lp-theme .whats-new-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 4px 20px; }
+.lp-theme .whats-new-head h2 { margin: 0; font-size: 17px; font-weight: 600; }
+
+.lp-theme .whats-new-tabs { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.lp-theme .whats-new-tablist { padding: 0 20px; }
+.lp-theme .whats-new-tab { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-ui); }
+.lp-theme .whats-new-tab [data-icon] { fill: currentColor; }
+.lp-theme .whats-new-count {
+  min-width: 18px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  color: var(--text-on-fill);
+  background: rgb(var(--unseen-rgb));
+}
+
+.lp-theme .whats-new-panel { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 20px 20px; outline: none; }
+.lp-theme .whats-new-week { margin-top: 14px; }
+.lp-theme .whats-new-week-label { margin: 0 0 2px; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.lp-theme .whats-new-list { margin: 0; padding: 0; list-style: none; }
+.lp-theme .whats-new-entry {
+  display: grid;
+  grid-template-columns: 8px 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+.lp-theme .whats-new-list > .whats-new-entry:first-child { border-top: none; }
+.lp-theme .whats-new-dot { width: 7px; height: 7px; margin-top: 7px; border-radius: 50%; }
+.lp-theme .whats-new-entry[data-fresh] .whats-new-dot { background: rgb(var(--unseen-rgb)); }
+
+/* The category: text in the body colour on a tint of the category's, so it
+   reads in every theme. */
+.lp-theme .whats-new-category {
+  --cat: var(--accent);
+  margin-top: 1px;
+  padding: 2px 0;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-align: center;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--cat) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cat) 45%, transparent);
+}
+.lp-theme .whats-new-category[data-category='changed'] { --cat: var(--warning); }
+.lp-theme .whats-new-category[data-category='fixed'] { --cat: var(--success); }
+.lp-theme .whats-new-category[data-category='removed'] { --cat: var(--danger); }
+
+.lp-theme .whats-new-text { min-width: 0; }
+.lp-theme .whats-new-title { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 0; font-size: 14px; font-weight: 600; line-height: 1.35; }
+.lp-theme .whats-new-body { margin-top: 2px; font-size: 13px; line-height: 1.45; color: var(--text-secondary); }
+.lp-theme .whats-new-body .md p { margin: 0; }
+.lp-theme .whats-new-body .md p + p { margin-top: 6px; }
+.lp-theme .whats-new-body a { color: var(--accent); }
+.lp-theme .whats-new-body code { font-family: var(--font-mono); font-size: 0.92em; }
+
+.lp-theme .whats-new-empty { padding: 32px 0 16px; text-align: center; }
+.lp-theme .whats-new-empty p { margin: 0; }
+.lp-theme .whats-new-empty-sub { margin-top: 4px !important; font-size: 13px; color: var(--text-secondary); }
+
+.whats-new-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The unseen dot on a What's new button. */
+.whats-new-trigger { position: relative; }
+.whats-new-trigger-dot {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgb(var(--unseen-rgb));
+  box-shadow: 0 0 0 2px var(--bg-surface);
+  pointer-events: none;
+}
+.whats-new-link-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  vertical-align: 1px;
+  background: rgb(var(--unseen-rgb));
+}
+
+/* The links (WhatsNewLinks.tsx). termag's foot without the refresh: LaunchPad's
+   button, drawn as the Lab and Settings links beside it (chat.css). */
+.chat-sidebar-foot .whats-new-foot-link {
+  gap: 0;
+  height: auto;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+.chat-sidebar-foot .whats-new-foot-link[data-hovered] { background: none; color: var(--text-primary); }
+/* lab's head, beside How it works ↗ (.sidebar-docs-link in App.css). */
+.whats-new-lab-link { padding: 0; border: none; background: none; font: inherit; font-size: 12px; cursor: pointer; }

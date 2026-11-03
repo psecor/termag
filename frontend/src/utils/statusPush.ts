@@ -23,6 +23,8 @@ export function statusFromPush(msg: Record<string, any>): AgentStatus {
     milestone: msg.milestone ?? null,
     // The Devin review pane's state (utils/reviewRing).
     review: msg.review ?? null,
+    // Every review pane of the workstream; `review` is slot 1's.
+    reviews: msg.reviews ?? null,
     // A handoff of this pane: HandoffStrip and the phone banner.
     handoff: msg.handoff ?? null,
   };

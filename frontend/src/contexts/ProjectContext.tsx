@@ -10,7 +10,9 @@ import { statusFromPush } from '../utils/statusPush';
 import { cloudSessionFeed } from '../services/cloudSessionFeed';
 import { boxFeed } from '../services/boxFeed';
 import { chatEvents, type ChatFrame } from '../chat/chatEvents';
+import { spaceFileEvents, type SpaceFileFrame } from '../chat/spaceFileLive';
 import { workspaceChangeFromPush } from '../utils/workspacePush';
+import { PRS_CHANGED_EVENT } from '../utils/prPipeline';
 import { FLAGS, useFlag } from '../flags';
 import { cloneInFlight } from '../utils/cloneTile';
 import { applyListRead, beginListRead, releaseListRead, settleCloneAction, type CloneAction, type CloneListState } from '../utils/cloneList';
@@ -295,6 +297,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         // Chat frames may have been missed while the socket was down; the open
         // chat view refetches its history so a finished turn stops showing busy.
         chatEvents.notifyReconnect();
+        spaceFileEvents.notifyReconnect();
       };
 
       ws.onmessage = (event) => {
@@ -323,10 +326,14 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           if (msg.type === 'claude-session') { void cloudSessionFeed.reload(); return; }
           // A simple-UI chat event (services/chatRunner.ts): the open chat view folds it in.
           if (msg.type === 'chat') { chatEvents.publish(msg as unknown as ChatFrame); return; }
+          // A file in a space this user can read changed (pages/chat/SpaceFileLive.tsx).
+          if (msg.type === 'space-file') { spaceFileEvents.publish(msg as unknown as SpaceFileFrame); return; }
           // A project or box changed outside this tab (the CLI, a spawn, a sweep, another tab).
           const change = workspaceChangeFromPush(msg);
           if (change === 'projects') { reloadProjectsRef.current().catch(() => {}); return; }
           if (change === 'boxes') { void boxFeed.reload(); return; }
+          // A session opened or changed a PR (backend services/prLiveUpdates.ts): every PR view re-reads.
+          if (change === 'prs') { window.dispatchEvent(new Event(PRS_CHANGED_EVENT)); return; }
           // A share revoked or left took this session out of the viewer's
           // scope (backend services/statusAudience.ts, shareChangeFrames).
           if (msg.type === 'status-gone') {

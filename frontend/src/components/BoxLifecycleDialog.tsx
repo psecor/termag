@@ -1,35 +1,28 @@
 import { useState } from 'react';
 import type { Instance } from '../types';
 import { instancesApi } from '../services/api';
-import {
-  CANNOT_HIBERNATE_TEXT, idleChoiceLabel, idleChoicesFor, terminateChoiceLabel, terminateChoicesFor,
-} from '../utils/boxLifecycle';
+import { idleChoiceLabel, idleChoicesFor, terminateChoiceLabel, terminateChoicesFor } from '../utils/boxLifecycle';
 
 export function BoxLifecycleDialog({ box, onClose, onSaved }: {
   box: Instance;
   onClose: () => void;
   onSaved: () => void;
 }) {
+  // Auto-park only ever stops the box, so there is no Include RAM, and both
+  // settings apply to any box.
   const current = box.lifecycle?.idleHibernateHours ?? null;
   const currentDays = box.lifecycle?.hibernatedTerminateDays ?? null;
-  const [hours, setHours] = useState<number | null>(current);
+  const [stopHours, setStopHours] = useState<number | null>(current);
   const [days, setDays] = useState<number | null>(currentDays);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const unchanged = hours === current && days === currentDays;
-  const showCannotHibernate = !!box.lifecycle && !box.lifecycle.canAutoHibernate && (hours !== null || days !== null);
-  // The server picks the sentence from box-idle-stop-enabled. The dialog can
-  // repeat it while idle hours stay unset; choosing hours keeps the flag-off sentence,
-  // which is still true for a box with its own idle setting.
-  const cannotText = hours === null && (box.lifecycle?.idleHibernateHours ?? null) === null && box.lifecycle?.warning
-    ? box.lifecycle.warning
-    : CANNOT_HIBERNATE_TEXT;
+  const unchanged = stopHours === current && days === currentDays;
 
   async function save() {
     setSaving(true);
     setError('');
     try {
-      await instancesApi.setLifecycle(box.id, { idleHibernateHours: hours, hibernatedTerminateDays: days });
+      await instancesApi.setLifecycle(box.id, { idleHibernateHours: stopHours, hibernatedTerminateDays: days });
       onSaved();
       onClose();
     } catch (err: unknown) {
@@ -52,26 +45,29 @@ export function BoxLifecycleDialog({ box, onClose, onSaved }: {
       >
         <div className="np-dialog-title" id="lc-title">Auto-park “{box.name}”</div>
         <div className="npf">
+          {/* box-idle-stop-enabled is server-only, so this cannot say the box stops after two hours. */}
+          <div className="npf-note">
+            A stop does not keep memory, and starting the box again takes about 10–20 seconds.
+          </div>
           <div className="npf-field">
-            <label htmlFor="lc-idle">Hibernate when idle</label>
+            <label htmlFor="lc-stop">Stop when idle</label>
             <select
-              id="lc-idle"
-              value={hours === null ? '' : String(hours)}
-              onChange={e => setHours(e.target.value === '' ? null : Number(e.target.value))}
+              id="lc-stop"
+              value={stopHours === null ? '' : String(stopHours)}
+              onChange={e => setStopHours(e.target.value === '' ? null : Number(e.target.value))}
               disabled={saving}
-              autoFocus
             >
-              {idleChoicesFor(current).map(h => (
-                <option key={h ?? 'off'} value={h === null ? '' : String(h)}>{idleChoiceLabel(h)}</option>
+              {idleChoicesFor(stopHours).map(h => (
+                <option key={h ?? 'default'} value={h === null ? '' : String(h)}>{h === null ? 'Default' : idleChoiceLabel(h)}</option>
               ))}
             </select>
             <div className="npf-note usage-dim">
               Idle means nobody typing and no agent working; an agent waiting for your answer counts as idle.
-              Start the box again to resume where you left off.
+              Default leaves it to termag&apos;s own idle stop, when that is on for you.
             </div>
           </div>
           <div className="npf-field">
-            <label htmlFor="lc-terminate">Terminate once hibernated</label>
+            <label htmlFor="lc-terminate">Terminate once parked</label>
             <select
               id="lc-terminate"
               value={days === null ? '' : String(days)}
@@ -83,11 +79,10 @@ export function BoxLifecycleDialog({ box, onClose, onSaved }: {
               ))}
             </select>
             <div className="npf-note usage-dim">
-              Counted from when it went to sleep, by hand or on its own. Work that isn't pushed anywhere keeps it
-              much longer (90 days by default). Terminating deletes its disk.
+              Counted from when auto-park stopped it. Work that isn&apos;t pushed anywhere keeps it much longer
+              (90 days by default). Terminating deletes its disk.
             </div>
           </div>
-          {showCannotHibernate && <div className="box-lifecycle-warning" role="status">{cannotText}</div>}
           {error && <div className="error-text">{error}</div>}
           <div className="npf-actions">
             <button type="button" className="btn-ghost" onClick={onClose} disabled={saving}>Cancel</button>

@@ -1,14 +1,19 @@
-// New chat in the simple UI: one composer. The repository sits above it, the
-// Claude model sits in its bar, and sending the message starts the chat.
-// Every chat gets its own new box (the server claims a warm one when the pool
-// has one, else launches one) and Claude; the first message waits in the
-// chat until Claude can take it (chat/newChat.ts). Trust, a space, a schedule
-// and the chat's names stay with the rest of the simple UI.
+// New chat in the simple UI: one composer. The question above it names the
+// repository, the Claude model and the permissions sit in its bar, and the
+// drawer under it says where the session runs: a new box (the server claims
+// a warm one when the pool has one, else launches one) or, with
+// chat-existing-box-enabled, one of yours, its space and names, and with
+// automations-enabled whether it runs on a schedule instead. Sending the
+// message starts the chat; the first message waits in the chat until Claude
+// can take it (chat/newChat.ts).
 import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useProjects } from '../../contexts/ProjectContext';
-import { automationsApi, credentialsApi, githubReposApi, instancesApi, projectsApi } from '../../services/api';
-import { AutomationFields, draftBody, draftCron, emptyDraft, type AutomationDraft } from '../../components/AutomationFields';
+import { automationsApi, credentialsApi, instancesApi, projectsApi, workstreamsApi } from '../../services/api';
+import { useScheduleCheck } from '../../components/AutomationFields';
+import { automationHref } from '../../chat/automationsView';
+import { useAutomations, useAutomationsEnabled } from '../../chat/useAutomations';
+import { draftBody, draftCron, emptyDraft, type AutomationDraft } from '../../utils/automationDraft';
 import { FLAGS, useFlag } from '../../flags';
 import { useDictation } from '../../chat/useDictation';
 import { DictationButton, DictationNote } from '../../chat/DictationButton';
@@ -18,24 +23,42 @@ import { noteAddBoxClick, noteBoxClaimed, noteProjectCreated } from '../../servi
 import { replaySessionId } from '../../observability';
 import { BOX_NAME_ERROR, isValidBoxName } from '../../utils/boxNames';
 import { funnyProjectName, isBoxFailedRefusal } from '../../utils/projectStart';
-import {
-  catalogFromWire, degradedCatalog, suggestedName, type CatalogGroup, type RepoCatalog, type RepoPick,
-} from '../../utils/repoPick';
+import { repoKey, suggestedName, type RepoPick } from '../../utils/repoPick';
 import { chatHref, repoNeedsTrust, repoStartsTrusted } from '../../chat/simpleChat';
-import { newChatNames, orchestratorOption, readLastStart, startBlocker, writeLastStart, writeQueued } from '../../chat/newChat';
 import {
-  newChatCreateFields, REPO_EMPTY, repoListView, repoTriggerLabel,
-  type ChatModelId,
-} from '../../chat/composer';
+  newChatNames, orchestratorOption, queueKey, readLastPick, readLastStart, readPermissionPick, rememberStartPick, sessionWords, startBlocker, worktreeName,
+  worktreeTargets, writeLastPick, writeLastStart, writePermissionPick, writeQueued,
+} from '../../chat/newChat';
+import { chatAgentName, newChatCreateFields, repoTriggerLabel, type ChatEffortId, type ChatModelId } from '../../chat/composer';
 import { CHAT_PROVIDER_ID, PROVIDERS } from '../../providers/registry';
 import { isSendKey, MAX_KEYS } from '../../chat/compose';
-import type { Instance } from '../../types';
+import type { Instance, Project } from '../../types';
 import { SpacePicker } from './SpacePicker';
+import { RepoPicker } from './RepoPicker';
+import { SchedulePicker } from './SchedulePicker';
 import { ModelPicker } from '../../chat/ModelPicker';
+import { writeEffortPick } from '../../chat/useChatEffort';
+import { FollowsPermissions, PermissionPicker } from '../../chat/PermissionPicker';
+import { writeModelPick } from '../../chat/useChatModel';
+import { CheckoutPicker, OWN_CLONE, type WorktreeBase } from './CheckoutPicker';
+import { OrchestratorToggle } from '../../chat/OrchestratorToggle';
+import { launchableBoxes, LaunchDrawer, NEW_BOX } from './LaunchDrawer';
+import { BoxSizeSelect } from '../../components/BoxSizePicker';
+import { BoxDiskInput } from '../../components/BoxDiskField';
+import { useBoxDiskPick, useBoxSizePick, useBoxSizes } from '../../hooks/useBoxSizes';
+import { useWarmBoxReady } from '../../hooks/useWarmBoxReady';
+import { sizeToSend } from '../../utils/boxSize';
+import { diskInputError, diskToSend } from '../../utils/boxDisk';
+import { canStartBox } from '../../utils/boxPower';
 import { SendIcon } from '../../chat/ComposerIcons';
 import { useChatModelOptions } from '../../chat/useChatModelOptions';
 import { ChatHistoryButton } from './chatChrome';
 import { useSpaceStep } from '../../chat/useSpaceStep';
+import { useSimpleDataIfAny } from './simpleData';
+import { githubRepoUrl } from '../../utils/repoPick';
+import { selectionRepos, toggleRepo, type ListedPick } from '../../utils/multiRepo';
+import { useSessionRefDrop } from '../../chat/useSessionRefDrop';
+import { recordTypedChatCommand } from '../../usageEvents';
 
 /** The automation API's prompt cap (backend routes/automations.ts MAX_PROMPT). */
 const MAX_AUTOMATION_PROMPT = 20_000;
@@ -60,19 +83,18 @@ function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? fallback;
 }
 
-function Caret() {
-  return <span className="chat-compose-caret" aria-hidden="true" />;
-}
-
 const browserStore = () => (typeof localStorage !== 'undefined' ? localStorage : null);
 
 export function NewChat() {
   const navigate = useNavigate();
+  const simple = useSimpleDataIfAny();
   const { projects, reloadProjects } = useProjects();
   const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const [params] = useSearchParams();
-  // The repository, space and model the last chat started with open again here.
+  // The repository and space the last chat started with open again here, and
+  // the model and effort last picked in any composer (chat/newChat.ts readLastPick).
   const [last] = useState(() => readLastStart(browserStore()));
+  const [lastPick] = useState(() => readLastPick(browserStore()));
   const spaceStep = useSpaceStep(params.get('space'), last.space);
   const rootRef = useRef<HTMLFormElement>(null);
   // Arriving here (the New session button, ⌘⇧O, or ⌘⇧O again while here: a
@@ -82,26 +104,46 @@ export function NewChat() {
   useEffect(() => { messageRef.current?.focus(); }, [visit]);
 
   const [pick, setPick] = useState<RepoPick>(last.pick ?? { kind: 'empty' });
-  const [picked, setModel] = useState<ChatModelId>(last.model);
+  // More repositories ticked after the pick: two or more make a multi-repo
+  // project. Only with multi-repo-projects-enabled.
+  const multiRepoOn = useFlag(FLAGS.multiRepo, false);
+  const [morePicked, setMore] = useState<ListedPick[]>([]);
+  const more = multiRepoOn ? morePicked : [];
+  const [picked, setPicked] = useState<ChatModelId>(lastPick.model ?? last.model);
+  const setModel = (id: ChatModelId) => { setPicked(id); writeLastPick(browserStore(), { model: id }); };
   // The last start's model while it is still offered: a Fireworks model shows once the menus load.
   const modelOptions = useChatModelOptions();
   const model = modelOptions.some(o => o.id === picked) ? picked : 'sonnet';
+  // The effort its turns run at, beside the model. Not for a schedule.
+  const effortOn = useFlag(FLAGS.chatEffort, false);
+  const [effort, setEffortState] = useState<ChatEffortId>(lastPick.effort ?? last.effort);
+  const setEffort = (id: ChatEffortId) => { setEffortState(id); writeLastPick(browserStore(), { effort: id }); };
   const [message, setMessage] = useState('');
-  const [paste, setPaste] = useState(last.pick?.kind === 'pasted' ? last.pick.url : '');
-  const [query, setQuery] = useState('');
   const [repoOpen, setRepoOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
+  const [permissionOpen, setPermissionOpen] = useState(false);
   // Bumped when another menu opens or the form sends, so the space menu closes.
   const [spaceMenuEpoch, setSpaceMenuEpoch] = useState(0);
   function dismissSpaceMenu() { setSpaceMenuEpoch(n => n + 1); }
-  const [catalog, setCatalog] = useState<RepoCatalog | null>(null);
-  const request = useRef(0);
   // Run on a schedule: the same box and repository,
   // but an automation instead of a chat; the first message is its prompt.
+  // The drawer's schedule dialog picks it (pages/chat/SchedulePicker.tsx).
   const automationsOn = useFlag(FLAGS.automations, false);
-  const [scheduled, setScheduled] = useState(false);
+  // ?schedule=1 (the simple UI's New automation) starts on On a schedule,
+  // and the choice follows the URL when it changes on a mounted page: New
+  // session after New automation (or the other way round) is the same route.
+  const scheduleParam = params.get('schedule') === '1';
+  const [schedulePicked, setScheduled] = useState(scheduleParam);
+  useEffect(() => { setScheduled(scheduleParam); }, [scheduleParam]);
+  const simpleAutomations = useAutomationsEnabled();
+  const { reload: reloadAutomations } = useAutomations();
+  const scheduled = automationsOn && schedulePicked;
   const dictation = useDictation({ text: message, setText: setMessage, max: scheduled ? MAX_AUTOMATION_PROMPT : MAX_KEYS });
+  // A session dragged in from the sidebar goes into the message as a reference to it (chat/sessionRef.ts).
+  const refDrop = useSessionRefDrop({ input: messageRef, text: message, setText: t => { dictation.onEdit(); setMessage(t); }, max: scheduled ? MAX_AUTOMATION_PROMPT : MAX_KEYS });
   const [draft, setDraft] = useState<AutomationDraft>(emptyDraft);
+  // Checked here, not in the dialog, so the answer keeps coming once Done closes it.
+  const scheduleCheck = useScheduleCheck(draft, scheduled);
   const [fallbackName] = useState(() => funnyProjectName());
   const defaults = useMemo(
     () => newChatNames(suggestedName(pick) ?? fallbackName, projects.map(p => p.name), boxes.map(b => b.name)),
@@ -119,16 +161,6 @@ export function NewChat() {
     return () => { cancelled = true; };
   }, []);
   const blocked = blocksManagedBox(gate);
-
-  function loadRepos(refresh: boolean) {
-    const id = ++request.current;
-    if (refresh) setCatalog(null);
-    githubReposApi.list(refresh)
-      .then(body => { if (request.current === id) setCatalog(catalogFromWire(body)); })
-      .catch(() => { if (request.current === id) setCatalog(degradedCatalog()); });
-  }
-
-  useEffect(() => { loadRepos(false); }, []);
 
   useEffect(() => {
     if (!repoOpen && !modelOpen) return;
@@ -152,76 +184,177 @@ export function NewChat() {
   // A box launched for an attempt whose project was then refused is reused
   // by the retry, so a second Send never launches a second box.
   const [launched, setLaunched] = useState<Instance | null>(null);
+  // Where the session runs: NEW_BOX, or the id of one of the user's boxes.
+  // An asleep box is woken when it is picked; the start waits until it is up.
+  const [boxChoice, setBoxChoice] = useState<string>(NEW_BOX);
+  // The new box's size: the dropdown shows only while box-default-size is on, preselecting what the
+  // server says a box for the repository launches at (its .termag/environment.json, utils/boxSize.ts).
+
+  const [wakingId, setWakingId] = useState<string | null>(null);
+  // The box whose wake was refused: Send says so instead of waiting on a box nobody is starting.
+  const [wakeFailedId, setWakeFailedId] = useState<string | null>(null);
+  // Your boxes are offered only with chat-existing-box-enabled; off, every session gets a new box, as before.
+  const existingBoxOn = useFlag(FLAGS.chatExistingBox, false);
+  const ownBoxes = useMemo(() => (existingBoxOn ? launchableBoxes(boxes) : []), [existingBoxOn, boxes]);
+  const chosenBox = boxChoice === NEW_BOX ? null : ownBoxes.find(b => b.id === boxChoice) ?? null;
+  // A chosen box that drops out of the list (a reload in flight, a backend
+  // restart, a box going away) stays chosen, as it was last seen: Send waits
+  // for it rather than quietly launching a new box instead.
+  const lastSeenBox = useRef<Instance | null>(null);
+  if (chosenBox) lastSeenBox.current = chosenBox;
+  const missingBox = boxChoice !== NEW_BOX && !chosenBox
+    ? (lastSeenBox.current?.id === boxChoice ? lastSeenBox.current : null)
+    : null;
+  const drawerBoxes = missingBox ? [...ownBoxes, missingBox] : ownBoxes;
+  // The server takes a project on a box that is up, or still launching (it waits for the agent).
+  const chosenBoxUp = !chosenBox || ['ready', 'provisioning', 'awaiting-agent'].includes(chosenBox.status);
+  // How the session gets its code (pages/chat/CheckoutPicker.tsx): its own
+  // clone, or a worktree of a project already on the chosen box with the same
+  // repository. A choice that no longer applies falls back to the clone.
+  const [checkoutChoice, setCheckoutChoice] = useState<string>(OWN_CLONE);
+  const [worktreeBase, setWorktreeBase] = useState<WorktreeBase>('origin');
+  // Only with chat-worktree-sessions-enabled; the server drops the fetch while it is off for the caller.
+  const worktreeOn = useFlag(FLAGS.chatWorktreeSessions, false);
+  const worktreeOptions = useMemo(
+    () => (scheduled || !worktreeOn ? [] : worktreeTargets(pick, projects, chosenBox?.id ?? null)),
+    [scheduled, worktreeOn, pick, projects, chosenBox],
+  );
+  const worktree: Project | null = worktreeOptions.find(p => p.id === checkoutChoice) ?? null;
+  // A worktree is one repository's workstream: the extra repositories ticked
+  // for a multi-repo project count for nothing there, the permission pick included.
+  const ticked = worktree ? [] : more;
+  // origin/<default> for a worktree: the project's default branch, else the
+  // picked repository's (the same repository, worktreeTargets). A project
+  // made from a pasted URL may know neither; then it starts off the checkout.
+  const worktreeDefault = (p: Project): string | null =>
+    p.repoDefaultBranch || (pick.kind === 'listed' ? pick.defaultBranch || null : null);
+  const worktreeStart: WorktreeBase = worktree && worktreeDefault(worktree) ? worktreeBase : 'checkout';
+  // A worktree from a fresh fetch is new code nobody on the box has looked at,
+  // so it asks as a fresh clone does: the permission pill, on the choice last
+  // picked for the repository. Full access is offered only where the project
+  // itself has it; a read-only project's fetched worktree is read-only too.
+  const fetchedTrustable = !!worktree && worktreeStart === 'origin' && worktree.chatTrusted === true;
+  // Its workstream's name: the session name if typed, else the message's first words.
+  const worktreeNameFor = (typed: string | null) => worktree
+    ? worktreeName(typed?.trim() || sessionWords(message) || fallbackName, worktree.workstreams.map(w => w.name))
+    : null;
   const [busy, setBusy] = useState<'space' | 'box' | 'chat' | null>(null);
   const [error, setError] = useState('');
 
   const fields = newChatCreateFields(pick, model);
   const repoUrl = fields?.repoUrl ?? null;
-  // Every repository asks once. A company-org repository starts checked;
-  // switching repository returns to that repository's default, and a manual
-  // tick applies only to the URL it was made on. The backend records the tick.
+  const workspaceRepos = fields ? selectionRepos({ pick, more: ticked }) : null;
+  // What a new box is sized for: every repository of a multi-repo project (the server takes the largest), else the one.
+  const sizeRepos = workspaceRepos ? workspaceRepos.map(r => r.url) : repoUrl;
+  const { sizes: boxSizes, disk: boxDisk } = useBoxSizes(boxChoice === NEW_BOX, sizeRepos);
+  const [boxSize, setBoxSize] = useBoxSizePick(sizeRepos);
+  // The new box's disk, beside its size: what the person typed, else the repository's diskGiB or 120 (utils/boxDisk.ts).
+  const [diskTyped, setDiskTyped] = useBoxDiskPick(sizeRepos);
+  const warmBoxReady = useWarmBoxReady(boxChoice === NEW_BOX && !!boxDisk);
+  // Every repository asks once, as the permission pill. It opens on the
+  // choice last picked for that repository, else a company-org repository on
+  // Full access and any other on Read only; a choice applies only to the
+  // repository it was made on. The backend records Full access as the trust tick.
   const askTrust = repoNeedsTrust(repoUrl);
-  // Same company-org rule as the default tick (repoStartsTrusted): for those
-  // repositories the checkbox moves into Options instead of sitting inline,
-  // since trust there is already the default rather than an opt-in ask.
-  const trustCompanyRepo = repoStartsTrusted(repoUrl);
-  const [trustChoice, setTrustChoice] = useState<{ url: string | null; checked: boolean } | null>(null);
-  const trustChecked = trustChoice?.url === repoUrl ? trustChoice.checked : repoStartsTrusted(repoUrl);
+  // Several repositories start on Full access only when every one would on
+  // its own, and a choice made for them holds only while the same ones are ticked.
+  const selectionUrls = [repoUrl, ...ticked.map(r => githubRepoUrl(r.fullName))];
+  const selectionKey = selectionUrls.map(u => (u && repoKey(u)) ?? '').join(' ');
+  const [trustChoice, setTrustChoice] = useState<{ key: string; checked: boolean } | null>(null);
+  const startsTrusted = selectionUrls.every(u => {
+    const remembered = readPermissionPick(browserStore(), u);
+    return remembered ? remembered === 'full' : repoStartsTrusted(u);
+  });
+  const trustChecked = trustChoice?.key === selectionKey ? trustChoice.checked : startsTrusted;
   // Act as an orchestrator: the box tells the chat's turns to use the opt-in
   // agent-orchestrator skill, out of the conversation (chat/newChat.ts).
   const [orchestrate, setOrchestrate] = useState(false);
   const orchestrator = orchestratorOption({
-    providerHasSkill: !!PROVIDERS[CHAT_PROVIDER_ID]?.orchestratorSkill,
+    providerHasSkill: !!PROVIDERS[CHAT_PROVIDER_ID]?.orchestratorSkill && !worktree,
     scheduled,
     trusted: askTrust ? trustChecked : true,
   });
-  const nameError = name && !PROJECT_NAME_RE.test(name) ? 'Letters, digits, - and _ only' : '';
-  const boxError = !launched && boxName && !isValidBoxName(boxName) ? BOX_NAME_ERROR : '';
-  // The schedule as AutomationFields previewed it: no box is launched for a
-  // schedule the API would refuse (too frequent, unreadable).
-  const [scheduleValid, setScheduleValid] = useState(false);
-  const scheduleOk = !scheduled || (draftCron(draft) !== null && !!draft.timezone && !!message.trim() && scheduleValid);
+  // A worktree's typed name goes through worktreeName, which makes any text a valid workstream name.
+  const nameError = !worktree && name && !PROJECT_NAME_RE.test(name) ? 'Letters, digits, - and _ only' : '';
+  const boxError = boxChoice === NEW_BOX && !launched && boxName && !isValidBoxName(boxName) ? BOX_NAME_ERROR : '';
+  const diskError = boxChoice === NEW_BOX && !launched ? diskInputError(boxDisk, diskTyped) : null;
+  // The schedule as /preview read it: no box is launched for a schedule the
+  // API would refuse (too frequent, unreadable).
+  const scheduleOk = !scheduled || (draftCron(draft) !== null && !!draft.timezone && !!message.trim() && scheduleCheck.valid);
+  // An automation's tier is the permission pill: Full access is the owner's
+  // trust tick (the full tier sets chatTrustedAt), Read only runs read-only.
+  const scheduleTier: AutomationDraft['tier'] = askTrust ? (trustChecked ? 'full' : 'read') : draft.tier;
   const whyNot = startBlocker({
-    busy: !!busy, hasRepo: fields !== null, name, nameError,
+    busy: !!busy, hasRepo: fields !== null, name: worktree ? worktreeNameFor(nameEdit) ?? '' : name, nameError,
     spacesReady: spaceStep.ready, spaceError: spaceStep.error,
-    boxReady: !!launched, boxName, boxError,
-  }) || (scheduleOk || busy ? '' : 'Pick a schedule the runs can keep, and say what each run should do');
+    boxReady: !!launched || boxChoice !== NEW_BOX, boxName, boxError: boxError || (diskError ? `Disk: ${diskError}` : ''),
+  }) || (chosenBox && !chosenBoxUp && !busy
+    ? (wakeFailedId === chosenBox.id ? `${chosenBox.name} didn't wake up: pick it again to retry, or pick another box` : `Waiting for ${chosenBox.name} to wake up`)
+    : '')
+    || (boxChoice !== NEW_BOX && !chosenBox && !busy ? `${missingBox?.name ?? 'That box'} isn't available right now: pick it again or another box` : '')
+    || (scheduleOk || busy ? '' : 'Pick a schedule the runs can keep, and say what each run should do')
+    || (scheduled && workspaceRepos && !busy ? 'A scheduled run works in one repository: untick the others' : '');
   // A plain chat still needs a message to send, just without a written hint.
   const messageMissing = !busy && !scheduled && !message.trim();
   const canStart = !busy && !blocked && !whyNot && !messageMissing;
 
-  const list = repoListView(catalog);
-  const q = query.trim().toLowerCase();
-
-  function visibleRepos(group: CatalogGroup) {
-    if (!q) return group.repos;
-    return group.repos.filter(repo => repo.fullName.toLowerCase().includes(q));
-  }
-
-  function chooseListed(fullName: string, defaultBranch: string) {
-    setPick({ kind: 'listed', fullName, defaultBranch });
-    setPaste('');
-    setNameEdit(null);
-    setBoxEdit(null);
-    setRepoOpen(false);
-    setError('');
-  }
-
-  function onPaste(url: string) {
-    setPaste(url);
-    setPick(url.trim() ? { kind: 'pasted', url } : { kind: 'empty' });
+  // A new repository renames the session and the box after it again, and is
+  // what the next New session opens on as soon as it is picked: a pasted URL
+  // only once it reads as a repository, so a half-typed one never is.
+  function choosePick(next: RepoPick) {
+    setPick(next);
+    setMore([]);
+    if (next.kind === 'listed' || (next.kind === 'pasted' && repoKey(next.url))) {
+      rememberStartPick(browserStore(), { pick: next });
+    }
     setNameEdit(null);
     setBoxEdit(null);
     setError('');
+  }
+
+  // A tick in the repository menu. The session is named after the first repository, so only a new first one renames it.
+  function toggleMore(repo: ListedPick) {
+    const next = toggleRepo({ pick, more }, repo);
+    setMore(next.more);
+    if (next.pick === pick) return;
+    setPick(next.pick);
+    if (next.pick.kind === 'listed') rememberStartPick(browserStore(), { pick: next.pick });
+    setNameEdit(null);
+    setBoxEdit(null);
+    setError('');
+  }
+
+  function chooseBox(choice: string) {
+    setBoxChoice(choice);
+    setError('');
+    const box = ownBoxes.find(b => b.id === choice);
+    if (!box || !canStartBox(box) || wakingId === box.id) return;
+    setWakingId(box.id);
+    setWakeFailedId(null);
+    instancesApi.start(box.id)
+      .then(r => {
+        // Starting now, whatever the next list says: the feed keeps polling a
+        // starting box, and canStartBox no longer offers a second start.
+        boxFeed.upsert({ ...box, status: r?.status ?? 'starting' });
+        return boxFeed.reload();
+      })
+      .catch(err => {
+        setWakeFailedId(box.id);
+        setError(apiError(err, `Could not wake ${box.name}`));
+      })
+      .finally(() => setWakingId(w => (w === box.id ? null : w)));
   }
 
   async function start(e?: React.FormEvent) {
     e?.preventDefault();
     if (!canStart || !fields) return;
+    // Never a new box for a chosen one that is missing (whyNot holds Send for it too).
+    if (boxChoice !== NEW_BOX && !chosenBox) return;
     dictation.detach();
     setError('');
     setRepoOpen(false);
     setModelOpen(false);
+    setPermissionOpen(false);
     dismissSpaceMenu();
     let space: string | null;
     try {
@@ -232,12 +365,12 @@ export function NewChat() {
       setBusy(null);
       return;
     }
-    let box = launched;
+    let box = chosenBox ?? launched;
     if (!box) {
       setBusy('box');
       noteAddBoxClick();
       try {
-        const r = await instancesApi.create(boxName, 'ec2');
+        const r = await instancesApi.create(boxName, 'ec2', { size: sizeToSend(boxSizes, boxSize), diskGiB: diskToSend(boxDisk, diskTyped), repo: sizeRepos });
         if (r.claimed) noteBoxClaimed(r.instance.id);
         boxFeed.upsert(r.instance);
         box = r.instance;
@@ -259,6 +392,10 @@ export function NewChat() {
       return;
     }
     setBusy('chat');
+    if (worktree) {
+      await startWorktree(worktree, space);
+      return;
+    }
     if (scheduled) {
       try {
         const created = await automationsApi.create({
@@ -270,14 +407,17 @@ export function NewChat() {
           claudeModel: fields.claudeModel,
           ...(fields.backend ? { backend: fields.backend, model: fields.model } : {}),
           // The full tier is the owner's trust tick (it sets chatTrustedAt): a
-          // repository the owner has not ticked runs read-only, whatever the
-          // Run settings panel says.
-          tier: askTrust && !trustChecked ? 'read' : draft.tier,
+          // repository left on Read only runs read-only.
+          tier: scheduleTier,
+          // With the simple UI's automation pages, the space picked is the automation's: it is listed there (chat/automationPlaces.ts).
+          ...(simpleAutomations && space ? { spaceName: space } : {}),
         });
         noteProjectCreated(created.project.id, box.id);
-        writeLastStart(browserStore(), { pick, space, model });
-        await reloadProjects().catch(() => {});
-        navigate(`/automations/${encodeURIComponent(created.project.id)}`);
+        // An automation runs at the default effort, but the next New session keeps the one picked.
+        writeLastStart(browserStore(), { pick, space, model, effort });
+        // A run-less automation is listed only from the shared automations list: reload it too, not wait for its poll.
+        await Promise.all([reloadProjects().catch(() => {}), reloadAutomations()]);
+        navigate(simpleAutomations ? automationHref(created.project.id) : `/automations/${encodeURIComponent(created.project.id)}`);
       } catch (err) {
         if (isBoxFailedRefusal(err)) {
           setLaunched(null);
@@ -296,16 +436,24 @@ export function NewChat() {
         instanceId: box.id,
         initialAgent: { enabled: true, provider: CHAT_PROVIDER_ID, ...(fields.backend ? { backend: fields.backend, model: fields.model } : {}) },
         replaySessionId: await replaySessionId(),
-        repoUrl: fields.repoUrl,
-        defaultBranch: fields.defaultBranch,
+        ...(workspaceRepos ? { repos: workspaceRepos } : { repoUrl: fields.repoUrl, defaultBranch: fields.defaultBranch }),
         claudeModel: fields.claudeModel,
         chatTrusted: askTrust && trustChecked,
         ...(orchestrate && orchestrator === 'available' ? { chatOrchestrator: true } : {}),
+        // The chat belongs to the space it was started in, or to none, for good (backend services/chatSpace.ts).
+        ...(spaceStep.show ? { chatSpace: space } : {}),
       });
       noteProjectCreated(project.id, box.id);
-      writeLastStart(browserStore(), { pick, space, model });
+      writeLastStart(browserStore(), { pick, space, model, effort });
+      // The first message goes from the session's view, at this effort (chat/useChatEffort.ts).
+      writeEffortPick(`${project.id}|main`, effortOn ? effort : 'default');
       const held = writeQueued(browserStore(), project.id, message);
+      // Sent later by the chat's sendQueued, not its composer, so counted here.
+      // Not held, it goes to the composer as a draft, which counts it when it is sent.
+      if (held) recordTypedChatCommand(message, 'new');
       await reloadProjects().catch(() => {});
+      // Its tab goes in the space it was started in (the sidebar groups a chat by its own space).
+      if (space) simple?.items.open({ kind: 'chat', projectId: project.id, workstream: 'main' }, null);
       navigate(chatHref(project.id, 'main'), held ? undefined : { state: { draft: message } });
     } catch (err) {
       if (isBoxFailedRefusal(err)) {
@@ -315,6 +463,35 @@ export function NewChat() {
       } else {
         setError(apiError(err, 'Could not start the session'));
       }
+      setBusy(null);
+    }
+  }
+
+  // A worktree of an existing project: a new workstream, from origin/<default>
+  // fetched now or off the project's checkout as the full UI's Branch off…
+  // does. Off the checkout it runs with the project's permissions; from a
+  // fetch, with the permission picked here (fullAccess), Full access only on a
+  // trusted project. A box too old to make a person's fetched tree refuses
+  // (backend createWorkstreamFor). The first message waits in the
+  // workstream's own queue.
+  async function startWorktree(project: Project, space: string | null) {
+    const wsName = worktreeNameFor(nameEdit) ?? 'session';
+    const branch = worktreeDefault(project);
+    try {
+      // The chat belongs to the space it was started in, as a clone's does (backend services/chatSpace.ts).
+      const inSpace = spaceStep.show ? { chatSpace: space } : {};
+      const ws = await workstreamsApi.create(project.id, worktreeStart === 'origin' && branch
+        ? { name: wsName, baseRef: `origin/${branch}`, fetch: { remoteBranch: branch, fullAccess: fetchedTrustable && trustChecked }, ...inSpace }
+        : { name: wsName, ...inSpace });
+      // Its first message goes from its own view, on the model and at the effort picked here.
+      writeModelPick(`${project.id}|${ws.name}`, model);
+      writeEffortPick(`${project.id}|${ws.name}`, effortOn ? effort : 'default');
+      writeLastStart(browserStore(), { pick, space, model, effort });
+      const held = writeQueued(browserStore(), queueKey(project.id, ws.name), message);
+      await reloadProjects().catch(() => {});
+      navigate(chatHref(project.id, ws.name), held ? undefined : { state: { draft: message } });
+    } catch (err) {
+      setError(apiError(err, `Could not start a worktree of ${project.name}`));
       setBusy(null);
     }
   }
@@ -336,110 +513,27 @@ export function NewChat() {
     : busy === 'chat' ? (scheduled ? 'Creating' : 'Starting')
     : scheduled ? 'Create automation' : 'Send';
 
-  // Shared by the inline spot and the one inside Options: same checkbox,
-  // same copy, same create payload either way (chatTrusted tracks trustChecked).
-  function trustCheckbox(extraClassName?: string) {
-    return (
-      <label className={extraClassName ? `chat-new-trust ${extraClassName}` : 'chat-new-trust'}>
-        <input type="checkbox" checked={trustChecked} onChange={e => setTrustChoice({ url: repoUrl, checked: e.target.checked })} />
-        <span>
-          {scheduled
-            ? <><strong>I trust this repository.</strong> Runs get the full tier: a fresh Claude runs commands, commits and opens PRs in it with nobody watching (its classifier denies rather than asks). Unchecked, every run is read-only.</>
-            : repoUrl
-              ? <><strong>I trust this repository.</strong> Claude runs commands and edits files in it without asking.</>
-              : <><strong>Let Claude run commands.</strong> Claude runs commands and edits files in this project without asking.</>}
-          {!scheduled && <>{' '}Unchecked, Claude can read it but cannot run tools until you trust it from the session.</>}
-        </span>
-      </label>
-    );
-  }
-
   return (
     <NewChatFrame>
       <form ref={rootRef} className="chat-compose chat-new-card" onSubmit={e => void start(e)}>
-        <div className="chat-compose-picks">
-        <div className="chat-compose-repo">
-          <button
-            type="button"
-            className="chat-compose-repo-btn"
-            aria-expanded={repoOpen}
-            aria-haspopup="listbox"
-            onClick={() => { setRepoOpen(o => !o); setModelOpen(false); dismissSpaceMenu(); }}
-          >
-            <span className="chat-compose-repo-name">{repoTriggerLabel(pick)}</span>
-            <Caret />
-          </button>
-          {repoOpen && (
-            <div className="chat-compose-menu" role="listbox" aria-label="Repositories">
-              <input
-                className="chat-compose-search"
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                placeholder="Search repositories"
-                aria-label="Search repositories"
-                autoFocus
-                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }}
-              />
-              {list.kind === 'loading' && <div className="chat-compose-note">Loading repositories…</div>}
-              {list.kind === 'error' && (
-                <div className="chat-compose-note" role="alert">
-                  {list.text}{' '}
-                  <button type="button" className="chat-compose-retry" onClick={() => loadRepos(true)}>Try again</button>
-                </div>
-              )}
-              {list.kind === 'empty' && <div className="chat-compose-note">{REPO_EMPTY}</div>}
-              {catalog?.ok && catalog.groups.map(group => {
-                const repos = visibleRepos(group);
-                if (repos.length === 0 && group.status === 'ok') return null;
-                return (
-                  <div key={`${group.kind}:${group.owner}`}>
-                    <div className="chat-compose-owner">{group.owner}</div>
-                    {group.status !== 'ok' && (
-                      <div className="chat-compose-note">
-                        {group.href ? <a href={group.href}>{group.text}</a> : group.text}
-                      </div>
-                    )}
-                    {repos.map(repo => (
-                      <button
-                        key={repo.fullName}
-                        type="button"
-                        role="option"
-                        aria-selected={pick.kind === 'listed' && pick.fullName === repo.fullName}
-                        className="chat-compose-option"
-                        onClick={() => chooseListed(repo.fullName, repo.defaultBranch)}
-                      >
-                        {repo.fullName}
-                      </button>
-                    ))}
-                  </div>
-                );
-              })}
-              <label className="chat-compose-paste">
-                <span>Repository URL</span>
-                <input
-                  value={paste}
-                  onChange={e => onPaste(e.target.value)}
-                  placeholder="https://github.com/owner/repo"
-                  aria-label="Repository URL"
-                  onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }}
-                />
-              </label>
-            </div>
-          )}
+        <div className="chat-launch-ask">
+        <span>{fields ? 'What are we doing in' : 'What are we doing?'}</span>
+        <RepoPicker
+          pick={pick}
+          onPick={choosePick}
+          empty={!fields}
+          open={repoOpen}
+          onOpenChange={open => { setRepoOpen(open); if (open) { setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); } }}
+          more={ticked}
+          onToggle={multiRepoOn && !worktree ? toggleMore : undefined}
+        />
+
+        {fields && <span className="chat-launch-q" aria-hidden="true">?</span>}
         </div>
 
-        {spaceStep.show && (
-          <SpacePicker
-            {...spaceStep.pickerProps}
-            error={spaceStep.error}
-            disabled={!!busy}
-            menuEpoch={spaceMenuEpoch}
-            onOpen={() => { setRepoOpen(false); setModelOpen(false); }}
-          />
-        )}
-        </div>
-
-        <div className="chat-compose-box">
+        {/* The composer and its drawer, with no gap between them: the drawer tucks under the composer. */}
+        <div className="chat-launch-composer">
+        <div className="chat-compose-box" {...refDrop.handlers} data-ref-drop={refDrop.over || undefined}>
           <textarea
             ref={messageRef}
             className="chat-compose-input"
@@ -453,18 +547,38 @@ export function NewChat() {
               e.preventDefault();
               void start();
             }}
-            placeholder={scheduled ? 'What each run should do. It starts on a fresh branch, with notes from earlier runs.' : 'What should Claude do?'}
+            placeholder={scheduled ? 'What each run should do. It starts on a fresh branch, with notes from earlier runs.' : `What should ${chatAgentName(model, modelOptions) ?? 'it'} do?`}
             aria-label="Message"
             rows={4}
           />
           <div className="chat-compose-bar">
+            <div className="chat-compose-pills">
             <ModelPicker
               model={model}
               options={modelOptions}
               onChange={setModel}
+              effort={effortOn && !scheduled ? effort : null}
+              onEffortChange={setEffort}
               open={modelOpen}
-              onOpenChange={open => { setModelOpen(open); if (open) { setRepoOpen(false); dismissSpaceMenu(); } }}
+              onOpenChange={open => { setModelOpen(open); if (open) { setRepoOpen(false); setPermissionOpen(false); dismissSpaceMenu(); } }}
             />
+            {worktree && !fetchedTrustable ? <FollowsPermissions project={worktree.name} fetched={worktreeStart === 'origin'} /> : askTrust && (
+              <PermissionPicker
+                value={trustChecked ? 'full' : 'read'}
+                onChange={choice => {
+                  setTrustChoice({ key: selectionKey, checked: choice === 'full' });
+                  if (ticked.length === 0) writePermissionPick(browserStore(), repoUrl, choice);
+                }}
+                open={permissionOpen}
+                onOpenChange={open => { setPermissionOpen(open); if (open) { setRepoOpen(false); setModelOpen(false); dismissSpaceMenu(); } }}
+                scheduled={scheduled}
+                disabled={!!busy}
+              />
+            )}
+            {orchestrator !== 'hidden' && (
+              <OrchestratorToggle on={orchestrate} onChange={setOrchestrate} state={orchestrator} disabled={!!busy} />
+            )}
+            </div>
             <div className="chat-compose-actions">
             <DictationButton dictation={dictation} disabled={!!busy} className="chat-compose-mic" />
             {/* Shows once there is a message, and stays while the session starts. */}
@@ -476,49 +590,82 @@ export function NewChat() {
             </div>
           </div>
         </div>
+        <LaunchDrawer
+          boxes={drawerBoxes}
+          boxChoice={boxChoice}
+          onBoxChoice={chooseBox}
+          wakingId={wakingId}
+          disabled={!!busy}
+          // After a launched box's project was refused, the retry keeps that box; the session name stays editable.
+          boxLocked={!!launched}
+          space={spaceStep.show ? (
+            <SpacePicker
+              {...spaceStep.pickerProps}
+              // A space is remembered once picked; a new one only once the session makes it.
+              onChange={next => {
+                spaceStep.pickerProps.onChange(next);
+                if (next.kind !== 'new') rememberStartPick(browserStore(), { space: next.kind === 'existing' ? next.name : null });
+              }}
+              error={spaceStep.error}
+              disabled={!!busy}
+              menuEpoch={spaceMenuEpoch}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); }}
+            />
+          ) : null}
+          checkout={worktreeOptions.length > 0 && fields ? (
+            <CheckoutPicker
+              choice={worktree ? worktree.id : OWN_CLONE}
+              onChoice={setCheckoutChoice}
+              base={worktreeStart}
+              onBase={setWorktreeBase}
+              targets={worktreeOptions}
+              defaultBranchOf={worktreeDefault}
+              repoName={repoTriggerLabel(pick)}
+              disabled={!!busy}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); }}
+            />
+          ) : null}
+          schedule={automationsOn ? (
+            <SchedulePicker
+              scheduled={scheduled}
+              onScheduledChange={setScheduled}
+              draft={{ ...draft, prompt: message, tier: scheduleTier }}
+              onDraftChange={setDraft}
+              check={scheduleCheck}
+              tierElsewhere={askTrust}
+              disabled={!!busy}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); }}
+            />
+          ) : null}
+          newBoxName={
+            <label className="chat-new-field chat-launch-new-field">
+              <span>Name</span>
+              <input value={launched ? launched.name : boxEdit ?? defaults.boxName} disabled={!!launched} onChange={e => setBoxEdit(e.target.value)} aria-label="Box name" />
+              {boxError && <span className="chat-new-error">{boxError}</span>}
+            </label>
+          }
+          newBoxSize={!launched && (boxSizes || boxDisk)
+            ? <>
+              {boxSizes && <BoxSizeSelect options={boxSizes} picked={boxSize} onPick={setBoxSize} disabled={!!busy} className="chat-launch-new-size" />}
+              {boxDisk && <BoxDiskInput disk={boxDisk} typed={diskTyped} onType={setDiskTyped} warmBoxReady={warmBoxReady} disabled={!!busy} className="chat-launch-new-disk" />}
+            </>
+            : null}
+          sessionName={
+            <label className="chat-new-field">
+              <span>Session name</span>
+              <input value={nameEdit ?? worktreeNameFor(null) ?? defaults.projectName} onChange={e => setNameEdit(e.target.value)} />
+              {nameError && <span className="chat-new-error">{nameError}</span>}
+            </label>
+          }
+        />
+        </div>
         <DictationNote dictation={dictation} className="chat-compose-status" />
 
-        {automationsOn && (
-          <label className="chat-new-trust chat-new-schedule">
-            <input type="checkbox" checked={scheduled} onChange={e => setScheduled(e.target.checked)} />
-            <span><strong>Run on a schedule.</strong> Instead of one session, an automation: a fresh Claude runs this prompt on a cadence, each run its own branch and conversation.</span>
-          </label>
-        )}
-        {scheduled && <AutomationFields draft={{ ...draft, prompt: message }} onChange={d => { setDraft(d); if (d.prompt !== message) setMessage(d.prompt); }} showEnabled idPrefix="nc-af" onValidity={setScheduleValid} />}
-        {askTrust && !trustCompanyRepo && trustCheckbox()}
-        {orchestrator !== 'hidden' && (
-          <label className="chat-new-orchestrator">
-            <input
-              type="checkbox"
-              checked={orchestrate && orchestrator === 'available'}
-              disabled={orchestrator !== 'available'}
-              onChange={e => setOrchestrate(e.target.checked)}
-            />
-            <span>
-              <strong>Act as an orchestrator.</strong> Claude starts with the agent-orchestrator skill: it splits the
-              work into tasks, hands them to other agents with <code>termag ask</code>, keeps plans and handoffs in a
-              termag space, and combines what comes back instead of doing the work itself.
-              {orchestrator === 'needs-trust' && <>{' '}Needs the trust box ticked{trustCompanyRepo ? ' (under Options)' : ''}: an untrusted session cannot run commands.</>}
-            </span>
-          </label>
-        )}
-        <details className="chat-new-options">
-          <summary>Options</summary>
-          {askTrust && trustCompanyRepo && trustCheckbox('chat-new-trust-options')}
-          <label className="chat-new-field">
-            <span>Session name</span>
-            <input value={nameEdit ?? defaults.projectName} onChange={e => setNameEdit(e.target.value)} />
-            {nameError && <span className="chat-new-error">{nameError}</span>}
-          </label>
-          <label className="chat-new-field">
-            <span>Box name</span>
-            <input value={launched ? launched.name : boxEdit ?? defaults.boxName} disabled={!!launched} onChange={e => setBoxEdit(e.target.value)} />
-            {boxError && <span className="chat-new-error">{boxError}</span>}
-          </label>
-        </details>
-        {whyNot && <span className="chat-compose-why" id="chat-new-why">{whyNot}</span>}
+        {/* Why Send is disabled: only once there is a message to send. */}
+        {whyNot && (message.trim() || scheduled) && <span className="chat-compose-why" id="chat-new-why">{whyNot}</span>}
         {busy && <div className="chat-compose-status" role="status">{busy === 'space' ? 'Setting up the space…' : busy === 'box' ? 'Launching a box…' : scheduled ? 'Creating…' : 'Starting…'}</div>}
         {error && <div className="chat-compose-error" role="alert">{error}</div>}
+        {refDrop.note && <div className="chat-compose-error" role="status">{refDrop.note}</div>}
       </form>
     </NewChatFrame>
   );

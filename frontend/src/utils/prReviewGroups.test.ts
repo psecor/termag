@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { PrGroupMember, PrPipelineResponse, PrReviewGroup, PrRow } from '../services/api';
 import {
-  closedGroups, groupKey, groupPill, groupPlaces, groupProgress, groupReviewBody, groupReviewPlan, groupSize, isCardView, memberRows, memberStatus, moved, nextMember,
-  openGroups, parseGroupPr, acceptSuggestion, suggestionWhy, suggestionsOf,
+  closedGroups, groupKey, groupPill, groupPlaces, groupProgress, groupReviewBody, groupReviewPlan, groupSize, isCardView, memberBotReview, memberReview, memberRows, memberStatus, moved, nextMember,
+  openGroups, parseGroupPr, acceptSuggestion, suggestionWhy, suggestionsOf, unreviewedCount,
 } from './prReviewGroups';
 
 const NOW = Date.parse('2026-10-24T12:00:00Z');
@@ -21,6 +21,38 @@ const group = (members: PrGroupMember[], over: Partial<PrReviewGroup> = {}): PrR
 });
 const res = (groups: PrReviewGroup[]): PrPipelineResponse => ({
   connected: true, viewer: 'me', lanes: [], prod: { sha: null, source: 'unknown' }, boxes: 0, fetchedAt: '2026-10-24T12:00:00Z', notes: [], groups,
+});
+
+describe('memberReview', () => {
+  const who = (over: Partial<{ approved: string[]; changes: string[]; commented: string[]; botsApproved: string[]; botsChanges: string[] }> = {}) => ({ approved: [], changes: [], commented: [], botsApproved: [], botsChanges: [], ...over });
+  it('says no review yet when no person has reviewed it, whatever a bot said', () => {
+    expect(memberReview(member({ reviewers: who({ botsApproved: ['cursor'] }) }), 'me')).toEqual({ kind: 'none', label: 'no review yet', title: 'No person has reviewed it yet.' });
+  });
+  it('gives a bot\'s verdict its own pill: changes over an approval, nothing for a merged member or none', () => {
+    expect(memberBotReview(member({ reviewers: who({ botsApproved: ['cursor'] }) }))).toMatchObject({ kind: 'approved', label: 'cursor approved' });
+    expect(memberBotReview(member({ reviewers: who({ botsApproved: ['cursor'] }) }))?.title).toContain('look for higher-level problems');
+    expect(memberBotReview(member({ reviewers: who({ botsApproved: ['cursor'], botsChanges: ['linter'] }) }))).toMatchObject({ kind: 'changes', label: 'linter wants changes' });
+    expect(memberBotReview(member({ reviewers: who({ approved: ['alice'] }) }))).toBeNull();
+    expect(memberBotReview(member({ state: 'merged', reviewers: who({ botsApproved: ['cursor'] }) }))).toBeNull();
+    expect(memberBotReview(member())).toBeNull();
+  });
+  it('ranks changes over an approval over comments, and calls the viewer you', () => {
+    expect(memberReview(member({ reviewers: who({ commented: ['Me'] }) }), 'me')).toMatchObject({ kind: 'commented', title: 'No approval yet. Comments from you.' });
+    expect(memberReview(member({ reviewers: who({ approved: ['alice', 'bob'], commented: ['carol'] }) }), 'me')).toMatchObject({ kind: 'approved', title: 'Approved by alice, bob. Comments from carol.' });
+    expect(memberReview(member({ reviewers: who({ approved: ['alice'], changes: ['bob'] }) }), 'me')).toMatchObject({ kind: 'changes', label: 'changes requested', title: 'Changes requested by bob. Approved by alice.' });
+  });
+  it('says nothing for a merged member, one GitHub could not read, or an older backend', () => {
+    expect(memberReview(member({ state: 'merged', reviewers: who() }), 'me')).toBeNull();
+    expect(memberReview(member({ reviewers: null }), 'me')).toBeNull();
+    expect(memberReview(member(), 'me')).toBeNull();
+  });
+  it('counts the open members no one has reviewed', () => {
+    const g = group([
+      member({ number: 1, reviewers: who() }), member({ number: 2, reviewers: who({ botsApproved: ['cursor'] }) }),
+      member({ number: 3, reviewers: who({ approved: ['alice'] }) }), member({ number: 4, state: 'merged', reviewers: who() }), member({ number: 5 }),
+    ]);
+    expect(unreviewedCount(g, 'me')).toBe(2);
+  });
 });
 
 describe('parseGroupPr', () => {

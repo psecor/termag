@@ -12,8 +12,8 @@ function contrast(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-// App.css's dark surfaces, and the light surfaces a light theme would use.
-const SURFACES = ['#0d1117', '#161b22', '#21262d', '#2d333b', '#ffffff', '#f6f8fa'];
+// App.css's dark surfaces, and its light --bg-base, --bg-surface and --bg-elevated.
+const SURFACES = ['#0d1117', '#161b22', '#21262d', '#2d333b', '#ffffff', '#f6f8fa', '#eaeef2'];
 
 const at = (name: string, createdAt: string) => ({ name, createdAt });
 

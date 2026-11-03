@@ -4,12 +4,18 @@ import type { ThemeSettings } from '../theme/schema';
 import type { OrgAccess } from '../pages/settings/githubOrgCopy';
 import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, BoxLifecycle, AutoTerminatedBox, Workstream, CloudSession, CloudSessionEvent, HandoffMode } from '../types';
 import type { BoxGateState } from '../boxGate';
-import { chatModelWire, type ChatModelId } from '../chat/composer';
+import type { WorkspaceRepoInput } from '../utils/multiRepo';
+import type { BoxSize, BoxSizeOptions } from '../utils/boxSize';
+import type { BoxResizeInfo, ResizeView } from '../utils/boxResize';
+import { chatModelWire, type ChatEffortWire, type ChatModelId } from '../chat/composer';
+import type { ChatAskThread } from '../chat/asks';
+import { sendClientHeader } from '../buildInfo';
 
 const api = axios.create({
   baseURL: '/termag',
   withCredentials: true,
 });
+sendClientHeader(api);
 
 // Every REST round-trip is evidence about reachability. An HTTP response of
 // any status (even 401/500) proves a termag server answered; only a
@@ -40,6 +46,8 @@ export interface PreferencesPatch {
   pushMutesChat?: boolean;
   /** Notify when a chat finishes its turn. */
   chatTurnNotify?: boolean;
+  /** Where later visits open; refused while onboarding-refresh-enabled is off. */
+  uiMode?: 'simple' | 'full' | null;
 }
 
 export const authApi = {
@@ -96,12 +104,18 @@ export const projectsApi = {
     replaySessionId?: string | null;
     /** The creator trusts the repository: its chat's Claude runs tools without asking (backend services/chatTrust.ts). */
     chatTrusted?: boolean;
+    /** Several repositories in one project (multi-repo-projects-enabled); replaces repoUrl/defaultBranch. */
+    repos?: WorkspaceRepoInput[];
     /** Simple-UI chat: opus, sonnet, haiku, or null for Claude's default. */
     claudeModel?: 'opus' | 'sonnet' | 'haiku' | null;
     /** New session's "Act as an orchestrator" (backend: kept only with chatTrusted). */
     chatOrchestrator?: boolean;
     /** The box this submit created came from the warm pool (telemetry only; backend services/productEvents.ts). */
     warmClaimed?: boolean;
+    /** New session's space for the chat, or null for "No space": the chat belongs to it for good (backend services/chatSpace.ts). */
+    chatSpace?: string | null;
+    /** The answer to a refusal for an archived project holding the name on the box (utils/projectStart.ts archivedNameClash). */
+    archivedName?: 'unarchive' | 'rename-aside';
   }): Promise<Project> =>
     api.post('/api/projects', data).then(r => r.data),
   /** Known starter repos for "first project" (webapp, research); "custom" is any GitHub URL. */
@@ -169,7 +183,8 @@ export const collabApi = {
 export const workstreamsApi = {
   list: (projectId: string): Promise<Workstream[]> =>
     api.get(`/api/projects/${projectId}/workstreams`).then(r => r.data),
-  create: (projectId: string, data: { name: string; branch?: string; baseRef?: string }): Promise<Workstream> =>
+  /** `fetch` starts from a fresh origin/<remoteBranch> on a box that can (backend createWorkstreamBody). */
+  create: (projectId: string, data: { name: string; branch?: string; baseRef?: string; fetch?: { remoteBranch: string; fullAccess?: boolean }; chatSpace?: string | null }): Promise<Workstream> =>
     api.post(`/api/projects/${projectId}/workstreams`, data).then(r => r.data),
   remove: (projectId: string, workstreamId: string, force = false): Promise<WorkstreamDeleteResult> =>
     api.delete(`/api/projects/${projectId}/workstreams/${workstreamId}`, {
@@ -178,6 +193,15 @@ export const workstreamsApi = {
   /** Rename the worktree dir + tmux sessions + row; the git branch is left alone. */
   rename: (projectId: string, workstreamId: string, name: string): Promise<Workstream> =>
     api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/rename`, { name }).then(r => r.data),
+  /**
+   * The files the session's checkout has changed that its upstream lacks (backend
+   * routes/workstreamChanges.ts); `branch`, the session's PR head, reads the worktree on it.
+   * `poll=1`: left out of network recording, as the PR list poll is.
+   */
+  changes: (projectId: string, workstream: string, branch?: string | null): Promise<InflightChanges> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/workstreams/${encodeURIComponent(workstream)}/changes`, {
+      params: { poll: 1, ...(branch ? { branch } : {}) },
+    }).then(r => r.data),
   /** Switch the agent this workstream runs: stops the one in its agent pane, starts `provider` there. */
   switchAgent: (projectId: string, workstreamId: string, provider: string, backend: string | null = null, model: string | null = null): Promise<{ ok: true; provider: string; backend: string | null; model: string | null; changed: boolean; warning?: string | null }> =>
     api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/agent`, { provider, backend, model }).then(r => r.data),
@@ -271,8 +295,23 @@ export const instancesApi = {
   // the person-triggered /api/instances calls stay recorded; the server ignores it.
   list: (): Promise<Instance[]> => api.get('/api/instances', { params: { poll: 1 } }).then(r => r.data),
   get: (id: string): Promise<Instance> => api.get(`/api/instances/${id}`).then(r => r.data),
-  create: (name: string, kind: InstanceKind = 'ec2'): Promise<InstanceCreated> =>
-    api.post('/api/instances', { name, kind }).then(r => r.data),
+  // size: one the New box picker chose (utils/boxSize.ts), absent for the
+  // default; repo: the repository the box is made for, for its default size.
+  // repo: one repository, or a multi-repo project's list, whose largest .termag/environment.json size the box takes.
+  // diskGiB: what the New box disk field had typed (utils/boxDisk.ts), absent for the repo's or the default.
+  create: (name: string, kind: InstanceKind = 'ec2', opts: { size?: BoxSize; diskGiB?: number; repo?: string | readonly string[] | null } = {}): Promise<InstanceCreated> =>
+    api.post('/api/instances', {
+      name, kind,
+      ...(opts.size ? { size: opts.size } : {}),
+      ...(opts.diskGiB !== undefined ? { diskGiB: opts.diskGiB } : {}),
+      ...(opts.repo?.length ? { repo: opts.repo } : {}),
+    }).then(r => r.data),
+  // repo: what the box is made for (one, or a list sent as repeated ?repo=), so the answer says what it is sized at.
+  sizes: (repo?: string | readonly string[] | null): Promise<BoxSizeOptions> => {
+    const repos = repo == null ? [] : typeof repo === 'string' ? [repo] : [...repo];
+    const query = repos.length ? `?${repos.map(r => `repo=${encodeURIComponent(r)}`).join('&')}` : '';
+    return api.get(`/api/instances/sizes${query}`).then(r => r.data);
+  },
   terminate: (id: string, confirmed = false) =>
     api.delete(`/api/instances/${id}`, { data: { confirmed } }).then(r => r.data),
   // 202 with the transitional status; poll list() until stopped / ready.
@@ -285,12 +324,22 @@ export const instancesApi = {
     api.post(`/api/instances/${id}/hibernate`).then(r => r.data),
   rename: (id: string, name: string): Promise<{ instance: Instance }> =>
     api.post(`/api/instances/${id}/rename`, { name }).then(r => r.data),
+  // Resize (backend services/boxResize.ts): what the Size… dialogs show, and
+  // the request, 202 with the resize as it starts. A busy box answers 409
+  // box_busy with its blockers; `force` confirms stopping them.
+  resizeInfo: (id: string): Promise<BoxResizeInfo> =>
+    api.get(`/api/instances/${id}/resize`).then(r => r.data),
+  resize: (id: string, size: BoxSize, force = false): Promise<{ resize: ResizeView }> =>
+    api.post(`/api/instances/${id}/resize`, force ? { size, force } : { size }).then(r => r.data),
   // A missing key leaves that setting alone; null turns it off.
   setLifecycle: (
     id: string,
     settings: { idleHibernateHours?: number | null; hibernatedTerminateDays?: number | null },
   ): Promise<{ lifecycle: BoxLifecycle }> =>
     api.patch(`/api/instances/${id}/lifecycle`, settings).then(r => r.data),
+  // The owner is using it: restart the idle clock, so auto-park waits a full limit again.
+  keepRunning: (id: string): Promise<{ lifecycle: BoxLifecycle }> =>
+    api.post(`/api/instances/${id}/keep-running`).then(r => r.data),
   autoTerminated: (): Promise<AutoTerminatedBox[]> =>
     api.get('/api/instances/auto-terminated').then(r => r.data),
   claimTiming: (id: string, ms: number, pickMs?: number | null): Promise<{ ok: true }> =>
@@ -445,13 +494,19 @@ export const claudeSessionsApi = {
 };
 
 export interface WarmPoolStatus {
+  /** What the pool holds in all: the per-size sum, or box-warm-pool-size for the single-size pool. */
   target: number;
+  /** By size; size null is the configured type (sizes off). */
+  targets: Array<{ size: 'small' | 'medium' | 'large' | null; target: number }>;
   warm: number;
   warming: number;
   staleWarm: number;
   failedLastHour: number;
   breakerOpen: boolean;
+  /** The first of specHashes, kept for older readers. */
   specHash: string | null;
+  /** The current spec hash of each size the pool holds (docs/box-provisioning.md, "Warm pool sizes"). */
+  specHashes: string[];
 }
 
 export const warmPoolApi = {
@@ -637,10 +692,12 @@ export interface WorktimeDay {
 
 export interface WorktimeResponse {
   days: Record<string, Record<string, WorktimeDay>>;
+  /** The reader's today, in the zone termag banks their working time by (the one `tz` sends). */
+  today?: string;
 }
 
 // Per-project rows behind /api/worktime. `projectId` is null when the banked
-// name no longer resolves to a project (renamed/archived). Dates server-local.
+// name no longer resolves to a project (renamed/archived). Days are the person's own.
 export interface WorktimeProjectRow {
   projectId: string | null;
   projectName: string;
@@ -653,14 +710,20 @@ export interface WorktimeProjectRow {
 
 export interface WorktimeProjectsResponse {
   days: number;
+  today?: string;
   rows: WorktimeProjectRow[];
+}
+
+/** This browser's IANA zone, which termag banks working time by; undefined when it can't say. */
+function viewerTimeZone(): string | undefined {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined; } catch { return undefined; }
 }
 
 export const worktimeApi = {
   get: (days = 30): Promise<WorktimeResponse> =>
-    api.get('/api/worktime', { params: { days } }).then(r => r.data),
+    api.get('/api/worktime', { params: { days, tz: viewerTimeZone() } }).then(r => r.data),
   byProject: (days = 30): Promise<WorktimeProjectsResponse> =>
-    api.get('/api/worktime/projects', { params: { days } }).then(r => r.data),
+    api.get('/api/worktime/projects', { params: { days, tz: viewerTimeZone() } }).then(r => r.data),
 };
 
 // One row per reachable tmux session (own + shared projects × live workstreams
@@ -708,6 +771,8 @@ export interface ChatHistory {
   sessionId: string | null;
   /** A turn is running on the box now; its events arrive on the status socket. */
   running: boolean;
+  /** The box's answer for each run of tool calls' heading, by run key: Haiku's heading, or that it failed after `calls` calls (agent/tool-group-headings.js); absent from an older box. */
+  headings?: Record<string, { heading: string } | { failed: true; calls?: number }>;
   queued: number;
   /** A message sent while a turn runs goes into that turn (agent chat-live-v1); else it waits for the turn to end. */
   liveInput?: boolean;
@@ -715,18 +780,30 @@ export interface ChatHistory {
   sendsLive?: boolean;
   /** The box's agent can stop only a live turn's current work (chat-interrupt-v1). */
   stopsTurn?: boolean;
+  /** The context popover's Clear, Compact and Resume are offered: `update` on a box whose runner predates chat-context-v1. Absent, they are not. */
+  contextActions?: 'ready' | 'update';
+  /** What this chat can never do, and why (another engine, or another backend for Compact). */
+  contextRefusals?: Partial<Record<'clear' | 'compact' | 'resume', string>>;
   /** This viewer's composer offers images (their chat-image-input-enabled, an agent with chat-images-v1). */
   imageInput?: boolean;
+  /** It offers PDFs as well (an agent with chat-pdfs-v1). */
+  pdfInput?: boolean;
+  /** Whether the model menu offers an effort for this chat (backend services/chatEffort.ts). */
+  effortInput?: boolean;
   /** The box holds queued messages from before its agent restarted, waiting for this (live) chat to resume them. */
   parked?: boolean;
   /** A repo chat's checkout is there; its first turn waits for it (a pane clone finishes after setup). */
   checkoutReady: boolean;
   /** The runner's record of each turn (cost, duration), oldest first; absent from an older agent. */
-  turns?: Array<{ turnId: string; prompt: string; userUuid?: string | null; costUsd: number | null; durationMs: number | null; at?: string | null; isError?: boolean }>;
+  turns?: Array<{ turnId: string; prompt: string; userUuid?: string | null; costUsd: number | null; durationMs: number | null; at?: string | null; isError?: boolean; sessionId?: string | null; sessionCostUsd?: number | null }>;
   /** Whether this chat's Claude may run tools without asking, as the backend decided it. */
   trust?: ChatTrust;
   /** The caller owns the project and may trust its repository. */
   canTrust?: boolean;
+  /** Read from the orchestrator's stored transcript because the box did not answer. */
+  stored?: boolean;
+  /** A chat coming back on its box, or one this viewer can't continue. */
+  continuation?: ChatContinuation;
   /** The model the chat's next turn runs on unless a message picks another (backend services/claudeChatModel.ts). */
   model?: string;
   /** Set when that model is another backend's. */
@@ -734,7 +811,11 @@ export interface ChatHistory {
   /** Claude's transcript entries ({type, message}), oldest first (chat/sdkChat.ts fromHistory). */
   entries: unknown[];
   /** The turn still running, replayed from its own log (a durable runner); its prompt is cut from `entries`. */
-  turn?: { turnId: string; events: Array<{ seq: number; event: unknown }> } | null;
+  turn?: {
+    turnId: string; events: Array<{ seq: number; event: unknown }>;
+    /** When `events` are only the newest lines: the turn-start and the background tasks as of the cut (agent chat-runner.js eventsFromLog). */
+    head?: unknown[];
+  } | null;
   /** A live Claude in the full UI's terminal has this session. Absent on an older backend. */
   terminalHolds?: boolean;
 }
@@ -743,6 +824,17 @@ export interface ChatTrust {
   trusted: boolean;
   reason: 'trusted' | null;
   mode: string;
+}
+
+/** A chat coming back on its box: its owner's send started a new box, or the stopped one. */
+export interface ChatContinuation {
+  phase?: 'starting-box' | 'restoring' | 'starting';
+  /** A stored chat's send is taken (held while its box comes back), so a message queued before the history came goes out. */
+  takesSends?: boolean;
+  /** Messages waiting for the chat to take them, oldest first; one the chat refused keeps its error. */
+  held?: Array<{ id: string; text: string; error: string | null }>;
+  /** Why this viewer can't send here: only the owner continues a chat whose box is gone or down. */
+  sendRefusal?: { code: string; reason: string };
 }
 
 export interface ArchivedChat {
@@ -755,6 +847,8 @@ export interface ArchivedChat {
   box: { id: string; name: string; kind: string; status: Instance['status']; hibernationConfigured: boolean } | null;
   /** Other projects on this chat's box, archived ones included. Zero means delete terminates the box. */
   otherProjects: number;
+  /** The box is gone and the orchestrator holds this chat's transcript, so Reopen opens that. */
+  storedHistory?: boolean;
 }
 
 /** The simple UI's chat lifecycle (backend routes/chats.ts): archive stops the box when it can. Delete terminates the box only when this chat is the last project on it. */
@@ -762,7 +856,7 @@ export const chatsApi = {
   archived: (): Promise<ArchivedChat[]> => api.get('/api/chats/archived').then(r => r.data),
   archive: (id: string): Promise<{ archived: true; box: { action: string | null; status?: string | null; reason?: string; error?: string } }> =>
     api.post(`/api/chats/${encodeURIComponent(id)}/archive`).then(r => r.data),
-  reopen: (id: string): Promise<{ reopened: boolean; pending?: boolean; box: ArchivedChat['box'] }> =>
+  reopen: (id: string): Promise<{ reopened: boolean; pending?: boolean; stored?: boolean; box: ArchivedChat['box'] }> =>
     api.post(`/api/chats/${encodeURIComponent(id)}/reopen`).then(r => r.data),
   remove: (id: string): Promise<{ deleted: true }> =>
     api.delete(`/api/chats/${encodeURIComponent(id)}`, { data: { confirmed: true } }).then(r => r.data),
@@ -775,15 +869,31 @@ export const chatApi = {
     api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/trust`, { trust: true }).then(r => r.data),
   history: (projectId: string, workstream: string): Promise<ChatHistory> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/chat`, { params: { workstream } }).then(r => r.data),
+  /** The asks this chat sent, and any of the caller's the chat's `termag ask` calls named. */
+  asks: (projectId: string, workstream: string, threads: readonly string[]): Promise<{ threads: ChatAskThread[] }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/asks`, { params: { workstream, ...(threads.length ? { threads: threads.join(',') } : {}) } }).then(r => r.data),
+  /** A subagent's own transcript from the chat's box: its messages as history entries. */
+  subagent: (projectId: string, workstream: string, agentId: string): Promise<{ agentId: string; entries: unknown[]; meta?: { agentType?: string; description?: string; finished?: boolean } }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/subagents/${encodeURIComponent(agentId)}`, { params: { workstream } }).then(r => r.data),
   /**
-   * `images`: base64 PNG/JPEG/GIF/WebP (chat/chatImageData.ts), only when the history said imageInput.
+   * `images`: base64 PNG/JPEG/GIF/WebP (chat/chatImageData.ts), only when the history said imageInput; PDFs too when it said pdfInput.
    * `model`: the chat switches to it from this message's turn on; omitted, the turn keeps the chat's model.
+   * `effort`: this turn's --effort (only when the history said effortInput); omitted, Claude Code's default.
+   * The chat's memory is its own space's, which the server keeps (backend services/chatSpace.ts): a send names none.
    */
-  send: (projectId: string, workstream: string, text: string, images: Array<{ mediaType: string; data: string }> = [], model?: ChatModelId | null): Promise<{ queued: boolean; turnId?: string; position?: number }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}) }).then(r => r.data),
+  send: (projectId: string, workstream: string, text: string, images: Array<{ mediaType: string; data: string; name?: string }> = [], model?: ChatModelId | null, effort?: ChatEffortWire | null): Promise<{ queued: boolean; turnId?: string; position?: number; held?: boolean; phase?: ChatContinuation['phase'] }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}), ...(effort ? { effort } : {}) }).then(r => r.data),
   /** `turn` stops only a live turn's current work; `all` (the default) stops the turn and its background tasks. */
   interrupt: (projectId: string, workstream: string, scope: 'turn' | 'all' = 'all'): Promise<{ interrupted: boolean; scope?: 'turn' | 'all'; dropped?: string[] }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/interrupt`, { workstream, scope }).then(r => r.data),
+  /**
+   * The context popover's actions. clear: the next message starts a new Claude session (`at` is the
+   * context-cleared event's). resume: the cleared session comes back. compact: a /compact turn starts.
+   */
+  context: (projectId: string, workstream: string, action: 'clear' | 'compact' | 'resume'): Promise<{
+    reset?: boolean; at?: string; resumed?: boolean; resumedAt?: string; sessionId?: string; compacting?: boolean; turnId?: string;
+  }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/context`, { workstream, action }).then(r => r.data),
   /** Open in full UI: continue the session in the agent pane (`claude --resume <id>`). */
   openInTerminal: (projectId: string, workstream: string): Promise<{ resumed: boolean; reason?: string; sessionId?: string }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/terminal`, { workstream }).then(r => r.data),
@@ -791,8 +901,8 @@ export const chatApi = {
    * The full UI's Claude has this session. Exit it when it is really there, or
    * clear a stale hold, then send `text` (and images) if there is anything to send.
    */
-  reclaim: (projectId: string, workstream: string, text = '', images: Array<{ mediaType: string; data: string }> = [], model?: ChatModelId | null): Promise<{ reclaimed: boolean; sent?: boolean; queued?: boolean; turnId?: string }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/reclaim`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}) }).then(r => r.data),
+  reclaim: (projectId: string, workstream: string, text = '', images: Array<{ mediaType: string; data: string; name?: string }> = [], model?: ChatModelId | null, effort?: ChatEffortWire | null): Promise<{ reclaimed: boolean; sent?: boolean; queued?: boolean; turnId?: string }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/reclaim`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}), ...(effort ? { effort } : {}) }).then(r => r.data),
 };
 
 export interface ClaudeLoginView {
@@ -807,8 +917,9 @@ export interface ClaudeLoginView {
 export const claudeLoginApi = {
   status: (projectId: string): Promise<ClaudeLoginView> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/claude-login`).then(r => r.data),
-  start: (projectId: string): Promise<ClaudeLoginView> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/claude-login`).then(r => r.data),
+  /** `reauth`: a turn failed on this seat's sign-in, so sign in again even if Claude still reads as signed in. */
+  start: (projectId: string, opts?: { reauth?: boolean }): Promise<ClaudeLoginView> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/claude-login`, opts?.reauth ? { reauth: true } : undefined).then(r => r.data),
   submit: (projectId: string, code: string): Promise<ClaudeLoginView> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/claude-login/code`, { code }).then(r => r.data),
   cancel: (projectId: string): Promise<ClaudeLoginView> =>
@@ -849,6 +960,18 @@ export const sessionsApi = {
     api.get(`/api/projects/${encodeURIComponent(projectId)}/sessions/${role}/capture`, {
       params: { workstream: params.workstream, lines: params.lines, styled: params.styled ? '1' : undefined },
     }).then(r => r.data),
+  /**
+   * The pane output log's tail (routes/paneHistory.ts), for "Load earlier":
+   * an agent pane's TUI runs on tmux's alternate screen, which keeps no
+   * scrollback, so this — not a deeper capture — is how the phone reaches
+   * the pane's past. `before` pages backward (the previous response's
+   * startByte); the server answers 404 when the box records none yet, 501
+   * when its agent predates the RPC. Read on demand, never polled.
+   */
+  history: (projectId: string, role: 'agent' | 'ctrl' | 'review', params: { workstream?: string; before?: number; maxBytes?: number }): Promise<{ session: string; content: string; startByte: number; endByte: number; totalBytes: number }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/sessions/${role}/history`, {
+      params: { workstream: params.workstream, before: params.before, maxBytes: params.maxBytes },
+    }).then(r => r.data),
 };
 
 // Agent handoff: the agent writes a handoff, its
@@ -864,6 +987,14 @@ export const handoffApi = {
 
 // The Review button: Devin reviewing a PR in the project's `review` tmux
 // session (backend/src/routes/review.ts).
+export interface ReviewPromptTemplate {
+  repo: string;
+  template: string;
+  source: 'repo' | 'home' | 'builtin';
+  label: string | null;
+  warnings: string[];
+}
+
 export interface ReviewGuessResponse {
   guess: import('../utils/review').PrGuess | null;
   branch: string | null;
@@ -872,6 +1003,8 @@ export interface ReviewGuessResponse {
   repo?: string | null;
   /** True when `repo` is definite: a null repo then means no GitHub remote, and a bare PR number is refused. */
   repoKnown?: boolean;
+  /** A multi-repo workstream's repositories (owner/name, by position); absent for one repository. */
+  repos?: string[];
   /** The prompt body the dialog shows before Start (older backends omit it). */
   promptTemplate?: string;
   promptSource?: 'repo' | 'home' | 'builtin';
@@ -879,6 +1012,11 @@ export interface ReviewGuessResponse {
   promptSourceLabel?: string | null;
   /** Template files that were there but unusable, one line each. */
   promptWarnings?: string[];
+  /**
+   * A multi-repo workstream's template in each repository's worktree; the
+   * top-level one is the workstream folder's, for a PR of none of them.
+   */
+  promptTemplates?: ReviewPromptTemplate[];
   /** The fixed last line (attribution for anything the reviewer posts); shown, not editable. */
   promptFooter?: string;
   /** The review tools on offer (older backends omit it: Devin only). `footer` is that tool's attribution line. */
@@ -893,14 +1031,18 @@ export const reviewApi = {
   // (written by the review sweep.md); nothing polls GET /review
   // any more. The route stays for on-demand probes and external callers.
   /** `group`: Review all with Devin, one session over a review group's members in order; `pr` is the first. */
-  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string; group?: { name: string; members: PrGroupMemberInput[] } }): Promise<{ ok: true; session: string; pr: number; url: string | null; reviewer?: string; startedAt: string }> =>
+  // `slot` / `replaced`: which of the workstream's review panes, and whether
+  // it replaced a review there; absent from an older backend (slot 1). A 409 `reviews_full`: all panes in use.
+  // `slot` in the body: that pane, replacing whatever runs there (the phone, which shows one, sends 1).
+  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string; group?: { name: string; members: PrGroupMemberInput[] }; slot?: number }): Promise<{ ok: true; session: string; slot?: number; replaced?: boolean; pr: number; url: string | null; reviewer?: string; startedAt: string }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/review`, body).then(r => r.data),
-  stop: (projectId: string, workstream: string): Promise<{ ok: true }> =>
-    api.delete(`/api/projects/${encodeURIComponent(projectId)}/review`, { params: { workstream } }).then(r => r.data),
-  // Called when the review terminal takes focus while the review is ready:
+  /** `session`: which review pane; absent is the first. */
+  stop: (projectId: string, workstream: string, session?: string): Promise<{ ok: true }> =>
+    api.delete(`/api/projects/${encodeURIComponent(projectId)}/review`, { params: { workstream, ...(session ? { session } : {}) } }).then(r => r.data),
+  // Called when a review terminal takes focus while its review is ready:
   // clears the sidebar's ring.
-  seen: (projectId: string, workstream: string): Promise<{ ok: true }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/review/seen`, { workstream }).then(r => r.data),
+  seen: (projectId: string, workstream: string, session?: string): Promise<{ ok: true }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/review/seen`, { workstream, ...(session ? { session } : {}) }).then(r => r.data),
 };
 
 export const statusApi = {
@@ -929,7 +1071,7 @@ export const sharingApi = {
 /** A preview share as its owner sees it. */
 export interface PreviewShareView {
   id: string;
-  /** user: one named person; link: a PR's link, for anyone signed in who opens it (phase 2). Absent from older backends: user. */
+  /** user: one named person; link: a link for anyone signed in who opens it, a PR's (phase 2) or an open link (no `pr`). Absent from older backends: user. */
   audience?: 'user' | 'link';
   workstream: string;
   grantee: { id: string; email: string; name: string } | null;
@@ -942,8 +1084,12 @@ export interface PreviewShareView {
   createdAt: string;
   liveViewers: number;
   blockedOrigins: string[];
+  /** A reviewer's last dev-stack refusal since anyone last got in: what they were told, and the checkout whose stack was in the way. Absent from older backends. */
+  lastRefusal?: { at: string; message: string; holder: string | null } | null;
   /** A link share's PR. */
   pr?: PreviewSharePr | null;
+  /** A link share from the PR's own checkout when that isn't the workstream's (4d), e.g. `~/src/webapp`. */
+  checkoutDir?: string | null;
   /** A link share's link, `/p/<token>`: its owner may copy it again. */
   linkPath?: string;
   /** Who opened a link share, most recent first. */
@@ -951,6 +1097,12 @@ export interface PreviewShareView {
 }
 
 export interface PreviewSharePr { repo: string; number: number; url: string; headOid?: string | null }
+
+/** GET …/preview-share-stack: whether a reviewer of a workstream's dev stack would get in now, and whose stack is in the way. */
+export type PreviewStackCheck =
+  | { checked: false }
+  | { checked: true; ok: true }
+  | { checked: true; ok: false; reason: string; message: string; holder: { dir: string; workstream: string | null } | null };
 
 export interface PreviewShareViewer {
   userId: string;
@@ -980,6 +1132,8 @@ export interface LinkShareMade {
   expiresAt: string;
   existing: boolean;
   pr: PreviewSharePr;
+  /** The PR's checkout on the box when it isn't the workstream's own (4d). */
+  checkoutDir?: string | null;
   comment: { state: 'posted'; url: string | null } | { state: 'kept' } | { state: 'posting' } | { state: 'failed'; error: string };
 }
 
@@ -1009,7 +1163,7 @@ export interface SharedWithMe {
   project: { name: string };
   workstream: string;
   expiresAt: string;
-  /** A PR's link share they opened. */
+  /** A PR's link share they opened; null for an open link or a share by name. */
   pr?: { repo: string; number: number } | null;
 }
 
@@ -1023,7 +1177,8 @@ export const usersApi = {
 };
 
 export const previewSharesApi = {
-  create: (projectId: string, body: { email: string; workstream: string; ttlHours?: number; recipe?: PreviewShareView['recipe'] }): Promise<{ id: string; expiresAt: string; link: string; ttlHours: number; renewed?: boolean }> =>
+  /** With `email`, for that person; with `audience: 'link'`, an open link anyone signed in can open (its `linkPath` is its token). */
+  create: (projectId: string, body: ({ email: string } | { audience: 'link' }) & { workstream: string; ttlHours?: number; recipe?: PreviewShareView['recipe'] }): Promise<{ id: string; expiresAt: string; link: string; linkPath?: string; ttlHours: number; renewed?: boolean }> =>
     api.post(`/api/projects/${projectId}/preview-shares`, body).then(r => r.data),
   list: (projectId: string): Promise<PreviewShareView[]> =>
     api.get(`/api/projects/${projectId}/preview-shares`).then(r => r.data.shares),
@@ -1038,6 +1193,9 @@ export const previewSharesApi = {
     api.get(`/api/projects/${projectId}/preview-share-settings`).then(r => r.data),
   saveSettings: (projectId: string, body: Partial<Omit<PreviewSettingsView, 'pathFilter'>> & { pathFilter?: string[] | string }): Promise<PreviewSettingsView> =>
     api.put(`/api/projects/${projectId}/preview-share-settings`, body).then(r => r.data),
+  /** Before sharing a workstream's dev stack: whether a reviewer would get in now (the box's own check). */
+  stackCheck: (projectId: string, workstream: string): Promise<PreviewStackCheck> =>
+    api.get(`/api/projects/${projectId}/preview-share-stack`, { params: { workstream } }).then(r => r.data),
   revokeViewer: (projectId: string, shareId: string, userId: string) =>
     api.delete(`/api/projects/${projectId}/preview-shares/${shareId}/viewers/${userId}`).then(r => r.data),
   sharedWithMe: (): Promise<SharedWithMe[]> =>
@@ -1112,7 +1270,10 @@ export interface McpConnector {
   linkError?: string | null;
   oauth?: { issuer: string; scopes: string[] } | null;
 }
-export interface McpConnectorList { available: boolean; storeAvailable: boolean; connectors: McpConnector[] }
+// A server the orchestrator offers every user (the mcp-default-connectors flag) that this
+// user hasn't connected yet. Settings lists it under "Available to connect".
+export interface McpCatalogServer { name: string; upstream: string }
+export interface McpConnectorList { available: boolean; storeAvailable: boolean; connectors: McpConnector[]; catalog?: McpCatalogServer[] }
 export interface McpConnectorInput {
   name?: string;
   upstream?: string;
@@ -1129,6 +1290,10 @@ export const mcpConnectorsApi = {
   // The server's sign-in page; the browser goes there and comes back to /settings/mcp.
   startOAuth: (id: string): Promise<string> =>
     api.post(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth/start`).then(r => r.data.authorizeUrl as string),
+  // Connects a catalog server: creates the user's OAuth connector for it and
+  // returns the server's sign-in URL.
+  connectCatalog: (name: string): Promise<string> =>
+    api.post(`/api/mcp-connectors/catalog/${encodeURIComponent(name)}/connect`).then(r => r.data.authorizeUrl as string),
   unlinkOAuth: (id: string): Promise<McpConnector> =>
     api.delete(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth`).then(r => r.data),
 };
@@ -1175,7 +1340,7 @@ export interface PrRow {
 }
 export interface PrLane { id: PrLaneId; label: string; rows: PrRow[] }
 export interface PrCheckout { projectId: string; workstream: string; repo: string }
-export interface PrEarlier { repo: string; number: number; workstream: PrWorkstreamLink; at: string | null }
+export interface PrEarlier { repo: string; number: number; workstream: PrWorkstreamLink; at: string | null; source?: 'created' | 'branch' | 'manual' }
 /** A review group's member (backend services/prReviewGroups.ts GroupMember). */
 export interface PrGroupMember {
   repo: string;
@@ -1189,6 +1354,8 @@ export interface PrGroupMember {
   /** The viewer's latest submitted review: APPROVED, CHANGES_REQUESTED or COMMENTED. */
   yourReview: string | null;
   askedYou: boolean;
+  /** Who has reviewed it, the author left out, bots apart; null unless open and read from GitHub, absent from an older backend. */
+  reviewers?: PrReviewers | null;
   checked: boolean;
   /** Its lane row when a lane lists it (inLane), else one built for the card; null when unread. */
   row: PrRow | null;
@@ -1196,6 +1363,8 @@ export interface PrGroupMember {
   /** Where a review of it could run, whatever its lane (merged and yours too); absent from an older backend. */
   pane?: PrWorkstreamLink | null;
 }
+/** Who has reviewed a PR by login: latest approval or request for changes per person, who only commented, and apart from them the bots whose latest review approved or asked for changes. */
+export interface PrReviewers { approved: string[]; changes: string[]; commented: string[]; botsApproved: string[]; botsChanges: string[] }
 /** A named, ordered list of PRs the user reviews together. */
 export interface PrReviewGroup {
   id: string;
@@ -1257,6 +1426,24 @@ export interface PrDeployPipeline {
   workflowUrl: string;
 }
 export interface PrFile { path: string; additions: number; deletions: number; changeType: string }
+/** One file a checkout has changed (agent git-changes.js): git's status letter, `?` untracked; null counts for a binary. */
+export interface ChangedFile { path: string; from?: string; status: string; additions: number | null; deletions: number | null }
+/** A session's in-flight changes (backend routes/workstreamChanges.ts). */
+export type InflightChanges =
+  | {
+    available: true;
+    branch: string | null;
+    upstream: string | null;
+    against: string | null;
+    commits: number;
+    committed: ChangedFile[];
+    uncommitted: ChangedFile[];
+    truncated: boolean;
+    /** The committed files couldn't be read: `committed` is empty though `commits` may not be. */
+    partial: boolean;
+    worktree: string | null;
+  }
+  | { available: false; reason: 'offline' | 'outdated-agent' | 'unreadable' };
 export interface PrReviewSummary { author: string | null; state: string; submittedAt: string | null }
 /** One PR up close (backend services/prReview.ts), for a row's overview. */
 export interface PrOverview {
@@ -1314,6 +1501,25 @@ const prPath = (repo: string, number: number) => {
   const [owner, name] = repo.split('/');
   return `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${number}`;
 };
+/** A PR's file and its patch (backend services/prFiles.ts). */
+export interface PrFilePatch {
+  path: string;
+  previousPath: string | null;
+  status: 'added' | 'removed' | 'modified' | 'renamed' | 'copied' | 'changed' | 'unchanged';
+  additions: number;
+  deletions: number;
+  patch: string | null;
+  /** GitHub gave a patch that termag left out, past its total cap. */
+  capped?: boolean;
+}
+export interface PrFiles { files: PrFilePatch[]; truncated: boolean }
+export interface PrThreadComment { id: string; author: string | null; bot: boolean; body: string; createdAt: string | null; url: string | null }
+export interface PrThread {
+  id: string; path: string; line: number | null; side: 'LEFT' | 'RIGHT'; resolved: boolean; outdated: boolean; comments: PrThreadComment[];
+  /** How many comments GitHub has: more than `comments` on a very long thread (absent from an older backend). */
+  total?: number;
+}
+
 export const prsApi = {
   // `poll=1`: the pipeline poll, left out of network recording
   // (observability.ts NETWORK_URL_BLOCKLIST); /api/prs/... actions stay recorded.
@@ -1345,9 +1551,13 @@ export const prsApi = {
   /** Drops a PR's stored workstream link. */
   unlink: (repo: string, number: number): Promise<void> => api.delete('/api/prs/links', { params: { repo, number } }).then(() => undefined),
   overview: (repo: string, number: number): Promise<PrOverview> => api.get(prPath(repo, number)).then(r => r.data),
+  /** The diff, a patch per file (Files changed). */
+  files: (repo: string, number: number): Promise<PrFiles> => api.get(`${prPath(repo, number)}/files`).then(r => r.data),
+  /** Every review thread on the PR, with its line. */
+  threads: (repo: string, number: number): Promise<PrThread[]> => api.get(`${prPath(repo, number)}/threads`).then(r => r.data.threads),
   /** Submits the user's own review on GitHub, with their stored token. */
-  review: (repo: string, number: number, event: PrReviewEvent, body: string): Promise<{ id: number | null; state: string | null; url: string | null }> =>
-    api.post(`${prPath(repo, number)}/review`, { event, body }).then(r => r.data),
+  review: (repo: string, number: number, event: PrReviewEvent, body: string, extra?: { comments?: Array<{ path: string; line: number; side?: 'RIGHT' | 'LEFT'; body: string }>; commitId?: string; title?: string; author?: string | null }): Promise<{ id: number | null; state: string | null; url: string | null }> =>
+    api.post(`${prPath(repo, number)}/review`, { event, body, ...(extra?.comments?.length ? { comments: extra.comments } : {}), ...(extra?.commitId ? { commitId: extra.commitId, title: extra.title, author: extra.author } : {}) }).then(r => r.data),
   /** Merges now (pinned to the head commit shown), or turns auto-merge on or off, as the user. */
   merge: (repo: string, number: number, req: PrMergeRequest): Promise<PrMergeResult> =>
     api.post(`${prPath(repo, number)}/merge`, req).then(r => r.data),
@@ -1481,7 +1691,11 @@ export interface AutomationRunView {
   retiredAt: string | null;
   createdAt: string;
   durationSec: number | null;
+  /** Why the run's space step was skipped or failed (a refusal code or transfer error); null = synced or no space. Absent before the space-folder backend. */
+  spaceSyncError?: string | null;
 }
+/** An automation's stored effort; null (or absent) = the provider's default. */
+export type AutomationEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface AutomationView {
   id: string;
   projectId: string;
@@ -1500,8 +1714,22 @@ export interface AutomationView {
   keepRuns: number;
   spaceName: string | null;
   notifySlack: boolean;
+  // The fields below come with the provider and space-folder backends
+  //  and are absent on a server without them: read
+  // absent as Claude, its default model and effort, and the default folder.
+  /** The user-facing provider id (frontend providers/registry.ts), e.g. 'claude'. */
+  provider?: string;
+  /** The chat provider the runs' agent row runs as, e.g. 'claude-chat'. */
+  chatProvider?: string;
+  model?: string | null;
+  backend?: string | null;
+  effort?: AutomationEffort | null;
+  /** The folder of spaceName the automation lives in, fixed by the server (`.termag/automations/<id>`), no leading or trailing slash. */
+  spaceFolder?: string | null;
   pausedReason: string | null;
   consecutiveFailures: number;
+  /** Wakes of its box EC2 refused in a row, since when and the last error; null while its starts take (absent from older servers). */
+  boxStartFailures?: { count: number; since: string | null; lastError: string | null } | null;
   nextRunAt: string | null;
   next: string[];
   lastRun: AutomationRunView | null;
@@ -1513,12 +1741,44 @@ export interface AutomationView {
 export interface AutomationSettings {
   schedule?: string; timezone?: string; prompt?: string; tier?: 'full' | 'read'; enabled?: boolean; prOnChange?: boolean;
   wakeBox?: boolean; notifySlack?: boolean; maxRunMinutes?: number; keepRuns?: number; spaceName?: string | null;
+  // Sent only to a server that has them (automationsApi.options() is not null). No spaceFolder: the server fixes it.
+  provider?: string; model?: string | null; effort?: AutomationEffort | null;
+  /** With model: what the next run starts on (utils/automationModel.ts); null is Claude's default backend, whose model is a tier. */
+  backend?: 'fireworks' | null;
+}
+/** One provider an automation may run on, as GET /api/automations/options evaluates it for the viewer (and a box). */
+export interface AutomationProviderOption {
+  id: string;
+  label: string;
+  chatProvider: string;
+  models: { id: string; label: string }[];
+  efforts: AutomationEffort[];
+  tiers: ('full' | 'read')[];
+  available: boolean;
+  /** Why it is not available, when it is not. */
+  reason?: string;
+}
+export interface AutomationOptions {
+  providers: AutomationProviderOption[];
+  spaces: { name: string; role: string }[];
 }
 export interface SchedulePreview {
   normalised: string; timezone: string; next: string[]; minGapMinutes: number | null; tooFrequent: number | null; keepsBoxUpMinutesPerDay: number | null;
 }
 export const automationsApi = {
   list: (): Promise<AutomationView[]> => api.get('/api/automations').then(r => r.data),
+  /**
+   * The providers, models, efforts and spaces an automation may use. Null on
+   * a server without the endpoint (it answers 404 there, as an unknown
+   * automation id): the caller offers Claude only.
+   */
+  options: (instanceId?: string): Promise<AutomationOptions | null> =>
+    api.get('/api/automations/options', { params: instanceId ? { instanceId } : {} })
+      .then(r => r.data as AutomationOptions)
+      .catch(err => {
+        if ((err as { response?: { status?: number } })?.response?.status === 404) return null;
+        throw err;
+      }),
   get: (id: string): Promise<AutomationView & { runs: AutomationRunView[] }> => api.get(`/api/automations/${encodeURIComponent(id)}`).then(r => r.data),
   create: (data: AutomationSettings & { name: string; instanceId: string; repoUrl?: string | null; defaultBranch?: string | null; replaySessionId?: string | null; claudeModel?: 'opus' | 'sonnet' | 'haiku' | null; backend?: 'fireworks'; model?: string }):
     Promise<{ project: Project; automation: AutomationView; next: string[] }> => api.post('/api/automations', data).then(r => r.data),
@@ -1559,10 +1819,14 @@ export interface SpaceView {
   quotaBytes: number;
   role?: 'owner' | 'editor' | 'viewer';
   readOnly?: boolean;
+  /** People in the space, invites not counted; in the list (GET /api/spaces) only. */
+  memberCount?: number;
 }
 export interface SpaceTreeDir { name: string; path: string }
-export interface SpaceTreeFile { name: string; path: string; size: number; modifiedAt: string | null; etag?: string }
+export interface SpaceTreeFile { name: string; path: string; size: number; modifiedAt: string | null; etag?: string; shared?: boolean }
 export interface SpaceTree { prefix: string; dirs: SpaceTreeDir[]; files: SpaceTreeFile[]; nextCursor: string | null }
+/** What a write says it read: the version (`ifMatch`, an ETag), that the file is new, or nothing (it overwrites). */
+export type SpaceWriteCondition = { ifMatch: string } | { ifNoneMatch: '*' } | null;
 export interface SpaceMember { userId: string; email: string; displayName: string; role: 'owner' | 'editor' | 'viewer'; addedAt: string }
 export interface SpaceInvite { id: string; email: string; role: 'owner' | 'editor' | 'viewer'; addedAt: string }
 export interface SpaceBoxGrant {
@@ -1588,7 +1852,17 @@ export interface SpaceEvent {
 export interface SpaceSignedUrl { url: string; expiresAt: string; size: number; contentType: string | null }
 /** How the file view shows a file (backend spacePaths.viewResponseHeaders). */
 export type SpaceViewRender = 'frame' | 'markdown' | 'html' | 'svg';
-export interface SpaceViewUrl extends SpaceSignedUrl { view: { contentType: string; render: SpaceViewRender } | null }
+/** A file's sharing with anyone signed in to termag (backend services/spaces/sharedFiles.ts). */
+export type SpaceFileShare =
+  | { shared: false }
+  | { shared: true; sharedAt: string; sharedBy: { displayName: string; email: string } | null };
+export interface SpaceViewUrl extends SpaceSignedUrl {
+  view: { contentType: string; render: SpaceViewRender } | null;
+  /** `canShare`: the Share button may change it (an editor or owner in the browser). */
+  share?: SpaceFileShare & { canShare: boolean };
+}
+/** A file's current version (GET /:space/files/head). */
+export interface SpaceFileHead { path: string; size: number; modifiedAt: string | null; etag: string | null }
 export type SpaceUploadStart =
   | { kind: 'single'; path: string; method: 'PUT'; url: string; headers: Record<string, string>; expiresAt: string }
   | { kind: 'multipart'; path: string; uploadId: string; partBytes: number; partCount: number };
@@ -1602,8 +1876,11 @@ export const spacesApi = {
   update: (space: string, patch: { name?: string; description?: string | null }): Promise<{ space: SpaceView }> =>
     api.patch(sp(space), patch).then(r => r.data),
   remove: (space: string): Promise<{ ok: true }> => api.delete(sp(space)).then(r => r.data),
+  /** One space, as the caller may see it; 404 when they can't (and for no such space). */
+  get: (space: string): Promise<{ space: SpaceView }> => api.get(sp(space)).then(r => r.data),
 
-  members: (space: string): Promise<{ members: SpaceMember[]; invites: SpaceInvite[] }> =>
+  /** `sharing`: spaces-sharing-enabled for the caller, which POST /members checks. */
+  members: (space: string): Promise<{ sharing: boolean; members: SpaceMember[]; invites: SpaceInvite[] }> =>
     api.get(`${sp(space)}/members`).then(r => r.data),
   addMember: (space: string, email: string, role: string): Promise<{ member?: SpaceMember; invite?: SpaceInvite }> =>
     api.post(`${sp(space)}/members`, { email, role }).then(r => r.data),
@@ -1614,7 +1891,8 @@ export const spacesApi = {
   removeInvite: (space: string, inviteId: string): Promise<{ ok: true }> =>
     api.delete(`${sp(space)}/invites/${encodeURIComponent(inviteId)}`).then(r => r.data),
 
-  boxes: (space: string): Promise<{ boxes: SpaceBoxGrant[] }> => api.get(`${sp(space)}/boxes`).then(r => r.data),
+  /** `listed`: terminated boxes whose projects stay listed in the space. */
+  boxes: (space: string): Promise<{ boxes: SpaceBoxGrant[]; listed?: Array<{ id: string }> }> => api.get(`${sp(space)}/boxes`).then(r => r.data),
   addBox: (space: string, box: string): Promise<{ box: { id: string; name: string } }> =>
     api.post(`${sp(space)}/boxes`, { box }).then(r => r.data),
   removeBox: (space: string, instanceId: string): Promise<{ ok: true }> =>
@@ -1627,21 +1905,36 @@ export const spacesApi = {
   /** A 30-minute URL for the file viewer's iframe; `view` is null when the browser has no viewer for the type. */
   view: (space: string, path: string): Promise<SpaceViewUrl> =>
     api.post(`${sp(space)}/files/download`, { path, view: true }).then(r => r.data),
-  startUpload: (space: string, path: string, size: number, contentType: string): Promise<SpaceUploadStart> =>
-    api.post(`${sp(space)}/files/upload`, { path, size, contentType }).then(r => r.data),
-  uploaded: (space: string, path: string): Promise<{ ok: true; size: number }> =>
-    api.post(`${sp(space)}/files/uploaded`, { path }).then(r => r.data),
+  /** `condition`: the version this page shows (`ifMatch`), or that the file must be new; a newer one answers 412 `changed`. */
+  startUpload: (space: string, path: string, size: number, contentType: string, condition: SpaceWriteCondition = null): Promise<SpaceUploadStart> =>
+    api.post(`${sp(space)}/files/upload`, { path, size, contentType, ...(condition ?? {}) }).then(r => r.data),
+  /** `etag`: what the PUT answered, so the orchestrator finds this write among the versions when it checks `condition` again. */
+  uploaded: (space: string, path: string, condition: SpaceWriteCondition = null, etag: string | null = null): Promise<{ ok: true; size: number; etag?: string }> =>
+    api.post(`${sp(space)}/files/uploaded`, { path, ...(condition ?? {}), ...(etag ? { etag } : {}) }).then(r => r.data),
   partUrls: (space: string, uploadId: string, path: string, size: number, partNumbers: number[]): Promise<{ parts: Array<{ partNumber: number; url: string }> }> =>
     api.post(`${sp(space)}/uploads/${encodeURIComponent(uploadId)}/parts`, { path, size, partNumbers }).then(r => r.data),
-  completeUpload: (space: string, uploadId: string, path: string, parts: Array<{ partNumber: number; etag: string }>): Promise<{ ok: true; size: number }> =>
-    api.post(`${sp(space)}/uploads/${encodeURIComponent(uploadId)}/complete`, { path, parts }).then(r => r.data),
+  completeUpload: (space: string, uploadId: string, path: string, parts: Array<{ partNumber: number; etag: string }>, condition: SpaceWriteCondition = null): Promise<{ ok: true; size: number }> =>
+    api.post(`${sp(space)}/uploads/${encodeURIComponent(uploadId)}/complete`, { path, parts, ...(condition ?? {}) }).then(r => r.data),
   abortUpload: (space: string, uploadId: string, path: string): Promise<{ ok: true }> =>
     api.delete(`${sp(space)}/uploads/${encodeURIComponent(uploadId)}`, { params: { path } }).then(r => r.data),
   move: (space: string, from: string, to: string): Promise<{ ok: boolean; moved: number; failed: string[] }> =>
     api.post(`${sp(space)}/files/move`, { from, to }).then(r => r.data),
   removeFiles: (space: string, path: string, recursive = false): Promise<{ ok: boolean; deleted: number; failed: string[] }> =>
     api.delete(`${sp(space)}/files`, { params: { path, ...(recursive ? { recursive: '1' } : {}) } }).then(r => r.data),
+  /** The file's version; null (a 304) while it is still `etag`. A removed file rejects with 404 `file_not_found`. */
+  fileHead: (space: string, path: string, etag: string | null): Promise<SpaceFileHead | null> =>
+    api.get(`${sp(space)}/files/head`, {
+      params: { path }, headers: etag ? { 'If-None-Match': etag } : {}, validateStatus: s => s === 200 || s === 304,
+    }).then(r => (r.status === 304 ? null : r.data)),
 
   events: (space: string, limit = 100): Promise<{ events: SpaceEvent[] }> =>
     api.get(`${sp(space)}/events`, { params: { limit } }).then(r => r.data),
+
+  share: (space: string, path: string): Promise<SpaceFileShare> =>
+    api.put(`${sp(space)}/files/share`, { path }).then(r => r.data),
+  unshare: (space: string, path: string): Promise<SpaceFileShare> =>
+    api.delete(`${sp(space)}/files/share`, { params: { path } }).then(r => r.data),
+  /** A shared file's view for someone who isn't a member of its space; 404 when it isn't shared with them. */
+  sharedView: (space: string, path: string): Promise<SpaceViewUrl> =>
+    api.post('/api/shared-files/view', { space, path }).then(r => r.data),
 };

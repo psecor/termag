@@ -64,7 +64,7 @@ export function NotificationsSection() {
       </div>
       <div className="dash-card">
         <p className="settings-hint">
-          A browser notification when a chat in the simple UI answers and it is your turn again, never for the
+          A browser notification when a chat in termag answers and it is your turn again, never for the
           chat you are looking at. Turning it on asks this browser for permission; where termag can send web
           push, this device also hears about it while termag is closed.
         </p>

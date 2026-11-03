@@ -21,7 +21,8 @@ export function readModelPick(chatId: string): ChatModelId | null {
   } catch { return null; }
 }
 
-function writeModelPick(chatId: string, id: ChatModelId | null) {
+/** Also New session's, for a worktree chat: its first message runs on the model picked there. */
+export function writeModelPick(chatId: string, id: ChatModelId | null) {
   try {
     if (id) localStorage.setItem(key(chatId), id);
     else localStorage.removeItem(key(chatId));

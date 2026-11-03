@@ -3,7 +3,7 @@
 // is off, and a failed load reads as no spaces, so the simple UI behaves as
 // it does without spaces. ChatApp loads them once and shares them
 // (ChatSpacesProvider), so the sidebar and the chat header agree.
-import { createContext, createElement, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, createElement, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { FLAGS, useFlag } from '../flags';
 import { spacesApi, type SpaceView } from '../services/api';
 import { boxSpaceIndex } from './chatSpaces';
@@ -21,6 +21,8 @@ export interface ChatSpaces {
    * absence means "not known yet", not "in no space".
    */
   current: boolean;
+  /** Load again: someone was added to or removed from a space, or a box was. */
+  reload?: () => void;
 }
 
 interface Loaded { loaded: boolean; spaces: SpaceView[]; index: Map<string, string[]>; forKey: string | null }
@@ -31,6 +33,8 @@ const EMPTY: Loaded = { loaded: false, spaces: [], index: new Map(), forKey: nul
 export function useChatSpaces(opts: { withBoxes: boolean; reloadKey?: string }): ChatSpaces {
   const enabled = useFlag(FLAGS.spaces, false);
   const [state, setState] = useState(EMPTY);
+  const [generation, setGeneration] = useState(0);
+  const reload = useCallback(() => setGeneration(g => g + 1), []);
   const key = opts.reloadKey ?? '';
   useEffect(() => {
     if (!enabled) { setState(EMPTY); return; }
@@ -38,14 +42,16 @@ export function useChatSpaces(opts: { withBoxes: boolean; reloadKey?: string }):
     (async () => {
       const { spaces } = await spacesApi.list();
       const entries = opts.withBoxes
-        ? await Promise.all(spaces.map(async s => ({ space: s.name, boxes: (await spacesApi.boxes(s.name).catch(() => ({ boxes: [] }))).boxes })))
+        ? await Promise.all(spaces.map(async s => ({ space: s.name, ...await spacesApi.boxes(s.name).catch(() => ({ boxes: [] })) })))
         : [];
       if (!cancelled) setState({ loaded: true, spaces, index: boxSpaceIndex(entries), forKey: key });
-    })().catch(() => { if (!cancelled) setState({ ...EMPTY, loaded: true, forKey: key }); });
+    // A failed first load reads as no spaces, as the simple UI is without them; a failed
+    // reload (say after a change in the Share dialog) keeps what was loaded.
+    })().catch(() => { if (!cancelled) setState(s => (s.loaded && s.forKey !== null ? s : { ...EMPTY, loaded: true, forKey: key })); });
     return () => { cancelled = true; };
-  }, [enabled, opts.withBoxes, key]);
+  }, [enabled, opts.withBoxes, key, generation]);
   const { loaded, spaces, index, forKey } = state;
-  return { enabled, loaded, spaces, index, current: loaded && forKey === key };
+  return { enabled, loaded, spaces, index, current: loaded && forKey === key, reload };
 }
 
 /** What ChatApp shares: the spaces, and each one's colour among them (spaceColors.spacePalette). */

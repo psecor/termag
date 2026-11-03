@@ -12,7 +12,12 @@ export async function replaySessionId(): Promise<string | null> {
 
 // Product events and custom events go to whatever recorder a deployment adds;
 // termag ships none, so these are no-ops that keep their call sites.
-export type BrowserProductEvent = 'welcome.viewed' | 'sshkey.added' | 'first.prompt';
+export type BrowserProductEvent =
+  | 'welcome.viewed' | 'sshkey.added' | 'first.prompt'
+  // The redrawn first run's funnel, under onboarding-refresh-enabled.
+  | 'welcome.step' | 'welcome.github.connected' | 'welcome.dotfiles.saved' | 'welcome.mode.chosen' | 'welcome.finished'
+  // Which client and view, and the chat UI's commands (usageEvents.ts).
+  | 'client.opened' | 'ui.mode.switched' | 'app.install.prompted' | 'app.installed' | 'chat.command';
 export type ProductEventAttributes = Record<string, string | number | boolean>;
 
 export function recordProductEvent(_name: BrowserProductEvent, _attributes: ProductEventAttributes = {}): void {}

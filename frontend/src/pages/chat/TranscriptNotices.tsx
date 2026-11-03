@@ -4,6 +4,7 @@
 // that ended on an error (Retry sends its prompt again).
 import React from 'react';
 import { errorHint } from '../../chat/sdkChat';
+import { UserMessageText } from '../../chat/UserMessageText';
 
 export function UnsentMessages({ texts, onSend, onDiscard, disabled }: {
   texts: readonly string[];
@@ -15,7 +16,7 @@ export function UnsentMessages({ texts, onSend, onDiscard, disabled }: {
     <>
       {texts.map((text, i) => (
         <div key={`unsent:${i}:${text}`} className="sdk-user sdk-unsent" data-pending="">
-          <div className="sdk-user-bubble">{text}</div>
+          <div className="sdk-user-bubble"><UserMessageText text={text} /></div>
           <div className="sdk-user-note">Not sent: you stopped the turn before it went.</div>
           <div className="sdk-unsent-actions">
             <button type="button" className="btn-tiny sdk-unsent-send" disabled={disabled} onClick={() => onSend(i)}>Send</button>

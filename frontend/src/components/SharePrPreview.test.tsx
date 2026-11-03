@@ -57,7 +57,10 @@ describe('Share preview in the PR overlay', () => {
   it('is offered only on an open PR of the viewer\'s own with a workstream, with both flags on', () => {
     mount(row());
     expect(button('Share preview')).toBeDefined();
-    for (const r of [row({ lane: 'needs_my_review' }), row({ lane: 'merged' }), row({ workstream: null }), row({ kind: 'branch' }), row({ lane: 'checks', badges: ['draft'] })]) {
+    // A draft is offered: the server says whether its repository allows drafts.
+    mount(row({ lane: 'checks', badges: ['draft'] }));
+    expect(button('Share preview')).toBeDefined();
+    for (const r of [row({ lane: 'needs_my_review' }), row({ lane: 'merged' }), row({ workstream: null }), row({ kind: 'branch' })]) {
       mount(r);
       expect(button('Share preview'), r.lane).toBeUndefined();
     }
@@ -95,6 +98,29 @@ describe('Share preview in the PR overlay', () => {
     await act(async () => { button('Share preview')!.click(); });
     await flush();
     expect(el.textContent).toContain('Shared. Link copied. Your GitHub token can\'t comment.');
+  });
+
+  it('says which checkout a share comes from when it is not the workstream\'s own (4d)', async () => {
+    mocks.api.createLink.mockResolvedValue(made({ checkoutDir: '/home/olive/src/webapp' }));
+    mount(row({ workstream: { projectId: 'p1', projectName: 'Webapp', workstream: 'main' } }));
+    await act(async () => { button('Share preview')!.click(); });
+    await flush();
+    expect(el.textContent).toContain('Shared. Its link is posted on the PR and copied.');
+    expect(el.querySelector('[title="/home/olive/src/webapp"]')?.textContent).toBe('from ~/src/webapp');
+    // Copying again replaces the note, never the checkout.
+    await act(async () => { button('Copy link')!.click(); });
+    await flush();
+    expect(el.textContent).toContain('Link copied.');
+    expect(el.querySelector('[title="/home/olive/src/webapp"]')?.textContent).toBe('from ~/src/webapp');
+  });
+
+  it('shows the server\'s reason for a checkout it cannot find, naming where it looked', async () => {
+    const error = 'This box has no checkout of example-org/webapp on feat/x, so there is no preview to share. It looked in /home/olive/termag/projects/Webapp, /home/olive/src/webapp.';
+    mocks.api.createLink.mockRejectedValue({ response: { data: { error, code: 'no-checkout' } } });
+    mount(row());
+    await act(async () => { button('Share preview')!.click(); });
+    await flush();
+    expect(el.querySelector('[role=alert]')?.textContent).toBe(error);
   });
 
   it('shows the server\'s reason for a PR it will not share', async () => {

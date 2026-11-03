@@ -10,6 +10,8 @@ import { boxFeed } from '../services/boxFeed';
 import { blocksManagedBox, gateArmed } from '../boxGate';
 import { credentialsApi, CredentialsStatus } from '../services/api';
 import { recordProductEvent } from '../observability';
+import { FLAGS, useFlag } from '../flags';
+import WelcomeRefresh from './welcome/WelcomeRefresh';
 
 /**
  * First-run setup: /welcome. Offered when /auth/me says
@@ -34,7 +36,12 @@ function apiError(err: unknown, fallback: string): string {
   return typeof msg === 'string' ? msg : fallback;
 }
 
+/** /welcome: the redrawn setup under onboarding-refresh-enabled, else the one below. */
 export default function Welcome() {
+  return useFlag(FLAGS.onboardingRefresh, false) ? <WelcomeRefresh /> : <WelcomeClassic />;
+}
+
+function WelcomeClassic() {
   const { user, setOnboarded } = useAuth();
   const navigate = useNavigate();
   const [step, setStep] = useState(0);

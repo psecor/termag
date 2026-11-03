@@ -17,3 +17,11 @@ describe('statusFromPush', () => {
     expect(statusFromPush({ status: 'working', updatedAt: 'x' }).handoff).toBeNull();
   });
 });
+
+describe('statusFromPush: review panes (docs/parallel-reviews.md)', () => {
+  it('keeps the list of review panes, and an absent one is null', () => {
+    const reviews = [{ state: 'done', pr: 2, slot: 2, session: 's-review-2' }];
+    expect(statusFromPush({ type: 'status', session: 's', status: 'idle', updatedAt: 'x', reviews }).reviews).toEqual(reviews);
+    expect(statusFromPush({ type: 'status', session: 's', status: 'idle', updatedAt: 'x' }).reviews).toBeNull();
+  });
+});

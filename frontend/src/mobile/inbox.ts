@@ -2,14 +2,14 @@
 // workstream) with an agent workflow, in one list ordered by attention —
 // needs you, running, reviewing, the rest — under a strip of counts. Pure so
 // the ordering is unit-testable; the Inbox page feeds it ProjectContext state.
-import type { AgentStatus, AgentStatusValue, CloudSession, Project, SessionReview } from '../types';
+import type { AgentStatus, AgentStatusValue, CloudSession, Project, SessionReview, Workstream } from '../types';
 import { cloudDotStatus, cloudLiveStatus, isActiveCloudSession } from '../utils/cloudSessions';
 import type { RecentRow, SessionRow } from '../services/api';
 import { runningProviderForSource } from '../providers/registry';
 import { sessionName } from '../utils/sessionName';
 import { statusKey } from '../utils/statusKey';
 import { recentsBucket, RecentsBucket } from '../utils/recents';
-import { ringStateFor, RingState } from '../utils/reviewRing';
+import { aggregateReviewRing, reviewsOf, ringStateFor, RingState } from '../utils/reviewRing';
 
 /** Where a row sits in the home list, in list order. */
 export type HomeBand = 'attention' | 'running' | 'reviewing' | 'other';
@@ -21,8 +21,22 @@ export interface InboxRow {
   projectId: string;
   projectName: string;
   workstream: string;
+  /** The workstream's id; absent for a project with no workstreams yet (its implicit main). */
+  workstreamId?: string | null;
   /** Claude's own title for the session, from its workstream (simple-ui-session-titles-enabled); null before it has one. */
   sessionTitle?: string | null;
+  /** The chat's own space (Workstream.spaceId), by id; null for none. */
+  spaceId?: string | null;
+  /** The server fixed that space (chat/chatSpaces.ts chatHomeSpace); false only from an older backend. */
+  spaceFixed?: boolean;
+  /** An ask thread's chat: the thread's title (`termag ask --title`, else from its prompt), shown in place of `ask-<thread>`. */
+  askTitle?: string | null;
+  /** An ask thread's chat: the thread's id. */
+  askThreadId?: string | null;
+  /** An ask thread's chat: the session that sent it, which the sidebar nests it under (chat/agentTree.ts). */
+  askParent?: { projectId: string; workstream: string } | null;
+  /** An ask thread's chat: the workstream and repository its asks name, so a follow-up names them too; null from an older orchestrator. */
+  askTarget?: { workstream: string; repo: string | null } | null;
   owner: string;                     // unix user whose tmux holds the session
   shared: boolean;                   // the viewer is a collaborator, not the owner
   provider: string | null;
@@ -35,6 +49,8 @@ export interface InboxRow {
   waitingReason: AgentStatus['waitingReason'];
   /** Last status write; the row's "how long in this state" clock. */
   updatedAt: string | null;
+  /** When the agent last came to rest from working or waiting (AgentStatus.stoppedAt): it has had a turn. */
+  stoppedAt?: string | null;
   message: string | null;
   contextTokens: number | null;
   rateLimited: string | null;
@@ -42,6 +58,8 @@ export interface InboxRow {
   review: SessionReview | null;
   /** The review ring the desktop would show: null = nothing to look at. */
   ring: RingState | null;
+  /** How many of the workstream's review panes share `ring`; 0 with no ring. */
+  reviewCount?: number;
   band: HomeBand;
   /** Recent sessions only: when the user last opened this session. */
   lastVisitedAt?: string;
@@ -94,7 +112,9 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
     if (p.archived || !p.workflows.some(w => w.type === 'agent')) continue;
     const owner = p.ownerUsername ?? username;
     const workstreams = p.workstreams.filter(ws => !ws.archived);
-    const list: Array<{ id?: string; name: string; sessionTitle?: string | null }> = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
+    const list: Array<{
+      id?: string; name: string; sessionTitle?: string | null; spaceId?: string | null; spaceFixedAt?: string | null; askThread?: Workstream['askThread'];
+    }> = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
     for (const ws of list) {
       const session = sessionName(owner, p.name, 'agent', ws.name);
       const st = statusMap[statusKey(p.instanceId, session)];
@@ -103,7 +123,18 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         projectId: p.id,
         projectName: p.name,
         workstream: ws.name,
+        workstreamId: ws.id ?? null,
         sessionTitle: ws.sessionTitle ?? null,
+        spaceId: ws.spaceId ?? null,
+        spaceFixed: ws.spaceFixedAt != null,
+        ...(ws.askThread ? {
+          askTitle: ws.askThread.title?.trim() || null,
+          askThreadId: ws.askThread.id,
+          askParent: ws.askThread.parentProjectId && ws.askThread.parentWorkstream
+            ? { projectId: ws.askThread.parentProjectId, workstream: ws.askThread.parentWorkstream }
+            : null,
+          askTarget: ws.askThread.workstream ? { workstream: ws.askThread.workstream, repo: ws.askThread.repoName ?? null } : null,
+        } : {}),
         owner,
         shared: p.role === 'collaborator',
         provider: providerFor(p, ws.id, st?.source),
@@ -113,10 +144,11 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         status: st?.status ?? 'not_running',
         waitingReason: st?.waitingReason ?? null,
         updatedAt: st?.updatedAt ?? p.lastActiveAt ?? null,
+        stoppedAt: st?.stoppedAt ?? null,
         message: st?.message?.trim() || null,
         contextTokens: st?.contextTokens ?? null,
         rateLimited: st?.rateLimited ?? null,
-        ...reviewFields(st?.status ?? 'not_running', st?.review),
+        ...reviewFields(st?.status ?? 'not_running', st),
       });
     }
   }
@@ -136,9 +168,17 @@ export function bandFor(status: AgentStatusValue, ring: RingState | null): HomeB
   return 'other';
 }
 
-function reviewFields(status: AgentStatusValue, review: SessionReview | null | undefined): Pick<InboxRow, 'review' | 'ring' | 'band'> {
-  const ring = ringStateFor(review);
-  return { review: review ?? null, ring, band: bandFor(status, ring) };
+/**
+ * The row's review: of the workstream's panes, the
+ * first in the most urgent ring state, so its label and clock name that PR;
+ * slot 1's when none rings.
+ */
+function reviewFields(status: AgentStatusValue, st: Pick<AgentStatus, 'review' | 'reviews'> | null | undefined): Pick<InboxRow, 'review' | 'ring' | 'band' | 'reviewCount'> {
+  const reviews = reviewsOf(st);
+  const rings = reviews.map(ringStateFor);
+  const ring = aggregateReviewRing(rings);
+  const review = ring ? reviews[rings.indexOf(ring)] : (st?.review ?? null);
+  return { review: review ?? null, ring, band: bandFor(status, ring), reviewCount: ring ? rings.filter(r => r === ring).length : 0 };
 }
 
 const ts = (s: string | null | undefined): number => (s ? Date.parse(s) : 0);
@@ -255,14 +295,17 @@ export function recentSessions(rows: readonly InboxRow[], recents: RecentRow[] |
 /**
  * The Search tab's instant filter: every whitespace-separated term must hit
  * the project, workstream, owner, provider, status message or review PR
- * (`312` or `#312`), or the box's name when `boxNameOf` gives one,
- * case-insensitively. Keeps the home order.
+ * (`312` or `#312`), or the box's name when `boxNameOf` gives one, or the
+ * name `nameOf` gives it (the simple UI's session title), case-insensitively.
+ * Keeps the home order.
  */
-export function searchRows(rows: readonly InboxRow[], query: string, boxNameOf?: (row: InboxRow) => string | null): InboxRow[] {
+export function searchRows(
+  rows: readonly InboxRow[], query: string, boxNameOf?: (row: InboxRow) => string | null, nameOf?: (row: InboxRow) => string | null,
+): InboxRow[] {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean).map(t => t.replace(/^#(?=\d)/, ''));
   if (terms.length === 0) return [];
   return rows.filter(r => {
-    const hay = [r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '', boxNameOf?.(r) ?? '']
+    const hay = [r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '', boxNameOf?.(r) ?? '', nameOf?.(r) ?? '']
       .join('\n').toLowerCase();
     return terms.every(t => hay.includes(t));
   });

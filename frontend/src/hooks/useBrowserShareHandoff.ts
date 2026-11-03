@@ -4,10 +4,11 @@ import { browserHandoff, type BrowserShareHandoff } from '../utils/browserPaneCo
 /**
  * A share link's handoff to its owner's own pane:
  * `?browser=open&browserShare=<id>[&browserAt=<path>]`, read once from the
- * URL the workspace loaded with. On the first render that has a project it
- * opens that project's browser dock, brings the ctrl tab forward on a narrow
- * viewport (the dock lives in that column), and drops the parameters from the
- * URL. `openShare` is for the dock's first dial only: the pane calls
+ * URL the workspace (or the simple UI, chat/uiMode.ts simpleUiShareHandoff)
+ * loaded with. On the first render that has a project it opens that
+ * project's browser (the workspace's dock, the simple UI's side panel on
+ * Browser), brings it forward on a narrow viewport (the workspace's ctrl tab,
+ * the simple UI's overlay), and drops the parameters from the URL. `openShare` is for the dock's first dial only: the pane calls
  * `consumeOpenShare` once a dial carrying it is ready, so a later reopen of
  * the dock lands where the owner left off, not back on the shared page.
  */

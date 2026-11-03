@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { admitImages, base64Bytes, createImageCache, dragHasFiles, imageFilesOf, isChatImageType, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, scaledSize, storedImageUrl } from './chatImageData';
+import { admitImages, preparePdf, base64Bytes, createImageCache, dragHasFiles, filesOf, isPdfFile, isChatImageType, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, scaledSize, storedImageUrl } from './chatImageData';
 
 const file = (type: string, name = 'f') => ({ type, name }) as File;
 
@@ -14,10 +14,7 @@ describe('chat image helpers', () => {
     expect(Math.ceil(MAX_CHAT_IMAGE_BYTES / 3) * 4).toBeLessThanOrEqual(5 * 1024 * 1024);
   });
 
-  it('finds the images among dropped files, and knows a file drag', () => {
-    const list = Object.assign([file('image/png'), file('text/plain'), file('image/heic')], { length: 3 });
-    expect(imageFilesOf(list).map(f => f.type)).toEqual(['image/png', 'image/heic']);
-    expect(imageFilesOf(null)).toEqual([]);
+  it('knows a file drag', () => {
     expect(dragHasFiles(['text/plain', 'Files'])).toBe(true);
     expect(dragHasFiles(['text/plain'])).toBe(false);
   });
@@ -29,6 +26,25 @@ describe('chat image helpers', () => {
     expect(r.note).toMatch(/PNG, JPEG, GIF and WebP/);
     expect(r.note).toMatch(/At most 4 images/);
     expect(admitImages(MAX_CHAT_IMAGES, [file('image/png')]).take).toEqual([]);
+  });
+
+  it('takes every pasted or dropped file, and admits PDFs only where they are taken', () => {
+    const list = Object.assign([file('image/png', 'a'), file('application/pdf', 'b.pdf'), file('', 'c.PDF'), file('text/plain', 'd.txt')], { length: 4 });
+    expect(filesOf(list).map(f => f.name)).toEqual(['a', 'b.pdf', 'c.PDF', 'd.txt']);
+    expect(filesOf(null)).toEqual([]);
+    expect(isPdfFile(file('', 'c.PDF'))).toBe(true);
+    expect(isPdfFile(file('text/plain', 'x.pdf'))).toBe(false);
+    const without = admitImages(0, filesOf(list));
+    expect(without.take.map(f => f.name)).toEqual(['a']);
+    expect(without.note).toMatch(/^Only PNG, JPEG, GIF and WebP images can be sent$/);
+    const withPdfs = admitImages(0, filesOf(list), true);
+    expect(withPdfs.take.map(f => f.name)).toEqual(['a', 'b.pdf', 'c.PDF']);
+    expect(withPdfs.note).toMatch(/images and PDFs can be sent/);
+  });
+
+  it('refuses a PDF over the cap rather than reading it', async () => {
+    const big = { name: 'big.pdf', type: 'application/pdf', size: MAX_CHAT_IMAGE_BYTES + 1 } as File;
+    await expect(preparePdf(big)).rejects.toThrow('big.pdf is larger than 3.8 MB');
   });
 
   it('scales the long edge down to the limit, keeping the shape', () => {

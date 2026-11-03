@@ -109,7 +109,8 @@ export function Prs() {
     const t = r.reviewTarget;
     if (!t || r.number == null) return;
     try {
-      await reviewApi.start(t.projectId, { workstream: t.workstream, pr: r.number, url: r.url });
+      // slot 1: the phone shows one review pane until it learns several.
+      await reviewApi.start(t.projectId, { workstream: t.workstream, pr: r.number, url: r.url, slot: 1 });
       navigate(conversationHref(t, 'review'));
     } catch (err) {
       setActionError(apiError(err, 'Could not start the review'));
@@ -127,7 +128,7 @@ export function Prs() {
     const [first] = plan.members;
     setActionError('');
     try {
-      await reviewApi.start(plan.target.projectId, { workstream: plan.target.workstream, pr: first.number, url: first.url, group: groupReviewBody(g, plan.members) });
+      await reviewApi.start(plan.target.projectId, { workstream: plan.target.workstream, pr: first.number, url: first.url, group: groupReviewBody(g, plan.members), slot: 1 });
       navigate(conversationHref(plan.target, 'review'));
     } catch (err) {
       setActionError(apiError(err, 'Could not start the review'));

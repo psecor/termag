@@ -23,16 +23,28 @@ function render(value: SpaceChoice, error = '', menuEpoch = 0) {
 }
 
 function trigger(): HTMLButtonElement {
-  return host.querySelector('.chat-compose-repo-btn') as HTMLButtonElement;
+  return host.querySelector('.chat-space-trigger') as HTMLButtonElement;
 }
 
 function open() {
   act(() => { trigger().click(); });
 }
 
-function option(text: string): HTMLButtonElement {
-  const found = [...host.querySelectorAll('[role="option"]')].find(o => o.textContent === text);
-  if (!found) throw new Error(`missing option ${text}`);
+/** The dialog is portaled to the body, outside the host. */
+function dialog(): HTMLElement | null {
+  return document.querySelector('.chat-space-dialog');
+}
+
+/** A choice's name, without New space's decorative "+". */
+function nameOf(o: Element): string | undefined {
+  const el = o.querySelector('.chat-launch-box-name')?.cloneNode(true) as HTMLElement | undefined;
+  el?.querySelectorAll('[aria-hidden="true"]').forEach(n => n.remove());
+  return el?.textContent ?? undefined;
+}
+
+function option(name: string): HTMLButtonElement {
+  const found = [...document.querySelectorAll('.chat-space-dialog [role="radio"]')].find(o => nameOf(o) === name);
+  if (!found) throw new Error(`missing option ${name}`);
   return found as HTMLButtonElement;
 }
 
@@ -50,103 +62,96 @@ afterEach(() => {
 });
 
 describe('SpacePicker', () => {
-  it('stays a compact trigger until opened, then offers no space, editable spaces, and a new one', () => {
+  it('is a trigger like the box, with no caret, that opens a dialog of no space, editable spaces and a new one', () => {
     render({ kind: 'none' });
     const button = trigger();
-    expect(button.textContent).toContain('No space');
-    expect(button.className).toContain('chat-compose-repo-btn');
-    expect(button.getAttribute('aria-haspopup')).toBe('listbox');
+    expect(button.textContent).toBe('No space');
+    expect(button.className).toContain('chat-launch-trigger');
+    expect(button.querySelector('.chat-compose-caret')).toBeNull();
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog');
     expect(button.getAttribute('aria-expanded')).toBe('false');
     expect(button.getAttribute('aria-label')).toBe('Space (optional), No space');
-    expect(host.querySelector('select')).toBeNull();
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    expect(dialog()).toBeNull();
     expect(host.textContent).not.toContain('shared file store');
     open();
     expect(button.getAttribute('aria-expanded')).toBe('true');
-    expect([...host.querySelectorAll('[role="option"]')].map(o => o.textContent)).toEqual(['No space', 'notes', 'New space…']);
-    expect(host.textContent).toContain("This session's box");
-    expect(host.textContent).not.toContain("This chat's box");
-    expect(host.querySelector('input')).toBeNull();
-    expect(host.textContent).toContain("This session's box can read and write it");
+    expect(dialog()?.getAttribute('role')).toBe('dialog');
+    expect([...document.querySelectorAll('.chat-space-dialog [role="radio"]')].map(nameOf)).toEqual(['No space', 'notes', 'New space']);
+    expect(option('No space').getAttribute('aria-checked')).toBe('true');
+    expect(dialog()?.textContent).toContain("This session's box can read and write it");
+    expect(dialog()?.querySelector('input')).toBeNull();
   });
 
-  it('reports each choice and closes except when naming a new space', () => {
+  it('closes on No space or a space, and stays open on New space for its name', () => {
     render({ kind: 'none' });
     open();
     act(() => { option('notes').click(); });
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    expect(dialog()).toBeNull();
+    expect(document.activeElement).toBe(trigger());
     open();
-    act(() => { option('New space…').click(); });
-    expect(host.querySelector('[role="listbox"]')).not.toBeNull();
+    act(() => { option('New space').click(); });
+    expect(dialog()).not.toBeNull();
     render({ kind: 'new', name: '' });
-    expect(host.querySelector('input')).not.toBeNull();
+    expect(dialog()?.querySelector('input')).not.toBeNull();
+    expect(document.activeElement).toBe(dialog()?.querySelector('input'));
     act(() => { option('No space').click(); });
+    expect(dialog()).toBeNull();
     expect(picked).toEqual([{ kind: 'existing', name: 'notes' }, { kind: 'new', name: '' }, { kind: 'none' }]);
   });
 
   it('holds the error back until the new name has been typed in', () => {
     render({ kind: 'new', name: '' }, 'Name the new space');
     open();
-    expect(host.textContent).not.toContain('Name the new space');
-    const input = host.querySelector('input')!;
+    expect(document.body.textContent).not.toContain('Name the new space');
+    const input = dialog()!.querySelector('input')!;
     expect(input.placeholder).toBe('e.g. team-notes');
     act(() => { input.dispatchEvent(new FocusEvent('focusout', { bubbles: true })); });
-    expect(host.textContent).toContain('Name the new space');
+    expect(dialog()?.textContent).toContain('Name the new space');
   });
 
-  it('asks for a new space\'s name, slugified, and shows the error', () => {
+  it("asks for a new space's name, slugified, and shows the error on the trigger once closed", () => {
     render({ kind: 'new', name: '' }, 'Name the new space');
     open();
-    const input = host.querySelector('input')!;
+    const input = dialog()!.querySelector('input')!;
     act(() => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Team Notes');
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     expect(picked).toEqual([{ kind: 'new', name: 'team-notes' }]);
+    expect(dialog()?.textContent).toContain('Name the new space');
+    act(() => { (dialog()!.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
+    expect(dialog()).toBeNull();
+    expect(trigger().getAttribute('aria-invalid')).toBe('true');
     expect(host.textContent).toContain('Name the new space');
   });
 
-  it('does not let Enter in the new-space name submit the form', () => {
+  it('takes Enter in the new name as Done, never as a submit', () => {
     render({ kind: 'new', name: 'team-notes' });
     open();
-    const input = host.querySelector('input')!;
+    const input = dialog()!.querySelector('input')!;
     const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
     act(() => { input.dispatchEvent(enter); });
     expect(enter.defaultPrevented).toBe(true);
-    expect(host.querySelector('[role="listbox"]')).not.toBeNull();
+    expect(dialog()).toBeNull();
   });
 
-  it('moves with the arrow keys, closes on Escape, and closes on an outside click', () => {
+  it('closes on Escape or Done, back on the trigger', () => {
     render({ kind: 'none' });
-    const down = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true });
-    act(() => { trigger().dispatchEvent(down); });
-    expect(down.defaultPrevented).toBe(true);
-    expect(document.activeElement).toBe(option('No space'));
-    act(() => {
-      option('No space').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
-    });
-    expect(document.activeElement).toBe(option('notes'));
-    act(() => {
-      option('notes').dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
-    });
-    expect(document.activeElement).toBe(option('New space…'));
-    const esc = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
-    act(() => { document.dispatchEvent(esc); });
-    expect(esc.defaultPrevented).toBe(true);
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    open();
+    act(() => { dialog()!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })); });
+    expect(dialog()).toBeNull();
     expect(document.activeElement).toBe(trigger());
-
     open();
-    act(() => { document.body.dispatchEvent(new Event('pointerdown', { bubbles: true })); });
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    act(() => { (dialog()!.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
+    expect(dialog()).toBeNull();
   });
 
-  it('closes when the page dismisses the menu, and does not open while disabled', () => {
+  it('closes when the page dismisses its menus, and does not open while disabled', () => {
     render({ kind: 'none' });
     open();
-    expect(host.querySelector('[role="listbox"]')).not.toBeNull();
+    expect(dialog()).not.toBeNull();
     render({ kind: 'none' }, '', 1);
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    expect(dialog()).toBeNull();
 
     act(() => root.render(
       <SpacePicker value={{ kind: 'none' }} spaces={spaces} disabled onChange={c => picked.push(c)} />,
@@ -154,7 +159,7 @@ describe('SpacePicker', () => {
     const button = trigger();
     expect(button.disabled).toBe(true);
     act(() => { button.click(); });
-    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    expect(dialog()).toBeNull();
   });
 
   it('marks each choice with its space colour, and No space neutral', () => {
@@ -164,6 +169,7 @@ describe('SpacePicker', () => {
     open();
     expect(swatch(option('notes'))?.style.getPropertyValue('--space-color')).toBe(spaceColor('notes').hex);
     expect(swatch(option('No space'))?.dataset.space).toBe('none');
+    act(() => { option('notes').click(); });
 
     render({ kind: 'none' });
     expect(swatch(trigger())?.dataset.space).toBe('none');

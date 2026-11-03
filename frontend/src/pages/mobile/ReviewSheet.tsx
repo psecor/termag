@@ -3,7 +3,8 @@
 // the workstream's `review` tmux session. The result shows up as a third tab.
 import React, { useEffect, useRef, useState } from 'react';
 import { reviewApi } from '../../services/api';
-import { guessExplanation, parsePrInputFull, reviewTargetView, type PrGuess } from '../../utils/review';
+import { guessExplanation, mismatchNote, parsePrInputFull, reviewTargetView, type PrGuess } from '../../utils/review';
+import { FLAGS, useFlag } from '../../flags';
 import { reviewSubmitLabel } from '../../mobile/review';
 import { Sheet, apiError } from './Sheet';
 
@@ -28,7 +29,8 @@ export function ReviewSheet({ projectId, projectName, workstream, hasReview, cur
   const [guess, setGuess] = useState<PrGuess | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [ghError, setGhError] = useState<string | null>(null);
-  const [repo, setRepo] = useState<{ repo: string | null; known: boolean }>({ repo: null, known: false });
+  const [repo, setRepo] = useState<{ repo: string | null; known: boolean; repos?: string[] }>({ repo: null, known: false });
+  const multiRepoOn = useFlag(FLAGS.multiRepo, false);
   const [value, setValue] = useState(initialValue ?? '');
   // A ref: the guess lands after the sheet opened, maybe after the user typed.
   const touched = useRef(initialValue != null && initialValue !== '');
@@ -40,7 +42,7 @@ export function ReviewSheet({ projectId, projectName, workstream, hasReview, cur
     reviewApi.guess(projectId, workstream)
       .then(r => {
         if (cancelled) return;
-        setGuess(r.guess); setBranch(r.branch); setGhError(r.ghError); setRepo({ repo: r.repo ?? null, known: r.repoKnown === true });
+        setGuess(r.guess); setBranch(r.branch); setGhError(r.ghError); setRepo({ repo: r.repo ?? null, known: r.repoKnown === true, repos: r.repos });
         if (r.guess && !touched.current) setValue(String(r.guess.number));
       })
       .catch(err => { if (!cancelled) setError(apiError(err, 'Could not look up the PR')); })
@@ -51,14 +53,15 @@ export function ReviewSheet({ projectId, projectName, workstream, hasReview, cur
   const parsed = parsePrInputFull(value);
   const pr = parsed?.number ?? null;
   // The repository the PR is in, as on the desktop dialog (utils/review.ts).
-  const target = reviewTargetView({ pr, typedUrl: parsed?.url ?? null, guess, repo: repo.repo, repoKnown: repo.known });
+  const target = reviewTargetView({ pr, typedUrl: parsed?.url ?? null, guess, repo: repo.repo, repoKnown: repo.known, repos: multiRepoOn ? repo.repos : null });
 
   const start = async (e: React.FormEvent) => {
     e.preventDefault();
     if (pr == null || starting || target.problem) return;
     setStarting(true); setError(null);
     try {
-      const r = await reviewApi.start(projectId, { workstream, pr, url: target.url });
+      // slot 1: the phone shows one review pane until it learns several.
+      const r = await reviewApi.start(projectId, { workstream, pr, url: target.url, slot: 1 });
       onStarted({ pr: r.pr, url: r.url, session: r.session });
       onClose();
     } catch (err) {
@@ -92,7 +95,7 @@ export function ReviewSheet({ projectId, projectName, workstream, hasReview, cur
         {!guessing && pr != null && target.repo && (
           <p className="m-form-note"><strong>{target.repo} #{pr}</strong>{target.title && <> — {target.title}</>}</p>
         )}
-        {!guessing && target.mismatch && <p className="m-form-note">Not this workstream's repository ({target.mismatch}). Check it is the PR you mean.</p>}
+        {!guessing && target.mismatch && <p className="m-form-note">{mismatchNote(target)}</p>}
         {!guessing && target.problem && <div className="m-form-error" role="alert">{target.problem}</div>}
         {!guessing && !guess && ghError && <p className="m-form-note">gh could not be asked: {ghError}</p>}
         {error && <div className="m-form-error" role="alert">{error}</div>}

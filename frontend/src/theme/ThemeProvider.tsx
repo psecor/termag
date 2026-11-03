@@ -31,16 +31,23 @@ const ThemeContext = createContext<ThemeContextValue>({
  * on the user object, so a save updates it through AuthContext.
  */
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const { user, updatePreferences } = useAuth();
+  const { user, loading, updatePreferences } = useAuth();
   const storedTheme = user?.theme;
   const saved = useMemo(() => normalizeTheme(storedTheme), [storedTheme]);
   const [previewed, setPreviewed] = useState<ThemeSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const theme = previewed ?? saved;
 
+  // Nothing is applied until /auth/me answers: index.html's pre-paint script
+  // has already set the cached palette, and applying the defaults first would
+  // flash dark. Signed out (login), the defaults apply but the cache is left
+  // for the next sign-in.
+  const signedIn = user != null;
   useEffect(() => {
-    applyTheme(theme, document.documentElement);
-  }, [theme]);
+    if (loading) return;
+    if (signedIn) applyTheme(theme, document.documentElement);
+    else applyTheme(theme, document.documentElement, document, null);
+  }, [theme, loading, signedIn]);
 
   const preview = useCallback((next: ThemeSettings | null) => setPreviewed(next), []);
 

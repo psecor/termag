@@ -33,6 +33,20 @@ describe('hitTarget', () => {
   });
 });
 
+describe('which review pane (docs/parallel-reviews.md)', () => {
+  const pane = (session?: string) => ({ state: 'done' as const, pr: 9, url: null, at: 'x', doneAt: 'x', seenAt: null, ...(session ? { session } : {}) });
+  it('a row about its review opens the pane that rings', () => {
+    expect(rowTarget({ ...row, ring: 'done', review: pane('u-p-review-3') })).toMatchObject({ pane: 'review', session: 'u-p-review-3' });
+    // An older backend names no pane: the first.
+    expect(rowTarget({ ...row, ring: 'done', review: pane() })).not.toHaveProperty('session');
+    expect(rowTarget({ ...row, review: pane('u-p-review-3') })).not.toHaveProperty('session');
+  });
+  it('a review hit opens the pane the text was in; other hits name no pane', () => {
+    expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'review', session: 'u-p-review-5' })).toMatchObject({ pane: 'review', session: 'u-p-review-5' });
+    expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'ctrl', session: 'u-p-ctrl' })).not.toHaveProperty('session');
+  });
+});
+
 describe('isSearchShortcut', () => {
   it('takes ⌘K and Ctrl+Shift+K', () => {
     expect(isSearchShortcut(key('k', { metaKey: true }))).toBe(true);

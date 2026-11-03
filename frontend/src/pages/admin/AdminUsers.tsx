@@ -3,21 +3,21 @@ import { useSearchParams } from 'react-router-dom';
 import { BarChart, Bar, ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { adminApi, type AdminRange, type AdminUser, type AdminUserDetail, type GrowthBucket } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { growthRows, growthSpan, BUCKET_NOUN, PREVIOUS_NOUN } from './growth';
 import { useAdminPolled, useSelectedDetail, pendingText, refreshFailedText, DataTable, Dot, KeyValues, fmtAgo, fmtUntil, fmtMs, fmtTok, fmtPct, type Column } from './shared';
 import { cloudCountCell } from '../../utils/adminCloud';
 
 const GROWTH_BUCKETS: GrowthBucket[] = ['day', 'week', 'month'];
-const NEW_COLOR = 'rgb(63, 185, 80)';
-const TOTAL_COLOR = 'rgb(88, 166, 255)';
+const NEW_COLOR = HUE.green;
+const TOTAL_COLOR = HUE.blue;
 
 const SERIES = [
-  { id: 'agentWorked', label: 'agent worked', color: 'rgb(88, 166, 255)' },
-  { id: 'humanWorked', label: 'human typed', color: 'rgb(246, 185, 59)' },
-  { id: 'usedTokens', label: 'used tokens', color: 'rgb(63, 185, 80)' },
-  { id: 'switchedProjects', label: 'switched projects', color: 'rgb(94, 234, 212)' },
+  { id: 'agentWorked', label: 'agent worked', color: HUE.blue },
+  { id: 'humanWorked', label: 'human typed', color: HUE.amber },
+  { id: 'usedTokens', label: 'used tokens', color: HUE.green },
+  { id: 'switchedProjects', label: 'switched projects', color: HUE.teal },
 ];
 
 export function AdminUsers({ range, now }: { range: AdminRange; now: number }) {
@@ -66,7 +66,7 @@ export function AdminUsers({ range, now }: { range: AdminRange; now: number }) {
             <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
             <YAxis yAxisId="new" tick={TICK} tickLine={false} axisLine={false} width={28} allowDecimals={false} />
             <YAxis yAxisId="total" orientation="right" tick={TICK} tickLine={false} axisLine={false} width={36} allowDecimals={false} />
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} />} />
+            <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} />} />
             <Bar yAxisId="new" dataKey="new" name="new users" fill={NEW_COLOR} stroke={SURFACE} strokeWidth={1} maxBarSize={BAR_MAX} isAnimationActive={false} />
             <Line yAxisId="total" type="monotone" dataKey="total" name="total users" stroke={TOTAL_COLOR} strokeWidth={2} dot={false} isAnimationActive={false} />
           </ComposedChart>
@@ -82,7 +82,7 @@ export function AdminUsers({ range, now }: { range: AdminRange; now: number }) {
               <CartesianGrid vertical={false} stroke={GRID_STROKE} />
               <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
               <YAxis tick={TICK} tickLine={false} axisLine={false} width={28} allowDecimals={false} />
-              <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={v => String(v)} />} />
+              <Tooltip cursor={CURSOR} content={<DashTooltip fmt={v => String(v)} />} />
               {SERIES.map(s => <Bar key={s.id} dataKey={s.id} name={s.label} fill={s.color} maxBarSize={10} isAnimationActive={false} />)}
             </BarChart>
           </ResponsiveContainer>

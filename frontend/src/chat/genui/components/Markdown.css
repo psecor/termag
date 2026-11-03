@@ -1,0 +1,8 @@
+/* Markdown.tsx. The surface zeroes the chat's prose margins (genui.css); a passage gets them back. */
+.md .genui-surface .genui-markdown :is(p, ul, ol, blockquote, .md-table, .md-pre) { margin: 0 0 8px; }
+.md .genui-surface .genui-markdown :is(h4, h5, h6) { margin: 12px 0 4px; }
+.md .genui-surface .genui-markdown :is(ul, ol) { padding-left: 20px; }
+.md .genui-surface .genui-markdown li { margin: 2px 0; }
+.md .genui-surface .genui-markdown li > p { margin: 0; }
+.md .genui-surface .genui-markdown > :first-child { margin-top: 0; }
+.md .genui-surface .genui-markdown > :last-child { margin-bottom: 0; }

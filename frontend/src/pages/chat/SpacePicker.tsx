@@ -1,17 +1,18 @@
-// New chat's optional space step (chat/chatSpaces.ts): no space, one of the
-// user's spaces they can edit, or a new one. Drawn like the repository
-// trigger above it: a compact button, with the choices in a menu, each space
-// with its colour (chat/spaceColors.ts) as the sidebar shows it. The chat's
-// new box gets editor access to the chosen space before the chat starts.
+// New session's optional space (chat/chatSpaces.ts): no space, one of the
+// user's spaces they can edit, or a new one. In the drawer it is a trigger
+// like the box's (pages/chat/LaunchDrawer.tsx): the space's colour
+// (chat/spaceColors.ts) and name, no caret, opening a dialog of choices drawn
+// as the box dialog's cards. Picking No space or a space closes it; New space
+// opens its name field inside the card and waits for Done. The session's box
+// gets editor access to the chosen space before the chat starts.
 import React, { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { SpaceView } from '../../services/api';
 import { pickableSpaces, slugifySpaceName, spaceNameOf, spaceTriggerLabel, type SpaceChoice } from '../../chat/chatSpaces';
 import { SPACE_NAME_HINT } from '../../utils/spaces';
+import { Dialog } from '../../components/Dialog';
+import { Tooltip } from '../../components/Tooltip';
 import { SpaceSwatch } from './SpaceSwatch';
-
-function Caret() {
-  return <span className="chat-compose-caret" aria-hidden="true" />;
-}
 
 export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoch = 0, onOpen }: {
   value: SpaceChoice;
@@ -19,20 +20,17 @@ export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoc
   spaces: readonly SpaceView[];
   error?: string;
   disabled?: boolean;
-  /** Bumps when the page opens another menu or sends, so this one closes. */
+  /** Bumps when the page opens a menu or sends, so the dialog closes. */
   menuEpoch?: number;
-  /** The menu is opening, so the page can close the repository and model menus. */
+  /** The dialog is opening, so the page can close the repository and model menus. */
   onOpen?: () => void;
 }) {
   const options = pickableSpaces(spaces);
   const label = spaceTriggerLabel(value);
   // A new space shows the colour its name will have as soon as it has one.
   const chosen = value.kind === 'existing' ? value.name : value.kind === 'new' ? spaceNameOf(value.name) || null : null;
-  const listId = useId();
   const errorId = useId();
-  const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [open, setOpen] = useState(false);
   // A new space's name is only wrong once the user has had a go at it.
@@ -49,49 +47,23 @@ export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoc
   useEffect(() => { if (disabled) setOpen(false); }, [disabled]);
 
   useEffect(() => {
-    if (!open) return;
-    if (value.kind === 'new') inputRef.current?.focus();
-    else menuRef.current?.querySelector<HTMLButtonElement>('[aria-selected="true"]')?.focus();
+    if (open && value.kind === 'new') inputRef.current?.focus();
   }, [open, value.kind]);
 
-  useEffect(() => {
-    if (!open) return;
-    function onPointer(e: PointerEvent) {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      setOpen(false);
-      triggerRef.current?.focus();
-    }
-    document.addEventListener('pointerdown', onPointer);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('pointerdown', onPointer);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
-  function toggle() {
+  function show() {
     if (disabled) return;
-    const next = !open;
-    if (next) onOpen?.();
-    setOpen(next);
-  }
-
-  function onTriggerKeyDown(e: React.KeyboardEvent) {
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    e.preventDefault();
-    if (open || disabled) return;
     onOpen?.();
     setOpen(true);
   }
 
-  function commit(next: SpaceChoice) {
-    onChange(next);
+  function close() {
     setOpen(false);
     triggerRef.current?.focus();
+  }
+
+  function commit(next: SpaceChoice) {
+    onChange(next);
+    close();
   }
 
   function chooseNew() {
@@ -103,89 +75,97 @@ export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoc
     inputRef.current?.focus();
   }
 
-  function onMenuKeyDown(e: React.KeyboardEvent) {
-    if ((e.target as HTMLElement).tagName === 'INPUT') return;
-    const items = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? [])];
-    const i = items.findIndex(item => item === document.activeElement);
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      items[Math.min(Math.max(i, 0) + 1, items.length - 1)]?.focus();
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      items[Math.max(i - 1, 0)]?.focus();
-    } else if (e.key === 'Home') {
-      e.preventDefault();
-      items[0]?.focus();
-    } else if (e.key === 'End') {
-      e.preventDefault();
-      items[items.length - 1]?.focus();
-    }
-  }
-
   return (
-    <div ref={rootRef} className="chat-compose-repo chat-new-space">
+    <div className="chat-new-space">
+      <Tooltip content={<><strong>Space (optional)</strong><span className="ui-tooltip-sub">A shared file store this session's box can read and write</span></>}>
       <button
         ref={triggerRef}
         type="button"
-        className="chat-compose-repo-btn"
-        aria-haspopup="listbox"
+        className="chat-launch-trigger chat-space-trigger"
+        aria-haspopup="dialog"
         aria-expanded={open}
-        aria-controls={listId}
         aria-label={`Space (optional), ${label}`}
         aria-describedby={shownError ? errorId : undefined}
         aria-invalid={shownError ? true : undefined}
-        title="Space (optional)"
         disabled={disabled}
-        onClick={toggle}
-        onKeyDown={onTriggerKeyDown}
+        onClick={show}
       >
         <SpaceSwatch space={chosen} />
-        <span className="chat-compose-repo-name">{label}</span>
-        <Caret />
+        <span className="chat-launch-trigger-label">{label}</span>
       </button>
-      {open && (
-        <div ref={menuRef} className="chat-compose-menu" onKeyDown={onMenuKeyDown}>
-          <div id={listId} role="listbox" aria-label="Spaces">
-            <button type="button" role="option" tabIndex={-1} aria-selected={value.kind === 'none'} className="chat-compose-option chat-space-option" onClick={() => commit({ kind: 'none' })}><SpaceSwatch space={null} />No space</button>
+      </Tooltip>
+      {shownError && !open && <span className="chat-new-error" id={errorId}>{shownError}</span>}
+      {open && createPortal(
+        <Dialog title="Space" onClose={close} className="chat-launch-dialog chat-space-dialog">
+          <p className="chat-launch-dialog-note">
+            A space is a shared file store. This session's box can read and write it, and so can a box it starts.
+          </p>
+          <div className="chat-launch-boxes" role="radiogroup" aria-label="Spaces">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={value.kind === 'none'}
+              className="chat-launch-box chat-space-choice"
+              onClick={() => commit({ kind: 'none' })}
+            >
+              <span className="chat-launch-box-name"><SpaceSwatch space={null} />No space</span>
+            </button>
+            {options.length > 0 && <div className="chat-menu-heading">Your spaces</div>}
             {options.map(s => (
               <button
                 key={s.id}
                 type="button"
-                role="option"
-                tabIndex={-1}
-                aria-selected={value.kind === 'existing' && value.name === s.name}
-                className="chat-compose-option chat-space-option"
+                role="radio"
+                aria-checked={value.kind === 'existing' && value.name === s.name}
+                className="chat-launch-box chat-space-choice"
                 onClick={() => commit({ kind: 'existing', name: s.name })}
               >
-                <SpaceSwatch space={s.name} />
-                {s.name}
+                <span className="chat-launch-box-name"><SpaceSwatch space={s.name} />{s.name}</span>
+                {s.description && <small>{s.description}</small>}
               </button>
             ))}
-            <button type="button" role="option" tabIndex={-1} aria-selected={value.kind === 'new'} className="chat-compose-option chat-space-option chat-space-option-new" onClick={chooseNew}>New space…</button>
+            {/* New space and its name are one choice: the name field opens inside it once picked. */}
+            <div className="chat-launch-new" data-checked={value.kind === 'new' || undefined}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={value.kind === 'new'}
+                className="chat-launch-box chat-space-choice"
+                onClick={chooseNew}
+              >
+                <span className="chat-launch-box-name"><span className="chat-space-plus" aria-hidden="true">+</span>New space</span>
+                <small>Made when the session starts</small>
+              </button>
+              {value.kind === 'new' && (
+                <div className="chat-launch-new-name">
+                  <label className="chat-new-field chat-launch-new-field">
+                    <span>Name</span>
+                    <input
+                      ref={inputRef}
+                      aria-label="New space name"
+                      value={value.name}
+                      disabled={disabled}
+                      placeholder="e.g. team-notes"
+                      title={SPACE_NAME_HINT}
+                      aria-describedby={shownError ? errorId : undefined}
+                      aria-invalid={shownError ? true : undefined}
+                      onBlur={() => setNameTouched(true)}
+                      onChange={e => { setNameTouched(true); onChange({ kind: 'new', name: slugifySpaceName(e.target.value) }); }}
+                      // Enter is Done, as in a form; it never starts the session.
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); close(); } }}
+                    />
+                    {shownError && <span className="chat-new-error" id={errorId}>{shownError}</span>}
+                  </label>
+                </div>
+              )}
+            </div>
           </div>
-          {value.kind === 'new' && (
-            <label className="chat-compose-paste">
-              <span>New space name</span>
-              <input
-                ref={inputRef}
-                aria-label="New space name"
-                value={value.name}
-                disabled={disabled}
-                placeholder="e.g. team-notes"
-                title={SPACE_NAME_HINT}
-                onBlur={() => setNameTouched(true)}
-                onChange={e => { setNameTouched(true); onChange({ kind: 'new', name: slugifySpaceName(e.target.value) }); }}
-                // Same as the repository URL paste: Enter must not submit the form and launch a box.
-                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }}
-              />
-            </label>
-          )}
-          <div className="chat-compose-note">
-            A space is a shared file store. This session's box can read and write it, and so can a box it starts.
+          <div className="chat-launch-dialog-actions">
+            <button type="button" className="btn-primary" onClick={close}>Done</button>
           </div>
-        </div>
+        </Dialog>,
+        document.body,
       )}
-      {shownError && <span className="chat-new-error" id={errorId}>{shownError}</span>}
     </div>
   );
 }

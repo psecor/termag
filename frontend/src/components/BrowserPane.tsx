@@ -434,16 +434,27 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
 
   // The release is listened for on the window, not the canvas: a button let
   // go outside the pane must still release in the page, or every later move
-  // is a drag. One listener per press; the canvas's own mouseup bubbles there.
-  const windowRelease = useRef<((e: MouseEvent) => void) | null>(null);
-  const releaseAtWindow = useCallback((e: MouseEvent) => {
-    windowRelease.current = null;
-    const c = canvasRef.current;
-    if (!c) return;
-    flushMove();
-    sendInput(pointerEvent('mouseReleased', e, c.getBoundingClientRect(), frameRef.current, e.detail || 1));
+  // is a drag. One listener for the pane's life, acting only while a press is
+  // held; the canvas's own mouseup bubbles there. Not one `once` listener per
+  // press: the observability SDK's addEventListener patch loses track of a
+  // `once` listener that fires right behind another mouseup listener (React's
+  // own always is) and then ignores the same function added again, so every
+  // release after the first never reached the page. Fixed in the recorder
+  // 1.4.1 (observability 1.3.1, session-replay 1.2.4); the one listener stays,
+  // as it doesn't depend on the patch, and the socket test still pins it.
+  const pressed = useRef(false);
+  useEffect(() => {
+    const onRelease = (e: MouseEvent) => {
+      if (!pressed.current) return;
+      pressed.current = false;
+      const c = canvasRef.current;
+      if (!c) return;
+      flushMove();
+      sendInput(pointerEvent('mouseReleased', e, c.getBoundingClientRect(), frameRef.current, e.detail || 1));
+    };
+    window.addEventListener('mouseup', onRelease);
+    return () => window.removeEventListener('mouseup', onRelease);
   }, [flushMove, sendInput]);
-  useEffect(() => () => { if (windowRelease.current) window.removeEventListener('mouseup', windowRelease.current); }, []);
 
   const onMouse = (type: 'mousePressed' | 'mouseMoved') => (e: React.MouseEvent<HTMLCanvasElement>) => {
     const c = canvasRef.current;
@@ -457,10 +468,7 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
     c.focus();
     flushMove();
     sendInput(event);
-    if (!windowRelease.current) {
-      windowRelease.current = releaseAtWindow;
-      window.addEventListener('mouseup', releaseAtWindow, { once: true });
-    }
+    pressed.current = true;
   };
 
   const onKey = (type: 'keyDown' | 'keyUp') => (e: React.KeyboardEvent<HTMLCanvasElement>) => {

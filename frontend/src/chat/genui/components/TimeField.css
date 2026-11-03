@@ -1,0 +1,3 @@
+/* TimeField.tsx. LaunchPad's field grows its input to fill the field; beside a
+   taller field in a Grid row that drew a tall box, so it keeps its own height. */
+.genui-surface .genui-timefield-input { flex: none; }

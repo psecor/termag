@@ -1,8 +1,9 @@
 /**
  * Date-key helpers. Two calendars are in play: token usage, visits, warp and
  * context series are keyed by UTC day (the agent/backend use toISOString), while
- * worktime `date` is the SERVER's local day. Helpers come in local + UTC pairs;
- * pick the one matching the data source.
+ * worktime `date` is the person's own local day (termag banks it in the zone
+ * the web UI sends, backend/src/services/worktimeDays.ts). Helpers come in
+ * local + UTC pairs; pick the one matching the data source.
  */
 
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -23,18 +24,16 @@ export function utcToday(): string {
   return utcDateKey(new Date());
 }
 
-/** Both local and UTC today strings (deduplicated) — covers timezone mismatch with server */
-export function todayDates(): string[] {
-  const lt = localToday();
-  const ut = utcToday();
-  return lt === ut ? [lt] : [lt, ut];
-}
-
 /** Last n local days, oldest → newest, ending today. */
 export function lastNDays(n: number): string[] {
+  return previousNDays(n, 0);
+}
+
+/** n local days ending `offset` days before today, as previousNDaysUTC. */
+export function previousNDays(n: number, offset: number): string[] {
   const result: string[] = [];
   const now = new Date();
-  for (let i = n - 1; i >= 0; i--) {
+  for (let i = n - 1 + offset; i >= offset; i--) {
     const d = new Date(now);
     d.setDate(d.getDate() - i);
     result.push(localDateKey(d));

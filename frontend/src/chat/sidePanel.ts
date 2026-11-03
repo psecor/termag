@@ -7,11 +7,12 @@
 // every conversation in this browser. The phone overlay always starts shut.
 // Where the user has spaces it also has Files, the space's explorer of agents
 // and files, and then it shows beside a space file and on a new tab too,
-// where Files is its only tab.
+// where Files is its only tab. Beside a session its owner may share, it also
+// has Share: the full UI's "Share…" on the browser dock.
 
 export const SIDE_PANEL_KEY = 'termag-chat-side-panel';
 
-export type SidePanelTab = 'files' | 'terminal' | 'browser';
+export type SidePanelTab = 'files' | 'terminal' | 'browser' | 'share' | 'pr' | 'review';
 
 export interface SidePanelState {
   open: boolean;
@@ -37,7 +38,7 @@ export function readSidePanel(storage: ReadStorage): SidePanelState {
   const r = raw as Record<string, unknown>;
   return {
     open: r.open === true,
-    tab: r.tab === 'browser' || r.tab === 'files' ? r.tab : 'terminal',
+    tab: r.tab === 'browser' || r.tab === 'files' || r.tab === 'share' || r.tab === 'pr' || r.tab === 'review' ? r.tab : 'terminal',
     width: typeof r.width === 'number' && Number.isFinite(r.width) ? Math.round(r.width) : SIDE_PANEL_DEFAULT_WIDTH,
   };
 }
@@ -59,17 +60,27 @@ export function clampSidePanelWidth(width: number, mainWidth: number): number {
 /**
  * What the panel is beside: `files`, a space to explore (absent for an agent
  * with no space); `session`, an agent's session, which Terminal and Browser
- * need (absent beside a file or on a new tab).
+ * need (absent beside a file or on a new tab); `share`, a session whose
+ * preview this user may share (browser-pane-preview-share-enabled, and its
+ * owner, not a collaborator); `pr`, a session's Pull request tab (the chrome
+ * refresh's, PrTab.tsx); `review`, its review panes.
  */
-export interface SidePanelOffer { files: boolean; session: boolean }
+export interface SidePanelOffer { files: boolean; session: boolean; share?: boolean; pr?: boolean; review?: boolean }
 
 const SESSION_ONLY: SidePanelOffer = { files: false, session: true };
 
-/** The tabs the panel offers: Files where there is a space, Terminal and Browser beside a session, Browser only where the browser pane is on. */
+/**
+ * The tabs the panel offers: Files where there is a space, Terminal and
+ * Browser beside a session, Browser only where the browser pane is on, and
+ * Share beside a session that may be shared, since a share is a browser too.
+ */
 export function sidePanelTabs(browserOn: boolean, offer: SidePanelOffer = SESSION_ONLY): SidePanelTab[] {
   const tabs: SidePanelTab[] = [];
   if (offer.files) tabs.push('files');
   if (offer.session) tabs.push(...(browserOn ? ['terminal', 'browser'] as const : ['terminal'] as const));
+  if (offer.session && browserOn && offer.share) tabs.push('share');
+  if (offer.session && offer.pr) tabs.push('pr');
+  if (offer.session && offer.review) tabs.push('review');
   return tabs;
 }
 
@@ -95,7 +106,7 @@ export function isSidePanelShortcut(e: Pick<KeyboardEvent, 'code' | 'ctrlKey' | 
 export type SidePanelBody = 'ready' | 'setup' | 'no-shell';
 
 /**
- * Whether either tab may attach, as the workspace decides for its ctrl
+ * Whether a session tab may attach (Share too: what it shares is the browser's), as the workspace decides for its ctrl
  * column (the ctrl terminal and the browser dock live in the same
  * `hasAgent && !cloneHeld` branch of App.tsx). The terminal is the
  * workstream's ctrl shell, never the agent pane (the chat reads that pane,

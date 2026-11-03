@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { spawnsApi, type SpawnNode, type SpawnTreeView } from '../services/api';
-import { PROVIDERS } from '../providers/registry';
+import { PROVIDERS, providerColor } from '../providers/registry';
+import { usePalette } from '../theme/usePalette';
 import { fmtK } from '../utils/format';
 import { childLink, fosterNote, spawnStateLabel } from '../utils/spawnUsage';
 import {
@@ -75,6 +76,7 @@ function useTree(target: Target) {
 function NodeCard({ n, x, y, outsideFoster, onOpen }: { n: SpawnNode; x: number; y: number; outsideFoster: string | null; onOpen: (n: SpawnNode) => void }) {
   const tone = networkTone(n);
   const p = PROVIDERS[n.provider];
+  const palette = usePalette();
   const state = spawnStateLabel(n);
   const pane = n.endedAt || n.retiredAt ? null : paneLabel(n.child.status);
   const tip = [nodeLabel(n), firstLine(n.title), `state: ${state}`, pane ? `pane: ${pane}` : null, outsideFoster ? `⇢ ${outsideFoster}` : null, n.orphanedAt ? '○ orphaned: its parent went away' : null]
@@ -93,7 +95,7 @@ function NodeCard({ n, x, y, outsideFoster, onOpen }: { n: SpawnNode; x: number;
       <title>{tip}</title>
       {n.orphanedAt && <rect className="spawn-net-ring" x={-5} y={-5} width={NODE_W + 10} height={NODE_H + 10} rx={12} />}
       <rect className="spawn-net-box" width={NODE_W} height={NODE_H} rx={8} />
-      <text className="spawn-net-badge" x={10} y={19} fill={p?.color.bright}>{p?.badge ?? n.provider}</text>
+      <text className="spawn-net-badge" x={10} y={19} fill={p ? providerColor(p, palette).bright : undefined}>{p?.badge ?? n.provider}</text>
       <text className="spawn-net-label" x={34} y={19}>{clip(nodeLabel(n), 22)}</text>
       <text className="spawn-net-sub" x={10} y={37}>
         {clip(outsideFoster ? `⇢ ${outsideFoster}` : `${n.orphanedAt ? '○ ' : ''}${state}${pane && pane !== 'idle' ? ` · ${pane}` : ''}`, 32)}

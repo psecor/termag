@@ -1,0 +1,6 @@
+/* Breadcrumbs.tsx. LaunchPad styles its crumbs' links; these are plain labels, in the surface's text size. */
+.genui-surface .genui-breadcrumbs { flex-wrap: wrap; row-gap: 2px; min-width: 0; margin: 0; padding: 0; color: var(--text-secondary); }
+.genui-breadcrumbs-item { min-width: 0; overflow-wrap: anywhere; }
+.genui-breadcrumbs-item[data-current] { color: var(--text-primary); font-weight: 600; }
+/* The slash at its own 20px grid, not LaunchPad's 24px: it sits beside 13.5px text, not a page heading. */
+.genui-surface .genui-breadcrumbs-item [data-icon="slash"] { flex: none; width: var(--lp-size-20); height: var(--lp-size-20); }

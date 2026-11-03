@@ -1,5 +1,7 @@
 // Pure helpers for the MCP section of Settings (McpSection.tsx).
 
+import type { ProviderConfig } from '../../providers/registry';
+
 const PLACEHOLDER = /\{\{\s*secret\.([A-Za-z0-9_-]{1,40})\s*\}\}/g;
 
 /** "Name: template" lines into header templates; blank lines are skipped. */
@@ -69,8 +71,21 @@ export function connectorStatus(c: {
   secretNames: string[] | null;
   linkStatus?: 'linked' | 'needs_link';
 }): { label: string; tone: ConnectorTone } {
-  if (c.authType === 'oauth') return c.linkStatus === 'linked' ? { label: 'linked', tone: 'good' } : { label: 'not linked', tone: 'warn' };
+  if (c.authType === 'oauth') return c.linkStatus === 'linked' ? { label: 'authed', tone: 'good' } : { label: 'not authed', tone: 'warn' };
   if (c.secretNames === null) return { label: 'secrets unreadable', tone: 'bad' };
   if (c.missingSecrets.length > 0) return { label: `missing ${c.missingSecrets.map(n => `secret.${n}`).join(', ')}`, tone: 'warn' };
   return { label: 'ready', tone: 'good' };
+}
+
+/**
+ * The agents the connectors reach on a box, for the section's copy: Claude
+ * Code, then every other provider
+ * whose mcpConnectors is set. A chat
+ * runner twin (claude-chat, pi-chat) is its agent's, never named twice.
+ */
+export function mcpAgentNames(providers: Record<string, Pick<ProviderConfig, 'id' | 'displayName' | 'mcpConnectors' | 'chatRunner'>>): string {
+  const names = ['Claude Code', ...new Set(Object.values(providers)
+    .filter(p => p.mcpConnectors && p.id !== 'claude' && !p.chatRunner)
+    .map(p => p.displayName))];
+  return names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }

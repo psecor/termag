@@ -15,6 +15,7 @@ import { AdminSettings } from './admin/AdminSettings';
 import { AdminSoftware } from './admin/AdminSoftware';
 import { AdminPrs } from './admin/AdminPrs';
 import { AdminSpend } from './admin/AdminSpend';
+import { AdminBugs, BugsBadge } from './admin/AdminBugs';
 
 const RANGE_KEY = 'termag:adminRange';
 // Absolute paths: a relative `to=""` resolves to the current URL inside the
@@ -30,6 +31,7 @@ const TABS = [
   { to: '/admin/cloud', label: 'Cloud sessions' },
   { to: '/admin/prs', label: 'PRs' },
   { to: '/admin/software', label: 'Software' },
+  { to: '/admin/bugs', label: 'Bugs' },
   { to: '/admin/system', label: 'System' },
   { to: '/admin/settings', label: 'Settings' },
 ];
@@ -61,7 +63,7 @@ export default function Admin() {
           <Link to="/dashboard">← dashboard</Link>
           <Link to="/">workspace</Link>
           <nav className="admin-tabs" aria-label="admin sections">
-            {TABS.map(t => <NavLink key={t.to} to={t.to} end={t.end}>{t.label}</NavLink>)}
+            {TABS.map(t => <NavLink key={t.to} to={t.to} end={t.end}>{t.label}{t.to === '/admin/bugs' && <BugsBadge />}</NavLink>)}
           </nav>
         </header>
         <Routes>
@@ -75,6 +77,8 @@ export default function Admin() {
           <Route path="cloud" element={<><RangePicker value={range} onChange={setRange} /><AdminCloud range={range} now={now} /></>} />
           <Route path="prs" element={<AdminPrs now={now} />} />
           <Route path="software" element={<AdminSoftware now={now} />} />
+          <Route path="bugs" element={<AdminBugs now={now} />} />
+          <Route path="bugs/:id" element={<AdminBugs now={now} />} />
           <Route path="system" element={<AdminSystem now={now} />} />
           <Route path="settings" element={<AdminSettings range={range} now={now} onRange={setRange} />} />
           {/* Absolute, like TABS: with v7 path resolution "." inside this splat is the unknown URL itself. */}

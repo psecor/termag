@@ -1,0 +1,12 @@
+/* Tree.tsx. The rows, indent per level and chevrons are LaunchPad's Tree. */
+.genui-tree { min-width: 0; }
+/* A leaf has no chevron; its text lines up with its branch siblings' (the chevron is a 16 px icon and a gap). */
+.genui-tree-item:not([data-has-child-items]) > [role="gridcell"] > :last-child {
+  margin-inline-start: calc(var(--lp-size-16) + var(--lp-spacing-300));
+}
+.genui-tree-label { min-width: 0; overflow-wrap: anywhere; }
+.genui-tree-code .genui-tree-label { font-family: var(--font-mono); font-size: 12px; font-weight: 400; }
+.genui-tree-detail {
+  margin-inline-start: auto; padding-inline-start: 12px; flex: none;
+  font-size: 12px; font-weight: 400; color: var(--text-secondary); white-space: nowrap; font-variant-numeric: tabular-nums;
+}

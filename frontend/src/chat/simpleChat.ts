@@ -2,8 +2,8 @@
 // it lists, the one-line status under the transcript, when the answer keys
 // show, and the links out of it.
 import type { AgentStatus, AgentStatusValue, Project } from '../types';
-import { CHAT_PROVIDER_ID } from '../providers/registry';
-import { sortHome, statusLabel, waitingLabel, type InboxRow } from '../mobile/inbox';
+import { isChatRunnerProvider } from '../providers/registry';
+import { buildRows, sortHome, statusLabel, waitingLabel, type InboxRow } from '../mobile/inbox';
 import { repoKey } from '../utils/repoPick';
 import type { Block } from './paneChat';
 import type { ChatLiveStatus } from './chatLiveStatus';
@@ -29,21 +29,113 @@ export function chatRows(rows: readonly InboxRow[]): InboxRow[] {
   return sortHome(rows.filter(r => r.kind === 'normal' || (r.kind === 'automation' && r.workstream !== 'main')));
 }
 
-export interface ChatRowName {
-  /** Claude's title for the session, when the row leads with it; null to lead with the project as before. */
-  title: string | null;
-  /** The project, and the workstream when it is not main: under the title, or the name itself without one. */
-  where: string;
+/**
+ * An ask thread's own chat: the workstream the orchestrator makes for it,
+ * named `ask-<thread id>` (backend services/agentMessages.ts
+ * askChatWorkstreamName).
+ */
+const ASK_CHAT_WORKSTREAM = /^ask-[a-z0-9]{8,40}$/;
+
+export function isAskChatWorkstream(name: string): boolean {
+  return ASK_CHAT_WORKSTREAM.test(name);
+}
+
+const isAskChat = (w: Project['workstreams'][number]) => Boolean(w.askThread) || isAskChatWorkstream(w.name);
+
+/**
+ * Projects whose main is a stand-in nobody has used (see
+ * withoutAskPlaceholders), decided from what the project holds rather than
+ * how it was made, so a project from an old CLI, made by hand or by another
+ * agent counts too: it has ask threads, and its main has never been used (no
+ * turns or typing banked as working time, no stored transcript, and no
+ * session title, which a chat turn's end sets). `createdFor: 'ask'` (`termag
+ * ask --new-box`, the deprecated --for-ask) is a hint for a project whose
+ * first ask has no chat yet; it never keeps a used main out.
+ */
+export function askPlaceholderProjects(projects: readonly Project[]): Set<string> {
+  const out = new Set<string>();
+  for (const p of projects) {
+    const main = p.workstreams.find(w => w.name === 'main');
+    if (!main || main.sessionTitle?.trim() || main.hasTranscript || main.hasTurns) continue;
+    const asked = p.workstreams.some(w => !w.archived && w.name !== 'main' && isAskChat(w));
+    if (asked || p.createdFor === 'ask') out.add(p.id);
+  }
+  return out;
+}
+
+/** The live status says the session has had a turn: it is working or needs you now, or came to rest from that. */
+const liveUsed = (r: InboxRow) => r.status === 'working' || r.status === 'waiting' || Boolean(r.stoppedAt);
+
+/**
+ * The rows without the unused main of a project that has asks
+ * (askPlaceholderProjects), whose ask threads have rows of their own (and
+ * show under the session that sent them). Its agent may have started and be
+ * waiting at its prompt (Ready), but it has done nothing, has no title and
+ * isn't open (`keep`: rowKey of every open tab and of the route's chat), so
+ * all it would add is one more row named after the project, like the
+ * project of the same name on the person's own box.
+ *
+ * A main that was used is never folded. `hosts` comes from the last project
+ * list, which learns of a first turn only when it is read again, so the live
+ * status counts too: working, waiting, or come to rest from that
+ * (`stoppedAt`). `used` remembers the mains seen used for the page's life (the
+ * caller keeps the set), so a main stays after its status is gone (a
+ * restart, a box reconnect) until the list says so itself.
+ */
+export function withoutAskPlaceholders(
+  rows: readonly InboxRow[], hosts: ReadonlySet<string>, keep: ReadonlySet<string>, used: Set<string> = new Set(),
+): InboxRow[] {
+  for (const r of rows) if (r.workstream === 'main' && liveUsed(r)) used.add(r.key);
+  if (!hosts.size) return [...rows];
+  return rows.filter(r => !(
+    r.workstream === 'main' && hosts.has(r.projectId) && !used.has(r.key)
+    && !r.sessionTitle?.trim() && !keep.has(r.key)
+  ));
 }
 
 /**
- * What a sidebar row is called. With simple-ui-session-titles-enabled and a
- * title Claude gave the session, the title leads and the project (and
- * workstream) is secondary; otherwise the row is named after the project.
+ * Every list's sessions in the simple UI (pages/chat/simpleData.tsx): the
+ * sidebar, Recent agents, the tabs, and the explorers (explorerAgents,
+ * noSpaceAgents), which all read these rows, so an ask project's unused main
+ * is folded out of each the same way. `keep`: rowKey of every open tab and
+ * of the route's chat; `used`: the mains seen used on this page
+ * (withoutAskPlaceholders), kept by the caller.
  */
-export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle'>, titlesShown: boolean): ChatRowName {
-  const title = titlesShown ? row.sessionTitle?.trim() || null : null;
-  return { title, where: agentLabel(row) };
+export function chatListRows(
+  projects: readonly Project[], statusMap: Record<string, AgentStatus | undefined>, username: string, keep: ReadonlySet<string>,
+  used: Set<string> = new Set(),
+): InboxRow[] {
+  return withoutAskPlaceholders(chatRows(buildRows([...projects], statusMap, username)), askPlaceholderProjects(projects), keep, used);
+}
+
+export interface ChatRowName {
+  /** What the row leads with: an ask's title or, untitled, its thread id (ask-<id>); else Claude's title for the session; null to lead with the project as before. */
+  title: string | null;
+  /**
+   * Under the title, or the name itself without one: the project, and the
+   * workstream when it is not main. For an ask, Claude's own title for its
+   * session when that is shown and says something else, else nothing (the
+   * project and box are in the tooltip).
+   */
+  where: string | null;
+  /** The row is an ask thread's chat, named by its title or its thread id. */
+  ask: boolean;
+}
+
+/**
+ * What a sidebar row is called. An ask thread leads with its title, or with
+ * its thread id (ask-<id>) when its caller gave none, whatever
+ * simple-ui-session-titles-enabled says; Claude's session title comes second. Otherwise, with that flag and a title Claude gave the
+ * session, the title leads and the project (and workstream) is secondary;
+ * else the row is named after the project.
+ */
+export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle' | 'askTitle' | 'askThreadId'>, titlesShown: boolean): ChatRowName {
+  const session = titlesShown ? row.sessionTitle?.trim() || null : null;
+  // Callers name their threads (the person on #743): an ask is called by its title, else by its
+  // thread id in the workstream's form (ask-<thread id>), never by anything derived.
+  const askName = row.askThreadId ? row.askTitle?.trim() || row.workstream : null;
+  if (askName) return { title: askName, where: session && session !== askName ? session : null, ask: true };
+  return { title: session, where: agentLabel(row), ask: false };
 }
 
 export interface SidebarLine {
@@ -208,14 +300,19 @@ export function repoSlug(url: string | null | undefined): string | null {
 
 /**
  * Whether a workstream's agent runs in the chat runner (the SDK chat) rather
- * than in its pane: its agent workflow, else the project's main one, is the
- * chat provider.
+ * than in its pane: its agent workflow, else the project's main one, is a
+ * chat-runner provider (any engine).
  */
 export function isSdkChat(project: Pick<Project, 'workflows' | 'workstreams'>, workstream: string): boolean {
+  return isChatRunnerProvider(chatProvider(project, workstream));
+}
+
+/** The provider of a workstream's agent workflow, else the project's main one. */
+export function chatProvider(project: Pick<Project, 'workflows' | 'workstreams'>, workstream: string): string | null | undefined {
   const ws = project.workstreams.find(w => w.name === workstream);
   const agents = project.workflows.filter(w => w.type === 'agent');
   const own = ws ? agents.find(w => w.workstreamId === ws.id) : undefined;
   const main = project.workstreams.find(w => w.name === 'main');
   const fallback = agents.find(w => main && w.workstreamId === main.id) ?? agents[0];
-  return (own ?? fallback)?.provider === CHAT_PROVIDER_ID;
+  return (own ?? fallback)?.provider;
 }

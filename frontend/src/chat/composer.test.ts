@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CHAT_MODELS, chatModelFromWire, chatModelLabel, chatModelOptions, chatModelWire, claudeModelForCreate, isChatModel, newChatCreateFields, repoListView, repoTriggerLabel, REPO_EMPTY, REPO_LOAD_ERROR,
+  CHAT_MODELS, chatAgentName, chatModelFromWire, chatModelLabel, chatModelOptions, chatModelWire, chatModelTakesPdfs, claudeModelForCreate, isChatModel, modelFamily, newChatCreateFields, repoListView, repoTriggerLabel, REPO_EMPTY, REPO_LOAD_ERROR,
 } from './composer';
 import { catalogFromWire, degradedCatalog, type RepoPick } from '../utils/repoPick';
 
@@ -62,6 +62,9 @@ describe('Fireworks models in the chat picker', () => {
 
   it('sends a Fireworks pick as its model and backend, and a tier as itself', () => {
     expect(chatModelWire(id)).toEqual({ model: KIMI, backend: 'fireworks' });
+    expect(chatModelTakesPdfs(id)).toBe(false);
+    expect(chatModelTakesPdfs('sonnet')).toBe(true);
+    expect(chatModelTakesPdfs(null)).toBe(true);
     expect(chatModelWire('sonnet')).toEqual({ model: 'sonnet' });
   });
 
@@ -87,10 +90,55 @@ describe('Fireworks models in the chat picker', () => {
     expect(chatModelLabel(id)).toBe('kimi-k3');
   });
 
+  it("keeps the viewer's Fireworks models in the flag's order", () => {
+    const glmFlash = 'accounts/fireworks/models/glm-5p3-flash';
+    const options = chatModelOptions([{ id: glmFlash, label: 'GLM 5.3 Flash' }, { id: KIMI, label: 'Kimi K3' }]);
+    expect(options.filter(o => o.fireworks).map(o => o.label)).toEqual(['GLM 5.3 Flash', 'Kimi K3']);
+  });
+
+  it('addresses the composer to the chosen model: Claude on a tier, the Fireworks model by name without its version', () => {
+    const options = chatModelOptions([{ id: KIMI, label: 'Kimi K3' }]);
+    expect(chatAgentName('opus', options)).toBe('Claude');
+    expect(chatAgentName('haiku')).toBe('Claude');
+    expect(chatAgentName(id, options)).toBe('Kimi');
+    // No label: the id's last segment, still without the version.
+    expect(chatAgentName(id)).toBe('kimi');
+    // Not yet known, or a Fireworks chat whose model the history could not say: no name rather than a wrong one.
+    expect(chatAgentName(null, options)).toBeNull();
+    expect(chatAgentName('fireworks:', options)).toBeNull();
+  });
+
+  it("drops a model label's version for the placeholder", () => {
+    expect(modelFamily('Kimi K3')).toBe('Kimi');
+    expect(modelFamily('Kimi K2.5')).toBe('Kimi');
+    expect(modelFamily('DeepSeek V4.1 Flash')).toBe('DeepSeek');
+    expect(modelFamily('GLM 5.3')).toBe('GLM');
+    expect(modelFamily('MiniMax M3')).toBe('MiniMax');
+    expect(modelFamily('GLM-4.6')).toBe('GLM');
+    expect(modelFamily('Qwen3 Coder')).toBe('Qwen');
+    expect(modelFamily('Llama 3.3 70B Instruct')).toBe('Llama');
+    // Nothing to drop, or nothing left once it is dropped: the label as it is.
+    expect(modelFamily('Mixtral')).toBe('Mixtral');
+    expect(modelFamily('4o')).toBe('4o');
+  });
+
   it("starts a chat on Fireworks through its agent's backend, with no Claude tier", () => {
     const listed = { kind: 'listed', fullName: 'acme/widget', url: 'https://github.com/acme/widget.git', defaultBranch: 'main' } as never;
     expect(claudeModelForCreate(id)).toBeNull();
     expect(newChatCreateFields(listed, id)).toMatchObject({ claudeModel: null, backend: 'fireworks', model: KIMI });
     expect(newChatCreateFields(listed, 'opus')).not.toHaveProperty('backend');
+  });
+});
+
+describe('effort', () => {
+  it('sends a level and nothing for Default, and labels each', async () => {
+    const { chatEffortWire, chatEffortLabel, isChatEffort, chatModelTakesEffort } = await import('./composer');
+    expect(chatEffortWire('default')).toBeNull();
+    expect(chatEffortWire('xhigh')).toBe('xhigh');
+    expect(chatEffortLabel('xhigh')).toBe('Extra high');
+    expect(isChatEffort('max')).toBe(true);
+    expect(isChatEffort('eleven')).toBe(false);
+    expect(chatModelTakesEffort('opus')).toBe(true);
+    expect(chatModelTakesEffort('fireworks:accounts/fireworks/models/kimi-k3')).toBe(false);
   });
 });

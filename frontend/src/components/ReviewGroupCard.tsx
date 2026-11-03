@@ -3,7 +3,7 @@ import { prsApi, type PrGroupMember, type PrGroupSuggestion, type PrReviewGroup,
 import { apiErrorText, rowParam } from '../utils/prPipeline';
 import { fmtAge } from '../utils/format';
 import {
-  acceptSuggestion, groupKey, groupProgress, groupReviewPlan, groupSize, memberInputs, memberLabel, memberStatus, moved, nextMember, parseGroupPr, suggestionWhy,
+  acceptSuggestion, groupKey, groupProgress, groupReviewPlan, groupSize, memberInputs, memberBotReview, memberLabel, memberReview, memberStatus, moved, nextMember, parseGroupPr, suggestionWhy, unreviewedCount,
 } from '../utils/prReviewGroups';
 
 /**
@@ -39,6 +39,7 @@ export function ReviewGroupCard({ group, viewer, now, selectedKey, knownRepos, o
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const next = nextMember(group, viewer);
+  const unreviewed = unreviewedCount(group, viewer);
 
   const run = async (fn: () => Promise<unknown>, failure: string): Promise<boolean> => {
     setBusy(true);
@@ -70,6 +71,7 @@ export function ReviewGroupCard({ group, viewer, now, selectedKey, knownRepos, o
           {open ? '▾' : '▸'} {group.done ? '✓ ' : ''}<span className="prg-name">{group.name}</span>
         </button>
         <span className="usage-dim">{groupSize(group)} · {groupProgress(group, viewer)}</span>
+        {!group.done && unreviewed > 0 && <span className="prg-unreviewed" title="Open PRs no one has reviewed yet (bots not counted)">{unreviewed} with no review yet</span>}
         <span className="prg-actions">
           {!group.done && next && (
             <button type="button" className="btn-ghost btn-tiny" disabled={busy} onClick={() => pickMember(next)}
@@ -95,6 +97,8 @@ export function ReviewGroupCard({ group, viewer, now, selectedKey, knownRepos, o
           {group.members.map((m, i) => {
             const key = m.row ? rowParam(m.row) : null;
             const isNext = next !== null && m === next;
+            const review = memberReview(m, viewer);
+            const bot = memberBotReview(m);
             return (
               <li key={`${m.repo}#${m.number}`}>
                 <button type="button" role="option" aria-selected={key !== null && key === selectedKey}
@@ -105,7 +109,10 @@ export function ReviewGroupCard({ group, viewer, now, selectedKey, knownRepos, o
                   <span className="prg-pos">{i + 1}</span>
                   <span className="prso-label">{memberLabel(m)}</span>
                   <span className="prg-title">{m.title}</span>
-                  <span className="prg-status usage-dim">{memberStatus(m, viewer, now)}{m.note ? <> · <em>{m.note}</em></> : null}</span>
+                  <span className="prg-status usage-dim">
+                    {review && <span className={`prs-badge prg-review prg-review--${review.kind}`} title={review.title}>{review.label}</span>}
+                    {bot && <span className={`prs-badge prg-review prg-review--bot-${bot.kind}`} title={bot.title}>{bot.label}</span>}
+                    {memberStatus(m, viewer, now)}{m.note ? <> · <em>{m.note}</em></> : null}</span>
                 </button>
               </li>
             );

@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
 import type { UsageResponse } from '../../services/api';
-import { PROVIDERS } from '../../providers/registry';
+import { PROVIDERS, providerColor } from '../../providers/registry';
+import { usePalette } from '../../theme/usePalette';
 import { dayTokens, fmtK, fmtAge, EMPTY_USAGE_DAY } from '../../utils/format';
 import { median } from '../../utils/dates';
 import { ChartCard } from './ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend, opaque } from './chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, CURSOR, DashTooltip, SeriesLegend, opaque } from './chartTheme';
 import { RangeKeys, shortDate } from './range';
 import { projectSeries, unattributedInRange, oldSchemaHosts } from './usageProjects';
 
@@ -26,6 +27,7 @@ interface Series { id: string; label: string; color: string; est?: boolean }
 export function TokensChart({ usage, unavailable, keys, stale, now, onRescan }: Props) {
   const [mode, setMode] = useState<Mode>(() => (localStorage.getItem(MODE_KEY) as Mode) || 'project');
   const [rescanning, setRescanning] = useState(false);
+  const palette = usePalette();
   const pick = (m: Mode) => { setMode(m); localStorage.setItem(MODE_KEY, m); };
 
   if (!usage) {
@@ -45,7 +47,7 @@ export function TokensChart({ usage, unavailable, keys, stale, now, onRescan }: 
       const d = byProvider[p.id];
       return d && keys.utc.some(k => d[k] && dayTokens(d[k]) > 0);
     });
-    series = providers.map(p => ({ id: p.id, label: p.displayName, color: opaque(p.color.base), est: p.usagePrecision === 'estimated' }));
+    series = providers.map(p => ({ id: p.id, label: p.displayName, color: opaque(providerColor(p, palette).base), est: p.usagePrecision === 'estimated' }));
     valueFor = (id, date) => dayTokens(byProvider[id]?.[date] ?? EMPTY_USAGE_DAY);
   } else {
     const ps = projectSeries(usage, keys.utc, 8);
@@ -130,7 +132,7 @@ export function TokensChart({ usage, unavailable, keys, stale, now, onRescan }: 
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
           <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
           <YAxis tick={TICK} tickLine={false} axisLine={false} width={40} tickFormatter={(v: number) => fmtK(v)} />
-          <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtK} total />} />
+          <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtK} total />} />
           {typical != null && (
             <ReferenceLine y={typical} stroke="var(--text-secondary)" strokeWidth={1} ifOverflow="extendDomain"
               label={{ value: `typical ${fmtK(typical)}`, position: 'insideTopRight', fill: 'var(--text-secondary)', fontSize: 10 }} />

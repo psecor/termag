@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { LineChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, YAxis } from 'recharts';
 import { spawnsApi, type SpawnNode, type SpawnSession, type SpawnUsage } from '../../services/api';
-import { PROVIDERS } from '../../providers/registry';
+import { PROVIDERS, providerBadgeStyle } from '../../providers/registry';
+import { usePalette } from '../../theme/usePalette';
 import { fmtAge, fmtK } from '../../utils/format';
 import { networkLink, sessionNetworkLink } from '../../utils/spawnNetwork';
 import {
@@ -37,11 +38,12 @@ function Meter({ label, used, limit, note }: { label: string; used: number; limi
 
 export function ProviderBadge({ id }: { id: string }) {
   const p = PROVIDERS[id];
+  const palette = usePalette();
   if (!p) return <span className="usage-dim">{id}</span>;
   return (
     <span
       className="project-provider-badge"
-      style={{ borderColor: p.color.bright.replace(/[\d.]+\)$/, '0.45)'), background: p.color.base.replace(/[\d.]+\)$/, '0.16)') }}
+      style={providerBadgeStyle(p, palette)}
       title={p.displayName}
     >{p.badge}</span>
   );

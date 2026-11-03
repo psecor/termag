@@ -50,10 +50,10 @@ export function CredentialsSection() {
             </label>
             <div className="credentials-hint">
               {!status.claudeGateway.available
-                ? 'Not set up on this orchestrator. Simple view can sign each box in to Claude Enterprise in the browser.'
+                ? 'Not set up on this orchestrator. termag can sign each box in to Claude Enterprise in the browser.'
                 : status.claudeGateway.enabled
-                  ? 'Your boxes are configured automatically. Off, or `termag-credentials skip claude-gateway` on one box, means signing that box in to Claude Enterprise. Simple view can do that in the browser.'
-                  : 'Off. Simple view can sign each box in to Claude Enterprise in the browser.'}
+                  ? 'Your boxes are configured automatically. Off, or `termag-credentials skip claude-gateway` on one box, means signing that box in to Claude Enterprise. termag can do that in the browser.'
+                  : 'Off. termag can sign each box in to Claude Enterprise in the browser.'}
             </div>
           </div>
 

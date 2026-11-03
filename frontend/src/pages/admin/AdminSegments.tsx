@@ -8,13 +8,25 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import type { NameType, ValueType } from 'recharts/types/component/DefaultTooltipContent';
 import { adminApi, type SegmentsOverview, type SegmentName } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
-import { TICK, GRID_STROKE, BAR_MAX, CHART_HEIGHT, DashTooltip } from '../dashboard/chartTheme';
+import { TICK, GRID_STROKE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip } from '../dashboard/chartTheme';
 import { useAdminPolled, DataTable, type Column } from './shared';
 
 const SEGMENT_ORDER: SegmentName[] = ['New', 'Power', 'Active', 'Passive', 'Dormant'];
 const SEGMENT_COLORS: Record<string, string> = {
-  New: '#f0c674', Power: '#7c5cff', Active: '#2f95d6',
-  Passive: '#58c2a9', Dormant: '#9aa5b1', Service: '#6e7681',
+  New: HUE.amber, Power: HUE.purple, Active: HUE.blue,
+  Passive: HUE.teal, Dormant: HUE.gray, Service: HUE.other,
+};
+/**
+ * What each rung means, in ladder order. Restates backend
+ * services/segments/rules.ts (RULES, segmentFor), the only place the
+ * numbers live; change both together.
+ */
+const SEGMENT_DEFINITIONS: Partial<Record<SegmentName, string>> = {
+  New: 'joined 3 days ago or less (checked first)',
+  Power: 'active 5+ of the last 7 days, and 2+ boxes or 5+ projects/workstreams created in the last 30 days',
+  Active: 'active 3+ of the last 7 days',
+  Passive: 'active 1 or 2 of the last 7 days',
+  Dormant: 'no active day in the last 7 days (drawn below the line)',
 };
 /** Drawn below the zero line on the ladder: users engagement has lost. */
 const BELOW: SegmentName[] = ['Dormant'];
@@ -35,7 +47,7 @@ export function AdminSegments() {
             <XAxis dataKey="date" tick={TICK} tickLine={false} axisLine={false} minTickGap={28} />
             <YAxis tick={TICK} tickLine={false} axisLine={false} width={26} allowDecimals={false} tickFormatter={count} />
             <ReferenceLine y={0} stroke="var(--text-secondary)" strokeWidth={1} strokeOpacity={0.5} />
-            <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={(p: TooltipContentProps<ValueType, NameType>) => (
+            <Tooltip cursor={CURSOR} content={(p: TooltipContentProps<ValueType, NameType>) => (
               <DashTooltip active={p.active} label={p.label} fmt={count}
                 payload={p.payload?.map(r => ({ name: String(r.name), color: r.color, dataKey: r.dataKey as string, value: Math.abs(Number(r.value)) }))} />
             )} />
@@ -45,14 +57,15 @@ export function AdminSegments() {
             ))}
           </BarChart>
         </ResponsiveContainer>
+        <SegmentDefinitions />
       </ChartCard>
 
       <ChartCard title="Today" subtitle={overview?.to} value={undefined} stale={!overview}>
         <HistogramTiles overview={overview} />
         <div className="usage-dim" style={{ marginTop: 8 }}>
           Active day: agent working time ≥ 5 min, human typing, or agent token usage.
-          Windows: 3d tenure (New) · 7d cadence (Power 5, Active 3, Passive 1) · 30d
-          for Dormant and the Power creation test (2 boxes or 5 projects/workstreams).
+          Windows: 3d tenure (New) · 7d cadence (Power 5, Active 3, Passive 1; none is
+          Dormant) · 30d for the Power creation test (2 boxes or 5 projects/workstreams).
         </div>
       </ChartCard>
 
@@ -60,7 +73,7 @@ export function AdminSegments() {
         subtitle={`7-day flows, ${overview?.transitions?.first?.slice(5) ?? '…'} → ${overview?.transitions?.last?.slice(5) ?? '…'}`}
         value={flowTotal(overview) || '…'} stale={!overview}>
         <FlowTable overview={overview} />
-        <div className="usage-dim">Dormant → anywhere means a user came back after 30 quiet days.</div>
+        <div className="usage-dim">Dormant → anywhere means a user came back after 7 or more quiet days.</div>
       </ChartCard>
 
       <DayListCard overview={overview} />
@@ -74,6 +87,24 @@ function trendRows(overview: SegmentsOverview | null): Array<Record<string, stri
     for (const s of SEGMENT_ORDER) row[s] = (d.counts.find(c => c.segment === s)?.n ?? 0) * (BELOW.includes(s) ? -1 : 1);
     return row;
   });
+}
+
+/** The rungs' definitions under the ladder, first match wins from the top. */
+function SegmentDefinitions() {
+  return (
+    <div style={{ display: 'grid', gap: 4, marginTop: 8 }}>
+      {SEGMENT_ORDER.map(s => (
+        <div key={s} className="dash-row">
+          <span className="dash-row-label">
+            <span aria-hidden style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, marginRight: 6, background: SEGMENT_COLORS[s] }} />
+            {s}
+          </span>
+          <span className="usage-dim">{SEGMENT_DEFINITIONS[s]}</span>
+        </div>
+      ))}
+      <div className="usage-dim dash-card-note">Each user gets the first segment that fits, top to bottom, every UTC day.</div>
+    </div>
+  );
 }
 
 function HistogramTiles({ overview }: { overview: SegmentsOverview | null }) {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Instance, InstanceStatus } from '../types';
-import { BoxFeed } from './boxFeed';
+import { BoxFeed, boxIsSettling } from './boxFeed';
 import { BoxStatusBus } from './boxStatusBus';
 
 const box = (status: InstanceStatus) => ({ id: 'box-1', name: 'box-1', status }) as Instance;
@@ -73,7 +73,7 @@ describe('BoxFeed', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('tells the box list about each new list, and keeps the last one when a fetch fails', async () => {
+  it('tells the box list about each new list, and keeps the last one (saying so once) when a fetch fails', async () => {
     let fail = false;
     const feed = new BoxFeed(async () => {
       if (fail) throw new Error('network');
@@ -86,7 +86,10 @@ describe('BoxFeed', () => {
     expect(onChange).toHaveBeenCalledTimes(1);
     fail = true;
     await feed.reload();
-    expect(onChange).toHaveBeenCalledTimes(1);
+    await feed.reload();
+    // Once for the change to isFailing, not again for a second failure in a row.
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(feed.isFailing()).toBe(true);
     expect(feed.getSnapshot().map(b => b.status)).toEqual(['ready']);
   });
 
@@ -202,5 +205,179 @@ describe('hasLoaded', () => {
     await feed.reload();
     expect(feed.hasLoaded()).toBe(true);
     feed.stop();
+  });
+});
+
+describe('isFresh', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('is fresh only once a list fetched since the last start() has come back', async () => {
+    const fetch = scripted('ready', 'stopped');
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+    expect(feed.isFresh()).toBe(false);
+
+    feed.start();
+    await flush();
+    expect(feed.isFresh()).toBe(true);
+
+    // The workspace unmounted. The kept list still says ready, but the box
+    // can park meanwhile: that copy is loaded, not fresh.
+    feed.stop();
+    expect(feed.hasLoaded()).toBe(true);
+    expect(feed.isFresh()).toBe(false);
+
+    feed.start();
+    expect(feed.isFresh()).toBe(false);
+    await flush();
+    expect(feed.isFresh()).toBe(true);
+    expect(feed.getSnapshot().map(b => b.status)).toEqual(['stopped']);
+  });
+
+  it('does not count a fetch begun before stop() as fresh after the next start()', async () => {
+    let answer!: (boxes: Instance[]) => void;
+    const fetch = vi.fn()
+      .mockImplementationOnce(async () => [box('ready')])
+      .mockImplementationOnce(() => new Promise<Instance[]>(r => { answer = r; }))
+      .mockImplementation(() => new Promise<Instance[]>(() => {}));
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+    feed.start();
+    await flush();
+    void feed.reload();
+    feed.stop();
+    feed.start();
+    answer([box('ready')]);
+    await flush();
+    expect(feed.isFresh()).toBe(false);
+  });
+
+  it('does not count a fetch begun while the feed was stopped as fresh after the next start()', async () => {
+    let answer!: (boxes: Instance[]) => void;
+    const fetch = vi.fn()
+      .mockImplementationOnce(async () => [box('ready')])
+      .mockImplementationOnce(() => new Promise<Instance[]>(r => { answer = r; }))
+      .mockImplementation(() => new Promise<Instance[]>(() => {}));
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+    feed.start();
+    await flush();
+    feed.stop();
+    // A start's follow-up reload, or a clone retry, while nothing owns the feed.
+    void feed.reload();
+    feed.start();
+    answer([box('ready')]);
+    await flush();
+    expect(feed.isFresh()).toBe(false);
+  });
+
+  it('retries on the poll when the fetch after start() fails, though every box has settled', async () => {
+    let fail = false;
+    const fetch = vi.fn(async () => {
+      if (fail) throw new Error('network');
+      return [box('stopped')];
+    });
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+    feed.start();
+    await flush();
+    feed.stop();
+    fail = true;
+    feed.start();
+    await flush();
+    expect(feed.isFresh()).toBe(false);
+    fail = false;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(feed.isFresh()).toBe(true);
+    // Fresh and settled: no more polling.
+    const calls = fetch.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledTimes(calls);
+    feed.stop();
+  });
+});
+
+// backend services/claimUpdate.ts; Bugbot on #1118: a row left `updating` past the bound must not keep the feed polling.
+describe('boxIsSettling for a claim update', () => {
+  it('polls while it runs, and not once it is past its bound', () => {
+    const ready = { id: 'b', name: 'b', status: 'ready', claimUpdateStatus: 'updating' } as Instance;
+    expect(boxIsSettling({ ...ready, claimUpdateStartedAt: new Date().toISOString() })).toBe(true);
+    expect(boxIsSettling({ ...ready, claimUpdateStartedAt: new Date(Date.now() - 10 * 60_000).toISOString() })).toBe(false);
+  });
+});
+
+describe('BoxFeed: a failed refresh', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps the last list, reports isFailing and tells listeners, then clears on the next good fetch', async () => {
+    let fail = false;
+    const fetch = vi.fn(async () => { if (fail) throw new Error('401'); return [box('ready')]; });
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+    let told = 0;
+    feed.subscribe(() => { told++; });
+
+    await feed.reload();
+    expect(feed.isFailing()).toBe(false);
+    told = 0;
+
+    fail = true;
+    await feed.reload();
+    expect(feed.isFailing()).toBe(true);
+    expect(feed.getSnapshot()).toEqual([box('ready')]);
+    expect(told).toBe(1);
+
+    fail = false;
+    await feed.reload();
+    expect(feed.isFailing()).toBe(false);
+  });
+
+  it('does not report a failure from an older fetch that a newer one already answered', async () => {
+    let rejectOld!: (e: Error) => void;
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => new Promise<Instance[]>((_, reject) => { rejectOld = reject; }))
+      .mockImplementation(async () => [box('ready')]);
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+
+    const old = feed.reload();
+    await feed.reload();
+    rejectOld(new Error('late'));
+    await old;
+
+    expect(feed.isFailing()).toBe(false);
+  });
+});
+
+describe('BoxFeed: reloadIfOlderThan and a restart', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('skips a reload while the last list is fresh, reloads once it is older, and always while failing', async () => {
+    let fail = false;
+    const fetch = vi.fn(async () => { if (fail) throw new Error('down'); return [box('ready')]; });
+    const feed = new BoxFeed(fetch, new BoxStatusBus(), 5000);
+
+    await feed.reload();
+    await feed.reloadIfOlderThan(30_000);
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    await feed.reloadIfOlderThan(30_000);
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    fail = true;
+    await feed.reload();
+    await feed.reloadIfOlderThan(30_000);
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('forgets a failure from before stop() when it starts again', async () => {
+    let fail = true;
+    const feed = new BoxFeed(async () => { if (fail) throw new Error('401'); return [box('ready')]; }, new BoxStatusBus(), 5000);
+    await feed.reload();
+    expect(feed.isFailing()).toBe(true);
+    feed.stop();
+    fail = false;
+    feed.start();
+    expect(feed.isFailing()).toBe(false);
+    await flush();
+    expect(feed.isFailing()).toBe(false);
   });
 });

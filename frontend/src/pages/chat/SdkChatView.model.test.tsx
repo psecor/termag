@@ -48,7 +48,7 @@ import { ChatChromeProvider } from './chatChrome';
 import { resetBackendChoicesForTests } from '../../providers/useBackendChoices';
 
 const project = {
-  id: 'p1', name: 'web', instanceId: null, repoUrl: null, setupStatus: 'ready', setupError: null, role: 'owner',
+  id: 'p1', name: 'web', instanceId: null, repoUrl: null, setupStatus: 'ready', setupError: null, role: 'owner', workflows: [], workstreams: [],
 } as unknown as Project;
 
 function historyOn(model: string, backend?: string) {
@@ -220,6 +220,23 @@ describe('SdkChatView model control', () => {
       expect(mocks.send).toHaveBeenLastCalledWith('p1', 'main', 'try kimi', [], `fireworks:${KIMI}`);
     });
 
+    it("lists the Fireworks models in the flag's order, whatever the default", async () => {
+      // The fireworks-models variation that lists GLM 5.3 Flash first (backend order: fireworksMenu.test.ts).
+      const id = (n: string) => `accounts/fireworks/models/${n}`;
+      mocks.models.mockResolvedValue({ providers: { 'claude-chat': [
+        { id: null, label: 'Default', models: [] },
+        { id: 'fireworks', label: 'Fireworks', models: [
+          { id: id('glm-5p3-flash'), label: 'GLM 5.3 Flash' }, { id: KIMI, label: 'Kimi K3' },
+          { id: id('deepseek-v4p1-flash'), label: 'DeepSeek V4.1 Flash' }, { id: id('glm-5p3'), label: 'GLM 5.3' },
+        ] },
+      ] } });
+      mocks.history.mockResolvedValue(historyOn(KIMI, 'fireworks'));
+      await render();
+      await act(async () => { modelButton().click(); });
+      expect([...document.querySelectorAll('[role="option"]')].map(o => o.textContent))
+        .toEqual(['Opus 5.5', 'Sonnet 5.5', 'Haiku 4.5', 'GLM 5.3 Flash', 'Kimi K3', 'DeepSeek V4.1 Flash', 'GLM 5.3']);
+    });
+
     it('shows a chat that runs on Fireworks by its model', async () => {
       mocks.history.mockResolvedValue(historyOn(KIMI, 'fireworks'));
       await render();
@@ -239,7 +256,7 @@ describe('SdkChatView model control', () => {
 describe('SdkChatView header on a phone', () => {
   const headerButtons = () => [...document.querySelectorAll<HTMLButtonElement>('.chat-header button')].map(b => b.getAttribute('aria-label') ?? b.textContent);
 
-  it('is one row: Sessions, the agent and its name, then ⋮ with Archive and Full UI', async () => {
+  it('is one row: Sessions, the agent and its name, then ⋮ with Archive, Open in Lab and Open in termag desktop', async () => {
     mocks.history.mockResolvedValue(historyOn('sonnet'));
     await render(true);
     expect(document.querySelector('.chat-header .chat-agent-icon')).not.toBeNull();
@@ -250,7 +267,7 @@ describe('SdkChatView header on a phone', () => {
     expect(more.getAttribute('aria-haspopup')).toBe('menu');
     await act(async () => { more.click(); });
     const items = [...document.querySelectorAll('.chat-ctx-menu [role=menuitem]')].map(b => b.textContent);
-    expect(items).toEqual(['Archive', 'Open in full UI']);
+    expect(items).toEqual(['Archive', 'Open in Lab', 'Open in termag desktop']);
     expect(more.getAttribute('aria-expanded')).toBe('true');
   });
 

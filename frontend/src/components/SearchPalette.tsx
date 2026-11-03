@@ -28,7 +28,7 @@ type PaneState =
   | { q: string; state: 'error'; error: string };
 
 /** The query's occurrences in one line of pane text, marked; text only, never markup. */
-function Highlight({ text, needle }: { text: string; needle: string }) {
+export function Highlight({ text, needle }: { text: string; needle: string }) {
   const n = needle.toLowerCase();
   const out: React.ReactNode[] = [];
   const lower = text.toLowerCase();
@@ -72,14 +72,21 @@ interface Source {
   openPr?: (row: PrRow) => void;
   /** A session's box name: found by the search and shown as a pill on its result. */
   boxNameOf?: (row: InboxRow) => string | null;
+  /** What a session is called where that isn't its project (the simple UI's session titles): found by the search too. */
+  nameOf?: (row: InboxRow) => string | null;
 }
+
+/** What draws the open palette: Palette here, or the simple UI's under its chrome refresh (pages/chat/ChatPalette.tsx). */
+export type PaletteViewProps = Source & { actions: PaletteAction[]; onClose: () => void };
 
 /**
  * ⌘K, trigger and shortcut, with its sessions and their opening passed in:
  * SearchPalette in the workspace, DashboardSearch on the dashboard (no
- * ProjectContext there).
+ * ProjectContext there). `view` draws the open palette; Palette by default.
  */
-export function PaletteLauncher({ actions = [], offline = false, ...source }: Source & { actions?: PaletteAction[]; offline?: boolean }) {
+export function PaletteLauncher({ actions = [], offline = false, view: View = Palette, ...source }: Source & {
+  actions?: PaletteAction[]; offline?: boolean; view?: React.ComponentType<PaletteViewProps>;
+}) {
   const [open, setOpen] = useState(false);
   useEffect(() => { if (offline) setOpen(false); }, [offline]);
   // Counted as it opens, with what opened it (custom event).
@@ -93,7 +100,7 @@ export function PaletteLauncher({ actions = [], offline = false, ...source }: So
   const returnFocus = useRef<HTMLElement | null>(null);
   const noteFocus = () => {
     const el = document.activeElement;
-    if (el instanceof HTMLElement && !el.closest('.palette')) returnFocus.current = el;
+    if (el instanceof HTMLElement && !el.closest('.palette, .chat-palette')) returnFocus.current = el;
   };
   useEffect(() => {
     if (open) return;
@@ -136,12 +143,17 @@ export function PaletteLauncher({ actions = [], offline = false, ...source }: So
       <button type="button" className="search-trigger" onClick={() => { openedVia.current = 'button'; noteFocus(); setOpen(true); }} disabled={offline} title={`Search sessions, pull requests and pane text (${SHORTCUT})`}>
         <span>⌕ Search…</span><kbd>{SHORTCUT}</kbd>
       </button>
-      {open && createPortal(<Palette actions={actions} {...source} onClose={() => setOpen(false)} />, document.body)}
+      {open && createPortal(<View actions={actions} {...source} onClose={() => setOpen(false)} />, document.body)}
     </>
   );
 }
 
-function Palette({ actions, rows, now, openTarget, openPr, boxNameOf, onClose }: Source & { actions: PaletteAction[]; onClose: () => void }) {
+/**
+ * What the open palette lists and does, whichever view draws it: the query,
+ * every item in display order (utils/searchPalette.ts), the recent searches,
+ * the pane search, and `choose`, which opens or runs an item.
+ */
+export function usePaletteModel({ actions, rows, now, openTarget, openPr, boxNameOf, nameOf, onClose }: PaletteViewProps) {
   const navigate = useNavigate();
   const location = useLocation();
   // The PR list, once per opening (the route answers from its cache); without GitHub, no section.
@@ -153,9 +165,7 @@ function Palette({ actions, rows, now, openTarget, openPr, boxNameOf, onClose }:
   }, []);
   const { rows: recents } = useRecents(10);
   const [query, setQuery] = useState('');
-  const [active, setActive] = useState(0);
   const [history, setHistory] = useState<string[]>(() => readRecentSearches(store()));
-  const listRef = useRef<HTMLDivElement>(null);
   const remember = (q: string) => {
     const next = pushRecentSearch(history, q);
     setHistory(next);
@@ -183,25 +193,19 @@ function Palette({ actions, rows, now, openTarget, openPr, boxNameOf, onClose }:
   const q = query.trim();
   const searching = q.length > 0;
   const matched = useMemo(() => matchActions(actions, query), [actions, query]);
-  const hits = useMemo(() => searchRows(rows, query, boxNameOf), [rows, query, boxNameOf]);
+  const suggested = useMemo(() => actions.filter(a => a.suggested), [actions]);
+  const hits = useMemo(() => searchRows(rows, query, boxNameOf, nameOf), [rows, query, boxNameOf, nameOf]);
   const prHits = useMemo(() => searchPrRows(prs, query, PR_LIMIT), [prs, query]);
   const recent = useMemo(() => recentSessions(rows, recents, now), [rows, recents, now]);
   const paneDone = pane?.q === q && pane.state === 'done' ? pane.result : null;
 
   const items = useMemo(
-    () => paletteItems({ q, actions: matched, history, recent, hits, prs: prHits, paneQuery: pane?.q ?? null, paneResult: paneDone }),
-    [q, matched, history, recent, hits, prHits, pane?.q, paneDone],
+    () => paletteItems({ q, actions: matched, history, recent, suggested, hits, prs: prHits, paneQuery: pane?.q ?? null, paneResult: paneDone }),
+    [q, matched, history, recent, suggested, hits, prHits, pane?.q, paneDone],
   );
 
-  useEffect(() => { setActive(0); }, [query]);
-  // The list can shrink under the highlight (a forgotten search, the
-  // pane-text item giving way to fewer hits).
-  useEffect(() => { setActive(i => clampIndex(i, items.length)); }, [items.length]);
-  useEffect(() => {
-    listRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)?.scrollIntoView({ block: 'nearest' });
-  }, [active]);
-
   const choose = (item: Item) => {
+    if (item.kind === 'action' && item.action.disabled) return;
     const event = paletteSelectEvent(item, q);
     trackEvent(event.key, event.data);
     if (item.kind === 'recent-query') { setQuery(item.q); remember(item.q); searchPanes(item.q); return; }
@@ -227,6 +231,29 @@ function Palette({ actions, rows, now, openTarget, openPr, boxNameOf, onClose }:
     if (new URLSearchParams(location.search).has(PRS_PARAM)) navigate({ search: prsSearch(location.search, null) }, { replace: true });
     openTarget(item.kind === 'row' ? rowTarget(item.row) : hitTarget(item.hit));
   };
+  /** Enter with nothing to open: search the pane text for the query. */
+  const searchPaneText = () => {
+    if (!searching) return;
+    remember(query);
+    searchPanes(query);
+  };
+
+  return { query, setQuery, q, searching, items, matched, hits, prs, prHits, recent, history, forget, pane, paneDone, choose, searchPaneText };
+}
+
+function Palette(props: PaletteViewProps) {
+  const { now, boxNameOf, onClose } = props;
+  const { query, setQuery, q, searching, items, matched, hits, prs, prHits, recent, history, forget, pane, paneDone, choose, searchPaneText } = usePaletteModel(props);
+  const [active, setActive] = useState(0);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => { setActive(0); }, [query]);
+  // The list can shrink under the highlight (a forgotten search, the
+  // pane-text item giving way to fewer hits).
+  useEffect(() => { setActive(i => clampIndex(i, items.length)); }, [items.length]);
+  useEffect(() => {
+    listRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`)?.scrollIntoView({ block: 'nearest' });
+  }, [active]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); setActive(i => Math.min(items.length - 1, i + 1)); return; }
@@ -234,7 +261,7 @@ function Palette({ actions, rows, now, openTarget, openPr, boxNameOf, onClose }:
     if (e.key === 'Enter') {
       e.preventDefault();
       if (items[active]) choose(items[active]);
-      else if (searching) { remember(query); searchPanes(query); }
+      else searchPaneText();
     }
   };
 

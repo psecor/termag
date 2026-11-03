@@ -71,6 +71,22 @@ describe('ReviewGroupCard', () => {
     expect(items[1].querySelector('.prg-status')?.textContent).toBe('by dev · not asked of you · merge after 646 is deployed');
     expect(items[2].querySelector('.prg-status')?.textContent).toBe('needs your review');
   });
+  it('marks whether anyone has reviewed each open member, and heads the card with how many no one has', () => {
+    const none = { approved: [], changes: [], commented: [], botsApproved: ['cursor'], botsChanges: [] };
+    const g: PrReviewGroup = { ...BRIDGE, members: [
+      member('example-org/termag', 646, { askedYou: false, reviewers: { ...none, approved: ['alice'] } }),
+      member('example-org/termag', 647, { reviewers: none }),
+      member('example-org/termag', 648, { state: 'merged', checked: true, askedYou: false, reviewers: null }),
+    ] };
+    render(<ReviewGroupCard group={g} viewer="me" now={NOW} selectedKey={null} knownRepos={[]} onPick={vi.fn()} onChanged={vi.fn()} onError={vi.fn()} />);
+    expect(host.querySelector('.prg-unreviewed')?.textContent).toBe('1 with no review yet');
+    const pills = [...host.querySelectorAll('.prg-member')].map(i => [...i.querySelectorAll('.prg-review')].map(p => p.textContent));
+    expect(pills).toEqual([['approved', 'cursor approved'], ['no review yet', 'cursor approved'], []]);
+    expect(host.querySelector('.prg-review')?.getAttribute('title')).toBe('Approved by alice.');
+    expect(host.querySelectorAll('.prg-member')[1].querySelector('.prg-review')?.className).toContain('prg-review--none');
+    expect(host.querySelector('.prg-review--bot-approved')?.getAttribute('title')).toContain('Not the end of the review.');
+    expect(host.querySelectorAll('.prg-member')[1].querySelector('.prg-status')?.textContent).toBe('no review yetcursor approvedneeds your review');
+  });
   it('picks a member\'s row, and Review next picks the first one not checked off', async () => {
     const onPick = vi.fn();
     render(<ReviewGroupCard group={BRIDGE} viewer="me" now={NOW} selectedKey={null} knownRepos={[]} onPick={onPick} onChanged={vi.fn()} onError={vi.fn()} />);

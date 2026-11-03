@@ -28,7 +28,9 @@ describe('terminal hold', () => {
     expect(refusalFromSend('terminal-holds')).toBe(true);
     expect(TERMINAL_HOLD_VIEW.text).not.toMatch(/\/exit/);
     expect(TERMINAL_HOLD_VIEW.returnLabel).toMatch(/Return it to this chat/);
-    expect(TERMINAL_HOLD_VIEW.fullUiLabel).toMatch(/full UI/);
+    expect(TERMINAL_HOLD_VIEW.fullUiLabel).toBe('Continue in Lab');
+    expect(TERMINAL_HOLD_VIEW.text).toBe("Claude is open in Lab, so this chat can't send yet.");
+    expect(TERMINAL_HOLD_VIEW.statusText).toBe('Open in Lab');
   });
 
   it('a history poll that says Claude has left clears the refusal so Send works', () => {
@@ -48,7 +50,7 @@ describe('terminal hold', () => {
 });
 
 describe('TerminalHoldNotice', () => {
-  it('offers return and the full UI, and does not tell anyone to type /exit', () => {
+  it('offers return and Lab, and does not tell anyone to type /exit', () => {
     const calls: string[] = [];
     act(() => root.render(
       <TerminalHoldNotice busy={false} onReturn={() => calls.push('return')} onFullUi={() => calls.push('full')} />,

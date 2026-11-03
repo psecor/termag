@@ -1,4 +1,4 @@
-import { lastNDaysUTC, previousNDaysUTC, todayDates, utcToday } from '../../utils/dates';
+import { lastNDays, lastNDaysUTC, localToday, previousNDays, previousNDaysUTC, utcToday } from '../../utils/dates';
 
 export type Range = 'today' | '7d' | '30d';
 export const RANGES: Array<{ id: Range; label: string }> = [
@@ -10,7 +10,7 @@ export interface RangeKeys {
   utc: string[];
   /** Prior period of the same length (for deltas); for Today, the trailing 14 UTC days. */
   priorUtc: string[];
-  /** Keys for worktime (server-local dates) — Today merges local+UTC. */
+  /** Keys for worktime: the person's own local days (termag banks it in this browser's zone). */
   worktime: string[];
   priorWorktime: string[];
   isToday: boolean;
@@ -21,14 +21,14 @@ export function rangeKeys(range: Range): RangeKeys {
   if (range === 'today') {
     return {
       utc: [utcToday()], priorUtc: previousNDaysUTC(14, 1),
-      worktime: todayDates(), priorWorktime: previousNDaysUTC(14, 1),
+      worktime: [localToday()], priorWorktime: previousNDays(14, 1),
       isToday: true, label: 'today',
     };
   }
   const n = range === '7d' ? 7 : 30;
   const utc = lastNDaysUTC(n);
   const prior = previousNDaysUTC(n, n);
-  return { utc, priorUtc: prior, worktime: utc, priorWorktime: prior, isToday: false, label: `last ${n} days` };
+  return { utc, priorUtc: prior, worktime: lastNDays(n), priorWorktime: previousNDays(n, n), isToday: false, label: `last ${n} days` };
 }
 
 /**

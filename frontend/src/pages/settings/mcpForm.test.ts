@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { connectorStatus, formatHeaderLines, linkResult, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { connectorStatus, formatHeaderLines, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { PROVIDERS } from '../../providers/registry';
 
 describe('parseHeaderLines', () => {
   it('reads Name: value lines, lowercasing names and keeping colons in values', () => {
@@ -65,8 +66,18 @@ describe('connectorStatus', () => {
     expect(connectorStatus({ authType: 'static', missingSecrets: [], secretNames: null })).toEqual({ label: 'secrets unreadable', tone: 'bad' });
   });
 
-  it('is linked or not linked for an OAuth server, whatever its secrets say', () => {
-    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: null, linkStatus: 'linked' })).toEqual({ label: 'linked', tone: 'good' });
-    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: [], linkStatus: 'needs_link' })).toEqual({ label: 'not linked', tone: 'warn' });
+  it('is authed or not authed for an OAuth server, whatever its secrets say', () => {
+    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: null, linkStatus: 'linked' })).toEqual({ label: 'authed', tone: 'good' });
+    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: [], linkStatus: 'needs_link' })).toEqual({ label: 'not authed', tone: 'warn' });
+  });
+});
+
+describe('mcpAgentNames', () => {
+  it('names Claude Code first, then each other agent the connectors reach, once', () => {
+    expect(mcpAgentNames(PROVIDERS)).toBe('Claude Code, Codex, Cursor, Gemini, Augment, Devin, pi and Mistral');
+  });
+
+  it('is Claude Code alone when no other agent has connectors', () => {
+    expect(mcpAgentNames({ claude: { id: 'claude', displayName: 'Claude', mcpConnectors: true }, deepseek: { id: 'deepseek', displayName: 'DeepSeek' } })).toBe('Claude Code');
   });
 });

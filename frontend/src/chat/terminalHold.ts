@@ -1,4 +1,4 @@
-// The simple UI hides the terminal. A Claude left open by "Open in full UI"
+// The simple UI hides the terminal. A Claude left open by "Open in Lab"
 // must not be a red line that says to type /exit there. History reports
 // whether that Claude is still the pane's foreground. A later poll that says
 // it is gone clears a send the pane refused, so Send works again.
@@ -6,10 +6,10 @@
 export const TERMINAL_HOLDS_CODE = 'terminal-holds';
 
 export const TERMINAL_HOLD_VIEW = {
-  statusText: 'Open in the full UI',
-  text: 'Claude is open in the full UI, so this chat cannot send yet.',
+  statusText: 'Open in Lab',
+  text: "Claude is open in Lab, so this chat can't send yet.",
   returnLabel: 'Return it to this chat',
-  fullUiLabel: 'Continue in the full UI',
+  fullUiLabel: 'Continue in Lab',
 } as const;
 
 export interface HoldState {

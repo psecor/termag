@@ -1,22 +1,17 @@
 import React from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import type { BriefingCharts as Charts } from '../services/api';
-import { PROVIDERS } from '../providers/registry';
+import { PROVIDERS, providerColor } from '../providers/registry';
+import { usePalette } from '../theme/usePalette';
 import { HUMAN } from '../utils/worktime';
 import { fmtDurationShort, fmtK } from '../utils/format';
 import { ChartCard } from '../pages/dashboard/ChartCard';
-import { TICK, GRID_STROKE, BAR_MAX, DashTooltip, SeriesLegend, opaque } from '../pages/dashboard/chartTheme';
+import { TICK, GRID_STROKE, BAR_MAX, CURSOR, DashTooltip, SeriesLegend, opaque } from '../pages/dashboard/chartTheme';
 import { shortDate } from '../pages/dashboard/range';
 
 const H = 3_600_000;
 const HEIGHT = 140;
 const hoursTick = (ms: number) => (ms >= H ? `${Math.round(ms / H)}h` : ms > 0 ? `${Math.round(ms / 60_000)}m` : '0');
-
-// The dashboard's own colors for the same two entities, so "you" and "agents"
-// read the same here as in the Activity chart below the card.
-const YOU = opaque(PROVIDERS[HUMAN].color.bright);
-const AGENTS = opaque(PROVIDERS.claude.color.base);
-const SERIES = [{ id: 'agentMs', label: 'Agents', color: AGENTS }, { id: 'humanMs', label: 'You', color: YOU }];
 
 /**
  * The briefing's "At a glance": the last seven days
@@ -25,6 +20,12 @@ const SERIES = [{ id: 'agentMs', label: 'Agents', color: AGENTS }, { id: 'humanM
  * Series come from the briefing row, so an old briefing keeps its charts.
  */
 export function BriefingCharts({ charts }: { charts: Charts }) {
+  // The dashboard's own colors for the same two entities, so "you" and "agents"
+  // read the same here as in the Activity chart below the card.
+  const palette = usePalette();
+  const YOU = opaque(providerColor(PROVIDERS[HUMAN], palette).bright);
+  const AGENTS = opaque(providerColor(PROVIDERS.claude, palette).base);
+  const SERIES = [{ id: 'agentMs', label: 'Agents', color: AGENTS }, { id: 'humanMs', label: 'You', color: YOU }];
   const days = charts.days.map(d => ({ ...d, label: shortDate(d.day) }));
   const anyTime = days.some(d => d.humanMs + d.agentMs > 0);
   const anyTokens = days.some(d => d.tokens > 0);
@@ -44,7 +45,7 @@ export function BriefingCharts({ charts }: { charts: Charts }) {
               <CartesianGrid vertical={false} stroke={GRID_STROKE} />
               <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={16} />
               <YAxis tick={TICK} tickLine={false} axisLine={false} width={32} tickFormatter={hoursTick} />
-              <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtDurationShort} />} />
+              <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtDurationShort} />} />
               <Bar dataKey="agentMs" name="Agents" fill={AGENTS} maxBarSize={BAR_MAX} radius={[4, 4, 0, 0]} isAnimationActive={false} />
               <Bar dataKey="humanMs" name="You" fill={YOU} maxBarSize={BAR_MAX} radius={[4, 4, 0, 0]} isAnimationActive={false} />
             </BarChart>
@@ -63,7 +64,7 @@ export function BriefingCharts({ charts }: { charts: Charts }) {
               <CartesianGrid vertical={false} stroke={GRID_STROKE} />
               <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={16} />
               <YAxis tick={TICK} tickLine={false} axisLine={false} width={46} tickFormatter={(n: number) => fmtK(Math.round(n))} />
-              <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={n => fmtK(Math.round(n))} />} />
+              <Tooltip cursor={CURSOR} content={<DashTooltip fmt={n => fmtK(Math.round(n))} />} />
               <Bar dataKey="tokens" name="Tokens" fill={AGENTS} maxBarSize={BAR_MAX} radius={[4, 4, 0, 0]} isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>

@@ -1,4 +1,5 @@
 import { SETUP_STATUSES, type Instance, type Project, type SetupStatus } from '../types';
+import { claimUpdateLive } from './boxFeed';
 
 export type ClonePhase = 'waiting' | 'cloning' | 'failed';
 
@@ -22,6 +23,13 @@ const VIEWS: Record<SetupStatus, CloneTileView> = {
   failed: { phase: 'failed', label: 'clone failed', holdTerminal: true, retry: true, startEmpty: true },
 };
 
+// A box just claimed from the pool, updating before its first launch
+// (backend services/claimUpdate.ts): the clone, or an empty project's agent,
+// follows once it is done.
+const BOX_UPDATING: CloneTileView = {
+  phase: 'waiting', label: 'updating the box…', holdTerminal: true, retry: false, startEmpty: false,
+};
+
 const BOX_FAILED: CloneTileView = {
   phase: 'failed', label: 'box failed', holdTerminal: true, retry: true, startEmpty: false,
 };
@@ -36,6 +44,7 @@ export interface SetupContext {
   boxFailed?: boolean;
   boxError?: string | null;
   hasRepo?: boolean;
+  boxUpdating?: boolean;
 }
 
 /**
@@ -48,7 +57,7 @@ export interface SetupContext {
  */
 export function setupContext(
   project: Pick<Project, 'instanceId' | 'repoUrl' | 'role'>,
-  boxes: readonly Pick<Instance, 'id' | 'status' | 'provisioningError'>[],
+  boxes: readonly Pick<Instance, 'id' | 'status' | 'provisioningError' | 'claimUpdateStatus' | 'claimUpdateStartedAt'>[],
   absenceConfirmed: boolean,
 ): SetupContext {
   const box = project.instanceId ? boxes.find(b => b.id === project.instanceId) : undefined;
@@ -57,6 +66,7 @@ export function setupContext(
     boxFailed: gone || box?.status === 'failed',
     boxError: box?.provisioningError ?? null,
     hasRepo: !!project.repoUrl,
+    boxUpdating: claimUpdateLive(box),
   };
 }
 
@@ -69,6 +79,7 @@ function isSetupStatus(value: string): value is SetupStatus {
 }
 
 export function cloneTile(setupStatus: string | null | undefined, ctx: SetupContext = {}): CloneTileView {
+  if (ctx.boxUpdating && (setupStatus == null || setupStatus === '' || setupStatus === 'none' || setupStatus === 'pending')) return BOX_UPDATING;
   if (setupStatus == null || setupStatus === '') return OPEN;
   if (!isSetupStatus(setupStatus)) return UNRECOGNIZED;
   if (setupStatus === 'pending' && ctx.boxFailed) return BOX_FAILED;

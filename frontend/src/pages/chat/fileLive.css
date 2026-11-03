@@ -1,0 +1,35 @@
+/* The live file view's cue (SpaceFileLive.tsx): a small pill just under the
+   header of the file view (.chat-conv is position: relative). It floats over
+   the content rather than pushing it, so nothing moves when it comes and goes. */
+.fv-live-cue {
+  position: absolute;
+  top: calc(56px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 2px 8px rgba(var(--shadow-rgb), calc(0.25 * var(--shadow-strength)));
+  animation: fv-live-cue-in 160ms ease-out;
+}
+.fv-live-cue[hidden] { display: none; }
+.fv-live-cue a { color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
+@keyframes fv-live-cue-in {
+  from { opacity: 0; transform: translate(-50%, -4px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fv-live-cue { animation: none; }
+}

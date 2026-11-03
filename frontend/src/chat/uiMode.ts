@@ -4,7 +4,10 @@
 // recorded opens /chat instead, so coming back to termag lands where the
 // user left it. Only that first load is redirected: a link or the back
 // button to `/` inside the app, and any deep link (`/?project=…`), open the
-// workspace.
+// workspace, except a share link its owner opened, which opens in the simple
+// UI's side panel (simpleUiShareHandoff).
+
+import { recordProductEvent } from '../observability';
 
 export const UI_MODE_KEY = 'termag-ui-mode';
 
@@ -26,7 +29,33 @@ function local(): Storage | null {
 }
 
 export function currentUiMode(): UiMode { return readUiMode(local()); }
-export function recordUiMode(mode: UiMode): void { writeUiMode(local(), mode); }
+
+/** What this browser has recorded, or null when it has recorded nothing yet. */
+function storedUiMode(): UiMode | null {
+  try {
+    const v = local()?.getItem(UI_MODE_KEY);
+    return v === 'simple' || v === 'full' ? v : null;
+  } catch { return null; }
+}
+// Told each time a visit records where it is, so the choice can be kept on
+// the user as well (contexts/AuthContext.tsx).
+const recorded = new Set<(mode: UiMode) => void>();
+export function onUiModeRecorded(listener: (mode: UiMode) => void): () => void {
+  recorded.add(listener);
+  return () => { recorded.delete(listener); };
+}
+
+export function recordUiMode(mode: UiMode): void {
+  const before = storedUiMode();
+  writeUiMode(local(), mode);
+  // A move between the simple UI and the workspace. Not a browser's
+  // first visit, which has nothing to move from (first run has welcome.mode.chosen), nor adoptUiMode.
+  if (before && before !== mode) recordProductEvent('ui.mode.switched', { 'termag.from': before, 'termag.to': mode });
+  recorded.forEach(listener => listener(mode));
+}
+
+/** The user's kept choice, applied to this browser before any route reads it; not reported back. */
+export function adoptUiMode(mode: UiMode): void { writeUiMode(local(), mode); }
 
 /** The router path (BrowserRouter's basename is /termag) plus query of a page URL. */
 export function routerEntry(loc: { pathname: string; search: string }): string {
@@ -61,4 +90,25 @@ export function shouldOpenSimpleUi(i: {
   if (i.locationKey !== INITIAL_LOCATION_KEY) return false;
   if (i.entry == null || i.here !== i.entry) return false;
   return i.here === '/';
+}
+
+/**
+ * A share link its owner opened, in the simple UI when that is where this
+ * browser was last. The backend sends them to the workspace's own pane
+ * (`/?project=&ws=&browser=open&browserShare=&browserAt=`, routes/previewShares.ts);
+ * this is the same in the chat, `/chat/p/<project>?ws=&browser=open&…`, whose
+ * side panel then opens on Browser at the share (useBrowserShareHandoff).
+ * Null for anything else, and without the side panel, which opens the workspace.
+ */
+export function simpleUiShareHandoff(i: { flagOn: boolean; sidePanelOn: boolean; mode: UiMode; search: string }): string | null {
+  if (!i.flagOn || !i.sidePanelOn || i.mode !== 'simple') return null;
+  const sp = new URLSearchParams(i.search);
+  const project = sp.get('project');
+  if (!project || sp.get('browser') !== 'open') return null;
+  const q = new URLSearchParams({ ws: sp.get('ws') || 'main' });
+  for (const key of ['browser', 'browserShare', 'browserAt']) {
+    const value = sp.get(key);
+    if (value != null) q.set(key, value);
+  }
+  return `/chat/p/${encodeURIComponent(project)}?${q}`;
 }

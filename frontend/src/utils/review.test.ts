@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { guessExplanation, parsePrInput, parsePrInputFull, renderReviewTemplate, reviewerDisplayName, reviewPromptHeader, reviewStateLabel, reviewStateText, reviewTargetView, type PrGuess } from './review';
+import { guessExplanation, mismatchNote, parsePrInput, parsePrInputFull, renderReviewTemplate, reviewerDisplayName, reviewPromptHeader, reviewStateLabel, reviewStateText, reviewTargetView, templateForRepo, type PrGuess } from './review';
 
 describe('parsePrInput', () => {
   it('accepts a number, #number, "PR 123" and a GitHub PR URL', () => {
@@ -108,5 +108,40 @@ describe('reviewPromptHeader', () => {
       .toBe('Review GitHub pull request #342 (https://github.com/example-org/termag/pull/342) in the repository example-org/termag. Pass --repo example-org/termag to every gh command: the current directory may be a different repository, or none.');
     expect(reviewPromptHeader(342, null)).toBe('Review GitHub pull request #342 for the repository in the current directory.');
     expect(reviewPromptHeader(null, null)).toBe('Review GitHub pull request #… for the repository in the current directory.');
+  });
+});
+
+describe('reviewTargetView for a multi-repo workstream', () => {
+  const repos = ['acme/web', 'acme/api'];
+  const g: PrGuess = { number: 12, url: null, title: null, branch: null, state: null, source: 'pane' };
+  it('refuses a bare number, naming its repositories', () => {
+    const v = reviewTargetView({ pr: 12, typedUrl: null, guess: g, repo: null, repoKnown: true, repos });
+    expect(v.url).toBeNull();
+    expect(v.problem).toMatch(/several repositories \(acme\/web, acme\/api\).*owner\/repo#12/);
+  });
+  it('takes a URL of one of them, and warns for a PR of none of them', () => {
+    const ok = reviewTargetView({ pr: 12, typedUrl: 'https://github.com/acme/api/pull/12', guess: null, repo: null, repoKnown: true, repos });
+    expect(ok).toMatchObject({ repo: 'acme/api', problem: null, mismatch: null });
+    expect(mismatchNote(ok)).toBeNull();
+    const other = reviewTargetView({ pr: 12, typedUrl: 'https://github.com/acme/docs/pull/12', guess: null, repo: null, repoKnown: true, repos });
+    expect(mismatchNote(other)).toBe('Not one of this workstream\'s repositories (acme/web, acme/api). Check it is the PR you mean.');
+  });
+  it('with the flag off (no repos passed), reads as a directory with no remote, as before', () => {
+    expect(reviewTargetView({ pr: 12, typedUrl: null, guess: g, repo: null, repoKnown: true, repos: null }).problem).toMatch(/no GitHub remote/);
+    const single = reviewTargetView({ pr: 342, typedUrl: 'https://github.com/example-org/webapp/pull/342', guess: null, repo: 'example-org/termag', repoKnown: true });
+    expect(mismatchNote(single)).toBe('Not this workstream\'s repository (example-org/termag). Check it is the PR you mean.');
+  });
+});
+
+describe('templateForRepo', () => {
+  const templates = [{ repo: 'example-org/termag', template: 'A' }, { repo: 'e2e-octocat/shop-web', template: 'B' }];
+  it("is the PR's repository's template, matched case-insensitively", () => {
+    expect(templateForRepo('e2e-octocat/shop-web', templates)?.template).toBe('B');
+    expect(templateForRepo('Example-Org/Termag', templates)?.template).toBe('A');
+  });
+  it('is null for a PR of none of them, no PR, or one repository', () => {
+    expect(templateForRepo('o/other', templates)).toBeNull();
+    expect(templateForRepo(null, templates)).toBeNull();
+    expect(templateForRepo('example-org/termag', undefined)).toBeNull();
   });
 });

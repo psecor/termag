@@ -109,6 +109,63 @@ describe('BrowserPane redials', () => {
   });
 });
 
+describe('BrowserPane mouse input', () => {
+  const ownerPane = async () => {
+    await act(async () => { root.render(<BrowserPane projectId="p1" workstream="main" url="http://127.0.0.1:3000/" onUrlChange={() => {}} />); });
+    await act(async () => { vi.advanceTimersByTime(10); });
+    const ws = RecordingSocket.made[0];
+    await act(async () => { ws.onmessage!({ data: JSON.stringify({ type: 'ready' }) }); });
+    return ws;
+  };
+  const mouseSent = (ws: RecordingSocket) => ws.sent
+    .filter(m => (m as { type: string }).type === 'input')
+    .map(m => (m as { event: { kind: string; type: string } }).event)
+    .filter(e => e.kind === 'mouse')
+    .map(e => e.type);
+  const press = (canvas: HTMLCanvasElement) => act(async () => { canvas.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, buttons: 1, detail: 1 })); });
+  const release = (target: EventTarget) => act(async () => { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0, buttons: 0, detail: 1 })); });
+
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('releases every press, where an addEventListener patch ignores a once listener added again', async () => {
+    // What a session recorder's user-interaction patch does to a
+    // `once` listener that fires right behind another listener for the same
+    // event (a window mouseup always fires behind React's root one): the
+    // browser drops it, the patch keeps it on its books, and the same function
+    // added again never reaches the browser.
+    const known = new Set<unknown>();
+    const add = window.addEventListener.bind(window);
+    const remove = window.removeEventListener.bind(window);
+    vi.spyOn(window, 'addEventListener').mockImplementation((type: string, fn: EventListenerOrEventListenerObject, opts?: boolean | AddEventListenerOptions) => {
+      if (known.has(fn)) return;
+      known.add(fn);
+      add(type, fn, opts);
+    });
+    vi.spyOn(window, 'removeEventListener').mockImplementation((type: string, fn: EventListenerOrEventListenerObject, opts?: boolean | EventListenerOptions) => {
+      known.delete(fn);
+      remove(type, fn, opts);
+    });
+    const ws = await ownerPane();
+    const canvas = host.querySelector('canvas') as HTMLCanvasElement;
+    for (let i = 0; i < 3; i++) {
+      await press(canvas);
+      await release(canvas);
+    }
+    expect(mouseSent(ws)).toEqual(['mousePressed', 'mouseReleased', 'mousePressed', 'mouseReleased', 'mousePressed', 'mouseReleased']);
+  });
+
+  it('releases a press let go outside the pane, and sends nothing for a mouseup no press of its own started', async () => {
+    const ws = await ownerPane();
+    const canvas = host.querySelector('canvas') as HTMLCanvasElement;
+    await release(document.body);
+    expect(mouseSent(ws)).toEqual([]);
+    await press(canvas);
+    await release(document.body);
+    await release(document.body);
+    expect(mouseSent(ws)).toEqual(['mousePressed', 'mouseReleased']);
+  });
+});
+
 describe('BrowserPane as a reviewer\'s pane', () => {
   const guestPane = async (props: Partial<React.ComponentProps<typeof BrowserPane>> = {}) => {
     await act(async () => { root.render(<BrowserPane share={{ shareId: 'cshare0000000001' }} url="about:blank" onUrlChange={() => {}} {...props} />); });

@@ -3,8 +3,13 @@
  * Response shapes mirror backend/src/services/admin/*.
  */
 import axios from 'axios';
+import { sendClientHeader } from '../buildInfo';
+import type { BoxSize } from '../utils/boxSize';
+import type { BoxResizeInfo, ResizeView } from '../utils/boxResize';
+import type { BoxLifecycle } from '../types';
 
 const api = axios.create({ baseURL: '/termag', withCredentials: true });
+sendClientHeader(api);
 
 export type AdminRange = 'today' | '7d' | '30d';
 const q = (range: AdminRange, extra: Record<string, string | number | boolean | undefined> = {}) => ({
@@ -16,6 +21,12 @@ export interface AdminInstance {
   ec2InstanceId: string | null; hostname: string | null;
   /** The AMI the box launched from and how it was chosen: published, channel:<name>, pinned, fallback:<asked>. */
   imageId: string | null; imageSource: string | null;
+  /** small, medium or large, and the EC2 type it launched as; size null for the configured type. */
+  size: string | null; instanceType: string | null;
+  /** Its current or last resize; null when it never had one. */
+  resize?: ResizeView | null;
+  /** The root disk in GB it was made with; null before it was recorded. The live volume is the detail's Disk section. */
+  diskGiB?: number | null;
   createdAt: string; readyAt: string | null; lastConnectedAt: string | null; terminatedAt: string | null;
   provisioningError: string | null; provisioningMs: number | null;
   owner: { id: string; email: string; unixUsername: string } | null;
@@ -40,6 +51,38 @@ export interface AdminInstanceDetail extends AdminInstance {
   projectList: Array<{ id: string; name: string; archived: boolean; lastActiveAt: string }>;
   tokens: Array<{ id: string; name: string; tokenPrefix: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null }>;
   securityGroupId: string | null; iamRoleName: string | null;
+  hibernationConfigured: boolean;
+  /** Null until an admin quarantines the box (backend/src/services/boxQuarantine.ts); kept after its terminate. */
+  quarantine: BoxQuarantine | null;
+  /** What auto-park will do with the box, with its owner's flags; null for an ownerless box. */
+  lifecycle: BoxLifecycle | null;
+  /** Its last 10 fleet operations (box_events: resizes, disk grows), newest first. Absent from older orchestrators. */
+  events?: BoxOperation[];
+}
+export type QuarantineStepName = 'tokens' | 'tag' | 'iam' | 'network' | 'snapshot' | 'stop';
+export interface QuarantineStepResult {
+  step: QuarantineStepName;
+  outcome: 'done' | 'skipped' | 'failed';
+  detail: string;
+  at: string;
+  snapshots?: Array<{ volumeId: string; device: string; snapshotId: string }>;
+}
+export interface BoxQuarantine {
+  at: string; by: string | null; reason: string | null; fromStatus: string | null;
+  /** Null while the first run is still under way, or if it was cut short before it recorded anything. */
+  steps: QuarantineStepResult[] | null;
+  /** A run is in flight on the orchestrator: its steps are still being written, and a retry would be refused. */
+  running: boolean;
+}
+/** The run's outcome, or (202) `running: true` when it outlasted the request: the detail's steps fill in as it goes. */
+export type QuarantineResult =
+  | { id: string; status: 'quarantined'; steps: QuarantineStepResult[]; failed: QuarantineStepName[] }
+  | { id: string; status: 'quarantined'; running: true };
+/** One row of box_events, as the Fleet card lists it (backend services/boxEvents.ts boxEventView). */
+export interface BoxOperation {
+  id: string; kind: string; actor: string | null; actorRole: string; reason: string | null;
+  from: string | null; to: string | null; phase: string; running: boolean;
+  startedAt: string; finishedAt: string | null; error: string | null;
 }
 export interface FleetOverview {
   total: number; byStatus: Record<string, number>; byKind: Record<string, number>; byRegion: Record<string, number>;
@@ -91,11 +134,39 @@ export interface SoftwareHost {
 export interface SoftwareSummary { component: string; reference: string | null; referenceNote: string; counts: Record<SoftwareState, number>; spread: Array<{ version: string; hosts: number }> }
 export interface SoftwareMatrix {
   components: string[]; summary: SoftwareSummary[]; hosts: SoftwareHost[];
+  /** `summary` without offline hosts (the orchestrator always counts), and how many were left out. Absent from an older backend. */
+  online?: { summary: SoftwareSummary[]; offline: number };
   targets: { boxCommit: string | null; orchestratorImageCommit: string | null; runningCommit: string | null };
   collector: { lastSweepAt: string | null; lastSelfAt: string | null; lastError: string | null };
   generatedAt: string;
 }
 export interface SoftwareHostDetail { host: SoftwareHost; changes: Array<{ component: string; from: string | null; to: string | null; at: string }> }
+// Tool updates from the Software tab, one
+// component at a time. The routes answer 404 {code: 'claude_update_off'} while the tool's enabled flag
+// (claude-code-update-enabled, codex-update-enabled, cursor-update-enabled, devin-update-enabled, pi-update-enabled, gh-update-enabled, aws-update-enabled, node-update-enabled) is off for the host's owner and box.
+export type UpdatableTool = 'claude' | 'codex' | 'cursor' | 'devin' | 'pi' | 'gh' | 'aws' | 'node';
+export type ToolRestart = 'none' | 'idle' | 'force';
+export type ToolUpdateScope = 'below-floor' | 'behind' | 'all';
+export interface ToolUpdatePreview {
+  hostKey: string; connected: boolean; capable: boolean; current: string | null; target: string | null; floor: string | null;
+  liveSessions: number; busySessions: number; runInFlight: boolean;
+  /** The orchestrator host's preview (phase 2e): its runs try-restart the runner orchestrator and take restart none only. */
+  kind?: 'orchestrator'; restarts?: ToolRestart[];
+  /** The orchestrator host: a quarantine holds its runner orchestrator stopped until a verified install. */
+  runnerHeld?: boolean;
+  /** The orchestrator host with no version pinned in orchestrator-claude-update-policy: a run only brings it up to the floor; nothingToDo when it is already there. */
+  floorOnly?: boolean; nothingToDo?: boolean;
+}
+export interface SoftwareUpdateRun {
+  id: string; hostKey: string; instanceId: string | null; component: UpdatableTool;
+  trigger: 'manual' | 'boot' | 'guard' | 'floor' | 'resume' | 'nightly'; requestedById: string | null; restart: ToolRestart;
+  status: 'requested' | 'running' | 'done' | 'failed' | 'refused' | 'expired';
+  outcome: 'updated' | 'current' | 'partial' | 'failed' | 'floor-only' | null;
+  target: string | null; fromVersion: string | null; toVersion: string | null; detail: string | null;
+  sessions: { stopped: number; resumed: number; fresh: number; cut: number; typed: number; other: number; runnersLeft: number } | null;
+  requestedAt: string; startedAt: string | null; finishedAt: string | null;
+}
+export interface FleetToolUpdate { runs: Array<{ hostKey: string; runId: string }>; skipped: Array<{ hostKey: string; reason: string }> }
 export interface ClientVersionRow { userId: string; user: string | null; kind: string; version: string; state: SoftwareState; lastSeenAt: string }
 // ── PR analytics ──
 export type PrView = 'credited' | 'humans' | 'all';
@@ -109,6 +180,16 @@ export interface PrSummary { group: string; view: PrView; basis: PrBasis; repos:
 export interface PrContributor { login: string; prs: number; share: number; agentPrs: number; agentAssisted: number; medianSize: number; termag: { userId: string; unixUsername: string } | null }
 export interface PrContributors { group: string; days: number; total: number; contributors: number; top: PrContributor[] }
 export interface PrTrend { group: string; weeks: number; rows: Array<{ week: string; human: number; agent: number; automation: number; prs: number; contributors: number }> }
+export interface PrTeam { key: string; name: string; parent: string | null; hidden: boolean; sort: number; members: string[]; manual: string[]; former: number }
+export interface PrTeamSummary extends PrSummary { team: string }
+export interface PrTeamMembers extends PrContributors { team: string }
+export interface PrTeamTrend extends PrTrend { team: string }
+export interface PrTeamRepos { group: string; team: string; view: PrView; basis: PrBasis; days: number; repos: Array<{ repo: string; prs: number; contributors: number }> }
+export interface PrTeamMemberInput { login: string; name?: string; email?: string }
+export type PrTeamReviewSide = 'given' | 'received';
+export interface PrTeamReviews extends PrReviews { team: string; side: PrTeamReviewSide }
+export interface PrTeamReviewers extends PrReviewers { team: string; side: PrTeamReviewSide }
+export interface PrTeamReviewTrend { group: string; team: string; weeks: number; rows: Array<{ week: string; given: number; received: number; reviewersGiven: number; reviewersReceived: number }> }
 export interface PrIngestStatus {
   ingester: { state: string; lastTickAt: string | null; lastDiscoveryAt: string | null; lastError: string | null; pausedUntil: string | null; rate: { remaining: number; limit: number; resetAt: string } | null };
   tokenOwner: { id: string; unixUsername: string } | null;
@@ -127,7 +208,7 @@ export interface PrReviewWindow {
 }
 export interface PrReviews { group: string; repos: number; reviewDays: number; approvalAgentLogins: string[]; windows: PrReviewWindow[]; generatedAt: string }
 export interface PrReviewer {
-  login: string; reviews: number; approved: number; changesRequested: number; commentOnly: number; inlineComments: number;
+  login: string; cls: string; reviews: number; approved: number; changesRequested: number; commentOnly: number; inlineComments: number;
   decidingApprovals: number; medianHoursToFirstReview: number | null; askedReviews: number; stalePickups: number; authorsHelped: number;
   termag: { userId: string; unixUsername: string } | null;
 }
@@ -339,6 +420,35 @@ export interface AdminsResponse {
 }
 export interface AuditRow { id: string; at: string; actorId: string; actor: string; tokenId: string | null; surface: string; action: string; args: Record<string, unknown> | null; outcome: string; status: number | null }
 
+// ── Box cost; mirrors backend/src/services/boxCost/report.ts ──
+export interface BoxCostMoney { active: number; idle: number; pool: number; boot: number; orphan: number; compute: number; storage: number; total: number }
+export interface BoxCostBox {
+  ec2InstanceId: string; instanceId: string | null; name: string | null; status: string | null; owner: string | null;
+  instanceType: string; volumeGb: number; runningHours: number; activeShare: number | null; teardownUnfinished: boolean; usd: BoxCostMoney;
+}
+export interface BoxCostPerson { userId: string; name: string; boxes: number; runningHours: number; activeShare: number | null; usd: BoxCostMoney }
+export interface BoxCostReport {
+  window: { since: string; until: string };
+  meteredFrom: string | null;
+  rates: { source: string; perHour: Record<string, number>; gp3PerGbMonth: number };
+  totals: BoxCostMoney & { runningHours: number; boxes: number };
+  days: Array<{ day: string } & BoxCostMoney>;
+  people: BoxCostPerson[];
+  boxes: BoxCostBox[];
+  parked: { boxes: number; gb: number; monthlyUsd: number };
+  unrated: string[];
+  reconcile: BoxReconcile | null;
+}
+export interface BoxReconcileLine {
+  ec2InstanceId: string; name: string | null; instanceType: string | null;
+  meteredHours: number; billedHours: number; meteredUsd: number; billedUsd: number;
+}
+export interface BoxReconcile {
+  days: string[]; estimatedDays: number;
+  meteredHours: number; billedHours: number; meteredUsd: number; billedUsd: number;
+  notMetered: BoxReconcileLine[]; notMeteredUsd: number; notBilled: BoxReconcileLine[]; drift: BoxReconcileLine[];
+}
+
 // ── Spend; mirrors backend/src/services/admin/spend/model.ts ──
 export type SpendPoolKind = 'contract' | 'infra';
 export type SpendPoolShare = 'proportional' | 'usage' | 'full';
@@ -384,10 +494,63 @@ export interface SpendReport {
 }
 export interface SpendWeek { week: string; days: number; metered: Record<string, number>; pools: Record<string, number>; totalUsd: number }
 
+export interface BoxVolumeModification { state: string; progress: number | null; targetSizeGb: number | null; startedAt: string | null }
+export interface BoxGrow {
+  volumeId: string; fromGb: number; toGb: number; by: string; startedAt: string;
+  state: 'modifying' | 'filesystem' | 'done' | 'failed'; detail: string | null; finishedAt: string | null;
+}
+export interface BoxDisk {
+  refusal: string | null;
+  maxGb: number;
+  volume: { volumeId: string; sizeGb: number; volumeType: string | null; modification: BoxVolumeModification | null } | { error: string } | null;
+  grow: BoxGrow | null;
+}
+
+// ── Bug reports (backend routes/admin/bugs.ts) ──
+export const BUG_STATUSES = ['new', 'triaged', 'duplicate', 'fixed', 'wontfix'] as const;
+export const BUG_AREAS = ['spaces', 'asks', 'publish', 'boxes', 'chat', 'cli', 'broker', 'other'] as const;
+export const BUG_SEVERITIES = ['low', 'medium', 'high'] as const;
+export type BugStatus = typeof BUG_STATUSES[number];
+export interface BugSummary { id: string; title: string; status: BugStatus; severity: string; area: string; createdAt: string }
+export interface BugListRow extends BugSummary {
+  reporter: string; box: string | null; agentProvider: string | null; linkUrl: string | null; duplicateOfId: string | null;
+}
+export interface BugReport extends BugSummary {
+  body: string; reporterUserId: string; credential: 'box' | 'device';
+  boxId: string | null; projectId: string | null; workstream: string | null; threadId: string | null;
+  agentProvider: string | null; agentModel: string | null; agentVersion: string | null;
+  cliVersion: string | null; boxAgentCommit: string | null; boxAgentCapabilities: string[]; boxImage: string | null;
+  command: string | null; errorOutput: string | null; redacted: string[];
+  duplicateOfId: string | null; linkUrl: string | null; triagedAt: string | null;
+}
+export interface BugEvent {
+  id: string; actorId: string; actor: string; status: BugStatus | null; duplicateOfId: string | null;
+  /** "" when the change cleared the link. */
+  linkUrl: string | null; note: string | null; createdAt: string;
+}
+export interface BugDetail {
+  report: BugReport;
+  reporter: { user: string; box: string | null; project: string | null };
+  events: BugEvent[];
+  duplicateOf: BugSummary | null;
+  duplicates: BugSummary[];
+}
+export interface BugFilters { status?: string; area?: string; severity?: string; q?: string }
+export interface BugChange { status?: BugStatus; duplicateOf?: string; link?: string | null; note?: string }
+
 export const adminApi = {
   overview: (range: AdminRange): Promise<AdminOverview> => api.get('/api/admin/overview', q(range)).then(r => r.data),
   instances: (all = false): Promise<AdminInstance[]> => api.get('/api/admin/fleet/instances', { params: all ? { all: 1 } : {} }).then(r => r.data),
   instance: (id: string): Promise<AdminInstanceDetail> => api.get(`/api/admin/fleet/instances/${encodeURIComponent(id)}`).then(r => r.data),
+  quarantineBox: (id: string, reason: string): Promise<QuarantineResult> =>
+    api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/quarantine`, { reason, confirm: true }).then(r => r.data),
+  terminateQuarantinedBox: (id: string): Promise<{ ok: true; archivedProjects: number }> =>
+    api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/terminate`, { confirm: true }).then(r => r.data),
+  boxDisk: (id: string): Promise<BoxDisk> => api.get(`/api/admin/fleet/instances/${encodeURIComponent(id)}/disk`).then(r => r.data),
+  growBoxDisk: (id: string, sizeGb: number): Promise<BoxGrow> => api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/disk`, { sizeGb }).then(r => r.data),
+  boxResizeInfo: (id: string): Promise<BoxResizeInfo> => api.get(`/api/admin/fleet/instances/${encodeURIComponent(id)}/resize`).then(r => r.data),
+  resizeBox: (id: string, size: BoxSize, reason: string, force = false): Promise<{ resize: ResizeView }> =>
+    api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/resize`, { size, reason, ...(force ? { force } : {}) }).then(r => r.data),
   fleetOverview: (): Promise<FleetOverview> => api.get('/api/admin/fleet/overview').then(r => r.data),
   provisioning: (range: AdminRange): Promise<ProvisioningStats> => api.get('/api/admin/fleet/provisioning', q(range)).then(r => r.data),
   users: (range: AdminRange): Promise<AdminUser[]> => api.get('/api/admin/users', q(range)).then(r => r.data),
@@ -401,6 +564,19 @@ export const adminApi = {
   prReviews: (group: string): Promise<PrReviews> => api.get('/api/admin/prs/reviews', { params: { group } }).then(r => r.data),
   prReviewers: (group: string, window: PrWindow): Promise<PrReviewers> => api.get('/api/admin/prs/reviewers', { params: { group, window } }).then(r => r.data),
   prReviewTrend: (group: string): Promise<PrReviewTrend> => api.get('/api/admin/prs/reviews/trend', { params: { group } }).then(r => r.data),
+  prTeams: (): Promise<PrTeam[]> => api.get('/api/admin/prs/teams').then(r => r.data),
+  prTeamSummary: (team: string, group: string, view: PrView, basis: PrBasis): Promise<PrTeamSummary> => api.get('/api/admin/prs/team-summary', { params: { team, group, view, basis } }).then(r => r.data),
+  prTeamMembers: (team: string, group: string, view: PrView, basis: PrBasis, window: PrWindow): Promise<PrTeamMembers> => api.get('/api/admin/prs/team-members', { params: { team, group, view, basis, window } }).then(r => r.data),
+  prTeamRepos: (team: string, group: string, view: PrView, basis: PrBasis, window: PrWindow): Promise<PrTeamRepos> => api.get('/api/admin/prs/team-repos', { params: { team, group, view, basis, window } }).then(r => r.data),
+  prTeamTrend: (team: string, group: string, view: PrView, basis: PrBasis): Promise<PrTeamTrend> => api.get('/api/admin/prs/team-trend', { params: { team, group, view, basis } }).then(r => r.data),
+  prTeamReviews: (team: string, group: string, side: PrTeamReviewSide): Promise<PrTeamReviews> => api.get('/api/admin/prs/team-reviews', { params: { team, group, side } }).then(r => r.data),
+  prTeamReviewers: (team: string, group: string, side: PrTeamReviewSide, window: PrWindow, limit?: number): Promise<PrTeamReviewers> => api.get('/api/admin/prs/team-reviewers', { params: { team, group, side, window, limit } }).then(r => r.data),
+  prTeamReviewTrend: (team: string, group: string): Promise<PrTeamReviewTrend> => api.get('/api/admin/prs/team-reviews/trend', { params: { team, group } }).then(r => r.data),
+  savePrTeam: (t: { key: string; name: string; parent: string | null; hidden: boolean; sort: number; members: PrTeamMemberInput[] }) => api.put(`/api/admin/prs/teams/${encodeURIComponent(t.key)}`, t).then(r => r.data),
+  deletePrTeam: (key: string) => api.delete(`/api/admin/prs/teams/${encodeURIComponent(key)}`).then(r => r.data),
+  syncPrTeams: (): Promise<{ teams: number; members: number; skipped: number }> => api.post('/api/admin/prs/teams/sync').then(r => r.data),
+  /** The same sync from an uploaded org-tree export (`teams-export.json`), for a deployment that reaches neither the file nor the API. */
+  importPrTeams: (exportJson: unknown): Promise<{ teams: number; members: number; skipped: number; source: string }> => api.post('/api/admin/prs/teams/import', exportJson).then(r => r.data),
   savePrGroup: (g: { slug: string; name: string; members: PrGroupMember[]; excluded: string[]; sort: number }) => api.put(`/api/admin/prs/groups/${encodeURIComponent(g.slug)}`, g).then(r => r.data),
   deletePrGroup: (slug: string) => api.delete(`/api/admin/prs/groups/${encodeURIComponent(slug)}`).then(r => r.data),
   setPrToken: (use: boolean): Promise<PrIngestStatus> => api.put('/api/admin/prs/token', { use }).then(r => r.data),
@@ -409,9 +585,14 @@ export const adminApi = {
   softwareHost: (hostKey: string): Promise<SoftwareHostDetail> => api.get(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}`).then(r => r.data),
   clientVersions: (): Promise<{ runningCommit: string | null; clients: ClientVersionRow[] }> => api.get('/api/admin/software/clients').then(r => r.data),
   refreshSoftware: () => api.post('/api/admin/software/refresh').then(r => r.data),
+  toolUpdatePreview: (component: UpdatableTool, hostKey: string): Promise<ToolUpdatePreview> => api.get(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}/update-preview`, { params: { component } }).then(r => r.data),
+  updateTool: (component: UpdatableTool, hostKey: string, restart: ToolRestart): Promise<{ runId: string; acknowledged: boolean }> => api.post(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}/update`, { component, restart }).then(r => r.data),
+  updateToolFleet: (component: UpdatableTool, scope: ToolUpdateScope, restart: ToolRestart): Promise<FleetToolUpdate> => api.post('/api/admin/software/update', { component, scope, restart }).then(r => r.data),
+  softwareUpdates: (component: UpdatableTool, limit = 50): Promise<{ runs: SoftwareUpdateRun[] }> => api.get('/api/admin/software/updates', { params: { component, limit } }).then(r => r.data),
   /** `from`/`to` are inclusive UTC day keys; the Spend tab picks 7, 30 or 90 days ending today. */
   spendReport: (from: string, to: string, active: boolean): Promise<SpendReport> => api.get('/api/admin/spend/report', { params: { from, to, ...(active ? { active: 1 } : {}) } }).then(r => r.data),
   spendTrend: (weeks = 12): Promise<{ weeks: SpendWeek[] }> => api.get('/api/admin/spend/trend', { params: { weeks } }).then(r => r.data),
+  boxCost: (from: string, to: string): Promise<BoxCostReport> => api.get('/api/admin/spend/boxes', { params: { from, to } }).then(r => r.data),
   spendModel: (): Promise<SpendModel> => api.get('/api/admin/spend/config').then(r => r.data),
   saveSpendModel: (m: Omit<SpendModel, 'updatedAt'>): Promise<SpendModel> => api.put('/api/admin/spend/config', m).then(r => r.data),
   userGrowth: (bucket: GrowthBucket): Promise<UserGrowth> => api.get('/api/admin/users/growth', { params: { bucket } }).then(r => r.data),
@@ -438,4 +619,9 @@ export const adminApi = {
   admins: (): Promise<AdminsResponse> => api.get('/api/admin/admins').then(r => r.data),
   setRole: (userId: string, role: 'admin' | 'member') => api.put(`/api/admin/admins/${encodeURIComponent(userId)}`, { role }).then(r => r.data),
   audit: (range: AdminRange, limit = 200): Promise<{ rows: AuditRow[]; limit: number }> => api.get('/api/admin/audit', q(range, { limit })).then(r => r.data),
+  bugReports: (f: BugFilters): Promise<{ reports: BugListRow[] }> =>
+    api.get('/api/admin/bug-reports', { params: Object.fromEntries(Object.entries(f).filter(([, v]) => v)) }).then(r => r.data),
+  bugCounts: (): Promise<{ counts: Record<BugStatus, number> }> => api.get('/api/admin/bug-reports/counts').then(r => r.data),
+  bugReport: (id: string): Promise<BugDetail> => api.get(`/api/admin/bug-reports/${encodeURIComponent(id)}`).then(r => r.data),
+  triageBug: (id: string, change: BugChange): Promise<{ report: BugReport }> => api.patch(`/api/admin/bug-reports/${encodeURIComponent(id)}`, change).then(r => r.data),
 };

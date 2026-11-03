@@ -15,6 +15,18 @@ export function sessionName(
 }
 
 /**
+ * Review panes per workstream, mirror of backend
+ * `tmux.reviewSessionName`: slot 1 is the `review` role's own name, slots
+ * 2..MAX are `<that>-<n>`.
+ */
+export const MAX_REVIEW_SLOTS = 8;
+
+export function reviewSessionName(username: string, project: string, workstream: string = 'main', slot: number = 1): string {
+  const base = sessionName(username, project, 'review', workstream);
+  return slot === 1 ? base : `${base}-${slot}`;
+}
+
+/**
  * Whether a session name is a workstream's agent pane: the `-agent` role
  * suffix, as sessionName() puts it last. Not a substring match, so a project
  * or workstream whose own name contains `agent` (`u-agentops-ctrl`) is

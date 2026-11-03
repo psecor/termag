@@ -61,4 +61,28 @@ describe('useChatSpaces', () => {
     expect(latest.current).toBe(true);
     expect(latest.index.get('box-b')).toEqual(['mine']);
   });
+
+  it('keeps the spaces it has when a reload fails, so the sidebar doesn\'t empty', async () => {
+    mocks.boxes = ['box-a'];
+    act(() => root.render(<Harness reloadKey="box-a" />));
+    await settle();
+    expect(latest.spaces.map(s => s.name)).toEqual(['mine']);
+    // A change in the Share dialog asks for a reload, and the list request fails.
+    mocks.list.mockImplementationOnce(() => Promise.reject(new Error('Network Error')));
+    act(() => latest.reload!());
+    await settle();
+    expect(latest.loaded).toBe(true);
+    expect(latest.spaces.map(s => s.name)).toEqual(['mine']);
+    expect(latest.index.get('box-a')).toEqual(['mine']);
+    expect(latest.current).toBe(true);
+  });
+
+  it('still settles as loaded and empty when the first load fails', async () => {
+    mocks.list.mockImplementationOnce(() => Promise.reject(new Error('Network Error')));
+    act(() => root.render(<Harness reloadKey="" />));
+    await settle();
+    expect(latest.loaded).toBe(true);
+    expect(latest.spaces).toEqual([]);
+  });
 });
+

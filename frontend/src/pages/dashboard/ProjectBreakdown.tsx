@@ -4,7 +4,8 @@ import type { SessionRow, WorktimeProjectRow, ContextSeries, UsageResponse } fro
 import { projectTokensInRange, unattributedInRange } from './usageProjects';
 import { CTX_COLOR } from '../../utils/worktime';
 import type { Project } from '../../types';
-import { PROVIDERS } from '../../providers/registry';
+import { PROVIDERS, providerColor } from '../../providers/registry';
+import { usePalette } from '../../theme/usePalette';
 import { fmtAge, fmtDurationShort, fmtK } from '../../utils/format';
 import { HUMAN } from '../../utils/worktime';
 import { contextLevel } from '../../utils/thresholds';
@@ -58,6 +59,7 @@ const SHOW = 12;
  */
 export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, now, stale }: Props) {
   const [all, setAll] = useState(false);
+  const palette = usePalette();
 
   const lines = useMemo(() => {
     const byId = new Map((projects ?? []).map(p => [p.id, p]));
@@ -120,7 +122,7 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, n
   const maxTokens = Math.max(1, ...lines.map(l => l.tokens));
 
   const providersUsed = Object.values(PROVIDERS).filter(p => p.id !== HUMAN && lines.some(l => (l.byProvider[p.id] ?? 0) > 0));
-  const series = providersUsed.map(p => ({ id: p.id, label: p.displayName, color: opaque(p.color.base) }));
+  const series = providersUsed.map(p => ({ id: p.id, label: p.displayName, color: opaque(providerColor(p, palette).base) }));
   const maxMs = Math.max(1, ...lines.map(l => Math.max(l.agentMs, l.humanMs)));
   const shown = all ? lines : lines.slice(0, SHOW);
   const totalAgent = lines.reduce((s, l) => s + l.agentMs, 0);
@@ -165,14 +167,14 @@ export function ProjectBreakdown({ rows, sessions, projects, ctx, usage, keys, n
                       {providersUsed.map(p => {
                         const ms = l.byProvider[p.id] ?? 0;
                         if (ms <= 0) return null;
-                        return <i key={p.id} style={{ width: `${(ms / maxMs) * 100}%`, background: opaque(p.color.base) }} />;
+                        return <i key={p.id} style={{ width: `${(ms / maxMs) * 100}%`, background: opaque(providerColor(p, palette).base) }} />;
                       })}
                     </span>
                     <span className="pb-val">{l.agentMs > 0 ? fmtDurationShort(l.agentMs) : '—'}</span>
                   </span>
                   <span className="pb-bar" title={`You: ${fmtDurationShort(l.humanMs)}`}>
                     <span className="pb-track">
-                      {l.humanMs > 0 && <i style={{ width: `${(l.humanMs / maxMs) * 100}%`, background: opaque(PROVIDERS[HUMAN].color.bright) }} />}
+                      {l.humanMs > 0 && <i style={{ width: `${(l.humanMs / maxMs) * 100}%`, background: opaque(providerColor(PROVIDERS[HUMAN], palette).bright) }} />}
                     </span>
                     <span className="pb-val">{l.humanMs > 0 ? fmtDurationShort(l.humanMs) : '—'}</span>
                   </span>

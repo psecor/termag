@@ -1,22 +1,24 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Dialog } from './Dialog';
 import { PersonPicker } from './PersonPicker';
+import { useSpaceMembers } from '../hooks/useSpaceMembers';
 import { browserStorage, rememberPerson } from '../utils/recentPeople';
 import { ConfirmDialog } from './ConfirmDialog';
-import { FLAGS, useFlag } from '../flags';
 import { REPLAY_BLOCK_CLASS } from '../observability';
-import { spacesApi, type SpaceBoxGrant, type SpaceEvent, type SpaceInvite, type SpaceMember, type SpaceTreeDir, type SpaceTreeFile, type SpaceView } from '../services/api';
-import { downloadFile, errorMessage, UploadAborted, uploadFile } from '../services/spaceTransfer';
+import { spacesApi, type SpaceEvent, type SpaceMember, type SpaceTreeDir, type SpaceTreeFile, type SpaceView } from '../services/api';
+import { downloadFile, errorMessage, UploadAborted, UploadConflict, uploadConditionFor, uploadFile } from '../services/spaceTransfer';
 import type { Instance } from '../types';
 import {
   actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, relPathError, prettyText, previewKind, roleAtLeast,
   SPACE_NAME_HINT, SPACE_NAME_RE, SPACE_ROLES, spaceFileLink, TEXT_PREVIEW_MAX_BYTES, usageLabel,
 } from '../utils/spaces';
 import type { DropEntry, DroppedFile } from '../utils/spaces';
+import { MermaidBlock } from '../chat/MermaidBlock';
+import { isMermaidPath } from '../chat/mermaidFence';
 
 export type SpaceTab = 'files' | 'members' | 'activity';
 
-interface UploadRow { id: number; path: string; size: number; sent: number; error?: string; done?: boolean; abort: AbortController }
+interface UploadRow { id: number; path: string; size: number; sent: number; error?: string; done?: boolean; abort: AbortController; file?: File; conflict?: boolean }
 
 interface Preview { path: string; kind: 'image' | 'pdf' | 'text'; url?: string; text?: string; truncated?: boolean; error?: string }
 
@@ -139,22 +141,47 @@ function FilesTab({ space, canWrite, setConfirm, onChanged }: {
     return [...dirs, ...extra].sort((a, b) => a.name.localeCompare(b.name));
   }, [dirs, pendingDirs, prefix]);
 
+  const updateUpload = (id: number, patch: Partial<UploadRow>) => setUploads(u => u.map(r => (r.id === id ? { ...r, ...patch } : r)));
+
+  /** One upload, `force` overwriting whatever is there; a conflict leaves the row with Reload and Overwrite. */
+  async function runUpload(row: UploadRow, file: File, force: boolean): Promise<void> {
+    // The version this listing shows: a newer one is refused, nothing written.
+    const condition = force ? null : uploadConditionFor(row.path, prefixRef.current, files, cursor === null && !loading);
+    try {
+      await uploadFile(space.name, row.path, file, sent => updateUpload(row.id, { sent }), row.abort.signal, condition);
+      updateUpload(row.id, { done: true, sent: file.size, error: undefined, conflict: false });
+    } catch (err) {
+      if (err instanceof UploadConflict) updateUpload(row.id, { error: err.message, conflict: true, sent: 0 });
+      else updateUpload(row.id, { error: err instanceof UploadAborted ? 'Cancelled' : errorMessage(err, 'Upload failed') });
+    }
+  }
+
+  async function overwrite(row: UploadRow) {
+    if (!row.file) return;
+    const again = { ...row, abort: new AbortController() };
+    updateUpload(row.id, { error: undefined, conflict: false, sent: 0, abort: again.abort });
+    await runUpload(again, row.file, true);
+    await load(prefixRef.current);
+    onChanged();
+    // As a batch's rows go once it is done: the finished row clears, a failed one stays with its ×.
+    setTimeout(() => setUploads(u => u.filter(r => r.id !== row.id || r.error)), 2500);
+  }
+
+  async function reloadAfterConflict(row: UploadRow) {
+    setUploads(x => x.filter(r => r.id !== row.id));
+    await load(prefixRef.current);
+  }
+
   function startUploads(chosen: DroppedFile[]) {
     if (chosen.length === 0) return;
-    const rows: UploadRow[] = chosen.map(({ file: f, rel }) => ({ id: ++uploadSeq, path: prefix + rel, size: f.size, sent: 0, abort: new AbortController() }));
+    const rows: UploadRow[] = chosen.map(({ file: f, rel }) => ({ id: ++uploadSeq, path: prefix + rel, size: f.size, sent: 0, abort: new AbortController(), file: f }));
     setUploads(u => [...u, ...rows]);
-    const update = (id: number, patch: Partial<UploadRow>) => setUploads(u => u.map(r => (r.id === id ? { ...r, ...patch } : r)));
     void (async () => {
       for (const [i, { file, rel }] of chosen.entries()) {
         const row = rows[i];
         const bad = relPathError(rel);
-        if (bad) { update(row.id, { error: bad }); continue; }
-        try {
-          await uploadFile(space.name, row.path, file, sent => update(row.id, { sent }), row.abort.signal);
-          update(row.id, { done: true, sent: file.size });
-        } catch (err) {
-          update(row.id, { error: err instanceof UploadAborted ? 'Cancelled' : errorMessage(err, 'Upload failed') });
-        }
+        if (bad) { updateUpload(row.id, { error: bad }); continue; }
+        await runUpload(row, file, false);
       }
       await load(prefixRef.current);
       onChanged();
@@ -293,6 +320,12 @@ function FilesTab({ space, canWrite, setConfirm, onChanged }: {
                 {u.error ?? (u.done ? 'done' : `${formatBytes(u.sent)} of ${formatBytes(u.size)}`)}
               </span>
               {!u.done && !u.error && <button type="button" className="btn-tiny" onClick={() => u.abort.abort()}>Cancel</button>}
+              {u.conflict && (
+                <>
+                  <button type="button" className="btn-tiny" onClick={() => void reloadAfterConflict(u)}>Reload</button>
+                  <button type="button" className="btn-tiny" onClick={() => void overwrite(u)}>Overwrite</button>
+                </>
+              )}
               {u.error && <button type="button" className="btn-tiny" onClick={() => setUploads(x => x.filter(r => r.id !== u.id))}>×</button>}
             </li>
           ))}
@@ -384,7 +417,9 @@ function PreviewPane({ preview, onClose, onDownload }: { preview: Preview; onClo
         )}
         {preview.kind === 'text' && preview.text !== undefined && (
           <>
-            <pre className="space-preview-text">{preview.text}</pre>
+            {isMermaidPath(preview.path) && !preview.truncated
+              ? <MermaidBlock source={preview.text} name={preview.path} />
+              : <pre className="space-preview-text">{preview.text}</pre>}
             {preview.truncated && <div className="usage-dim">Showing the first {formatBytes(TEXT_PREVIEW_MAX_BYTES)}; download for the rest.</div>}
           </>
         )}
@@ -403,36 +438,14 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
   onRenamed: (s: SpaceView) => void;
   onGone: () => void;
 }) {
-  const [members, setMembers] = useState<SpaceMember[]>([]);
-  const [invites, setInvites] = useState<SpaceInvite[]>([]);
-  const [boxes, setBoxes] = useState<SpaceBoxGrant[]>([]);
-  const [error, setError] = useState('');
-  const [note, setNote] = useState('');
+  const { members, invites, boxes, sharing, error, note, setError, setNote, act } = useSpaceMembers(space.name);
   const [email, setEmail] = useState('');
   const [pickedName, setPickedName] = useState<string | undefined>();
   const [role, setRole] = useState<string>('editor');
   const [boxToAdd, setBoxToAdd] = useState('');
   const [newName, setNewName] = useState<string | null>(null);
   const isOwner = space.role === 'owner' && !space.readOnly;
-  const sharingOn = useFlag(FLAGS.spacesSharing, false);
   const canAddBox = roleAtLeast(space.role, 'editor') && !space.readOnly;
-
-  const load = useCallback(async () => {
-    try {
-      const [m, b] = await Promise.all([spacesApi.members(space.name), spacesApi.boxes(space.name)]);
-      setMembers(m.members);
-      setInvites(m.invites);
-      setBoxes(b.boxes);
-    } catch (err) { setError(errorMessage(err, 'Could not load members')); }
-  }, [space.name]);
-
-  useEffect(() => { void load(); }, [load]);
-
-  async function act(fn: () => Promise<unknown>, fallback: string, after?: () => void) {
-    setError('');
-    setNote('');
-    try { await fn(); after?.(); await load(); } catch (err) { setError(errorMessage(err, fallback)); }
-  }
 
   const granted = new Set(boxes.map(b => b.id));
   const inherited = new Set(boxes.flatMap(b => b.children.map(c => c.id)));
@@ -483,10 +496,10 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
           </li>
         ))}
       </ul>
-      {isOwner && !sharingOn && (
+      {isOwner && sharing === false && (
         <div className="usage-dim space-hint">Sharing spaces with other people is not turned on for you yet.</div>
       )}
-      {isOwner && sharingOn && (
+      {isOwner && sharing === true && (
         <form
           className="inline-form space-inline-form"
           onSubmit={e => {

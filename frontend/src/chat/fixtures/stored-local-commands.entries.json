@@ -1,0 +1,81 @@
+[
+  {
+    "type": "user",
+    "uuid": "9501f369-da14-4941-8c96-320b6c0a393c",
+    "timestamp": "2026-10-23T04:45:34.311Z",
+    "message": {
+      "role": "user",
+      "content": "<command-name>/reload-plugins</command-name>\n            <command-message>reload-plugins</command-message>\n            <command-args></command-args>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "5c3b010f-9cd6-4e5a-952c-8281c7dc164f",
+    "timestamp": "2026-10-23T04:45:34.349Z",
+    "message": {
+      "role": "user",
+      "content": "<local-command-stdout>Reloaded: 0 plugins · 0 skills · 6 agents · 0 hooks · 0 plugin MCP servers · 0 plugin LSP servers</local-command-stdout>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "29a706e2-9f23-4db1-b360-dddcd572ed3c",
+    "timestamp": "2026-10-23T04:45:52.906Z",
+    "message": {
+      "role": "user",
+      "content": "<command-name>/context</command-name>\n            <command-message>context</command-message>\n            <command-args></command-args>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "b6ac82f5-be41-4649-a305-375a7359e8de",
+    "timestamp": "2026-10-23T04:45:52.906Z",
+    "message": {
+      "role": "user",
+      "content": "<local-command-stdout> Context Usage\n⛀ ⛁ ⛀ ⛀ ⛶   Opus 5.5\n⛶ ⛶ ⛶ ⛶ ⛶   claude-opus-5-5\n⛶ ⛶ ⛶ ⛶ ⛶   31.9k/1m tokens (3%)\n⛶ ⛶ ⛶ ⛶ ⛶\n⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category\n⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 2.7k tokens (0.3%)\n⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 26.9k tokens (2.7%)\n⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Skills: 2.1k tokens (0.2%)\n⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Messages: 170 tokens (0.0%)\n⛶ ⛶ ⛶ ⛝ ⛝   ⛶ Free space: 935.1k (93.5%)\n            ⛝ Autocompact buffer: 33k tokens (3.3%)\n\nAuto-compact window: 1m tokens\n\nSkills · /skills\n└ 15 skills · 2.1k tokens\n\n/context all to expand</local-command-stdout>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "76a9b094-dece-4a8a-9e35-3a2944a1f474",
+    "timestamp": "2026-10-23T04:46:00.744Z",
+    "message": {
+      "role": "user",
+      "content": "<command-name>/reload-plugins</command-name>\n            <command-message>reload-plugins</command-message>\n            <command-args></command-args>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "1d437182-bb6e-45fc-b321-b1a6c0d962c2",
+    "timestamp": "2026-10-23T04:46:00.776Z",
+    "message": {
+      "role": "user",
+      "content": "<local-command-stdout>Reloaded: 0 plugins · 0 skills · 6 agents · 0 hooks · 0 plugin MCP servers · 0 plugin LSP servers</local-command-stdout>"
+    }
+  },
+  {
+    "type": "user",
+    "uuid": "7f712a69-77f0-4f76-80ea-da388c1b900c",
+    "timestamp": "2026-10-23T04:46:06.770Z",
+    "message": {
+      "role": "user",
+      "content": "hello"
+    }
+  },
+  {
+    "type": "assistant",
+    "uuid": "3e963d61-deb0-403c-b6f4-35f19578db7d",
+    "timestamp": "2026-10-23T04:46:06.890Z",
+    "message": {
+      "id": "2d60f5a7-e61d-4a8d-8788-82967e922bf0",
+      "role": "assistant",
+      "model": "<synthetic>",
+      "content": [
+        {
+          "type": "text",
+          "text": "Invalid API key · Fix external API key"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,1433 @@
+/* ── The simple UI's chrome refresh ──────
+   Behind simple-ui-chrome-refresh-enabled: every rule here is keyed on
+   .chat-root[data-chrome="refresh"], which ChatApp sets only while the flag
+   is on, so with it off none of this applies. Colours are termag's own
+   variables; LaunchPad's tokens are mapped to them in launchpad/theme.css.
+
+   Layout, while the sidebar is docked: the sidebar sits on the window, and
+   the conversation (or whatever the route shows) and the side panel are
+   cards on it, 8px apart, so no rule separates the columns. */
+
+/* LaunchPad's dark palette and its font, Inter: inside the refresh, termag's
+   own variables take LaunchPad's values, so everything that reads them
+   (termag's styles and, through launchpad/theme.css, LaunchPad's components)
+   turns to LaunchPad's greys at once. LaunchPad's overlays render at the end
+   of the body, so they get the same values while a refreshed chat is on
+   screen. @launchpad-ui/tokens/themes.css is still never imported: these are
+   termag's variables, set here only, and a person's theme (Lab's backdrop)
+   is untouched. The sidebar's item menu (ContextMenu.tsx, .chat-ctx-popover)
+   is the exception: it keeps termag's own palette, as it did before it was
+   LaunchPad's, so these two blocks skip it. The variables :root derives from these (--status-*) are
+   derived again here, since a var() resolves where it is declared.
+   Contrast (WCAG AA, 4.5:1 for text): gray-50, gray-300, gray-400, blue-400,
+   green-300, yellow-400 and red-400 all clear it on the window, a card and
+   gray-900 (the composer, menus); gray-400 is 3.9:1 on gray-800, so text on
+   --bg-active is --text-secondary or brighter. Inter is bundled by
+   @launchpad-ui/tokens/fonts.css (imported beside this file in ChatApp.tsx). */
+.chat-root[data-chrome='refresh'],
+:root:has(.chat-root[data-chrome='refresh']) .lp-theme:not(.chat-ctx-popover) {
+  --bg-base: #181a1f;              /* gray-950: a card */
+  --bg-surface: #23252a;           /* gray-900: the composer, a raised row */
+  --bg-elevated: #23252a;          /* gray-900: menus, popovers */
+  --bg-active: #2d3239;            /* gray-800 */
+  --border: rgba(255, 255, 255, 0.08);
+  --text-primary: #eceff2;         /* gray-50 */
+  --text-secondary: #a9afb4;       /* gray-300 */
+  --text-muted: #898e94;           /* gray-400 */
+  --text-inverse: #181a1f;
+  --accent: #7084ff;               /* blue-400 */
+  --accent-dim: #425eff;           /* blue-500: white on it is 4.9:1 */
+  --success: #1ecb6a;              /* green-300 */
+  --warning: #ffc933;              /* yellow-400 */
+  --danger: #f84f6e;               /* red-400 */
+  --status-working: var(--success);
+  --status-waiting: var(--warning);
+  --status-ready: #898e94;
+  --status-ready-rgb: 137, 142, 148;
+  --status-off: var(--text-muted);
+  --unseen-rgb: 112, 132, 255;
+  --font-ui: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* LaunchPad's light palette, under termag's light switch (html[data-palette],
+   theme/apply.ts): the same variables at LaunchPad's light values, a white
+   card and white menus over a gray-50 window. Text, the accent and the
+   status colours clear 4.5:1 on the window, a card and gray-0 (the
+   composer); on gray-100 (--bg-active) --text-muted is 3.9:1, so text there is
+   --text-secondary or darker, as in dark (chromePaletteCss.test.ts checks). */
+html[data-palette='light'] .chat-root[data-chrome='refresh'],
+html[data-palette='light']:has(.chat-root[data-chrome='refresh']) .lp-theme:not(.chat-ctx-popover) {
+  --bg-base: #ffffff;              /* white: a card */
+  --bg-surface: #f7f9fb;           /* gray-0: the composer, a raised row */
+  --bg-elevated: #ffffff;          /* white: menus, popovers */
+  --bg-active: #d8dde3;            /* gray-100 */
+  --border: rgba(24, 26, 31, 0.12);
+  --text-primary: #23252a;         /* gray-900 */
+  --text-secondary: #545a62;       /* gray-600 */
+  --text-muted: #656b73;           /* gray-500, darkened to clear 4.5:1 on the window */
+  --text-inverse: #ffffff;
+  --accent: #3144d9;               /* blue-600 */
+  --accent-dim: #425eff;           /* blue-500: white on it is 4.9:1 */
+  --success: #006933;              /* green-600 */
+  --warning: #664b00;              /* yellow-800 */
+  --danger: #b6073c;               /* red-600 */
+  --status-ready: #656b73;
+  --status-ready-rgb: 101, 107, 115;
+  --unseen-rgb: 49, 68, 217;
+}
+
+.chat-root[data-chrome='refresh'] {
+  /* The window is a shade under a card, as in LaunchPad and the mock. */
+  --chrome-window: #101114;
+  --chrome-card: var(--bg-base);
+  --chrome-card-border: color-mix(in srgb, var(--border) 70%, transparent);
+  --chrome-card-radius: 12px;
+  --chrome-gap: 8px;
+}
+html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: #eceff2; /* gray-50 */ }
+.chat-root[data-chrome='refresh'][data-pane='docked'] { background: var(--chrome-window); }
+.chat-root[data-chrome='refresh'] {
+  font-family: var(--font-ui);
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── The sidebar, on the window, resizable (SidebarResize.tsx) ── */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-sidebar {
+  position: relative;
+  background: transparent;
+  border-right: none;
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: calc(var(--chrome-gap) / -2 - 4px);
+  width: 8px;
+  height: 100%;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+/* A thin line in the gap, lit on hover, while dragging and on keyboard focus. */
+.chat-root[data-chrome='refresh'] .chat-sidebar-resize::after {
+  content: '';
+  position: absolute;
+  top: var(--chrome-gap);
+  bottom: var(--chrome-gap);
+  left: 3px;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar-resize:hover::after,
+.chat-root[data-chrome='refresh'] .chat-sidebar-resize:active::after,
+.chat-root[data-chrome='refresh'] .chat-sidebar-resize:focus-visible::after {
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+/* ── Cards: the route's view and the side panel ── */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-main {
+  box-sizing: border-box;
+  padding: var(--chrome-gap) var(--chrome-gap) var(--chrome-gap) 0;
+  gap: var(--chrome-gap);
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-main > :not(.chat-side-panel) {
+  flex: 1 1 0;
+  min-width: 0;
+  background: var(--chrome-card);
+  border: 1px solid var(--chrome-card-border);
+  border-radius: var(--chrome-card-radius);
+}
+/* A view that doesn't scroll itself is clipped to the card's corners; one that
+   does (New session's page) is a scroll container, which clips them already. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-main > .chat-view { overflow: hidden; }
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-main > .chat-home {
+  margin: 0;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-panel {
+  background: var(--chrome-card);
+  border: 1px solid var(--chrome-card-border);
+  border-radius: var(--chrome-card-radius);
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-head {
+  border-bottom-color: var(--chrome-card-border);
+  border-radius: var(--chrome-card-radius) var(--chrome-card-radius) 0 0;
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-body {
+  background: transparent;
+  border-radius: 0 0 var(--chrome-card-radius) var(--chrome-card-radius);
+  overflow: hidden;
+}
+/* The panel's resize handle sits in the gap before it, lit like the sidebar's. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-divider {
+  left: calc(var(--chrome-gap) * -1 - 1px);
+  width: var(--chrome-gap);
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-divider:hover { background: none; opacity: 1; }
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-divider::after {
+  content: '';
+  position: absolute;
+  top: var(--chrome-gap);
+  bottom: var(--chrome-gap);
+  left: 3px;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-divider:hover::after {
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+/* ── The sidebar's head and foot (SidebarChrome.tsx) ──
+   Text sits on the window (--bg-surface) or a row's hover. --text-muted fails
+   WCAG AA there, so text is --text-primary or --text-secondary; muted is kept
+   for marks that are not text. */
+.chat-root[data-chrome='refresh'] {
+  --chrome-row-hover: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  --chrome-row-active: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  --chrome-tree-guide: color-mix(in srgb, var(--text-primary) 14%, transparent);
+}
+/* 48px tall under any notch: the inset is padding on top of the row, not taken out of it. */
+.chat-root[data-chrome='refresh'] .chat-sidebar-head {
+  height: calc(48px + env(safe-area-inset-top, 0px));
+  box-sizing: border-box;
+  padding: env(safe-area-inset-top, 0px) 12px 0 14px;
+  border-bottom: none;
+}
+.chat-root[data-chrome='refresh'] .chat-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+
+/* New session: a full-width row at the top, its shortcut at the end; Search under it. */
+.chat-root[data-chrome='refresh'] .chat-sidebar-actions { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 8px; }
+.chat-root[data-chrome='refresh'] .chat-new-row {
+  width: 100%;
+  height: 36px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0 10px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-primary) 6%, transparent);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+}
+.chat-root[data-chrome='refresh'] .chat-new-row:hover { background: color-mix(in srgb, var(--text-primary) 11%, transparent); }
+.chat-root[data-chrome='refresh'] .chat-new-row-label { flex: 1; text-align: left; }
+.chat-root[data-chrome='refresh'] :is(.chat-new-kbd, .chat-search-kbd) {
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.chat-root[data-chrome='refresh'] .chat-search { padding: 0; }
+/* ChatSearch stays mounted for ⌘K and its palette; SearchButton is its trigger here. */
+.chat-root[data-chrome='refresh'] .chat-search .search-trigger { display: none; }
+.chat-root[data-chrome='refresh'] .chat-search-button {
+  width: 100%;
+  height: 32px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 400;
+}
+.chat-root[data-chrome='refresh'] .chat-search-button:hover { background: var(--chrome-row-hover); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-search-button [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .chat-search-button-label { flex: 1; text-align: left; }
+
+/* The foot: the account and its menu, Settings beside it. */
+.chat-root[data-chrome='refresh'] .chat-sidebar-foot {
+  gap: 2px;
+  align-items: center;
+  padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+  border-top: none;
+}
+.chat-root[data-chrome='refresh'] .chat-account {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0 8px;
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-weight: 400;
+  text-align: left;
+}
+.chat-root[data-chrome='refresh'] .chat-account:hover,
+.chat-root[data-chrome='refresh'] .chat-account[aria-expanded='true'] { background: var(--chrome-row-hover); }
+.chat-root[data-chrome='refresh'] .chat-account-avatar { flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-account-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.chat-root[data-chrome='refresh'] :is(.chat-account-name, .chat-account-sub) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .chat-account-name { font-size: 13px; font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-account-sub { font-size: 11.5px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-account-caret { margin-left: auto; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] :is(.chat-account-caret, .chat-settings-button) [data-icon],
+.chat-root[data-chrome='refresh'] .chat-account-caret[data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-settings-button { flex-shrink: 0; border-radius: 8px; }
+
+/* ── Menus the refresh opens (portaled to the body, so keyed on their own classes) ──
+   LaunchPad's menu item lays an icon, a label and a description out in a grid;
+   here the icon takes the first column, beside both lines. */
+.lp-theme.chat-menu-popover { min-width: 240px; padding: 4px; font-family: var(--font-ui); }
+.lp-theme.chat-menu-popover [role='menuitem'] { border-radius: 8px; padding: 7px 10px; }
+.lp-theme.chat-menu-popover [role='menuitem'] > :has(> [slot='label']) {
+  grid-template-columns: 20px minmax(0, 1fr);
+  grid-template-areas: none;
+  column-gap: 10px;
+  row-gap: 1px;
+}
+.lp-theme.chat-menu-popover [role='menuitem'] > :has(> [slot='label']) > svg { grid-column: 1; grid-row: 1 / span 2; align-self: start; fill: var(--text-secondary); }
+.lp-theme.chat-menu-popover [role='menuitem'] [slot='label'] { grid-column: 2; grid-row: 1; font-weight: 500; line-height: 20px; }
+.lp-theme.chat-menu-popover [role='menuitem'] [slot='description'] { grid-column: 2; grid-row: 2; color: var(--text-secondary); font-size: 12px; }
+
+/* ── Sidebar rows (OpenItems.tsx): one line, the state's mark, the title, the age ──
+   The state's mark (StatusMark.tsx, chat/rowState.ts): LaunchPad's spinner
+   while it works, a dot when it needs you (amber to approve, blue to answer,
+   red when it stopped), nothing when it is done or not running. */
+.chat-root[data-chrome='refresh'] .chat-items { padding: 4px 8px 12px; }
+.chat-root[data-chrome='refresh'] .chat-group + .chat-group { margin-top: 14px; }
+.chat-root[data-chrome='refresh'] .chat-group-toggle:hover { background: var(--chrome-row-hover); }
+.chat-root[data-chrome='refresh'] .chat-group-count {
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  border-radius: 6px;
+}
+.chat-root[data-chrome='refresh'] .chat-item {
+  height: 34px;
+  gap: 10px;
+  padding: 0 8px;
+  border-radius: 8px;
+}
+.chat-root[data-chrome='refresh'] .chat-item:hover { background: var(--chrome-row-hover); }
+.chat-root[data-chrome='refresh'] .chat-item.active { background: var(--chrome-row-active); }
+/* Needing you is the dot's to say; the name stays readable, a little heavier. */
+.chat-root[data-chrome='refresh'] .chat-item[data-band='attention'] .chat-item-name { color: var(--text-primary); font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-item:is([data-state='approval'], [data-state='unread'], [data-state='error']) .chat-item-name { font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-item[data-state='off'] .chat-item-name { color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-item-age {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+/* The ⋮ shows where the age is, on hover and focus. A touch screen shows the ⋮ all the
+   time (chat.css), so there the row keeps room for it beside the age, as without the flag. */
+.chat-root[data-chrome='refresh'] .chat-item-li:is(:hover, :focus-within) .chat-item-age { visibility: hidden; }
+@media (hover: none) and (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-item-li:is(:hover, :focus-within) .chat-item-age { visibility: visible; }
+}
+.chat-root[data-chrome='refresh'] .chat-item-li .item-menu-btn { top: 4px; right: 4px; width: 26px; height: 26px; border-radius: 7px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-item-li .item-menu-btn:is(:hover, [aria-expanded='true']) { background: var(--chrome-row-active); color: var(--text-primary); }
+/* The tab's X beside it (chat.css), the same size; shown, the age goes and the name keeps clear of both. */
+.chat-root[data-chrome='refresh'] .chat-item-li .chat-item-close { top: 4px; right: 4px; width: 26px; height: 26px; border-radius: 7px; }
+.chat-root[data-chrome='refresh'] .chat-item-li .chat-item-close [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-item-li .chat-item-close:hover { background: var(--chrome-row-active); }
+.chat-root[data-chrome='refresh'] .chat-item-li .chat-item-close:hover [data-icon] { fill: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-item-closable > .chat-item-menu { right: 32px; }
+.chat-root[data-chrome='refresh'] .chat-item-closable:is(:hover, :focus-within, :has(> .chat-item-menu[aria-expanded='true'])) > .chat-item { padding-right: 62px; }
+.chat-root[data-chrome='refresh'] .chat-item-closable:is(:hover, :focus-within, :has(> .chat-item-menu[aria-expanded='true'])) .chat-item-age { display: none; }
+/* A finger gets 44px rows and a 44px ⋮, as without the flag (chat.css). A Standard row
+   (below) is at least as tall as its ⋮, which sits at its top, so the ⋮ never reaches into
+   the next row; these outrank the Standard rules wherever they sit in the file. */
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-item { height: 44px; padding-right: 44px; }
+  .chat-root[data-chrome='refresh'] .chat-item-li .item-menu-btn { top: 0; right: 0; width: 44px; height: 44px; }
+  .chat-root[data-chrome='refresh'] .chat-items .chat-item[data-density='standard'] { min-height: 44px; }
+  .chat-root[data-chrome='refresh'] .chat-items .chat-item[data-density='standard'] + .item-menu-btn { top: 0; }
+  .chat-root[data-chrome='refresh'] .chat-item-li .chat-item-close { top: 0; right: 0; width: 44px; height: 44px; }
+  .chat-root[data-chrome='refresh'] .chat-items .chat-item[data-density='standard'] ~ .chat-item-close { top: 0; }
+  .chat-root[data-chrome='refresh'] .chat-item-closable > .chat-item-menu { right: 44px; }
+  .chat-root[data-chrome='refresh'] .chat-item-closable > .chat-item,
+  .chat-root[data-chrome='refresh'] .chat-item-closable:is(:hover, :focus-within, :has(> .chat-item-menu[aria-expanded='true'])) > .chat-item { padding-right: 88px; }
+  .chat-root[data-chrome='refresh'] .chat-item-closable:is(:hover, :focus-within, :has(> .chat-item-menu[aria-expanded='true'])) .chat-item-age { display: inline; }
+}
+
+/* ── The sidebar's groups (OpenItems.tsx), as the mock drew them ──
+   A head is quiet: the space's swatch, its name in the secondary colour at a normal
+   weight, and its count beside the name. The fold caret and the ⋮ show on hover, on
+   keyboard focus and while the menu is open; a folded space keeps its caret, turned,
+   and a touch screen (no hover) always shows the ⋮. There is no rail down a space and
+   no indent under its head: rows line up under the head, each one's state mark in the
+   gutter below the swatch. A session's agents (chat/agentTree.ts) are a tree under it (below). */
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-head { min-height: 28px; padding: 0 2px 2px 0; }
+.chat-root[data-chrome='refresh'] .chat-items .space-swatch { width: 9px; height: 9px; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-toggle { gap: 8px; padding: 4px 6px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-toggle:hover { background: none; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-name { flex: 0 1 auto; font-weight: 500; letter-spacing: 0; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-count { order: 2; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-head .chat-group-caret { order: 3; opacity: 0; transition: opacity 0.12s ease, transform 0.12s ease; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-attn { order: 4; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-menu { width: 28px; height: 28px; border-radius: 7px; opacity: 0; transition: opacity 0.12s ease; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-head:is(:hover, :focus-within) :is(.chat-group-caret, .chat-group-menu),
+.chat-root[data-chrome='refresh'] .chat-items .chat-group[data-folded] .chat-group-head .chat-group-caret,
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-menu[aria-expanded='true'] { opacity: 1; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-menu:is(:hover, [aria-expanded='true']) { background: var(--chrome-row-active); color: var(--text-primary); }
+@media (hover: none) {
+  .chat-root[data-chrome='refresh'] .chat-items .chat-group-menu { opacity: 1; }
+}
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-items .chat-group-head { padding: 0; }
+  .chat-root[data-chrome='refresh'] .chat-items .chat-group-menu { width: 44px; height: 44px; }
+}
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-list { margin: 0; padding: 0; border-left: none; }
+/* What sits under a head lines up with the rows' names: 8px of padding, the 20px mark, a 10px gap. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-empty { padding: 6px 8px 8px 38px; font-size: 12px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-more { padding: 6px 8px 6px 38px; border-radius: 8px; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-more:hover { background: var(--chrome-row-hover); }
+/* A file's and a new tab's icon (LaunchPad's) take the mark's 20px column, so every name starts in one place. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-icon { width: 20px; height: 20px; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-icon [data-icon] { fill: var(--text-secondary); }
+/* ── A session's agents (chat/agentTree.ts), as a tree under it ──
+   A nested row spans the list as every row does, so the highlights share one left edge; its
+   mark and name step in 16px a level instead of the row. A guide runs from the parent down
+   through what it started, under the parent's mark, one line for each level above the row; it
+   is a background image, since the row's ::before and ::after are the drop markers (chat.css).
+   This rule outranks the row's hover and active backgrounds, which would reset the image. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-item {
+  margin-left: 0;
+  padding-left: calc(8px + var(--chat-depth) * 16px);
+  background-image: repeating-linear-gradient(to right, var(--chrome-tree-guide) 0 1px, transparent 1px 16px);
+  background-size: calc(var(--chat-depth) * 16px) 100%;
+  background-position: 17.5px 0;
+  background-repeat: no-repeat;
+}
+/* An automation's Show all lines up with its runs' names: the padding, the 20px mark, the 10px gap. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-item.chat-runs-all { padding-left: calc(38px + var(--chat-depth) * 16px); }
+/* The parent's caret takes its mark's place. It shows when the mark is empty (done, not
+   running), and in the mark's stead on hover or keyboard focus, so a working parent keeps its
+   spinner until you reach for the caret. Hidden, it is still where a click on the mark lands. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-li.chat-tree-li > .chat-twisty {
+  top: 7px;
+  left: calc(8px + var(--chat-depth) * 16px);
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li:has(> .chat-item > .chat-status-mark:empty) > .chat-twisty,
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li:is(:hover, :has(:focus-visible)) > .chat-twisty { opacity: 1; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li:has(> .chat-twisty):is(:hover, :has(:focus-visible)) > .chat-item > .chat-status-mark { visibility: hidden; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-twisty:hover { background: var(--chrome-row-active); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-twisty:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A Standard row's mark sits on its first line, a pixel lower (below). */
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li:has(> .chat-item[data-density='standard']) > .chat-twisty { top: 9px; }
+/* A finger gets the row's height and the mark's column, padding and gap included, with the caret where the mark is. */
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-items .chat-item-li.chat-tree-li > .chat-twisty { top: 0; left: calc(var(--chat-depth) * 16px); width: 36px; height: 44px; }
+  /* The Standard rule above outranks the one before (its :has() counts), so it says top: 0 itself. */
+  .chat-root[data-chrome='refresh'] .chat-items .chat-tree-li:has(> .chat-item[data-density='standard']) > .chat-twisty { top: 0; height: 38px; }
+}
+/* A folded parent says how many rows it hides, right after its name, as a space's head gives its count. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-folded {
+  flex-shrink: 0;
+  margin-right: auto;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.chat-root[data-chrome='refresh'] .chat-items :is(.chat-item, .chat-item-top):has(> .chat-item-folded) > .chat-item-name { flex: 0 1 auto; }
+
+.chat-root[data-chrome='refresh'] .chat-status-mark,
+.lp-theme.chat-palette-layer .chat-status-mark {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-root[data-chrome='refresh'] .chat-status-mark [role='progressbar'],
+.lp-theme.chat-palette-layer .chat-status-mark [role='progressbar'] { --fill-color: var(--accent); }
+.chat-root[data-chrome='refresh'] .chat-status-dot,
+.lp-theme.chat-palette-layer .chat-status-dot {
+  --dot: var(--accent);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--dot) 22%, transparent);
+}
+.chat-root[data-chrome='refresh'] .chat-status-mark[data-status='approval'] .chat-status-dot,
+.lp-theme.chat-palette-layer .chat-status-mark[data-status='approval'] .chat-status-dot { --dot: var(--warning); animation: chrome-pulse 1.6s ease-in-out infinite; }
+.chat-root[data-chrome='refresh'] .chat-status-mark[data-status='error'] .chat-status-dot,
+.lp-theme.chat-palette-layer .chat-status-mark[data-status='error'] .chat-status-dot { --dot: var(--danger); }
+@keyframes chrome-pulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--dot) 10%, transparent); } }
+@media (prefers-reduced-motion: reduce) {
+  .chat-root[data-chrome='refresh'] .chat-status-dot,
+  .lp-theme.chat-palette-layer .chat-status-dot { animation: none; }
+}
+
+/* ── Archived (ArchivedRows.tsx): a head like a status group's, rows like the sessions', the border under it ──
+   The head's toggle and each row are LaunchPad Buttons wearing the space head's and the session
+   row's classes. LaunchPad's button sets its own font, layout, padding and fills, so these rules
+   put back the head's and the row's. The section sits above the account, its border under it. */
+.chat-root[data-chrome='refresh'] .chat-archived-group {
+  flex-shrink: 0;
+  max-height: 40%;
+  overflow-y: auto;
+  padding: 4px 8px 8px;
+  border-radius: 0;
+  border-bottom: 1px solid var(--border);
+}
+/* The head is quiet, as a status group's is (no swatch): the name at a normal weight, the count
+   beside it, and the caret on hover, on keyboard focus, or turned while the list is folded. */
+.chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-head { min-height: 28px; padding: 0 2px 2px 0; }
+.chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-name { flex: 0 1 auto; font-weight: 500; letter-spacing: 0; }
+.chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-count { order: 2; }
+.chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-head .chat-group-caret { order: 3; opacity: 0; transition: opacity 0.12s ease, transform 0.12s ease; }
+.chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-head:is(:hover, :focus-within) .chat-group-caret,
+.chat-root[data-chrome='refresh'] .chat-archived-group[data-folded] .chat-group-head .chat-group-caret { opacity: 1; }
+.chat-root[data-chrome='refresh'] .chat-archived-fold {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.chat-root[data-chrome='refresh'] .chat-archived-fold:is(:hover, [data-hovered], [data-pressed]) { background: none; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-archived-fold[data-focus-visible] { background: none; outline: 2px solid var(--accent); outline-offset: -2px; }
+/* No rail and no indent: rows line up under the head, as the spaces' do. */
+.chat-root[data-chrome='refresh'] .chat-archived-rows { margin: 0; padding: 0; border-left: none; }
+.chat-root[data-chrome='refresh'] .chat-archived-item {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+  color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
+}
+.chat-root[data-chrome='refresh'] .chat-archived-item:is(:hover, [data-hovered], [data-pressed], [aria-expanded='true']) { background: var(--chrome-row-hover); }
+.chat-root[data-chrome='refresh'] .chat-archived-item.active { background: var(--chrome-row-active); }
+.chat-root[data-chrome='refresh'] .chat-archived-item[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* ⋯ shows where the box's word (or the age) is, on hover, on focus and while the menu is open. */
+.chat-root[data-chrome='refresh'] .chat-archived-more {
+  position: absolute;
+  top: 7px;
+  right: 6px;
+  display: inline-flex;
+  opacity: 0;
+  pointer-events: none;
+}
+.chat-root[data-chrome='refresh'] .chat-archived-more [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-archived-li:is(:hover, :focus-within) .chat-archived-more,
+.chat-root[data-chrome='refresh'] .chat-archived-item[aria-expanded='true'] .chat-archived-more { opacity: 1; }
+.chat-root[data-chrome='refresh'] .chat-archived-item[aria-expanded='true'] .chat-item-age { visibility: hidden; }
+@media (hover: none) and (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-archived-more { opacity: 1; }
+}
+/* A finger's 44px row (the session rows' rule) keeps the ⋯ centred. */
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-archived-more { top: 12px; }
+}
+.chat-root[data-chrome='refresh'] .chat-archived-note { margin: 6px 8px 0; font-size: 12px; line-height: 16px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-archived-note[data-tone='error'] { color: var(--danger); }
+/* Delete forever… in the row's menu reads as the old list's red link did. LaunchPad's destructive item
+   fills red on hover, which the description's grey can't be read on, so it is a plain item in red. */
+.lp-theme.chat-menu-popover .chat-menu-danger [slot='label'] { color: var(--danger); }
+.lp-theme.chat-menu-popover .chat-menu-danger > :has(> [slot='label']) > svg { fill: var(--danger); }
+/* Delete forever's confirm (ArchivedDeleteConfirm), portaled to the body under LP_THEME. */
+.lp-theme .chat-archived-confirm { font-family: var(--font-ui); color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; }
+.lp-theme .chat-archived-confirm-dialog { display: flex; flex-direction: column; gap: 10px; padding: 20px; outline: none; }
+.lp-theme .chat-archived-confirm-dialog p { margin: 0; color: var(--text-secondary); }
+.lp-theme .chat-archived-confirm-buttons { justify-content: flex-end; margin-top: 6px; }
+
+/* ── A session's header (SessionHeader.tsx), on a desktop width ──
+   space / title, the project chip, a Working pill; then the box, ⋯ and the panel toggle.
+   48px tall, as the side panel's head, so the toggle and the panel's collapse button
+   sit in the same place at the window's corner. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-header {
+  height: calc(48px + env(safe-area-inset-top, 0px));
+  box-sizing: border-box;
+  padding: env(safe-area-inset-top, 0px) 8px 0 16px;
+  gap: 8px;
+  background: transparent;
+  border-bottom-color: var(--chrome-card-border);
+}
+.chat-root[data-chrome='refresh'] .chat-header .chat-title { gap: 8px; }
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-space {
+  max-width: 30%;
+  gap: 7px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+/* The breadcrumb's slash only follows a space. */
+.chat-root[data-chrome='refresh'] .chat-crumb-sep { display: none; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-title-space + .chat-crumb-sep { display: inline; }
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-name { font-size: 14px; font-weight: 500; letter-spacing: -0.01em; }
+.chat-root[data-chrome='refresh'] .chat-title-project {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 2px 8px 2px 4px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.chat-root[data-chrome='refresh'] .chat-title-project [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-repo { color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-title-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 2px 10px 2px 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+}
+.chat-root[data-chrome='refresh'] .chat-title-state [role='progressbar'] { --fill-color: var(--accent); }
+.chat-root[data-chrome='refresh'] .chat-header .chat-header-actions { gap: 2px; align-items: center; }
+.chat-root[data-chrome='refresh'] .chat-header-sep { width: 1px; height: 18px; margin: 0 4px; background: var(--border); }
+.chat-root[data-chrome='refresh'] :is(.chat-session-more, .chat-side-toggle, .chat-side-close) { width: 32px; height: 32px; border-radius: 8px; }
+.chat-root[data-chrome='refresh'] :is(.chat-session-more, .chat-side-toggle, .chat-side-close) [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] :is(.chat-session-more, .chat-side-toggle, .chat-side-close):hover [data-icon] { fill: var(--text-primary); }
+
+/* The side panel's head lines up with the header, its collapse button where the toggle was. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-head {
+  height: calc(48px + env(safe-area-inset-top, 0px));
+  box-sizing: border-box;
+  padding: env(safe-area-inset-top, 0px) 8px 0 6px;
+}
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-close { padding: 0; flex-shrink: 0; }
+
+/* ── The conversation ── the user's turn as a quiet bubble, not a blue one. */
+.chat-root[data-chrome='refresh'] .sdk-user-bubble {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-radius: 16px;
+}
+
+/* ── The side panel's tabs (PanelTabs.tsx): as many as you like, each closable, + for a new one ──
+   They shrink as they multiply, then turn to icons, then the rest go in "N more", so + and the
+   collapse button stay in view. The sizes are chat/panelTabs.ts PANEL_TAB_SIZES': change both. */
+.chat-root[data-chrome='refresh'] .chat-side-head { gap: 4px; }
+.chat-root[data-chrome='refresh'] .chat-side-tabs { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow: hidden; }
+.chat-root[data-chrome='refresh'] .chat-side-tab {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 34px;
+  height: 32px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab:hover { background: var(--chrome-row-hover); color: var(--text-primary); }
+/* The fitted strip's tabs only (PanelTabStrip, data-fit): the phone's overlay keeps its fixed
+   tabs, which share the class, with their own padding and border (chat.css). */
+.chat-root[data-chrome='refresh'] .chat-side-tabs[data-fit] > .chat-side-tab {
+  position: relative;
+  min-width: 96px;
+  max-width: 176px;
+  box-sizing: border-box;
+  /* Not the old tab's padding and underline (chat.css): the tab's button and × pad it. */
+  padding: 0;
+  border: none;
+}
+/* The tab on screen never shrinks, but a long title (a subagent's) stops short of taking the strip. */
+.chat-root[data-chrome='refresh'] .chat-side-tabs[data-fit] > .chat-side-tab[data-selected] {
+  flex-shrink: 0;
+  min-width: 0;
+  max-width: min(176px, 50%);
+  background: var(--chrome-row-active);
+  color: var(--text-primary);
+}
+/* A tab that is only its icon: its label stays its name, read aloud and in its tooltip. */
+.chat-root[data-chrome='refresh'] .chat-side-tabs[data-fit] > .chat-side-tab[data-compact] { flex: 0 0 32px; min-width: 32px; }
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-compact] .chat-side-tab-main { justify-content: center; width: 100%; padding: 0; }
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-compact] .chat-side-tab-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 100%;
+  padding: 0 4px 0 8px;
+  overflow: hidden;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab-main:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.chat-root[data-chrome='refresh'] .chat-side-tab-main [data-icon] { fill: currentColor; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-side-tab-label { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .chat-side-tab-close { width: 22px; height: 22px; margin-right: 4px; border-radius: 6px; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-side-tab-close [data-icon] { fill: var(--text-secondary); }
+/* Every labeled tab always has its ×, so a hover never changes a tab's width; a tab that isn't
+   shown has it quieter, full strength on hover or focus. */
+.chat-root[data-chrome='refresh'] .chat-side-tab:not([data-selected]) .chat-side-tab-close [data-icon] { opacity: 0.55; }
+.chat-root[data-chrome='refresh'] .chat-side-tab:is(:hover, :focus-within) .chat-side-tab-close [data-icon] { opacity: 1; }
+.chat-root[data-chrome='refresh'] .chat-side-add { width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-side-add [data-icon] { fill: var(--text-secondary); }
+/* "N more": the tabs that don't fit, in a menu. */
+.chat-root[data-chrome='refresh'] .chat-side-more {
+  flex: 0 0 44px;
+  height: 28px;
+  gap: 0;
+  padding: 0 2px 0 6px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.chat-root[data-chrome='refresh'] .chat-side-more [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .chat-side-more:hover { color: var(--text-primary); }
+.lp-theme.chat-side-more-menu { max-width: 320px; }
+/* LaunchPad's label is a flex box, which never ellipsizes its text. */
+.lp-theme.chat-side-more-menu [slot='label'] { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* The launcher: a new tab picks its tool. */
+.chat-root[data-chrome='refresh'] .chat-launcher { display: flex; flex-direction: column; gap: 16px; padding: 28px 20px; overflow-y: auto; }
+.chat-root[data-chrome='refresh'] .chat-launcher-head { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
+.chat-root[data-chrome='refresh'] .chat-launcher-title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.chat-root[data-chrome='refresh'] .chat-launcher-sub { font-size: 12.5px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-launcher-grid { display: flex; flex-direction: column; gap: 8px; }
+.chat-root[data-chrome='refresh'] .chat-launcher-tile {
+  width: 100%;
+  height: auto;
+  justify-content: flex-start;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 12px;
+  text-align: left;
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+  box-shadow: inset 0 0 0 1px var(--chrome-card-border);
+  color: var(--text-primary);
+}
+.chat-root[data-chrome='refresh'] .chat-launcher-tile:hover { background: color-mix(in srgb, var(--text-primary) 6%, transparent); }
+.chat-root[data-chrome='refresh'] .chat-launcher-icon {
+  --tile: var(--accent);
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--tile) 14%, transparent);
+}
+.chat-root[data-chrome='refresh'] .chat-launcher-icon [data-icon] { fill: var(--tile); }
+.chat-root[data-chrome='refresh'] .chat-launcher-icon[data-kind='terminal'] { --tile: var(--success); }
+.chat-root[data-chrome='refresh'] .chat-launcher-icon[data-kind='browser'] { --tile: color-mix(in srgb, var(--accent) 55%, var(--danger)); }
+.chat-root[data-chrome='refresh'] .chat-launcher-icon[data-kind='share'] { --tile: var(--warning); }
+.chat-root[data-chrome='refresh'] .chat-launcher-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.chat-root[data-chrome='refresh'] .chat-launcher-name { font-size: 14px; font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-launcher-desc { font-size: 12.5px; font-weight: 400; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-launcher-key {
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* ── The side panel's terminal: room to breathe, and the padding is the terminal's ──
+   Its background (the card's, under the terminal's see-through one) and its dimming
+   while unfocused (Terminal.tsx's .terminal-dimmed, App.css), stretched over the padding. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-body[data-tool='terminal'] { padding: 12px 8px 8px 14px; }
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-body[data-tool='terminal'] .terminal-dimmed::after {
+  top: -12px;
+  right: -8px;
+  bottom: -8px;
+  left: -14px;
+}
+
+/* ── The side panel's Pull request tab (PrTab.tsx): the gates, then the full UI's PR view ── */
+.chat-root[data-chrome='refresh'] .pr-panel { display: flex; flex-direction: column; gap: 12px; padding: 16px; overflow-y: auto; font-size: 13px; }
+.chat-root[data-chrome='refresh'] .pr-panel-empty { align-items: center; justify-content: center; text-align: center; gap: 8px; padding: 32px 24px; }
+.chat-root[data-chrome='refresh'] .pr-panel-label { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-launcher-icon[data-kind='pr'] { --tile: var(--accent); }
+.chat-root[data-chrome='refresh'] .pr-panel-gates {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+  box-shadow: inset 0 0 0 1px var(--chrome-card-border);
+}
+.chat-root[data-chrome='refresh'] .ctx-heading { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-gates { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.chat-root[data-chrome='refresh'] .ctx-gates li { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+/* The name keeps its width; a long detail (many reviewers) is what gives way, to an ellipsis. */
+.chat-root[data-chrome='refresh'] .ctx-gate-name { flex: 1 0 auto; }
+.chat-root[data-chrome='refresh'] .ctx-gate-detail { min-width: 0; color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .ctx-mark { width: 20px; height: 20px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
+.chat-root[data-chrome='refresh'] .ctx-mark [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-mark[data-status='pass'] [data-icon] { fill: var(--success); }
+.chat-root[data-chrome='refresh'] .ctx-mark[data-status='fail'] [data-icon] { fill: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-mark[data-status='waiting'] [data-icon] { fill: var(--warning); }
+.chat-root[data-chrome='refresh'] .ctx-mark [role='progressbar'] { --fill-color: var(--accent); }
+
+/* ── The context card (SessionContextCard.tsx): in the conversation's right gutter,
+   while the panel is shut and the conversation is wide enough to keep its column. ── */
+.chat-root[data-chrome='refresh'] .chat-conv { container: chrome-conv / inline-size; }
+.chat-root[data-chrome='refresh'] .ctx-card { display: none; }
+@container chrome-conv (min-width: 1100px) {
+  .chat-root[data-chrome='refresh'] .ctx-card {
+    position: absolute;
+    z-index: 2;
+    top: 60px;
+    right: 14px;
+    width: 288px;
+    max-height: calc(100% - 200px);
+    overflow-y: auto;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px;
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--text-primary) 3%, var(--chrome-card));
+    border: 1px solid var(--chrome-card-border);
+  }
+  .chat-root[data-chrome='refresh'] .chat-conv:has(.ctx-card) :is(.chat-transcript, .chat-bottom) { padding-right: 316px; }
+}
+.chat-root[data-chrome='refresh'] .ctx-section { padding: 8px 8px 10px; }
+.chat-root[data-chrome='refresh'] .ctx-section + .ctx-section { border-top: 1px solid var(--chrome-card-border); }
+.chat-root[data-chrome='refresh'] .ctx-card .ctx-heading { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+.chat-root[data-chrome='refresh'] .ctx-heading-aside { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; font-weight: 400; }
+.chat-root[data-chrome='refresh'] .ctx-rows { display: flex; flex-direction: column; gap: 6px; }
+.chat-root[data-chrome='refresh'] .ctx-row { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12.5px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-row > [data-icon] { fill: var(--text-secondary); flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .ctx-row > :is(span, code) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-root[data-chrome='refresh'] .ctx-row code { font-family: var(--font-mono); font-size: 11.5px; }
+.chat-root[data-chrome='refresh'] .ctx-row-space .chat-title-space { gap: 8px; padding: 0 0 0 5px; border: none; background: none; color: var(--text-secondary); font-size: 12.5px; max-width: none; }
+.chat-root[data-chrome='refresh'] .ctx-pill {
+  --pill: var(--success);
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--pill) 14%, transparent);
+  color: var(--pill);
+  font-size: 11px;
+  font-weight: 500;
+}
+.chat-root[data-chrome='refresh'] .ctx-pill[data-status='waiting'] { --pill: var(--warning); }
+.chat-root[data-chrome='refresh'] .ctx-pill[data-status='off'] { --pill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-pill[data-status='fail'] { --pill: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-numstat { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .ctx-add { color: var(--success); }
+.chat-root[data-chrome='refresh'] .ctx-del { color: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-bar { display: inline-flex; gap: 2px; }
+.chat-root[data-chrome='refresh'] .ctx-bar > span { width: 7px; height: 7px; border-radius: 2px; background: color-mix(in srgb, var(--text-primary) 12%, transparent); }
+.chat-root[data-chrome='refresh'] .ctx-bar > [data-kind='add'] { background: var(--success); }
+.chat-root[data-chrome='refresh'] .ctx-bar > [data-kind='del'] { background: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.chat-root[data-chrome='refresh'] .ctx-files li { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chat-root[data-chrome='refresh'] .ctx-file-kind { width: 14px; flex-shrink: 0; font-size: 10.5px; font-weight: 600; color: var(--text-secondary); text-align: center; }
+.chat-root[data-chrome='refresh'] .ctx-file-kind[data-kind='A'] { color: var(--success); }
+.chat-root[data-chrome='refresh'] .ctx-file-kind[data-kind='D'] { color: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .ctx-file-dir { color: var(--text-secondary); }
+/* In-flight changes (useSessionChanges.ts): a group per state, each with its own count, above the PR's files. */
+.chat-root[data-chrome='refresh'] .ctx-group + .ctx-group,
+.chat-root[data-chrome='refresh'] .ctx-group + .ctx-subheading { margin-top: 10px; }
+.chat-root[data-chrome='refresh'] .ctx-subheading { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; font-family: var(--font-ui); font-size: 11.5px; font-weight: 500; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-where { margin: -2px 0 8px; font-size: 12px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-where code { font-family: var(--font-mono); font-size: 11px; }
+.chat-root[data-chrome='refresh'] .ctx-files-more { font-size: 12px; color: var(--text-secondary); padding-left: 22px; }
+.chat-root[data-chrome='refresh'] .ctx-empty { margin: 0; font-size: 12.5px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-pr {
+  width: 100%;
+  height: auto;
+  justify-content: flex-start;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 8px;
+  border-radius: 10px;
+  text-align: left;
+  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+  color: var(--text-primary);
+}
+.chat-root[data-chrome='refresh'] .ctx-pr:hover { background: color-mix(in srgb, var(--text-primary) 7%, transparent); }
+.chat-root[data-chrome='refresh'] .ctx-pr-state {
+  --state: var(--success);
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--state) 14%, transparent);
+}
+.chat-root[data-chrome='refresh'] .ctx-pr-state[data-state='merged'] { --state: var(--accent); }
+.chat-root[data-chrome='refresh'] .ctx-pr-state[data-state='closed'] { --state: var(--danger); }
+.chat-root[data-chrome='refresh'] .ctx-pr-state [data-icon] { fill: var(--state); }
+.chat-root[data-chrome='refresh'] .ctx-pr-text { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 1px; }
+.chat-root[data-chrome='refresh'] .ctx-pr-title { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .ctx-pr-sub { font-size: 11.5px; font-weight: 400; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .ctx-pr-go[data-icon] { fill: var(--text-secondary); flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .ctx-card .ctx-gates li { font-size: 12.5px; }
+
+/* ── Subagents (Subagents.tsx, AgentTab.tsx): an Agent call's row, and its tab ── */
+.chat-root[data-chrome='refresh'] .agent-call[data-shown] { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.chat-root[data-chrome='refresh'] .agent-call-head {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 400;
+  text-align: left;
+}
+.chat-root[data-chrome='refresh'] .agent-call-head:hover { background: var(--bg-elevated); }
+.chat-root[data-chrome='refresh'] .agent-call-head > * { flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .agent-call-head .sdk-tool-intent { flex: 0 1 auto; min-width: 0; }
+.chat-root[data-chrome='refresh'] .agent-type {
+  padding: 0 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+.chat-root[data-chrome='refresh'] .agent-call-line { font-size: 12px; color: var(--text-secondary); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .agent-call-open {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.chat-root[data-chrome='refresh'] .agent-call-open [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .agent-call-head:hover .agent-call-open { color: var(--text-primary); background: color-mix(in srgb, var(--text-primary) 7%, transparent); }
+.chat-root[data-chrome='refresh'] .agent-call[data-shown] .agent-call-open { color: var(--accent); }
+.chat-root[data-chrome='refresh'] .agent-call-flash { animation: agent-call-flash 1.4s ease-out; }
+@keyframes agent-call-flash { 0%, 30% { box-shadow: 0 0 0 2px var(--accent); } 100% { box-shadow: 0 0 0 2px transparent; } }
+@media (prefers-reduced-motion: reduce) { .chat-root[data-chrome='refresh'] .agent-call-flash { animation: none; box-shadow: 0 0 0 2px var(--accent); } }
+.chat-root[data-chrome='refresh'] .agent-mark { width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
+.chat-root[data-chrome='refresh'] .agent-mark [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-mark[data-status='done'] [data-icon] { fill: var(--success); }
+.chat-root[data-chrome='refresh'] .agent-mark[data-status='failed'] [data-icon] { fill: var(--danger); }
+.chat-root[data-chrome='refresh'] .agent-mark [role='progressbar'] { --fill-color: var(--accent); }
+
+.chat-root[data-chrome='refresh'] .agent-panel { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow-y: auto; font-size: 13.5px; }
+.chat-root[data-chrome='refresh'] .agent-panel-empty { padding: 24px; gap: 6px; }
+.chat-root[data-chrome='refresh'] .agent-panel-head { padding: 14px 16px 12px; border-bottom: 1px solid var(--chrome-card-border); }
+.chat-root[data-chrome='refresh'] .agent-panel-row { display: flex; align-items: center; gap: 8px; }
+.chat-root[data-chrome='refresh'] .agent-pill {
+  --pill: var(--success);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px 1px 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--pill) 14%, transparent);
+  color: var(--pill);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.chat-root[data-chrome='refresh'] .agent-pill[data-status='running'] { --pill: var(--accent); }
+.chat-root[data-chrome='refresh'] .agent-pill[data-status='failed'] { --pill: var(--danger); }
+.chat-root[data-chrome='refresh'] .agent-pill[data-status='stopped'] { --pill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-pill .agent-mark [data-icon] { fill: var(--pill); }
+.chat-root[data-chrome='refresh'] .agent-panel-jump { margin-left: auto; gap: 4px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-panel-jump [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .agent-panel-title { display: block; margin: 8px 0 3px; font-size: 15px; font-weight: 600; color: var(--text-primary); overflow-wrap: anywhere; }
+.chat-root[data-chrome='refresh'] .agent-panel-meta { font-size: 12.5px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .agent-panel-body { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px 24px; }
+.chat-root[data-chrome='refresh'] .agent-brief {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+  box-shadow: inset 0 0 0 1px var(--chrome-card-border);
+}
+.chat-root[data-chrome='refresh'] .agent-brief-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-brief-head [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-brief-toggle { margin-left: auto; height: 22px; padding: 0 6px; font-weight: 400; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-brief-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .agent-brief:not([data-open]) .agent-brief-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.chat-root[data-chrome='refresh'] .agent-transcript { display: flex; flex-direction: column; gap: 10px; }
+.chat-root[data-chrome='refresh'] .agent-panel-note { margin: 0; color: var(--text-secondary); font-size: 12.5px; }
+.chat-root[data-chrome='refresh'] .agent-panel-step { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 13px; }
+.chat-root[data-chrome='refresh'] .agent-result {
+  --tint: var(--success);
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--tint) 6%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tint) 25%, transparent);
+}
+.chat-root[data-chrome='refresh'] .agent-result[data-status='failed'] { --tint: var(--danger); }
+.chat-root[data-chrome='refresh'] .agent-result[data-status='stopped'] { --tint: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .agent-result-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-side-body[data-tool='agent'] { padding: 0; }
+
+/* ── Asks (Asks.tsx): a `termag ask` call's row, and a shut run's one quiet line ── */
+/* Whether Claude is waiting for the reply: a --no-wait ask says it isn't, in words. */
+.chat-root[data-chrome='refresh'] .ask-waiting {
+  flex-shrink: 0;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.chat-root[data-chrome='refresh'] .ask-waiting[data-waiting='claude'] { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.chat-root[data-chrome='refresh'] .ask-call .agent-call-open { opacity: 0; }
+.chat-root[data-chrome='refresh'] .ask-call .agent-call-head:hover .agent-call-open,
+.chat-root[data-chrome='refresh'] .ask-call .agent-call-head:focus-visible .agent-call-open,
+.chat-root[data-chrome='refresh'] .ask-call[data-shown] .agent-call-open { opacity: 1; }
+.chat-root[data-chrome='refresh'] .ask-line { display: flex; flex-direction: column; gap: 6px; }
+.chat-root[data-chrome='refresh'] .ask-line-head {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 400;
+  text-align: left;
+}
+.chat-root[data-chrome='refresh'] .ask-line-head:hover { background: color-mix(in srgb, var(--text-primary) 4%, transparent); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .ask-line-lead { flex-shrink: 0; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .ask-line-detail { flex: 0 1 auto; min-width: 0; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .ask-line-chevron[data-icon] { margin-left: auto; flex-shrink: 0; fill: currentColor; }
+.chat-root[data-chrome='refresh'] .ask-line-rows { display: flex; flex-direction: column; gap: 6px; margin-left: 10px; padding-left: 14px; border-left: 2px solid var(--chrome-card-border); }
+
+/* The ask's tab (AskTab.tsx): its waiting note says plainly when no reply is coming back to Claude. */
+.chat-root[data-chrome='refresh'] .ask-waiting-note {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.chat-root[data-chrome='refresh'] .ask-waiting-note strong { color: var(--text-primary); font-weight: 600; }
+.chat-root[data-chrome='refresh'] .ask-waiting-note[data-tone='waiting'] { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.chat-root[data-chrome='refresh'] .ask-waiting-note[data-tone='waiting'] strong { color: var(--accent); }
+.chat-root[data-chrome='refresh'] .ask-panel-actions { display: flex; gap: 6px; margin-top: 10px; }
+.chat-root[data-chrome='refresh'] .ask-panel-actions [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .ask-turn { display: flex; flex-direction: column; gap: 10px; }
+.chat-root[data-chrome='refresh'] .ask-turn-sep { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 12px; }
+.chat-root[data-chrome='refresh'] .ask-turn-sep::before,
+.chat-root[data-chrome='refresh'] .ask-turn-sep::after { content: ''; flex: 1; height: 1px; background: var(--chrome-card-border); }
+
+/* ── Subagents kept in view (Subagents.tsx): the context card's Agents, or the drawer on the composer ── */
+.chat-root[data-chrome='refresh'] .ctx-card .ctx-agents { padding: 8px 2px 6px; }
+.chat-root[data-chrome='refresh'] .ctx-card .ctx-agents .ctx-heading { padding: 0 6px; }
+.chat-root[data-chrome='refresh'] .ctx-agent-rows { display: flex; flex-direction: column; }
+.chat-root[data-chrome='refresh'] .agent-row {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  justify-content: flex-start;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-weight: 400;
+  text-align: left;
+}
+.chat-root[data-chrome='refresh'] .agent-row:hover { background: color-mix(in srgb, var(--text-primary) 6%, transparent); }
+.chat-root[data-chrome='refresh'] .agent-row[data-shown] { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.chat-root[data-chrome='refresh'] .agent-row .agent-mark { margin-top: 1px; }
+.chat-root[data-chrome='refresh'] .agent-row-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.chat-root[data-chrome='refresh'] .agent-row-name { font-size: 12.5px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .agent-row-sub { font-size: 11.5px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .agent-row-time { flex-shrink: 0; margin-top: 1px; font-size: 11.5px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+/* Centred on the composer as .chat-bottom's children are (max 820px, auto margins), 18px in from each side.
+   With subagents and asks both kept in view, .agent-drawer-stack is that frame and holds the two drawers. */
+.chat-root[data-chrome='refresh'] .chat-bottom > .agent-drawer,
+.chat-root[data-chrome='refresh'] .chat-bottom > .agent-drawer-stack {
+  position: relative;
+  box-sizing: border-box;
+  width: calc(min(820px, 100%) - 36px);
+  margin: 0 auto -1px;
+  border: 1px solid var(--chrome-card-border);
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  background: color-mix(in srgb, var(--text-primary) 3%, var(--chrome-card));
+  overflow: hidden;
+}
+.chat-root[data-chrome='refresh'] .agent-drawer-head {
+  width: 100%;
+  height: 30px;
+  min-width: 0;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 0 10px 0 12px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+.chat-root[data-chrome='refresh'] .agent-drawer-head:hover { color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .agent-drawer-marks { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .agent-drawer-lead { flex-shrink: 0; color: var(--text-primary); font-weight: 500; }
+.chat-root[data-chrome='refresh'] .agent-drawer[data-done] .agent-drawer-lead { color: var(--text-secondary); font-weight: 400; }
+.chat-root[data-chrome='refresh'] .agent-drawer-now { flex: 1; min-width: 0; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .agent-drawer-chevron[data-icon] { margin-left: auto; flex-shrink: 0; fill: currentColor; }
+.chat-root[data-chrome='refresh'] .agent-drawer-list { display: flex; flex-direction: column; max-height: 148px; overflow-y: auto; padding: 4px; border-bottom: 1px solid var(--chrome-card-border); }
+.chat-root[data-chrome='refresh'] .agent-drawer .agent-row { align-items: center; padding: 4px 6px; }
+.chat-root[data-chrome='refresh'] .agent-drawer .agent-row .agent-mark { margin-top: 0; }
+.chat-root[data-chrome='refresh'] .agent-drawer .agent-row-text { flex-direction: row; align-items: baseline; gap: 8px; }
+.chat-root[data-chrome='refresh'] .agent-drawer .agent-row-name { flex: 0 1 auto; }
+.chat-root[data-chrome='refresh'] .agent-drawer .agent-row-sub { flex: 1 1 0; }
+.chat-root[data-chrome='refresh'] .agent-drawer-stack > .agent-drawer + .agent-drawer { border-top: 1px solid var(--chrome-card-border); }
+/* While the context card shows them (the panel shut, the chat wide enough), the drawer doesn't. */
+@container chrome-conv (min-width: 1100px) {
+  .chat-root[data-chrome='refresh'] .chat-conv:has(.ctx-card) .agent-drawer,
+  .chat-root[data-chrome='refresh'] .chat-conv:has(.ctx-card) .agent-drawer-stack { display: none; }
+}
+
+/* ── View options (ViewOptions.tsx), beside Search ── */
+.chat-root[data-chrome='refresh'] .chat-search-row { display: flex; align-items: center; gap: 4px; }
+.chat-root[data-chrome='refresh'] .chat-search-row .chat-search { flex: 1; min-width: 0; }
+.chat-root[data-chrome='refresh'] .chat-view-button { flex-shrink: 0; border-radius: 8px; }
+.chat-root[data-chrome='refresh'] .chat-view-button [data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-view-button:hover [data-icon] { fill: var(--text-primary); }
+.lp-theme.chat-view-popover { font-family: var(--font-ui); }
+.lp-theme .chat-view-dialog { width: 280px; padding: 14px; display: flex; flex-direction: column; gap: 12px; outline: none; font-size: 13px; }
+.lp-theme .chat-view-field { display: flex; flex-direction: column; gap: 6px; }
+.lp-theme .chat-view-label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.lp-theme .chat-view-segment {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+.lp-theme .chat-view-segment > * { justify-content: center; gap: 6px; height: 30px; border-radius: 7px; font-size: 12.5px; }
+/* The chosen option is a quiet lift, not LaunchPad's saturated selected blue. */
+.lp-theme .chat-view-segment > [data-selected] {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(var(--shadow-rgb), calc(0.35 * var(--shadow-strength)));
+}
+.lp-theme .chat-view-segment [data-icon] { fill: currentColor; }
+.lp-theme .chat-view-sep { margin: 0; border-color: var(--border); background: var(--border); }
+.lp-theme .chat-view-switch { justify-content: space-between; flex-direction: row-reverse; width: 100%; font-size: 13px; }
+
+/* ── Standard rows (StandardRow.tsx): the title and age, then where and the state, then the agent's last words ── */
+.chat-root[data-chrome='refresh'] .chat-item[data-density='standard'] {
+  height: auto;
+  min-height: 34px;
+  align-items: flex-start;
+  padding-top: 8px;
+  padding-bottom: 9px;
+}
+.chat-root[data-chrome='refresh'] .chat-item[data-density='standard'] + .item-menu-btn { top: 6px; }
+.chat-root[data-chrome='refresh'] .chat-item[data-density='standard'] ~ .chat-item-close { top: 6px; }
+.chat-root[data-chrome='refresh'] .chat-item-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding-top: 1px; }
+.chat-root[data-chrome='refresh'] .chat-item-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.chat-root[data-chrome='refresh'] .chat-item-top .chat-item-name { flex: 1; min-width: 0; }
+.chat-root[data-chrome='refresh'] .chat-item-sub { display: flex; gap: 6px; min-width: 0; font-size: 12px; line-height: 20px; color: var(--text-secondary); white-space: nowrap; }
+.chat-root[data-chrome='refresh'] .chat-item-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .chat-item-where + .chat-item-state::before { content: '·'; margin-right: 6px; }
+.chat-root[data-chrome='refresh'] .chat-item-state { flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-item-sub[data-status='working'] .chat-item-state { color: var(--accent); }
+.chat-root[data-chrome='refresh'] .chat-item-sub[data-status='approval'] .chat-item-state { color: var(--warning); }
+.chat-root[data-chrome='refresh'] .chat-item-sub[data-status='error'] .chat-item-state { color: var(--danger); }
+.chat-root[data-chrome='refresh'] .chat-item-msg { font-size: 12px; line-height: 20px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .chat-item[data-density='standard'] .chat-status-mark { margin-top: 1px; }
+/* An option that isn't chosen is flat; only the chosen one lifts. */
+.lp-theme .chat-view-segment > :not([data-selected]) { background: transparent; box-shadow: none; border-color: transparent; color: var(--text-secondary); }
+.lp-theme .chat-view-segment > :not([data-selected]):hover { background: color-mix(in srgb, var(--text-primary) 6%, transparent); color: var(--text-primary); }
+/* A narrow Standard row gives up where it is first, then the state ends in an ellipsis. */
+.chat-root[data-chrome='refresh'] .chat-item-sub { overflow: hidden; }
+.chat-root[data-chrome='refresh'] .chat-item-state { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-root[data-chrome='refresh'] .chat-item-where { flex-shrink: 3; }
+
+/* ── The composer (SdkComposer.tsx): its notes above it and one round Stop (ComposerStop.tsx) ── */
+/* The notes and the trust note start past the composer's rounded corner, where its text and the
+   status line do. Nothing to say, no line: nothing is kept for them. */
+.chat-root[data-chrome='refresh'] .chat-composer-notes[data-above],
+.chat-root[data-chrome='refresh'] .chat-bottom > .chat-trust { box-sizing: border-box; width: calc(min(820px, 100%) - 32px); }
+.chat-root[data-chrome='refresh'] .chat-composer-notes[data-above] { min-height: 0; display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.chat-root[data-chrome='refresh'] .chat-composer-notes[data-above]:empty { display: none; }
+.chat-root[data-chrome='refresh'] .chat-composer-notes[data-above] > .chat-composer-note { padding: 0; }
+.chat-root[data-chrome='refresh'] .chat-composer-notes[data-above] > .chat-hold { margin-top: 0; padding: 8px 8px 8px 12px; font-size: 13px; color: var(--text-primary); }
+/* Stop and Send hold no room while neither shows. */
+.chat-root[data-chrome='refresh'] .chat-compose-end { min-width: 0; }
+.chat-root[data-chrome='refresh'] .chat-compose-end:empty { display: none; }
+/* LaunchPad's Button in termag's round Stop. */
+.chat-root[data-chrome='refresh'] .chat-compose-end .chat-stop-btn {
+  width: 32px; height: 32px; min-width: 0; padding: 0; border: none; border-radius: 50%;
+  background: var(--text-primary); color: var(--bg-base);
+}
+.chat-root[data-chrome='refresh'] .chat-compose-end .chat-stop-btn:is(:hover, [data-hovered], [data-pressed], [aria-expanded='true']) {
+  background: color-mix(in srgb, var(--text-primary) 80%, var(--text-on-fill));
+}
+.chat-root[data-chrome='refresh'] .chat-compose-end .chat-stop-btn + .chat-send-btn { margin-left: 4px; }
+.lp-theme.chat-stop-popover { max-width: 320px; }
+.lp-theme.chat-stop-popover .chat-stop-all [slot='label'] { color: var(--danger); }
+.lp-theme.chat-stop-popover .chat-stop-all[role='menuitem'] svg { fill: var(--danger); }
+@media (max-width: 767px) {
+  .chat-root[data-chrome='refresh'] .chat-compose-end .chat-stop-btn { width: 40px; height: 40px; }
+}
+
+/* ── ⌘K (ChatPalette.tsx): LaunchPad's SearchField over a ListBox in a Modal ──
+   The palette renders at the end of the body, outside .chat-root, so it is
+   keyed on its overlay's class, which only ChatPalette sets; its colours come
+   from the overlay rule at the top of this file, and its type from --font-ui.
+   Rows read as the sidebar's: the state's mark (or a 20px icon) in the
+   gutter, the name, then where it is and its state in --text-secondary. */
+.lp-theme.chat-palette-layer {
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgba(var(--scrim-rgb), 0.5);
+  /* LaunchPad's 1px blur only smudges the page behind. */
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  font-family: var(--font-ui);
+}
+.lp-theme.chat-palette-layer .chat-palette {
+  position: relative;
+  bottom: auto;
+  width: min(640px, calc(100vw - 24px));
+  max-height: min(560px, 76vh);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  box-shadow: 0 24px 64px rgba(var(--shadow-rgb), calc(0.55 * var(--shadow-strength))), 0 0 0 1px rgba(var(--shadow-rgb), calc(0.35 * var(--shadow-strength)));
+}
+.lp-theme.chat-palette-layer .chat-palette-dialog { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.lp-theme.chat-palette-layer .chat-palette-field { flex-shrink: 0; border-bottom: 1px solid var(--border); }
+/* SearchField hands its Group the field's look (a box); here the field is the palette's whole top line. */
+.lp-theme.chat-palette-layer .chat-palette-group {
+  display: flex;
+  flex: none;
+  align-items: center;
+  height: 52px;
+  padding: 0 12px 0 16px;
+  gap: 12px;
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+.lp-theme.chat-palette-layer .chat-palette-group input {
+  flex: 1;
+  min-width: 0;
+  height: auto;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  outline: none;
+  font: inherit;
+  font-size: 15px;
+  color: var(--text-primary);
+}
+.lp-theme.chat-palette-layer .chat-palette-group input::placeholder { color: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-field-icon { fill: var(--text-secondary); flex-shrink: 0; }
+.lp-theme.chat-palette-layer .chat-palette-clear [data-icon] { fill: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-list { flex: 1; min-height: 0; overflow-y: auto; padding: 6px; outline: none; }
+.lp-theme.chat-palette-layer .chat-palette-section { padding: 0; }
+.lp-theme.chat-palette-layer .chat-palette-section + .chat-palette-section { border-top: none; margin-top: 6px; }
+/* A head is quiet, as the sidebar's are: its name at weight 500, its count beside it. */
+.lp-theme.chat-palette-layer .chat-palette-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 10px 4px;
+  border: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.lp-theme.chat-palette-layer .chat-palette-count { font-weight: 400; }
+.lp-theme.chat-palette-layer .chat-palette-note { font-weight: 400; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lp-theme.chat-palette-layer .chat-palette-item {
+  min-height: 44px;
+  padding: 6px 10px;
+  gap: 10px;
+  border-radius: 8px;
+  cursor: default;
+  font-size: 13px;
+}
+.lp-theme.chat-palette-layer .chat-palette-item[data-hovered] { background: color-mix(in srgb, var(--text-primary) 6%, transparent); }
+.lp-theme.chat-palette-layer .chat-palette-item:is([data-focused], [data-focus-visible]) { background: color-mix(in srgb, var(--text-primary) 9%, transparent); outline: none; }
+.lp-theme.chat-palette-layer .chat-palette-item > span:first-child { gap: 10px; }
+.lp-theme.chat-palette-layer .chat-palette-icon { flex-shrink: 0; fill: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.lp-theme.chat-palette-layer .chat-palette-title {
+  color: var(--text-primary);
+  font-weight: 500;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-theme.chat-palette-layer .chat-palette-sub {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A session that isn't running is dimmed, as in the sidebar. */
+.lp-theme.chat-palette-layer .chat-palette-item[data-status='off'] .chat-palette-title { color: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-box { flex-shrink: 1; max-width: 140px; font-size: 11.5px; font-weight: 400; line-height: 16px; }
+.lp-theme.chat-palette-layer .chat-palette-meta { flex-shrink: 0; min-width: 28px; text-align: right; font-size: 12px; font-weight: 400; color: var(--text-secondary); white-space: nowrap; }
+/* A command's own shortcut, at the row's end; one that can't run now is dimmed, with why under it. */
+.lp-theme.chat-palette-layer .chat-palette-keys {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.lp-theme.chat-palette-layer .chat-palette-item[data-disabled] { opacity: 0.6; }
+.lp-theme.chat-palette-layer .chat-palette-cta .chat-palette-title { color: var(--accent); }
+.lp-theme.chat-palette-layer .chat-palette-cta .chat-palette-icon { fill: var(--accent); }
+.lp-theme.chat-palette-layer .chat-palette-hit > span:first-child { align-items: flex-start; }
+.lp-theme.chat-palette-layer .chat-palette-hit .chat-palette-meta { line-height: 18px; }
+/* Pane text is terminal output, so it is the one thing here in monospace. */
+.lp-theme.chat-palette-layer .chat-palette-lines { display: flex; flex-direction: column; gap: 1px; margin-top: 4px; min-width: 0; }
+.lp-theme.chat-palette-layer .chat-palette-line {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-theme.chat-palette-layer .chat-palette-line mark { background: color-mix(in srgb, var(--warning) 30%, transparent); color: var(--text-primary); border-radius: 2px; }
+.lp-theme.chat-palette-layer .chat-palette-lineno { color: var(--text-secondary); opacity: 0.7; margin-right: 8px; }
+/* A recent search's ×, shown where the row is under the pointer or highlighted. */
+.lp-theme.chat-palette-layer .chat-palette-forget { flex-shrink: 0; visibility: hidden; }
+.lp-theme.chat-palette-layer .chat-palette-forget [data-icon] { fill: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-recent:is([data-hovered], [data-focused]) .chat-palette-forget { visibility: visible; }
+@media (hover: none) {
+  .lp-theme.chat-palette-layer .chat-palette-forget { visibility: visible; }
+}
+.lp-theme.chat-palette-layer .chat-palette-empty { padding: 28px 16px; text-align: center; font-size: 13px; font-weight: 400; color: var(--text-secondary); }
+.lp-theme.chat-palette-layer .chat-palette-foot {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.lp-theme.chat-palette-layer .chat-palette-foot-end { margin-left: auto; }
+.lp-theme.chat-palette-layer .chat-palette-foot kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  margin-right: 2px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+/* A phone: the palette sits near the top and stops above the on-screen keyboard
+   (React Aria sets --visual-viewport-height on the overlay as the keyboard opens) and above
+   the home indicator (the bottom safe area, as chat.css's phone chrome reserves it), and the
+   key hints in the foot go, since a phone has no keys to press. */
+@media (max-width: 767px) {
+  .lp-theme.chat-palette-layer { padding-top: calc(12px + env(safe-area-inset-top, 0px)); }
+  .lp-theme.chat-palette-layer .chat-palette {
+    max-height: calc(var(--visual-viewport-height, 100vh) - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  }
+  .lp-theme.chat-palette-layer .chat-palette-foot { display: none; }
+}
+/* A finger: a command's shortcut is no use, the field is 16px so iOS doesn't zoom into it
+   as it takes the focus, and a recent search's × is 44px, as every target is (chat.css). */
+@media (pointer: coarse) {
+  .lp-theme.chat-palette-layer .chat-palette-keys { display: none; }
+  .lp-theme.chat-palette-layer .chat-palette-group input { font-size: 16px; }
+  .lp-theme.chat-palette-layer .chat-palette-forget { min-width: 44px; min-height: 44px; margin: -6px -10px -6px 0; }
+  .lp-theme.chat-palette-layer .chat-palette-clear { min-width: 44px; min-height: 44px; margin-right: -10px; }
+}

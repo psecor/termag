@@ -6,7 +6,7 @@
 // and leaves the open chat alone.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { flattenForSend, sendErrorText } from './compose';
-import { claimHeldUntil, claimQueued, finishQueued, isQueueKey, readQueued, releaseQueued, writeQueued } from './newChat';
+import { claimHeldUntil, claimQueued, finishQueued, isQueueKey, queueKey, readQueued, releaseQueued, writeQueued } from './newChat';
 
 const store = () => (typeof localStorage !== 'undefined' ? localStorage : null);
 
@@ -47,8 +47,9 @@ export interface QueuedMessage {
 }
 
 export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
-  // Only the main workstream, where a new chat starts, has a queue.
-  const key = o.projectId && o.workstream === 'main' ? o.projectId : null;
+  // New session starts a chat on a project's main workstream, or on a new
+  // worktree's (chat/newChat.ts queueKey); each has its own queue.
+  const key = o.projectId ? queueKey(o.projectId, o.workstream) : null;
   const [queued, setQueued] = useState<string | null>(null);
   const [echo, setEcho] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,7 +79,7 @@ export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
     };
   }, [key]);
 
-  const { up, offline, send, workstream, raw } = o;
+  const { projectId, up, offline, send, workstream, raw } = o;
   useEffect(() => {
     if (!key || !queued || !up || offline || error || inFlight.has(key)) return;
     if (readQueued(store(), key) == null) {
@@ -102,7 +103,8 @@ export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
     }
     const keys = raw ? text.trim() : flattenForSend(text);
     inFlight.add(key);
-    send(key, workstream, keys)
+    // The key is the queue's (project@workstream for a worktree); the send is the project's.
+    send(projectId!, workstream, keys)
       .then(() => {
         finishQueued(store(), key, text);
         if (current.current === key) setEcho(keys);
@@ -115,7 +117,7 @@ export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
         inFlight.delete(key);
         if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(SETTLED_EVENT, { detail: key }));
       });
-  }, [key, queued, up, offline, error, send, workstream, raw, attempt]);
+  }, [key, projectId, queued, up, offline, error, send, workstream, raw, attempt]);
 
   const enqueue = useCallback((text: string): boolean => {
     if (!key) return false;

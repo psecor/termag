@@ -11,7 +11,8 @@ import { NewProjectForm, type NewProjectMode } from './NewProjectForm';
  * left provisioning when the dialog closes keeps going server-side and shows
  * up in the sidebar's Boxes section. In `automation` mode (Shift on the
  * button, the split button's caret) the same form
- * creates an automation instead.
+ * creates an automation instead. The box of the project open behind the
+ * dialog is the default, so a new project lands on the box already set up.
  */
 export function NewProjectDialog({
   onClose,
@@ -24,7 +25,8 @@ export function NewProjectDialog({
   onBranchOff?: (projectId: string) => void;
   mode?: NewProjectMode;
 }) {
-  const { reloadProjects, setActiveProject } = useProjects();
+  const { projects, activeProjectId, reloadProjects, setActiveProject } = useProjects();
+  const currentBoxId = projects.find(p => p.id === activeProjectId)?.instanceId ?? null;
 
   return createPortal(
     <Dialog title={mode === 'automation' ? 'New automation' : 'New project'} className="np-dialog" onClose={onClose}>
@@ -32,6 +34,7 @@ export function NewProjectDialog({
         autoFocus
         mode={mode}
         initialBoxId={initialBoxId}
+        defaultBoxId={currentBoxId}
         onBranchOff={onBranchOff}
         submitLabel={mode === 'automation' ? 'Create automation' : 'Create and open'}
         actions={<button type="button" className="btn-ghost" onClick={onClose}>Cancel</button>}

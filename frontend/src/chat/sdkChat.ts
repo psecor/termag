@@ -3,42 +3,97 @@
 // entries (history, same shapes), producing the items the chat renders —
 // user bubbles, assistant text (streamed), tool cards with their results —
 // and the one status line. Unknown events are ignored, never fatal.
+import { isClaudeAuthError } from './claudeLogin';
+import { emptyUsage, withMessageUsage, withPlanSpend, withRateLimit, withResultUsage, withSpendReset, type ChatUsage } from './contextUsage';
+import { agentResult, isAgentTool, mergeInfo, notificationInfo, taskEvent, taskStatus, type SubagentInfo, type SubagentRecord } from './subagents';
 
 /**
  * An image in a user message: `src` while it is only in this browser (a data
  * URL), `path` once the box keeps it (read through GET /api/projects/:id/image).
  */
-export interface ChatImage { mediaType: string; src?: string; path?: string }
+export interface ChatImage { mediaType: string; src?: string; path?: string; /** A PDF's file name. */ name?: string }
 
 export type ChatItem =
-  | { kind: 'user'; key: string; text: string; pending?: boolean; uuid?: string; turnId?: string; images?: ChatImage[] }
+  | {
+    kind: 'user'; key: string; text: string; pending?: boolean; uuid?: string; turnId?: string; images?: ChatImage[];
+    /** Taken in while a turn ran (a live replay, or the agent's entry from a queued_command): never what started a turn. */
+    midTurn?: boolean;
+  }
   | { kind: 'text'; key: string; text: string; streaming: boolean }
   | {
     kind: 'tool'; key: string; id: string; name: string; input: unknown;
     inputJson: string; result: string | null; isError: boolean; done: boolean;
     /** A Skill call's instructions (its SKILL.md), which Claude Code adds as a synthetic user message. */
     skill?: string;
+    /**
+     * A call Claude sent to the background (Bash's `run_in_background`): its
+     * result only says it started, so the card follows the task itself, from
+     * `running` to how its notification says it ended.
+     */
+    background?: BackgroundState;
+    /** That background call's task id (its result's "ID: …"), which the box's task list names. */
+    taskId?: string;
+    /**
+     * When the call was made and when its result came (ISO, the box's
+     * clock): the stream's and the transcript's own `timestamp`. Without one,
+     * the nearest earlier event's time (`ChatState.clock`), marked `startGuessed` / `endGuessed`.
+     */
+    startedAt?: string | null;
+    endedAt?: string | null;
+    startGuessed?: true;
+    endGuessed?: true;
   }
   /** A skill's instructions loaded without a Skill call (a typed slash command). */
   | { kind: 'skill'; key: string; name: string; text: string }
   | { kind: 'error'; key: string; text: string }
   /** Something the user did, said in neutral words: "Stopped by you". */
-  | { kind: 'note'; key: string; text: string }
+  /** `info`: a note about the turn, not a stop; isStopNote tells them apart. */
+  | { kind: 'note'; key: string; text: string; info?: true }
+  /** The box ran the turn read-only though the chat asked for full tools (agent settleTurnMode): why, and what undoes it. */
+  | { kind: 'readonly'; key: string; reason: string; fix?: string }
   /**
    * A slash command Claude Code ran itself (a mod's `/reload-plugins`), never
    * the model's: one line, "Ran /reload-plugins: not available over a remote connection".
    */
-  | { kind: 'command'; key: string; name: string; args: string; output: string | null; folded: string[] };
+  | { kind: 'command'; key: string; name: string; args: string; output: string | null; folded: string[] }
+  /**
+   * Where the chat's context was cleared or compacted (agent chat-context-v1).
+   * Above a clear is not in Claude's context; above a compact is, as Claude's
+   * summary. `undone`: Resume put the cleared session back.
+   */
+  | {
+    kind: 'divider'; key: string; at: string | null; variant: 'cleared' | 'compacted'; undone?: boolean; preTokens?: number | null;
+    /** A compacted divider's summary, the transcript entry its turn record names (agent historyEntries): its cost is pinned here. */
+    promptUuid?: string;
+  }
+  /**
+   * Background tasks that ended, as one muted line (a run of them folded
+   * together): Claude Code tells the model with a user-role
+   * `<task-notification>`, which the person never typed.
+   */
+  | { kind: 'tasks'; key: string; ended: TaskEnd[] };
+
+/** One background task's end, from its notification. `agent`: a background subagent's, labelled by its call's description. */
+export interface TaskEnd { taskId: string; status: BackgroundState; label: string; exitCode: number | null; agent?: true }
 
 /** `waiting`: Claude answered, and its turn stays open on a background task; a message sent now goes into it only on a live turn. */
-export type ChatPhase = 'idle' | 'thinking' | 'writing' | 'tool' | 'waiting';
+export type ChatPhase = 'idle' | 'thinking' | 'writing' | 'tool' | 'waiting' | 'compacting';
 
 /** What one turn cost and how long it took (the runner's turn record, agent/chat-runner.js). */
-export interface TurnCost { costUsd: number | null; durationMs: number | null }
+export interface TurnCost {
+  costUsd: number | null; durationMs: number | null;
+  /** When the turn ended (ISO): the record's `at`, the turn-end's, or the turn's last event's time. */
+  endedAt?: string | null;
+}
 
-/** A turn record as chat-history returns it. `userUuid` is the transcript entry this turn wrote. */
+/**
+ * A turn record as chat-history returns it. `userUuid` is the transcript entry this turn wrote.
+ * An agent that sends `sessionCostUsd` (the session's total after this turn) has made `costUsd`
+ * the turn's own; an older one sends the session's total as `costUsd` (turnCosts).
+ */
 export interface TurnRecord extends TurnCost {
   turnId: string; prompt: string; at?: string | null; isError?: boolean; userUuid?: string | null;
+  sessionId?: string | null; sessionCostUsd?: number | null;
 }
 
 export interface ChatState {
@@ -52,9 +107,18 @@ export interface ChatState {
   costs: Record<string, TurnCost>;
   /** Cost of turns whose transcript entry is not in this view (the history tail, or a prompt Claude never wrote). */
   extraCostUsd: number;
+  /** Those turns' records, with when each ended, so the since-cleared cost can count the ones after a clear. */
+  unplacedCosts?: UnplacedCost[];
   /** The prompt of the turn running now, and the cost its result reported (an agent without turn-end costs). */
   turnUserKey: string | null;
   lastResult: TurnCost | null;
+  /**
+   * What the session has cost so far, as its last turn said (Claude's total_cost_usd, which a
+   * resume carries on): the next turn costs what it grows by (turnCost). Null in a new session.
+   */
+  sessionCostUsd?: number | null;
+  /** That total when the context was last cleared, for a Resume to put back. */
+  clearedSessionCostUsd?: number | null;
   /** The assistant message being streamed: its id and which item each content index fills. */
   stream: { messageId: string | null; byIndex: Record<number, string>; textStarted: number };
   /** Per assistant message, how many final text blocks have arrived (their keys). */
@@ -68,13 +132,45 @@ export interface ChatState {
   replaySkip?: string | null;
   /** The running turn reads messages while it runs (its turn-start's `live`, agent chat-live-v1). */
   liveTurn?: boolean;
+  /** The box asks Haiku for this turn's tool-group headings (its turn-start's `headings`): only then may a run wait for one. */
+  turnHeadings?: boolean;
   /** This view, or another, stopped only the running turn's current work (`user-stop` scope `turn`): its result says so. */
   stopTurnOnly?: boolean;
   /** The running turn's background tasks (Claude's `background_tasks_changed`). Stop everything ends them; a turn-only stop ends only the subagents. */
   background?: BackgroundTask[];
+  /**
+   * Each Agent call's subagent, by the call's id (chat/subagents.ts): what Claude Code said about it, and its own
+   * messages (they name the call as `parent_tool_use_id`), folded by this reducer apart from the chat's.
+   */
+  subagents?: Record<string, SubagentRecord>;
+  /** The context ring's numbers (chat/contextUsage.ts). History carries each call's prompt size only, so a reload keeps the rest (withKeptUsage). */
+  usage?: ChatUsage;
+  /** The running turn is the runner's /compact (its turn-start's `compact`): its events are Claude Code's compaction, not a reply. */
+  compacting?: boolean;
+  /** The ring's numbers when the context was last cleared, for a Resume to put back. */
+  clearedUsage?: ChatUsage | null;
+  /** The context size the last compaction started from (its boundary's pre_tokens), until a reply says the new one. */
+  compactedFrom?: number | null;
+  /**
+   * Claude answered, then a background task's end set it going again in the
+   * same process, with no message from anyone: the status says so. Cleared
+   * by its next answer, a message and the turn's end.
+   */
+  woken?: boolean;
+  /** The seq of the last turn that failed on Claude's sign-in, until Claude answers again (the sign-in card reads it). */
+  authFailure?: number | null;
+  /**
+   * The newest time an event carried (ISO: an entry's `timestamp`, a box
+   * line's `at`): the time of an event that has none of its own, such as a
+   * streamed tool call or a turn-end from an older agent.
+   */
+  clock?: string | null;
 }
 
-export interface BackgroundTask { description: string; subagent: boolean }
+export interface BackgroundTask { description: string; subagent: boolean; id?: string }
+
+/** Where a background call is: still running, or how it ended (`stopped` also when its turn ended with it unreported). */
+export type BackgroundState = 'running' | 'done' | 'failed' | 'stopped';
 
 export interface FrameCursor { turnId: string | null; seq: number }
 
@@ -86,6 +182,7 @@ export const emptyChat: ChatState = {
 };
 
 type AnyEvent = Record<string, any>;
+const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
 const MAX_RESULT = 20_000;
 
 /** Tool output as text: a string, or the text parts of a content array. */
@@ -95,7 +192,7 @@ export function resultText(content: unknown): string {
   else if (Array.isArray(content)) {
     text = content.map(part => (part && typeof part === 'object' && typeof part.text === 'string'
       ? part.text
-      : part?.type === 'image' ? '[image]' : '')).filter(Boolean).join('\n');
+      : part?.type === 'image' ? '[image]' : part?.type === 'document' ? '[PDF]' : '')).filter(Boolean).join('\n');
   }
   return text.length > MAX_RESULT ? `${text.slice(0, MAX_RESULT)}\n… (${text.length - MAX_RESULT} more characters)` : text;
 }
@@ -106,7 +203,7 @@ function promptText(content: unknown): string | null {
   if (!Array.isArray(content)) return null;
   const texts = content.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text as string);
   if (texts.length) return texts.join('\n');
-  return content.some(p => p?.type === 'image') ? '' : null;
+  return content.some(p => p?.type === 'image' || p?.type === 'document') ? '' : null;
 }
 
 /** A user message's own images (not a tool result's): the box's stored copies, or inline data. */
@@ -114,12 +211,14 @@ export function promptImages(content: unknown): ChatImage[] {
   if (!Array.isArray(content)) return [];
   const out: ChatImage[] = [];
   for (const p of content) {
-    const src = p?.type === 'image' ? p.source : null;
+    const doc = p?.type === 'document';
+    const src = p?.type === 'image' || doc ? p.source : null;
     if (!src || typeof src !== 'object') continue;
-    const mediaType = typeof src.media_type === 'string' ? src.media_type : 'image/png';
-    if (src.type === 'termag' && typeof src.path === 'string') out.push({ mediaType, path: src.path });
-    else if (src.type === 'base64' && typeof src.data === 'string') out.push({ mediaType, src: `data:${mediaType};base64,${src.data}` });
-    else out.push({ mediaType });
+    const mediaType = typeof src.media_type === 'string' ? src.media_type : doc ? 'application/pdf' : 'image/png';
+    const named = doc && typeof p.title === 'string' && p.title ? { name: p.title as string } : {};
+    if (src.type === 'termag' && typeof src.path === 'string') out.push({ mediaType, path: src.path, ...named });
+    else if (src.type === 'base64' && typeof src.data === 'string') out.push({ mediaType, src: `data:${mediaType};base64,${src.data}`, ...named });
+    else out.push({ mediaType, ...named });
   }
   return out;
 }
@@ -128,7 +227,7 @@ export function promptImages(content: unknown): ChatImage[] {
 function refImages(raw: unknown): ChatImage[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter(r => r && typeof r.path === 'string')
-    .map(r => ({ mediaType: typeof r.mediaType === 'string' ? r.mediaType : 'image/png', path: r.path as string }));
+    .map(r => ({ mediaType: typeof r.mediaType === 'string' ? r.mediaType : 'image/png', path: r.path as string, ...(typeof r.name === 'string' && r.name ? { name: r.name as string } : {}) }));
 }
 
 const withImages = (images: ChatImage[]) => (images.length ? { images } : {});
@@ -163,8 +262,31 @@ function setTool(items: ChatItem[], id: string, change: (tool: Extract<ChatItem,
   return next;
 }
 
-function newTool(id: string, name: string, input: unknown): ChatItem {
-  return { kind: 'tool', key: `tool:${id}`, id, name, input, inputJson: '', result: null, isError: false, done: false };
+function newTool(id: string, name: string, input: unknown, when: Stamp = { at: null, guessed: false }): ChatItem {
+  return {
+    kind: 'tool', key: `tool:${id}`, id, name, input, inputJson: '', result: null, isError: false, done: false,
+    ...(when.at && { startedAt: when.at }), ...(when.at && when.guessed && { startGuessed: true as const }),
+  };
+}
+
+/** An event's time: its own (`guessed: false`), else the chat's clock, the nearest earlier one. */
+interface Stamp { at: string | null; guessed: boolean }
+
+/** The time an event carries: a transcript or stream entry's `timestamp`, a box line's `at`. */
+function eventTime(e: AnyEvent): string | null {
+  const at = typeof e.timestamp === 'string' ? e.timestamp : typeof e.at === 'string' ? e.at : null;
+  return at && Number.isFinite(Date.parse(at)) ? at : null;
+}
+
+function stampOf(state: ChatState, e: AnyEvent): Stamp {
+  const own = eventTime(e);
+  return own ? { at: own, guessed: false } : { at: state.clock ?? null, guessed: true };
+}
+
+/** A call that has just ended: when, unless it already knows. */
+function ended(t: Extract<ChatItem, { kind: 'tool' }>, when: Stamp): Extract<ChatItem, { kind: 'tool' }> {
+  if (t.endedAt || !when.at) return t;
+  return { ...t, endedAt: when.at, ...(when.guessed && { endGuessed: true as const }) };
 }
 
 /** Show a message the user just sent, before its turn starts. */
@@ -197,7 +319,7 @@ function streamEvent(state: ChatState, ev: AnyEvent): ChatState {
           ...state,
           phase: 'tool',
           activeTool: { name: block.name, input: block.input ?? {} },
-          items: upsert(state.items, key, () => newTool(block.id, block.name ?? 'tool', block.input ?? {}), it => it),
+          items: upsert(state.items, key, () => newTool(block.id, block.name ?? 'tool', block.input ?? {}, stampOf(state, ev)), it => it),
           stream: { ...state.stream, byIndex: { ...state.stream.byIndex, [e.index]: key } },
         };
       }
@@ -211,7 +333,7 @@ function streamEvent(state: ChatState, ev: AnyEvent): ChatState {
         return { ...state, items: upsert(state.items, key, () => ({ kind: 'text', key, text: d.text, streaming: true }), it => (it.kind === 'text' ? { ...it, text: it.text + d.text } : it)) };
       }
       if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
-        const items = upsert(state.items, key, () => newTool(key.slice(5), 'tool', {}), it => {
+        const items = upsert(state.items, key, () => newTool(key.slice(5), 'tool', {}, stampOf(state, ev)), it => {
           if (it.kind !== 'tool') return it;
           const inputJson = it.inputJson + d.partial_json;
           let input = it.input;
@@ -251,8 +373,13 @@ function assistantEvent(state: ChatState, ev: AnyEvent): ChatState {
       if (state.running) { phase = 'writing'; activeTool = null; }
     } else if (block?.type === 'tool_use' && typeof block.id === 'string') {
       const key = `tool:${block.id}`;
-      items = upsert(items, key, () => newTool(block.id, block.name ?? 'tool', block.input ?? {}),
-        it => (it.kind === 'tool' ? { ...it, name: block.name ?? it.name, input: block.input ?? it.input } : it));
+      // A call first seen streaming has only a guessed start; its message's own time replaces it.
+      const when = stampOf(state, ev);
+      items = upsert(items, key, () => newTool(block.id, block.name ?? 'tool', block.input ?? {}, when),
+        it => (it.kind === 'tool' ? {
+          ...it, name: block.name ?? it.name, input: block.input ?? it.input,
+          ...(!when.guessed && (it.startGuessed || !it.startedAt) && { startedAt: when.at, startGuessed: undefined }),
+        } : it));
       if (state.running) { phase = 'tool'; activeTool = { name: block.name ?? 'tool', input: block.input ?? {} }; }
     }
   }
@@ -296,6 +423,106 @@ function syntheticText(items: ChatItem[], ev: AnyEvent, text: string): ChatItem[
 }
 
 const INTERRUPT_MARK = /^\[Request interrupted by user\b/;
+
+// What a background call's tool_result says (Claude Code's Bash with run_in_background).
+const BACKGROUND_STARTED = /^Command running in background with ID: ([A-Za-z0-9_-]+)/;
+const TASK_NOTIFICATION = /^\s*<task-notification>/;
+// A user-role message that is only a reminder Claude Code adds for the model.
+const SYSTEM_REMINDER_ONLY = /^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/;
+
+interface TaskNote { taskId: string | null; toolUseId: string | null; status: string | null; summary: string | null }
+
+/**
+ * A background task's notification as a user-role message holds it (the
+ * transcript's entry, its queued_command, or a live turn's replay of it,
+ * each marked `origin.kind: task-notification`): the task, its call, how it
+ * ended and Claude Code's summary. Null for anything else.
+ */
+function taskNotification(text: string, origin?: unknown): TaskNote | null {
+  const marked = (origin as { kind?: unknown } | null)?.kind === 'task-notification';
+  if (!TASK_NOTIFICATION.test(text) && !marked) return null;
+  const tag = (name: string) => new RegExp(`<${name}>([^<]*)</${name}>`).exec(text)?.[1]?.trim() || null;
+  return { taskId: tag('task-id'), toolUseId: tag('tool-use-id'), status: tag('status'), summary: tag('summary') };
+}
+
+/** What a task's line says: its description (the summary's quoted name), and its exit code when the summary has one. */
+function taskEnd(note: TaskNote, status: BackgroundState): TaskEnd {
+  const summary = (note.summary ?? '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  const quoted = /"([^"]+)"/.exec(summary)?.[1] ?? null;
+  const code = /exit code (-?\d+)/i.exec(summary);
+  return { taskId: note.taskId ?? '', status, label: quoted ?? (summary || 'a background task'), exitCode: code ? Number(code[1]) : null };
+}
+
+/** "✓ Background command finished: npm test (exit 0)" for one end; a run of them is counted. */
+export function tasksLine(item: Extract<ChatItem, { kind: 'tasks' }>): { mark: string; text: string; warn: boolean } {
+  const warn = item.ended.some(t => t.status !== 'done');
+  const one = (t: TaskEnd) => {
+    const verb = t.status === 'done' ? 'finished' : t.status === 'failed' ? 'failed' : 'stopped';
+    return `Background ${t.agent ? 'agent' : 'command'} ${verb}: ${t.label}${t.exitCode != null ? ` (exit ${t.exitCode})` : ''}`;
+  };
+  if (item.ended.length === 1) return { mark: warn ? '✗' : '✓', text: one(item.ended[0]), warn };
+  const bad = item.ended.filter(t => t.status !== 'done').length;
+  const noun = item.ended.every(t => t.agent) ? 'agents' : item.ended.some(t => t.agent) ? 'tasks' : 'commands';
+  const counted = `${item.ended.length} background ${noun} ended${bad ? `, ${bad} without finishing` : ''}`;
+  return { mark: warn ? '✗' : '✓', text: `${counted}: ${item.ended.map(t => t.label).join(' · ')}`, warn };
+}
+
+function backgroundState(status: unknown): BackgroundState {
+  if (status === 'completed') return 'done';
+  if (status === 'failed') return 'failed';
+  return 'stopped';
+}
+
+/**
+ * A background task ended: its card says how, a line says so where the
+ * notification fell (one line per task, a run of them folded into one), and
+ * a turn that only waited on it is working again, since Claude Code takes
+ * the notification as its next step (a task that ends while Claude works
+ * waits for that work). `background` is false for a live notification of a
+ * foreground call (Claude Code reports those too): it changes nothing.
+ */
+function backgroundEnded(state: ChatState, note: TaskNote, background: boolean): ChatState {
+  const call = note.toolUseId ? state.items.find(it => it.kind === 'tool' && it.id === note.toolUseId) : undefined;
+  // A task a subagent started (its own subagent, its own background command): the subagent's, not the chat's.
+  if (note.toolUseId && !call && Object.values(state.subagents ?? {}).some(r => knowsCall(r.chat, note.toolUseId!))) return state;
+  // A subagent reports its end with an output file in the foreground too: its call's result says how it went.
+  const agent = call?.kind === 'tool' && isAgentTool(call.name) ? call : null;
+  if (agent && !agentInBackground(state, agent)) return state;
+  if (!background && !(call?.kind === 'tool' && call.background)) return state;
+  const status = backgroundState(note.status);
+  let items = note.toolUseId
+    ? setTool(state.items, note.toolUseId, t => ({ ...t, background: status }))
+    : state.items;
+  const seen = note.taskId != null && items.some(it => it.kind === 'tasks' && it.ended.some(t => t.taskId === note.taskId));
+  if (!seen) {
+    const description = agent ? str((agent.input as AnyEvent | null)?.description) : null;
+    const end: TaskEnd = agent ? { ...taskEnd(note, status), ...(description && { label: description }), agent: true } : taskEnd(note, status);
+    const last = items[items.length - 1];
+    items = last?.kind === 'tasks'
+      ? [...items.slice(0, -1), { ...last, ended: [...last.ended, end] }]
+      : [...items, { kind: 'tasks', key: `tasks:${note.taskId ?? state.seq + 1}`, ended: [end] }];
+  }
+  return { ...wake(state), items };
+}
+
+/** Claude, which had answered, is going again on its own: a background task set it off. */
+function wake(state: ChatState): ChatState {
+  return state.running && state.phase === 'waiting' ? { ...state, phase: 'thinking', activeTool: null, woken: true } : state;
+}
+
+/**
+ * Calls still running in the background when nothing will report them
+ * again (the process they ran in is gone): all of them, or with `running`
+ * (the box's task ids now), those it no longer lists. A call with no task
+ * id stays as it is then: nothing says it ended.
+ */
+export function settleBackground(items: ChatItem[], running?: ReadonlySet<string>): ChatItem[] {
+  const ended = (it: ChatItem) => it.kind === 'tool' && it.background === 'running'
+    && (!running || (it.taskId != null && !running.has(it.taskId)));
+  return items.some(ended)
+    ? items.map(it => (ended(it) ? { ...(it as Extract<ChatItem, { kind: 'tool' }>), background: 'stopped' as const } : it))
+    : items;
+}
 
 // A local command's echo in the transcript: `<command-name>/x</command-name>`
 // with its message and args, its output in `<local-command-stdout>`, and the
@@ -378,16 +605,33 @@ export function commandLine(item: Extract<ChatItem, { kind: 'command' }>): strin
 
 function userEvent(state: ChatState, ev: AnyEvent): ChatState {
   const content = ev.message?.content;
+  const when = stampOf(state, ev);
   let items = state.items;
   let phase = state.phase;
   if (Array.isArray(content)) {
     for (const part of content) {
       if (part?.type !== 'tool_result' || typeof part.tool_use_id !== 'string') continue;
-      items = setTool(items, part.tool_use_id, t => ({ ...t, result: resultText(part.content), isError: part.is_error === true, done: true }));
+      items = setTool(items, part.tool_use_id, t => {
+        const result = resultText(part.content);
+        const isError = part.is_error === true;
+        const started = !isError ? BACKGROUND_STARTED.exec(result) : null;
+        const background = started ? 'running' as const : t.background;
+        return ended({ ...t, result, isError, done: true, ...(background && { background }), ...(started?.[1] && { taskId: started[1] }) }, when);
+      });
       if (state.running) phase = 'thinking';
     }
   }
   const prompt = promptText(content);
+  const note = prompt != null ? taskNotification(prompt, ev.origin) : null;
+  if (note) {
+    // A background task's end as a user-role message (the transcript's, or
+    // a live turn's replay when it fell mid-work): Claude Code's words to the
+    // model, never a bubble. An idle wake-up comes live as task_notification.
+    // A subagent's also carries its report and usage.
+    const told = note.toolUseId ? withSubagentInfo({ ...state, items }, note.toolUseId, null, { status: taskStatus(note.status) ?? 'stopped', ...notificationInfo(prompt!) }) : { ...state, items };
+    return { ...backgroundEnded(told, note, true), seq: state.seq + 1 };
+  }
+  if (prompt != null && SYSTEM_REMINDER_ONLY.test(prompt)) return { ...state, items, phase, seq: state.seq + 1 };
   if (prompt != null && INTERRUPT_MARK.test(prompt)) {
     // Claude took a turn-only stop: the result after it is the stop's, also
     // in a view that did not send it and in a reloaded history. A stop of
@@ -397,6 +641,8 @@ function userEvent(state: ChatState, ev: AnyEvent): ChatState {
   }
   const images = promptImages(content);
   const command = prompt != null && !images.length ? localCommand(prompt) : null;
+  // /compact's echo: the compacted divider says it.
+  if (command?.name === 'compact' || (command && command.name == null && command.output === 'Compacted')) return { ...state, items, phase, seq: state.seq + 1 };
   if (command) {
     const key = typeof ev.uuid === 'string' ? `command:${ev.uuid}` : `command:${state.seq + 1}`;
     return { ...state, items: commandItems(items, command, key), phase, seq: state.seq + 1 };
@@ -408,34 +654,193 @@ function userEvent(state: ChatState, ev: AnyEvent): ChatState {
     // A live turn took a message in: the turn's own prompt (already shown),
     // or one sent while it ran, whose queued bubble moves here, where Claude read it.
     if (state.replaySkip === messageKey(prompt, images)) {
-      return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, replaySkip: null, seq: state.seq + 1 };
+      return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, replaySkip: null, woken: false, seq: state.seq + 1 };
     }
     const key = typeof ev.uuid === 'string' ? `user:${ev.uuid}` : `user:${state.seq + 1}`;
     // The same message the history already holds (a transcript line keeps the message's uuid).
     if (typeof ev.uuid === 'string' && items.some(it => it.kind === 'user' && it.key === key)) {
-      return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, seq: state.seq + 1 };
+      return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, woken: false, seq: state.seq + 1 };
     }
     const i = items.findIndex(it => it.kind === 'user' && it.pending && sameMessage(it, prompt, images.length));
-    items = [...(i >= 0 ? [...items.slice(0, i), ...items.slice(i + 1)] : items), { kind: 'user', key, text: prompt, ...withImages(images) }];
-    return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, seq: state.seq + 1 };
+    items = [...(i >= 0 ? [...items.slice(0, i), ...items.slice(i + 1)] : items), { kind: 'user', key, text: prompt, midTurn: true, ...withImages(images) }];
+    return { ...state, items, phase: state.running ? 'thinking' : phase, activeTool: null, woken: false, seq: state.seq + 1 };
   } else if (prompt != null) {
     const last = items[items.length - 1];
     // The live turn already showed it (turn-start); a transcript replays it.
-    if (!(last && sameMessage(last, prompt, images.length))) {
+    // A mid-turn message is in the view already under its live uuid.
+    const shown = typeof ev.uuid === 'string' && items.some(it => it.kind === 'user' && it.key === `user:${ev.uuid}`);
+    if (!shown && !(last && sameMessage(last, prompt, images.length))) {
       const uuid = typeof ev.uuid === 'string' ? ev.uuid : undefined;
       const key = uuid ? `user:${uuid}` : `user:${state.seq + 1}`;
-      items = [...items, { kind: 'user', key, text: prompt, uuid, ...withImages(images) }];
+      items = [...items, { kind: 'user', key, text: prompt, uuid, ...(ev.queued === true && { midTurn: true }), ...withImages(images) }];
     }
   }
   return { ...state, items, phase, activeTool: phase === 'thinking' ? null : state.activeTool, seq: state.seq + 1 };
+}
+
+/** The context ring's numbers, from the events that carry them: a call's usage, a result's windows, the plan's limits. */
+function withUsage(state: ChatState, e: AnyEvent): ChatState {
+  const before = state.usage ?? emptyUsage;
+  let usage = before;
+  if (e.type === 'assistant') usage = withMessageUsage(before, e.message, e.parent_tool_use_id);
+  else if (e.type === 'stream_event' && e.event?.type === 'message_start') usage = withMessageUsage(before, e.event.message, e.parent_tool_use_id);
+  else if (e.type === 'result') usage = withResultUsage(before, e.modelUsage);
+  else if (e.type === 'rate_limit_event') usage = withRateLimit(before, e.rate_limit_info);
+  // The box's notice after an answer (agent/claude-plan-usage.js): a seat's monthly spend.
+  else if (e.type === 'plan-usage') usage = withPlanSpend(before, e.spend);
+  if (usage === before) return state;
+  // A reply says the context's size again: what it was compacted from is history.
+  return usage.contextTokens != null && usage.contextTokens !== before.contextTokens ? { ...state, usage, compactedFrom: null } : { ...state, usage };
+}
+
+/**
+ * Where a compaction happened: one divider per boundary (by its uuid, so a
+ * live frame over a history that holds it adds none), and the ring's context
+ * empties until the next reply says how big the summary left it.
+ */
+function compactedDivider(state: ChatState, uuid: string | null, at: string | null, preTokens: number | null, promptUuid: string | null = null): ChatState {
+  const key = `compacted:${uuid ?? at ?? state.seq + 1}`;
+  // The compact turn has no bubble: its cost is the divider's, so it counts since a clear and in the total.
+  const turnUserKey = state.compacting && state.running && !state.turnUserKey ? key : state.turnUserKey;
+  // Already folded (a live frame over a history that holds it): a reply since may have filled the
+  // ring again, so leave the rest, but the running compact turn still files its cost here.
+  if (state.items.some(it => it.key === key)) return turnUserKey === state.turnUserKey ? state : { ...state, turnUserKey };
+  const items = [...state.items, { kind: 'divider' as const, key, at, variant: 'compacted' as const, preTokens, ...(promptUuid ? { promptUuid } : {}) }];
+  const usage = state.usage ? { ...state.usage, contextTokens: null } : state.usage;
+  return { ...state, items, usage, compactedFrom: preTokens, turnUserKey, seq: state.seq + 1 };
+}
+
+/**
+ * A turn that failed on Claude's sign-in marks the chat until Claude answers
+ * again: Claude Code's `authentication_failed` assistant message (its text in
+ * a transcript), or a failed result saying so.
+ */
+function withAuthFailure(state: ChatState, e: AnyEvent): ChatState {
+  const texts = (blocks: unknown) => (Array.isArray(blocks) ? blocks : [])
+    .map((b: AnyEvent) => (b?.type === 'text' && typeof b.text === 'string' ? b.text : '')).join(' ');
+  if (e.type === 'assistant') {
+    const message = e.message ?? {};
+    const synthetic = message.model === '<synthetic>' || e.isApiErrorMessage === true;
+    if (e.error === 'authentication_failed' || (synthetic && isClaudeAuthError(texts(message.content)))) {
+      return { ...state, authFailure: state.seq + 1 };
+    }
+    return !synthetic && state.authFailure != null ? { ...state, authFailure: null } : state;
+  }
+  if (e.type === 'result' && e.is_error === true && typeof e.result === 'string' && isClaudeAuthError(e.result)) {
+    return { ...state, authFailure: state.seq + 1 };
+  }
+  return state;
 }
 
 /** Fold one event (live or from the transcript) into the chat. */
 export function applyEvent(state: ChatState, ev: unknown): ChatState {
   if (!ev || typeof ev !== 'object') return state;
   const e = ev as AnyEvent;
+  state = withAuthFailure(withUsage(state, e), e);
+  // A subagent's own message is its transcript, never the chat's.
+  if (typeof e.parent_tool_use_id === 'string' && e.parent_tool_use_id && (e.type === 'assistant' || e.type === 'user' || e.type === 'stream_event')) {
+    return withClock(subagentMessage(state, e.parent_tool_use_id, e), e);
+  }
+  const task = taskEvent(e);
+  if (task) state = withSubagentInfo(state, task.toolUseId, task.taskId, task.info, e.subtype === 'task_started');
+  return withClock(withAgentResults(foldEvent(state, e), e), e);
+}
+
+// ── Subagents (chat/subagents.ts) ──
+
+/** The chat a subagent's own messages fold into: one whose turn runs, so its calls and words stream as the chat's do. */
+const subagentChat: ChatState = { ...emptyChat, running: true, phase: 'thinking' };
+
+/** Whether `chat` (or a subagent under it) made the call `id`. */
+function knowsCall(chat: ChatState, id: string): boolean {
+  if (chat.subagents?.[id] || chat.items.some(it => it.kind === 'tool' && it.id === id)) return true;
+  return Object.values(chat.subagents ?? {}).some(r => knowsCall(r.chat, id));
+}
+
+/** The chat's own subagent (its call's id) whose tree holds the call `id`: the call itself, or the subagent that made it. */
+function ownerOf(state: ChatState, id: string): string | null {
+  if (state.subagents?.[id] || state.items.some(it => it.kind === 'tool' && it.id === id)) return id;
+  for (const [key, rec] of Object.entries(state.subagents ?? {})) if (knowsCall(rec.chat, id)) return key;
+  return null;
+}
+
+function withRecord(state: ChatState, key: string, change: (rec: SubagentRecord) => SubagentRecord): ChatState {
+  const rec = state.subagents?.[key] ?? { info: {}, chat: subagentChat };
+  return { ...state, subagents: { ...state.subagents, [key]: change(rec) } };
+}
+
+/**
+ * A message of a subagent's own: into its chat, the call it names (one a
+ * subagent made, for a subagent of a subagent, goes down to that one's).
+ */
+function subagentMessage(state: ChatState, parent: string, e: AnyEvent): ChatState {
+  const key = ownerOf(state, parent) ?? parent;
+  const inner = key === parent ? { ...e, parent_tool_use_id: null } : e;
+  return withRecord(state, key, rec => ({ ...rec, chat: applyEvent(rec.chat, inner) }));
+}
+
+/**
+ * What an event says about a subagent, kept on its call's record: by the call
+ * it names, else (task_updated names only its task) by the subagent's id.
+ */
+function withSubagentInfo(state: ChatState, toolUseId: string | null, taskId: string | null, info: SubagentInfo, starts = false): ChatState {
+  const key = toolUseId ? ownerOf(state, toolUseId) ?? toolUseId
+    : taskId ? Object.keys(state.subagents ?? {}).find(k => state.subagents![k].info.agentId === taskId || hasAgent(state.subagents![k].chat, taskId)) ?? null
+    : null;
+  if (!key) return state;
+  if (toolUseId && key !== toolUseId) return withRecord(state, key, rec => ({ ...rec, chat: withSubagentInfo(rec.chat, toolUseId, taskId, info, starts) }));
+  if (!toolUseId && state.subagents?.[key]?.info.agentId !== taskId) return withRecord(state, key, rec => ({ ...rec, chat: withSubagentInfo(rec.chat, null, taskId, info) }));
+  // A background command's task events name its Bash call: no subagent there.
+  const call = state.items.find(it => it.kind === 'tool' && it.id === key);
+  if (call?.kind === 'tool' && !isAgentTool(call.name)) return state;
+  // Only an Agent call, or a subagent's own start (its call cut from the history), makes a record.
+  if (!call && !state.subagents?.[key] && !starts) return state;
+  return withRecord(state, key, rec => ({ ...rec, info: mergeInfo(rec.info, info) }));
+}
+
+function hasAgent(chat: ChatState, taskId: string): boolean {
+  return Object.values(chat.subagents ?? {}).some(r => r.info.agentId === taskId || hasAgent(r.chat, taskId));
+}
+
+/** A background subagent: its call asked for one, or its events or its result said so. */
+function agentInBackground(state: ChatState, call: Extract<ChatItem, { kind: 'tool' }>): boolean {
+  return (call.input as AnyEvent | null)?.run_in_background === true || call.background != null || state.subagents?.[call.id]?.info.background === true;
+}
+
+/**
+ * An Agent call's result: its subagent's id and, run in the foreground, its
+ * report. One sent to the background is running there: its call follows the
+ * task until its notification says how it ended, as a background command's does.
+ */
+function withAgentResults(state: ChatState, e: AnyEvent): ChatState {
+  if (e.type !== 'user' || !Array.isArray(e.message?.content)) return state;
+  let next = state;
+  for (const part of e.message.content as AnyEvent[]) {
+    if (part?.type !== 'tool_result' || typeof part.tool_use_id !== 'string') continue;
+    const call = next.items.find(it => it.kind === 'tool' && it.id === part.tool_use_id);
+    if (call?.kind !== 'tool' || !isAgentTool(call.name) || call.result == null) continue;
+    const info = agentResult(call.result, call.isError, e.tool_use_result);
+    next = withSubagentInfo(next, call.id, null, info);
+    if (info.background && !call.isError && !call.background) {
+      next = { ...next, items: setTool(next.items, call.id, t => ({ ...t, background: 'running' as const, ...(info.agentId && { taskId: info.agentId }) })) };
+    }
+  }
+  return next;
+}
+
+/** The chat's clock moves on to an event's own time; a replayed older event leaves it. */
+function withClock(state: ChatState, e: AnyEvent): ChatState {
+  const at = eventTime(e);
+  return at && (!state.clock || at > state.clock) ? { ...state, clock: at } : state;
+}
+
+function foldEvent(state: ChatState, e: AnyEvent): ChatState {
   switch (e.type) {
     case 'turn-start': {
+      // A compact turn (agent chat-context-v1) is no message: its divider comes with the compaction.
+      if (e.compact === true) {
+        return { ...state, running: true, phase: 'compacting', activeTool: null, turnUserKey: null, lastResult: null, stopRequested: false, stopTurnOnly: false, replaySkip: null, liveTurn: false, turnHeadings: false, background: [], compacting: true, seq: state.seq + 1 };
+      }
       const text = typeof e.text === 'string' ? e.text : '';
       const images = refImages(e.images);
       const i = state.items.findIndex(it => it.kind === 'user' && it.pending && sameMessage(it, text, images.length));
@@ -450,22 +855,41 @@ export function applyEvent(state: ChatState, ev: unknown): ChatState {
         turnUserKey = `turn:${state.seq + 1}`;
         items = [...state.items, { kind: 'user', key: turnUserKey, text, ...withImages(images) }];
       }
-      return { ...state, items, running: true, phase: 'thinking', activeTool: null, turnUserKey, lastResult: null, stopRequested: false, stopTurnOnly: false, replaySkip: messageKey(text, images), liveTurn: e.live === true, background: [], seq: state.seq + 1 };
+      // The box refused the turn's trusted mode (agent chat-runner.js settleTurnMode), so it can only read: say so, and why.
+      if (typeof e.readOnly === 'string' && e.readOnly) {
+        items = [...items, { kind: 'readonly', key: `readonly:${state.seq + 1}`, reason: e.readOnly, ...(typeof e.readOnlyFix === 'string' && e.readOnlyFix ? { fix: e.readOnlyFix } : {}) }];
+      }
+      // compacting: false, as a compact turn that never settled (its turn-end lost) must not hide this turn's events.
+      return { ...state, items, running: true, phase: 'thinking', activeTool: null, turnUserKey, lastResult: null, stopRequested: false, stopTurnOnly: false, replaySkip: messageKey(text, images), liveTurn: e.live === true, turnHeadings: e.headings === true, background: [], compacting: false, woken: false, seq: state.seq + 1 };
     }
     case 'system':
       if (e.subtype === 'background_tasks_changed' && Array.isArray(e.tasks)) {
         const background: BackgroundTask[] = e.tasks.map((t: AnyEvent) => ({
           description: typeof t?.description === 'string' && t.description.trim() ? t.description.trim() : 'a background task',
           subagent: t?.task_type === 'local_agent',
+          ...(typeof t?.task_id === 'string' && { id: t.task_id }),
         }));
         return { ...state, background };
       }
-      return e.subtype === 'init' && typeof e.session_id === 'string' ? { ...state, sessionId: e.session_id } : state;
+      if (e.subtype === 'compact_boundary') {
+        const pre = typeof e.compact_metadata?.pre_tokens === 'number' ? e.compact_metadata.pre_tokens : null;
+        return compactedDivider(state, typeof e.uuid === 'string' ? e.uuid : null, typeof e.timestamp === 'string' ? e.timestamp : null, pre);
+      }
+      if (e.subtype === 'task_notification') {
+        // A background task has an output file; a foreground call's notification has none.
+        const note: TaskNote = { taskId: str(e.task_id), toolUseId: str(e.tool_use_id), status: str(e.status), summary: str(e.summary) };
+        return backgroundEnded(state, note, typeof e.output_file === 'string' && e.output_file !== '');
+      }
+      // Claude Code starts each query with an init, a wake-up's too.
+      if (e.subtype === 'init') return wake(typeof e.session_id === 'string' ? { ...state, sessionId: e.session_id } : state);
+      return state;
     case 'stream_event':
-      return streamEvent(state, e);
+      return streamEvent(wake(state), e);
     case 'assistant':
-      return assistantEvent(state, e);
+      return assistantEvent(wake(state), e);
     case 'user':
+      // What a compaction says as a user (its summary, its "Compacted" echo) is Claude Code's, not the person's.
+      if (state.compacting && state.running) return { ...state, seq: state.seq + 1 };
       return userEvent(state, e);
     case 'user-stop':
       return state.running ? { ...state, stopRequested: true, stopTurnOnly: e.scope === 'turn' } : state;
@@ -483,16 +907,17 @@ export function applyEvent(state: ChatState, ev: unknown): ChatState {
       // A turn-only stop ends with this result while background commands go
       // on: what was open is cut off, and the stop is said here, not at turn-end.
       if (state.stopTurnOnly && state.running) {
+        const when = stampOf(state, e);
         const settled: ChatItem[] = state.items.map(it => (it.kind === 'text' && it.streaming ? { ...it, streaming: false }
-          : it.kind === 'tool' && !it.done ? { ...it, done: true } : it));
-        if (settled[settled.length - 1]?.kind !== 'note') settled.push({ kind: 'note', key: `note:${state.seq + 1}`, text: 'Stopped by you' });
+          : it.kind === 'tool' && !it.done ? ended({ ...it, done: true }, when) : it));
+        if (!isStopNote(settled[settled.length - 1])) settled.push({ kind: 'note', key: `note:${state.seq + 1}`, text: 'Stopped by you' });
         return {
           ...state, items: settled, lastResult, phase: 'waiting', activeTool: null, stopRequested: false, stopTurnOnly: false,
           stream: { messageId: null, byIndex: {}, textStarted: 0 }, seq: state.seq + 1,
         };
       }
       // A live turn stays open after its answer while a background task runs.
-      return { ...state, items, lastResult, phase: state.running ? 'waiting' : state.phase, activeTool: state.running ? null : state.activeTool, seq: state.seq + 1 };
+      return { ...state, items, lastResult, phase: state.running ? 'waiting' : state.phase, activeTool: state.running ? null : state.activeTool, woken: false, seq: state.seq + 1 };
     }
     case 'queue-dropped': {
       // Stop dropped messages queued behind the turn: their bubbles come down.
@@ -508,33 +933,78 @@ export function applyEvent(state: ChatState, ev: unknown): ChatState {
       });
       return { ...state, items };
     }
+    case 'context-cleared': {
+      // The box's word (live, and in the history) that the next turn starts a
+      // new session. The ring empties; plan windows are the account's, so they
+      // stay. The requesting view folds the answer in, then its own frame: one
+      // divider. A history line with `resumedAt` is a clear Resume undid: its
+      // divider says so, and the context carried on.
+      const at = typeof e.at === 'string' ? e.at : null;
+      const key = `cleared:${at ?? state.seq + 1}`;
+      if (typeof e.resumedAt === 'string') {
+        const items = state.items.some(it => it.key === key) ? state.items : [...state.items, { kind: 'divider' as const, key, at, variant: 'cleared' as const, undone: true }];
+        return { ...state, items, seq: state.seq + 1 };
+      }
+      // Already folded (the answer, then the frame): the stash must keep what the ring had before.
+      if (state.items.some(it => it.key === key)) return state;
+      const items = [...state.items, { kind: 'divider' as const, key, at, variant: 'cleared' as const }];
+      return {
+        ...state, items, sessionId: null, clearedUsage: state.usage ?? null, compactedFrom: null,
+        usage: { ...emptyUsage, limits: state.usage?.limits ?? {} }, seq: state.seq + 1,
+        sessionCostUsd: null, clearedSessionCostUsd: state.sessionCostUsd ?? null,
+      };
+    }
+    case 'context-resumed': {
+      // Resume put the cleared session back: its divider is marked undone, and the ring shows what it had.
+      const key = `cleared:${typeof e.at === 'string' ? e.at : ''}`;
+      const items = state.items.map(it => (it.kind === 'divider' && it.key === key ? { ...it, undone: true } : it));
+      const usage = state.clearedUsage ? { ...state.clearedUsage, limits: { ...state.clearedUsage.limits, ...(state.usage?.limits ?? {}) } } : state.usage;
+      return {
+        ...state, items, sessionId: typeof e.sessionId === 'string' ? e.sessionId : state.sessionId, usage, clearedUsage: null, seq: state.seq + 1,
+        sessionCostUsd: state.clearedSessionCostUsd ?? null, clearedSessionCostUsd: null,
+      };
+    }
+    case 'context-compacted': {
+      // The history's compact boundary (agent chat-runner.js historyEntries).
+      return compactedDivider(state, typeof e.uuid === 'string' ? e.uuid : null, typeof e.at === 'string' ? e.at : null, typeof e.preTokens === 'number' ? e.preTokens : null,
+        typeof e.summaryUuid === 'string' ? e.summaryUuid : null);
+    }
     case 'runner-error':
       // The turn is over (a failed spawn may never send turn-end), so settle
       // like one: stop the spinner and let the composer send again.
       return {
         ...state,
-        items: [...state.items, { kind: 'error', key: `error:${state.seq + 1}`, text: String(e.message ?? 'The chat runner failed') }],
-        running: false, phase: 'idle', activeTool: null, liveTurn: false, background: [], seq: state.seq + 1,
+        items: settleBackground([...state.items, { kind: 'error', key: `error:${state.seq + 1}`, text: String(e.message ?? 'The chat runner failed') }]),
+        running: false, phase: 'idle', activeTool: null, liveTurn: false, background: [], compacting: false, woken: false, seq: state.seq + 1,
       };
     case 'turn-end': {
       // Nothing streams once the turn is over; a tool still open was cut off.
-      const items: ChatItem[] = state.items.map(it => (it.kind === 'text' && it.streaming ? { ...it, streaming: false }
-        : it.kind === 'tool' && !it.done ? { ...it, done: true } : it));
+      const when = stampOf(state, e);
+      const items: ChatItem[] = settleBackground(state.items.map(it => (it.kind === 'text' && it.streaming ? { ...it, streaming: false }
+        : it.kind === 'tool' && !it.done ? ended({ ...it, done: true }, when) : it)));
       // Stopped here, or in another view (Claude exits on the SIGINT: signal or 130).
       const stopped = state.stopRequested || e.signal === 'SIGINT' || e.exitCode === 130;
-      if (stopped && state.running && items[items.length - 1]?.kind !== 'note') {
+      if (stopped && state.running && !isStopNote(items[items.length - 1])) {
         items.push({ kind: 'note', key: `note:${state.seq + 1}`, text: 'Stopped by you' });
       }
-      // The runner's record of the turn; an agent without one leaves the result's numbers.
+      // The runner's record of the turn; an agent without one leaves the result's numbers. Both
+      // are the session's total, unless the record says that beside its cost (sessionCostUsd): then
+      // the cost is the turn's own. Otherwise the turn's own is what the total grew by.
+      const priced = 'sessionCostUsd' in e;
+      const total: number | null = priced ? (typeof e.sessionCostUsd === 'number' ? e.sessionCostUsd : null)
+        : typeof e.costUsd === 'number' ? e.costUsd : e.costUsd === null ? null : state.lastResult?.costUsd ?? null;
       const cost: TurnCost = {
-        costUsd: typeof e.costUsd === 'number' ? e.costUsd : e.costUsd === null ? null : state.lastResult?.costUsd ?? null,
+        costUsd: priced ? (typeof e.costUsd === 'number' ? e.costUsd : null) : turnCost(total, state.sessionCostUsd ?? null),
         durationMs: typeof e.durationMs === 'number' ? e.durationMs : state.lastResult?.durationMs ?? null,
+        // The agent's record says when (`at`); an older agent's turn-end has no time, so its last event's.
+        ...(when.at && { endedAt: when.at }),
       };
       const costs = state.turnUserKey ? { ...state.costs, [state.turnUserKey]: cost } : state.costs;
       const extraCostUsd = state.turnUserKey ? state.extraCostUsd : state.extraCostUsd + (cost.costUsd ?? 0);
       return {
         ...state, items, costs, extraCostUsd, running: false, phase: 'idle', activeTool: null,
-        turnUserKey: null, lastResult: null, stopRequested: false, stopTurnOnly: false, liveTurn: false, background: [],
+        sessionCostUsd: total ?? state.sessionCostUsd ?? null,
+        turnUserKey: null, lastResult: null, stopRequested: false, stopTurnOnly: false, liveTurn: false, background: [], compacting: false, woken: false,
         seq: stopped ? state.seq + 1 : state.seq, stream: { messageId: null, byIndex: {}, textStarted: 0 },
       };
     }
@@ -553,29 +1023,103 @@ export function applyEvent(state: ChatState, ev: unknown): ChatState {
 export function alignTurnCosts(
   users: ReadonlyArray<{ key: string; uuid?: string; turnId?: string }>,
   records: ReadonlyArray<TurnRecord>,
-): { costs: Record<string, TurnCost>; extraCostUsd: number } {
+): { costs: Record<string, TurnCost>; extraCostUsd: number; unplaced: UnplacedCost[] } {
   const costs: Record<string, TurnCost> = {};
   const used = new Set<number>();
   let extraCostUsd = 0;
+  const unplaced: UnplacedCost[] = [];
   for (const r of records) {
     let j = r.turnId ? users.findIndex((u, i) => !used.has(i) && u.turnId === r.turnId) : -1;
     if (j < 0 && r.userUuid) j = users.findIndex((u, i) => !used.has(i) && u.uuid === r.userUuid);
     if (j >= 0) {
-      costs[users[j].key] = { costUsd: r.costUsd, durationMs: r.durationMs };
+      costs[users[j].key] = { costUsd: r.costUsd, durationMs: r.durationMs, ...(r.at && { endedAt: r.at }) };
       used.add(j);
     } else {
       extraCostUsd += r.costUsd ?? 0;
+      if (r.costUsd != null) unplaced.push({ at: r.at ?? null, costUsd: r.costUsd });
     }
   }
-  return { costs, extraCostUsd };
+  return { costs, extraCostUsd, unplaced };
 }
 
+
+/**
+ * A turn's own cost from its session's total and the total after the session's turn before it.
+ * `claude -p --resume` carries the session's cost on, so total_cost_usd is all the session has
+ * cost so far. A total lower than the one before is a counter that started again (a resume that
+ * did not restore it, another config dir or box): all of it is this turn's.
+ */
+export function turnCost(total: number | null, previous: number | null): number | null {
+  if (total == null) return null;
+  // Rounded past Claude's own precision, so a difference of totals is no float noise.
+  return previous == null || total < previous ? total : Math.round((total - previous) * 1e10) / 1e10;
+}
+
+/**
+ * The turn records with each turn's own cost, the current session's total after its last turn
+ * (which the next turn counts from), and the total when the context was last cleared (which a
+ * Resume puts back). An agent that sends `sessionCostUsd` took the costs itself, per session.
+ * An older one sends each session's total as the cost and no session, so the totals are taken
+ * in order as one session, which a clear (`clears`: when each was, a divider's ISO time) starts
+ * again. A just-cleared chat has no session yet (resetContext): its turns are those after the clear.
+ */
+export function turnCosts(
+  records: ReadonlyArray<TurnRecord>, clears: ReadonlyArray<string> = [], sessionId: string | null = null,
+): { records: TurnRecord[]; sessionCostUsd: number | null; clearedSessionCostUsd: number | null } {
+  const lastClear = clears.reduce<string | null>((a, c) => (a == null || c > a ? c : a), null);
+  if (records.some(r => r.sessionCostUsd !== undefined)) {
+    const last = (rs: TurnRecord[]) => (rs.length ? rs[rs.length - 1].sessionCostUsd ?? null : null);
+    const totals = records.filter(r => r.sessionCostUsd != null);
+    const current = totals.filter(r => (sessionId
+      ? !r.sessionId || r.sessionId === sessionId
+      : lastClear == null || (r.at != null && r.at > lastClear)));
+    // The session the last clear left: its turns are the ones before it, after any clear before that.
+    const earlier = lastClear == null ? null : clears.filter(c => c < lastClear).reduce<string | null>((a, c) => (a == null || c > a ? c : a), null);
+    const cleared = lastClear == null ? [] : totals.filter(r => r.at != null && r.at < lastClear && (earlier == null || r.at > earlier));
+    return { records: [...records], sessionCostUsd: last(current), clearedSessionCostUsd: last(cleared) };
+  }
+  let previous: number | null = null;
+  let previousAt: string | null = null;
+  let clearedSessionCostUsd: number | null = null;
+  let clearedAt: string | null = null;
+  const clearedSince = (at: string | null | undefined) => previousAt != null && clears.some(c => c > previousAt! && (at == null || c < at));
+  const out = records.map(r => {
+    if (clearedSince(r.at)) previous = null;
+    const own = turnCost(r.costUsd, previous);
+    if (r.costUsd != null) { previous = r.costUsd; previousAt = r.at ?? previousAt; }
+    // The running total as the last clear found it.
+    if (lastClear != null && r.at != null && r.at < lastClear) { clearedSessionCostUsd = previous; clearedAt = previousAt; }
+    return { ...r, costUsd: own };
+  });
+  // A clear between that turn and the last one left an empty session there.
+  if (clearedAt != null && clears.some(c => c > clearedAt! && c < lastClear!)) clearedSessionCostUsd = null;
+  return { records: out, sessionCostUsd: clearedSince(null) ? null : previous, clearedSessionCostUsd };
+}
+
+/** A turn record no bubble in view took (the history tail cut it): when it ended, and what it cost. */
+export interface UnplacedCost { at: string | null; costUsd: number }
 
 /** What the whole chat has cost so far, or null before any turn reported a cost. */
 export function chatCostTotal(state: Pick<ChatState, 'costs' | 'extraCostUsd'>): number | null {
   const known = Object.values(state.costs).map(c => c.costUsd).filter((c): c is number => c != null);
   if (known.length === 0 && state.extraCostUsd === 0) return null;
   return known.reduce((a, b) => a + b, 0) + state.extraCostUsd;
+}
+
+/**
+ * What the chat has cost since its context was last cleared: the replies after
+ * the last divider. Null when it was never cleared (the total says it all).
+ */
+export function costSinceCleared(state: Pick<ChatState, 'items' | 'costs' | 'unplacedCosts'>): number | null {
+  let last = -1;
+  state.items.forEach((it, i) => { if (it.kind === 'divider' && it.variant === 'cleared' && !it.undone) last = i; });
+  if (last < 0) return null;
+  // A prompt's turn, or a compact turn's (its divider holds the cost).
+  const inView = state.items.slice(last + 1).reduce((sum, it) => sum + (it.kind === 'user' || (it.kind === 'divider' && it.variant === 'compacted') ? state.costs[it.key]?.costUsd ?? 0 : 0), 0);
+  // And the turns after the clear whose bubbles the history cap cut: by when they ended (both ISO times).
+  const clearedAt = (state.items[last] as Extract<ChatItem, { kind: 'divider' }>).at;
+  const cut = clearedAt ? (state.unplacedCosts ?? []).filter(u => u.at != null && u.at > clearedAt).reduce((sum, u) => sum + u.costUsd, 0) : 0;
+  return inView + cut;
 }
 
 /** "$0.04", "<$0.01", "$12.30". */
@@ -605,9 +1149,61 @@ export function turnMeta(cost: TurnCost | undefined): string | null {
 
 export type ChatGroup =
   | { kind: 'user'; item: Extract<ChatItem, { kind: 'user' }> }
+  | { kind: 'divider'; item: Extract<ChatItem, { kind: 'divider' }> }
   | { kind: 'reply'; key: string; userKey: string | null; items: ChatItem[] };
 
-/** The chat as prompts and the replies after them: what a reply's cost footnote hangs on. */
+/**
+ * How many of a chat's newest groups (prompts and replies, `groupTurns`) a
+ * view renders at first. A long session's history is hundreds of markdown
+ * and tool blocks; drawing only the newest keeps a switch to it quick, and
+ * the earlier ones come in as the reader scrolls up to them
+ * (`windowStart`, `transcriptWindow`, `loadsEarlier`).
+ */
+export const TRANSCRIPT_WINDOW = 40;
+
+/** How close to the top of the transcript a scroll up brings in the next earlier groups. */
+export const EARLIER_EDGE_PX = 400;
+
+/**
+ * Whether a scroll event brings in earlier groups: the reader moved up (so
+ * the first event, the scroll to the bottom when a chat opens, and the
+ * anchoring jump after earlier groups came in never count), to within
+ * EARLIER_EDGE_PX of the top, with groups left out and none on their way.
+ */
+export function loadsEarlier(i: { scrollTop: number; prevScrollTop: number | null; hidden: number; pending: boolean }): boolean {
+  if (i.hidden <= 0 || i.pending || i.prevScrollTop == null) return false;
+  return i.scrollTop < i.prevScrollTop && i.scrollTop <= EARLIER_EDGE_PX;
+}
+
+/** A group's key: its prompt's, or its reply's. */
+export function chatGroupKey(g: ChatGroup): string {
+  return g.kind === 'reply' ? g.key : g.item.key;
+}
+
+/**
+ * Where a chat's window starts: at the group it was fixed to (`from`, a
+ * group key), so new prompts and replies append below without pushing the
+ * oldest drawn one out. Before it is fixed, or once that group is gone (a
+ * history reload that dropped it), the window is the newest TRANSCRIPT_WINDOW
+ * groups, which is the whole chat when it is no longer than that.
+ */
+export function windowStart(keys: readonly string[], from: string | null): number {
+  const at = from == null ? -1 : keys.indexOf(from);
+  return at >= 0 ? at : Math.max(0, keys.length - TRANSCRIPT_WINDOW);
+}
+
+/** Where the window starts once the next earlier groups come in. */
+export function earlierStart(start: number): number {
+  return Math.max(0, start - TRANSCRIPT_WINDOW);
+}
+
+/** The groups from `start` on, and how many earlier ones are left out. */
+export function transcriptWindow<T>(groups: readonly T[], start: number): { groups: readonly T[]; hidden: number } {
+  const hidden = Math.min(Math.max(0, start), groups.length);
+  return { groups: hidden ? groups.slice(hidden) : groups, hidden };
+}
+
+/** The chat as prompts and the replies after them: what a reply's cost footnote hangs on. A divider stands alone. */
 export function groupTurns(items: readonly ChatItem[]): ChatGroup[] {
   const groups: ChatGroup[] = [];
   let userKey: string | null = null;
@@ -615,6 +1211,11 @@ export function groupTurns(items: readonly ChatItem[]): ChatGroup[] {
     if (item.kind === 'user') {
       groups.push({ kind: 'user', item });
       userKey = item.key;
+      continue;
+    }
+    if (item.kind === 'divider') {
+      groups.push({ kind: 'divider', item });
+      userKey = null;
       continue;
     }
     const last = groups[groups.length - 1];
@@ -675,25 +1276,102 @@ export function applyFrame(state: ChatState, frame: { turnId?: string | null; se
  * after the replay, so a lost turn's prompt is in the list and is not also
  * counted as extra. A cost the replay already pinned, and no record claimed,
  * stays: the record may not be written until the next poll.
+ *
+ * `box` is what the history says beside the replay: whether a turn runs, and
+ * whether it is live. A long turn's replay is only its newest lines, with no
+ * turn-start to say it runs; the box's `head` (agent chat-runner.js
+ * eventsFromLog: the turn-start and the background tasks as of the cut) goes
+ * first, and without one (an older agent) `running` alone marks the turn
+ * open, or the chat said "Done" over a turn still at work.
  */
 export function fromHistory(
   entries: unknown[],
   sessionId: string | null = null,
-  turn: { turnId: string; events: Array<{ seq: number; event: unknown }> } | null = null,
+  turn: { turnId: string; events: Array<{ seq: number; event: unknown }>; head?: unknown[] } | null = null,
   records: ReadonlyArray<TurnRecord> = [],
+  box: { running?: boolean; liveInput?: boolean } = {},
 ): ChatState {
-  let state = entries.reduce<ChatState>(applyEvent, { ...emptyChat, sessionId });
+  // The snapshot's session is the current one: a divider among the entries is an earlier clear.
+  let state: ChatState = { ...entries.reduce<ChatState>(applyEvent, emptyChat), sessionId };
+  // Each record's own cost, and the session's total the replayed turn counts from (not its own record's).
+  const clears = state.items.flatMap(it => (it.kind === 'divider' && it.variant === 'cleared' && !it.undone && it.at ? [it.at] : []));
+  const priced = turnCosts(records, clears, sessionId);
+  const before = turn ? turnCosts(records.filter(r => r.turnId !== turn.turnId), clears, sessionId) : priced;
+  state = { ...state, sessionCostUsd: before.sessionCostUsd, clearedSessionCostUsd: before.clearedSessionCostUsd };
+  // With a replay, the entries are the turns before it, which have ended:
+  // no background call of theirs is still running, whatever their last
+  // word was (a Stop, a notification the history cut).
+  if (turn) state = { ...state, items: settleBackground(state.items) };
   // A replay capped to its newest lines starts mid-turn: take it from there.
-  if (turn && turn.events.length) state = { ...state, cursor: { turnId: turn.turnId, seq: turn.events[0].seq - 1 } };
+  if (turn && turn.events.length) {
+    if (turn.events[0].seq > 1) {
+      for (const ev of turn.head ?? []) state = applyEvent(state, ev);
+      // The prompt's replay is before the cut: nothing left to skip.
+      state = { ...state, replaySkip: null };
+      if (box.running && !state.running) {
+        state = { ...state, running: true, phase: 'thinking', activeTool: null, lastResult: null, liveTurn: box.liveInput === true, background: [] };
+      }
+    }
+    state = { ...state, cursor: { turnId: turn.turnId, seq: turn.events[0].seq - 1 } };
+  }
   for (const e of turn?.events ?? []) state = applyFrame(state, { turnId: turn!.turnId, seq: e.seq, event: e.event }).state;
+  // Nothing runs on the box, so nothing will say a background call ended.
+  if (box.running === false && !state.running) state = { ...state, items: settleBackground(state.items) };
+  // The running turn's own calls: those the box's latest task list (in the
+  // replay, or the cut's head) no longer names have ended.
+  else if (state.running && turn) {
+    const lists = [...(turn.head ?? []), ...turn.events.map(e => e.event)]
+      .filter((ev): ev is AnyEvent => (ev as AnyEvent)?.type === 'system' && (ev as AnyEvent).subtype === 'background_tasks_changed' && Array.isArray((ev as AnyEvent).tasks));
+    const latest = lists[lists.length - 1];
+    if (latest) state = { ...state, items: settleBackground(state.items, new Set(latest.tasks.map((t: AnyEvent) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'))) };
+  }
   if (!records.length) return state;
-  const users = state.items.filter((it): it is Extract<ChatItem, { kind: 'user' }> => it.kind === 'user');
-  const aligned = alignTurnCosts(users, records);
+  // A compact turn's record names its summary, which a compacted divider carries.
+  const users = state.items.flatMap<{ key: string; uuid?: string; turnId?: string }>(it => (it.kind === 'user' ? [it]
+    : it.kind === 'divider' && it.variant === 'compacted' && it.promptUuid ? [{ key: it.key, uuid: it.promptUuid }] : []));
+  const aligned = alignTurnCosts(users, priced.records);
   const costs = { ...aligned.costs };
   for (const [key, value] of Object.entries(state.costs)) {
     if (!(key in costs)) costs[key] = value;
   }
-  return { ...state, costs, extraCostUsd: aligned.extraCostUsd };
+  return { ...state, costs, extraCostUsd: aligned.extraCostUsd, unplacedCosts: aligned.unplaced };
+}
+
+/**
+ * A history load keeps the context ring's numbers. A box's history carries
+ * each call's prompt size (agent/chat-runner.js promptUsage), so a reopened
+ * chat fills the ring again, but not the context window a result reported
+ * or the plan's windows; an older box's history carries none of it, and no
+ * replay carries a seat's monthly spend. So the
+ * snapshot keeps what this chat had: in this view (`prev`, a reload of the
+ * same chat) or when it was last open in this tab (`remembered`). Plan
+ * windows merge by type, as live events do (withRateLimit): a replay that
+ * carries one window does not drop the others.
+ */
+export function withKeptUsage(prev: ChatState, next: ChatState, remembered: ChatUsage | null = null): ChatState {
+  const kept = prev.usage ?? remembered;
+  if (!kept) return next;
+  const got = next.usage;
+  if (!got) return { ...next, usage: kept };
+  return {
+    ...next,
+    usage: {
+      ...got,
+      contextWindow: got.contextWindow ?? (got.model === kept.model ? kept.contextWindow : null),
+      // Merged by type; the live-only spend's reset follows the merged overage window (withSpendReset).
+      limits: withSpendReset({ ...kept.limits, ...got.limits }),
+    },
+  };
+}
+
+// The ring's numbers for each chat opened in this tab, so going back to one
+// shows them at once instead of waiting for its next reply.
+const usageByChat = new Map<string, ChatUsage>();
+export function rememberUsage(chatId: string, usage: ChatUsage | undefined): void {
+  if (usage) usageByChat.set(chatId, usage);
+}
+export function rememberedUsage(chatId: string): ChatUsage | null {
+  return usageByChat.get(chatId) ?? null;
 }
 
 /**
@@ -717,7 +1395,7 @@ export function toolSummary(name: string, input: unknown): { title: string; deta
     case 'Grep': case 'Glob': return { title: name, detail: str(i.pattern) };
     case 'WebFetch': return { title: name, detail: str(i.url) };
     case 'WebSearch': return { title: name, detail: str(i.query) };
-    case 'Task': return { title: name, detail: str(i.description) };
+    case 'Task': case 'Agent': return { title: name, detail: str(i.description) };
     case 'TodoWrite': return { title: 'Todos', detail: Array.isArray(i.todos) ? `${i.todos.length} items` : null };
     case 'Skill': return { title: 'Skill', detail: str(i.skill)?.replace(/^\//, '') ?? null };
     default: {
@@ -768,9 +1446,58 @@ export function stopTitle(background: number | readonly BackgroundTask[], contro
   return `Stop Claude and ${tasksPhrase(tasks, 'task')} it started (Esc)`;
 }
 
+/** One way to stop, as the chrome refresh's Stop menu offers it. */
+export interface StopChoice { scope: 'turn' | 'all'; label: string; hint: string }
+
+/** What a stop also ends, by Claude's own descriptions of the tasks where it gave them: "Also ends: Run the tests, Build". */
+const ending = (lead: string, tasks: readonly BackgroundTask[]) => {
+  const names = tasks.map(t => t.description.trim());
+  if (!names.length || names.some(n => !n)) return `${lead} ${tasksPhrase(tasks.length, 'task')}`;
+  return `${lead}: ${names.length <= 2 ? names.join(', ') : `${names.slice(0, 2).join(', ')} and ${names.length - 2} more`}`;
+};
+
+/**
+ * The chrome refresh's Stop menu (pages/chat/ComposerStop.tsx). Empty when a
+ * click should just stop: nothing runs in the background that a stop would
+ * either keep or end (a subagent ends with any stop). Otherwise each stop the
+ * turn allows: Claude alone, where it can stop on its own (`split`), and
+ * Claude with its background commands.
+ */
+export function stopChoices(background: readonly BackgroundTask[], control: StopControl): StopChoice[] {
+  const commands = background.filter(t => !t.subagent);
+  if (!commands.length) return [];
+  const subagents = background.length - commands.length;
+  const all: StopChoice = control === 'background'
+    ? { scope: 'all', label: 'Stop background tasks', hint: ending('Claude has answered. Ends', background) }
+    : { scope: 'all', label: 'Stop Claude and background tasks', hint: ending('Also ends', background) };
+  if (control !== 'split') return [all];
+  const keeps = commands.length === 1 ? 'Its background task keeps running' : `Its ${commands.length} background tasks keep running`;
+  const ends = subagents ? `; ${tasksPhrase(subagents, 'subagent')} ${subagents === 1 ? 'ends' : 'end'}` : '';
+  return [{ scope: 'turn', label: 'Stop Claude', hint: `${keeps}${ends}` }, all];
+}
+
 /** The history's word that the running turn is live, for a log whose turn-start does not say. */
 export function seedLiveTurn(state: ChatState, liveInput: boolean | undefined): ChatState {
   return state.running && liveInput === true && !state.liveTurn ? { ...state, liveTurn: true } : state;
+}
+
+/** The "Stopped by you" note, not an informational one (a read-only turn's). */
+export function isStopNote(it: ChatItem | undefined): boolean {
+  return it?.kind === 'note' && it.info !== true;
+}
+
+/**
+ * The line under a chat whose session the desktop app's thread is working on:
+ * the session's status
+ * comes from that thread's hooks (source `t3:…`), not from this chat's runner,
+ * so the chat itself looks done. Null otherwise.
+ */
+export function desktopTurnStatus(status: { status?: string; source?: string | null } | undefined): ChatStatusLine | null {
+  if (!status || typeof status.source !== 'string' || !status.source.startsWith('t3:')) return null;
+  if (status.status === 'working') return { tone: 'working', text: 'Working in the desktop app' };
+  // Waiting on an approval or an answer there: still the desktop's turn, and a send here is refused.
+  if (status.status === 'waiting') return { tone: 'working', text: 'Waiting for you in the desktop app' };
+  return null;
 }
 
 /** The single line under the chat saying what Claude is doing now. */
@@ -778,7 +1505,13 @@ export function chatStatus(state: ChatState, sendsLive = false): ChatStatusLine 
   if (!state.running) {
     const last = state.items[state.items.length - 1];
     if (last?.kind === 'error') return { tone: 'error', text: 'Failed · your turn' };
-    if (last?.kind === 'note') return { tone: 'idle', text: 'Stopped · your turn' };
+    if (isStopNote(last)) return { tone: 'idle', text: 'Stopped · your turn' };
+    if (last?.kind === 'divider') {
+      const text = last.variant === 'compacted' ? 'Context compacted · your turn' : last.undone ? 'Previous context resumed · your turn' : 'Context cleared · your turn';
+      return { tone: 'idle', text };
+    }
+    // Sent, and its turn not started yet: not the last turn's "Done".
+    if (last?.kind === 'user' && last.pending) return { tone: 'working', text: 'Sending…' };
     return { tone: 'idle', text: state.items.length ? 'Done · your turn' : 'Say what you want to do' };
   }
   if (state.phase === 'tool' && state.activeTool) {
@@ -786,9 +1519,19 @@ export function chatStatus(state: ChatState, sendsLive = false): ChatStatusLine 
     return { tone: 'working', text: detail ? `Running ${title} · ${detail.length > 70 ? `${detail.slice(0, 69)}…` : detail}` : `Running ${title}` };
   }
   if (state.phase === 'writing') return { tone: 'working', text: 'Writing…' };
+  if (state.phase === 'compacting') return { tone: 'working', text: 'Compacting the conversation…' };
   if (state.phase === 'waiting') {
-    return { tone: 'working', text: sendGoesLive(state, sendsLive) ? 'Waiting on background work · you can still send a message' : 'Waiting on background work · a message waits until it ends' };
+    // Claude has answered and only its background tasks run: idle, as the
+    // session's status says (backend statusForChatEvent), with what is left.
+    const n = state.background?.length ?? 0;
+    // Subagents alone are agents; with a command among them, tasks.
+    const agents = n > 0 && state.background!.every(t => t.subagent);
+    const tasks = n === 0 ? 'background work' : agents ? (n === 1 ? '1 agent' : `${n} agents`) : n === 1 ? '1 background task' : `${n} background tasks`;
+    return sendGoesLive(state, sendsLive)
+      ? { tone: 'idle', text: `Your turn · ${tasks} ${n === 0 ? 'still running' : 'running'}` }
+      : { tone: 'idle', text: `Waiting on ${tasks} · a message waits until ${n > 1 ? 'they end' : 'it ends'}` };
   }
+  if (state.woken) return { tone: 'working', text: 'Working · background task finished' };
   return { tone: 'working', text: 'Thinking…' };
 }
 
@@ -846,14 +1589,24 @@ export type HistoryLoad = 'loading' | 'ok' | 'setup' | 'error';
  * checkout is there (a box that clones in the pane reports setup done before
  * its checkout finishes). Until then the history is asked again, and the
  * setup steps show; they also show while a first message waits to be sent.
+ *
+ * The first answer is still out on every open and every switch, which is
+ * not setup by itself: the steps show then only when something says the
+ * chat really is coming up (the project is held for its box or clone, a
+ * message waits, or `comingUp`: its box is launching or starting). An
+ * existing chat whose history is on its way is `loading`, a placeholder
+ * shaped like the transcript, not "Starting Claude". Should the answer
+ * turn out to be setup, the steps take over then.
  */
-export function sdkReadiness(i: { held: boolean; history: HistoryLoad; checkoutReady: boolean; queued: boolean }): {
-  runnerReady: boolean; pollHistory: boolean; showSteps: boolean;
+export function sdkReadiness(i: { held: boolean; history: HistoryLoad; checkoutReady: boolean; queued: boolean; comingUp?: boolean }): {
+  runnerReady: boolean; pollHistory: boolean; showSteps: boolean; loading: boolean;
 } {
   const runnerReady = !i.held && i.history === 'ok' && i.checkoutReady;
   const pollHistory = !i.held && (i.history === 'setup' || (i.history === 'ok' && !i.checkoutReady));
-  const showSteps = i.held || (i.history !== 'error' && !runnerReady) || i.queued;
-  return { runnerReady, pollHistory, showSteps };
+  const showSteps = i.held || i.queued || i.history === 'setup' || (i.history === 'ok' && !i.checkoutReady)
+    || (i.history === 'loading' && i.comingUp === true);
+  const loading = !showSteps && i.history === 'loading';
+  return { runnerReady, pollHistory, showSteps, loading };
 }
 
 /**
@@ -865,13 +1618,37 @@ export function sdkReadiness(i: { held: boolean; history: HistoryLoad; checkoutR
  * whose prompt is the snapshot's last one marks the turn running without a
  * second bubble.
  */
+/**
+ * Where the running turn starts in a snapshot with no replay of it, at the
+ * latest: everything before is from turns that ended. A turn's prompt is a
+ * user line no other turn took in (not `midTurn`), but a message a live
+ * turn took in while it only waited is a plain user line too, so the last
+ * one cannot be told from a prompt. The finished turns' records can: the
+ * running turn's prompt comes after the last finished turn's prompt, and the
+ * first turn-starting line after that is at or before it. With no record
+ * to go by, 0: leave a card running rather than end one that still runs.
+ */
+function runningTurnStart(items: readonly ChatItem[], records: ReadonlyArray<TurnRecord>): number {
+  const finished = new Set(records.map(r => r.userUuid).filter((u): u is string => typeof u === 'string'));
+  let last = -1;
+  items.forEach((it, i) => { if (it.kind === 'user' && it.uuid && finished.has(it.uuid)) last = i; });
+  if (last < 0) return 0;
+  const next = items.findIndex((it, i) => i > last && it.kind === 'user' && !it.midTurn);
+  return next < 0 ? last : next;
+}
+
 export function mergeHistory(
   snapshot: { entries: unknown[]; sessionId: string | null; running: boolean; turns?: readonly TurnRecord[] },
   live: readonly unknown[],
 ): ChatState {
-  const base = fromHistory(snapshot.entries, snapshot.sessionId, null, snapshot.turns ?? []);
+  const fromEntries = fromHistory(snapshot.entries, snapshot.sessionId, null, snapshot.turns ?? []);
+  // The last prompt, which a turn-start may be the replay of: a message taken in mid-turn never is.
+  const lastUser = [...fromEntries.items].reverse().find(it => it.kind === 'user' && !it.midTurn);
+  // An older agent's snapshot holds the running turn too, from its prompt on:
+  // only that turn's background calls can still run.
+  const cut = snapshot.running ? runningTurnStart(fromEntries.items, snapshot.turns ?? []) : fromEntries.items.length;
+  const base = cut > 0 ? { ...fromEntries, items: [...settleBackground(fromEntries.items.slice(0, cut)), ...fromEntries.items.slice(cut)] } : fromEntries;
   let state: ChatState = snapshot.running ? { ...base, running: true, phase: 'thinking' } : base;
-  const lastUser = [...base.items].reverse().find(it => it.kind === 'user');
   // Assistant blocks the snapshot already holds, by message id and content.
   const sig = (e: AnyEvent) => `${e.message?.id ?? ''}|${JSON.stringify(e.message?.content ?? null)}`;
   const assistants = (snapshot.entries as AnyEvent[]).filter(e => e?.type === 'assistant');
@@ -893,7 +1670,7 @@ export function mergeHistory(
       const unanswered = base.items[base.items.length - 1] === lastUser;
       repeatTurn = !unanswered;
       state = {
-        ...state, running: true, phase: 'thinking', activeTool: null, lastResult: null, liveTurn: e?.live === true,
+        ...state, running: true, phase: 'thinking', activeTool: null, lastResult: null, liveTurn: e?.live === true, turnHeadings: e?.headings === true, compacting: false,
         // Only the unanswered prompt is this turn. Pointing a repeat at it would replace that reply's cost.
         turnUserKey: unanswered ? lastUser.key : null,
         replaySkip: unanswered ? startKey : null,
@@ -919,5 +1696,59 @@ export function mergeHistory(
     }
     state = applyEvent(state, ev);
   }
-  return state;
+  // Nothing runs on the box, so nothing will say a background call ended.
+  return state.running ? state : { ...state, items: settleBackground(state.items) };
+}
+
+export type ContextAction = 'clear' | 'compact' | 'resume';
+
+export interface ActionState { enabled: boolean; reason: string | null }
+
+/**
+ * What the context popover's actions say now (agent chat-context-v1): hidden
+ * (null), or Clear and Compact each enabled or disabled with why (null when
+ * this chat can never do it: hidden, not disabled), and whether Resume
+ * previous context is on offer (it is hidden otherwise). `offered` is the history's
+ * contextActions (backend services/chatRunner.ts chatContextActions):
+ * `update` is a box whose runner predates chat-context-v1. `refusals` is what
+ * this chat can never do (chatContextRefusals: another engine or backend).
+ * Resume is there from a clear until the first message after it: once that
+ * turn has started a new session, the two would have to be merged. Compact
+ * has no threshold: with a session and Claude idle it is always allowed (the
+ * person's call), so it is disabled only where it cannot run at all.
+ */
+export function contextActions(i: {
+  offered: 'ready' | 'update' | null | undefined;
+  refusals?: Partial<Record<ContextAction, string>>;
+  runnerReady: boolean;
+  running: boolean;
+  held: boolean;
+  sessionId: string | null;
+  items: readonly ChatItem[];
+}): { clear: ActionState | null; compact: ActionState | null; resume: boolean } | null {
+  if (!i.offered) return null;
+  const off = (reason: string): ActionState => ({ enabled: false, reason });
+  if (i.offered === 'update') {
+    const why = off("This box's agent needs an update before it can do this.");
+    return { clear: why, compact: why, resume: false };
+  }
+  const busy = !i.runnerReady ? 'Claude is still starting.'
+    : i.running ? 'Wait for Claude to finish, or stop it, first.'
+    : i.held ? 'Claude is open in Lab. Return it to this chat first.'
+    : null;
+  let lastDivider = -1;
+  i.items.forEach((it, k) => { if (it.kind === 'divider') lastDivider = k; });
+  const divider = lastDivider >= 0 ? i.items[lastDivider] as Extract<ChatItem, { kind: 'divider' }> : null;
+  const sinceDivider = i.items.slice(lastDivider + 1);
+  const resume = !busy && !i.sessionId && !i.refusals?.resume && divider?.variant === 'cleared' && !divider.undone && !sinceDivider.some(it => it.kind === 'user');
+  // What this chat can never do (another engine or backend) is hidden (null), not disabled.
+  const clear: ActionState | null = i.refusals?.clear ? null
+    : busy ? off(busy)
+    : !i.sessionId ? off(divider?.variant === 'cleared' && !divider.undone ? 'Context is already clear.' : 'Nothing to clear yet.')
+    : { enabled: true, reason: null };
+  const compact: ActionState | null = i.refusals?.compact ? null
+    : busy ? off(busy)
+    : !i.sessionId ? off('Nothing to compact yet.')
+    : { enabled: true, reason: null };
+  return { clear, compact, resume };
 }

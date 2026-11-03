@@ -16,6 +16,12 @@ describe('paletteItems', () => {
     expect(items.map(i => i.kind)).toEqual(['recent-query', 'row']);
   });
 
+  it('empty query: suggested actions after the recents, and only while nothing is typed', () => {
+    const suggested = [action('New session')];
+    expect(paletteItems({ ...base, history: ['foo'], recent: [row('a')], suggested }).map(i => i.kind)).toEqual(['recent-query', 'row', 'action']);
+    expect(paletteItems({ ...base, q: 'zzz', suggested }).map(i => i.kind)).toEqual(['cta']);
+  });
+
   it('typing: matching sessions, then the pane-text item', () => {
     const items = paletteItems({ ...base, q: 'sam', hits: [row('a'), row('b')] });
     expect(items.map(i => i.kind)).toEqual(['row', 'row', 'cta']);

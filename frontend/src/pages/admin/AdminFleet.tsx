@@ -2,9 +2,37 @@ import React, { useCallback, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { adminApi, type AdminCloudSessions, type AdminInstance, type AdminInstanceDetail, type AdminRange, type FleetOverview } from '../../services/adminApi';
 import { ChartCard } from '../dashboard/ChartCard';
+import { AdminBoxDisk } from './AdminBoxDisk';
+import { AdminBoxResize } from './AdminBoxResize';
+import { AdminBoxEvents } from './AdminBoxEvents';
+import { phaseLabel } from '../../utils/boxResize';
 import { useAdminPolled, useSelectedDetail, pendingText, refreshFailedText,DataTable, StatusPill, Dot, KeyValues, fmtAgo, fmtSeconds, type Column } from './shared';
 import { adminCloudName, agentAgeLabel, cloudCountCell, pressureCell, pressureClass, updateOutcomeClass } from '../../utils/adminCloud';
 import { cloudStateLabel } from '../../utils/cloudSessions';
+import { BoxQuarantine } from './BoxQuarantine';
+import { boxSizeBadge, isRequirementsSize } from '../../utils/boxSize';
+
+/** What auto-park will do with a box, in one line: its limit and where it came from, the park, and the last automatic one. */
+export function autoParkCell(
+  lc: AdminInstanceDetail['lifecycle'],
+  now: number,
+  box: Pick<AdminInstanceDetail, 'kind' | 'ec2InstanceId'>,
+): string {
+  if (!lc) return '— (no owner)';
+  // Nothing parks an external or instanceless box, whatever its settings (Bugbot on #622).
+  if (box.kind !== 'ec2' || !box.ec2InstanceId) return 'never (not an EC2 box termag runs)';
+  // A box's own hours stop it, under box-auto-lifecycle-enabled; box-idle-stop-enabled's window stops it too.
+  const limit = lc.idleLimitHours
+    ? lc.idleLimitSource === 'default'
+      ? `stops after ${lc.idleLimitHours} h idle (box-idle-stop-enabled)`
+      : `stops after ${lc.idleLimitHours} h idle (its own)`
+    : lc.idleHibernateHours
+      ? `off (its own ${lc.idleHibernateHours} h need box-auto-lifecycle-enabled)`
+      : 'off';
+  const park = lc.parkAt ? ` · ${lc.warnedAt ? 'warned, ' : ''}parks ${new Date(lc.parkAt).toLocaleString()}` : '';
+  const last = lc.autoParkedAt ? ` · auto-parked ${fmtAgo(lc.autoParkedAt, now)}` : '';
+  return `${limit}${park}${last}`;
+}
 
 export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
   const [all, setAll] = useState(false);
@@ -27,6 +55,15 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
     { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} /> },
     { id: 'conn', label: 'agent', value: r => (r.connected ? 1 : 0), render: r => <Dot on={r.connected} /> },
     { id: 'kind', label: 'kind', value: r => r.kind },
+    { id: 'size', label: 'size', value: r => boxSizeBadge(r.size, r.instanceType)?.label ?? '', title: 'the size it launched at, and the EC2 type it got; the type alone for no size (BOX_INSTANCE_TYPE) and for a repo\'s .termag/environment.json requirements',
+      render: r => {
+        const badge = boxSizeBadge(r.size, r.instanceType);
+        if (r.resize?.running) return <span title={phaseLabel(r.resize.phase)}>{badge?.label ?? '?'} → {r.resize.to} <span className="usage-dim">({r.resize.phase})</span></span>;
+        if (!badge) return <span className="usage-dim">—</span>;
+        return <span title={badge.title}>{r.size ? badge.label : <span className="usage-dim">{badge.label}</span>}</span>;
+      } },
+    { id: 'disk', label: 'disk', value: r => r.diskGiB ?? 0, title: 'the root disk it was made with, in GB (50 to 300, else 120); the live volume, after any Grow disk, is in the box\'s Disk section',
+      render: r => (r.diskGiB ? `${r.diskGiB} GB` : <span className="usage-dim">—</span>) },
     { id: 'region', label: 'region', value: r => r.region },
     { id: 'projects', label: 'projects', value: r => r.projects.active, align: 'right', render: r => `${r.projects.active}${r.projects.archived ? ` (+${r.projects.archived})` : ''}` },
     { id: 'cloud', label: 'cloud', value: r => r.cloud ? r.cloud.running + r.cloud.starting : 0, align: 'right', title: 'Claude Code cloud sessions open on the box',
@@ -73,15 +110,22 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
                 ['last update', detail.update ? <span className={updateOutcomeClass(detail.update.outcome)}>{detail.update.outcome} · {fmtAgo(detail.update.at, now)} · {detail.update.detail}{detail.update.commit ? ` · ${detail.update.commit.slice(0, 12)}` : ''}</span> : 'never reported (a wrapper from before the report, or never asked)'],
                 ['created / ready', `${fmtAgo(detail.createdAt, now)} / ${detail.readyAt ? fmtAgo(detail.readyAt, now) : '—'}`],
                 ['ec2', detail.ec2InstanceId ? `${detail.ec2InstanceId} · ${detail.region ?? ''} · ${detail.hostname ?? ''}` : 'none (external)'],
+                ['size', detail.size && isRequirementsSize(detail.size) ? boxSizeBadge(detail.size, detail.instanceType)!.title
+                  : detail.size ? `${detail.size} · ${detail.instanceType ?? 'type not recorded'}` : detail.instanceType ? `${detail.instanceType} (no size: the configured type)` : 'not recorded (launched before sizes were recorded, or external)'],
+                ['resize', <AdminBoxResize key={detail.id} boxId={detail.id} onChanged={list.refresh} />],
                 ['image', detail.imageId ? `${detail.imageId} · ${detail.imageSource ?? 'published'}` : 'not recorded (launched before images were recorded, or external)'],
+                ['auto-park', autoParkCell(detail.lifecycle, now, detail)],
                 ['iam / sg', `${detail.iamRoleName ?? '—'} / ${detail.securityGroupId ?? '—'}`],
                 ['error', detail.provisioningError ?? '—'],
                 ['tokens', detail.tokens.map(t => `${t.name} (${t.tokenPrefix}${t.revokedAt ? ', revoked' : ''})`).join(' · ') || '—'],
                 ['host', detail.host ? <span className={pressureClass(detail.host)}>{pressureCell(detail.host)} · {detail.host.keptCheckouts ?? 0} kept cloud checkout{detail.host.keptCheckouts === 1 ? '' : 's'} · sampled {fmtAgo(detail.host.sampledAt, now)}</span> : 'no sample yet (agent predates host sampling)'],
+                ['disk', <AdminBoxDisk boxId={detail.id} now={now} />],
+                ['operations', <AdminBoxEvents events={detail.events} now={now} />],
                 ['cloud sessions', detail.cloud && detail.cloud.running + detail.cloud.starting > 0
                   ? <Link to={`/admin/cloud?box=${encodeURIComponent(detail.id)}`}>{cloudCountCell(detail.cloud)}</Link>
                   : 'none open'],
               ]} />
+              <BoxQuarantine box={detail} now={now} onChanged={list.refresh} />
               {cloudRuns.length > 0 && (
                 <>
                   <div className="dash-section-title" style={{ marginTop: 8 }}>cloud runs</div>

@@ -5,6 +5,7 @@
 // progress so the box does not sit at the paste prompt.
 import React, { useEffect, useRef, useState } from 'react';
 import { claudeLoginApi } from '../services/api';
+import type { InstanceStatus } from '../types';
 import { REPLAY_BLOCK_CLASS } from '../observability';
 import {
   loginCard, loginCodeError, loginTransport, safeLoginMessage, sawLoginFlow, takeLoginView,
@@ -13,6 +14,8 @@ import {
 
 const POLL_MS = 4000;
 const POLL = new Set(['offline', 'starting', 'submitting', 'needs-code']);
+// Failures that say nothing about sign-in clear up on their own: ask again.
+const POLL_TRANSPORT = new Set<LoginTransport>(['offline', 'unreachable', 'check-failed']);
 
 export function ClaudeLoginPanel({
   card, busy, draft, localError, onDraft, onStart, onSubmit,
@@ -66,7 +69,17 @@ function messageOf(err: unknown): string | undefined {
   return safeLoginMessage(data?.error);
 }
 
-export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: string; owner: boolean; enabled: boolean }) {
+export function ClaudeLoginCard({ projectId, owner, enabled, box, hostShowsBox, authFailure }: {
+  projectId: string;
+  owner: boolean;
+  enabled: boolean;
+  /** The box feed's status, so a box that is down can say why. */
+  box?: InstanceStatus | null;
+  /** The chat's status line already says the box or its agent is down, so the card does not. */
+  hostShowsBox?: boolean;
+  /** Changes each time a turn fails on Claude's sign-in; null once Claude answers again. */
+  authFailure?: number | null;
+}) {
   const [view, setView] = useState<ClaudeLoginView | null>(null);
   const [engaged, setEngaged] = useState(false);
   const [transport, setTransport] = useState<LoginTransport>(null);
@@ -74,6 +87,10 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
   const [draft, setDraft] = useState('');
   const [localError, setLocalError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+  // A turn failed on the sign-in. Claude can still read as signed in then
+  // (an expired token on disk), so the card offers a fresh sign-in anyway.
+  const [authLost, setAuthLost] = useState(false);
+  const loadRef = useRef<(() => void) | null>(null);
   const phaseRef = useRef<string | null>(null);
   const viewRef = useRef<ClaudeLoginView | null>(null);
   // Bumped when a status read starts, when start/submit settles, and when
@@ -107,6 +124,7 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
     setDraft('');
     setLocalError(undefined);
     setBusy(false);
+    setAuthLost(false);
 
     if (!enabled || !projectId) return;
     let stop = false;
@@ -124,18 +142,20 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
         if (sawLoginFlow(chosen.phase)) { engagedRef.current = true; setEngaged(true); }
       }, err => {
         if (stop || projectRef.current !== forProject || gen !== viewGen.current) return;
-        setTransport(loginTransport(err));
+        setTransport(loginTransport(err, 'status'));
         setTransportError(messageOf(err));
       });
     };
+    loadRef.current = load;
     void load();
     const id = window.setInterval(() => {
       const phase = phaseRef.current;
       const current = transportRef.current;
-      if (current === 'offline' || (phase != null && POLL.has(phase))) void load();
+      if (POLL_TRANSPORT.has(current) || (phase != null && POLL.has(phase))) void load();
     }, POLL_MS);
     return () => {
       stop = true;
+      loadRef.current = null;
       window.clearInterval(id);
       // The route and the box RPC already exist. Calling them here stops the
       // CLI when the chat changes or the card goes away. A finished sign-in
@@ -147,8 +167,15 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
     };
   }, [enabled, projectId]);
 
+  // A turn failed on the sign-in: ask the box again and offer a fresh one.
+  useEffect(() => {
+    if (authFailure == null) { setAuthLost(false); return; }
+    setAuthLost(true);
+    loadRef.current?.();
+  }, [authFailure]);
+
   if (!enabled) return null;
-  const card = loginCard(view, { owner, engaged, transport, transportError });
+  const card = loginCard(view, { owner, engaged, transport, transportError, box, hostShowsBox, authLost });
 
   const onStart = () => {
     const forProject = projectId;
@@ -156,7 +183,7 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
     setLocalError(undefined);
     engagedRef.current = true;
     setEngaged(true);
-    claudeLoginApi.start(forProject).then(next => {
+    (authLost ? claudeLoginApi.start(forProject, { reauth: true }) : claudeLoginApi.start(forProject)).then(next => {
       if (projectRef.current !== forProject) return;
       viewGen.current += 1;
       viewRef.current = next;
@@ -191,6 +218,7 @@ export function ClaudeLoginCard({ projectId, owner, enabled }: { projectId: stri
       setTransport(null);
       setTransportError(undefined);
       if (next.phase === 'ready' || sawLoginFlow(next.phase)) { engagedRef.current = true; setEngaged(true); }
+      if (next.phase === 'ready') setAuthLost(false);
     }, err => {
       if (projectRef.current !== forProject) return;
       setTransport(loginTransport(err));

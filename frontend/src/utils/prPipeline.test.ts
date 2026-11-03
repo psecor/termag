@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { PrLane, PrRow } from '../services/api';
-import { myReviewCount, asksForMyReview, hasOverview, bakePending, boxesBehindText, deferrals, deferredText, splitDeferred, viewEntries, inRepo, isPrsView, needsYou, needsYouRows, prsRepoSearch, prsSearch, rowParam, canSubmitReview, checksSummary, compareUrl, deployStage, firstNonEmpty, laneTabLabel, mention, mergeReadiness, PHONE_LANE_ORDER, pingText, reviewerRoster, reviewStateLabel, rowDetail, rowLabel, rowAction, searchPrRows } from './prPipeline';
+import { myReviewCount, asksForMyReview, hasOverview, bakePending, boxesBehindText, deferrals, deferredText, splitDeferred, viewEntries, inRepo, isPrsView, needsYou, needsYouRows, prsRepoSearch, prsSearch, rowKey, rowParam, canSubmitReview, checksSummary, compareUrl, deployStage, firstNonEmpty, laneTabLabel, mention, mergeReadiness, PHONE_LANE_ORDER, pingText, reviewerRoster, reviewStateLabel, rowDetail, rowLabel, rowAction, searchPrRows } from './prPipeline';
 
 const NOW = Date.parse('2026-10-09T12:00:00Z');
 
@@ -458,5 +458,15 @@ describe('prsStale', () => {
     const { prsStale } = await import('./prPipeline');
     expect(prsStale({ connected: true, fetchedAt: new Date(NOW - 3 * 3_600_000).toISOString() }, null, NOW)).toBe('Last read from GitHub 3h ago. This may be out of date.');
     expect(prsStale({ connected: true }, new Error('boom'), NOW)).toMatch(/^Last read from GitHub a while ago: refreshing failed/);
+  });
+});
+
+describe('rowKey', () => {
+  it('tells apart a multi-repo workstream\'s branch rows, one per repository', () => {
+    const ws = { projectId: 'p1', projectName: 'acme', workstream: 'feat' };
+    const a = row({ kind: 'branch', number: null, repo: 'acme/web', workstream: ws });
+    const b = row({ kind: 'branch', number: null, repo: 'acme/api', workstream: ws });
+    expect(rowKey(a)).not.toBe(rowKey(b));
+    expect(rowKey(row({ number: 9 }))).toBe('example-org/termag#9');
   });
 });

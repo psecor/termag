@@ -7,6 +7,10 @@ import { startClientBeacon } from './buildInfo';
 // Starts listening for beforeinstallprompt before the lazy /m chunk loads (mobile/install.ts).
 import './mobile/install';
 import { NAVIGATE_EVENT } from './mobile/push';
+// JetBrains Mono ships with the app (--font-mono in App.css), so code and terminals
+// don't depend on the OS's `monospace` font, which some Linux and Windows setups map to a serif.
+import '@fontsource-variable/jetbrains-mono/wght.css';
+import '@fontsource-variable/jetbrains-mono/wght-italic.css';
 import './App.css';
 
 // A lazy route's chunk failed to load: the orchestrator rolled to a new build

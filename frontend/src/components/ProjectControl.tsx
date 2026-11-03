@@ -4,9 +4,11 @@ import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ConfirmDialog, type ConfirmTone } from './ConfirmDialog';
 import { BoxLifecycleDialog } from './BoxLifecycleDialog';
+import { BoxResizeDialog } from './BoxResizeDialog';
+import { AnchoredMenu, useMenuAnchor } from './AnchoredMenu';
 import { BoxSpacesDialog } from './BoxSpacesDialog';
 import { SpaceDialog } from './SpaceDialog';
-import { autoTerminatedText, lifecycleNote, offersAutoHibernate } from '../utils/boxLifecycle';
+import { autoTerminatedText, lifecycleNote, offersAutoHibernate, warnedParkAt } from '../utils/boxLifecycle';
 import { SwitchAgentDialog } from './SwitchAgentDialog';
 import { HandoffDialog } from './HandoffDialog';
 import { canHandOff } from '../utils/handoff';
@@ -22,7 +24,8 @@ import { NewProjectDialog } from './NewProjectDialog';
 import { DOCS_SITE_URL } from '../pages/settings/settingsDocs';
 import { optBackIntoMobile } from '../mobile/redirect';
 import { Project, ProjectInvite, ProjectShareInfo, AgentStatusValue, Instance, AutoTerminatedBox, Workstream, CloudSession, HandoffMode } from '../types';
-import { MODEL_BACKENDS, PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider, runningProviderForSource } from '../providers/registry';
+import { MODEL_BACKENDS, PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider, providerBadgeStyle, runningProviderForSource } from '../providers/registry';
+import { usePalette } from '../theme/usePalette';
 import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { useConnection } from '../contexts/ConnectionContext';
@@ -37,23 +40,27 @@ import { useTheme } from '../theme/ThemeProvider';
 import { metatermVisibility } from '../utils/metatermVisibility';
 import { boxStripeColor } from '../utils/boxColor';
 import { groupRollup, pruneCollapsedGroups, readCollapsedGroups, writeCollapsedGroups } from '../utils/collapsedGroups';
+import { stoppedBoxGroups } from '../utils/stoppedBoxGroups';
+import { hiddenAsks, withoutAsks } from '../utils/askBoxGroups';
+import { StoppedBoxesToggle } from './StoppedBoxesToggle';
 import { sessionName as buildSessionName } from '../utils/sessionName';
 import { boxImageBadge, boxNameTitle } from '../utils/boxImage';
+import { BoxSizeBadge } from './BoxSizePicker';
+import { offersResize, resizeBadge } from '../utils/boxResize';
 import { statusKey } from '../utils/statusKey';
 import { flashesTransition } from '../utils/statusFlash';
 import { shouldShowPrPrompt } from '../utils/prPrompt';
-import {
-  SEEN_STOPS_KEY, formatStopAge, markSeen, mergeSeenStops, readSeenStops, unseenStopAge, writeSeenStops,
-  type SeenStops, type UnseenAge,
-} from '../utils/unseenStops';
-import { aggregateReviewRing, reviewRingTooltip, ringStateFor, type RingState } from '../utils/reviewRing';
+import { formatStopAge, markSeen, seenStopKey, unseenStopAge, type UnseenAge } from '../utils/unseenStops';
+import { useSeenStops } from '../hooks/useSeenStops';
+import { aggregateReviewRing, reviewRingTooltip, reviewsOf, ringForReviews, type RingState } from '../utils/reviewRing';
 import {
   boxDisplay,
-  canHibernateBox,
   canStartBox,
   canStopBox,
   hibernationAgeNote,
   isBoxParked,
+  isQuarantined,
+  QUARANTINED_BOX_NOTE,
   showsBoxError,
 } from '../utils/boxPower';
 import { boxFeed } from '../services/boxFeed';
@@ -63,9 +70,15 @@ import { repoPromptDue } from '../utils/repoPick';
 import { CloneProgress } from './CloneProgress';
 import { automationsApi, type AutomationView } from '../services/api';
 import { projectKindTraits } from '../utils/projectKind';
-import { automationSubtitle, occurrenceShort, RUN_STATE_LABEL } from '../utils/automationSchedule';
+import { automationSubtitle, RUN_STATE_LABEL } from '../utils/automationSchedule';
+import { automationHref, newestRunsFirst, runLabel, runsStatus, runsUnfolded, shownRuns } from '../utils/automationRuns';
+import { workstreamNameFromBranch } from '../utils/workstreamChoices';
 import { chatHref } from '../chat/simpleChat';
 import type { NewProjectMode } from './NewProjectForm';
+import { WhatsNewLabLink } from '../whatsNew/WhatsNewLinks';
+
+/** How often a box row's countdown to an automatic park redraws. */
+const COUNTDOWN_TICK_MS = 30_000;
 
 // Aggregate priority for combining per-workstream statuses into a single
 // project-row signal: "is anything alive on this project?"
@@ -107,6 +120,7 @@ export function boxSummary(boxes: Instance[], cloudSessions = 0): string {
 }
 
 export function ProjectControl() {
+  const palette = usePalette();
   const { user, updateDefaultAgentProvider } = useAuth();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -162,6 +176,9 @@ export function ProjectControl() {
     setRenamingId(null);
   }
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  // Automations whose runs the person unfolded (true) or folded (false); the
+  // rest list theirs only while one of them is the open workstream.
+  const [unfoldedRuns, setUnfoldedRuns] = useState<ReadonlyMap<string, boolean>>(new Map());
   const [confirmState, setConfirmState] = useState<{ message: string; onConfirm: () => void; confirmLabel?: string; tone?: ConfirmTone } | null>(null);
   // Switch agent dialog: which workstream it is for, and whether a switch is in flight.
   const [switchTarget, setSwitchTarget] = useState<{ project: Project; ws: Workstream } | null>(null);
@@ -266,49 +283,20 @@ export function ProjectControl() {
 
   // "Stopped since you looked": agent sessions that
   // came to rest after this browser last had them on screen keep a marker
-  // until opened. Seen times live in localStorage, per browser.
+  // until opened. Seen times live in localStorage, per browser, shared with
+  // termag's sidebar (hooks/useSeenStops.ts).
   const browserStorage = typeof localStorage !== 'undefined' ? localStorage : null;
-  const [seenStops, setSeenStops] = useState<SeenStops>(() => readSeenStops(browserStorage, Date.now()));
-  const [pageVisible, setPageVisible] = useState(() => typeof document === 'undefined' || !document.hidden);
+  const { seenStops, updateSeen, pageVisible } = useSeenStops();
   // The marker ages (fresh → recent → old → gone) with no status change to re-render it.
   const [stopClock, setStopClock] = useState(() => Date.now());
   useEffect(() => {
-    const onVisibility = () => setPageVisible(!document.hidden);
-    // Another tab opened something: take its seen times.
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === SEEN_STOPS_KEY) setSeenStops(readSeenStops(localStorage, Date.now()));
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('storage', onStorage);
     const tick = setInterval(() => setStopClock(Date.now()), 60_000);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('storage', onStorage);
-      clearInterval(tick);
-    };
+    return () => clearInterval(tick);
   }, []);
-  // Every change is applied over what storage holds now, merged with this
-  // tab's view, and written at once: another tab may have saved since this
-  // one last read, and a stale snapshot must not put its markers back.
-  const seenRef = useRef(seenStops);
-  seenRef.current = seenStops;
-  const updateSeen = useCallback((fn: (s: SeenStops) => SeenStops) => {
-    const base = mergeSeenStops(seenRef.current, readSeenStops(browserStorage, Date.now()));
-    const next = fn(base);
-    writeSeenStops(browserStorage, next);
-    seenRef.current = next;
-    setSeenStops(next);
-  }, [browserStorage]);
 
-  // Seen times are keyed by project and workstream id, not session name, so a
-  // project or workstream rename keeps them (the status, stoppedAt included,
-  // moves to the new name). main can't be renamed and is keyed by name. Any
-  // other workstream has no key until its id is known: a name-keyed mark made
-  // before the list loads would be orphaned once the id key takes over.
+  // Seen times are keyed by project and workstream id (utils/unseenStops.ts seenStopKey).
   function seenKeyOf(project: Project, wsName: string): string | null {
-    if (wsName === 'main') return `${project.id}:main`;
-    const ws = project.workstreams?.find(w => w.name === wsName);
-    return ws ? `${project.id}:${ws.id}` : null;
+    return seenStopKey(project.id, wsName, project.workstreams?.find(w => w.name === wsName)?.id);
   }
 
   // Each agent session of a project with the workstream it belongs to.
@@ -378,15 +366,23 @@ export function ProjectControl() {
   const [shares, setShares] = useState<ProjectShareInfo[]>([]);
 
   const [branchOffProjectId, setBranchOffProjectId] = useState<string | null>(null);
+  const [newWorkstreamName, setNewWorkstreamName] = useState('');
+  // The branch may hold `/`, the name cannot. Each field follows the other until it is typed in.
+  const [newWorkstreamBranch, setNewWorkstreamBranch] = useState('');
+  const [newWorkstreamNameEdited, setNewWorkstreamNameEdited] = useState(false);
+  const [newWorkstreamBranchEdited, setNewWorkstreamBranchEdited] = useState(false);
+  // Stable (setters only), so the palette's memo can call it without listing it.
+  const resetBranchOffForm = useCallback(() => {
+    setNewWorkstreamName(''); setNewWorkstreamBranch(''); setNewWorkstreamNameEdited(false); setNewWorkstreamBranchEdited(false);
+  }, []);
   useEffect(() => {
     if (searchParams.get('branchOff') !== '1') return;
     const id = searchParams.get('project');
-    if (id) setBranchOffProjectId(id);
+    if (id) { setBranchOffProjectId(id); resetBranchOffForm(); }
     const next = new URLSearchParams(searchParams);
     next.delete('branchOff');
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
-  const [newWorkstreamName, setNewWorkstreamName] = useState('');
   // ⌘K actions: Branch off… opens the open project's branch-off form. Not
   // for a kind that cannot branch (MetaTerm, an automation: its workstreams
   // are the scheduler's runs) or a project shared with you, as on the phone.
@@ -410,7 +406,8 @@ export function ProjectControl() {
       detail: branchName,
       keywords: ['new workstream', 'worktree'],
       run: () => {
-        if (branchOffProjectId !== branchId) setNewWorkstreamName('');
+        // Another project's form starts empty: a leftover branch would be sent for it.
+        if (branchOffProjectId !== branchId) resetBranchOffForm();
         setBranchOffProjectId(branchId);
       },
     }];
@@ -535,6 +532,16 @@ export function ProjectControl() {
   // New project dialog, which waits for them (and carries the GitHub gate).
   const [newBoxName, setNewBoxName] = useState('');
   const [boxError, setBoxError] = useState('');
+  // A warned box's countdown moves on its own: the feed doesn't poll a ready
+  // box, so tick while any box has a standing warning (Bugbot on #622).
+  const [countdownNow, setCountdownNow] = useState(() => Date.now());
+  const anyWarned = boxes.some(b => warnedParkAt(b) !== null);
+  useEffect(() => {
+    if (!anyWarned) return;
+    setCountdownNow(Date.now());
+    const timer = setInterval(() => setCountdownNow(Date.now()), COUNTDOWN_TICK_MS);
+    return () => clearInterval(timer);
+  }, [anyWarned]);
   const [boxMenuOpenId, setBoxMenuOpenId] = useState<string | null>(null);
   // Set after creating a self-managed box: the one-time token + config to paste
   // into agent.config.json on the user's own machine.
@@ -561,6 +568,9 @@ export function ProjectControl() {
     return () => { cancelled = true; clearInterval(t); };
   }, [automationsOn, hasAutomationProjects, projects.length]);
   const [lifecycleBox, setLifecycleBox] = useState<Instance | null>(null);
+  const [resizeBox, setResizeBox] = useState<Instance | null>(null);
+  // The ⋮ that owns the open row menu, one across all kinds (AnchoredMenu.useMenuAnchor).
+  const menus = useMenuAnchor();
   const [autoTerminated, setAutoTerminated] = useState<AutoTerminatedBox[]>([]);
   const [warmPool, setWarmPool] = useState<WarmPoolStatus | null>(null);
   const [claimLog, setClaimLog] = useState<{ boxName: string; log: string } | null>(null);
@@ -676,7 +686,19 @@ export function ProjectControl() {
 
   function statusGlyph(project: Project): React.ReactNode {
     if (!project.workflows.some(w => w.type === 'agent')) return '—';
-    return <StatusDot status={aggregateStatus(project)} />;
+    return <StatusDot status={projectKindTraits(project.kind).isAutomation ? latestRunStatus(project) : aggregateStatus(project)} />;
+  }
+
+  /** An automation's runs, newest first: its workstreams but main, where no agent ever runs. */
+  function automationRuns(project: Project) {
+    return newestRunsFirst(project.workstreams.filter(ws => ws.name !== 'main'), ws => ws.name);
+  }
+
+  /** An automation's row: working while a run works, else its latest run's status (utils/automationRuns.ts). */
+  function latestRunStatus(project: Project): AgentStatusValue {
+    const owner = project.ownerUsername ?? user?.unixUsername ?? '';
+    return runsStatus(automationRuns(project).map(ws =>
+      statusMap[statusKey(project.instanceId, buildSessionName(owner, project.name, 'agent', ws.name))]?.status ?? 'not_running'));
   }
 
   // Any workstream of the project with a live "PR opened — compact or clear?"
@@ -691,21 +713,22 @@ export function ProjectControl() {
     return projectAgentSessions(project).some(s => prPromptPendingSession(project.instanceId, s));
   }
 
-  // The Devin review ring for one workstream and the
-  // tile's aggregation over them (waiting > reviewing > done). pr is the PR
-  // of whichever workstream owns the aggregated state, for the tooltip.
-  function reviewRingSession(instanceId: string | null | undefined, session: string): { ring: RingState | null; pr: number | null; reviewer: string | null } {
-    const st = statusMap[statusKey(instanceId, session)];
-    const review = st?.review ?? null;
-    return { ring: ringStateFor(review), pr: review?.pr ?? null, reviewer: review?.reviewer ?? null };
+  // The review ring for one workstream, over its review
+  // panes, and the tile's aggregation over the
+  // workstreams (waiting > reviewing > done). pr is the PR of whichever pane
+  // owns the aggregated state, for the tooltip; count, how many panes share it.
+  type ReviewRing = { ring: RingState | null; pr: number | null; reviewer: string | null; count: number };
+  function reviewRingSession(instanceId: string | null | undefined, session: string): ReviewRing {
+    return ringForReviews(reviewsOf(statusMap[statusKey(instanceId, session)]));
   }
-  function reviewRingFor(project: Project): { ring: RingState | null; pr: number | null; reviewer: string | null } {
-    if (!project.workflows.some(w => w.type === 'agent')) return { ring: null, pr: null, reviewer: null };
+  function reviewRingFor(project: Project): ReviewRing {
+    if (!project.workflows.some(w => w.type === 'agent')) return { ring: null, pr: null, reviewer: null, count: 0 };
     const entries = projectAgentSessions(project).map(s => reviewRingSession(project.instanceId, s));
     const ring = aggregateReviewRing(entries.map(e => e.ring));
-    if (!ring) return { ring: null, pr: null, reviewer: null };
+    if (!ring) return { ring: null, pr: null, reviewer: null, count: 0 };
     const top = entries.find(e => e.ring === ring);
-    return { ring, pr: top?.pr ?? null, reviewer: top?.reviewer ?? null };
+    const count = entries.filter(e => e.ring === ring).reduce((n, e) => n + e.count, 0);
+    return { ring, pr: top?.pr ?? null, reviewer: top?.reviewer ?? null, count };
   }
 
   function contextWarning(project: Project): { level: 'ok' | 'warn' | 'danger'; tokens: number } | null {
@@ -916,7 +939,15 @@ export function ProjectControl() {
       message: archiveMessage(project.name, project.workstreams.length),
       confirmLabel: `Archive ${project.name}`,
       onConfirm: async () => {
-        await projectsApi.archive(project.id);
+        // The archive is refused when the box cannot stop a chat turn (409);
+        // without this the dialog closed and nothing seemed to happen.
+        try {
+          await projectsApi.archive(project.id);
+        } catch (err: unknown) {
+          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+          setError(msg ?? `Failed to archive ${project.name}`);
+          return;
+        }
         if (activeProjectId === project.id) setActiveProject(null);
         await reloadProjects();
       },
@@ -931,10 +962,12 @@ export function ProjectControl() {
   async function createWorkstream(e: React.FormEvent, projectId: string) {
     e.preventDefault();
     const name = newWorkstreamName.trim();
-    if (!name) return;
+    const branch = newWorkstreamBranch.trim();
+    // A branch can leave no name (`main`, a run's, or no letters a name can hold): say so, not nothing.
+    if (!name) { setError('Give the workstream a name: letters, digits, - and _'); return; }
     try {
-      const ws = await workstreamsApi.create(projectId, { name });
-      setNewWorkstreamName('');
+      const ws = await workstreamsApi.create(projectId, { name, ...(branch ? { branch } : {}) });
+      resetBranchOffForm();
       setBranchOffProjectId(null);
       await reloadProjects();
       // Auto-switch to the freshly-created workstream — branching off without
@@ -1149,30 +1182,6 @@ export function ProjectControl() {
     });
   }
 
-  function hibernateBox(box: Instance) {
-    setConfirmState({
-      message: `Hibernate box "${box.name}"? EC2 saves the box's memory to its disk and powers the instance off, so `
-        + 'agents, tmux sessions, dev servers and containers resume exactly where they were when you start it. '
-        + 'Network connections (port forwards, SSO and SSH sessions) drop and reconnect. '
-        + 'A hibernated box costs only its disk; after 55 days termag resumes and re-hibernates it, '
-        + "since EC2 doesn't keep a box hibernated longer than 60.",
-      confirmLabel: 'Hibernate',
-      tone: 'primary',
-      onConfirm: async () => {
-        try {
-          const { status } = await instancesApi.hibernate(box.id);
-          setBoxError(status === 'stopping'
-            ? 'EC2 would not hibernate this box right now, so it was stopped instead. Its sessions are recreated when you start it.'
-            : '');
-        } catch (err: unknown) {
-          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-          setBoxError(msg || 'Failed to hibernate box');
-        }
-        await reloadBoxes();
-      },
-    });
-  }
-
   async function dismissRepoPrompt(box: Instance) {
     try {
       const row = await instancesApi.dismissRepoPrompt(box.id);
@@ -1201,6 +1210,17 @@ export function ProjectControl() {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
       setBoxError(msg || 'Failed to rename box');
     }
+  }
+
+  async function keepBoxRunning(box: Instance) {
+    try {
+      await instancesApi.keepRunning(box.id);
+      setBoxError('');
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setBoxError(msg || 'Failed to keep the box running');
+    }
+    await reloadBoxes();
   }
 
   async function startBox(box: Instance) {
@@ -1261,14 +1281,6 @@ export function ProjectControl() {
   function automationFor(p: { id: string; kind?: string }): AutomationView | null {
     return p.kind === 'automation' ? automations.get(p.id) ?? null : null;
   }
-  /** "Mon 09:00" for a run workstream `run-20261020-0900`; the name itself otherwise. */
-  function runLabel(name: string, timezone?: string): string {
-    const m = /^run-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(?:-(\d+))?$/.exec(name);
-    if (!m) return name;
-    const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00Z`;
-    return `${occurrenceShort(iso, timezone ?? 'UTC')}${m[6] ? ` (${m[6]})` : ''}`;
-  }
-
   function renderProjectItem(p: typeof projects[0]) {
     const provider = displayAgentProvider(p);
     const config = provider ? PROVIDERS[provider] : null;
@@ -1280,7 +1292,9 @@ export function ProjectControl() {
     const stripe = boxStripeColor(p.instanceId);
     const box = p.instanceId ? boxes.find(b => b.id === p.instanceId) : null;
     const parked = isBoxParked(box?.status);
+    const isAutomation = projectKindTraits(p.kind).isAutomation;
     const wsCount = p.workstreams?.length ?? 0;
+    const runCount = isAutomation ? automationRuns(p).length : 0;
     // Only owned projects are pinnable, so only they're selectable in edit mode.
     const selectable = p.role !== 'collaborator';
     const selected = selectMode && selectedIds.has(p.id);
@@ -1318,9 +1332,9 @@ export function ProjectControl() {
         <span className={`project-status${statusesStale ? ' stale' : ''}`}>
           {parked ? '⏸' : statusGlyph(p)}
           {(() => {
-            const { ring, pr, reviewer } = reviewRingFor(p);
+            const { ring, pr, reviewer, count } = reviewRingFor(p);
             return ring && !parked
-              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr, reviewer)} />
+              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr, reviewer, count)} />
               : null;
           })()}
           {!parked && prPromptPending(p) && (
@@ -1373,7 +1387,9 @@ export function ProjectControl() {
             {wsCount <= 1 && p.role !== 'collaborator' && (
               <WorktreePrPills pills={prPillsFor(p.id, mainWs?.name ?? 'main', statusMap[statusKey(p.instanceId, projectAgentSessions(p)[0])]?.milestone)} />
             )}
-            {wsCount > 1 && (
+            {isAutomation ? runCount > 0 && (
+              <span className="project-workstream-count" title={`${runCount} ${runCount === 1 ? 'run' : 'runs'}`}>↳{runCount}</span>
+            ) : wsCount > 1 && (
               <span
                 className="project-workstream-count"
                 title={`${wsCount} workstreams`}
@@ -1384,10 +1400,7 @@ export function ProjectControl() {
             ) : config && (
               <span
                 className="project-provider-badge"
-                style={{
-                  borderColor: config.color.bright.replace(/[\d.]+\)$/, '0.45)'),
-                  background: config.color.base.replace(/[\d.]+\)$/, '0.16)'),
-                }}
+                style={providerBadgeStyle(config, palette)}
                 title={`runtime: ${config.displayName}${backendNote(mainBackend)}${modelNote(mainWs ? storedWorkstreamModel(p, mainWs) : null)}${savedProvider ? `, saved: ${savedProvider}` : ''}${mixedProviderNote(p, provider)}`}
               >
                 {config.badge}{backendBadge(mainBackend)}
@@ -1399,10 +1412,9 @@ export function ProjectControl() {
         <span className="project-actions" onClick={e => e.stopPropagation()}>
           <button
             className="btn-tiny btn-overflow"
-            onClick={() => setMenuOpenId(menuOpenId === p.id ? null : p.id)}
+            onClick={e => { menus.claim(`project:${p.id}`, e.currentTarget); setMenuOpenId(menuOpenId === p.id && menus.anchorFor(`project:${p.id}`) ? null : p.id); }}
           >⋮</button>
-          {menuOpenId === p.id && (
-            <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
+          <AnchoredMenu anchor={menuOpenId === p.id ? menus.anchorFor(`project:${p.id}`) : null} onClose={() => setMenuOpenId(null)}>
               {p.role === 'collaborator' ? (
                 <button onClick={() => { leaveProject(p.id); setMenuOpenId(null); }}>Leave project</button>
               ) : (
@@ -1426,7 +1438,7 @@ export function ProjectControl() {
                   {projectKindTraits(p.kind).canBranchOff && (
                     <button onClick={() => {
                       setBranchOffProjectId(branchOffProjectId === p.id ? null : p.id);
-                      setNewWorkstreamName('');
+                      resetBranchOffForm();
                       setMenuOpenId(null);
                     }}>
                       Branch off…
@@ -1469,8 +1481,7 @@ export function ProjectControl() {
                   </button>
                 </>
               )}
-            </div>
-          )}
+          </AnchoredMenu>
         </span>
         )}
         <CloneProgress
@@ -1507,6 +1518,22 @@ export function ProjectControl() {
   const rest = metatermProject ? projects.filter(p => p.id !== metatermProject.id) : projects;
 
   const knownBoxIds = new Set(boxes.map(b => b.id));
+  const boxesWithCloud = new Set(cloud.byBox.keys());
+  // Boxes and projects made for `termag ask` leave the list under Settings →
+  // Appearance, "Hide ask boxes" (utils/askBoxGroups.ts for what always
+  // stays). They go first, so "Show stopped (N)" never counts what it
+  // wouldn't bring back. Select mode shows them, as it does stopped boxes.
+  const askHidden = hiddenAsks({
+    enabled: theme.sidebarHideAskBoxes && !selectMode,
+    boxes, projects: rest, activeProjectId: activeProjectId ?? null, boxesWithCloud,
+  });
+  const listed = withoutAsks(rest, askHidden);
+  // Groups of stopped, hibernated or terminated boxes fold behind "Show
+  // stopped (N)" at the foot of the list (utils/stoppedBoxGroups.ts for what
+  // always stays). Select mode shows them all, like it expands every group.
+  const stopped = stoppedBoxGroups({ boxes, projects: listed, activeProjectId: activeProjectId ?? null, boxesWithCloud });
+  const showStopped = theme.sidebarShowStopped || selectMode;
+  const hiddenBoxIds = showStopped ? null : stopped.boxIds;
   const groups: {
     key: string; label: string; color: string | null;
     dot?: string; note?: string | null; rows: typeof projects;
@@ -1515,9 +1542,11 @@ export function ProjectControl() {
   }[] = [];
 
   [...boxes].sort((a, b) => a.name.localeCompare(b.name)).forEach(b => {
-    const rows = sortPinned(rest.filter(p => p.instanceId === b.id));
+    if (askHidden.boxIds.has(b.id)) return;
+    const rows = sortPinned(listed.filter(p => p.instanceId === b.id));
     const cloudRows = cloud.byBox.get(b.id) ?? [];
     if (!rows.length && !cloudRows.length) return;
+    if (hiddenBoxIds?.has(b.id)) return;
     const display = boxDisplay(b.status);
     groups.push({
       key: b.id,
@@ -1562,7 +1591,10 @@ export function ProjectControl() {
   function applyCollapsed(next: Set<string>) {
     for (const g of groups) {
       if (!next.has(g.key) || collapsedGroups.has(g.key)) continue;
-      if (branchOffProjectId && branchOffProjectId !== activeProjectId && g.rows.some(p => p.id === branchOffProjectId)) setBranchOffProjectId(null);
+      if (branchOffProjectId && branchOffProjectId !== activeProjectId && g.rows.some(p => p.id === branchOffProjectId)) {
+        setBranchOffProjectId(null);
+        resetBranchOffForm();
+      }
       if (cloudRenameKey && g.cloud?.some(c => c.key === cloudRenameKey)) cancelCloudRename();
     }
     updateCollapsed(next);
@@ -1603,7 +1635,7 @@ export function ProjectControl() {
               {/* Sign out moved to Settings (rarely used); its slot is the Recents switcher. */}
               <RecentsDropdown />
               {/* The phone client. Opening it here clears a
-                  "Full UI" opt-out so the redirect works again on that browser. */}
+                  "Lab" opt-out so the redirect works again on that browser. */}
               <button
                 className="btn-ghost"
                 onClick={() => { optBackIntoMobile(); navigate('/m'); }}
@@ -1611,22 +1643,23 @@ export function ProjectControl() {
                 aria-label="Phone view"
               >📱</button>
               {simpleUi && (
-                <button className="btn-ghost" onClick={() => navigate('/chat')} title="Simple view" aria-label="Simple view">💬</button>
+                <button className="btn-ghost" onClick={() => navigate('/chat')} title="Open in termag" aria-label="Open in termag">💬</button>
               )}
               <button className="btn-ghost" onClick={() => navigate('/settings')} title="Settings" aria-label="Settings">⚙</button>
             </span>
           </div>
-          {DOCS_SITE_URL && (
+          <div className="sidebar-links">
             <a
               className="sidebar-docs-link"
               href={DOCS_SITE_URL}
               target="_blank"
               rel="noopener noreferrer"
-              title="Docs site"
+              title="Internal docs site"
             >
               How it works ↗
             </a>
-          )}
+            <WhatsNewLabLink />
+          </div>
         </div>
 
         <StatusStrip />
@@ -1786,10 +1819,7 @@ export function ProjectControl() {
                   <span className={`project-status${statusesStale ? ' stale' : ''}`}><StatusDot status={dot} /></span>
                   <span
                     className="project-provider-badge cloud-provider-badge"
-                    style={{
-                      borderColor: PROVIDERS.claude.color.bright.replace(/[\d.]+\)$/, '0.45)'),
-                      background: PROVIDERS.claude.color.base.replace(/[\d.]+\)$/, '0.16)'),
-                    }}
+                    style={providerBadgeStyle(PROVIDERS.claude, palette)}
                     title={s.state === 'queued' ? 'Claude Code cloud session (claude.ai), waiting for a box' : s.state === 'starting' ? 'Claude Code cloud session (claude.ai), starting on this box' : 'Claude Code cloud session (claude.ai), running on this box'}
                   >{PROVIDERS.claude.badge} ☁</span>
                   <span className="cloud-session-main">
@@ -1817,17 +1847,15 @@ export function ProjectControl() {
                       : <span className="cloud-meta">{[s.state === 'starting' ? 'starting' : null, platform, age].filter(Boolean).join(' · ')}</span>}
                   </span>
                   <span className="project-actions" onClick={e => e.stopPropagation()}>
-                    <button className="btn-tiny btn-overflow" onClick={() => setCloudMenuKey(cloudMenuKey === s.key ? null : s.key)}>⋮</button>
-                    {cloudMenuKey === s.key && (
-                      <div className="project-menu" onMouseLeave={() => setCloudMenuKey(null)}>
+                    <button className="btn-tiny btn-overflow" onClick={e => { menus.claim(`cloud:${s.key}`, e.currentTarget); setCloudMenuKey(cloudMenuKey === s.key && menus.anchorFor(`cloud:${s.key}`) ? null : s.key); }}>⋮</button>
+                    <AnchoredMenu anchor={cloudMenuKey === s.key ? menus.anchorFor(`cloud:${s.key}`) : null} onClose={() => setCloudMenuKey(null)}>
                         {s.url && <a className="project-menu-link" href={s.url} target="_blank" rel="noreferrer" onClick={() => setCloudMenuKey(null)}>Open on claude.ai</a>}
                         {canRenameCloud(s)
                           ? <button onClick={() => { beginCloudRename(s); setCloudMenuKey(null); }}>Rename…</button>
                           : <button disabled title="Rename is available after termag places the session on a box">Rename…</button>}
                         {s.current && <button onClick={() => { void showCloudLog(s); setCloudMenuKey(null); }}>Runner log</button>}
                         {canEnd && <button className="menu-danger" onClick={() => { endCloudSession(s); setCloudMenuKey(null); }}>End session</button>}
-                      </div>
-                    )}
+                    </AnchoredMenu>
                   </span>
                   {s.state === 'queued' && s.queuedReason && <span className="box-error">{s.queuedReason}</span>}
                 </li>
@@ -1838,21 +1866,30 @@ export function ProjectControl() {
               const branchingOff = branchOffProjectId === p.id;
               const auto = automationFor(p);
               const isAutomation = projectKindTraits(p.kind).isAutomation;
-              // An automation's runs always show, newest first and without
-              // main (no agent ever runs there); the last few, then the page.
-              const runRows = isAutomation
-                ? [...p.workstreams.filter(ws => ws.name !== 'main')].sort((a, b) => b.name.localeCompare(a.name))
-                : p.workstreams;
-              const shownRows = isAutomation ? runRows.slice(0, 5) : runRows;
-              const showWorkstreams = isAutomation ? runRows.length > 0 : p.workstreams.length > 1;
+              // An automation's runs are folded under it unless the person
+              // unfolds them or one is open: newest first and without main (no
+              // agent ever runs there), the last ten, then the page.
               const activeWs = getActiveWorkstream(p.id);
+              const runRows = isAutomation ? automationRuns(p) : p.workstreams;
+              const runsOpen = isAutomation && runsUnfolded(p.id, unfoldedRuns, activeProjectId === p.id && activeWs ? { projectId: p.id, workstream: activeWs } : null);
+              const shownRows = isAutomation ? (runsOpen ? shownRuns(runRows, ws => activeProjectId === p.id && ws.name === activeWs) : []) : runRows;
+              const showWorkstreams = isAutomation ? shownRows.length > 0 : p.workstreams.length > 1;
               const owner = p.ownerUsername ?? user?.unixUsername ?? '';
               return (
                 <React.Fragment key={p.id}>
                   {renderProjectItem(p)}
                   {isAutomation && (
-                    <li className="project-automation-sub" onClick={() => navigate(`/automations/${encodeURIComponent(p.id)}`)} title="Open the automation">
-                      {auto ? automationSubtitle(auto, auto.timezone) : 'automation'}
+                    <li className="project-automation-sub" onClick={() => navigate(automationHref(p.id))} title="Open the automation">
+                      {runRows.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn-ghost project-runs-toggle"
+                          aria-expanded={runsOpen}
+                          title={runsOpen ? 'Fold the runs' : 'Show the runs'}
+                          onClick={e => { e.stopPropagation(); setUnfoldedRuns(m => new Map(m).set(p.id, !runsOpen)); }}
+                        >{runsOpen ? '▾' : '▸'} {runRows.length} {runRows.length === 1 ? 'run' : 'runs'}</button>
+                      )}
+                      <span className="project-automation-text">{auto ? automationSubtitle(auto, auto.timezone) : 'automation'}</span>
                     </li>
                   )}
                   {branchingOff && (
@@ -1862,18 +1899,39 @@ export function ProjectControl() {
                         onSubmit={e => createWorkstream(e, p.id)}
                         onClick={e => e.stopPropagation()}
                       >
-                        <input
-                          autoFocus
-                          value={newWorkstreamName}
-                          onChange={e => setNewWorkstreamName(e.target.value)}
-                          placeholder="workstream name (also branch)"
-                        />
-                        <button type="submit" title="Branch off" aria-label="Create workstream" data-analytics="workstream-create">+</button>
-                        <button
-                          type="button"
-                          className="btn-tiny"
-                          onClick={() => { setBranchOffProjectId(null); setNewWorkstreamName(''); }}
-                        >×</button>
+                        <label className="branch-off-row branch-off-field">
+                          <span>Workstream name</span>
+                          <input
+                            autoFocus
+                            value={newWorkstreamName}
+                            onChange={e => {
+                              setNewWorkstreamName(e.target.value);
+                              setNewWorkstreamNameEdited(e.target.value !== '');
+                              if (!newWorkstreamBranchEdited) setNewWorkstreamBranch(e.target.value);
+                            }}
+                          />
+                        </label>
+                        <label className="branch-off-row branch-off-field">
+                          <span>Branch name</span>
+                          <input
+                            value={newWorkstreamBranch}
+                            onChange={e => {
+                              setNewWorkstreamBranch(e.target.value);
+                              setNewWorkstreamBranchEdited(e.target.value !== '');
+                              if (!newWorkstreamNameEdited) setNewWorkstreamName(workstreamNameFromBranch(e.target.value));
+                            }}
+                          />
+                        </label>
+                        <div className="branch-off-row branch-off-actions">
+                          <button type="submit" title="Branch off" aria-label="Create workstream" data-analytics="workstream-create">+</button>
+                          <button
+                            type="button"
+                            className="btn-tiny"
+                            title="Cancel"
+                            aria-label="Cancel branch off"
+                            onClick={() => { setBranchOffProjectId(null); resetBranchOffForm(); }}
+                          >×</button>
+                        </div>
                       </form>
                     </li>
                   )}
@@ -1902,9 +1960,9 @@ export function ProjectControl() {
                         <span className={`workstream-status${statusesStale ? ' stale' : ''}`}>
                           {wsHasAgent ? <StatusDot status={wsStatus} /> : '—'}
                           {(() => {
-                            const { ring, pr, reviewer } = reviewRingSession(p.instanceId, wsSession);
+                            const { ring, pr, reviewer, count } = reviewRingSession(p.instanceId, wsSession);
                             return wsHasAgent && ring
-                              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr, reviewer)} />
+                              ? <span className={`review-ring is-${ring}`} title={reviewRingTooltip(ring, pr, reviewer, count)} />
                               : null;
                           })()}
                           {wsHasAgent && prPromptPendingSession(p.instanceId, wsSession) && (
@@ -1945,10 +2003,7 @@ export function ProjectControl() {
                         {wsConfig && (
                           <span
                             className="project-provider-badge workstream-provider-badge"
-                            style={{
-                              borderColor: wsConfig.color.bright.replace(/[\d.]+\)$/, '0.45)'),
-                              background: wsConfig.color.base.replace(/[\d.]+\)$/, '0.16)'),
-                            }}
+                            style={providerBadgeStyle(wsConfig, palette)}
                             title={`runtime: ${wsConfig.displayName}${backendNote(storedWorkstreamBackend(p, ws))}${modelNote(storedWorkstreamModel(p, ws))}`}
                           >
                             {wsConfig.badge}{backendBadge(storedWorkstreamBackend(p, ws))}
@@ -1958,10 +2013,9 @@ export function ProjectControl() {
                           <span className="project-actions" onClick={e => e.stopPropagation()}>
                             <button
                               className="btn-tiny btn-overflow"
-                              onClick={() => setMenuOpenId(menuOpenId === ws.id ? null : ws.id)}
+                              onClick={e => { menus.claim(`ws:${ws.id}`, e.currentTarget); setMenuOpenId(menuOpenId === ws.id && menus.anchorFor(`ws:${ws.id}`) ? null : ws.id); }}
                             >⋮</button>
-                            {menuOpenId === ws.id && (
-                              <div className="project-menu" onMouseLeave={() => setMenuOpenId(null)}>
+                            <AnchoredMenu anchor={menuOpenId === ws.id ? menus.anchorFor(`ws:${ws.id}`) : null} onClose={() => setMenuOpenId(null)}>
                                 {!isAutomation && (
                                   <button onClick={() => { beginRename(ws.id, ws.name); setMenuOpenId(null); }}>
                                     Rename
@@ -1985,17 +2039,16 @@ export function ProjectControl() {
                                 <button className="menu-danger" onClick={() => { if (isAutomation && auto) retireRun(p, ws, auto); else deleteWorkstream(p, ws); setMenuOpenId(null); }}>
                                   {isAutomation ? 'Retire run' : 'Delete'}
                                 </button>
-                              </div>
-                            )}
+                            </AnchoredMenu>
                           </span>
                         )}
                       </li>
                     );
                   })}
-                  {isAutomation && runRows.length > shownRows.length && (
-                    <li className="project-workstream-item project-automation-more" onClick={() => navigate(`/automations/${encodeURIComponent(p.id)}`)}>
+                  {runsOpen && runRows.length > shownRows.length && (
+                    <li className="project-workstream-item project-automation-more" onClick={() => navigate(automationHref(p.id))}>
                       <span className="workstream-marker">↳</span>
-                      <span className="workstream-name usage-dim">all {runRows.length} runs…</span>
+                      <span className="workstream-name usage-dim">Show all {runRows.length} runs</span>
                     </li>
                   )}
                 </React.Fragment>
@@ -2059,6 +2112,9 @@ export function ProjectControl() {
               </React.Fragment>
                   );
                 })}
+                {stopped.boxIds.size > 0 && !selectMode && (
+                  <StoppedBoxesToggle boxCount={stopped.boxIds.size} projectCount={stopped.projectCount} />
+                )}
               </>
             );
           })()}
@@ -2116,7 +2172,7 @@ export function ProjectControl() {
             <ul className="box-list">
               {boxes.map(b => {
                 const display = boxDisplay(b.status);
-                const note = lifecycleNote(b);
+                const note = lifecycleNote(b, undefined, countdownNow);
                 // Same deterministic hue projects use for their "which box" stripe
                 // (b.id is the project's instanceId), so this box is color-matched
                 // to the project rows running on it.
@@ -2166,38 +2222,38 @@ export function ProjectControl() {
                       const image = boxImageBadge(b.imageId, b.imageSource);
                       return image && <span className={`box-kind-badge${image.fallback ? ' box-image-fallback' : ''}`} title={image.title}>{image.label}</span>;
                     })()}
-                    <span className="box-meta">
-                      {display.label ?? `${b._count?.projects ?? 0} proj${cloud.byBox.get(b.id)?.length ? ` · ${cloudCountLabel(cloud.byBox.get(b.id)!.length)}` : ''}`}
+                    <BoxSizeBadge size={b.size} instanceType={b.instanceType} diskGiB={b.diskGiB} />
+                    <span className={`box-meta${resizeBadge(b) ? ' box-resize-badge' : ''}`}>
+                      {resizeBadge(b) ?? display.label ?? `${b._count?.projects ?? 0} proj${cloud.byBox.get(b.id)?.length ? ` · ${cloudCountLabel(cloud.byBox.get(b.id)!.length)}` : ''}`}
                     </span>
-                    <span className="project-actions" onClick={e => e.stopPropagation()}>
+                    {!isQuarantined(b) && <span className="project-actions" onClick={e => e.stopPropagation()}>
                       <button
                         className="btn-tiny btn-overflow"
-                        onClick={() => setBoxMenuOpenId(boxMenuOpenId === b.id ? null : b.id)}
+                        onClick={e => { menus.claim(`box:${b.id}`, e.currentTarget); setBoxMenuOpenId(boxMenuOpenId === b.id && menus.anchorFor(`box:${b.id}`) ? null : b.id); }}
                       >⋮</button>
-                      {boxMenuOpenId === b.id && (
-                        <div className="project-menu" onMouseLeave={() => setBoxMenuOpenId(null)}>
+                      <AnchoredMenu anchor={boxMenuOpenId === b.id ? menus.anchorFor(`box:${b.id}`) : null} onClose={() => setBoxMenuOpenId(null)}>
                           {canStartBox(b) && (
                             <button onClick={() => { startBox(b); setBoxMenuOpenId(null); }}>
                               {b.status === 'hibernated' ? 'Resume box' : 'Start box'}
                             </button>
-                          )}
-                          {canHibernateBox(b) && (
-                            <button
-                              title="Save memory to disk and power off; start resumes where you left off"
-                              onClick={() => { hibernateBox(b); setBoxMenuOpenId(null); }}
-                            >Hibernate box</button>
                           )}
                           {canStopBox(b) && (
                             <button onClick={() => { stopBox(b); setBoxMenuOpenId(null); }}>Stop box</button>
                           )}
                           {offersAutoHibernate(b, autoLifecycleOn) && (
                             <button
-                              title="Hibernate this box on its own after it has been idle for a while"
+                              title="Stop this box on its own after it has been idle for a while"
                               onClick={() => { setLifecycleBox(b); setBoxMenuOpenId(null); }}
                             >Auto-park…</button>
                           )}
                           {boxRenameOn && (
                             <button onClick={() => { beginRename(b.id, b.name); setBoxMenuOpenId(null); }}>Rename…</button>
+                          )}
+                          {offersResize(b) && (
+                            <button
+                              title="Change how many vCPUs and how much memory this box has; it restarts"
+                              onClick={() => { setResizeBox(b); setBoxMenuOpenId(null); }}
+                            >Resize box</button>
                           )}
                           {spacesOn && b.status !== 'terminated' && (
                             <button
@@ -2208,9 +2264,8 @@ export function ProjectControl() {
                           <button className="menu-danger" onClick={() => { terminateBox(b); setBoxMenuOpenId(null); }}>
                             Terminate
                           </button>
-                        </div>
-                      )}
-                    </span>
+                      </AnchoredMenu>
+                    </span>}
                     {repoPickerOn && repoPromptDue({
                       kind: b.kind,
                       dismissedAt: b.repoPromptDismissedAt ?? null,
@@ -2223,10 +2278,16 @@ export function ProjectControl() {
                       </div>
                     )}
                     {showsBoxError(b) && <span className="box-error">{b.provisioningError}</span>}
+                    {isQuarantined(b) && <span className="box-error">{QUARANTINED_BOX_NOTE}</span>}
                     {hibernationAgeNote(b) && <span className="box-error">{hibernationAgeNote(b)}</span>}
                     {note && <span className="box-error box-note" title={note.title}>{note.text}</span>}
+                    {note?.keepRunning && (
+                      <button type="button" className="box-keep-running" title="You're using it: restart its idle clock" onClick={() => void keepBoxRunning(b)}>
+                        Keep running
+                      </button>
+                    )}
                     {b.rehibernatePending && b.status !== 'hibernated' && (
-                      <span className="box-error">Resumed to restart the 60-day hibernation limit; hibernates again once ready.</span>
+                      <span className="box-error">Resumed to restart the 60-day hibernation limit; stops again once ready.</span>
                     )}
                   </li>
                 );
@@ -2376,11 +2437,16 @@ export function ProjectControl() {
           onBranchOff={projectId => {
             setShowNewProject(false);
             setBranchOffProjectId(projectId);
+            resetBranchOffForm();
           }}
         />
       )}
       {lifecycleBox && createPortal(
         <BoxLifecycleDialog box={lifecycleBox} onClose={() => setLifecycleBox(null)} onSaved={() => { void reloadBoxes(); }} />,
+        document.body,
+      )}
+      {resizeBox && createPortal(
+        <BoxResizeDialog box={resizeBox} onClose={() => setResizeBox(null)} onChanged={() => { void reloadBoxes(); }} />,
         document.body,
       )}
       {openSpace && createPortal(

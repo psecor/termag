@@ -8,26 +8,30 @@ import type { PaneSearchHit } from '../services/api';
 export type WorkspacePane = 'agent' | 'ctrl' | 'review';
 
 export type WorkspaceTarget =
-  | { kind: 'pane'; projectId: string; workstream: string; pane: WorkspacePane }
+  /** `session`: which review pane, when the pane is a review; absent, the first. */
+  | { kind: 'pane'; projectId: string; workstream: string; pane: WorkspacePane; session?: string }
   /** A Claude Code cloud session: no pane here, its page on claude.ai. */
   | { kind: 'external'; url: string }
   | { kind: 'none' };
 
-/** A session row: its workstream, with the review dock open when the row is about its review. */
-export function rowTarget(row: Pick<InboxRow, 'kind' | 'url' | 'projectId' | 'workstream' | 'status' | 'ring'>): WorkspaceTarget {
+/** A session row: its workstream, with the review dock open when the row is about its review (the pane that rings). */
+export function rowTarget(row: Pick<InboxRow, 'kind' | 'url' | 'projectId' | 'workstream' | 'status' | 'ring'> & { review?: InboxRow['review'] }): WorkspaceTarget {
   if (row.kind === 'cloud') return row.url ? { kind: 'external', url: row.url } : { kind: 'none' };
-  return { kind: 'pane', projectId: row.projectId, workstream: row.workstream || 'main', pane: opensReview(row) ? 'review' : 'agent' };
+  const workstream = row.workstream || 'main';
+  if (!opensReview(row)) return { kind: 'pane', projectId: row.projectId, workstream, pane: 'agent' };
+  return { kind: 'pane', projectId: row.projectId, workstream, pane: 'review', ...(row.review?.session ? { session: row.review.session } : {}) };
 }
 
-/** A pane-text hit: its workstream and the pane the text was in (a data pane opens the agent). */
-export function hitTarget(hit: Pick<PaneSearchHit, 'projectId' | 'workstream' | 'role'>): WorkspaceTarget {
+/** A pane-text hit: its workstream and the pane the text was in (a data pane opens the agent; a review hit, its own pane). */
+export function hitTarget(hit: Pick<PaneSearchHit, 'projectId' | 'workstream' | 'role'> & { session?: string }): WorkspaceTarget {
   const pane: WorkspacePane = hit.role === 'ctrl' || hit.role === 'review' ? hit.role : 'agent';
-  return { kind: 'pane', projectId: hit.projectId, workstream: hit.workstream || 'main', pane };
+  return { kind: 'pane', projectId: hit.projectId, workstream: hit.workstream || 'main', pane, ...(pane === 'review' && hit.session ? { session: hit.session } : {}) };
 }
 
 /** Fired after a switch so MainLayout can focus the pane (or open the review dock). */
 export const FOCUS_PANE_EVENT = 'termag:focus-pane';
-export interface FocusPaneDetail { projectId: string; workstream: string; pane: WorkspacePane }
+/** `session`: which review pane to open; absent, the first. */
+export interface FocusPaneDetail { projectId: string; workstream: string; pane: WorkspacePane; session?: string }
 
 /**
  * The palette shortcut: ⌘K (Meta+K on any platform) or Ctrl+Shift+K. Plain

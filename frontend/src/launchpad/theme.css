@@ -1,0 +1,160 @@
+/* LaunchPad (@launchpad-ui/components) in termag's colours and fonts: the one map.
+ *
+ * LaunchPad's components read --lp-color-* tokens; here they are termag's
+ * colours (never @launchpad-ui/tokens/themes.css: a person's theme must
+ * apply; docs/agents/gotchas.md, LaunchPad). Put .lp-theme on the element a
+ * LaunchPad surface sits in, and on each of its popovers, menus and tooltips:
+ * they render at the end of the body, outside it. `LP_THEME` in
+ * launchpad/theme.ts is the class name. launchpad/theme.test.ts checks this
+ * map against the installed components' stylesheet. */
+.lp-theme {
+  --lp-color-text-ui-primary-base: var(--text-primary);
+  --lp-color-text-ui-secondary: var(--text-secondary);
+  --lp-color-text-field-placeholder: var(--text-muted);
+  --lp-color-text-field-disabled: var(--text-muted);
+  --lp-color-text-interactive-base: var(--text-primary);
+  --lp-color-text-interactive-active: var(--text-primary);
+  --lp-color-text-interactive-disabled: var(--text-muted);
+  --lp-color-text-interactive-selected: var(--text-primary);
+  --lp-color-text-interactive-destructive: var(--text-on-fill);
+  --lp-color-text-interactive-primary-base: var(--text-on-fill);
+  --lp-color-text-interactive-primary-hover: var(--text-on-fill);
+  --lp-color-text-interactive-primary-focus: var(--text-on-fill);
+  --lp-color-text-interactive-primary-active: var(--text-on-fill);
+  --lp-color-text-feedback-error: var(--danger);
+  --lp-color-text-feedback-success: var(--success);
+  --lp-color-text-feedback-warning: var(--warning);
+  --lp-color-text-feedback-info: var(--accent);
+  --lp-color-text-code-string: var(--code-string);
+  --lp-color-text-product-beta: var(--accent);
+  --lp-color-text-product-federal: var(--text-secondary);
+
+  --lp-color-bg-ui-primary: var(--bg-surface);
+  --lp-color-bg-ui-secondary: var(--bg-elevated);
+  --lp-color-bg-ui-tertiary: var(--bg-active);
+  --lp-color-bg-field-base: var(--bg-base);
+  --lp-color-bg-field-disabled: var(--bg-surface);
+  --lp-color-bg-overlay-primary: var(--bg-elevated);
+  --lp-color-bg-overlay-secondary: var(--bg-elevated);
+  --lp-color-bg-interactive-primary-base: var(--accent-dim);
+  --lp-color-bg-interactive-primary-hover: color-mix(in srgb, var(--accent-dim) 82%, var(--text-on-fill));
+  --lp-color-bg-interactive-primary-focus: var(--accent-dim);
+  --lp-color-bg-interactive-primary-active: color-mix(in srgb, var(--accent-dim) 70%, var(--text-on-fill));
+  --lp-color-bg-interactive-secondary-base: var(--bg-elevated);
+  --lp-color-bg-interactive-secondary-hover: var(--bg-active);
+  --lp-color-bg-interactive-secondary-focus: var(--bg-elevated);
+  --lp-color-bg-interactive-secondary-active: var(--bg-active);
+  --lp-color-bg-interactive-tertiary-base: transparent;
+  --lp-color-bg-interactive-tertiary-hover: var(--bg-active);
+  --lp-color-bg-interactive-tertiary-focus: transparent;
+  --lp-color-bg-interactive-tertiary-active: var(--bg-active);
+  --lp-color-bg-interactive-selected: var(--accent-dim);
+  --lp-color-bg-interactive-destructive-base: var(--danger);
+  --lp-color-bg-interactive-destructive-hover: color-mix(in srgb, var(--danger) 85%, var(--text-primary));
+  --lp-color-bg-interactive-destructive-focus: var(--danger);
+  --lp-color-bg-interactive-destructive-active: color-mix(in srgb, var(--danger) 75%, var(--text-primary));
+  --lp-color-bg-feedback-success: color-mix(in srgb, var(--success) 14%, var(--bg-surface));
+  --lp-color-bg-feedback-error: color-mix(in srgb, var(--danger) 14%, var(--bg-surface));
+  --lp-color-bg-feedback-warning: color-mix(in srgb, var(--warning) 14%, var(--bg-surface));
+  --lp-color-bg-feedback-info: color-mix(in srgb, var(--accent) 12%, var(--bg-surface));
+  --lp-color-bg-product-beta: color-mix(in srgb, var(--accent) 14%, transparent);
+  --lp-color-bg-product-federal: var(--bg-active);
+
+  --lp-color-border-ui-primary: var(--border);
+  --lp-color-border-ui-secondary: var(--border);
+  --lp-color-border-field-base: var(--border);
+  --lp-color-border-field-error: var(--danger);
+  --lp-color-border-interactive-secondary-base: var(--border);
+  --lp-color-border-interactive-primary-base: var(--accent-dim);
+  --lp-color-border-interactive-selected: var(--accent);
+  --lp-color-border-interactive-focus: var(--accent);
+  --lp-color-border-interactive-disabled: var(--border);
+
+  --lp-color-fill-ui-primary: var(--text-primary);
+  --lp-color-fill-ui-secondary: var(--text-secondary);
+  --lp-color-fill-interactive-primary: var(--accent);
+  --lp-color-fill-feedback-success: var(--success);
+  --lp-color-fill-feedback-error: var(--danger);
+  --lp-color-fill-feedback-warning: var(--warning);
+  --lp-color-fill-feedback-info: var(--accent);
+
+  /* lightningcss's light/dark switch. Popover's and Modal's border and
+     box-shadow read var(--lightningcss-light, …) var(--lightningcss-dark, …);
+     the pair is set on :root in the page base launchpadCss.ts drops, and with
+     neither defined both fallbacks apply and the declarations are invalid, so
+     no border or shadow is drawn. termag is dark: LaunchPad's dark values win,
+     as its [data-theme=dark] rule sets them. */
+  --lightningcss-light: ;
+  --lightningcss-dark: initial;
+
+  --lp-color-shadow-interactive-focus: var(--accent);
+  --lp-color-shadow-interactive-primary: transparent;
+  --lp-color-shadow-ui-primary: rgba(0, 0, 0, 0.25);
+  --lp-color-shadow-ui-secondary: rgba(0, 0, 0, 0.18);
+  --lp-color-white-950: var(--text-primary);
+  --lp-color-white-100: var(--bg-active);
+  --lp-color-white-0: var(--bg-elevated);
+  --lp-color-black-500: rgba(0, 0, 0, 0.5);
+  /* The few palette colours components use directly: the Switch's on track,
+     ProgressBar's and Meter's fill (--fill-color), the initials avatars. */
+  --lp-color-green-500: var(--success);
+  --lp-color-green-600: var(--success);
+  --lp-color-brand-cyan-base: var(--accent);
+  --lp-color-blue-600: var(--accent-dim);
+  --lp-color-brand-lime-dark: color-mix(in srgb, var(--success) 70%, var(--bg-base));
+  --lp-color-brand-pink-base: color-mix(in srgb, var(--danger) 70%, var(--bg-base));
+  --lp-color-purple-600: color-mix(in srgb, var(--accent) 50%, var(--danger));
+  /* Alert's own variables, which LaunchPad sets on :root (dropped with its page base). */
+  --alert-color-bg-neutral: var(--bg-surface);
+  --alert-color-border-neutral: var(--border);
+  --alert-color-bg-info: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+  --alert-color-border-info: color-mix(in srgb, var(--accent) 45%, var(--border));
+  --alert-color-bg-success: color-mix(in srgb, var(--success) 10%, var(--bg-surface));
+  --alert-color-border-success: color-mix(in srgb, var(--success) 45%, var(--border));
+  --alert-color-bg-warning: color-mix(in srgb, var(--warning) 10%, var(--bg-surface));
+  --alert-color-border-warning: color-mix(in srgb, var(--warning) 45%, var(--border));
+  --alert-color-bg-error: color-mix(in srgb, var(--danger) 10%, var(--bg-surface));
+  --alert-color-border-error: color-mix(in srgb, var(--danger) 45%, var(--border));
+  /* The spinner's ring, which LaunchPad colours with a palette grey. */
+  --lp-color-gray-500: var(--text-muted);
+  /* A Tooltip's <kbd>, which LaunchPad draws in palette greys. */
+  --lp-color-gray-100: var(--text-primary);
+  --lp-color-gray-700: var(--border);
+  --lp-color-gray-900: var(--bg-base);
+
+  /* Fonts: termag's UI font, and monospace only for code. LaunchPad's text
+     tokens are set on :root by @launchpad-ui/tokens/index.css, where
+     var(--lp-font-family-base) has already been replaced by Inter, so each one
+     the components read is declared again here, where the family is termag's.
+     Same values as the tokens package; the test holds them to it. */
+  --lp-font-family-base: var(--font-ui);
+  --lp-font-family-monospace: var(--font-mono);
+  --lp-text-body-1-regular: var(--lp-font-weight-regular) var(--lp-font-size-300)/var(--lp-line-height-300) var(--lp-font-family-base);
+  --lp-text-body-1-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-300)/var(--lp-line-height-300) var(--lp-font-family-base);
+  --lp-text-body-2-regular: var(--lp-font-weight-regular) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-base);
+  --lp-text-body-2-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-base);
+  --lp-text-code-1-regular: var(--lp-font-weight-regular) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-monospace);
+  --lp-text-heading-1-medium: var(--lp-font-weight-medium) var(--lp-font-size-400)/var(--lp-line-height-400) var(--lp-font-family-base);
+  --lp-text-heading-1-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-400)/var(--lp-line-height-400) var(--lp-font-family-base);
+  --lp-text-heading-2-medium: var(--lp-font-weight-medium) var(--lp-font-size-300)/var(--lp-line-height-300) var(--lp-font-family-base);
+  --lp-text-heading-2-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-300)/var(--lp-line-height-300) var(--lp-font-family-base);
+  --lp-text-label-1-medium: var(--lp-font-weight-medium) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-base);
+  --lp-text-label-1-regular: var(--lp-font-weight-regular) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-base);
+  --lp-text-label-1-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-200)/var(--lp-line-height-200) var(--lp-font-family-base);
+  --lp-text-label-2-medium: var(--lp-font-weight-medium) var(--lp-font-size-100)/var(--lp-line-height-100) var(--lp-font-family-base);
+  --lp-text-label-2-regular: var(--lp-font-weight-regular) var(--lp-font-size-100)/var(--lp-line-height-100) var(--lp-font-family-base);
+  --lp-text-label-2-semibold: var(--lp-font-weight-semibold) var(--lp-font-size-100)/var(--lp-line-height-100) var(--lp-font-family-base);
+  --lp-text-small-1-regular: var(--lp-font-weight-regular) var(--lp-font-size-100)/var(--lp-line-height-100) var(--lp-font-family-base);
+
+  font-family: var(--font-ui);
+  color: var(--text-primary);
+}
+
+/* LaunchPad's spinner turns once every 350ms (--lp-duration-350), which reads
+   as alarm beside a conversation. Once a second is calm, and reduced motion
+   slows it further. Proposed upstream: a duration token for it, and a
+   reduced-motion rule. */
+.lp-theme [role="progressbar"] svg[class*="_indeterminate"] { animation-duration: 1s; }
+@media (prefers-reduced-motion: reduce) {
+  .lp-theme [role="progressbar"] svg[class*="_indeterminate"] { animation-duration: 2.4s; }
+}

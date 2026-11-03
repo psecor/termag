@@ -84,3 +84,18 @@ describe('a project waiting on a new box', () => {
       .toBe('clone failed');
   });
 });
+
+// backend services/claimUpdate.ts: a box just claimed from the pool updates before its first launch.
+describe('a project on a box updating after its claim', () => {
+  it('holds the terminal, says so, and opens once the update is over', () => {
+    for (const status of ['pending', 'none', null]) {
+      expect(cloneTile(status, { boxUpdating: true })).toMatchObject({ phase: 'waiting', label: 'updating the box…', holdTerminal: true, retry: false });
+    }
+    expect(cloneTile('none', { boxUpdating: false }).holdTerminal).toBe(false);
+    const now = new Date().toISOString();
+    expect(setupContext({ instanceId: 'b1', repoUrl: null, role: 'owner' } as never, [{ id: 'b1', status: 'ready', claimUpdateStatus: 'updating', claimUpdateStartedAt: now }], false).boxUpdating).toBe(true);
+    // Bugbot on #1118: one left `updating` past the bound (its orchestrator stopped) holds nothing.
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    expect(setupContext({ instanceId: 'b1', repoUrl: null, role: 'owner' } as never, [{ id: 'b1', status: 'ready', claimUpdateStatus: 'updating', claimUpdateStartedAt: old }], false).boxUpdating).toBe(false);
+  });
+});

@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
-  agentUp, bootEstimateMinutes, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, newChatNames, orchestratorOption, preLaunchTail,
-  readLastStart, readQueued, releaseQueued, setupComplete, setupSteps, showSetup, startBlocker, uniqueName, writeLastStart, writeQueued,
+  queueKey, sessionWords, worktreeName, worktreeTargets,
+  agentUp, bootEstimateMinutes, boxComingUp, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, newChatNames, orchestratorOption, preLaunchTail,
+  readLastPick, readLastStart, readQueued, releaseQueued, rememberStartPick, setupComplete, setupSteps, showSetup, startBlocker, uniqueName, writeLastPick, writeLastStart, writeQueued,
   type SetupInput,
 } from './newChat';
 
@@ -59,6 +60,24 @@ describe('setupSteps', () => {
       { id: 'agent', state: 'pending', text: 'Starting Claude' },
     ]);
     expect(setupSteps({ ...base, etaMinutes: null })[0].text).toBe('Launching box web · usually a few minutes');
+  });
+
+  // backend services/claimUpdate.ts: a stale pool box runs current main before its first launch.
+  it('says the claimed box is updating, and holds the clone and Claude until it is done', () => {
+    const updating = { ...base, box: { ...base.box!, status: 'ready' as const, claimedAt: '2026-10-15T10:00:00Z', claimUpdateStatus: 'updating', claimUpdateStartedAt: new Date(Date.now() - 5_000).toISOString() } };
+    expect(setupSteps(updating).map(s => [s.state, s.text])).toEqual([
+      ['active', 'Claimed a ready box, web · Updating the box…'],
+      ['pending', 'Clone acme/web'],
+      ['pending', 'Starting Claude'],
+    ]);
+    // However it ended, the launch goes ahead.
+    for (const claimUpdateStatus of ['updated', 'current', 'failed', 'timed-out']) {
+      expect(setupSteps({ ...updating, box: { ...updating.box, claimUpdateStatus } })[0]).toEqual({ id: 'box', state: 'done', text: 'Claimed a ready box, web' });
+    }
+    // Bugbot on #1118: a row left `updating` by an orchestrator that stopped mid-update holds nothing past the bound.
+    const stale = { ...updating.box, claimUpdateStartedAt: new Date(Date.now() - 10 * 60_000).toISOString() };
+    expect(setupSteps({ ...updating, box: stale })[0].state).toBe('done');
+    expect(setupSteps({ ...updating, box: { ...updating.box, claimUpdateStartedAt: null } })[0].state).toBe('done');
   });
 
   it('says a warm box was claimed, then follows the clone', () => {
@@ -248,8 +267,8 @@ describe('startBlocker', () => {
   });
 
   it('says the first thing in the way', () => {
-    expect(startBlocker({ ...ok, hasRepo: false })).toMatch(/repository URL/);
-    expect(startBlocker({ ...ok, name: '' })).toBe('Give the session a name under Options');
+    expect(startBlocker({ ...ok, hasRepo: false })).toMatch(/Choose a repository/);
+    expect(startBlocker({ ...ok, name: '' })).toBe('Give the session a name in the box settings');
     expect(startBlocker({ ...ok, nameError: 'Letters, digits, - and _ only' })).toBe('Session name: Letters, digits, - and _ only');
     expect(startBlocker({ ...ok, spacesReady: false })).toMatch(/spaces/);
     expect(startBlocker({ ...ok, spaceError: 'Name the new space' })).toBe('Name the new space');
@@ -262,35 +281,69 @@ describe('startBlocker', () => {
   });
 });
 
+describe('readLastPick / writeLastPick', () => {
+  function memStore() {
+    const m = new Map<string, string>();
+    return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); }, removeItem: (k: string) => { m.delete(k); } };
+  }
+
+  it('keeps the model and effort as they are picked, each on its own', () => {
+    const store = memStore();
+    expect(readLastPick(store)).toEqual({ model: null, effort: null });
+    writeLastPick(store, { model: 'sonnet' });
+    writeLastPick(store, { effort: 'max' });
+    expect(readLastPick(store)).toEqual({ model: 'sonnet', effort: 'max' });
+    writeLastPick(store, { model: 'opus' });
+    expect(readLastPick(store)).toEqual({ model: 'opus', effort: 'max' });
+  });
+
+  it('reads garbage, an unknown model or an unknown effort as not picked', () => {
+    const store = memStore();
+    store.setItem('termag-chat-last-pick', '{not json');
+    expect(readLastPick(store)).toEqual({ model: null, effort: null });
+    store.setItem('termag-chat-last-pick', JSON.stringify({ model: 'opus-3', effort: 'eleven' }));
+    expect(readLastPick(store)).toEqual({ model: null, effort: null });
+    expect(readLastPick(null)).toEqual({ model: null, effort: null });
+  });
+});
+
 describe('readLastStart / writeLastStart', () => {
   function memStore() {
     const m = new Map<string, string>();
     return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); }, removeItem: (k: string) => { m.delete(k); } };
   }
-  const none = { pick: null, space: null, model: 'sonnet' };
+  const none = { pick: null, space: null, model: 'sonnet', effort: 'default' };
 
   it('remembers a listed or pasted repository, the space and the model', () => {
     const store = memStore();
     expect(readLastStart(store)).toEqual(none);
     writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'opus' });
-    expect(readLastStart(store)).toEqual({ pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'opus' });
+    expect(readLastStart(store)).toEqual({ pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'opus', effort: 'default' });
     writeLastStart(store, { pick: { kind: 'pasted', url: 'https://github.com/acme/api' }, space: null, model: 'haiku' });
-    expect(readLastStart(store)).toEqual({ pick: { kind: 'pasted', url: 'https://github.com/acme/api' }, space: null, model: 'haiku' });
+    expect(readLastStart(store)).toEqual({ pick: { kind: 'pasted', url: 'https://github.com/acme/api' }, space: null, model: 'haiku', effort: 'default' });
+  });
+
+  it('remembers the effort beside the model, and reads an unknown one as Default', () => {
+    const store = memStore();
+    writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: null, model: 'opus', effort: 'max' });
+    expect(readLastStart(store).effort).toBe('max');
+    store.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: null, model: 'opus', effort: 'eleven' }));
+    expect(readLastStart(store).effort).toBe('default');
   });
 
   it('forgets the repository for a pick it cannot keep', () => {
     const store = memStore();
     writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'sonnet' });
     writeLastStart(store, { pick: { kind: 'empty' }, space: 'notes', model: 'sonnet' });
-    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet', effort: 'default' });
   });
 
   it('reads a model no longer offered, including the retired Auto, as Sonnet', () => {
     const store = memStore();
     store.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: 'notes', model: 'opus-3' }));
-    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet', effort: 'default' });
     store.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: 'notes', model: 'auto' }));
-    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet' });
+    expect(readLastStart(store)).toEqual({ pick: null, space: 'notes', model: 'sonnet', effort: 'default' });
   });
 
   it('reads garbage, or no storage, as nothing remembered', () => {
@@ -310,5 +363,78 @@ describe('orchestratorOption', () => {
     expect(orchestratorOption({ providerHasSkill: true, scheduled: true, trusted: true })).toBe('hidden');
     expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: false })).toBe('needs-trust');
     expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: true })).toBe('available');
+  });
+});
+
+describe('rememberStartPick', () => {
+  it('keeps a picked repository or space before any session starts, changing only what it is given', () => {
+    const m = new Map<string, string>();
+    const store = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => { m.set(k, v); }, removeItem: (k: string) => { m.delete(k); } };
+    writeLastStart(store, { pick: { kind: 'listed', fullName: 'acme/web', defaultBranch: 'main' }, space: 'notes', model: 'sonnet' });
+    rememberStartPick(store, { pick: { kind: 'listed', fullName: 'acme/api', defaultBranch: 'trunk' } });
+    expect(readLastStart(store)).toMatchObject({ pick: { kind: 'listed', fullName: 'acme/api', defaultBranch: 'trunk' }, space: 'notes', model: 'sonnet' });
+    rememberStartPick(store, { space: null });
+    expect(readLastStart(store).space).toBeNull();
+    rememberStartPick(store, { pick: { kind: 'empty' } });
+    expect(readLastStart(store).pick).toEqual({ kind: 'listed', fullName: 'acme/api', defaultBranch: 'trunk' });
+    m.clear();
+    rememberStartPick(store, { space: 'team' });
+    expect(readLastStart(store)).toMatchObject({ pick: null, space: 'team', model: 'sonnet' });
+  });
+});
+
+describe('boxComingUp', () => {
+  it('is a box still launching or starting, not one that is up, parked or unknown', () => {
+    for (const s of ['provisioning', 'awaiting-agent', 'warming', 'warm', 'starting']) expect(boxComingUp(s)).toBe(true);
+    for (const s of ['ready', 'stopped', 'hibernated', 'failed', null, undefined]) expect(boxComingUp(s)).toBe(false);
+  });
+});
+
+describe('worktree sessions', () => {
+  const project = (over: Record<string, unknown>) => ({
+    id: 'p1', name: 'webapp', archived: false, instanceId: 'b1', kind: 'normal', role: 'owner',
+    repoUrl: 'https://github.com/example-org/webapp.git',
+    workstreams: [{ id: 'w1', name: 'main' }],
+    workflows: [{ id: 'f1', type: 'agent', provider: 'claude-chat', workstreamId: 'w1' }],
+    ...over,
+  }) as never;
+  const webapp = { kind: 'listed', fullName: 'example-org/webapp', defaultBranch: 'main' } as const;
+
+  it('branches off only your own chat projects with the repository on the chosen box', () => {
+    const mine = project({});
+    const all = [
+      mine,
+      project({ id: 'p2', instanceId: 'b2' }),
+      project({ id: 'p3', role: 'collaborator' }),
+      project({ id: 'p4', kind: 'automation' }),
+      project({ id: 'p5', archived: true }),
+      project({ id: 'p6', repoUrl: 'https://github.com/acme/web.git' }),
+      project({ id: 'p7', workflows: [{ id: 'f7', type: 'agent', provider: 'claude', workstreamId: 'w1' }] }),
+    ];
+    expect(worktreeTargets(webapp, all, 'b1').map((p: { id: string }) => p.id)).toEqual(['p1']);
+    expect(worktreeTargets(webapp, all, null)).toEqual([]);
+    expect(worktreeTargets({ kind: 'empty' }, all, 'b1')).toEqual([]);
+  });
+
+  it('names the workstream as the backend takes it, unique in the project', () => {
+    expect(worktreeName('Fix the Login!', [])).toBe('fix-the-login');
+    expect(worktreeName('fix-the-login', ['main', 'fix-the-login', 'fix-the-login-2'])).toBe('fix-the-login-3');
+    expect(worktreeName('main', ['main'])).toBe('main-2');
+    // Never the automation scheduler's run-<date>-<time> shape, which the backend refuses (isRunName).
+    expect(worktreeName('run 20261028 0930', [])).toBe('run-20261028-0930-session');
+    expect(worktreeName('run-20261028-0930-2', [])).toBe('run-20261028-0930-2-session');
+    expect(worktreeName('run 20261028', [])).toBe('run-20261028');
+    // A workstream in another case takes the name too: one directory on a case-insensitive disk.
+    expect(worktreeName('fix-login', ['Fix-Login'])).toBe('fix-login-2');
+    expect(worktreeName('Main', [])).toBe('main-2');
+    expect(worktreeName('!!!', [])).toBe('session');
+    expect(worktreeName('x'.repeat(80), []).length).toBeLessThanOrEqual(40);
+    expect(sessionWords('Fix the flag toggle on Safari please')).toBe('fix-the-flag-toggle-on');
+    expect(sessionWords('   ')).toBe('');
+  });
+
+  it('keys the first message by project for main, project@workstream for a worktree', () => {
+    expect(queueKey('p1', 'main')).toBe('p1');
+    expect(queueKey('p1', 'fix-the-login')).toBe('p1@fix-the-login');
   });
 });

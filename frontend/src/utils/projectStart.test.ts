@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, pickDefaultBox, unusableBoxAdvice } from './projectStart';
+import { archivedNameClash, boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, pickDefaultBox, unusableBoxAdvice } from './projectStart';
 
 describe('pickDefaultBox', () => {
   it('prefers ready, then in-flight, never parked', () => {
@@ -51,5 +51,20 @@ describe('isBoxFailedRefusal', () => {
     expect(isBoxFailedRefusal({ response: { data: { code: 'box-failed', error: 'The box failed to launch' } } })).toBe(true);
     expect(isBoxFailedRefusal({ response: { data: { error: 'Box agent is not connected' } } })).toBe(false);
     expect(isBoxFailedRefusal(new Error('network'))).toBe(false);
+  });
+});
+
+describe('archivedNameClash', () => {
+  const archived = { id: 'p-old', name: 'webapp', archivedAt: '2026-10-21T04:39:59.296Z', repoUrl: null, workstreams: 3 };
+
+  it('reads the archived project off the refusal', () => {
+    expect(archivedNameClash({ response: { data: { code: 'archived-name-taken', archived } } }))
+      .toEqual({ id: 'p-old', name: 'webapp', archivedAt: '2026-10-21T04:39:59.296Z', workstreams: 3 });
+  });
+
+  it('is null for any other failure', () => {
+    expect(archivedNameClash({ response: { data: { error: 'Project name already exists' } } })).toBeNull();
+    expect(archivedNameClash({ response: { data: { code: 'box-failed', archived } } })).toBeNull();
+    expect(archivedNameClash(new Error('network'))).toBeNull();
   });
 });

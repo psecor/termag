@@ -32,8 +32,13 @@ export const FAILED_AFTER_ATTEMPTS = 5;
  */
 export const STARTING_POLL_MS = 10_000;
 
-export type BoxParkedStatus = 'stopping' | 'stopped' | 'starting' | 'hibernating' | 'hibernated';
-const BOX_PARKED_STATUSES: readonly string[] = ['stopping', 'stopped', 'starting', 'hibernating', 'hibernated'];
+export type BoxParkedStatus = 'stopping' | 'stopped' | 'starting' | 'hibernating' | 'hibernated' | 'quarantined';
+const BOX_PARKED_STATUSES: readonly string[] = ['stopping', 'stopped', 'starting', 'hibernating', 'hibernated', 'quarantined'];
+
+/** A quarantined box never starts again, so its pane offers no wait and no Check now. */
+export function parkedForGood(status: BoxParkedStatus): boolean {
+  return status === 'quarantined';
+}
 
 export interface BoxParkedNotice {
   instanceId: string;
@@ -138,11 +143,12 @@ export function step(s: PaneLoop, e: PaneEvent): { loop: PaneLoop; fx: PaneEffec
 
     case 'box-status':
       if (!s.parked) {
-        // The backend doesn't close a pane's socket when its box's agent goes
-        // away, so a pane left open across a stop sits on a dead socket.
-        // Dialling again swaps it for the parked notice.
+        // The box going down usually shows up here first. The backend ends a
+        // pane's socket only once the box agent's own socket drops, and a
+        // hibernating box's goes quiet until the heartbeat gives up on it.
+        // Dialling again now swaps the pane for the parked notice.
         const goingDown = e.status === 'stopping' || e.status === 'stopped'
-          || e.status === 'hibernating' || e.status === 'hibernated';
+          || e.status === 'hibernating' || e.status === 'hibernated' || e.status === 'quarantined';
         return { loop: s, fx: e.ownBox && goingDown ? { dialNow: true } : {} };
       }
       if (s.parked.instanceId !== e.instanceId || s.parked.status === e.status) {

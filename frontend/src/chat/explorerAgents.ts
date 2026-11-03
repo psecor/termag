@@ -6,15 +6,46 @@
 /** One agent started by another: the child session and the session that started it. */
 export interface SpawnLink { projectId: string; workstream: string; parentProjectId: string; parentWorkstream: string }
 
-export interface AgentRowLike { projectId: string; workstream: string; projectName: string; instanceId: string | null }
+export interface AgentRowLike {
+  projectId: string; workstream: string; projectName: string; instanceId: string | null;
+  /** An ask thread's chat: the thread's title and id (mobile/inbox.ts InboxRow). */
+  askTitle?: string | null; askThreadId?: string | null;
+}
 
 export interface AgentNode<R> { row: R; children: Array<AgentNode<R>> }
 
 
 const keyOf = (r: { projectId: string; workstream: string }) => `${r.projectId}|${r.workstream}`;
 
-export function agentLabel(r: Pick<AgentRowLike, 'projectName' | 'workstream'>): string {
-  return r.workstream === 'main' ? r.projectName : `${r.projectName} · ${r.workstream}`;
+type Named = Pick<AgentRowLike, 'workstream' | 'askTitle' | 'askThreadId'>;
+
+/**
+ * What a workstream is called on screen: an ask thread's title in place of
+ * its `ask-<thread>` name, which stays the workstream's real name (tmux
+ * sessions, routes and status are keyed on it), else the name: an untitled
+ * ask shows as `ask-<thread id>`.
+ */
+export function workstreamLabel(r: Named): string {
+  return r.askTitle?.trim() || r.workstream;
+}
+
+/** The tooltip for a workstream's label: an ask thread's id and workstream, which its title hides; else null. */
+export function workstreamTip(r: Named & { projectName?: string }): string | null {
+  if (!r.askThreadId) return null;
+  const where = r.projectName ? `${r.projectName} · ${r.workstream}` : r.workstream;
+  return r.askTitle?.trim() ? `ask thread ${r.askThreadId} (${where})` : `ask thread ${r.askThreadId}`;
+}
+
+/**
+ * A session's name in a list: the project, with the workstream when it is not
+ * main. An ask thread is called by its title alone, else by its thread id
+ * (ask-<thread id>, the workstream's name): callers name their threads and
+ * nothing is derived. The project and box it runs in are the ask's plumbing
+ * (both in the tooltip), and in the tree it sits under the session that sent it.
+ */
+export function agentLabel(r: Pick<AgentRowLike, 'projectName'> & Named): string {
+  if (r.askThreadId) return workstreamLabel(r);
+  return r.workstream === 'main' ? r.projectName : `${r.projectName} · ${workstreamLabel(r)}`;
 }
 
 const byLabel = <R extends AgentRowLike>(a: R, b: R) => agentLabel(a).localeCompare(agentLabel(b));

@@ -1,13 +1,14 @@
 // One session as a chat: the agent pane captured and
 // parsed into turns, a key bar for the things a CLI wants pressed, and a
 // native composer that types into the pane through send-keys.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
 import { activityApi, projectsApi, reviewApi, sessionsApi, visitsApi, workstreamsApi } from '../../services/api';
 import { PROVIDERS } from '../../providers/registry';
 import { sessionName } from '../../utils/sessionName';
+import { workstreamNameFromBranch } from '../../utils/workstreamChoices';
 import { statusKey } from '../../utils/statusKey';
 import { contextLevel } from '../../utils/thresholds';
 import { Block, parsePane } from '../../chat/paneChat';
@@ -17,6 +18,7 @@ import { useFollowBottom } from '../../chat/useFollowBottom';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { paneKey, useCapture } from '../../chat/useCapture';
 import { providerFor, STATUS_GLYPH, waitingLabel } from '../../mobile/inbox';
+import { initialPaneHistory, loadEarlierDone, loadEarlierFail, loadEarlierStart, PaneHistoryState } from '../../mobile/paneHistory';
 import { useReview } from '../../mobile/useReview';
 import { PaneRole, reviewKeyLabel, reviewPollStatus, reviewStopCopy, reviewTabLabel, roleFromParam } from '../../mobile/review';
 import { reviewStateLabel, reviewStateText } from '../../utils/review';
@@ -34,6 +36,8 @@ import { photoToPng } from '../../mobile/photo';
 import { shareText } from '../../mobile/shareOut';
 import { useWakeLock, wakeLockSupported } from '../../mobile/useWakeLock';
 import { reloadApp } from '../../mobile/useMobileRefresh';
+import { useStartParkedBoxOnOpen } from '../../hooks/useStartParkedBoxOnOpen';
+import { recordTypedChatCommand } from '../../usageEvents';
 
 // Remembered across conversations in this tab so visits carry a previous id,
 // like the desktop's project switcher does.
@@ -49,6 +53,7 @@ export function Conversation() {
   const ws = params.get('ws') || 'main';
   const role: PaneRole = roleFromParam(params.get('role'));
   const project = projects.find(p => p.id === projectId);
+  useStartParkedBoxOnOpen(project, ws);
   const owner = project?.ownerUsername ?? user?.unixUsername ?? '';
   const workstream = project?.workstreams.find(w => w.name === ws);
   const agentSession = project ? sessionName(owner, project.name, 'agent', ws) : '';
@@ -83,6 +88,9 @@ export function Conversation() {
     status: role === 'review' ? reviewPollStatus(review.status) : status?.status,
     statusUpdatedAt: role === 'review' ? review.status?.state ?? undefined : status?.updatedAt,
     enabled: Boolean(project && paneAvailable),
+    // 2x the hook's 400 default: more scrollback per capture, still under the
+    // capture route's 1000-line cap so no backend change rides along.
+    lines: 800,
   });
   // Reading a finished review on the phone is what focusing the Devin pane is
   // on the desktop (ReviewDock): post seen, so the row leaves the home list's
@@ -121,6 +129,39 @@ export function Conversation() {
   const currentPane = useRef(openPane);
   currentPane.current = openPane;
   const { scroller, onScroll, unseen, jumpToBottom } = useFollowBottom(parsed, openPane);
+
+  // "Load earlier": plain chunks of the pane output
+  // log, above the transcript. An agent pane's TUI runs on tmux's alternate
+  // screen, which keeps no scrollback, so this — not a deeper capture — is
+  // how the pane's past is reached. Reset with the pane, like the draft.
+  const [history, setHistory] = useState<PaneHistoryState>(initialPaneHistory);
+  useEffect(() => { setHistory(initialPaneHistory); }, [projectId, ws, role]);
+  const historyBefore = useRef<number | null>(null);
+  historyBefore.current = history.before;
+  const onLoadEarlier = useCallback(async () => {
+    if (!project) return;
+    const target = currentPane.current;
+    setHistory(loadEarlierStart);
+    try {
+      const r = await sessionsApi.history(project.id, role, { workstream: ws, before: historyBefore.current ?? undefined });
+      if (currentPane.current !== target) return;
+      setHistory(h => loadEarlierDone(h, r));
+    } catch (err) {
+      if (currentPane.current !== target) return;
+      setHistory(h => loadEarlierFail(h, (err as { response?: { status?: number } }).response?.status));
+    }
+  }, [project?.id, role, ws]);
+  // Keep the reader's place when a chunk lands above them.
+  const chunkCount = history.chunks.length;
+  const prevHeight = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    if (prevHeight.current != null && chunkCount > 0) {
+      el.scrollTop += el.scrollHeight - prevHeight.current;
+    }
+    prevHeight.current = el.scrollHeight;
+  }, [chunkCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Composer + key bar.
   const [text, setText] = useState('');
@@ -200,6 +241,7 @@ export function Conversation() {
     // pane only, as the desktop terminal records it; a line typed into the
     // ctrl shell or the review pane is not a prompt.
     if (withEnter && role === 'agent') recordProductEventOnce('first.prompt', { 'termag.pane': 'mobile' });
+    if (withEnter && role === 'agent') recordTypedChatCommand(keys, 'mobile');
     void send({ keys, enter: withEnter, literal: true }, text);
   };
   const onQuick = (k: QuickKey) => { void send({ keys: k.keys, enter: k.enter, literal: k.literal }, null); };
@@ -223,11 +265,15 @@ export function Conversation() {
     setParams(next, { replace: true });
   };
 
-  // Header menu: branch off, pin, archive, open in full UI.
+  // Header menu: branch off, pin, archive, open in Lab.
   const [menuOpen, setMenuOpen] = useState(false);
   const [branchOpen, setBranchOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [branchName, setBranchName] = useState('');
+  // The git branch may hold `/`, the name cannot. Each field follows the other until it is typed in.
+  const [newBranch, setNewBranch] = useState('');
+  const [branchNameEdited, setBranchNameEdited] = useState(false);
+  const [newBranchEdited, setNewBranchEdited] = useState(false);
   const [baseRef, setBaseRef] = useState('');
   const [branchBusy, setBranchBusy] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -248,7 +294,12 @@ export function Conversation() {
   const awake = useWakeLock(keepAwake);
   const lastReply = parsed ? [...parsed.blocks].reverse().find(b => b.kind === 'agent' && b.text.trim()) : undefined;
   const closeMenu = useCallback(() => setMenuOpen(false), []);
-  const closeBranch = useCallback(() => { setBranchOpen(false); setActionError(''); }, []);
+  // A closed or created form starts empty next time, so no old branch rides along.
+  const resetBranchForm = useCallback(() => {
+    setBranchName(''); setNewBranch(''); setBranchNameEdited(false); setNewBranchEdited(false); setBaseRef('');
+  }, []);
+  const closeBranch = useCallback(() => { setBranchOpen(false); setActionError(''); resetBranchForm(); }, [resetBranchForm]);
+  useEffect(() => { setBranchOpen(false); resetBranchForm(); }, [projectId, resetBranchForm]);
   const closeArchive = useCallback(() => setArchiveOpen(false), []);
   const openFull = () => {
     optOutOfMobile();
@@ -285,9 +336,11 @@ export function Conversation() {
     if (!project || !name || branchBusy) return;
     setBranchBusy(true); setActionError('');
     try {
-      const created = await workstreamsApi.create(project.id, { name, ...(baseRef.trim() ? { baseRef: baseRef.trim() } : {}) });
+      const created = await workstreamsApi.create(project.id, {
+        name, ...(newBranch.trim() ? { branch: newBranch.trim() } : {}), ...(baseRef.trim() ? { baseRef: baseRef.trim() } : {}),
+      });
       await reloadProjects();
-      setBranchOpen(false); setBranchName(''); setBaseRef('');
+      setBranchOpen(false); resetBranchForm();
       setWs(created.name);
     } catch (err) {
       setActionError(apiError(err, 'Could not branch off'));
@@ -363,7 +416,7 @@ export function Conversation() {
             { label: 'Archive project…', onClick: () => setArchiveOpen(true), danger: true, disabled: !projectKindTraits(project.kind).canArchive || project.role === 'collaborator' },
             ...(lastReply ? [{ label: 'Share the last reply…', onClick: () => { void shareText(lastReply.text, `${project.name} · ${agentLabel}`); } }] : []),
             ...(wakeLockSupported() ? [{ label: keepAwake ? 'Let the screen sleep' : 'Keep screen on', onClick: () => setKeepAwake(k => !k) }] : []),
-            { label: 'Open in full UI', onClick: openFull },
+            { label: 'Open in Lab', onClick: openFull },
             { label: 'Reload app', onClick: reloadApp },
           ]}
         />
@@ -375,7 +428,20 @@ export function Conversation() {
               <span className="m-field-label">Workstream name</span>
               <input className="m-text" autoFocus required autoCapitalize="off" autoCorrect="off" spellCheck={false}
                 pattern="[A-Za-z0-9_-]+" title="letters, digits, dashes and underscores"
-                placeholder="feature-x" value={branchName} onChange={e => setBranchName(e.target.value)} />
+                value={branchName}
+                onChange={e => {
+                  setBranchName(e.target.value); setBranchNameEdited(e.target.value !== '');
+                  if (!newBranchEdited) setNewBranch(e.target.value);
+                }} />
+            </label>
+            <label className="m-field">
+              <span className="m-field-label">Branch name</span>
+              <input className="m-text" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+                value={newBranch}
+                onChange={e => {
+                  setNewBranch(e.target.value); setNewBranchEdited(e.target.value !== '');
+                  if (!branchNameEdited) setBranchName(workstreamNameFromBranch(e.target.value));
+                }} />
             </label>
             <label className="m-field">
               <span className="m-field-label">Base ref (optional)</span>
@@ -384,7 +450,7 @@ export function Conversation() {
             </label>
             {actionError && <div className="m-form-error" role="alert">{actionError}</div>}
             <button type="submit" className="m-primary" disabled={!branchName.trim() || branchBusy}>{branchBusy ? 'Creating…' : 'Create and open'}</button>
-            <p className="m-form-note">A git worktree and a branch named after the workstream, with their own agent and ctrl sessions.</p>
+            <p className="m-form-note">A git worktree and a branch (named after the workstream unless you give one), with their own agent and ctrl sessions.</p>
           </form>
         </Sheet>
       )}
@@ -446,6 +512,18 @@ export function Conversation() {
             : <div className="m-empty">This project has no agent workflow. The ctrl tab still works.</div>
         )}
         {paneAvailable && parsed == null && !capture.error && <div className="m-empty">Loading…</div>}
+        {paneAvailable && !history.exhausted && (
+          <button className="m-history-load" onClick={() => { void onLoadEarlier(); }} disabled={history.loading}>
+            {history.loading ? 'Loading…' : '↑ Load earlier'}
+          </button>
+        )}
+        {history.error === 'failed' && <div className="m-notice">Could not load earlier output</div>}
+        {history.chunks.map(c => (
+          <div key={c.startByte} className="m-history">
+            <div className="m-history-label">· earlier pane output ·</div>
+            <div className="m-history-text" data-replay-block>{c.text}</div>
+          </div>
+        ))}
         {capture.error === 'offline' && <div className="m-notice m-notice-warn">The box's agent is offline. Showing the last capture.</div>}
         {capture.error === 'denied' && <div className="m-notice m-notice-warn">This session is not reachable.</div>}
         {capture.error === 'failed' && <div className="m-notice">Capture failed · retrying</div>}

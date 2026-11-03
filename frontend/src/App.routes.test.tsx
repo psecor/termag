@@ -55,11 +55,13 @@ const USER = {
 
 const SIMPLE_UI = { 'simple-ui-enabled': true };
 
+// Every socket URL the app dialled, in order.
+let dialled: string[] = [];
 class FakeSocket {
   static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   readyState = 0;
   onopen = null; onmessage = null; onclose = null; onerror = null;
-  constructor(readonly url: string) {}
+  constructor(readonly url: string) { dialled.push(url); }
   send() {}
   close() { this.readyState = 3; }
   addEventListener() {}
@@ -67,8 +69,12 @@ class FakeSocket {
 }
 
 let where = '';
+// Every path and query the router showed, in order.
+let visited: string[] = [];
 function Location() {
-  where = useLocation().pathname;
+  const { pathname, search } = useLocation();
+  where = pathname;
+  if (visited[visited.length - 1] !== `${pathname}${search}`) visited.push(`${pathname}${search}`);
   return null;
 }
 
@@ -99,6 +105,8 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   where = '';
+  visited = [];
+  dialled = [];
 });
 
 afterEach(() => {
@@ -145,6 +153,29 @@ describe('top-level routes', { timeout: 10_000 }, () => {
   it('/chat opens the simple UI', async () => {
     await open('/chat', has('.chat-root .chat-home'), 'the simple UI home');
     expect(where).toBe('/chat');
+    expect(errors).toEqual([]);
+  });
+
+  it('the simple UI carries no chrome refresh with its flag off, and loads no icon sprite', async () => {
+    await open('/chat', has('.chat-root .chat-home'), 'the simple UI home');
+    const chatRoot = container.querySelector('.chat-root')!;
+    expect(chatRoot.className).toBe('chat-root');
+    expect(chatRoot.hasAttribute('data-chrome')).toBe(false);
+    expect(document.getElementById('lp-icons-sprite')).toBeNull();
+    expect(document.body.hasAttribute('data-chrome')).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it('with simple-ui-chrome-refresh-enabled on, the refresh is scoped to .chat-root, never <body>', async () => {
+    const flags = { ...SIMPLE_UI, 'simple-ui-chrome-refresh-enabled': true };
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
+    setFlagValues(flags);
+    await open('/chat', has('.chat-root[data-chrome="refresh"].lp-theme .chat-home'), 'the refreshed simple UI home');
+    for (const el of [document.documentElement, document.body]) {
+      expect(el.hasAttribute('data-chrome')).toBe(false);
+      expect(el.hasAttribute('data-theme')).toBe(false);
+      expect(el.classList.contains('lp-theme')).toBe(false);
+    }
     expect(errors).toEqual([]);
   });
 
@@ -215,6 +246,77 @@ describe('top-level routes', { timeout: 10_000 }, () => {
   it('signed out, the workspace goes to the sign-in page', async () => {
     net.routes.delete('/auth/me');
     await open('/', () => where === '/login' && has('.login-page')(), 'the sign-in page');
+    expect(errors).toEqual([]);
+  });
+
+  it('a signed-in page keeps onboarding-refresh-enabled for the sign-in page, and forgets it when it is off', async () => {
+    const flags = { ...SIMPLE_UI, 'onboarding-refresh-enabled': true };
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
+    setFlagValues(flags);
+    await open('/settings', heading('Settings'), 'Settings');
+    expect(localStorage.getItem('termag-onboarding-refresh')).toBe('1');
+    act(() => root?.unmount());
+    root = null;
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: SIMPLE_UI });
+    setFlagValues(SIMPLE_UI);
+    await open('/settings', heading('Settings'), 'Settings');
+    expect(localStorage.getItem('termag-onboarding-refresh')).toBeNull();
+    expect(errors).toEqual([]);
+  });
+
+  it('signed out with onboarding-refresh-enabled remembered, the sign-in page is the redrawn one', async () => {
+    net.routes.delete('/auth/me');
+    localStorage.setItem('termag-onboarding-refresh', '1');
+    await open('/login?error=unauthorized', () => where === '/login' && has('.wel-login')(), 'the redrawn sign-in page');
+    expect(document.body.textContent).toContain("This account doesn't have access to termag yet.");
+    expect(has('.login-page')()).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it('a share link its owner opened goes to the simple UI\'s side panel when that UI was last', async () => {
+    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true };
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
+    setFlagValues(flags);
+    localStorage.setItem('termag-ui-mode', 'simple');
+    const handoff = 'browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx';
+    await open(`/?project=p1&ws=feature-x&${handoff}`, () => where === '/chat/p/p1' || where === '/chat', 'the simple UI');
+    expect(visited).toContain(`/chat/p/p1?ws=feature-x&${handoff}`);
+    expect(visited.some(v => v.startsWith('/?') && v !== `/?project=p1&ws=feature-x&${handoff}`)).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it('a share link its owner opened dials the share from a side panel already open on Browser', async () => {
+    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true, 'browser-pane-enabled': true };
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
+    setFlagValues(flags);
+    net.routes.set('/api/projects', [{
+      id: 'p1', name: 'sample', archived: false, instanceId: null, setupStatus: null, role: 'owner', ownerUsername: 'e2e',
+      workflows: [{ id: 'w1', type: 'agent', provider: 'claude', workstreamId: 'ws1' }], workstreams: [{ id: 'ws1', name: 'main' }],
+    }]);
+    localStorage.setItem('termag-ui-mode', 'simple');
+    localStorage.setItem('termag-chat-side-panel', JSON.stringify({ open: true, tab: 'browser', width: 480 }));
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+    const browserDials = () => dialled.filter(u => u.includes('/ws/browser?'));
+    // The page's own URL, which the handoff is read from (the memory router leaves it alone).
+    const link = '/?project=p1&ws=main&browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx';
+    window.history.replaceState(null, '', `/termag${link}`);
+    await open(link, () => browserDials().length > 0, 'a browser dial');
+    expect(where).toBe('/chat/p/p1');
+    const first = new URL(browserDials()[0]).searchParams;
+    expect(first.get('projectId')).toBe('p1');
+    expect(first.get('openShare')).toBe('cshare0000000001');
+    expect(first.get('at')).toBe('/projects/x');
+    expect(window.location.search).toBe('?project=p1&ws=main');
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('a share link its owner opened stays in the workspace when the full UI was last', async () => {
+    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true };
+    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
+    setFlagValues(flags);
+    await open('/?project=p1&ws=main&browser=open&browserShare=cshare0000000001', has('.app-layout'), 'the workspace');
+    expect(where).toBe('/');
+    expect(visited.some(v => v.startsWith('/chat'))).toBe(false);
     expect(errors).toEqual([]);
   });
 

@@ -1,14 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { reviewApi, type ReviewGuessResponse } from '../services/api';
-import { guessExplanation, MAX_REVIEW_BODY, parsePrInputFull, renderReviewTemplate, reviewPromptHeader, reviewTargetView, type PrGuess } from '../utils/review';
+import { reviewApi, type ReviewGuessResponse, type ReviewPromptTemplate } from '../services/api';
+import { guessExplanation, MAX_REVIEW_BODY, mismatchNote, parsePrInputFull, renderReviewTemplate, reviewPromptHeader, reviewTargetView, templateForRepo, type PrGuess } from '../utils/review';
+import { FLAGS, useFlag } from '../flags';
 import { Dialog } from './Dialog';
+import { reviewStartNote, reviewStartPlan, type ReviewPane } from '../utils/reviewPanes';
 
 interface Props {
   projectId: string;
   workstream: string;
-  /** A review pane is already alive for this workstream: starting replaces it. */
-  hasReview: boolean;
-  onStarted: (r: { pr: number; url: string | null; session: string; reviewer?: string }) => void;
+  /** The workstream's review panes: what a start adds to, restarts or replaces. */
+  panes: ReviewPane[];
+  /** parallel-reviews-enabled: a start adds a pane rather than replacing the first. */
+  parallel: boolean;
+  onStarted: (r: { pr: number; url: string | null; session: string; slot?: number; reviewer?: string }) => void;
 }
 
 /**
@@ -41,13 +45,14 @@ function storeReviewer(id: string): void {
   try { localStorage.setItem(REVIEWER_KEY, id); } catch { /* private mode */ }
 }
 
-export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Props) {
+export function ReviewButton({ projectId, workstream, panes, parallel, onStarted }: Props) {
   const [open, setOpen] = useState(false);
   const [guessing, setGuessing] = useState(false);
   const [guess, setGuess] = useState<PrGuess | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [ghError, setGhError] = useState<string | null>(null);
-  const [repo, setRepo] = useState<{ repo: string | null; known: boolean }>({ repo: null, known: false });
+  const [repo, setRepo] = useState<{ repo: string | null; known: boolean; repos?: string[] }>({ repo: null, known: false });
+  const multiRepoOn = useFlag(FLAGS.multiRepo, false);
   const [value, setValue] = useState('');
   // A ref, not state: the guess effect reads it when the result lands, which
   // can be after the user started typing; a state value captured when the
@@ -62,6 +67,7 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
   const [reviewers, setReviewers] = useState<Reviewer[]>([]);
   const [reviewerId, setReviewerId] = useState<string | null>(null);
   const [promptSource, setPromptSource] = useState<{ source: string; label: string | null; warnings: string[] } | null>(null);
+  const [repoTemplates, setRepoTemplates] = useState<ReviewPromptTemplate[] | null>(null);
   const [showPrompt, setShowPrompt] = useState(false);
   // null = not edited: the textarea follows the template for whichever PR is typed.
   const [promptDraft, setPromptDraft] = useState<string | null>(null);
@@ -73,12 +79,13 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setGuessing(true); setGuess(null); setBranch(null); setGhError(null); setRepo({ repo: null, known: false }); setError(null); setPromptTemplate(null); setPromptFooter(null); setPromptSource(null);
+    setGuessing(true); setGuess(null); setBranch(null); setGhError(null); setRepo({ repo: null, known: false }); setError(null); setPromptTemplate(null); setPromptFooter(null); setPromptSource(null); setRepoTemplates(null);
     reviewApi.guess(projectId, workstream)
       .then(r => {
         if (cancelled) return;
-        setGuess(r.guess); setBranch(r.branch); setGhError(r.ghError); setRepo({ repo: r.repo ?? null, known: r.repoKnown === true }); setPromptTemplate(r.promptTemplate ?? null); setPromptFooter(r.promptFooter ?? null);
+        setGuess(r.guess); setBranch(r.branch); setGhError(r.ghError); setRepo({ repo: r.repo ?? null, known: r.repoKnown === true, repos: r.repos }); setPromptTemplate(r.promptTemplate ?? null); setPromptFooter(r.promptFooter ?? null);
         setPromptSource({ source: r.promptSource ?? 'builtin', label: r.promptSourceLabel ?? null, warnings: r.promptWarnings ?? [] });
+        setRepoTemplates(r.promptTemplates ?? null);
         const list = r.reviewers ?? [];
         setReviewers(list);
         const stored = storedReviewer();
@@ -102,11 +109,16 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
 
   const parsed = parsePrInputFull(value);
   const pr = parsed?.number ?? null;
-  const target = reviewTargetView({ pr, typedUrl: parsed?.url ?? null, guess, repo: repo.repo, repoKnown: repo.known });
+  const target = reviewTargetView({ pr, typedUrl: parsed?.url ?? null, guess, repo: repo.repo, repoKnown: repo.known, repos: multiRepoOn ? repo.repos : null });
   const prUrl = target.url;
-  const promptBody = promptDraft ?? (promptTemplate != null ? renderReviewTemplate(promptTemplate, pr, prUrl) : '');
+  // A multi-repo workstream: the template in the PR's repository, the one Start reads.
+  const repoTemplate = templateForRepo(target.repo, repoTemplates);
+  const shownTemplate = repoTemplate?.template ?? promptTemplate;
+  const shownSource = repoTemplate ?? promptSource;
+  const promptBody = promptDraft ?? (shownTemplate != null ? renderReviewTemplate(shownTemplate, pr, prUrl) : '');
   const promptInvalid = promptDraft != null && (!promptDraft.trim() || promptDraft.length > MAX_REVIEW_BODY);
-  const canStart = pr != null && !starting && !promptInvalid && !target.problem;
+  const plan = reviewStartPlan(panes, { pr, url: prUrl }, parallel);
+  const canStart = pr != null && !starting && !promptInvalid && !target.problem && plan.kind !== 'full';
   const reviewer = reviewers.find(x => x.id === reviewerId) ?? null;
   const reviewerLabel = reviewer?.name ?? 'Devin';
   const footer = reviewer?.footer ?? promptFooter;
@@ -122,7 +134,7 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
         ...(reviewer ? { reviewer: reviewer.id } : {}),
       });
       if (reviewer) storeReviewer(reviewer.id);
-      onStarted({ pr: r.pr, url: r.url, session: r.session, reviewer: r.reviewer ?? reviewer?.id });
+      onStarted({ pr: r.pr, url: r.url, session: r.session, slot: r.slot, reviewer: r.reviewer ?? reviewer?.id });
       setStarting(false);
       setOpen(false); reset();
     } catch (err: any) {
@@ -176,9 +188,7 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
               </div>
             )}
             {!guessing && target.mismatch && (
-              <div className="review-dialog-hint review-dialog-warning">
-                Not this workstream's repository ({target.mismatch}). Check it is the PR you mean.
-              </div>
+              <div className="review-dialog-hint review-dialog-warning">{mismatchNote(target)}</div>
             )}
             {!guessing && target.problem && <div className="review-dialog-error">{target.problem}</div>}
             {!guessing && !guess && ghError && (
@@ -197,7 +207,7 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
                 </select>
               </div>
             )}
-            {promptTemplate != null && (
+            {shownTemplate != null && (
               <div className="review-dialog-prompt">
                 <div className="review-dialog-prompt-bar">
                   <button
@@ -214,12 +224,12 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
                     </button>
                   )}
                 </div>
-                {showPrompt && (promptSource?.label || !!promptSource?.warnings.length) && (
+                {showPrompt && (shownSource?.label || !!shownSource?.warnings.length) && (
                   <div className="review-dialog-hint review-dialog-prompt-source">
-                    {promptSource.label && <>Template: <code>{promptSource.label}</code></>}
+                    {shownSource.label && <>Template: <code>{shownSource.label}</code>{repoTemplate && <> in {repoTemplate.repo}</>}</>}
                     {/* The repo file is read from the checkout under review: a PR can change it. */}
-                    {promptSource.source === 'repo' && ' (from the checked-out branch; read it before starting)'}
-                    {promptSource.warnings.map(w => <div key={w} className="review-dialog-error">Skipped {w}</div>)}
+                    {shownSource.source === 'repo' && ' (from the checked-out branch; read it before starting)'}
+                    {shownSource.warnings.map(w => <div key={w} className="review-dialog-error">Skipped {w}</div>)}
                   </div>
                 )}
                 {showPrompt && (
@@ -255,7 +265,7 @@ export function ReviewButton({ projectId, workstream, hasReview, onStarted }: Pr
             )}
             <div className="review-dialog-note">
               Starts {reviewerLabel} in a review pane under the ctrl terminal{reviewer ? <>, in {reviewer.note}</> : ''}.
-              {hasReview && ' The running review is replaced.'}
+              {plan.kind !== 'new' && ` ${reviewStartNote(plan)}`}
             </div>
             {error && <div className="review-dialog-error">{error}</div>}
             <div className="confirm-actions">

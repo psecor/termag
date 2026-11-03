@@ -11,7 +11,7 @@ export interface RedirectInputs {
   flagOn: boolean;
   /** `matchMedia(MOBILE_MEDIA_QUERY).matches` */
   phoneLike: boolean;
-  /** The user pressed "Full UI" on this browser (or, installed, in this window). */
+  /** The user pressed "Lab" on this browser (or, installed, in this window). */
   optedOut: boolean;
   /** Launched from the home screen on a touch device (`installedOnTouch`). */
   installed?: boolean;
@@ -95,19 +95,19 @@ function safeStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
 }
 
 /**
- * Where "Full UI" is remembered: this browser for good, or — in an installed
+ * Where "Lab" is remembered: this browser for good, or — in an installed
  * app — this window only, so the next launch is the phone client again.
  */
 export function optOutStorage(installed: boolean): Storage | null {
   return safeStorage(installed ? 'sessionStorage' : 'localStorage');
 }
 
-/** The live "has this browser/window pressed Full UI" answer. */
+/** The live "has this browser/window pressed Lab" answer. */
 export function currentOptOut(installed: boolean): boolean {
   return readOptOut(optOutStorage(installed));
 }
 
-/** "Full UI": stop redirecting this browser (or this installed window). */
+/** "Lab": stop redirecting this browser (or this installed window). */
 export function optOutOfMobile(): void {
   const installed = typeof window !== 'undefined' && installedAppMode(window);
   writeOptOut(optOutStorage(installed), true);

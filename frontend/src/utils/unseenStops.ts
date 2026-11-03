@@ -26,6 +26,18 @@ export interface SeenStops {
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem'>;
 
+/**
+ * A session's key in the store: by project and workstream id, so a project or
+ * workstream rename keeps it (the status, stoppedAt included, moves to the new
+ * name). main can't be renamed and is keyed by name. Any other workstream has
+ * no key until its id is known: a name-keyed mark made before the list loads
+ * would be orphaned once the id key takes over.
+ */
+export function seenStopKey(projectId: string, workstream: string, workstreamId: string | null | undefined): string | null {
+  if (workstream === 'main') return `${projectId}:main`;
+  return workstreamId ? `${projectId}:${workstreamId}` : null;
+}
+
 export function readSeenStops(storage: StorageLike | null, now: number): SeenStops {
   try {
     const raw = storage?.getItem(SEEN_STOPS_KEY);

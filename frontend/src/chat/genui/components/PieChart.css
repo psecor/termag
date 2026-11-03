@@ -1,0 +1,20 @@
+/* PieChart.tsx. The tooltip and legend are the dashboard's (.dash-tip, .usage-legend in App.css). */
+.genui-piechart { margin: 0; min-width: 0; }
+.genui-piechart-drawing { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+.genui-piechart-plot { position: relative; flex: none; }
+.genui-piechart-placeholder { border-radius: 50%; background: var(--bg-active); opacity: 0.4; }
+
+/* The total, in the ring's hole. Text inks, never a slice's colour. */
+.genui-piechart-center {
+  position: absolute; inset: 0; pointer-events: none;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; text-align: center;
+}
+.genui-piechart-total { font-size: 20px; font-weight: 600; line-height: 1.2; color: var(--text-primary); }
+.genui-piechart-total-label { max-width: 96px; font-size: 11.5px; line-height: 1.3; color: var(--text-secondary); overflow-wrap: anywhere; }
+
+/* The legend carries each share, so it is a column beside the ring, in readable ink, rather than the dashboard's muted row. */
+.genui-piechart .usage-legend {
+  flex: 1 1 140px; min-width: 0; flex-direction: column; align-items: flex-start; justify-content: center; gap: 5px;
+  font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere;
+}
+.genui-piechart .usage-legend i { margin-right: 6px; }

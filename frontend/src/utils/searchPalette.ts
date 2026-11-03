@@ -16,6 +16,14 @@ export interface PaletteAction {
   detail?: string;
   /** More words that find it. */
   keywords?: string[];
+  /** Its LaunchPad icon, where the palette draws one (the simple UI's, pages/chat/ChatPalette.tsx). */
+  icon?: string;
+  /** Its own shortcut, shown at the row's end (⌘⇧O for New session). */
+  keys?: string;
+  /** Listed, but can't run now; `detail` says why. */
+  disabled?: boolean;
+  /** Also listed under Commands while nothing is typed, after the recents. */
+  suggested?: boolean;
   run: () => void;
 }
 
@@ -34,6 +42,8 @@ export interface PaletteInput {
   actions: PaletteAction[];
   history: string[];
   recent: InboxRow[];
+  /** The actions to list while nothing is typed (`suggested`), after the recents. */
+  suggested?: PaletteAction[];
   /** Sessions matching the query (searchRows). */
   hits: InboxRow[];
   /** Pull requests matching the query, from every lane (searchPrRows). */
@@ -45,15 +55,20 @@ export interface PaletteInput {
 }
 
 /**
- * Empty query: recent searches, then recent sessions. Otherwise: the matching
+ * Empty query: recent searches, then recent sessions, then any suggested
+ * actions (after the recents, so ⌘K Enter still reopens the latest). Otherwise: the matching
  * actions first (so ⌘K, b, Enter branches off), then the matching sessions,
  * then the matching pull requests, then the pane-text hits for this query, or — before a pane search
  * has run for it — the "Search pane text for …" item (2+ characters, as the
  * route requires).
  */
-export function paletteItems({ q, actions, history, recent, hits, prs = [], paneQuery, paneResult }: PaletteInput): PaletteItem[] {
+export function paletteItems({ q, actions, history, recent, suggested = [], hits, prs = [], paneQuery, paneResult }: PaletteInput): PaletteItem[] {
   if (!q) {
-    return [...history.map(h => ({ kind: 'recent-query' as const, q: h })), ...recent.map(row => ({ kind: 'row' as const, row }))];
+    return [
+      ...history.map(h => ({ kind: 'recent-query' as const, q: h })),
+      ...recent.map(row => ({ kind: 'row' as const, row })),
+      ...suggested.map(action => ({ kind: 'action' as const, action })),
+    ];
   }
   const out: PaletteItem[] = [
     ...actions.map(action => ({ kind: 'action' as const, action })),

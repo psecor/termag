@@ -124,6 +124,47 @@ export function memberStatus(m: PrGroupMember, viewer: string | null, now: numbe
   return `by ${m.author ?? 'someone'} · not asked of you`;
 }
 
+export type MemberReviewKind = 'none' | 'commented' | 'changes' | 'approved';
+
+/**
+ * Whether anyone has reviewed a member yet, for the pill on its row: so a
+ * group of a team's PRs shows which still want a first review. People only
+ * (the Cursor approval agent approves nearly every PR, so its approval gets
+ * its own pill, memberBotReview); a request for changes outranks an
+ * approval. Null for a member that is not open or was not read from GitHub.
+ */
+export function memberReview(m: Pick<PrGroupMember, 'state' | 'reviewers'>, viewer: string | null): { kind: MemberReviewKind; label: string; title: string } | null {
+  const r = m.reviewers;
+  if (m.state !== 'open' || !r) return null;
+  const v = viewer?.toLowerCase();
+  const names = (logins: string[]) => logins.map(l => (l.toLowerCase() === v ? 'you' : l)).join(', ');
+  const commented = r.commented.length ? ` Comments from ${names(r.commented)}.` : '';
+  if (r.changes.length) return { kind: 'changes', label: 'changes requested', title: `Changes requested by ${names(r.changes)}.${r.approved.length ? ` Approved by ${names(r.approved)}.` : ''}${commented}` };
+  if (r.approved.length) return { kind: 'approved', label: 'approved', title: `Approved by ${names(r.approved)}.${commented}` };
+  if (r.commented.length) return { kind: 'commented', label: 'commented', title: `No approval yet.${commented}` };
+  return { kind: 'none', label: 'no review yet', title: 'No person has reviewed it yet.' };
+}
+
+/**
+ * A bot's verdict on a member, for a pill of its own beside the people's: the
+ * Cursor approval agent's approval says the low-level pass is done (Bugbot's
+ * findings dealt with), so a reviewer can look for higher-level problems; it
+ * does not end the review. A bot asking for changes outranks one approving.
+ */
+export function memberBotReview(m: Pick<PrGroupMember, 'state' | 'reviewers'>): { kind: 'approved' | 'changes'; label: string; title: string } | null {
+  const r = m.state === 'open' ? m.reviewers : null;
+  const changes = r?.botsChanges ?? [];
+  const approved = r?.botsApproved ?? [];
+  if (changes.length) return { kind: 'changes', label: `${changes[0]} wants changes`, title: `Changes requested by ${changes.join(', ')} (bot).` };
+  if (approved.length) return { kind: 'approved', label: `${approved[0]} approved`, title: `Approved by ${approved.join(', ')} (bot): the low-level pass is done, so look for higher-level problems. Not the end of the review.` };
+  return null;
+}
+
+/** How many of a group's open members no one has reviewed yet. */
+export function unreviewedCount(group: PrReviewGroup, viewer: string | null): number {
+  return group.members.filter(m => memberReview(m, viewer)?.kind === 'none').length;
+}
+
 /** The members as the group routes take them, in this order. */
 export function memberInputs(members: Pick<PrGroupMember, 'repo' | 'number' | 'note'>[]): PrGroupMemberInput[] {
   return members.map(m => ({ repo: m.repo, number: m.number, note: m.note }));

@@ -5,7 +5,10 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatChromeProvider, type ChatChrome } from './chatChrome';
 
-const mocks = vi.hoisted(() => ({ open: vi.fn(), tree: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  pick: vi.fn((_ref: unknown, _current: string | null) => 'p7'), tree: vi.fn(), get: vi.fn(), reload: vi.fn(),
+  spaces: [{ name: 'notes' }, { name: 'design' }] as Array<{ name: string }>,
+}));
 const row = (projectId: string, projectName: string, instanceId: string) => ({
   key: `${projectId}|main`, projectId, projectName, workstream: 'main', owner: 'ada', shared: false, provider: 'claude', instanceId,
   kind: 'normal', pinned: false, status: 'idle', waitingReason: null, updatedAt: null, message: null, contextTokens: null,
@@ -13,15 +16,15 @@ const row = (projectId: string, projectName: string, instanceId: string) => ({
 });
 vi.mock('./simpleData', () => {
   const data = () => ({
-    items: { open: mocks.open, state: { items: [{ id: 't1', kind: 'file', space: 'notes', path: 'docs/plan.md', openedAt: 5 }] } },
+    items: { pick: mocks.pick, state: { items: [{ id: 't1', kind: 'file', space: 'notes', path: 'docs/plan.md', openedAt: 5 }] } },
     rows: [row('a', 'review-notes', 'box-n'), row('b', 'landing', 'box-d')],
     live: new Map(), setupOf: new Map(), links: [], activeTab: 't9', itemsShown: true,
-    spaces: { enabled: true, loaded: true, spaces: [{ name: 'notes' }, { name: 'design' }], index: new Map([['box-n', ['notes']], ['box-d', ['design']]]) },
+    spaces: { enabled: true, loaded: true, spaces: mocks.spaces, reload: mocks.reload, index: new Map([['box-n', ['notes']], ['box-d', ['design']]]) },
   });
   return { WithSimpleData: ({ children }: { children: React.ReactNode }) => children, useSimpleData: data, useSimpleDataIfAny: data };
 });
 vi.mock('../../contexts/ProjectContext', () => ({ useProjects: () => ({ projects: [{ id: 'a', lastActiveAt: '2026-10-23T10:00:00Z' }] }) }));
-vi.mock('../../services/api', () => ({ spacesApi: { tree: mocks.tree } }));
+vi.mock('../../services/api', () => ({ spacesApi: { tree: mocks.tree, get: mocks.get } }));
 
 import { FileExplorer } from './FileExplorer';
 
@@ -37,6 +40,7 @@ function Probe() {
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   mocks.tree.mockResolvedValue({ prefix: '', dirs: [], files: [], nextCursor: null });
+  mocks.get.mockRejectedValue({ response: { status: 404, data: { error: 'Not found' } } });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -45,14 +49,16 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
-  mocks.open.mockReset();
+  mocks.pick.mockClear();
+  mocks.get.mockReset();
+  mocks.reload.mockReset();
 });
 
-function render(chrome: Partial<ChatChrome>) {
+function render(chrome: Partial<ChatChrome>, path = '/chat/files/notes?tab=t9') {
   const value: ChatChrome = { mode: 'docked', historyOpen: false, openHistory: () => {}, closeHistory: () => {}, ...chrome };
   act(() => root.render(
     <ChatChromeProvider value={value}>
-      <MemoryRouter initialEntries={['/chat/files/notes?tab=t9']}>
+      <MemoryRouter initialEntries={[path]}>
         <Routes><Route path="/chat/files/:space" element={<FileExplorer />} /></Routes>
         <Probe />
       </MemoryRouter>
@@ -71,11 +77,11 @@ describe('a new tab', () => {
     expect(host.querySelector('.chat-side-toggle')).not.toBeNull();
   });
 
-  it('shows a pick in this tab', () => {
+  it('shows a pick in the tab the store picks: its own, or this one', () => {
     render({});
     act(() => (host.querySelectorAll<HTMLAnchorElement>('.nt-row')[1]).click());
-    expect(mocks.open).toHaveBeenCalledWith({ kind: 'chat', projectId: 'a', workstream: 'main', space: 'notes' }, 't9');
-    expect(location).toBe('/chat/p/a?tab=t9');
+    expect(mocks.pick).toHaveBeenCalledWith({ kind: 'chat', projectId: 'a', workstream: 'main' }, 't9', undefined, 'notes');
+    expect(location).toBe('/chat/p/a?tab=p7');
   });
 
   it('puts Show tools under ⋮ on a phone', () => {
@@ -87,4 +93,60 @@ describe('a new tab', () => {
     act(() => item.click());
     expect(toggle).toHaveBeenCalled();
   });
+
+  const settle = () => act(async () => { for (let i = 0; i < 3; i++) await new Promise(r => setTimeout(r, 0)); });
+
+  it('says so when the server has no such space for the user, and lists nothing', async () => {
+    render({ sidePanel: { open: true, toggle: () => {} } }, '/chat/files/secret?tab=t9');
+    await settle();
+    expect(mocks.get).toHaveBeenCalledWith('secret');
+    const note = host.querySelector('.nt-no-access')!;
+    expect(note.getAttribute('role')).toBe('status');
+    expect(note.querySelector('.nt-head')!.textContent).toBe('You don\'t have access to secret');
+    expect(note.textContent).toContain('Ask its owner to add you, then open the link again.');
+    expect(host.querySelector('.nt-list')).toBeNull();
+  });
+
+  it('asks the server about a space missing from a stale list, and reloads the list when it answers', async () => {
+    // Added to the space after the sidebar loaded its spaces.
+    mocks.get.mockResolvedValue({ space: { name: 'fresh', role: 'editor' } });
+    render({ sidePanel: { open: true, toggle: () => {} } }, '/chat/files/fresh?tab=t9');
+    await settle();
+    expect(mocks.get).toHaveBeenCalledWith('fresh');
+    expect(host.querySelector('.nt-no-access')).toBeNull();
+    expect(host.querySelector('.nt-head')!.textContent).toBe('Recent in fresh');
+    expect(mocks.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a network error', new Error('Network Error')],
+    ['a 5xx', { response: { status: 503, data: { error: 'Spaces storage is unavailable right now' } } }],
+  ])('never says no access when asking the server ends in %s', async (_what, err) => {
+    mocks.get.mockRejectedValue(err);
+    render({ sidePanel: { open: true, toggle: () => {} } }, '/chat/files/secret?tab=t9');
+    await settle();
+    expect(mocks.get).toHaveBeenCalledWith('secret');
+    expect(host.querySelector('.nt-no-access')).toBeNull();
+    expect(host.querySelector('.nt-head')!.textContent).toBe('Recent in secret');
+  });
+
+  it('doesn\'t take a failed or empty list for "no spaces": a space the list lacks is asked about', async () => {
+    mocks.spaces.splice(0);
+    try {
+      mocks.get.mockResolvedValue({ space: { name: 'notes', role: 'owner' } });
+      render({ sidePanel: { open: true, toggle: () => {} } });
+      await settle();
+      expect(host.querySelector('.nt-no-access')).toBeNull();
+      expect(host.querySelector('.nt-head')!.textContent).toBe('Recent in notes');
+    } finally {
+      mocks.spaces.push({ name: 'notes' }, { name: 'design' });
+    }
+  });
+
+  it('doesn\'t ask the server about a space the list has', async () => {
+    render({ sidePanel: { open: true, toggle: () => {} } });
+    await settle();
+    expect(mocks.get).not.toHaveBeenCalled();
+  });
 });
+

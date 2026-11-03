@@ -1,0 +1,24 @@
+/* Timeline.tsx: a dot per event on a hairline rail; the dot's colour is its tone. */
+.genui-surface .genui-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; min-width: 0; }
+.genui-timeline-event {
+  --genui-tone: var(--text-muted);
+  position: relative; display: grid; grid-template-columns: 10px minmax(0, 1fr); column-gap: 12px; padding-bottom: 14px;
+}
+.genui-timeline-event:last-child { padding-bottom: 0; }
+/* The rail from under this dot to just above the next one. */
+.genui-timeline-event:not(:last-child)::before {
+  content: ''; position: absolute; left: 4px; top: 18px; bottom: -2px; width: 2px; border-radius: 1px; background: var(--border);
+}
+.genui-timeline-dot { box-sizing: border-box; width: 10px; height: 10px; margin-top: 5px; border-radius: 50%; background: var(--genui-tone); }
+/* No tone: a hollow ring, so a coloured dot stands out. */
+.genui-timeline-event[data-tone="default"] .genui-timeline-dot { background: transparent; border: 2px solid var(--text-muted); }
+.genui-timeline-event[data-tone="info"] { --genui-tone: var(--accent); }
+.genui-timeline-event[data-tone="success"] { --genui-tone: var(--success); }
+.genui-timeline-event[data-tone="warning"] { --genui-tone: var(--warning); }
+.genui-timeline-event[data-tone="danger"] { --genui-tone: var(--danger); }
+
+.genui-timeline-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.genui-timeline-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0 12px; }
+.genui-timeline-title { font-weight: 500; color: var(--text-primary); overflow-wrap: anywhere; min-width: 0; }
+.genui-timeline-time { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+.genui-timeline-detail { font-size: 12.5px; color: var(--text-secondary); overflow-wrap: anywhere; }

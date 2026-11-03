@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { prsApi, type PrMergeMethod, type PrMergeRequest, type PrOverview, type PrRerunResult, type PrReviewEvent, type PrRow } from '../../services/api';
+import { prsApi, type PrMergeMethod, type PrMergeRequest, type PrOverview, type PrPipelineResponse, type PrRerunResult, type PrReviewEvent, type PrRow } from '../../services/api';
 import { Dialog } from '../../components/Dialog';
 import { fmtAge } from '../../utils/format';
 import { MERGE_METHOD_LABEL, REVIEW_EVENTS, canSubmitReview, checksSummary, mergeReadiness, pingText, reviewStateLabel, reviewerRoster, rowLabel } from '../../utils/prPipeline';
+import { prDescription } from '../../utils/prDescription';
+import { Markdown } from '../../chat/Markdown';
 
 /**
  * A pull request up close (PrDetail), in the PR overlay's detail pane or the
@@ -16,7 +18,8 @@ import { MERGE_METHOD_LABEL, REVIEW_EVENTS, canSubmitReview, checksSummary, merg
  * panel re-runs the failed GitHub Actions jobs (POST …/rerun-failed). On the
  * viewer's own PR a reviewers panel re-requests reviews (POST …/reviewers) and
  * posts a ping comment the user has read and can edit (POST …/comment).
- * The description is shown as its raw text: termag renders no GitHub HTML.
+ * The description is GitHub's markdown, drawn by the chat's own renderer
+ * (chat/Markdown.tsx): it never interprets HTML, and loads no image.
  */
 
 function apiErrorText(err: unknown, fallback: string): string {
@@ -24,13 +27,13 @@ function apiErrorText(err: unknown, fallback: string): string {
   return typeof msg === 'string' ? msg : fallback;
 }
 
-function ago(at: string | null | undefined, now: number): string {
+export function ago(at: string | null | undefined, now: number): string {
   if (!at) return '';
   const t = Date.parse(at);
   return Number.isFinite(t) ? `${fmtAge(Math.max(0, now - t))} ago` : '';
 }
 
-const CHANGE_GLYPH: Record<string, string> = { ADDED: 'A', DELETED: 'D', RENAMED: 'R', COPIED: 'C', CHANGED: 'M', MODIFIED: 'M' };
+export const CHANGE_GLYPH: Record<string, string> = { ADDED: 'A', DELETED: 'D', RENAMED: 'R', COPIED: 'C', CHANGED: 'M', MODIFIED: 'M' };
 
 function ReviewForm({ pr, onSubmitted }: { pr: PrOverview; onSubmitted: (event: PrReviewEvent) => void }) {
   const [event, setEvent] = useState<PrReviewEvent>('COMMENT');
@@ -307,35 +310,79 @@ function mergeDoneText(d: MergeDone): string {
 }
 
 /**
+ * What the viewer can do on the PR, below its description: re-run failed
+ * checks; review it, or on their own PR merge it (or turn auto-merge on or
+ * off) and re-request or ping its reviewers. Give it a `key` per PR, as
+ * PrDetail is given: a submitted review or a merge belongs to one PR. The
+ * simple UI's Conversation tab (pages/chat/PrConversation.tsx) shows it too.
+ */
+export function PrActions({ pr, url, now, onChanged }: { pr: PrOverview; url: string | null | undefined; now: number; onChanged: () => void }) {
+  const [done, setDone] = useState<PrReviewEvent | null>(null);
+  const [merged, setMerged] = useState<MergeDone | null>(null);
+  return (
+    <>
+      {pr.state === 'OPEN' && (pr.failedSuites.runs.length > 0 || pr.failedSuites.other.length > 0) && (
+        <ChecksPanel pr={pr} onDone={onChanged} />
+      )}
+
+      {done ? (
+        <div className="pro-done" role="status">
+          {REVIEW_EVENTS.find(e => e.id === done)?.done} on GitHub.{' '}
+          {url && <a href={url} target="_blank" rel="noreferrer">Open the PR</a>}
+        </div>
+      ) : pr.viewerCanReview ? (
+        <>
+          {pr.viewerReview && <div className="usage-dim pro-note">You {reviewStateLabel(pr.viewerReview.state)} {ago(pr.viewerReview.submittedAt, now)}.</div>}
+          <ReviewForm pr={pr} onSubmitted={ev => { setDone(ev); onChanged(); }} />
+        </>
+      ) : merged ? (
+        <div className="pro-done" role="status">{mergeDoneText(merged)}</div>
+      ) : pr.viewerCanMerge ? (
+        <MergePanel pr={pr} onDone={d => { setMerged(d); onChanged(); }} />
+      ) : null}
+
+      {/* Only a merge ends the review: an auto-merge toggle is exactly when a ping is still due. */}
+      {pr.viewerCanMerge && merged?.kind !== 'merged' && <ReviewersPanel pr={pr} onChanged={onChanged} />}
+    </>
+  );
+}
+
+/**
  * The body of a PR up close, without a frame: title, meta, description, files,
  * and the panels that act on it. The dialog below wraps it for the phone; the
  * PR overlay (PrsOverlay) shows it in its detail pane. Give it a `key` per PR:
  * its state (a submitted review, a merge) belongs to one PR.
  */
-export function PrDetail({ row, now, onChanged, footer }: {
+export function PrDetail({ row, now, onChanged, footer, onLoaded, listed }: {
   row: PrRow;
   now: number;
   /** After a review or merge action lands: the caller refreshes the lanes. */
   onChanged: () => void;
   /** Extra buttons beside the GitHub links (the dialog's Close). */
   footer?: React.ReactNode;
+  /** The PR as read from GitHub, for a caller that shows more of it (the simple UI's merge gates). */
+  onLoaded?: (pr: PrOverview) => void;
+  /**
+   * The caller's latest read of the PR list (GET /api/prs): each new one reads
+   * the PR again, so its checks and reviews follow GitHub while it stays open.
+   */
+  listed?: PrPipelineResponse | null;
 }) {
   const [pr, setPr] = useState<PrOverview | null>(null);
   const [error, setError] = useState('');
-  const [done, setDone] = useState<PrReviewEvent | null>(null);
-  const [merged, setMerged] = useState<MergeDone | null>(null);
 
   useEffect(() => {
     if (!row.repo || row.number == null) return;
     let live = true;
     prsApi.overview(row.repo, row.number)
-      .then(p => { if (live) setPr(p); })
+      .then(p => { if (live) { setPr(p); setError(''); onLoaded?.(p); } })
       .catch(err => { if (live) setError(apiErrorText(err, 'Could not read the pull request from GitHub.')); });
     return () => { live = false; };
-  }, [row.repo, row.number]);
+  }, [row.repo, row.number, listed]);
 
   const url = pr?.url ?? row.url;
   const checks = pr ? checksSummary(pr.checks) : null;
+  const description = prDescription(pr?.body);
 
   return (
     <>
@@ -345,7 +392,8 @@ export function PrDetail({ row, now, onChanged, footer }: {
         {pr && pr.state !== 'OPEN' && <span className="prs-badge">{pr.state.toLowerCase()}</span>}
       </div>
 
-      {error && <div className="error-text" role="alert">{error}</div>}
+      {/* A re-read that fails keeps the PR shown: the next one may answer. */}
+      {error && !pr && <div className="error-text" role="alert">{error}</div>}
       {!pr && !error && <div className="usage-dim pro-note">Reading from GitHub…</div>}
 
       {pr && (
@@ -368,7 +416,7 @@ export function PrDetail({ row, now, onChanged, footer }: {
             {pr.requestedReviewers.length > 0 && <span className="usage-dim">waiting on {pr.requestedReviewers.join(', ')}</span>}
           </div>
 
-          <div className="pro-body">{pr.body.trim() ? pr.body : <span className="usage-dim">No description.</span>}</div>
+          <div className={`pro-body${description ? ' pro-body-md' : ''}`}>{description ? <Markdown text={description} /> : <span className="usage-dim">No description.</span>}</div>
 
           <details className="pro-files">
             <summary>Files ({pr.changedFiles})</summary>
@@ -384,28 +432,7 @@ export function PrDetail({ row, now, onChanged, footer }: {
             </ul>
           </details>
 
-          {pr.state === 'OPEN' && (pr.failedSuites.runs.length > 0 || pr.failedSuites.other.length > 0) && (
-            <ChecksPanel pr={pr} onDone={onChanged} />
-          )}
-
-          {done ? (
-            <div className="pro-done" role="status">
-              {REVIEW_EVENTS.find(e => e.id === done)?.done} on GitHub.{' '}
-              {url && <a href={url} target="_blank" rel="noreferrer">Open the PR</a>}
-            </div>
-          ) : pr.viewerCanReview ? (
-            <>
-              {pr.viewerReview && <div className="usage-dim pro-note">You {reviewStateLabel(pr.viewerReview.state)} {ago(pr.viewerReview.submittedAt, now)}.</div>}
-              <ReviewForm pr={pr} onSubmitted={ev => { setDone(ev); onChanged(); }} />
-            </>
-          ) : merged ? (
-            <div className="pro-done" role="status">{mergeDoneText(merged)}</div>
-          ) : pr.viewerCanMerge ? (
-            <MergePanel pr={pr} onDone={d => { setMerged(d); onChanged(); }} />
-          ) : null}
-
-          {/* Only a merge ends the review: an auto-merge toggle is exactly when a ping is still due. */}
-          {pr.viewerCanMerge && merged?.kind !== 'merged' && <ReviewersPanel pr={pr} onChanged={onChanged} />}
+          <PrActions pr={pr} url={url} now={now} onChanged={onChanged} />
         </>
       )}
 

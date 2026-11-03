@@ -108,6 +108,16 @@ describe('the phone\'s PR screen with review groups', () => {
     act(() => button('Review next · termag#647')!.click());
     expect((mocks.overview as PrRow).number).toBe(647);
   });
+  it('says on each open member whether anyone has reviewed it, and on the head how many no one has', () => {
+    const none = { approved: [], changes: [], commented: [], botsApproved: [], botsChanges: [] };
+    mocks.data = { ...RES, groups: [{ ...GROUP, members: GROUP.members.map(m => (m.number === 647 ? { ...m, reviewers: { ...none, botsApproved: ['cursor'] } } : m.number === 648 ? { ...m, reviewers: { ...none, changes: ['ana'] } } : m)) }] };
+    render('/m/prs?lane=needs_my_review');
+    expect(document.querySelector('.m-prg-head')?.textContent).toContain('1 of 3 to review · 1 with no review yet');
+    act(() => document.querySelector<HTMLButtonElement>('.m-prg-head')!.click());
+    const previews = [...document.querySelectorAll('.m-prg-member .m-row-preview')].map(p => p.textContent);
+    expect(previews[1]).toBe('termag#647 · no review yet · cursor approved · needs your review · box side');
+    expect(previews[2]).toMatch(/^termag#648 · changes requested · yours/);
+  });
   it('Review all with Devin confirms, starts one review of what is left, and lands on its tab', async () => {
     render('/m/prs?lane=needs_my_review');
     act(() => document.querySelector<HTMLButtonElement>('.m-prg-head')!.click());
@@ -117,6 +127,8 @@ describe('the phone\'s PR screen with review groups', () => {
     expect(mocks.start).toHaveBeenCalledWith('p1', {
       workstream: 'main', pr: 647, url: 'https://github.com/example-org/termag/pull/647',
       group: { name: 'Desktop bridge', members: [{ repo: 'example-org/termag', number: 647, note: 'box side' }] },
+      // The phone shows one review pane, so it keeps to the first.
+      slot: 1,
     });
     expect(path).toBe('/m/p/p1?role=review');
   });

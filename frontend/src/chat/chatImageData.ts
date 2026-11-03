@@ -10,6 +10,9 @@ export const MAX_CHAT_IMAGE_BYTES = Math.floor((5 * 1024 * 1024 * 3) / 4);
 export const MAX_IMAGE_EDGE = 2000;
 export const CHAT_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] as const;
 export const CHAT_IMAGE_ACCEPT = CHAT_IMAGE_TYPES.join(',');
+/** A PDF goes as it is, to Claude as a document (agent/chat-images.js, chat-pdfs-v1). */
+export const CHAT_PDF_TYPE = 'application/pdf';
+export const CHAT_ATTACHMENT_ACCEPT = `${CHAT_IMAGE_ACCEPT},${CHAT_PDF_TYPE}`;
 
 /** One image ready to send: `data` is what the backend takes, `src` what the composer and bubble show. */
 export interface PreparedImage { id: string; mediaType: string; data: string; src: string; name: string }
@@ -18,13 +21,19 @@ export function isChatImageType(type: string): boolean {
   return (CHAT_IMAGE_TYPES as readonly string[]).includes(type);
 }
 
-/** The image files among dropped or pasted items (a drag of text, or a folder, has none). */
-export function imageFilesOf(list: { readonly length: number; [i: number]: File } | null | undefined): File[] {
+/** Every file in a paste or drop: what cannot be sent is noted by admitImages, not silently dropped. */
+export function filesOf(list: { readonly length: number; [i: number]: File } | null | undefined): File[] {
   if (!list) return [];
   const out: File[] = [];
-  for (let i = 0; i < list.length; i++) if (list[i].type.startsWith('image/')) out.push(list[i]);
+  for (let i = 0; i < list.length; i++) out.push(list[i]);
   return out;
 }
+
+/** A PDF by its type, or by its name when the browser gives none. */
+export function isPdfFile(file: Pick<File, 'type' | 'name'>): boolean {
+  return file.type === CHAT_PDF_TYPE || (!file.type && /\.pdf$/i.test(file.name));
+}
+
 
 /** Whether a drag carries files at all, which is all a dragover may know. */
 export function dragHasFiles(types: readonly string[] | DOMStringList | null | undefined): boolean {
@@ -37,13 +46,13 @@ export function dragHasFiles(types: readonly string[] | DOMStringList | null | u
  * supported types, up to MAX_CHAT_IMAGES in all, with one note for what it
  * left out.
  */
-export function admitImages(held: number, files: readonly File[]): { take: File[]; note: string | null } {
-  const supported = files.filter(f => isChatImageType(f.type));
+export function admitImages(held: number, files: readonly File[], pdfs = false): { take: File[]; note: string | null } {
+  const supported = files.filter(f => isChatImageType(f.type) || (pdfs && isPdfFile(f)));
   const room = Math.max(0, MAX_CHAT_IMAGES - held);
   const take = supported.slice(0, room);
   const notes: string[] = [];
-  if (supported.length < files.length) notes.push('Only PNG, JPEG, GIF and WebP images can be sent');
-  if (supported.length > room) notes.push(`At most ${MAX_CHAT_IMAGES} images per message`);
+  if (supported.length < files.length) notes.push(pdfs ? 'Only PNG, JPEG, GIF and WebP images and PDFs can be sent' : 'Only PNG, JPEG, GIF and WebP images can be sent');
+  if (supported.length > room) notes.push(`At most ${MAX_CHAT_IMAGES} ${pdfs ? 'attachments' : 'images'} per message`);
   return { take, note: notes.length ? notes.join('. ') : null };
 }
 
@@ -115,6 +124,20 @@ export async function prepareImage(file: File): Promise<PreparedImage> {
     if (base64Bytes(data) <= MAX_CHAT_IMAGE_BYTES) return { id, mediaType: type, data, src, name };
   }
   throw new Error(`${name} is too large to send, even made smaller`);
+}
+
+/** A PDF to send as it is; one over the cap is refused, as nothing can make it smaller here. */
+export async function preparePdf(file: File): Promise<PreparedImage> {
+  const name = file.name || 'document.pdf';
+  if (file.size > MAX_CHAT_IMAGE_BYTES) throw new Error(`${name} is larger than ${Math.round(MAX_CHAT_IMAGE_BYTES / 1024 / 1024 * 10) / 10} MB`);
+  const read = await readDataUrl(file);
+  const data = read.slice(read.indexOf(',') + 1);
+  return { id: `pdf${++nextId}`, mediaType: CHAT_PDF_TYPE, data, src: `data:${CHAT_PDF_TYPE};base64,${data}`, name };
+}
+
+/** An admitted file, made ready to send: a PDF as it is, an image by prepareImage. */
+export function prepareAttachment(file: File): Promise<PreparedImage> {
+  return isPdfFile(file) ? preparePdf(file) : prepareImage(file);
 }
 
 /** Where the backend serves an image the box keeps for a chat (routes/sessions.ts, the read-image RPC). */

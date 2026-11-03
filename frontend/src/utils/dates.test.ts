@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { lastNDaysUTC, previousNDaysUTC, utcDateKey, median } from './dates';
+import { lastNDays, lastNDaysUTC, localToday, previousNDays, previousNDaysUTC, utcDateKey, median } from './dates';
 
 describe('previousNDaysUTC', () => {
   it('offset 0 equals lastNDaysUTC and ends today (UTC)', () => {
@@ -17,6 +17,16 @@ describe('previousNDaysUTC', () => {
     const lastPrev = new Date(prev[6] + 'T00:00:00Z');
     const firstCur = new Date(cur[0] + 'T00:00:00Z');
     expect(firstCur.getTime() - lastPrev.getTime()).toBe(86_400_000);
+  });
+});
+
+describe('previousNDays', () => {
+  it('is the local days, offset 0 ending today, offset n the period before', () => {
+    expect(previousNDays(7, 0)).toEqual(lastNDays(7));
+    expect(lastNDays(7)[6]).toBe(localToday());
+    const prev = previousNDays(7, 7);
+    expect(new Set([...lastNDays(7), ...prev]).size).toBe(14);
+    expect(prev[6] < lastNDays(7)[0]).toBe(true);
   });
 });
 

@@ -1,11 +1,12 @@
 import React from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import type { WorktimeResponse } from '../../services/api';
-import { PROVIDERS, ProviderConfig } from '../../providers/registry';
+import { PROVIDERS, ProviderConfig, providerColor } from '../../providers/registry';
+import { usePalette } from '../../theme/usePalette';
 import { fmtDuration, fmtDurationShort } from '../../utils/format';
 import { HUMAN, mergeWtDays, activeWtProviders, WtDayData } from '../../utils/worktime';
 import { ChartCard } from './ChartCard';
-import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, DashTooltip, SeriesLegend, opaque } from './chartTheme';
+import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, CURSOR, DashTooltip, SeriesLegend, opaque } from './chartTheme';
 import { RangeKeys, shortDate } from './range';
 
 const H = 3_600_000;
@@ -19,6 +20,7 @@ interface Props { wt: WorktimeResponse | null; keys: RangeKeys; stale: boolean }
  * the base (here: your own time first, agents after it).
  */
 function StackedRow({ data, providers, maxMs }: { data: WtDayData; providers: ProviderConfig[]; maxMs: number }) {
+  const palette = usePalette();
   const total = providers.reduce((s, p) => s + (data[p.id]?.totalMs ?? 0), 0);
   const fillPct = maxMs > 0 ? Math.min((total / maxMs) * 100, 100) : 0;
   return (
@@ -28,7 +30,8 @@ function StackedRow({ data, providers, maxMs }: { data: WtDayData; providers: Pr
           {providers.map(p => {
             const ms = data[p.id]?.totalMs ?? 0;
             if (ms <= 0 || total <= 0) return null;
-            const color = p.id === HUMAN ? p.color.bright : p.color.base;
+            const c = providerColor(p, palette);
+            const color = p.id === HUMAN ? c.bright : c.base;
             return <div key={p.id} className="wt-stacked-bar-seg" style={{ width: `${(ms / total) * 100}%`, background: opaque(color) }} title={`${p.displayName}: ${fmtDurationShort(ms)}`} />;
           })}
         </div>
@@ -46,6 +49,7 @@ function StackedRow({ data, providers, maxMs }: { data: WtDayData; providers: Pr
  * halves the space.
  */
 export function WorktimeCharts({ wt, keys, stale }: Props) {
+  const palette = usePalette();
   const human = PROVIDERS[HUMAN];
   if (!wt) {
     return (
@@ -57,7 +61,7 @@ export function WorktimeCharts({ wt, keys, stale }: Props) {
   const agentProviders = activeWtProviders(wt).filter(p => p.id !== HUMAN);
   // Legend / table order: agents, then you (left-to-right order of the bars).
   const stack: ProviderConfig[] = [...agentProviders, human];
-  const colorOf = (p: ProviderConfig) => opaque(p.id === HUMAN ? p.color.bright : p.color.base);
+  const colorOf = (p: ProviderConfig) => opaque(p.id === HUMAN ? providerColor(p, palette).bright : providerColor(p, palette).base);
   const series = stack.map(p => ({ id: p.id, label: p.id === HUMAN ? 'You' : p.displayName, color: colorOf(p) }));
 
   // Daily rows for the range (server-local keys).
@@ -126,7 +130,7 @@ export function WorktimeCharts({ wt, keys, stale }: Props) {
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
           <XAxis dataKey="label" tick={TICK} tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
           <YAxis tick={TICK} tickLine={false} axisLine={false} width={36} tickFormatter={hoursTick} />
-          <Tooltip cursor={{ fill: 'rgba(255,255,255,0.04)' }} content={<DashTooltip fmt={fmtDurationShort} total />} />
+          <Tooltip cursor={CURSOR} content={<DashTooltip fmt={fmtDurationShort} total />} />
           {/* Two bars per day, side by side: the agents (one stack, a segment per
               provider) and you. Same axis, so the heights compare directly. */}
           {agentProviders.map(p => (
