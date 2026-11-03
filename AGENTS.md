@@ -26,7 +26,7 @@ Production-ready. Provider registry covers Codex, Claude, Mistral (vibe), Devin,
 
 ## Domain Model
 
-The concepts the rest of this file and the code assume, one paragraph each, in [docs/agents/domain-model.md](docs/agents/domain-model.md): **Project**, **Paired tmux sessions**, **Workstream**, **Instance ("box")**, **Provider registry**, **Per-user agent process**, **Status events**, **Context-token warnings**, **Rate-limit detection**, **Working-time tracking**, **User segments (engagement ladder)**, **Human activity tracking**, **Project visit telemetry**, **Warp / flow-speed telemetry**, **Project sharing**, **Space**, **Automation**, **Admin surface**, **Agent-to-agent asks**, **Status WebSocket**.
+The concepts the rest of this file and the code assume, one paragraph each, in [docs/agents/domain-model.md](docs/agents/domain-model.md): **Project**, **Paired tmux sessions**, **Workstream**, **Instance ("box")**, **Provider registry**, **Per-user agent process**, **Status events**, **Context-token warnings**, **Rate-limit detection**, **Working-time tracking**, **User segments (engagement ladder)**, **Human activity tracking**, **Project visit telemetry**, **Warp / flow-speed telemetry**, **Project sharing**, **Space**, **Automation**, **Admin surface**, **Agent-to-agent asks**, **Desktop bridge**, **Status WebSocket**.
 
 ## Repository Layout
 
@@ -74,11 +74,7 @@ termag/
 │   ├── agents/                     What this file indexes: domain model, data and schema, configuration,
 │   │                               observability, integration surfaces, gotchas (each in full)
 │   ├── box-provisioning.md         Design doc for orchestrator-driven box provisioning
-│   ├── orchestrator-rds.md         The orchestrator's database on Aurora: design, cutover runbook
 │   ├── hosted-apps.md              How to host extra apps on ALB suburls via the nginx gateway
-│   ├── host-storage-handoff.md     How the host data volume moves to a new orchestrator; runbook
-│   ├── project-migration.md        Design: moving a project and its workstreams between boxes
-│   └── preview-share.md            Preview shares: a reviewer's sandboxed browser pane, no project access
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
 
@@ -188,7 +184,7 @@ Apache snippet in `deploy/apache.conf`. See `deploy/setup.md` for the canonical 
 **Changes should ship with tests.** The backend runs [vitest](https://vitest.dev):
 
 ```bash
-cd backend && npm test                       # vitest run — discovers src/**/*.test.ts
+cd backend && npm test                       # prisma generate, then vitest run — discovers src/**/*.test.ts
 npm test -- src/auth/allowedUsers.test.ts    # one file
 npm test -- -t 'domain wildcard'             # one test by name
 npm run test:watch
@@ -217,11 +213,12 @@ run against fakes. Opt-in fakes (`E2E_FAKE_AWS` via Floci, `E2E_FAKE_CLAUDE`, `E
 `E2E_TLS`, `E2E_SSHD`, `E2E_EC2_BOXES`, `E2E_EC2_LAUNCH`, `E2E_WARM_POOL`, `E2E_TMUX_FAULTS`) cover
 what a feature needs beyond that, and `E2E_FLAGS` sets `TERMAG_FLAGS` for the stack
 (`AUTH_MODE=local` only); extend them there rather than keeping one-off overlays.
-Guide: [`docs/e2e-stack.md`](docs/e2e-stack.md).
+Guide: [`docs/e2e-stack.md`](docs/e2e-stack.md), which also has recipes for the states a check or demo needs ("Setting up a scene").
+A PR's demo video, captioned: `scripts/demo-kit/demo-kit.mjs`.
 
 ## Observability & Maintenance
 
-Where logs live, how to tail them, health checks and routine operations: [docs/agents/observability.md](docs/agents/observability.md).
+Where logs live, how to tail them, health checks and routine operations: [docs/agents/observability.md](docs/agents/observability.md). The product-event list is there; `box.resumed` is the stop and hibernate resume sample.
 
 ## Integration Surfaces
 
@@ -231,65 +228,92 @@ The APIs, sockets and events other projects and boxes use, with payload shapes: 
 
 Read the matching entry in [docs/agents/gotchas.md](docs/agents/gotchas.md) before changing code in that area: each lede below is only the rule, not why it holds or what breaks.
 
-1. Per-user agent must be restarted on `agent/agent.js` changes
-2. `loginctl enable-linger <user>` is mandatory (Linux)
-3. `session` table is `connect-pg-simple`'s, but it IS declared in `schema.prisma`
-4. Slack scopes are large
-5. WebSocket upgrade ordering in Apache
-6. `ALLOWED_USERS` maps email→unixuser
-7. Project working dirs may be symlinks
-8. Claude Code hooks fire `curl ... &` (background)
-9. Codex bridge subprocess is owned by the per-user agent
-10. Provider registry lives in two files and must stay in sync
-11. `agentProvider` is a string, not an enum
-12. tmux poller patterns are provider-specific
-13. Working-time attribution is per-provider source
-14. Thermometers use an absolute 8h scale, not p50-relative
-15. Project sharing routes terminal access through the *owner's* per-user agent
-16. Context-token warnings are parsed from agent pane text, not a structured signal
-17. Rate-limit detection is also pane-text parsing
-18. Slack `/t` executor strips `ANTHROPIC_API_KEY` from the spawned env
-19. Project-list ordering is `pinned DESC, lastActiveAt DESC`
-20. Stale `waiting` status is auto-cleared by the per-user agent
-21. Agent reconnect reconstructs sessions from the backend's view, not the agent's
-22. `ensureAgentSessionsAndLaunch` probes before relaunching
-23. EC2 security-group descriptions must be ASCII
-24. Boxes are provisioned per-Unix-user
-25. The box AMI is discovered by tag, not by id
-26. Every project has a `main` workstream by default
-27. `AUTH_MODE=local` is the only sign-in bypass, and it is loopback-only
-28. `routes/auth.ts` is the source of truth for sign-in modes
-29. The container has no local tmux — `LOCAL_SESSIONS_ENABLED=false`
-30. `~/.local/bin/xclip` is a termag shim, not X11 xclip
-31. `deploy/` is the source of truth, but only `termag-reconcile` makes it true on a running box
-32. First boot rewrites the baked `/home/termag` path from a bake-time index, and the index step must stay the last provisioner
-33. `termag.service` runs `db:guard` before every start, and it can refuse
-34. Theme settings are a JSON column validated by a module that exists twice
-35. Admin tokens are `agent_tokens` rows with `scope = 'admin'` and must never reach `/ws/agent`
-36. Env-sourced admins are re-checked against `ADMIN_USERS` on every request; granted admins are not
-37. A cloud session's live status is keyed by the runner's tmux session name, not a project
-38. A session checkout's Bazel output base is removed by `termag-claude-runner`, by path hash
-39. The Review pane is a fifth session role, and the role list lives in five places
-40. An ask run has the box owner's full access, which is why asks are owner-only
-41. Never build a shell string to type text into tmux — spawn `tmux` with an argv array
-42. A provider that runs on boxes must post its own status, with a registered `source` — the tmux poller only sees the orchestrator's tmux
-43. `hibernated` is not `stopped`, and hibernation is fixed at launch
-44. A stale box is asked to update by the orchestrator, behind `box-auto-update-enabled`, and "current" means the newest box AMI's commit
-45. Host homes reach a new orchestrator only after the old one terminates, and nothing may touch a host account before that
-46. The daily briefing runs on the owner's box, never on the orchestrator, and is opt-in
-47. A PR or commit made on a box is marked as termag's, and authorship is never touched
-48. An agent spawn's brief is claimed by the first launch, by spawn id or child project id, never by name
-49. A handoff types only fixed lines, and a restart's relaunch is claimed like a spawn's brief
-50. New projects get a repo and an initial commit automatically, and the helper that does it lives in two files
-51. The viewport zoom lock is the workspace's, not the phone's
-52. A push subscription's endpoint is a URL the server POSTs to
-53. `VAPID_SUBJECT` must be a public contact, or Apple refuses every push
-54. Every agent telemetry resource carries the same four attributes
-55. An automation run is a chat-runner turn, and only the relay or the timeout sweep may finish it
-56. The browser pane's guest Chromium runs as `termag-guest`, and its sandbox is root's
-57. The simple UI's side panel attaches the ctrl shell, never the agent pane, and shares its tmux window
-58. A tab never starts the Okta login by itself; only a click or key press does
-59. A desktop thread's status is filed by its checkout, not its tmux pane
+One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas.md), in alphabetical order by slug, the same order as gotchas.md. There are no numbers: cite a gotcha by its subject or its slug. Insert a new one where its slug sorts, in both files, never at the end (`backend/src/docsLists.test.ts` checks that the two lists match).
+
+- [admin-env-admins](docs/agents/gotchas.md#admin-env-admins): Env-sourced admins are re-checked against `ADMIN_USERS` on every request; granted admins are not
+- [admin-tokens](docs/agents/gotchas.md#admin-tokens): Admin tokens are `agent_tokens` rows with `scope = 'admin'` and must never reach `/ws/agent`
+- [agent-bash-tool-shell](docs/agents/gotchas.md#agent-bash-tool-shell): Claude Code's Bash tool runs bash on a box, not the owner's zsh, and bash reads only `$BASH_ENV`
+- [agent-launch-probes-first](docs/agents/gotchas.md#agent-launch-probes-first): `ensureAgentSessionsAndLaunch` probes before relaunching
+- [agent-linger](docs/agents/gotchas.md#agent-linger): `loginctl enable-linger <user>` is mandatory (Linux)
+- [agent-reconnect-backend-view](docs/agents/gotchas.md#agent-reconnect-backend-view): Agent reconnect reconstructs sessions from the backend's view, not the agent's
+- [agent-restart-on-change](docs/agents/gotchas.md#agent-restart-on-change): Per-user agent must be restarted on `agent/agent.js` changes
+- [ami-by-tag](docs/agents/gotchas.md#ami-by-tag): The box AMI is discovered by tag, not by id
+- [ami-first-boot-path-index](docs/agents/gotchas.md#ami-first-boot-path-index): First boot rewrites the baked `/home/termag` path from a bake-time index, and the index step must stay the last provisioner
+- [ask-owner-only](docs/agents/gotchas.md#ask-owner-only): An ask run has the box owner's full access, which is why asks are owner-only
+- [ask-push-clone-upstream](docs/agents/gotchas.md#ask-push-clone-upstream): A push-mode ask clone's branch tracks an origin branch, or the thread's chat loses its tools
+- [ask-target-pr-history](docs/agents/gotchas.md#ask-target-pr-history): A thread on another PR fetches that PR's history in full, and its publish orders base-branch commits through GitHub
+- [auth-allowed-users](docs/agents/gotchas.md#auth-allowed-users): `ALLOWED_USERS` maps email→unixuser
+- [auth-local-mode](docs/agents/gotchas.md#auth-local-mode): `AUTH_MODE=local` is the only sign-in bypass, and it is loopback-only
+- [auth-okta-login-on-gesture](docs/agents/gotchas.md#auth-okta-login-on-gesture): A tab never starts the Okta login by itself; only a click or key press does
+- [auth-routes-source-of-truth](docs/agents/gotchas.md#auth-routes-source-of-truth): `routes/auth.ts` is the source of truth for sign-in modes
+- [automation-run-is-chat-turn](docs/agents/gotchas.md#automation-run-is-chat-turn): An automation run is a chat-runner turn, and only the relay or the timeout sweep may finish it
+- [box-auto-update](docs/agents/gotchas.md#box-auto-update): A stale box is asked to update by the orchestrator, behind `box-auto-update-enabled`, and "current" means the newest box AMI's commit
+- [box-claim-update](docs/agents/gotchas.md#box-claim-update): A box claimed from the warm pool is updated to the orchestrator's commit before its first launch, and every launch path waits for it
+- [box-deploy-reconcile](docs/agents/gotchas.md#box-deploy-reconcile): `deploy/` is the source of truth, but only `termag-reconcile` makes it true on a running box
+- [box-dotfiles-private-rerun](docs/agents/gotchas.md#box-dotfiles-private-rerun): A private dotfiles repo is cloned by a rerun, never by the claim's own run
+- [box-hibernated-not-stopped](docs/agents/gotchas.md#box-hibernated-not-stopped): `hibernated` is not `stopped`, and hibernation is fixed at launch
+- [box-per-unix-user](docs/agents/gotchas.md#box-per-unix-user): Boxes are provisioned per-Unix-user
+- [box-quarantine-held-by-status](docs/agents/gotchas.md#box-quarantine-held-by-status): A quarantined box is held by its status: every path that starts, terminates or reconnects a box must refuse `quarantined`
+- [box-repo-environment-file](docs/agents/gotchas.md#box-repo-environment-file): A box's default size comes from the repository's own `.termag/environment.json`, which is not a space's `.termag/`
+- [box-resize-hibernation-pool](docs/agents/gotchas.md#box-resize-hibernation-pool): A resize stops a hibernated box plainly first, and a resized box may lose hibernation and its pool spec
+- [box-sg-ascii](docs/agents/gotchas.md#box-sg-ascii): EC2 security-group descriptions must be ASCII
+- [box-xclip-shim](docs/agents/gotchas.md#box-xclip-shim): `~/.local/bin/xclip` is a termag shim, not X11 xclip
+- [briefing-on-owner-box](docs/agents/gotchas.md#briefing-on-owner-box): The daily briefing runs on the owner's box, never on the orchestrator, and is opt-in
+- [browser-pane-guest-chromium](docs/agents/gotchas.md#browser-pane-guest-chromium): The browser pane's guest Chromium runs as `termag-guest`, and its sandbox is root's
+- [chat-live-turn-stdin](docs/agents/gotchas.md#chat-live-turn-stdin): A live chat turn's stdin closes once, late, and the wrapper says so with `stdin-ended`
+- [chat-mermaid-sandboxed-frame](docs/agents/gotchas.md#chat-mermaid-sandboxed-frame): A Mermaid diagram is drawn in a sandboxed frame with svg-pan-zoom and Hammer.js, and Mermaid is only ever imported dynamically
+- [chat-open-mode-own-tree](docs/agents/gotchas.md#chat-open-mode-own-tree): A chat turn gets its full tools only on the project's own tree, and a read-only turn tells the model and the person why
+- [chat-pi-open-tiers-no-classifier](docs/agents/gotchas.md#chat-pi-open-tiers-no-classifier): pi's open tiers have no classifier, and only `--no-extensions` keeps the owner's MCP servers out
+- [chat-pi-process-group-stop](docs/agents/gotchas.md#chat-pi-process-group-stop): A pi chat turn never loads the pi status extension, and is stopped with SIGTERM to its process group
+- [chat-pi-turn-end-settled](docs/agents/gotchas.md#chat-pi-turn-end-settled): A pi turn ends on `agent_settled`, and a model error exits 0
+- [chat-stream-line-timestamps](docs/agents/gotchas.md#chat-stream-line-timestamps): In Claude's stream-json, only `assistant` and `user` lines carry a time
+- [chat-turn-cost-session-total](docs/agents/gotchas.md#chat-turn-cost-session-total): A chat turn's `total_cost_usd` is the session's cost so far, not the turn's
+- [cloud-runner-bazel-output-base](docs/agents/gotchas.md#cloud-runner-bazel-output-base): A session checkout's Bazel output base is removed by `termag-claude-runner`, by path hash
+- [container-no-local-tmux](docs/agents/gotchas.md#container-no-local-tmux): The container has no local tmux — `LOCAL_SESSIONS_ENABLED=false`
+- [db-session-table](docs/agents/gotchas.md#db-session-table): `session` table is `connect-pg-simple`'s, but it IS declared in `schema.prisma`
+- [deploy-apache-websocket-order](docs/agents/gotchas.md#deploy-apache-websocket-order): WebSocket upgrade ordering in Apache
+- [deploy-db-guard](docs/agents/gotchas.md#deploy-db-guard): `termag.service` runs `db:guard` before every start, and it can refuse
+- [deploy-host-homes-cutover](docs/agents/gotchas.md#deploy-host-homes-cutover): Host homes reach a new orchestrator only after the old one terminates, and nothing may touch a host account before that
+- [git-marks-prs-and-commits](docs/agents/gotchas.md#git-marks-prs-and-commits): A PR or commit made on a box is marked as termag's, and authorship is never touched
+- [github-broker-ghes-meta](docs/agents/gotchas.md#github-broker-ghes-meta): To `gh`, the GitHub broker is a GitHub Enterprise Server, so the gateway answers its version probe
+- [o11y-agent-resource-attributes](docs/agents/gotchas.md#o11y-agent-resource-attributes): Every agent telemetry resource carries the same four attributes
+- [pane-alt-screen-no-history](docs/agents/gotchas.md#pane-alt-screen-no-history): Agent panes run their TUI on tmux's alternate screen — capture has no history there
+- [project-dir-symlinks](docs/agents/gotchas.md#project-dir-symlinks): Project working dirs may be symlinks
+- [project-initial-commit](docs/agents/gotchas.md#project-initial-commit): New projects get a repo and an initial commit automatically, and the helper that does it lives in two files
+- [project-list-order](docs/agents/gotchas.md#project-list-order): Project-list ordering is `pinned DESC, lastActiveAt DESC`
+- [project-multi-repo-not-git](docs/agents/gotchas.md#project-multi-repo-not-git): A multi-repo project's directory is not a git repository
+- [project-sharing-owner-agent](docs/agents/gotchas.md#project-sharing-owner-agent): Project sharing routes terminal access through the *owner's* per-user agent
+- [provider-registry-two-files](docs/agents/gotchas.md#provider-registry-two-files): Provider registry lives in two files and must stay in sync
+- [provider-string-not-enum](docs/agents/gotchas.md#provider-string-not-enum): `agentProvider` is a string, not an enum
+- [push-endpoint-url](docs/agents/gotchas.md#push-endpoint-url): A push subscription's endpoint is a URL the server POSTs to
+- [push-vapid-subject](docs/agents/gotchas.md#push-vapid-subject): `VAPID_SUBJECT` must be a public contact, or Apple refuses every push
+- [simple-ui-launchpad-controls](docs/agents/gotchas.md#simple-ui-launchpad-controls): New simple-UI controls are LaunchPad's, and monospace is for code
+- [simple-ui-side-panel-ctrl-shell](docs/agents/gotchas.md#simple-ui-side-panel-ctrl-shell): The simple UI's side panel attaches the ctrl shell, never the agent pane, and shares its tmux window
+- [slack-scopes](docs/agents/gotchas.md#slack-scopes): Slack scopes are large
+- [slack-t-strips-api-key](docs/agents/gotchas.md#slack-t-strips-api-key): Slack `/t` executor strips `ANTHROPIC_API_KEY` from the spawned env
+- [space-memory-frozen-prompt](docs/agents/gotchas.md#space-memory-frozen-prompt): A chat session's space memory is frozen into its system prompt at the session's first turn; changes come as a notice in the message
+- [spawn-brief-claim](docs/agents/gotchas.md#spawn-brief-claim): An agent spawn's brief is claimed by the first launch, by spawn id or child project id, never by name
+- [spawn-handoff-fixed-lines](docs/agents/gotchas.md#spawn-handoff-fixed-lines): A handoff types only fixed lines, and a restart's relaunch is claimed like a spawn's brief
+- [status-claude-hooks-background](docs/agents/gotchas.md#status-claude-hooks-background): Claude Code hooks fire `curl ... &` (background)
+- [status-cloud-session-key](docs/agents/gotchas.md#status-cloud-session-key): A cloud session's live status is keyed by the runner's tmux session name, not a project
+- [status-codex-bridge](docs/agents/gotchas.md#status-codex-bridge): Codex bridge subprocess is owned by the per-user agent
+- [status-context-warnings-pane-text](docs/agents/gotchas.md#status-context-warnings-pane-text): Context-token warnings are parsed from agent pane text, not a structured signal
+- [status-desktop-thread-checkout](docs/agents/gotchas.md#status-desktop-thread-checkout): A desktop thread's status is filed by its checkout, not its tmux pane
+- [status-provider-posts-own](docs/agents/gotchas.md#status-provider-posts-own): A provider that runs on boxes must post its own status, with a registered `source` — the tmux poller only sees the orchestrator's tmux
+- [status-rate-limit-pane-text](docs/agents/gotchas.md#status-rate-limit-pane-text): Rate-limit detection is also pane-text parsing
+- [status-stale-waiting](docs/agents/gotchas.md#status-stale-waiting): Stale `waiting` status is auto-cleared by the per-user agent
+- [status-tmux-poller-patterns](docs/agents/gotchas.md#status-tmux-poller-patterns): tmux poller patterns are provider-specific
+- [status-working-time-source](docs/agents/gotchas.md#status-working-time-source): Working-time attribution is per-provider source
+- [test-fake-timers-fake-intl](docs/agents/gotchas.md#test-fake-timers-fake-intl): `vi.useFakeTimers()` fakes `Intl` too, so a timezone spy does nothing under it
+- [test-root-only-cases](docs/agents/gotchas.md#test-root-only-cases): A test case that needs a file you don't own runs only as root
+- [tmux-argv-not-shell-string](docs/agents/gotchas.md#tmux-argv-not-shell-string): Never build a shell string to type text into tmux — spawn `tmux` with an argv array
+- [ui-theme-settings-two-modules](docs/agents/gotchas.md#ui-theme-settings-two-modules): Theme settings are a JSON column validated by a module that exists twice
+- [ui-thermometer-scale](docs/agents/gotchas.md#ui-thermometer-scale): Thermometers use an absolute 8h scale, not p50-relative
+- [ui-whats-new-entries](docs/agents/gotchas.md#ui-whats-new-entries): A change people will notice adds or edits its What's new entry, in the PR that makes it live
+- [ui-zoom-lock](docs/agents/gotchas.md#ui-zoom-lock): The viewport zoom lock is the workspace's, not the phone's
+- [workstream-main](docs/agents/gotchas.md#workstream-main): Every project has a `main` workstream by default
+- [workstream-review-pane-role](docs/agents/gotchas.md#workstream-review-pane-role): The Review pane is a fifth session role, and the role list lives in five places
+- [worktime-day-is-the-persons](docs/agents/gotchas.md#worktime-day-is-the-persons): A working-time day is the person's own, in the zone their clients last sent
 
 ## Related
 

@@ -1,6 +1,6 @@
 # Box hibernation
 
-A box launched hibernation-capable gets a **Hibernate box** action next to **Stop box**. Hibernating saves the box's RAM to a swap file on its root volume and powers the instance off. A start then resumes it with tmux sessions, agents, dev servers and containers where they were. Like a stopped box, a hibernated box costs only its EBS volumes. Stop stays a plain stop.
+Nothing hibernates a box any more: parking is a stop, the box menu has no **Hibernate box**, and a manual hibernate answers 409 `hibernate_off` (Park by stopping). A box hibernated before that still resumes, and the rest of this page describes how hibernation works for it and for launches. Hibernating saves the box's RAM to a swap file on its root volume and powers the instance off. A start then resumes it with tmux sessions, agents, dev servers and containers where they were. Like a stopped box, a hibernated box costs only its EBS volumes. Stop stays a plain stop.
 
 ## What has to line up
 
@@ -39,15 +39,15 @@ ready ──hibernate──▶ hibernating ──sweep (EC2 stopped, StateReason
 
 ## The 60-day limit
 
-EC2 doesn't support keeping an instance hibernated for longer than 60 days. Once a box has been hibernated for `BOX_HIBERNATION_REFRESH_DAYS` (default 55), the power sweep resumes it with `rehibernatePending` set. When its agent connects, the sweep hibernates it again, which restarts the clock and keeps the RAM. If EC2 refuses the re-hibernate, the sweep retries every 10 s, up to 30 times, then plainly stops the box. The box list warns from day 50. Set `BOX_HIBERNATION_REFRESH_DAYS=0` to turn the refresh off.
+EC2 doesn't support keeping an instance hibernated for longer than 60 days. Once a box has been hibernated for `BOX_HIBERNATION_REFRESH_DAYS` (default 55), the power sweep resumes it with `rehibernatePending` set. When its agent connects, the sweep stops it (Park by stopping): parking never hibernates, so the RAM is not kept, and a manual hibernate answers 409 `hibernate_off`. A box already hibernated still resumes. The box list warns from day 50. Set `BOX_HIBERNATION_REFRESH_DAYS=0` to turn the refresh off.
 
 ## Rolling it out
 
 Nothing here needs AWS access by hand: the orchestrator's own role launches, hibernates and resumes the test box.
 
 1. Bake a candidate on a channel from main: Publish AMI → target `box`, `hibernation` ticked, `publish` off, `channel` `hibernation`. This makes a `Component=box-candidate` tagged `Hibernation=supported`, `Channel=hibernation` and `Retain=true`. The job summary shows the AMI id.
-2. Set the `box-image` flag to `hibernation` for the tester only. That needs a flag source with per-user targeting; `TERMAG_FLAGS` sets one value for everyone, so on a stack configured that way, run this step on a test orchestrator.
-3. As the tester, add a box (it launches as the orchestrator's `BOX_INSTANCE_TYPE`, which must support hibernation; M8g, M9g and T4g do). It skips the warm pool and launches from the candidate with hibernation configured; the box list shows a `hibernation` badge, and the tooltip the AMI id. Run tmux, Claude and `make dev`, then **Hibernate box** and **Start box** from the box menu. Check that the resume works (kernel lockdown on the NitroTPM image is the main unknown), and note how long hibernate and resume take, whether `/dev/tpm0` and containers survive, and how much first boot slows down.
+2. Set the `box-image` flag to `hibernation` for the tester only (an individual target on their user context). Everyone else stays on the published image.
+3. As the tester, add a box (it launches as the orchestrator's `BOX_INSTANCE_TYPE`, which must support hibernation; M8g, M9g and T4g do). It skips the warm pool and launches from the candidate with hibernation configured; the box list shows a `hibernation` badge, and the tooltip the AMI id. Run tmux, Claude and `make dev`, then **Hibernate box** and **Start box** from the box menu (as it was rolled out; the menu no longer offers Hibernate). Check that the resume works (kernel lockdown on the NitroTPM image is the main unknown), and note how long hibernate and resume take, whether `/dev/tpm0` and containers survive, and how much first boot slows down.
 4. Set the repo Variable `BOX_HIBERNATION_BAKE=true`, so scheduled bakes publish hibernation-capable images. Users on the published image still get plain Stop while `box-hibernation-enabled` serves `false`.
 5. With per-user targeting, optionally turn `box-hibernation-enabled` on for a few users first. Their new boxes launch hibernation-capable from the published image and skip the warm pool, since the pool still launches without it.
 6. Turn `box-hibernation-enabled` on for everyone (`TERMAG_FLAGS='{"box-hibernation-enabled": true}'`). The warm pool's spec hash then changes and rolls the pool onto hibernation-capable boxes, and every user at the default claims from it again.

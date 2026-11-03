@@ -131,7 +131,10 @@ Two kinds, both created from the **Boxes** section of the UI:
 
 - **EC2** (default): the orchestrator provisions an AWS box for you via the SDK
   (see [docs/box-provisioning.md](docs/box-provisioning.md)). The token rides in
-  `user_data` and never leaves the server.
+  `user_data` and never leaves the server. The CLI (`termag box create`) makes
+  EC2 boxes too; `--minimal` launches the lean `Component=box-min` image —
+  what the box contract needs and nothing else, bootstrapped by you (also in
+  `docs/box-provisioning.md`).
 - **Self-managed**: tick *"self-managed (run agent on my own machine)"* when
   adding a box. No AWS is touched; the UI returns a one-time `agent.config.json`
   snippet (`termag_url` + `token`) to paste onto your own machine (laptop,
