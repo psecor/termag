@@ -27,8 +27,19 @@
 #   E2E_T3_COMMAND=c   with E2E_T3: the t3 command boxes run instead (a fork's build, say)
 #   E2E_CLAUDE_BIN=p   a real claude binary on every box's PATH (not with E2E_FAKE_CLAUDE)
 #   E2E_FAKE_GITHUB=1  api.github.com + github.com git stub for the backend, stand-in gh on boxes
+#   E2E_REAL_GITHUB=1  with E2E_FAKE_GITHUB: boxes clone and fetch from the real github.com
+#                      with your own git credentials (read only: pushes go to the stub);
+#                      the backend's GitHub calls still all go to the stub
+#   E2E_DOTFILES_REPO=<https://github.com/owner/repo>
+#                      with E2E_WARM_POOL: your dotfiles preference, applied on a warm-pool
+#                      claim as in production, without running anything from the repository
+#                      (E2E_DOTFILES_SCRIPTS=1 runs its install script: only for a repo
+#                      whose script you have read)
 #   E2E_PANE_CLONE=1   boxes clone a repository in the agent pane, as an agent without the
 #                      durable clone unit does, instead of through termag-project-clone@
+#   E2E_ASK_RUNNER=1   every box, a launched one too, gets the real termag-subagent-run at
+#                      ~/.local/bin, so its agent takes asks (ask-v1, ask-chat-v1) from its
+#                      first connect; with E2E_FAKE_CLAUDE their turns run the stand-in claude
 #   E2E_TLS=1          nginx gateway from deploy/nginx; boxes connect over wss
 #   E2E_BROKER_443=1   with E2E_CLAUDE_GATEWAY: relay 127.0.0.1:443 (from the box address) to
 #                      the gateway's GitHub broker front and point the backend's
@@ -70,6 +81,12 @@ FAKE_AWS=${E2E_FAKE_AWS:-}
 CREDENTIAL_STORE=${E2E_CREDENTIAL_STORE:-}
 SPACES=${E2E_SPACES:-}
 FAKE_CLAUDE=${E2E_FAKE_CLAUDE:-}
+# E2E_CLAUDE_SIGNED_IN=1: every stand-in box, a launched one too, counts as
+# signed in through the termag gateway (a gateway apiKeyHelper in its
+# ~/.claude/settings.json), as a real box does once credentials are delivered.
+# Off by default, so the stack still shows the Sign in to Claude Enterprise
+# flow (fakes/claude-auth.mjs) that stand-in boxes otherwise always need.
+CLAUDE_SIGNED_IN=${E2E_CLAUDE_SIGNED_IN:-}
 FAKE_GITHUB=${E2E_FAKE_GITHUB:-}
 DOTFILES_SCRIPTS=${E2E_DOTFILES_SCRIPTS:-}
 FAKE_TLS=${E2E_TLS:-}
@@ -120,6 +137,9 @@ BACKEND_ENV_EXTRA=${E2E_BACKEND_ENV:+$(realpath "$E2E_BACKEND_ENV")}
 OVERLAP=${E2E_OVERLAP:-}
 GREEN_PORT=${E2E_GREEN_PORT:-}
 PANE_CLONE=${E2E_PANE_CLONE:-}
+ASK_RUNNER=${E2E_ASK_RUNNER:-}
+REAL_GITHUB=${E2E_REAL_GITHUB:-}
+DOTFILES_REPO=${E2E_DOTFILES_REPO:-}
 # Boxes reach GitHub through a broker only with the Claude gateway (its GitHub
 # listener); without one a box's own git config is its only way to GitHub.
 GITHUB_BROKER=${E2E_CLAUDE_GATEWAY:+1}
@@ -188,6 +208,21 @@ fakes_check() {
     [ -z "$FAKE_CLAUDE" ] || die "E2E_CLAUDE_BIN and E2E_FAKE_CLAUDE both put a claude on the boxes; pick one"
     [ -x "$CLAUDE_BIN" ] || die "E2E_CLAUDE_BIN: $CLAUDE_BIN is not executable"
   fi
+  if [ -n "$REAL_GITHUB" ]; then
+    # The stub stays the backend's GitHub: SSH keys, token checks, PRs and
+    # pushes never reach your account.
+    [ -n "$FAKE_GITHUB" ] || die "E2E_REAL_GITHUB needs E2E_FAKE_GITHUB=1: the backend's GitHub calls go to the stub"
+    [ -z "$GITHUB_BROKER" ] || die "E2E_REAL_GITHUB does not run with E2E_CLAUDE_GATEWAY: its broker would hand boxes the stored token"
+    [ -z "$FAKE_TLS" ] || die "E2E_REAL_GITHUB does not run with E2E_TLS: the boxes then trust only the stack's CA, so github.com's certificate would not verify"
+  fi
+  if [ -n "$DOTFILES_REPO" ]; then
+    [ -n "$WARM_POOL" ] || die "E2E_DOTFILES_REPO needs E2E_WARM_POOL: dotfiles are applied only on a warm-pool claim"
+    # As parseDotfilesRepoUrl saves it: no trailing slash, no .git.
+    while [[ $DOTFILES_REPO == */ ]]; do DOTFILES_REPO=${DOTFILES_REPO%/}; done
+    DOTFILES_REPO=${DOTFILES_REPO%.git}
+    [[ $DOTFILES_REPO =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+      || die "E2E_DOTFILES_REPO must be https://github.com/<owner>/<repo>, got '$DOTFILES_REPO'"
+  fi
   if [ -n "$BACKEND_ENV_EXTRA" ] && [ ! -r "$BACKEND_ENV_EXTRA" ]; then die "E2E_BACKEND_ENV: cannot read $BACKEND_ENV_EXTRA"; fi
   if [ -n "$BROKER_443" ]; then
     [ -n "$CLAUDE_GATEWAY_TF" ] && [ -n "$FAKE_GITHUB" ] || die "E2E_BROKER_443 needs E2E_CLAUDE_GATEWAY and E2E_FAKE_GITHUB=1: the broker is the gateway's"
@@ -233,13 +268,14 @@ fakes_check() {
 
 fakes_record() {
   cat >>"$ROOT/stack.env" <<EOF
-FAKES="${PG_IAM:+pg-iam }${FAKE_AWS:+aws }${CREDENTIAL_STORE:+credential-store }${SPACES:+spaces }${FAKE_BEDROCK:+bedrock }${FAKE_MCP:+mcp }${CLAUDE_GATEWAY_TF:+claude-gateway }${EC2_LAUNCH:+ec2-launch }${WARM_POOL:+warm-pool }${FLAGS:+flags }${FAKE_CLAUDE:+claude }${CLAUDE_BIN:+real-claude }${T3:+t3 }${FAKE_GITHUB:+github }${FAKE_TLS:+tls }${FAKE_SSHD:+sshd }${TMUX_FAULTS:+tmux-faults }"
+FAKES="${PG_IAM:+pg-iam }${FAKE_AWS:+aws }${CREDENTIAL_STORE:+credential-store }${SPACES:+spaces }${FAKE_BEDROCK:+bedrock }${FAKE_MCP:+mcp }${CLAUDE_GATEWAY_TF:+claude-gateway }${EC2_LAUNCH:+ec2-launch }${WARM_POOL:+warm-pool }${FLAGS:+flags }${FAKE_CLAUDE:+claude }${CLAUDE_BIN:+real-claude }${T3:+t3 }${FAKE_GITHUB:+github }${REAL_GITHUB:+real-github }${DOTFILES_REPO:+dotfiles }${FAKE_TLS:+tls }${FAKE_SSHD:+sshd }${TMUX_FAULTS:+tmux-faults }"
 EC2_BOXES=$EC2_BOXES
 AWS_URL=${FAKE_AWS:+http://127.0.0.1:$AWS_PORT}
 FLOCI_MODE=$FLOCI_MODE
 EC2_URL=${EC2_LAUNCH:+http://127.0.0.1:$EC2_PORT}
 AWS_REGION=${FAKE_AWS:+$AWS_REGION_E2E}
 GITHUB_URL=${FAKE_GITHUB:+http://127.0.0.1:$GITHUB_PORT}
+DOTFILES_REPO=$DOTFILES_REPO
 TLS_URL=${FAKE_TLS:+https://localhost:$TLS_PORT/termag}
 GITHUB_BROKER_FRONT=${CLAUDE_GATEWAY_TF:+https://localhost:$GITHUB_GW_PORT}
 STS_URL=${CLAUDE_GATEWAY_TF:+http://127.0.0.1:$STS_PORT}
@@ -257,6 +293,39 @@ t3_box_command() {
   if [ -n "$T3_COMMAND" ]; then command -v "$T3_COMMAND"; return; fi
   E2E_CACHE_DIR="$CACHE_DIR" bash "$fakes_dir/t3.sh" fetch 2>>"$ROOT/logs/t3-install.log" \
     || die "fetching the pinned t3 release failed (logs/t3-install.log)"
+}
+
+# E2E_REAL_GITHUB: the git credential helper every box's git uses for
+# https://github.com. It asks your own git (your HOME, your credential helpers:
+# the keychain, gh) for a credential and hands it to the box's git for that one
+# request; this helper stores nothing, and `store` and `erase` are ignored, so
+# nothing is written to your keychain through it. It answers only a fetch: a
+# git clone, fetch, pull or ls-remote talking to github.com over https, never a
+# push (a box's pushes go to the stub anyway, fakes_box_github_gitconfig) and
+# never a bare `git credential fill`, so git's own plumbing can't hand the
+# token out.
+#
+# The box gets it through its environment, which git reads after every config
+# file, behind an empty credential.helper that drops the helpers those files
+# gave: git sends `store` to every helper it has, so a linked dotfiles
+# .gitconfig's `helper = store` or osxkeychain, or Apple git's built-in
+# osxkeychain (which GIT_CONFIG_SYSTEM does not replace), would keep the token.
+# A helper the box puts on a command line (git -c credential.helper=…, read
+# after the environment) still sees it: accidents, not malice.
+real_github_helper() {
+  local dir="$ROOT/real-github"
+  mkdir -p "$dir"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# Written by scripts/e2e/fakes/fakes.sh (E2E_REAL_GITHUB). Holds no credential.'
+    printf 'HOST_HOME=%q\n' "$HOME"
+    printf 'HOST_PATH=%q\n' "$PATH"
+    printf 'HOST_USER=%q\n' "$(id -un)"
+    cat "$fakes_dir/git-credential-host"
+  } >"$dir/git-credential"
+  chmod 0755 "$dir/git-credential"
+  box_extra+=(GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=
+    GIT_CONFIG_KEY_1=credential.https://github.com.helper "GIT_CONFIG_VALUE_1=!'$dir/git-credential'")
 }
 
 # The stack's CA and its localhost certificate, once.
@@ -425,6 +494,25 @@ EOF
     port_in_use "$EC2_PORT" || die "the EC2 launch fake did not listen on $EC2_PORT (logs/ec2-launch.log)"
   fi
 
+  if [ -n "$FAKE_GITHUB" ] && [ -n "$DOTFILES_REPO" ] && [ -z "$REAL_GITHUB" ]; then
+    # A box's git reaches the stub for github.com, so the stub serves the
+    # dotfiles repository: fetched once, anonymously, as a public repo.
+    local slug=${DOTFILES_REPO#https://github.com/}
+    slug=${slug%.git}
+    local bare="$ROOT/github/$slug.git"
+    if [ ! -d "$bare" ]; then
+      log "mirroring $DOTFILES_REPO into the GitHub stub (an anonymous fetch)"
+      mkdir -p "$(dirname "$bare")"
+      env -i "${base_env[@]}" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git clone -q --bare -- "$DOTFILES_REPO" "$bare" >>"$ROOT/logs/github.log" 2>&1 \
+        || die "could not fetch $DOTFILES_REPO anonymously; a private dotfiles repo needs E2E_REAL_GITHUB=1"
+      : >"$bare/termag-e2e-public"
+    fi
+  fi
+  if [ -n "$REAL_GITHUB" ]; then
+    real_github_helper
+  fi
+
   if [ -n "$FAKE_GITHUB" ]; then
     log "starting the api.github.com stub on 127.0.0.1:$GITHUB_PORT"
     start_daemon github "$fakes_dir" env -i "${base_env[@]}" "E2E_GITHUB_PORT=$GITHUB_PORT" "E2E_GITHUB_ROOT=$ROOT/github" node github-stub.mjs
@@ -505,7 +593,7 @@ fakes_after_backend() {
       -e "s#/etc/nginx/snippets/termag-proxy.conf#$n/termag-proxy.conf#" \
       -e "s#127.0.0.1:3100#127.0.0.1:$PORT#" \
       "$repo/deploy/nginx/termag-checks.conf" >"$n/checks.conf"
-  if ! grep -q "listen 127.0.0.1:$CHECKS_PORT;" "$n/checks.conf" || [ "$(grep -c "127.0.0.1:$PORT;" "$n/checks.conf")" != 4 ] \
+  if ! grep -q "listen 127.0.0.1:$CHECKS_PORT;" "$n/checks.conf" || [ "$(grep -c "127.0.0.1:$PORT;" "$n/checks.conf")" != "$(grep -c '127.0.0.1:3100;' "$repo/deploy/nginx/termag-checks.conf")" ] \
      || grep -q '/etc/nginx/snippets' "$n/checks.conf"; then
     die "deploy/nginx/termag-checks.conf no longer matches what scripts/e2e/fakes/fakes.sh rewrites"
   fi
@@ -632,7 +720,7 @@ EOF
     log "starting the Claude gateway (Envoy) on 127.0.0.1:$ENVOY_PORT, TLS front on localhost:$CLAUDE_GW_PORT"
     # The task role's credentials in production; any key signs for the stub.
     start_daemon claude-gateway "$ROOT/claude-gateway" env -i "${base_env[@]}" \
-      AWS_ACCESS_KEY_ID=AKIAE2ECLAUDEGATEWAY AWS_SECRET_ACCESS_KEY=e2e-fake-secret AWS_EC2_METADATA_DISABLED=true \
+      "AWS_ACCESS_KEY_ID=$GATEWAY_KEY_ID" AWS_SECRET_ACCESS_KEY=e2e-fake-secret AWS_EC2_METADATA_DISABLED=true \
       "$envoy" -c envoy.yaml --disable-hot-restart --log-level warn
     wait_http "http://127.0.0.1:$ENVOY_PORT/healthz" claude-gateway
     wait_http "http://127.0.0.1:$((ENVOY_PORT + 2))/healthz" claude-gateway
@@ -657,30 +745,17 @@ EOF
   box_extra+=("NODE_EXTRA_CA_CERTS=$t/ca.pem" "CURL_CA_BUNDLE=$t/ca.pem" "GIT_SSL_CAINFO=$t/ca.pem" "SSL_CERT_FILE=$t/ca.pem")
 }
 
-# Per box, before its agent starts. $1 = box name, $2 = box dir, $3 = its
-# tmux socket (box.sh picks it).
+# Per box, before its agent starts. $1 = box name, $2 = box dir.
 fakes_box() {
-  local name=$1 box=$2 sock=${3:-$2/tmux.sock}
-  if [ -n "$TMUX_FAULTS" ]; then
-    : >"$box/tmux-fault"
-    # Modes match the agent's attach sequence: it sets set-clipboard right
-    # before each `tmux attach-session`, and polls with capture-pane.
-    cat >"$box/bin/tmux" <<EOF
-#!/bin/sh
-mode=\$(cat '$box/tmux-fault' 2>/dev/null)
-case "\$mode:\$1 \$2 \$3" in
-  attach-delay=*:"set-option -g set-clipboard") sleep "\${mode#attach-delay=}" ;;
-  hang:capture-pane*|hang:display-message*) exec sleep 100000 ;;
-esac
-exec '$REAL_TMUX' -S '$sock' "\$@"
-EOF
-    chmod 0755 "$box/bin/tmux"
-  fi
+  local name=$1 box=$2
+  # E2E_TMUX_FAULTS: box.sh's tmux wrapper reads this file before each call.
+  if [ -n "$TMUX_FAULTS" ]; then : >"$box/tmux-fault"; fi
   [ -n "$CLAUDE_BIN" ] && ln -sf "$CLAUDE_BIN" "$box/bin/claude"
   if [ -n "$CLAUDE_KEYCHAINS" ]; then mkdir -p "$box/home/Library" && ln -sfn "$CLAUDE_KEYCHAINS" "$box/home/Library/Keychains"; fi
   [ -n "$FAKE_CLAUDE" ] && install -m 0755 "$fakes_dir/claude" "$box/bin/claude" \
     && install -m 0644 "$fakes_dir/claude-bedrock.mjs" "$box/bin/claude-bedrock.mjs" \
     && install -m 0644 "$fakes_dir/claude-stream.mjs" "$box/bin/claude-stream.mjs" \
+    && install -m 0644 "$fakes_dir/claude-json.mjs" "$box/bin/claude-json.mjs" \
     && install -m 0644 "$fakes_dir/claude-sdk.mjs" "$box/bin/claude-sdk.mjs" \
     && install -m 0644 "$fakes_dir/claude-auth.mjs" "$box/bin/claude-auth.mjs"
   # The desktop threads' Claude (the SDK-mode stand-in under the box's t3
@@ -694,9 +769,23 @@ EOF
     [ -e "$box/home/.claude/settings.json" ] || install -m 0644 "$repo/deploy/claude-settings.json" "$box/home/.claude/settings.json"
     install -m 0755 "$repo/deploy/termag-status" "$box/home/.local/bin/termag-status"
   fi
+  if [ -n "$FAKE_CLAUDE" ] && [ -n "$CLAUDE_SIGNED_IN" ]; then
+    mkdir -p "$box/home/.claude"
+    node -e '
+      const fs = require("fs"); const f = process.argv[1];
+      let s = {}; try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+      if (!s.apiKeyHelper) { s.apiKeyHelper = "echo e2e-gateway"; fs.writeFileSync(f, JSON.stringify(s, null, 2) + "\n"); }
+    ' "$box/home/.claude/settings.json"
+  fi
   if [ -n "$FAKE_GITHUB" ]; then
     install -m 0755 "$fakes_dir/gh" "$box/bin/gh"
-    git config -f "$box/etc/gitconfig" "url.http://127.0.0.1:$GITHUB_PORT/_github.com/.insteadOf" https://github.com/
+    fakes_box_github_gitconfig "$box/etc/gitconfig"
+  fi
+  # The agent announces asks only where the real runner is (it greps the file
+  # for its phases), as termag-reconcile installs it on a box image.
+  if [ -n "${ASK_RUNNER:-}" ]; then
+    mkdir -p "$box/home/.local/bin"
+    install -m 0755 "$repo/deploy/termag-subagent-run" "$box/home/.local/bin/termag-subagent-run"
   fi
   local warm=
   grep -q '"warm": true' "$box/home/.termag/agent.config.json" && warm=1
@@ -704,6 +793,26 @@ EOF
   if [ -z "$PANE_CLONE" ]; then fakes_clone_box "$box"; fi
   if [ -n "$warm" ]; then fakes_warm_box "$box"; fi
   return 0
+}
+
+# Where a box's git reaches GitHub (E2E_FAKE_GITHUB), in its system gitconfig
+# $1. box.sh runs again for every start of the box: set, don't pile up.
+fakes_box_github_gitconfig() {
+  local cfg=$1 stub="http://127.0.0.1:$GITHUB_PORT/_github.com/"
+  git config -f "$cfg" --unset-all "url.$stub.insteadOf" 2>/dev/null || true
+  git config -f "$cfg" --unset-all "url.$stub.pushInsteadOf" 2>/dev/null || true
+  if [ -n "$REAL_GITHUB" ]; then
+    # Clones and fetches go to github.com, with your credentials through the
+    # box's environment (real_github_helper); a push goes to the stub, which
+    # has none of your repositories.
+    git config -f "$cfg" --add "url.$stub.pushInsteadOf" https://github.com/
+  else
+    git config -f "$cfg" "url.$stub.insteadOf" https://github.com/
+  fi
+  # ssh reads the keys of your passwd entry, not the box's HOME: a push
+  # over ssh would be yours.
+  git config -f "$cfg" --add "url.$stub.pushInsteadOf" git@github.com:
+  git config -f "$cfg" --add "url.$stub.pushInsteadOf" ssh://git@github.com/
 }
 
 # The termag units a box's agent starts with `systemctl --user` run through a
@@ -728,8 +837,8 @@ fakes_units_box() {
 # ready or failed, as on a box image, instead of being typed into the agent
 # pane. Without a GitHub broker (it is the Claude gateway's) nothing will ever
 # deliver GitHub to the box, which is what github.skip says: the box's own git
-# config (the stub, with E2E_FAKE_GITHUB) is its way to GitHub, and the clone
-# need not wait for a delivery.
+# config (the stub, or with E2E_REAL_GITHUB your credentials) is its way to
+# GitHub, and the clone need not wait for a delivery.
 fakes_clone_box() {
   local box=$1 co="$1/home/src/termag"
   ln -sfn "$repo/deploy/termag-project-clone" "$co/deploy/termag-project-clone"
@@ -793,7 +902,7 @@ fakes_after_boxes() {
     # Logins land on the box, not the machine: its HOME, PATH and tmux server.
     # shellcheck disable=SC2016
     printf '#!/bin/sh\ncd %q\nexport HOME=%q PATH=%q SHELL=/bin/bash TERMAG_E2E_ROOT=%q\n[ -n "$SSH_ORIGINAL_COMMAND" ] && exec /bin/bash -c "$SSH_ORIGINAL_COMMAND"\nexec /bin/bash -l\n' \
-      "$box/home" "$box/home" "$box/bin:$PATH" "$ROOT" >"$s/$name-login"
+      "$box/home" "$box/home" "$(box_path "$box" "$ROOT")" "$ROOT" >"$s/$name-login"
     chmod 0755 "$s/$name-login"
     cat >"$s/$name.conf" <<EOF
 Port $port
@@ -827,9 +936,14 @@ fakes_summary() {
   [ -n "$FAKE_MCP" ] && echo "  mcp       broker https://localhost:$MCP_GW_PORT -> Envoy 127.0.0.1:$((ENVOY_PORT + 6)); server stub https://localhost:$MCP_PORT/mcp (Bearer e2e-mcp-secret; /_e2e/calls)"
   [ "$EC2_BOXES" -gt 0 ] && echo "  ec2 boxes box-1..box-$EC2_BOXES registered as kind=ec2${EC2_LAUNCH:+, started by the launch fake}"
   [ -n "$EC2_LAUNCH" ] && echo "  ec2       launch fake on 127.0.0.1:$EC2_PORT, so Add box works; scripts/e2e/ctl.sh ec2 bake|clear|no-agent|agent"
-  [ -n "$WARM_POOL" ] && echo "  warm pool $WARM_POOL box(es), reconciled every ${WARM_POOL_TICK}s${FAKE_GITHUB:+; public dotfiles repo https://github.com/e2e-org/dotfiles}"
+  [ -n "$REAL_GITHUB" ] && echo "  real gh   boxes clone and fetch from github.com with your own git credentials (read only; pushes go to the stub)"
+  [ -n "$DOTFILES_REPO" ] && echo "  dotfiles  $DOTFILES_REPO, applied on a warm-pool claim$([ -n "${DOTFILES_SCRIPTS:-}" ] && printf ', its install script run' || printf ', nothing from it run (links only)')"
+  local try_dotfiles=
+  [ -n "$FAKE_GITHUB" ] && [ -z "$REAL_GITHUB" ] && [ -z "$DOTFILES_REPO" ] && try_dotfiles="; public dotfiles repo https://github.com/e2e-org/dotfiles"
+  [ -n "$WARM_POOL" ] && echo "  warm pool $WARM_POOL box(es), reconciled every ${WARM_POOL_TICK}s$try_dotfiles"
   [ -z "$PANE_CLONE" ] && echo "  clones    durable, through termag-project-clone@ on each box (E2E_PANE_CLONE=1 types them into the agent pane)"
-  [ -n "$T3" ] && echo "  t3        every box's agent can run $(sed -n 's/^T3_COMMAND=//p' "$ROOT/stack.env")"
+  [ -n "$ASK_RUNNER" ] && echo "  asks      every box has deploy/termag-subagent-run, so it takes asks from its first connect"
+  [ -n "$T3" ] && echo "  t3        every box's agent can run $(sed -n 's/^T3_COMMAND=//p' "$ROOT/stack.env") (docs/desktop-t3-bridge.md)"
   [ -n "$CLAUDE_BIN" ] && echo "  claude    $CLAUDE_BIN on every box's PATH (your own Claude login)"
   [ -n "$FLAGS" ] && echo "  flags     $FLAGS (TERMAG_FLAGS)"
   [ -n "$TMUX_FAULTS" ] && echo "  faults    scripts/e2e/ctl.sh fault box-N hang|attach-delay=S|off"

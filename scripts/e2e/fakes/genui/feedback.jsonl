@@ -1,0 +1,13 @@
+{"op":"add","path":"/root","value":"feedback"}
+{"op":"add","path":"/elements/feedback","value":{"type":"Card","props":{"title":"Review feedback for #797","description":"4 items from my review. Choose what happens to each, then send; nothing is posted until you do."},"children":["fb-form"]}}
+{"op":"add","path":"/elements/fb-form","value":{"type":"Form","children":["fb-list","fb-actions"],"on":{"submit":{"action":"submit"}},"props":{}}}
+{"op":"add","path":"/elements/fb-list","value":{"type":"Stack","props":{"gap":"medium"},"repeat":{"statePath":"/items","key":"id"},"children":["fb-item"]}}
+{"op":"add","path":"/elements/fb-item","value":{"type":"Stack","props":{"gap":"small"},"children":["fb-where","fb-comment","fb-choice","fb-edit","fb-sep"]}}
+{"op":"add","path":"/elements/fb-where","value":{"type":"Text","props":{"text":{"$item":"where"},"size":"small","tone":"muted"},"children":[]}}
+{"op":"add","path":"/elements/fb-comment","value":{"type":"Text","props":{"text":{"$item":"comment"}},"children":[]}}
+{"op":"add","path":"/elements/fb-choice","value":{"type":"RadioGroup","props":{"label":"What to do with it","orientation":"horizontal","value":{"$bindItem":"decision"},"options":[{"value":"post","label":"Post"},{"value":"edit","label":"Edit, then post"},{"value":"ignore","label":"Ignore"}]},"children":[]}}
+{"op":"add","path":"/elements/fb-edit","value":{"type":"TextArea","props":{"label":"Your wording","value":{"$bindItem":"edited"},"rows":2,"placeholder":"What to post instead"},"visible":{"$item":"decision","eq":"edit"},"children":[]}}
+{"op":"add","path":"/elements/fb-sep","value":{"type":"Separator","props":{},"children":[]}}
+{"op":"add","path":"/elements/fb-actions","value":{"type":"ButtonGroup","children":["fb-send"],"props":{}}}
+{"op":"add","path":"/elements/fb-send","value":{"type":"Button","props":{"label":"Send my decisions","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/state/items","value":[{"id":"r1","where":"frontend/src/chat/genui/spec.ts:142","comment":"This walks the tree twice (cycleOrDepth, then overBudget); one pass could do both.","decision":"post","edited":""},{"id":"r2","where":"frontend/src/chat/genui/registry.tsx:188","comment":"Sorting compares formatted strings; numeric columns should compare numbers.","decision":"post","edited":""},{"id":"r3","where":"docs/simple-ui-chat-generative-ui.md:40","comment":"Nit: the JSONL example would read better with a Card at the root.","decision":"ignore","edited":""},{"id":"r4","where":"agent/chat-runner.js:1631","comment":"system-prompt.md is written before the turn's mode is settled; worth a comment.","decision":"edit","edited":"Worth a comment on why system-prompt.md is written before the mode is settled."}]}

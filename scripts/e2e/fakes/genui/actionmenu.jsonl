@@ -1,0 +1,20 @@
+{"op":"add","path":"/root","value":"prs"}
+{"op":"add","path":"/elements/prs","value":{"type":"Card","props":{"title":"Your open PRs","description":"Three need something from you."},"children":["rows","foot"]}}
+{"op":"add","path":"/elements/foot","value":{"type":"Stack","props":{"direction":"horizontal","justify":"end"},"children":["bulk"]}}
+{"op":"add","path":"/elements/rows","value":{"type":"Stack","props":{"gap":"medium"},"children":["r1","r2","r3"]}}
+{"op":"add","path":"/elements/r1","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between","align":"center"},"children":["r1-info","r1-m"]}}
+{"op":"add","path":"/elements/r1-info","value":{"type":"Stack","props":{"gap":"none"},"children":["r1-t","r1-s"]}}
+{"op":"add","path":"/elements/r1-t","value":{"type":"Text","props":{"text":"#842 Ghostty terminfo on boxes"},"children":[]}}
+{"op":"add","path":"/elements/r1-s","value":{"type":"Status","props":{"status":"success","label":"Checks pass"},"children":[]}}
+{"op":"add","path":"/elements/r1-m","value":{"type":"ActionMenu","props":{"label":"Actions for #842","trigger":"more","items":[{"id":"rerun","label":"Re-run checks"},{"id":"rebase","label":"Rebase on main","description":"Then wait for checks again"},{"id":"ready","label":"Mark ready for review"},{"id":"close","label":"Close the PR","variant":"destructive"}]},"children":[],"on":{"select":{"action":"choose"}}}}
+{"op":"add","path":"/elements/r2","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between","align":"center"},"children":["r2-info","r2-m"]}}
+{"op":"add","path":"/elements/r2-info","value":{"type":"Stack","props":{"gap":"none"},"children":["r2-t","r2-s"]}}
+{"op":"add","path":"/elements/r2-t","value":{"type":"Text","props":{"text":"#838 Retry the box bake on a spot loss"},"children":[]}}
+{"op":"add","path":"/elements/r2-s","value":{"type":"Status","props":{"status":"warning","label":"1 check failing"},"children":[]}}
+{"op":"add","path":"/elements/r2-m","value":{"type":"ActionMenu","props":{"label":"Actions for #838","trigger":"more","items":[{"id":"rerun","label":"Re-run checks"},{"id":"rebase","label":"Rebase on main","description":"Then wait for checks again"},{"id":"ready","label":"Mark ready for review"},{"id":"close","label":"Close the PR","variant":"destructive"}]},"children":[],"on":{"select":{"action":"choose"}}}}
+{"op":"add","path":"/elements/r3","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between","align":"center"},"children":["r3-info","r3-m"]}}
+{"op":"add","path":"/elements/r3-info","value":{"type":"Stack","props":{"gap":"none"},"children":["r3-t","r3-s"]}}
+{"op":"add","path":"/elements/r3-t","value":{"type":"Text","props":{"text":"#831 Space colours in the sidebar"},"children":[]}}
+{"op":"add","path":"/elements/r3-s","value":{"type":"Status","props":{"status":"info","label":"Waiting for review"},"children":[]}}
+{"op":"add","path":"/elements/r3-m","value":{"type":"ActionMenu","props":{"label":"Actions for #831","trigger":"more","items":[{"id":"rerun","label":"Re-run checks"},{"id":"rebase","label":"Rebase on main","description":"Then wait for checks again"},{"id":"ready","label":"Mark ready for review"},{"id":"close","label":"Close the PR","variant":"destructive"}]},"children":[],"on":{"select":{"action":"choose"}}}}
+{"op":"add","path":"/elements/bulk","value":{"type":"ActionMenu","props":{"label":"All three","items":[{"id":"rerun-all","label":"Re-run every failing check"},{"id":"rebase-all","label":"Rebase all on main"},{"id":"close-all","label":"Close all three","variant":"destructive"}]},"children":[],"on":{"select":{"action":"choose"}}}}

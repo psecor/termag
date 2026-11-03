@@ -1,0 +1,19 @@
+{"op":"add","path":"/root","value":"box"}
+{"op":"add","path":"/elements/box","value":{"type":"Card","props":{"title":"box-ada-3 · us-east-1","description":"m7i.2xlarge, up 3 days. Last update 2 hours ago."},"children":["box-status","box-tabs"]}}
+{"op":"add","path":"/elements/box-status","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small"},"children":["box-running","box-image","box-avatar"]}}
+{"op":"add","path":"/elements/box-running","value":{"type":"Status","props":{"status":"success","label":"Running"},"children":[]}}
+{"op":"add","path":"/elements/box-image","value":{"type":"Badge","props":{"text":"image 2026-10-26","tone":"info"},"children":[]}}
+{"op":"add","path":"/elements/box-avatar","value":{"type":"Avatar","props":{"name":"Ada Lovelace","size":"small","showName":true},"children":[]}}
+{"op":"add","path":"/elements/box-tabs","value":{"type":"Tabs","props":{"tabs":[{"id":"overview","label":"Overview"},{"id":"sessions","label":"Sessions"},{"id":"update","label":"Update"}]},"children":["box-overview","box-sessions","box-update"]}}
+{"op":"add","path":"/elements/box-overview","value":{"type":"Stack","children":["box-kpis","box-meters"],"props":{}}}
+{"op":"add","path":"/elements/box-kpis","value":{"type":"Grid","props":{"columns":4,"gap":"small"},"children":["kpi-cpu","kpi-mem","kpi-sessions","kpi-cost"]}}
+{"op":"add","path":"/elements/kpi-cpu","value":{"type":"Stat","props":{"label":"CPU","value":42,"unit":"%","delta":"+8% in 1 h","trend":"up","tone":"info"},"children":[]}}
+{"op":"add","path":"/elements/kpi-mem","value":{"type":"Stat","props":{"label":"Memory","value":19.6,"unit":"GB","caption":"of 32 GB"},"children":[]}}
+{"op":"add","path":"/elements/kpi-sessions","value":{"type":"Stat","props":{"label":"Sessions","value":5,"delta":"2 working","trend":"flat"},"children":[]}}
+{"op":"add","path":"/elements/kpi-cost","value":{"type":"Stat","props":{"label":"Cost today","value":"$4.12","delta":"−12% vs. yesterday","trend":"down","tone":"success"},"children":[]}}
+{"op":"add","path":"/elements/box-meters","value":{"type":"Grid","props":{"columns":2},"children":["meter-disk","meter-mem","progress-bake"]}}
+{"op":"add","path":"/elements/meter-disk","value":{"type":"Meter","props":{"label":"Disk","value":78,"valueLabel":"156 of 200 GB","tone":"warning"},"children":[]}}
+{"op":"add","path":"/elements/meter-mem","value":{"type":"Meter","props":{"label":"Memory","value":61,"valueLabel":"61%"},"children":[]}}
+{"op":"add","path":"/elements/progress-bake","value":{"type":"ProgressBar","props":{"label":"Bazel cache warm-up","value":64},"children":[]}}
+{"op":"add","path":"/elements/box-sessions","value":{"type":"Table","props":{"label":"Sessions on this box","rowKey":"name","columns":[{"key":"name","label":"Session","format":"code","sortable":true},{"key":"agent","label":"Agent","sortable":true},{"key":"status","label":"Status","format":"status","sortable":true},{"key":"hours","label":"Working (h)","format":"number","sortable":true}],"rows":[{"name":"checkout-flow","agent":"Claude","status":"working","hours":3.5},{"name":"flag-cleanup","agent":"Codex","status":"done","hours":1.2},{"name":"docs-sweep","agent":"Claude","status":"waiting","hours":0.4},{"name":"perf-traces","agent":"Claude","status":"working","hours":2.1},{"name":"main","agent":"Claude","status":"idle","hours":0}]},"children":[]}}
+{"op":"add","path":"/elements/box-update","value":{"type":"Steps","props":{"steps":[{"label":"Pull main","status":"done","detail":"a716400e, 12 commits"},{"label":"Reconcile deploy/ artifacts","status":"done"},{"label":"Restart the agent","status":"current","detail":"Waiting for 2 working sessions to finish"},{"label":"Report to the orchestrator","status":"pending"}]},"children":[]}}

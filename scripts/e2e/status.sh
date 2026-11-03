@@ -40,5 +40,9 @@ if "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$PG_PORT"; then
 else
   printf '%-12s %-8s %s\n' postgres DEAD logs/postgres.log; rc=1
 fi
+# Every tmux server under the root must hold a box's environment, never yours.
+isolation=$(e2e_tmux_isolation "$root")
+if [ -z "$isolation" ]; then echo "isolation ok (every tmux server under the root has a box's HOME)"
+else printf 'ISOLATION %s\n' "$isolation"; rc=1; fi
 if curl -sf "http://127.0.0.1:$PORT/termag/health" >/dev/null; then echo "health    ok"; else echo "health    FAILING"; rc=1; fi
 exit $rc

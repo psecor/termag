@@ -1,0 +1,9 @@
+{"op":"add","path":"/root","value":"try-it"}
+{"op":"add","path":"/elements/try-it","value":{"type":"Card","props":{"title":"Try the fix locally","description":"The branch is pushed and its checks pass."},"children":["try-branch","try-checkout","try-e2e","try-ids","try-summary"]}}
+{"op":"add","path":"/elements/try-branch","value":{"type":"CopyText","props":{"label":"Branch","value":"fix/session-title-bedrock"},"children":[]}}
+{"op":"add","path":"/elements/try-checkout","value":{"type":"CopyText","props":{"label":"Check it out","value":"git fetch origin && git switch fix/session-title-bedrock"},"children":[]}}
+{"op":"add","path":"/elements/try-e2e","value":{"type":"CopyText","props":{"label":"Run the generative UI e2e test","value":"E2E_FLAGS='{\"chat-generative-ui-enabled\":true}' make e2e-test-genui"},"children":[]}}
+{"op":"add","path":"/elements/try-ids","value":{"type":"Grid","props":{"columns":2,"gap":"small"},"children":["try-commit","try-session"]}}
+{"op":"add","path":"/elements/try-commit","value":{"type":"CopyText","props":{"label":"Commit","value":"7aa27063c4e1b9f2d8a5e0c3b6f1d4a7e9c2b5f8"},"children":[]}}
+{"op":"add","path":"/elements/try-session","value":{"type":"CopyText","props":{"label":"Chat session","value":"sdk-chat-3f9c2a71"},"children":[]}}
+{"op":"add","path":"/elements/try-summary","value":{"type":"CopyText","props":{"label":"Line for the PR description","code":false,"value":"Session titles now come from Bedrock when the box has no Anthropic key, so every chat gets a title."},"children":[]}}

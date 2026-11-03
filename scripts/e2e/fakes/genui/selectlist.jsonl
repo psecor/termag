@@ -1,0 +1,12 @@
+{"op":"add","path":"/root","value":"box"}
+{"op":"add","path":"/elements/box","value":{"type":"Card","props":{"title":"Set up your box","description":"You can change both later in Settings."},"children":["box-form"]}}
+{"op":"add","path":"/elements/box-form","value":{"type":"Form","props":{},"children":["size-head","size","tools-head","tools","box-actions"],"on":{"submit":{"action":"submit"}}}}
+{"op":"add","path":"/elements/size-head","value":{"type":"Heading","props":{"text":"Size","level":3},"children":[]}}
+{"op":"add","path":"/elements/size","value":{"type":"SelectList","props":{"label":"Box size","value":{"$bindState":"/size"},"options":[{"value":"small","label":"Small","description":"2 vCPU, 8 GB. One agent at a time."},{"value":"medium","label":"Medium","description":"4 vCPU, 16 GB. Two or three agents, light builds."},{"value":"large","label":"Large","description":"8 vCPU, 32 GB. Several agents and full test runs."},{"value":"xlarge","label":"Extra large","description":"16 vCPU, 64 GB. Big monorepos and parallel e2e stacks."}]},"children":[]}}
+{"op":"add","path":"/elements/tools-head","value":{"type":"Heading","props":{"text":"Install on first boot","level":3},"children":[]}}
+{"op":"add","path":"/elements/tools","value":{"type":"SelectList","props":{"label":"Tools to install","selectionMode":"multiple","value":{"$bindState":"/tools"},"options":[{"value":"node","label":"Node 22","description":"With pnpm and npm."},{"value":"go","label":"Go 1.25"},{"value":"python","label":"Python 3.13","description":"With uv."},{"value":"docker","label":"Docker","description":"Needed for the e2e stack."},{"value":"playwright","label":"Playwright browsers","description":"About 1 GB; for browser tests."}]},"children":[]}}
+{"op":"add","path":"/elements/box-actions","value":{"type":"ButtonGroup","props":{},"children":["box-go","box-cancel"]}}
+{"op":"add","path":"/elements/box-go","value":{"type":"Button","props":{"label":"Create box","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/elements/box-cancel","value":{"type":"Button","props":{"label":"Cancel","variant":"minimal"},"children":[],"on":{"press":{"action":"cancel"}}}}
+{"op":"add","path":"/state/size","value":"medium"}
+{"op":"add","path":"/state/tools","value":["node","docker"]}

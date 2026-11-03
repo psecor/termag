@@ -1,0 +1,16 @@
+{"op":"add","path":"/root","value":"rollout"}
+{"op":"add","path":"/elements/rollout","value":{"type":"Card","props":{"title":"Roll out new-checkout","description":"Serve the new checkout flow to part of your traffic. Nothing changes until you start it."},"children":["rollout-form"]}}
+{"op":"add","path":"/elements/rollout-form","value":{"type":"Form","children":["env","pct","guarded","notify","note","rollout-actions"],"on":{"submit":{"action":"submit"}},"props":{}}}
+{"op":"add","path":"/elements/env","value":{"type":"Select","props":{"label":"Environment","value":{"$bindState":"/environment"},"isRequired":true,"options":[{"value":"test","label":"Test","description":"Internal traffic only"},{"value":"staging","label":"Staging"},{"value":"production","label":"Production","description":"Real customers"}]},"children":[]}}
+{"op":"add","path":"/elements/pct","value":{"type":"Slider","props":{"label":"Rollout","value":{"$bindState":"/percentage"},"min":0,"max":100,"step":5,"unit":"%"},"children":[]}}
+{"op":"add","path":"/elements/guarded","value":{"type":"Switch","props":{"label":"Guarded rollout: stop on an error-rate regression","checked":{"$bindState":"/guarded"}},"children":[]}}
+{"op":"add","path":"/elements/notify","value":{"type":"Checkbox","props":{"label":"Post to #releases when it starts","checked":{"$bindState":"/notify"}},"children":[]}}
+{"op":"add","path":"/elements/note","value":{"type":"TextArea","props":{"label":"Note for the audit log","value":{"$bindState":"/note"},"placeholder":"Why now? (optional)","rows":2},"children":[]}}
+{"op":"add","path":"/elements/rollout-actions","value":{"type":"ButtonGroup","children":["rollout-start","rollout-cancel"],"props":{}}}
+{"op":"add","path":"/elements/rollout-start","value":{"type":"Button","props":{"label":"Start rollout","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/elements/rollout-cancel","value":{"type":"Button","props":{"label":"Not now","variant":"minimal"},"on":{"press":{"action":"cancel"}},"children":[]}}
+{"op":"add","path":"/state/environment","value":"staging"}
+{"op":"add","path":"/state/percentage","value":25}
+{"op":"add","path":"/state/guarded","value":true}
+{"op":"add","path":"/state/notify","value":true}
+{"op":"add","path":"/state/note","value":""}

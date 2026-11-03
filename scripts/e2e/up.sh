@@ -41,6 +41,10 @@ command -v setsid >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || die "mis
 PG_BIN=$(pg_bindir)
 [ -x "$PG_BIN/initdb" ] || die "no PostgreSQL server binaries found; install postgresql or set E2E_PG_BIN"
 REAL_TMUX=$(command -v tmux)
+if [ "$(id -u)" = 0 ]; then
+  log "warning: running as root, which ignores directory modes: a tmux started outside a box's bin/tmux CAN start that box's server here."
+  log "warning: only the isolation check (make e2e-status) and termag-status's own e2e guard stand between such a server and your real orchestrator (docs/e2e-stack.md, \"Isolation\")."
+fi
 
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 for p in "$PORT" "$BOX_NET_PORT" "$FRONTEND_PORT" "$PG_PORT"; do
@@ -49,7 +53,8 @@ done
 fakes_check
 
 for d in backend frontend agent; do
-  if [ ! -d "$repo/$d/node_modules" ]; then
+  # Also when the lockfile is newer than the last install (npm's own .package-lock.json): a new dependency.
+  if [ "$repo/$d/package-lock.json" -nt "$repo/$d/node_modules/.package-lock.json" ]; then
     log "installing $d dependencies"
     npm --prefix "$repo/$d" ci --no-audit --no-fund
   fi
@@ -57,6 +62,8 @@ done
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/termag-e2e.XXXXXX")
 mkdir -p "$ROOT"/{logs,pids,cmds,tmp,boxes,pg,orchestrator-home}
 printf '%s\n' "$ROOT" > "$ROOT/.termag-e2e"
+# Box PATHs are built from these, not from yours (docs/e2e-stack.md, "Isolation").
+link_box_tools "$ROOT/bin"
 printf '%s\n' "$ROOT" > "$E2E_POINTER"
 
 on_exit() {
@@ -126,6 +133,9 @@ LOCAL_SESSIONS_ENABLED=false
 AGENT_WS_URL=ws://127.0.0.1:$PORT/termag/ws/agent
 TMUX_POLLER_USAGE_FILE=$ROOT/tmux-poller-usage.json
 CHECKPOINT_DISABLE=1
+# The orgs PR reads and checkouts are limited to (empty by default): the
+# fixtures' repositories live in these two.
+GITHUB_REPO_ORGS=example-org,example-team
 EOF
 umask 022
 fakes_before_backend
@@ -155,6 +165,14 @@ start_daemon box-network "$here" env -i "${base_env[@]}" node box-network.mjs "$
 for _ in $(seq 1 40); do port_in_use "$BOX_NET_PORT" && break; sleep 0.25; done
 port_in_use "$BOX_NET_PORT" || die "the box network did not listen on $BOX_NET_PORT (logs/box-network.log)"
 agent_ws_url="$box_scheme://$box_host:$BOX_NET_PORT/termag/ws/agent"
+# The only origins a stand-in box's termag-status may post to: the box
+# network, the backend, and with E2E_TLS the TLS front (docs/e2e-stack.md,
+# "Isolation").
+{
+  printf '%s://%s:%s\n' "${box_scheme/ws/http}" "$box_host" "$BOX_NET_PORT"
+  printf 'http://127.0.0.1:%s\n' "$PORT"
+  [ -z "$FAKE_TLS" ] || printf 'https://localhost:%s\n' "$TLS_PORT"
+} >"$ROOT/status-origins"
 
 log "starting the frontend on localhost:$FRONTEND_PORT"
 start_daemon frontend "$repo/frontend" env -i "${base_env[@]}" \
@@ -166,12 +184,12 @@ wait_http "http://localhost:$FRONTEND_PORT/termag/" frontend
 # fake starts after up.sh has exited.
 {
   declare -p ROOT REAL_TMUX EMAIL agent_ws_url base_env box_extra
-  declare -p FAKE_CLAUDE FAKE_GITHUB GITHUB_PORT TMUX_FAULTS CLAUDE_BIN CLAUDE_KEYCHAINS
-  declare -p T3 PANE_CLONE GITHUB_BROKER
+  declare -p FAKE_CLAUDE CLAUDE_SIGNED_IN FAKE_GITHUB GITHUB_PORT TMUX_FAULTS CLAUDE_BIN CLAUDE_KEYCHAINS
+  declare -p T3 REAL_GITHUB PANE_CLONE GITHUB_BROKER ASK_RUNNER
 } >"$ROOT/box.env"
 
 api_env=("${base_env[@]}" "E2E_API_URL=http://127.0.0.1:$PORT/termag" "E2E_AGENT_WS_URL=$agent_ws_url"
-  "E2E_EC2_BOXES=$EC2_BOXES" "E2E_EC2_LAUNCH=$EC2_LAUNCH")
+  "E2E_EC2_BOXES=$EC2_BOXES" "E2E_EC2_LAUNCH=$EC2_LAUNCH" "E2E_DOTFILES_REPO=$DOTFILES_REPO")
 env -i "${api_env[@]}" node "$here/seed.mjs" boxes "$ROOT" "$BOXES"
 
 # With E2E_EC2_LAUNCH the ec2 boxes are started by the launch fake instead.
@@ -182,8 +200,13 @@ for ((i = first_box; i <= BOXES; i++)); do
   bash "$here/box.sh" "$ROOT" "box-$i"
 done
 fakes_after_boxes
+if isolation=$(e2e_tmux_isolation "$ROOT") && [ -n "$isolation" ]; then
+  die "a tmux server under $ROOT does not have a box's environment (docs/e2e-stack.md, \"Isolation\"):
+$isolation"
+fi
 
 env -i "${api_env[@]}" node "$here/seed.mjs" project "$ROOT"
+env -i "${api_env[@]}" node "$here/seed.mjs" bug-reports "$ROOT"
 
 trap - EXIT
 cat <<EOF

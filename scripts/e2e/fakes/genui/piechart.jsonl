@@ -1,0 +1,10 @@
+{"op":"add","path":"/root","value":"pies"}
+{"op":"add","path":"/elements/pies","value":{"type":"Grid","props":{"columns":2,"gap":"medium"},"children":["sessions-card","spend-card","reviews-card","ci-card"]}}
+{"op":"add","path":"/elements/sessions-card","value":{"type":"Card","props":{"title":"Sessions by agent","description":"This week"},"children":["sessions"]}}
+{"op":"add","path":"/elements/sessions","value":{"type":"PieChart","props":{"label":"Sessions this week by agent","totalLabel":"sessions","slices":[{"label":"Claude","value":312},{"label":"Codex","value":148},{"label":"Cursor","value":96},{"label":"Grok","value":41}]},"children":[]}}
+{"op":"add","path":"/elements/spend-card","value":{"type":"Card","props":{"title":"Box spend by service","description":"October so far, in dollars"},"children":["spend"]}}
+{"op":"add","path":"/elements/spend","value":{"type":"PieChart","props":{"label":"Box spend in October by AWS service, in dollars","unit":"$","totalLabel":"this month","slices":[{"label":"EC2","value":1842.5},{"label":"EBS","value":412.2},{"label":"Data transfer","value":188.9},{"label":"S3","value":96.4},{"label":"CloudWatch","value":54.1},{"label":"Other","value":31.7}]},"children":[]}}
+{"op":"add","path":"/elements/reviews-card","value":{"type":"Card","props":{"title":"How reviews ended","description":"PRs closed in the last 30 days"},"children":["reviews"]}}
+{"op":"add","path":"/elements/reviews","value":{"type":"PieChart","props":{"label":"How the last 30 days of PR reviews ended","totalLabel":"PRs","slices":[{"label":"Approved","value":41},{"label":"Changes requested","value":9},{"label":"Closed unmerged","value":3},{"label":"Reverted","value":0}]},"children":[]}}
+{"op":"add","path":"/elements/ci-card","value":{"type":"Card","props":{"title":"CI time by suite","description":"The last run on main"},"children":["ci"]}}
+{"op":"add","path":"/elements/ci","value":{"type":"PieChart","props":{"label":"Seconds of CI time by test suite, last run on main","unit":"s","slices":[{"label":"e2e","value":905},{"label":"backend","value":412},{"label":"frontend","value":268}]},"children":[]}}

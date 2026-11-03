@@ -7,7 +7,13 @@
 //                                          hand-built box; with E2E_EC2_LAUNCH it
 //                                          launches them), the rest "external".
 //   node seed.mjs project <root>          wait for every box to be ready, then
-//                                          create the sample project on box-1
+//                                          create the sample project on box-1 and,
+//                                          with E2E_DOTFILES_REPO, save it as the
+//                                          user's dotfiles repository
+//   node seed.mjs bug-reports <root>      file the sample bug reports (real ones
+//                                          agents hit on 2026-10-28) through
+//                                          POST /api/cli/v1/bug-reports with the
+//                                          boxes' own tokens
 //
 // Box tokens are written only to <root>/boxes/<name>/home/.termag/agent.config.json
 // (mode 0600) and are never printed.
@@ -17,7 +23,7 @@ import { join } from 'node:path';
 const [cmd, root, countArg] = process.argv.slice(2);
 const base = process.env.E2E_API_URL;
 if (!cmd || !root || !base) {
-  console.error('usage: E2E_API_URL=http://127.0.0.1:<port>/termag node seed.mjs boxes|project <root> [count]');
+  console.error('usage: E2E_API_URL=http://127.0.0.1:<port>/termag node seed.mjs boxes|project|bug-reports <root> [count]');
   process.exit(2);
 }
 
@@ -87,12 +93,73 @@ async function seedProject(cookie) {
     initialAgent: { enabled: true, provider: 'claude' },
   });
   console.log(`[seed] project sample (${project.id ?? project.project?.id}) on ${boxes[0].name}`);
+
+  // As Settings saves it: a warm-pool claim hands it to the box (on-claim).
+  const dotfilesRepoUrl = process.env.E2E_DOTFILES_REPO;
+  if (dotfilesRepoUrl) {
+    const res = await fetch(`${base}/auth/me/preferences`, {
+      method: 'PUT',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ dotfilesRepoUrl }),
+    });
+    if (!res.ok) throw new Error(`PUT /auth/me/preferences: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
+    console.log(`[seed] dotfiles repository ${dotfilesRepoUrl}`);
+  }
+}
+
+// What agents ran into on 2026-10-28, before there was anywhere to file it.
+const SAMPLE_BUGS = [
+  {
+    box: 0, title: 'termag space put over an existing file answers 403', area: 'spaces', severity: 'high',
+    command: 'termag space put handoff.md improve-termag:handoffs/spaceput.md',
+    errorOutput: 'termag: 403 Forbidden: You may not write improve-termag:handoffs/spaceput.md\n',
+    body: '## Repro\n\n1. `termag space put a.md improve-termag:notes/a.md` (new file): saved.\n2. Run the same command again, so the path exists.\n\n**Expected:** the file is replaced (the box is an editor of the space).\n\n**Actual:** `403 Forbidden`, every time, for any existing path. New paths still work.\n\n**Workaround:** write to a new file name.',
+  },
+  {
+    box: 0, title: 'gh pr list --search fails through the GitHub broker', area: 'broker', severity: 'medium',
+    command: 'gh pr list --search "bug report in:title" --state open',
+    errorOutput: 'HTTP 403: Resource not accessible by integration (https://github-broker.termag.example.com/api/graphql)\n',
+    body: '`gh pr list` works through the broker; adding `--search` fails with a 403 from the GraphQL endpoint.\n\n**Expected:** the same PRs `gh pr list` shows, filtered.\n\n**Workaround:** `gh pr list --json title,number` and filter with `jq`.',
+  },
+  {
+    box: 1, title: 'publish refuses a bundle with an empty reason', area: 'publish', severity: 'high',
+    command: 'termag ask publish (end of the ask run)',
+    errorOutput: 'the bundle does not apply on the base commit: \n',
+    body: 'The ask run committed on `ask`; publish refused the bundle with `the bundle does not apply on the base commit: ` and nothing after the colon.\n\n**Expected:** a reason (which commit was missing), or the PR.\n\nNo workaround from inside the run; the commits are still in the clone.',
+  },
+  {
+    box: 1, title: 'automation classifier denies termag box stop', area: 'boxes', severity: 'low',
+    command: 'termag box stop ask-box-3 --yes',
+    errorOutput: 'Permission denied by the automation classifier: stopping infrastructure is not allowed\n',
+    body: 'An orchestrator session stopping an idle ask box it created (as the agent-orchestrator skill says to) is denied by the classifier.\n\n**Expected:** allowed: it is the box the session created, and stopping keeps its disk.\n\n**Workaround:** ask the person to stop it.',
+  },
+];
+
+async function seedBugReports(cookie) {
+  const boxes = JSON.parse(readFileSync(join(root, 'boxes.json'), 'utf8'));
+  const projects = await api(cookie, 'GET', '/projects');
+  const list = Array.isArray(projects) ? projects : projects.projects ?? [];
+  for (const bug of SAMPLE_BUGS) {
+    const box = boxes[Math.min(bug.box, boxes.length - 1)];
+    const { token } = JSON.parse(readFileSync(join(root, 'boxes', box.name, 'home', '.termag', 'agent.config.json'), 'utf8'));
+    const project = list.find(p => p.instanceId === box.id);
+    const { box: _b, ...report } = bug;
+    const res = await fetch(`${base}/api/cli/v1/bug-reports`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...report, cliVersion: '0.1.0', agentProvider: 'claude', agentModel: 'us.anthropic.claude-opus-5-5', agentVersion: 'claude-code 2.1.312', projectId: project?.id }),
+    });
+    const text = await res.text();
+    if (res.status !== 201) throw new Error(`POST /api/cli/v1/bug-reports: HTTP ${res.status} ${text.slice(0, 300)}`);
+    console.log(`[seed] bug report ${JSON.parse(text).id} from ${box.name}: ${bug.title}`);
+  }
 }
 
 try {
   const cookie = await login();
   if (cmd === 'boxes') await seedBoxes(cookie, Number(countArg ?? 1));
   else if (cmd === 'project') await seedProject(cookie);
+  else if (cmd === 'bug-reports') await seedBugReports(cookie);
   else throw new Error(`unknown command ${cmd}`);
 } catch (err) {
   console.error(`[seed] ${err.message}`);

@@ -1,0 +1,23 @@
+{"op":"add","path":"/root","value":"trends"}
+{"op":"add","path":"/elements/trends","value":{"type":"Card","props":{"title":"Main, the last 14 days","description":"Each line runs oldest to newest; the dot is today."},"children":["tiles","trends-sep","rows"]}}
+{"op":"add","path":"/elements/tiles","value":{"type":"Grid","props":{"columns":3,"gap":"medium"},"children":["deploys","latency","failures"]}}
+{"op":"add","path":"/elements/deploys","value":{"type":"Stack","props":{"gap":"small"},"children":["deploys-stat","deploys-line"]}}
+{"op":"add","path":"/elements/deploys-stat","value":{"type":"Stat","props":{"label":"Deploys today","value":21,"delta":"+3 on yesterday","trend":"up","tone":"success"},"children":[]}}
+{"op":"add","path":"/elements/deploys-line","value":{"type":"Sparkline","props":{"label":"Deploys per day, last 14 days","tone":"success","values":[12,14,9,15,17,6,4,16,18,15,19,20,18,21]},"children":[]}}
+{"op":"add","path":"/elements/latency","value":{"type":"Stack","props":{"gap":"small"},"children":["latency-stat","latency-line"]}}
+{"op":"add","path":"/elements/latency-stat","value":{"type":"Stat","props":{"label":"API p95","value":182,"unit":"ms","delta":"−6% on last week","trend":"down","tone":"success"},"children":[]}}
+{"op":"add","path":"/elements/latency-line","value":{"type":"Sparkline","props":{"label":"API p95 latency per day in ms, last 14 days","unit":"ms","values":[212,205,198,240,236,201,190,187,195,191,188,185,184,182]},"children":[]}}
+{"op":"add","path":"/elements/failures","value":{"type":"Stack","props":{"gap":"small"},"children":["failures-stat","failures-line"]}}
+{"op":"add","path":"/elements/failures-stat","value":{"type":"Stat","props":{"label":"Failed CI runs today","value":7,"delta":"+4 on yesterday","trend":"up","tone":"danger"},"children":[]}}
+{"op":"add","path":"/elements/failures-line","value":{"type":"Sparkline","props":{"label":"Failed CI runs per day, last 14 days","tone":"danger","values":[1,0,2,1,1,0,0,2,1,3,2,3,3,7]},"children":[]}}
+{"op":"add","path":"/elements/trends-sep","value":{"type":"Separator","props":{},"children":[]}}
+{"op":"add","path":"/elements/rows","value":{"type":"Stack","props":{"gap":"small"},"children":["errors-row","spend-row","sessions-row"]}}
+{"op":"add","path":"/elements/errors-row","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between"},"children":["errors-text","errors-line"]}}
+{"op":"add","path":"/elements/errors-text","value":{"type":"Text","props":{"text":"API error rate"},"children":[]}}
+{"op":"add","path":"/elements/errors-line","value":{"type":"Sparkline","props":{"label":"API error rate per day in percent, last 14 days","tone":"warning","unit":"%","showLast":true,"values":[0.4,0.3,0.5,0.4,0.6,0.5,0.4,0.7,0.9,0.8,1.1,1.0,1.3,1.4]},"children":[]}}
+{"op":"add","path":"/elements/spend-row","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between"},"children":["spend-text","spend-line"]}}
+{"op":"add","path":"/elements/spend-text","value":{"type":"Text","props":{"text":"Box spend per day"},"children":[]}}
+{"op":"add","path":"/elements/spend-line","value":{"type":"Sparkline","props":{"label":"Box spend per day in dollars, last 14 days","unit":"$","showLast":true,"values":[42.1,44.8,47.2,45.9,49.3,21.4,18.7,43.6,46.2,48.8,47.5,50.1,22.3,19.9]},"children":[]}}
+{"op":"add","path":"/elements/sessions-row","value":{"type":"Stack","props":{"direction":"horizontal","justify":"between"},"children":["sessions-text","sessions-line"]}}
+{"op":"add","path":"/elements/sessions-text","value":{"type":"Text","props":{"text":"Live agent sessions, every 8 hours"},"children":[]}}
+{"op":"add","path":"/elements/sessions-line","value":{"type":"Sparkline","props":{"label":"Live agent sessions every 8 hours, last 14 days","showLast":true,"values":[18,31,22,19,34,25,17,36,27,20,38,29,12,15,11,14,16,13,21,39,30,23,41,32,22,43,33,24,45,35,13,16,12,15,17,14,25,47,36,28,49,38]},"children":[]}}

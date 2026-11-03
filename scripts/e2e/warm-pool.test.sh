@@ -91,6 +91,13 @@ PY
 
 echo "--- the pool"
 if wait_warm 2 90; then pass "the reconciler fills the pool to 2 warm boxes"; else fail "the pool fills" 2 "$(warm_ids | grep -c .)"; fi
+# BOX_SUBNET_ID and the fake's fallback subnet are one pool: the two launches
+# that filled it each started in a different subnet, and both went through.
+if grep -q BOX_FALLBACK_SUBNET_IDS "$ROOT/backend.env"; then
+  check "the pool's two launches took turns across both subnets" \
+    "$(sed -n 's/^BOX_SUBNET_ID=//p; s/^BOX_FALLBACK_SUBNET_IDS=//p' "$ROOT/backend.env" | sort | tr '\n' ' ')" \
+    "$(head -2 "$ROOT/ec2/runs" | awk '$3 == "launched" {print $1}' | sort | tr '\n' ' ')"
+fi
 first=$(warm_ids | head -1)
 b=$(box_dir "$first")
 check "a pool box's agent announced itself warm and ran the on-warm unit" succeeded "$(row "$first" '"onWarmStatus"')"
@@ -212,6 +219,33 @@ else
     fi
     set_dotfiles null
   fi
+fi
+
+primary=$(sed -n 's/^BOX_SUBNET_ID=//p' "$ROOT/backend.env" | tail -1)
+fallback=$(sed -n 's/^BOX_FALLBACK_SUBNET_IDS=//p' "$ROOT/backend.env" | tail -1)
+if ! grep -q BOX_FALLBACK_SUBNET_IDS "$repo/backend/src/services/boxProvisioner.ts"; then
+  skip "capacity fallback checks: this backend has no BOX_FALLBACK_SUBNET_IDS"
+elif [ -z "$fallback" ]; then
+  fail "the EC2 fake gives the stack a fallback subnet" "a BOX_FALLBACK_SUBNET_IDS line in backend.env" "none"
+else
+  echo "--- capacity fallback"
+  # The primary subnet's AZ runs out of the type, as us-east-2a did for
+  # m9g.2xlarge on 2026-10-20. Failing a warm row makes the pool launch one.
+  wait_warm 2 60
+  : >"$ROOT/ec2/runs"
+  $CTL ec2 no-capacity "$primary" >/dev/null
+  victim=$(warm_ids | head -1)
+  sql "update instances set status = 'failed', \"provisioningError\" = 'e2e: make room' where id = '$victim'" >/dev/null
+  for _ in $(seq 1 240); do grep -q ' launched$' "$ROOT/ec2/runs" 2>/dev/null && break; sleep 0.25; done
+  # uniq: the SDK retries a 5xx refusal itself before the walk sees it, as it
+  # did on EC2 (three CloudTrail errors per refused launch).
+  # Launches take turns starting in each subnet, so this one may start in
+  # either; it must end launched in the fallback, never in the refused primary.
+  check "a launch EC2 refuses for capacity lands in a subnet with room" \
+    "$fallback launched" \
+    "$(awk '{print $1, $3}' "$ROOT/ec2/runs" | uniq | grep -v " InsufficientInstanceCapacity$" | tr '\n' '|' | sed 's/|$//')"
+  if wait_warm 2 90; then pass "and the box it launched there warms"; else fail "the fallback box warms" 2 "$(warm_ids | grep -c .)"; fi
+  $CTL ec2 capacity >/dev/null
 fi
 
 echo "--- down"

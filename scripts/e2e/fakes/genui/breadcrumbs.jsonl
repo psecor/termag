@@ -1,0 +1,9 @@
+{"op":"add","path":"/root","value":"where"}
+{"op":"add","path":"/elements/where","value":{"type":"Stack","props":{"gap":"medium"},"children":["file-card","flag-card"]}}
+{"op":"add","path":"/elements/file-card","value":{"type":"Card","props":{"title":"Where the timeout is set"},"children":["file-crumbs","file-facts","file-code"]}}
+{"op":"add","path":"/elements/file-crumbs","value":{"type":"Breadcrumbs","props":{"items":[{"id":"repo","label":"termag"},{"id":"backend","label":"backend"},{"id":"src","label":"src"},{"id":"services","label":"services"},{"id":"payments","label":"payments"},{"id":"file","label":"paymentsClient.ts"}],"label":"Where the timeout is set"},"children":[]}}
+{"op":"add","path":"/elements/file-facts","value":{"type":"KeyValue","props":{"items":[{"label":"Line","value":42},{"label":"Last changed","value":"PR #812, Oct 27"},{"label":"Commit","value":"9d41e0b","code":true}]},"children":[]}}
+{"op":"add","path":"/elements/file-code","value":{"type":"CodeBlock","props":{"language":"diff","code":"@@ -40,3 +40,3 @@\n export const AUTH_TIMEOUT_MS =\n-  10_000;\n+  2_000;"},"children":[]}}
+{"op":"add","path":"/elements/flag-card","value":{"type":"Card","props":{"title":"The flag that gates it","tone":"muted"},"children":["flag-crumbs","flag-text"]}}
+{"op":"add","path":"/elements/flag-crumbs","value":{"type":"Breadcrumbs","props":{"items":[{"id":"project","label":"Checkout"},{"id":"env","label":"Production"},{"id":"flag","label":"payments-client-v4"}],"label":"Where the flag lives"},"children":[]}}
+{"op":"add","path":"/elements/flag-text","value":{"type":"Text","props":{"text":"On for 100% of traffic since Oct 27, 4:02 PM. Turning it off sends checkout back to the 3.x client without a deploy.","tone":"muted"},"children":[]}}

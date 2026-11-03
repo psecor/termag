@@ -24,12 +24,14 @@ pass() { echo "ok:   $1"; }
 fail() { echo "FAIL: $1"; echo "      want: $2"; echo "      got:  $3"; failures=$((failures + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "$2" "$3"; fi; }
 
-if [ ! -x "$repo/cli/node_modules/.bin/tsc" ]; then
+# npm ci when the lockfile is newer than the last install (npm's own .package-lock.json), not only when
+# there is none: an existing checkout must pick up a new dependency.
+if [ "$repo/cli/package-lock.json" -nt "$repo/cli/node_modules/.package-lock.json" ]; then
   (cd "$repo/cli" && npm ci --no-audit --no-fund >"$WORK/cli-install.log" 2>&1) || { cat "$WORK/cli-install.log"; echo "FAIL: cli npm ci"; exit 1; }
 fi
 (cd "$repo/cli" && npm run build >"$WORK/cli-build.log" 2>&1) || { cat "$WORK/cli-build.log"; echo "FAIL: cli build"; exit 1; }
 pass "cli builds"
-if [ ! -x "$repo/tui/node_modules/.bin/tsc" ]; then
+if [ "$repo/tui/package-lock.json" -nt "$repo/tui/node_modules/.package-lock.json" ]; then
   (cd "$repo/tui" && npm ci --no-audit --no-fund >"$WORK/tui-install.log" 2>&1) || { cat "$WORK/tui-install.log"; echo "FAIL: tui npm ci"; exit 1; }
 fi
 (cd "$repo/tui" && npm run build >"$WORK/tui-build.log" 2>&1) || { cat "$WORK/tui-build.log"; echo "FAIL: tui build"; exit 1; }

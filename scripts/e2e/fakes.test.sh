@@ -9,6 +9,8 @@
 #   E2E_TEST_CLAUDE_GATEWAY=<example-org/terraform checkout>
 #                              also run the Claude gateway through Envoy; needs a
 #                              backend with the gateway and terraform
+#   E2E_BROKER_443=1           with the gateway, also run the real gh through the broker
+#                              (needs gh, and unprivileged ports from 443; see docs/e2e-stack.md)
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -321,13 +323,13 @@ check "with the backend's env, fetch(api.github.com) reaches the stub" e2e-octoc
 check "stub: github.com git smart-HTTP serves e2e-org/sample" 40 \
   "$(git -c credential.helper= ls-remote "http://x-access-token:t_good@127.0.0.1:$E2E_GITHUB_PORT/_github.com/e2e-org/sample.git" HEAD | cut -f1 | tr -d '\n' | wc -c)"
 check "stub: git without a token gets 401" 401 \
-  "$(curl -s -o /dev/null -w '%{http_code}' "$GH/_github.com/e2e-org/sample.git/info/refs?service=git-upload-pack")"
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GH/_github.com/e2e-org/sample.git/info/refs?service=git-upload-pack")" # gitleaks:allow (not a credential: a fake GitHub host path)
 check "stub: git with a _bad token in Basic auth gets 401" 401 \
   "$(curl -s -o /dev/null -w '%{http_code}' -u x-access-token:t_bad "$GH/_github.com/e2e-org/sample.git/info/refs?service=git-upload-pack")"
 check "stub: git ls-remote with a _bad token fails" failed \
   "$(git -c credential.helper= ls-remote "http://x-access-token:t_bad@127.0.0.1:$E2E_GITHUB_PORT/_github.com/e2e-org/sample.git" HEAD >/dev/null 2>&1 && echo listed || echo failed)"
 check "stub: the API reads _bad out of Basic auth too" 401 \
-  "$(curl -s -o /dev/null -w '%{http_code}' -u x:t_bad "$GH/user")"
+  "$(curl -s -o /dev/null -w '%{http_code}' -u x:t_bad "$GH/user")" # gitleaks:allow (a deliberately bad fake token)
 redirected=$(cd "$repo/backend" && env -i PATH="$PATH" "${genv[@]}" \
   node -e 'fetch("https://github.com/e2e-org/sample.git/info/refs?service=git-upload-pack", { headers: { authorization: "Basic " + Buffer.from("x:t_good").toString("base64") } }).then(r => console.log(r.status), e => console.log("ERR " + e.message))')
 check "with the backend's env, fetch(github.com) reaches the stub's git" 200 "$redirected"
@@ -339,8 +341,11 @@ if command -v gh >/dev/null; then
 fi
 "$T1" send-keys -t "$U-sample-ctrl" 'echo tok_e2e | gh auth login --with-token && gh auth status' Enter
 sleep 1
-check "gh stub on the box keeps the token" "github.com: logged in (stub)" \
-  "$("$T1" capture-pane -p -t "$U-sample-ctrl" | grep -o 'github.com: logged in (stub)' | head -n1)"
+# With E2E_BROKER_443 the box's GH_HOST is the broker, so its gh is the real one.
+if [ -z "${E2E_BROKER_443:-}" ]; then
+  check "gh stub on the box keeps the token" "github.com: logged in (stub)" \
+    "$("$T1" capture-pane -p -t "$U-sample-ctrl" | grep -o 'github.com: logged in (stub)' | head -n1)"
+fi
 
 echo "--- E2E_CREDENTIAL_STORE (KMS envelope encryption in Postgres)"
 cred_arn=$(bash "$here/fakes/aws.sh" call TrentService.DescribeKey '{"KeyId":"alias/termag-user-credentials"}' | jq -r .KeyMetadata.Arn)
@@ -476,6 +481,32 @@ if [ -n "${E2E_CLAUDE_GATEWAY:-}" ]; then
   check "an encoded spelling of the repository still takes the checked route, and is refused" \
     "Blocked by the termag GitHub broker: repository visibility change" \
     "$(ghf -H "$(box_auth box-1)" -X PATCH -d '{"visibility":"public"}' "$GHF/api/v3/repos/e2e-org/sample%2F" | jq -r .message)"
+  # gh's GHES feature detection (docs/agents/gotchas.md, "To gh, the GitHub
+  # broker is a GitHub Enterprise Server"), once the checkout's gateway adds
+  # installed_version to /meta. The stub's /meta, like api.github.com's, has none.
+  if grep -q 'github_ghes_version' "$E2E_CLAUDE_GATEWAY/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config/main.tf"; then
+    ghes=$(sed -n 's/^ *github_ghes_version *= *"\([^"]*\)".*/\1/p' "$E2E_CLAUDE_GATEWAY/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config/main.tf")
+    meta=$(ghf -H "$(box_auth box-1)" "$GHF/api/v3/meta")
+    stub_meta=$(curl -s "$GH/meta")
+    check "GET /api/v3/meta through the broker carries gh's GHES installed_version" "$ghes" "$(jq -r .installed_version <<<"$meta")"
+    check "and the rest of /meta as GitHub sent it" "$(jq -cS . <<<"$stub_meta")" "$(jq -cS 'del(.installed_version)' <<<"$meta")"
+    check "and a gzip-accepting client gets it too (the route asks GitHub for an uncompressed body)" "$ghes" \
+      "$(ghf --compressed -H "$(box_auth box-1)" "$GHF/api/v3/meta" | jq -r .installed_version)"
+    check "other API paths are untouched" "null e2e-octocat" \
+      "$(ghf -H "$(box_auth box-1)" "$GHF/api/v3/user" | jq -r '"\(.installed_version) \(.login)"')"
+    check "and so is the API root" null "$(ghf -H "$(box_auth box-1)" "$GHF/api/v3/" | jq -r .installed_version)"
+    # The real gh, as a box runs it against the broker (E2E_BROKER_443 puts it on 443).
+    if [ "${E2E_BROKER_443:-}" = 1 ] && command -v gh >/dev/null; then
+      ghb() { env -i PATH="$PATH" HOME="$WORK/gh-home" XDG_CACHE_HOME="$WORK/gh-home/cache" SSL_CERT_FILE="$ROOT/tls/ca.pem" \
+        GH_HOST=localhost GH_ENTERPRISE_TOKEN="$(box_tok box-1)" GH_PROMPT_DISABLED=1 gh "$@" 2>&1; }
+      # Each of these reads /meta first; without installed_version it exits with "malformed version: ".
+      for c in "pr list -R localhost/example-org/termag --author e2e-octocat" "pr list -R localhost/example-org/termag --state all --label x" \
+               "search prs --repo example-org/termag --author e2e-octocat"; do
+        # shellcheck disable=SC2086 # the command's words
+        check "gh $c through the broker lists the stub's PRs" 4243 "$(ghb $c | grep -o '4243' | head -n1 || true)"
+      done
+    fi
+  fi
   check "a path the broker does not forward gets 404 from Envoy, with no check" 404 \
     "$(ghf -o /dev/null -w '%{http_code}' "$GHF/login/oauth/access_token")"
   gitf() { GIT_SSL_CAINFO="$ROOT/tls/ca.pem" git -c credential.helper= -c "http.$GHF/.extraHeader=$(box_auth box-1)" "$@"; }
@@ -715,7 +746,7 @@ check "and so does the boxes' TLS front (the ALB lands on :3040)" 404 \
   "$(curl -s --cacert "$ROOT/tls/ca.pem" -o /dev/null -w '%{http_code}' "https://localhost:$E2E_TLS_PORT/termag/internal/claude-authz/model/x/invoke")"
 check "and no longer serves GitHub paths itself" 404 \
   "$(curl -s --cacert "$ROOT/tls/ca.pem" -o /dev/null -w '%{http_code}' "https://localhost:$E2E_TLS_PORT/api/v3/user")"
-check "without E2E_BROKER_443 the backend gets no GitHub broker URL" "" \
+[ -n "${E2E_BROKER_443:-}" ] || check "without E2E_BROKER_443 the backend gets no GitHub broker URL" "" \
   "$(sed -n 's/^GITHUB_BROKER_URL=//p' "$ROOT/backend.env")"
 kill "$echo_pid"; wait "$echo_pid" 2>/dev/null
 bash "$here/ctl.sh" start backend >/dev/null

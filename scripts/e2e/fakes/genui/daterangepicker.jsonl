@@ -1,0 +1,10 @@
+{"op":"add","path":"/root","value":"export"}
+{"op":"add","path":"/elements/export","value":{"type":"Card","props":{"title":"Export usage","description":"Sessions, tokens and box hours per person, as a CSV."},"children":["export-form"]}}
+{"op":"add","path":"/elements/export-form","value":{"type":"Form","props":{},"children":["period","compare","export-actions"],"on":{"submit":{"action":"submit"}}}}
+{"op":"add","path":"/elements/period","value":{"type":"DateRangePicker","props":{"label":"Period","value":{"$bindState":"/period"},"min":"2026-07-31","max":"2026-10-28","isRequired":true,"description":"Up to 90 days back, ending today at the latest."},"children":[]}}
+{"op":"add","path":"/elements/compare","value":{"type":"DateRangePicker","props":{"label":"Compare with","value":{"$bindState":"/compare"},"max":"2026-10-28","description":"Optional: a second period, side by side."},"children":[]}}
+{"op":"add","path":"/elements/export-actions","value":{"type":"ButtonGroup","props":{},"children":["export-go","export-cancel"]}}
+{"op":"add","path":"/elements/export-go","value":{"type":"Button","props":{"label":"Export","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/elements/export-cancel","value":{"type":"Button","props":{"label":"Cancel","variant":"minimal"},"children":[],"on":{"press":{"action":"cancel"}}}}
+{"op":"add","path":"/state/period","value":{"start":"2026-10-01","end":"2026-10-28"}}
+{"op":"add","path":"/state/compare","value":null}

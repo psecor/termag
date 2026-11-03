@@ -1,0 +1,12 @@
+{"op":"add","path":"/root","value":"watch"}
+{"op":"add","path":"/elements/watch","value":{"type":"Card","props":{"title":"Watch PR #848","description":"I'll check its CI and review threads and tell you what changed."},"children":["watch-form"]}}
+{"op":"add","path":"/elements/watch-form","value":{"type":"Form","props":{},"children":["every","about","until","watch-actions"],"on":{"submit":{"action":"submit"}}}}
+{"op":"add","path":"/elements/every","value":{"type":"SegmentedControl","props":{"label":"Check every","value":{"$bindState":"/every"},"options":[{"value":"1m","label":"1 min"},{"value":"5m","label":"5 min"},{"value":"15m","label":"15 min"},{"value":"30m","label":"30 min"},{"value":"1h","label":"1 hour"},{"value":"4h","label":"4 hours"}]},"children":[]}}
+{"op":"add","path":"/elements/about","value":{"type":"SegmentedControl","props":{"label":"Tell me about","value":{"$bindState":"/about"},"options":[{"value":"failures","label":"Failures only"},{"value":"all","label":"Every change"}]},"children":[]}}
+{"op":"add","path":"/elements/until","value":{"type":"SegmentedControl","props":{"label":"Stop","value":{"$bindState":"/until"},"options":[{"value":"merge","label":"When it merges"},{"value":"1d","label":"After a day"},{"value":"1w","label":"After a week"}]},"children":[]}}
+{"op":"add","path":"/elements/watch-actions","value":{"type":"ButtonGroup","props":{},"children":["watch-start","watch-cancel"]}}
+{"op":"add","path":"/elements/watch-start","value":{"type":"Button","props":{"label":"Start watching","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/elements/watch-cancel","value":{"type":"Button","props":{"label":"Not now","variant":"minimal"},"children":[],"on":{"press":{"action":"cancel"}}}}
+{"op":"add","path":"/state/every","value":"15m"}
+{"op":"add","path":"/state/about","value":"failures"}
+{"op":"add","path":"/state/until","value":"merge"}

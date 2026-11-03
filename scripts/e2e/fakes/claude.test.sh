@@ -123,6 +123,28 @@ prompt=$(grep '"hook_event_name":"UserPromptSubmit"' "$HOOKLOG" | jq -r '"\(.pro
 (cd "$WORK/proj" && printf '%s\n' '{"type":"user","message":{"role":"user","content":"hi"}}' | CLAUDE_CONFIG_DIR="$WORK/cfg" sdk --permission-mode bypassPermissions >/dev/null)
 [ "$(grep -cE '^(UserPromptSubmit|Stop) /' "$HOOKLOG")" = 2 ] || fail "the user settings come from CLAUDE_CONFIG_DIR: $(cat "$HOOKLOG")"
 
+# One-shot `-p --output-format json` calls go where each would go on a box.
+# The tool-group heading (agent/tool-group-headings.js) and the session title
+# (agent/session-title.js) both go through agent/haiku-oneshot.js, with the
+# same flags; only their system prompts tell them apart.
+ROOT="$(cd "$(dirname "$STUB")/../../.." && pwd)"
+HEADING_SYSTEM="$(cd "$ROOT" && node -e 'process.stdout.write(require("./agent/tool-group-headings").HEADING_SYSTEM_PROMPT)')"
+TITLE_SYSTEM="$(cd "$ROOT" && node -e 'process.stdout.write(require("./agent/session-title").TITLE_SYSTEM_PROMPT)')"
+oneshot_args() { (cd "$ROOT" && node -e 'process.stdout.write(require("./agent/haiku-oneshot").oneshotArgs(process.argv[1]).join("\0"))' "$1"); }
+[ -n "$HEADING_SYSTEM" ] && [ -n "$TITLE_SYSTEM" ] || fail "could not read the heading and title system prompts"
+(cd "$ROOT" && node -e 'process.stdout.write(require("./agent/tool-group-headings").headingPrompt({ request: "quiet check the repo", first: { id: "a", name: "Bash", input: { command: "ls -la", description: "List the repository root" } } }))') >"$WORK/group.txt"
+mapfile -d '' -t HEADING_ARGS < <(oneshot_args "$HEADING_SYSTEM")
+out="$(E2E_HEADING_DELAY_MS=0 "$STUB" "${HEADING_ARGS[@]}" <"$WORK/group.txt" 2>&1)"
+[ "$(printf '%s' "$out" | jq -r .result 2>/dev/null)" = 'Check repository contents and status' ] \
+  || fail "the tool-group heading call did not reach claude-json.mjs: $out"
+mapfile -d '' -t TITLE_ARGS < <(oneshot_args "$TITLE_SYSTEM")
+out="$(printf 'fix the flaky login test on main please' | "$STUB" "${TITLE_ARGS[@]}" 2>&1)"
+[ "$(printf '%s' "$out" | jq -r .result 2>/dev/null)" = 'Fix the flaky login test on' ] \
+  || fail "the session-title call did not get its title: $out"
+# A briefing or ask run passes --output-format json too, and stays a Bedrock turn.
+out="$("$STUB" -p --output-format json 'summarise my day' </dev/null 2>&1)"
+printf '%s' "$out" | grep -q 'claude (stub): no settings' || fail "a plain -p --output-format json call was not a Bedrock turn: $out"
+
 if [ "$failures" -eq 0 ]; then
   echo "ok"
 else

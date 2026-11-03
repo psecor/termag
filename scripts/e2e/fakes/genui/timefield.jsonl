@@ -1,0 +1,15 @@
+{"op":"add","path":"/root","value":"schedule"}
+{"op":"add","path":"/elements/schedule","value":{"type":"Card","props":{"title":"Schedule the rollout","description":"new-checkout goes to 25% of production in the window you pick. Times are your local time."},"children":["schedule-form"]}}
+{"op":"add","path":"/elements/schedule-form","value":{"type":"Form","props":{},"children":["day","window","quiet","schedule-actions"],"on":{"submit":{"action":"submit"}}}}
+{"op":"add","path":"/elements/day","value":{"type":"DatePicker","props":{"label":"Day","value":{"$bindState":"/day"},"min":"2026-10-28","isRequired":true},"children":[]}}
+{"op":"add","path":"/elements/window","value":{"type":"Grid","props":{"columns":2},"children":["start","end"]}}
+{"op":"add","path":"/elements/start","value":{"type":"TimeField","props":{"label":"Start","value":{"$bindState":"/start"},"isRequired":true},"children":[]}}
+{"op":"add","path":"/elements/end","value":{"type":"TimeField","props":{"label":"Finish by","value":{"$bindState":"/end"},"description":"I'll roll back if it isn't done."},"children":[]}}
+{"op":"add","path":"/elements/quiet","value":{"type":"TimeField","props":{"label":"Pause alerts until","value":{"$bindState":"/quiet"},"description":"Optional. Leave empty to keep alerts on."},"children":[]}}
+{"op":"add","path":"/elements/schedule-actions","value":{"type":"ButtonGroup","props":{},"children":["schedule-go","schedule-cancel"]}}
+{"op":"add","path":"/elements/schedule-go","value":{"type":"Button","props":{"label":"Schedule","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/elements/schedule-cancel","value":{"type":"Button","props":{"label":"Not now","variant":"minimal"},"children":[],"on":{"press":{"action":"cancel"}}}}
+{"op":"add","path":"/state/day","value":"2026-10-29"}
+{"op":"add","path":"/state/start","value":"09:30"}
+{"op":"add","path":"/state/end","value":"17:00"}
+{"op":"add","path":"/state/quiet","value":null}

@@ -1,0 +1,20 @@
+{"op":"add","path":"/root","value":"plans"}
+{"op":"add","path":"/elements/plans","value":{"type":"Stack","props":{"gap":"medium"},"children":["plans-intro","plans-grid"]}}
+{"op":"add","path":"/elements/plans-intro","value":{"type":"Text","props":{"text":"Three ways to move sessions to the new schema. Pick one and I'll write the plan out in full.","tone":"muted"},"children":[]}}
+{"op":"add","path":"/elements/plans-grid","value":{"type":"Grid","props":{"columns":3},"children":["plan-a","plan-b","plan-c"]}}
+{"op":"add","path":"/elements/plan-a","value":{"type":"Card","props":{"title":"In place","tone":"default"},"children":["plan-a-desc","plan-a-list","plan-a-kv","plan-a-choose"]}}
+{"op":"add","path":"/elements/plan-a-desc","value":{"type":"Text","props":{"text":"Migrate the table online, a batch at a time."},"children":[]}}
+{"op":"add","path":"/elements/plan-a-list","value":{"type":"List","props":{"items":["No downtime","Takes about 6 hours","Rollback is a second migration"]},"children":[]}}
+{"op":"add","path":"/elements/plan-a-kv","value":{"type":"KeyValue","props":{"items":[{"label":"Risk","value":"Medium"},{"label":"Effort","value":"6 h"}]},"children":[]}}
+{"op":"add","path":"/elements/plan-a-choose","value":{"type":"Button","props":{"label":"Choose in place","variant":"default"},"on":{"press":{"action":"choose","params":{"value":"in-place","label":"In place"}}},"children":[]}}
+{"op":"add","path":"/elements/plan-b","value":{"type":"Card","props":{"title":"Shadow table","tone":"accent"},"children":["plan-b-badge","plan-b-desc","plan-b-list","plan-b-kv","plan-b-choose"]}}
+{"op":"add","path":"/elements/plan-b-badge","value":{"type":"Badge","props":{"text":"Recommended","tone":"success"},"children":[]}}
+{"op":"add","path":"/elements/plan-b-desc","value":{"type":"Text","props":{"text":"Write to both tables, backfill, then switch reads."},"children":[]}}
+{"op":"add","path":"/elements/plan-b-list","value":{"type":"List","props":{"items":["No downtime","Easy rollback: switch reads back","Two extra deploys"]},"children":[]}}
+{"op":"add","path":"/elements/plan-b-kv","value":{"type":"KeyValue","props":{"items":[{"label":"Risk","value":"Low"},{"label":"Effort","value":"2 days"}]},"children":[]}}
+{"op":"add","path":"/elements/plan-b-choose","value":{"type":"Button","props":{"label":"Choose shadow table","variant":"primary"},"on":{"press":{"action":"choose","params":{"value":"shadow","label":"Shadow table"}}},"children":[]}}
+{"op":"add","path":"/elements/plan-c","value":{"type":"Card","props":{"title":"Maintenance window","tone":"default"},"children":["plan-c-desc","plan-c-list","plan-c-kv","plan-c-choose"]}}
+{"op":"add","path":"/elements/plan-c-desc","value":{"type":"Text","props":{"text":"Take writes offline for the copy."},"children":[]}}
+{"op":"add","path":"/elements/plan-c-list","value":{"type":"List","props":{"items":["Simplest code","About 20 minutes of read-only","Needs an announcement"]},"children":[]}}
+{"op":"add","path":"/elements/plan-c-kv","value":{"type":"KeyValue","props":{"items":[{"label":"Risk","value":"Low"},{"label":"Effort","value":"1 h"}]},"children":[]}}
+{"op":"add","path":"/elements/plan-c-choose","value":{"type":"Button","props":{"label":"Choose maintenance window","variant":"default"},"on":{"press":{"action":"choose","params":{"value":"window","label":"Maintenance window"}}},"children":[]}}

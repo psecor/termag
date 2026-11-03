@@ -4,7 +4,7 @@
 // logged in, 1 when not), and `auth login --claudeai --sso` prints an SSO
 // authorize URL and reads one code#state line. The line is never written back.
 import { createInterface } from 'node:readline';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -51,6 +51,7 @@ function login() {
     if (line.trim() === GOOD) {
       mkdirSync(claudeDir, { recursive: true });
       writeFileSync(marker, 'ok\n', { mode: 0o600 });
+      rmSync(join(claudeDir, 'expired'), { force: true });
       process.stdout.write('Login successful.\n');
       process.exit(0);
     }

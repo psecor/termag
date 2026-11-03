@@ -1,0 +1,24 @@
+{"op":"add","path":"/root","value":"canary"}
+{"op":"add","path":"/elements/canary","value":{"type":"Card","props":{"title":"Canary: session-titles-enabled","description":"10% of users for the last 2 hours"},"children":["canary-stats","canary-sep","canary-settings-head","canary-promote-row","canary-pause-row","canary-budget-row"]}}
+{"op":"add","path":"/elements/canary-stats","value":{"type":"Grid","props":{"columns":2,"gap":"small"},"children":["canary-errors-row","canary-latency-row"]}}
+{"op":"add","path":"/elements/canary-errors-row","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small","align":"start"},"children":["canary-errors","canary-errors-hint"]}}
+{"op":"add","path":"/elements/canary-errors","value":{"type":"Stat","props":{"label":"Error rate","value":"0.21","unit":"%","delta":"−0.04","trend":"down","tone":"success","caption":"Budget 0.5%"},"children":[]}}
+{"op":"add","path":"/elements/canary-errors-hint","value":{"type":"Hint","props":{"text":"Failed requests out of all requests from users in the canary, over the last 30 minutes. The rollout waits while this is over the budget.","label":"About the error rate"},"children":[]}}
+{"op":"add","path":"/elements/canary-latency-row","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small","align":"start"},"children":["canary-latency","canary-latency-hint"]}}
+{"op":"add","path":"/elements/canary-latency","value":{"type":"Stat","props":{"label":"Title latency, p95","value":840,"unit":"ms","delta":"+120 ms","trend":"up","tone":"warning"},"children":[]}}
+{"op":"add","path":"/elements/canary-latency-hint","value":{"type":"Hint","props":{"text":"How long the slowest 5% of chats waited for a title after their first reply. Titles come from Bedrock when the box has no Anthropic key, which adds about 100 ms.","label":"About title latency"},"children":[]}}
+{"op":"add","path":"/elements/canary-sep","value":{"type":"Separator","props":{},"children":[]}}
+{"op":"add","path":"/elements/canary-settings-head","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small"},"children":["canary-settings-title","canary-settings-hint"]}}
+{"op":"add","path":"/elements/canary-settings-title","value":{"type":"Heading","props":{"text":"Next step","level":3},"children":[]}}
+{"op":"add","path":"/elements/canary-settings-hint","value":{"type":"Hint","props":{"text":"These apply from the next check, every 10 minutes. Nothing changes for users already in the canary."},"children":[]}}
+{"op":"add","path":"/elements/canary-promote-row","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small"},"children":["canary-promote","canary-promote-hint"]}}
+{"op":"add","path":"/elements/canary-promote","value":{"type":"Switch","props":{"label":"Promote to 50% on its own","checked":{"$bindState":"/autoPromote"}},"children":[]}}
+{"op":"add","path":"/elements/canary-promote-hint","value":{"type":"Hint","props":{"text":"Once the error rate has stayed under the budget for an hour, the rollout goes to 50% without asking.","label":"About promoting on its own"},"children":[]}}
+{"op":"add","path":"/elements/canary-pause-row","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small"},"children":["canary-pause","canary-pause-hint"]}}
+{"op":"add","path":"/elements/canary-pause","value":{"type":"Checkbox","props":{"label":"Pause on a Sev2 alert","checked":{"$bindState":"/pauseOnAlert"}},"children":[]}}
+{"op":"add","path":"/elements/canary-pause-hint","value":{"type":"Hint","props":{"text":"Any Sev2 or worse on the chat service holds the rollout where it is until someone resumes it.","label":"About pausing on an alert"},"children":[]}}
+{"op":"add","path":"/elements/canary-budget-row","value":{"type":"Stack","props":{"direction":"horizontal","gap":"small"},"children":["canary-budget","canary-budget-hint"]}}
+{"op":"add","path":"/elements/canary-budget","value":{"type":"Text","props":{"text":"Error budget: 0.5% of requests","tone":"muted","size":"small"},"children":[]}}
+{"op":"add","path":"/elements/canary-budget-hint","value":{"type":"Hint","props":{"text":"Set by the chat service's SLO: 99.5% of requests succeed in any 30 days.","label":"About the error budget"},"children":[]}}
+{"op":"add","path":"/state/autoPromote","value":true}
+{"op":"add","path":"/state/pauseOnAlert","value":true}

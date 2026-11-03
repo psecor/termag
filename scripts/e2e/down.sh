@@ -31,9 +31,13 @@ if [ -f "$root/floci/container" ]; then
 fi
 
 # A box whose socket path would be too long keeps it under <root>/tmux (box.sh).
-for sock in "$root"/boxes/*/tmux.sock "$root"/tmux/*; do
-  [ -S "$sock" ] && { tmux -S "$sock" kill-server 2>/dev/null || true; }
-done
+# Any other socket under the root is asked too: a tmux server started outside
+# a box's bin/tmux has no TERMAG_E2E_ROOT, so the sweep below would miss it.
+while IFS= read -r sock; do
+  tmux -S "$sock" kill-server 2>/dev/null || true
+done < <(find "$root" -path "$root/pg" -prune -o -type s -print 2>/dev/null)
+# The socket directories are read-only (box.sh); rm needs them writable.
+chmod u+w "$root"/boxes/*/tmux "$root"/tmux/* 2>/dev/null || true
 
 if [ -f "$root/pg/data/postmaster.pid" ]; then
   # shellcheck disable=SC1091

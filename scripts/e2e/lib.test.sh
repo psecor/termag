@@ -47,5 +47,30 @@ got=$(bash -c '. "$1/lib.sh"; pkce_challenge "$2"' _ "$here" -hHjopntB8t3Wler83t
 [ "$got" = _X8-qG8a9VwOR0K8QzOhE-jPrFyTSIa7S8AuArNlGdo ] \
   || fail 'pkce_challenge takes a verifier that starts with -' _X8-qG8a9VwOR0K8QzOhE-jPrFyTSIa7S8AuArNlGdo "$got"
 
-if [ "$failures" -eq 0 ]; then echo 'PASS: e2e_leaks reports writes after the marker, and skips older, future-dated and own-work files; pkce_challenge'; fi
+# e2e_tmux_isolation asks every socket under the root with tmux. A socket that
+# isn't tmux's and never answers kept the descriptors tmux handed it (tsx
+# watch's IPC socket did), so the check's loops never saw EOF and up.sh hung
+# before "stack is up". It must come back, with nothing to say about it.
+if command -v tmux >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+  R="$T/root"
+  mkdir -p "$R/boxes/box-1"
+  node -e 'require("net").createServer({ pauseOnConnect: true }, () => {}).listen(process.argv[1], () => console.log("up"))' \
+    "$R/boxes/box-1/silent.sock" > "$T/silent.out" 2>&1 &
+  silent=$!
+  i=0; until grep -q up "$T/silent.out" 2>/dev/null || [ "$i" -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
+  bash -c '. "$1/lib.sh"; e2e_tmux_isolation "$2"' _ "$here" "$R" > "$T/isolation.out" 2>&1 &
+  asking=$!
+  i=0; while kill -0 "$asking" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$asking" 2>/dev/null; then
+    kill -9 "$asking" 2>/dev/null
+    fail 'e2e_tmux_isolation comes back from a socket that never answers' 'done within 15 s' 'still asking'
+  else
+    [ -z "$(cat "$T/isolation.out")" ] \
+      || fail 'a socket that never answers is not a stray server' '' "$(cat "$T/isolation.out")"
+  fi
+  kill "$silent" 2>/dev/null || true
+  wait "$silent" 2>/dev/null || true
+fi
+
+if [ "$failures" -eq 0 ]; then echo 'PASS: e2e_leaks reports writes after the marker, and skips older, future-dated and own-work files; pkce_challenge; e2e_tmux_isolation skips a socket that never answers'; fi
 [ "$failures" -eq 0 ]

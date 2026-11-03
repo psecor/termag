@@ -1,0 +1,14 @@
+{"op":"add","path":"/root","value":"empties"}
+{"op":"add","path":"/elements/empties","value":{"type":"Grid","props":{"columns":2,"gap":"medium"},"children":["reviews-card","search-card","alerts-card","boxes-card"]}}
+{"op":"add","path":"/elements/reviews-card","value":{"type":"Card","props":{"title":"Waiting on your review"},"children":["reviews-empty"]}}
+{"op":"add","path":"/elements/reviews-empty","value":{"type":"EmptyState","props":{"title":"No PRs waiting on you","description":"Every review you were asked for is done. New requests show up here.","icon":"check-circle"},"children":["reviews-merged"]}}
+{"op":"add","path":"/elements/reviews-merged","value":{"type":"Button","props":{"label":"Show what merged this week"},"on":{"press":{"action":"choose","params":{"value":"merged-this-week","label":"Show what merged this week"}}},"children":[]}}
+{"op":"add","path":"/elements/search-card","value":{"type":"Card","props":{"title":"Sessions matching “flaky e2e”"},"children":["search-empty"]}}
+{"op":"add","path":"/elements/search-empty","value":{"type":"EmptyState","props":{"title":"No sessions match","description":"Nothing in this project mentions “flaky e2e” in the last 30 days. Try fewer words, or every project.","icon":"search"},"children":["search-actions"]}}
+{"op":"add","path":"/elements/search-actions","value":{"type":"ButtonGroup","props":{},"children":["search-all","search-clear"]}}
+{"op":"add","path":"/elements/search-all","value":{"type":"Button","props":{"label":"Search every project","variant":"primary"},"on":{"press":{"action":"choose","params":{"value":"search-all","label":"Search every project"}}},"children":[]}}
+{"op":"add","path":"/elements/search-clear","value":{"type":"Button","props":{"label":"Not now","variant":"minimal"},"on":{"press":{"action":"cancel"}},"children":[]}}
+{"op":"add","path":"/elements/alerts-card","value":{"type":"Card","props":{"title":"Alerts"},"children":["alerts-empty"]}}
+{"op":"add","path":"/elements/alerts-empty","value":{"type":"EmptyState","props":{"title":"No alerts in the last 24 hours","description":"Latency, errors and spend all stayed inside their limits.","icon":"notifications"},"children":[]}}
+{"op":"add","path":"/elements/boxes-card","value":{"type":"Card","props":{"title":"Your boxes","tone":"muted"},"children":["boxes-empty"]}}
+{"op":"add","path":"/elements/boxes-empty","value":{"type":"EmptyState","props":{"title":"You have no boxes yet"},"children":[]}}

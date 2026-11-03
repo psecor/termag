@@ -44,7 +44,9 @@ PORT=${STAGE_PROD_PORT:-18432}
 #   collab_responses, agent_threads, agent_messages
 #                                   queues staging's sweeps would deliver again,
 #                                   typing into this box's real panes
-EXCLUDE=${STAGE_PROD_EXCLUDE_DATA:-session cli_sessions user_credentials agent_tokens orchestrator_leases project_invites space_invites agent_spawns agent_handoffs spawn_events collab_requests collab_responses agent_threads agent_messages}
+#   agent_thread_prs                rows of agent_threads, whose data is left
+#                                   out: their foreign key fails the restore
+EXCLUDE=${STAGE_PROD_EXCLUDE_DATA:-session cli_sessions user_credentials agent_tokens orchestrator_leases project_invites space_invites agent_spawns agent_handoffs spawn_events collab_requests collab_responses agent_threads agent_messages agent_thread_prs}
 
 log() { printf '[prod-snapshot] %s\n' "$*" >&2; }
 die() { printf '[prod-snapshot] error: %s\n' "$*" >&2; exit 1; }

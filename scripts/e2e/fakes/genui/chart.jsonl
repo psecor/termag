@@ -1,0 +1,10 @@
+{"op":"add","path":"/root","value":"charts"}
+{"op":"add","path":"/elements/charts","value":{"type":"Grid","props":{"columns":2,"gap":"medium"},"children":["latency-card","deploys-card","cost-card","sessions-card"]}}
+{"op":"add","path":"/elements/latency-card","value":{"type":"Card","props":{"title":"API latency","description":"p50 and p95 over the last 10 days"},"children":["latency"]}}
+{"op":"add","path":"/elements/latency","value":{"type":"Chart","props":{"label":"API latency, p50 and p95, by day","kind":"line","unit":"ms","x":["Oct 19","Oct 20","Oct 21","Oct 22","Oct 23","Oct 24","Oct 25","Oct 26","Oct 27","Oct 28"],"series":[{"name":"p95","values":[212,205,198,240,236,201,190,187,195,182]},{"name":"p50","values":[84,82,80,91,90,81,78,77,79,76]}]},"children":[]}}
+{"op":"add","path":"/elements/deploys-card","value":{"type":"Card","props":{"title":"Deploys","description":"Per week, by how they went out"},"children":["deploys"]}}
+{"op":"add","path":"/elements/deploys","value":{"type":"Chart","props":{"label":"Deploys per week, by kind","kind":"bar","stacked":true,"x":["Sep 22","Sep 29","Oct 6","Oct 13","Oct 20","Oct 27"],"series":[{"name":"Auto","values":[14,17,12,19,21,18]},{"name":"Manual","values":[3,2,5,1,2,1]},{"name":"Rollback","values":[1,0,1,0,1,0]}]},"children":[]}}
+{"op":"add","path":"/elements/cost-card","value":{"type":"Card","props":{"title":"Box spend","description":"Dollars per day"},"children":["cost"]}}
+{"op":"add","path":"/elements/cost","value":{"type":"Chart","props":{"label":"Box spend in dollars per day","kind":"area","unit":"$","x":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"series":[{"name":"Spend","values":[42.1,44.8,47.2,45.9,49.3,21.4,18.7]}]},"children":[]}}
+{"op":"add","path":"/elements/sessions-card","value":{"type":"Card","props":{"title":"Sessions by agent"},"children":["sessions"]}}
+{"op":"add","path":"/elements/sessions","value":{"type":"Chart","props":{"label":"Sessions this week by agent","kind":"bar","x":["Claude","Codex","Cursor","Grok"],"series":[{"name":"Sessions","values":[312,148,96,41]}]},"children":[]}}

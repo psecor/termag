@@ -14,7 +14,8 @@
 //
 // Hibernation, which Floci has no notion of: a RunInstances with
 // HibernationOptions.Configured=true marks the instance hibernation-capable,
-// DescribeInstanceTypes is answered here (every type supports it, 4 GiB), and
+// DescribeInstanceTypes is answered here (every type supports it; the shape
+// from CATALOG, else 2 vCPU and 4 GiB), and
 // a StopInstances with Hibernate=true freezes the box's agent and tmux server
 // (SIGSTOP) instead of killing them, so its sessions survive; the next
 // StartInstances thaws them and DescribeInstances reports the stop's reason as
@@ -22,6 +23,21 @@
 // it answers UnsupportedHibernationConfiguration, and with
 // <root>/ec2/refuse-hibernate every hibernate answers EC2's "not ready to
 // hibernate yet".
+//
+// Capacity: a RunInstances into a subnet listed in <root>/ec2/no-capacity (one
+// id per line, `ctl.sh ec2 no-capacity <subnet>`) answers EC2's
+// InsufficientInstanceCapacity. setup gives the stack a second subnet as
+// BOX_FALLBACK_SUBNET_IDS so a refused launch has somewhere to go, and every
+// RunInstances is appended to <root>/ec2/runs as `<subnet> <type> <result>`,
+// and its root volume size logged.
+//
+// A repo's environment.json requirements: GetInstanceTypesFromInstanceRequirements is
+// answered here too, from CATALOG (Floci has no such call).
+//
+// CreateSnapshot, which Floci does not support, is answered here: a snapshot
+// id, with the volume, description and tags recorded in
+// <root>/ec2/snapshots/<id>.json for a check to read (a box quarantine takes
+// one per volume, backend/src/services/boxQuarantine.ts). Nothing is copied.
 //
 //   node ec2-launcher.mjs setup <root>   register a box image, print backend env lines
 //   node ec2-launcher.mjs serve <root>   run the proxy on 127.0.0.1:$E2E_EC2_PORT
@@ -33,6 +49,14 @@
 // Env: E2E_FLOCI_URL, E2E_EC2_PORT, AWS_REGION. Tokens are written only to the
 // launched box's agent config (0600) and never logged.
 //
+// Resize (backend services/boxResize.ts): ModifyInstanceAttribute with an
+// InstanceType is answered here (a DryRun with DryRunOperation, as EC2 does
+// when the role may make the call), the new type kept in <root>/ec2/<id>.type
+// and put into DescribeInstances; DescribeInstanceTypeOfferings offers every
+// type asked about. A StartInstances of an instance whose type is listed in
+// <root>/ec2/no-capacity-types (`ctl.sh ec2 no-capacity-type <type>`) answers
+// InsufficientInstanceCapacity, so the resize walks to the size's next type.
+//
 // Floci drops image tags: RegisterImage's TagSpecifications are lost, and
 // DescribeImages returns no tagSet and ignores tag: filters. CreateTags and
 // DescribeTags do work, so bake tags with CreateTags and the proxy puts them
@@ -40,7 +64,7 @@
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -147,8 +171,10 @@ async function clear() {
 async function setup() {
   const { DescribeSubnetsCommand } = sdk();
   const { Subnets = [] } = await ec2().send(new DescribeSubnetsCommand({}));
-  const subnet = Subnets.sort((a, b) => a.SubnetId.localeCompare(b.SubnetId))[0];
+  const sorted = Subnets.sort((a, b) => a.SubnetId.localeCompare(b.SubnetId));
+  const subnet = sorted[0];
   if (!subnet) throw new Error('floci has no default subnet');
+  const fallback = sorted.find(s => s.VpcId === subnet.VpcId && s.SubnetId !== subnet.SubnetId) ?? await createSubnet(subnet.VpcId);
   await bake();
   console.log([
     `AWS_ENDPOINT_URL_EC2=http://127.0.0.1:${process.env.E2E_EC2_PORT}`,
@@ -156,7 +182,17 @@ async function setup() {
     'BOX_PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::000000000000:policy/termag-e2e-box-boundary',
     `BOX_VPC_ID=${subnet.VpcId}`,
     `BOX_SUBNET_ID=${subnet.SubnetId}`,
+    `BOX_FALLBACK_SUBNET_IDS=${fallback.SubnetId}`,
   ].join('\n'));
+}
+
+/** A second subnet in the VPC, for a stack whose Floci came up with only one. */
+async function createSubnet(vpcId) {
+  const { DescribeVpcsCommand, CreateSubnetCommand } = sdk();
+  const { Vpcs = [] } = await ec2().send(new DescribeVpcsCommand({ VpcIds: [vpcId] }));
+  const [a, b] = (Vpcs[0]?.CidrBlock ?? '172.31.0.0/16').split('.');
+  const { Subnet } = await ec2().send(new CreateSubnetCommand({ VpcId: vpcId, CidrBlock: `${a}.${b}.250.0/24` }));
+  return Subnet;
 }
 
 // ── The proxy ────────────────────────────────────────────────────────────
@@ -278,6 +314,8 @@ async function powerStop(instanceId) {
   const name = boxOf(instanceId);
   if (!name) return;
   await powerOff(name);
+  // The next start is a new boot (box.sh writes a new boot id; agent/box-notice.js).
+  rmSync(join(root, 'boxes', name, 'boot_id'), { force: true });
   log(`${instanceId}: stopped, powered box ${name} off`);
 }
 
@@ -304,13 +342,122 @@ function ec2Error(code, message) {
     + '<RequestID>e2e-hibernate</RequestID></Response>';
 }
 
+const xmlText = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function createSnapshot(form) {
+  const volumeId = form.get('VolumeId') ?? '';
+  const id = `snap-${Array.from({ length: 17 }, () => Math.floor(Math.random() * 16).toString(16)).join('')}`;
+  const tags = {};
+  for (const [k, v] of form) {
+    const m = k.match(/^TagSpecification\.1\.Tag\.(\d+)\.Key$/);
+    if (m) tags[v] = form.get(`TagSpecification.1.Tag.${m[1]}.Value`) ?? '';
+  }
+  const description = form.get('Description') ?? '';
+  const startTime = new Date().toISOString();
+  mkdirSync(join(state, 'snapshots'), { recursive: true });
+  writeFileSync(join(state, 'snapshots', `${id}.json`), JSON.stringify({ snapshotId: id, volumeId, description, tags, startTime }, null, 2));
+  log(`${volumeId}: snapshot ${id} recorded`);
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<CreateSnapshotResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+    + `<requestId>e2e-snapshot</requestId><snapshotId>${id}</snapshotId><volumeId>${xmlText(volumeId)}</volumeId>`
+    + `<status>pending</status><startTime>${startTime}</startTime><progress></progress><ownerId>000000000000</ownerId>`
+    + `<volumeSize>8</volumeSize><description>${xmlText(description)}</description><encrypted>false</encrypted>`
+    + '</CreateSnapshotResponse>';
+}
+
+/** The type a ModifyInstanceAttribute gave the instance, or null for the one it launched as. */
+function modifiedType(id) {
+  try { return readFileSync(join(state, `${id}.type`), 'utf8').trim() || null; } catch { return null; }
+}
+
+/** Types `ctl.sh ec2 no-capacity-type` has emptied of capacity, for StartInstances. */
+function noCapacityTypes() {
+  try {
+    return new Set(readFileSync(join(state, 'no-capacity-types'), 'utf8').split('\n').map(l => l.trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+/** DescribeInstances with each resized instance's type as ModifyInstanceAttribute set it. */
+function withModifiedTypes(xml) {
+  return xml.replace(/<item>\s*<instanceId>(i-[0-9a-f]+)<\/instanceId>[\s\S]*?<\/item>(?=\s*<\/instancesSet>)/g, (item, id) => {
+    const type = modifiedType(id);
+    return type ? item.replace(/<instanceType>[^<]*<\/instanceType>/, `<instanceType>${type}</instanceType>`) : item;
+  });
+}
+
+function typeOfferings(form) {
+  const types = [...form].filter(([k]) => /^Filter\.\d+\.Name$/.test(k)).flatMap(([k, v]) => {
+    if (v !== 'instance-type') return [];
+    const n = k.split('.')[1];
+    return [...form].filter(([kk]) => kk.startsWith(`Filter.${n}.Value.`)).map(([, vv]) => vv);
+  });
+  const zone = [...form].find(([k, v]) => /^Filter\.\d+\.Name$/.test(k) && v === 'location');
+  const where = zone ? form.get(`Filter.${zone[0].split('.')[1]}.Value.1`) : `${region}a`;
+  const items = types.map(t => `<item><instanceType>${t}</instanceType><locationType>availability-zone</locationType><location>${where}</location></item>`).join('');
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<DescribeInstanceTypeOfferingsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+    + `<requestId>e2e-offerings</requestId><instanceTypeOfferingSet>${items}</instanceTypeOfferingSet></DescribeInstanceTypeOfferingsResponse>`;
+}
+
+/** Subnets `ctl.sh ec2 no-capacity` has emptied of capacity. */
+function noCapacitySubnets() {
+  try {
+    return new Set(readFileSync(join(state, 'no-capacity'), 'utf8').split('\n').map(l => l.trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function recordRun(form, result) {
+  appendFileSync(join(state, 'runs'), `${form.get('SubnetId') ?? '-'} ${form.get('InstanceType') ?? '-'} ${result}\n`);
+  // The root volume asked for (backend boxProvisioner.amiWithDisk), which Floci drops: its volumes are all 8 GB.
+  log(`RunInstances ${form.get('InstanceType') ?? '-'}: root volume ${form.get('BlockDeviceMapping.1.Ebs.VolumeSize') ?? '-'} GB, ${result}`);
+}
+
+// The Graviton types a repo's environment.json requirements can match (backend
+// services/boxRequirements.ts): vCPUs and GiB, as EC2 lists them.
+const CATALOG = {
+  'm8g.large': [2, 8], 'm8g.xlarge': [4, 16], 'm8g.2xlarge': [8, 32], 'm8g.4xlarge': [16, 64],
+  'm7g.large': [2, 8], 'm7g.xlarge': [4, 16], 'm7g.2xlarge': [8, 32], 'm7g.4xlarge': [16, 64],
+  'r8g.large': [2, 16], 'r8g.xlarge': [4, 32], 'r8g.2xlarge': [8, 64],
+  'r7g.large': [2, 16], 'r7g.xlarge': [4, 32], 'r7g.2xlarge': [8, 64],
+  'c8g.large': [2, 4], 'c8g.xlarge': [4, 8], 'c8g.2xlarge': [8, 16],
+};
+
+/** DescribeInstanceTypes: every type supports hibernation; a catalog type has its shape, any other 4 GiB. */
 function instanceTypes(form) {
   const types = [...form].filter(([k]) => /^InstanceType\.\d+$/.test(k)).map(([, v]) => v);
-  const items = types.map(t => `<item><instanceType>${t}</instanceType><hibernationSupported>true</hibernationSupported>`
-    + '<memoryInfo><sizeInMiB>4096</sizeInMiB></memoryInfo></item>').join('');
+  const items = types.map(t => {
+    const [vcpus, gib] = CATALOG[t] ?? [2, 4];
+    return `<item><instanceType>${t}</instanceType><hibernationSupported>true</hibernationSupported>`
+      + `<vCpuInfo><defaultVCpus>${vcpus}</defaultVCpus></vCpuInfo><memoryInfo><sizeInMiB>${gib * 1024}</sizeInMiB></memoryInfo></item>`;
+  }).join('');
   return '<?xml version="1.0" encoding="UTF-8"?>'
     + '<DescribeInstanceTypesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
     + `<requestId>e2e-types</requestId><instanceTypeSet>${items}</instanceTypeSet></DescribeInstanceTypesResponse>`;
+}
+
+/**
+ * GetInstanceTypesFromInstanceRequirements over CATALOG: the vCPU and memory
+ * ranges, and AllowedInstanceType patterns (`r8g.*`), as EC2 filters them. Every
+ * request is appended to <root>/ec2/requirements.
+ */
+function requirementTypes(form) {
+  const num = (k, d) => (form.has(k) ? Number(form.get(k)) : d);
+  const vMin = num('InstanceRequirements.VCpuCount.Min', 0), vMax = num('InstanceRequirements.VCpuCount.Max', Infinity);
+  const mMin = num('InstanceRequirements.MemoryMiB.Min', 0), mMax = num('InstanceRequirements.MemoryMiB.Max', Infinity);
+  const allowed = [...form].filter(([k]) => /^InstanceRequirements\.AllowedInstanceType\.\d+$/.test(k))
+    .map(([, v]) => new RegExp(`^${v.replace(/\./g, '\\.').replace(/\*/g, '.*')}$`));
+  const hits = Object.entries(CATALOG)
+    .filter(([t, [v, g]]) => v >= vMin && v <= vMax && g * 1024 >= mMin && g * 1024 <= mMax && (!allowed.length || allowed.some(r => r.test(t))))
+    .map(([t]) => t);
+  appendFileSync(join(state, 'requirements'), `vcpu ${vMin}-${vMax} memory ${mMin}-${mMax} -> ${hits.join(' ') || '-'}\n`);
+  const items = hits.map(t => `<item><instanceType>${t}</instanceType></item>`).join('');
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<GetInstanceTypesFromInstanceRequirementsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">'
+    + `<requestId>e2e-requirements</requestId><instanceTypeSet>${items}</instanceTypeSet></GetInstanceTypesFromInstanceRequirementsResponse>`;
 }
 
 async function tmuxServerPid(name) {
@@ -381,6 +528,41 @@ function serve() {
       res.writeHead(200, { 'content-type': 'text/xml' }).end(instanceTypes(form));
       return;
     }
+    if (action === 'CreateSnapshot') {
+      res.writeHead(200, { 'content-type': 'text/xml' }).end(createSnapshot(form));
+      return;
+    }
+    if (action === 'GetInstanceTypesFromInstanceRequirements') {
+      res.writeHead(200, { 'content-type': 'text/xml' }).end(requirementTypes(form));
+      return;
+    }
+    if (action === 'DescribeInstanceTypeOfferings') {
+      res.writeHead(200, { 'content-type': 'text/xml' }).end(typeOfferings(form));
+      return;
+    }
+    if (action === 'ModifyInstanceAttribute' && form.get('InstanceType.Value')) {
+      const id = form.get('InstanceId');
+      const type = form.get('InstanceType.Value');
+      if (form.get('DryRun') === 'true') {
+        res.writeHead(412, { 'content-type': 'text/xml' }).end(ec2Error('DryRunOperation', 'Request would have succeeded, but DryRun flag is set.'));
+        return;
+      }
+      writeFileSync(join(state, `${id}.type`), type);
+      log(`${id}: instance type set to ${type}`);
+      res.writeHead(200, { 'content-type': 'text/xml' }).end('<?xml version="1.0" encoding="UTF-8"?>'
+        + '<ModifyInstanceAttributeResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>e2e-modify</requestId><return>true</return></ModifyInstanceAttributeResponse>');
+      return;
+    }
+    if (action === 'StartInstances') {
+      const ids = [...form].filter(([k]) => /^InstanceId\.\d+$/.test(k)).map(([, v]) => v);
+      const full = ids.find(id => modifiedType(id) && noCapacityTypes().has(modifiedType(id)));
+      if (full) {
+        log(`StartInstances ${full} as ${modifiedType(full)}: no capacity (ctl.sh ec2 no-capacity-type)`);
+        res.writeHead(500, { 'content-type': 'text/xml' }).end(ec2Error('InsufficientInstanceCapacity',
+          `We currently do not have sufficient ${modifiedType(full)} capacity in the Availability Zone you requested.`));
+        return;
+      }
+    }
     const hibernating = action === 'StopInstances' && form.get('Hibernate') === 'true';
     if (hibernating) {
       const ids = [...form].filter(([k]) => /^InstanceId\.\d+$/.test(k)).map(([, v]) => v);
@@ -398,6 +580,13 @@ function serve() {
         return;
       }
       form.delete('Hibernate');
+    }
+    if (action === 'RunInstances' && noCapacitySubnets().has(form.get('SubnetId'))) {
+      log(`RunInstances ${form.get('InstanceType')} in ${form.get('SubnetId')}: no capacity (ctl.sh ec2 no-capacity)`);
+      recordRun(form, 'InsufficientInstanceCapacity');
+      res.writeHead(500, { 'content-type': 'text/xml' }).end(ec2Error('InsufficientInstanceCapacity',
+        `We currently do not have sufficient ${form.get('InstanceType')} capacity in the Availability Zone you requested.`));
+      return;
     }
     if (action === 'StopInstances' && existsSync(join(state, 'ignore-stop'))) {
       const ids = [...form].filter(([k]) => /^InstanceId\.\d+$/.test(k)).map(([, v]) => v);
@@ -417,7 +606,7 @@ function serve() {
       return;
     }
     let text = await upstream.text();
-    if (upstream.ok && action === 'DescribeInstances') text = withHibernateReasons(text);
+    if (upstream.ok && action === 'DescribeInstances') text = withModifiedTypes(withHibernateReasons(text));
     if (upstream.ok && action === 'DescribeImages') {
       try {
         text = await withImageTags(text, form);
@@ -429,6 +618,7 @@ function serve() {
     }
     if (upstream.ok && action === 'DescribeInstances' && holdTerminate()) text = shuttingDown(text);
     res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'text/xml' }).end(text);
+    if (action === 'RunInstances') recordRun(form, upstream.ok ? 'launched' : `http-${upstream.status}`);
     if (!upstream.ok) return;
     try {
       if (action === 'RunInstances') {

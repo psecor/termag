@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# `termag ask` across two orchestrators on one database: the reply is never stored, so a `termag ask` that
-# long-polls one backend only gets it if the backend the box posted the result
-# to hands it over through Postgres LISTEN/NOTIFY. Runs on the E2E_OVERLAP
+# `termag ask` across two orchestrators on one database:
+# the stack has no transcript key, so no reply is
+# stored, and a `termag ask` that long-polls one backend only gets it if the
+# backend the box posted the result to hands it over through Postgres
+# LISTEN/NOTIFY. Runs on the E2E_OVERLAP
 # stack (two backends, the box network standing in for the ALB):
 #
 #   1. live overlap: the ask starts on blue, green takes the lease, the CLI
@@ -43,7 +45,9 @@ pass() { echo "ok:   $1"; }
 fail() { echo "FAIL: $1"; echo "      want: $2"; echo "      got:  $3"; fails=$((fails + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "$2" "$3"; fi; }
 
-if [ ! -x "$repo/cli/node_modules/.bin/tsc" ]; then
+# npm ci when the lockfile is newer than the last install (npm's own .package-lock.json), not only when
+# there is none: an existing checkout must pick up a new dependency.
+if [ "$repo/cli/package-lock.json" -nt "$repo/cli/node_modules/.package-lock.json" ]; then
   (cd "$repo/cli" && npm ci --no-audit --no-fund >"$WORK/cli-install.log" 2>&1) || { cat "$WORK/cli-install.log"; echo "FAIL: cli npm ci"; exit 1; }
 fi
 (cd "$repo/cli" && npm run build >"$WORK/cli-build.log" 2>&1) || { cat "$WORK/cli-build.log"; echo "FAIL: cli build"; exit 1; }

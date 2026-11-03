@@ -5,7 +5,11 @@
 # files and folders, moves and removes them, an ungranted box and a revoked
 # grant see nothing, a box cannot manage a space, objects land SSE-KMS under
 # alias/termag-spaces in the derived bucket, and every transfer is in the
-# space's events. Runs on its own ports and TMPDIR, beside any stack that is up.
+# space's events, and an automation in the space gets its folder
+# (decision 13): the fixed .termag/automations/<id>, a
+# chosen folder refused, its README written into the folder by the box, its
+# files kept out of space memory, and the move script taking an old folder's
+# notes there. Runs on its own ports and TMPDIR, beside any stack that is up.
 #
 # Run: bash scripts/e2e/spaces.test.sh   (or make e2e-test-spaces)
 set -uo pipefail
@@ -15,7 +19,7 @@ repo=$(cd "$here/../.." && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
 export E2E_PORT=${E2E_TEST_PORT:-3960} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-5994} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55459} E2E_BOXES=2 \
-  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_FLAGS='{"spaces-enabled":true,"spaces-sharing-enabled":true}'
+  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_FLAGS='{"spaces-enabled":true,"spaces-sharing-enabled":true,"automations-enabled":true,"automation-space-folder-enabled":true,"space-memory-enabled":true}'
 [ -n "${E2E_KEEP:-}" ] || trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 failures=0
@@ -23,7 +27,9 @@ pass() { echo "ok:   $1"; }
 fail() { echo "FAIL: $1"; echo "      want: $2"; echo "      got:  $3"; failures=$((failures + 1)); }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "$2" "$3"; fi; }
 
-if [ ! -x "$repo/cli/node_modules/.bin/tsc" ]; then
+# npm ci when the lockfile is newer than the last install (npm's own .package-lock.json), not only when
+# there is none: an existing checkout must pick up a new dependency.
+if [ "$repo/cli/package-lock.json" -nt "$repo/cli/node_modules/.package-lock.json" ]; then
   (cd "$repo/cli" && npm ci --no-audit --no-fund >"$WORK/cli-install.log" 2>&1) || { cat "$WORK/cli-install.log"; echo "FAIL: cli npm ci"; exit 1; }
 fi
 (cd "$repo/cli" && npm run build >"$WORK/cli-build.log" 2>&1) || { cat "$WORK/cli-build.log"; echo "FAIL: cli build"; exit 1; }
@@ -164,6 +170,38 @@ check "and signing in comes back to the link" "$link_path" \
 check "the link's GET is an event" true \
   "$(browser GET /spaces/team/events | jq -r '[.events[] | select(.action == "file.get" and .path == "docs/page.html" and .actorInstanceId == null)] | length > 0')"
 
+echo "--- a box shares what a PR links (docs/spaces.md, \"Sharing a file\")"
+# A third person, signed in to termag but no member of team: a session row and its signed cookie
+# (docs/e2e-stack.md, "A second user"), and in ALLOWED_USERS, which every shared read re-checks.
+"${PSQL[@]}" -c "INSERT INTO users (id, \"googleId\", \"googleEmail\", \"unixUsername\", \"displayName\", \"onboardedAt\") VALUES ('e2e-riley', 'e2e-riley', 'riley@termag.local', 'riley', 'Riley', now())" >/dev/null
+"${PSQL[@]}" -c "INSERT INTO session (sid, sess, expire) VALUES ('e2e-riley-sid', '{\"cookie\":{\"originalMaxAge\":86400000,\"expires\":\"2099-01-01T00:00:00.000Z\",\"httpOnly\":true,\"path\":\"/termag\"},\"passport\":{\"user\":\"e2e-riley\"}}', now() + interval '1 day')" >/dev/null
+sed -i -E 's/^(ALLOWED_USERS=.*)$/\1,riley@termag.local:riley/' "$ROOT/backend.env"
+connected() { grep -c '\[AGENT\] Connected: ' "$ROOT/logs/backend.log" 2>/dev/null || true; }
+before=$(connected)
+bash "$here/ctl.sh" restart backend >/dev/null 2>&1
+# Both boxes' agents reconnect before anything below (the automations) needs them.
+for _ in $(seq 1 240); do [ "$(connected)" -ge $((before + 2)) ] && break; sleep 0.25; done
+RILEY="termag.sid=$(cd "$repo/backend" && node -e 'process.stdout.write(encodeURIComponent("s:" + require("cookie-signature").sign("e2e-riley-sid", process.argv[1])))' \
+  "$(sed -n 's/^SESSION_SECRET=//p' "$ROOT/backend.env")")"
+as_riley() { curl -s -o /dev/null -w "$1" -H "Cookie: $RILEY" "$API/files/team/$2"; }
+printf 'png' >"$WORK/box-1/x.png"
+on_box box-1 space put x.png team:artifacts/x.png >/dev/null 2>&1
+on_box box-1 space put x.png team:notes.md >/dev/null 2>&1
+check "riley is signed in" riley@termag.local "$(curl -s -H "Cookie: $RILEY" "$API/auth/me" | jq -r .email)"
+check "before the share, the link is a 404 for riley" 404 "$(as_riley '%{http_code}' artifacts/x.png)"
+check "the box shares a file" 0 "$(on_box box-1 space share team:artifacts/x.png >/dev/null 2>&1; echo $?)"
+check "space ls marks it shared" "x.png (shared)" "$(on_box box-1 space ls team:artifacts/ 2>/dev/null | grep -o 'x.png (shared)')"
+check "the share names the box's owner" "e2e@termag.local" \
+  "$(on_box box-1 space share team:artifacts/x.png --json 2>/dev/null | jq -r .sharedBy.email)"
+check "and its event the box" "$("${PSQL[@]}" -c "select id from instances where name = 'box-1'")" \
+  "$(browser GET /spaces/team/events | jq -r '[.events[] | select(.action == "file.share" and .path == "artifacts/x.png")][0].actorInstanceId')"
+check "riley, no member, opens the box's link" "$AWS/$BUCKET/" "$(as_riley '%{redirect_url}' artifacts/x.png | grep -o "^$AWS/$BUCKET/")"
+check "the box shares a file at the space root too: there is no folder limit" 0 "$(on_box box-1 space share team:notes.md >/dev/null 2>&1; echo $?)"
+check "which riley opens as well" "$AWS/$BUCKET/" "$(as_riley '%{redirect_url}' notes.md | grep -o "^$AWS/$BUCKET/")"
+check "the box makes it private again" 0 "$(on_box box-1 space unshare team:notes.md >/dev/null 2>&1; echo $?)"
+check "the box unshares it" 0 "$(on_box box-1 space unshare team:artifacts/x.png >/dev/null 2>&1; echo $?)"
+check "and riley's link is a 404 again" 404 "$(as_riley '%{http_code}' artifacts/x.png)"
+
 echo "--- audit"
 events=$(browser GET /spaces/team/events)
 check "the box's puts are events, with the box as actor" true \
@@ -173,8 +211,58 @@ check "the browser's put is an event with no box" true \
 check "usage counts what was uploaded" true \
   "$(browser GET /spaces/team | jq -r '.space.usedBytes >= 73400320')"
 
-echo "--- revoking"
+echo "--- an automation's folder"
+# The box runs `~/.local/bin/termag space put` as a one-shot, as termag-reconcile installs it on real boxes.
+BOX1_HOME="$ROOT/boxes/box-1/home"
+mkdir -p "$BOX1_HOME/.local/bin"
+printf '#!/bin/sh\nexec node %s/cli/bin/termag.js "$@"\n' "$repo" >"$BOX1_HOME/.local/bin/termag"
+chmod +x "$BOX1_HOME/.local/bin/termag"
 box1=$("${PSQL[@]}" -c "select id from instances where name = 'box-1'")
+auto() { printf '{"name":"%s","instanceId":"%s","schedule":"0 9 * * 1","timezone":"UTC","prompt":"Say hi.","tier":"read","enabled":false,"spaceName":"team"%s}' "$1" "$box1" "${2:+,\"spaceFolder\":\"$2\"}"; }
+created=$(browser POST /automations "$(auto weekly)")
+weekly=$(echo "$created" | jq -r .automation.id)
+check "an automation in a space lives in .termag/automations/<its id>" "team .termag/automations/$weekly" \
+  "$(echo "$created" | jq -r '"\(.automation.spaceName) \(.automation.spaceFolder)"')"
+check "a body naming a folder is refused: the folder is fixed" space_folder_fixed \
+  "$(browser POST /automations "$(auto other 'automations/weekly')" | jq -r .code)"
+daily=$(browser POST /automations "$(auto daily)" | jq -r .automation.id)
+check "another automation of the space gets a folder of its own" ".termag/automations/$daily" \
+  "$(browser GET "/automations/$daily" | jq -r .spaceFolder)"
+readme=""
+for _ in $(seq 1 60); do
+  readme=$(on_box box-1 space get "team:.termag/automations/$weekly/README.md" readme.md >/dev/null 2>&1 && head -1 "$WORK/box-1/readme.md")
+  [ -n "$readme" ] && break
+  sleep 1
+done
+check "the box wrote the README into the folder" "# Automation weekly" "$readme"
+check "which lays out the folder" yes "$(grep -q 'memory/MEMORY.md' "$WORK/box-1/readme.md" && grep -q 'runs/<run>.md' "$WORK/box-1/readme.md" && echo yes || echo no)"
+check "an automation's files are not in the space memory log" 0 \
+  "$(browser GET /spaces/team/memory/log | jq '[.entries[] | select(.path | startswith(".termag/automations/"))] | length')"
+printf 'the box pasted AKIA%s here\n' ZZZZZZZZZZZZZZZZ >"$WORK/box-1/run.md"
+check "a run log under .termag/automations/ is not refused by the memory secret scan" 0 \
+  "$(on_box box-1 space put run.md "team:.termag/automations/$weekly/runs/run-1.md" >/dev/null 2>&1; echo $?)"
+
+echo "--- moving an old folder (scripts/moveAutomationFolders.ts)"
+legacy=$(browser POST /automations "$(auto legacy)" | jq -r .automation.id)
+printf '# notes\nlearned a thing\n' >"$WORK/box-1/notes.md"
+on_box box-1 space put notes.md team:automations/legacy/memory/MEMORY.md >/dev/null 2>&1
+printf 'keep me\n' >"$WORK/box-1/out.txt"
+on_box box-1 space put out.txt team:automations/legacy/outputs/run-1/out.txt >/dev/null 2>&1
+"${PSQL[@]}" -c "update automations set \"spaceFolder\" = 'automations/legacy' where id = '$legacy'" >/dev/null
+move() { (cd "$repo/backend" && set -a && . "$ROOT/backend.env" && set +a && npx tsx src/scripts/moveAutomationFolders.ts "$@" 2>/dev/null | grep "^{"); }  # the backend logs to stdout too
+check "a dry run says it would move the notes" would_move "$(move | jq -r "select(.id == \"$legacy\") | .result")"
+check "and moves nothing" "automations/legacy" "$(browser GET "/automations/$legacy" | jq -r .spaceFolder)"
+check "--apply moves it" moved "$(move --apply | jq -r "select(.id == \"$legacy\") | .result")"
+check "the row says the fixed folder" ".termag/automations/$legacy" "$(browser GET "/automations/$legacy" | jq -r .spaceFolder)"
+on_box box-1 space get "team:.termag/automations/$legacy/memory/MEMORY.md" moved.md >/dev/null 2>&1
+check "the notes are at the fixed folder" "learned a thing" "$(sed -n 2p "$WORK/box-1/moved.md")"
+on_box box-1 space get team:automations/legacy/memory/MEMORY.md gone.md >/dev/null 2>&1
+check "and gone from the old one (exit 3)" 3 $?
+check "a run's outputs stay where people may link to them" 0 \
+  "$(on_box box-1 space get team:automations/legacy/outputs/run-1/out.txt kept.txt >/dev/null 2>&1; echo $?)"
+check "a second run has nothing left to do" "" "$(move --apply | jq -r "select(.id == \"$legacy\") | .result")"
+
+echo "--- revoking"
 check "remove box-1's grant" 200 "$(status DELETE "/spaces/team/boxes/$box1")"
 on_box box-1 space get team:docs/note.txt again.txt >/dev/null 2>&1
 check "box-1 no longer reaches team (exit 3)" 3 $?

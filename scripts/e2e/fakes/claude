@@ -28,8 +28,25 @@ if [ "${1:-}" != -p ] && [ "${1:-}" != --print ]; then
 fi
 # `claude -p … --output-format stream-json`: the simple UI's chat runner
 # (agent/chat-runner.js); a scripted turn with tool calls (claude-stream.mjs).
+# The box agent's one-shot Haiku calls pass --no-session-persistence beside
+# --output-format json, which the briefing and ask runs also pass and which
+# stay a Bedrock turn below. Two of them, told apart by their system prompt
+# (both go through agent/haiku-oneshot.js): the tool-group heading
+# (agent/tool-group-headings.js, "group of tool calls") is claude-json.mjs,
+# and the session title (agent/session-title.js) is claude-stream.mjs.
 if [ "${1:-}" = -p ] || [ "${1:-}" = --print ]; then
-  for a in "$@"; do [ "$a" = stream-json ] && exec node "$(dirname "$0")/claude-stream.mjs" "$@"; done
+  one_shot=0 json=0 summary=0 prev=
+  for a in "$@"; do
+    [ "$a" = stream-json ] && exec node "$(dirname "$0")/claude-stream.mjs" "$@"
+    [ "$a" = --no-session-persistence ] && one_shot=1
+    [ "$prev" = --output-format ] && [ "$a" = json ] && json=1
+    if [ "$prev" = --system-prompt ]; then case "$a" in *"group of tool calls"*) summary=1 ;; esac; fi
+    prev=$a
+  done
+  if [ "$one_shot$json" = 11 ]; then
+    [ "$summary" = 1 ] && exec node "$(dirname "$0")/claude-json.mjs" "$@"
+    exec node "$(dirname "$0")/claude-stream.mjs" "$@"
+  fi
 fi
 # `claude -p [--model <tier|id>] <prompt>`: one Bedrock turn through the box's
 # termag Claude gateway settings (~/.claude/settings.json), as Claude Code makes it.
