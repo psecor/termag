@@ -3,7 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const prisma = vi.hoisted(() => ({
   workstream: { findUnique: vi.fn() },
   workflow: { findFirst: vi.fn() },
-  automationRun: { update: vi.fn(), updateMany: vi.fn() },
+  automationRun: { update: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn(async () => null) },
+}));
+vi.mock('./spaceSync', () => ({
+  pullForRun: vi.fn(async () => ({ error: null, usable: true })),
+  readmeFor: vi.fn(() => '# readme'),
+  spaceFoldersEnabledFor: vi.fn(async () => false),
+  syncErrorText: (e: string) => `words for ${e}`,
 }));
 vi.mock('../../db', () => ({ prisma }));
 vi.mock('../agentRegistry', () => ({
@@ -14,7 +20,15 @@ vi.mock('../agentRegistry', () => ({
 vi.mock('../chatRunner', () => ({
   AUTO_MODE: 'auto',
   chatKeyFor: (p: string, w: string) => `${p}--${w}`,
-  chatSendRpcPayload: vi.fn((p: Record<string, unknown>, message: string) => ({ ...p, message })),
+  chatSendRpcPayload: vi.fn((p: Record<string, unknown>, message: string, _caps?: unknown, opts?: Record<string, unknown>) => ({ ...p, message, ...opts })),
+  chatMemorySpace: (place: { space: { name: string } | null; reachable: boolean }) => (place.space && place.reachable ? place.space.name : null),
+}));
+// The run's chat belongs to the automation's space (services/chatSpace.ts): granted to the box here.
+vi.mock('../chatSpace', () => ({
+  resolveChatSpaceChoice: vi.fn(async (name: string | null) => ({ spaceId: name ? `s-${name}` : null })),
+  chatSpaceFor: vi.fn(async (_ws: string, opts: { requested?: { name: string | null } }) => ({
+    space: opts.requested?.name ? { id: `s-${opts.requested.name}`, name: opts.requested.name } : null, reachable: true,
+  })),
 }));
 vi.mock('../chatTrust', () => ({ UNTRUSTED_MODE: 'plan' }));
 // The choice's launch (services/chatLaunch.test.ts): a tier as itself, none as Sonnet, Fireworks refused here.
@@ -33,7 +47,9 @@ import { startRun } from './runner';
 import { chatLaunchFor } from '../chatLaunch';
 import { sendForProject } from '../agentRegistry';
 import { chatSendRpcPayload } from '../chatRunner';
+import { chatSpaceFor } from '../chatSpace';
 import { createWorkstreamFor, removeWorkstreamFor } from '../../routes/workstreams';
+import { pullForRun, spaceFoldersEnabledFor } from './spaceSync';
 
 const occurrence = new Date('2026-10-20T09:00:00Z');
 const target = {
@@ -80,6 +96,17 @@ describe('startRun', () => {
     vi.mocked(chatSendRpcPayload).mockClear();
     await startRun(target);
     expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[0]).toMatchObject({ model: 'sonnet' });
+  });
+
+  it("sends the owner's launch as chatLaunchFor decides it: the gateway's profile, or the alias for an owner off the gateway", async () => {
+    prisma.workflow.findFirst.mockResolvedValueOnce({ backend: null, model: 'opus' });
+    vi.mocked(chatLaunchFor).mockResolvedValueOnce({ ok: true, launch: { model: 'us.anthropic.claude-opus-5-5' } });
+    await startRun(target);
+    expect(vi.mocked(chatLaunchFor).mock.calls.at(-1)?.[1]).toMatchObject({ ownerId: 'u1' });
+    expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[0]).toMatchObject({ model: 'us.anthropic.claude-opus-5-5' });
+    prisma.workflow.findFirst.mockResolvedValueOnce({ backend: null, model: 'opus' });
+    await startRun(target);
+    expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[0]).toMatchObject({ model: 'opus' });
   });
 
   it('fails the launch, and discards the tree, when the choice cannot start on this box', async () => {
@@ -167,5 +194,42 @@ describe('startRun', () => {
     expect(await startRun(target)).toEqual({ kind: 'failed', reason: 'launch', error: 'git worktree add failed: Agent request timed out: git-worktree-add' });
     expect(createWorkstreamFor).toHaveBeenCalledTimes(1);
     expect(chatSends()).toHaveLength(0);
+  });
+});
+
+describe('startRun in a space', () => {
+  const inSpace = { ...target, automation: { ...(target.automation as object), spaceName: 'team', spaceFolder: 'automations/triage', projectId: 'p1' } as never, run: { id: 'r1', scheduledFor: occurrence, trigger: 'schedule' } as never };
+  beforeEach(() => {
+    vi.mocked(sendForProject).mockImplementation(async () => ({ ok: true }));
+    vi.mocked(createWorkstreamFor).mockReset().mockResolvedValue({ status: 201, body: { id: 'w1', name: 'run-20261020-0900', fetched: true, baseSha: 'abc1234' } });
+  });
+  const brief = () => String(chatSends()[0]?.[2] && (chatSends()[0][2] as { message: string }).message);
+
+  it('with folders off, pulls the notes only and names no space in the brief', async () => {
+    await startRun(inSpace);
+    expect(pullForRun).toHaveBeenCalledWith(expect.objectContaining({ spaceName: 'team', folder: 'automations/triage', memoryDir: '/home/me/.termag/automations/p1/memory' }), { folders: false, previousLog: null, readme: null });
+    expect(brief()).not.toContain('--- space ---');
+  });
+
+  it('with folders on, pulls the previous log and the README, and the brief has the space section', async () => {
+    vi.mocked(spaceFoldersEnabledFor).mockResolvedValueOnce(true);
+    prisma.automationRun.findFirst.mockResolvedValueOnce({ scheduledFor: new Date('2026-10-19T09:00:00Z'), trigger: 'manual' } as never);
+    await startRun(inSpace);
+    expect(pullForRun).toHaveBeenCalledWith(expect.anything(), { folders: true, previousLog: 'run-20261019-0900-manual', readme: '# readme' });
+    expect(brief()).toContain('This automation lives in termag space team, folder automations/triage/.');
+    // Its chat belongs to the automation's space, fixed as its workstream is made (services/chatSpace.ts), and its turns load that space's memory.
+    expect(vi.mocked(createWorkstreamFor).mock.calls.at(-1)?.[2]).toMatchObject({ chatSpace: { spaceId: 's-team' } });
+    expect(vi.mocked(chatSpaceFor)).toHaveBeenLastCalledWith(expect.any(String), { requested: { name: 'team', userId: expect.any(String) } });
+    expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[3]).toEqual({ memorySpace: 'team' });
+    expect(brief()).toContain('outputs/run-20261020-0900/');
+  });
+
+  it('records the trouble on the row as it links it, and the brief says the space was not available', async () => {
+    vi.mocked(spaceFoldersEnabledFor).mockResolvedValueOnce(true);
+    vi.mocked(pullForRun).mockResolvedValueOnce({ error: 'space_read_only', usable: false });
+    await startRun(inSpace);
+    const link = prisma.automationRun.updateMany.mock.calls.find(c => c[0].data.workstreamId === 'w1');
+    expect(link![0].data).toMatchObject({ spaceSyncError: 'space_read_only' });
+    expect(brief()).toContain('the space was not available this run: words for space_read_only');
   });
 });

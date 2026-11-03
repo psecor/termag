@@ -16,8 +16,8 @@ describe('reviewers', () => {
     expect(reviewerLaunch('devin', F)).toBe(`devin --permission-mode smart --prompt-file ${F}`);
     expect(reviewerLaunch('claude', F)).toBe(`claude --permission-mode plan "$(cat ${F})"`);
     expect(reviewerLaunch('cursor', F)).toBe(`cursor-agent --mode plan --auto-review "$(cat ${F})"`);
-    expect(reviewLaunchCommand('a-p-review', 'claude')).toBe(reviewerLaunch('claude', F));
-    expect(reviewLaunchCommand('a-p-review')).toBe(reviewerLaunch('devin', F));
+    expect(reviewLaunchCommand('a-p-review', 'claude')).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('claude', F)}`);
+    expect(reviewLaunchCommand('a-p-review')).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('devin', F)}`);
   });
   it('recognises each from the pane foreground command', () => {
     expect(reviewerForForeground('devin')).toBe('devin');

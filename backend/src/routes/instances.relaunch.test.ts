@@ -49,7 +49,11 @@ const terminateBox = vi.fn(async () => true);
 vi.mock('../db', () => ({ prisma }));
 vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn() }));
 vi.mock('../services/boxProvisioner', () => ({ provisionBox, terminateBox, isBoxProvisioningConfigured: () => true }));
-vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
+vi.mock('../services/featureFlags', () => ({
+  boolVariation: vi.fn(async () => false),
+  stringVariation: vi.fn(async (_key: string, _user: unknown, fallback: string) => fallback),
+  stringVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: string) => fallback),
+}));
 vi.mock('../services/boxImage', () => ({
   boxImageSelectionFor: vi.fn(async () => ({ kind: 'published' })),
   isPublished: () => true,

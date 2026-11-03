@@ -1,4 +1,8 @@
 import 'dotenv/config';
+// Before anything requires express, pg, undici or the AWS SDK: their
+// instrumentations patch them as they load (services/tracing.ts). Second,
+// after dotenv, which it reads; tracing.test.ts pins the order.
+import './services/tracing';
 // Must run before any module constructs a PrismaClient: derives DATABASE_URL
 // from platform-injected PG_* variables when it is not set explicitly.
 import './config/bootstrap';
@@ -16,15 +20,24 @@ import { configurePassport, authRouter, albSessionBridge, authMode, upgradeUserI
 import { stashPostLoginReturn } from './auth/postLoginReturn';
 import { projectsRouter } from './routes/projects';
 import { chatRouter } from './routes/chat';
+import { chatAsksRouter } from './routes/chatAsks';
 import { CHAT_MESSAGE_BODY_LIMIT } from './services/chatImages';
 import { chatsRouter } from './routes/chats';
 import { claudeLoginRouter } from './routes/claudeLogin';
-import { mayReceiveChat, setChatPushCallback, startChatRelay, startChatStatusSweep, stopChatStatusSweep } from './services/chatRunner';
+import { chatPushRoute, mayReceiveChat, setChatPushCallback, startChatRelay, startChatStatusSweep, stopChatStatusSweep } from './services/chatRunner';
+import { startChatTranscriptSync } from './services/chatTranscriptSync';
+import { startChatResumeRestores } from './services/chatNewBox';
+import { startHeldDelivery } from './services/chatHeld';
+import { deliverHeldMessage, sendAskNotice } from './routes/chat';
+import { startChatPrLinks } from './services/chatPrLinks';
+import { startPrLiveUpdates } from './services/prLiveUpdates';
 import { statusRouter } from './routes/status';
 import { browserRouter } from './routes/browser';
 import { agentTokensRouter } from './routes/agentTokens';
 import { usageRouter } from './routes/usage';
 import { worktimeRouter } from './routes/worktime';
+import { createPrismaCliWorktime } from './routes/cliWorktimePrisma';
+import { createPrismaCliSessionSearch } from './routes/cliSessionSearchPrisma';
 import { sharingRouter } from './routes/sharing';
 import { sessionsRouter } from './routes/sessions';
 import { metatermRouter } from './routes/metaterm';
@@ -38,9 +51,11 @@ import { warmPoolRouter } from './routes/warmPool';
 import { apiErrorHandler } from './middleware/errors';
 import { isAllowedUpgradeOrigin } from './auth/wsOrigin';
 import { workstreamsRouter } from './routes/workstreams';
+import { workstreamChangesRouter } from './routes/workstreamChanges';
 import { featureFlagsRouter } from './routes/featureFlags';
 import { credentialsRouter } from './routes/credentials';
 import { mcpClientMetadataHandler, mcpConnectorsRouter } from './routes/mcpConnectors';
+import { prismaCliMcpConnectors } from './routes/cliMcpConnectors';
 import { githubReposRouter } from './routes/githubRepos';
 import { githubAuthzRouter } from './routes/githubAuthz';
 import { claudeAuthzRouter } from './routes/claudeAuthz';
@@ -49,16 +64,18 @@ import { mcpAuthzRouter } from './routes/mcpAuthz';
 import { claudeRunnerRouter } from './routes/claudeRunner';
 import { claudeRunnerEventsRouter } from './routes/claudeRunnerEvents';
 import { boxUpdatePolicyRouter } from './routes/boxUpdatePolicy';
+import { toolUpdateRouter } from './routes/toolUpdate';
 import { usersRouter } from './routes/users';
 import { isOwnRunnerSessionStatus } from './services/claudeRunnerSpawn';
 import { claudeSessionsRouter } from './routes/claudeSessions';
 import { setCloudSessionChangeCallback } from './services/claudeSessionEvents';
 import { coalesceWorkspaceChanges, setWorkspaceChangeCallback } from './services/workspaceEvents';
+import { setBoxResizePush } from './services/boxResize';
 import { installWorkspaceWriteNotifier } from './services/workspaceWrites';
 import { startCloudSessionSweeps, stopCloudSessionSweeps } from './services/claudeSessions';
 import { getCallerProofConfig } from './services/callerIdentity';
 import { providersRouter } from './routes/providers';
-import { prsRouter } from './routes/prs';
+import { prsRouter, reloadPipelineForUser } from './routes/prs';
 import { pushRouter } from './routes/push';
 import { termagVersion } from './services/termagVersion';
 import { adminRouter } from './routes/admin';
@@ -70,34 +87,50 @@ import { backfillBoxEcrPullPolicies, startProvisioningSweep, stopProvisioningSwe
 import { moveChatModelsToWorkflows } from './services/chatModelMove';
 import { instanceStatus, startPowerSweep, stopPowerSweep } from './services/boxPower';
 import { TERMINAL_BOX_PARKED_CLOSE_CODE, terminalAttachRefusal } from './services/boxPowerPolicy';
+import { QUARANTINED } from './services/boxQuarantinePolicy';
 import { terminalSessionAccess } from './services/sessionAccess';
 import { loadSharedScope, sendThroughShare, setShareChangeCallback, shareChangeFrames, shareChangeTouches, startSharedRefresh, statusRoute, type ScopeHolder } from './services/statusAudience';
 import type { AgentStatus } from './types';
 import { startWarmPoolReconciler, stopWarmPoolReconciler } from './services/warmPool';
 import { startBoxUpdateSweep, stopBoxUpdateSweep } from './services/boxUpdate';
+import { startOrchestratorClaudeSweep, stopOrchestratorClaudeSweep } from './services/toolUpdate/orchestrator';
 import { prismaCliAsk, startAskQueue, startAskReplies, startAskSweep, stopAskQueue, stopAskReplies, stopAskSweep } from './services/askService';
 import { BRIEFING_RESULT_BODY_LIMIT, briefingsRouter } from './routes/briefings';
+import { TEAMS_EXPORT_BODY_LIMIT } from './services/prAnalytics/teamSync';
+import { createPrismaCliBriefings } from './routes/cliBriefingsPrisma';
+import { prismaCliSessionSpace } from './routes/cliSessionSpace';
+import { prismaCliGithubRepos } from './routes/cliGithubRepos';
+import { prismaCliDotfiles } from './services/cliDotfilesPrisma';
+import { createPrismaCliChats } from './routes/cliChatsPrisma';
+import { cliFeaturesFor } from './routes/cliFeatures';
 import { automationsRouter } from './routes/automations';
-import { recheckMirrorsForMember } from './services/automations/memorySync';
+import { recheckMirrorsForMember } from './services/automations/spaceSync';
 import { startAutomationScheduler, stopAutomationScheduler } from './services/automations/scheduler';
 import { startAutomationCompletion } from './services/automations/complete';
+import { setT3HookCaller, t3HookCallerFor } from './services/automations/t3Hook';
 import { startBriefingScheduler, stopBriefingScheduler } from './services/briefing/scheduler';
 import { registerBriefingSlackActions } from './services/briefing/slack';
-import { startLifecycleSweep, stopLifecycleSweep } from './services/boxLifecycle';
+import { registerBoxIdleSlackActions } from './services/boxIdleNotices';
+import { setLiveTunnels, startLifecycleSweep, stopLifecycleSweep } from './services/boxLifecycle';
 import { startHostSampling, stopHostSampling } from './services/hostSamples';
+import { startBoxMeter, stopBoxMeter } from './services/boxCost/meter';
+import { startBillPull, stopBillPull } from './services/boxCost/bill';
 import { startSoftwareCollector, stopSoftwareCollector } from './services/software/collector';
 import { clientVersionMiddleware } from './services/software/clients';
+import { surfaceMiddleware } from './services/requestSurface';
 import { requireAuth } from './middleware/auth';
 import { spaStatic } from './middleware/spaStatic';
 import { handleBrowserPaneSocket } from './routes/browserWs';
 import { startPrIngester, stopPrIngester } from './services/prAnalytics/ingester';
 import { startSegmentTracker, stopSegmentTracker } from './services/segments/tracker';
-import { syncAdminBootstrap } from './services/admin/adminAccess';
+import { isAdminUser, syncAdminBootstrap } from './services/admin/adminAccess';
 import { setStatusChangeCallback, getStatus, getAllStatuses, hydrateStatuses, rehydrateStatuses, setStatusTimersSuspended } from './services/status';
 import { createStatusTakeover } from './services/statusTakeover';
 import { milestoneForSharedViewer } from './services/milestone';
+import { statusFrame } from './services/statusFrame';
 import { startReviewSweep, stopReviewSweep, reviewForSharedViewer } from './services/reviewSweep';
 import { startSpawnNudgeSweep, stopSpawnNudgeSweep } from './services/agentSpawnSweep';
+import { setAskNoticeChatSender, startAskNoticeSweep, stopAskNoticeSweep } from './services/askNoticeSweep';
 import { spawnsRouter } from './routes/spawns';
 import { handoffsRouter } from './routes/handoffs';
 import { startHandoffSweep, stopHandoffSweep } from './services/agentHandoffSweep';
@@ -105,17 +138,23 @@ import { collabRouter } from './routes/collab';
 import { registerCollabSlackActions } from './slack/collab';
 import { startCollabNudgeSweep, stopCollabNudgeSweep } from './services/collabSweep';
 import { initOtel, shutdownOtel } from './services/otel';
+import { installOperationSpans } from './services/tracing/prismaSpans';
+import { serverSpanMiddleware, setServerSpanAttributes } from './services/tracing/requestSpan';
+import { tracingRegistered } from './services/tracing/state';
+import { setSweepLeaderProbe } from './services/tracing/spans';
 import { registerSpawnGauges } from './services/spawnMetrics';
 import { debugLog } from './services/debugLog';
 import { parseStatusKey } from './services/statusKey';
 import { createSlackApp, startSlackApp, stopSlackApp } from './slack/app';
+import { stopAgentRunsForRestart } from './slack/agentSession';
 import { createDiscordClient, startDiscordClient, stopDiscordClient } from './discord/app';
 import { validateAgentToken } from './routes/agentTokens';
+import { acceptsScope } from './services/agentTokenScopes';
 import {
   registerAgent, isAgentConnected, isInstanceAgentConnected,
-  requestTerminalStream, requestInstanceTerminalStream,
+  requestTerminalStream, requestInstanceTerminalStream, TERMINAL_AGENT_GONE, TERMINAL_AGENT_GONE_CLOSE_CODE,
   sendTerminalInput, sendTerminalPasteImage, sendTerminalResize, sendTerminalMouse, closeTerminalStream,
-  setAgentRegistryDraining,
+  setAgentRegistryDraining, sendToInstanceAgent,
 } from './services/agentRegistry';
 import { leaseConfigFromEnv, newHolder, OrchestratorLease } from './services/orchestratorLease';
 import { prismaLeaseStore } from './services/orchestratorLeasePrisma';
@@ -132,11 +171,24 @@ import { AuthCodeStore } from './services/cliAuth';
 import { cliJwtFromEnv } from './services/cliJwtKms';
 import { prismaCliStore } from './services/cliStorePrisma';
 import { prismaCliLifecycle } from './routes/cliLifecyclePrisma';
+import { prismaCliAutomations } from './routes/cliAutomationsPrisma';
+import { prismaCliSpeech } from './routes/cliSpeechPrisma';
+import { prismaCliPreviewShares } from './routes/cliPreviewSharesPrisma';
 import { prismaCliTui } from './routes/cliTuiPrisma';
+import { prismaCliPrs } from './routes/cliPrsPrisma';
 import { authenticateCliUpgrade, cliWsRoute, refusalResponse, watchCliSocket } from './routes/cliWs';
+import {
+  cliT3RelayRouter, endUpgrade, handleAgentTunnelUpgrade, handleT3RelayUpgrade, isAgentTunnelPath, rawRefusal, RELAY_REDIAL_CLOSE_CODE, relayServerOptions, t3RelayTarget,
+} from './routes/cliT3';
+import { createPrismaCliT3 } from './routes/cliT3Prisma';
+import { createCliForward, forwardMaxConcurrent, forwardServerOptions, forwardTarget, FORWARD_DRAIN_CLOSE_CODE } from './routes/cliForward';
+import { createPrismaForwardBoxes } from './routes/cliForwardPrisma';
+import { AgentTunnels, tunnelHeartbeat } from './services/agentTunnels';
 import { verifyAlbIdentity } from './auth/albOidc';
 import { startHumanActivityTracker, stopHumanActivityTracker } from './services/humanActivity';
+import { loadUserTimeZones } from './services/userTimeZone';
 import { startProjectClone } from './services/projectClone';
+import { startWorkspaceSetup } from './services/workspaceSetup';
 import { startChatGate } from './services/chatGate';
 import { cliCredentialsRouter } from './routes/cliCredentials';
 import { prismaCliCredentials } from './services/cliCredentialsPrisma';
@@ -145,14 +197,19 @@ import { startContextSampler, stopContextSampler } from './services/contextSampl
 import { startTokenUsageSampler, stopTokenUsageSampler } from './services/tokenUsageSampler';
 import { agentTokenForms, agentWsToken, QUERY_TOKEN_REFUSAL } from './auth/agentWsToken';
 import { spaceCallerFromCli, spacesRouter } from './routes/spaces';
-import { spaceFilesRouter } from './routes/spaceFiles';
+import { sharedFileApiRouter, spaceFilesRouter } from './routes/spaceFiles';
+import { parseAllowedUsers, resolveUnixUsername } from './auth/allowedUsers';
 import { previewLinkRouter, previewSharesRouter, defaultPreviewShareRouteDeps, installAutoPreviewShares } from './routes/previewShares';
 import { installPreviewShareLinkHooks, startPreviewShareSweep, stopPreviewShareSweep } from './services/previewShareLinks';
-import { FILE_LINK_PREFIX, spaceFileLinkPath } from './services/spaces/spaceLinks';
-import { spaceObjects, spacesEnabledFor, spacesHtmlLinksEnabledFor, spacesSharingEnabledFor, spacesSweeper, spaceStore } from './services/spaces/spacesRuntime';
+import { FILE_LINK_PREFIX, spaceFileLinkPath, spaceFolderPagePath } from './services/spaces/spaceLinks';
+import {
+  notifySpaceFileChange, simpleUiFilesEnabledFor, spaceMemoryEnabledFor, spaceObjects, spacesEnabledFor, spacesHtmlLinksEnabledFor, spacesSharingEnabledFor, spacesSweeper,
+  spaceStore, startSpaceFileFeed,
+} from './services/spaces/spacesRuntime';
 
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
+import { prismaBugReports } from './services/bugReportsPrisma';
 import { getActiveHomeViewers } from './slack/events';
 
 const app = express();
@@ -167,6 +224,41 @@ const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
 
 // --- Middleware ---
 app.set('trust proxy', 1);
+// The request's server span, bound to the request before anything can lose
+// its context; request attributes are set through it (services/tracing/requestSpan.ts).
+app.use(BASE_PATH || '/', serverSpanMiddleware);
+// The client a request comes from, the surface feature flags are read for
+// (services/requestSurface.ts). It only reads headers, so it goes ahead of
+// everything, the bearer-only relay and forward routers below included, and
+// again after the session middleware.
+app.use(BASE_PATH || '/', surfaceMiddleware);
+
+// The desktop app's box relay (routes/cliT3.ts):
+// ahead of cors and the body parsers, because it hands the t3 client's
+// requests, preflights included, to the box untouched. Bearer-only like the
+// rest of /api/cli/v1, which is mounted below.
+const cliJwt = cliJwtFromEnv(process.env, `${FRONTEND_URL}${BASE_PATH}`);
+cliJwt.catch(err => console.error('[CLI] access-token keys did not load; /api/cli/v1 answers 500:', err));
+// The CLI sockets judge their bearer exactly as /api/cli/v1 does (routes/cliWs.ts).
+const cliWsDeps = { store: prismaCliStore, jwt: cliJwt };
+const agentTunnels = new AgentTunnels({ send: sendToInstanceAgent });
+// A forward opened since the box's last host sample still holds it (the `tunnels` busy check).
+setLiveTunnels(ids => agentTunnels.boxesWithTunnels(ids, 'port'));
+const prismaCliT3 = createPrismaCliT3({ tunnels: agentTunnels });
+// A t3 automation's run calls its T3 task's webhook through the same tunnels (services/automations/t3Hook.ts).
+setT3HookCaller(t3HookCallerFor({ access: (user, boxId) => prismaCliT3.access(user, boxId), openTunnel: (user, boxId) => prismaCliT3.openTunnel(user, boxId) }));
+app.use(`${BASE_PATH}/api/cli/v1/boxes/:id/t3/relay`, cliT3RelayRouter({ bearer: cliBearer(cliWsDeps), t3: prismaCliT3 }));
+// The native port forward (routes/cliForward.ts): the
+// probe here, the forward socket in the upgrade dispatch below.
+const forwardWss = new WebSocketServer(forwardServerOptions());
+const cliForward = createCliForward({
+  bearer: cliWsDeps, boxes: createPrismaForwardBoxes(), tunnels: agentTunnels, wss: forwardWss,
+  isServing: () => drain.isServing(), maxConcurrent: forwardMaxConcurrent(process.env),
+  // Not startHeartbeat: a leg the relay has paused for backpressure can't read its pong.
+  heartbeat: (ws) => tunnelHeartbeat(ws, WS_HEARTBEAT_MS),
+});
+app.use(`${BASE_PATH}/api/cli/v1/boxes/:id/forward`, cliForward.router());
+
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 // Before express.json(): the GitHub broker's check reads GraphQL bodies raw.
 // Registered only with a caller allowlist, so without one the path 404s.
@@ -180,6 +272,8 @@ if (callerProof) {
 // A briefing's result (the composed JSON plus the run's usage) may pass the
 // global 100kb default; parsed here first, express.json() below skips it.
 app.use(`${BASE_PATH}/api/briefings/:id/result`, express.json({ limit: BRIEFING_RESULT_BODY_LIMIT }));
+// A teams export (admin PRs tab, Import export…) is ~170 KB for 75 teams.
+app.use(`${BASE_PATH}/api/admin/prs/teams/import`, express.json({ limit: TEAMS_EXPORT_BODY_LIMIT }));
 // A chat message may carry images as base64 (services/chatImages.ts).
 app.use(`${BASE_PATH}/api/projects/:id/chat/messages`, express.json({ limit: CHAT_MESSAGE_BODY_LIMIT }));
 // Returning a session to the chat can carry the same image message.
@@ -201,6 +295,7 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
   slackApp = createSlackApp();
   slackClient = slackApp.client;
   registerBriefingSlackActions(slackApp);
+  registerBoxIdleSlackActions(slackApp);
   registerCollabSlackActions(slackApp);
 
   if (process.env.CAPTURE_API_SECRET) {
@@ -217,11 +312,6 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
   }
 }
 
-const cliJwt = cliJwtFromEnv(process.env, `${FRONTEND_URL}${BASE_PATH}`);
-cliJwt.catch(err => console.error('[CLI] access-token keys did not load; /api/cli/v1 answers 500:', err));
-// The CLI sockets judge their bearer exactly as /api/cli/v1 does (routes/cliWs.ts).
-const cliWsDeps = { store: prismaCliStore, jwt: cliJwt };
-
 // Which client build each user runs. Ahead of the
 // /api/cli/v1 routers, which finish every CLI and TUI request: it only reads
 // headers here and looks up the user (req.user or res.locals.cliAuth) when the
@@ -237,7 +327,8 @@ app.use(`${BASE_PATH}/api/cli/v1`, cliCredentialsRouter({ store: prismaCliStore,
 app.use(`${BASE_PATH}/api/cli/v1/spaces`, (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); },
   cliBearer({ store: prismaCliStore, jwt: cliJwt }),
   spacesRouter({
-    store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, onMemberChanged: recheckMirrorsForMember,
+    store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, memoryEnabled: spaceMemoryEnabledFor, onMemberChanged: recheckMirrorsForMember,
+    onFileChange: notifySpaceFileChange,
     caller: (_req, res) => {
       const auth = res.locals.cliAuth as CliAuth | undefined;
       return auth ? spaceCallerFromCli(auth) : null;
@@ -248,7 +339,21 @@ app.use(`${BASE_PATH}/api/cli/v1/spaces`, (_req, res, next) => { res.set('Cache-
 // --- termag CLI API (bearer-only, before session/passport/ALB bridge) ---
 // Mounted ahead of the cookie stack on purpose: see routes/cliApi.ts.
 const cliAuthCodes = new AuthCodeStore();
-app.use(`${BASE_PATH}/api/cli/v1`, cliApiRouter({ store: prismaCliStore, codes: cliAuthCodes, jwt: cliJwt, tui: prismaCliTui, lifecycle: prismaCliLifecycle, ask: prismaCliAsk }));
+app.use(`${BASE_PATH}/api/cli/v1`, cliApiRouter({
+  store: prismaCliStore, codes: cliAuthCodes, jwt: cliJwt, tui: prismaCliTui, prs: prismaCliPrs, lifecycle: prismaCliLifecycle, ask: prismaCliAsk, t3: prismaCliT3, automations: prismaCliAutomations,
+  worktime: createPrismaCliWorktime(),
+  sessionSearch: createPrismaCliSessionSearch(),
+  bugReports: { store: prismaBugReports }, mcpConnectors: prismaCliMcpConnectors,
+  briefings: createPrismaCliBriefings(),
+  chats: createPrismaCliChats(),
+  features: cliFeaturesFor,
+  // The same speech model frontendDist (below) serves at /termag/speech/, for the desktop's dictation.
+  speech: prismaCliSpeech(join(__dirname, '../../frontend/dist')),
+  previewShares: prismaCliPreviewShares,
+  sessionSpace: prismaCliSessionSpace,
+  githubRepos: prismaCliGithubRepos,
+  dotfiles: prismaCliDotfiles,
+}));
 
 const sessionMiddleware = session({
   // connect-pg-simple's `session` table is declared in prisma/schema.prisma
@@ -290,6 +395,14 @@ app.use(BASE_PATH || '/', passport.initialize());
 app.use(BASE_PATH || '/', passport.session());
 // Turn the ALB's verified Okta identity (x-amzn-oidc-data) into a session.
 app.use(BASE_PATH || '/', albSessionBridge);
+// The signed-in user's id on the request's server span (services/tracing/requestSpan.ts).
+app.use(BASE_PATH || '/', (req, _res, next) => {
+  if (req.user) setServerSpanAttributes(req, { 'termag.user': req.user.id });
+  next();
+});
+// Again, for /auth and /api: connect-pg-simple's pool can resume a request in
+// another one's async context, so the surface is set afresh from its headers.
+app.use(BASE_PATH || '/', surfaceMiddleware);
 // The web bundle's beacon (on load, then hourly): the middleware above records its build.
 app.post(`${BASE_PATH}/api/client/hello`, requireAuth, (_req, res) => { res.status(204).end(); });
 
@@ -313,6 +426,7 @@ app.use(`${BASE_PATH}/auth/cli`, cliAuthorizeRouter({
 app.use(`${BASE_PATH}/auth`, authRouter());
 app.use(`${BASE_PATH}/api/projects`, projectsRouter());
 app.use(`${BASE_PATH}/api/projects`, chatRouter());
+app.use(`${BASE_PATH}/api/projects`, chatAsksRouter());
 app.use(`${BASE_PATH}/api/chats`, chatsRouter());
 app.use(`${BASE_PATH}/api/projects`, claudeLoginRouter());
 app.use(`${BASE_PATH}/api/status`, statusRouter());
@@ -324,6 +438,9 @@ app.use(`${BASE_PATH}/api/claude-runner`, claudeRunnerEventsRouter());
 // for its owner. Anything but a yes from here, this route included when it is
 // missing, leaves the box as it is.
 app.use(`${BASE_PATH}/api/box-update`, boxUpdatePolicyRouter());
+// A box's tool update (Claude Code: deploy/termag-claude-update) asks its
+// policy and reports its run.
+app.use(`${BASE_PATH}/api/tool-update`, toolUpdateRouter());
 // The person picker in the share and space dialogs (routes/users.ts).
 app.use(`${BASE_PATH}/api/users`, usersRouter());
 // The owner's view of those sessions: runs, events, runner log, end.
@@ -344,16 +461,25 @@ app.use(`${BASE_PATH}/api/warp`, warpRouter());
 app.use(`${BASE_PATH}/api/context`, contextRouter());
 app.use(`${BASE_PATH}/api/instances`, instancesRouter());
 app.use(`${BASE_PATH}/api/spaces`, requireAuth, spacesRouter({
-  store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, onMemberChanged: recheckMirrorsForMember,
+  store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, sharing: spacesSharingEnabledFor, memoryEnabled: spaceMemoryEnabledFor, onMemberChanged: recheckMirrorsForMember,
+  onFileChange: notifySpaceFileChange,
   caller: req => (req.user ? { kind: 'user', userId: req.user.id } : null),
   fileLink: (space, path) => `${FRONTEND_URL}${spaceFileLinkPath(BASE_PATH, space, path)}`,
 }));
 // Space file links, /termag/files/<space>/<path> (routes/spaceFiles.ts): a
 // navigation, so behind the session cookie and the ALB's Okta default action,
 // never under /api. Must stay ahead of the SPA fallback below.
+// A file shared with termag is read by anyone ALLOWED_USERS still lets in,
+// re-checked on every read (services/spaces/sharedFiles.ts).
+const sharedFileViewerAllowed = (email: string) => resolveUnixUsername(parseAllowedUsers(process.env.ALLOWED_USERS), email) !== undefined;
+app.use(`${BASE_PATH}/api/shared-files`, requireAuth, sharedFileApiRouter({
+  store: spaceStore, objects: spaceObjects, userId: req => req.user?.id ?? null, viewerAllowed: sharedFileViewerAllowed,
+}));
 app.use(`${BASE_PATH}${FILE_LINK_PREFIX}`, spaceFilesRouter({
   store: spaceStore, objects: spaceObjects, enabled: spacesEnabledFor, htmlEnabled: spacesHtmlLinksEnabledFor,
   userId: req => req.user?.id ?? null,
+  viewerAllowed: sharedFileViewerAllowed,
+  folderPage: async (userId, space, dir) => (await simpleUiFilesEnabledFor(userId) ? spaceFolderPagePath(BASE_PATH, space, dir) : null),
   signIn: authMode() === 'okta'
     ? undefined
     : req => new Promise((resolve, reject) => {
@@ -383,6 +509,8 @@ installAutoPreviewShares();
 app.use(`${BASE_PATH}/api/ssh-keys`, sshKeysRouter());
 app.use(`${BASE_PATH}/api/warm-pool`, warmPoolRouter());
 app.use(`${BASE_PATH}/api`, workstreamsRouter());
+// A session's in-flight changes for the simple UI's context card (routes/workstreamChanges.ts).
+app.use(`${BASE_PATH}/api`, workstreamChangesRouter());
 app.use(`${BASE_PATH}/api`, spawnsRouter());
 app.use(`${BASE_PATH}/api`, handoffsRouter());
 app.use(`${BASE_PATH}/api`, collabRouter());
@@ -478,12 +606,16 @@ function startLeaderWork(): void {
   startWarmPoolReconciler();
   startCloudSessionSweeps();
   startBoxUpdateSweep();
+  startOrchestratorClaudeSweep();
   startAskSweep();
+  startAskNoticeSweep();
   startBriefingScheduler();
   startAutomationScheduler();
   startLifecycleSweep();
   startPreviewShareSweep();
   startHostSampling();
+  startBoxMeter();
+  startBillPull();
   startPrIngester();
   startSegmentTracker();
   spacesSweeper.start();
@@ -508,12 +640,16 @@ function stopLeaderWork(): void {
   stopWarmPoolReconciler();
   stopCloudSessionSweeps();
   stopBoxUpdateSweep();
+  stopOrchestratorClaudeSweep();
   stopAskSweep();
+  stopAskNoticeSweep();
   stopBriefingScheduler();
   stopAutomationScheduler();
   stopLifecycleSweep();
   stopPreviewShareSweep();
   stopHostSampling();
+  stopBoxMeter();
+  stopBillPull();
   stopPrIngester().catch(() => {});
   stopSegmentTracker().catch(() => {});
   spacesSweeper.stop();
@@ -527,6 +663,19 @@ const closeSockets = (agents: boolean): number => {
     client.close(DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON);
     n++;
   }
+  // The desktop relay's sockets go with the browsers', with the code t3 redials
+  // on (its preview stream reads 4503 as its own; routes/cliT3.ts).
+  if (!agents) {
+    for (const client of t3RelayWss.clients) {
+      client.close(RELAY_REDIAL_CLOSE_CODE, DRAIN_CLOSE_REASON);
+      n++;
+    }
+    // Forwards too: the CLI redials new connections (a live one is lost).
+    for (const client of forwardWss.clients) {
+      client.close(FORWARD_DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON);
+      n++;
+    }
+  }
   return n;
 };
 
@@ -538,6 +687,8 @@ const drain = createDrain({
   closeAgents: () => closeSockets(true),
   closeBrowsers: () => closeSockets(false),
 });
+// Each sweep tick's span says whether this process held the lease (services/tracing/spans.ts).
+setSweepLeaderProbe(() => drain.isServing());
 
 // Box-agent sockets, so the drain can close them before the browsers'.
 const agentSockets = new WeakSet<WebSocket>();
@@ -569,8 +720,51 @@ app.use(apiErrorHandler);
 // --- WebSocket server for terminal streams and status push ---
 const wss = new WebSocketServer({ noServer: true });
 
+// The desktop bridge's sockets (routes/cliT3.ts): the relay to a box's t3
+// server and the box agents' tunnel dial-backs. Each has its own server, so
+// neither goes through the connection handler's path routing below.
+const t3RelayWss = new WebSocketServer(relayServerOptions());
+const agentTunnelWss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
+
 // Share session middleware with WebSocket upgrade
 server.on('upgrade', (req, socket, head) => {
+  const upgradeUrl = new URL(req.url ?? '', 'http://localhost');
+  // Bearer-authenticated, so the browser Origin guard below doesn't apply: the
+  // relay's own Origin travels as X-T3-Origin for the box's t3 server to judge,
+  // and an agent sends none.
+  const relayTarget = t3RelayTarget(upgradeUrl, BASE_PATH);
+  if (relayTarget) {
+    handleT3RelayUpgrade(req, socket, head, relayTarget, {
+      bearer: cliWsDeps, t3: prismaCliT3, wss: t3RelayWss, isServing: () => drain.isServing(),
+      heartbeat: startHeartbeat,
+      drainCloseCode: RELAY_REDIAL_CLOSE_CODE, parkedCloseCode: TERMINAL_BOX_PARKED_CLOSE_CODE,
+    }).catch((err) => {
+      // Whatever it held is dropped when this socket closes (Hangup).
+      console.error('[T3-RELAY] upgrade failed:', (err as Error).message);
+      endUpgrade(socket, rawRefusal(502, 'tunnel_failed', 'relay error'));
+    });
+    return;
+  }
+  // Bearer-authenticated like the relay: the CLI sends no Origin.
+  const forward = forwardTarget(upgradeUrl, BASE_PATH);
+  if (forward) {
+    cliForward.upgrade(req, socket, head, forward).catch((err) => {
+      // Whatever it held is dropped when this socket closes (Hangup).
+      console.error('[FORWARD] upgrade failed:', (err as Error).message);
+      endUpgrade(socket, rawRefusal(502, 'tunnel_failed', 'forward error'));
+    });
+    return;
+  }
+  if (isAgentTunnelPath(upgradeUrl.pathname, BASE_PATH)) {
+    handleAgentTunnelUpgrade(req, socket, head, {
+      // Not startHeartbeat: a tunnel paused for backpressure can't read its pong.
+      tunnels: agentTunnels, validateAgentToken, wss: agentTunnelWss, heartbeat: (ws) => tunnelHeartbeat(ws, WS_HEARTBEAT_MS),
+    }).catch((err) => {
+      console.error('[T3-TUNNEL] dial-back failed:', (err as Error).message);
+      endUpgrade(socket, rawRefusal(500, 'tunnel_failed', 'tunnel error'));
+    });
+    return;
+  }
   // Reject a cross-origin handshake before touching the session, so a page on
   // another same-site origin can't open a terminal on the victim's ambient
   // cookie (see auth/wsOrigin.ts). The agent sends no Origin and passes here;
@@ -633,10 +827,11 @@ type StatusClientInfo = ScopeHolder & { unixUsername: string; ownedBoxes: Map<st
 
 /** A status as a collaborator gets it: no PR URL on the milestone or the review (see the fan-out below). */
 function sharedStatusPayload(session: string, status: AgentStatus): string {
-  return JSON.stringify({
-    type: 'status', session, ...status,
+  return statusFrame(session, {
+    ...status,
     milestone: milestoneForSharedViewer(status.milestone),
     review: reviewForSharedViewer(status.review),
+    reviews: status.reviews?.map(r => reviewForSharedViewer(r)!) ?? status.reviews,
   });
 }
 const statusClients = new Map<WebSocket, StatusClientInfo>();
@@ -780,11 +975,16 @@ wss.on('connection', (ws, req) => {
               ws.send(JSON.stringify({ type: 'output', data: msg.data }));
             } else if (msg.type === 'terminal-exit') {
               ws.send(JSON.stringify({ type: 'exit' }));
+            } else if (msg.type === TERMINAL_AGENT_GONE) {
+              // The box agent's socket dropped and its PTY with it. Close this
+              // one so the pane dials again and reattaches once the agent is
+              // back, rather than typing into a stream nothing reads.
+              ws.close(TERMINAL_AGENT_GONE_CLOSE_CODE, 'box agent disconnected');
             }
           }
         };
         const streamId = instanceId
-          ? await requestInstanceTerminalStream(instanceId, { id: project.userId }, tmuxSession, initCols, initRows, onData)
+          ? await requestInstanceTerminalStream(instanceId, tmuxSession, initCols, initRows, onData)
           : await requestTerminalStream(project.userId, tmuxSession, initCols, initRows, onData);
 
         // A browser that left during the attach has already fired 'close', so
@@ -865,7 +1065,7 @@ wss.on('connection', (ws, req) => {
         const { session, instanceId } = parseStatusKey(key);
         const route = statusRoute(clientInfo, session, instanceId);
         if (route === 'own' || (route === 'runner' && isOwnRunnerSessionStatus(session, instanceId, ownedBoxes))) {
-          ws.send(JSON.stringify({ type: 'status', session, ...status }));
+          ws.send(statusFrame(session, status));
         } else if (route === 'shared') {
           // The scope was read just now. Same stripping as the live fan-out.
           ws.send(sharedStatusPayload(session, status));
@@ -918,8 +1118,13 @@ wss.on('connection', (ws, req) => {
       // Only agent-scoped tokens may register as an agent. An admin token
       // that reached here would evict the user's real agent (agentRegistry
       // replaces the agent for the same key) — refuse instead.
-      if (result.token.scope !== 'agent') {
+      if (!acceptsScope('agentSocket', result.token.scope)) {
         ws.close(1008, 'token scope does not permit agent connections');
+        return;
+      }
+      if (result.instance?.status === QUARANTINED) {
+        console.warn(`[AGENT-WS] refused an agent for quarantined instance ${result.instance.id} (token ${result.token.id})`);
+        ws.close(1008, 'box is quarantined');
         return;
       }
       // result.instance is null for legacy per-user tokens, non-null for
@@ -945,14 +1150,14 @@ wss.on('connection', (ws, req) => {
 // Push status changes to all connected status clients
 setStatusChangeCallback((sessionName: string, instanceId: string | null) => {
   const status = getStatus(sessionName, instanceId);
-  const payload = JSON.stringify({ type: 'status', session: sessionName, ...status });
+  const payload = statusFrame(sessionName, status);
   // A collaborator gets only the sessions of the projects shared with them
   // (statusRoute, services/statusAudience.ts), and those without the
   // milestone's PR URL (the prompt still works) or the review's: the owner
   // gets the full payload. The stripping dates from when this fan-out went to
   // anyone sharing any project with the owner; GET /api/sessions carries the
   // URL for the projects a collaborator has.
-  const sharedPayload = status.milestone || status.review ? sharedStatusPayload(sessionName, status) : payload;
+  const sharedPayload = status.milestone || status.review || status.reviews?.length ? sharedStatusPayload(sessionName, status) : payload;
   // Every fan-out, so a debug line (TERMAG_DEBUG=STATUS): it was the single
   // largest source of journal records shipped to Observability.
   debugLog('STATUS', () => `Push ${sessionName} to ${statusClients.size} clients`);
@@ -988,14 +1193,16 @@ setStatusChangeCallback((sessionName: string, instanceId: string | null) => {
 // not shared with project collaborators. The browser refetches the list.
 // Simple-UI chat events (services/chatRunner.ts) carry prompts and file
 // contents, so they go to the project's owner and the users this project is
-// shared with (mayReceiveChat), never by the session-name prefix.
+// shared with (mayReceiveChat), never by the session-name prefix. The box
+// owner's seat spend (ownerOnlyChatEvent) goes to the owner alone.
 setChatPushCallback(({ owner, payload }) => {
   const body = JSON.stringify(payload);
   const chat = { owner, projectId: payload.projectId };
   for (const [client, clientInfo] of statusClients) {
     if (client.readyState !== WebSocket.OPEN) continue;
-    if (clientInfo.unixUsername === owner) client.send(body);
-    else sendThroughShare(clientInfo, () => mayReceiveChat(chat, clientInfo), () => {
+    const route = chatPushRoute(payload.event, owner, clientInfo.unixUsername);
+    if (route === 'owner') client.send(body);
+    else if (route === 'share') sendThroughShare(clientInfo, () => mayReceiveChat(chat, clientInfo), () => {
       if (client.readyState === WebSocket.OPEN) client.send(body);
     });
   }
@@ -1020,6 +1227,19 @@ setShareChangeCallback((change) => {
   }
 });
 startChatRelay();
+// Every process: a turn end and a box's connect arrive where the box's socket is.
+startChatTranscriptSync();
+startChatResumeRestores();
+startHeldDelivery(deliverHeldMessage);
+// The ask finish notice reaches a chat through the chat send path (services/askNoticeSweep.ts).
+setAskNoticeChatSender(sendAskNotice);
+// Every process, for the same reason: a chat's PRs, linked to its workstream (services/chatPrLinks.ts).
+startChatPrLinks();
+// Every process too: a PR a session opens or changes, to its owner's browsers now (services/prLiveUpdates.ts).
+startPrLiveUpdates(async userId => {
+  const pipeline = await reloadPipelineForUser(userId);
+  return pipeline && pipeline.lanes.flatMap(l => l.rows).flatMap(r => (r.kind === 'pr' && r.repo && r.number != null ? [{ repo: r.repo, number: r.number }] : []));
+});
 // Every process: a run's turn ends on whichever process relays its box.
 startAutomationCompletion();
 
@@ -1034,9 +1254,29 @@ setWorkspaceChangeCallback(coalesceWorkspaceChanges((ownerId, what) => {
     if (client.readyState === WebSocket.OPEN && clientInfo.userId === ownerId) client.send(payload);
   }
 }, 500));
+// A resize's phases (services/boxResize.ts), to the box owner's and the
+// actor's (an admin's) status sockets on this process; other processes' tabs
+// read the phase from the row when the workspace change makes them reload.
+setBoxResizePush((frame, userIds) => {
+  const payload = JSON.stringify(frame);
+  for (const [client, clientInfo] of statusClients) {
+    if (client.readyState === WebSocket.OPEN && userIds.includes(clientInfo.userId)) client.send(payload);
+  }
+});
 // Every project, workstream, workflow or share write that changes the list
 // tells its owner and collaborators, whichever path made it.
+// A span per Prisma operation, outermost, when the tracer is on (services/tracing/prismaSpans.ts).
+if (tracingRegistered()) installOperationSpans(prismaIndex);
 installWorkspaceWriteNotifier(prismaIndex);
+
+// A space file put, moved or removed, heard from whichever process recorded it
+// (services/spaces/spaceFileBus.ts): to the status sockets of people who can
+// read the space (spaceFileFeed.ts).
+function spaceFileClients() {
+  return [...statusClients].filter(([ws]) => ws.readyState === WebSocket.OPEN)
+    .map(([ws, info]) => ({ userId: info.userId, send: (frame: string) => { try { ws.send(frame); } catch {} } }));
+}
+let stopSpaceFileFeed: (() => void) | null = null;
 
 setCloudSessionChangeCallback((owner, sessionId) => {
   const payload = JSON.stringify({ type: 'claude-session', sessionId, at: new Date().toISOString() });
@@ -1056,15 +1296,22 @@ void termagVersion().then(v => console.log(`[VERSION] termag ${v.sha?.slice(0, 1
 // has re-read the table (services/statusTakeover.ts).
 if (leaseConfig) setStatusTimersSuspended(true);
 let stopProjectClone: (() => void) | null = null;
+let stopWorkspaceSetup: (() => void) | null = null;
 let stopChatGate: (() => void) | null = null;
-hydrateStatuses()
+// Working time banks by each person's day, so their zones are in before
+// anything can bank: a span hydration banks late, or the first hook.
+loadUserTimeZones()
+  .catch((err: Error) => console.warn(`[WORKTIME] could not load time zones, banking by the orchestrator's day: ${err.message}`))
+  .then(() => hydrateStatuses())
   .then(n => console.log(`[STATUS] hydrated ${n} session status(es) from session_statuses`))
   .catch(err => console.error('[STATUS] hydrate failed, starting empty:', (err as Error).message))
   .finally(() => server.listen(PORT, BIND_HOST, () => {
   console.log(`termag backend running on ${BIND_HOST ?? '*'}:${PORT} at ${BASE_PATH}`);
   stopProjectClone = startProjectClone();
+  stopWorkspaceSetup = startWorkspaceSetup();
   stopChatGate = startChatGate();
   startAskReplies();
+  stopSpaceFileFeed = startSpaceFileFeed(spaceFileClients);
   startAskQueue();
   startHumanActivityTracker();
   startWarpSampler();
@@ -1090,6 +1337,7 @@ function shutdown() {
   console.log('termag shutting down...');
   lease?.stop();
   stopProjectClone?.();
+  stopWorkspaceSetup?.();
   stopChatGate?.();
   stopPowerSweep();
   stopProvisioningSweep();
@@ -1103,24 +1351,54 @@ function shutdown() {
   stopWarmPoolReconciler();
   stopCloudSessionSweeps();
   stopBoxUpdateSweep();
+  stopOrchestratorClaudeSweep();
   stopAskSweep();
+  stopAskNoticeSweep();
   stopAskReplies();
+  stopSpaceFileFeed?.();
   stopAskQueue();
   stopBriefingScheduler();
   stopLifecycleSweep();
   stopPreviewShareSweep();
   closeFeatureFlags().catch(() => {});
-  shutdownOtel().catch(() => {});
   // Close all WebSocket connections so the process can exit. A process that
   // was displaced (another one serves) closes with the drain code, which
   // agents and browsers redial at once.
   const displaced = leaseConfig !== null && !drain.isServing();
+  // Forwards first, and before OTel's last export: each one's close is logged
+  // and counted now, since the process won't wait out the handshakes.
+  if (displaced) cliForward.closeAll(FORWARD_DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON);
+  else cliForward.closeAll(1001, 'server shutting down');
+  const otelFlushed = shutdownOtel().catch(() => {});
   for (const client of wss.clients) {
     if (displaced) client.close(DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON);
     else client.close(1001, 'server shutting down');
   }
+  for (const client of t3RelayWss.clients) {
+    if (displaced) client.close(RELAY_REDIAL_CLOSE_CODE, DRAIN_CLOSE_REASON);
+    else client.close(1001, 'server shutting down');
+  }
+  for (const client of forwardWss.clients) {
+    if (displaced) client.close(FORWARD_DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON);
+    else client.close(1001, 'server shutting down');
+  }
+  // A box's tunnel ends with the relayed socket it carries; these are the rest.
+  for (const tunnel of agentTunnelWss.clients) tunnel.close(1001, 'server shutting down');
   wss.close();
-  server.close(() => process.exit(0));
+  t3RelayWss.close();
+  forwardWss.close();
+  agentTunnelWss.close();
+  // Agent turns in Slack are stopped with a "termag restarted" note, which needs
+  // a moment to post; the exit waits for it, within the 5-second limit below.
+  const agentRunsStopped = stopAgentRunsForRestart(4000)
+    .then(n => { if (n) console.log(`[AGENT] stopped ${n} agent run(s) for the restart`); })
+    .catch(() => {});
+  // The last spans, logs and metrics go out too, capped at 2 s, inside the
+  // 5 s force exit below and systemd's TimeoutStopSec.
+  const otelFlushedOrTimedOut = Promise.race([otelFlushed, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
+  server.close(() => {
+    void Promise.all([agentRunsStopped, otelFlushedOrTimedOut]).finally(() => process.exit(0));
+  });
   // Force exit after 5 seconds if graceful shutdown hangs
   setTimeout(() => process.exit(1), 5000).unref();
 }

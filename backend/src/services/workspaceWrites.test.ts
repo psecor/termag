@@ -86,13 +86,19 @@ describe('touchesList', () => {
     expect(touchesList('Project', 'update', { data: { name: 'n' } })).toBe(true);
     expect(touchesList('Project', 'update', { data: { instanceId: 'box2' } })).toBe(true);
     expect(touchesList('Project', 'update', { data: { workstreams: { create: {} } } })).toBe(true);
-    expect(touchesList('Project', 'update', { data: { lastActiveAt: new Date(), chatTrustedAt: new Date() } })).toBe(false);
+    expect(touchesList('Project', 'update', { data: { lastActiveAt: new Date() } })).toBe(false);
+    // Trusting a project from its session reloads the list, whose chatTrusted New session reads.
+    expect(touchesList('Project', 'update', { data: { chatTrustedAt: new Date() } })).toBe(true);
     expect(touchesList('Workflow', 'update', { data: { provider: 'codex' } })).toBe(true);
     expect(touchesList('Workstream', 'upsert', { create: {}, update: {} })).toBe(true);
     // A chat's session title is what the simple UI's sidebar leads with.
     expect(touchesList('Workstream', 'updateMany', { data: { sessionTitle: 'Auth fix' } })).toBe(true);
     expect(touchesList('Workstream', 'update', { data: { lastActiveAt: new Date() } })).toBe(false);
     expect(touchesList('Project', 'findMany', {})).toBe(false);
+    // An ask's chat is named by its thread's title, once the thread links it.
+    expect(touchesList('AgentThread', 'update', { data: { chatWorkstreamId: 'ws1' } })).toBe(true);
+    expect(touchesList('AgentThread', 'update', { data: { title: 'Fix the rows' } })).toBe(true);
+    expect(touchesList('AgentThread', 'updateMany', { data: { hopCount: { increment: 1 } } })).toBe(false);
   });
 });
 

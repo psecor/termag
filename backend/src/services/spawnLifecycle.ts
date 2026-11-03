@@ -60,6 +60,18 @@ export function retireCheck(s: BranchState | null): RetireCheck {
   return { ok: false, reason: `${s.aheadOfBase} commit${s.aheadOfBase === 1 ? '' : 's'} never pushed` };
 }
 
+/**
+ * retireCheck over a multi-repo workstream's worktrees:
+ * removable only when every repository is, and nothing beyond base only when
+ * that holds in each. A kept one names its repositories.
+ */
+export function retireCheckAcross(checks: ReadonlyArray<{ repo: string; check: RetireCheck }>): RetireCheck {
+  if (checks.length === 0) return { ok: false, reason: 'its checkout state could not be read' };
+  const kept = checks.filter((c): c is { repo: string; check: { ok: false; reason: string } } => !c.check.ok);
+  if (kept.length > 0) return { ok: false, reason: kept.map(c => `${c.repo}: ${c.check.reason}`).join('; ') };
+  return { ok: true, why: checks.every(c => c.check.ok && c.check.why === 'nothing_beyond_base') ? 'nothing_beyond_base' : 'pushed' };
+}
+
 export interface LifecycleRow {
   relationship: string;
   state: string;

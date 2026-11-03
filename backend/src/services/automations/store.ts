@@ -9,6 +9,8 @@ import { prisma } from '../../db';
 import { skipReasonLabel } from './admit';
 import { changesLabel } from './report';
 import { nextOccurrences } from './schedule';
+import { mainAgentRow, modelView } from './model';
+import { folderOf } from './spaceFolder';
 
 export const LIVE_RUN_STATES = ['pending', 'running'] as const;
 export const FINISHED_RUN_STATES = ['done', 'blocked', 'needs_input', 'failed'] as const;
@@ -39,6 +41,8 @@ export interface RunView {
   /** "3 commits, pushed" / "no changes" / null before the run ended. */
   changesLabel: string | null;
   reportedAt: string | null;
+  /** Why the space step was skipped or failed for this run; null when it synced or there is no space. */
+  spaceSyncError: string | null;
   startedAt: string | null;
   finishedAt: string | null;
   retiredAt: string | null;
@@ -57,6 +61,10 @@ export interface AutomationView {
   schedule: string;
   timezone: string;
   prompt: string;
+  /** chat (a chat-runner turn per run) or t3 (a T3 scheduled task's webhook per run). */
+  kind: string;
+  /** The T3 task a t3 automation starts; null for chat. */
+  t3TaskId: string | null;
   tier: string;
   enabled: boolean;
   prOnChange: boolean;
@@ -64,9 +72,17 @@ export interface AutomationView {
   maxRunMinutes: number;
   keepRuns: number;
   spaceName: string | null;
+  /** The folder of spaceName the automation lives in; null with no space. */
+  spaceFolder: string | null;
   notifySlack: boolean;
+  /** What the next run starts on (model.ts): main's agent row; backend null is Claude's default, model a tier or null for Sonnet. */
+  chatProvider: string | null;
+  backend: string | null;
+  model: string | null;
   pausedReason: string | null;
   consecutiveFailures: number;
+  /** Wakes of its box EC2 refused in a row, since when, and the last error; null while its starts take. */
+  boxStartFailures: { count: number; since: string | null; lastError: string | null } | null;
   nextRunAt: string | null;
   /** The next three occurrences from now, for the sidebar and the page. */
   next: string[];
@@ -93,7 +109,7 @@ export function runView(r: AutomationRun & { workstream?: { name: string } | nul
     costUsd: r.costUsd, inputTokens: r.inputTokens, outputTokens: r.outputTokens,
     commitsAhead: r.commitsAhead, pushed: r.pushed, dirty: r.dirty,
     changesLabel: r.finishedAt && r.state !== 'skipped' ? changesLabel({ commitsAhead: r.commitsAhead, pushed: r.pushed, dirty: r.dirty }) : null,
-    reportedAt: iso(r.reportedAt),
+    reportedAt: iso(r.reportedAt), spaceSyncError: r.spaceSyncError,
     startedAt: iso(r.startedAt), finishedAt: iso(r.finishedAt), retiredAt: iso(r.retiredAt), createdAt: r.createdAt.toISOString(),
     durationSec: started !== null && ended !== null ? Math.max(0, Math.round((ended - started) / 1000)) : null,
   };
@@ -104,7 +120,7 @@ export function failureLabel(reason: string): string {
     case 'timeout': return 'stopped at its time limit';
     case 'interrupted': return 'stopped by its owner';
     case 'launch': return 'could not start';
-    case 'runner-error': return 'Claude exited without an answer';
+    case 'runner-error': return 'the agent exited without an answer';
     default: return reason;
   }
 }
@@ -126,6 +142,7 @@ export async function automationView(a: AutomationRow, viewerId: string, now: Da
     orderBy: { createdAt: 'desc' },
     include: { workstream: { select: { name: true } } },
   });
+  const agent = await mainAgentRow(a.projectId);
   let next: string[] = [];
   if (a.enabled && !a.pausedReason && !a.project.archived) {
     try { next = nextOccurrences(a.schedule, a.timezone, now, 3).map(d => d.toISOString()); } catch { next = []; }
@@ -133,9 +150,10 @@ export async function automationView(a: AutomationRow, viewerId: string, now: Da
   return {
     id: a.id, projectId: a.projectId, projectName: a.project.name, instanceId: a.project.instanceId,
     repoUrl: a.project.repoUrl, defaultBranch: a.project.repoDefaultBranch,
-    schedule: a.schedule, timezone: a.timezone, prompt: a.prompt, tier: a.tier, enabled: a.enabled,
+    schedule: a.schedule, timezone: a.timezone, prompt: a.prompt, kind: a.kind, t3TaskId: a.t3TaskId, tier: a.tier, enabled: a.enabled,
     prOnChange: a.prOnChange, wakeBox: a.wakeBox, maxRunMinutes: a.maxRunMinutes, keepRuns: a.keepRuns,
-    spaceName: a.spaceName, notifySlack: a.notifySlack, pausedReason: a.pausedReason, consecutiveFailures: a.consecutiveFailures,
+    spaceName: a.spaceName, spaceFolder: a.spaceName ? folderOf(a) : null, notifySlack: a.notifySlack, ...modelView(agent), pausedReason: a.pausedReason, consecutiveFailures: a.consecutiveFailures,
+    boxStartFailures: a.boxStartFailures > 0 ? { count: a.boxStartFailures, since: iso(a.boxStartFailingSince), lastError: a.boxStartError } : null,
     nextRunAt: iso(a.nextRunAt), next, lastRun: last ? runView(last, now) : null,
     createdAt: a.createdAt.toISOString(), updatedAt: a.updatedAt.toISOString(),
     owner: a.userId === viewerId, archived: a.project.archived,

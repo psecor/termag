@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
   project: { findFirst: vi.fn() },
+  projectRepo: { findMany: vi.fn(async () => [] as { name: string }[]) },
   agentSpawn: { updateMany: vi.fn(async () => ({ count: 1 })), update: vi.fn(async () => ({})), findUnique: vi.fn(async () => ({ parkedAt: new Date(), retiredAt: null })) },
 }));
 vi.mock('../db', () => ({ prisma }));
@@ -122,6 +123,23 @@ describe('checkoutCheck and retireSpawn', () => {
     vi.mocked(sendForProject).mockResolvedValue({ branch: 'add-tests', upstream: null, ahead: 0, aheadOfBase: 0, dirty: false, origin: null, baseLocal: 'spawn-base' });
     expect(await checkoutCheck(spawn({ baseSha: 'abc1234' }))).toEqual({ ok: true, why: 'nothing_beyond_base' });
     expect(vi.mocked(sendForProject).mock.calls[0][2]).toMatchObject({ verifyRemote: true, base: 'abc1234' });
+  });
+
+  it('reads every repository of a multi-repo child, without a spawn base, and keeps it for any one', async () => {
+    prisma.project.findFirst.mockResolvedValue({
+      id: 'p1', name: 'proj', layout: 'workspace', instanceId: 'box1', user: { id: 'u1', unixUsername: 'me', defaultAgentProvider: 'claude' },
+      instance: { hostHome: '/home/me', status: 'ready' },
+      workstreams: [{ id: 'ws1', name: 'add-tests', workflows: [{ type: 'agent', provider: 'claude' }] }],
+    });
+    prisma.projectRepo.findMany.mockResolvedValue([{ name: 'web' }, { name: 'api' }]);
+    const pushed = { branch: 'add-tests', upstream: 'origin/add-tests', ahead: 0, abKnown: true, aheadOfBase: 3, dirty: false, remoteContainsHead: true };
+    vi.mocked(sendForProject).mockImplementation(async (_h, _t, p) => (String((p as { cwd: string }).cwd).endsWith('/api') ? { ...pushed, dirty: true } : pushed));
+    expect(await checkoutCheck(spawn({ baseSha: 'abc1234' }))).toEqual({ ok: false, reason: 'api: uncommitted changes' });
+    const cwds = vi.mocked(sendForProject).mock.calls.map(c => (c[2] as { cwd: string }).cwd);
+    expect(cwds.map(c => c.replace(/^.*\/proj\//, ''))).toEqual(['.worktrees/add-tests/web', '.worktrees/add-tests/api']);
+    expect(vi.mocked(sendForProject).mock.calls.every(c => !('base' in (c[2] as object)))).toBe(true);
+    vi.mocked(sendForProject).mockResolvedValue(pushed);
+    expect(await checkoutCheck(spawn())).toEqual({ ok: true, why: 'pushed' });
   });
 
   it('keeps work that would be lost, recording why once', async () => {

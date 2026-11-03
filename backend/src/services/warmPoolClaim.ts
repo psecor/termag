@@ -16,9 +16,11 @@
 import { Instance, Prisma, User } from '@prisma/client';
 import { prisma } from '../db';
 import { OWNED_BOX_SELECT, type OwnedBoxRow } from './ownedBoxRow';
+import type { BoxSize } from './boxSize';
 import { connectedInstanceIds, disownInstanceAgent, notifyInstanceClaimed, rebindInstanceOwner, sendToInstanceAgent, settleClaimedOwner } from './agentRegistry';
 import { syncBoxAuthorizedKeys } from './sshKeySync';
 import { deliverToInstance } from './credentialDelivery';
+import { startClaimUpdate } from './claimUpdate';
 
 /** Per-user gate on the whole claim path. Off unless TERMAG_FLAGS turns it on. */
 export const WARM_POOL_ENABLED_FLAG = 'warm-pool-enabled';
@@ -43,6 +45,14 @@ export interface ClaimRequest {
   owner: ClaimOwner;
   boxName: string;
   currentHash: string;
+  /**
+   * The size the claimer would have launched (boxSize.ts), null for
+   * BOX_INSTANCE_TYPE. Only a box of that size is taken. The size is in
+   * currentHash already (each size the pool holds hashes apart), so this
+   * holds even if a caller passed another size's hash: a box warmed at
+   * another size is never handed out.
+   */
+  size: BoxSize | null;
   /**
    * Asked again inside the claim's transaction, under serializable isolation,
    * with the owner's non-terminated boxes as that snapshot sees them; a false
@@ -84,9 +94,11 @@ export interface ClaimEffects {
   /**
    * What a connect does for an owned box and a claim skips, because the box
    * connected while it had no owner and never reconnects: the owner's SSH
-   * keys. Runs only for the box handed over. Must not throw.
+   * keys, and the claim's update (claimUpdate.ts). Runs only for the box
+   * handed over. Resolves with what changed on the row meanwhile, for the
+   * claim's answer. Must not throw.
    */
-  welcomeOwner(instance: Instance, owner: ClaimOwner): Promise<void>;
+  welcomeOwner(instance: Instance, owner: ClaimOwner): Promise<Partial<Instance> | void>;
 }
 
 /** What the box's agent said back to box-claim, beyond acknowledging it. */
@@ -145,8 +157,8 @@ export async function claimWarmBox(req: ClaimRequest, effects: ClaimEffects): Pr
     if (!claimAwaitsOnClaimReport(req.owner, ack)) {
       await effects.settleClaim(instance.id);
     }
-    await effects.welcomeOwner(instance, req.owner);
-    return { claimed: true, instance, candidatesTried: tried + 1 };
+    const changed = await effects.welcomeOwner(instance, req.owner);
+    return { claimed: true, instance: changed ? { ...instance, ...changed } : instance, candidatesTried: tried + 1 };
   }
 
   return { claimed: false, reason: 'every-candidate-failed', candidatesTried: MAX_CLAIM_CANDIDATES };
@@ -227,6 +239,7 @@ async function takeWarmBox(req: ClaimRequest, liveIds: string[]): Promise<Instan
         WHERE status = 'warm'
           AND "userId" IS NULL
           AND "poolSpecHash" = ${req.currentHash}
+          AND "size" IS NOT DISTINCT FROM ${req.size}::text
           AND ("agentDisconnectedAt" IS NULL OR "agentDisconnectedAt" < "lastConnectedAt")
           AND id = ANY(${liveIds})
         ORDER BY "warmedAt" ASC
@@ -261,21 +274,33 @@ async function configureBox(instance: Instance, owner: ClaimOwner): Promise<BoxC
   }
 }
 
-async function welcomeOwner(instance: Instance, owner: ClaimOwner): Promise<void> {
+async function welcomeOwner(instance: Instance, owner: ClaimOwner): Promise<Partial<Instance>> {
   // The box's hello came while it was ownerless, and the claim does not redial.
   // The chat gate only opens on a hello that names a user, so tell it now.
   notifyInstanceClaimed(instance.id);
-  // Settled either way, as a hello's delivery is: an ask waits on it, not on its success.
-  void deliverToInstance(instance.id, owner.id).catch(err => {
+  const delivery = deliverToInstance(instance.id, owner.id).catch(err => {
     console.error(`[CRED] delivery to instance ${instance.id} on claim failed:`, errMsg(err));
-  }).finally(() => settleClaimedOwner(instance));
-  if (instance.kind !== 'ec2' || !instance.hostHome) return;
+  });
+  // Then the box is brought up to this orchestrator's commit, before anything
+  // is launched on it (claimUpdate.ts); a launch asked for meanwhile waits for
+  // that. Settled once both are over, as a hello's delivery is: an ask waits
+  // on it, not on its success. A current box's update ends before the
+  // delivery does, so the delivery is waited for too. An update that
+  // restarted the agent leaves this connection closed, and the new one is
+  // settled by its own hello.
+  const update = await startClaimUpdate(instance, owner, delivery);
+  void Promise.all([delivery, update.done]).finally(() => settleClaimedOwner(instance));
+  // What the claim's answer says of the update: both chat views' setup steps read it.
+  // The start is the row's to within a write: the UIs only age a stuck one out by it.
+  const view: Partial<Instance> = update.updating ? { claimUpdateStatus: 'updating', claimUpdateStartedAt: new Date() } : {};
+  if (instance.kind !== 'ec2' || !instance.hostHome) return view;
   try {
     await syncBoxAuthorizedKeys(instance.id, owner.id, instance.hostHome);
   } catch (err) {
     // The next reconnect's hello syncs them, as for any owned box.
     console.error(`[SSH-KEYS] instance ${instance.id}: sync on claim failed:`, errMsg(err));
   }
+  return view;
 }
 
 /** Git identity plus the optional dotfiles URL. Never a GitHub token. */

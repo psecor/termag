@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../db', () => ({
   prisma: {
     project: { findFirst: vi.fn() },
-    workstream: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(async () => ({})) },
+    workstream: { findUnique: vi.fn(), findMany: vi.fn(), create: vi.fn(), update: vi.fn(async () => ({})) },
     workflow: { findMany: vi.fn(async () => []), create: vi.fn() },
   },
 }));
@@ -42,6 +42,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   withProject({});
   vi.mocked(prisma.workstream.findUnique).mockResolvedValue(null);
+  vi.mocked(prisma.workstream.findMany).mockResolvedValue([]);
   create.mockImplementation((async ({ data }: { data: { name: string; branch: string } }) => ({ id: 'w1', ...data })) as never);
   send.mockResolvedValue({ ok: true, path: '/x' });
 });
@@ -66,6 +67,48 @@ describe('createWorkstreamFor first-commit backstop', () => {
     const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1' });
     expect(got.status).toBe(409);
     expect((got.body as { error: string }).error).toBe(CHECKOUT_NOT_LANDED);
+    expect(create).not.toHaveBeenCalled();
+  });
+});
+
+describe('createWorkstreamFor branch', () => {
+  it('refuses a new branch git would not create, before anything is recorded', async () => {
+    for (const branch of ['team/', 'a//b', 'a/.b']) {
+      const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1', branch });
+      expect(got.status, branch).toBe(400);
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('adds the worktree under its name on a branch that holds slashes', async () => {
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1', branch: 'me/ABC-1/x' });
+    expect(got.status).toBe(201);
+    expect(send.mock.calls.find(c => c[1] === 'git-worktree-add')?.[2]).toMatchObject({ worktreeName: 'ws1', branch: 'me/ABC-1/x' });
+  });
+
+  it('refuses a name another workstream holds, before the box is asked', async () => {
+    vi.mocked(prisma.workstream.findMany).mockResolvedValue([{ name: 'ws1' }] as never);
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1', branch: 'me/ABC-1/x' });
+    expect(got.status).toBe(409);
+    expect((got.body as { error: string }).error).toBe('A workstream with that name already exists');
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('says the name is taken when one workstream has the name and another the branch', async () => {
+    vi.mocked(prisma.workstream.findMany).mockResolvedValue([{ name: 'beta' }, { name: 'alpha' }] as never);
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'alpha', branch: 'me/beta' });
+    expect(got.status).toBe(409);
+    expect((got.body as { error: string }).error).toBe('A workstream with that name already exists');
+  });
+
+  it('refuses a branch another workstream holds, before the box is asked', async () => {
+    vi.mocked(prisma.workstream.findMany).mockResolvedValue([{ name: 'main' }] as never);
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1', branch: 'master' });
+    expect(got.status).toBe(409);
+    expect(vi.mocked(prisma.workstream.findMany).mock.calls[0]?.[0]).toMatchObject({ where: { projectId: 'p1', OR: [{ name: 'ws1' }, { branch: 'master' }] } });
+    expect((got.body as { error: string }).error).toMatch(/branch master/);
+    expect(send).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
   });
 });

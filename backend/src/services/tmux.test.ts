@@ -102,3 +102,20 @@ describe('exactSessionTarget', () => {
     expect(exactSessionTarget('u-p-agent')).toBe('=u-p-agent');
   });
 });
+
+describe('review slot names (docs/parallel-reviews.md)', () => {
+  it('keeps slot 1 as the review role\'s name and suffixes the rest after the role', async () => {
+    const { reviewSessionName, reviewSessionNames, reviewSlotOf, sessionName, MAX_REVIEW_SLOTS } = await import('./tmux');
+    expect(reviewSessionName('alice', 'termag', 'main', 1)).toBe(sessionName('alice', 'termag', 'review', 'main'));
+    expect(reviewSessionName('alice', 'termag', 'feat', 3)).toBe('alice-termag-feat-review-3');
+    expect(reviewSessionNames('alice', 'termag')).toHaveLength(MAX_REVIEW_SLOTS);
+    expect(reviewSlotOf('alice-termag-review-8', 'alice', 'termag')).toBe(8);
+    expect(reviewSlotOf('alice-termag-review-9', 'alice', 'termag')).toBeNull();
+    // A workstream named `2` owns `…-2-review`; slots never take that form.
+    expect(reviewSessionNames('alice', 'termag')).not.toContain(sessionName('alice', 'termag', 'review', '2'));
+  });
+  it('targets a pane exactly', async () => {
+    const { exactPaneTarget } = await import('./tmux');
+    expect(exactPaneTarget('alice-termag-review')).toBe('=alice-termag-review:');
+  });
+});

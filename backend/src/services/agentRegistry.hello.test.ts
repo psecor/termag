@@ -1,11 +1,13 @@
 import { EventEmitter } from 'events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const rowStatus = vi.hoisted(() => ({ value: 'ready' }));
 vi.mock('../db', () => ({
   prisma: {
     instance: {
       update: async () => ({}),
       updateMany: async () => ({ count: 1 }),
+      findUnique: async () => ({ status: rowStatus.value }),
     },
     user: {
       findUnique: async () => ({ claudeGatewayEnabled: false }),
@@ -17,6 +19,8 @@ vi.mock('./agentRuntime', () => ({
   reconstructInstanceSessions: async () => {},
 }));
 vi.mock('./sshKeySync', () => ({ syncBoxAuthorizedKeys: async () => {} }));
+const dotfiles = vi.hoisted(() => ({ personalize: vi.fn(async () => {}) }));
+vi.mock('./newBoxDotfiles', () => ({ personalizeNewBox: dotfiles.personalize }));
 
 const { registerAgent, instanceAgentTransport, instanceAgentSettled, onBoxAgentHello, onBoxAgentFrame } = await import('./agentRegistry');
 type BoxAgentHelloEvent = Parameters<Parameters<typeof onBoxAgentHello>[0]>[0];
@@ -27,6 +31,7 @@ class FakeAgentSocket extends EventEmitter {
   sent: Record<string, any>[] = [];
   send(raw: string) { this.sent.push(JSON.parse(raw)); }
   close() { this.readyState = 3; this.emit('close'); }
+  terminate() { this.close(); }
   fromAgent(msg: object) { this.emit('message', Buffer.from(JSON.stringify(msg))); }
 }
 
@@ -36,6 +41,21 @@ const ada = { id: 'u_ada', unixUsername: 'ada' } as any;
 const ownedBox = (id: string) => ({ id, name: `ada-${id}`, userId: 'u_ada', kind: 'ec2', status: 'ready' }) as any;
 const hello = (capabilities: string[] = []) => ({
   type: 'hello', unixUser: 'ada', home: '/home/ada', hostname: 'box', agentVersion: '1.0.0', capabilities,
+});
+
+describe('a box quarantined after its token was checked', () => {
+  it('has its socket dropped once it is in the registry', async () => {
+    rowStatus.value = 'quarantined';
+    try {
+      const ws = new FakeAgentSocket();
+      registerAgent(ada, ws as any, ownedBox('q1'));
+      await flush();
+      expect(ws.readyState).toBe(3);
+      expect(instanceAgentTransport('q1')).toBeNull();
+    } finally {
+      rowStatus.value = 'ready';
+    }
+  });
 });
 
 // The hello is what tells the orchestrator which code a box runs: the
@@ -150,6 +170,33 @@ describe('when a box agent hello has settled', () => {
     ws.fromAgent({ requestId: ws.sent[1].requestId, data: {} });
 
     await expect(events[0].settled).resolves.toBe(undefined);
+  });
+
+  it('waits, on a new box marked for its owner\'s dotfiles, for them to start', async () => {
+    let release!: () => void;
+    dotfiles.personalize.mockReset();
+    dotfiles.personalize.mockImplementation(() => new Promise<void>(r => { release = r; }));
+    const ws = new FakeAgentSocket();
+    registerAgent(ada, ws as any, { ...ownedBox('s4'), onClaimStatus: 'pending', claimedAt: null });
+    ws.fromAgent(hello(['box-update-v1']));
+    await flush();
+    await flush();
+    expect(dotfiles.personalize).toHaveBeenCalledWith('s4', '/home/ada', expect.objectContaining({ send: expect.any(Function) }));
+    const settled = tracked(events[0].settled);
+    await flush();
+    expect(settled.done).toBe(false);
+    release();
+    await events[0].settled;
+    expect(settled.done).toBe(true);
+  });
+
+  it('starts no dotfiles on a box that is not marked for them', async () => {
+    dotfiles.personalize.mockReset();
+    const ws = new FakeAgentSocket();
+    registerAgent(ada, ws as any, { ...ownedBox('s5'), onClaimStatus: 'succeeded', claimedAt: new Date() });
+    ws.fromAgent(hello(['box-update-v1']));
+    await events[0].settled;
+    expect(dotfiles.personalize).not.toHaveBeenCalled();
   });
 
   it('sends nothing to an agent without credentials-v1 and settles on the host write alone', async () => {

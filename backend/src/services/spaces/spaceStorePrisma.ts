@@ -2,6 +2,8 @@ import { randomUUID } from 'crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
 import { isSpaceRole, type SpaceRole } from './spaceAccess';
+import { MAX_INHERITANCE_HOPS } from './spaceInheritance';
+import { isMemoryEvent, memoryEventsQuery, pruneEventsWhere } from './spaceMemory';
 import {
   LastOwnerError,
   SpaceNameTakenError,
@@ -19,6 +21,38 @@ import { findUserByEmail } from '../userByEmail';
  * at once can't both pass a check made before either wrote. A space already
  * ownerless (its owner's account is gone) is left alone, so members can leave.
  */
+/**
+ * recordListings in SQL: each box reaches its own grants and, as
+ * spaceInheritance.ancestorsOf walks, its live same-owner ancestors' grants.
+ * A listing is for the project's box; one the project moved off is moved to
+ * its new box when that box reaches the space too, and left stale otherwise.
+ */
+function recordListingsSql(spaceId: string | null): Prisma.Sql {
+  return Prisma.sql`
+    WITH RECURSIVE reach(box, via, hops) AS (
+      SELECT id, id, 0 FROM instances
+      UNION ALL
+      SELECT r.box, parent.id, r.hops + 1
+      FROM reach r
+      JOIN instances cur ON cur.id = r.via
+      JOIN instances parent ON parent.id = cur."parentInstanceId"
+      JOIN instances child ON child.id = r.box
+      WHERE r.hops < ${MAX_INHERITANCE_HOPS} AND parent.id <> r.box
+        AND parent.status <> 'terminated' AND parent."userId" = child."userId"
+    )
+    INSERT INTO project_spaces ("projectId", "spaceId", "instanceId", "addedById")
+    SELECT DISTINCT ON (p.id, sb."spaceId") p.id, sb."spaceId", r.box, sb."addedById"
+    FROM reach r
+    JOIN space_boxes sb ON sb."instanceId" = r.via
+    JOIN spaces s ON s.id = sb."spaceId" AND s."deletedAt" IS NULL
+    JOIN projects p ON p."instanceId" = r.box
+    WHERE ${spaceId}::text IS NULL OR sb."spaceId" = ${spaceId}
+    ORDER BY p.id, sb."spaceId", r.hops
+    -- A project that moved to another box the space reaches is listed for that box now.
+    ON CONFLICT ("projectId", "spaceId") DO UPDATE SET "instanceId" = EXCLUDED."instanceId", "addedById" = EXCLUDED."addedById"
+    WHERE project_spaces."instanceId" <> EXCLUDED."instanceId"`;
+}
+
 async function withOwnerGuard<T>(spaceId: string, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
   return prisma.$transaction(async tx => {
     await tx.$queryRaw`SELECT id FROM spaces WHERE id = ${spaceId} FOR UPDATE`;
@@ -89,10 +123,10 @@ export const prismaSpaceStore: SpaceStore = {
   async spacesOfUser(userId) {
     const rows = await prisma.spaceMember.findMany({
       where: { userId, space: { deletedAt: null } },
-      include: { space: true },
+      include: { space: { include: { _count: { select: { members: true } } } } },
       orderBy: { space: { name: 'asc' } },
     });
-    return rows.map(r => ({ space: r.space, role: role(r.role) }));
+    return rows.map(({ space: { _count, ...space }, role: r }) => ({ space, role: role(r), memberCount: _count.members }));
   },
 
   async spacesGrantedTo(instanceIds) {
@@ -208,6 +242,7 @@ export const prismaSpaceStore: SpaceStore = {
   async removeMember(spaceId, userId) {
     return withOwnerGuard(spaceId, async tx => {
       const boxes = await tx.spaceBox.deleteMany({ where: { spaceId, instance: { userId } } });
+      await tx.projectSpace.deleteMany({ where: { spaceId, project: { userId } } });
       await tx.spaceMember.delete({ where: { spaceId_userId: { spaceId, userId } } });
       return { removedBoxes: boxes.count };
     });
@@ -232,10 +267,44 @@ export const prismaSpaceStore: SpaceStore = {
       create: { spaceId, instanceId, addedById },
       update: {},
     });
+    await prisma.$executeRaw(recordListingsSql(spaceId));
   },
 
   async removeGrant(spaceId, instanceId) {
-    return (await prisma.spaceBox.deleteMany({ where: { spaceId, instanceId } })).count > 0;
+    const removed = await prisma.$transaction(async tx => {
+      const n = (await tx.spaceBox.deleteMany({ where: { spaceId, instanceId } })).count;
+      await tx.$executeRaw`
+        WITH RECURSIVE down(box, hops) AS (
+          SELECT id, 0 FROM instances WHERE id = ${instanceId}
+          UNION ALL
+          SELECT c.id, d.hops + 1
+          FROM down d
+          JOIN instances c ON c."parentInstanceId" = d.box
+          JOIN instances root ON root.id = ${instanceId}
+          WHERE d.hops < ${MAX_INHERITANCE_HOPS} AND c."userId" = root."userId"
+        )
+        DELETE FROM project_spaces ps
+        WHERE ps."spaceId" = ${spaceId} AND ps."instanceId" IN (
+          -- Walk through a terminated child, whose own listing stays, to the live boxes it listed below it.
+          SELECT d.box FROM down d JOIN instances i ON i.id = d.box WHERE d.hops = 0 OR i.status <> 'terminated'
+        )`;
+      await tx.$executeRaw(recordListingsSql(spaceId));
+      return n;
+    });
+    return removed > 0;
+  },
+
+  async recordListings(spaceId) {
+    return prisma.$executeRaw(recordListingsSql(spaceId ?? null));
+  },
+
+  async listedBoxes(spaceId) {
+    const rows = await prisma.projectSpace.findMany({
+      where: { spaceId },
+      select: { instanceId: true, project: { select: { instanceId: true } } },
+    });
+    // A listing counts only while its project is still on the box it was made for.
+    return [...new Set(rows.filter(r => r.project.instanceId === r.instanceId).map(r => r.instanceId))];
   },
 
   async chargeBytes(spaceId, bytes, liveUntil, ref) {
@@ -250,14 +319,51 @@ export const prismaSpaceStore: SpaceStore = {
     return n > 0;
   },
 
+  async fileShare(spaceId, path) {
+    const row = await prisma.spaceFileShare.findUnique({ where: { spaceId_path: { spaceId, path } } });
+    if (!row) return null;
+    const user = await prisma.user.findUnique({ where: { id: row.sharedById }, select: userSelect });
+    return { spaceId, path, sharedById: row.sharedById, createdAt: row.createdAt, sharedBy: user ? spaceUser(user) : null };
+  },
+
+  async sharedPaths(spaceId) {
+    const rows = await prisma.spaceFileShare.findMany({ where: { spaceId }, select: { path: true } });
+    return new Set(rows.map(r => r.path));
+  },
+
+  async addFileShare(spaceId, path, sharedById) {
+    await prisma.spaceFileShare.upsert({
+      where: { spaceId_path: { spaceId, path } },
+      create: { spaceId, path, sharedById },
+      update: {},
+    });
+    return (await prismaSpaceStore.fileShare(spaceId, path))!;
+  },
+
+  async removeFileShares(spaceId, target) {
+    if ('path' in target) return (await prisma.spaceFileShare.deleteMany({ where: { spaceId, path: target.path } })).count;
+    // Prisma's `startsWith` is a LIKE that leaves `%` and `_` unescaped; `starts_with` compares literally.
+    return prisma.$executeRaw`DELETE FROM space_file_shares WHERE "spaceId" = ${spaceId} AND starts_with(path, ${target.prefix})`;
+  },
+
   async recordEvent(e) {
     await prisma.spaceEvent.create({
       data: {
         spaceId: e.spaceId, actorUserId: e.actorUserId, actorInstanceId: e.actorInstanceId ?? null,
         via: e.via ?? null, action: e.action, path: e.path ?? null,
         bytes: e.bytes === null || e.bytes === undefined ? null : BigInt(e.bytes),
+        versionId: e.versionId ?? null, note: e.note ?? null,
       },
     });
+  },
+
+  async memoryEvents(spaceId, { since, limit }) {
+    const rows = await prisma.spaceEvent.findMany(memoryEventsQuery(spaceId, since, limit));
+    return rows.filter(isMemoryEvent);
+  },
+
+  async lastWrite(spaceId, path) {
+    return prisma.spaceEvent.findFirst({ where: { spaceId, path, action: { in: ['file.put', 'file.put.signed'] } }, orderBy: { at: 'desc' } });
   },
 
   async lastPutAt(spaceId, path) {
@@ -305,7 +411,7 @@ export const prismaSpaceStore: SpaceStore = {
   },
 
   async pruneEvents(before) {
-    return (await prisma.spaceEvent.deleteMany({ where: { at: { lt: before } } })).count;
+    return (await prisma.spaceEvent.deleteMany({ where: pruneEventsWhere(before) })).count;
   },
 
   async pruneTerminatedGrants() {

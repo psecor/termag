@@ -41,16 +41,22 @@ describe('resolvedChatTier', () => {
 });
 
 describe('claudeLaunchModel', () => {
-  it('uses the alias when the gateway is off', () => {
-    expect(claudeLaunchModel('sonnet', {})).toBe('sonnet');
-    expect(claudeLaunchModel('opus', {})).toBe('opus');
+  it('uses the alias when the orchestrator has no gateway', () => {
+    expect(claudeLaunchModel('sonnet', true, {})).toBe('sonnet');
+    expect(claudeLaunchModel('opus', false, {})).toBe('opus');
   });
 
-  it('resolves a tier to the pinned profile the gateway allowlist accepts', () => {
-    expect(claudeLaunchModel('opus', PINS)).toBe('us.anthropic.claude-opus-5-5');
-    expect(claudeLaunchModel('sonnet', PINS)).toBe('us.anthropic.claude-sonnet-5-5');
-    expect(claudeLaunchModel('haiku', PINS)).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
-    expect(claudeModelArg(claudeLaunchModel('haiku', PINS))).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
+  it('resolves a tier to the pinned profile the gateway allowlist accepts, while the owner has the gateway on', () => {
+    expect(claudeLaunchModel('opus', true, PINS)).toBe('us.anthropic.claude-opus-5-5');
+    expect(claudeLaunchModel('sonnet', true, PINS)).toBe('us.anthropic.claude-sonnet-5-5');
+    expect(claudeLaunchModel('haiku', true, PINS)).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
+    expect(claudeModelArg(claudeLaunchModel('haiku', true, PINS))).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0');
+  });
+
+  it('uses the alias for an owner who turned the gateway off: their own Claude login knows no profile id', () => {
+    expect(claudeLaunchModel('opus', false, PINS)).toBe('opus');
+    expect(claudeLaunchModel('sonnet', false, PINS)).toBe('sonnet');
+    expect(claudeLaunchModel('haiku', false, PINS)).toBe('haiku');
   });
 });
 

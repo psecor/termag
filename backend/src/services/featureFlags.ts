@@ -18,6 +18,7 @@
 // Functional singleton like the other services: module state, plain exports.
 
 import type { BoolFlagKey, JsonFlagKey, NumberFlagKey, StringFlagKey } from '../flags';
+import { currentSurface } from './requestSurface';
 
 export type FlagValues = Record<string, unknown>;
 
@@ -107,15 +108,36 @@ export async function numberVariationForContext(key: NumberFlagKey, _context: Fl
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
+/** A number flag for this user (and box): a configured number, else the fallback. */
+export async function numberVariation(key: NumberFlagKey, _user: FlagUser, fallback: number, _box?: FlagBox | null): Promise<number> {
+  const v = values[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+/** A JSON flag for a context no user is behind: the configured value, else the fallback. */
+export async function jsonVariationForContext(key: JsonFlagKey, _context: FlagContext, fallback: unknown): Promise<unknown> {
+  return key in values ? values[key] : fallback;
+}
+
+/** A string flag for a context no user is behind: a configured string, else the fallback. */
+export async function stringVariationForContext(key: StringFlagKey, _context: FlagContext, fallback: string): Promise<string> {
+  const v = values[key];
+  return typeof v === 'string' ? v : fallback;
+}
+
 /**
  * The context a flag read for this user (and box) would use with a targeting
  * flag source. The env-backed source ignores it; it is built so call sites read
  * the same whichever source is wired in.
  */
-export function buildFlagContext(user: FlagUser, box?: FlagBox | null): FlagContext {
-  return box
-    ? { kind: 'multi', key: `${user.id}:${box.id}`, user: user.id, box: box.id }
-    : { kind: 'user', key: user.id };
+export function buildFlagContext(user: FlagUser, box?: FlagBox | null, repo?: string | null): FlagContext {
+  // The client the request came from (services/requestSurface.ts), so a
+  // targeting source can tell the browser, the phone, the CLI and Slack apart.
+  const surface = currentSurface();
+  const key = [user.id, box?.id, repo].filter(Boolean).join(':');
+  return box || repo
+    ? { kind: 'multi', key, user: user.id, ...(surface && { surface }), ...(box && { box: box.id }), ...(repo && { repo }) }
+    : { kind: 'user', key: user.id, ...(surface && { surface }) };
 }
 
 /** A JSON flag: any configured value is returned; the caller validates the shape. */

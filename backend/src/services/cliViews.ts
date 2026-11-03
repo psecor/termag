@@ -4,10 +4,13 @@
  *
  * Pure: rows in, views out. Agent connectivity and live status are passed in.
  */
+import type { LifecycleView } from './boxLifecyclePolicy';
+import { resizeView, type ResizeEventRow, type ResizeView } from './boxResizePolicy';
 import { isValidBoxName } from './boxNames';
 import { cliSessionValidity, type CliSessionTimes } from './cliAuth';
 import { projectDirUnder, resolveProjectRoot } from './projectPaths';
 import { needsBoxRelaunch, toSetupStatus } from './projectSetup';
+import type { CreatedFor } from '../routes/cliLifecycle';
 
 export type BoxState =
   | 'provisioning' | 'running' | 'stopping' | 'stopped' | 'hibernating' | 'hibernated' | 'starting'
@@ -35,10 +38,16 @@ export function isAddressableName(name: string): boolean {
   return isValidBoxName(name);
 }
 
+/** The column holds only what routes/cliLifecycle.ts parseCreatedFor accepts; anything else reads as null. */
+function createdFor(v: string | null | undefined): CreatedFor | null {
+  return v === 'ask' ? 'ask' : null;
+}
+
 export interface BoxRow {
   id: string;
   name: string;
   kind: string;
+  flavor: string;
   status: string;
   provisioningError: string | null;
   ec2InstanceId: string | null;
@@ -47,6 +56,13 @@ export interface BoxRow {
   createdAt: Date;
   readyAt: Date | null;
   projects: Array<{ id: string; name: string }>;
+  size?: string | null;
+  instanceType?: string | null;
+  /** The box's latest `resize` row in box_events (services/boxEvents.ts), when it has one. */
+  resizeEvent?: ResizeEventRow | null;
+  diskGiB?: number | null;
+  createdFor?: string | null;
+  lifecycle?: LifecycleView | null;
 }
 
 export interface CliBox {
@@ -54,6 +70,7 @@ export interface CliBox {
   name: string;
   addressable: boolean;
   kind: string;
+  flavor: string;
   state: BoxState;
   status: string;
   agentConnected: boolean;
@@ -64,6 +81,22 @@ export interface CliBox {
   createdAt: string;
   readyAt: string | null;
   projects: Array<{ id: string; name: string }>;
+  /** small, medium or large (services/boxSize.ts); null for a box launched as the configured type, or external. */
+  size: string | null;
+  /** The EC2 type it launched as (or was resized to); null for older and external boxes. */
+  instanceType: string | null;
+  /** Its current or last resize (services/boxResizePolicy.ts resizeView); null when it never had one. */
+  resize: ResizeView | null;
+  /** The root disk in GiB it was made with (services/boxDiskSize.ts); null for older and external boxes. */
+  diskGiB: number | null;
+  /** 'ask' for a box made only for `termag ask` (`--for-ask`), else null. */
+  createdFor: CreatedFor | null;
+  /**
+   * What auto-park will do with it, as the web UI's box list says (when it
+   * stops, the warning before it, when it is terminated); null when its owner
+   * couldn't be read.
+   */
+  lifecycle: LifecycleView | null;
 }
 
 export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
@@ -72,6 +105,7 @@ export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
     name: row.name,
     addressable: isAddressableName(row.name),
     kind: row.kind,
+    flavor: row.flavor,
     state: boxState(row.status),
     status: row.status,
     agentConnected,
@@ -82,6 +116,12 @@ export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
     createdAt: row.createdAt.toISOString(),
     readyAt: row.readyAt ? row.readyAt.toISOString() : null,
     projects: row.projects.map(p => ({ id: p.id, name: p.name })),
+    size: row.size ?? null,
+    instanceType: row.instanceType ?? null,
+    resize: resizeView(row.resizeEvent),
+    diskGiB: row.diskGiB ?? null,
+    createdFor: createdFor(row.createdFor),
+    lifecycle: row.lifecycle ?? null,
   };
 }
 
@@ -101,6 +141,7 @@ export interface ProjectRow {
   repoUrl?: string | null;
   setupStatus?: string | null;
   setupError?: string | null;
+  createdFor?: string | null;
 }
 
 /**
@@ -183,6 +224,8 @@ export interface CliProject {
   sessions: ProjectSessions | null;
   /** The project's clone (shapeClone); null when there is none to wait for. */
   clone: CliClone | null;
+  /** 'ask' for a project made only for `termag ask` (`--for-ask`), else null. */
+  createdFor: CreatedFor | null;
 }
 
 export interface ProjectSessions {
@@ -213,6 +256,7 @@ export function shapeProject(row: ProjectRow, agentStatus: LiveStatus | undefine
     directory: projectDirUnder(root, row.name),
     sessions: sessions ?? null,
     clone: shapeClone(row),
+    createdFor: createdFor(row.createdFor),
   };
 }
 

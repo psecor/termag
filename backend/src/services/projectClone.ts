@@ -25,10 +25,11 @@ import {
   sendToInstanceAgent,
 } from './agentRegistry';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider } from './agentRuntime';
+import { claimUpdateRunning, claimUpdateSettled } from './claimUpdateGate';
 import { hasGithubCredential } from './boxCreationGate';
 import { deliversGithub } from './credentialDelivery';
 import { isManagedBox } from './instanceLifecycle';
-import { shouldWaitForPaneCheckout, waitForPaneCheckout } from './paneCheckout';
+import { paneCheckoutReady, shouldWaitForPaneCheckout, waitForPaneCheckout } from './paneCheckout';
 import { resolveProjectRoot } from './projectPaths';
 import { buildCloneCommand, templateForRepoUrl } from './projectTemplates';
 import {
@@ -53,7 +54,9 @@ export interface SetupTarget {
 export type SetupOutcome =
   | { kind: 'applied'; from: SetupStatus; to: SetupStatus }
   | { kind: 'ignored'; why: string }
-  | { kind: 'refused'; error: string };
+  | { kind: 'refused'; error: string }
+  // The checkout waits in the background: for the box's GitHub delivery (deferDeliveryWait), or for a claim's update.
+  | { kind: 'deferred' };
 
 const CLONE_RPC_TIMEOUT_MS = 30_000;
 
@@ -106,8 +109,36 @@ function projectDir(row: SetupRow): string {
   return tmux.projectDirFor({ name: row.name, user: row.user, instance: row.instance }, 'main');
 }
 
-export async function applySetupEvent(target: SetupTarget, event: SetupEvent): Promise<SetupOutcome> {
-  if (event.kind === 'agent-connected') await waitForPaneDelivery(target, event);
+/**
+ * `deferDeliveryWait` is project create's (routes/projects.ts) on a box that
+ * is already up: when the checkout would first wait for the box's GitHub
+ * delivery (waitForPaneDelivery, up to 30 s), the request does not. The wait
+ * and the event go on here and the create answers at once, so the session
+ * opens and shows its checkout as pending while it happens.
+ */
+export async function applySetupEvent(target: SetupTarget, event: SetupEvent, opts: { deferDeliveryWait?: boolean } = {}): Promise<SetupOutcome> {
+  // A box just claimed from the pool is updating (claimUpdate.ts), and may
+  // restart its agent: the clone or checkout waits for it in the background,
+  // with the capabilities the agent has after it, and the create answers now.
+  if (event.kind === 'agent-connected' && claimUpdateRunning(target.instanceId)) {
+    void claimUpdateSettled(target.instanceId).then(() => {
+      const now = agentView(target.instanceId);
+      if (now.kind !== 'present') return;
+      return applySetupEvent(target, { kind: 'agent-connected', capabilities: now.capabilities }, opts);
+    }).catch(err => {
+      console.error(`[CLONE] ${target.projectId}: setup after the claim update failed: ${(err as Error).message}`);
+    });
+    return { kind: 'deferred' };
+  }
+  if (event.kind === 'agent-connected') {
+    if (opts.deferDeliveryWait && await pendingPaneDelivery(target, event)) {
+      void applySetupEvent(target, event).catch(err => {
+        console.error(`[CLONE] ${target.projectId}: deferred setup failed: ${(err as Error).message}`);
+      });
+      return { kind: 'deferred' };
+    }
+    await waitForPaneDelivery(target, event);
+  }
   const outcome = await serialize(target.projectId, () => applyNow(target, event));
   if (outcome.kind === 'ignored') {
     console.log(`[CLONE] ${target.projectId}: ${event.kind} ignored: ${outcome.why}`);
@@ -122,28 +153,41 @@ export async function applySetupEvent(target: SetupTarget, event: SetupEvent): P
  * the decision is made again on a fresh row once the wait is over.
  */
 async function waitForPaneDelivery(target: SetupTarget, event: SetupEvent): Promise<void> {
+  const pending = await pendingPaneDelivery(target, event);
+  if (!pending) return;
+  const settled = await waitForPaneCheckout(pending.read, { expectGithub: pending.expectGithub });
+  if (settled === 'timeout') {
+    console.warn(`[CLONE] ${pending.projectId}: pane checkout proceeded before GitHub delivery settled`);
+  }
+}
+
+/** What waitForPaneDelivery would wait on, or null when the pane checkout may go now (or there is none). */
+async function pendingPaneDelivery(target: SetupTarget, event: SetupEvent) {
   const row = await loadSetupRow(target);
   const status = row && toSetupStatus(row.setupStatus);
-  if (!row || !status) return;
+  if (!row || !status) return null;
   const decision = decideSetup(setupSnapshot(row, status), event);
-  if (decision.kind !== 'move' || !decision.effects.includes('pane-checkout')) return;
+  if (decision.kind !== 'move' || !decision.effects.includes('pane-checkout')) return null;
   if (!shouldWaitForPaneCheckout({
     hasRepo: row.repoUrl !== null,
     managed: isManagedBox(row.instance),
     hasGithubCredential: await hasGithubCredential(row.userId),
-  })) return;
-  const settled = await waitForPaneCheckout(() => prisma.instance.findUnique({
+  })) return null;
+  const read = () => prisma.instance.findUnique({
     where: { id: row.instanceId },
     select: { githubDeliveredAt: true, onClaimStatus: true },
-  }), { expectGithub: deliversGithub() });
-  if (settled === 'timeout') {
-    console.warn(`[CLONE] ${row.id}: pane checkout proceeded before GitHub delivery settled`);
-  }
+  });
+  const expectGithub = deliversGithub();
+  if (paneCheckoutReady(await read(), { expectGithub })) return null;
+  return { projectId: row.id, read, expectGithub };
 }
 
 async function applyNow(target: SetupTarget, event: SetupEvent): Promise<SetupOutcome> {
   const row = await loadSetupRow(target);
   if (!row) return { kind: 'ignored', why: 'no live project on that box' };
+  // With no repoUrl it would read as an empty project and launch in a root
+  // that has no marker yet, which tmux-create would git-init.
+  if (row.layout === 'workspace') return { kind: 'ignored', why: 'a multi-repo project is set up by workspaceSetup' };
   const status = toSetupStatus(row.setupStatus);
   if (!status) return { kind: 'ignored', why: `unknown setup status ${row.setupStatus}` };
 
@@ -293,6 +337,19 @@ async function runEffect(effect: SetupEffect, row: SetupRow, admission: SetupAdm
 }
 
 /**
+ * The sessions of every workflow the project has, as a finished clone starts
+ * them: what a multi-repo project's last repository landing runs
+ * (services/workspaceSetup.ts). `admission` lets the launch through while the
+ * aggregate status is still leaving `from`.
+ */
+export async function launchProjectSessions(target: SetupTarget, admission: SetupAdmission): Promise<boolean> {
+  const row = await loadSetupRow(target);
+  if (!row) return false;
+  const result = await runEffect('launch', row, admission);
+  return result.ok;
+}
+
+/**
  * Drive every project on this box that is still waiting for, or in the middle
  * of, its clone. Runs on each hello: the box's agent may have restarted
  * mid-clone, or may only now have connected for a project picked while the
@@ -305,9 +362,10 @@ export async function redispatchClones(ev: BoxAgentHelloEvent): Promise<void> {
       instanceId: ev.instance.id, userId: ev.user.id, archived: false,
       setupStatus: { in: ['pending', 'cloning'] },
     },
-    select: { id: true },
+    select: { id: true, layout: true },
   });
-  await Promise.all(rows.map(async ({ id }) => {
+  // A multi-repo project's repositories are driven by services/workspaceSetup.ts.
+  await Promise.all(rows.filter(r => r.layout !== 'workspace').map(async ({ id }) => {
     const live = agentView(ev.instance.id);
     if (live.kind !== 'present') return;
     try {
@@ -321,6 +379,8 @@ export async function redispatchClones(ev: BoxAgentHelloEvent): Promise<void> {
 }
 
 function onCloneStatus({ instance, msg }: BoxAgentFrame): void {
+  // One repository of a multi-repo project: services/workspaceSetup.ts.
+  if (msg && typeof msg === 'object' && 'repo' in msg && (msg as { repo?: unknown }).repo != null) return;
   const frame = parseCloneStatusFrame(msg);
   if (!frame) {
     console.warn(`[CLONE] dropped an unreadable project-clone-status from ${instance.id}`);

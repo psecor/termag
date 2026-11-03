@@ -26,6 +26,18 @@ export const ASK_CANCEL_CAPABILITY = 'ask-cancel-v1';
  * and answers the ask in the simple UI. Without it the run is headless.
  */
 export const ASK_CHAT_CAPABILITY = 'ask-chat-v1';
+/**
+ * A box's agent whose ask turns can be live and take a follow-up on the
+ * thread into the running turn (`ask-run` with `live` and `steerOf`).
+ */
+export const ASK_STEER_CAPABILITY = 'ask-steer-v1';
+/**
+ * A box's agent whose runner gives the thread a normal clone with `origin`,
+ * where the run pushes and opens its draft PRs itself, and reports the
+ * branches it pushed instead of a bundle. `ask-run`
+ * then names the thread's branch (`pushBranch`).
+ */
+export const ASK_PUSH_CAPABILITY = 'ask-push-v1';
 
 /** The workstream an ask thread's chat lives in: one per thread, no worktree of its own. */
 export function askChatWorkstreamName(threadId: string): string {
@@ -91,7 +103,7 @@ export function ownerOnlyRefusal(
  * submitted or working at once. Each run is a whole Claude Code session with
  * the owner's access, so a loop of agents asking agents must hit a wall.
  */
-export const MAX_ACTIVE_ASKS = 10;
+export const MAX_ACTIVE_ASKS = 20;
 
 /** The refusal for a new ask when the asker already has `active` asks running, or null. */
 export function capRefusal(active: number): { error: string; code: 'too_many_asks' } | null {
@@ -113,32 +125,120 @@ export const BUNDLE_TTL_MS = 60 * 60 * 1000;
 export const MAX_WAIT_SEC = 50;
 
 /**
- * A message's state, named after A2A's TaskState: `submitted` until the box takes the run, `working` while it
- * runs and publishes, then `completed`, `failed` or `canceled`.
+ * A message's state, named after A2A's TaskState:
+ * `submitted` until the box takes the run, `working` while it
+ * runs and publishes, then `completed`, `failed` or `canceled`. `superseded`
+ * is termag's own: a follow-up went into its running turn, and that
+ * follow-up's reply answers it (`supersededById`).
  */
-export type MessageStatus = 'submitted' | 'working' | 'completed' | 'failed' | 'canceled';
+export type MessageStatus = 'submitted' | 'working' | 'completed' | 'failed' | 'canceled' | 'superseded';
 export const ACTIVE_STATES: MessageStatus[] = ['submitted', 'working'];
-export const isTerminal = (s: string): boolean => s === 'completed' || s === 'failed' || s === 'canceled';
+export const isTerminal = (s: string): boolean => s === 'completed' || s === 'failed' || s === 'canceled' || s === 'superseded';
+
+export type SteerDecision =
+  | { kind: 'steer' }
+  /** Not into the running turn: the orchestrator holds it as the thread's next turn, saying why. */
+  | { kind: 'queue'; reason: string };
+
+/**
+ * What a follow-up on a thread whose newest message is still active gets:
+ * it joins that message's running turn (a `working` message on a connected
+ * box whose agent can take it; the box may
+ * still answer that the turn can't, and then runs it after it), or it is
+ * queued as the thread's next turn, with the reason.
+ * Either way at most one run works in the
+ * thread's clone at a time.
+ */
+export function steerDecision(
+  busy: { id: string; status: string; queued: boolean },
+  facts: { box: string; connected: boolean; capable: boolean; liveTurn: boolean },
+): SteerDecision {
+  if (busy.status !== 'working') {
+    return { kind: 'queue', reason: busy.queued ? `${busy.id} is itself waiting (for its box, its project's clone or the turn before it)` : `${busy.id} is still starting` };
+  }
+  if (!facts.connected) return { kind: 'queue', reason: `${facts.box} is not connected` };
+  if (!facts.capable) return { kind: 'queue', reason: `${facts.box}'s agent can't add a message to a running turn (it needs a newer termag agent)` };
+  // What the box says of the run (ask-run-status `live`): a headless run, or a turn started before steering, takes no message.
+  if (!facts.liveTurn) return { kind: 'queue', reason: `${busy.id} is not a live chat turn (it runs headless, or started before steering was on), so nothing can join it` };
+  return { kind: 'steer' };
+}
+
+/** Why the box's turn could not take a follow-up (ask-chat.js steerRun's reason), for the asker. */
+export function steerRefusalText(reason: string | null): string {
+  const engine = /^engine_no_live_input:([a-z0-9-]{1,40})$/.exec(reason ?? '');
+  if (engine) return `the ${engine[1]} engine takes no message in the middle of a turn`;
+  const known: Record<string, string> = {
+    finished: 'its turn had just ended', reporting: 'its turn had just ended', not_live: 'its turn was not started as a live turn',
+    queued: 'its turn had not started yet', preparing: 'its clone was still being prepared', starting: 'its turn was still starting',
+    stopping: 'its turn was stopping', superseded: 'another follow-up joined it first', 'queue-full': 'too many messages already wait in its turn',
+    gone: 'its run was no longer on the box', headless: 'it runs headless, outside the chat',
+    input_closed: 'its turn had stopped taking messages (Claude was finishing its background work)',
+  };
+  return known[reason ?? ''] ?? (reason ? reason.slice(0, 200) : 'the box gave no reason');
+}
+
+/**
+ * How long a follow-up queued as a thread's next turn waits for the turns
+ * before it. A turn has no time limit, so this is generous; past it the
+ * follow-up fails rather than wait forever.
+ */
+export const THREAD_QUEUE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * A follow-up queued as its thread's next turn goes once no message of the
+ * thread created before it is still active (submitted or working): one turn
+ * at a time, in order.
+ */
+export function waitsForThread(m: { id: string; createdAt: Date }, threadActive: ReadonlyArray<{ id: string; createdAt: Date }>): boolean {
+  return threadActive.some(o => o.id !== m.id && o.createdAt.getTime() < m.createdAt.getTime());
+}
+
+export const THREAD_QUEUE_EXPIRED = `the thread's previous turn was still running ${THREAD_QUEUE_TTL_MS / 3_600_000} hours after this follow-up, so it never ran; ask again`;
+
+/**
+ * What a wait on a superseded message gets (ASK_SUPERSEDED_REPLY): `together`
+ * (the default) keeps the wait going until the turn its follow-up joined
+ * ends, then answers it with that reply (`answeredWith`); `follow` answers at
+ * once with the superseded state and its pointer, and the CLI moves its wait
+ * to the follow-up.
+ */
+export function supersededReplyMode(env: NodeJS.ProcessEnv = process.env): 'together' | 'follow' {
+  return env.ASK_SUPERSEDED_REPLY === 'follow' ? 'follow' : 'together';
+}
+
+/**
+ * A wait on superseded message `a`, answered together with `f`, the last
+ * message of its chain: `f`'s state, reply and outcome under `a`'s id, with
+ * `answeredWith` naming `f`. The reply is counted on `f` only (its `readAt`);
+ * `a` stays superseded in the inbox.
+ */
+export function answeredTogether(a: MessageRow, f: MessageRow): MessageRow {
+  return {
+    ...f, id: a.id, threadId: a.threadId, hop: a.hop, createdAt: a.createdAt, startedAt: a.startedAt,
+    supersededById: a.supersededById ?? f.id,
+  };
+}
 
 /**
  * A refusal of an ask the target can't take (A2A's `rejected`): answered at
  * once, never stored, so nothing waits on a turn that can only fail.
  */
-export function rejection(status: 409, error: string, code: string, req: Pick<AskRequest, 'messageId' | 'threadId'>) {
-  return { status, body: { error, code, status: 'rejected' as const, message: req.messageId, thread: req.threadId } };
+export function rejection(status: 409, error: string, code: string, req: Pick<AskRequest, 'messageId' | 'threadId'>, extra: Record<string, unknown> = {}) {
+  return { status, body: { ...extra, error, code, status: 'rejected' as const, message: req.messageId, thread: req.threadId } };
 }
 
 /**
  * A retried POST /ask: the id already names a message. It is the same ask
- * only for the same asker, project, workstream, thread (when one was named)
- * and prompt size; anything else reused the id.
+ * only for the same asker, project, workstream, repository, thread (when one
+ * was named) and prompt size; anything else reused the id.
  */
 export function replayDecision(
-  existing: { senderUserId: string; projectId: string; workstream: string; threadId: string; promptBytes: number },
-  req: { userId: string; projectId: string; workstream: string; threadId: string | null; promptBytes: number },
+  existing: { senderUserId: string; projectId: string; workstream: string; repo?: string | null; threadId: string; promptBytes: number },
+  req: { userId: string; projectId: string; workstream: string; repo?: string | null; threadId: string | null; promptBytes: number },
 ): 'same' | 'taken' | 'different' {
   if (existing.senderUserId !== req.userId) return 'taken';
   if (existing.projectId !== req.projectId || existing.workstream !== req.workstream) return 'different';
+  if ((existing.repo ?? null) !== (req.repo ?? null)) return 'different';
   if (req.threadId && req.threadId !== existing.threadId) return 'different';
   return existing.promptBytes === req.promptBytes ? 'same' : 'different';
 }
@@ -156,11 +256,15 @@ export type CancelDecision =
  * A turn whose result is in is past cancelling: it is publishing.
  */
 export function cancelDecision(
-  m: { status: string; resultAt: Date | null; senderUserId: string; projectOwnerId: string },
+  m: { status: string; resultAt: Date | null; senderUserId: string; projectOwnerId: string; supersededById?: string | null },
   userId: string,
 ): CancelDecision {
   if (m.senderUserId !== userId && m.projectOwnerId !== userId) return { kind: 'not_found' };
   if (m.status === 'canceled') return { kind: 'already' };
+  if (m.status === 'superseded') {
+    const by = m.supersededById ?? 'a follow-up';
+    return { kind: 'finished', why: `the message was superseded by ${by}, which carries on its turn; cancel ${by} to stop it` };
+  }
   if (isTerminal(m.status)) return { kind: 'finished', why: `the message is already ${m.status}` };
   if (m.resultAt) return { kind: 'finished', why: 'the run already finished and its result is being published' };
   return { kind: 'cancel' };
@@ -307,17 +411,21 @@ export interface AskRef {
   box: string;
   project: string;
   workstream: string | null;
+  /** A multi-repo project's repository (ProjectRepo.name), the `:<repo>` suffix. */
+  repo: string | null;
 }
 
 // Box names a CLI can address (cliViews isAddressableName); project and
-// workstream names may hold anything but the separators and whitespace.
-const REF = /^([A-Za-z0-9_-]+)\/([^/@\s]+)(?:@([^/@\s]+))?$/;
+// workstream names may hold anything but the separators and whitespace. The
+// repository is a ProjectRepo name (projectRepos.ts REPO_NAME_RE).
+const REF = /^([A-Za-z0-9_-]+)\/([^/@:\s]+)(?:@([^/@:\s]+))?(?::([A-Za-z0-9][A-Za-z0-9_-]*))?$/;
+const CHECKOUT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 
-/** `box/project` or `box/project@workstream`. */
+/** `box/project[@workstream][:repo]`. */
 export function parseAskRef(text: string): AskRef | null {
   const m = REF.exec(text.trim());
   if (!m) return null;
-  return { box: m[1], project: m[2], workstream: m[3] ?? null };
+  return { box: m[1], project: m[2], workstream: m[3] ?? null, repo: m[4] ?? null };
 }
 
 export interface AskRequest {
@@ -325,6 +433,8 @@ export interface AskRequest {
   ref: AskRef | null;
   projectId: string | null;
   workstream: string;
+  /** The repository of a multi-repo project the ask runs in; null for a single-repository project. */
+  repo: string | null;
   prompt: string;
   threadId: string | null;
   /**
@@ -332,6 +442,117 @@ export interface AskRequest {
    * POST names the same ask and gets it back instead of a second turn.
    */
   messageId: string | null;
+  /** `--title`, on one line (parseAskTitle); null for none: a new thread is then untitled and shows its id, a follow-up keeps its title. */
+  title: string | null;
+  /** Who is asking, as the CLI saw it (parseAskSender); checked before it is stored. Null from outside a session. */
+  sender: AskSender | null;
+  /**
+   * The asking Claude Code conversation's session id (`sender.claudeSession`,
+   * the caller's CLAUDE_CODE_SESSION_ID; parseAskClaudeSession), which a new
+   * thread keeps as its telemetry parent (termag.ask.parent.session). Null
+   * when the caller is not in Claude Code or sent a malformed one.
+   */
+  senderClaudeSession: string | null;
+  /**
+   * `--update-pr`: an existing PR of the asker's the thread publishes to instead of
+   * its own branch (parseTargetPr; askPublish checks it). `repo` is null when
+   * the caller gave only the number. Null for none: a follow-up then keeps the
+   * thread's remembered target, if any.
+   */
+  targetPr: TargetPrRef | null;
+  /**
+   * `termag ask --new-box`: the CLI made the target's box for this ask just
+   * now. A new thread records it (AgentThread.newBox) when the box says it was
+   * made for an ask; a follow-up ignores it.
+   */
+  newBox: boolean;
+  /**
+   * Tell the sending session when this message finishes;
+   * false for `termag ask --no-notify`. Absent (an older
+   * CLI) is true: only a session the orchestrator could check is ever told.
+   */
+  notify: boolean;
+}
+
+/** A PR named by `termag ask --update-pr`: its number, and its owner/name when the caller said. */
+export interface TargetPrRef { number: number; repo: string | null }
+
+const PR_REF = /^(?:([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})#)?#?(\d{1,9})$/;
+const PR_REF_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})\/pull\/(\d{1,9})\/?$/;
+
+/** `pr` in POST /ask: `753`, `#753`, `owner/name#753` or the PR's github.com URL. Absent or null is none. */
+export function parseTargetPr(raw: unknown): { targetPr: TargetPrRef | null } | { error: string } {
+  if (raw === undefined || raw === null || raw === '') return { targetPr: null };
+  const text = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw.trim() : null;
+  const m = text === null ? null : PR_REF.exec(text) ?? PR_REF_URL.exec(text);
+  const number = m ? Number(m[2]) : NaN;
+  if (!m || !Number.isSafeInteger(number) || number < 1) return { error: 'pr is not a pull request: give its number, owner/name#number or its github.com URL' };
+  const repo = m[1] ?? null;
+  if (repo && !isRepoName(repo)) return { error: 'pr names a repository that is not owner/name' };
+  return { targetPr: { number, repo } };
+}
+
+/**
+ * The session an ask comes from: a tmux pane's session name, or a chat
+ * turn's project id and workstream (the agent's TERMAG_PROJECT_ID and
+ * TERMAG_WORKSTREAM; a turn has no pane).
+ */
+export type AskSender = { session: string } | { projectId: string; workstream: string };
+
+const SENDER_SESSION_RE = /^[A-Za-z0-9_.-]{1,200}$/;
+const SENDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Whether the project an ask says it comes from can be its parent: the
+ * asker's own live project, with that workstream, and on the box whose token
+ * sent the ask when a box sent it (a laptop shell names no box). Only places
+ * the thread in the UI, so a wrong claim can at worst nest it under another
+ * of the asker's own sessions.
+ */
+export function senderParentAllowed(
+  project: { userId: string; archived: boolean; instanceId: string | null; workstreams: Array<{ name: string; archived: boolean }> } | null,
+  workstream: string, userId: string, senderInstanceId: string | null,
+): boolean {
+  if (!project || project.userId !== userId || project.archived) return false;
+  if (senderInstanceId && project.instanceId !== senderInstanceId) return false;
+  return project.workstreams.some(w => w.name === workstream && !w.archived);
+}
+
+/** `sender` from POST /ask. Anything malformed is dropped, not refused: it only places the thread in the UI. */
+export function parseAskSender(raw: unknown): AskSender | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.projectId === 'string' && SENDER_ID_RE.test(r.projectId) && typeof r.workstream === 'string' && SENDER_SESSION_RE.test(r.workstream)) {
+    return { projectId: r.projectId, workstream: r.workstream };
+  }
+  if (typeof r.session === 'string' && SENDER_SESSION_RE.test(r.session)) return { session: r.session };
+  return null;
+}
+
+const CLAUDE_SESSION_RE = /^[A-Za-z0-9-]{8,64}$/;
+
+/** `sender.claudeSession` from POST /ask: a Claude Code session id, or null. Malformed is dropped, like the sender. */
+export function parseAskClaudeSession(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = (raw as Record<string, unknown>).claudeSession;
+  return typeof id === 'string' && CLAUDE_SESSION_RE.test(id) ? id : null;
+}
+
+/**
+ * The longest thread title, in characters. Callers name their threads with
+ * `termag ask --title` (the person on #743: nothing is derived, and an
+ * untitled thread shows its id), so a longer one is refused, never cut.
+ */
+export const MAX_ASK_TITLE_CHARS = 60;
+
+/** `title` in POST /ask: absent or null is none; else one line, as typed, between 1 and MAX_ASK_TITLE_CHARS characters. */
+function parseAskTitle(raw: unknown): { title: string | null } | { error: string } {
+  if (raw === undefined || raw === null) return { title: null };
+  if (typeof raw !== 'string') return { error: 'title must be a string' };
+  const title = raw.replace(/\s+/g, ' ').trim();
+  if (!title) return { error: 'title is empty' };
+  if ([...title].length > MAX_ASK_TITLE_CHARS) return { error: `title is too long (at most ${MAX_ASK_TITLE_CHARS} characters)` };
+  return { title };
 }
 
 export function parseAskBody(body: unknown): AskRequest | { error: string } {
@@ -342,15 +563,22 @@ export function parseAskBody(body: unknown): AskRequest | { error: string } {
   }
   const target = typeof b.target === 'string' ? b.target.trim() : '';
   const projectId = typeof b.projectId === 'string' ? b.projectId.trim() : '';
-  if (!target === !projectId) return { error: 'name the project as target ("box/project[@workstream]") or projectId, not both' };
+  if (!target === !projectId) return { error: 'name the project as target ("box/project[@workstream][:repo]") or projectId, not both' };
   let ref: AskRef | null = null;
   if (target) {
     ref = parseAskRef(target);
-    if (!ref) return { error: `"${target}" is not box/project or box/project@workstream` };
+    if (!ref) return { error: `"${target}" is not box/project[@workstream][:repo]` };
   }
   const bodyWs = typeof b.workstream === 'string' && b.workstream.trim() ? b.workstream.trim() : null;
   if (ref?.workstream && bodyWs && ref.workstream !== bodyWs) return { error: 'the workstream is named twice, differently' };
   const workstream = ref?.workstream ?? bodyWs ?? 'main';
+  let bodyRepo: string | null = null;
+  if (b.repo !== undefined && b.repo !== null && b.repo !== '') {
+    if (typeof b.repo !== 'string' || !CHECKOUT_NAME.test(b.repo.trim())) return { error: 'repo is not a repository name' };
+    bodyRepo = b.repo.trim();
+  }
+  if (ref?.repo && bodyRepo && ref.repo !== bodyRepo) return { error: 'the repository is named twice, differently' };
+  const repo = ref?.repo ?? bodyRepo;
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
   if (!prompt.trim()) return { error: 'prompt (non-empty string) required' };
   if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) return { error: `prompt too long (max ${MAX_PROMPT_BYTES / 1024} KB)` };
@@ -364,7 +592,50 @@ export function parseAskBody(body: unknown): AskRequest | { error: string } {
     if (!isMessageId(b.messageId)) return { error: 'messageId must be 8-40 lowercase letters and digits' };
     messageId = b.messageId;
   }
-  return { ref, projectId: projectId || null, workstream, prompt, threadId, messageId };
+  const titled = parseAskTitle(b.title);
+  if ('error' in titled) return titled;
+  const pr = parseTargetPr(b.pr);
+  if ('error' in pr) return pr;
+  if (b.newBox !== undefined && typeof b.newBox !== 'boolean') return { error: 'newBox must be true or false' };
+  if (b.notify !== undefined && typeof b.notify !== 'boolean') return { error: 'notify must be true or false' };
+  return {
+    ref, projectId: projectId || null, workstream, repo, prompt, threadId, messageId, title: titled.title, sender: parseAskSender(b.sender), senderClaudeSession: parseAskClaudeSession(b.sender), targetPr: pr.targetPr,
+    newBox: b.newBox === true,
+    notify: b.notify !== false,
+  };
+}
+
+export const REPO_REQUIRED_CODE = 'repo_required';
+
+/**
+ * Which checkout of the target an ask runs in, or why it can't.
+ * A multi-repo project's folder is not a repository, so an ask into one names a
+ * repository, and runs in that repository's checkout or worktree; only with
+ * multi-repo-projects-enabled on for the asker. A single-repository project takes no repository.
+ * `repos` is in the project's order; `target` is how the asker wrote the project.
+ */
+export function repoTarget(
+  p: { workspace: boolean; repos: readonly string[]; target: string },
+  repo: string | null,
+  multiRepoOn: boolean,
+): { repo: string | null } | { error: string; code: string; repos?: string[] } {
+  if (!p.workspace) {
+    return repo
+      ? { error: `${p.target} has one repository, so it takes no ":${repo}"; ask ${p.target}`, code: 'not_multi_repo' }
+      : { repo: null };
+  }
+  if (!multiRepoOn) return { error: 'Asks into a project with several repositories are not on for you', code: 'multi_repo_disabled' };
+  const repos = [...p.repos];
+  if (!repo) {
+    return { error: `${p.target} holds several repositories (${repos.join(', ')}); name one, as ${p.target}:<repo>`, code: REPO_REQUIRED_CODE, repos };
+  }
+  if (!repos.includes(repo)) return { error: `${p.target} has no repository ${repo}; it holds ${repos.join(', ')}`, code: 'unknown_repo', repos };
+  return { repo };
+}
+
+/** Where a run on this checkout starts: the workstream's folder, or the repository's directory in it. */
+export function askCwd(dir: string, repo: string | null): string {
+  return repo ? `${dir.replace(/\/+$/, '')}/${repo}` : dir;
 }
 
 export interface TargetCandidate {
@@ -380,7 +651,7 @@ export interface TargetCandidate {
  * win over shared ones with the same box and project name; two shared
  * projects that still collide are reported, so the caller can use the id.
  */
-export function pickTarget(candidates: TargetCandidate[], ref: AskRef): { projectId: string } | { error: string; status: 404 | 409 } {
+export function pickTarget(candidates: TargetCandidate[], ref: Pick<AskRef, 'box' | 'project'>): { projectId: string } | { error: string; status: 404 | 409 } {
   const hits = candidates.filter(c => c.boxName === ref.box && c.projectName === ref.project);
   const own = hits.filter(c => c.isOwner);
   if (own.length === 1) return { projectId: own[0].projectId };
@@ -424,9 +695,9 @@ export function askPrKeyOfRef(ref: string): string | null {
   return m && ASK_PR_KEY.test(m[1]) ? m[1] : null;
 }
 
-/** How a target is written back to people: `box/project@workstream`, `@main` left out. */
-export function askTarget(box: string, project: string, workstream: string): string {
-  return `${box}/${project}${workstream === 'main' ? '' : `@${workstream}`}`;
+/** How a target is written back to people: `box/project@workstream:repo`, `@main` left out. */
+export function askTarget(box: string, project: string, workstream: string, repo?: string | null): string {
+  return `${box}/${project}${workstream === 'main' ? '' : `@${workstream}`}${repo ? `:${repo}` : ''}`;
 }
 
 const PR_BODY_BEGIN = '<!-- TERMAG_PR_BODY_BEGIN -->';
@@ -514,14 +785,20 @@ export function commitDescription(commits: Array<{ subject: string; body: string
  */
 export function prBody(input: {
   senderUsername: string; target: string; threadId: string; box: string; project: string; description?: string; prKey?: string;
+  /** The thread publishes to this existing PR (`--update-pr`) rather than one it opened. */
+  targetPr?: boolean;
 }): string {
   const description = input.description?.trim();
   return markPrBody([
     ...(description ? [description, '', '---', ''] : []),
-    `Opened by \`termag ask\` for ${input.senderUsername}: an agent run on \`${input.target}\`, thread \`${input.threadId}\`.`,
+    input.targetPr
+      ? `Updated by \`termag ask\` for ${input.senderUsername}: an agent run on \`${input.target}\`, thread \`${input.threadId}\`, which publishes to this pull request (\`--update-pr\`).`
+      : `Opened by \`termag ask\` for ${input.senderUsername}: an agent run on \`${input.target}\`, thread \`${input.threadId}\`.`,
     ...(input.prKey ? ['', `This is one of the thread's pull requests, from the run's branch \`pr/${input.prKey}\`; the reply to the ask lists them all.`] : []),
     '',
-    'The run worked in its own clone of the committed code. termag checked its commits before pushing (descends from the base, no protected paths, authored by the asker, no secret-shaped strings); review the change as you would any other before marking it ready.',
+    input.targetPr
+      ? "The run worked in its own clone, on this pull request's branch. termag checked the pull request's own commits before pushing (builds on the branch as GitHub has it, no protected paths, authored by the asker, no secret-shaped strings); review the change as you would any other before marking it ready."
+      : 'The run worked in its own clone of the committed code. termag checked its commits before pushing (descends from the base, no protected paths, authored by the asker, no secret-shaped strings); review the change as you would any other before marking it ready.',
     '',
     `Follow-ups on the thread push here: \`termag ask ${input.target} --thread ${input.threadId} "…"\`.`,
   ].join('\n'), { box: input.box, project: input.project, ask: input.threadId });
@@ -542,10 +819,17 @@ export interface MessageRow {
   completedAt: Date | null;
   readAt: Date | null;
   queuedPrompt?: string | null;
+  supersededById?: string | null;
+  /** Its reply in ask_replies (askReplyStore.ts), when one is stored. */
+  storedReply?: { bytes: number; truncated?: boolean } | null;
+  /** What became of the finish notice to the sending session (askNotice.ts NoticeOutcome); null while none is due or settled. */
+  notice?: string | null;
 }
 
 export interface ThreadRow {
   id: string;
+  /** What the caller named the thread (`termag ask --title`); null when untitled, which shows the thread's id. */
+  title?: string | null;
   hopCount: number;
   branch: string | null;
   prNumber: number | null;
@@ -564,10 +848,11 @@ export function threadPrs(t: ThreadRow): PrView[] {
 }
 
 /**
- * A message as the CLI sees it. `reply` is the text only while a process holds
- * it for hand-off (askReplyBus.ts); after that `replyDelivered` says whether a
- * poll got it before it was dropped. Nothing keeps the text. `pr` is the
- * thread's own PR (else its first), for CLIs from before `prs`.
+ * A message as the CLI sees it. `reply` is the text when this poll got it:
+ * held for hand-off (askReplyBus.ts) or stored (askReplyStore.ts). Otherwise
+ * `replyStored` says whether a later `--reply` can still read it, and
+ * `replyDelivered` whether anything has read it yet. `pr` is the thread's own
+ * PR (else its first), for CLIs from before `prs`.
  */
 export function messageView(m: MessageRow, t: ThreadRow, target: string, reply: string | null) {
   const prs = threadPrs(t);
@@ -575,6 +860,7 @@ export function messageView(m: MessageRow, t: ThreadRow, target: string, reply: 
   return {
     message: m.id,
     thread: t.id,
+    title: t.title ?? null,
     target,
     status: m.status,
     // Submitted and waiting for its parked box to come up or its project's clone to finish.
@@ -589,6 +875,12 @@ export function messageView(m: MessageRow, t: ThreadRow, target: string, reply: 
     replyBytes: m.replyBytes,
     reply,
     replyDelivered: m.readAt !== null,
+    // Kept for ASK_REPLY_TTL_MS: unread and stored is the inbox's NEW.
+    replyStored: m.storedReply != null,
+    // Superseded: the follow-up whose reply answers this message too.
+    supersededBy: m.supersededById ?? null,
+    // The finish notice to the session that sent it: chat, pane, waiter, gone, ….
+    notice: m.notice ?? null,
     publish: m.publish ? { status: m.publish, detail: m.publishDetail } : null,
     pr: first ? { url: first.url, number: first.number, branch: first.branch } : null,
     prs,
@@ -612,6 +904,33 @@ export interface RunResult {
   prDescription: string | null;
   /** The descriptions of the run's pr/<key> branches, by key (TERMAG_ASK_PR_DIR), untrusted like prDescription. */
   prDescriptions: Record<string, string>;
+  /**
+   * The branches the thread's clone pushed to GitHub and the tips it pushed, from
+   * a runner with ask-push-v1; null from one that sends a bundle. Untrusted:
+   * askPushes confirms each on GitHub.
+   */
+  pushes: ReportedPush[] | null;
+}
+
+export interface ReportedPush { branch: string; sha: string }
+
+/** The most pushed branches a result names; a clone that pushed more is cut there. */
+export const MAX_REPORTED_PUSHES = 50;
+// A branch name as git allows it, kept to what a URL path carries plainly.
+const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)[A-Za-z0-9._\/-]{1,200}(?<![/.])$/;
+export const isPushBranch = (s: string): boolean => BRANCH.test(s);
+
+function parsePushes(v: unknown): ReportedPush[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: ReportedPush[] = [];
+  for (const p of v) {
+    if (out.length >= MAX_REPORTED_PUSHES) break;
+    if (!p || typeof p !== 'object') continue;
+    const { branch, sha } = p as Record<string, unknown>;
+    if (typeof branch !== 'string' || !isPushBranch(branch) || typeof sha !== 'string' || !SHA.test(sha)) continue;
+    if (!out.some(o => o.branch === branch)) out.push({ branch, sha });
+  }
+  return out;
 }
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -648,6 +967,7 @@ export function parseRunResult(body: unknown): RunResult | { error: string } {
     bundle: b.bundle === true,
     prDescription: typeof b.prDescription === 'string' && b.prDescription.trim() ? b.prDescription : null,
     prDescriptions: parsePrDescriptions(b.prDescriptions),
+    pushes: parsePushes(b.pushes),
   };
 }
 
@@ -672,6 +992,22 @@ export function replyEnvelope(input: { from: string; threadId: string; messageId
 }
 
 /**
+ * Never a git remote in the clone: one its `ask` branch does not track makes
+ * every later turn on the thread read-only (agent chat-runner.js: the clone
+ * may then hold a fetched PR head, #940), so the base branch is fetched by URL,
+ * unshallowed: the clone is one commit deep (termag-subagent-run prepare_thread).
+ */
+function remoteLine(checkout: string | undefined): string {
+  const how = checkout
+    ? `: \`git fetch $([ -f .git/shallow ] && echo --unshallow) --no-tags "$(git -C '${checkout}' remote get-url origin)" '+refs/heads/main:refs/remotes/termag/main'\`, then \`git merge refs/remotes/termag/main\` (another base branch: its name for main; \`--unshallow\` only while the clone is shallow, since a one-commit clone has no merge base with main and git refuses "unrelated histories")`
+    : ', into a ref under refs/remotes/termag/, with `--unshallow` while the clone is shallow';
+  return `- Never add or change a git remote in this clone (no \`git remote add\`, no \`gh pr checkout\`): every later turn on the thread would run read-only. To catch up with the base branch, fetch it by URL${how}.`;
+}
+
+/** Both run prompts (and chat-runner.js's ORCHESTRATOR_SYSTEM_PROMPT) send termag bugs, worked around or not, to `termag bug report`. */
+const BUG_REPORT_LINE = '- If a termag command or feature misbehaves, even if you find a workaround, file it with `termag bug report` (the termag-bug-report skill).';
+
+/**
  * Appended to the run's system prompt. It names the sender (always the
  * project's owner: asks are owner-only) and states how the run works: as the
  * owner, in a clone, publishing only through termag.
@@ -681,16 +1017,69 @@ export function runSystemPrompt(input: {
   senderDisplayName: string;
   target: string;
   branch: string;
+  /**
+   * The thread publishes to this existing PR (`--update-pr`): its head branch, and
+   * the live checkout whose origin the run fetches it from.
+   */
+  targetPr?: { number: number; repo: string; branch: string; checkout: string } | null;
+  /** The live checkout, whose origin a run fetches another PR's branch from. */
+  checkout?: string;
+  /**
+   * The box's runner has ask-push-v1: the clone is a normal one with origin, on
+   * the thread's branch (`branch`, or the target PR's), and the run pushes and
+   * opens its draft PRs itself (pushSystemPrompt).
+   */
+  push?: boolean;
 }): string {
+  if (input.push) return pushSystemPrompt(input);
+  const t = input.targetPr;
+  const askLine = t
+    ? [
+      `- This thread updates an existing pull request, #${t.number} in ${t.repo}, whose branch is \`${t.branch}\`. termag pushes the \`ask\` branch to it, without force, so \`ask\` must build on that branch exactly as GitHub has it. Before you change anything, and again before your last commit, fetch it: \`git fetch $([ -f .git/shallow ] && echo --unshallow) --no-tags "$(git -C '${t.checkout}' remote get-url origin)" '+refs/heads/${t.branch}:refs/remotes/termag/target'\` (\`--unshallow\` only while the clone is shallow; reading the live checkout's origin URL is fine). Then \`git reset --hard refs/remotes/termag/target\` while \`ask\` has no commits of yours, or \`git merge --ff-only refs/remotes/termag/target\` once it has; never rebase, amend or drop the pull request's commits. If the branch moved on GitHub after your last fetch, termag refuses the publish.`,
+      `- If the request needs code changes, commit them on \`ask\`, on top of that branch. termag publishes them to pull request #${t.number}; never push or open a pull request yourself. Every commit on the pull request must be authored and committed as the sender, merges only of its base branch.`,
+    ]
+    : [
+      `- If the request needs code changes, commit them on the \`ask\` branch, the one checked out at the start. termag publishes your commits as a draft pull request on ${input.branch}; never push or open a pull request yourself.`,
+      ...(input.checkout ? [`- To continue an existing pull request of the sender's instead, put \`ask\` on its branch before committing: \`git fetch $([ -f .git/shallow ] && echo --unshallow) --no-tags "$(git -C '${input.checkout}' remote get-url origin)" '+refs/heads/<its branch>:refs/remotes/termag/target' && git reset --hard refs/remotes/termag/target\` (\`--unshallow\` only while the clone is shallow). When \`ask\` builds on exactly one open pull request the sender opened, termag publishes to it instead of a new draft; on several (a stack), it refuses and the sender names one with --update-pr. A change meant as a separate new pull request goes on a \`pr/<name>\` branch, never on top of another pull request's branch.`] : []),
+    ];
   return [
     `You are answering a request sent to ${input.target} by ${input.senderDisplayName} (${input.senderUsername}), from another of their termag agents or their own terminal.`,
     'This run executes headless as the box owner, with their credentials, network and tools, in a fresh clone of the project\'s committed code.',
     '- Work only in this clone: never edit, commit in or reset the live checkout of the project or any other directory on the box.',
-    '- Do not change credentials, permissions, CI workflows, CODEOWNERS, deploy/ or sudoers files: termag refuses to publish commits that touch them.',
-    `- If the request needs code changes, commit them on the \`ask\` branch, the one checked out at the start. termag publishes your commits as a draft pull request on ${input.branch}; never push or open a pull request yourself.`,
+    remoteLine(t?.checkout ?? input.checkout),
+    '- Do not change credentials, permissions, CI workflows, CODEOWNERS or sudoers files: termag refuses to publish commits that touch them.',
+    ...askLine,
     `- If the environment variable TERMAG_ASK_PR_DIR is set and the sender asks for separate pull requests, or the work is clearly several independent changes, termag can open more than one: put each further pull request on its own branch \`pr/<name>\` (lowercase letters, digits and hyphens, at most 40) started from the base (\`git switch -c pr/<name> termag/base\`), commit there, and write its description to \`$TERMAG_ASK_PR_DIR/<name>.md\` in the same form. Each becomes a draft pull request on ${input.branch}-<name>, at most ${MAX_ASK_PRS} per thread counting the one on \`ask\`; later turns update them by branch name. Switch back to \`ask\` for the main change. Other branch names are not published.`,
     '- If you commit and the environment variable TERMAG_ASK_PR_BODY_FILE is set, write the pull request description to that file (it is outside the git tree; never commit it): an optional first line `# <title>`, then Markdown saying what changed and why, how you tested it, and open questions for the reviewer. Rewrite it on a later turn if the change moves on. Without one, termag builds the description from your commit messages, so write those well either way.',
+    BUG_REPORT_LINE,
     'Finish with a short, self-contained answer for the sender: what you found or changed, and anything they must check.',
+  ].join('\n');
+}
+
+/**
+ * runSystemPrompt for a box with ask-push-v1: the
+ * run publishes like any session on the box, by pushing through the broker
+ * and opening its draft PR with the termag-pr skill. termag reads what it
+ * pushed at the end of the turn and lists those PRs in the reply.
+ */
+function pushSystemPrompt(input: {
+  senderUsername: string; senderDisplayName: string; target: string; branch: string;
+  targetPr?: { number: number; repo: string; branch: string } | null;
+}): string {
+  const t = input.targetPr;
+  const own = t ? t.branch : input.branch;
+  return [
+    `You are answering a request sent to ${input.target} by ${input.senderDisplayName} (${input.senderUsername}), from another of their termag agents or their own terminal.`,
+    'This run executes as the box owner, with their credentials, network and tools, in the thread\'s own clone of the project (a normal clone with `origin`). Work only in this clone: never edit, commit in or reset the live checkout of the project or any other directory on the box.',
+    t
+      ? `- This thread updates pull request #${t.number} in ${t.repo}. Its branch \`${own}\` is checked out, tracking \`origin/${own}\`. Run \`git pull --ff-only\` before you change anything: someone may have pushed to it since.`
+      : `- You are on the thread's branch \`${own}\`. Commit there.`,
+    `- If the request needs code changes, publish them yourself: catch up with \`git fetch origin && git merge origin/<default branch>\` if you need to, then \`git push origin HEAD:${own}\`, then open a draft pull request for it with the termag-pr skill (\`termag-pr-create <title file> <body file> --draft\`) unless it already has one. Push before you finish: termag lists the pull requests of the branches this clone pushed, and says so in the reply when a branch has commits that were not pushed.`,
+    `- A separate pull request goes on its own branch from the default branch: \`git switch -c ${input.branch}-<name> origin/<default branch>\` (<name>: lowercase letters, digits and hyphens), pushed and opened the same way. To work on another existing pull request of the sender's, \`gh pr checkout <n>\`, commit, and \`git push\`.`,
+    '- Never push to the default branch (the clone\'s pre-push hook refuses it), to someone else\'s pull request, or with --force to a branch someone else has pushed to. Do not change credentials, permissions or CI workflows unless the request is about them.',
+    '- A pull request\'s title and body come from files, through the termag-pr skill; its body names this thread (TERMAG_ASK_THREAD). When the change spans several pull requests, link each from the others\' bodies.',
+    BUG_REPORT_LINE,
+    'Finish with a short, self-contained answer for the sender: what you found or changed, the pull requests, and anything they must check.',
   ].join('\n');
 }
 
@@ -728,6 +1117,12 @@ export interface TargetInput {
   /** Project.setupStatus / setupError: an ask to a project still cloning waits; one whose setup failed is refused. */
   setupStatus: string;
   setupError: string | null;
+  /** A multi-repo project's repository this card asks (repoTarget). */
+  repo?: string | null;
+  /** Why no ask may go to this target whatever its box says (repoTarget's refusal). */
+  refused?: string | null;
+  /** Claude's title for the workstream's session (Workstream.sessionTitle), what the simple UI calls it; null before it has one. */
+  sessionTitle?: string | null;
 }
 
 /**
@@ -736,8 +1131,9 @@ export interface TargetInput {
  * ask starts it and runs once it connects; its reason says so.
  */
 export function targetAskable(
-  t: Pick<TargetInput, 'box' | 'project' | 'boxStatus' | 'connected' | 'capabilities' | 'wakes' | 'setupStatus' | 'setupError'>,
+  t: Pick<TargetInput, 'box' | 'project' | 'boxStatus' | 'connected' | 'capabilities' | 'wakes' | 'setupStatus' | 'setupError' | 'refused'>,
 ): { askable: boolean; reason: string | null } {
+  if (t.refused) return { askable: false, reason: t.refused };
   const unready = setupRefusal({ name: t.project, setupStatus: t.setupStatus, setupError: t.setupError });
   if (unready) return { askable: false, reason: unready.error };
   if ((t.connected || t.wakes) && isProjectSettingUp(t.setupStatus)
@@ -760,7 +1156,7 @@ export function targetAskable(
 export function targetCard(t: TargetInput) {
   const { askable, reason } = targetAskable(t);
   return {
-    name: askTarget(t.box, t.project, t.workstream),
+    name: askTarget(t.box, t.project, t.workstream, t.repo),
     description: t.description ?? '',
     provider: { organization: t.owner },
     version: ASK_AGENT_CAPABILITY,
@@ -773,13 +1169,36 @@ export function targetCard(t: TargetInput) {
         required: false,
         params: {
           projectId: t.projectId, box: t.box, project: t.project, workstream: t.workstream,
+          ...(t.repo ? { repo: t.repo } : {}),
           owner: t.owner, shared: t.shared, boxStatus: t.boxStatus, connected: t.connected,
           askable, reason, cancel: t.capabilities.includes(ASK_CANCEL_CAPABILITY),
+          sessionTitle: t.sessionTitle?.trim() || null,
         },
       }],
     },
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain', 'text/uri-list'],
     skills: [],
+  };
+}
+
+/** The most ask threads GET /ask/targets lists, newest first. */
+export const MAX_LISTED_THREADS = 200;
+
+/**
+ * One of the caller's ask threads that has a chat, as GET /ask/targets lists it
+ * for `termag ask --find`: what the simple UI calls it (its title, else Claude's title for its
+ * session), and the target and thread a follow-up names to talk to that session.
+ */
+export function threadTarget(t: {
+  id: string; title: string | null; sessionTitle: string | null; updatedAt: Date;
+  box: string; project: string; workstream: string; repoName: string | null;
+}) {
+  return {
+    thread: t.id,
+    title: t.title?.trim() || null,
+    sessionTitle: t.sessionTitle?.trim() || null,
+    target: askTarget(t.box, t.project, t.workstream, t.repoName),
+    updatedAt: t.updatedAt.toISOString(),
   };
 }

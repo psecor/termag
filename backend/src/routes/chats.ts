@@ -9,6 +9,10 @@
  *                                    parked turn. Until then the row stays
  *                                    archived, so hello's chat-recover drops
  *                                    it and chat-history cannot resumeQueue.
+ *                                    A chat whose box is gone unarchives at
+ *                                    once when its transcript is stored
+ *                                    (`storedHistory` on the archived list),
+ *                                    and reads from the store.
  *   DELETE /api/chats/:id            { confirmed: true }: from the archive only.
  *                                    The box is terminated, and the history on
  *                                    it goes, only when this chat is the last
@@ -38,7 +42,8 @@ import { isProjectAgentConnected, sendForProject } from '../services/agentRegist
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { revokeChats } from '../services/chatRevoke';
-import { archivePowerFor, deleteTerminatesBox, otherProjectsFromTotal, reopenPlanFor, reopenRelease } from '../services/chatLifecycle';
+import { projectsWithStoredHistory } from '../services/chatTranscriptSync';
+import { archivePowerFor, deleteTerminatesBox, otherProjectsFromTotal, reopenPlanFor, reopenRelease, storedReopenRelease } from '../services/chatLifecycle';
 import { powerOwnedBox, terminateOwnedBox } from './instances';
 import { relaunchChatOrRestore } from './chatReopen';
 import { archiveOwnedProject, ensureDataSessions } from './projects';
@@ -51,7 +56,7 @@ async function ownedChat(userId: string, id: string) {
     where: { id, userId },
     include: {
       instance: { select: BOX_SELECT },
-      workstreams: { select: { id: true } },
+      workstreams: { select: { id: true, name: true } },
       workflows: { include: { workstream: { select: { id: true, name: true } } } },
     },
   });
@@ -59,7 +64,8 @@ async function ownedChat(userId: string, id: string) {
   return project.workflows.some(w => w.type === 'agent' && isChatRunnerProvider(w.provider)) ? project : null;
 }
 
-export async function archivedChatsFor(userId: string): Promise<RouteResult> {
+export async function archivedChatsFor(user: Express.User): Promise<RouteResult> {
+  const userId = user.id;
   const rows = await prisma.project.findMany({
     where: { userId, archived: true, workflows: { some: { type: 'agent', provider: { not: null } } } },
     include: { instance: { select: BOX_SELECT }, workflows: { select: { type: true, provider: true } } },
@@ -78,16 +84,19 @@ export async function archivedChatsFor(userId: string): Promise<RouteResult> {
     _count: true,
   });
   const onBox = new Map(totals.flatMap(row => (row.instanceId ? [[row.instanceId, row._count] as const] : [])));
+  const gone = chats.filter(c => !c.box || c.box.status === 'terminated' || c.box.status === 'failed').map(c => c.id);
+  const stored = await projectsWithStoredHistory(user, gone);
   return {
     status: 200,
     body: chats.map(c => ({
       ...c,
       otherProjects: c.box ? otherProjectsFromTotal(onBox.get(c.box.id) ?? 1) : 0,
+      storedHistory: stored.has(c.id),
     })),
   };
 }
 
-export async function archiveChatFor(user: Express.User, id: string): Promise<RouteResult> {
+export async function archiveChatFor(user: Express.User, id: string, opts: { powerBox?: boolean } = {}): Promise<RouteResult> {
   const chat = await ownedChat(user.id, id);
   if (!chat) return { status: 404, body: { error: 'Chat not found' } };
   if (chat.archived) return { status: 409, body: { error: 'This chat is archived already' } };
@@ -96,6 +105,8 @@ export async function archiveChatFor(user: Express.User, id: string): Promise<Ro
   // is not stopped.
   const archived = await archiveOwnedProject(user, id, { keepWorkflows: true });
   if (archived.status !== 200) return archived;
+  // The desktop's archive leaves the box alone: its other threads may be running on it.
+  if (opts.powerBox === false) return { status: 200, body: { archived: true, box: { action: null, reason: 'kept' } } };
 
   const others = chat.instance
     ? await prisma.project.count({ where: { instanceId: chat.instance.id, archived: false, id: { not: id } } })
@@ -110,12 +121,32 @@ export async function archiveChatFor(user: Express.User, id: string): Promise<Ro
   return { status: 200, body: { archived: true, box } };
 }
 
-export async function reopenChatFor(user: Express.User, id: string): Promise<RouteResult> {
+export async function reopenChatFor(user: Express.User, id: string, opts: { startBox?: boolean } = {}): Promise<RouteResult> {
   const chat = await ownedChat(user.id, id);
   if (!chat) return { status: 404, body: { error: 'Chat not found' } };
   if (!chat.archived) return { status: 200, body: { reopened: true, box: chat.instance } };
-  const plan = reopenPlanFor(chat.instance);
+  const gone = !chat.instance || chat.instance.status === 'terminated' || chat.instance.status === 'failed';
+  const plan = reopenPlanFor(chat.instance, gone && (await projectsWithStoredHistory(user, [chat.id])).has(chat.id));
   if ('refused' in plan) return { status: plan.refused.status, body: { error: plan.refused.error } };
+  if ('stored' in plan) {
+    // No box to start or relaunch on: the chat reads from the store.
+    const storedHost = { userId: user.id, instanceId: chat.instanceId };
+    const canConnect = !!chat.instance && chat.instance.status !== 'terminated' && await prisma.agentToken.count({
+      where: { instanceId: chat.instance.id, revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+    }) > 0;
+    const storedConnected = !!chat.instanceId && isProjectAgentConnected(storedHost);
+    const storedBlocked = storedConnected
+      ? await revokeChats((type, payload) => sendForProject(storedHost, type, payload), true, chat.id, chat.workstreams)
+      : null;
+    const storedRelease = storedReopenRelease(canConnect, storedConnected, storedBlocked);
+    if (!storedRelease.unarchive) return { status: 409, body: { error: storedRelease.error } };
+    await prisma.project.update({ where: { id }, data: { archived: false } });
+    return { status: 200, body: { reopened: true, stored: true, box: chat.instance } };
+  }
+  // The desktop's unarchive never starts a box: a stopped one has to be started first.
+  if (plan.start && opts.startBox === false) {
+    return { status: 409, body: { error: "This chat's box is stopped: start it to reopen the chat", code: 'box-stopped' } };
+  }
   if (plan.start) {
     // Start first: a box EC2 will not start leaves the chat in the archive.
     const started = await powerOwnedBox(user, chat.instance!.id, 'start');
@@ -133,7 +164,7 @@ export async function reopenChatFor(user: Express.User, id: string): Promise<Rou
       (type, payload) => sendForProject(host, type, payload),
       true,
       chat.id,
-      chat.workstreams.map(w => w.id),
+      chat.workstreams,
     )
     : null;
   const release = reopenRelease(connected, blocked);
@@ -196,7 +227,7 @@ export async function deleteChatFor(user: Express.User, id: string, confirmed: b
         (type, payload) => sendForProject(host, type, payload),
         isProjectAgentConnected(host),
         chat.id,
-        chat.workstreams.map(w => w.id),
+        chat.workstreams,
         { offlineBlocks: !destroysHost },
       );
       if (blocked) return { status: 409, body: { error: blocked } };
@@ -210,7 +241,7 @@ export async function deleteChatFor(user: Express.User, id: string, confirmed: b
 
 export function chatsRouter(): Router {
   const router = Router();
-  router.get('/archived', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archivedChatsFor(req.user!.id))));
+  router.get('/archived', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archivedChatsFor(req.user!))));
   router.post('/:id/archive', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archiveChatFor(req.user!, req.params.id))));
   router.post('/:id/reopen', requireAuth, asyncHandler(async (req, res) => sendResult(res, await reopenChatFor(req.user!, req.params.id))));
   router.delete('/:id', requireAuth, asyncHandler(async (req, res) => {

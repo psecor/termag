@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_THEME, normalizeHexColor, normalizeTheme, validateTheme } from './schema';
+import { DEFAULT_THEME, mergeStoredThemeKeys, normalizeHexColor, normalizeTheme, validateTheme } from './schema';
 
 describe('normalizeHexColor', () => {
   it('canonicalizes case, whitespace, a missing hash and 3-digit shorthand', () => {
@@ -19,7 +19,7 @@ describe('validateTheme', () => {
   it('accepts the default theme and a solid colour, canonicalizing the colour', () => {
     expect(validateTheme(DEFAULT_THEME)).toEqual({ ok: true, theme: DEFAULT_THEME });
     expect(validateTheme({ version: 1, background: { mode: 'solid', color: '#0B1A2E' } }))
-      .toEqual({ ok: true, theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: false, sidebarMetaTerm: false } });
+      .toEqual({ ok: true, theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: false, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false } });
   });
 
   it('rejects a missing or wrong version', () => {
@@ -36,8 +36,8 @@ describe('validateTheme', () => {
   });
 
   it('rejects unknown keys at both levels', () => {
-    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, palette: {} }))
-      .toMatchObject({ ok: false, error: /unknown keys: palette/ });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, fonts: {} }))
+      .toMatchObject({ ok: false, error: /unknown keys: fonts/ });
     expect(validateTheme({ version: 1, background: { mode: 'hyperspace', opacity: 1 } }))
       .toMatchObject({ ok: false, error: /unknown keys: opacity/ });
   });
@@ -58,6 +58,78 @@ describe('validateTheme', () => {
       .toMatchObject({ ok: false, error: /sidebarMetaTerm/ });
   });
 
+  it('keeps sidebarShowStopped, defaulting it off (stopped boxes hidden) when absent, and rejects a non-boolean', () => {
+    expect(DEFAULT_THEME.sidebarShowStopped).toBe(false);
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarShowStopped: true }))
+      .toEqual({ ok: true, theme: { ...DEFAULT_THEME, sidebarShowStopped: true } });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' } }))
+      .toEqual({ ok: true, theme: DEFAULT_THEME });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarShowStopped: 'yes' }))
+      .toMatchObject({ ok: false, error: /sidebarShowStopped/ });
+  });
+
+  it('keeps sidebarHideAskBoxes, defaulting it off (ask boxes listed) when absent, and rejects a non-boolean', () => {
+    expect(DEFAULT_THEME.sidebarHideAskBoxes).toBe(false);
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarHideAskBoxes: true }))
+      .toEqual({ ok: true, theme: { ...DEFAULT_THEME, sidebarHideAskBoxes: true } });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' } }))
+      .toEqual({ ok: true, theme: DEFAULT_THEME });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarHideAskBoxes: 'yes' }))
+      .toMatchObject({ ok: false, error: /sidebarHideAskBoxes/ });
+  });
+
+  it('keeps starfieldTurkeys only when on, so off is stored as absent, and rejects a non-boolean', () => {
+    expect(DEFAULT_THEME.starfieldTurkeys).toBeUndefined();
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, starfieldTurkeys: true }))
+      .toEqual({ ok: true, theme: { ...DEFAULT_THEME, starfieldTurkeys: true } });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, starfieldTurkeys: false }))
+      .toEqual({ ok: true, theme: DEFAULT_THEME });
+    expect(validateTheme({ version: 1, background: { mode: 'hyperspace' }, starfieldTurkeys: 'yes' }))
+      .toMatchObject({ ok: false, error: /starfieldTurkeys/ });
+    expect(normalizeTheme({ starfieldTurkeys: true }).starfieldTurkeys).toBe(true);
+    expect(normalizeTheme({ starfieldTurkeys: 'true' }).starfieldTurkeys).toBeUndefined();
+  });
+
+  it('keeps stored turkeys for a tab that does not send the key, and lets an explicit false clear them', () => {
+    const stored = { ...DEFAULT_THEME, starfieldTurkeys: true };
+    expect(mergeStoredThemeKeys({ version: 1, background: { mode: 'hyperspace' } }, stored))
+      .toMatchObject({ starfieldTurkeys: true });
+    expect(mergeStoredThemeKeys({ version: 1, background: { mode: 'hyperspace' }, starfieldTurkeys: false }, stored))
+      .toMatchObject({ starfieldTurkeys: false });
+  });
+
+  it('keeps a light palette, stores dark as absent, and rejects anything else', () => {
+    expect(DEFAULT_THEME.palette).toBeUndefined();
+    expect(validateTheme({ ...DEFAULT_THEME, palette: 'light' })).toEqual({ ok: true, theme: { ...DEFAULT_THEME, palette: 'light' } });
+    expect(validateTheme({ ...DEFAULT_THEME, palette: 'dark' })).toEqual({ ok: true, theme: DEFAULT_THEME });
+    for (const bad of ['system', 'Light', true, null, {}]) {
+      expect(validateTheme({ ...DEFAULT_THEME, palette: bad })).toMatchObject({ ok: false, error: /palette/ });
+    }
+  });
+
+  it('keeps JetBrains Mono for terminals, stores Maple Mono as absent, and rejects anything else', () => {
+    expect(DEFAULT_THEME.terminalFont).toBeUndefined();
+    expect(validateTheme({ ...DEFAULT_THEME, terminalFont: 'jetbrains' }))
+      .toEqual({ ok: true, theme: { ...DEFAULT_THEME, terminalFont: 'jetbrains' } });
+    expect(validateTheme({ ...DEFAULT_THEME, terminalFont: 'maple' })).toEqual({ ok: true, theme: DEFAULT_THEME });
+    for (const bad of ['jbmono', 'Maple', '', true, null, {}]) {
+      expect(validateTheme({ ...DEFAULT_THEME, terminalFont: bad })).toMatchObject({ ok: false, error: /terminalFont/ });
+    }
+    expect(normalizeTheme({ terminalFont: 'jetbrains' }).terminalFont).toBe('jetbrains');
+    for (const other of ['maple', 'jbmono', undefined, 1]) {
+      expect(normalizeTheme({ terminalFont: other }).terminalFont).toBeUndefined();
+    }
+  });
+
+  it('keeps a stored terminal font for a tab that does not send the key, and lets an explicit maple switch back', () => {
+    const stored = { ...DEFAULT_THEME, terminalFont: 'jetbrains' };
+    expect(mergeStoredThemeKeys({ version: 1, background: { mode: 'hyperspace' } }, stored))
+      .toMatchObject({ terminalFont: 'jetbrains' });
+    const back = mergeStoredThemeKeys({ ...DEFAULT_THEME, terminalFont: 'maple' }, stored);
+    expect(back).toMatchObject({ terminalFont: 'maple' });
+    expect(validateTheme(back)).toEqual({ ok: true, theme: DEFAULT_THEME });
+  });
+
   it('rejects non-objects', () => {
     for (const bad of [null, undefined, 'hyperspace', 1, [], true]) {
       expect(validateTheme(bad)).toMatchObject({ ok: false });
@@ -74,7 +146,7 @@ describe('normalizeTheme', () => {
 
   it('keeps a valid background and canonicalizes its colour', () => {
     expect(normalizeTheme({ version: 1, background: { mode: 'solid', color: '#ABCDEF' } }))
-      .toEqual({ version: 1, background: { mode: 'solid', color: '#abcdef' }, sidebarActivity: false, sidebarMetaTerm: false });
+      .toEqual({ version: 1, background: { mode: 'solid', color: '#abcdef' }, sidebarActivity: false, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false });
   });
 
   it('falls back to the default background when the stored one is unreadable', () => {
@@ -84,7 +156,7 @@ describe('normalizeTheme', () => {
 
   it('ignores the stored version and unknown keys', () => {
     expect(normalizeTheme({ version: 99, background: { mode: 'solid', color: '#000000' }, future: true }))
-      .toEqual({ version: 1, background: { mode: 'solid', color: '#000000' }, sidebarActivity: false, sidebarMetaTerm: false });
+      .toEqual({ version: 1, background: { mode: 'solid', color: '#000000' }, sidebarActivity: false, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false });
   });
 
   it('shows the sidebar activity only when it was stored as true', () => {
@@ -92,9 +164,53 @@ describe('normalizeTheme', () => {
     expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarActivity: 'true' }).sidebarActivity).toBe(false);
   });
 
+  it('shows projects on stopped boxes only when that was stored as true', () => {
+    expect(normalizeTheme({}).sidebarShowStopped).toBe(false);
+    expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarShowStopped: true }).sidebarShowStopped).toBe(true);
+    expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarShowStopped: 1 }).sidebarShowStopped).toBe(false);
+  });
+
+  it('hides ask boxes only when that was stored as true', () => {
+    expect(normalizeTheme({}).sidebarHideAskBoxes).toBe(false);
+    expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarHideAskBoxes: true }).sidebarHideAskBoxes).toBe(true);
+    expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarHideAskBoxes: 'true' }).sidebarHideAskBoxes).toBe(false);
+  });
+
   it('offers MetaTerm only to users who opted in', () => {
     expect(normalizeTheme({}).sidebarMetaTerm).toBe(false);
     expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarMetaTerm: true }).sidebarMetaTerm).toBe(true);
     expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, sidebarMetaTerm: 'true' }).sidebarMetaTerm).toBe(false);
+  });
+});
+
+describe('normalizeTheme palette', () => {
+  it('reads light back and anything else as dark (absent)', () => {
+    expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, palette: 'light' }).palette).toBe('light');
+    for (const other of ['dark', 'system', undefined, 1]) {
+      expect(normalizeTheme({ version: 1, background: { mode: 'hyperspace' }, palette: other })).toEqual(DEFAULT_THEME);
+    }
+  });
+});
+
+describe('mergeStoredThemeKeys', () => {
+  const stored = { version: 1, background: { mode: 'hyperspace' }, palette: 'light', sidebarActivity: true, sidebarMetaTerm: true };
+
+  it('fills the optional keys a stale client left out from the stored theme', () => {
+    expect(mergeStoredThemeKeys({ version: 1, background: { mode: 'solid', color: '#000000' } }, stored))
+      .toEqual({ version: 1, background: { mode: 'solid', color: '#000000' }, palette: 'light', sidebarActivity: true, sidebarMetaTerm: true, sidebarShowStopped: false, sidebarHideAskBoxes: false });
+  });
+
+  it('lets keys the client sent win, including an explicit dark', () => {
+    expect(mergeStoredThemeKeys({ ...DEFAULT_THEME, palette: 'dark' }, stored))
+      .toEqual({ ...DEFAULT_THEME, palette: 'dark' });
+  });
+
+  it('adds nothing for a palette stored as dark, and fills no required key', () => {
+    expect(mergeStoredThemeKeys({ version: 1 }, {})).toEqual({ version: 1, sidebarActivity: false, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false });
+  });
+
+  it('passes non-objects and unknown keys through for the validator to reject', () => {
+    expect(mergeStoredThemeKeys('nope', stored)).toBe('nope');
+    expect(validateTheme(mergeStoredThemeKeys({ ...DEFAULT_THEME, fonts: {} }, stored))).toMatchObject({ ok: false, error: /unknown keys: fonts/ });
   });
 });

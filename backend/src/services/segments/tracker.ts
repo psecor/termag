@@ -17,6 +17,7 @@
 import { prisma } from'../../db';
 import { segmentFor, isActiveDay, type Segment } from './rules';
 import { isoToday } from './dateutil';
+import { traceSweep } from '../tracing/spans';
 
 export interface TrackerStatus {
   state: 'idle' | 'running' | 'error';
@@ -189,9 +190,12 @@ async function tick(): Promise<void> {
   console.log(`[SEGMENTS] rebuilt ${r.rows} rows for ${r.users} users`);
 }
 
+// Traced inside the catch, so a failed rebuild fails its span.
+const tracedRebuildSegments = traceSweep('segments', () => rebuildSegments());
+
 async function runRebuild(): Promise<void> {
   try {
-    await rebuildSegments();
+    await tracedRebuildSegments();
   } catch { /* status already carries the error */ }
 }
 

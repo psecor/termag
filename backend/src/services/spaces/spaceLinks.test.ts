@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { HTML_LINK_HEADERS, fileLinkResponseHeaders, isHtmlLink, parseSpaceFileLink, spaceFileLinkPath } from './spaceLinks';
+import { HTML_LINK_HEADERS, fileLinkResponseHeaders, isHtmlLink, parseSpaceFileLink, spaceFileLinkPath, spaceFolderPagePath } from './spaceLinks';
 
 describe('spaceFileLinkPath', () => {
   it('builds /files/<space>/<path> under the base path, each segment encoded', () => {
@@ -19,7 +19,7 @@ describe('spaceFileLinkPath', () => {
 
 describe('parseSpaceFileLink', () => {
   it('refuses anything that is not /<space>/<path>', () => {
-    for (const raw of ['', '/', '/assets', '/assets/', 'assets/x', '/Assets/x', '/a/x', '/as%2Fsets/x', '/assets/%E0%A4%A']) {
+    for (const raw of ['', '/', '/assets', 'assets/x', '/Assets/x', '/a/x', '/as%2Fsets/x', '/assets/%E0%A4%A']) {
       expect(parseSpaceFileLink(raw)).toBeNull();
     }
   });
@@ -27,6 +27,19 @@ describe('parseSpaceFileLink', () => {
   it('decodes segments and leaves validation of the path to normalizeFilePath', () => {
     expect(parseSpaceFileLink('/assets/%2e%2e/x')).toEqual({ space: 'assets', path: '../x' });
     expect(parseSpaceFileLink('/assets/a%2Fb')).toEqual({ space: 'assets', path: 'a/b' });
+  });
+
+  it('keeps a folder\'s trailing slash, and names the space\'s root as \'\'', () => {
+    expect(parseSpaceFileLink('/assets/docs/')).toEqual({ space: 'assets', path: 'docs/' });
+    expect(parseSpaceFileLink('/assets/')).toEqual({ space: 'assets', path: '' });
+  });
+});
+
+describe('spaceFolderPagePath', () => {
+  it('is the simple UI\'s page for the space, with the folder to show in its explorer', () => {
+    expect(spaceFolderPagePath('/termag', 'assets', 'docs/deep/')).toBe('/termag/chat/files/assets?dir=docs%2Fdeep%2F');
+    expect(spaceFolderPagePath('/termag', 'assets', 'My Docs/')).toBe('/termag/chat/files/assets?dir=My%20Docs%2F');
+    expect(spaceFolderPagePath('', 'assets', '')).toBe('/chat/files/assets?dir=');
   });
 });
 

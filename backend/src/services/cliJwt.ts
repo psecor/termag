@@ -85,7 +85,14 @@ export class CliJwt {
     return { token: `${header}.${payload}.${signature.toString('base64url')}`, expiresIn: CLI_ACCESS_TOKEN_TTL_S };
   }
 
-  verify(token: string, nowMs: number): CliAccessClaims | null {
+  /**
+   * The claims of a token this orchestrator signed with a key it still
+   * publishes, or null. `ignoreExpiry` skips `exp` alone, for a socket that
+   * was admitted with the token while it was live (the native forward's
+   * recheck); the signature, `kid`, issuer, audience and claims are judged
+   * all the same.
+   */
+  verify(token: string, nowMs: number, opts: { ignoreExpiry?: boolean } = {}): CliAccessClaims | null {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
     const [header, payload, signature] = parts;
@@ -97,7 +104,7 @@ export class CliJwt {
     const c = decodeJson(payload);
     if (!c || c.iss !== this.issuer || c.aud !== CLI_JWT_AUDIENCE) return null;
     if (typeof c.sub !== 'string' || typeof c.jti !== 'string' || typeof c.exp !== 'number') return null;
-    if (nowMs >= c.exp * 1000) return null;
+    if (!opts.ignoreExpiry && nowMs >= c.exp * 1000) return null;
     return { sub: c.sub, jti: c.jti, exp: c.exp };
   }
 }

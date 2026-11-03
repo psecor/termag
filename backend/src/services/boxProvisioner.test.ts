@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   amiSupportsHibernation,
   amiTermagSha,
+  amiWithDisk,
   planHibernation,
   resolveRootDevice,
 } from './boxProvisioner';
@@ -96,5 +97,32 @@ describe('planHibernation', () => {
     expect(planHibernation(true, ami, null).reason).toMatch(/could not describe/);
     expect(planHibernation(true, ami, { ...m9g2xl, hibernationSupported: false }).reason).toMatch(/does not support/);
     expect(planHibernation(true, ami, { hibernationSupported: true, memoryMiB: 0 })).toMatchObject({ configured: false, rootVolumeGb: 120 });
+  });
+});
+
+describe('amiWithDisk: the disk a box was asked for, as its root volume', () => {
+  const ami = { imageId: 'ami-1', rootDeviceName: '/dev/sda1', rootVolumeGb: 120, imageGb: 120, hibernationSupported: true, termagSha: null, createdAt: null };
+
+  it('sizes the root to the disk asked for, above the image or below the configured floor', () => {
+    expect(amiWithDisk(ami, 200).rootVolumeGb).toBe(200);
+    expect(amiWithDisk({ ...ami, imageGb: 60 }, 80).rootVolumeGb).toBe(80);
+  });
+
+  it('never goes under the image\'s snapshot, which EC2 refuses: 50 on the 120 GB image is 120', () => {
+    expect(amiWithDisk(ami, 50).rootVolumeGb).toBe(120);
+  });
+
+  it('keeps the AMI as it is with no disk asked for', () => {
+    expect(amiWithDisk(ami, null)).toBe(ami);
+    expect(amiWithDisk(ami, undefined)).toBe(ami);
+  });
+
+  it('takes the root size as the floor for an AMI that does not report its image size', () => {
+    const { imageGb: _, ...bare } = ami;
+    expect(amiWithDisk(bare, 50).rootVolumeGb).toBe(120);
+  });
+
+  it('is what hibernation adds the RAM to: 200 GB on a 32 GB type is a 232 GB root', () => {
+    expect(planHibernation(true, amiWithDisk(ami, 200), { hibernationSupported: true, memoryMiB: 32 * 1024 }).rootVolumeGb).toBe(232);
   });
 });

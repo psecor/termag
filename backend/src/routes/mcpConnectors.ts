@@ -7,15 +7,15 @@ import { getCredentialStoreConfig } from '../services/credentialStore';
 import { deliverToUserBoxes } from '../services/credentialDelivery';
 import {
   connectorSecretNames, consumeOAuthState, CONNECTOR_SELECT, createOAuthState, deleteConnector, findConnector, forgetConnectorOAuth,
-  listConnectors, mcpBrokerEnabledForUser, readConnectorSecrets, readOAuth, setLinkStatus, updateConnectorDroppingOAuth, withOAuthLock, writeConnectorSecrets,
+  catalogForUser, listConnectors, mcpBrokerEnabledForUser, readConnectorSecrets, readOAuth, setLinkStatus, updateConnectorDroppingOAuth, withOAuthLock, writeConnectorSecrets,
 } from '../services/mcpConnectorStore';
 import {
   applySecretsPatch, assertPatchFitsAuth, getMcpBrokerUrl, McpConnectorError, referencedSecrets, upstreamTestAllow, validateConnectorName,
   validateHeaderTemplates, validateSecretsPatch, validateUpstream, type HeaderTemplates,
 } from '../services/mcpConnectors';
 import {
-  authorizeUrl, callbackIssuerProblem, cimdClientId, clientMetadataDocument, commitLink, discoverOAuth, exchangeCode, newStateNonce, OAuthGrantError, oauthRedirectUri,
-  pkcePair, registerClient, registeredRow, registrationPath, revokeToken, signState, stateNonce, verifyState, type DiscoveredOAuth,
+  authorizeUrl, callbackIssuerProblem, cimdClientId, clientIsStale, clientMetadataDocument, commitLink, discoverOAuth, exchangeCode, newStateNonce, OAuthGrantError, oauthRedirectUri,
+  pkcePair, preregisteredClientFor, registerClient, registeredRow, registrationPath, revokeToken, signState, stateNonce, verifyState, type DiscoveredOAuth,
 } from '../services/mcpOAuth';
 import { checkOAuthUrl, safeOAuthHttp } from '../services/mcpOAuthHttp';
 
@@ -25,7 +25,8 @@ const stateSecret = () => process.env.SESSION_SECRET ?? 'dev-secret';
 
 type Row = NonNullable<Awaited<ReturnType<typeof findConnector>>>;
 
-async function view(row: Row, broker: string | null) {
+/** A connector as Settings → MCP servers shows it; also the CLI API's read-only list (routes/cliMcpConnectors.ts). */
+export async function view(row: Row, broker: string | null) {
   const base = {
     id: row.id,
     name: row.name,
@@ -79,6 +80,36 @@ async function discover(upstream: string): Promise<DiscoveredOAuth> {
   const meta = await discoverOAuth(upstream, { http: safeOAuthHttp(allow), check: url => { checkOAuthUrl(url, allow); } });
   registrationPath(meta, cimdClientId(termagUrlFromEnv()));
   return meta;
+}
+
+/**
+ * Starts sign-in for an OAuth connector and returns the URL to send the
+ * browser to. Registers termag as a client with the server first if it
+ * isn't registered yet.
+ */
+async function startLink(userId: string, connector: Row): Promise<string> {
+  if (connector.authType !== 'oauth') throw new McpConnectorError('this connector uses static headers, not OAuth');
+  if (!getCredentialStoreConfig()) throw new McpConnectorError(STORE_OFF, 503);
+  const termagUrl = termagUrlOrFail();
+  const meta = connector.oauthMetadata as unknown as DiscoveredOAuth;
+  const redirectUri = oauthRedirectUri(termagUrl);
+  const cimd = cimdClientId(termagUrl);
+  const preregistered = preregisteredClientFor(meta);
+  const stored = await readOAuth(userId, connector.id);
+  let client = stored?.client;
+  if (clientIsStale(client, meta, { redirectUri, cimdClientId: cimd, preregistered })) {
+    const fresh = await registerClient(meta, { http: safeOAuthHttp(), cimdClientId: cimd, redirectUri, preregistered });
+    client = fresh;
+    await withOAuthLock(userId, connector.id, async io => {
+      const { row, droppedTokens } = registeredRow(await io.read(), fresh);
+      await io.write(row);
+      if (droppedTokens) await io.needsLink('registered again with the server; link it again');
+    });
+  }
+  const nonce = newStateNonce();
+  const { verifier, challenge } = pkcePair();
+  await createOAuthState(nonce, userId, connector.id, verifier);
+  return authorizeUrl(meta, client!, { state: signState(stateSecret(), nonce, userId, connector.id), challenge });
 }
 
 /** Revoke (best effort) and forget the user's tokens and client for an oauth connector. */
@@ -137,11 +168,58 @@ export function mcpConnectorsRouter(): Router {
   router.get('/', asyncHandler(async (req, res) => {
     const broker = getMcpBrokerUrl();
     const rows = await listConnectors(req.user!.id);
+    const catalog = await catalogForUser(req.user!);
     res.json({
       available: broker !== null,
       storeAvailable: getCredentialStoreConfig() !== null,
       connectors: await Promise.all(rows.map(r => view(r, broker))),
+      // The orchestrator's servers this user hasn't connected yet, which Settings
+      // offers under "Available to connect". Once the user has a connector for a
+      // server's URL, it is one of their connectors instead and drops out of here.
+      catalog: catalog.filter(d => !rows.some(r => r.upstream === d.upstream)),
     });
+  }));
+
+  // Connect a catalog server: create the user's OAuth connector for it, which
+  // looks up the server's OAuth settings just as adding a server by hand does,
+  // and answer with the sign-in URL. If the user already has an OAuth connector
+  // for that URL (a second click, a second tab, or one added by hand), it is
+  // reused rather than duplicated.
+  router.post('/catalog/:name/connect', asyncHandler(async (req, res) => {
+    const userId = req.user!.id;
+    const def = (await catalogForUser(req.user!)).find(d => d.name === req.params.name);
+    if (!def) {
+      res.status(404).json({ error: 'No such MCP server in the catalog' });
+      return;
+    }
+    const existing = async () => (await listConnectors(userId)).find(r => r.authType === 'oauth' && r.upstream === def.upstream) ?? null;
+    try {
+      if (!getCredentialStoreConfig()) throw new McpConnectorError(STORE_OFF, 503);
+      termagUrlOrFail();
+      let connector = await existing();
+      if (!connector) {
+        const meta = await discover((await validateUpstream(def.upstream)).url);
+        try {
+          connector = await prisma.mcpConnector.create({
+            data: { userId, name: def.name, upstream: def.upstream, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
+            select: CONNECTOR_SELECT,
+          });
+          void deliverToUserBoxes(userId);
+        } catch (err) {
+          if ((err as { code?: string }).code !== 'P2002') throw err;
+          // Another connect for this server got there first: use its connector.
+          // Otherwise the name is taken by one of the user's own connectors for
+          // a different server, and only the user can free it.
+          connector = await existing();
+          if (!connector) {
+            throw new McpConnectorError(`You already have an MCP connector named "${def.name}" for another server. Rename or delete it, then connect again.`, 409);
+          }
+        }
+      }
+      res.json({ id: connector.id, authorizeUrl: await startLink(userId, connector) });
+    } catch (err) {
+      if (!fail(res, err)) throw err;
+    }
   }));
 
   router.post('/', asyncHandler(async (req, res) => {
@@ -315,29 +393,7 @@ export function mcpConnectorsRouter(): Router {
       return;
     }
     try {
-      if (connector.authType !== 'oauth') throw new McpConnectorError('this connector uses static headers, not OAuth');
-      if (!getCredentialStoreConfig()) throw new McpConnectorError(STORE_OFF, 503);
-      const termagUrl = termagUrlOrFail();
-      const meta = connector.oauthMetadata as unknown as DiscoveredOAuth;
-      const redirectUri = oauthRedirectUri(termagUrl);
-      const cimd = cimdClientId(termagUrl);
-      const stored = await readOAuth(userId, connector.id);
-      let client = stored?.client;
-      const stale = !client || client.redirectUri !== redirectUri || client.issuer !== meta.issuer
-        || (client.via === 'cimd' && client.clientId !== cimd);
-      if (stale) {
-        const fresh = await registerClient(meta, { http: safeOAuthHttp(), cimdClientId: cimd, redirectUri });
-        client = fresh;
-        await withOAuthLock(userId, connector.id, async io => {
-          const { row, droppedTokens } = registeredRow(await io.read(), fresh);
-          await io.write(row);
-          if (droppedTokens) await io.needsLink('registered again with the server; link it again');
-        });
-      }
-      const nonce = newStateNonce();
-      const { verifier, challenge } = pkcePair();
-      await createOAuthState(nonce, userId, connector.id, verifier);
-      res.json({ authorizeUrl: authorizeUrl(meta, client!, { state: signState(stateSecret(), nonce, userId, connector.id), challenge }) });
+      res.json({ authorizeUrl: await startLink(userId, connector) });
     } catch (err) {
       if (!fail(res, err)) throw err;
     }

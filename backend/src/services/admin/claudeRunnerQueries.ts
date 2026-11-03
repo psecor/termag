@@ -529,6 +529,8 @@ const CODE_CATEGORY: Record<string, RefusalCategory> = {
   'box-wait': 'box-pending', 'box-starting': 'box-pending', 'box-claimed': 'box-pending', 'box-provisioning': 'box-pending', 'box-on-its-way': 'box-pending',
   'box-hold': 'box-blocked', 'box-start-failed': 'box-blocked', 'no-provisioning': 'box-blocked', 'box-creation-refused': 'box-blocked',
   'agent-list-failed': 'agent-failed', 'agent-launch-failed': 'agent-failed',
+  // The box's software is what is old, as with the agent.
+  'claude-too-old': 'agent-too-old',
 };
 
 /**
@@ -543,7 +545,7 @@ export function refusalCategory(kind: string, detail: string | null, code: strin
   if (kind === 'agent-failed') return 'agent-failed';
   const d = detail ?? '';
   if (d === REFUSAL_TEXTS.github) return 'github';
-  if (d === REFUSAL_TEXTS.agentTooOld) return 'agent-too-old';
+  if (d === REFUSAL_TEXTS.agentTooOld || d === REFUSAL_TEXTS.claudeTooOld) return 'agent-too-old';
   if (d === REFUSAL_TEXTS.noBox) return 'no-box';
   if (d.startsWith(REFUSAL_TEXTS.boxesFullPrefix)) return 'boxes-full';
   if (d === REFUSAL_TEXTS.hookGaveUp) return 'hook-gave-up';

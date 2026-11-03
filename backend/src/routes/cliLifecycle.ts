@@ -1,6 +1,6 @@
 /**
  * The CLI's lifecycle routes under /api/cli/v1 (milestone 2): box create,
- * start, stop, rename, terminate and auto-park settings; project create, rename,
+ * start, stop, rename, resize, terminate and auto-park settings; project create, rename,
  * archive and clone retry; workstream create and remove.
  *
  * Each route is a thin shell over a CliLifecycle, whose Prisma implementation
@@ -22,9 +22,41 @@ import type { CliWorkstreamRequest } from '../services/cliWorkstreams';
 import type { CliAuth } from './cliApi';
 import type { RouteResult } from './routeResult';
 
+/** What a box or project was made for, when its creator says: only asks so far. */
+export type CreatedFor = 'ask';
+
+/** `createdFor` in a create body: absent is null; anything but a known purpose is an error. */
+export function parseCreatedFor(body: unknown): { createdFor: CreatedFor | null } | { error: string } {
+  const v = body && typeof body === 'object' ? (body as Record<string, unknown>).createdFor : undefined;
+  if (v === undefined || v === null || v === '') return { createdFor: null };
+  return v === 'ask' ? { createdFor: 'ask' } : { error: 'createdFor must be "ask"' };
+}
+
+/**
+ * The CLI's create-body fields, as the routes (and the CLI test's fake)
+ * pass them. Each optional field rides only when the request carried it, so
+ * a 1.x CLI's request shapes a 2.x createBox call exactly as its own did.
+ * `flavor` round-trips as typed: services/boxFlavor's `flavorOf` is what
+ * decides a 'minimal' from anything fuzzed.
+ */
+export interface CliCreateBoxInput {
+  name: string;
+  size?: string;
+  diskGiB?: number;
+  repoUrls?: string[];
+  flavor?: unknown;
+}
+
 export interface CliLifecycle {
-  /** parentInstanceId: the box whose credentials ask for it, null for a device sign-in. */
-  createBox(user: CliUser, name: string, parentInstanceId: string | null): Promise<RouteResult>;
+  /**
+   * parentInstanceId: the box whose credentials ask for it, null for a device
+   * sign-in. size: as sent, validated by createBox (services/boxSize.ts);
+   * repoUrls: the repositories a project made with it starts from, for its size.
+   * diskGiB: as sent, a number createBox checks the range of (services/boxDiskSize.ts).
+   * The fields are CliCreateBoxInput (below) — the body their POST carries,
+   * one field per concept.
+   */
+  createBox(user: CliUser, input: CliCreateBoxInput, parentInstanceId: string | null, createdFor?: CreatedFor | null): Promise<RouteResult>;
   /** The user's box's parent: undefined when the user has no such box. */
   boxParent(user: CliUser, boxId: string): Promise<string | null | undefined>;
   /**
@@ -36,9 +68,24 @@ export interface CliLifecycle {
   powerBox(user: CliUser, boxId: string, action: 'start' | 'stop' | 'hibernate'): Promise<RouteResult>;
   /** The settings body of PATCH /api/instances/:id/lifecycle, passed through for the shared parser. */
   setBoxLifecycle(user: CliUser, boxId: string, settings: unknown): Promise<RouteResult>;
+  /** Keep running: restart the box's idle clock. Never for a box's own credential (the route refuses those). */
+  keepBoxRunning(user: CliUser, boxId: string): Promise<RouteResult>;
+  /** What the user's boxes cost today (services/boxCost/owner.ts). Never for a box's own credential. */
+  boxCosts(user: CliUser): Promise<RouteResult>;
   removeBox(user: CliUser, boxId: string, confirmed: boolean): Promise<RouteResult>;
   renameBox(user: CliUser, boxId: string, name: string): Promise<RouteResult>;
-  createProject(user: CliUser, input: { boxId: string; name: string; agent: string; repoUrl?: string }): Promise<RouteResult>;
+  /** GET /api/instances/:id/resize's answer: the sizes, the current or last resize, a refusal and what runs on the box. */
+  resizeInfo(user: CliUser, boxId: string): Promise<RouteResult>;
+  /** GET /api/instances/sizes's answer for a new box: the sizes and the one to preselect; `repo` is the query's, as sent. */
+  boxSizes(user: CliUser, repo: unknown): Promise<RouteResult>;
+  /** POST /api/instances/:id/resize's checks and job (services/boxResize.ts): 202 with the box and its resize. */
+  resizeBox(user: CliUser, boxId: string, input: { size: string; force: boolean }): Promise<RouteResult>;
+  /**
+   * createdFor: what the project was made for ('ask'), recorded on it; marks a
+   * project that already existed too. repoUrls: two or more, a multi-repo
+   * project (instead of repoUrl).
+   */
+  createProject(user: CliUser, input: { boxId: string; name: string; agent: string; repoUrl?: string; repoUrls?: string[]; createdFor?: CreatedFor | null; chatSpace?: string | null }): Promise<RouteResult>;
   renameProject(user: CliUser, projectId: string, name: string): Promise<RouteResult>;
   archiveProject(user: CliUser, projectId: string): Promise<RouteResult>;
   /** A workstream in one of the user's own projects, as the web UI's Branch off… makes it. */
@@ -54,8 +101,8 @@ export interface CliLifecycle {
 
 /**
  * A shared handler's failure, as the CLI sees it: its error message, a code
- * the CLI can branch on, and a box's live projects when that is the reason.
- * Everything else in the body is dropped.
+ * the CLI can branch on, a box's live projects when that is the reason, and
+ * a resize's blockers. Everything else in the body is dropped.
  */
 export function cliErrorResult(result: RouteResult): RouteResult {
   const body = (result.body ?? {}) as { error?: unknown; code?: unknown; projects?: unknown };
@@ -68,6 +115,13 @@ export function cliErrorResult(result: RouteResult): RouteResult {
   if (Array.isArray(body.projects)) {
     out.projects = (body.projects as Array<{ id: string; name: string }>).map(p => ({ id: p.id, name: p.name }));
   }
+  // A busy box's resize refusal: what blocks it, and whether --force would go ahead.
+  const busy = result.body as { blockers?: unknown; forceable?: unknown } | null;
+  if (Array.isArray(busy?.blockers)) {
+    out.blockers = (busy!.blockers as Array<{ check: string; reason: string; forceable: boolean }>)
+      .map(b => ({ check: b.check, reason: b.reason, forceable: b.forceable }));
+  }
+  if (typeof busy?.forceable === 'boolean') out.forceable = busy.forceable;
   return { status: result.status, body: out };
 }
 
@@ -83,17 +137,94 @@ function badRequest(res: Response, error: string): void {
   res.status(400).json({ error, code: 'invalid_request' });
 }
 
+/**
+ * New session's space for the session a create starts (services/chatSpace.ts),
+ * as the web form sends it: a space name, or null for No space. Absent, the
+ * session gets its box's first grant at first use, as any other does.
+ */
+function chatSpaceField(body: unknown): { chatSpace?: string | null } | { error: string } {
+  const value = body && typeof body === 'object' ? (body as Record<string, unknown>).chatSpace : undefined;
+  if (value === undefined) return {};
+  if (value === null) return { chatSpace: null };
+  if (typeof value !== 'string' || !value.trim()) return { error: 'chatSpace must be a space name or null' };
+  return { chatSpace: value.trim() };
+}
+
 function stringField(body: unknown, key: string): string | null {
   const value = (body as Record<string, unknown> | undefined)?.[key];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+/** A `from`'s repository: a template's, a GitHub URL, or another project's (`<box>/<project>`). */
+async function repoUrlFrom(lifecycle: CliLifecycle, user: CliUser, from: string): Promise<{ repoUrl: string } | RouteResult> {
+  const start = resolveStartFrom(from);
+  if (start.ok) return { repoUrl: start.repoUrl };
+  // Template ids have no slash and repository URLs carry a scheme or `git@`,
+  // so `<box>/<project>` can only mean another project to start from.
+  const ref = parseAskRef(from);
+  if (!ref || ref.workstream) return { status: 400, body: { error: `${start.error}, or <box>/<project>`, code: 'invalid_request' } };
+  return lifecycle.projectRepoUrl(user, ref.box, ref.project);
+}
+
+/** The most repositories a project holds. */
+const MAX_FROMS = 8;
+
+/**
+ * `from` in a body: one source, or a list of them for a multi-repo project
+ * (`termag ask --new-box --from a --from b`); an empty list is none.
+ */
+function fromField(body: unknown): { froms: string[] } | { error: string } {
+  const value = (body as Record<string, unknown> | undefined)?.from;
+  if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) return { froms: [] };
+  const list = Array.isArray(value) ? value : [value];
+  if (!list.every(v => typeof v === 'string' && v.trim())) return { error: 'from must be a source, or a list of them' };
+  if (list.length > MAX_FROMS) return { error: `from takes at most ${MAX_FROMS} sources` };
+  return { froms: (list as string[]).map(v => v.trim()) };
+}
+
+/** Each `from`'s repository, in order, or the first refusal. */
+async function repoUrlsFrom(lifecycle: CliLifecycle, user: CliUser, froms: readonly string[]): Promise<{ repoUrls: string[] } | RouteResult> {
+  const repoUrls: string[] = [];
+  for (const from of froms) {
+    const source = await repoUrlFrom(lifecycle, user, from);
+    if (!('repoUrl' in source)) return source;
+    repoUrls.push(source.repoUrl);
+  }
+  return { repoUrls };
+}
+
 export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle, bearer: RequestHandler): void {
+  // `size`: small, medium or large. `from`: what the project made on it will
+  // start from (`project create --new-box --from`), resolved as POST
+  // /projects does, so the box gets that repository's size; a list of them
+  // for a multi-repo project, whose largest the box takes. `diskGiB`: the
+  // root disk (`--disk`), else the repositories' or the default.
   router.post('/boxes', bearer, asyncHandler(async (req, res) => {
     const name = stringField(req.body, 'name');
     if (!name) { badRequest(res, 'name required'); return; }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (body.size !== undefined && typeof body.size !== 'string') { badRequest(res, 'size must be a string'); return; }
+    const size = stringField(body, 'size') ?? undefined;
+    if (body.diskGiB !== undefined && typeof body.diskGiB !== 'number') { badRequest(res, 'diskGiB must be a number'); return; }
+    const diskGiB = body.diskGiB as number | undefined;
+    const purpose = parseCreatedFor(req.body);
+    if ('error' in purpose) { badRequest(res, purpose.error); return; }
     const { user, credential } = cliAuth(res);
-    send(res, await lifecycle.createBox(user, name, credential.kind === 'box' ? credential.boxId : null));
+    const from = fromField(body);
+    if ('error' in from) { badRequest(res, from.error); return; }
+    const sources = await repoUrlsFrom(lifecycle, user, from.froms);
+    if (!('repoUrls' in sources)) { send(res, sources); return; }
+
+    // The request, restated as the create input — one named field per line,
+    // each sent only when the CLI sent it, so a 1.x CLI's request makes
+    // exactly the createBox call its own shape did (cliLifecycle.test pins
+    // this shape field by field).
+    const input: CliCreateBoxInput = { name };
+    if (size !== undefined) input.size = size;
+    if (diskGiB !== undefined) input.diskGiB = diskGiB;
+    if (body.flavor !== undefined) input.flavor = body.flavor;
+    if (sources.repoUrls.length > 0) input.repoUrls = sources.repoUrls;
+    send(res, await lifecycle.createBox(user, input, credential.kind === 'box' ? credential.boxId : null, purpose.createdFor));
   }));
 
   // hibernate: the same rules as the web UI's (powerRequestError: a box
@@ -108,10 +239,59 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     send(res, await lifecycle.setBoxLifecycle(cliAuth(res).user, req.params.id, req.body));
   }));
 
+  // Keep running is a person saying they are using the box. A box's own
+  // credential (an agent on a box) can't say that, or an agent could keep
+  // every box of its owner up for good.
+  router.post('/boxes/:id/keep-running', bearer, asyncHandler(async (req, res) => {
+    const { user, credential } = cliAuth(res);
+    if (credential.kind === 'box') {
+      res.status(403).json({ error: 'Keep running needs your own sign-in (termag login), not a box credential', code: 'box_credential' });
+      return;
+    }
+    send(res, await lifecycle.keepBoxRunning(user, req.params.id));
+  }));
+
+  // A box's cost is its owner's to see, not an agent's on one of their boxes.
+  router.get('/boxes/cost', bearer, asyncHandler(async (_req, res) => {
+    const { user, credential } = cliAuth(res);
+    if (credential.kind === 'box') {
+      res.status(403).json({ error: "A box's cost needs your own sign-in (termag login), not a box credential", code: 'box_credential' });
+      return;
+    }
+    send(res, await lifecycle.boxCosts(user));
+  }));
+
   router.post('/boxes/:id/rename', bearer, asyncHandler(async (req, res) => {
     const name = stringField(req.body, 'name');
     if (!name) { badRequest(res, 'name required'); return; }
     send(res, await lifecycle.renameBox(cliAuth(res).user, req.params.id, name));
+  }));
+
+  // The New box pickers' sizes; `?repo=` once per repository the box is for.
+  router.get('/boxes/sizes', bearer, asyncHandler(async (req, res) => {
+    send(res, await lifecycle.boxSizes(cliAuth(res).user, req.query.repo));
+  }));
+
+  // Reading is harmless, so any credential of the owner's may: what Resize… shows.
+  router.get('/boxes/:id/resize', bearer, asyncHandler(async (req, res) => {
+    send(res, await lifecycle.resizeInfo(cliAuth(res).user, req.params.id));
+  }));
+
+  // A box's own credential may resize only a box it created, as for terminate:
+  // resizing stops the box, and an agent must not stop its own or another's.
+  router.post('/boxes/:id/resize', bearer, asyncHandler(async (req, res) => {
+    const size = stringField(req.body, 'size');
+    if (!size) { badRequest(res, 'size required (small, medium or large)'); return; }
+    const { user, credential } = cliAuth(res);
+    if (credential.kind === 'box' && (!credential.boxId || await lifecycle.boxParent(user, req.params.id) !== credential.boxId)) {
+      res.status(403).json({
+        error: "A box's own credentials can only resize a box they created; run `termag box resize` where you've run `termag login`",
+        code: 'forbidden',
+      });
+      return;
+    }
+    const force = (req.body as { force?: unknown } | undefined)?.force === true;
+    send(res, await lifecycle.resizeBox(user, req.params.id, { size, force }));
   }));
 
   router.delete('/boxes/:id', bearer, asyncHandler(async (req, res) => {
@@ -133,18 +313,21 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     const agent = stringField(req.body, 'agent');
     if (!boxId || !name) { badRequest(res, 'boxId and name required'); return; }
     if (!agent) { badRequest(res, 'agent required'); return; }
-    const from = stringField(req.body, 'from');
-    if (!from) { send(res, await lifecycle.createProject(cliAuth(res).user, { boxId, name, agent })); return; }
+    const purpose = parseCreatedFor(req.body);
+    if ('error' in purpose) { badRequest(res, purpose.error); return; }
+    // Only named when given, so a plain create passes what it always did.
+    const createdFor = purpose.createdFor ? { createdFor: purpose.createdFor } : {};
+    const from = fromField(req.body);
+    if ('error' in from) { badRequest(res, from.error); return; }
+    const space = chatSpaceField(req.body);
+    if ('error' in space) { badRequest(res, space.error); return; }
     const user = cliAuth(res).user;
-    const start = resolveStartFrom(from);
-    if (start.ok) { send(res, await lifecycle.createProject(user, { boxId, name, agent, repoUrl: start.repoUrl })); return; }
-    // Template ids have no slash and repository URLs carry a scheme or `git@`,
-    // so `<box>/<project>` can only mean another project to start from.
-    const ref = parseAskRef(from);
-    if (!ref || ref.workstream) { badRequest(res, `${start.error}, or <box>/<project>`); return; }
-    const source = await lifecycle.projectRepoUrl(user, ref.box, ref.project);
-    if (!('repoUrl' in source)) { send(res, source); return; }
-    send(res, await lifecycle.createProject(user, { boxId, name, agent, repoUrl: source.repoUrl }));
+    if (!from.froms.length) { send(res, await lifecycle.createProject(user, { boxId, name, agent, ...createdFor, ...space })); return; }
+    const sources = await repoUrlsFrom(lifecycle, user, from.froms);
+    if (!('repoUrls' in sources)) { send(res, sources); return; }
+    // Several sources: a multi-repo project holding exactly those repositories.
+    const repos = sources.repoUrls.length > 1 ? { repoUrls: sources.repoUrls } : { repoUrl: sources.repoUrls[0] };
+    send(res, await lifecycle.createProject(user, { boxId, name, agent, ...repos, ...createdFor, ...space }));
   }));
 
   router.post('/projects/:id/rename', bearer, asyncHandler(async (req, res) => {
@@ -176,11 +359,14 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
       badRequest(res, 'startFromOrigin must be true or false');
       return;
     }
+    const space = chatSpaceField(body);
+    if ('error' in space) { badRequest(res, space.error); return; }
     send(res, await lifecycle.createWorkstream(cliAuth(res).user, req.params.id, {
       name,
       ...(base ? { base } : {}),
       ...(agent ? { agent } : {}),
       ...(body.startFromOrigin === true ? { startFromOrigin: true } : {}),
+      ...space,
     }));
   }));
 

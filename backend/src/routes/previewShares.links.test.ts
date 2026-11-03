@@ -18,11 +18,11 @@ vi.mock('../services/agentRegistry', () => ({
 import { sendForProject } from '../services/agentRegistry';
 import { GithubApiError } from '../services/githubCredential';
 import type { PrFacts } from '../services/prReview';
-import { linkTokenFor, linkTokenHash, LINK_SHARE_DAYS } from '../services/previewShareRules';
+import { WEBAPP_REVIEWER_ACCOUNT, linkTokenFor, linkTokenHash, LINK_SHARE_DAYS } from '../services/previewShareRules';
 import { onPreviewShareEnded, registerGuestSocket, resetLiveGuests, type GuestShareContext, type PreviewShareStore, type ShareRow } from '../services/previewShares';
 import type { ShareGithub } from '../services/previewShareLinks';
 import {
-  createLinkShareFor, extendShareFor, installAutoPreviewShares, linkSharePath, previewLinkRouter, revokeViewerFor, saveSettingsFor, settingsFor, shareForGrantee,
+  createLinkShareFor, createShareFor, extendShareFor, installAutoPreviewShares, linkSharePath, previewLinkRouter, revokeViewerFor, saveSettingsFor, settingsFor, shareForGrantee,
   type PreviewShareRouteDeps,
 } from './previewShares';
 import { recordCreatedLink } from '../services/workstreamPrs';
@@ -38,7 +38,8 @@ function linkRow(over: Partial<ShareRow> = {}): ShareRow {
   return {
     id: 'clink00000000001', projectId: 'p1', workstreamId: 'ws1', ownerId: owner.id, audience: 'link', granteeId: null,
     originRecipe: { kind: 'webapp-dev-stack' }, expiresAt: new Date(NOW + LINK_SHARE_DAYS * 86400e3), revokedAt: null, endedAt: null, endedReason: null,
-    lastOpenedAt: null, createdAt: new Date(NOW), prRepo: 'example-org/webapp', prNumber: 42, prCommentId: null, prHeadOid: 'a'.repeat(40), ...over,
+    lastOpenedAt: null, createdAt: new Date(NOW), prRepo: 'example-org/webapp', prNumber: 42, prCommentId: null, prHeadOid: 'a'.repeat(40),
+    prHeadBranch: null, checkoutDir: null, ...over,
   };
 }
 
@@ -68,8 +69,9 @@ function fakeStore(initial: ShareRow[] = []) {
   const hashes = new Map<string, string>();
   const events: any[] = [];
   for (const r of initial) if (!r.endedAt) keys.set(r.workstreamId ?? `${r.projectId}:main`, r.id);
+  const opened: any[] = [];
   const store = {
-    rows, viewers, events, hashes,
+    rows, viewers, events, hashes, opened,
     guestContext: vi.fn(async (id: string, viewerId?: string): Promise<GuestShareContext | null> => {
       const s = rows.find(r => r.id === id);
       if (!s) return null;
@@ -80,7 +82,8 @@ function fakeStore(initial: ShareRow[] = []) {
         ...(viewerId !== undefined && s.audience === 'link' ? { viewerRow: viewers.get(`${id}:${viewerId}`) ?? null } : {}),
       };
     }),
-    prefs: { recipe: null as any, accountHint: null as string | null, prLinksEnabled: false, pathFilter: [] as string[] },
+    // A project whose owner never saved its settings: prLinksEnabled is null.
+    prefs: { recipe: null as any, accountHint: null as string | null, prLinksEnabled: null as boolean | null, pathFilter: [] as string[] },
     settings: vi.fn(async function (this: any) { return { ...store.prefs }; }),
     saveSettings: vi.fn(async (_p: string, next: any) => { store.prefs = { ...next }; return { ...store.prefs }; }),
     recordEvent: vi.fn(async (shareId: string, kind: string, opts?: any) => { events.push({ shareId, kind, ...opts }); }),
@@ -119,13 +122,44 @@ function fakeStore(initial: ShareRow[] = []) {
         active.endedAt = input.now; active.endedReason = 'superseded';
         ended = active;
       }
-      const share = linkRow({ id: `clink${String(rows.length + 1).padStart(11, '0')}`, workstreamId: input.workstreamId, prRepo: input.prRepo, prNumber: input.prNumber, prHeadOid: input.prHeadOid, expiresAt: input.expiresAt, originRecipe: input.recipe });
+      if (input.samePr) {
+        const same = rows.find(r => !r.endedAt && r.ownerId === input.ownerId && r.prRepo?.toLowerCase() === input.prRepo.toLowerCase() && r.prNumber === input.prNumber);
+        if (same) return { share: same, existing: true, ended: null };
+      }
+      const share = linkRow({
+        id: `clink${String(rows.length + 1).padStart(11, '0')}`, workstreamId: input.workstreamId, prRepo: input.prRepo, prNumber: input.prNumber, prHeadOid: input.prHeadOid,
+        expiresAt: input.expiresAt, originRecipe: input.recipe, prHeadBranch: input.prHeadBranch ?? null, checkoutDir: input.checkoutDir ?? null,
+      });
+      store.opened.push(input);
       rows.push(share);
       keys.set(input.linkKey, share.id);
       hashes.set(input.hashFor(share.id), share.id);
       return { share, existing: false, ended };
     }),
-    extend: vi.fn(async () => null),
+    extend: vi.fn(async (projectId: string, id: string, expiresAt: Date) => {
+      const s = rows.find(r => r.id === id && r.projectId === projectId && !r.endedAt);
+      if (!s) return null;
+      s.expiresAt = expiresAt;
+      return s;
+    }),
+    // Open links: a link share with no PR, renewed rather than made twice.
+    liveOpenLink: vi.fn(async ({ projectId, workstreamIds, now }: { projectId: string; workstreamIds: (string | null)[]; now: Date }) => rows.find(r => r.projectId === projectId
+      && r.audience === 'link' && !r.prRepo && r.prNumber === null && workstreamIds.includes(r.workstreamId) && !r.revokedAt && !r.endedAt && r.expiresAt.getTime() > now.getTime()) ?? null),
+    createOpenLink: vi.fn(async (input: any) => {
+      const share = linkRow({
+        id: `copen${String(rows.length + 1).padStart(11, '0')}`, workstreamId: input.workstreamId, prRepo: null, prNumber: null, prHeadOid: null,
+        originRecipe: input.recipe, expiresAt: input.expiresAt,
+      });
+      rows.push(share);
+      hashes.set(input.hashFor(share.id), share.id);
+      return share;
+    }),
+    renew: vi.fn(async (projectId: string, id: string, { recipe, expiresAt }: any) => {
+      const s = rows.find(r => r.id === id && r.projectId === projectId && !r.revokedAt && !r.endedAt);
+      if (!s) return null;
+      s.originRecipe = recipe; s.expiresAt = expiresAt;
+      return s;
+    }),
   };
   return store as typeof store & PreviewShareStore;
 }
@@ -141,6 +175,11 @@ function deps(over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), gi
     isCollaborator: vi.fn(async () => false),
     sharingOn: vi.fn(async () => true),
     prLinksOn: vi.fn(async () => true),
+    autoShareDefault: vi.fn(async () => false),
+    draftSharesOn: vi.fn(async () => false),
+    checkoutSharesOn: vi.fn(async () => false),
+    listWorkstreams: vi.fn(async () => [{ id: null, name: 'main' }, { id: 'ws1', name: 'feature-x' }]),
+    findCheckout: vi.fn(),
     ttlDefault: vi.fn(async () => 24),
     boxStatus: vi.fn(async () => 'ready'),
     notifyWake: vi.fn(async () => true),
@@ -176,7 +215,7 @@ describe('making a PR link share', () => {
     // Only the token's hash is kept, and the link is in the comment.
     expect(d.store.hashes.get(linkTokenHash(token))).toBe(body.id);
     expect(github.posted[0]).toContain(body.link);
-    expect(github.posted[0]).toContain('reviewer@example.com / example-password');
+    expect(github.posted[0]).toContain(WEBAPP_REVIEWER_ACCOUNT);
     expect(d.store.rows[0].prCommentId).toBe('9001');
   });
 
@@ -221,6 +260,17 @@ describe('making a PR link share', () => {
       expect(r, code).toMatchObject({ status: 409, body: { code } });
       expect(d.store.openLinkShare).not.toHaveBeenCalled();
     }
+  });
+
+  it('shares a draft when its repository allows drafts, asking only about a draft', async () => {
+    const draftsOn = vi.fn(async () => true);
+    const d = deps({ draftSharesOn: draftsOn }, fakeStore(), fakeGithub({ readPr: vi.fn(async () => facts({ isDraft: true })) }));
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', ask)).status).toBe(201);
+    expect(draftsOn).toHaveBeenCalledWith(owner, project.instance, 'example-org/webapp');
+    const ready = deps({ draftSharesOn: draftsOn });
+    draftsOn.mockClear();
+    expect((await createLinkShareFor(ready, asUser(owner), 'p1', ask)).status).toBe(201);
+    expect(draftsOn).not.toHaveBeenCalled();
   });
 
   it('refuses a project without a repository on record, a PR outside the orgs, and someone else\'s project', async () => {
@@ -308,6 +358,271 @@ describe('making a PR link share', () => {
   it('a link share is not extended: its PR decides', async () => {
     const d = deps({}, fakeStore([linkRow()]));
     expect(await extendShareFor(d, asUser(owner), 'p1', 'clink00000000001', { ttlHours: 168 })).toMatchObject({ status: 409, body: { code: 'link-share' } });
+  });
+});
+
+describe('an open link: the share dialog with nobody named', () => {
+  const openDeps = (over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), github = fakeGithub()) => deps({
+    openLinksOn: vi.fn(async () => true),
+    findWorkstream: vi.fn(async (_p: string, name: string) => (name === 'feature-x' ? { id: 'ws1' } : name === 'main' ? { id: null } : undefined)),
+    ...over,
+  }, store, github);
+
+  it('makes a link share with no PR for the dialog\'s lifetime, its link its token, and asks GitHub nothing', async () => {
+    const github = fakeGithub();
+    const d = openDeps({}, fakeStore(), github);
+    const r = await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x', ttlHours: 72 });
+    expect(r.status).toBe(201);
+    const body = r.body as any;
+    const token = linkTokenFor(SECRET, body.id);
+    expect(body).toMatchObject({ link: `/p/${token}`, linkPath: `/p/${token}`, ttlHours: 72, expiresAt: new Date(NOW + 72 * 3600e3).toISOString() });
+    expect(d.store.hashes.get(linkTokenHash(token))).toBe(body.id);
+    expect(d.store.rows[0]).toMatchObject({ audience: 'link', workstreamId: 'ws1', prRepo: null, prNumber: null, granteeId: null });
+    expect(d.store.events).toEqual([expect.objectContaining({ shareId: body.id, kind: 'created', actorId: owner.id, detail: { audience: 'link', ttlHours: 72 } })]);
+    expect(d.githubFor).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+  });
+
+  it('lets in whoever opens its link, once that made their viewer row, and nobody by its id alone', async () => {
+    const d = openDeps();
+    const id = ((await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' })).body as any).id;
+    expect(await shareForGrantee(d, asUser(viewer), id)).toMatchObject({ status: 404 });
+    await d.store.addViewer(id, viewer.id);
+    expect(await shareForGrantee(d, asUser(viewer), id)).toMatchObject({ status: 200, body: { state: 'active', pr: null } });
+    expect(await shareForGrantee(d, asUser(stranger), id)).toMatchObject({ status: 404 });
+  });
+
+  it('sharing by link again renews the workstream\'s open link, same link; a PR\'s link share there is another share', async () => {
+    const d = openDeps({}, fakeStore([linkRow()]));
+    const first = await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' });
+    expect(first.status).toBe(201);
+    const { id, link } = first.body as any;
+    expect(id).not.toBe('clink00000000001');
+    const again = await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x', ttlHours: 168 });
+    expect(again).toMatchObject({ status: 200, body: { id, link, renewed: true, expiresAt: new Date(NOW + 168 * 3600e3).toISOString() } });
+    // A shorter lifetime asked for now keeps the later end.
+    expect(await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x', ttlHours: 1 })).toMatchObject({ status: 200, body: { id, expiresAt: new Date(NOW + 168 * 3600e3).toISOString() } });
+    expect(d.store.rows).toHaveLength(2);
+    expect(d.store.rows[0].endedAt).toBeNull();
+  });
+
+  it('is extended like a share by name', async () => {
+    const d = openDeps();
+    const id = ((await createShareFor(d, asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' })).body as any).id;
+    expect(await extendShareFor(d, asUser(owner), 'p1', id, { ttlHours: 168 })).toMatchObject({ status: 200, body: { id, expiresAt: new Date(NOW + 168 * 3600e3).toISOString() } });
+  });
+
+  it('needs its own flag beside sharing\'s, and is never what a missing email means', async () => {
+    expect(await createShareFor(openDeps({ openLinksOn: vi.fn(async () => false) }), asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' }))
+      .toMatchObject({ status: 403, body: { code: 'open-links-disabled' } });
+    expect(await createShareFor(openDeps({ sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' }))
+      .toMatchObject({ status: 403, body: { code: 'preview-share-disabled' } });
+    const d = openDeps();
+    expect(await createShareFor(d, asUser(owner), 'p1', { workstream: 'feature-x' })).toMatchObject({ status: 400, body: { error: 'email is required' } });
+    // Naming someone and asking for a link is refused, never widened to everyone.
+    expect(await createShareFor(d, asUser(owner), 'p1', { audience: 'link', email: 'gus@x.test', workstream: 'feature-x' })).toMatchObject({ status: 400, body: { code: 'email-with-link' } });
+    expect(await createShareFor(d, asUser(owner), 'p1', { audience: 'link', email: '  ', workstream: 'feature-x' })).toMatchObject({ status: 201 });
+    d.store.rows.length = 0;
+    expect(await createShareFor(d, asUser(stranger), 'p1', { audience: 'link', workstream: 'feature-x' })).toMatchObject({ status: 404 });
+    expect(d.store.rows).toHaveLength(0);
+  });
+});
+
+describe('4d: a link share from the PR\'s own checkout', () => {
+  const olive = { ...owner, unixUsername: 'olive' } as User;
+  // webapp#76005's setup: the project's folder is another repository, and webapp lives in ~/src beside it.
+  const handbook = { ...project, name: 'Webapp', repoUrl: 'https://github.com/example-team/ffeld-termag' };
+  const src = '/home/olive/src/webapp';
+  const onMain = { workstream: 'main', repo: 'example-org/webapp', number: 42 };
+  const fromSrc = { ok: true as const, dir: src, realDir: src, workstream: null, repo: 'example-org/webapp', branch: 'feat/x', head: 'b'.repeat(40) };
+  const d4 = (over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), github: ShareGithub | null = fakeGithub()) => deps({
+    checkoutSharesOn: vi.fn(async () => true),
+    findOwnedProject: vi.fn(async (userId: string, id: string) => (userId === owner.id && id === 'p1' ? handbook : null)),
+    findUser: vi.fn(async (id: string) => (id === owner.id ? olive : [viewer, stranger].find(u => u.id === id) ?? null)),
+    findCheckout: vi.fn(async () => fromSrc),
+    ...over,
+  }, store, github);
+
+  it('shares a PR from ~/src/<repo> when the project\'s own checkout is another repository, keyed by box and directory', async () => {
+    const d = d4();
+    const r = await createLinkShareFor(d, asUser(owner), 'p1', onMain);
+    expect(r.status).toBe(201);
+    expect((r.body as any).checkoutDir).toBe(src);
+    expect(d.store.opened[0]).toMatchObject({ workstreamId: null, checkoutDir: src, prHeadBranch: 'feat/x', samePr: true, linkKey: expect.stringMatching(/^box:box-1:dir:[0-9a-f]{16}$/) });
+    expect(d.findCheckout).toHaveBeenCalledWith(expect.objectContaining({
+      host: { userId: owner.id, instanceId: 'box-1' }, home: '/home/olive', asking: '/home/olive/termag/projects/Webapp',
+      repo: 'example-org/webapp', branch: 'feat/x', headOid: 'b'.repeat(40),
+      candidates: [
+        { dir: '/home/olive/termag/projects/Webapp', workstream: { id: null, name: 'main' }, worktrees: true },
+        { dir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' }, worktrees: false },
+        { dir: src, workstream: null, worktrees: true },
+      ],
+    }));
+    // Without the flag, today's rule refuses it.
+    expect(await createLinkShareFor(d4({ checkoutSharesOn: vi.fn(async () => false) }), asUser(owner), 'p1', onMain)).toMatchObject({ status: 409, body: { code: 'other-repo' } });
+  });
+
+  it('looks in ~/src under GitHub\'s spelling of the name and in lowercase, and keys a symlinked one where it resolves', async () => {
+    const d = d4({ findCheckout: vi.fn(async () => ({ ...fromSrc, realDir: '/data/olive/webapp' })) }, fakeStore(), fakeGithub({ readPr: vi.fn(async () => facts({ repo: 'example-org/Webapp' })) }));
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', onMain)).status).toBe(201);
+    const { candidates } = (d.findCheckout as any).mock.calls[0][0];
+    expect(candidates.filter((c: any) => c.workstream === null).map((c: any) => c.dir)).toEqual(['/home/olive/src/Webapp', src]);
+    expect(d.store.opened[0].checkoutDir).toBe(src);
+    expect(d.store.opened[0].linkKey).not.toBe((await import('../services/prCheckout')).checkoutLinkKey({ userId: owner.id, instanceId: 'box-1' }, src));
+    expect(d.store.opened[0].linkKey).toBe((await import('../services/prCheckout')).checkoutLinkKey({ userId: owner.id, instanceId: 'box-1' }, '/data/olive/webapp'));
+  });
+
+  it('an asking workstream the list misses keeps its own row, so a match is never stored as the project\'s main', async () => {
+    const own = { ...fromSrc, dir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', realDir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' } };
+    const d = d4({ listWorkstreams: vi.fn(async () => [{ id: null, name: 'main' }]), findCheckout: vi.fn(async () => own) });
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', { ...onMain, workstream: 'feature-x' })).status).toBe(201);
+    expect((d.findCheckout as any).mock.calls[0][0].candidates[0]).toEqual({ dir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' }, worktrees: false });
+    expect(d.store.opened[0]).toMatchObject({ workstreamId: 'ws1', checkoutDir: null, linkKey: 'ws1' });
+  });
+
+  it('a match that is a workstream\'s own checkout is that workstream\'s share, as today', async () => {
+    const d = d4({ findCheckout: vi.fn(async () => ({ ...fromSrc, dir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' } })) });
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', onMain)).status).toBe(201);
+    expect(d.store.opened[0]).toMatchObject({ workstreamId: 'ws1', checkoutDir: null, linkKey: 'ws1' });
+  });
+
+  it('tells the owner which repository and branch it looked for, and where, when no checkout can be shared', async () => {
+    const looked = ['/home/olive/termag/projects/Webapp', src];
+    for (const reason of ['no-checkout', 'ambiguous-checkout', 'checkout-unreadable'] as const) {
+      const d = d4({ findCheckout: vi.fn(async () => ({ ok: false as const, reason, looked })) });
+      const r = await createLinkShareFor(d, asUser(owner), 'p1', onMain);
+      expect(r, reason).toMatchObject({ status: 409, body: { code: reason } });
+      expect((r.body as any).error).toContain('feat/x');
+      expect(d.store.openLinkShare).not.toHaveBeenCalled();
+    }
+    const none = d4({ findCheckout: vi.fn(async () => ({ ok: false as const, reason: 'no-checkout' as const, looked })) });
+    expect(((await createLinkShareFor(none, asUser(owner), 'p1', onMain)).body as any).error).toBe(
+      `This box has no checkout of example-org/webapp on feat/x, so there is no preview to share. It looked in /home/olive/termag/projects/Webapp, ${src}.`,
+    );
+  });
+
+  it('in a multi-repo project looks in each workstream\'s worktree of the PR\'s repository, and shares that directory', async () => {
+    const shop = { ...handbook, name: 'shop', repoUrl: null, repos: [{ name: 'web', url: 'https://github.com/acme/web.git' }, { name: 'webapp', url: 'https://github.com/example-org/webapp.git' }] };
+    const root = '/home/olive/termag/projects/shop';
+    const inWs = { ...fromSrc, dir: `${root}/.worktrees/feature-x/webapp`, realDir: `${root}/.worktrees/feature-x/webapp`, workstream: { id: 'ws1', name: 'feature-x' } };
+    const d = d4({ findOwnedProject: vi.fn(async () => shop), findCheckout: vi.fn(async () => inWs) });
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', { ...onMain, workstream: 'feature-x' })).status).toBe(201);
+    const asked = (d.findCheckout as any).mock.calls[0][0];
+    expect(asked.asking).toBe(`${root}/.worktrees/feature-x/webapp`);
+    expect(asked.candidates.filter((c: any) => c.workstream).map((c: any) => [c.dir, c.worktrees])).toEqual([
+      [`${root}/.worktrees/feature-x/webapp`, false], [`${root}/webapp`, true],
+    ]);
+    expect(d.store.opened[0]).toMatchObject({
+      workstreamId: 'ws1', checkoutDir: `${root}/.worktrees/feature-x/webapp`,
+      linkKey: (await import('../services/prCheckout')).checkoutLinkKey({ userId: owner.id, instanceId: 'box-1' }, `${root}/.worktrees/feature-x/webapp`),
+    });
+
+    // A PR of a repository the project does not hold: only ~/src is a candidate.
+    const other = d4({ findOwnedProject: vi.fn(async () => ({ ...shop, repos: [shop.repos[0]] })) });
+    await createLinkShareFor(other, asUser(owner), 'p1', onMain);
+    expect((other.findCheckout as any).mock.calls[0][0].candidates.every((c: any) => c.workstream === null)).toBe(true);
+  });
+
+  it('in a multi-repo project, a PR of a repository it holds follows the project\'s saved settings', async () => {
+    const shop = { ...handbook, name: 'shop', repoUrl: null, repos: [{ name: 'web', url: 'https://github.com/acme/web.git' }, { name: 'webapp', url: 'https://github.com/Example-Org/Webapp.git' }] };
+    const inWs = { ...fromSrc, dir: '/home/olive/termag/projects/shop/.worktrees/feature-x/webapp', realDir: '/home/olive/termag/projects/shop/.worktrees/feature-x/webapp', workstream: { id: 'ws1', name: 'feature-x' } };
+    const auto = (d: ReturnType<typeof deps>) => createLinkShareFor(d, asUser(owner), 'p1', { ...onMain, workstream: 'feature-x' }, { auto: true });
+
+    // The project's saved choice wins over the repository's default.
+    const off = d4({ findOwnedProject: vi.fn(async () => shop), autoShareDefault: vi.fn(async () => true), findCheckout: vi.fn(async () => inWs) });
+    off.store.prefs.prLinksEnabled = false;
+    expect(await auto(off)).toEqual({ status: 200, body: { skipped: 'off' } });
+
+    // Its path filter applies, and its reviewer hint goes on the comment.
+    const filtered = d4({ findOwnedProject: vi.fn(async () => shop), findCheckout: vi.fn(async () => inWs) });
+    filtered.store.prefs = { ...filtered.store.prefs, prLinksEnabled: true, pathFilter: ['internal/'] };
+    expect(await auto(filtered)).toEqual({ status: 200, body: { skipped: 'paths' } });
+    const github = fakeGithub();
+    const hinted = d4({ findOwnedProject: vi.fn(async () => shop), findCheckout: vi.fn(async () => inWs) }, fakeStore(), github);
+    hinted.store.prefs = { ...hinted.store.prefs, prLinksEnabled: true, accountHint: 'shop reviewer' };
+    expect((await auto(hinted)).status).toBe(201);
+    expect(github.posted[0]).toContain('shop reviewer');
+
+    // Before a first save, the PR's repository's default decides.
+    const unsaved = d4({ findOwnedProject: vi.fn(async () => shop), autoShareDefault: vi.fn(async () => true), findCheckout: vi.fn(async () => inWs) });
+    expect((await auto(unsaved)).status).toBe(201);
+    expect(unsaved.autoShareDefault).toHaveBeenCalledWith(olive, shop.instance, 'example-org/webapp');
+  });
+
+  it('an agent without the light form keeps today\'s rule', async () => {
+    const d = d4({ findCheckout: vi.fn(async () => ({ ok: false as const, reason: 'outdated-agent' as const, looked: [] })) });
+    expect(await createLinkShareFor(d, asUser(owner), 'p1', onMain)).toMatchObject({ status: 409, body: { code: 'other-repo' } });
+    // In the project's own repository on the workstream's branch, today's rule shares it.
+    const own = d4({ findOwnedProject: vi.fn(async () => project), findCheckout: vi.fn(async () => ({ ok: false as const, reason: 'outdated-agent' as const, looked: [] })) });
+    expect((await createLinkShareFor(own, asUser(owner), 'p1', ask)).status).toBe(201);
+    expect(own.store.opened[0]).toMatchObject({ workstreamId: 'ws1', checkoutDir: null, linkKey: 'ws1' });
+  });
+
+  it('asks GitHub first: a PR that could never be shared costs the box nothing', async () => {
+    for (const [over, code] of [[{ author: { login: 'gus', id: 8 } }, 'not-author'], [{ state: 'CLOSED' }, 'not-open'], [{ visibility: 'PUBLIC' }, 'public'], [{ crossRepo: true }, 'fork']] as [Partial<PrFacts>, string][]) {
+      const d = d4({}, fakeStore(), fakeGithub({ readPr: vi.fn(async () => facts(over)) }));
+      expect(await createLinkShareFor(d, asUser(owner), 'p1', onMain), code).toMatchObject({ status: 409, body: { code } });
+      expect(d.findCheckout).not.toHaveBeenCalled();
+    }
+  });
+
+  it('keeps a PR on its first live share, so it never gets a second comment', async () => {
+    const github = fakeGithub();
+    const store = fakeStore();
+    const first = await createLinkShareFor(d4({}, store, github), asUser(owner), 'p1', onMain);
+    const again = await createLinkShareFor(
+      d4({ findCheckout: vi.fn(async () => ({ ...fromSrc, dir: '/home/olive/termag/projects/Webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' } })) }, store, github),
+      asUser(owner), 'p1', { ...onMain, workstream: 'feature-x' },
+    );
+    expect(again).toMatchObject({ status: 200, body: { id: (first.body as any).id, existing: true } });
+    expect(github.posted).toHaveLength(1);
+  });
+
+  it('reads the draft flag for the PR\'s repository', async () => {
+    const draftsOn = vi.fn(async () => true);
+    const d = d4({ draftSharesOn: draftsOn }, fakeStore(), fakeGithub({ readPr: vi.fn(async () => facts({ isDraft: true })) }));
+    expect((await createLinkShareFor(d, asUser(owner), 'p1', onMain)).status).toBe(201);
+    expect(draftsOn).toHaveBeenCalledWith(olive, handbook.instance, 'example-org/webapp');
+  });
+
+  describe('automatic shares in another repository follow that repository\'s default alone (decision 16)', () => {
+    const auto = (d: ReturnType<typeof deps>) => createLinkShareFor(d, asUser(owner), 'p1', { ...onMain, repo: 'Example-Org/Webapp' }, { auto: true });
+
+    it('the repository\'s default decides, read lowercased, whatever the project saved', async () => {
+      const on = d4({ autoShareDefault: vi.fn(async () => true) });
+      on.store.prefs.prLinksEnabled = false;
+      expect((await auto(on)).status).toBe(201);
+      expect(on.autoShareDefault).toHaveBeenCalledWith(olive, handbook.instance, 'example-org/webapp');
+
+      const off = d4({ autoShareDefault: vi.fn(async () => false) });
+      off.store.prefs.prLinksEnabled = true;
+      expect(await auto(off)).toEqual({ status: 200, body: { skipped: 'off' } });
+    });
+
+    it('the project\'s path filter and reviewer hint stay with its own repository', async () => {
+      const github = fakeGithub();
+      const d = d4({ autoShareDefault: vi.fn(async () => true) }, fakeStore(), github);
+      d.store.prefs = { ...d.store.prefs, prLinksEnabled: true, pathFilter: ['docs/'], accountHint: 'handbook reviewer' };
+      expect((await auto(d)).status).toBe(201);
+      expect(github.posted[0]).not.toContain('handbook reviewer');
+      expect(github.posted[0]).toContain(WEBAPP_REVIEWER_ACCOUNT);
+    });
+
+    it('the label and the path filter skip a PR before the box is asked', async () => {
+      const labelled = d4({ autoShareDefault: vi.fn(async () => true) }, fakeStore(), fakeGithub({ readScope: vi.fn(async () => ({ labels: ['no-preview'], paths: ['static/a.ts'], complete: true })) }));
+      expect(await auto(labelled)).toEqual({ status: 200, body: { skipped: 'label' } });
+      expect(labelled.findCheckout).not.toHaveBeenCalled();
+      const filtered = d4({ findOwnedProject: vi.fn(async () => project) }, fakeStore(), fakeGithub());
+      filtered.store.prefs = { ...filtered.store.prefs, prLinksEnabled: true, pathFilter: ['internal/'] };
+      expect(await createLinkShareFor(filtered, asUser(owner), 'p1', ask, { auto: true })).toEqual({ status: 200, body: { skipped: 'paths' } });
+      expect(filtered.findCheckout).not.toHaveBeenCalled();
+    });
+
+    it('in the project\'s own repository, its saved choice still wins', async () => {
+      const own = d4({ findOwnedProject: vi.fn(async () => project), autoShareDefault: vi.fn(async () => true), findCheckout: vi.fn(async () => ({ ...fromSrc, dir: '/home/olive/termag/projects/webapp/.worktrees/feature-x', workstream: { id: 'ws1', name: 'feature-x' } })) });
+      own.store.prefs.prLinksEnabled = false;
+      expect(await createLinkShareFor(own, asUser(owner), 'p1', ask, { auto: true })).toEqual({ status: 200, body: { skipped: 'off' } });
+    });
   });
 });
 
@@ -409,6 +724,25 @@ describe('automatic shares of the PRs an owner opens (4c)', () => {
     expect(await auto(theirs)).toMatchObject({ status: 409, body: { code: 'not-author' } });
   });
 
+  it('before the owner saves, the repository\'s default decides; a saved choice wins over it', async () => {
+    const on = deps({ autoShareDefault: vi.fn(async () => true) });
+    expect((await auto(on)).status).toBe(201);
+    expect(on.autoShareDefault).toHaveBeenCalledWith(owner, project.instance, 'example-org/webapp');
+
+    const savedOff = deps({ autoShareDefault: vi.fn(async () => true) });
+    savedOff.store.prefs.prLinksEnabled = false;
+    expect(await auto(savedOff)).toEqual({ status: 200, body: { skipped: 'off' } });
+    expect(savedOff.autoShareDefault).not.toHaveBeenCalled();
+  });
+
+  it('shares a draft the moment it is opened when its repository allows drafts', async () => {
+    const draft = () => fakeGithub({ readPr: vi.fn(async () => facts({ isDraft: true })) });
+    const allowed = deps({ autoShareDefault: vi.fn(async () => true), draftSharesOn: vi.fn(async () => true) }, fakeStore(), draft());
+    expect((await auto(allowed)).status).toBe(201);
+    const refused = deps({ autoShareDefault: vi.fn(async () => true) }, fakeStore(), draft());
+    expect(await auto(refused)).toMatchObject({ status: 409, body: { code: 'draft' } });
+  });
+
   it('runs on the pr_created milestone, through the workstream link it records', async () => {
     const github = fakeGithub();
     const d = deps({}, fakeStore(), github);
@@ -440,6 +774,17 @@ describe('a project\'s preview settings (4c)', () => {
     for (const bad of [{ prLinksEnabled: 'yes' }, { pathFilter: 'a/../b' }, { reviewerAccountHint: 'a\nb' }, { recipe: { kind: 'manual', origins: ['example.com:80'] } }]) {
       expect((await saveSettingsFor(d, asUser(owner), 'p1', bad)).status, JSON.stringify(bad)).toBe(400);
     }
+  });
+
+  it('shows the repository\'s default until the first save, which keeps what the dialog showed', async () => {
+    const d = deps({ autoShareDefault: vi.fn(async () => true) });
+    expect((await settingsFor(d, asUser(owner), 'p1')).body).toMatchObject({ prLinksEnabled: true });
+    // Saving only the path filter keeps automatic shares on...
+    expect((await saveSettingsFor(d, asUser(owner), 'p1', { pathFilter: 'static/' })).body).toMatchObject({ prLinksEnabled: true, pathFilter: ['static/'] });
+    expect(d.store.prefs.prLinksEnabled).toBe(true);
+    // ...and from then on the saved choice holds, whatever the default says.
+    vi.mocked(d.autoShareDefault).mockResolvedValue(false);
+    expect((await settingsFor(d, asUser(owner), 'p1')).body).toMatchObject({ prLinksEnabled: true });
   });
 
   it('only the owner, and saving needs the flags', async () => {

@@ -17,6 +17,7 @@
 import { createHash, timingSafeEqual } from 'crypto';
 import type { OtlpDestination } from '../config/env';
 import type { OwnedBoxRow } from './ownedBoxRow';
+import { compareVersions } from './software/versions';
 
 export interface SpawnRequest {
   orderId: string;
@@ -102,6 +103,38 @@ export const CLAUDE_RUNNER_AUTO_USER_FLAG = 'claude-runner-auto-user-enabled';
  */
 export const WRAPPER_FLAGS_CAPABILITY = 'claude-runner-wrapper-v2';
 
+/**
+ * What a box's agent announces when its `termag-claude-runner` takes
+ * `--claude-floor <x.y.z>`: the
+ * wrapper then brings Claude Code up to the floor itself, or refuses the
+ * session, before the runner starts. A wrapper from before reads only its
+ * floor file, or has no guard at all.
+ */
+export const WRAPPER_FLOOR_CAPABILITY = 'claude-runner-wrapper-v3';
+
+/**
+ * The orchestrator's backstop on the Claude Code floor, for one box:
+ *   `pass`     the wrapper enforces the floor: send it as --claude-floor;
+ *   `too-old`  the box's inventory reads below the floor and its wrapper
+ *              cannot enforce it: no new runner there (claude-too-old), and
+ *              the box gets a floor run;
+ *   `ok`       anything else, a box with no inventory included (unknown is
+ *              not below).
+ * `enforce` is claude-code-update-enabled for the owner and the box: off,
+ * nothing is refused, as before the backstop.
+ */
+export type ClaudeFloorDecision =
+  | { kind: 'pass'; floor: string }
+  | { kind: 'too-old'; installed: string; floor: string }
+  | { kind: 'ok' };
+
+export function claudeFloorDecision(f: { floor: string; installed: string | null; wrapperFloor: boolean; enforce: boolean }): ClaudeFloorDecision {
+  if (f.wrapperFloor) return { kind: 'pass', floor: f.floor };
+  if (!f.enforce || !f.installed) return { kind: 'ok' };
+  const c = compareVersions(f.installed, f.floor);
+  return c !== null && c < 0 ? { kind: 'too-old', installed: f.installed, floor: f.floor } : { kind: 'ok' };
+}
+
 export interface CandidateBox {
   id: string;
   kind: string;
@@ -114,6 +147,8 @@ export interface CandidateBox {
   capable: boolean;
   /** The agent announced WRAPPER_FLAGS_CAPABILITY: the box can run Anthropic-managed git. */
   wrapperCapable?: boolean;
+  /** The agent announced WRAPPER_FLOOR_CAPABILITY: the wrapper takes --claude-floor. */
+  wrapperFloor?: boolean;
 }
 
 /**
@@ -275,11 +310,12 @@ export interface RunnerLaunch {
   /**
    * The session's only process (argv, no shell): it ends when the runner does.
    * `termag-claude-runner <order> <slot>`, then, when the orchestrator ships
-   * telemetry, `--otel-project <routing key> --otel-endpoint <url>`: where the
-   * session's own OpenTelemetry goes, and `--user-key <user id> --box-key
-   * <instance id>`, so the session's telemetry can be joined to the owner and
-   * the box; then, for a flagged owner on
-   * a capable box, `--anthropic-git` and `--github <state>` (RunnerGitOptions).
+   * telemetry, `--ld-project <client-side id> --otel-endpoint <url>`: where the
+   * session's own OpenTelemetry goes, and `--ld-user-key <user id> --ld-box-key <instance id>`, the
+   * flag context keys the browser's own telemetry carries, so the two
+   * join on `context.contextKeys.user` / `.box`; then, for a flagged owner on
+   * a capable box, `--anthropic-git` and `--github <state>` (RunnerGitOptions);
+   * then, for a wrapper that takes it, `--claude-floor <x.y.z>` (ClaudeFloorDecision).
    * A script from before the flags reads `$1 $2` and ignores them.
    */
   command: string[];
@@ -313,7 +349,7 @@ export interface RunnerGitOptions {
   github: GithubLaunchState;
 }
 
-export function runnerLaunch(hostHome: string, hostUnixUser: string, orderId: string, slot: number, telemetry: OtlpDestination | null = null, contextKeys: RunnerContextKeys | null = null, git: RunnerGitOptions | null = null): RunnerLaunch {
+export function runnerLaunch(hostHome: string, hostUnixUser: string, orderId: string, slot: number, telemetry: OtlpDestination | null = null, contextKeys: RunnerContextKeys | null = null, git: RunnerGitOptions | null = null, claudeFloor: string | null = null): RunnerLaunch {
   const home = hostHome.replace(/\/+$/, '');
   const stateDir = `${home}/.termag/claude-runner`;
   const routing = telemetry ? [
@@ -325,7 +361,7 @@ export function runnerLaunch(hostHome: string, hostUnixUser: string, orderId: st
     workOrderPath: `${stateDir}/${orderId}.work-order`,
     workOrderMode: 0o600,
     sessionName: runnerSessionName(hostUnixUser, slot, orderId),
-    command: [`${home}/.local/bin/termag-claude-runner`, orderId, String(slot), ...routing, ...gitFlags],
+    command: [`${home}/.local/bin/termag-claude-runner`, orderId, String(slot), ...routing, ...gitFlags, ...(claudeFloor ? ['--claude-floor', claudeFloor] : [])],
     cwd: stateDir,
     gitInit: false,
     slot,
@@ -464,6 +500,8 @@ export const REFUSAL_CODES = [
   'box-on-its-way', 'no-provisioning', 'box-creation-refused',
   // A box agent failed an RPC (502).
   'agent-list-failed', 'agent-launch-failed',
+  // The Claude Code floor's backstop: every box's Claude is below it.
+  'claude-too-old',
 ] as const;
 export type RefusalCode = typeof REFUSAL_CODES[number];
 
@@ -478,6 +516,8 @@ export const REFUSAL = {
   githubNotConnected: () => refusal('github', REFUSAL_TEXTS.github),
   noBox: () => refusal('no-box', REFUSAL_TEXTS.noBox),
   agentOutdated: () => refusal('agent-too-old', REFUSAL_TEXTS.agentTooOld),
+  /** Every box that could take the session runs a Claude Code below the floor its wrapper cannot enforce (ClaudeFloorDecision). */
+  claudeOutdated: () => refusal('claude-too-old', REFUSAL_TEXTS.claudeTooOld),
   boxesFull: (boxes: number, max: number) => refusal('boxes-full', REFUSAL_TEXTS.boxesFull(boxes, max)),
   /** The hook's curl gave up before the launch: nothing started, claimed or bought. */
   hookGone: (what: 'launch' | 'box') => refusal('hook-gave-up',
@@ -487,6 +527,9 @@ export const REFUSAL = {
   /** A ready box is still receiving the credentials a claim or a change started; the runner would copy a half-written settings file. */
   boxSettling: (name: string) => refusal('box-wait',
     `box "${name}" is still receiving its credentials; retried once they have landed`),
+  /** A box just claimed from the pool is updating to the orchestrator's commit (services/claimUpdate.ts). */
+  boxUpdating: (name: string) => refusal('box-wait',
+    `box "${name}" is updating after its claim; retried once it is done`),
   /** autoBoxPlan said a box failed within the hour; `reason` names it. */
   boxHold: (reason: string) => refusal('box-hold', reason),
   boxStarting: (verb: 'starting' | 'resuming', name: string) => refusal('box-starting',
@@ -536,6 +579,7 @@ export type GithubCredentialState = 'present' | 'absent' | 'unknown';
 export const REFUSAL_TEXTS = {
   github: 'the session owner has not connected GitHub in termag; paste `gh auth token` on the termag Credentials page, then the session is retried',
   agentTooOld: "the session owner's box runs a termag agent too old for cloud sessions; it is retried once the box's termag is updated",
+  claudeTooOld: "the session owner's box runs a Claude Code older than termag's floor, and its runner cannot update it; it is retried once the box's Claude Code is updated",
   noBox: 'no ready termag box with a connected agent for the session owner; start or add a box in termag',
   /** Carries counts: `every box of the session owner (2) already runs 3 cloud sessions; ...`. Matched by prefix. */
   boxesFullPrefix: 'every box of the session owner (',

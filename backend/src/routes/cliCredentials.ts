@@ -3,12 +3,13 @@
  * mounts this just ahead of cliApiRouter, before the cookie stack, and every
  * route takes cliApiRouter's own bearer check, so the same two credential
  * kinds reach them and anything else falls through to its 404. Reads are open
- * to both; the one write, storing the GitHub token, takes a device sign-in
- * only, so an agent on a box can never change its owner's credentials with the
- * box's own token. Adding an SSH key is web-only (routes/sshKeys.ts): a key
- * opens a shell on every box, so a CLI credential cannot add one. That was held
- * back until CLI sessions could be revoked; they can be now, and allowing it is
- * its own decision, not made yet. POST /ssh-keys gets the CLI API's 404.
+ * to both; the writes, storing the GitHub token and removing an SSH key, take
+ * a device sign-in only, so an agent on a box can never change its owner's
+ * credentials with the box's own token. Adding an SSH key is web-only
+ * (routes/sshKeys.ts): a key opens a shell on every box, so a CLI credential
+ * cannot add one. That was held back until CLI sessions could be revoked; they
+ * can be now, and allowing it is its own decision, not made yet. POST
+ * /ssh-keys gets the CLI API's 404.
  *
  * No response carries a token or a full public key.
  */
@@ -52,6 +53,14 @@ export function cliCredentialsRouter(deps: Pick<CliApiDeps, 'store' | 'jwt' | 'n
 
   router.get('/ssh-keys', bearer, asyncHandler(async (_req, res) => {
     res.json({ sshKeys: await credentials.listSshKeys(cliAuth(res).user.id) });
+  }));
+
+  // As the Settings page's Remove: `boxes` is which boxes took it out now,
+  // and which do when their agent next connects (null: termag couldn't check).
+  router.delete('/ssh-keys/:id', bearer, deviceOnly, asyncHandler(async (req, res) => {
+    const result = await credentials.removeSshKey(cliAuth(res).user.id, req.params.id);
+    if (result.kind === 'not_found') { res.status(404).json({ error: 'Key not found', code: 'ssh_key_not_found' }); return; }
+    res.json({ boxes: result.boxes });
   }));
 
   router.put('/github', bearer, deviceOnly, asyncHandler(async (req, res) => {

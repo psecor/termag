@@ -48,7 +48,7 @@ const parents: Record<string, string | null> = { 'i-child': 'i-devbox', 'i-other
 let sources: Record<string, { repoUrl: string } | RouteResult>;
 
 const lifecycle: CliLifecycle = {
-  async createBox(user, name, parent) { calls.push(['createBox', user.id, name, parent]); return next; },
+  async createBox(user, input, parent, createdFor) { calls.push(['createBox', user.id, input, parent, ...(createdFor ? [createdFor] : [])]); return next; },
   async boxParent(_user, id) { return parents[id]; },
   async projectRepoUrl(user, box, project) {
     calls.push(['projectRepoUrl', user.id, box, project]);
@@ -56,8 +56,13 @@ const lifecycle: CliLifecycle = {
   },
   async powerBox(user, id, action) { calls.push(['powerBox', user.id, id, action]); return next; },
   async setBoxLifecycle(user, id, settings) { calls.push(['setBoxLifecycle', user.id, id, settings]); return next; },
+  async keepBoxRunning(user, id) { calls.push(['keepBoxRunning', user.id, id]); return next; },
+  async boxCosts(user) { calls.push(['boxCosts', user.id]); return next; },
   async removeBox(user, id, confirmed) { calls.push(['removeBox', user.id, id, confirmed]); return next; },
   async renameBox(user, id, name) { calls.push(['renameBox', user.id, id, name]); return next; },
+  async resizeBox(user, id, input) { calls.push(['resizeBox', user.id, id, input]); return next; },
+  async resizeInfo(user, id) { calls.push(['resizeInfo', user.id, id]); return next; },
+  async boxSizes(user, repo) { calls.push(['boxSizes', user.id, repo]); return next; },
   async createProject(user, input) { calls.push(['createProject', user.id, input]); return next; },
   async renameProject(user, id, name) { calls.push(['renameProject', user.id, id, name]); return next; },
   async archiveProject(user, id) { calls.push(['archiveProject', user.id, id]); return next; },
@@ -115,7 +120,7 @@ describe('lifecycle routes', () => {
     await call('POST', '/projects/p1/clone/retry', BOX);
 
     expect(calls).toEqual([
-      ['createBox', 'alice', 'devbox', null],
+      ['createBox', 'alice', { name: 'devbox' }, null],
       ['powerBox', 'alice', 'i-devbox', 'stop'],
       ['powerBox', 'alice', 'i-devbox', 'start'],
       ['powerBox', 'alice', 'i-devbox', 'hibernate'],
@@ -135,6 +140,20 @@ describe('lifecycle routes', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: 'has_projects' });
     expect(calls).toEqual([['removeBox', 'alice', 'i-devbox', false]]);
+  });
+
+  it('forwards --minimal as the createBox option, defaulting to false', async () => {
+    next = ok(201, { box: { id: 'i-lean' }, claimed: false });
+    expect((await call('POST', '/boxes', DEVICE, { name: 'leanbox', flavor: 'minimal' })).status).toBe(201);
+    expect((await call('POST', '/boxes', DEVICE, { name: 'fullbox' })).status).toBe(201);
+    // Anything non-true reads as the default: a 1.x CLI asking a 2.x
+    // orchestrator, or a fuzzed value.
+    expect((await call('POST', '/boxes', DEVICE, { name: 'weird', flavor: 'yes' })).status).toBe(201);
+    expect(calls).toEqual([
+      ['createBox', 'alice', { name: 'leanbox', size: undefined, flavor: 'minimal' }, null],
+      ['createBox', 'alice', { name: 'fullbox', size: undefined }, null],
+      ['createBox', 'alice', { name: 'weird', size: undefined, flavor: 'yes' }, null],
+    ]);
   });
 
   it('refuse missing fields before calling a handler', async () => {
@@ -162,6 +181,17 @@ describe('lifecycle routes', () => {
       ['createProject', 'alice', { boxId: 'i-devbox', name: 'r', agent: 'claude', repoUrl: 'https://github.com/o/r' }],
       ['createProject', 'alice', { boxId: 'i-devbox', name: 'e', agent: 'claude' }],
     ]);
+  });
+
+  it('make a multi-repo project of a list of froms, and refuse a list longer than a project holds', async () => {
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'mr', agent: 'claude', from: ['termag', 'https://github.com/o/r'] });
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'one', agent: 'claude', from: ['https://github.com/o/r'] });
+    expect(calls).toEqual([
+      ['createProject', 'alice', { boxId: 'i-devbox', name: 'mr', agent: 'claude', repoUrls: ['https://github.com/psecor/termag.git', 'https://github.com/o/r'] }],
+      ['createProject', 'alice', { boxId: 'i-devbox', name: 'one', agent: 'claude', repoUrl: 'https://github.com/o/r' }],
+    ]);
+    const many = await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'x', agent: 'claude', from: Array(9).fill('termag') });
+    expect(many.status).toBe(400);
   });
 
   it('refuse a `from` that is neither a template, a GitHub URL nor <box>/<project>', async () => {
@@ -211,6 +241,27 @@ describe('workstream routes', () => {
     ]);
   });
 
+  it('pass New session\'s space through by name, or null for No space, and refuse anything else', async () => {
+    next = ok(201, { workstream: { id: 'w1' }, warnings: [] });
+    await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix', chatSpace: ' team ' });
+    await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix', chatSpace: null });
+    next = ok(201, { project: { id: 'p2' } });
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fix', agent: 'claude-chat', chatSpace: 'team' });
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fix', agent: 'claude-chat', chatSpace: null });
+    expect(calls).toEqual([
+      ['createWorkstream', 'alice', 'p1', { name: 'fix', chatSpace: 'team' }],
+      ['createWorkstream', 'alice', 'p1', { name: 'fix', chatSpace: null }],
+      ['createProject', 'alice', { boxId: 'i-devbox', name: 'fix', agent: 'claude-chat', chatSpace: 'team' }],
+      ['createProject', 'alice', { boxId: 'i-devbox', name: 'fix', agent: 'claude-chat', chatSpace: null }],
+    ]);
+    calls.length = 0;
+    for (const chatSpace of [7, '', '  ', true]) {
+      expect((await call('POST', '/projects/p1/workstreams', DEVICE, { name: 'fix', chatSpace })).status).toBe(400);
+      expect((await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fix', agent: 'claude', chatSpace })).status).toBe(400);
+    }
+    expect(calls).toEqual([]);
+  });
+
   it('refuse a missing name, an agent nobody offers, and fields of the wrong type', async () => {
     for (const body of [
       {},
@@ -246,7 +297,136 @@ describe('workstream routes', () => {
   });
 });
 
+describe('box create with a size and what its project starts from', () => {
+  it('passes the size through, and resolves --from to the repository the box is for', async () => {
+    sources = { 'devbox/web': { repoUrl: 'https://github.com/example-org/webapp' } };
+    next = ok(201, { box: { id: 'i-new' }, claimed: false });
+    await call('POST', '/boxes', DEVICE, { name: 'a', size: 'small' });
+    await call('POST', '/boxes', DEVICE, { name: 'b', from: 'https://github.com/example-org/webapp' });
+    await call('POST', '/boxes', DEVICE, { name: 'c', from: 'devbox/web', size: 'large' });
+    expect(calls).toEqual([
+      ['createBox', 'alice', { name: 'a', size: 'small' }, null],
+      ['createBox', 'alice', { name: 'b', repoUrls: ['https://github.com/example-org/webapp'] }, null],
+      ['projectRepoUrl', 'alice', 'devbox', 'web'],
+      ['createBox', 'alice', { name: 'c', size: 'large', repoUrls: ['https://github.com/example-org/webapp'] }, null],
+    ]);
+  });
+
+  it('resolves a list of froms, in order, for a box made for a multi-repo project', async () => {
+    sources = { 'devbox/web': { repoUrl: 'https://github.com/acme/web' } };
+    next = ok(201, { box: { id: 'i-new' }, claimed: false });
+    await call('POST', '/boxes', DEVICE, { name: 'mr', from: ['devbox/web', 'https://github.com/acme/api'] });
+    expect(calls).toEqual([
+      ['projectRepoUrl', 'alice', 'devbox', 'web'],
+      ['createBox', 'alice', { name: 'mr', repoUrls: ['https://github.com/acme/web', 'https://github.com/acme/api'] }, null],
+    ]);
+    const bad = await call('POST', '/boxes', DEVICE, { name: 'mr', from: ['ok', 3] });
+    expect(bad.status).toBe(400);
+  });
+
+  it('refuses a size that is not a string, and a from that names nothing, before creating anything', async () => {
+    const bad = await call('POST', '/boxes', DEVICE, { name: 'a', size: 2 });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ code: 'invalid_request' });
+    const nowhere = await call('POST', '/boxes', DEVICE, { name: 'a', from: 'not a repo' });
+    expect(nowhere.status).toBe(400);
+    const gone = await call('POST', '/boxes', DEVICE, { name: 'a', from: 'devbox/missing' });
+    expect(gone.status).toBe(404);
+    expect(calls).toEqual([['projectRepoUrl', 'alice', 'devbox', 'missing']]);
+  });
+});
+
+describe('box cost', () => {
+  it("answers a person's own sign-in, never a box's credential", async () => {
+    next = ok(200, { day: '2026-10-30', boxes: [{ id: 'i-devbox', todayUsd: 1.84 }] });
+    const res = await call('GET', '/boxes/cost', DEVICE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ boxes: [{ id: 'i-devbox', todayUsd: 1.84 }] });
+    const refused = await call('GET', '/boxes/cost', BOX);
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ code: 'box_credential' });
+    expect(calls).toEqual([['boxCosts', 'alice']]);
+  });
+});
+
+describe('box resize', () => {
+  it('passes the size and force through for a signed-in person', async () => {
+    next = ok(202, { box: { id: 'i-devbox' }, resize: { to: 'large', phase: 'stopping' } });
+    const res = await call('POST', '/boxes/i-devbox/resize', DEVICE, { size: 'large', force: true });
+    expect(res.status).toBe(202);
+    expect(calls).toEqual([['resizeBox', 'alice', 'i-devbox', { size: 'large', force: true }]]);
+  });
+
+  it('needs a size', async () => {
+    expect((await call('POST', '/boxes/i-devbox/resize', DEVICE, {})).status).toBe(400);
+    expect(calls).toEqual([]);
+  });
+
+  it("a box's own credential resizes only a box it created, never itself", async () => {
+    next = ok(202, { box: { id: 'i-child' } });
+    expect((await call('POST', '/boxes/i-child/resize', BOX, { size: 'medium' })).status).toBe(202);
+    for (const id of ['i-devbox', 'i-other']) {
+      const res = await call('POST', `/boxes/${id}/resize`, BOX, { size: 'medium' });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ code: 'forbidden' });
+    }
+    expect(calls).toEqual([['resizeBox', 'alice', 'i-child', { size: 'medium', force: false }]]);
+  });
+
+  it('reads what Resize… shows for any credential of the owner', async () => {
+    next = ok(200, { sizes: [{ size: 'large' }], blockers: [] });
+    for (const credential of [DEVICE, BOX]) {
+      const res = await call('GET', '/boxes/i-devbox/resize', credential);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ sizes: [{ size: 'large' }], blockers: [] });
+    }
+    expect(calls).toEqual([['resizeInfo', 'alice', 'i-devbox'], ['resizeInfo', 'alice', 'i-devbox']]);
+  });
+
+  it('reads the New box sizes for each repository asked about', async () => {
+    next = ok(200, { defaultSize: 'medium' });
+    const res = await call('GET', '/boxes/sizes?repo=https://github.com/a/b&repo=https://github.com/a/c', DEVICE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ defaultSize: 'medium' });
+    expect(calls).toEqual([['boxSizes', 'alice', ['https://github.com/a/b', 'https://github.com/a/c']]]);
+  });
+
+  it("a busy box's blockers reach the CLI", () => {
+    const blockers = [{ check: 'working', reason: 'an agent is working on it', forceable: true }];
+    expect(cliErrorResult({ status: 409, body: { error: 'busy', code: 'box_busy', blockers, forceable: true, extra: 1 } }))
+      .toEqual({ status: 409, body: { error: 'busy', code: 'box_busy', blockers, forceable: true } });
+  });
+});
+
+describe('box create with a disk', () => {
+  it('passes diskGiB through with the size and the repositories', async () => {
+    next = ok(201, { box: { id: 'i-new' }, claimed: false });
+    await call('POST', '/boxes', DEVICE, { name: 'a', diskGiB: 200 });
+    await call('POST', '/boxes', DEVICE, { name: 'b', size: 'large', diskGiB: 300, from: 'https://github.com/acme/api' });
+    expect(calls).toEqual([
+      ['createBox', 'alice', { name: 'a', diskGiB: 200 }, null],
+      ['createBox', 'alice', { name: 'b', size: 'large', diskGiB: 300, repoUrls: ['https://github.com/acme/api'] }, null],
+    ]);
+  });
+
+  it('refuses a diskGiB that is not a number before creating anything; the range is the create\'s to check', async () => {
+    const bad = await call('POST', '/boxes', DEVICE, { name: 'a', diskGiB: '200' });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ code: 'invalid_request' });
+    expect(calls).toEqual([]);
+  });
+});
+
 describe('box credentials', () => {
+  it('may not keep a box running: that is a person saying they are using it', async () => {
+    const res = await call('POST', '/boxes/i-devbox/keep-running', BOX);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'box_credential' });
+    expect(calls).toEqual([]);
+    expect((await call('POST', '/boxes/i-devbox/keep-running', DEVICE)).status).toBe(200);
+    expect(calls).toEqual([['keepBoxRunning', 'alice', 'i-devbox']]);
+  });
+
   it('may create, start, stop, rename, and manage projects and their workstreams', async () => {
     for (const [method, path, body] of [
       ['POST', '/boxes', { name: 'other' }],
@@ -262,7 +442,7 @@ describe('box credentials', () => {
       expect((await call(method, path, BOX, body)).status, `${method} ${path}`).toBe(200);
     }
     expect(calls).toHaveLength(9);
-    expect(calls[0]).toEqual(['createBox', 'alice', 'other', 'i-devbox']);
+    expect(calls[0]).toEqual(['createBox', 'alice', { name: 'other' }, 'i-devbox']);
   });
 
   it('may terminate a box they created', async () => {
@@ -305,5 +485,16 @@ describe('cliErrorResult', () => {
     expect(cliErrorResult({ status: 409, body: { error: 'no', code: 'provisioning_unconfigured' } }).body)
       .toEqual({ error: 'no', code: 'provisioning_unconfigured' });
     expect(cliErrorResult({ status: 500, body: null })).toEqual({ status: 500, body: { error: 'Request failed' } });
+  });
+
+  it('records that a box or project was made for asks, and refuses another purpose', async () => {
+    next = { status: 201, body: {} };
+    await call('POST', '/boxes', BOX, { name: 'askbox', createdFor: 'ask' });
+    await call('POST', '/projects', BOX, { boxId: 'i-askbox', name: 'termag-3', agent: 'claude', createdFor: 'ask' });
+    expect(calls).toEqual([
+      ['createBox', 'alice', { name: 'askbox' }, 'i-devbox', 'ask'],
+      ['createProject', 'alice', { boxId: 'i-askbox', name: 'termag-3', agent: 'claude', createdFor: 'ask' }],
+    ]);
+    expect((await call('POST', '/projects', BOX, { boxId: 'i-askbox', name: 'x', agent: 'claude', createdFor: 'fun' })).status).toBe(400);
   });
 });

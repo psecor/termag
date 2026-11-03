@@ -116,6 +116,20 @@ describe('the link share sweep', () => {
     expect(notifyOwner).not.toHaveBeenCalled();
   });
 
+  it('an open link has no PR to read: it ends only when it expires, and nobody is told', async () => {
+    const st = store([
+      row({ id: 'copen00000000001', prRepo: null, prNumber: null, prCommentId: null, prHeadOid: null }),
+      row({ id: 'copen00000000002', prRepo: null, prNumber: null, prCommentId: null, prHeadOid: null, expiresAt: new Date(NOW - 1) }),
+    ]);
+    const githubFor = vi.fn();
+    const notifyOwner = vi.fn();
+    const r = await runLinkShareSweep(NOW, { store: st, githubFor, notifyOwner });
+    expect(r).toEqual({ checked: 2, ended: { expired: 1 }, skipped: 0 });
+    expect(st.rows.map(x => x.endedReason)).toEqual([null, 'expired']);
+    expect(githubFor).not.toHaveBeenCalled();
+    expect(notifyOwner).not.toHaveBeenCalled();
+  });
+
   it('a stored PR that no longer parses ends the share, and its owner is told', async () => {
     const st = store([row({ prRepo: 'gone-org/webapp' })]);
     const notifyOwner = vi.fn(async () => {});

@@ -1,7 +1,7 @@
 /**
- * How many claimable warm boxes the pool holds: the number flag
+ * How many claimable warm boxes the single-size pool holds: the number flag
  * `box-warm-pool-size`, read for the pool's fixed context (POOL_FLAG_CONTEXT), so
- * the flag's one value is the size and no user target
+ * each environment's fallthrough is the size and no user target
  * can move it. Every replica evaluates the same context and so agrees on the
  * target, which the serializable insert in warmPool.ts re-checks anyway.
  *
@@ -15,6 +15,10 @@
  * under AUTH_MODE=local like the e2e stack's other overrides,
  * so a deployment cannot hold the pool size away from the flag through its
  * environment.
+ *
+ * Only the single-size pool reads it: sizes off for the pool, or
+ * box-warm-pool-sizes unset or malformed. When that flag serves an object,
+ * its counts are the pool and this one is not read (warmPoolSizes.ts).
  */
 import { numberVariationForContext } from './featureFlags';
 import { POOL_FLAG_CONTEXT } from './boxHibernationFlag';

@@ -17,7 +17,7 @@ vi.mock('../middleware/auth', () => ({
   requireAuthOrAgentToken: (req: { user?: unknown }, _res: unknown, next: () => void) => { req.user = { id: 'u1' }; next(); },
 }));
 
-const { prsRouter, loadPipeline, termagDeploys, pipelineNotes, limit, _resetPipelineMemos } = await import('./prs');
+const { prsRouter, loadPipeline, termagDeploys, pipelineNotes, limit, withJustOpened, _resetPipelineMemos } = await import('./prs');
 const { GithubApiError } = await import('../services/githubCredential');
 const { GithubRetryableError, GithubTimeoutError } = await import('../services/prPipelineGithub');
 const { deferredUntil } = await import('../services/prDeferrals');
@@ -392,6 +392,65 @@ describe('loadPipeline', () => {
   });
 });
 
+describe('PRs a session just opened (pr-live-updates-enabled)', () => {
+  const open = (number: number, author: string | null = 'me') => ({
+    repo: 'example-org/termag', number, title: `PR ${number}`, url: `https://github.com/example-org/termag/pull/${number}`, author,
+    isDraft: false, headRefName: `feat-${number}`, baseRefName: 'main', updatedAt: '2026-10-09T11:59:00Z', reviewDecision: null,
+    mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', autoMerge: false, checkRollup: null, checks: [], requestedReviewers: [],
+  });
+  const numbered = (pr: ReturnType<typeof open>) => ({
+    repo: pr.repo, number: pr.number, found: true, state: 'OPEN' as const, open: pr, title: pr.title, url: pr.url, author: pr.author,
+    headRefName: pr.headRefName, baseRefName: 'main', mergedAt: null, closedAt: null, yourReview: null, reviewers: null,
+  });
+  const rows = (got: Awaited<ReturnType<typeof loadPipeline>>) => got.lanes.flatMap(l => l.rows).map(r => r.number);
+
+  it("reads one the search doesn't have yet by number, so the first list after it opens has it", async () => {
+    const d = deps({
+      justOpened: vi.fn(async () => [{ repo: 'Example-Org/Termag', number: 931 }]),
+      byNumber: vi.fn(async () => [numbered(open(931))]),
+    });
+    const got = await loadPipeline('u1', TOKEN_A, d);
+    expect(d.justOpened).toHaveBeenCalledWith('u1', new Date('2026-10-09T11:50:00Z'));
+    expect(d.byNumber).toHaveBeenCalledWith(TOKEN_A, 'me', [{ repo: 'Example-Org/Termag', number: 931 }]);
+    expect(rows(got)).toEqual([931]);
+  });
+
+  it('asks GitHub nothing more once the search has it, or when nothing was just opened', async () => {
+    const d = deps({
+      search: vi.fn(async () => ({ viewer: 'me', authored: [open(931)], reviewRequested: [], merged: [], truncated: [] })),
+      justOpened: vi.fn(async () => [{ repo: 'example-org/termag', number: 931 }]),
+      byNumber: vi.fn(async () => []),
+    });
+    expect(rows(await loadPipeline('u1', TOKEN_A, d))).toEqual([931]);
+    const none = deps({ justOpened: vi.fn(async () => []), byNumber: vi.fn(async () => []) });
+    await loadPipeline('u1', TOKEN_A, none);
+    expect(d.byNumber).not.toHaveBeenCalled();
+    expect(none.byNumber).not.toHaveBeenCalled();
+  });
+
+  it("adds only the viewer's own open PRs, and nothing when the read fails", async () => {
+    const search = { viewer: 'Me', authored: [], reviewRequested: [], merged: [], truncated: [] };
+    const refs = [{ repo: 'example-org/termag', number: 1 }, { repo: 'example-org/termag', number: 2 }, { repo: 'example-org/termag', number: 3 }];
+    const merged = { ...numbered(open(3)), state: 'MERGED' as const, open: null };
+    const got = await withJustOpened(search, refs, TOKEN_A, { byNumber: async () => [numbered(open(1, 'me')), numbered(open(2, 'someone')), merged] });
+    expect(got.authored.map(p => p.number)).toEqual([1]);
+    const failed = await withJustOpened(search, refs, TOKEN_A, { byNumber: async () => { throw new Error('502'); } });
+    expect(failed).toBe(search);
+  });
+
+  it("reads none outside the orgs the search lists, which would show for ten minutes and then go", async () => {
+    const byNumber = vi.fn(async () => []);
+    const search = { viewer: 'me', authored: [], reviewRequested: [], merged: [], truncated: [] };
+    await withJustOpened(search, [{ repo: 'jonnyd/dotfiles', number: 3 }, { repo: 'Example-Team/team-tools', number: 4 }], TOKEN_A, { byNumber });
+    expect(byNumber).toHaveBeenCalledWith(TOKEN_A, 'me', [{ repo: 'Example-Team/team-tools', number: 4 }]);
+  });
+
+  it('a failed lookup of the just-opened PRs costs the list nothing', async () => {
+    const got = await loadPipeline('u1', TOKEN_A, deps({ justOpened: vi.fn(async () => { throw new Error('db down'); }), byNumber: vi.fn(async () => []) }));
+    expect(rows(got)).toEqual([]);
+  });
+});
+
 describe('termagDeploys', () => {
   it('compares box commits only for a box-side merge that is already in prod', async () => {
     const contains = vi.fn(async (_t: string, _r: string, running: string) => running === PROD);
@@ -558,7 +617,7 @@ describe('workstream links', () => {
   it('sends the stored links no lane lists as earlier PRs', async () => {
     await send('PUT', '/prs/links', { repo: 'example-org/termag', number: 41, projectId: 'p1', workstream: 'termag-pr-dash' });
     const body = await (await get('/prs')).json();
-    expect(body.earlier).toEqual([{ repo: 'example-org/termag', number: 41, workstream: WS_LINK, at: null }]);
+    expect(body.earlier).toEqual([{ repo: 'example-org/termag', number: 41, workstream: WS_LINK, at: null, source: 'manual' }]);
   });
   it('still answers the lanes when the links cannot be read', async () => {
     current.links.list = vi.fn(async () => { throw new Error('db down'); });

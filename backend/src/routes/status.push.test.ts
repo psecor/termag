@@ -7,6 +7,7 @@ import { getAllNotificationTargets } from '../slack/lts';
 import { getSlackApp } from '../slack/app';
 import { pushOnWaitingTransition, waitingChatMuted } from '../services/pushWaiting';
 import type { AgentStatus } from '../types/index';
+import { prisma } from '../db';
 
 // The `web` target in POST /api/status: the push decision
 // sees the status from BEFORE the write, runs whether or not the hook asked
@@ -88,5 +89,16 @@ describe('POST /api/status → web push', () => {
     await post({ session: 'alice-cx-agent', status: 'idle', notify: true });
     expect(waitingChatMuted).not.toHaveBeenCalled();
     expect(pushOnWaitingTransition).toHaveBeenCalledWith(expect.objectContaining({ prev: 'working', next: 'idle' }));
+  });
+});
+
+describe('POST /api/status → project lastActiveAt', () => {
+  afterEach(() => vi.clearAllMocks());
+
+  it('touches the project when an agent or a Review pane starts working', async () => {
+    for (const session of ['alice-cx-agent', 'alice-cx-review', 'alice-cx-review-3']) {
+      await post({ session, status: 'working' });
+    }
+    expect(vi.mocked(prisma.project.updateMany).mock.calls.map(c => (c[0] as { where: { name: string } }).where.name)).toEqual(['cx', 'cx', 'cx']);
   });
 });

@@ -14,7 +14,7 @@
 import type { AutomationRun } from '@prisma/client';
 import { sendForProject } from '../agentRegistry';
 import { getSlackApp } from '../../slack/app';
-import { findSecretsInText } from '../askPublish';
+import { findSecretsInText } from '../secretPatterns';
 import { slackEscape, webBase, sessionLink } from '../briefing/slack';
 
 export interface BranchSummary {

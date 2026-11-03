@@ -15,28 +15,14 @@
  * decryption matches the ARN recorded with the data key, never an alias.
  */
 
-import {
-  AlgorithmSuiteIdentifier,
-  buildClient,
-  CommitmentPolicy,
-  KmsKeyringNode,
-  type KeyringNode,
-} from '@aws-crypto/client-node';
+import type { KeyringNode } from '@aws-crypto/client-node';
 import { prisma } from '../db';
 import { githubLabel } from './githubCredential';
 import { publicOrgStatuses, type OrgAccess } from './githubRepos';
+import { KMS_KEY_ARN, kmsKeyring, openBytes, sealBytes } from './sealedMessages';
 
 export const CREDENTIAL_PURPOSE = 'termag-user-credential';
-const KEY_ARN = /^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/[A-Za-z0-9-]+$/;
 const PROVIDER = /^[a-z][a-z0-9-]{0,31}$/;
-// Without signing: the one role that decrypts is also the one that encrypts,
-// so a signature would prove nothing a GCM tag doesn't.
-const SUITE = AlgorithmSuiteIdentifier.ALG_AES256_GCM_IV12_TAG16_HKDF_SHA512_COMMIT_KEY;
-
-const { encrypt, decrypt } = buildClient({
-  commitmentPolicy: CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
-  maxEncryptedDataKeys: 1,
-});
 
 export interface CredentialStoreConfig {
   kmsKeyArn: string;
@@ -49,7 +35,7 @@ let warnedNotArn = false;
 export function getCredentialStoreConfig(env: NodeJS.ProcessEnv = process.env): CredentialStoreConfig | null {
   const kmsKeyArn = env.CREDENTIAL_STORE_KMS_KEY_ID?.trim();
   if (!kmsKeyArn) return null;
-  if (!KEY_ARN.test(kmsKeyArn)) {
+  if (!KMS_KEY_ARN.test(kmsKeyArn)) {
     if (!warnedNotArn) {
       console.warn('[CRED] CREDENTIAL_STORE_KMS_KEY_ID must be a KMS key ARN (not an alias or key id); the credential store is off');
       warnedNotArn = true;
@@ -65,34 +51,19 @@ export function encryptionContextFor(userId: string, provider: string): Record<s
   return { purpose: CREDENTIAL_PURPOSE, userId, provider };
 }
 
-const kmsKeyrings = new Map<string, KeyringNode>();
-
 function keyringFor(cfg: CredentialStoreConfig): KeyringNode {
-  if (cfg.keyring) return cfg.keyring;
-  let keyring = kmsKeyrings.get(cfg.kmsKeyArn);
-  if (!keyring) {
-    keyring = new KmsKeyringNode({ generatorKeyId: cfg.kmsKeyArn });
-    kmsKeyrings.set(cfg.kmsKeyArn, keyring);
-  }
-  return keyring;
+  return cfg.keyring ?? kmsKeyring(cfg.kmsKeyArn);
 }
 
 export async function sealCredential(cfg: CredentialStoreConfig, userId: string, provider: string, value: unknown): Promise<Buffer> {
-  const { result } = await encrypt(keyringFor(cfg), Buffer.from(JSON.stringify(value), 'utf8'), {
-    encryptionContext: encryptionContextFor(userId, provider),
-    suiteId: SUITE,
-  });
-  return result;
+  return sealBytes(keyringFor(cfg), Buffer.from(JSON.stringify(value), 'utf8'), encryptionContextFor(userId, provider));
 }
 
 export async function openCredential(cfg: CredentialStoreConfig, userId: string, provider: string, ciphertext: Uint8Array): Promise<unknown> {
-  const expected = encryptionContextFor(userId, provider);
-  const { plaintext, messageHeader } = await decrypt(keyringFor(cfg), Buffer.from(ciphertext));
-  const actual = messageHeader.encryptionContext;
-  const keys = Object.keys(actual);
-  if (keys.length !== Object.keys(expected).length || keys.some(k => actual[k] !== expected[k])) {
-    throw new Error(`stored ${provider} credential was not encrypted for this user and provider`);
-  }
+  const plaintext = await openBytes(
+    keyringFor(cfg), ciphertext, encryptionContextFor(userId, provider),
+    `stored ${provider} credential was not encrypted for this user and provider`,
+  );
   return JSON.parse(plaintext.toString('utf8'));
 }
 
@@ -213,16 +184,18 @@ export interface GithubCredentialSnapshot {
   readonly secret: GithubSecret;
   /** Ciphertext of the row that was read. A later write matches this and does not insert. */
   readonly ciphertext: Buffer;
+  /** When the row was last written: a connect, or a recheck that changed it. Delivered to boxes, so a replaced token is told from a redelivered one. */
+  readonly updatedAt: Date;
 }
 
 async function readGithubSnapshot(cfg: CredentialStoreConfig, userId: string): Promise<GithubCredentialSnapshot | null> {
   const row = await prisma.userCredential.findUnique({
     where: { userId_provider: { userId, provider: 'github' } },
-    select: { ciphertext: true },
+    select: { ciphertext: true, updatedAt: true },
   });
   if (!row) return null;
   const secret = await openCredential(cfg, userId, 'github', row.ciphertext) as GithubSecret;
-  return { secret, ciphertext: Buffer.from(row.ciphertext) };
+  return { secret, ciphertext: Buffer.from(row.ciphertext), updatedAt: row.updatedAt };
 }
 
 /**

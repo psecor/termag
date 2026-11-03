@@ -9,6 +9,7 @@ import { asyncHandler } from '../../middleware/errors';
 import { requireAdminSession } from '../../middleware/admin';
 import { parseRange } from '../../services/admin/range';
 import { parseConfig, parsePools, parsePrices } from '../../services/admin/spend/config';
+import { boxCostReport } from '../../services/boxCost/report';
 import { getSpendConfig, saveSpendConfig, spendReport, spendTrendReport, TREND_MAX_WEEKS } from '../../services/admin/spend/queries';
 
 export function spendRouter(): Router {
@@ -26,6 +27,13 @@ export function spendRouter(): Router {
     const weeks = raw === undefined || raw === '' ? 12 : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN;
     if (!(weeks >= 1 && weeks <= TREND_MAX_WEEKS)) { res.status(400).json({ error: `weeks must be 1 to ${TREND_MAX_WEEKS}` }); return; }
     res.json(await spendTrendReport(weeks));
+  }));
+
+  // What the AWS boxes cost, from the box meter's hours.
+  router.get('/spend/boxes', asyncHandler(async (req, res) => {
+    const range = parseRange(req.query as Record<string, unknown>);
+    if ('error' in range) { res.status(400).json({ error: range.error }); return; }
+    res.json(await boxCostReport(range));
   }));
 
   router.get('/spend/config', asyncHandler(async (_req, res) => { res.json(await getSpendConfig()); }));

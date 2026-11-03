@@ -11,6 +11,7 @@ const size = vi.hoisted(() => ({ value: 5 }));
 vi.mock('./featureFlags', () => ({
   boolVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: boolean) => fallback),
   numberVariationForContext: vi.fn(async () => size.value),
+  stringVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: string) => fallback),
 }));
 
 const terminateBox = vi.hoisted(() => vi.fn());
@@ -25,6 +26,7 @@ vi.mock('./boxProvisioner', () => ({
   terminateBox,
 }));
 vi.mock('./warmPoolClaim', () => ({ resendStalledClaims: vi.fn(async () => {}) }));
+vi.mock('./claimUpdate', () => ({ expireStaleClaimUpdates: vi.fn(async () => {}) }));
 
 type Row = { id: string; status: string; userId: string | null; poolSpecHash: string; createdAt: Date; warmedAt: Date | null; lastConnectedAt: Date | null; agentDisconnectedAt: Date | null; provisioningError: null };
 const db = vi.hoisted(() => ({ rows: [] as Row[] }));
@@ -75,7 +77,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   resetPoolSpecCache();
-  hash = await currentPoolSpecHash();
+  hash = await currentPoolSpecHash(null);
   size.value = 5;
   db.rows = [];
 });

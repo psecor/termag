@@ -8,28 +8,12 @@ import { targetBoxCommit } from '../boxUpdate';
 import { newestOrchestratorImage } from '../prDeploy';
 import { termagVersion } from '../termagVersion';
 import { collectorStatus } from './collector';
+import { isOnline, short, summarize, type Cell, type HostRow } from './summary';
 import {
-  COMMIT_COMPONENTS, commitState, hooksState, termagReference, newestVersion, sortComponents, toolState, compareVersions, type SoftwareState,
+  COMMIT_COMPONENTS, commitState, hooksState, termagReference, newestVersion, sortComponents, toolState, type SoftwareState,
 } from './versions';
 
-export interface Cell { version: string | null; raw: string | null; path: string | null; state: SoftwareState; observedAt: string }
-export interface HostRow {
-  hostKey: string; kind: 'orchestrator' | 'box' | 'agent'; name: string; owner: string | null;
-  boxKind: string | null; status: string | null; connected: boolean; lastInventoryAt: string | null;
-  cells: Record<string, Cell>;
-}
-export interface ComponentSummary {
-  component: string;
-  /** What a current host runs: a version, or a commit sha for termag and images. */
-  reference: string | null;
-  referenceNote: string;
-  counts: Record<SoftwareState, number>;
-  /** Versions seen, most common first. */
-  spread: Array<{ version: string; hosts: number }>;
-}
-
-const EMPTY_COUNTS = (): Record<SoftwareState, number> => ({ current: 0, behind: 0, outdated: 0, ahead: 0, missing: 0, unknown: 0 });
-const short = (s: string | null | undefined) => (s ? s.slice(0, 12) : null);
+export type { Cell, HostRow, ComponentSummary } from './summary';
 
 export async function softwareMatrix() {
   const [rows, boxes, agentUsers, boxTarget, orchImage, running] = await Promise.all([
@@ -73,30 +57,21 @@ export async function softwareMatrix() {
     return { ...h, lastInventoryAt: inv.length ? new Date(Math.max(...inv)).toISOString() : null, cells };
   });
 
-  const summary: ComponentSummary[] = components.map(c => {
-    const counts = EMPTY_COUNTS();
-    const spread = new Map<string, number>();
-    for (const h of hostList) {
-      const cell = h.cells[c];
-      if (!cell) continue;
-      counts[cell.state]++;
-      const v = COMMIT_COMPONENTS.has(c) ? short(cell.version) : cell.version;
-      if (v) spread.set(v, (spread.get(v) ?? 0) + 1);
-    }
-    const reference = COMMIT_COMPONENTS.has(c) ? null : c === 'hooks' ? 'current' : toolRef.get(c) ?? null;
-    const referenceNote = c === 'termag' || c === 'image'
+  const reference = (c: string) => ({
+    reference: COMMIT_COMPONENTS.has(c) ? null : c === 'hooks' ? 'current' : toolRef.get(c) ?? null,
+    referenceNote: c === 'termag' || c === 'image'
       ? `boxes: ${boxTarget ? `newest box image ${short(boxTarget)}` : `no box image known, so the orchestrator's running ${short(running.sha) ?? 'commit'}`} · orchestrator and its agents: ${orchImage?.sha ? `newest orchestrator image ${short(orchImage.sha)}` : `no image known, so its running ${short(running.sha) ?? 'commit'}`}`
       : c === 'termag-checkout' ? 'each host\'s running commit: a different checkout means pulled but not restarted'
       : c === 'hooks' ? 'the last box update\'s Claude hooks step'
-      : 'the newest version anywhere in the fleet';
-    return {
-      component: c, reference, referenceNote, counts,
-      spread: [...spread].map(([version, hosts]) => ({ version, hosts })).sort((a, b) => b.hosts - a.hosts || (compareVersions(b.version, a.version) ?? 0)),
-    };
+      : 'the newest version anywhere in the fleet',
   });
+  const summary = summarize(components, hostList, reference);
+  const onlineHosts = hostList.filter(isOnline);
 
   return {
     components, summary, hosts: hostList,
+    // The same counts without offline hosts, for the tab's "exclude offline hosts" (on by default).
+    online: { summary: summarize(components, onlineHosts, reference), offline: hostList.length - onlineHosts.length },
     targets: { boxCommit: boxTarget, orchestratorImageCommit: orchImage?.sha ?? null, runningCommit: running.sha },
     collector: collectorStatus(),
     generatedAt: new Date().toISOString(),

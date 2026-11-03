@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "prebuild": "prisma generate --no-hints",
     "build": "tsc",
     "start": "node dist/index.js",
+    "pretest": "prisma generate --no-hints",
     "test": "vitest run",
     "test:watch": "vitest",
     "db:generate": "prisma generate",
@@ -12,10 +14,12 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:push": "node dist/scripts/dbPush.js",
     "db:guard": "node dist/scripts/dbGuard.js",
+    "automations:move-folders": "node dist/scripts/moveAutomationFolders.js",
     "push:vapid": "node -e \"const k=require('web-push').generateVAPIDKeys();console.log('VAPID_PUBLIC_KEY='+k.publicKey+'\\\\nVAPID_PRIVATE_KEY='+k.privateKey+'\\\\nVAPID_SUBJECT=mailto:you@example.com')\""
   },
   "dependencies": {
     "@aws-crypto/client-node": "^5.0.2",
+    "@aws-sdk/client-cost-explorer": "^3.1152.0",
     "@aws-sdk/client-ec2": "^3.1056.0",
     "@aws-sdk/client-iam": "^3.1056.0",
     "@aws-sdk/client-kms": "^3.1146.0",
@@ -28,11 +32,21 @@
     "@modelcontextprotocol/sdk": "^1.32.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.223.0",
+    "@opentelemetry/core": "2.12.0",
     "@opentelemetry/exporter-logs-otlp-http": "^0.223.0",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.223.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.0",
+    "@opentelemetry/instrumentation": "0.223.0",
+    "@opentelemetry/instrumentation-aws-sdk": "0.78.0",
+    "@opentelemetry/instrumentation-express": "0.71.1",
+    "@opentelemetry/instrumentation-http": "0.223.0",
+    "@opentelemetry/instrumentation-pg": "0.76.0",
+    "@opentelemetry/instrumentation-undici": "0.33.0",
     "@opentelemetry/resources": "^2.12.0",
     "@opentelemetry/sdk-logs": "^0.223.0",
     "@opentelemetry/sdk-metrics": "^2.12.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
+    "@opentelemetry/sdk-trace-node": "2.12.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "@prisma/adapter-pg": "^5.22.0",
     "@prisma/client": "^5.10.0",
@@ -70,6 +84,7 @@
     "@types/ws": "^8.5.10",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "yaml": "2.9.0"
   }
 }

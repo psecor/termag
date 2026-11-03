@@ -8,7 +8,10 @@
  *   haiku  Claude Haiku 4.5   us.anthropic.claude-haiku-4-5-20251001-v1:0
  * Claude Code accepts `--model opus|sonnet|haiku` and resolves each alias
  * through ANTHROPIC_DEFAULT_*_MODEL, which the gateway settings set to those
- * profiles. It also accepts the profile id itself.
+ * profiles. It also accepts the profile id itself. Off the gateway (its owner
+ * turned "Claude through the termag gateway" off, or the box ran
+ * `termag-credentials skip claude-gateway`) Claude Code talks to Anthropic's
+ * own API, which knows only the alias: a profile id there fails every turn.
  *
  * There is no Auto: it was never a router termag owns, only an omitted
  * `--model` flag that let Claude Code fall back to its own default. Every
@@ -46,12 +49,15 @@ export function resolvedChatTier(stored: unknown): ClaudeChatTier {
 
 /**
  * The `--model` argument for a chat turn, always a concrete tier: when the
- * gateway is configured, its pinned profile id, which is what the gateway
- * allowlist accepts; otherwise the tier alias, which Claude Code accepts on
- * its own.
+ * gateway is configured and on for the owner (`onGateway`, the condition
+ * credentialDelivery delivers it on), its pinned profile id, which is what
+ * the gateway allowlist accepts; otherwise the tier alias, which Claude Code
+ * accepts on its own. The box has the last word: its runner turns a profile
+ * id back into the alias where its Claude settings are not on the gateway
+ * (agent/chat-runner.js claudeLaunchArg), which a box-level skip needs.
  */
-export function claudeLaunchModel(tier: ClaudeChatTier, env: NodeJS.ProcessEnv = process.env): string {
-  const pinned = getClaudeGatewayConfig(env)?.models[tier];
+export function claudeLaunchModel(tier: ClaudeChatTier, onGateway: boolean, env: NodeJS.ProcessEnv = process.env): string {
+  const pinned = onGateway ? getClaudeGatewayConfig(env)?.models[tier] : undefined;
   return pinned ?? tier;
 }
 

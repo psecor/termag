@@ -43,6 +43,8 @@ import {
 import { AssumeRoleCommand, STSClient } from '@aws-sdk/client-sts';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { SpaceResources } from './spaceConfig';
+import type { PutCondition } from './spaceMemory';
+import type { ObjectVersionInfo } from './spaceVersions';
 
 export interface AwsCredentialIdentity {
   accessKeyId: string;
@@ -66,7 +68,11 @@ export interface PresignedPut extends PresignedUrl { method: 'PUT'; headers: Rec
 
 export interface SpaceObjects {
   list(prefix: string, opts?: { cursor?: string | null; delimiter?: boolean; max?: number }): Promise<ListResult>;
-  head(key: string): Promise<{ size: number; contentType: string | null; lastModified: Date | null } | null>;
+  /**
+   * `etag` is the current version's, quoted as S3 sends it; `versionId` as S3
+   * has it (null on an unversioned bucket, as Floci may be).
+   */
+  head(key: string): Promise<{ size: number; contentType: string | null; lastModified: Date | null; etag?: string | null; versionId?: string | null } | null>;
   /** `ttlS` is at most VIEW_TTL_S, which MIN_SESSION_LEFT_MS covers. */
   presignGet(key: string, response: { contentDisposition: string; contentType?: string }, ttlS?: number): Promise<PresignedUrl>;
   /**
@@ -75,13 +81,32 @@ export interface SpaceObjects {
    * is gone. More than `maxBytes` back means the object is over the limit.
    */
   read(key: string, maxBytes: number): Promise<Buffer | null>;
-  presignPut(key: string, size: number, contentType: string): Promise<PresignedPut>;
+  /**
+   * `condition` makes it a conditional write (space memory's add and edit):
+   * S3 answers 412 PreconditionFailed when the object's ETag no longer
+   * matches, or when it exists for `ifNoneMatch: '*'`. The header is signed,
+   * so a client can't drop it and write anyway.
+   */
+  presignPut(key: string, size: number, contentType: string, condition?: PutCondition | null, proof?: string | null): Promise<PresignedPut>;
+  /** The `termag-upload` metadata a version carries (presignPut's `proof`), or null. */
+  uploadProofOf(key: string, versionId: string): Promise<string | null>;
   createMultipart(key: string, contentType: string): Promise<string>;
   /** Each part URL signs its exact Content-Length, so a part can't carry more than the declared upload. */
   presignParts(key: string, uploadId: string, parts: Array<{ partNumber: number; size: number }>): Promise<Array<{ partNumber: number } & PresignedUrl>>;
-  completeMultipart(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>): Promise<void>;
+  /** `condition` as presignPut's, which S3 checks when it assembles the object; returns the new version's ETag. */
+  completeMultipart(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>, condition?: PutCondition | null): Promise<{ etag: string | null }>;
   abortMultipart(key: string, uploadId: string): Promise<void>;
-  copy(fromKey: string, toKey: string): Promise<void>;
+  /** `sourceIfMatch`: S3 refuses (412) when the source is no longer that version (CopySourceIfMatch). */
+  copy(fromKey: string, toKey: string, opts?: { sourceIfMatch?: string | null }): Promise<void>;
+  /** The key's versions, newest first, delete markers included (spaceVersions.ts landedCheck). */
+  versionsOf(key: string, max?: number): Promise<ObjectVersionInfo[]>;
+  /**
+   * Makes an older version the current one again: a copy of it, so every
+   * version stays. `ifMatch`: only while that ETag is current (CopyObject's
+   * If-Match on the destination), else 412 PreconditionFailed and nothing
+   * written. Answers the copy's ETag, the current version's now.
+   */
+  restoreVersion(key: string, versionId: string, ifMatch?: string | null): Promise<{ etag: string | null }>;
   /** Deletes current versions (a delete marker each); returns the keys S3 refused. */
   deleteKeys(keys: string[]): Promise<string[]>;
   /** Bytes in every version under the prefix, current and noncurrent. */
@@ -347,7 +372,10 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
     async head(key) {
       try {
         const out = await s3.send(new HeadObjectCommand({ Bucket, Key: key }));
-        return { size: Number(out.ContentLength ?? 0), contentType: out.ContentType ?? null, lastModified: out.LastModified ?? null };
+        return {
+          size: Number(out.ContentLength ?? 0), contentType: out.ContentType ?? null, lastModified: out.LastModified ?? null,
+          etag: out.ETag ?? null, versionId: out.VersionId ?? null,
+        };
       } catch (err) {
         const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
         if (status === 404 || (err as Error).name === 'NotFound') return null;
@@ -378,13 +406,21 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
       return { url, expiresAt: expiresAt(expiresIn) };
     },
 
-    async presignPut(key, size, contentType) {
-      const headers = { 'content-type': contentType, ...sseHeaders(resources.kmsKeyId) };
+    async presignPut(key, size, contentType, condition = null, proof = null) {
+      const conditionHeaders: Record<string, string> = condition?.ifMatch ? { 'if-match': condition.ifMatch }
+        : condition?.ifNoneMatch ? { 'if-none-match': condition.ifNoneMatch } : {};
+      const headers = { 'content-type': contentType, ...conditionHeaders, ...sseHeaders(resources.kmsKeyId) };
+      // The proof (spaceVersions.ts uploadProof) is metadata, which the presigner hoists into the
+      // URL's signed query: the version S3 makes carries it and a client can't change it. It is not
+      // in `headers`: sent as a header too, it is unsigned and S3 refuses the PUT with 403 AccessDenied.
       const url = await getSignedUrl(s3, new PutObjectCommand({
         Bucket, Key: key, ContentLength: size, ContentType: contentType, ...sse,
+        ...(condition?.ifMatch ? { IfMatch: condition.ifMatch } : {}),
+        ...(condition?.ifNoneMatch ? { IfNoneMatch: condition.ifNoneMatch } : {}),
+        ...(proof ? { Metadata: { 'termag-upload': proof } } : {}),
       }), {
         expiresIn: PUT_TTL_S,
-        signableHeaders: new Set(['content-length', 'content-type']),
+        signableHeaders: new Set(['content-length', 'content-type', ...Object.keys(conditionHeaders)]),
         unhoistableHeaders: new Set(Object.keys(sseHeaders(resources.kmsKeyId))),
       });
       return { method: 'PUT', url, headers, expiresAt: expiresAt(PUT_TTL_S) };
@@ -407,23 +443,48 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
       })));
     },
 
-    async completeMultipart(key, uploadId, parts) {
-      await s3.send(new CompleteMultipartUploadCommand({
+    async completeMultipart(key, uploadId, parts, condition = null) {
+      const out = await s3.send(new CompleteMultipartUploadCommand({
         Bucket, Key: key, UploadId: uploadId,
         MultipartUpload: { Parts: parts.map(p => ({ PartNumber: p.partNumber, ETag: p.etag })) },
+        ...(condition?.ifMatch ? { IfMatch: condition.ifMatch } : {}),
+        ...(condition?.ifNoneMatch ? { IfNoneMatch: condition.ifNoneMatch } : {}),
       }));
+      return { etag: out.ETag ?? null };
     },
 
     async abortMultipart(key, uploadId) {
       await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: key, UploadId: uploadId }));
     },
 
-    async copy(fromKey, toKey) {
+    async copy(fromKey, toKey, opts = {}) {
       await s3.send(new CopyObjectCommand({
         Bucket, Key: toKey,
         CopySource: copySource(Bucket, fromKey),
+        ...(opts.sourceIfMatch ? { CopySourceIfMatch: opts.sourceIfMatch } : {}),
         ...sse,
       }));
+    },
+    async versionsOf(key, max = 10) {
+      const out = await s3.send(new ListObjectVersionsCommand({ Bucket, Prefix: key, MaxKeys: Math.max(max * 2, 10) }));
+      const all = [
+        ...(out.Versions ?? []).filter(v => v.Key === key).map(v => ({ versionId: v.VersionId ?? null, etag: v.ETag ?? null, lastModified: v.LastModified ?? null, deleteMarker: false, latest: v.IsLatest === true })),
+        ...(out.DeleteMarkers ?? []).filter(v => v.Key === key).map(v => ({ versionId: v.VersionId ?? null, etag: null, lastModified: v.LastModified ?? null, deleteMarker: true, latest: v.IsLatest === true })),
+      ].sort((a, b) => Number(b.latest) - Number(a.latest) || (b.lastModified?.getTime() ?? 0) - (a.lastModified?.getTime() ?? 0));
+      return all.slice(0, max).map(({ latest: _latest, ...v }): ObjectVersionInfo => v);
+    },
+    async uploadProofOf(key, versionId) {
+      const out = await s3.send(new HeadObjectCommand({ Bucket, Key: key, VersionId: versionId }));
+      return out.Metadata?.['termag-upload'] ?? null;
+    },
+    async restoreVersion(key, versionId, ifMatch = null) {
+      const out = await s3.send(new CopyObjectCommand({
+        Bucket, Key: key,
+        CopySource: `${copySource(Bucket, key)}?versionId=${encodeURIComponent(versionId)}`,
+        ...(ifMatch ? { IfMatch: ifMatch } : {}),
+        ...sse,
+      }));
+      return { etag: out.CopyObjectResult?.ETag ?? null };
     },
 
     async deleteKeys(keys) {

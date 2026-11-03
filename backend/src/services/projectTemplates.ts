@@ -95,8 +95,11 @@ export function buildCloneCommand(
     const objects = dq(`${referenceDir}/.git/objects`);
     parts.push(`{ [ -d ${objects} ] && mkdir -p .git/objects/info && echo ${objects} >> .git/objects/info/alternates; true; }`);
   }
-  // Tolerant of a retry in a dir that already has the remote.
-  parts.push(`{ ${git(`remote add origin ${sq(repoUrl)}`)} 2>/dev/null || ${git(`remote set-url origin ${sq(repoUrl)}`)}; }`);
+  // Tolerant of a retry in a dir that already has the remote. The space before
+  // `;` matters: the line is typed key by key, and Oh My Zsh's url-quote-magic
+  // (on by default on boxes) turns a `;` typed straight after a URL into `\;`,
+  // so set-url would save the URL with a `;` on the end.
+  parts.push(`{ ${git(`remote add origin ${sq(repoUrl)}`)} 2>/dev/null || ${git(`remote set-url origin ${sq(repoUrl)}`)} ; }`);
   parts.push(git('fetch --progress origin'));
   parts.push(git('remote set-head origin -a'));
   // Check out the remote's default branch under its own name, tracking origin.

@@ -80,8 +80,11 @@ import {
   pickSelectedImage,
   selectionKey,
 } from './boxImage';
+import { instanceTypesForSize, type BoxSize } from './boxSize';
 import { MANAGED_BEGIN, MANAGED_END, managedBlock } from './sshKeys';
+import { QUARANTINED, QUARANTINE_DENY_POLICY } from './boxQuarantinePolicy';
 import { ownerAuthorizedKeyLines } from './sshKeySync';
+import { flavorSpec, type BoxFlavor } from './boxFlavor';
 import {
   EC2_GROUP_NOT_FOUND,
   EC2_INSTANCE_NOT_FOUND,
@@ -100,6 +103,7 @@ import {
   parseBoxEcrPull,
   type BoxEcrPullConfig,
 } from './boxEcrPolicy';
+import { failRoot, traceSweep } from './tracing/spans';
 
 
 const SSM_CORE_POLICY_ARN = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore';
@@ -114,7 +118,9 @@ export interface BoxConfig {
   permissionsBoundaryArn: string;
   vpcId: string;
   subnetId: string;
+  fallbackSubnetIds: string[]; // with subnetId, one pool: launches take turns starting in each
   instanceType: string;        // MUST be arm64/Graviton — the AMI is arm64-only
+  fallbackInstanceTypes: string[]; // tried in order once instanceType has no capacity in any subnet; arm64 too
   hostSecurityGroupId?: string; // optional: SG fronting the agent endpoint — box SG gets :3040 ingress here
   assumeRoleArn?: string;      // optional: cross-account provisioner role to assume for every AWS call
   managedTag: string;          // ManagedBy tag value the grant scopes on
@@ -139,6 +145,11 @@ export function getBoxConfig(env: NodeJS.ProcessEnv = process.env): BoxConfig | 
   if (!region || !agentWsUrl || !resourcePrefix || !permissionsBoundaryArn || !vpcId || !subnetId) {
     return null;
   }
+  const instanceType = env.BOX_INSTANCE_TYPE ?? 't4g.medium';
+
+  // The minimal flavor's disk default is the boxDiskSize module's concern
+  // (minimalDefaultDiskGiB) — nothing here floors a launch by it anymore.
+  const rootVolumeGb = parseInt(env.BOX_ROOT_VOLUME_GB ?? '120', 10);
 
   return {
     region,
@@ -154,15 +165,25 @@ export function getBoxConfig(env: NodeJS.ProcessEnv = process.env): BoxConfig | 
     // Optional: cross-account role chaining for an orchestrator whose ambient
     // identity (e.g. an EKS pod identity) lives outside the box account.
     assumeRoleArn: env.BOX_PROVISIONER_ROLE_ARN?.trim() || undefined,
-    instanceType: env.BOX_INSTANCE_TYPE ?? 't4g.medium',
+    instanceType,
+    // Optional: a box launch otherwise depends on one AZ having one type free,
+    // which is how the warm pool failed 2026-10-20..22 (m9g.2xlarge, us-east-2a).
+    // No subnet is primary: launchCandidates rotates where each launch starts.
+    fallbackSubnetIds: parseList(env.BOX_FALLBACK_SUBNET_IDS).filter(s => s !== subnetId),
+    fallbackInstanceTypes: parseList(env.BOX_FALLBACK_INSTANCE_TYPES).filter(t => t !== instanceType),
     managedTag: env.BOX_MANAGED_TAG ?? 'termag-box',
     // A floor, not the final size: resolveRootDevice raises it to the AMI
     // snapshot's size when the image is bigger, so this never has to keep pace
     // with the bake.
-    rootVolumeGb: parseInt(env.BOX_ROOT_VOLUME_GB ?? '120', 10),
+    rootVolumeGb,
     gitTokenSecretArn: env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
     ecrPull: parseBoxEcrPull(env),
   };
+}
+
+/** A comma-separated env list, trimmed, blanks and repeats dropped. */
+function parseList(raw: string | undefined): string[] {
+  return [...new Set((raw ?? '').split(',').map(s => s.trim()).filter(Boolean))];
 }
 
 export function isBoxProvisioningConfigured(): boolean {
@@ -470,6 +491,25 @@ export interface ProvisionArgs {
   image: BoxImageSelection;
   /** The owner's `box-hibernation-enabled` flag (boxHibernationFlag.ownerHibernationEnabled), read with the claim decision. */
   hibernation: boolean;
+  /** A type of the caller's own in place of BOX_INSTANCE_TYPE and its fallbacks. Unset: the configured ones. */
+  instanceTypes?: InstanceTypeChoice;
+  /** The disk the box was asked for (services/boxDiskSize.ts). Unset: the flavor's default, as a pool box gets. */
+  diskGiB?: number | null;
+  /** Which flavor's image (services/boxFlavor.ts); the relaunch path always says 'full'. */
+  flavor: BoxFlavor;
+}
+/** An instance type to launch, and the ones to try in order when EC2 has no capacity for it. All arm64. */
+export interface InstanceTypeChoice {
+  type: string;
+  fallbacks: string[];
+}
+
+/** The config a launch walks: `choice` in place of the configured types, its fallbacks without the primary or repeats. */
+export function withInstanceTypes(cfg: BoxConfig, choice: InstanceTypeChoice | undefined): BoxConfig {
+  if (!choice) return cfg;
+  const instanceType = choice.type.trim();
+  const fallbacks = [...new Set(choice.fallbacks.map(t => t.trim()).filter(t => t && t !== instanceType))];
+  return { ...cfg, instanceType, fallbackInstanceTypes: fallbacks };
 }
 
 const NOT_CONFIGURED = 'box provisioning not configured (missing AWS_REGION / BOX_* env)';
@@ -505,12 +545,14 @@ export async function provisionBox(args: ProvisionArgs): Promise<void> {
     ownerAuthorizedKeys,
   });
 
-  const launched = await launchBox(cfg, {
+  const launched = await launchBox(withInstanceTypes(cfg, args.instanceTypes), {
     instanceId: args.instance.id,
     boxName: args.boxName,
     userData,
     image: args.image,
     hibernation: args.hibernation,
+    diskGiB: args.diskGiB,
+    flavor: args.flavor,
     extraTags: [
       { Key: 'Owner', Value: args.owner },
       { Key: 'BoxName', Value: args.boxName },
@@ -526,6 +568,7 @@ export interface ProvisionPoolArgs {
   token: string;          // raw agent bearer token, bound to the box and to no user
   poolSpecHash: string;   // already recorded on the Instance row by the reconciler
   hibernation: boolean;   // the pool's box-hibernation-enabled value, the one in poolSpecHash
+  size: BoxSize | null;   // the pool's box-default-size, also in poolSpecHash and on the row; null: BOX_INSTANCE_TYPE
 }
 
 /**
@@ -549,13 +592,15 @@ export async function provisionPoolBox(args: ProvisionPoolArgs): Promise<boolean
     poolSpecHash: args.poolSpecHash,
   });
 
-  const launched = await launchBox(cfg, {
+  const launched = await launchBox(withInstanceTypes(cfg, instanceTypesForSize(args.size)), {
     instanceId: args.instance.id,
     boxName: args.instance.name,
     userData,
     // Always the published image: the pool spec hash (warmPool.currentPoolSpecHash) is built from it.
     image: PUBLISHED_IMAGE,
     hibernation: args.hibernation,
+    // A pool box is always the full flavor — BOX_FLAVORS.minimal.warmPoolEligible is false, nowhere claims one.
+    flavor: 'full',
     extraTags: [
       { Key: 'BoxName', Value: args.instance.name },
       { Key: 'Pool', Value: 'warm' },
@@ -573,7 +618,10 @@ interface LaunchBoxArgs {
   userData: string;
   image: BoxImageSelection;
   hibernation: boolean;  // box-hibernation-enabled for this box's owner, or the pool's value
+  diskGiB?: number | null;  // the disk asked for (amiWithDisk); unset: the AMI's discovered size
   extraTags: Tag[];  // appended after Name/App/ManagedBy on every resource
+  /** Which flavor the launch rides (services/boxFlavor.ts); a pool launch never says 'minimal'. */
+  flavor: BoxFlavor;
 }
 
 /** The AWS resource handles a successful launch leaves behind. */
@@ -615,10 +663,16 @@ async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs): Promise<LaunchedBox 
     prisma.instance.update({ where: { id: a.instanceId }, data: { ...data, cleanedUpAt: null } });
 
   try {
-    // 1. The box AMI (the published one unless the owner's box-image flag
-    //    names another), plus the root-device shape to launch it with.
-    const image = await resolveBoxImage(ec2, cfg, a.image);
-    const ami = image.ami;
+    // 1. The box AMI, per the flavor's spec (services/boxFlavor.ts) — 'full'
+    //    is the published one unless the owner's box-image flag or a channel
+    //    names another; 'minimal' owns the lean Component=box-min discovery
+    //    and never reads the flag — plus the root-device shape to launch it
+    //    with. The root is the disk asked for, never under the image's
+    //    snapshot; the row records what the box gets, hibernation's RAM aside.
+    //    A minimal caller resolved diskGiB with BOX_MINIMAL_ROOT_VOLUME_GB's
+    //    default in the mix (routes/instances.ts).
+    const image = await flavorSpec(a.flavor).resolveImage({ ec2, cfg, selection: a.image });
+    const ami = amiWithDisk(image.ami, a.diskGiB);
 
     // 2. Per-box egress-only SG (AWS adds the default allow-all egress rule).
     const sg = await ec2.send(new CreateSecurityGroupCommand({
@@ -629,7 +683,7 @@ async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs): Promise<LaunchedBox 
       TagSpecifications: [{ ResourceType: 'security-group', Tags: [...tags, { Key: 'Component', Value: 'box-sg' }] }],
     }));
     const securityGroupId = sg.GroupId!;
-    await record({ region: cfg.region, securityGroupId, imageId: ami.imageId, imageSource: image.source });
+    await record({ region: cfg.region, securityGroupId, imageId: ami.imageId, imageSource: image.source, diskGiB: ami.rootVolumeGb });
 
     // 3. Let the box reach the orchestrator: :3040 ingress on the host SG from
     //    the box SG (grant's Ec2BoxIngressToHost). Only the EC2-hosted
@@ -651,12 +705,28 @@ async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs): Promise<LaunchedBox 
     // 5. Launch, hibernation-capable when the AMI, the type and the flag
     //    all allow it. EC2 only takes HibernationOptions here, never later.
     //    An image the box-image flag chose is its own opt-in:
-    //    box-hibernation-enabled gates only the published image.
-    const hibernation = await planBoxHibernation(ec2, cfg, ami, hibernationEnabledFor(a.hibernation, image));
-    if (hibernation.reason) console.log(`[BOX] ${a.boxName}: launching without hibernation: ${hibernation.reason}`);
-    const launched = await runInstance(ec2, { ami, name, securityGroupId, iamRoleName, userData: a.userData, cfg, tags, hibernation });
+    //    box-hibernation-enabled gates only the published image. A capacity
+    //    refusal moves on to the next subnet, then the next type.
+    // An admin may have quarantined the box while its SG and role were being
+    // made; never boot an instance for it. The SG and role are left for the
+    // admin's terminate, which tears them down from the handles recorded above.
+    if (await isQuarantinedNow(a.instanceId)) {
+      console.warn(`[BOX] ${a.boxName}: quarantined during its launch; not starting an instance`);
+      return null;
+    }
+    const launched = await runInstanceWithFallback(ec2, a.boxName, hibernationEnabledFor(a.hibernation, image),
+      { ami, name, securityGroupId, iamRoleName, userData: a.userData, cfg, tags });
     const ec2InstanceId = launched.instanceId;
-    await record({ ec2InstanceId, hibernationConfigured: launched.hibernationConfigured });
+    await record({ ec2InstanceId, hibernationConfigured: launched.hibernationConfigured, instanceType: launched.instanceType });
+    // Quarantined while RunInstances was in flight: that run had no instance
+    // to contain, so its AWS steps are run again now there is one.
+    if (await isQuarantinedNow(a.instanceId)) {
+      console.warn(`[BOX] ${a.boxName}: quarantined while ${ec2InstanceId} was launching; containing it`);
+      const { resumeQuarantineAfterLaunch } = await import('./boxQuarantine');
+      void resumeQuarantineAfterLaunch(a.instanceId)
+        .catch(err => console.error(`[QUARANTINE] ${a.boxName}: containing ${ec2InstanceId} after its launch failed; the provisioning sweep retries:`, errMsg(err)));
+      return null;
+    }
 
     // 6. Private DNS, diagnostic only. Status stays `provisioning` (or
     //    `warming` for a pool box) until the agent dials in. Never fails the
@@ -680,6 +750,8 @@ export interface BoxAmi {
   imageId: string;
   rootDeviceName: string;
   rootVolumeGb: number;
+  /** The image's own root snapshot size: no root volume may be smaller (amiWithDisk). Absent: rootVolumeGb is the floor. */
+  imageGb?: number;
   /** Tagged Hibernation=supported by the bake (packer/scripts/enable-hibernation.sh). */
   hibernationSupported: boolean;
   /**
@@ -690,6 +762,18 @@ export interface BoxAmi {
   termagSha: string | null;
   /** The image's CreationDate (ISO 8601): when a current box's code was baked. */
   createdAt: string | null;
+}
+
+/**
+ * The AMI to launch with the disk a box was asked for (services/boxDiskSize.ts)
+ * as its root volume, raised to the image's snapshot when that is bigger, as
+ * EC2 refuses a smaller one: 50 GB on the 120 GB image is 120. With none asked
+ * for, the AMI as discovered (BOX_ROOT_VOLUME_GB, else the snapshot).
+ * Hibernation's RAM goes on top of this (planHibernation).
+ */
+export function amiWithDisk<A extends Pick<BoxAmi, 'rootVolumeGb' | 'imageGb'>>(ami: A, diskGiB: number | null | undefined): A {
+  if (diskGiB == null) return ami;
+  return { ...ami, rootVolumeGb: Math.max(diskGiB, ami.imageGb ?? ami.rootVolumeGb) };
 }
 
 /** The AMI tag naming the commit it was baked from (publish-ami.yml). */
@@ -754,15 +838,15 @@ export function hibernationEnabledFor(flagOn: boolean, image: Pick<ResolvedBoxIm
   return flagOn || image.selected;
 }
 
-async function planBoxHibernation(ec2: EC2Client, cfg: BoxConfig, ami: BoxAmi, enabled: boolean): Promise<HibernationPlan> {
+async function planBoxHibernation(ec2: EC2Client, instanceType: string, ami: BoxAmi, enabled: boolean): Promise<HibernationPlan> {
   if (!enabled || !ami.hibernationSupported) return planHibernation(enabled, ami, null);
   let type: InstanceTypeHibernationInfo | null = null;
   try {
-    const res = await ec2.send(new DescribeInstanceTypesCommand({ InstanceTypes: [cfg.instanceType as any] }));
+    const res = await ec2.send(new DescribeInstanceTypesCommand({ InstanceTypes: [instanceType as any] }));
     const info = res.InstanceTypes?.[0];
     if (info) type = { hibernationSupported: !!info.HibernationSupported, memoryMiB: info.MemoryInfo?.SizeInMiB ?? 0 };
   } catch (err) {
-    console.warn(`[BOX] DescribeInstanceTypes ${cfg.instanceType} failed:`, errMsg(err));
+    console.warn(`[BOX] DescribeInstanceTypes ${instanceType} failed:`, errMsg(err));
   }
   return planHibernation(true, ami, type);
 }
@@ -808,19 +892,30 @@ export function resolveRootDevice(
  * Exported for the warm pool: the pool spec hash is built from the AMI id, so
  * the reconciler needs the same discovery the launch uses rather than a second
  * copy of the tag filter that could drift from it.
+ *
+ * `component` distinguishes the standard bake (Component=box) from the lean
+ * one (Component=box-min) — the anonymous minimal flavor's image. Callers
+ * that reach for the minimal component go through resolveMinimalBoxImage;
+ * everything else uses the default. There is no discovery floor anymore:
+ * sizing moved to the launch (amiWithDisk), against the disk chosen for the
+ * box (services/boxDiskSize.ts) and the image's own snapshot (imageGb).
  */
-export async function discoverLatestAmi(ec2: EC2Client, cfg: BoxConfig): Promise<BoxAmi> {
+export async function discoverLatestAmi(
+  ec2: EC2Client,
+  cfg: BoxConfig,
+  component: 'box' | 'box-min' = 'box',
+): Promise<BoxAmi> {
   const res = await ec2.send(new DescribeImagesCommand({
     Filters: [
       { Name: 'tag:App', Values: ['termag'] },
-      { Name: 'tag:Component', Values: ['box'] },
+      { Name: 'tag:Component', Values: [component] },
       { Name: 'state', Values: ['available'] },
     ],
     Owners: ['self'],
   }));
   const images = (res.Images ?? []).filter(i => i.CreationDate);
   if (images.length === 0) {
-    throw new Error('No box AMI found (tag App=termag, Component=box). Run `packer build` first.');
+    throw new Error(`No box AMI found (tag App=termag, Component=${component}). Run \`packer build\` first.`);
   }
   images.sort((a, b) => (b.CreationDate! < a.CreationDate! ? -1 : 1));
   return toBoxAmi(images[0], cfg);
@@ -835,6 +930,7 @@ function toBoxAmi(image: Image, cfg: Pick<BoxConfig, 'rootVolumeGb'>): BoxAmi {
     imageId: image.ImageId!,
     rootDeviceName: deviceName,
     rootVolumeGb: volumeGb,
+    imageGb: resolveRootDevice(image, 0).volumeGb || undefined,
     hibernationSupported: amiSupportsHibernation(image),
     termagSha: amiTermagSha(image),
     createdAt: image.CreationDate ?? null,
@@ -884,6 +980,29 @@ export async function resolveBoxImage(ec2: EC2Client, cfg: BoxConfig, selection:
   }
   console.warn(`[BOX] box-image ${selectionKey(selection)} unusable (${reason}); launching from the published box image`);
   return { ami: await discoverLatestAmi(ec2, cfg), source: fallbackImageSource(selection), selected: false };
+}
+
+/**
+ * The minimal flavor's image: the newest Component=box-min. This never falls
+ * back to the published image the way a bad box-image flag value does: the
+ * owner asked for a minimal box, and silently handing them the full bake is
+ * the opposite of the ask — a missing minimal image fails the launch loudly
+ * on the row.
+ *
+ * Sizing lives with the launch: the disk chosen for the box
+ * (services/boxDiskSize.ts, whose fallback default for this flavor is
+ * BOX_MINIMAL_ROOT_VOLUME_GB — see routes/instances.ts) clamps to the image's
+ * own snapshot size through amiWithDisk. A lean image on a 120GB disk is
+ * 100GB of nothing; that default is what keeps one from happening.
+ */
+export async function resolveMinimalBoxImage(ec2: EC2Client, cfg: BoxConfig): Promise<ResolvedBoxImage> {
+  return {
+    ami: await discoverLatestAmi(ec2, cfg, 'box-min'),
+    // Not one of boxImage.boxImageSource's values; the box list renders it
+    // via the same unknown-source branch that shows `pinned`/`channel`.
+    source: 'minimal',
+    selected: false,
+  };
 }
 
 async function authorizeHostIngress(ec2: EC2Client, hostSgId: string, boxSgId: string, boxName: string): Promise<void> {
@@ -963,6 +1082,75 @@ interface RunArgs {
   cfg: BoxConfig;
   tags: Tag[];
   hibernation: HibernationPlan;
+  instanceType: string;
+  subnetId: string;
+}
+
+/** Where the next launch's subnet walk starts, so launches spread across every subnet instead of filling the first. */
+let nextSubnet = 0;
+
+/** Test hook: the next launch starts at the first subnet again. */
+export function resetSubnetRotationForTests(): void {
+  nextSubnet = 0;
+}
+
+/**
+ * Where a launch may go, in the order it tries them: the configured type in
+ * every subnet, then each fallback type. The subnets are walked from `start`
+ * (mod their count), wrapping around, so every subnet gets its turn first.
+ */
+export function launchCandidates(
+  cfg: Pick<BoxConfig, 'instanceType' | 'fallbackInstanceTypes' | 'subnetId' | 'fallbackSubnetIds'>,
+  start = 0,
+): { instanceType: string; subnetId: string }[] {
+  const pool = [cfg.subnetId, ...cfg.fallbackSubnetIds];
+  const at = start % pool.length;
+  const subnets = [...pool.slice(at), ...pool.slice(0, at)];
+  return [cfg.instanceType, ...cfg.fallbackInstanceTypes].flatMap(instanceType => subnets.map(subnetId => ({ instanceType, subnetId })));
+}
+
+/**
+ * RunInstances refusals that say "not here, not this type" rather than "not
+ * at all". VcpuLimitExceeded is deliberately absent: the Graviton general
+ * purpose types share one quota bucket, so another type or AZ hits it too.
+ */
+export function isCapacityRefusal(err: unknown): boolean {
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'InsufficientInstanceCapacity' || name === 'InsufficientFreeAddressesInSubnet') return true;
+  // "Your requested instance type (x) is not supported in your requested Availability Zone"
+  return name === 'Unsupported' && /availability zone/i.test(errMsg(err));
+}
+
+/**
+ * Launch at the first candidate EC2 has room for. Each type gets its own
+ * hibernation plan, since the root volume grows by that type's RAM. Any error
+ * other than a capacity refusal ends the walk, as does the last candidate's.
+ */
+async function runInstanceWithFallback(
+  ec2: EC2Client,
+  boxName: string,
+  hibernationEnabled: boolean,
+  a: Omit<RunArgs, 'hibernation' | 'instanceType' | 'subnetId'>,
+): Promise<{ instanceId: string; hibernationConfigured: boolean; instanceType: string }> {
+  const candidates = launchCandidates(a.cfg, nextSubnet++);
+  const plans = new Map<string, HibernationPlan>();
+  for (const [i, { instanceType, subnetId }] of candidates.entries()) {
+    let hibernation = plans.get(instanceType);
+    if (!hibernation) {
+      hibernation = await planBoxHibernation(ec2, instanceType, a.ami, hibernationEnabled);
+      plans.set(instanceType, hibernation);
+      if (hibernation.reason) console.log(`[BOX] ${boxName}: launching ${instanceType} without hibernation: ${hibernation.reason}`);
+    }
+    try {
+      const launched = await runInstance(ec2, { ...a, hibernation, instanceType, subnetId });
+      if (i > 0) console.log(`[BOX] ${boxName}: launched on fallback ${instanceType} in ${subnetId}`);
+      return { ...launched, instanceType };
+    } catch (err) {
+      if (i === candidates.length - 1 || !isCapacityRefusal(err)) throw err;
+      console.warn(`[BOX] ${boxName}: no ${instanceType} capacity in ${subnetId} (${errMsg(err)}); trying the next`);
+    }
+  }
+  throw new Error('no launch candidates');
 }
 
 /**
@@ -987,10 +1175,10 @@ async function runInstance(ec2: EC2Client, a: RunArgs): Promise<{ instanceId: st
 async function runInstanceOnce(ec2: EC2Client, a: RunArgs, hibernate: boolean): Promise<string> {
   const cmd = new RunInstancesCommand({
     ImageId: a.ami.imageId,
-    InstanceType: a.cfg.instanceType as any,
+    InstanceType: a.instanceType as any,
     MinCount: 1,
     MaxCount: 1,
-    SubnetId: a.cfg.subnetId,
+    SubnetId: a.subnetId,
     SecurityGroupIds: [a.securityGroupId],
     IamInstanceProfile: { Name: a.iamRoleName },
     MetadataOptions: {
@@ -1053,11 +1241,17 @@ async function describePrivateDns(ec2: EC2Client, instanceId: string): Promise<s
 async function markFailed(instanceId: string, error: string): Promise<void> {
   // Never over a terminated row: a launch that fails after the user deleted
   // the box would otherwise move it out of `terminated`, where neither the
-  // user nor the teardown sweep would look for its resources again.
+  // user nor the teardown sweep would look for its resources again. Nor over
+  // a quarantined one, which `failed` would hand back to its owner's Retry.
   await prisma.instance.updateMany({
-    where: { id: instanceId, status: { not: 'terminated' } },
+    where: { id: instanceId, status: { notIn: ['terminated', QUARANTINED] } },
     data: { status: 'failed', provisioningError: error.slice(0, 1000) },
   }).catch(e => console.error(`[BOX] Failed to mark instance ${instanceId} failed:`, e.message));
+}
+
+async function isQuarantinedNow(instanceId: string): Promise<boolean> {
+  const row = await prisma.instance.findUnique({ where: { id: instanceId }, select: { status: true } });
+  return row?.status === QUARANTINED;
 }
 
 // ── Boxes created on an owner's behalf ───────────────────────────────────────
@@ -1132,24 +1326,27 @@ export interface BoxOwner {
  * creates that both pass the re-check conflict under serializable isolation
  * (P2034, isConcurrentCreate), which the caller treats as "one is on its way".
  * Returns the box name; null when box provisioning is not configured or
- * `stillNeeded` said no. Persistence errors are thrown.
+ * `stillNeeded` said no. Persistence errors are thrown. `size` (boxSize.ts)
+ * is recorded on the row, and the launch walks its types unless
+ * `launch.instanceTypes` names others; null is BOX_INSTANCE_TYPE.
  */
 export async function provisionNewBox(
   user: BoxOwner,
   baseName: string,
   stillNeeded: (owned: OwnedBoxRow[]) => boolean,
   launch: LaunchChoices,
+  size: BoxSize | null = null,
 ): Promise<string | null> {
   if (!isBoxProvisioningConfigured()) return null;
-  const created = await createBoxRow(user, baseName, stillNeeded);
+  const created = await createBoxRow(user, baseName, stillNeeded, size);
   if (!created) return null;
-  console.log(`[BOX] Provisioning box "${created.boxName}" for ${user.googleEmail}`);
-  launchCreatedBox(user, created, launch);
+  console.log(`[BOX] Provisioning box "${created.boxName}" for ${user.googleEmail}${size ? ` (${size})` : ''}`);
+  launchCreatedBox(user, created, { ...launch, instanceTypes: launch.instanceTypes ?? instanceTypesForSize(size) });
   return created.boxName;
 }
 
 /** The owner's flags a launch needs decided (ProvisionArgs), read by the caller with its claim decision. */
-export type LaunchChoices = Pick<ProvisionArgs, 'image' | 'hibernation'>;
+export type LaunchChoices = Pick<ProvisionArgs, 'image' | 'hibernation' | 'instanceTypes' | 'flavor'>;
 
 /** P2002 (the (userId, name) unique index) or P2034 (serialization failure): another create won. */
 export function isConcurrentCreate(err: unknown): boolean {
@@ -1171,6 +1368,7 @@ async function createBoxRow(
   user: BoxOwner,
   baseName: string,
   stillNeeded: (owned: OwnedBoxRow[]) => boolean,
+  size: BoxSize | null,
 ): Promise<CreatedBox | null> {
   const rawToken = 'tmag_' + randomBytes(32).toString('hex');
   const tokenHash = createHash('sha256').update(rawToken).digest('hex');
@@ -1186,7 +1384,7 @@ async function createBoxRow(
       if (!stillNeeded(owned)) return null;
       const boxName = await resolveFreeBoxName(tx, user.id, baseName);
       const inst = await tx.instance.create({
-        data: { userId: user.id, name: boxName, kind: 'ec2', status: 'provisioning' },
+        data: { userId: user.id, name: boxName, kind: 'ec2', status: 'provisioning', size },
       });
       await tx.agentToken.create({
         data: {
@@ -1391,6 +1589,7 @@ async function inlinePolicyNames(iam: IAMClient, roleName: string): Promise<stri
     console.error(`[BOX] list inline policies for ${roleName} failed:`, errMsg(err));
     names.add(GIT_TOKEN_INLINE_POLICY);
     names.add(BOX_ECR_PULL_INLINE_POLICY);
+    names.add(QUARANTINE_DENY_POLICY);
   }
   return [...names];
 }
@@ -1448,7 +1647,7 @@ export async function backfillBoxEcrPullPolicies(): Promise<void> {
  * exactly the shape authorizeHostIngress writes. The box SG itself is excluded
  * (a self-referencing rule is not what blocks deletion).
  */
-async function findSecurityGroupsReferencing(ec2: EC2Client, boxSgId: string): Promise<string[]> {
+export async function findSecurityGroupsReferencing(ec2: EC2Client, boxSgId: string): Promise<string[]> {
   const res = await ec2.send(new DescribeSecurityGroupsCommand({
     Filters: [{ Name: 'ip-permission.group-id', Values: [boxSgId] }],
   }));
@@ -1534,15 +1733,24 @@ export function startProvisioningSweep(intervalMs = provisioningSweepIntervalMs(
       if (stuck.count > 0) console.log(`[BOX] Swept ${stuck.count} stuck-provisioning box(es) → failed`);
       await sweepStuckWarming(now);
     } catch (err) {
+      failRoot(err);
       console.error('[BOX] Provisioning sweep failed:', errMsg(err));
     }
     try {
       await sweepUncleanedTeardowns(new Date());
     } catch (err) {
+      failRoot(err);
       console.error('[BOX] Teardown sweep failed:', errMsg(err));
     }
+    try {
+      const { sweepUncontainedQuarantines } = await import('./boxQuarantine');
+      await sweepUncontainedQuarantines();
+    } catch (err) {
+      failRoot(err);
+      console.error('[QUARANTINE] Containment sweep failed:', errMsg(err));
+    }
   };
-  sweepTimer = setInterval(tick, intervalMs);
+  sweepTimer = setInterval(traceSweep('provisioning', tick), intervalMs);
   sweepTimer.unref?.();
 }
 

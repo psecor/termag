@@ -27,6 +27,9 @@ export interface PrNode {
   mergedAt: string | null;
   closedAt: string | null;
   baseRefName: string;
+  /** Absent in fixtures from before commits were read. */
+  headRefOid?: string | null;
+  mergeCommit?: { oid: string } | null;
   additions: number;
   deletions: number;
   changedFiles: number;
@@ -40,6 +43,11 @@ export interface PrNode {
   reviews?: { totalCount: number; nodes: Array<{ id: string; author: { login: string; __typename: string } | null; state: string; submittedAt: string | null; body?: string | null; comments: { totalCount: number } }> } | null;
   comments?: { totalCount: number; nodes: Array<{ author: { login: string; __typename: string } | null }> } | null;
   timelineItems?: { nodes: Array<{ __typename?: string; createdAt?: string; requestedReviewer?: { __typename: string; login?: string; slug?: string } | null }> } | null;
+}
+
+/** The head and merge commits to store, lowercased; null where GitHub has none (unmerged, or a fixture without them). */
+export function prCommitShas(n: Pick<PrNode, 'headRefOid' | 'mergeCommit'>): { headSha: string | null; mergeSha: string | null } {
+  return { headSha: n.headRefOid?.toLowerCase() || null, mergeSha: n.mergeCommit?.oid?.toLowerCase() || null };
 }
 
 export interface RateLimit { remaining: number; limit: number; resetAt: string }

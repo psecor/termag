@@ -162,6 +162,45 @@ export function sessionName(
     : `${username}-${project}-${workstream}-${role}`);
 }
 
+/**
+ * Review panes per workstream: slot 1 is the
+ * `review` role's own name, slots 2..MAX are `<that>-<n>`. The number goes
+ * after the role so no slot can equal another workstream's legal name (those
+ * all end in a role); `…-<ws>-2-review` would be workstream `<ws>-2`'s pane.
+ * Keep in sync with frontend/src/utils/sessionName.ts.
+ */
+export const MAX_REVIEW_SLOTS = 8;
+
+export function reviewSessionName(username: string, project: string, workstream: string = 'main', slot: number = 1): string {
+  const base = sessionName(username, project, 'review', workstream);
+  return slot === 1 ? base : `${base}-${slot}`;
+}
+
+/** Every review slot's session name for a workstream, slot 1 first. */
+export function reviewSessionNames(username: string, project: string, workstream: string = 'main'): string[] {
+  return Array.from({ length: MAX_REVIEW_SLOTS }, (_, i) => reviewSessionName(username, project, workstream, i + 1));
+}
+
+/** Which slot a session name is among a workstream's review panes, or null. Compared, never parsed. */
+export function reviewSlotOf(session: string, username: string, project: string, workstream: string = 'main'): number | null {
+  const i = reviewSessionNames(username, project, workstream).indexOf(session);
+  return i < 0 ? null : i + 1;
+}
+
+/**
+ * The exact pane target `=<name>:` as a `sessionName` for the agent's tmux
+ * RPCs, which pass the string to `-t` as given. A bare name prefix-matches
+ * when its own session is gone: `…-review` would reach `…-review-2`
+ * (verified on tmux 3.4). has-session, kill-session, send-keys, set-option,
+ * show-options, capture-pane, list-panes and display-message all take it,
+ * where send-keys and set-option refuse the session form `=<name>`; so no
+ * agent change is needed. Never for tmux-create, whose name is the new
+ * session's.
+ */
+export function exactPaneTarget(name: string): string {
+  return `=${name}:`;
+}
+
 // Session names are "<unixUsername>-<project>[-<workstream>]-<role>" and a
 // unixUsername may itself contain hyphens, so match the FULL username as a
 // prefix. Parsing the first hyphen segment instead would both reject

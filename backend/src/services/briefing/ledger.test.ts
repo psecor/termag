@@ -267,6 +267,28 @@ describe('buildLedger: patterns, charts and Done/Defer', () => {
     expect(l.sessions[0].dismissed).toBe(false);
   });
 
+  it("reads working time by the person's own days, as termag banks it", async () => {
+    // 8:30 AM on the 12th in Tokyo is still the 11th in UTC (the orchestrator's day here).
+    const seen: string[][] = [];
+    const tokenDays: string[][] = [];
+    const east = { ...window, since: '2026-10-09T16:00:00.000Z', until: '2026-10-11T23:30:00.000Z' };
+    const l = await buildLedger(user, east, deps({
+      worktimeTz: () => 'Asia/Tokyo',
+      worktime: async (_u, days) => { seen.push(days); return []; },
+      tokensByDay: async (_u, days) => { tokenDays.push(days); return [{ date: '2026-10-12', tokens: 5 }]; },
+    }));
+    expect(seen[0]).toEqual(['2026-10-10', '2026-10-11', '2026-10-12']);
+    expect(seen[1].at(-1)).toBe('2026-10-12');
+    // The chart's token series is read for its own days, so none slides off the axis.
+    expect(tokenDays[0]).toEqual(seen[1]);
+    expect(l.charts.days.at(-1)).toMatchObject({ day: '2026-10-12', tokens: 5 });
+    // No zone recorded: the orchestrator's days, as before.
+    seen.length = 0;
+    await buildLedger(user, east, deps({ worktimeTz: () => undefined, worktime: async (_u, days) => { seen.push(days); return []; } }));
+    expect(seen[0]).toEqual(['2026-10-09', '2026-10-10', '2026-10-11']);
+    expect(seen[1].at(-1)).toBe('2026-10-11');
+  });
+
   it('charts the seven days ending with the window, and the window per project', async () => {
     const d = deps({
       ownedProjects: async () => [project({})],

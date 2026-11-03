@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { branchStateFromRpc, lifecycleLabel, lifecycleStep, retireCheck, retireNow } from './spawnLifecycle';
+import { branchStateFromRpc, lifecycleLabel, lifecycleStep, retireCheck, retireCheckAcross, retireNow } from './spawnLifecycle';
 
 const now = Date.parse('2026-10-18T12:00:00Z');
 const MIN = 60_000;
@@ -119,5 +119,24 @@ describe('retireCheck for a local-only project (#453)', () => {
   it('treats an answer without an origin field as a remote checkout, as before', () => {
     expect(branchStateFromRpc({ dirty: false, upstream: null, ahead: 0, aheadOfBase: null })?.localOnly).toBeUndefined();
     expect(retireCheck(branchStateFromRpc({ dirty: false, upstream: null, ahead: 0, aheadOfBase: null }))).toEqual({ ok: false, reason: 'its commits could not be counted' });
+  });
+});
+
+describe('retireCheckAcross (a multi-repo workstream)', () => {
+  it('removable only when every repository is, and nothing beyond base only when each is', () => {
+    expect(retireCheckAcross([{ repo: 'web', check: { ok: true, why: 'nothing_beyond_base' } }, { repo: 'api', check: { ok: true, why: 'nothing_beyond_base' } }]))
+      .toEqual({ ok: true, why: 'nothing_beyond_base' });
+    expect(retireCheckAcross([{ repo: 'web', check: { ok: true, why: 'pushed' } }, { repo: 'api', check: { ok: true, why: 'nothing_beyond_base' } }]))
+      .toEqual({ ok: true, why: 'pushed' });
+  });
+  it('keeps it when any repository would lose work, naming each', () => {
+    expect(retireCheckAcross([
+      { repo: 'web', check: { ok: false, reason: 'uncommitted changes' } },
+      { repo: 'api', check: { ok: true, why: 'pushed' } },
+      { repo: 'cli', check: { ok: false, reason: '2 commits not pushed' } },
+    ])).toEqual({ ok: false, reason: 'web: uncommitted changes; cli: 2 commits not pushed' });
+  });
+  it('keeps it when there is nothing to read', () => {
+    expect(retireCheckAcross([]).ok).toBe(false);
   });
 });

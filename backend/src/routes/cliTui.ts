@@ -61,6 +61,9 @@ const CODE_FOR_STATUS: Record<number, string> = {
   504: 'upstream_timeout',
 };
 
+/** A box credential's answer on the PR routes (here and routes/cliPrs.ts). */
+export const PRS_DEVICE_ONLY = { error: 'Pull requests need a device sign-in: run `termag login` here.', code: 'device_sign_in_required' };
+
 /** A shared handler's answer with a CLI `code` on failures. */
 export function tuiResult(result: RouteResult): RouteResult {
   if (result.status < 400) return result;
@@ -129,7 +132,7 @@ export function mountCliTuiRoutes(router: Router, tui: CliTui, bearer: RequestHa
   router.get('/prs', bearer, asyncHandler(async (_req, res) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') {
-      res.status(403).json({ error: 'Pull requests need a device sign-in: run `termag login` here.', code: 'device_sign_in_required' });
+      res.status(403).json(PRS_DEVICE_ONLY);
       return;
     }
     send(res, await tui.prs(user));

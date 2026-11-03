@@ -39,6 +39,17 @@ const IDENTITY = identityOf({
 type Probe = Awaited<ReturnType<typeof probeReviewPane>>;
 
 /** A minimal fake sendForProject: answers the RPCs probeReviewPane and discovery ask. */
+/**
+ * tmux's `-t` lookup, as the fake agent answers it: `=<name>:` (or `=<name>`)
+ * is that session only; a bare name is that session, else the first one it
+ * prefixes, the hazard behind exact targets.
+ */
+function tmuxResolves(sessions: string[], target: string): string | null {
+  const exact = /^=(.+?):?$/.exec(target);
+  if (exact) return sessions.includes(exact[1]) ? exact[1] : null;
+  return sessions.includes(target) ? target : (sessions.find(x => x.startsWith(target)) ?? null);
+}
+
 function fakeSend(pane: { sessions?: string[]; cmd?: string | null; text?: string; option?: unknown } = {}) {
   const calls: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const send = vi.fn(async (_host: unknown, type: string, payload: Record<string, unknown> = {}) => {
@@ -47,7 +58,7 @@ function fakeSend(pane: { sessions?: string[]; cmd?: string | null; text?: strin
       case 'tmux-list':
         return { sessions: pane.sessions ?? [] };
       case 'tmux-has-session':
-        return { exists: pane.sessions?.includes(String(payload.sessionName)) === true };
+        return { exists: tmuxResolves(pane.sessions ?? [], String(payload.sessionName)) !== null };
       case 'tmux-foreground-cmd':
         return pane.cmd === undefined ? null : { cmd: pane.cmd ?? null };
       case 'tmux-capture':
@@ -358,5 +369,63 @@ describe('probeReviewPane (the classifier the route and sweep share)', () => {
     expect(first.recovered).toBeNull();
     expect(first.unrecoverable).toBe(true);
     expect(calls.filter(c => c.type === 'tmux-capture' && c.payload.lines === 1000)).toHaveLength(1);
+  });
+});
+
+describe('review slots (docs/parallel-reviews.md)', () => {
+  const slot = (n: number) => identityOf({ host: HOST, projectId: 'p1', projectName: 'widget', ownerUsername: 'alice', workstream: 'main', slot: n });
+
+  it('files each slot apart and publishes the whole list, slot 1 alone as review', () => {
+    registerReviewRecord(slot(2), { pr: 647, url: 'https://github.com/o/r/pull/647' }, { now: 1_000 });
+    let st = getStatus('alice-widget-agent', HOST.instanceId);
+    // Only slot 2 runs: the clients that know one pane (slot 1) see none.
+    expect(st.review).toBeNull();
+    expect(st.reviews?.map(r => [r.slot, r.session, r.pr])).toEqual([[2, 'alice-widget-review-2', 647]]);
+
+    registerReviewRecord(slot(1), { pr: 646, url: 'https://github.com/o/r/pull/646' }, { now: 2_000 });
+    st = getStatus('alice-widget-agent', HOST.instanceId);
+    expect(st.review).toMatchObject({ slot: 1, pr: 646, session: 'alice-widget-review' });
+    expect(st.reviews?.map(r => r.pr)).toEqual([646, 647]);
+  });
+
+  it('clearing one slot keeps the others', () => {
+    registerReviewRecord(slot(1), { pr: 646, url: null }, { now: 1_000 });
+    registerReviewRecord(slot(3), { pr: 648, url: null }, { now: 1_000 });
+    clearReviewRecord(slot(1));
+    const st = getStatus('alice-widget-agent', HOST.instanceId);
+    expect(st.review).toBeNull();
+    expect(st.reviews?.map(r => r.slot)).toEqual([3]);
+    clearReviewRecord(slot(3));
+    expect(getStatus('alice-widget-agent', HOST.instanceId).reviews).toBeNull();
+  });
+
+  it('marks one slot seen without touching another', () => {
+    registerReviewRecord(slot(1), { pr: 646, url: null }, { now: 1_000 });
+    registerReviewRecord(slot(2), { pr: 647, url: null }, { now: 1_000 });
+    expect(markReviewSeen(HOST.instanceId, 'alice-widget-review-2', 5_000)).toBe(true);
+    const st = getStatus('alice-widget-agent', HOST.instanceId);
+    expect(st.reviews?.map(r => r.seenAt?.getTime() ?? null)).toEqual([null, 5_000]);
+  });
+
+  it('adopts every live slot from one tmux-list, each under its own name', async () => {
+    const { send } = fakeSend({ sessions: ['alice-widget-review-2', 'alice-widget-review-5'], cmd: 'devin', option: '205 https://github.com/o/r/pull/205 devin' });
+    const r = await adoptHostPanels(send, { host: HOST, projects: [{ projectId: 'p1', projectName: 'widget', ownerUsername: 'alice', workstreams: ['main'] }] }, 1_000);
+    expect(r).toEqual({ ok: true, adopted: 2 });
+    expect(getReviewRecord(HOST.instanceId, 'alice-widget-review-2')?.slot).toBe(2);
+    expect(getReviewRecord(HOST.instanceId, 'alice-widget-review-5')?.slot).toBe(5);
+    expect(getReviewRecord(HOST.instanceId, 'alice-widget-review')).toBeNull();
+  });
+
+  it('a gone slot 1 reads as gone though slot 2 shares its prefix (exact targets)', async () => {
+    const { send, calls } = fakeSend({ sessions: ['alice-widget-review-2'], cmd: 'devin' });
+    const p = await probeReviewPane(send, HOST, 'alice-widget-review', { pr: 646, url: null });
+    expect(p.exists).toBe(false);
+    expect(calls[0]).toMatchObject({ type: 'tmux-has-session', payload: { sessionName: '=alice-widget-review:' } });
+  });
+
+  it('strips every list entry\'s link for a shared viewer', () => {
+    registerReviewRecord(slot(2), { pr: 647, url: 'https://github.com/o/r/pull/647' }, { now: 1_000 });
+    const st = getStatus('alice-widget-agent', HOST.instanceId);
+    expect(st.reviews!.map(r => reviewForSharedViewer(r)!.url)).toEqual([null]);
   });
 });

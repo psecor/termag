@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../db', () => ({
   prisma: {
     project: { findFirst: vi.fn() },
-    workstream: { findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
+    workstream: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(async () => []), create: vi.fn(), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
     workflow: { findMany: vi.fn(), create: vi.fn(async () => ({})) },
     automationRun: { updateMany: vi.fn(async () => ({ count: 0 })) },
   },

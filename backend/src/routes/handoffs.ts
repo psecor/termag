@@ -42,7 +42,7 @@ import {
 import { publishHandoff } from '../services/agentHandoffSweep';
 import { isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
 import { resolveAgentProvider } from '../services/agentRuntime';
-import { findSecretsInText } from '../services/askPublish';
+import { findSecretsInText } from '../services/secretPatterns';
 import { powerStateError } from '../services/boxPowerPolicy';
 import { boolVariation } from '../services/featureFlags';
 import { resolveProjectRoot } from '../services/projectPaths';

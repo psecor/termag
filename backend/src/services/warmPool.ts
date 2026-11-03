@@ -28,10 +28,14 @@ import {
   type BoxConfig,
 } from './boxProvisioner';
 import { poolHibernationEnabled } from './boxHibernationFlag';
+import { instanceTypesForSize, isBoxSize, type BoxSize } from './boxSize';
 import { planWarmPool, type PoolPlan, type PoolRowView } from './warmPoolPlanner';
 import { ttlMemo } from './ttlMemo';
 import { resendStalledClaims } from './warmPoolClaim';
-import { warmPoolSizeOverride, warmPoolTargetSize, WARM_POOL_SIZE_FLAG } from './warmPoolSize';
+import { expireStaleClaimUpdates } from './claimUpdate';
+import { warmPoolSizeOverride, WARM_POOL_SIZE_FLAG } from './warmPoolSize';
+import { warmPoolTargetFor, warmPoolTargets, type PoolTarget } from './warmPoolSizes';
+import { failRoot, traceSweep } from './tracing/spans';
 
 /** A warm box whose agent has been gone this long is failed, not handed to anyone. */
 const AGENT_LOST_AFTER_MS = 5 * 60 * 1000;
@@ -55,7 +59,8 @@ let breakerOpen = false;
 
 /** What the last tick to reach the planner decided. */
 export interface WarmPoolTickState {
-  specHash: string;
+  /** The current spec hash of every size the tick planned, so a warm box on none of them is stale. */
+  specHashes: string[];
   breakerOpen: boolean;
 }
 
@@ -90,7 +95,7 @@ export function startWarmPoolReconciler(intervalMs?: number): void {
   if (override.ignored) console.warn(`[POOL] ${override.ignored}`);
   else if (override.size !== null) console.log(`[POOL] pool size ${override.size} from WARM_POOL_TARGET_SIZE (AUTH_MODE=local), not ${WARM_POOL_SIZE_FLAG}`);
   if (!getBoxConfig()) console.log('[POOL] box provisioning is not configured; the pool will stay empty');
-  reconcileTimer = setInterval(reconcileWarmPool, intervalMs ?? policy.reconcileMs);
+  reconcileTimer = setInterval(traceSweep('warm-pool', () => reconcileWarmPool()), intervalMs ?? policy.reconcileMs);
   reconcileTimer.unref?.();
 }
 
@@ -109,44 +114,82 @@ export async function reconcileWarmPool(): Promise<void> {
 
   try {
     const now = new Date();
-    const target = await warmPoolTargetSize();
+    const targets = await warmPoolTargets();
+    const total = targets.reduce((sum, t) => sum + t.target, 0);
 
     // First, and ahead of the early return below: a claim whose RPC never
     // landed belongs to a user already, so the pool's target has no bearing on
     // it, and the spec hash this tick needs next is an AWS call that can throw.
     await resendStalledClaims(now);
+    await expireStaleClaimUpdates(now);
 
     const rows = await selectPoolRows(now);
 
     // The default outside staging: no pool wanted and none left over, so the
     // tick costs one indexed query and makes no AWS call at all.
-    if (target <= 0 && rows.every((row) => row.status === 'failed')) return;
+    if (total <= 0 && rows.every((row) => row.status === 'failed')) return;
 
-    const spec = await currentPoolSpec();
-    const currentHash = spec.hash;
-    const plan = planWarmPool({
-      rows,
-      lastWarmedAt: await latestWarmedAt(),
-      target,
-      maxInFlight: policy.maxInFlight,
-      currentHash,
-      maxAgeMs: policy.maxAgeMs,
-      agentLostAfterMs: AGENT_LOST_AFTER_MS,
-      breakerWindowMs: BREAKER_WINDOW_MS,
-      breakerThreshold: BREAKER_THRESHOLD,
-      now,
-    });
-    lastTick = { specHash: currentHash, breakerOpen: plan.breaker.open };
-
-    logTick(currentHash, target, plan);
+    // One plan per size, each over that size's rows. Failed rows go to every
+    // plan, so the breaker reads the whole pool's warm path, as before sizes.
+    // The in-flight cap is the pool's, not a size's: each size's plan gets
+    // what the other sizes' booting boxes, and the launches planned ahead of
+    // it this tick, leave of it.
+    const lastWarmedAt = await latestWarmedAt();
+    const failed = rows.filter((row) => row.status === 'failed');
+    let warmingElsewhere = rows.filter((row) => row.status === 'warming').length;
+    const specHashes: string[] = [];
+    let breaker: PoolPlan['breaker'] | null = null;
     logNewlyWarm(rows);
-    logBreaker(plan);
-    await failLostBoxes(plan);
-    await launchBoxes(plan, spec, target, policy);
-    await retireBoxes(plan);
+
+    for (const group of poolGroups(targets, rows)) {
+      const spec = await currentPoolSpec(group.size);
+      const own = rows.filter((row) => row.status !== 'failed' && row.size === group.size);
+      const ownWarming = own.filter((row) => row.status === 'warming').length;
+      warmingElsewhere -= ownWarming;
+      const plan = planWarmPool({
+        rows: [...own, ...failed],
+        lastWarmedAt,
+        target: group.target,
+        maxInFlight: Math.max(0, policy.maxInFlight - warmingElsewhere),
+        currentHash: spec.hash,
+        maxAgeMs: policy.maxAgeMs,
+        agentLostAfterMs: AGENT_LOST_AFTER_MS,
+        breakerWindowMs: BREAKER_WINDOW_MS,
+        breakerThreshold: BREAKER_THRESHOLD,
+        now,
+      });
+      warmingElsewhere += ownWarming + plan.launch;
+      if (group.target > 0) specHashes.push(spec.hash);
+      breaker ??= plan.breaker;
+
+      logTick(spec, group.target, plan);
+      await failLostBoxes(plan);
+      await launchBoxes(plan, spec, group.target, policy);
+      await retireBoxes(plan);
+    }
+
+    if (breaker) {
+      lastTick = { specHashes, breakerOpen: breaker.open };
+      logBreaker(breaker);
+    }
   } catch (err) {
+    failRoot(err);
     console.error('[POOL] Reconcile failed:', errMsg(err));
   }
+}
+
+/**
+ * The sizes a tick plans: every size with a target, then any size the pool
+ * still has boxes of but no longer wants (sizes turned off or on, a size's
+ * count set to 0), at target 0 so its plan drains them.
+ */
+export function poolGroups(targets: PoolTarget[], rows: Pick<PoolRowView, 'status' | 'size'>[]): PoolTarget[] {
+  const groups = [...targets];
+  for (const row of rows) {
+    if (row.status === 'failed' || groups.some((g) => g.size === row.size)) continue;
+    groups.push({ size: row.size, target: 0 });
+  }
+  return groups;
 }
 
 // ── The pool spec hash ────────────────────────────────────────────────────────
@@ -166,18 +209,22 @@ export function resetPoolSpecCache(): void {
   latestPoolAmi = null;
 }
 
-/** The pool's current spec: its hash, and the box-hibernation-enabled value the hash was built from. */
+/** One size's current spec: its hash, and the box-hibernation-enabled value and size the hash was built from. */
 export interface PoolSpec {
   hash: string;
   /** What the pool's launches pass as the flag; the AMI and the type still decide. */
   hibernation: boolean;
+  /** The size this spec's boxes launch at; null is BOX_INSTANCE_TYPE (sizes off for the pool). */
+  size: BoxSize | null;
 }
 
 /**
  * Everything that makes a warm box current, as one value: the image it boots,
- * the instance type it boots on, the script that wires it up, and whether it
- * launches hibernation-capable. A box whose poolSpecHash differs from this is
- * stale and gets replaced.
+ * the instance type it boots on, the script that wires it up, whether it
+ * launches hibernation-capable, and its size. Each size the pool holds has
+ * its own (warmPoolSizes.ts). A box whose poolSpecHash differs from its
+ * size's is stale and gets replaced, and a claim only takes a box of the
+ * current hash for the size it asked for, so it can never hand out another.
  *
  * Nothing in it comes from the database, and the flag is read for a fixed
  * context (boxHibernationFlag.POOL_FLAG_CONTEXT), so every replica computes the
@@ -185,11 +232,11 @@ export interface PoolSpec {
  * the flag is an in-memory read, and a missing box config throws on every
  * call rather than being remembered.
  */
-export async function currentPoolSpecHash(): Promise<string> {
-  return (await currentPoolSpec()).hash;
+export async function currentPoolSpecHash(size: BoxSize | null): Promise<string> {
+  return (await currentPoolSpec(size)).hash;
 }
 
-export async function currentPoolSpec(): Promise<PoolSpec> {
+export async function currentPoolSpec(size: BoxSize | null): Promise<PoolSpec> {
   const config = requireBoxConfig();
   if (!latestPoolAmi) {
     latestPoolAmi = ttlMemo(
@@ -206,21 +253,24 @@ export async function currentPoolSpec(): Promise<PoolSpec> {
   return {
     hash: poolSpecHash({
       amiId: ami.imageId,
-      instanceType: config.instanceType,
+      instanceType: instanceTypesForSize(size)?.type ?? config.instanceType,
       warmCloudInit: warmCloudInitShape(config),
       hibernation: hibernation && ami.hibernationSupported,
+      size,
     }),
     hibernation,
+    size,
   };
 }
 
 /**
- * The hash the claim statement filters on, or null when there is no point
- * asking for one.
+ * The hash the claim statement filters on for a box of `size`, or null when
+ * there is no point asking for one.
  *
  * Deriving it costs a DescribeImages call, so two indexed reads come first: a
- * target of 0 means the pool should not exist and every claim takes the cold
- * path (WP-2), and an empty pool has nothing for the statement to match. Both
+ * target of 0 for the size means the pool holds none of it and the claim
+ * takes the cold path (WP-2), and no warm box of the size leaves nothing for
+ * the statement to match. Both
  * are the common case on a deployment that has not opted in, and neither
  * should make a user's click wait on AWS. The cache in #104 is what makes the
  * call itself cheap once it is warranted.
@@ -228,11 +278,11 @@ export async function currentPoolSpec(): Promise<PoolSpec> {
  * Failing soft matters more than the call: an AWS hiccup should cost the user
  * a cold box, not an error.
  */
-export async function poolSpecHashOrNull(): Promise<string | null> {
-  if (await warmPoolTargetSize() <= 0) return null;
-  if (await prisma.instance.count({ where: { userId: null, status: 'warm' } }) === 0) return null;
+export async function poolSpecHashOrNull(size: BoxSize | null): Promise<string | null> {
+  if (await warmPoolTargetFor(size) <= 0) return null;
+  if (await prisma.instance.count({ where: { userId: null, status: 'warm', size } }) === 0) return null;
   try {
-    return await currentPoolSpecHash();
+    return await currentPoolSpecHash(size);
   } catch (err) {
     console.warn('[POOL] claim skipped, no pool spec hash:', err instanceof Error ? err.message : String(err));
     return null;
@@ -254,11 +304,13 @@ function requireBoxConfig(): BoxConfig {
  * sha256(amiId + "\n" + instanceType + "\n" + sha256(warm cloud-init)), per the
  * tech spec, with "\nhibernation" appended only for hibernation-capable
  * launches, so a pool launched without it keeps its hash and turning it on
- * rolls the pool over onto boxes that can hibernate.
+ * rolls the pool over onto boxes that can hibernate. "\nsize=<size>" is
+ * appended the same way, only when the pool has a size, so a pool of
+ * BOX_INSTANCE_TYPE boxes keeps the hash it had before sizes.
  */
-export function poolSpecHash(spec: { amiId: string; instanceType: string; warmCloudInit: string; hibernation?: boolean }): string {
+export function poolSpecHash(spec: { amiId: string; instanceType: string; warmCloudInit: string; hibernation?: boolean; size?: BoxSize | null }): string {
   const template = createHash('sha256').update(spec.warmCloudInit).digest('hex');
-  const suffix = spec.hibernation ? '\nhibernation' : '';
+  const suffix = (spec.hibernation ? '\nhibernation' : '') + (spec.size ? `\nsize=${spec.size}` : '');
   return createHash('sha256').update(`${spec.amiId}\n${spec.instanceType}\n${template}${suffix}`).digest('hex');
 }
 
@@ -296,15 +348,18 @@ async function selectPoolRows(now: Date): Promise<PoolRowView[]> {
       lastConnectedAt: true,
       agentDisconnectedAt: true,
       provisioningError: true,
+      size: true,
     },
   });
 
   // Instance.status is a free-form Postgres string, so it is parsed here
   // rather than asserted. A value the planner has no rule for is dropped
   // instead of being read as one of the three it does.
+  // The same for size: a value outside the three reads as no size, which
+  // with sizes on is a size no group wants, so it drains.
   return rows.flatMap((row) => {
     const status = poolStatusOf(row.status);
-    return status ? [{ ...row, status }] : [];
+    return status ? [{ ...row, status, size: isBoxSize(row.size) ? row.size : null }] : [];
   });
 }
 
@@ -346,24 +401,26 @@ async function failLostBoxes(plan: PoolPlan): Promise<void> {
 async function launchBoxes(plan: PoolPlan, spec: PoolSpec, target: number, policy: WarmPoolConfig): Promise<void> {
   const currentHash = spec.hash;
   for (let i = 0; i < plan.launch; i++) {
-    const launched = await insertPoolRow(currentHash, target, policy.maxInFlight);
+    const launched = await insertPoolRow(currentHash, spec.size, target, policy.maxInFlight);
     // Null means there is no longer room to launch, either because another pod
     // took the target or the cap, or because this tick's own earlier inserts
     // did. Either way, stop.
     if (!launched) break;
 
-    console.log(`[POOL] launch ${launched.instance.id} (${launched.instance.name}) spec=${currentHash.slice(0, 12)} target=${target} warm=${plan.supply.claimable} warming=${plan.supply.inFlight}`);
+    console.log(`[POOL] launch ${launched.instance.id} (${launched.instance.name}) spec=${currentHash.slice(0, 12)} size=${spec.size ?? 'configured'} target=${target} warm=${plan.supply.claimable} warming=${plan.supply.inFlight}`);
     void provisionPoolBox({
       instance: launched.instance,
       token: launched.token,
       poolSpecHash: currentHash,
       hibernation: spec.hibernation,
+      size: spec.size,
     });
   }
 }
 
 async function insertPoolRow(
   currentHash: string,
+  size: BoxSize | null,
   target: number,
   maxInFlight: number,
 ): Promise<{ instance: Instance; token: string } | null> {
@@ -399,7 +456,7 @@ async function insertPoolRow(
         if (inFlight >= maxInFlight) return null;
 
         const created = await tx.instance.create({
-          data: { userId: null, name, kind: 'ec2', status: 'warming', poolSpecHash: currentHash },
+          data: { userId: null, name, kind: 'ec2', status: 'warming', poolSpecHash: currentHash, size },
         });
         await tx.agentToken.create({
           data: { userId: null, instanceId: created.id, name: `pool: ${name}`, tokenHash, tokenPrefix },
@@ -446,35 +503,35 @@ async function retireBoxes(plan: PoolPlan): Promise<void> {
 
 // ── Observability ─────────────────────────────────────────────────────────────
 
-function logTick(hash: string, target: number, plan: PoolPlan): void {
+function logTick(spec: PoolSpec, target: number, plan: PoolPlan): void {
   console.log(
-    `[POOL] tick spec=${hash.slice(0, 12)} target=${target} warm=${plan.supply.claimable} warming=${plan.supply.inFlight} launch=${plan.launch} retire=${plan.terminate.length} fail=${plan.fail.length} breaker=${plan.breaker.open ? 'open' : 'closed'}`,
+    `[POOL] tick size=${spec.size ?? 'configured'} spec=${spec.hash.slice(0, 12)} target=${target} warm=${plan.supply.claimable} warming=${plan.supply.inFlight} launch=${plan.launch} retire=${plan.terminate.length} fail=${plan.fail.length} breaker=${plan.breaker.open ? 'open' : 'closed'}`,
   );
 }
 
 function logNewlyWarm(rows: PoolRowView[]): void {
   const fresh = rows
     .flatMap((row) => (row.status === 'warm' && row.warmedAt !== null
-      ? [{ id: row.id, at: row.warmedAt, bootMs: row.warmedAt.getTime() - row.createdAt.getTime() }]
+      ? [{ id: row.id, size: row.size, at: row.warmedAt, bootMs: row.warmedAt.getTime() - row.createdAt.getTime() }]
       : []))
     .filter((box) => loggedWarmUpTo === null || box.at > loggedWarmUpTo)
     .sort((a, b) => a.at.getTime() - b.at.getTime());
 
   for (const box of fresh) {
-    console.log(`[POOL] warm ${box.id} after ${Math.round(box.bootMs / 1000)}s`);
+    console.log(`[POOL] warm ${box.id} size=${box.size ?? 'configured'} after ${Math.round(box.bootMs / 1000)}s`);
     loggedWarmUpTo = box.at;
   }
 }
 
-function logBreaker(plan: PoolPlan): void {
-  if (plan.breaker.open) {
+function logBreaker(breaker: PoolPlan['breaker']): void {
+  if (breaker.open) {
     // Once per tick while open, not once on the edge, so the condition shows
     // up in a log tail taken at any moment rather than only at the transition.
-    console.log(`[POOL] breaker open: ${plan.breaker.failures} warming failures in the last hour, last was ${plan.breaker.lastError ?? 'not recorded'}`);
+    console.log(`[POOL] breaker open: ${breaker.failures} warming failures in the last hour, last was ${breaker.lastError ?? 'not recorded'}`);
   } else if (breakerOpen) {
     console.log('[POOL] breaker closed: a box warmed successfully');
   }
-  breakerOpen = plan.breaker.open;
+  breakerOpen = breaker.open;
 }
 
 function errMsg(err: unknown): string {

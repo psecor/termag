@@ -9,9 +9,13 @@
  *     haven't landed yet (settledCharges); an upload left unfinished for
  *     MULTIPART_MAX_AGE_MS is aborted first (the bucket's lifecycle rule does
  *     the same after a day; this keeps the count right without waiting on it);
- *   - drop SpaceBox rows of terminated boxes (the access check refuses them
- *     already, this keeps the Members tab honest);
- *   - prune SpaceEvent rows older than 90 days.
+ *   - list every project in the spaces its box reaches (ProjectSpace), then
+ *     drop SpaceBox rows of terminated boxes (the access check refuses them
+ *     already, this keeps the Members tab honest); in that order, so a
+ *     terminated box's projects stay listed in its spaces;
+ *   - prune SpaceEvent rows older than 90 days, except `.termag/` ones (a
+ *     space's shared agent memory), which are kept
+ *     indefinitely: that history is the memory's changelog.
  *
  * With no spaces at all it makes no AWS call, so a deployment that never
  * turns the flag on never needs the bucket.
@@ -19,6 +23,7 @@
 import type { ObjectVersion, OpenUpload, SpaceObjects } from './spaceObjects';
 import { spacePrefix } from './spacePaths';
 import type { LiveCharge, SpaceStore } from './spaceStore';
+import { failRoot, traceSweep } from '../tracing/spans';
 
 export const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 export const EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
@@ -32,10 +37,11 @@ export const CHARGE_MATCH_WINDOW_MS = 30 * 60 * 1000;
 /** A deleted space's uploads are all aborted, however recent. */
 const ABORT_ALL = new Date(8.64e15);
 
-export interface SweepResult { purged: number; recounted: number; uploadsAborted: number; grantsPruned: number; eventsPruned: number; errors: string[] }
+export interface SweepResult { purged: number; recounted: number; uploadsAborted: number; listingsRecorded: number; grantsPruned: number; eventsPruned: number; errors: string[] }
 
 export async function sweepSpaces(store: SpaceStore, objects: () => Promise<SpaceObjects>, now = Date.now()): Promise<SweepResult> {
-  const result: SweepResult = { purged: 0, recounted: 0, uploadsAborted: 0, grantsPruned: 0, eventsPruned: 0, errors: [] };
+  const result: SweepResult = { purged: 0, recounted: 0, uploadsAborted: 0, listingsRecorded: 0, grantsPruned: 0, eventsPruned: 0, errors: [] };
+  result.listingsRecorded = await store.recordListings();
   result.grantsPruned = await store.pruneTerminatedGrants();
   result.eventsPruned = await store.pruneEvents(new Date(now - EVENT_RETENTION_MS));
   await store.pruneCharges(new Date(now - CHARGE_MATCH_WINDOW_MS));
@@ -122,7 +128,12 @@ export function spacesSweep(store: SpaceStore, objects: () => Promise<SpaceObjec
     if (running) return;
     running = true;
     try {
-      const r = await sweepSpaces(store, objects);
+      const r = await traceSweep('spaces', async () => {
+        const out = await sweepSpaces(store, objects);
+        // The errors are logged below; only their count goes on the span.
+        if (out.errors.length) failRoot(new Error(`${out.errors.length} space sweep errors`));
+        return out;
+      })();
       if (r.purged || r.uploadsAborted || r.grantsPruned || r.eventsPruned || r.errors.length) {
         console.log(`[SPACES] sweep: purged ${r.purged}, recounted ${r.recounted}, uploads aborted ${r.uploadsAborted}, grants pruned ${r.grantsPruned}, events pruned ${r.eventsPruned}${r.errors.length ? `, errors: ${r.errors.join('; ')}` : ''}`);
       }

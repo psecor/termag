@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  buildGroupReviewPrompt, parseGroupReview,
-  chooseGuess, classifyReviewPane, isDevinForeground, parseGhPrView, parsePrInput, prFromLaunchEcho, prFromText, prNumberFromUrl,
+  buildGroupReviewPrompt, chooseReviewSlot, parseGroupReview,
+  chooseGuess, guessRepoIndex, classifyReviewPane, isDevinForeground, parseGhPrView, parsePrInput, prFromLaunchEcho, prFromText, prNumberFromUrl,
   reviewLaunchCommand, urlForPr, buildReviewPrompt, reviewPromptHeader, renderReviewTemplate, parseReviewBody, reviewPromptPath,
   DEFAULT_REVIEW_TEMPLATE, MAX_REVIEW_BODY, reviewAttribution, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
 } from './review';
@@ -73,6 +73,14 @@ describe('chooseGuess', () => {
   it('carries the branch, title and state from gh', () => {
     expect(chooseGuess({ gh, branch: 'other', milestoneUrl: null, pane: null })).toEqual({ number: 1, url: gh.url, title: 't', branch: 'feat', state: 'OPEN', source: 'gh' });
   });
+  it('guessRepoIndex: an open PR in any repository beats a merged one in an earlier', () => {
+    const merged = { state: 'MERGED' }, open = { state: 'OPEN' };
+    expect(guessRepoIndex([merged, null, open])).toBe(2);
+    expect(guessRepoIndex([null, open, open])).toBe(1);
+    expect(guessRepoIndex([null, merged, { state: 'CLOSED' }])).toBe(1);
+    expect(guessRepoIndex([null, null])).toBe(-1);
+    expect(guessRepoIndex([])).toBe(-1);
+  });
   it('urlForPr only accepts a GitHub PR url for that number', () => {
     expect(urlForPr('https://github.com/o/r/pull/9', 9)).toBe('https://github.com/o/r/pull/9');
     expect(urlForPr('https://github.com/o/r/pull/9', 8)).toBeNull();
@@ -84,7 +92,7 @@ describe('chooseGuess', () => {
 describe('reviewLaunchCommand', () => {
   it('points devin at the prompt file through $HOME; the prompt never reaches the shell', () => {
     expect(reviewLaunchCommand('ada-web-review'))
-      .toBe('devin --permission-mode smart --prompt-file "$HOME/.termag/review-prompts/ada-web-review.md"');
+      .toBe('TERMAG_SESSION_KIND=interactive devin --permission-mode smart --prompt-file "$HOME/.termag/review-prompts/ada-web-review.md"');
   });
   it('refuses a session name that is not plain', () => {
     expect(() => reviewLaunchCommand("a'b")).toThrow();
@@ -299,3 +307,29 @@ describe('a review group\'s review', () => {
   });
 });
 
+
+describe('chooseReviewSlot (docs/parallel-reviews.md)', () => {
+  const T = 'https://github.com/example-org/termag/pull/';
+  const slots = (...live: Array<[number, string | null] | null>) =>
+    Array.from({ length: 8 }, (_, i) => {
+      const s = live[i];
+      return s ? { slot: i + 1, alive: true, pr: s[0], url: s[1] } : { slot: i + 1, alive: false, pr: null, url: null };
+    });
+  it('restarts the pane already on that PR', () => {
+    expect(chooseReviewSlot(slots([646, `${T}646`], [647, `${T}647`]), { pr: 647, url: `${T}647` })).toEqual({ slot: 2, replaces: true });
+  });
+  it('takes the lowest free slot for another PR, a gap included', () => {
+    expect(chooseReviewSlot(slots([646, `${T}646`], null, [648, `${T}648`]), { pr: 700, url: `${T}700` })).toEqual({ slot: 2, replaces: false });
+  });
+  it('tells the same number in another repository apart', () => {
+    expect(chooseReviewSlot(slots([28576, `${T}28576`]), { pr: 28576, url: 'https://github.com/example-org/terraform/pull/28576' }))
+      .toEqual({ slot: 2, replaces: false });
+    expect(chooseReviewSlot(slots([12, `${T}12`]), { pr: 12, url: 'https://github.com/Example-Org/Termag/pull/12' })).toEqual({ slot: 1, replaces: true });
+    expect(chooseReviewSlot(slots([12, null]), { pr: 12, url: `${T}12` })).toEqual({ slot: 2, replaces: false });
+  });
+  it('keeps a finished review\'s slot (alive is alive) and is full when all 8 are', () => {
+    const all = slots(...Array.from({ length: 8 }, (_, i): [number, string] => [100 + i, `${T}${100 + i}`]));
+    expect(chooseReviewSlot(all, { pr: 999, url: `${T}999` })).toEqual({ full: true });
+    expect(chooseReviewSlot(all, { pr: 104, url: `${T}104` })).toEqual({ slot: 5, replaces: true });
+  });
+});

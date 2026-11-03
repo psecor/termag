@@ -15,9 +15,10 @@ vi.mock('../services/agentRegistry', () => ({
 }));
 
 import { sendForProject } from '../services/agentRegistry';
+import { WEBAPP_REVIEWER_ACCOUNT } from '../services/previewShareRules';
 import { registerGuestSocket, resetLiveGuests, type GuestShareContext, type PreviewShareStore, type ShareRow } from '../services/previewShares';
 import {
-  askWakeFor, createShareFor, extendShareFor, previewLinkRouter, revokeShareFor, shareForGrantee, type PreviewShareRouteDeps,
+  askWakeFor, createShareFor, extendShareFor, previewLinkRouter, revokeShareFor, shareForGrantee, stackCheckFor, type PreviewShareRouteDeps,
 } from './previewShares';
 
 const NOW = Date.parse('2026-10-20T12:00:00Z');
@@ -181,7 +182,7 @@ describe('revoking and extending', () => {
 describe('a share as its grantee sees it', () => {
   it('shows the grantee its state, and anyone else the same 404', async () => {
     const live = deps({}, fakeStore([shareRow()]));
-    expect(await shareForGrantee(live, asUser(guest), 'cshare0000000001')).toMatchObject({ status: 200, body: { state: 'active', owner: { name: 'Olive Owner' }, workstream: 'feature-x', boxStatus: 'ready', signInHint: 'reviewer@example.com / example-password' } });
+    expect(await shareForGrantee(live, asUser(guest), 'cshare0000000001')).toMatchObject({ status: 200, body: { state: 'active', owner: { name: 'Olive Owner' }, workstream: 'feature-x', boxStatus: 'ready', signInHint: WEBAPP_REVIEWER_ACCOUNT } });
     const expired = deps({}, fakeStore([shareRow({ expiresAt: new Date(NOW - 1) })]));
     expect(await shareForGrantee(expired, asUser(guest), 'cshare0000000001')).toMatchObject({ status: 200, body: { state: 'expired', message: expect.stringMatching(/expired/), signInHint: null } });
     for (const d of [live, expired]) {
@@ -273,5 +274,41 @@ describe('the share link', () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe('checking the dev stack before sharing', () => {
+  const boxProject = { ...project, instance: { hostHome: '/home/olive' } as any };
+  const checkDeps = (answer: unknown, over: Partial<PreviewShareRouteDeps> = {}) => deps({
+    findOwnedProject: vi.fn(async (userId, id) => (userId === owner.id && id === 'p1' ? boxProject : null)),
+    listWorkstreams: vi.fn(async () => [{ id: null, name: 'main' }, { id: 'ws1', name: 'feature-x' }]),
+    checkStack: vi.fn(async () => answer),
+    ...over,
+  });
+
+  it('asks the box about the workstream\'s own checkout, and names the workstream whose stack is in the way', async () => {
+    const d = checkDeps({ ok: false, reason: 'other-workstream', holder: '/home/olive/termag/projects/webapp/.worktrees/feature-x/dev-stack' });
+    const r = await stackCheckFor(d, asUser(owner), 'p1', { workstream: 'main' });
+    expect(d.checkStack).toHaveBeenCalledWith({ userId: owner.id, instanceId: 'box-1' }, {
+      recipe: { kind: 'webapp-dev-stack' }, cwd: '/home/olive/termag/projects/webapp',
+      checkouts: [{ workstream: 'main', dir: '/home/olive/termag/projects/webapp' }, { workstream: 'feature-x', dir: '/home/olive/termag/projects/webapp/.worktrees/feature-x' }],
+    });
+    expect(r).toMatchObject({ status: 200, body: { checked: true, ok: false, reason: 'other-workstream', holder: { workstream: 'feature-x' }, message: expect.stringMatching(/Share feature-x instead/) } });
+  });
+
+  it('is fine when a reviewer would get in, and unchecked when the box gives no answer', async () => {
+    expect(await stackCheckFor(checkDeps({ ok: true, primaryUrl: 'http://localhost/' }), asUser(owner), 'p1', { workstream: 'feature-x' })).toEqual({ status: 200, body: { checked: true, ok: true } });
+    const offline = checkDeps(null);
+    expect(await stackCheckFor(offline, asUser(owner), 'p1', {})).toEqual({ status: 200, body: { checked: false } });
+    expect(offline.checkStack).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/home/olive/termag/projects/webapp' }));
+  });
+
+  it('is its owner\'s only, with sharing on, for a workstream the project has', async () => {
+    const d = checkDeps({ ok: true });
+    expect((await stackCheckFor(d, asUser(stranger), 'p1', {})).status).toBe(404);
+    expect((await stackCheckFor(checkDeps({ ok: true }, { sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', {})).status).toBe(403);
+    expect((await stackCheckFor(d, asUser(owner), 'p1', { workstream: 'gone' })).status).toBe(404);
+    expect((await stackCheckFor(d, asUser(owner), 'p1', { workstream: '../x' })).status).toBe(400);
+    expect(d.checkStack).not.toHaveBeenCalled();
   });
 });

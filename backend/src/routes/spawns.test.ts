@@ -108,9 +108,20 @@ describe('spawnFor', () => {
       baseSha: 'abc1234',
     });
     expect(vi.mocked(sendForProject).mock.calls[0][1]).toBe('write-file');
-    expect(vi.mocked(createWorkstreamFor).mock.calls[0][2]).toEqual({ name: 'add-tests', baseRef: 'abc1234', provider: 'claude', spawnId: 'ck1' });
+    expect(vi.mocked(createWorkstreamFor).mock.calls[0][2]).toEqual({ name: 'add-tests', branch: 'add-tests', baseRef: 'abc1234', provider: 'claude', spawnId: 'ck1' });
     // Its status history starts with the row, not at the sweep's next refresh.
     expect(vi.mocked(watchSpawnedSession)).toHaveBeenCalledWith({ spawnId: 'ck1', userId: 'u1', rootSpawnId: 'ck1', instanceId: BOX, session: 'me-proj-add-tests-agent' });
+  });
+
+  it('puts a spawn on the branch it asks for, named after the branch unless it names itself', async () => {
+    const r = await spawnFor(user, BOX, { task: 'Add tests', branch: 'skz/ABC-123/fix-login', from });
+    expect(r.status).toBe(201);
+    expect(vi.mocked(createWorkstreamFor).mock.calls[0][2]).toMatchObject({ name: 'skz-ABC-123-fix-login', branch: 'skz/ABC-123/fix-login' });
+    expect(JSON.stringify(vi.mocked(sendForProject).mock.calls[0][2])).toContain('on git branch skz/ABC-123/fix-login');
+
+    vi.mocked(createWorkstreamFor).mockClear();
+    await spawnFor(user, BOX, { task: 'Add tests', name: 'tests', branch: 'skz/ABC-123/fix-login', from });
+    expect(vi.mocked(createWorkstreamFor).mock.calls[0][2]).toMatchObject({ name: 'tests', branch: 'skz/ABC-123/fix-login' });
   });
 
   it('refuses an agent token that names no pane: the limits would have nothing to count', async () => {
@@ -234,6 +245,18 @@ describe('spawnFor', () => {
   it('logs a refusal that never reached the limits with its code', async () => {
     await spawnFor(user, BOX, { task: 'x', projectId: 'p1' });
     expect(refusedReasons()).toEqual(['no_pane']);
+  });
+
+  it('409s a branch another workstream of the project holds, before writing a brief', async () => {
+    prisma.project.findFirst.mockImplementation(async ({ include }: { include?: { workstreams?: { select?: unknown } } }) => (
+      include?.workstreams?.select
+        ? { ...parentProject, workstreams: [{ name: 'main', branch: 'main' }, { name: 'login', branch: 'skz/ABC-123/fix-login' }], instance: { hostHome: '/home/me', status: 'ready' } }
+        : parentProject));
+    const r = await spawnFor(user, BOX, { task: 'Add tests', branch: 'skz/ABC-123/fix-login', from });
+    expect(r.status).toBe(409);
+    expect((r.body as { code: string }).code).toBe('branch_taken');
+    expect(prisma.agentSpawn.create).not.toHaveBeenCalled();
+    expect(createWorkstreamFor).not.toHaveBeenCalled();
   });
 
   it('409s a workstream target on a parked box before writing a brief', async () => {

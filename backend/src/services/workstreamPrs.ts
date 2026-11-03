@@ -4,7 +4,8 @@
  * branch, and agents often open a PR from a plain git worktree that no
  * workstream owns. So the link is also stored, one per user and PR:
  *
- *   created  the workstream's agent ran `gh pr create` (the pr_created milestone)
+ *   created  the workstream's agent ran `gh pr create` (the pr_created milestone,
+ *            or for a chat its events: services/chatPrLinks.ts)
  *   branch   the workstream's checkout was seen on the PR's branch
  *   manual   the user attached it from the PR overlay
  *
@@ -38,6 +39,8 @@ export interface EarlierPr {
   number: number;
   workstream: WorkstreamLink;
   at: string | null;
+  /** How the link was made: the simple UI's reviews take only a manual one (a review session) as the PR's session. */
+  source: StoredLinkSource;
 }
 
 /** How many earlier PRs GET /api/prs sends: the sidebar shows a few per workstream at most. */
@@ -100,7 +103,7 @@ export function earlierLinks(
     .slice()
     .sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''))
     .slice(0, limit)
-    .map(l => ({ repo: l.repo, number: l.number, workstream: l.workstream, at: l.at ?? null }));
+    .map(l => ({ repo: l.repo, number: l.number, workstream: l.workstream, at: l.at ?? null, source: l.source }));
 }
 
 export interface AttachInput { repo: string; number: number; projectId: string; workstream: string }
@@ -181,11 +184,6 @@ export async function recordCheckoutLinks(userId: string, rows: Pick<PrRow, 'kin
   }
 }
 
-/**
- * A PR the session's agent just opened (POST /api/status/milestone,
- * pr_created): stored against the session's workstream. A session that maps
- * to no workstream (a runner session, an unknown pane) records nothing.
- */
 /** A session reported opening a PR, resolved to its owner's project and workstream (the `pr_created` milestone). */
 export interface PrCreatedEvent {
   userId: string;
@@ -207,6 +205,11 @@ export function onPrCreated(listener: (ev: PrCreatedEvent) => void): () => void 
   return () => { prCreatedListeners.delete(listener); };
 }
 
+/**
+ * A PR the session's agent just opened (POST /api/status/milestone,
+ * pr_created): stored against the session's workstream. A session that maps
+ * to no workstream (a runner session, an unknown pane) records nothing.
+ */
 export async function recordCreatedLink(
   session: string, instanceId: string | null, url: string | null,
   deps: { resolve?: typeof resolveSessionProject; store?: WorkstreamPrStore } = {},
@@ -215,8 +218,16 @@ export async function recordCreatedLink(
   if (!pr) return false;
   const resolved = await (deps.resolve ?? resolveSessionProject)(session, instanceId);
   if (!resolved || isAmbiguousSession(resolved) || !resolved.projectId || !resolved.workstream) return false;
-  const recorded = await (deps.store ?? prismaWorkstreamPrs).record(resolved.userId, pr, { projectId: resolved.projectId, workstream: resolved.workstream }, 'created');
-  const ev: PrCreatedEvent = { userId: resolved.userId, projectId: resolved.projectId, workstream: resolved.workstream, pr };
+  return recordCreatedLinkAt({ userId: resolved.userId, projectId: resolved.projectId, workstream: resolved.workstream, pr }, deps.store);
+}
+
+/**
+ * A PR opened from a workstream already known to be the user's (a chat's,
+ * services/chatPrLinks.ts; the milestone's, above): stored as `created`, and
+ * every onPrCreated listener told.
+ */
+export async function recordCreatedLinkAt(ev: PrCreatedEvent, store: WorkstreamPrStore = prismaWorkstreamPrs): Promise<boolean> {
+  const recorded = await store.record(ev.userId, ev.pr, { projectId: ev.projectId, workstream: ev.workstream }, 'created');
   for (const listener of [...prCreatedListeners]) {
     try { listener(ev); } catch (err) { console.warn(`[WORKSTREAM-PR] a pr_created listener failed: ${(err as Error).message}`); }
   }

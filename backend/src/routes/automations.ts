@@ -6,7 +6,7 @@
  *   POST /api/automations/preview               a schedule's next occurrences, in words before Save
  *   GET  /api/automations                       mine and shared with me
  *   GET  /api/automations/:id                   one, with its last 50 runs (:id is the automation's or its project's id)
- *   PATCH /api/automations/:id                  schedule, prompt, tier, enabled, …; clears a pause
+ *   PATCH /api/automations/:id                  schedule, prompt, tier, enabled, space and folder, backend and model, …; clears a pause
  *   POST /api/automations/:id/run               a manual occurrence now (202)
  *   POST /api/automations/:id/runs/:runId/stop  interrupt a live run
  *   POST /api/automations/:id/runs/:runId/retire remove a finished run's worktree (:runId: the run's id or its workstream's)
@@ -30,13 +30,17 @@ import { automationLimitsFor, type AutomationLimits } from '../services/automati
 import { estimateMinutesPerDay, minGapMinutes, nextOccurrence, nextOccurrences, occurrenceMinute, parseSchedule, parseTimezone } from '../services/automations/schedule';
 import { automationFor, automationView, automationsFor, runsFor, type AutomationRow } from '../services/automations/store';
 import { chatKeyFor } from '../services/chatRunner';
+import { fireworksOfferedTo } from '../services/fireworksFlag';
+import { mainAgentRow, namesModelChoice, parseModelChoice } from '../services/automations/model';
 import { memoryDir } from '../services/automations/runner';
-import { SYNC_REFUSAL_TEXT, checkSpaceForOwner } from '../services/automations/memorySync';
+import { SPACE_FOLDER_FLAG, SYNC_REFUSAL_TEXT, checkSpaceForOwner, publishReadmeFor } from '../services/automations/spaceSync';
+import { chosenFolderRefusal, spaceFolderFor } from '../services/automations/spaceFolder';
 import { boolVariation } from '../services/featureFlags';
 import { isReservedProjectName, RESERVED_NAME_ERROR } from './projectNames';
 import { archiveOwnedProject, createProjectFor } from './projects';
 import { RouteResult, sendResult } from './routeResult';
 import { removeWorkstreamFor } from './workstreams';
+import { forgetT3Hook, parseT3Fields, saveT3Hook, T3_AUTOMATION_KIND, t3HookStoreReady, T3HookStoreUnavailable } from '../services/automations/t3Hook';
 
 const MAX_PROMPT = 20_000;
 
@@ -99,6 +103,16 @@ async function flagFor(user: Express.User, instanceId: string | null): Promise<b
   return boolVariation(AUTOMATIONS_FLAG, user, false, box);
 }
 
+/**
+ * The folder is fixed (spaceFolder.ts): a body naming another is a 400, not
+ * ignored, so a caller never believes its folder was used. The fixed one
+ * itself goes through, so a client that sends the view back can still save.
+ */
+function folderRefused(raw: unknown, fixed: string | null): RouteResult | null {
+  const error = chosenFolderRefusal(raw, fixed);
+  return error ? { status: 400, body: { error, code: 'space_folder_fixed' } } : null;
+}
+
 const disabled: RouteResult = { status: 403, body: { error: 'Automations are not enabled for you on this box', code: 'automations_disabled' } };
 
 export async function createAutomationFor(user: Express.User, raw: unknown): Promise<RouteResult> {
@@ -125,7 +139,20 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
     const space = await checkSpaceForOwner(user.id, settings.value.spaceName);
     if (!space.ok) return { status: 400, body: { error: SYNC_REFUSAL_TEXT[space.reason], code: space.reason } };
   }
+  // The folder is .termag/automations/<id> (decision 13): no id yet, so no folder can match it.
+  const refused = folderRefused(body.spaceFolder, null);
+  if (refused) return refused;
   const tier = settings.value.tier ?? 'full';
+  // A t3 automation runs a T3 Code scheduled task on its box (services/automations/t3Hook.ts).
+  const kind = body.kind === undefined || body.kind === 'chat' ? 'chat' : body.kind === T3_AUTOMATION_KIND ? T3_AUTOMATION_KIND : null;
+  if (!kind) return { status: 400, body: { error: 'kind is chat or t3' } };
+  const t3 = kind === T3_AUTOMATION_KIND ? parseT3Fields(body.t3) : null;
+  if (t3 && !t3.ok) return { status: 400, body: { error: t3.error } };
+  // Before anything is made: with no store the webhook couldn't be kept, and a
+  // project archived behind the refusal would block the name on a retry.
+  if (t3 && !t3HookStoreReady()) {
+    return { status: 503, body: { error: "This termag has no credential store, so it cannot keep a T3 task's webhook", code: 'credential_store_off' } };
+  }
   if (body.repoUrl !== undefined && body.repoUrl !== null && typeof body.repoUrl !== 'string') return { status: 400, body: { error: 'repoUrl must be a string' } };
   if (body.defaultBranch !== undefined && body.defaultBranch !== null && typeof body.defaultBranch !== 'string') return { status: 400, body: { error: 'defaultBranch must be a string' } };
 
@@ -166,6 +193,7 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
       data: {
         projectId: project.id, userId: user.id,
         schedule: sched.value.schedule, timezone: sched.value.timezone, prompt: settings.value.prompt!,
+        kind, t3TaskId: t3?.ok ? t3.value.taskId : null,
         tier, enabled: settings.value.enabled ?? true, prOnChange: settings.value.prOnChange ?? true,
         wakeBox: settings.value.wakeBox ?? false, notifySlack: settings.value.notifySlack ?? false,
         maxRunMinutes: Math.min(settings.value.maxRunMinutes ?? 60, limits.maxRunMinutes),
@@ -180,7 +208,23 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
     await archiveOwnedProject(user, project.id).catch(() => {});
     throw err;
   }
+  if (t3?.ok) {
+    try {
+      await saveT3Hook(user.id, automation.id, t3.value.hookPath);
+    } catch (err) {
+      // No webhook kept, no automation: it could never run.
+      await prisma.automation.delete({ where: { id: automation.id } }).catch(() => {});
+      await archiveOwnedProject(user, project.id).catch(() => {});
+      if (err instanceof T3HookStoreUnavailable) return { status: 503, body: { error: err.message, code: 'credential_store_off' } };
+      throw err;
+    }
+  }
+  // The folder is derived from the id, which the row has only now.
+  if (automation.spaceName) {
+    automation = await prisma.automation.update({ where: { id: automation.id }, data: { spaceFolder: spaceFolderFor(automation.id) }, include: { project: { select: { name: true, instanceId: true, repoUrl: true, repoDefaultBranch: true, archived: true, userId: true } } } });
+  }
   console.log(`[AUTOMATION] ${user.unixUsername} created ${name} (${sched.value.schedule} ${sched.value.timezone}, ${tier})`);
+  if (automation.spaceName && await boolVariation(SPACE_FOLDER_FLAG, user, false)) void publishReadmeFor(automation.id);
   return { status: 201, body: { project: created.body, automation: await automationView(automation as AutomationRow, user.id, now), next: nextOccurrences(sched.value.schedule, sched.value.timezone, now, 3).map(d => d.toISOString()) } };
 }
 
@@ -247,20 +291,57 @@ export async function updateAutomationFor(user: Express.User, id: string, raw: u
   }
   const settings = parseSettings(body, limits, false);
   if (!settings.ok) return { status: 400, body: { error: settings.error } };
+  const rest = settings.value;
+  const folders = await boolVariation(SPACE_FOLDER_FLAG, user, false);
+  // The fixed folder, or the one the row still has from before it (until the move script moves it).
+  const refused = folderRefused(body.spaceFolder, a.spaceFolder ?? spaceFolderFor(a.id));
+  if (refused) return refused;
+  const nextSpace = rest.spaceName !== undefined ? rest.spaceName : a.spaceName;
+  const spaceChanged = !!nextSpace && nextSpace !== a.spaceName;
   // A space is checked when it is chosen, not on every save that carries the
   // same name back: with spaces-enabled off later, the owner could otherwise
   // save nothing (the picker is hidden then) until the mirror was cleared.
-  if (settings.value.spaceName && settings.value.spaceName !== a.spaceName) {
-    const space = await checkSpaceForOwner(user.id, settings.value.spaceName, a.projectId);
+  if (spaceChanged) {
+    const space = await checkSpaceForOwner(user.id, nextSpace!, a.projectId);
     if (!space.ok) return { status: 400, body: { error: SYNC_REFUSAL_TEXT[space.reason], code: space.reason } };
   }
-  Object.assign(data, settings.value);
-  if (settings.value.enabled === true && !a.enabled) {
+  // The model the next run starts on lives on main's agent row (services/automations/model.ts); a run already made keeps its own.
+  let agentChange: { id: string; backend: string | null; model: string | null } | null = null;
+  if (namesModelChoice(body)) {
+    const agent = await mainAgentRow(a.projectId);
+    if (!agent?.provider) return { status: 409, body: { error: 'This automation has no agent to change the model of', code: 'no_agent' } };
+    const fireworks = body.backend === 'fireworks' ? await fireworksOfferedTo(user) : null;
+    const choice = parseModelChoice(body, agent.provider, fireworks);
+    if (!choice.ok) return { status: 400, body: { error: choice.error } };
+    if (choice.choice.backend === 'fireworks' && !a.project.instanceId) return { status: 400, body: { error: 'Fireworks models run only on a box' } };
+    if (choice.choice.backend !== agent.backend || choice.choice.model !== agent.model) agentChange = { id: agent.id, ...choice.choice };
+  }
+  Object.assign(data, rest);
+  // A t3 automation's task, or its webhook after a rotation, saved again from the desktop.
+  if (body.t3 !== undefined) {
+    if (a.kind !== T3_AUTOMATION_KIND) return { status: 400, body: { error: 't3 is only for an automation that runs a T3 task' } };
+    const t3 = parseT3Fields(body.t3);
+    if (!t3.ok) return { status: 400, body: { error: t3.error } };
+    try {
+      await saveT3Hook(user.id, a.id, t3.value.hookPath);
+    } catch (err) {
+      if (err instanceof T3HookStoreUnavailable) return { status: 503, body: { error: err.message, code: 'credential_store_off' } };
+      throw err;
+    }
+    data.t3TaskId = t3.value.taskId;
+  }
+  // Attaching a space, or another one, puts the automation in its fixed folder there; detaching keeps the column.
+  if (spaceChanged) data.spaceFolder = spaceFolderFor(a.id);
+  if (rest.enabled === true && !a.enabled) {
     const enabledCount = await prisma.automation.count({ where: { userId: user.id, enabled: true, project: { archived: false } } });
     if (enabledCount >= limits.maxEnabledPerUser) return { status: 429, body: { error: `you already have ${enabledCount} automations enabled (limit ${limits.maxEnabledPerUser})`, code: 'automation_limit' } };
   }
-  if (settings.value.tier === 'full' && !a.project.archived) {
+  if (rest.tier === 'full' && !a.project.archived) {
     await prisma.project.updateMany({ where: { id: a.projectId, chatTrustedAt: null }, data: { chatTrustedAt: new Date() } });
+  }
+  if (agentChange) {
+    await prisma.workflow.update({ where: { id: agentChange.id }, data: { backend: agentChange.backend, model: agentChange.model } });
+    console.log(`[AUTOMATION] ${user.unixUsername} ${a.project.name}: next runs on ${agentChange.backend ?? 'default'} ${agentChange.model ?? '(default model)'}`);
   }
   const now = new Date();
   const schedule = (data.schedule as string | undefined) ?? a.schedule;
@@ -271,6 +352,8 @@ export async function updateAutomationFor(user: Express.User, id: string, raw: u
     data: { ...data, pausedReason: null, consecutiveFailures: 0, nextRunAt: nextOccurrence(schedule, timezone, now), lastOccurrence: now },
     include: { project: { select: { name: true, instanceId: true, repoUrl: true, repoDefaultBranch: true, archived: true, userId: true } } },
   });
+  // The README says what the automation is: a save may have changed that.
+  if (folders && updated.spaceName) void publishReadmeFor(updated.id);
   return { status: 200, body: await automationView(updated as AutomationRow, user.id, now) };
 }
 
@@ -365,7 +448,10 @@ export async function memoryFor(user: Express.User, id: string): Promise<RouteRe
 export async function deleteAutomationFor(user: Express.User, id: string): Promise<RouteResult> {
   const a = await owned(user, id);
   if (isResult(a)) return a;
-  return archiveOwnedProject(user, a.projectId);
+  const archived = await archiveOwnedProject(user, a.projectId);
+  // Its webhook can start the T3 task on the box: an archived automation keeps none.
+  if (a.kind === T3_AUTOMATION_KIND && archived.status < 300) await forgetT3Hook(user.id, a.id).catch(() => {});
+  return archived;
 }
 
 export function automationsRouter(): Router {

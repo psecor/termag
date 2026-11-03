@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../db', () => ({ prisma: {} }));
 
-const { applyLinks, earlierLinks, onPrCreated, parsePrUrl, recordCreatedLink, replaces } = await import('./workstreamPrs');
+const { applyLinks, earlierLinks, onPrCreated, parsePrUrl, recordCreatedLink, recordCreatedLinkAt, replaces } = await import('./workstreamPrs');
 type Row = Parameters<typeof applyLinks>[0][number];
 
 const MINE = { projectId: 'p1', projectName: 'termag', workstream: 'termag-pr-dash' };
@@ -86,6 +86,20 @@ describe('recordCreatedLink', () => {
       await recordCreatedLink('s', null, URL, { resolve: vi.fn(async () => null), store });
       expect(seen).toHaveLength(1);
     } finally { off1(); off2(); warn.mockRestore(); }
+  });
+});
+
+describe('recordCreatedLinkAt', () => {
+  it('stores a PR at a workstream already resolved (a chat\'s) and tells the listeners', async () => {
+    const seen: unknown[] = [];
+    const off = onPrCreated(ev => { seen.push(ev); });
+    try {
+      const record = vi.fn(async () => true);
+      const ev = { userId: 'u1', projectId: 'p1', workstream: 'main', pr: { repo: 'example-org/termag', number: 844 } };
+      expect(await recordCreatedLinkAt(ev, { record, list: vi.fn(), detach: vi.fn() })).toBe(true);
+      expect(record).toHaveBeenCalledWith('u1', { repo: 'example-org/termag', number: 844 }, { projectId: 'p1', workstream: 'main' }, 'created');
+      expect(seen).toEqual([ev]);
+    } finally { off(); }
   });
 });
 

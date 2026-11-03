@@ -1,6 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import {
+  parseAskSender,
+  senderParentAllowed,
+  parseAskClaudeSession,
+  MAX_ASK_TITLE_CHARS,
   ASK_CHAT_CAPABILITY,
+  steerDecision,
+  steerRefusalText,
+  supersededReplyMode,
+  answeredTogether,
+  waitsForThread,
   askChatSendRefusal,
   askChatWorkstreamName,
   MAX_ACTIVE_ASKS,
@@ -13,6 +22,8 @@ import {
   capRefusal,
   ownerOnlyRefusal,
   askTarget,
+  askCwd,
+  repoTarget,
   cancelDecision,
   cancelShouldStop,
   isTerminal,
@@ -50,22 +61,41 @@ import {
   setupRefusal,
   targetAskable,
   targetCard,
+  threadTarget,
   truncateUtf8,
   type TargetCandidate,
 } from './agentMessages';
 
 describe('parseAskRef', () => {
   it('reads box/project and box/project@workstream', () => {
-    expect(parseAskRef('devbox/api')).toEqual({ box: 'devbox', project: 'api', workstream: null });
-    expect(parseAskRef(' devbox/api@fix-1 ')).toEqual({ box: 'devbox', project: 'api', workstream: 'fix-1' });
+    expect(parseAskRef('devbox/api')).toEqual({ box: 'devbox', project: 'api', workstream: null, repo: null });
+    expect(parseAskRef(' devbox/api@fix-1 ')).toEqual({ box: 'devbox', project: 'api', workstream: 'fix-1', repo: null });
+  });
+
+  it('reads a multi-repo project\'s repository after a colon, with or without a workstream', () => {
+    expect(parseAskRef('devbox/shop:shop-web')).toEqual({ box: 'devbox', project: 'shop', workstream: null, repo: 'shop-web' });
+    expect(parseAskRef('devbox/shop@fix:shop_api2')).toEqual({ box: 'devbox', project: 'shop', workstream: 'fix', repo: 'shop_api2' });
   });
 
   it('refuses anything else', () => {
-    for (const bad of ['api', 'a/b/c', 'a/b@', 'a/b@c@d', 'a b/c', '/c', 'a/']) expect(parseAskRef(bad)).toBeNull();
+    for (const bad of ['api', 'a/b/c', 'a/b@', 'a/b@c@d', 'a b/c', '/c', 'a/', 'a/b:', 'a/b:-web', 'a/b:x:y', 'a/b:x@ws', 'a/b:x.y', 'a/b@:x']) {
+      expect(parseAskRef(bad)).toBeNull();
+    }
   });
 });
 
 describe('parseAskBody', () => {
+  it('reads --update-pr as a number, owner/name#number or a PR URL', () => {
+    expect(parseAskBody({ target: 'box/p', prompt: 'x' })).toMatchObject({ targetPr: null });
+    expect(parseAskBody({ target: 'box/p', prompt: 'x', pr: 753 })).toMatchObject({ targetPr: { number: 753, repo: null } });
+    expect(parseAskBody({ target: 'box/p', prompt: 'x', pr: '#753' })).toMatchObject({ targetPr: { number: 753, repo: null } });
+    expect(parseAskBody({ target: 'box/p', prompt: 'x', pr: 'org/api#753' })).toMatchObject({ targetPr: { number: 753, repo: 'org/api' } });
+    expect(parseAskBody({ target: 'box/p', prompt: 'x', pr: 'https://github.com/org/api/pull/753' })).toMatchObject({ targetPr: { number: 753, repo: 'org/api' } });
+    for (const pr of ['0', 'abc', 'org/api', 'https://example.com/org/api/pull/1', '../x#1', -1, true]) {
+      expect(parseAskBody({ target: 'box/p', prompt: 'x', pr })).toHaveProperty('error');
+    }
+  });
+
   it('defaults the workstream to main', () => {
     expect(parseAskBody({ target: 'box/p', prompt: 'hi' })).toMatchObject({ workstream: 'main', threadId: null });
     expect(parseAskBody({ projectId: 'p1', prompt: 'hi' })).toMatchObject({ ref: null, projectId: 'p1', workstream: 'main' });
@@ -90,6 +120,16 @@ describe('parseAskBody', () => {
     expect(parseAskBody({ target: 'b/p', prompt: 'x', messageId: 'NOT-AN-ID-AT-ALL' })).toHaveProperty('error');
   });
 
+  it('takes the repository from the ref or the body, not two different ones', () => {
+    expect(parseAskBody({ target: 'box/p', prompt: 'x' })).toMatchObject({ repo: null });
+    expect(parseAskBody({ target: 'box/p@ws:web', prompt: 'x' })).toMatchObject({ workstream: 'ws', repo: 'web' });
+    expect(parseAskBody({ projectId: 'p', repo: 'web', prompt: 'x' })).toMatchObject({ repo: 'web' });
+    expect(parseAskBody({ target: 'box/p:web', repo: 'web', prompt: 'x' })).toMatchObject({ repo: 'web' });
+    expect(parseAskBody({ target: 'box/p:web', repo: 'api', prompt: 'x' })).toEqual({ error: expect.stringMatching(/named twice/) });
+    expect(parseAskBody({ projectId: 'p', repo: '../etc', prompt: 'x' })).toEqual({ error: 'repo is not a repository name' });
+    expect(parseAskBody({ projectId: 'p', repo: 7, prompt: 'x' })).toHaveProperty('error');
+  });
+
   it('refuses a box field: the project identifies its box', () => {
     expect(parseAskBody({ target: 'b/p', prompt: 'x', box: 'devbox' })).toEqual({ error: expect.stringMatching(/names a project/) });
     expect(parseAskBody({ projectId: 'p', prompt: 'x', instanceId: 'inst_1' })).toEqual({ error: expect.stringMatching(/names a project/) });
@@ -100,7 +140,7 @@ describe('pickTarget', () => {
   const c = (id: string, owner: string, isOwner: boolean): TargetCandidate => ({
     projectId: id, projectName: 'api', boxName: 'devbox', ownerUsername: owner, isOwner,
   });
-  const ref = { box: 'devbox', project: 'api', workstream: null };
+  const ref = { box: 'devbox', project: 'api' };
 
   it('prefers the caller\'s own project', () => {
     expect(pickTarget([c('shared', 'bob', false), c('mine', 'alice', true)], ref)).toEqual({ projectId: 'mine' });
@@ -118,7 +158,7 @@ describe('pickTarget', () => {
 
 describe('askBranch and askTarget', () => {
   it('keeps the branch a legal ref', () => {
-    expect(askBranch('zmayberry', 'clx1')).toBe('termag-zmayberry/clx1');
+    expect(askBranch('zmay', 'clx1')).toBe('termag-zmay/clx1');
     expect(askBranch('first.last', 'clx1')).toBe('termag-first-last/clx1');
     expect(askBranch('...', 'clx1')).toBe('termag-user/clx1');
   });
@@ -126,6 +166,54 @@ describe('askBranch and askTarget', () => {
   it('leaves @main out', () => {
     expect(askTarget('box', 'p', 'main')).toBe('box/p');
     expect(askTarget('box', 'p', 'fix')).toBe('box/p@fix');
+  });
+
+  it('writes a multi-repo project\'s repository last', () => {
+    expect(askTarget('box', 'shop', 'main', 'web')).toBe('box/shop:web');
+    expect(askTarget('box', 'shop', 'fix', 'web')).toBe('box/shop@fix:web');
+    expect(askTarget('box', 'p', 'fix', null)).toBe('box/p@fix');
+  });
+});
+
+describe('repoTarget', () => {
+  const shop = { workspace: true, repos: ['shop-web', 'shop-api'], target: 'box/shop@fix' };
+  const single = { workspace: false, repos: [], target: 'box/api' };
+
+  it('runs a single-repository ask where it always did, and refuses a repository there', () => {
+    expect(repoTarget(single, null, false)).toEqual({ repo: null });
+    expect(repoTarget(single, null, true)).toEqual({ repo: null });
+    expect(repoTarget(single, 'web', true)).toEqual({
+      error: 'box/api has one repository, so it takes no ":web"; ask box/api', code: 'not_multi_repo',
+    });
+  });
+
+  it('runs an ask into a multi-repo project in the repository it names', () => {
+    expect(repoTarget(shop, 'shop-api', true)).toEqual({ repo: 'shop-api' });
+  });
+
+  it('refuses a bare ask into a multi-repo project, listing its repositories in order', () => {
+    expect(repoTarget(shop, null, true)).toEqual({
+      error: 'box/shop@fix holds several repositories (shop-web, shop-api); name one, as box/shop@fix:<repo>',
+      code: 'repo_required', repos: ['shop-web', 'shop-api'],
+    });
+  });
+
+  it('refuses a repository the project does not hold, listing those it does', () => {
+    expect(repoTarget(shop, 'shop-db', true)).toEqual({
+      error: 'box/shop@fix has no repository shop-db; it holds shop-web, shop-api', code: 'unknown_repo', repos: ['shop-web', 'shop-api'],
+    });
+  });
+
+  it('refuses every ask into a multi-repo project with multi-repo-projects-enabled off', () => {
+    for (const repo of [null, 'shop-web']) expect(repoTarget(shop, repo, false)).toMatchObject({ code: 'multi_repo_disabled' });
+  });
+});
+
+describe('askCwd', () => {
+  it('is the workstream folder, or the repository in it', () => {
+    expect(askCwd('/home/u/termag/projects/api', null)).toBe('/home/u/termag/projects/api');
+    expect(askCwd('/home/u/termag/projects/shop', 'web')).toBe('/home/u/termag/projects/shop/web');
+    expect(askCwd('/home/u/termag/projects/shop/.worktrees/fix/', 'web')).toBe('/home/u/termag/projects/shop/.worktrees/fix/web');
   });
 });
 
@@ -149,7 +237,7 @@ describe('parseRunResult', () => {
   it('keeps well-formed fields and drops the rest', () => {
     expect(parseRunResult({
       result: 'ok', sessionId: 'bad id!', numTurns: -1, baseSha: 'xyz', repo: 'a/../b', isError: 'yes', bundle: 1, prDescription: 7,
-    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {} });
+    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {}, pushes: null });
     expect(parseRunResult({ result: 'ok', prDescription: '  \n' })).toMatchObject({ prDescription: null });
     expect(parseRunResult({ result: 'ok', prDescription: '# T\nbody' })).toMatchObject({ prDescription: '# T\nbody' });
   });
@@ -169,6 +257,48 @@ describe('parseRunResult', () => {
 
   it('needs a result string', () => {
     expect(parseRunResult({})).toHaveProperty('error');
+  });
+
+  it('reads the branches a push-mode clone pushed, and null from a runner that sent a bundle', () => {
+    const sha = 'a'.repeat(40);
+    expect(parseRunResult({ result: 'ok', bundle: true })).toMatchObject({ pushes: null });
+    expect(parseRunResult({ result: 'ok', pushes: [] })).toMatchObject({ pushes: [] });
+    const r = parseRunResult({
+      result: 'ok',
+      pushes: [
+        { branch: 'termag-ada/t1', sha }, { branch: 'termag-ada/t1', sha }, { branch: '../x', sha }, { branch: '-x', sha },
+        { branch: 'a//b', sha }, { branch: 'x.lock', sha }, { branch: 'ok/branch', sha: 'nope' }, 'junk', { branch: 'feature/x-1', sha },
+      ],
+    });
+    expect('pushes' in r && r.pushes).toEqual([{ branch: 'termag-ada/t1', sha }, { branch: 'feature/x-1', sha }]);
+  });
+});
+
+describe('runSystemPrompt with push (ask-push-v1)', () => {
+  const base = { senderUsername: 'ada', senderDisplayName: 'Ada', target: 'devbox/api', branch: 'termag-ada/t1' };
+  it('tells the run to push its branch and open a draft PR itself, never through termag publish', () => {
+    const p = runSystemPrompt({ ...base, push: true });
+    expect(p).toContain('git push origin HEAD:termag-ada/t1');
+    expect(p).toContain('termag-pr-create <title file> <body file> --draft');
+    expect(p).toContain('git switch -c termag-ada/t1-<name> origin/<default branch>');
+    expect(p).not.toContain('termag/base');
+    expect(p).not.toContain('TERMAG_ASK_PR_DIR');
+  });
+
+  it("on a thread that updates another PR, pushes that PR's branch after pulling it", () => {
+    const p = runSystemPrompt({ ...base, push: true, targetPr: { number: 753, repo: 'org/api', branch: 'feat/x', checkout: '/c' } });
+    expect(p).toContain('pull request #753 in org/api');
+    expect(p).toContain('git pull --ff-only');
+    expect(p).toContain('git push origin HEAD:feat/x');
+  });
+});
+
+describe('runSystemPrompt: termag bugs', () => {
+  it('tells both kinds of run to file a termag bug even after working around it', () => {
+    const base = { senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' };
+    for (const p of [runSystemPrompt(base), runSystemPrompt({ ...base, push: true })]) {
+      expect(p).toContain('If a termag command or feature misbehaves, even if you find a workaround, file it with `termag bug report` (the termag-bug-report skill).');
+    }
   });
 });
 
@@ -196,6 +326,17 @@ describe('runSystemPrompt', () => {
     expect(p).toContain('Work only in this clone');
     expect(p).toContain('never push');
     expect(p).not.toMatch(/sandbox|no network/);
+  });
+
+  it('tells the run never to add a git remote, and how to fetch main without one (#940)', () => {
+    // A remote `ask` does not track makes every later turn on the thread read-only.
+    const p = runSystemPrompt({ senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t', checkout: '/home/u/p' });
+    expect(p).toContain('Never add or change a git remote in this clone');
+    expect(p).toContain('read-only');
+    // Unshallowed while the clone is shallow (Bugbot, #940): a depth-1 clone whose base is not on
+    // main has no merge base with it, and `git merge` refuses "unrelated histories".
+    expect(p).toContain(`git fetch $([ -f .git/shallow ] && echo --unshallow) --no-tags "$(git -C '/home/u/p' remote get-url origin)" '+refs/heads/main:refs/remotes/termag/main'`);
+    expect(p).toContain('git merge refs/remotes/termag/main');
   });
 
   it('tells the run where a PR description goes, outside the git tree', () => {
@@ -239,7 +380,7 @@ describe('ownerOnlyRefusal', () => {
 
 describe('capRefusal', () => {
   it(`lets an ask through below ${MAX_ACTIVE_ASKS} active asks`, () => {
-    expect(MAX_ACTIVE_ASKS).toBe(10);
+    expect(MAX_ACTIVE_ASKS).toBe(20);
     expect(capRefusal(0)).toBeNull();
     expect(capRefusal(MAX_ACTIVE_ASKS - 1)).toBeNull();
   });
@@ -494,6 +635,11 @@ describe('rejection', () => {
       body: { error: 'box-1 is not connected (stopped)', code: 'box_offline', status: 'rejected', message: 'cabcdef12345', thread: null },
     });
   });
+
+  it('carries extra fields, never over its own', () => {
+    expect(rejection(409, 'name one', 'repo_required', { messageId: null, threadId: null }, { repos: ['web', 'api'], code: 'x' }).body)
+      .toEqual({ repos: ['web', 'api'], error: 'name one', code: 'repo_required', status: 'rejected', message: null, thread: null });
+  });
 });
 
 describe('replayDecision', () => {
@@ -509,6 +655,9 @@ describe('replayDecision', () => {
     expect(replayDecision(existing, { ...req, userId: 'u2' })).toBe('taken');
     expect(replayDecision(existing, { ...req, projectId: 'p2' })).toBe('different');
     expect(replayDecision(existing, { ...req, workstream: 'ws' })).toBe('different');
+    expect(replayDecision(existing, { ...req, repo: 'web' })).toBe('different');
+    expect(replayDecision({ ...existing, repo: 'web' }, { ...req, repo: 'api' })).toBe('different');
+    expect(replayDecision({ ...existing, repo: 'web' }, { ...req, repo: 'web' })).toBe('same');
     expect(replayDecision(existing, { ...req, threadId: 't2' })).toBe('different');
     expect(replayDecision(existing, { ...req, promptBytes: 11 })).toBe('different');
   });
@@ -529,6 +678,15 @@ describe('parseStatusDescription', () => {
 
   it('caps the length', () => {
     expect(Buffer.byteLength(parseStatusDescription(`---\nstatus_description: ${'a'.repeat(900)}\n---\n`)!)).toBeLessThanOrEqual(500);
+  });
+});
+
+describe('threadTarget', () => {
+  it("names the thread's target as a follow-up must, and what the simple UI calls its chat", () => {
+    const t = { id: 'thr1', title: ' Members-only composer (#765) ', sessionTitle: null, updatedAt: new Date('2026-10-28T12:00:00Z'), box: 'box-1', project: 'shop', workstream: 'main', repoName: null };
+    expect(threadTarget(t)).toEqual({ thread: 'thr1', title: 'Members-only composer (#765)', sessionTitle: null, target: 'box-1/shop', updatedAt: '2026-10-28T12:00:00.000Z' });
+    expect(threadTarget({ ...t, title: '', sessionTitle: 'Gate the composer', workstream: 'fix', repoName: 'shop-web' }))
+      .toMatchObject({ title: null, sessionTitle: 'Gate the composer', target: 'box-1/shop@fix:shop-web' });
   });
 });
 
@@ -555,6 +713,12 @@ describe('targetCard', () => {
     expect(targetCard({ ...t, workstream: 'fix', description: null })).toMatchObject({ name: 'box-1/api@fix', description: '' });
   });
 
+  it("carries the session's title, null before it has one", () => {
+    expect(targetCard(t).capabilities.extensions[0].params.sessionTitle).toBeNull();
+    expect(targetCard({ ...t, sessionTitle: '  ' }).capabilities.extensions[0].params.sessionTitle).toBeNull();
+    expect(targetCard({ ...t, sessionTitle: ' Fix login redirect ' }).capabilities.extensions[0].params.sessionTitle).toBe('Fix login redirect');
+  });
+
   it('says why a target would be rejected', () => {
     expect(targetAskable({ ...t, connected: false, boxStatus: 'stopped' })).toEqual({ askable: false, reason: expect.stringContaining('not connected (stopped)') });
     expect(targetAskable({ ...t, capabilities: [] })).toEqual({ askable: false, reason: expect.stringContaining("can't run asks") });
@@ -571,6 +735,14 @@ describe('targetCard', () => {
     expect(targetAskable({ ...t, connected: false, boxStatus: 'stopped', wakes: true, setupStatus: 'cloning' }).askable).toBe(true);
   });
 
+  it('names a multi-repo project\'s repository, and says why a target is refused whatever its box says', () => {
+    const card = targetCard({ ...t, project: 'shop', workstream: 'fix', repo: 'shop-web' });
+    expect(card.name).toBe('box-1/shop@fix:shop-web');
+    expect(card.capabilities.extensions[0].params).toMatchObject({ project: 'shop', workstream: 'fix', repo: 'shop-web', askable: true });
+    expect(targetCard(t).capabilities.extensions[0].params).not.toHaveProperty('repo');
+    expect(targetAskable({ ...t, refused: 'not on for you' })).toEqual({ askable: false, reason: 'not on for you' });
+  });
+
   it('still refuses a cloning project the box could never run an ask for', () => {
     expect(targetAskable({ ...t, setupStatus: 'cloning', capabilities: [] })).toEqual({ askable: false, reason: expect.stringContaining("can't run asks") });
     expect(targetAskable({ ...t, setupStatus: 'cloning', connected: false, boxStatus: 'ready' })).toEqual({ askable: false, reason: expect.stringContaining('not connected (ready)') });
@@ -585,7 +757,7 @@ describe('prBody', () => {
     const lines = body.split('\n');
     expect(lines[0]).toBe('<!-- TERMAG_PR_BODY_BEGIN -->');
     expect(lines[1]).toContain('Opened by `termag ask` for ada');
-    expect(body.endsWith('<!-- TERMAG_PR_BODY_END -->\n\n<!-- termag: box=i-0abc123 project=api ask=thr1234567890 -->\n<sub>Opened from termag</sub>\n')).toBe(true);
+    expect(body.endsWith('<!-- TERMAG_PR_BODY_END -->\n\n<!-- termag: box=i-0abc123 project=api ask=thr1234567890 -->\n<sub>Opened from termag</sub>\n')).toBe(true); // gitleaks:allow (not a key: the PR body footer)
   });
 
   it('keeps marker values from closing the comment', () => {
@@ -669,5 +841,128 @@ describe('an ask thread\'s chat', () => {
   it('needs a box agent that runs asks as chats', () => {
     expect(askChatSendRefusal({ userId: 'u1', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: ['chat-runner-v1'] }))
       .toMatchObject({ status: 409, body: { code: 'runner-missing' } });
+  });
+});
+
+describe('ask thread titles', () => {
+  // The person on #743: callers name their threads; nothing is derived, and an untitled thread shows its id.
+  it('takes --title as given, on one line, and never one from the prompt', () => {
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: '  Members-only file composer (#765) ' })).toMatchObject({ title: 'Members-only file composer (#765)' });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: 'Fix\nthe   rows' })).toMatchObject({ title: 'Fix the rows' });
+    // Markdown and names are the caller's: kept as typed.
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: 'Keep `snake_case` and **this**' })).toMatchObject({ title: 'Keep `snake_case` and **this**' });
+    expect(parseAskBody({ target: 'box/p', prompt: '# A heading that is not a title\n\nBody' })).toMatchObject({ title: null });
+    expect(parseAskBody({ target: 'box/p', prompt: 'First line, not a title' })).toMatchObject({ title: null });
+  });
+
+  it(`caps a title at ${MAX_ASK_TITLE_CHARS} characters and refuses an empty or non-string one`, () => {
+    expect(MAX_ASK_TITLE_CHARS).toBe(60);
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: 'x'.repeat(60) })).toMatchObject({ title: 'x'.repeat(60) });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: 'x'.repeat(61) })).toEqual({ error: 'title is too long (at most 60 characters)' });
+    // Characters, not bytes or UTF-16 units.
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: '🙂'.repeat(60) })).toMatchObject({ title: '🙂'.repeat(60) });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: '' })).toEqual({ error: 'title is empty' });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: '  \n ' })).toEqual({ error: 'title is empty' });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: 3 })).toEqual({ error: 'title must be a string' });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', title: null })).toMatchObject({ title: null });
+  });
+});
+
+describe('who asked', () => {
+  it('takes a pane session or a chat turn project and workstream, and drops anything else', () => {
+    expect(parseAskSender({ session: 'alice-termag-3-agent' })).toEqual({ session: 'alice-termag-3-agent' });
+    expect(parseAskSender({ projectId: 'cmp1', workstream: 'main' })).toEqual({ projectId: 'cmp1', workstream: 'main' });
+    expect(parseAskSender({ session: 'a b; rm -rf' })).toBeNull();
+    expect(parseAskSender({ projectId: 'cmp1' })).toBeNull();
+    expect(parseAskSender('alice-termag-3-agent')).toBeNull();
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', sender: { session: 'alice-p-agent' } })).toMatchObject({ sender: { session: 'alice-p-agent' } });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi' })).toMatchObject({ sender: null });
+  });
+
+  it("keeps the asking Claude Code session id beside either sender, or alone, and drops a malformed one", () => {
+    const id = '0b7c2f7e-1c1d-4c55-9a43-2f0e6d1b8a10';
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', sender: { projectId: 'cmp1', workstream: 'main', claudeSession: id } }))
+      .toMatchObject({ sender: { projectId: 'cmp1', workstream: 'main' }, senderClaudeSession: id });
+    expect(parseAskBody({ target: 'box/p', prompt: 'hi', sender: { claudeSession: id } })).toMatchObject({ sender: null, senderClaudeSession: id });
+    for (const bad of ['a,b=c', 'short', 'x'.repeat(65), 7]) expect(parseAskClaudeSession({ claudeSession: bad })).toBeNull();
+    expect(parseAskClaudeSession(null)).toBeNull();
+  });
+
+  it("accepts only the asker's own live workstream, on the box that sent the ask", () => {
+    const p = { userId: 'u1', archived: false, instanceId: 'box1', workstreams: [{ name: 'main', archived: false }, { name: 'old', archived: true }] };
+    expect(senderParentAllowed(p, 'main', 'u1', 'box1')).toBe(true);
+    expect(senderParentAllowed(p, 'main', 'u1', null)).toBe(true);
+    expect(senderParentAllowed(p, 'main', 'u1', 'box2')).toBe(false);
+    expect(senderParentAllowed(p, 'main', 'u2', 'box1')).toBe(false);
+    expect(senderParentAllowed(p, 'old', 'u1', 'box1')).toBe(false);
+    expect(senderParentAllowed(p, 'nope', 'u1', 'box1')).toBe(false);
+    expect(senderParentAllowed({ ...p, archived: true }, 'main', 'u1', 'box1')).toBe(false);
+    expect(senderParentAllowed(null, 'main', 'u1', 'box1')).toBe(false);
+  });
+});
+
+describe('steering a follow-up into a working turn', () => {
+  const busy = { id: 'msga00000001', status: 'working', queued: false };
+  const facts = { box: 'devbox', connected: true, capable: true, liveTurn: true };
+
+  it('steers only into a working turn on a connected box that can take it; otherwise queues it as the next turn, saying why', () => {
+    expect(steerDecision(busy, facts)).toEqual({ kind: 'steer' });
+    expect(steerDecision(busy, { ...facts, capable: false })).toEqual({ kind: 'queue', reason: "devbox's agent can't add a message to a running turn (it needs a newer termag agent)" });
+    expect(steerDecision(busy, { ...facts, connected: false })).toEqual({ kind: 'queue', reason: 'devbox is not connected' });
+    // A leftover headless turn on a box that now announces ask-steer-v1 (an agent restart mid-rollout).
+    expect(steerDecision(busy, { ...facts, liveTurn: false })).toEqual({ kind: 'queue', reason: 'msga00000001 is not a live chat turn (it runs headless, or started before steering was on), so nothing can join it' });
+    expect(steerDecision({ ...busy, status: 'submitted' }, facts)).toEqual({ kind: 'queue', reason: 'msga00000001 is still starting' });
+    expect(steerDecision({ ...busy, status: 'submitted', queued: true }, facts)).toMatchObject({ kind: 'queue', reason: expect.stringContaining('is itself waiting') });
+  });
+
+
+  it('sends a queued next turn only once every earlier message of its thread has ended, in order', () => {
+    const at = (id: string, t: number) => ({ id, createdAt: new Date(t) });
+    expect(waitsForThread(at('b', 2), [at('a', 1), at('b', 2)])).toBe(true);
+    expect(waitsForThread(at('b', 2), [at('b', 2)])).toBe(false);
+    // A later one waits for this one, not the other way round.
+    expect(waitsForThread(at('b', 2), [at('b', 2), at('c', 3)])).toBe(false);
+    expect(waitsForThread(at('c', 3), [at('b', 2), at('c', 3)])).toBe(true);
+  });
+
+  it('says in words why the box\'s turn could not take a follow-up', () => {
+    expect(steerRefusalText('finished')).toBe('its turn had just ended');
+    expect(steerRefusalText('engine_no_live_input:pi')).toBe('the pi engine takes no message in the middle of a turn');
+    expect(steerRefusalText('input_closed')).toBe('its turn had stopped taking messages (Claude was finishing its background work)');
+    expect(steerRefusalText('something new')).toBe('something new');
+    expect(steerRefusalText(null)).toBe('the box gave no reason');
+  });
+
+  it('answers a wait on a superseded message together with its follow-up by default; follow is the switch', () => {
+    expect(supersededReplyMode({})).toBe('together');
+    expect(supersededReplyMode({ ASK_SUPERSEDED_REPLY: 'follow' })).toBe('follow');
+    const row = (id: string, over: Record<string, unknown> = {}) => ({
+      id, threadId: 't', status: 'completed', hop: 2, error: null, numTurns: 1, replyBytes: 9,
+      publish: 'none', publishDetail: null, createdAt: new Date(2), startedAt: new Date(2), completedAt: new Date(3), readAt: new Date(3), ...over,
+    });
+    const a = row('msga00000001', { status: 'superseded', hop: 1, createdAt: new Date(1), startedAt: new Date(1), replyBytes: null, readAt: null, supersededById: 'msgb00000001' });
+    expect(answeredTogether(a, row('msgb00000001'))).toMatchObject({
+      id: 'msga00000001', hop: 1, status: 'completed', replyBytes: 9, readAt: new Date(3), supersededById: 'msgb00000001', createdAt: new Date(1),
+    });
+  });
+
+  it('counts superseded as terminal and not active, and points a cancel at the follow-up', () => {
+    expect(isTerminal('superseded')).toBe(true);
+    const m = { status: 'superseded', resultAt: null, senderUserId: 'asker', projectOwnerId: 'owner', supersededById: 'msgb00000001' };
+    expect(cancelDecision(m, 'asker')).toEqual({
+      kind: 'finished', why: 'the message was superseded by msgb00000001, which carries on its turn; cancel msgb00000001 to stop it',
+    });
+    expect(cancelDecision(m, 'mallory')).toEqual({ kind: 'not_found' });
+  });
+
+  it('shows what a superseded message points at, and no reply of its own', () => {
+    const m = {
+      id: 'msga00000001', threadId: 't', status: 'superseded', hop: 1, error: null, numTurns: null, replyBytes: null,
+      publish: null, publishDetail: null, createdAt: new Date(0), startedAt: new Date(0), completedAt: new Date(1), readAt: null,
+      supersededById: 'msgb00000001',
+    };
+    const v = messageView(m, { id: 't', hopCount: 2, branch: null, prNumber: null, prUrl: null }, 'box/p', null);
+    expect(v).toMatchObject({ status: 'superseded', supersededBy: 'msgb00000001', reply: null, replyBytes: null });
+    expect(messageView({ ...m, status: 'completed', supersededById: null }, { id: 't', hopCount: 2, branch: null, prNumber: null, prUrl: null }, 'box/p', null).supersededBy).toBeNull();
   });
 });

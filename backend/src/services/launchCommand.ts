@@ -26,7 +26,7 @@
  */
 
 import { PROVIDERS } from '../providers/registry';
-import { FIREWORKS_CAPABILITY } from './fireworksGateway';
+import { FIREWORKS_CAPABILITY, FIREWORKS_MENU_CAPABILITY, FIREWORKS_PI_MENU_CAPABILITY } from './fireworksGateway';
 
 export const TELEMETRY_REPLAY_CAPABILITY = 'telemetry-replay-v1';
 
@@ -68,7 +68,13 @@ export interface LaunchOptions {
   /** On a non-default backend: Claude Code's small/fast model, and the context window to give the box. */
   fastModel?: string;
   context?: number;
+  /** On Fireworks: the flag's models for the harness's /model (fireworksMenuArg), typed only to a box that takes them:
+   *  fireworks-menu-v1 for Claude Code, fireworks-pi-menu-v1 for pi. */
+  models?: string;
 }
+
+// fireworksMenuArg's base64, typed into a shell.
+const MODELS_ARG = /^[A-Za-z0-9+/=]{1,12000}$/;
 
 // A model id is typed into a shell: aliases (opus), Fireworks ids
 // (accounts/fireworks/models/kimi-k3), Bedrock profiles (us.anthropic.…:0).
@@ -83,6 +89,9 @@ function withModel(command: string, modelArgs: string[]): string {
 
 // What a box must advertise to start a harness on each backend.
 const BACKEND_CAPABILITY: Record<string, string> = { fireworks: FIREWORKS_CAPABILITY };
+
+// What a box must advertise to take a harness's /model list (`--models`).
+const MENU_CAPABILITY: Record<string, string> = { claude: FIREWORKS_MENU_CAPABILITY, pi: FIREWORKS_PI_MENU_CAPABILITY };
 
 // pi's launcher per backend, in place of the launch command's first word.
 const PI_LAUNCHER: Record<string, string> = { fireworks: 'termag-pi-fireworks' };
@@ -106,7 +115,7 @@ export function refusalLine(why: string): string {
 function onBackend(
   launchCommand: string, opts: LaunchOptions & { id: string | null; env: string },
 ): { final: string } | { command: string } | null {
-  const { provider, backend, capabilities, id, env, model, fastModel, context } = opts;
+  const { provider, backend, capabilities, id, env, model, fastModel, context, models } = opts;
   if (!backend || !provider || !(PROVIDERS[provider]?.backends ?? []).includes(backend)) return null;
   const capability = BACKEND_CAPABILITY[backend];
   if (capability && !capabilities.includes(capability)) {
@@ -114,20 +123,33 @@ function onBackend(
   }
   const [first, ...rest] = launchCommand.split(' ');
   if (first !== PROVIDERS[provider].launchCommand.split(' ')[0]) return null;
-  // The model, Claude Code's fast model and the window go to the box script
-  // with the launch: the box keeps no model list.
+  // The model, Claude Code's fast model, the window and its /model menu go
+  // to the box script with the launch: the box keeps no model list.
+  //
   const pick = [
     ...(model && MODEL_ARG.test(model) ? ['--model', model] : []),
     ...(provider === 'claude' && fastModel && MODEL_ARG.test(fastModel) ? ['--fast', fastModel] : []),
     ...(context && Number.isInteger(context) ? ['--context', String(context)] : []),
+    ...(models && MODELS_ARG.test(models) && capabilities.includes(MENU_CAPABILITY[provider] ?? '') ? ['--models', models] : []),
   ];
   if (provider === 'claude') {
-    const settings = [`${env}termag-credentials launch-settings --backend ${backend}`, ...pick, id ?? '-'].join(' ');
-    return { final: [`termag_settings=$(${settings}) && claude --settings "$termag_settings"`, ...rest].join(' ') };
+    const settings = [`${PANE_KIND_ENV}${env}termag-credentials launch-settings --backend ${backend}`, ...pick, id ?? '-'].join(' ');
+    return { final: [`termag_settings=$(${settings}) && ${PANE_KIND_ENV}claude --settings "$termag_settings"`, ...rest].join(' ') };
   }
   const launcher = provider === 'pi' ? PI_LAUNCHER[backend] : undefined;
   return launcher ? { command: [launcher, ...pick, ...rest].join(' ') } : null;
 }
+
+/**
+ * `TERMAG_SESSION_KIND=interactive `, ahead of the agent's own command, so
+ * the agent and every tool it runs see what kind of termag session they are
+ * in: the
+ * value its resource's termag.session.kind has. Only on the command, never
+ * exported into the pane's shell, which is a person's once the agent exits.
+ * Claude Code's box script (telemetry-launch, launch-settings) gets it too,
+ * so a kind the pane's shell inherited never names a pane's resource.
+ */
+export const PANE_KIND_ENV = 'TERMAG_SESSION_KIND=interactive ';
 
 // Project and workstream names are already limited to these by their routes
 // (routes/projects.ts, routes/workstreams.ts); checked again here because the
@@ -153,22 +175,25 @@ export function resourceEnvPrefix(project?: string | null, workstream?: string |
  * one. Anything else, bare. A Claude launch with neither a replay nor a
  * project stays bare too, so nothing changes for a caller that names none.
  * A non-default backend first swaps in its launcher (onBackend), and a
- * chosen model goes in as `--model` right after the harness's word.
+ * chosen model goes in as `--model` right after the harness's word. Every
+ * agent command starts with PANE_KIND_ENV; an empty one stays empty.
  */
-export function launchCommandFor(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context }: LaunchOptions): string {
+export function launchCommandFor(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models }: LaunchOptions): string {
   const id = replaySessionIdFrom(replaySessionId);
   const env = resourceEnvPrefix(project, workstream);
   const modelArgs = model && MODEL_ARG.test(model) ? ['--model', model] : [];
   const bare = launchCommand === 'claude';
-  const moved = onBackend(launchCommand, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, id, env });
+  const moved = onBackend(launchCommand, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models, id, env });
   if (moved && 'final' in moved) return moved.final;
   launchCommand = moved ? moved.command : withModel(launchCommand, modelArgs);
+  if (!launchCommand) return launchCommand;
+  // termag-agent-otel execs the agent, which keeps the kind.
   if (provider && OTEL_WRAPPED.has(provider) && capabilities.includes(AGENT_TELEMETRY_CAPABILITY)) {
-    return `${env}termag-agent-otel ${provider}${id ? ` --replay ${id}` : ''} -- ${launchCommand}`;
+    return `${PANE_KIND_ENV}${env}termag-agent-otel ${provider}${id ? ` --replay ${id}` : ''} -- ${launchCommand}`;
   }
-  if (!bare) return launchCommand;
-  if ((!id && !env) || !capabilities.includes(TELEMETRY_REPLAY_CAPABILITY)) return launchCommand;
+  if (!bare) return `${PANE_KIND_ENV}${launchCommand}`;
+  if ((!id && !env) || !capabilities.includes(TELEMETRY_REPLAY_CAPABILITY)) return `${PANE_KIND_ENV}${launchCommand}`;
   // `-` stands for "no replay": an older box script reads it as a bad id and
   // prints {}, the current one adds the project and workstream alone.
-  return [`claude --settings "$(${env}termag-credentials telemetry-launch ${id ?? '-'})"`, ...modelArgs].join(' ');
+  return [`${PANE_KIND_ENV}claude --settings "$(${PANE_KIND_ENV}${env}termag-credentials telemetry-launch ${id ?? '-'})"`, ...modelArgs].join(' ');
 }

@@ -1,14 +1,17 @@
 /**
  * The wire format and the in-memory hand-off behind ask replies.
  *
- * A reply is never written to the database. The orchestrator that receives a
+ *
+ * The NOTIFY carries the text, never a table: the sealed copy a later
+ * `--reply` reads is askReplyStore.ts's. The orchestrator that receives a
  * box's result sends the text as Postgres NOTIFYs on REPLY_CHANNEL in the same
  * transaction that marks the message finished, so every orchestrator process
  * listening on the shared database (both halves of an overlapping deploy) gets
  * it at commit and can answer whichever long poll the asker's CLI holds.
  * NOTIFY payloads are capped below 8000 bytes, so the text travels as base64
  * chunks; each process reassembles them and holds the result for HANDOFF_TTL_MS,
- * then forgets it. services/askReplyListener.ts owns the LISTEN connection.
+ * then forgets it. services/askReplyListener.ts listens, over the process's one
+ * LISTEN connection (services/pgListener.ts).
  */
 
 export const REPLY_CHANNEL = 'termag_ask_reply';

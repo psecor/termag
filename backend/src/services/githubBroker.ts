@@ -7,7 +7,10 @@
  *
  * gh treats the broker as a GitHub Enterprise host, so it is addressed in the
  * GHES layout at the root: `/<owner>/<repo>/<git smart-HTTP>`, `/api/v3/*` and
- * `/api/graphql`.
+ * `/api/graphql`. gh's GHES feature detection also reads `installed_version`
+ * from `/api/v3/meta`, which api.github.com's /meta lacks; the gateway's Envoy
+ * adds one to the response (docs/agents/gotchas.md, "To `gh`, the GitHub
+ * broker is a GitHub Enterprise Server"), since the check here never sees it.
  *
  * The owner's token scopes are the real boundary; the blocklist is defence in
  * depth against a box minting persistent credentials or doing admin damage.

@@ -3,7 +3,7 @@ import type { CallerProofConfig } from '../services/callerIdentity';
 import { decideFireworksRequest } from '../services/fireworksAuthz';
 import { fireworksModelsForBox } from '../services/fireworksFlag';
 import { getFireworksGatewayConfig } from '../services/fireworksGateway';
-import { boxForToken, gatewayCheckRouter } from './gatewayCheck';
+import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
 
 /**
  * Envoy's ext_authz check for the gateway's Fireworks route: every model call
@@ -16,7 +16,7 @@ export function fireworksAuthzRouter(cfg: CallerProofConfig): Router {
       { path, authorization: req.headers.authorization, apiKey: req.header('x-api-key'), model: req.header('x-termag-fireworks-model') },
       {
         configured: getFireworksGatewayConfig() !== null,
-        boxForToken,
+        boxForToken: boxForTokenAt('fireworksGateway'),
         modelsFor: box => fireworksModelsForBox(box.userId, box.instanceId),
       },
     ));

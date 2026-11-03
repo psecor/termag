@@ -1,7 +1,7 @@
 import { Router, RequestHandler } from 'express';
 import { WorkflowType } from '@prisma/client';
 import { prisma } from '../db';
-import { CHAT_PROVIDER_ID, PROVIDER_IDS, SELECTABLE_PROVIDER_IDS, isBackendFor, isSelectableProvider } from '../providers/registry';
+import { CHAT_PROVIDER_ID, PROVIDERS, PROVIDER_IDS, SELECTABLE_PROVIDER_IDS, isBackendFor, isChatRunnerProvider, isLaunchableChatProvider, isSelectableProvider } from '../providers/registry';
 import { isModelFor } from '../services/modelChoices';
 import { fireworksOfferedTo } from '../services/fireworksFlag';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
@@ -9,12 +9,22 @@ import { parseBulkPinBody } from './bulkPin';
 import { planUnarchiveLaunches } from './unarchive';
 import { renameSpawnProject } from '../services/spawnRenames';
 import { buildCloneCommand, parseRepoUrl, PROJECT_TEMPLATES, templateForRepoUrl } from '../services/projectTemplates';
-import { archivedLookup, archivedRepoConflict, isBranchName, recordedBranch } from '../services/repoCreate';
+import {
+  ARCHIVED_NAME_TAKEN,
+  archivedAsideName,
+  archivedLookups,
+  archivedRepoConflict,
+  isBranchName,
+  parseArchivedNameChoice,
+  recordedBranch,
+  type ArchivedNameChoice,
+} from '../services/repoCreate';
 import { isReservedProjectName, RESERVED_NAME_ERROR } from './projectNames';
 import * as tmux from '../services/tmux';
 import {
   isAgentConnected,
   isProjectAgentConnected,
+  projectAgentCapabilities,
   sendForProject,
   sendToAgent,
 } from '../services/agentRegistry';
@@ -24,6 +34,7 @@ import { createProjectChannel } from '../slack/channels';
 import { setNotificationTarget } from '../slack/lts';
 import { rename } from 'fs/promises';
 import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
+import { claimUpdateRunning } from '../services/claimUpdateGate';
 import { parseClaudeChatModel } from '../services/claudeChatModel';
 import { replaySessionIdFrom } from '../services/launchCommand';
 import { ensureMainWorkstream } from '../services/workstreams';
@@ -32,6 +43,7 @@ import { agentView, applySetupEvent } from '../services/projectClone';
 import { cloneRoute, needsBoxRelaunch, waitsForBoxAgent } from '../services/projectSetup';
 import { ensureHostSetup, hostAgentUnavailableResponse } from '../services/hostSetup';
 import { assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { historyFor } from './paneHistory';
 import { powerStateError } from '../services/boxPowerPolicy';
 import { refuseParkedBox } from '../middleware/parkedBox';
 import { refuseUnreadySetup } from '../middleware/unreadySetup';
@@ -43,9 +55,16 @@ import { isProjectKind, kindRefusal, projectKindTraits, type ProjectKind } from 
 import { recordProductEvent } from '../services/productEvents';
 import { notifyOnSuccess } from '../services/workspaceEvents';
 import { endPreviewShares } from '../services/previewShares';
+import { isWorkspace, planWorkspaceRepos, workspaceBoxRefusal, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import { MULTI_REPO_DISABLED_CODE, multiRepoEnabled } from '../services/multiRepoFlag';
+import { dispatchWorkspace, retryWorkspace } from '../services/workspaceSetup';
+import { mainUseKey, usedMains } from '../services/workstreamUse';
+import { chatSpaceFor, fixedOnCreate, fixListedChatSpaces, resolveChatSpaceChoice } from '../services/chatSpace';
 
 
 const CAPTURE_MIN_INTERVAL_MS = 1000;
+// A multi-repo rename runs `git worktree repair` in each repository on the box.
+const WORKSPACE_RENAME_TIMEOUT_MS = 60_000;
 const captureRateLimits = new Map<string, number>();
 
 function normalizeProvider(provider?: string | null, fallback?: string | null): string {
@@ -95,7 +114,13 @@ export interface CreateProjectInput {
   repoUrl?: string | null;
   defaultBranch?: string | null;
   /**
-   * The browser session recording (its id) the browser sent this from.
+   * Two or more repositories: a multi-repo (workspace) project on a box whose
+   * agent has workspace-clone-v1. Behind
+   * multi-repo-projects-enabled; exclusive with repoUrl.
+   */
+  repos?: Array<{ url?: unknown; name?: unknown; defaultBranch?: unknown }> | null;
+  /**
+   * The session replay (id) the browser sent this from, if a recorder is wired in.
    * The agent launch types it so the session's Claude Code spans are filed
    * under that replay (services/launchCommand.ts); anything that is not an
    * id is ignored, never an error.
@@ -129,16 +154,45 @@ export interface CreateProjectInput {
    * (the project.created event's warmClaimed); absent when no box was made.
    */
   warmClaimed?: boolean;
+  /**
+   * New session's space for the chat (services/chatSpace.ts): a space name,
+   * or null for "No space". Absent, the chat gets its box's first granted
+   * space at first use, as every chat made another way does.
+   */
+  chatSpace?: string | null;
+  /**
+   * The answer to a 409 ARCHIVED_NAME_TAKEN: an archived project holds the
+   * name on this box (services/repoCreate.ts ArchivedNameChoice).
+   */
+  archivedName?: ArchivedNameChoice | null;
 }
 
 export async function createProjectFor(user: Express.User, input: CreateProjectInput): Promise<RouteResult> {
-  return notifyOnSuccess(await createProjectRow(user, input), user.id, 'projects');
+  // New session's space, resolved now and written in the main workstream's insert: a listing while
+  // setup and launch run would otherwise fix the chat to its box's first grant first (Bugbot, #769).
+  const choice = input.chatSpace === null || typeof input.chatSpace === 'string'
+    ? await resolveChatSpaceChoice(input.chatSpace, user.id).catch(() => null)
+    : null;
+  const result = await createProjectRow(user, input, fixedOnCreate(choice));
+  const id = result.status < 300 && result.body && typeof result.body === 'object' ? (result.body as { id?: unknown }).id : undefined;
+  if (typeof id === 'string' && (input.chatSpace === null || typeof input.chatSpace === 'string')) {
+    // An un-archived project's main existed already: fixed here unless it was. An unknown name falls back to the box's first grant.
+    try {
+      const ws = await ensureMainWorkstream(id);
+      await chatSpaceFor(ws.id, { requested: { name: input.chatSpace, userId: user.id } });
+    } catch (err) {
+      console.warn(`[PROJECTS] ${id}: chat space not recorded: ${(err as Error).message}`);
+    }
+  }
+  return notifyOnSuccess(result, user.id, 'projects');
 }
 
-async function createProjectRow(user: Express.User, input: CreateProjectInput): Promise<RouteResult> {
+async function createProjectRow(user: Express.User, input: CreateProjectInput, chatSpace: { spaceId?: string | null; spaceFixedAt?: Date } = {}): Promise<RouteResult> {
   try {
     const { name, description, color, initialAgent, instanceId, repoUrl: repoUrlInput, defaultBranch } = input;
     if (!name) { return { status: 400, body: { error: 'name required' } }; }
+    const archivedChoice = parseArchivedNameChoice(input.archivedName);
+    if (archivedChoice === undefined) { return { status: 400, body: { error: 'archivedName must be unarchive or rename-aside' } }; }
     const replaySessionId = replaySessionIdFrom(input.replaySessionId);
     const parsedModel = parseClaudeChatModel(input.claudeModel);
     if (!parsedModel.ok) return { status: 400, body: { error: parsedModel.error } };
@@ -170,9 +224,15 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
     if (isReservedProjectName(name)) { return { status: 400, body: { error: RESERVED_NAME_ERROR } }; }
 
     // A NEW explicit choice must be a selectable provider; an omitted one falls
-    // back to the user default, which may legitimately be a legacy id. Checked
-    // here, before any side effect, so the un-archive branch below is covered too.
-    if (initialAgent?.provider && !isSelectableProvider(initialAgent.provider) && initialAgent.provider !== CHAT_PROVIDER_ID) {
+    // back to the user default, which may legitimately be a legacy id. A chat-runner
+    // provider (the simple UI's chats, automations) is accepted although no picker
+    // offers it, but only on an engine the box's runner can drive
+    // (SUPPORTED_CHAT_ENGINES), never silently as Claude. Checked here, before any
+    // side effect, so the un-archive branch below is covered too.
+    if (initialAgent?.provider && isChatRunnerProvider(initialAgent.provider) && !isLaunchableChatProvider(initialAgent.provider)) {
+      return { status: 400, body: { error: `${initialAgent.provider} cannot run yet: the chat runner has no ${PROVIDERS[initialAgent.provider].chatEngine} engine` } };
+    }
+    if (initialAgent?.provider && !isSelectableProvider(initialAgent.provider) && !isChatRunnerProvider(initialAgent.provider)) {
       return { status: 400, body: { error: `provider must be one of: ${SELECTABLE_PROVIDER_IDS.join(', ')}` } };
     }
     const initialBackend = initialAgent?.backend == null || initialAgent.backend === '' ? null : initialAgent.backend;
@@ -227,16 +287,64 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
       return { status: 400, body: { error: 'Fireworks models run only on a box' } };
     }
 
-    const archived = await prisma.project.findFirst({
-      where: { userId: user.id, name, ...archivedLookup(!!repo, projectInstanceId) },
-      include: {
-        workflows: { include: { workstream: true } },
-        workstreams: { where: { archived: false }, select: { id: true, name: true }, orderBy: { createdAt: 'asc' } },
-      },
-    });
-    const archivedDisposition = archivedRepoConflict(!!repo, archived != null);
-    if (archivedDisposition === 'conflict') {
-      return { status: 409, body: { error: 'An archived project with this name exists on this box' } };
+    if (input.repos != null) {
+      return await createWorkspaceProject(user, input, chatSpace, {
+        name, instanceId: projectInstanceId, boxStatus, replaySessionId, initialBackend, initialModel,
+      });
+    }
+
+    let archived = null;
+    for (const where of archivedLookups(!!repo, projectInstanceId)) {
+      archived = await prisma.project.findFirst({
+        where: { userId: user.id, name, ...where },
+        include: {
+          workflows: { include: { workstream: true } },
+          workstreams: { where: { archived: false }, select: { id: true, name: true }, orderBy: { createdAt: 'asc' } },
+        },
+        orderBy: { updatedAt: 'desc' },
+      });
+      if (archived) break;
+    }
+    // Un-archiving would bring it back with no clones (on a new box) and no marker.
+    if (archived && isWorkspace(archived)) {
+      return { status: 409, body: { error: 'An archived project with several repositories has this name; pick another name' } };
+    }
+    const archivedDisposition = archivedRepoConflict(
+      !!repo,
+      archived && { sameBox: archived.instanceId === projectInstanceId },
+      archivedChoice,
+    );
+    if (archivedDisposition === 'conflict' && archived) {
+      // The form offers both ways out: bring it back, or rename it aside.
+      return {
+        status: 409,
+        body: {
+          error: `An archived project named ${name} is on this box`,
+          code: ARCHIVED_NAME_TAKEN,
+          archived: {
+            id: archived.id,
+            name: archived.name,
+            archivedAt: archived.updatedAt,
+            repoUrl: archived.repoUrl,
+            workstreams: archived.workstreams.length,
+          },
+        },
+      };
+    }
+    if (archivedDisposition === 'rename-aside' && archived) {
+      // Through the rename route, which also moves its folder on the box if
+      // it is still there, so the new project's checkout finds the dir free.
+      const prefix = `${name}-archived-`;
+      const taken = await prisma.project.findMany({
+        where: { userId: user.id, instanceId: projectInstanceId, name: { startsWith: prefix } },
+        select: { name: true },
+      });
+      const aside = archivedAsideName(name, archived.updatedAt, new Set(taken.map(p => p.name)));
+      const renamed = await renameProjectRow(user, archived.id, aside);
+      if (renamed.status !== 200) {
+        const why = (renamed.body as { error?: string }).error ?? 'rename failed';
+        return { status: renamed.status, body: { error: `Could not rename the archived ${name} aside: ${why}` } };
+      }
     }
     if (archivedDisposition === 'unarchive' && archived) {
       // Un-archiving may move the project to a different box, and archiving
@@ -510,7 +618,7 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
       hasRepo: !!repo,
       defaultBranch: typeof defaultBranch === 'string' ? defaultBranch : null,
     });
-    const ws = await ensureMainWorkstream(project.id, branch !== undefined ? { branch } : undefined);
+    const ws = await ensureMainWorkstream(project.id, { ...(branch !== undefined ? { branch } : {}), space: chatSpace });
 
     recordProductEvent('project.created', { user: user.id, box: projectInstanceId }, {
       provider,
@@ -532,9 +640,11 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
         // above found nothing to redispatch, so this create has to drive it.
         const now = agentView(setupBox);
         if (now.kind === 'present') {
+          // On a box still waiting for its GitHub delivery the checkout goes on
+          // in the background, so the session opens now (deferDeliveryWait).
           const outcome = await applySetupEvent({ projectId: project.id, instanceId: setupBox }, {
             kind: 'agent-connected', capabilities: now.capabilities,
-          });
+          }, { deferDeliveryWait: true });
           // A hello that read the row before its workflow existed set an empty
           // project up with nothing to launch. Setup events for a project run
           // one at a time, so any such hello has finished by now; the launch
@@ -557,7 +667,7 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
           }
         }
       } else if (provider) {
-        await ensureAgentSessionsAndLaunch({
+        const launch = () => ensureAgentSessionsAndLaunch({
           userId: user.id,
           unixUsername: user.unixUsername,
           projectName: name,
@@ -569,30 +679,21 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
           replaySessionId,
           spawnId: input.spawnId,
         });
+        // A box just claimed from the pool launches once its update is done
+        // (services/claimUpdate.ts, up to a few minutes): not the request's to
+        // wait on, so the project opens now and its pane follows.
+        if (claimUpdateRunning(projectInstanceId)) {
+          void launch().catch(err => console.error(`[PROJECTS] ${project.id}: launch after the claim update failed:`, (err as Error).message));
+        } else {
+          await launch();
+        }
       }
     } catch (err) {
       await prisma.project.delete({ where: { id: project.id } }).catch(() => {});
       throw err;
     }
 
-    // Create Slack channel #proj-<user>-<project> (fire-and-forget, non-blocking).
-    // If we know the creator's Slack id, also route the agent session's
-    // "needs input" notifications there, matching what `/t create` does.
-    createProjectChannel(user.unixUsername, name, user.slackUserId ?? undefined).then(channelId => {
-      if (!channelId) return;
-      prisma.project.update({
-        where: { id: project.id },
-        data: { slackChannelId: channelId },
-      }).catch(err => console.error('[PROJECTS] Failed to save channel ID:', err.message));
-      if (user.slackUserId) {
-        setNotificationTarget(
-          tmux.sessionName(user.unixUsername, name, 'agent'),
-          { channel: channelId, userId: user.slackUserId },
-          'slack',
-          projectInstanceId,
-        );
-      }
-    });
+    startProjectChannel(user, project.id, name, projectInstanceId);
 
     // Re-fetch with workflows so the response shape matches the existing
     // contract (callers expect `workflows: [...]` on a freshly-created project).
@@ -610,14 +711,117 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput): 
   }
 }
 
-async function ownedBoxProject(user: Express.User, id: string): Promise<{ projectId: string; instanceId: string } | RouteResult> {
+/**
+ * Create Slack channel #proj-<user>-<project> (fire-and-forget, non-blocking).
+ * If we know the creator's Slack id, also route the agent session's "needs
+ * input" notifications there, matching what `/t create` does.
+ */
+function startProjectChannel(user: Express.User, projectId: string, name: string, instanceId: string | null): void {
+  createProjectChannel(user.unixUsername, name, user.slackUserId ?? undefined).then(channelId => {
+    if (!channelId) return;
+    prisma.project.update({
+      where: { id: projectId },
+      data: { slackChannelId: channelId },
+    }).catch(err => console.error('[PROJECTS] Failed to save channel ID:', err.message));
+    if (user.slackUserId) {
+      setNotificationTarget(
+        tmux.sessionName(user.unixUsername, name, 'agent'),
+        { channel: channelId, userId: user.slackUserId },
+        'slack',
+        instanceId,
+      );
+    }
+  });
+}
+
+/**
+ * A multi-repo project: the row with layout
+ * workspace, a ProjectRepo per repository in pending, main's agent workflow,
+ * then the box's agent makes the workspace root and clones each repository
+ * (services/workspaceSetup.ts). Sessions start when all of them are ready.
+ * Never un-archives: an archived project of that name on the same box answers
+ * 409 (the unique name); on another box this is a new project.
+ */
+async function createWorkspaceProject(
+  user: Express.User,
+  input: CreateProjectInput,
+  chatSpace: { spaceId?: string | null; spaceFixedAt?: Date },
+  checked: { name: string; instanceId: string | null; boxStatus: string | null; replaySessionId: string | null; initialBackend: string | null; initialModel: string | null },
+): Promise<RouteResult> {
+  if (!await multiRepoEnabled(user)) {
+    return { status: 403, body: { error: 'Projects with more than one repository are not on for you', code: MULTI_REPO_DISABLED_CODE } };
+  }
+  if (input.repoUrl) return { status: 400, body: { error: 'Send either repoUrl or repos, not both' } };
+  if (input.defaultBranch != null) return { status: 400, body: { error: 'defaultBranch is per repository; leave it out with repos' } };
+  if (input.kind && input.kind !== 'normal') return { status: 400, body: { error: 'Only a normal project can hold several repositories' } };
+  if (input.spawnId) return { status: 400, body: { error: 'A spawned project holds one repository' } };
+  const planned = planWorkspaceRepos(input.repos);
+  if (!planned.ok) return { status: 400, body: { error: planned.error } };
+  if (!checked.instanceId) return { status: 400, body: { error: 'A project with several repositories runs on a box' } };
+  const view = agentView(checked.instanceId);
+  const refusal = workspaceBoxRefusal({
+    present: view.kind === 'present',
+    booting: checked.boxStatus != null && waitsForBoxAgent(checked.boxStatus, view.kind === 'present'),
+    capabilities: view.kind === 'present' ? view.capabilities : [],
+  });
+  if (refusal) return { status: refusal.status, body: { error: refusal.error } };
+  const provider = input.initialAgent?.enabled
+    ? normalizeProvider(input.initialAgent.provider, user.defaultAgentProvider)
+    : null;
+
+  const project = await prisma.project.create({
+    data: {
+      name: checked.name,
+      description: input.description,
+      color: input.color,
+      userId: user.id,
+      instanceId: checked.instanceId,
+      layout: 'workspace',
+      repoUrl: null,
+      setupStatus: 'pending',
+      launchReplaySessionId: checked.replaySessionId,
+      chatTrustedAt: input.chatTrusted === true ? new Date() : null,
+      chatOrchestrator: input.chatOrchestrator === true && input.chatTrusted === true && provider === CHAT_PROVIDER_ID,
+      repos: { create: planned.repos.map(r => ({ name: r.name, url: r.url, defaultBranch: r.defaultBranch, position: r.position })) },
+    },
+  });
+  try {
+    const ws = await ensureMainWorkstream(project.id, { branch: 'main', space: chatSpace });
+    if (provider) {
+      await prisma.workflow.create({
+        data: { projectId: project.id, workstreamId: ws.id, type: 'agent', provider, backend: checked.initialBackend, model: checked.initialModel },
+      });
+    }
+    recordProductEvent('project.created', { user: user.id, box: checked.instanceId }, {
+      provider,
+      repoSource: 'github',
+      boxKind: 'box',
+      warmClaimed: typeof input.warmClaimed === 'boolean' ? input.warmClaimed : null,
+      spawned: false,
+    });
+  } catch (err) {
+    await prisma.project.delete({ where: { id: project.id } }).catch(() => {});
+    throw err;
+  }
+  // An init-workspace and up to MULTI_REPO_MAX clone RPCs: not the request's
+  // to wait on. What does not go out now goes at the box's next hello.
+  void dispatchWorkspace(project.id).catch(err => console.error(`[PROJECTS] ${project.id}: workspace setup failed:`, (err as Error).message));
+  startProjectChannel(user, project.id, checked.name, checked.instanceId);
+  const created = await prisma.project.findUniqueOrThrow({
+    where: { id: project.id },
+    include: { workflows: true, workstreams: { orderBy: { createdAt: 'asc' } }, repos: { orderBy: { position: 'asc' } } },
+  });
+  return { status: 201, body: created };
+}
+
+async function ownedBoxProject(user: Express.User, id: string): Promise<{ projectId: string; instanceId: string; layout: string } | RouteResult> {
   const project = await prisma.project.findFirst({
     where: { id, userId: user.id, archived: false },
-    select: { id: true, instanceId: true },
+    select: { id: true, instanceId: true, layout: true },
   });
   if (!project) return { status: 404, body: { error: 'Project not found' } };
   if (!project.instanceId) return { status: 400, body: { error: 'Only a project on a box clones its repository' } };
-  return { projectId: project.id, instanceId: project.instanceId };
+  return { projectId: project.id, instanceId: project.instanceId, layout: project.layout };
 }
 
 /**
@@ -629,7 +833,7 @@ async function ownedBoxProject(user: Express.User, id: string): Promise<{ projec
  */
 async function relaunchBoxFor(
   user: Express.User,
-  box: { id: string; name: string; kind: string; status: string; ec2InstanceId: string | null },
+  box: { id: string; name: string; kind: string; flavor: string; status: string; ec2InstanceId: string | null; size: string | null; createdFor?: string | null; diskGiB?: number | null },
 ): Promise<RouteResult> {
   // Loaded here, not at the top: the box routes pull in the provisioner and
   // the warm pool, which nothing else in this module needs.
@@ -648,12 +852,20 @@ async function relaunchBoxFor(
       if (row) void terminateBox(row);
     }
   }
-  const created = await createBox(user, { name: box.name, kind: 'ec2' });
+  // Same name, same flavor: Retry of a minimal box relaunches minimal (its
+  // disk came from BOX_MINIMAL_ROOT_VOLUME_GB's default the first time around;
+  // its recorded diskGiB rides the opts, never a re-decision).
+  const created = await createBox(user, { name: box.name, kind: 'ec2', flavor: box.flavor === 'minimal' ? 'minimal' : 'full' }, { relaunchSize: box.size, relaunchDiskGiB: box.diskGiB ?? null });
   if (created.status !== 201) return created;
   const fresh = (created.body as { instance: { id: string } }).instance;
+  // A box made for an ask stays one: a rerun of `termag ask --new-box` after a failed launch comes through here.
+  if (box.createdFor === 'ask') {
+    const { applyAskBoxPolicy } = await import('../services/boxLifecycle');
+    await applyAskBoxPolicy(fresh.id);
+  }
   const waiting = await prisma.project.findMany({
     where: { instanceId: box.id, userId: user.id, archived: false, setupStatus: 'pending' },
-    select: { id: true },
+    select: { id: true, layout: true },
   });
   await prisma.project.updateMany({
     where: { id: { in: waiting.map(p => p.id) }, setupStatus: 'pending' },
@@ -663,7 +875,11 @@ async function relaunchBoxFor(
   // A claimed warm box said hello long ago, so nothing else drives these.
   const view = agentView(fresh.id);
   if (view.kind === 'present') {
-    for (const { id } of waiting) {
+    for (const { id, layout } of waiting) {
+      if (layout === 'workspace') {
+        await dispatchWorkspace(id).catch(err => console.error(`[PROJECTS] ${id}: workspace setup on ${fresh.id} failed:`, (err as Error).message));
+        continue;
+      }
       await applySetupEvent({ projectId: id, instanceId: fresh.id }, {
         kind: 'agent-connected', capabilities: view.capabilities,
       }).catch(err => console.error(`[PROJECTS] ${id}: setup on ${fresh.id} failed:`, (err as Error).message));
@@ -679,8 +895,15 @@ export async function retryCloneFor(user: Express.User, id: string): Promise<Rou
   try {
     const project = await prisma.project.findFirst({
       where: { id, userId: user.id, archived: false },
-      select: { setupStatus: true, instance: true },
+      select: { setupStatus: true, instance: true, layout: true },
     });
+    if (project?.layout === 'workspace' && !needsBoxRelaunch(project.setupStatus, project.instance)) {
+      const { retried, dispatch } = await retryWorkspace(id);
+      if (dispatch === 'unsupported') return { status: 409, body: { error: WORKSPACE_UNSUPPORTED } };
+      if (retried.length === 0 && dispatch !== 'dispatched') return { status: 409, body: { error: 'No repository of this project failed to clone.' } };
+      const row = await prisma.project.findUnique({ where: { id }, select: { setupStatus: true } });
+      return { status: 202, body: { setupStatus: row?.setupStatus ?? 'pending', retried } };
+    }
     if (project && needsBoxRelaunch(project.setupStatus, project.instance)) {
       return await relaunchBoxFor(user, project.instance!);
     }
@@ -707,6 +930,9 @@ export async function startEmptyFor(user: Express.User, id: string): Promise<Rou
   try {
     const target = await ownedBoxProject(user, id);
     if ('status' in target) return target;
+    if (target.layout === 'workspace') {
+      return { status: 409, body: { error: 'A project with several repositories cannot start empty: retry the repositories that failed.' } };
+    }
     if (!isProjectAgentConnected({ userId: user.id, instanceId: target.instanceId })) {
       return { status: 503, body: { error: 'Box agent is not connected' } };
     }
@@ -742,10 +968,14 @@ async function renameProjectRow(user: Express.User, id: string, newName: unknown
       include: {
         workflows: { include: { workstream: true } },
         instance: { select: { hostHome: true, status: true } },
+        repos: { orderBy: { position: 'asc' } },
+        workstreams: { select: { name: true, branch: true }, orderBy: { createdAt: 'asc' } },
       },
     });
     if (!project) { return { status: 404, body: { error: 'Not found' } }; }
     if (!projectKindTraits(project.kind).canRenameProject) { return { status: 400, body: { error: kindRefusal(project.kind, 'be renamed') } }; }
+    const workspace = isWorkspace(project);
+    if (workspace && !project.instance) { return { status: 409, body: { error: 'A project with several repositories can only be renamed on its box' } }; }
 
     const oldName = project.name;
     if (oldName === newName) { return { status: 200, body: { ok: true } }; }
@@ -762,6 +992,12 @@ async function renameProjectRow(user: Express.User, id: string, newName: unknown
     if (project.instance) {
       const refused = boxRenameError(project.instance.status, agentConnected);
       if (refused) return refused;
+    }
+    if (workspace) {
+      // Each repository's checkout and every workstream's worktree of it record
+      // each other's paths, so the box repairs them all after the move.
+      const refusal = workspaceRenameRefusal({ capabilities: projectAgentCapabilities(projectHost), repos: project.repos });
+      if (refusal) return { status: refusal.status, body: { error: refusal.error, ...(refusal.code ? { code: refusal.code } : {}) } };
     }
 
     const providerRestarts: Array<{ provider: string; workstream: string }> = [];
@@ -801,10 +1037,20 @@ async function renameProjectRow(user: Express.User, id: string, newName: unknown
       const pathOf = (name: string) => tmux.projectDirFor({
         name, user: { unixUsername: username }, instance: { hostHome: project.instance!.hostHome },
       });
+      const workspacePlan = workspace ? {
+        repos: project.repos.map(r => r.name),
+        guides: workspaceGuideWrites({
+          project: newName,
+          repos: project.repos,
+          workstreams: project.workstreams,
+          dirFor: ws => tmux.projectDirFor({ name: newName, user: { unixUsername: username }, instance: { hostHome: project.instance!.hostHome } }, ws),
+        }),
+      } : undefined;
       try {
         await sendForProject(projectHost, 'project-rename', {
           sessions, fromDir: pathOf(oldName), toDir: pathOf(newName),
-        });
+          ...(workspacePlan ? { workspace: workspacePlan } : {}),
+        }, workspacePlan ? WORKSPACE_RENAME_TIMEOUT_MS : undefined);
       } catch (err) {
         await restartCodex(oldName);
         return boxRenameRpcError(err instanceof Error ? err.message : String(err));
@@ -871,7 +1117,7 @@ async function archiveProjectRow(user: Express.User, id: string, opts: ArchiveOp
   try {
     const project = await prisma.project.findFirst({
       where: { id, userId: user.id },
-      include: { workflows: { include: { workstream: true } }, workstreams: { select: { id: true } } },
+      include: { workflows: { include: { workstream: true } }, workstreams: { select: { id: true, name: true } } },
     });
     if (!project) { return { status: 404, body: { error: 'Not found' } }; }
     if (!projectKindTraits(project.kind).canArchive) { return { status: 400, body: { error: kindRefusal(project.kind, 'be archived') } }; }
@@ -883,7 +1129,7 @@ async function archiveProjectRow(user: Express.User, id: string, opts: ArchiveOp
       (type, payload) => sendForProject(host, type, payload),
       isProjectAgentConnected(host),
       project.id,
-      project.workstreams.map(w => w.id),
+      project.workstreams,
     );
     if (blocked) return { status: 409, body: { error: blocked } };
 
@@ -962,13 +1208,13 @@ export function projectsRouter(): Router {
         return;
       }
       if (archived === true && !existing.archived) {
-        const workstreams = await prisma.workstream.findMany({ where: { projectId: existing.id }, select: { id: true } });
+        const workstreams = await prisma.workstream.findMany({ where: { projectId: existing.id }, select: { id: true, name: true } });
         const host = { userId: req.user!.id, instanceId: existing.instanceId };
         const blocked = await revokeChats(
           (type, payload) => sendForProject(host, type, payload),
           isProjectAgentConnected(host),
           existing.id,
-          workstreams.map(w => w.id),
+          workstreams,
         );
         if (blocked) { res.status(409).json({ error: blocked }); return; }
       }
@@ -1145,6 +1391,11 @@ export function projectsRouter(): Router {
     res.status(result.status).json(result.body);
   };
 
+  const history: RequestHandler = async (req, res) => {
+    const result = await historyFor(req.user!.id, req.params.id, req.params.role, req.query, req.agentInstanceId ?? 'browser');
+    res.status(result.status).json(result.body);
+  };
+
   router.get('/', requireAuthOrAgentToken, list);
   // Starter repos for "first project" (first-run wizard). Before any /:id route.
   router.get('/templates', requireAuth, (_req, res) => {
@@ -1167,8 +1418,20 @@ export function projectsRouter(): Router {
   });
   router.delete('/:id/workflows/:type', requireAuth, removeWorkflow);
   router.get('/:id/sessions/:role/capture', requireAuthOrAgentToken, capture);
+  // The pane output log's tail, for the phone's "Load earlier" (routes/paneHistory.ts).
+  router.get('/:id/sessions/:role/history', requireAuthOrAgentToken, history);
 
   return router;
+}
+
+/**
+ * A listed workstream: its row, its ask thread, and the signs the simple UI
+ * reads for a main that was never used: `hasTranscript`, its chat has a stored
+ * transcript, and on main `hasTurns`, it has
+ * banked working time (services/workstreamUse.ts).
+ */
+function workstreamView<W extends { name: string; _count: { chatTranscripts: number } }>({ _count, ...w }: W, mainUsed: boolean) {
+  return { ...w, hasTranscript: _count.chatTranscripts > 0, ...(w.name === 'main' ? { hasTurns: mainUsed } : {}) };
 }
 
 /**
@@ -1179,7 +1442,17 @@ export function projectsRouter(): Router {
 export async function listProjectsFor(userId: string) {
   const projectInclude = {
     workflows: true,
-    workstreams: { orderBy: { createdAt: 'asc' as const } },
+    // An ask's chat carries its thread, whose title the simple UI names it by, and
+    // the workstream and repository it asks, which a follow-up names (a session
+    // dragged into a composer); the
+    // transcript count says whether a chat was ever used (hasTranscript).
+    workstreams: {
+      orderBy: { createdAt: 'asc' as const },
+      include: {
+        askThread: { select: { id: true, title: true, parentProjectId: true, parentWorkstream: true, workstream: true, repoName: true } },
+        _count: { select: { chatTranscripts: true } },
+      },
+    },
     user: { select: { unixUsername: true } },
   };
   const owned = await prisma.project.findMany({
@@ -1192,15 +1465,28 @@ export async function listProjectsFor(userId: string) {
     where: { userId },
     include: { project: { include: projectInclude } },
   });
+  // Each chat's space, fixed at its first listing when nothing fixed it before (services/chatSpace.ts).
+  const listed = [...owned, ...shares.map(s => s.project)];
+  const mainOf = (p: { name: string; instanceId: string | null; user: { unixUsername: string } }) =>
+    ({ username: p.user.unixUsername, project: p.name, instanceId: p.instanceId });
+  const used = await usedMains(listed.map(mainOf));
+  const views = <W extends Parameters<typeof workstreamView>[0]>(p: Parameters<typeof mainOf>[0] & { workstreams: W[] }) =>
+    p.workstreams.map(w => workstreamView(w, used.has(mainUseKey(mainOf(p)))));
+  const boxOfWs = new Map(listed.flatMap(p => p.workstreams.map(ws => [ws.id, p.instanceId] as const)));
+  await fixListedChatSpaces(listed.flatMap(p => p.workstreams), ws => boxOfWs.get(ws.id) ?? null)
+    .catch(err => console.warn(`[PROJECTS] fixing chat spaces: ${(err as Error).message}`));
 
   return [
     ...owned.map(p => ({
       id: p.id, name: p.name, description: p.description, color: p.color,
       archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
       createdAt: p.createdAt, updatedAt: p.updatedAt,
-      userId: p.userId, instanceId: p.instanceId, kind: p.kind, repoUrl: p.repoUrl,
+      userId: p.userId, instanceId: p.instanceId, kind: p.kind, createdFor: p.createdFor, repoUrl: p.repoUrl,
       repoDefaultBranch: p.repoDefaultBranch, setupStatus: p.setupStatus, setupError: p.setupError,
-      workflows: p.workflows, workstreams: p.workstreams,
+      workflows: p.workflows, workstreams: views(p),
+      // The owner's own trust tick, so New session can offer a worktree from a
+      // fresh fetch Full access only where the project has it.
+      chatTrusted: p.chatTrustedAt != null,
       ownerUsername: p.user.unixUsername, role: 'owner' as const,
     })),
     ...shares
@@ -1211,11 +1497,11 @@ export async function listProjectsFor(userId: string) {
         pinned: s.project.pinned, lastActiveAt: s.project.lastActiveAt,
         createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
         userId: s.project.userId, instanceId: s.project.instanceId, kind: s.project.kind,
-        repoUrl: s.project.repoUrl,
+        createdFor: s.project.createdFor, repoUrl: s.project.repoUrl,
         repoDefaultBranch: s.project.repoDefaultBranch,
         setupStatus: s.project.setupStatus, setupError: s.project.setupError,
         workflows: s.project.workflows,
-        workstreams: s.project.workstreams,
+        workstreams: views(s.project),
         ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
       })),
   ];

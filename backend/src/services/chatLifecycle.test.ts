@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { chatRevokeError } from './chatRevoke';
-import { archivePowerFor, deleteTerminatesBox, otherProjectsFromTotal, reopenPlanFor, reopenRelease } from './chatLifecycle';
+import { archivePowerFor, deleteTerminatesBox, otherProjectsFromTotal, reopenPlanFor, reopenRelease, storedReopenRelease } from './chatLifecycle';
 
 const box = (status: string, extra: object = {}) => ({ kind: 'ec2', status, ...extra });
 
 describe('archivePowerFor', () => {
-  it('stops the chat\'s box, or hibernates it when it was launched able to', () => {
+  it('stops the chat\'s box, never hibernates it, even when it was launched able to', () => {
     expect(archivePowerFor(box('ready'), 0)).toEqual({ action: 'stop' });
-    expect(archivePowerFor(box('ready', { hibernationConfigured: true }), 0)).toEqual({ action: 'hibernate' });
+    expect(archivePowerFor(box('ready', { hibernationConfigured: true }), 0)).toEqual({ action: 'stop' });
   });
 
   it('leaves the box alone when something else lives there, it is not termag\'s to power, or it is not up', () => {
@@ -18,9 +18,43 @@ describe('archivePowerFor', () => {
     expect(archivePowerFor(null, 0).action).toBeNull();
   });
 
+  it('says a gone box is gone, whatever its kind, so the archive page does not call it still running', () => {
+    for (const status of ['terminated', 'failed']) {
+      expect(archivePowerFor(box(status), 0)).toEqual({ action: null, reason: `the box is ${status}` });
+      expect(archivePowerFor({ kind: 'external', status }, 0)).toEqual({ action: null, reason: `the box is ${status}` });
+      expect(archivePowerFor(box(status), 2)).toEqual({ action: null, reason: `the box is ${status}` });
+    }
+  });
+
   it('stops a box that is still coming up, and does not try to hibernate it', () => {
     expect(archivePowerFor(box('starting'), 0)).toEqual({ action: 'stop' });
     expect(archivePowerFor(box('starting', { hibernationConfigured: true }), 0)).toEqual({ action: 'stop' });
+  });
+});
+
+describe('storedReopenRelease', () => {
+  it('unarchives at once when the box can no longer connect', () => {
+    expect(storedReopenRelease(false, false, null)).toEqual({ unarchive: true });
+  });
+
+  it('refuses a failed box that can still connect but is offline: its parked turn is still on disk', () => {
+    expect(storedReopenRelease(true, false, null)).toEqual({ unarchive: false, error: expect.stringContaining('Terminate the box') });
+  });
+
+  it('unarchives a connected failed box only after its chat-clear stopped the turn', () => {
+    expect(storedReopenRelease(true, true, null)).toEqual({ unarchive: true });
+    expect(storedReopenRelease(true, true, 'Could not stop the chat on workstream main')).toEqual({
+      unarchive: false,
+      error: 'Could not stop the chat on workstream main',
+    });
+  });
+
+  it('still needs the chat-clear from an agent connected on a revoked or expired token', () => {
+    expect(storedReopenRelease(false, true, 'Could not stop the chat on workstream main')).toEqual({
+      unarchive: false,
+      error: 'Could not stop the chat on workstream main',
+    });
+    expect(storedReopenRelease(false, true, null)).toEqual({ unarchive: true });
   });
 });
 
@@ -59,6 +93,14 @@ describe('reopenPlanFor', () => {
     expect(reopenPlanFor(box('hibernating'))).toMatchObject({ refused: { status: 409 } });
     expect(reopenPlanFor(box('terminated'))).toMatchObject({ refused: { error: expect.stringMatching(/Delete the chat/) } });
     expect(reopenPlanFor(null)).toMatchObject({ refused: { status: 409 } });
+  });
+
+  it('reopens a chat whose box is gone from its stored transcript, and only then', () => {
+    expect(reopenPlanFor(box('terminated'), true)).toEqual({ stored: true });
+    expect(reopenPlanFor(box('failed'), true)).toEqual({ stored: true });
+    expect(reopenPlanFor(null, true)).toEqual({ stored: true });
+    expect(reopenPlanFor(box('stopped'), true)).toEqual({ start: true });
+    expect(reopenPlanFor(box('stopping'), true)).toMatchObject({ refused: { status: 409 } });
   });
 });
 

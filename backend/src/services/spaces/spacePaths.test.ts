@@ -140,7 +140,7 @@ describe('downloadResponseHeaders', () => {
   });
 
   it('serves text-like files inline as plain text', () => {
-    for (const path of ['README.md', 'x.markdown', 'x.JSON', 'x.csv', 'x.tsv', 'x.log', 'x.diff', 'x.patch', 'x.yaml', 'x.yml', 'x.toml']) {
+    for (const path of ['README.md', 'x.markdown', 'x.JSON', 'x.csv', 'x.tsv', 'x.log', 'x.diff', 'x.patch', 'x.yaml', 'x.yml', 'x.toml', 'flow.mmd', 'board.mermaid']) {
       expect(downloadResponseHeaders(path, true)).toMatchObject({
         contentDisposition: expect.stringMatching(/^inline;/),
         contentType: 'text/plain; charset=utf-8',
@@ -177,6 +177,12 @@ describe('viewResponseHeaders', () => {
     expect(viewResponseHeaders('clip.mp4')).toMatchObject({ contentType: 'video/mp4', render: 'frame' });
     expect(viewResponseHeaders('song.mp3')).toMatchObject({ contentType: 'audio/mpeg', render: 'frame' });
     expect(viewResponseHeaders('src/main.go')).toMatchObject({ contentType: 'text/plain; charset=utf-8', render: 'frame' });
+  });
+
+  it('frames a Mermaid file as plain text, which the file view draws as its diagram', () => {
+    for (const path of ['flow.mmd', 'docs/board.MERMAID']) {
+      expect(viewResponseHeaders(path)).toMatchObject({ contentType: 'text/plain; charset=utf-8', contentDisposition: expect.stringMatching(/^inline/), render: 'frame' });
+    }
   });
 
   it('signs Markdown, HTML and SVG as plain text for the client to render', () => {

@@ -6,6 +6,10 @@ import type { CliSessionRecord, CliStore, CliUser } from '../services/cliStore';
 import type { CliBox, CliProject } from '../services/cliViews';
 
 vi.mock('../db', () => ({ prisma: {} }));
+const productEvents: Array<{ name: string; ctx: unknown; detail: unknown }> = [];
+vi.mock('../services/productEvents', () => ({
+  recordProductEvent: (name: string, ctx: unknown, detail: unknown) => { productEvents.push({ name, ctx, detail }); },
+}));
 vi.mock('../middleware/auth', () => ({
   requireAuth: (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const id = req.get('x-test-user');
@@ -78,6 +82,8 @@ class FakeStore implements CliStore {
     s.revokedAt = now;
     return true;
   }
+  admins = new Set<string>();
+  async isAdmin(userId: string) { return this.admins.has(userId); }
 }
 
 let store: FakeStore;
@@ -89,7 +95,7 @@ let base: string;
 beforeAll(async () => {
   const app = express();
   app.use(express.json());
-  app.use('/api/cli/v1', (req, res, next) => cliApiRouter({ store, codes, jwt: Promise.resolve(jwt), now: () => new Date(clock) })(req, res, next));
+  app.use('/api/cli/v1', (req, res, next) => cliApiRouter({ store, codes, jwt: Promise.resolve(jwt), now: () => new Date(clock), features: u => featuresFor(u) })(req, res, next));
   app.use('/api/cli-devices', (req, res, next) => cliDevicesRouter({ store, now: () => new Date(clock) })(req, res, next));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -178,12 +184,36 @@ describe('POST /api/cli/v1/token', () => {
   });
 });
 
+// What termag turns on for the person, as whoami reports it (routes/cliFeatures.ts).
+let featuresFor: (user: { id: string }) => Promise<{ automations: boolean }> = async () => ({ automations: false });
+
 describe('access tokens', () => {
   it('authenticate as the device session they were minted from', async () => {
     const { accessToken } = await signIn();
     const res = await call('/api/cli/v1/whoami', { token: accessToken });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ user: { email: 'alice@example.com' }, credential: { kind: 'device', deviceName: 'mbp' } });
+  });
+
+  it('say in whoami whether the user is an admin', async () => {
+    store.admins.add('alice');
+    const alice = await signIn();
+    expect(await (await call('/api/cli/v1/whoami', { token: alice.accessToken })).json()).toMatchObject({ user: { email: 'alice@example.com', admin: true } });
+    const bob = await signIn('bob');
+    expect(await (await call('/api/cli/v1/whoami', { token: bob.accessToken })).json()).toMatchObject({ user: { email: 'bob@example.com', admin: false } });
+  });
+
+  it("say in whoami what termag turns on for the person, and off when the lookup fails", async () => {
+    const alice = await signIn();
+    featuresFor = async u => ({ automations: u.id === 'alice' });
+    expect(await (await call('/api/cli/v1/whoami', { token: alice.accessToken })).json()).toMatchObject({ features: { automations: true } });
+    const bob = await signIn('bob');
+    expect(await (await call('/api/cli/v1/whoami', { token: bob.accessToken })).json()).toMatchObject({ features: { automations: false } });
+    featuresFor = async () => { throw new Error('the flag source is down'); };
+    const res = await call('/api/cli/v1/whoami', { token: alice.accessToken });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ features: { automations: false } });
+    featuresFor = async () => ({ automations: false });
   });
 
   it('stop at once when the session is revoked, and lapse after an hour', async () => {
@@ -280,7 +310,8 @@ describe('bearer auth', () => {
     store.agentTokens.set('tmag_warm', null);
     const ok = await call('/api/cli/v1/whoami', { token: 'tmag_box' });
     expect(await ok.json()).toEqual({
-      user: { email: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice' },
+      user: { email: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice', admin: false },
+      features: { automations: false },
       credential: { kind: 'box', boxId: 'i-devbox' },
     });
     expect((await call('/api/cli/v1/whoami', { token: 'tmag_warm' })).status).toBe(401);
@@ -308,7 +339,8 @@ describe('reads', () => {
   it('whoami describes the device sign-in', async () => {
     const token = await login();
     expect(await (await call('/api/cli/v1/whoami', { token })).json()).toEqual({
-      user: { email: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice' },
+      user: { email: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice', admin: false },
+      features: { automations: false },
       credential: {
         kind: 'device', deviceName: 'mbp',
         expiresAt: new Date(clock + 7 * DAY).toISOString(), maxExpiresAt: new Date(clock + 30 * DAY).toISOString(),
@@ -348,5 +380,86 @@ describe('/api/cli-devices (web UI)', () => {
 
   it('needs a browser session', async () => {
     expect((await call('/api/cli-devices')).status).toBe(401);
+  });
+});
+
+describe('/api/cli/v1/devices (the desktop)', () => {
+  it("lists the caller's live sign-ins, marking its own", async () => {
+    const desktop = await login('alice', 'mbp desktop');
+    await login('alice', 'mbp');
+    await login('bob', 'bobs-laptop');
+    const res = await call('/api/cli/v1/devices', { token: desktop });
+    expect(res.status).toBe(200);
+    const { devices } = await res.json() as { devices: Array<{ deviceName: string; current: boolean; expiresAt: string }> };
+    expect(devices.map(d => [d.deviceName, d.current])).toEqual([['mbp desktop', true], ['mbp', false]]);
+    expect(devices[0].expiresAt).toBe(new Date(clock + 7 * DAY).toISOString());
+  });
+
+  it("signs out another of the caller's devices, or its own, never someone else's", async () => {
+    const desktop = await login('alice', 'mbp desktop');
+    const laptop = await login('alice', 'mbp');
+    await login('bob', 'bobs-laptop');
+    const laptopId = store.sessions.find(s => s.deviceName === 'mbp')!.id;
+    const bobsId = store.sessions.find(s => s.userId === 'bob')!.id;
+
+    const other = await call(`/api/cli/v1/devices/${bobsId}`, { method: 'DELETE', token: desktop });
+    expect(other.status).toBe(404);
+    expect(await other.json()).toMatchObject({ code: 'device_not_found' });
+    expect(store.sessions.find(s => s.id === bobsId)!.revokedAt).toBeNull();
+
+    expect((await call(`/api/cli/v1/devices/${laptopId}`, { method: 'DELETE', token: desktop })).status).toBe(204);
+    expect((await call('/api/cli/v1/whoami', { token: laptop })).status).toBe(401);
+    expect((await call('/api/cli/v1/whoami', { token: desktop })).status).toBe(200);
+
+    const ownId = store.sessions.find(s => s.deviceName === 'mbp desktop')!.id;
+    expect((await call(`/api/cli/v1/devices/${ownId}`, { method: 'DELETE', token: desktop })).status).toBe(204);
+    expect((await call('/api/cli/v1/whoami', { token: desktop })).status).toBe(401);
+  });
+
+  it("is a device sign-in's only: a box's own token neither lists nor signs out", async () => {
+    await login('alice', 'mbp');
+    store.agentTokens.set('tmag_box', { user: alice, instanceId: 'i-devbox' });
+    const list = await call('/api/cli/v1/devices', { token: 'tmag_box' });
+    expect(list.status).toBe(403);
+    expect(await list.json()).toMatchObject({ code: 'box_credential' });
+    const id = store.sessions[0].id;
+    expect((await call(`/api/cli/v1/devices/${id}`, { method: 'DELETE', token: 'tmag_box' })).status).toBe(403);
+    expect(store.sessions[0].revokedAt).toBeNull();
+  });
+});
+
+describe('POST /usage', () => {
+  beforeEach(() => { productEvents.length = 0; });
+
+  it('records a device sign-in\'s run as cli.command, with no box', async () => {
+    const token = await login();
+    const res = await call('/api/cli/v1/usage', {
+      method: 'POST', token, body: JSON.stringify({ command: 'box list', phase: 'finished', exitCode: 0, durationMs: 120, version: '0.4.1' }),
+    });
+    expect(res.status).toBe(204);
+    expect(productEvents).toEqual([{
+      name: 'cli.command',
+      ctx: { user: 'alice', box: null },
+      detail: expect.objectContaining({ command: 'box list', phase: 'finished', exitCode: 0, durationMs: 120, credential: 'device' }),
+    }]);
+  });
+
+  it('records the box for the CLI on a box', async () => {
+    store.agentTokens.set('tmag_box', { user: alice, instanceId: 'i-devbox' });
+    const res = await call('/api/cli/v1/usage', { method: 'POST', token: 'tmag_box', body: JSON.stringify({ command: 'ask', phase: 'finished' }) });
+    expect(res.status).toBe(204);
+    expect(productEvents[0]).toMatchObject({ ctx: { user: 'alice', box: 'i-devbox' }, detail: { credential: 'box' } });
+  });
+
+  it('refuses a report that is not a command name, and records nothing', async () => {
+    const token = await login();
+    const res = await call('/api/cli/v1/usage', { method: 'POST', token, body: JSON.stringify({ command: 'ask "fix it"', phase: 'finished' }) });
+    expect(res.status).toBe(400);
+    expect(productEvents).toEqual([]);
+  });
+
+  it('needs a credential', async () => {
+    expect((await call('/api/cli/v1/usage', { method: 'POST', body: JSON.stringify({ command: 'whoami', phase: 'finished' }) })).status).toBe(401);
+    expect(productEvents).toEqual([]);
   });
 });

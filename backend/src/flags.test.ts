@@ -29,9 +29,27 @@ const backendText = sources(join(repo, 'backend/src'))
   .join('\n');
 const frontendFiles = sources(join(repo, 'frontend/src')).map((f) => ({ f, text: readFileSync(f, 'utf8') }));
 
+// The first key listed after one it sorts before, or null when the list is in order.
+function outOfOrder(list: string[]): string | null {
+  const at = list.findIndex((k, i) => i > 0 && k < list[i - 1]);
+  return at < 0 ? null : `${list[at]} is listed after ${list[at - 1]}`;
+}
+
 describe('flag registry', () => {
   it('found the browser flags', () => {
     expect(browserKeys.size).toBeGreaterThan(0);
+  });
+
+  // Sorted, two PRs that each add a flag edit different parts of the file,
+  // instead of both appending at the end and conflicting there.
+  it('lists the registry in alphabetical order by key', () => {
+    const bad = outOfOrder(keys);
+    expect(bad, `backend/src/flags.ts: ${bad}; insert the flag in alphabetical order (node scripts/sort-flags.mjs)`).toBeNull();
+  });
+
+  it('lists the browser flags in alphabetical order by flag key', () => {
+    const bad = outOfOrder([...browserKeys.values()]);
+    expect(bad, `frontend/src/flags.ts: ${bad}; insert the flag in alphabetical order (node scripts/sort-flags.mjs)`).toBeNull();
   });
 
   it('lists every browser flag, marked client', () => {
@@ -54,7 +72,7 @@ describe('flag registry', () => {
       // the constant's declaration alone is not one.
       const names = [...backendText.matchAll(new RegExp(`const (\\w+)\\s*=\\s*['"\`]${key}['"\`]`, 'g'))].map((m) => m[1]);
       const arg = [`['"\`]${key}['"\`]`, ...names.map((n) => `${n}\\b`)].join('|');
-      const read = new RegExp(`(?:boolVariation|boolVariationForContext|stringVariation|numberVariationForContext|jsonVariation)\\(\\s*(?:${arg})`).test(backendText);
+      const read = new RegExp(`(?:boolVariation|boolVariationForContext|stringVariation|numberVariation|numberVariationForContext|jsonVariation|jsonVariationForContext)\\(\\s*(?:${arg})`).test(backendText);
       const listed = FLAG_REGISTRY[key].server.length > 0;
       expect(read, `${key}: server is ${JSON.stringify(FLAG_REGISTRY[key].server)}, but backend/src ${read ? 'reads' : 'never reads'} it`).toBe(listed);
     }

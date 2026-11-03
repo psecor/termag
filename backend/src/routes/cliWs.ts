@@ -92,6 +92,7 @@ export interface CliCredentialLapse { code: number; reason: string }
 export async function recheckCliCredential(
   deps: CliBearerDeps,
   opened: { auth: CliAuth; raw: string },
+  opts: { ignoreAccessTokenExpiry?: boolean } = {},
 ): Promise<CliCredentialLapse | null> {
   const now = (deps.now ?? (() => new Date()))();
   const { credential, user } = opened.auth;
@@ -106,9 +107,12 @@ export async function recheckCliCredential(
         : 'Sign-in expired; run `termag login`');
     }
     if (isJwtShaped(opened.raw)) {
-      const claims = (await deps.jwt).verify(opened.raw, now.getTime());
+      const claims = (await deps.jwt).verify(opened.raw, now.getTime(), { ignoreExpiry: opts.ignoreAccessTokenExpiry });
       if (!claims || claims.jti !== credential.sessionId || claims.sub !== user.id) {
-        return { code: CLI_WS_REAUTH_CLOSE_CODE, reason: 'Access token expired; reconnect with a fresh one' };
+        return {
+          code: CLI_WS_REAUTH_CLOSE_CODE,
+          reason: opts.ignoreAccessTokenExpiry ? 'Access token no longer valid; reconnect with a fresh one' : 'Access token expired; reconnect with a fresh one',
+        };
       }
     }
     return null;
@@ -121,6 +125,26 @@ export async function recheckCliCredential(
 /** Open CLI sockets by device session, so a revoke here closes them at once. */
 const socketsBySession = new Map<string, Set<WebSocket>>();
 
+export interface WatchCliSocketOptions {
+  /**
+   * The close code for an access token that lapsed while its sign-in is still
+   * good, instead of CLI_WS_REAUTH_CLOSE_CODE: the desktop relay's clients read
+   * 4401 as final (routes/cliT3.ts, RELAY_REDIAL_CLOSE_CODE). A revoked or
+   * expired sign-in closes with CLI_WS_REVOKED_CLOSE_CODE whatever this says.
+   */
+  reauthCloseCode?: number;
+  /**
+   * Skip the access token's `exp`, and only that: its signature against the
+   * current keys, `kid`, `jti` and `sub` are still judged on every recheck,
+   * so retiring a signing key still closes the socket, and so does the device
+   * session behind it (revoked, idle, maximum age). The native forward's v1
+   * sets it: its socket carries one live TCP stream that can't redial, so it
+   * would end within the token's hour; its own lifetime cap bounds it instead.
+   * v2 renews the token in band and doesn't.
+   */
+  ignoreAccessTokenExpiry?: boolean;
+}
+
 /**
  * Keep judging an open CLI socket's credential: register it for immediate
  * close on a device revoke, and re-check it on an interval. A failed re-check
@@ -131,6 +155,7 @@ export function watchCliSocket(
   deps: CliBearerDeps,
   opened: { auth: CliAuth; raw: string },
   intervalMs = CLI_WS_RECHECK_MS,
+  opts: WatchCliSocketOptions = {},
 ): void {
   const { credential } = opened.auth;
   const sessionId = credential.kind === 'device' ? credential.sessionId : null;
@@ -140,8 +165,10 @@ export function watchCliSocket(
     set.add(ws);
   }
   const timer = setInterval(() => {
-    recheckCliCredential(deps, opened).then((lapse) => {
-      if (lapse) closeRevoked(ws, lapse.reason, lapse.code);
+    recheckCliCredential(deps, opened, { ignoreAccessTokenExpiry: opts.ignoreAccessTokenExpiry }).then((lapse) => {
+      if (!lapse) return;
+      const code = lapse.code === CLI_WS_REAUTH_CLOSE_CODE ? opts.reauthCloseCode ?? lapse.code : lapse.code;
+      closeRevoked(ws, lapse.reason, code);
     }, () => { /* not evidence either way */ });
   }, intervalMs);
   timer.unref?.();

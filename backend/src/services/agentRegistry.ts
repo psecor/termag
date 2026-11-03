@@ -32,6 +32,7 @@ import {
   connectUpdate,
   parseAgentConnection,
   registryKeyOf,
+  stuckMarkDropUpdate,
   warmCompletionUpdate,
 } from './instanceLifecycle';
 import { describeOnWarmRun, onWarmRunUpdate, parseOnWarmReport, promotesToWarm } from './onWarmStatus';
@@ -39,7 +40,13 @@ import { deliverToInstance, CREDENTIALS_CAPABILITY } from './credentialDelivery'
 import { onClaimRunUpdate, parseOnClaimReport } from './onClaimStatus';
 import { syncBoxAuthorizedKeys } from './sshKeySync';
 import { clearsPowerErrorOnConnect } from './boxPowerPolicy';
+import { recordBoxStartReady } from './boxStartLatency';
+import { recordBoxReady } from './boxPowerEvents';
 import { isTerminalReport, noteBoxActivity } from './boxActivity';
+import { QUARANTINED } from './boxQuarantinePolicy';
+import { personalizeNewBox } from './newBoxDotfiles';
+import { notifyWorkspaceChange } from './workspaceEvents';
+import { withSpan } from './tracing/spans';
 
 
 interface ConnectedAgent {
@@ -60,6 +67,33 @@ interface ConnectedAgent {
 
 const userAgents = new Map<string, ConnectedAgent>();      // userId → agent (legacy)
 const instanceAgents = new Map<string, ConnectedAgent>();  // instanceId → agent (V1+)
+
+
+/**
+ * How an agent RPC failed, for callers that must tell the two apart (a tool
+ * update: services/toolUpdate/runs.ts). Both are plain Errors to everyone
+ * else, with the messages they always had.
+ *
+ * AgentReplyError: the agent answered, with a top-level `error`; it did not
+ * do what was asked.
+ */
+export class AgentReplyError extends Error {
+  constructor(message: string) { super(message); this.name = 'AgentReplyError'; }
+}
+
+/**
+ * AgentTransportError: no answer came, because the request timed out, the
+ * socket dropped while it was pending, or no agent was connected. After a
+ * send, the agent may or may not have acted on it.
+ */
+export class AgentTransportError extends Error {
+  constructor(message: string) { super(message); this.name = 'AgentTransportError'; }
+}
+
+/** AgentNotConnectedError: the AgentTransportError of a request that was never sent, as no agent was connected. */
+export class AgentNotConnectedError extends AgentTransportError {
+  constructor(message: string) { super(message); this.name = 'AgentNotConnectedError'; }
+}
 
 export interface ConnectedOwnedBox {
   instance: Instance;
@@ -130,9 +164,26 @@ export function onBoxAgentFrame(type: string, listener: (frame: BoxAgentFrame) =
   return () => { listeners.delete(listener); };
 }
 
-// Terminal data subscribers: streamId → { callback, userId, instanceId }
-type TerminalStream = { onData: (msg: any) => void; userId: string; instanceId: string | null };
+// Terminal subscribers: streamId → { callback, agent, instanceId }. Like a
+// browser pane's, a terminal stream is bound to the agent socket that opened
+// its PTY: only that socket may feed it, input goes only to it, and its close
+// ends the stream with a TERMINAL_AGENT_GONE event. The agent kills every PTY
+// when its socket closes (agent/agent.js), so a box agent that reconnects is a
+// new socket holding none of them. Routing by key sent a pane's keystrokes to
+// that new socket, which dropped them, and the pane sat on a socket that still
+// looked connected until the page was reloaded.
+type TerminalStream = { onData: (msg: any) => void; agent: ConnectedAgent; instanceId: string | null };
 const terminalStreams = new Map<string, TerminalStream>();
+
+/** What a terminal stream's subscriber hears when the agent socket holding its PTY closes. */
+export const TERMINAL_AGENT_GONE = 'terminal-agent-gone';
+/**
+ * The close the terminal socket gets for TERMINAL_AGENT_GONE: 1012, "service
+ * restart". The browser (frontend/src/utils/terminalReconnect.ts) and the TUI
+ * (tui/src/terminalSocket.ts) read any close but a parked box's as a drop and
+ * dial again, which reattaches once the agent is back.
+ */
+export const TERMINAL_AGENT_GONE_CLOSE_CODE = 1012;
 
 // Browser pane subscribers: streamId → { callback, holder }.
 // A stream is bound to the agent socket that opened its browser: only that
@@ -156,6 +207,16 @@ export function setAgentRegistryDraining(value: boolean): void {
 
 function nextRequestId(): string {
   return `req_${++requestCounter}_${Date.now()}`;
+}
+
+// A box's agent coming or going changes what its owner's box list says (a
+// start lands as ready here), so their open tabs refetch it rather than keep
+// the list from before. Read agent.conn when it happens, not the connection
+// the socket registered with: a claim (rebindInstanceOwner) or a return to the
+// pool (disownInstanceAgent) changes the owner without a reconnect. A warm box
+// has no owner, so nobody is told.
+function notifyBoxOwner(agent: ConnectedAgent): void {
+  if (agent.conn.kind === 'owned-box') notifyWorkspaceChange(agent.conn.user.id, 'boxes');
 }
 
 export function registerAgent(user: User | null, ws: WebSocket, instance: Instance | null): void {
@@ -197,7 +258,7 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
         agent.pendingRequests.delete(msg.requestId);
 
         if (msg.error) {
-          pending.reject(new Error(msg.error));
+          pending.reject(new AgentReplyError(msg.error));
         } else {
           pending.resolve(msg.data);
         }
@@ -248,19 +309,39 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
           // start is idempotent.
           if (hello.warm && instance.status === 'warming') {
             console.log(`[POOL] instance ${instance.name} agent connected, starting the on-warm run`);
-            sendToInstanceAgent(instance.id, 'on-warm-start', {}).catch(err => {
-              // Not fatal to the socket. The stuck sweep fails a box whose warm
-              // run never reports, and the next reconnect tries again.
-              console.error(`[POOL] instance ${instance.name} on-warm-start failed:`, err.message);
-            });
+            // The status above is the token check's; the run carries a GitHub
+            // token, so it goes only to a box still warming now.
+            prisma.instance.findUnique({ where: { id: instance.id }, select: { status: true } })
+              .then(row => {
+                if (row?.status !== 'warming') {
+                  console.warn(`[POOL] instance ${instance.name} is ${row?.status ?? 'gone'} now; not starting the on-warm run`);
+                  return;
+                }
+                return sendToInstanceAgent(instance.id, 'on-warm-start', {});
+              })
+              .catch(err => {
+                // Not fatal to the socket. The stuck sweep fails a box whose warm
+                // run never reports, and the next reconnect tries again.
+                console.error(`[POOL] instance ${instance.name} on-warm-start failed:`, err.message);
+              });
           }
         }
         if (conn.kind === 'owned-box') {
           // The worktime accumulator banks runner sessions under this owner (services/boxOwners.ts).
           rememberBoxOwner(conn.instance.id, conn.user.unixUsername);
+          // A box launched for its owner and marked for their dotfiles
+          // (services/newBoxDotfiles.ts): after credentials, so a private
+          // repository clones through the broker, and before the hello
+          // settles, so a clone waits for the run as on a claimed box.
+          let dotfiles: Promise<void> = Promise.resolve();
+          if (conn.instance.onClaimStatus === 'pending' && !conn.instance.claimedAt) {
+            const id = conn.instance.id;
+            dotfiles = Promise.all([hostIdentity, credentials])
+              .then(() => personalizeNewBox(id, hello.home, { prisma, send: (i, type, payload) => sendToInstanceAgent(i, type, payload) }));
+          }
           const event: BoxAgentHelloEvent = {
             instance: conn.instance, user: conn.user, agentCommit: hello.agentCommit, capabilities: hello.capabilities,
-            settled: Promise.all([hostIdentity, credentials]).then(() => { settledOwnedConns.add(conn); }),
+            settled: Promise.all([hostIdentity, credentials, dotfiles]).then(() => { settledOwnedConns.add(conn); }),
           };
           for (const listener of boxHelloListeners) {
             try {
@@ -322,7 +403,7 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
       if (msg.type === 'terminal-data' && msg.streamId) {
         const stream = terminalStreams.get(msg.streamId);
         // Stream ids are guessable, so only the agent that holds a stream may feed it.
-        if (stream && streamAgent(stream) === agent) {
+        if (stream && stream.agent === agent) {
           stream.onData(msg);
         } else {
           // Nobody here reads this stream, e.g. the agent spawned it after the
@@ -377,19 +458,36 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
         console.error(`[BROWSER-PANE] exit listener failed for ${streamId}:`, (err as Error).message);
       }
     }
+    // Its terminals' PTYs are gone too: end each stream so its socket closes
+    // and the pane redials. Not while draining: the drain closes every
+    // terminal socket itself, a moment after the agents, so that a pane
+    // redialling finds its box on the serving process
+    // (services/orchestratorDrain.ts). A replaced socket's terminals end here
+    // too, for the same reason as its browsers.
+    if (!draining) {
+      for (const [streamId, stream] of terminalStreams) {
+        if (stream.agent !== agent) continue;
+        terminalStreams.delete(streamId);
+        try {
+          stream.onData({ type: TERMINAL_AGENT_GONE, streamId });
+        } catch (err) {
+          console.error(`[TERMINAL] agent-gone listener failed for ${streamId}:`, (err as Error).message);
+        }
+      }
+    }
     // Only remove if this is still the current agent for the key. Without
     // that guard a replaced socket's close would stamp over the live agent.
     if (targetMap.get(targetKey)?.ws === ws) {
       for (const [, pending] of agent.pendingRequests) {
         clearTimeout(pending.timer);
-        pending.reject(new Error('Agent disconnected'));
+        pending.reject(new AgentTransportError('Agent disconnected'));
       }
       targetMap.delete(targetKey);
       if (conn.kind !== 'user-agent' && !draining) {
         prisma.instance.update({
           where: { id: conn.instance.id },
           data: { agentDisconnectedAt: new Date() },
-        }).catch(err => {
+        }).then(() => notifyBoxOwner(agent)).catch(err => {
           console.error(`[AGENT] Failed to stamp disconnect for instance ${conn.instance.id}:`, err.message);
         });
       }
@@ -401,6 +499,17 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
 
   if (conn.kind !== 'user-agent') {
     const box = conn.instance;
+    // The token was checked before this socket was in the map, so a
+    // quarantine that landed in between had no socket to drop. Read the row
+    // again now that it is, and drop it here instead.
+    Promise.resolve()
+      .then(() => prisma.instance.findUnique({ where: { id: box.id }, select: { status: true } }))
+      .then(row => {
+        if (row?.status === QUARANTINED && instanceAgents.get(box.id) === agent) {
+          dropInstanceAgent(box.id, 'quarantined after its token was checked');
+        }
+      })
+      .catch(err => console.error(`[AGENT] quarantine re-check for instance ${box.id} failed:`, err.message));
     const connectedAt = new Date();
     // Fire-and-forget; the connection is good regardless of whether these DB
     // writes land. Their order is load-bearing at both steps. The guarded
@@ -417,7 +526,11 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
     prisma.instance.updateMany({
       where: { id: box.id, status: 'provisioning', readyAt: null },
       data: { readyAt: connectedAt },
-    }).then(() => prisma.instance.updateMany(connectUpdate(box, connectedAt)))
+    }).then(first => {
+      // The write-once readyAt landed: this is the box's first connect, the end of cold provisioning.
+      if (first.count === 1) recordBoxReady(box, connectedAt);
+      return prisma.instance.updateMany(connectUpdate(box, connectedAt));
+    })
       .then(applied => {
         if (applied.count === 0) {
           // The status moved under us, so its write was declined. The agent is
@@ -426,15 +539,19 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
           return prisma.instance.updateMany({
             where: { id: box.id },
             data: { lastConnectedAt: connectedAt },
-          });
+          }).then(() => prisma.instance.updateMany(stuckMarkDropUpdate(box.id)));
         }
+        // A termag start ends when this write lands. A connect from stopped
+        // or hibernated was powered on outside termag and has no request clock.
+        if (box.status === 'starting') recordBoxStartReady(box.id, connectedAt.getTime());
         if (!clearsPowerErrorOnConnect(box.status)) return undefined;
         return prisma.instance.updateMany({
           where: { id: box.id, status: 'ready' },
           data: { provisioningError: null },
         });
       })
-      .then(() => markWarmIfComplete(box.id)).catch(err => {
+      .then(() => markWarmIfComplete(box.id))
+      .then(() => notifyBoxOwner(agent)).catch(err => {
       console.error(`[AGENT] Failed to record connect for instance ${box.id}:`, err.message);
     });
   }
@@ -621,7 +738,7 @@ export function getInstanceAgent(instanceId: string): ConnectedAgent | null {
   return agent;
 }
 
-/** The agent holding a stream's PTY or browser: the project's box agent, or the owner's legacy agent. */
+/** The agent a new browser stream is opened on: the project's box agent, or the owner's legacy agent. */
 function streamAgent(stream: { userId: string; instanceId: string | null }): ConnectedAgent | null {
   return stream.instanceId ? getInstanceAgent(stream.instanceId) : getAgent(stream.userId);
 }
@@ -664,16 +781,37 @@ export function isInstanceAgentConnected(instanceId: string): boolean {
 }
 
 function sendOnAgent(agent: ConnectedAgent, type: string, payload: Record<string, unknown>, timeoutMs: number): Promise<any> {
-  const requestId = nextRequestId();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      agent.pendingRequests.delete(requestId);
-      reject(new Error(`Agent request timed out: ${type}`));
-    }, timeoutMs);
+  // A child span of whatever request or tick awaits the reply
+  // (services/tracing/spans.ts): the method and the box, never the payload.
+  return withSpan('termag.box.rpc', rpcSpanAttributes(agent.conn, type), (span) => {
+    const requestId = nextRequestId();
+    let timedOut = false;
+    const reply = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        agent.pendingRequests.delete(requestId);
+        timedOut = true;
+        reject(new AgentTransportError(`Agent request timed out: ${type}`));
+      }, timeoutMs);
 
-    agent.pendingRequests.set(requestId, { resolve, reject, timer });
-    agent.ws.send(JSON.stringify({ requestId, type, ...payload }));
+      agent.pendingRequests.set(requestId, { resolve, reject, timer });
+      agent.ws.send(JSON.stringify({ requestId, type, ...payload }));
+    });
+    return reply.then(
+      (data) => { span.setAttribute('termag.rpc.outcome', 'ok'); return data; },
+      (err: unknown) => { span.setAttribute('termag.rpc.outcome', timedOut ? 'timeout' : 'error'); throw err; },
+    );
   });
+}
+
+/** An RPC's type is a fixed word from agent.js's handlers; anything else is reported as `other`. */
+const RPC_METHOD = /^[a-z][a-z0-9:_-]{0,47}$/;
+
+/** termag.box.rpc's attributes: ids and the method only. */
+export function rpcSpanAttributes(conn: AgentConnection, type: string): Record<string, string> {
+  const attrs: Record<string, string> = { 'termag.rpc.method': RPC_METHOD.test(type) ? type : 'other' };
+  if (conn.kind === 'user-agent') attrs['termag.user'] = conn.user.id;
+  else attrs['termag.box'] = conn.instance.id;
+  return attrs;
 }
 
 /**
@@ -681,7 +819,7 @@ function sendOnAgent(agent: ConnectedAgent, type: string, payload: Record<string
  */
 export function sendToAgent(userId: string, type: string, payload: Record<string, unknown> = {}, timeoutMs: number = 10000): Promise<any> {
   const agent = getAgent(userId);
-  if (!agent) return Promise.reject(new Error('Agent not connected'));
+  if (!agent) return Promise.reject(new AgentNotConnectedError('Agent not connected'));
   return sendOnAgent(agent, type, payload, timeoutMs);
 }
 
@@ -690,7 +828,7 @@ export function sendToAgent(userId: string, type: string, payload: Record<string
  */
 export function sendToInstanceAgent(instanceId: string, type: string, payload: Record<string, unknown> = {}, timeoutMs: number = 10000): Promise<any> {
   const agent = getInstanceAgent(instanceId);
-  if (!agent) return Promise.reject(new Error('Instance agent not connected'));
+  if (!agent) return Promise.reject(new AgentNotConnectedError('Instance agent not connected'));
   return sendOnAgent(agent, type, payload, timeoutMs);
 }
 
@@ -733,16 +871,9 @@ export async function requestTerminalStream(
   rows: number,
   onData: (msg: any) => void,
 ): Promise<string> {
-  const streamId = `stream_${nextRequestId()}`;
-  terminalStreams.set(streamId, { onData, userId, instanceId: null });
-
-  try {
-    await sendToAgent(userId, 'terminal-attach', { tmuxSessionName, streamId, cols, rows });
-    return streamId;
-  } catch (err) {
-    terminalStreams.delete(streamId);
-    throw err;
-  }
+  const agent = getAgent(userId);
+  if (!agent) throw new Error('Agent not connected');
+  return attachTerminal(agent, null, tmuxSessionName, cols, rows, onData);
 }
 
 /**
@@ -750,17 +881,29 @@ export async function requestTerminalStream(
  */
 export async function requestInstanceTerminalStream(
   instanceId: string,
-  user: Pick<User, 'id'>,
+  tmuxSessionName: string,
+  cols: number,
+  rows: number,
+  onData: (msg: any) => void,
+): Promise<string> {
+  const agent = getInstanceAgent(instanceId);
+  if (!agent) throw new Error('Instance agent not connected');
+  return attachTerminal(agent, instanceId, tmuxSessionName, cols, rows, onData);
+}
+
+/** Open a PTY on `agent`, bound to that socket and no later one. */
+async function attachTerminal(
+  agent: ConnectedAgent,
+  instanceId: string | null,
   tmuxSessionName: string,
   cols: number,
   rows: number,
   onData: (msg: any) => void,
 ): Promise<string> {
   const streamId = `stream_${nextRequestId()}`;
-  terminalStreams.set(streamId, { onData, userId: user.id, instanceId });
-
+  terminalStreams.set(streamId, { onData, agent, instanceId });
   try {
-    await sendToInstanceAgent(instanceId, 'terminal-attach', { tmuxSessionName, streamId, cols, rows });
+    await sendOnAgent(agent, 'terminal-attach', { tmuxSessionName, streamId, cols, rows }, 10000);
     return streamId;
   } catch (err) {
     terminalStreams.delete(streamId);
@@ -770,9 +913,8 @@ export async function requestInstanceTerminalStream(
 
 function sendToStreamAgent(streamId: string, msg: Record<string, unknown>): void {
   const stream = terminalStreams.get(streamId);
-  const agent = stream && streamAgent(stream);
-  if (!agent) return;
-  agent.ws.send(JSON.stringify({ ...msg, streamId }));
+  if (!stream || stream.agent.ws.readyState !== WebSocket.OPEN) return;
+  stream.agent.ws.send(JSON.stringify({ ...msg, streamId }));
 }
 
 export function sendTerminalInput(streamId: string, data: string): void {

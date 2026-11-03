@@ -3,11 +3,12 @@ import {
   GUEST_BUSY_CLOSE_CODE, GUEST_STACK_CLOSE_CODE, GUEST_UNSAFE_CLOSE_CODE, MAX_ORIGINS,
   canonicalOrigin, guestAttachRefusal, guestPaneKey, isShareId, localRedirectPath, maxGuestPanes, parseRecipe, resolveGuestAccess, reviewerSignInHint, safeAtPath, ttlHours,
   type GuestShare,
-  activeLinkKeyOf, checkLinkSharePr, endedCommentBody, isLinkToken, linkTokenFor, linkTokenHash, previewCommentBody,
+  homeLabel, lastStackRefusal, splitStackRefusal, stackCheckView,
+  activeLinkKeyOf, checkLinkSharePr, endedCommentBody, isLinkToken, isOpenLink, linkTokenFor, linkTokenHash, previewCommentBody,
   guestWakeRefusal, wakeBudget,
-  autoShareDecision, parseAccountHint, parsePathFilter,
+  autoShareDecision, parseAccountHint, parsePathFilter, WEBAPP_REVIEWER_ACCOUNT,
 } from './previewShareRules';
-import { isAutoHibernateNote } from './boxLifecyclePolicy';
+import { isAutoHibernateNote, isSweepStopped } from './boxLifecyclePolicy';
 import type { PrFacts } from './prReview';
 
 describe('canonicalOrigin', () => {
@@ -92,10 +93,10 @@ describe('isShareId and localRedirectPath', () => {
 
 describe('reviewerSignInHint', () => {
   it('takes the project\'s hint, else webapp\'s seeded account for its dev stack, else nothing', () => {
-    expect(reviewerSignInHint({ kind: 'webapp-dev-stack' })).toBe('reviewer@example.com / example-password');
+    expect(reviewerSignInHint({ kind: 'webapp-dev-stack' })).toBe(WEBAPP_REVIEWER_ACCOUNT);
     expect(reviewerSignInHint({ kind: 'manual', origins: ['127.0.0.1:3000'] })).toBeNull();
     expect(reviewerSignInHint({ kind: 'manual', origins: ['127.0.0.1:3000'] }, '  demo@example.com / demo  ')).toBe('demo@example.com / demo');
-    expect(reviewerSignInHint({ kind: 'webapp-dev-stack' }, '   ')).toBe('reviewer@example.com / example-password');
+    expect(reviewerSignInHint({ kind: 'webapp-dev-stack' }, '   ')).toBe(WEBAPP_REVIEWER_ACCOUNT);
     expect(reviewerSignInHint({ kind: 'webapp-dev-stack' }, 'x'.repeat(500))).toHaveLength(200);
   });
 });
@@ -144,7 +145,11 @@ describe('guestAttachRefusal and guestPaneKey', () => {
     expect(guestAttachRefusal('guest-busy: this box takes no reviewers right now').message).toBe('This box takes no reviewers right now. Trying again shortly.');
     expect(guestAttachRefusal('guest-busy: /home/owner/secret path').message).toBe('This preview is busy right now. Trying again shortly.');
     expect(guestAttachRefusal('Error: guest-memory: the box is low on memory')).toMatchObject({ code: GUEST_BUSY_CLOSE_CODE, retry: true });
-    expect(guestAttachRefusal('guest-stack:other-workstream')).toMatchObject({ code: GUEST_STACK_CLOSE_CODE, retry: false, message: expect.stringMatching(/another workstream/) });
+    expect(guestAttachRefusal('guest-stack:other-workstream')).toMatchObject({ code: GUEST_STACK_CLOSE_CODE, retry: false, message: expect.stringMatching(/started from another checkout, not this workstream's/) });
+    // The stack in the way is named for the owner only: the reviewer gets the same sentence.
+    expect(guestAttachRefusal('Error: guest-stack:other-workstream: started from /home/owner/src/webapp/dev-stack').message)
+      .toBe(guestAttachRefusal('guest-stack:other-workstream').message);
+    expect(guestAttachRefusal('guest-stack:other-workstream', { checkout: true }).message).toMatch(/not the one this preview shows/);
     expect(guestAttachRefusal('guest-stack:stack-not-running')).toMatchObject({ code: GUEST_STACK_CLOSE_CODE, message: expect.stringMatching(/isn't running/) });
     expect(guestAttachRefusal('guest-unsafe: this box could not confirm …')).toMatchObject({ code: GUEST_UNSAFE_CLOSE_CODE, retry: false });
     expect(guestAttachRefusal('guest-unavailable: no launcher')).toMatchObject({ code: 4501 });
@@ -154,6 +159,75 @@ describe('guestAttachRefusal and guestPaneKey', () => {
     expect(guestAttachRefusal("Error: ENOENT: no such file or directory, open '/home/owner/src/termag/agent/agent.config.json'").message)
       .toBe("Could not start a browser on the owner's box. Try again in a moment.");
     expect(guestPaneKey('s1', 'u1')).toBe('guest:s1:u1');
+  });
+});
+
+describe('the dev stack in the way, for the owner', () => {
+  it('splits the stack in the way off an agent refusal, and only a plain absolute path', () => {
+    expect(splitStackRefusal('Error: guest-stack:other-workstream: started from /home/o/src/webapp/dev-stack'))
+      .toEqual({ reason: 'guest-stack:other-workstream', holder: '/home/o/src/webapp/dev-stack' });
+    expect(splitStackRefusal('guest-stack:other-workstream')).toEqual({ reason: 'guest-stack:other-workstream', holder: null });
+    expect(splitStackRefusal('guest-busy: 5 reviewers are already using this preview')).toEqual({ reason: 'guest-busy: 5 reviewers are already using this preview', holder: null });
+    expect(splitStackRefusal('guest-stack:other-workstream: started from relative/dev-stack').holder).toBeNull();
+    expect(splitStackRefusal('guest-stack:other-workstream: started from /a\u001b[2J/dev-stack').holder).toBeNull();
+  });
+
+  it('names the home directory as ~', () => {
+    expect(homeLabel('/home/olive/src/webapp')).toBe('~/src/webapp');
+    expect(homeLabel('/srv/x')).toBe('/srv/x');
+  });
+
+  const checkouts = [
+    { workstream: 'main', dir: '/home/o/termag/projects/fav' },
+    { workstream: 'favorites', dir: '/home/o/termag/projects/fav/.worktrees/favorites' },
+  ];
+
+  it('names the workstream whose stack is in the way, so the dialog can offer it', () => {
+    const view = stackCheckView({ ok: false, reason: 'other-workstream', holder: '/home/o/termag/projects/fav/.worktrees/favorites/dev-stack' }, { workstream: 'main', checkouts });
+    expect(view).toEqual({
+      checked: true, ok: false, reason: 'other-workstream', holder: { dir: '/home/o/termag/projects/fav/.worktrees/favorites', workstream: 'favorites' },
+      message: expect.stringMatching(/^The dev stack on your box was started from the favorites workstream, not main, so a reviewer would be refused\. Share favorites instead/),
+    });
+  });
+
+  it('names a checkout outside the project by its path, and says what to fix otherwise', () => {
+    const other = stackCheckView({ ok: false, reason: 'other-workstream', holder: '/home/o/src/webapp/dev-stack' }, { workstream: 'main', checkouts });
+    expect(other).toMatchObject({ holder: { dir: '/home/o/src/webapp', workstream: null }, message: expect.stringMatching(/started from ~\/src\/webapp, not main's checkout/) });
+    expect(stackCheckView({ ok: false, reason: 'other-workstream' }, { workstream: 'main', checkouts })).toMatchObject({ holder: null, message: expect.stringMatching(/Something other than main's dev stack/) });
+    expect(stackCheckView({ ok: false, reason: 'stack-not-running' }, { workstream: 'favorites', checkouts }).message).toBe("favorites's dev stack isn't running on your box, so a reviewer would be refused until it is.");
+    expect(stackCheckView({ ok: false, reason: 'not-a-dev-stack' }, { workstream: 'main', checkouts }).message).toMatch(/Share addresses on this box instead/);
+    expect(stackCheckView({ ok: false, reason: 'whatever' }, { workstream: 'main', checkouts }).message).toBe('Your box could not check the dev stack.');
+  });
+
+  it('is fine when a reviewer would get in, and unchecked when the box gave no answer', () => {
+    expect(stackCheckView({ ok: true, primaryUrl: 'http://127.0.0.2/' }, { workstream: 'main', checkouts })).toEqual({ checked: true, ok: true });
+    expect(stackCheckView(null, { workstream: 'main', checkouts })).toEqual({ checked: false });
+    // A holder that can't be shown is dropped, not passed on.
+    expect(stackCheckView({ ok: false, reason: 'other-workstream', holder: 7 }, { workstream: 'main', checkouts })).toMatchObject({ holder: null });
+  });
+
+  it('takes the box\'s word for which workstream a symlinked checkout is, from the checkouts it was sent only', () => {
+    // .worktrees/favorites links to /mnt/fav: Docker reports the real path, which the box matched.
+    const linked = { ok: false, reason: 'other-workstream', holder: '/mnt/fav/dev-stack', holderWorkstream: 'favorites' };
+    expect(stackCheckView(linked, { workstream: 'main', checkouts })).toMatchObject({ holder: { dir: '/mnt/fav', workstream: 'favorites' }, message: expect.stringMatching(/Share favorites instead/) });
+    expect(stackCheckView({ ...linked, holderWorkstream: 'not-sent' }, { workstream: 'main', checkouts })).toMatchObject({ holder: { dir: '/mnt/fav', workstream: null } });
+    expect(stackCheckView({ ...linked, holderWorkstream: 'main' }, { workstream: 'main', checkouts })).toMatchObject({ holder: { workstream: null } });
+  });
+
+  it('keeps a share\'s last stack refusal until a reviewer gets in, with what they were told', () => {
+    const at = new Date('2026-10-28T16:27:00Z');
+    const event = { reason: 'guest-stack:other-workstream', detail: { holder: '/home/o/src/webapp/dev-stack' }, at };
+    expect(lastStackRefusal(event, { lastOpenedAt: null, checkout: false })).toEqual({
+      at: at.toISOString(), message: guestAttachRefusal('guest-stack:other-workstream').message, holder: '/home/o/src/webapp',
+    });
+    expect(lastStackRefusal(event, { lastOpenedAt: new Date('2026-10-28T16:00:00Z'), checkout: false })).not.toBeNull();
+    expect(lastStackRefusal(event, { lastOpenedAt: new Date('2026-10-28T17:00:00Z'), checkout: false })).toBeNull();
+    // Shared again since (perhaps with another recipe): the refusal was the old share's.
+    expect(lastStackRefusal(event, { lastOpenedAt: null, renewedAt: new Date('2026-10-28T16:30:00Z'), checkout: false })).toBeNull();
+    expect(lastStackRefusal(event, { lastOpenedAt: null, renewedAt: new Date('2026-10-28T16:00:00Z'), checkout: false })).not.toBeNull();
+    expect(lastStackRefusal({ ...event, detail: null }, { lastOpenedAt: null, checkout: true })).toMatchObject({ holder: null, message: expect.stringMatching(/not the one this preview shows/) });
+    expect(lastStackRefusal({ ...event, reason: 'box-asleep' }, { lastOpenedAt: null, checkout: false })).toBeNull();
+    expect(lastStackRefusal(undefined, { lastOpenedAt: null, checkout: false })).toBeNull();
   });
 });
 
@@ -177,6 +251,12 @@ describe('link shares (phase 2)', () => {
     expect(linkTokenHash(t)).not.toContain(t);
   });
 
+  it('calls a link share with no PR an open link, and nothing else', () => {
+    expect(isOpenLink({ audience: 'link', prRepo: null, prNumber: null })).toBe(true);
+    expect(isOpenLink({ audience: 'link', prRepo: 'example-org/webapp', prNumber: 42 })).toBe(false);
+    expect(isOpenLink({ audience: 'user', prRepo: null, prNumber: null })).toBe(false);
+  });
+
   it('keys a workstream\'s active link share by its row, or the project\'s implicit main', () => {
     expect(activeLinkKeyOf('p1', 'ws1')).toBe('ws1');
     expect(activeLinkKeyOf('p1', null)).toBe('p1:main');
@@ -193,6 +273,9 @@ describe('link shares (phase 2)', () => {
     expect(reason({ state: 'MERGED' })).toBe('not-open');
     expect(reason({ state: 'CLOSED' })).toBe('not-open');
     expect(reason({ isDraft: true })).toBe('draft');
+    // A target that allows drafts lets one through, and nothing else.
+    expect(reason({ isDraft: true }, { ...target, draftsOk: true })).toBe('ok');
+    expect(reason({ isDraft: true, visibility: 'PUBLIC' }, { ...target, draftsOk: true })).toBe('public');
     expect(reason({ visibility: 'PUBLIC' })).toBe('public');
     expect(reason({ visibility: '' })).toBe('public');
     expect(reason({ repo: 'example-org/termag' })).toBe('other-repo');
@@ -213,9 +296,9 @@ describe('link shares (phase 2)', () => {
   });
 
   it('writes the comment with the link, the sign-in hint and its marker; the ended one keeps no link', () => {
-    const body = previewCommentBody({ link: 'https://t.test/termag/p/abc', shareId: 'cshare0000000001', signInHint: 'reviewer@example.com / example-password', ownerName: 'Olive <Owner>' });
+    const body = previewCommentBody({ link: 'https://t.test/termag/p/abc', shareId: 'cshare0000000001', signInHint: 'reviewer@example.com / testing', ownerName: 'Olive <Owner>' });
     expect(body).toContain('https://t.test/termag/p/abc');
-    expect(body).toContain('`reviewer@example.com / example-password`');
+    expect(body).toContain('`reviewer@example.com / testing`');
     expect(body).toContain("Olive Owner's termag box");
     expect(body).toContain('<!-- termag-preview-share:cshare0000000001 -->');
     expect(previewCommentBody({ link: 'L', shareId: 's', signInHint: null, ownerName: 'O' })).not.toContain('Sign in');
@@ -231,14 +314,24 @@ describe('waking the box (4b)', () => {
   const auto = (note: string | null) => isAutoHibernateNote(note);
   const box = (over: Record<string, unknown> = {}) => ({ status: 'hibernated', lifecycleNote: 'Hibernated automatically after 2 h idle. Start it to resume where you left off.', autoTerminatedAt: null, ...over }) as any;
 
+  const sweepStopped = (b: { parkedAt?: Date | null; lifecycleNote: string | null }) => isSweepStopped(b);
+
   it('wakes only a box the idle sweep hibernated and nobody touched since', () => {
-    expect(guestWakeRefusal(box(), auto)).toBeNull();
-    expect(guestWakeRefusal(box({ lifecycleNote: null }), auto)).toBe('not-auto');
-    expect(guestWakeRefusal(box({ lifecycleNote: 'Terminated automatically.' }), auto)).toBe('not-auto');
-    expect(guestWakeRefusal(box({ status: 'stopped' }), auto)).toBe('not-auto');
-    expect(guestWakeRefusal(box({ status: 'ready' }), auto)).toBe('awake');
-    expect(guestWakeRefusal(box({ autoTerminatedAt: new Date() }), auto)).toBe('no-box');
-    expect(guestWakeRefusal(null, auto)).toBe('no-box');
+    expect(guestWakeRefusal(box(), auto, sweepStopped)).toBeNull();
+    expect(guestWakeRefusal(box({ lifecycleNote: null }), auto, sweepStopped)).toBe('not-auto');
+    expect(guestWakeRefusal(box({ lifecycleNote: 'Terminated automatically.' }), auto, sweepStopped)).toBe('not-auto');
+    expect(guestWakeRefusal(box({ status: 'stopped' }), auto, sweepStopped)).toBe('not-auto');
+    expect(guestWakeRefusal(box({ status: 'ready' }), auto, sweepStopped)).toBe('awake');
+    expect(guestWakeRefusal(box({ autoTerminatedAt: new Date() }), auto, sweepStopped)).toBe('no-box');
+    expect(guestWakeRefusal(null, auto, sweepStopped)).toBe('no-box');
+  });
+
+  it('also wakes a stopped box the sweep stopped, never one stopped by hand', () => {
+    const stopped = (over: Record<string, unknown> = {}) => box({ status: 'stopped', lifecycleNote: 'Stopped automatically after 1 h idle. Start it to get its sessions back.', parkedAt: new Date(), ...over });
+    expect(guestWakeRefusal(stopped(), auto, sweepStopped)).toBeNull();
+    expect(guestWakeRefusal(stopped({ lifecycleNote: null }), auto, sweepStopped)).toBe('not-auto');
+    expect(guestWakeRefusal(stopped({ parkedAt: null }), auto, sweepStopped)).toBe('not-auto');
+    expect(guestWakeRefusal(stopped({ autoTerminatedAt: new Date() }), auto, sweepStopped)).toBe('no-box');
   });
 
   it('allows one wake per 30 minutes and six in any 24 hours, per owner', () => {

@@ -1,5 +1,6 @@
 import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
+import { fixedOnCreate, resolveChatSpaceChoice } from '../services/chatSpace';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { createRequire } from 'module';
@@ -24,7 +25,7 @@ import { clearMilestoneTimer, moveStatus, notifyStatusChange, setStatus, updateS
 import type { LaunchOutcome } from '../services/agentRuntime';
 import { planSessionRenames, validateWorkstreamRename } from '../services/workstreamRename';
 import { renameSpawnWorkstream } from '../services/spawnRenames';
-import { isBranchName } from '../services/repoCreate';
+import { isBranchName, isNewBranchName } from '../services/repoCreate';
 import { repoFromOrigin } from '../services/prBranches';
 import { powerStateError } from '../services/boxPowerPolicy';
 import { refuseUnreadySessions } from '../services/sessionGate';
@@ -34,6 +35,11 @@ import { kindRefusal, projectKindTraits } from '../services/projectKind';
 import { isRunName } from '../services/automations/schedule';
 import { recordProductEvent } from '../services/productEvents';
 import { endPreviewShares } from '../services/previewShares';
+import { isWorkspace, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_CLONE_CAPABILITY, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import {
+  buildWorkstreamTree, PR_CHECKOUT_TIMEOUT_MS, removeWorkstreamTree, undoWorkstreamTree, workspacePrRepo, WORKTREE_PR_PATH_CAPABILITY,
+} from '../services/workspaceWorkstreams';
+import { boolVariation } from '../services/featureFlags';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -128,6 +134,9 @@ export interface CreateWorkstreamInput {
    * is adopted, and the workstream takes its directory's name. `repo` is the
    * PR's `owner/name`: a project whose origin is another repository is refused
    * before the fetch, which would only fail on a `pull/<n>/head` it lacks.
+   * In a multi-repo project the PR goes in its repository's worktree and the
+   * other repositories branch off onto the PR's branch name; nothing is
+   * adopted (services/workspaceWorkstreams.ts buildWorkstreamTree).
    */
   pr?: { repo: string; number: number; sameRepo: boolean; headOid: string };
   /**
@@ -135,6 +144,13 @@ export interface CreateWorkstreamInput {
    * a kind that refuses Branch off… by hand still gets its run workstreams.
    */
   system?: boolean;
+  /**
+   * The chat's space, resolved (services/chatSpace.ts resolveChatSpaceChoice) and fixed in the
+   * row's insert, so a listing before its first turn can't fix it to the box's first grant: an
+   * automation's run (services/automations/runner.ts), or New session's worktree session, whose
+   * named space the create route resolves for its caller (browserChatSpace).
+   */
+  chatSpace?: { spaceId: string | null } | null;
   /** What the new workstream's agent starts on (services/firstPrompt.ts); validated by the caller. */
   firstPrompt?: string | null;
   /** Make the workstream's Slack channel (default true); a run gets none. */
@@ -146,10 +162,41 @@ export interface CreateWorkstreamInput {
    * response says `fetched: false`.
    */
   fetch?: { remoteBranch: string };
+  /**
+   * The fetch is a person's, asked for in the simple UI's New session as a
+   * worktree session (createWorkstreamBody, only while
+   * chat-worktree-sessions-enabled is on for them): the box leaves the tree
+   * unmarked, as a fresh clone a person starts (WORKTREE_FETCH_ATTENDED_CAPABILITY),
+   * when it starts from the ref that fetch refreshed (agent/worktree-fetch.js
+   * startsFromFetch). After a failed fetch, or from another base, the box
+   * marks it unattended, so a trusted turn there runs auto.
+   * Every other fetch, an automation run's or the desktop app's
+   * `startFromOrigin` (services/cliWorkstreams.ts), is marked unattended as
+   * before. Only the cookie route sets it.
+   */
+  attended?: boolean;
+  /**
+   * The person's permission pick for that freshly fetched tree (New session's
+   * pill, as a fresh clone asks): Full access leaves it the project's own tree,
+   * so a trusted project's turns there run with full access and load its
+   * config, as a fresh clone ticked trusted does. Read only asks the box never
+   * to record the tree as its own (`readOnly`, worktree-fetch.js marksOwn, part
+   * of WORKTREE_FETCH_ATTENDED_CAPABILITY), and it is marked unattended, so
+   * every turn there is read-only and never loads the fetched tip's hooks,
+   * .mcp.json or apiKeyHelper. Only with `attended`.
+   */
+  readOnly?: boolean;
 }
 
 /** The agent capability for a fetch before `git-worktree-add` (agent/agent.js). */
 export const WORKTREE_FETCH_CAPABILITY = 'worktree-fetch-v1';
+/**
+ * The agent capability for a fetch a person asked for (agent/worktree-fetch.js):
+ * the tree is left unmarked, as a fresh clone is (`attended`, Full access), or
+ * never recorded as the project's own (`readOnly`, Read only). A fetch without
+ * either is an automation run's, marked unattended, which never gets the full mode.
+ */
+export const WORKTREE_FETCH_ATTENDED_CAPABILITY = 'worktree-fetch-attended-v1';
 
 /** What createWorkstreamFor answers over the workstream row. */
 export interface CreatedWorkstreamExtras {
@@ -174,10 +221,7 @@ export const CHECKOUT_NOT_LANDED =
 
 /** The agent capability git-worktree-add-pr needs (agent/git-worktree-pr.js). */
 export const WORKTREE_PR_CAPABILITY = 'worktree-pr-v1';
-// Longer than the agent can take (agent/git-worktree-pr.js MAX_DURATION_MS: two
-// 90 s fetches, a 90 s checkout and the ref steps: 510 s), so the orchestrator
-// never gives up on a checkout the agent then finishes.
-const PR_CHECKOUT_TIMEOUT_MS = 600_000;
+const AGENT_CANNOT_CHECK_OUT_PR = "This box's agent cannot check out a pull request yet: update termag on the box and restart its agent.";
 const ORIGIN_READ_TIMEOUT_MS = 10_000;
 
 /**
@@ -194,12 +238,59 @@ async function projectOriginRepo(host: { userId: string; instanceId: string | nu
 }
 
 /**
+ * A browser's create body. `fetch` branches from a freshly fetched
+ * origin/<remoteBranch>: the simple UI's New session asks for it so a
+ * worktree session starts on the default branch's tip, not on whatever the
+ * project's checkout has moved to. It is kept only for a valid branch name and
+ * only with `allowFetch` (chat-worktree-sessions-enabled for the caller,
+ * browserFetchAllowed), and then it is `attended`: a person's. Without it the
+ * add is a plain branch-off from the body's base, as before.
+ * createWorkstreamFor honours an attended fetch only on a box that can mark
+ * the tree so (WORKTREE_FETCH_ATTENDED_CAPABILITY).
+ */
+export function createWorkstreamBody(body: unknown, opts: { allowFetch: boolean }): Pick<CreateWorkstreamInput, 'name' | 'branch' | 'baseRef' | 'fetch' | 'attended' | 'readOnly'> {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+  const f = b.fetch && typeof b.fetch === 'object' ? b.fetch as Record<string, unknown> : null;
+  const remote = f ? str(f.remoteBranch) : undefined;
+  // Only an explicit Full access makes the fetched tree the person's own; anything else is Read only.
+  const readOnly = f?.fullAccess !== true;
+  return {
+    name: str(b.name), branch: str(b.branch), baseRef: str(b.baseRef),
+    ...(opts.allowFetch && remote && isBranchName(remote) ? { fetch: { remoteBranch: remote }, attended: true, readOnly } : {}),
+  };
+}
+
+/**
+ * New session's space for a worktree session's chat (services/chatSpace.ts), as a project's main
+ * gets on create: a space name the caller may use, or null for No space, resolved for them.
+ * Nothing when the body names none, or a space they can't use: the chat then gets its box's
+ * first granted space at its first listing, as every chat made another way does.
+ */
+export async function browserChatSpace(
+  user: Express.User, body: unknown, resolve: typeof resolveChatSpaceChoice = resolveChatSpaceChoice,
+): Promise<{ spaceId: string | null } | null> {
+  const name = body && typeof body === 'object' ? (body as Record<string, unknown>).chatSpace : undefined;
+  if (name !== null && typeof name !== 'string') return null;
+  return resolve(name, user.id).catch(() => null);
+}
+
+/**
+ * Whether a browser's fetch is honoured: chat-worktree-sessions-enabled for
+ * the caller, read only when the body asks for a fetch it would keep.
+ */
+export async function browserFetchAllowed(user: Express.User, body: unknown): Promise<boolean> {
+  if (!createWorkstreamBody(body, { allowFetch: true }).fetch) return false;
+  return boolVariation('chat-worktree-sessions-enabled', user, false);
+}
+
+/**
  * Create a workstream in one of the user's own projects: the worktree on its
  * host, the row, its Slack channel, and a copy of main's workflows launched
  * in it. Shared by the cookie route and agent spawns (routes/spawns.ts).
  */
 export async function createWorkstreamFor(user: Express.User, projectId: string, input: CreateWorkstreamInput): Promise<RouteResult> {
-  const { name, branch, baseRef, provider, spawnId, pr, system, fetch, firstPrompt } = input;
+  const { name, branch, baseRef, provider, spawnId, pr, system, fetch, attended, readOnly, firstPrompt } = input;
   if (!name) return { status: 400, body: { error: 'name required' } };
   if (!NAME_REGEX.test(name)) {
     return { status: 400, body: { error: 'name must be alphanumeric with dashes/underscores only, at most 64 characters' } };
@@ -213,7 +304,7 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   const branchName = branch ?? name;
   // A PR's branch is GitHub's, and may use anything git allows: the box judges it with
   // `git check-ref-format` (agent/git-worktree-pr.js) and only ever passes it as an argument.
-  if (!(pr ? isPrBranchName(branchName) : isBranchName(branchName))) {
+  if (!(pr ? isPrBranchName(branchName) : isNewBranchName(branchName))) {
     return { status: 400, body: { error: 'branch contains disallowed characters' } };
   }
   const ref = baseRef ?? 'HEAD';
@@ -236,11 +327,20 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   const unready = refuseUnreadySessions(project);
   if (unready) return { status: 409, body: { error: unready.message } };
 
-  const existing = await prisma.workstream.findUnique({
-    where: { projectId_name: { projectId: project.id, name } },
+  // The name is unique per project. So is a new branch: `git worktree add -b` refuses a
+  // branch another worktree holds, the main one's (whatever the default branch is called)
+  // included. A PR's branch may be adopted. When one row has the name and another the
+  // branch, the name is what is said: a new branch alone would still meet it.
+  const existing = await prisma.workstream.findMany({
+    where: { projectId: project.id, OR: [{ name }, ...(pr ? [] : [{ branch: branchName }])] },
+    select: { name: true },
+    take: 2,
   });
-  if (existing) {
+  if (existing.some(w => w.name === name)) {
     return { status: 409, body: { error: 'A workstream with that name already exists' } };
+  }
+  if (existing.length > 0) {
+    return { status: 409, body: { error: `branch ${branchName} is already a workstream's in this project; pick another branch` } };
   }
 
   const projDir = projectDirFor(project);
@@ -252,10 +352,34 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   let baseSha: string | null = null;
   // An adopted or reused worktree is not ours to remove if the row cannot be written.
   let createdWorktree = true;
-  if (pr) {
+  // A multi-repo project: a worktree of every repository.
+  let workspaceMade: string[] | null = null;
+  // The PR's repository in a multi-repo project: its worktree's branch is the PR's, never deleted on an undo.
+  let workspacePrRepoName: string | null = null;
+  if (isWorkspace(project)) {
+    // New session's worktree from a fresh fetch (attended) has no multi-repo form: its permission pick could not hold.
+    if (fetch && attended === true && !system) return { status: 409, body: { error: 'Starting a worktree session from origin in a project with several repositories is not supported yet: start from its checkout' } };
+    if (!project.instanceId || !isProjectAgentConnected(projectHost)) return { status: 503, body: { error: 'Box agent is not connected' } };
+    const capabilities = projectAgentCapabilities(projectHost);
+    if (!capabilities.includes(WORKSPACE_CLONE_CAPABILITY)) return { status: 409, body: { error: WORKSPACE_UNSUPPORTED } };
+    if (pr && !capabilities.includes(WORKTREE_PR_PATH_CAPABILITY)) return { status: 409, body: { error: AGENT_CANNOT_CHECK_OUT_PR } };
+    const repos = await prisma.projectRepo.findMany({ where: { projectId: project.id }, orderBy: { position: 'asc' } });
+    let prTarget: { repoName: string; number: number; sameRepo: boolean; headOid: string } | undefined;
+    if (pr) {
+      const target = workspacePrRepo(project.name, repos, pr);
+      if (!target.ok) return { status: 409, body: { error: target.error } };
+      prTarget = { repoName: target.repo.name, number: pr.number, sameRepo: pr.sameRepo, headOid: pr.headOid };
+    }
+    const unreadyRepo = repos.find(r => r.setupStatus !== 'ready');
+    if (unreadyRepo) return { status: 409, body: { error: `${unreadyRepo.name} is not cloned yet` } };
+    const built = await buildWorkstreamTree(project, repos, name, branchName, ref, prTarget);
+    if (!built.ok) return { status: 500, body: { error: pr ? `Could not check out the pull request: ${built.error}` : `git worktree add failed: ${built.error}` } };
+    workspaceMade = built.made;
+    workspacePrRepoName = prTarget?.repoName ?? null;
+  } else if (pr) {
     if (!isProjectAgentConnected(projectHost)) return { status: 503, body: { error: 'Box agent is not connected' } };
     if (!projectAgentCapabilities(projectHost).includes(WORKTREE_PR_CAPABILITY)) {
-      return { status: 409, body: { error: "This box's agent cannot check out a pull request yet: update termag on the box and restart its agent." } };
+      return { status: 409, body: { error: AGENT_CANNOT_CHECK_OUT_PR } };
     }
     // Only a known mismatch refuses: an origin the box cannot read leaves it to the fetch, as before.
     const origin = await projectOriginRepo(projectHost, projDir);
@@ -290,14 +414,31 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
     const initRepo = !project.repoUrl;
     try {
       if (isProjectAgentConnected(projectHost)) {
-        const canFetch = !!fetch && projectAgentCapabilities(projectHost).includes(WORKTREE_FETCH_CAPABILITY);
+        // An automation run's fetch, or the desktop app's startFromOrigin, is
+        // made with nobody watching, and the box marks the tree so. A
+        // person's (`attended`, New session's worktree) needs a box that can
+        // say so, or the tree would be marked an automation's and never get
+        // the full mode. Without that the start is refused: New session said
+        // "origin/<default>, fetched now", and a branch-off from the checkout
+        // would be neither that code nor, for Read only, that permission.
+        const caps = projectAgentCapabilities(projectHost);
+        const personFetch = !!fetch && attended === true && !system;
+        // A person's Full access asks the box to leave the fetched tree as
+        // theirs; their Read only asks it never to record the tree as its own
+        // (readOnly, above). Both need a box that knows to.
+        const personFull = personFetch && readOnly !== true;
+        const canFetch = !!fetch && caps.includes(WORKTREE_FETCH_CAPABILITY)
+          && (!personFetch || caps.includes(WORKTREE_FETCH_ATTENDED_CAPABILITY));
+        if (personFetch && !canFetch) {
+          return { status: 409, body: { error: "This box's agent cannot start a session from a fresh origin yet: update termag on the box and restart its agent, or start from the project's checkout." } };
+        }
         const added = await sendForProject(projectHost, 'git-worktree-add', {
           projectDir: projDir,
           worktreeName: name,
           branch: branchName,
           baseRef: ref,
           initRepo,
-          ...(canFetch ? { fetch: fetch.remoteBranch } : {}),
+          ...(canFetch ? { fetch: fetch.remoteBranch, ...(personFull ? { attended: true } : {}), ...(personFetch && !personFull ? { readOnly: true } : {}) } : {}),
         // With a fetch the agent spends up to 30 s on it (agent/worktree-fetch.js FETCH_TIMEOUT_MS)
         // before the add itself; the wait covers both with room to spare.
         }, canFetch ? 90_000 : 10_000) as { fetched?: unknown; baseSha?: unknown } | undefined;
@@ -320,9 +461,13 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   let workstream;
   try {
     workstream = await prisma.workstream.create({
-      data: { projectId: project.id, name: wsName, branch: branchName },
+      data: { projectId: project.id, name: wsName, branch: branchName, ...fixedOnCreate(input.chatSpace) },
     });
   } catch (err) {
+    if (workspaceMade) {
+      await undoWorkstreamTree(project, workspaceMade, wsName, branchName, workspacePrRepoName ? [workspacePrRepoName] : []).catch(() => {});
+      throw err;
+    }
     // DB write lost a race — try to clean up the worktree + branch we just
     // created so a retry isn't blocked by the half-built state. A PR's
     // branch is not deleted: it is the PR's, and may hold the user's work.
@@ -498,7 +643,7 @@ export async function removeWorkstreamFor(
     (type, payload) => sendForProject(projectHost, type, payload),
     isProjectAgentConnected(projectHost),
     project.id,
-    [workstream.id],
+    [{ id: workstream.id, name: workstream.name }],
   );
   if (blocked) return { status: 409, body: { error: blocked } };
 
@@ -531,7 +676,14 @@ export async function removeWorkstreamFor(
   let branchDeleteWarning: string | null = null;
   // An ask's chat has no worktree, and its `ask` branch is the clone's, not
   // the project's (services/askChat.ts): there is nothing in git to remove.
-  if (!workstream.askThread) try {
+  if (!workstream.askThread && isWorkspace(project)) {
+    if (!isProjectAgentConnected(projectHost)) return { status: 503, body: { error: 'Box agent is not connected' } };
+    if (!projectAgentCapabilities(projectHost).includes(WORKSPACE_CLONE_CAPABILITY)) return { status: 409, body: { error: WORKSPACE_UNSUPPORTED } };
+    const repos = await prisma.projectRepo.findMany({ where: { projectId: project.id }, orderBy: { position: 'asc' } });
+    const removed = await removeWorkstreamTree(project, repos, workstream, { force, keepBranch: opts.keepBranch });
+    if (!removed.ok) return { status: removed.status, body: { error: removed.error } };
+    branchDeleteWarning = removed.warnings.length > 0 ? removed.warnings.join('; ') : null;
+  } else if (!workstream.askThread) try {
     if (isProjectAgentConnected(projectHost)) {
       const result = await sendForProject(projectHost, 'git-worktree-remove', {
         projectDir: projDir,
@@ -597,12 +749,13 @@ export function workstreamsRouter(): Router {
   };
 
   // POST /api/projects/:projectId/workstreams — create a new workstream
-  // Body: { name, branch?, baseRef? } (createWorkstreamFor)
+  // Body: { name, branch?, baseRef?, fetch?: { remoteBranch, fullAccess? } } (createWorkstreamBody, createWorkstreamFor)
   const create: RequestHandler = async (req, res) => {
-    const { name, branch, baseRef } = req.body as {
-      name?: string; branch?: string; baseRef?: string;
-    };
-    sendResult(res, await createWorkstreamFor(req.user!, req.params.projectId, { name, branch, baseRef }));
+    const allowFetch = await browserFetchAllowed(req.user!, req.body);
+    const chatSpace = await browserChatSpace(req.user!, req.body);
+    sendResult(res, await createWorkstreamFor(req.user!, req.params.projectId, {
+      ...createWorkstreamBody(req.body, { allowFetch }), ...(chatSpace ? { chatSpace } : {}),
+    }));
   };
 
   // POST /api/projects/:projectId/workstreams/:id/rename { name }
@@ -639,12 +792,19 @@ export function workstreamsRouter(): Router {
     const from = workstream.name;
     const { project } = workstream;
     if (!projectKindTraits(project.kind).canBranchOff) { res.status(400).json({ error: kindRefusal(project.kind, 'rename a workstream') }); return; }
+    const workspace = isWorkspace(project);
+    if (workspace && !project.instanceId) { res.status(409).json({ error: 'A project with several repositories can only be renamed on its box' }); return; }
 
     const username = project.user.unixUsername;
     const projDir = projectDirFor(project);
     const projectHost = { userId: project.userId, instanceId: project.instanceId };
     const connected = isProjectAgentConnected(projectHost);
     if (!connected && project.instanceId) { res.status(503).json({ error: 'Box agent is not connected' }); return; }
+    const repos = workspace ? await prisma.projectRepo.findMany({ where: { projectId: project.id }, orderBy: { position: 'asc' } }) : [];
+    if (workspace) {
+      const refusal = workspaceRenameRefusal({ capabilities: projectAgentCapabilities(projectHost), repos });
+      if (refusal) { res.status(refusal.status).json({ error: refusal.error, ...(refusal.code ? { code: refusal.code } : {}) }); return; }
+    }
 
     // 1. The row (unique on projectId+name; a clash surfaces here, before anything moves).
     try {
@@ -655,12 +815,44 @@ export function workstreamsRouter(): Router {
       }
       throw err;
     }
-    const revertRow = () => prisma.workstream.update({ where: { id: workstream.id }, data: { name: from } }).catch(e =>
-      console.error('[WORKSTREAMS] rename: failed to revert row after git error:', (e as Error).message));
-
-    // 2. The worktree directory.
+    // The asks this workstream sent are told back to it by name (askNoticeSweep), so they follow
+    // it now, with the row: were they left on the old name while the folder moves, the sweep would
+    // find no such workstream and settle their notices as gone. Best effort, like the spawn rows.
+    let noticeIds: string[] = [];
     try {
-      if (connected) {
+      noticeIds = (await prisma.agentMessage.findMany({
+        where: { senderUserId: project.userId, notifyProjectId: project.id, notifyWorkstream: from },
+        select: { id: true },
+      })).map(m => m.id);
+      if (noticeIds.length) await prisma.agentMessage.updateMany({ where: { id: { in: noticeIds } }, data: { notifyWorkstream: to } });
+    } catch (e) {
+      console.warn('[WORKSTREAMS] rename: could not carry ask notices to the new name:', (e as Error).message);
+      noticeIds = [];
+    }
+    const revertRow = async () => {
+      await prisma.workstream.update({ where: { id: workstream.id }, data: { name: from } }).catch(e =>
+        console.error('[WORKSTREAMS] rename: failed to revert row after git error:', (e as Error).message));
+      if (noticeIds.length) {
+        await prisma.agentMessage.updateMany({ where: { id: { in: noticeIds } }, data: { notifyWorkstream: from } }).catch(e =>
+          console.error('[WORKSTREAMS] rename: failed to revert ask notices after git error:', (e as Error).message));
+      }
+    };
+
+    // 2. The worktree directory. A multi-repo workstream's root holds a
+    // worktree of each repository: the box moves the root and repairs each
+    // one, or moves nothing (agent/workspace.js moveWorkstreamRoot).
+    try {
+      if (workspace) {
+        await sendForProject(projectHost, 'workspace-move', {
+          root: projDir,
+          fromDir: projectDirFor(project, from),
+          toDir: projectDirFor(project, to),
+          repos: repos.map(r => r.name),
+          guides: workspaceGuideWrites({
+            project: project.name, repos, workstreams: [{ name: to, branch: workstream.branch }], dirFor: ws => projectDirFor(project, ws),
+          }),
+        }, 60_000);
+      } else if (connected) {
         await sendForProject(projectHost, 'git-worktree-move', { projectDir: projDir, from, to });
       } else {
         await execAsync(
@@ -675,7 +867,7 @@ export function workstreamsRouter(): Router {
         res.status(501).json({ error: 'This box\'s agent is too old to rename workstreams; update termag on the box and restart its agent' });
         return;
       }
-      res.status(409).json({ error: `git worktree move failed: ${msg}` });
+      res.status(409).json({ error: workspace ? `The workstream folder could not be moved: ${msg}` : `git worktree move failed: ${msg}` });
       return;
     }
 

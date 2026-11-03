@@ -23,7 +23,7 @@ vi.mock('./tmux', async (importOriginal) => ({
   killSession,
 }));
 
-const { stopAgentPane } = await import('./agentRuntime');
+const { stopAgentPane, stopAgentSessions } = await import('./agentRuntime');
 const { PROVIDERS } = await import('../providers/registry');
 const pollerProvider = Object.values(PROVIDERS).find(p => p.needsPoller)!.id;
 
@@ -63,5 +63,20 @@ describe('stopAgentPane', () => {
     connected.value = false;
     await stopAgentPane({ ...ctx, instanceId: null, provider: 'claude' });
     expect(killSession).toHaveBeenCalledWith('ada-termag-feature-x-agent');
+  });
+});
+
+describe('stopAgentSessions: every review pane (docs/parallel-reviews.md)', () => {
+  beforeEach(() => { sent.length = 0; events.length = 0; connected.value = true; killSession.mockClear(); });
+  it('kills all eight review slots by exact target, beside the agent pair', async () => {
+    await stopAgentSessions({ ...ctx, provider: 'claude' });
+    const kills = sent.filter(s => s.type === 'tmux-kill').map(s => s.payload.sessionName);
+    expect(kills.slice(0, 2)).toEqual(['ada-termag-feature-x-agent', 'ada-termag-feature-x-ctrl']);
+    expect(kills.slice(2)).toEqual(['=ada-termag-feature-x-review:', ...[2, 3, 4, 5, 6, 7, 8].map(n => `=ada-termag-feature-x-review-${n}:`)]);
+  });
+  it('kills them on the orchestrator\'s own tmux for a legacy project', async () => {
+    connected.value = false;
+    await stopAgentSessions({ ...ctx, instanceId: null, provider: 'claude' });
+    expect(killSession.mock.calls.map(c => (c as unknown[])[0])).toContain('ada-termag-feature-x-review-8');
   });
 });

@@ -11,6 +11,8 @@
  * one-line test case instead of a staging run.
  */
 
+import type { BoxSize } from './boxSize';
+
 /** Why a box left the pool without ever being claimed. */
 export type FailReason = 'agent lost';
 
@@ -37,6 +39,11 @@ export interface PoolRowView {
   agentDisconnectedAt: Date | null;
   /** The recorded failure, quoted in the breaker's log line. */
   provisioningError: string | null;
+  /**
+   * The size it launched at, null for BOX_INSTANCE_TYPE. The planner never
+   * reads it: the reconciler plans each size apart (warmPool.poolGroups).
+   */
+  size: BoxSize | null;
 }
 
 export interface PlanInput {

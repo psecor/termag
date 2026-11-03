@@ -11,7 +11,8 @@ import { recordSpawnEvent } from './spawnEvents';
 import { setStatus } from './status';
 import * as tmux from './tmux';
 import { powerStateError } from './boxPowerPolicy';
-import { branchStateFromRpc, retireCheck, type RetireCheck } from './spawnLifecycle';
+import { branchStateFromRpc, retireCheck, retireCheckAcross, type RetireCheck } from './spawnLifecycle';
+import { isWorkspace } from './projectRepos';
 import { archiveOwnedProject } from '../routes/projects';
 import { removeWorkstreamFor } from '../routes/workstreams';
 
@@ -113,9 +114,18 @@ export async function checkoutCheck(s: AgentSpawn): Promise<RetireCheck> {
   if (refused && !refused.ok) return { ok: false, reason: `its box is unavailable (${refused.error})` };
   const cwd = tmux.projectDirFor(c.project, c.ws.name);
   // verifyRemote: origin itself must confirm the branch holds HEAD (ls-remote), so allow for it.
+  const read = (dir: string, base: string | null) =>
+    sendForProject(c.host, 'git-branch-state', { cwd: dir, verifyRemote: true, ...(base ? { base } : {}) }, 20_000)
+      .then(branchStateFromRpc, () => null);
+  if (isWorkspace(c.project)) {
+    // Not a repository itself: every repository's worktree in it. A spawn base is one
+    // repository's commit, so none is passed; their repositories are all on GitHub.
+    const repos = await prisma.projectRepo.findMany({ where: { projectId: c.project.id }, orderBy: { position: 'asc' }, select: { name: true } });
+    const checks = await Promise.all(repos.map(async r => ({ repo: r.name, check: retireCheck(await read(`${cwd}/${r.name}`, null)) })));
+    return retireCheckAcross(checks);
+  }
   // base: what it was spawned from, so a local-only checkout can be counted without origin (#453).
-  const raw = await sendForProject(c.host, 'git-branch-state', { cwd, verifyRemote: true, ...(s.baseSha ? { base: s.baseSha } : {}) }, 20_000).catch(() => null);
-  return retireCheck(branchStateFromRpc(raw));
+  return retireCheck(await read(cwd, s.baseSha));
 }
 
 /**

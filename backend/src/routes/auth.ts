@@ -5,7 +5,7 @@ import { takePostLoginRedirect } from '../auth/postLoginReturn';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { prisma } from '../db';
 import { SELECTABLE_PROVIDER_IDS } from '../providers/registry';
-import { normalizeTheme, validateTheme } from '../theme/schema';
+import { mergeStoredThemeKeys, normalizeTheme, validateTheme } from '../theme/schema';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 import { albVerifierConfigFromEnv, verifyAlbIdentity } from '../auth/albOidc';
 import {
@@ -13,11 +13,13 @@ import {
 } from '../auth/oidc';
 import { assertLocalLoginAllowed, forwardedClients, isSameHostRequest } from '../auth/localLogin';
 import { peerAddress } from '../auth/peerAddress';
+import { loopbackRedirect, parseAuthorizeParams } from '../services/cliAuth';
 import { ensureHostSetup } from '../services/hostSetup';
 import { parseDotfilesRepoUrl } from '../services/dotfilesUrl';
 import { isAdminUser } from '../services/admin/adminAccess';
 import { findUserByEmail, sameEmail } from '../services/userByEmail';
 import { ownerPlacementKey, serializeByKey } from '../services/claudeRunnerSpawn';
+import { boolVariation } from '../services/featureFlags';
 
 
 export type AuthMode = 'google' | 'okta' | 'oidc' | 'local';
@@ -267,6 +269,19 @@ export function configurePassport(): void {
  * Any device-trust policy is enforced upstream by the IdP before the ALB ever
  * signs this header.
  */
+/**
+ * A `termag login` approval (the CLI's, or the desktop app's) from an identity
+ * that is not allowlisted: its loopback callback, told `not_allowed`, so the
+ * sign-in says why at once instead of waiting out its timeout behind a 403 in
+ * the tab. Null for any other request. The redirect carries only the state the
+ * request brought.
+ */
+function cliLoginRefusal(req: Request): string | null {
+  if (req.method !== 'GET' || req.path !== '/auth/cli/authorize') return null;
+  const params = parseAuthorizeParams(req.query as Record<string, unknown>);
+  return 'error' in params ? null : loopbackRedirect(params.port, { error: 'not_allowed', state: params.state });
+}
+
 export const albSessionBridge: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
   // Only the ALB/Okta edge model consults this header. In google mode the bridge
   // is a no-op so the header (if ever present) can't be used to bypass OAuth.
@@ -289,6 +304,8 @@ export const albSessionBridge: RequestHandler = async (req: Request, res: Respon
   try {
     const user = await upsertAllowlistedUser(identity, 'okta');
     if (!user) {
+      const refused = cliLoginRefusal(req);
+      if (refused) { res.redirect(303, refused); return; }
       res.status(403).json({ error: 'Forbidden' });
       return;
     }
@@ -470,6 +487,12 @@ export function authRouter(): Router {
     role: isAdminUser(user) ? 'admin' : 'member',
   });
 
+  // Where a person's later visits open, termag (`simple`) or Lab (`full`),
+  // kept on the user under onboarding-refresh-enabled. Off, /me leaves it out and a write is refused, so
+  // the browser keeps its own as before.
+  const uiModeOn = (user: Express.User) => boolVariation('onboarding-refresh-enabled', user, false);
+  const withUiMode = (on: boolean, user: { uiMode?: string | null }) => (on ? { uiMode: user.uiMode ?? null } : {});
+
   const me: RequestHandler = async (req, res) => {
     if (!req.user) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -483,7 +506,7 @@ export function authRouter(): Router {
         needsOnboarding = projects === 0;
       } catch { needsOnboarding = false; }
     }
-    res.json({ ...userPayload(req.user), needsOnboarding });
+    res.json({ ...userPayload(req.user), needsOnboarding, ...withUiMode(await uiModeOn(req.user), req.user) });
   };
 
   // PUT /auth/me/onboarding { done: boolean } — the first-run wizard was
@@ -495,21 +518,36 @@ export function authRouter(): Router {
     if (typeof done !== 'boolean') { res.status(400).json({ error: 'done must be a boolean' }); return; }
     const user = await prisma.user.update({ where: { id: req.user.id }, data: { onboardedAt: done ? new Date() : null } });
     req.user.onboardedAt = user.onboardedAt;
-    res.json({ ...userPayload(req.user), needsOnboarding: false });
+    res.json({ ...userPayload(req.user), needsOnboarding: false, ...withUiMode(await uiModeOn(req.user), req.user) });
   };
 
   // Partial update: any subset of the preference fields, each validated on its
-  // own. The theme arrives whole (the client holds the full object), so there
-  // is no read-modify-write and no merge here.
+  // own. The theme arrives whole (the client holds the full object), except
+  // that a tab loaded before an optional key existed leaves it out: those are
+  // filled from the stored theme (mergeStoredThemeKeys), so a stale tab's save
+  // does not reset, say, a light palette to dark. Unknown keys are still rejected.
   const updatePreferences: RequestHandler = async (req, res) => {
     if (!req.user) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
 
-    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown };
-    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean } = {};
+    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown; uiMode?: unknown };
+    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean; uiMode?: string | null } = {};
     const has = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
+    const uiModeAllowed = await uiModeOn(req.user);
+
+    if (has('uiMode')) {
+      if (!uiModeAllowed) {
+        res.status(403).json({ error: 'Keeping where termag opens is not available yet', code: 'ui_mode_disabled' });
+        return;
+      }
+      if (body.uiMode !== null && body.uiMode !== 'simple' && body.uiMode !== 'full') {
+        res.status(400).json({ error: 'uiMode must be simple, full or null' });
+        return;
+      }
+      data.uiMode = body.uiMode;
+    }
 
     if (has('defaultAgentProvider')) {
       if (typeof body.defaultAgentProvider !== 'string' || !SELECTABLE_PROVIDER_IDS.includes(body.defaultAgentProvider)) {
@@ -529,7 +567,7 @@ export function authRouter(): Router {
     }
 
     if (has('theme')) {
-      const theme = validateTheme(body.theme);
+      const theme = validateTheme(mergeStoredThemeKeys(body.theme, req.user.theme));
       if (!theme.ok) {
         res.status(400).json({ error: theme.error });
         return;
@@ -568,8 +606,9 @@ export function authRouter(): Router {
     req.user.theme = user.theme;
     req.user.pushMutesChat = user.pushMutesChat;
     req.user.chatTurnNotify = user.chatTurnNotify;
+    req.user.uiMode = user.uiMode;
 
-    res.json(userPayload(user));
+    res.json({ ...userPayload(user), ...withUiMode(uiModeAllowed, user) });
   };
 
   // Local mode: sign in as the first identity in ALLOWED_USERS without an

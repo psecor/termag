@@ -2,7 +2,7 @@
  * Claude Enterprise sign-in for the simple UI (agent/claude-login.js).
  *
  *   GET    /api/projects/:id/claude-login       the phase a browser may see
- *   POST   /api/projects/:id/claude-login       start, owner only
+ *   POST   /api/projects/:id/claude-login       start, owner only ({ reauth: true } signs a seat in again)
  *   POST   /api/projects/:id/claude-login/code  one paste, owner only
  *   DELETE /api/projects/:id/claude-login       cancel, owner only
  *
@@ -77,13 +77,15 @@ export function claudeLoginRouter(): Router {
       connected,
       capabilities: projectAgentCapabilities(target.host),
     });
-    if (problem?.body.code === 'offline') { res.json(target.owner ? offlineView() : sanitizeLoginView({ loggedIn: false }, false)); return; }
+    // Offline says nothing about sign-in, so a collaborator gets it too
+    // rather than "the owner needs to sign in".
+    if (problem?.body.code === 'offline') { res.json(offlineView()); return; }
     if (problem) { res.status(problem.status).json(problem.body); return; }
     try {
       const raw = await sendForProject(target.host, 'claude-login-status', {}, 15_000);
       res.json(sanitizeLoginView(raw, target.owner));
     } catch (err) {
-      const failure = loginRpcFailure(err instanceof Error ? err.message : '');
+      const failure = loginRpcFailure(err instanceof Error ? err.message : '', 'status');
       res.status(failure.status).json(failure.body);
     }
   }));
@@ -102,7 +104,8 @@ export function claudeLoginRouter(): Router {
     });
     if (problem) { res.status(problem.status).json(problem.body); return; }
     try {
-      const raw = await sendForProject(target.host, 'claude-login-start', { email: loginEmail(req.user!.googleEmail) }, LOGIN_RPC_MS);
+      // reauth: a turn failed on the seat's expired sign-in, which `claude auth status` can still call logged in.
+      const raw = await sendForProject(target.host, 'claude-login-start', { email: loginEmail(req.user!.googleEmail), reauth: req.body?.reauth === true }, LOGIN_RPC_MS);
       res.json(sanitizeLoginView(raw, true));
     } catch (err) {
       const failure = loginRpcFailure(err instanceof Error ? err.message : '');

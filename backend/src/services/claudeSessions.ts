@@ -19,6 +19,7 @@ import { ownerPlacementKey, serializeByKey } from './claudeRunnerSpawn';
 import { isInstanceAgentConnected, sendToInstanceAgent } from './agentRegistry';
 import { parseRunnerSessions, runnerSessionName, tmuxSafe } from './claudeRunnerSpawn';
 import { recordSessionEvent, type SessionEventKind } from './claudeSessionEvents';
+import { traceSweep } from './tracing/spans';
 
 export type CloudSessionState = 'queued' | 'starting' | 'running' | 'ended' | 'lost';
 
@@ -503,9 +504,11 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export function startCloudSessionSweeps(lostEveryMs = 5 * 60 * 1000, retentionEveryMs = 60 * 60 * 1000): void {
   if (lostTimer) return;
   backfillSessionSeq().catch(e => console.error('[CLAUDE-RUNNER] sessionSeq backfill failed:', errMsg(e)));
-  lostTimer = setInterval(() => sweepLostRuns().catch(e => console.error('[CLAUDE-RUNNER] lost sweep failed:', errMsg(e))), lostEveryMs);
+  const lost = traceSweep('claude-runner-lost', () => sweepLostRuns());
+  const retention = traceSweep('claude-runner-retention', () => sweepRetention());
+  lostTimer = setInterval(() => lost().catch(e => console.error('[CLAUDE-RUNNER] lost sweep failed:', errMsg(e))), lostEveryMs);
   lostTimer.unref?.();
-  retentionTimer = setInterval(() => sweepRetention().catch(e => console.error('[CLAUDE-RUNNER] retention sweep failed:', errMsg(e))), retentionEveryMs);
+  retentionTimer = setInterval(() => retention().catch(e => console.error('[CLAUDE-RUNNER] retention sweep failed:', errMsg(e))), retentionEveryMs);
   retentionTimer.unref?.();
 }
 

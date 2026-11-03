@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { validateAgentToken } from '../routes/agentTokens';
+import { acceptsScope } from '../services/agentTokenScopes';
 import { touchLastSeen } from '../services/admin/adminAccess';
+import { setServerSpanAttributes } from '../services/tracing/requestSpan';
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (req.user) {
@@ -30,9 +32,10 @@ export async function requireAuthOrAgentToken(req: Request, res: Response, next:
       // Admin-scoped tokens are for /api/admin and /mcp/admin only
       // (middleware/admin.ts); they never act as a user. Laptop clients (the
       // CLI and `termag tui`) use /api/cli/v1, not these routes.
-      if (result?.user && result.token.scope === 'agent') {
+      if (result?.user && acceptsScope('agentRoutes', result.token.scope)) {
         req.user = result.user;
         req.agentInstanceId = result.instance?.id ?? null;
+        setServerSpanAttributes(req, { 'termag.user': result.user.id });
         next();
         return;
       }

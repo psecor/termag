@@ -72,6 +72,16 @@ export function chatReclaimPostRefusal(
   return null;
 }
 
+/** POST /chat/context. A form POST must not clear, compact or resume a chat's context. */
+export function chatContextPostRefusal(
+  post: ChatTrustPost,
+  env: NodeJS.ProcessEnv = process.env,
+): { status: 400 | 403; error: string } | null {
+  if (originRefusal(post, env)) return { status: 403, error: 'This request did not come from termag.' };
+  if (!isJsonObject(post)) return { status: 400, error: 'Changing the context requires a JSON body.' };
+  return null;
+}
+
 /**
  * A refused browser POST is the response. The handler — chatTerminalFor,
  * chatTrustFor — runs only when the gate passed, so a form POST never

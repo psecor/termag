@@ -24,6 +24,20 @@ describe('provider registries stay in sync (gotcha: two files, by hand)', () => 
     expect(frontend.SELECTABLE_PROVIDER_IDS).toEqual(backend.SELECTABLE_PROVIDER_IDS);
   });
 
+  it('colours agree in both palettes, so a provider reads the same in the UI and from GET /api/providers', () => {
+    for (const id of backend.PROVIDER_IDS) {
+      expect(frontend.PROVIDERS[id].color, id).toEqual(backend.PROVIDERS[id].color);
+      expect(frontend.PROVIDERS[id].lightColor, id).toEqual(backend.PROVIDERS[id].lightColor);
+    }
+  });
+
+  it('mcpConnectors is set exactly where the backend has an mcpConfig (docs/mcp-broker.md)', () => {
+    for (const id of backend.PROVIDER_IDS) {
+      expect(!!frontend.PROVIDERS[id].mcpConnectors, id).toBe(!!backend.PROVIDERS[id].mcpConfig);
+    }
+    expect(frontend.PROVIDERS.human.mcpConnectors).toBeFalsy();
+  });
+
   it('statusSources agree, so a live status names the same provider on both sides', () => {
     for (const id of backend.PROVIDER_IDS) {
       expect(frontend.PROVIDERS[id].statusSources, id).toEqual(backend.PROVIDERS[id].statusSources);
@@ -46,6 +60,57 @@ describe('provider registries stay in sync (gotcha: two files, by hand)', () => 
   });
 });
 
+describe('chat engines (an automation run is a chat-runner turn)', () => {
+  it('chatRunner, chatEngine and automationChatProvider agree on both sides', () => {
+    for (const id of backend.PROVIDER_IDS) {
+      expect(!!frontend.PROVIDERS[id].chatRunner, id).toBe(!!backend.PROVIDERS[id].chatRunner);
+      expect(frontend.PROVIDERS[id].chatEngine, id).toBe(backend.PROVIDERS[id].chatEngine);
+      expect(frontend.PROVIDERS[id].automationChatProvider, id).toBe(backend.PROVIDERS[id].automationChatProvider);
+      expect(frontend.isChatRunnerProvider(id), id).toBe(backend.isChatRunnerProvider(id));
+    }
+    expect(frontend.CHAT_PROVIDER_ID).toBe(backend.CHAT_PROVIDER_ID);
+  });
+
+  it('every chat-runner provider names its engine, is never selectable, and reports as the runner', () => {
+    const runners = backend.PROVIDER_IDS.filter(backend.isChatRunnerProvider);
+    expect(runners).toEqual(['claude-chat', 'pi-chat']);
+    for (const id of runners) {
+      expect(backend.PROVIDERS[id].chatEngine, id).toBeDefined();
+      expect(backend.PROVIDERS[id].selectable, id).toBe(false);
+      expect(backend.PROVIDERS[id].statusSources, id).toEqual(['chat-runner']);
+      expect(backend.PROVIDERS[id].processNames, id).toEqual([]);
+    }
+    for (const id of backend.PROVIDER_IDS.filter(id => !backend.isChatRunnerProvider(id))) {
+      expect(backend.PROVIDERS[id].chatEngine, id).toBeUndefined();
+    }
+    expect(backend.chatEngineOf('claude-chat')).toBe('claude');
+    expect(backend.chatEngineOf('pi-chat')).toBe('pi');
+    expect(backend.chatEngineOf('claude')).toBeUndefined();
+    expect(backend.chatEngineOf(null)).toBeUndefined();
+    // The runner's source still books as Claude's chat, as before pi-chat existed.
+    expect(backend.providerForSource('chat-runner')).toBe('claude-chat');
+    expect(frontend.providerForSource('chat-runner')).toBe('claude-chat');
+  });
+
+  it('only claude-chat can be launched until the pi engine lands (A2 adds pi to SUPPORTED_CHAT_ENGINES)', () => {
+    expect([...backend.SUPPORTED_CHAT_ENGINES]).toEqual(['claude']);
+    expect(backend.PROVIDER_IDS.filter(backend.isLaunchableChatProvider)).toEqual(['claude-chat']);
+    expect(backend.isLaunchableChatProvider('pi-chat')).toBe(false);
+    expect(backend.isLaunchableChatProvider('claude')).toBe(false);
+    expect(backend.isLaunchableChatProvider(undefined)).toBe(false);
+  });
+
+  it('automations run Claude as claude-chat, nothing else', () => {
+    expect(backend.automationProviders()).toEqual(['claude']);
+    expect(backend.PROVIDERS.claude.automationChatProvider).toBe(backend.CHAT_PROVIDER_ID);
+    expect(backend.PROVIDERS.pi.automationChatProvider).toBeUndefined();
+    for (const id of backend.automationProviders()) {
+      expect(backend.isSelectableProvider(id), id).toBe(true);
+      expect(backend.isChatRunnerProvider(backend.PROVIDERS[id].automationChatProvider), id).toBe(true);
+    }
+  });
+});
+
 describe('model backends', () => {
   it("Claude Code (a pane's and the simple UI chat's) and pi can run on Fireworks; null is every harness default", () => {
     expect(backend.PROVIDER_IDS.filter(id => backend.backendsFor(id).length > 0)).toEqual(['claude', 'claude-chat', 'pi']);
@@ -60,6 +125,17 @@ describe('model backends', () => {
 describe('orchestrator skill', () => {
   it('is offered only for the Claude agents termag-reconcile installs it for', () => {
     expect(backend.PROVIDER_IDS.filter(id => backend.PROVIDERS[id].orchestratorSkill)).toEqual(['claude', 'claude-chat']);
+  });
+});
+
+describe('MCP connector targets', () => {
+  it('every agent but DeepSeek gets the connectors; Claude through its own config, the rest through the bridge', () => {
+    expect(backend.PROVIDER_IDS.filter(id => !backend.PROVIDERS[id].mcpConfig)).toEqual(['deepseek']);
+    expect(backend.PROVIDERS.claude.mcpConfig).toBe('claude');
+    expect(backend.PROVIDERS['claude-chat'].mcpConfig).toBe('claude');
+    expect(backend.PROVIDERS.pi.mcpConfig).toBe('pi');
+    expect(backend.PROVIDERS['pi-chat'].mcpConfig).toBe('pi');
+    expect(backend.mcpAgentTargets()).toEqual(['auggie', 'codex', 'cursor', 'devin', 'gemini', 'pi', 'vibe']);
   });
 });
 

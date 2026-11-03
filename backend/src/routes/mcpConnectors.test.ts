@@ -14,6 +14,9 @@ type Row = {
 };
 let rows: Row[] = [];
 let flagOn = true;
+// What the mcp-default-connectors flag serves: the catalog, or null while it is off.
+const ACME_ENTRY = { name: 'acme', upstream: 'https://mcp.example.test:18444/acme' };
+let defaultsFlag: unknown = [ACME_ENTRY];
 let storeConfigured = true;
 let storedSecrets: Record<string, string> = {};
 
@@ -28,6 +31,7 @@ const prismaMock = {
       rows.push(row);
       return row;
     }),
+    findMany: vi.fn(async () => []),
     update: vi.fn(async ({ where, data }: { where: { id: string }; data: Partial<Row> }) => {
       const row = rows.find(r => r.id === where.id)!;
       if (data.name && duplicate(row.userId, data.name, row.id)) throw p2002();
@@ -53,6 +57,11 @@ vi.mock('../services/credentialStore', async (importOriginal) => ({
 
 const deliverToUserBoxes = vi.fn(async () => {});
 vi.mock('../services/credentialDelivery', () => ({ deliverToUserBoxes }));
+
+vi.mock('../services/featureFlags', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/featureFlags')>()),
+  jsonVariation: async (key: string, _user: unknown, fallback: unknown) => (key === 'mcp-default-connectors' ? defaultsFlag : fallback),
+}));
 
 const writeConnectorSecrets = vi.fn(async () => {});
 vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
@@ -81,12 +90,15 @@ vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
     return { row: r, dropped };
   },
   setLinkStatus: async () => {},
+  createOAuthState: async () => {},
+  forgetConnectorOAuth: async () => {},
 }));
 
 const exchangeCode = vi.fn(async () => ({ accessToken: 'at', expiresAt: null }));
 vi.mock('../services/mcpOAuth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/mcpOAuth')>()),
   exchangeCode,
+  registerClient: async () => CLIENT,
   discoverOAuth: async () => ({
     resource: 'https://mcp.example.test:18444/v2', scopes: [], issuer: 'https://auth.example.test',
     authorizationEndpoint: 'https://auth.example.test/authorize', tokenEndpoint: 'https://auth.example.test/token',
@@ -126,6 +138,7 @@ beforeAll(async () => {
 afterAll(async () => {
   delete process.env.MCP_UPSTREAM_TEST_ALLOW;
   delete process.env.MCP_BROKER_URL;
+  delete process.env.FRONTEND_URL;
   await new Promise(resolve => server.close(resolve));
 });
 
@@ -140,10 +153,12 @@ beforeEach(() => {
     row({ id: 'c4', name: 'notes', authType: 'oauth', headerTemplates: null }),
   ];
   flagOn = true;
+  defaultsFlag = [ACME_ENTRY];
   storeConfigured = true;
   storedSecrets = {};
   lockStored = { client: CLIENT };
   linkWrites.length = 0;
+  process.env.FRONTEND_URL = 'https://termag.example.test';
   vi.clearAllMocks();
 });
 
@@ -311,5 +326,91 @@ describe('PATCH a new upstream on an oauth connector', () => {
     const res = await call('PATCH', '/c4', 'u1', { upstream: 'https://mcp.example.test:18444/v2' });
     expect(res.status).toBe(200);
     expect(lockStored).toBeNull();
+  });
+});
+
+describe('the catalog of MCP servers (the mcp-default-connectors flag)', () => {
+  const ACME = 'https://mcp.example.test:18444/acme';
+
+  it('offers a catalog server until the user has a connector for its URL, then lists it as an ordinary connector', async () => {
+    const before = await call('GET', '/', 'u1');
+    expect(before.body.catalog).toEqual([{ name: 'acme', upstream: ACME }]);
+    rows.push(row({ id: 'c9', name: 'acme', upstream: ACME, authType: 'oauth', headerTemplates: null }));
+    const after = await call('GET', '/', 'u1');
+    expect(after.body.catalog).toEqual([]);
+    const connected = after.body.connectors.find((c: { id: string }) => c.id === 'c9');
+    expect(connected).toMatchObject({ name: 'acme', authType: 'oauth', linkStatus: 'needs_link' });
+    expect(connected).not.toHaveProperty('default');
+    // u1 connecting it doesn't affect u2, who is still offered it.
+    expect((await call('GET', '/', 'u2')).body.catalog).toHaveLength(1);
+  });
+
+  it('stops offering it once the user has any connector for that URL, even one added by hand with headers', async () => {
+    rows.push(row({ id: 'c9', name: 'mine', upstream: ACME }));
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([]);
+  });
+
+  it('offers it again after the user deletes their connector for it', async () => {
+    rows.push(row({ id: 'c9', name: 'acme', upstream: ACME, authType: 'oauth', headerTemplates: null }));
+    expect((await call('DELETE', '/c9', 'u1')).status).toBe(204);
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([{ name: 'acme', upstream: ACME }]);
+  });
+
+  it('creates the user\'s oauth connector on connect and answers the sign-in URL', async () => {
+    const res = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(res.status).toBe(200);
+    expect(res.body.authorizeUrl).toMatch(/^https:\/\/auth\.example\.test\/authorize\?/);
+    const created = rows.find(r => r.id === res.body.id);
+    expect(created).toMatchObject({ userId: 'u1', name: 'acme', upstream: ACME, authType: 'oauth' });
+    expect(deliverToUserBoxes).toHaveBeenCalledWith('u1');
+    // Connecting again (a double click) reuses the connector instead of creating a second one.
+    const again = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(again.body.id).toBe(res.body.id);
+    expect(prismaMock.mcpConnector.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers nothing and connects nothing while mcp-default-connectors is off (null) or serves []', async () => {
+    for (const value of [null, []]) {
+      defaultsFlag = value;
+      expect((await call('GET', '/', 'u1')).body.catalog).toEqual([]);
+      expect(await call('POST', '/catalog/acme/connect', 'u1')).toEqual({ status: 404, body: { error: 'No such MCP server in the catalog' } });
+    }
+    expect(prismaMock.mcpConnector.create).not.toHaveBeenCalled();
+  });
+
+  it('reuses an OAuth connector the user added by hand for that URL, whatever its name', async () => {
+    const { discoverOAuth } = await import('../services/mcpOAuth');
+    const oauthMetadata = await discoverOAuth(ACME, {} as never);
+    rows.push(row({ id: 'c9', name: 'my-acme', upstream: ACME, authType: 'oauth', headerTemplates: null, oauthMetadata }));
+    const res = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe('c9');
+    expect(prismaMock.mcpConnector.create).not.toHaveBeenCalled();
+  });
+
+  it('answers a 409 that names the remedy when the user has a connector with that name for another server', async () => {
+    rows.push(row({ id: 'c9', name: 'acme', upstream: 'https://mcp.example.test/other' }));
+    const res = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/named "acme" for another server\. Rename or delete it/);
+    expect(rows.filter(r => r.userId === 'u1' && r.name === 'acme')).toHaveLength(1);
+  });
+
+  it('reuses the connector a concurrent connect created instead of answering 409', async () => {
+    // The other request's row lands between this one's check and its create.
+    prismaMock.mcpConnector.create.mockImplementationOnce(async ({ data }) => {
+      rows.push({ ...data, id: 'c-race', createdAt: new Date(), updatedAt: new Date() });
+      throw p2002();
+    });
+    const res = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe('c-race');
+  });
+
+  it('answers 404 for a name not in the catalog, and 503 without a credential store, creating nothing', async () => {
+    expect((await call('POST', '/catalog/figma/connect', 'u1')).status).toBe(404);
+    storeConfigured = false;
+    expect((await call('POST', '/catalog/acme/connect', 'u1')).status).toBe(503);
+    expect(prismaMock.mcpConnector.create).not.toHaveBeenCalled();
   });
 });

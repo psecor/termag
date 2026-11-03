@@ -84,6 +84,21 @@ export function parseSlashCommand(raw: string): SlashCommand {
   }
 }
 
+/**
+ * The slack.command product event's detail: which
+ * form of `/t` ran, never a name or the text typed. `/t` alone is `send` with
+ * `showPane`; `/t !<keys>` is `send` with `keys`. Pure.
+ */
+export function slashCommandDetail(cmd: SlashCommand): Record<string, string | boolean | undefined> {
+  switch (cmd.kind) {
+    case 'help': return { command: 'help', topic: cmd.topic ?? undefined };
+    case 'local': return { command: 'local', action: cmd.local.action };
+    case 'send': return { command: 'send', literal: cmd.literal, showPane: cmd.text === '', keys: !cmd.literal && cmd.text.startsWith('!') };
+    case 'ctrl': return { command: 'ctrl', showPane: cmd.text === '' };
+    default: return { command: cmd.kind };
+  }
+}
+
 /** `<word> <one argument>`; the word alone is its help; more words are not this command (undefined). */
 function oneArgument(words: string[], topic: HelpTopic, command: (arg: string) => SlashCommand): SlashCommand | undefined {
   if (words.length === 1) return { kind: 'help', topic };

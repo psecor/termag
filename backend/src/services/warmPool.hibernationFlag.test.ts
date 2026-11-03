@@ -22,6 +22,7 @@ vi.mock('./featureFlags', () => {
     boolVariationForContext: vi.fn(async (key: string, ctx: FlagContext, fallback: boolean) => evaluate(key, ctx, fallback)),
     boolVariation: vi.fn(async (key: string, user: { id: string }, fallback: boolean) => evaluate(key, { kind: 'user', key: user.id }, fallback)),
     numberVariationForContext: vi.fn(async (key: string, _ctx: FlagContext, fallback: number) => (key === 'box-warm-pool-size' ? 1 : fallback)),
+    stringVariationForContext: vi.fn(async (_key: string, _ctx: FlagContext, fallback: string) => fallback),
   };
 });
 
@@ -38,6 +39,7 @@ vi.mock('./boxProvisioner', () => ({
   terminateBox: vi.fn(),
 }));
 vi.mock('./warmPoolClaim', () => ({ resendStalledClaims: vi.fn(async () => {}) }));
+vi.mock('./claimUpdate', () => ({ expireStaleClaimUpdates: vi.fn(async () => {}) }));
 
 const tx = {
   instance: {
@@ -68,38 +70,38 @@ beforeEach(() => {
 
 describe('the warm pool and box-hibernation-enabled', () => {
   it('reads the flag for the fixed pool context, never a user', async () => {
-    await currentPoolSpec();
+    await currentPoolSpec(null);
     expect(flag.contexts).toEqual([POOL_FLAG_CONTEXT]);
     expect(POOL_FLAG_CONTEXT).toMatchObject({ kind: 'box', key: 'termag-warm-pool' });
   });
 
   it('follows the fallthrough, so flipping it changes the spec hash and rolls the pool', async () => {
-    const off = await currentPoolSpec();
+    const off = await currentPoolSpec(null);
     flag.fallthrough = true;
-    const on = await currentPoolSpec();
+    const on = await currentPoolSpec(null);
     expect(off.hibernation).toBe(false);
     expect(on.hibernation).toBe(true);
     expect(on.hash).not.toBe(off.hash);
   });
 
   it('is not moved by a user target', async () => {
-    const before = await currentPoolSpec();
+    const before = await currentPoolSpec(null);
     flag.userTargets = { u1: true };
-    expect(await currentPoolSpec()).toEqual(before);
+    expect(await currentPoolSpec(null)).toEqual(before);
   });
 
   it('leaves the hash alone on an AMI that cannot hibernate', async () => {
     ami.hibernationSupported = false;
-    const off = await currentPoolSpec();
+    const off = await currentPoolSpec(null);
     flag.fallthrough = true;
-    const on = await currentPoolSpec();
+    const on = await currentPoolSpec(null);
     expect(on.hash).toBe(off.hash);
     expect(on.hibernation).toBe(true);
   });
 
   it('launches pool boxes with the value it hashed', async () => {
     flag.fallthrough = true;
-    const spec = await currentPoolSpec();
+    const spec = await currentPoolSpec(null);
     await reconcileWarmPool();
     expect(provisionPoolBox).toHaveBeenCalledOnce();
     expect(provisionPoolBox).toHaveBeenCalledWith(expect.objectContaining({ poolSpecHash: spec.hash, hibernation: true }));

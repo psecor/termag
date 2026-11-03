@@ -9,7 +9,7 @@ import { setWorkspaceChangeCallback } from '../services/workspaceEvents';
 const project = {
   id: 'p1', name: 'askproj', kind: 'standard', instanceId: 'i1', userId: 'u1',
   workflows: [{ type: 'agent', provider: 'claude', workstream: { name: 'main' } }],
-  workstreams: [{ id: 'w1' }],
+  workstreams: [{ id: 'w1', name: 'main' }],
 };
 const prisma = {
   project: { findFirst: vi.fn(), update: vi.fn(async () => ({})) },
@@ -53,6 +53,11 @@ describe('archiveOwnedProject', () => {
     expect((await archiveOwnedProject(user, 'p1')).status).toBe(200);
     expect(prisma.project.update).toHaveBeenCalledWith({ where: { id: 'p1' }, data: { archived: true } });
     expect(changed.mock.calls).toEqual([['u1', 'projects']]);
+  });
+
+  it('hands the chat revoke each workstream\'s id and name, so a refusal can name it', async () => {
+    await archiveOwnedProject(user, 'p1');
+    expect(revokeChats).toHaveBeenCalledWith(expect.any(Function), true, 'p1', [{ id: 'w1', name: 'main' }]);
   });
 
   it('says nothing when the project is missing or a chat turn blocks the archive', async () => {

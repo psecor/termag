@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  applySecretsPatch, assertPatchFitsAuth, getMcpBrokerUrl, isPublicAddress, mcpCredentialProvider, McpConnectorError, parseUpstream,
+  applySecretsPatch, assertPatchFitsAuth, defaultConnectors, getMcpBrokerUrl, isPublicAddress, mcpCredentialProvider, McpConnectorError, parseUpstream,
   referencedSecrets, relinkMessage, renderHeaders, upstreamTestAllow, validateConnectorName, validateHeaderTemplates,
   validateSecretsPatch, validateUpstream,
 } from './mcpConnectors';
@@ -176,6 +176,52 @@ describe('getMcpBrokerUrl', () => {
       'https://mcp-broker.example.test?x=1', 'https://mcp-broker.example.test?', 'https://mcp-broker.example.test#f',
       'https://[2001:db8::1]', 'not a url', 'https://',
     ]) expect(getMcpBrokerUrl({ MCP_BROKER_URL: bad }), bad).toBeNull();
+  });
+});
+
+describe('defaultConnectors', () => {
+  // The value the mcp-default-connectors flag serves.
+  const json = (v: unknown) => defaultConnectors(v, {});
+
+  it('is empty when the flag is off (null) or serves an empty array', () => {
+    expect(json(null)).toEqual([]);
+    expect(json(undefined)).toEqual([]);
+    expect(json([])).toEqual([]);
+  });
+
+  it('reads {name, upstream} entries, normalising the URL as a stored upstream', () => {
+    expect(json([
+      { name: 'acme', upstream: 'https://MCP.Acme.example/mcp' },
+      { name: 'docs', upstream: 'https://docs.example/' },
+    ])).toEqual([
+      { name: 'acme', upstream: 'https://mcp.acme.example/mcp' },
+      { name: 'docs', upstream: 'https://docs.example' },
+    ]);
+  });
+
+  it('keeps a comma in a URL path, which the old name=url format split on', () => {
+    expect(json([{ name: 'acme', upstream: 'https://mcp.acme.example/a,b/mcp' }]))
+      .toEqual([{ name: 'acme', upstream: 'https://mcp.acme.example/a,b/mcp' }]);
+  });
+
+  it('offers nothing for a value that is not an array, a JSON string included', () => {
+    expect(json('acme=https://mcp.acme.example/mcp')).toEqual([]);
+    expect(json('[{"name":"acme","upstream":"https://mcp.acme.example/mcp"}]')).toEqual([]);
+    expect(json({ name: 'acme', upstream: 'https://mcp.acme.example/mcp' })).toEqual([]);
+  });
+
+  it('skips bad entries and repeats, keeping the rest', () => {
+    expect(json([
+      'acme', null, ['x'], { upstream: 'https://no-name.example/mcp' }, { name: 'Bad', upstream: 'https://a.example/mcp' },
+      { name: 'plain', upstream: 'http://a.example/mcp' }, { name: 'nourl' },
+      { name: 'ok', upstream: 'https://a.example/mcp' }, { name: 'ok', upstream: 'https://b.example/mcp' },
+      { name: 'again', upstream: 'https://a.example/mcp' }, { name: 'two', upstream: 'https://b.example/mcp' },
+    ])).toEqual([{ name: 'ok', upstream: 'https://a.example/mcp' }, { name: 'two', upstream: 'https://b.example/mcp' }]);
+  });
+
+  it('ignores unknown keys (say, from a value written for a newer termag) and still offers the server', () => {
+    expect(json([{ name: 'acme', upstream: 'https://mcp.acme.example/mcp', headers: { 'x-project': 'default' } }]))
+      .toEqual([{ name: 'acme', upstream: 'https://mcp.acme.example/mcp' }]);
   });
 });
 

@@ -6,8 +6,8 @@
  */
 import { getReviewRecord } from './reviewSweep';
 import { sendForProject, isProjectAgentConnected, type ProjectHost } from './agentRegistry';
-import { SESSION_ROLES, isOnCallerHost } from './sessionAccess';
-import { sessionName } from './tmux';
+import { SESSION_ROLES, isOnCallerHost, type SessionRole } from './sessionAccess';
+import { reviewSessionNames, sessionName } from './tmux';
 import { getAllStatuses } from './status';
 import { statusKey } from './statusKey';
 import { providerForSource } from '../providers/registry';
@@ -40,6 +40,8 @@ export interface SessionRow {
   workstream: string;
   role: string;
   session: string;
+  /** A review pane's slot: one row per live slot, slot 1 first. Absent for other roles. */
+  slot?: number;
   instanceId: string | null;
   /** Is this pane on the host the caller's own agent token belongs to? Always false for browser sessions and the admin view. */
   onCallerHost: boolean;
@@ -94,8 +96,10 @@ export async function collectSessionRows(
     const live = await liveSet(host);
     const wsNames = p.workstreams.length ? p.workstreams.map(w => w.name) : ['main'];
     for (const ws of wsNames) {
-      for (const role of SESSION_ROLES) {
-        const session = sessionName(p.user.unixUsername, p.name, role, ws);
+      const panes = SESSION_ROLES.flatMap((role): Array<{ role: SessionRole; session: string; slot?: number }> => (role === 'review'
+        ? reviewSessionNames(p.user.unixUsername, p.name, ws).map((session, i) => ({ role, session, slot: i + 1 }))
+        : [{ role, session: sessionName(p.user.unixUsername, p.name, role, ws) }]));
+      for (const { role, session, slot } of panes) {
         const alive = live ? live.has(session) : false;
         // agent/ctrl exist for every project; data roles only if actually live.
         // agent/ctrl exist for every project; data and review roles only if actually live.
@@ -105,7 +109,7 @@ export async function collectSessionRows(
         const raw = statuses.get(statusKey(p.instanceId, session));
         out.push({
           projectId: p.id, projectName: p.name, owner: p.user.unixUsername, ownerUserId: p.userId, access,
-          workstream: ws, role, session, instanceId: p.instanceId,
+          workstream: ws, role, session, ...(slot !== undefined ? { slot } : {}), instanceId: p.instanceId,
           onCallerHost: isOnCallerHost(p.instanceId, callerInstanceId),
           connected, alive, status: raw?.status ?? 'not_running', contextTokens: raw?.contextTokens ?? null,
           // Triage fields (additive). updatedAt is the last status WRITE — metadata

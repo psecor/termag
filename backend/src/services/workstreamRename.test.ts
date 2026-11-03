@@ -28,11 +28,13 @@ describe('planSessionRenames', () => {
       { role: 'agent', from: 'me-proj-old-agent', to: 'me-proj-new-agent' },
       { role: 'ctrl', from: 'me-proj-old-ctrl', to: 'me-proj-new-ctrl' },
       { role: 'review', from: 'me-proj-old-review', to: 'me-proj-new-review' },
+      // Every review slot.
+      ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ role: 'review', from: `me-proj-old-review-${n}`, to: `me-proj-new-review-${n}` })),
     ]);
   });
   it('renames the data pair for a data workflow and de-duplicates repeated types', () => {
     const plan = planSessionRenames('me', 'proj', 'old', 'new', ['data', 'data', 'agent']);
-    expect(plan.map(p => p.role)).toEqual(['data', 'data-ctrl', 'agent', 'ctrl', 'review']);
+    expect(plan.map(p => p.role)).toEqual(['data', 'data-ctrl', 'agent', 'ctrl', ...Array(8).fill('review')]);
   });
   it('is empty with no workflows', () => {
     expect(planSessionRenames('me', 'proj', 'old', 'new', [])).toEqual([]);

@@ -75,7 +75,7 @@ const SEARCHES = {
   search(query: $q, type: ISSUE, first: $first, after: $after) { ${PAGED} nodes { ...Merged } }
 }`,
 };
-const CONTEXTS = `contexts(first: 50) { nodes {
+export const CONTEXTS = `contexts(first: 50) { nodes {
         __typename
         ... on CheckRun { name status conclusion }
         ... on StatusContext { context state }
@@ -311,6 +311,24 @@ export interface NumberedPr {
   closedAt: string | null;
   /** The viewer's latest submitted review (approve, changes or comment): a draft (PENDING) or a dismissed one is not. */
   yourReview: { state: string; submittedAt: string | null } | null;
+  /** Who has reviewed it, the author left out; null unless found. */
+  reviewers: PrReviewers | null;
+}
+
+/**
+ * Who has reviewed a PR, by login: each person's latest approval or request
+ * for changes (GitHub's latestOpinionatedReviews), and who has only
+ * commented. Bots (the Cursor approval agent approves nearly every PR, Bugbot
+ * comments on it) are kept apart, so a bot's approval never reads as a person's.
+ */
+export interface PrReviewers {
+  approved: string[];
+  changes: string[];
+  commented: string[];
+  /** Bots whose latest review approved it: the Cursor approval agent's is a signal of its own (the low-level pass is done), shown apart from people's. */
+  botsApproved: string[];
+  /** Bots whose latest review asked for changes. */
+  botsChanges: string[];
 }
 
 // `states`: a review still being written (PENDING) has no submittedAt and must
@@ -320,6 +338,8 @@ function byNumberQuery(n: number): string {
   const fields = Array.from({ length: n }, (_, i) => `  m${i}: repository(owner: $o${i}, name: $n${i}) { pullRequest(number: $p${i}) {
     ...Open ...Requested state mergedAt closedAt
     yours: reviews(author: $viewer, last: 1, states: [APPROVED, CHANGES_REQUESTED, COMMENTED]) { nodes { state submittedAt } }
+    decided: latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }
+    commented: reviews(last: 30, states: [COMMENTED]) { nodes { author { __typename login } } }
   } }`).join('\n');
   return [`query ByNumber($viewer: String!, ${vars}) {\n${fields}\n}`, FRAGMENTS.Open, FRAGMENTS.Requested].join('\n');
 }
@@ -327,7 +347,7 @@ function byNumberQuery(n: number): string {
 function parseNumbered(ref: { repo: string; number: number }, node: Raw | null | undefined, viewer: string): NumberedPr {
   const none: NumberedPr = {
     repo: ref.repo, number: ref.number, found: false, state: null, open: null, title: '', url: '', author: null,
-    headRefName: '', baseRefName: '', mergedAt: null, closedAt: null, yourReview: null,
+    headRefName: '', baseRefName: '', mergedAt: null, closedAt: null, yourReview: null, reviewers: null,
   };
   if (!node || !isPr(node)) return none;
   const state = node.state === 'OPEN' || node.state === 'MERGED' || node.state === 'CLOSED' ? node.state : null;
@@ -346,7 +366,29 @@ function parseNumbered(ref: { repo: string; number: number }, node: Raw | null |
     mergedAt: str(node.mergedAt),
     closedAt: str(node.closedAt),
     yourReview: str(review?.state) ? { state: review!.state, submittedAt: str(review!.submittedAt) } : null,
+    reviewers: parseReviewers(node),
   };
+}
+
+function parseReviewers(node: Raw): PrReviewers {
+  const author = str(node.author?.login)?.toLowerCase() ?? null;
+  const out: PrReviewers = { approved: [], changes: [], commented: [], botsApproved: [], botsChanges: [] };
+  const seen = new Set<string>();
+  const add = (list: string[], login: string) => {
+    if (!seen.has(login.toLowerCase())) { seen.add(login.toLowerCase()); list.push(login); }
+  };
+  for (const r of (node.decided?.nodes ?? []) as Raw[]) {
+    const login = str(r?.author?.login);
+    if (!login || login.toLowerCase() === author) continue;
+    if (r.state !== 'APPROVED' && r.state !== 'CHANGES_REQUESTED') continue;
+    const bot = r.author.__typename === 'Bot';
+    add(r.state === 'APPROVED' ? (bot ? out.botsApproved : out.approved) : (bot ? out.botsChanges : out.changes), login);
+  }
+  for (const r of (node.commented?.nodes ?? []) as Raw[]) {
+    const login = str(r?.author?.login);
+    if (login && login.toLowerCase() !== author && r.author.__typename !== 'Bot') add(out.commented, login);
+  }
+  return out;
 }
 
 /** The token's GitHub login, for a read outside the lane searches (which carry it). */
@@ -454,7 +496,7 @@ function str(v: unknown): string | null {
   return typeof v === 'string' && v ? v : null;
 }
 
-function checkState(node: Raw): CheckState | null {
+export function checkState(node: Raw): CheckState | null {
   if (node?.__typename === 'CheckRun') {
     const name = str(node.name);
     if (!name) return null;

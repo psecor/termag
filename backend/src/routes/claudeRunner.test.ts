@@ -15,9 +15,12 @@ import { poolSpecHashOrNull } from '../services/warmPool';
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { boxImageSelectionFor } from '../services/boxImage';
 import { ownerHibernationEnabled } from '../services/boxHibernationFlag';
+import { ownerDefaultSize } from '../services/boxSize';
+import { warmPoolTargetFor } from '../services/warmPoolSizes';
 import { deliveryInFlight } from '../services/credentialDelivery';
 import { createOwnerFromAllowlist, slackRealName } from '../services/claudeRunnerOwner';
 import { notifyGithubAbsent, notifyRefusal } from '../services/claudeRunnerNotices';
+import { requestFloorRuns, runnerFloors } from '../services/claudeRunnerFloor';
 import { getCredentialStoreConfig, githubStoreDeps } from '../services/credentialStore';
 import { getGithubBrokerUrl } from '../services/githubBroker';
 
@@ -40,6 +43,8 @@ vi.mock('../services/boxImage', () => ({
   isPublished: (selection: { kind: string }) => selection.kind === 'published',
 }));
 vi.mock('../services/boxHibernationFlag', () => ({ ownerHibernationEnabled: vi.fn(async () => false), poolHibernationEnabled: vi.fn(async () => false) }));
+vi.mock('../services/boxSize', () => ({ ownerDefaultSize: vi.fn(async () => null) }));
+vi.mock('../services/warmPoolSizes', () => ({ warmPoolTargetFor: vi.fn(async () => 5), recordPoolClaim: vi.fn() }));
 vi.mock('../services/boxCreationGate', () => ({
   readBoxCreationFacts: vi.fn(async () => ({ required: false, flagOn: false, hasGithubCredential: false })),
   boxCreationRefusal: vi.fn(() => null),
@@ -56,6 +61,7 @@ vi.mock('../services/agentRegistry', () => ({
 vi.mock('../services/credentialStore', () => ({ getCredentialStoreConfig: vi.fn(() => null), githubStoreDeps: vi.fn() }));
 vi.mock('../services/credentialDelivery', () => ({ deliveryInFlight: vi.fn(() => null) }));
 vi.mock('../services/claudeRunnerNotices', () => ({ notifyRefusal: vi.fn(async () => false), notifyGithubAbsent: vi.fn(async () => false) }));
+vi.mock('../services/claudeRunnerFloor', () => ({ runnerFloors: vi.fn(async () => new Map()), requestFloorRuns: vi.fn() }));
 vi.mock('../services/claudeRunnerOwner', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/claudeRunnerOwner')>()),
   createOwnerFromAllowlist: vi.fn(), slackRealName: vi.fn(async () => null),
@@ -356,7 +362,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     flags({ 'claude-runner-auto-box-enabled': true });
     const [a, b] = await Promise.all([spawn(), spawn()]);
     expect(provisionNewBox).toHaveBeenCalledTimes(1);
-    expect(provisionNewBox).toHaveBeenCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false });
+    expect(provisionNewBox).toHaveBeenCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, null);
     for (const res of [a, b]) expect(res.status).toHaveBeenCalledWith(503);
     expect(a.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
     expect(b.json).toHaveBeenCalledWith({ error: expect.stringContaining('provisioning; retried'), code: 'box-wait' });
@@ -390,7 +396,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     owned = [stopped];
     vi.mocked(prisma.instance.findUnique).mockResolvedValue(stopped as never);
     const res = await spawn();
-    expect(requestPower).toHaveBeenCalledWith(stopped, 'start', { markInUse: true });
+    expect(requestPower).toHaveBeenCalledWith(stopped, 'start', { markInUse: true, startedBy: 'cloud' });
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('starting box "old"'), code: 'box-starting' });
     expect(provisionNewBox).not.toHaveBeenCalled();
   });
@@ -401,7 +407,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     owned = [napping];
     vi.mocked(prisma.instance.findUnique).mockResolvedValue(napping as never);
     const res = await spawn();
-    expect(requestPower).toHaveBeenCalledWith(napping, 'start', { markInUse: true });
+    expect(requestPower).toHaveBeenCalledWith(napping, 'start', { markInUse: true, startedBy: 'cloud' });
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('resuming box "nap"'), code: 'box-starting' });
     expect(provisionNewBox).not.toHaveBeenCalled();
   });
@@ -433,13 +439,34 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     vi.mocked(boxImageSelectionFor).mockResolvedValueOnce({ kind: 'ami', amiId: 'ami-123' } as never);
     await spawn();
     expect(claimWarmBox).not.toHaveBeenCalled();
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'ami', amiId: 'ami-123' }, hibernation: false });
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'ami', amiId: 'ami-123' }, hibernation: false, flavor: 'full' }, null);
 
     owned = [];
     vi.mocked(ownerHibernationEnabled).mockResolvedValueOnce(true);
     await spawn();
     expect(claimWarmBox).not.toHaveBeenCalled();
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: true });
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: true, flavor: 'full' }, null);
+
+    // box-warm-pool-sizes: a size the pool holds none of launches cold, at the owner's size.
+    owned = [];
+    vi.mocked(ownerDefaultSize).mockResolvedValueOnce('small');
+    vi.mocked(warmPoolTargetFor).mockResolvedValueOnce(0);
+    await spawn();
+    expect(claimWarmBox).not.toHaveBeenCalled();
+    expect(poolSpecHashOrNull).not.toHaveBeenCalledWith('small');
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, 'small');
+  });
+
+  it("claims at the owner's size from that size's pool, and asks the claim for only that size", async () => {
+    flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+    vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
+    vi.mocked(ownerDefaultSize).mockResolvedValueOnce('small');
+    vi.mocked(claimWarmBox).mockResolvedValueOnce({ claimed: false, reason: 'no-warm-box', candidatesTried: 0 });
+    await spawn();
+    expect(warmPoolTargetFor).toHaveBeenCalledWith('small');
+    expect(poolSpecHashOrNull).toHaveBeenCalledWith('small');
+    expect(claimWarmBox).toHaveBeenCalledWith(expect.objectContaining({ currentHash: 'hash', size: 'small' }), expect.anything());
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, 'small');
   });
 
   it('hands the create a re-check for inside its transaction, and stands down when it says a box is already on its way (Bugbot on #191)', async () => {
@@ -1040,3 +1067,55 @@ describe('POST /internal/claude-runner/spawn, owner notices', () => {
     expect(notifyGithubAbsent).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /internal/claude-runner/spawn, the Claude Code floor (docs/claude-code-updates.md)', () => {
+  beforeEach(() => {
+    vi.mocked(findUserByEmail).mockResolvedValue({ id: 'u1', googleEmail: 'ada@example.com', unixUsername: 'ada' } as never);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.mocked(prisma.instance.findMany).mockResolvedValue([box('box-a')] as never);
+    vi.mocked(isInstanceAgentConnected).mockReturnValue(true);
+    vi.mocked(instanceAgentTransport).mockReturnValue({ conn: {} as never, capabilities: ['credentials-v1', 'tmux-create-command-v1', 'claude-runner-wrapper-v3'], agentCommit: null });
+    agents({});
+  });
+  afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); });
+
+  it('reads the floor for the owner\'s ready boxes, with what their wrapper takes', async () => {
+    await spawn();
+    expect(vi.mocked(runnerFloors).mock.calls[0][1]).toEqual([expect.objectContaining({ id: 'box-a', wrapperFloor: true })]);
+  });
+
+  it('passes the floor to a wrapper that enforces it, after every other flag', async () => {
+    vi.mocked(runnerFloors).mockResolvedValueOnce(new Map([['box-a', { kind: 'pass', floor: '2.1.308' }]]));
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(calls('tmux-create')[0][2].command).toEqual(['/home/ada/.local/bin/termag-claude-runner', 'ord.1', '2', '--claude-floor', '2.1.308']);
+  });
+
+  it('refuses claude-too-old when every box is below the floor its wrapper cannot enforce, and asks for floor runs', async () => {
+    const floors = new Map([['box-a', { kind: 'too-old' as const, installed: '2.1.300', floor: '2.1.308' }]]);
+    vi.mocked(runnerFloors).mockResolvedValueOnce(floors);
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining("older than termag's floor"), code: 'claude-too-old' });
+    expect(calls('tmux-create')).toEqual([]);
+    expect(requestFloorRuns).toHaveBeenCalledWith(expect.objectContaining({ id: 'u1' }), [expect.objectContaining({ id: 'box-a' })], floors);
+    expect(codes()).toEqual(['claude-too-old']);
+  });
+
+  it('places on another box when only one is below the floor', async () => {
+    vi.mocked(prisma.instance.findMany).mockResolvedValue([box('box-a'), box('box-b')] as never);
+    vi.mocked(runnerFloors).mockResolvedValueOnce(new Map([['box-a', { kind: 'too-old', installed: '2.1.300', floor: '2.1.308' }], ['box-b', { kind: 'ok' }]]));
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(calls('tmux-create').map(c => c[0])).toEqual(['box-b']);
+  });
+
+  it('still finds an order already running on a box below the floor, rather than starting a second runner', async () => {
+    vi.mocked(runnerFloors).mockResolvedValueOnce(new Map([['box-a', { kind: 'too-old', installed: '2.1.300', floor: '2.1.308' }]]));
+    agents({ 'box-a': ['ada-claude-runner-s2-ord_d1-r'] });
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(calls('tmux-create')).toEqual([]);
+  });
+});
+

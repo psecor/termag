@@ -1,67 +1,90 @@
 import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
-import { toWorktimeProjectRows } from '../services/worktimeProjects';
+import { toWorktimeProjectRows, worktimeUsernames } from '../services/worktimeProjects';
+import { noteUserTimeZone } from '../services/userTimeZone';
+import { shiftDay, workTimeDay } from '../services/worktimeDays';
+import type { RouteResult } from './routeResult';
 
+/** Who reads working time: the zone they report is recorded for banking (services/userTimeZone.ts). */
+type Reader = { readonly id: string; readonly unixUsername: string; readonly timeZone?: string | null };
+
+/**
+ * This person's today, and the day `daysBack` days before it, in the zone the
+ * reader sends as `tz` (else the one on record, else the orchestrator's):
+ * working time is banked by their days (services/worktimeDays.ts).
+ */
+function readerDays(user: Reader, tzRaw: unknown, daysBack: number): { today: string; since: string } {
+  const today = workTimeDay(Date.now(), noteUserTimeZone(user, tzRaw));
+  return { today, since: shiftDay(today, -daysBack) };
+}
+
+/**
+ * GET /api/worktime?days=N&tz=Zone: banked time per day and provider (`human`
+ * is the user's own), and which day is their `today`. Shared with GET
+ * /api/cli/v1/worktime (routes/cliWorktime.ts).
+ */
+export async function worktimeFor(user: Reader, daysRaw: unknown, tzRaw?: unknown): Promise<RouteResult> {
+  const daysBack = parseInt(daysRaw as string) || 30;
+  const { today, since } = readerDays(user, tzRaw, daysBack);
+  try {
+    const entries = await prisma.workTimeEntry.findMany({
+      where: {
+        username: { in: worktimeUsernames(user.unixUsername) },
+        date: { gte: since },
+      },
+      orderBy: { date: 'asc' },
+    });
+
+    // Group by date, then by provider
+    const days: Record<string, Record<string, { totalMs: number; sessions: number }>> = {};
+    for (const e of entries) {
+      if (!days[e.date]) days[e.date] = {};
+      if (!days[e.date][e.provider]) {
+        days[e.date][e.provider] = { totalMs: 0, sessions: 0 };
+      }
+      days[e.date][e.provider].totalMs += e.totalMs;
+      days[e.date][e.provider].sessions += e.sessions;
+    }
+
+    return { status: 200, body: { days, today } };
+  } catch {
+    return { status: 500, body: { error: 'Failed to fetch worktime data' } };
+  }
+}
+
+// GET /api/worktime/projects?days=N&tz=Zone — the same rows, but keeping the
+// project dimension (resolved to id + workstream) instead of grouping it away.
+// Feeds the dashboard's effort-by-project view. Days are the person's, like `/`.
+// Shared with GET /api/cli/v1/worktime/projects.
+export async function worktimeByProjectFor(user: Reader, daysRaw: unknown, tzRaw?: unknown): Promise<RouteResult> {
+  const daysBack = Math.min(365, Math.max(1, parseInt(daysRaw as string) || 30));
+  const { today, since } = readerDays(user, tzRaw, daysBack);
+  try {
+    const [entries, projects] = await Promise.all([
+      prisma.workTimeEntry.findMany({
+        where: { username: { in: worktimeUsernames(user.unixUsername) }, date: { gte: since } },
+        orderBy: { date: 'asc' },
+      }),
+      prisma.project.findMany({ where: { userId: user.id }, select: { id: true, name: true, instanceId: true } }),
+    ]);
+    return { status: 200, body: { days: daysBack, today, rows: toWorktimeProjectRows(entries, projects) } };
+  } catch {
+    return { status: 500, body: { error: 'Failed to fetch per-project worktime data' } };
+  }
+}
 
 export function worktimeRouter(): Router {
   const router = Router();
 
   const getWorktime: RequestHandler = async (req, res) => {
-    const username = req.user!.unixUsername;
-    const daysBack = parseInt(req.query.days as string) || 30;
-
-    // Calculate start date
-    const start = new Date();
-    start.setDate(start.getDate() - daysBack);
-    const startStr = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
-
-    try {
-      const entries = await prisma.workTimeEntry.findMany({
-        where: {
-          username,
-          date: { gte: startStr },
-        },
-        orderBy: { date: 'asc' },
-      });
-
-      // Group by date, then by provider
-      const days: Record<string, Record<string, { totalMs: number; sessions: number }>> = {};
-      for (const e of entries) {
-        if (!days[e.date]) days[e.date] = {};
-        if (!days[e.date][e.provider]) {
-          days[e.date][e.provider] = { totalMs: 0, sessions: 0 };
-        }
-        days[e.date][e.provider].totalMs += e.totalMs;
-        days[e.date][e.provider].sessions += e.sessions;
-      }
-
-      res.json({ days });
-    } catch {
-      res.status(500).json({ error: 'Failed to fetch worktime data' });
-    }
+    const out = await worktimeFor(req.user!, req.query.days, req.query.tz);
+    res.status(out.status).json(out.body);
   };
 
-  // GET /api/worktime/projects?days=N — the same rows, but keeping the project
-  // dimension (resolved to id + workstream) instead of grouping it away. Feeds
-  // the dashboard's effort-by-project view. Dates are server-local like `/`.
   const getWorktimeByProject: RequestHandler = async (req, res) => {
-    const daysBack = Math.min(365, Math.max(1, parseInt(req.query.days as string) || 30));
-    const start = new Date();
-    start.setDate(start.getDate() - daysBack);
-    const startStr = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
-    try {
-      const [entries, projects] = await Promise.all([
-        prisma.workTimeEntry.findMany({
-          where: { username: req.user!.unixUsername, date: { gte: startStr } },
-          orderBy: { date: 'asc' },
-        }),
-        prisma.project.findMany({ where: { userId: req.user!.id }, select: { id: true, name: true, instanceId: true } }),
-      ]);
-      res.json({ days: daysBack, rows: toWorktimeProjectRows(entries, projects) });
-    } catch {
-      res.status(500).json({ error: 'Failed to fetch per-project worktime data' });
-    }
+    const out = await worktimeByProjectFor(req.user!, req.query.days, req.query.tz);
+    res.status(out.status).json(out.body);
   };
 
   router.get('/projects', requireAuth, getWorktimeByProject);

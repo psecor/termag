@@ -15,6 +15,7 @@ import { tokenSourceSql } from '../admin/tokenSource';
 import { isProjectAgentConnected, sendForProject, type ProjectHost } from '../agentRegistry';
 import { projectDirFor } from '../tmux';
 import { toWorktimeProjectRows, type WorktimeEntryLike } from '../worktimeProjects';
+import { timeZoneFor } from '../userTimeZone';
 import { cloudSessionName, sessionUrl } from '../claudeSessions';
 import { listSessionRowsFor } from '../../routes/sessions';
 import { captureFor } from '../../routes/projects';
@@ -90,6 +91,8 @@ export interface LedgerDeps {
   digest: (host: ProjectHost, cwd: string, since: string, until: string) => Promise<DigestReply>;
   paneTail: (userId: string, projectId: string, workstream: string) => Promise<string | null>;
   serverTz: () => string;
+  /** The zone this person's working time is banked in (services/userTimeZone.ts); undefined: the orchestrator's. */
+  worktimeTz?: (username: string) => string | undefined;
   now: () => Date;
 }
 
@@ -163,13 +166,15 @@ export async function buildLedger(
   const until = new Date(window.until);
   const notes: string[] = [];
 
-  const serverDays = dayKeysTouched(since, until, deps.serverTz());
+  // Working time is banked by the person's own days (docs/agents/gotchas.md, worktime-day-is-the-persons).
+  const worktimeTz = deps.worktimeTz?.(user.unixUsername) ?? deps.serverTz();
+  const worktimeDays = dayKeysTouched(since, until, worktimeTz);
   const utcDays = dayKeysTouched(since, until, 'UTC');
 
   const [live, owned, worktime, tokenRows, visitRows, cloud, prRows, spawnOrphans] = await Promise.all([
     deps.liveRows(user.id),
     deps.ownedProjects(user.id),
-    deps.worktime(user.unixUsername, serverDays),
+    deps.worktime(user.unixUsername, worktimeDays),
     deps.tokens(user.id, utcDays),
     deps.visits(user.id, since, until),
     deps.cloud(user.id, since, until),
@@ -179,13 +184,16 @@ export async function buildLedger(
   const ownedById = new Map(owned.map(p => [p.id, p]));
   const now = deps.now();
   const patternSince = new Date(until.getTime() - PATTERN_DAYS * 24 * 60 * 60 * 1000);
-  const chartDays = dayKeysEnding(localDayKey(until, deps.serverTz()), CHART_DAYS);
+  const chartDays = dayKeysEnding(localDayKey(until, worktimeTz), CHART_DAYS);
   const [context, context14, visits14, chartWorktime, tokensByDay, dismissals] = await Promise.all([
     deps.contextPeaks(owned.map(p => p.id), since, until),
     deps.contextPeaks(owned.map(p => p.id), patternSince, until),
     deps.visits(user.id, patternSince, until),
     deps.worktime(user.unixUsername, chartDays),
-    deps.tokensByDay(user.id, dayKeysEnding(localDayKey(until, 'UTC'), CHART_DAYS)),
+    // Tokens are kept by UTC day only: read the same date keys the chart shows,
+    // so a bar pairs the person's working day with that date's tokens and none
+    // slides off the axis when their day isn't UTC's.
+    deps.tokensByDay(user.id, chartDays),
     // A dismissal read that fails hides nothing; it only shows dismissed items again.
     deps.dismissals(user.id, now).catch(() => [] as BriefingDismissal[]),
   ]);
@@ -338,7 +346,7 @@ export async function buildLedger(
     if (failed) notes.push(`${failed} digest read(s) failed.`);
     if (skipped) notes.push(`${skipped} quieter session(s) were listed without a digest (limit ${MAX_DIGESTS}).`);
   }
-  notes.push('Worktime and token totals include whole days at the window edges (worktime days are server-local, token days UTC).');
+  notes.push('Worktime and token totals include whole days at the window edges (worktime days are the person\'s own, token days UTC).');
 
   // Done or deferred left-open items: a done one comes back once its session does something new.
   for (const s of sessions) {
@@ -506,5 +514,6 @@ export const defaultLedgerDeps: LedgerDeps = {
     return r.status === 200 ? String((r.body as { content?: unknown }).content ?? '') : null;
   },
   serverTz: serverTimeZone,
+  worktimeTz: timeZoneFor,
   now: () => new Date(),
 };

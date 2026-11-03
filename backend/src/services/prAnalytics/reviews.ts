@@ -91,8 +91,16 @@ export interface RPr {
 export interface RReview { prId: string; login: string; cls: string; state: string; submittedAt: Date; comments: number }
 
 const isSelf = (pr: RPr, login: string) => login === pr.author || (!!pr.credited && login === pr.credited);
-const byPerson = (pr: RPr | undefined, r: RReview) => !!pr && r.cls === 'human' && !!r.login && !isSelf(pr, r.login);
+/** A review by a person, of someone else's PR: what the reviewer metrics count by default. */
+const isHuman = (pr: RPr | undefined, r: RReview) => !!pr && r.cls === 'human' && !!r.login && !isSelf(pr, r.login);
+/** A review by a reviewer whose class is in `classes`, of someone else's PR. */
+const isReviewer = (pr: RPr | undefined, r: RReview, classes: ReadonlySet<string>) => !!pr && classes.has(r.cls) && !!r.login && !isSelf(pr, r.login);
 const isAgentApproval = (r: RReview) => r.state === 'APPROVED' && r.cls !== 'human' && APPROVAL_AGENT_LOGINS.includes(base(r.login));
+
+/** Every reviewer class, for a view that wants bots too (tagged, so they can be filtered). */
+export const ALL_REVIEWER_CLASSES: ReadonlySet<string> = new Set(['human', 'agent', 'automation']);
+/** People only, the default for every reviewer metric. */
+const HUMAN_CLASSES: ReadonlySet<string> = new Set(['human']);
 const inWin = (d: Date | null, since: Date, until: Date) => !!d && d >= since && d < until;
 const round1 = (n: number) => Math.round(n * 10) / 10;
 
@@ -102,15 +110,15 @@ function spread(values: number[]) {
   return { prs: v.length, p50: round1(percentile(v, 0.5)), p95: round1(percentile(v, 0.95)), max: v.length ? v[v.length - 1] : 0 };
 }
 
-interface Pair { prId: string; login: string; approved: boolean; changes: boolean; comments: number }
+interface Pair { prId: string; login: string; cls: string; approved: boolean; changes: boolean; comments: number }
 
-/** One entry per person per PR with a review in the window. DISMISSED counts as neither approval nor changes. */
-function pairsIn(prs: Map<string, RPr>, reviews: RReview[], since: Date, until: Date): Map<string, Pair> {
+/** One entry per reviewer per PR with a review in the window. DISMISSED counts as neither approval nor changes. */
+function pairsIn(prs: Map<string, RPr>, reviews: RReview[], since: Date, until: Date, classes: ReadonlySet<string>): Map<string, Pair> {
   const pairs = new Map<string, Pair>();
   for (const r of reviews) {
-    if (!inWin(r.submittedAt, since, until) || !byPerson(prs.get(r.prId), r)) continue;
+    if (!inWin(r.submittedAt, since, until) || !isReviewer(prs.get(r.prId), r, classes)) continue;
     const k = `${r.prId} ${r.login}`;
-    const p = pairs.get(k) ?? { prId: r.prId, login: r.login, approved: false, changes: false, comments: 0 };
+    const p = pairs.get(k) ?? { prId: r.prId, login: r.login, cls: r.cls, approved: false, changes: false, comments: 0 };
     pairs.set(k, p);
     if (r.state === 'APPROVED') p.approved = true;
     if (r.state === 'CHANGES_REQUESTED') p.changes = true;
@@ -126,7 +134,7 @@ function approvalKind(pr: RPr, reviews: RReview[]): ApprovalKind {
   let human = false; let agent = false;
   for (const r of reviews) {
     if (r.submittedAt > pr.mergedAt!) continue;
-    if (r.state === 'APPROVED' && byPerson(pr, r)) human = true;
+    if (r.state === 'APPROVED' && isHuman(pr, r)) human = true;
     else if (isAgentApproval(r)) agent = true;
   }
   return human ? (agent ? 'humanAndAgent' : 'humanOnly') : agent ? 'agentOnly' : 'none';
@@ -171,9 +179,9 @@ function agentSplit(prs: RPr[], byPr: Map<string, RReview[]>, since: Date, until
   return out;
 }
 
-export function reviewWindow(prs: RPr[], reviews: RReview[], since: Date, until: Date, agentRepos: Set<string>): ReviewWindow {
+export function reviewWindow(prs: RPr[], reviews: RReview[], since: Date, until: Date, agentRepos: Set<string>, classes: ReadonlySet<string> = HUMAN_CLASSES): ReviewWindow {
   const { byId, byPr } = index(prs, reviews);
-  const pairs = [...pairsIn(byId, reviews, since, until).values()];
+  const pairs = [...pairsIn(byId, reviews, since, until, classes).values()];
   const perPerson = new Map<string, number>();
   for (const p of pairs) perPerson.set(p.login, (perPerson.get(p.login) ?? 0) + 1);
 
@@ -200,6 +208,8 @@ export function reviewWindow(prs: RPr[], reviews: RReview[], since: Date, until:
 
 export interface Reviewer {
   login: string;
+  /** human, agent or automation: a bot is tagged, so a view can filter it. */
+  cls: string;
   reviews: number; approved: number; changesRequested: number; commentOnly: number; inlineComments: number;
   /** PRs merged in the window where theirs was the last human approval before the merge. */
   decidingApprovals: number;
@@ -230,23 +240,23 @@ function askedAt(pr: RPr, login: string, mine: number[]): { asked: number; answe
   return { asked: Math.max(...named.filter(t => t <= answered)), answered };
 }
 
-export function topReviewers(prs: RPr[], reviews: RReview[], since: Date, until: Date): Reviewer[] {
+export function topReviewers(prs: RPr[], reviews: RReview[], since: Date, until: Date, classes: ReadonlySet<string> = HUMAN_CLASSES): Reviewer[] {
   const { byId, byPr } = index(prs, reviews);
   const out = new Map<string, Reviewer & { hours: number[]; authors: Set<string> }>();
-  const get = (login: string) => {
+  const get = (login: string, cls: string) => {
     let r = out.get(login);
-    if (!r) { r = { login, reviews: 0, approved: 0, changesRequested: 0, commentOnly: 0, inlineComments: 0, decidingApprovals: 0, medianHoursToFirstReview: null, askedReviews: 0, stalePickups: 0, authorsHelped: 0, hours: [], authors: new Set() }; out.set(login, r); }
+    if (!r) { r = { login, cls, reviews: 0, approved: 0, changesRequested: 0, commentOnly: 0, inlineComments: 0, decidingApprovals: 0, medianHoursToFirstReview: null, askedReviews: 0, stalePickups: 0, authorsHelped: 0, hours: [], authors: new Set() }; out.set(login, r); }
     return r;
   };
-  for (const p of pairsIn(byId, reviews, since, until).values()) {
+  for (const p of pairsIn(byId, reviews, since, until, classes).values()) {
     const pr = byId.get(p.prId)!;
-    const r = get(p.login);
+    const r = get(p.login, p.cls);
     r.reviews++; r.inlineComments += p.comments;
     if (p.approved) r.approved++;
     if (p.changes) r.changesRequested++;
     if (!p.approved && !p.changes) r.commentOnly++;
     r.authors.add(pr.credited ?? pr.author);
-    const people = (byPr.get(p.prId) ?? []).filter(x => byPerson(pr, x));
+    const people = (byPr.get(p.prId) ?? []).filter(x => isReviewer(pr, x, classes));
     const mine = people.filter(x => x.login === p.login).map(x => x.submittedAt.getTime());
     const first = Math.min(...mine);
     const asked = askedAt(pr, p.login, mine);
@@ -257,9 +267,9 @@ export function topReviewers(prs: RPr[], reviews: RReview[], since: Date, until:
   for (const pr of prs) {
     if (!inWin(pr.mergedAt, since, until) || !pr.reviewsRead) continue;
     const last = (byPr.get(pr.id) ?? [])
-      .filter(r => r.state === 'APPROVED' && r.submittedAt <= pr.mergedAt! && byPerson(pr, r))
+      .filter(r => r.state === 'APPROVED' && r.submittedAt <= pr.mergedAt! && isHuman(pr, r))
       .sort((a, b) => b.submittedAt.getTime() - a.submittedAt.getTime())[0];
-    if (last) get(last.login).decidingApprovals++;
+    if (last) get(last.login, 'human').decidingApprovals++;
   }
   return [...out.values()].map(({ hours, authors, ...r }) => ({
     ...r,
@@ -279,6 +289,33 @@ export function reviewTrend(prs: RPr[], reviews: RReview[], start: Date, now: Da
     weeks.push({
       week: new Date(w).toISOString().slice(0, 10), reviews: r.reviews, reviewers: r.distribution.contributors,
       agentOnly: r.agent.agentOnly, humanApproved: r.agent.humanOnly + r.agent.humanAndAgent, unapproved: r.agent.none,
+    });
+  }
+  return weeks;
+}
+
+export interface TeamReviewWeek { week: string; given: number; received: number; reviewersGiven: number; reviewersReceived: number }
+
+/**
+ * Weekly (Monday UTC) reviews a team gave (by its members) and received (on PRs
+ * credited to them), from `start` to `now`, the last week partial. The roster
+ * is resolved per week through `loginsIn`, so a week counts the team as it was
+ * then. Received counts every reviewer class, as the received cards do.
+ */
+export function teamReviewTrend(prs: RPr[], reviews: RReview[], loginsIn: (since: Date, until: Date) => string[], start: Date, now: Date): TeamReviewWeek[] {
+  const none = new Set<string>();
+  const weeks: TeamReviewWeek[] = [];
+  for (let w = start.getTime(); w <= now.getTime(); w += 7 * 86_400_000) {
+    const from = new Date(w);
+    const until = new Date(Math.min(w + 7 * 86_400_000, now.getTime() + 1));
+    const team = new Set(loginsIn(from, until));
+    const teamPrIds = new Set(prs.filter(p => p.credited && team.has(p.credited)).map(p => p.id));
+    const g = reviewWindow(prs, reviews.filter(r => team.has(r.login)), from, until, none);
+    const r = reviewWindow(prs, reviews.filter(r => teamPrIds.has(r.prId)), from, until, none, ALL_REVIEWER_CLASSES);
+    weeks.push({
+      week: from.toISOString().slice(0, 10),
+      given: g.reviews, received: r.reviews,
+      reviewersGiven: g.distribution.contributors, reviewersReceived: r.distribution.contributors,
     });
   }
   return weeks;

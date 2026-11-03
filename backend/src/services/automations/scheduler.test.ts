@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
-  automation: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
+  automation: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   automationRun: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn(), count: vi.fn() },
   instance: { findUnique: vi.fn() },
   user: { findUnique: vi.fn() },
@@ -12,8 +12,9 @@ vi.mock('../agentRegistry', () => ({
   isInstanceAgentConnected: vi.fn(() => true),
   sendForProject: vi.fn(async () => ({ ok: true })),
 }));
-vi.mock('../boxPower', () => ({ requestPower: vi.fn(async () => 'starting') }));
+vi.mock('../boxPower', () => ({ PowerRequestConflict: class extends Error {}, requestPower: vi.fn(async () => 'starting') }));
 vi.mock('../boxLifecycle', () => ({ registerBoxBusyCheck: vi.fn() }));
+vi.mock('../boxActivity', () => ({ noteAutomationRunActivity: vi.fn(async () => undefined) }));
 vi.mock('../featureFlags', () => ({ boolVariation: vi.fn(async () => true), jsonVariation: vi.fn(async () => null) }));
 vi.mock('../../routes/workstreams', () => ({ removeWorkstreamFor: vi.fn(async () => ({ status: 200, body: {} })) }));
 vi.mock('./complete', () => ({ reportRun: vi.fn(async () => undefined), pushNotesForRun: vi.fn(async () => undefined), queueNotesPushForRun: vi.fn(async () => ({ done: Promise.resolve() })), settleInterruptedRun: vi.fn(async () => undefined) }));
@@ -21,12 +22,17 @@ vi.mock('./runner', () => ({ startRun: vi.fn(async () => ({ kind: 'started', wor
 
 import { Prisma } from '@prisma/client';
 import { dailyMinutesUsed, decideAndStart, NOTES_PUSH_DELAY_MS, resolvePending, retireBeyondKeep, startDue, timeOutRuns } from './scheduler';
+import { registerBoxBusyCheck } from '../boxLifecycle';
+
+// Taken before the first clearAllMocks: the module registers it at import.
+const automationBusyCheck = vi.mocked(registerBoxBusyCheck).mock.calls.find(c => c[0] === 'automation-run')![1];
 import { startRun } from './runner';
 import { reportRun, settleInterruptedRun } from './complete';
 import { DEFAULT_AUTOMATION_LIMITS } from './limits';
-import { requestPower } from '../boxPower';
+import { PowerRequestConflict, requestPower } from '../boxPower';
+import { noteAutomationRunActivity } from '../boxActivity';
 import { isInstanceAgentConnected, sendForProject } from '../agentRegistry';
-import { jsonVariation } from '../featureFlags';
+import { boolVariation, jsonVariation } from '../featureFlags';
 import { removeWorkstreamFor } from '../../routes/workstreams';
 
 const now = new Date('2026-10-20T09:00:30Z');
@@ -96,8 +102,37 @@ describe('startDue', () => {
     prisma.automation.findMany.mockResolvedValue([{ ...automation, wakeBox: true, lastOccurrence: new Date('2026-10-19T09:00:00Z'), project: { ...automation.project, instance: { ...instance, status: 'hibernated' } } }]);
     vi.mocked(isInstanceAgentConnected).mockReturnValue(false);
     expect(await startDue(now)).toBe(0);
-    expect(requestPower).toHaveBeenCalledWith(expect.objectContaining({ id: 'box1' }), 'start');
+    expect(requestPower).toHaveBeenCalledWith(expect.objectContaining({ id: 'box1' }), 'start', { startedBy: 'automation', andSet: { lastActivityAt: now } });
     expect(prisma.automationRun.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ state: 'skipped' }) }));
+  });
+
+  it('counts a wake EC2 refuses on the automation, from the first refusal, and clears it once a start takes', async () => {
+    const asleep = { ...automation, wakeBox: true, lastOccurrence: new Date('2026-10-19T09:00:00Z'), project: { ...automation.project, instance: { ...instance, status: 'stopped' } } };
+    prisma.automation.findMany.mockResolvedValue([asleep]);
+    vi.mocked(isInstanceAgentConnected).mockReturnValue(false);
+    vi.mocked(requestPower).mockRejectedValueOnce(new Error('Insufficient capacity.'));
+    await startDue(now);
+    expect(prisma.automation.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { boxStartFailures: { increment: 1 }, boxStartError: 'Insufficient capacity.' } });
+    expect(prisma.automation.updateMany).toHaveBeenCalledWith({ where: { id: 'a1', boxStartFailingSince: null }, data: { boxStartFailingSince: now } });
+
+    // The box moving under the wake (another start, a terminate claim) is no refusal.
+    vi.clearAllMocks();
+    prisma.automation.findMany.mockResolvedValue([asleep]);
+    vi.mocked(requestPower).mockRejectedValueOnce(new PowerRequestConflict('The box changed state; reload and try again'));
+    await startDue(now);
+    expect(prisma.automation.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ boxStartFailures: expect.anything() }) }));
+
+    vi.clearAllMocks();
+    prisma.automation.findMany.mockResolvedValue([{ ...asleep, boxStartFailures: 6 }]);
+    await startDue(now);
+    expect(prisma.automation.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { boxStartFailures: 0, boxStartFailingSince: null, boxStartError: null } });
+  });
+
+  it('restarts the box\'s idle clock when it claims a run', async () => {
+    prisma.automation.findMany.mockResolvedValue([{ ...automation, lastOccurrence: new Date('2026-10-19T09:00:00Z') }]);
+    await startDue(now);
+    expect(startRun).toHaveBeenCalled();
+    expect(noteAutomationRunActivity).toHaveBeenCalledWith('box1', now);
   });
 
   it('skips when the previous run is still live', async () => {
@@ -141,6 +176,19 @@ describe('decideAndStart', () => {
     vi.mocked(startRun).mockResolvedValueOnce({ kind: 'unknown', workstreamId: 'w1', workstream: 'run-20261020-0900', branch: 'b', error: 'Agent request timed out: chat-send' });
     expect(await decideAndStart(automation as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'start' });
     expect(prisma.automationRun.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ state: 'failed' }) }));
+  });
+
+  it('pauses a t3 automation whose box is gone, rather than skipping it as flag_off for good', async () => {
+    const t3 = { ...automation, kind: 't3', project: { ...automation.project, instanceId: null, instance: null } };
+    expect(await decideAndStart(t3 as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'skip', reason: 'box_gone' });
+    expect(prisma.automation.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { pausedReason: 'box_gone' } });
+  });
+
+  it('skips a t3 automation as flag_off when desktop-app-enabled is off for its box', async () => {
+    vi.mocked(boolVariation).mockImplementation(async (key: string) => key !== 'desktop-app-enabled');
+    const t3 = { ...automation, kind: 't3' };
+    expect(await decideAndStart(t3 as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'skip', reason: 'flag_off' });
+    vi.mocked(boolVariation).mockImplementation(async () => true);
   });
 
   it('reports an older runner as a skip', async () => {
@@ -292,5 +340,23 @@ describe('retireBeyondKeep', () => {
 describe('retire', () => {
   it('is wired to removeWorkstreamFor', () => {
     expect(removeWorkstreamFor).toBeDefined();
+  });
+});
+
+describe('the automation-run busy check', () => {
+  it('holds a box with a run inside its time limit, and one a waking automation has a run pending for', async () => {
+    const now = Date.now();
+    prisma.automationRun.findMany
+      .mockResolvedValueOnce([
+        { instanceId: 'b-running', startedAt: new Date(now - 5 * 60_000), automation: { maxRunMinutes: 30 } },
+        { instanceId: 'b-overdue', startedAt: new Date(now - 31 * 60_000), automation: { maxRunMinutes: 30 } },
+      ])
+      .mockResolvedValueOnce([{ automation: { project: { instanceId: 'b-pending' } } }]);
+    const busy = await automationBusyCheck(['b-running', 'b-overdue', 'b-pending', 'b-idle']);
+    expect([...busy].sort()).toEqual(['b-pending', 'b-running']);
+    const pendingQuery = prisma.automationRun.findMany.mock.calls[1][0];
+    expect(pendingQuery.where).toMatchObject({
+      state: 'pending', automation: { wakeBox: true, project: { instanceId: { in: ['b-running', 'b-overdue', 'b-pending', 'b-idle'] } } },
+    });
   });
 });

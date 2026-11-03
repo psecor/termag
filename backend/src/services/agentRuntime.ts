@@ -1,6 +1,6 @@
 import * as tmux from './tmux';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from './agentRegistry';
-import { launchCommandFor } from './launchCommand';
+import { launchCommandFor, PANE_KIND_ENV } from './launchCommand';
 import { claimSpawnLaunch, isParkedSpawn, releaseSpawnLaunch, unparkOnLaunch } from './agentSpawnStore';
 import { watchLaunchedSpawn } from './spawnStatusLog';
 import { spawnFolderTrust } from './agentSpawn';
@@ -8,7 +8,7 @@ import { claimHandoffLaunch, releaseHandoffLaunch } from './agentHandoffStore';
 import { registerPollerSession, unregisterPollerSession } from './tmuxPoller';
 import { PROVIDERS, isBackendFor } from '../providers/registry';
 import { isClaudeCode, isModelFor } from './modelChoices';
-import { fireworksContext, type FireworksModels } from './fireworksGateway';
+import { fireworksContext, fireworksMenuArg, type FireworksModels } from './fireworksGateway';
 import { fireworksModelsForBox } from './fireworksFlag';
 import { refusalLine } from './launchCommand';
 import { classifyForeground } from './foregroundProbe';
@@ -18,6 +18,7 @@ import { rememberUserKey } from './userKeys';
 import { firstPromptLaunchCommand, firstPromptPath } from './firstPrompt';
 import { resolveProjectRoot } from './projectPaths';
 import { prisma } from '../db';
+import { claimUpdateSettled } from './claimUpdateGate';
 
 
 /**
@@ -156,6 +157,14 @@ interface AgentRuntimeContext {
    */
   resume?: boolean;
   /**
+   * With `resume`, the conversation to resume by id, for a bridge provider
+   * (Codex), whose pane the agent's codex-session-start launches, or one with
+   * a resumeById (Cursor): a tool update's report names the one the pane had
+   * (services/toolUpdate/panes.ts). Without it a bridge pane starts fresh, and
+   * any other its resumeCommand, as they always have.
+   */
+  resumeSessionId?: string;
+  /**
    * What the agent's first launch starts on, when the user wrote it (a new
    * workstream for a PR, services/firstPrompt.ts). A spawn's brief or a
    * handoff wins; a provider without promptLaunch launches bare.
@@ -177,6 +186,8 @@ export interface LaunchModel {
   model: string | null;
   fastModel?: string;
   context?: number;
+  // On Fireworks: the flag's models for the harness's /model (fireworksMenuArg).
+  models?: string;
   // Typed instead of the agent: the backend cannot be used for this owner and box.
   refusal?: string;
 }
@@ -205,7 +216,10 @@ export function launchChoice(
   // its small/fast model included, so the smaller of the two.
   const windows = (isClaudeCode(provider) ? [m, fireworks.fastModel] : [m]).map(id => fireworksContext(fireworks, id));
   const context = windows.every(w => w !== null) ? Math.min(...(windows as number[])) : undefined;
-  return { backend: b, model: m, fastModel: fireworks.fastModel, ...(context ? { context } : {}) };
+  return {
+    backend: b, model: m, fastModel: fireworks.fastModel, ...(context ? { context } : {}),
+    models: fireworksMenuArg(fireworks.models),
+  };
 }
 
 /** launchChoice with the flags read for the owner and box; a failed read is no Fireworks. */
@@ -268,10 +282,15 @@ async function launchUnlocked({
   admission,
   spawnId,
   resume,
+  resumeSessionId,
   firstPrompt,
   backend: backendOverride,
   model: modelOverride,
 }: AgentRuntimeContext): Promise<LaunchOutcome> {
+  // A box just claimed from the pool is brought up to this orchestrator's
+  // commit before its first launch (claimUpdate.ts); bounded, and a failed
+  // update launches on the commit the box has.
+  await claimUpdateSettled(instanceId);
   // Before any RPC: tmux-create makes the dir and git-inits it, which would
   // poison a clone still in progress. A name with no live row is not gated.
   const setup = await prisma.project.findFirst({
@@ -336,7 +355,14 @@ async function launchUnlocked({
       // The pane's project and workstream go to the bridge, which puts them in
       // the app server's environment for termag-agent-otel (termag.project,
       // termag.workstream on the resource, as a typed launch's env prefix does).
-      await sendForProject(project, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: projectName, workstream });
+      // A resume by id types `codex resume <id>` in the pane (agent.js); an
+      // agent that predates it ignores the field and starts fresh. Only a tool
+      // update's relaunch passes one, and only to a box whose agent announces
+      // tool-update-codex-v1, which came with it.
+      await sendForProject(project, 'codex-session-start', {
+        sessionName: mainSession, cwd: projDir, project: projectName, workstream,
+        ...(resume && resumeSessionId ? { resumeSessionId } : {}),
+      });
     } else {
       const capabilities = instanceId ? instanceAgentTransport(instanceId)?.capabilities ?? [] : [];
       // A spawned agent's first launch starts on its brief,
@@ -353,7 +379,10 @@ async function launchUnlocked({
       }
       const handedOff = claim;
       const prompted = !spawned && !handedOff && firstPrompt ? await writeFirstPrompt(project, provider, mainSession, firstPrompt, { unixUsername, hostHome }) : null;
-      const fresh = resume ? config.resumeCommand ?? config.launchCommand : config.launchCommand;
+      // A tool update's relaunch names the conversation (resumeSessionId): a
+      // provider that resumes by id (Cursor) gets exactly that one.
+      const byId = resume && resumeSessionId ? config.resumeById?.(resumeSessionId) ?? null : null;
+      const fresh = resume ? byId ?? config.resumeCommand ?? config.launchCommand : config.launchCommand;
       const row = backendOverride !== undefined || modelOverride !== undefined
         ? { backend: backendOverride ?? null, model: modelOverride ?? null }
         : setup ? await workflowChoice(setup.id, workstream) : { backend: null, model: null };
@@ -407,7 +436,9 @@ async function launchUnlocked({
     if (preLaunch) await tmux.sendKeys(mainSession, preLaunch);
     return 'launched';
   }
-  await tmux.sendKeys(mainSession, preLaunch ? `${preLaunch} && ${config.launchCommand}` : config.launchCommand);
+  // A pane like a box's (launchCommandFor): the agent's tools see its session kind.
+  const launch = config.launchCommand ? `${PANE_KIND_ENV}${config.launchCommand}` : config.launchCommand;
+  await tmux.sendKeys(mainSession, preLaunch ? `${preLaunch} && ${launch}` : launch);
 
   if (config.needsPoller) {
     registerPollerSession(mainSession, provider);
@@ -653,9 +684,10 @@ export async function stopAgentSessions({
   const config = PROVIDERS[provider];
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent', workstream);
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl', workstream);
-  // The Devin review pane (routes/review.ts) hangs off the agent workflow and
-  // must die with it, or Devin keeps burning tokens in a pane nobody can see.
-  const reviewSession = tmux.sessionName(unixUsername, projectName, 'review', workstream);
+  // The review panes (routes/review.ts, every slot)
+  // hang off the agent workflow and must die with it, or a reviewer keeps
+  // burning tokens in a pane nobody can see.
+  const reviewSessions = tmux.reviewSessionNames(unixUsername, projectName, workstream);
   const project = { userId, instanceId };
 
   if (config?.needsPoller) {
@@ -668,7 +700,9 @@ export async function stopAgentSessions({
     }
     await sendForProject(project, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
     await sendForProject(project, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
-    await sendForProject(project, 'tmux-kill', { sessionName: reviewSession }).catch(() => {});
+    // Exact targets: a bare `…-review` would prefix-match `…-review-2` once its own pane is gone.
+    await Promise.all(reviewSessions.map(name =>
+      sendForProject(project, 'tmux-kill', { sessionName: tmux.exactPaneTarget(name) }).catch(() => {})));
     return;
   }
 
@@ -679,5 +713,5 @@ export async function stopAgentSessions({
 
   await tmux.killSession(mainSession);
   await tmux.killSession(ctrlSession);
-  await tmux.killSession(reviewSession);
+  for (const name of reviewSessions) await tmux.killSession(name);
 }

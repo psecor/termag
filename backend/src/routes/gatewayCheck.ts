@@ -3,13 +3,16 @@ import { verifyCallerProof, type CallerProofConfig } from '../services/callerIde
 import type { AuthzBox, AuthzDecision } from '../services/gatewayAuthz';
 import { isManagedBox, parseAgentConnection } from '../services/instanceLifecycle';
 import { validateAgentToken } from './agentTokens';
+import { acceptsScope, type TokenSite } from '../services/agentTokenScopes';
 import { debugLog } from '../services/debugLog';
 
-export async function boxForToken(token: string): Promise<AuthzBox | null> {
+/** The box or user agent behind a token, for the gateway check at `site`; null when the token, or its scope, isn't accepted there. */
+export async function boxForToken(token: string, site: TokenSite): Promise<AuthzBox | null> {
   const validated = await validateAgentToken(token);
-  // Only agent-scoped tokens identify a box or a user's agent here; admin and
-  // client tokens (middleware/admin.ts) never authorise gateway calls.
-  const conn = validated && validated.token.scope === 'agent' ? parseAgentConnection(validated) : null;
+  // Each gateway names the scopes it accepts (services/agentTokenScopes.ts):
+  // today agent tokens only; admin and client tokens (middleware/admin.ts)
+  // never authorise gateway calls.
+  const conn = validated && acceptsScope(site, validated.token.scope) ? parseAgentConnection(validated) : null;
   if (!conn) return null;
   if (conn.kind === 'user-agent') return { userId: conn.user.id, instanceId: '-', managed: false };
   if (conn.kind !== 'owned-box') return { userId: '-', instanceId: conn.instance.id, managed: false };
@@ -20,6 +23,9 @@ export async function boxForToken(token: string): Promise<AuthzBox | null> {
     email: conn.user.googleEmail,
   };
 }
+
+/** boxForToken bound to one gateway's site, in the shape the gateways' deps take. */
+export const boxForTokenAt = (site: TokenSite) => (token: string) => boxForToken(token, site);
 
 export interface CheckRequest {
   req: Request;

@@ -7,7 +7,9 @@ vi.mock('./agentRuntime', () => ({
   reconstructInstanceSessions: async () => {},
 }));
 
-const { registerAgent, requestTerminalStream, closeTerminalStream } = await import('./agentRegistry');
+const {
+  registerAgent, requestTerminalStream, closeTerminalStream, sendTerminalInput, setAgentRegistryDraining, TERMINAL_AGENT_GONE,
+} = await import('./agentRegistry');
 
 class FakeAgentSocket extends EventEmitter {
   readyState = 1; // WebSocket.OPEN
@@ -86,5 +88,64 @@ describe('terminal data from agents', () => {
 
     // One from closeTerminalStream, one for the straggler; the agent ignores unknown ids.
     expect(ws.closesFor(streamId)).toHaveLength(2);
+  });
+});
+
+describe('a terminal stream and the agent socket that opened it', () => {
+  async function attached(user: { id: string }, ws: FakeAgentSocket) {
+    const onData = vi.fn();
+    const attach = requestTerminalStream(user.id, 'dev-proj-agent', 80, 24, onData);
+    const { requestId, streamId } = ws.sent.find(m => m.type === 'terminal-attach');
+    ws.fromAgent({ requestId, data: { ok: true, streamId } });
+    await attach;
+    return { streamId, onData };
+  }
+  const inputsFor = (ws: FakeAgentSocket, streamId: string) =>
+    ws.sent.filter(m => m.type === 'terminal-input' && m.streamId === streamId).map(m => m.data);
+
+  it('takes the input while the socket is up, and ends the stream when it closes', async () => {
+    const { user, ws } = connectAgent();
+    const { streamId, onData } = await attached(user, ws);
+    sendTerminalInput(streamId, 'ls');
+    expect(inputsFor(ws, streamId)).toEqual(['ls']);
+
+    // The agent kills every PTY when its socket closes; the browser must hear it.
+    ws.close();
+
+    expect(onData).toHaveBeenCalledWith({ type: TERMINAL_AGENT_GONE, streamId });
+  });
+
+  it('never routes the stream to the socket that replaced it', async () => {
+    const { user, ws } = connectAgent();
+    const { streamId, onData } = await attached(user, ws);
+
+    // A reconnect: the new socket closes the old one, and holds no PTYs.
+    const next = new FakeAgentSocket();
+    registerAgent(user as any, next as any, null);
+    sendTerminalInput(streamId, 'typed after the reconnect');
+    next.fromAgent({ type: 'terminal-data', streamId, data: 'stray' });
+
+    expect(onData.mock.calls).toEqual([[{ type: TERMINAL_AGENT_GONE, streamId }]]);
+    expect(inputsFor(next, streamId)).toEqual([]);
+    expect(next.closesFor(streamId)).toHaveLength(1);
+  });
+
+  it('leaves the terminals to the drain while the process is draining', async () => {
+    setAgentRegistryDraining(true);
+    try {
+      const { user, ws } = connectAgent();
+      const { streamId, onData } = await attached(user, ws);
+      ws.close();
+      sendTerminalInput(streamId, 'typed into the draining process');
+
+      expect(onData).not.toHaveBeenCalled();
+      expect(inputsFor(ws, streamId)).toEqual([]);
+    } finally {
+      setAgentRegistryDraining(false);
+    }
+  });
+
+  it('refuses an attach when no agent is connected', async () => {
+    await expect(requestTerminalStream('nobody', 'dev-proj-agent', 80, 24, () => {})).rejects.toThrow('Agent not connected');
   });
 });

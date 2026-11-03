@@ -24,6 +24,8 @@ export interface CliWorkstreamRequest {
   /** The new workstream's agent instead of main's (a provider id, checked by the route). */
   agent?: string;
   startFromOrigin?: boolean;
+  /** New session's space for the workstream's chat, by name, or null for No space (routes/cliLifecycle.ts chatSpaceField). */
+  chatSpace?: string | null;
 }
 
 export interface CliWorkstreamView {

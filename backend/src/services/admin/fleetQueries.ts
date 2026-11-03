@@ -2,19 +2,30 @@
  * Fleet (boxes) queries for the admin surface. Each export answers one
  * question and is shared by the REST route and the MCP tool of the same name.
  */
+import { resizeView, type ResizeView } from '../boxResizePolicy';
+import { boxEventView, latestBoxEvents, recentBoxEvents, type BoxEventView } from '../boxEvents';
 import { prisma } from '../../db';
 import { getConnectedAgents, instanceAgentTransport, isInstanceAgentConnected } from '../agentRegistry';
 import { allHostStatuses } from '../tokenUsageSampler';
 import { cloudSummary, hostPressureOf, type CloudCounts, type HostPressure } from './claudeRunnerQueries';
 import { lastBoxUpdateOf, type LastBoxUpdate } from '../boxUpdateReport';
 import { boxUpdateTarget, type BoxUpdateTarget } from '../boxUpdate';
+import { lifecycleViewFor } from '../boxLifecycle';
 import type { Range } from './range';
+import { parseStepResults } from '../boxQuarantinePolicy';
+import { quarantineRunning } from '../boxQuarantine';
 
 export interface AdminInstance {
   id: string; name: string; kind: string; status: string; region: string | null;
   ec2InstanceId: string | null; hostname: string | null;
   /** The AMI the box launched from and how it was chosen (boxImage.boxImageSource); null before they were recorded. */
   imageId: string | null; imageSource: string | null;
+  /** The size it launched at (boxSize.ts) and the EC2 type it got; null for no size (BOX_INSTANCE_TYPE) or before they were recorded. */
+  size: string | null; instanceType: string | null;
+  /** Its current or last resize (services/boxResizePolicy.ts resizeView); null when it never had one. */
+  resize: ResizeView | null;
+  /** The root disk in GiB it was made with (boxDiskSize.ts); null before it was recorded. The live volume is the detail's Disk section. */
+  diskGiB: number | null;
   createdAt: string; readyAt: string | null; lastConnectedAt: string | null; terminatedAt: string | null;
   provisioningError: string | null;
   provisioningMs: number | null;
@@ -48,6 +59,7 @@ export async function listInstances(opts: { includeTerminated?: boolean } = {}):
     }),
     cloudSummary(),
   ]);
+  const resizes = await latestBoxEvents(rows.map(r => r.id), 'resize');
   // Per-instance registry lookup, not getConnectedAgents(): that list only
   // carries owned boxes, so an unclaimed warm-pool agent would read as offline.
   const scans = new Map(allHostStatuses().filter(h => h.instanceId).map(h => [h.instanceId!, h]));
@@ -59,6 +71,7 @@ export async function listInstances(opts: { includeTerminated?: boolean } = {}):
       id: r.id, name: r.name, kind: r.kind, status: r.status, region: r.region,
       ec2InstanceId: r.ec2InstanceId, hostname: r.hostname,
       imageId: r.imageId, imageSource: r.imageSource,
+      size: r.size, instanceType: r.instanceType, diskGiB: r.diskGiB, resize: resizeView(resizes.get(r.id)),
       createdAt: r.createdAt.toISOString(), readyAt: r.readyAt?.toISOString() ?? null,
       lastConnectedAt: r.lastConnectedAt?.toISOString() ?? null, terminatedAt: r.terminatedAt?.toISOString() ?? null,
       provisioningError: r.provisioningError,
@@ -163,6 +176,18 @@ export async function provisioningStats(range: Range): Promise<ProvisioningStats
   };
 }
 
+/**
+ * The box's last 10 fleet operations (box_events: resizes, disk grows), newest
+ * first, each with who asked by unix name, for the detail card.
+ */
+export async function recentOperations(boxId: string): Promise<Array<BoxEventView & { actor: string | null }>> {
+  const rows = await recentBoxEvents(boxId, 10);
+  const ids = [...new Set(rows.map(r => r.actorId).filter((x): x is string => !!x))];
+  const users = ids.length ? await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, unixUsername: true } }) : [];
+  const names = new Map(users.map(u => [u.id, u.unixUsername]));
+  return rows.map(r => ({ ...boxEventView(r), actor: r.actorId ? names.get(r.actorId) ?? r.actorId : null }));
+}
+
 export async function getInstance(id: string) {
   const [all, row] = await Promise.all([
     listInstances({ includeTerminated: true }),
@@ -171,13 +196,33 @@ export async function getInstance(id: string) {
       include: {
         projects: { select: { id: true, name: true, archived: true, lastActiveAt: true }, orderBy: { lastActiveAt: 'desc' } },
         agentTokens: { select: { id: true, name: true, tokenPrefix: true, createdAt: true, lastUsedAt: true, revokedAt: true } },
+        user: true,
       },
     }),
   ]);
   const summary = all.find(i => i.id === id);
   if (!summary || !row) return null;
+  const [quarantinedBy, lifecycle, events] = await Promise.all([
+    row.quarantinedById
+      ? prisma.user.findUnique({ where: { id: row.quarantinedById }, select: { googleEmail: true } })
+      : null,
+    // What auto-park will do with the box, read with its owner's flags, as the owner's box list shows it.
+    row.user ? lifecycleViewFor(row.user, row) : null,
+    recentOperations(id),
+  ]);
   return {
+    lifecycle,
+    events,
     ...summary,
+    hibernationConfigured: row.hibernationConfigured,
+    quarantine: row.quarantinedAt ? {
+      at: row.quarantinedAt.toISOString(),
+      by: quarantinedBy?.googleEmail ?? row.quarantinedById,
+      reason: row.quarantineReason,
+      fromStatus: row.quarantineFromStatus,
+      steps: parseStepResults(row.quarantineSteps),
+      running: quarantineRunning(row.id),
+    } : null,
     projectList: row.projects.map(p => ({ id: p.id, name: p.name, archived: p.archived, lastActiveAt: p.lastActiveAt.toISOString() })),
     tokens: row.agentTokens.map(t => ({ ...t, createdAt: t.createdAt.toISOString(), lastUsedAt: t.lastUsedAt?.toISOString() ?? null, revokedAt: t.revokedAt?.toISOString() ?? null })),
     securityGroupId: row.securityGroupId, iamRoleName: row.iamRoleName,

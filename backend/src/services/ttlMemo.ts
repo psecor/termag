@@ -41,13 +41,18 @@ export function ttlMemo<T>(
  * that, or never loaded: the caller waits for the load. A failed background
  * reload keeps the old value, so a GitHub blip does not blank a dashboard;
  * the ceiling keeps a lasting failure (a revoked token) from hiding forever.
+ *
+ * `reload()` loads now, fresh or not, while callers keep getting the old
+ * value, and its result serves the next call. A load already in flight is
+ * joined: it may have started before what the caller wants to see, so a
+ * caller looking for a change checks the result and asks again.
  */
 export function swrMemo<T>(
   load: () => Promise<T>,
   freshMs: number,
   maxStaleMs: number,
   clock: () => number = Date.now,
-): () => Promise<T> {
+): (() => Promise<T>) & { reload: () => Promise<T> } {
   let value: { v: T; at: number } | null = null;
   let inflight: Promise<T> | null = null;
 
@@ -58,7 +63,7 @@ export function swrMemo<T>(
     return inflight;
   };
 
-  return () => {
+  const get = () => {
     const age = value ? clock() - value.at : Infinity;
     if (value && age < freshMs) return Promise.resolve(value.v);
     if (value && age < maxStaleMs) {
@@ -67,4 +72,5 @@ export function swrMemo<T>(
     }
     return reload();
   };
+  return Object.assign(get, { reload });
 }

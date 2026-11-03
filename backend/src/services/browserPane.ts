@@ -20,6 +20,8 @@ export const BROWSER_PANE_PROFILES_FLAG = 'browser-pane-persistent-profiles-enab
 export const BROWSER_PANE_PROFILES_CAPABILITY = 'browser-pane-profiles-v1';
 /** A box agent that can run a reviewer's guest pane (agent/browser-guest.js) and has the box's guest user. */
 export const BROWSER_PANE_GUEST_CAPABILITY = 'browser-pane-guest-v1';
+/** A box agent that answers `browser-guest-check`: a guest attach's dev-stack check, for the owner before sharing. */
+export const BROWSER_GUEST_CHECK_CAPABILITY = 'browser-guest-check-v1';
 
 /** The flag is off for this viewer and box. */
 export const BROWSER_PANE_DISABLED_CLOSE_CODE = 4403;
@@ -123,6 +125,10 @@ export function agentSupportsKeptProfiles(capabilities: readonly string[]): bool
 
 export function agentSupportsGuests(capabilities: readonly string[]): boolean {
   return capabilities.includes(BROWSER_PANE_GUEST_CAPABILITY);
+}
+
+export function agentSupportsStackCheck(capabilities: readonly string[]): boolean {
+  return capabilities.includes(BROWSER_GUEST_CHECK_CAPABILITY);
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {

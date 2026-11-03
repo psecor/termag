@@ -84,7 +84,7 @@ describe('status writes from a box', () => {
   it('refuses the t3 server session to a caller with no box (a browser session)', async () => {
     const { requireAuthOrAgentToken } = await import('../middleware/auth');
     vi.mocked(requireAuthOrAgentToken).mockImplementationOnce(async (req: Request, _res: Response, next: () => void) => {
-      req.user = { id: 'u1', unixUsername: 'ffeldberg' } as never;
+      req.user = { id: 'u1', unixUsername: 'ffeld' } as never;
       next();
     });
     expect((await post('termag-t3')).statusCode).toBe(403);

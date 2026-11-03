@@ -11,7 +11,10 @@
  *                                   working, or finished in the last day
  *   GET  /ask/targets               every project workstream the caller may
  *                                   ask, as A2A AgentCards (the extended card:
- *                                   per caller, behind the same credential)
+ *                                   per caller, behind the same credential),
+ *                                   with its session title, and the caller's
+ *                                   ask threads that have a chat
+ *                                   (`termag ask --find`)
  *   POST /ask/messages/:id/cancel   cancel a submitted or working message and
  *                                   stop its run (the asker or the target
  *                                   project's owner)

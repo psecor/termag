@@ -111,6 +111,7 @@ const INLINE_TYPES: Record<string, string> = {
   mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', ogg: 'audio/ogg', oga: 'audio/ogg', flac: 'audio/flac',
   txt: TEXT_PLAIN, md: TEXT_PLAIN, markdown: TEXT_PLAIN, json: TEXT_PLAIN, csv: TEXT_PLAIN, tsv: TEXT_PLAIN,
   log: TEXT_PLAIN, diff: TEXT_PLAIN, patch: TEXT_PLAIN, yaml: TEXT_PLAIN, yml: TEXT_PLAIN, toml: TEXT_PLAIN,
+  mmd: TEXT_PLAIN, mermaid: TEXT_PLAIN,
 };
 
 export function extensionOf(path: string): string {
@@ -146,6 +147,8 @@ const TEXT_EXTENSIONS = [
   'txt', 'md', 'markdown', 'log', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'xml',
   'sh', 'bash', 'zsh', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'go', 'rs', 'java', 'kt', 'rb', 'php', 'c', 'h',
   'cc', 'cpp', 'hpp', 'cs', 'swift', 'sql', 'css', 'scss', 'tf', 'hcl', 'proto', 'graphql', 'diff', 'patch',
+  // Mermaid: the file view draws the diagram (frontend chat/mermaid.ts).
+  'mmd', 'mermaid',
 ];
 const VIEW_TYPES: Record<string, string> = {
   ...INLINE_TYPES,

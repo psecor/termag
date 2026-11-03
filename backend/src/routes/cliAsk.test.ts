@@ -89,8 +89,44 @@ describe('POST /ask', () => {
     const res = await call('POST', '/ask', BOX, { target: 'devbox/api@fix', prompt: 'why?' });
     expect(res.status).toBe(202);
     expect(calls).toEqual([['ask', 'alice', 'i-devbox', {
-      ref: { box: 'devbox', project: 'api', workstream: 'fix' }, projectId: null, workstream: 'fix', prompt: 'why?', threadId: null, messageId: null,
+      ref: { box: 'devbox', project: 'api', workstream: 'fix', repo: null }, projectId: null, workstream: 'fix', repo: null, prompt: 'why?', threadId: null, messageId: null, title: null, sender: null, senderClaudeSession: null, targetPr: null, newBox: false, notify: true,
     }]]);
+  });
+
+  it('passes --no-notify through as notify: false, and refuses one that is not a boolean', async () => {
+    next = { status: 202, body: {} };
+    await call('POST', '/ask', BOX, { target: 'askbox/app', prompt: 'x', notify: false });
+    expect(calls[0][3]).toMatchObject({ notify: false });
+    expect((await call('POST', '/ask', BOX, { target: 'askbox/app', prompt: 'x', notify: 'no' })).status).toBe(400);
+  });
+
+  it('passes --new-box through as newBox, and refuses one that is not a boolean', async () => {
+    next = { status: 202, body: {} };
+    await call('POST', '/ask', BOX, { target: 'askbox/app', prompt: 'x', newBox: true });
+    expect(calls[0][3]).toMatchObject({ newBox: true });
+    expect((await call('POST', '/ask', BOX, { target: 'askbox/app', prompt: 'x', newBox: 'yes' })).status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("passes a multi-repo project's repository through, from the target", async () => {
+    next = { status: 202, body: { thread: 't', message: 'm' } };
+    await call('POST', '/ask', BOX, { target: 'devbox/shop@fix:shop-web', prompt: 'why?' });
+    expect(calls[0][3]).toMatchObject({ ref: { project: 'shop', workstream: 'fix', repo: 'shop-web' }, workstream: 'fix', repo: 'shop-web' });
+  });
+
+  it('passes --update-pr through as the PR it names, and refuses one that is not a PR', async () => {
+    next = { status: 202, body: {} };
+    await call('POST', '/ask', BOX, { target: 'devbox/api', prompt: 'x', pr: 'org/api#753' });
+    expect(calls[0][3]).toMatchObject({ targetPr: { number: 753, repo: 'org/api' } });
+    const bad = await call('POST', '/ask', BOX, { target: 'devbox/api', prompt: 'x', pr: 'not a pr' });
+    expect(bad.status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('passes the title through', async () => {
+    next = { status: 202, body: {} };
+    await call('POST', '/ask', BOX, { target: 'devbox/api', prompt: 'why?', title: '  Readable   names ' });
+    expect((calls[0][3] as { title: string }).title).toBe('Readable names');
   });
 
   it('records no sending box for a signed-in CLI', async () => {
@@ -173,8 +209,17 @@ describe('box-only run routes', () => {
     expect(calls[0]).toEqual(['recordResult', 'i-devbox', MSG, {
       result: 'done', sessionId: 'abc-123', isError: false, numTurns: 3, exitReason: null,
       baseSha: 'a'.repeat(40), repo: 'org/repo', bundle: true, prDescription: '# Title\n\nWhat changed.',
-      prDescriptions: { docs: '# Docs' },
+      prDescriptions: { docs: '# Docs' }, pushes: null,
     }]);
+  });
+
+  it('parse the branches a push-mode clone pushed', async () => {
+    next = { status: 202, body: { ok: true } };
+    const res = await call('POST', `/ask/runs/${MSG}/result`, BOX, {
+      result: 'done', bundle: false, pushes: [{ branch: 'termag-ada/thr1', sha: 'c'.repeat(40) }],
+    });
+    expect(res.status).toBe(202);
+    expect(calls[0][3]).toMatchObject({ bundle: false, pushes: [{ branch: 'termag-ada/thr1', sha: 'c'.repeat(40) }] });
   });
 });
 

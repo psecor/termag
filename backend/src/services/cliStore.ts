@@ -4,6 +4,7 @@
  * services/cliStorePrisma.ts.
  */
 import type { CliBox, CliProject, DeviceRow } from './cliViews';
+import { acceptsScope } from './agentTokenScopes';
 
 export interface CliUser {
   id: string;
@@ -32,7 +33,7 @@ export interface ValidatedAgentTokenLike {
 export function boxCredentialFromAgentToken(
   result: ValidatedAgentTokenLike | null,
 ): { user: CliUser; instanceId: string | null } | null {
-  if (!result?.user || result.token.scope !== 'agent') return null;
+  if (!result?.user || !acceptsScope('cliBox', result.token.scope)) return null;
   return { user: result.user, instanceId: result.instance?.id ?? null };
 }
 
@@ -53,4 +54,6 @@ export interface CliStore {
   listProjects(userId: string): Promise<CliProject[]>;
   listDevices(userId: string): Promise<DeviceRow[]>;
   revokeDevice(userId: string, id: string, now: Date): Promise<boolean>;
+  /** Whether the user is a termag admin now (services/admin/adminAccess.ts); absent, whoami says no. */
+  isAdmin?(userId: string): Promise<boolean>;
 }

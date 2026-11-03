@@ -24,8 +24,9 @@ const PAGE_SIZES = [PR_PAGE, 25, 10];
 const RATE = 'rateLimit { remaining limit resetAt }';
 
 // title and files serve path-scoped groups; reviews, comments and the ready
-// events (ready, review requested) serve the review metrics. A page of 50 costs 8 points (6 without the last three).
-const PR_FIELDS = `id number title state isDraft createdAt updatedAt mergedAt closedAt baseRefName additions deletions changedFiles body
+// events (ready, review requested) serve the review metrics; headRefOid and
+// mergeCommit join a PR to the commits deployed, at no extra points. A page of 50 costs 8 points (6 without the last three).
+const PR_FIELDS = `id number title state isDraft createdAt updatedAt mergedAt closedAt baseRefName headRefOid mergeCommit { oid } additions deletions changedFiles body
         author { login __typename }
         files(first: 100) { nodes { path } }
         commits(last: 10) { nodes { commit { messageBody authors(first: 3) { nodes { user { login } } } } } }

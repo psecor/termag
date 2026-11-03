@@ -17,11 +17,13 @@
  * matching the capture route.
  */
 import { prisma } from '../db';
-import { sessionName } from './tmux';
+import { MAX_REVIEW_SLOTS, reviewSessionName, reviewSessionNames, sessionName } from './tmux';
 import type { ProjectHost } from './agentRegistry';
 
-// `review` is the Devin PR-review pane the UI's Review button starts next to
-// the ctrl pane (routes/review.ts). It exists only while a review runs.
+// `review` is the PR-review pane the UI's Review button starts next to the
+// ctrl pane (routes/review.ts). It exists only while a review runs, and a
+// workstream has up to MAX_REVIEW_SLOTS of them:
+// the role's own name is slot 1, `<it>-<n>` the rest.
 export const SESSION_ROLES = ['agent', 'ctrl', 'data', 'data-ctrl', 'review'] as const;
 export type SessionRole = typeof SESSION_ROLES[number];
 
@@ -35,6 +37,7 @@ export function legalSessions(owner: string, projectName: string, workstreams: s
   const out: string[] = [];
   for (const ws of wsList) {
     for (const role of SESSION_ROLES) out.push(sessionName(owner, projectName, role, ws));
+    out.push(...reviewSessionNames(owner, projectName, ws).slice(1));
   }
   return out;
 }
@@ -60,6 +63,8 @@ export interface SessionAccess {
   session: string;
   role: SessionRole;
   workstream: string;
+  /** The review pane's slot (1..MAX_REVIEW_SLOTS) for role `review`; null for every other role. */
+  slot: number | null;
   isOwner: boolean;
   project: { id: string; name: string; userId: string; instanceId: string | null; ownerUsername: string; setupStatus: string };
 }
@@ -69,12 +74,23 @@ export async function assertSessionAccess(
   projectId: string,
   role: string,
   workstream: string = 'main',
+  slot?: number,
 ): Promise<SessionAccess> {
   // Role first, so a bad role is a 400 without touching the database.
   if (!isSessionRole(role)) {
     throw new SessionAccessError(400, `role must be one of: ${SESSION_ROLES.join(', ')}`);
   }
-  return (await projectSessionAccess(requesterId, projectId))(role, workstream);
+  return (await projectSessionAccess(requesterId, projectId))(role, workstream, slot);
+}
+
+/** Pure: a review slot as a request gave it, or an error. Absent is slot 1, today's one pane. */
+export function parseReviewSlot(raw: unknown): { ok: true; slot: number } | { ok: false; error: string } {
+  if (raw == null || raw === '') return { ok: true, slot: 1 };
+  const n = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : raw;
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > MAX_REVIEW_SLOTS) {
+    return { ok: false, error: `slot must be 1 to ${MAX_REVIEW_SLOTS}` };
+  }
+  return { ok: true, slot: n };
 }
 
 /**
@@ -87,7 +103,7 @@ export async function assertSessionAccess(
 export async function projectSessionAccess(
   requesterId: string,
   projectId: string,
-): Promise<(role: string, workstream?: string) => SessionAccess> {
+): Promise<(role: string, workstream?: string, slot?: number) => SessionAccess> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     include: {
@@ -106,16 +122,23 @@ export async function projectSessionAccess(
   }
 
   const known = project.workstreams.length ? project.workstreams.map(w => w.name) : ['main'];
-  return (role: string, workstream: string = 'main'): SessionAccess => {
+  return (role: string, workstream: string = 'main', slot?: number): SessionAccess => {
     if (!isSessionRole(role)) {
       throw new SessionAccessError(400, `role must be one of: ${SESSION_ROLES.join(', ')}`);
     }
+    if (slot !== undefined && (role !== 'review' || !parseReviewSlot(slot).ok)) {
+      throw new SessionAccessError(400, `slot must be 1 to ${MAX_REVIEW_SLOTS}, and only for the review role`);
+    }
     if (!known.includes(workstream)) throw new SessionAccessError(404, 'Workstream not found');
+    const reviewSlot = role === 'review' ? (slot ?? 1) : null;
     return {
       host: { userId: project.userId, instanceId: project.instanceId },
-      session: sessionName(project.user.unixUsername, project.name, role, workstream),
+      session: reviewSlot !== null
+        ? reviewSessionName(project.user.unixUsername, project.name, workstream, reviewSlot)
+        : sessionName(project.user.unixUsername, project.name, role, workstream),
       role,
       workstream,
+      slot: reviewSlot,
       isOwner,
       project: {
         id: project.id, name: project.name, userId: project.userId,
@@ -153,7 +176,9 @@ export async function terminalSessionAccess(
     throw err;
   }
   try {
-    return SESSION_ROLES.map(role => forPane(role, workstream)).find(a => a.session === session)
+    // Every review slot is a pane of its own.
+    const slots = Array.from({ length: MAX_REVIEW_SLOTS - 1 }, (_, i) => forPane('review', workstream, i + 2));
+    return [...SESSION_ROLES.map(role => forPane(role, workstream)), ...slots].find(a => a.session === session)
       ?? { refusal: 'session/project mismatch' };
   } catch (err) {
     // A workstream the project does not have.

@@ -60,7 +60,7 @@ describe('GET /api/box-update/policy', () => {
     const res = await get();
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ enabled: false, reason: 'flag-off' });
-    expect(boolVariation).toHaveBeenCalledWith(BOX_AUTO_UPDATE_FLAG, ada, false, box);
+    expect(boolVariation).toHaveBeenCalledWith(BOX_AUTO_UPDATE_FLAG, ada, false, { id: box.id, name: box.name, kind: box.kind });
     expect(vi.mocked(console.log).mock.calls.map(c => String(c[0]))).toEqual([
       "[BOX-UPDATE] policy for ada's box box-a: off (flag-off)",
     ]);
@@ -76,7 +76,25 @@ describe('GET /api/box-update/policy', () => {
     ]);
   });
 
-  it('falls back to off when the flag is not set', async () => {
+  // services/claimUpdate.ts: a box just claimed from the pool runs current main before its first launch.
+  it('says yes, whatever the flag, while the box\'s claim update runs', async () => {
+    vi.mocked(prisma.instance.findUnique).mockResolvedValueOnce({ ...box, claimUpdateStatus: 'updating', claimUpdateStartedAt: new Date() } as never);
+    const res = await get();
+    expect(res.body).toEqual({ enabled: true, reason: 'claim' });
+    expect(boolVariation).not.toHaveBeenCalled();
+    expect(vi.mocked(console.log).mock.calls.map(c => String(c[0]))).toEqual([
+      "[BOX-UPDATE] policy for ada's box box-a: enabled (claim update)",
+    ]);
+  });
+
+  it('asks the flag again once the claim update is over, or stale', async () => {
+    vi.mocked(prisma.instance.findUnique).mockResolvedValueOnce({ ...box, claimUpdateStatus: 'updated', claimUpdateStartedAt: new Date() } as never);
+    expect((await get()).body).toEqual({ enabled: false, reason: 'flag-off' });
+    vi.mocked(prisma.instance.findUnique).mockResolvedValueOnce({ ...box, claimUpdateStatus: 'updating', claimUpdateStartedAt: new Date(Date.now() - 60 * 60 * 1000) } as never);
+    expect((await get()).body).toEqual({ enabled: false, reason: 'flag-off' });
+  });
+
+  it('falls back to off when the flag has no say', async () => {
     // boolVariation's fallback argument is what an unconfigured SDK returns.
     const res = await get();
     expect(vi.mocked(boolVariation).mock.calls[0][2]).toBe(false);

@@ -5,7 +5,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../db', () => ({
   prisma: {
     project: { findFirst: vi.fn() },
-    workstream: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn(async () => ({})) },
+    projectRepo: { findMany: vi.fn(async () => []) },
+    workstream: { findUnique: vi.fn(), findMany: vi.fn(async () => []), create: vi.fn(), update: vi.fn(async () => ({})) },
     workflow: { findMany: vi.fn(async () => []), create: vi.fn() },
   },
 }));
@@ -117,6 +118,61 @@ describe('the project\'s repository', () => {
       return { ok: true, path: '/x' };
     }) as never);
     expect((await createWorkstreamFor(USER, 'p1', input)).status).toBe(201);
+  });
+});
+
+describe('a multi-repo project (docs/multi-repo-projects.md)', () => {
+  const SHOP = { ...PROJECT, name: 'shop', layout: 'workspace', setupStatus: 'ready' };
+  const REPOS = [
+    { name: 'shop-web', url: 'https://github.com/acme/shop-web.git', position: 0, setupStatus: 'ready' },
+    { name: 'shop-api', url: 'https://github.com/acme/shop-api.git', position: 1, setupStatus: 'ready' },
+  ];
+  const ROOT = '/home/psecor/termag/projects/shop';
+  const apiPr = { ...input, name: 'shop-api-pr7', branch: 'feat/x', pr: { repo: 'acme/shop-api', number: 7, sameRepo: true, headOid: 'c'.repeat(40) } };
+  beforeEach(() => {
+    vi.mocked(prisma.project.findFirst).mockResolvedValue(SHOP as never);
+    vi.mocked(prisma.projectRepo.findMany).mockResolvedValue(REPOS as never);
+    vi.mocked(registry.projectAgentCapabilities).mockReturnValue(['worktree-pr-v1', 'worktree-pr-path-v1', 'workspace-clone-v1']);
+    send.mockResolvedValue({ ok: true });
+  });
+
+  it('checks the PR out in its repository\'s worktree, the others on its branch', async () => {
+    const got = await createWorkstreamFor(USER, 'p1', apiPr);
+    expect(got.status).toBe(201);
+    const adds = send.mock.calls.filter(c => c[1] === 'git-worktree-add-pr' || c[1] === 'git-worktree-add').map(c => [c[1], (c[2] as { projectDir: string }).projectDir, (c[2] as { worktreePath: string }).worktreePath, (c[2] as { branch: string }).branch]);
+    expect(adds).toEqual([
+      ['git-worktree-add-pr', `${ROOT}/shop-api`, `${ROOT}/.worktrees/shop-api-pr7/shop-api`, 'feat/x'],
+      ['git-worktree-add', `${ROOT}/shop-web`, `${ROOT}/.worktrees/shop-api-pr7/shop-web`, 'feat/x'],
+    ]);
+    expect(send.mock.calls.some(c => c[1] === 'git-branch-state')).toBe(false);
+    expect(create).toHaveBeenCalledWith({ data: { projectId: 'p1', name: 'shop-api-pr7', branch: 'feat/x' } });
+  });
+  it('refuses a PR of a repository the project does not hold, before the box is asked anything', async () => {
+    const got = await createWorkstreamFor(USER, 'p1', { ...apiPr, pr: { ...apiPr.pr, repo: 'acme/docs' } });
+    expect(got).toEqual({ status: 409, body: { error: 'shop holds acme/shop-web, acme/shop-api, not acme/docs. Make a project for acme/docs (or un-archive one), then try again.' } });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('asks for an agent update when the box cannot put a PR worktree at a path', async () => {
+    vi.mocked(registry.projectAgentCapabilities).mockReturnValue(['worktree-pr-v1', 'workspace-clone-v1']);
+    const got = await createWorkstreamFor(USER, 'p1', apiPr);
+    expect(got.status).toBe(409);
+    expect((got.body as { error: string }).error).toMatch(/update termag on the box/);
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('reports a failed checkout as the PR\'s, naming the repository', async () => {
+    send.mockImplementation((async (_h: unknown, type: string) => {
+      if (type === 'git-worktree-add-pr') throw new Error("origin's pull/7 is 00000000, not the PR's head cccccccc");
+      return { ok: true };
+    }) as never);
+    const got = await createWorkstreamFor(USER, 'p1', apiPr);
+    expect(got).toEqual({ status: 500, body: { error: "Could not check out the pull request: shop-api: origin's pull/7 is 00000000, not the PR's head cccccccc" } });
+    expect(create).not.toHaveBeenCalled();
+  });
+  it('keeps the PR\'s branch when the row cannot be written, and drops the branches it made', async () => {
+    create.mockRejectedValueOnce(new Error('race'));
+    await expect(createWorkstreamFor(USER, 'p1', apiPr)).rejects.toThrow('race');
+    const removes = send.mock.calls.filter(c => c[1] === 'git-worktree-remove').map(c => [(c[2] as { projectDir: string }).projectDir, (c[2] as { branch?: string }).branch]);
+    expect(removes).toEqual([[`${ROOT}/shop-api`, undefined], [`${ROOT}/shop-web`, 'feat/x']]);
   });
 });
 

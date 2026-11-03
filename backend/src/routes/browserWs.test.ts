@@ -470,7 +470,15 @@ describe('handleBrowserPaneSocket: a reviewer\'s guest pane', () => {
     expect(ws.closed).toEqual({ code: 4429, reason: 'busy' });
     ws = await open(guestDeps({ requestStream: vi.fn(async () => { throw new Error('guest-stack:other-workstream'); }) }), 'share=cshare0000000001', guestUser.id);
     expect(ws.closed).toEqual({ code: 4424, reason: 'agent refused' });
-    expect(ws.sent[0].reason).toMatch(/another workstream/);
+    expect(ws.sent[0].reason).toMatch(/started from another checkout/);
+  });
+
+  it('records whose stack was in the way for the owner, and never tells the reviewer', async () => {
+    const d = guestDeps({ requestStream: vi.fn(async () => { throw new Error('guest-stack:other-workstream: started from /home/owner/src/webapp/dev-stack'); }) });
+    const ws = await open(d, 'share=cshare0000000001', guestUser.id);
+    expect(ws.closed).toEqual({ code: 4424, reason: 'agent refused' });
+    expect(JSON.stringify(ws.sent)).not.toContain('/home/owner');
+    expect(d.recordShareEvent).toHaveBeenCalledWith('cshare0000000001', 'refused', { reason: 'guest-stack:other-workstream', detail: { holder: '/home/owner/src/webapp/dev-stack' } });
   });
 
   it('relays the guest\'s blocked addresses and checkout, records a missing loopback origin once, and never answers suggest', async () => {
@@ -529,6 +537,67 @@ describe('handleBrowserPaneSocket: a reviewer\'s guest pane', () => {
     revoked = true;
     await new Promise((r) => setTimeout(r, 60));
     expect(ws2.closed).toEqual({ code: 4410, reason: 'revoked' });
+  });
+
+  describe('4d: a share from the PR\'s own checkout', () => {
+    const srcShare = { audience: 'link', granteeId: null, prHeadBranch: 'retro-mode', checkoutDir: '/home/boxuser/src/webapp' };
+    const linkCtx = (shareOver: Record<string, unknown> = srcShare) => ({ ...ctx({}, shareOver), viewerRow: { revokedAt: null } });
+
+    it('shows the share\'s checkout, and refuses its guest while that checkout is on another branch, without ending the share', async () => {
+      let onEvent: ((msg: any) => void) | null = null;
+      const d = guestDeps({ guestContext: vi.fn(async () => linkCtx() as any), requestStream: vi.fn(async (_h, _o, cb) => { onEvent = cb; return 'browser_9'; }) });
+      const ws = await open(d, 'share=cshare0000000001&url=about:blank', guestUser.id);
+      expect(d.requestStream.mock.calls[0][1]).toMatchObject({ mode: 'guest', cwd: '/home/boxuser/src/webapp' });
+      // The PR's branch, or a report the box couldn't read: left alone.
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: 'retro-mode', head: 'abc123', dirty: 0 });
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: '', head: 'abc123', dirty: 0 });
+      expect(ws.closed).toBeNull();
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: 'main', head: 'def456', dirty: 0 });
+      expect(ws.closed).toEqual({ code: 4424, reason: 'checkout-moved' });
+      expect(ws.sent).toContainEqual({ type: 'checkout', branch: 'main', head: 'def456', dirty: 0 });
+      expect(ws.sent.at(-1)).toEqual({ type: 'exit', reason: "The owner's checkout is on main now, not this pull request's retro-mode. Open the preview again once they switch back." });
+      expect(d.recordShareEvent).toHaveBeenCalledWith('cshare0000000001', 'refused', { actorId: 'u-guest', reason: 'checkout-moved' });
+    });
+
+    it('compares a branch longer than the pane shows in full', async () => {
+      const long = `ffeld/${'x'.repeat(240)}`;
+      let onEvent: ((msg: any) => void) | null = null;
+      const d = guestDeps({ guestContext: vi.fn(async () => linkCtx({ ...srcShare, prHeadBranch: long }) as any), requestStream: vi.fn(async (_h, _o, cb) => { onEvent = cb; return 'browser_9'; }) });
+      const ws = await open(d, 'share=cshare0000000001&url=about:blank', guestUser.id);
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: long, head: 'abc123', dirty: 0 });
+      expect(ws.closed).toBeNull();
+      expect(ws.sent).toContainEqual({ type: 'checkout', branch: long.slice(0, 200), head: 'abc123', dirty: 0 });
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: `${long}-other`, head: 'abc123', dirty: 0 });
+      expect(ws.closed).toEqual({ code: 4424, reason: 'checkout-moved' });
+    });
+
+    it('a detached checkout is moved too, and a share made before 4d is never compared', async () => {
+      let onEvent: ((msg: any) => void) | null = null;
+      const d = guestDeps({ guestContext: vi.fn(async () => linkCtx() as any), requestStream: vi.fn(async (_h, _o, cb) => { onEvent = cb; return 'browser_9'; }) });
+      const ws = await open(d, 'share=cshare0000000001&url=about:blank', guestUser.id);
+      onEvent!({ type: 'browser-checkout', streamId: 'browser_9', branch: 'HEAD', head: 'def456', dirty: 0 });
+      expect(ws.closed).toEqual({ code: 4424, reason: 'checkout-moved' });
+      expect(ws.sent.at(-1).reason).toMatch(/no branch \(a detached HEAD\)/);
+
+      let onOld: ((msg: any) => void) | null = null;
+      const old = guestDeps({ guestContext: vi.fn(async () => linkCtx({ audience: 'link', granteeId: null }) as any), requestStream: vi.fn(async (_h, _o, cb) => { onOld = cb; return 'browser_9'; }) });
+      const oldWs = await open(old, 'share=cshare0000000001&url=about:blank', guestUser.id);
+      onOld!({ type: 'browser-checkout', streamId: 'browser_9', branch: 'main', head: 'def456', dirty: 0 });
+      expect(oldWs.closed).toBeNull();
+    });
+
+    it('says "checkout" in the dev-stack refusals of such a share', async () => {
+      const d = guestDeps({ guestContext: vi.fn(async () => linkCtx() as any), requestStream: vi.fn(async () => { throw new Error('guest-stack:stack-not-running'); }) });
+      const ws = await open(d, 'share=cshare0000000001&url=about:blank', guestUser.id);
+      expect(ws.closed).toEqual({ code: 4424, reason: 'agent refused' });
+      expect(ws.sent[0].reason).toBe("This checkout's dev stack isn't running on the owner's box.");
+    });
+
+    it('opens the owner\'s own link on the share\'s checkout, keeping their workstream for suggestions', async () => {
+      const d = guestDeps({ guestContext: vi.fn(async () => linkCtx() as any) });
+      await open(d, 'projectId=p1&workstream=feature-x&url=about:blank&openShare=cshare0000000001', owner.id);
+      expect(d.requestStream.mock.calls[0][1]).toMatchObject({ openRecipe: { kind: 'webapp-dev-stack' }, cwd: '/home/boxuser/src/webapp' });
+    });
   });
 
   it('has a live guest redial (not end) when its share\'s recipe changes, here at once and at the next re-check anywhere else', async () => {

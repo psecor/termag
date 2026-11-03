@@ -1,8 +1,7 @@
 import { Router, RequestHandler } from 'express';
-import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
-import { listSshKeys, pushKeys, registerSshKey } from '../services/sshKeyRegistration';
+import { listSshKeys, registerSshKey, removeSshKey } from '../services/sshKeyRegistration';
 
 export function sshKeysRouter(): Router {
   const router = Router();
@@ -22,11 +21,9 @@ export function sshKeysRouter(): Router {
   };
 
   const remove: RequestHandler = async (req, res) => {
-    const result = await prisma.sshPublicKey.deleteMany({
-      where: { id: req.params.id, userId: req.user!.id },
-    });
-    if (result.count === 0) { res.status(404).json({ error: 'Key not found' }); return; }
-    res.json({ ok: true, boxes: await pushKeys(req.user!.id) });
+    const result = await removeSshKey(req.user!.id, req.params.id);
+    if (result.kind === 'not_found') { res.status(404).json({ error: 'Key not found' }); return; }
+    res.json({ ok: true, boxes: result.boxes });
   };
 
   router.get('/', requireAuth, asyncHandler(list));

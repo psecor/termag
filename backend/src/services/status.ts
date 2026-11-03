@@ -5,10 +5,12 @@ import { isAgentRunning } from './tmux';
 import { providerForSource } from '../providers/registry';
 import { parseStatusKey, statusKey } from './statusKey';
 import { CLOUD_WORKTIME_PROJECT, workTimeIdentity } from './worktimeProjects';
+import { timeZoneFor } from './userTimeZone';
+import { splitWorkTimeByDay } from './worktimeDays';
 import { isRunnerSessionShaped } from './claudeRunnerSpawn';
 import { boxOwnerUsername, primeBoxOwners } from './boxOwners';
 import { isMilestoneExpired, MILESTONE_TTL_MS } from './milestone';
-import { noteBoxActivity } from './boxActivity';
+import { noteAgentWorking } from './boxActivity';
 import { forgetTurns, moveTurns } from './sessionTurns';
 import {
   AUTO_IDLE_MESSAGE, AUTO_IDLE_MS, AUTO_IDLE_TAIL_CREDIT_MS, HYDRATE_MAX_AGE_MS, hydrateStatus, instanceKeyOf, persistRetryDelayMs, rowIsNewer, shouldPersist, toRow,
@@ -89,13 +91,11 @@ function setAutoIdleTail(key: string, tail: AutoIdleTail): void {
   autoIdleTails.set(key, tail);
 }
 
-function todayStr(d: Date = new Date()): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
 function parseSessionName(sessionName: string, instanceId: string | null = null): { username: string; project: string } | null {
-  // Format: username-project-agent
-  const m = sessionName.match(/^(.+?)-(.+)-agent$/);
+  // Format: username-project-agent. A Review pane (username-project-review, or
+  // -review-<n> for slots 2 to 8) banks under the same
+  // project; the reviewer's own source names the provider.
+  const m = sessionName.match(/^(.+?)-(.+)-(?:agent|review(?:-[2-8])?)$/);
   if (m) return { username: m[1], project: m[2] };
   // A Claude Code cloud session's runner (<boxUser>-claude-runner-s<slot>-<order>-r):
   // its time belongs to the box's owner,
@@ -106,6 +106,24 @@ function parseSessionName(sessionName: string, instanceId: string | null = null)
     return owner ? { username: owner, project: CLOUD_WORKTIME_PROJECT } : null;
   }
   return null;
+}
+
+/**
+ * Banks [startMs, endMs) by the owner's own day (services/worktimeDays.ts):
+ * a span across their midnight lands on both days, and a counted session on
+ * the last of them.
+ */
+function bankWorkTime(
+  who: { username: string; project: string; provider: string; instanceId: string | null },
+  startMs: number,
+  endMs: number,
+  opts: { sessions: boolean },
+): void {
+  const parts = splitWorkTimeByDay(startMs, endMs, timeZoneFor(who.username));
+  parts.forEach((part, i) => {
+    const identity = workTimeIdentity(who.username, who.project, who.provider, part.date, who.instanceId);
+    upsertWorkTime(identity, part.ms, { sessions: opts.sessions && i === parts.length - 1 });
+  });
 }
 
 function upsertWorkTime(
@@ -144,10 +162,8 @@ function creditAutoIdleTail(sessionName: string, instanceId: string | null): voi
   const now = Date.now();
   const tailMs = now - tail.cutAt;
   if (tailMs > AUTO_IDLE_TAIL_CREDIT_MS || tailMs < 1000) return;
-  // Banked under the day of the credit, like every other late bank — a tail
-  // that crosses midnight lands in the day the resume happened.
-  const identity = workTimeIdentity(tail.username, tail.project, tail.provider, todayStr(new Date(now)), tail.instanceId);
-  upsertWorkTime(identity, tailMs, { sessions: false });
+  // The silent stretch itself, cut at the owner's midnight like any span.
+  bankWorkTime(tail, tail.cutAt, now, { sessions: false });
 }
 
 function startWorkingTimer(sessionName: string, instanceId: string | null, source?: string): void {
@@ -182,11 +198,9 @@ function stopWorkingTimer(
 
   const durationMs = endedAt - session.startedAt;
   if (durationMs >= 1000) {
-    // The day the span ended, not now: a span banked late (hydration after a
-    // restart past midnight) belongs to the day the timer would have fired.
-    const date = todayStr(new Date(endedAt));
-    const identity = workTimeIdentity(session.username, session.project, session.provider, date, session.instanceId);
-    upsertWorkTime(identity, durationMs, { sessions: true });
+    // The span's own days, not now's: a span banked late (hydration after a
+    // restart past midnight) belongs to the days it ran.
+    bankWorkTime(session, session.startedAt, endedAt, { sessions: true });
   }
 
   // Record deadline cuts so a prompt resume can credit the silent stretch.
@@ -323,6 +337,7 @@ function armAutoIdle(sessionName: string, instanceId: string | null, delayMs: nu
         rateLimited: current.rateLimited,
         milestone: current.milestone,
         review: current.review,
+        reviews: current.reviews,
         handoff: current.handoff,
         stoppedAt: at,
       };
@@ -550,6 +565,7 @@ export function setStatus(
     // poller-driven flip of `status` must not drop it. An explicit null clears
     // it (the sweep's pane-gone / stop paths).
     review: meta.review !== undefined ? meta.review : previous?.review,
+    reviews: meta.reviews !== undefined ? meta.reviews : previous?.reviews,
     // And a handoff in flight: its route and sweep own it.
     handoff: meta.handoff !== undefined ? meta.handoff : previous?.handoff,
     // Preserve rateLimited unless explicitly provided (null clears it). A
@@ -588,7 +604,7 @@ export function setStatus(
 
   // Set auto-idle only when working
   if (status === 'working') {
-    noteBoxActivity(resolvedInstanceId);
+    noteAgentWorking(resolvedInstanceId, sessionName);
     armAutoIdle(sessionName, resolvedInstanceId, AUTO_IDLE_MS);
   } else {
     const existing = autoIdleTimers.get(key);

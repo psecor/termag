@@ -245,9 +245,10 @@ export const GUEST_REFUSAL_MESSAGES: Record<GuestRefusal, string> = {
 /**
  * What an agent's guest refusal (agent/browser-pane.js attach: `guest-…`
  * codes) becomes for the viewer: a close code, whether the pane redials, and
- * a message.
+ * a message. `checkout`: the share shows a checkout that isn't a
+ * workstream's own (4d), so its dev-stack messages say "checkout".
  */
-export function guestAttachRefusal(message: string): { code: number; retry: boolean; message: string } {
+export function guestAttachRefusal(message: string, opts: { checkout?: boolean } = {}): { code: number; retry: boolean; message: string } {
   const m = message.match(/^(?:Error: )?(guest-[a-z]+)(?::([a-z-]+))?/);
   const code = m ? m[1] : '';
   const reason = m ? m[2] : '';
@@ -264,13 +265,23 @@ export function guestAttachRefusal(message: string): { code: number; retry: bool
     case 'guest-stack': {
       const why: Record<string, string> = {
         'stack-not-running': "This workstream's dev stack isn't running on the owner's box.",
-        'other-workstream': "The dev stack running on the owner's box belongs to another workstream.",
+        // Another checkout's: another workstream's, another project's, or one
+        // outside termag's projects (~/src/webapp). The guest is never told which.
+        'other-workstream': "The dev stack running on the owner's box was started from another checkout, not this workstream's.",
         'not-a-dev-stack': "This workstream has no webapp dev stack to show.",
         'no-checkout': "This workstream's checkout isn't on the owner's box.",
         unverifiable: "The owner's box can't confirm which dev stack is running.",
         'no-origins': 'This preview names no address to show.',
         'bad-recipe': 'This preview is set up wrongly. Ask its owner to share it again.',
       };
+      if (opts.checkout) {
+        Object.assign(why, {
+          'stack-not-running': "This checkout's dev stack isn't running on the owner's box.",
+          'other-workstream': "The dev stack running on the owner's box was started from another checkout, not the one this preview shows.",
+          'not-a-dev-stack': "This checkout has no webapp dev stack to show.",
+          'no-checkout': "This checkout isn't on the owner's box any more.",
+        });
+      }
       return { code: GUEST_STACK_CLOSE_CODE, retry: false, message: why[reason] ?? 'The app this preview shows is not available.' };
     }
     case 'guest-unsafe':
@@ -284,6 +295,132 @@ export function guestAttachRefusal(message: string): { code: number; retry: bool
       // events (its owner's to read); the reviewer is told only that it failed.
       return { code: 1011, retry: false, message: "Could not start a browser on the owner's box. Try again in a moment." };
   }
+}
+
+/**
+ * An agent's refusal with the stack in the way split off: `guest-stack:<reason>:
+ * started from <dir>` (agent/browser-pane.js attach) is `{ reason:
+ * 'guest-stack:<reason>', holder: '<dir>' }`, anything else stays whole with a
+ * null holder. The holder is the owner's to read (their share's events and
+ * list); a guest is only ever told guestAttachRefusal's sentence.
+ */
+export function splitStackRefusal(message: string): { reason: string; holder: string | null } {
+  const m = message.match(/^(?:Error: )?(guest-stack:[a-z-]+): started from (.+)$/s);
+  if (!m) return { reason: message, holder: null };
+  return { reason: m[1], holder: plainDir(m[2]) };
+}
+
+/** An absolute path with nothing to print but the path, or null: what a dir from the box may be shown as. */
+function plainDir(dir: unknown): string | null {
+  if (typeof dir !== 'string' || !dir.startsWith('/') || dir.length > 1024) return null;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(dir)) return null;
+  return dir;
+}
+
+/** A stack's compose working dir as its checkout: `<checkout>/dev-stack`. */
+function checkoutOfComposeDir(dir: string): string {
+  return dir.replace(/\/dev-stack\/*$/, '') || '/';
+}
+
+/**
+ * A reviewer's last dev-stack refusal on a share, for its owner's list: when,
+ * what the reviewer was told, and the checkout whose stack was in the way.
+ * Null when there is none, when a reviewer got in after it (`lastOpenedAt` is
+ * set by a successful guest attach only), or when the share was renewed
+ * after it (`renewedAt`: sharing again, which can change its recipe, is the
+ * only way a share's recipe changes).
+ */
+export function lastStackRefusal(
+  event: { reason: string | null; detail: unknown; at: Date } | undefined,
+  share: { lastOpenedAt: Date | null; renewedAt?: Date | null; checkout: boolean },
+): { at: string; message: string; holder: string | null } | null {
+  if (!event || !event.reason || !event.reason.startsWith('guest-stack:')) return null;
+  for (const later of [share.lastOpenedAt, share.renewedAt]) {
+    if (later && later.getTime() >= event.at.getTime()) return null;
+  }
+  const holder = plainDir((event.detail as { holder?: unknown } | null)?.holder);
+  return {
+    at: event.at.toISOString(),
+    message: guestAttachRefusal(event.reason, { checkout: share.checkout }).message,
+    holder: holder ? checkoutOfComposeDir(holder) : null,
+  };
+}
+
+/** A dir on the box as its owner reads it: `/home/olive/src/webapp` is `~/src/webapp`. */
+export function homeLabel(dir: string): string {
+  const m = /^\/(?:home\/[^/]+|root)\/(.+)$/.exec(dir);
+  return m ? `~/${m[1]}` : dir;
+}
+
+/** The share dialog's look at a workstream's dev stack (routes/previewShares.ts stackCheckFor). */
+export type StackCheck =
+  /** The box couldn't be asked: offline, asleep, or an agent older than browser-guest-check-v1. */
+  | { checked: false }
+  | { checked: true; ok: true }
+  | {
+    checked: true; ok: false; reason: string; message: string;
+    /** Whose stack is in the way: its checkout, and the project's workstream that is when it is one. */
+    holder: { dir: string; workstream: string | null } | null;
+  };
+
+/**
+ * What the owner is told before sharing `workstream`'s dev stack, from the
+ * agent's `browser-guest-check` answer: whether a reviewer would get in now,
+ * and if not, why, in the owner's terms. `checkouts` are the project's live
+ * workstreams and their checkouts on the box, as sent with the check, so a
+ * stack started from one of them is named by its workstream ("Share it
+ * instead"). The agent says which (`holderWorkstream`, compared on the box,
+ * where a symlinked checkout resolves); only a name from `checkouts` counts,
+ * and an older agent's answer falls back to comparing the paths as spelled.
+ */
+export function stackCheckView(raw: unknown, ctx: { workstream: string; checkouts: Array<{ workstream: string; dir: string }> }): StackCheck {
+  if (!raw || typeof raw !== 'object') return { checked: false };
+  const r = raw as { ok?: unknown; reason?: unknown; holder?: unknown; holderWorkstream?: unknown };
+  if (r.ok === true) return { checked: true, ok: true };
+  const reason = typeof r.reason === 'string' ? r.reason : '';
+  const composeDir = plainDir(r.holder);
+  const dir = composeDir ? checkoutOfComposeDir(composeDir) : null;
+  const named = typeof r.holderWorkstream === 'string' ? ctx.checkouts.find(c => c.workstream === r.holderWorkstream) : undefined;
+  const match = named ?? (dir ? ctx.checkouts.find(c => c.dir === dir) : undefined);
+  const holder = dir ? { dir, workstream: match && match.workstream !== ctx.workstream ? match.workstream : null } : null;
+  const ws = ctx.workstream;
+  const refused = 'so a reviewer would be refused';
+  let message: string;
+  switch (reason) {
+    case 'other-workstream':
+      message = holder?.workstream
+        ? `The dev stack on your box was started from the ${holder.workstream} workstream, not ${ws}, ${refused}. Share ${holder.workstream} instead, or stop that stack and start ${ws}'s.`
+        : holder
+          ? `The dev stack on your box was started from ${homeLabel(holder.dir)}, not ${ws}'s checkout, ${refused} until ${ws}'s own stack runs.`
+          : `Something other than ${ws}'s dev stack answers on its address on your box, ${refused}.`;
+      break;
+    case 'stack-not-running':
+      message = `${ws}'s dev stack isn't running on your box, ${refused} until it is.`;
+      break;
+    case 'not-a-dev-stack':
+      message = `${ws} has no webapp dev stack. Share addresses on this box instead.`;
+      break;
+    case 'no-checkout':
+      message = `${ws}'s checkout isn't on your box.`;
+      break;
+    case 'unverifiable':
+      message = "Your box can't tell which dev stack is running right now.";
+      break;
+    default:
+      message = 'Your box could not check the dev stack.';
+  }
+  return { checked: true, ok: false, reason, message, holder };
+}
+
+/**
+ * 4d: a link share's checkout is on another branch than its PR's, so its
+ * guest is refused rather than shown it (routes/browserWs.ts). Final: the
+ * share stays, and opening it again after the owner switches back works.
+ */
+export function checkoutMovedMessage(branch: string, prBranch: string): string {
+  const shown = branch === 'HEAD' ? 'no branch (a detached HEAD)' : branch;
+  return `The owner's checkout is on ${shown} now, not this pull request's ${prBranch}. Open the preview again once they switch back.`;
 }
 
 // ── Phase 2: PR link shares ──────────────────────────────────────────────────
@@ -310,17 +447,36 @@ export function isLinkToken(v: unknown): v is string {
   return typeof v === 'string' && /^[0-9a-f]{32}$/.test(v);
 }
 
+/**
+ * An open link: a link share with no pull request behind it, made from the
+ * share dialog with nobody named, for anyone signed in to termag who opens
+ * its link. It lasts as a per-person share does (the dialog's lifetime,
+ * extendable), and never holds `activeLinkKey`, so a PR's link share of the
+ * same workstream never supersedes it.
+ */
+export function isOpenLink(share: { audience: string; prRepo: string | null; prNumber: number | null }): boolean {
+  return share.audience === 'link' && !share.prRepo && share.prNumber === null;
+}
+
 /** The value of `activeLinkKey` while a workstream's link share is live: its row id, or `<project>:main`. */
 export function activeLinkKeyOf(projectId: string, workstreamId: string | null): string {
   return workstreamId ?? `${projectId}:main`;
 }
 
-/** What a link share is for, from the server's own records (never the box's). */
+/**
+ * What a link share is for. Without 4d, from the server's own records: the
+ * project's repository and the workstream's branch. With 4d
+ * (browser-pane-pr-checkout-shares-enabled), from the PR's checkout as the
+ * box reports it (services/prCheckout.ts), so both fields are the box's
+ * report; GitHub still decides authorship, state, visibility and forks.
+ */
 export interface LinkShareTarget {
-  /** The project's repository as `owner/name` (Project.repoUrl), or null when it has none. */
+  /** The repository as `owner/name`: the project's (Project.repoUrl), or the checkout's origin (4d); null when there is none. */
   repo: string | null;
-  /** The workstream's branch (Workstream.branch). */
+  /** The branch: the workstream's (Workstream.branch), or the checkout's (4d). */
   branch: string | null;
+  /** A draft may be shared too (browser-pane-pr-draft-shares-enabled, for this repository). */
+  draftsOk?: boolean;
 }
 
 export type LinkSharePrRefusal = 'not-open' | 'draft' | 'public' | 'other-repo' | 'fork' | 'not-author' | 'other-branch' | 'no-repo';
@@ -337,11 +493,44 @@ export const LINK_SHARE_PR_MESSAGES: Record<LinkSharePrRefusal, string> = {
 };
 
 /**
- * Whether a PR may have a link share for `target`. Every link share: open, not a draft, a
- * private or internal repository, the target's own repository. A share an
+ * Whether a PR may have a link share for `target`.
+ * Every link share: open, not a draft unless
+ * the target allows drafts, a private or internal repository, the target's
+ * own repository. A share an
  * owner makes also needs them to be its author (the token's own user, read
  * now) and its head to be the workstream's branch in that repository.
  */
+/**
+ * The checks that need only GitHub (4d, item 1): run
+ * before the box is asked about checkouts, so a PR that could never be
+ * shared costs the box nothing. checkLinkSharePr repeats them.
+ */
+export function checkLinkSharePrOnGithub(
+  facts: PrFacts,
+  opts: { draftsOk?: boolean },
+): { ok: true } | { ok: false; reason: LinkSharePrRefusal; message: string } {
+  const no = (reason: LinkSharePrRefusal) => ({ ok: false as const, reason, message: LINK_SHARE_PR_MESSAGES[reason] });
+  if (facts.state !== 'OPEN') return no('not-open');
+  if (facts.isDraft && !opts.draftsOk) return no('draft');
+  if (facts.visibility !== 'PRIVATE' && facts.visibility !== 'INTERNAL') return no('public');
+  if (facts.author.id === null || facts.author.id !== facts.viewer.id) return no('not-author');
+  if (facts.crossRepo) return no('fork');
+  return { ok: true };
+}
+
+/** Why no checkout on the box could be shared for a PR (services/prCheckout.ts), as its owner is told. */
+export function checkoutRefusalMessage(reason: 'no-checkout' | 'ambiguous-checkout' | 'checkout-unreadable', pr: { repo: string; branch: string }, looked: string[]): string {
+  const where = looked.length ? ` It looked in ${looked.join(', ')}.` : '';
+  switch (reason) {
+    case 'no-checkout':
+      return `This box has no checkout of ${pr.repo} on ${pr.branch}, so there is no preview to share.${where}`;
+    case 'ambiguous-checkout':
+      return `More than one checkout of ${pr.repo} on this box is on ${pr.branch}, and none is at the pull request's head, so termag can't tell which to share.${where}`;
+    case 'checkout-unreadable':
+      return `termag couldn't read every checkout on this box just now, so it can't tell which one holds ${pr.branch}. Try again in a moment.`;
+  }
+}
+
 export function checkLinkSharePr(
   facts: PrFacts,
   target: LinkShareTarget,
@@ -350,7 +539,7 @@ export function checkLinkSharePr(
   const no = (reason: LinkSharePrRefusal) => ({ ok: false as const, reason, message: LINK_SHARE_PR_MESSAGES[reason] });
   if (!target.repo) return no('no-repo');
   if (facts.state !== 'OPEN') return no('not-open');
-  if (facts.isDraft) return no('draft');
+  if (facts.isDraft && !target.draftsOk) return no('draft');
   if (facts.visibility !== 'PRIVATE' && facts.visibility !== 'INTERNAL') return no('public');
   if (facts.repo.toLowerCase() !== target.repo.toLowerCase()) return no('other-repo');
   if (madeBy === 'owner') {
@@ -413,14 +602,22 @@ export const WAKE_MESSAGES: Record<WakeRefusal, string> = {
 };
 
 /**
- * Whether a reviewer may wake this box: only one the idle sweep hibernated and nobody has touched since,
- * never one its owner stopped or hibernated, which may hold work in progress
- * or come back without its dev stack. Null when it may; the owner's power
- * checks (boxPowerPolicy.powerRequestError) still run after this.
+ * Whether a reviewer may wake this box (Phase 2
+ * item 5): only one the idle sweep stopped (`sweepStopped`,
+ * boxLifecyclePolicy.isSweepStopped), or hibernated before parking became a
+ * stop, and nobody has touched since; never one its owner stopped or
+ * hibernated, which may hold work in progress or come back without its dev
+ * stack. Null when it may;
+ * the owner's power checks (boxPowerPolicy.powerRequestError) still run after this.
  */
-export function guestWakeRefusal(box: { status: string; lifecycleNote: string | null; autoTerminatedAt: Date | null } | null, isAutoNote: (note: string | null) => boolean): WakeRefusal | null {
+export function guestWakeRefusal(
+  box: { status: string; lifecycleNote: string | null; autoTerminatedAt: Date | null; parkedAt?: Date | null } | null,
+  isAutoNote: (note: string | null) => boolean,
+  sweepStopped: (box: { parkedAt?: Date | null; lifecycleNote: string | null }) => boolean,
+): WakeRefusal | null {
   if (!box || box.autoTerminatedAt) return 'no-box';
-  if (box.status !== 'hibernated') return box.status === 'stopped' ? 'not-auto' : 'awake';
+  if (box.status === 'stopped') return sweepStopped(box) ? null : 'not-auto';
+  if (box.status !== 'hibernated') return 'awake';
   if (!isAutoNote(box.lifecycleNote)) return 'not-auto';
   return null;
 }

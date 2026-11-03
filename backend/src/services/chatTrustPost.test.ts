@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { chatReclaimPostRefusal, chatTerminalPostRefusal, chatTrustPostRefusal, runAfterPostRefusal } from './chatTrustPost';
+import { chatReclaimPostRefusal, chatContextPostRefusal, chatTerminalPostRefusal, chatTrustPostRefusal, runAfterPostRefusal } from './chatTrustPost';
 
 const env = { FRONTEND_URL: 'https://app.termag.example.com/termag/' };
 const app = 'https://app.termag.example.com';
@@ -99,6 +99,18 @@ describe('chatReclaimPostRefusal', () => {
       secFetchSite: 'same-site', origin: sibling, contentType: 'application/x-www-form-urlencoded', body: {},
     }, env)?.status).toBe(403);
     expect(chatReclaimPostRefusal({ ...same, contentType: 'text/plain', body: { workstream: 'main' } }, env)?.status).toBe(400);
+  });
+});
+
+describe('chatContextPostRefusal', () => {
+  it('accepts same-origin JSON and rejects a form POST that would clear a chat', () => {
+    const same = { secFetchSite: 'same-origin' as const, origin: app };
+    expect(chatContextPostRefusal({ ...same, contentType: 'application/json', body: { workstream: 'main' } }, env)).toBeNull();
+    expect(chatContextPostRefusal({
+      secFetchSite: 'same-site', origin: sibling, contentType: 'application/x-www-form-urlencoded', body: {},
+    }, env)?.status).toBe(403);
+    expect(chatContextPostRefusal({ ...same, contentType: 'text/plain', body: { workstream: 'main' } }, env)?.status).toBe(400);
+    expect(chatContextPostRefusal({ ...same, contentType: 'application/json', body: ['main'] }, env)?.status).toBe(400);
   });
 });
 

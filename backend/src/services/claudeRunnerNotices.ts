@@ -69,6 +69,8 @@ export function noticeForRefusal(code: RefusalCode, input: NoticeInput): string 
       return `Your Claude Code cloud session is waiting: you have no termag box running. ${ACCESS} Then start or add a box in termag; the session is retried on its own.${links(input, true)}`;
     case 'agent-too-old':
       return `Your Claude Code cloud session is waiting: your termag box runs an agent too old for cloud sessions. It is retried once the box has updated; termag updates boxes on its own.${links(input, true)}`;
+    case 'claude-too-old':
+      return `Your Claude Code cloud session is waiting: your termag box runs a Claude Code older than termag's floor. It is retried once the box has updated Claude Code; termag asks the box to update when it can.${links(input, true)}`;
     case 'boxes-full':
       return `Your Claude Code cloud session is waiting: every box of yours already runs the most cloud sessions it can. It is retried when one ends.${links(input, true)}`;
     case 'box-claimed':

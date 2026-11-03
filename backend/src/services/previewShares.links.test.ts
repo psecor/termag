@@ -28,6 +28,10 @@ vi.mock('../db', () => {
       return { count: hit.length };
     }),
     update: vi.fn(async ({ where, data }: any) => { const s = db.shares.find(x => x.id === where.id); Object.assign(s, data); return s; }),
+    // The open-link lookup's shape (liveOpenLink): live, of one project and audience, no PR, one of the workstreams.
+    findFirst: vi.fn(async ({ where }: any) => db.shares.find(s => s.projectId === where.projectId && s.audience === where.audience
+      && (s.prRepo ?? null) === where.prRepo && (s.prNumber ?? null) === where.prNumber && !s.revokedAt && !s.endedAt
+      && s.expiresAt > where.expiresAt.gt && where.OR.some((o: any) => o.workstreamId === s.workstreamId)) ?? null),
     create: vi.fn(async ({ data }: any) => {
       if (db.failCreateOnce) {
         db.failCreateOnce = false;
@@ -120,6 +124,28 @@ describe('opening a workstream\'s link share', () => {
     const r = await store.openLinkShare(base);
     // The retry finds the other share live for the same PR, and returns it.
     expect(r).toMatchObject({ existing: true, share: { id: 'cother000000001' } });
+  });
+});
+
+describe('an open link in the store', () => {
+  const open = { projectId: 'p1', workstreamId: 'ws1', ownerId: 'u-owner', recipe: { kind: 'webapp-dev-stack' as const }, expiresAt: new Date(NOW.getTime() + 24 * 3600e3), hashFor: (id: string) => `hash-of-${id}` };
+
+  it('is a link share with no PR and no key, its token\'s hash from its own id', async () => {
+    const made = await store.createOpenLink(open);
+    expect(db.shares[0]).toMatchObject({ id: made.id, audience: 'link', linkTokenHash: `hash-of-${made.id}`, workstreamId: 'ws1' });
+    expect(db.shares[0].prRepo ?? null).toBeNull();
+    expect(db.shares[0].activeLinkKey ?? null).toBeNull();
+    expect(await store.linkShareId(`hash-of-${made.id}`)).toBe(made.id);
+  });
+
+  it('is found live for its workstream; a PR\'s link share there, or one that ended, is not it', async () => {
+    await store.openLinkShare(base);
+    expect(await store.liveOpenLink({ projectId: 'p1', workstreamIds: ['ws1'], now: NOW })).toBeNull();
+    const made = await store.createOpenLink(open);
+    expect(await store.liveOpenLink({ projectId: 'p1', workstreamIds: ['ws1'], now: NOW })).toMatchObject({ id: made.id });
+    expect(await store.liveOpenLink({ projectId: 'p1', workstreamIds: ['ws2'], now: NOW })).toBeNull();
+    db.shares.find(s => s.id === made.id).endedAt = NOW;
+    expect(await store.liveOpenLink({ projectId: 'p1', workstreamIds: ['ws1'], now: NOW })).toBeNull();
   });
 });
 

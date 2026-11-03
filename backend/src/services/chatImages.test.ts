@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CHAT_IMAGES_CAPABILITY, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
-  chatImageInput, chatImagesRefusal, checkChatImages, sniffImageType,
+  CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES,
+  chatImageInput, chatImagesRefusal, chatPdfInput, checkChatImages, pdfCount, sniffAttachmentType,
 } from './chatImages';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
@@ -9,15 +9,17 @@ const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16]);
 const GIF = Buffer.from('GIF89a\x01\x00\x01\x00', 'latin1');
 const WEBP = Buffer.from('RIFF\x10\x00\x00\x00WEBPVP8 ', 'latin1');
 const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>');
+const PDF = Buffer.from('%PDF-1.7\n%body', 'latin1');
 
-describe('sniffImageType', () => {
-  it('knows the four types by their bytes, and nothing else', () => {
-    expect(sniffImageType(PNG)).toBe('image/png');
-    expect(sniffImageType(JPEG)).toBe('image/jpeg');
-    expect(sniffImageType(GIF)).toBe('image/gif');
-    expect(sniffImageType(WEBP)).toBe('image/webp');
-    expect(sniffImageType(SVG)).toBeNull();
-    expect(sniffImageType(Buffer.alloc(0))).toBeNull();
+describe('sniffAttachmentType', () => {
+  it('knows the four image types and PDF by their bytes, and nothing else', () => {
+    expect(sniffAttachmentType(PNG)).toBe('image/png');
+    expect(sniffAttachmentType(JPEG)).toBe('image/jpeg');
+    expect(sniffAttachmentType(GIF)).toBe('image/gif');
+    expect(sniffAttachmentType(WEBP)).toBe('image/webp');
+    expect(sniffAttachmentType(PDF)).toBe('application/pdf');
+    expect(sniffAttachmentType(SVG)).toBeNull();
+    expect(sniffAttachmentType(Buffer.alloc(0))).toBeNull();
   });
 });
 
@@ -34,6 +36,15 @@ describe('checkChatImages', () => {
       { mediaType: 'image/png', data: PNG.toString('base64') },
       { mediaType: 'image/jpeg', data: JPEG.toString('base64') },
     ] });
+  });
+
+  it('takes a PDF by its bytes, keeping its file name', () => {
+    const r = checkChatImages([{ mediaType: 'image/png', data: PDF.toString('base64'), name: ' report\n.pdf ' }, { data: PNG.toString('base64'), name: 'x.png' }]);
+    expect(r).toEqual({ ok: true, images: [
+      { mediaType: 'application/pdf', data: PDF.toString('base64'), name: 'report.pdf' },
+      { mediaType: 'image/png', data: PNG.toString('base64') },
+    ] });
+    if (r.ok) expect(pdfCount(r.images)).toBe(1);
   });
 
   it('refuses what is not a list of base64 images', () => {
@@ -65,6 +76,23 @@ describe('chatImagesRefusal', () => {
     expect(chatImagesRefusal(1, false, [CHAT_IMAGES_CAPABILITY])).toMatchObject({ status: 403, code: 'images-disabled' });
     expect(chatImagesRefusal(1, true, [])).toMatchObject({ status: 409, code: 'images-unsupported' });
     expect(chatImagesRefusal(2, true, [CHAT_IMAGES_CAPABILITY])).toBeNull();
+  });
+
+  it('refuses PDFs on a runner without chat-pdfs-v1, and offers them only on one', () => {
+    expect(chatImagesRefusal(1, true, [CHAT_IMAGES_CAPABILITY], 1)).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
+    expect(chatImagesRefusal(1, true, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY], 1)).toBeNull();
+    expect(chatImagesRefusal(1, false, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY], 1)).toMatchObject({ code: 'images-disabled' });
+    expect(chatPdfInput(true, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY])).toBe(true);
+    expect(chatPdfInput(true, [CHAT_IMAGES_CAPABILITY])).toBe(false);
+    expect(chatPdfInput(false, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY])).toBe(false);
+  });
+
+  it("refuses PDFs, and does not offer them, in a chat on another model backend", () => {
+    const caps = [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY];
+    expect(chatImagesRefusal(1, true, caps, 1, 'fireworks')).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
+    expect(chatImagesRefusal(1, true, caps, 0, 'fireworks')).toBeNull();
+    expect(chatPdfInput(true, caps, 'fireworks')).toBe(false);
+    expect(chatPdfInput(true, caps, null)).toBe(true);
   });
 
   it('offers the composer images only with both', () => {

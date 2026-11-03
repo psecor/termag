@@ -21,12 +21,17 @@ type Row = Record<string, unknown>;
 /** Per model: the fields of the list's rows (routes/projects.ts listProjectsFor), and relations a nested write can change them through. */
 const WATCHED: Record<string, ReadonlySet<string>> = {
   Project: new Set([
-    'name', 'description', 'color', 'archived', 'pinned', 'kind', 'userId', 'user', 'instanceId', 'instance',
+    'name', 'description', 'color', 'archived', 'pinned', 'kind', 'createdFor', 'userId', 'user', 'instanceId', 'instance',
     'repoUrl', 'repoDefaultBranch', 'setupStatus', 'setupError', 'workstreams', 'workflows', 'shares',
+    // The list's chatTrusted: New session offers a fetched worktree Full access only on a trusted project.
+    'chatTrustedAt',
   ]),
-  Workstream: new Set(['name', 'branch', 'archived', 'sessionTitle', 'projectId', 'project', 'workflows']),
+  // chatHolder, t3ThreadId and chatSessionId: the desktop's sidebar shows who drives a chat (services/chatHolder.ts).
+  Workstream: new Set(['name', 'branch', 'archived', 'sessionTitle', 'spaceId', 'space', 'projectId', 'project', 'workflows', 'chatHolder', 't3ThreadId', 'chatSessionId']),
   Workflow: new Set(['type', 'provider', 'projectId', 'project', 'workstreamId', 'workstream']),
   ProjectShare: new Set(['projectId', 'project', 'userId', 'user']),
+  // An ask's chat is named by its thread's title, and only once the thread links it (askChat.ensureAskChat).
+  AgentThread: new Set(['title', 'chatWorkstreamId', 'chatWorkstream']),
 };
 
 /** Writes Prisma middleware sees; reads and anything else pass straight through. */
@@ -47,6 +52,7 @@ const SELECT: Record<string, Row> = {
   Workstream: { projectId: true },
   Workflow: { projectId: true },
   ProjectShare: { projectId: true, userId: true },
+  AgentThread: { projectId: true },
 };
 
 function delegate(client: PrismaLike, model: string): DelegateLike {

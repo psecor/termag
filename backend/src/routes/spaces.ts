@@ -16,7 +16,8 @@
  *
  * A box can read and write files but never manage: creating, renaming or
  * deleting a space and changing members or boxes need a person (a browser
- * session or a device login).
+ * session or a device login). A box may share a file with termag, as an
+ * editor or owner can (sharedFiles.ts).
  */
 import { Router, type Request, type RequestHandler, type Response } from 'express';
 import { asyncHandler } from '../middleware/errors';
@@ -32,7 +33,15 @@ import {
   SpacePathError, downloadResponseHeaders, movedPath, normalizeFilePath, normalizePrefix, objectKey, pathOfKey,
   uploadContentType, validateSpaceName, viewResponseHeaders,
 } from '../services/spaces/spacePaths';
-import { LastOwnerError, SpaceNameTakenError, type ChargeRef, type SpaceRecord, type SpaceStore } from '../services/spaces/spaceStore';
+import {
+  MEMORY_LOG_MAX, MemoryRequestError, lastWriters, logEntries, noteOf, putConditionOf, sinceOf, type MemoryActor, type PutCondition,
+} from '../services/spaces/spaceMemory';
+import { changedBody, currentConflict, isRealVersionId, landedCheck, sameEtag, uploadProof, uploadProofHolds } from '../services/spaces/spaceVersions';
+import {
+  LastOwnerError, SpaceNameTakenError, type ChargeRef, type FileShareRecord, type SpaceEventRecord, type SpaceRecord, type SpaceStore,
+} from '../services/spaces/spaceStore';
+import { canShareFiles, sharingDisabled } from '../services/spaces/sharedFiles';
+import { fileChangeOf, type FileChange } from '../services/spaces/spaceFileBus';
 
 export const SINGLE_PUT_MAX_BYTES = 64 * 1024 * 1024;
 export const PART_BYTES = 64 * 1024 * 1024;
@@ -62,27 +71,42 @@ export interface SpacesRouterDeps {
    * can't be read.
    */
   objects: (identity: PresignerIdentity) => Promise<SpaceObjects>;
+  /**
+   * A file was put, moved or removed (spaceFileBus.ts sends it to every
+   * process); called after the change's event is recorded, never awaited.
+   */
+  onFileChange?: (change: FileChange) => void;
   /** The spaces-enabled flag for this user. */
   enabled: (userId: string) => Promise<boolean>;
   /** The spaces-sharing-enabled flag for this user: off, adding members and invites is refused. */
   sharing: (userId: string) => Promise<boolean>;
-  /** A member's role was lowered or they left (services/automations/memorySync.ts recheckMirrorsForMember). */
+  /** A member's role was lowered or they left (services/automations/spaceSync.ts recheckMirrorsForMember). */
   onMemberChanged?: (spaceName: string, userId: string) => Promise<void>;
   /** Who is calling, from whatever the mount authenticated; null is a 401. */
   caller: (req: Request, res: Response) => SpaceCaller | null;
+  /**
+   * The space-memory-enabled flag for this user; unset
+   * or off, the memory routes answer 404 `space_memory_off`, and the box's
+   * sync then removes its local copy.
+   */
+  memoryEnabled?: (userId: string) => Promise<boolean>;
   /** The absolute browser link to a file (routes/spaceFiles.ts); unset, `files/link` answers 404. */
   fileLink?: (space: string, path: string) => string;
+  /** The secret a conditional PUT's proof is made with (spaceVersions.ts uploadProof); defaults to SESSION_SECRET. */
+  uploadSecret?: () => string;
+  /** The file-sharing kill switch (services/spaces/sharedFiles.ts); defaults to SPACE_FILE_SHARING_DISABLED. */
+  sharingDisabled?: () => boolean;
   now?: () => number;
 }
 
 interface Loaded { space: SpaceRecord; access: SpaceAccess }
 
 class HttpFailure extends Error {
-  constructor(readonly status: number, message: string, readonly code: string) { super(message); }
+  constructor(readonly status: number, message: string, readonly code: string, readonly extra: Record<string, unknown> = {}) { super(message); }
 }
 
-function fail(status: number, message: string, code: string): never {
-  throw new HttpFailure(status, message, code);
+function fail(status: number, message: string, code: string, extra: Record<string, unknown> = {}): never {
+  throw new HttpFailure(status, message, code, extra);
 }
 
 function notFound(): never {
@@ -94,10 +118,11 @@ function handler(fn: (req: Request, res: Response) => Promise<void>): RequestHan
     try {
       await fn(req, res);
     } catch (err) {
-      if (err instanceof HttpFailure) { res.status(err.status).json({ error: err.message, code: err.code }); return; }
+      if (err instanceof HttpFailure) { res.status(err.status).json({ error: err.message, code: err.code, ...err.extra }); return; }
       if (err instanceof SpacePathError) { res.status(400).json({ error: err.message, code: err.code }); return; }
       if (err instanceof SpaceNameTakenError) { res.status(409).json({ error: err.message, code: err.code }); return; }
       if (err instanceof LastOwnerError) { res.status(400).json({ error: err.message, code: err.code }); return; }
+      if (err instanceof MemoryRequestError) { res.status(400).json({ error: err.message, code: err.code }); return; }
       if (err instanceof SpacesUnavailableError) {
         res.status(503).json({ error: 'Spaces storage is unavailable right now', code: err.code });
         return;
@@ -125,6 +150,13 @@ function spaceView(space: SpaceRecord, access: SpaceAccess | null) {
 
 function bodyOf(req: Request): Record<string, unknown> {
   return req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+}
+
+/** A file's sharing state for the file view's Share button. */
+export function shareView(share: FileShareRecord | null) {
+  return share
+    ? { shared: true, sharedAt: share.createdAt.toISOString(), sharedBy: share.sharedBy ? { displayName: share.sharedBy.displayName, email: share.sharedBy.email } : null }
+    : { shared: false };
 }
 
 function baseName(path: string): string {
@@ -204,9 +236,13 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     return { space, access };
   }
 
-  function event(res: Response, space: SpaceRecord, access: SpaceAccess | null, action: string, extra: { path?: string | null; bytes?: number | bigint | null } = {}) {
+  /** Records the event; a file.put, file.mv or file.rm also goes out as a live change (`etag`: a put's new version). */
+  async function event(
+    res: Response, space: SpaceRecord, access: SpaceAccess | null, action: string,
+    { etag, ...extra }: { path?: string | null; bytes?: number | bigint | null; etag?: string | null; versionId?: string | null; note?: string | null } = {},
+  ) {
     const caller = callerOf(res);
-    return store.recordEvent({
+    await store.recordEvent({
       spaceId: space.id,
       actorUserId: caller.userId,
       actorInstanceId: caller.kind === 'box' ? caller.instanceId : null,
@@ -214,6 +250,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       action,
       ...extra,
     });
+    const change = deps.onFileChange ? fileChangeOf(space.id, action, extra.path ?? null, etag ?? null) : null;
+    if (change) deps.onFileChange!(change);
   }
 
   // ---- spaces ----
@@ -223,7 +261,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     if (caller.kind === 'user') {
       await store.claimInvites(caller.userId);
       const rows = await store.spacesOfUser(caller.userId);
-      const spaces = await Promise.all(rows.map(async r => spaceView(r.space, await accessFor(caller, r.space))));
+      const spaces = await Promise.all(rows.map(async r => ({ ...spaceView(r.space, await accessFor(caller, r.space)), memberCount: r.memberCount })));
       res.json({ spaces });
       return;
     }
@@ -367,14 +405,22 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
   router.get('/:space/boxes', handler(async (req, res) => {
     const caller = callerOf(res);
     const { space } = await load(req, res, 'viewer');
-    const grants = (await store.grants(space.id)).filter(g => g.box.status !== 'terminated');
+    const all = await store.grants(space.id);
+    const grants = all.filter(g => g.box.status !== 'terminated');
     const candidates = caller.kind === 'user' ? await store.boxesOwnedBy(caller.userId) : [];
     const boxes = grants.map(g => ({
       id: g.box.id, name: g.box.name, kind: g.box.kind, status: g.box.status, ownerEmail: g.box.ownerEmail,
       mine: g.box.userId === caller.userId,
       children: childBoxesOf(g.box.id, candidates).map(c => ({ id: c.id, name: c.name, via: g.box.id })),
     }));
-    res.json({ boxes });
+    // Boxes whose projects stay listed here though no live grant reaches them:
+    // terminated ones (recorded, or whose grants the sweep hasn't recorded and
+    // pruned yet), and live children of a terminated parent.
+    const reached = new Set(boxes.flatMap(b => [b.id, ...b.children.map(c => c.id)]));
+    const gone = all.filter(g => g.box.status === 'terminated').map(g => g.box.id);
+    const listed = [...new Set([...gone, ...await store.listedBoxes(space.id)])]
+      .filter(id => !reached.has(id)).sort().map(id => ({ id }));
+    res.json({ boxes, listed });
   }));
 
   router.post('/:space/boxes', handler(async (req, res) => {
@@ -412,14 +458,19 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
     const recursive = req.query.recursive === '1' || req.query.recursive === 'true';
     const objects = await objectsFor(res);
-    const listed = await objects.list(objectKey(space.id, prefix), { cursor, delimiter: !recursive });
+    const [listed, shared] = await Promise.all([
+      objects.list(objectKey(space.id, prefix), { cursor, delimiter: !recursive }),
+      store.sharedPaths(space.id),
+    ]);
     res.json({
       prefix,
       dirs: listed.prefixes.map(k => pathOfKey(space.id, k)).filter((p): p is string => p !== null)
         .map(path => ({ name: baseName(path), path })),
       files: listed.files.flatMap(f => {
         const path = pathOfKey(space.id, f.key);
-        return path === null || path.endsWith('/') ? [] : [{ name: baseName(path), path, size: f.size, modifiedAt: f.modifiedAt, etag: f.etag }];
+        return path === null || path.endsWith('/') ? [] : [{
+          name: baseName(path), path, size: f.size, modifiedAt: f.modifiedAt, etag: f.etag, ...(shared.has(path) ? { shared: true } : {}),
+        }];
       }),
       nextCursor: listed.nextCursor,
     });
@@ -442,8 +493,36 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     await event(res, space, access, 'file.get', { path, bytes: head.size });
     res.json({
       ...url, size: head.size, contentType: head.contentType,
-      ...(body.view === true ? { view: view ? { contentType: view.contentType, render: view.render } : null } : {}),
+      // The version served, so a later write can say it read this one.
+      ...(head.etag ? { etag: head.etag } : {}), ...(head.versionId ? { versionId: head.versionId } : {}),
+      ...(body.view === true ? {
+        view: view ? { contentType: view.contentType, render: view.render } : null,
+        share: { ...shareView(await store.fileShare(space.id, path)), canShare: canShareFiles(access) },
+      } : {}),
     });
+  }));
+
+  // Sharing one file read-only with anyone signed in to termag (services/spaces/sharedFiles.ts).
+  // A box may share too; the row names its owner, the event the box.
+  router.put('/:space/files/share', handler(async (req, res) => {
+    const caller = callerOf(res);
+    const { space, access } = await load(req, res, 'editor');
+    if (!canShareFiles(access)) fail(403, `You can't share files in ${space.name}`, 'forbidden');
+    if ((deps.sharingDisabled ?? sharingDisabled)()) fail(403, 'Sharing files is turned off on this termag', 'sharing_off');
+    const path = normalizeFilePath(bodyOf(req).path);
+    if (!await (await objectsFor(res)).head(objectKey(space.id, path))) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+    const before = await store.fileShare(space.id, path);
+    const share = before ?? await store.addFileShare(space.id, path, caller.userId);
+    if (!before) await event(res, space, access, 'file.share', { path });
+    res.json(shareView(share));
+  }));
+
+  router.delete('/:space/files/share', handler(async (req, res) => {
+    const { space, access } = await load(req, res, 'editor');
+    if (!canShareFiles(access)) fail(403, `You can't change sharing in ${space.name}`, 'forbidden');
+    const path = normalizeFilePath(req.query.path);
+    if (await store.removeFileShares(space.id, { path }) > 0) await event(res, space, access, 'file.unshare', { path });
+    res.json(shareView(null));
   }));
 
   router.post('/:space/files/link', handler(async (req, res) => {
@@ -462,19 +541,25 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const path = normalizeFilePath(body.path);
     const size = await checkDeclaredSize(space, body.size);
     const contentType = uploadContentType(body.contentType);
+    // The version the writer read: checked here, signed into the PUT, and checked again on the confirm.
+    const condition = putConditionOf(body);
     const key = objectKey(space.id, path);
     throttle(caller);
     const objects = await objectsFor(res);
+    if (condition) await refuseIfChanged(res, { space, access }, path, condition, await objects.head(key));
     if (size <= SINGLE_PUT_MAX_BYTES) {
       await charge(space, size, PUT_TTL_S, { key });
-      const put = await objects.presignPut(key, size, contentType);
+      const proof = condition ? uploadProof(proofSecret(), { spaceId: space.id, path, caller: proofCaller(caller), condition }) : null;
+      const put = await objects.presignPut(key, size, contentType, condition, proof);
       // A client may PUT and never call /uploaded, so the signing is the event that is always there.
       await event(res, space, access, 'file.put.signed', { path, bytes: size });
-      res.json({ kind: 'single', path, ...put });
+      // `conditional` tells the CLI this orchestrator signed the condition; an older one ignores it and writes blind.
+      res.json({ kind: 'single', path, ...put, ...(condition ? { conditional: true } : {}) });
       return;
     }
     const uploadId = await objects.createMultipart(key, contentType);
-    res.json({ kind: 'multipart', path, uploadId, partBytes: PART_BYTES, partCount: Math.ceil(size / PART_BYTES) });
+    // A multipart upload's condition goes again with its complete, where S3 assembles the object.
+    res.json({ kind: 'multipart', path, uploadId, partBytes: PART_BYTES, partCount: Math.ceil(size / PART_BYTES), ...(condition ? { conditional: true } : {}) });
   }));
 
   function overQuota(space: SpaceRecord): never {
@@ -511,21 +596,121 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
    * recorded (its last-modified time is not after the newest file.put for the
    * path) records nothing.
    */
-  async function recordPut(res: Response, loaded: Loaded, path: string, objects: SpaceObjects): Promise<number> {
+  async function recordPut(res: Response, loaded: Loaded, path: string, objects: SpaceObjects, note: string | null = null) {
     const head = await objects.head(objectKey(loaded.space.id, path));
     if (!head) fail(409, `${path} was not uploaded`, 'not_uploaded');
     const counted = head.lastModified ? await store.lastPutAt(loaded.space.id, path) : null;
-    if (counted && head.lastModified && counted >= head.lastModified) return head.size;
-    await event(res, loaded.space, loaded.access, 'file.put', { path, bytes: head.size });
-    return head.size;
+    if (counted && head.lastModified && counted >= head.lastModified) return head;
+    await event(res, loaded.space, loaded.access, 'file.put', { path, bytes: head.size, etag: head.etag, versionId: head.versionId ?? null, note });
+    return head;
+  }
+
+  /** 412 `changed`, with who wrote the file last and when, unless the current version satisfies the condition. */
+  async function refuseIfChanged(res: Response, loaded: Loaded, path: string, condition: PutCondition, current: { etag?: string | null } | null): Promise<void> {
+    const conflict = currentConflict(condition, current ? { etag: current.etag ?? null } : null);
+    if (conflict) await failChanged(loaded, path, condition, conflict.now);
+  }
+
+  async function failChanged(loaded: Loaded, path: string, condition: PutCondition, now: string | null): Promise<never> {
+    const last = await store.lastWrite(loaded.space.id, path);
+    let who: { by: string | null; box: string | null; at: Date } | null = null;
+    if (last) {
+      const member = (await store.members(loaded.space.id)).find(m => m.userId === last.actorUserId);
+      const box = last.actorInstanceId ? (await store.box(last.actorInstanceId))?.name ?? null : null;
+      who = { by: member?.user.email ?? null, box, at: last.at };
+    }
+    const { error, code, ...extra } = changedBody(loaded.space.name, path, condition, now, who);
+    fail(412, error, code, extra);
+  }
+
+  /** Who a proof is signed for: a person, or one of their boxes. */
+  const proofCaller = (c: SpaceCaller) => (c.kind === 'box' ? `${c.userId}/${c.instanceId}` : c.userId);
+  const proofSecret = () => (deps.uploadSecret ? deps.uploadSecret() : process.env.SESSION_SECRET ?? 'dev-secret');
+
+  /**
+   * The confirm's check (spaceVersions.ts landedCheck): the write landed on
+   * the version its writer expected, or the version it replaced is put back
+   * and the answer is 412. For any storage that ignored the condition.
+   *
+   * `ours` is the version this confirm says it wrote. From a multipart
+   * complete it is S3's answer (`trusted`). From a single PUT's confirm it is
+   * the client's word, so the version must carry this caller's proof for
+   * this path and condition (uploadProof, signed into the PUT) before
+   * anything acts on it: a confirm naming someone else's version is 412,
+   * with nothing copied and nothing recorded. A restore copies only while
+   * ours is still the current version (CopyObject If-Match): a write that
+   * landed after the check stays, and the 412 names it. A restore that
+   * happens is recorded (`file.put.reverted`), goes out as a live change, and
+   * its 412 names the restored copy's ETag, the version current now.
+   */
+  async function checkLanded(res: Response, loaded: Loaded, path: string, objects: SpaceObjects, condition: PutCondition | null, ours: string | null, trusted = false): Promise<void> {
+    if (!condition) return;
+    const key = objectKey(loaded.space.id, path);
+    const versions = await objects.versionsOf(key, 10);
+    const named = ours ? versions.find(v => !v.deleteMarker && v.etag !== null && sameEtag(v.etag, ours)) : undefined;
+    if (!trusted && named && isRealVersionId(named.versionId)) {
+      const proof = await objects.uploadProofOf(key, named.versionId!);
+      if (!uploadProofHolds(proofSecret(), proof, { spaceId: loaded.space.id, path, caller: proofCaller(callerOf(res)), condition })) {
+        await failChanged(loaded, path, condition, versions.find(v => !v.deleteMarker)?.etag ?? null);
+      }
+    }
+    const check = landedCheck(condition, versions, ours);
+    if (check.ok) return;
+    if (check.restore?.kind === 'version') {
+      let restored: string | null = null;
+      try {
+        restored = (await objects.restoreVersion(key, check.restore.versionId, named?.etag ?? ours)).etag;
+      } catch (err) {
+        if (!preconditionFailed(err)) throw err;
+        // Someone wrote after the check: theirs stays current, and is what the 412 names.
+        await failChanged(loaded, path, condition, (await objects.head(key))?.etag ?? null);
+      }
+      const now = restored ?? (await objects.head(key))?.etag ?? check.now;
+      await event(res, loaded.space, loaded.access, 'file.put.reverted', { path, etag: now });
+      await failChanged(loaded, path, condition, now);
+    }
+    await failChanged(loaded, path, condition, check.now);
+  }
+
+  /** Whether storage refused a conditional request (412 PreconditionFailed). */
+  function preconditionFailed(err: unknown): boolean {
+    const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+    return e?.$metadata?.httpStatusCode === 412 || e?.name === 'PreconditionFailed';
   }
 
   router.post('/:space/files/uploaded', handler(async (req, res) => {
     const loaded = await load(req, res, 'editor');
     throttle(callerOf(res));
-    const path = normalizeFilePath(bodyOf(req).path);
-    const size = await recordPut(res, loaded, path, await objectsFor(res));
-    res.json({ ok: true, path, size });
+    const body = bodyOf(req);
+    const path = normalizeFilePath(body.path);
+    const note = noteOf(body.note);
+    const condition = putConditionOf(body);
+    const objects = await objectsFor(res);
+    // `etag`: what the PUT answered, which finds this write among the versions.
+    await checkLanded(res, loaded, path, objects, condition, typeof body.etag === 'string' && body.etag.length <= 200 ? body.etag : null);
+    const head = await recordPut(res, loaded, path, objects, note);
+    res.json({ ok: true, path, size: head.size, ...(head.etag ? { etag: head.etag } : {}), ...(head.versionId ? { versionId: head.versionId } : {}) });
+  }));
+
+  /**
+   * The file's current version, for the file view's one-off checks:
+   * once when it opens, and once each time
+   * frames may have been missed (a reconnect, a resync). `ETag` is S3's, and
+   * an `If-None-Match` that still matches is a 304 with no body. Nothing
+   * polls it. No presign, so no rate limit.
+   */
+  router.get('/:space/files/head', handler(async (req, res) => {
+    const { space } = await load(req, res, 'viewer');
+    const path = normalizeFilePath(req.query.path);
+    const head = await (await objectsFor(res)).head(objectKey(space.id, path));
+    if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+    res.set('Cache-Control', 'no-store');
+    if (head.etag) {
+      res.set('ETag', head.etag);
+      const sent = req.get('If-None-Match');
+      if (sent && sent.split(',').map(t => t.trim()).includes(head.etag)) { res.status(304).end(); return; }
+    }
+    res.json({ path, size: head.size, modifiedAt: head.lastModified?.toISOString() ?? null, etag: head.etag ?? null });
   }));
 
   router.post('/:space/uploads/:uploadId/parts', handler(async (req, res) => {
@@ -559,9 +744,19 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       fail(400, 'parts must be [{partNumber, etag}]', 'invalid_parts');
     }
     const objects = await objectsFor(res);
-    await objects.completeMultipart(objectKey(loaded.space.id, path), String(req.params.uploadId), parts as Array<{ partNumber: number; etag: string }>);
-    const size = await recordPut(res, loaded, path, objects);
-    res.json({ ok: true, path, size });
+    const condition = putConditionOf(body);
+    const key = objectKey(loaded.space.id, path);
+    if (condition) await refuseIfChanged(res, loaded, path, condition, await objects.head(key));
+    let ours: string | null = null;
+    try {
+      ours = (await objects.completeMultipart(key, String(req.params.uploadId), parts as Array<{ partNumber: number; etag: string }>, condition)).etag;
+    } catch (err) {
+      if (condition && preconditionFailed(err)) await failChanged(loaded, path, condition, (await objects.head(key))?.etag ?? null);
+      throw err;
+    }
+    await checkLanded(res, loaded, path, objects, condition, ours, true);
+    const head = await recordPut(res, loaded, path, objects);
+    res.json({ ok: true, path, size: head.size, ...(head.etag ? { etag: head.etag } : {}), ...(head.versionId ? { versionId: head.versionId } : {}) });
   }));
 
   router.delete('/:space/uploads/:uploadId', handler(async (req, res) => {
@@ -591,6 +786,10 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const to = isDir ? normalizePrefix(body.to) : normalizeFilePath(body.to);
     if (from === to) fail(400, 'from and to are the same', 'same_path');
     if (isDir && to.startsWith(from)) fail(400, 'Cannot move a folder into itself', 'invalid_move');
+    // A file's move can name the version it read (`ifMatch`) and that the destination must be new (`ifNoneMatch`); a folder's can't.
+    const condition = putConditionOf({ ifMatch: body.ifMatch });
+    const destNew = body.ifNoneMatch === '*';
+    if (isDir && (condition || destNew)) fail(400, 'A folder move checks no versions; move its files one by one to check them', 'invalid_condition');
     const objects = await objectsFor(res);
 
     let sources: Array<{ key: string; size: number }>;
@@ -600,6 +799,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       sources = found.keys;
     } else {
       const head = await objects.head(objectKey(space.id, from));
+      if (condition) await refuseIfChanged(res, { space, access }, from, condition, head);
+      if (destNew) await refuseIfChanged(res, { space, access }, to, { ifNoneMatch: '*' }, await objects.head(objectKey(space.id, to)));
       sources = head ? [{ key: objectKey(space.id, from), size: head.size }] : [];
     }
     if (sources.length === 0) fail(404, `Nothing at ${from} in ${space.name}`, 'file_not_found');
@@ -612,10 +813,17 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       const path = pathOfKey(space.id, s.key);
       if (path === null) continue;
       const dest = objectKey(space.id, movedPath(from, to, path));
-      await objects.copy(s.key, dest);
+      try {
+        await objects.copy(s.key, dest, { sourceIfMatch: condition?.ifMatch ?? null });
+      } catch (err) {
+        if (condition && preconditionFailed(err)) await failChanged({ space, access }, from, condition, (await objects.head(s.key))?.etag ?? null);
+        throw err;
+      }
       moved.push(s.key);
     }
     const failed = await objects.deleteKeys(moved);
+    // A share is of a path; the file at its new path starts private.
+    await store.removeFileShares(space.id, isDir ? { prefix: from } : { path: from });
     await event(res, space, access, 'file.mv', { path: `${from} -> ${to}`, bytes: total });
     res.json({ ok: failed.length === 0, moved: moved.length, failed: failed.map(k => pathOfKey(space.id, k)) });
   }));
@@ -623,6 +831,10 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
   router.delete('/:space/files', handler(async (req, res) => {
     const { space, access } = await load(req, res, 'editor');
     const recursive = req.query.recursive === '1' || req.query.recursive === 'true';
+    const note = noteOf(req.query.note);
+    // A file's delete can name the version it read; checked by HEAD just before (a recursive one checks none).
+    const condition = putConditionOf({ ifMatch: req.query.ifMatch });
+    if (recursive && condition) fail(400, 'A folder delete checks no versions', 'invalid_condition');
     const objects = await objectsFor(res);
     let keys: string[];
     let label: string;
@@ -633,13 +845,60 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       label = prefix;
     } else {
       const path = normalizeFilePath(req.query.path);
-      if (!await objects.head(objectKey(space.id, path))) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+      const head = await objects.head(objectKey(space.id, path));
+      if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+      if (condition) await refuseIfChanged(res, { space, access }, path, condition, head);
       keys = [objectKey(space.id, path)];
       label = path;
     }
     const failed = keys.length ? await objects.deleteKeys(keys) : [];
-    await event(res, space, access, 'file.rm', { path: label });
+    await store.removeFileShares(space.id, recursive ? { prefix: label } : { path: label });
+    await event(res, space, access, 'file.rm', { path: label, note });
     res.json({ ok: failed.length === 0, deleted: keys.length - failed.length, failed: failed.map(k => pathOfKey(space.id, k)) });
+  }));
+
+  // ---- space memory ----
+
+  /** The names behind events: members by user id, boxes by id (looked up once each). */
+  async function memoryActors(space: SpaceRecord, events: SpaceEventRecord[]) {
+    const members = new Map((await store.members(space.id)).map(m => [m.userId, m.user]));
+    const boxIds = [...new Set(events.flatMap(e => (e.actorInstanceId ? [e.actorInstanceId] : [])))];
+    const boxes = new Map(await Promise.all(boxIds.map(async id => [id, (await store.box(id))?.name ?? null] as const)));
+    return (e: SpaceEventRecord): MemoryActor => {
+      const user = members.get(e.actorUserId);
+      return { userId: e.actorUserId, email: user?.email ?? null, name: user?.displayName ?? null, box: e.actorInstanceId ? boxes.get(e.actorInstanceId) ?? null : null };
+    };
+  }
+
+  async function loadMemory(req: Request, res: Response): Promise<Loaded> {
+    const loaded = await load(req, res, 'viewer');
+    if (!deps.memoryEnabled || !await deps.memoryEnabled(callerOf(res).userId)) {
+      fail(404, 'Space memory is not turned on for you', 'space_memory_off');
+    }
+    return loaded;
+  }
+
+  // What the box's sync needs beside the files: the caller's role, and the last writer of each memory file.
+  router.get('/:space/memory', handler(async (req, res) => {
+    const { space, access } = await loadMemory(req, res);
+    // The whole history: .termag/ events are never pruned.
+    const since = new Date(0);
+    const events = await store.memoryEvents(space.id, { since, limit: MEMORY_LOG_MAX * 4 });
+    const writers = lastWriters(events, await memoryActors(space, events));
+    res.json({
+      space: space.name, role: access.role, readOnly: access.readOnly,
+      writable: roleAtLeast(access.role, 'editor') && !access.readOnly,
+      me: callerOf(res).userId, writers,
+    });
+  }));
+
+  // `termag space memory log`: every member may read the history of the memory their agents load.
+  router.get('/:space/memory/log', handler(async (req, res) => {
+    const { space } = await loadMemory(req, res);
+    const since = sinceOf(req.query.since, now()) ?? new Date(now() - 7 * 24 * 60 * 60 * 1000);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), MEMORY_LOG_MAX);
+    const events = await store.memoryEvents(space.id, { since, limit: limit * 2 });
+    res.json({ space: space.name, since: since.toISOString(), entries: logEntries(events, await memoryActors(space, events)).slice(0, limit) });
   }));
 
   // ---- audit ----
@@ -654,6 +913,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
         id: e.id, at: e.at.toISOString(), action: e.action, path: e.path ?? null,
         bytes: e.bytes === null || e.bytes === undefined ? null : Number(e.bytes),
         actorUserId: e.actorUserId, actorInstanceId: e.actorInstanceId ?? null, via: e.via ?? null,
+        ...(e.versionId ? { versionId: e.versionId } : {}), ...(e.note ? { note: e.note } : {}),
       })),
     });
   }));

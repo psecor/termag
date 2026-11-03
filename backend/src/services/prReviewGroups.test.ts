@@ -18,7 +18,7 @@ const numbered = (over: Partial<NumberedPr> = {}): NumberedPr => {
   const o = over.open === undefined ? open({ repo: over.repo ?? 'example-org/termag', number: over.number ?? 646 }) : over.open;
   return {
     repo: 'example-org/termag', number: 646, found: true, state: 'OPEN', open: o, title: o?.title ?? 'Bridge', url: o?.url ?? 'u', author: o?.author ?? 'dev',
-    headRefName: 'desktop-bridge', baseRefName: 'main', mergedAt: null, closedAt: null, yourReview: null, ...over,
+    headRefName: 'desktop-bridge', baseRefName: 'main', mergedAt: null, closedAt: null, yourReview: null, reviewers: null, ...over,
   };
 };
 const group = (members: { repo: string; number: number; note?: string | null; title?: string }[], over: Partial<{ id: string; closedAt: string | null }> = {}) => ({
@@ -107,6 +107,17 @@ describe('assembleGroups', () => {
     expect(g.members[0].row?.lane).toBe('ready_to_merge');
     expect(g.members[0].row?.askedYou).toBeUndefined();
     expect(g.members[0].checked).toBe(false);
+  });
+  it('serves who reviewed an open member, and nothing for a merged one or when GitHub could not be read', () => {
+    const who = { approved: ['alice'], changes: [], commented: ['carol'], botsApproved: ['cursor'], botsChanges: [] };
+    const g = group([{ repo: 'o/r', number: 1 }, { repo: 'o/r', number: 2 }]);
+    const [read] = assembleGroups([g], fetched(
+      numbered({ repo: 'o/r', number: 1, open: open({ repo: 'o/r', number: 1 }), reviewers: who }),
+      numbered({ repo: 'o/r', number: 2, state: 'MERGED', open: null, mergedAt: 'x', reviewers: who }),
+    ), [], 'me');
+    expect(read.members.map(m => m.reviewers)).toEqual([who, null]);
+    const [unread] = assembleGroups([g], null, [openRow(open({ repo: 'o/r', number: 1 }), 'needs_my_review')], 'me');
+    expect(unread.members.map(m => m.reviewers)).toEqual([null, null]);
   });
   it('is done once every member is checked off, and an empty group never is', () => {
     const merged = numbered({ ...BRIDGE, state: 'MERGED', open: null, mergedAt: '2026-10-24T02:00:00Z' });

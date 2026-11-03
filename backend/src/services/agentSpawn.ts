@@ -5,7 +5,8 @@
  * no RPCs — routes/spawns.ts does those and calls in here.
  */
 import { PROVIDERS } from '../providers/registry';
-import { isBranchName } from './repoCreate';
+import { isBranchName, isNewBranchName } from './repoCreate';
+import { isRunName } from './automations/schedule';
 import { parseRepoUrl } from './projectTemplates';
 
 export const SPAWN_FLAG = 'agent-spawn-enabled';
@@ -37,6 +38,8 @@ export interface SpawnRequest {
   name?: string;
   provider?: string;
   baseRef?: string;
+  /** Workstream target: the git branch, which may hold `/` (default: the name). */
+  branch?: string;
   /** Workstream target: the project to branch in (default: the caller's). */
   projectId?: string;
   /** Project target: the box (default: the caller's). */
@@ -101,6 +104,7 @@ export function parseSpawnRequest(raw: unknown): Parsed<SpawnRequest> {
     name: optString(body, 'name', MAX_NAME),
     provider: optString(body, 'provider', 40),
     baseRef: optString(body, 'baseRef', 200),
+    branch: optString(body, 'branch', 200),
     projectId: optString(body, 'projectId', 100),
     boxId: optString(body, 'boxId', 100),
     repoUrl: optString(body, 'repoUrl', 500),
@@ -111,9 +115,11 @@ export function parseSpawnRequest(raw: unknown): Parsed<SpawnRequest> {
   if (v.name && !NAME.test(v.name)) return { ok: false, error: 'name must be alphanumeric with dashes/underscores only' };
   if (v.name === 'main') return { ok: false, error: '"main" is reserved for the default workstream' };
   if (v.baseRef && !isBranchName(v.baseRef)) return { ok: false, error: 'baseRef contains disallowed characters' };
+  if (v.branch && !isNewBranchName(v.branch)) return { ok: false, error: 'branch contains disallowed characters' };
   if (target === 'workstream' && (v.boxId || v.repoUrl)) return { ok: false, error: 'boxId and repoUrl need target: "project"' };
   if (target === 'project' && v.projectId) return { ok: false, error: 'projectId is for target: "workstream"' };
   if (target === 'project' && v.baseRef) return { ok: false, error: 'baseRef is for target: "workstream"' };
+  if (target === 'project' && v.branch) return { ok: false, error: 'branch is for target: "workstream"' };
   if (v.repoUrl) {
     // Checked here, before the spawn row and brief exist, not by the project
     // create after them: a refused URL must leave no failed spawn behind.
@@ -184,6 +190,20 @@ export function slugFromTask(task: string): string {
   }
   if (!slug) slug = (words[0] ?? '').slice(0, 32);
   return slug && slug !== 'main' ? slug : 'task';
+}
+
+/**
+ * A workstream name from a branch: every run of `/` or other characters a name
+ * cannot hold becomes one `-` (`skz/ABC-123/fix` → `skz-ABC-123-fix`), at most
+ * 40 characters; '' when nothing usable is left, or when it would be `main` or
+ * an automation run's name (`run/20261020/0900`), which createWorkstreamFor
+ * refuses. The name is a directory and a tmux session part, so it never takes a
+ * `/`. The frontend's workstreamNameFromBranch is the same rule at the UI's 64
+ * characters.
+ */
+export function nameFromBranch(branch: string): string {
+  const name = branch.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, MAX_NAME).replace(/-$/, '');
+  return name === 'main' || isRunName(name) ? '' : name;
 }
 
 /** `base`, else `base-2`, `base-3`, … whichever is not taken (case-insensitive, like branch names on a Mac). */

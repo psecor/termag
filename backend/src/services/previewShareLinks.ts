@@ -19,10 +19,10 @@ import { prisma } from '../db';
 import { readGithubAccess } from './credentialStore';
 import { GithubApiError } from './githubCredential';
 import { editComment, fetchPrFacts, fetchPrScope, parsePrRef, postComment, type PrFacts, type PrRef, type PrScope } from './prReview';
-import { endedCommentBody, GUEST_REFUSAL_MESSAGES, guestWakeRefusal, previewCommentBody, WAKE_MESSAGES, type WakeRefusal } from './previewShareRules';
+import { endedCommentBody, GUEST_REFUSAL_MESSAGES, guestWakeRefusal, isOpenLink, previewCommentBody, WAKE_MESSAGES, type WakeRefusal } from './previewShareRules';
 import { PowerRequestConflict, requestPower } from './boxPower';
 import { powerRequestError } from './boxPowerPolicy';
-import { isAutoHibernateNote } from './boxLifecyclePolicy';
+import { isAutoHibernateNote, isSweepStopped } from './boxLifecyclePolicy';
 import { isBoxProvisioningConfigured } from './boxProvisioner';
 import { notifyWorkspaceChange } from './workspaceEvents';
 import {
@@ -30,6 +30,7 @@ import {
 } from './previewShares';
 import { getSlackApp } from '../slack/app';
 import { slackIdFor } from './briefing/slack';
+import { traceSweep } from './tracing/spans';
 
 export const LINK_SHARE_SWEEP_MS = 5 * 60 * 1000;
 const GITHUB_TIMEOUT_MS = 20_000;
@@ -200,7 +201,7 @@ let sweeping = false;
  * not bring it back), as does its expiry. A PR the owner's token can no
  * longer read (no token, a 401, a 404) ends it too, and the owner is told; a
  * GitHub that fails otherwise is tried again next pass. An open PR's head
- * commit is kept for the guest header.
+ * commit is kept for the guest header. An open link (no PR) only expires.
  */
 export async function runLinkShareSweep(now: number, deps: LinkShareSweepDeps = defaultLinkShareSweepDeps): Promise<SweepResult> {
   const result: SweepResult = { checked: 0, ended: {}, skipped: 0 };
@@ -218,6 +219,8 @@ export async function runLinkShareSweep(now: number, deps: LinkShareSweepDeps = 
       const { share, owner } = entry;
       result.checked++;
       if (share.expiresAt.getTime() <= now) { await end(entry, 'expired'); continue; }
+      // An open link has no PR to read: only its expiry ends it here.
+      if (isOpenLink(share)) continue;
       const ref = sharePrRef(share);
       let unreadable = false;
       let github: ShareGithub | null = null;
@@ -270,7 +273,8 @@ let timer: ReturnType<typeof setInterval> | null = null;
 
 export function startPreviewShareSweep(intervalMs = LINK_SHARE_SWEEP_MS): void {
   if (timer) return;
-  const tick = () => { runLinkShareSweep(Date.now()).catch(err => console.error('[PREVIEW-SHARE] sweep failed:', err)); };
+  const sweep = traceSweep('preview-shares', () => runLinkShareSweep(Date.now()));
+  const tick = () => { sweep().catch(err => console.error('[PREVIEW-SHARE] sweep failed:', err)); };
   timer = setInterval(tick, intervalMs);
   timer.unref();
 }
@@ -320,13 +324,13 @@ export type WakeResult =
  * read: link shares made before 4b would have it off.)
  */
 export function wakeable(ctx: GuestShareContext): boolean {
-  return ctx.share.audience === 'link' && guestWakeRefusal(ctx.project.instance, isAutoHibernateNote) === null;
+  return ctx.share.audience === 'link' && guestWakeRefusal(ctx.project.instance, isAutoHibernateNote, isSweepStopped) === null;
 }
 
 /**
  * Seam 4: make a share's box reachable for `viewer`, who may already open
  * it (the caller checked). Today: wake the owner's box when the idle sweep
- * hibernated it, as an owner's start would (powerRequestError, for the
+ * stopped it (or, before parking became a stop, hibernated it), as an owner's start would (powerRequestError, for the
  * owner), within the owner's budget across all their shares, and tell them.
  * A fleet would pick or start a box with a free slot here instead.
  */
@@ -336,7 +340,7 @@ export async function wakeShareBox(deps: WakeDeps, ctx: GuestShareContext, viewe
   const box = ctx.project.instance;
   if (share.audience !== 'link') return no('not-wakeable');
   if (box?.status === 'starting') return { ok: true, status: 'starting' };
-  const refusal = guestWakeRefusal(box, isAutoHibernateNote);
+  const refusal = guestWakeRefusal(box, isAutoHibernateNote, isSweepStopped);
   if (refusal) return no(refusal);
   if (!(await deps.wakeOn(owner, box))) return no('wake-off');
   // The owner's own checks, as the owner: a box on EC2, provisioning on, a

@@ -35,6 +35,29 @@ export const PRODUCT_EVENTS = [
   'cloud.session.started',
   'cloud.session.ended',
   'box.provisioned',
+  // A new box's first connect: cold provisioning time (services/boxPowerEvents.ts).
+  'box.ready',
+  'box.resumed',
+  // A warm-pool claim, hit or miss, by size, for tuning box-warm-pool-sizes
+  // (services/warmPoolSizes.ts).
+  'box.pool.claim',
+  // Every stop or hibernate asked for, whoever asked, and what the power
+  // sweep settled it to (services/boxPowerEvents.ts).
+  'box.sleep.requested',
+  'box.sleep.settled',
+  // Auto-stop idle boxes: the warning, the park,
+  // what held a box up, Keep running, and whether a DM reached the owner.
+  // Starts are box.resumed, which says who started the box and how long
+  // after an auto-park.
+  'box.idle.warned',
+  'box.parked',
+  'box.park.deferred',
+  'box.kept_running',
+  'box.idle.notice',
+  // A resize that ran (services/boxResize.ts): from, to, who asked, how long, how it ended.
+  'box.resize',
+  'cli.command',
+  'slack.command',
 ] as const;
 export type ProductEventName = typeof PRODUCT_EVENTS[number];
 

@@ -13,6 +13,7 @@ const prisma = {
   },
 };
 const sendForProject = vi.fn();
+let capabilities: string[] = [];
 const ensureAgentSessionsAndLaunch = vi.fn(async () => {});
 
 vi.mock('../db', () => ({ prisma }));
@@ -31,6 +32,7 @@ vi.mock('../services/agentRegistry', () => ({
   isProjectAgentConnected: vi.fn(() => true),
   sendForProject,
   sendToAgent: vi.fn(),
+  projectAgentCapabilities: () => capabilities,
 }));
 vi.mock('../services/agentRuntime', () => ({
   ensureAgentSessionsAndLaunch,
@@ -82,6 +84,68 @@ describe('renameOwnedProject on a box with a Codex agent', () => {
     await renameOwnedProject(user, 'p1', 'new');
     expect(setStatus).toHaveBeenCalledWith('alice-new-agent', 'idle', { instanceId: 'i1', stoppedAt: STOPPED_AT });
     live.clear();
+  });
+});
+
+describe('renameOwnedProject on a multi-repo project', () => {
+  const workspace = {
+    ...project,
+    layout: 'workspace',
+    repos: [
+      { name: 'shop-web', url: 'https://github.com/o/shop-web', position: 0, setupStatus: 'ready' },
+      { name: 'shop-api', url: 'https://github.com/o/shop-api', position: 1, setupStatus: 'ready' },
+    ],
+    workstreams: [{ name: 'main', branch: 'main' }, { name: 'fix', branch: 'e2e/fix' }],
+  };
+  const asWorkspace = (row: object) => prisma.project.findFirst.mockImplementation(
+    async (args: { where: { name?: string } }) => (args.where.name ? null : row));
+
+  it('refuses on a box whose agent cannot repair the worktrees, before touching anything', async () => {
+    asWorkspace(workspace);
+    capabilities = ['workspace-clone-v1'];
+    const result = await renameOwnedProject(user, 'p1', 'new');
+    expect(result).toMatchObject({ status: 409, body: { code: 'agent_outdated' } });
+    expect(sendForProject).not.toHaveBeenCalled();
+    expect(prisma.project.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses while a repository is still cloning into the folder', async () => {
+    asWorkspace({ ...workspace, repos: [workspace.repos[0], { ...workspace.repos[1], setupStatus: 'cloning' }] });
+    capabilities = ['workspace-clone-v1', 'workspace-rename-v1'];
+    const result = await renameOwnedProject(user, 'p1', 'new');
+    expect(result).toMatchObject({ status: 409, body: { error: 'shop-api is still being cloned; rename once it is done' } });
+    expect(sendForProject).not.toHaveBeenCalled();
+  });
+
+  it('has the box repair every repository and rewrite the guides under the new name', async () => {
+    asWorkspace(workspace);
+    capabilities = ['workspace-clone-v1', 'workspace-rename-v1'];
+    sendForProject.mockResolvedValue({});
+    const result = await renameOwnedProject(user, 'p1', 'new');
+    expect(result.status).toBe(200);
+    const call = sendForProject.mock.calls.find(c => c[1] === 'project-rename')!;
+    const plan = call[2] as { fromDir: string; toDir: string; workspace: { repos: string[]; guides: Array<{ dir: string; content: string }> } };
+    expect(plan.fromDir).toBe('/home/alice/termag/projects/old');
+    expect(plan.toDir).toBe('/home/alice/termag/projects/new');
+    expect(plan.workspace.repos).toEqual(['shop-web', 'shop-api']);
+    expect(plan.workspace.guides.map(g => [g.dir, g.content.split('\n')[1]])).toEqual([
+      ['/home/alice/termag/projects/new', '# new'],
+      ['/home/alice/termag/projects/new/.worktrees/fix', '# new / fix'],
+    ]);
+    expect(call[3]).toBe(60_000);
+    expect(prisma.project.update).toHaveBeenCalledWith({ where: { id: 'p1' }, data: { name: 'new' } });
+  });
+
+  it('keeps the old name when the box could not repair a worktree and put everything back', async () => {
+    asWorkspace(workspace);
+    capabilities = ['workspace-clone-v1', 'workspace-rename-v1'];
+    sendForProject.mockImplementation(async (_host: unknown, command: string) => {
+      if (command === 'project-rename') throw new Error('git worktree repair failed (shop-api: error: x); nothing was renamed');
+      return {};
+    });
+    const result = await renameOwnedProject(user, 'p1', 'new');
+    expect(result).toMatchObject({ status: 502, body: { error: expect.stringMatching(/nothing was renamed/) } });
+    expect(prisma.project.update).not.toHaveBeenCalled();
   });
 });
 

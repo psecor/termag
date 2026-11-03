@@ -8,6 +8,8 @@
  * turns like pane turns) and hands to index.ts for the status WebSocket.
  */
 import { prisma } from '../db';
+import { CHAT_EFFORT_CAPABILITY, type ChatEffort } from './chatEffort';
+import { genUiFields } from './chatGenUi';
 import { onBoxAgentFrame } from './agentRegistry';
 import { classifyForeground } from './foregroundProbe';
 import { getAllStatuses, getStatus, notifyStatusChange, setStatus } from './status';
@@ -15,7 +17,10 @@ import { parseStatusKey, statusKey } from './statusKey';
 import { settleTurnPost } from './sessionTurns';
 import { TRUSTED_MODE, UNTRUSTED_MODE } from './chatTrust';
 import { pushOnChatTurn } from './chatTurnPush';
+import { chatHolderOf, saveChatHolder } from './chatHolder';
+import { FIREWORKS_MENU_CAPABILITY } from './fireworksGateway';
 import * as tmux from './tmux';
+import { traceSweep } from './tracing/spans';
 
 export const CHAT_RUNNER_CAPABILITY = 'chat-runner-v1';
 /** The runner understands a trusted turn. chat-runner-v1 alone refuses any mode but dontAsk. */
@@ -25,6 +30,16 @@ export const CHAT_LIVE_CAPABILITY = 'chat-live-v1';
 export const CHAT_LIVE_INPUT_FLAG = 'chat-live-input-enabled';
 /** A send asks the runner for Claude's title for the session on each turn-end. */
 export const SESSION_TITLES_FLAG = 'simple-ui-session-titles-enabled';
+/** A box agent whose runner keeps the desktop app's hold on a chat's session (agent/chat-runner.js claimT3). */
+export const CHAT_T3_HOLD_CAPABILITY = 'chat-t3-hold-v1';
+/**
+ * A send asks the runner for the box owner's Claude Enterprise monthly spend
+ * after the turn's answer (agent/claude-plan-usage.js).
+ * The box reads it from Anthropic's undocumented usage endpoint with its
+ * claude.ai login, so only the project owner's own sends ask, and only with
+ * the flag on for them.
+ */
+export const CHAT_PLAN_SPEND_FLAG = 'chat-plan-spend-enabled';
 /** chat-interrupt takes scope 'turn': a live turn's Stop ends only Claude's current work and its background commands keep running. */
 export const CHAT_INTERRUPT_CAPABILITY = 'chat-interrupt-v1';
 export const CHAT_STATUS_SOURCE = 'chat-runner';
@@ -44,17 +59,43 @@ export const CHAT_ORCHESTRATOR_CAPABILITY = 'chat-orchestrator-v1';
  * chat on another backend is refused there instead.
  */
 export const CHAT_BACKEND_CAPABILITY = 'chat-backend-v1';
+/** A send may carry `boxNotices` and a `notice` (agent/box-notice.js). */
+export const CHAT_BOX_NOTICE_CAPABILITY = 'chat-box-notice-v1';
+/**
+ * The runner takes the context popover's actions:
+ * chat-reset (Clear), chat-resume (undo the last clear until a turn starts a new
+ * session) and chat-compact (a /compact turn, Claude Code's own compaction).
+ */
+export const CHAT_CONTEXT_CAPABILITY = 'chat-context-v1';
 
-/** Where a chat's turns run (Workflow.backend), and Fireworks' fast model and window. Absent = the default backend. */
+/**
+ * The runner hands out a subagent's own transcript (chat-subagent-read):
+ * Claude Code's `<session>/subagents/agent-<id>.jsonl`.
+ */
+export const CHAT_SUBAGENTS_CAPABILITY = 'chat-subagents-v1';
+/** Subagents in the simple UI's chat: their rows, the agent tab and GET …/chat/subagents/:agentId. */
+export const CHAT_SUBAGENTS_FLAG = 'chat-subagents-enabled';
+/** A subagent's id as Claude Code names its file: a name, never a path (the agent checks it too). */
+export function subagentIdOf(raw: unknown): string | null {
+  return typeof raw === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(raw) ? raw : null;
+}
+
+/** Where a chat's turns run (Workflow.backend), and Fireworks' fast model, window and model list. Absent = the default backend. */
 export interface ChatBackend {
   backend?: string | null;
   fastModel?: string;
   context?: number;
+  // The flag's models (fireworksMenuArg): Claude Code's model names, and the /model menu of Open in full UI.
+  models?: string;
 }
 
-function backendFields(t: ChatBackend): Record<string, unknown> {
+function backendFields(t: ChatBackend, capabilities: readonly string[]): Record<string, unknown> {
   if (!t.backend) return {};
-  return { backend: t.backend, ...(t.fastModel ? { fastModel: t.fastModel } : {}), ...(t.context ? { context: t.context } : {}) };
+  return {
+    backend: t.backend, ...(t.fastModel ? { fastModel: t.fastModel } : {}), ...(t.context ? { context: t.context } : {}),
+    // An older runner, or credentials script, has no use for it.
+    ...(t.models && capabilities.includes(FIREWORKS_MENU_CAPABILITY) ? { models: t.models } : {}),
+  };
 }
 export const AUTO_MODE = 'auto';
 export const MAX_CHAT_TEXT = 100_000;
@@ -102,6 +143,15 @@ export function chatTargetError(target: {
 }
 
 /**
+ * Whether a chat's history may come from the stored transcript instead of a
+ * `chatTargetError` refusal: the box is offline, or the project has no box
+ * (a chat reopened read-only after its box went away).
+ */
+export function chatHistoryFromStore(refusal: { status: number; body: unknown }): boolean {
+  return refusal.status === 503 || (refusal.body as { code?: unknown } | null)?.code === 'no-box';
+}
+
+/**
  * Whether a chat's first turn must wait for a checkout. Keyed off the repo
  * still being set: start-empty clears `repoUrl` (services/projectClone.ts), so
  * a chat that was started without its repository is not gated forever on a
@@ -128,6 +178,11 @@ export function chatRpcFailure(message: string): { status: number; body: { error
   if (/^checkout-pending\b/.test(message)) return { status: 409, body: { error: 'The repository is still being checked out; the message is sent when it is there', code: 'checkout-pending' } };
   if (/^queue-full\b/.test(message)) return { status: 429, body: { error: 'Too many messages are already waiting; let the current ones finish', code: 'queue-full' } };
   if (/^chat-stopped\b/.test(message)) return { status: 409, body: { error: 'The chat was stopped before this message went in; send it again', code: 'chat-stopped' } };
+  if (/^chat-busy\b/.test(message)) return { status: 409, body: { error: 'Claude is still busy with this session; wait for the turn to end, or stop it, first', code: 'chat-busy' } };
+  // The desktop app's thread holds the session and runs a turn (or hasn't started its first).
+  if (/^t3-busy\b/.test(message)) return { status: 409, body: { error: 'Claude is working on this in the desktop app; send again when its turn ends', code: 't3-busy' } };
+  if (/^resume-gone\b/.test(message)) return { status: 409, body: { error: 'A message since the clear started a new session, so the earlier one cannot come back', code: 'resume-gone' } };
+  if (/^nothing-to-compact\b/.test(message)) return { status: 409, body: { error: 'This chat has no context to compact yet', code: 'nothing-to-compact' } };
   if (/^chat-clearing\b/.test(message)) return { status: 409, body: { error: 'This chat is being stopped; nothing more can be sent to it', code: 'chat-clearing' } };
   if (/^image-refused\b/.test(message)) return { status: 400, body: { error: message.replace(/^image-refused:\s*/, ''), code: 'bad-image' } };
   if (/^mode-refused\b/.test(message)) {
@@ -290,27 +345,39 @@ export function onChatEvent(listener: ChatEventListener): () => void {
  * session id stays on the box.
  */
 export function chatResumeClaimPayload(
-  target: { chatKey: string; cwd: string; permissionMode: string; model?: string | null } & ChatBackend,
+  target: { chatKey: string; cwd: string; permissionMode: string; model?: string | null; project?: string | null; workstream?: string } & ChatBackend,
   capabilities: readonly string[] = [],
 ): Record<string, unknown> {
   return {
     chatKey: target.chatKey,
     cwd: target.cwd,
+    ...telemetryNames(target),
     permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
     // The chat's backend, so Open in full UI continues there; its model with it.
-    ...(target.backend && target.model ? { model: target.model, ...backendFields(target) } : {}),
+    ...(target.backend && target.model ? { model: target.model, ...backendFields(target, capabilities) } : {}),
   };
 }
 
+/**
+ * The project's and workstream's names, for the telemetry resource of the
+ * box's Claude runs for this chat (agent/chat-runner.js chatTelemetryEnv):
+ * termag.project and termag.workstream, as a pane of the same workstream
+ * sends them. An older runner ignores them; the box drops a bad pair.
+ */
+function telemetryNames(target: { project?: string | null; workstream?: string }): Record<string, string> {
+  return target.project ? { project: target.project, ...(target.workstream ? { workstream: target.workstream } : {}) } : {};
+}
+
 export function chatSendRpcPayload(
-  target: { chatKey: string; cwd: string; projectId: string; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean } & ChatBackend,
+  target: { chatKey: string; cwd: string; projectId: string; project?: string | null; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean } & ChatBackend,
   text: string,
   capabilities: readonly string[] = [],
-  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean } = {},
+  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean; headings?: boolean; effort?: ChatEffort | null; genUi?: boolean; genUiHint?: boolean; memorySpace?: string | null; boxNotices?: boolean; notice?: string | null; planSpend?: boolean } = {},
 ): Record<string, unknown> {
   return {
     chatKey: target.chatKey, cwd: target.cwd, text, projectId: target.projectId,
     workstream: target.workstream, workstreamId: target.workstreamId,
+    ...(target.project ? { project: target.project } : {}),
     requireCheckout: target.requireCheckout,
     permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
     // chat-live-input-enabled, to an agent that can take it: the turn this
@@ -320,14 +387,39 @@ export function chatSendRpcPayload(
     // string (services/claudeChatModel.ts); the runner drops anything else.
     ...(target.model ? { model: target.model } : {}),
     // Another backend's model is only that backend's; the caller checked chat-backend-v1.
-    ...backendFields(target),
+    ...backendFields(target, capabilities),
     // New session's "Act as an orchestrator". An older runner would drop it anyway.
     ...(target.orchestrator && capabilities.includes(CHAT_ORCHESTRATOR_CAPABILITY) ? { orchestrator: true } : {}),
     // Already checked against chat-image-input-enabled and chat-images-v1 (services/chatImages.ts).
     ...(opts.images?.length ? { images: opts.images } : {}),
     // simple-ui-session-titles-enabled. An older runner drops it, and its turn-ends carry no title.
     ...(opts.titles ? { titles: true } : {}),
+    // Haiku's heading for each run of tool calls. An older runner drops it, and the browser keeps Claude's lead-in or the calls' labels.
+    ...(opts.headings ? { headings: true } : {}),
+    // Already checked against chat-effort-enabled and the chat's backend (services/chatEffort.ts); an older runner gets none.
+    ...(opts.effort && capabilities.includes(CHAT_EFFORT_CAPABILITY) ? { effort: opts.effort } : {}),
+    // The chat's own space, whose .termag/ the turn loads (services/chatSpace.ts), or null for none: a chat
+    // with no space, or one its box isn't granted, loads nothing. Whether memory loads at all is
+    // space-memory-enabled, checked when the box syncs. Undefined says nothing (the box's default).
+    ...(opts.memorySpace !== undefined && capabilities.includes(SPACE_MEMORY_CAPABILITY) ? { spaceMemory: { space: opts.memorySpace } } : {}),
+    // Already checked against chat-generative-ui-enabled and the chat's backend (services/chatGenUi.ts): the catalog
+    // prompt for this turn, and to a runner that files it (chat-genui-v2) the hint its turns carry instead.
+    ...(opts.genUi ? genUiFields(capabilities, opts.genUiHint === true) : {}),
+    // chat-resume-new-box-enabled: tell the turn when the box restarted
+    // since the session's last one, and the first turn on a new box what was lost. In the message, never the system prompt.
+    ...(opts.boxNotices && capabilities.includes(CHAT_BOX_NOTICE_CAPABILITY) ? { boxNotices: true } : {}),
+    ...(opts.notice && capabilities.includes(CHAT_BOX_NOTICE_CAPABILITY) ? { notice: opts.notice } : {}),
+    // chat-plan-spend-enabled, for the owner's send. An older runner drops it and never asks.
+    ...(opts.planSpend ? { planSpend: true } : {}),
   };
+}
+
+/** The agent loads a space's shared memory into its chat turns (agent/space-memory.js). */
+export const SPACE_MEMORY_CAPABILITY = 'space-memory-v1';
+
+/** What a chat's turn loads, from its fixed space (services/chatSpace.ts): the name while its box is granted it, else none. */
+export function chatMemorySpace(place: { space: { name: string } | null; reachable: boolean }): string | null {
+  return place.space && place.reachable ? place.space.name : null;
 }
 
 export type ChatStopScope = 'turn' | 'all';
@@ -347,11 +439,51 @@ export function chatInterruptRpcPayload(chatKey: string, capabilities: readonly 
   return { chatKey, ...(scope === 'turn' && chatStopsTurn(capabilities) ? { scope: 'turn' as const } : {}) };
 }
 
+/**
+ * Whether this viewer is offered the context popover's actions, as GET …/chat
+ * reports it: `ready` on a runner with chat-context-v1, `update` on an older
+ * one (the browser shows them disabled, with why), and null in an ask's
+ * chat, which never offers them (its session follows the thread's clone,
+ * agent/ask-chat.js).
+ */
+export function chatContextActions(capabilities: readonly string[], ask: boolean): 'ready' | 'update' | null {
+  if (ask) return null;
+  return capabilities.includes(CHAT_CONTEXT_CAPABILITY) ? 'ready' : 'update';
+}
+
+export type ChatContextAction = 'clear' | 'compact' | 'resume';
+
+/** The action a POST …/chat/context asks for, or null for anything else. */
+export function chatContextAction(raw: unknown): ChatContextAction | null {
+  return raw === 'clear' || raw === 'compact' || raw === 'resume' ? raw : null;
+}
+
+/**
+ * Why this chat cannot take an action at all, whatever its state: what it
+ * runs on. Clear and Resume move the runner's Claude session id, so they need
+ * the Claude engine. Compact is Claude Code's own /compact, verified headless
+ * on Claude's models; a chat on another backend (Fireworks) is not offered it.
+ */
+export function chatContextRefusals(engine: string | null | undefined, backend: string | null | undefined): Partial<Record<ChatContextAction, string>> {
+  if (engine !== 'claude') {
+    const why = "This agent's chats can't do this yet; only Claude Code's can.";
+    return { clear: why, compact: why, resume: why };
+  }
+  return backend ? { compact: "Compacting runs on Claude's own models; this chat runs on another backend." } : {};
+}
+
 /** Whether a send from this person can go into a running live turn: their chat-live-input-enabled, on an agent with chat-live-v1. */
 export function chatSendsLive(capabilities: readonly string[], liveInputFlag: boolean | undefined): boolean {
   return liveInputFlag === true && capabilities.includes(CHAT_LIVE_CAPABILITY);
 }
 
+/** A workstream whose chat a clear stops: the id keys the chat, the name is what a refusal shows. */
+export interface ChatWorkstream {
+  id: string;
+  name: string;
+}
+
+/** What the box did with one workstream's chat. `workstream` is its name. */
 export type ChatClearResult =
   | { workstream: string; cleared: number; stopped: boolean }
   | { workstream: string; skipped: 'runner-missing' | 'offline' }
@@ -368,12 +500,12 @@ export type ChatClearResult =
 export async function clearChatsOnBox(
   send: (type: string, payload: Record<string, unknown>) => Promise<unknown>,
   projectId: string,
-  workstreams: readonly string[],
+  workstreams: readonly ChatWorkstream[],
 ): Promise<ChatClearResult[]> {
   const out: ChatClearResult[] = [];
-  for (const workstream of workstreams) {
+  for (const { id, name: workstream } of workstreams) {
     try {
-      const r = (await send('chat-clear', { chatKey: chatKeyFor(projectId, workstream) })) as { cleared?: number; stopped?: boolean } | null;
+      const r = (await send('chat-clear', { chatKey: chatKeyFor(projectId, id) })) as { cleared?: number; stopped?: boolean } | null;
       out.push({ workstream, cleared: Number(r?.cleared) || 0, stopped: Boolean(r?.stopped) });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -406,14 +538,16 @@ function assistantPreview(blocks: readonly Block[]): string | null {
  * Claude answers (`result`) or the turn ends. A live turn (agent
  * chat-live-v1) stays open after an answer while a background task runs,
  * and is `working` again when it takes in another message (its replayed
- * `user` line) or a task's notification sets it going (`assistant`). The
+ * `user` line) or a task's end sets it going: Claude Code says so with a
+ * `task_notification`, then starts that query with an `init`, before any
+ * `assistant` (a thinking-only one moves nothing). The
  * message is what lists preview, so it is the last thing Claude said
  * (`prevMessage` carries it across tool calls and the turn end), never a
  * tool call's arguments.
  */
 export function statusForChatEvent(event: unknown, prevMessage?: string): { status: 'working' | 'idle'; message?: string } | null {
   if (!event || typeof event !== 'object') return null;
-  const ev = event as { type?: unknown; isReplay?: unknown; message?: { content?: unknown } };
+  const ev = event as { type?: unknown; subtype?: unknown; isReplay?: unknown; message?: { content?: unknown } };
   const kept = prevMessage && prevMessage !== THINKING ? prevMessage : undefined;
   switch (ev.type) {
     case 'turn-start':
@@ -427,6 +561,8 @@ export function statusForChatEvent(event: unknown, prevMessage?: string): { stat
     }
     case 'user':
       return ev.isReplay === true && typeof ev.message?.content === 'string' ? { status: 'working', message: THINKING } : null;
+    case 'system':
+      return ev.subtype === 'task_notification' || ev.subtype === 'init' ? { status: 'working', message: prevMessage || THINKING } : null;
     case 'result':
     case 'turn-end':
       return kept ? { status: 'idle', message: kept } : { status: 'idle' };
@@ -439,14 +575,16 @@ export function statusForChatEvent(event: unknown, prevMessage?: string): { stat
 export const SESSION_TITLE_MAX = 80;
 
 /**
- * The title a chat event reports for its session: a turn-end's `title`
- * (agent/session-title.js), on one line, without control or direction
- * characters, cut to SESSION_TITLE_MAX. Null for any other event or a blank.
+ * The title a chat event reports for its session, on one line, without
+ * control or direction characters, cut to SESSION_TITLE_MAX: a turn-end's
+ * `title`, Claude's own (agent/session-title.js), or a `session-title`
+ * frame, the one the box generates where Claude names no session (Bedrock).
+ * Null for any other event or a blank.
  */
 export function sessionTitleOf(event: unknown): string | null {
   if (!event || typeof event !== 'object') return null;
   const ev = event as { type?: unknown; title?: unknown };
-  if (ev.type !== 'turn-end' || typeof ev.title !== 'string') return null;
+  if ((ev.type !== 'turn-end' && ev.type !== 'session-title') || typeof ev.title !== 'string') return null;
   const line = ev.title
     .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
     .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
@@ -463,11 +601,34 @@ export function sessionTitleOf(event: unknown): string | null {
  * title every turn, and an unchanged one costs no list push
  * (services/workspaceWrites.ts watches the field).
  */
-export async function saveSessionTitle(projectId: string, workstreamId: string, title: string): Promise<void> {
+export async function saveSessionTitle(projectId: string, workstreamId: string, title: string, now = new Date()): Promise<void> {
+  // Claude's title never replaces a person's rename (Workstream.sessionTitleSource).
   await prisma.workstream.updateMany({
-    where: { id: workstreamId, projectId, OR: [{ sessionTitle: null }, { sessionTitle: { not: title } }] },
-    data: { sessionTitle: title },
+    where: {
+      id: workstreamId, projectId,
+      AND: [
+        { OR: [{ sessionTitle: null }, { sessionTitle: { not: title } }] },
+        { OR: [{ sessionTitleSource: null }, { sessionTitleSource: { not: 'person' } }] },
+      ],
+    },
+    data: { sessionTitle: title, sessionTitleAt: now, sessionTitleSource: 'claude' },
   });
+}
+
+/**
+ * A person's name for the chat's session (the desktop app's rename, POST
+ * /api/cli/v1/projects/:id/chat/title), cut and cleaned as Claude's are. It
+ * sticks against Claude's later titles; between people the newer one wins.
+ * Null when the title has nothing in it.
+ */
+export async function renameSessionFor(projectId: string, workstreamId: string, raw: unknown, now = new Date()): Promise<{ title: string; titleAt: string } | null> {
+  const title = sessionTitleOf({ type: 'session-title', title: raw });
+  if (!title) return null;
+  await prisma.workstream.updateMany({
+    where: { id: workstreamId, projectId },
+    data: { sessionTitle: title, sessionTitleAt: now, sessionTitleSource: 'person' },
+  });
+  return { title, titleAt: now.toISOString() };
 }
 
 export interface ChatPush {
@@ -492,6 +653,25 @@ let pusher: Pusher | null = null;
  * raw — never through `tmuxSafeName`, which folds `.` and `:` to `_` and would
  * let `jane_doe` receive `jane.doe`'s chats.
  */
+/**
+ * A chat event only the project's owner receives, never a collaborator the
+ * project is shared with: a `plan-usage` notice is the box owner's own Claude
+ * seat spend (agent/claude-plan-usage.js), not part of the conversation.
+ */
+export function ownerOnlyChatEvent(event: unknown): boolean {
+  return !!event && typeof event === 'object' && (event as { type?: unknown }).type === 'plan-usage';
+}
+
+/**
+ * Where one status socket gets a chat push (index.ts setChatPushCallback): the
+ * project's owner always, a collaborator through their share (mayReceiveChat),
+ * except an owner-only event (ownerOnlyChatEvent), which a collaborator never gets.
+ */
+export function chatPushRoute(event: unknown, owner: string, viewerUnixUsername: string): 'owner' | 'share' | 'none' {
+  if (viewerUnixUsername === owner) return 'owner';
+  return ownerOnlyChatEvent(event) ? 'none' : 'share';
+}
+
 export function mayReceiveChat(
   chat: { owner: string; projectId: string },
   viewer: { unixUsername: string; sharedProjectIds: ReadonlySet<string> },
@@ -579,8 +759,9 @@ export function sweepStaleChatStatus(now: number = Date.now()): number {
 /** Leader-only: the stale-chat-status sweep. The turn-end frame is the normal path. */
 export function startChatStatusSweep(): void {
   if (sweepTimer) return;
+  const sweep = traceSweep('chat-status', () => sweepStaleChatStatus());
   sweepTimer = setInterval(() => {
-    try { sweepStaleChatStatus(); } catch (err) { console.error('[CHAT] status sweep failed:', err instanceof Error ? err.message : String(err)); }
+    try { sweep(); } catch (err) { console.error('[CHAT] status sweep failed:', err instanceof Error ? err.message : String(err)); }
   }, 30_000);
   sweepTimer.unref?.();
 }
@@ -615,6 +796,15 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
     void saveSessionTitle(projectId, msg.workstreamId, title).catch(err => {
       console.error('[CHAT] session title not saved:', err instanceof Error ? err.message : String(err));
     });
+  }
+  // The box handed the session to the desktop's thread, or took it back (services/chatHolder.ts).
+  const holder = chatHolderOf(msg.event);
+  if (holder && typeof msg.workstreamId === 'string' && msg.workstreamId) {
+    try {
+      await saveChatHolder(projectId, msg.workstreamId, holder, new Date());
+    } catch (err) {
+      console.error('[CHAT] chat holder not saved:', err instanceof Error ? err.message : String(err));
+    }
   }
   pusher?.({
     sessionName,

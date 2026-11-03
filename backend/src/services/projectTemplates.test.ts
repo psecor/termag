@@ -35,7 +35,7 @@ describe('buildCloneCommand', () => {
   it('fetches into the initialised repo and checks out the default branch', () => {
     const cmd = buildCloneCommand('https://github.com/example-org/research.git', undefined, MANAGED);
     expect(cmd).toBe(
-      `{ GIT_CONFIG_GLOBAL=/dev/null git remote add origin 'https://github.com/example-org/research.git' 2>/dev/null || GIT_CONFIG_GLOBAL=/dev/null git remote set-url origin 'https://github.com/example-org/research.git'; } && GIT_CONFIG_GLOBAL=/dev/null git fetch --progress origin && GIT_CONFIG_GLOBAL=/dev/null git remote set-head origin -a && GIT_CONFIG_GLOBAL=/dev/null git checkout --track "$(GIT_CONFIG_GLOBAL=/dev/null git symbolic-ref --short refs/remotes/origin/HEAD)" && mkdir -p .git/info && { grep -qxF '/.worktrees/' .git/info/exclude 2>/dev/null || echo '/.worktrees/' >> .git/info/exclude; }`,
+      `{ GIT_CONFIG_GLOBAL=/dev/null git remote add origin 'https://github.com/example-org/research.git' 2>/dev/null || GIT_CONFIG_GLOBAL=/dev/null git remote set-url origin 'https://github.com/example-org/research.git' ; } && GIT_CONFIG_GLOBAL=/dev/null git fetch --progress origin && GIT_CONFIG_GLOBAL=/dev/null git remote set-head origin -a && GIT_CONFIG_GLOBAL=/dev/null git checkout --track "$(GIT_CONFIG_GLOBAL=/dev/null git symbolic-ref --short refs/remotes/origin/HEAD)" && mkdir -p .git/info && { grep -qxF '/.worktrees/' .git/info/exclude 2>/dev/null || echo '/.worktrees/' >> .git/info/exclude; }`,
     );
     expect(cmd).not.toContain('alternates');
     expect(cmd).not.toContain('export GIT_CONFIG_GLOBAL');
@@ -54,8 +54,17 @@ describe('buildCloneCommand', () => {
 
   it('single-quotes the url so it is one shell word, and re-points an existing remote on retry', () => {
     const cmd = buildCloneCommand('https://github.com/o/r.git', undefined, MANAGED);
-    expect(cmd).toContain("{ GIT_CONFIG_GLOBAL=/dev/null git remote add origin 'https://github.com/o/r.git' 2>/dev/null || GIT_CONFIG_GLOBAL=/dev/null git remote set-url origin 'https://github.com/o/r.git'; } && GIT_CONFIG_GLOBAL=/dev/null git fetch");
+    expect(cmd).toContain("{ GIT_CONFIG_GLOBAL=/dev/null git remote add origin 'https://github.com/o/r.git' 2>/dev/null || GIT_CONFIG_GLOBAL=/dev/null git remote set-url origin 'https://github.com/o/r.git' ; } && GIT_CONFIG_GLOBAL=/dev/null git fetch");
     expect(cmd.startsWith('(')).toBe(false);
+  });
+
+  it('types nothing straight after the quoted url that url-quote-magic would escape', () => {
+    // Oh My Zsh's url-quote-magic backslash-escapes ; & < > ! typed as part of a
+    // word that starts with a URL. The line arrives key by key, so `'url';`
+    // would reach git as `url;`.
+    for (const opts of [MANAGED, undefined]) {
+      expect(buildCloneCommand('https://github.com/o/r.git', '$HOME/src/r', opts)).not.toMatch(/'https:\/\/[^']*'[;&<>!]/);
+    }
   });
 
   it('leaves the global gitconfig alone for a host or external box', () => {
@@ -63,7 +72,7 @@ describe('buildCloneCommand', () => {
     expect(cmd).not.toContain('GIT_CONFIG_GLOBAL');
     expect(cmd).not.toContain('export ');
     expect(cmd.startsWith('(')).toBe(false);
-    expect(cmd).toContain("{ git remote add origin 'https://github.com/o/r.git' 2>/dev/null || git remote set-url origin 'https://github.com/o/r.git'; } && git fetch --progress origin");
+    expect(cmd).toContain("{ git remote add origin 'https://github.com/o/r.git' 2>/dev/null || git remote set-url origin 'https://github.com/o/r.git' ; } && git fetch --progress origin");
     expect(buildCloneCommand('https://github.com/o/r.git', undefined, { blankGlobalGitconfig: false })).toBe(cmd);
   });
 

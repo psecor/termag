@@ -4,7 +4,7 @@ import { termagUrlFromEnv } from '../services/claudeRunnerNotices';
 import { decideMcpRequest } from '../services/mcpAuthz';
 import { findConnector, mcpBrokerEnabledForBox, oauthAccessToken, readConnectorSecrets } from '../services/mcpConnectorStore';
 import { upstreamTestAllow } from '../services/mcpConnectors';
-import { boxForToken, gatewayCheckRouter } from './gatewayCheck';
+import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
 
 /**
  * Envoy's ext_authz check for the MCP broker listener: every request a box's
@@ -15,7 +15,7 @@ export function mcpAuthzRouter(cfg: CallerProofConfig): Router {
     decideMcpRequest(
       { path, authorization: req.headers.authorization },
       {
-        boxForToken,
+        boxForToken: boxForTokenAt('mcpGateway'),
         flagOn: box => mcpBrokerEnabledForBox(box.userId, box.instanceId),
         connector: findConnector,
         secrets: readConnectorSecrets,

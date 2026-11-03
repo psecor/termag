@@ -85,7 +85,15 @@ vi.mock('../slack/channels', () => ({ createProjectChannel: vi.fn(async () => nu
 vi.mock('../slack/lts', () => ({ setNotificationTarget: vi.fn() }));
 vi.mock('../services/status', () => ({ deleteStatus: vi.fn(), setStatus: vi.fn(), notifyStatusChange: vi.fn() }));
 vi.mock('./instances', () => ({ createBox }));
+vi.mock('../services/chatSpace', async importOriginal => ({
+  ...(await importOriginal<typeof import('../services/chatSpace')>()),
+  chatSpaceFor: vi.fn(async () => ({ space: null, reachable: false })),
+  fixListedChatSpaces: vi.fn(),
+  resolveChatSpaceChoice: vi.fn(async (name: string | null | undefined) => (name === null ? { spaceId: null } : name === 'design' ? { spaceId: 's-design' } : null)),
+}));
 vi.mock('../services/boxProvisioner', () => ({ isBoxProvisioningConfigured: () => true, terminateBox }));
+const applyAskBoxPolicy = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock('../services/boxLifecycle', async importOriginal => ({ ...(await importOriginal<object>()), applyAskBoxPolicy }));
 vi.mock('../services/agentRegistry', () => ({
   isAgentConnected: vi.fn(() => state.connected),
   isProjectAgentConnected: vi.fn(() => state.connected),
@@ -205,6 +213,33 @@ describe('a project asked for with a new box', () => {
     expect(types()).toContain('mkdir');
   });
 
+  it('records New session\'s space, or its "No space", on the chat; says nothing for a create that names none (plan-outbox #38)', async () => {
+    const { chatSpaceFor } = await import('../services/chatSpace');
+    state.box = box('ready');
+    state.connected = true;
+    prisma.workstream.upsert.mockClear();
+    // Fixed in the insert of the main workstream itself, so a listing during the create can't fix it first (Bugbot, #769).
+    // The insert is the first upsert of a create (createProjectFor's own check after it updates nothing).
+    const created = () => {
+      const calls = prisma.workstream.upsert.mock.calls as unknown as Array<[{ create: Record<string, unknown> }]>;
+      const c = calls.map(x => x[0].create);
+      prisma.workstream.upsert.mockClear();
+      return c[0];
+    };
+    expect((await createProjectFor(user, { ...empty, chatSpace: 'design' })).status).toBe(201);
+    expect(created()).toMatchObject({ spaceId: 's-design', spaceFixedAt: expect.any(Date) });
+    expect(vi.mocked(chatSpaceFor)).toHaveBeenLastCalledWith('ws1', { requested: { name: 'design', userId: 'u1' } });
+    state.project = null;
+    await createProjectFor(user, { ...empty, chatSpace: null });
+    expect(created()).toMatchObject({ spaceId: null, spaceFixedAt: expect.any(Date) });
+    expect(vi.mocked(chatSpaceFor)).toHaveBeenLastCalledWith('ws1', { requested: { name: null, userId: 'u1' } });
+    vi.mocked(chatSpaceFor).mockClear();
+    state.project = null;
+    await createProjectFor(user, empty);
+    expect(vi.mocked(chatSpaceFor)).not.toHaveBeenCalled();
+    expect(created()).not.toHaveProperty('spaceFixedAt');
+  });
+
   it('keeps "Act as an orchestrator" only for a trusted chat', async () => {
     state.box = box('provisioning');
     const chat = { ...empty, initialAgent: { enabled: true, provider: 'claude-chat' } };
@@ -220,6 +255,18 @@ describe('a project asked for with a new box', () => {
       await createProjectFor(user, input);
       expect(stored()).toBe(false);
     }
+  });
+
+  it('creates a claude-chat project, and refuses pi-chat until the runner has a pi engine', async () => {
+    state.box = box('ready');
+    state.connected = true;
+    const chat = (provider: string) => ({ ...empty, initialAgent: { enabled: true, provider } });
+    expect(await createProjectFor(user, chat('pi-chat'))).toEqual({
+      status: 400, body: { error: 'pi-chat cannot run yet: the chat runner has no pi engine' },
+    });
+    expect(prisma.project.create).not.toHaveBeenCalled();
+    expect((await createProjectFor(user, chat('claude-chat'))).status).toBe(201);
+    expect(state.workflows.map(w => w.provider)).toEqual(['claude-chat']);
   });
 
   it('records the create and the agent launch as product events, keyed by the user and the box', async () => {
@@ -272,8 +319,37 @@ describe('Retry on a project whose box failed to launch', () => {
     expect(result).toEqual({ status: 202, body: { setupStatus: 'pending', instanceId: 'box2' } });
     expect(state.box?.status).toBe('terminated');
     expect(terminateBox).toHaveBeenCalledOnce();
-    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2' });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: undefined, relaunchDiskGiB: null });
     expect(state.project).toMatchObject({ instanceId: 'box2', setupStatus: 'pending' });
+  });
+
+  it("launches the replacement at the failed box's size", async () => {
+    (state.box as unknown as { size: string }).size = 'medium';
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1');
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: 'medium', relaunchDiskGiB: null });
+  });
+
+  it("keeps an ask box's ask-box policy on the replacement (termag ask --new-box rerun after a failed launch)", async () => {
+    (state.box as unknown as { createdFor: string }).createdFor = 'ask';
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    expect((await retryCloneFor(user, 'p1')).status).toBe(202);
+    expect(applyAskBoxPolicy).toHaveBeenCalledWith('box2');
+  });
+
+  it('gives any other box no ask-box policy', async () => {
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1');
+    expect(applyAskBoxPolicy).not.toHaveBeenCalled();
+  });
+
+  it('relaunches a failed minimal box as minimal, not as the full bake', async () => {
+    state.box = { ...box('provisioning'), flavor: 'minimal' };
+    await createProjectFor(user, empty);
+    state.box.status = 'failed';
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1');
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'minimal' }, { relaunchSize: undefined, relaunchDiskGiB: null });
   });
 
   it('leaves the project on the retired box when no new box can be made, so Retry can try again', async () => {

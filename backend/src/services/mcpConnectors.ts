@@ -12,6 +12,8 @@ import { BlockList, isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 
 export const MCP_BROKER_FLAG = 'mcp-broker-enabled';
+// The catalog of MCP servers that Settings offers every user, and its on switch (see defaultConnectors).
+export const MCP_DEFAULTS_FLAG = 'mcp-default-connectors';
 
 export const CONNECTOR_NAME = /^[a-z][a-z0-9-]{0,40}$/;
 export const SECRET_NAME = /^[A-Za-z0-9_-]{1,40}$/;
@@ -53,6 +55,69 @@ export function getMcpBrokerUrl(env: NodeJS.ProcessEnv = process.env): string | 
   if (u.protocol !== 'https:' || u.username || u.password || u.pathname !== '/' || u.search || u.hash || raw.includes('?') || raw.includes('#')) return null;
   const url = `https://${u.host}`;
   return /^https:\/\/[A-Za-z0-9.:-]+$/.test(url) ? url : null;
+}
+
+export interface DefaultConnector {
+  name: string;
+  // Normalised the same way a saved connector's URL is (parseUpstream), so the two
+  // can be compared to tell whether the user already has this server.
+  upstream: string;
+}
+
+const warnedDefaults = new Set<string>();
+
+// This runs on every Settings page load, so log each problem only once.
+function warnDefaults(message: string): void {
+  const line = `[MCP] ${MCP_DEFAULTS_FLAG} flag: ${message}`;
+  if (!warnedDefaults.has(line)) console.warn(line);
+  warnedDefaults.add(line);
+}
+
+// The keys a catalog entry may have. Add new optional ones here (headers, a
+// display name) without changing the format.
+const CATALOG_ENTRY_KEYS = new Set(['name', 'upstream']);
+
+/**
+ * The MCP servers the orchestrator offers every user, from the value the
+ * mcp-default-connectors JSON flag serves them: an array of
+ * `{ "name", "upstream" }` objects, for example
+ * `[{"name":"acme","upstream":"https://mcp.acme.example/mcp"}]`. The flag is
+ * both the list and its on switch: off (null, the fallback) or `[]` offers
+ * nothing.
+ *
+ * Settings lists each one under "Available to connect" until the user
+ * connects it, which creates that user's own OAuth connector for it; from
+ * then on it is one of their connectors like any other. The URLs live in
+ * the flag rather than here.
+ *
+ * Problems are logged and skipped rather than failing the page: a value that
+ * isn't an array offers nothing; an entry with a bad name or URL, or that
+ * repeats a name or URL already listed, is skipped; and an unknown key is
+ * ignored, so a value written for a newer termag still offers its servers.
+ */
+export function defaultConnectors(entries: unknown, env: NodeJS.ProcessEnv = process.env): DefaultConnector[] {
+  if (entries === null || entries === undefined) return [];
+  if (!Array.isArray(entries)) {
+    warnDefaults('expected a JSON array of {"name","upstream"} objects');
+    return [];
+  }
+  const out: DefaultConnector[] = [];
+  entries.forEach((entry: unknown, index) => {
+    const label = typeof (entry as { name?: unknown })?.name === 'string' ? `"${(entry as { name: string }).name}"` : `entry ${index + 1}`;
+    try {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new McpConnectorError('expected an object');
+      const { name: rawName, upstream: rawUpstream } = entry as { name?: unknown; upstream?: unknown };
+      const name = validateConnectorName(rawName);
+      const upstream = parseUpstream(rawUpstream, upstreamTestAllow(env)).url;
+      if (out.some(d => d.name === name || d.upstream === upstream)) throw new McpConnectorError('listed twice');
+      const unknown = Object.keys(entry).filter(k => !CATALOG_ENTRY_KEYS.has(k));
+      if (unknown.length) warnDefaults(`${label}: ignoring unknown key${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')}`);
+      out.push({ name, upstream });
+    } catch (err) {
+      warnDefaults(`skipping ${label}: ${(err as Error).message}`);
+    }
+  });
+  return out;
 }
 
 export class McpConnectorError extends Error {

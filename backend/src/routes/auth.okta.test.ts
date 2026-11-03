@@ -39,9 +39,16 @@ function useUsers(seed: Express.User[]) {
   return rows;
 }
 
-function fakeReq(sessionUser?: Express.User, headers: Record<string, string> = {}) {
+function fakeReq(
+  sessionUser?: Express.User,
+  headers: Record<string, string> = {},
+  at: { method?: string; path?: string; query?: Record<string, string> } = {},
+) {
   const store = { generate: vi.fn(), destroy: vi.fn() };
   const req = {
+    method: at.method ?? 'GET',
+    path: at.path ?? '/api/me',
+    query: at.query ?? {},
     headers,
     user: sessionUser,
     session: sessionUser ? { passport: { user: sessionUser.id } } : {},
@@ -59,7 +66,7 @@ function fakeReq(sessionUser?: Express.User, headers: Record<string, string> = {
 }
 
 function fakeRes() {
-  return { status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis() };
+  return { status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), redirect: vi.fn() };
 }
 
 async function bridge(req: ReturnType<typeof fakeReq>) {
@@ -163,6 +170,27 @@ describe('albSessionBridge in okta mode', () => {
     const { res } = await bridge(req);
     expect(res.status).toHaveBeenCalledWith(403);
     expect(req.login).not.toHaveBeenCalled();
+  });
+
+  it("sends a refused identity's `termag login` approval back to its loopback, saying not_allowed", async () => {
+    vi.mocked(verifyAlbIdentity).mockResolvedValue({ email: 'nobody@example.com', sub: 's' });
+    const authorize = {
+      port: '50123', state: 's'.repeat(22), code_challenge: 'c'.repeat(43), code_challenge_method: 'S256', device_name: 'mbp desktop',
+    };
+    const { res } = await bridge(fakeReq(undefined, {}, { path: '/auth/cli/authorize', query: authorize }));
+    expect(res.redirect).toHaveBeenCalledWith(303, `http://127.0.0.1:50123/callback?error=not_allowed&state=${'s'.repeat(22)}`);
+    expect(res.status).not.toHaveBeenCalled();
+
+    // A malformed approval, an approval's POST, and any other page still get the 403.
+    for (const at of [
+      { path: '/auth/cli/authorize', query: { ...authorize, port: '80' } },
+      { method: 'POST', path: '/auth/cli/authorize', query: authorize },
+      { path: '/api/me' },
+    ]) {
+      const { res: other } = await bridge(fakeReq(undefined, {}, at));
+      expect(other.status).toHaveBeenCalledWith(403);
+      expect(other.redirect).not.toHaveBeenCalled();
+    }
   });
 
   it('still lets a bearer token through when a header-less request also carries a cookie', async () => {

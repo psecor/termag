@@ -22,8 +22,8 @@
  */
 
 import { GithubApiError } from './githubCredential';
-import { FRAGMENTS, ORGS, headers, parseOpenPr } from './prPipelineGithub';
-import type { OpenPr } from './prPipeline';
+import { CONTEXTS, FRAGMENTS, ORGS, checkState, headers, parseOpenPr } from './prPipelineGithub';
+import type { CheckState, OpenPr } from './prPipeline';
 
 type Fetch = typeof fetch;
 type Raw = Record<string, any>;
@@ -59,10 +59,20 @@ export function parsePrRef(owner: unknown, name: unknown, number: unknown): PrRe
 }
 
 export type ReviewEvent = 'APPROVE' | 'COMMENT' | 'REQUEST_CHANGES';
-export interface ReviewInput { event: ReviewEvent; body: string }
+/** An inline comment on a line of the PR's head (the simple UI's review card). */
+export interface ReviewComment { path: string; line: number; side: 'RIGHT' | 'LEFT'; body: string }
+export interface ReviewInput {
+  event: ReviewEvent;
+  body: string;
+  /** Inline comments; absent from a summary-only review. */
+  comments?: ReviewComment[];
+  /** The head commit the review is of: GitHub refuses comments that don't apply to it, so a push since can't take them. */
+  commitId?: string;
+}
 
 // GitHub's own limit on a review body.
 export const MAX_REVIEW_BODY = 65_536;
+export const MAX_REVIEW_COMMENTS = 50;
 
 export function parseReviewInput(raw: unknown): ReviewInput {
   const r = (raw ?? {}) as Raw;
@@ -72,9 +82,35 @@ export function parseReviewInput(raw: unknown): ReviewInput {
   }
   const body = typeof r.body === 'string' ? r.body.trim() : '';
   if (body.length > MAX_REVIEW_BODY) throw new PrInputError('The review is too long for GitHub');
-  // GitHub refuses both without a body; say so before the round trip.
+  const comments = parseReviewComments(r.comments);
+  // GitHub refuses both without a body, inline comments or not; say so before the round trip.
   if (!body && event !== 'APPROVE') throw new PrInputError(event === 'COMMENT' ? 'A comment needs some text' : 'Say what needs to change');
-  return { event, body };
+  let commitId: string | undefined;
+  if (r.commitId !== undefined && r.commitId !== null) {
+    if (typeof r.commitId !== 'string' || !SHA.test(r.commitId)) throw new PrInputError('commitId must be the head commit the review is of');
+    commitId = r.commitId.toLowerCase();
+  }
+  if (comments?.length && !commitId) throw new PrInputError('Inline comments need the head commit they are on (commitId)');
+  return { event, body, ...(comments?.length ? { comments } : {}), ...(commitId ? { commitId } : {}) };
+}
+
+function parseReviewComments(raw: unknown): ReviewComment[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new PrInputError('comments must be a list');
+  if (raw.length > MAX_REVIEW_COMMENTS) throw new PrInputError(`At most ${MAX_REVIEW_COMMENTS} inline comments in one review`);
+  let total = 0;
+  return raw.map((c: Raw, i) => {
+    const path = typeof c?.path === 'string' ? c.path.trim() : '';
+    // A repository path: no NUL, no leading slash, no "..".
+    if (!path || path.length > 1000 || path.includes('\0') || path.startsWith('/') || path.split('/').includes('..')) throw new PrInputError(`Comment ${i + 1}: a file path in the repository`);
+    if (!Number.isInteger(c.line) || c.line < 1 || c.line > 10_000_000) throw new PrInputError(`Comment ${i + 1}: a line number`);
+    const side = c.side === 'LEFT' ? 'LEFT' : 'RIGHT';
+    const body = typeof c.body === 'string' ? c.body.trim() : '';
+    if (!body) throw new PrInputError(`Comment ${i + 1} has no text`);
+    total += body.length;
+    if (total > MAX_REVIEW_BODY) throw new PrInputError('The inline comments are too long for GitHub');
+    return { path, line: c.line, side, body };
+  });
 }
 
 // ── Overview ─────────────────────────────────────────────────────────────────
@@ -165,6 +201,9 @@ const OVERVIEW = `query Overview($owner: String!, $name: String!, $number: Int!)
     autoMergeRequest { mergeMethod }
     repository { mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed viewerDefaultMergeMethod }
     ...Suites
+    headChecks: commits(last: 1) { nodes { commit { statusCheckRollup { state
+      ${CONTEXTS}
+    } } } }
   } }
 }
 ${SUITES_FRAGMENT}
@@ -204,8 +243,13 @@ export function parseOverview(data: Raw): PrOverview | null {
   if (!base) return null;
   const viewer = typeof data.viewer?.login === 'string' ? data.viewer.login : '';
   const state = node.state === 'MERGED' || node.state === 'CLOSED' ? node.state : 'OPEN';
+  // Each check on the head: the Checks tab and the gates (Bugbot, the Security agent) read them, and the
+  // Open fragment the searches share asks only for the rollup's state.
+  const contexts = node.headChecks?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes;
+  const checks = Array.isArray(contexts) ? (contexts as Raw[]).map(checkState).filter((c): c is CheckState => c !== null) : base.checks;
   return {
     ...base,
+    checks,
     viewer,
     state,
     body: typeof node.body === 'string' ? node.body : '',
@@ -267,7 +311,12 @@ export async function submitReview(token: string, ref: PrRef, input: ReviewInput
     method: 'POST',
     headers: { ...headers(token), 'Content-Type': 'application/json' },
     // An APPROVE with no text sends no body: GitHub stores "" as an empty comment.
-    body: JSON.stringify(input.body ? { event: input.event, body: input.body } : { event: input.event }),
+    body: JSON.stringify({
+      event: input.event,
+      ...(input.body ? { body: input.body } : {}),
+      ...(input.commitId ? { commit_id: input.commitId } : {}),
+      ...(input.comments?.length ? { comments: input.comments.map(c => ({ path: c.path, line: c.line, side: c.side, body: c.body })) } : {}),
+    }),
   });
   let body: unknown = null;
   try { body = await res.json(); } catch { body = null; }

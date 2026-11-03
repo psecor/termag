@@ -21,14 +21,34 @@ describe('sweepSpaces', () => {
     await store.markDeleted(gone.id);
     store.addBox('dead', 'alice', 'dead', 'terminated');
     await store.addGrant(live.id, 'dead', 'alice');
+    store.addProject('chat', 'alice', 'dead');
     const now = Date.now();
     store.eventRows.push({ id: 'old', at: new Date(now - EVENT_RETENTION_MS - 1), spaceId: live.id, actorUserId: 'alice', action: 'file.get' });
 
     const r = await sweepSpaces(store, async () => s3, now);
-    expect(r).toEqual({ purged: 1, recounted: 1, uploadsAborted: 0, grantsPruned: 1, eventsPruned: 1, errors: [] });
+    expect(r).toEqual({ purged: 1, recounted: 1, uploadsAborted: 0, listingsRecorded: 1, grantsPruned: 1, eventsPruned: 1, errors: [] });
+    expect(store.listedIn('chat')).toEqual([live.id]);
     expect(store.spaces.has(gone.id)).toBe(false);
     expect(s3.versions.has(`${gone.id}/b`)).toBe(false);
     expect(store.spaces.get(live.id)!.usedBytes).toBe(14n);
+  });
+
+  it('keeps .termag/ history indefinitely, and prunes .termag/tools/ and other paths at 90 days', async () => {
+    const store = new MemorySpaceStore();
+    store.addUser('alice');
+    const live = await store.createSpace({ name: 'live', description: null, userId: 'alice' });
+    const now = Date.now();
+    const old = new Date(now - EVENT_RETENTION_MS - 1);
+    // Older than a year, the retention there was before: still kept.
+    const ancient = new Date(now - 400 * 24 * 60 * 60 * 1000);
+    const row = (id: string, at: Date, path: string | null) => ({ id, at, spaceId: live.id, actorUserId: 'alice', action: 'file.put', path });
+    store.eventRows.push(row('mem', old, '.termag/memory/a.md'), row('tool', old, '.termag/tools/t/data.json'), row('file', old, 'a.md'),
+      row('none', old, null), row('memAncient', ancient, '.termag/prompt.md'), row('fresh', new Date(now), 'b.md'),
+      row('movedIn', old, 'drafts/a.md -> .termag/memory/a.md'), row('movedToTools', old, 'x.json -> .termag/tools/t/x.json'),
+      row('fileAncient', ancient, 'old.md'));
+    const r = await sweepSpaces(store, async () => new MemorySpaceObjects(), now);
+    expect(r.eventsPruned).toBe(5);
+    expect(store.eventRows.map(e => e.id).sort()).toEqual(['fresh', 'mem', 'memAncient', 'movedIn']);
   });
 
   it('keeps charges whose URLs are still live on top of what S3 holds, and prunes expired ones after the match window', async () => {

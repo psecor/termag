@@ -41,11 +41,11 @@ describe('orchestratorHealth', () => {
   });
 
   it('carries the Observability link from the environment, https only', async () => {
-    expect(observabilityUrlFromEnv({ OBSERVABILITY_UI_URL: ' https://app.example.test/o11y ' })).toBe('https://app.example.test/o11y');
+    expect(observabilityUrlFromEnv({ OBSERVABILITY_UI_URL: ' https://app.example.test/observe ' })).toBe('https://app.example.test/observe');
     expect(observabilityUrlFromEnv({ OBSERVABILITY_UI_URL: 'http://plain.example.test' })).toBeNull();
     expect(observabilityUrlFromEnv({})).toBeNull();
-    const h = await orchestratorHealth({ env: { OBSERVABILITY_UI_URL: 'https://app.example.test/o11y' } });
-    expect(h.observabilityUrl).toBe('https://app.example.test/o11y');
+    const h = await orchestratorHealth({ env: { OBSERVABILITY_UI_URL: 'https://app.example.test/observe' } });
+    expect(h.observabilityUrl).toBe('https://app.example.test/observe');
   });
 
   it('reports a unit that does not answer, and caches that too', async () => {

@@ -42,8 +42,10 @@ describe('segmentFor (the engagement ladder)', () => {
     expect(segmentFor('2026-10-01', act, emptyCreations, '2026-10-17')).toBe('Dormant');
   });
 
-  it('30-day Dormant window: a user from Oct 1 is Dormant on Nov 15 with no activity', () => {
-    const act = new Set(['2026-10-10']); // long gone by Nov 15
+  it('Dormant is 7 days with no active day: Passive on day 6 after the last one, Dormant on day 7', () => {
+    const act = new Set(['2026-10-10']);
+    expect(segmentFor('2026-10-01', act, emptyCreations, '2026-10-16')).toBe('Passive');
+    expect(segmentFor('2026-10-01', act, emptyCreations, '2026-10-17')).toBe('Dormant');
     expect(segmentFor('2026-10-01', act, emptyCreations, '2026-11-15')).toBe('Dormant');
   });
 
@@ -58,7 +60,8 @@ describe('segmentFor (the engagement ladder)', () => {
     expect(RULES).toMatchObject({
       NEW_DAYS: 3, ACTIVE_WINDOW: 7, ACTIVE_MIN: 3, PASSIVE_WINDOW: 7, PASSIVE_MIN: 1,
       POWER_WINDOW: 7, POWER_MIN: 5, POWER_CREAT_WINDOW: 30, POWER_BOXES: 2,
-      POWER_CREATIONS: 5, DORMANT_WINDOW: 30,
+      POWER_CREATIONS: 5,
     });
+    expect(RULES).not.toHaveProperty('DORMANT_WINDOW');
   });
 });

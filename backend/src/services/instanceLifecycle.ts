@@ -9,10 +9,24 @@
  */
 
 import type { Instance, User } from '@prisma/client';
+import { isStuckStartNote, STUCK_START_NOTE_PREFIX } from './boxLifecyclePolicy';
+
+/**
+ * The stuck-start stop's mark, dropped by any connect of the box's agent:
+ * the box came up. connectUpdate puts it in its own write; this is the same
+ * drop for a connect whose guarded write missed (agentRegistry), keyed on
+ * the note instead of the status (Bugbot on #623).
+ */
+export function stuckMarkDropUpdate(instanceId: string) {
+  return {
+    where: { id: instanceId, lifecycleNote: { startsWith: STUCK_START_NOTE_PREFIX } },
+    data: { lifecycleNote: null, autoParkedAt: null, idleWarnedAt: null, idleParkAt: null },
+  };
+}
 
 export const INSTANCE_STATUSES = [
   'provisioning', 'awaiting-agent', 'warming', 'warm', 'ready', 'stopping', 'stopped', 'starting',
-  'hibernating', 'hibernated', 'failed', 'terminated',
+  'hibernating', 'hibernated', 'failed', 'quarantined', 'terminated',
 ] as const;
 export type InstanceStatus = typeof INSTANCE_STATUSES[number];
 
@@ -77,7 +91,9 @@ export function registryKeyOf(conn: AgentConnection): { scope: 'user' | 'instanc
  * Resize box workflow), so the box is simply up again. `stopping` stays put: a
  * redial while EC2 is shutting the box down is not the box coming back, and
  * the power sweep settles it from the EC2 state either way. `hibernating` and
- * `hibernated` follow the same two rules.
+ * `hibernated` follow the same two rules. `quarantined` stays put: its tokens
+ * are revoked, so a connect means something got past that, and must not make
+ * the box usable again.
  */
 const CONNECT_TRANSITIONS: Readonly<Record<InstanceStatus, InstanceStatus>> = {
   'provisioning': 'ready',
@@ -91,6 +107,7 @@ const CONNECT_TRANSITIONS: Readonly<Record<InstanceStatus, InstanceStatus>> = {
   'hibernating': 'hibernating',
   'hibernated': 'ready',
   'failed': 'failed',
+  'quarantined': 'quarantined',
   'terminated': 'terminated',
 };
 
@@ -115,19 +132,48 @@ export function nextStatusOnConnect(status: string): string {
  * is connected whatever the row now says.
  */
 export function connectUpdate(
-  instance: Pick<Instance, 'id' | 'status'>,
+  instance: Pick<Instance, 'id' | 'status'> & Partial<Pick<Instance, 'autoParkedAt' | 'lifecycleNote' | 'rehibernatePending'>>,
   now: Date,
-): { where: { id: string; status: string }; data: { status: string; lastConnectedAt: Date } } {
+): {
+  where: { id: string; status: string };
+  data: {
+    status: string; lastConnectedAt: Date; lastReadyAt?: Date; idleWarnedAt?: null; idleParkAt?: null;
+    autoParkedAt?: null; lifecycleNote?: null; downSince?: null;
+  };
+} {
   // Deliberately no agentDisconnectedAt. The close path is its only writer,
   // and the two writes are unordered, so clearing it here would revive a box
   // whose disconnect had already landed. The columns are independent facts;
   // a reader decides liveness with
   // `agentDisconnectedAt IS NULL OR agentDisconnectedAt < lastConnectedAt`.
+  // lastReadyAt only when this connect is what makes the box ready (a start,
+  // a resume, a first boot), never on a reconnect of a box that already was:
+  // the lifecycle sweep's start grace counts from it (boxLifecyclePolicy.ts).
+  // The same connect clears the sweep's warning: one written before the box
+  // came up (an idle warning before it went down, a stuck-start warning while
+  // it wouldn't connect) promises nothing about it now (Bugbot on #623).
+  // A box that carries the stuck-start stop's note and whose agent now
+  // connects has come up after all, whatever its status: its stuck stop
+  // timed out back to `ready`, it was started again after one, or the agent
+  // was restarted while the stop was still in flight, as the warning says
+  // to. The stuck stop's mark goes, so neither the retry nor the quiet
+  // re-park takes it for a box nobody woke; when the connect also makes it
+  // ready, it is the box's start (Bugbot and the security review on #623).
+  // The connect that brings the box up ends its down clock (box.resumed's
+  // downMinutes, boxPower.ts), except the 60-day refresh's: that box goes
+  // straight back to hibernated and keeps the clock from before it.
+  const status = nextStatusOnConnect(instance.status);
+  const cameUp = status === 'ready' && instance.status !== 'ready';
+  const stuckStopFailed = isStuckStartNote(instance.lifecycleNote);
   return {
     where: { id: instance.id, status: instance.status },
     data: {
-      status: nextStatusOnConnect(instance.status),
+      status,
       lastConnectedAt: now,
+      ...(cameUp ? { lastReadyAt: now, idleWarnedAt: null, idleParkAt: null } : {}),
+      ...(cameUp && !instance.rehibernatePending ? { downSince: null } : {}),
+      ...(stuckStopFailed ? { idleWarnedAt: null, idleParkAt: null, autoParkedAt: null, lifecycleNote: null } : {}),
+      ...(stuckStopFailed && status === 'ready' ? { lastReadyAt: now } : {}),
     },
   };
 }

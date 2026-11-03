@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { humanActivityKey } from './humanActivity';
-import { CLOUD_WORKTIME_LABEL, CLOUD_WORKTIME_PROJECT, resolveWorktimeProject, toWorktimeProjectRows, workTimeIdentity } from './worktimeProjects';
+import { CLOUD_WORKTIME_LABEL, CLOUD_WORKTIME_PROJECT, resolveWorktimeProject, toWorktimeProjectRows, workTimeIdentity, worktimeUsernames } from './worktimeProjects';
 
 const NAMES = ['termag', 'ic', 'ic-sample-app', 'research'];
 
@@ -70,5 +70,16 @@ describe('toWorktimeProjectRows', () => {
     expect(workTimeIdentity('alice', 'cx', 'human', 'd', null).instanceId).toBe('');
     expect(humanActivityKey('alice', 'cx', 'box-a')).not.toBe(humanActivityKey('alice', 'cx', 'box-b'));
     expect(humanActivityKey('alice', 'cx', null)).toBe(humanActivityKey('alice', 'cx', null));
+  });
+});
+
+describe('worktimeUsernames', () => {
+  it('reads a dotted or coloned name under its tmux-folded form too', () => {
+    expect(worktimeUsernames('first.last')).toEqual(['first.last', 'first_last']);
+    expect(worktimeUsernames('a:b.c')).toEqual(['a:b.c', 'a_b_c']);
+  });
+
+  it('reads a plain name once', () => {
+    expect(worktimeUsernames('alice')).toEqual(['alice']);
   });
 });

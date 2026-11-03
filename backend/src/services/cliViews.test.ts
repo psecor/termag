@@ -5,7 +5,7 @@ import { boxState, isAddressableName, shapeBox, shapeClone, shapeDevices, shapeP
 const T = new Date('2026-10-01T12:00:00Z');
 
 const box: BoxRow = {
-  id: 'i1', name: 'devbox', kind: 'ec2', status: 'ready', provisioningError: null,
+  id: 'i1', name: 'devbox', kind: 'ec2', flavor: 'full', status: 'ready', provisioningError: null,
   ec2InstanceId: 'i-0abc', region: 'us-east-2', hostUnixUser: 'zane',
   createdAt: T, readyAt: T, projects: [{ id: 'p1', name: 'fix' }],
 };
@@ -36,10 +36,25 @@ describe('isAddressableName', () => {
 describe('shapeBox', () => {
   it('shapes a running box', () => {
     expect(shapeBox(box, true)).toEqual({
-      id: 'i1', name: 'devbox', addressable: true, kind: 'ec2', state: 'running', status: 'ready',
+      id: 'i1', name: 'devbox', addressable: true, kind: 'ec2', flavor: 'full', state: 'running', status: 'ready',
       agentConnected: true, error: null, ec2InstanceId: 'i-0abc', region: 'us-east-2', hostUnixUser: 'zane',
       createdAt: T.toISOString(), readyAt: T.toISOString(), projects: [{ id: 'p1', name: 'fix' }],
+      size: null, instanceType: null, diskGiB: null, resize: null, createdFor: null, lifecycle: null,
     });
+  });
+
+  it("says a box made for `termag ask` is one, and any other value isn't", () => {
+    expect(shapeBox({ ...box, createdFor: 'ask' }, true).createdFor).toBe('ask');
+    expect(shapeBox({ ...box, createdFor: null }, true).createdFor).toBeNull();
+    expect(shapeBox({ ...box, createdFor: 'later' }, true).createdFor).toBeNull();
+  });
+
+  it('carries the size and the type the box launched as', () => {
+    expect(shapeBox({ ...box, size: 'small', instanceType: 'r8g.large' }, true)).toMatchObject({ size: 'small', instanceType: 'r8g.large' });
+  });
+
+  it('carries the disk it was made with', () => {
+    expect(shapeBox({ ...box, diskGiB: 200 }, true)).toMatchObject({ diskGiB: 200 });
   });
 
   it('surfaces the provisioning error only for a failed box', () => {
@@ -90,6 +105,11 @@ describe('shapeProject', () => {
     expect(shapeProject(row, undefined)?.clone).toBeNull();
     expect(shapeProject({ ...row, repoUrl: 'https://github.com/a/b', setupStatus: 'cloning' }, undefined)?.clone)
       .toEqual({ state: 'cloning', setupStatus: 'cloning', error: null, repoUrl: 'https://github.com/a/b', retryable: false });
+  });
+
+  it("says a project made for `termag ask` is one, null otherwise", () => {
+    expect(shapeProject({ ...row, createdFor: 'ask' }, undefined)?.createdFor).toBe('ask');
+    expect(shapeProject(row, undefined)?.createdFor).toBeNull();
   });
 });
 

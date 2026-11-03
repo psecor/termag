@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { reviewFields, reviewRows, reviewTrend, reviewWindow, topReviewers, type RPr, type RReview } from './reviews';
+import { reviewFields, reviewRows, reviewTrend, reviewWindow, teamReviewTrend, topReviewers, ALL_REVIEWER_CLASSES, type RPr, type RReview } from './reviews';
 import { DEFAULT_AGENT_LOGINS, DEFAULT_BOT_LOGINS } from './classify';
 import type { PrNode } from './sync';
 
@@ -179,6 +179,31 @@ describe('reviewTrend', () => {
     expect(w).toEqual([
       { week: '2026-10-12', reviews: 0, reviewers: 0, agentOnly: 1, humanApproved: 0, unapproved: 0 },
       { week: '2026-10-19', reviews: 1, reviewers: 1, agentOnly: 0, humanApproved: 1, unapproved: 0 },
+    ]);
+  });
+});
+
+describe('reviewer classes', () => {
+  it('includes a tagged bot only when the classes allow it', () => {
+    const prs = [pr('a')];
+    const reviews = [rv('a', 'bugbot', 'COMMENTED', '2026-10-21T00:00:00Z', { cls: 'automation' }), rv('a', 'grace', 'APPROVED', '2026-10-21T00:00:00Z')];
+    expect(topReviewers(prs, reviews, since(30), NOW).map(r => r.login)).toEqual(['grace']);
+    expect(topReviewers(prs, reviews, since(30), NOW, ALL_REVIEWER_CLASSES).map(r => `${r.login}:${r.cls}`).sort()).toEqual(['bugbot:automation', 'grace:human']);
+    expect(reviewWindow(prs, reviews, since(30), NOW, AGENT_REPOS).reviews).toBe(1);
+    expect(reviewWindow(prs, reviews, since(30), NOW, AGENT_REPOS, ALL_REVIEWER_CLASSES).reviews).toBe(2);
+  });
+});
+
+describe('teamReviewTrend', () => {
+  it('separates reviews given by the team from reviews received on its PRs', () => {
+    const prs = [pr('mine', { credited: 'grace', mergedAt: at('2026-10-20T00:00:00Z') }), pr('other', { credited: 'linus' })];
+    const reviews = [
+      rv('mine', 'outsider', 'APPROVED', '2026-10-20T01:00:00Z'),
+      rv('other', 'grace', 'APPROVED', '2026-10-20T02:00:00Z'),
+      rv('mine', 'grace', 'COMMENTED', '2026-10-20T03:00:00Z'),
+    ];
+    expect(teamReviewTrend(prs, reviews, () => ['grace'], at('2026-10-19T00:00:00Z'), NOW)).toEqual([
+      { week: '2026-10-19', given: 1, received: 1, reviewersGiven: 1, reviewersReceived: 1 },
     ]);
   });
 });

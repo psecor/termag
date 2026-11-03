@@ -18,7 +18,7 @@ export function providersRouter(): Router {
     res.json({
       providers: SELECTABLE_PROVIDER_IDS.map(id => {
         const p = PROVIDERS[id];
-        return { id, displayName: p.displayName, badge: p.badge, color: p.color, usagePrecision: p.usagePrecision };
+        return { id, displayName: p.displayName, badge: p.badge, color: p.color, lightColor: p.lightColor, usagePrecision: p.usagePrecision };
       }),
     });
   };

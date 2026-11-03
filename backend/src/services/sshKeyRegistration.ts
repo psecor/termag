@@ -1,6 +1,7 @@
 /**
  * Owner SSH public keys. The Settings page route (routes/sshKeys.ts)
- * registers and lists them; the CLI (routes/cliCredentials.ts) only lists them.
+ * registers, lists and removes them; the CLI API (routes/cliCredentials.ts)
+ * lists and removes them.
  */
 import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
@@ -42,6 +43,17 @@ export async function pushKeys(userId: string): Promise<SshKeySyncResult | null>
     console.error('[SSH-KEYS] push failed:', err instanceof Error ? err.message : String(err));
     return null;
   }
+}
+
+export type RemoveSshKeyResult =
+  | { kind: 'removed'; boxes: SshKeySyncResult | null }
+  | { kind: 'not_found' };
+
+/** Takes the key out of termag's managed keys on every box the owner has. */
+export async function removeSshKey(userId: string, id: string): Promise<RemoveSshKeyResult> {
+  const result = await prisma.sshPublicKey.deleteMany({ where: { id, userId } });
+  if (result.count === 0) return { kind: 'not_found' };
+  return { kind: 'removed', boxes: await pushKeys(userId) };
 }
 
 export type RegisterSshKeyResult =

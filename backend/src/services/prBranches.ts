@@ -17,6 +17,7 @@ import { WORK_PROJECT_KINDS } from './projectKind';
 import { isProjectAgentConnected, sendForProject, type ProjectHost } from './agentRegistry';
 import { getGithubBrokerUrl } from './githubBroker';
 import type { BranchState, LinkableWorkstream } from './prPipeline';
+import { isWorkspace, repoSlug } from './projectRepos';
 import { projectDirFor } from './tmux';
 
 // The agent's git calls are capped at 5 s for `status` and 2 s for the rest,
@@ -32,6 +33,13 @@ export interface WorkstreamTarget {
   workstream: string;
   /** Workstream.branch: what the worktree was created for. */
   branch: string;
+  /**
+   * owner/name the checkout is known to be without asking the box: a
+   * multi-repo project's ProjectRepo, which has
+   * one target per repository, all on the same branch. Without it those
+   * would link by branch alone, and several on one branch link to nothing.
+   */
+  repo?: string | null;
 }
 
 /** The fields of the RPC answer this reads; everything is re-validated. */
@@ -83,7 +91,7 @@ export function toBranchState(t: WorkstreamTarget, raw: RawBranchState): BranchS
   if (!branch) return null; // detached HEAD: nothing a PR could come from
   const upstream = str(raw.upstream);
   return {
-    repo: repoFromOrigin(raw.origin),
+    repo: repoFromOrigin(raw.origin) ?? t.repo ?? null,
     branch,
     baseBranch: str(raw.baseBranch) ?? 'main',
     // Not a count (the agent's rev-list failed, or an older answer): unknown, not 0.
@@ -115,13 +123,21 @@ export async function sweepBranches(
   // Once an agent says it has no such RPC, don't ask it again for its other workstreams.
   const outdated = new Set<string>();
   const hostKey = (h: ProjectHost) => h.instanceId ?? `legacy:${h.userId}`;
+  // The notes count workstreams: a multi-repo one has a target per repository.
+  const counted = new Set<string>();
+  const note = (t: WorkstreamTarget, reason: 'offline' | 'outdatedAgent' | 'failed') => {
+    const key = `${reason}\u0000${t.projectId}\u0000${t.workstream}`;
+    if (counted.has(key)) return;
+    counted.add(key);
+    out[reason]++;
+  };
 
   const one = async (t: WorkstreamTarget) => {
     const fallback: LinkableWorkstream = {
-      projectId: t.projectId, projectName: t.projectName, workstream: t.workstream, branch: t.branch, repo: null,
+      projectId: t.projectId, projectName: t.projectName, workstream: t.workstream, branch: t.branch, repo: t.repo ?? null,
     };
-    if (!deps.connected(t.host)) { out.offline++; out.workstreams.push(fallback); return; }
-    if (outdated.has(hostKey(t.host))) { out.outdatedAgent++; out.workstreams.push(fallback); return; }
+    if (!deps.connected(t.host)) { note(t, 'offline'); out.workstreams.push(fallback); return; }
+    if (outdated.has(hostKey(t.host))) { note(t, 'outdatedAgent'); out.workstreams.push(fallback); return; }
     try {
       const raw = await deps.send(t.host, 'git-branch-state', { cwd: t.cwd }, RPC_TIMEOUT_MS) as RawBranchState;
       const state = toBranchState(t, raw ?? {});
@@ -129,8 +145,8 @@ export async function sweepBranches(
       out.branches.push(state);
       out.workstreams.push({ ...fallback, branch: state.branch, repo: state.repo });
     } catch (err) {
-      if (/Unknown command/i.test((err as Error).message)) { outdated.add(hostKey(t.host)); out.outdatedAgent++; }
-      else out.failed++;
+      if (/Unknown command/i.test((err as Error).message)) { outdated.add(hostKey(t.host)); note(t, 'outdatedAgent'); }
+      else note(t, 'failed');
       // Either way the workstream still links by branch.
       out.workstreams.push(fallback);
     }
@@ -153,23 +169,43 @@ export async function workstreamTargets(userId: string): Promise<WorkstreamTarge
       branch: true,
       project: {
         select: {
-          id: true, name: true, userId: true, instanceId: true,
+          id: true, name: true, userId: true, instanceId: true, layout: true,
           user: { select: { unixUsername: true } },
           instance: { select: { hostHome: true } },
+          repos: { select: { name: true, url: true, position: true } },
         },
       },
     },
   });
   // A stopped box has no agent connected, so the sweep counts it offline and
   // its workstreams still link by branch.
-  return rows.map(w => ({
-    host: { userId: w.project.userId, instanceId: w.project.instanceId },
-    cwd: projectDirFor(w.project, w.name),
-    projectId: w.project.id,
-    projectName: w.project.name,
-    workstream: w.name,
-    branch: w.branch,
-  }));
+  return rows.flatMap(w => workstreamTargetsOf(w.project, { name: w.name, branch: w.branch }));
+}
+
+/**
+ * Where one workstream's checkouts are: its directory, or for a multi-repo
+ * project (whose directory is not a repository) each repository's worktree
+ * in it, by position.
+ */
+export function workstreamTargetsOf(
+  project: Parameters<typeof projectDirFor>[0] & {
+    id: string; userId: string; instanceId: string | null; layout?: string | null;
+    repos?: ReadonlyArray<{ name: string; url: string; position: number }>;
+  },
+  ws: { name: string; branch: string },
+): WorkstreamTarget[] {
+  const base = {
+    host: { userId: project.userId, instanceId: project.instanceId },
+    projectId: project.id,
+    projectName: project.name,
+    workstream: ws.name,
+    branch: ws.branch,
+  };
+  const dir = projectDirFor(project, ws.name);
+  if (!isWorkspace(project)) return [{ ...base, cwd: dir }];
+  return [...(project.repos ?? [])]
+    .sort((a, b) => a.position - b.position)
+    .map(r => ({ ...base, cwd: `${dir}/${r.name}`, repo: repoSlug(r.url) }));
 }
 
 export async function readBranches(userId: string): Promise<BranchSweep> {

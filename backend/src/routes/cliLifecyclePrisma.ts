@@ -9,21 +9,27 @@ import { posix } from 'path';
 import { prisma } from '../db';
 import { pickTarget } from '../services/agentMessages';
 import { instanceAgentTransport, sendToInstanceAgent } from '../services/agentRegistry';
+import { ownerBoxCostToday } from '../services/boxCost/owner';
+import { applyAskBoxPolicy } from '../services/boxLifecycle';
 import { isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { powerStateError } from '../services/boxPowerPolicy';
 import type { CliUser } from '../services/cliStore';
 import { prismaCliStore } from '../services/cliStorePrisma';
+import { resolveChatSpaceChoice } from '../services/chatSpace';
 import { createCliWorkstream } from '../services/cliWorkstreams';
 import { T3_CAPABILITY, desktopAppEnabled } from '../services/desktopAppFlag';
 import { repoFromOrigin } from '../services/prBranches';
 import { projectDirFor } from '../services/tmux';
 import { cliErrorResult, type CliLifecycle } from './cliLifecycle';
-import { createBox, powerOwnedBox, renameOwnedBox, setOwnedBoxLifecycle, terminateOwnedBox } from './instances';
+import {
+  boxSizeChoices, createBox, keepOwnedBoxRunning, ownedBoxResizeInfo, powerOwnedBox, renameOwnedBox, repoQuery,
+  resizeOwnedBox, setOwnedBoxLifecycle, terminateOwnedBox,
+} from './instances';
 import { archiveOwnedProject, createProjectFor, renameOwnedProject, retryCloneFor } from './projects';
 import type { RouteResult } from './routeResult';
 import { createWorkstreamFor, removeWorkstreamFor } from './workstreams';
 
-async function fullUser(user: CliUser): Promise<Express.User> {
+export async function fullUser(user: CliUser): Promise<Express.User> {
   const row = await prisma.user.findUnique({ where: { id: user.id } });
   if (!row) throw new Error('User not found');
   return row;
@@ -38,9 +44,10 @@ async function projectView(userId: string, id: string) {
 }
 
 /**
- * The routes only the desktop app calls (workstreams, clone retry, hibernate)
- * answer as if they weren't there unless desktop-app-enabled is on for the
- * owner and the box, as the desktop's own bridge does.
+ * The routes only the desktop app calls (workstreams, hibernate) answer as if
+ * they weren't there unless desktop-app-enabled is on for the owner and the
+ * box, as the desktop's own bridge does. Clone retry isn't one of them:
+ * `termag ask --new-box` retries a project whose box failed to launch.
  */
 const DESKTOP_OFF: RouteResult = {
   status: 404,
@@ -90,7 +97,7 @@ function workstreamError(result: RouteResult): RouteResult {
  * (the t3-paths RPC, as t3/projects asks it) when the agent has one, else as
  * the orchestrator names it, which is the same path on every box without a remap.
  */
-async function boxDirectory(userId: string, projectId: string, name: string): Promise<{ directory: string; exists: boolean }> {
+export async function boxDirectory(userId: string, projectId: string, name: string): Promise<{ directory: string; exists: boolean }> {
   const project = await prisma.project.findFirst({
     where: { id: projectId, userId },
     select: { name: true, instanceId: true, user: { select: { unixUsername: true } }, instance: { select: { hostHome: true } } },
@@ -114,7 +121,7 @@ function idOf(body: unknown, key?: string): string {
 }
 
 export const prismaCliLifecycle: CliLifecycle = {
-  async createBox(user, name, parentInstanceId) {
+  async createBox(user, input, parentInstanceId, createdFor) {
     // Without provisioning, the cookie route hands back a raw token for a
     // hand-built box. The CLI only makes EC2 boxes, so it never asks for one.
     if (!isBoxProvisioningConfigured()) {
@@ -123,10 +130,28 @@ export const prismaCliLifecycle: CliLifecycle = {
         body: { error: 'This orchestrator has no box provisioning configured', code: 'provisioning_unconfigured' },
       };
     }
-    const result = await createBox(await fullUser(user), { name, kind: 'ec2' }, { parentInstanceId });
+    // The CLI's fields, restated for instances.createBox: these names are
+    // all it takes (what the CLI calls repoUrls is `repo` here), and `flavor`
+    // rides as-typed when the CLI sent it — services/boxFlavor's flavorOf is
+    // what turns anything fuzzed into the flavor that instance should ride.
+    const result = await createBox(
+      await fullUser(user),
+      {
+        name: input.name,
+        kind: 'ec2',
+        size: input.size,
+        diskGiB: input.diskGiB,
+        repo: input.repoUrls,
+        ...(input.flavor !== undefined ? { flavor: input.flavor } : {}),
+      },
+      { parentInstanceId, createdFor },
+    );
     if (result.status !== 201) return cliErrorResult(result);
-    const claimed = (result.body as { claimed?: boolean }).claimed === true;
-    return { status: 201, body: { box: await boxView(user.id, idOf(result.body, 'instance')), claimed } };
+    const { claimed, warnings } = result.body as { claimed?: boolean; warnings?: string[] };
+    const boxId = idOf(result.body, 'instance');
+    // A box made for an ask gets the ask-box policy in one place (boxLifecycle.applyAskBoxPolicy).
+    if (createdFor === 'ask') await applyAskBoxPolicy(boxId);
+    return { status: 201, body: { box: await boxView(user.id, boxId), claimed: claimed === true, ...(warnings?.length ? { warnings } : {}) } };
   },
 
   async boxParent(user, boxId) {
@@ -151,7 +176,7 @@ export const prismaCliLifecycle: CliLifecycle = {
     const picked = pickTarget(rows.map(p => ({
       projectId: p.id, projectName: p.name, boxName: p.instance?.name ?? null,
       ownerUsername: p.user.unixUsername, isOwner: p.userId === user.id,
-    })), { box, project, workstream: null });
+    })), { box, project });
     if ('error' in picked) {
       return { status: picked.status, body: { error: picked.error, code: picked.status === 404 ? 'not_found' : 'ambiguous' } };
     }
@@ -187,6 +212,25 @@ export const prismaCliLifecycle: CliLifecycle = {
     return result;
   },
 
+  async resizeInfo(user, boxId) {
+    const result = await ownedBoxResizeInfo(await fullUser(user), boxId);
+    return result.status === 200 ? result : cliErrorResult(result);
+  },
+
+  async boxSizes(user, repo) {
+    return boxSizeChoices(await fullUser(user), repoQuery(repo));
+  },
+
+  async boxCosts(user) {
+    return { status: 200, body: await ownerBoxCostToday(user.id) };
+  },
+
+  async keepBoxRunning(user, boxId) {
+    const result = await keepOwnedBoxRunning(await fullUser(user), boxId, 'cli');
+    if (result.status !== 200) return cliErrorResult(result);
+    return result;
+  },
+
   async removeBox(user, boxId, confirmed) {
     const result = await terminateOwnedBox(await fullUser(user), boxId, confirmed);
     if (result.status !== 200) return cliErrorResult(result);
@@ -203,16 +247,32 @@ export const prismaCliLifecycle: CliLifecycle = {
     return { status: 200, body: { box: await boxView(user.id, boxId) } };
   },
 
-  async createProject(user, { boxId, name, agent, repoUrl }) {
+  async resizeBox(user, boxId, { size, force }) {
+    const result = await resizeOwnedBox(await fullUser(user), boxId, { size, force }, 'cli');
+    if (result.status !== 202) return cliErrorResult(result);
+    return { status: 202, body: { box: await boxView(user.id, boxId), resize: (result.body as { resize: unknown }).resize } };
+  },
+
+  async createProject(user, { boxId, name, agent, repoUrl, repoUrls, createdFor, chatSpace }) {
+    // Several repositories: a multi-repo project (routes/projects.ts createWorkspaceProject), each checkout named by its repository.
+    const source = repoUrls?.length ? { repos: repoUrls.map(url => ({ url })) } : { repoUrl };
     const result = await createProjectFor(await fullUser(user), {
-      name, instanceId: boxId, initialAgent: { enabled: true, provider: agent }, repoUrl,
+      name, instanceId: boxId, initialAgent: { enabled: true, provider: agent }, ...source,
+      // Fixed on its main workstream from the insert, as the web form's is (services/chatSpace.ts).
+      ...(chatSpace !== undefined ? { chatSpace } : {}),
     });
     if (result.status !== 201 && result.status !== 200) return cliErrorResult(result);
     const restored = (result.body as { restored?: boolean }).restored === true;
+    if (createdFor) await prisma.project.update({ where: { id: idOf(result.body) }, data: { createdFor } });
+    const repos = ((result.body as { repos?: Array<{ name: string; url: string }> }).repos ?? []).map(r => ({ name: r.name, url: r.url }));
     // An un-archived project keeps its old directory; only a fresh one is cloned.
     return {
       status: result.status,
-      body: { project: await projectView(user.id, idOf(result.body)), restored, repoUrl: restored ? null : repoUrl ?? null },
+      body: {
+        project: await projectView(user.id, idOf(result.body)), restored,
+        repoUrl: restored ? null : repoUrl ?? repoUrls?.[0] ?? null,
+        ...(repos.length ? { repos } : {}),
+      },
     };
   },
 
@@ -231,8 +291,13 @@ export const prismaCliLifecycle: CliLifecycle = {
   async createWorkstream(user, projectId, request) {
     if (await desktopOff(user, await projectBox(user, projectId))) return DESKTOP_OFF;
     const owner = await fullUser(user);
+    // Resolved for the caller and fixed in the workstream's insert, as New session's worktree is
+    // (routes/workstreams.ts browserChatSpace): a space they can't use leaves it to the box's first grant.
+    const chatSpace = request.chatSpace !== undefined
+      ? await resolveChatSpaceChoice(request.chatSpace, user.id).catch(() => null)
+      : null;
     const result = await createCliWorkstream(request, {
-      create: input => createWorkstreamFor(owner, projectId, input),
+      create: input => createWorkstreamFor(owner, projectId, { ...input, ...(chatSpace ? { chatSpace } : {}) }),
       locate: name => boxDirectory(user.id, projectId, name),
     });
     return result.status === 201 ? result : workstreamError(result);
@@ -254,7 +319,7 @@ export const prismaCliLifecycle: CliLifecycle = {
   },
 
   async retryClone(user, projectId) {
-    if (await desktopOff(user, await projectBox(user, projectId))) return DESKTOP_OFF;
+    if (!(await projectBox(user, projectId))) return { status: 404, body: { error: 'Project not found', code: 'not_found' } };
     const refused = await parkedRefusal(user, projectId);
     if (refused) return refused;
     const result = await retryCloneFor(await fullUser(user), projectId);

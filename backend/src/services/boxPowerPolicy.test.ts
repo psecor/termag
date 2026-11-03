@@ -11,11 +11,13 @@ import {
   powerStateError,
   powerTimeoutsFromEnv,
   settlePowerState,
+  sleepKeepsDownClock,
   TERMINAL_BOX_PARKED_CLOSE_CODE,
   terminalAttachRefusal,
   terminalBoxParkedNotice,
 } from './boxPowerPolicy';
 import { INSTANCE_STATUSES } from './instanceLifecycle';
+import { QUARANTINED_OWNER_ERROR } from './boxQuarantinePolicy';
 
 const owned: PowerRequestBox = {
   userId: 'u1', kind: 'ec2', status: 'ready', ec2InstanceId: 'i-0abc', hibernationConfigured: true,
@@ -35,6 +37,13 @@ describe('powerRequestError', () => {
   it('refuses any power change on a box claimed for an automatic terminate', () => {
     expect(powerRequestError(box({ status: 'hibernated', autoTerminatedAt: new Date() }), 'u1', 'start', true))
       .toEqual({ status: 409, error: 'This box is being terminated automatically' });
+  });
+
+  it('refuses every power change on a quarantined box, start included', () => {
+    for (const action of ['start', 'stop', 'hibernate'] as const) {
+      expect(powerRequestError(box({ status: 'quarantined' }), 'u1', action, true))
+        .toEqual({ status: 409, error: QUARANTINED_OWNER_ERROR });
+    }
   });
 
   it("answers 404 for another user's box, the same as for a missing one", () => {
@@ -103,8 +112,12 @@ describe('powerStateError', () => {
     expect(powerStateError('hibernated')).toMatch(/hibernated\. Resume it/);
   });
 
+  it('says a quarantined box is kept for investigation', () => {
+    expect(powerStateError('quarantined')).toMatch(/quarantined by a termag admin/);
+  });
+
   it('says nothing for any other status', () => {
-    for (const s of INSTANCE_STATUSES.filter(s => !parked.includes(s))) {
+    for (const s of INSTANCE_STATUSES.filter(s => !parked.includes(s) && s !== 'quarantined')) {
       expect(powerStateError(s)).toBe(null);
     }
   });
@@ -121,10 +134,11 @@ describe('terminalBoxParkedNotice', () => {
     expect(terminalBoxParkedNotice('box-1', 'starting')?.status).toBe('starting');
     expect(terminalBoxParkedNotice('box-1', 'stopping')?.status).toBe('stopping');
     expect(terminalBoxParkedNotice('box-1', 'hibernated')?.status).toBe('hibernated');
+    expect(terminalBoxParkedNotice('box-1', 'quarantined')).toMatchObject({ status: 'quarantined', message: expect.stringMatching(/quarantined/) });
   });
 
   it('is null for every other status, which keeps the plain "agent not connected" close', () => {
-    for (const s of INSTANCE_STATUSES.filter(s => !parked.includes(s))) {
+    for (const s of INSTANCE_STATUSES.filter(s => !parked.includes(s) && s !== 'quarantined')) {
       expect(terminalBoxParkedNotice('box-1', s)).toBe(null);
     }
   });
@@ -330,5 +344,21 @@ describe('hibernation refresh', () => {
     expect(hibernationRefreshDue({ status: 'hibernated', hibernatedAt: null }, now, 55 * day)).toBe(false);
     expect(hibernationRefreshDue({ status: 'stopped', hibernatedAt: at(80) }, now, 55 * day)).toBe(false);
     expect(hibernationRefreshDue({ status: 'hibernated', hibernatedAt: at(80) }, now, 0)).toBe(false);
+  });
+});
+
+describe('sleepKeepsDownClock', () => {
+  const up = new Date('2026-10-26T12:00:00Z');
+  it('keeps the clock of a box that never came up, whoever asks', () => {
+    expect(sleepKeepsDownClock({ status: 'starting' }, 'owner')).toBe(true);
+    expect(sleepKeepsDownClock({ status: 'starting' }, 'stuck-start')).toBe(true);
+  });
+  it('ends it for any stop or hibernate of a ready box but the refresh\'s', () => {
+    for (const by of ['owner', 'idle', 'stuck-start', null]) expect(sleepKeepsDownClock({ status: 'ready', lastReadyAt: up }, by)).toBe(false);
+  });
+  it('keeps it for the refresh\'s re-hibernate of an untouched box, not one used since the refresh brought it up', () => {
+    expect(sleepKeepsDownClock({ status: 'ready', lastReadyAt: up, lastActivityAt: new Date(up.getTime() - 60_000) }, 'refresh')).toBe(true);
+    expect(sleepKeepsDownClock({ status: 'ready', lastReadyAt: up, lastActivityAt: null }, 'refresh')).toBe(true);
+    expect(sleepKeepsDownClock({ status: 'ready', lastReadyAt: up, lastActivityAt: new Date(up.getTime() + 1) }, 'refresh')).toBe(false);
   });
 });

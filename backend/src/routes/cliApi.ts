@@ -29,6 +29,7 @@ import { Router, RequestHandler, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { mountCliTuiRoutes, type CliTui } from './cliTui';
+import { mountCliPrsRoutes, type CliPrs } from './cliPrs';
 import {
   AuthCodeStore,
   CLI_TOKEN_PREFIX,
@@ -44,10 +45,30 @@ import { closeCliSocketsForSession } from './cliWs';
 import { shapeDevices } from '../services/cliViews';
 import { mountCliLifecycleRoutes, type CliLifecycle } from './cliLifecycle';
 import { mountCliAskRoutes, type CliAsk } from './cliAsk';
+import { mountCliSpeechRoutes, type CliSpeech } from './cliSpeech';
+import { mountCliPreviewShareRoutes, type CliPreviewShares } from './cliPreviewShares';
+import { mountCliT3Routes, type CliT3 } from './cliT3';
+import { mountCliWorktimeRoutes, type CliWorktime } from './cliWorktime';
+import { mountCliSessionSearchRoutes, type CliSessionSearch } from './cliSessionSearch';
+import { mountCliAutomationRoutes, type CliAutomations } from './cliAutomations';
+import { mountCliBugReportRoutes, type CliBugReports } from './cliBugReports';
+import { mountCliMcpConnectorRoutes, type CliMcpConnectors } from './cliMcpConnectors';
+import { mountCliBriefingRoutes, type CliBriefings } from './cliBriefings';
+import { mountCliSessionSpaceRoutes, type CliSessionSpace } from './cliSessionSpace';
+import { mountCliGithubRepoRoutes, type CliGithubRepos } from './cliGithubRepos';
+import { mountCliChatRoutes, type CliChats } from './cliChats';
+import type { CliFeatures } from './cliFeatures';
+
+const NO_FEATURES: CliFeatures = { automations: false };
+import { mountCliDotfilesRoutes, type CliDotfiles } from './cliDotfiles';
+import { parseCliUsage } from '../services/cliUsage';
+import { recordProductEvent } from '../services/productEvents';
 
 export interface CliApiDeps {
   /** The TUI's routes (routes/cliTui.ts); unset in tests that don't need them. */
   tui?: CliTui;
+  /** The desktop's PR page writes (routes/cliPrs.ts): deferrals and review groups. */
+  prs?: CliPrs;
   store: CliStore;
   codes: AuthCodeStore;
   /** A promise because KMS keys load asynchronously at startup. */
@@ -56,6 +77,34 @@ export interface CliApiDeps {
   lifecycle?: CliLifecycle;
   /** Agent-to-agent asks (routes/cliAsk.ts). */
   ask?: CliAsk;
+  /** The desktop app's box bridge (routes/cliT3.ts); its relay is mounted separately, in index.ts. */
+  t3?: CliT3;
+  /** The desktop app's speech model for on-device dictation (routes/cliSpeech.ts). */
+  speech?: CliSpeech;
+  /** The desktop app's working time (routes/cliWorktime.ts). */
+  worktime?: CliWorktime;
+  /** Pane text search for the desktop's "Search terminal output" (routes/cliSessionSearch.ts). */
+  sessionSearch?: CliSessionSearch;
+  /** The desktop app's preview shares (routes/cliPreviewShares.ts), over the browser routes' handlers. */
+  previewShares?: CliPreviewShares;
+  /** Automations (routes/cliAutomations.ts), over the web UI's own handlers. */
+  automations?: CliAutomations;
+  /** `termag bug report` (routes/cliBugReports.ts). */
+  bugReports?: CliBugReports;
+  /** The user's MCP broker connectors, read-only (routes/cliMcpConnectors.ts). */
+  mcpConnectors?: CliMcpConnectors;
+  /** The desktop app's briefing card (routes/cliBriefings.ts). */
+  briefings?: CliBriefings;
+  /** A session's space, for the box's memory hooks (routes/cliSessionSpace.ts). */
+  sessionSpace?: CliSessionSpace;
+  /** The desktop app's repository picker (routes/cliGithubRepos.ts). */
+  githubRepos?: CliGithubRepos;
+  /** The desktop app's sidebar: termag web's sessions and their history (routes/cliChats.ts). */
+  chats?: CliChats;
+  /** What termag turns on for the person, in GET /whoami (routes/cliFeatures.ts). */
+  features?: (user: CliUser) => Promise<CliFeatures>;
+  /** The desktop app's Settings → Dotfiles (routes/cliDotfiles.ts). */
+  dotfiles?: CliDotfiles;
 }
 
 export type CliCredential =
@@ -73,6 +122,13 @@ function cliAuth(res: Response): CliAuth {
 
 function authRequired(res: Response, message: string): void {
   res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: message, code: 'auth_required' });
+}
+
+function devicesNeedSignIn(res: Response): void {
+  res.status(403).json({
+    error: "A box's own credentials cannot see or sign out your CLI sign-ins; run this on your laptop after `termag login`",
+    code: 'box_credential',
+  });
 }
 
 function userView(u: CliUser) {
@@ -155,6 +211,7 @@ export function cliApiRouter(deps: CliApiDeps): Router {
   });
 
   if (deps.tui) mountCliTuiRoutes(router, deps.tui, bearer);
+  if (deps.prs) mountCliPrsRoutes(router, deps.prs, bearer);
 
   // The ALB's jwt-validation action fetches this; it is public.
   router.get('/jwks.json', asyncHandler(async (_req, res) => {
@@ -228,10 +285,36 @@ export function cliApiRouter(deps: CliApiDeps): Router {
     res.status(204).end();
   }));
 
-  router.get('/whoami', bearer, (_req, res) => {
+  // The desktop's Settings → CLI sign-ins: the web's /api/cli-devices, with
+  // which one is the caller's own. A device sign-in only: a box's own token
+  // never sees or signs out its owner's devices.
+  router.get('/devices', bearer, asyncHandler(async (_req, res) => {
     const { user, credential } = cliAuth(res);
+    if (credential.kind !== 'device') { devicesNeedSignIn(res); return; }
+    const devices = shapeDevices(await deps.store.listDevices(user.id), now());
+    res.json({ devices: devices.map(d => ({ ...d, current: d.id === credential.sessionId })) });
+  }));
+
+  router.delete('/devices/:id', bearer, asyncHandler(async (req, res) => {
+    const { user, credential } = cliAuth(res);
+    if (credential.kind !== 'device') { devicesNeedSignIn(res); return; }
+    if (!await deps.store.revokeDevice(user.id, req.params.id, now())) {
+      res.status(404).json({ error: 'Device not found', code: 'device_not_found' });
+      return;
+    }
+    closeCliSocketsForSession(req.params.id);
+    res.status(204).end();
+  }));
+
+  // `admin`: the termag desktop shows its Admin link to admins only (the page checks again).
+  router.get('/whoami', bearer, asyncHandler(async (_req, res) => {
+    const { user, credential } = cliAuth(res);
+    const admin = deps.store.isAdmin ? await deps.store.isAdmin(user.id) : false;
+    // A flag lookup that fails shows the feature as off, never fails the sign-in check.
+    const features = deps.features ? await deps.features(user).catch(() => NO_FEATURES) : NO_FEATURES;
     res.json({
-      user: userView(user),
+      user: { ...userView(user), admin },
+      features,
       credential: credential.kind === 'device'
         ? {
           kind: 'device',
@@ -241,6 +324,18 @@ export function cliApiRouter(deps: CliApiDeps): Router {
         }
         : { kind: 'box', boxId: credential.boxId },
     });
+  }));
+
+  // The CLI's usage report (services/cliUsage.ts):
+  // one per command run, recorded as the cli.command product event.
+  router.post('/usage', bearer, (req, res) => {
+    const parsed = parseCliUsage(req.body);
+    if ('error' in parsed) { res.status(400).json({ error: parsed.error, code: 'invalid_usage' }); return; }
+    const { user, credential } = cliAuth(res);
+    recordProductEvent('cli.command', { user: user.id, box: credential.kind === 'box' ? credential.boxId : null }, {
+      ...parsed.detail, credential: credential.kind,
+    });
+    res.status(204).end();
   });
 
   router.get('/boxes', bearer, asyncHandler(async (_req, res) => {
@@ -253,6 +348,19 @@ export function cliApiRouter(deps: CliApiDeps): Router {
 
   if (deps.lifecycle) mountCliLifecycleRoutes(router, deps.lifecycle, bearer);
   if (deps.ask) mountCliAskRoutes(router, deps.ask, bearer);
+  if (deps.t3) mountCliT3Routes(router, deps.t3, bearer);
+  if (deps.speech) mountCliSpeechRoutes(router, deps.speech, bearer);
+  if (deps.worktime) mountCliWorktimeRoutes(router, deps.worktime, bearer);
+  if (deps.sessionSearch) mountCliSessionSearchRoutes(router, deps.sessionSearch, bearer);
+  if (deps.previewShares) mountCliPreviewShareRoutes(router, deps.previewShares, bearer);
+  if (deps.automations) mountCliAutomationRoutes(router, deps.automations, bearer);
+  if (deps.bugReports) mountCliBugReportRoutes(router, deps.bugReports, bearer, now);
+  if (deps.mcpConnectors) mountCliMcpConnectorRoutes(router, deps.mcpConnectors, bearer);
+  if (deps.sessionSpace) mountCliSessionSpaceRoutes(router, deps.sessionSpace, bearer);
+  if (deps.githubRepos) mountCliGithubRepoRoutes(router, deps.githubRepos, bearer);
+  if (deps.briefings) mountCliBriefingRoutes(router, deps.briefings, bearer);
+  if (deps.chats) mountCliChatRoutes(router, deps.chats, bearer);
+  if (deps.dotfiles) mountCliDotfilesRoutes(router, deps.dotfiles, bearer);
 
   router.use((_req, res) => {
     res.status(404).json({ error: 'No such CLI endpoint; this termag CLI may be newer than the orchestrator', code: 'not_found' });

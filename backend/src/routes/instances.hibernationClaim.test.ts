@@ -22,6 +22,9 @@ vi.mock('../services/featureFlags', () => {
     boolVariationForContext: vi.fn(async (key: string, ctx: FlagContext, fallback: boolean) => evaluate(key, ctx, fallback)),
     boolVariation: vi.fn(async (key: string, user: { id: string }, fallback: boolean) => evaluate(key, { kind: 'user', key: user.id }, fallback)),
     stringVariation: vi.fn(async (_key: string, _user: unknown, fallback: string) => fallback),
+    stringVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: string) => fallback),
+    numberVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: number) => fallback),
+    jsonVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: unknown) => fallback),
   };
 });
 

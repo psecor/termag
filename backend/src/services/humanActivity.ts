@@ -7,7 +7,10 @@
  */
 
 import { prisma } from '../db';
+import { timeZoneFor } from './userTimeZone';
+import { splitWorkTimeByDay } from './worktimeDays';
 import { workTimeIdentity } from './worktimeProjects';
+import { traceSweep } from './tracing/spans';
 
 
 const DECAY_MS = 3 * 60 * 1000; // 3 minutes
@@ -24,11 +27,6 @@ interface ActiveSession {
 const activeSessions = new Map<string, ActiveSession>();
 let checkTimer: NodeJS.Timeout | null = null;
 
-function todayStr(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
 export function humanActivityKey(username: string, project: string, instanceId: string | null): string {
   return `${username}:${instanceId ?? ''}:${project}`;
 }
@@ -37,21 +35,26 @@ function bankTime(session: ActiveSession): void {
   const durationMs = session.lastHeartbeat - session.startedAt;
   if (durationMs < 5000) return; // ignore trivial blips
 
-  const date = todayStr();
-  const identity = workTimeIdentity(session.username, session.project, 'human', date, session.instanceId);
-  prisma.workTimeEntry.upsert({
-    where: { username_project_provider_date_instanceId: identity },
-    update: {
-      totalMs: { increment: durationMs },
-      sessions: { increment: 1 },
-    },
-    create: {
-      ...identity,
-      totalMs: durationMs,
-      sessions: 1,
-    },
-  }).catch(err => {
-    console.error('[HUMAN-ACTIVITY] Failed to persist:', (err as Error).message);
+  // Banked by the person's own day (services/worktimeDays.ts): a span across
+  // their midnight lands on both days, the session counted on the last.
+  const parts = splitWorkTimeByDay(session.startedAt, session.lastHeartbeat, timeZoneFor(session.username));
+  parts.forEach((part, i) => {
+    const sessions = i === parts.length - 1 ? 1 : 0;
+    const identity = workTimeIdentity(session.username, session.project, 'human', part.date, session.instanceId);
+    prisma.workTimeEntry.upsert({
+      where: { username_project_provider_date_instanceId: identity },
+      update: {
+        totalMs: { increment: part.ms },
+        sessions: { increment: sessions },
+      },
+      create: {
+        ...identity,
+        totalMs: part.ms,
+        sessions,
+      },
+    }).catch(err => {
+      console.error('[HUMAN-ACTIVITY] Failed to persist:', (err as Error).message);
+    });
   });
 }
 
@@ -92,7 +95,7 @@ export function lastHumanHeartbeat(username: string, project: string, instanceId
 /** Start the decay checker */
 export function startHumanActivityTracker(): void {
   if (checkTimer) return;
-  checkTimer = setInterval(checkDecay, CHECK_INTERVAL_MS);
+  checkTimer = setInterval(traceSweep('human-activity', checkDecay), CHECK_INTERVAL_MS);
 }
 
 /** Stop tracker and bank all active sessions */

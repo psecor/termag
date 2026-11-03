@@ -100,6 +100,10 @@ describe('nextStatusOnConnect', () => {
     expect(nextStatusOnConnect('terminated')).toBe('terminated');
   });
 
+  it('never makes a quarantined box usable again', () => {
+    expect(nextStatusOnConnect('quarantined')).toBe('quarantined');
+  });
+
   it('passes an unrecognised status through unchanged', () => {
     expect(nextStatusOnConnect('hibernating')).toBe('hibernating');
   });
@@ -121,8 +125,41 @@ describe('connectUpdate', () => {
   it('marks a provisioning box ready', () => {
     expect(connectUpdate(instanceWithStatus('provisioning'), now)).toEqual({
       where: { id: instance.id, status: 'provisioning' },
-      data: { status: 'ready', lastConnectedAt: now },
+      data: { status: 'ready', lastConnectedAt: now, lastReadyAt: now, idleWarnedAt: null, idleParkAt: null, downSince: null },
     });
+  });
+
+  it('stamps lastReadyAt and clears a stale warning when the connect makes a started or resumed box ready, not on a reconnect', () => {
+    for (const status of ['starting', 'stopped', 'hibernated']) {
+      expect(connectUpdate(instanceWithStatus(status), now).data)
+        .toEqual({ status: 'ready', lastConnectedAt: now, lastReadyAt: now, idleWarnedAt: null, idleParkAt: null, downSince: null });
+    }
+    expect(connectUpdate(instanceWithStatus('ready'), now).data).toEqual({ status: 'ready', lastConnectedAt: now });
+  });
+
+  it("ends the box's down clock when it comes up, except for the 60-day refresh's connect, which keeps it", () => {
+    expect(connectUpdate({ ...instanceWithStatus('starting'), rehibernatePending: false }, now).data).toMatchObject({ downSince: null });
+    // The refresh's resume goes straight back to hibernated: the box stays down as far as box.resumed is concerned.
+    expect(connectUpdate({ ...instanceWithStatus('starting'), rehibernatePending: true }, now).data).not.toHaveProperty('downSince');
+    // A reconnect of a box that was already up, or a connect that doesn't make it ready, leaves it alone.
+    expect(connectUpdate(instanceWithStatus('ready'), now).data).not.toHaveProperty('downSince');
+    expect(connectUpdate(instanceWithStatus('stopping'), now).data).not.toHaveProperty('downSince');
+  });
+
+  it('treats the connect of a box carrying the stuck-start stop\'s note as its start, and drops the stuck mark', () => {
+    const stuck = { ...instanceWithStatus('ready'), autoParkedAt: null, lifecycleNote: 'Stopped automatically: it was started at …' };
+    const dropped = { status: 'ready', lastConnectedAt: now, lastReadyAt: now, idleWarnedAt: null, idleParkAt: null, autoParkedAt: null, lifecycleNote: null };
+    // Its stop timed out back to ready, and now its agent connects.
+    expect(connectUpdate(stuck, now).data).toEqual(dropped);
+    // Started again after a stuck stop that took (an automation's wake keeps the note).
+    expect(connectUpdate({ ...stuck, status: 'starting', autoParkedAt: new Date(now.getTime() - 60_000) }, now).data).toEqual({ ...dropped, downSince: null });
+    // The agent restarted while the stop is still in flight: the mark goes, and the box stays stopping.
+    expect(connectUpdate({ ...stuck, status: 'stopping', autoParkedAt: new Date(now.getTime() - 60_000) }, now).data).toEqual({
+      status: nextStatusOnConnect('stopping'), lastConnectedAt: now, idleWarnedAt: null, idleParkAt: null, autoParkedAt: null, lifecycleNote: null,
+    });
+    // An idle auto-stop's mark stays: a box an automation woke is still one nobody touched.
+    const idleStopped = { ...stuck, lifecycleNote: 'Stopped automatically after 2 h idle.' };
+    expect(connectUpdate(idleStopped, now).data).toEqual({ status: 'ready', lastConnectedAt: now });
   });
 
   it('does not make a warming box ready', () => {
@@ -155,8 +192,7 @@ describe('connectUpdate', () => {
     // connect update that touched this column would clear a disconnect that had
     // already landed and leave a dead box reading as connected.
     for (const status of INSTANCE_STATUSES) {
-      expect(Object.keys(connectUpdate(instanceWithStatus(status), now).data).sort())
-        .toEqual(['lastConnectedAt', 'status']);
+      expect(Object.keys(connectUpdate(instanceWithStatus(status), now).data)).not.toContain('agentDisconnectedAt');
     }
   });
 });

@@ -41,6 +41,7 @@ import { asyncHandler } from '../middleware/errors';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { parseRunnerEvent, recordRunnerEnd, recordRunnerStarted, recordRunnerTitle, recordRunnerUsage, type RunIdentity } from '../services/claudeRunnerSessions';
 import { notifyCloudSessionChange, recordSessionEvent, type SessionEventKind } from '../services/claudeSessionEvents';
+import { noteBoxActivity } from '../services/boxActivity';
 import { recordProductEvent } from '../services/productEvents';
 
 export function claudeRunnerEventsRouter(): Router {
@@ -87,6 +88,9 @@ export function claudeRunnerEventsRouter(): Router {
         provider: 'claude', kind: 'cloud', clientPlatform: outcome.clientPlatform, slot: outcome.slot,
       });
       await appendEvent(outcome, orderId, 'started', outcome.clientPlatform);
+      // The owner is using the box from the Claude app: their session's start
+      // and end are activity, or a box used only that way would look idle.
+      noteBoxActivity(outcome.instanceId);
       res.status(204).end();
       return;
     }
@@ -121,6 +125,7 @@ export function claudeRunnerEventsRouter(): Router {
           provider: 'claude', kind: 'cloud', durationSec: outcome.durationSec, exitStatus: outcome.exitStatus, exitReason: outcome.exitReason, slot: outcome.slot,
         });
         await appendEvent(outcome, orderId, 'ended', outcome.exitReason ?? `exit ${outcome.exitStatus}`);
+        noteBoxActivity(outcome.instanceId);
         res.status(204).end();
         return;
       }

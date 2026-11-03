@@ -69,7 +69,10 @@ export async function recordBoxUpdateReport(instanceId: string, r: BoxUpdateRepo
   if (!box) return null;
   await prisma.instance.update({
     where: { id: instanceId },
-    data: { lastUpdateAt: r.at, lastUpdateOutcome: r.outcome, lastUpdateDetail: reportDetail(r), lastUpdateCommit: r.to ?? r.from },
+    // The report ends the lifecycle sweep's hold on a pushed update. Cleared
+    // here, on the orchestrator's receipt, rather than compared against
+    // lastUpdateAt, which is the box's own clock (Devin on #617).
+    data: { lastUpdateAt: r.at, lastUpdateOutcome: r.outcome, lastUpdateDetail: reportDetail(r), lastUpdateCommit: r.to ?? r.from, updatePushedAt: null },
   });
   return { boxName: box.name, owner: box.user?.unixUsername ?? null };
 }

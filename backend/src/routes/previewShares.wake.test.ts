@@ -149,3 +149,38 @@ describe('a reviewer waking the box', () => {
     expect((await shareForGrantee(setup().deps, asUser(owner), 'clink00000000001')).body).toMatchObject({ canWake: false });
   });
 });
+
+describe('a reviewer waking a box the sweep stopped', () => {
+  const stopped = (note: string | null, over: Partial<Instance> = {}) =>
+    ({ status: 'stopped', lifecycleNote: note, hibernationConfigured: false, parkedAt: new Date(NOW - 3600e3), ...over }) as Partial<Instance>;
+  const SWEEP_NOTES = [
+    'Stopped automatically after 1 h idle. Start it to get its sessions back.',
+    'Stopped automatically: it was started at 2026-10-22 09:00 UTC and its agent never connected. Start it again, or terminate it if that keeps happening.',
+    'Stopped by the 60-day hibernation refresh, so its memory was not kept. Start it to get its sessions back.',
+  ];
+
+  it('wakes a box the sweep stopped (own hours, the default window, a stuck start, the refresh)', async () => {
+    for (const note of SWEEP_NOTES) {
+      const { deps, wake } = setup({ box: stopped(note) });
+      expect(await wakeFor(deps, asUser(viewer), 'clink00000000001'), note).toEqual({ status: 202, body: { ok: true, status: 'starting' } });
+      expect(wake.start).toHaveBeenCalled();
+      expect((await shareForGrantee(setup({ box: stopped(note) }).deps, asUser(viewer), 'clink00000000001')).body).toMatchObject({ canWake: true });
+    }
+  });
+
+  it('never wakes a box its owner stopped by hand, or a terminated one', async () => {
+    // An owner's stop clears the note; an owner's start clears parkedAt too.
+    for (const over of [stopped(null), stopped(SWEEP_NOTES[0], { parkedAt: null }), stopped(SWEEP_NOTES[0], { autoTerminatedAt: new Date(NOW) })]) {
+      const { deps, wake } = setup({ box: over });
+      const res = await wakeFor(deps, asUser(viewer), 'clink00000000001');
+      expect(res.status).toBe(409);
+      expect(wake.start).not.toHaveBeenCalled();
+      expect((await shareForGrantee(setup({ box: over }).deps, asUser(viewer), 'clink00000000001')).body).toMatchObject({ canWake: false });
+    }
+  });
+
+  it('still wakes a box the sweep hibernated before parking became a stop', async () => {
+    const { deps } = setup();
+    expect(await wakeFor(deps, asUser(viewer), 'clink00000000001')).toEqual({ status: 202, body: { ok: true, status: 'starting' } });
+  });
+});

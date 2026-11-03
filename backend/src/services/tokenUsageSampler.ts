@@ -22,6 +22,7 @@ import { getConnectedAgents, sendForProject } from './agentRegistry';
 import { getPollerUsage } from './tmuxPoller';
 import { serverSideUsageProviderIds } from '../providers/registry';
 import { resolveUsageSource, ProjectCandidate } from './tokenUsageResolve';
+import { traceSweep } from './tracing/spans';
 
 export const LEGACY_HOST = 'legacy';
 const TICK_MS = 30_000;
@@ -350,7 +351,8 @@ function tick(): void {
 
 export function startTokenUsageSampler(): void {
   if (tickTimer) return;
-  tickTimer = setInterval(tick, TICK_MS);
+  // The tick only starts each due user's scan; the scans' RPCs end under it later.
+  tickTimer = setInterval(traceSweep('token-usage', tick), TICK_MS);
   tick();
   console.log('[TOKEN-USAGE] Sampler started');
 }

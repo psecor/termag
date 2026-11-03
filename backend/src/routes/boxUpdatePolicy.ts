@@ -8,7 +8,9 @@
  * box-auto-update-enabled flag for the box's owner, evaluated on the owner +
  * box multi-context the push uses (services/boxUpdatePolicy.ts).
  *
- *   200  { enabled: true } or { enabled: false, reason: 'flag-off' }
+ *   200  { enabled: true }, { enabled: true, reason: 'claim' } (a claim's update,
+ *        services/claimUpdate.ts, whatever the flag says) or
+ *        { enabled: false, reason: 'flag-off' }
  *   401  no valid agent token (a warm-pool token has no owner to evaluate for)
  *   403  a browser session, or a token without an instance
  *
@@ -27,7 +29,7 @@ import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { asyncHandler } from '../middleware/errors';
 import { requireAuthOrAgentToken } from '../middleware/auth';
-import { boxUpdatePolicy } from '../services/boxUpdatePolicy';
+import { boxUpdatePolicy, claimUpdateOpensPolicy } from '../services/boxUpdatePolicy';
 import { parseBoxUpdateReport, recordBoxUpdateReport, reportDetail } from '../services/boxUpdateReport';
 
 export function boxUpdatePolicyRouter(): Router {
@@ -40,9 +42,16 @@ export function boxUpdatePolicyRouter(): Router {
       res.status(403).json({ error: 'box agents only: this route takes an instance-bound agent token' });
       return;
     }
-    const box = await prisma.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true, kind: true } });
-    const policy = await boxUpdatePolicy(owner, box);
-    console.log(`[BOX-UPDATE] policy for ${owner.unixUsername}'s box ${instanceId}: ${policy.enabled ? 'enabled' : `off (${policy.reason})`}`);
+    const box = await prisma.instance.findUnique({
+      where: { id: instanceId },
+      select: { id: true, name: true, kind: true, claimUpdateStatus: true, claimUpdateStartedAt: true },
+    });
+    // A claim's update (services/claimUpdate.ts) runs whatever the flag says:
+    // a box just claimed has nothing live on it to protect.
+    const policy = box && claimUpdateOpensPolicy(box)
+      ? { enabled: true as const, reason: 'claim' as const }
+      : await boxUpdatePolicy(owner, box && { id: box.id, name: box.name, kind: box.kind });
+    console.log(`[BOX-UPDATE] policy for ${owner.unixUsername}'s box ${instanceId}: ${policy.enabled ? `enabled${policy.reason === 'claim' ? ' (claim update)' : ''}` : `off (${policy.reason})`}`);
     res.json(policy);
   };
 

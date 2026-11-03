@@ -67,6 +67,8 @@ export interface SearchableRow {
   workstream: string;
   role: string;
   session: string;
+  /** A review pane's slot (services/sessionInventory.ts); absent is slot 1. */
+  slot?: number;
   connected: boolean;
   alive: boolean;
   status: string;
@@ -79,7 +81,7 @@ export interface SearchDeps {
    * per-pane check returning the host and rebuilt session name. Either step
    * throws (SessionAccessError) when the caller may not read the pane.
    */
-  accessProject: (userId: string, projectId: string) => Promise<(role: string, workstream: string) => { host: ProjectHost; session: string }>;
+  accessProject: (userId: string, projectId: string) => Promise<(role: string, workstream: string, slot?: number) => { host: ProjectHost; session: string }>;
   capture: (host: ProjectHost, session: string, lines: number) => Promise<string>;
 }
 
@@ -157,7 +159,9 @@ export async function searchSessions(
     try {
       let project = projects.get(row.projectId);
       if (!project) { project = deps.accessProject(userId, row.projectId); projects.set(row.projectId, project); }
-      const a = (await project)(row.role, row.workstream);
+      const forPane = await project;
+      // A review row past slot 1 names its slot (services/sessionInventory.ts); the rest are role + workstream.
+      const a = row.role === 'review' && row.slot !== undefined ? forPane(row.role, row.workstream, row.slot) : forPane(row.role, row.workstream);
       const content = await deps.capture(a.host, a.session, lines);
       const m = findMatches(content, query);
       if (m.count === 0) return;

@@ -198,7 +198,7 @@ export async function sendUnlessTerminalHolds<T>(
 export const TERMINAL_HOLDS_ANSWER = {
   status: 409 as const,
   body: {
-    error: 'Claude is open in the full UI. Return it to this chat, or continue there.',
+    error: 'Claude is open in Lab. Return it to this chat, or continue there.',
     code: 'terminal-holds' as const,
   },
 };
@@ -315,7 +315,7 @@ export function reclaimAnswer(r: ReclaimOutcome, sent?: Record<string, unknown>)
 /** POST /chat/terminal's status from the pane outcome. */
 export function terminalAnswer(r: ResumeOutcome): { status: number; body: unknown } {
   if (r.status === 'turn-running') {
-    return { status: 409, body: { error: 'Claude is answering in the chat; open it in the full UI when the turn ends', code: 'turn-running' } };
+    return { status: 409, body: { error: 'Claude is answering in the chat; open it in Lab when the turn ends', code: 'turn-running' } };
   }
   if (r.status === 'skipped') {
     return { status: 200, body: { resumed: false, reason: r.reason, ...(r.sessionId ? { sessionId: r.sessionId } : {}) } };

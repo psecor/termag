@@ -57,15 +57,19 @@ import { boolVariation } from '../services/featureFlags';
 import { isBoxProvisioningConfigured, isConcurrentCreate, pickFreeBoxName, provisionNewBox } from '../services/boxProvisioner';
 import { boxImageSelectionFor, isPublished } from '../services/boxImage';
 import { ownerHibernationEnabled, poolHibernationEnabled } from '../services/boxHibernationFlag';
+import { ownerDefaultSize } from '../services/boxSize';
+import { recordPoolClaim, warmPoolTargetFor } from '../services/warmPoolSizes';
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { PowerRequestConflict, requestPower } from '../services/boxPower';
 import { powerRequestError } from '../services/boxPowerPolicy';
 import { claimWarmBox, isNameConflict, prismaClaimEffects, WARM_POOL_ENABLED_FLAG } from '../services/warmPoolClaim';
+import { claimUpdateRunning } from '../services/claimUpdateGate';
 import { poolSpecHashOrNull, reconcileWarmPool } from '../services/warmPool';
 import { deliveryInFlight } from '../services/credentialDelivery';
 import { parseAllowedUsers, resolveUnixUsername } from '../auth/allowedUsers';
 import { createOwnerFromAllowlist, flagIdentity, pendingOwnerContext, slackRealName } from '../services/claudeRunnerOwner';
 import { notifyGithubAbsent, notifyRefusal } from '../services/claudeRunnerNotices';
+import { requestFloorRuns, runnerFloors } from '../services/claudeRunnerFloor';
 import type { RefusalCode } from '../services/claudeRunnerSpawn';
 import {
   CLAUDE_RUNNER_ANTHROPIC_GIT_FLAG,
@@ -75,6 +79,7 @@ import {
   MAX_RUNNERS_PER_BOX,
   type RunnerGitOptions,
   WRAPPER_FLAGS_CAPABILITY,
+  WRAPPER_FLOOR_CAPABILITY,
   type OwnedBox,
   REFUSAL,
   type Refusal,
@@ -189,7 +194,7 @@ async function getOwnerABox(
       // restarts and parkedAt clears in the same write, so a box the
       // lifecycle sweep parked is not parked again, on its old clock, the
       // moment the session ends (Bugbot on #191).
-      await requestPower(instance, 'start', { markInUse: true });
+      await requestPower(instance, 'start', { markInUse: true, startedBy: 'cloud' });
       console.log(`[CLAUDE-RUNNER] order ${orderId}: ${verb} ${plan.box.status} box ${instance.name} (${instance.id}) for ${user.unixUsername}`);
     } catch (err) {
       if (!(err instanceof PowerRequestConflict)) {
@@ -223,12 +228,18 @@ async function getOwnerABox(
   // claim decision and the launch agree, as Add box does (routes/instances.ts
   // createBox): a pool box runs the published image with the pool's
   // hibernation value, so an owner whose flags say otherwise takes the cold path.
+  // The owner's box-default-size picks which of the pool's sizes to claim.
   const image = await boxImageSelectionFor(flagIdentity(user));
   const hibernation = await ownerHibernationEnabled(flagIdentity(user));
+  const size = await ownerDefaultSize(flagIdentity(user));
   try {
-    if (await boolVariation(WARM_POOL_ENABLED_FLAG, flagIdentity(user), false) && isPublished(image) && hibernation === await poolHibernationEnabled()) {
-      const currentHash = await poolSpecHashOrNull();
-      if (currentHash) {
+    if (await boolVariation(WARM_POOL_ENABLED_FLAG, flagIdentity(user), false) && isPublished(image)
+      && hibernation === await poolHibernationEnabled()) {
+      const pooled = await warmPoolTargetFor(size) > 0;
+      const currentHash = pooled ? await poolSpecHashOrNull(size) : null;
+      if (!currentHash) {
+        recordPoolClaim({ user, size, via: 'claude-runner', outcome: 'miss', reason: pooled ? 'no-warm-box' : 'size-not-pooled' });
+      } else {
         // A name free across all of the owner's rows: terminated ones still
         // hold theirs in the (userId, name) unique index.
         const taken = new Set((await prisma.instance.findMany({ where: { userId: user.id }, select: { name: true } })).map(i => i.name));
@@ -244,8 +255,9 @@ async function getOwnerABox(
         const eligible = noColdBox
           ? (id: string) => instanceAgentTransport(id)?.capabilities.includes(WRAPPER_FLAGS_CAPABILITY) ?? false
           : undefined;
-        const claim = await claimWarmBox({ owner: user, boxName: pickFreeBoxName(taken, autoBoxName()), currentHash, stillNeeded, parentInstanceId: null, eligible }, prismaClaimEffects);
+        const claim = await claimWarmBox({ owner: user, boxName: pickFreeBoxName(taken, autoBoxName()), currentHash, size, stillNeeded, parentInstanceId: null, eligible }, prismaClaimEffects);
         if (claim.claimed) {
+          recordPoolClaim({ user, size, via: 'claude-runner', box: claim.instance.id, outcome: 'hit' });
           void reconcileWarmPool();
           console.log(`[CLAUDE-RUNNER] order ${orderId}: claimed warm box ${claim.instance.name} (${claim.instance.id}) for ${user.unixUsername}`);
           // The agent is already connected (a warm box's is), so place now when
@@ -253,13 +265,14 @@ async function getOwnerABox(
           // is theirs and the re-offer places on it.
           return (await placeOnClaimed(claim.instance)) ?? retry(REFUSAL.boxClaimed(claim.instance.name));
         }
+        recordPoolClaim({ user, size, via: 'claude-runner', outcome: 'miss', reason: claim.reason });
         console.log(`[CLAUDE-RUNNER] order ${orderId}: warm claim fell through (${claim.reason}${eligible ? `, ${WRAPPER_FLAGS_CAPABILITY} boxes only` : ''}); ${noColdBox ? 'no cold box without GitHub connected' : 'provisioning cold'}`);
       }
     }
     if (noColdBox) return retry(REFUSAL.boxCreationRefused(noColdBox.body.error));
     // Cold: minutes, async. The next spawn sees the box as `provisioning` and waits.
     if (callerGone()) return gone();
-    const name = await provisionNewBox(user, autoBoxName(), stillNeeded, { image, hibernation });
+    const name = await provisionNewBox(user, autoBoxName(), stillNeeded, { image, hibernation, flavor: 'full' }, size);
     // Provisioning is configured (checked above), so null means the re-check
     // found a box already on its way.
     if (!name) return retry(REFUSAL.boxOnItsWay());
@@ -446,11 +459,27 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
             connected: isInstanceAgentConnected(b.id),
             capable: caps.includes(RUNNER_AGENT_CAPABILITY),
             wrapperCapable: caps.includes(WRAPPER_FLAGS_CAPABILITY),
+            wrapperFloor: caps.includes(WRAPPER_FLOOR_CAPABILITY),
           };
         });
       };
       const candidates = await readyCandidates();
       const boxes = runnerBoxes(candidates);
+      // The Claude Code floor: a
+      // v3 wrapper is told the floor and enforces it; a box whose inventory
+      // reads below it, with a wrapper that cannot, takes no new runner and is
+      // asked to update (a floor run). Behind claude-code-update-enabled.
+      const floors = await runnerFloors(ldUser, boxes);
+      requestFloorRuns(ldUser, boxes, floors);
+      /** The floor for boxes this request found later (a claimed or a newly ready one). */
+      const addFloors = async (more: Array<CandidateBox & { name: string }>) => {
+        const fresh = more.filter(b => !floors.has(b.id));
+        const found = await runnerFloors(ldUser, fresh);
+        for (const [id, f] of found) floors.set(id, f);
+        requestFloorRuns(ldUser, fresh, found);
+      };
+      const tooOld = (box: { id: string }) => floors.get(box.id)?.kind === 'too-old';
+      const floorFor = (box: { id: string }): string | null => { const f = floors.get(box.id); return f?.kind === 'pass' ? f.floor : null; };
       // A box whose wrapper predates the git flags cannot run the proxy: for
       // an owner the gate refused it takes no new session, as if the flag
       // were off. It still counts for "already running": an order live on
@@ -458,7 +487,8 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       // it must hear so rather than the GitHub refusal, so the refusal for
       // "no eligible box" is placement's, after the sessions are listed
       // (placeRunner, `full` with no eligible box; Bugbot on #287).
-      const eligible = (box: { wrapperCapable?: boolean }) => !gateRefused || !!box.wrapperCapable;
+      const gitEligible = (box: { wrapperCapable?: boolean }) => !gateRefused || !!box.wrapperCapable;
+      const eligible = (box: { id: string; wrapperCapable?: boolean }) => gitEligible(box) && !tooOld(box);
       /** The git flags for a launch on `box`: only where its wrapper understands them. */
       const gitFor = (box: { wrapperCapable?: boolean }): RunnerGitOptions | null =>
         anthropicGit && box.wrapperCapable ? { anthropicGit: true, github: githubState } : null;
@@ -494,8 +524,12 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
         }
         // No eligible box at all means every ready box has an old wrapper and
         // the owner has no termag GitHub credential: that is the GitHub
-        // refusal, not "boxes full" (Bugbot on #287).
-        if (placement.kind === 'full') return refused(placement.boxes === 0 ? REFUSAL.githubNotConnected() : REFUSAL.boxesFull(placement.boxes, placement.max));
+        // refusal, not "boxes full" (Bugbot on #287). Or every box git could
+        // use runs a Claude Code below the floor: claude-too-old.
+        if (placement.kind === 'full') {
+          if (placement.boxes > 0) return refused(REFUSAL.boxesFull(placement.boxes, placement.max));
+          return refused(listed.some(l => gitEligible(l.box) && tooOld(l.box)) ? REFUSAL.claudeOutdated() : REFUSAL.githubNotConnected());
+        }
         if (callerGone) {
           console.warn(`[CLAUDE-RUNNER] order ${orderId}: the spawn hook stopped waiting; not launching (the session is re-offered)`);
           return refused(REFUSAL.hookGone('launch'));
@@ -509,11 +543,19 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
           console.log(`[CLAUDE-RUNNER] order ${orderId}: box ${box.name} is still receiving its credentials; not launching yet`);
           return refused(REFUSAL.boxSettling(box.name));
         }
+        // A box just claimed from the pool is updating and may restart its
+        // agent (services/claimUpdate.ts): longer than the hook waits, so the
+        // re-offer places on it once it is done, and the runner starts on the
+        // updated box rather than deferring the update's restart.
+        if (claimUpdateRunning(box.id)) {
+          console.log(`[CLAUDE-RUNNER] order ${orderId}: box ${box.name} is updating after its claim; not launching yet`);
+          return refused(REFUSAL.boxUpdating(box.name));
+        }
         if (callerGone) {
           console.warn(`[CLAUDE-RUNNER] order ${orderId}: the spawn hook stopped waiting; not launching (the session is re-offered)`);
           return refused(REFUSAL.hookGone('launch'));
         }
-        const launch = runnerLaunch(box.hostHome!, box.hostUnixUser!, orderId, slot, telemetry, { user: user.id, box: box.id }, gitFor(box));
+        const launch = runnerLaunch(box.hostHome!, box.hostUnixUser!, orderId, slot, telemetry, { user: user.id, box: box.id }, gitFor(box), floorFor(box));
         const rpc = (type: string, payload: Record<string, unknown>) => sendToInstanceAgent(box.id, type, payload);
         // The session record, before the launch: a runner that exits at once
         // reports its end within a second, and the report needs the row
@@ -569,7 +611,9 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
           connected: isInstanceAgentConnected(instance.id),
           capable: caps.includes(RUNNER_AGENT_CAPABILITY),
           wrapperCapable: caps.includes(WRAPPER_FLAGS_CAPABILITY),
+          wrapperFloor: caps.includes(WRAPPER_FLOOR_CAPABILITY),
         };
+        await addFloors([candidate]);
         if (runnerBoxes([candidate]).length === 0 || (gateRefused && !candidate.wrapperCapable)) {
           console.log(`[CLAUDE-RUNNER] order ${orderId}: claimed box ${instance.name} cannot take the runner yet (agent ${candidate.connected ? 'connected' : 'not connected'}, ${candidate.capable ? 'capable' : 'not capable'}${gateRefused && !candidate.wrapperCapable ? ', wrapper predates Anthropic-managed git and the owner has no termag GitHub credential' : ''}); the re-offer places on it`);
           return null;
@@ -583,6 +627,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       /** A ready box of the owner's as of now (a burst's earlier session may have claimed one): place on it, else null. */
       const placeIfReady = async (): Promise<Outcome | null> => {
         const fresh = runnerBoxes(await readyCandidates());
+        if (fresh.length > 0) await addFloors(fresh);
         return fresh.length > 0 ? placeOnBoxes(fresh) : null;
       };
 

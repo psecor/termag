@@ -27,7 +27,9 @@ const spendReport = vi.fn(async () => ({ ok: 'report' }));
 const spendTrendReport = vi.fn(async (weeks: number) => ({ weeks }));
 const getSpendConfig = vi.fn(async () => ({ ok: 'config' }));
 const saveSpendConfig = vi.fn(async () => ({ ok: 'saved' }));
+const boxCostReport = vi.fn(async (range: { sinceKey: string; untilKey: string }) => ({ since: range.sinceKey, until: range.untilKey }));
 vi.mock('../../db', () => ({ prisma: {} }));
+vi.mock('../../services/boxCost/report', () => ({ boxCostReport }));
 vi.mock('../../services/admin/spend/queries', () => ({ spendReport, spendTrendReport, getSpendConfig, saveSpendConfig, TREND_MAX_WEEKS: 52 }));
 
 const { spendRouter } = await import('./spend');
@@ -86,5 +88,18 @@ describe('GET /spend/trend and /spend/report', () => {
     expect((await fetch(`${base}/spend/report?from=2026-10-10&to=2026-10-01`)).status).toBe(400);
     expect((await fetch(`${base}/spend/report?from=2026-10-01&to=2026-10-10&active=1`)).status).toBe(200);
     expect(spendReport).toHaveBeenCalledWith(expect.objectContaining({ days: 10 }), true);
+  });
+});
+
+describe('GET /spend/boxes', () => {
+  it('reports the asked window, with an admin token too', async () => {
+    const r = await fetch(`${base}/spend/boxes?from=2026-10-20&to=2026-10-26`, { headers: { 'x-test-token': '1' } });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ since: '2026-10-20', until: '2026-10-26' });
+  });
+  it('rejects a bad range without querying', async () => {
+    const r = await fetch(`${base}/spend/boxes?from=2026-10-26&to=nope`);
+    expect(r.status).toBe(400);
+    expect(boxCostReport).not.toHaveBeenCalled();
   });
 });

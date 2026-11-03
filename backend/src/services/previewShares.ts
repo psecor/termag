@@ -6,7 +6,7 @@
  */
 import { Prisma, type Instance, type User } from '@prisma/client';
 import { prisma } from '../db';
-import { GUEST_REFUSAL_MESSAGES, guestPaneKey, wakeBudget, type GuestShare, type OriginRecipe } from './previewShareRules';
+import { GUEST_REFUSAL_MESSAGES, guestPaneKey, lastStackRefusal, wakeBudget, type GuestShare, type OriginRecipe } from './previewShareRules';
 import { projectAgentCapabilities, sendForProject, type ProjectHost } from './agentRegistry';
 import { BROWSER_PANE_PROFILES_CAPABILITY } from './browserPane';
 import { projectDirUnder, resolveProjectRoot } from './projectPaths';
@@ -23,6 +23,10 @@ export interface ShareRow extends GuestShare {
   prNumber: number | null;
   prCommentId: string | null;
   prHeadOid: string | null;
+  /** 4d: the PR's head branch when shared; a guest is refused while the checkout is on another. */
+  prHeadBranch: string | null;
+  /** 4d: the PR's checkout on the box when it isn't the workstream's own; seam 1 shows it instead. */
+  checkoutDir: string | null;
 }
 
 /** Everything the guest path needs about a share, in one read. */
@@ -71,8 +75,12 @@ export interface ShareView {
   liveViewers: number;
   /** Loopback origins a guest's browser was refused lately: what the owner may want to add. */
   blockedOrigins: string[];
+  /** A reviewer's last dev-stack refusal since anyone last got in: what they were told, and whose stack was in the way. */
+  lastRefusal: { at: string; message: string; holder: string | null } | null;
   /** A link share's PR. */
   pr: { repo: string; number: number; url: string; headOid: string | null } | null;
+  /** 4d: the checkout it shows when that isn't the workstream's own, e.g. `~/src/webapp`'s. */
+  checkoutDir: string | null;
   /** A link share's viewers, most recent first. */
   viewers: ShareViewerView[];
 }
@@ -97,7 +105,7 @@ export interface LiveLinkShare {
 const shareSelect = {
   id: true, projectId: true, workstreamId: true, ownerId: true, audience: true, granteeId: true, originRecipe: true,
   expiresAt: true, revokedAt: true, endedAt: true, endedReason: true, lastOpenedAt: true, createdAt: true,
-  prRepo: true, prNumber: true, prCommentId: true, prHeadOid: true,
+  prRepo: true, prNumber: true, prCommentId: true, prHeadOid: true, prHeadBranch: true, checkoutDir: true,
 } satisfies Prisma.PreviewShareSelect;
 
 export const prUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
@@ -106,10 +114,17 @@ export const prUrl = (repo: string, number: number) => `https://github.com/${rep
 export interface PreviewSettings {
   recipe: OriginRecipe | null;
   accountHint: string | null;
-  /** Share the PRs its owner opens automatically (4c). */
-  prLinksEnabled: boolean;
+  /**
+   * Share the PRs its owner opens automatically (4c). Null until the owner
+   * first saves the settings: browser-pane-pr-auto-share-default decides
+   * until then (routes/previewShares.ts, effectiveSettings).
+   */
+  prLinksEnabled: boolean | null;
   pathFilter: string[];
 }
+
+/** Preview settings as saved: a save always says whether shares are automatic. */
+export type SavedPreviewSettings = PreviewSettings & { prLinksEnabled: boolean };
 
 /** liveLinkShares reads this many at a time. */
 const LIVE_LINK_PAGE = 500;
@@ -170,11 +185,20 @@ export interface PreviewShareStore {
    * milestone); one for another PR, or past its expiry, is ended first
    * (`superseded`, `expired`) and returned as `ended`. The new share's token
    * hash is `hashFor(id)`, set once its id exists.
+   *
+   * With `samePr` (4d), a live link share of the same owner and PR under
+   * any key is returned as it is too: a PR keeps its first share, and so
+   * one comment, whichever checkout a later ask finds.
    */
   openLinkShare(input: {
     projectId: string; workstreamId: string | null; ownerId: string; recipe: OriginRecipe; expiresAt: Date;
     prRepo: string; prNumber: number; prHeadOid: string; linkKey: string; hashFor: (shareId: string) => string; now: Date;
+    prHeadBranch?: string | null; checkoutDir?: string | null; samePr?: boolean;
   }): Promise<{ share: ShareRow; existing: boolean; ended: ShareRow | null }>;
+  /** The workstream's live open link (a link share with no PR), if any: sharing by link again renews it. */
+  liveOpenLink(input: { projectId: string; workstreamIds: (string | null)[]; now: Date }): Promise<ShareRow | null>;
+  /** An open link, for anyone signed in who opens it; its token hash is `hashFor(id)`, set once its id exists. */
+  createOpenLink(input: { projectId: string; workstreamId: string | null; ownerId: string; recipe: OriginRecipe; expiresAt: Date; hashFor: (shareId: string) => string }): Promise<ShareRow>;
   /** Someone opened a link share's link: their viewer row (made once; a revoked one stays revoked). */
   addViewer(shareId: string, userId: string): Promise<{ revokedAt: Date | null }>;
   /** Revoke one viewer of a link share, scoped by project; whether there was one to revoke. */
@@ -207,7 +231,7 @@ export interface PreviewShareStore {
   refundWake(wakeId: string): Promise<void>;
   /** A project's preview settings (PreviewShareSettings): its default recipe and reviewer sign-in hint, and its automatic shares (4c). */
   settings(projectId: string): Promise<PreviewSettings>;
-  saveSettings(projectId: string, settings: PreviewSettings): Promise<PreviewSettings>;
+  saveSettings(projectId: string, settings: SavedPreviewSettings): Promise<PreviewSettings>;
 }
 
 export const prismaPreviewShareStore: PreviewShareStore = {
@@ -283,6 +307,19 @@ export const prismaPreviewShareStore: PreviewShareStore = {
         viewers: { orderBy: { lastOpenedAt: 'desc' }, take: 50, select: { userId: true, firstOpenedAt: true, lastOpenedAt: true, revokedAt: true, user: { select: { googleEmail: true, displayName: true } } } },
       },
     });
+    // Each share's latest dev-stack refusal (routes/browserWs.ts records
+    // them) and latest renewal, which may have changed its recipe since.
+    const latest = rows.length === 0 ? [] : await prisma.previewShareEvent.findMany({
+      where: {
+        shareId: { in: rows.map(r => r.id) },
+        OR: [{ kind: 'refused', reason: { startsWith: 'guest-stack:' } }, { kind: 'renewed' }],
+      },
+      orderBy: { at: 'desc' },
+      distinct: ['shareId', 'kind'],
+      select: { shareId: true, kind: true, reason: true, detail: true, at: true },
+    });
+    const refusalOf = new Map(latest.filter(e => e.kind === 'refused').map(e => [e.shareId, e]));
+    const renewedAtOf = new Map(latest.filter(e => e.kind === 'renewed').map(e => [e.shareId, e.at]));
     return rows.map(r => ({
       id: r.id,
       audience: r.audience === 'link' ? 'link' as const : 'user' as const,
@@ -297,7 +334,9 @@ export const prismaPreviewShareStore: PreviewShareStore = {
       createdAt: r.createdAt.toISOString(),
       liveViewers: liveGuestCount(r.id),
       blockedOrigins: [...new Set(r.events.map(e => (e.detail as { origin?: unknown } | null)?.origin).filter((o): o is string => typeof o === 'string'))].slice(0, 8),
+      lastRefusal: lastStackRefusal(refusalOf.get(r.id), { lastOpenedAt: r.lastOpenedAt, renewedAt: renewedAtOf.get(r.id) ?? null, checkout: !!r.checkoutDir }),
       pr: r.prRepo && r.prNumber ? { repo: r.prRepo, number: r.prNumber, url: prUrl(r.prRepo, r.prNumber), headOid: r.prHeadOid } : null,
+      checkoutDir: r.checkoutDir,
       viewers: r.viewers.map(v => ({
         userId: v.userId, name: v.user.displayName, email: v.user.googleEmail,
         firstOpenedAt: v.firstOpenedAt.toISOString(), lastOpenedAt: v.lastOpenedAt.toISOString(), revokedAt: v.revokedAt?.toISOString() ?? null,
@@ -390,6 +429,19 @@ export const prismaPreviewShareStore: PreviewShareStore = {
 
   async openLinkShare(input) {
     const attempt = () => prisma.$transaction(async (tx) => {
+      if (input.samePr) {
+        // Two asks for one PR from different checkouts have different keys, so
+        // the unique key can't keep them apart: one waits for the other here.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`link-share:${input.ownerId}:${input.prRepo.toLowerCase()}#${input.prNumber}`}))`;
+        const same = await tx.previewShare.findFirst({
+          where: {
+            ownerId: input.ownerId, audience: 'link', prRepo: { equals: input.prRepo, mode: 'insensitive' }, prNumber: input.prNumber,
+            activeLinkKey: { not: null }, revokedAt: null, endedAt: null, expiresAt: { gt: input.now },
+          },
+          select: shareSelect,
+        });
+        if (same) return { share: toRow(same), existing: true, ended: null };
+      }
       const active = await tx.previewShare.findUnique({ where: { activeLinkKey: input.linkKey }, select: shareSelect });
       let ended: ShareRow | null = null;
       if (active) {
@@ -412,11 +464,12 @@ export const prismaPreviewShareStore: PreviewShareStore = {
           projectId: input.projectId, workstreamId: input.workstreamId, ownerId: input.ownerId, audience: 'link',
           originRecipe: input.recipe as unknown as Prisma.InputJsonValue, expiresAt: input.expiresAt,
           prRepo: input.prRepo, prNumber: input.prNumber, prHeadOid: input.prHeadOid, activeLinkKey: input.linkKey,
+          prHeadBranch: input.prHeadBranch ?? null, checkoutDir: input.checkoutDir ?? null,
         },
         select: { id: true },
       });
       const share = await tx.previewShare.update({ where: { id: made.id }, data: { linkTokenHash: input.hashFor(made.id) }, select: shareSelect });
-      await tx.previewShareEvent.create({ data: { shareId: share.id, kind: 'created', actorId: input.ownerId, detail: { pr: `${input.prRepo}#${input.prNumber}` } } });
+      await tx.previewShareEvent.create({ data: { shareId: share.id, kind: 'created', actorId: input.ownerId, detail: { pr: `${input.prRepo}#${input.prNumber}`, ...(input.checkoutDir ? { checkoutDir: input.checkoutDir } : {}) } } });
       return { share: toRow(share), existing: false, ended };
     });
     try {
@@ -427,6 +480,28 @@ export const prismaPreviewShareStore: PreviewShareStore = {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') return attempt();
       throw err;
     }
+  },
+
+  async liveOpenLink({ projectId, workstreamIds, now }) {
+    const s = await prisma.previewShare.findFirst({
+      where: {
+        projectId, audience: 'link', prRepo: null, prNumber: null, revokedAt: null, endedAt: null, expiresAt: { gt: now },
+        OR: workstreamIds.map(workstreamId => ({ workstreamId })),
+      },
+      orderBy: { createdAt: 'desc' },
+      select: shareSelect,
+    });
+    return s ? toRow(s) : null;
+  },
+
+  async createOpenLink({ projectId, workstreamId, ownerId, recipe, expiresAt, hashFor }) {
+    return prisma.$transaction(async (tx) => {
+      const made = await tx.previewShare.create({
+        data: { projectId, workstreamId, ownerId, audience: 'link', originRecipe: recipe as unknown as Prisma.InputJsonValue, expiresAt },
+        select: { id: true },
+      });
+      return toRow(await tx.previewShare.update({ where: { id: made.id }, data: { linkTokenHash: hashFor(made.id) }, select: shareSelect }));
+    });
   },
 
   async addViewer(shareId, userId) {
@@ -538,7 +613,7 @@ export const prismaPreviewShareStore: PreviewShareStore = {
     const row = await prisma.previewShareSettings.findUnique({ where: { projectId }, select: { originRecipe: true, reviewerAccountHint: true, prLinksEnabled: true, pathFilter: true } });
     return {
       recipe: (row?.originRecipe as unknown as OriginRecipe | null) ?? null, accountHint: row?.reviewerAccountHint ?? null,
-      prLinksEnabled: row?.prLinksEnabled ?? false, pathFilter: row?.pathFilter ?? [],
+      prLinksEnabled: row ? row.prLinksEnabled : null, pathFilter: row?.pathFilter ?? [],
     };
   },
 
@@ -630,7 +705,7 @@ export interface ShareTarget {
   host: ProjectHost;
   /** The workstream's current name. */
   workstream: string;
-  /** Its checkout on the box: the agent's ownership check runs against it. */
+  /** The checkout on the box: the agent's ownership check runs against it. The workstream's, or the share's `checkoutDir` (4d). */
   cwd: string;
   recipe: OriginRecipe;
 }
@@ -638,7 +713,8 @@ export interface ShareTarget {
 /**
  * Seam 1: what a share points at. Every guest path asks this, never the
  * share's project or workstream fields. Today a share is the owner's own
- * workstream on their own box; a preview fleet would answer here too.
+ * workstream on their own box, or (4d) the checkout there that holds its
+ * PR's branch; a preview fleet would answer here too.
  * Null when its workstream is gone.
  */
 export function shareTarget(ctx: GuestShareContext): ShareTarget | null {
@@ -647,7 +723,7 @@ export function shareTarget(ctx: GuestShareContext): ShareTarget | null {
   return {
     host: { userId: project.userId, instanceId: project.instanceId },
     workstream: ctx.workstream.name,
-    cwd: projectDirUnder(resolveProjectRoot({ ownerUnixUser: project.ownerUnixUsername, hostHome: project.instance?.hostHome }), project.name, ctx.workstream.name),
+    cwd: ctx.share.checkoutDir ?? projectDirUnder(resolveProjectRoot({ ownerUnixUser: project.ownerUnixUsername, hostHome: project.instance?.hostHome }), project.name, ctx.workstream.name),
     recipe: ctx.share.originRecipe,
   };
 }

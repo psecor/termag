@@ -11,7 +11,7 @@
 // shown in the row's tooltip). `main` cannot be renamed: it has no worktree
 // and its sessions carry the historical 3-segment names.
 import { isRunName } from './automations/schedule';
-import { sessionName } from './tmux';
+import { reviewSessionNames, sessionName } from './tmux';
 
 // Capped at 64 to match the chat relay's WORKSTREAM_RE (services/chatRunner.ts).
 export const WORKSTREAM_NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -50,9 +50,10 @@ export function planSessionRenames(
     if (t === 'agent') roles.push('agent', 'ctrl', 'review');
     else roles.push('data', 'data-ctrl');
   }
-  return roles.map(role => ({
-    role,
-    from: sessionName(username, projectName, role, from),
-    to: sessionName(username, projectName, role, to),
-  }));
+  return roles.flatMap((role): SessionRename[] => {
+    if (role !== 'review') return [{ role, from: sessionName(username, projectName, role, from), to: sessionName(username, projectName, role, to) }];
+    // Every review slot; most are absent, which the rename tolerates.
+    const next = reviewSessionNames(username, projectName, to);
+    return reviewSessionNames(username, projectName, from).map((f, i) => ({ role, from: f, to: next[i] }));
+  });
 }

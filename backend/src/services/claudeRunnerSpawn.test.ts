@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   AUTO_BOX_FAILURE_HOLD_MS, MAX_RUNNERS_PER_BOX, PROVISIONING_FAILURE_WINDOW_MS, REFUSAL, REFUSAL_CODES, allocateSlot, autoBoxName, autoBoxPlan, bearerToken, githubGate,
   parseRunnerSessions, parseSpawnBody, placeRunner, refusalStatus, runnerBoxes, runnerLaunch, runnerSessionName, serializeByKey,
-  tmuxSafe, tokensEqual, isRunnerSessionOf, isOwnRunnerSessionStatus, isRunnerSessionShaped,
+  tmuxSafe, tokensEqual, isRunnerSessionOf, isOwnRunnerSessionStatus, isRunnerSessionShaped, claudeFloorDecision,
 } from './claudeRunnerSpawn';
 
 const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcmRlciJ9.c2lnbmF0dXJl'; // gitleaks:allow
@@ -281,6 +281,7 @@ describe('REFUSAL', () => {
     REFUSAL.boxStarting('resuming', 'nap'), REFUSAL.boxStartFailed('old', 'stopped', null), REFUSAL.boxStartFailed('old', 'stopped', 'not found'),
     REFUSAL.boxClaimed('claude-20261009'), REFUSAL.boxProvisioning('claude-20261009'), REFUSAL.boxOnItsWay(), REFUSAL.noProvisioning(),
     REFUSAL.boxCreationRefused('Connect GitHub in Settings before adding a box'), REFUSAL.agentListFailed('timeout'), REFUSAL.agentLaunchFailed('tmux-create failed'),
+    REFUSAL.claudeOutdated(),
   ];
 
   it('uses every code in REFUSAL_CODES and no other', () => {
@@ -310,11 +311,42 @@ describe('REFUSAL', () => {
       'Connect GitHub in Settings before adding a box; the session is retried once GitHub is connected',
       'a box agent did not list its sessions: timeout',
       'the box agent refused the launch: tmux-create failed',
+      "the session owner's box runs a Claude Code older than termag's floor, and its runner cannot update it; it is retried once the box's Claude Code is updated",
     ]);
   });
 
   it('answers 502 only for a box agent that failed an RPC', () => {
     expect(all.filter(r => refusalStatus(r) === 502).map(r => r.code)).toEqual(['agent-list-failed', 'agent-launch-failed']);
+  });
+});
+
+describe('claudeFloorDecision', () => {
+  const f = { floor: '2.1.308', installed: '2.1.300', wrapperFloor: false, enforce: true };
+
+  it('tells a v3 wrapper the floor, whatever the inventory says or the flag', () => {
+    expect(claudeFloorDecision({ ...f, wrapperFloor: true })).toEqual({ kind: 'pass', floor: '2.1.308' });
+    expect(claudeFloorDecision({ ...f, wrapperFloor: true, enforce: false, installed: null })).toEqual({ kind: 'pass', floor: '2.1.308' });
+  });
+
+  it('refuses a box below the floor whose wrapper cannot enforce it', () => {
+    expect(claudeFloorDecision(f)).toEqual({ kind: 'too-old', installed: '2.1.300', floor: '2.1.308' });
+    expect(claudeFloorDecision({ ...f, installed: '2.0.999' })).toMatchObject({ kind: 'too-old' });
+  });
+
+  it('lets a box at or above the floor, one with no inventory, or an unreadable version through', () => {
+    for (const installed of ['2.1.308', '2.1.312', '3.0.0', null, 'garbled']) expect(claudeFloorDecision({ ...f, installed })).toEqual({ kind: 'ok' });
+  });
+
+  it('refuses nothing with claude-code-update-enabled off', () => {
+    expect(claudeFloorDecision({ ...f, enforce: false })).toEqual({ kind: 'ok' });
+  });
+});
+
+describe('runnerLaunch --claude-floor', () => {
+  it('goes last, only when given', () => {
+    const git = { anthropicGit: true, github: 'connected' as const };
+    expect(runnerLaunch('/home/ada', 'ada', 'o1', 2, null, null, git, '2.1.308').command.slice(3)).toEqual(['--anthropic-git', '--github', 'connected', '--claude-floor', '2.1.308']);
+    expect(runnerLaunch('/home/ada', 'ada', 'o1', 2, null, null, null, null).command).toEqual(['/home/ada/.local/bin/termag-claude-runner', 'o1', '2']);
   });
 });
 

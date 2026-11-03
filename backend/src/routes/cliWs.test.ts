@@ -159,4 +159,19 @@ describe('after the upgrade', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(ws.closed?.[0]).toBe(4401);
   });
+
+  it('closes with the caller\'s re-dial code instead (the desktop relay\'s 1012); a revoked sign-in is still 1008', async () => {
+    vi.useFakeTimers({ now });
+    const { token } = await jwt.issue('alice', session.id, now.getTime());
+    let clock = now.getTime();
+    const ticking = { ...deps, now: () => new Date(clock) };
+    const lapsed = new FakeWs();
+    watchCliSocket(lapsed as never, ticking, { auth: device('s1'), raw: token }, 1000, { reauthCloseCode: 1012 });
+    const revokedWs = new FakeWs();
+    watchCliSocket(revokedWs as never, ticking, { auth: device('s2'), raw: DEVICE }, 1000, { reauthCloseCode: 1012 });
+    clock += 61 * 60_000;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(lapsed.closed).toEqual([1012, 'Access token expired; reconnect with a fresh one']);
+    expect(revokedWs.closed?.[0]).toBe(1008);
+  });
 });

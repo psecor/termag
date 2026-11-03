@@ -2,13 +2,15 @@
 // Devin review pane's live state. Every few seconds it probes the review
 // panes it knows about — one classifier, `probeReviewPane` in
 // services/review.ts, shared with the GET /review route — and writes the
-// result as `AgentStatus.review` on the AGENT session's status, which the
-// status WebSocket pushes like `milestone`. The sidebar's review ring and the
-// review dock both read that field; neither polls tmux.
+// result as `AgentStatus.reviews` (every slot's pane)
+// and `AgentStatus.review` (slot 1's, for the clients that know one pane) on
+// the AGENT session's status, which the status WebSocket pushes like
+// `milestone`. The sidebar's review ring and the review docks read them;
+// neither polls tmux.
 //
 // The record map is in memory: nothing is persisted (no migration). On a
 // backend restart, and whenever a host's agent (re)connects, the sweep lists
-// that host's tmux sessions once (`tmux-list`) and adopts every `-review`
+// that host's tmux sessions once (`tmux-list`) and adopts every review slot's
 // session a project legally owns, reading its PR from the
 // `@termag-review-pr` option or the launch echo (probeReviewPane).
 //
@@ -21,7 +23,7 @@ import { prisma } from '../db';
 import { connectedProjectHosts, isProjectAgentConnected, sendForProject, type ProjectHost } from './agentRegistry';
 import { getAllStatuses, notifyStatusChange, setStatus, updateStatusMeta } from './status';
 import { statusKey } from './statusKey';
-import { sessionName } from './tmux';
+import { MAX_REVIEW_SLOTS, reviewSessionName, sessionName } from './tmux';
 import { probeReviewPane, type ReviewPaneState, type SendForHost } from './review';
 import type { SessionReview } from '../types';
 
@@ -52,6 +54,8 @@ export interface ReviewRecord {
   projectName: string;
   ownerUsername: string;
   workstream: string;
+  /** Which of the workstream's review panes (1..MAX_REVIEW_SLOTS). */
+  slot: number;
   reviewSession: string;
   agentSession: string;
 
@@ -87,16 +91,37 @@ export function reviewMetaOf(rec: ReviewRecord): SessionReview {
     at: rec.at,
     doneAt: rec.doneAt,
     seenAt: rec.seenAt,
+    session: rec.reviewSession,
+    slot: rec.slot,
   };
 }
 
-/** The identity one project+workstream's review pane is filed under. */
+/** Every record of one agent session's workstream, slot order. */
+export function reviewRecordsOf(instanceId: string | null, agentSession: string): ReviewRecord[] {
+  return [...records.values()]
+    .filter(r => r.host.instanceId === instanceId && r.agentSession === agentSession)
+    .sort((a, b) => a.slot - b.slot);
+}
+
+/**
+ * What an agent session's status carries for its workstream's reviews: the
+ * list, and slot 1's alone as `review` (the phone, the TUI and MCP address
+ * slot 1 only until they learn slots). Nulls when
+ * there are none.
+ */
+function reviewsMeta(instanceId: string | null, agentSession: string): { review: SessionReview | null; reviews: SessionReview[] | null } {
+  const list = reviewRecordsOf(instanceId, agentSession).map(reviewMetaOf);
+  return { review: list.find(r => r.slot === 1) ?? null, reviews: list.length ? list : null };
+}
+
+/** The identity one project+workstream's review pane (one slot) is filed under. */
 export interface ReviewIdentity {
   host: ProjectHost;
   projectId: string;
   projectName: string;
   ownerUsername: string;
   workstream: string;
+  slot: number;
   /** Session names built server-side from the parts, never a caller string. */
   reviewSession: string;
   agentSession: string;
@@ -112,10 +137,14 @@ export function identityOf(input: {
   projectName: string;
   ownerUsername: string;
   workstream: string;
+  /** Absent: slot 1, the `review` role's own name. */
+  slot?: number;
 }): ReviewIdentity {
+  const slot = input.slot ?? 1;
   return {
     ...input,
-    reviewSession: sessionName(input.ownerUsername, input.projectName, 'review', input.workstream),
+    slot,
+    reviewSession: reviewSessionName(input.ownerUsername, input.projectName, input.workstream, slot),
     agentSession: sessionName(input.ownerUsername, input.projectName, 'agent', input.workstream),
   };
 }
@@ -133,20 +162,22 @@ export function identityOf(input: {
 function writeMeta(rec: ReviewRecord, opts: { force?: boolean } = {}): void {
   if (!opts.force && rec.lastPushedState === rec.state) return;
   const st = statusKey(rec.host.instanceId, rec.agentSession);
+  // The whole workstream's list, not this record alone: one field per pane would overwrite the others.
+  const meta = reviewsMeta(rec.host.instanceId, rec.agentSession);
   if (!getAllStatuses().has(st)) {
-    setStatus(rec.agentSession, 'not_running', { review: reviewMetaOf(rec) }, undefined, rec.host.instanceId);
+    setStatus(rec.agentSession, 'not_running', meta, undefined, rec.host.instanceId);
   } else {
-    updateStatusMeta(rec.agentSession, { review: reviewMetaOf(rec) }, rec.host.instanceId);
+    updateStatusMeta(rec.agentSession, meta, rec.host.instanceId);
   }
   rec.lastPushedState = rec.state;
   notifyStatusChange(rec.agentSession, rec.host.instanceId);
 }
 
-/** Clear the review field on the AGENT session's status (record-less clear path). */
+/** Drop a cleared pane from the AGENT session's status (record-less clear path); the other slots stay. */
 function writeClearedMeta(identity: ReviewIdentity): void {
   const st = statusKey(identity.host.instanceId, identity.agentSession);
   if (!getAllStatuses().has(st)) return; // nothing carries a stale review
-  updateStatusMeta(identity.agentSession, { review: null }, identity.host.instanceId);
+  updateStatusMeta(identity.agentSession, reviewsMeta(identity.host.instanceId, identity.agentSession), identity.host.instanceId);
   notifyStatusChange(identity.agentSession, identity.host.instanceId);
 }
 
@@ -169,6 +200,7 @@ function fileRecord(
     projectName: identity.projectName,
     ownerUsername: identity.ownerUsername,
     workstream: identity.workstream,
+    slot: identity.slot,
     reviewSession: identity.reviewSession,
     agentSession: identity.agentSession,
     state: opts.state ?? 'reviewing',
@@ -352,16 +384,15 @@ export async function adoptHostPanels(
   const live = new Set<string>(Array.isArray(sessions) ? sessions : []);
   let adopted = 0;
   for (const proj of groupHost.projects) {
-    for (const ws of proj.workstreams) {
-      const identity: ReviewIdentity = {
+    for (const ws of proj.workstreams) for (let slot = 1; slot <= MAX_REVIEW_SLOTS; slot++) {
+      const identity = identityOf({
         host: groupHost.host,
         projectId: proj.projectId,
         projectName: proj.projectName,
         ownerUsername: proj.ownerUsername,
         workstream: ws,
-        reviewSession: sessionName(proj.ownerUsername, proj.projectName, 'review', ws),
-        agentSession: sessionName(proj.ownerUsername, proj.projectName, 'agent', ws),
-      };
+        slot,
+      });
       if (!live.has(identity.reviewSession)) continue;
       const key = recordKey(groupHost.host.instanceId, identity.reviewSession);
       if (records.has(key)) continue;
@@ -405,6 +436,7 @@ export async function runReviewSweepTick(
       projectName: rec.projectName,
       ownerUsername: rec.ownerUsername,
       workstream: rec.workstream,
+      slot: rec.slot,
       reviewSession: rec.reviewSession,
       agentSession: rec.agentSession,
     };

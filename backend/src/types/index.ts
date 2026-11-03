@@ -21,6 +21,10 @@ declare global {
       lastSeenAt: Date | null;
       /** First-run wizard finished or skipped; null = never. */
       onboardedAt: Date | null;
+      // termag (`simple`) or Lab (`full`), under onboarding-refresh-enabled; null: not chosen.
+      uiMode: string | null;
+      /** The IANA zone this person's clients last reported; working time banks by its days. Null: the orchestrator's. */
+      timeZone: string | null;
       /** The last "Claude Cloud N" handed to this owner. */
       claudeSessionSeq: number;
       /** Daily briefing schedule, read through services/briefing/schedule.ts ({} = off). */
@@ -95,6 +99,13 @@ export interface AgentStatus {
    */
   review?: SessionReview | null;
   /**
+   * Every review pane of the workstream, slot order,
+   * each with its `session` and `slot`; written by the sweep beside `review`,
+   * which stays slot 1's for the clients that know one pane (phone, TUI, MCP).
+   * Null or absent: none (or a backend before parallel reviews).
+   */
+  reviews?: SessionReview[] | null;
+  /**
    * An open (or just finished) handoff of this agent pane, written by the
    * handoff route and sweep and pushed over
    * /ws/status like `review`. Not persisted: the agent_handoffs row is.
@@ -119,6 +130,9 @@ export interface SessionReview {
   doneAt: Date | null;
   /** When the viewer focused the review terminal while the review was done. */
   seenAt: Date | null;
+  /** The review pane's tmux session and slot (1 = the `review` role's own name); absent from a backend before parallel reviews. */
+  session?: string;
+  slot?: number;
 }
 
 export interface SessionHandoff {

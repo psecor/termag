@@ -255,3 +255,21 @@ describe('checksFailed (check names unread)', () => {
     expect(assignLanes(input({ authored: [open()] }))[0].checksFailed).toBe(false);
   });
 });
+
+describe('a multi-repo workstream (docs/multi-repo-projects.md)', () => {
+  it('links one PR per repository to the same workstream, and lists each repository\'s unPRed branch', () => {
+    const wsOf = (repo: string) => ws('feat', { projectName: 'acme', repo });
+    const branch = (repo: string): BranchState => ({
+      repo, branch: 'feat', baseBranch: 'main', aheadOfBase: 1, pushed: true, dirty: false, lastCommitAt: null,
+      workstream: { projectId: 'p1', projectName: 'acme', workstream: 'feat' },
+    });
+    const rows = assignLanes(input({
+      authored: [open({ repo: 'acme/web', number: 7 }), open({ repo: 'acme/api', number: 9 })],
+      branches: [branch('acme/web'), branch('acme/api'), branch('acme/cli')],
+      workstreams: [wsOf('acme/web'), wsOf('acme/api'), wsOf('acme/cli')],
+    }));
+    const link = { projectId: 'p1', projectName: 'acme', workstream: 'feat' };
+    expect(rows.filter(r => r.kind === 'pr').map(r => [r.repo, r.workstream])).toEqual(expect.arrayContaining([['acme/web', link], ['acme/api', link]]));
+    expect(rows.filter(r => r.kind === 'branch').map(r => [r.repo, r.lane])).toEqual([['acme/cli', 'needs_pr']]);
+  });
+});

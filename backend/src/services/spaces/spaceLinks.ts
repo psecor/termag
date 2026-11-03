@@ -20,10 +20,20 @@ export function spaceFileLinkPath(basePath: string, space: string, path: string)
 }
 
 /**
+ * The simple UI's page for a space with `dir` (a prefix: '' or ending in `/`)
+ * shown in its explorer, `<basePath>/chat/files/<space>?dir=<dir>`: where a
+ * link to a folder goes (routes/spaceFiles.ts).
+ */
+export function spaceFolderPagePath(basePath: string, space: string, dir: string): string {
+  return `${basePath}/chat/files/${encodeURIComponent(space)}?dir=${encodeURIComponent(dir)}`;
+}
+
+/**
  * The space and raw file path a link names, from the request path below the
- * `/files` mount (`/<space>/<path...>`, still percent-encoded). Null for
- * anything that can't be one; the caller still runs the path through
- * normalizeFilePath.
+ * `/files` mount (`/<space>/<path...>`, still percent-encoded). A folder's
+ * link keeps its trailing slash (`docs/`), and the space's own, `/<space>/`,
+ * is ''. Null for anything that can't be one; the caller still runs the path
+ * through normalizeFilePath or normalizePrefix.
  */
 export function parseSpaceFileLink(rawPath: string): { space: string; path: string } | null {
   if (!rawPath.startsWith('/')) return null;
@@ -33,8 +43,7 @@ export function parseSpaceFileLink(rawPath: string): { space: string; path: stri
   try { decoded = segments.map(decodeURIComponent); } catch { return null; }
   const [space, ...rest] = decoded;
   if (!SPACE_NAME_RE.test(space)) return null;
-  const path = rest.join('/');
-  return path ? { space, path } : null;
+  return { space, path: rest.join('/') };
 }
 
 /**

@@ -103,6 +103,14 @@ describe('searchSessions', () => {
     expect(perPane).toHaveBeenCalledWith('review', 'feat');
   });
 
+  it('captures each review pane by its own slot (docs/parallel-reviews.md)', async () => {
+    const rows = [row({ role: 'review' }), row({ role: 'review', session: 'u-p-review-3', slot: 3 })];
+    const perPane = vi.fn((role: string, ws: string, slot?: number) => ({ host: { userId: 'u1', instanceId: null }, session: `x|${role}|${ws}|${slot ?? 1}` }));
+    const capture = vi.fn(async () => '');
+    await searchSessions('u1', 'zz', { roles: ['review'] }, deps(rows, { accessProject: vi.fn(async () => perPane), capture }));
+    expect(capture.mock.calls.map(c => (c as unknown[])[1]).sort()).toEqual(['x|review|main|1', 'x|review|main|3']);
+  });
+
   it('caps the panes per search and reports the rest as skipped', async () => {
     const rows = Array.from({ length: 65 }, (_, i) => row({ projectId: `x${i}` }));
     const capture = vi.fn(async () => '');

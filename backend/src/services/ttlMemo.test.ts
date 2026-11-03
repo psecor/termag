@@ -150,6 +150,35 @@ describe('swrMemo', () => {
     expect(await get()).toBe('a');
   });
 
+  it('reload() loads while fresh, serving the old value until it answers', async () => {
+    const now = 0;
+    const loads = [deferred<string>(), deferred<string>()];
+    let i = 0;
+    const get = swrMemo(() => loads[i++].promise, 100, 1000, () => now);
+    const first = get(); loads[0].resolve('a'); await first;
+    const reloaded = get.reload();
+    expect(i).toBe(2);
+    expect(await get()).toBe('a');
+    loads[1].resolve('b');
+    expect(await reloaded).toBe('b');
+    expect(await get()).toBe('b');
+    expect(i).toBe(2);
+  });
+
+  it('reload() joins a load already in flight', async () => {
+    let now = 0;
+    const loads = [deferred<string>(), deferred<string>()];
+    let i = 0;
+    const get = swrMemo(() => loads[i++].promise, 100, 1000, () => now);
+    const first = get(); loads[0].resolve('a'); await first;
+    now = 150;
+    await get(); // starts the background reload
+    const joined = get.reload();
+    expect(i).toBe(2);
+    loads[1].resolve('b');
+    expect(await joined).toBe('b');
+  });
+
   it('past maxStaleMs the caller waits, and sees the error', async () => {
     let now = 0; let fail = false;
     const get = swrMemo(async () => { if (fail) throw new Error('revoked'); return 'a'; }, 100, 1000, () => now);

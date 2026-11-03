@@ -38,13 +38,25 @@ import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { PowerAction, powerRequestError } from '../services/boxPowerPolicy';
+import { QUARANTINED, QUARANTINED_OWNER_ERROR, ownerBoxView } from '../services/boxQuarantinePolicy';
+import { boxInUseFields } from '../services/boxActivity';
 import { recordProductEvent } from '../services/productEvents';
+import { boxEventDimensions } from '../services/boxPowerEvents';
 import { PowerRequestConflict, requestPower } from '../services/boxPower';
 import { lifecycleViewFor, recentAutoTerminations, setBoxLifecycle } from '../services/boxLifecycle';
+import { HIBERNATE_OFF_CODE, HIBERNATE_OFF_ERROR } from '../services/boxPowerPolicy';
 import { lifecycleSettingsError, parseLifecycleSettings } from '../services/boxLifecyclePolicy';
 import { boolVariation } from '../services/featureFlags';
+import { marksNewBoxForDotfiles, NEW_BOX_DOTFILES_FLAG } from '../services/newBoxDotfiles';
 import { boxImageSelectionFor, isPublished, PUBLISHED_IMAGE } from '../services/boxImage';
 import { ownerHibernationEnabled, poolHibernationEnabled } from '../services/boxHibernationFlag';
+import { boxSizeOptions, decideBoxSize, instanceTypesForSize, isBoxSize, ownerDefaultSize, type BoxSize } from '../services/boxSize';
+import { recordPoolClaim, warmPoolTargetFor } from '../services/warmPoolSizes';
+import { repoSizesFor } from '../services/repoEnvironment';
+import { decideBoxDisk, defaultDiskGiB, diskOptions, DISK_ERROR } from '../services/boxDiskSize';
+import { flavorOf, flavorSpec, type BoxFlavor } from '../services/boxFlavor';
+import { parseRequirementsLabel, requirementsLabel, requirementsResolver, type BoxRequirements } from '../services/boxRequirements';
+import type { InstanceTypeChoice } from '../services/boxProvisioner';
 import { poolSpecHashOrNull, reconcileWarmPool } from '../services/warmPool';
 import { isInstanceAgentConnected, sendToInstanceAgent } from '../services/agentRegistry';
 import { revokeChats } from '../services/chatRevoke';
@@ -59,7 +71,10 @@ import { boxRenameEnabled, boxTokenName, checkBoxRename, RENAME_DISABLED_CODE } 
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { RouteResult, sendResult } from './routeResult';
 import { parseClaimTiming } from '../services/repoCreate';
-import { notifyOnSuccess } from '../services/workspaceEvents';
+import { notifyOnSuccess, notifyWorkspaceChange } from '../services/workspaceEvents';
+import { resizeInfo, startResize, type ResizeActor } from '../services/boxResize';
+import { resizeAccess, resizeView } from '../services/boxResizePolicy';
+import { latestBoxEvents } from '../services/boxEvents';
 
 
 function hashToken(token: string): string {
@@ -77,6 +92,7 @@ async function hibernationMatchesPool(user: Express.User, hibernation: boolean):
   console.log(`[POOL] claim skipped for ${user.unixUsername}: box-hibernation-enabled is ${hibernation}, the pool's is ${pool}`);
   return false;
 }
+
 
 /** A same-named box a new launch replaces: an EC2 box whose launch failed. */
 function retiresOnRelaunch(existing: { kind: string; status: string }, kind: string): boolean {
@@ -108,28 +124,139 @@ async function retireFailedBox(box: { id: string }): Promise<boolean> {
 //   "external"           — self-managed host; no AWS, token returned for the
 //                          user to run the agent themselves.
 //
+// input.size: small, medium or large (services/boxSize.ts), for an ec2 box
+// whose owner has box-default-size on; absent, the repo's .termag/environment.json
+// or the default (decideBoxSize). input.repo: the GitHub repository the box
+// is made for (a URL or owner/name), or a list of them for a multi-repo
+// project, whose environment.json files are read (services/repoEnvironment.ts; the
+// largest wins). A environment.json setting it can't use is left out, and the 201's
+// `warnings` says why.
+//
+// input.diskGiB: the root disk, a whole number of GiB from 50 to 300
+// (services/boxDiskSize.ts), for an ec2 box this orchestrator launches; absent,
+// the repo files' resources.diskGiB or the default (BOX_ROOT_VOLUME_GB, 120).
+// Not behind box-default-size. Any disk but the default launches cold: every
+// warm-pool box has the default.
+//
 // opts.parentInstanceId: the box whose own credentials asked for this one
 // (the CLI on a box), recorded on the row whether it is claimed or launched.
+// opts.relaunchSize, opts.relaunchDiskGiB: the size and disk of the failed
+// box a Retry replaces, kept whatever the flag or the repo file says now. opts.createdFor: 'ask' for a box made for an
+// ask (`termag ask --new-box`, the deprecated --for-ask), recorded by the
+// CLI's create; it is sized like any other box.
+/**
+ * A repo's requirements as what a box launches at: EC2's match
+ * (services/boxRequirements.ts), recorded as `4vcpu-32gib`; the preset it
+ * starts with when it is one (which the warm pool can hold); else `fallback`,
+ * the default, with a warning pushed onto `warnings`.
+ */
+async function meetRequirements(
+  requirements: BoxRequirements, fallback: BoxSize | null, warnings: string[],
+): Promise<{ size: BoxSize | null; matched: { label: string; types: InstanceTypeChoice } | null }> {
+  const r = await requirementsResolver.resolve(requirements);
+  if (!r.ok) {
+    warnings.push(`${r.warning}; launching ${fallback ?? 'the configured type'} instead`);
+    return { size: fallback, matched: null };
+  }
+  if (r.preset) return { size: r.preset, matched: null };
+  return { size: null, matched: { label: requirementsLabel(requirements), types: r.choice } };
+}
+
+/** A 201's `warnings` (what of the repo's environment.json was left out), only when there are any. */
+const warned = (warnings: string[]) => (warnings.length ? { warnings } : {});
+
 export async function createBox(
   user: Express.User,
-  input: { name?: unknown; kind?: unknown },
-  opts: { requestHost?: string; parentInstanceId?: string | null } = {},
+  input: { name?: unknown; kind?: unknown; size?: unknown; diskGiB?: unknown; repo?: unknown; flavor?: unknown; minimal?: unknown },
+  opts: CreateBoxOpts = {},
 ): Promise<RouteResult> {
   return notifyOnSuccess(await createBoxRow(user, input, opts), user.id, 'boxes');
 }
 
+interface CreateBoxOpts {
+  requestHost?: string;
+  parentInstanceId?: string | null;
+  relaunchSize?: string | null;
+  relaunchDiskGiB?: number | null;
+  createdFor?: string | null;
+}
+
 async function createBoxRow(
   user: Express.User,
-  input: { name?: unknown; kind?: unknown },
-  opts: { requestHost?: string; parentInstanceId?: string | null },
+  input: { name?: unknown; kind?: unknown; size?: unknown; diskGiB?: unknown; repo?: unknown; flavor?: unknown; minimal?: unknown },
+  opts: CreateBoxOpts,
 ): Promise<RouteResult> {
   const { name, kind: rawKind } = input;
   if (!name || typeof name !== 'string' || !name.trim()) {
     return { status: 400, body: { error: 'name required' } };
   }
   const kind = rawKind === 'external' ? 'external' : 'ec2';
+  // Which flavor the box rides (services/boxFlavor.ts). The canonical field
+  // is `flavor: 'minimal'` (the CLI's `--minimal`, POST /api/instances); a
+  // 1.x-ish `minimal: true` means the same while it shows up. The spec's
+  // three decisions ride with it: which image (a minimal request never reads
+  // the box-image flag — it is per-user and chooses among full-bake images),
+  // the disk fallback, and warm-pool eligibility. An external box runs on
+  // hardware we never touch and always reads 'full'.
+  const flavor: BoxFlavor = kind === 'ec2'
+    ? (input.flavor !== undefined && input.flavor !== null ? flavorOf(input.flavor) : flavorOf(input.minimal))
+    : 'full';
+  const spec = flavorSpec(flavor);
   const trimmed = name.trim();
   if (!isValidBoxName(trimmed)) return { status: 400, body: { error: BOX_NAME_ERROR } };
+  const repos = input.repo === undefined || input.repo === null ? []
+    : typeof input.repo === 'string' ? [input.repo]
+    : Array.isArray(input.repo) && input.repo.every(r => typeof r === 'string') ? input.repo as string[]
+    : null;
+  if (!repos) return { status: 400, body: { error: 'repo must be a string or a list of them', code: 'invalid_request' } };
+
+  // The size, decided before anything is written so a bad one costs nothing.
+  // Only an orchestrator-launched box has one; the owner's box-default-size
+  // must be on for any (decideBoxSize).
+  const provisioned = kind === 'ec2' && isBoxProvisioningConfigured();
+  const askedDisk = input.diskGiB !== undefined && input.diskGiB !== null;
+  if (askedDisk && !provisioned) {
+    return { status: 400, body: { error: 'Only a box this orchestrator launches has a disk size', code: 'invalid_disk' } };
+  }
+  if (askedDisk && !decideBoxDisk(input.diskGiB, null, 0).ok) return { status: 400, body: { error: DISK_ERROR, code: 'invalid_disk' } };
+  // The disk, null for a box this orchestrator doesn't launch.
+  let diskGiB = null as number | null;
+  let size = null as BoxSize | null;
+  // A repo's requirements (services/boxRequirements.ts) once matched: the row
+  // records them as `4vcpu-32gib` and the launch walks their types. Null for
+  // a preset, or when they fell back to `size`.
+  let matched = null as { label: string; types: InstanceTypeChoice } | null;
+  const sizeWarnings: string[] = [];
+  const meet = async (requirements: BoxRequirements, fallback: BoxSize | null): Promise<void> => {
+    ({ size, matched } = await meetRequirements(requirements, fallback, sizeWarnings));
+  };
+  const relaunchRequirements = parseRequirementsLabel(opts.relaunchSize);
+  // A Retry's disk is the failed box's own, already decided (and maybe raised to the image's).
+  const relaunchDisk = provisioned ? opts.relaunchDiskGiB ?? null : null;
+  if (provisioned && isBoxSize(opts.relaunchSize)) {
+    size = opts.relaunchSize;
+    diskGiB = relaunchDisk ?? spec.defaultDiskGiB();
+  } else if (provisioned && relaunchRequirements) {
+    await meet(relaunchRequirements, await ownerDefaultSize(user));
+    diskGiB = relaunchDisk ?? spec.defaultDiskGiB();
+  } else if (provisioned) {
+    const flagDefault = await ownerDefaultSize(user);
+    // The repo file only matters for what isn't asked for: the size while sizes are on, and the disk; otherwise it isn't read.
+    const asked = input.size !== undefined && input.size !== null && input.size !== '';
+    const diskKnown = askedDisk || relaunchDisk != null;
+    const repoFile = (!asked && flagDefault) || !diskKnown ? await repoSizesFor(user.id, repos) : { sizes: null, warnings: [] };
+    const sizing = decideBoxSize(input.size, repoFile.sizes, flagDefault);
+    if (!sizing.ok) return { status: sizing.status, body: { error: sizing.error, code: sizing.code } };
+    const disk = decideBoxDisk(input.diskGiB, repoFile.sizes, spec.defaultDiskGiB());
+    if (!disk.ok) return { status: disk.status, body: { error: disk.error, code: disk.code } };
+    diskGiB = relaunchDisk ?? disk.diskGiB;
+    size = sizing.size;
+    sizeWarnings.push(...repoFile.warnings);
+    if (sizing.requirements) await meet(sizing.requirements, sizing.size);
+    for (const w of sizeWarnings) console.warn(`[BOX] ${user.unixUsername}'s ${trimmed}: ${w}`);
+  } else if (input.size !== undefined && input.size !== null && input.size !== '') {
+    return { status: 400, body: { error: 'Only a box this orchestrator launches has a size', code: 'invalid_size' } };
+  }
 
   // Uniqueness per user. The DB has a unique index but we surface a 409
   // here rather than letting the user see a raw Prisma error.
@@ -160,10 +287,11 @@ async function createBoxRow(
   try {
     // The owner's box-image and box-hibernation-enabled flags, read once so
     // the claim decision and the launch agree. Pool boxes run the published
-    // image with the pool's hibernation value, so a user whose flags say
-    // otherwise always takes the cold path.
-    const provisioned = kind === 'ec2' && isBoxProvisioningConfigured();
-    const image = provisioned ? await boxImageSelectionFor(user) : PUBLISHED_IMAGE;
+    // image with the pool's hibernation value and size, so a user whose
+    // flags or size say otherwise always takes the cold path. A flavor the
+    // flagAware=false spec owns (minimal) spends no flag read: the
+    // flag chooses among full-bake images, and its image is none of them.
+    const image = provisioned && spec.flagAware ? await boxImageSelectionFor(user) : PUBLISHED_IMAGE;
     const hibernation = provisioned ? await ownerHibernationEnabled(user) : false;
 
     // The warm path, when there is a pool to ask and this user is in the
@@ -171,27 +299,44 @@ async function createBoxRow(
     // boxes whose agents will not answer, falls through to the cold path
     // below untouched.
     if (provisioned
+      // Pool boxes run the published full image; a flavor their spec keeps out of the pool never
+      // claims one, whatever the owner's flags say.
+      && spec.warmPoolEligible
       && isPublished(image)
       && await boolVariation(WARM_POOL_ENABLED_FLAG, user, false)
-      && await hibernationMatchesPool(user, hibernation)) {
-      const currentHash = await poolSpecHashOrNull();
-      if (currentHash) {
+      && await hibernationMatchesPool(user, hibernation)
+      // A repo's requirements matched to a type of their own: the pool holds presets only.
+      && !matched) {
+      // The pool holds each size apart (services/warmPoolSizes.ts), so the
+      // claim asks for the size this box launches at; a size it holds none
+      // of, or none warm right now, is a miss that goes cold. Every pool box
+      // has the default disk, so any other disk goes cold without asking.
+      const otherDisk = diskGiB !== defaultDiskGiB();
+      const pooled = !otherDisk && await warmPoolTargetFor(size) > 0;
+      const currentHash = pooled ? await poolSpecHashOrNull(size) : null;
+      if (!currentHash) {
+        const reason = otherDisk ? 'disk-not-pooled' : pooled ? 'no-warm-box' : 'size-not-pooled';
+        recordPoolClaim({ user, size, via: 'add-box', outcome: 'miss', reason });
+      } else {
         const startedAt = Date.now();
         const outcome = await claimWarmBox(
-          { owner: user, boxName: trimmed, currentHash, parentInstanceId: opts.parentInstanceId ?? null },
+          { owner: user, boxName: trimmed, currentHash, size, parentInstanceId: opts.parentInstanceId ?? null },
           prismaClaimEffects,
         );
         if (outcome.claimed) {
           console.log(`[POOL] claim ${outcome.instance.id} by ${user.unixUsername} in ${Date.now() - startedAt}ms`);
+          recordPoolClaim({ user, size, via: 'add-box', box: outcome.instance.id, outcome: 'hit' });
           // Un-awaited so the refill is under way before the browser has
           // rendered the row, and never on this request's critical path.
           void reconcileWarmPool();
           recordProductEvent('box.provisioned', { user: user.id, box: outcome.instance.id }, {
+            ...boxEventDimensions(outcome.instance),
             boxKind: 'ec2', warmClaimed: true, claimMs: Date.now() - startedAt, child: !!opts.parentInstanceId,
           });
-          return { status: 201, body: { instance: outcome.instance, claimed: true } };
+          return { status: 201, body: { instance: outcome.instance, claimed: true, ...warned(sizeWarnings) } };
         }
         console.log(`[POOL] claim fell through for ${user.unixUsername}: ${outcome.reason} after ${outcome.candidatesTried} candidate(s)`);
+        recordPoolClaim({ user, size, via: 'add-box', outcome: 'miss', reason: outcome.reason });
       }
     }
 
@@ -199,17 +344,27 @@ async function createBoxRow(
     const tokenHash = hashToken(rawToken);
     const tokenPrefix = rawToken.substring(0, 13) + '...';
 
+    const newBoxDotfiles = marksNewBoxForDotfiles({
+      kind, dotfilesRepoUrl: user.dotfilesRepoUrl,
+      flagOn: kind === 'ec2' && !!user.dotfilesRepoUrl && await boolVariation(NEW_BOX_DOTFILES_FLAG, user, false),
+    });
     const instance = await prisma.$transaction(async (tx) => {
       const created = await tx.instance.create({
         data: {
           userId: user.id,
           name: trimmed,
           kind,
+          size: matched?.label ?? size,
+          diskGiB,
+          flavor,
           parentInstanceId: opts.parentInstanceId ?? null,
           // External boxes have no provisioning step — they sit at
           // "awaiting-agent" until the self-run agent dials in and
           // registerAgent flips them to "ready".
           status: kind === 'external' ? 'awaiting-agent' : 'provisioning',
+          // The owner's dotfiles, applied on the agent's first hello as a
+          // warm claim does (services/newBoxDotfiles.ts).
+          ...(newBoxDotfiles ? { onClaimStatus: 'pending' } : {}),
         },
       });
       await tx.agentToken.create({
@@ -263,10 +418,13 @@ async function createBoxRow(
         remoteUnixUser: user.unixUsername,
         gitUserEmail: user.googleEmail,
         gitUserName: user.displayName,
+        flavor,
         image,
         hibernation,
+        instanceTypes: matched?.types ?? instanceTypesForSize(size),
+        diskGiB,
       });
-      return { status: 201, body: { instance, claimed: false } };
+      return { status: 201, body: { instance, claimed: false, ...warned(sizeWarnings) } };
     }
 
     // Legacy fallback: provisioning not configured. Return the raw token once
@@ -314,12 +472,14 @@ async function terminateBoxRow(user: Express.User, id: string, confirmed: boolea
     include: {
       projects: {
         where: { archived: false },
-        select: { id: true, name: true, workstreams: { select: { id: true } } },
+        select: { id: true, name: true, workstreams: { select: { id: true, name: true } } },
       },
     },
   });
   if (!instance) return { status: 404, body: { error: 'Box not found' } };
   if (instance.status === 'terminated') return { status: 200, body: { ok: true, alreadyTerminated: true } };
+  // The lifecycle sweep, chat delete and the CLI all terminate through here.
+  if (instance.status === QUARANTINED) return { status: 409, body: { error: QUARANTINED_OWNER_ERROR } };
 
   if (instance.projects.length > 0 && !confirmed) {
     return {
@@ -344,7 +504,7 @@ async function terminateBoxRow(user: Express.User, id: string, confirmed: boolea
         (type, payload) => sendToInstanceAgent(instance.id, type, payload),
         connected,
         project.id,
-        project.workstreams.map(w => w.id),
+        project.workstreams,
         { offlineBlocks: !destroysHost },
       );
       if (blocked) return { status: 409, body: { error: blocked } };
@@ -407,6 +567,11 @@ async function powerBoxRow(user: Express.User, id: string, action: PowerAction):
   const instance = await prisma.instance.findUnique({ where: { id } });
   const refused = powerRequestError(instance, user.id, action, isBoxProvisioningConfigured());
   if (refused) return { status: refused.status, body: { error: refused.error } };
+  // Nothing hibernates a box, a person included. A start still resumes one
+  // already hibernated.
+  if (action === 'hibernate') {
+    return { status: 409, body: { error: HIBERNATE_OFF_ERROR, code: HIBERNATE_OFF_CODE } };
+  }
   try {
     const status = await requestPower(instance!, action, { markInUse: action === 'start', byOwner: true });
     return { status: 202, body: { ok: true, status } };
@@ -434,6 +599,26 @@ export async function setOwnedBoxLifecycle(user: Express.User, id: string, body:
   return { status: 200, body: { lifecycle: await lifecycleViewFor(user, row) } };
 }
 
+// Keep a box running: its owner is using it, so
+// the idle clock restarts and a standing warning goes stale, as a keystroke
+// would make it. Owner only; another user's box answers 404 like a missing
+// one, and only a ready box can be kept (409 otherwise). `via` is where the
+// owner pressed it, for the box.kept_running product event.
+export async function keepOwnedBoxRunning(user: Express.User, id: string, via: 'ui' | 'cli' | 'slack'): Promise<RouteResult> {
+  const instance = await prisma.instance.findFirst({ where: { id, userId: user.id } });
+  if (!instance) return { status: 404, body: { error: 'Box not found' } };
+  const notRunning = { status: 409, body: { error: `Only a running box can be kept running; ${instance.name} is ${instance.status}` } };
+  if (instance.status !== 'ready') return notRunning;
+  const kept = await prisma.instance.updateMany({ where: { id, status: 'ready' }, data: boxInUseFields(id) });
+  if (kept.count === 0) return notRunning;
+  recordProductEvent('box.kept_running', { user: user.id, box: id }, { via });
+  // Kept from Slack or the CLI, the owner's open tabs drop the countdown too (Bugbot on #621).
+  notifyWorkspaceChange(user.id, 'boxes');
+  console.log(`[LIFECYCLE] ${instance.name} (${user.unixUsername}): kept running by the owner (${via})`);
+  const row = await prisma.instance.findUniqueOrThrow({ where: { id } });
+  return { status: 200, body: { lifecycle: await lifecycleViewFor(user, row) } };
+}
+
 // Rename a box (services/boxRename.ts). Owner only; another user's box answers
 // 404 like a missing one. Its agent token's label follows when it still
 // carries the old name. Project lists show box names, so both lists change.
@@ -446,6 +631,7 @@ async function renameBoxRow(user: Express.User, id: string, newName: unknown): P
     return { status: 403, body: { error: 'Renaming boxes is not enabled for you', code: RENAME_DISABLED_CODE } };
   }
   const instance = await prisma.instance.findFirst({ where: { id, userId: user.id } });
+  if (instance?.status === QUARANTINED) return { status: 409, body: { error: QUARANTINED_OWNER_ERROR } };
   const check = checkBoxRename(instance, newName);
   if (!check.ok) return { status: check.status, body: { error: check.error } };
   if (check.unchanged) return { status: 200, body: { instance } };
@@ -473,6 +659,68 @@ async function renameBoxRow(user: Express.User, id: string, newName: unknown): P
   }
 }
 
+// Resize a box to another size (services/boxResize.ts). Owner only here;
+// another user's box answers 404 like a missing one, and an admin resizes
+// anyone's from the Fleet tab (routes/admin/resize.ts). `force` confirms
+// stopping what is running on it (a turn, an SSH session); 202 with the
+// resize as it starts, whose phases follow on the status socket.
+export async function resizeOwnedBox(user: Express.User, id: string, body: unknown, via: ResizeActor['via']): Promise<RouteResult> {
+  const instance = await prisma.instance.findUnique({ where: { id } });
+  const denied = resizeAccess(instance, { id: user.id, isAdmin: false }, 'owner');
+  if (denied) return { status: denied.status, body: { error: denied.error, code: denied.code } };
+  const { size, force } = (body ?? {}) as { size?: unknown; force?: unknown };
+  const started = await startResize(instance!, size, { userId: user.id, role: 'owner', via }, { force: force === true });
+  return started.ok ? { status: 202, body: { resize: started.resize } } : { status: started.status, body: started.body };
+}
+
+/** `?repo=` once per repository: a multi-repo project's box takes the largest. */
+export function repoQuery(value: unknown): string[] {
+  return (Array.isArray(value) ? value : [value])
+    .filter((r): r is string => typeof r === 'string' && !!r.trim()).map(r => r.trim());
+}
+
+/**
+ * The New box pickers' sizes for a box for `repos` (GET /api/instances/sizes,
+ * and the CLI's GET /boxes/sizes): every size, and the one to preselect.
+ */
+export async function boxSizeChoices(user: Express.User, repos: string[]): Promise<RouteResult> {
+  const provisioned = isBoxProvisioningConfigured();
+  const flagDefault = provisioned ? await ownerDefaultSize(user) : null;
+  // Read for the disk too, which no flag gates.
+  const repoFile = provisioned && repos.length ? await repoSizesFor(user.id, repos) : { sizes: null, warnings: [] };
+  const sizing = decideBoxSize(undefined, repoFile.sizes, flagDefault);
+  const warnings = [...repoFile.warnings];
+  let defaultSize = sizing.ok ? sizing.size : null;
+  // The repo's minimums as EC2 matched them: the pickers' preselected entry, named by its type (r8g.xlarge).
+  let defaultRequirements: (BoxRequirements & { instanceType: string }) | null = null;
+  if (sizing.ok && sizing.requirements) {
+    const met = await meetRequirements(sizing.requirements, sizing.size, warnings);
+    // Matched, defaultSize stays the preset they'd fall back to, for a client without the repo entry.
+    if (met.matched) defaultRequirements = { ...sizing.requirements, instanceType: met.matched.types.type };
+    else defaultSize = met.size;
+  }
+  return {
+    status: 200,
+    body: {
+      ...boxSizeOptions(flagDefault),
+      defaultSize,
+      defaultSource: sizing.ok ? sizing.source : null,
+      defaultRequirements,
+      warnings,
+      // The disk field's range and preselection (services/boxDiskSize.ts); null where no box is launched here.
+      disk: provisioned ? diskOptions(defaultDiskGiB(), repoFile.sizes) : null,
+    },
+  };
+}
+
+/** What the Size… pickers show for the caller's own box (services/boxResize.ts resizeInfo). */
+export async function ownedBoxResizeInfo(user: Express.User, id: string): Promise<RouteResult> {
+  const instance = await prisma.instance.findUnique({ where: { id } });
+  const denied = resizeAccess(instance, { id: user.id, isAdmin: false }, 'owner');
+  if (denied) return { status: denied.status, body: { error: denied.error, code: denied.code } };
+  return { status: 200, body: await resizeInfo(instance!) };
+}
+
 export function instancesRouter(): Router {
   const router = Router();
 
@@ -483,7 +731,11 @@ export function instancesRouter(): Router {
       include: { _count: { select: { projects: true } } },
       orderBy: { createdAt: 'desc' },
     });
-    res.json(await Promise.all(instances.map(async i => ({ ...i, lifecycle: await lifecycleViewFor(req.user!, i) }))));
+    // Each box's current or last resize, from box_events (services/boxEvents.ts).
+    const resizes = await latestBoxEvents(instances.map(i => i.id), 'resize');
+    res.json(await Promise.all(instances.map(async i => ({
+      ...ownerBoxView(i), lifecycle: await lifecycleViewFor(req.user!, i), resize: resizeView(resizes.get(i.id)),
+    }))));
   };
 
   // Single box. Includes project list (id+name only) for the delete-confirm UI.
@@ -499,7 +751,7 @@ export function instancesRouter(): Router {
       },
     });
     if (!instance) { res.status(404).json({ error: 'Box not found' }); return; }
-    res.json(instance);
+    res.json(ownerBoxView(instance));
   };
 
   const create: RequestHandler = async (req, res) => {
@@ -544,7 +796,7 @@ export function instancesRouter(): Router {
       where: { id: existing.id, userId: req.user!.id },
     });
     if (!instance) { res.status(404).json({ error: 'Box not found' }); return; }
-    res.json(instance);
+    res.json(ownerBoxView(instance));
   };
 
   const onClaimLog: RequestHandler = async (req, res) => {
@@ -591,6 +843,17 @@ export function instancesRouter(): Router {
   router.get('/auto-terminated', requireAuth, asyncHandler(async (req, res) => {
     res.json(await recentAutoTerminations(req.user!.id));
   }));
+  // The New box pickers' sizes (services/boxSize.ts): `enabled: false` while
+  // the owner's box-default-size is off, which is also when POST refuses one.
+  // `defaultSize` is what a POST with no size would launch at for `?repo=`
+  // (decideBoxSize: the repo's .termag/environment.json, else the owner's default),
+  // which the dropdowns preselect, or `defaultRequirements` when the file's
+  // minimums matched a type of their own; `warnings` what of that file was
+  // left out. `disk`, whatever the size flag says: the New box disk field's
+  // range, the default, and what a box for `?repo=` gets.
+  router.get('/sizes', requireAuth, asyncHandler(async (req, res) => {
+    sendResult(res, await boxSizeChoices(req.user!, repoQuery(req.query.repo)));
+  }));
   router.get('/:id', requireAuth, asyncHandler(getOne));
   router.post('/', requireAuth, asyncHandler(create));
   router.post('/:id/claim-timing', requireAuth, asyncHandler(claimTiming));
@@ -605,6 +868,15 @@ export function instancesRouter(): Router {
   }));
   router.patch('/:id/lifecycle', requireAuth, asyncHandler(async (req, res) => {
     sendResult(res, await setOwnedBoxLifecycle(req.user!, req.params.id, req.body));
+  }));
+  router.post('/:id/keep-running', requireAuth, asyncHandler(async (req, res) => {
+    sendResult(res, await keepOwnedBoxRunning(req.user!, req.params.id, 'ui'));
+  }));
+  router.get('/:id/resize', requireAuth, asyncHandler(async (req, res) => {
+    sendResult(res, await ownedBoxResizeInfo(req.user!, req.params.id));
+  }));
+  router.post('/:id/resize', requireAuth, asyncHandler(async (req, res) => {
+    sendResult(res, await resizeOwnedBox(req.user!, req.params.id, req.body, 'ui'));
   }));
 
   return router;

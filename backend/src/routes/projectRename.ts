@@ -8,7 +8,7 @@
  * orphan the box's sessions under the old name.
  */
 import { powerStateError } from '../services/boxPowerPolicy';
-import { sessionName } from '../services/tmux';
+import { reviewSessionNames, sessionName } from '../services/tmux';
 import type { RouteResult } from './routeResult';
 
 export interface RenameWorkflow {
@@ -24,14 +24,18 @@ export function renameSessionPairs(
 ): Array<{ from: string; to: string }> {
   const pairs: Array<{ from: string; to: string }> = [];
   for (const wf of workflows) {
-    // `review` (the Devin review pane, routes/review.ts) rides along with the
-    // agent pair; it usually does not exist, and the rename tolerates that.
-    const roles = wf.type === 'agent' ? (['agent', 'ctrl', 'review'] as const) : (['data', 'data-ctrl'] as const);
+    // `review` (the review panes, routes/review.ts: every slot)
+    // rides along with the agent pair; they usually do not exist, and the rename tolerates that.
+    const roles = wf.type === 'agent' ? (['agent', 'ctrl'] as const) : (['data', 'data-ctrl'] as const);
     for (const role of roles) {
       pairs.push({
         from: sessionName(unixUsername, oldName, role, wf.workstream),
         to: sessionName(unixUsername, newName, role, wf.workstream),
       });
+    }
+    if (wf.type === 'agent') {
+      const to = reviewSessionNames(unixUsername, newName, wf.workstream);
+      reviewSessionNames(unixUsername, oldName, wf.workstream).forEach((from, i) => pairs.push({ from, to: to[i] }));
     }
   }
   return pairs;

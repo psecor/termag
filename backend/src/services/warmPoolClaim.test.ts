@@ -38,6 +38,7 @@ function claimedRow(id: string): Instance {
     userId: OWNER.id,
     name: REQUEST.boxName,
     kind: 'ec2',
+    flavor: 'full',
     ec2InstanceId: `i-${id}`,
     region: 'us-east-1',
     hostname: `ip-10-0-0-1.${id}`,

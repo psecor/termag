@@ -9,6 +9,7 @@
  */
 
 import { prisma } from '../db';
+import { traceSweep } from './tracing/spans';
 
 
 const CHECK_INTERVAL_MS = 30_000;     // sweep for stale buckets every 30s
@@ -117,7 +118,7 @@ function sweepStale(): void {
 
 export function startWarpSampler(): void {
   if (checkTimer) return;
-  checkTimer = setInterval(sweepStale, CHECK_INTERVAL_MS);
+  checkTimer = setInterval(traceSweep('warp', sweepStale), CHECK_INTERVAL_MS);
 }
 
 export async function stopWarpSampler(): Promise<void> {

@@ -6,7 +6,7 @@
  * cliCredentialsPrisma.ts. No method returns a credential value.
  */
 import type { OrgAccess } from './githubRepos';
-import type { SshKeyInfo } from './sshKeyRegistration';
+import type { RemoveSshKeyResult, SshKeyInfo } from './sshKeyRegistration';
 
 export interface CliCredentialStatus {
   github: {
@@ -26,6 +26,7 @@ export class CredentialStoreUnavailableError extends Error {
 export interface CliCredentials {
   status(userId: string): Promise<CliCredentialStatus>;
   listSshKeys(userId: string): Promise<SshKeyInfo[]>;
+  removeSshKey(userId: string, id: string): Promise<RemoveSshKeyResult>;
   /** Throws CredentialInputError (bad token) or CredentialStoreUnavailableError. */
   connectGithub(userId: string, token: unknown): Promise<{ label: string }>;
 }

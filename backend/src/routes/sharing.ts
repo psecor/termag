@@ -1,7 +1,7 @@
 import { Router, RequestHandler, Response } from 'express';
 import { prisma } from '../db';
 import { kindRefusal, projectKindTraits } from '../services/projectKind';
-import { recheckMirror } from '../services/automations/memorySync';
+import { recheckMirror } from '../services/automations/spaceSync';
 import { requireAuth } from '../middleware/auth';
 import { boxSharingEnabled, SHARING_DISABLED_CODE } from '../services/boxSharingFlag';
 import { recordProductEvent } from '../services/productEvents';

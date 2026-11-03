@@ -50,7 +50,7 @@ describe('productEventRecord', () => {
     expect(new Set(PRODUCT_EVENTS).size).toBe(PRODUCT_EVENTS.length);
     expect(PRODUCT_EVENTS).toEqual(expect.arrayContaining([
       'project.created', 'agent.session.started', 'agent.session.ended', 'agent.status.changed', 'workstream.created',
-      'share.invited', 'cloud.session.queued', 'cloud.session.placed', 'cloud.session.started', 'cloud.session.ended', 'box.provisioned',
+      'share.invited', 'cloud.session.queued', 'cloud.session.placed', 'cloud.session.started', 'cloud.session.ended', 'box.provisioned', 'box.resumed',
     ]));
   });
 });

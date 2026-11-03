@@ -17,7 +17,7 @@
 import { prisma } from '../db';
 import { PrInputError } from './prReview';
 import { authoredLane, mergedRow, openRow, prKey, type PrRow, type WorkstreamLink } from './prPipeline';
-import type { NumberedPr } from './prPipelineGithub';
+import type { NumberedPr, PrReviewers } from './prPipelineGithub';
 
 export const MAX_MEMBERS = 20;
 export const MAX_OPEN_GROUPS = 10;
@@ -55,6 +55,8 @@ export interface GroupMember {
   yourReview: string | null;
   /** A pending request names the viewer. */
   askedYou: boolean;
+  /** Who has reviewed it (people apart from bots, the author left out); null unless open and read from GitHub. */
+  reviewers: PrReviewers | null;
   checked: boolean;
   /** Its lane row when a lane lists it, else one built for the card (`inLane` false); null when unread. */
   row: PrRow | null;
@@ -187,6 +189,7 @@ export function assembleGroups(
         state,
         yourReview,
         askedYou,
+        reviewers: state === 'open' ? (pr?.reviewers ?? null) : null,
         checked,
         row,
         inLane: lane !== null,

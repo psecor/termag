@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { McpConnectorError } from './mcpConnectors';
 import {
-  authorizeUrl, callbackIssuerProblem, cimdClientId, clientMetadataDocument, commitLink, discoverOAuth, exchangeCode, forgetOAuth, freshAccessToken,
-  McpNeedsLinkError, OAuthGrantError, pkcePair, refreshTokens, registerClient, registeredRow, registrationPath, resourceCovers,
+  authorizeUrl, callbackIssuerProblem, cimdClientId, clientIsStale, clientMetadataDocument, commitLink, discoverOAuth, exchangeCode, forgetOAuth, freshAccessToken,
+  McpNeedsLinkError, OAuthGrantError, pkcePair, preregisteredClients, refreshTokens, registerClient, registeredRow, registrationPath, resourceCovers,
   resourceMetadataFrom, revokeToken, signState, stateNonce, verifyState, wellKnown, type DiscoveredOAuth, type OAuthClient,
   type OAuthLockIo, type OAuthTokens, type StoredOAuth,
 } from './mcpOAuth';
@@ -453,5 +453,207 @@ describe('checkOAuthUrl', () => {
       expect(new URL(ip).hostname.startsWith('['), ip).toBe(true);
       expect(() => checkOAuthUrl(ip, new Set()), ip).toThrow(/names an IP address/);
     }
+  });
+});
+
+describe('pre-registered clients (MCP_OAUTH_CLIENTS)', () => {
+  // What https://mcp.slack.com publishes (probed 2026-10-30), scopes cut down.
+  const SLACK_UP = 'https://mcp.slack.com/mcp';
+  const slack = () => fakeHttp({
+    [SLACK_UP]: () => status(401, {}, { 'www-authenticate': 'Bearer resource_metadata="https://mcp.slack.com/.well-known/oauth-protected-resource"' }),
+    'https://mcp.slack.com/.well-known/oauth-protected-resource': () => ok({
+      resource: 'https://mcp.slack.com', authorization_servers: ['https://mcp.slack.com'], scopes_supported: ['search:read.public', 'chat:write'],
+    }),
+    'https://mcp.slack.com/.well-known/oauth-authorization-server': () => ok({
+      issuer: 'https://mcp.slack.com',
+      authorization_endpoint: 'https://slack.com/oauth/v2_user/authorize',
+      token_endpoint: 'https://slack.com/api/oauth.v2.user.access',
+      response_types_supported: ['code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+      token_endpoint_auth_methods_supported: ['client_secret_post'],
+      code_challenge_methods_supported: ['S256'],
+    }),
+    'https://slack.com/api/oauth.v2.user.access': () => ok({ ok: true, access_token: 'xoxp-user', token_type: 'user', authed_user: { id: 'U1' }, team: { id: 'T1' } }),
+  });
+  const SECRET = 'not-a-real-slack-secret-9f3a';
+  const ENV = {
+    MCP_OAUTH_CLIENTS: JSON.stringify([{ issuer: 'https://mcp.slack.com', resource: 'https://mcp.slack.com', clientId: '111.222', clientSecretEnv: 'MCP_OAUTH_SLACK_CLIENT_SECRET', tokenTypes: ['user'] }]),
+    MCP_OAUTH_SLACK_CLIENT_SECRET: SECRET,
+  };
+  const useEnv = (env: Record<string, string>) => { for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v); };
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+  async function discoverSlack() {
+    return discoverOAuth(SLACK_UP, { http: slack().http, check });
+  }
+
+  it('reads the secret from the variable the entry names, and skips bad entries naming no value', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const env = {
+      ...ENV,
+      MCP_OAUTH_CLIENTS: JSON.stringify([
+        ...JSON.parse(ENV.MCP_OAUTH_CLIENTS),
+        { issuer: 'https://unset.example', resource: 'https://unset.example', clientId: 'x', clientSecretEnv: 'MCP_OAUTH_UNSET_SECRET' },
+        { issuer: 'http://plain.example', clientId: 'x', clientSecretEnv: 'MCP_OAUTH_SLACK_CLIENT_SECRET' },
+        { issuer: 'https://inline.example', resource: 'https://inline.example', clientId: 'x', clientSecret: SECRET },
+        { issuer: 'https://mcp.slack.com', clientId: 'unpinned', clientSecretEnv: 'MCP_OAUTH_SLACK_CLIENT_SECRET' },
+      ]),
+    };
+    expect(preregisteredClients(env)).toEqual([{ issuer: 'https://mcp.slack.com', resource: 'https://mcp.slack.com', clientId: '111.222', clientSecret: SECRET, tokenTypes: ['user'] }]);
+    expect(preregisteredClients({ MCP_OAUTH_CLIENTS: '{not json' })).toEqual([]);
+    expect(preregisteredClients({})).toEqual([]);
+    expect(warn.mock.calls.flat().join('\n')).toMatch(/MCP_OAUTH_UNSET_SECRET is unset/);
+    expect(warn.mock.calls.flat().join('\n')).not.toContain(SECRET);
+  });
+
+  it('is chosen over DCR and CIMD when the issuer matches, and only then', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    expect(meta).toMatchObject({ issuer: 'https://mcp.slack.com', resource: 'https://mcp.slack.com', registrationEndpoint: null, revocationEndpoint: null, tokenAuthMethods: ['client_secret_post'] });
+    expect(registrationPath(meta, null)).toBe('preregistered');
+    expect(registrationPath({ ...meta, registrationEndpoint: 'https://slack.com/register', cimdSupported: true }, 'https://t.example/m.json')).toBe('preregistered');
+    expect(registrationPath(DISCOVERED, null)).toBe('dcr');
+    vi.unstubAllEnvs();
+    expect(() => registrationPath(meta, null)).toThrow(/no pre-registered client for https:\/\/mcp\.slack\.com \(MCP_OAUTH_CLIENTS\)/);
+  });
+
+  it('is not used for another resource that names the same issuer (review: Slack token sent to an attacker upstream)', async () => {
+    useEnv(ENV);
+    const EVIL = 'https://evil.example/mcp';
+    const { http } = fakeHttp({
+      [EVIL]: () => status(401, {}, { 'www-authenticate': 'Bearer resource_metadata="https://evil.example/.well-known/oauth-protected-resource/mcp"' }),
+      'https://evil.example/.well-known/oauth-protected-resource/mcp': () => ok({
+        resource: 'https://evil.example', authorization_servers: ['https://mcp.slack.com'], scopes_supported: ['search:read.private', 'im:history'],
+      }),
+    });
+    // Slack's real authorization-server metadata, behind the attacker's resource.
+    const meta = await discoverOAuth(EVIL, { http: async (u, r) => (u.startsWith('https://mcp.slack.com') ? slack().http(u, r) : http(u, r)), check });
+    expect(meta.issuer).toBe('https://mcp.slack.com');
+    expect(() => registrationPath(meta, null)).toThrow(/no pre-registered client/);
+    await expect(registerClient(meta, { http, cimdClientId: null, redirectUri: 'r' })).rejects.toThrow(/no pre-registered client/);
+  });
+
+  it('never hands a pre-registered client\'s token to an upstream outside its pinned resource', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    expect(client.resource).toBe('https://mcp.slack.com');
+    const s = fakeStore({ client, tokens: { accessToken: 'xoxp-user', expiresAt: null } });
+    const deps = { read: s.read, withLock: s.withLock, refresh: async () => { throw new Error('no'); }, now: () => 0 };
+    expect(await freshAccessToken({ ...deps, upstream: SLACK_UP })).toBe('xoxp-user');
+    await expect(freshAccessToken({ ...deps, upstream: 'https://evil.example/mcp' })).rejects.toBeInstanceOf(McpNeedsLinkError);
+    // And a token request for metadata naming another resource is refused before anything is sent.
+    const { http, calls } = slack();
+    await expect(exchangeCode({ ...meta, resource: 'https://evil.example' }, client, { code: 'c', verifier: 'v' }, http)).rejects.toThrow(/no longer has the pre-registered client/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('uses the auth method the server advertises, and refuses a server that takes no secret', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const { http, calls } = fakeHttp({});
+    const c = await registerClient(meta, { http, cimdClientId: null, redirectUri: CLIENT.redirectUri });
+    expect(c).toEqual({ clientId: '111.222', authMethod: 'client_secret_post', via: 'preregistered', redirectUri: CLIENT.redirectUri, issuer: 'https://mcp.slack.com', resource: 'https://mcp.slack.com' });
+    expect(calls).toHaveLength(0);
+    expect((await registerClient({ ...meta, tokenAuthMethods: [] }, { http, cimdClientId: null, redirectUri: 'r' })).authMethod).toBe('client_secret_basic');
+    expect(() => registrationPath({ ...meta, tokenAuthMethods: ['none', 'private_key_jwt'] }, null)).toThrow(/neither client_secret_basic nor client_secret_post/);
+  });
+
+  it('sends the secret to the token endpoint only, and stores, shows and logs it nowhere', async () => {
+    useEnv(ENV);
+    const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error')];
+    const meta = await discoverSlack();
+    const { http, calls } = slack();
+    const client = await registerClient(meta, { http, cimdClientId: null, redirectUri: CLIENT.redirectUri });
+    const url = authorizeUrl(meta, client, { state: 's', challenge: 'c' });
+    const tokens = await exchangeCode(meta, client, { code: 'code', verifier: 'v' }, http, 1000);
+
+    expect(tokens).toEqual({ accessToken: 'xoxp-user', expiresAt: null });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://slack.com/api/oauth.v2.user.access');
+    expect(Object.fromEntries(new URLSearchParams(calls[0].req.body))).toEqual({
+      grant_type: 'authorization_code', code: 'code', code_verifier: 'v', redirect_uri: CLIENT.redirectUri,
+      resource: 'https://mcp.slack.com', client_id: '111.222', client_secret: SECRET,
+    });
+    expect(calls[0].req.headers?.authorization).toBeUndefined();
+    const u = new URL(url);
+    expect(u.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(u.searchParams.get('resource')).toBe('https://mcp.slack.com');
+    expect(u.searchParams.get('client_id')).toBe('111.222');
+    for (const shown of [url, JSON.stringify(client), JSON.stringify(meta), JSON.stringify({ client, tokens } satisfies StoredOAuth)]) expect(shown).not.toContain(SECRET);
+    for (const spy of logs) expect(JSON.stringify(spy.mock.calls)).not.toContain(SECRET);
+  });
+
+  it("accepts Slack's \"user\" token type only for a client configured to, and still refuses others", async () => {
+    useEnv({ ...ENV, MCP_OAUTH_CLIENTS: JSON.stringify([{ ...JSON.parse(ENV.MCP_OAUTH_CLIENTS)[0], tokenTypes: undefined }]) });
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    await expect(exchangeCode(meta, client, { code: 'c', verifier: 'v' }, slack().http)).rejects.toThrow(/user token, not a bearer token/);
+    const { http } = fakeHttp({ 'https://auth.example/token': () => ok({ access_token: 'at', token_type: 'user' }) });
+    await expect(exchangeCode(DISCOVERED, CLIENT, { code: 'c', verifier: 'v' }, http)).rejects.toThrow(/not a bearer/);
+  });
+
+  it("reads Slack's 200 {ok:false} as a refusal, a bad code as a grant error, without echoing the secret", async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    const answer = (error: string) => fakeHttp({ 'https://slack.com/api/oauth.v2.user.access': () => ok({ ok: false, error }) }).http;
+    await expect(exchangeCode(meta, client, { code: 'c', verifier: 'v' }, answer('invalid_code'))).rejects.toBeInstanceOf(OAuthGrantError);
+    await expect(refreshTokens(meta, client, 'rt', answer('invalid_refresh_token'))).rejects.toBeInstanceOf(OAuthGrantError);
+    const err = await exchangeCode(meta, client, { code: 'c', verifier: 'v' }, answer('bad_client_secret')).catch(e => e as Error);
+    expect(err).toBeInstanceOf(McpConnectorError);
+    expect(err.message).toBe('the token endpoint refused: bad_client_secret');
+  });
+
+  it('keeps a token with no refresh token and no expiry linked, with no refresh and no needs_link', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    const tokens = await exchangeCode(meta, client, { code: 'c', verifier: 'v' }, slack().http);
+    const s = fakeStore({ client, tokens });
+    let refreshed = 0;
+    const deps = { read: s.read, withLock: s.withLock, upstream: SLACK_UP, refresh: async () => { refreshed++; return tokens; }, now: () => Date.now() + 365 * 86_400_000 };
+    expect(await freshAccessToken(deps)).toBe('xoxp-user');
+    expect(await freshAccessToken(deps)).toBe('xoxp-user');
+    expect(refreshed).toBe(0);
+    expect(s.linkCalls).toEqual([]);
+    expect(s.row).toEqual({ client, tokens });
+  });
+
+  it('unlinks by deleting the row when the server advertises no revocation endpoint', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    const { http, calls } = fakeHttp({});
+    const s = fakeStore({ client, tokens: { accessToken: 'xoxp-user', expiresAt: null } });
+    await forgetOAuth({ withLock: s.withLock, revoke: (c, t) => revokeToken(meta, c, t, http) });
+    expect(calls).toHaveLength(0);
+    expect(s.row).toBeNull();
+  });
+
+  it('refuses token requests once the client is gone from the config, and unlink still works', async () => {
+    useEnv(ENV);
+    const meta = await discoverSlack();
+    const client = await registerClient(meta, { http: fakeHttp({}).http, cimdClientId: null, redirectUri: 'r' });
+    vi.unstubAllEnvs();
+    const { http, calls } = slack();
+    await expect(refreshTokens(meta, client, 'rt', http)).rejects.toThrow(/no longer has the pre-registered client/);
+    expect(await revokeToken({ ...meta, revocationEndpoint: 'https://slack.com/revoke' }, client, { accessToken: 'a', expiresAt: null }, http)).toBe(false);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('registers again when a pre-registered client is added, changed or removed', () => {
+    const pre = { issuer: 'https://auth.example', resource: UP, clientId: 'pre-id', clientSecret: SECRET, tokenTypes: [] };
+    const preClient: OAuthClient = { ...CLIENT, clientId: 'pre-id', authMethod: 'client_secret_post', via: 'preregistered', resource: UP };
+    const opts = { redirectUri: CLIENT.redirectUri, cimdClientId: null };
+    expect(clientIsStale(undefined, DISCOVERED, { ...opts, preregistered: null })).toBe(true);
+    expect(clientIsStale(CLIENT, DISCOVERED, { ...opts, preregistered: null })).toBe(false);
+    expect(clientIsStale(CLIENT, DISCOVERED, { ...opts, preregistered: pre })).toBe(true);
+    expect(clientIsStale(preClient, DISCOVERED, { ...opts, preregistered: pre })).toBe(false);
+    expect(clientIsStale(preClient, DISCOVERED, { ...opts, preregistered: { ...pre, clientId: 'other' } })).toBe(true);
+    expect(clientIsStale(preClient, DISCOVERED, { ...opts, preregistered: null })).toBe(true);
+    expect(clientIsStale(preClient, DISCOVERED, { ...opts, preregistered: { ...pre, resource: 'https://mcp.example/other' } })).toBe(true);
+    expect(clientIsStale(preClient, DISCOVERED, { ...opts, redirectUri: 'https://elsewhere', preregistered: pre })).toBe(true);
+    expect(clientIsStale({ ...CLIENT, via: 'cimd' }, DISCOVERED, { ...opts, preregistered: null })).toBe(true);
   });
 });

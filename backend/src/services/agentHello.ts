@@ -24,6 +24,10 @@ export interface AgentHello {
 }
 
 const MAX_FIELD_LENGTH = 512;
+// A bound on agent-supplied input, not a budget: a capability past it reads
+// as missing, so it sits well above what a fully set-up box sends (35 in
+// October 2026). Raise it before the agent's list gets close.
+export const MAX_CAPABILITIES = 128;
 
 /** Host pressure as the agent samples it (agent/host-sample.js); each field null when the agent could not read it. */
 export interface HostSample {
@@ -34,6 +38,15 @@ export interface HostSample {
   /** The box's size; absent from agents that predate spawn telemetry. */
   cores: number | null;
   memTotalMb: number | null;
+  /** Open SSH and SSM sessions; absent from older agents. */
+  sshSessions: number | null;
+  /**
+   * Open port-forward tunnels, `tunnels.port`; absent from agents before
+   * port-forward-v1. The t3 count is left out: the desktop app holds a t3
+   * relay open for as long as it is connected, so counting it would keep an
+   * idle box up for good (the `tunnels` busy check reads this).
+   */
+  openTunnels: number | null;
 }
 
 const pct = (v: unknown): number | null => (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 100 ? v : null);
@@ -41,12 +54,19 @@ const count = (v: unknown): number | null => (typeof v === 'number' && Number.is
 const load = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 100_000 ? Math.round(v * 100) / 100 : null);
 
 /** The `host` object of a hello or a host-sample reply; null when absent or not an object. */
+/** `port` of `tunnels: { t3, port }`; null when it isn't a count. */
+function portTunnelCount(v: unknown): number | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+  return count((v as Record<string, unknown>).port);
+}
+
 export function parseHostSample(value: unknown): HostSample | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const h = value as Record<string, unknown>;
   return {
     diskUsedPct: pct(h.diskUsedPct), memUsedPct: pct(h.memUsedPct), load1: load(h.load1), keptCheckouts: count(h.keptCheckouts),
-    cores: count(h.cores) || null, memTotalMb: count(h.memTotalMb) || null,
+    cores: count(h.cores) || null, memTotalMb: count(h.memTotalMb) || null, sshSessions: count(h.sshSessions),
+    openTunnels: portTunnelCount(h.tunnels),
   };
 }
 
@@ -70,7 +90,7 @@ export function parseAgentHello(msg: unknown): AgentHello | null {
     agentCommitAt: commitDate(fields.agentCommitAt),
     warm: fields.warm === true,
     capabilities: Array.isArray(fields.capabilities)
-      ? fields.capabilities.filter((c): c is string => typeof c === 'string' && /^[a-z0-9-]{1,64}$/.test(c)).slice(0, 32)
+      ? fields.capabilities.filter((c): c is string => typeof c === 'string' && /^[a-z0-9-]{1,64}$/.test(c)).slice(0, MAX_CAPABILITIES)
       : [],
     host: parseHostSample(fields.host),
   };

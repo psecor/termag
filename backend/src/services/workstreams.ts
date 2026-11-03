@@ -31,7 +31,8 @@ export function mainWorkstreamBranch(input: {
 
 export async function ensureMainWorkstream(
   projectId: string,
-  opts?: { branch?: string },
+  /** `space`: a chat space fixed in the insert (services/chatSpace.ts fixedOnCreate); an existing main keeps its own. */
+  opts?: { branch?: string; space?: { spaceId?: string | null; spaceFixedAt?: Date } },
 ): Promise<{ id: string; name: string }> {
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -51,7 +52,7 @@ export async function ensureMainWorkstream(
 
   return prisma.workstream.upsert({
     where: { projectId_name: { projectId, name: 'main' } },
-    create: { projectId, name: 'main', branch },
+    create: { projectId, name: 'main', branch, ...(opts?.space ?? {}) },
     update: {},
     select: { id: true, name: true },
   });

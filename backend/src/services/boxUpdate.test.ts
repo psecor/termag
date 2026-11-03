@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./featureFlags', () => ({ boolVariation: vi.fn(async () => false), stringVariation: vi.fn(async () => '') }));
-vi.mock('../db', () => ({ prisma: { instance: { groupBy: vi.fn(async () => [{ lastUpdateOutcome: 'updated', _count: 2 }, { lastUpdateOutcome: 'failed', _count: 1 }]) } } }));
+const pushStamps: Array<{ where: any; data: any }> = [];
+vi.mock('../db', () => ({ prisma: { instance: {
+  groupBy: vi.fn(async () => [{ lastUpdateOutcome: 'updated', _count: 2 }, { lastUpdateOutcome: 'failed', _count: 1 }]),
+  updateMany: vi.fn(async (args: any) => { pushStamps.push(args); return { count: 1 }; }),
+} } }));
 vi.mock('./agentRegistry', () => ({
   sendToInstanceAgent: vi.fn(async () => ({ ok: true, started: true, unit: 'termag-box-update.service' })),
   instanceAgentTransport: vi.fn(() => null),
@@ -17,7 +21,7 @@ vi.mock('./boxProvisioner', () => ({
 }));
 
 const {
-  BOX_AUTO_UPDATE_FLAG, boxUpdateDecision, boxUpdateStatus, considerBoxUpdate, resetBoxUpdateCache,
+  BOX_AUTO_UPDATE_FLAG, boxUpdateDecision, boxUpdateStatus, considerBoxUpdate, noteClaimUpdated, resetBoxUpdateCache,
   runBoxUpdateSweep, startBoxUpdateSweep, stopBoxUpdateSweep, targetBoxCommit,
 } = await import('./boxUpdate');
 const { boolVariation, stringVariation } = await import('./featureFlags');
@@ -87,9 +91,12 @@ describe('boxUpdateDecision', () => {
 
 describe('considerBoxUpdate', () => {
   it('asks a stale box once per target, with the target in the RPC', async () => {
+    pushStamps.length = 0;
     expect(await considerBoxUpdate(candidate('b1', OLD), 'sweep')).toEqual({ push: true });
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith('b1', 'box-update', { target: NEW }, 15_000);
+    // Recorded for the lifecycle sweep's box-update busy check.
+    expect(pushStamps).toEqual([{ where: { id: 'b1' }, data: { updatePushedAt: expect.any(Date) } }]);
 
     expect(await considerBoxUpdate(candidate('b1', OLD), 'sweep')).toEqual({ push: false, reason: 'already-pushed' });
     expect(send).toHaveBeenCalledTimes(1);
@@ -149,6 +156,19 @@ describe('considerBoxUpdate', () => {
     expect(await considerBoxUpdate(candidate('b7', null), 'hello')).toEqual({ push: true });
     expect(await considerBoxUpdate(candidate('b7', null), 'sweep')).toEqual({ push: false, reason: 'already-pushed' });
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  // claimUpdate.ts brought a claimed box to the orchestrator's commit, which is
+  // not the image's: the hello its restart brings is not a reason to run it again.
+  it('counts a claim\'s update as the push for the current target', async () => {
+    const MAIN = 'e'.repeat(40);
+    noteClaimUpdated('b9');
+    expect(await considerBoxUpdate(candidate('b9', MAIN), 'hello')).toEqual({ push: false, reason: 'already-pushed' });
+    expect(send).not.toHaveBeenCalled();
+    // Once: the next check is the usual one, so a target that moves later is
+    // pushed (a box last asked about an older target is, in boxUpdateDecision).
+    expect(await considerBoxUpdate(candidate('b9', MAIN), 'sweep')).toEqual({ push: false, reason: 'already-pushed' });
+    expect(await considerBoxUpdate(candidate('b10', MAIN), 'hello')).toEqual({ push: true });
   });
 
   it('records a failed push for this target rather than retrying it every sweep', async () => {

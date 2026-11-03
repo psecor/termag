@@ -428,6 +428,18 @@ describe('fetchPrsByNumber (review groups)', () => {
       return { body: {
         data: {
           m0: { pullRequest: { ...openNode, id: 'PR_9', state: 'OPEN', mergedAt: null, closedAt: null, yours: { nodes: [{ state: 'COMMENTED', submittedAt: '2026-10-24T10:00:00Z' }] },
+            decided: { nodes: [
+              { state: 'APPROVED', author: { __typename: 'Bot', login: 'cursor' } },
+              { state: 'CHANGES_REQUESTED', author: { __typename: 'Bot', login: 'linter' } },
+              { state: 'APPROVED', author: { __typename: 'User', login: 'alice' } },
+              { state: 'CHANGES_REQUESTED', author: { __typename: 'User', login: 'bob' } },
+              { state: 'DISMISSED', author: { __typename: 'User', login: 'dora' } },
+            ] },
+            commented: { nodes: [
+              { author: { __typename: 'Bot', login: 'cursor' } }, { author: { __typename: 'User', login: 'Alice' } },
+              { author: { __typename: 'User', login: 'carol' } }, { author: { __typename: 'User', login: 'carol' } },
+              { author: { __typename: 'User', login: (openNode as { author: { login: string } }).author.login } }, { author: null },
+            ] },
             commits: { nodes: [{ commit: { statusCheckRollup: { state: 'FAILURE' } } }] } } },
           m1: { pullRequest: { ...mergedNode, id: 'PR_8', state: 'MERGED', closedAt: '2026-10-08T00:00:00Z', yours: { nodes: [] } } },
           m2: { pullRequest: null },
@@ -445,10 +457,14 @@ describe('fetchPrsByNumber (review groups)', () => {
     expect(first.query).toContain('yours: reviews(author: $viewer, last: 1, states: [APPROVED, CHANGES_REQUESTED, COMMENTED])');
     expect(got.map(p => [p.number, p.found, p.state])).toEqual([[9, true, 'OPEN'], [8, true, 'MERGED'], [404, false, null], [1, false, null]]);
     expect(got[0].yourReview).toEqual({ state: 'COMMENTED', submittedAt: '2026-10-24T10:00:00Z' });
+    // People apart from bots; an approver's comment is not a second entry; the author and a dismissed review are left out.
+    expect(got[0].reviewers).toEqual({ approved: ['alice'], changes: ['bob'], commented: ['carol'], botsApproved: ['cursor'], botsChanges: ['linter'] });
+    expect(first.query).toContain('decided: latestOpinionatedReviews(first: 20)');
     // The viewer is not among the requested reviewers (alice, platform-team): not asked of them.
     expect(got[0].open?.requestedYou).toBe(false);
     expect(got[0].open!.checks.map(c => c.name)).toEqual(['Bugbot', 'ci', 'lint', 'security']);
-    expect(got[1]).toMatchObject({ open: null, mergedAt: '2026-10-08T00:00:00Z', yourReview: null });
+    expect(got[1]).toMatchObject({ open: null, mergedAt: '2026-10-08T00:00:00Z', yourReview: null, reviewers: { approved: [], changes: [], commented: [], botsApproved: [], botsChanges: [] } });
+    expect(got[2].reviewers).toBeNull();
   });
   it('splits a long list into batches of BY_NUMBER_BATCH, answered in order', async () => {
     const { fetchImpl, calls } = fakeFetch((_url, init) => {

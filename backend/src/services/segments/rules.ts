@@ -16,7 +16,6 @@ export const RULES = {
   PASSIVE_WINDOW: 7, PASSIVE_MIN: 1,
   POWER_WINDOW: 7, POWER_MIN: 5,
   POWER_CREAT_WINDOW: 30, POWER_BOXES: 2, POWER_CREATIONS: 5,
-  DORMANT_WINDOW: 30,
 } as const;
 
 /** The agent-time floor for a day to count as active (5 min). */
@@ -47,7 +46,8 @@ function covered(active: Set<string>, day: string, window: number, minimum: numb
 
 /**
  * Segment for one user on one evaluation day, first match wins:
- * New > Power > Active > Passive > Dormant.
+ * New > Power > Active > Passive > Dormant. Dormant has no window of its
+ * own: it is a user with no active day in Passive's 7.
  *
  * @param tenureStart users.createdAt (YYYY-MM-DD): the New gate.
  * @param active days that passed isActiveDay, including days before tenureStart

@@ -6,6 +6,7 @@ import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } f
 import { claudeRunnerEventsRouter } from './claudeRunnerEvents';
 import { recordRunnerEnd, recordRunnerStarted, recordRunnerTitle, recordRunnerUsage } from '../services/claudeRunnerSessions';
 import { notifyCloudSessionChange, recordSessionEvent } from '../services/claudeSessionEvents';
+import { noteBoxActivity } from '../services/boxActivity';
 
 let agentInstanceId: string | null = 'box-a';
 vi.mock('../db', () => ({ prisma: {} }));
@@ -21,6 +22,7 @@ vi.mock('../services/claudeRunnerSessions', async (importOriginal) => ({
   recordRunnerEnd: vi.fn(), recordRunnerStarted: vi.fn(), recordRunnerTitle: vi.fn(), recordRunnerUsage: vi.fn(),
 }));
 vi.mock('../services/claudeSessionEvents', () => ({ recordSessionEvent: vi.fn(async () => {}), notifyCloudSessionChange: vi.fn() }));
+vi.mock('../services/boxActivity', () => ({ noteBoxActivity: vi.fn() }));
 const who = { userId: 'u1', who: 'ada', sessionId: 'cse_01A', instanceId: 'box-a', boxName: 'ada-box', slot: 2 };
 
 // The product events the route records (services/productEvents.ts), read off
@@ -91,6 +93,8 @@ describe('POST /api/claude-runner/event', () => {
       'event.name': 'cloud.session.ended', 'termag.user.id': 'u1', 'termag.box.id': 'box-a',
       'termag.provider': 'claude', 'termag.kind': 'cloud', 'termag.durationSec': 5000, 'termag.exitStatus': 0, 'termag.exitReason': 'completed', 'termag.slot': 2,
     }]);
+    // A cloud session is its owner using the box.
+    expect(noteBoxActivity).toHaveBeenCalledWith('box-a');
   });
 
   it('records a started report, logs the serving line and appends the event', async () => {
@@ -104,6 +108,7 @@ describe('POST /api/claude-runner/event', () => {
       'event.name': 'cloud.session.started', 'termag.user.id': 'u1', 'termag.box.id': 'box-a',
       'termag.provider': 'claude', 'termag.kind': 'cloud', 'termag.clientPlatform': 'web_claude_ai', 'termag.slot': 2,
     }]);
+    expect(noteBoxActivity).toHaveBeenCalledWith('box-a');
   });
 
   it('sets a title without logging or storing the text, and pushes the change', async () => {
@@ -152,6 +157,7 @@ describe('POST /api/claude-runner/event', () => {
     expect(res.statusCode).toBe(204);
     expect(lines('log')).toEqual([]);
     expect(productEvents()).toEqual([]);
+    expect(noteBoxActivity).not.toHaveBeenCalled();
   });
 
   it('answers 404 for an order it never started, and 403 for another box\'s', async () => {

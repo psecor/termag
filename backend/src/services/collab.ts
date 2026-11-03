@@ -6,7 +6,7 @@
  * the sender's preview and the modals, and decides when to tell the asking
  * agent about a reply. No I/O here: routes/collab.ts and slack/collab.ts do it.
  */
-import { findSecretsInText } from './askPublish';
+import { findSecretsInText } from './secretPatterns';
 import { nudgeDecision } from './agentSpawn';
 
 export const COLLAB_FLAG = 'slack-collab-enabled';

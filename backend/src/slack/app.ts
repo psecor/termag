@@ -11,6 +11,10 @@ const { App } = require('@slack/bolt');
 import { registerEventHandlers } from './events';
 import { describeSlackGate } from './access';
 import { loadActiveTargetsOrRetry } from './activeTargets';
+import { loadAgentThreadsOrRetry } from './agentStore';
+import { acceptAgentRuns, stopAgentRunsForRestart } from './agentSession';
+import { slackSurfaceMiddleware } from '../services/requestSurface';
+import { slackTraceMiddleware } from '../services/tracing/botSpans';
 
 let slackApp: any = null;
 
@@ -27,6 +31,11 @@ export function createSlackApp(): any {
     ...(clientOptions && { clientOptions, installerOptions: { clientOptions } }),
   });
 
+  // Each Slack request a trace of its own, ids only (services/tracing/botSpans.ts);
+  // first, so the span covers the surface middleware and the listeners.
+  app.use(slackTraceMiddleware);
+  // Flags read while handling a Slack event carry `surface: slack`.
+  app.use(slackSurfaceMiddleware);
   registerEventHandlers(app);
   slackApp = app;
   return app;
@@ -39,8 +48,11 @@ export async function startSlackApp(app: any): Promise<boolean> {
     return false;
   }
 
-  // Before connecting, so the first /t already sees everyone's saved target.
+  // Before connecting, so the first /t already sees everyone's saved target,
+  // and a reply in an agent thread its saved session and owner.
   await loadActiveTargetsOrRetry('SLACK');
+  await loadAgentThreadsOrRetry();
+  acceptAgentRuns();
   try {
     await app.start();
     console.log('[SLACK] Bot running in Socket Mode');
@@ -58,7 +70,17 @@ export async function startSlackApp(app: any): Promise<boolean> {
  * status writes trigger.
  */
 export async function stopSlackApp(app: any): Promise<void> {
-  await app.stop();
+  // Runs are stopped at once (and no new one starts), the connection closes
+  // whether or not that throws, and then the stop waits for their notes, which
+  // go out through the Web API client. A next holder that reaches one of these
+  // threads first finds its run claim held (agentStore.ts) and asks the person
+  // to try again, rather than resuming the same session alongside.
+  const stopping = stopAgentRunsForRestart();
+  try {
+    await app.stop();
+  } finally {
+    await stopping;
+  }
 }
 
 export function getSlackApp() {

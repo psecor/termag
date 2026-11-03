@@ -63,6 +63,20 @@ describe('CliJwt', () => {
     expect(jwt.verify('not.a.jwt', NOW)).toBeNull();
   });
 
+  it('skips exp alone when asked: the signature, the key and the claims still count', async () => {
+    const { token } = await jwt.issue('alice', 's1', NOW);
+    const { header, payload } = decode(token);
+    const late = NOW + 12 * 3600_000;
+    expect(jwt.verify(token, late, { ignoreExpiry: true })).toEqual({ sub: 'alice', jti: 's1', exp: NOW / 1000 + 3600 });
+    const [h, , s] = token.split('.');
+    const tampered = `${h}.${Buffer.from(JSON.stringify({ ...payload, sub: 'bob' })).toString('base64url')}.${s}`;
+    expect(jwt.verify(tampered, late, { ignoreExpiry: true })).toBeNull();
+    expect(jwt.verify(await resign(localCliJwtKey(), header, payload), late, { ignoreExpiry: true })).toBeNull();
+    expect(jwt.verify(await resign(key, header, { ...payload, exp: 'never' }), late, { ignoreExpiry: true })).toBeNull();
+    // A key no longer published: retired.
+    expect(new CliJwt(ISSUER, [localCliJwtKey()]).verify(token, NOW, { ignoreExpiry: true })).toBeNull();
+  });
+
   it('signs with the first key and accepts every published one', async () => {
     const next = localCliJwtKey();
     const old = await jwt.issue('alice', 's1', NOW);

@@ -11,13 +11,17 @@ import { prisma } from '../../db';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from '../agentRegistry';
 import { chatLaunchFor } from '../chatLaunch';
 import { storedChatChoice } from '../claudeChatModel';
-import { AUTO_MODE, chatKeyFor, chatSendRpcPayload } from '../chatRunner';
+import { AUTO_MODE, chatKeyFor, chatMemorySpace, chatSendRpcPayload } from '../chatRunner';
+import { chatSpaceFor, resolveChatSpaceChoice } from '../chatSpace';
 import { UNTRUSTED_MODE } from '../chatTrust';
 import { createWorkstreamFor, removeWorkstreamFor, type CreatedWorkstreamExtras } from '../../routes/workstreams';
 import * as tmux from '../tmux';
-import { buildAutomationBrief, occurrenceLabel, type RunTier } from './brief';
-import { syncMemory } from './memorySync';
+import { buildAutomationBrief, occurrenceLabel, type BriefSpace, type RunTier } from './brief';
+import { runLogName } from './runLog';
 import { runBranch, runName } from './schedule';
+import { folderOf } from './spaceFolder';
+import { pullForRun, readmeFor, spaceFoldersEnabledFor, syncErrorText } from './spaceSync';
+import { FINISHED_RUN_STATES } from './store';
 
 /** Where a project's runs keep their shared notes on the box. */
 export function memoryDir(home: string, projectId: string): string {
@@ -81,8 +85,10 @@ export async function startRun(t: StartTarget): Promise<StartOutcome> {
   const branchName = name === baseName ? branch : `${branch}-${name.slice(baseName.length + 1)}`;
 
   const user = { id: owner.id, unixUsername: owner.unixUsername, slackUserId: null } as unknown as Express.User;
+  // The run's chat belongs to the automation's space from its first row (services/chatSpace.ts).
+  const chatSpace = await resolveChatSpaceChoice(automation.spaceName, project.userId).catch(() => null);
   const created = await createWorkstreamFor(user, project.id, {
-    name, branch: branchName, baseRef: `origin/${defaultBranch}`, system: true, slack: false,
+    name, branch: branchName, baseRef: `origin/${defaultBranch}`, system: true, slack: false, chatSpace,
     fetch: { remoteBranch: defaultBranch },
   });
   if (created.status !== 201) {
@@ -94,7 +100,7 @@ export async function startRun(t: StartTarget): Promise<StartOutcome> {
     // agent) is the launch's failure: a retry from HEAD would start on a
     // stale checkout, or on top of an add that did land on the box.
     if (/git worktree add failed/.test(body.error ?? '') && UNRESOLVED_BASE_REF.test(body.error ?? '')) {
-      const again = await createWorkstreamFor(user, project.id, { name, branch: branchName, baseRef: 'HEAD', system: true, slack: false });
+      const again = await createWorkstreamFor(user, project.id, { name, branch: branchName, baseRef: 'HEAD', system: true, slack: false, chatSpace });
       if (again.status !== 201) return { kind: 'failed', reason: 'launch', error: (again.body as { error?: string }).error ?? 'could not make the workstream' };
       return await sendBrief(t, again.body as WorkstreamBody, { fetched: false, baseSha: null }, name, branchName, defaultBranch);
     }
@@ -105,6 +111,16 @@ export async function startRun(t: StartTarget): Promise<StartOutcome> {
 }
 
 type WorkstreamBody = { id: string; name: string } & CreatedWorkstreamExtras;
+
+/** The log name of the automation's latest run that started and finished before this one, whose log the space may hold. */
+async function previousRunLog(automationId: string, runId: string): Promise<string | null> {
+  const prev = await prisma.automationRun.findFirst({
+    where: { automationId, id: { not: runId }, startedAt: { not: null }, state: { in: [...FINISHED_RUN_STATES] } },
+    orderBy: { startedAt: 'desc' },
+    select: { scheduledFor: true, trigger: true },
+  }).catch(() => null);
+  return prev ? runLogName(prev) : null;
+}
 
 /** git's words for a `worktree add` whose start point does not exist (an unfetched origin/<default>). */
 const UNRESOLVED_BASE_REF = /invalid reference|not a valid object name|unknown revision/;
@@ -152,20 +168,34 @@ async function sendBrief(
     console.warn(`[AUTOMATION] ${project.name}: could not read or seed the notes file; the run starts with whatever the box has: ${(err as Error).message}`);
   }
 
-  // Notes mirrored in a space come down first;
-  // a pull that fails leaves whatever the box has.
+  // The space's files come down first (decision 13):
+  // the notes, and with folders on the state, the previous run's log and
+  // the README. Trouble leaves whatever the box has, and the brief and the
+  // row say so.
+  let space: BriefSpace | null = null;
+  let spaceSyncError: string | null = null;
   if (automation.spaceName) {
-    await syncMemory({
-      runId: run.id, userId: owner.id, projectId: project.id, projectName: project.name, spaceName: automation.spaceName,
+    const folders = await spaceFoldersEnabledFor(owner.id).catch(() => false);
+    const folder = folderOf(automation);
+    const previousLog = folders ? await previousRunLog(automation.id, run.id) : null;
+    const pulled = await pullForRun({
+      runId: run.id, userId: owner.id, projectId: project.id, projectName: project.name, spaceName: automation.spaceName, folder,
       host, box: { id: box.id, hostHome: box.hostHome, hostUnixUser: owner.unixUsername }, memoryDir: memory,
-    }, 'get');
+    }, { folders, previousLog, readme: folders ? readmeFor({ ...automation, spaceName: automation.spaceName }, project.name, owner.unixUsername) : null });
+    if (folders) {
+      spaceSyncError = pulled.error;
+      space = {
+        spaceName: automation.spaceName, folder, logName: runLogName(run), previousRun: previousLog !== null,
+        unavailable: pulled.usable ? null : syncErrorText(pulled.error ?? 'the notes could not be copied'),
+      };
+    }
   }
 
   // Link the row before the send (a fast turn-end must find its run), and
   // only while it still runs: Stop or the timeout sweep may have failed it
   // during the worktree add and the notes pull, when there was no
   // workstream to interrupt yet. Then nothing is sent and the tree goes.
-  const linked = await prisma.automationRun.updateMany({ where: { id: run.id, state: 'running' }, data: { workstreamId: ws.id, branch } });
+  const linked = await prisma.automationRun.updateMany({ where: { id: run.id, state: 'running' }, data: { workstreamId: ws.id, branch, ...(spaceSyncError ? { spaceSyncError } : {}) } });
   if (linked.count === 0) {
     console.log(`[AUTOMATION] ${project.name} ${run.scheduledFor.toISOString()}: stopped before its brief was sent; discarding ${ws.name}`);
     await discardWorkstream(t, ws);
@@ -176,7 +206,7 @@ async function sendBrief(
     automationName: project.name, projectName: project.name,
     occurrenceLabel: occurrenceLabel(run.scheduledFor, automation.timezone),
     runName: name, branch, defaultBranch, baseSha: base.baseSha, fetched: base.fetched,
-    memoryPath: memory, prompt: automation.prompt, tier: automation.tier as RunTier, prOnChange: automation.prOnChange,
+    memoryPath: memory, prompt: automation.prompt, tier: automation.tier as RunTier, prOnChange: automation.prOnChange, space,
   });
   const cwd = tmux.projectDirFor({ name: project.name, user: { unixUsername: owner.unixUsername }, instance: { hostHome: box.hostHome } }, ws.name);
   const caps = instanceAgentTransport(project.instanceId)?.capabilities ?? [];
@@ -188,10 +218,13 @@ async function sendBrief(
     return { kind: 'failed', reason: 'launch', error: launch.body.error };
   }
   const payload = chatSendRpcPayload({
-    chatKey: chatKeyFor(project.id, ws.id), cwd, projectId: project.id, workstream: ws.name, workstreamId: ws.id,
+    chatKey: chatKeyFor(project.id, ws.id), cwd, projectId: project.id, project: project.name, workstream: ws.name, workstreamId: ws.id,
     requireCheckout: false, permissionMode: modeForTier(automation.tier, project.chatTrustedAt != null),
     ...launch.launch,
-  }, brief, caps);
+  }, brief, caps, {
+    // The run's chat belongs to the automation's space (services/chatSpace.ts), fixed before its first turn.
+    memorySpace: chatMemorySpace(await chatSpaceFor(ws.id, { requested: { name: automation.spaceName, userId: project.userId } })),
+  });
   try {
     await sendForProject(host, 'chat-send', payload, 15_000);
   } catch (err) {

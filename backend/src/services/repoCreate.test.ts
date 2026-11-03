@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
-  archivedLookup,
+  archivedAsideName,
+  archivedLookups,
   archivedRepoConflict,
+  parseArchivedNameChoice,
   isBranchName,
+  isNewBranchName,
   parseClaimTiming,
   recordedBranch,
 } from './repoCreate';
@@ -22,6 +25,23 @@ describe('isBranchName', () => {
 
   it('rejects a leading slash', () => {
     expect(isBranchName('/tmp')).toBe(false);
+  });
+});
+
+describe('isNewBranchName', () => {
+  it('accepts a branch with slashes', () => {
+    expect(isNewBranchName('skz/ABC-123/fix-login')).toBe(true);
+    expect(isNewBranchName('v1.2/fix')).toBe(true);
+  });
+
+  it('rejects what git check-ref-format would refuse after isBranchName lets it through', () => {
+    for (const bad of ['team/', 'a//b', 'a/.b', '.a', 'a.', 'a/b.lock', 'a.lock/b', 'a@{1}', '@', 'HEAD']) {
+      expect(isNewBranchName(bad), bad).toBe(false);
+    }
+  });
+
+  it('keeps every refusal of isBranchName', () => {
+    for (const bad of ['release/../main', '-develop', '/tmp', 'a b']) expect(isNewBranchName(bad), bad).toBe(false);
   });
 });
 
@@ -51,31 +71,69 @@ describe('recordedBranch', () => {
   });
 });
 
-describe('archivedLookup', () => {
-  it('does not pin a plain create to a box', () => {
-    expect(archivedLookup(false, 'box-1')).toEqual({ archived: true });
+describe('archivedLookups', () => {
+  it('tries the requested box before any box for a plain create', () => {
+    expect(archivedLookups(false, 'box-1')).toEqual([{ archived: true, instanceId: 'box-1' }, { archived: true }]);
   });
 
   it('limits a repo pick to the requested box', () => {
-    expect(archivedLookup(true, 'box-1')).toEqual({ archived: true, instanceId: 'box-1' });
+    expect(archivedLookups(true, 'box-1')).toEqual([{ archived: true, instanceId: 'box-1' }]);
+  });
+});
+
+describe('parseArchivedNameChoice', () => {
+  it('reads both choices and treats absence as none', () => {
+    expect(parseArchivedNameChoice('unarchive')).toBe('unarchive');
+    expect(parseArchivedNameChoice('rename-aside')).toBe('rename-aside');
+    expect(parseArchivedNameChoice(undefined)).toBeNull();
+    expect(parseArchivedNameChoice(null)).toBeNull();
+  });
+
+  it('rejects anything else', () => {
+    expect(parseArchivedNameChoice('delete')).toBeUndefined();
   });
 });
 
 describe('archivedRepoConflict', () => {
+  const sameBox = { sameBox: true };
+
   it('conflicts when the repo name is archived on this box', () => {
-    expect(archivedRepoConflict(true, true)).toBe('conflict');
+    expect(archivedRepoConflict(true, sameBox)).toBe('conflict');
   });
 
   it('starts fresh when the repo name is not archived on this box', () => {
-    expect(archivedRepoConflict(true, false)).toBe('fresh');
+    expect(archivedRepoConflict(true, null)).toBe('fresh');
   });
 
   it('un-archives a plain create that found a row', () => {
-    expect(archivedRepoConflict(false, true)).toBe('unarchive');
+    expect(archivedRepoConflict(false, sameBox)).toBe('unarchive');
+    expect(archivedRepoConflict(false, { sameBox: false })).toBe('unarchive');
   });
 
   it('starts fresh when a plain create finds nothing', () => {
-    expect(archivedRepoConflict(false, false)).toBe('fresh');
+    expect(archivedRepoConflict(false, null)).toBe('fresh');
+  });
+
+  it('follows the form\'s answer to a conflict', () => {
+    expect(archivedRepoConflict(true, sameBox, 'unarchive')).toBe('unarchive');
+    expect(archivedRepoConflict(true, sameBox, 'rename-aside')).toBe('rename-aside');
+  });
+
+  it('has nothing to rename aside when the row is on another box', () => {
+    expect(archivedRepoConflict(false, { sameBox: false }, 'rename-aside')).toBe('fresh');
+  });
+});
+
+describe('archivedAsideName', () => {
+  const at = new Date('2026-10-21T04:39:59Z');
+
+  it('names it after the day it was archived', () => {
+    expect(archivedAsideName('webapp', at, new Set())).toBe('webapp-archived-2026-10-21');
+  });
+
+  it('counts past names in use', () => {
+    const taken = new Set(['webapp-archived-2026-10-21', 'webapp-archived-2026-10-21-2']);
+    expect(archivedAsideName('webapp', at, taken)).toBe('webapp-archived-2026-10-21-3');
   });
 });
 

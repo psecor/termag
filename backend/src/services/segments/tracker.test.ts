@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const upserts: Array<{ userId: string; date: string; segment: string }> = [];
+// Which sweeps' own spans a failure reached; otherwise the tick just runs.
+const sweepFailures = vi.hoisted(() => [] as string[]);
+vi.mock('../tracing/spans', () => ({
+  traceSweep: (name: string, tick: () => Promise<unknown>) => () =>
+    tick().catch((err: unknown) => { sweepFailures.push(name); throw err; }),
+}));
 
 vi.mock('../../db', () => ({
   prisma: {
@@ -18,7 +24,7 @@ vi.mock('../../db', () => ({
 }));
 
 import { prisma } from '../../db';
-import { rebuildSegments, segmentTrackerStatus } from './tracker';
+import { rebuildSegments, segmentTrackerStatus, segmentTrackerTick } from './tracker';
 
 const rawUsers = [
   { id: 'u-early', createdAt: new Date('2026-10-01T00:00:00Z') },
@@ -85,5 +91,15 @@ describe('rebuildSegments', () => {
     await rebuildSegments();
     expect(segmentTrackerStatus().lastRunAt).not.toBeNull();
     expect(segmentTrackerStatus().state).toBe('idle');
+  });
+});
+
+describe('the segments sweep span', () => {
+  it('fails when the rebuild fails, though the tracker only records the error', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(prisma.user.findMany).mockRejectedValueOnce(new Error('database unavailable'));
+    const { status } = await segmentTrackerTick();
+    expect(status.state).toBe('error');
+    expect(sweepFailures).toEqual(['segments']);
   });
 });

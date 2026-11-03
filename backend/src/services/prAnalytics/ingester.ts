@@ -21,9 +21,12 @@ import { readGithubAccess } from '../credentialStore';
 import { isAdminUser } from '../admin/adminAccess';
 import { classifyPr, bodyWindow, DEFAULT_AGENT_LOGINS, DEFAULT_BOT_LOGINS, type ClassifyLists } from './classify';
 import { SEED_GROUPS, resolveGroup, orgsToList, scopeKey, scorePr, type GroupDef, type GroupMember, type PathScope, type RepoInfo } from './groups';
-import { syncRepo, searchSync, pauseBelow, type PrNode, type RateLimit, type SyncState } from './sync';
+import { SEED_TEAMS, SEED_TEAM_MEMBERS, SEED_START } from './teams';
+import { orgApiBase, orgExportPath, syncTeams } from './teamSync';
+import { syncRepo, searchSync, pauseBelow, prCommitShas, type PrNode, type RateLimit, type SyncState } from './sync';
 import { fetchPrPage, isRateLimited, listOrgRepos, listTopicRepos, searchPrPage } from './github';
 import { REVIEW_DAYS, reviewFields, reviewRows } from './reviews';
+import { traceSweep } from '../tracing/spans';
 
 const TICK_MS = 60_000;
 const DISCOVERY_MS = 6 * 3600_000;
@@ -90,6 +93,51 @@ async function ensureSeeded(): Promise<void> {
   if (missing.length) discoveryDue = true;
 }
 
+/**
+ * Create each seed team and its roster once, by key.
+ * Seed memberships are `manual`: the org-tree's real intervals arrive with the
+ * sync, and a manual row wins until the admin replaces it.
+ */
+async function ensureTeamsSeeded(): Promise<void> {
+  const s = await getSettings();
+  const seeded = new Set(strings(s.seededTeams));
+  const missing = SEED_TEAMS.filter(t => !seeded.has(t.key));
+  if (!missing.length) return;
+  for (const t of missing) {
+    await prisma.team.upsert({ where: { key: t.key }, create: { key: t.key, name: t.name, parent: t.parent, hidden: t.hidden, sort: t.sort }, update: {} });
+    for (const m of SEED_TEAM_MEMBERS.filter(x => x.teamKey === t.key)) {
+      const start = m.start ? new Date(`${m.start}T00:00:00Z`) : SEED_START;
+      await prisma.teamMembership.upsert({
+        where: { teamKey_login_start: { teamKey: t.key, login: m.login, start } },
+        create: { teamKey: t.key, login: m.login, name: m.name, email: m.email || null, start, openStart: true, source: m.source ?? 'manual' },
+        update: {},
+      });
+    }
+    seeded.add(t.key);
+  }
+  await prisma.prAnalyticsSettings.update({ where: { id: SETTINGS_ID }, data: { seededTeams: [...seeded] } });
+}
+
+const TEAM_SYNC_MS = 6 * 3600_000;
+let teamSyncAt = 0;
+/**
+ * Pull the org-tree's registry and rosters every 6 h, when an API base is
+ * configured (Sync). In memory: a restart syncs once.
+ */
+async function syncTeamsIfDue(): Promise<void> {
+  if (!orgApiBase() && !orgExportPath()) return;
+  if (Date.now() - teamSyncAt < TEAM_SYNC_MS) return;
+  try {
+    const r = await syncTeams();
+    teamSyncAt = Date.now();
+    console.log(`[PR-INGEST] teams synced: ${r.teams} teams, ${r.members} members (${r.skipped} unresolved)`);
+  } catch (err) {
+    // Retry sooner than the 6 h window, but not on every tick.
+    teamSyncAt = Date.now() - TEAM_SYNC_MS + 15 * 60_000;
+    console.warn('[PR-INGEST] team sync failed:', err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function discover(token: string): Promise<void> {
   const groups = (await prisma.repoGroup.findMany()).map(rowToGroup);
   const known: RepoInfo[] = [];
@@ -147,6 +195,7 @@ function toRow(n: PrNode, repo: string, visibility: string, lists: ClassifyLists
     repo, repoVisibility: visibility, number: n.number, authorLogin, authorType: n.author?.__typename ?? '',
     authorClass: c.authorClass, creditedLogin: c.creditedLogin, creditSource: c.creditSource, agentAssisted: c.agentAssisted,
     state: n.state, isDraft: n.isDraft, baseRef: n.baseRefName ?? '',
+    ...prCommitShas(n),
     additions: n.additions ?? 0, deletions: n.deletions ?? 0, changedFiles: n.changedFiles ?? 0,
     createdAt: new Date(n.createdAt), mergedAt: n.mergedAt ? new Date(n.mergedAt) : null, closedAt: n.closedAt ? new Date(n.closedAt) : null,
     prUpdatedAt: new Date(n.updatedAt),
@@ -208,6 +257,8 @@ export async function tick(now = Date.now()): Promise<void> {
   if (!access) { status.state = 'owner-has-no-github'; return; }
   status.state = 'running';
   await ensureSeeded();
+  await ensureTeamsSeeded();
+  await syncTeamsIfDue();
   if (discoveryDue || !status.lastDiscoveryAt || now - Date.parse(status.lastDiscoveryAt) > DISCOVERY_MS) {
     discoveryDue = false;
     await discover(access.token);
@@ -329,9 +380,11 @@ async function writeNodes(repo: string, nodes: PrNode[], visibility: string, lis
   }));
 }
 
+const tracedTick = traceSweep('pr-ingest', () => tick());
+
 function runTick(): void {
   if (running) return;
-  running = tick().then(() => { status.lastError = null; }).catch(err => {
+  running = tracedTick().then(() => { status.lastError = null; }).catch(err => {
     status.state = 'error'; status.lastError = (err as Error).message.slice(0, 300);
     console.error('[PR-INGEST] tick failed:', status.lastError);
   }).finally(() => { running = null; });

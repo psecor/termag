@@ -105,7 +105,7 @@ async function usersBy(untilTs: Date) {
 
 /**
  * userId → provider → agent ms in the window. work_time_entries keys people by
- * unix username and days server-local; agent-written rows carry the tmux-safe
+ * unix username and days by their own zone, else server-local; agent-written rows carry the tmux-safe
  * form (`.` and `:` folded to `_`, services/tmux.ts tmuxSafeName), so match either.
  */
 async function agentMs(range: Range): Promise<Map<string, Map<string, number>>> {

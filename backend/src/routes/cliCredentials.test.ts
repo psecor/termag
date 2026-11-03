@@ -49,6 +49,13 @@ class FakeCredentials implements CliCredentials {
   storedTokens: string[] = [];
   async status() { return { github: this.github, claudeGateway: { available: true, enabled: true } }; }
   async listSshKeys() { return this.keys; }
+  async removeSshKey(_userId: string, id: string) {
+    const before = this.keys.length;
+    this.keys = this.keys.filter(k => k.id !== id);
+    return this.keys.length < before
+      ? { kind: 'removed' as const, boxes: { updated: ['devbox'], pending: ['parked'] } }
+      : { kind: 'not_found' as const };
+  }
   async connectGithub(_userId: string, token: unknown) {
     if (!this.github.available) throw new CredentialStoreUnavailableError();
     if (token !== GH) throw new CredentialInputError('That is not a GitHub token (paste the output of `gh auth token`).');
@@ -132,6 +139,30 @@ describe('POST /ssh-keys', () => {
       expect(await res.json()).toMatchObject({ code: 'not_found' });
     }
     expect(creds.keys).toHaveLength(0);
+  });
+});
+
+describe('DELETE /ssh-keys/:id', () => {
+  it('removes the key and says which boxes took it out', async () => {
+    creds.keys = [key('SHA256:abc')];
+    const res = await call('/ssh-keys/k1', DEVICE, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ boxes: { updated: ['devbox'], pending: ['parked'] } });
+    expect(creds.keys).toEqual([]);
+  });
+
+  it("answers 404 for a key that isn't the caller's", async () => {
+    const res = await call('/ssh-keys/k9', DEVICE, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'ssh_key_not_found' });
+  });
+
+  it("refuses a box's own token", async () => {
+    creds.keys = [key('SHA256:abc')];
+    const res = await call('/ssh-keys/k1', BOX, { method: 'DELETE' });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'box_credential' });
+    expect(creds.keys).toHaveLength(1);
   });
 });
 

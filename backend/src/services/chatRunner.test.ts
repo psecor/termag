@@ -9,7 +9,7 @@ vi.mock('../db', () => ({
     workstream: { updateMany: db.workstreamUpdateMany },
   },
 }));
-import { saveSessionTitle, sessionTitleOf, SESSION_TITLE_MAX, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, clearChatsOnBox, historyTerminalHolds, isIdleShell, mayReceiveChat, paneProbeKind, paneStillHolds, permissionModeForAgent, probeFromForeground, reconcileChatStatus, resumeCommandFor, resumeDecision, statusForChatEvent, sweepStaleChatStatus, terminalHoldsChat, toolCallLabel, CHAT_INTERRUPT_CAPABILITY, CHAT_LIVE_CAPABILITY, CHAT_ORCHESTRATOR_CAPABILITY, CHAT_RUNNER_CAPABILITY, CHAT_STATUS_SOURCE, CHAT_TRUST_CAPABILITY } from './chatRunner';
+import { renameSessionFor, saveSessionTitle, sessionTitleOf, SESSION_TITLE_MAX, chatContextAction, chatContextActions, chatContextRefusals, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, clearChatsOnBox, historyTerminalHolds, isIdleShell, mayReceiveChat, paneProbeKind, paneStillHolds, permissionModeForAgent, probeFromForeground, reconcileChatStatus, resumeCommandFor, resumeDecision, statusForChatEvent, sweepStaleChatStatus, terminalHoldsChat, toolCallLabel, CHAT_INTERRUPT_CAPABILITY, CHAT_LIVE_CAPABILITY, CHAT_ORCHESTRATOR_CAPABILITY, CHAT_CONTEXT_CAPABILITY, CHAT_RUNNER_CAPABILITY, CHAT_STATUS_SOURCE, CHAT_TRUST_CAPABILITY, SPACE_MEMORY_CAPABILITY, chatHistoryFromStore, CHAT_BOX_NOTICE_CAPABILITY, ownerOnlyChatEvent, chatPushRoute } from './chatRunner';
 import { sessionBelongsToUser, sessionName } from './tmux';
 import { getStatus, setStatus } from './status';
 import { settleTurnPost } from './sessionTurns';
@@ -66,6 +66,14 @@ describe('statusForChatEvent', () => {
     expect(statusForChatEvent({ type: 'user', message: { content: 'old prompt' } })).toBeNull();
   });
 
+  it('works again when a background task\'s end wakes Claude after its answer, before it says anything', () => {
+    const notification = { type: 'system', subtype: 'task_notification', task_id: 'b1', tool_use_id: 'toolu_1', status: 'completed' };
+    expect(statusForChatEvent(notification, 'Asked; waiting on it.')).toEqual({ status: 'working', message: 'Asked; waiting on it.' });
+    expect(statusForChatEvent({ type: 'system', subtype: 'init', session_id: 's1' })).toEqual({ status: 'working', message: 'Thinking' });
+    expect(statusForChatEvent({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })).toBeNull();
+    expect(statusForChatEvent({ type: 'system', subtype: 'task_started', task_id: 'b1' })).toBeNull();
+  });
+
   it('leaves the status alone for everything else', () => {
     expect(statusForChatEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '  ' }] } })).toBeNull();
     expect(statusForChatEvent({ type: 'stream_event', event: {} })).toBeNull();
@@ -74,9 +82,13 @@ describe('statusForChatEvent', () => {
 });
 
 describe('sessionTitleOf', () => {
-  it('takes a turn-end\'s title and nothing from any other event', () => {
+  it('takes a turn-end\'s title or a session-title frame\'s, and nothing from any other event', () => {
     expect(sessionTitleOf({ type: 'turn-end', exitCode: 0, title: 'Login rate limiting' })).toBe('Login rate limiting');
     expect(sessionTitleOf({ type: 'turn-end', exitCode: 0 })).toBeNull();
+    // The title the box generates where Claude names no session (Bedrock).
+    expect(sessionTitleOf({ type: 'session-title', title: 'Fix SSO dashboard redirect loop', source: 'generated' })).toBe('Fix SSO dashboard redirect loop');
+    expect(sessionTitleOf({ type: 'session-title', title: '  \n ' })).toBeNull();
+    expect(sessionTitleOf({ type: 'session-title' })).toBeNull();
     expect(sessionTitleOf({ type: 'assistant', title: 'Not a title' })).toBeNull();
     expect(sessionTitleOf({ type: 'turn-end', title: 42 })).toBeNull();
     expect(sessionTitleOf(null)).toBeNull();
@@ -97,12 +109,72 @@ describe('sessionTitleOf', () => {
 });
 
 describe('saveSessionTitle', () => {
-  it('writes the project\'s own workstream, and only when the title changed', async () => {
-    await saveSessionTitle('p1', 'w1', 'Auth fix');
+  const at = new Date('2026-11-02T20:00:00Z');
+  it("writes the project's own workstream, only when the title changed, and never over a person's rename", async () => {
+    await saveSessionTitle('p1', 'w1', 'Auth fix', at);
     expect(db.workstreamUpdateMany).toHaveBeenCalledWith({
-      where: { id: 'w1', projectId: 'p1', OR: [{ sessionTitle: null }, { sessionTitle: { not: 'Auth fix' } }] },
-      data: { sessionTitle: 'Auth fix' },
+      where: {
+        id: 'w1', projectId: 'p1',
+        AND: [
+          { OR: [{ sessionTitle: null }, { sessionTitle: { not: 'Auth fix' } }] },
+          { OR: [{ sessionTitleSource: null }, { sessionTitleSource: { not: 'person' } }] },
+        ],
+      },
+      data: { sessionTitle: 'Auth fix', sessionTitleAt: at, sessionTitleSource: 'claude' },
     });
+  });
+
+  it("records a person's rename, cleaned and cut as Claude's titles are, and nothing for a blank one", async () => {
+    db.workstreamUpdateMany.mockClear();
+    expect(await renameSessionFor('p1', 'w1', '  Ship\nthe fix  ', at)).toEqual({ title: 'Ship the fix', titleAt: at.toISOString() });
+    expect(db.workstreamUpdateMany).toHaveBeenCalledWith({
+      where: { id: 'w1', projectId: 'p1' },
+      data: { sessionTitle: 'Ship the fix', sessionTitleAt: at, sessionTitleSource: 'person' },
+    });
+    expect(await renameSessionFor('p1', 'w1', '   ', at)).toBeNull();
+    expect(await renameSessionFor('p1', 'w1', 7, at)).toBeNull();
+  });
+});
+
+describe('chatContextActions', () => {
+  it('offers the context actions, and never in an ask chat', () => {
+    expect(chatContextActions([CHAT_RUNNER_CAPABILITY, CHAT_CONTEXT_CAPABILITY], false)).toBe('ready');
+    expect(chatContextActions([CHAT_CONTEXT_CAPABILITY], true)).toBeNull();
+  });
+
+  it('says an older runner needs an update instead of hiding the actions', () => {
+    expect(chatContextActions([CHAT_RUNNER_CAPABILITY], false)).toBe('update');
+  });
+});
+
+describe('chatContextAction', () => {
+  it('takes clear, compact and resume only', () => {
+    expect(['clear', 'compact', 'resume', 'reset', '', null].map(chatContextAction)).toEqual(['clear', 'compact', 'resume', null, null, null]);
+  });
+});
+
+describe('chatContextRefusals', () => {
+  it('lets a Claude chat on its own models do everything', () => {
+    expect(chatContextRefusals('claude', null)).toEqual({});
+  });
+  it('does not compact a chat on another backend, but clears and resumes it', () => {
+    const r = chatContextRefusals('claude', 'fireworks');
+    expect(Object.keys(r)).toEqual(['compact']);
+  });
+  it('refuses all three for another engine, with why', () => {
+    const r = chatContextRefusals('pi', null);
+    expect(Object.keys(r).sort()).toEqual(['clear', 'compact', 'resume']);
+    expect(r.compact).toMatch(/Claude Code/);
+  });
+});
+
+describe('chatRpcFailure: the context actions', () => {
+  it('answers each refusal as a 409 the browser can show', () => {
+    for (const [message, code] of [['chat-busy: a turn is running', 'chat-busy'], ['resume-gone: a message started a new session', 'resume-gone'], ['nothing-to-compact: no context', 'nothing-to-compact']]) {
+      const r = chatRpcFailure(message);
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe(code);
+    }
   });
 });
 
@@ -116,6 +188,26 @@ describe('chatRpcFailure', () => {
     expect(chatRpcFailure('mode-refused: the chat runner only runs dontAsk').status).not.toBe(502);
     expect(chatRpcFailure('image-refused: image 1 is not a PNG, JPEG, GIF or WebP')).toEqual({ status: 400, body: { error: 'image 1 is not a PNG, JPEG, GIF or WebP', code: 'bad-image' } });
     expect(chatRpcFailure('cwd must be absolute')).toEqual({ status: 502, body: { error: 'cwd must be absolute' } });
+  });
+});
+
+describe('chatPushRoute: the fan-out of a chat push, per status socket', () => {
+  it("sends the owner everything, and a collaborator everything but the owner's seat spend", () => {
+    const spend = { type: 'plan-usage', spend: { usedMinor: 1, limitMinor: 2 } };
+    expect(chatPushRoute(spend, 'alice', 'alice')).toBe('owner');
+    expect(chatPushRoute(spend, 'alice', 'bob')).toBe('none');
+    expect(chatPushRoute({ type: 'assistant' }, 'alice', 'bob')).toBe('share');
+    expect(chatPushRoute({ type: 'assistant' }, 'alice', 'alice')).toBe('owner');
+  });
+});
+
+describe('ownerOnlyChatEvent', () => {
+  it("keeps the box owner's seat spend from collaborators, and nothing else", () => {
+    expect(ownerOnlyChatEvent({ type: 'plan-usage', spend: { usedMinor: 1, limitMinor: 2 } })).toBe(true);
+    expect(ownerOnlyChatEvent({ type: 'rate_limit_event', rate_limit_info: {} })).toBe(false);
+    expect(ownerOnlyChatEvent({ type: 'assistant' })).toBe(false);
+    expect(ownerOnlyChatEvent(null)).toBe(false);
+    expect(ownerOnlyChatEvent('plan-usage')).toBe(false);
   });
 });
 
@@ -216,18 +308,34 @@ describe('chatTargetError', () => {
   });
 });
 
+describe('chatHistoryFromStore', () => {
+  const ok = { isChatProvider: true, instanceId: 'box-1', setupStatus: 'ready', connected: true, capabilities: ['chat-runner-v1'] };
+
+  it('reads the store for an offline box and for a project whose box is gone', () => {
+    expect(chatHistoryFromStore(chatTargetError({ ...ok, connected: false })!)).toBe(true);
+    expect(chatHistoryFromStore(chatTargetError({ ...ok, instanceId: null })!)).toBe(true);
+  });
+
+  it('keeps every other refusal', () => {
+    expect(chatHistoryFromStore(chatTargetError({ ...ok, isChatProvider: false })!)).toBe(false);
+    expect(chatHistoryFromStore(chatTargetError({ ...ok, setupStatus: 'cloning' })!)).toBe(false);
+    expect(chatHistoryFromStore(chatTargetError({ ...ok, capabilities: [] })!)).toBe(false);
+    expect(chatHistoryFromStore({ status: 404, body: { error: 'Project not found' } })).toBe(false);
+  });
+});
+
 describe('clearChatsOnBox', () => {
-  it('clears each workstream\'s chat on the box and reports what it did', async () => {
+  it('clears each workstream\'s chat by its id and reports it by its name', async () => {
     const calls: Array<[string, Record<string, unknown>]> = [];
     const send = async (type: string, payload: Record<string, unknown>) => {
       calls.push([type, payload]);
-      return payload.chatKey === 'p1--main' ? { cleared: 2, stopped: true } : { cleared: 0, stopped: false };
+      return payload.chatKey === 'p1--w1' ? { cleared: 2, stopped: true } : { cleared: 0, stopped: false };
     };
-    expect(await clearChatsOnBox(send, 'p1', ['main', 'tui'])).toEqual([
+    expect(await clearChatsOnBox(send, 'p1', [{ id: 'w1', name: 'main' }, { id: 'w2', name: 'tui' }])).toEqual([
       { workstream: 'main', cleared: 2, stopped: true },
       { workstream: 'tui', cleared: 0, stopped: false },
     ]);
-    expect(calls).toEqual([['chat-clear', { chatKey: 'p1--main' }], ['chat-clear', { chatKey: 'p1--tui' }]]);
+    expect(calls).toEqual([['chat-clear', { chatKey: 'p1--w1' }], ['chat-clear', { chatKey: 'p1--w2' }]]);
   });
 
   it('reports an old agent, an offline box and other failures instead of throwing', async () => {
@@ -236,7 +344,7 @@ describe('clearChatsOnBox', () => {
       if (payload.chatKey === 'p1--b') throw new Error('Box agent not connected');
       throw new Error('boom');
     };
-    expect(await clearChatsOnBox(send, 'p1', ['a', 'b', 'c'])).toEqual([
+    expect(await clearChatsOnBox(send, 'p1', [{ id: 'a', name: 'a' }, { id: 'b', name: 'b' }, { id: 'c', name: 'c' }])).toEqual([
       { workstream: 'a', skipped: 'runner-missing' },
       { workstream: 'b', skipped: 'offline' },
       { workstream: 'c', error: 'boom' },
@@ -348,10 +456,33 @@ describe('resumeDecision', () => {
 });
 
 describe('chatSendRpcPayload', () => {
+  it('carries box notices only when asked, and only to an agent with chat-box-notice-v1 (chat-resume-new-box-enabled)', () => {
+    const t = { chatKey: 'p--w', cwd: '/w', projectId: 'p', workstream: 'main', workstreamId: 'w', requireCheckout: false, permissionMode: 'dontAsk' };
+    const plain = chatSendRpcPayload(t, 'hi', [CHAT_BOX_NOTICE_CAPABILITY]);
+    expect(plain).not.toHaveProperty('boxNotices');
+    expect(plain).not.toHaveProperty('notice');
+    expect(chatSendRpcPayload(t, 'hi', [CHAT_BOX_NOTICE_CAPABILITY], { boxNotices: true, notice: 'new box' })).toMatchObject({ boxNotices: true, notice: 'new box', text: 'hi' });
+    const older = chatSendRpcPayload(t, 'hi', [], { boxNotices: true, notice: 'new box' });
+    expect(older).not.toHaveProperty('boxNotices');
+    expect(older).not.toHaveProperty('notice');
+  });
   const target = { chatKey: 'p--w1', cwd: '/w/p', projectId: 'p', workstream: 'main', workstreamId: 'w1', requireCheckout: true, permissionMode: 'dontAsk' };
 
   it('carries the mode the backend decided', () => {
     expect(chatSendRpcPayload(target, 'hi')).toEqual({ ...target, text: 'hi' });
+  });
+
+  it('names the project for the turn\'s telemetry resource, and leaves it out when the caller has none', () => {
+    expect(chatSendRpcPayload({ ...target, project: 'webapp' }, 'hi')).toMatchObject({ project: 'webapp', workstream: 'main' });
+    expect(chatSendRpcPayload({ ...target, project: null }, 'hi')).not.toHaveProperty('project');
+  });
+
+  it('names the chat\'s space whose memory the turn loads, or none, only to an agent with space-memory-v1', () => {
+    expect(chatSendRpcPayload(target, 'hi', [SPACE_MEMORY_CAPABILITY], { memorySpace: 'team' }).spaceMemory).toEqual({ space: 'team' });
+    expect(chatSendRpcPayload(target, 'hi', [], { memorySpace: 'team' }).spaceMemory).toBeUndefined();
+    // A chat with no space (or one its box isn't granted) loads nothing: said, so the box doesn't pick its default.
+    expect(chatSendRpcPayload(target, 'hi', [SPACE_MEMORY_CAPABILITY], { memorySpace: null }).spaceMemory).toEqual({ space: null });
+    expect(chatSendRpcPayload(target, 'hi', [SPACE_MEMORY_CAPABILITY]).spaceMemory).toBeUndefined();
   });
 
   it('passes a chosen Claude model and omits a missing one', () => {
@@ -375,6 +506,24 @@ describe('chatSendRpcPayload', () => {
     expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { titles: true }).titles).toBe(true);
     expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { titles: false })).not.toHaveProperty('titles');
     expect(chatSendRpcPayload(target, 'hi')).not.toHaveProperty('titles');
+  });
+
+  it('asks for tool-group headings only when the send says so', () => {
+    expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { headings: true }).headings).toBe(true);
+    expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { headings: false })).not.toHaveProperty('headings');
+    expect(chatSendRpcPayload(target, 'hi')).not.toHaveProperty('headings');
+  });
+
+  it('carries a checked effort only to an agent with chat-effort-v1', () => {
+    expect(chatSendRpcPayload(target, 'hi', ['chat-effort-v1'], { effort: 'xhigh' }).effort).toBe('xhigh');
+    expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { effort: 'xhigh' })).not.toHaveProperty('effort');
+    expect(chatSendRpcPayload(target, 'hi', ['chat-effort-v1'], { effort: null })).not.toHaveProperty('effort');
+  });
+
+  it('asks for the seat\'s monthly spend only when the route says so', () => {
+    expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { planSpend: true }).planSpend).toBe(true);
+    expect(chatSendRpcPayload(target, 'hi', [CHAT_RUNNER_CAPABILITY], { planSpend: false })).not.toHaveProperty('planSpend');
+    expect(chatSendRpcPayload(target, 'hi')).not.toHaveProperty('planSpend');
   });
 
   it('carries checked images only when there are some', () => {
@@ -417,6 +566,14 @@ describe('chatResumeClaimPayload', () => {
     });
     expect(chatResumeClaimPayload(target, [CHAT_RUNNER_CAPABILITY]).permissionMode).toBe('dontAsk');
     expect(chatResumeClaimPayload({ ...target, permissionMode: 'dontAsk' }, [CHAT_RUNNER_CAPABILITY, CHAT_TRUST_CAPABILITY]).permissionMode).toBe('dontAsk');
+  });
+
+  it('names the project and workstream for the pane\'s telemetry resource, only with a project', () => {
+    expect(chatResumeClaimPayload({ ...target, project: 'webapp', workstream: 'feature-x' }, [CHAT_RUNNER_CAPABILITY]))
+      .toMatchObject({ project: 'webapp', workstream: 'feature-x' });
+    const none = chatResumeClaimPayload({ ...target, workstream: 'feature-x' }, [CHAT_RUNNER_CAPABILITY]);
+    expect(none).not.toHaveProperty('project');
+    expect(none).not.toHaveProperty('workstream');
   });
 });
 

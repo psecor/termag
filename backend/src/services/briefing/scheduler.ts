@@ -9,6 +9,7 @@ import { prisma } from '../../db';
 import { readSchedule, scheduleDue, scheduleKey } from './schedule';
 import { startBriefing, sweepStuckRuns } from './runner';
 import { deliverBriefingDm, undeliveredDms } from './slack';
+import { failRoot, traceSweep } from '../tracing/spans';
 
 const TICK_MS = 60_000;
 let timer: NodeJS.Timeout | null = null;
@@ -39,9 +40,9 @@ const defaultDeps: TickDeps = {
 
 /** One pass: time out stuck runs, retry DMs that did not go out, then start every due, not-yet-done scheduled briefing. */
 export async function schedulerTick(now: Date = new Date(), deps: TickDeps = defaultDeps): Promise<{ started: number }> {
-  await deps.sweep(now).catch(err => console.error('[BRIEFING] stuck-run sweep failed:', (err as Error).message));
+  await deps.sweep(now).catch(err => { failRoot(err); console.error('[BRIEFING] stuck-run sweep failed:', (err as Error).message); });
   for (const id of await deps.undelivered(now).catch(() => [] as string[])) {
-    await deps.deliver(id).catch(err => console.error(`[BRIEFING] ${id}: Slack retry failed:`, (err as Error).message));
+    await deps.deliver(id).catch(err => { failRoot(err); console.error(`[BRIEFING] ${id}: Slack retry failed:`, (err as Error).message); });
   }
   let started = 0;
   for (const u of await deps.enabledUsers()) {
@@ -67,12 +68,14 @@ export async function schedulerTick(now: Date = new Date(), deps: TickDeps = def
   return { started };
 }
 
+const tracedTick = traceSweep('briefing', () => schedulerTick());
+
 export function startBriefingScheduler(): void {
   if (timer) return;
   timer = setInterval(() => {
     if (ticking) return;
     ticking = true;
-    schedulerTick().catch(err => console.error('[BRIEFING] scheduler tick failed:', (err as Error).message))
+    tracedTick().catch(err => console.error('[BRIEFING] scheduler tick failed:', (err as Error).message))
       .finally(() => { ticking = false; });
   }, TICK_MS);
   timer.unref?.();

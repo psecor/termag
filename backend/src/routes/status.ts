@@ -7,11 +7,12 @@ import { milestoneOnReading, parseMilestoneBody } from '../services/milestone';
 import { recordCreatedLink } from '../services/workstreamPrs';
 import { AgentStatus } from '../types/index';
 import { validateAgentToken } from './agentTokens';
+import { acceptsScope } from '../services/agentTokenScopes';
 import { getAllNotificationTargets } from '../slack/lts';
 import { getSlackApp } from '../slack/app';
 import { getDiscordClient } from '../discord/app';
-import { formatPaneForSlack, sessionBelongsToUser, sessionName } from '../services/tmux';
-import { SESSION_ROLES } from '../services/sessionAccess';
+import { formatPaneForSlack, sessionBelongsToUser } from '../services/tmux';
+import { legalSessions } from '../services/sessionAccess';
 // Capture must route through the per-user agent (the backend can't see the
 // user's tmux in-process), same as the /t command path. Without this, the
 // needs-input notification rendered "(unable to capture pane)".
@@ -29,6 +30,7 @@ import { isRunnerSessionOf } from '../services/claudeRunnerSpawn';
 import { sendResult, type RouteResult } from './routeResult';
 import { pushOnWaitingTransition, waitingChatMuted } from '../services/pushWaiting';
 import { settleTurnPost, T3_SERVER_SESSION } from '../services/sessionTurns';
+import { chatStatusSessionFor } from '../services/desktopThreadStatus';
 
 
 const statusTracking = new Map<string, {
@@ -124,7 +126,7 @@ export function statusRouter(): Router {
   const router = Router();
 
   const postStatus: RequestHandler = async (req, res) => {
-    const { session, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId, contextTokens, rateLimited } = req.body as {
+    const { session: postedSession, status, message, notify, source, waitingReason, activityScore, tokenBurst, activeTurn, threadId, contextTokens, rateLimited } = req.body as {
       session?: string;
       status?: AgentStatus['status'];
       message?: string;
@@ -139,7 +141,7 @@ export function statusRouter(): Router {
       rateLimited?: string | null;
     };
 
-    if (!session) {
+    if (!postedSession) {
       res.status(400).json({ error: 'session required' });
       return;
     }
@@ -151,12 +153,21 @@ export function statusRouter(): Router {
     // and keep their prior trust. This stops a compromised box, which now
     // reaches :3040 directly over the VPC, from forging status + notifications
     // for another user's sessions across projects.
-    if (!(await callerMayWrite(req, session))) {
+    if (!(await callerMayWrite(req, postedSession))) {
       res.status(403).json({ error: 'forbidden: session not owned by caller' });
       return;
     }
 
     const instanceId = writeInstanceId(req);
+    // A desktop thread whose checkout has no pane session posts as the t3 server; a
+    // chat on this box that holds its Claude session takes it (services/desktopThreadStatus.ts).
+    const chatOfThread = postedSession === T3_SERVER_SESSION && instanceId && typeof threadId === 'string' && threadId
+      && typeof source === 'string' && source.startsWith('t3:')
+      ? await chatStatusSessionFor(instanceId, threadId).catch(() => null)
+      : null;
+    // Only a chat the caller may write itself: posting as termag-t3 proves nothing about it.
+    const desktopChat = chatOfThread && await callerMayWrite(req, chatOfThread) ? chatOfThread : null;
+    const session = desktopChat ?? postedSession;
 
     // Metadata-only update (e.g. contextTokens from agent scanner, rateLimited from pane scanner)
     if (!status && (contextTokens !== undefined || rateLimited !== undefined)) {
@@ -212,6 +223,16 @@ export function statusRouter(): Router {
     // Read before the write: the web push fires on the transition INTO waiting.
     const previousStatus = getAllStatuses().get(statusKey(instanceId, session))?.status;
 
+    // The t3 server's own session still takes the post as box activity, as it
+    // did before the chat took it: the thread's PreToolUse posts carry no
+    // thread id, so they stay there, and only this settles them. No push or
+    // notification follows from it.
+    if (desktopChat) {
+      const box = settleTurnPost(statusKey(instanceId, T3_SERVER_SESSION), { status, source, threadId, message, waitingReason });
+      setStatus(T3_SERVER_SESSION, box.status, { message: box.message, source: box.source, waitingReason: box.waitingReason, threadId: box.threadId }, undefined, instanceId);
+      notifyStatusChange(T3_SERVER_SESSION, instanceId);
+    }
+
     // The post reports one turn; with desktop threads in the same checkout
     // the session's status is the busiest turn's (services/sessionTurns.ts).
     // Anywhere else `effective` is the post itself.
@@ -239,7 +260,7 @@ export function statusRouter(): Router {
 
     // Touch lastActiveAt when agent starts working (for project sort order).
     if (effective.status === 'working') {
-      const sessionMatch = session.match(/^(.+?)-(.+)-agent$/);
+      const sessionMatch = session.match(/^(.+?)-(.+)-(?:agent|review(?:-[2-8])?)$/);
       if (sessionMatch) {
         const [, username, projectName] = sessionMatch;
         prisma.project.updateMany({
@@ -339,7 +360,7 @@ export function statusRouter(): Router {
     const authHeader = req.headers.authorization ?? '';
     if (authHeader.startsWith('Bearer ')) {
       const token = await validateAgentToken(authHeader.slice(7)).catch(() => null);
-      if (!token || token.token.scope !== 'agent') {
+      if (!token || !acceptsScope('status', token.token.scope)) {
         res.status(401).json({ error: 'Unauthorized' });
         return;
       }
@@ -352,7 +373,7 @@ export function statusRouter(): Router {
     // key), so never hand out the milestone here: its URL names a repo and PR
     // the caller may not be allowed to see. Same for the review's PR URL — the
     // same leak, same omission. The agent that reads this route uses neither.
-    const { milestone: _omit, review: _omitReview, ...status } = getStatus(req.params.session, instanceId);
+    const { milestone: _omit, review: _omitReview, reviews: _omitReviews, ...status } = getStatus(req.params.session, instanceId);
     res.json(status);
   };
 
@@ -418,7 +439,7 @@ export function statusRouter(): Router {
       allowed = shares.some(({ project: p }) => {
         if ((p.instanceId ?? null) !== inst) return false;
         const wsNames = p.workstreams.length ? p.workstreams.map(w => w.name) : ['main'];
-        return wsNames.some(ws => SESSION_ROLES.some(role => sessionName(p.user.unixUsername, p.name, role, ws) === session));
+        return legalSessions(p.user.unixUsername, p.name, wsNames).includes(session);
       });
     }
     if (!allowed) {

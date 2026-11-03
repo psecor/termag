@@ -33,6 +33,15 @@ export interface WorktimeEntryLike {
   instanceId?: string | null;
 }
 
+/**
+ * The usernames a person's time is banked under: an agent span keeps its tmux
+ * session's name, and tmux folds `.` and `:` to `_` (services/tmux.ts
+ * tmuxSafeName); a heartbeat keeps the real one. Read both.
+ */
+export function worktimeUsernames(unixUsername: string): string[] {
+  return [...new Set([unixUsername, unixUsername.replace(/[.:]/g, '_')])];
+}
+
 export function workTimeInstanceId(instanceId: string | null | undefined): string {
   return instanceId ? instanceId : '';
 }

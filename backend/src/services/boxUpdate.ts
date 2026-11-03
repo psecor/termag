@@ -53,6 +53,7 @@ import { BOX_AUTO_UPDATE_FLAG } from './boxUpdatePolicy';
 import { isManagedBox } from './instanceLifecycle';
 import { boolVariation } from './featureFlags';
 import { ttlMemo } from './ttlMemo';
+import { traceSweep } from './tracing/spans';
 
 /** The flag lives with the box's own check of it (boxUpdatePolicy.ts); re-exported for the admin status and the tests. */
 export { BOX_AUTO_UPDATE_FLAG };
@@ -176,6 +177,7 @@ export function resetBoxUpdateCache(target?: () => Promise<string | null>, selec
   selectedTargets.clear();
   lastTarget = NO_TARGET;
   pushed.clear();
+  claimUpdated.clear();
   lastSweepAt = null;
 }
 
@@ -190,6 +192,19 @@ export interface BoxUpdateCandidate {
 
 /** instance id → the target it was last asked to move to. Per process; a restart asks once more, which is harmless. */
 const pushed = new Map<string, string>();
+/**
+ * Boxes a claim brought up to this orchestrator's commit (claimUpdate.ts) and
+ * not yet compared here. Their next check counts that update as the push for
+ * the current target, so the hello the update's restart brings does not ask
+ * the box to run it again a minute later; a target that moves after it is
+ * pushed as usual.
+ */
+const claimUpdated = new Set<string>();
+
+/** A claim's update has run on this box (claimUpdate.ts). */
+export function noteClaimUpdated(instanceId: string): void {
+  claimUpdated.add(instanceId);
+}
 let lastSweepAt: Date | null = null;
 
 const short = (sha: string | null) => (sha ? sha.slice(0, 12) : 'unknown');
@@ -209,6 +224,7 @@ export async function considerBoxUpdate(c: BoxUpdateCandidate, trigger: 'hello' 
   const targetCommit = flagOn && managed && capable
     ? await targetCommitFor(await boxImageSelectionFor(c.user, box))
     : null;
+  if (targetCommit && claimUpdated.delete(c.instance.id)) pushed.set(c.instance.id, targetCommit);
   const decision = boxUpdateDecision({
     flagOn, managed, capabilities: c.capabilities, agentCommit: c.agentCommit, targetCommit,
     lastPushedTarget: pushed.get(c.instance.id) ?? null,
@@ -217,6 +233,11 @@ export async function considerBoxUpdate(c: BoxUpdateCandidate, trigger: 'hello' 
 
   pushed.set(c.instance.id, targetCommit);
   console.log(`[BOX-UPDATE] ${c.instance.name} (${c.user.unixUsername}) runs ${short(c.agentCommit)}, a current box runs ${short(targetCommit)}; asking it to update (${trigger})`);
+  // The lifecycle sweep leaves the box up until it reports this run
+  // (boxLifecycle.ts, `box-update`). Best effort: the push goes out regardless.
+  await Promise.resolve()
+    .then(() => prisma.instance.updateMany({ where: { id: c.instance.id }, data: { updatePushedAt: new Date() } }))
+    .catch(err => console.warn(`[BOX-UPDATE] ${c.instance.name}: could not record the push: ${errMsg(err)}`));
   try {
     const reply = await sendToInstanceAgent(c.instance.id, 'box-update', { target: targetCommit }, 15_000);
     console.log(`[BOX-UPDATE] ${c.instance.name}: ${reply?.unit ?? 'the update unit'} started`);
@@ -272,8 +293,9 @@ export function startBoxUpdateSweep(opts: { sweepMs?: number; helloDelayMs?: num
   if (sweepTimer) return;
   helloDelayMs = opts.helloDelayMs ?? HELLO_PUSH_DELAY_MS;
   unsubscribeHello = onBoxAgentHello(onHello);
+  const sweep = traceSweep('box-update', () => runBoxUpdateSweep());
   sweepTimer = setInterval(() => {
-    runBoxUpdateSweep().catch(err => console.error('[BOX-UPDATE] sweep failed:', errMsg(err)));
+    sweep().catch(err => console.error('[BOX-UPDATE] sweep failed:', errMsg(err)));
   }, opts.sweepMs ?? BOX_UPDATE_SWEEP_MS);
   sweepTimer.unref?.();
 }

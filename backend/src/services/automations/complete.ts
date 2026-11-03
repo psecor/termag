@@ -14,16 +14,27 @@
  * sweep and Stop fail the row first and interrupt second, so their
  * turn-end arrives at a row that is already final; the notes the turn wrote
  * before the interrupt still go up. A follow-up turn's end pushes the file
- * again, which is the same file (or newer) and harmless.
+ * again, which is the same file (or newer) and harmless. With space
+ * folders on, the state file goes with the notes, and the run's log goes
+ * to runs/<name>.md, ahead of the report. For the turn-end's own finish,
+ * the log's and the notes' pushes take their queue places before the row
+ * is final (for a row the sweep or Stop finished, the two are queued side
+ * by side once it is), so the next run's pulls wait, and the log renders
+ * from the final row. The row is never held `running` for the uploads.
  */
 import { prisma } from '../../db';
+import { noteAutomationRunActivity } from '../boxActivity';
 import { onChatEvent, type ChatEventSeen } from '../chatRunner';
 import { parseRunReport } from './brief';
 import { automationLimitsFor } from './limits';
-import { syncMemory } from './memorySync';
 import { memoryDir } from './runner';
-import { postRunReport, summarizeBranch } from './report';
+import { changesLabel, postRunReport, summarizeBranch, type BranchSummary } from './report';
 import { occurrenceLabel } from './brief';
+import { renderRunLog, runLogName } from './runLog';
+import { folderOf } from './spaceFolder';
+import { noteSpaceSyncError, pushAfterRun, pushRunLog, spaceFoldersEnabledFor, syncErrorText, type SyncTarget } from './spaceSync';
+import { failureLabel } from './store';
+import { skipReasonLabel } from './admit';
 import * as tmux from '../tmux';
 
 interface PendingResult {
@@ -95,7 +106,7 @@ export function finishFields(p: PendingResult | undefined, exit: { lost?: boolea
   state: string; reason: string | null; summary: string | null; prUrl: string | null;
 } {
   if (p?.runnerError || (!p?.text && exit.exitCode != null && exit.exitCode !== 0)) {
-    return { state: 'failed', reason: 'runner-error', summary: p?.runnerError ?? `Claude exited ${exit.signal ?? exit.exitCode}`, prUrl: null };
+    return { state: 'failed', reason: 'runner-error', summary: p?.runnerError ?? `the agent exited ${exit.signal ?? exit.exitCode}`, prUrl: null };
   }
   if (exit.signal === 'SIGINT' && !p?.text) return { state: 'failed', reason: 'interrupted', summary: null, prUrl: null };
   if (exit.lost && !p?.text) return { state: 'failed', reason: 'runner-error', summary: 'the box lost the turn', prUrl: null };
@@ -125,8 +136,29 @@ export async function completeRun(ref: RunRef, exit: { lost?: boolean; exitCode?
   // turn-end that finishes the row is the run's; a row the timeout sweep or
   // Stop finished is pushed by them (pushNotesForRun), not by the turn-end
   // their interrupt causes, which looks the same as a follow-up's.
-  const finished = run.state === 'running' ? await finishRow(run, p, exit) : false;
-  if (finished) await pushNotes(run);
+  let finished = false;
+  if (run.state === 'running') {
+    const fields = finishFields(p, exit);
+    const finishedAt = new Date();
+    // With space folders on, the run log's push holds its queue place before
+    // the row is final: the row's finishing is what lets the next run (a Run
+    // now the moment after) start, and that run's pull of this log (its
+    // previous-run.md) queues behind it. The push renders from the row once
+    // this finish has written it, so the row is not left `running` (for the
+    // timeout sweep and the next occurrence's admit) while the log uploads.
+    // The notes push holds its place the same way: queued after the row is
+    // final, it would leave a gap in which the next run pulls stale notes.
+    let rowFinal!: (ours: boolean) => void;
+    const gate = new Promise<boolean>(resolve => { rowFinal = resolve; });
+    const log = await queueRunLogForRun(run.id, 0, gate);
+    const notes = await queueNotesPush(run, { delayMs: 0, gate });
+    try {
+      finished = await finishRow(run, p, fields, finishedAt);
+    } finally {
+      rowFinal(finished);
+    }
+    await Promise.all([log.done, notes.done]);
+  }
   // What the run left on its branch, and the Slack report, follow every
   // finish the same way: the timeout sweep and Stop fail the row before the
   // turn ends, and a run that timed out is the one the channel most needs to
@@ -136,25 +168,115 @@ export async function completeRun(ref: RunRef, exit: { lost?: boolean; exitCode?
 
 type RunRow = NonNullable<Awaited<ReturnType<typeof findRun>>>;
 
-/** Push the run's notes file to the automation's space, if it has one. */
-async function pushNotes(run: RunRow, opts: { delayMs?: number; queued?: (done: Promise<unknown>) => void } = {}): Promise<void> {
+/** The run's transfer target, if its automation is in a space and its box and owner are known. */
+async function syncTargetFor(run: RunRow): Promise<SyncTarget | null> {
   const a = run.automation;
-  if (!a.spaceName || !a.project.instanceId) return;
+  if (!a.spaceName || !a.project.instanceId) return null;
+  const box = await prisma.instance.findUnique({ where: { id: a.project.instanceId }, select: { id: true, hostHome: true, hostUnixUser: true } });
+  const owner = await prisma.user.findUnique({ where: { id: a.userId }, select: { unixUsername: true } });
+  if (!box || !owner) return null;
+  return {
+    runId: run.id, userId: a.userId, projectId: a.projectId, projectName: a.project.name, spaceName: a.spaceName, folder: folderOf(a),
+    host: { userId: a.userId, instanceId: box.id }, box: { id: box.id, hostHome: box.hostHome, hostUnixUser: box.hostUnixUser ?? owner.unixUsername },
+    memoryDir: memoryDir(box.hostHome ?? `/home/${owner.unixUsername}`, a.projectId),
+  };
+}
+
+/** Push the run's notes file (and, with space folders on, its state) to the automation's space, if it has one. */
+async function pushNotes(run: RunRow, opts: { delayMs?: number; queued?: (done: Promise<unknown>) => void; gate?: Promise<boolean> } = {}): Promise<void> {
   // A row never linked to its workstream never got past its notes pull (the
   // runner links it after the pull): Stop or the timeout sweep caught the
   // run in its setup, and the box's file is the seed, or a copy from before
   // this run. Pushing it would replace the space's notes with that.
   if (!run.workstreamId) return;
-  const box = await prisma.instance.findUnique({ where: { id: a.project.instanceId }, select: { id: true, hostHome: true, hostUnixUser: true } });
-  const owner = await prisma.user.findUnique({ where: { id: a.userId }, select: { unixUsername: true } });
-  if (!box || !owner) return;
-  const done = syncMemory({
-    runId: run.id, userId: a.userId, projectId: a.projectId, projectName: a.project.name, spaceName: a.spaceName,
-    host: { userId: a.userId, instanceId: box.id }, box: { id: box.id, hostHome: box.hostHome, hostUnixUser: box.hostUnixUser ?? owner.unixUsername },
-    memoryDir: memoryDir(box.hostHome ?? `/home/${owner.unixUsername}`, a.projectId),
-  }, 'put', { delayMs: opts.delayMs });
-  opts.queued?.(done);
-  await done;
+  const t = await syncTargetFor(run);
+  if (!t) return;
+  const folders = await spaceFoldersEnabledFor(run.automation.userId).catch(() => false);
+  const error = await pushAfterRun(t, { folders, delayMs: opts.delayMs, queued: opts.queued, gate: opts.gate });
+  if (folders) await noteSpaceSyncError(run.id, error);
+}
+
+/**
+ * The run's notes push, queued now and run after delayMs (`gate`: as for
+ * the run log). Resolves when the push holds its place; `done` when it has
+ * run. Never throws.
+ */
+async function queueNotesPush(run: RunRow, opts: { delayMs: number; gate?: Promise<boolean> }): Promise<{ done: Promise<void> }> {
+  let done: Promise<unknown> = Promise.resolve();
+  await new Promise<void>(resolve => {
+    const all = pushNotes(run, { ...opts, queued: d => { done = d; resolve(); } });
+    all.then(() => resolve(), err => { console.warn(`[AUTOMATION] notes push for run ${run.id} failed: ${(err as Error).message}`); resolve(); });
+  });
+  return { done: done.then(() => undefined, () => undefined) };
+}
+
+/** What the run left on its branch, read once and kept on the row (a later follow-up turn would rewrite it with its own tree). */
+async function branchSummaryOf(run: RunRow): Promise<BranchSummary> {
+  const kept = { commitsAhead: run.commitsAhead, pushed: run.pushed, dirty: run.dirty };
+  const a = run.automation;
+  if (kept.commitsAhead !== null || kept.pushed !== null || kept.dirty !== null || !a.project.instanceId || !run.workstream) return kept;
+  const cwd = tmux.projectDirFor({ name: a.project.name, user: { unixUsername: a.project.user.unixUsername }, instance: { hostHome: a.project.instance?.hostHome ?? null } }, run.workstream.name);
+  return summarizeBranch({ userId: a.userId, instanceId: a.project.instanceId }, cwd);
+}
+
+/** The run log for a row as it is (or is about to be written). */
+async function runLogText(run: RunRow): Promise<string> {
+  const agent = run.workstreamId
+    ? await prisma.workflow.findFirst({ where: { workstreamId: run.workstreamId, type: 'agent' }, select: { provider: true, model: true } }).catch(() => null)
+    : null;
+  const failedOrSkipped = run.state === 'failed' || run.state === 'skipped';
+  const summarized = run.commitsAhead !== null || run.pushed !== null || run.dirty !== null;
+  return renderRunLog({
+    automationName: run.automation.project.name, logName: runLogName(run), occurrenceLabel: occurrenceLabel(run.scheduledFor, run.automation.timezone),
+    trigger: run.trigger, provider: agent?.provider ?? null, model: agent?.model ?? null, state: run.state,
+    reasonLabel: failedOrSkipped && run.reason ? (run.state === 'skipped' ? skipReasonLabel(run.reason) : failureLabel(run.reason)) : null,
+    summary: run.summary, workstream: run.workstream?.name ?? null, branch: run.branch, prUrl: run.prUrl,
+    changes: summarized ? changesLabel({ commitsAhead: run.commitsAhead, pushed: run.pushed, dirty: run.dirty }) : null,
+    costUsd: run.costUsd, inputTokens: run.inputTokens, outputTokens: run.outputTokens, startedAt: run.startedAt, finishedAt: run.finishedAt,
+    spaceSyncError: run.spaceSyncError ? syncErrorText(run.spaceSyncError) : null,
+  });
+}
+
+/** The run's transfer target when its log goes to the space: in a space, folders on, and linked to its workstream (past its pull). */
+async function runLogTarget(run: RunRow): Promise<SyncTarget | null> {
+  if (!run.workstreamId || !run.automation.spaceName) return null;
+  if (!(await spaceFoldersEnabledFor(run.automation.userId).catch(() => false))) return null;
+  return syncTargetFor(run);
+}
+
+/**
+ * A run's log, queued now: for a run the timeout sweep or Stop finished,
+ * beside its notes push (the row is already final, so the next run may
+ * start and ask for this log at once); for the turn-end's own finish, just
+ * before the row is written (`gate`: whether that finish was this run's,
+ * awaited in the queue). Written after delayMs from the row as it is then.
+ * Resolves when the push holds its place; `done` when it has run. Never
+ * throws.
+ */
+async function queueRunLogForRun(runId: string, delayMs: number, gate?: Promise<boolean>): Promise<{ done: Promise<void> }> {
+  let done: Promise<unknown> = Promise.resolve();
+  try {
+    const run = await findRunById(runId);
+    const t = run ? await runLogTarget(run) : null;
+    if (run && t) {
+      const render = async (): Promise<string | null> => {
+        if (gate && !(await gate)) return null;
+        const now = await findRunById(runId);
+        if (!now || now.state === 'running' || now.state === 'pending') return null;
+        const changes = await branchSummaryOf(now);
+        await prisma.automationRun.update({ where: { id: runId }, data: changes }).catch(() => {});
+        return runLogText({ ...now, ...changes });
+      };
+      await new Promise<void>(resolve => {
+        pushRunLog(t, runLogName(run), render, { delayMs, queued: d => { done = d; resolve(); } })
+          .then(error => noteSpaceSyncError(runId, error))
+          .then(() => resolve(), err => { console.warn(`[AUTOMATION] run log for run ${runId} failed: ${(err as Error).message}`); resolve(); });
+      });
+    }
+  } catch (err) {
+    console.warn(`[AUTOMATION] run log for run ${runId} failed: ${(err as Error).message}`);
+  }
+  return { done: done.then(() => undefined, () => undefined) };
 }
 
 /**
@@ -181,22 +303,16 @@ export async function pushNotesForRun(runId: string): Promise<void> {
  * the push holds its place in the queue; `done` when it has run. Never throws.
  */
 export async function queueNotesPushForRun(runId: string, delayMs: number): Promise<{ done: Promise<void> }> {
-  let done: Promise<unknown> = Promise.resolve();
   try {
     const run = await prisma.automationRun.findUnique({
       where: { id: runId },
       include: { automation: { include: { project: { select: { name: true, userId: true, instanceId: true } } } } },
     });
-    if (run) {
-      await new Promise<void>(resolve => {
-        const all = pushNotes(run as RunRow, { delayMs, queued: d => { done = d; resolve(); } });
-        all.then(() => resolve(), err => { console.warn(`[AUTOMATION] notes push for run ${runId} failed: ${(err as Error).message}`); resolve(); });
-      });
-    }
+    if (run) return await queueNotesPush(run as RunRow, { delayMs });
   } catch (err) {
     console.warn(`[AUTOMATION] notes push for run ${runId} failed: ${(err as Error).message}`);
   }
-  return { done: done.then(() => undefined, () => undefined) };
+  return { done: Promise.resolve() };
 }
 
 /**
@@ -212,31 +328,38 @@ export async function queueNotesPushForRun(runId: string, delayMs: number): Prom
  */
 export async function settleInterruptedRun(runId: string, delayMs: number): Promise<void> {
   const { done } = await queueNotesPushForRun(runId, delayMs);
+  const log = await queueRunLogForRun(runId, delayMs);
   const settled = new Promise(r => setTimeout(r, delayMs));
-  void Promise.all([done, settled])
+  void Promise.all([done, log.done, settled])
     .then(() => reportRun(runId))
     .catch(err => console.warn(`[AUTOMATION] report for run ${runId} failed: ${(err as Error).message}`));
 }
 
+const RUN_INCLUDE = {
+  automation: { include: { project: { select: { name: true, userId: true, instanceId: true, slackChannelId: true, instance: { select: { hostHome: true } }, user: { select: { unixUsername: true } } } } } },
+  workstream: { select: { name: true } },
+} as const;
+
 function findRun(workstreamId: string) {
-  return prisma.automationRun.findUnique({
-    where: { workstreamId },
-    include: { automation: { include: { project: { select: { name: true, userId: true, instanceId: true, slackChannelId: true, instance: { select: { hostHome: true } }, user: { select: { unixUsername: true } } } } } }, workstream: { select: { name: true } } },
-  });
+  return prisma.automationRun.findUnique({ where: { workstreamId }, include: RUN_INCLUDE });
+}
+
+function findRunById(id: string) {
+  return prisma.automationRun.findUnique({ where: { id }, include: RUN_INCLUDE });
 }
 
 /** Write the run's final fields and the automation's failure count, if the row is still running; true when this call did. */
-async function finishRow(run: RunRow, p: PendingResult | undefined, exit: { lost?: boolean; exitCode?: number | null; signal?: string | null }): Promise<boolean> {
-  const fields = finishFields(p, exit);
-  const now = new Date();
+async function finishRow(run: RunRow, p: PendingResult | undefined, fields: ReturnType<typeof finishFields>, finishedAt: Date): Promise<boolean> {
   const updated = await prisma.automationRun.updateMany({
     where: { id: run.id, state: 'running' },
     data: {
-      state: fields.state, reason: fields.reason, summary: fields.summary, prUrl: fields.prUrl, finishedAt: now,
+      state: fields.state, reason: fields.reason, summary: fields.summary, prUrl: fields.prUrl, finishedAt,
       chatSessionId: p?.sessionId ?? run.chatSessionId, costUsd: p?.costUsd ?? null, inputTokens: p?.inputTokens ?? null, outputTokens: p?.outputTokens ?? null,
     },
   });
   if (updated.count === 0) return false;
+  // The run's end is the box in use, as its start was: the idle window counts from here.
+  await noteAutomationRunActivity(run.instanceId, finishedAt);
   const a = run.automation;
   const failed = fields.state === 'failed';
   if (failed) {

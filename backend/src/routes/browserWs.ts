@@ -48,8 +48,8 @@ import {
   type BrowserSuggestion,
 } from '../services/browserPane';
 import {
-  GUEST_REFUSAL_MESSAGES, GUEST_REFUSED_CLOSE_CODE, guestAttachRefusal, guestPaneKey, isShareId, maxGuestPanes, resolveGuestAccess, safeAtPath, shareLiveness,
-  type GuestRefusal,
+  checkoutMovedMessage, GUEST_REFUSAL_MESSAGES, GUEST_REFUSED_CLOSE_CODE, GUEST_STACK_CLOSE_CODE, guestAttachRefusal, guestPaneKey, isShareId, maxGuestPanes, resolveGuestAccess, safeAtPath, shareLiveness,
+  splitStackRefusal, type GuestRefusal,
 } from '../services/previewShareRules';
 import {
   prismaPreviewShareStore, registerGuestSocket, shareTarget, type GuestShareContext, type GuestSocketHandle,
@@ -226,13 +226,15 @@ export async function handleBrowserPaneSocket(
   // Where the project's files live on the box, for the suggestion scan's dev-stack hint.
   const cwd = projectDirUnder(resolveProjectRoot({ ownerUnixUser: project.ownerUnixUsername, hostHome: project.instance?.hostHome }), project.name, request.workstream);
   const openShare = await ownSharePage(deps, url, project.id, request.workstream);
+  // The share's app is resolved against the share's checkout (seam 1), which
+  // for a 4d share isn't this workstream's directory; suggestions keep `cwd`.
   await relayBrowserStream(ws, deps, refuse, {
     host, projectId: project.id, cwd, keptProfiles, guest: false,
     attach: {
       url: request.url, width: request.width, height: request.height, paneKey,
       ...(persistProfile ? { persistProfile: true } : {}),
       ...(url.searchParams.get('dialogs') === '1' ? { relayDialogs: true } : {}),
-      ...(openShare ? { openRecipe: openShare.recipe, cwd, ...(openShare.at ? { atPath: openShare.at } : {}) } : {}),
+      ...(openShare ? { openRecipe: openShare.recipe, cwd: openShare.cwd ?? cwd, ...(openShare.at ? { atPath: openShare.at } : {}) } : {}),
     },
   });
 }
@@ -245,13 +247,13 @@ export async function handleBrowserPaneSocket(
  * else (another project's, a revoked, ended or expired share) is ignored,
  * and the pane opens as it would have.
  */
-async function ownSharePage(deps: BrowserWsDeps, url: URL, projectId: string, workstream: string): Promise<{ recipe: unknown; at: string | null } | null> {
+async function ownSharePage(deps: BrowserWsDeps, url: URL, projectId: string, workstream: string): Promise<{ recipe: unknown; at: string | null; cwd: string | null } | null> {
   const shareId = url.searchParams.get('openShare');
   if (!isShareId(shareId)) return null;
   const ctx = await deps.guestContext(shareId).catch(() => null);
   if (!ctx || ctx.project.id !== projectId || (ctx.workstream?.name ?? 'main') !== workstream) return null;
   if (!shareLiveness({ share: ctx.share, workstream: ctx.workstream, projectArchived: ctx.project.archived, now: deps.now() }).ok) return null;
-  return { recipe: ctx.share.originRecipe, at: safeAtPath(url.searchParams.get('at')) };
+  return { recipe: ctx.share.originRecipe, at: safeAtPath(url.searchParams.get('at')), cwd: shareTarget(ctx)?.cwd ?? null };
 }
 
 type Refuse = (code: number, reason: string, message?: string) => void;
@@ -353,8 +355,20 @@ async function handleGuestSocket(ws: BrowserPaneSocket, url: URL, viewerId: stri
     unregister();
   });
 
+  // 4d: a link share shows its PR's branch. While the box's checkout is on
+  // another branch (or detached, `HEAD`), its guests are refused, not shown
+  // whatever it moved to; the share stays, for when it comes back. An empty
+  // branch is a report the box couldn't read: nothing to compare.
+  const prBranch = ctx.share.prHeadBranch;
+  const onCheckout = prBranch ? (checkout: { branch: string }) => {
+    if (!checkout.branch || checkout.branch === prBranch) return;
+    deps.log(`[BROWSER-PANE] guest ${viewer.id} on share ${shareId} closed: the checkout is on ${checkout.branch}, not ${prBranch}`);
+    deps.recordShareEvent(shareId, 'refused', { actorId: viewer.id, reason: 'checkout-moved' }).catch(() => {});
+    end(GUEST_STACK_CLOSE_CODE, 'checkout-moved', checkoutMovedMessage(checkout.branch.slice(0, 200), prBranch.slice(0, 200)));
+  } : undefined;
   const opened = await relayBrowserStream(ws, deps, refuse, {
     host, projectId: project.id, cwd: null, keptProfiles, guest: true, shareId,
+    checkoutShare: !!ctx.share.checkoutDir, onCheckout,
     attach: {
       url: startUrl, width: viewport.width, height: viewport.height, paneKey: guestPaneKey(shareId, viewer.id),
       mode: 'guest', recipe: target.recipe, cwd, maxGuestPanes: maxGuests,
@@ -394,6 +408,10 @@ interface RelayOptions {
   keptProfiles: boolean;
   guest: boolean;
   shareId?: string;
+  /** 4d: the share shows a checkout that isn't a workstream's own, so the guest's dev-stack messages say "checkout". */
+  checkoutShare?: boolean;
+  /** A guest's checkout report (the box's branch, HEAD and dirty count), after it is relayed to the pane. */
+  onCheckout?: (checkout: { branch: string; head: string; dirty: number | null }) => void;
   attach: BrowserAttachOptions;
 }
 
@@ -503,15 +521,20 @@ async function relayBrowserStream(ws: BrowserPaneSocket, deps: BrowserWsDeps, re
         case 'browser-dialog-closed':
           if (typeof msg.id === 'number') ws.send(JSON.stringify({ type: 'dialog-closed', id: msg.id }));
           break;
-        case 'browser-checkout':
+        case 'browser-checkout': {
           if (!guest) break;
-          ws.send(JSON.stringify({
-            type: 'checkout',
-            branch: typeof msg.branch === 'string' ? msg.branch.slice(0, 200) : '',
+          // The pane shows 200 characters of the branch; the comparison
+          // (onCheckout) gets git's longest, so a long branch still matches.
+          const branch = typeof msg.branch === 'string' ? msg.branch.slice(0, 1024) : '';
+          const checkout = {
+            branch: branch.slice(0, 200),
             head: typeof msg.head === 'string' ? msg.head.slice(0, 64) : '',
             dirty: typeof msg.dirty === 'number' ? msg.dirty : null,
-          }));
+          };
+          ws.send(JSON.stringify({ type: 'checkout', ...checkout }));
+          opts.onCheckout?.({ ...checkout, branch });
           break;
+        }
         default:
           break;
       }
@@ -520,8 +543,10 @@ async function relayBrowserStream(ws: BrowserPaneSocket, deps: BrowserWsDeps, re
     const message = (err as Error).message;
     deps.log(`[BROWSER-PANE] attach failed for project ${projectId}: ${message}`);
     if (guest) {
-      const mapped = guestAttachRefusal(message);
-      if (opts.shareId) deps.recordShareEvent(opts.shareId, 'refused', { reason: message.slice(0, 120) }).catch(() => {});
+      const mapped = guestAttachRefusal(message, { checkout: opts.checkoutShare === true });
+      // A stack in the way is named for the owner's list (services/previewShares.ts lastRefusal), apart from the reason.
+      const { reason, holder } = splitStackRefusal(message);
+      if (opts.shareId) deps.recordShareEvent(opts.shareId, 'refused', { reason: reason.slice(0, 120), ...(holder ? { detail: { holder } } : {}) }).catch(() => {});
       refuse(mapped.code, mapped.retry ? 'busy' : 'agent refused', mapped.message);
     } else {
       refuse(1011, 'agent error', `Could not start a browser on the box: ${message}`);

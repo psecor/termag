@@ -70,6 +70,12 @@ describe('loginTargetError and loginRpcFailure', () => {
     expect(loginRpcFailure('Unknown command: claude-login-status').body.code).toBe('login-missing');
     expect(loginRpcFailure('Agent request timed out: claude-login-start').status).toBe(504);
   });
+
+  it('does not call a failed status read a failed sign-in', () => {
+    const read = loginRpcFailure('socket closed', 'status');
+    expect(read).toEqual({ status: 502, body: { error: "The box's agent could not read Claude's sign-in status.", code: 'status-failed' } });
+    expect(loginRpcFailure('Agent request timed out: claude-login-status', 'status').body.error).not.toMatch(/sign-in/i);
+  });
 });
 
 describe('loginEmail and allowLoginAttempt', () => {

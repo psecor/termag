@@ -1,6 +1,9 @@
+import { isAdminUser } from './admin/adminAccess';
+import { latestBoxEvents } from './boxEvents';
 import { prisma } from '../db';
 import { validateAgentToken } from '../routes/agentTokens';
 import { isInstanceAgentConnected } from './agentRegistry';
+import { lifecycleViewFor } from './boxLifecycle';
 import { getAllStatuses } from './status';
 import { statusKey } from './statusKey';
 import { sessionName } from './tmux';
@@ -56,16 +59,21 @@ export const prismaCliStore: CliStore = {
   },
 
   async listBoxes(userId) {
-    const rows = await prisma.instance.findMany({
-      where: { userId, status: { not: 'terminated' } },
-      select: {
-        id: true, name: true, kind: true, status: true, provisioningError: true,
-        ec2InstanceId: true, region: true, hostUnixUser: true, createdAt: true, readyAt: true,
-        projects: { where: { archived: false }, select: { id: true, name: true }, orderBy: { name: 'asc' } },
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-    return rows.map(r => shapeBox(r, isInstanceAgentConnected(r.id)));
+    // Whole rows: the lifecycle view reads the idle clock, the warning and the park.
+    const [rows, owner] = await Promise.all([
+      prisma.instance.findMany({
+        where: { userId, status: { not: 'terminated' } },
+        include: { projects: { where: { archived: false }, select: { id: true, name: true }, orderBy: { name: 'asc' } } },
+        orderBy: { createdAt: 'asc' },
+      }),
+      prisma.user.findUnique({ where: { id: userId } }),
+    ]);
+    const resizes = await latestBoxEvents(rows.map(r => r.id), 'resize');
+    return Promise.all(rows.map(async r => shapeBox({
+      ...r,
+      resizeEvent: resizes.get(r.id) ?? null,
+      lifecycle: owner ? await lifecycleViewFor(owner, r) : null,
+    }, isInstanceAgentConnected(r.id))));
   },
 
   async listProjects(userId) {
@@ -73,7 +81,7 @@ export const prismaCliStore: CliStore = {
       where: { userId, archived: false },
       select: {
         id: true, name: true, instanceId: true, lastActiveAt: true,
-        repoUrl: true, setupStatus: true, setupError: true,
+        repoUrl: true, setupStatus: true, setupError: true, createdFor: true,
         instance: { select: { id: true, name: true, hostHome: true, kind: true, status: true, provisioningError: true } },
         user: { select: { unixUsername: true } },
         workstreams: { where: { archived: false }, select: { name: true }, orderBy: { createdAt: 'asc' } },
@@ -109,5 +117,13 @@ export const prismaCliStore: CliStore = {
       data: { revokedAt: now },
     });
     return result.count > 0;
+  },
+
+  async isAdmin(userId) {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, googleEmail: true, role: true, adminSource: true },
+    });
+    return isAdminUser(user);
   },
 };

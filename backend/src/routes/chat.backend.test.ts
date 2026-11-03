@@ -11,6 +11,8 @@ const ALL_CAPS = ['chat-runner-v1', 'chat-trust-v1', 'chat-backend-v1', 'firewor
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
   workflow: { update: vi.fn() },
+  // chatLaunchFor reads whether the owner has the Claude gateway on.
+  user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: true })) },
 }));
 vi.mock('../db', () => ({ prisma }));
 const caps = vi.hoisted(() => ({ list: [] as string[] }));
@@ -43,8 +45,9 @@ vi.mock('../services/tmux', () => ({
   sessionName: vi.fn(() => 'owner_proj_agent'),
 }));
 
-import { chatHistoryFor, chatSendFor, chatTerminalFor } from './chat';
+import { chatHistoryFor, chatReclaimFor, chatSendFor, chatTerminalFor } from './chat';
 import { sendForProject } from '../services/agentRegistry';
+import { boolVariation } from '../services/featureFlags';
 
 function storedOn(backend: string | null, model: string | null) {
   prisma.project.findUnique.mockResolvedValue({
@@ -132,6 +135,18 @@ describe('chat history and Open in full UI on a model backend', () => {
     storedOn('fireworks', KIMI);
     await chatTerminalFor('owner', 'p1', { workstream: 'main' });
     expect(sent('chat-resume-claim')[0]).toMatchObject({ backend: 'fireworks', model: KIMI, fastModel: FAST });
+    expect(sent('chat-resume-claim')[0]).not.toHaveProperty('models');
+  });
+
+  it("carries the flag's models, for Claude Code's model names and Open in full UI's /model, to a box with fireworks-menu-v1", async () => {
+    caps.list = [...ALL_CAPS, 'fireworks-menu-v1'];
+    storedOn('fireworks', KIMI);
+    await chatSendFor('owner', 'p1', { workstream: 'main', text: 'hi' }, viewer);
+    await chatTerminalFor('owner', 'p1', { workstream: 'main' });
+    const decode = (m: unknown) => JSON.parse(Buffer.from(String(m), 'base64').toString('utf8'));
+    for (const frame of [sent('chat-send')[0], sent('chat-resume-claim')[0]]) {
+      expect(decode(frame.models)).toEqual(FW.models);
+    }
   });
 
   it('refuses Open in full UI where the backend cannot run, instead of resuming on the default', async () => {
@@ -146,5 +161,42 @@ describe('chat history and Open in full UI on a model backend', () => {
     await chatTerminalFor('owner', 'p1', { workstream: 'main' });
     expect(sent('chat-resume-claim')[0]).not.toHaveProperty('model');
     expect(sent('chat-resume-claim')[0]).not.toHaveProperty('backend');
+  });
+});
+
+describe('PDFs in a chat', () => {
+  const PDF_CAPS = [...ALL_CAPS, 'chat-images-v1', 'chat-pdfs-v1'];
+  const pdf = [{ mediaType: 'application/pdf', data: Buffer.from('%PDF-1.7\n%body').toString('base64'), name: 'spec.pdf' }];
+  beforeEach(() => {
+    vi.mocked(boolVariation).mockImplementation(async (flag: string) => flag === 'chat-image-input-enabled');
+    caps.list = PDF_CAPS;
+  });
+
+  it('offers PDFs on a Claude chat whose runner takes them, and not on an older runner or another backend', async () => {
+    storedOn(null, 'sonnet');
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: true });
+    caps.list = [...ALL_CAPS, 'chat-images-v1'];
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: false });
+    caps.list = PDF_CAPS;
+    storedOn('fireworks', KIMI);
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: false });
+  });
+
+  it('sends a PDF on Claude, and refuses it to an older runner or on another backend', async () => {
+    storedOn(null, 'sonnet');
+    expect((await chatSendFor('owner', 'p1', { workstream: 'main', text: 'read', images: pdf }, viewer)).status).toBe(202);
+    expect(sent('chat-send')[0].images).toEqual(pdf);
+    caps.list = [...ALL_CAPS, 'chat-images-v1'];
+    expect(await chatSendFor('owner', 'p1', { workstream: 'main', text: 'read', images: pdf }, viewer)).toMatchObject({ status: 409, body: { code: 'pdfs-unsupported' } });
+    caps.list = PDF_CAPS;
+    storedOn('fireworks', KIMI);
+    expect(await chatSendFor('owner', 'p1', { workstream: 'main', text: 'read', images: pdf }, viewer)).toMatchObject({ status: 409, body: { code: 'pdfs-unsupported' } });
+    expect(sent('chat-send')).toHaveLength(1);
+  });
+
+  it('refuses a reclaimed draft with a PDF on an older runner', async () => {
+    storedOn(null, 'sonnet');
+    caps.list = [...ALL_CAPS, 'chat-images-v1'];
+    expect(await chatReclaimFor('owner', 'p1', { workstream: 'main', text: 'read', images: pdf }, viewer)).toMatchObject({ status: 409, body: { code: 'pdfs-unsupported' } });
   });
 });

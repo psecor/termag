@@ -3,6 +3,7 @@ import express from 'express';
 import type { AddressInfo } from 'net';
 import type { Server } from 'http';
 import { spaceCallerFromCli, spacesRouter, SINGLE_PUT_MAX_BYTES } from './spaces';
+import { spaceFilesRouter } from './spaceFiles';
 import { spaceFileLinkPath } from '../services/spaces/spaceLinks';
 import { SpacesUnavailableError } from '../services/spaces/spaceConfig';
 import { MemorySpaceObjects, MemorySpaceStore } from '../services/spaces/spacesTestkit';
@@ -14,9 +15,13 @@ let store: MemorySpaceStore;
 let objects: MemorySpaceObjects;
 let enabled: Set<string>;
 let sharing: Set<string>;
+let memory: Set<string>;
 let unavailable = false;
 let identities: PresignerIdentity[];
+/** Live file changes the router sent (onFileChange), for the open views a change must reach. */
+const fileChanges: Array<{ kind: string; path: string; etag?: string }> = [];
 let server: Server;
+let origin: string;
 let base: string;
 
 beforeAll(async () => {
@@ -32,6 +37,7 @@ beforeAll(async () => {
     },
     enabled: async userId => enabled.has(userId),
     sharing: async userId => sharing.has(userId),
+    memoryEnabled: async userId => memory.has(userId),
     caller: r => {
       const user = r.get('x-user');
       if (!user) return null;
@@ -39,9 +45,19 @@ beforeAll(async () => {
       return (box ? { kind: 'box', userId: user, instanceId: box } : { kind: 'user', userId: user }) satisfies SpaceCaller;
     },
     fileLink: (space, path) => `https://ui.example${spaceFileLinkPath('/termag', space, path)}`,
+    onFileChange: c => { fileChanges.push(c as never); },
+  }));
+  // The browser link, for a non-member's read of a file a box shared.
+  app.use('/termag/files', spaceFilesRouter({
+    store: liveStore as MemorySpaceStore,
+    objects: async () => objects,
+    enabled: async userId => enabled.has(userId),
+    userId: r => r.get('x-user') ?? null,
+    viewerAllowed: () => true,
   }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
-  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/spaces`;
+  origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  base = `${origin}/api/spaces`;
 });
 
 afterAll(() => new Promise<void>(resolve => server.close(() => resolve())));
@@ -51,6 +67,7 @@ beforeEach(() => {
   objects = new MemorySpaceObjects();
   enabled = new Set(['alice', 'bob', 'carol']);
   sharing = new Set(['alice', 'bob', 'carol']);
+  memory = new Set(['alice', 'bob', 'carol']);
   unavailable = false;
   identities = [];
   store.addUser('alice');
@@ -120,6 +137,17 @@ describe('spaces', () => {
     const r = await call('GET', '/', { as: 'alice' });
     expect(r.body.spaces).toEqual([expect.objectContaining({ name: 'assets', role: 'owner', readOnly: false, quotaBytes: 107374182400 })]);
     expect((await call('GET', '/', { as: 'bob' })).body.spaces).toEqual([]);
+  });
+
+  it('lists each space with its member count, invites not counted', async () => {
+    await createSpace();
+    await createSpace('solo');
+    expect((await call('GET', '/', { as: 'alice' })).body.spaces.map((s: { name: string; memberCount: number }) => [s.name, s.memberCount]))
+      .toEqual([['assets', 1], ['solo', 1]]);
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'editor' } });
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'nobody@example.com', role: 'viewer' } });
+    const counts = (await call('GET', '/', { as: 'bob' })).body.spaces.map((s: { name: string; memberCount: number }) => [s.name, s.memberCount]);
+    expect(counts).toEqual([['assets', 2]]);
   });
 
   it('refuses a bad or taken name', async () => {
@@ -328,6 +356,96 @@ describe('boxes', () => {
     await call('POST', '/assets/boxes', { as: 'bob', body: { box: 'bob-box' } });
     expect((await call('DELETE', '/assets/boxes/bobbox', { as: 'carol' })).status).toBe(403);
     expect((await call('DELETE', '/assets/boxes/bobbox', { as: 'alice' })).status).toBe(200);
+  });
+});
+
+describe('listing outlives the box', () => {
+  beforeEach(async () => {
+    await createSpace();
+    store.addProject('chat', 'alice', 'alicebox');
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
+  });
+
+  it('lists a terminated box\'s project in the space, before and after the sweep prunes its grant', async () => {
+    const assets = [...store.spaces.values()][0];
+    expect(store.listedIn('chat')).toEqual([assets.id]);
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([]);
+    store.boxes.get('alicebox')!.status = 'terminated';
+    const before = await call('GET', '/assets/boxes', { as: 'alice' });
+    expect(before.body.boxes).toEqual([]);
+    expect(before.body.listed).toEqual([{ id: 'alicebox' }]);
+    await store.recordListings();
+    expect(await store.pruneTerminatedGrants()).toBe(1);
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([{ id: 'alicebox' }]);
+    expect((await call('GET', '/assets/tree', { as: 'alice', box: 'alicebox' })).status).toBe(404);
+  });
+
+  it('keeps a child\'s inherited listing once its parent terminates', async () => {
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    store.addProject('ask', 'alice', 'askbox');
+    await store.recordListings();
+    store.boxes.get('alicebox')!.status = 'terminated';
+    store.boxes.get('askbox')!.status = 'terminated';
+    await store.recordListings();
+    await store.pruneTerminatedGrants();
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([{ id: 'alicebox' }, { id: 'askbox' }]);
+  });
+
+  it('keeps a live child\'s inherited listing in the space once its parent terminates', async () => {
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    store.addProject('ask', 'alice', 'askbox');
+    await store.recordListings();
+    const live = await call('GET', '/assets/boxes', { as: 'alice' });
+    expect(live.body.boxes[0].children).toEqual([expect.objectContaining({ id: 'askbox' })]);
+    expect(live.body.listed).toEqual([]);
+    store.boxes.get('alicebox')!.status = 'terminated';
+    await store.recordListings();
+    await store.pruneTerminatedGrants();
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([{ id: 'alicebox' }, { id: 'askbox' }]);
+  });
+
+  it('unlists a removed box\'s projects and its live children\'s', async () => {
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    store.addProject('ask', 'alice', 'askbox');
+    await store.recordListings();
+    expect(store.listedIn('ask')).toHaveLength(1);
+    expect((await call('DELETE', '/assets/boxes/alicebox', { as: 'alice' })).status).toBe(200);
+    expect(store.listedIn('chat')).toEqual([]);
+    expect(store.listedIn('ask')).toEqual([]);
+  });
+
+  it('keeps a listing another grant still reaches', async () => {
+    store.addBox('askbox', 'alice', 'ask-box', 'ready', 'alicebox');
+    store.addProject('ask', 'alice', 'askbox');
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'ask-box' } });
+    await call('DELETE', '/assets/boxes/alicebox', { as: 'alice' });
+    expect(store.listedIn('ask')).toHaveLength(1);
+  });
+
+  it('doesn\'t list a box a project moved to that the space never granted', async () => {
+    store.addBox('newbox', 'alice', 'new-box', 'ready');
+    store.projects.get('chat')!.instanceId = 'newbox';
+    store.boxes.get('alicebox')!.status = 'terminated';
+    await store.recordListings();
+    await store.pruneTerminatedGrants();
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([]);
+  });
+
+  it('moves the listing with a project that lands on another granted box', async () => {
+    store.addBox('newbox', 'alice', 'new-box', 'ready');
+    await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'new-box' } });
+    store.projects.get('chat')!.instanceId = 'newbox';
+    await store.recordListings();
+    store.boxes.get('newbox')!.status = 'terminated';
+    await store.recordListings();
+    await store.pruneTerminatedGrants();
+    expect((await call('GET', '/assets/boxes', { as: 'alice' })).body.listed).toEqual([{ id: 'newbox' }]);
+  });
+
+  it('unlists a member\'s projects when they leave', async () => {
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'owner' } });
+    expect((await call('DELETE', '/assets/members/alice', { as: 'alice' })).status).toBe(200);
+    expect(store.listedIn('chat')).toEqual([]);
   });
 });
 
@@ -542,5 +660,425 @@ describe('files', () => {
     expect(store.eventRows.at(-1)).toMatchObject({ action: 'file.get', actorUserId: 'alice', actorInstanceId: 'alicebox', via: null });
     const events = await call('GET', '/assets/events', { as: 'alice' });
     expect(events.body.events[0]).toMatchObject({ action: 'file.get', actorInstanceId: 'alicebox' });
+  });
+});
+
+describe('space memory (docs/space-memory.md)', () => {
+  async function memorySpace() {
+    const s = await createSpace();
+    await call('POST', `/${s.name}/members`, { as: 'alice', body: { email: 'bob@example.com', role: 'editor' } });
+    await call('POST', `/${s.name}/members`, { as: 'alice', body: { email: 'carol@example.com', role: 'viewer' } });
+    await call('POST', `/${s.name}/boxes`, { as: 'alice', body: { box: 'alice-box' } });
+    return s;
+  }
+  async function put(as: string, path: string, opts: { box?: string; note?: string; body?: Record<string, unknown> } = {}) {
+    const up = await call('POST', '/assets/files/upload', { as, box: opts.box, body: { path, size: 5, contentType: 'text/markdown', ...opts.body } });
+    if (up.status !== 200) return up;
+    objects.put(`${store.spaces.values().next().value!.id}/${path}`, 5, 'text/markdown');
+    return call('POST', '/assets/files/uploaded', { as, box: opts.box, body: { path, ...(opts.note ? { note: opts.note } : {}) } });
+  }
+
+  it('answers 404 space_memory_off while space-memory-enabled is off for the caller, a box\'s owner included', async () => {
+    await memorySpace();
+    memory.delete('alice');
+    const r = await call('GET', '/assets/memory', { as: 'alice', box: 'alicebox' });
+    expect(r).toEqual({ status: 404, body: expect.objectContaining({ code: 'space_memory_off' }) });
+    expect((await call('GET', '/assets/memory/log', { as: 'alice' })).body.code).toBe('space_memory_off');
+    // Files work as before: the flag gates loading, not the space.
+    expect((await call('GET', '/assets/tree', { as: 'alice', box: 'alicebox' })).status).toBe(200);
+  });
+
+  it('still hides a space the caller has no role in', async () => {
+    await memorySpace();
+    store.addUser('dave');
+    memory.add('dave');
+    enabled.add('dave');
+    expect((await call('GET', '/assets/memory', { as: 'dave' })).body.code).toBe('not_found');
+  });
+
+  it('gives the role and the last writer of each memory file, not of tools or other paths', async () => {
+    await memorySpace();
+    expect((await put('alice', '.termag/memory/a.md', { box: 'alicebox', note: 'first fact' })).status).toBe(200);
+    expect((await put('bob', '.termag/memory/a.md')).status).toBe(200);
+    expect((await put('alice', '.termag/memory/b.md')).status).toBe(200);
+    expect((await put('alice', '.termag/tools/t/data.json')).status).toBe(200);
+    expect((await put('alice', 'notes.md')).status).toBe(200);
+    await call('DELETE', '/assets/files?path=.termag/memory/b.md&note=stale', { as: 'alice' });
+
+    const r = await call('GET', '/assets/memory', { as: 'alice', box: 'alicebox' });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual(expect.objectContaining({ space: 'assets', role: 'owner', readOnly: false, writable: true, me: 'alice' }));
+    expect(Object.keys(r.body.writers)).toEqual(['.termag/memory/a.md']);
+    expect(r.body.writers['.termag/memory/a.md']).toEqual(expect.objectContaining({ userId: 'bob', email: 'bob@example.com', box: null }));
+
+    const viewer = await call('GET', '/assets/memory', { as: 'carol' });
+    expect(viewer.body).toEqual(expect.objectContaining({ role: 'viewer', writable: false }));
+  });
+
+  it('logs memory changes with who, which box, the S3 version and the note', async () => {
+    await memorySpace();
+    await put('alice', '.termag/memory/a.md', { box: 'alicebox', note: '  why\n it changed ' });
+    await call('DELETE', '/assets/files?path=.termag/memory/a.md&note=wrong', { as: 'bob' });
+    await put('alice', 'other.md');
+    const r = await call('GET', '/assets/memory/log?since=1d', { as: 'carol' });
+    expect(r.status).toBe(200);
+    expect(r.body.entries).toEqual([
+      expect.objectContaining({ action: 'file.rm', path: '.termag/memory/a.md', note: 'wrong', userId: 'bob', box: null }),
+      expect.objectContaining({ action: 'file.put', path: '.termag/memory/a.md', note: 'why it changed', userId: 'alice', box: 'alice-box', versionId: 'v1', bytes: 5 }),
+    ]);
+    expect((await call('GET', '/assets/memory/log?since=soon', { as: 'carol' })).body.code).toBe('invalid_since');
+  });
+
+  it('refuses a note that is too long or holds a secret, and records nothing for it', async () => {
+    await memorySpace();
+    const long = await put('alice', '.termag/memory/a.md', { note: 'x'.repeat(201) });
+    expect(long.body.code).toBe('invalid_note');
+    const secret = await put('alice', '.termag/memory/a.md', { note: `key AKIA${'Q'.repeat(16)}` });
+    expect(secret).toEqual({ status: 400, body: expect.objectContaining({ code: 'note_secret' }) });
+    expect(store.eventRows.filter(e => e.action === 'file.put')).toEqual([]);
+  });
+
+  it('signs a conditional write when asked, and says so', async () => {
+    const sp = await memorySpace();
+    objects.put(`${sp.id}/.termag/memory/a.md`, 5);
+    const current = objects.etagOf(`${sp.id}/.termag/memory/a.md`)!;
+    const edit = await call('POST', '/assets/files/upload', { as: 'alice', box: 'alicebox', body: { path: '.termag/memory/a.md', size: 5, contentType: 'text/markdown', ifMatch: current } });
+    expect(edit.body).toEqual(expect.objectContaining({ kind: 'single', conditional: true, headers: expect.objectContaining({ 'if-match': current }) }));
+    const add = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: '.termag/memory/b.md', size: 5, ifNoneMatch: '*' } });
+    expect(add.body.headers['if-none-match']).toBe('*');
+    const plain = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'c.md', size: 5 } });
+    expect(plain.body.conditional).toBeUndefined();
+    expect((await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'd.md', size: 5, ifMatch: '"a"', ifNoneMatch: '*' } })).body.code).toBe('invalid_condition');
+    expect((await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'd.md', size: 5, ifNoneMatch: 'x' } })).body.code).toBe('invalid_condition');
+    // A multipart upload's condition goes again with its complete.
+    const big = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'e.bin', size: SINGLE_PUT_MAX_BYTES + 1, ifNoneMatch: '*' } });
+    expect(big.body).toEqual(expect.objectContaining({ kind: 'multipart', conditional: true }));
+  });
+
+  it('lets a viewer read memory but refuses their writes', async () => {
+    await memorySpace();
+    expect((await call('GET', '/assets/memory', { as: 'carol' })).status).toBe(200);
+    expect((await call('POST', '/assets/files/upload', { as: 'carol', body: { path: '.termag/memory/x.md', size: 5, ifNoneMatch: '*' } })).status).toBe(403);
+  });
+});
+
+describe('optimistic concurrency on every file write (docs/spaces.md, "Conflicts")', () => {
+  let sp: { id: string; name: string };
+  const key = (p: string) => `${sp.id}/${p}`;
+  beforeEach(async () => {
+    sp = await createSpace();
+    await call('POST', `/${sp.name}/members`, { as: 'alice', body: { email: 'bob@example.com', role: 'editor' } });
+    await call('POST', `/${sp.name}/boxes`, { as: 'alice', body: { box: 'bob-box' } }).catch(() => null);
+  });
+  /** One whole write as a client does it: sign, the PUT lands, confirm; `cond` is what it read. */
+  async function write(as: string, path: string, cond: Record<string, unknown> = {}, opts: { box?: string } = {}) {
+    const up = await call('POST', '/assets/files/upload', { as, box: opts.box, body: { path, size: 5, ...cond } });
+    if (up.status !== 200) return up;
+    // The PUT as a client sends it: the headers the upload signed, its proof among them.
+    objects.putSigned(key(path), 5, up.body.headers);
+    return call('POST', '/assets/files/uploaded', { as, box: opts.box, body: { path, etag: objects.etagOf(key(path)), ...cond } });
+  }
+
+  it('a confirm can\'t name someone else\'s version as its own: 412, nothing copied, nothing recorded (Security Agent, #769)', async () => {
+    await write('alice', 'a.md');
+    const first = objects.etagOf(key('a.md'))!;
+    expect((await write('bob', 'a.md', { ifMatch: first })).status).toBe(200);
+    const bobs = objects.etagOf(key('a.md'))!;
+    const versions = objects.history.get(key('a.md'))!.length;
+    const puts = store.eventRows.filter(e => e.action.startsWith('file.put')).length;
+    // Alice knows the current ETag and claims it as her write, with a condition it can't meet: no PUT of hers exists.
+    for (const cond of [{ ifNoneMatch: '*' }, { ifMatch: '"0123456789abcdef0123456789abcdef"' }]) {
+      const r = await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a.md', etag: bobs, ...cond } });
+      expect(r.status).toBe(412);
+      expect(r.body.code).toBe('changed');
+    }
+    expect(objects.etagOf(key('a.md')), 'Bob\'s version stays current').toBe(bobs);
+    expect(objects.history.get(key('a.md'))!.length, 'no restore copied anything').toBe(versions);
+    expect(store.eventRows.filter(e => e.action.startsWith('file.put')).length).toBe(puts);
+    // Even signed for the path and the condition, someone else's version isn't hers: the proof names its signer.
+    const signed = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'a.md', size: 5, ifMatch: first } });
+    expect(signed.status).toBe(412);
+  });
+
+  it('a download says which version it served', async () => {
+    objects.put(key('a.md'), 5);
+    const r = await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'a.md' } });
+    expect(r.body).toEqual(expect.objectContaining({ etag: objects.etagOf(key('a.md')), versionId: 'v1' }));
+  });
+
+  it('refuses before signing a write over a newer version: 412 changed, with who wrote it and when', async () => {
+    expect((await write('alice', 'a.md')).status).toBe(200);
+    const read = objects.etagOf(key('a.md'))!;
+    expect((await write('bob', 'a.md', { ifMatch: read })).status).toBe(200);
+    const signed = objects.presigned.length;
+    const r = await write('alice', 'a.md', { ifMatch: read });
+    expect(r.status).toBe(412);
+    expect(r.body).toEqual(expect.objectContaining({ code: 'changed', path: 'a.md', yours: read, now: objects.etagOf(key('a.md')), by: 'bob@example.com' }));
+    expect(r.body.error).toMatch(/^assets:a\.md changed since you read it \(yours "[^"]+", now "[^"]+" by bob@example\.com at \d{4}-/);
+    expect(objects.presigned.length, 'nothing signed').toBe(signed);
+  });
+
+  it('refuses a new file that already exists, and a write over a file removed since', async () => {
+    await write('alice', 'a.md');
+    expect((await write('bob', 'a.md', { ifNoneMatch: '*' })).body).toEqual(expect.objectContaining({ code: 'changed', yours: 'new' }));
+    const read = objects.etagOf(key('a.md'))!;
+    await call('DELETE', '/assets/files?path=a.md', { as: 'bob' });
+    const gone = await write('alice', 'a.md', { ifMatch: read });
+    expect(gone.status).toBe(412);
+    expect(gone.body.now).toBeNull();
+    expect(gone.body.error).toContain('now gone');
+  });
+
+  it('where storage ignores the condition, the confirm puts the newer version back and answers 412', async () => {
+    objects.enforceConditions = false;
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    // Alice signs while the file is still the version she read; Bob writes in between; then her PUT lands.
+    const signed = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'a.md', size: 5, ifMatch: read } });
+    expect(signed.status).toBe(200);
+    expect((await write('bob', 'a.md', { ifMatch: read })).status).toBe(200);
+    const bobs = objects.etagOf(key('a.md'))!;
+    const bobsVersion = objects.history.get(key('a.md'))!.at(-1)!.versionId;
+    objects.putSigned(key('a.md'), 7, signed.body.headers);
+    const putsBefore = store.eventRows.filter(e => e.action === 'file.put').length;
+    const r = await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a.md', etag: objects.etagOf(key('a.md')), ifMatch: read } });
+    expect(r.status).toBe(412);
+    expect(r.body).toEqual(expect.objectContaining({ code: 'changed', yours: read, by: 'bob@example.com' }));
+    // Bob's version is current again (a copy of it), and Alice's bytes stay in the history only.
+    expect(objects.files.get(key('a.md'))!.size).toBe(5);
+    const history = objects.history.get(key('a.md'))!;
+    expect(history.at(-2)!.size).toBe(7);
+    expect(history.find(v => v.versionId === bobsVersion)).toBeTruthy();
+    expect(store.eventRows.filter(e => e.action === 'file.put').length, 'her write is not recorded').toBe(putsBefore);
+    // The restore is: who wrote over whom, and that their version was put back.
+    expect(store.eventRows.at(-1)).toEqual(expect.objectContaining({ action: 'file.put.reverted', path: 'a.md' }));
+    // The 412 names the version that is current now, the restored copy, and open views hear of it (Bugbot, #769).
+    const restored = objects.etagOf(key('a.md'))!;
+    expect(restored).not.toBe(bobs);
+    expect(r.body.now).toBe(restored);
+    expect(fileChanges.at(-1)).toEqual(expect.objectContaining({ kind: 'put', path: 'a.md', etag: restored }));
+  });
+
+  it('a restore never clobbers a write that lands after the check: the copy is conditional on ours being current (Bugbot, #769)', async () => {
+    objects.enforceConditions = false;
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    const signed = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'a.md', size: 5, ifMatch: read } });
+    expect((await write('bob', 'a.md', { ifMatch: read })).status).toBe(200);
+    objects.putSigned(key('a.md'), 7, signed.body.headers);
+    // Carol's write lands between the versions the confirm read and its copy.
+    objects.beforeRestore = () => { objects.put(key('a.md'), 11); };
+    const r = await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a.md', etag: objects.etagOf(key('a.md')), ifMatch: read } });
+    objects.beforeRestore = null;
+    expect(r.status).toBe(412);
+    expect(objects.files.get(key('a.md'))!.size, 'Carol\'s write stays current').toBe(11);
+    expect(r.body.now).toBe(objects.etagOf(key('a.md')));
+    expect(store.eventRows.some(e => e.action === 'file.put.reverted')).toBe(false);
+  });
+
+  it('where storage ignores it, a new file that someone else created first is put back as theirs', async () => {
+    objects.enforceConditions = false;
+    const signed = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'n.md', size: 5, ifNoneMatch: '*' } });
+    expect(signed.status).toBe(200);
+    expect((await write('bob', 'n.md')).status).toBe(200);
+    objects.putSigned(key('n.md'), 9, signed.body.headers);
+    const r = await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'n.md', etag: objects.etagOf(key('n.md')), ifNoneMatch: '*' } });
+    expect(r.status).toBe(412);
+    expect(objects.files.get(key('n.md'))!.size).toBe(5);
+  });
+
+  it('on a store without version history, a confirmed write stays: the confirm never deletes the only version (Bugbot sweep 12)', async () => {
+    objects.versioned = false;
+    objects.enforceConditions = false;
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    const r = await write('alice', 'a.md', { ifMatch: read });
+    expect(r.status).toBe(200);
+    expect(objects.files.has(key('a.md'))).toBe(true);
+    const fresh = await write('alice', 'new.md', { ifNoneMatch: '*' });
+    expect(fresh.status).toBe(200);
+    expect(objects.files.has(key('new.md'))).toBe(true);
+  });
+
+  it('a confirm sent again (a retry) passes, and changes nothing', async () => {
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    expect((await write('alice', 'a.md', { ifMatch: read })).status).toBe(200);
+    const ours = objects.etagOf(key('a.md'))!;
+    const again = await call('POST', '/assets/files/uploaded', { as: 'alice', body: { path: 'a.md', etag: ours, ifMatch: read } });
+    expect(again.status).toBe(200);
+    expect(objects.etagOf(key('a.md'))).toBe(ours);
+  });
+
+  it('confirms a write on the version it expected, and answers its new version', async () => {
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    const r = await write('alice', 'a.md', { ifMatch: read });
+    expect(r.status).toBe(200);
+    expect(r.body).toEqual(expect.objectContaining({ ok: true, etag: objects.etagOf(key('a.md')), versionId: 'v2' }));
+  });
+
+  it('checks a multipart upload at its complete', async () => {
+    await write('alice', 'big.bin');
+    const read = objects.etagOf(key('big.bin'))!;
+    const up = await call('POST', '/assets/files/upload', { as: 'alice', body: { path: 'big.bin', size: SINGLE_PUT_MAX_BYTES + 1, ifMatch: read } });
+    expect(up.body.conditional).toBe(true);
+    await write('bob', 'big.bin');
+    const r = await call('POST', `/assets/uploads/${up.body.uploadId}/complete`, { as: 'alice', body: { path: 'big.bin', parts: [{ partNumber: 1, etag: '"p1"' }], ifMatch: read } });
+    expect(r.status).toBe(412);
+    expect(r.body.code).toBe('changed');
+  });
+
+  it('checks a file move\'s source version and a new destination; a folder move checks none', async () => {
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    await write('bob', 'a.md');
+    expect((await call('POST', '/assets/files/move', { as: 'alice', body: { from: 'a.md', to: 'b.md', ifMatch: read } })).status).toBe(412);
+    expect(objects.files.has(key('b.md'))).toBe(false);
+    const now = objects.etagOf(key('a.md'))!;
+    await write('alice', 'c.md');
+    expect((await call('POST', '/assets/files/move', { as: 'alice', body: { from: 'a.md', to: 'c.md', ifMatch: now, ifNoneMatch: '*' } })).body.code).toBe('changed');
+    expect((await call('POST', '/assets/files/move', { as: 'alice', body: { from: 'a.md', to: 'b.md', ifMatch: now } })).status).toBe(200);
+    expect(objects.copies.at(-1)).toEqual({ from: key('a.md'), to: key('b.md'), sourceIfMatch: now });
+    expect((await call('POST', '/assets/files/move', { as: 'alice', body: { from: 'dir/', to: 'other/', ifMatch: now } })).body.code).toBe('invalid_condition');
+  });
+
+  it('checks a single file\'s delete; a folder delete checks none', async () => {
+    await write('alice', 'a.md');
+    const read = objects.etagOf(key('a.md'))!;
+    await write('bob', 'a.md');
+    const r = await call('DELETE', `/assets/files?path=a.md&ifMatch=${encodeURIComponent(read)}`, { as: 'alice' });
+    expect(r.status).toBe(412);
+    expect(objects.files.has(key('a.md'))).toBe(true);
+    expect((await call('DELETE', `/assets/files?path=a.md&ifMatch=${encodeURIComponent(objects.etagOf(key('a.md'))!)}`, { as: 'alice' })).status).toBe(200);
+    expect((await call('DELETE', `/assets/files?path=dir/&recursive=1&ifMatch=${encodeURIComponent(read)}`, { as: 'alice' })).body.code).toBe('invalid_condition');
+  });
+
+  it('a write with no condition is unconditional, as before', async () => {
+    await write('alice', 'a.md');
+    await write('bob', 'a.md');
+    expect((await write('alice', 'a.md')).status).toBe(200);
+  });
+});
+
+describe('sharing a file', () => {
+  let s: { id: string; name: string };
+  const share = (as: string, path = 'docs/a.md', box?: string) => call('PUT', '/assets/files/share', { as, box, body: { path } });
+  const unshare = (as: string, path = 'docs/a.md', box?: string) => call('DELETE', `/assets/files/share?path=${encodeURIComponent(path)}`, { as, box });
+
+  beforeEach(async () => {
+    s = await createSpace();
+    objects.put(`${s.id}/docs/a.md`, 1, 'text/markdown');
+    objects.put(`${s.id}/docs/b.md`, 1, 'text/markdown');
+    await call('POST', '/assets/members', { as: 'alice', body: { email: 'bob@example.com', role: 'viewer' } });
+  });
+
+  it('shares and unshares one file, once each in the audit, and shows it in the view and the tree', async () => {
+    expect((await share('alice')).body).toMatchObject({ shared: true, sharedBy: { displayName: 'alice' } });
+    expect((await share('alice')).status).toBe(200);
+    const viewed = await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'docs/a.md', view: true } });
+    expect(viewed.body.share).toMatchObject({ shared: true, canShare: true });
+    const tree = await call('GET', '/assets/tree?prefix=docs/', { as: 'alice' });
+    expect(tree.body.files.map((f: { path: string; shared?: boolean }) => [f.path, f.shared ?? false])).toEqual([['docs/a.md', true], ['docs/b.md', false]]);
+    expect((await unshare('alice')).body).toEqual({ shared: false });
+    expect((await unshare('alice')).status).toBe(200);
+    expect(store.eventRows.filter(e => e.action.startsWith('file.') && e.action.includes('share')).map(e => [e.action, e.path]))
+      .toEqual([['file.share', 'docs/a.md'], ['file.unshare', 'docs/a.md']]);
+  });
+
+  it('refuses a viewer, a read-only space, a missing file and a folder', async () => {
+    expect((await share('bob')).status).toBe(403);
+    const viewed = await call('POST', '/assets/files/download', { as: 'bob', body: { path: 'docs/a.md', view: true } });
+    expect(viewed.body.share).toEqual({ shared: false, canShare: false });
+    expect((await share('alice', 'docs/nope.md')).body.code).toBe('file_not_found');
+    expect((await share('alice', 'docs/')).status).toBe(400);
+    store.spaces.get(s.id)!.readOnlyAt = new Date();
+    expect((await share('alice')).body.code).toBe('read_only');
+    expect(store.shareRows).toEqual([]);
+  });
+
+  describe('from a box', () => {
+    beforeEach(async () => {
+      await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
+      objects.put(`${s.id}/notes.md`, 1, 'text/markdown');
+    });
+
+    it('shares and unshares any file, as its owner, with the box in the audit', async () => {
+      expect((await share('alice', 'docs/a.md', 'alicebox')).body).toMatchObject({ shared: true, sharedBy: { displayName: 'alice' } });
+      expect((await share('alice', 'notes.md', 'alicebox')).status).toBe(200);
+      expect(store.shareRows.map(r => [r.path, r.sharedById])).toEqual([['docs/a.md', 'alice'], ['notes.md', 'alice']]);
+      expect((await unshare('alice', 'notes.md', 'alicebox')).body).toEqual({ shared: false });
+      expect(store.shareRows.map(r => r.path)).toEqual(['docs/a.md']);
+      expect(store.eventRows.filter(e => e.action.includes('share')).map(e => [e.action, e.path, e.actorUserId, e.actorInstanceId]))
+        .toEqual([
+          ['file.share', 'docs/a.md', 'alice', 'alicebox'],
+          ['file.share', 'notes.md', 'alice', 'alicebox'],
+          ['file.unshare', 'notes.md', 'alice', 'alicebox'],
+        ]);
+      const viewed = await call('POST', '/assets/files/download', { as: 'alice', box: 'alicebox', body: { path: 'docs/a.md', view: true } });
+      expect(viewed.body.share).toMatchObject({ shared: true, canShare: true });
+    });
+
+    it('unshares a file a person shared, as a person can', async () => {
+      await share('alice', 'notes.md');
+      expect((await unshare('alice', 'notes.md', 'alicebox')).body).toEqual({ shared: false });
+      expect(store.shareRows).toEqual([]);
+    });
+
+    it('keeps every other check: editor, a box with access, a read-only space, a missing file, the kill switch', async () => {
+      await call('PATCH', '/assets/members/bob', { as: 'alice', body: { role: 'editor' } });
+      expect((await call('POST', '/assets/boxes', { as: 'bob', body: { box: 'bob-box' } })).status).toBe(201);
+      await call('PATCH', '/assets/members/bob', { as: 'alice', body: { role: 'viewer' } });
+      expect((await call('GET', '/assets/tree', { as: 'bob', box: 'bobbox' })).status).toBe(200);
+      expect((await share('bob', 'notes.md', 'bobbox')).body.code).toBe('forbidden');
+      expect((await unshare('bob', 'notes.md', 'bobbox')).status).toBe(403);
+      store.addBox('stray', 'alice', 'stray-box');
+      expect((await share('alice', 'notes.md', 'stray')).status).toBe(404);
+      expect((await share('alice', 'nope.md', 'alicebox')).body.code).toBe('file_not_found');
+      process.env.SPACE_FILE_SHARING_DISABLED = '1';
+      try {
+        expect((await share('alice', 'notes.md', 'alicebox')).body.code).toBe('sharing_off');
+      } finally {
+        delete process.env.SPACE_FILE_SHARING_DISABLED;
+      }
+      store.spaces.get(s.id)!.readOnlyAt = new Date();
+      expect((await share('alice', 'notes.md', 'alicebox')).body.code).toBe('read_only');
+      expect(store.shareRows).toEqual([]);
+    });
+
+    it('lets a non-member open the file it shared through the link, until the box unshares it', async () => {
+      const link = `${origin}/termag/files/assets/notes.md`;
+      const open = () => fetch(link, { headers: { 'x-user': 'carol' }, redirect: 'manual' });
+      expect((await open()).status).toBe(404);
+      await share('alice', 'notes.md', 'alicebox');
+      const r = await open();
+      expect(r.status).toBe(302);
+      expect(r.headers.get('location')).toBe(`https://s3.test/get/${s.id}/notes.md`);
+      expect(store.eventRows.filter(e => e.action === 'file.get').at(-1)).toMatchObject({ actorUserId: 'carol', via: 'share', path: 'notes.md' });
+      await unshare('alice', 'notes.md', 'alicebox');
+      expect((await open()).status).toBe(404);
+    });
+  });
+
+  it('refuses a new share with the kill switch on, but still lets a file be made private', async () => {
+    await share('alice');
+    process.env.SPACE_FILE_SHARING_DISABLED = '1';
+    try {
+      expect((await share('alice', 'docs/b.md')).body.code).toBe('sharing_off');
+      expect((await unshare('alice')).body).toEqual({ shared: false });
+    } finally {
+      delete process.env.SPACE_FILE_SHARING_DISABLED;
+    }
+  });
+
+  it('drops the share when the file is deleted or moved, so the new path starts private', async () => {
+    objects.put(`${s.id}/c.md`, 1, 'text/markdown');
+    await share('alice');
+    await share('alice', 'docs/b.md');
+    await share('alice', 'c.md');
+    await call('POST', '/assets/files/move', { as: 'alice', body: { from: 'docs/', to: 'old/' } });
+    expect([...await store.sharedPaths(s.id)]).toEqual(['c.md']);
+    await call('DELETE', '/assets/files?path=c.md', { as: 'alice' });
+    expect(store.shareRows).toEqual([]);
   });
 });

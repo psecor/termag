@@ -12,6 +12,7 @@
 // is a file) the config of the repository it belongs to.
 import type { ProjectHost } from './agentRegistry';
 import { repoFromOrigin } from './prBranches';
+import { repoSlug } from './projectRepos';
 import { GITHUB_PR_URL, type SendForHost } from './review';
 
 /**
@@ -22,6 +23,18 @@ import { GITHUB_PR_URL, type SendForHost } from './review';
 export interface WorkstreamRepo {
   repo: string | null;
   known: boolean;
+  /**
+   * A multi-repo workstream: owner/name of each
+   * of its repositories. `repo` is then null and `known` true: its directory
+   * is not a checkout, and a bare number could be in any of them.
+   */
+  repos?: string[];
+}
+
+/** A multi-repo workstream's repositories, from its ProjectRepo rows; no box read needed. */
+export function workspaceRepos(repos: ReadonlyArray<{ url: string; position: number }>): WorkstreamRepo {
+  const slugs = [...repos].sort((a, b) => a.position - b.position).map(r => repoSlug(r.url)).filter((s): s is string => !!s);
+  return { repo: null, known: true, repos: slugs };
 }
 
 /** `owner/name` from a GitHub PR URL. */
@@ -125,9 +138,15 @@ export async function workstreamRepo(send: SendForHost, host: ProjectHost, cwd: 
 export function reviewTarget(pr: number, url: string | null, ws: WorkstreamRepo):
   { url: string | null; repo: string | null; mismatch: string | null } | { refuse: string } {
   const fromUrl = repoFromPrUrl(url);
+  const several = ws.repos && ws.repos.length > 0 ? ws.repos : null;
   if (fromUrl) {
-    const mismatch = ws.repo && ws.repo.toLowerCase() !== fromUrl.toLowerCase() ? ws.repo : null;
+    const mismatch = several
+      ? (several.some(r => r.toLowerCase() === fromUrl.toLowerCase()) ? null : several.join(', '))
+      : ws.repo && ws.repo.toLowerCase() !== fromUrl.toLowerCase() ? ws.repo : null;
     return { url, repo: fromUrl, mismatch };
+  }
+  if (several) {
+    return { refuse: `This workstream holds several repositories (${several.join(', ')}), so PR #${pr} could be in any of them. Paste the PR's URL or type owner/repo#${pr}.` };
   }
   if (ws.repo) return { url: prUrlFor(ws.repo, pr), repo: ws.repo, mismatch: null };
   if (ws.known) {

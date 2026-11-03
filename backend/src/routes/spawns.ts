@@ -30,6 +30,7 @@ import {
   SPAWN_FLAG,
   buildBrief,
   chooseSpawnProvider,
+  nameFromBranch,
   parseReport,
   parseSpawnRequest,
   slugFromTask,
@@ -88,7 +89,8 @@ export async function resolveCaller(user: Express.User, session: string, callerI
     include: { workstreams: { where: { name: resolved.workstream }, include: { workflows: true } } },
   });
   if (!project) return notYours;
-  const role = ROLES.find(r => tmux.sessionName(user.unixUsername, project.name, r, resolved.workstream!) === session) ?? null;
+  const role = ROLES.find(r => tmux.sessionName(user.unixUsername, project.name, r, resolved.workstream!) === session)
+    ?? (tmux.reviewSlotOf(session, user.unixUsername, project.name, resolved.workstream) !== null ? 'review' : null);
   const agentWorkflow = project.workstreams[0]?.workflows.find(w => w.type === 'agent');
   return {
     ok: true,
@@ -325,7 +327,7 @@ async function spawnWorkstream(
   if (!projectId) return { status: 400, body: { error: 'projectId required when the call names no session of yours (from.session)', code: 'invalid' } };
   const project = await prisma.project.findFirst({
     where: { id: projectId, userId: user.id, archived: false },
-    include: { workstreams: { select: { name: true } }, instance: { select: { hostHome: true, status: true } } },
+    include: { workstreams: { select: { name: true, branch: true } }, instance: { select: { hostHome: true, status: true } } },
   });
   if (!project) return { status: 404, body: { error: 'Project not found', code: 'not_found' } };
   if (!project.instanceId) return { status: 400, body: { error: 'Spawning needs a box project', code: 'invalid' } };
@@ -335,17 +337,22 @@ async function spawnWorkstream(
   if (parked) return { status: 409, body: { error: parked, code: 'parked' } };
   const host = { userId: user.id, instanceId: project.instanceId };
   if (!isProjectAgentConnected(host)) return { status: 503, body: { error: 'Box agent is not connected', code: 'box_offline' } };
+  const name = req.name ?? uniqueName((req.branch && nameFromBranch(req.branch)) || slugFromTask(req.task), project.workstreams.map(w => w.name));
+  const branch = req.branch ?? name;
+  // `git worktree add -b` refuses a branch another worktree holds, and that is after the brief is written.
+  if (project.workstreams.some(w => w.branch === branch)) {
+    return { status: 409, body: { error: `branch ${branch} is already a workstream's in this project; pick another branch`, code: 'branch_taken' } };
+  }
   const admitted = await admit(user, caller, lineage, project.instanceId, 'workstream');
   if (!admitted.ok) return admitted.result;
 
-  const name = req.name ?? uniqueName(slugFromTask(req.task), project.workstreams.map(w => w.name));
   // The caller's HEAD is a commit in this repository only when it works in this project.
   const baseRef = req.baseRef ?? (caller?.projectId === project.id ? req.from?.head : undefined) ?? null;
   const child: ChildPlan = {
     projectId: project.id,
     projectName: project.name,
     workstream: name,
-    branch: name,
+    branch,
     baseRef,
     instanceId: project.instanceId,
     home: resolveProjectRoot({ ownerUnixUser: user.unixUsername, hostHome: project.instance?.hostHome }),
@@ -354,7 +361,7 @@ async function spawnWorkstream(
   const row = await recordAndWriteBrief(user, req, caller, lineage, provider, child);
   if (!row.ok) return row.result;
 
-  const result = await createWorkstreamFor(user, project.id, { name, baseRef: baseRef ?? undefined, provider, spawnId: row.value.id })
+  const result = await createWorkstreamFor(user, project.id, { name, branch, baseRef: baseRef ?? undefined, provider, spawnId: row.value.id })
     .catch((err: Error): RouteResult => ({ status: 500, body: { error: err.message } }));
   if (result.status !== 201) {
     await failSpawn(row.value.id, user.id, errorOf(result), result.status);

@@ -243,6 +243,9 @@ describe('resumeChatInPane', () => {
 describe('terminalAnswer', () => {
   it('maps a running turn to 409 and a resume or a skip to 200', () => {
     expect(terminalAnswer({ status: 'turn-running' })).toMatchObject({ status: 409, body: { code: 'turn-running' } });
+    // The terminal-first UI is called Lab in what people read.
+    expect(terminalAnswer({ status: 'turn-running' }).body).toMatchObject({ error: 'Claude is answering in the chat; open it in Lab when the turn ends' });
+    expect(TERMINAL_HOLDS_ANSWER.body.error).toBe('Claude is open in Lab. Return it to this chat, or continue there.');
     expect(terminalAnswer({ status: 'skipped', reason: 'pane-busy', sessionId: SESSION })).toEqual({
       status: 200, body: { resumed: false, reason: 'pane-busy', sessionId: SESSION },
     });

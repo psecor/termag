@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAgentHello, parseHostSample } from './agentHello';
+import { MAX_CAPABILITIES, parseAgentHello, parseHostSample } from './agentHello';
 
 const SHA = 'a3f1c2d4e5b6a7c8d9e0f1a2b3c4d5e6f7a8b9c0';
 
@@ -162,21 +162,54 @@ describe('parseAgentHello', () => {
       type: 'hello', unixUser: 'psecor', home: '/home/psecor', capabilities: 'credentials-v1',
     })?.capabilities).toEqual([]);
   });
+
+  it('keeps every capability a fully set-up box sends, the browser pane ones last', () => {
+    // A box's hello as of October 2026 (agent/agent.js sendHello). Under the
+    // old cap of 32 the last three were dropped, and the orchestrator refused
+    // preview-share guests on a box whose agent could host them.
+    const box = [
+      'credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1',
+      'mcp-broker-v1', 'fireworks-v1', 'tmux-create-command-v1', 'box-update-v1', 'ask-v1', 'ask-cancel-v1', 'ask-chat-v1',
+      'host-sample-v1', 'unsaved-work-v1', 'software-inventory-v1', 'briefing-v1', 'chat-runner-v1', 'chat-durable-v1',
+      'chat-trust-v1', 'chat-auto-v1', 'chat-live-v1', 'chat-interrupt-v1', 'chat-orchestrator-v1', 'chat-backend-v1',
+      'chat-images-v1', 'claude-login-v1', 'worktree-pr-v1', 'worktree-fetch-v1', 'read-image-v1', 'claude-trust-folder-v1',
+      'browser-pane-v1', 'browser-pane-guest-v1', 'browser-pane-profiles-v1', 'claude-runner-wrapper-v2',
+    ];
+    expect(parseAgentHello({ type: 'hello', unixUser: 'psecor', home: '/home/psecor', capabilities: box })?.capabilities).toEqual(box);
+  });
+
+  it(`keeps at most ${MAX_CAPABILITIES} capabilities`, () => {
+    const many = Array.from({ length: MAX_CAPABILITIES + 5 }, (_, i) => `cap-${i}-v1`);
+    expect(parseAgentHello({ type: 'hello', unixUser: 'psecor', home: '/home/psecor', capabilities: many })?.capabilities)
+      .toEqual(many.slice(0, MAX_CAPABILITIES));
+  });
 });
 
 describe('parseHostSample', () => {
   it('keeps whole percentages, a finite load and a count; anything else is null, an absent object is null', () => {
-    expect(parseHostSample({ diskUsedPct: 93, memUsedPct: 14, load1: 11.764, keptCheckouts: 2 })).toEqual({ diskUsedPct: 93, memUsedPct: 14, load1: 11.76, keptCheckouts: 2, cores: null, memTotalMb: null });
+    expect(parseHostSample({ diskUsedPct: 93, memUsedPct: 14, load1: 11.764, keptCheckouts: 2 })).toEqual({ diskUsedPct: 93, memUsedPct: 14, load1: 11.76, keptCheckouts: 2, cores: null, memTotalMb: null, sshSessions: null, openTunnels: null });
+    expect(parseHostSample({ sshSessions: 2 })).toMatchObject({ sshSessions: 2 });
+    expect(parseHostSample({ sshSessions: 0 })).toMatchObject({ sshSessions: 0 });
+    expect(parseHostSample({ sshSessions: -1 })).toMatchObject({ sshSessions: null });
     expect(parseHostSample({ cores: 2, memTotalMb: 3793 })).toMatchObject({ cores: 2, memTotalMb: 3793 });
     expect(parseHostSample({ cores: 0, memTotalMb: -5 })).toMatchObject({ cores: null, memTotalMb: null });
-    expect(parseHostSample({ diskUsedPct: 101, memUsedPct: -1, load1: 'high', keptCheckouts: 1.5 })).toEqual({ diskUsedPct: null, memUsedPct: null, load1: null, keptCheckouts: null, cores: null, memTotalMb: null });
+    expect(parseHostSample({ diskUsedPct: 101, memUsedPct: -1, load1: 'high', keptCheckouts: 1.5 })).toEqual({ diskUsedPct: null, memUsedPct: null, load1: null, keptCheckouts: null, cores: null, memTotalMb: null, sshSessions: null, openTunnels: null });
     expect(parseHostSample(undefined)).toBeNull();
     expect(parseHostSample('93%')).toBeNull();
+  });
+  it('keeps the open port forwards and leaves out the t3 relays: the desktop holds one while connected (docs/port-forward.md)', () => {
+    expect(parseHostSample({ tunnels: { t3: 1, port: 3 } })).toMatchObject({ openTunnels: 3 });
+    expect(parseHostSample({ tunnels: { t3: 0, port: 0 } })).toMatchObject({ openTunnels: 0 });
+    expect(parseHostSample({ tunnels: { port: 2 } })).toMatchObject({ openTunnels: 2 });
+    expect(parseHostSample({ tunnels: { t3: 2, port: 0 } })).toMatchObject({ openTunnels: 0 });
+    for (const tunnels of [undefined, null, 5, [1, 2], {}, { t3: 'x', port: 1.5 }, { t3: 2 }, { t3: 2, port: -1 }]) {
+      expect(parseHostSample({ tunnels }), JSON.stringify(tunnels)).toMatchObject({ openTunnels: null });
+    }
   });
   it('rides on the hello, and an older agent without it parses as before', () => {
     const base = { type: 'hello', unixUser: 'ada', home: '/home/ada' };
     expect(parseAgentHello(base)?.host).toBeNull();
-    expect(parseAgentHello({ ...base, host: { diskUsedPct: 50, memUsedPct: 20, load1: 1, keptCheckouts: 0 } })?.host).toEqual({ diskUsedPct: 50, memUsedPct: 20, load1: 1, keptCheckouts: 0, cores: null, memTotalMb: null });
+    expect(parseAgentHello({ ...base, host: { diskUsedPct: 50, memUsedPct: 20, load1: 1, keptCheckouts: 0 } })?.host).toEqual({ diskUsedPct: 50, memUsedPct: 20, load1: 1, keptCheckouts: 0, cores: null, memTotalMb: null, sshSessions: null, openTunnels: null });
   });
 });
 

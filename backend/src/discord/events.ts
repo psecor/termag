@@ -4,7 +4,8 @@
  * Handles /t slash command and emoji reactions for terminal control.
  */
 
-import { Client, ChatInputCommandInteraction, Message } from 'discord.js';
+import { Client, ChatInputCommandInteraction, Message, type ClientEvents } from 'discord.js';
+import { tracedDiscordListener } from '../services/tracing/botSpans';
 import { prisma } from '../db';
 import { resolveDiscordUser } from './userMapping';
 import { formatPaneForDiscord } from './formatting';
@@ -121,9 +122,14 @@ async function pollUntilStable(
   }
 }
 
+/** A listener with each call in a root span `termag.discord.<event>`, ids only (services/tracing/botSpans.ts). */
+function onTraced<K extends keyof ClientEvents>(client: Client, event: K, listener: (...args: ClientEvents[K]) => Promise<void>): void {
+  client.on(event, tracedDiscordListener(event, listener));
+}
+
 export function registerDiscordEvents(client: Client): void {
   // Slash command handler
-  client.on('interactionCreate', async (interaction) => {
+  onTraced(client, 'interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand() || interaction.commandName !== 't') return;
 
     const discordUserId = interaction.user.id;
@@ -410,7 +416,7 @@ export function registerDiscordEvents(client: Client): void {
   });
 
   // Emoji reaction handler
-  client.on('messageReactionAdd', async (reaction, user) => {
+  onTraced(client, 'messageReactionAdd', async (reaction, user) => {
     if (user.bot) return;
 
     // Hydrate partials

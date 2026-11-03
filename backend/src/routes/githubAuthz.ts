@@ -2,7 +2,7 @@ import type { Request, Router } from 'express';
 import type { CallerProofConfig } from '../services/callerIdentity';
 import { githubTokenSource } from '../services/credentialStore';
 import { decideGithubRequest } from '../services/githubAuthz';
-import { boxForToken, gatewayCheckRouter } from './gatewayCheck';
+import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
 
 // Envoy sends a body only for the checks that read one, and caps it lower.
 const MAX_BODY = 8 * 1024 * 1024;
@@ -38,7 +38,7 @@ export function githubAuthzRouter(cfg: CallerProofConfig): Router {
     const body = req.method === 'GET' || req.method === 'HEAD' ? '' : await readBody(req);
     return decideGithubRequest(
       { method: req.method, path, search, authorization: req.headers.authorization, body },
-      { boxForToken, ownerToken: githubTokenSource },
+      { boxForToken: boxForTokenAt('githubBroker'), ownerToken: githubTokenSource },
     );
   }, quiet);
 }

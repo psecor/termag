@@ -103,14 +103,19 @@ export function loginTargetError(target: {
   return null;
 }
 
-/** An agent error as the route's answer. The agent's text is not forwarded. */
-export function loginRpcFailure(message: string): { status: number; body: { error: string; code: string } } {
+/**
+ * An agent error as the route's answer. The agent's text is not forwarded.
+ * A failed status read is the agent not answering, not a failed sign-in.
+ */
+export function loginRpcFailure(message: string, op: 'status' | 'action' = 'action'): { status: number; body: { error: string; code: string } } {
   if (/Unknown command/.test(message)) {
     return { status: 409, body: { error: "This box's termag needs an update before it can sign in to Claude here.", code: 'login-missing' } };
   }
   if (/^Agent request timed out: claude-login-/.test(message)) {
+    if (op === 'status') return { status: 504, body: { error: "The box's agent did not answer in time.", code: 'timeout' } };
     return { status: 504, body: { error: 'Claude sign-in took too long. Try again.', code: 'timeout' } };
   }
+  if (op === 'status') return { status: 502, body: { error: "The box's agent could not read Claude's sign-in status.", code: 'status-failed' } };
   return { status: 502, body: { error: 'Claude sign-in failed. Try again.', code: 'login-failed' } };
 }
 

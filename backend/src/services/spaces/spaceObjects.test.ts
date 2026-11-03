@@ -27,6 +27,29 @@ describe('presignPut', () => {
     expect(put.headers['x-amz-server-side-encryption-aws-kms-key-id']).toBe('arn:aws:kms:us-east-2:123456789012:alias/termag-spaces');
   });
 
+  it('signs a conditional write\'s If-Match or If-None-Match, so the client cannot drop it', async () => {
+    const edit = await objects().presignPut('sp/.termag/memory/a.md', 12, 'text/markdown', { ifMatch: '"abc123"' });
+    expect(new URL(edit.url).searchParams.get('X-Amz-SignedHeaders')!.split(';')).toContain('if-match');
+    expect(edit.headers['if-match']).toBe('"abc123"');
+    expect(edit.headers['if-none-match']).toBeUndefined();
+    const add = await objects().presignPut('sp/.termag/memory/b.md', 12, 'text/markdown', { ifNoneMatch: '*' });
+    expect(new URL(add.url).searchParams.get('X-Amz-SignedHeaders')!.split(';')).toContain('if-none-match');
+    expect(add.headers['if-none-match']).toBe('*');
+    const plain = await objects().presignPut('sp/a.txt', 12, 'text/plain');
+    expect(new URL(plain.url).searchParams.get('X-Amz-SignedHeaders')!.split(';')).not.toContain('if-match');
+  });
+
+  it('returns only headers it signed, so S3 takes a conditional write with its proof (no 403 "headers not signed")', async () => {
+    const put = await objects().presignPut('sp/status.md', 12, 'text/markdown', { ifMatch: '"abc123"' }, 'proof123');
+    const url = new URL(put.url);
+    const signed = url.searchParams.get('X-Amz-SignedHeaders')!.split(';');
+    // S3 refuses any x-amz-* header sent but not signed; the CLI and the browser send `headers` verbatim.
+    expect(Object.keys(put.headers).filter(h => !signed.includes(h))).toEqual([]);
+    // The proof is signed in the query instead, and S3 stores it on the version as metadata all the same.
+    expect(url.searchParams.get('x-amz-meta-termag-upload')).toBe('proof123');
+    expect(put.headers['x-amz-meta-termag-upload']).toBeUndefined();
+  });
+
   it('signs no checksum of the (empty) presign body', async () => {
     const put = await objects().presignPut('sp/a.txt', 12, 'text/plain');
     expect([...new URL(put.url).searchParams.keys()].filter(k => k.toLowerCase().includes('checksum'))).toEqual([]);

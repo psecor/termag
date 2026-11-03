@@ -20,6 +20,12 @@ describe('matchSession', () => {
       .toEqual({ projectId: 'p1', workstream: 'main', instanceId: null });
   });
 
+  it('matches every review slot, and no slot past the last (docs/parallel-reviews.md)', () => {
+    const projects = [proj({ id: 'p1', name: 'termag', workstreams: [{ name: 'main' }, { name: 'feature' }] })];
+    expect(matchSession('alice-termag-review-3', owner, projects)).toEqual({ projectId: 'p1', workstream: 'main', instanceId: null });
+    expect(matchSession('alice-termag-feature-review-8', owner, projects)).toEqual({ projectId: 'p1', workstream: 'feature', instanceId: null });
+    expect(matchSession('alice-termag-review-9', owner, projects)).toBeNull();
+  });
   it('matches a non-main workstream and a non-agent role', () => {
     const projects = [proj({ id: 'p1', name: 'termag', workstreams: [{ name: 'main' }, { name: 'feature' }] })];
     expect(matchSession('alice-termag-feature-ctrl', owner, projects))

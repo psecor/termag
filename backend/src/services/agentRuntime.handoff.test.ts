@@ -55,6 +55,8 @@ const { claimHandoffLaunch, releaseHandoffLaunch } = await import('./agentHandof
 const launch = { userId: 'u1', unixUsername: 'alice', projectName: 'research', provider: 'claude', instanceId: 'box1', workstream: 'main', hostHome: '/home/alice' };
 const typed = () => state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys);
 const handoff = { id: 'ck1', command: 'claude "$(cat "$HOME/.termag/handoffs/ck1.md")"' };
+// What a pane types ahead of every agent's command (services/launchCommand.ts PANE_KIND_ENV).
+const K = 'TERMAG_SESSION_KIND=interactive ';
 
 beforeEach(() => {
   state.sent = [];
@@ -68,14 +70,14 @@ describe('ensureAgentSessionsAndLaunch', () => {
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);
     await ensureAgentSessionsAndLaunch(launch);
     expect(claimHandoffLaunch).toHaveBeenCalledWith({ userId: 'u1', projectId: 'p1', workstream: 'main', provider: 'claude' });
-    expect(typed()).toEqual([handoff.command]);
+    expect(typed()).toEqual([`${K}${handoff.command}`]);
   });
 
   it('leaves the handoff alone when a spawn brief claims the launch first', async () => {
     vi.mocked(claimSpawnLaunch).mockResolvedValueOnce({ id: 'sp1', command: 'claude "$(cat brief)"' });
     await ensureAgentSessionsAndLaunch(launch);
     expect(claimHandoffLaunch).not.toHaveBeenCalled();
-    expect(typed()).toEqual(['claude "$(cat brief)"']);
+    expect(typed()).toEqual([`${K}claude "$(cat brief)"`]);
   });
 
   it('starts on the user\'s first prompt from its file, after a spawn brief or a handoff', async () => {
@@ -83,13 +85,13 @@ describe('ensureAgentSessionsAndLaunch', () => {
     expect(state.sent.find(s => s.type === 'write-file')?.payload).toEqual({
       path: '/home/alice/.termag/first-prompts/alice-research-termag-pr1-agent.md', content: 'Describe termag#1.\n', mode: 0o600,
     });
-    expect(typed()).toEqual(['claude "$(cat "$HOME/.termag/first-prompts/alice-research-termag-pr1-agent.md")"']);
+    expect(typed()).toEqual([`${K}claude "$(cat "$HOME/.termag/first-prompts/alice-research-termag-pr1-agent.md")"`]);
     state.sent = [];
     state.foreground = 'zsh';
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);
     await ensureAgentSessionsAndLaunch({ ...launch, firstPrompt: 'Describe termag#1.' });
     expect(state.sent.some(s => s.type === 'write-file')).toBe(false);
-    expect(typed()).toEqual([handoff.command]);
+    expect(typed()).toEqual([`${K}${handoff.command}`]);
   });
 
   it('types nothing when another launch is starting the handoff in this pane', async () => {
@@ -128,7 +130,7 @@ describe('ensureAgentSessionsAndLaunch: the workstream\'s model backend', () => 
     await ensureAgentSessionsAndLaunch(launch);
     expect(prisma.workflow.findFirst).toHaveBeenCalledWith({ where: { projectId: 'p1', type: 'agent', workstream: { name: 'main' } }, select: { backend: true, model: true } });
     // No model picked: the flag's default, and Claude Code's window is the smaller of it and the fast model.
-    expect(typed()).toEqual([`termag_settings=$(TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials launch-settings --backend fireworks --model ${KIMI} --fast ${DS} --context 512000 -) && claude --settings "$termag_settings"`]);
+    expect(typed()).toEqual([`termag_settings=$(${K}TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials launch-settings --backend fireworks --model ${KIMI} --fast ${DS} --context 512000 -) && ${K}claude --settings "$termag_settings"`]);
 
     state.sent = [];
     state.foreground = 'zsh';
@@ -143,12 +145,12 @@ describe('ensureAgentSessionsAndLaunch: the workstream\'s model backend', () => 
     vi.mocked(instanceAgentTransport).mockReturnValue({ conn: {}, capabilities: ['fireworks-v1'], agentCommit: null, agentCommitAt: null, helloReceived: true } as never);
     await ensureAgentSessionsAndLaunch({ ...launch, backend: null });
     expect(prisma.workflow.findFirst).not.toHaveBeenCalled();
-    expect(typed()).toEqual(['claude']);
+    expect(typed()).toEqual([`${K}claude`]);
     state.sent = [];
     state.foreground = 'zsh';
     prisma.workflow.findFirst.mockResolvedValueOnce({ backend: 'fireworks' });
     await ensureAgentSessionsAndLaunch({ ...launch, provider: 'cursor' });
-    expect(typed()).toEqual(['cursor-agent']);
+    expect(typed()).toEqual([`${K}cursor-agent`]);
   });
 });
 
@@ -156,12 +158,12 @@ describe('ensureAgentSessionsAndLaunch: the workstream\'s model', () => {
   it('starts on the model its agent row names, and drops one the provider and backend do not offer', async () => {
     prisma.workflow.findFirst.mockResolvedValueOnce({ backend: null, model: 'sonnet' });
     await ensureAgentSessionsAndLaunch(launch);
-    expect(typed()).toEqual(['claude --model sonnet']);
+    expect(typed()).toEqual([`${K}claude --model sonnet`]);
     state.sent = [];
     state.foreground = 'zsh';
     prisma.workflow.findFirst.mockResolvedValueOnce({ backend: null, model: 'accounts/fireworks/models/kimi-k3' });
     await ensureAgentSessionsAndLaunch(launch);
-    expect(typed()).toEqual(['claude']);
+    expect(typed()).toEqual([`${K}claude`]);
   });
 });
 
@@ -169,7 +171,7 @@ describe('one launch at a time per pane', () => {
   it('a reconnect racing a handoff relaunch types once: the second sees the agent the first started', async () => {
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);
     await Promise.all([ensureAgentSessionsAndLaunch(launch), reconstructInstanceSessions('box1', 'u1', 'alice')]);
-    expect(typed()).toEqual([handoff.command]);
+    expect(typed()).toEqual([`${K}${handoff.command}`]);
   });
 
   it('runs one holder at a time per key, others in parallel, and survives a throwing holder', async () => {
@@ -191,7 +193,7 @@ describe('reconnect reconstruction', () => {
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);
     await reconstructInstanceSessions('box1', 'u1', 'alice');
     expect(claimHandoffLaunch).toHaveBeenCalledWith({ userId: 'u1', projectId: 'p1', workstream: 'main', provider: 'claude' });
-    expect(typed()).toEqual([handoff.command]);
+    expect(typed()).toEqual([`${K}${handoff.command}`]);
   });
 
   it('never types the resume command over a handoff launch another path just made', async () => {
@@ -202,7 +204,7 @@ describe('reconnect reconstruction', () => {
 
   it('resumes as before when there is no handoff, and releases one whose launch fails', async () => {
     await reconstructInstanceSessions('box1', 'u1', 'alice');
-    expect(typed()).toEqual(['claude --continue']);
+    expect(typed()).toEqual([`${K}claude --continue`]);
     state.sent = [];
     state.foreground = 'zsh'; // the resumed agent exited again
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);

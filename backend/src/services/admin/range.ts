@@ -4,10 +4,14 @@
  * `range` is `today | 7d | 30d` (the dashboard's picker) or an explicit
  * `from`/`to` pair of YYYY-MM-DD keys (inclusive). Day keys are UTC, matching
  * token_usage_days / project_visits / warp_samples. work_time_entries dates
- * are server-local: for a range that reaches today, `worktimeKeys` adds the
- * server-local today key when it differs from the UTC one (the dashboard's
- * `todayDates()` straddle), and nothing else — so totals cover the labelled
- * range, not N+1 days. On a UTC orchestrator the two key sets are identical.
+ * are each person's own day (docs/agents/gotchas.md, worktime-day-is-the-persons),
+ * else server-local: for a range that reaches today, `worktimeKeys` adds the
+ * server-local today key when it differs from the UTC one, and nothing else
+ * — so totals cover the labelled range, not N+1 days. On a UTC orchestrator
+ * the two key sets are identical. Since a person's day is their own, a
+ * range's edge days shift by their offset: a New York evening (UTC's next
+ * day) counts on the day before in admin's UTC days. Widening the keys would
+ * count everyone's whole day beyond the range instead, so they stay as is.
  */
 export type RangeId = 'today' | '7d' | '30d';
 

@@ -40,9 +40,16 @@ export interface SpaceEventInput {
   action: string;
   path?: string | null;
   bytes?: bigint | number | null;
+  /** A file.put's S3 version. */
+  versionId?: string | null;
+  /** The writer's reason (spaceMemory.ts noteOf). */
+  note?: string | null;
 }
 
 export interface SpaceEventRecord extends SpaceEventInput { id: string; at: Date }
+
+/** A file shared read-only with anyone signed in to termag; `sharedBy` is null once that user is gone. */
+export interface FileShareRecord { spaceId: string; path: string; sharedById: string; createdAt: Date; sharedBy: SpaceUser | null }
 
 export class SpaceNameTakenError extends Error {
   readonly code = 'name_taken';
@@ -67,7 +74,8 @@ export interface SpaceStore {
   /** Turns pending invites for this user's email into memberships; returns how many. */
   claimInvites(userId: string): Promise<number>;
 
-  spacesOfUser(userId: string): Promise<Array<{ space: SpaceRecord; role: SpaceRole }>>;
+  /** The user's spaces, each with its member count (invites not included). */
+  spacesOfUser(userId: string): Promise<Array<{ space: SpaceRecord; role: SpaceRole; memberCount: number }>>;
   /** Spaces with an explicit grant to any of these boxes. */
   spacesGrantedTo(instanceIds: string[]): Promise<Array<{ space: SpaceRecord; instanceId: string }>>;
   findSpace(idOrName: string): Promise<SpaceRecord | null>;
@@ -90,15 +98,32 @@ export interface SpaceStore {
   setMemberRole(spaceId: string, userId: string, role: SpaceRole): Promise<void>;
   /**
    * Deletes the membership and, in the same transaction, that user's box
-   * grants in the space. Throws LastOwnerError, changing nothing, when no
-   * owner would remain.
+   * grants in the space and their projects' listings in it. Throws
+   * LastOwnerError, changing nothing, when no owner would remain.
    */
   removeMember(spaceId: string, userId: string): Promise<{ removedBoxes: number }>;
   removeInvite(spaceId: string, inviteId: string): Promise<boolean>;
 
   grants(spaceId: string): Promise<SpaceGrantRecord[]>;
+  /** Also lists the box's projects, and its descendants', in the space. */
   addGrant(spaceId: string, instanceId: string, addedById: string): Promise<void>;
+  /**
+   * Also unlists the box's projects and its live descendants' from the
+   * space, keeping those another grant still reaches it through. A terminated
+   * descendant keeps its listing: nothing re-records it once its own grants
+   * are pruned.
+   */
   removeGrant(spaceId: string, instanceId: string): Promise<boolean>;
+
+  /**
+   * Lists every project in each live space its box reaches, by a grant on the
+   * box or one inherited from an ancestor (spaceInheritance.ts), terminated
+   * boxes included while their grants last. Only adds; returns how many it
+   * added. `spaceId` limits it to one space.
+   */
+  recordListings(spaceId?: string): Promise<number>;
+  /** Boxes, in any state, with a project listed in the space. */
+  listedBoxes(spaceId: string): Promise<string[]>;
 
   /**
    * Adds `bytes` to usedBytes in one conditional write, only if the total stays
@@ -108,10 +133,27 @@ export interface SpaceStore {
    * recount in between keeps it.
    */
   chargeBytes(spaceId: string, bytes: bigint, liveUntil: Date, ref: ChargeRef | null): Promise<boolean>;
+
+  // Shared files (routes/spaces.ts files/share, routes/spaceFiles.ts).
+  fileShare(spaceId: string, path: string): Promise<FileShareRecord | null>;
+  /** The paths of the space's shared files. */
+  sharedPaths(spaceId: string): Promise<Set<string>>;
+  /** Shares `path`, or leaves an existing share (and who made it) as it is. */
+  addFileShare(spaceId: string, path: string, sharedById: string): Promise<FileShareRecord>;
+  /** Unshares `path`, or with `prefix` every file under that folder; returns how many. */
+  removeFileShares(spaceId: string, target: { path: string } | { prefix: string }): Promise<number>;
+
   recordEvent(event: SpaceEventInput): Promise<void>;
   events(spaceId: string, opts: { limit: number; before?: Date | null }): Promise<SpaceEventRecord[]>;
+  /**
+   * File events touching `.termag/` (spaceMemory.ts MEMORY_ACTIONS whose path
+   * names it), newest first, at or after `since`.
+   */
+  memoryEvents(spaceId: string, opts: { since: Date; limit: number }): Promise<SpaceEventRecord[]>;
   /** When the newest `file.put` event for this path was recorded, if any. */
   lastPutAt(spaceId: string, path: string): Promise<Date | null>;
+  /** The newest write of this path (file.put or file.put.signed), for a conflict's "by <who> at <when>". */
+  lastWrite(spaceId: string, path: string): Promise<SpaceEventRecord | null>;
 
   // The hourly sweep (spaceSweeper.ts).
   deletedSpaces(): Promise<SpaceRecord[]>;
@@ -125,6 +167,8 @@ export interface SpaceStore {
   recountUsedBytes(spaceId: string, stored: bigint, now: Date, settled: string[]): Promise<void>;
   pruneCharges(before: Date): Promise<number>;
   deleteSpaceRow(spaceId: string): Promise<void>;
+  /** Events before `before`, except `.termag/` ones (spaceMemory.ts memoryPathWhere), which are kept indefinitely. */
   pruneEvents(before: Date): Promise<number>;
+  /** Run after recordListings, so a terminated box's projects stay listed. */
   pruneTerminatedGrants(): Promise<number>;
 }

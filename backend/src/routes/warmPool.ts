@@ -10,7 +10,7 @@ import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
-import { warmPoolTargetSize } from '../services/warmPoolSize';
+import { warmPoolTargets } from '../services/warmPoolSizes';
 import { lastWarmPoolTick } from '../services/warmPool';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -34,7 +34,8 @@ export function warmPoolRouter(): Router {
           // A bare `not` misses a null column, measured against Postgres, and
           // a row with no hash at all launched before the pool tracked one,
           // which is exactly what stale means.
-          OR: [{ poolSpecHash: null }, { poolSpecHash: { not: tick.specHash } }],
+          // Each size the pool holds has its own current hash.
+          OR: [{ poolSpecHash: null }, { poolSpecHash: { notIn: tick.specHashes } }],
         },
       }),
       prisma.instance.count({
@@ -42,14 +43,22 @@ export function warmPoolRouter(): Router {
       }),
     ]);
 
+    // What the reconciler holds: the per-size counts' sum when
+    // box-warm-pool-sizes serves an object (box-warm-pool-size is not read
+    // then), else box-warm-pool-size for the single-size pool.
+    const targets = await warmPoolTargets();
+
     res.json({
-      target: await warmPoolTargetSize(),
+      target: targets.reduce((sum, t) => sum + t.target, 0),
+      targets,
       warm,
       warming,
       staleWarm,
       failedLastHour,
       breakerOpen: tick?.breakerOpen ?? false,
-      specHash: tick?.specHash ?? null,
+      // The first size's hash, kept for older readers; specHashes has them all.
+      specHash: tick?.specHashes[0] ?? null,
+      specHashes: tick?.specHashes ?? [],
     });
   };
 

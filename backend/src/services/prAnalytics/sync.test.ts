@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { syncRepo, searchSync, pauseBelow, SEARCH_CAP, type PrNode, type Page, type SearchNode, type SearchPage, type SyncState } from './sync';
+import { syncRepo, searchSync, pauseBelow, prCommitShas, SEARCH_CAP, type PrNode, type Page, type SearchNode, type SearchPage, type SyncState } from './sync';
 
 const node = (n: number, updatedAt: string): PrNode => ({
   id: `pr${n}`, number: n, state: 'MERGED', isDraft: false, createdAt: updatedAt, updatedAt, mergedAt: updatedAt, closedAt: updatedAt,
@@ -169,5 +169,13 @@ describe('searchSync', () => {
     const r = await searchSync(10, { fetchPage: a => search.fetchPage(a), write: s.write, include, shouldPause: () => false });
     expect(r).toEqual({ pages: 1, written: 0, paused: false, complete: false, overCap: true, cursor: null });
     expect(s.seen).toEqual([]);
+  });
+});
+
+describe('prCommitShas', () => {
+  it('lowercases the head and merge commits, and stores null where there is none', () => {
+    expect(prCommitShas({ headRefOid: 'ABC123', mergeCommit: { oid: 'DEF456' } })).toEqual({ headSha: 'abc123', mergeSha: 'def456' });
+    expect(prCommitShas({ headRefOid: 'abc123', mergeCommit: null })).toEqual({ headSha: 'abc123', mergeSha: null });
+    expect(prCommitShas({})).toEqual({ headSha: null, mergeSha: null });
   });
 });

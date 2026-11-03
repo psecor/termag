@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createRepoCache } from './githubRepoCache';
 import type { RepoEntry, RepoList } from './githubRepos';
 
-const TOKEN = 'gho_SENTINELsentinelSENTINEL0123456789';
+const TOKEN = 'gho_SENTINELsentinelSENTINEL0123456789'; // gitleaks:allow (test sentinel)
 const PAT = 'github_pat_11AAAAAAA0123456789abcdef';
 const NOW = 1_700_000_000_000;
 const PLUS_60 = '2023-11-14T22:14:20.000Z';

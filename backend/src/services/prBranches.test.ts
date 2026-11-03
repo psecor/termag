@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../db', () => ({ prisma: {} }));
 vi.mock('./agentRegistry', () => ({ isProjectAgentConnected: vi.fn(), sendForProject: vi.fn() }));
 
-import { repoFromOrigin, sweepBranches, toBranchState, type WorkstreamTarget } from './prBranches';
+import { repoFromOrigin, sweepBranches, toBranchState, workstreamTargetsOf, type WorkstreamTarget } from './prBranches';
 
 const target = (over: Partial<WorkstreamTarget> = {}): WorkstreamTarget => ({
   host: { userId: 'u1', instanceId: 'i1' }, cwd: '/home/me/projects/termag/.worktrees/feat',
@@ -84,5 +84,53 @@ describe('sweepBranches', () => {
     expect(got.branches).toHaveLength(1);
     expect(got.workstreams).toHaveLength(2);
     expect(got).toMatchObject({ failed: 1, offline: 0, outdatedAgent: 0 });
+  });
+});
+
+describe('multi-repo workstreams (docs/multi-repo-projects.md)', () => {
+  const project = {
+    id: 'p1', name: 'acme', userId: 'u1', instanceId: 'i1', user: { unixUsername: 'me' }, instance: { hostHome: '/home/me' },
+    layout: 'workspace',
+    repos: [
+      { name: 'api', url: 'https://github.com/acme/api', position: 1 },
+      { name: 'web', url: 'git@github.com:acme/web.git', position: 0 },
+    ],
+  };
+
+  it('reads each repository\'s worktree, by position, knowing its repository', () => {
+    const got = workstreamTargetsOf(project, { name: 'feat', branch: 'feat' });
+    expect(got.map(t => [t.cwd.replace(/^.*\/acme\//, ''), t.repo])).toEqual([
+      ['.worktrees/feat/web', 'acme/web'],
+      ['.worktrees/feat/api', 'acme/api'],
+    ]);
+    expect(workstreamTargetsOf(project, { name: 'main', branch: 'main' }).map(t => t.cwd.replace(/^.*\/acme\//, ''))).toEqual(['web', 'api']);
+  });
+
+  it('a single-repository project is one target at its directory, as before', () => {
+    const got = workstreamTargetsOf({ ...project, layout: 'repo' }, { name: 'feat', branch: 'feat' });
+    expect(got).toHaveLength(1);
+    expect(got[0].cwd).toMatch(/acme\/\.worktrees\/feat$/);
+    expect(got[0].repo).toBeUndefined();
+  });
+
+  it('links each repository\'s branch on its own, and counts an offline workstream once', async () => {
+    const targets = workstreamTargetsOf(project, { name: 'feat', branch: 'feat' });
+    const send = vi.fn(async (_h: unknown, _t: string, p: Record<string, unknown>) => ({
+      branch: 'feat', upstream: 'origin/feat', ahead: 0, baseBranch: 'main', aheadOfBase: 1, dirty: false,
+      origin: String(p.cwd).endsWith('/web') ? 'git@github.com:acme/web.git' : 'https://github.com/acme/api.git',
+    }));
+    const got = await sweepBranches(targets, { connected: () => true, send });
+    expect(got.branches.map(b => b.repo).sort()).toEqual(['acme/api', 'acme/web']);
+    expect(got.workstreams.map(w => w.repo).sort()).toEqual(['acme/api', 'acme/web']);
+
+    const offline = await sweepBranches(targets, { connected: () => false, send });
+    expect(offline.offline).toBe(1);
+    // Still linkable per repository: a null repo on both would match neither (two on one branch).
+    expect(offline.workstreams.map(w => w.repo).sort()).toEqual(['acme/api', 'acme/web']);
+  });
+
+  it('an unreadable origin keeps the known repository', () => {
+    const [t] = workstreamTargetsOf(project, { name: 'feat', branch: 'feat' });
+    expect(toBranchState(t, { branch: 'feat', origin: null })?.repo).toBe('acme/web');
   });
 });

@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
-import { findSecrets, protectedArea, publishBundle, publishSummary, type PrOutcome, type PublishConfig, type PublishInput, type PublishOutcome } from './askPublish';
+import { MAX_COMMITS, findSecrets, protectedArea, publishBundle, publishSummary, type PrOutcome, type PublishConfig, type PublishInput, type PublishOutcome } from './askPublish';
 import { MAX_ASK_PRS, PR_DESCRIPTION_MAX, askPrBranch, prBody } from './agentMessages';
 
 describe('protectedArea', () => {
@@ -11,13 +11,19 @@ describe('protectedArea', () => {
     expect(protectedArea('.github/workflows/ci.yml')).toBe('.github/workflows');
     expect(protectedArea('docs/CODEOWNERS')).toBe('CODEOWNERS');
     expect(protectedArea('CODEOWNERS')).toBe('CODEOWNERS');
-    expect(protectedArea('deploy/termag-reconcile')).toBe('deploy/');
     expect(protectedArea('etc/sudoers.d/termag')).toBe('sudoers.d');
     expect(protectedArea('x/sudoers')).toBe('sudoers');
   });
 
+  it('protects sudoers files inside deploy/ by the sudoers rule', () => {
+    expect(protectedArea('deploy/claude-runner-orchestrator.sudoers')).toBe('sudoers');
+    expect(protectedArea('deploy/termag-guest-browser.sudoers')).toBe('sudoers');
+    expect(protectedArea('deploy/sudoers')).toBe('sudoers');
+    expect(protectedArea('deploy/sudoers.d/termag')).toBe('sudoers.d');
+  });
+
   it('leaves the rest alone', () => {
-    for (const p of ['src/deploy/x.ts', '.github/dependabot.yml', 'CODEOWNERS.md', 'README.md']) expect(protectedArea(p)).toBeNull();
+    for (const p of ['deploy/termag-reconcile', 'deploy/termag-status', 'deploy/claude-skills/agent-ask/SKILL.md', 'src/deploy/x.ts', 'deploy/sudoers.md', 'docs/sudoers-notes.md', '.github/dependabot.yml', 'CODEOWNERS.md', 'README.md']) expect(protectedArea(p)).toBeNull();
   });
 });
 
@@ -44,10 +50,13 @@ let work: string;
 let baseSha: string;
 let api: Array<{ method: string; url: string; body: unknown; auth: string | null }>;
 let prState = 'open';
+/** The base branch of PR #7 on the fake GitHub. */
+let prBase = 'main';
 let openPrs: Array<Record<string, unknown>>;
 /** PR bodies as the fake GitHub holds them, by number. */
 let bodies: Map<number, string>;
 let patchStatus = 200;
+let compareStatus = 200;
 let nextPr = 42;
 
 function sh(cwd: string, args: string[], env: Record<string, string> = {}): string {
@@ -55,6 +64,7 @@ function sh(cwd: string, args: string[], env: Record<string, string> = {}): stri
     cwd,
     env: { PATH: process.env.PATH, HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', ...env },
     encoding: 'utf8',
+    stdio: 'pipe',
   }).trim();
 }
 
@@ -84,10 +94,23 @@ const fakeFetch = (async (url: string | URL, init?: RequestInit) => {
   const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
   if (method === 'GET' && u.includes('/pulls?')) {
     const head = decodeURIComponent(/head=([^&]+)/.exec(u)?.[1] ?? '').replace(/^[^:]*:/, '');
-    return json(200, openPrs.filter(p => !p.head || p.head === head).map(p => ({ ...p, body: bodies.get(Number(p.number)) ?? null })));
+    return json(200, openPrs.filter(p => !p.head || p.head === head).map(p => ({ base: { ref: 'main' }, ...p, body: bodies.get(Number(p.number)) ?? null })));
   }
-  if (method === 'GET' && u.endsWith('/pulls/7')) return json(200, { number: 7, state: prState, html_url: 'https://github.com/org/repo/pull/7', body: bodies.get(7) ?? null });
+  if (method === 'GET' && u.endsWith('/pulls/7')) return json(200, { number: 7, state: prState, base: { ref: prBase }, html_url: 'https://github.com/org/repo/pull/7', body: bodies.get(7) ?? null });
   if (method === 'GET' && u.endsWith('/repos/org/repo')) return json(200, { default_branch: 'main' });
+  const cmp = /\/repos\/org\/repo\/compare\/([^/?]+)\.\.\.([0-9a-f]{40})\?/.exec(u);
+  if (method === 'GET' && cmp) {
+    if (compareStatus !== 200) return json(compareStatus, { message: 'Server Error' });
+    const [, branch, sha] = cmp;
+    try { sh(remote, ['cat-file', '-e', `${sha}^{commit}`]); } catch { return json(404, { message: 'Not Found' }); }
+    const tip = sh(remote, ['rev-parse', `refs/heads/${branch}`]);
+    let status = 'diverged';
+    if (sha === tip) status = 'identical';
+    else {
+      try { sh(remote, ['merge-base', '--is-ancestor', sha, tip]); status = 'behind'; } catch { /* not on it */ }
+    }
+    return json(200, { status });
+  }
   if (method === 'POST' && u.endsWith('/pulls')) {
     const n = nextPr++;
     bodies.set(n, String(body?.body));
@@ -123,6 +146,8 @@ const one = (o: PublishOutcome): PrOutcome | PublishOutcome => {
 };
 const pub = async (i: PublishInput) => one(await publishBundle(cfg(), i));
 const posted = () => api.find(c => c.method === 'POST')!.body as Record<string, string>;
+/** What was written to GitHub's API; looking up a branch's base branch only reads. */
+const writes = () => api.filter(c => c.method !== 'GET');
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'ask-publish-test-'));
@@ -139,7 +164,9 @@ beforeEach(() => {
   openPrs = [];
   bodies = new Map();
   prState = 'open';
+  prBase = 'main';
   patchStatus = 200;
+  compareStatus = 200;
   nextPr = 42;
 });
 
@@ -230,7 +257,7 @@ describe('publishBundle', () => {
     expect(bodies.get(7)).toBe(bodyFor('## Commits\n\n- one\n- two'));
     api = [];
     await pub(input({ prNumber: 7 }));
-    expect(api.map(c => c.method)).toEqual(['GET']);
+    expect(writes()).toEqual([]);
   });
 
   it("leaves a body without termag's markers alone, and still publishes when the update fails", async () => {
@@ -274,7 +301,18 @@ describe('publishBundle', () => {
   it('refuses protected paths', async () => {
     commit('.github/workflows/x.yml', 'on: push\n', 'ci');
     expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('.github/workflows') });
-    expect(api).toEqual([]);
+    expect(writes()).toEqual([]);
+  });
+
+  it('publishes a change to deploy/', async () => {
+    commit('deploy/termag-status', '#!/bin/sh\n', 'status');
+    expect(await pub(input())).toMatchObject({ kind: 'published', commits: 1 });
+  });
+
+  it('refuses a sudoers file inside deploy/', async () => {
+    commit('deploy/claude-runner-orchestrator.sudoers', 'Defaults !lecture\n', 'sudoers');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('sudoers') });
+    expect(writes()).toEqual([]);
   });
 
   it('refuses a protected path whose name git would quote, or that a later commit removes', async () => {
@@ -285,7 +323,7 @@ describe('publishBundle', () => {
     sh(work, ['rm', '-q', '.github/workflows/tab\there.yml']);
     sh(work, ['commit', '-q', '-m', 'remove'], as(ASKER));
     expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('.github/workflows') });
-    expect(api).toEqual([]);
+    expect(writes()).toEqual([]);
   });
 
   it('refuses commits by someone else', async () => {
@@ -335,7 +373,7 @@ describe('publishBundle', () => {
     expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('termag agent token') });
   });
 
-  it('refuses a merge commit, whose own changes a per-commit patch never shows', async () => {
+  it('refuses a merge of anything but the base branch, here a side branch whose merge adds a secret', async () => {
     commit('a.txt', '1\n', 'one');
     sh(work, ['checkout', '-q', '-b', 'side', baseSha]);
     commit('b.txt', '2\n', 'two');
@@ -344,9 +382,9 @@ describe('publishBundle', () => {
     writeFileSync(join(work, 'cfg.env'), `KEY=AKIA${'ABCDEFGHIJKLMNOP'}\n`);
     sh(work, ['add', 'cfg.env']);
     sh(work, ['commit', '-q', '-m', 'merge side'], as(ASKER));
-    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merge commit') });
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than main') });
     expect(sh(remote, ['branch', '--list', 'termag-alice/thread1'])).toBe('');
-    expect(api).toEqual([]);
+    expect(writes()).toEqual([]);
   });
 
   it("refuses a bundle with a branch that is neither the run's own nor pr/<name>", async () => {
@@ -461,6 +499,252 @@ describe('publishBundle with several branches', () => {
   it('refuses a bundle whose branch name is not a valid key', async () => {
     sh(work, ['branch', '-f', 'pr/Bad_Name', 'pr/docs']);
     expect(await publishBundle(cfg(), input({ bundle: bundleOf('ask', 'pr/Bad_Name') }))).toMatchObject({ kind: 'refused', reason: expect.stringContaining('pr/Bad_Name') });
+  });
+});
+
+/**
+ * The base branch moving on GitHub while the thread's base stays put: main
+ * gets commits by someone else, deploy/ and a workflow among them, and the
+ * run's branches merge it in or start from it.
+ * The tests use a workflow (GUARDED) as the protected path: whatever the
+ * PROTECTED list holds, they only need that one to be in it.
+ */
+describe('publishBundle with base merges', () => {
+  const OWNER = 'owner@example.com';
+  const compares = () => api.filter(c => c.url.includes('/compare/')).length;
+  const GUARDED = '.github/workflows';
+  /** Stage a file in the work tree, for a merge's resolution. */
+  const stage = (path: string, content: string) => {
+    mkdirSync(dirname(join(work, path)), { recursive: true });
+    writeFileSync(join(work, path), content);
+    sh(work, ['add', path]);
+  };
+  /** A commit on main, by the owner, pushed to GitHub; the run's branch is left checked out. */
+  function onMain(path: string, content: string, message: string): string {
+    const back = sh(work, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    sh(work, ['checkout', '-q', 'gh-main']);
+    commit(path, content, message, OWNER);
+    sh(work, ['push', '-q', remote, 'gh-main:main']);
+    sh(work, ['checkout', '-q', back]);
+    return sh(work, ['rev-parse', 'gh-main']);
+  }
+  /** Merge a commit into the checked-out branch as `email`, with `edit` run before committing (an evil resolution). */
+  function mergeIn(what: string, edit: () => void = () => {}, email = ASKER): void {
+    sh(work, ['merge', '-q', '--no-ff', '--no-commit', what], as(email));
+    edit();
+    sh(work, ['commit', '-q', '--no-edit'], as(email));
+  }
+
+  beforeEach(() => {
+    sh(work, ['branch', 'gh-main', baseSha]);
+    onBranch('ask');
+    commit('src/a.ts', 'export const a = 1;\n', 'feat: add a');
+    expect(protectedArea(`${GUARDED}/ci.yml`)).toBe(GUARDED);
+    onMain('deploy/termag-status', '#!/bin/sh\n', 'deploy: status script (#900)');
+    onMain(`${GUARDED}/ci.yml`, 'on: push\n', 'ci: run the tests (#902)');
+    onMain('src/m.ts', 'export const m = 1;\n', 'feat: m (#901)');
+  });
+
+  it('publishes a branch the babysitter merged main into, with the thread\'s commit on top', async () => {
+    // Turn one published `ask`; then main was merged into the PR on GitHub.
+    expect(await pub(input({ bundle: bundleOf('ask') }))).toMatchObject({ kind: 'published', commits: 1 });
+    mergeIn('gh-main');
+    sh(work, ['push', '-q', remote, 'ask:termag-alice/thread1']);
+    // The thread resets to that tip and commits on top.
+    commit('src/a.ts', 'export const a = 2;\n', 'feat: a is 2');
+    const out = await pub(input({ bundle: bundleOf('ask') }));
+    expect(out).toMatchObject({ kind: 'published', commits: 3, headSha: sh(work, ['rev-parse', 'ask']) });
+    expect(sh(remote, ['rev-parse', 'refs/heads/termag-alice/thread1'])).toBe(sh(work, ['rev-parse', 'ask']));
+  });
+
+  it('publishes a new pr/<name> branch started from a newer main, which has protected-path commits since the thread\'s base', async () => {
+    onBranch('pr/docs', 'gh-main');
+    commit('docs/a.md', '# a\n', 'docs: describe a');
+    const out = await publishBundle(cfg(), input({ bundle: bundleOf('pr/docs') }));
+    expect(out).toMatchObject({ kind: 'done', prs: [{ kind: 'published', key: 'docs', commits: 1 }] });
+    expect(posted().title).toBe('docs: describe a');
+  });
+
+  it('refuses an evil merge whose resolution adds a protected path', async () => {
+    mergeIn('gh-main', () => stage(`${GUARDED}/evil.yml`, 'on: push\n'));
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining(`protected paths (${GUARDED})`) });
+    expect(sh(remote, ['branch', '--list', 'termag-alice/thread1'])).toBe('');
+  });
+
+  it('refuses an evil merge buried under a commit that takes its change back out', async () => {
+    mergeIn('gh-main', () => stage(`${GUARDED}/evil.yml`, 'on: push\n'));
+    sh(work, ['rm', '-q', `${GUARDED}/evil.yml`]);
+    sh(work, ['commit', '-q', '-m', 'tidy'], as(ASKER));
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining(`protected paths (${GUARDED})`) });
+  });
+
+  it("refuses an evil merge that undoes main's change to a protected path", async () => {
+    mergeIn('gh-main', () => { sh(work, ['rm', '-qf', `${GUARDED}/ci.yml`]); });
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining(`protected paths (${GUARDED})`) });
+  });
+
+  it('refuses an evil merge whose resolution adds a secret', async () => {
+    mergeIn('gh-main', () => { writeFileSync(join(work, 'cfg.env'), `KEY=AKIA${'ABCDEFGHIJKLMNOP'}\n`); sh(work, ['add', 'cfg.env']); });
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('AWS access key id') });
+  });
+
+  it('refuses an evil merge whose resolution edits a file neither side changed', async () => {
+    mergeIn('gh-main', () => { writeFileSync(join(work, 'README.md'), `hello tmag_${'a'.repeat(32)}\n`); sh(work, ['add', 'README.md']); });
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('termag agent token') });
+  });
+
+  it("refuses a merge whose other parent is on GitHub but not on main", async () => {
+    sh(work, ['checkout', '-q', '-b', 'feature', 'gh-main']);
+    commit('src/f.ts', 'f\n', 'feature', OWNER);
+    sh(work, ['push', '-q', remote, 'feature']);
+    sh(work, ['checkout', '-q', 'ask']);
+    mergeIn('feature');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than main') });
+  });
+
+  it('refuses a merge of main plus a commit that is on no branch of GitHub', async () => {
+    sh(work, ['checkout', '-q', '-b', 'local', 'gh-main']);
+    commit('src/l.ts', 'l\n', 'looks like main', OWNER);
+    sh(work, ['checkout', '-q', 'ask']);
+    mergeIn('local');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than main') });
+  });
+
+  it("refuses a merge of the run's own branches, as before", async () => {
+    onBranch('pr/x');
+    commit('src/x.ts', 'x\n', 'x');
+    sh(work, ['checkout', '-q', 'ask']);
+    mergeIn('pr/x');
+    expect(await pub(input({ bundle: bundleOf('ask') }))).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than main') });
+  });
+
+  it('refuses an octopus merge, even of main', async () => {
+    onBranch('pr/x');
+    commit('src/x.ts', 'x\n', 'x');
+    sh(work, ['checkout', '-q', 'ask']);
+    sh(work, ['merge', '-q', '--no-edit', 'gh-main', 'pr/x'], as(ASKER));
+    expect(await pub(input({ bundle: bundleOf('ask') }))).toMatchObject({ kind: 'refused', reason: expect.stringContaining('3 parents') });
+  });
+
+  it('refuses a merge of two commits that are both on main', async () => {
+    onBranch('pr/m', baseSha);
+    mergeIn('gh-main');
+    expect(await publishBundle(cfg(), input({ bundle: bundleOf('pr/m') }))).toMatchObject({ kind: 'done', prs: [{ kind: 'refused', reason: expect.stringContaining('both on main') }] });
+  });
+
+  it('refuses an unrelated history merged together with main', async () => {
+    sh(work, ['checkout', '-q', '--orphan', 'other']);
+    sh(work, ['rm', '-rq', '--cached', '.']);
+    commit('z.txt', 'z\n', 'root');
+    sh(work, ['checkout', '-q', '-f', 'ask']);
+    sh(work, ['merge', '-q', '--no-edit', '--allow-unrelated-histories', 'other'], as(ASKER));
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringMatching(/no parent|something other than main/) });
+  });
+
+  it("still checks the PR's own commits: authorship, the merge's own author, protected paths, secrets", async () => {
+    const tip = sh(work, ['rev-parse', 'ask']);
+    mergeIn('gh-main', () => {}, 'mallory@example.com');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('mallory@example.com') });
+    sh(work, ['reset', '-q', '--hard', tip]);
+    mergeIn('gh-main');
+    commit('src/b.ts', 'b\n', 'b', 'mallory@example.com');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('mallory@example.com') });
+    sh(work, ['reset', '-q', '--hard', 'HEAD~1']);
+    commit('.github/workflows/x.yml', 'on: push\n', 'ci');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('.github/workflows') });
+    sh(work, ['reset', '-q', '--hard', 'HEAD~1']);
+    commit('cfg.env', `KEY=AKIA${'ABCDEFGHIJKLMNOP'}\n`, 'add');
+    commit('cfg.env', 'KEY=\n', 'remove');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('AWS access key id') });
+    expect(sh(remote, ['branch', '--list', 'termag-alice/thread1'])).toBe('');
+  });
+
+  it("refuses a protected path on the branch's own line that the merge resolution keeps", async () => {
+    commit(`${GUARDED}/mine.yml`, 'on: push\n', 'mine');
+    mergeIn('gh-main');
+    expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining(GUARDED) });
+  });
+
+  it('refuses a branch that holds only commits already on main', async () => {
+    onBranch('pr/m', 'gh-main');
+    expect(await publishBundle(cfg(), input({ bundle: bundleOf('pr/m') }))).toMatchObject({ kind: 'done', prs: [{ kind: 'refused', reason: expect.stringContaining('not already on main') }] });
+  });
+
+  describe("the base branch is the PR's own", () => {
+    /** A `release` branch on GitHub that forked before main's commits. */
+    function release(): void {
+      sh(work, ['branch', 'release', baseSha]);
+      sh(work, ['checkout', '-q', 'release']);
+      commit('src/r.ts', 'r\n', 'release: r', OWNER);
+      sh(work, ['push', '-q', remote, 'release']);
+      sh(work, ['checkout', '-q', 'ask']);
+    }
+    const comparedWith = () => [...new Set(api.filter(c => c.url.includes('/compare/')).map(c => /\/compare\/(.+)\.\.\./.exec(c.url)![1]))];
+
+    it('judges a PR retargeted on GitHub against its new base, not the default branch', async () => {
+      release();
+      prBase = 'release';
+      const tip = sh(work, ['rev-parse', 'ask']);
+      mergeIn('gh-main');
+      expect(await pub(input({ prNumber: 7 }))).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than release') });
+      sh(work, ['reset', '-q', '--hard', tip]);
+      mergeIn('release');
+      expect(await pub(input({ prNumber: 7 }))).toMatchObject({ kind: 'published', prNumber: 7, commits: 2 });
+      expect(comparedWith()).toEqual(['release']);
+    });
+
+    it("finds the branch's open PR by its head when the thread has none remembered", async () => {
+      release();
+      openPrs = [{ number: 43, head: 'termag-alice/thread1', base: { ref: 'release' }, html_url: 'https://github.com/org/repo/pull/43' }];
+      mergeIn('gh-main');
+      expect(await pub(input())).toMatchObject({ kind: 'refused', reason: expect.stringContaining('merges something other than release') });
+    });
+
+    it('falls back to the default branch when the PR is closed, or there is none yet', async () => {
+      release();
+      prBase = 'release';
+      prState = 'closed';
+      mergeIn('gh-main');
+      expect(await pub(input({ prNumber: 7 }))).toMatchObject({ kind: 'published', prCreated: true });
+      expect(comparedWith()).toEqual(['main']);
+    });
+
+    it("judges a new pr/<name> branch against the default branch while the thread's own PR targets another", async () => {
+      release();
+      prBase = 'release';
+      onBranch('pr/docs', 'gh-main');
+      commit('docs/a.md', '# a\n', 'docs: describe a');
+      sh(work, ['checkout', '-q', 'ask']);
+      mergeIn('release');
+      const out = await publishBundle(cfg(), input({ bundle: bundleOf('ask', 'pr/docs'), prNumbers: { '': 7 } }));
+      expect(out).toMatchObject({ kind: 'done', prs: [
+        { kind: 'published', key: '', prNumber: 7 },
+        { kind: 'published', key: 'docs', commits: 1, prCreated: true },
+      ] });
+      expect(comparedWith().sort()).toEqual(['main', 'release']);
+    });
+
+    it('fails when the PR has no readable base', async () => {
+      openPrs = [{ number: 43, head: 'termag-alice/thread1', base: null, html_url: 'https://github.com/org/repo/pull/43' }];
+      mergeIn('gh-main');
+      expect(await pub(input())).toMatchObject({ kind: 'failed', reason: expect.stringContaining('base branch of PR #43') });
+    });
+  });
+
+  it('fails rather than guess when GitHub cannot say what is on main', async () => {
+    mergeIn('gh-main');
+    compareStatus = 500;
+    expect(await pub(input())).toMatchObject({ kind: 'failed', reason: expect.stringContaining('compare answered 500') });
+    expect(sh(remote, ['branch', '--list', 'termag-alice/thread1'])).toBe('');
+  });
+
+  it('asks GitHub about a long stretch of main in a few calls, and caps the branch\'s own commits', async () => {
+    for (let i = 0; i < 30; i++) onMain(`src/n${i}.ts`, `${i}\n`, `n${i}`);
+    onBranch('pr/docs', 'gh-main');
+    commit('docs/a.md', '# a\n', 'docs');
+    expect(await publishBundle(cfg(), input({ bundle: bundleOf('pr/docs') }))).toMatchObject({ kind: 'done', prs: [{ kind: 'published', commits: 1 }] });
+    expect(compares()).toBeLessThanOrEqual(7);
+    expect(MAX_COMMITS).toBe(200);
   });
 });
 

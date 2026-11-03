@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 
 const registry = vi.hoisted(() => ({ agent: null as unknown, sent: [] as unknown[] }));
-const db = vi.hoisted(() => ({ updates: [] as { where: { id: string }; data: { githubDeliveredAt: Date | null } }[] }));
+const db = vi.hoisted(() => ({ updates: [] as { where: { id: string }; data: { githubDeliveredAt: Date | null } }[], status: 'ready' }));
 vi.mock('../db', () => ({
   prisma: {
     user: { findUnique: async () => ({ claudeGatewayEnabled: true }) },
     instance: {
+      findUnique: async () => ({ status: db.status }),
       update: async (args: { where: { id: string }; data: { githubDeliveredAt: Date | null } }) => {
         db.updates.push(args);
         return {};
@@ -21,7 +22,13 @@ vi.mock('./agentRegistry', () => ({
 const store = vi.hoisted(() => ({ config: null as unknown, read: async (): Promise<unknown> => null }));
 vi.mock('./credentialStore', () => ({
   getCredentialStoreConfig: () => store.config,
-  githubStoreDeps: () => ({ read: () => store.read() }),
+  githubStoreDeps: () => ({
+    read: () => store.read(),
+    readSnapshot: async () => {
+      const secret = await store.read();
+      return secret ? { secret, ciphertext: Buffer.alloc(0), updatedAt: new Date('2026-10-28T10:00:00.000Z') } : null;
+    },
+  }),
 }));
 
 const mcp = vi.hoisted(() => ({ flag: true, connectors: [] as { id: string; name: string }[], fail: false }));
@@ -47,7 +54,7 @@ const ec2Box = { kind: 'owned-box', user: { id: 'u' }, instance: { id: 'i', user
 const externalBox = { kind: 'owned-box', user: { id: 'u' }, instance: { id: 'i', userId: 'u', kind: 'external' } } as never;
 const V1 = ['credentials-v1'];
 
-const BROKER = { url: 'https://agent.termag.example.com', login: 'octocat' };
+const BROKER = { url: 'https://agent.termag.example.com', login: 'octocat', updatedAt: '2026-10-28T10:00:00.000Z' };
 const BOTH = ['credentials-v1', 'github-broker-v1'];
 const OFF = { claudeSettings: null, claudeOffReason: 'claude-why', githubBroker: null, githubOffReason: 'github-why' };
 const ALL = BOTH;
@@ -57,7 +64,7 @@ describe('planDelivery', () => {
     const steps = planDelivery({ ...OFF, claudeSettings: { env: {} }, githubBroker: BROKER }, BOTH);
     expect(steps).toEqual([
       { type: 'credentials-apply', provider: 'claude-gateway', payload: { env: {} } },
-      { type: 'credentials-apply', provider: 'github', payload: { broker: 'https://agent.termag.example.com', login: 'octocat' } },
+      { type: 'credentials-apply', provider: 'github', payload: { broker: 'https://agent.termag.example.com', login: 'octocat', updatedAt: '2026-10-28T10:00:00.000Z' } },
     ]);
     expect(JSON.stringify(steps)).not.toMatch(/token|ssh|PRIVATE/i);
   });
@@ -110,6 +117,18 @@ describe('refusalFor', () => {
 
 describe('deliverToInstance', () => {
   const sentSteps = () => registry.sent.map(([, type, body]) => ({ type, ...(body as object) }));
+
+  it('sends nothing at all to a box quarantined after its agent connected', async () => {
+    registry.agent = { conn: ec2Box, capabilities: [...BOTH] };
+    registry.sent = [];
+    db.status = 'quarantined';
+    try {
+      await deliverToInstance('i', 'u');
+    } finally {
+      db.status = 'ready';
+    }
+    expect(registry.sent).toEqual([]);
+  });
 
   it('sends an external box no credential, only removes that say why', async () => {
     registry.agent = { conn: externalBox, capabilities: V1 };
@@ -365,6 +384,20 @@ describe('planDelivery: mcp', () => {
     expect(providersFor(ALL)).not.toContain('mcp');
     expect(providersFor(CAPS)).toContain('mcp');
   });
+
+  it('adds the agent list only for an mcp-broker-v2 box, empty when the flag left it out', () => {
+    const V2 = [...CAPS, 'mcp-broker-v2'];
+    const agents = ['codex', 'cursor'];
+    expect(planDelivery({ ...OFF, mcp: { ...MCP, agents } }, V2))
+      .toContainEqual({ type: 'credentials-apply', provider: 'mcp', payload: { ...MCP, agents } });
+    expect(planDelivery({ ...OFF, mcp: MCP }, V2))
+      .toContainEqual({ type: 'credentials-apply', provider: 'mcp', payload: { ...MCP, agents: [] } });
+    // A v1 script refuses keys it does not know, so it never sees agents.
+    expect(planDelivery({ ...OFF, mcp: { ...MCP, agents } }, CAPS))
+      .toContainEqual({ type: 'credentials-apply', provider: 'mcp', payload: MCP });
+    // mcp-broker-v2 alone is not mcp-broker-v1: no step.
+    expect(planDelivery({ ...OFF, mcp: { ...MCP, agents } }, [...ALL, 'mcp-broker-v2']).some(s => s.provider === 'mcp')).toBe(false);
+  });
 });
 
 describe('deliverToInstance: mcp', () => {
@@ -391,6 +424,32 @@ describe('deliverToInstance: mcp', () => {
     } finally {
       delete process.env.MCP_BROKER_URL;
       mcp.fail = false;
+    }
+  });
+});
+
+describe('deliverToInstance: mcp for the other agents', () => {
+  const mcpSteps = () => (registry.sent as [string, string, { provider: string }][]).filter(([, , p]) => p.provider === 'mcp');
+  const BROKER = 'https://mcp-broker.example.test';
+
+  it('names every bridged agent for a v2 box, and nothing extra for a v1 box', async () => {
+    process.env.MCP_BROKER_URL = `${BROKER}/`;
+    try {
+      mcp.flag = true;
+      mcp.connectors = [{ id: 'c1', name: 'figma' }];
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1', 'mcp-broker-v2'] };
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: {
+        broker: BROKER, connectors: [{ id: 'c1', name: 'figma' }],
+        agents: ['auggie', 'codex', 'cursor', 'devin', 'gemini', 'pi', 'vibe'],
+      } }, 30_000]]);
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1'] };
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: { broker: BROKER, connectors: [{ id: 'c1', name: 'figma' }] } }, 30_000]]);
+    } finally {
+      delete process.env.MCP_BROKER_URL;
     }
   });
 });

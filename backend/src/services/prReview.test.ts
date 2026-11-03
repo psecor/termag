@@ -84,6 +84,19 @@ describe('parseOverview', () => {
     expect(parseOverview({ viewer: { login: 'Alice' }, repository: { pullRequest: prNode } })!.viewerCanReview).toBe(false);
     expect(parseOverview({ viewer: { login: 'me' }, repository: { pullRequest: { ...prNode, state: 'MERGED' } } })!.viewerCanReview).toBe(false);
   });
+  it('reads each check on the head, which the gates and the Checks tab need', () => {
+    const headChecks = { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING', contexts: { nodes: [
+      { __typename: 'CheckRun', name: 'Cursor Bugbot', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { __typename: 'CheckRun', name: 'Cursor Security Agent: Termag Security Reviewer', status: 'IN_PROGRESS', conclusion: null },
+      { __typename: 'StatusContext', context: 'ci/backend', state: 'FAILURE' },
+    ] } } } }] };
+    const pr = parseOverview({ viewer: { login: 'me' }, repository: { pullRequest: { ...prNode, headChecks } } })!;
+    expect(pr.checks).toEqual([
+      { name: 'Cursor Bugbot', state: 'passed' },
+      { name: 'Cursor Security Agent: Termag Security Reviewer', state: 'pending' },
+      { name: 'ci/backend', state: 'failed' },
+    ]);
+  });
   it('is null when there is no such PR', () => {
     expect(parseOverview({ viewer: { login: 'me' }, repository: { pullRequest: null } })).toBeNull();
     expect(parseOverview({ viewer: { login: 'me' }, repository: null })).toBeNull();
@@ -438,5 +451,24 @@ describe('fetchPrScope', () => {
     expect((await fetchPrScope('t', ref, short.fetchImpl)).complete).toBe(false);
     const gone = fakeFetch(() => ({ status: 404, body: {} }));
     await expect(fetchPrScope('t', ref, gone.fetchImpl)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('parseReviewInput: inline comments (docs/simple-ui-reviews.md)', () => {
+  const sha = 'a'.repeat(40);
+  it('takes comments on the head commit, with the summary GitHub needs for COMMENT and REQUEST_CHANGES', () => {
+    expect(parseReviewInput({ event: 'REQUEST_CHANGES', body: 'One cut.', commitId: sha, comments: [{ path: 'agent/tunnel-dial.js', line: 239, body: ' Cut here. ' }] })).toEqual({
+      event: 'REQUEST_CHANGES', body: 'One cut.', commitId: sha, comments: [{ path: 'agent/tunnel-dial.js', line: 239, side: 'RIGHT', body: 'Cut here.' }],
+    });
+    expect(() => parseReviewInput({ event: 'REQUEST_CHANGES', commitId: sha, comments: [{ path: 'a.ts', line: 1, body: 'x' }] })).toThrow('Say what needs to change');
+    expect(parseReviewInput({ event: 'APPROVE', commitId: sha, comments: [{ path: 'a.ts', line: 1, body: 'x' }] })).toMatchObject({ event: 'APPROVE', body: '' });
+  });
+  it('refuses comments without the commit, on a bad path or line, or empty', () => {
+    expect(() => parseReviewInput({ event: 'COMMENT', body: 'x', comments: [{ path: 'a.ts', line: 1, body: 'x' }] })).toThrow('need the head commit');
+    expect(() => parseReviewInput({ event: 'COMMENT', body: 'x', commitId: sha, comments: [{ path: '../etc/passwd', line: 1, body: 'x' }] })).toThrow('a file path');
+    expect(() => parseReviewInput({ event: 'COMMENT', body: 'x', commitId: sha, comments: [{ path: 'a.ts', line: 0, body: 'x' }] })).toThrow('a line number');
+    expect(() => parseReviewInput({ event: 'COMMENT', body: 'x', commitId: sha, comments: [{ path: 'a.ts', line: 2, body: '  ' }] })).toThrow('has no text');
+    expect(() => parseReviewInput({ event: 'COMMENT', commitId: 'abc', body: 'x' })).toThrow('commitId');
+    expect(() => parseReviewInput({ event: 'COMMENT', body: 'x', commitId: sha, comments: Array.from({ length: 51 }, () => ({ path: 'a', line: 1, body: 'x' })) })).toThrow('At most 50');
   });
 });

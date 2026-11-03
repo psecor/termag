@@ -1,6 +1,8 @@
 /**
  * /api/admin — read-only org-wide views (phase 0) plus admin management
- * (tokens, admins, audit) from ./manage.ts. Every route sits behind
+ * (tokens, admins, audit) from ./manage.ts, growing a box's disk from ./disk.ts,
+ * resizing a box from ./resize.ts, bug-report triage from ./bugs.ts and box
+ * quarantine from ./quarantine.ts. Every route sits behind
  * requireAdmin (session role or admin bearer) and a per-caller rate limit.
  * Handlers are thin: parse → call the shared query → json. The MCP server
  * (mcp/adminServer.ts) calls the same query functions.
@@ -19,8 +21,13 @@ import { computeSignals } from '../../services/admin/signalsData';
 import { systemHealth } from '../../services/admin/systemQueries';
 import { spawnLimitsReport } from '../../services/admin/spawnLimitsQueries';
 import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHealth, parseReportGroup, pipelineHealth } from '../../services/admin/claudeRunnerQueries';
+import { prismaBugReports } from '../../services/bugReportsPrisma';
+import { bugsRouter } from './bugs';
+import { diskRouter } from './disk';
+import { resizeRouter } from './resize';
 import { manageRouter } from './manage';
 import { prsRouter } from './prs';
+import { quarantineRouter } from './quarantine';
 import { segmentsRouter } from './segments';
 import { softwareRouter } from './software';
 import { spendRouter } from './spend';
@@ -137,10 +144,14 @@ export function adminRouter(): Router {
   router.get('/claude-runner/summary', asyncHandler(async (_req, res) => { res.json(await cloudSummary()); }));
   router.get('/claude-runner/capacity', asyncHandler(async (_req, res) => { res.json(await capacity()); }));
 
+  router.use(bugsRouter(prismaBugReports));
+  router.use(diskRouter());
+  router.use(resizeRouter());
   router.use(prsRouter());
   router.use(segmentsRouter());
   router.use(softwareRouter());
   router.use(spendRouter());
   router.use(manageRouter());
+  router.use(quarantineRouter());
   return router;
 }

@@ -15,6 +15,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { prisma } from '../db';
 import { validateAgentToken } from '../routes/agentTokens';
+import { acceptsScope } from '../services/agentTokenScopes';
 import { isAdminUser, touchLastSeen } from '../services/admin/adminAccess';
 
 declare global {
@@ -53,7 +54,7 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
     if (authHeader.startsWith('Bearer ')) {
       try {
         const result = await validateAgentToken(authHeader.slice(7));
-        if (result && result.token.scope === 'admin') {
+        if (result && acceptsScope('admin', result.token.scope)) {
           req.user = result.user as Express.User;
           req.adminTokenId = result.token.id;
         } else if (result) {

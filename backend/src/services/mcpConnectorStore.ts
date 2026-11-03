@@ -9,9 +9,9 @@ import { prisma } from '../db';
 import {
   getCredentialStoreConfig, openCredential, readCredential, sealCredential, writeCredentials, deleteCredentials,
 } from './credentialStore';
-import { boolVariation } from './featureFlags';
+import { boolVariation, jsonVariation } from './featureFlags';
 import type { FlagUser } from './featureFlags';
-import { asSecrets, mcpCredentialProvider, MCP_BROKER_FLAG, type Secrets } from './mcpConnectors';
+import { asSecrets, defaultConnectors, mcpCredentialProvider, MCP_BROKER_FLAG, MCP_DEFAULTS_FLAG, type DefaultConnector, type Secrets } from './mcpConnectors';
 import { forgetOAuth, freshAccessToken, refreshTokens, revokeToken, type DiscoveredOAuth, type OAuthLockIo, type StoredOAuth } from './mcpOAuth';
 import { safeOAuthHttp } from './mcpOAuthHttp';
 
@@ -21,14 +21,23 @@ export function mcpBrokerEnabledForUser(user: FlagUser): Promise<boolean> {
   return boolVariation(MCP_BROKER_FLAG, user, false);
 }
 
-/** The flag for the owner and the box, as ext_authz and delivery read it. */
-export async function mcpBrokerEnabledForBox(userId: string, instanceId: string): Promise<boolean> {
+/** The catalog of MCP servers this user is offered (the mcp-default-connectors flag); empty while it is off. */
+export async function catalogForUser(user: FlagUser): Promise<DefaultConnector[]> {
+  return defaultConnectors(await jsonVariation(MCP_DEFAULTS_FLAG, user, null));
+}
+
+async function boxContext(userId: string, instanceId: string) {
   const [user, instance] = await Promise.all([
     prisma.user.findUnique({ where: { id: userId }, select: LD_USER_SELECT }),
     prisma.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true, kind: true } }),
   ]);
-  if (!user || !instance) return false;
-  return boolVariation(MCP_BROKER_FLAG, user, false, instance);
+  return user && instance ? { user, instance } : null;
+}
+
+/** The flag for the owner and the box, as ext_authz and delivery read it. */
+export async function mcpBrokerEnabledForBox(userId: string, instanceId: string): Promise<boolean> {
+  const ctx = await boxContext(userId, instanceId);
+  return !!ctx && boolVariation(MCP_BROKER_FLAG, ctx.user, false, ctx.instance);
 }
 
 export const CONNECTOR_SELECT = {
@@ -180,11 +189,12 @@ export function forgetConnectorOAuth(connector: { id: string; userId: string; oa
 }
 
 /** The upstream Authorization for an oauth connector; throws McpNeedsLinkError. */
-export function oauthAccessToken(connector: { id: string; userId: string; oauthMetadata?: unknown }): Promise<string> {
+export function oauthAccessToken(connector: { id: string; userId: string; upstream: string; oauthMetadata?: unknown }): Promise<string> {
   const meta = connector.oauthMetadata as DiscoveredOAuth;
   const http = safeOAuthHttp();
   return freshAccessToken({
     read: () => readOAuth(connector.userId, connector.id),
+    upstream: connector.upstream,
     withLock: fn => withOAuthLock(connector.userId, connector.id, fn),
     refresh: (client, refreshToken) => refreshTokens(meta, client, refreshToken, http),
     now: Date.now,

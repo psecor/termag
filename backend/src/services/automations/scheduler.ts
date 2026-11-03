@@ -14,9 +14,11 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
 import { instanceAgentTransport, isInstanceAgentConnected, sendForProject } from '../agentRegistry';
 import { wakeAction } from '../agentMessages';
+import { noteAutomationRunActivity } from '../boxActivity';
 import { registerBoxBusyCheck } from '../boxLifecycle';
-import { requestPower } from '../boxPower';
+import { PowerRequestConflict, requestPower } from '../boxPower';
 import { CHAT_AUTO_CAPABILITY, CHAT_RUNNER_CAPABILITY, chatKeyFor } from '../chatRunner';
+import { desktopAppEnabled, T3_CAPABILITY } from '../desktopAppFlag';
 import { boolVariation } from '../featureFlags';
 import { removeWorkstreamFor } from '../../routes/workstreams';
 import { admitRun, type AdmitDecision } from './admit';
@@ -25,6 +27,8 @@ import { automationLimitsFor, type AutomationLimits } from './limits';
 import { startRun } from './runner';
 import { MAX_ENUMERATED, newestOccurrence, occurrenceMinute, occurrencesBetween, nextOccurrence } from './schedule';
 import { FINISHED_RUN_STATES } from './store';
+import { fireT3Hook, T3_AUTOMATION_KIND } from './t3Hook';
+import { failRoot, traceSweep } from '../tracing/spans';
 
 export const AUTOMATIONS_FLAG = 'automations-enabled';
 export const TICK_MS = 60_000;
@@ -64,10 +68,12 @@ async function previousLive(automationId: string, exceptRunId: string): Promise<
   return (await prisma.automationRun.count({ where: { automationId, state: { in: ['pending', 'running'] }, id: { not: exceptRunId } } })) > 0;
 }
 
-/** Whether this automation's owner has the flag on for its box. */
+/** Whether this automation's owner has the flag on for its box; a t3 one also needs the desktop bridge's. */
 async function flagOn(a: Row): Promise<boolean> {
   const box = a.project.instance ? { id: a.project.instance.id, name: a.project.instance.name, kind: a.project.instance.kind } : null;
-  return boolVariation(AUTOMATIONS_FLAG, a.project.user, false, box);
+  if (!(await boolVariation(AUTOMATIONS_FLAG, a.project.user, false, box))) return false;
+  // No box: let admit see box_gone, which pauses the automation, rather than skipping as flag_off for good.
+  return a.kind !== T3_AUTOMATION_KIND || box === null || (await desktopAppEnabled(a.project.user, box));
 }
 
 function runnerCapable(instanceId: string, tier: string): boolean {
@@ -92,7 +98,7 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
     boxLiveRuns: inst ? await liveRunsOnBox(inst.id) : 0,
     boxWake: wakeAction(inst?.status ?? null),
     boxConnected: inst ? isInstanceAgentConnected(inst.id) : false,
-    runnerCapable: inst ? runnerCapable(inst.id, a.tier) : false,
+    runnerCapable: inst ? (a.kind === T3_AUTOMATION_KIND ? t3Capable(inst.id) : runnerCapable(inst.id, a.tier)) : false,
     wakeBox: a.wakeBox,
     limits,
   });
@@ -109,10 +115,17 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
   if (decision.kind === 'pending') {
     if (decision.wake && inst) {
       try {
-        await requestPower(inst, 'start');
+        // The wake is activity: the box comes up with its idle clock
+        // restarted, so it isn't taken for one nobody touched since its
+        // auto-park (noteAutomationRunActivity).
+        await requestPower(inst, 'start', { startedBy: 'automation', andSet: { lastActivityAt: now } });
         console.log(`[AUTOMATION] ${a.project.name}: starting box ${inst.name} for ${run.scheduledFor.toISOString()}`);
+        if (a.boxStartFailures > 0) await clearBoxStartFailures(a.id);
       } catch (err) {
         console.warn(`[AUTOMATION] ${a.project.name}: could not start box ${inst.name}: ${(err as Error).message}`);
+        // A conflict is the box moving under us (another start, a terminate
+        // claim), not a start EC2 refused.
+        if (!(err instanceof PowerRequestConflict)) await noteBoxStartFailure(a.id, (err as Error).message, now);
       }
     }
     return decision;
@@ -135,6 +148,12 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
     console.log(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → skipped box_concurrent (claimed past the box's cap)`);
     return { kind: 'skip', reason: 'box_concurrent' };
   }
+  // A run is the box in use: its idle window counts from here (and from its
+  // end, complete.ts), and the busy check holds the box in between. A t3
+  // run uses the box too: its webhook call is the run.
+  await noteAutomationRunActivity(inst.id, now);
+  if (a.boxStartFailures > 0) await clearBoxStartFailures(a.id);
+  if (a.kind === T3_AUTOMATION_KIND) return startT3Run(a, run, inst, limits);
   const outcome = await startRun({
     automation: a, run: { ...run, state: 'running', startedAt: now, instanceId: inst.id },
     project: { id: a.project.id, name: a.project.name, userId: a.project.userId, instanceId: inst.id, repoDefaultBranch: a.project.repoDefaultBranch, chatTrustedAt: a.project.chatTrustedAt },
@@ -163,6 +182,80 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
   // The run's workstream link is the runner's, written before the brief went out.
   await prisma.automation.update({ where: { id: a.id }, data: { lastOccurrence: run.trigger === 'schedule' ? run.scheduledFor : a.lastOccurrence } });
   return { kind: 'start' };
+}
+
+/**
+ * A wake EC2 refused (Insufficient capacity, most often): counted on the
+ * automation, with when the streak began and the last error, so its page and
+ * `automation show` say "couldn't start its box N times since …" instead of
+ * a log line only. The next start that takes clears it.
+ */
+async function noteBoxStartFailure(automationId: string, error: string, now: Date): Promise<void> {
+  try {
+    await prisma.automation.update({ where: { id: automationId }, data: { boxStartFailures: { increment: 1 }, boxStartError: error.slice(0, 500) } });
+    await prisma.automation.updateMany({ where: { id: automationId, boxStartFailingSince: null }, data: { boxStartFailingSince: now } });
+  } catch (err) {
+    console.warn(`[AUTOMATION] ${automationId}: could not record the failed start:`, (err as Error).message);
+  }
+}
+
+async function clearBoxStartFailures(automationId: string): Promise<void> {
+  await prisma.automation.update({ where: { id: automationId }, data: { boxStartFailures: 0, boxStartFailingSince: null, boxStartError: null } })
+    .catch(err => console.warn(`[AUTOMATION] ${automationId}: could not clear the failed starts:`, (err as Error).message));
+}
+
+function t3Capable(instanceId: string): boolean {
+  return (instanceAgentTransport(instanceId)?.capabilities ?? []).includes(T3_CAPABILITY);
+}
+
+/**
+ * A t3 automation's run (services/automations/t3Hook.ts): one call to its T3
+ * task's webhook on the box. T3 starts the thread and keeps no run record
+ * termag can read, so the run is done once T3 has the request, and its row
+ * says so; the thread is the box's to show.
+ */
+async function startT3Run(
+  a: Row, run: { id: string; trigger: string; scheduledFor: Date }, inst: { id: string; name: string }, limits: AutomationLimits,
+): Promise<StartDecision> {
+  const outcome = await fireT3Hook(a.project.user, inst.id, a.id, {
+    termag: { automation: a.project.name, trigger: run.trigger, scheduledFor: run.scheduledFor.toISOString(), runId: run.id },
+  });
+  if (outcome.kind === 'wait') {
+    // Up but not serving yet (a woken box's t3 server starting): back to pending,
+    // which the next tick retries until pendingMinutes, as when the agent isn't connected yet.
+    await prisma.automationRun.updateMany({ where: { id: run.id, state: 'running' }, data: { state: 'pending', startedAt: null, instanceId: null } });
+    console.log(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → waiting: ${outcome.error}`);
+    return { kind: 'pending', wake: false };
+  }
+  const finishedAt = new Date();
+  const report = () => reportRun(run.id).catch(err => console.warn(`[AUTOMATION] ${a.project.name}: report failed: ${(err as Error).message}`));
+  if (outcome.kind === 'started') {
+    const done = await prisma.automationRun.updateMany({
+      where: { id: run.id, state: 'running' },
+      data: { state: 'done', summary: `Started its T3 task on ${inst.name}`, finishedAt },
+    });
+    if (done.count > 0) {
+      await prisma.automation.update({
+        where: { id: a.id },
+        data: { consecutiveFailures: 0, lastOccurrence: run.trigger === 'schedule' ? run.scheduledFor : a.lastOccurrence },
+      });
+      console.log(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → started T3 task ${a.t3TaskId ?? '?'} on ${inst.name}${outcome.deliveryId ? ` (delivery ${outcome.deliveryId})` : ''}`);
+      await report();
+    }
+    return { kind: 'start' };
+  }
+  const failed = await prisma.automationRun.updateMany({
+    where: { id: run.id, state: 'running' },
+    data: { state: 'failed', reason: outcome.reason, summary: outcome.error, finishedAt },
+  });
+  if (failed.count > 0) {
+    // A task that is gone fails every later run the same way: pause now, not after three.
+    if (outcome.pause) await prisma.automation.update({ where: { id: a.id }, data: { pausedReason: outcome.reason } });
+    else await noteFailure(a, limits);
+    console.warn(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → failed ${outcome.reason}: ${outcome.error}`);
+    await report();
+  }
+  return { kind: 'failed', reason: outcome.reason, error: outcome.error };
 }
 
 async function noteFailure(a: Row, limits: AutomationLimits): Promise<void> {
@@ -202,6 +295,7 @@ export async function timeOutRuns(now: Date): Promise<number> {
       data: { state: 'failed', reason: 'timeout', finishedAt: now, summary: `stopped after ${r.automation.maxRunMinutes} minutes` },
     });
     if (updated.count === 0) continue; // finished on its own meanwhile
+    await noteAutomationRunActivity(r.instanceId, now);
     if (r.workstream && p.instanceId) {
       await sendForProject({ userId: p.userId, instanceId: p.instanceId }, 'chat-interrupt', { chatKey: chatKeyFor(p.id, r.workstream.id) }, 10_000)
         .catch(err => console.warn(`[AUTOMATION] ${p.name}: interrupt failed: ${(err as Error).message}`));
@@ -337,18 +431,20 @@ export async function retireBeyondKeep(now: Date): Promise<number> {
 }
 
 export async function schedulerTick(now: Date = new Date()): Promise<void> {
-  await timeOutRuns(now).catch(err => console.error('[AUTOMATION] timeout sweep failed:', (err as Error).message));
-  await resolvePending(now).catch(err => console.error('[AUTOMATION] pending sweep failed:', (err as Error).message));
-  await startDue(now).catch(err => console.error('[AUTOMATION] due sweep failed:', (err as Error).message));
-  await retireBeyondKeep(now).catch(err => console.error('[AUTOMATION] retire sweep failed:', (err as Error).message));
+  await timeOutRuns(now).catch(err => { failRoot(err); console.error('[AUTOMATION] timeout sweep failed:', (err as Error).message); });
+  await resolvePending(now).catch(err => { failRoot(err); console.error('[AUTOMATION] pending sweep failed:', (err as Error).message); });
+  await startDue(now).catch(err => { failRoot(err); console.error('[AUTOMATION] due sweep failed:', (err as Error).message); });
+  await retireBeyondKeep(now).catch(err => { failRoot(err); console.error('[AUTOMATION] retire sweep failed:', (err as Error).message); });
 }
+
+const tracedTick = traceSweep('automations', () => schedulerTick());
 
 export function startAutomationScheduler(): void {
   if (timer) return;
   timer = setInterval(() => {
     if (ticking) return;
     ticking = true;
-    schedulerTick().catch(err => console.error('[AUTOMATION] tick failed:', (err as Error).message)).finally(() => { ticking = false; });
+    tracedTick().catch(err => console.error('[AUTOMATION] tick failed:', (err as Error).message)).finally(() => { ticking = false; });
   }, TICK_MS);
   timer.unref?.();
 }
@@ -359,17 +455,31 @@ export function stopAutomationScheduler(): void {
 
 // A box with a run inside its time limit is busy: auto-hibernate must not
 // park it. Past the limit the run is the
-// timeout sweep's, so it never keeps a box up for good.
+// timeout sweep's, so it never keeps a box up for good. So is a box an
+// automation that can wake it has a run pending for: the scheduler woke it
+// (or will) and claims the run on a later tick, and a pending row has no
+// instanceId yet, so it is found through the automation's project. A pending
+// row is skipped after its pendingMinutes, which can't exceed a day.
 registerBoxBusyCheck('automation-run', async ids => {
-  const rows = await prisma.automationRun.findMany({
-    where: { instanceId: { in: ids }, state: 'running' },
-    select: { instanceId: true, startedAt: true, automation: { select: { maxRunMinutes: true } } },
-  });
   const now = Date.now();
+  const [rows, pending] = await Promise.all([
+    prisma.automationRun.findMany({
+      where: { instanceId: { in: ids }, state: 'running' },
+      select: { instanceId: true, startedAt: true, automation: { select: { maxRunMinutes: true } } },
+    }),
+    prisma.automationRun.findMany({
+      where: {
+        state: 'pending', createdAt: { gte: new Date(now - 24 * 60 * 60_000) },
+        automation: { wakeBox: true, project: { instanceId: { in: ids } } },
+      },
+      select: { automation: { select: { project: { select: { instanceId: true } } } } },
+    }),
+  ]);
   const busy = new Set<string>();
   for (const r of rows) {
     if (!r.instanceId) continue;
     if (!r.startedAt || now - r.startedAt.getTime() < r.automation.maxRunMinutes * 60_000) busy.add(r.instanceId);
   }
+  for (const r of pending) if (r.automation.project.instanceId) busy.add(r.automation.project.instanceId);
   return busy;
 });

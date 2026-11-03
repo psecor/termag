@@ -11,6 +11,13 @@ type App = any;
 import { prisma } from '../db';
 
 import { executeClaudeCommand, resolveWorkingDir } from './executor';
+import {
+  isAgentApp, threadKey, setSessionStatus, agentRuns, suggestedPrompts, publishSuggestedPrompts,
+  CHOICE_ACTION, parseChoiceValue, resetAgentConversation, mayStopRun,
+} from './agentSession';
+import { runAgentTurn } from './agentTurn';
+import { ATTACH_ACTION, parseAttachValue, shareAttachment } from './agentAttachments';
+import { slackAgentEnabled } from '../services/slackAgentFlag';
 import { StreamingMessageUpdater } from './streaming';
 import { formatError, formatWelcome } from './formatting';
 import { publishHomeView } from './homeView';
@@ -19,7 +26,8 @@ import { slackChatAllowed, slackProjectAccess, slackRefusalText, slackUserRefusa
 import { clearActiveTarget, getActiveTarget, guessActiveTarget, setActiveTarget, type ChatPlatform } from './activeTargets';
 import { handleCollabThreadMessage } from './collab';
 import { slackHandoff } from './handoffCommand';
-import { parseSlashCommand, slashHelp } from './slashCommand';
+import { parseSlashCommand, slashCommandDetail, slashHelp } from './slashCommand';
+import { recordProductEvent } from '../services/productEvents';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { sessionName, projectDir, formatPaneForSlack } from '../services/tmux';
 import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
@@ -127,6 +135,15 @@ export async function addReactionHints(client: any, channelId: string, messageTs
 // Rate limiting
 const userLastRequest = new Map<string, number>();
 const RATE_LIMIT_MS = (parseInt(process.env.RATE_LIMIT_SECONDS ?? '2', 10)) * 1000;
+
+/**
+ * The agent-session path (agentTurn.ts): only for people DMs and @mentions answer
+ * at all (slackChatAllowed), when the Slack app is an agent and the flag is on for them.
+ */
+async function useAgentPath(client: import('@slack/web-api').WebClient, slackUserId: string): Promise<boolean> {
+  if (!slackChatAllowed(slackUserId) || !(await isAgentApp(client))) return false;
+  return slackAgentEnabled(await resolveTermagUser(slackUserId, client));
+}
 
 function isRateLimited(userId: string): boolean {
   const now = Date.now();
@@ -287,8 +304,10 @@ async function processMessage(opts: {
   };
   threadTs: string;
   messageTs: string;
+  /** The sender's workspace; an agent reply in a channel is streamed to them. */
+  teamId?: string;
 }): Promise<void> {
-  const { userId, channelId, inDM, text, botUserId, say, client, threadTs, messageTs } = opts;
+  const { userId, channelId, inDM, text, botUserId, say, client, threadTs, messageTs, teamId } = opts;
   // Seen only by the sender: any reply in a DM, an ephemeral one in a channel
   // (in the mention's thread when it was in one).
   const replyPrivately = (reply: string) => (inDM
@@ -324,6 +343,12 @@ async function processMessage(opts: {
 
   // Special commands
   if (lower === 'new session' || lower === 'reset' || lower === 'clear') {
+    // The agent path's Claude sessions too, or the next turn would --resume the old one.
+    const reset = resetAgentConversation({ channel: channelId, threadTs, userId, inDM });
+    if (!reset.reset) {
+      await replyPrivately(`This thread is <@${reset.owner}>'s conversation with me, so only they can reset it. @mention me in a new message to start your own.`);
+      return;
+    }
     sessionMessageCount.set(userId, 0);
     await say({ text: '🔄 *Session cleared!* Starting fresh.', thread_ts: threadTs });
     return;
@@ -337,6 +362,17 @@ async function processMessage(opts: {
   const projectId = getActiveProjectId(userId);
   const workingDir = await resolveWorkingDir(userId, projectId, getActiveWorkstream(userId));
   console.log(`[EXECUTOR] Running for user=${userId} projectId=${projectId} workstream=${getActiveWorkstream(userId)} workingDir=${workingDir} message="${message.slice(0, 80)}"`);
+
+  const webClient = client as unknown as import('@slack/web-api').WebClient;
+  const inChannel = !inDM;
+  if ((!inChannel || teamId) && await useAgentPath(webClient, userId)) {
+    await runAgentTurn({
+      client: webClient, say, channelId, threadTs, messageTs, message, workingDir, userId,
+      recipient: inChannel ? { userId, teamId: teamId! } : null,
+    });
+    return;
+  }
+
   const msgCount = sessionMessageCount.get(userId) ?? 0;
 
   const reactionEmoji = 'hourglass_flowing_sand';
@@ -378,9 +414,11 @@ export function registerEventHandlers(app: App): void {
     console.log(`[APP_MENTION] Received: user=${event.user} channel=${event.channel} text="${(event.text || '').slice(0, 80)}"`);
     try {
       await processMessage({
-        userId: event.user, channelId: event.channel, inDM: false, text: event.text,
+        // Slack also delivers an @mention typed in a DM here; it is still that DM.
+        userId: event.user, channelId: event.channel, inDM: event.channel_type === 'im' || String(event.channel ?? '').startsWith('D'), text: event.text,
         botUserId: context.botUserId, say, client,
         threadTs: event.thread_ts || event.ts, messageTs: event.ts,
+        teamId: event.user_team ?? event.team ?? context.teamId,
       });
     } catch (error) {
       console.error('[APP_MENTION] Error:', error);
@@ -435,6 +473,8 @@ export function registerEventHandlers(app: App): void {
     const userCommand = command.text.trim();
     const access = slackProjectAccess(userId, termagUser?.id ?? null);
     const cmd = parseSlashCommand(userCommand);
+    // An operator in ALLOWED_SLACK_USERS may have no termag user: no key to join on, so `mapped` says so.
+    recordProductEvent('slack.command', { user: termagUser?.id }, { ...slashCommandDetail(cmd), mapped: !!termagUser });
 
     // ── /t help [command] ──────────────────────────────
     if (cmd.kind === 'help') {
@@ -862,7 +902,9 @@ export function registerEventHandlers(app: App): void {
     await addReactionHints(client, command.channel_id, msg.ts, finalPane);
   };
 
-  app.command('/t', async (args: any) => {
+  // A dev app installed beside the production one needs its own command name,
+  // or Slack routes /t to either.
+  app.command(process.env.SLACK_COMMAND?.trim() || '/t', async (args: any) => {
     await args.ack();
     try {
       await slashT(args);
@@ -874,8 +916,126 @@ export function registerEventHandlers(app: App): void {
     }
   });
 
+  // A choice button under an agent reply: the click becomes the user's next message.
+  app.action(CHOICE_ACTION, async ({ ack, body, action, client }: any) => {
+    await ack();
+    const picked = parseChoiceValue(action.value ?? '');
+    const clicker: string = body.user?.id;
+    const channelId: string = body.channel?.id;
+    const message = body.message;
+    if (!picked || !clicker || !channelId || !message) return;
+    if (isRateLimited(clicker)) return;
+    if (!(await useAgentPath(client, clicker))) return;
+    const threadTs: string = message.thread_ts ?? message.ts;
+    if (picked.forUser && clicker !== picked.forUser) {
+      await client.chat.postEphemeral({
+        channel: channelId, user: clicker, thread_ts: threadTs,
+        text: `Only <@${picked.forUser}> can answer this one.`,
+      }).catch(() => {});
+      return;
+    }
+
+    // Everything that could still refuse the click comes before the buttons are
+    // replaced, so "chose X" always means a turn is starting.
+    const teamId: string | undefined = body.user?.team_id ?? body.team?.id;
+    const inChannel = !channelId.startsWith('D');
+    if (inChannel && !teamId) return;
+
+    const chose = `<@${clicker}> chose *${picked.choice}*`;
+    // Marked only once the turn starts: a turn that refuses (busy, the cap, a
+    // restart, another process's claim) leaves the buttons to click again.
+    const markChosen = () => client.chat.update({
+      channel: channelId, ts: message.ts, text: chose,
+      blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text: chose }] }],
+    }).catch((error: Error) => console.error('[AGENT] could not mark the choice:', error.message));
+
+    const workingDir = await resolveWorkingDir(clicker, getActiveProjectId(clicker), getActiveWorkstream(clicker));
+    await runAgentTurn({
+      client,
+      say: (args) => client.chat.postMessage({ channel: channelId, ...args }),
+      channelId, threadTs, messageTs: message.ts, message: picked.choice, workingDir, userId: clicker,
+      recipient: inChannel ? { userId: clicker, teamId: teamId! } : null,
+      react: false,
+      onStart: markChosen,
+    });
+  });
+
+  // Share / Don't share on a file an agent reply wants to attach (agentAttachments.ts).
+  const answeredOffers = new Set<string>();
+  app.action(ATTACH_ACTION, async ({ ack, body, action, client }: any) => {
+    await ack();
+    const offer = parseAttachValue(action.value ?? '');
+    const clicker: string = body.user?.id;
+    const channelId: string = body.channel?.id;
+    const message = body.message;
+    if (!offer || !clicker || !channelId || !message) return;
+    if (isRateLimited(clicker)) return;
+    if (!(await useAgentPath(client, clicker))) return;
+    const threadTs: string = message.thread_ts ?? message.ts;
+    if (clicker !== offer.forUser) {
+      await client.chat.postEphemeral({
+        channel: channelId, user: clicker, thread_ts: threadTs,
+        text: `Only <@${offer.forUser}> can decide whether to share this.`,
+      }).catch(() => {});
+      return;
+    }
+    // Each offer is answered once: a second click (a slow upload, or an update
+    // that failed and left the buttons up) must not post the file again.
+    const offerKey = `${channelId}:${message.ts}`;
+    if (answeredOffers.has(offerKey)) return;
+    answeredOffers.add(offerKey);
+    if (answeredOffers.size > 500) answeredOffers.delete(answeredOffers.values().next().value as string);
+
+    const name = offer.path.split('/').pop() ?? offer.path;
+    const mark = (text: string) => client.chat.update({
+      channel: channelId, ts: message.ts, text,
+      blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text }] }],
+    }).catch((error: Error) => console.error('[AGENT] could not mark the attachment:', error.message));
+    if (action.action_id === 'agent_attach_skip') {
+      await mark(`<@${clicker}> chose not to share *${name}*.`);
+      return;
+    }
+    // The buttons go before the upload starts.
+    await mark(`Sharing *${name}*…`);
+    const problem = await shareAttachment(client, { channel: channelId, threadTs, path: offer.path, workingDir: offer.workingDir });
+    await mark(problem ? `Couldn't share *${name}*: ${problem}.` : `<@${clicker}> shared *${name}*.`);
+  });
+
+  // The Stop button on a `processing` agent session (agentSession.ts).
+  app.event('agent_session_stopped', async ({ event, client }: any) => {
+    const key = threadKey(event.channel, event.thread_ts);
+    const run = agentRuns.get(key);
+    if (run) {
+      // Only the person the run is for may end it, even where the whole channel sees the button.
+      if (!mayStopRun(key, event.user)) {
+        console.warn(`[AGENT] ignored a Stop from ${event.user} on ${run.userId}'s run`);
+        // Slack took the thread off Working…, and the Stop button with it, when it
+        // was pressed; put both back so the owner can still stop their run.
+        // Through the turn, so it never lands after the turn has finished.
+        run.keepAlive();
+        return;
+      }
+      run.controller.abort();
+    } else {
+      await setSessionStatus(client, { channel: event.channel, threadTs: event.thread_ts, status: 'active' });
+    }
+  });
+
   // App Home
   app.event('app_home_opened', async ({ event, client }: any) => {
+    if (event.tab === 'messages') {
+      try {
+        if (!(await useAgentPath(client, event.user))) return;
+        const target = await activeTarget(event.user);
+        const label = target
+          ? (target.workstream === 'main' ? target.project.name : `${target.project.name}/${target.workstream}`)
+          : null;
+        await publishSuggestedPrompts(client, event.channel, suggestedPrompts(label, process.env.SLACK_COMMAND?.trim() || '/t'));
+      } catch (error) {
+        console.error('[AGENT] suggested prompts:', error);
+      }
+      return;
+    }
     try {
       activeHomeViewers.add(event.user);
       await publishHomeView(client, event.user);

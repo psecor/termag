@@ -14,6 +14,7 @@
  */
 
 import { refuseUnreadySessions, type SessionRefusal } from './sessionGate';
+import { QUARANTINED, QUARANTINED_OWNER_ERROR } from './boxQuarantinePolicy';
 
 export type PowerAction = 'stop' | 'start' | 'hibernate';
 
@@ -67,6 +68,7 @@ export function powerRequestError(
   }
   if (!box.ec2InstanceId) return { status: 409, error: 'This box has no EC2 instance yet' };
   if (box.autoTerminatedAt) return { status: 409, error: 'This box is being terminated automatically' };
+  if (box.status === QUARANTINED) return { status: 409, error: QUARANTINED_OWNER_ERROR };
   if (action === 'hibernate' && !box.hibernationConfigured) {
     return { status: 409, error: 'This box was launched without hibernation support. Stop it instead.' };
   }
@@ -89,6 +91,7 @@ export function powerStateError(status: string): string | null {
     case 'starting': return 'This box is starting. Try again once it is ready.';
     case 'hibernating': return 'This box is hibernating. Resume it once it has hibernated.';
     case 'hibernated': return 'This box is hibernated. Resume it from the Boxes list first.';
+    case QUARANTINED: return QUARANTINED_OWNER_ERROR;
     default: return null;
   }
 }
@@ -108,7 +111,8 @@ export const TERMINAL_BOX_PARKED_CLOSE_CODE = 4409;
 export interface TerminalBoxParkedNotice {
   type: 'box-power';
   instanceId: string;
-  status: ParkedStatus;
+  /** A quarantined box is parked for good: its pane shows why instead of "agent not connected". */
+  status: ParkedStatus | typeof QUARANTINED;
   message: string;
 }
 
@@ -172,6 +176,24 @@ export function isHibernateRefusal(err: unknown): boolean {
   return name === 'UnsupportedHibernationConfiguration' || /hibernat/i.test(message);
 }
 
+/**
+ * The note the 60-day refresh leaves when it stops a hibernated box instead
+ * of hibernating it again. It replaces the sweep's auto-hibernate note, which
+ * would promise memory the stop dropped (Bugbot on #766), and like it marks a
+ * box the sweep parked: a preview-share reviewer may wake it
+ * (boxLifecyclePolicy.isSweepStopped).
+ */
+export const REFRESH_STOP_NOTE = 'Stopped by the 60-day hibernation refresh, so its memory was not kept. '
+  + 'Start it to get its sessions back.';
+
+/**
+ * What a manual hibernate answers: parking never hibernates a box (waking a
+ * hibernated one has hung in `starting` with its agent never connecting,
+ * while a stop and a start has not). A hibernated box can still be resumed.
+ */
+export const HIBERNATE_OFF_ERROR = 'Hibernate is turned off for this box. Stop it instead; a start brings its projects back.';
+export const HIBERNATE_OFF_CODE = 'hibernate_off';
+
 /** Written to provisioningError when a hibernate falls back to a plain stop. */
 export function hibernateFallbackNote(reason: string): string {
   return `EC2 would not hibernate this box (${reason}), so it was stopped instead. `
@@ -184,6 +206,28 @@ export function hibernateFallbackNote(reason: string): string {
  * again, which restarts the clock and keeps its RAM.
  */
 export const DEFAULT_HIBERNATION_REFRESH_DAYS = 55;
+
+/**
+ * Whether a stop or hibernate asked of the box keeps its down clock
+ * (`downSince`, box.resumed's downMinutes) rather than ending it. The clock
+ * runs from when the box went down until it is up for use, and lives on the
+ * row so any orchestrator process, after any restart, reads the same thing.
+ * A box asked to go down from `starting` never came up, so its clock runs
+ * on. From `ready` it was up, and the clock ends here (the settle starts a new
+ * one), with one exception: the 60-day refresh's re-hibernate of a box that
+ * nobody used since the refresh's resume brought it up (no activity since
+ * `lastReadyAt`), which only woke the box to sleep again. A box an owner used
+ * in that window, or stopped themselves, was up for real.
+ */
+export function sleepKeepsDownClock(
+  box: { status: string; lastActivityAt?: Date | null; lastReadyAt?: Date | null },
+  by: string | null,
+): boolean {
+  if (box.status !== 'ready') return true;
+  if (by !== 'refresh') return false;
+  const usedSinceUp = !!box.lastActivityAt && !!box.lastReadyAt && box.lastActivityAt.getTime() >= box.lastReadyAt.getTime();
+  return !usedSinceUp;
+}
 
 /** 0 (BOX_HIBERNATION_REFRESH_DAYS=0) turns the refresh off. */
 export function hibernationRefreshMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {

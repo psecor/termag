@@ -29,10 +29,14 @@ import { systemHealth } from '../services/admin/systemQueries';
 import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHealth, pipelineHealth, REPORT_GROUPS } from '../services/admin/claudeRunnerQueries';
 import { prisma } from '../db';
 import { softwareMatrix, softwareHost, clientVersions } from '../services/software/queries';
-import { prSummary, prContributors, prTrend, prGroups, prIngestStatus, prReviews, prReviewers, prReviewTrend } from '../services/prAnalytics/queries';
+import { SUMMARY_HOSTS, summaryAnswer } from '../services/software/summary';
+import { prSummary, prContributors, prTrend, prGroups, prIngestStatus, prReviews, prReviewers, prReviewTrend, prTeamRepos, prTeams, loadTeamRoster, prTeamReviews, prTeamReviewers, prTeamReviewTrend, ALL_REPOS } from '../services/prAnalytics/queries';
 import { REVIEW_TREND_MAX_WEEKS } from '../services/prAnalytics/reviews';
 import { VIEWS, BASES } from '../services/prAnalytics/stats';
+import { boxCostReport } from '../services/boxCost/report';
 import { getSpendConfig, spendReport, spendTrendReport, TREND_MAX_WEEKS } from '../services/admin/spend/queries';
+import { AREAS, SEVERITIES, STATUSES, fillCounts, sortNewFirst } from '../services/bugReports';
+import { prismaBugReports } from '../services/bugReportsPrisma';
 
 const rangeArgs = {
   range: z.enum(['today', '7d', '30d']).optional().describe('Preset window (UTC day keys). Default 7d.'),
@@ -56,7 +60,7 @@ const STALENESS = {
 type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 const json = (v: unknown): ToolResult => ({ content: [{ type: 'text', text: JSON.stringify(v, null, 2) }] });
 
-function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
+export function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
   const server = new McpServer(
     { name: 'termag-admin', version: '0.1.0' },
     { instructions: `Read-only administrative view of one termag orchestrator: boxes, users, projects, live sessions, token usage, working time, behaviour signals, GitHub PR analytics and reviews per repo group, estimated AI spend and system health. Aggregates and metadata only — never terminal contents. This token cannot mint tokens, grant admin or take any action; those need a signed-in admin in the web UI. ${RANGE_NOTE}` },
@@ -155,8 +159,37 @@ function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
     { ...groupArg, weeks: z.number().int().min(1).max(REVIEW_TREND_MAX_WEEKS).optional().describe(`Default ${REVIEW_TREND_MAX_WEEKS}.`) },
     async a => notFound(await prReviewTrend(a.group, a.weeks ?? REVIEW_TREND_MAX_WEEKS)));
   tool('pr_ingest_status', 'PR ingestion health: whose GitHub token ingests, the ingester state and rate-limit headroom, repos backfilled out of total, PRs stored, and per-repo errors.', {}, () => prIngestStatus());
-  tool('software_summary', 'Deployed software: per component (termag commit, image, Claude hooks, Claude Code, Codex, Cursor, Devin, pi, Node, npm, gh, AWS CLI, tmux, git, Docker, Python, nginx, Envoy, otelcol, Postgres, OS, kernel) its reference version, how many hosts are current / behind / outdated / ahead / missing / unknown, and the spread of versions. Tools compare against the newest version in the fleet; termag and images against the newest box or orchestrator image.', {},
-    async () => { const m = await softwareMatrix(); return { summary: m.summary, targets: m.targets, collector: m.collector }; });
+  // Teams: a roster of people, scoped to a repo
+  // group for now. `group` is required, as the REST routes require it.
+  const teamArg = { ...prArgs, team: z.string().describe('Team key (pr_teams lists them).'), group: z.string().optional().describe('Repo group slug (pr_groups lists them); omit for every ingested repo.') };
+  const teamScope = async (a: { team: string }) => loadTeamRoster(a.team.trim().toLowerCase());
+  const noTeam = { error: 'no such team' };
+  tool('pr_teams', 'PR analytics teams: key, name, parent, hidden, and current and former member counts.', {}, () => prTeams());
+  tool('pr_team_summary', 'For one team in a repo group and the last 1, 7 and 30 days: the same PRs summary as pr_summary, scoped to the people on the team (and its sub-teams).',
+    teamArg, async a => { const s = await teamScope(a); return s ? notFound(await prSummary(a.group ?? ALL_REPOS, a.view ?? 'credited', a.basis ?? 'merged', new Date(), s)) : noTeam; });
+  tool('pr_team_members', 'Every person on a team (and its sub-teams) over 1, 7 or 30 days, zeros included: PRs, share of the team, agent PRs credited, agent-assisted PRs, median PR size, and the termag user when their GitHub is connected.',
+    { ...teamArg, window: z.union([z.literal(1), z.literal(7), z.literal(30)]).optional().describe('Days. Default 30.') },
+    async a => { const s = await teamScope(a); return s ? notFound(await prContributors(a.group ?? ALL_REPOS, a.view ?? 'credited', a.basis ?? 'merged', a.window ?? 30, 100, new Date(), s)) : noTeam; });
+  tool('pr_team_repos', 'Where a team ships: its PRs by repo over 1, 7 or 30 days.',
+    { ...teamArg, window: z.union([z.literal(1), z.literal(7), z.literal(30)]).optional().describe('Days. Default 30.') },
+    async a => { const s = await teamScope(a); return s ? notFound(await prTeamRepos(a.group ?? ALL_REPOS, a.view ?? 'credited', a.basis ?? 'merged', a.window ?? 30, s)) : noTeam; });
+  tool('pr_team_trend', 'Weekly (Monday UTC) PRs of a team by author class, PRs in the chosen view and distinct contributors.',
+    { ...teamArg, weeks: z.number().int().min(1).max(78).optional().describe('Default 26.') },
+    async a => { const s = await teamScope(a); return s ? notFound(await prTrend(a.group ?? ALL_REPOS, a.view ?? 'credited', a.basis ?? 'merged', a.weeks ?? 26, new Date(), s)) : noTeam; });
+  const sideArg = { ...teamArg, side: z.enum(['given', 'received']).describe('given: reviews by the team; received: reviews on the team\'s PRs.') };
+  tool('pr_team_reviews', 'For one team and the last 1, 7 and 30 days: reviews given by the team (by its members) or received (on PRs credited to them) — reviews, reviewers, per-reviewer distribution, approvals, changes requested, comment-only, inline comments, comments per merged PR and the approval split (received).',
+    sideArg, async a => { const s = await teamScope(a); return s ? notFound(await prTeamReviews(a.group ?? ALL_REPOS, a.side, s)) : noTeam; });
+  tool('pr_team_reviewers', 'Reviewers of a team over 1, 7 or 30 days: the team\'s own members with reviews given (zeros included), or the people who reviewed the team\'s PRs (received).',
+    { ...sideArg, window: z.union([z.literal(1), z.literal(7), z.literal(30)]).optional().describe('Days. Default 30.'), limit: z.number().int().min(1).max(100).optional().describe('Received only. Default 10.') },
+    async a => { const s = await teamScope(a); return s ? notFound(await prTeamReviewers(a.group ?? ALL_REPOS, a.side, s, a.window ?? 30, a.limit ?? 10)) : noTeam; });
+  tool('pr_team_review_trend', `Weekly (Monday UTC) reviews a team gave and received, and the reviewers on each side. Reviews are kept ${REVIEW_TREND_MAX_WEEKS} weeks back.`,
+    { ...teamArg, weeks: z.number().int().min(1).max(REVIEW_TREND_MAX_WEEKS).optional().describe(`Default ${REVIEW_TREND_MAX_WEEKS}.`) },
+    async a => { const s = await teamScope(a); return s ? notFound(await prTeamReviewTrend(a.group ?? ALL_REPOS, s, a.weeks ?? REVIEW_TREND_MAX_WEEKS)) : noTeam; });
+  tool('software_summary', 'Deployed software: per component (termag commit, image, Claude hooks, Claude Code, Codex, Cursor, Devin, pi, Node, npm, gh, AWS CLI, tmux, git, Docker, Python, nginx, Envoy, otelcol, Postgres, OS, kernel) its reference version, how many hosts are current / behind / outdated / ahead / missing / unknown, and the spread of versions. Tools compare against the newest version in the fleet; termag and images against the newest box or orchestrator image. '
+    + 'Offline hosts (agent not connected; the orchestrator always counts) keep their last inventory, often days old, and can dominate the counts. `summary` is always over every host and `online.summary` always without offline hosts (`online.offline` says how many were left out); `counted` says which the answer holds. '
+    + 'hosts: "both" (the default, so a caller that passes nothing sees both sets, labelled, and cannot take stale boxes for the live fleet; `summary` is what it was before this option), "online" (only `online`), or "all" (only `summary`, with `offline`).',
+    { hosts: z.enum(SUMMARY_HOSTS).optional().describe('Which hosts to count: both (default), online, or all.') },
+    async a => summaryAnswer(await softwareMatrix(), a.hosts ?? 'both'));
   tool('software_matrix', 'Every host (the orchestrator, each box, each per-user agent on the orchestrator) with each component\'s version and state. Filter by component, owner, or only cells that need updating.',
     { component: z.string().optional(), owner: z.string().optional(), needsUpdate: z.boolean().optional().describe('Only hosts with a behind or outdated cell.') },
     async a => {
@@ -180,7 +213,21 @@ function buildServer(actor: { id: string; tokenId: string | null }): McpServer {
   tool('spend_trend', 'Estimated AI spend per Monday-UTC week: metered cost by provider and each cost pool\'s termag share.',
     { weeks: z.number().int().min(1).max(TREND_MAX_WEEKS).optional().describe('Default 12.') },
     a => spendTrendReport(a.weeks ?? 12));
+  tool('box_cost', `What the AWS boxes cost over a range: metered hours from EC2 × effective rates from the bill (Savings Plan + EDP). Compute split active / idle / warm pool / booting / orphan (EC2 runs it, termag has no live row), root-volume storage in any power state, per day, per person and per box (most expensive first), and what parked boxes' volumes cost a month. ${RANGE_NOTE}`,
+    { ...rangeArgs, limit: z.number().int().min(1).max(500).optional().describe('Boxes and people to return, default 50.') },
+    async a => { const r = await boxCostReport(rangeFrom(a)); const n = a.limit ?? 50; return { ...r, people: r.people.slice(0, n), boxes: r.boxes.slice(0, n) }; });
   tool('spend_config', 'The spend model\'s assumptions: loaded cost per person, org headcount, the assumed model mix, the dated price table and the cost pools.', {}, () => getSpendConfig());
+  // The same store /api/admin/bug-reports reads. Read-only, like every tool
+  // here: triage is a PATCH that needs requireAdmin and a signed-in admin session.
+  tool('bug_reports', 'termag bug reports filed with `termag bug report`, new first: id, title, status, severity, area, reporter user id and box id, agent, GitHub link, duplicate pointer, plus counts per status. Filter by status, area and severity; q searches the title, body, command and error output. Bodies are included; secrets were redacted on filing.',
+    {
+      status: z.array(z.enum(STATUSES)).optional(), area: z.array(z.enum(AREAS)).optional(), severity: z.array(z.enum(SEVERITIES)).optional(),
+      q: z.string().max(200).optional(), limit: z.number().int().min(1).max(200).optional().describe('Default 50.'),
+    },
+    async a => ({
+      counts: fillCounts(await prismaBugReports.countsByStatus()),
+      reports: sortNewFirst(await prismaBugReports.list({ statuses: a.status, areas: a.area, severities: a.severity, search: a.q?.trim() || undefined, limit: a.limit ?? 50 })),
+    }));
   tool('system_health','Orchestrator process (version, uptime, memory, auth mode), connected agents, in-memory status map, usage-scan health, database size and per-table rows/bytes.', {}, () => systemHealth());
   tool('audit_log', 'Recent admin REST requests and MCP tool calls: who, what, args summary, outcome.',
     { ...rangeArgs, limit: z.number().int().min(1).max(1000).optional(), actorId: z.string().optional() },

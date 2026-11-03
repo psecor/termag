@@ -37,7 +37,8 @@ describe('recordBoxUpdateReport', () => {
     expect(await recordBoxUpdateReport('box-a', r)).toEqual({ boxName: 'ada-box', owner: 'ada' });
     expect(prisma.instance.update).toHaveBeenCalledWith({
       where: { id: 'box-a' },
-      data: { lastUpdateAt: r.at, lastUpdateOutcome: 'updated', lastUpdateDetail: 'pull=pulled:3 reconcile=clean deps=installed agent=restarted', lastUpdateCommit: SHA_B },
+      // updatePushedAt: null ends the lifecycle sweep's box-update hold on the orchestrator's receipt.
+      data: { lastUpdateAt: r.at, lastUpdateOutcome: 'updated', lastUpdateDetail: 'pull=pulled:3 reconcile=clean deps=installed agent=restarted', lastUpdateCommit: SHA_B, updatePushedAt: null },
     });
     expect(reportDetail(r)).toBe('pull=pulled:3 reconcile=clean deps=installed agent=restarted');
     vi.mocked(prisma.instance.findUnique).mockResolvedValue(null);

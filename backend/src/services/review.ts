@@ -7,6 +7,8 @@
 // pane classifier used by the GET route AND the review sweep) takes its send
 // function as a parameter for the same reason.
 import type { ProjectHost } from './agentRegistry';
+import { PANE_KIND_ENV } from './launchCommand';
+import { exactPaneTarget } from './tmux';
 import {
   classifyReviewerPane, DEFAULT_REVIEWER, isReviewerId, reviewerForForeground, reviewerLaunch, type ReviewerId,
 } from './reviewers';
@@ -116,6 +118,17 @@ export function chooseGuess(input: {
     return { number: input.pane.number, url: input.pane.url, title: null, branch: null, state: null, source: 'pane' };
   }
   return fromGh();
+}
+
+/**
+ * Which of a multi-repo workstream's repositories the guess reads gh from:
+ * the first (by position) whose branch has an open PR, else the first with any
+ * PR, so a merged one in an earlier repository never hides an open one in a
+ * later. -1 when none has a PR.
+ */
+export function guessRepoIndex(ghs: ReadonlyArray<{ state: string | null } | null>): number {
+  const open = ghs.findIndex(g => g?.state === 'OPEN');
+  return open >= 0 ? open : ghs.findIndex(g => g != null);
 }
 
 /** A URL is only attached to a PR when it is a GitHub PR URL for that very number. */
@@ -352,7 +365,8 @@ export function reviewPromptPath(home: string, session: string): string {
  */
 export function reviewLaunchCommand(session: string, reviewer: ReviewerId = DEFAULT_REVIEWER): string {
   const file = `"$HOME/${REVIEW_PROMPT_DIR}/${promptFileName(session)}"`;
-  return reviewerLaunch(reviewer, file);
+  // A pane like any other: the kind its resource has, for the tools the reviewer runs.
+  return `${PANE_KIND_ENV}${reviewerLaunch(reviewer, file)}`;
 }
 
 /** Is the review pane's foreground command Devin (still reviewing or at its prompt)? */
@@ -391,6 +405,39 @@ export function prFromLaunchEcho(text: string): { number: number; url: string | 
     first ??= { number: n, url: null };
   }
   return first;
+}
+
+// ── Which review slot a start takes ─────
+
+/** One of a workstream's review slots as the start route sees it: alive in tmux, and the PR its record names. */
+export interface ReviewSlotView {
+  slot: number;
+  alive: boolean;
+  pr: number | null;
+  url: string | null;
+}
+
+const PR_URL_REPO = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/i;
+
+/** Two PR links in one repository (the number is compared apart); two absent links match, one absent does not. */
+function sameRepo(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b;
+  const ra = PR_URL_REPO.exec(a)?.[1]?.toLowerCase();
+  return !!ra && ra === PR_URL_REPO.exec(b)?.[1]?.toLowerCase();
+}
+
+/**
+ * The slot a review of `want` starts in: the live pane already on that PR
+ * (repository and number) restarts, as Review always did; else the lowest
+ * slot with no live pane. A finished review is still alive (something to
+ * read) and keeps its slot until closed. None free: `full`.
+ */
+export function chooseReviewSlot(slots: ReviewSlotView[], want: { pr: number; url: string | null }): { slot: number; replaces: boolean } | { full: true } {
+  const ordered = [...slots].sort((a, b) => a.slot - b.slot);
+  const same = ordered.find(s => s.alive && s.pr === want.pr && sameRepo(s.url, want.url));
+  if (same) return { slot: same.slot, replaces: true };
+  const free = ordered.find(s => !s.alive);
+  return free ? { slot: free.slot, replaces: false } : { full: true };
 }
 
 // ── The tmux PR option and the shared pane probe ─────────────────
@@ -450,23 +497,25 @@ export async function probeReviewPane(
   session: string,
   rec: { pr: number; url: string | null; reviewer?: ReviewerId | null } | null,
 ): Promise<ReviewProbe> {
-  const r = await send(host, 'tmux-has-session', { sessionName: session }, 5000);
+  // Exact: a gone `…-review` would otherwise read its sibling `…-review-2`.
+  const target = exactPaneTarget(session);
+  const r = await send(host, 'tmux-has-session', { sessionName: target }, 5000);
   if (r?.exists !== true) {
     return { exists: false, state: null, pr: null, url: null, reviewer: rec?.reviewer ?? DEFAULT_REVIEWER, recovered: null, unrecoverable: false };
   }
   const [fg, cap] = await Promise.all([
-    send(host, 'tmux-foreground-cmd', { sessionName: session }, 5000).catch(() => null),
-    send(host, 'tmux-capture', { sessionName: session, lines: 40 }, 5000).catch(() => null),
+    send(host, 'tmux-foreground-cmd', { sessionName: target }, 5000).catch(() => null),
+    send(host, 'tmux-capture', { sessionName: target, lines: 40 }, 5000).catch(() => null),
   ]);
   let found: { pr: number; url: string | null; reviewer: ReviewerId | null } | null = null;
   let unrecoverable = false;
   if (!rec) {
-    const opt = await send(host, 'tmux-get-user-option', { sessionName: session, name: PR_OPTION }, 5000).catch(() => null);
+    const opt = await send(host, 'tmux-get-user-option', { sessionName: target, name: PR_OPTION }, 5000).catch(() => null);
     found = decodePrOption(opt?.value);
     if (!found) {
       // Scrollback rotated, or a hand-made session: the deep capture runs
       // once, and the caller remembers it found nothing (unrecoverable).
-      const deep = await send(host, 'tmux-capture', { sessionName: session, lines: 1000 }, 5000).catch(() => null);
+      const deep = await send(host, 'tmux-capture', { sessionName: target, lines: 1000 }, 5000).catch(() => null);
       const echo = deep ? prFromLaunchEcho(typeof deep?.content === 'string' ? deep.content : '') : null;
       if (echo) found = { pr: echo.number, url: echo.url, reviewer: null };
       else if (deep) unrecoverable = true;

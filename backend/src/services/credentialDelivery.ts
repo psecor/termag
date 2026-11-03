@@ -25,6 +25,8 @@ import { getGithubBrokerUrl } from './githubBroker';
 import { AGENT_TELEMETRY_CAPABILITY } from './launchCommand';
 import { listConnectors, mcpBrokerEnabledForBox } from './mcpConnectorStore';
 import { getMcpBrokerUrl } from './mcpConnectors';
+import { QUARANTINED } from './boxQuarantinePolicy';
+import { mcpAgentTargets } from '../providers/registry';
 
 export const CREDENTIALS_CAPABILITY = 'credentials-v1';
 // The box routes git and gh through the orchestrator's GitHub broker. An agent
@@ -43,6 +45,13 @@ export { AGENT_TELEMETRY_CAPABILITY };
 // the MCP broker with termag-mcp-headers. An agent
 // without it gets no mcp step.
 export const MCP_BROKER_CAPABILITY = 'mcp-broker-v1';
+// The box's mcp provider also takes `agents`: the other agent CLIs to register
+// each connector with, as a stdio entry that runs termag-mcp-bridge (the
+// registry's mcpConfig). The agent
+// advertises it only when its termag-credentials can, so a v2 box always gets
+// the key and a v1 box never does: its script refuses any key it does not
+// know.
+export const MCP_AGENTS_CAPABILITY = 'mcp-broker-v2';
 // The box writes pi's Fireworks provider and the Claude Code settings
 // `termag-credentials launch-settings` prints. An agent without
 // it gets no fireworks step.
@@ -146,7 +155,11 @@ export interface DeliveryInput {
   claudeSettings: Record<string, unknown> | null;
   claudeOffReason: string;
   // Set when the owner has a GitHub credential and the broker has a URL.
-  githubBroker: { url: string; login: string } | null;
+  // updatedAt is the credential row's, as ISO 8601: the box's agent keys its
+  // one-rerun-per-connection dotfiles retry on it (agent/on-claim.js), so a
+  // token the owner replaces on the Credentials page is a new connection and
+  // a reconnect's redelivery is not.
+  githubBroker: { url: string; login: string; updatedAt: string } | null;
   githubOffReason: string;
   // The stored GitHub row could not be read (KMS, a bad ciphertext). The box
   // gets no GitHub step, so a transient failure neither strips a working
@@ -157,8 +170,9 @@ export interface DeliveryInput {
   // agentTelemetrySettings, under the same condition.
   agentTelemetry?: { endpoint: string; resourceAttributes: string } | null;
   // The broker and the owner's connectors (ids and names only) when the broker
-  // is configured and mcp-broker-enabled is on for the owner and box.
-  mcp?: { broker: string; connectors: { id: string; name: string }[] } | null;
+  // is configured and mcp-broker-enabled is on for the owner and box, with the
+  // agent CLIs to register them with (mcpAgentTargets).
+  mcp?: { broker: string; connectors: { id: string; name: string }[]; agents?: string[] } | null;
   mcpOffReason?: string;
   // The connectors could not be read: no mcp step, as for githubUnknown.
   mcpUnknown?: boolean;
@@ -206,7 +220,7 @@ export function planDelivery(input: DeliveryInput, capabilities: string[]): Deli
     steps.push({
       type: 'credentials-apply',
       provider: 'github',
-      payload: { broker: input.githubBroker.url, login: input.githubBroker.login },
+      payload: { broker: input.githubBroker.url, login: input.githubBroker.login, updatedAt: input.githubBroker.updatedAt },
     });
   }
   if (capabilities.includes(TELEMETRY_CAPABILITY)) {
@@ -220,8 +234,10 @@ export function planDelivery(input: DeliveryInput, capabilities: string[]): Deli
       : { type: 'credentials-remove', provider: 'agent-telemetry', reason: REASONS.noAgentTelemetry });
   }
   if (capabilities.includes(MCP_BROKER_CAPABILITY) && !input.mcpUnknown) {
-    steps.push(input.mcp
-      ? { type: 'credentials-apply', provider: 'mcp', payload: { broker: input.mcp.broker, connectors: input.mcp.connectors } }
+    const payload: Record<string, unknown> | null = input.mcp ? { broker: input.mcp.broker, connectors: input.mcp.connectors } : null;
+    if (input.mcp && payload && capabilities.includes(MCP_AGENTS_CAPABILITY)) payload.agents = input.mcp.agents ?? [];
+    steps.push(payload
+      ? { type: 'credentials-apply', provider: 'mcp', payload }
       : { type: 'credentials-remove', provider: 'mcp', reason: input.mcpOffReason ?? REASONS.noMcpBroker });
   }
   if (capabilities.includes(FIREWORKS_CAPABILITY) && !input.fireworksUnknown) {
@@ -256,8 +272,8 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
   let githubError: Error | null = null;
   if (store) {
     try {
-      const github = await githubStoreDeps(store, userId).read();
-      if (github && brokerUrl) githubBroker = { url: brokerUrl, login: github.login };
+      const github = await githubStoreDeps(store, userId).readSnapshot();
+      if (github && brokerUrl) githubBroker = { url: brokerUrl, login: github.secret.login, updatedAt: github.updatedAt.toISOString() };
       else if (!github) githubOffReason = REASONS.notConnected;
     } catch (err) {
       githubError = err as Error;
@@ -288,7 +304,7 @@ async function mcpInputFor(userId: string, instanceId: string): Promise<Pick<Del
   try {
     if (!await mcpBrokerEnabledForBox(userId, instanceId)) return { mcp: null, mcpOffReason: REASONS.mcpOff };
     const connectors = (await listConnectors(userId)).map(c => ({ id: c.id, name: c.name }));
-    return { mcp: { broker, connectors } };
+    return { mcp: { broker, connectors, agents: mcpAgentTargets() } };
   } catch (err) {
     console.error(`[CRED] could not read MCP connectors for instance ${instanceId}:`, (err as Error).message);
     return { mcpUnknown: true };
@@ -349,6 +365,13 @@ export function deliverToInstance(instanceId: string, userId: string): Promise<v
 async function deliverToInstanceNow(instanceId: string, userId: string): Promise<void> {
   const agent = instanceAgentTransport(instanceId);
   if (!agent || !agent.capabilities.includes(CREDENTIALS_CAPABILITY)) return;
+  // Read now, not from the row the socket authenticated with: a box
+  // quarantined after its agent's token was checked must get nothing.
+  const box = await prisma.instance.findUnique({ where: { id: instanceId }, select: { status: true } });
+  if (!box || box.status === QUARANTINED || box.status === 'terminated') {
+    console.warn(`[CRED] instance ${instanceId} is ${box?.status ?? 'gone'}; delivering nothing`);
+    return;
+  }
   // A box that gets nothing is still told why.
   const refusal = refusalFor(agent);
   let firstError: Error | null = null;

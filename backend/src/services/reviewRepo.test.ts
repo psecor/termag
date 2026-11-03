@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../db', () => ({ prisma: {} }));
 vi.mock('./agentRegistry', () => ({ isProjectAgentConnected: vi.fn(), sendForProject: vi.fn() }));
 
-import { originFromGitConfig, prUrlFor, repoFromPrUrl, reviewTarget, workstreamRepo } from './reviewRepo';
+import { originFromGitConfig, prUrlFor, repoFromPrUrl, reviewTarget, workspaceRepos, workstreamRepo } from './reviewRepo';
 import type { ProjectHost } from './agentRegistry';
 
 const host = { instanceId: 'i-1', userId: 'u1' } as unknown as ProjectHost;
@@ -112,5 +112,20 @@ describe('reviewTarget', () => {
   });
   it('an unreadable remote starts the review as before', () => {
     expect(reviewTarget(342, null, { repo: null, known: false })).toEqual({ url: null, repo: null, mismatch: null });
+  });
+});
+
+describe('reviewTarget for a multi-repo workstream', () => {
+  const ws = workspaceRepos([{ url: 'https://github.com/acme/api', position: 1 }, { url: 'https://github.com/acme/web', position: 0 }]);
+  it('lists its repositories by position, with no single one', () => {
+    expect(ws).toEqual({ repo: null, known: true, repos: ['acme/web', 'acme/api'] });
+  });
+  it('refuses a bare number, naming the repositories', () => {
+    const t = reviewTarget(12, null, ws);
+    expect('refuse' in t && t.refuse).toMatch(/several repositories \(acme\/web, acme\/api\).*owner\/repo#12/);
+  });
+  it('takes a URL of one of them, and says when it is none of them', () => {
+    expect(reviewTarget(12, 'https://github.com/ACME/api/pull/12', ws)).toEqual({ url: 'https://github.com/ACME/api/pull/12', repo: 'ACME/api', mismatch: null });
+    expect(reviewTarget(12, 'https://github.com/acme/docs/pull/12', ws)).toMatchObject({ repo: 'acme/docs', mismatch: 'acme/web, acme/api' });
   });
 });

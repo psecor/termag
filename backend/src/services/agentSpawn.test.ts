@@ -5,6 +5,7 @@ import {
   SPAWNABLE_PROVIDERS,
   buildBrief,
   chooseSpawnProvider,
+  nameFromBranch,
   nudgeDecision,
   nudgeLine,
   nudgeLines,
@@ -48,10 +49,23 @@ describe('parseSpawnRequest', () => {
     expect(parseSpawnRequest({ task: 't', name: 'main' }).ok).toBe(false);
   });
 
+  it('takes a branch that may hold slashes, and refuses one git would not take', () => {
+    const r = parseSpawnRequest({ task: 't', branch: 'skz/ABC-123/fix-login' });
+    expect(r.ok && r.value.branch).toBe('skz/ABC-123/fix-login');
+    expect(parseSpawnRequest({ task: 't', branch: '../x' }).ok).toBe(false);
+    expect(parseSpawnRequest({ task: 't', branch: '-x' }).ok).toBe(false);
+    expect(parseSpawnRequest({ task: 't', branch: 'a b' }).ok).toBe(false);
+    // Refused before the spawn row and brief are written, not by git afterwards.
+    expect(parseSpawnRequest({ task: 't', branch: 'team/' }).ok).toBe(false);
+    expect(parseSpawnRequest({ task: 't', branch: 'a//b' }).ok).toBe(false);
+    expect(parseSpawnRequest({ task: 't', branch: 'a/.b' }).ok).toBe(false);
+  });
+
   it('keeps target-only fields on their target', () => {
     expect(parseSpawnRequest({ task: 't', boxId: 'b' }).ok).toBe(false);
     expect(parseSpawnRequest({ task: 't', target: 'project', projectId: 'p' }).ok).toBe(false);
     expect(parseSpawnRequest({ task: 't', target: 'project', baseRef: 'main' }).ok).toBe(false);
+    expect(parseSpawnRequest({ task: 't', target: 'project', branch: 'me/x' }).ok).toBe(false);
     expect(parseSpawnRequest({ task: 't', target: 'project', boxId: 'b', repoUrl: 'example-org/x' }).ok).toBe(true);
   });
 
@@ -105,6 +119,16 @@ describe('names', () => {
     expect(slugFromTask('a'.repeat(50))).toHaveLength(32);
   });
 
+  it('names a workstream after a branch, every slash a dash, at most 40 characters', () => {
+    expect(nameFromBranch('skz/ABC-123/fix-login')).toBe('skz-ABC-123-fix-login');
+    expect(nameFromBranch('feat/v1.2//x/')).toBe('feat-v1-2-x');
+    expect(nameFromBranch(`skz/${'x'.repeat(35)}/more`)).toBe(`skz-${'x'.repeat(35)}`);
+    expect(nameFromBranch('main')).toBe('');
+    expect(nameFromBranch('...')).toBe('');
+    expect(nameFromBranch('run/20261020/0900')).toBe('');
+    expect(nameFromBranch('run/20261020/0900/2')).toBe('');
+  });
+
   it('makes a name unique against taken ones, case-insensitively', () => {
     expect(uniqueName('fix', ['main'])).toBe('fix');
     expect(uniqueName('fix', ['Fix', 'fix-2'])).toBe('fix-3');
@@ -138,9 +162,9 @@ describe('providers', () => {
   it('keeps the telemetry wrapper around a prompted launch', () => {
     const caps = [AGENT_TELEMETRY_CAPABILITY];
     expect(launchCommandFor(spawnLaunchCommand('devin', 'ck1'), { capabilities: caps, provider: 'devin' }))
-      .toBe('termag-agent-otel devin -- devin --prompt-file "$HOME/.termag/spawn-prompts/ck1.md"');
+      .toBe('TERMAG_SESSION_KIND=interactive termag-agent-otel devin -- devin --prompt-file "$HOME/.termag/spawn-prompts/ck1.md"');
     expect(launchCommandFor(spawnLaunchCommand('claude', 'ck1'), { capabilities: caps, provider: 'claude' }))
-      .toBe('claude "$(cat "$HOME/.termag/spawn-prompts/ck1.md")"');
+      .toBe('TERMAG_SESSION_KIND=interactive claude "$(cat "$HOME/.termag/spawn-prompts/ck1.md")"');
   });
 
   it('writes the prompt under the box home', () => {

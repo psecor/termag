@@ -80,3 +80,35 @@ export function parseFireworksModels(value: unknown): FireworksModels | null {
 export function fireworksContext(fw: FireworksModels, id: string): number | null {
   return fw.models.find(m => m.id === id)?.context ?? null;
 }
+
+/**
+ * The box takes Fireworks' model list with a Claude Code launch: `launch-settings
+ * --models <list>`, and a chat send's or claim's `models`, become the /model
+ * menu. Advertised by an agent
+ * whose credentials script carries the marker (agent/credentials.js); an older
+ * script would read `--models` as the replay id.
+ */
+export const FIREWORKS_MENU_CAPABILITY = 'fireworks-menu-v1';
+
+/**
+ * The same list with a pi launch: `termag-pi-fireworks --models <list>` writes
+ * every model into pi's `termag-fireworks` provider, by label and with its
+ * window, for pi's /model. Advertised only
+ * while both box scripts carry their marker (agent/credentials.js): an older
+ * launcher would pass `--models` to pi, and an older pi-model refuses it.
+ */
+export const FIREWORKS_PI_MENU_CAPABILITY = 'fireworks-pi-menu-v1';
+
+// The most models a launch carries: the list is typed into the pane.
+const MENU_MAX = 32;
+
+/**
+ * The flag's models as `--models` carries them: base64 of
+ * `[{ "id", "label", "context"? }]`, in the flag's order (parseFireworksModels
+ * has dropped bad and repeated ids and filled missing labels). Base64 because
+ * labels have spaces and the value is typed into a shell.
+ */
+export function fireworksMenuArg(models: readonly FireworksModel[]): string {
+  const list = models.slice(0, MENU_MAX).map(m => ({ id: m.id, label: m.label, ...(m.context ? { context: m.context } : {}) }));
+  return Buffer.from(JSON.stringify(list), 'utf8').toString('base64');
+}

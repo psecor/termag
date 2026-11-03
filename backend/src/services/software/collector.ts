@@ -24,6 +24,7 @@ import { termagVersion } from '../termagVersion';
 import { hooksFromDetail } from './versions';
 import { parseInventoryReply, recordEntries, pruneChanges, ORCHESTRATOR_COMPONENTS, type Entry } from './store';
 import { singleFlight } from './runner';
+import { traceSweep } from '../tracing/spans';
 
 const execFileAsync = promisify(execFile);
 export const INVENTORY_CAPABILITY = 'software-inventory-v1';
@@ -124,6 +125,21 @@ async function lastAgentInventory(hostKey: string): Promise<number> {
   return at;
 }
 
+/**
+ * Ask one connected host for its inventory now (a tool update's report,
+ * services/toolUpdate/runs.ts), outside the sweep and its 6-hour
+ * gate. False when the host is not connected or cannot answer one.
+ */
+export async function refreshHostInventory(hostKey: string): Promise<boolean> {
+  const h = inventoryHosts().find(x => x.hostKey === hostKey);
+  if (!h || !h.capabilities.includes(INVENTORY_CAPABILITY)) return false;
+  // Stamped only once it worked: a failed ask must not hold the sweep's own
+  // ask off for 6 hours, or the tab shows the version from before the update.
+  await inventoryOf(h);
+  lastInventory.set(h.hostKey, Date.now());
+  return true;
+}
+
 export async function sweep(now = Date.now()): Promise<void> {
   status.lastSweepAt = new Date(now).toISOString();
   const force = forceNext;
@@ -181,11 +197,13 @@ export async function selfInventory(): Promise<void> {
 // ── lifecycle ──────────────────────────────────────────────────────────────
 let timer: NodeJS.Timeout | null = null;
 
-const runner = singleFlight(async () => {
+// The span covers the pass, not the tick: run() only starts one, and a
+// failing pass has to mark its own span to keep the trace.
+const runner = singleFlight(traceSweep('software', async () => {
   if (lastSelfAt === null || Date.now() - lastSelfAt > INVENTORY_EVERY_MS) await selfInventory();
   await sweep();
   status.lastError = null;
-}, err => {
+}), err => {
   status.lastError = err instanceof Error ? err.message : String(err);
   console.error('[SOFTWARE] sweep failed:', status.lastError);
 });

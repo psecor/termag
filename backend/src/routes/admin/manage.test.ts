@@ -30,7 +30,7 @@ describe('resolveUserKey', () => {
   });
   it('sends anything else to the id or username lookup', async () => {
     const l = lookups();
-    expect(await resolveUserKey('jdanger', l)).toEqual({ via: 'idOrUsername', k: 'jdanger' });
+    expect(await resolveUserKey('jdoe', l)).toEqual({ via: 'idOrUsername', k: 'jdoe' });
     expect(l.byEmail).not.toHaveBeenCalled();
   });
   it('returns null for a blank key without a query', async () => {

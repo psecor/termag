@@ -13,6 +13,7 @@ function matches(row: Record<string, any>, where: Record<string, any>): boolean 
     if (k === 'OR') return (v as any[]).some(w => matches(row, w));
     if (v && typeof v === 'object' && !(v instanceof Date)) {
       if ('in' in v) return v.in.includes(row[k]);
+      if ('notIn' in v) return !v.notIn.includes(row[k]);
       if ('not' in v) return row[k] !== v.not;
       if ('lt' in v) return row[k] != null && row[k] < v.lt;
     }
@@ -42,12 +43,15 @@ vi.mock('../db', () => ({
         for (const row of rows.values()) if (matches(row, where)) { Object.assign(row, data); count++; }
         return { count };
       },
+      findUnique: async ({ where }: any) => (rows.has(where.id) ? { ...rows.get(where.id) } : null),
       findMany: async ({ where, take }: any) =>
         [...rows.values()].filter(r => matches(r, where)).sort(byAttemptThenCreated).slice(0, take).map(r => ({ ...r })),
     },
   },
 }));
 vi.mock('./sshKeySync', () => ({ ownerAuthorizedKeyLines: async () => [] }));
+const resumed = vi.hoisted(() => [] as string[]);
+vi.mock('./boxQuarantine', () => ({ resumeQuarantineAfterLaunch: async (id: string) => { resumed.push(id); } }));
 
 // ── Fake EC2 + IAM, with the NotFound / DeleteConflict behavior of the real ones ──
 
@@ -58,6 +62,8 @@ const aws = {
   profiles: new Map<string, Set<string>>(),
   fail: new Map<string, string>(),   // command name -> error name it throws
   before: new Map<string, () => void>(), // command name -> runs once, before it is handled
+  refuseRun: null as ((input: any) => string | null) | null, // RunInstances input -> error name it throws
+  runs: [] as { type: string; subnet: string }[],
   sent: [] as string[],
   seq: 0,
 };
@@ -83,7 +89,11 @@ vi.mock('@aws-sdk/client-ec2', () => {
         case 'DescribeImages':
           return { Images: [{ ImageId: 'ami-1', CreationDate: '2026-10-01T00:00:00Z', RootDeviceName: '/dev/sda1', BlockDeviceMappings: [] }] };
         case 'CreateSecurityGroup': { const id = `sg-${++aws.seq}`; aws.sgs.add(id); return { GroupId: id }; }
-        case 'RunInstances': { const id = `i-${++aws.seq}`; aws.instances.set(id, 'running'); return { Instances: [{ InstanceId: id }] }; }
+        case 'RunInstances': {
+          aws.runs.push({ type: i.InstanceType, subnet: i.SubnetId });
+          const refused = aws.refuseRun?.(i);
+          if (refused) throw awsError(refused);
+          const id = `i-${++aws.seq}`; aws.instances.set(id, 'running'); return { Instances: [{ InstanceId: id }] }; }
         case 'DescribeInstances': {
           const state = aws.instances.get(i.InstanceIds[0]);
           if (!state) throw awsError('InvalidInstanceID.NotFound');
@@ -151,7 +161,7 @@ vi.mock('@aws-sdk/client-iam', () => {
   return mod;
 });
 
-const { terminateBox, sweepUncleanedTeardowns, provisionPoolBox } = await import('./boxProvisioner');
+const { terminateBox, sweepUncleanedTeardowns, provisionPoolBox, resetSubnetRotationForTests } = await import('./boxProvisioner');
 
 const PREFIX = 'termag-e2e-box';
 const ENV = {
@@ -200,11 +210,14 @@ beforeEach(() => {
   rows.clear();
   failUpdate = null;
   aws.instances.clear(); aws.sgs.clear(); aws.roles.clear(); aws.profiles.clear(); aws.fail.clear(); aws.before.clear();
+  aws.refuseRun = null; aws.runs = [];
   aws.sent = []; aws.seq = 0;
+  resumed.length = 0;
   for (const k of Object.keys(process.env)) if (k.startsWith('BOX_') || k === 'HOST_SECURITY_GROUP_ID') delete process.env[k];
   Object.assign(process.env, ENV);
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 describe('terminateBox', () => {
@@ -414,6 +427,28 @@ describe('launchBox records each handle as it is created', () => {
     expect(rows.get('a')).toMatchObject({ ec2InstanceId: 'i-2', hostname: null, status: 'warming', provisioningError: null });
   });
 
+  it('never boots an instance for a box quarantined while its SG and role were made', async () => {
+    aws.before.set('CreateInstanceProfile', () => { rows.get('a')!.status = 'quarantined'; });
+    expect(await pool('a')).toBe(false);
+    expect(aws.sent).not.toContain('RunInstances');
+    expect(rows.get('a')).toMatchObject({ status: 'quarantined', securityGroupId: 'sg-1', iamRoleName: `${PREFIX}-a`, ec2InstanceId: null });
+    expect(resumed).toEqual([]);
+  });
+
+  it('contains an instance whose launch was in flight when the box was quarantined', async () => {
+    aws.before.set('RunInstances', () => { rows.get('a')!.status = 'quarantined'; });
+    expect(await pool('a')).toBe(false);
+    expect(rows.get('a')).toMatchObject({ status: 'quarantined', ec2InstanceId: 'i-2' });
+    expect(resumed).toEqual(['a']);
+  });
+
+  it('never moves a quarantined box to failed when its launch fails', async () => {
+    aws.before.set('CreateRole', () => { rows.get('a')!.status = 'quarantined'; });
+    aws.fail.set('CreateRole', 'ServiceFailure');
+    expect(await pool('a')).toBe(false);
+    expect(rows.get('a')!.status).toBe('quarantined');
+  });
+
   it('reopens a finished teardown when a launch records a resource after it', async () => {
     seed('a', { status: 'terminated', cleanedUpAt: minutesAgo(1) });
     // The launch for this row is still running and creates its SG now.
@@ -424,5 +459,65 @@ describe('launchBox records each handle as it is created', () => {
     expect(row.cleanedUpAt).toBeNull();
     // ...and the failure does not move it out of `terminated`, where the sweep looks.
     expect(row.status).toBe('terminated');
+  });
+});
+
+describe('launchBox falls back on capacity refusals', () => {
+  const pool = (id: string) => provisionPoolBox({
+    instance: seed(id, { status: 'warming', userId: null, terminatedAt: null, region: null }) as Instance,
+    token: 'tmag_test',
+    poolSpecHash: 'hash',
+  });
+  beforeEach(() => {
+    process.env.BOX_INSTANCE_TYPE = 'm9g.2xlarge';
+    process.env.BOX_FALLBACK_SUBNET_IDS = 'subnet-2,subnet-3';
+    process.env.BOX_FALLBACK_INSTANCE_TYPES = 'm8g.2xlarge';
+    resetSubnetRotationForTests();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  it('starts each launch in the next subnet, wrapping around', async () => {
+    for (const id of ['a', 'b', 'c', 'd']) expect(await pool(id)).toBe(true);
+    expect(aws.runs.map(r => r.subnet)).toEqual(['subnet-1', 'subnet-2', 'subnet-3', 'subnet-1']);
+  });
+
+  it('walks on from where the rotation started, wrapping to the first subnet', async () => {
+    expect(await pool('a')).toBe(true);
+    aws.runs.length = 0;
+    aws.refuseRun = i => (i.SubnetId !== 'subnet-1' ? 'InsufficientInstanceCapacity' : null);
+    expect(await pool('b')).toBe(true);
+    expect(aws.runs.map(r => r.subnet)).toEqual(['subnet-2', 'subnet-3', 'subnet-1']);
+  });
+
+  it('tries the configured type in every subnet before the next type', async () => {
+    aws.refuseRun = i => (i.InstanceType === 'm9g.2xlarge' ? 'InsufficientInstanceCapacity' : null);
+    expect(await pool('a')).toBe(true);
+    expect(aws.runs).toEqual([
+      { type: 'm9g.2xlarge', subnet: 'subnet-1' },
+      { type: 'm9g.2xlarge', subnet: 'subnet-2' },
+      { type: 'm9g.2xlarge', subnet: 'subnet-3' },
+      { type: 'm8g.2xlarge', subnet: 'subnet-1' },
+    ]);
+    expect(rows.get('a')).toMatchObject({ status: 'warming', ec2InstanceId: expect.stringMatching(/^i-/) });
+  });
+
+  it('stops at the first subnet with room', async () => {
+    aws.refuseRun = i => (i.SubnetId === 'subnet-1' ? 'InsufficientInstanceCapacity' : null);
+    expect(await pool('a')).toBe(true);
+    expect(aws.runs.map(r => r.subnet)).toEqual(['subnet-1', 'subnet-2']);
+  });
+
+  it('does not walk on for the vCPU quota, which every candidate shares', async () => {
+    aws.refuseRun = () => 'VcpuLimitExceeded';
+    expect(await pool('a')).toBe(false);
+    expect(aws.runs).toHaveLength(1);
+    expect(rows.get('a')).toMatchObject({ status: 'failed', provisioningError: 'VcpuLimitExceeded' });
+  });
+
+  it('fails with the last refusal once every candidate is out of capacity', async () => {
+    aws.refuseRun = () => 'InsufficientInstanceCapacity';
+    expect(await pool('a')).toBe(false);
+    expect(aws.runs).toHaveLength(6);
+    expect(rows.get('a')).toMatchObject({ status: 'failed', provisioningError: 'InsufficientInstanceCapacity' });
   });
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Row = Record<string, any>;
 
@@ -276,7 +276,7 @@ describe('a repo pick on a box', () => {
 
     expect(keysSent()).toHaveLength(1);
     expect(keysSent()[0]).toContain('GIT_CONFIG_GLOBAL=/dev/null git fetch --progress origin');
-    expect(keysSent()[0]).toContain('&& claude');
+    expect(keysSent()[0]).toContain('&& TERMAG_SESSION_KIND=interactive claude');
     expect(types()).toEqual(['tmux-create', 'tmux-create', 'tmux-foreground-cmd', 'tmux-send-keys']);
     expect(project().setupStatus).toBe('none');
   });
@@ -309,7 +309,7 @@ describe('a repo pick on a box', () => {
 
     expect(keysSent()).toHaveLength(1);
     expect(keysSent()[0]).toContain('git fetch --progress origin');
-    expect(keysSent()[0]).toContain('&& claude');
+    expect(keysSent()[0]).toContain('&& TERMAG_SESSION_KIND=interactive claude');
     expect(project()).toMatchObject({ setupStatus: 'none', setupAttempt: 1, setupError: null });
   });
 
@@ -342,6 +342,41 @@ describe('a repo pick on a box', () => {
   });
 });
 
+describe('a create on a box that is up but still waiting for its GitHub delivery', () => {
+  // An orchestrator that delivers GitHub at all (deliversGithub): the credential store and the broker.
+  beforeEach(() => {
+    vi.stubEnv('CREDENTIAL_STORE_KMS_KEY_ID', 'arn:aws:kms:us-east-2:000000000000:key/k');
+    vi.stubEnv('GITHUB_BROKER_URL', 'https://agent.termag.example.com');
+  });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('answers at once, and types the pane checkout once the delivery lands', async () => {
+    db.credentials = [{ userId: 'u1', provider: 'github' }];
+    connect([]);
+    const started = Date.now();
+    const result = await createWidget();
+    // The request does not wait out the delivery (up to 30 s): the session opens and shows its checkout pending.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.status).toBe(201);
+    expect(result.body).toMatchObject({ setupStatus: 'pending' });
+    expect(keysSent()).toEqual([]);
+
+    db.instances[0].githubDeliveredAt = new Date();
+    await vi.waitFor(() => expect(keysSent()).toHaveLength(1), { timeout: 3_000 });
+    expect(keysSent()[0]).toContain('git fetch --progress origin');
+    expect(project().setupStatus).toBe('none');
+  });
+
+  it('types the pane checkout in the create when the delivery has already landed', async () => {
+    db.credentials = [{ userId: 'u1', provider: 'github' }];
+    db.instances[0].githubDeliveredAt = new Date();
+    connect([]);
+    await createWidget();
+    expect(keysSent()).toHaveLength(1);
+    expect(project().setupStatus).toBe('none');
+  });
+});
+
 describe('what the box reports', () => {
   beforeEach(async () => {
     await createWidget();
@@ -358,7 +393,7 @@ describe('what the box reports', () => {
     expect(await applySetupEvent({ projectId: 'p1', instanceId: 'box1' }, report(0, 'ready', { branch: 'trunk' })))
       .toEqual({ kind: 'ignored', why: 'report-ready while ready' });
 
-    expect(keysSent()).toEqual(['claude']);
+    expect(keysSent()).toEqual(['TERMAG_SESSION_KIND=interactive claude']);
     expect(project()).toMatchObject({ setupStatus: 'ready', repoDefaultBranch: 'trunk', setupError: null });
     expect(mainBranch()).toBe('trunk');
   });
@@ -467,7 +502,7 @@ describe('the replay the create came from', () => {
     expect(project().launchReplaySessionId).toBe(RID);
 
     expect(await applySetupEvent(target, report(0, 'ready', { branch: 'trunk' }))).toEqual({ kind: 'applied', from: 'cloning', to: 'ready' });
-    expect(keysSent()).toEqual([`claude --settings "$(TERMAG_PROJECT=widget TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${RID})"`]);
+    expect(keysSent()).toEqual([`TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=widget TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${RID})"`]);
     expect(project()).toMatchObject({ setupStatus: 'ready', launchReplaySessionId: null });
   });
 
@@ -480,7 +515,7 @@ describe('the replay the create came from', () => {
     await redispatchClones(connect(CAPABLE));
     await applySetupEvent(target, report(0, 'cloning'));
     await applySetupEvent(target, report(0, 'ready', { branch: 'trunk' }));
-    expect(keysSent()).toEqual(['claude']);
+    expect(keysSent()).toEqual(['TERMAG_SESSION_KIND=interactive claude']);
     expect(project().launchReplaySessionId).toBeNull();
   });
 
@@ -544,7 +579,7 @@ describe('retry and start empty', () => {
       { type: 'init-wiki', payload: { dir: DIR, slug: 'widget', username: 'alice' } },
     ]);
     expect(types().slice(2)).toEqual(['tmux-create', 'tmux-create', 'tmux-foreground-cmd', 'tmux-send-keys']);
-    expect(keysSent()).toEqual(['claude']);
+    expect(keysSent()).toEqual(['TERMAG_SESSION_KIND=interactive claude']);
   });
 
   it('start empty needs the box agent', async () => {
@@ -558,6 +593,37 @@ describe('retry and start empty', () => {
     const other = { ...user, id: 'u2' } as Express.User;
     expect(await retryCloneFor(other, 'p1')).toEqual({ status: 404, body: { error: 'Project not found' } });
     expect(await startEmptyFor(other, 'p1')).toEqual({ status: 404, body: { error: 'Project not found' } });
+  });
+});
+
+describe('a multi-repo project and the single-repository setup', () => {
+  beforeEach(async () => {
+    await createWidget();
+    Object.assign(project(), { layout: 'workspace', repoUrl: null });
+    state.sent = [];
+  });
+
+  it('is left alone by a hello: no empty dir, no sessions in a root with no marker yet', async () => {
+    connect(CAPABLE);
+    const outcome = await applySetupEvent({ projectId: 'p1', instanceId: 'box1' }, { kind: 'agent-connected', capabilities: CAPABLE });
+    expect(outcome).toMatchObject({ kind: 'ignored' });
+    expect(state.sent).toEqual([]);
+    expect(project().setupStatus).toBe('pending');
+  });
+
+  it('cannot start empty', async () => {
+    connect(CAPABLE);
+    project().setupStatus = 'failed';
+    expect(await startEmptyFor(user, 'p1')).toMatchObject({ status: 409 });
+    expect(state.sent).toEqual([]);
+    expect(project().setupStatus).toBe('failed');
+  });
+
+  it('is not brought back by a new project of its name: un-archived, it would have no clones', async () => {
+    project().archived = true;
+    const result = await createProjectFor(user, { name: 'widget', instanceId: 'box2', initialAgent: { enabled: true, provider: 'claude' } });
+    expect(result).toMatchObject({ status: 409, body: { error: expect.stringContaining('several repositories') } });
+    expect(project()).toMatchObject({ archived: true, instanceId: 'box1' });
   });
 });
 

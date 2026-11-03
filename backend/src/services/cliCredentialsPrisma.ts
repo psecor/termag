@@ -5,7 +5,7 @@ import { CredentialStoreUnavailableError } from './cliCredentials';
 import { deliverToUserBoxes } from './credentialDelivery';
 import { getCredentialStoreConfig, githubStoreDeps, readGithubOrgAccess } from './credentialStore';
 import { connectGithub } from './githubCredential';
-import { listSshKeys } from './sshKeyRegistration';
+import { listSshKeys, removeSshKey } from './sshKeyRegistration';
 
 /** The same reads and writes as the Settings page (routes/credentials.ts, routes/sshKeys.ts). */
 export const prismaCliCredentials: CliCredentials = {
@@ -27,6 +27,7 @@ export const prismaCliCredentials: CliCredentials = {
   },
 
   listSshKeys,
+  removeSshKey,
 
   async connectGithub(userId, token) {
     const cfg = getCredentialStoreConfig();

@@ -5,7 +5,7 @@
  * reports what the box did; this module decides whether that is enough to
  * revoke.
  */
-import { ChatClearResult, clearChatsOnBox } from './chatRunner';
+import { ChatClearResult, ChatWorkstream, clearChatsOnBox } from './chatRunner';
 
 export interface ChatKeyRow {
   chatKey: string;
@@ -40,6 +40,17 @@ export function deadChatKeys(projects: readonly ProjectChatShape[], keys: readon
 }
 
 /**
+ * What a skipped clear means to the person who asked. An agent from before
+ * the chat runner's chat-clear (#408) answers "Unknown command"; it may still
+ * have a turn running (chat-send came first, in #404), so the revoke stays
+ * refused and the message says how to get past it.
+ */
+const SKIPPED_WHY: Record<Extract<ChatClearResult, { skipped: string }>['skipped'], string> = {
+  'runner-missing': "the box's agent predates the chat runner; it needs an update and a restart",
+  offline: "the box's agent went offline",
+};
+
+/**
  * Why a revoke must not proceed, or null when it may.
  *
  * An offline box is allowed to archive: the next hello refuses those chats.
@@ -58,7 +69,7 @@ export function chatRevokeError(
     return null;
   }
   for (const result of results) {
-    if ('skipped' in result) return `Could not stop the chat on workstream ${result.workstream} (${result.skipped})`;
+    if ('skipped' in result) return `Could not stop the chat on workstream ${result.workstream}: ${SKIPPED_WHY[result.skipped]}`;
     if ('error' in result) return `Could not stop the chat on workstream ${result.workstream}: ${result.error}`;
     if (result.stopped !== true) return `Could not stop the chat on workstream ${result.workstream}`;
   }
@@ -70,10 +81,10 @@ export async function revokeChats(
   send: (type: string, payload: Record<string, unknown>) => Promise<unknown>,
   connected: boolean,
   projectId: string,
-  workstreamIds: readonly string[],
+  workstreams: readonly ChatWorkstream[],
   opts?: { offlineBlocks?: boolean },
 ): Promise<string | null> {
   if (!connected) return chatRevokeError(false, [], opts);
-  const results = await clearChatsOnBox(send, projectId, workstreamIds);
+  const results = await clearChatsOnBox(send, projectId, workstreams);
   return chatRevokeError(true, results);
 }

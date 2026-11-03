@@ -35,6 +35,7 @@ const { ensureAgentSessionsAndLaunch, reconstructInstanceSessions, setPaneLaunch
 // Launches here follow one another into the same pane; the post-launch settle would only add waits.
 setPaneLaunchSettleForTests(0);
 const { SessionGateError } = await import('./sessionGate');
+const { resetClaimUpdateGate, trackClaimUpdate } = await import('./claimUpdateGate');
 
 const launch = {
   userId: 'u1',
@@ -54,6 +55,33 @@ beforeEach(() => {
   state.capabilities = [];
   state.sent = [];
   vi.clearAllMocks();
+  resetClaimUpdateGate();
+});
+
+// A box just claimed from the pool runs current main before its first launch (claimUpdate.ts).
+describe('ensureAgentSessionsAndLaunch on a box whose claim update is running', () => {
+  it('sends nothing to the box until the update is done, then launches', async () => {
+    let done!: () => void;
+    trackClaimUpdate('box1', new Promise<void>(r => { done = r; }));
+
+    const launched = ensureAgentSessionsAndLaunch(launch);
+    await new Promise(r => setTimeout(r, 20));
+    expect(state.sent).toEqual([]);
+
+    done();
+    await expect(launched).resolves.toBe('launched');
+    expect(state.sent.map(s => s.type)).toContain('tmux-send-keys');
+  });
+
+  it('launches when the update fails, as it does after a timeout', async () => {
+    trackClaimUpdate('box1', Promise.reject(new Error('box-update failed')));
+    await expect(ensureAgentSessionsAndLaunch(launch)).resolves.toBe('launched');
+  });
+
+  it('does not wait for another box', async () => {
+    trackClaimUpdate('box2', new Promise<void>(() => {}));
+    await expect(ensureAgentSessionsAndLaunch(launch)).resolves.toBe('launched');
+  });
 });
 
 describe('ensureAgentSessionsAndLaunch session gate', () => {
@@ -92,7 +120,7 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
       { type: 'tmux-create', payload: { sessionName: 'alice-research-agent', cwd: dir } },
       { type: 'tmux-create', payload: { sessionName: 'alice-research-ctrl', cwd: dir } },
       { type: 'tmux-foreground-cmd', payload: { sessionName: 'alice-research-agent' } },
-      { type: 'tmux-send-keys', payload: { sessionName: 'alice-research-agent', keys: 'claude', withEnter: true } },
+      { type: 'tmux-send-keys', payload: { sessionName: 'alice-research-agent', keys: 'TERMAG_SESSION_KIND=interactive claude', withEnter: true } },
     ]);
   });
 
@@ -122,7 +150,7 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
       payload: {
         sessionName: 'alice-research-agent',
         // The pane's project and workstream ride ahead of the box script (services/launchCommand.ts).
-        keys: `git clone x && claude --settings "$(TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${replaySessionId})"`,
+        keys: `git clone x && TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${replaySessionId})"`,
         withEnter: true,
       },
     }]);
@@ -131,18 +159,18 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
   it('types the bare command on a box without the subcommand', async () => {
     state.capabilities = ['credentials-v1', 'telemetry-v1'];
     expect(await ensureAgentSessionsAndLaunch({ ...launch, replaySessionId: 'huuhcqcev124emZ9urmRjjPSNXLl' })).toBe('launched');
-    expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['claude']);
+    expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['TERMAG_SESSION_KIND=interactive claude']);
   });
 
   it('types the project and workstream without a replay when the box can print them, else the bare command', async () => {
     state.capabilities = ['telemetry-replay-v1'];
     expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');
     expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys))
-      .toEqual(['claude --settings "$(TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch -)"']);
+      .toEqual(['TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch -)"']);
     state.sent = [];
     state.capabilities = ['credentials-v1'];
     expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');
-    expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['claude']);
+    expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys)).toEqual(['TERMAG_SESSION_KIND=interactive claude']);
   });
 
   it("starts a Codex pane through the bridge, naming the pane's project and workstream for its resource", async () => {
@@ -152,6 +180,29 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
       type: 'codex-session-start',
       payload: { sessionName: 'alice-research-agent', cwd: dir, project: 'research', workstream: 'main' },
     }]);
+  });
+
+  it('resumes a Codex pane by id only when a tool update names the conversation; a bare resume starts fresh as before', async () => {
+    const id = '01a18c85-d963-7800-93d4-991c84da09d5';
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex', resume: true, resumeSessionId: id })).toBe('launched');
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex', resume: true })).toBe('launched');
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex', resumeSessionId: id })).toBe('launched');
+    expect(state.sent.filter(s => s.type === 'codex-session-start').map(s => s.payload)).toEqual([
+      { sessionName: 'alice-research-agent', cwd: dir, project: 'research', workstream: 'main', resumeSessionId: id },
+      { sessionName: 'alice-research-agent', cwd: dir, project: 'research', workstream: 'main' },
+      { sessionName: 'alice-research-agent', cwd: dir, project: 'research', workstream: 'main' },
+    ]);
+  });
+
+  it('resumes a Cursor pane by chat id only on a tool update\'s relaunch; anything else launches as before', async () => {
+    const chat = '3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b';
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'cursor', resume: true, resumeSessionId: chat })).toBe('launched');
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'cursor', resume: true })).toBe('launched');
+    expect(await ensureAgentSessionsAndLaunch({ ...launch, provider: 'cursor', resume: true, resumeSessionId: 'x; rm -rf ~' })).toBe('launched');
+    const keys = state.sent.filter(s => s.type === 'tmux-send-keys').map(s => String(s.payload.keys));
+    expect(keys).toHaveLength(3);
+    expect(keys[0]).toContain(`cursor-agent --resume ${chat}`);
+    for (const k of keys.slice(1)) { expect(k).toContain('cursor-agent'); expect(k).not.toContain('--resume'); expect(k).not.toContain('rm -rf'); }
   });
 
   it('reports a pane that already has git or an agent in it, and types nothing', async () => {
@@ -186,7 +237,7 @@ describe('reconstruction and setup status', () => {
     expect(state.sent.filter(s => s.type !== 'tmux-foreground-cmd')).toEqual([
       { type: 'tmux-create', payload: { sessionName: 'alice-notes-agent', cwd: '/home/alice/termag/projects/notes' } },
       { type: 'tmux-create', payload: { sessionName: 'alice-notes-ctrl', cwd: '/home/alice/termag/projects/notes' } },
-      { type: 'tmux-send-keys', payload: { sessionName: 'alice-notes-agent', keys: 'claude --continue', withEnter: true } },
+      { type: 'tmux-send-keys', payload: { sessionName: 'alice-notes-agent', keys: 'TERMAG_SESSION_KIND=interactive claude --continue', withEnter: true } },
     ]);
   });
 

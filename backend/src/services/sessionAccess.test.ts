@@ -23,12 +23,16 @@ vi.mock('../db', () => ({
   },
 }));
 
-const { legalSessions, isSessionRole, isOnCallerHost, terminalSessionAccess, SESSION_ROLES } = await import('./sessionAccess');
+const { legalSessions, isSessionRole, isOnCallerHost, parseReviewSlot, projectSessionAccess, terminalSessionAccess, SESSION_ROLES } = await import('./sessionAccess');
+const { MAX_REVIEW_SLOTS } = await import('./tmux');
 
 describe('legalSessions', () => {
   it('builds every role for main, collapsing the workstream segment', () => {
     expect(legalSessions('alice', 'termag', ['main'])).toEqual([
       'alice-termag-agent', 'alice-termag-ctrl', 'alice-termag-data', 'alice-termag-data-ctrl', 'alice-termag-review',
+      // Review slots 2..8.
+      'alice-termag-review-2', 'alice-termag-review-3', 'alice-termag-review-4', 'alice-termag-review-5',
+      'alice-termag-review-6', 'alice-termag-review-7', 'alice-termag-review-8',
     ]);
   });
   it('threads non-main workstreams through the name', () => {
@@ -39,7 +43,7 @@ describe('legalSessions', () => {
     expect(legalSessions('alice', 'termag', [])).toEqual(legalSessions('alice', 'termag', ['main']));
   });
   it('covers all workstreams × roles', () => {
-    expect(legalSessions('alice', 'p', ['main', 'a', 'b'])).toHaveLength(3 * SESSION_ROLES.length);
+    expect(legalSessions('alice', 'p', ['main', 'a', 'b'])).toHaveLength(3 * (SESSION_ROLES.length + MAX_REVIEW_SLOTS - 1));
   });
   it('handles hyphenated project and workstream names verbatim', () => {
     expect(legalSessions('alice', 'ic-sample-app', ['small-fixes']))
@@ -69,6 +73,31 @@ describe('isOnCallerHost', () => {
   it('is false for a browser session, which has no host', () => {
     expect(isOnCallerHost(null, undefined)).toBe(false);
     expect(isOnCallerHost('box-1', undefined)).toBe(false);
+  });
+});
+
+describe('review slots (docs/parallel-reviews.md)', () => {
+  it('attaches every review slot of a workstream, and no slot past the last', async () => {
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-review-3')).toMatchObject({ role: 'review', slot: 3, session: 'alice-myproj-review-3' });
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-review')).toMatchObject({ role: 'review', slot: 1 });
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-feature-review-8', 'feature')).toMatchObject({ slot: 8 });
+    for (const target of ['alice-myproj-review-9', 'alice-myproj-review-1', 'alice-myproj-review-02', 'alice-myproj-review-']) {
+      expect(await terminalSessionAccess('u-bob', 'p-myproj', target)).toEqual({ refusal: 'session/project mismatch' });
+    }
+  });
+  it('builds a slot only for the review role, and only 1 to 8', async () => {
+    const forPane = await projectSessionAccess('u-alice', 'p-myproj');
+    expect(forPane('review', 'main', 2)).toMatchObject({ session: 'alice-myproj-review-2', slot: 2 });
+    expect(forPane('review', 'main')).toMatchObject({ session: 'alice-myproj-review', slot: 1 });
+    expect(forPane('agent', 'main')).toMatchObject({ slot: null });
+    expect(() => forPane('agent', 'main', 2)).toThrow(/only for the review role/);
+    expect(() => forPane('review', 'main', 9)).toThrow(/slot must be 1 to 8/);
+  });
+  it('parses a slot from a request, absent being slot 1', () => {
+    expect(parseReviewSlot(undefined)).toEqual({ ok: true, slot: 1 });
+    expect(parseReviewSlot('4')).toEqual({ ok: true, slot: 4 });
+    expect(parseReviewSlot(8)).toEqual({ ok: true, slot: 8 });
+    for (const bad of [0, 9, '2.5', 'x', -1, 1.5]) expect(parseReviewSlot(bad).ok).toBe(false);
   });
 });
 

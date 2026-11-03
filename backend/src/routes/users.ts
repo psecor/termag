@@ -5,25 +5,32 @@
  *
  * A signed-in user only (the session; agent tokens never reach it), never
  * themselves, and rate-limited per user. Fewer than 2 characters answer [].
- * services/userSearch.ts says what matches.
+ * services/userSearch.ts says what matches. The desktop app's share dialog
+ * asks the same through its CLI mirror (routes/cliPreviewShares.ts), a device
+ * sign-in's only.
  */
 import { Router, type Request, type Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
 import { asyncHandler } from '../middleware/errors';
 import { PEOPLE_MAX_QUERY, searchPeople, type Person } from '../services/userSearch';
+import { sendResult, type RouteResult } from './routeResult';
 
 export interface UsersRouteDeps {
   search(query: string, selfId: string): Promise<Person[]>;
+}
+
+export async function searchPeopleFor(deps: UsersRouteDeps, selfId: string, rawQuery: unknown): Promise<RouteResult> {
+  const q = typeof rawQuery === 'string' ? rawQuery : '';
+  if (q.length > PEOPLE_MAX_QUERY) return { status: 400, body: { error: `q is at most ${PEOPLE_MAX_QUERY} characters` } };
+  return { status: 200, body: { people: await deps.search(q, selfId) } };
 }
 
 export function usersRouter(deps: UsersRouteDeps = { search: searchPeople }): Router {
   const router = Router();
   const limit = rateLimit({ capacity: 30, perMinute: 60, keyOf: req => req.user?.id ?? req.ip ?? 'anon' });
   router.get('/search', requireAuth, limit, asyncHandler(async (req: Request, res: Response) => {
-    const q = typeof req.query.q === 'string' ? req.query.q : '';
-    if (q.length > PEOPLE_MAX_QUERY) { res.status(400).json({ error: `q is at most ${PEOPLE_MAX_QUERY} characters` }); return; }
-    res.json({ people: await deps.search(q, req.user!.id) });
+    sendResult(res, await searchPeopleFor(deps, req.user!.id, req.query.q));
   }));
   return router;
 }

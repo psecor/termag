@@ -2,6 +2,7 @@
 // (Workflow.backend and Workflow.model): the `--model`, and
 // on another backend what chat-send and chat-resume-claim carry for it. The
 // chat routes and an automation run's brief both send through here.
+import { prisma } from '../db';
 import { CHAT_PROVIDER_ID } from '../providers/registry';
 import { launchChoice } from './agentRuntime';
 import { CHAT_BACKEND_CAPABILITY, type ChatBackend } from './chatRunner';
@@ -17,7 +18,9 @@ export type ChatLaunchResult =
 
 /**
  * The launch for a chat's choice on the owner's box. The default backend is a
- * tier's launch string (claudeLaunchModel), Sonnet when none is stored. Fireworks needs
+ * tier's launch string (claudeLaunchModel), Sonnet when none is stored: the
+ * gateway's pinned profile while the owner has the gateway on, the alias once
+ * they turned it off (their own Claude login takes no profile id). Fireworks needs
  * a box whose runner and credentials script take it, and the fireworks-models
  * flag on for the owner and box: the gateway's check reads the same flags, so
  * a refusal here says why before a turn would fail there. A model no longer
@@ -29,7 +32,8 @@ export async function chatLaunchFor(
 ): Promise<ChatLaunchResult> {
   if (choice.backend !== 'fireworks') {
     const tier = resolvedChatTier(choice.model);
-    return { ok: true, launch: { model: claudeModelArg(claudeLaunchModel(tier)) ?? tier } };
+    const owner = await prisma.user.findUnique({ where: { id: box.ownerId }, select: { claudeGatewayEnabled: true } });
+    return { ok: true, launch: { model: claudeModelArg(claudeLaunchModel(tier, !!owner?.claudeGatewayEnabled)) ?? tier } };
   }
   if (!box.instanceId) {
     return { ok: false, status: 409, body: { error: 'Fireworks models run only on a box', code: 'backend-unavailable' } };
@@ -51,5 +55,8 @@ export async function chatLaunchFor(
     };
   }
   const l = launchChoice(CHAT_PROVIDER_ID, 'fireworks', choice.model, fireworks);
-  return { ok: true, launch: { backend: 'fireworks', model: l.model, fastModel: l.fastModel, ...(l.context ? { context: l.context } : {}) } };
+  return {
+    ok: true,
+    launch: { backend: 'fireworks', model: l.model, fastModel: l.fastModel, ...(l.context ? { context: l.context } : {}), ...(l.models ? { models: l.models } : {}) },
+  };
 }

@@ -196,6 +196,8 @@ describe('repo create checkout', () => {
     });
 
     expect(result.status).toBe(201);
+    // The create answers before the wait is over; the clone follows in the background (deferDeliveryWait).
+    await vi.waitFor(() => expect(keysSent()).toHaveLength(1));
     expect(state.deliveryReads).toBe(2);
     expect(sentDuringReconnect).toEqual([]);
     const keys = keysSent();
@@ -203,8 +205,8 @@ describe('repo create checkout', () => {
       expect.stringContaining('git fetch --progress origin'),
     ]);
     expect(keys[0]).toContain('GIT_CONFIG_GLOBAL=/dev/null git fetch --progress origin');
-    expect(keys[0]).toContain('&& claude');
-    expect(keys.some(k => k === 'claude' || k === 'claude --continue')).toBe(false);
+    expect(keys[0]).toContain('&& TERMAG_SESSION_KIND=interactive claude');
+    expect(keys.some(k => k === 'TERMAG_SESSION_KIND=interactive claude' || k === 'TERMAG_SESSION_KIND=interactive claude --continue')).toBe(false);
   });
 
   it('keeps the user gitconfig for an external box and a host create', async () => {
@@ -275,6 +277,9 @@ describe('repo create checkout', () => {
     expect(prisma.project.create.mock.calls[0][0].data.repoUrl).toBe(null);
     expect(prisma.workstream.upsert.mock.calls[0][0].create.branch).toBe('main');
     expect(prisma.project.findFirst.mock.calls[0][0].where).toEqual({
+      userId: 'u1', name: 'notes', archived: true, instanceId: 'box1',
+    });
+    expect(prisma.project.findFirst.mock.calls[1][0].where).toEqual({
       userId: 'u1', name: 'notes', archived: true,
     });
   });
@@ -331,23 +336,104 @@ describe('repo create checkout', () => {
 
   it('refuses a repo create when that name is archived on this box', async () => {
     state.box = box('ec2');
-    prisma.project.findFirst.mockResolvedValue({
-      id: 'old', name: 'widget', archived: true, instanceId: 'box1', workflows: [],
-    });
-    const result = await createProjectFor(user, {
-      name: 'widget',
-      instanceId: 'box1',
-      initialAgent: { enabled: true, provider: 'claude' },
-      repoUrl: 'https://github.com/acme/widget.git',
-      defaultBranch: 'develop',
-    });
+    prisma.project.findFirst.mockResolvedValue(archivedWidget());
+    const result = await createProjectFor(user, widgetRepoCreate());
     expect(result).toEqual({
       status: 409,
-      body: { error: 'An archived project with this name exists on this box' },
+      body: {
+        error: 'An archived project named widget is on this box',
+        code: 'archived-name-taken',
+        archived: { id: 'old', name: 'widget', archivedAt: ARCHIVED_AT, repoUrl: 'https://github.com/acme/widget.git', workstreams: 1 },
+      },
     });
+    expect(prisma.project.findFirst).toHaveBeenCalledTimes(1);
     expect(prisma.project.findFirst.mock.calls[0][0].where).toEqual({
       userId: 'u1', name: 'widget', archived: true, instanceId: 'box1',
     });
     expect(state.sent).toEqual([]);
   });
+
+  it('renames the archived project aside, folder and all, then creates the new one', async () => {
+    state.box = box('ec2');
+    let renamed = false;
+    prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown> }) => {
+      const { where } = args;
+      if (where.archived === true) return renamed ? null : archivedWidget();
+      if (where.id === 'old') return { ...archivedWidget(), instance: { hostHome: '/home/alice', status: 'ready' } };
+      if (where.name === 'widget-archived-2026-10-21') return null;
+      return findProject(args);
+    });
+    prisma.project.update.mockImplementation(async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      if (args.where.id === 'old' && args.data.name) renamed = true;
+      return {};
+    });
+    const result = await createProjectFor(user, { ...widgetRepoCreate(), archivedName: 'rename-aside' });
+    expect(result.status).toBe(201);
+    const rename = state.sent.find(s => s.type === 'project-rename');
+    expect(rename?.payload).toMatchObject({ fromDir: expect.stringMatching(/\/widget$/), toDir: expect.stringMatching(/\/widget-archived-2026-10-21$/) });
+    expect(prisma.project.update).toHaveBeenCalledWith({ where: { id: 'old' }, data: { name: 'widget-archived-2026-10-21' } });
+    expect(prisma.project.create.mock.calls[0][0].data).toMatchObject({ name: 'widget', instanceId: 'box1', repoUrl: 'https://github.com/acme/widget.git' });
+  });
+
+  it('creates nothing when the archived project cannot be renamed aside', async () => {
+    state.box = box('ec2');
+    prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown> }) => {
+      if (args.where.archived === true) return archivedWidget();
+      if (args.where.id === 'old') return { ...archivedWidget(), instance: { hostHome: '/home/alice', status: 'ready' } };
+      return null;
+    });
+    sendForProject.mockImplementationOnce(async () => { throw new Error('/home/alice/projects/widget-archived-2026-10-21 already exists'); });
+    const result = await createProjectFor(user, { ...widgetRepoCreate(), archivedName: 'rename-aside' });
+    expect(result.status).not.toBe(201);
+    expect((result.body as { error: string }).error).toMatch(/^Could not rename the archived widget aside: /);
+    expect(prisma.project.create).not.toHaveBeenCalled();
+  });
+
+  it('un-archives the project for a repo create that asks to', async () => {
+    state.box = box('ec2');
+    prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown> }) =>
+      (args.where.archived === true ? archivedWidget() : findProject(args)));
+    const result = await createProjectFor(user, { ...widgetRepoCreate(), archivedName: 'unarchive' });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ restored: true });
+    expect(prisma.project.update.mock.calls[0][0]).toMatchObject({ where: { id: 'old' }, data: { archived: false, instanceId: 'box1' } });
+    expect(prisma.project.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses an archivedName that is not a choice', async () => {
+    const result = await createProjectFor(user, { ...widgetRepoCreate(), archivedName: 'delete' as never });
+    expect(result).toEqual({ status: 400, body: { error: 'archivedName must be unarchive or rename-aside' } });
+  });
+
+  it("looks on the requested box before any other for a plain create's un-archive", async () => {
+    state.box = box('ec2');
+    await createProjectFor(user, { name: 'widget', instanceId: 'box1', initialAgent: { enabled: true, provider: 'claude' } });
+    const archivedLookups = prisma.project.findFirst.mock.calls
+      .map(c => c[0].where)
+      .filter(w => w.archived === true);
+    expect(archivedLookups).toEqual([
+      { userId: 'u1', name: 'widget', archived: true, instanceId: 'box1' },
+      { userId: 'u1', name: 'widget', archived: true },
+    ]);
+  });
 });
+
+const ARCHIVED_AT = new Date('2026-10-21T04:39:59.296Z');
+
+function archivedWidget() {
+  return {
+    id: 'old', name: 'widget', archived: true, instanceId: 'box1', kind: 'normal',
+    repoUrl: 'https://github.com/acme/widget.git', updatedAt: ARCHIVED_AT,
+    workflows: [], workstreams: [{ id: 'ws-old', name: 'main' }],
+  };
+}
+
+function widgetRepoCreate() {
+  return {
+    name: 'widget',
+    instanceId: 'box1',
+    initialAgent: { enabled: true, provider: 'claude' },
+    repoUrl: 'https://github.com/acme/widget.git',
+    defaultBranch: 'develop',
+  };
+}

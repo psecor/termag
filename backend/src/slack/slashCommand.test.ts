@@ -4,7 +4,7 @@ vi.mock('./handoffCommand', () => ({
   isHandoffCommand: (text: string) => /^handoff(\s+(clear|compact|restart))?$/i.test(text.trim()),
 }));
 
-import { helpTopic, parseSlashCommand, slashHelp } from './slashCommand';
+import { helpTopic, parseSlashCommand, slashCommandDetail, slashHelp } from './slashCommand';
 
 const send = (text: string, literal = false) => ({ kind: 'send', text, literal });
 
@@ -108,5 +108,25 @@ describe('slashHelp', () => {
     expect(helpTopic('sessions')).toBe('ls');
     expect(helpTopic('constructor')).toBeNull();
     expect(helpTopic(undefined)).toBeNull();
+  });
+});
+
+describe('slashCommandDetail', () => {
+  const detail = (text: string) => slashCommandDetail(parseSlashCommand(text));
+
+  it('names the form that ran', () => {
+    expect(detail('projects')).toEqual({ command: 'projects' });
+    expect(detail('help switch')).toEqual({ command: 'help', topic: 'switch' });
+    expect(detail('local ls')).toEqual({ command: 'local', action: 'list' });
+    expect(detail('')).toEqual({ command: 'send', literal: false, showPane: true, keys: false });
+    expect(detail('!2')).toEqual({ command: 'send', literal: false, showPane: false, keys: true });
+    expect(detail('-- !ls')).toEqual({ command: 'send', literal: true, showPane: false, keys: false });
+  });
+
+  it('never carries a name or the text typed', () => {
+    for (const text of ['switch secret-project/ws', 'create acme-merger', 'attach alice-x-agent', 'please rotate the key sk-123', 'ctrl cat ~/.env', 'local detach mine']) {
+      const values = Object.values(detail(text)).filter(v => typeof v === 'string') as string[];
+      expect(values.join(' ')).not.toMatch(/secret|acme|alice|rotate|env|mine/);
+    }
   });
 });
