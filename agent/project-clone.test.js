@@ -25,6 +25,7 @@ const {
   runClone,
   writeGuides,
   readState,
+  unitTemplateLoaded,
 } = require('./project-clone');
 
 const REQUEST = {
@@ -57,7 +58,7 @@ test('the capability is the one the orchestrator selects durable clone with', ()
 });
 
 test('accepts the orchestrator payload and rejects a shell path or a missing box id', () => {
-  assert.deepEqual(acceptCloneRequest(REQUEST), { ok: true, request: REQUEST });
+  assert.deepEqual(acceptCloneRequest(REQUEST), { ok: true, request: { ...REQUEST, repo: null, key: 'p1' } });
   assert.deepEqual(acceptCloneRequest({ ...REQUEST, referenceDir: undefined }).request.referenceDir, null);
   assert.equal(acceptCloneRequest({ ...REQUEST, instanceId: '' }).ok, false);
   assert.equal(acceptCloneRequest({ ...REQUEST, dir: 'projects/widget' }).ok, false);
@@ -173,6 +174,39 @@ function systemd(calls, active = 'inactive') {
     return { stdout: '' };
   };
 }
+
+// systemctl as systemd 255 answers it: `show` on a bare template name is an
+// error, an instance of an installed template is `loaded`, anything else
+// `not-found`.
+function systemd255(installed) {
+  const calls = [];
+  const exec = async (cmd, args, opts) => {
+    calls.push({ cmd, args: [...args], opts });
+    const unit = args[args.length - 1];
+    if (/@\.service$/.test(unit)) {
+      const err = new Error(`Command failed: systemctl ${args.join(' ')}`);
+      err.code = 1;
+      err.stderr = `Failed to get properties: Unit name ${unit} is neither a valid invocation ID nor unit name.\n`;
+      throw err;
+    }
+    const template = unit.replace(/@[^.]+\.service$/, '@.service');
+    return { stdout: installed.includes(template) ? 'loaded\n' : 'not-found\n' };
+  };
+  return { exec, calls };
+}
+
+test('the clone unit counts as loaded when systemd 255 loads an instance of the template', async () => {
+  const installed = systemd255(['termag-project-clone@.service']);
+  assert.equal(await unitTemplateLoaded(installed.exec), true);
+  assert.equal(installed.calls.length, 1);
+  assert.equal(installed.calls[0].cmd, 'systemctl');
+  // An instance, not the template: systemd 255 refuses `show` on a template name.
+  assert.deepEqual(installed.calls[0].args, ['--user', 'show', '-p', 'LoadState', '--value', 'termag-project-clone@probe.service']);
+  assert.ok(installed.calls[0].opts.timeout > 0, 'bounded');
+
+  assert.equal(await unitTemplateLoaded(systemd255([]).exec), false);
+  assert.equal(await unitTemplateLoaded(async () => { throw new Error('Failed to connect to bus'); }), false);
+});
 
 test('the RPC stores the box id and the attempt, then starts that project unit', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-rpc-'));
@@ -562,5 +596,51 @@ test('a clone that needs more disk than the machine has fails before creating th
   assert.equal(await runClone('p1', { home, execFile: execFileAsync }), 1);
   assert.equal(fs.existsSync(dest), false);
   assert.match(readState(home, 'p1').error, /not enough free disk/);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a workspace repository is keyed <projectId>--<repo>, and its frames name it', async () => {
+  assert.equal(acceptCloneRequest({ ...REQUEST, repo: 'a.b' }).ok, false);
+  assert.equal(acceptCloneRequest({ ...REQUEST, projectId: 'p1--x' }).ok, false);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-ws-'));
+  const calls = [];
+  const req = { ...REQUEST, repo: 'api', dir: '/home/ada/projects/widget/api' };
+  assert.deepEqual(await handleProjectClone(req, { execFile: systemd(calls), home, remapPath: (p) => p }), { ok: true, started: true });
+  assert.equal(readState(home, 'p1--api').repo, 'api');
+  assert.equal(readState(home, 'p1'), null);
+  assert.deepEqual(calls.filter(([cmd, args]) => cmd === 'systemctl' && args.includes('start')), [
+    ['systemctl', ['--user', 'start', '--no-block', 'termag-project-clone@p1--api.service']],
+  ]);
+  assert.deepEqual(frameFromState({ ...readState(home, 'p1--api'), status: 'failed', error: 'x' }), {
+    projectId: 'p1', instanceId: 'box1', attempt: 2, status: 'failed', repo: 'api', error: 'x',
+  });
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('two repositories clone side by side; one failing leaves the other, and a retry clones only it', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-ws-run-'));
+  const src = path.join(home, 'src');
+  seedRepo(src);
+  const root = path.join(home, 'projects', 'widget');
+  fs.mkdirSync(path.join(home, '.termag', 'clones'), { recursive: true });
+  fs.mkdirSync(path.join(home, '.config', 'termag'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.config', 'termag', 'github.skip'), '');
+  const write = (repo, url, attempt) => fs.writeFileSync(
+    path.join(home, '.termag', 'clones', `p1--${repo}.json`),
+    JSON.stringify({ ...pendingOf({ ...REQUEST, dir: path.join(root, repo), referenceDir: null, attempt }), url, repo, key: `p1--${repo}` }),
+  );
+  write('web', src, 0);
+  write('api', path.join(home, 'missing'), 0);
+  assert.equal(await runClone('p1--web', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(await runClone('p1--api', { home, execFile: execFileAsync, waitSeconds: 300 }), 1);
+  assert.equal(readState(home, 'p1--web').status, 'ready');
+  assert.equal(readState(home, 'p1--api').status, 'failed');
+  // A repository of a workspace gets no generated guide of its own.
+  assert.equal(fs.existsSync(path.join(root, 'web', 'AGENTS.md')), false);
+  assert.equal(fs.existsSync(path.join(root, '.clone-api')), false);
+  write('api', src, 1);
+  assert.equal(await runClone('p1--api', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(readState(home, 'p1--api').status, 'ready');
+  assert.equal(fs.readFileSync(path.join(root, 'web', 'README'), 'utf8'), 'hello\n');
   fs.rmSync(home, { recursive: true, force: true });
 });

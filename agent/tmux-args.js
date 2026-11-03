@@ -40,18 +40,35 @@ function tmuxPaneTarget(sessionName, exact = false) {
  * reboot would keep creating sessions without it. `-e` sets the variable on
  * the session itself, which its panes and command inherit, on a fresh server
  * and a surviving one alike (verified on tmux 3.4; `-e` exists since 3.2).
+ * CLAUDE_CODE_SHELL and BASH_ENV come from the same unit for the same reason:
+ * they make Claude Code's Bash tool run bash, not the owner's zsh (gotcha
+ * agent-bash-tool-shell), and a pane on a surviving server would miss them.
  */
-const SESSION_ENV = ['TERMAG_BOX'];
+const SESSION_ENV = ['TERMAG_BOX', 'CLAUDE_CODE_SHELL', 'BASH_ENV'];
+
+/**
+ * Variables every login-shell pane gets, whatever the agent's environment.
+ * Boxes bake Oh My Zsh at its default update mode, `prompt`: once its 13 days
+ * are up, every new shell asks "Would you like to update? [Y/n]" and reads ONE
+ * key, so the first character the backend typed into a new pane went to that
+ * question. A clone line lost its leading `{` and failed to parse, and
+ * `claude …` would arrive as `laude …`. Any answer but `n` asks again in the
+ * next shell. DISABLE_AUTO_UPDATE=true is the old-style setting Oh My Zsh
+ * still honours when no `zstyle ':omz:update' mode` is set, so an owner's own
+ * choice in ~/.zshrc wins (verified with zsh 5.9 and Oh My Zsh of 2026-10-06:
+ * the prompt is gone and the first key reaches the line editor).
+ */
+const SHELL_PANE_ENV = { DISABLE_AUTO_UPDATE: 'true' };
 
 /**
  * `new-session` for tmux-create. Without `command` the pane runs the user's
- * login shell, as every project pane does. With it (an argv array, two or more
- * elements) tmux execs that program directly, no shell in between, so the
- * session lives exactly as long as the program: the Claude runner's session
- * ends when the runner does (verified on tmux 3.4: the arguments arrive
- * verbatim, `.` included, and the session is gone once the command exits).
- * `env` is the agent's environment (process.env at the call site); the
- * SESSION_ENV variables present in it ride along as `-e KEY=VALUE`.
+ * login shell, as every project pane does, with SHELL_PANE_ENV. With it (an
+ * argv array, two or more elements) tmux execs that program directly, no shell
+ * in between, so the session lives exactly as long as the program: the Claude
+ * runner's session ends when the runner does (verified on tmux 3.4: the
+ * arguments arrive verbatim, `.` included, and the session is gone once the
+ * command exits). `env` is the agent's environment (process.env at the call
+ * site); the SESSION_ENV variables present in it ride along as `-e KEY=VALUE`.
  */
 function newSessionArgv(sessionName, cwd, command = null, env = {}) {
   const argv = ['new-session', '-d', '-s', sessionName, '-c', cwd, '-x', '120', '-y', '30'];
@@ -59,6 +76,7 @@ function newSessionArgv(sessionName, cwd, command = null, env = {}) {
     if (env[key] !== undefined && env[key] !== '') argv.push('-e', `${key}=${env[key]}`);
   }
   if (command) argv.push('--', ...command);
+  else for (const [key, value] of Object.entries(SHELL_PANE_ENV)) argv.push('-e', `${key}=${value}`);
   return argv;
 }
 
@@ -112,6 +130,17 @@ function enterArgv(sessionName) {
 }
 
 /**
+ * `pipe-pane -o`: append every byte the pane emits to `file`. The one argv
+ * that carries a shell command — tmux runs it with sh; the path comes from
+ * pane-history.js, sanitized and single-quoted. `-o` arms only when no pipe
+ * is active, so arming again (every tmux-create, every agent restart) is a
+ * no-op rather than a second pipe doubling the log.
+ */
+function pipePaneArgv(sessionName, file) {
+  return ['pipe-pane', '-o', '-t', sessionName, `cat >> '${file}'`];
+}
+
+/**
  * One pane from `tmux list-panes -F '#{pane_dead} #{pane_current_command}'`.
  * pane_dead is 1 when that process has exited and tmux is still showing the
  * pane; the command name can still be the program that left. A line with no
@@ -156,4 +185,4 @@ function tailLines(text, n) {
  */
 const CAPABILITIES = ['tmux-create-command-v1'];
 
-module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, CAPABILITIES, SESSION_ENV };
+module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv, CAPABILITIES, SESSION_ENV };

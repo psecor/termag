@@ -400,10 +400,11 @@ export const SPAWN_TOOL = {
       doneWhen: { type: 'string', maxLength: 2000, description: 'How it can tell it is finished, e.g. "tests pass and a draft PR is open".' },
       relationship: { type: 'string', enum: ['delegate', 'peer'], description: 'Default delegate.' },
       provider: { type: 'string', enum: ['claude', 'cursor', 'devin', 'pi'], description: 'Default: the provider of this session\'s workstream, else the user\'s default.' },
-      name: { type: 'string', maxLength: 40, description: 'Workstream (and branch) or project name; default derived from the task.' },
+      name: { type: 'string', maxLength: 40, description: 'Workstream or project name (letters, digits, - and _); default derived from branch, else the task.' },
       target: { type: 'string', enum: ['workstream', 'project'], description: 'Default workstream (this project). project = a new project.' },
       projectId: { type: 'string', description: 'workstream target: another of your projects (from list_sessions) instead of this one.' },
       baseRef: { type: 'string', description: 'workstream target: branch or commit to start from instead of your HEAD.' },
+      branch: { type: 'string', maxLength: 200, description: 'workstream target: the new git branch, which may hold slashes (e.g. me/ABC-123/fix-login); default the workstream name.' },
       repoUrl: { type: 'string', description: 'project target: a GitHub repo to clone (owner/name or URL).' },
       boxId: { type: 'string', description: 'project target: a box other than this one.' },
     },
@@ -762,7 +763,7 @@ export function createServer(deps = {}) {
         const own = needOwnSession('spawn_agent');
         const sha = head();
         const body = { from: { session: own, ...(sha ? { head: sha } : {}) } };
-        for (const k of ['task', 'context', 'doneWhen', 'relationship', 'provider', 'name', 'target', 'projectId', 'baseRef', 'repoUrl', 'boxId']) {
+        for (const k of ['task', 'context', 'doneWhen', 'relationship', 'provider', 'name', 'target', 'projectId', 'baseRef', 'branch', 'repoUrl', 'boxId']) {
           if (a[k] !== undefined) body[k] = a[k];
         }
         const r = await api('POST', '/spawns', body);

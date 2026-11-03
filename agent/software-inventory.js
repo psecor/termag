@@ -54,7 +54,10 @@ function probeScript(probes) {
   const lines = [
     '[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1',
     'PATH="$HOME/.local/bin:$HOME/.pyenv/shims:$PATH:/usr/sbin:/usr/local/sbin"',
-    'probe() { n=$1; shift; p=$(command -v "$1" 2>/dev/null) || { printf \'@@%s\\t\\t\\n\' "$n"; return; }; o=$(timeout 10 "$@" 2>&1 </dev/null | head -n 1); printf \'@@%s\\t%s\\t%s\\n\' "$n" "$p" "$o"; }',
+    // The first five lines of output, joined with \x1f (one record per probe): a
+    // tool that prints a notice or a warning ahead of its version (a cursor-agent
+    // update or migration notice, a Node warning on stderr) is still read.
+    'probe() { n=$1; shift; p=$(command -v "$1" 2>/dev/null) || { printf \'@@%s\\t\\t\\n\' "$n"; return; }; o=$(timeout 10 "$@" 2>&1 </dev/null | head -n 5 | tr -d \'\\r\\t\' | tr \'\\n\' \'\\037\'); printf \'@@%s\\t%s\\t%s\\n\' "$n" "$p" "${o%$\'\\037\'}"; }',
   ];
   for (const p of probes) {
     if (!NAME_RE.test(p.name) || !/^[a-z0-9-]+( -?-?[A-Za-z]+)*$/.test(p.cmd)) throw new Error(`bad probe ${p.name}`);
@@ -74,8 +77,15 @@ function parseProbeOutput(text, probes) {
   return probes.map(probe => {
     const r = byName.get(probe.name);
     if (!r || !r.path) return { name: probe.name, ok: false, version: null, raw: null, path: null };
-    const m = probe.re.exec(r.raw);
-    return { name: probe.name, ok: !!m, version: m ? m[1] : null, raw: r.raw.slice(0, 200), path: r.path.slice(0, 300) };
+    // The line that is the version alone (cursor-agent's), else the first of its lines the version reads
+    // from; raw is that line, else the first. A notice that mentions a date or another build cannot win
+    // over the version line itself (Bugbot on #1080).
+    const lines = r.raw.split('\x1f').map(l => l.trim()).filter(Boolean);
+    let m = null;
+    let raw = lines[0] ?? '';
+    for (const l of lines) { const x = probe.re.exec(l); if (x && x[0] === l) { m = x; raw = l; break; } }
+    if (!m) for (const l of lines) { const x = probe.re.exec(l); if (x) { m = x; raw = l; break; } }
+    return { name: probe.name, ok: !!m, version: m ? m[1] : null, raw: raw.slice(0, 200), path: r.path.slice(0, 300) };
   });
 }
 

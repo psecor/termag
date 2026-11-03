@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { CHUNK_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward } = require('./transcript-lines');
+const { CHUNK_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward, wholeLinesFrom } = require('./transcript-lines');
 
 const tmpFile = (text) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-lines-'));
@@ -73,4 +73,36 @@ test('history tail: the descriptor is closed even when the read fails', () => {
   };
   assert.equal(historyTail('/x', { maxBytes: 100, fsImpl: failing }), '');
   assert.deepEqual(closed, [42]);
+});
+
+test('wholeLinesFrom: the exact bytes up to the last newline that fits, never a line still being written', () => {
+  const file = tmpFile('one\ntwo\nthree\npart');
+  const read = (start, maxBytes) => {
+    const r = wholeLinesFrom(file, { start, maxBytes });
+    return [r.size, r.data.toString('utf8')];
+  };
+  assert.deepEqual(read(0, 1000), [18, 'one\ntwo\nthree\n']);
+  assert.deepEqual(read(0, 9), [18, 'one\ntwo\n']);
+  assert.deepEqual(read(4, 1000), [18, 'two\nthree\n']);
+  assert.deepEqual(read(14, 1000), [18, ''], 'only a partial line left');
+  assert.deepEqual(read(18, 1000), [18, ''], 'at the end');
+  // A first line longer than the window is read whole.
+  assert.deepEqual(read(8, 2), [18, 'three\n']);
+  const bytes = 'é\n'.repeat(3);
+  const multi = tmpFile(bytes);
+  assert.equal(wholeLinesFrom(multi, { start: 0, maxBytes: 4 }).data.length, 3, 'bytes, not characters');
+});
+
+test('wholeLinesFrom: a line over the line limit is skipped by its length, not read and not thrown on', () => {
+  const long = 'x'.repeat(CHUNK_BYTES * 2 + 5);
+  const file = tmpFile(`one\n${long}\ntwo\n`);
+  const r = wholeLinesFrom(file, { start: 4, maxBytes: 8, lineMax: 64 });
+  assert.equal(r.data.length, 0);
+  assert.equal(r.skipped, long.length + 1, 'its bytes and its newline, across read chunks');
+  assert.equal(wholeLinesFrom(file, { start: 4 + r.skipped, maxBytes: 8, lineMax: 64 }).data.toString(), 'two\n', 'the read after it goes on');
+  assert.equal(wholeLinesFrom(file, { start: 0, maxBytes: 100, lineMax: 64 }).data.toString(), 'one\n', 'lines before it are read as usual');
+
+  const unfinished = tmpFile(`one\n${long}`);
+  const still = wholeLinesFrom(unfinished, { start: 4, maxBytes: 8, lineMax: 64 });
+  assert.deepEqual([still.data.length, still.skipped], [0, undefined], 'a long line still being written is waited for');
 });

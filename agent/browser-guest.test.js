@@ -8,6 +8,7 @@ const {
   PROXY_PORT_FIRST, PROXY_PORT_LAST, MAX_ORIGINS, MIN_MEM_AVAILABLE_BYTES,
   canonicalOrigin, originOfUrl, connectOrigin, displayOrigin, GuestProxy, readDevStackOverride, webappSlotOrigins,
   publisherWorkingDir, resolveRecipe, canaryHtml, Canary, guestEnvironment, memAvailableBytes, checkoutState,
+  ownFrontDoor, overrideForFrontDoor, checkRecipe, CHECK_CAPABILITIES,
 } = require('./browser-guest');
 
 const listen = (server, host = '127.0.0.1') => new Promise((r) => server.listen(0, host, () => r(server.address().port)));
@@ -33,11 +34,15 @@ test('canonicalOrigin: loopback only, one spelling per address, explicit or defa
   assert.equal(canonicalOrigin('127.0.0.2', { requirePort: true }), null);
   assert.equal(canonicalOrigin('127.0.0.2:80', { requirePort: true }), '127.0.0.2:80');
   assert.equal(canonicalOrigin('http://127.0.0.2/', { requirePort: true }), '127.0.0.2:80', 'a URL carries its scheme default');
+  // A request URL's path and query don't count toward the cap; its host does.
+  assert.equal(canonicalOrigin(`http://127.0.0.2/api?filter=${'x'.repeat(4000)}`), '127.0.0.2:80');
+  assert.equal(canonicalOrigin(`http://${'a'.repeat(301)}/`), null);
 });
 
 test('originOfUrl: about:blank is always fine; connectOrigin takes an authority, never a URL', () => {
   assert.equal(originOfUrl('about:blank'), '');
   assert.equal(originOfUrl('http://127.0.0.2:3012/x'), '127.0.0.2:3012');
+  assert.equal(originOfUrl(`http://127.0.0.2/flags?q=${'x'.repeat(400)}`), '127.0.0.2:80');
   assert.equal(originOfUrl('http://example.com/'), null);
   assert.equal(connectOrigin('127.0.0.2:3012'), '127.0.0.2:3012');
   assert.equal(connectOrigin('[::1]:443'), '[::1]:443');
@@ -53,6 +58,7 @@ test('safeAtPath and urlAt: a link\'s at is a path on the share\'s first origin,
     assert.equal(safeAtPath(bad), null, String(bad));
   }
   assert.equal(urlAt('http://127.0.0.2/', '/flags?x=1'), 'http://127.0.0.2/flags?x=1');
+  assert.equal(urlAt('http://127.0.0.2/', `/flags?q=${'x'.repeat(400)}`), `http://127.0.0.2/flags?q=${'x'.repeat(400)}`);
   assert.equal(urlAt('https://127.0.0.1:4443/', '/a'), 'https://127.0.0.1:4443/a');
   assert.equal(urlAt('http://127.0.0.2/', '//example.com/'), null);
   assert.equal(urlAt('http://127.0.0.2/', '/@example.com/'), 'http://127.0.0.2/@example.com/', 'userinfo can only appear before the host');
@@ -92,6 +98,10 @@ test('GuestProxy: forwards an allowed absolute-URI request to the matched origin
   let r = await viaProxy(`http://127.0.0.1:${appPort}/a?b=1`, { host: `127.0.0.1:${appPort}`, 'proxy-connection': 'keep-alive' });
   assert.deepEqual([r.status, r.body], [200, 'hi /a?b=1']);
   assert.equal(seen[0].proxy, undefined);
+  // A long query is still the allowed origin (webapp's approval-requests filter is 336 characters).
+  const longPath = `/q?filter=${'x'.repeat(2000)}`;
+  r = await viaProxy(`http://127.0.0.1:${appPort}${longPath}`);
+  assert.deepEqual([r.status, r.body], [200, `hi ${longPath}`]);
   // localhost is the same origin, resolved without DNS.
   r = await viaProxy(`http://localhost:${appPort}/l`);
   assert.equal(r.status, 200);
@@ -294,8 +304,8 @@ test('webappSlotOrigins: the default slot is localhost, slot N is 127.0.0.N with
 
 test('dockerPublisher / publisherWorkingDir: the container publishing ip:port, and the address it is bound to', async () => {
   const containers = [
-    { Ports: [{ IP: '127.0.0.3', PublicPort: 80 }], Labels: { 'com.docker.compose.project.working_dir': '/other/dev-stack' } },
-    { Ports: [{ IP: '127.0.0.2', PublicPort: 80 }], Labels: { 'com.docker.compose.project.working_dir': '/mine/dev-stack' } },
+    { Ports: [{ IP: '127.0.0.3', PublicPort: 80, Type: 'tcp' }], Labels: { 'com.docker.compose.project.working_dir': '/other/dev-stack' } },
+    { Ports: [{ IP: '127.0.0.2', PublicPort: 80, Type: 'tcp' }], Labels: { 'com.docker.compose.project.working_dir': '/mine/dev-stack' } },
   ];
   const asked = [];
   const get = async (p) => { asked.push(p); return containers; };
@@ -303,12 +313,16 @@ test('dockerPublisher / publisherWorkingDir: the container publishing ip:port, a
   assert.match(decodeURIComponent(asked[0]), /"publish":\["80"\]/);
   assert.equal(await publisherWorkingDir('127.0.0.4', 80, get), '', 'nobody publishes it');
   assert.equal(await publisherWorkingDir('127.0.0.2', 80, async () => null), null, 'Docker cannot be asked');
-  assert.equal(await publisherWorkingDir('127.0.0.5', 80, async () => [{ Ports: [{ IP: '0.0.0.0', PublicPort: 80 }], Labels: {} }]), '', 'a container without the label');
+  assert.equal(await publisherWorkingDir('127.0.0.5', 80, async () => [{ Ports: [{ IP: '0.0.0.0', PublicPort: 80, Type: 'tcp' }], Labels: {} }]), '', 'a container without the label');
   const { dockerPublisher } = require('./browser-guest');
   assert.deepEqual(await dockerPublisher('127.0.0.2', 80, get), { workingDir: '/mine/dev-stack', boundIp: '127.0.0.2' });
   assert.deepEqual(await dockerPublisher('127.0.0.4', 80, get), { workingDir: '', boundIp: null });
-  assert.deepEqual(await dockerPublisher('127.0.0.6', 80, async () => [{ Ports: [{ IP: '0.0.0.0', PublicPort: 80 }], Labels: { 'com.docker.compose.project.working_dir': '/w/dev-stack' } }]), { workingDir: '/w/dev-stack', boundIp: '0.0.0.0' });
+  assert.deepEqual(await dockerPublisher('127.0.0.6', 80, async () => [{ Ports: [{ IP: '0.0.0.0', PublicPort: 80, Type: 'tcp' }], Labels: { 'com.docker.compose.project.working_dir': '/w/dev-stack' } }]), { workingDir: '/w/dev-stack', boundIp: '0.0.0.0' });
   assert.equal(await dockerPublisher('127.0.0.2', 80, async () => null), null);
+  // A UDP publish of the port is not who holds its TCP socket.
+  const udp = [{ Ports: [{ IP: '127.0.0.2', PublicPort: 80, Type: 'udp' }, { IP: '0.0.0.0', PublicPort: 80, Type: 'tcp' }], Labels: { 'com.docker.compose.project.working_dir': '/mine/dev-stack' } }];
+  assert.deepEqual(await dockerPublisher('127.0.0.2', 80, async () => udp), { workingDir: '/mine/dev-stack', boundIp: '0.0.0.0' });
+  assert.deepEqual(await dockerPublisher('127.0.0.2', 80, async () => [{ ...udp[0], Ports: [udp[0].Ports[0]] }]), { workingDir: '', boundIp: null });
 });
 
 test('resolveRecipe: manual origins are checked; a webapp slot only while its own stack serves it', async () => {
@@ -327,6 +341,8 @@ test('resolveRecipe: manual origins are checked; a webapp slot only while its ow
   const deps = (dir, override = 'DEV_INSTANCE=2\n', over = {}) => ({
     readFileSync: () => override, skipDirCheck: true,
     dockerPublisher: async () => (dir === null ? null : { workingDir: dir, boundIp: dir ? '127.0.0.2' : null }),
+    // No front door of the checkout's own in Docker: the slot is the file's.
+    dockerServiceBindings: async () => [],
     sameDir: (a, b) => a === b, listenersOn: () => [], ...over,
   });
   const g = { kind: 'webapp-dev-stack' };
@@ -335,7 +351,9 @@ test('resolveRecipe: manual origins are checked; a webapp slot only while its ow
     assert.deepEqual(await resolveRecipe(g, bad, deps('/w/dev-stack')), { ok: false, reason: 'no-checkout' }, JSON.stringify(bad));
   }
   assert.deepEqual(await resolveRecipe(g, '/w', deps('/w/dev-stack')), { ok: true, origins: ['127.0.0.2:80', '127.0.0.2:3012', '127.0.0.2:8765'], primaryUrl: 'http://127.0.0.2/' });
-  assert.deepEqual(await resolveRecipe(g, '/w', deps('/other/dev-stack')), { ok: false, reason: 'other-workstream' });
+  assert.deepEqual(await resolveRecipe(g, '/w', deps('/other/dev-stack')), { ok: false, reason: 'other-workstream', holder: '/other/dev-stack' });
+  // A holder that isn't a plain absolute path isn't passed on.
+  assert.deepEqual(await resolveRecipe(g, '/w', deps('/other/../x\n/dev-stack')), { ok: false, reason: 'other-workstream' });
   assert.deepEqual(await resolveRecipe(g, '/w', deps('')), { ok: false, reason: 'stack-not-running' });
   assert.deepEqual(await resolveRecipe(g, '/w', deps(null)), { ok: false, reason: 'unverifiable' });
   assert.deepEqual(await resolveRecipe(g, '/w', deps('/w/dev-stack', 'DEV_INSTANCE=12\n')), { ok: false, reason: 'not-a-dev-stack' });
@@ -345,6 +363,86 @@ test('resolveRecipe: manual origins are checked; a webapp slot only while its ow
   const shadow = (who) => (_h, p, _io, opts) => (p === 80 && opts && opts.exactOnly ? who : []);
   assert.deepEqual(await resolveRecipe(g, '/w', deps('/w/dev-stack', undefined, { ...wildFront, listenersOn: shadow([{ pid: 4, cwd: '/x' }]) })), { ok: false, reason: 'other-workstream' });
   assert.equal((await resolveRecipe(g, '/w', deps('/w/dev-stack', undefined, { ...wildFront, listenersOn: shadow([]) }))).ok, true);
+});
+
+test('ownFrontDoor: the one front door the checkout\'s own stack publishes, by Docker\'s reading', async () => {
+  const at = (bindings) => ({ dockerServiceBindings: async (service) => (service === 'varnish-fastly' ? bindings : []), sameDir: (a, b) => a === b });
+  assert.deepEqual(await ownFrontDoor('/w', at([{ ip: '127.0.0.3', port: 80, workingDir: '/w/dev-stack' }])), { ip: '127.0.0.3', port: 80 });
+  // Another checkout's front door, an address no slot binds, and `::` beside a wildcard publish don't count.
+  assert.deepEqual(await ownFrontDoor('/w', at([
+    { ip: '127.0.0.1', port: 80, workingDir: '/x/dev-stack' },
+    { ip: '10.0.0.5', port: 80, workingDir: '/w/dev-stack' },
+    { ip: '127.0.0.9', port: 80, workingDir: '/w/dev-stack' },
+    { ip: '0.0.0.0', port: 8090, workingDir: '/w/dev-stack' },
+    { ip: '::', port: 8090, workingDir: '/w/dev-stack' },
+  ])), { ip: null, port: 8090 });
+  assert.equal(await ownFrontDoor('/w', at([{ ip: '127.0.0.1', port: 80, workingDir: '/x/dev-stack' }])), false, 'not running here');
+  assert.equal(await ownFrontDoor('/w', at([{ ip: '127.0.0.1', port: 80, workingDir: '' }])), false, 'no compose label');
+  assert.equal(await ownFrontDoor('/w', at([
+    { ip: '127.0.0.2', port: 80, workingDir: '/w/dev-stack' }, { ip: '127.0.0.2', port: 81, workingDir: '/w/dev-stack' },
+  ])), false, 'two answers: none');
+  assert.equal(await ownFrontDoor('/w', at(null)), null, "Docker can't be asked");
+});
+
+test('overrideForFrontDoor: the slot from the front door, the file\'s asset port only for its own instance', () => {
+  assert.deepEqual(overrideForFrontDoor({ ip: '127.0.0.2', port: 80 }, {}), { DEV_INSTANCE: 2, DEV_VARNISH_PORT: 80 });
+  assert.deepEqual(overrideForFrontDoor({ ip: '127.0.0.1', port: 8090 }, {}), { DEV_VARNISH_PORT: 8090 });
+  assert.deepEqual(overrideForFrontDoor({ ip: '127.0.0.2', port: 80 }, { DEV_INSTANCE: 2, DEV_WEBAPP_DEVSERVER_PORT: 4012 }), { DEV_INSTANCE: 2, DEV_VARNISH_PORT: 80, DEV_WEBAPP_DEVSERVER_PORT: 4012 });
+  assert.deepEqual(overrideForFrontDoor({ ip: '127.0.0.3', port: 80 }, { DEV_INSTANCE: 2, DEV_WEBAPP_DEVSERVER_PORT: 4012 }), { DEV_INSTANCE: 3, DEV_VARNISH_PORT: 80 }, 'a stale file');
+  // A wildcard publish names no instance: the file's.
+  assert.deepEqual(overrideForFrontDoor({ ip: null, port: 80 }, { DEV_INSTANCE: 4 }), { DEV_INSTANCE: 4, DEV_VARNISH_PORT: 80 });
+  assert.deepEqual(overrideForFrontDoor({ ip: null, port: 80 }, {}), { DEV_VARNISH_PORT: 80 });
+});
+
+test('resolveRecipe: a stack started with DEV_INSTANCE in the environment is found on its own slot', async () => {
+  const g = { kind: 'webapp-dev-stack' };
+  // `DEV_INSTANCE=2 make dev` from a worktree with no override file, while
+  // another checkout runs instance 1: the file alone points at instance 1.
+  const publishers = { '127.0.0.1:80': '/main/dev-stack', '127.0.0.2:80': '/w/dev-stack' };
+  const deps = {
+    readFileSync: () => { throw new Error('ENOENT'); }, skipDirCheck: true,
+    dockerServiceBindings: async () => [
+      { ip: '127.0.0.1', port: 80, workingDir: '/main/dev-stack' }, { ip: '127.0.0.2', port: 80, workingDir: '/w/dev-stack' },
+    ],
+    dockerPublisher: async (ip, port) => ({ workingDir: publishers[`${ip}:${port}`] || '', boundIp: publishers[`${ip}:${port}`] ? ip : null }),
+    sameDir: (a, b) => a === b, listenersOn: () => [],
+  };
+  assert.deepEqual(await resolveRecipe(g, '/w', deps), { ok: true, origins: ['127.0.0.2:80', '127.0.0.2:3012', '127.0.0.2:8765'], primaryUrl: 'http://127.0.0.2/' });
+  // Not running: the file's slot, and whose stack holds it.
+  const down = { ...deps, dockerServiceBindings: async () => [{ ip: '127.0.0.1', port: 80, workingDir: '/main/dev-stack' }] };
+  assert.deepEqual(await resolveRecipe(g, '/w', down), { ok: false, reason: 'other-workstream', holder: '/main/dev-stack' });
+  assert.deepEqual(await resolveRecipe(g, '/w', { ...deps, dockerServiceBindings: async () => null }), { ok: false, reason: 'unverifiable' });
+});
+
+test('checkRecipe: what an attach would find, without the origins', async () => {
+  const deps = {
+    readFileSync: () => 'DEV_INSTANCE=2\n', skipDirCheck: true, dockerServiceBindings: async () => [],
+    dockerPublisher: async () => ({ workingDir: '/x/dev-stack', boundIp: '127.0.0.2' }), sameDir: (a, b) => a === b, listenersOn: () => [],
+  };
+  assert.deepEqual(await checkRecipe({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/w' }, deps), { ok: false, reason: 'other-workstream', holder: '/x/dev-stack' });
+  assert.deepEqual(await checkRecipe({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/x' }, deps), { ok: true, primaryUrl: 'http://127.0.0.2/' });
+  assert.deepEqual(await checkRecipe({ recipe: { kind: 'manual', origins: ['127.0.0.1:3000'] } }), { ok: true, primaryUrl: 'http://127.0.0.1:3000/' });
+  assert.deepEqual(await checkRecipe({ recipe: { kind: 'webapp-dev-stack' }, cwd: 7 }, deps), { ok: false, reason: 'no-checkout' });
+  assert.deepEqual(await checkRecipe(null), { ok: false, reason: 'bad-recipe' });
+  assert.deepEqual(CHECK_CAPABILITIES, ['browser-guest-check-v1']);
+});
+
+test('checkRecipe: names which of the project\'s checkouts holds the stack, compared on the box', async () => {
+  // .worktrees/feature is a symlink to /mnt/feature: Docker reports the real path.
+  const real = { '/p/.worktrees/feature/dev-stack': '/mnt/feature/dev-stack', '/mnt/feature/dev-stack': '/mnt/feature/dev-stack', '/p/dev-stack': '/p/dev-stack', '/w/dev-stack': '/w/dev-stack' };
+  const deps = {
+    readFileSync: () => '', skipDirCheck: true, dockerServiceBindings: async () => [],
+    dockerPublisher: async () => ({ workingDir: '/mnt/feature/dev-stack', boundIp: '127.0.0.1' }),
+    sameDir: (a, b) => (real[a] || a) === (real[b] || b), listenersOn: () => [],
+  };
+  const checkouts = [{ workstream: 'main', dir: '/p' }, { workstream: 'feature', dir: '/p/.worktrees/feature' }];
+  assert.deepEqual(await checkRecipe({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/p', checkouts }, deps),
+    { ok: false, reason: 'other-workstream', holder: '/mnt/feature/dev-stack', holderWorkstream: 'feature' });
+  // None of them, or no list, or entries that aren't plain: the holder alone.
+  for (const list of [[{ workstream: 'main', dir: '/p' }], undefined, [{ workstream: 'feature', dir: '/p/../p/.worktrees/feature' }, { dir: '/p/.worktrees/feature' }]]) {
+    assert.deepEqual(await checkRecipe({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/w', checkouts: list }, deps),
+      { ok: false, reason: 'other-workstream', holder: '/mnt/feature/dev-stack' }, JSON.stringify(list));
+  }
 });
 
 test('the canary page tries TCP and WebRTC UDP to its canaries, then reports', () => {
@@ -416,4 +514,10 @@ test('checkoutState: branch, head and the count of changed paths; null outside a
   assert.deepEqual(await checkoutState('/w', run), { branch: 'feature-x', head: 'abc123', dirty: 2 });
   assert.equal(await checkoutState('/w', (c, a, o, cb) => cb(new Error('not a git repository'))), null);
   assert.equal(await checkoutState(null, run), null);
+});
+
+test('checkoutState takes no optional git locks, so its status never holds index.lock', async () => {
+  const envs = [];
+  await checkoutState('/w', (cmd, args, opts, cb) => { envs.push(opts.env && opts.env.GIT_OPTIONAL_LOCKS); cb(null, ''); });
+  assert.deepEqual(envs, ['0', '0', '0']);
 });

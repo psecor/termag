@@ -11,7 +11,8 @@
 //             code) -> chat-send in that clone, bypassPermissions, the
 //             orchestrator's system prompt, the asker's git identity
 //   turn end  the turn's stream-json `result` event -> `--report` (bundle,
-//             then the reply, to /api/cli/v1/ask/runs/<id>/...)
+//             or the branches the clone pushed (ask-push-v1), then the
+//             reply, to /api/cli/v1/ask/runs/<id>/...)
 //   dropped   a queued ask the chat never ran -> `--fail`
 //
 // A person's message in that chat (chat-send with `ask`) is prepared the
@@ -22,18 +23,30 @@
 // `sent` (queued or running in the chat) or `reporting` (the reporter's pid
 // beside it), and a canceled run's file is removed, which is what keeps it
 // from being reported.
+//
+// Steering (ask-steer-v1):
+// an ask-run with `live` runs as a live turn, and one with `steerOf` goes into
+// the live turn that ask runs in, as another user message (chat-runner.js
+// steerAsk). The turn's chain of asks is its asks.json; when it ends, the
+// report goes to the last one that reached Claude, with Claude's last result
+// after that message. The ask it joined becomes a tombstone (`superseded`,
+// `supersededBy`) until then. A follow-up the turn can't take is refused and
+// starts nothing here: the orchestrator holds it as the thread's next turn, so
+// at most one run ever works in the thread's clone.
 
 const fs = require('fs');
 const path = require('path');
 const askRun = require('./ask-run');
 const { sessionIdFrom } = require('./chat-turn');
 
-const CAPABILITIES = ['ask-chat-v1'];
+const CAPABILITIES = ['ask-chat-v1', 'ask-steer-v1'];
+const RUN_ID_RE = /^[a-z0-9]{8,40}$/;
 const PHASES_MARKER = 'Phases: ask-chat-v1';
 const TRUSTED_MODE = 'bypassPermissions';
 // The script waits up to five minutes for a checkout to land, then clones.
 const PREPARE_TIMEOUT_MS = 15 * 60 * 1000;
 const STOPPED = 'The ask\'s turn on the target box stopped before Claude answered.';
+const STOPPED_FOLLOW_UP = 'The ask\'s turn on the target box stopped before Claude answered this follow-up.';
 
 function jobsDir(home) { return path.join(askRun.stateDir(home), 'jobs'); }
 
@@ -53,34 +66,92 @@ function chatOf(msg) {
     projectId: String(c.projectId || ''),
     workstream: String(c.workstream || ''),
     workstreamId: c.workstreamId != null ? String(c.workstreamId) : null,
+    // The project's name, for the turn's telemetry resource (chat-runner.js chatTelemetryEnv); an older orchestrator sends none.
+    ...(typeof c.project === 'string' && c.project ? { project: c.project } : {}),
   };
+}
+
+/** The text of a user message's content: a string, or its text blocks. */
+function contentText(content) {
+  if (typeof content === 'string') return content;
+  return Array.isArray(content) ? content.filter(b => b && b.type === 'text').map(b => b.text).join('\n') : null;
 }
 
 /**
  * The reply of a finished turn, as the result event termag-subagent-run
  * reports: Claude's own last `result`, else an error naming why there is
  * none (stopped, or the runner's last error), keeping the session so the
- * thread's next ask resumes it.
+ * thread's next ask resumes it. With `after` (a follow-up steered into the
+ * turn), only a result after Claude took that message in counts: its replay
+ * (--replay-user-messages) is where it did. A log with no such replay (an
+ * older Claude) falls back to the last result.
  */
-function turnResult(log) {
-  let result = null;
-  let runnerError = null;
+function turnResult(log, after = null) {
+  const events = [];
   for (const line of log.split('\n')) {
     if (!line.trim()) continue;
-    let ev;
-    try { ev = JSON.parse(line); } catch { continue; }
-    if (ev && ev.type === 'result') result = ev;
+    try { events.push(JSON.parse(line)); } catch { /* not a whole line */ }
+  }
+  let from = 0;
+  let replayed = false;
+  if (after != null) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev && ev.type === 'user' && ev.isReplay === true && contentText(ev.message && ev.message.content) === after) { from = i + 1; replayed = true; break; }
+    }
+  }
+  let result = null;
+  let runnerError = null;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (ev && ev.type === 'result') { if (i >= from) result = ev; }
     else if (ev && ev.type === 'runner-error' && typeof ev.message === 'string') runnerError = ev.message;
   }
   if (result) return result;
+  const stopped = replayed ? STOPPED_FOLLOW_UP : STOPPED;
   return {
     type: 'result',
     subtype: 'error_turn_stopped',
     is_error: true,
-    result: runnerError ? `${STOPPED} ${runnerError}` : STOPPED,
+    result: runnerError ? `${stopped} ${runnerError}` : stopped,
     session_id: sessionIdFrom(log) || undefined,
     num_turns: null,
   };
+}
+
+/**
+ * Who a finished turn answers (chat-runner.js keeps the chain): the ask it
+ * started with, then those steered into it (`steered`, from asks.json), each
+ * `delivered` once the wrapper wrote it to Claude (its inbox file is
+ * `.sent`) and `waiting` while its inbox file is still there. The target is
+ * the last delivered one. A later one was taken out of the inbox for the next
+ * turn, so the target is superseded and nothing is reported for it (`report`
+ * false); one still waiting, of a stopped turn, is `lost`.
+ */
+function turnTarget(head, steered, { delivered, waiting }) {
+  const chain = [{ runId: head, text: null }, ...steered];
+  let target = 0;
+  for (let i = 1; i < chain.length; i++) if (delivered(chain[i])) target = i;
+  const later = chain.slice(target + 1);
+  return {
+    runId: chain[target].runId,
+    after: target > 0 ? chain[target].text : null,
+    superseded: chain.slice(0, target).map(e => e.runId),
+    report: later.length === 0,
+    lost: later.filter(e => waiting(e)).map(e => e.runId),
+  };
+}
+
+/**
+ * A reply from a turn that ran read-only (chat-runner.js settleTurnMode
+ * refused bypassPermissions) leads with that, so the asker sees why nothing
+ * was changed, not only Claude's account of it.
+ */
+function withReadOnlyNotice(result, readOnly, fix) {
+  if (typeof readOnly !== 'string' || !readOnly) return result;
+  const back = typeof fix === 'string' && fix ? ` To give it its tools back, on the box, ${fix}.` : '';
+  const notice = `[termag: this turn ran read-only, with only Read, Grep and Glob, because ${readOnly}. It could not edit files, run commands or commit.${back}]`;
+  return { ...result, result: `${notice}\n\n${typeof result.result === 'string' ? result.result : ''}` };
 }
 
 /** The reason the script logged for a failed phase (`failed: <reason>`), else the error. */
@@ -174,6 +245,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
    * in the same place, the clone's .git.
    */
   function prPaths(prep) {
+    // A push-mode clone: the run opens its PRs itself, so there are no description files.
+    if (prep.push === true) return {};
     const git = path.join(prep.repoDir, '.git');
     const inGit = p => typeof p === 'string' && path.dirname(p) === git;
     return {
@@ -190,11 +263,12 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
   }
 
   // chat-recover comes on every reconnect, so a run may still be on its way when reconcile sees it.
-  const inFlight = new Set();
+  const inFlight = new Map();
   async function runPrepared(runId) {
     if (inFlight.has(runId)) return;
-    inFlight.add(runId);
-    try { await prepareAndSend(runId); } finally { inFlight.delete(runId); }
+    const run = prepareAndSend(runId);
+    inFlight.set(runId, run);
+    try { await run; } finally { inFlight.delete(runId); }
   }
 
   async function prepareAndSend(runId) {
@@ -216,9 +290,15 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       setStage(file, 'sent');
       const sent = await chats.sendMessage({
         chatKey: job.chat.chatKey, cwd: prep.repoDir, text: job.prompt,
-        projectId: job.chat.projectId, workstream: job.chat.workstream, workstreamId: job.chat.workstreamId,
-        permissionMode: TRUSTED_MODE,
-        ask: { threadId: job.threadId, runId, systemPrompt: job.systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep) },
+        projectId: job.chat.projectId, project: job.chat.project, workstream: job.chat.workstream, workstreamId: job.chat.workstreamId,
+        permissionMode: TRUSTED_MODE, ...(job.spaceMemory ? { spaceMemory: job.spaceMemory } : {}),
+        // live: the turn reads stdin as it runs, so a later ask on the thread can join it (steerRun).
+        ...(job.live === true ? { liveInput: true } : {}),
+        ask: {
+          threadId: job.threadId, runId, systemPrompt: job.systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep),
+          // Who asked, for the turn's telemetry resource (chat-runner.js askTelemetryOf checks it).
+          ...(job.telemetry ? { telemetry: job.telemetry } : {}),
+        },
       });
       log(`[ASK] run ${runId} on thread ${job.threadId}: ${sent.queued ? 'queued in' : 'started in'} chat ${job.chat.chatKey}`);
     } catch (err) {
@@ -226,17 +306,73 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
     }
   }
 
+  /** ask-run with a chat: write the job and answer; the clone and the turn follow. */
+  function startRun(msg, cwd) {
+    // spaceMemory: the thread chat's own space (backend services/chatSpace.ts), as its other turns load.
+    const job = {
+      ...askRun.buildJob(msg, cwd), mode: 'chat', chat: chatOf(msg), stage: 'preparing',
+      ...(msg.live === true ? { live: true } : {}),
+      ...(msg.spaceMemory && typeof msg.spaceMemory === 'object' ? { spaceMemory: msg.spaceMemory } : {}),
+      ...(msg.telemetry && typeof msg.telemetry === 'object' ? { telemetry: msg.telemetry } : {}),
+    };
+    if (!fsImpl.existsSync(cwd)) throw new Error(`the project checkout ${cwd} does not exist on this box`);
+    ensureDirs();
+    writeJob(jobFile(job.runId), job);
+    runPrepared(job.runId).catch(err => log(`[ASK] run ${job.runId}: ${err.message}`));
+    return { ok: true, started: true, chat: job.chat.chatKey };
+  }
+
+  /** Why the run `prev` has no live turn a follow-up can join now, or null when it may have one. */
+  function steerRefusal(prev) {
+    const job = readJob(jobFile(prev));
+    if (!job) return 'gone';
+    if (job.mode !== 'chat') return 'headless';
+    if (inFlight.has(prev) || job.stage === 'preparing') return 'preparing';
+    return job.stage === 'sent' ? null : job.stage;
+  }
+
   return {
     capable: () => askChatCapable(home, fsImpl),
 
-    /** ask-run with a chat: write the job and answer; the clone and the turn follow. */
-    startRun(msg, cwd) {
-      const job = { ...askRun.buildJob(msg, cwd), mode: 'chat', chat: chatOf(msg), stage: 'preparing' };
+    startRun: (msg, cwd) => startRun(msg, cwd),
+
+    /**
+     * ask-run with `steerOf`: the follow-up joins the live turn that run is
+     * in, and that run is superseded (`steered: true`). A turn that can't
+     * take it (headless, still being prepared, queued, not live, over or
+     * reporting) refuses it (`started: false`, `steered: false` and why), and
+     * nothing starts: a run of its own now would share the thread's clone
+     * with that one, so the orchestrator holds it as the next turn instead.
+     */
+    async steerRun(msg, cwd) {
+      const prev = typeof msg.steerOf === 'string' && RUN_ID_RE.test(msg.steerOf) ? msg.steerOf : null;
+      if (!prev) throw new Error('steerOf is not a run id');
+      const job = { ...askRun.buildJob(msg, cwd), mode: 'chat', chat: chatOf(msg), live: true };
       if (!fsImpl.existsSync(cwd)) throw new Error(`the project checkout ${cwd} does not exist on this box`);
-      ensureDirs();
-      writeJob(jobFile(job.runId), job);
-      runPrepared(job.runId).catch(err => log(`[ASK] run ${job.runId}: ${err.message}`));
-      return { ok: true, started: true, chat: job.chat.chatKey };
+      let reason = steerRefusal(prev);
+      if (!reason) {
+        ensureDirs();
+        // Before the steer, so the turn's end finds the job it reports to.
+        writeJob(jobFile(job.runId), { ...job, stage: 'sent', steerOf: prev });
+        let r;
+        try {
+          r = await chats.steerAsk({ runId: prev, newRunId: job.runId, text: job.prompt });
+        } catch (err) {
+          r = { steered: false, reason: err.message };
+        }
+        if (r.steered) {
+          // Gone once the turn has ended and cleaned up, and then not written again.
+          const prevFile = jobFile(prev);
+          const prevJob = readJob(prevFile);
+          if (prevJob) writeJob(prevFile, { ...prevJob, stage: 'superseded', supersededBy: job.runId });
+          log(`[ASK] run ${job.runId} on thread ${job.threadId}: steered into ${prev}'s turn ${r.turnId}`);
+          return { ok: true, started: true, steered: true, chat: job.chat.chatKey, turnId: r.turnId };
+        }
+        fsImpl.rmSync(jobFile(job.runId), { force: true });
+        reason = r.reason || 'refused';
+      }
+      log(`[ASK] run ${job.runId} on thread ${job.threadId}: not steered into ${prev} (${reason}); the orchestrator holds it as the next turn`);
+      return { ok: true, started: false, steered: false, chat: job.chat.chatKey, reason };
     },
 
     /**
@@ -244,7 +380,7 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
      * it was swept), then a turn with no run.
      */
     async sendMessage(msg, cwd) {
-      const chat = { chatKey: msg.chatKey, projectId: msg.projectId, workstream: msg.workstream, workstreamId: msg.workstreamId };
+      const chat = { chatKey: msg.chatKey, projectId: msg.projectId, project: msg.project, workstream: msg.workstream, workstreamId: msg.workstreamId };
       const a = msg.ask || {};
       const job = askRun.buildJob({
         runId: 'person0000', threadId: a.threadId, prompt: msg.text, baseSha: a.baseSha || null,
@@ -252,7 +388,11 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       }, cwd);
       ensureDirs();
       const file = path.join(jobs, `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.json`);
-      writeJob(file, { runId: '', threadId: job.threadId, cwd, baseSha: job.baseSha, waitForCheckout: false });
+      writeJob(file, {
+        runId: '', threadId: job.threadId, cwd, baseSha: job.baseSha, waitForCheckout: false,
+        // A clone made again for this message pushes as the thread's asks do.
+        ...(typeof a.pushBranch === 'string' && askRun.isPushBranch(a.pushBranch) ? { pushBranch: a.pushBranch, gitEmail: job.gitEmail } : {}),
+      });
       let prep;
       try {
         prep = await prepare(file);
@@ -266,21 +406,51 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       try { systemPrompt = fsImpl.readFileSync(systemPromptFile(prep.repoDir), 'utf8'); } catch { /* a thread cloned again: none */ }
       return chats.sendMessage({
         ...chat, cwd: prep.repoDir, text: msg.text, permissionMode: TRUSTED_MODE, model: msg.model, images: msg.images,
-        ask: { threadId: job.threadId, systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep) },
+        ...(msg.spaceMemory && typeof msg.spaceMemory === 'object' ? { spaceMemory: msg.spaceMemory } : {}),
+        ask: {
+          threadId: job.threadId, systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep),
+          // Who asked, for the turn's telemetry resource: the same session as the thread's asks.
+          ...(a.telemetry && typeof a.telemetry === 'object' ? { telemetry: a.telemetry } : {}),
+        },
       });
     },
 
-    /** chat-runner onTurnDone: an ask's turn is over, so report it. */
+    /**
+     * chat-runner onTurnDone: an ask's turn is over, so report it, to the
+     * newest ask of its chain that reached Claude (turnTarget).
+     */
     async onTurnDone(meta, dir) {
-      const runId = meta.ask && meta.ask.runId;
-      if (!runId) return;
+      const head = meta.ask && meta.ask.runId;
+      if (!head) return;
+      let steered = [];
+      try { steered = JSON.parse(fsImpl.readFileSync(path.join(dir, 'asks.json'), 'utf8')); } catch { /* never steered */ }
+      if (!Array.isArray(steered)) steered = [];
+      steered = steered.filter(e => e && RUN_ID_RE.test(String(e.runId || '')) && /^\d+\.json$/.test(String(e.inbox || '')));
+      const inbox = path.join(dir, 'inbox');
+      const t = turnTarget(head, steered, {
+        delivered: e => fsImpl.existsSync(path.join(inbox, e.inbox.replace(/\.json$/, '.sent'))),
+        waiting: e => fsImpl.existsSync(path.join(inbox, e.inbox)),
+      });
+      // Their follow-up's reply answers them; the orchestrator marked them superseded.
+      for (const id of t.superseded) {
+        const j = readJob(jobFile(id));
+        if (j && j.stage !== 'reporting') fsImpl.rmSync(jobFile(id), { force: true });
+      }
+      for (const id of t.lost) fail(id, 'the ask\'s turn on the target box stopped before this follow-up went in');
+      const runId = t.runId;
       const file = jobFile(runId);
       const job = readJob(file);
       if (!job || job.stage === 'reporting') return;
+      if (!t.report || job.stage === 'superseded') {
+        // A later follow-up answers it: the next turn's, or one steered in after this turn's end.
+        fsImpl.rmSync(file, { force: true });
+        log(`[ASK] run ${runId}: turn ${meta.turnId} over, superseded, nothing to report`);
+        return;
+      }
       let text = '';
       try { text = fsImpl.readFileSync(path.join(dir, 'events.jsonl'), 'utf8'); } catch { /* never started */ }
       const resultFile = path.join(jobs, `${runId}.result.json`);
-      fsImpl.writeFileSync(resultFile, JSON.stringify(turnResult(text)), { mode: 0o600 });
+      fsImpl.writeFileSync(resultFile, JSON.stringify(withReadOnlyNotice(turnResult(text, t.after), meta.readOnly, meta.readOnlyFix)), { mode: 0o600 });
       setStage(file, 'reporting');
       const pid = spawnPhase(['--report', file, resultFile], runId);
       fsImpl.writeFileSync(path.join(jobs, `${runId}.pid`), String(pid), { mode: 0o600 });
@@ -296,7 +466,10 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
     status(msg) {
       const runId = typeof msg.runId === 'string' ? msg.runId : '';
       const job = /^[a-z0-9]{8,40}$/.test(runId) ? readJob(jobFile(runId)) : null;
-      if (job && job.mode === 'chat' && job.stage !== 'reporting') return { running: true, known: true, stage: job.stage };
+      // Its turn goes on as the follow-up's: that one is live, not this.
+      if (job && job.stage === 'superseded') return { running: false, known: true, stage: job.stage, supersededBy: job.supersededBy };
+      // live: a turn a follow-up can join (steerRun); anything else holds the clone without taking messages.
+      if (job && job.mode === 'chat' && job.stage !== 'reporting') return { running: true, known: true, stage: job.stage, mode: 'chat', live: job.live === true };
       return askRun.askRunStatus(msg, { home, fsImpl });
     },
 
@@ -304,6 +477,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
     async cancel(msg) {
       const runId = typeof msg.runId === 'string' ? msg.runId : '';
       const job = /^[a-z0-9]{8,40}$/.test(runId) ? readJob(jobFile(runId)) : null;
+      // The turn is the follow-up's now; a cancel of that one stops it.
+      if (job && job.stage === 'superseded') return { stopped: false, stage: job.stage, supersededBy: job.supersededBy };
       if (!job || job.mode !== 'chat' || job.stage === 'reporting') return askRun.cancelAskRun(msg, { home, fsImpl });
       fsImpl.rmSync(jobFile(runId), { force: true });
       const child = preparing.get(runId);
@@ -313,6 +488,13 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
         return { stopped: true, stage: 'preparing', pid: child.pid };
       }
       const stopped = await chats.cancelAsk(runId);
+      // The asks it superseded in that turn: the turn's end that would remove them is not reported.
+      for (let prev = job.steerOf, n = 0; prev && RUN_ID_RE.test(prev) && n < 100; n++) {
+        const j = readJob(jobFile(prev));
+        if (!j || j.stage !== 'superseded') break;
+        fsImpl.rmSync(jobFile(prev), { force: true });
+        prev = j.steerOf;
+      }
       return { stopped: true, stage: job.stage, ...stopped };
     },
 
@@ -341,4 +523,4 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
   };
 }
 
-module.exports = { CAPABILITIES, PHASES_MARKER, askChatCapable, chatOf, createAskChat, failureReason, turnResult };
+module.exports = { CAPABILITIES, PHASES_MARKER, askChatCapable, chatOf, createAskChat, failureReason, turnResult, turnTarget, withReadOnlyNotice };

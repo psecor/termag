@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
-const { childEnv, closingEvents, createLiveTracker, createMcpReloader, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, userLine } = require('./chat-turn');
+const { childEnv, closingEvents, reportedExit, createLiveTracker, createMcpReloader, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, userLine } = require('./chat-turn');
 
 test('closing: a failure without a result says why, every turn ends with turn-end', () => {
   assert.deepEqual(closingEvents({ code: 0, signal: null, result: true }), [{ type: 'turn-end', exitCode: 0, signal: null }]);
@@ -18,6 +18,24 @@ test('closing: a failure without a result says why, every turn ends with turn-en
     closingEvents({ code: null, signal: 'SIGINT', result: false, interrupted: true }),
     [{ type: 'turn-end', exitCode: null, signal: 'SIGINT' }],
   );
+});
+
+test('closing: a stopped pi turn ends as SIGINT, as a stopped Claude turn does, not with the SIGTERM it was stopped by', () => {
+  for (const exit of [{ code: 143, signal: null }, { code: null, signal: 'SIGTERM' }, { code: null, signal: 'SIGKILL' }]) {
+    assert.deepEqual(
+      closingEvents({ ...exit, result: false, interrupted: true, engine: 'pi' }),
+      [{ type: 'turn-end', exitCode: null, signal: 'SIGINT' }],
+    );
+    assert.deepEqual(reportedExit({ ...exit, interrupted: true, engine: 'pi' }), { code: null, signal: 'SIGINT' });
+  }
+  // pi's own clean exit before the stop landed is kept.
+  assert.deepEqual(reportedExit({ code: 0, signal: null, interrupted: true, engine: 'pi' }), { code: 0, signal: null });
+  // A pi turn that was not stopped keeps what it exited with, and says why.
+  const died = closingEvents({ code: null, signal: 'SIGTERM', result: false, engine: 'pi' });
+  assert.deepEqual(died.map(e => e.type), ['runner-error', 'turn-end']);
+  assert.equal(died[1].signal, 'SIGTERM');
+  // A Claude turn is reported as it exited.
+  assert.deepEqual(reportedExit({ code: 0, signal: null, interrupted: true }), { code: 0, signal: null });
 });
 
 test('log reading: the session id from init, and whether a result came', () => {
@@ -32,6 +50,12 @@ test('child env: no tmux variables, the agent\'s PATH', () => {
   const env = childEnv({ TMUX: 's', TMUX_PANE: '%1', PATH: '/tmux/path', HOME: '/h' }, '/agent/path');
   assert.deepEqual(env, { PATH: '/agent/path', HOME: '/h' });
   assert.equal(childEnv({ HOME: '/h' }, '/agent/path', '/h/.termag/chat-config').CLAUDE_CONFIG_DIR, '/h/.termag/chat-config');
+  const turn = childEnv({ HOME: '/h' }, '/p', null, { TERMAG_PROJECT_ID: 'proj1', TERMAG_WORKSTREAM: 'main', LD_PRELOAD: '/evil.so' });
+  assert.equal(turn.TERMAG_PROJECT_ID, 'proj1');
+  assert.equal(turn.TERMAG_WORKSTREAM, 'main');
+  assert.equal(turn.LD_PRELOAD, undefined);
+  // The turn's kind replaces one the agent's own environment carried.
+  assert.equal(childEnv({ TERMAG_SESSION_KIND: 'interactive' }, '/p', null, { TERMAG_SESSION_KIND: 'chat' }).TERMAG_SESSION_KIND, 'chat');
 });
 
 test('a real turn: prompt on stdin, the log framed, the session id kept, exit written', () => {
@@ -93,6 +117,39 @@ test('a hangup escalates to SIGKILL when the child ignores SIGTERM, then the wra
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'exit'), 'utf8')).signal, 'SIGKILL');
 });
 
+test('a hangup while a finished pi turn drains its stdout keeps pi\'s own exit, and stops what pi left behind', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-pi-drain-'));
+  const bin = path.join(dir, 'pi');
+  const left = path.join(dir, 'left.pid');
+  // pi answers and exits 0, leaving a process that holds its stdout open.
+  fs.writeFileSync(bin, `#!/bin/sh
+cat ${JSON.stringify(path.join(__dirname, 'fixtures/pi/success.jsonl'))}
+sleep 30 &
+echo $! > ${JSON.stringify(left)}
+exit 0
+`, { mode: 0o755 });
+  turnMeta(dir, bin);
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ ...meta, engine: 'pi' }));
+  const wrapper = spawn(process.execPath, [path.join(__dirname, 'chat-turn.js'), dir], { stdio: 'ignore' });
+  const exited = new Promise(resolve => wrapper.once('exit', resolve));
+  for (let i = 0; i < 100 && !fs.existsSync(left); i++) await new Promise(r => setTimeout(r, 20));
+  await new Promise(r => setTimeout(r, 200)); // pi has exited; the wrapper is draining
+  assert.ok(!fs.existsSync(path.join(dir, 'exit')), 'still draining');
+  // chat-clear (signalStop) marks the turn interrupted and kills the session.
+  fs.writeFileSync(path.join(dir, 'interrupted'), '');
+  wrapper.kill('SIGHUP');
+  assert.equal(await exited, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'exit'), 'utf8')), { code: 0, signal: null });
+  const events = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.equal(events.filter(e => e.type === 'result').length, 1);
+  assert.deepEqual(events.at(-1), { type: 'turn-end', exitCode: 0, signal: null });
+  const pid = Number(fs.readFileSync(left, 'utf8'));
+  let alive = true;
+  for (let i = 0; i < 50 && alive; i++) { try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 20)); } catch { alive = false; } }
+  assert.equal(alive, false, 'the leftover process was stopped');
+});
+
 test('a real turn that fails: the reason from stderr, then turn-end', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-'));
   const bin = path.join(dir, 'claude');
@@ -106,7 +163,7 @@ test('a real turn that fails: the reason from stderr, then turn-end', () => {
 });
 
 test('live tracker: idle once the last message is answered and no background task is left', () => {
-  const t = createLiveTracker();
+  const t = createLiveTracker({ graceMs: 0 });
   assert.equal(t.idle(), false);
   t.feed('{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1"}]}\n{"type":"res');
   t.feed('ult"}\n');
@@ -116,6 +173,59 @@ test('live tracker: idle once the last message is answered and no background tas
   t.delivered();
   assert.equal(t.idle(), false, 'a message went in after that answer');
   t.feed('not json\n{"type":"result"}\n');
+  assert.equal(t.idle(), true);
+});
+
+test('live tracker: idle only once Claude has looked done for the grace period', () => {
+  let clock = 0;
+  const t = createLiveTracker({ now: () => clock, graceMs: 1500 });
+  t.feed('{"type":"result"}\n');
+  assert.equal(t.idle(), false, 'just answered');
+  clock = 1499;
+  assert.equal(t.idle(), false);
+  clock = 1500;
+  assert.equal(t.idle(), true);
+  t.feed('{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1"}]}\n');
+  assert.equal(t.idle(), false);
+  t.feed('{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n');
+  clock = 2000;
+  assert.equal(t.idle(), false, 'the grace starts over');
+  clock = 3500;
+  assert.equal(t.idle(), true);
+});
+
+test('live tracker: a turn Claude starts after its answer is work until its own result', () => {
+  let clock = 0;
+  const t = createLiveTracker({ now: () => clock, graceMs: 0 });
+  for (const line of ['{"type":"system","subtype":"init"}', '{"type":"assistant"}', '{"type":"stream_event"}']) {
+    t.feed('{"type":"result"}\n');
+    assert.equal(t.idle(), true);
+    t.feed(`${line}\n`);
+    assert.equal(t.idle(), false, line);
+  }
+  t.feed('{"type":"result"}\n');
+  assert.equal(t.idle(), true);
+});
+
+test('live tracker: a task notification after the answer holds idle off for the turn it wakes, but not forever', () => {
+  let clock = 0;
+  const t = createLiveTracker({ now: () => clock, graceMs: 0, wakeMs: 30000 });
+  t.feed('{"type":"result"}\n{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}\n');
+  assert.equal(t.idle(), false, 'its turn has not begun yet');
+  clock = 29999;
+  assert.equal(t.idle(), false);
+  // A killed task's notification wakes no turn.
+  clock = 30000;
+  assert.equal(t.idle(), true);
+  // Claude Code's own order: the notification, then the task list empties, then the woken turn's init.
+  t.feed('{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b3"}]}\n{"type":"result"}\n');
+  t.feed('{"type":"system","subtype":"task_notification","task_id":"b3","status":"completed"}\n{"type":"system","subtype":"background_tasks_changed","tasks":[]}\n');
+  clock = 31000;
+  assert.equal(t.idle(), false, 'the task list is empty, but its notification has not been read yet');
+  t.feed('{"type":"system","subtype":"init"}\n{"type":"result"}\n');
+  assert.equal(t.idle(), true);
+  // One that came before Claude's answer was read in that turn.
+  t.feed('{"type":"system","subtype":"task_notification","task_id":"b2","status":"completed"}\n{"type":"result"}\n');
   assert.equal(t.idle(), true);
 });
 
@@ -129,6 +239,7 @@ test('inbox: waiting messages oldest first, delivered and partial files left out
 
 // A stand-in for claude -p in stream-json input mode: each message is replayed,
 // then answered with a result; "bg" holds a background task for a moment first;
+// "wake" answers, and its task's notification (after the task is gone) starts a turn with another task;
 // "work" starts a background task and a slow foreground answer that an interrupt control request cuts short.
 // It exits when stdin ends and no task is left, as Claude does.
 const LIVE_CLAUDE = `#!/usr/bin/env node
@@ -152,6 +263,19 @@ process.stdin.on('data', d => {
       setTimeout(() => { tasks--; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] }); out({ type: 'result', result: 'bg done' }); maybeExit(); }, 1500);
       working = setTimeout(() => { working = null; out({ type: 'result', result: 'got: work' }); }, 4000);
       continue;
+    }
+    if (text === 'wake') {
+      tasks++; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'b1' }] });
+      setTimeout(() => {
+        tasks--; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+        setTimeout(() => {
+          out({ type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'completed' });
+          out({ type: 'system', subtype: 'init', session_id: 'sess-live-0000' });
+          tasks++; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'b2' }] });
+          out({ type: 'result', result: 'woke' });
+          setTimeout(() => { tasks--; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] }); out({ type: 'result', result: 'b2 done' }); maybeExit(); }, 1500);
+        }, 400);
+      }, 300);
     }
     if (text === 'bg') {
       tasks++; out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'b1' }] });
@@ -195,11 +319,25 @@ test('a live turn: a message sent while a background task runs is answered in th
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8')).sessionId, 'sess-live-0000');
 });
 
+test('a live turn whose finished task wakes Claude after its answer still takes messages, and ends when that turn is done', async () => {
+  const { dir, events, until, exited } = liveTurn('chat-turn-live-wake-', 'wake');
+  await until(ev => ev.some(e => e.result === 'woke'));
+  assert.ok(!fs.existsSync(path.join(dir, 'stdin-ended')));
+  fs.mkdirSync(path.join(dir, 'inbox'));
+  fs.writeFileSync(path.join(dir, 'inbox/000001.json'), JSON.stringify({ text: 'still there?' }));
+  await until(ev => ev.some(e => e.result === 'got: still there?'));
+  assert.equal(await exited, 0);
+  assert.deepEqual(events().filter(e => e.type === 'result').map(e => e.result), ['got: wake', 'woke', 'got: still there?', 'b2 done']);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'inbox')), ['000001.sent']);
+  assert.ok(fs.existsSync(path.join(dir, 'stdin-ended')));
+});
+
 test('a live turn with nothing left to do ends after its answer', async () => {
-  const { events, exited } = liveTurn('chat-turn-live-idle-', 'hello');
+  const { dir, events, exited } = liveTurn('chat-turn-live-idle-', 'hello');
   const t0 = Date.now();
   assert.equal(await exited, 0);
-  assert.ok(Date.now() - t0 < 3000, 'stdin closed once Claude answered');
+  assert.ok(Date.now() - t0 < 4000, 'stdin closed once Claude answered, after the grace');
+  assert.ok(fs.existsSync(path.join(dir, 'stdin-ended')));
   assert.deepEqual(events().map(e => e.result || e.type), ['turn-start', 'system', 'user', 'got: hello', 'turn-end']);
   assert.equal(events()[0].live, true, 'its turn-start says the turn reads messages');
 });
@@ -296,11 +434,55 @@ test('mcp reload: the control line Claude takes, and its answer is told apart fr
 function fakeLiveChild() {
   const child = new EventEmitter();
   const writes = [];
-  child.stdin = { on() {}, write(line) { writes.push(JSON.parse(line)); }, end() {} };
-  return { child, writes };
+  const stdin = { ended: false };
+  child.stdin = { on() {}, write(line) { writes.push(JSON.parse(line)); }, end() { stdin.ended = true; } };
+  return { child, writes, stdin };
 }
 
 const tickMs = () => new Promise(r => setTimeout(r, 300));
+
+// The incident: Claude answers with one background task open; the task ends
+// (tasks: []) and only then does its task_notification wake Claude into a turn
+// of its own, which starts more background tasks and runs on. Closing stdin at
+// tasks: [] left that turn deaf to every message sent after it.
+test('a live turn keeps stdin open and the inbox read when a task notification wakes Claude after its answer', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-wake-'));
+  fs.writeFileSync(path.join(dir, 'prompt.txt'), 'hi');
+  const events = path.join(dir, 'events.jsonl');
+  fs.writeFileSync(events, '');
+  const log = (...evs) => fs.appendFileSync(events, evs.map(e => `${JSON.stringify(e)}\n`).join(''));
+  const bg = ids => ({ type: 'system', subtype: 'background_tasks_changed', tasks: ids.map(task_id => ({ task_id })) });
+  let clock = 0;
+  const { child, writes, stdin } = fakeLiveChild();
+  runLive(dir, child, events, 0, { now: () => clock });
+  try {
+    log({ type: 'system', subtype: 'init' }, { type: 'assistant' }, bg(['b8z2bbxcj']), { type: 'result', result: 'answer 24' });
+    await tickMs();
+    log(bg([]));
+    await tickMs();
+    clock += 200;
+    await tickMs();
+    assert.equal(stdin.ended, false, 'Claude has only just looked done');
+    log({ type: 'system', subtype: 'task_notification', task_id: 'b8z2bbxcj', status: 'completed' }, { type: 'system', subtype: 'init' });
+    log({ type: 'assistant' }, bg(['t1', 't2', 't3', 't4', 't5', 't6']));
+    await tickMs();
+    clock += 60000;
+    await tickMs();
+    assert.equal(stdin.ended, false);
+    fs.mkdirSync(path.join(dir, 'inbox'));
+    fs.writeFileSync(path.join(dir, 'inbox/000025.json'), JSON.stringify({ text: "let's mark 748 ready" }));
+    await tickMs();
+    assert.deepEqual(writes.map(w => w.message.content), ['hi', "let's mark 748 ready"]);
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'inbox')), ['000025.sent']);
+    assert.ok(!fs.existsSync(path.join(dir, 'stdin-ended')));
+    log({ type: 'result', result: 'answer 25' }, bg([]), { type: 'result', result: 'woken turn done' });
+    await tickMs();
+    clock += 1500;
+    await tickMs();
+    assert.equal(stdin.ended, true, 'done once Claude is done');
+    assert.ok(fs.existsSync(path.join(dir, 'stdin-ended')), 'and the agent is told it takes no more messages');
+  } finally { child.emit('exit', 0, null); }
+});
 
 test('a live turn that loads MCP servers sends reload_plugins on stdin once the version file changes and settles', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-mcp-'));
@@ -336,4 +518,14 @@ test('a live turn without an MCP version file never reloads', async () => {
     await tickMs();
     assert.deepEqual(writes.map(w => w.type), ['user']);
   } finally { child.emit('exit', 0, null); }
+});
+
+test('turn-start: a compact turn says so, and any other says nothing', () => {
+  const { turnStartEvent } = require('./chat-turn');
+  assert.equal(turnStartEvent({ text: '/compact', resumed: true, compact: true }).compact, true);
+  assert.equal('compact' in turnStartEvent({ text: 'hi' }), false);
+  // Whether the runner asks Haiku for this turn's tool-group headings: the browser waits for one only then.
+  assert.equal(turnStartEvent({ text: 'hi', headings: true }).headings, true);
+  assert.equal('headings' in turnStartEvent({ text: 'hi' }), false);
+  assert.equal('headings' in turnStartEvent({ text: 'hi', headings: true, ask: { runId: 'r' } }), false, 'an ask\'s turn is never headed');
 });

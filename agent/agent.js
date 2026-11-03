@@ -25,30 +25,41 @@ const { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSes
 const worktreeFetch = require('./worktree-fetch');
 const hostSample = require('./host-sample');
 const unsavedWork = require('./unsaved-work');
+const diskGrow = require('./disk-grow');
 const softwareInventory = require('./software-inventory');
 const runnerSessions = require('./runner-sessions');
 const { renameProject } = require('./project-rename');
 const { writeFileRpc } = require('./write-file');
-const { gitBranchState } = require('./git-branch-state');
+const { gitBranchState, gitCheckoutFacts } = require('./git-branch-state');
+const gitChanges = require('./git-changes');
 const gitWorktreePr = require('./git-worktree-pr');
 const gitWorktreeOwn = require('./git-worktree-own');
 const briefing = require('./briefing-digest');
 const { dialArgs, refusedForWantOfQueryToken, redialDelayMs, DRAIN_CLOSE_CODE } = require('./agent-dial');
 const credentials = require('./credentials');
-const { planOnClaim, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
+const { planOnClaim, planOnClaimRetry, onClaimRetryKey, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
 const boxUpdate = require('./box-update');
+const toolUpdate = require('./tool-update');
+const { codexPaneCommand } = require('./codex-launch');
 const askRun = require('./ask-run');
 const askChat = require('./ask-chat');
 const projectClone = require('./project-clone');
+const workspace = require('./workspace');
 const chatRunner = require('./chat-runner');
+const boxNotice = require('./box-notice');
+const spaceMemory = require('./space-memory');
+const spaceSyncRpc = require('./space-sync');
 const browserPane = require('./browser-pane');
 const browserGuest = require('./browser-guest');
-const { codexResourceEnv, withoutResourceEnv } = require('./codex-resource-env');
+const { codexResourceEnv, codexBridgeEnv } = require('./codex-resource-env');
 const { CLIPBOARD_MAX_BYTES, writeClipboardMailbox, clipboardPasteImage } = require('./clipboard-mailbox');
 const readImage = require('./read-image');
+const paneHistory = require('./pane-history');
 const claudeTrust = require('./claude-trust');
 const runnerWrapper = require('./claude-runner-wrapper');
 const claudeLogin = require('./claude-login');
+const t3Bridge = require('./t3-bridge');
+const portTunnel = require('./port-tunnel');
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -90,6 +101,10 @@ function remapPath(p) {
     }
   }
   return p;
+}
+
+function remapGuides(guides) {
+  return Array.isArray(guides) ? guides.map(g => ({ ...g, dir: remapPath(g?.dir) })) : [];
 }
 
 // ── Wiki init ─────────────────────────────────────────────────────────────
@@ -448,15 +463,26 @@ const chats = chatRunner.createChatRunner({
     liveSocket.send(JSON.stringify(frame));
     return true;
   },
-  startProcess: (meta, dir) => execFileAsync('tmux', newSessionArgv(meta.session, meta.cwd, [process.execPath, CHAT_TURN_SCRIPT, dir], process.env)),
+  // TERMAG_SPACE_MEMORY_MANAGED: the runner gives the turn its space memory, so the Claude Code hooks don't (space-memory.js).
+  startProcess: (meta, dir) => execFileAsync('tmux', newSessionArgv(meta.session, meta.cwd, spaceMemory.managedCommand([process.execPath, CHAT_TURN_SCRIPT, dir]), process.env)),
   sessionAlive: (name) => execFileAsync('tmux', ['has-session', '-t', tmuxSessionTarget(name, true)]).then(() => true, () => false),
   signalPid: (pid, signal) => { try { process.kill(pid, signal); } catch { /* already gone */ } },
+  // The desktop app's threads on this box's t3 server (t3-bridge.js), which
+  // may hold a chat's session (claimT3). The bridge is made below, once its
+  // command is known, and before any chat RPC can arrive.
+  t3Sessions: {
+    session: (a) => (t3 ? t3.threadSession(a) : { result: 'unsupported' }),
+    release: (a) => (t3 ? t3.threadRelease(a) : { result: 'unsupported' }),
+    adopt: (a) => (t3 ? t3.threadAdopt(a) : { result: 'unsupported' }),
+  },
   // A failed kill-session must reach chat-clear. Swallowing it made a turn
   // that was only marked cancelled look stopped while Claude was still alive.
   stopSession: (name) => execFileAsync('tmux', ['kill-session', '-t', tmuxSessionTarget(name, true)]),
   log: (line) => console.log(line),
   onTurnDone: (meta, dir) => askChats.onTurnDone(meta, dir),
   onDropped: (jobs) => askChats.onDropped(jobs),
+  // TERMAG_BOOT_ID_FILE: the e2e stand-in boxes share their host's kernel, so each start writes its own boot id.
+  bootNow: () => boxNotice.bootIdentity(process.env.TERMAG_BOOT_ID_FILE ? { file: process.env.TERMAG_BOOT_ID_FILE } : {}),
 });
 // An ask's thread as a chat of its target project (ask-chat.js).
 const askChats = askChat.createAskChat({
@@ -538,6 +564,58 @@ async function prepareOnClaim(payload) {
   fs.renameSync(tmp, ON_CLAIM_ENV_FILE);
   try { fs.unlinkSync(ON_CLAIM_STATUS_FILE); } catch { /* none yet */ }
   return plan;
+}
+
+// A private dotfiles repo cannot clone at claim time: the orchestrator sends
+// box-claim, which starts the run, and only then delivers GitHub through the
+// broker (warmPoolClaim.ts: configureBox, then welcomeOwner), so the clone
+// runs seconds before /etc/gitconfig could have sent it through the broker and
+// the run ends skipped/needs-auth. Once a GitHub delivery has landed, run the
+// claim again; the runner reads the saved URL and skips a checkout it already
+// applied. The claim's own run may still be in flight when the delivery
+// arrives, so wait for it to end first, up to its 10-minute budget. A
+// delivery is repeated on every reconnect, and a repo the token still cannot
+// read must not be cloned at each one, so each delivered connection gets one
+// rerun per cooldown, counted from the rerun it started, not from the
+// delivery. The key (onClaimRetryKey) carries the credential's updatedAt, so
+// the delivery that follows a token the owner replaced on the Credentials
+// page (routes/credentials.ts) is a new connection and reruns at once. Two
+// reruns cannot clone over each other: the runner holds one lock for the run.
+const ON_CLAIM_RETRY_POLL_MS = 2000;
+const ON_CLAIM_RETRY_WAIT_MS = 12 * 60 * 1000;
+const ON_CLAIM_RETRY_COOLDOWN_MS = 30 * 60 * 1000;
+const onClaimRetriedAt = new Map();
+let onClaimRetry = null;
+
+function readOnClaimStatus() {
+  try { return JSON.parse(fs.readFileSync(ON_CLAIM_STATUS_FILE, 'utf8')); } catch { return null; }
+}
+
+function retryOnClaimAfterGithub(payload) {
+  if (onClaimRetry) return onClaimRetry;
+  if (!fs.existsSync(ON_CLAIM_URL_FILE)) return Promise.resolve();
+  const key = onClaimRetryKey(payload);
+  const last = onClaimRetriedAt.get(key);
+  if (last !== undefined && Date.now() - last < ON_CLAIM_RETRY_COOLDOWN_MS) return Promise.resolve();
+  onClaimRetry = (async () => {
+    const deadline = Date.now() + ON_CLAIM_RETRY_WAIT_MS;
+    for (;;) {
+      const plan = planOnClaimRetry({ hasUrl: true, unitState: await onClaimUnitState(), status: readOnClaimStatus() });
+      if (plan === 'none') return;
+      if (plan === 'start') {
+        onClaimRetriedAt.set(key, Date.now());
+        await execFileAsync('systemctl', ['--user', 'start', '--no-block', ON_CLAIM_UNIT]);
+        console.log('[CLAIM] GitHub through termag is in place; running the deferred dotfiles claim again');
+        if (onClaimForwarder) onClaimForwarder.tick();
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise(resolve => setTimeout(resolve, ON_CLAIM_RETRY_POLL_MS));
+    }
+  })()
+    .catch(err => console.error('[CLAIM] rerunning the dotfiles claim after the GitHub delivery failed:', err && err.message))
+    .finally(() => { onClaimRetry = null; });
+  return onClaimRetry;
 }
 
 // ── Rate limit scanner ────────────────────────────────────────────────────
@@ -728,7 +806,7 @@ function stopCodexBridge(sessionName) {
   try { bridge.child.kill('SIGTERM'); } catch { /* ignore */ }
 }
 
-async function startCodexSession(sessionName, cwd, resourceEnv = {}) {
+async function startCodexSession(sessionName, cwd, resourceEnv = {}, resumeSessionId = null) {
   stopCodexBridge(sessionName);
 
   const port = await getFreePort();
@@ -755,7 +833,9 @@ async function startCodexSession(sessionName, cwd, resourceEnv = {}) {
     // the app server the bridge starts through termag-agent-otel, which puts
     // them on its resource as termag.project / termag.workstream;
     // the agent's own environment never carries them.
-    { cwd, env: { ...withoutResourceEnv(process.env), ...resourceEnv, TERMAG_STATUS_BEARER_TOKEN: token } },
+    // TERMAG_SESSION_KIND=interactive, as the resource says: the app server is
+    // where Codex's commands run, so the tools it starts inherit it.
+    { cwd, env: { ...codexBridgeEnv(process.env, resourceEnv), TERMAG_STATUS_BEARER_TOKEN: token } },
   );
 
   codexBridges.set(sessionName, { child, port, remoteUrl });
@@ -770,12 +850,54 @@ async function startCodexSession(sessionName, cwd, resourceEnv = {}) {
   await wait(200);
   await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${shellEscape('clear')} Enter`);
   await wait(200);
-  const codexCmd = `codex --remote ${remoteUrl} --no-alt-screen -C ${shellEscape(cwd)} -a on-request`;
+  // `codex resume <id>` when a tool update's relaunch names the pane's
+  // conversation (agent/codex-launch.js); otherwise a fresh client.
+  const codexCmd = codexPaneCommand({ remoteUrl, cwd, resumeSessionId });
   await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${shellEscape(codexCmd)} Enter`);
   return { ok: true, remoteUrl, port };
 }
 
 credentials.configure({ agentConfig: path.resolve(configPath) });
+
+// The desktop app's box bridge (agent/t3-bridge.js):
+// a t3 server on loopback, reached only through tunnels the orchestrator asks
+// for. Advertised where a t3 command resolves, or, read before the first
+// hello, where the checkout pins a server this box can still install.
+const t3Command = t3Bridge.resolveT3Command({ env: process.env, config });
+console.log(`[AGENT] t3 bridge: ${t3Command ? `using ${t3Command}` : 'no t3 command found'}`);
+const t3Installer = path.resolve(__dirname, '..', 'deploy', 'termag-t3-install');
+const t3Dropin = path.join(os.homedir() || process.env.HOME || '/', '.config', 'systemd', 'user', 'termag-agent.service.d', 't3.conf');
+const t3Pinned = t3Command
+  ? null
+  : t3Bridge.createPinnedInstall({ installer: t3Installer, dropin: t3Dropin, execFile: execFileAsync, log: (m) => console.log(m) });
+const t3Release = t3Bridge.createReleaseInstall({ installer: t3Installer, dropin: t3Dropin, execFile: execFileAsync });
+// t3-update moves only the installer's launcher: the pinned install's, or a
+// command that is the one its drop-in names (not an owner's own t3).
+const t3Updatable = t3Pinned !== null || (t3Command !== null && t3Command === t3Release.launcher());
+function makeT3Bridge(pinned) {
+  return t3Bridge.createT3Bridge({
+    command: t3Command, pinned, release: t3Release, home: os.homedir() || process.env.HOME || '/', execFile: execFileAsync, remapPath,
+    termagUrl: termag_url, token, WebSocket, log: (m) => console.log(m),
+    claudeCommand: t3Bridge.resolveT3ClaudeCommand({ env: process.env, config }),
+    piCommand: t3Bridge.resolveOnPath('pi', process.env.PATH),
+  });
+}
+let t3 = t3Command ? makeT3Bridge(null) : null;
+// The desktop's Space: the box copies its spaces with its own CLI (agent/space-sync.js).
+const spaceSync = spaceSyncRpc.createSpaceSync({ home: os.homedir() || process.env.HOME || '/' });
+// The port forward (agent/port-tunnel.js): tunnels to the user's own box
+// ports, checked by agent/port-guard.js. Needs no t3. Advertised only where
+// the guard has /proc/net/tcp to read (Linux), and used only once the
+// orchestrator's box-port-forward-enabled flag is on.
+const portForwardCapabilities = portTunnel.capabilities();
+const portTunnels = portTunnel.createPortTunnels({ termagUrl: termag_url, token, WebSocket, log: (m) => console.log(m) });
+
+/** The host sample, with the open tunnels the orchestrator's idle sweep counts as busy. */
+function hostSampleNow() {
+  return hostSample.sampleHostSync(os.homedir() || process.env.HOME || '/', {
+    tunnels: { t3: t3 ? t3.openTunnels() : 0, port: portTunnels.openTunnels() },
+  });
+}
 
 // The commit this process runs, read once at startup from the checkout agent/
 // is part of (agent/box-update.js). The orchestrator compares it with what a
@@ -806,10 +928,15 @@ let agentCommitAt = null;
 // Whether termag-box-update.service is installed here; the box-update
 // capability is announced only then (agent/box-update.js).
 let boxUpdateCapable = false;
+// The tools whose update unit (termag-claude-update@.service for claude,
+// termag-codex-update@.service for codex) is installed here; each one's
+// capability is announced only for those (agent/tool-update.js).
+let toolUpdateComponents = [];
 let projectCloneCapable = false;
-// Whether the installed termag-claude-runner understands the git flags; the
-// wrapper capability is announced only then (agent/claude-runner-wrapper.js).
-let wrapperFlagsCapable = false;
+// What the installed termag-claude-runner understands: v2 for the git flags,
+// v3 for --claude-floor (agent/claude-runner-wrapper.js). Nothing without a
+// wrapper.
+let wrapperCapabilities = [];
 
 // Tell the backend which host this agent is on, so it stops guessing
 // /home/<user> for the project directories it sends back.
@@ -832,8 +959,8 @@ function sendHello(ws) {
       warm: config.warm === true,
       // Disk, memory, load and kept runner checkouts (host-sample.js); the
       // backend writes them on the box row and refreshes them over the
-      // `host-sample` RPC.
-      host: hostSample.sampleHostSync(os.homedir() || process.env.HOME || '/'),
+      // `host-sample` RPC (S5).
+      host: hostSampleNow(),
       // "credentials": false in the config advertises no credential
       // capability, so the orchestrator never sends credentials-apply/remove:
       // for a second agent on a box whose first agent already owns the box's
@@ -843,13 +970,19 @@ function sendHello(ws) {
       capabilities: [
         ...(config.credentials === false ? [] : credentials.CAPABILITIES),
         ...TMUX_CAPABILITIES,
+        ...paneHistory.CAPABILITIES,
         ...(boxUpdateCapable ? boxUpdate.CAPABILITIES : []),
+        ...toolUpdate.capabilities(toolUpdateComponents),
         // ask-v1 only where termag-reconcile installed termag-subagent-run.
         ...(askRun.askRunnerInstalled(os.homedir() || process.env.HOME || '/') ? askRun.CAPABILITIES : []),
         ...(askChats.capable() ? askChat.CAPABILITIES : []),
+        ...(askRun.askPushCapable(os.homedir() || process.env.HOME || '/') ? [askRun.PUSH_CAPABILITY] : []),
         ...(projectCloneCapable ? projectClone.CAPABILITIES : []),
+        ...(projectCloneCapable ? workspace.CAPABILITIES : []),
         ...hostSample.CAPABILITIES,
         ...unsavedWork.CAPABILITIES,
+        ...gitChanges.CAPABILITIES,
+        ...(process.platform === 'linux' ? diskGrow.CAPABILITIES : []),
         ...softwareInventory.CAPABILITIES,
         ...briefing.CAPABILITIES,
         ...chatRunner.CAPABILITIES,
@@ -857,11 +990,18 @@ function sendHello(ws) {
         ...gitWorktreePr.CAPABILITIES,
         ...worktreeFetch.CAPABILITIES,
         ...readImage.CAPABILITIES,
+        ...spaceMemory.CAPABILITIES,
+        ...spaceSyncRpc.CAPABILITIES,
         ...claudeTrust.CAPABILITIES,
         ...(browserBinary ? browserPane.CAPABILITIES : []),
         ...(guestBrowser.ok ? [browserPane.GUEST_CAPABILITY] : []),
+        // Reads Docker and the checkout only, so it needs no guest browser.
+        ...browserGuest.CHECK_CAPABILITIES,
         ...(browserBinary ? [browserPane.PROFILES_CAPABILITY] : []),
-        ...(wrapperFlagsCapable ? runnerWrapper.CAPABILITIES : []),
+        ...wrapperCapabilities,
+        ...(t3 ? t3Bridge.CAPABILITIES : []),
+        ...(t3 && t3Updatable ? t3Bridge.UPDATE_CAPABILITIES : []),
+        ...portForwardCapabilities,
       ],
     }));
   } catch (err) {
@@ -955,8 +1095,10 @@ function connect() {
             alreadyRepo = realTop === realCwd;
           } catch { /* not in a repo */ }
           // gitInit: false opts out (the Claude runner session lives in a
-          // state directory that must not become a repository).
-          if (!alreadyRepo && msg.gitInit !== false) {
+          // state directory that must not become a repository), and so does a
+          // multi-repo project's workspace root or workstream root, which
+          // holds repositories but is not one (agent/workspace.js).
+          if (workspace.shouldGitInit(cwd, { alreadyRepo, gitInit: msg.gitInit })) {
             await gitInit(cwd);
           }
           // `command` (argv, tmux-create-command-v1): the pane runs that
@@ -986,6 +1128,18 @@ function connect() {
             // set-clipboard is a server option; -g applies it to all sessions.
             await execAsync(`tmux set-option -g set-clipboard on`);
             await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
+          }
+          // Pane output history for the phone's "Load earlier" (pane-history-v1):
+          // an agent pane's TUI runs on tmux's alternate screen, which keeps no
+          // scrollback, so capture alone cannot reach the pane's past. Armed on
+          // the created and already-exists paths alike (`-o` makes a second arm
+          // a no-op), so an agent restart re-arms every session the backend
+          // reconstructs. Best effort: a pipe that will not start costs nothing
+          // today.
+          try {
+            await paneHistory.arm(process.env.HOME || '/home', sessionName, { execFile: execFileAsync });
+          } catch (err) {
+            console.warn(`[AGENT] pane-history arm failed for ${sessionName}: ${err.message}`);
           }
           respond(ws, requestId, { ok: true, created });
           break;
@@ -1076,10 +1230,32 @@ function connect() {
           break;
         }
 
+        case 'pane-history-read': {
+          // Tail of the pane's output log (pane-history-v1, agent/pane-history.js),
+          // for the phone's "Load earlier". The backend's sessionAccess gate has
+          // already decided the caller may see this pane; the log is the same
+          // bytes the pane emitted. Agents from before this case answer
+          // "Unknown command", which the backend turns into a 501.
+          try {
+            respond(ws, requestId, await paneHistory.readTail(
+              process.env.HOME || '/home', msg.sessionName,
+              { beforeBytes: msg.beforeBytes, maxBytes: msg.maxBytes },
+            ));
+          } catch (err) {
+            respond(ws, requestId, null, err.message);
+          }
+          break;
+        }
+
         case 'project-rename': {
           for (const { from } of msg.sessions ?? []) stopCodexBridge(from);
           const result = await renameProject(
-            { sessions: msg.sessions, fromDir: remapPath(msg.fromDir), toDir: remapPath(msg.toDir) },
+            {
+              sessions: msg.sessions,
+              fromDir: remapPath(msg.fromDir),
+              toDir: remapPath(msg.toDir),
+              ...(msg.workspace ? { workspace: { repos: msg.workspace.repos, guides: remapGuides(msg.workspace.guides) } } : {}),
+            },
             { execFile: execFileAsync },
           );
           respond(ws, requestId, result);
@@ -1162,7 +1338,7 @@ function connect() {
           // to HEAD). The worktree lives inside the main project dir so it
           // travels along on rename and stays grouped with its parent.
           const projectDir = remapPath(msg.projectDir);
-          const { worktreeName, branch, baseRef, initRepo, fetch } = msg;
+          const { worktreeName, branch, baseRef, initRepo, fetch, attended, readOnly } = msg;
           if (!projectDir || !worktreeName || !branch) {
             throw new Error('projectDir, worktreeName, and branch are required');
           }
@@ -1182,8 +1358,16 @@ function connect() {
           // local first commit would own the branch a pane checkout creates.
           // An older backend never sends it, which keeps the old behaviour.
           if (initRepo === true) await ensureProjectRepo(projectDir);
-          const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
+          // worktreePath (workspace-clone-v1): a multi-repo project's
+          // repository gets its worktree at <wsRoot>/<repo>, not under its own
+          // checkout. Only sent to an agent advertising it.
+          const worktreePath = typeof msg.worktreePath === 'string' && path.isAbsolute(msg.worktreePath)
+            ? remapPath(msg.worktreePath)
+            : `${projectDir}/.worktrees/${worktreeName}`;
           const ref = baseRef || 'HEAD';
+          // A person's start from the ref this fetch refreshed (worktree-fetch.js startsFromFetch):
+          // the only one their Full access leaves unmarked or records as origin's default.
+          const fresh = worktreeFetch.startsFromFetch(fetched, fetch, ref);
           // Idempotent, like tmux-create: a worktree already at that path on
           // that branch is reused rather than failed on. That is what lets a
           // second orchestrator (docs/stage.md) adopt a workstream the first
@@ -1193,7 +1377,9 @@ function connect() {
               const { stdout } = await execAsync(`git -C ${shellEscape(worktreePath)} rev-parse --abbrev-ref HEAD`);
               if (stdout.trim() === branch) {
                 // A reused run worktree is as unattended as a new one (below).
-                if (fetched !== null) await markUnattended(worktreePath, branch);
+                if (worktreeFetch.marksUnattended(fetched, attended, fresh)) await markUnattended(worktreePath, branch);
+                // A Read only pick never keeps an own mark an earlier create left on this tree.
+                if (!worktreeFetch.marksOwn(readOnly)) await worktreeFetch.clearOwn(execFileAsync, worktreePath, branch);
                 // The fetch above ran all the same; say so, and where this tree is.
                 respond(ws, requestId, {
                   ok: true, path: worktreePath, existing: true,
@@ -1208,16 +1394,32 @@ function connect() {
           );
           // The chat runner trusts a branch-off only once this proof is written,
           // and only when `ref` is already marked own or is the main worktree's
-          // current same-repo branch. A raw commit, a pull ref, an unmarked
-          // origin/<name>, or another remote is left unmarked. An existing
-          // worktree reused above is not marked either: a missing marker stays
-          // read-only, including a pull-request checkout from before it.
-          await gitWorktreeOwn.markOwnCheckout({ worktreePath, branch, repoPath: projectDir, startPoint: ref }, { execFile: execFileAsync });
+          // current same-repo branch, or is origin's default branch fetched
+          // for a person (attended: a fresh clone's footing, whatever branch
+          // the project's checkout is on). A raw commit, a pull ref, any other
+          // unmarked origin/<name>, or another remote is left unmarked. An
+          // existing worktree reused above is not marked either: a missing
+          // marker stays read-only, including a pull-request checkout from
+          // before it.
+          // A person's Read only pick (readOnly) is never marked own, so it stays read-only.
+          if (worktreeFetch.marksOwn(readOnly)) {
+            await gitWorktreeOwn.markOwnCheckout({
+              worktreePath, branch, repoPath: projectDir, startPoint: ref,
+              // Only a start from the ref this fetch refreshed: a failed fetch leaves the box's
+              // older origin/<default>, and another start was not fetched at all.
+              fetchedDefault: attended === true && fresh,
+            }, { execFile: execFileAsync });
+          } else {
+            await worktreeFetch.clearOwn(execFileAsync, worktreePath, branch);
+          }
           // A tree made from origin's tip with nobody watching (an automation
           // run) keeps that fact: the chat runner never loads such a
           // checkout's startup config, even for a later trusted follow-up
-          // (chat-runner.js turnModeFor).
-          if (fetched !== null) await markUnattended(worktreePath, branch);
+          // (chat-runner.js turnModeFor). One a person asked for (attended,
+          // worktree-fetch.js) is left as a fresh clone is, but only when it
+          // starts from the ref this fetch refreshed (fresh): after a failed
+          // fetch, or from any other start, it is marked as a run's is.
+          if (worktreeFetch.marksUnattended(fetched, attended, fresh)) await markUnattended(worktreePath, branch);
           respond(ws, requestId, {
             ok: true, path: worktreePath,
             ...(fetched === null ? {} : { fetched, baseSha: await worktreeFetch.headSha(execFileAsync, worktreePath) }),
@@ -1229,8 +1431,11 @@ function connect() {
           // A worktree on a pull request's own branch (git-worktree-pr.js):
           // fetched from pull/<n>/head, or an agent-made worktree adopted.
           const projectDir = remapPath(msg.projectDir);
+          // worktreePath (worktree-pr-path-v1): a multi-repo project's <wsRoot>/<repo>, as for git-worktree-add.
+          const worktreePath = typeof msg.worktreePath === 'string' && path.isAbsolute(msg.worktreePath) ? remapPath(msg.worktreePath) : undefined;
           respond(ws, requestId, await gitWorktreePr.addPrWorktree({
-            projectDir, worktreeName: msg.worktreeName, branch: msg.branch, number: msg.number, sameRepo: msg.sameRepo === true, headOid: msg.headOid,
+            projectDir, worktreeName: msg.worktreeName, ...(worktreePath ? { worktreePath } : {}),
+            branch: msg.branch, number: msg.number, sameRepo: msg.sameRepo === true, headOid: msg.headOid,
           }, { execFile: execFileAsync }));
           break;
         }
@@ -1268,6 +1473,20 @@ function connect() {
             break;
           }
           await execAsync(`tmux rename-session -t ${shellEscape(`=${from}`)} ${shellEscape(to)}`);
+          // The pane history log rides the rename. The pipe's `cat >>` holds
+          // the file open, and an open fd follows the inode across a rename —
+          // so moving the path moves the writer with it; without this, reads
+          // under the new name 404 while `cat` keeps the old path alive.
+          try {
+            await fs.promises.rename(
+              paneHistory.historyFilePath(process.env.HOME || '/home', from),
+              paneHistory.historyFilePath(process.env.HOME || '/home', to),
+            );
+          } catch (err) {
+            if (err.code !== 'ENOENT') {
+              console.warn(`[AGENT] pane-history rename ${from} -> ${to} failed: ${err.message}`);
+            }
+          }
           respond(ws, requestId, { ok: true, renamed: true });
           break;
         }
@@ -1286,7 +1505,9 @@ function connect() {
           if (!projectDir || !worktreeName) {
             throw new Error('projectDir and worktreeName are required');
           }
-          const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
+          const worktreePath = typeof msg.worktreePath === 'string' && path.isAbsolute(msg.worktreePath)
+            ? remapPath(msg.worktreePath)
+            : `${projectDir}/.worktrees/${worktreeName}`;
           // The directory may already be gone: removed by hand, or by a
           // `git worktree remove` run outside termag. `worktree remove` then
           // fails with "is not a working tree", and the backend turns any
@@ -1387,9 +1608,25 @@ function connect() {
           // pre-PR lanes (git-branch-state.js). Local refs only, no fetch.
           const cwd = remapPath(msg.cwd);
           if (!cwd) throw new Error('cwd is required');
+          // light: only repository, branch, HEAD and top level, without `git status`, so the
+          // backend can find a PR's checkout among several directories (4d).
+          if (msg.light === true) {
+            respond(ws, requestId, await gitCheckoutFacts(cwd, { execFile: execFileAsync }, { worktrees: msg.worktrees === true }));
+            break;
+          }
           // verifyRemote: also ask origin whether it holds HEAD (the spawn lifecycle's retire check).
           // base: the commit a spawned checkout was made from, counted against when there is no origin (#453).
           respond(ws, requestId, await gitBranchState(cwd, { execFile: execFileAsync }, { verifyRemote: msg.verifyRemote === true, base: msg.base }));
+          break;
+        }
+
+        case 'git-changes': {
+          // The files a checkout has changed that its upstream lacks, for the
+          // simple UI's context card (git-changes.js). Names and line counts only.
+          const cwd = remapPath(msg.cwd);
+          if (!cwd) throw new Error('cwd is required');
+          // branch: the session's PR's head, read from the repository's worktree on it (git-changes.js).
+          respond(ws, requestId, await gitChanges.gitChanges(cwd, { execFile: execFileAsync }, { branch: msg.branch }));
           break;
         }
 
@@ -1411,7 +1648,9 @@ function connect() {
           if (!sessionName || !cwd) throw new Error('sessionName and cwd are required');
           // The pane's project and workstream, for the app server's telemetry
           // resource (codex-resource-env.js); an older orchestrator sends none.
-          const result = await startCodexSession(sessionName, cwd, codexResourceEnv(msg));
+          // resumeSessionId: the conversation a tool update stopped in this
+          // pane; checked as a Codex thread id there.
+          const result = await startCodexSession(sessionName, cwd, codexResourceEnv(msg), msg.resumeSessionId);
           respond(ws, requestId, result);
           break;
         }
@@ -1569,6 +1808,13 @@ function connect() {
           break;
         }
 
+        // The share dialog's look at a workstream's dev stack, for its owner:
+        // what a guest's attach would find, and whose stack is in the way.
+        case 'browser-guest-check': {
+          respond(ws, requestId, await browserGuest.checkRecipe(msg));
+          break;
+        }
+
         // A kept profile forgotten (a share revoked or expired) or reset by
         // its viewer: its browser is closed and the profile deleted.
         case 'browser-profile-forget': {
@@ -1613,6 +1859,12 @@ function connect() {
           await credentials.applyCredential(msg.provider, msg.payload);
           console.log(`[CRED] applied ${msg.provider}`);
           respond(ws, requestId, { ok: true });
+          // After the ack: a dotfiles claim that waited for GitHub can run now.
+          if (msg.provider === 'github') void retryOnClaimAfterGithub(msg.payload);
+          // And the pinned t3 server, whose gh:// fetch needed this login, so
+          // it is in place before the desktop asks: again, if an install ran
+          // (or still runs) without it.
+          if (msg.provider === 'github' && t3 && t3Pinned) t3Pinned.retry();
           break;
         }
 
@@ -1668,7 +1920,7 @@ function connect() {
         }
 
         case 'claude-login-start': {
-          const view = await claudeSignIn.start(msg.email);
+          const view = await claudeSignIn.start(msg.email, { reauth: msg.reauth === true });
           console.log(`[CLAUDE-LOGIN] start -> ${view.phase}${view.loggedIn ? ' logged-in' : ''}`);
           respond(ws, requestId, view);
           break;
@@ -1706,11 +1958,33 @@ function connect() {
             break;
           }
           respond(ws, requestId, await chats.sendMessage({
-            chatKey: msg.chatKey, cwd, text: msg.text, projectId: msg.projectId, workstream: msg.workstream,
+            chatKey: msg.chatKey, cwd, text: msg.text, projectId: msg.projectId, project: msg.project, workstream: msg.workstream,
             workstreamId: msg.workstreamId, permissionMode: msg.permissionMode, paneProbe: msg.paneProbe,
             liveInput: msg.liveInput === true, model: msg.model, images: msg.images, orchestrator: msg.orchestrator === true,
-            backend: msg.backend, fastModel: msg.fastModel, context: msg.context, titles: msg.titles === true,
+            backend: msg.backend, fastModel: msg.fastModel, context: msg.context, models: msg.models, titles: msg.titles === true, headings: msg.headings === true, effort: msg.effort,
+            engine: msg.engine,
+            genUiPrompt: msg.genUiPrompt,
+            genUiHint: msg.genUiHint,
+            boxNotices: msg.boxNotices === true, notice: msg.notice,
+            spaceMemory: msg.spaceMemory,
+            planSpend: msg.planSpend === true,
           }));
+          break;
+        }
+
+        case 'chat-engine-check': {
+          // Whether a turn on this engine could start now (chat-pi-v1): for
+          // pi, termag-pi-headless --check (the owner's AWS SSO session,
+          // the broker). Runs no model; at most about 10 s.
+          respond(ws, requestId, await chatRunner.checkEngine({ engine: msg.engine }, { home: process.env.HOME || os.homedir() }));
+          break;
+        }
+
+        case 'chat-session-restore': {
+          // A chat continued from a terminated box: its stored session, written
+          // here in pieces so the next turn resumes it.
+          const cwd = remapPath(msg.cwd);
+          respond(ws, requestId, await chats.restoreSession(msg.chatKey, { sessionId: msg.sessionId, cwd, from: msg.from, data: msg.data, done: msg.done === true }));
           break;
         }
 
@@ -1729,6 +2003,17 @@ function connect() {
           const history = await chats.history(msg.chatKey);
           const checkout = msg.requireCheckout && cwd ? await chatRunner.checkoutReady(cwd, execFileAsync) : true;
           respond(ws, requestId, { ...history, checkoutReady: checkout });
+          break;
+        }
+
+        case 'chat-transcript-read': {
+          respond(ws, requestId, await chats.transcriptRead(msg.chatKey, { sessionId: msg.sessionId, from: msg.from, maxBytes: msg.maxBytes }));
+          break;
+        }
+
+        case 'chat-subagent-read': {
+          // A subagent's own transcript, beside the chat's session (chat-subagents-v1).
+          respond(ws, requestId, await chats.subagentHistory(msg.chatKey, msg.agentId));
           break;
         }
 
@@ -1756,8 +2041,17 @@ function connect() {
           respond(ws, requestId, await chats.claimResume(msg.chatKey, {
             cwd: remapPath(msg.cwd),
             permissionMode: msg.permissionMode,
-            backend: msg.backend, model: msg.model, fastModel: msg.fastModel, context: msg.context,
+            backend: msg.backend, model: msg.model, fastModel: msg.fastModel, context: msg.context, models: msg.models,
+            // The pane's telemetry resource names them (chat-runner.js chatTelemetryEnv); an older orchestrator sends neither.
+            project: msg.project, workstream: msg.workstream,
           }));
+          break;
+        }
+
+        case 'chat-t3-claim': {
+          // The desktop app's thread takes the session (chat-t3-hold-v1): refused
+          // while a runner turn or the pane has it; a runner send takes it back.
+          respond(ws, requestId, await chats.claimT3(msg.chatKey, { threadId: msg.threadId, workstream: msg.workstream }));
           break;
         }
 
@@ -1777,6 +2071,32 @@ function connect() {
           break;
         }
 
+        case 'chat-reset': {
+          // Clear context: the chat's next turn starts a new session (chat-context-v1).
+          respond(ws, requestId, await chats.resetContext(msg.chatKey, {
+            projectId: msg.projectId, workstream: msg.workstream, workstreamId: msg.workstreamId,
+          }));
+          break;
+        }
+
+        case 'chat-resume': {
+          // Undo the last clear while no turn has started a new session (chat-context-v1).
+          respond(ws, requestId, await chats.resumePrevious(msg.chatKey, {
+            projectId: msg.projectId, workstream: msg.workstream, workstreamId: msg.workstreamId,
+          }));
+          break;
+        }
+
+        case 'chat-compact': {
+          // A /compact turn on the chat's session (chat-context-v1); events follow as chat-event frames.
+          respond(ws, requestId, await chats.compact({
+            chatKey: msg.chatKey, cwd: remapPath(msg.cwd), projectId: msg.projectId, project: msg.project, workstream: msg.workstream,
+            workstreamId: msg.workstreamId, permissionMode: msg.permissionMode, paneProbe: msg.paneProbe,
+            model: msg.model, backend: msg.backend, fastModel: msg.fastModel, context: msg.context, models: msg.models,
+          }));
+          break;
+        }
+
         case 'chat-sweep': {
           // What this process would take up, so the backend can say which of
           // them belong to an archived project or a deleted workstream.
@@ -1792,13 +2112,44 @@ function connect() {
           break;
         }
 
+        case 'init-workspace': {
+          // A multi-repo project's workspace or workstream root: the marker
+          // and the generated guide, never git (agent/workspace.js).
+          respond(ws, requestId, workspace.initWorkspace({ dir: remapPath(msg.dir), guide: msg.guide }));
+          break;
+        }
+
+        case 'workspace-root-state': {
+          // Which worktrees and which other files a workstream root holds, checked before removing it.
+          respond(ws, requestId, workspace.workstreamRootState({ wsRoot: remapPath(msg.wsRoot), repos: msg.repos }));
+          break;
+        }
+
+        case 'workspace-root-remove': {
+          // A workstream root once its worktrees are removed: its guide goes with it, and with force anything else.
+          respond(ws, requestId, workspace.removeWorkstreamRoot({ wsRoot: remapPath(msg.wsRoot), force: msg.force === true }));
+          break;
+        }
+
+        case 'workspace-move': {
+          // A multi-repo workstream's rename: its root moves, each worktree in it is repaired, all or nothing.
+          respond(ws, requestId, await workspace.moveWorkstreamRoot({
+            root: remapPath(msg.root),
+            fromDir: remapPath(msg.fromDir),
+            toDir: remapPath(msg.toDir),
+            repos: msg.repos,
+            guides: remapGuides(msg.guides),
+          }, { execFile: execFileAsync }));
+          break;
+        }
+
         case 'project-clone': {
           const result = await projectClone.handleProjectClone(msg, {
             execFile: execFileAsync,
             home: process.env.HOME || os.homedir(),
             remapPath,
           });
-          console.log(`[CLONE] ${msg.projectId} attempt ${msg.attempt}: ${result.started ? 'started' : result.ignored}`);
+          console.log(`[CLONE] ${msg.projectId}${msg.repo ? `/${msg.repo}` : ''} attempt ${msg.attempt}: ${result.started ? 'started' : result.ignored}`);
           respond(ws, requestId, result);
           if (cloneForwarder) cloneForwarder.tick();
           break;
@@ -1817,14 +2168,27 @@ function connect() {
           break;
         }
 
+        case 'tool-update': {
+          // Hands over to the component's unit for this run
+          // (termag-claude-update@<run>.service) and answers once systemctl
+          // has taken the start: the run stops and resumes sessions for up to
+          // an hour, and fetches its own policy (agent/tool-update.js). An
+          // error reply means nothing was started.
+          const result = await toolUpdate.startToolUpdate(msg, execFileAsync);
+          console.log(`[TOOL-UPDATE] started ${result.unit}`);
+          respond(ws, requestId, result);
+          break;
+        }
+
         case 'ask-run': {
           // Starts deploy/termag-subagent-run detached and answers at once;
           // the runner posts the reply to the orchestrator itself
           // (agent/ask-run.js). With `chat`, the run
           // is a turn of the thread's chat instead (agent/ask-chat.js).
           if (msg.chat) {
-            const result = askChats.startRun(msg, remapPath(msg.cwd));
-            console.log(`[ASK] run ${msg.runId} on thread ${msg.threadId} going to chat ${result.chat}`);
+            // steerOf (ask-steer-v1): a follow-up into the live turn that run is in, else the turn after it.
+            const result = msg.steerOf ? await askChats.steerRun(msg, remapPath(msg.cwd)) : askChats.startRun(msg, remapPath(msg.cwd));
+            console.log(`[ASK] run ${msg.runId} on thread ${msg.threadId} ${result.steered ? `steered into ${msg.steerOf}'s turn in` : result.started === false ? `not steered (${result.reason}), nothing started for` : 'going to'} chat ${result.chat}`);
             respond(ws, requestId, result);
             break;
           }
@@ -1847,13 +2211,19 @@ function connect() {
         }
 
         case 'host-sample': {
-          respond(ws, requestId, hostSample.sampleHostSync(os.homedir() || process.env.HOME || '/'));
+          respond(ws, requestId, hostSampleNow());
           break;
         }
 
         case 'unsaved-work': {
           // Read-only git scan before an automatic hibernate (agent/unsaved-work.js).
           respond(ws, requestId, await unsavedWork.scanUnsavedWork(execFileAsync, os.homedir() || process.env.HOME || '/'));
+          break;
+        }
+
+        case 'disk-grow': {
+          // Fixed steps only (disk-grow.js): fill the root volume the orchestrator just grew.
+          respond(ws, requestId, await diskGrow.growRootDisk(execFileAsync));
           break;
         }
 
@@ -1874,6 +2244,32 @@ function connect() {
           // backends send {} and get everything, as before.
           const result = await usageScanner.scan({ since: msg.since });
           respond(ws, requestId, result);
+          break;
+        }
+
+        case 't3-ensure':
+        case 't3-update':
+        case 't3-pair':
+        case 't3-revoke':
+        case 't3-paths': {
+          if (!t3) { respond(ws, requestId, null, 'No t3 command on this box'); break; }
+          if (type === 't3-ensure') respond(ws, requestId, await t3.ensure({ label: msg.label, fireworks: msg.fireworks }));
+          else if (type === 't3-update') respond(ws, requestId, await t3.update({ version: msg.version, label: msg.label }));
+          else if (type === 't3-pair') respond(ws, requestId, await t3.pair({ label: msg.label }));
+          else if (type === 't3-revoke') respond(ws, requestId, await t3.revoke({ label: msg.label }));
+          else respond(ws, requestId, t3.paths({ paths: msg.paths }));
+          break;
+        }
+
+        case 'space-sync': {
+          respond(ws, requestId, await spaceSync.sync({ space: msg.space }));
+          break;
+        }
+
+        case 'tunnel-open': {
+          // By target: 't3' to the desktop bridge, as before; { kind: 'port' }
+          // to the port forward (agent/port-tunnel.js), which needs no t3.
+          respond(ws, requestId, await portTunnel.openTunnelRpc(msg, { t3, portTunnels }));
           break;
         }
 
@@ -1968,14 +2364,20 @@ Promise.all([
   boxUpdate.boxUpdateUnitLoaded(execFileAsync),
   boxUpdate.readCheckoutCommitDate(execFileAsync, CHECKOUT_DIR),
   projectClone.unitTemplateLoaded(execFileAsync),
-]).then(([sha, unitLoaded, at, cloneUnitLoaded]) => {
+  t3Pinned ? t3Pinned.check() : false,
+  toolUpdate.loadedComponents(execFileAsync),
+]).then(([sha, unitLoaded, at, cloneUnitLoaded, t3Installable, toolUnits]) => {
   agentCommit = sha;
   agentCommitAt = sha ? at : null;
   boxUpdateCapable = unitLoaded;
+  toolUpdateComponents = toolUnits;
+  console.log(`[AGENT] tool updates: ${toolUnits.length ? toolUnits.map((c) => toolUpdate.TOOL_UNITS[c]).join(', ') + ' installed' : 'no update unit installed, capability not advertised'}`);
   projectCloneCapable = cloneUnitLoaded;
+  if (t3Installable) t3 = makeT3Bridge(t3Pinned);
+  if (t3Pinned) console.log(`[AGENT] t3 bridge: ${t3Installable ? 'the pinned t3 server is not installed yet; installed when first asked' : 'nothing to install, capability not advertised'}`);
   console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}; ${projectClone.UNIT_TEMPLATE} ${cloneUnitLoaded ? 'installed' : 'not installed'}`);
-  wrapperFlagsCapable = runnerWrapper.wrapperSupportsFlags();
-  console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}; claude-runner wrapper ${wrapperFlagsCapable ? 'understands the git flags' : 'predates the git flags or is absent'}`);
+  wrapperCapabilities = runnerWrapper.wrapperCapabilities();
+  console.log(`[AGENT] running commit ${sha ? sha.slice(0, 12) : 'unknown (not a git checkout)'}; ${boxUpdate.BOX_UPDATE_UNIT} ${unitLoaded ? 'installed' : 'not installed'}; claude-runner wrapper ${wrapperCapabilities.length ? `announces ${wrapperCapabilities.join(', ')}` : 'predates the git flags or is absent'}`);
   connect();
   softwareInventory.warmInventory();
 });

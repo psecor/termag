@@ -17,13 +17,41 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { sniffImageMime } = require('./read-image');
 
-const CAPABILITIES = ['chat-images-v1'];
+// chat-pdfs-v1: a send's images may also be PDFs, which go to Claude as document blocks.
+const CAPABILITIES = ['chat-images-v1', 'chat-pdfs-v1'];
+const PDF = 'application/pdf';
 const MAX_IMAGES = 4;
+// The Messages API reads at most 100 pages of a PDF.
+const MAX_PDF_PAGES = 100;
 // The Messages API takes at most 5 MB of base64 per image.
 const MAX_IMAGE_BYTES = Math.floor((5 * 1024 * 1024 * 3) / 4);
-const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', [PDF]: 'pdf' };
 const ID_RE = /^[0-9a-f]{64}$/;
 const IMAGES_ROOT = '.termag/chat-images';
+
+/** A PDF's own bytes start with `%PDF-`. */
+function isPdf(buf) {
+  return buf.length >= 5 && buf.toString('latin1', 0, 5) === '%PDF-';
+}
+
+/**
+ * Why the Messages API would refuse this PDF, or null. A refused document
+ * stays in the Claude Code session and goes with every later turn, so it
+ * is refused here instead. The page count is a scan for page objects: one
+ * in compressed object streams counts as none, which passes.
+ */
+function pdfRefusal(buf) {
+  const text = buf.toString('latin1');
+  if (/\/Encrypt\b/.test(text)) return 'is an encrypted PDF';
+  const pages = (text.match(/\/Type\s*\/Page(?![A-Za-z])/g) || []).length;
+  if (pages > MAX_PDF_PAGES) return `has more than ${MAX_PDF_PAGES} pages`;
+  return null;
+}
+
+/** What `buf` is as an attachment: an image type, a PDF, or null. */
+function sniffAttachmentMime(buf) {
+  return sniffImageMime(buf) || (isPdf(buf) ? PDF : null);
+}
 
 /** Where a chat's images live, as the `~/` path the browser asks read-image for. */
 function homePath(chatKey, id, mediaType) {
@@ -32,8 +60,8 @@ function homePath(chatKey, id, mediaType) {
 
 /**
  * The images a chat-send carries, checked: at most MAX_IMAGES, each base64
- * of a PNG, JPEG, GIF or WebP (by its bytes, not the declared type) of at
- * most MAX_IMAGE_BYTES. Returns the decoded images; throws `image-refused:`.
+ * of a PNG, JPEG, GIF, WebP or PDF (by its bytes, not the declared type) of
+ * at most MAX_IMAGE_BYTES; a PDF also passes pdfRefusal. Returns the decoded images; throws `image-refused:`.
  */
 function decodeImages(images) {
   if (images == null) return [];
@@ -44,10 +72,20 @@ function decodeImages(images) {
     if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) throw new Error(`image-refused: image ${i + 1} is not base64`);
     const buf = Buffer.from(data, 'base64');
     if (buf.length > MAX_IMAGE_BYTES) throw new Error(`image-refused: image ${i + 1} is larger than ${MAX_IMAGE_BYTES} bytes`);
-    const mediaType = sniffImageMime(buf);
-    if (!mediaType) throw new Error(`image-refused: image ${i + 1} is not a PNG, JPEG, GIF or WebP`);
-    return { buf, mediaType };
+    const mediaType = sniffAttachmentMime(buf);
+    if (!mediaType) throw new Error(`image-refused: image ${i + 1} is not a PNG, JPEG, GIF, WebP or PDF`);
+    const refused = mediaType === PDF ? pdfRefusal(buf) : null;
+    if (refused) throw new Error(`image-refused: image ${i + 1} ${refused}`);
+    const name = mediaType === PDF ? attachmentName(img.name) : null;
+    return { buf, mediaType, ...(name ? { name } : {}) };
   });
+}
+
+/** A PDF's file name as sent, made safe to keep as its document title, or null. */
+function attachmentName(raw) {
+  if (typeof raw !== 'string') return null;
+  const name = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 200);
+  return name || null;
 }
 
 function createImageStore(home, fsImpl = fs) {
@@ -55,7 +93,7 @@ function createImageStore(home, fsImpl = fs) {
   const fileFor = (chatKey, id, mediaType) => path.join(dirFor(chatKey), `${id}.${EXT[mediaType]}`);
 
   /** Keep one image for a chat; returns its reference. Idempotent: the name is the bytes' hash. */
-  function save(chatKey, buf, mediaType) {
+  function save(chatKey, buf, mediaType, name = null) {
     const id = crypto.createHash('sha256').update(buf).digest('hex');
     const file = fileFor(chatKey, id, mediaType);
     if (!fsImpl.existsSync(file)) {
@@ -64,21 +102,26 @@ function createImageStore(home, fsImpl = fs) {
       fsImpl.writeFileSync(tmp, buf, { mode: 0o600 });
       fsImpl.renameSync(tmp, file);
     }
-    return { id, mediaType, path: homePath(chatKey, id, mediaType) };
+    return { id, mediaType, path: homePath(chatKey, id, mediaType), ...(name ? { name } : {}) };
   }
 
-  /** The stream-json image block for a stored reference, or null when the file is gone. */
+  /** The stream-json image (or, for a PDF, document) block for a stored reference, or null when the file is gone. */
   function block(chatKey, ref) {
     if (!ref || !ID_RE.test(ref.id) || !EXT[ref.mediaType]) return null;
     let buf;
     try { buf = fsImpl.readFileSync(fileFor(chatKey, ref.id, ref.mediaType)); } catch { return null; }
-    return { type: 'image', source: { type: 'base64', media_type: ref.mediaType, data: buf.toString('base64') } };
+    const source = { type: 'base64', media_type: ref.mediaType, data: buf.toString('base64') };
+    if (ref.mediaType === PDF) {
+      const title = attachmentName(ref.name);
+      return { type: 'document', source, ...(title ? { title } : {}) };
+    }
+    return { type: 'image', source };
   }
 
   /**
-   * A message's content with every base64 image (its own, or one inside a
-   * tool result) replaced by a reference to the stored copy, saved on the
-   * way when this box does not have it yet (an image Read returned).
+   * A message's content with every base64 image or PDF (its own, or one
+   * inside a tool result) replaced by a reference to the stored copy, saved
+   * on the way when this box does not have it yet (one Read returned).
    */
   function strip(chatKey, content) {
     if (!Array.isArray(content)) return content;
@@ -91,6 +134,14 @@ function createImageStore(home, fsImpl = fs) {
         if (!mediaType) return { type: 'image', source: { type: 'termag', media_type: part.source.media_type || null, path: null } };
         const ref = save(chatKey, buf, mediaType);
         return { type: 'image', source: { type: 'termag', media_type: mediaType, id: ref.id, path: ref.path } };
+      }
+      if (part && part.type === 'document' && part.source && part.source.type === 'base64' && part.source.data) {
+        const buf = Buffer.from(String(part.source.data), 'base64');
+        const title = attachmentName(part.title);
+        changed = true;
+        if (!isPdf(buf)) return { type: 'document', source: { type: 'termag', media_type: part.source.media_type || null, path: null }, ...(title ? { title } : {}) };
+        const ref = save(chatKey, buf, PDF);
+        return { type: 'document', source: { type: 'termag', media_type: PDF, id: ref.id, path: ref.path }, ...(title ? { title } : {}) };
       }
       if (part && part.type === 'tool_result' && Array.isArray(part.content)) {
         const inner = strip(chatKey, part.content);
@@ -111,10 +162,10 @@ function createImageStore(home, fsImpl = fs) {
   return { save, block, strip, stripEvent };
 }
 
-/** A user message's content: its images first, then its text (the order the Messages API recommends). */
+/** A user message's content: its images (and PDFs) first, then its text (the order the Messages API recommends). */
 function userContent(text, blocks) {
   if (!blocks || !blocks.length) return text;
   return [...blocks, ...(text ? [{ type: 'text', text }] : [])];
 }
 
-module.exports = { CAPABILITIES, MAX_IMAGES, MAX_IMAGE_BYTES, createImageStore, decodeImages, homePath, userContent };
+module.exports = { CAPABILITIES, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_PDF_PAGES, PDF, createImageStore, decodeImages, homePath, sniffAttachmentMime, userContent };

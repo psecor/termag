@@ -370,6 +370,20 @@ test('a local start is own only when it is already marked own, or it is the main
   assert.equal(off.marked.marked, true);
   assert.equal((await git(off.wt, 'config', '--local', '--get', 'branch.off-main.termagCheckout')).stdout.trim(), 'own');
   await absent(project, 'branch.main.termagCheckout');
+
+  // Under a box's broker rewrite, main tracking origin's repository through an
+  // alias (`gh:`, which names it only once expanded) is still origin's; a fork
+  // behind the same alias is not.
+  await git(project, 'remote', 'set-url', 'origin', 'https://github.com/example-org/termag.git');
+  await git(project, 'config', '--local', 'url.https://broker.example.test/.insteadOf', 'https://github.com/');
+  await git(project, 'config', '--local', 'url.https://github.com/.insteadOf', 'gh:');
+  await git(project, 'remote', 'add', 'alias', 'gh:example-org/termag.git');
+  await git(project, 'config', '--local', 'branch.main.remote', 'alias');
+  const aliased = await add('off-main-alias', 'main');
+  assert.equal(aliased.marked.marked, true);
+  await git(project, 'remote', 'set-url', 'alias', 'gh:colleague/termag.git');
+  const forked = await add('off-main-alias-fork', 'main');
+  assert.deepEqual(forked.marked, { marked: false, reason: 'start' });
 });
 
 test('an unmarked origin/<branch> is backfilled as pr and the new worktree stays unmarked', async () => {
@@ -532,4 +546,74 @@ test('a missing or non-symbolic origin/HEAD does not backfill main or master as 
   assert.equal(masterFacts.branch, 'master');
   assert.equal(masterFacts.checkout, null);
   assert.equal(checkoutOwnTree(masterFacts), true);
+});
+
+test("a person's fresh origin/<default> is own whatever the main worktree is on; no other origin/<name> is", async () => {
+  const { checkoutOwnTree, readCheckoutFacts } = require('./chat-runner');
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1' };
+  const git = (cwd, ...args) => run('git', ['-C', cwd, ...args], { env });
+  const exec = (cmd, args, opts) => run(cmd, args, { ...opts, env });
+  const absent = async (cwd, key) => assert.rejects(git(cwd, 'config', '--local', '--get', key));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'worktree-own-fetched-'));
+  const origin = path.join(dir, 'origin.git');
+  const project = path.join(dir, 'project');
+  await run('git', ['init', '-q', '--bare', '-b', 'main', origin], { env });
+  const seed = path.join(dir, 'seed');
+  await run('git', ['init', '-q', '-b', 'main', seed], { env });
+  await git(seed, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init');
+  await git(seed, 'remote', 'add', 'origin', origin);
+  await git(seed, 'push', '-q', 'origin', 'main');
+  await git(seed, 'push', '-q', 'origin', 'main:someone-else');
+  await run('git', ['clone', '-q', origin, project], { env });
+  await git(project, 'fetch', '-q', 'origin');
+  // The project's checkout has moved off the default branch.
+  await git(project, 'checkout', '-q', '-b', 'side');
+
+  const add = async (name, start, fetchedDefault) => {
+    const tree = path.join(project, '.worktrees', name);
+    await git(project, 'worktree', 'add', '-q', '-b', name, tree, start);
+    const marked = await markOwnCheckout({ worktreePath: tree, branch: name, repoPath: project, startPoint: start, fetchedDefault }, { execFile: exec });
+    return { tree, marked };
+  };
+
+  // Without the person's fetch, an origin/main start is not proof while the checkout is elsewhere.
+  const plain = await add('plain', 'origin/main', false);
+  assert.deepEqual(plain.marked, { marked: false, reason: 'start' });
+  await absent(plain.tree, 'branch.plain.termagCheckout');
+  assert.equal(checkoutOwnTree(await readCheckoutFacts(plain.tree, run)), false);
+
+  const fresh = await add('fresh', 'origin/main', true);
+  assert.equal(fresh.marked.marked, true);
+  assert.equal((await git(fresh.tree, 'config', '--local', '--get', 'branch.fresh.termagCheckout')).stdout.trim(), 'own');
+  // It keeps the upstream git gave it, origin's main.
+  assert.equal((await git(fresh.tree, 'config', '--local', '--get', 'branch.fresh.merge')).stdout.trim(), 'refs/heads/main');
+  assert.equal(checkoutOwnTree(await readCheckoutFacts(fresh.tree, run)), true);
+
+  // Another origin branch is shaped like a pull request's head: never own, fetched or not.
+  const other = await add('other', 'origin/someone-else', true);
+  assert.deepEqual(other.marked, { marked: false, reason: 'start' });
+  await absent(other.tree, 'branch.other.termagCheckout');
+  assert.equal(checkoutOwnTree(await readCheckoutFacts(other.tree, run)), false);
+
+  // A stale origin/HEAD (a default from clone time) is read again from the remote, not believed.
+  await git(project, 'remote', 'set-head', 'origin', 'someone-else');
+  const stale = await add('stale', 'origin/someone-else', true);
+  assert.deepEqual(stale.marked, { marked: false, reason: 'start' });
+  assert.equal((await git(project, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD')).stdout.trim(), 'origin/main');
+
+  // Read again before the backfill, too: with origin/HEAD stale, the real
+  // default's local branch (main, tracking origin/main) is not stamped pr, and
+  // a worktree from origin/main is still own.
+  await git(project, 'remote', 'set-head', 'origin', 'someone-else');
+  const again = await add('again', 'origin/main', true);
+  assert.equal(again.marked.marked, true);
+  await absent(project, 'branch.main.termagCheckout');
+  assert.equal(checkoutOwnTree(await readCheckoutFacts(again.tree, run)), true);
+
+  // A remote that cannot say what its default is attests nothing: no main/master guess.
+  await git(project, 'remote', 'set-url', 'origin', path.join(dir, 'gone.git'));
+  await git(project, 'remote', 'set-head', 'origin', '-d');
+  const unreachable = await add('unreachable', 'origin/main', true);
+  assert.deepEqual(unreachable.marked, { marked: false, reason: 'start' });
+  await absent(unreachable.tree, 'branch.unreachable.termagCheckout');
 });

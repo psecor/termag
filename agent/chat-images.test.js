@@ -6,12 +6,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawn } = require('node:child_process');
-const { MAX_IMAGE_BYTES, MAX_IMAGES, createImageStore, decodeImages, userContent } = require('./chat-images');
+const { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_PDF_PAGES, createImageStore, decodeImages, userContent } = require('./chat-images');
 const { CAPABILITIES, createChatRunner, entriesBeforeTurn, turnArgs, userPromptUuid } = require('./chat-runner');
 
 // The smallest real PNG and GIF headers sniffImageMime accepts.
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('png-body')]);
 const GIF = Buffer.from('GIF89a-gif-body');
+const PDF = Buffer.from('%PDF-1.4\n%pdf-body');
 const sha = buf => crypto.createHash('sha256').update(buf).digest('hex');
 const tmp = prefix => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
@@ -29,6 +30,54 @@ test('decode: base64 of a PNG, JPEG, GIF or WebP by its bytes, capped in count a
   const big = Buffer.concat([PNG, Buffer.alloc(MAX_IMAGE_BYTES)]);
   assert.throws(() => decodeImages([{ data: big.toString('base64') }]), /larger than/);
   assert.throws(() => decodeImages('x'), /must be a list/);
+});
+
+test('pdf: a PDF is decoded by its bytes with its name, kept, sent as a document block, and stripped to a reference', () => {
+  assert.ok(CAPABILITIES.includes('chat-pdfs-v1'));
+  const [doc] = decodeImages([{ mediaType: 'image/png', data: PDF.toString('base64'), name: 'spec\u0000.pdf' }]);
+  assert.equal(doc.mediaType, 'application/pdf');
+  assert.equal(doc.name, 'spec.pdf');
+  const home = tmp('chat-pdf-store-');
+  const store = createImageStore(home);
+  const ref = store.save('p1--w1', doc.buf, doc.mediaType, doc.name);
+  assert.deepEqual(ref, { id: sha(PDF), mediaType: 'application/pdf', path: `~/.termag/chat-images/p1--w1/${sha(PDF)}.pdf`, name: 'spec.pdf' });
+  assert.deepEqual(store.block('p1--w1', ref), { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: PDF.toString('base64') }, title: 'spec.pdf' });
+  const ev = { type: 'user', message: { role: 'user', content: [
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: PDF.toString('base64') }, title: 'spec.pdf' },
+    { type: 'text', text: 'summarize' },
+  ] } };
+  const out = store.stripEvent('p1--w1', ev);
+  assert.ok(!JSON.stringify(out).includes(PDF.toString('base64')), 'no PDF bytes leave in an event');
+  assert.deepEqual(out.message.content[0], { type: 'document', source: { type: 'termag', media_type: 'application/pdf', id: sha(PDF), path: ref.path }, title: 'spec.pdf' });
+});
+
+test('pdf: an encrypted PDF, or one over the page limit, is refused before it reaches the session', () => {
+  const enc = Buffer.from('%PDF-1.7\ntrailer << /Root 1 0 R /Encrypt 5 0 R >>');
+  assert.throws(() => decodeImages([{ data: enc.toString('base64') }]), /^Error: image-refused: image 1 is an encrypted PDF/);
+  const pages = n => Buffer.from(`%PDF-1.7\n<< /Type /Pages /Count ${n} >>\n${'<< /Type /Page >>\n'.repeat(n)}`);
+  assert.equal(decodeImages([{ data: pages(MAX_PDF_PAGES).toString('base64') }]).length, 1, '/Pages is not a page');
+  assert.throws(() => decodeImages([{ data: pages(MAX_PDF_PAGES + 1).toString('base64') }]), /more than 100 pages/);
+});
+
+test('pdf: a PDF in a tool result (one Read returned) is kept and stripped too; a document that is not a PDF keeps no path', () => {
+  const store = createImageStore(tmp('chat-pdf-tool-'));
+  const doc = data => ({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } });
+  const ev = { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: [doc(PDF.toString('base64'))] }] } };
+  const out = store.stripEvent('p1--w1', ev);
+  assert.deepEqual(out.message.content[0].content[0].source, { type: 'termag', media_type: 'application/pdf', id: sha(PDF), path: `~/.termag/chat-images/p1--w1/${sha(PDF)}.pdf` });
+  assert.ok(store.block('p1--w1', { id: sha(PDF), mediaType: 'application/pdf' }), 'the tool\'s PDF is on disk');
+  const bad = store.stripEvent('p1--w1', { type: 'user', message: { content: [doc(Buffer.from('not a pdf').toString('base64'))] } });
+  assert.deepEqual(bad.message.content[0], { type: 'document', source: { type: 'termag', media_type: 'application/pdf', path: null } });
+});
+
+test('runner: a PDF goes to Claude only; a send on another backend is refused', async () => {
+  const b = box();
+  const r = createChatRunner({ home: tmp('chat-pdf-fw-'), username: 'alice', claudeBin: '/bin/claude', send: () => true, ...b });
+  const images = [{ data: PDF.toString('base64'), name: 'spec.pdf' }];
+  await assert.rejects(r.sendMessage(job('read', { images, backend: 'fireworks', model: 'accounts/fireworks/models/kimi-k3' })), /^Error: image-refused: PDFs go to Claude's own models/);
+  const { turnId } = await r.sendMessage(job('read', { images }));
+  const line = JSON.parse(fs.readFileSync(path.join(b.procs.get(turnId).dir, 'prompt.jsonl'), 'utf8'));
+  assert.deepEqual(line.message.content[0], { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: PDF.toString('base64') }, title: 'spec.pdf' });
 });
 
 test('store: an image is kept once under its hash, read back as a block, and stripped to a reference', () => {
@@ -213,6 +262,9 @@ test('history cut: an image-only prompt is its images, so a tool result after it
   const stored = [{ type: 'user', message: { content: [{ type: 'image', source: { type: 'termag', id: sha(PNG) } }, { type: 'text', text: 'and this?' }] } }, toolResult];
   assert.equal(entriesBeforeTurn(stored, 'and this?', [sha(PNG)]).length, 0, 'a stored reference counts by its id');
   assert.equal(entriesBeforeTurn(stored, 'and this?').length, 2, 'the same words without the image are another message');
+  const pdfPrompt = [entries[0], entries[1], { type: 'user', message: { content: [{ type: 'document', source: { type: 'termag', id: sha(PDF) } }, { type: 'text', text: 'read' }] } }, toolResult];
+  assert.equal(entriesBeforeTurn(pdfPrompt, 'read', [sha(PDF)]).length, 2, 'a document prompt is cut at like an image one');
+  assert.equal(entriesBeforeTurn(pdfPrompt, 'read').length, 4, 'without its PDF, another message');
 });
 
 test('user prompt uuid: an image-only message is a prompt; a tool result still is not', () => {

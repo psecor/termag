@@ -6,6 +6,8 @@
 // are never logged.
 
 const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // telemetry-replay-v1: deploy/termag-credentials has `telemetry-launch`, so the
@@ -19,10 +21,91 @@ const path = require('path');
 // termag-mcp-headers.
 // fireworks-v1: the script takes the fireworks provider (pi's provider and the
 // Claude Code settings `launch-settings` hands it).
-const CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1'];
+const BASE_CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1'];
 const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks'];
 
 const DEFAULT_SCRIPT = path.join(__dirname, '..', 'deploy', 'termag-credentials');
+// Where a launch finds the scripts. A launch the orchestrator types into a
+// pane (`termag-credentials launch-settings`, `termag-pi-fireworks`;
+// services/launchCommand.ts) runs the copy the pane's PATH finds, not the
+// checkout's. On a box that is the one termag-reconcile installs in
+// ~/.local/bin (its table, `bin`), which the pane's shell puts first, and
+// only a reconcile moves it forward: a checkout pulled by hand, or by a run
+// whose reconcile failed, carries a marker that copy may not. A host without
+// it runs whatever its PATH holds, so the agent's PATH comes next.
+function installedDirs(env = process.env, home = os.homedir() || env.HOME || '/') {
+  const fromPath = String(env.PATH || '').split(path.delimiter).filter(Boolean);
+  return [path.join(home, '.local', 'bin'), ...fromPath];
+}
+
+// mcp-broker-v2: the mcp provider also takes `agents`, the other agent CLIs
+// to register the connectors with through termag-mcp-bridge (mcp-bridge.js).
+// That half lives in the script, which
+// can land on a box before or after this file, so it is advertised only when
+// the script carries the marker, and read again at every hello: a script
+// updated under a running agent is picked up at its next connect.
+const MCP_AGENTS_CAPABILITY = 'mcp-broker-v2';
+const MCP_AGENTS_MARKER = 'termag-credentials: mcp-broker-v2';
+
+// fireworks-menu-v1: `launch-settings --models` takes the flag's model list
+// for Claude Code's /model menu. Read from the script the
+// same way: an older script would take `--models` for the replay id. The
+// launch runs the installed copy, so both copies must carry the marker: a
+// checkout pulled without a reconcile is ahead of it.
+const FIREWORKS_MENU_CAPABILITY = 'fireworks-menu-v1';
+const FIREWORKS_MENU_MARKER = 'termag-credentials: fireworks-menu-v1';
+
+// fireworks-pi-menu-v1: `termag-pi-fireworks --models` hands the flag's
+// model list to `termag-credentials pi-model`, which writes them all into
+// pi's provider for its /model. Both scripts must carry
+// their marker, in the installed copies as well as the checkout's: an older
+// launcher would pass `--models` on to pi, and an older pi-model refuses it.
+const FIREWORKS_PI_MENU_CAPABILITY = 'fireworks-pi-menu-v1';
+const FIREWORKS_PI_MENU_MARKER = 'termag-credentials: fireworks-pi-menu-v1';
+const FIREWORKS_PI_LAUNCHER_MARKER = 'termag-pi-fireworks: fireworks-pi-menu-v1';
+
+function scriptHas(marker, script = DEFAULT_SCRIPT, readFile = fs.readFileSync) {
+  try {
+    return String(readFile(script, 'utf8')).includes(marker);
+  } catch {
+    return false;
+  }
+}
+
+// The copy of `name` a launch would run: the first in `dirs` there is.
+function launchCopy(name, dirs, readFile) {
+  for (const dir of dirs) {
+    const file = path.join(dir, name);
+    try {
+      readFile(file, 'utf8');
+      return file;
+    } catch { /* not here */ }
+  }
+  return null;
+}
+
+// `script` is the checkout's termag-credentials, what applyCredential runs, and
+// `dirs` is where a typed launch looks for its copies (installedDirs).
+// mcp-broker-v2 is read from the checkout's script alone, since only
+// applyCredential relies on it.
+function capabilitiesFor(script = DEFAULT_SCRIPT, readFile = fs.readFileSync, dirs = installedDirs()) {
+  const launcher = path.join(path.dirname(script), 'termag-pi-fireworks');
+  const searched = Array.isArray(dirs) ? dirs : [dirs];
+  // The checkout's copy and the one a launch would run.
+  const bothHave = (marker, checkoutCopy, name) => {
+    if (!scriptHas(marker, checkoutCopy, readFile)) return false;
+    const copy = launchCopy(name, searched, readFile);
+    return copy !== null && scriptHas(marker, copy, readFile);
+  };
+  return [
+    ...BASE_CAPABILITIES,
+    ...(scriptHas(MCP_AGENTS_MARKER, script, readFile) ? [MCP_AGENTS_CAPABILITY] : []),
+    ...(bothHave(FIREWORKS_MENU_MARKER, script, 'termag-credentials') ? [FIREWORKS_MENU_CAPABILITY] : []),
+    ...(bothHave(FIREWORKS_PI_MENU_MARKER, script, 'termag-credentials')
+      && bothHave(FIREWORKS_PI_LAUNCHER_MARKER, launcher, 'termag-pi-fireworks')
+      ? [FIREWORKS_PI_MENU_CAPABILITY] : []),
+  ];
+}
 
 // The git credential helper and Claude Code's apiKeyHelper, both configured by
 // termag-credentials, read the box token from here, so the token itself is
@@ -59,7 +142,16 @@ function removeCredential(provider, script, reason) {
 }
 
 module.exports = {
-  CAPABILITIES,
+  get CAPABILITIES() { return capabilitiesFor(); },
+  capabilitiesFor,
+  installedDirs,
+  MCP_AGENTS_CAPABILITY,
+  MCP_AGENTS_MARKER,
+  FIREWORKS_MENU_CAPABILITY,
+  FIREWORKS_MENU_MARKER,
+  FIREWORKS_PI_MENU_CAPABILITY,
+  FIREWORKS_PI_MENU_MARKER,
+  FIREWORKS_PI_LAUNCHER_MARKER,
   configure,
   PROVIDERS,
   applyCredential,

@@ -15,7 +15,13 @@
 // a subagent) runs. claude -p stays up for those tasks anyway; stdin closes,
 // and Claude exits, only once it has answered the last message and has no
 // background task left. What the inbox still holds then, the agent sends as
-// the next turn.
+// the next turn. stdin cannot be reopened, so it is closed late rather than
+// early: a background task that finishes after Claude's answer sends Claude a
+// task notification, and Claude starts a turn of its own to read it (an init,
+// then more work, maybe more background tasks). The tracker counts that turn
+// as work until its result, and holds off a little after Claude looks done in
+// case one is coming. Once stdin is closed the wrapper writes `stdin-ended`,
+// and the agent stops putting messages in the inbox.
 //
 // A turn whose message carries images (agent/chat-images.js) reads stream-json
 // too: prompt.jsonl holds the message as one input line, its images as
@@ -27,7 +33,7 @@
 // removed ones without a line in the transcript. Any other turn is its own
 // `claude -p` process and reads ~/.claude.json when it starts.
 //
-//   <turn dir>/meta.json     { chatKey, bin, args, cwd, path, text, resumed, stateFile, live, images }
+//   <turn dir>/meta.json     { chatKey, bin, args, cwd, path, text, resumed, stateFile, live, images, engine }
 //   <turn dir>/prompt.txt    the message (stdin, or the first input line of a live turn)
 //   <turn dir>/prompt.jsonl  the message as a stream-json line, when it carries images
 //   <turn dir>/inbox/        a live turn's later messages, <n>.json { text, line? }; <n>.sent once delivered;
@@ -35,12 +41,27 @@
 //                            stream-json interrupt: background commands keep running)
 //   <turn dir>/events.jsonl  one event per line: the turn's whole log
 //   <turn dir>/stderr.log    Claude's stderr
-//   <turn dir>/claude.pid    for chat-interrupt
+//   <turn dir>/claude.pid    for chat-interrupt (the agent's pid, whichever engine)
+//   <turn dir>/turn.pid      this wrapper's pid: a stop is not over until it is gone
+//   <turn dir>/pi-events.jsonl  a pi turn's own stream, as pi wrote it (for diagnosis)
+//   <turn dir>/stdin-ended   a live turn takes no more messages (Claude may still be running)
 //   <turn dir>/exit          { code, signal } once the turn is over
+//
+// A turn on the pi engine (meta.engine 'pi', chat-runner.js piTurnArgs) runs
+// `termag-pi-headless --headless … -p --mode json` with the prompt on
+// stdin too: a prompt in argv with stdin left open hangs pi. Its stdout goes
+// through pi-events.js, so events.jsonl holds the same Claude-shaped events
+// as any other turn, and pi's own lines go to pi-events.jsonl. pi is the
+// leader of its own process group, and every stop is SIGTERM to that group:
+// pi runs each bash tool in a session of its own, kills it on SIGTERM and
+// records the result, while SIGINT leaves the tool running. Signalling the
+// group also reaches pi through the launcher's shell, whether it execs or not.
+// No live input, images or MCP reload for pi.
 
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { createPiNormalizer } = require('./pi-events');
 
 const SESSION_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
 const INBOX_POLL_MS = 250;
@@ -50,6 +71,12 @@ const INTERRUPT_RE = /^interrupt-(\d+)\.json$/;
 // what it last read: the version must hold still this long before one.
 const MCP_SETTLE_MS = 3000;
 const MCP_RELOAD_ID = 'termag-mcp-reload-';
+// How long a live turn must look done before stdin closes: a background task's
+// last background_tasks_changed comes just before its task_notification.
+const IDLE_GRACE_MS = 1500;
+// How long a task notification after Claude's answer holds stdin open for the
+// turn it wakes. A killed task's notification wakes none; this bounds the wait.
+const WAKE_MS = 30000;
 
 /** The session id Claude announced in its init event, or null. */
 function sessionIdFrom(jsonl) {
@@ -70,14 +97,32 @@ function sawResult(jsonl) {
   })());
 }
 
+/** What a turn's messages call its agent. */
+function agentLabel(engine) {
+  return engine === 'pi' ? 'pi' : 'Claude';
+}
+
+/**
+ * How a turn's exit is reported. A stopped pi turn ends on the SIGTERM it was
+ * stopped with (143, or the SIGKILL after it), but a stop reads as SIGINT
+ * everywhere downstream (the chat's `stopped`, an automation's `interrupted`),
+ * as closeTurn writes it.
+ */
+function reportedExit({ code, signal, interrupted, engine }) {
+  // pi's own exit 0 (it had finished before the stop) is kept.
+  if (interrupted && engine === 'pi' && code !== 0) return { code: null, signal: 'SIGINT' };
+  return { code, signal: signal || null };
+}
+
 /** The lines a turn ends with: why it failed, if it did without a result, then turn-end. A deliberate stop (the runner's `interrupted` marker) is not a failure. */
-function closingEvents({ code, signal, result, stderrTail, interrupted }) {
+function closingEvents({ code, signal, result, stderrTail, interrupted, engine }) {
   const out = [];
   if (!result && code !== 0 && !interrupted) {
     const last = (stderrTail || '').trim().split('\n').pop() || '';
-    out.push({ type: 'runner-error', message: `Claude exited ${signal || code}${last ? `: ${last.slice(0, 300)}` : ''}` });
+    out.push({ type: 'runner-error', message: `${agentLabel(engine)} exited ${signal || code}${last ? `: ${last.slice(0, 300)}` : ''}` });
   }
-  out.push({ type: 'turn-end', exitCode: code, signal: signal || null });
+  const exit = reportedExit({ code, signal, interrupted, engine });
+  out.push({ type: 'turn-end', exitCode: exit.code, signal: exit.signal });
   return out;
 }
 
@@ -85,7 +130,8 @@ function closingEvents({ code, signal, result, stderrTail, interrupted }) {
  * The environment of the Claude child: no tmux variables (the box's status
  * hooks key on the pane), the agent's PATH, the scratch config dir when the
  * runner set one, and the turn's own variables (an ask's git identity and
- * where it writes PR descriptions).
+ * where it writes PR descriptions; which session the turn is, for `termag ask`;
+ * its kind, TERMAG_SESSION_KIND, the same as its telemetry resource's).
  */
 function childEnv(env, pathValue, configDir, extra) {
   const next = { ...env };
@@ -94,7 +140,7 @@ function childEnv(env, pathValue, configDir, extra) {
   if (pathValue) next.PATH = pathValue;
   if (configDir) next.CLAUDE_CONFIG_DIR = configDir;
   if (extra && typeof extra === 'object') {
-    for (const [k, v] of Object.entries(extra)) if (/^(GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|TERMAG_ASK_PR_(BODY_FILE|DIR))$/.test(k) && typeof v === 'string') next[k] = v;
+    for (const [k, v] of Object.entries(extra)) if (/^(GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|TERMAG_ASK_PR_(BODY_FILE|DIR)|TERMAG_ASK_THREAD|TERMAG_PROJECT_ID|TERMAG_SESSION_KIND|TERMAG_WORKSTREAM)$/.test(k) && typeof v === 'string') next[k] = v;
   }
   return next;
 }
@@ -112,13 +158,17 @@ function firstLine(dir) {
 
 /**
  * What a live turn's log says about Claude, line by line: whether it has
- * answered the last message it was given (a `result` since the last
- * delivery), and how many background tasks it still has.
+ * answered (a `result` since the last delivery, and no turn of its own begun
+ * since), and how many background tasks it still has. `idle()` is true once
+ * that has held for `graceMs` and no task notification since the answer is
+ * still waiting, up to `wakeMs`, for the turn it wakes. Called every tick.
  */
-function createLiveTracker() {
+function createLiveTracker({ now = Date.now, graceMs = IDLE_GRACE_MS, wakeMs = WAKE_MS } = {}) {
   let carry = '';
   let answered = false;
   let tasks = 0;
+  let notifiedAt = null;
+  let quietSince = null;
   return {
     feed(chunk) {
       const lines = (carry + chunk).split('\n');
@@ -126,12 +176,20 @@ function createLiveTracker() {
       for (const line of lines) {
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }
-        if (ev.type === 'result') answered = true;
+        if (ev.type === 'result') { answered = true; notifiedAt = null; }
+        // Claude at work after its answer: a task notification woke it into a turn of its own.
+        else if (ev.type === 'assistant' || ev.type === 'stream_event' || (ev.type === 'system' && ev.subtype === 'init')) { answered = false; notifiedAt = null; }
+        else if (ev.type === 'system' && ev.subtype === 'task_notification') notifiedAt = now();
         else if (ev.type === 'system' && ev.subtype === 'background_tasks_changed' && Array.isArray(ev.tasks)) tasks = ev.tasks.length;
       }
     },
     delivered() { answered = false; },
-    idle() { return answered && tasks === 0; },
+    idle() {
+      const quiet = answered && tasks === 0 && (notifiedAt === null || now() - notifiedAt >= wakeMs);
+      if (!quiet) { quietSince = null; return false; }
+      if (quietSince === null) quietSince = now();
+      return now() - quietSince >= graceMs;
+    },
   };
 }
 
@@ -196,14 +254,15 @@ function pendingInbox(inbox) {
 /**
  * Feed a live turn: the first message, then the inbox as it fills. Each
  * message is claimed by renaming it to .sent before it is written, so the
- * agent can tell what went in. stdin is ended when Claude is idle; the
- * inbox is read in the same tick first, so only a message that lands in the
- * moment before stdin ends is left there, for the agent to send next turn.
- * With `mcpVersionFile`, a change to it reloads Claude's MCP servers.
+ * agent can tell what went in. stdin is ended when Claude is idle, after
+ * `stdin-ended` is written; the inbox is read in the same tick first, so only
+ * a message that lands in the moment before the agent sees that file is left
+ * there, for the agent to send next turn. With `mcpVersionFile`, a change to
+ * it reloads Claude's MCP servers.
  */
-function runLive(dir, child, eventsFile, startOffset, { mcpVersionFile = null, now = Date.now } = {}) {
+function runLive(dir, child, eventsFile, startOffset, { mcpVersionFile = null, now = Date.now, graceMs, wakeMs } = {}) {
   const inbox = path.join(dir, 'inbox');
-  const tracker = createLiveTracker();
+  const tracker = createLiveTracker({ now, graceMs, wakeMs });
   // Lines before Claude started are this wrapper's (turn-start), not Claude's.
   let offset = startOffset;
   let ended = false;
@@ -260,6 +319,7 @@ function runLive(dir, child, eventsFile, startOffset, { mcpVersionFile = null, n
     if (!tracker.idle()) return;
     ended = true;
     clearInterval(timer);
+    try { fs.writeFileSync(path.join(dir, 'stdin-ended'), new Date(now()).toISOString()); } catch { /* the agent finds out at exit */ }
     try { child.stdin.end(); } catch { /* gone */ }
   };
   write(firstLine(dir));
@@ -270,7 +330,12 @@ function runLive(dir, child, eventsFile, startOffset, { mcpVersionFile = null, n
 /** The line a turn's log starts with: the message, and the images it carries (references, never their bytes). */
 function turnStartEvent(meta) {
   const images = Array.isArray(meta.images) && meta.images.length ? meta.images : null;
-  return { type: 'turn-start', text: meta.text, resumed: Boolean(meta.resumed), live: meta.live === true, ...(images && { images }) };
+  // compact: the turn is the chat runner's /compact (chat-context-v1), drawn as a divider, not a message.
+  // newBoxNotice: the turn's message opens with the orchestrator's new-box notice; it is told when this turn's Claude starts (backend chatNewBox.ts).
+  // readOnly: the turn asked for an open mode and runs read-only (dontAsk) instead, and why (chat-runner.js settleTurnMode);
+  // readOnlyFix: what the person runs on the box to get the tools back, when there is such a thing (readOnlyFix).
+  // headings: the runner asks Haiku for this turn's tool-group headings (tool-group-headings.js), so the browser may wait for them.
+  return { type: 'turn-start', text: meta.text, resumed: Boolean(meta.resumed), live: meta.live === true, ...(images && { images }), ...(meta.compact === true && { compact: true }), ...(meta.newBoxNotice === true && { newBoxNotice: true }), ...(meta.headings === true && !meta.ask && { headings: true }), ...(typeof meta.readOnly === 'string' && { readOnly: meta.readOnly }), ...(typeof meta.readOnly === 'string' && typeof meta.readOnlyFix === 'string' && { readOnlyFix: meta.readOnlyFix }) };
 }
 
 function appendLine(file, ev) {
@@ -294,50 +359,123 @@ function writeAtomic(file, text) {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * A pi turn's stdout, line by line: each line as pi wrote it to `rawFile`,
+ * and what pi-events.js makes of it to `eventsFile`. `close()` takes the
+ * last unfinished line and returns the normaliser, for its end().
+ */
+function createPiPipe(eventsFile, rawFile, normalizer = createPiNormalizer()) {
+  let carry = '';
+  const take = (line) => {
+    if (!line.trim()) return;
+    try { fs.appendFileSync(rawFile, `${line}\n`); } catch { /* diagnosis only */ }
+    for (const ev of normalizer.push(line)) appendLine(eventsFile, ev);
+  };
+  return {
+    write(chunk) {
+      const lines = (carry + chunk).split('\n');
+      carry = lines.pop();
+      for (const line of lines) take(line);
+    },
+    close() {
+      if (carry) take(carry);
+      carry = '';
+      return normalizer;
+    },
+  };
+}
+
+/**
+ * How a turn signals its agent. Claude is the child itself. pi leads its own
+ * process group (spawned detached) and every stop is SIGTERM to that group:
+ * SIGINT would leave pi's tool processes running.
+ */
+function agentSignals(engine) {
+  if (engine === 'pi') return { group: true, stop: 'SIGTERM', interrupt: 'SIGTERM' };
+  return { group: false, stop: 'SIGTERM', interrupt: 'SIGINT' };
+}
+
+/** What the turn writes to the chat's state file once it is over: the session for the next turn, on the engine that made it. */
+function stateRecord(sessionId, meta, at = new Date()) {
+  return { sessionId, cwd: meta.cwd, ...(meta.engine === 'pi' ? { engine: 'pi' } : {}), updatedAt: at.toISOString() };
+}
+
+// How long a pi turn waits, after pi exited, for the rest of its stdout.
+const PI_DRAIN_MS = 2000;
+
 function main(dir) {
   const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
   const events = path.join(dir, 'events.jsonl');
   const stderrFile = path.join(dir, 'stderr.log');
+  const engine = meta.engine === 'pi' ? 'pi' : 'claude';
+  const label = agentLabel(engine);
+  const signals = agentSignals(engine);
+  fs.writeFileSync(path.join(dir, 'turn.pid'), String(process.pid));
   appendLine(events, turnStartEvent(meta));
 
   let finished = false;
+  let pipe = null;
   const finish = (code, signal) => {
     if (finished) return;
     finished = true;
+    const interrupted = fs.existsSync(path.join(dir, 'interrupted'));
+    if (pipe) for (const ev of pipe.close().end({ code, interrupted })) appendLine(events, ev);
     let log = '';
     try { log = fs.readFileSync(events, 'utf8'); } catch { /* nothing written */ }
     // A wrapper that never gets here (reboot, OOM) leaves the init line in
     // the log; chat-runner closeTurn reads it and records the same id.
     const sessionId = sessionIdFrom(log);
     if (sessionId && meta.stateFile) {
-      try { writeAtomic(meta.stateFile, JSON.stringify({ sessionId, cwd: meta.cwd, updatedAt: new Date().toISOString() })); } catch { /* next turn starts fresh */ }
+      try { writeAtomic(meta.stateFile, JSON.stringify(stateRecord(sessionId, meta))); } catch { /* next turn starts fresh */ }
     }
-    const interrupted = fs.existsSync(path.join(dir, 'interrupted'));
-    for (const ev of closingEvents({ code, signal, result: sawResult(log), stderrTail: tail(stderrFile), interrupted })) appendLine(events, ev);
-    writeAtomic(path.join(dir, 'exit'), JSON.stringify({ code, signal: signal || null }));
+    for (const ev of closingEvents({ code, signal, result: sawResult(log), stderrTail: tail(stderrFile), interrupted, engine })) appendLine(events, ev);
+    writeAtomic(path.join(dir, 'exit'), JSON.stringify(reportedExit({ code, signal, interrupted, engine })));
     process.exit(0);
   };
 
-  const out = fs.openSync(events, 'a');
+  const out = engine === 'pi' ? 'pipe' : fs.openSync(events, 'a');
   const err = fs.openSync(stderrFile, 'a');
-  const live = meta.live === true;
-  const input = live ? 'pipe' : fs.openSync(path.join(dir, fs.existsSync(path.join(dir, 'prompt.jsonl')) ? 'prompt.jsonl' : 'prompt.txt'), 'r');
+  const live = meta.live === true && engine !== 'pi';
+  const input = live ? 'pipe' : fs.openSync(path.join(dir, engine !== 'pi' && fs.existsSync(path.join(dir, 'prompt.jsonl')) ? 'prompt.jsonl' : 'prompt.txt'), 'r');
   const startOffset = fs.statSync(events).size;
   let child;
   try {
-    child = spawn(meta.bin, meta.args, { cwd: meta.cwd, env: childEnv(process.env, meta.path, meta.configDir, meta.env), stdio: [input, out, err] });
+    child = spawn(meta.bin, meta.args, {
+      cwd: meta.cwd, env: childEnv(process.env, meta.path, meta.configDir, meta.env), stdio: [input, out, err],
+      ...(signals.group ? { detached: true } : {}),
+    });
     if (live) runLive(dir, child, events, startOffset, { mcpVersionFile: meta.mcpVersionFile || null });
   } catch (e) {
-    appendLine(events, { type: 'runner-error', message: `could not start Claude: ${e.message}` });
+    appendLine(events, { type: 'runner-error', message: `could not start ${label}: ${e.message}` });
     finish(127, null);
     return;
   }
+  let drained = engine !== 'pi';
+  let exited = null;
+  const done = () => { if (drained && exited) finish(exited.code, exited.signal); };
+  if (engine === 'pi' && child.stdout) {
+    pipe = createPiPipe(events, path.join(dir, 'pi-events.jsonl'));
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => pipe.write(chunk));
+    child.stdout.on('end', () => { drained = true; done(); });
+  }
   if (child.pid) fs.writeFileSync(path.join(dir, 'claude.pid'), String(child.pid));
   child.on('error', e => {
-    appendLine(events, { type: 'runner-error', message: `could not start Claude: ${e.message}` });
+    appendLine(events, { type: 'runner-error', message: `could not start ${label}: ${e.message}` });
     finish(127, null);
   });
-  child.on('exit', (code, signal) => finish(code, signal));
+  child.on('exit', (code, signal) => {
+    exited = { code, signal };
+    // A process pi left behind may hold its stdout open: stop waiting after a while.
+    if (!drained) setTimeout(() => { drained = true; done(); }, PI_DRAIN_MS).unref?.();
+    done();
+  });
+  const kill = (sig) => {
+    try {
+      if (signals.group) { process.kill(-child.pid, sig); return true; }
+      return child.kill(sig);
+    } catch { return false; }
+  };
   // tmux kill-session delivers SIGHUP. Signaling the child and staying up
   // left the wrapper alive after the session was gone, so chat-clear could
   // not tell a stopped turn from a live one. Kill the child, escalate, exit.
@@ -345,16 +483,20 @@ function main(dir) {
   const onHangup = () => {
     if (stopping) return;
     stopping = true;
-    const kill = (sig) => { try { return child.kill(sig); } catch { return false; } };
-    if (!kill('SIGTERM') || child.exitCode != null || child.signalCode != null) { finish(null, 'SIGTERM'); return; }
+    // pi already exited and its stdout is still draining: the turn ended on its
+    // own, so it keeps pi's exit. Stopping the group ends whatever pi left
+    // holding stdout, and the drain (at most PI_DRAIN_MS) finishes the turn.
+    if (exited) { kill(signals.stop); return; }
+    if (!kill(signals.stop) || child.exitCode != null || child.signalCode != null) { finish(null, 'SIGTERM'); return; }
     const timer = setTimeout(() => { kill('SIGKILL'); finish(null, 'SIGKILL'); }, 3000);
     timer.unref?.();
     child.once('exit', () => clearTimeout(timer));
   };
   for (const sig of ['SIGHUP', 'SIGTERM']) process.on(sig, onHangup);
-  process.on('SIGINT', () => { try { child.kill('SIGINT'); } catch { /* gone */ } });
+  process.on('SIGINT', () => { kill(signals.interrupt); });
 }
 
-module.exports = { childEnv, closingEvents, createLiveTracker, createMcpReloader, firstLine, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, turnStartEvent, userLine };
+module.exports = {
+  reportedExit, agentLabel, agentSignals, childEnv, closingEvents, createPiPipe, stateRecord, createLiveTracker, createMcpReloader, firstLine, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, turnStartEvent, userLine };
 
 if (require.main === module) main(process.argv[2]);

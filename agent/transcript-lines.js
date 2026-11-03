@@ -151,4 +151,46 @@ function historyTail(file, { end = Infinity, maxBytes, shrink = e => e, fsImpl =
   return kept.length ? `${kept.reverse().join('\n')}\n` : '';
 }
 
-module.exports = { CHUNK_BYTES, LINE_MAX_BYTES, RAW_MAX_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward };
+/**
+ * The file's bytes from offset `start` up to the last newline that fits in
+ * `maxBytes`, exactly as stored, so the orchestrator's copy stays byte for
+ * byte the file (chat-transcript-read). A first line longer than `maxBytes`
+ * is read whole up to `lineMax` (LINE_MAX_BYTES). A longer one is not read: `skipped` is
+ * its length with its newline, so the caller can step past it, and `data` is
+ * empty. Bytes after the last newline (a line still being written) are left
+ * for the next read.
+ */
+function wholeLinesFrom(file, { start = 0, maxBytes, lineMax = LINE_MAX_BYTES, fsImpl = fs } = {}) {
+  const fd = fsImpl.openSync(file, 'r');
+  try {
+    const size = fsImpl.fstatSync(fd).size;
+    if (start >= size) return { size, data: Buffer.alloc(0) };
+    let want = Math.min(size - start, maxBytes);
+    for (;;) {
+      const buf = Buffer.alloc(want);
+      const n = fsImpl.readSync(fd, buf, 0, want, start);
+      const cut = buf.subarray(0, n).lastIndexOf(0x0a);
+      if (cut >= 0) return { size, data: buf.subarray(0, cut + 1) };
+      if (start + n >= size) return { size, data: Buffer.alloc(0) };
+      if (want >= lineMax) return { size, data: Buffer.alloc(0), ...lineEndAfter(fd, start, start + n, size, fsImpl) };
+      want = Math.min(size - start, lineMax, want * 2);
+    }
+  } finally {
+    try { fsImpl.closeSync(fd); } catch { /* already gone */ }
+  }
+}
+
+/** `{ skipped }` up to and including the first newline at or after `from`, or nothing while the line is still being written. */
+function lineEndAfter(fd, start, from, size, fsImpl) {
+  const buf = Buffer.alloc(CHUNK_BYTES);
+  for (let pos = from; pos < size;) {
+    const n = fsImpl.readSync(fd, buf, 0, Math.min(CHUNK_BYTES, size - pos), pos);
+    if (n <= 0) break;
+    const nl = buf.subarray(0, n).indexOf(0x0a);
+    if (nl >= 0) return { skipped: pos + nl + 1 - start };
+    pos += n;
+  }
+  return {};
+}
+
+module.exports = { CHUNK_BYTES, LINE_MAX_BYTES, RAW_MAX_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward, wholeLinesFrom };

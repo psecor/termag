@@ -19,7 +19,7 @@ function statusJson(loggedIn, extra = {}) {
   });
 }
 
-function harness({ gateway = false } = {}) {
+function harness({ gateway = false, ...options } = {}) {
   const state = { signedIn: false, gateway, spawns: 0, writes: [], env: null };
   async function execFile(_bin, args) {
     assert.deepEqual(args, ['auth', 'status']);
@@ -65,6 +65,7 @@ function harness({ gateway = false } = {}) {
     claudeBin: '/usr/bin/claude',
     urlWaitMs: 200,
     resultWaitMs: 200,
+    ...options,
   });
   return { login, state };
 }
@@ -178,6 +179,63 @@ test('a gateway box is left alone and no login process starts', async () => {
   assert.equal(view.loggedIn, true);
   assert.equal(view.authMethod, 'third_party');
   assert.equal(view.url, undefined);
+  assert.equal(state.spawns, 0);
+});
+
+test('reauth signs a seat in again after a turn failed on it, and a status poll keeps that login open', async () => {
+  const { login, state } = harness();
+  state.signedIn = true;
+  // Without reauth a signed-in seat is left alone.
+  assert.equal((await login.start('person@example.invalid')).phase, 'ready');
+  assert.equal(state.spawns, 0);
+
+  const started = await login.start('person@example.invalid', { reauth: true });
+  assert.equal(started.phase, 'needs-code');
+  assert.equal(started.loggedIn, false);
+  assert.equal(started.url, URL);
+  assert.equal(state.spawns, 1);
+  // The old seat still reads as logged in: that must not end the login.
+  const polled = await login.status();
+  assert.equal(polled.phase, 'needs-code');
+  assert.equal(polled.loggedIn, false);
+  const bad = await login.submit('not-a-code');
+  assert.equal(bad.phase, 'needs-code');
+
+  const ok = await login.submit(GOOD);
+  assert.equal(ok.phase, 'ready');
+  assert.equal(ok.loggedIn, true);
+  assert.equal(state.writes.length, 1);
+});
+
+test('a reauth that expires does not turn the stale seat back into signed in', async () => {
+  const { login, state } = harness({ ttlMs: 30 });
+  state.signedIn = true;
+  const started = await login.start('person@example.invalid', { reauth: true });
+  assert.equal(started.phase, 'needs-code');
+  await new Promise(resolve => setTimeout(resolve, 80));
+  // `claude auth status` still says logged in: that is the dead seat, not a sign-in.
+  const polled = await login.status();
+  assert.equal(polled.phase, 'expired');
+  assert.equal(polled.loggedIn, false);
+  const late = await login.submit(GOOD);
+  assert.notEqual(late.phase, 'ready');
+  assert.equal(late.loggedIn, false);
+  assert.equal(state.writes.length, 0);
+  // A plain start (another tab, no reauth flag) signs in again too, rather than calling the seat ready.
+  const again = await login.start('person@example.invalid');
+  assert.equal(again.phase, 'needs-code');
+  assert.equal(state.spawns, 2);
+  // Only a confirmed fresh login counts.
+  const ok = await login.submit(GOOD);
+  assert.equal(ok.phase, 'ready');
+  assert.equal(ok.loggedIn, true);
+  assert.equal((await login.status()).phase, 'ready');
+});
+
+test('reauth leaves a gateway box alone', async () => {
+  const { login, state } = harness({ gateway: true });
+  const view = await login.start('person@example.invalid', { reauth: true });
+  assert.equal(view.phase, 'ready');
   assert.equal(state.spawns, 0);
 });
 

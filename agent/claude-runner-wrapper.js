@@ -16,13 +16,38 @@ const os = require('os');
 const path = require('path');
 
 const CAPABILITIES = ['claude-runner-wrapper-v2'];
+/**
+ * Announced when the wrapper takes --claude-floor <x.y.z> (the word
+ * `claude-floor` on its flags line): the orchestrator then passes the policy's
+ * Claude Code floor, which takes precedence over the box's floor file.
+ * A wrapper without the word
+ * would ignore the flag and judge by its file alone, so it gets no v3.
+ */
+const FLOOR_CAPABILITY = 'claude-runner-wrapper-v3';
 
 /** The line a wrapper carries once it understands --anthropic-git and --github. */
 const FLAGS_MARKER = 'termag-claude-runner-flags: anthropic-git github';
+/** The word on that line for --claude-floor. */
+const FLOOR_WORD = 'claude-floor';
 
 /** Where termag-reconcile installs the wrapper (its table names this path). */
 function wrapperPath(home = os.homedir()) {
   return path.join(home, '.local', 'bin', 'termag-claude-runner');
+}
+
+/** The installed wrapper's text, or null when there is none or it cannot be read. */
+function readWrapper(readFile, home) {
+  try {
+    return String(readFile(wrapperPath(home), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** The words on the wrapper's `termag-claude-runner-flags:` line (none without one). */
+function flagWords(text) {
+  const m = /termag-claude-runner-flags:([^\n]*)/.exec(text || '');
+  return m ? m[1].trim().split(/\s+/).filter(Boolean) : [];
 }
 
 /**
@@ -30,11 +55,22 @@ function wrapperPath(home = os.homedir()) {
  * throw, when there is no wrapper or it cannot be read.
  */
 function wrapperSupportsFlags(readFile = fs.readFileSync, home = os.homedir()) {
-  try {
-    return String(readFile(wrapperPath(home), 'utf8')).includes(FLAGS_MARKER);
-  } catch {
-    return false;
-  }
+  const text = readWrapper(readFile, home);
+  return text !== null && text.includes(FLAGS_MARKER);
 }
 
-module.exports = { CAPABILITIES, FLAGS_MARKER, wrapperPath, wrapperSupportsFlags };
+/**
+ * The wrapper capabilities to announce: v2 for the git flags' marker, as
+ * before, and v3 when the flags line also has `claude-floor`. Empty, never a
+ * throw, when there is no wrapper.
+ */
+function wrapperCapabilities(readFile = fs.readFileSync, home = os.homedir()) {
+  const text = readWrapper(readFile, home);
+  if (text === null) return [];
+  return [
+    ...(text.includes(FLAGS_MARKER) ? CAPABILITIES : []),
+    ...(flagWords(text).includes(FLOOR_WORD) ? [FLOOR_CAPABILITY] : []),
+  ];
+}
+
+module.exports = { CAPABILITIES, FLOOR_CAPABILITY, FLAGS_MARKER, FLOOR_WORD, wrapperPath, flagWords, wrapperSupportsFlags, wrapperCapabilities };

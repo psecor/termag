@@ -8,7 +8,8 @@
 //     is forced through (layer 2)
 //   * resolveRecipe: a share's origins, worked out at every attach from the
 //     workstream's checkout, and the check that a running dev stack is that
-//     workstream's own
+//     workstream's own; checkRecipe, the same check for the owner before
+//     sharing
 //   * Canary: the self-check a guest browser runs before it shows anything:
 //     a page that tries to reach a TCP and a UDP canary around the proxy
 //   * guestEnvironment, checkoutState, memAvailableBytes: the box facts
@@ -21,6 +22,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
+const { dockerGet, dockerPublisher, dockerServiceBindings, procAddress, listenersOn, insideDir } = require('./local-listeners');
 
 const GUEST_USER = 'termag-guest';
 const GUEST_LAUNCHER = '/usr/local/libexec/termag-guest-chromium';
@@ -56,11 +58,14 @@ const HOP_HEADERS = ['proxy-connection', 'proxy-authorization', 'proxy-authentic
  * WHATWG parsing already turns 127.1, 2130706433, 0x7f.0.0.1, 0177.0.0.1 and a
  * trailing dot into 127.0.0.1 (Chromium does the same before the proxy sees a
  * request), so they all compare equal.
+ *
+ * The proxy and `navigate` pass whole URLs, so only the host counts toward the
+ * length cap: an app's path and query can be as long as it likes.
  */
 function canonicalOrigin(input, { requirePort = false } = {}) {
   if (typeof input !== 'string') return null;
   const s = input.trim();
-  if (!s || s.length > 300) return null;
+  if (!s) return null;
   let raw = s;
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
     if (requirePort && !/:\d+$/.test(s)) return null;
@@ -68,6 +73,7 @@ function canonicalOrigin(input, { requirePort = false } = {}) {
   }
   let url;
   try { url = new URL(raw); } catch { return null; }
+  if (url.host.length > 300) return null;
   if (url.protocol !== 'http:' && url.protocol !== 'https:' && url.protocol !== 'ws:' && url.protocol !== 'wss:') return null;
   if (url.username || url.password) return null;
   const secure = url.protocol === 'https:' || url.protocol === 'wss:';
@@ -336,45 +342,52 @@ function webappSlotOrigins(override) {
   };
 }
 
-/** An absolute path already in normal form: no `.` or `..` segment, no doubled slash, no NUL. */
-function isPlainAbsolutePath(p) {
-  return typeof p === 'string' && p.length > 1 && p.length <= 4096 && !p.includes('\0') && path.isAbsolute(p) && path.normalize(p) === p;
-}
+// webapp's front door (dev-stack/docker-compose.yml): the varnish that
+// publishes DEV_BIND_IP:DEV_VARNISH_PORT.
+const FRONT_DOOR_SERVICE = 'varnish-fastly';
 
-/** GET a Docker Engine API path over the unix socket: the parsed JSON, or null when Docker can't be asked. */
-function dockerGet(apiPath, socketPath = '/var/run/docker.sock', timeoutMs = 3000) {
-  return new Promise((resolve) => {
-    const req = http.get({ socketPath, path: apiPath, timeout: timeoutMs }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => { if (body.length < 4 * 1024 * 1024) body += c; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) { resolve(null); return; }
-        try { resolve(JSON.parse(body)); } catch { resolve(null); }
-      });
-    });
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', () => resolve(null));
-  });
+/**
+ * Where the checkout's own stack publishes its front door, by Docker's
+ * reading: `{ ip, port }`, false when the checkout runs none (or Docker gives
+ * no single answer), null when Docker can't be asked. The override file
+ * misses a slot picked in the environment (`DEV_INSTANCE=2 make dev`, as
+ * webapp's Makefile documents it), and the file alone would then look for
+ * the stack on instance 1. A publish on 0.0.0.0 says nothing about the
+ * instance: `ip` is null then.
+ */
+async function ownFrontDoor(cwd, deps = {}) {
+  const bindings = await (deps.dockerServiceBindings || dockerServiceBindings)(FRONT_DOOR_SERVICE);
+  if (bindings === null) return null;
+  const same = deps.sameDir || sameDir;
+  const devStack = path.join(cwd, 'dev-stack');
+  const found = new Map();
+  for (const b of bindings) {
+    if (!b.workingDir || !same(b.workingDir, devStack)) continue;
+    // `::` beside a 0.0.0.0 publish, or an address no slot binds.
+    if (b.ip !== '0.0.0.0' && !/^127\.0\.0\.[1-8]$/.test(b.ip)) continue;
+    found.set(`${b.ip}:${b.port}`, { ip: b.ip === '0.0.0.0' ? null : b.ip, port: b.port });
+  }
+  return found.size === 1 ? [...found.values()][0] : false;
 }
 
 /**
- * The container that publishes ip:port, as `{ workingDir, boundIp }`: its
- * `com.docker.compose.project.working_dir` label ('' without one) and the
- * address the publish is bound to, `ip` itself or 0.0.0.0. `{ workingDir: '',
- * boundIp: null }` when no container publishes it, null when Docker can't be
- * asked.
+ * The override for the slot `front` (ownFrontDoor) is on: its instance and
+ * front port, and the file's asset-server port only when the file names the
+ * same instance (a stale file's port belongs to another slot).
  */
-async function dockerPublisher(ip, port, get = dockerGet) {
-  const filters = encodeURIComponent(JSON.stringify({ publish: [String(port)] }));
-  const list = await get(`/containers/json?filters=${filters}`);
-  if (!Array.isArray(list)) return null;
-  for (const c of list) {
-    const ports = Array.isArray(c.Ports) ? c.Ports : [];
-    const match = ports.find((p) => p && p.PublicPort === port && (p.IP === ip || p.IP === '0.0.0.0'));
-    if (match) return { workingDir: (c.Labels && c.Labels['com.docker.compose.project.working_dir']) || '', boundIp: match.IP };
-  }
-  return { workingDir: '', boundIp: null };
+function overrideForFrontDoor(front, file) {
+  const fileN = Number.isInteger(file.DEV_INSTANCE) ? file.DEV_INSTANCE : 1;
+  const n = front.ip === null ? fileN : Number(front.ip.split('.')[3]);
+  return {
+    ...(n === 1 ? {} : { DEV_INSTANCE: n }),
+    DEV_VARNISH_PORT: front.port,
+    ...(n === fileN && file.DEV_WEBAPP_DEVSERVER_PORT ? { DEV_WEBAPP_DEVSERVER_PORT: file.DEV_WEBAPP_DEVSERVER_PORT } : {}),
+  };
+}
+
+/** An absolute path already in normal form: no `.` or `..` segment, no doubled slash, no NUL. */
+function isPlainAbsolutePath(p) {
+  return typeof p === 'string' && p.length > 1 && p.length <= 4096 && !p.includes('\0') && path.isAbsolute(p) && path.normalize(p) === p;
 }
 
 /** dockerPublisher's working dir alone: '' when no container publishes ip:port, null when Docker can't be asked. */
@@ -385,79 +398,6 @@ async function publisherWorkingDir(ip, port, get = dockerGet) {
 
 function sameDir(a, b, realpathSync = fs.realpathSync) {
   try { return realpathSync(a) === realpathSync(b); } catch { return false; }
-}
-
-/** `/proc/net/tcp{,6}`'s hex address as a dotted IPv4 (an IPv4-mapped IPv6 one too), `::` for the IPv6 wildcard, or null. */
-function procAddress(hex) {
-  if (hex.length === 8) return [3, 2, 1, 0].map((i) => parseInt(hex.slice(i * 2, i * 2 + 2), 16)).join('.');
-  if (hex.length !== 32) return null;
-  if (/^0{32}$/.test(hex)) return '::';
-  // Four little-endian 32-bit words: ::ffff:a.b.c.d is 0000…0000, FFFF0000, then the IPv4 word.
-  if (hex.slice(0, 16) === '0'.repeat(16) && hex.slice(16, 24).toUpperCase() === 'FFFF0000') return procAddress(hex.slice(24));
-  return 'other-v6';
-}
-
-/**
- * Who would take a connection to `ip:port`, from the kernel's own tables, as
- * `{ pid, cwd }` per TCP listening socket (both null where it belongs to a
- * process this user can't see: another user's, root's, Docker's proxy among
- * them). The kernel hands an IPv4 connection to the most specific listener:
- * one bound to `ip` itself, else one on 0.0.0.0, else a dual-stack `::`. So
- * only the most specific kind present is returned: an unrelated wildcard
- * beside this address's own listener never counts. (A `::` socket may be
- * IPv6-only, which the tables don't show; alone, it is counted, which leaves
- * an origin out rather than in.) `exactOnly`: the ones bound to `ip` itself,
- * which take its connections even beside a wildcard publish. Linux only; an
- * empty list where nothing listens.
- */
-function listenersOn(ip, port, io = {}, { exactOnly = false } = {}) {
-  const read = io.readFileSync || fs.readFileSync;
-  const readdir = io.readdirSync || fs.readdirSync;
-  const readlink = io.readlinkSync || fs.readlinkSync;
-  // Listening sockets by how specifically they're bound: 0 this address, 1 0.0.0.0, 2 ::.
-  const byRank = [new Set(), new Set(), new Set()];
-  for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
-    let text = '';
-    try { text = read(table, 'utf8'); } catch { continue; }
-    for (const line of text.split('\n').slice(1)) {
-      const f = line.trim().split(/\s+/);
-      if (f.length < 10 || f[3] !== '0A') continue; // 0A: LISTEN
-      const [addrHex, portHex] = f[1].split(':');
-      if (parseInt(portHex, 16) !== port) continue;
-      const addr = procAddress(addrHex);
-      const rank = addr === ip ? 0 : addr === '0.0.0.0' ? 1 : addr === '::' ? 2 : -1;
-      if (rank >= 0) byRank[rank].add(f[9]);
-    }
-  }
-  const inodes = exactOnly ? byRank[0] : byRank.find((set) => set.size > 0) || new Set();
-  if (inodes.size === 0) return [];
-  const owners = new Map();
-  let pids = [];
-  try { pids = readdir('/proc').filter((n) => /^\d+$/.test(n)); } catch { /* no /proc: owners stay unknown */ }
-  for (const pid of pids) {
-    let fds;
-    try { fds = readdir(`/proc/${pid}/fd`); } catch { continue; } // not ours to look at
-    for (const fd of fds) {
-      let link;
-      try { link = readlink(`/proc/${pid}/fd/${fd}`); } catch { continue; }
-      const m = /^socket:\[(\d+)\]$/.exec(link);
-      if (m && inodes.has(m[1]) && !owners.has(m[1])) {
-        let cwd = null;
-        try { cwd = readlink(`/proc/${pid}/cwd`); } catch { /* gone */ }
-        owners.set(m[1], { pid: Number(pid), cwd });
-      }
-    }
-    if (owners.size === inodes.size) break;
-  }
-  return [...inodes].map((inode) => owners.get(inode) || { pid: null, cwd: null });
-}
-
-/** Whether `child` is `dir` or inside it (both resolved, so a symlinked checkout still matches). */
-function insideDir(child, dir, realpathSync = fs.realpathSync) {
-  try {
-    const rel = path.relative(realpathSync(dir), realpathSync(child));
-    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-  } catch { return false; }
 }
 
 /**
@@ -518,12 +458,16 @@ async function ownedOrigins(slot, cwd, deps = {}) {
  * A share's origins for this attach: `{ ok: true, origins, primaryUrl }`, or
  * `{ ok: false, reason }` with reason one of no-checkout, not-a-dev-stack,
  * stack-not-running, other-workstream, unverifiable, no-origins, bad-recipe.
+ * An other-workstream refusal carries `holder` when Docker names the stack in
+ * the way: its compose working dir, for the owner only.
  *
  *   { kind: 'manual', origins: [...] }      literal loopback origins, checked
- *   { kind: 'webapp-dev-stack' }          the workstream's own slot, and only
- *                                           while its own stack serves it; of
- *                                           its other ports, only the ones this
- *                                           checkout serves (ownedOrigins)
+ *   { kind: 'webapp-dev-stack' }          the slot the workstream's own stack
+ *                                           runs on (ownFrontDoor), else the
+ *                                           one its override file names, and
+ *                                           only while its own stack serves it;
+ *                                           of its other ports, only the ones
+ *                                           this checkout serves (ownedOrigins)
  */
 async function resolveRecipe(recipe, cwd, deps = {}) {
   const read = deps.readFileSync || fs.readFileSync;
@@ -554,15 +498,54 @@ async function resolveRecipe(recipe, cwd, deps = {}) {
   try { if (!fs.statSync(path.join(cwd, 'dev-stack')).isDirectory()) return { ok: false, reason: 'not-a-dev-stack' }; } catch {
     if (!deps.skipDirCheck) return { ok: false, reason: 'not-a-dev-stack' };
   }
-  const slot = webappSlotOrigins(readDevStackOverride(cwd, read) || {});
-  if (!slot) return { ok: false, reason: 'not-a-dev-stack' };
+  const file = readDevStackOverride(cwd, read) || {};
+  const named = webappSlotOrigins(file);
+  if (!named) return { ok: false, reason: 'not-a-dev-stack' };
+  const own = await ownFrontDoor(cwd, deps);
+  if (own === null) return { ok: false, reason: 'unverifiable' };
+  const slot = (own && webappSlotOrigins(overrideForFrontDoor(own, file))) || named;
   const front = await publisher(slot.ip, slot.frontPort);
   if (front === null) return { ok: false, reason: 'unverifiable' };
   if (front.workingDir === '') return { ok: false, reason: 'stack-not-running' };
-  if (!same(front.workingDir, path.join(cwd, 'dev-stack'))) return { ok: false, reason: 'other-workstream' };
+  if (!same(front.workingDir, path.join(cwd, 'dev-stack'))) {
+    return { ok: false, reason: 'other-workstream', ...(isPlainAbsolutePath(front.workingDir) ? { holder: front.workingDir } : {}) };
+  }
   if (shadowOf(slot.ip, slot.frontPort, front, cwd, deps.listenersOn || listenersOn, deps.insideDir || insideDir)) return { ok: false, reason: 'other-workstream' };
   const owned = await ownedOrigins(slot, cwd, deps);
   return { ok: true, origins: owned.origins, primaryUrl: slot.primaryUrl, ...(owned.dropped.length ? { dropped: owned.dropped } : {}) };
+}
+
+/** The `browser-guest-check` RPC, which the hello advertises with this. */
+const CHECK_CAPABILITIES = ['browser-guest-check-v1'];
+
+/**
+ * Of the backend's `checkouts` (`{ workstream, dir }`, the project's), the
+ * workstream whose dev-stack `holder` is, compared on this box (sameDir, so
+ * a symlinked checkout matches the real path Docker reports), or null.
+ */
+function checkoutHolding(holder, checkouts, deps = {}) {
+  const same = deps.sameDir || sameDir;
+  if (!Array.isArray(checkouts)) return null;
+  for (const c of checkouts.slice(0, 64)) {
+    if (!c || typeof c.workstream !== 'string' || !isPlainAbsolutePath(c.dir)) continue;
+    if (same(path.join(c.dir, 'dev-stack'), holder)) return c.workstream;
+  }
+  return null;
+}
+
+/**
+ * The owner's look before sharing (the `browser-guest-check` RPC): what a
+ * guest's attach would find now, `{ ok: true, primaryUrl }` or `{ ok: false,
+ * reason, holder?, holderWorkstream? }`, without opening anything.
+ * `holderWorkstream` names which of `msg.checkouts` the stack in the way was
+ * started from. Only the backend's owner-only route asks it
+ * (routes/previewShares.ts stackCheckFor).
+ */
+async function checkRecipe(msg, deps = {}) {
+  const resolved = await resolveRecipe(msg && msg.recipe, msg && typeof msg.cwd === 'string' ? msg.cwd : null, deps);
+  if (resolved.ok) return { ok: true, primaryUrl: resolved.primaryUrl };
+  const holderWorkstream = resolved.holder ? checkoutHolding(resolved.holder, msg && msg.checkouts, deps) : null;
+  return { ok: false, reason: resolved.reason, ...(resolved.holder ? { holder: resolved.holder } : {}), ...(holderWorkstream ? { holderWorkstream } : {}) };
 }
 
 // ── The canary ──────────────────────────────────────────────────────────────
@@ -696,8 +679,12 @@ function memAvailableBytes(readFileSync = fs.readFileSync) {
  * HMR pushes uncommitted edits straight into a guest's tab, so this says so.
  */
 function checkoutState(cwd, run = execFile) {
+  // Read-only, so no optional locks: the `status` must not hold index.lock
+  // while the workstream's own git writes (git-branch-state.js says why).
   const git = (...args) => new Promise((resolve) => {
-    run('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => resolve(err ? null : out));
+    run('git', ['-C', cwd, ...args], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    }, (err, out) => resolve(err ? null : out));
   });
   if (typeof cwd !== 'string' || !cwd) return Promise.resolve(null);
   return Promise.all([git('rev-parse', '--abbrev-ref', 'HEAD'), git('rev-parse', 'HEAD'), git('status', '--porcelain')]).then(([branch, head, status]) => {
@@ -734,7 +721,11 @@ module.exports = {
   listenersOn,
   insideDir,
   ownedOrigins,
+  ownFrontDoor,
+  overrideForFrontDoor,
   resolveRecipe,
+  CHECK_CAPABILITIES,
+  checkRecipe,
   canaryHtml,
   Canary,
   guestEnvironment,

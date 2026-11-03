@@ -19,6 +19,10 @@
  *      head, untracked. A PR from the same repository then gets its upstream
  *      (origin/<branch>), so a plain `git push` updates it; a fork's never
  *      tracks anything, so a push cannot land on the shared repository.
+ *   `worktreePath` (absolute, worktree-pr-path-v1): the worktree goes there
+ *      instead, for a multi-repo project's <wsRoot>/<repo>. A worktree already
+ *      at that path on the branch is reused; one anywhere else is refused, not
+ *      adopted, since the workstream's other repositories would be missing.
  *      Either way the branch records `branch.<name>.termagCheckout` (`pr` or
  *      `fork`). That is how the chat runner knows the workstream was checked
  *      out from a pull request after HEAD has moved on. Absence of the key
@@ -31,8 +35,9 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
-const CAPABILITIES = ['worktree-pr-v1'];
+const CAPABILITIES = ['worktree-pr-v1', 'worktree-pr-path-v1'];
 
 const NAME = /^[A-Za-z0-9_-]+$/;
 const OID = /^[0-9a-f]{40}$/;
@@ -61,11 +66,14 @@ function real(p) {
   try { return fs.realpathSync(p); } catch { return null; }
 }
 
-async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRepo, headOid }, { execFile }) {
+async function addPrWorktree({ projectDir, worktreeName, worktreePath: atPath, branch, number, sameRepo, headOid }, { execFile }) {
   if (!projectDir || !worktreeName || !branch || !number || !headOid) {
     throw new Error('projectDir, worktreeName, branch, number and headOid are required');
   }
   if (!NAME.test(worktreeName)) throw new Error('worktreeName must be alphanumeric with dashes/underscores only');
+  if (atPath !== undefined && (typeof atPath !== 'string' || !path.isAbsolute(atPath) || atPath.split('/').includes('..'))) {
+    throw new Error('worktreePath must be an absolute path');
+  }
   if (typeof branch !== 'string' || branch.startsWith('-')) throw new Error('branch contains disallowed characters');
   if (!Number.isInteger(number) || number < 1) throw new Error('number must be a PR number');
   if (!OID.test(headOid)) throw new Error('headOid must be a full commit id');
@@ -92,7 +100,7 @@ async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRep
   }
 
   const root = real(projectDir) ?? projectDir;
-  const worktreePath = `${projectDir}/.worktrees/${worktreeName}`;
+  const worktreePath = atPath ?? `${projectDir}/.worktrees/${worktreeName}`;
   // Forget worktrees whose directory is gone, so neither the list nor `worktree add` counts them.
   await git(['worktree', 'prune']).catch(() => undefined);
   const { stdout: list } = await git(['worktree', 'list', '--porcelain']);
@@ -107,7 +115,7 @@ async function addPrWorktree({ projectDir, worktreeName, branch, number, sameRep
     }
     const prefix = `${root}/.worktrees/`;
     const rel = at.startsWith(prefix) ? at.slice(prefix.length) : null;
-    if (rel && NAME.test(rel)) {
+    if (!atPath && rel && NAME.test(rel)) {
       await markCheckout();
       return { ok: true, path: holder.path, adopted: rel };
     }

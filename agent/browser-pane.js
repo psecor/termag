@@ -1927,7 +1927,9 @@ function createManager({ binary, home, log = console.log, parkMs = PARK_MS, pane
       if (guest) {
         if (!guestEnv.ok) throw new Error(`guest-unavailable: ${guestEnv.reason}`);
         const resolved = await resolveRecipe(msg.recipe, typeof msg.cwd === 'string' ? msg.cwd : null);
-        if (!resolved.ok) throw new Error(`guest-stack:${resolved.reason}`);
+        // The holder rides after the reason, for the owner's share events; the
+        // backend tells the guest only the reason's own sentence.
+        if (!resolved.ok) throw new Error(`guest-stack:${resolved.reason}${resolved.holder ? `: started from ${resolved.holder}` : ''}`);
         for (const d of resolved.dropped || []) log(`[BROWSER-PANE] ${paneKey}: ${d.origin} left out of the share: ${d.why}`);
         if (url === 'about:blank') url = guestMode.urlAt(resolved.primaryUrl, msg.atPath) || resolved.primaryUrl;
         const origin = guestMode.originOfUrl(url);

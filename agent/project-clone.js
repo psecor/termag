@@ -9,6 +9,10 @@ const UNIT_TEMPLATE = 'termag-project-clone@.service';
 // project while personalization can still be running.
 const DEFAULT_WAIT_SECONDS = 11 * 60;
 const ID_RE = /^[A-Za-z0-9_-]+$/;
+// One repository of a multi-repo project: its state
+// file and unit instance are keyed <projectId>--<repo>, which ID_RE still
+// accepts, so deploy/termag-project-clone runs it unchanged.
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 const HTTPS_RE = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
 const SSH_RE = /^git@github\.com:([\w.-]+)\/([\w.-]+?)(?:\.git)?$/;
 const BRANCH_RE = /^[a-zA-Z0-9_./-]+$/;
@@ -20,6 +24,10 @@ function clonesDir(home) {
 
 function statePath(home, projectId) {
   return path.join(clonesDir(home), `${projectId}.json`);
+}
+
+function cloneKey(projectId, repo) {
+  return repo ? `${projectId}--${repo}` : projectId;
 }
 
 function instanceUnit(projectId) {
@@ -58,8 +66,12 @@ function sameRepository(a, b) {
 function acceptCloneRequest(msg) {
   if (!msg || typeof msg !== 'object') return { ok: false, error: 'project-clone: empty request' };
   const { projectId, instanceId, dir, url, branch, attempt, sizeKb, referenceDir } = msg;
-  if (typeof projectId !== 'string' || !ID_RE.test(projectId)) {
+  if (typeof projectId !== 'string' || !ID_RE.test(projectId) || projectId.includes('--')) {
     return { ok: false, error: 'project-clone: projectId must be a single path segment' };
+  }
+  const repo = msg.repo == null ? null : msg.repo;
+  if (repo !== null && (typeof repo !== 'string' || !REPO_RE.test(repo))) {
+    return { ok: false, error: 'project-clone: repo must be a repository directory name' };
   }
   if (typeof instanceId !== 'string' || !instanceId || /[\r\n]/.test(instanceId)) {
     return { ok: false, error: 'project-clone: instanceId is required' };
@@ -88,13 +100,14 @@ function acceptCloneRequest(msg) {
   }
   return {
     ok: true,
-    request: { projectId, instanceId, dir, url, branch, attempt, sizeKb, referenceDir: ref },
+    request: { projectId, repo, key: cloneKey(projectId, repo), instanceId, dir, url, branch, attempt, sizeKb, referenceDir: ref },
   };
 }
 
 function pendingState(request) {
   return {
     projectId: request.projectId,
+    ...(request.repo ? { repo: request.repo, key: request.key } : {}),
     instanceId: request.instanceId,
     attempt: request.attempt,
     dir: request.dir,
@@ -110,6 +123,7 @@ function planClone({ unitState, existing, request }) {
   const running = unitState === 'active' || unitState === 'activating';
   const same = existing
     && existing.projectId === request.projectId
+    && (existing.repo || null) === (request.repo || null)
     && existing.attempt === request.attempt;
   if (same && existing.status === 'ready') return { kind: 'ignore', why: 'ready' };
   if (same && existing.status === 'failed') return { kind: 'ignore', why: 'failed' };
@@ -150,6 +164,7 @@ function frameFromState(state) {
     attempt: state.attempt,
     status: state.status,
   };
+  if (typeof state.repo === 'string' && REPO_RE.test(state.repo)) frame.repo = state.repo;
   if (state.status === 'ready') frame.branch = typeof state.branch === 'string' ? state.branch : null;
   if (state.status === 'failed') frame.error = typeof state.error === 'string' && state.error ? state.error : 'clone failed';
   return frame;
@@ -362,7 +377,7 @@ function writeExclude(dir) {
 
 function save(home, state, patch) {
   const next = { ...state, ...patch };
-  writeJson(statePath(home, state.projectId), next);
+  writeJson(statePath(home, state.key || state.projectId), next);
   return next;
 }
 
@@ -415,7 +430,7 @@ async function runClone(projectId, opts = {}) {
     return 1;
   }
 
-  const temp = tempCloneDir(state.dir, state.projectId);
+  const temp = tempCloneDir(state.dir, state.repo || state.projectId);
   fs.rmSync(temp, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(temp), { recursive: true });
   state = save(home, state, { status: 'cloning', error: undefined });
@@ -435,7 +450,9 @@ async function runClone(projectId, opts = {}) {
     return 1;
   }
 
-  writeGuides(
+  // A repository of a workspace project brings its own guide; the
+  // workspace's is the root's (agent/workspace.js).
+  if (!state.repo) writeGuides(
     temp,
     path.basename(state.dir),
     opts.username || process.env.USER || 'owner',
@@ -469,11 +486,16 @@ async function unitActiveState(execFile, projectId) {
   }
 }
 
+// Asked of an instance, `termag-project-clone@probe.service`, not the template:
+// systemd 255 (the boxes' Ubuntu 24.04) refuses `show` on a template name ("neither
+// a valid invocation ID nor unit name"), so asking the template announced nothing.
+// An instance of an installed template loads (`show` starts nothing); one of a
+// missing template is `not-found`. Same probe as tool-update.js.
 async function unitTemplateLoaded(execFile) {
   try {
     const { stdout } = await execFile(
       'systemctl',
-      ['--user', 'show', '-p', 'LoadState', '--value', UNIT_TEMPLATE],
+      ['--user', 'show', '-p', 'LoadState', '--value', instanceUnit('probe')],
       { timeout: 5000 },
     );
     return String(stdout).trim() === 'loaded';
@@ -493,14 +515,14 @@ async function handleProjectClone(msg, { execFile, home, remapPath }) {
   if (!path.isAbsolute(request.dir) || (request.referenceDir && !path.isAbsolute(request.referenceDir))) {
     throw new Error('project-clone: dir and referenceDir must stay absolute');
   }
-  const existing = readState(home, request.projectId);
-  const unitState = await unitActiveState(execFile, request.projectId);
+  const existing = readState(home, request.key);
+  const unitState = await unitActiveState(execFile, request.key);
   const plan = planClone({ unitState, existing, request });
   if (plan.kind === 'ignore') return { ok: true, started: false, ignored: plan.why };
-  const unit = instanceUnit(request.projectId);
+  const unit = instanceUnit(request.key);
   if (plan.stop) await execFile('systemctl', ['--user', 'stop', unit], { timeout: 15000 });
-  writeJson(statePath(home, request.projectId), plan.state);
-  fs.rmSync(tempCloneDir(request.dir, request.projectId), { recursive: true, force: true });
+  writeJson(statePath(home, request.key), plan.state);
+  fs.rmSync(tempCloneDir(request.dir, request.repo || request.projectId), { recursive: true, force: true });
   try {
     await execFile('systemctl', ['--user', 'reset-failed', unit], { timeout: 10000 });
   } catch (err) {

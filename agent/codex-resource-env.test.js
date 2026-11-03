@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { codexResourceEnv, withoutResourceEnv } = require('./codex-resource-env');
+const { codexResourceEnv, withoutResourceEnv, codexBridgeEnv } = require('./codex-resource-env');
 
 test('names the pair when the RPC carries both as ids', () => {
   assert.deepEqual(
@@ -33,4 +33,11 @@ test('withoutResourceEnv takes only the pair out of a copy', () => {
   const env = { PATH: '/bin', TERMAG_PROJECT: 'old', TERMAG_WORKSTREAM: 'old', TERMAG_STATUS_BEARER_TOKEN: 't' };
   assert.deepEqual(withoutResourceEnv(env), { PATH: '/bin', TERMAG_STATUS_BEARER_TOKEN: 't' });
   assert.equal(env.TERMAG_PROJECT, 'old');
+});
+
+test('codexBridgeEnv: the session pair and kind interactive, over whatever the agent inherited', () => {
+  const env = { PATH: '/bin', TERMAG_PROJECT: 'old', TERMAG_WORKSTREAM: 'old', TERMAG_SESSION_KIND: 'ask' };
+  assert.deepEqual(codexBridgeEnv(env, { TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main' }),
+    { PATH: '/bin', TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main', TERMAG_SESSION_KIND: 'interactive' });
+  assert.deepEqual(codexBridgeEnv(env), { PATH: '/bin', TERMAG_SESSION_KIND: 'interactive' });
 });

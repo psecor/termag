@@ -33,4 +33,15 @@ function withoutResourceEnv(env) {
   return out;
 }
 
-module.exports = { codexResourceEnv, withoutResourceEnv };
+/**
+ * The status bridge's environment, which the app server inherits: `env`
+ * without an inherited pair, the session's own pair (codexResourceEnv), and
+ * TERMAG_SESSION_KIND=interactive, the kind its resource carries, which the
+ * app server's commands inherit in turn. The kind
+ * replaces whatever `env` carried.
+ */
+function codexBridgeEnv(env, resourceEnv = {}) {
+  return { ...withoutResourceEnv(env), ...resourceEnv, TERMAG_SESSION_KIND: 'interactive' };
+}
+
+module.exports = { codexResourceEnv, withoutResourceEnv, codexBridgeEnv };

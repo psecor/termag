@@ -119,6 +119,12 @@ function createClaudeLogin({
   // observe the old value and must not apply that stale snapshot.
   let epoch = 0;
   let signedIn = null;
+  // A sign-in started over a seat that still reads as logged in (a turn
+  // failed on its expired token). That read is the dead seat, so it does not
+  // count as signed in until a login here succeeds (or is cancelled), also
+  // after this one expires or fails: it would report a sign-in that did not
+  // happen.
+  let reauth = false;
   // start() awaits status before it records the child. Overlapping clicks
   // would both see no process and leave two CLIs, and the paste would go to
   // only one of them. One start runs at a time; the next joins it.
@@ -170,6 +176,7 @@ function createClaudeLogin({
 
   function shape(auth) {
     const out = { ...publicAuth(auth), phase: phase === 'success-pending' ? 'submitting' : phase };
+    if (reauth) out.loggedIn = false;
     if (error && out.phase !== 'ready') out.error = error;
     if (url && (out.phase === 'needs-code' || out.phase === 'submitting')) out.url = url;
     return out;
@@ -267,8 +274,14 @@ function createClaudeLogin({
     }
   }
 
+  /** A status that means signed in. After a reauth started, the old seat does not. */
+  function confirmed(auth) {
+    return Boolean(auth && auth.loggedIn && !reauth);
+  }
+
   function ready(auth) {
     if (proc) kill();
+    reauth = false;
     phase = 'ready';
     error = null;
     url = null;
@@ -291,7 +304,7 @@ function createClaudeLogin({
       if (loginOpen()) return shape({ loggedIn: false });
       return unavailable();
     }
-    if (auth.loggedIn) return ready(auth);
+    if (confirmed(auth)) return ready(auth);
     // submit has seen "Login successful." and is confirming. proc is often
     // already null here. Leave that phase; the confirming read owns the result.
     if (phase === 'success-pending' || phase === 'submitting') return shape(auth);
@@ -299,7 +312,7 @@ function createClaudeLogin({
     return shape(auth);
   }
 
-  async function beginStart(email) {
+  async function beginStart(email, wantReauth) {
     const auth = await readStatus();
     if (!auth) {
       // A second Sign in while the first CLI is up must join it, not report
@@ -307,8 +320,11 @@ function createClaudeLogin({
       if (loginOpen()) return shape({ loggedIn: false });
       return unavailable();
     }
-    // A gateway box, or any box that already has a seat, is not logged in again.
-    if (auth.loggedIn) return ready(auth);
+    // A gateway box, or any box that already has a seat, is not logged in
+    // again, unless a turn just failed on that seat's expired sign-in
+    // (reauth). A gateway's refusal is not fixed by an SSO login.
+    const relogin = wantReauth && auth.authMethod === 'claude.ai';
+    if (auth.loggedIn && !relogin && !reauth) return ready(auth);
     expireIfNeeded();
     if (proc && (phase === 'starting' || phase === 'needs-code' || phase === 'submitting' || phase === 'success-pending')) {
       return shape(auth);
@@ -319,6 +335,7 @@ function createClaudeLogin({
     error = null;
     outcome = null;
     phase = 'starting';
+    reauth = reauth || auth.loggedIn === true;
     startedAt = now();
     const args = ['auth', 'login', '--claudeai', '--sso'];
     const hint = safeEmail(email);
@@ -364,12 +381,12 @@ function createClaudeLogin({
       buf = '';
     }
     const again = await readStatus();
-    if (again && again.loggedIn) return ready(again);
+    if (confirmed(again)) return ready(again);
     return shape(again || auth);
   }
 
-  function start(email) {
-    const run = startTail.then(() => beginStart(email));
+  function start(email, opts = {}) {
+    const run = startTail.then(() => beginStart(email, opts.reauth === true));
     startTail = run.then(() => {}, () => {});
     return run;
   }
@@ -378,14 +395,14 @@ function createClaudeLogin({
     const rejected = codeError(code);
     if (rejected) {
       const auth = await readStatus();
-      const current = auth && auth.loggedIn ? ready(auth) : shape(auth || { loggedIn: false });
+      const current = confirmed(auth) ? ready(auth) : shape(auth || { loggedIn: false });
       if (current.phase === 'ready') return current;
       return { ...current, error: rejected };
     }
     expireIfNeeded();
     if (!proc || !url || phase === 'expired' || phase === 'failed') {
       const auth = await readStatus();
-      const current = auth && auth.loggedIn ? ready(auth) : shape(auth || { loggedIn: false });
+      const current = confirmed(auth) ? ready(auth) : shape(auth || { loggedIn: false });
       if (current.phase === 'ready') return current;
       return { ...current, error: 'Start sign-in again, then paste the code.' };
     }
@@ -434,6 +451,7 @@ function createClaudeLogin({
 
   function cancel() {
     kill();
+    reauth = false;
     url = null;
     buf = '';
     outcome = null;

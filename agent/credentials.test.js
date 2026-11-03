@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  applyCredential, removeCredential, CAPABILITIES, configure,
+  applyCredential, removeCredential, CAPABILITIES, configure, capabilitiesFor, MCP_AGENTS_MARKER, FIREWORKS_MENU_MARKER,
+  FIREWORKS_PI_MENU_MARKER, FIREWORKS_PI_LAUNCHER_MARKER, installedDirs,
 } = require('./credentials');
 
 const SENTINEL = 'sentinel-token-7f3e';
@@ -16,7 +17,82 @@ function stubScript(dir, body) {
 }
 
 test('advertises credentials-v1, the GitHub broker, telemetry and its launch settings', () => {
-  assert.deepStrictEqual(CAPABILITIES, ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1']);
+  assert.deepStrictEqual(CAPABILITIES.slice(0, 7), ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1']);
+});
+
+test('advertises mcp-broker-v2 only when the script carries its marker', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const old = stubScript(dir, 'exit 0');
+  assert.ok(!capabilitiesFor(old).includes('mcp-broker-v2'));
+  fs.writeFileSync(old, `#!/bin/sh
+# ${MCP_AGENTS_MARKER}
+`);
+  assert.deepStrictEqual(capabilitiesFor(old).slice(-2), ['fireworks-v1', 'mcp-broker-v2']);
+  assert.ok(!capabilitiesFor(path.join(dir, 'missing')).includes('mcp-broker-v2'));
+});
+
+test('advertises fireworks-menu-v1 only when the script takes --models, in the checkout and installed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-bin-'));
+  const old = stubScript(dir, 'exit 0');
+  stubScript(bin, `# ${FIREWORKS_MENU_MARKER}`);
+  assert.ok(!capabilitiesFor(old, undefined, bin).includes('fireworks-menu-v1'));
+  fs.writeFileSync(old, `#!/bin/sh\n# ${FIREWORKS_MENU_MARKER}\n`);
+  assert.deepStrictEqual(capabilitiesFor(old, undefined, bin).slice(-2), ['fireworks-v1', 'fireworks-menu-v1']);
+  // A checkout pulled ahead of the installed copy the launch runs.
+  fs.writeFileSync(path.join(bin, 'termag-credentials'), '#!/bin/sh\nexit 0\n');
+  assert.ok(!capabilitiesFor(old, undefined, bin).includes('fireworks-menu-v1'));
+  // Nothing installed at all.
+  assert.ok(!capabilitiesFor(old, undefined, path.join(bin, 'missing')).includes('fireworks-menu-v1'));
+  // The real script carries it.
+  assert.ok(capabilitiesFor(undefined, undefined, path.join(__dirname, '..', 'deploy')).includes('fireworks-menu-v1'));
+});
+
+test('advertises fireworks-pi-menu-v1 only when both pi-model and termag-pi-fireworks take --models, in the checkout and installed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-bin-'));
+  const script = stubScript(dir, `# ${FIREWORKS_PI_MENU_MARKER}`);
+  stubScript(bin, `# ${FIREWORKS_PI_MENU_MARKER}`);
+  fs.writeFileSync(path.join(bin, 'termag-pi-fireworks'), `#!/bin/sh\n# ${FIREWORKS_PI_LAUNCHER_MARKER}\n`);
+  // pi-model takes it, but an older launcher would hand --models to pi.
+  assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
+  fs.writeFileSync(path.join(dir, 'termag-pi-fireworks'), `#!/bin/sh\n# ${FIREWORKS_PI_LAUNCHER_MARKER}\n`);
+  assert.deepStrictEqual(capabilitiesFor(script, undefined, bin).slice(-2), ['fireworks-v1', 'fireworks-pi-menu-v1']);
+  // The installed launcher predates it.
+  fs.writeFileSync(path.join(bin, 'termag-pi-fireworks'), '#!/bin/sh\nexit 0\n');
+  assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
+  fs.writeFileSync(path.join(bin, 'termag-pi-fireworks'), `#!/bin/sh\n# ${FIREWORKS_PI_LAUNCHER_MARKER}\n`);
+  // The installed pi-model predates it.
+  fs.writeFileSync(path.join(bin, 'termag-credentials'), '#!/bin/sh\nexit 0\n');
+  assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
+  // A launcher that takes it, with an older pi-model that refuses it.
+  stubScript(bin, `# ${FIREWORKS_PI_MENU_MARKER}`);
+  fs.writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
+  // The real scripts carry both.
+  assert.ok(capabilitiesFor(undefined, undefined, path.join(__dirname, '..', 'deploy')).includes('fireworks-pi-menu-v1'));
+});
+
+// Bugbot on #1118: a host without ~/.local/bin copies runs the launch from
+// whatever its PATH finds, so that copy is the one that counts.
+test('reads the copy a launch would run: the first one on the search path', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const localBin = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-bin-'));
+  const onPath = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-path-'));
+  const script = stubScript(dir, `# ${FIREWORKS_MENU_MARKER}`);
+  // Nothing in ~/.local/bin; the PATH's copy carries the marker.
+  stubScript(onPath, `# ${FIREWORKS_MENU_MARKER}`);
+  assert.ok(capabilitiesFor(script, undefined, [localBin, onPath]).includes('fireworks-menu-v1'));
+  // An older copy earlier on the path is the one the shell would run.
+  stubScript(localBin, 'exit 0');
+  assert.ok(!capabilitiesFor(script, undefined, [localBin, onPath]).includes('fireworks-menu-v1'));
+  // None anywhere: the launch could not run termag-credentials at all.
+  assert.ok(!capabilitiesFor(script, undefined, [path.join(localBin, 'none')]).includes('fireworks-menu-v1'));
+});
+
+test('searches ~/.local/bin first, then the agent\'s PATH', () => {
+  const dirs = installedDirs({ HOME: '/home/ada', PATH: '/usr/local/bin:/home/ada/src/termag/deploy::/usr/bin' }, '/home/ada');
+  assert.deepStrictEqual(dirs, ['/home/ada/.local/bin', '/usr/local/bin', '/home/ada/src/termag/deploy', '/usr/bin']);
 });
 
 test('the script is told where the agent config is, not given the token', async () => {

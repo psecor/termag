@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { sendKeysArgv, enterArgv, captureArgv, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget } = require('./tmux-args');
+const { sendKeysArgv, enterArgv, captureArgv, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv } = require('./tmux-args');
 
 test('literal text is passed through untouched — quotes, backslashes, $ and backticks', () => {
   const text = `psql -c "select 1 from users where name='psecor'" \\ $HOME \`x\` don't`;
@@ -13,6 +13,13 @@ test('literal text is passed through untouched — quotes, backslashes, $ and ba
 test('text starting with a dash sits after -- so tmux does not parse it as an option', () => {
   assert.deepEqual(sendKeysArgv('s', '-n foo', { literal: true }), ['send-keys', '-t', 's', '-l', '--', '-n foo']);
   assert.deepEqual(sendKeysArgv('s', '-n foo'), ['send-keys', '-t', 's', '--', '-n foo']);
+});
+
+// pane-history-v1: the pipe arms only with -o (a second arm is a no-op, not a
+// second pipe doubling the log), and the log path is single-quoted for sh.
+test('pipe-pane argv appends to a quoted log path, only when no pipe is active', () => {
+  assert.deepEqual(pipePaneArgv('u-p-agent', '/home/u/.cache/termag/pane-history/u-p-agent.log'),
+    ['pipe-pane', '-o', '-t', 'u-p-agent', "cat >> '/home/u/.cache/termag/pane-history/u-p-agent.log'"]);
 });
 
 test('foreground: a dead pane can still be named claude, and an old line has no dead flag', () => {
@@ -45,7 +52,7 @@ test('exact targets get the = prefix so tmux never prefix-matches a longer name'
 });
 
 test('new-session: a login shell by default; with a command, that argv after `--`, no shell', () => {
-  assert.deepEqual(newSessionArgv('s', '/w'), ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30']);
+  assert.deepEqual(newSessionArgv('s', '/w'), ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30', '-e', 'DISABLE_AUTO_UPDATE=true']);
   assert.deepEqual(
     newSessionArgv('s', '/w', ['/home/u/.local/bin/termag-claude-runner', 'ord.1', '2']),
     ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30', '--', '/home/u/.local/bin/termag-claude-runner', 'ord.1', '2'],
@@ -55,7 +62,7 @@ test('new-session: a login shell by default; with a command, that argv after `--
 test('new-session carries TERMAG_BOX from the agent environment as -e, before --; absent or empty is omitted', () => {
   assert.deepEqual(
     newSessionArgv('s', '/w', null, { TERMAG_BOX: '1', PATH: '/usr/bin' }),
-    ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30', '-e', 'TERMAG_BOX=1'],
+    ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30', '-e', 'TERMAG_BOX=1', '-e', 'DISABLE_AUTO_UPDATE=true'],
   );
   assert.deepEqual(
     newSessionArgv('s', '/w', ['/home/u/.local/bin/termag-claude-runner', 'ord.1', '2'], { TERMAG_BOX: '1' }),
@@ -63,6 +70,15 @@ test('new-session carries TERMAG_BOX from the agent environment as -e, before --
   );
   assert.deepEqual(newSessionArgv('s', '/w', null, { PATH: '/usr/bin' }), newSessionArgv('s', '/w'));
   assert.deepEqual(newSessionArgv('s', '/w', null, { TERMAG_BOX: '' }), newSessionArgv('s', '/w'));
+});
+
+test('new-session carries CLAUDE_CODE_SHELL and BASH_ENV, so the Bash tool runs bash on a surviving server too', () => {
+  assert.deepEqual(
+    newSessionArgv('s', '/w', null, { TERMAG_BOX: '1', CLAUDE_CODE_SHELL: '/bin/bash', BASH_ENV: '/home/u/.local/share/termag/bash-env' }),
+    ['new-session', '-d', '-s', 's', '-c', '/w', '-x', '120', '-y', '30', '-e', 'TERMAG_BOX=1', '-e', 'CLAUDE_CODE_SHELL=/bin/bash',
+      '-e', 'BASH_ENV=/home/u/.local/share/termag/bash-env', '-e', 'DISABLE_AUTO_UPDATE=true'],
+  );
+  assert.deepEqual(newSessionArgv('s', '/w', null, { CLAUDE_CODE_SHELL: '' }), newSessionArgv('s', '/w'));
 });
 
 function hasTmux() {

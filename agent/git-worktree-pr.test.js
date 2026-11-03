@@ -125,6 +125,23 @@ test('ignores a stale worktree whose directory is gone (Bugbot), and refuses one
   await assert.rejects(addPrWorktree(same(g), deps), /with work that is not this PR's/);
 });
 
+test('checks out at an absolute worktreePath, reuses it, and adopts nothing elsewhere (multi-repo)', async () => {
+  const f = fixture();
+  const at = path.join(f.dir, 'ws-root', 'repo');
+  fs.mkdirSync(path.dirname(at));
+  const got = await addPrWorktree({ ...same(f), worktreePath: at }, deps);
+  assert.deepStrictEqual(got, { ok: true, path: at, localBranch: false, fastForwarded: false, upstream: true });
+  assert.strictEqual(run(at, 'rev-parse', 'HEAD'), f.oid('feat/x'));
+  assert.strictEqual(fs.existsSync(path.join(f.project, '.worktrees', 'proj-x')), false);
+  assert.deepStrictEqual(await addPrWorktree({ ...same(f), worktreePath: at }, deps), { ok: true, path: at, existing: true });
+
+  const g = fixture();
+  run(g.project, 'fetch', '-q', 'origin', 'feat/x:feat/x');
+  run(g.project, 'worktree', 'add', '-q', path.join(g.project, '.worktrees', 'agent-made'), 'feat/x');
+  await assert.rejects(addPrWorktree({ ...same(g), worktreePath: path.join(g.dir, 'ws-root', 'repo') }, deps), /feat\/x is already checked out at .*agent-made/);
+  await assert.rejects(addPrWorktree({ ...same(g), worktreePath: 'relative/repo' }, { execFile: () => { throw new Error('ran git'); } }), /worktreePath/);
+});
+
 test('judges branch names by git check-ref-format, and refuses unsafe input before touching origin (Devin 6)', async () => {
   const f = fixture();
   await assert.rejects(addPrWorktree({ ...same(f), branch: 'a..b' }, deps), /branch/);

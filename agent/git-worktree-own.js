@@ -37,8 +37,17 @@ async function configGet(execFile, cwd, key) {
   }
 }
 
+/**
+ * As chat-runner.js remoteUrl: the first configured URL when that names a
+ * GitHub repository (a box's broker rewrite would hide it), else as
+ * `remote get-url` expands insteadOf (an alias such as `gh:owner/name`).
+ */
 async function remoteUrl(execFile, cwd, remote) {
   if (!remote || remote.startsWith('-')) return '';
+  try {
+    const configured = String((await git(execFile, cwd, ['config', '--get-all', `remote.${remote}.url`])).stdout || '').split('\n')[0].trim();
+    if (githubSlug(configured)) return configured;
+  } catch { /* no url configured: get-url says what git uses */ }
   try {
     return String((await git(execFile, cwd, ['remote', 'get-url', '--', remote])).stdout || '').trim();
   } catch {
@@ -212,18 +221,63 @@ async function resolvedStartRef(execFile, repoPath, startPoint) {
 }
 
 /**
+ * Whether a start that a person asked for from a fresh fetch (agent.js
+ * `git-worktree-add` with `attended`, worktree-fetch.js) is origin's default
+ * branch: `refs/remotes/origin/<default>`, in a repository with an origin,
+ * and its local branch not a
+ * pull-request checkout; the default is read from the remote now
+ * (remoteDefaultNow), not guessed. That branch is the repository's trunk,
+ * never a pull request's head, so it is this repository's own tree whatever branch the
+ * main worktree is on, as a fresh clone's checkout is. Any other
+ * `origin/<name>`, including the branch the person named for the fetch, is
+ * not: a same-repo pull request's head has that shape too.
+ */
+function fetchedDefaultAttestsOwn(fullRef, remoteDefault, { originUrl = '', checkout = '', upstreamMerge = '', upstreamRef = '' } = {}) {
+  if (!remoteDefault || !originUrl || typeof fullRef !== 'string') return false;
+  if (!sourceBranchAllowsOwn({ checkout, upstreamMerge, upstreamRef })) return false;
+  return fullRef === `refs/remotes/origin/${remoteDefault}`;
+}
+
+const REMOTE_HEAD_TIMEOUT_MS = 10_000;
+
+/**
+ * origin's default branch as the remote has it now: `git remote set-head
+ * origin --auto` (what a fresh clone records), then the symref it wrote. ''
+ * when the remote cannot say. Never originHeadBranch's main/master guess, and
+ * never a symref left from the clone: a branch that used to be the default,
+ * or merely exists, is not the trunk. It costs a second network round trip
+ * (up to REMOTE_HEAD_TIMEOUT_MS, inside the orchestrator's 90 s wait for the
+ * add), and it rewrites the project's own refs/remotes/origin/HEAD, which
+ * originHeadBranch and git-branch-state.js read: a correction to what a fresh
+ * clone would record, made as a side effect of a worktree session starting.
+ */
+async function remoteDefaultNow(execFile, repoPath) {
+  try {
+    await execFile('git', ['-C', repoPath, 'remote', 'set-head', 'origin', '--auto'], { timeout: REMOTE_HEAD_TIMEOUT_MS });
+    const name = String((await git(execFile, repoPath, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])).stdout || '').trim();
+    return name.startsWith('origin/') ? name.slice('origin/'.length) : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Record that `branch` in `worktreePath` is a branch-off of this repository.
  * Does not replace `pr` or `fork`. Does not replace an upstream that is
  * already configured. Does nothing unless `startPoint`, resolved in
  * `repoPath`, is a branch already marked `own` or the main worktree's
- * current same-repo branch: no marker, no invented upstream. Other
- * unmarked `origin/<name>` branches are backfilled as `pr` first.
+ * current same-repo branch, or (`fetchedDefault`, a person's fetch of it)
+ * origin's default branch: no marker, no invented upstream. Other unmarked
+ * `origin/<name>` branches are backfilled as `pr` first.
  */
-async function markOwnCheckout({ worktreePath, branch, repoPath, startPoint }, { execFile }) {
+async function markOwnCheckout({ worktreePath, branch, repoPath, startPoint, fetchedDefault = false }, { execFile }) {
   if (!worktreePath || typeof branch !== 'string' || !branch || branch.startsWith('-') || branch.includes('..')) {
     throw new Error('worktreePath and branch are required');
   }
   const currentBranch = await mainWorktreeBranch(execFile, repoPath);
+  // Asked before the backfill, which keeps origin/HEAD's branch unmarked: a
+  // stale symref there would stamp the real default's local branch `pr`.
+  const remoteDefault = fetchedDefault === true && repoPath ? await remoteDefaultNow(execFile, repoPath) : '';
   await backfillUnmarkedPrBranches(execFile, repoPath, { currentBranch, skipBranch: branch });
   const fullRef = await resolvedStartRef(execFile, repoPath, startPoint);
   const originUrl = repoPath ? await remoteUrl(execFile, repoPath, 'origin') : '';
@@ -243,9 +297,9 @@ async function markOwnCheckout({ worktreePath, branch, repoPath, startPoint }, {
       upstreamRemoteUrl = await remoteUrl(execFile, repoPath, remoteName);
     }
   }
-  if (!startRefAttestsOwn(fullRef, { originUrl, upstreamRemoteUrl, checkout, upstreamMerge, upstreamRef, currentBranch })) {
-    return { marked: false, reason: 'start' };
-  }
+  const attests = startRefAttestsOwn(fullRef, { originUrl, upstreamRemoteUrl, checkout, upstreamMerge, upstreamRef, currentBranch })
+    || fetchedDefaultAttestsOwn(fullRef, remoteDefault, { originUrl, checkout, upstreamMerge, upstreamRef });
+  if (!attests) return { marked: false, reason: 'start' };
 
   const key = `branch.${branch}.termagCheckout`;
   const existing = await configGet(execFile, worktreePath, key);

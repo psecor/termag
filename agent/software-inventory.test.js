@@ -40,6 +40,41 @@ test('orchestrator probes parse nginx, envoy and otelcol', () => {
   assert.deepStrictEqual(out.map(e => e.version), ['1.24.0', '1.32.1', '0.161.0']);
 });
 
+test('reads the version from the first line that has one, so a notice ahead of it is no longer unknown', () => {
+  const out = parseProbeOutput('@@cursor-agent\t/home/u/.local/bin/cursor-agent\tUpdating Cursor Agent, please wait\x1f2026.10.22-27dcf5f\n@@node\t/usr/bin/node\t(node:12) Warning: something\x1fv24.22.1\n', PROBES);
+  const byName = Object.fromEntries(out.map(e => [e.name, e]));
+  assert.deepStrictEqual([byName['cursor-agent'].ok, byName['cursor-agent'].version, byName['cursor-agent'].raw], [true, '2026.10.22-27dcf5f', '2026.10.22-27dcf5f']);
+  assert.deepStrictEqual([byName.node.version, byName.node.raw], ['24.22.1', 'v24.22.1']);
+  // No line has one: unknown as before, with the first line to hover.
+  const odd = parseProbeOutput('@@cursor-agent\t/x/cursor-agent\tPress any key\x1fto log in\n', PROBES).find(e => e.name === 'cursor-agent');
+  assert.deepStrictEqual([odd.ok, odd.version, odd.raw], [false, null, 'Press any key']);
+});
+
+test('the probe keeps five lines of each tool\'s output, one record per tool', () => {
+  const s = probeScript(PROBES);
+  assert.match(s, /head -n 5 \| tr -d '\\r\\t' \| tr '\\n' '\\037'/);
+});
+
+test('a notice that mentions a date or another build never takes the version line\'s place', () => {
+  const out = parseProbeOutput('@@cursor-agent\t/x/cursor-agent\tUpdate available: 2026.10.30-1a2b3c4 (run cursor-agent update)\x1fMigrating config from 2026.09.01\x1f2026.10.22-27dcf5f\n@@gh\t/usr/bin/gh\tgh version 2.103.3 (2026-10-26)\x1fhttps://github.com/cli/cli/releases/tag/v2.103.3\n', PROBES);
+  const by = Object.fromEntries(out.map(e => [e.name, e]));
+  assert.equal(by['cursor-agent'].version, '2026.10.22-27dcf5f');
+  assert.equal(by['cursor-agent'].raw, '2026.10.22-27dcf5f');
+  assert.equal(by.gh.version, '2.103.3');
+});
+
+test('the real probe reads a tool that prints a notice ahead of its version', () => {
+  const fs = require('fs'); const os = require('os'); const path = require('path'); const { execFileSync } = require('child_process');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'inv-'));
+  fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
+  const bin = path.join(home, '.local/bin/cursor-agent');
+  fs.writeFileSync(bin, '#!/bin/sh\necho "Finishing the switch to the new agent host" >&2\necho "2026.10.22-27dcf5f"\n', { mode: 0o755 });
+  const probes = PROBES.filter(p => p.name === 'cursor-agent');
+  const out = execFileSync('bash', ['-c', probeScript(probes)], { env: { HOME: home, PATH: '/usr/bin:/bin' } }).toString();
+  assert.deepStrictEqual(parseProbeOutput(out, probes).map(e => [e.ok, e.version, e.path]), [[true, '2026.10.22-27dcf5f', bin]]);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test('the script only ever contains the fixed probes', () => {
   const s = probeScript(PROBES);
   for (const p of PROBES) assert.ok(s.includes(`probe ${p.name} ${p.cmd}`));

@@ -75,6 +75,12 @@ common operational tasks.>
 <Optional. APIs, webhooks, real-time events, anything other projects
 consume. Tabular: event/endpoint, payload shape, when emitted.>
 
+## Overlapping work
+
+On a termag box, read the `termag-overlap` skill (`~/.claude/skills/termag-overlap/SKILL.md`) when you
+start planning a task and before you open a PR. It lists open PRs and recent commits on the default
+branch that touch the same files, flags or names, so you can tell the user before building something twice.
+
 ## Sharing files
 
 On a termag box, read the `termag-spaces` skill (`~/.claude/skills/termag-spaces/SKILL.md`) before sharing

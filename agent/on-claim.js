@@ -57,4 +57,34 @@ function createStatusForwarder({ read, send, isOpen }) {
   };
 }
 
-module.exports = { planOnClaim, renderOnClaimEnv, createStatusForwarder };
+/**
+ * What to do with a deferred claim once GitHub reaches the box through termag
+ * (credentials-apply github). The box-claim RPC starts the run before the
+ * orchestrator delivers the broker's gitconfig, so a private repo's clone ran
+ * without it and the run ended skipped/needs-auth. With the rewrites in
+ * place the same run succeeds, and the runner skips a checkout it already
+ * applied, so repeating it is safe.
+ *
+ *   wait   a run is in flight; it may still end needs-auth
+ *   start  the last run ended needs-auth and there is a URL to retry
+ *   none   no URL, no run yet, or a run that was not waiting for GitHub
+ */
+function planOnClaimRetry({ hasUrl, unitState, status }) {
+  if (!hasUrl) return 'none';
+  if (unitState === 'active' || unitState === 'activating') return 'wait';
+  if (status && typeof status === 'object' && status.state === 'skipped' && status.reason === 'needs-auth') return 'start';
+  return 'none';
+}
+
+// One deferred rerun per GitHub connection the orchestrator delivers. Every
+// reconnect redelivers the same connection, so the broker and login alone
+// would make the rerun after a token the owner replaced on the Credentials
+// page, or after an org the recheck found newly authorized, look like a
+// repeat. Those arrive with the credential's later updatedAt, so it is part
+// of the key. An orchestrator that sends none gets the broker and login.
+function onClaimRetryKey(payload) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  return [p.broker, p.login, p.updatedAt].map(v => (v == null ? '' : String(v))).join('|');
+}
+
+module.exports = { planOnClaim, planOnClaimRetry, onClaimRetryKey, renderOnClaimEnv, createStatusForwarder };

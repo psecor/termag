@@ -363,6 +363,19 @@ test('spawn_agent sends its own session and HEAD with the task, and reports wher
   assert.match(text, /workstream=add-tests/);
 });
 
+test('spawn_agent passes a branch through', async () => {
+  const created = {
+    spawn: { id: 'ck1', relationship: 'delegate', state: 'running' },
+    project: { id: 'p1', name: 'proj' }, workstream: 'skz-ABC-1-fix', session: 'me-proj-skz-ABC-1-fix-agent', launched: true,
+  };
+  const { srv, calls } = server((p, init) => (p === '/termag/api/spawns' && init.method === 'POST' ? [201, created] : null), {
+    ownSession: () => 'me-proj-agent',
+    head: () => 'abc1234',
+  });
+  await srv.callTool('spawn_agent', { task: 'Fix it', branch: 'skz/ABC-1/fix' });
+  assert.equal(calls[0].body.branch, 'skz/ABC-1/fix');
+});
+
 test('spawn_agent refuses outside tmux and when switched off, without calling the backend', async () => {
   const { srv, calls } = server(() => null);
   await assert.rejects(srv.callTool('spawn_agent', { task: 't' }), /inside a termag tmux pane/);

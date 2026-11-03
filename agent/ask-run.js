@@ -22,6 +22,10 @@ const path = require('path');
 
 const CAPABILITIES = ['ask-v1', 'ask-cancel-v1'];
 const RUNNER = 'termag-subagent-run';
+// A runner that clones normally and lets the run push
+// says so in a line of its header; the capability is announced only then.
+const PUSH_CAPABILITY = 'ask-push-v1';
+const PUSH_MARKER = 'Pushes: ask-push-v1';
 
 const ID = /^[a-z0-9]{8,40}$/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -45,6 +49,16 @@ function askRunnerInstalled(home, fsImpl = fs) {
   }
 }
 
+function askPushCapable(home, fsImpl = fs) {
+  if (!askRunnerInstalled(home, fsImpl)) return false;
+  try { return fsImpl.readFileSync(runnerPath(home), 'utf8').includes(PUSH_MARKER); } catch { return false; }
+}
+
+// The thread's branch an ask-push-v1 job names: a git branch name with nothing a
+// shell or URL reads twice (backend agentMessages.ts isPushBranch).
+const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)[A-Za-z0-9._/-]{1,200}$/;
+const isPushBranch = b => BRANCH.test(b) && !b.endsWith('/') && !b.endsWith('.');
+
 /** The job file's content, or a thrown Error naming the bad field. */
 function buildJob(msg, cwd) {
   const str = (v) => (typeof v === 'string' ? v : '');
@@ -55,6 +69,7 @@ function buildJob(msg, cwd) {
   if (msg.baseSha != null && !SHA.test(str(msg.baseSha))) throw new Error('baseSha is not a commit');
   if (msg.resumeSessionId != null && !SESSION.test(str(msg.resumeSessionId))) throw new Error('resumeSessionId is malformed');
   if (!str(msg.gitEmail).includes('@')) throw new Error('gitEmail required');
+  if (msg.pushBranch != null && !isPushBranch(str(msg.pushBranch))) throw new Error('pushBranch is not a branch name');
   return {
     runId: msg.runId,
     threadId: msg.threadId,
@@ -65,6 +80,7 @@ function buildJob(msg, cwd) {
     systemPrompt: str(msg.systemPrompt),
     gitName: str(msg.gitName).replace(/[\r\n<>]/g, ' ').trim() || msg.gitEmail,
     gitEmail: msg.gitEmail.replace(/[\r\n<>\s]/g, ''),
+    ...(msg.pushBranch ? { pushBranch: msg.pushBranch } : {}),
   };
 }
 
@@ -141,4 +157,4 @@ function cancelAskRun(msg, deps) {
   return { stopped: true, pid: st.pid };
 }
 
-module.exports = { CAPABILITIES, RUNNER, runnerPath, stateDir, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun };
+module.exports = { CAPABILITIES, PUSH_CAPABILITY, PUSH_MARKER, RUNNER, runnerPath, stateDir, askRunnerInstalled, askPushCapable, isPushBranch, buildJob, startAskRun, askRunStatus, cancelAskRun };

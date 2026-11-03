@@ -4,7 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { planOnClaim, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
+const { planOnClaim, planOnClaimRetry, onClaimRetryKey, renderOnClaimEnv, createStatusForwarder } = require('./on-claim');
 
 test('renderOnClaimEnv quotes the owner and the repo and carries no token', () => {
   const env = renderOnClaimEnv({
@@ -38,6 +38,37 @@ test('planOnClaim starts only when there is work and nothing has finished', () =
     planOnClaim({ unitState: 'active', hasWork: true }),
     { write: false, start: false },
   );
+});
+
+test('planOnClaimRetry reruns only a claim that ended waiting for GitHub', () => {
+  const needsAuth = { state: 'skipped', reason: 'needs-auth' };
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: needsAuth }), 'start');
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'failed', status: needsAuth }), 'start');
+  // No repo was ever saved: GitHub arriving changes nothing.
+  assert.equal(planOnClaimRetry({ hasUrl: false, unitState: 'inactive', status: needsAuth }), 'none');
+  // The claim's own run is still cloning; its result is not in yet.
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'active', status: { state: 'running' } }), 'wait');
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'activating', status: null }), 'wait');
+  // Finished runs that were not waiting for GitHub are left alone.
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: { state: 'succeeded' } }), 'none');
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: { state: 'failed', reason: 'script-failed' } }), 'none');
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: { state: 'skipped', reason: 'no-dotfiles' } }), 'none');
+  // A box that never ran a claim has no status file.
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: null }), 'none');
+  assert.equal(planOnClaimRetry({ hasUrl: true, unitState: 'inactive', status: 'garbage' }), 'none');
+});
+
+test('onClaimRetryKey tells a replaced token from a redelivered one', () => {
+  const first = { broker: 'https://agent.termag.example.com', login: 'ada', updatedAt: '2026-10-28T10:00:00.000Z' };
+  // A reconnect delivers the same connection again: same key, so the cooldown holds.
+  assert.equal(onClaimRetryKey({ ...first }), onClaimRetryKey(first));
+  // The Credentials page stored a new token, or the recheck found a new org: a new key.
+  assert.notEqual(onClaimRetryKey({ ...first, updatedAt: '2026-10-28T10:05:00.000Z' }), onClaimRetryKey(first));
+  assert.notEqual(onClaimRetryKey({ ...first, login: 'grace' }), onClaimRetryKey(first));
+  // An orchestrator that sends no updatedAt still keys on the broker and login.
+  assert.equal(onClaimRetryKey({ broker: 'b', login: 'ada' }), 'b|ada|');
+  assert.equal(onClaimRetryKey(null), '||');
+  assert.equal(onClaimRetryKey('garbage'), '||');
 });
 
 // A socket and a status file the test controls.

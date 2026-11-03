@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { CAPABILITIES, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun, runnerPath } = require('./ask-run');
+const { CAPABILITIES, PUSH_CAPABILITY, askPushCapable, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun, runnerPath } = require('./ask-run');
 
 let home;
 let cwd;
@@ -54,6 +54,25 @@ test('buildJob checks every field and cleans the git identity', () => {
   assert.equal(job.gitName, 'Alice Evil');
   assert.equal(job.baseSha, 'a'.repeat(40));
   assert.equal(job.resumeSessionId, 'abc-1');
+});
+
+test('buildJob keeps a pushBranch only when it is a branch name (ask-push-v1)', () => {
+  assert.equal(buildJob(msg(), cwd).pushBranch, undefined);
+  assert.equal(buildJob(msg({ pushBranch: 'termag-ada/thr0000000001' }), cwd).pushBranch, 'termag-ada/thr0000000001');
+  for (const bad of ['../x', '-x', 'a//b', 'x.lock', 'a b', 'x/', '$(id)', 'a;b']) {
+    assert.throws(() => buildJob(msg({ pushBranch: bad }), cwd), /pushBranch/, bad);
+  }
+});
+
+test('announces ask-push-v1 only for a runner that says it pushes', () => {
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-push-'));
+  assert.equal(askPushCapable(h), false);
+  fs.mkdirSync(path.dirname(runnerPath(h)), { recursive: true });
+  fs.writeFileSync(runnerPath(h), '#!/bin/sh\n# Phases: ask-chat-v1\n', { mode: 0o755 });
+  assert.equal(askPushCapable(h), false);
+  fs.writeFileSync(runnerPath(h), '#!/bin/sh\n# Pushes: ask-push-v1\n', { mode: 0o755 });
+  assert.equal(askPushCapable(h), true);
+  assert.equal(PUSH_CAPABILITY, 'ask-push-v1');
 });
 
 test('startAskRun writes a private job file and starts the runner detached', () => {
