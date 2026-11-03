@@ -28,6 +28,7 @@
 # Defaults:
 #   box      TERMAG_BOX_ID, else the EC2 instance id from IMDS, else the
 #            short hostname
+#   ask      TERMAG_ASK_THREAD (an ask run sets it), else none
 #   project  TERMAG_PROJECT, else the <name> in .../termag/projects/<name>/
 #            of the working directory (a workstream's .worktrees/<ws> below
 #            it included), else the git checkout's directory name
@@ -40,7 +41,7 @@ END='<!-- TERMAG_PR_BODY_END -->'
 
 box=${TERMAG_BOX_ID:-}
 project=${TERMAG_PROJECT:-}
-ask=''
+ask=${TERMAG_ASK_THREAD:-}
 file='-'
 while [ $# -gt 0 ]; do
   case $1 in

@@ -1,0 +1,28 @@
+# Claude Code update run %i on the orchestrator host:
+#
+# deploy/claude-orchestrator-update --run as root, from its root-owned copy.
+# Started by /usr/local/libexec/termag/claude-orchestrator-update-start, which
+# the backend (termag) runs through sudo for the Software tab's orchestrator
+# row and the nightly run; installed by packer/scripts/orchestrator-setup.sh.
+# One instance per run id: a run cannot run twice at once.
+[Unit]
+Description=termag: update the orchestrator host's Claude Code, run %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/termag/claude-orchestrator-update --run %i
+# 1 (below the floor, a failed install, STALE or DOWN) and 3 (an install
+# rejected) are outcomes the run has recorded, not unit failures.
+SuccessExitStatus=0 1 3
+# The run's own budget is 600 s plus the restart wait; this only backs it up.
+TimeoutStartSec=900
+Nice=10
+# ProtectHome makes root's home read-only, so npm's cache (and its logs) go
+# to a cache directory systemd creates; without it every install is EROFS.
+CacheDirectory=claude-orchestrator-update
+Environment=npm_config_cache=/var/cache/claude-orchestrator-update/npm
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

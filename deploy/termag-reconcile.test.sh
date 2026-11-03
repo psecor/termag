@@ -16,13 +16,19 @@
 #     does not wait on the theme picker; the trust prompt is left alone
 #   * pi gets the same server in ~/.pi/agent/mcp.json, with no approvals merge
 #     (pi runs tool calls without prompting, so there is nothing to allow-list)
+#   * Devin's status hooks are merged into ~/.config/devin/config.json the same
+#     additive way: termag-status entries replaced per event, the rest kept
 #   * enable=enable units get their default.target.wants symlink, and that is
 #     checked independently of file content -- the whole point, since a box built
 #     before this script existed has the right unit files and no symlinks
 #   * the termag CLI is installed through cli/install.sh only when its --check
 #     reports drift, and a failed install does not fail the run
+#   * so is the t3 server, through deploy/termag-t3-install, bounded by
+#     TERMAG_T3_INSTALL_TIMEOUT
 #   * the box-update service and script are installed; the service is not
 #     enabled (the orchestrator starts it over the agent's box-update RPC)
+#   * the Claude Code updater, its floor file and its boot unit are installed,
+#     and the boot unit is enabled (it runs at every boot, before the agent)
 #   * the retired ask sandbox: the old setup and exec scripts are removed;
 #     the termag-subagent user and its root go only with sudo -n and no
 #     process of the user running; --check reports them and changes nothing;
@@ -31,6 +37,9 @@
 #     box: --check reports its drift and applies nothing; a host, a box
 #     without passwordless sudo, or a checkout without the script is no drift;
 #     a failed setup is reported and does not fail the run
+#   * so does the terminfo setup (deploy/termag-terminfo-setup), the same way
+#   * ~/.local and ~/.local/state lose group and other write (created when
+#     missing); nothing else about their mode changes, and --check only reports
 #
 # `systemctl` is stubbed: the real one would reach this user's actual manager.
 #
@@ -64,6 +73,13 @@ TERMAG_ASK_SANDBOX_SUDO=false; export TERMAG_ASK_SANDBOX_ROOT TERMAG_ASK_SANDBOX
 # Nor does the guest browser setup: no sudo, and not a box.
 TERMAG_GUEST_BROWSER_SUDO=false; TERMAG_GUEST_BROWSER_BOX_MARKER="$WORK/no-box-marker"
 export TERMAG_GUEST_BROWSER_SUDO TERMAG_GUEST_BROWSER_BOX_MARKER
+# Nor the terminfo setup.
+TERMAG_TERMINFO_SUDO=false; TERMAG_TERMINFO_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_TERMINFO_SUDO TERMAG_TERMINFO_BOX_MARKER
+TERMAG_GH_UPDATE_SUDO=false; TERMAG_GH_UPDATE_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_GH_UPDATE_SUDO TERMAG_GH_UPDATE_BOX_MARKER
+TERMAG_AWS_UPDATE_SUDO=false; TERMAG_AWS_UPDATE_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_AWS_UPDATE_SUDO TERMAG_AWS_UPDATE_BOX_MARKER
 
 # Record daemon-reload calls instead of issuing them.
 cat > "$STUB/systemctl" <<'STUBEOF'
@@ -113,11 +129,35 @@ seed_source pi-skills/termag-spaces/SKILL.md     'v1-pi-spaces-skill'
 mkdir -p "$CHECKOUT/deploy/claude-skills/termag-handoff" "$CHECKOUT/deploy/pi-skills/termag-handoff"
 seed_source claude-skills/termag-handoff/SKILL.md 'v1-handoff-skill'
 seed_source pi-skills/termag-handoff/SKILL.md     'v1-pi-handoff-skill'
+seed_source termag-overlap               'v1-overlap'
+mkdir -p "$CHECKOUT/deploy/claude-skills/termag-overlap" "$CHECKOUT/deploy/pi-skills/termag-overlap"
+seed_source claude-skills/termag-overlap/SKILL.md 'v1-overlap-skill'
+seed_source pi-skills/termag-overlap/SKILL.md     'v1-pi-overlap-skill'
+mkdir -p "$CHECKOUT/deploy/claude-skills/termag-bug-report" "$CHECKOUT/deploy/pi-skills/termag-bug-report"
+seed_source claude-skills/termag-bug-report/SKILL.md 'v1-bug-report-skill'
+seed_source pi-skills/termag-bug-report/SKILL.md     'v1-pi-bug-report-skill'
 mkdir -p "$CHECKOUT/deploy/claude-skills/agent-orchestrator"
 seed_source claude-skills/agent-orchestrator/SKILL.md 'v1-orchestrator-skill'
 seed_source termag-pi-fireworks          'v1-pi-fireworks'
 seed_source termag-agent-otel            'v1-agent-otel'
 seed_source termag-claude-runner         'v1-claude-runner'
+seed_source termag-claude-update         'v1-claude-update'
+seed_source claude-code-floor            '2.1.308'
+seed_source termag-bash-env              'v1-bash-env'
+seed_source termag-claude-update-boot.service 'v1-claude-update-boot-unit'
+seed_source 'termag-claude-update@.service' 'v1-claude-update-run-unit'
+seed_source termag-tool-update-lib       'v1-tool-update-lib'
+seed_source termag-codex-update          'v1-codex-update'
+seed_source 'termag-codex-update@.service' 'v1-codex-update-run-unit'
+seed_source termag-cursor-update         'v1-cursor-update'
+seed_source 'termag-cursor-update@.service' 'v1-cursor-update-run-unit'
+seed_source termag-devin-update          'v1-devin-update'
+seed_source 'termag-devin-update@.service' 'v1-devin-update-run-unit'
+seed_source termag-pi-update             'v1-pi-update'
+seed_source 'termag-pi-update@.service'  'v1-pi-update-run-unit'
+seed_source termag-node-update           'v1-node-update'
+seed_source 'termag-node-update@.service' 'v1-node-update-run-unit'
+seed_source termag-node-release-keys.asc 'v1-node-release-keys'
 seed_source termag-briefing              'v1-briefing'
 mkdir -p "$CHECKOUT/deploy/pi-ext"
 seed_source pi-ext/termag-status.ts      'v1-pi-ext'
@@ -130,7 +170,7 @@ seed_source claude-runner-hooks/post-session 'v1-hook-post-session'
 
 # ── --list ──────────────────────────────────────────────────────────────────
 got="$(run --list | wc -l | tr -d ' ')"
-[ "$got" = 40 ] || fail '--list prints every artifact' 40 "$got"
+[ "$got" = 63 ] || fail '--list prints every artifact' 63 "$got"
 
 # ── no checkout is not an error ─────────────────────────────────────────────
 out="$(HOME="$HOME_DIR" TERMAG_CHECKOUT="$WORK/absent" PATH="$STUB:$PATH" "$SCRIPT" 2>&1)"
@@ -152,6 +192,23 @@ for f in "$HOME_DIR/.config/systemd/user/termag-agent.service" \
          "$HOME_DIR/.local/bin/termag-hooks-update" \
          "$HOME_DIR/.local/bin/termag-pi-fireworks" \
          "$HOME_DIR/.local/bin/termag-claude-runner" \
+         "$HOME_DIR/.local/bin/termag-claude-update" \
+         "$HOME_DIR/.local/share/termag/claude-code-floor" \
+         "$HOME_DIR/.local/share/termag/bash-env" \
+         "$HOME_DIR/.config/systemd/user/termag-claude-update-boot.service" \
+         "$HOME_DIR/.config/systemd/user/termag-claude-update@.service" \
+         "$HOME_DIR/.local/bin/termag-tool-update-lib" \
+         "$HOME_DIR/.local/bin/termag-codex-update" \
+         "$HOME_DIR/.config/systemd/user/termag-codex-update@.service" \
+         "$HOME_DIR/.local/bin/termag-cursor-update" \
+         "$HOME_DIR/.config/systemd/user/termag-cursor-update@.service" \
+         "$HOME_DIR/.local/bin/termag-devin-update" \
+         "$HOME_DIR/.config/systemd/user/termag-devin-update@.service" \
+         "$HOME_DIR/.local/bin/termag-pi-update" \
+         "$HOME_DIR/.config/systemd/user/termag-pi-update@.service" \
+         "$HOME_DIR/.local/bin/termag-node-update" \
+         "$HOME_DIR/.config/systemd/user/termag-node-update@.service" \
+         "$HOME_DIR/.local/share/termag/termag-node-release-keys.asc" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-status.ts" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-status-core.ts" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-otel.ts" \
@@ -168,6 +225,21 @@ got="$(stat -c %a "$HOME_DIR/.config/systemd/user/termag-agent.service" 2>/dev/n
 [ "$got" = 644 ] || fail 'unit installed 644' 644 "$got"
 got="$(stat -c %a "$HOME_DIR/.local/bin/termag-status" 2>/dev/null)"
 [ "$got" = 755 ] || fail 'script installed 755' 755 "$got"
+got="$(stat -c %a "$HOME_DIR/.local/bin/termag-claude-update" 2>/dev/null)"
+[ "$got" = 755 ] || fail 'the Claude Code updater installed 755' 755 "$got"
+got="$(stat -c %a "$HOME_DIR/.local/share/termag/claude-code-floor" 2>/dev/null)"
+[ "$got" = 644 ] || fail 'the Claude Code floor installed 644' 644 "$got"
+got="$(stat -c %a "$HOME_DIR/.local/bin/termag-codex-update" 2>/dev/null)"
+[ "$got" = 755 ] || fail 'the Codex updater installed 755' 755 "$got"
+# Sourced, never run: not executable, though it sits in ~/.local/bin beside its callers.
+got="$(stat -c %a "$HOME_DIR/.local/bin/termag-tool-update-lib" 2>/dev/null)"
+[ "$got" = 644 ] || fail 'the shared updater lib installed 644' 644 "$got"
+# Ahead of its callers, so a reconcile that stops halfway never leaves a new updater on an old lib.
+lib_at=$(run --list | grep -n '^termag-tool-update-lib:' | cut -d: -f1)
+upd_at=$(run --list | grep -n '^termag-claude-update:' | cut -d: -f1)
+[ -n "$lib_at" ] && [ -n "$upd_at" ] && [ "$lib_at" -lt "$upd_at" ] || fail 'the shared lib is installed before the updaters' "lib before claude-update" "lib $lib_at, claude-update $upd_at"
+got="$(stat -c %a "$HOME_DIR/.local/share/termag/bash-env" 2>/dev/null)"
+[ "$got" = 644 ] || fail 'the Bash tool BASH_ENV file installed 644 (sourced, not run)' 644 "$got"
 
 # A unit changed, so exactly one daemon-reload should have been issued.
 got="$(grep -c 'daemon-reload' "$RELOAD_LOG" 2>/dev/null)"
@@ -242,7 +314,8 @@ esac
 WANTS="$HOME_DIR/.config/systemd/user/default.target.wants"
 
 # The enable=enable units must be linked; the noenable ones must not.
-for u in termag-reconcile.service; do
+# The Claude Code boot update runs at every boot, so it is enabled too.
+for u in termag-reconcile.service termag-claude-update-boot.service; do
   got="$(readlink "$WANTS/$u" 2>/dev/null)"
   [ "$got" = "../$u" ] || fail "enables $u" "../$u" "${got:-(no symlink)}"
 done
@@ -257,6 +330,25 @@ if [ -e "$WANTS/termag-box-update.service" ]; then
 fi
 if [ -e "$WANTS/termag-project-clone@.service" ]; then
   fail 'does not enable termag-project-clone@.service' '(no symlink)' 'symlink present'
+fi
+# The Claude Code run unit is a template the agent starts per orchestrator run.
+if [ -e "$WANTS/termag-claude-update@.service" ]; then
+  fail 'does not enable termag-claude-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-codex-update@.service" ]; then
+  fail 'does not enable termag-codex-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-cursor-update@.service" ]; then
+  fail 'does not enable termag-cursor-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-devin-update@.service" ]; then
+  fail 'does not enable termag-devin-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-pi-update@.service" ]; then
+  fail 'does not enable termag-pi-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-node-update@.service" ]; then
+  fail 'does not enable termag-node-update@.service' '(no symlink)' 'symlink present'
 fi
 # Enabling this one would be wrong rather than merely surprising: the backend
 # starts it through the agent so the on-claim credential is minted immediately
@@ -332,6 +424,12 @@ got="$(cat "$HOME_DIR/.claude/skills/termag-spaces/SKILL.md" "$HOME_DIR/.pi/agen
 [ "$got" = 'v1-spaces-skill v1-pi-spaces-skill ' ] || fail 'spaces skills installed' 'v1-spaces-skill v1-pi-spaces-skill' "$got"
 got="$(cat "$HOME_DIR/.claude/skills/termag-handoff/SKILL.md" "$HOME_DIR/.pi/agent/skills/termag-handoff/SKILL.md" 2>/dev/null | tr '\n' ' ')"
 [ "$got" = 'v1-handoff-skill v1-pi-handoff-skill ' ] || fail 'handoff skills installed' 'v1-handoff-skill v1-pi-handoff-skill' "$got"
+got="$(stat -c %a "$HOME_DIR/.local/bin/termag-overlap" 2>/dev/null)"
+[ "$got" = 755 ] || fail 'termag-overlap installed 755' 755 "$got"
+got="$(cat "$HOME_DIR/.claude/skills/termag-overlap/SKILL.md" "$HOME_DIR/.pi/agent/skills/termag-overlap/SKILL.md" 2>/dev/null | tr '\n' ' ')"
+[ "$got" = 'v1-overlap-skill v1-pi-overlap-skill ' ] || fail 'overlap skills installed' 'v1-overlap-skill v1-pi-overlap-skill' "$got"
+got="$(cat "$HOME_DIR/.claude/skills/termag-bug-report/SKILL.md" "$HOME_DIR/.pi/agent/skills/termag-bug-report/SKILL.md" 2>/dev/null | tr '\n' ' ')"
+[ "$got" = 'v1-bug-report-skill v1-pi-bug-report-skill ' ] || fail 'bug-report skills installed' 'v1-bug-report-skill v1-pi-bug-report-skill' "$got"
 got="$(cat "$HOME_DIR/.claude/skills/agent-orchestrator/SKILL.md" 2>/dev/null)"
 [ "$got" = 'v1-orchestrator-skill' ] || fail 'orchestrator skill installed for Claude Code' 'v1-orchestrator-skill' "$got"
 got="$(stat -c %a "$HOME_DIR/.claude/skills/agent-orchestrator/SKILL.md" 2>/dev/null)"
@@ -610,6 +708,25 @@ esac
 got="$(jq -c '.mcpServers.metaterm.env.METATERM_SEND_KEYS_DEFAULT' "$HOME_DIR/.pi/agent/mcp.json")"
 [ "$got" = '"on"' ] || fail '--check does not rewrite pi drift' 'unchanged' "$got"
 
+# termag-credentials writes the MCP connectors into the same file under its
+# lock (mcp-broker-v2): reconcile waits for it there too.
+if command -v flock >/dev/null 2>&1; then
+  printf '%s\n' '{"mcpServers":{}}' > "$HOME_DIR/.pi/agent/mcp.json"
+  # Long enough to outlast the ~/.claude.json merges' own waits before pi's.
+  flock "$HOME_DIR/.config/termag/claude-json.lock" sleep 8 &
+  holder=$!
+  sleep 0.5
+  out="$(TERMAG_CLAUDE_JSON_LOCK_WAIT=1 run 2>&1)"
+  case "$out" in
+    *'held its lock too long; not adding MetaTerm MCP server (pi)'*) : ;;
+    *) fail "reconcile gives up on a held lock for pi's mcp.json" 'held its lock too long' "$out" ;;
+  esac
+  got="$(jq -c '.mcpServers.metaterm' "$HOME_DIR/.pi/agent/mcp.json")"
+  [ "$got" = null ] || fail "reconcile writes nothing to pi's mcp.json while the lock is held" null "$got"
+  wait "$holder"
+  run >/dev/null 2>&1
+fi
+
 # Unparseable pi config is skipped, not replaced.
 printf 'not json\n' > "$HOME_DIR/.pi/agent/mcp.json"
 out="$(run 2>&1)"
@@ -633,6 +750,61 @@ got="$(jq -c '[.mcpServers.metaterm.type, .mcpServers.metaterm.env.METATERM_SEND
 [ "$got" = '["stdio","off","https://example.com/mcp"]' ] || fail 'heals a scalar metaterm entry' 'canonical' "$got"
 got="$(stat -c %a "$HOME_DIR/.pi/agent/mcp.json")"
 [ "$got" = 640 ] || fail 'keeps the pi mcp.json mode across a heal' 640 "$got"
+
+# ── Devin's status hooks (deploy/devin-hooks.json → ~/.config/devin/config.json) ──
+DEVCFG="$HOME_DIR/.config/devin/config.json"
+rm -f "$DEVCFG"
+run >/dev/null 2>&1
+[ ! -e "$DEVCFG" ] || fail 'no Devin hooks without the canonical file (older checkout)' 'no config.json' "$(cat "$DEVCFG")"
+
+cp "$(dirname "$SCRIPT")/devin-hooks.json" "$CHECKOUT/deploy/devin-hooks.json"
+run >/dev/null 2>&1
+got="$(jq -cS '.hooks' "$DEVCFG")"
+want="$(jq -cS '.hooks' "$CHECKOUT/deploy/devin-hooks.json")"
+[ "$got" = "$want" ] || fail 'creates the Devin config holding the canonical hooks' "$want" "$got"
+got="$(stat -c %a "$DEVCFG")"
+[ "$got" = 600 ] || fail 'creates ~/.config/devin/config.json 0600' 600 "$got"
+out="$(run 2>&1)"
+[ -z "$out" ] || fail 'merged Devin hooks are silent next boot' '(no output)' "$out"
+
+# The owner's config survives: Devin's own keys, an owner hook on a termag
+# event and on another event. A stale termag-status entry is replaced, not
+# duplicated. Mode kept.
+printf '%s\n' '{"version":1,"permissions":{"allow":["Exec(git)"]},"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"notify-send done"}]},{"matcher":"","hooks":[{"type":"command","command":"$HOME/.local/bin/termag-status idle"}]}],"PreCompact":[{"matcher":"","hooks":[{"type":"command","command":"mine"}]}]}}' > "$DEVCFG"
+chmod 640 "$DEVCFG"
+run >/dev/null 2>&1
+got="$(jq -c '[.version, .permissions.allow, .hooks.PreCompact[0].hooks[0].command, (.hooks.Stop | map(.hooks[0].command | test("termag-status")))]' "$DEVCFG")"
+[ "$got" = '[1,["Exec(git)"],"mine",[false,true]]' ] || fail "keeps the owner's Devin config, replaces the stale termag entry" '[1,[Exec(git)],mine,[false,true]]' "$got"
+got="$(jq -r '.hooks.Stop[1].hooks[0].command' "$DEVCFG")"
+case "$got" in *'stop --source devin-hooks'*) : ;; *) fail 'the Stop entry is the canonical one' 'stop --source devin-hooks' "$got" ;; esac
+got="$(stat -c %a "$DEVCFG")"
+[ "$got" = 640 ] || fail 'keeps the Devin config mode' 640 "$got"
+out="$(run 2>&1)"
+[ -z "$out" ] || fail 'a merged owner config is silent next boot' '(no output)' "$out"
+
+# A stale termag hook sharing a group with an owner hook goes alone; one under
+# an event devin-hooks.json no longer lists goes too, with the event it empties.
+printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"exec","hooks":[{"type":"command","command":"mine-pre"},{"type":"command","command":"termag-status working"}]}],"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"termag-status idle --source devin-hooks"}]}],"Notification":[{"matcher":"","hooks":[{"type":"command","command":"mine-note"},{"type":"command","command":"termag-status waiting --notify"}]}],"PreCompact":[]}}' > "$DEVCFG"
+run >/dev/null 2>&1
+got="$(jq -c '[(.hooks.PreToolUse | map(.hooks | map(.command | test("termag-status") | if . then "t" else "o" end) | join(""))), (.hooks | has("SessionStart")), (.hooks.Notification | map(.hooks[].command)), .hooks.PreCompact]' "$DEVCFG")"
+[ "$got" = '[["o","t"],false,["mine-note"],[]]' ] || fail 'drops termag hooks per hook and under every event' '[[o,t],false,[mine-note],[]]' "$got"
+
+# Drift is reported by --check and left alone.
+jq 'del(.hooks.SessionEnd)' "$DEVCFG" > "$DEVCFG.tmp" && mv "$DEVCFG.tmp" "$DEVCFG"
+out="$(run --check 2>&1)"
+case "$out" in *'DRIFT: termag status hooks (Devin)'*) : ;; *) fail '--check reports Devin hook drift' 'DRIFT (Devin)' "$out" ;; esac
+got="$(jq -c '.hooks.SessionEnd' "$DEVCFG")"
+[ "$got" = null ] || fail '--check does not rewrite Devin drift' null "$got"
+run >/dev/null 2>&1
+
+# Unparseable (e.g. JSONC with comments, which Devin accepts) is skipped, not replaced.
+printf '// mine\n{}\n' > "$DEVCFG"
+out="$(run 2>&1)"
+case "$out" in *'not valid JSON'*) : ;; *) fail 'says why it skipped an unparseable Devin config' 'not valid JSON' "$out" ;; esac
+got="$(cat "$DEVCFG")"
+[ "$got" = "$(printf '// mine\n{}')" ] || fail 'leaves an unparseable Devin config alone' '// mine {}' "$got"
+rm -f "$DEVCFG"
+run >/dev/null 2>&1
 
 # ── the retired ask sandbox ─────────────────────────────────────────────────
 mkdir -p "$CHECKOUT/deploy/claude-skills/agent-ask"
@@ -735,6 +907,105 @@ got=$?
 case "$out" in *'termag-reconcile: the guest browser setup failed'*) ;; *) fail 'says the guest setup failed' 'the guest browser setup failed' "$out" ;; esac
 rm -f "$CHECKOUT/deploy/termag-guest-browser-setup" "$GUEST_DRIFT" "$GUEST_FAILS"
 
+# ── the gh updater setup ────────────────────────────────────────────────────
+# A stand-in like the guest browser's: logs, drifts while $GHU_DRIFT exists.
+cat > "$CHECKOUT/deploy/termag-gh-update-setup" <<'SETUPEOF'
+echo "setup $*" >> "$GHU_LOG"
+case " $* " in
+  *" --check "*) [ -f "$GHU_DRIFT" ] && { echo 'DRIFT: /etc/sudoers.d/termag-gh-update is missing'; exit 1; }; exit 0 ;;
+esac
+echo 'installed: /etc/sudoers.d/termag-gh-update'
+rm -f "$GHU_DRIFT"
+SETUPEOF
+GHU_LOG="$WORK/ghu-log"; GHU_DRIFT="$WORK/ghu-drift"
+export GHU_LOG GHU_DRIFT
+touch "$WORK/box-marker" "$GHU_DRIFT"; : > "$GHU_LOG"
+ghu_run() { TERMAG_GH_UPDATE_BOX_MARKER="$WORK/box-marker" TERMAG_GH_UPDATE_SUDO="$STUB/fake-sudo" run "$@"; }
+TERMAG_GH_UPDATE_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+[ -s "$GHU_LOG" ] && fail 'the gh updater setup never runs off a box' 'empty log' "$(cat "$GHU_LOG")"
+out="$(ghu_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'the gh updater setup drift is drift' 1 "$got"
+case "$out" in *'DRIFT: gh updater: /etc/sudoers.d/termag-gh-update is missing'*) ;; *) fail '--check names the gh updater drift' 'DRIFT: gh updater: …' "$out" ;; esac
+grep -q "sudo bash $CHECKOUT/deploy/termag-gh-update-setup" "$SUDO_LOG" || fail 'the gh updater setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(ghu_run 2>&1)"
+case "$out" in *'reconciled: gh updater: installed: /etc/sudoers.d/termag-gh-update'*) ;; *) fail 'applies the gh updater setup' 'reconciled: gh updater: …' "$out" ;; esac
+grep -qx "setup --agent-user $(id -un)" "$GHU_LOG" || fail 'applies the gh updater setup for this user' "setup --agent-user $(id -un)" "$(cat "$GHU_LOG")"
+rm -f "$CHECKOUT/deploy/termag-gh-update-setup" "$GHU_DRIFT"
+
+# ── the aws updater setup ────────────────────────────────────────────────────
+# A stand-in like the guest browser's: logs, drifts while $AWSU_DRIFT exists.
+cat > "$CHECKOUT/deploy/termag-aws-update-setup" <<'SETUPEOF'
+echo "setup $*" >> "$AWSU_LOG"
+case " $* " in
+  *" --check "*) [ -f "$AWSU_DRIFT" ] && { echo 'DRIFT: /etc/sudoers.d/termag-aws-update is missing'; exit 1; }; exit 0 ;;
+esac
+echo 'installed: /etc/sudoers.d/termag-aws-update'
+rm -f "$AWSU_DRIFT"
+SETUPEOF
+AWSU_LOG="$WORK/awsu-log"; AWSU_DRIFT="$WORK/awsu-drift"
+export AWSU_LOG AWSU_DRIFT
+touch "$WORK/box-marker" "$AWSU_DRIFT"; : > "$AWSU_LOG"
+awsu_run() { TERMAG_AWS_UPDATE_BOX_MARKER="$WORK/box-marker" TERMAG_AWS_UPDATE_SUDO="$STUB/fake-sudo" TERMAG_AWS_UPDATE_CLI="$STUB/fake-sudo" run "$@"; }
+# A box without the AWS CLI (the minimal flavor): never run, and no drift (Bugbot on #1110).
+TERMAG_AWS_UPDATE_BOX_MARKER="$WORK/box-marker" TERMAG_AWS_UPDATE_SUDO="$STUB/fake-sudo" TERMAG_AWS_UPDATE_CLI="$WORK/no-aws" run --check >/dev/null 2>&1
+[ -s "$AWSU_LOG" ] && fail 'the aws updater setup never runs on a box without the AWS CLI' 'empty log' "$(cat "$AWSU_LOG")"
+TERMAG_AWS_UPDATE_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+[ -s "$AWSU_LOG" ] && fail 'the aws updater setup never runs off a box' 'empty log' "$(cat "$AWSU_LOG")"
+out="$(awsu_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'the aws updater setup drift is drift' 1 "$got"
+case "$out" in *'DRIFT: aws updater: /etc/sudoers.d/termag-aws-update is missing'*) ;; *) fail '--check names the aws updater drift' 'DRIFT: aws updater: …' "$out" ;; esac
+grep -q "sudo bash $CHECKOUT/deploy/termag-aws-update-setup" "$SUDO_LOG" || fail 'the aws updater setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(awsu_run 2>&1)"
+case "$out" in *'reconciled: aws updater: installed: /etc/sudoers.d/termag-aws-update'*) ;; *) fail 'applies the aws updater setup' 'reconciled: aws updater: …' "$out" ;; esac
+grep -qx "setup --agent-user $(id -un)" "$AWSU_LOG" || fail 'applies the aws updater setup for this user' "setup --agent-user $(id -un)" "$(cat "$AWSU_LOG")"
+rm -f "$CHECKOUT/deploy/termag-aws-update-setup" "$AWSU_DRIFT"
+
+# ── the terminfo setup ──────────────────────────────────────────────────────
+# A stand-in like the guest browser's: logs, drifts while $TI_DRIFT exists,
+# fails a real run while $TI_FAILS exists.
+cat > "$CHECKOUT/deploy/termag-terminfo-setup" <<'SETUPEOF'
+echo "terminfo $*" >> "$TI_LOG"
+case " $* " in
+  *" --check "*) [ -f "$TI_DRIFT" ] && { echo 'DRIFT: terminfo xterm-ghostty ghostty is missing or differs in /etc/terminfo'; exit 1; }; exit 0 ;;
+esac
+[ -f "$TI_FAILS" ] && { echo 'termag-terminfo-setup: tic -x could not install terminfo/ghostty.terminfo' >&2; exit 1; }
+echo 'installed: terminfo xterm-ghostty ghostty in /etc/terminfo'
+rm -f "$TI_DRIFT"
+SETUPEOF
+TI_LOG="$WORK/ti-log"; TI_DRIFT="$WORK/ti-drift"; TI_FAILS="$WORK/ti-fails"
+export TI_LOG TI_DRIFT TI_FAILS
+touch "$TI_DRIFT"; : > "$TI_LOG"; : > "$SUDO_LOG"
+ti_run() { TERMAG_TERMINFO_BOX_MARKER="$WORK/box-marker" TERMAG_TERMINFO_SUDO="$STUB/fake-sudo" run "$@"; }
+
+TERMAG_TERMINFO_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+got=$?
+[ "$got" = 0 ] || fail 'the terminfo setup is no drift off a box' 0 "$got"
+TERMAG_TERMINFO_BOX_MARKER="$WORK/box-marker" run --check >/dev/null 2>&1
+got=$?
+[ "$got" = 0 ] || fail 'the terminfo setup is no drift without sudo' 0 "$got"
+[ -s "$TI_LOG" ] && fail 'the terminfo setup never runs off a box or without sudo' 'empty log' "$(cat "$TI_LOG")"
+
+out="$(ti_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'missing terminfo is drift' 1 "$got"
+case "$out" in *'DRIFT: terminfo xterm-ghostty ghostty is missing'*) ;; *) fail '--check names the terminfo drift' 'DRIFT: terminfo …' "$out" ;; esac
+[ "$(cat "$TI_LOG")" = 'terminfo --check' ] || fail '--check only checks the terminfo' 'terminfo --check' "$(cat "$TI_LOG")"
+grep -q "sudo bash $CHECKOUT/deploy/termag-terminfo-setup" "$SUDO_LOG" || fail 'the terminfo setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(ti_run 2>&1)"
+case "$out" in *'reconciled: installed: terminfo xterm-ghostty ghostty in /etc/terminfo'*) ;; *) fail 'applies the terminfo setup' 'reconciled: installed: terminfo …' "$out" ;; esac
+ti_run --check >/dev/null 2>&1
+got=$?
+[ "$got" = 0 ] || fail 'installed terminfo is no drift' 0 "$got"
+
+touch "$TI_DRIFT" "$TI_FAILS"
+out="$(ti_run 2>&1)"
+got=$?
+[ "$got" = 0 ] || fail 'a failed terminfo setup does not fail the run' 0 "$got"
+case "$out" in *'termag-reconcile: the terminfo setup failed'*) ;; *) fail 'says the terminfo setup failed' 'the terminfo setup failed' "$out" ;; esac
+rm -f "$CHECKOUT/deploy/termag-terminfo-setup" "$TI_DRIFT" "$TI_FAILS"
+
 # ── the commit trailer hook in the git template ─────────────────────────────
 if command -v git >/dev/null 2>&1; then
   TEMPLATE_HOOK="$HOME_DIR/.local/share/termag/git-template/hooks/commit-msg"
@@ -776,6 +1047,21 @@ if command -v git >/dev/null 2>&1; then
   done
   rm -f "$HOME_DIR/.gitconfig"
 
+  # An owner ~/.gitconfig without init.templateDir: ours goes in the XDG config
+  # and --check still sees it there (git config --global reads only ~/.gitconfig
+  # once that exists, so a --global read reported drift after every reconcile).
+  rm -f "$XDG_GIT"
+  printf '[user]\n\tname = Owner\n' > "$HOME_DIR/.gitconfig"
+  run >/dev/null 2>&1
+  got="$(git config --file "$XDG_GIT" --get init.templateDir)"
+  # shellcheck disable=SC2088
+  [ "$got" = '~/.local/share/termag/git-template' ] || fail 'init.templateDir set in the XDG config beside an owner ~/.gitconfig' '~/.local/share/termag/git-template' "$got"
+  got="$(git config --file "$HOME_DIR/.gitconfig" --get init.templateDir)"
+  [ -z "$got" ] || fail "an owner's ~/.gitconfig is not written" '' "$got"
+  out="$(run --check 2>&1)"
+  [ "$?" = 0 ] || fail '--check is clean with ours in the XDG config beside an owner ~/.gitconfig' 0 "$out"
+  rm -f "$HOME_DIR/.gitconfig"
+
   # An owner's own init.templateDir is left alone, and no project gets a copy.
   rm -f "$XDG_GIT" "$P/bare/.git/hooks/commit-msg"
   printf '[init]\n\ttemplateDir = /opt/mine\n' > "$HOME_DIR/.gitconfig"
@@ -787,6 +1073,51 @@ if command -v git >/dev/null 2>&1; then
   rm -rf "$HOME_DIR/.gitconfig" "$HOME_DIR/termag"
   run >/dev/null 2>&1
 fi
+
+# ── the t3 server ───────────────────────────────────────────────────────────
+# deploy/termag-t3-install is stubbed like cli/install.sh: it records its
+# arguments and reports drift while $T3_STATE says so.
+# termag-t3-install.test.sh covers the real installer.
+T3_LOG="$WORK/t3-calls"; T3_STATE="$WORK/t3-state"; export T3_LOG T3_STATE
+cat > "$CHECKOUT/deploy/termag-t3-install" <<'STUBEOF'
+#!/bin/sh
+echo "${1:-install}" >> "$T3_LOG"
+case "${1:-}" in
+  --check) [ "$(cat "$T3_STATE")" = current ] && exit 0; echo "MISSING: t3 server 0.1.1-abc"; exit 1 ;;
+esac
+case "$(cat "$T3_STATE")" in
+  broken) echo 'termag-t3-install: could not fetch https://example.invalid/x.tar.gz'; exit 3 ;;
+  slow) sleep 5 ;;
+esac
+echo current > "$T3_STATE"
+echo 'reconciled: t3 server 0.1.1-abc in /opt/termag-t3/0.1.1-abc (t3 v0.1.1)'
+STUBEOF
+chmod 755 "$CHECKOUT/deploy/termag-t3-install"
+t3_run() { HOME="$HOME_DIR" TERMAG_CHECKOUT="$CHECKOUT" PATH="$STUB:$PATH" "$SCRIPT" "$@"; }
+
+echo missing > "$T3_STATE"; : > "$T3_LOG"
+out="$(t3_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail '--check exits 1 on a missing t3 server' 1 "$got"
+case "$out" in *'MISSING: t3 server'*) : ;; *) fail '--check passes on the installer report' 'MISSING: t3 server' "$out" ;; esac
+[ "$(cat "$T3_STATE")" = missing ] || fail '--check does not install the t3 server' missing "$(cat "$T3_STATE")"
+out="$(t3_run 2>&1)"
+case "$out" in *'reconciled: t3 server 0.1.1-abc'*) : ;; *) fail 'installs a missing t3 server' 'reconciled: t3 server' "$out" ;; esac
+: > "$T3_LOG"
+out="$(t3_run 2>&1)"
+[ -z "$out" ] || fail 'a current t3 server is silent' '(no output)' "$out"
+[ "$(cat "$T3_LOG")" = --check ] || fail 'a current t3 server is only checked' '--check' "$(cat "$T3_LOG")"
+echo broken > "$T3_STATE"
+out="$(t3_run 2>&1)"
+got=$?
+[ "$got" = 0 ] || fail 'a failed t3 install does not fail the run' 0 "$got"
+case "$out" in *'the t3 server did not install'*'could not fetch'*) : ;; *) fail 'a failed t3 install is reported' 'the t3 server did not install: ...' "$out" ;; esac
+if command -v timeout >/dev/null 2>&1; then
+  echo slow > "$T3_STATE"
+  out="$(TERMAG_T3_INSTALL_TIMEOUT=1 t3_run 2>&1)"
+  case "$out" in *'the t3 server did not install'*) : ;; *) fail 'a slow t3 install is cut off' 'the t3 server did not install' "$out" ;; esac
+fi
+rm -f "$CHECKOUT/deploy/termag-t3-install"
 
 # ── Claude Code plugins, rendered with the box's own home ───────────────────
 PLUGIN_SRC="$CHECKOUT/deploy/claude-plugins/termag-mcp-refresh"
@@ -823,13 +1154,38 @@ out="$(run --check 2>&1)"
 [ "$?" = 0 ] || fail '--check is clean after the plugin is reconciled' 0 "$out"
 rm -rf "$CHECKOUT/deploy/claude-plugins"
 
+# ── ~/.local and ~/.local/state lose group and other write ─────────────────
+LOCAL_DIR="$HOME_DIR/.local"; STATE_DIR="$HOME_DIR/.local/state"
+mode_of() { ls -ld -- "$1" | cut -c1-10; }
+[ "$(mode_of "$STATE_DIR")" != '' ] || fail 'creates ~/.local/state' present absent
+chmod 775 "$LOCAL_DIR"; chmod 777 "$STATE_DIR"
+out="$(run --check 2>&1)"
+[ "$?" = 1 ] || fail '--check exits 1 on a group-writable ~/.local' 1 "$out"
+case "$out" in *"DRIFT: $LOCAL_DIR is group- or other-writable"*"DRIFT: $STATE_DIR is group- or other-writable"*) ;; *) fail '--check names both dirs' 'DRIFT ~/.local, ~/.local/state' "$out" ;; esac
+[ "$(mode_of "$STATE_DIR")" = drwxrwxrwx ] || fail '--check changes no mode' drwxrwxrwx "$(mode_of "$STATE_DIR")"
+run >/dev/null 2>&1
+[ "$(mode_of "$LOCAL_DIR")" = drwxr-xr-x ] || fail 'removes group write from ~/.local' drwxr-xr-x "$(mode_of "$LOCAL_DIR")"
+[ "$(mode_of "$STATE_DIR")" = drwxr-xr-x ] || fail 'removes group and other write from ~/.local/state' drwxr-xr-x "$(mode_of "$STATE_DIR")"
+out="$(run 2>&1)"
+[ -z "$out" ] || fail 'a fixed ~/.local is silent on the next run' '(no output)' "$out"
+chmod 700 "$STATE_DIR"
+out="$(run --check 2>&1)"
+[ "$?" = 0 ] || fail 'a tighter ~/.local/state is not drift' 0 "$out"
+run >/dev/null 2>&1
+[ "$(mode_of "$STATE_DIR")" = drwx------ ] || fail 'never loosens ~/.local/state' drwx------ "$(mode_of "$STATE_DIR")"
+rmdir "$STATE_DIR"
+out="$(run --check 2>&1)"
+case "$out" in *"MISSING: $STATE_DIR"*) ;; *) fail '--check reports a missing ~/.local/state' 'MISSING ~/.local/state' "$out" ;; esac
+(umask 002; run >/dev/null 2>&1)
+[ "$(mode_of "$STATE_DIR")" = drwxr-xr-x ] || fail 'creates ~/.local/state without group write under umask 002' drwxr-xr-x "$(mode_of "$STATE_DIR")"
+
 # ── argument handling ───────────────────────────────────────────────────────
 run --not-a-flag >/dev/null 2>&1
 got=$?
 [ "$got" = 2 ] || fail 'unknown flag exits 2' 2 "$got"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: content-compare, modes, reload gating, settings exclusion, unit enablement, box-update service, MetaTerm config, termag CLI, ask sandbox retirement, guest browser setup, commit trailer hook, Claude plugins'
+  echo 'PASS: content-compare, modes, reload gating, settings exclusion, unit enablement, box-update service, Claude Code updater and boot unit, MetaTerm config, Devin hooks, termag CLI, docker ECR helper, ask sandbox retirement, guest browser setup, gh updater setup, aws updater setup, terminfo setup, commit trailer hook, Claude plugins, t3 server, ~/.local modes'
   exit 0
 fi
 echo "$failures failure(s)"

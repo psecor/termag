@@ -131,6 +131,19 @@ box only when its owner ran the updater by hand.
   `termag-host-setup` (orchestrator accounts) add this entry to an existing
   `settings.json`; it is the only change either makes to the hooks.
 - `UserPromptSubmit`, `PreToolUse` post `status: "working"` (green)
+- `UserPromptSubmit` first runs `termag-status t3-guard` in the foreground,
+  the one hook whose exit code counts: inside the box's t3 server, a prompt
+  on a Claude session a termag chat names, while the desktop's thread doesn't
+  hold it, exits 2 and is refused. Outside the t3 server, or when it can't tell, it lets the prompt
+  through; a missing `termag-status` never blocks one.
+- `SessionStart` and `UserPromptSubmit` also run `termag space memory context
+  --hook <event> --refresh 60s`, as a second hook in
+  termag-status's own entries so `termag-hooks-update` replaces them. At
+  session start it prints the box's space memory index as `additionalContext`,
+  and on a prompt it prints a one-line notice when that memory changed since
+  the session last looked, or nothing. It prints nothing when space memory is
+  off, the CLI is missing, or anything fails, and nothing in a chat-runner turn
+  (`TERMAG_SPACE_MEMORY_MANAGED=1`), which gets its memory from the runner, or in a chat resumed in a pane with Open in full UI, whose launcher sets it too. The hook checks the variable itself, so the CLI isn't started there.
 - `PostToolUse` reads the hook JSON on stdin: posts `working`, and when the tool
   was a Bash `gh pr create` / `gh pr merge` that succeeded (the PR URL in its
   output is the proof) also posts a **milestone** (`/api/status/milestone`,

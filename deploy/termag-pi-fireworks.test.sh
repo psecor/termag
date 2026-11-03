@@ -46,6 +46,15 @@ want="TERMAG_PI_AGENT=fireworks --provider termag-fireworks --model $KIMI -e $EX
 run --model "$KIMI" >/dev/null 2>&1
 [ "$(cat "$WORK/creds.args")" = "pi-model --model $KIMI" ] || fail 'no --context without a window' "pi-model --model $KIMI" "$(cat "$WORK/creds.args")"
 
+# ── --models: the flag's list goes to pi-model, never to pi ─────────────────
+LIST=W3siaWQiOiJhY2NvdW50cy9maXJld29ya3MvbW9kZWxzL2tpbWktazMiLCJsYWJlbCI6IktpbWkgSzMifV0=
+got="$(run --model "$KIMI" --context 1048576 --models "$LIST" --continue 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+want="TERMAG_PI_AGENT=fireworks --provider termag-fireworks --model $KIMI -e $EXT_DIR/termag-otel.ts -e $EXT_DIR/termag-status.ts --continue"
+[ "$got" = "$want" ] || fail 'pi gets no --models, and starts on the launch model' "$want" "$got"
+[ "$(cat "$WORK/creds.args")" = "pi-model --model $KIMI --context 1048576 --models $LIST" ] \
+  || fail 'the list goes to termag-credentials pi-model' "pi-model --model $KIMI --context 1048576 --models $LIST" "$(cat "$WORK/creds.args")"
+grep -q 'termag-pi-fireworks: fireworks-pi-menu-v1' "$DIR/termag-pi-fireworks" || fail 'the launcher carries the marker agent/credentials.js reads' marker missing
+
 # ── Fireworks not set up here: the reason, exit 1, no pi ────────────────────
 touch "$WORK/not-set-up"
 out="$(run --model "$KIMI" 2>&1)"; got=$?

@@ -20,13 +20,28 @@
 # secret file. IMDS is blocked for host accounts separately (termag-imds-guard).
 Description=Claude Code self-hosted runner orchestrator (spawns runners on termag boxes)
 Documentation=https://code.claude.com/docs/en/self-hosted-environments-configuration#on-demand-runners
-After=network-online.target termag.service
-Wants=network-online.target
+# claude-orchestrator-floor.service brings /usr/bin/claude to termag's floor
+# (deploy/claude-code-floor) first, whatever cloud-init's pin installed.
+# Wants=, never
+# Requires=: a floor run that fails or times out must not keep this from
+# starting.
+After=network-online.target termag.service claude-orchestrator-floor.service
+Wants=network-online.target claude-orchestrator-floor.service
 ConditionPathExists=/etc/claude/environment-secret
 ConditionPathExists=/etc/claude/spawn-token
 # Holds CLAUDE_RUNNER_SPAWN_URL on the port the backend bound this boot; the
 # hook refuses to run without it rather than guess a port nginx 404s.
 ConditionPathExists=/etc/claude/orchestrator.env
+# Never start onto nothing, nor onto bytes nobody verified: no executable /usr/bin/claude (cloud-
+# init's install and the floor run both failed, or the floor run quarantined
+# what it could not verify), or the floor run's hold marker, written with a
+# quarantine and removed by the next verified install. Conditions, not a
+# Requisite= on the floor unit: they are checked at every start (cloud-init's,
+# the backend's, and each Restart=always restart), a failed one skips the start
+# rather than failing the unit, so it never crash-loops, and nothing else
+# orders on this unit, so the backend starts regardless.
+ConditionFileIsExecutable=/usr/bin/claude
+ConditionPathExists=!/var/lib/claude-orchestrator-update/runner-held
 StartLimitIntervalSec=600
 StartLimitBurst=10
 

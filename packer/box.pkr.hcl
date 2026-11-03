@@ -60,6 +60,10 @@ locals {
   // Gitignored; the file provisioners below ship both.
   termag_bundle = "${path.root}/termag.bundle"
 
+  // Where scripts/stage-t3-server.sh stages the t3 server tarball for upload
+  // (empty when t3_server_artifact is). Gitignored.
+  t3_server_stage = "${path.root}/t3-server.tar.gz"
+
   base_termag_sha = var.bake_mode == "incremental" && var.base_termag_sha != "" ? var.base_termag_sha : var.termag_baked_sha
   base_baked_at   = var.base_baked_at != "" ? var.base_baked_at : formatdate("YYYY-MM-DD'T'hh:mm:ss'Z'", timestamp())
 }
@@ -117,6 +121,12 @@ variable "base_baked_at" {
   type        = string
   default     = ""
   description = "Incremental bakes only: when the full bake at the root of the chain ran (RFC 3339 UTC), read off the source image's BaseBakedAt tag. Empty = now, which is right for a full bake. Publish AMI's age rule reads this tag, so a chain of incremental bakes still re-roots on a fresh Ubuntu image every BOX_AMI_MAX_AGE_DAYS."
+}
+
+variable "t3_server_artifact" {
+  type        = string
+  default     = ""
+  description = "Local path, on the host running packer, of a termag-t3-server-<version>-linux-arm64.tar.gz (your T3 Code build's box-server package) to bake into the image. deploy/t3-server.pin's version and sha256 have to match it, so this bakes exactly the pinned server. Empty (the default, and every CI bake) = the image has no t3 server and nothing about the bake changes: the bake never fetches the pin's base_url (a gh:// source needs the box owner's login), and a box installs the pinned server on boot through termag-reconcile."
 }
 
 variable "scratch_volume_size" {
@@ -371,6 +381,31 @@ build {
       "AGENT_WIKI_REPO_URL=${var.agent_wiki_repo_url}",
     ]
     timeout = "45m"
+  }
+
+  // The pinned t3 server for the desktop app (deploy/t3-server.pin), only when t3_server_artifact
+  // hands over its tarball: without one these three steps upload an empty
+  // file and install nothing. Both bake modes, after setup.sh and
+  // refresh-box.sh, which wipe /tmp when they finish. A file provisioner needs
+  // a source that exists, so shell-local always stages one: the tarball, or an
+  // empty file. `generated = true`: it does not exist at `packer validate` time.
+  provisioner "shell-local" {
+    environment_vars = [
+      "STAGE=${local.t3_server_stage}",
+      "ARTIFACT=${var.t3_server_artifact}",
+    ]
+    scripts = ["${path.root}/scripts/stage-t3-server.sh"]
+  }
+
+  provisioner "file" {
+    source      = local.t3_server_stage
+    destination = "/tmp/t3-server.tar.gz"
+    generated   = true
+  }
+
+  provisioner "shell" {
+    script  = "${path.root}/scripts/install-t3-server.sh"
+    timeout = "10m"
   }
 
   provisioner "shell" {

@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# termag-claude-update — keep the Claude Code a box's cloud-session runners
+# start at or above a floor version.
+#
+# Why this exists: Anthropic asks every organisation that runs self-hosted
+# Claude Code runners to keep them at or above a version (2.1.308 for
+# CVE-2026-111943 and CVE-2026-111497) and to keep updating. termag-claude-runner
+# starts its runner with DISABLE_AUTOUPDATER=1, and nothing else in termag
+# updated Claude Code: a box moved forward only when its owner's own
+# interactive Claude updated the shared npm prefix, so a box used only for
+# cloud sessions stayed at its image's version. This is the box's updater.
+#
+# Three callers:
+#   * termag-claude-runner, before a runner starts, when the claude it would
+#     start is below the floor (deploy/claude-code-floor, installed by
+#     termag-reconcile): --ensure <floor>, capped by the runner so the runner
+#     still registers inside the orchestrator's spawn deadline.
+#   * termag-claude-update-boot.service, at every boot, after termag-reconcile
+#     and before the agent: --boot. A stopped box boots with every Claude gone,
+#     so whatever this installs is what everything after it starts on.
+#   * termag-claude-update@<run>.service, started by the agent's tool-update
+#     RPC when the orchestrator asks this box for a run (phase 2: the admin
+#     Software tab's "Update Claude Code"): --run <run-id>. It asks the
+#     orchestrator for its policy, installs, stops and resumes sessions as the
+#     policy says, and reports (below, "--run").
+#
+# What one run does:
+#   1. Takes ~/.termag/claude-update.lock (flock), so the runner guard, a boot
+#      run and a run by hand never run npm over each other. Waits for it as
+#      long as its own budget allows (less what it needs afterwards), so it
+#      outlasts a holder that started with it: two runner slots spawned
+#      together after a floor bump both reach the guard, and the second must
+#      not give up while the first one's install is about to finish.
+#      TERMAG_CLAUDE_LOCK_WAIT caps the wait further, when set. Everything
+#      after the lock is decided afresh: a waiter that finds the box at the
+#      floor (and nothing rejected) exits 0 without installing, and a
+#      rejection the holder recorded still holds. A run that cannot get the
+#      lock installs nothing and exits on the version it finds.
+#   2. Resolves the claude termag-claude-runner would start: $CLAUDE_BIN when
+#      set, else ~/.local/bin/claude, else the one on PATH (with the nvm
+#      default's bin on it).
+#   3. Decides what it wants:
+#        --ensure <floor>  the floor, and only when that claude is below it.
+#        --boot            the floor from the floor file, and npm's `latest`
+#                          (`npm view @anthropic-ai/claude-code@latest
+#                          version`). The user manager has no
+#                          network-online.target, so this waits for the
+#                          registry itself, at most TERMAG_CLAUDE_NETWORK_WAIT
+#                          seconds; without an answer it installs nothing.
+#   4. Updates each install that is below what it wants, and only those
+#      (never one already at it: npm would reinstall the same version and
+#      replace the binary under every running session):
+#        * the npm global under the nvm default, where the package is
+#          installed (what the box image bakes): `npm install -g
+#          @anthropic-ai/claude-code@<x.y.z>`, retried once (the owner's own
+#          Claude may be auto-updating the same prefix), then accepted only
+#          when its package.json and its claude --version both say exactly
+#          x.y.z (the binary comes from the package's postinstall, so a clean
+#          npm exit proves nothing). A global prefix this user cannot write
+#          (root's /usr on the orchestrator host) is skipped and reported as
+#          root-owned;
+#        * a native ~/.local/bin/claude (one that is not a link into
+#          node_modules): `claude install <x.y.z>`, never `claude update`
+#          (whose own channel would pick the bytes), then accepted only when
+#          its claude --version says exactly x.y.z.
+#      Both install one exact version, resolved once and never a tag:
+#      TERMAG_CLAUDE_TARGET's version, unless it resolves below what the run
+#      wants (a `latest` under the floor) or cannot be resolved, and then that
+#      version itself. Neither ever moves an install down. An install that
+#      ends anywhere but exactly that version is REJECTED: recorded in
+#      ~/.termag/claude-update.rejected until a later run installs that path
+#      again and verifies it, and while recorded every run exits 3 and
+#      termag-claude-runner starts no runner. A rejected install is also put
+#      back: the previous version is reinstalled and verified, or, failing
+#      that, the binary just laid down is quarantined (renamed to
+#      <name>.rejected, not executable), so nothing that resolves `claude`
+#      afterwards (the agent's pane relaunch, a login shell) runs bytes this
+#      script did not verify. The record stays either way.
+#   5. Resolves claude again and checks it against the floor.
+#
+# A record whose install path is gone (an uninstalled npm package, a deleted
+# ~/.local/bin/claude) or is no longer that channel's (a native path that is
+# now a link into node_modules) is expired when the next run starts: nothing
+# it rejected is left to run, and that run installs and verifies afresh.
+# Otherwise one such record would keep every run at exit 3 and refuse every
+# cloud session for good. By hand: `rm ~/.termag/claude-update.rejected`, then
+# `termag-claude-update --boot`, which installs and verifies again.
+#
+# --ensure and --boot never restart or stop anything: a running session keeps
+# the binary it started with.
+#
+# --run <run-id> (phase 2):
+#   1. GET <orchestrator>/api/tool-update/policy?component=claude&run=<id>
+#      with the agent token: {floor, target, restart, drainSec, run}. A 200
+#      that names this run gives its restart (none, idle or force) and
+#      drainSec; a 200 with run null gives restart none; anything else (no
+#      answer, a refusal, an unreadable body) is the floor file alone, with
+#      restart none: an install below the floor is brought to exactly the
+#      floor version, never to TERMAG_CLAUDE_TARGET or npm's latest.
+#   2. Installs as above, wanting the floor and the policy's target resolved
+#      to one exact version (a dist-tag through `npm view`, once), never below
+#      what is installed and never the same version again.
+#   3. Stops sessions still on an old binary, as restart says (see "sessions,
+#      after a run's install" below): runners drain and are never SIGKILLed,
+#      the top claude of each tmux pane is stopped (idle: once it is out of a
+#      turn, at most drainSec; force: now), everything else is counted only.
+#      The per-user agent is not restarted. Agent panes are listed for the
+#      orchestrator, which relaunches them through its own launch path; any
+#      other pane whose session had a conversation gets `claude --resume <id>`
+#      typed into it, and one without is left at its shell.
+#   4. POST <orchestrator>/api/tool-update/report: {component: "claude",
+#      trigger, run, outcome (updated, current, partial, failed), target,
+#      fromVersion, toVersion, detail, sessions {stopped, resumed, fresh, cut,
+#      typed, other, runnersLeft}, panes [{session, role, sessionId?,
+#      hadConversation}]}. Not when the orchestrator answered the policy with
+#      404 (it knows no such run). A signal (systemctl stop, the unit's
+#      timeout) reports `failed` and exits 143.
+#   The box cannot tell which trigger asked for the run (manual, floor,
+#   nightly, resume): it reports "manual", which names its run, and the
+#   orchestrator keeps the trigger it recorded on the run.
+#
+# What is still trusted: npm's registry, and @anthropic-ai/claude-code as
+# published there, as for the image bake and as Claude Code's own
+# auto-updater trusts it on every box. Installing one exact, verified version
+# closes the gap between what was resolved and what is installed; it does not
+# authenticate the publisher, and `claude --version` is not provenance. There
+# is no repo-pinned digest, by decision; pinning, as deploy/t3-server.pin does, is the option if that trust
+# is withdrawn. Phase 2's orchestrator policy (`target`) is where an approved
+# version would come from.
+#
+# Usage:
+#   termag-claude-update --ensure <floor>   bring the runner's claude to <floor>
+#                                           (x.y.z) if it is below it
+#   termag-claude-update --boot             the floor from the floor file, and
+#                                           npm's latest; what the boot unit runs
+#   termag-claude-update --run <run-id>     one orchestrator run: the policy,
+#                                           the install, the sessions, the
+#                                           report; what the run unit runs
+#
+# Exit codes: 0 when the runner's claude is at or above the floor (or --boot
+# has no floor to apply), 1 when it is below it or there is no claude, 2 on bad
+# usage, 3 while an install is rejected (it did not end at exactly the version
+# asked for; this takes precedence). --run exits as its install did, whatever
+# its sessions did (the report says that), and 143 when a signal stops it.
+# Logs go to stderr, one `termag-claude-update: ...` line each, ending with a
+# summary line (and for --run, the run's line and the report).
+#
+# Env:
+#   CLAUDE_BIN                   the claude to judge (as termag-claude-runner)
+#   TERMAG_STATE_DIR             where the lock lives (default $HOME/.termag)
+#   TERMAG_CLAUDE_FLOOR_FILE     --boot's floor (default
+#                                $HOME/.local/share/termag/claude-code-floor,
+#                                else the checkout's deploy/claude-code-floor)
+#   TERMAG_CLAUDE_TARGET         what to install: a dist-tag or a version
+#                                (default latest)
+#   TERMAG_CLAUDE_BUDGET         seconds the whole run may take; every wait and
+#                                install takes its share from it and the run
+#                                stops itself inside it (default 240 for --boot,
+#                                which fits the boot unit's 5 min; 600 for
+#                                --run's install, before its sessions; 1800
+#                                for --ensure, whose caller passes its own)
+#   TERMAG_CLAUDE_LOCK_WAIT      at most this many seconds to wait for the lock
+#                                (default: unset, as long as the budget allows)
+#   TERMAG_CLAUDE_NETWORK_WAIT   --boot: seconds to wait for the registry (default 120)
+#   TERMAG_CLAUDE_INSTALL_TIMEOUT  seconds for each install step (default 300)
+#   TERMAG_CLAUDE_RETRY_SLEEP    seconds before the npm retry (default 15)
+#   TERMAG_AGENT_CONFIG          --run: the agent config with the orchestrator
+#                                URL and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT        --run: seconds for each orchestrator call (default 20)
+#   TERMAG_CLAUDE_KILL_AFTER     --run: seconds from a pane session's SIGTERM to
+#                                its SIGKILL (default 20)
+#   TERMAG_CLAUDE_RUNNER_WAIT    --run: seconds to wait for runners to drain
+#                                (default 780)
+#   TERMAG_CLAUDE_RESUME_WAIT    --run: seconds after typing a resume before it
+#                                is checked (default 10)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+
+PKG=@anthropic-ai/claude-code
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+TARGET="${TERMAG_CLAUDE_TARGET:-latest}"
+LOCK_WAIT="${TERMAG_CLAUDE_LOCK_WAIT:-}"
+NETWORK_WAIT="${TERMAG_CLAUDE_NETWORK_WAIT:-120}"
+INSTALL_TIMEOUT="${TERMAG_CLAUDE_INSTALL_TIMEOUT:-300}"
+RETRY_SLEEP="${TERMAG_CLAUDE_RETRY_SLEEP:-15}"
+
+# What this tool's updater shares with every other's (the budget, the policy,
+# the lock, the pinned npm install with its rejection record, restore and
+# quarantine, the sessions and the report) is deploy/termag-tool-update-lib,
+# beside this script (termag-reconcile installs both into ~/.local/bin).
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-claude-update TU_COMPONENT=claude TU_BIN=claude TU_TAGS='latest|stable'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/claude-update.lock
+REJECTED=$STATE_DIR/claude-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-claude-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-claude-update --ensure <x.y.z> | --boot | --run <run-id>"; exit 2; }
+
+MODE='' FLOOR='' RUN_ID=''
+case "${1:-}" in
+  --ensure) MODE=ensure; FLOOR=${2:-}; is_version "$FLOOR" || usage; [ $# -eq 2 ] || usage ;;
+  --boot) MODE=boot; [ $# -eq 1 ] || usage ;;
+  # The run id names the systemd instance and goes into a URL and a report:
+  # the orchestrator's id pattern, nothing a shell or a URL would read.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+case "$MODE" in
+  boot) BUDGET="${TERMAG_CLAUDE_BUDGET:-240}" ;;
+  run) BUDGET="${TERMAG_CLAUDE_BUDGET:-600}" ;;
+  *) BUDGET="${TERMAG_CLAUDE_BUDGET:-1800}" ;;
+esac
+case "$TARGET" in ''|*[!A-Za-z0-9.-]*) log "bad TERMAG_CLAUDE_TARGET '$TARGET'"; exit 2 ;; esac
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+KILL_AFTER="${TERMAG_CLAUDE_KILL_AFTER:-20}"
+RUNNER_WAIT="${TERMAG_CLAUDE_RUNNER_WAIT:-780}"
+RESUME_WAIT="${TERMAG_CLAUDE_RESUME_WAIT:-10}"
+for n in "${LOCK_WAIT:-0}" "$NETWORK_WAIT" "$INSTALL_TIMEOUT" "$RETRY_SLEEP" "$BUDGET" "$POLICY_TIMEOUT" "$KILL_AFTER" "$RUNNER_WAIT" "$RESUME_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+# The budget: termag-tool-update-lib's tu_budget, left and run_capped.
+tu_budget
+
+# The nvm default's node, npm and npm-global claude, as termag-claude-runner
+# has them. Every command that could read stdin gets </dev/null.
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 </dev/null
+
+# The claude termag-claude-runner would start (its own resolution, which runs
+# after it has put ~/.local/bin first and sourced nvm).
+resolve() {
+  hash -r
+  if [ -n "${CLAUDE_BIN:-}" ]; then printf '%s' "$CLAUDE_BIN"
+  elif [ -x "$HOME/.local/bin/claude" ]; then printf '%s' "$HOME/.local/bin/claude"
+  else command -v claude 2>/dev/null || true
+  fi
+}
+
+# The orchestrator's policy (--run): termag-tool-update-lib's tu_fetch_policy,
+# which sets FLOOR_ONLY when there is none.
+tu_fetch_policy
+
+if [ "$MODE" = boot ] || { [ "$MODE" = run ] && [ -z "$FLOOR" ]; }; then
+  ff=${TERMAG_CLAUDE_FLOOR_FILE:-$HOME/.local/share/termag/claude-code-floor}
+  [ -r "$ff" ] || [ -n "${TERMAG_CLAUDE_FLOOR_FILE:-}" ] || ff=$HOME/src/termag/deploy/claude-code-floor
+  FLOOR=$(head -n 1 "$ff" 2>/dev/null | tr -d '[:space:]')
+  if [ -z "$FLOOR" ] && [ "$FLOOR_ONLY" = 1 ]; then
+    log "no floor in $ff and no policy; installing nothing"
+  elif [ -z "$FLOOR" ]; then
+    log "no floor in $ff; updating to $TARGET only"
+  elif ! is_version "$FLOOR"; then
+    log "ignoring the floor '$FLOOR' in $ff: not x.y.z"; FLOOR=
+  fi
+fi
+
+# The rejection record (REJECTED, above) is termag-tool-update-lib's: reject,
+# accept, was_rejected and quarantine. A record whose install path is gone
+# (see the header) is expired here: the native one, and the npm global's
+# (tu_expire_npm): nothing they rejected is left to run.
+expire_stale() {
+  [ -s "$REJECTED" ] || return 0
+  local n=$HOME/.local/bin/claude
+  if was_rejected native; then
+    case "$( [ -x "$n" ] && readlink -f "$n" )" in
+      ''|*/node_modules/*)
+        log "the rejected native install is gone ($n is missing or now a link into node_modules); expiring its record"
+        accept native ;;
+    esac
+  fi
+  tu_expire_npm
+}
+
+# The summary's notes, for termag-tool-update-lib's finish and report.
+# shellcheck disable=SC2154  # set by termag-tool-update-lib
+tu_notes() { printf 'npm=%s native=%s' "$npm_note" "$native_note"; }
+tu_notes_all() { printf '%s%s' "$npm_note" "$native_note"; }
+
+# ── sessions, after a run's install (--run) ─────────────────────────────────
+# Ported from scripts/claude-floor/claude-floor.sh (phase 0, run on the fleet
+# on 2026-10-29), with its lessons: the per-user agent is never restarted (its
+# reconnect relaunched every agent pane at a shell, and resumed never-used
+# sessions, which failed with "No conversation found"), so the agent panes
+# this stops are listed in the report for the orchestrator to relaunch through
+# its own launch path, resuming only those that had a conversation.
+#
+# What still runs a binary that is no longer current (its inode is not the
+# resolved claude's, ~/.local/bin/claude's or the npm global's):
+#   * runners (self-hosted-runner, never the orchestrator's): SIGTERM; each
+#     drains (--drain-wait-sec 600 lets a running turn finish) and exits, and
+#     the cloud session's next message gets a new runner on the new binary.
+#     Waited for up to TERMAG_CLAUDE_RUNNER_WAIT (780 s: the drain and the
+#     post-session hook's 120 s), and never SIGKILLed: termag-claude-runner's
+#     exit trap would then remove or move the checkout while the runner's
+#     Claude child may still be writing to it. One still alive is left and
+#     counted (runnersLeft); a later run picks it up.
+#   * the interactive session in each tmux pane, the top claude of the pane
+#     (its sub-claudes go with it): restart=idle stops each one as soon as its
+#     session file (~/.claude/sessions/<pid>.json, or under the process's
+#     CLAUDE_CONFIG_DIR) is not "busy", and at drainSec whatever its status
+#     (cut); restart=force stops them all at once (cut counts those busy).
+#     SIGTERM, then SIGKILL after TERMAG_CLAUDE_KILL_AFTER (20 s).
+#   * anything else (chat-runner turns and other -p turns, desktop threads,
+#     sessions outside tmux) is counted as other and never touched.
+# Then, per stopped pane, once its shell has the foreground back (at most
+# 10 s): an agent pane (a tmux session named <...>-agent, termag's) is left at
+# its shell for the orchestrator; any other pane whose session had a
+# conversation (its transcript, <config>/projects/<cwd encoded>/<id>.jsonl,
+# exists) gets `claude --resume <id>` typed with tmux send-keys -l; one
+# without is left at its shell (fresh). Nothing is ever typed into a pane that
+# is not at a shell. RESUME_WAIT (10 s) after the last one typed, a typed pane
+# that is no longer at a shell counts as resumed.
+#
+# Nothing is stopped when the run did not end at or above the floor, with
+# nothing rejected (a restart would come back on the old binary or on
+# unverified bytes), or when another run held the lock.
+#
+# The stopping, the resume and the report are termag-tool-update-lib's
+# (stop_sessions, after_install, post_report); what is Claude Code's is below:
+# which processes are its sessions, their session files and transcripts.
+is_claude() {
+  local exe cmd
+  exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+  case "$exe" in
+    */claude|*/claude\ \(deleted\)|*/claude.exe|*/claude.exe\ \(deleted\)|*/claude/versions/*) return 0 ;;
+    */node|*/node\ \(deleted\))
+      cmd=$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)
+      case "$cmd" in *@anthropic-ai/claude-code*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+under_claude() {
+  local p; p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do is_claude "$p" && return 0; p=$(ppid_of "$p"); done
+  return 1
+}
+config_of() { local c; c=$(env_of "$1" CLAUDE_CONFIG_DIR); printf '%s' "${c:-$HOME/.claude}"; }
+# A field of the session file Claude Code keeps for a live interactive session.
+sess() { jq -r --arg k "$2" '.[$k] // empty | tostring' "$(config_of "$1")/sessions/$1.json" 2>/dev/null | head -n 1; }
+# had_conversation CONFIG CWD ID: the session's transcript exists. By the
+# cwd's encoded name first (every character but a letter or digit becomes
+# '-'), then under any project dir (a long cwd's name is shortened).
+had_conversation() {
+  local cfg=$1 cwd=$2 id=$3 f
+  [ -n "$id" ] || return 1
+  [ -f "$cfg/projects/$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9]/-/g')/$id.jsonl" ] && return 0
+  for f in "$cfg"/projects/*/"$id.jsonl"; do [ -f "$f" ] && return 0; done
+  return 1
+}
+
+p_cfg=() p_cwd=()
+find_sessions() {
+  local c current=() pid cmd pane sock name npm_bin
+  npm_bin=; command -v npm >/dev/null 2>&1 && npm_bin=$(npm prefix -g </dev/null 2>/dev/null)/bin/claude
+  for c in "$(resolve)" "$HOME/.local/bin/claude" "$npm_bin"; do
+    [ -n "$c" ] && [ -e "$c" ] || continue
+    current+=("$(readlink -f "$c")")
+  done
+  for pid in $(pgrep -u "$(id -u)"); do
+    is_claude "$pid" || continue
+    # A replaced binary's inode is no longer any current one's, whatever the path says.
+    for c in "${current[@]}"; do [ "/proc/$pid/exe" -ef "$c" ] && continue 2; done
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || continue
+    case "$cmd" in
+      *"self-hosted-runner orchestrator"*) continue ;;
+      *self-hosted-runner*) runners+=("$pid"); continue ;;
+    esac
+    under_claude "$pid" && continue
+    pane=$(env_of "$pid" TMUX_PANE)
+    case "$cmd" in *" -p "*|*" --print "*) pane= ;; esac
+    sock=; [ -n "$pane" ] && sock=$(socket_of "$pid")
+    name=; [ -n "$sock" ] && name=$(tmux -S "$sock" display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    if [ -z "$name" ]; then other=$((other + 1)); continue; fi
+    p_pid+=("$pid"); p_sock+=("$sock"); p_pane+=("$pane"); p_sess+=("$name")
+    p_cfg+=("$(config_of "$pid")"); p_id+=("$(sess "$pid" sessionId)")
+    c=$(sess "$pid" cwd); [ -n "$c" ] || c=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+    p_cwd+=("$c")
+  done
+}
+
+# termag-tool-update-lib's stop_sessions asks these of pane I.
+tu_status() { sess "${p_pid[$1]}" status; }
+tu_had() { had_conversation "${p_cfg[$1]}" "${p_cwd[$1]}" "$2"; }
+tu_resume_line() { printf 'claude --resume %s' "$1"; }
+
+[ "$MODE" = run ] && trap on_signal TERM INT HUP
+
+tu_lock
+expire_stale
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ] && [ -z "$FLOOR" ]; then
+  log "no policy and no floor; installing nothing"
+  finish
+fi
+if { [ "$MODE" = ensure ] || [ "$FLOOR_ONLY" = 1 ]; } && [ -n "$bin" ] && [ -n "$FLOOR" ] && at_least "$have" "$FLOOR" && [ ! -s "$REJECTED" ]; then
+  log "claude $bin is $have, at or above the floor $FLOOR; nothing to do"
+  finish
+fi
+
+# What each install must reach: the floor, and for --boot npm's latest too.
+want=$FLOOR
+if [ "$MODE" = boot ]; then
+  latest=
+  if command -v npm >/dev/null 2>&1; then
+    net_wait=$(left "$NETWORK_WAIT")
+    net_deadline=$(( $(date +%s) + net_wait ))
+    while :; do
+      cap=$(left 20); [ "$cap" -gt 0 ] || break
+      latest=$(timeout -k 2 "$cap" npm view "$PKG@latest" version </dev/null 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+      is_version "$latest" && break
+      latest=
+      [ $(( $(date +%s) + 5 )) -lt "$net_deadline" ] || break
+      sleep 5
+    done
+  fi
+  if [ -z "$latest" ]; then
+    log "no answer from the npm registry within ${net_wait:-0}s (no network?); installing nothing"
+    finish
+  fi
+  if [ -z "$want" ] || at_least "$latest" "$want"; then want=$latest; fi
+  log "npm's latest is $latest; want ${want}${FLOOR:+ (floor $FLOOR)}"
+fi
+# A run with a policy wants its target too, resolved once, and the floor
+# (termag-tool-update-lib's tu_run_target). Then one exact version for both
+# installs, never a tag (tu_spec): the target's, unless it resolves below what
+# this run wants, else that version itself. A dist-tag can sit below the floor
+# (latest 2.1.300 under a 2.1.308 floor), and installing it would leave the box
+# below, or move it down, and the runner guard would refuse every session.
+tu_run_target
+tu_spec
+
+# ── the npm global under the nvm default ────────────────────────────────────
+# termag-tool-update-lib's tu_npm_global: exactly spec where the npm global is
+# below `want`, verified by its package.json and its claude --version, else
+# rejected and put back or quarantined. The binary comes from the package's
+# postinstall (node install.cjs, from the platform's optional dependency).
+tu_npm_global
+
+# ── a native install in ~/.local/bin ────────────────────────────────────────
+nat=$HOME/.local/bin/claude
+# shellcheck disable=SC2154  # spec_v: termag-tool-update-lib's tu_spec sets it
+if [ -x "$nat" ]; then
+  case "$(readlink -f "$nat")" in
+    */node_modules/*) native_note=link-to-npm ;;
+    *)
+      before=$(ver "$nat")
+      if at_least "$before" "$want" && ! was_rejected native; then
+        native_note=$before
+      elif downgrade "$before" && ! was_rejected native; then
+        native_note="$before(no-downgrade)"
+        log "native $nat is $before; claude install $spec_v would move it down; skipped"
+      else
+        # Never `claude update`: that lets the binary's own channel choose the
+        # bytes. `claude install <x.y.z>` with the exact version resolved
+        # above moves the native install to it (up or down, no --force
+        # needed, DISABLE_AUTOUPDATER or not; checked on a box with 2.1.308
+        # and 2.1.312), and is accepted only if --version then says exactly that.
+        # What to put back if this install is rejected: the version file the
+        # link points at (the native installer keeps one per version and
+        # moves the link), or a hardlink to a plain-file binary.
+        nat_prev='' nat_backup=''
+        if [ -L "$nat" ]; then
+          nat_prev=$(readlink -f "$nat")
+        elif ln -f "$nat" "$STATE_DIR/claude-native.prev" 2>/dev/null; then
+          nat_backup=$STATE_DIR/claude-native.prev
+        fi
+        nat_rc=0
+        log "native $nat is ${before:-not running}; running claude install $spec_v"
+        run_capped "$(left "$INSTALL_TIMEOUT")" "$nat" install "$spec_v" </dev/null >&2 || nat_rc=$?
+        after=$(ver "$nat")
+        if [ "$after" = "$spec_v" ]; then
+          native_note="${before:-broken}->$after"
+          log "native $nat is now $spec_v, verified (claude --version)"
+          accept native
+        elif [ "$nat_rc" != 0 ] && [ "$after" = "$before" ] && ! was_rejected native; then
+          native_note="${before:-broken}->FAILED"
+          log "claude install $spec_v did not complete"
+        else
+          native_note="${before:-broken}->pin-mismatch"
+          reject native "asked for $spec_v; $nat --version says ${after:-nothing (does not run)}"
+          # Put the version that ran back, verified; else quarantine what the
+          # install left (the link and its target). The record stays.
+          restored=0
+          if [ -n "$before" ]; then
+            if [ -n "$nat_prev" ] && [ "$(ver "$nat_prev")" = "$before" ] \
+              && ln -sfn "$nat_prev" "$nat.tmp.$$" && mv -Tf "$nat.tmp.$$" "$nat" && [ "$(ver "$nat")" = "$before" ]; then
+              restored=1
+            elif [ -n "$nat_backup" ] && [ "$(ver "$nat_backup")" = "$before" ] \
+              && mv -f "$nat_backup" "$nat" && [ "$(ver "$nat")" = "$before" ]; then
+              restored=1
+            fi
+          fi
+          rm -f "$nat.tmp.$$"
+          if [ "$restored" = 1 ]; then
+            native_note="$native_note,restored:$before"
+            log "native $nat is back at $before, verified"
+          else
+            nat_real=$(readlink -f "$nat" 2>/dev/null)
+            if [ -L "$nat" ]; then rm -f "$nat"; fi
+            if quarantine "$nat_real" || [ ! -e "$nat" ]; then
+              native_note="$native_note,quarantined"
+            else
+              log "could not quarantine $nat"
+            fi
+          fi
+        fi
+        rm -f "$STATE_DIR/claude-native.prev"
+      fi ;;
+  esac
+fi
+
+finish

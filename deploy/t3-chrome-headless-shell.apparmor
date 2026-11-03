@@ -1,0 +1,11 @@
+# Installed by deploy/termag-t3-install: lets the t3 server's headless browser
+# use Chrome's sandbox. The same profile as the fork's `t3 browser setup`
+# (apps/server/src/preview/PreviewBrowserHost.ts, APPARMOR_PROFILE).
+abi <abi/4.0>,
+include <tunables/global>
+
+profile t3-chrome-headless-shell /**/tools/chrome-headless-shell/*/*/chrome-headless-shell flags=(unconfined) {
+  userns,
+
+  include if exists <local/t3-chrome-headless-shell>
+}

@@ -205,11 +205,46 @@ got="$(login)"
 systemctl start "user@$auid.service" && wait_for 20 test -e "$ahome/probe-ran" \
   || fail "guard loaded: re-adopted account's services start" "probe-ran" "$(systemctl status "user@$auid.service" 2>&1 | tail -5)"
 
+# What a start that stalls is waiting on, taken while it waits: the queued
+# jobs, the re-adopted account's own manager and processes, and logind.
+stall_snapshot() {
+  echo "--- system jobs"; systemctl list-jobs --no-pager 2>&1
+  echo "--- $A's manager"
+  runuser -u "$A" -- env XDG_RUNTIME_DIR="/run/user/$auid" timeout 5 systemctl --user is-system-running 2>&1
+  runuser -u "$A" -- env XDG_RUNTIME_DIR="/run/user/$auid" timeout 5 systemctl --user list-jobs --no-pager 2>&1
+  echo "--- $A's processes"; ps -o pid,stat,wchan:24,etime,args -u "$auid" 2>&1
+  echo "--- logind"; loginctl user-status "$auid" --no-pager 2>&1 | head -15
+}
+
 # ── table flushed behind the active guard: every start reapplies it ─────────
 for unit in "user@$auid.service" ssh.service; do
+  before="$(runuser -u "$A" -- env XDG_RUNTIME_DIR="/run/user/$auid" timeout 5 systemctl --user is-system-running 2>&1)"
+  t0="$(date +%s)"
   systemctl stop "$unit"
-  rm -f "$WORK/table-loaded"
-  systemctl start "$unit" || fail "table flushed: $unit starts" "started" "$(systemctl status "$unit" 2>&1 | tail -5)"
+  # Its runtime dir goes with it, as logind stops it on a host. Here only
+  # user@ held it, and its stop-when-unneeded can lose the race with the start
+  # below. A dir that survives keeps dbus.socket's socket file, pam_systemd
+  # exports DBUS_SESSION_BUS_ADDRESS for it, and on a runner (whose
+  # /etc/environment gives every user manager the runner's XDG_RUNTIME_DIR)
+  # the new manager's socket units' `systemctl --user set-environment` falls
+  # back to that bus: the manager's own dbus.socket, not answering until those
+  # units have started. The start then hangs to its 90 s timeout.
+  [ "$unit" = "user@$auid.service" ] && systemctl stop "user-runtime-dir@$auid.service"
+  t1="$(date +%s)"
+  rm -f "$WORK/table-loaded" "$WORK/stall"
+  systemctl start "$unit" &
+  start=$!
+  (sleep 15 && kill -0 "$start" 2>/dev/null && stall_snapshot >"$WORK/stall" 2>&1) &
+  snap=$!
+  if ! wait "$start"; then
+    fail "table flushed: $unit starts" "started" "$(systemctl status "$unit" 2>&1 | tail -5)"
+    echo "      $A's manager before the stop: $before; the stop took $((t1 - t0))s"
+    wait "$snap"
+    sed 's/^/      /' "$WORK/stall" 2>/dev/null
+    echo "      --- journal since the stop"
+    journalctl -b --no-pager -o short-precise --since "@$t0" 2>&1 | tail -120 | sed 's/^/      /'
+  fi
+  kill "$snap" 2>/dev/null
   [ -e "$WORK/table-loaded" ] || fail "table flushed: starting $unit reloads the rules" "table-loaded" "not reloaded"
 done
 # ... and a start whose reload fails doesn't happen.

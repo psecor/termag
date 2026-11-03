@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# termag-mcp-bridge -- one termag MCP connector as a stdio MCP server, for the
+# agent CLIs that cannot run termag-mcp-headers. termag-credentials registers it with Codex, Cursor, Devin, pi,
+# Gemini, Auggie and vibe, one entry per connector:
+#
+#   termag-mcp-bridge <broker>/c/<id> <agent.config.json>
+#
+# The bridge itself is agent/mcp-bridge.js: it forwards each message to the
+# broker with this box's agent token, read from the agent config on every
+# request. Nothing is stored and no token or header is logged.
+#
+# stdout is the JSON-RPC channel: nothing but the bridge may write to it.
+#
+# Env:
+#   TERMAG_CHECKOUT   the termag checkout when this copy is not in one (default $HOME/src/termag)
+
+set -u
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The checkout's own copy when run from <checkout>/deploy, as termag-credentials
+# registers it; the box's checkout from the ~/.local/bin copy.
+BRIDGE="$SELF_DIR/../agent/mcp-bridge.js"
+[ -f "$BRIDGE" ] || BRIDGE="${TERMAG_CHECKOUT:-$HOME/src/termag}/agent/mcp-bridge.js"
+if [ ! -f "$BRIDGE" ]; then
+  printf 'termag-mcp-bridge: no bridge at %s\n' "$BRIDGE" >&2
+  exit 1
+fi
+
+# The agent CLIs start this with their own PATH, which may lack node (Cursor
+# and Devin are native binaries). Then agent/run-node.sh picks the Node the
+# agent unit uses: it sources nvm.sh with --no-use, so a project's .nvmrc is
+# not followed, and in its own shell, so nvm.sh is not run under set -u.
+if ! command -v node >/dev/null 2>&1; then
+  exec /bin/bash "$(dirname "$BRIDGE")/run-node.sh" "$BRIDGE" "$@"
+fi
+
+exec node "$BRIDGE" "$@"

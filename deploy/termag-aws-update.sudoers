@@ -1,0 +1,14 @@
+# The AWS CLI v2's updater (docs/tool-updates.md, "The AWS CLI v2: the second root
+# recipe"). Installed as /etc/sudoers.d/termag-aws-update (0440) by
+# deploy/termag-aws-update-setup.
+#
+# The AWS CLI is root's install, so its update runs as root, in the system unit
+# termag-aws-update@<run>.service. The agent user may start it, and only it,
+# through the one root-owned helper, with one argument of the run id's
+# alphabet (the helper checks its length): no shell, no other unit, no other
+# command. The boxes' blanket NOPASSWD rule (packer/scripts/setup.sh) does
+# not make this one moot: the agent never needs more than this line.
+#
+# The agent user is named by uid: cloud-init renames the box user at launch
+# (usermod -l, uid kept). The setup script fills @AGENT_UID@ in.
+#@AGENT_UID@ ALL=(root) NOPASSWD: /usr/local/libexec/termag/termag-aws-update-start ^[a-z0-9]+$

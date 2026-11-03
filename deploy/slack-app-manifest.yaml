@@ -10,6 +10,27 @@
 # Put those in the backend .env and restart termag. Socket mode means no public
 # request URL is needed (the backend dials out to Slack). See deploy/setup.md §7.
 #
+# Slack's MCP server (https://mcp.slack.com/mcp) through termag's MCP broker
+#  uses this same app as its OAuth
+# client: oauth_config.scopes.user and redirect_urls below. An app admin must:
+#   1. Replace termag.example.com in redirect_urls with the orchestrator's
+#      FRONTEND_URL host (keep BASE_PATH, here /termag), then apply this
+#      manifest (App Manifest → paste → Save).
+#   2. Reinstall the app to the workspace, so the new user scopes are granted.
+#      Slack lets only internal or directory-published apps use MCP, so keep
+#      the app undistributed (internal to this workspace).
+#   3. Basic Information → App Credentials → Client ID and Client Secret into the
+#      orchestrator's environment, then restart it:
+#        MCP_OAUTH_CLIENTS='[{"issuer":"https://mcp.slack.com","resource":"https://mcp.slack.com","clientId":"<Client ID>","clientSecretEnv":"MCP_OAUTH_SLACK_CLIENT_SECRET","tokenTypes":["user"]}]'
+#        MCP_OAUTH_SLACK_CLIENT_SECRET=<Client Secret>
+#   Each user then adds https://mcp.slack.com/mcp as an OAuth connector in
+#   Settings → MCP servers and links it with their own Slack account.
+#
+# For a local dev app, change `name`/`display_name` and the command (e.g. /tdev),
+# and set SLACK_COMMAND to match. Never reuse the production app's tokens
+# locally: Slack hands each Socket Mode event to one of the app's connections,
+# so a laptop backend would take some of production's /t commands.
+#
 # Scopes/events mirror what the code uses (backend/src/slack/*).
 display_information:
   name: termag
@@ -17,6 +38,11 @@ display_information:
   background_color: "#161b22"
 
 features:
+  # DMs to the bot (message.im) and the Home tab (app_home_opened → views.publish).
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: termag
     always_online: true
@@ -27,6 +53,9 @@ features:
       should_escape: false
 
 oauth_config:
+  # The MCP broker's OAuth callback (deploy notes above): <FRONTEND_URL><BASE_PATH>/api/mcp-connectors/oauth/callback.
+  redirect_urls:
+    - https://termag.example.com/termag/api/mcp-connectors/oauth/callback
   scopes:
     bot:
       - app_mentions:read
@@ -47,6 +76,46 @@ oauth_config:
       - reactions:write
       - users:read
       - users:read.email
+    # Slack's MCP server acts as the user who linked it. termag asks for every
+    # scope its protected-resource metadata lists (scopes_supported, the same
+    # list as Slack's per-tool table at docs.slack.dev/ai/mcp-server), so all of
+    # them must be here or the sign-in fails.
+    user:
+      # Search messages, channels, files and users.
+      - search:read.public
+      - search:read.private
+      - search:read.mpim
+      - search:read.im
+      - search:read.files
+      - search:read.users
+      # Read channels, threads and DMs, and list members.
+      - channels:history
+      - groups:history
+      - mpim:history
+      - im:history
+      - channels:read
+      - groups:read
+      - mpim:read
+      - im:read
+      # Post and schedule messages as the user; create conversations.
+      - chat:write
+      - channels:write
+      - groups:write
+      - mpim:write
+      - im:write
+      # Users and profiles.
+      - users:read
+      - users:read.email
+      # Canvases, lists, files, reactions, emoji.
+      - canvases:read
+      - canvases:write
+      - lists:read
+      - lists:write
+      - files:read
+      - files:write
+      - reactions:read
+      - reactions:write
+      - emoji:read
 
 settings:
   event_subscriptions:

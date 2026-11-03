@@ -79,6 +79,9 @@ EOF
 install_deploy_artifacts
 install_box_marker
 install_guest_browser
+install_gh_updater
+install_aws_updater
+install_terminfo
 
 # Truncate machine-id so each EC2 launched from this AMI gets a fresh one.
 sudo truncate -s 0 /etc/machine-id

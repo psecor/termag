@@ -1,5 +1,5 @@
 #!/bin/sh
-# Tests the orchestrator's log shipper: deploy/termag-otelcol-env (the
+# Tests the orchestrator's log, metric and trace shipper: deploy/termag-otelcol-env (the
 # per-instance config it renders from the backend .env), the unit and how the
 # orchestrator image installs them, and deploy/termag-otelcol.yaml itself.
 #
@@ -7,7 +7,8 @@
 # It merges the shipped config with the rendered one and a test override that
 # reads fixture files instead of the journal and writes to a file instead of
 # the collector, runs it, and checks what would have been sent: the redaction,
-# the journal-entry reshaping and the resource attributes. Without the binary
+# the journal-entry reshaping and the resource attributes, and that a span's
+# attributes, event attributes and status message are redacted the same way. Without the binary
 # that part prints SKIP, or fails with TERMAG_OTELCOL_REQUIRE=1 (CI). With
 # TERMAG_OTELCOL_JOURNAL=1 (root, systemd as PID 1) it also runs the real
 # journald receiver against a transient termag.service.
@@ -143,6 +144,32 @@ done
 order="$(grep -nE '^\s+- (transform/journald|filter/noise|transform/redact)$' "$CONFIG" | head -3 | sed 's/^[0-9]*:\s*- //' | tr '\n' ' ')"
 [ "$order" = 'transform/journald filter/noise transform/redact ' ] || fail "config: filter/noise sits between transform/journald and transform/redact" 'transform/journald filter/noise transform/redact' "$order"
 
+# The traces pipeline: the backend's spans, through transform/redact-spans.
+for want in \
+  '  transform/redact-spans:' \
+  '    traces:' \
+  '      receivers: [otlp/termag]' \
+  '        - transform/redact-spans' \
+  '          - delete_key(span.attributes, "client.address")' \
+  '          - delete_key(span.attributes, "network.peer.address")'; do
+  grep -qxF -- "$want" "$CONFIG" || fail "config: has line" "$want" "missing"
+done
+# transform/redact-spans carries a copy of transform/redact's patterns (OTTL
+# can't share a list between processors): the same (pattern, replacement)
+# pairs, in the same order, for the span attributes, the status message and the
+# span-event attributes. A pattern added to one and not the other fails here.
+# patterns <prefix>: the '"<pattern>", "<replacement>"' tail of every statement
+# that starts with <prefix>, in file order.
+patterns() {
+  awk -v p="          - $1" 'index($0, p) == 1 { s = substr($0, length(p) + 1); sub(/\)$/, "", s); print s }' "$CONFIG"
+}
+log_patterns="$(patterns 'replace_pattern(log.body, ')"
+[ "$(printf '%s\n' "$log_patterns" | grep -c .)" -ge 11 ] || fail "config: transform/redact's patterns are found" "at least 11" "$log_patterns"
+for prefix in 'replace_all_patterns(span.attributes, "value", ' 'replace_pattern(span.status.message, ' 'replace_all_patterns(spanevent.attributes, "value", '; do
+  got="$(patterns "$prefix")"
+  [ "$got" = "$log_patterns" ] || fail "config: transform/redact-spans' $prefix... uses exactly transform/redact's patterns" "$log_patterns" "$got"
+done
+
 # The backend's OTLP receiver must never listen beyond loopback.
 grep -nE '^\s+endpoint: ' "$CONFIG" | grep -vE 'endpoint: 127\.0\.0\.1:' \
   && fail "config: every receiver endpoint is loopback" "127.0.0.1 only" "$(grep -nE '^\s+endpoint: ' "$CONFIG")"
@@ -164,6 +191,13 @@ OBSERVABILITY_OTLP_ENDPOINT=https://otel.example.test'
   AWS_KEY_ID="AKIA""ABCDEFGHIJKLMNOP"
   # A work-order JWT, should the runner orchestrator ever echo one.
   JWT_FIX="eyJ""hbGciOiJIUzI1NiJ9.eyJ""zdWIiOiJvcmRlciJ9.c2lnbmF0dXJlX2ZpeHR1cmU"
+  GH_FIX="ghp_""0123456789abcdefghijABCDEFGHIJklmnop"
+  ANT_FIX="sk-ant-""api03-0123456789abcdefXYZ"
+  # Every token shape transform/redact knows, in one string, and what it must
+  # become. The span carries it as an attribute, as an event's
+  # exception.message and as its status message.
+  SPAN_SECRETS="url https://h.example.test/termag/ws/agent?token=$TOKEN auth Bearer abcdefghijklmnop.qrstuv jwt $JWT_FIX slack xoxb-1234567890-abcdefghij ld sdk-12345678-1234-1234-1234-123456789abc gh $GH_FIX anthropic $ANT_FIX aws $AWS_KEY_ID db postgresql://termag:hunter2pass@localhost:5432/termag"
+  SPAN_REDACTED="url https://h.example.test/termag/ws/agent?token=REDACTED auth Bearer REDACTED jwt REDACTED_JWT slack REDACTED_SLACK_TOKEN ld REDACTED_SDK_KEY gh REDACTED_GITHUB_TOKEN anthropic REDACTED_ANTHROPIC_KEY aws REDACTED_AWS_KEY_ID db postgresql://termag:REDACTED@localhost:5432/termag"
   cat >"$WORK/log/nginx/access.log" <<EOF
 10.0.1.5 - - [06/Oct/2026:21:00:00 +0000] "GET /termag/ws/agent?token=$TOKEN HTTP/1.1" 101 0 "-" "node"
 10.0.1.6 - - [06/Oct/2026:21:00:01 +0000] "GET /termag/auth/oidc/callback?code=s3cr3tc0de&state=st4te HTTP/1.1" 302 0 "-" "Mozilla"
@@ -237,6 +271,8 @@ service:
       exporters: [file/test]
     metrics:
       exporters: [file/test]
+    traces:
+      exporters: [file/test]
 EOF
   if ! "$BIN" validate --config="$CONFIG" --config="$WORK/destination.yaml" --config="$WORK/test.yaml" >"$WORK/validate.log" 2>&1; then
     fail "collector: config validates" "valid" "$(cat "$WORK/validate.log")"
@@ -249,14 +285,21 @@ EOF
     OTLP="http://127.0.0.1:${TERMAG_OTELCOL_TEST_OTLP_PORT:-14318}"
     OTLP_LOG='{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"termag-orchestrator"}}]},"scopeLogs":[{"scope":{"name":"termag.spawn"},"logRecords":[{"timeUnixNano":"1760000000000000000","observedTimeUnixNano":"1760000000000000000","eventName":"termag.spawn.refused","body":{"stringValue":"spawn refused (box_busy) ws/agent?token='"$TOKEN"'"},"attributes":[{"key":"termag.spawn.reason","value":{"stringValue":"box_busy"}}]}]}]}]}'
     OTLP_METRIC='{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"termag-orchestrator"}}]},"scopeMetrics":[{"scope":{"name":"termag.spawn"},"metrics":[{"name":"termag.box.hot","gauge":{"dataPoints":[{"timeUnixNano":"1760000000000000000","asInt":"1","attributes":[{"key":"termag.box","value":{"stringValue":"b1"}}]}]}}]}]}]}'
+    # A failed server span as the backend exports it, but with every secret
+    # its ScrubbingExporter should already have removed (url.full, an
+    # authorization header, an exception message, the status message) and the
+    # client's addresses. No service.name: resource/termag supplies it.
+    sattr() { printf '{"key":"%s","value":{"stringValue":"%s"}}' "$1" "$2"; }
+    OTLP_SPAN='{"resourceSpans":[{"resource":{"attributes":[]},"scopeSpans":[{"scope":{"name":"@opentelemetry/instrumentation-http"},"spans":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","name":"GET /termag/ws/agent","kind":2,"startTimeUnixNano":"1760000000000000000","endTimeUnixNano":"1760000000100000000","attributes":['"$(sattr termag.test.secrets "$SPAN_SECRETS"),$(sattr url.full "https://h.example.test/termag/ws/agent?token=$TOKEN"),$(sattr http.request.header.authorization "Bearer abcdefghijklmnop.qrstuv"),$(sattr url.query "code=qc0de1234&state=qst4te99"),$(sattr client.address 203.0.113.7),$(sattr network.peer.address 198.51.100.9),$(sattr http.route /termag/ws/agent)"'],"events":[{"timeUnixNano":"1760000000050000000","name":"exception","attributes":['"$(sattr exception.type Error),$(sattr exception.message "$SPAN_SECRETS")"']}],"status":{"code":2,"message":"'"$SPAN_SECRETS"'"}}]}]}]}'
     pushed=0 i=0
     while [ "$i" -lt 50 ] && [ "$pushed" = 0 ]; do
       if curl -fsS -o /dev/null -H 'Content-Type: application/json' -d "$OTLP_LOG" "$OTLP/v1/logs" 2>/dev/null \
-        && curl -fsS -o /dev/null -H 'Content-Type: application/json' -d "$OTLP_METRIC" "$OTLP/v1/metrics" 2>/dev/null; then pushed=1; fi
+        && curl -fsS -o /dev/null -H 'Content-Type: application/json' -d "$OTLP_METRIC" "$OTLP/v1/metrics" 2>/dev/null \
+        && curl -fsS -o /dev/null -H 'Content-Type: application/json' -d "$OTLP_SPAN" "$OTLP/v1/traces" 2>/dev/null; then pushed=1; fi
       i=$((i + 1))
       [ "$pushed" = 1 ] || sleep 0.2
     done
-    [ "$pushed" = 1 ] || fail "collector: the backend's OTLP receiver accepts logs and metrics" "HTTP 200" "no answer on $OTLP"
+    [ "$pushed" = 1 ] || fail "collector: the backend's OTLP receiver accepts logs, metrics and traces" "HTTP 200" "no answer on $OTLP"
     # 15 lines plus the two noise-fixture lines that are kept (the GH-AUTHZ
     # refusal and the near-miss STATUS line); the three dropped ones never count.
     want_records=17
@@ -266,7 +309,8 @@ EOF
     while [ "$i" -lt 150 ]; do
       n=$(grep -o '"observedTimeUnixNano"' "$WORK/out.json" 2>/dev/null | wc -l)
       if [ "${n:-0}" -ge "$want_records" ] && grep -q '"name":"up"' "$WORK/out.json" 2>/dev/null \
-        && grep -q '"name":"termag.box.hot"' "$WORK/out.json" 2>/dev/null; then break; fi
+        && grep -q '"name":"termag.box.hot"' "$WORK/out.json" 2>/dev/null \
+        && grep -q '"resourceSpans"' "$WORK/out.json" 2>/dev/null; then break; fi
       i=$((i + 1))
       sleep 0.2
     done
@@ -286,6 +330,30 @@ EOF
       case "$sent" in *"$kept"*) ;; *) fail "collector: keeps the line next to the noise" "$kept" "missing" ;; esac
     done
     case "$sent" in *'spawn refused (box_busy) ws/agent?token=REDACTED'*) ;; *) fail "collector: the backend's log records are redacted" "token=REDACTED" "$(grep -o 'spawn refused[^"]*' "$WORK/out.json" | head -1)" ;; esac
+
+    # The traces pipeline: the span arrives, every secret masked wherever it
+    # was (attribute, event attribute, status message), the addresses gone,
+    # and the same resource as the logs.
+    spans_sent="$(grep -F '"resourceSpans"' "$WORK/out.json" 2>/dev/null)"
+    [ -n "$spans_sent" ] || fail "collector: the backend's spans are exported" "a resourceSpans batch" "none: $(tail -5 "$WORK/collector.log")"
+    for secret in "$TOKEN" abcdefghijklmnop.qrstuv "$JWT_FIX" xoxb-1234567890-abcdefghij sdk-12345678-1234-1234-1234-123456789abc \
+      "$GH_FIX" "$ANT_FIX" "$AWS_KEY_ID" hunter2pass qc0de1234 qst4te99 203.0.113.7 198.51.100.9 '"client.address"' '"network.peer.address"'; do
+      case "$spans_sent" in *"$secret"*) fail "collector: a span doesn't carry $secret" "absent" "present" ;; esac
+    done
+    for want in \
+      "$(sattr termag.test.secrets "$SPAN_REDACTED")" \
+      "$(sattr exception.message "$SPAN_REDACTED")" \
+      "\"message\":\"$SPAN_REDACTED\"" \
+      "$(sattr url.full 'https://h.example.test/termag/ws/agent?token=REDACTED')" \
+      "$(sattr http.request.header.authorization 'Bearer REDACTED')" \
+      "$(sattr url.query 'code=REDACTED&state=REDACTED')" \
+      "$(sattr http.route /termag/ws/agent)" \
+      "$(sattr exception.type Error)" \
+      '"key":"telemetry.project_id","value":{"stringValue":"5f0c1e2d3a4b5c6d7e8f9a0b"}' \
+      '"key":"service.name","value":{"stringValue":"termag-orchestrator"}' \
+      '"key":"host.name"'; do
+      case "$spans_sent" in *"$want"*) ;; *) fail "collector: exports the span with" "$want" "missing: $spans_sent" ;; esac
+    done
 
     for secret in "$TOKEN" tmag_cmdline_secret s3cr3tc0de st4te hunter2pass abcdefghijklmnop.qrstuv \
       xoxb-1234567890-abcdefghij sdk-12345678-1234-1234-1234-123456789abc "$AWS_KEY_ID" "$JWT_FIX"; do

@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# claude-orchestrator-update — keep the orchestrator host's /usr/bin/claude at
+# or above the Claude Code floor, and update it on request.
+# Runs as root.
+#
+# Why this exists: /usr/bin/claude on the orchestrator host runs the Claude
+# Code self-hosted runner orchestrator (claude-runner-orchestrator.service),
+# every host user's sessions and the backend's own Software probe. The infra
+# repo's cloud-init installs it at every boot, pinned to an exact version
+# (claude_code_version). Every orchestrator deploy is an instance refresh, so
+# a floor raised in termag (deploy/claude-code-floor) did not move the host,
+# and a pin below the floor put it back below on every deploy. This script
+# makes the host follow termag's floor itself.
+#
+# Two callers, both systemd units installed by packer/scripts/orchestrator-setup.sh:
+#   * claude-orchestrator-floor.service, at boot: --boot. Pulled in and
+#     ordered before claude-runner-orchestrator.service (and started by
+#     cloud-init right after its own install, where cloud-init has that hook),
+#     so the runner orchestrator starts on what this leaves. The floor only:
+#     exactly the floor version when /usr/bin/claude is below it (or missing,
+#     or does not run), otherwise nothing.
+#   * claude-orchestrator-update@<run>.service: --run <run-id>. Started by
+#     /usr/local/libexec/termag/claude-orchestrator-update-start, which the
+#     backend (the termag user) runs through one sudoers line when an admin
+#     asks from the Software tab's orchestrator row, or for the nightly run.
+#     The run id is all that crosses sudo. The policy (floor and target) is
+#     what the backend wrote for that run into
+#     /var/lib/claude-orchestrator-update/requests/<run>.json, read as the
+#     termag user; anything else there is ignored. The run installs the
+#     pinned version, or the floor, then try-restarts the runner
+#     orchestrator and waits for its new process.
+#
+# What one run does:
+#   1. Takes /var/lib/claude-orchestrator-update/lock (flock), so a boot run
+#      and a requested run never run npm over each other, waiting at most
+#      what its budget leaves.
+#   2. The floor is root's copy of deploy/claude-code-floor
+#      (/usr/local/lib/termag/claude-code-floor, installed by the bake), never
+#      /opt/termag's, which the termag user owns. A --run's request may raise
+#      it, never lower it.
+#   3. Wants: --boot the floor; --run the request's target, which is only
+#      ever an exact x.y.z (orchestrator-claude-update-policy's pin; a tag or
+#      anything else is refused), or the floor when there is no pin or the
+#      pin is below the floor. A pin is run exactly: up or down to it, never
+#      below the floor. Otherwise it never moves the install down. It never
+#      reinstalls the version already there (npm would replace the binary
+#      under every running session for nothing), unless an earlier install
+#      was rejected (below). A --run with no pin that has nothing to bring
+#      up to the floor records floor-only.
+#   4. Installs exactly that version into root's npm global, naming the
+#      platform package too, as cloud-init does (`npm install -g
+#      @anthropic-ai/claude-code-linux-arm64@<v> @anthropic-ai/claude-code@<v>`):
+#      the wrapper's postinstall links the native binary from that optional
+#      dependency, and a skipped one would leave the placeholder. One retry
+#      while the budget allows. Accepted only when the wrapper's package.json,
+#      the platform package's package.json and `/usr/bin/claude --version`
+#      all say exactly that version. An install that ends anywhere else is
+#      REJECTED (recorded in /var/lib/claude-orchestrator-update/rejected,
+#      so the next run reinstalls while the binary is missing, unverified or
+#      below the floor, and otherwise drops the record) and put
+#      back: the previous version, reinstalled and verified the same way, or,
+#      failing that, the binary just laid down is quarantined (renamed to
+#      <file>.rejected, not executable), so nothing starts bytes this did not
+#      verify. A failed install that changed nothing is not a rejection.
+#      A quarantine (or one that failed) also HOLDS the runner orchestrator:
+#      /var/lib/claude-orchestrator-update/runner-held is written, which the
+#      runner's unit conditions on (ConditionPathExists=!), so nothing starts
+#      it, and a running one is stopped. The next verified install, boot or
+#      requested, removes the marker and starts the runner if it is enabled.
+#   5. When the runner orchestrator's main process does not run the current
+#      binary: `systemctl try-restart` (a stopped unit, as on a draining host
+#      in an overlapping deploy, stays stopped; one between restarts is
+#      restarted), then waits up to 15 s for its new process, as
+#      scripts/claude-floor/claude-floor.sh does. unit_binary= says current,
+#      - (not running), STALE(<what it runs>) or DOWN(<state>); STALE and
+#      DOWN fail the run. At boot the unit has not started yet: nothing to do.
+#   6. Counts host users' sessions on an old binary (the top claude of each
+#      process tree whose executable is not the current file), by user, and
+#      leaves them running. Stopping them is later work.
+#   7. Writes the run's record, in the shape of a box's tool-update report,
+#      to /var/lib/claude-orchestrator-update/runs/<id>.json (root:termag,
+#      0640), where the backend reads it into software_update_runs; a boot
+#      run's id is "boot" and the kernel's boot id. Then the summary line.
+#
+# It never keeps the host from booting or anything from starting: the boot
+# unit is a Wants= of the runner orchestrator (never Requires=), every step
+# takes its share of one budget (240 s at boot, inside the unit's 300 s), and
+# every outcome but bad usage exits in SuccessExitStatus, so the unit ends
+# active and a runner restart does not run it again.
+#
+# What is still trusted: npm's registry and @anthropic-ai/claude-code as
+# published there, as for cloud-init's install and the box updater.
+#
+#
+# Usage:
+#   claude-orchestrator-update --boot           the floor, at boot
+#   claude-orchestrator-update --run <run-id>   one requested run
+#
+# Exit codes: 0 when /usr/bin/claude ends at or above the floor and nothing
+# failed, 1 when it is below the floor, missing, or the run failed (install,
+# STALE, DOWN), 2 on bad usage, 3 while an install is rejected, 143 on a
+# signal (the record says failed).
+#
+# Env (tests; the units set none of these):
+#   TERMAG_CO_CLAUDE_BIN (/usr/bin/claude), TERMAG_CO_FLOOR_FILE
+#   (/usr/local/lib/termag/claude-code-floor), TERMAG_CO_STATE_DIR
+#   (/var/lib/claude-orchestrator-update), TERMAG_CO_PLATFORM (from uname -m),
+#   TERMAG_CO_PROC (/proc), TERMAG_CO_BUDGET (240 boot, 600 run),
+#   TERMAG_CO_INSTALL_TIMEOUT (300), TERMAG_CO_RETRY_SLEEP (15),
+#   TERMAG_CO_KILL_GRACE (10), TERMAG_CO_VER_TIMEOUT (8),
+#   TERMAG_CO_UNIT_WAIT_TRIES (30, half a second each), TERMAG_CO_BOOT_ID,
+#   TERMAG_CO_PATH_PREFIX (directories put before the system ones).
+set -u
+# The system directories, whatever the caller had; TERMAG_CO_PATH_PREFIX (the
+# tests' stubs) goes first.
+PATH=${TERMAG_CO_PATH_PREFIX:+$TERMAG_CO_PATH_PREFIX:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+PKG=@anthropic-ai/claude-code
+CLAUDE_BIN=${TERMAG_CO_CLAUDE_BIN:-/usr/bin/claude}
+FLOOR_FILE=${TERMAG_CO_FLOOR_FILE:-/usr/local/lib/termag/claude-code-floor}
+STATE=${TERMAG_CO_STATE_DIR:-/var/lib/claude-orchestrator-update}
+PROC=${TERMAG_CO_PROC:-/proc}
+RUNNER_UNIT=claude-runner-orchestrator.service
+REQUESTS=$STATE/requests
+RESULTS=$STATE/runs
+REJECTED=$STATE/rejected
+# While this exists the runner orchestrator does not start: its unit has
+# ConditionPathExists=!<this> (deploy/claude-runner-orchestrator.service).
+HELD=$STATE/runner-held
+
+log() { printf 'claude-orchestrator-update: %s\n' "$*" >&2; }
+usage() { log "usage: claude-orchestrator-update --boot | --run <run-id>"; exit 2; }
+is_version() { [[ "$1" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; }
+at_least() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+
+MODE='' RUN_ID=''
+case "${1:-}" in
+  --boot) MODE=boot; [ $# -eq 1 ] || usage ;;
+  # The run id names the systemd instance, a request file and a record: the
+  # orchestrator's id pattern, as the start helper and the sudoers rule check it.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+
+case "$MODE" in boot) BUDGET=${TERMAG_CO_BUDGET:-240} ;; *) BUDGET=${TERMAG_CO_BUDGET:-600} ;; esac
+INSTALL_TIMEOUT=${TERMAG_CO_INSTALL_TIMEOUT:-300}
+RETRY_SLEEP=${TERMAG_CO_RETRY_SLEEP:-15}
+KILL_GRACE=${TERMAG_CO_KILL_GRACE:-10}
+VER_TIMEOUT=${TERMAG_CO_VER_TIMEOUT:-8}
+UNIT_WAIT_TRIES=${TERMAG_CO_UNIT_WAIT_TRIES:-30}
+SETTLE=${TERMAG_CO_SETTLE:-5}
+for n in "$SETTLE" "$BUDGET" "$INSTALL_TIMEOUT" "$RETRY_SLEEP" "$KILL_GRACE" "$VER_TIMEOUT" "$UNIT_WAIT_TRIES"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+# ── the budget ──────────────────────────────────────────────────────────────
+# One deadline for the whole run, as termag-claude-update has it. A long step
+# (the lock, npm view, an install) gets what is left minus RESERVE: an
+# install's TERM-to-KILL grace, two version checks and the restart wait, plus
+# slack, so the run ends inside its budget on its own and systemd's
+# TimeoutStartSec never has to cut it.
+RESERVE=$(( KILL_GRACE + 2 * VER_TIMEOUT + UNIT_WAIT_TRIES / 2 + 2 * SETTLE + 4 ))
+DEADLINE=$(( $(date +%s) + BUDGET ))
+left() {
+  local l=$(( DEADLINE - $(date +%s) - RESERVE ))
+  [ "$l" -gt 0 ] || l=0
+  [ "$l" -lt "$1" ] || l=$1
+  printf '%s' "$l"
+}
+run_capped() {
+  local cap=$1; shift
+  [ "$cap" -gt 0 ] || { log "the ${BUDGET}s budget is spent; not running $1"; return 124; }
+  timeout -k "$KILL_GRACE" "$cap" "$@"
+}
+
+ver() { [ -x "$1" ] || return 0; timeout -k 2 "$VER_TIMEOUT" "$1" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1; }
+
+case "${TERMAG_CO_PLATFORM:-$(uname -m)}" in
+  aarch64|linux-arm64) PLATFORM_PKG=$PKG-linux-arm64 ;;
+  x86_64|linux-x64) PLATFORM_PKG=$PKG-linux-x64 ;;
+  *) PLATFORM_PKG='' ;;
+esac
+
+NPM_ROOT=$(npm root -g </dev/null 2>/dev/null) || NPM_ROOT=
+pver() { [ -n "$NPM_ROOT" ] && sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$NPM_ROOT/$1/package.json" 2>/dev/null | head -n 1; }
+# The platform package's version, or "n/a" where this platform has none to name.
+plat_ver() { if [ -n "$PLATFORM_PKG" ]; then pver "$PLATFORM_PKG"; else echo n/a; fi; }
+# verified V: both package.json files and the binary say exactly V.
+verified() {
+  [ "$(pver "$PKG")" = "$1" ] && [ "$(ver "$CLAUDE_BIN")" = "$1" ] || return 1
+  [ -z "$PLATFORM_PKG" ] || [ "$(pver "$PLATFORM_PKG")" = "$1" ]
+}
+
+notes=()
+note() { notes+=("$1"); }
+RESULT_ID=$RUN_ID
+if [ "$MODE" = boot ]; then
+  boot_id=${TERMAG_CO_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)}
+  boot_id=$(printf '%s' "$boot_id" | tr -dc 'a-f0-9' | head -c 32)
+  [ ${#boot_id} -ge 16 ] || boot_id=$(date +%s%N | tr -dc '0-9' | head -c 20)
+  RESULT_ID=boot$boot_id
+fi
+
+# ── the record ──────────────────────────────────────────────────────────────
+# The backend reads it (services/toolUpdate/orchestrator.ts) with the box
+# report's parser, so it has a box report's fields: component, trigger,
+# outcome, run, target, fromVersion, toVersion, detail, sessions, panes.
+before='' after='' spec='' TARGET='' old_sessions=0 old_by_user='' unit_bin=- written=0
+write_record() {
+  local outcome=$1 trigger=manual detail tmp
+  [ "$MODE" = boot ] && trigger=boot
+  detail="$(IFS=' '; echo "${notes[*]:-}") unit_binary=$unit_bin"
+  [ "$old_sessions" -gt 0 ] && detail="$detail; host sessions on an old binary: $old_sessions ($old_by_user), left running"
+  install -d -m 0750 "$RESULTS" 2>/dev/null || mkdir -p "$RESULTS" 2>/dev/null
+  tmp=$(mktemp "$RESULTS/.$RESULT_ID.XXXXXX") || { log "could not write the record in $RESULTS"; return 1; }
+  if jq -n --arg outcome "$outcome" --arg trigger "$trigger" --arg run "$RESULT_ID" --arg target "${spec:-$TARGET}" \
+      --arg from "$before" --arg to "$after" --arg detail "$detail" --argjson other "$old_sessions" '{
+        component: "claude", host: "orchestrator", trigger: $trigger, outcome: $outcome, run: $run,
+        target: (if $target == "" then null else $target end),
+        fromVersion: (if $from == "" then null else $from end), toVersion: (if $to == "" then null else $to end),
+        detail: $detail[0:2000],
+        sessions: {stopped: 0, resumed: 0, fresh: 0, cut: 0, typed: 0, other: $other, runnersLeft: 0},
+        panes: []
+      }' >"$tmp"; then
+    # The backend (the termag group) reads it; nobody else needs to.
+    if [ "$(id -u)" = 0 ]; then chown root:termag "$tmp" 2>/dev/null || true; fi
+    chmod 0640 "$tmp"
+    mv -f "$tmp" "$RESULTS/$RESULT_ID.json" && written=1
+  else
+    rm -f "$tmp"
+  fi
+}
+
+on_signal() {
+  trap - TERM INT HUP
+  note "stopped-by-signal"
+  after=$(ver "$CLAUDE_BIN")
+  [ "$written" = 1 ] || write_record failed
+  log "run=$RESULT_ID stopped by a signal; recorded failed"
+  exit 143
+}
+trap on_signal TERM INT HUP
+
+# ── 1. the lock ─────────────────────────────────────────────────────────────
+install -d -m 0755 "$STATE" 2>/dev/null || mkdir -p "$STATE"
+exec 9>>"$STATE/lock"
+if ! flock -w "$(left "$BUDGET")" 9; then
+  note "lock-busy"
+  before=$(ver "$CLAUDE_BIN") after=$before
+  write_record failed
+  log "run=$RESULT_ID could not take $STATE/lock within its budget; installed nothing"
+  exit 1
+fi
+
+# ── 2. the floor, and the request ───────────────────────────────────────────
+FLOOR=$(tr -d '[:space:]' <"$FLOOR_FILE" 2>/dev/null)
+if ! is_version "$FLOOR"; then
+  log "no floor in $FLOOR_FILE ('$FLOOR')"
+  note "no-floor"
+  FLOOR=''
+fi
+
+# The request is the termag user's file: read it as that user, so root never
+# follows a link the backend could not, and take only two validated fields.
+read_request() {
+  local f=$REQUESTS/$RUN_ID.json
+  if [ "$(id -u)" = 0 ] && [ "$(stat -c %U "$REQUESTS" 2>/dev/null)" != root ]; then
+    setpriv --reuid="$(stat -c %u "$REQUESTS")" --regid="$(stat -c %g "$REQUESTS")" --clear-groups -- head -c 4096 -- "$f" 2>/dev/null
+  else
+    head -c 4096 -- "$f" 2>/dev/null
+  fi
+}
+if [ "$MODE" = run ]; then
+  req=$(read_request)
+  r_floor=$(printf '%s' "$req" | jq -r 'if type == "object" then (.floor // "") else "" end' 2>/dev/null) || r_floor=
+  r_target=$(printf '%s' "$req" | jq -r 'if type == "object" then (.target // "") else "" end' 2>/dev/null) || r_target=
+  # The orchestrator host takes exact versions only (orchestrator-claude-
+  # update-policy, a decision on #1165): a pin, or no target at all,
+  # which is the floor only. A tag (latest, stable) or anything else is
+  # refused and logged, and the run is the floor only too.
+  if [ -z "$req" ]; then
+    log "no request for run $RUN_ID in $REQUESTS: the floor only"
+    note "policy=none"
+  elif is_version "$r_target"; then
+    TARGET=$r_target
+    note "policy=pin($r_target)"
+  elif [ -z "$r_target" ] || [ "$r_target" = null ]; then
+    log "no version pinned for the orchestrator host: the floor only"
+    note "policy=floor-only"
+  else
+    r_shown=$(printf '%s' "$r_target" | tr -dc 'A-Za-z0-9.-' | head -c 40)
+    log "the request's target '$r_shown' is not an exact version; refused: the floor only"
+    note "target-refused($r_shown)"
+  fi
+  if is_version "$r_floor" && { [ -z "$FLOOR" ] || at_least "$r_floor" "$FLOOR"; }; then FLOOR=$r_floor; fi
+fi
+
+# ── 3. what it wants ────────────────────────────────────────────────────────
+before=$(ver "$CLAUDE_BIN")
+before_pkg=$(pver "$PKG")
+# Whether the runner orchestrator was up (or between restarts) before the
+# install: if it is down afterwards, it went down during the install, not
+# because a draining host stopped it (step 5).
+runner_was=$(systemctl show -p ActiveState --value "$RUNNER_UNIT" 2>/dev/null)
+before_plat=$(plat_ver)
+rejected=0; [ -s "$REJECTED" ] && rejected=1
+# TARGET is only ever an exact version (above), so nothing is resolved
+# through the registry: npm installs that version or fails.
+target_v=$TARGET
+if [ -n "$target_v" ] && { [ -z "$FLOOR" ] || at_least "$target_v" "$FLOOR"; }; then
+  spec=$target_v
+else
+  [ -n "$target_v" ] && { log "$TARGET resolves to $target_v, below the floor $FLOOR"; note "target-below-floor($target_v)"; }
+  spec=$FLOOR
+fi
+
+# A rejection whose binary on disk now verifies (put back, or reinstalled
+# since) at or above the floor is over: nothing unverified is left, and
+# reinstalling "what it wants" would move a restored version down to the
+# floor (Devin on #1165). The record still forces a reinstall while the
+# binary is missing, unverified or below the floor.
+if [ "$rejected" = 1 ] && [ -n "$before" ] && verified "$before" && { [ -z "$FLOOR" ] || at_least "$before" "$FLOOR"; }; then
+  log "the earlier rejection is over: $CLAUDE_BIN is $before, verified"
+  note "rejection-cleared($before)"
+  rm -f "$REJECTED"
+  rejected=0
+fi
+need=0
+if [ -z "$spec" ]; then
+  log "nothing to install: no floor and no target"
+elif [ "$rejected" = 1 ]; then
+  log "an earlier install was rejected ($(head -c 300 "$REJECTED")): reinstalling $spec"
+  need=1
+elif [ -z "$before" ]; then
+  log "$CLAUDE_BIN is missing or does not run (package.json says ${before_pkg:-nothing}): installing $spec"
+  need=1
+elif ! at_least "$before" "$spec"; then
+  need=1
+elif [ "$before" != "$spec" ] && [ -n "$target_v" ]; then
+  # A pin below what runs: the host runs exactly the pin, or the floor when
+  # the pin is below it (spec), so the tab has a way back down.
+  log "pinned to $spec, below the $before installed: moving down to it"
+  note "downgrade($before->$spec)"
+  need=1
+elif [ "$before" != "$spec" ]; then
+  note "no-downgrade($before>$spec)"
+fi
+
+# ── 4. the install ──────────────────────────────────────────────────────────
+reject() {
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >"$REJECTED.tmp" && mv -f "$REJECTED.tmp" "$REJECTED"
+  log "REJECTED: $1"
+}
+quarantine() {
+  [ -n "$1" ] && [ -e "$1" ] || return 1
+  mv -f "$1" "$1.rejected" 2>/dev/null || return 1
+  chmod a-x "$1.rejected" 2>/dev/null || true
+  log "quarantined $1 as $1.rejected: nothing starts it now"
+}
+npm_install() {
+  local v=$1 cap pkgs=()
+  [ -n "$PLATFORM_PKG" ] && pkgs+=("$PLATFORM_PKG@$v")
+  pkgs+=("$PKG@$v")
+  cap=$(left "$INSTALL_TIMEOUT")
+  log "installing ${pkgs[*]} (at most ${cap}s)"
+  run_capped "$cap" npm install -g --no-fund --no-audit --loglevel=error "${pkgs[@]}" </dev/null >&2
+}
+# hold_runner WHY: no unverified bytes run. Writes the marker the runner
+# orchestrator's unit conditions on, so nothing starts it (cloud-init, the
+# backend's serve, Restart=always), and stops it if it is running: it is on
+# the binary the install just replaced, and must not come back onto nothing.
+hold_runner() {
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >"$HELD.tmp" && mv -f "$HELD.tmp" "$HELD"
+  log "holding $RUNNER_UNIT: $1"
+  systemctl cat "$RUNNER_UNIT" >/dev/null 2>&1 || return 0
+  case "$(systemctl show -p ActiveState --value "$RUNNER_UNIT" 2>/dev/null)" in
+    active|activating|reloading)
+      if systemctl stop "$RUNNER_UNIT"; then note runner-stopped; else note runner-stop-FAILED; fi ;;
+    *) note runner-held ;;
+  esac
+}
+install_rc=0 released=0
+if [ "$need" = 1 ]; then
+  ok=0
+  if npm_install "$spec"; then ok=1
+  elif [ "$(left "$INSTALL_TIMEOUT")" -gt $(( RETRY_SLEEP + 30 )) ]; then
+    log "npm install failed; retrying in ${RETRY_SLEEP}s"
+    sleep "$RETRY_SLEEP"
+    npm_install "$spec" && ok=1
+  else
+    log "npm install failed or was stopped, and the budget has no room for a retry"
+  fi
+  NPM_ROOT=$(npm root -g </dev/null 2>/dev/null) || NPM_ROOT=
+  if verified "$spec"; then
+    rm -f "$REJECTED"
+    note "installed(${before:-none}->$spec)"
+    log "installed $PKG@$spec, verified (package.json, ${PLATFORM_PKG:+the platform package.json, }claude --version)"
+  elif [ "$ok" = 0 ] && [ "$(pver "$PKG")" = "$before_pkg" ] && [ "$(plat_ver)" = "$before_plat" ] && [ "$(ver "$CLAUDE_BIN")" = "$before" ] && [ "$rejected" = 0 ]; then
+    note "npm-FAILED"
+    log "npm install of $spec did not complete; nothing changed"
+    install_rc=1
+  else
+    reject "asked for $spec; $PKG's package.json says $(pver "$PKG" || true), ${PLATFORM_PKG:-no platform package} says $(plat_ver || true), claude --version says $(ver "$CLAUDE_BIN" || true)"
+    note "REJECTED($spec)"
+    install_rc=3
+    restored=0
+    if is_version "$before_pkg" && [ "$before" = "$before_pkg" ] && [ "$rejected" = 0 ]; then
+      log "putting $before_pkg back"
+      if npm_install "$before_pkg"; then NPM_ROOT=$(npm root -g </dev/null 2>/dev/null) || NPM_ROOT=; fi
+      if verified "$before_pkg"; then
+        restored=1
+        note "restored($before_pkg)"
+        log "back at $before_pkg, verified"
+      else
+        log "could not put $before_pkg back"
+      fi
+    fi
+    if [ "$restored" = 0 ]; then
+      if quarantine "$(readlink -f "$CLAUDE_BIN" 2>/dev/null)"; then note quarantined; else note "quarantine-FAILED"; fi
+      hold_runner "the install of $spec could not be verified or put back"
+    fi
+  fi
+fi
+after=$(ver "$CLAUDE_BIN")
+# A hold ends once the binary on disk verifies at or above the floor and no
+# rejection is open, whoever put it there: this run's install, or one put
+# back or reinstalled since (Bugbot on #1165). A quarantine in this run left
+# no binary, and a failed one leaves its rejection, so neither releases.
+if [ -e "$HELD" ] && [ -n "$after" ] && [ ! -s "$REJECTED" ] && verified "$after" && { [ -z "$FLOOR" ] || at_least "$after" "$FLOOR"; }; then
+  rm -f "$HELD"
+  released=1
+fi
+
+# The install is done: let the lock go before touching the runner. Its unit
+# Wants= the floor unit, so a restart starts that unit again when it is not
+# active (one stopped by a signal, say), and the floor run would then wait
+# on this lock while this run waits on the restart (Bugbot on #1165). The
+# next holder decides afresh, as every run does.
+exec 9>&-
+
+# ── 5. the runner orchestrator ──────────────────────────────────────────────
+# The same checks as scripts/claude-floor/claude-floor.sh (claude-floor.test.sh
+# tests them there against real processes): which binary the unit's main
+# process runs, the wait for the new process after a restart, and DOWN.
+ustate() { echo "$(systemctl show -p ActiveState --value "$RUNNER_UNIT" 2>/dev/null)/$(systemctl show -p SubState --value "$RUNNER_UNIT" 2>/dev/null)"; }
+unit_binary() {
+  local pid exe
+  pid=$(systemctl show -p MainPID --value "$RUNNER_UNIT" 2>/dev/null)
+  [ "${pid:-0}" != 0 ] || { echo -; return; }
+  if [ "$PROC/$pid/exe" -ef "$(readlink -f "$CLAUDE_BIN")" ]; then echo current; return; fi
+  exe=$(readlink "$PROC/$pid/exe" 2>/dev/null) || exe=unknown
+  exe=${exe// (deleted)/,deleted}
+  echo "STALE(${exe// /_})"
+}
+unit_wait_current() {
+  local i=0
+  while [ "$i" -lt "$UNIT_WAIT_TRIES" ]; do
+    [ "$(unit_binary)" = current ] && return 0
+    i=$((i + 1))
+    sleep 0.5
+  done
+  return 1
+}
+# runner_settled: after a restart, the new process is on the current file
+# (unit_wait_current), and then stays: SETTLE seconds later its MainPID and
+# systemd's NRestarts are unchanged. A runner that exits a second after it
+# starts would otherwise read current while systemd backs off.
+runner_settled() {
+  local p0 n0 p1 n1
+  # 1: never on the current file (STALE, or no process: runner_report says
+  # which); 2: it was, and did not stay up.
+  unit_wait_current || return 1
+  p0=$(systemctl show -p MainPID --value "$RUNNER_UNIT" 2>/dev/null)
+  n0=$(systemctl show -p NRestarts --value "$RUNNER_UNIT" 2>/dev/null)
+  sleep "$SETTLE"
+  p1=$(systemctl show -p MainPID --value "$RUNNER_UNIT" 2>/dev/null)
+  n1=$(systemctl show -p NRestarts --value "$RUNNER_UNIT" 2>/dev/null)
+  if [ "$p1" = "$p0" ] && [ "$n1" = "$n0" ] && [ "$(unit_binary)" = current ]; then return 0; fi
+  note "runner-not-settled(pid:$p0->$p1,restarts:$n0->$n1)"
+  return 2
+}
+# The unit_binary= field: DOWN(<state>) when a restart left no process or one
+# that did not stay up, else what unit_binary says.
+runner_report() {
+  local b
+  b=$(unit_binary)
+  if [ "$restarted" = 1 ] && { [ "$b" = - ] || [ "${settle_fail:-0}" = 1 ]; }; then b="DOWN($(ustate))"; fi
+  echo "$b"
+}
+restarted=0 settle_fail=0
+if [ "$released" = 1 ] && systemctl cat "$RUNNER_UNIT" >/dev/null 2>&1; then
+  # A verified install after a hold: the runner may start again. Started only
+  # when it is enabled (cloud-init enables it when the host has its key), and
+  # without waiting: at boot its own start job is already queued after this.
+  note runner-released
+  if [ "$(systemctl is-enabled "$RUNNER_UNIT" 2>/dev/null)" = enabled ]; then
+    case "$(systemctl show -p ActiveState --value "$RUNNER_UNIT" 2>/dev/null)" in
+      inactive|failed) systemctl start --no-block "$RUNNER_UNIT" && note runner-started ;;
+    esac
+  fi
+fi
+if [ ! -e "$HELD" ] && [ -n "$after" ] && { [ -z "$FLOOR" ] || at_least "$after" "$FLOOR"; } && systemctl cat "$RUNNER_UNIT" >/dev/null 2>&1; then
+  ub=$(unit_binary)
+  if [ "$ub" != - ] && [ "$ub" != current ]; then
+    systemctl try-restart "$RUNNER_UNIT" && restarted=1
+  elif [ "$ub" = - ] && [ "$(ustate)" = activating/auto-restart ] && [ "$after" != "$before" ]; then
+    # Between restarts (Restart=always backs off up to 300 s): start it on the new binary now.
+    systemctl restart "$RUNNER_UNIT" && restarted=1
+  elif [ "$ub" = - ] && [ "$(ustate)" = inactive/dead ] && { [ "$runner_was" = active ] || [ "$runner_was" = activating ]; } \
+      && [ "$(systemctl show -p ConditionResult --value "$RUNNER_UNIT" 2>/dev/null)" = no ]; then
+    # It was up when the run began, and its last start was skipped by a
+    # condition: a Restart=always start that fell while npm was replacing
+    # /usr/bin/claude (ConditionFileIsExecutable; Bugbot on #1165). A drain's
+    # `systemctl stop` leaves ConditionResult=yes, so a runner a displaced host
+    # stopped during the run stays stopped. Start it on the new binary,
+    # without blocking: the wait below follows it, and a blocking start can
+    # never then wait on a job that waits on this one.
+    systemctl start --no-block "$RUNNER_UNIT" && restarted=1
+  fi
+  if [ "$restarted" = 1 ]; then note "runner-restarted"; runner_settled; [ $? = 2 ] && settle_fail=1; fi
+fi
+unit_bin=$(runner_report)
+
+# A release whose runner does not stay up (DOWN after an upgrade): put the
+# version that ran back, verified, and restart onto it, as a rejected install
+# is put back. The run still fails: the target did not
+# hold. An unverified put-back is rejected, quarantined and held like any.
+case "$unit_bin" in
+  DOWN*)
+    # Not a crash: a drain stopped it during the settle (a stop leaves the
+    # unit inactive, with its last start's conditions met). The new version
+    # stays, and so does the stop (Bugbot on #1165).
+    if [ "$(ustate)" = inactive/dead ] && [ "$(systemctl show -p ConditionResult --value "$RUNNER_UNIT" 2>/dev/null)" != no ]; then
+      note "runner-stopped-meanwhile"
+      unit_bin=-
+    elif [ "$need" = 1 ] && [ "$install_rc" = 0 ] && is_version "$before_pkg" && [ "$before" = "$before_pkg" ] && [ "$after" != "$before" ]; then
+      log "the runner orchestrator does not stay up on $after ($unit_bin): putting $before_pkg back"
+      note "runner-down-on($after)"
+      exec 9>>"$STATE/lock"
+      if ! flock -w "$(left 60)" 9; then
+        note "put-back-skipped(lock-busy)"
+      else
+        new_v=$after
+        npm_install "$before_pkg" || :
+        NPM_ROOT=$(npm root -g </dev/null 2>/dev/null) || NPM_ROOT=
+        if verified "$before_pkg"; then
+          note "put-back($before_pkg)"
+          exec 9>&-
+          settle_fail=0
+          # try-restart, as everywhere else: a unit a drain stopped meanwhile stays stopped (Bugbot on #1165).
+          if systemctl try-restart "$RUNNER_UNIT"; then restarted=1; runner_settled; [ $? = 2 ] && settle_fail=1; fi
+        elif verified "$new_v"; then
+          # The put-back did not run or changed nothing (a spent budget, the
+          # registry): the verified new version stays; nothing to reject
+          # (Bugbot on #1165).
+          note "put-back-FAILED(nothing-changed)"
+          exec 9>&-
+        else
+          reject "put back $before_pkg after the runner went down on $after; it did not verify"
+          note "put-back-REJECTED($before_pkg)"
+          install_rc=3
+          if quarantine "$(readlink -f "$CLAUDE_BIN" 2>/dev/null)"; then note quarantined; else note "quarantine-FAILED"; fi
+          hold_runner "the put-back of $before_pkg could not be verified"
+          exec 9>&-
+        fi
+      fi
+      after=$(ver "$CLAUDE_BIN")
+      unit_bin=$(runner_report)
+      # The target did not hold: the run fails (3 stays 3).
+      [ "$install_rc" = 0 ] && install_rc=1
+    fi ;;
+esac
+
+# ── 6. host users' sessions on an old binary ────────────────────────────────
+# The top claude of each process tree (its sub-claudes go with it), whose
+# executable is not the file /usr/bin/claude is now. Counted, left running.
+cur=$(readlink -f "$CLAUDE_BIN" 2>/dev/null)
+runner_pid=$(systemctl show -p MainPID --value "$RUNNER_UNIT" 2>/dev/null)
+# Only root's install counts: a host user's own claude (nvm, ~/.local/bin) is
+# theirs. A process on a replaced install runs a deleted file under the
+# package's directory, or under the one npm renamed it to while installing
+# (@anthropic-ai/.claude-code-<random>, seen on a systemd host).
+is_claude_exe() {
+  [ -n "$NPM_ROOT" ] || return 1
+  case "$(readlink "$PROC/$1/exe" 2>/dev/null)" in "$NPM_ROOT/@anthropic-ai/claude-code"*|"$NPM_ROOT/@anthropic-ai/.claude-code"*) return 0 ;; esac
+  return 1
+}
+ppid_of() { sed -E 's/^.*\) [A-Za-z] ([0-9]+) .*$/\1/' "$PROC/$1/stat" 2>/dev/null; }
+declare -A by_user=()
+for d in "$PROC"/[0-9]*; do
+  pid=${d##*/}
+  [ "$pid" = "${runner_pid:-0}" ] && continue
+  is_claude_exe "$pid" || continue
+  [ -n "$cur" ] && [ "$PROC/$pid/exe" -ef "$cur" ] && continue
+  pp=$(ppid_of "$pid"); [ -n "$pp" ] && is_claude_exe "$pp" && continue
+  uid=$(awk '/^Uid:/ { print $2; exit }' "$PROC/$pid/status" 2>/dev/null)
+  u=$(getent passwd "${uid:-x}" 2>/dev/null | cut -d: -f1); u=${u:-uid${uid:-?}}
+  by_user[$u]=$(( ${by_user[$u]:-0} + 1 ))
+  old_sessions=$((old_sessions + 1))
+done
+for u in $(printf '%s\n' "${!by_user[@]}" | sort); do old_by_user="${old_by_user:+$old_by_user, }$u ${by_user[$u]}"; done
+
+# ── 7. the outcome, the record, the summary ─────────────────────────────────
+rc=0 outcome=current state=ok
+[ "$need" = 1 ] && [ "$install_rc" = 0 ] && outcome=updated
+if [ -z "$after" ] || { [ -n "$FLOOR" ] && ! at_least "$after" "$FLOOR"; }; then state=BELOW_FLOOR; rc=1; fi
+[ "$install_rc" != 0 ] && rc=$install_rc
+case "$unit_bin" in STALE*|DOWN*) [ "$rc" = 0 ] && rc=1 ;; esac
+# A requested run with no pin that had nothing to bring up to the floor:
+# floor-only, not current, so the tab says why nothing moved.
+[ "$MODE" = run ] && [ -z "$TARGET" ] && [ "$need" = 0 ] && outcome=floor-only
+[ "$rc" != 0 ] && outcome=failed
+[ -s "$REJECTED" ] && rc=3
+write_record "$outcome" || log "the record for $RESULT_ID was not written"
+log "run=$RESULT_ID mode=$MODE outcome=$outcome claude=${before:-none}->${after:-none} state=$state floor=${FLOOR:--} target=${TARGET:-floor}${spec:+($spec)} unit=$(ustate) unit_binary=$unit_bin old_sessions=$old_sessions runner_held=$([ -e "$HELD" ] && echo yes || echo no) note=$(IFS=,; echo "${notes[*]:--}")"
+exit "$rc"

@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# termag-codex-update — update the Codex CLI on a box when the orchestrator
+# asks, and stop and resume its sessions as the run's policy says.
+#
+#
+# Why this exists: Codex runs code with its owner's credentials, and has had
+# advisories that a box only leaves behind by updating (the floor's sources
+# are in backend/src/services/codexUpdatePolicy.ts). The image bakes
+# @openai/codex from npm at latest, unpinned (packer/scripts/setup.sh), and
+# nothing else moved it forward: the fleet ran 0.162 to 0.165 on 2026-10-30.
+# This is the box's updater, Claude Code's recipe (deploy/termag-claude-update)
+# for a second tool: what the two share is deploy/termag-tool-update-lib,
+# beside this script.
+#
+# One caller: termag-codex-update@<run>.service, started by the agent's
+# tool-update RPC (agent/tool-update.js) when an admin updates Codex from the
+# Software tab: --run <run-id>. There is no boot run and no runner guard:
+# Codex runs no cloud sessions.
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=codex&run=<id> with
+#      the agent token on curl's stdin: {floor, target, restart, drainSec,
+#      run}. A 200 that names this run gives its restart (none, idle or force)
+#      and drainSec. A 200 with run null (the flag turned off since, the run
+#      expired), and anything else (no answer, a refusal, an unreadable body),
+#      installs nothing and restarts nothing: Codex has no floor file to fall
+#      back on, and a box is never updated past what the orchestrator
+#      authorised.
+#   2. Takes ~/.termag/codex-update.lock (flock), so two runs never run npm
+#      over each other.
+#   3. Resolves the policy's target to one exact version (a dist-tag through
+#      `npm view @openai/codex@latest version`, once), never below the floor
+#      and never below what is installed, and installs exactly that into the
+#      npm global under the nvm default, where the image puts it, only when
+#      the installed one is below it: `npm install -g @openai/codex@<x.y.z>`,
+#      retried once. Accepted only when the package's package.json and
+#      `codex --version` both say exactly x.y.z: the native binary comes from
+#      a platform dependency (@openai/codex-linux-<arch>), so a clean npm exit
+#      proves nothing. An install that ends anywhere else is REJECTED:
+#      recorded in ~/.termag/codex-update.rejected until a later run installs
+#      and verifies it (every run exits 3 meanwhile), and put back (the
+#      version before, reinstalled and verified) or, failing that,
+#      quarantined (bin/codex.js renamed to codex.js.rejected, not
+#      executable), so nothing that resolves `codex` afterwards runs bytes this
+#      script did not verify.
+#   4. Stops the Codex sessions still on an old binary, as restart says:
+#        * the Codex in each tmux pane: its native binary (the process whose
+#          /proc/<pid>/exe is no longer the installed one's inode), which its
+#          node launcher (bin/codex.js) exits with. restart=idle stops each
+#          one once its conversation is out of a turn, at most drainSec, then
+#          cuts it; restart=force stops them all at once. SIGTERM, then
+#          SIGKILL after TERMAG_CODEX_KILL_AFTER (20 s). "In a turn" is read
+#          from the conversation's rollout
+#          (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl, which the
+#          Codex holding the conversation keeps open): its last task_started
+#          with no task_complete or turn_aborted after it. A termag agent pane
+#          is a --remote client of the app server its bridge started
+#          (agent/codex-status-bridge.js), and that server, matched by its
+#          --listen address, holds the rollout;
+#        * anything else (the bridge's app servers, `codex exec` and review
+#          turns, MCP servers, a Codex that is not the pane shell's own, such
+#          as one another agent's tool call runs, sessions outside tmux) is
+#          counted as other and left alone. An agent
+#          pane's app server is replaced when the orchestrator relaunches the
+#          pane (its codex-session-start restarts the bridge).
+#      Then, per stopped pane, once its shell has the foreground back: an
+#      agent pane (a tmux session named <...>-agent) is left at its shell and
+#      listed for the orchestrator, which relaunches it through its own launch
+#      path with `codex resume <id>` when it had a conversation; any other
+#      pane with a conversation gets `codex resume <id>` typed into it, and
+#      one without is left at its shell. Panes of other agents (Claude Code,
+#      Cursor, ...) are never touched.
+#   5. POST <orchestrator>/api/tool-update/report: {component: "codex",
+#      trigger: "manual", run, outcome (updated, current, partial, failed),
+#      target, fromVersion, toVersion, detail, sessions {stopped, resumed,
+#      fresh, cut, typed, other, runnersLeft}, panes [{session, role,
+#      sessionId?, hadConversation}]}. Not when the orchestrator answered the
+#      policy with 404 (it knows no such run). A signal (systemctl stop, the
+#      unit's timeout) reports `failed` and exits 143.
+#
+# What is still trusted: npm's registry, and @openai/codex as published
+# there, as for the image bake. Installing one exact, verified version closes
+# the gap between what was resolved and what is installed; it does not
+# authenticate the publisher, and `codex --version` is not provenance.
+#
+# Usage:
+#   termag-codex-update --run <run-id>   one orchestrator run: the policy, the
+#                                        install, the sessions, the report
+#
+# Exit codes: 0 when the codex a session would start is at or above the floor
+# (or nothing was asked of it), 1 when it is below it or there is no codex, 2
+# on bad usage, 3 while an install is rejected (this takes precedence), 143
+# when a signal stops it. The report says what the sessions did. Logs go to
+# stderr, one `termag-codex-update: ...` line each, ending with a summary
+# line, the run's line and the report.
+#
+# Env:
+#   CODEX_BIN                     the codex to judge (default: the one on PATH,
+#                                 with the nvm default's bin on it)
+#   TERMAG_STATE_DIR              where the lock lives (default $HOME/.termag)
+#   TERMAG_CODEX_BUDGET           seconds the install may take, before its
+#                                 sessions (default 600)
+#   TERMAG_CODEX_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_CODEX_INSTALL_TIMEOUT  seconds for each install step (default 300)
+#   TERMAG_CODEX_RETRY_SLEEP      seconds before the npm retry (default 15)
+#   TERMAG_AGENT_CONFIG           the agent config with the orchestrator URL
+#                                 and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT         seconds for each orchestrator call (default 20)
+#   TERMAG_CODEX_KILL_AFTER       seconds from a session's SIGTERM to its
+#                                 SIGKILL (default 20)
+#   TERMAG_CODEX_RESUME_WAIT      seconds after typing a resume before it is
+#                                 checked (default 10)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+
+PKG=@openai/codex
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_CODEX_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_CODEX_INSTALL_TIMEOUT:-300}"
+RETRY_SLEEP="${TERMAG_CODEX_RETRY_SLEEP:-15}"
+
+# The budget, the policy, the lock, the pinned npm install with its rejection
+# record, restore and quarantine, the sessions and the report are
+# deploy/termag-tool-update-lib's, which termag-reconcile installs beside this.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-codex-update TU_COMPONENT=codex TU_BIN=codex TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/codex-update.lock
+# The npm global is Codex's only install: a run that finds none fails.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NPM_REQUIRED=1
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+REJECTED=$STATE_DIR/codex-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-codex-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-codex-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  # The run id names the systemd instance and goes into a URL and a report:
+  # the orchestrator's id pattern, nothing a shell or a URL would read.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_CODEX_BUDGET:-600}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+KILL_AFTER="${TERMAG_CODEX_KILL_AFTER:-20}"
+# Codex has no runners to drain; the loop's wait for them is moot.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+RUNNER_WAIT=0
+RESUME_WAIT="${TERMAG_CODEX_RESUME_WAIT:-10}"
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$RETRY_SLEEP" "$BUDGET" "$POLICY_TIMEOUT" "$KILL_AFTER" "$RESUME_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+# The nvm default's node, npm and npm-global codex, as a login shell has them.
+# Every command that could read stdin gets </dev/null.
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 </dev/null
+
+# The codex a pane, the agent's bridge or a login shell would start.
+resolve() {
+  hash -r
+  if [ -n "${CODEX_BIN:-}" ]; then printf '%s' "$CODEX_BIN"
+  else command -v codex 2>/dev/null || true
+  fi
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); Codex has no fallback floor"
+# A 200 that names no run (the flag turned off since the request, the run
+# expired): not this run's to install, so nothing, as with no policy at all.
+# Claude Code's updater installs the target there; Codex is updated only by a
+# run the orchestrator started.
+# Its floor is not this run's either: a box below it is not a failed run.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+expire_stale() { [ -s "$REJECTED" ] || return 0; tu_expire_npm; }
+
+# shellcheck disable=SC2154  # set by termag-tool-update-lib
+tu_notes() { printf 'npm=%s' "$npm_note"; }
+tu_notes_all() { printf '%s' "$npm_note"; }
+
+# ── sessions, after a run's install ─────────────────────────────────────────
+# Codex's part of termag-tool-update-lib's stop_sessions (see the header, 4):
+# which processes are its sessions, and their rollouts.
+#
+# A Codex process is its native binary (…/vendor/<triple>/bin/codex, or
+# …/vendor/<triple>/codex/codex in older packages; its exe ends in /codex),
+# started by the node launcher bin/codex.js, which forwards signals to it and
+# exits with it. The launcher's exe is node, which an update never replaces,
+# so the native binary is what is judged old, and what is stopped.
+is_codex() {
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in
+    */codex|*/codex\ \(deleted\)) return 0 ;;
+  esac
+  return 1
+}
+under_codex() {
+  local p; p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do is_codex "$p" && return 0; p=$(ppid_of "$p"); done
+  return 1
+}
+# argv of a process, one word per line.
+argv_of() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
+# The open rollout of a process (the native binary holds its conversation's
+# open), the newest when there are several. Not its children's: a pane's Codex
+# whose shell tool runs another Codex must not be judged, or resumed, by that
+# one's conversation.
+rollout_of() {
+  local f t newest=''
+  for f in /proc/"$1"/fd/*; do
+    t=$(readlink "$f" 2>/dev/null) || continue
+    case "$t" in
+      */sessions/*/rollout-*.jsonl) if [ -z "$newest" ] || [ "$t" -nt "$newest" ]; then newest=$t; fi ;;
+    esac
+  done
+  printf '%s' "$newest"
+}
+# The subcommand a Codex process runs: its first argument that is neither a
+# flag nor a flag's value (the TUI's prompt, when it is not a subcommand),
+# empty for the TUI on its own.
+subcommand_of() {
+  local a skip=0
+  while IFS= read -r a; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      -c|--config|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|-i|--image|--add-dir|--remote|--remote-auth-token-env|--enable|--disable|--local-provider) skip=1 ;;
+      -*) ;;
+      *) printf '%s' "$a"; return 0 ;;
+    esac
+  done < <(argv_of "$1" | tail -n +2)
+}
+# Whether a Codex is the pane's own: started by the pane's shell, directly or
+# through its node launcher (bin/codex.js). One started by anything else in the
+# pane (another agent's tool call, whichever agent that is: Claude Code, pi,
+# Devin, ...; a script) is that process's work, never this run's to stop.
+pane_owned() {
+  local p a pane_pid=$3
+  p=$(ppid_of "$1")
+  # The launcher is node running bin/codex.js under whatever name it was
+  # started by (npm's bin/codex link, as PATH finds it).
+  case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+    */node|*/node\ \(deleted\))
+      a=$(argv_of "$p" | sed -n 2p)
+      case "$a" in /*) ;; *) a=/proc/$p/cwd/$a ;; esac
+      case "$(readlink -f "$a" 2>/dev/null)" in */@openai/codex/bin/codex.js) p=$(ppid_of "$p") ;; esac ;;
+  esac
+  [ -n "$pane_pid" ] && [ "$p" = "$pane_pid" ]
+}
+# The rollout of a pane's session: its own, or, for a --remote client (a
+# termag agent pane), the app server's that listens on that address.
+pane_rollout() {
+  local pid=$1 remote srv r
+  r=$(rollout_of "$pid")
+  if [ -z "$r" ]; then
+    remote=$(argv_of "$pid" | sed -n '/^--remote$/{n;p;q}')
+    if [ -n "$remote" ]; then
+      for srv in $(pgrep -u "$(id -u)"); do
+        is_codex "$srv" || continue
+        argv_of "$srv" | grep -qx app-server || continue
+        [ "$(argv_of "$srv" | sed -n '/^--listen$/{n;p;q}')" = "$remote" ] || continue
+        r=$(rollout_of "$srv"); [ -n "$r" ] && break
+      done
+    fi
+  fi
+  printf '%s' "$r"
+}
+# The conversation's id: the rollout's name ends in it (rollout-<time>-<uuid>.jsonl).
+rollout_id() {
+  local b=${1##*/}; b=${b%.jsonl}; b=${b: -36}
+  [[ "$b" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && printf '%s' "$b"
+}
+
+p_roll=()
+find_sessions() {
+  local c current=() pid sub pane sock name pkg r
+  # The installed native binaries (every platform build the package holds,
+  # nested in its node_modules or hoisted beside it as @openai/codex-<platform>,
+  # wherever bin/codex.js resolves them from; Bugbot on #1076), and the
+  # resolved codex itself when it is one: what is current.
+  pkg=; command -v npm >/dev/null 2>&1 && pkg=$(npm root -g </dev/null 2>/dev/null)/$PKG
+  if [ -n "$pkg" ] && [ -d "$pkg" ]; then
+    while IFS= read -r c; do current+=("$c"); done < <(find "$pkg" "$pkg"-* -path '*/vendor/*' -type f -name codex 2>/dev/null)
+  fi
+  c=$(resolve); [ -n "$c" ] && [ -e "$c" ] && current+=("$(readlink -f "$c")")
+  for pid in $(pgrep -u "$(id -u)"); do
+    is_codex "$pid" || continue
+    # A replaced binary's inode is no longer any current one's, whatever the path says.
+    for c in "${current[@]}"; do [ "/proc/$pid/exe" -ef "$c" ] && continue 2; done
+    under_codex "$pid" && continue
+    # A subcommand that is not the TUI (the bridge's app server, an exec turn,
+    # a review, an MCP server) is other, wherever it sits among the flags; so
+    # is a Codex another agent runs.
+    sub=$(subcommand_of "$pid")
+    # (A first positional that is none of these is the TUI's prompt.)
+    case "$sub" in
+      exec|e|review|app-server|mcp|mcp-server|proto|cloud|apply|a|login|logout|sandbox|debug|completion|doctor|remote-control)
+        other=$((other + 1)); continue ;;
+    esac
+    pane=$(env_of "$pid" TMUX_PANE)
+    sock=; [ -n "$pane" ] && sock=$(socket_of "$pid")
+    name=; [ -n "$sock" ] && name=$(tmux -S "$sock" display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    if [ -z "$name" ]; then other=$((other + 1)); continue; fi
+    pane_owned "$pid" "$sock" "$(tmux -S "$sock" display -p -t "$pane" '#{pane_pid}' 2>/dev/null)" || { other=$((other + 1)); continue; }
+    r=$(pane_rollout "$pid")
+    p_pid+=("$pid"); p_sock+=("$sock"); p_pane+=("$pane"); p_sess+=("$name")
+    p_roll+=("$r"); p_id+=("$( [ -n "$r" ] && rollout_id "$r" )")
+  done
+}
+
+# termag-tool-update-lib's stop_sessions asks these of pane I. A turn is
+# between a task_started and its task_complete (or turn_aborted), as the
+# rollout records them; an escaped one inside a message never matches.
+tu_status() {
+  local r=${p_roll[$1]}
+  [ -n "$r" ] && [ -f "$r" ] || return 0
+  case "$(grep -oE '"type":"(task_started|task_complete|turn_aborted)"' "$r" 2>/dev/null | tail -n 1)" in
+    *task_started*) printf busy ;;
+    *) printf idle ;;
+  esac
+}
+# A conversation: the rollout of this id has had at least one turn.
+tu_had() {
+  local r=${p_roll[$1]}
+  [ -n "$2" ] && [ -n "$r" ] && [ -f "$r" ] && grep -q '"type":"task_started"' "$r" 2>/dev/null
+}
+tu_resume_line() { printf 'codex resume %s' "$1"; }
+
+trap on_signal TERM INT HUP
+
+tu_lock
+expire_stale
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+
+# What the install must reach: the floor, and the policy's target.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+# ── the npm global under the nvm default ────────────────────────────────────
+tu_npm_global
+
+finish

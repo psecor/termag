@@ -1,0 +1,38 @@
+[Unit]
+Description=termag: Claude Code update run %i from the orchestrator (install, then restart sessions as its policy says)
+
+[Service]
+# Why this exists: the orchestrator's manual (and later automatic) Claude Code
+# updates (phase 2). The agent's tool-update RPC
+# starts termag-claude-update@<run>.service with the run id as the instance
+# name and answers at once; this unit runs the update outside the agent's
+# process, because a run waits up to an hour for sessions to leave a turn and
+# must not hang on, or die with, the agent. systemd runs one instance per run
+# id at a time, so a repeated RPC for the same run joins the one running.
+# Nothing on the box starts it on its own: no [Install] section, and
+# termag-reconcile lists it as noenable.
+Type=oneshot
+
+# The copy termag-reconcile installed, the one the runner guard and the boot
+# unit run. %i is the run id the agent checked against ^[a-z0-9]{20,40}$; the
+# script checks it again. --run asks the orchestrator for the run's policy
+# with the agent token (no version or command crosses the RPC), installs one
+# exact version, stops and resumes sessions as the policy says, and reports.
+# %h survives the cloud-init user rename.
+ExecStart=%h/.local/bin/termag-claude-update --run %i
+
+# Exit 1 (still below the floor) and 3 (an install rejected) are outcomes the
+# report carries, not unit failures.
+SuccessExitStatus=0 1 3
+
+# The ceiling for the whole run: the install's 600 s budget
+# (TERMAG_CLAUDE_BUDGET, the script's default for --run), then the sessions,
+# which take at most the policy's drainSec (up to 3600 s) plus a 20 s kill
+# grace and the resume check, while runners drain alongside for up to 780 s,
+# and the report. About 75 min at worst; 90 min is also how long the
+# orchestrator counts a started run as in flight. A stop sends SIGTERM, and
+# the script reports the run as failed before it exits.
+TimeoutStartSec=90min
+
+# Behind the owner's own work: a build in a pane should not notice this.
+Nice=10

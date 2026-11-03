@@ -21,7 +21,8 @@ fail() { printf 'FAIL: %s\n  want: %s\n  got:  %s\n' "$1" "$2" "$3"; failed=1; }
 
 cmp -s "$CLAUDE" "$PI" || fail 'the Claude Code and pi copies are identical' 'no diff' "$(diff "$CLAUDE" "$PI" | head -5)"
 
-description="$(sed -n '2,/^---$/p' "$CLAUDE" | sed -n 's/^description: //p')"
+# Strict YAML: a description holding ': ' is single-quoted ('' for '); see backend/src/skillFrontmatter.test.ts.
+description="$(sed -n '2,/^---$/p' "$CLAUDE" | sed -n 's/^description: //p' | sed "s/^'\(.*\)'\$/\1/; s/''/'/g")"
 body="$(sed '1,/^---$/d' "$CLAUDE" | tr '\n' ' ' | tr -s ' ')"
 nudge='you produce a file someone else will want (a report, screenshots, a dataset, build output), put it in the space and give the `space:path`'
 
@@ -77,6 +78,9 @@ has 'sharing a space with a teammate: least role, a person manages, only who the
   'termag space boxes team add' 'needs a person' '**Members & boxes**' 'Only add people the user asked for'
 has 'a person gets the browser link, another box the space:path' "$body" \
   '## Sharing what you make' '`termag space url`' 'For another box or agent' '`termag space get <space:path>`'
+has 'a file a PR links is shared and linked by its url, and logs or secrets never are' "$body" \
+  '**In a pull request**' '`termag space share <space:path>`' \
+  'link what `termag space url <space:path>` prints' 'never logs or files'
 has 'plans and notes that outlive a session go in a space, and are fetched again later' "$body" \
   '## Plans and notes that outlive this session' 'plans/<project>/<topic>.md' '`termag space get` the file again'
 has 'hand-offs between agents and boxes, and ask runs, are covered' "$body" \

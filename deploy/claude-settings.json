@@ -6,6 +6,11 @@
           {
             "type": "command",
             "command": "\"$HOME/.local/bin/termag-status\" session-start >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
+            "command": "[ \"$TERMAG_SPACE_MEMORY_MANAGED\" = 1 ] || { [ -x \"$HOME/.local/bin/termag\" ] && \"$HOME/.local/bin/termag\" space memory context --hook SessionStart --refresh 60s 2>/dev/null; } || true",
+            "timeout": 20
           }
         ]
       }
@@ -15,7 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" prompt-submit >/dev/null 2>&1 &"
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" t3-guard; [ $? != 2 ] || exit 2; printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" prompt-submit >/dev/null 2>&1 & [ \"$TERMAG_SPACE_MEMORY_MANAGED\" = 1 ] || { [ -x \"$HOME/.local/bin/termag\" ] && printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag\" space memory context --hook UserPromptSubmit --refresh 60s 2>/dev/null; } || true",
+            "timeout": 20
           }
         ]
       }

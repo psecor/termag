@@ -192,7 +192,17 @@ apt_get install -y \
     keychain \
     postgresql-client \
     rsync \
-    tpm2-tools
+    tpm2-tools \
+    libatomic1 \
+    ncurses-term \
+    kitty-terminfo
+# ncurses-term and kitty-terminfo: terminfo for terminals ncurses-base lacks
+# (WezTerm's wezterm, kitty's xterm-kitty), so tmux attaches from them over a
+# plain ssh. Ghostty's entry is in no 24.04 package; install_terminfo
+# (box-lib.sh) compiles a pinned copy.
+# libatomic1: the desktop app's t3 server (scripts/install-t3-server.sh) is a
+# Node single-executable, and Node's Linux builds link it. build-essential
+# pulls it in today (gcc -> libgcc-13-dev); named here so that is not load-bearing.
 # pyenv build dependencies (so `pyenv install` can compile CPython)
 apt_get install -y \
     make libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
@@ -666,6 +676,25 @@ git clone "${AGENT_WIKI_REPO_URL}" agent-wiki || true
 echo "\$baked" > /home/termag/.termag-baked-sha
 EOF
 
+# Claude Code at or above deploy/claude-code-floor,
+# as the Node pin is checked above: the npm install there is unpinned, and an
+# image below the floor would start every box's cloud sessions on a version
+# Anthropic asks runners to stay off. Read from the checkout just cloned, the
+# file termag-reconcile installs for termag-claude-runner's guard.
+sudo -u termag -H bash <<'CLAUDE_FLOOR'
+set -euo pipefail
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+floor=$(head -n 1 "$HOME/src/termag/deploy/claude-code-floor" | tr -d '[:space:]')
+[[ "$floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "[packer] deploy/claude-code-floor holds '$floor', not x.y.z -- failing build"; exit 1; }
+have=$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+if [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$have" "$floor" | sort -V | head -n 1)" != "$floor" ]; then
+  echo "[packer] claude is ${have:-missing}, below the floor $floor (deploy/claude-code-floor) -- failing build"
+  exit 1
+fi
+echo "[packer] claude $have is at or above the floor $floor"
+CLAUDE_FLOOR
+
 # ─────────────────────────────────────────────────────────────────────────────
 # systemd --user unit. Cloud-init writes
 # ~termag/src/termag/agent/agent.config.json with the bearer token at launch,
@@ -677,6 +706,9 @@ EOF
 install_deploy_artifacts
 install_box_marker
 install_guest_browser
+install_gh_updater
+install_aws_updater
+install_terminfo
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code status hooks. termag tracks working/waiting/idle state via hooks

@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# termag-aws-update — update the AWS CLI v2 on a box when the orchestrator
+# asks.
+#
+# Why this exists: the AWS CLI holds its owner's AWS credentials and has had
+# advisories (the floor's sources are in backend/src/services/awsUpdatePolicy.ts).
+# The image installs it as root with AWS's own installer, from the unversioned
+# latest zip and without checking its signature (packer/scripts/setup.sh:
+# `curl awscli-exe-linux-aarch64.zip; unzip; sudo ./aws/install`), and nothing
+# moves it afterwards: 191 hosts were on older minors on 2026-10-30.
+#
+# It runs as root on the GitHub CLI's seam (deploy/termag-gh-update): the system
+# unit termag-aws-update@<run>.service, started by the agent through one
+# root-owned helper, termag-aws-update-start <run-id>, the only thing a sudoers
+# rule lets the agent user run for it (deploy/termag-aws-update-setup installs
+# all of it). Nothing here runs a shell or a command the orchestrator or the
+# user chose:
+#   * the run id is the orchestrator's id pattern, checked by the helper, the
+#     sudoers rule and here again;
+#   * the version comes from the policy as x.y.z only, and goes into AWS's own
+#     download URL for that exact version
+#     (awscli.amazonaws.com/awscli-exe-linux-<arch>-<x.y.z>.zip); latest is the
+#     unversioned zip, whose version is read from the verified package itself;
+#   * every zip is verified, before it is unzipped, against its .sig with
+#     AWS's published PGP key, pinned here by fingerprint
+#     (FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C, AWS CLI Team
+#     <aws-cli@amazon.com>, as AWS's install guide documents it) and installed
+#     beside this as termag-aws-cli.gpg; a zip whose signature does not verify
+#     with exactly that key is never unpacked;
+#   * the package's own `aws --version` must name the version before AWS's
+#     installer (`./aws/install --update`, from the verified zip) runs;
+#   * the agent config is read as the agent user (setpriv), its token and URL
+#     checked; the lock, the record and the downloads are root's, in
+#     /var/lib/termag/aws-update (0700).
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=aws&run=<id> with the
+#      agent token. Only a 200 that names this run installs anything.
+#   2. Takes /var/lib/termag/aws-update/aws-update.lock (flock).
+#   3. Resolves the target to one exact version (latest: the unversioned zip,
+#      downloaded and verified, its version read from it once), and only when
+#      the installed one is below it downloads that version's zip and .sig,
+#      verifies them, checks the package's version, and runs AWS's installer
+#      with --update into /usr/local/aws-cli (v2/<version>, v2/current) and
+#      /usr/local/bin, where the image put it. Accepted only when the aws a
+#      shell starts says exactly x.y.z; otherwise rejected (the record, exit 3)
+#      and v2/current put back to the version before, verified.
+#   4. The AWS CLI has no sessions: a running aws keeps its old files until it
+#      exits, and the installer leaves older versions' directories in place.
+#   5. POST <orchestrator>/api/tool-update/report: {component: "aws", ...}.
+#
+# What is still trusted: AWS's signing key, pinned as above, as AWS documents
+# it (it expires 2027-07-01; AWS extends it in place, and the copy here must
+# follow), and AWS's installer inside the zip it signed.
+#
+# Usage:
+#   termag-aws-update --run <run-id>   one orchestrator run, as root
+#
+# Exit codes: 0 when aws is at or above the floor (or nothing was asked of it),
+# 1 when it is below it or missing, 2 on bad usage, 3 while an install is
+# rejected, 143 when a signal stops it.
+#
+# Env (the unit's EnvironmentFile, /etc/termag/aws-update.env):
+#   TERMAG_AWS_AGENT_UID        the box user the agent runs as (by uid)
+# and, for tests, read only by a run that is not root:
+#   TERMAG_AWS_AS_USER          1: a run that is not root (the tests)
+#   TERMAG_AWS_ROOT             prefixes /usr/local/aws-cli and /usr/local/bin
+#   TERMAG_AWS_STATE_DIR        where the lock, record and downloads live
+#   TERMAG_AWS_KEYRING          the keyring the signature is checked with
+#   TERMAG_AWS_FINGERPRINT      the key it must be signed by
+#   TERMAG_AWS_DOWNLOAD_URL     where the zips are (default
+#                               https://awscli.amazonaws.com)
+#   TERMAG_AWS_BUDGET           seconds the install may take (default 900)
+#   TERMAG_AWS_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_AWS_INSTALL_TIMEOUT  seconds for each download and the install
+#                               (default 300)
+#   TERMAG_POLICY_TIMEOUT       seconds for each orchestrator call (default 20)
+
+set -u
+# As root: root's own PATH and paths, nothing from the environment but the
+# unit's EnvironmentFile (TERMAG_AWS_AGENT_UID).
+if [ "$(id -u)" = 0 ]; then
+  AS_USER=0
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  unset TERMAG_AWS_ROOT TERMAG_AWS_STATE_DIR TERMAG_AWS_KEYRING TERMAG_AWS_FINGERPRINT TERMAG_AWS_DOWNLOAD_URL TERMAG_AGENT_CONFIG
+elif [ "${TERMAG_AWS_AS_USER:-}" = 1 ]; then
+  AS_USER=1
+  PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+else
+  printf 'termag-aws-update: run as root (termag-aws-update@<run>.service)\n' >&2
+  exit 2
+fi
+export PATH LC_ALL=C
+umask 077
+
+HERE=$(dirname "$(readlink -f "$0")")
+PREFIX="${TERMAG_AWS_ROOT:-}"
+INSTALL_DIR=$PREFIX/usr/local/aws-cli
+BIN_DIR=$PREFIX/usr/local/bin
+STATE_DIR="${TERMAG_AWS_STATE_DIR:-/var/lib/termag/aws-update}"
+KEYRING="${TERMAG_AWS_KEYRING:-$HERE/termag-aws-cli.gpg}"
+FINGERPRINT="${TERMAG_AWS_FINGERPRINT:-FB5DB77FD5C118B80511ADA8A6310ACC4672475C}"
+DOWNLOAD_URL="${TERMAG_AWS_DOWNLOAD_URL:-https://awscli.amazonaws.com}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_AWS_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_AWS_INSTALL_TIMEOUT:-300}"
+
+# The budget, the policy, the lock, the record and the report are
+# deploy/termag-tool-update-lib's: root's copy, installed beside this.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-aws-update TU_COMPONENT=aws TU_BIN=aws TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/aws-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+REJECTED=$STATE_DIR/aws-update.rejected
+TU_LIB=$HERE/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-aws-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-aws-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_AWS_BUDGET:-900}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+# No sessions to stop, drain or resume.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+AGENT_UID="${TERMAG_AWS_AGENT_UID:-}"
+case "$AGENT_UID" in ''|0|*[!0-9]*) log "no agent user (TERMAG_AWS_AGENT_UID '${AGENT_UID}'); see /etc/termag/aws-update.env"; exit 2 ;; esac
+[[ "$FINGERPRINT" =~ ^[0-9A-F]{40}$ ]] || { log "bad key fingerprint"; exit 2; }
+
+tu_budget
+
+# The aws a shell starts: the installer's link in /usr/local/bin.
+resolve() { [ -x "$BIN_DIR/aws" ] && printf '%s' "$BIN_DIR/aws"; }
+
+# The agent's endpoint, from the agent user's config, read as that user: its
+# home and the config's paths are the user's to point anywhere, and root never
+# opens them itself. Replaces the lib's agent_endpoint, which reads as the
+# caller.
+agent_endpoint() {
+  local home cfg body=''
+  [ -n "$AGENT_URL" ] && return 0
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { POLICY=no-curl-or-jq; return 1; }
+  home=$(getent passwd "$AGENT_UID" | cut -d: -f6)
+  case "$home" in /*) ;; *) POLICY=no-agent-user; return 1 ;; esac
+  for cfg in "$home/src/termag/agent/agent.config.json" "$home/.termag/agent.config.json" "$home/.config/termag/agent.config.json"; do
+    if [ "$AS_USER" = 1 ]; then
+      body=$(head -c 65536 -- "$cfg" 2>/dev/null) || body=
+    else
+      body=$(setpriv --reuid="$AGENT_UID" --regid="$(id -g "$AGENT_UID" 2>/dev/null || echo 65534)" --clear-groups --no-new-privs \
+        head -c 65536 -- "$cfg" 2>/dev/null </dev/null) || body=
+    fi
+    [ -n "$body" ] && break
+  done
+  [ -n "$body" ] || { POLICY=no-agent-config; return 1; }
+  AGENT_TOKEN=$(printf '%s' "$body" | jq -r '.token // empty' 2>/dev/null) || AGENT_TOKEN=
+  AGENT_URL=$(printf '%s' "$body" | jq -r '.termag_url // empty' 2>/dev/null) || AGENT_URL=
+  # The token goes into curl's config on stdin, quoted: nothing that could end
+  # the quote or the line; the URL must be the agent's own wss/ws endpoint.
+  [[ "$AGENT_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{8,512}$ ]] || AGENT_TOKEN=
+  [[ "$AGENT_URL" =~ ^wss?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?/ws/agent$ ]] || AGENT_URL=
+  if [ -z "$AGENT_TOKEN" ] || [ -z "$AGENT_URL" ]; then POLICY=no-token; AGENT_URL=; return 1; fi
+  return 0
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); the AWS CLI has no fallback floor"
+# A 200 that names no run: not this run's to install, so nothing.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+inst_note=-
+tu_notes() { printf 'installer=%s' "$inst_note"; }
+tu_notes_all() { printf '%s' "$inst_note"; }
+# No sessions: stop_sessions finds nothing on an old binary.
+find_sessions() { :; }
+tu_status() { printf idle; }
+tu_had() { return 1; }
+tu_resume_line() { :; }
+
+# ── AWS's signed zips ───────────────────────────────────────────────────────
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x86_64 ;;
+    aarch64|arm64) printf aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+WORK=
+# fetch NAME DIR: NAME.zip and NAME.zip.sig from AWS into DIR, the zip verified
+# with the pinned key (and only then unzipped into DIR/pkg); prints the
+# version its own aws says. Fails, leaving nothing unpacked, on any step.
+fetch() {
+  local name=$1 dir=$2 status v
+  rm -rf "$dir"; mkdir -p "$dir" || return 1
+  run_capped "$(left "$INSTALL_TIMEOUT")" curl -fsSL --proto '=https' -o "$dir/pkg.zip" "$DOWNLOAD_URL/$name.zip" </dev/null || { log "could not download $name.zip"; return 1; }
+  run_capped "$(left 60)" curl -fsSL --proto '=https' -o "$dir/pkg.zip.sig" "$DOWNLOAD_URL/$name.zip.sig" </dev/null || { log "could not download $name.zip.sig"; return 1; }
+  # Only a good signature by exactly the pinned key: gpgv's VALIDSIG names the
+  # signing key's (primary) fingerprint.
+  status=$(gpgv --status-fd 1 --keyring "$KEYRING" "$dir/pkg.zip.sig" "$dir/pkg.zip" 2>/dev/null </dev/null) || { log "$name.zip: the signature does not verify with AWS's key; not unpacked"; return 1; }
+  if ! printf '%s\n' "$status" | grep -qE "^\[GNUPG:\] VALIDSIG [0-9A-F]+ .* ${FINGERPRINT}\$"; then
+    log "$name.zip: signed, but not by AWS's key $FINGERPRINT; not unpacked"; return 1
+  fi
+  # The package unpacked as its modes say (under umask 022), inside root's
+  # 0700 work directory: the installer copies those modes into v2/<version>,
+  # which every user runs (the demo found a root-only install under 077).
+  ( umask 022; unzip -q "$dir/pkg.zip" -d "$dir/pkg" </dev/null >&2 ) || { log "$name.zip did not unzip"; return 1; }
+  v=$(ver "$dir/pkg/aws/dist/aws")
+  is_version "$v" || { log "$name.zip's aws does not run"; return 1; }
+  printf '%s' "$v"
+}
+# tu_resolve_tag latest: the version the unversioned zip holds, verified, kept
+# in WORK/latest to install if it is the one wanted.
+tu_can_resolve() { return 0; }
+tu_resolve_tag() {
+  local a
+  [ "$1" = latest ] && a=$(arch) || return 0
+  fetch "awscli-exe-linux-$a" "$WORK/latest"
+}
+
+# point_current VERSION: v2/current names v2/VERSION, in one rename.
+point_current() {
+  ln -sfn "$INSTALL_DIR/v2/$1" "$INSTALL_DIR/v2/current.tmp.$$" && mv -Tf "$INSTALL_DIR/v2/current.tmp.$$" "$INSTALL_DIR/v2/current" \
+    || { rm -f "$INSTALL_DIR/v2/current.tmp.$$"; return 1; }
+}
+
+trap on_signal TERM INT HUP
+# On the way out: the downloads go. A run cut off once it had moved a version
+# aside or started the installer (a signal mid-install) leaves what it had:
+# the tree the installer was writing goes (the installer creates
+# v2/<version> early, and that directory was not there before, or was moved
+# aside), the copy moved aside comes back, and v2/current names the version
+# that ran (Bugbot and Devin on #1110). Once the installer finished, the copy
+# moved aside is spent.
+stale='' installing=0 installed=0
+on_exit() {
+  rm -rf "$WORK"
+  if [ "$installed" = 1 ]; then
+    [ -z "$stale" ] || rm -rf "$stale"
+  elif [ "$installing" = 1 ] || { [ -n "$stale" ] && [ -e "$stale" ]; }; then
+    # shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+    rm -rf "$INSTALL_DIR/v2/$spec_v"
+    [ -z "$stale" ] || mv -T "$stale" "$INSTALL_DIR/v2/$spec_v" 2>/dev/null
+    [ -z "${prev:-}" ] || [ "$(readlink "$INSTALL_DIR/v2/current" 2>/dev/null)" = "$INSTALL_DIR/v2/$prev" ] || point_current "$prev" 2>/dev/null
+  fi
+}
+trap on_exit EXIT
+
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null
+tu_lock
+WORK=$(mktemp -d "$STATE_DIR/work.XXXXXX") || { log "cannot create a work directory in $STATE_DIR"; finish; }
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+if ! a=$(arch); then
+  inst_note="${have:-none}->FAILED"
+  log "no AWS CLI build for $(uname -m)"
+  finish
+fi
+
+# What the install must reach: the floor, and the policy's target.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+if [ "$have" = "$spec_v" ] && ! was_rejected aws; then
+  inst_note=$have
+  finish
+fi
+if downgrade "$have" && ! was_rejected aws; then
+  inst_note="$have(no-downgrade)"
+  log "aws is $have; $spec_v would move it down; skipped"
+  finish
+fi
+
+# The package: latest's, already verified, when it is the version wanted;
+# else that exact version's own zip.
+if [ -d "$WORK/latest/pkg" ] && [ "$(ver "$WORK/latest/pkg/aws/dist/aws")" = "$spec_v" ]; then
+  pkg=$WORK/latest/pkg
+else
+  log "aws is ${have:-not installed}; downloading AWS CLI $spec_v ($a, at most $(left "$INSTALL_TIMEOUT")s)"
+  if ! got=$(fetch "awscli-exe-linux-$a-$spec_v" "$WORK/exact"); then
+    inst_note="${have:-none}->FAILED"
+    finish
+  fi
+  if [ "$got" != "$spec_v" ]; then
+    inst_note="${have:-none}->pin-mismatch(not-installed)"
+    log "AWS CLI $spec_v's package says $got; not installed, nothing changed"
+    finish
+  fi
+  pkg=$WORK/exact/pkg
+fi
+
+prev=$(readlink "$INSTALL_DIR/v2/current" 2>/dev/null); prev=${prev##*/}
+# A v2/<version> already there (a rejected install, or one cut off halfway)
+# would be skipped by AWS's installer on every run: moved aside first, so the
+# verified package is what lands, and back if the installer fails (Bugbot on
+# #1110).
+if [ -e "$INSTALL_DIR/v2/$spec_v" ]; then
+  stale=$INSTALL_DIR/v2/.termag-replaced-$spec_v-$$
+  mv -T "$INSTALL_DIR/v2/$spec_v" "$stale" || { inst_note="${have:-none}->FAILED"; log "cannot move the old $INSTALL_DIR/v2/$spec_v aside; nothing changed"; finish; }
+  log "moved the $spec_v already in $INSTALL_DIR/v2 aside ($stale); the verified package replaces it"
+fi
+log "installing AWS CLI $spec_v with AWS's installer (--update), verified package"
+installing=1
+if ! ( umask 022; run_capped "$(left "$INSTALL_TIMEOUT")" "$pkg/aws/install" --install-dir "$INSTALL_DIR" --bin-dir "$BIN_DIR" --update </dev/null >&2 ); then
+  inst_note="${have:-none}->FAILED"
+  if [ -n "$stale" ]; then rm -rf "$INSTALL_DIR/v2/$spec_v"; mv -T "$stale" "$INSTALL_DIR/v2/$spec_v" || log "could not move $stale back"; stale=; fi
+  # The installer may have pointed v2/current at a tree it did not finish.
+  [ -z "$prev" ] || [ "$(readlink "$INSTALL_DIR/v2/current" 2>/dev/null)" = "$INSTALL_DIR/v2/$prev" ] || point_current "$prev" || log "could not point v2/current back at $prev"
+  log "AWS's installer failed; aws is ${have:-not installed} as before"
+  installing=0
+  finish
+fi
+installed=1
+# The installer skips a version whose directory is already there; current
+# must still name it.
+[ "$(readlink "$INSTALL_DIR/v2/current" 2>/dev/null)" = "$INSTALL_DIR/v2/$spec_v" ] || point_current "$spec_v" || log "could not point v2/current at $spec_v"
+after=$(ver "$(resolve)")
+if [ "$after" = "$spec_v" ]; then
+  inst_note="${have:-none}->$after"
+  log "aws is now $spec_v, verified (its signature, its package and the aws a shell starts)"
+  accept aws
+  # AWS's installer keeps every v2/<version>, a full CLI copy each: once the
+  # new one is verified, every other but the version that ran goes (running
+  # aws processes keep their files there; a review on #1110).
+  for d in "$INSTALL_DIR"/v2/*; do
+    v=${d##*/}
+    [ -d "$d" ] && [ ! -L "$d" ] && is_version "$v" || continue
+    [ "$v" = "$spec_v" ] || [ "$v" = "${prev:-}" ] && continue
+    rm -rf "$d" && log "removed the older AWS CLI $v ($d)"
+  done
+  finish
+fi
+inst_note="${have:-none}->pin-mismatch"
+reject aws "asked for $spec_v; $BIN_DIR/aws --version says ${after:-nothing (does not run)}"
+# v2/current back to the version that ran, verified; its directory is still
+# there (the installer never removes one).
+if [ -n "$have" ] && [ -n "$prev" ] && [ "$(ver "$INSTALL_DIR/v2/$prev/bin/aws")" = "$have" ] && point_current "$prev" && [ "$(ver "$(resolve)")" = "$have" ]; then
+  inst_note="$inst_note,restored:$have"
+  log "v2/current is back at $have, verified"
+fi
+finish

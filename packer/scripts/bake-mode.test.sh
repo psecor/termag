@@ -111,7 +111,10 @@ else
     fail "refresh-box.sh does not gate on BAKE_MODE"
 fi
 
-dests=$(grep -oE 'destination *= *"/tmp/[^"]+"' "$PKR" | grep -oE '/tmp/[^"]+' | grep -v -E 'rewrite-home-paths|box-lib|termag.bundle' | sort -u)
+# Not deploy/ files: the home-path rewrite and box-lib.sh are bake machinery,
+# the bundle is the checkout itself, and the t3 server tarball is consumed by
+# scripts/install-t3-server.sh, its own provisioner in both modes.
+dests=$(grep -oE 'destination *= *"/tmp/[^"]+"' "$PKR" | grep -oE '/tmp/[^"]+' | grep -v -E 'rewrite-home-paths|box-lib|termag.bundle|t3-server.tar.gz' | sort -u)
 missing=""
 for d in $dests; do
     grep -qF -- "$d" "$LIB" || missing="$missing $d"
@@ -156,6 +159,17 @@ if grep -q -- '-lname "\$MOUNT\*"' "$DETACH"; then
 else
     fail "detach-scratch.sh has no symlink guard for the mount"
 fi
+# The boot-time Claude Code update must not run inside a bake: its npm install
+# would race the sweep of termag's processes and the home write baseline. It
+# runs only where the agent config cloud-init writes at launch exists.
+BOOTU=$HERE/../../deploy/termag-claude-update-boot.service
+if grep -qx 'ConditionPathExists=|%h/src/termag/agent/agent.config.json' "$BOOTU" \
+   && ! grep -qsE '(install|cp|>)[^#]*agent\.config\.json' "$SETUP" "$REFRESH"; then
+    pass "the boot Claude Code update is skipped in a bake (it needs the launch-time agent config)"
+else
+    fail "termag-claude-update-boot.service lacks the agent-config condition, or a bake step writes an agent config"
+fi
+
 if grep -qE '^RTK_VERSION=v[0-9]+\.[0-9]+\.[0-9]+$' "$SETUP" && grep -qE '^RTK_SHA256=[0-9a-f]{64}$' "$SETUP"; then
     pass "rtk is pinned to a tag and a sha256"
 else

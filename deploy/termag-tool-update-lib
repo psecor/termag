@@ -1,0 +1,792 @@
+# shellcheck shell=bash
+# termag-tool-update-lib — what every tool's updater on a box shares.
+# Sourced, never run: deploy/termag-claude-update
+# (Claude Code) and deploy/termag-codex-update (Codex) source it from the
+# directory they run from, where termag-reconcile installs it beside them
+# (~/.local/bin), as the checkout's deploy/ has it.
+#
+# It holds the parts that do not depend on the tool, moved here from
+# termag-claude-update unchanged in what they do:
+#   * the budget: one deadline for the run, and each long step's share of it;
+#   * the orchestrator's policy (--run): GET /api/tool-update/policy with the
+#     agent token on curl's stdin, never in an argument;
+#   * the lock, so two runs of one tool never run npm over each other;
+#   * one exact version: the policy's target resolved once, never a tag;
+#   * the npm global install of that version, accepted only when its
+#     package.json and the tool's own --version both say exactly it, else
+#     rejected (the record), and put back (the version before, reinstalled
+#     and verified) or quarantined (<file>.rejected, not executable);
+#   * the summary line and the exit status;
+#   * stopping a run's sessions on an old binary, panes resumed or listed for
+#     the orchestrator, and the report.
+#
+# The tool's script sets, before it sources this:
+#   TU_NAME       its name, the prefix of every log line (termag-claude-update)
+#   TU_COMPONENT  its component in the orchestrator's registry (claude, codex)
+#   TU_BIN        its binary's name (claude, codex), for messages and states
+#   TU_TAGS       the dist-tags its policy's target may name ('latest|stable')
+#   TU_NPM_FLAGS  an array of extra `npm install -g` flags (pi: --ignore-scripts,
+#                 as the image installs it); none when unset
+#   PKG           its npm package
+#   TU_NO_FALLBACK_FLOOR  1 for a tool with no floor of its own (every one but
+#                 Claude Code): a run the orchestrator started whose policy was
+#                 refused, unreachable or unreadable installed and checked
+#                 nothing, so it is reported failed, never current
+#   tu_npm_allowed V  (optional) whether the npm global may install version V
+#                 (pi's pins); one it may not is not installed, the run fails.
+#                 It may print the path of a package file it checked (the
+#                 pinned bytes), which npm then installs instead of
+#                 PKG@V, for the install and for a put-back alike
+#   TU_NPM_REQUIRED  1 when the npm global is the tool's only install (Codex):
+#                 a run that finds no package there fails and says so, where
+#                 Claude Code (with its native install) has nothing to do there
+#   STATE_DIR, TU_LOCK_FILE, REJECTED  where its lock and its record live
+#   TARGET, LOCK_WAIT, INSTALL_TIMEOUT, RETRY_SLEEP, POLICY_TIMEOUT,
+#   KILL_AFTER, RUNNER_WAIT, RESUME_WAIT  from its environment
+# and, before it calls these, MODE (run, or its own), RUN_ID, BUDGET, FLOOR,
+# and the functions:
+#   resolve            prints the binary a session would start
+#   tu_notes           the summary's per-install notes ("npm=... native=...")
+#   tu_notes_all       the same notes run together, which the outcome reads
+#   find_sessions      fills runners, the pane arrays (p_pid, p_sock, p_pane,
+#                      p_sess, p_id) and `other` with what runs an old binary
+#   tu_status I        "busy" while pane I's session is in a turn
+#   tu_had I ID        whether pane I's session ID had a conversation
+#   tu_resume_line ID  what is typed into a pane to resume session ID
+#   (and, to drop a session guessed from a place another process shares,
+#   p_guess and peers for tu_unshare, below)
+#   finish's caller may set from_v; the run's install sets spec_v.
+
+log() { printf '%s: %s\n' "$TU_NAME" "$*" >&2; }
+# A tool's version: x.y.z unless the tool sets its own shape before sourcing
+# this (TU_VERSION_RE anchored, TU_VERSION_GREP the same unanchored, for
+# reading it out of `--version`; Cursor's is 2026.10.22-27dcf5f).
+TU_VERSION_RE=${TU_VERSION_RE:-'^[0-9]+\.[0-9]+\.[0-9]+$'}
+TU_VERSION_GREP=${TU_VERSION_GREP:-'[0-9]+\.[0-9]+\.[0-9]+'}
+is_version() { [[ "$1" =~ $TU_VERSION_RE ]]; }
+
+# ── the budget ──────────────────────────────────────────────────────────────
+# One deadline for the whole run. A step that could take long (the lock, the
+# registry, an install) gets at most what is left minus RESERVE, which is what
+# the steps after it may still need, and no more: an install's TERM-to-KILL
+# grace (KILL_GRACE), the version check after it and the summary's
+# (VER_TIMEOUT each; a working binary answers in well under a second), and 4 s
+# of slack: 10 + 2 * 8 + 4 = 30 s. So the run ends inside its budget on its
+# own, and an install is stopped by this script, never cut by whatever started
+# it (systemd's TimeoutStartSec, the runner's cap). A stopped install can leave
+# the npm global half written; the next run sees that its binary does not run
+# and reinstalls it.
+#
+# Claude Code's runner numbers (deploy/termag-claude-runner): its cap is
+# 180 s, and it passes a budget of 170 s, so the longest single install from
+# there is about 170 - 30 = 140 s, less what the lock and the registry took.
+# The boot unit's: a 240 s budget inside systemd's 300 s, so an install gets
+# up to 210 s.
+#
+# The lock wait is the exception: a waiter keeps only LOCK_RESERVE back, what
+# it needs once it has the lock and finds the holder's install done (the
+# version check and the summary's, VER_TIMEOUT each, and 2 s): 18 s. From the
+# runner that is a wait of up to about 152 s, past the ~140 s a holder that
+# started with it can spend on one install. A waiter that then still has an
+# install to do has no budget left for it, and says so.
+tu_budget() {
+  VER_TIMEOUT=8
+  KILL_GRACE=10
+  RESERVE=$(( KILL_GRACE + 2 * VER_TIMEOUT + 4 ))
+  LOCK_RESERVE=$(( 2 * VER_TIMEOUT + 2 ))
+  DEADLINE=$(( $(date +%s) + BUDGET ))
+}
+# left CAP: seconds a step may take, at most CAP; 0 when the budget is spent.
+left() {
+  local l=$(( DEADLINE - $(date +%s) - RESERVE ))
+  [ "$l" -gt 0 ] || l=0
+  [ "$l" -lt "$1" ] || l=$1
+  printf '%s' "$l"
+}
+# run_capped CAP CMD...: CMD with at most CAP seconds, in its own process
+# group, so a timeout reaches npm's children too; KILL KILL_GRACE s after the TERM.
+run_capped() {
+  local cap=$1; shift
+  [ "$cap" -gt 0 ] || { log "the ${BUDGET}s budget is spent; not running $1"; return 124; }
+  timeout -k "$KILL_GRACE" "$cap" "$@"
+}
+
+# A tool's --version: the line that is the version alone, else the first
+# version on any line ("2.1.314 (Claude Code)"), so a notice ahead of it that
+# names another build cannot pass for it (Bugbot on #1080).
+ver() {
+  local out v
+  out=$(timeout -k 2 "$VER_TIMEOUT" "$1" --version </dev/null 2>/dev/null)
+  v=$(printf '%s\n' "$out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -xE "$TU_VERSION_GREP" | head -n 1)
+  [ -n "$v" ] || v=$(printf '%s\n' "$out" | grep -oE "$TU_VERSION_GREP" | head -n 1)
+  printf '%s\n' "$v"
+}
+at_least() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+
+# ── the orchestrator's policy (--run) ───────────────────────────────────────
+# GET <orchestrator>/api/tool-update/policy?component=<c>&run=<id> with the
+# agent token, as termag-box-update --when-enabled asks for its own policy:
+# {floor, target, restart, drainSec, run}. Only a 200 that names this run gives
+# a restart; a 200 with run null (the flag off, the run expired or not this
+# box's to start) is the floor and the target with restart none, and anything
+# else (unreachable, refused, unreadable) is the tool's fallback floor alone
+# (FLOOR_ONLY): exactly the floor version where an install is below it,
+# restarting nothing, and nothing at all for a tool without one (POLICY says
+# which, for the report).
+RESTART=none DRAIN=0 POLICY=- POLICY_CODE=''
+# Config search order follows agent/agent.js, deploy/termag-status and
+# deploy/termag-box-update.
+find_agent_config() {
+  local c
+  for c in "${TERMAG_AGENT_CONFIG:-}" \
+           "$HOME/src/termag/agent/agent.config.json" \
+           "$HOME/.termag/agent.config.json" \
+           "$HOME/.config/termag/agent.config.json"; do
+    if [ -n "$c" ] && [ -r "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+# api_url TERMAG_URL PATH: ws(s)://host/termag/ws/agent -> http(s)://host/termag/api/<PATH>.
+api_url() {
+  local url=${1%%\?*}
+  case $url in
+    ws://*)  url="http://${url#ws://}"   ;;
+    wss://*) url="https://${url#wss://}" ;;
+  esac
+  case $url in
+    */ws/agent) printf '%s' "${url%/ws/agent}/api/$2" ;;
+    *) return 1 ;;
+  esac
+}
+AGENT_TOKEN='' AGENT_URL=''
+agent_endpoint() {
+  local config
+  [ -n "$AGENT_URL" ] && return 0
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { POLICY=no-curl-or-jq; return 1; }
+  config=$(find_agent_config) || { POLICY=no-agent-config; return 1; }
+  AGENT_TOKEN=$(jq -r '.token // empty' "$config" 2>/dev/null) || AGENT_TOKEN=
+  AGENT_URL=$(jq -r '.termag_url // empty' "$config" 2>/dev/null) || AGENT_URL=
+  if [ -z "$AGENT_TOKEN" ] || [ -z "$AGENT_URL" ]; then POLICY=no-token; AGENT_URL=; return 1; fi
+  return 0
+}
+# api CODE-VAR OUT-FILE METHOD PATH [BODY]: one call with the agent token on
+# curl's stdin (-K -, never -H on the world-readable command line), retried
+# twice 5 s apart when there is no answer or a 5xx (both endpoints take a
+# repeat: a policy fetch within 5 minutes gets the same run back, and a report
+# on an ended run changes nothing).
+api() {
+  local _var=$1 out=$2 method=$3 path=$4 body=${5:-} url _code try
+  url=$(api_url "$AGENT_URL" "$path") || { printf -v "$_var" '%s' bad-url; return 1; }
+  for try in 1 2 3; do
+    if [ "$method" = POST ]; then
+      _code=$(printf 'header = "Authorization: Bearer %s"\n' "$AGENT_TOKEN" \
+        | curl -s -m "$POLICY_TIMEOUT" -K - -o "$out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "$body" "$url" 2>/dev/null) || _code=000
+    else
+      _code=$(printf 'header = "Authorization: Bearer %s"\n' "$AGENT_TOKEN" \
+        | curl -s -m "$POLICY_TIMEOUT" -K - -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || _code=000
+    fi
+    case "$_code" in ''|000|5??) [ "$try" = 3 ] || sleep 5 ;; *) break ;; esac
+  done
+  printf -v "$_var" '%s' "${_code:-000}"
+}
+# tu_fetch_policy: a --run's policy (above), then FLOOR_ONLY: 1 when the run
+# has no policy from the orchestrator, so applies the tool's fallback floor.
+tu_fetch_policy() {
+  if [ "$MODE" = run ]; then
+    if agent_endpoint; then
+      pbody=$(mktemp "${TMPDIR:-/tmp}/termag-$TU_COMPONENT-policy.XXXXXX")
+      api POLICY_CODE "$pbody" GET "tool-update/policy?component=$TU_COMPONENT&run=$RUN_ID"
+      if [ "$POLICY_CODE" = 200 ]; then
+        IFS='|' read -r p_floor p_target p_restart p_drain p_run < <(jq -r '[.floor, .target, .restart, .drainSec, (.run.id // "")] | map(. // "" | tostring | gsub("[|\n]"; "")) | join("|")' "$pbody" 2>/dev/null) || true
+        if is_version "${p_floor:-}" && { [[ "${p_target:-}" =~ ^(${TU_TAGS})$ ]] || is_version "${p_target:-}"; } \
+          && [[ "${p_restart:-}" =~ ^(none|idle|force)$ ]] && [[ "${p_drain:-}" =~ ^[0-9]{1,4}$ ]] && [ "$p_drain" -le 3600 ]; then
+          FLOOR=$p_floor TARGET=$p_target DRAIN=$p_drain
+          if [ "${p_run:-}" = "$RUN_ID" ]; then RESTART=$p_restart POLICY=ok; else POLICY='ok-no-run'; fi
+        else
+          POLICY=unreadable
+        fi
+      else
+        case "$POLICY_CODE" in 000) POLICY=unreachable ;; *) POLICY="refused:$POLICY_CODE" ;; esac
+      fi
+      rm -f "$pbody"
+    fi
+    log "policy for run $RUN_ID: $POLICY${POLICY_CODE:+ (HTTP $POLICY_CODE)}; floor ${FLOOR:-from the floor file}, target $TARGET, restart $RESTART${DRAIN:+, drain ${DRAIN}s}"
+  fi
+  # A run whose policy fetch failed applies the fallback floor, as --ensure would.
+  FLOOR_ONLY=0
+  case "$POLICY" in ok|ok-no-run|-) ;; *) FLOOR_ONLY=1 ;; esac
+}
+
+# ── the rejection record ────────────────────────────────────────────────────
+# An install that did not end at exactly the version asked for (another
+# version, or a binary that does not run) is recorded in REJECTED, one line
+# per install path, and stays recorded until a later run installs that path
+# and verifies it. While it exists every run exits 3 (and, for Claude Code,
+# termag-claude-runner starts no runner): the binary now in place is not one
+# this script checked.
+# reject PATH DETAIL / accept PATH: the record for one install path.
+reject() {
+  { grep -v "^$1 " "$REJECTED" 2>/dev/null; printf '%s %s\n' "$1" "$2"; } >"$REJECTED.tmp" && mv -f "$REJECTED.tmp" "$REJECTED"
+  log "REJECTED $1 install: $2"
+}
+accept() {
+  [ -e "$REJECTED" ] || return 0
+  grep -v "^$1 " "$REJECTED" >"$REJECTED.tmp" 2>/dev/null
+  if [ -s "$REJECTED.tmp" ]; then mv -f "$REJECTED.tmp" "$REJECTED"; else rm -f "$REJECTED" "$REJECTED.tmp"; fi
+}
+# Whether PATH was rejected by an earlier run: it is reinstalled even when its
+# version already looks current.
+was_rejected() { grep -q "^$1 " "$REJECTED" 2>/dev/null; }
+# The npm global's record, expired once the package is gone: nothing it
+# rejected is left to run, and the next run installs and verifies afresh.
+tu_expire_npm() {
+  local root
+  if was_rejected npm; then
+    root=; command -v npm >/dev/null 2>&1 && root=$(npm root -g </dev/null 2>/dev/null)
+    if [ -z "$root" ] || [ ! -f "$root/$PKG/package.json" ]; then
+      log "the rejected npm global $PKG is gone; expiring its record"
+      accept npm
+    fi
+  fi
+}
+# quarantine FILE: rename it out of the way, not executable, so whatever
+# resolves the tool afterwards cannot start it. Prints nothing; 0 when done.
+quarantine() {
+  [ -n "$1" ] && [ -e "$1" ] || return 1
+  mv -f "$1" "$1.rejected" 2>/dev/null || return 1
+  chmod a-x "$1.rejected" 2>/dev/null || true
+  log "quarantined $1 as $1.rejected: nothing resolves $TU_BIN to it now"
+}
+
+# The summary line, and the exit status, from the binary a session would start.
+# native_note is Claude Code's (its ~/.local/bin install); a tool that has
+# only the npm global leaves it out of its tu_notes.
+# shellcheck disable=SC2034
+npm_note=- native_note=-
+finish() {
+  local bin v state=ok rc=0
+  bin=$(resolve)
+  v=; [ -n "$bin" ] && v=$(ver "$bin")
+  if [ -s "$REJECTED" ]; then state=rejected; rc=3
+  elif [ -z "$bin" ]; then state=no-$TU_BIN; rc=1
+  elif [ -n "$FLOOR" ] && ! at_least "$v" "$FLOOR"; then state=below-floor; rc=1
+  fi
+  log "$TU_BIN=${bin:--} version=${v:--} floor=${FLOOR:--} state=$state $(tu_notes)"
+  if [ "$MODE" = run ]; then
+    to_v=$v
+    [ -n "${from_v:-}" ] || from_v=$v
+    after_install "$rc" "$state" "$bin"
+  fi
+  exit "$rc"
+}
+
+# ── the lock ────────────────────────────────────────────────────────────────
+# tu_lock: TU_LOCK_FILE (flock) for the rest of the run, waited for as long as
+# the budget allows, less LOCK_RESERVE (LOCK_WAIT caps it further). A run that
+# cannot open or get it installs nothing and finishes on what it finds.
+LOCK_HELD=0
+tu_lock() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if ! exec 9>"$TU_LOCK_FILE"; then
+    log "cannot open $TU_LOCK_FILE; installing nothing"
+    finish
+  fi
+  lock_wait=$(( DEADLINE - $(date +%s) - LOCK_RESERVE ))
+  [ "$lock_wait" -gt 0 ] || lock_wait=0
+  [ -z "$LOCK_WAIT" ] || [ "$lock_wait" -le "$LOCK_WAIT" ] || lock_wait=$LOCK_WAIT
+  lock_start=$(date +%s)
+  if ! flock -n 9; then
+    log "another $TU_NAME holds the lock; waiting up to ${lock_wait}s"
+    if ! flock -w "$lock_wait" 9; then
+      log "another $TU_NAME held the lock for ${lock_wait}s; installing nothing"
+      finish
+    fi
+    log "got the lock after $(( $(date +%s) - lock_start ))s; checking again"
+  fi
+  LOCK_HELD=1
+}
+
+# ── what to install ─────────────────────────────────────────────────────────
+# tu_resolve_tag TAG CAP: the exact version a dist-tag names, in at most CAP
+# seconds; tu_can_resolve: whether this box can ask. npm's registry unless the
+# tool defines its own (Cursor asks its installer).
+tu_can_resolve() { command -v npm >/dev/null 2>&1; }
+tu_resolve_tag() { timeout -k 2 "$2" npm view "$PKG@$1" version </dev/null 2>/dev/null | tail -n 1 | tr -d '[:space:]'; }
+
+# tu_run_target: a run with a policy wants its target too (the policy's
+# dist-tag resolved once here, or its exact version), and the floor. A target
+# that does not resolve leaves the floor, as a refused policy does. Reads and
+# sets `want`.
+run_target_v=
+tu_run_target() {
+  if [ "$MODE" = run ] && [ "$FLOOR_ONLY" = 0 ]; then
+    if is_version "$TARGET"; then
+      run_target_v=$TARGET
+    elif tu_can_resolve; then
+      for _ in 1 2 3; do
+        cap=$(left 20); [ "$cap" -gt 0 ] || break
+        run_target_v=$(tu_resolve_tag "$TARGET" "$cap")
+        is_version "$run_target_v" && break
+        run_target_v=; sleep 5
+      done
+    fi
+    if [ -z "$run_target_v" ]; then
+      # A tool with no floor of its own had nothing to do but reach the
+      # target: that run failed, even where the box is above the floor
+      # (Bugbot on #1110).
+      [ "${TU_NO_FALLBACK_FLOOR:-0}" = 1 ] && TU_TARGET_UNRESOLVED=1
+      log "the policy's target $TARGET does not resolve to a version; ${FLOOR:+the floor $FLOOR only}"
+    elif [ -z "$want" ] || at_least "$run_target_v" "$want"; then
+      want=$run_target_v
+    fi
+    log "the policy's target $TARGET is ${run_target_v:-unknown}; want ${want:-nothing}${FLOOR:+ (floor $FLOOR)}"
+  fi
+}
+
+# tu_spec: one exact version for every install, resolved once here and never
+# a tag: a tag can move between this resolution and the install, and what is
+# installed must be what was checked. TARGET's version, unless it resolves
+# below what this run wants, or cannot be resolved while that is known; then
+# the wanted version itself. A dist-tag can sit below the floor (latest
+# 2.1.300 under a 2.1.308 floor), and installing it would leave the box below,
+# or move it down.
+# A --run without the orchestrator's policy (FLOOR_ONLY) installs the floor
+# itself and resolves no target: the run was not authorised to go further, and
+# npm's latest is not the floor (Devin on #995). Sets spec_v and spec, or
+# finishes when there is nothing to install.
+tu_spec() {
+  target_v=
+  if [ "$FLOOR_ONLY" = 1 ]; then
+    target_v=$FLOOR
+  elif is_version "$TARGET"; then
+    target_v=$TARGET
+  elif [ "$MODE" = boot ] && [ "$TARGET" = latest ]; then
+    target_v=${latest:-}
+  elif [ -n "$run_target_v" ]; then
+    target_v=$run_target_v
+  elif tu_can_resolve; then
+    cap=$(left 20)
+    if [ "$cap" -gt 0 ]; then
+      target_v=$(tu_resolve_tag "$TARGET" "$cap")
+    fi
+    is_version "$target_v" || target_v=
+  fi
+  if [ -n "$target_v" ] && { [ -z "$want" ] || at_least "$target_v" "$want"; }; then
+    spec_v=$target_v
+  else
+    spec_v=$want
+    [ -z "$target_v" ] || log "$TARGET resolves to $target_v, below $want"
+  fi
+  if ! is_version "$spec_v"; then
+    log "$TARGET does not resolve to a version and there is no floor; installing nothing"
+    finish
+  fi
+  spec=$spec_v
+  log "installing exactly $spec_v where an install is below ${want:-it} ($TARGET resolves to ${target_v:-nothing})"
+}
+# Whether installing spec would move an install at $1 down: a downgrade
+# replaces the binary under running sessions for nothing. Not for a rejected
+# install, whose version string is no reason to keep it.
+downgrade() { [ -n "$1" ] && [ -n "$spec_v" ] && ! at_least "$spec_v" "$1"; }
+
+# ── the npm global under the nvm default ────────────────────────────────────
+# tu_npm_global: the tool's npm global, brought to exactly spec when it is
+# below `want` (or was rejected), and only then; npm_note says what happened.
+tu_npm_global() {
+  npm_src=''
+  if ! command -v npm >/dev/null 2>&1; then
+    # No npm at all: for a tool with no other install, a failed run, which
+    # also restarts nothing (Bugbot on #1076).
+    if [ "${TU_NPM_REQUIRED:-0}" = 1 ]; then
+      npm_note="none->FAILED:no-npm"
+      log "there is no npm on this box; nothing to update $PKG with"
+    fi
+    return 0
+  fi
+  npm_root=$(npm root -g </dev/null 2>/dev/null)
+  pkg_dir=$npm_root/$PKG
+  # The binary npm links for the package: what an install is judged and
+  # verified by. Its own --version, not package.json: an install stopped
+  # halfway can leave a package.json that says current next to a binary that
+  # does not run, and that one must be reinstalled.
+  npm_bin=$(npm prefix -g </dev/null 2>/dev/null)/bin/$TU_BIN
+  # Indented with spaces or tabs (pi's package.json is tab-indented).
+  pver() { sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$pkg_dir/package.json" 2>/dev/null | head -n 1; }
+  if [ ! -f "$pkg_dir/package.json" ]; then
+    # An update, not an install: the image installs the tool. A tool with no
+    # other install says so, and the run fails rather than reading current
+    # (Bugbot on #1076).
+    if [ "${TU_NPM_REQUIRED:-0}" = 1 ]; then
+      npm_note="none->FAILED:not-in-npm-global"
+      log "$PKG is not in the npm global under $npm_root; nothing to update (the image installs it)"
+    fi
+    return 0
+  fi
+  before=$(ver "$npm_bin") before_pkg=$(pver)
+  # Never at the version already there: npm reinstalls it ("2.1.312 =>
+  # 2.1.312, changed 2 packages"), replacing the binary under every running
+  # session for nothing. A rejected install is the exception: what is there
+  # is not what was checked.
+  if at_least "$before" "$want" && ! was_rejected npm; then
+    npm_note=$before
+  elif [ ! -w "$npm_root" ]; then
+    # A prefix this user cannot write (root's /usr on the orchestrator host)
+    # is someone else's to update.
+    npm_note="${before:-$(pver)}(root-owned)"
+    log "npm global $PKG is ${before:-unknown} under $npm_root, which this user cannot write; skipped"
+  elif downgrade "$before" && ! was_rejected npm; then
+    npm_note="$before(no-downgrade)"
+    log "npm global $PKG is $before; $PKG@$spec ($spec_v) would move it down; skipped"
+  # A tool that installs only versions it has pinned (pi): one it has not is
+  # not installed, and the run fails (Security review on #1088).
+  elif declare -F tu_npm_allowed >/dev/null && ! npm_src=$(tu_npm_allowed "$spec_v"); then
+    npm_note="${before:-$(pver)}->FAILED:unpinned:$spec_v"
+  else
+    npm_src=${npm_src:-$PKG@$spec}
+    [ -n "$before" ] || log "npm global $PKG ($(pver) by its package.json): $npm_bin --version does not run; reinstalling"
+    npm_install() {
+      local cap; cap=$(left "$INSTALL_TIMEOUT")
+      log "npm global $PKG is ${before:-unknown}; installing $PKG@$spec (at most ${cap}s)"
+      run_capped "$cap" npm install -g --no-fund --no-audit --loglevel=error ${TU_NPM_FLAGS[@]+"${TU_NPM_FLAGS[@]}"} "$npm_src" </dev/null >&2
+    }
+    ok=0
+    if npm_install; then ok=1
+    # One retry (the owner's own agent may be auto-updating the same
+    # prefix), only while the budget still holds a sleep and a real try.
+    elif [ "$(left "$INSTALL_TIMEOUT")" -gt $(( RETRY_SLEEP + 30 )) ]; then
+      log "npm install failed; retrying in ${RETRY_SLEEP}s"
+      sleep "$RETRY_SLEEP"
+      npm_install && ok=1
+    else
+      log "npm install failed or was stopped, and the ${BUDGET}s budget has no room for a retry"
+    fi
+    # Accepted only when the package npm wrote says exactly the version
+    # asked for and its binary runs and says the same: the binary comes from
+    # the package's postinstall (Claude Code) or a platform dependency
+    # (Codex), so a clean npm exit alone proves nothing.
+    after=$(ver "$npm_bin") after_pkg=$(pver)
+    if [ "$after_pkg" = "$spec_v" ] && [ "$after" = "$spec_v" ]; then
+      npm_note="${before:-broken}->$after"
+      log "npm installed $PKG@$spec_v, verified (package.json and $TU_BIN --version)"
+      accept npm
+    elif [ "$ok" = 0 ] && [ "$after_pkg" = "$before_pkg" ] && [ "$after" = "$before" ] && ! was_rejected npm; then
+      # Nothing changed: a failed install, not a wrong one.
+      npm_note="${before:-broken}->FAILED"
+      log "npm install -g $PKG@$spec_v did not complete"
+    else
+      npm_note="${before:-broken}->pin-mismatch"
+      reject npm "asked for $spec_v; package.json says ${after_pkg:-nothing}, $npm_bin --version says ${after:-nothing (does not run)}"
+      # Put it back: the version that was there and ran, reinstalled and
+      # verified like any install; else quarantine what npm just laid down.
+      # The record stays: every run exits 3 until a later run installs this
+      # path and verifies it.
+      # A tool with pins puts back only the pinned bytes of that version.
+      restored=0 back_src=$PKG@$before_pkg
+      if declare -F tu_npm_allowed >/dev/null && is_version "$before_pkg" && ! back_src=$(tu_npm_allowed "$before_pkg"); then
+        log "the version before, $before_pkg, has no pinned package to put back"; before_pkg=
+      fi
+      back_src=${back_src:-$PKG@$before_pkg}
+      if is_version "$before_pkg" && [ "$before" = "$before_pkg" ]; then
+        log "putting the npm global back to $before_pkg"
+        if run_capped "$(left "$INSTALL_TIMEOUT")" npm install -g --no-fund --no-audit --loglevel=error ${TU_NPM_FLAGS[@]+"${TU_NPM_FLAGS[@]}"} "$back_src" </dev/null >&2 \
+          && [ "$(pver)" = "$before_pkg" ] && [ "$(ver "$npm_bin")" = "$before_pkg" ]; then
+          restored=1 npm_note="$npm_note,restored:$before_pkg"
+          log "npm global $PKG is back at $before_pkg, verified"
+        else
+          log "could not put the npm global back to $before_pkg"
+        fi
+      fi
+      if [ "$restored" = 0 ]; then
+        if quarantine "$(readlink -f "$npm_bin" 2>/dev/null)"; then
+          npm_note="$npm_note,quarantined"
+        else
+          log "could not quarantine the npm global's $TU_BIN ($npm_bin)"
+        fi
+      fi
+    fi
+  fi
+}
+
+# ── sessions, after a run's install (--run) ─────────────────────────────────
+# What the tool's find_sessions found on an old binary: runners (Claude
+# Code's cloud-session runners: SIGTERM, a drain of up to RUNNER_WAIT, never
+# SIGKILL) and the top session of each tmux pane (restart=idle stops each one
+# as soon as tu_status says it is not "busy", and at drainSec whatever it says
+# (cut); restart=force stops them all at once (cut counts those busy):
+# SIGTERM, then SIGKILL after KILL_AFTER). Anything else is `other`, counted
+# and never touched.
+#
+# Then, per stopped pane, once its shell has the foreground back (at most
+# 10 s): an agent pane (a tmux session named <...>-agent, termag's) is left at
+# its shell for the orchestrator, which relaunches it; any other pane whose
+# session had a conversation (tu_had) gets tu_resume_line typed with tmux
+# send-keys -l; one without is left at its shell (fresh). Nothing is ever
+# typed into a pane that is not at a shell. RESUME_WAIT after the last one
+# typed, a typed pane that is no longer at a shell counts as resumed.
+ppid_of() { sed -E 's/^.*\) [A-Za-z] ([0-9]+) .*$/\1/' "/proc/$1/stat" 2>/dev/null; }
+env_of() { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | sed -n "s/^$2=//p" | head -n 1; }
+# The tmux server socket a process's pane lives on, as this process can reach
+# it (through /proc/<pid>/root when that process has a private /tmp).
+socket_of() {
+  local s; s=$(env_of "$1" TMUX); s=${s%%,*}
+  [ -n "$s" ] || return 1
+  if [ -S "$s" ]; then printf '%s' "$s"; elif [ -S "/proc/$1/root$s" ]; then printf '%s' "/proc/$1/root$s"; else return 1; fi
+}
+is_shell() {
+  case "$(tmux -S "$1" display -p -t "$2" '#{pane_current_command}' 2>/dev/null)" in
+    zsh|bash|sh|dash|fish|ksh|-zsh|-bash) return 0 ;;
+  esac
+  return 1
+}
+pane_exists() { tmux -S "$1" display -p -t "$2" '#{pane_id}' >/dev/null 2>&1; }
+# Alive and not a zombie: an exited child its parent has not reaped yet still
+# answers kill -0, and is gone for every purpose here.
+is_alive() { kill -0 "$1" 2>/dev/null && [ "$(sed -E 's/^.*\) ([A-Za-z]) .*$/\1/' "/proc/$1/stat" 2>/dev/null)" != Z ]; }
+alive() { local k=0 p; for p in "$@"; do is_alive "$p" && k=$((k + 1)); done; echo "$k"; }
+
+runners=() p_pid=() p_sock=() p_pane=() p_sess=() p_id=()
+other=0
+
+# The run's counts and its panes, for the report (sessions, panes).
+s_stopped=0 s_resumed=0 s_fresh=0 s_cut=0 s_typed=0 s_left=0 killed=0 gone=0 ended=0 stuck=0 agent_panes=0
+panes_json=()
+restart_note=
+# Each pane's state in stop_sessions (live, term, dead, finished, ended):
+# outside it too, so a run stopped by a signal still lists the panes it had
+# already stopped (on_signal).
+p_st=()
+# list_pane I: pane I in the report's panes, with its role and conversation;
+# sets LP_ROLE (agent, other) and LP_HAD (true, false).
+LP_ROLE='' LP_HAD=''
+# tu_unshare: for a tool that guesses a pane's session from where it runs (the
+# newest one in its working directory), after find_sessions has set p_guess[I]
+# (that place, or empty for a session the process named itself) and peers (the
+# place of every one of the tool's processes, old binary or current). A guess
+# whose place another process shares may be that process's session, so it is
+# no pane's: it is dropped, and the pane left at its shell rather than resumed
+# in another's conversation (Devin on #1080, #1087, #1088).
+p_guess=() peers=() p_shared=()
+tu_unshare() {
+  local i k n
+  for i in "${!p_pid[@]}"; do
+    k=${p_guess[$i]:-}; [ -n "$k" ] || continue
+    n=$(printf '%s\n' "${peers[@]}" | grep -cxF -- "$k")
+    [ "$n" -gt 1 ] || continue
+    p_id[$i]='' p_shared[$i]=1
+  done
+}
+list_pane() {
+  local i=$1 id role had
+  id=${p_id[$i]}
+  [[ "$id" =~ ^[A-Za-z0-9-]{1,100}$ ]] || id=
+  had=false; [ "${p_shared[$i]:-}" = 1 ] || ! tu_had "$i" "$id" || had=true
+  case "${p_sess[$i]}" in *-agent) role=agent ;; *) role=other ;; esac
+  LP_ROLE=$role LP_HAD=$had
+  # The orchestrator matches the name against its own (no whitespace,
+  # ':', '.' or control characters, as tmux.tmuxSafeName leaves it);
+  # any other name is a pane it cannot relaunch, so it is counted only.
+  if [[ "${p_sess[$i]}" =~ ^[^[:space:][:cntrl:]:.]{1,200}$ ]] && [ "${#panes_json[@]}" -lt 200 ]; then
+    panes_json+=("$(jq -nc --arg s "${p_sess[$i]}" --arg r "$role" --arg id "$id" --argjson h "$had" \
+      '{session: $s, role: $r, hadConversation: $h} + (if $id != "" then {sessionId: $id} else {} end)')")
+  fi
+}
+stop_sessions() {
+  local i now t0 deadline hard pending id role had status typed_at=0
+  local -a p_t=() p_typed=()
+  [ "${#runners[@]}" -gt 0 ] && kill -TERM "${runners[@]}" 2>/dev/null
+  t0=$(date +%s)
+  if [ "$RESTART" = force ]; then deadline=$t0; else deadline=$(( t0 + DRAIN )); fi
+  # A process that outlives even its SIGKILL (stuck in the kernel) is given up
+  # on here, so the run always ends and reports.
+  hard=$(( deadline + KILL_AFTER + 30 ))
+  for i in "${!p_pid[@]}"; do p_st[$i]=live p_t[$i]=0 p_typed[$i]=0; done
+  # One pass a second over every pane: live -> term (SIGTERM; SIGKILL after
+  # KILL_AFTER) -> dead (its process gone) -> finished (listed, and resumed,
+  # left or fresh) once its shell has the foreground back; live -> ended when
+  # it exits on its own (not stopped by this run, so not reported). Runners
+  # drain alongside.
+  while :; do
+    now=$(date +%s) pending=0
+    for i in "${!p_pid[@]}"; do
+      case "${p_st[$i]}" in
+        live)
+          if ! is_alive "${p_pid[$i]}"; then p_st[$i]=ended; ended=$((ended + 1)); continue; fi
+          status=$(tu_status "$i")
+          if [ "$RESTART" = force ] || [ "$now" -ge "$deadline" ] || [ "$status" != busy ]; then
+            [ "$status" = busy ] && s_cut=$((s_cut + 1))
+            kill -TERM "${p_pid[$i]}" 2>/dev/null
+            p_st[$i]=term p_t[$i]=$now
+          fi
+          pending=1 ;;
+        term)
+          if ! is_alive "${p_pid[$i]}"; then p_st[$i]=dead p_t[$i]=$now
+          elif [ "$now" -ge "$hard" ] && [ "${p_t[$i]}" = -1 ]; then
+            p_st[$i]=ended stuck=$((stuck + 1)); continue
+          elif [ "${p_t[$i]}" -gt 0 ] && [ $(( now - p_t[i] )) -ge "$KILL_AFTER" ]; then
+            kill -KILL "${p_pid[$i]}" 2>/dev/null; killed=$((killed + 1)); p_t[$i]=-1
+          fi
+          pending=1 ;;
+        dead)
+          # Until the pane's shell has the foreground back (a launch wrapper
+          # exits after its session), at most 10 s.
+          if pane_exists "${p_sock[$i]}" "${p_pane[$i]}" && ! is_shell "${p_sock[$i]}" "${p_pane[$i]}" && [ $(( now - p_t[i] )) -lt 10 ]; then
+            pending=1; continue
+          fi
+          p_st[$i]=finished s_stopped=$((s_stopped + 1))
+          pane_exists "${p_sock[$i]}" "${p_pane[$i]}" || gone=$((gone + 1))
+          id=${p_id[$i]}
+          [[ "$id" =~ ^[A-Za-z0-9-]{1,100}$ ]] || id=
+          list_pane "$i"; role=$LP_ROLE had=$LP_HAD
+          [ "$role" = agent ] && agent_panes=$((agent_panes + 1))
+          if [ "$role" = agent ] || ! pane_exists "${p_sock[$i]}" "${p_pane[$i]}"; then
+            :
+          elif [ "$had" = true ] && is_shell "${p_sock[$i]}" "${p_pane[$i]}"; then
+            # argv, never a shell string: -l types the text as it is, `--`
+            # keeps it from being read as a flag, and Enter is its own call.
+            tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" -l -- "$(tu_resume_line "$id")" \
+              && tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" Enter \
+              && { s_typed=$((s_typed + 1)); p_typed[$i]=1; typed_at=$now; }
+          elif [ "$had" = true ]; then
+            s_left=$((s_left + 1))
+          else
+            s_fresh=$((s_fresh + 1))
+          fi ;;
+      esac
+    done
+    [ "$pending" = 0 ] && [ "$(alive "${runners[@]}")" -eq 0 ] && break
+    [ "$pending" = 0 ] && [ $(( now - t0 )) -ge "$RUNNER_WAIT" ] && break
+    sleep 1
+  done
+  runners_left=$(alive "${runners[@]}")
+  if [ "$s_typed" -gt 0 ]; then
+    now=$(date +%s)
+    [ $(( now - typed_at )) -ge "$RESUME_WAIT" ] || sleep $(( RESUME_WAIT - (now - typed_at) ))
+    for i in "${!p_pid[@]}"; do
+      [ "${p_typed[$i]}" = 1 ] && pane_exists "${p_sock[$i]}" "${p_pane[$i]}" && ! is_shell "${p_sock[$i]}" "${p_pane[$i]}" && s_resumed=$((s_resumed + 1))
+    done
+  fi
+}
+
+# The target a report names: the exact version this run resolved, else the
+# floor for a floor-only run (no policy, so no target; none for a tool with
+# no fallback floor), else the policy's own target, as termag-claude-update
+# did on #995 (Bugbot on #995).
+report_target() {
+  if [ -n "${spec_v:-}" ]; then printf '%s' "$spec_v"
+  elif [ "${FLOOR_ONLY:-1}" = 1 ]; then printf '%s' "${FLOOR:-}"
+  else printf '%s' "$TARGET"
+  fi
+}
+
+# post_report OUTCOME DETAIL: POST /api/tool-update/report. Best effort, as
+# termag-box-update's report: a box that cannot reach the orchestrator leaves
+# the run to expire there. Not for a run the orchestrator does not know (404
+# on the policy): there is nothing to attach it to.
+post_report() {
+  local outcome=$1 detail=$2 body code out panes
+  if [ "$POLICY_CODE" = 404 ]; then log "report: not posted: the orchestrator knows no run $RUN_ID"; return 0; fi
+  agent_endpoint || { log "report: not posted: $POLICY"; return 0; }
+  panes=$(printf '%s\n' "${panes_json[@]}" | jq -sc '.' 2>/dev/null) || panes='[]'
+  [ "${#panes_json[@]}" -gt 0 ] || panes='[]'
+  body=$(jq -nc --arg component "$TU_COMPONENT" --arg run "$RUN_ID" --arg o "$outcome" --arg target "$(report_target)" \
+    --arg from "${from_v:-}" --arg to "${to_v:-}" --arg d "${detail:0:2000}" --argjson panes "$panes" \
+    --argjson stopped "$s_stopped" --argjson resumed "$s_resumed" --argjson fresh "$s_fresh" --argjson cut "$s_cut" \
+    --argjson typed "$s_typed" --argjson other "$other" --argjson left "${runners_left:-0}" \
+    '{component: $component, trigger: "manual", run: $run, outcome: $o, detail: $d,
+      sessions: {stopped: $stopped, resumed: $resumed, fresh: $fresh, cut: $cut, typed: $typed, other: $other, runnersLeft: $left},
+      panes: $panes}
+     + (if $target != "" then {target: $target} else {} end)
+     + (if $from != "" then {fromVersion: $from} else {} end) + (if $to != "" then {toVersion: $to} else {} end)')
+  log "report body: $body"
+  out=$(mktemp "${TMPDIR:-/tmp}/termag-$TU_COMPONENT-report.XXXXXX")
+  api code "$out" POST tool-update/report "$body"
+  rm -f "$out"
+  case "$code" in
+    204) log "report: posted ($outcome)" ;;
+    000) log "report: not posted: the orchestrator is unreachable" ;;
+    *) log "report: not posted: HTTP $code" ;;
+  esac
+}
+
+# after_install RC STATE BIN: what a run does once its install is settled
+# (from finish): stop and resume sessions as the policy says, then report.
+# Nothing is stopped when the run did not end at or above the floor, with
+# nothing rejected (a restart would come back on the old binary or on
+# unverified bytes), or when another run held the lock.
+runners_left=0 to_v=''
+after_install() {
+  local rc=$1 state=$2 outcome detail notes
+  find_sessions
+  if [ "$RESTART" = none ]; then
+    restart_note=none
+  elif [ "$rc" != 0 ]; then
+    restart_note="none($TU_BIN $state)"
+  elif [ "$LOCK_HELD" != 1 ]; then
+    restart_note="none(lock held)"
+  # Nothing installed and the install failed (not in the npm global, a failed
+  # download): a restart would put every session back on the binary it
+  # already ran (Bugbot on #1076). Unless what a session starts is already
+  # the target (Claude Code's native install beside a failed npm global):
+  # a session on an older binary then moves to it (Devin on #1076).
+  # A package refused before it went live ("(not-installed)") installed
+  # nothing either (Bugbot on #1087).
+  elif notes=$(tu_notes_all) && [[ "$notes" == *FAILED* || "$notes" == *'(not-installed)'* ]] && [[ "$notes" != *'->'[0-9]* ]] \
+    && { [ -z "${spec_v:-}" ] || [ "${to_v:-}" != "$spec_v" ]; }; then
+    restart_note="none(nothing installed)"
+  elif [ "${TU_TARGET_UNRESOLVED:-0}" = 1 ] && [[ "$(tu_notes_all)" != *'->'[0-9]* ]]; then
+    restart_note="none(target unresolved)"
+  elif [ $(( ${#runners[@]} + ${#p_pid[@]} )) -eq 0 ]; then
+    restart_note="$RESTART(nothing on an old binary)"
+  else
+    restart_note=$RESTART
+    stop_sessions
+  fi
+  notes=$(tu_notes_all)
+  # A run that never got the lock installed and restarted nothing: it did not
+  # happen, whatever the box is at (Bugbot on #995).
+  if [ "$rc" != 0 ] || [ "$LOCK_HELD" != 1 ]; then outcome=failed
+  # No policy, and no floor of its own to fall back to: nothing was installed
+  # or checked against a target, so the admin's update did not happen
+  # (Bugbot on #1080). A run the orchestrator did not start (ok-no-run) is
+  # not this one's to report failed.
+  elif [ "${TU_NO_FALLBACK_FLOOR:-0}" = 1 ] && [ "$FLOOR_ONLY" = 1 ] && ! [[ "$POLICY" =~ ^(ok|ok-no-run|-)$ ]]; then outcome=failed
+  # The policy's target did not resolve and nothing was installed: the
+  # admin's update did not happen (Bugbot on #1110).
+  elif [ "${TU_TARGET_UNRESOLVED:-0}" = 1 ] && [[ "$notes" != *'->'[0-9]* ]]; then outcome=failed
+  else
+    case "$notes" in
+      *'->'[0-9]*) outcome=updated ;;
+      *FAILED*|*pin-mismatch*) outcome=failed ;;
+      *) outcome=current ;;
+    esac
+    case "$outcome:$notes" in updated:*FAILED*|updated:*pin-mismatch*) outcome=partial ;; esac
+    # A runner left draining or a typed resume that did not take: done, but not all of it.
+    if [ "$outcome" != failed ] && { [ "${runners_left:-0}" -gt 0 ] || [ "$s_resumed" -lt "$s_typed" ]; }; then outcome=partial; fi
+  fi
+  detail="policy=$POLICY restart=$restart_note drain=${DRAIN}s target=$TARGET->${spec_v:--} $TU_BIN=${3:--} version=${from_v:--}->${to_v:--} floor=${FLOOR:--} state=$state $(tu_notes)"
+  detail="$detail runners=${#runners[@]} runners_left=${runners_left:-0} panes=${#p_pid[@]} agent_panes=$agent_panes other=$other stopped=$s_stopped cut=$s_cut killed=$killed stuck=$stuck ended=$ended gone=$gone typed=$s_typed resumed=$s_resumed fresh=$s_fresh left=$s_left"
+  [ "$LOCK_HELD" = 1 ] || detail="$detail lock=held-by-another-run"
+  log "run $RUN_ID: $outcome; $detail"
+  trap - TERM INT HUP
+  post_report "$outcome" "$detail"
+}
+# A run stopped by a signal (systemctl stop, the unit's timeout), during its
+# install or while it waits for sessions, still says so, with what it had done.
+# TU_TMP: what a tool is downloading or unpacking right now, removed when a
+# signal stops the run, so a stop mid-download leaves nothing behind (a review
+# on #1080).
+TU_TMP=()
+on_signal() {
+  local i
+  trap - TERM INT HUP
+  log "stopped by a signal"
+  [ "${#TU_TMP[@]}" -eq 0 ] || rm -rf -- "${TU_TMP[@]}"
+  runners_left=$(alive "${runners[@]}")
+  # The panes it had already sent SIGTERM (term) or seen go (dead) and not yet
+  # listed: listed now, so the orchestrator relaunches them (Bugbot on #995).
+  for i in "${!p_st[@]}"; do
+    case "${p_st[$i]}" in term|dead) list_pane "$i"; s_stopped=$((s_stopped + 1)) ;; esac
+  done
+  post_report failed "policy=$POLICY restart=$RESTART stopped by a signal; $(tu_notes) runners=${#runners[@]} panes=${#p_pid[@]} stopped=$s_stopped cut=$s_cut typed=$s_typed"
+  exit 143
+}

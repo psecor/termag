@@ -5,10 +5,11 @@
 #   warm    run deploy/on-warm.d/*.sh from the checkout while the box is still
 #           unowned, so a claimed box arrives with its slow work already done.
 #   claim   clone an optional personal dotfiles repo when it is public, or
-#           leave the saved URL for a later run after the owner signs in,
-#           then apply it: its install script, else `chezmoi init --apply`
-#           for a chezmoi source tree, else links to its top-level dotfiles.
-#           No GitHub token is read or written.
+#           leave the saved URL for a later run (the agent's, once GitHub
+#           reaches the box through termag; the owner's own rerun, after they
+#           sign in), then apply it: its install script, else `chezmoi init
+#           --apply` for a chezmoi source tree, else links to its top-level
+#           dotfiles. No GitHub token is read or written.
 #
 # The backend starts the warm run through the agent once the agent has
 # connected, never cloud-init, so nothing enables termag-on-warm.service at
@@ -23,6 +24,11 @@
 #   TERMAG_CHECKOUT      checkout to take the scripts from (default
 #                        $HOME/src/termag); exported to each script too
 #   TERMAG_HOOK_TIMEOUT  per-script timeout, a timeout(1) duration (default 20m)
+#   TERMAG_CLAIM_TIMEOUT the claim run's budget, a timeout(1) duration (default 10m)
+#   TERMAG_CLAIM_LOCK_WAIT
+#                        seconds a claim run waits for another claim run to end
+#                        before it fails with reason lock-timeout (default 660,
+#                        the claim budget plus its kill grace)
 #   TERMAG_STATE_DIR     where the log and status file go (default $HOME/.termag)
 #   TERMAG_DOTFILES_NO_SCRIPTS
 #                        1: claim runs nothing from the dotfiles repository (no
@@ -466,11 +472,31 @@ run_claim_work() {
 
 run_claim() {
   log 'claim run starting'
+  # The owner runs this directly, and the agent starts the unit for the same
+  # reason (a GitHub delivery): two runs at once would each take the other's
+  # half-made checkout for an unfinished clone and remove it. One lock for the
+  # whole run; the second waits, then finds the checkout applied.
+  local lock="$STATE_DIR/on-claim.lock" lock_wait="${TERMAG_CLAIM_LOCK_WAIT:-660}"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock"
+    if ! flock -n 9; then
+      log 'another claim run holds the lock; waiting for it'
+      flock -w "$lock_wait" 9 || fail_run lock-timeout "another claim run held the lock for over ${lock_wait}s"
+    fi
+  else
+    log 'flock not found; running without the claim lock'
+  fi
   unset TERMAG_GITHUB_TOKEN GIT_ASKPASS TERMAG_GIT_ASKPASS || true
   if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090 # mode-600 file written by the local agent
     . "$ENV_FILE"
   fi
+  # A rerun (the owner's after GitHub login, or the agent once GitHub arrives
+  # through termag) has no env file: the unit removes it after the first run.
+  # The identity the claim set in the global git config stands in, so the
+  # repository's entrypoint sees the same owner either time.
+  [ -n "${TERMAG_OWNER_NAME:-}" ] || TERMAG_OWNER_NAME=$(git config --global user.name 2>/dev/null || true)
+  [ -n "${TERMAG_OWNER_EMAIL:-}" ] || TERMAG_OWNER_EMAIL=$(git config --global user.email 2>/dev/null || true)
   export TERMAG_DOTFILES_REPO_URL="${TERMAG_DOTFILES_REPO_URL:-}"
   export TERMAG_OWNER_EMAIL="${TERMAG_OWNER_EMAIL:-}"
   export TERMAG_OWNER_NAME="${TERMAG_OWNER_NAME:-}"
@@ -485,7 +511,9 @@ run_claim() {
   local started rc elapsed
   started=$(date +%s)
   rc=0
-  timeout -k 30s "$HOOK_TIMEOUT" bash -c 'set -euo pipefail; run_claim_work' >> "$LOG_FILE" 2>&1 &
+  # The lock stays with this process: a daemon the entrypoint leaves behind
+  # must not keep holding it.
+  timeout -k 30s "$HOOK_TIMEOUT" bash -c 'set -euo pipefail; run_claim_work' 9>&- >> "$LOG_FILE" 2>&1 &
   CHILD=$!
   wait "$CHILD" || rc=$?
   CHILD=

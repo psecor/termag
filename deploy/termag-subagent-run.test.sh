@@ -28,6 +28,13 @@
 #     its HEAD
 #   * no commits, no upload; a run without a result and a non-GitHub origin
 #     are each reported to the asker; long replies are cut to the body limit
+#   * push mode (ask-push-v1, a job with pushBranch): a normal clone with
+#     origin, not shallow and without the live checkout's unpushed commits,
+#     on the thread's branch tracking the default branch; the run pushes
+#     itself, the result names the branches the clone pushed and no bundle
+#     goes up; a branch with commits it did not push is said in the reply;
+#     the pre-push hook refuses the default branch; a person's prepare keeps
+#     the layout; an older clone of the thread is converted in place
 #   * idle threads are swept with their transcripts; a bad job exits 2
 #     without reporting
 #   * a TERM during the run stops the run's whole process group and exits 143
@@ -57,6 +64,9 @@ has() { case "$2" in *"$3"*) : ;; *) fail "$1" "$3" "$2" ;; esac; }
 lacks() { case "$2" in *"$3"*) fail "$1" "(no '$3')" "$2" ;; esac; }
 
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+# Not inherited from a session that runs these tests.
+unset TERMAG_ASK_PR_BODY_FILE TERMAG_ASK_PR_DIR TERMAG_ASK_THREAD
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
 export HOME="$WORK/home"
 STUB="$WORK/stub"
 TSTATE="$WORK/state"
@@ -138,6 +148,16 @@ case $mode in
     git switch -q -c scratch termag/base && echo s > s.txt && git add . && git commit -q -m scratch
     git switch -q ask ;;
   elsewhere) git switch -q -c elsewhere termag/base && echo e > e.txt && git add . && git commit -q -m elsewhere ;;
+  push)
+    b=$(git branch --show-current)
+    echo p > pushed-change.txt && git add . && git commit -q -m 'push change'
+    git push -q origin "HEAD:$b" 2> "$TSTATE/push-stderr"
+    git switch -q -c "$b-docs" origin/main && echo d > docs.txt && git add . && git commit -q -m docs && git push -q origin HEAD 2>> "$TSTATE/push-stderr"
+    git switch -q -c scratch origin/main && echo s > s.txt && git add . && git commit -q -m scratch
+    git switch -q "$b" ;;
+  push-main)
+    echo m > main-change.txt && git add . && git commit -q -m 'onto main'
+    git push origin HEAD:main 2> "$TSTATE/push-stderr"; echo $? > "$TSTATE/push-exit" ;;
   utf8-*)
     i=0; printf x > "$TSTATE/long-reply"
     while [ $i -lt "${mode#utf8-}" ]; do printf 'é%.0s' $(seq 1 1000) >> "$TSTATE/long-reply"; i=$((i + 1000)); done
@@ -411,6 +431,130 @@ run --prepare "$J"; eq 'a failed prepare without a run exits 1' "$?" 1
 lacks 'and reports nothing' "$(cat "$LOG")" 'curl'
 has 'saying why on stderr' "$(cat "$TSTATE/stderr")" 'does not exist'
 
+# ── push mode (ask-push-v1) ───────────────────────────────────────────────────────────
+# "GitHub" is the bare origin, reached through the box's own rewrite as the broker is.
+printf '[init]\n\ttemplateDir = %s\n[url "%s"]\n\tinsteadOf = https://github.com/org/repo.git\n' "$WORK/git-template" "$ORIGIN" > "$WORK/box-gitconfig-push"
+runp() { : > "$LOG"; rm -f "$TSTATE/result.json" "$TSTATE/uploaded.bundle" "$TSTATE/claude-args"; GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" "$@" 2> "$TSTATE/stderr"; }
+SAVED_ORIGIN=$(gitp config --get remote.origin.url)
+gitp remote set-url origin https://github.com/org/repo.git
+echo push > "$TSTATE/claude-mode"
+PB=termag-ada/threadpush01
+runp "$(job runpush0001 threadpush01 '{"pushBranch":"'"$PB"'"}')"; eq 'a push-mode turn exits 0' "$?" 0
+P="$ROOT/threads/threadpush01/repo"
+eq 'the clone has origin, as the checkout names it' "$(git -C "$P" config --get remote.origin.url)" https://github.com/org/repo.git
+eq 'and is not shallow' "$(git -C "$P" rev-parse --is-shallow-repository)" false
+git -C "$P" cat-file -e "$LIVE_HEAD^{commit}" 2>/dev/null && fail "the live checkout's unpushed commit stays out of the clone" absent present
+eq 'the run is on the thread branch' "$(git -C "$P" branch --show-current)" "$PB"
+eq 'which tracks the default branch, so it is its own tree' "$(git -C "$P" rev-parse --abbrev-ref "$PB@{upstream}")" origin/main
+git -C "$P" rev-parse -q --verify refs/termag/base >/dev/null && fail 'no refs/termag/base in a push clone' absent present
+if command -v node >/dev/null 2>&1; then
+  own=$(node -e 'const c = require(process.argv[1]); c.readCheckoutFacts(process.argv[2]).then(f => process.stdout.write(String(c.checkoutOwnTree(f))))' "$DIR/../agent/chat-runner.js" "$P" 2>&1)
+  eq "the chat runner sees the push clone as the project's own tree (gotcha ask-push-clone-upstream)" "$own" true
+fi
+[ -x "$P/.git/hooks/pre-push" ] || fail 'the clone has the pre-push hook' present absent
+has 'the run knows its thread' "$(cat "$TSTATE/claude-env")" 'TERMAG_ASK_THREAD=threadpush01'
+lacks 'and gets no PR description file' "$(cat "$TSTATE/claude-env")" 'TERMAG_ASK_PR_BODY_FILE='
+lacks 'no bundle goes up' "$(cat "$LOG")" '/bundle'
+R="$TSTATE/result.json"
+eq 'the result names what the clone pushed' "$(jq -c '[.pushes[] | .branch] | sort' "$R")" "[\"$PB\",\"$PB-docs\"]"
+eq 'with the tips GitHub has' "$(jq -r --arg b "$PB" '.pushes[] | select(.branch == $b) | .sha' "$R")" "$(git -C "$ORIGIN" rev-parse "refs/heads/$PB")"
+eq 'bundle flag' "$(jq -r .bundle "$R")" false
+eq 'pushed as the asker' "$(git -C "$ORIGIN" log -1 --format='%ae %ce' "refs/heads/$PB")" 'ada@example.com ada@example.com'
+has 'a branch committed but not pushed is said in the reply' "$(jq -r .result "$R")" 'branch scratch has 1 commit(s) that were committed but not pushed'
+lacks 'and a pushed one is not' "$(jq -r .result "$R")" "branch $PB has"
+eq 'push mode is remembered' "$(jq -r '.layout + " " + .branch' "$ROOT/threads/threadpush01/meta.json")" "push $PB"
+# The default branch is refused by the clone's hook.
+MAIN_BEFORE=$(git -C "$ORIGIN" rev-parse refs/heads/main)
+echo push-main > "$TSTATE/claude-mode"
+runp "$(job runpush0002 threadpush01 '{"pushBranch":"'"$PB"'","resumeSessionId":"sess-1"}')"
+lacks 'a push to the default branch fails' "$(cat "$TSTATE/push-exit")" 0
+has 'saying why' "$(cat "$TSTATE/push-stderr")" 'not pushing to main, the default branch'
+eq 'and main is untouched' "$(git -C "$ORIGIN" rev-parse refs/heads/main)" "$MAIN_BEFORE"
+eq 'the earlier pushes are still reported' "$(jq -r '.pushes | length' "$TSTATE/result.json")" 2
+# A base that is no branch tip (the upstream moved on past the merge-base), fetched
+# under an owner's protocol.version=0, which refuses unadvertised commits by default.
+gitp update-ref refs/remotes/origin/main "$(gitp commit-tree -p "$BASE" -m ahead "$BASE^{tree}")"
+printf '[protocol]\n\tversion = 0\n' >> "$WORK/box-gitconfig-push"
+echo none > "$TSTATE/claude-mode"
+runp "$(job runpush0003 threadpush03 '{"pushBranch":"termag-ada/threadpush03"}')"; eq 'a base that is no branch tip still clones, under protocol v0' "$?" 0
+eq 'and the clone starts there' "$(git -C "$ROOT/threads/threadpush03/repo" rev-parse HEAD 2>/dev/null)" "$BASE"
+gitp update-ref refs/remotes/origin/main "$BASE"
+sed -i '/^\[protocol\]/,$d' "$WORK/box-gitconfig-push"
+# GitHub unreachable during prepare (a broker blip): no origin branch is fetched, and
+# the branch must still get a refs/heads upstream, or the chat runner refuses the clone.
+printf '[url "%s"]\n\tinsteadOf = https://github.com/org/repo.git\n' "$WORK/no-such-github.git" > "$WORK/box-gitconfig-offline"
+echo none > "$TSTATE/claude-mode"
+: > "$LOG"; GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-offline" "$SCRIPT" "$(job runpush0004 threadpush04 '{"pushBranch":"termag-ada/threadpush04"}')" 2> "$TSTATE/stderr"
+eq 'an offline prepare still runs the turn' "$?" 0
+O="$ROOT/threads/threadpush04/repo"
+eq 'and the branch tracks the default branch anyway' "$(git -C "$O" config --get branch.termag-ada/threadpush04.merge) $(git -C "$O" config --get branch.termag-ada/threadpush04.remote)" 'refs/heads/main origin'
+if command -v node >/dev/null 2>&1; then
+  own=$(node -e 'const c = require(process.argv[1]); c.readCheckoutFacts(process.argv[2]).then(f => process.stdout.write(String(c.checkoutOwnTree(f))))' "$DIR/../agent/chat-runner.js" "$O" 2>&1)
+  eq "so the chat runner still takes it for the project's own tree" "$own" true
+fi
+# A person's message in the thread's chat names no branch: the clone keeps its layout.
+echo commit > "$TSTATE/claude-mode"
+out=$(GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadpush01 '{"waitForCheckout":false}')" 2>/dev/null)
+eq "a person's prepare keeps push mode" "$(printf '%s' "$out" | jq -r '"\(.push) \(.branch) \(.prDir)"')" "true $PB null"
+# An older clone of a thread is converted on its first push-mode turn.
+run "$(job runconv0001 threadconv001)"
+C="$ROOT/threads/threadconv001/repo"
+git -C "$C" switch -q -c pr/notes ask 2>/dev/null && echo n > "$C/n.txt" && git -C "$C" add n.txt && git -C "$C" -c user.name=a -c user.email=ada@example.com commit -q -m notes && git -C "$C" switch -q ask
+echo none > "$TSTATE/claude-mode"
+CB=termag-ada/threadconv001
+runp "$(job runconv0002 threadconv001 '{"pushBranch":"'"$CB"'","resumeSessionId":"sess-1"}')"; eq 'a converted turn exits 0' "$?" 0
+eq 'the converted clone is on the thread branch' "$(git -C "$C" branch --show-current)" "$CB"
+git -C "$C" rev-parse -q --verify "refs/heads/$CB-notes" >/dev/null || fail 'pr/<name> becomes <branch>-<name>' present absent
+git -C "$C" rev-parse -q --verify refs/heads/ask >/dev/null && fail 'ask is renamed' absent present
+eq 'the converted branch tracks the default branch (never published)' "$(git -C "$C" rev-parse --abbrev-ref "$CB@{upstream}" 2>/dev/null)" origin/main
+eq 'and so does a renamed pr/<name>' "$(git -C "$C" rev-parse --abbrev-ref "$CB-notes@{upstream}" 2>/dev/null)" origin/main
+# A turn left on a branch with no upstream gets one at the next prepare.
+git -C "$C" switch -q -c loose "$CB" && git -C "$C" branch -q --unset-upstream loose 2>/dev/null
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadconv001 '{"waitForCheckout":false}')" >/dev/null 2>&1
+eq 'a branch left with no upstream gets one at the next prepare' "$(git -C "$C" rev-parse --abbrev-ref "loose@{upstream}" 2>/dev/null)" origin/main
+git -C "$C" switch -q "$CB"
+eq 'the converted clone is not shallow' "$(git -C "$C" rev-parse --is-shallow-repository)" false
+eq 'and has origin' "$(git -C "$C" config --get remote.origin.url)" https://github.com/org/repo.git
+git -C "$C" rev-parse -q --verify refs/termag/base >/dev/null && fail 'refs/termag/base goes' absent present
+eq 'nothing pushed yet' "$(jq -c .pushes "$TSTATE/result.json")" '[]'
+has 'its unpublished commits are said in the reply' "$(jq -r .result "$TSTATE/result.json")" "branch $CB has 1 commit(s) that were committed but not pushed"
+# --report decides push vs bundle from the job, not meta.json's layout, which the turn can
+# rewrite: a cleared layout still reports what the clone pushed, and sends no bundle (Bugbot on #902).
+echo none > "$TSTATE/claude-mode"
+runp "$(job runrl000001 threadrl0001 '{"pushBranch":"termag-ada/threadrl0001"}')"
+RL="$ROOT/threads/threadrl0001/repo"
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" git -C "$RL" -c user.name=Ada -c user.email=ada@example.com commit -q --allow-empty -m mine
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" git -C "$RL" push -q origin HEAD 2>/dev/null
+jq 'del(.layout)' "$ROOT/threads/threadrl0001/meta.json" > "$WORK/meta.next" && mv "$WORK/meta.next" "$ROOT/threads/threadrl0001/meta.json"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"sess-1","num_turns":1}\n' > "$HOME/result-rl.json"
+: > "$LOG"; GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --report "$(job runrl000002 threadrl0001 '{"pushBranch":"termag-ada/threadrl0001"}')" "$HOME/result-rl.json" 2>/dev/null
+eq "a report with meta.json's layout cleared still names what the clone pushed" "$(jq -c '[.pushes[]?.branch]' "$TSTATE/result.json")" '["termag-ada/threadrl0001"]'
+lacks "and sends no bundle" "$(cat "$LOG")" '/bundle'
+# A later job naming another pushBranch (a follow-up --update-pr on a thread that published
+# nothing) moves the existing push clone onto that branch (Bugbot on #902).
+echo none > "$TSTATE/claude-mode"
+runp "$(job runsw000001 threadsw0001 '{"pushBranch":"termag-ada/threadsw0001"}')"
+SW="$ROOT/threads/threadsw0001/repo"
+TGT=$(git -C "$ORIGIN" -c user.name=Bob -c user.email=bob@example.com commit-tree -p "$BASE" -m 'the PR' "$BASE^{tree}")
+git -C "$ORIGIN" update-ref refs/heads/feat/target "$TGT"
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadsw0001 '{"pushBranch":"feat/target","waitForCheckout":false}')" >/dev/null 2>&1
+eq "a later job's pushBranch is checked out" "$(git -C "$SW" branch --show-current)" feat/target
+eq "at GitHub's tip of it" "$(git -C "$SW" rev-parse HEAD)" "$TGT"
+eq "tracking its own origin branch" "$(git -C "$SW" rev-parse --abbrev-ref 'feat/target@{upstream}' 2>/dev/null)" origin/feat/target
+eq "and meta.json names it" "$(jq -r .branch "$ROOT/threads/threadsw0001/meta.json")" feat/target
+# A switch whose branch GitHub couldn't be asked about fails the prepare and changes nothing,
+# so the next prepare retries; it never starts the branch from the base (Bugbot on #902).
+git -C "$ORIGIN" update-ref refs/heads/feat/target2 "$TGT"
+printf '[url "%s"]\n\tinsteadOf = https://github.com/org/repo.git\n' "$WORK/no-such-github.git" > "$WORK/box-gitconfig-offline2"
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-offline2" "$SCRIPT" --prepare "$(job '' threadsw0001 '{"pushBranch":"feat/target2","waitForCheckout":false}')" >/dev/null 2>&1; sw=$?
+lacks "a switch with GitHub unreachable fails the prepare" "$sw" 0
+git -C "$SW" rev-parse -q --verify refs/heads/feat/target2 >/dev/null && fail "and makes no branch from the base" absent present
+eq "and leaves meta.json's branch alone" "$(jq -r .branch "$ROOT/threads/threadsw0001/meta.json")" feat/target
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadsw0001 '{"pushBranch":"feat/target2","waitForCheckout":false}')" >/dev/null 2>&1
+eq "the next prepare, with GitHub back, switches at GitHub's tip" "$(git -C "$SW" rev-parse HEAD) $(jq -r .branch "$ROOT/threads/threadsw0001/meta.json")" "$TGT feat/target2"
+echo commit > "$TSTATE/claude-mode"
+gitp remote set-url origin "$SAVED_ORIGIN"
+
 # ── sweep and bad input ───────────────────────────────────────────────────────────────
 OLD="$ROOT/threads/oldthread0001"
 mkdir -p "$OLD/repo"
@@ -426,7 +570,7 @@ run "$HOME/bad.json"; eq 'bad job exits 2' "$?" 2
 lacks 'without reporting' "$(cat "$LOG")" 'curl'
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: committed-only clone, run as the box user, bundle, PR description, several PRs, resume, errors, sweep, cancel'
+  echo 'PASS: committed-only clone, run as the box user, bundle, PR description, several PRs, push mode, resume, errors, sweep, cancel'
   exit 0
 fi
 echo "$failures failure(s)"

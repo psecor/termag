@@ -1,0 +1,25 @@
+# The t3 server a box runs for the desktop app: a build of T3 Code's server
+# packaged for a box, one tarball per architecture.
+#
+# The one place it is pinned. deploy/termag-t3-install reads it, from
+# termag-reconcile on every boot and box update, so a bump here reaches running
+# boxes without a rebake, and from a box image bake handed the tarball
+# (packer/scripts/install-t3-server.sh), which never fetches base_url. Set
+# `version`, both digests and base_url together, from the .sha256 files your
+# release carries next to the tarballs. A digest left empty means nothing is
+# installed on that architecture; as shipped, nothing is pinned, so boxes run
+# no t3 server until you point this at your own T3 Code build.
+#
+# KEY=value lines; read by termag-t3-install, never sourced.
+
+version=
+sha256_linux_arm64=
+sha256_linux_x64=
+
+# Where the tarballs live: <base_url>/termag-t3-server-<version>-linux-<arch>.tar.gz.
+# gh://<owner>/<repo>/<tag> is a GitHub release, fetched with the box owner's
+# gh login (so a private repository's releases work); https://, s3:// (the
+# box's AWS CLI and instance role), file:// and absolute paths work too. A gh://
+# source needs the owner's login, so a box gets the server from termag-reconcile
+# once it is claimed (boot, or a box update).
+base_url=

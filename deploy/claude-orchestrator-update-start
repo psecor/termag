@@ -1,0 +1,25 @@
+#!/bin/bash
+# claude-orchestrator-update-start — start one Claude Code update run on the
+# orchestrator host, as root. Installed as /usr/local/libexec/termag/claude-orchestrator-update-start
+# (root's, 0755) by packer/scripts/orchestrator-setup.sh;
+# deploy/claude-orchestrator-update.sudoers lets the termag user (the backend)
+# run this, and only this, as root, with one argument.
+#
+# It takes a run id and starts claude-orchestrator-update@<run>.service, the
+# system unit that runs deploy/claude-orchestrator-update as root, without
+# waiting for it (the backend follows the run through its record). Nothing
+# else: no shell, no other unit, no other verb, and no version. The version
+# comes from the run's policy, which the backend wrote for the run; the root
+# recipe reads it as the termag user and validates it. The run id is the
+# orchestrator's id pattern, checked here as the sudoers rule and the recipe
+# check it. The same shape as a box's termag-gh-update-start.
+#
+# Usage: claude-orchestrator-update-start <run-id>
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+SYSTEMCTL=/usr/bin/systemctl
+if [ $# -ne 1 ] || ! [[ "$1" =~ ^[a-z0-9]{20,40}$ ]]; then
+  printf 'usage: claude-orchestrator-update-start <run-id>\n' >&2
+  exit 2
+fi
+exec "$SYSTEMCTL" start --no-block "claude-orchestrator-update@$1.service"

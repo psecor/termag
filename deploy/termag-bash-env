@@ -1,0 +1,39 @@
+# shellcheck shell=sh
+# termag-bash-env — sourced (never run) by every non-interactive bash that
+# carries BASH_ENV, above all the shell Claude Code's Bash tool runs each
+# command in. Installed at ~/.local/share/termag/bash-env by termag-reconcile.
+#
+# Why bash at all: the box user's login shell is zsh, and Claude Code's Bash
+# tool runs $SHELL unless CLAUDE_CODE_SHELL names another. Agents write bash,
+# and zsh fails it in ways bash does not: an unquoted glob with no match is an
+# error (`grep --include=*.ts` -> "no matches found"), a word starting with `=`
+# is a command lookup (`echo =====` -> "= not found"), an unquoted $var does
+# not split. termag-agent.service and agent/tmux-args.js set
+# CLAUDE_CODE_SHELL=/bin/bash and BASH_ENV=<this file> (the gotcha
+# agent-bash-tool-shell in docs/agents/gotchas.md).
+#
+# What this file is for: a non-interactive zsh reads /etc/zsh/zshenv and
+# ~/.zshenv before every command, and that is where a box keeps part of its
+# environment. A non-interactive bash reads neither, nor /etc/profile.d, nor
+# ~/.bashrc; it reads only $BASH_ENV. So this gives bash what zshenv gave zsh:
+#   GH_HOST          the GitHub broker (termag-credentials writes it to
+#                    ~/.zshenv and /etc/profile.d/termag-github.sh only; a chat
+#                    or ask turn's claude does not have it in its environment).
+#                    gh today also finds the broker as its only logged-in host,
+#                    but anything that reads GH_HOST itself would not.
+#   TERMAG_BOX       the box marker (/etc/profile.d/termag-box.sh)
+# Not PATH: Claude Code's Bash tool sources its shell snapshot after this file,
+# and the snapshot ends in `export PATH=<claude's own PATH>`, so a PATH set here
+# never reaches a command. ~/.local/bin comes from the SessionStart hook's
+# CLAUDE_ENV_FILE (deploy/claude-hooks.md), sourced after the snapshot, and the
+# toolchains from claude's environment (agent/chat-runner.js, toolchainDirs).
+#
+# POSIX sh, silent and cheap: it runs before every Bash tool command and every
+# bash script those commands start. Nothing here may print or fail (a `bash -e`
+# reads it with errexit already on, so no bare test that can be false).
+# TERMAG_PROFILE_D is for deploy/termag-bash-env.test.sh only.
+for termag_bash_env_f in "${TERMAG_PROFILE_D:-/etc/profile.d}/termag-box.sh" "${TERMAG_PROFILE_D:-/etc/profile.d}/termag-github.sh"; do
+  # shellcheck disable=SC1090  # the profile.d files termag-credentials and box-lib.sh write
+  if [ -r "$termag_bash_env_f" ]; then . "$termag_bash_env_f"; fi
+done
+unset termag_bash_env_f

@@ -1,0 +1,21 @@
+#!/bin/bash
+# termag-aws-update-start — start one AWS CLI v2 update run, as root.
+# Installed as
+# /usr/local/libexec/termag/termag-aws-update-start (root's, 0755) by
+# deploy/termag-aws-update-setup; deploy/termag-aws-update.sudoers lets the
+# agent user run this, and only this, as root, with one argument.
+#
+# It takes a run id and starts termag-aws-update@<run>.service, the system
+# unit that runs deploy/termag-aws-update as root, without waiting for it
+# (the agent's tool-update RPC answers at once). Nothing else: no shell, no
+# other unit, no other verb. The run id is the orchestrator's id pattern,
+# checked here as the sudoers rule and the recipe check it.
+#
+# Usage: termag-aws-update-start <run-id>
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+if [ $# -ne 1 ] || ! [[ "$1" =~ ^[a-z0-9]{20,40}$ ]]; then
+  printf 'usage: termag-aws-update-start <run-id>\n' >&2
+  exit 2
+fi
+exec systemctl start --no-block "termag-aws-update@$1.service"

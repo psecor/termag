@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+# termag-cursor-update — update the Cursor agent CLI on a box when the
+# orchestrator asks, and stop and resume its sessions as the run's policy says.
+#
+#
+# Why this exists: the Cursor agent runs code with its owner's credentials,
+# and its CLI has had advisories a box only leaves behind by updating (the
+# floor's sources are in backend/src/services/cursorUpdatePolicy.ts). The image
+# bakes it with Cursor's installer (packer/scripts/setup.sh: `curl
+# https://cursor.com/install | bash`), and what moves it afterwards is its own
+# updater, when a session starts it. This is the box's updater, the second
+# recipe shape on deploy/termag-tool-update-lib: not an npm package, but a
+# versioned directory and two links.
+#
+# The install, as Cursor's installer lays it out:
+#   ~/.local/share/cursor-agent/versions/<version>/   the package (its own node,
+#                                                     index.js, cursor-agent)
+#   ~/.local/bin/agent, ~/.local/bin/cursor-agent     links to that version's
+#                                                     cursor-agent
+# A version is a dated build, 2026.10.22-27dcf5f, and its package is
+# https://downloads.cursor.com/lab/<version>/linux/<x64|arm64>/agent-cli-package.tar.gz,
+# the URL the installer itself downloads. `cursor-agent update` is never used:
+# that lets the binary's own channel choose the bytes.
+#
+# One caller: termag-cursor-update@<run>.service, started by the agent's
+# tool-update RPC (agent/tool-update.js) when an admin updates the Cursor agent
+# from the Software tab: --run <run-id>.
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=cursor&run=<id> with
+#      the agent token on curl's stdin, as termag-codex-update does. Only a 200
+#      that names this run installs anything; no policy, or a 200 with run
+#      null, installs nothing and restarts nothing.
+#   2. Takes ~/.termag/cursor-update.lock (flock).
+#   3. Resolves the target to one build: an exact one from the policy, or
+#      latest, the build the installer at https://cursor.com/install names
+#      (fetched once). Never below the floor or what is installed.
+#   4. Where the installed build is below it: downloads that build's package,
+#      which must match the sha256 pinned for it (below) before it is unpacked,
+#      into versions/.tmp-termag-<version>-<pid> and runs its own
+#      `cursor-agent --version`, which must say exactly that build; a package
+#      that says anything else never goes live (nothing changed, the run
+#      fails). Then moves it to versions/<version>, points both links at it
+#      (each one replaced in a single rename), and checks the cursor-agent a
+#      session would start says exactly that build. One that does not is
+#      REJECTED: recorded in ~/.termag/cursor-update.rejected until a later run
+#      installs and verifies it (every run exits 3 meanwhile), the links are
+#      put back to the build that was there and verified, or, failing that,
+#      the new build is quarantined (its cursor-agent renamed to
+#      cursor-agent.rejected, not executable, and the links removed). Older
+#      builds' directories are left: a running session may be using one.
+#   5. Stops the Cursor agent sessions still on an old build, as restart says:
+#        * the cursor-agent in each tmux pane that the pane's shell started (its
+#          process is the build's own node, versions/<old>/node): restart=idle
+#          stops each one once its pane shows no turn in progress (none of the
+#          activity words or the spinner termag's own status poller reads, and
+#          its chat store not written in the last 5 s), at most drainSec, then
+#          cuts it; restart=force stops them all at once. SIGTERM, then SIGKILL
+#          after TERMAG_CURSOR_KILL_AFTER (20 s);
+#        * anything else (a -p turn, a subcommand such as ls or mcp, a
+#          cursor-agent another agent's tool call runs, sessions outside tmux)
+#          is counted as other and left alone.
+#      The pane's chat is the newest ~/.cursor/chats/<md5 of its workspace>/
+#      <chat id>/store.db written since the process started (or under the
+#      process's CURSOR_CONFIG_DIR). Then, per stopped pane: an agent pane
+#      (<...>-agent) is listed for the orchestrator, which relaunches it with
+#      `cursor-agent --resume <chat id>` when it had a chat, else fresh; any
+#      other pane with a chat gets `cursor-agent --resume <chat id>` typed; one
+#      without is left at its shell. Other agents' panes are never touched.
+#   6. POST <orchestrator>/api/tool-update/report: {component: "cursor", ...},
+#      the shape every tool reports.
+#
+# What is trusted: the digest pinned below for each build. Cursor publishes no
+# checksum for its packages, so a build is installed only once its package's
+# sha256 is pinned in this script (PINS), taken from a download of it, the
+# bytes the image bake installs for that build. The downloaded tarball must
+# match the pin before it is unpacked or anything in it runs; a build with no
+# pin is not downloaded, and the run fails and says so (Security review on
+# #1080). Its --version is not provenance, only the check that the pinned
+# package is the build asked for. A new Cursor build reaches the fleet with a
+# PR that adds its pin.
+#
+# Usage:
+#   termag-cursor-update --run <run-id>   one orchestrator run: the policy, the
+#                                         install, the sessions, the report
+#
+# Exit codes: 0 when the cursor-agent a session would start is at or above the
+# floor (or nothing was asked of it), 1 when it is below it or there is none, 2
+# on bad usage, 3 while an install is rejected, 143 when a signal stops it.
+#
+# Env:
+#   CURSOR_BIN                     the cursor-agent to judge (default: the one on PATH)
+#   TERMAG_STATE_DIR               where the lock lives (default $HOME/.termag)
+#   TERMAG_CURSOR_BUDGET           seconds the install may take, before its
+#                                  sessions (default 600)
+#   TERMAG_CURSOR_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_CURSOR_INSTALL_TIMEOUT  seconds for the download (default 300)
+#   TERMAG_AGENT_CONFIG            the agent config with the orchestrator URL
+#                                  and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT          seconds for each orchestrator call (default 20)
+#   TERMAG_CURSOR_KILL_AFTER       seconds from a session's SIGTERM to its
+#                                  SIGKILL (default 20)
+#   TERMAG_CURSOR_RESUME_WAIT      seconds after typing a resume before it is
+#                                  checked (default 10)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+PKG=cursor-agent
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_CURSOR_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_CURSOR_INSTALL_TIMEOUT:-300}"
+VERSIONS=$HOME/.local/share/cursor-agent/versions
+LINKS=("$HOME/.local/bin/cursor-agent" "$HOME/.local/bin/agent")
+INSTALLER_URL=https://cursor.com/install
+DOWNLOAD_URL=https://downloads.cursor.com/lab
+# The pinned packages: "<build> <x64|arm64> <sha256 of agent-cli-package.tar.gz>".
+# TERMAG_CURSOR_PINS: a file of such lines instead (the tests' builds).
+# Refreshing them: weekly, and on any Cursor
+# advisory, whoever owns the tool updates adds the build cursor.com/install
+# names (a run logs it while it is unpinned) in a PR: both arches' packages
+# downloaded from downloads.cursor.com over TLS, each package's own
+# cursor-agent --version checked to say the build, its sha256 taken with
+# sha256sum, and the same digest got from a second download on another
+# machine. latest then moves to it on the next run.
+PINS='2026.10.22-27dcf5f x64 85296944e4600a83c4b764f578d1502bf9c416db200d33a593e8f3ecabfdc294
+2026.10.22-27dcf5f arm64 22a36df9720830668ccd4d707e5190204ab9c8a0efb2f068cc914895f804d3ec'
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-cursor-update TU_COMPONENT=cursor TU_BIN=cursor-agent TU_TAGS='latest'
+# A build: the date and the build hash, as its directory and download are named.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_VERSION_RE='^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{6,40}$' TU_VERSION_GREP='[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{6,40}'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/cursor-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+REJECTED=$STATE_DIR/cursor-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-cursor-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-cursor-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  # The run id names the systemd instance and goes into a URL and a report.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_CURSOR_BUDGET:-600}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+KILL_AFTER="${TERMAG_CURSOR_KILL_AFTER:-20}"
+# The Cursor agent has no runners to drain.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+RUNNER_WAIT=0
+RESUME_WAIT="${TERMAG_CURSOR_RESUME_WAIT:-10}"
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT" "$KILL_AFTER" "$RESUME_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+# The cursor-agent a pane or a login shell would start.
+resolve() {
+  hash -r
+  if [ -n "${CURSOR_BIN:-}" ]; then printf '%s' "$CURSOR_BIN"
+  else command -v cursor-agent 2>/dev/null || true
+  fi
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); the Cursor agent has no fallback floor"
+# A 200 that names no run: not this run's to install, and not its floor either.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+# latest is the newest build pinned for this machine's arch (PINS), never
+# whatever Cursor names before its pin lands: a run of latest then installs
+# that build or reports current, rather than failing on an unpinned one (a
+# review on #1080). The build the installer names (downloads.cursor.com/lab/
+# <build>/..., fetched once) is only logged when it is not pinned yet, so a pin
+# refresh is due.
+tu_can_resolve() { command -v curl >/dev/null 2>&1; }
+tu_resolve_tag() {
+  local a newest named
+  [ "$1" = latest ] || return 0
+  a=$(arch) || return 0
+  newest=$(pinned_builds "$a" | tail -n 1)
+  named=$(timeout -k 2 "$2" curl -fsSL "$INSTALLER_URL" </dev/null 2>/dev/null \
+    | grep -oE "downloads\.cursor\.com/lab/$TU_VERSION_GREP/" | head -n 1 | grep -oE "$TU_VERSION_GREP")
+  if [ -n "$named" ] && [ -z "$(pin_of "$named" "$a")" ]; then
+    log "Cursor's installer names build $named, which is not pinned yet; latest is the newest pinned build, ${newest:-none}"
+  fi
+  printf '%s' "$newest"
+}
+
+# The rejection record's one install path is `cursor`: expired once the build
+# the links point at is gone (nothing it rejected is left to run).
+expire_stale() {
+  [ -s "$REJECTED" ] || return 0
+  if was_rejected cursor && [ ! -x "$(readlink -f "${LINKS[0]}" 2>/dev/null)" ]; then
+    log "the rejected Cursor agent build is gone (${LINKS[0]} points at nothing); expiring its record"
+    accept cursor
+  fi
+}
+
+# Builds of one day do not order by their hash. Against a floor, the day is
+# what counts (at_least, which the lib's floor checks use): another build of
+# the floor's day is not below it. Against the build asked for, only that build
+# or a later day's is at it (at_build): another build of its day is installed,
+# and replacing it is not a downgrade (Bugbot on #1080).
+at_least() {
+  [ -n "$1" ] || return 1
+  [ "$(printf '%s\n%s\n' "${1%%-*}" "${2%%-*}" | sort -V | head -n 1)" = "${2%%-*}" ]
+}
+at_build() {
+  [ -n "$1" ] || return 1
+  [ "$1" = "$2" ] && return 0
+  [ "${1%%-*}" != "${2%%-*}" ] && at_least "$1" "$2"
+}
+downgrade() { [ -n "$1" ] && [ -n "${spec_v:-}" ] && [ "${spec_v%%-*}" != "${1%%-*}" ] && ! at_least "$spec_v" "$1"; }
+
+inst_note=-
+tu_notes() { printf 'install=%s' "$inst_note"; }
+tu_notes_all() { printf '%s' "$inst_note"; }
+
+# ── the install: a versioned directory and two links ────────────────────────
+# relink TARGET: both links at TARGET, each replaced in one rename.
+relink() {
+  local l
+  mkdir -p "$HOME/.local/bin"
+  for l in "${LINKS[@]}"; do
+    ln -sfn "$1" "$l.tmp.$$" && mv -Tf "$l.tmp.$$" "$l" || { rm -f "$l.tmp.$$"; return 1; }
+  done
+}
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x64 ;;
+    arm64|aarch64) printf arm64 ;;
+    *) return 1 ;;
+  esac
+}
+# pinned_builds ARCH: the builds pinned for ARCH, oldest day first.
+pinned_builds() {
+  local src="$PINS"
+  [ -z "${TERMAG_CURSOR_PINS:-}" ] || src=$(cat "$TERMAG_CURSOR_PINS" 2>/dev/null)
+  printf '%s\n' "$src" | awk -v a="$1" '$2 == a && $3 ~ /^[0-9a-f]+$/ && length($3) == 64 { print $1 }' | sort -t- -k1,1V -k2,2 | uniq
+}
+# pin_of BUILD ARCH: that package's pinned sha256, or nothing.
+pin_of() {
+  local src="$PINS"
+  [ -z "${TERMAG_CURSOR_PINS:-}" ] || src=$(cat "$TERMAG_CURSOR_PINS" 2>/dev/null)
+  printf '%s\n' "$src" | awk -v b="$1" -v a="$2" '$1 == b && $2 == a && $3 ~ /^[0-9a-f]+$/ && length($3) == 64 { print $3; exit }'
+}
+# shellcheck disable=SC2154  # spec_v and want: termag-tool-update-lib's tu_spec sets them
+# put_back: the build moved aside back into $dir, the tree there moved to
+# $hid.rejected-<pid>; all or nothing: when the aside build cannot go back,
+# the moved tree returns, so $dir, which the links name, is never left empty
+# (Bugbot on #1080).
+put_back() {
+  mv -f "$dir" "$hid.rejected-$$" || return 1
+  mv -f "$aside" "$dir" && return 0
+  mv -f "$hid.rejected-$$" "$dir" || log "could not move $hid.rejected-$$ back to $dir"
+  return 1
+}
+# in_use DIR: a live process runs from DIR (its executable is in it).
+in_use() {
+  local e
+  for e in /proc/[0-9]*/exe; do
+    case "$(readlink "$e" 2>/dev/null)" in "$1"/*) return 0 ;; esac
+  done
+  return 1
+}
+# prune_builds KEEP...: once a build is verified, the build directories and
+# the copies set aside that are not KEPT (the new build and the one that ran),
+# that no link names and no live process runs from, go, with any download a
+# stopped run left (a review on #1080). Each kept build carries its own node,
+# so these pile up otherwise.
+prune_builds() {
+  local d k l
+  for d in "$VERSIONS"/* "$VERSIONS"/.[!.]*; do
+    [ -e "$d" ] && [ ! -L "$d" ] || continue
+    case "${d##*/}" in
+      .tmp-termag-*.tgz) [ -f "$d" ] && rm -f "$d"; continue ;;
+      [0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*|.[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*|.tmp-termag-*) [ -d "$d" ] || continue ;;
+      *) continue ;;
+    esac
+    for k in "$@"; do [ "$d" = "$k" ] && continue 2; done
+    for l in "${LINKS[@]}"; do
+      case "$(readlink -f "$l" 2>/dev/null)" in "$d"/*) continue 2 ;; esac
+    done
+    if in_use "$d"; then log "kept $d: a process still runs from it"; continue; fi
+    rm -rf "$d" && log "removed $d (no link names it, nothing runs from it)"
+  done
+}
+tu_cursor_install() {
+  local bin before prev dir hid tmp got after a l rejected aside='' rc=0 restored=0 pin sum
+  bin=$(resolve)
+  before=; [ -n "$bin" ] && before=$(ver "$bin")
+  prev=$(readlink -f "${LINKS[0]}" 2>/dev/null)
+  if at_build "$before" "$want" && ! was_rejected cursor; then
+    inst_note=$before
+    # On a later build than any pin (Cursor's own updater moved it): left
+    # alone, and said so (a review on #1080).
+    if [ "$before" != "$spec_v" ] && a=$(arch) && [ -z "$(pin_of "$before" "$a")" ]; then
+      inst_note="$before(ahead-of-pins)"
+      log "cursor-agent is build $before, ahead of every pinned build (newest $spec_v); left alone"
+    fi
+    return 0
+  fi
+  if downgrade "$before" && ! was_rejected cursor; then
+    inst_note="$before(no-downgrade)"
+    log "cursor-agent is $before; $spec_v would move it down; skipped"
+    return 0
+  fi
+  a=$(arch) || { inst_note="${before:-none}->FAILED"; log "no Cursor agent build for $(uname -m)"; return 0; }
+  pin=$(pin_of "$spec_v" "$a")
+  if [ -z "$pin" ]; then
+    inst_note="${before:-none}->FAILED:unpinned:$spec_v"
+    log "build $spec_v ($a) has no pinned digest in termag-cursor-update; not downloaded, nothing changed"
+    return 0
+  fi
+  dir=$VERSIONS/$spec_v
+  # Copies set aside are dot names: Cursor's own updater skips those when it
+  # keeps its two newest builds, and this run prunes them once verified.
+  hid=$VERSIONS/.$spec_v
+  tmp=$VERSIONS/.tmp-termag-$spec_v-$$
+  # shellcheck disable=SC2034  # read by termag-tool-update-lib's on_signal
+  TU_TMP=("$tmp" "$tmp.tgz")
+  mkdir -p "$tmp" || { inst_note="${before:-none}->FAILED"; log "cannot create $tmp"; return 0; }
+  log "cursor-agent is ${before:-not installed}; downloading build $spec_v ($a, at most $(left "$INSTALL_TIMEOUT")s)"
+  run_capped "$(left "$INSTALL_TIMEOUT")" curl -fsSL -o "$tmp.tgz" "$DOWNLOAD_URL/$spec_v/linux/$a/agent-cli-package.tar.gz" </dev/null || rc=$?
+  # The pinned digest, before the package is unpacked or anything in it runs.
+  if [ "$rc" = 0 ]; then
+    sum=$(sha256sum "$tmp.tgz" 2>/dev/null | cut -c1-64)
+    if [ "$sum" != "$pin" ]; then
+      rm -rf "$tmp" "$tmp.tgz"
+      inst_note="${before:-none}->FAILED:digest:$spec_v"
+      log "build $spec_v's package is not the pinned one (sha256 ${sum:-unreadable}, pinned $pin); not unpacked, nothing changed"
+      return 0
+    fi
+  fi
+  [ "$rc" = 0 ] && { tar --strip-components=1 -xzf "$tmp.tgz" -C "$tmp" 2>/dev/null || rc=$?; }
+  rm -f "$tmp.tgz"
+  if [ "$rc" != 0 ]; then
+    rm -rf "$tmp"
+    inst_note="${before:-none}->FAILED"
+    log "the download of build $spec_v did not complete"
+    return 0
+  fi
+  # The package's own cursor-agent, before anything points at it.
+  got=$(ver "$tmp/cursor-agent")
+  if [ "$got" != "$spec_v" ]; then
+    rm -rf "$tmp"
+    inst_note="${before:-none}->pin-mismatch(not-installed)"
+    log "build $spec_v's package says ${got:-nothing (does not run)}; not installed, nothing changed"
+    return 0
+  fi
+  # A directory of that build already there is moved aside, never deleted: a
+  # session may still run from it even when the links point elsewhere
+  # (Cursor's own updater relinks on its own; Bugbot on #1080). The one the
+  # links point at (an install this script rejected, or one Cursor's updater
+  # linked) is also kept to put back if the new one fails. Either is kept
+  # after, as older builds are.
+  if [ -e "$dir" ]; then
+    if [ "$prev" = "$(readlink -f "$dir/cursor-agent" 2>/dev/null)" ]; then
+      # Moved aside, or nothing changes: a failed move would leave the new
+      # tree to land inside the live one (Bugbot on #1080).
+      aside=$hid.replaced-$$
+      mv -f "$dir" "$aside" || { rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move the linked build $spec_v aside; nothing changed"; return 0; }
+    else
+      mv -f "$dir" "$hid.unlinked-$$" || { rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move the old $spec_v directory aside; nothing changed"; return 0; }
+      log "kept the $spec_v directory that nothing linked as $hid.unlinked-$$ (a session may still run from it)"
+    fi
+  fi
+  if ! mv -f "$tmp" "$dir"; then
+    rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move build $spec_v into $VERSIONS"
+    # The linked build goes back where the links point (Bugbot on #1080).
+    [ -z "$aside" ] || mv -f "$aside" "$dir" || log "cannot move $aside back to $dir"
+    return 0
+  fi
+  if ! relink "$dir/cursor-agent"; then
+    # Not a mismatch: nothing new was checked live. The links go back to the
+    # build that ran (moved aside: back into its own directory, where they
+    # point), and none is removed (Bugbot on #1080).
+    inst_note="${before:-none}->FAILED"
+    log "could not point the links at build $spec_v; the links stay on the build that ran"
+    if [ -n "$aside" ]; then
+      put_back || log "could not move $aside back to $dir; $dir is the new build, verified in its package"
+    elif [ -n "$prev" ]; then
+      relink "$prev" || log "could not point the links back at $prev"
+    fi
+    return 0
+  fi
+  after=$(ver "$(resolve)")
+  if [ "$after" = "$spec_v" ]; then
+    inst_note="${before:-none}->$after"
+    log "cursor-agent is now build $spec_v, verified (its package and the cursor-agent a session starts)"
+    accept cursor
+    # shellcheck disable=SC2034  # read by termag-tool-update-lib's on_signal
+    TU_TMP=()
+    prune_builds "$dir" "$(dirname "$prev" 2>/dev/null)"
+    return 0
+  fi
+  inst_note="${before:-none}->pin-mismatch"
+  reject cursor "asked for $spec_v; $(resolve) --version says ${after:-nothing (does not run)}"
+  # Put the build that ran back, verified; else quarantine the new one. A
+  # build moved aside goes back to its own directory first, the new one aside.
+  rejected=$dir
+  if [ -n "$before" ] && [ -n "$aside" ] && [ "$(ver "$aside/cursor-agent")" = "$before" ] \
+    && put_back && rejected=$hid.rejected-$$ && relink "$dir/cursor-agent" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "build $before is back in place and linked, verified; the rejected download is $rejected"
+    quarantine "$rejected/cursor-agent" >/dev/null 2>&1 || true
+  elif [ -n "$before" ] && [ -z "$aside" ] && [ -n "$prev" ] && [ "$(ver "$prev")" = "$before" ] && relink "$prev" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "the links are back at build $before, verified"
+  fi
+  # Last: the build that ran, where it was moved aside, when it could not go
+  # back into its directory (Bugbot on #1080).
+  if [ "$restored" = 0 ] && [ -n "$before" ] && [ -n "$aside" ] && [ -d "$aside" ] && [ "$(ver "$aside/cursor-agent")" = "$before" ] \
+    && relink "$aside/cursor-agent" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "the links name build $before where it was moved aside ($aside), verified"
+  fi
+  if [ "$restored" = 0 ]; then
+    # Only the rejected build goes, and only the links into it: a build put
+    # back, or one the links never left, stays (Bugbot on #1080).
+    for l in "${LINKS[@]}"; do
+      case "$(readlink -f "$l" 2>/dev/null)" in "$rejected"/*) rm -f "$l" ;; esac
+    done
+    if quarantine "$rejected/cursor-agent"; then inst_note="$inst_note,quarantined"; else log "could not quarantine $rejected/cursor-agent"; fi
+  fi
+}
+
+# ── sessions, after a run's install ─────────────────────────────────────────
+# A Cursor agent session is its build's own node (versions/<build>/node; the
+# cursor-agent script execs it under its own name), and it is old when that
+# node is not the current build's.
+is_cursor() {
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in
+    */cursor-agent/versions/*/node|*/cursor-agent/versions/*/node\ \(deleted\)) return 0 ;;
+  esac
+  return 1
+}
+under_cursor() {
+  local p; p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do is_cursor "$p" && return 0; p=$(ppid_of "$p"); done
+  return 1
+}
+argv_of() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
+# The user's arguments: everything after the package's index.js.
+user_args() { argv_of "$1" | sed -n '/\/index\.js$/,$p' | tail -n +2; }
+# Whether it is the pane's own: the pane shell's child (the script execs node).
+pane_owned() { [ -n "$2" ] && [ "$(ppid_of "$1")" = "$2" ]; }
+# The workspace: --workspace's path when given, else the process's cwd.
+workspace_of() {
+  local w; w=$(user_args "$1" | sed -n '/^--workspace$/{n;p;q}')
+  case "$w" in /*) printf '%s' "$w" ;; *) readlink "/proc/$1/cwd" 2>/dev/null ;; esac
+}
+# When a process started, in seconds since the epoch: its start in clock ticks
+# after boot (/proc/<pid>/stat, field 22) plus the boot time.
+started_at() {
+  local ticks btime hz
+  ticks=$(sed -E 's/^.*\) [A-Za-z] //' "/proc/$1/stat" 2>/dev/null | awk '{print $19}')
+  btime=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  [ -n "$ticks" ] && [ -n "$btime" ] && printf '%s' $(( btime + ticks / hz ))
+}
+# Where the CLI keeps a process's chats, as it names them: <config>/chats/<md5
+# of its workspace>/<id>/store.db, its config CURSOR_CONFIG_DIR, else
+# $XDG_CONFIG_HOME/cursor, else ~/.cursor (the CLI's own order).
+chats_of() {
+  local cfg x ws
+  cfg=$(env_of "$1" CURSOR_CONFIG_DIR)
+  if [ -z "$cfg" ]; then x=$(env_of "$1" XDG_CONFIG_HOME); cfg=${x:+$x/cursor}; fi
+  cfg=${cfg:-$HOME/.cursor}
+  ws=$(workspace_of "$1"); [ -n "$ws" ] || return 0
+  printf '%s/chats/%s' "$cfg" "$(printf '%s' "$ws" | md5sum | cut -c1-32)"
+}
+# The chat a process names itself: --resume <id> (as the last update left
+# it), or --new-session-id <id> (a new chat under that id), whatever the case
+# of its id (Bugbot on #1080).
+named_chat() {
+  local rid
+  rid=$(user_args "$1" | sed -n -E '/^--(resume|new-session-id)$/{n;p;q}; s/^--(resume|new-session-id)=//p' | head -n 1)
+  [[ "$rid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && printf '%s' "$rid"
+}
+# The pane's chat: the one it names, whether or not it has written its store
+# since; else its workspace's newest written since the process started (one
+# from an earlier session in the same workspace is not this one's), a guess
+# that tu_unshare drops when another process shares the workspace.
+chat_of() {
+  local pid=$1 dir f t since newest='' newest_t=0 rid
+  dir=$(chats_of "$pid"); [ -n "$dir" ] || return 0
+  rid=$(named_chat "$pid")
+  if [ -n "$rid" ]; then
+    [ -f "$dir/$rid/store.db" ] && printf '%s' "$dir/$rid/store.db"
+    return 0
+  fi
+  since=$(started_at "$pid"); [ -n "$since" ] || return 0
+  for f in "$dir"/*/store.db; do
+    [ -f "$f" ] || continue
+    t=$(stat -c %Y "$f" 2>/dev/null) || continue
+    [ "$t" -ge "$since" ] && [ "$t" -ge "$newest_t" ] && { newest=$f newest_t=$t; }
+  done
+  printf '%s' "$newest"
+}
+
+p_chat=() p_named=()
+find_sessions() {
+  local c cur='' pid pane sock name sub chat id named
+  c=$(resolve); [ -n "$c" ] && cur=$(dirname "$(readlink -f "$c" 2>/dev/null)")/node
+  for pid in $(pgrep -u "$(id -u)"); do
+    is_cursor "$pid" || continue
+    under_cursor "$pid" && continue
+    # Every Cursor's workspace, old or current, for tu_unshare.
+    peers+=("$(chats_of "$pid")")
+    [ -n "$cur" ] && [ "/proc/$pid/exe" -ef "$cur" ] && continue
+    # A -p turn, or a subcommand that is not the TUI, is other.
+    if user_args "$pid" | grep -qxE -- '-p|--print'; then other=$((other + 1)); continue; fi
+    sub=$(user_args "$pid" | grep -v '^-' | head -n 1)
+    case "$sub" in
+      ls|status|whoami|login|logout|mcp|update|upgrade|models|about|create-chat|generate-rule|rule|install-shell-integration|uninstall-shell-integration)
+        other=$((other + 1)); continue ;;
+    esac
+    pane=$(env_of "$pid" TMUX_PANE)
+    sock=; [ -n "$pane" ] && sock=$(socket_of "$pid")
+    name=; [ -n "$sock" ] && name=$(tmux -S "$sock" display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    if [ -z "$name" ]; then other=$((other + 1)); continue; fi
+    pane_owned "$pid" "$(tmux -S "$sock" display -p -t "$pane" '#{pane_pid}' 2>/dev/null)" || { other=$((other + 1)); continue; }
+    chat=$(chat_of "$pid")
+    # The id the pane's own argv names wins (--resume or --new-session-id, the
+    # UUID shape resumeById takes, either case, kept as the CLI was given it):
+    # the CLI resumes from it alone, with or without a store where this run
+    # looks (Bugbot on #1080). Else the id of the store chat_of found.
+    named=$(named_chat "$pid")
+    if [ -n "$named" ]; then
+      id=$named
+    else
+      id=; [ -n "$chat" ] && id=$(basename "$(dirname "$chat")")
+      [[ "$id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { id=; chat=; }
+    fi
+    p_pid+=("$pid"); p_sock+=("$sock"); p_pane+=("$pane"); p_sess+=("$name")
+    p_chat+=("$chat"); p_id+=("$id"); p_named+=("${named:+1}")
+    if [ -n "$named" ]; then p_guess+=(''); else p_guess+=("$(chats_of "$pid")"); fi
+  done
+  tu_unshare
+}
+
+# termag-tool-update-lib's stop_sessions asks these of pane I. In a turn: its
+# chat store was written in the last 5 s; or the pane's last lines show the
+# CLI's spinner (braille, beside "Thinking" and every running tool row); or
+# they show one of the words termag's own status poller reads for Cursor
+# (backend/src/providers/registry.ts) and the screen is still changing. A
+# finished tool row reads in the past tense ("Globbed"), but one that failed or
+# was interrupted keeps its word on a screen that no longer changes: that is
+# not a turn (Devin on #1080).
+cursor_screen() {
+  # The last 25 lines with something on them: a tall pane's screen ends in blank ones.
+  tmux -S "${p_sock[$1]}" capture-pane -p -t "${p_pane[$1]}" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 25
+}
+tu_status() {
+  local r=${p_chat[$1]} text
+  if [ -n "$r" ] && [ -f "$r" ] && [ $(( $(date +%s) - $(stat -c %Y "$r" 2>/dev/null || echo 0) )) -lt 5 ]; then printf busy; return; fi
+  text=$(cursor_screen "$1")
+  if printf '%s' "$text" | LC_ALL=C.UTF-8 grep -qP '[\x{2800}-\x{28FF}]' 2>/dev/null; then printf busy; return; fi
+  if printf '%s\n' "$text" | grep -qiE '^\s*(Thinking|Composing|Reading|Globbing|Writing|Editing|Searching|Running|Executing|Applying|Planning|Grepping|Using tool|Running command)\b'; then
+    sleep 1
+    [ "$(cursor_screen "$1")" != "$text" ] && { printf busy; return; }
+  fi
+  printf idle
+}
+# A conversation: a chat the pane names in its argv, or its chat's store.
+tu_had() { [ -n "$2" ] && { [ "${p_named[$1]:-}" = 1 ] || { [ -n "${p_chat[$1]}" ] && [ -f "${p_chat[$1]}" ]; }; }; }
+tu_resume_line() { printf 'cursor-agent --resume %s' "$1"; }
+
+trap on_signal TERM INT HUP
+
+tu_lock
+expire_stale
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+tu_cursor_install
+
+finish

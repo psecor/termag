@@ -1,0 +1,23 @@
+# The AWS CLI v2's update run %i: deploy/termag-aws-update as root, from its root-owned copy.
+# A system unit, unlike the other tools' user units: the AWS CLI is root's install.
+# Started by /usr/local/libexec/termag/termag-aws-update-start, which the agent
+# runs through sudo for the orchestrator's tool-update RPC; installed by
+# deploy/termag-aws-update-setup.
+[Unit]
+Description=termag: update the AWS CLI v2, tool-update run %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# TERMAG_AWS_AGENT_UID: the agent user, whose agent config holds the
+# orchestrator URL and token (read as that user).
+EnvironmentFile=/etc/termag/aws-update.env
+ExecStart=/usr/local/libexec/termag/termag-aws-update --run %i
+# 1 (below the floor, or no aws) and 3 (an install rejected) are outcomes the
+# recipe has already reported, not unit failures, as for the other tools' units.
+SuccessExitStatus=0 1 3
+TimeoutStartSec=1200
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

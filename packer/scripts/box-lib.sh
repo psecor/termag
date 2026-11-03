@@ -4,15 +4,20 @@
 # /var/lib/termag-bake/box-lib.sh, which outlives the /tmp wipes setup.sh and
 # refresh-box.sh do at their end. Source it from there.
 
-# Wait for termag's boot-time user unit (termag-reconcile)
-# to finish. $1 = log prefix for the refusal message.
+# Wait for termag's boot-time user units (termag-reconcile,
+# termag-claude-update-boot) to finish. $1 = log prefix for the refusal message.
+# termag-claude-update-boot is skipped in a bake (it needs an agent config,
+# which only a launched box has), so it is here only in case that ever
+# changes: an npm install into ~/.nvm must not be cut by the bake's sweep of
+# termag's processes, or still be writing at its home write baseline. Its own
+# cap is 5 min (TimeoutStartSec), inside this wait's 10.
 wait_for_boot_units() {
     local prefix=${1:-[packer]} uid busy=""
     uid=$(id -u termag)
     for _ in $(seq 1 120); do
         busy=$(sudo -u termag XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user list-units \
                     --type=service --state=running,activating --no-legend --plain 2>/dev/null \
-                | awk '{print $1}' | grep -E '^termag-reconcile\.service$' || true)
+                | awk '{print $1}' | grep -E '^termag-(reconcile|claude-update-boot)\.service$' || true)
         [ -z "$busy" ] && return 0
         sleep 5
     done
@@ -48,6 +53,32 @@ install_deploy_artifacts() {
 # so a box baked before it converges too.
 install_guest_browser() {
     sudo bash /home/termag/src/termag/deploy/termag-guest-browser-setup --agent-user termag
+}
+
+# The GitHub CLI's root updater: its recipe, root's copy of the lib, the start helper, the system
+# unit and the one sudoers line that lets the agent user start it. gh is
+# installed above as root, from GitHub's apt repository. Runs from the
+# checkout cloned above, as termag (the sudoers line names its uid, which the
+# rename at launch keeps); termag-reconcile runs the same script on every
+# boot, so a box baked before it converges too.
+install_gh_updater() {
+    sudo bash /home/termag/src/termag/deploy/termag-gh-update-setup --agent-user termag
+}
+
+# The AWS CLI v2's root updater: the GitHub CLI's seam again, with AWS's PGP key as the
+# keyring every zip is verified with. The AWS CLI is installed above as root,
+# with AWS's installer; termag-reconcile runs the same script on every boot.
+install_aws_updater() {
+    sudo bash /home/termag/src/termag/deploy/termag-aws-update-setup --agent-user termag
+}
+
+# Terminfo for terminals Ubuntu 24.04's ncurses lacks (Ghostty's
+# xterm-ghostty), system-wide in /etc/terminfo, so plain ssh and editor
+# Remote-SSH from those terminals reach a tmux that will attach. From the
+# checkout cloned above, like install_guest_browser; termag-reconcile runs the
+# same script on every boot, so a box baked before it converges too.
+install_terminfo() {
+    sudo bash /home/termag/src/termag/deploy/termag-terminfo-setup
 }
 
 # Mark the box for login shells, so tooling can tell it runs on a termag box

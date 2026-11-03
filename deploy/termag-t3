@@ -1,0 +1,42 @@
+#!/bin/sh
+# termag-t3 -- the t3 server command on a termag box: the pinned server under
+# <root>/current (deploy/t3-server.pin), with the box's outbound policy.
+#
+# deploy/termag-t3-install copies this to <root>/bin/t3 (default
+# /opt/termag-t3/bin/t3) and points the agent at it through its unit drop-in
+# (TERMAG_T3_COMMAND), so agent/t3-bridge.js runs `<root>/bin/t3 serve ...`
+# in the termag-t3 tmux session and `<root>/bin/t3 auth pairing create`.
+#
+# The policy lives here, in termag, rather than in the agent's environment:
+# the server starts in a tmux session, whose environment is the tmux server's
+# (however old that is), not the agent's; this file is on the command line
+# itself. And it ships with termag (termag-reconcile reinstalls it), so a new
+# default needs no new server build.
+#
+# Every default applies only while the variable is unset, so a deliberate
+# setting (an owner's, a test's) wins.
+set -eu
+
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s\n' "$0")
+root=$(CDPATH='' cd -P -- "$(dirname -- "$self")/.." && pwd)
+
+# Product analytics to T3's PostHog (ingest.t3.codes). The fork already
+# defaults it off and the agent passes it too; it also gates the T3 Connect
+# relay's trace export.
+: "${T3CODE_TELEMETRY_ENABLED:=false}"
+# The server's own OpenTelemetry export, hard off. Without it any
+# OTEL_EXPORTER_OTLP_ENDPOINT that reaches the termag-t3 tmux session (an
+# owner's shell, a tmux server started from one) would make the t3 server
+# export its traces and logs there. termag's Claude telemetry is configured in
+# ~/.claude/settings.json, not the environment, and the T3CODE_ name (not
+# OTEL_SDK_DISABLED) leaves the Claude that t3 runs, with this environment,
+# exporting as before.
+: "${T3CODE_OTEL_SDK_DISABLED:=true}"
+export T3CODE_TELEMETRY_ENABLED T3CODE_OTEL_SDK_DISABLED
+
+# The model manifest (raw.githubusercontent.com/pingdotgg/t3code) and the npm
+# "latest" checks for Claude Code and Codex have no variable; they are off by
+# the server setting enableProviderUpdateChecks=false, which termag-t3-install
+# writes into ~/.t3/userdata/settings.json when it is unset.
+
+exec "$root/current/bin/t3" "$@"

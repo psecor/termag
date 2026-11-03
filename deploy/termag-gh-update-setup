@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# termag-gh-update-setup — put the GitHub CLI's root updater in place.
+# Run as root;
+# idempotent.
+#
+# gh is root's package (GitHub's apt repository, packer/scripts/setup.sh), so
+# its update cannot run in the agent user's systemd like the other tools'.
+# This installs, all root's:
+#
+#   1. /usr/local/libexec/termag/: the recipe (termag-gh-update, 0755), its
+#      copy of termag-tool-update-lib (0644: root sources this one, never the
+#      user's ~/.local/bin copy) and the start helper
+#      (termag-gh-update-start, 0755)
+#   2. the system unit termag-gh-update@.service, and
+#      /etc/termag/gh-update.env naming the agent user by uid
+#   3. /etc/sudoers.d/termag-gh-update: the agent user may run the start
+#      helper, and only it, as root (checked with visudo before it goes in)
+#   4. /var/lib/termag/gh-update (0700): the lock and the rejection record
+#
+# Content-compared like termag-reconcile: a current box writes nothing.
+# Called by packer/scripts/setup.sh at bake, and by termag-reconcile through
+# `sudo -n` on every boot and box update, so a box that predates it converges
+# without a bake.
+#
+# Usage:
+#   termag-gh-update-setup [--agent-user NAME]           apply, reporting only
+#                                                        what changed
+#   termag-gh-update-setup [--agent-user NAME] --check   report what is missing
+#                       or differs, change nothing (exit 1 if anything)
+#
+# --agent-user is the box user the agent runs as (default termag, the name at
+# bake; termag-reconcile passes its own name).
+#
+# Env (tests): TERMAG_GH_SETUP_ROOT prefixes every path this writes or reads;
+# TERMAG_GH_SETUP_DEPLOY is where the sources are (default: this script's
+# directory).
+set -u
+
+AGENT_USER=termag
+DEPLOY="${TERMAG_GH_SETUP_DEPLOY:-$(cd "$(dirname "$0")" && pwd)}"
+ROOT="${TERMAG_GH_SETUP_ROOT:-}"
+LIBEXEC=/usr/local/libexec/termag
+
+MODE=apply
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --agent-user) AGENT_USER="${2:-}"; shift ;;
+    -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+AGENT_UID=$(id -u "$AGENT_USER" 2>/dev/null) || AGENT_UID=
+case "$AGENT_UID" in
+  ''|0) printf 'termag-gh-update-setup: no usable agent user %s\n' "$AGENT_USER" >&2; exit 2 ;;
+esac
+
+if [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
+  echo 'termag-gh-update-setup: run as root' >&2
+  exit 1
+fi
+
+changed=0
+failed=0
+units_changed=0
+
+say() { printf '%s\n' "$*"; }
+drift() { changed=$((changed + 1)); [ "$MODE" = check ] && say "DRIFT: $*"; return 0; }
+broke() { failed=$((failed + 1)); printf 'termag-gh-update-setup: %s\n' "$*" >&2; }
+
+# Owner flags only as root: a test run writes as its own user.
+install_owned() {
+  if [ "$(id -u)" = 0 ]; then install -o root -g root "$@"; else install "$@"; fi
+}
+
+# put <source> <installed path> <mode> <kind: unit|sudoers|file>
+# A source is a file in deploy/, or an absolute path (a rendered one).
+put() {
+  local src="$1" dest="$ROOT$2" mode=$3 kind=$4 name
+  case "$src" in /*) name=$(basename "$src") ;; *) name=$src; src="$DEPLOY/$src" ;; esac
+  if [ ! -f "$src" ]; then broke "missing source $src"; return; fi
+  if cmp -s "$src" "$dest" 2>/dev/null && [ "$(stat -c %a "$dest")" = "$mode" ]; then
+    return
+  fi
+  if [ -e "$dest" ]; then drift "$2 differs from $name"; else drift "$2 is missing"; fi
+  [ "$MODE" = apply ] || return
+  if [ "$kind" = sudoers ] && ! visudo -cf "$src" >/dev/null; then
+    broke "$name does not parse; not installed"
+    return
+  fi
+  install_owned -d -m 0755 "$(dirname "$dest")" 2>/dev/null || mkdir -p "$(dirname "$dest")" || { broke "could not create $(dirname "$dest")"; return; }
+  # Into place in one rename: sudo and systemd never read half a file.
+  if install_owned -m "$mode" "$src" "$dest.termag-new" && mv -f "$dest.termag-new" "$dest"; then
+    say "installed: $2"
+    [ "$kind" = unit ] && units_changed=1
+  else
+    rm -f "$dest.termag-new"
+    broke "could not install $2"
+  fi
+}
+
+RENDERED=$(mktemp -d)
+trap 'rm -rf "$RENDERED"' EXIT
+sed "s/@AGENT_UID@/$AGENT_UID/" "$DEPLOY/termag-gh-update.sudoers" >"$RENDERED/termag-gh-update.sudoers"
+printf '# The agent user, by uid (deploy/termag-gh-update-setup).\nTERMAG_GH_AGENT_UID=%s\n' "$AGENT_UID" >"$RENDERED/gh-update.env"
+
+# ── 1, 2 and 3. the files ─────────────────────────────────────────────────────
+# The lib and the recipe before the helper and the rule that start them, so a
+# setup that stops halfway never leaves a startable unit on missing code.
+put termag-tool-update-lib "$LIBEXEC/termag-tool-update-lib" 644 file
+put termag-gh-update "$LIBEXEC/termag-gh-update" 755 file
+put "$RENDERED/gh-update.env" /etc/termag/gh-update.env 644 file
+put termag-gh-update@.service /etc/systemd/system/termag-gh-update@.service 644 unit
+put termag-gh-update-start "$LIBEXEC/termag-gh-update-start" 755 file
+put "$RENDERED/termag-gh-update.sudoers" /etc/sudoers.d/termag-gh-update 440 sudoers
+
+# ── 4. the state directory ────────────────────────────────────────────────────
+state="$ROOT/var/lib/termag/gh-update"
+if [ ! -d "$state" ] || [ "$(stat -c %a "$state")" != 700 ]; then
+  drift "/var/lib/termag/gh-update is missing or not 0700"
+  if [ "$MODE" = apply ]; then
+    { install_owned -d -m 0700 "$state" && chmod 0700 "$state"; } && say "installed: /var/lib/termag/gh-update" || broke "could not create /var/lib/termag/gh-update"
+  fi
+fi
+
+if [ "$MODE" = apply ] && [ "$units_changed" = 1 ] && [ -z "$ROOT" ]; then
+  systemctl daemon-reload || broke 'daemon-reload failed'
+fi
+
+[ "$MODE" = check ] && [ "$changed" -gt 0 ] && exit 1
+[ "$failed" -gt 0 ] && exit 1
+exit 0

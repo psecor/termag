@@ -1,0 +1,23 @@
+# The GitHub CLI's update run %i: deploy/termag-gh-update as root, from its root-owned copy.
+# A system unit, unlike the other tools' user units: gh is root's package.
+# Started by /usr/local/libexec/termag/termag-gh-update-start, which the agent
+# runs through sudo for the orchestrator's tool-update RPC; installed by
+# deploy/termag-gh-update-setup.
+[Unit]
+Description=termag: update the GitHub CLI (gh), tool-update run %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# TERMAG_GH_AGENT_UID: the agent user, whose agent config holds the
+# orchestrator URL and token (read as that user).
+EnvironmentFile=/etc/termag/gh-update.env
+ExecStart=/usr/local/libexec/termag/termag-gh-update --run %i
+# 1 (below the floor, or no gh) and 3 (an install rejected) are outcomes the
+# recipe has already reported, not unit failures, as for the other tools' units.
+SuccessExitStatus=0 1 3
+TimeoutStartSec=1200
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

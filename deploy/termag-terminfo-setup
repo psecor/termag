@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# termag-terminfo-setup — install the terminfo entries a box's Ubuntu lacks
+# into /etc/terminfo, system-wide. Run as root; idempotent.
+#
+# A terminal's TERM has to name an entry the box has, or tmux refuses to attach
+# ("missing or unsuitable terminal: xterm-ghostty") and full-screen programs
+# misdraw. Ubuntu 24.04's ncurses (6.4+20240113) predates Ghostty's entry, and
+# Ghostty's own ssh integration only wraps the ssh typed in a shell, so plain
+# ssh, VS Code Remote-SSH and anything else that spawns ssh arrive with an
+# unknown TERM. The termag CLI copies the local entry itself (cli/src/connect/
+# terminfo.ts); this covers every other client.
+#
+# What it installs, each from a vendored source compiled with `tic -x`:
+#
+#   terminfo/ghostty.terminfo   xterm-ghostty, ghostty (Ghostty 1.4.0; MIT,
+#                               terminfo/LICENSE.ghostty; terminfo/README.md
+#                               says how it was generated)
+#
+# A source whose sha256 is not the pinned one fails the run, so an edited or
+# truncated file never reaches a box. kitty (xterm-kitty) comes from Ubuntu's
+# kitty-terminfo package and WezTerm from ncurses-term, both installed by the
+# bake (packer/scripts/setup.sh), not here.
+#
+# /etc/terminfo, not /usr/share/terminfo: ncurses reads it first, and it is
+# the admin's, so no package owns or replaces these files. Content-compared
+# like termag-reconcile: a current box writes nothing. Called by
+# packer/scripts/box-lib.sh at bake (both bake modes), and by termag-reconcile
+# through `sudo -n` on every boot and box update, so a box that predates it
+# converges without a bake.
+#
+# Usage:
+#   termag-terminfo-setup           install what is missing or differs,
+#                                   reporting only what changed
+#   termag-terminfo-setup --check   report it, change nothing (exit 1 if any)
+#
+# Env (tests): TERMAG_TERMINFO_SETUP_ROOT prefixes /etc/terminfo;
+# TERMAG_TERMINFO_SETUP_DEPLOY is where the sources are (default: this
+# script's directory).
+set -u
+
+DEPLOY="${TERMAG_TERMINFO_SETUP_DEPLOY:-$(cd "$(dirname "$0")" && pwd)}"
+DEST="${TERMAG_TERMINFO_SETUP_ROOT:-}/etc/terminfo"
+
+MODE=apply
+case "${1:-}" in
+  --check) MODE=check ;;
+  '') ;;
+  -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+esac
+
+# source : sha256 : the entry's names, primary first
+SOURCES='terminfo/ghostty.terminfo:e5e9cc4e9fddf6aab3088b40ec42fafe8309ef1ae5d3764d0bbf2fc44105ccf0:xterm-ghostty ghostty'
+
+for tool in tic sha256sum; do
+  command -v "$tool" >/dev/null 2>&1 || { printf 'termag-terminfo-setup: %s not found\n' "$tool" >&2; exit 2; }
+done
+
+TMP=$(mktemp -d) || exit 2
+trap 'rm -rf "$TMP"' EXIT
+
+# An entry's compiled path under a terminfo directory: <first letter>/<name>.
+path_of() { printf '%s/%s/%s' "$1" "${2:0:1}" "$2"; }
+
+drift=0
+failed=0
+while IFS=: read -r src sum names; do
+  [ -n "$src" ] || continue
+  file="$DEPLOY/$src"
+  got=$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1)
+  if [ "$got" != "$sum" ]; then
+    printf 'termag-terminfo-setup: %s does not match its pinned sha256 (%s); not installing it\n' "$src" "${got:-missing}" >&2
+    failed=1
+    continue
+  fi
+  built="$TMP/${src##*/}"
+  if ! tic -x -o "$built" "$file" >/dev/null 2>"$TMP/tic.err"; then
+    printf 'termag-terminfo-setup: tic -x could not compile %s:\n%s\n' "$src" "$(cat "$TMP/tic.err")" >&2
+    failed=1
+    continue
+  fi
+  read -r -a list <<< "$names"
+  primary=${list[0]}
+  differs=()
+  # The primary name is the compiled file; tic links each alias to it.
+  cmp -s "$(path_of "$built" "$primary")" "$(path_of "$DEST" "$primary")" || differs+=("$primary")
+  for alias in "${list[@]:1}"; do
+    cmp -s "$(path_of "$built" "$alias")" "$(path_of "$DEST" "$alias")" || differs+=("$alias")
+  done
+  [ "${#differs[@]}" -gt 0 ] || continue
+  drift=1
+  if [ "$MODE" = check ]; then
+    printf 'DRIFT: terminfo %s is missing or differs in %s\n' "${differs[*]}" "$DEST"
+    continue
+  fi
+  mkdir -p "$DEST" && chmod 0755 "$DEST"
+  if tic -x -o "$DEST" "$file" >/dev/null 2>"$TMP/tic.err"; then
+    printf 'installed: terminfo %s in %s\n' "${differs[*]}" "$DEST"
+  else
+    printf 'termag-terminfo-setup: tic -x could not install %s in %s:\n%s\n' "$src" "$DEST" "$(cat "$TMP/tic.err")" >&2
+    failed=1
+  fi
+done <<EOF
+$SOURCES
+EOF
+
+[ "$failed" = 0 ] || exit 1
+[ "$MODE" = check ] && [ "$drift" = 1 ] && exit 1
+exit 0

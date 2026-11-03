@@ -38,8 +38,10 @@ chmod 755 "$STUB/gh"
 SYSGIT="$WORK/etc/gitconfig"; PROFILE_D="$WORK/etc/profile.d"; mkdir -p "$PROFILE_D"
 CONFIG="$WORK/agent.config.json"; BOX_TOKEN='tmag_boxsentinel_boxsentinel_0123' # gitleaks:allow
 printf '{"termag_url":"wss://b","token":"%s"}\n' "$BOX_TOKEN" > "$CONFIG"
+# The config locations the script takes from the environment are pinned to $H
+# too: GitHub's runners set XDG_CONFIG_HOME, and an owner may set the others.
 run() {
-  HOME="$H" PATH="$STUB:$PATH" TERMAG_CLAUDE_MANAGED_SETTINGS="$MANAGED" TERMAG_CREDENTIALS_SUDO='' \
+  HOME="$H" XDG_CONFIG_HOME="$H/.config" CODEX_HOME="$H/.codex" VIBE_HOME="$H/.vibe" PATH="$STUB:$PATH" TERMAG_CLAUDE_MANAGED_SETTINGS="$MANAGED" TERMAG_CREDENTIALS_SUDO='' \
     GIT_CONFIG_SYSTEM="$SYSGIT" TERMAG_PROFILE_D="$PROFILE_D" TERMAG_AGENT_CONFIG="$CONFIG" \
     "$SCRIPT" "$@"
 }
@@ -378,6 +380,75 @@ for pair in 'gon falon:main' 'webapp:' ':main' 'webapp:ws,x=y' "$(printf 'a%.0s'
 done
 got="$(TERMAG_PROJECT='gon falon' TERMAG_WORKSTREAM=main run telemetry-launch -)"
 [ "$got" = '{}' ] || fail 'telemetry-launch with nothing valid to add prints {}' '{}' "$got"
+# A launch that is not a pane (the chat runner's turns and one-shots) names
+# its kind, which replaces the settings' termag.session.kind, or is added
+# where they have none; a bad kind or one-shot name is dropped, never the launch.
+got="$(TERMAG_SESSION_KIND=chat TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,service.name=termag-claude-session,termag.box=$BOX,termag.session.kind=chat,termag.project=webapp,termag.workstream=main\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch adds a kind the settings do not name' "$want" "$got"
+cp "$CS" "$WORK/cs.kind"
+jq '.env.OTEL_RESOURCE_ATTRIBUTES |= sub("service.name="; "termag.session.kind=interactive,service.name=")' "$WORK/cs.kind" > "$WORK/cs" && cat "$WORK/cs" > "$CS"
+got="$(TERMAG_SESSION_KIND=oneshot TERMAG_ONESHOT=title TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=oneshot,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=main,termag.oneshot=title\"}}"
+[ "$got" = "$want" ] || fail "telemetry-launch replaces the settings' kind and names the one-shot" "$want" "$got"
+got="$(TERMAG_SESSION_KIND=chat run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=chat,service.name=termag-claude-session,termag.box=$BOX\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch with a kind and no project still sets the kind' "$want" "$got"
+for bad in 'chat,x=y' 'Chat' 'ch at' "$(printf 'a%.0s' $(seq 33))"; do
+  got="$(TERMAG_SESSION_KIND="$bad" TERMAG_ONESHOT=title TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+  want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=interactive,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=main\"}}"
+  [ "$got" = "$want" ] || fail "telemetry-launch drops a kind that is not lowercase letters and hyphens ($bad), and the one-shot with it" "$want" "$got"
+done
+got="$(TERMAG_SESSION_KIND=oneshot TERMAG_ONESHOT='title,x=y' run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=oneshot,service.name=termag-claude-session,termag.box=$BOX\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch drops a bad one-shot name, keeps the kind' "$want" "$got"
+# A pane's launch names its kind too (backend services/launchCommand.ts
+# PANE_KIND_ENV), the settings' own: the resource is the one it had before.
+got="$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+want="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+[ "$got" = "$want" ] || fail "telemetry-launch: a pane's explicit interactive leaves its resource as it was" "$want" "$got"
+# The explicit kind wins over one the caller's environment carries: a pane's
+# launch typed into a shell that inherited another kind is still a pane, and a
+# chat turn started by an agent whose environment says interactive is a chat.
+got="$(export TERMAG_SESSION_KIND=ask; TERMAG_SESSION_KIND=interactive run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=interactive,service.name=termag-claude-session,termag.box=$BOX\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch: an explicit interactive wins over an inherited kind' "$want" "$got"
+for kind in ask chat oneshot; do
+  got="$(export TERMAG_SESSION_KIND=interactive; TERMAG_SESSION_KIND=$kind run telemetry-launch -)"
+  want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=$kind,service.name=termag-claude-session,termag.box=$BOX\"}}"
+  [ "$got" = "$want" ] || fail "telemetry-launch: an explicit $kind wins over an inherited interactive" "$want" "$got"
+done
+# A launch that names no kind inside an agent's session (one agent starting
+# another by hand) takes the session's: the environment it runs in says so.
+got="$(export TERMAG_SESSION_KIND=chat; run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=chat,service.name=termag-claude-session,termag.box=$BOX\"}}"
+[ "$got" = "$want" ] || fail "telemetry-launch: a nested launch with no kind of its own takes its session's" "$want" "$got"
+# An ask's turn says who asked: the thread, the hop and the parent session's
+# box, project, workstream and Claude Code session. Each bad value is dropped
+# on its own (project and workstream as a pair), and nothing without a thread.
+ASKBASE="telemetry.project_id=p1,termag.session.kind=ask,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=ask-thr12345678"
+SID=0b7c2f7e-1c1d-4c55-9a43-2f0e6d1b8a10
+ask_launch() {
+  TERMAG_SESSION_KIND=ask TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=ask-thr12345678 TERMAG_ASK_THREAD="$1" TERMAG_ASK_HOP="$2" \
+    TERMAG_ASK_PARENT_BOX="$3" TERMAG_ASK_PARENT_PROJECT="$4" TERMAG_ASK_PARENT_WORKSTREAM="$5" TERMAG_ASK_PARENT_SESSION="$6" run telemetry-launch -
+}
+got="$(ask_launch thr12345678 3 devbox termag main "$SID")"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"$ASKBASE,termag.ask.thread=thr12345678,termag.ask.hop=3,termag.ask.parent.box=devbox,termag.ask.parent.project=termag,termag.ask.parent.workstream=main,termag.ask.parent.session=$SID\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch names the ask thread, its hop and who asked' "$want" "$got"
+got="$(ask_launch thr12345678 '' '' '' '' '')"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"$ASKBASE,termag.ask.thread=thr12345678\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch names the thread alone when nobody else is known' "$want" "$got"
+got="$(ask_launch thr12345678 '0' 'dev box' 'termag' '' 'a,b=c')"
+[ "$got" = "$want" ] || fail 'telemetry-launch drops a bad hop, box, half a parent pair and a bad session, keeps the thread' "$want" "$got"
+got="$(ask_launch thr12345678 1234567 devbox 'ter,mag' main "$SID")"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"$ASKBASE,termag.ask.thread=thr12345678,termag.ask.parent.box=devbox,termag.ask.parent.session=$SID\"}}"
+[ "$got" = "$want" ] || fail 'telemetry-launch drops a hop over six digits and a parent pair with a bad project, keeps the rest' "$want" "$got"
+for bad in '' 'THR12345678' 'thr1' 'thr12345678,x=y' "$(printf 'a%.0s' $(seq 41))"; do
+  got="$(ask_launch "$bad" 3 devbox termag main "$SID")"
+  want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"$ASKBASE\"}}"
+  [ "$got" = "$want" ] || fail "telemetry-launch adds no termag.ask.* without a well-formed thread ($bad)" "$want" "$got"
+done
+cat "$WORK/cs.kind" > "$CS"
 
 for bad in '{"env":{"OTEL_LOG_USER_PROMPTS":"1","OTEL_EXPORTER_OTLP_ENDPOINT":"https://otel.example.test"}}' \
            '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=x","OTEL_EXPORTER_OTLP_ENDPOINT":"https://otel.example.test"}}' \
@@ -641,6 +712,129 @@ else
   echo 'SKIP: flock is not installed; the MCP lock test needs it'
 fi
 
+# ── MCP servers for the other agent CLIs (mcp-broker-v2) ────────────────────
+run remove mcp </dev/null 2>/dev/null
+BRIDGE="$(dirname "$SCRIPT")/termag-mcp-bridge"
+CODEX="$H/.codex/config.toml"; CURSOR="$H/.cursor/mcp.json"; PI="$H/.pi/agent/mcp.json"
+DEVIN="$H/.config/devin/mcp_config.json"; AST="$H/.config/termag/mcp-agents.json"
+mkdir -p "$H/.codex" "$H/.cursor" "$H/.pi/agent"
+printf 'model = "o3"\n\n[mcp_servers.jira]\ncommand = "mine"\n' > "$CODEX"
+cp "$CODEX" "$WORK/codex.orig"
+printf '{"mcpServers":{"jira":{"command":"mine"}},"other":1}' > "$CURSOR"
+printf '{"mcpServers":{"metaterm":{"type":"stdio","command":"~/.local/bin/termag-metaterm-mcp"}}}' > "$PI"
+ALL_AGENTS='"agents":["auggie","codex","cursor","devin","gemini","pi","vibe"]'
+CONNS='"connectors":[{"id":"c1abc","name":"figma"},{"id":"c2abc","name":"jira"}]'
+MCPV2="{\"broker\":\"https://mcp-broker.example.test\",$CONNS,$ALL_AGENTS}"
+arun() { TERMAG_MCP_AGENTS_INSTALLED='codex cursor devin pi' run "$@"; }
+printf '%s' "$MCPV2" | arun apply mcp 2>"$WORK/mcp.err"; got=$?
+[ "$got" = 0 ] || fail 'apply mcp with agents succeeds' 0 "$got: $(cat "$WORK/mcp.err")"
+want="$(jq -cn --arg b "$BRIDGE" --arg c "$CONFIG" '{command:$b,args:["https://mcp-broker.example.test/c/c1abc",$c]}')"
+got="$(jq -c '.mcpServers.figma' "$CURSOR")"
+[ "$got" = "$want" ] || fail 'cursor gets a stdio entry that runs the bridge on the broker URL and the agent config' "$want" "$got"
+got="$(jq -c '[.mcpServers.jira, .other]' "$CURSOR")"
+[ "$got" = '[{"command":"mine"},1]' ] || fail "cursor keeps the owner's same-named server and other keys" '[{"command":"mine"},1]' "$got"
+grep -q "left your own MCP server jira in $CURSOR" "$WORK/mcp.err" || fail 'apply mcp says it left the owner'"'"'s cursor jira' 'a note' "$(cat "$WORK/mcp.err")"
+got="$(jq -c '.mcpServers | keys' "$PI")"
+[ "$got" = '["figma","jira","metaterm"]' ] || fail 'pi gets both connectors beside metaterm' '["figma","jira","metaterm"]' "$got"
+got="$(jq -c '.mcpServers.figma.transport' "$DEVIN")"
+[ "$got" = '"stdio"' ] || fail "devin's entries name their transport, and its config is created" '"stdio"' "$got"
+for f in "$H/.gemini/settings.json" "$H/.augment/settings.json" "$H/.vibe/config.toml"; do
+  [ ! -e "$f" ] || fail 'no config is created for an agent CLI that is not installed' 'absent' "$f"
+done
+got="$(grep -c 'mcp_servers.figma' "$CODEX")"
+[ "$got" = 1 ] || fail 'codex gets a figma table' 1 "$got"
+grep -q 'mcp_servers.jira' "$CODEX" && [ "$(grep -c '^\[mcp_servers.jira\]' "$CODEX")" = 1 ] \
+  || fail "codex keeps the owner's jira and adds no second one" 'one [mcp_servers.jira]' "$(cat "$CODEX")"
+if python3 -c 'import tomllib' >/dev/null 2>&1; then
+  got="$(python3 -I -c 'import sys, tomllib, json; d = tomllib.load(open(sys.argv[1], "rb")); print(json.dumps([d["model"], d["mcp_servers"]["figma"]["args"][0], d["mcp_servers"]["jira"]["command"]]))' "$CODEX")"
+  [ "$got" = '["o3", "https://mcp-broker.example.test/c/c1abc", "mine"]' ] || fail "codex's config still parses, with ours and theirs" 'o3, figma args, jira mine' "$got"
+fi
+grep -qF "$BOX_TOKEN" "$CODEX" "$CURSOR" "$PI" "$DEVIN" "$AST" && fail 'no agent config holds the token' 'no token' 'token present'
+got="$(jq -c 'with_entries(.value |= keys)' "$AST")"
+[ "$got" = '{"codex":["figma"],"cursor":["figma"],"devin":["figma","jira"],"pi":["figma","jira"]}' ] \
+  || fail 'the agents state records exactly what was written' 'codex/cursor figma, devin/pi both' "$got"
+got="$(stat -c %a "$DEVIN")"
+[ "$got" = 600 ] || fail "a config termag creates is the owner's only" 600 "$got"
+
+for f in "$CODEX" "$CURSOR" "$PI" "$DEVIN"; do cp "$f" "$WORK/$(basename "$(dirname "$f")").before"; done
+printf '%s' "$MCPV2" | arun apply mcp 2>/dev/null
+for f in "$CODEX" "$CURSOR" "$PI" "$DEVIN"; do
+  cmp -s "$f" "$WORK/$(basename "$(dirname "$f")").before" || fail 'a repeated apply mcp leaves every agent config alone' 'unchanged' "$f"
+done
+got="$(run status | grep '^mcp (codex)')"
+[ "$got" = "mcp (codex): on, figma through termag-mcp-bridge ($CODEX)" ] || fail 'status names each agent' 'mcp (codex): on, figma …' "$got"
+
+# pi's /mcp writes exposure into the entry: still ours, and kept.
+jq '.mcpServers.figma.exposure = "direct"' "$PI" > "$WORK/pi-mcp.json" && cp "$WORK/pi-mcp.json" "$PI"
+printf '%s' "$MCPV2" | arun apply mcp 2>/dev/null
+got="$(jq -c '.mcpServers.figma.exposure' "$PI")"
+[ "$got" = '"direct"' ] || fail "an exposure the owner set on pi's entry survives a delivery" '"direct"' "$got"
+got="$(run status | grep '^mcp (pi)')"
+case "$got" in 'mcp (pi): on, figma, jira '*) : ;; *) fail 'a tuned pi entry is still on in status' 'mcp (pi): on, figma, jira …' "$got" ;; esac
+
+# Fewer connectors and agents: termag's entries go, the owner's stay.
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c1abc","name":"figma"}],"agents":["codex","pi"]}' | arun apply mcp 2>/dev/null
+got="$(jq -c '[(.mcpServers | keys), .mcpServers.figma.exposure]' "$PI")"
+[ "$got" = '[["figma","metaterm"],"direct"]' ] || fail 'pi loses the dropped connector only' '[["figma","metaterm"],"direct"]' "$got"
+got="$(jq -c '.mcpServers | keys' "$CURSOR")"
+[ "$got" = '["jira"]' ] || fail 'cursor, no longer named, keeps only the owner'"'"'s server' '["jira"]' "$got"
+got="$(jq -c '.mcpServers // {} | keys' "$DEVIN")"
+[ "$got" = '[]' ] || fail "devin, no longer named, has no termag server left" '[]' "$got"
+
+# An orchestrator from before mcp-broker-v2 sends no agents: they stay as they are.
+cp "$CODEX" "$WORK/codex.before"
+printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[]}' | arun apply mcp 2>/dev/null
+cmp -s "$CODEX" "$WORK/codex.before" || fail 'a delivery without agents leaves the agent configs alone' 'unchanged' "$(cat "$CODEX")"
+
+for bad in '{"broker":"https://b.example","connectors":[],"agents":["emacs"]}' \
+           '{"broker":"https://b.example","connectors":[],"agents":"codex"}' \
+           '{"broker":"https://b.example","connectors":[],"agents":["codex","codex"]}'; do
+  printf '%s' "$bad" | arun apply mcp >/dev/null 2>&1 && fail "apply mcp refuses $bad" 'non-zero exit' 0
+done
+
+# A codex config that does not parse is left alone; the other agents still converge.
+if python3 -c 'import tomllib' >/dev/null 2>&1; then
+  printf 'model = "o3\n' > "$WORK/bad.toml"; cp "$CODEX" "$WORK/codex.good"; cp "$WORK/bad.toml" "$CODEX"
+  printf '%s' "{\"broker\":\"https://mcp-broker.example.test\",$CONNS,\"agents\":[\"codex\",\"pi\"]}" | arun apply mcp 2>"$WORK/mcp.err"; got=$?
+  [ "$got" != 0 ] || fail 'apply mcp reports a codex config it could not merge into' 'non-zero exit' 0
+  cmp -s "$CODEX" "$WORK/bad.toml" || fail 'an invalid codex config is left as it was' 'unchanged' "$(cat "$CODEX")"
+  got="$(jq -c '.mcpServers | keys' "$PI")"
+  [ "$got" = '["figma","jira","metaterm"]' ] || fail 'pi still gets its entries' '["figma","jira","metaterm"]' "$got"
+  cp "$WORK/codex.good" "$CODEX"
+fi
+
+run remove mcp </dev/null 2>/dev/null
+cmp -s "$CODEX" "$WORK/codex.orig" || fail "remove mcp gives the owner's codex config back as it was" "$(cat "$WORK/codex.orig")" "$(cat "$CODEX")"
+got="$(jq -c '.mcpServers | keys' "$PI")"
+[ "$got" = '["metaterm"]' ] || fail 'remove mcp takes termag'"'"'s pi entries out' '["metaterm"]' "$got"
+[ ! -e "$AST" ] || fail 'remove mcp deletes the agents record' 'absent' 'present'
+
+got="$("$BRIDGE" 2>&1)"; code=$?
+case "$code:$got" in 2:*usage*) : ;; 127:*'no usable Node.js'*) : ;; *) fail 'termag-mcp-bridge without arguments prints its usage' '2: usage' "$code: $got" ;; esac
+
+# Without node on PATH the bridge takes the nvm node, as agent/run-node.sh does.
+# The stub nvm.sh is like the real one: it reads variables that may be unset,
+# its auto-use follows the cwd's .nvmrc (here a version that is not installed,
+# so no node), and with --no-use it leaves PATH alone.
+NVMV="$WORK/nvm/versions/node/v99.0.0/bin"
+mkdir -p "$WORK/nonode" "$NVMV" "$WORK/nvmrc-project"
+for t in bash dirname sort; do ln -sf "$(command -v "$t")" "$WORK/nonode/$t"; done
+printf '#!/bin/sh\necho "node $*"\n' > "$NVMV/node"; chmod +x "$NVMV/node"
+cat > "$WORK/nvm/nvm.sh" <<NVM
+: "\$TERMAG_TEST_UNSET_IN_NVM"
+nvm() { [ "\$1 \$2" = 'which default' ] && echo "$NVMV/node"; }
+case " \$* " in
+  *' --no-use '*) ;;
+  *) if [ -f .nvmrc ]; then echo "N/A: version \$(cat .nvmrc) is not yet installed." >&2; else PATH="$NVMV:\$PATH"; fi ;;
+esac
+NVM
+echo v1.2.3 > "$WORK/nvmrc-project/.nvmrc"
+want="node $(dirname "$BRIDGE")/../agent/mcp-bridge.js https://b.example/c/x cfg.json"
+got="$(env -u TERMAG_TEST_UNSET_IN_NVM PATH="$WORK/nonode" NVM_DIR="$WORK/nvm" "$BRIDGE" https://b.example/c/x cfg.json 2>/dev/null)"
+[ "$got" = "$want" ] || fail 'termag-mcp-bridge finds nvm node though nvm.sh reads an unset variable' "$want" "$got"
+got="$(cd "$WORK/nvmrc-project" && env -u TERMAG_TEST_UNSET_IN_NVM PATH="$WORK/nonode" NVM_DIR="$WORK/nvm" "$BRIDGE" https://b.example/c/x cfg.json 2>/dev/null)"
+[ "$got" = "$want" ] || fail "termag-mcp-bridge finds nvm node in a project whose .nvmrc names a version that isn't installed" "$want" "$got"
+
 # ── Fireworks (pi and Claude Code, through the gateway) ─────────────────────
 PIM="$WORK/pi/models.json"; FWS="$H/.config/termag/fireworks.json"; FWC="$H/.config/termag/claude-fireworks.json"
 runfw() { TERMAG_PI_MODELS="$PIM" run "$@"; }
@@ -692,6 +886,42 @@ got="$(jq -c '.providers["termag-fireworks"] | [.baseUrl, (.models | length)]' "
 [ "$got" = '["https://gw2.example/fireworks/inference/v1",2]' ] || fail "a new base moves pi's provider and keeps its models" '[gw2, 2]' "$got"
 printf '%s' "$FW" | runfw apply fireworks 2>/dev/null
 
+# pi-model --models: the flag's list (fireworksMenuArg) becomes pi's provider, for pi's /model:
+# every model by its label and window, in the flag's order; one dropped from the flag goes.
+pim() { jq -cn "$1" | base64 | tr -d '\n'; }
+pimodels() { jq -c '[.providers["termag-fireworks"].models[] | [.id, .name, .contextWindow]]' "$PIM"; }
+GF=accounts/fireworks/models/glm-5p3-flash DSF=accounts/fireworks/models/deepseek-v4p1-flash-1017
+cp "$PIM" "$WORK/pim.keep"; cp "$H/.config/termag/fireworks-pi.json" "$WORK/pis.keep" 2>/dev/null || true
+THREE="$(pim "[{id:\"$GF\",label:\"GLM 5.3 Flash\",context:1048576},{id:\"$DSF\",label:\"DeepSeek V4.1 Flash\",context:1048576},{id:\"$KIMI\",label:\"Kimi K3\",context:1048576}]")"
+runfw pi-model --model "$GF" --context 1048576 --models "$THREE" </dev/null 2>/dev/null || fail 'pi-model --models succeeds' 0 $?
+got="$(pimodels)"
+[ "$got" = "[[\"$GF\",\"GLM 5.3 Flash\",1048576],[\"$DSF\",\"DeepSeek V4.1 Flash\",1048576],[\"$KIMI\",\"Kimi K3\",1048576]]" ] \
+  || fail "pi-model --models writes all three of the flag's models, by label, with their windows, and drops models launched before" 'three rows' "$got"
+got="$(jq -r '.providers.ollama.baseUrl' "$PIM")"
+[ "$got" = http://localhost:11434/v1 ] || fail "--models leaves the owner's own pi provider" http://localhost:11434/v1 "$got"
+# One model: only it.
+runfw pi-model --model "$KIMI" --models "$(pim "[{id:\"$KIMI\",label:\"Kimi K3\",context:1048576}]")" </dev/null 2>/dev/null
+got="$(pimodels)"
+[ "$got" = "[[\"$KIMI\",\"Kimi K3\",1048576]]" ] || fail 'pi-model --models with one model: only it, and the other two are removed' 'one row' "$got"
+# A label with spaces, a model with no window, and the launch's model missing from the list.
+runfw pi-model --model "$DS" --context 200000 --models "$(pim "[{id:\"$KIMI\",label:\"  Kimi K3 (preview, 1M)  \"},{id:\"$GF\",label:\"GLM 5.3 Flash\",context:1048576}]")" </dev/null 2>/dev/null
+got="$(pimodels)"
+[ "$got" = "[[\"$KIMI\",\"Kimi K3 (preview, 1M)\",null],[\"$GF\",\"GLM 5.3 Flash\",1048576],[\"$DS\",\"deepseek-v4p1-flash-spot\",200000]]" ] \
+  || fail 'a label with spaces is kept whole, a model with no window gets none, and the launch model is kept though the flag lacks it' 'three rows' "$got"
+# The launch's window wins for its own model; an unreadable list adds the launch's model alone, saying so.
+runfw pi-model --model "$GF" --context 512000 --models "$THREE" </dev/null 2>/dev/null
+got="$(jq -c '[.providers["termag-fireworks"].models[] | select(.id == "'"$GF"'") | .contextWindow]' "$PIM")"
+[ "$got" = '[512000]' ] || fail "the launch's --context is its model's window" '[512000]' "$got"
+runfw pi-model --model "$KIMI" --models 'bm90IGpzb24=' </dev/null 2>"$WORK/err"; code=$?
+got="$(pimodels | jq -c 'length')"
+[ "$code" = 0 ] && [ "$got" = 3 ] && grep -q 'not a model list' "$WORK/err" \
+  || fail 'an unreadable --models still launches, keeping the provider and saying why' '0, 3 rows, a reason' "$code, $got"
+runfw pi-model --model "$KIMI" --models 'a;b' </dev/null >/dev/null 2>&1 || fail '--models that is not base64 does not fail the launch' 0 $?
+grep -q 'termag-credentials: fireworks-pi-menu-v1' "$SCRIPT" || fail 'the script carries the fireworks-pi-menu-v1 marker agent/credentials.js reads' marker missing
+grep -q 'termag-pi-fireworks: fireworks-pi-menu-v1' "$(dirname "$SCRIPT")/termag-pi-fireworks" || fail 'the launcher carries its fireworks-pi-menu-v1 marker' marker missing
+# Back to the provider the tests below expect.
+cp "$WORK/pim.keep" "$PIM"; if [ -s "$WORK/pis.keep" ]; then cp "$WORK/pis.keep" "$H/.config/termag/fireworks-pi.json"; fi
+
 # launch-settings: the one --settings a Claude Code launch on the backend gets, with the launch's model.
 got="$(runfw launch-settings --backend fireworks --model "$KIMI" --fast "$DS" --context 512000 - 2>/dev/null \
   | jq -c '.env | [.ANTHROPIC_BASE_URL, .ANTHROPIC_MODEL, .ANTHROPIC_DEFAULT_SONNET_MODEL, .ANTHROPIC_SMALL_FAST_MODEL, .ANTHROPIC_DEFAULT_HAIKU_MODEL, .CLAUDE_CODE_MAX_CONTEXT_TOKENS]')"
@@ -699,6 +929,30 @@ got="$(runfw launch-settings --backend fireworks --model "$KIMI" --fast "$DS" --
   || fail "launch-settings puts the launch's model on every tier, the fast one on haiku, and the window" 'kimi tiers, ds fast, 512000' "$got"
 got="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>/dev/null | jq -c '.env | [.ANTHROPIC_SMALL_FAST_MODEL, .CLAUDE_CODE_MAX_CONTEXT_TOKENS]')"
 [ "$got" = "[\"$KIMI\",null]" ] || fail 'without --fast the model is the fast one too, and without --context there is no window' "[kimi,null]" "$got"
+# --models: the flag's list (fireworksMenuArg) becomes Claude Code's /model menu, in its order, by label;
+# every tier points at a Fireworks model and is named from the list.
+fwm() { jq -cn "$1" | base64 | tr -d '\n'; }
+GLMF=accounts/fireworks/models/glm-5p3-flash GLM=accounts/fireworks/models/glm-5p3 MM=accounts/fireworks/models/minimax-m3
+FIVE="$(fwm "[{id:\"$GLMF\",label:\"GLM 5.3 Flash\",context:200000},{id:\"$KIMI\",label:\"Kimi K3\",context:1048576},{id:\"$DS\",label:\"DeepSeek V4.1 Flash\",context:1048576},{id:\"$GLM\",label:\"GLM 5.3\",context:131072},{id:\"$MM\",label:\"MiniMax M3\",context:512000}]")"
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --fast "$DS" --context 1048576 --models "$FIVE" - 2>/dev/null \
+  | jq -c '[.modelPicker.replaceBuiltInOptions, [.modelPicker.options[] | [.label, .description]]]')"
+[ "$got" = '[true,[["GLM 5.3 Flash","Fireworks · 200k context"],["Kimi K3","Fireworks · 1M context"],["DeepSeek V4.1 Flash","Fireworks · 1M context"],["GLM 5.3","Fireworks · 128k context"],["MiniMax M3","Fireworks · 512k context"]]]' ] \
+  || fail "launch-settings lists all five of the flag's models in its order, by label, with their windows" 'five rows' "$got"
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --fast "$DS" --models "$FIVE" - 2>/dev/null \
+  | jq -r '.env | [.ANTHROPIC_DEFAULT_OPUS_MODEL, .ANTHROPIC_DEFAULT_OPUS_MODEL_NAME, .ANTHROPIC_DEFAULT_SONNET_MODEL, .ANTHROPIC_DEFAULT_FABLE_MODEL, .ANTHROPIC_DEFAULT_FABLE_MODEL_NAME, .ANTHROPIC_DEFAULT_HAIKU_MODEL, .ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME, .ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION] | join("|")')"
+[ "$got" = "$KIMI|Kimi K3|$KIMI|$KIMI|Kimi K3|$DS|DeepSeek V4.1 Flash|Fireworks · 1M context" ] \
+  || fail 'every tier, fable included, is the launch model (haiku the fast one), named from the list' 'kimi tiers, ds haiku' "$got"
+# One model; a repeated id, a bad one, a missing or blank label and an unknown window.
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --models "$(fwm "[{id:\"$KIMI\"}]")" - 2>/dev/null | jq -c '[.modelPicker.options, .env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME]')"
+[ "$got" = "[[{\"model\":\"$KIMI\",\"label\":\"kimi-k3\",\"description\":\"Fireworks\"}],\"kimi-k3\"]" ] || fail 'one model with no label is one row named by its id' 'one row' "$got"
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --models "$(fwm "[{id:\"$KIMI\",label:\"Kimi K3\"},{id:\"$KIMI\",label:\"again\"},{id:\"gpt-5\"},\"x\",{id:\"$GLM\",label:\"  \"}]")" - 2>/dev/null | jq -c '[.modelPicker.options[] | .label]')"
+[ "$got" = '["Kimi K3","glm-5p3"]' ] || fail 'a repeated id is listed once, a bad entry dropped, a blank label is the id' '[Kimi K3, glm-5p3]' "$got"
+# A list it cannot read leaves the launch as it was without one, saying so.
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --models 'bm90IGpzb24=' - 2>"$WORK/err" | jq -c '[has("modelPicker"), .env.ANTHROPIC_DEFAULT_FABLE_MODEL]')"
+[ "$got" = "[false,\"$KIMI\"]" ] && grep -q 'not a model list' "$WORK/err" || fail 'an unreadable --models still launches, with no menu, and says why' "[false,kimi]" "$got"
+got="$(runfw launch-settings --backend fireworks --model "$KIMI" --models 'a;b' - 2>/dev/null | jq -c 'has("modelPicker")')"
+[ "$got" = false ] || fail '--models that is not base64 is ignored' false "$got"
+grep -q 'termag-credentials: fireworks-menu-v1' "$SCRIPT" || fail 'the script carries the fireworks-menu-v1 marker agent/credentials.js reads' marker missing
 runfw launch-settings --backend fireworks - >/dev/null 2>&1 && fail 'launch-settings on fireworks needs a model' non-zero 0
 runfw launch-settings --backend fireworks --model gpt-5 - >/dev/null 2>&1 && fail 'launch-settings refuses a model that is not a Fireworks id' non-zero 0
 # With termag's telemetry on, the launch's resource attributes ride in the same JSON.
@@ -711,6 +965,23 @@ got="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main runfw launch-settings --back
 cp "$WORK/cs.keep" "$CS"; if [ -e "$WORK/tstate.keep" ]; then cp "$WORK/tstate.keep" "$TSTATE"; else rm -f "$TSTATE"; fi
 got="$(runfw launch-settings - 2>/dev/null)"
 [ "$got" = '{}' ] || fail 'launch-settings without --backend is telemetry-launch' '{}' "$got"
+# A Fireworks id /model saved as the owner's `model`: every launch off the
+# backend starts on the default instead, and the file is left as it is.
+cp "$CS" "$WORK/cs.keep"
+jq --arg m "$KIMI" '.model = $m' "$WORK/cs.keep" > "$CS"; cp "$CS" "$WORK/cs.fw"
+for cmd in telemetry-launch launch-settings; do
+  got="$(runfw $cmd - 2>/dev/null)"
+  [ "$got" = '{"model":""}' ] || fail "$cmd starts on the default over a saved Fireworks model" '{"model":""}' "$got"
+done
+cmp -s "$CS" "$WORK/cs.fw" || fail "the guard leaves the owner's settings as they are" unchanged "$(cat "$CS")"
+got="$(runfw launch-settings --backend fireworks --model "$DS" - 2>/dev/null | jq -c '[has("model"), .env.ANTHROPIC_MODEL]')"
+[ "$got" = "[false,\"$DS\"]" ] || fail 'a Fireworks launch is unchanged by a saved Fireworks model' "[false,ds]" "$got"
+for keep in opus 'us.anthropic.claude-opus-4-5-20251101-v1:0' 'accounts/fireworks/models/x;rm'; do
+  jq --arg m "$keep" '.model = $m' "$WORK/cs.keep" > "$CS"
+  got="$(runfw telemetry-launch - 2>/dev/null)"
+  [ "$got" = '{}' ] || fail "a saved model that is not a Fireworks id is kept ($keep)" '{}' "$got"
+done
+cp "$WORK/cs.keep" "$CS"
 runfw launch-settings --backend bedrock - >/dev/null 2>&1 && fail 'launch-settings refuses a backend it does not know' 'non-zero' 0
 
 # remove takes out only our provider; an owner's own under our name is theirs.
@@ -788,7 +1059,7 @@ run apply codex </dev/null >/dev/null 2>&1; got=$?
 [ "$got" = 2 ] || fail 'unknown providers exit 2' 2 "$got"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + mcp apply/remove/plugin dirs + fireworks apply/skip/remove/status/launch-settings/pi-model + legacy cleanup'
+  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + mcp apply/remove/plugin dirs + mcp for the other agents + fireworks apply/skip/remove/status/launch-settings/pi-model + legacy cleanup'
   exit 0
 fi
 echo "$failures failure(s)"

@@ -1,12 +1,53 @@
 # termag box AMI
 
-Builds an Ubuntu 24.04 arm64 AMI with everything a termag box needs at
-runtime. The resulting AMI is consumed by the Terraform module that
-provisions per-user boxes.
+Builds Ubuntu 24.04 arm64 AMIs for per-user termag boxes, in two flavors:
+
+- **`box.pkr.hcl` (this file's subject)** — the full bake: every toolchain,
+  agent CLI and the dev stack, so a box is *ready to work* the moment it starts. Consumed by the Terraform module that
+  provisions per-user boxes; `Component=box` is the discovery tag.
+- **`box-min.pkr.hcl`** — the lean bake: the box contract and nothing else, for
+  `termag box create --minimal` (`Component=box-min`). See "The lean image"
+  below.
 
 The image bakes a **full devbox toolset** — `scripts/setup.sh` installs the
 language toolchains, agent CLIs and dev tooling, so an agent on a box has the
 same capabilities a human gets on a workstation.
+
+## The lean image (box-min.pkr.hcl)
+
+`termag box create <name> --minimal` launches from a separate lean image
+tagged `Component=box-min` — the box contract plus what its panes need to
+work: the placeholder `termag` user, nvm + a default Node alias, the termag
+agent checkout (+ CLI builds from the same bundle), `git`/`zsh`/`tmux`/`gh`/
+`jq`, **Docker** (docker-ce + buildx + compose; images pull per project — the pre-pulled dev-stack set is
+the war-cache half that stays out), the **agent CLIs** with the full bake's
+shapes (`claude`, `codex`, `pi@1.0.2` pinned `--ignore-scripts`; `cursor`
+and `devin` from their vendor installers), the deploy/ units and the
+TERMAG_BOX marker, the NitroTPM registration, and the same
+home-path index machinery. No language toolchains, no Playwright, no
+Chromium, no browser-harness/clickhousectl, no awscli, and none of the
+war cache (clones, node_modules, the pnpm store, the bazel disk cache,
+pre-pulled images). Skills and MCP registrations are not baked either — they
+re-land from the checkout through termag-reconcile at boot, and the
+bootstrapper (the termag-herdr plugin's `termag-bootstrap`, or the owner's
+own scripted one) decides what is wanted once the reconcile split lands.
+
+The baked root volume is **60GB**, not the full bake's 120: the lean snapshot
+needs well under half of that, and the orchestrator's
+`BOX_MINIMAL_ROOT_VOLUME_GB` default (60, in
+`backend/src/services/boxProvisioner.ts`) matches.
+
+Bake it from "Publish AMI" with **target `box-min`** (publish ticked to tag
+`Component=box-min`; off for a `box-min-candidate` you can inspect), or by
+hand: `packer build -var vpc_id=… -var subnet_id=… box-min.pkr.hcl`. There is
+no incremental mode — the bake is minutes and always starts from Canonical
+Ubuntu. The schedule's `check-box-min-ami` staleness check covers the same
+inputs the box check does (the whole checkout ships as the bundle here too;
+for the lean image all of `deploy/` counts, since reconcile re-lands it from
+the checkout at boot), so the flavor stays fresh on the same weekly re-root.
+`packer/scripts/box-min.test.sh` enforces what may not bake its way in: any
+provisioner from the toolchain war (`setup.sh`, the app-bake scripts, the
+scratch-volume pair, hibernation) is a failed check.
 
 ## What's in the image
 
@@ -29,6 +70,15 @@ same capabilities a human gets on a workstation.
     import writes no `__pycache__` into the baked home.
   - Rust via **rustup**/`cargo`.
   - `uv` (Astral).
+- **The desktop app's t3 server**, only when the bake is handed its tarball
+  (`-var t3_server_artifact=<path>`, below): the version pinned in
+  `deploy/t3-server.pin`, installed by `scripts/install-t3-server.sh` (both
+  bake modes) through `deploy/termag-t3-install` into `/opt/termag-t3`, with
+  the agent drop-in that points `TERMAG_T3_COMMAND` at it. Without one, which
+  is every CI bake, the image has no t3 server and the step does nothing: a
+  bake never fetches the pin's `base_url` (a `gh://` source needs the box
+  owner's login), and a box installs the pinned server on boot through
+  `termag-reconcile`.
 - **Agent CLIs**: `claude` + `codex` + `pi` (npm-global under nvm), `cursor`
   (`cursor-agent` binary, vendor installer), `devin` (vendor installer).
 - **Extra tools**: `rtk` (pinned, digest-checked
@@ -240,8 +290,11 @@ and inspect the image without it becoming what new boxes launch from.
    termag source itself — so the AMI reflects the ref you choose.
 3. Set **`target`**:
    - `box` — bake only the per-user box AMI (this image).
+   - `box-min` — bake only the lean `Component=box-min` image (see "The lean
+     image" above); publish ticked = live for `--minimal`, off = candidate.
    - `orchestrator` — bake only the control-plane server AMI.
-   - `both` (default) — bake both.
+   - `both` (default) — bake the full box and the orchestrator, not the lean
+     one (its own staleness check drives that on the schedule).
 4. Tick **`publish`** if the result should become the live box image
    (`Component=box`). Leave it off to get a `box-candidate`; the run's
    *Verify the published AMI* summary prints the `create-tags` one-liner
@@ -281,6 +334,14 @@ packer build \
   -var subnet_id=<private-subnet> \
   box.pkr.hcl
 ```
+
+To bake the desktop app's t3 server from a local tarball (your T3 Code
+build's box-server package), add
+`-var t3_server_artifact=<path>/termag-t3-server-<version>-linux-arm64.tar.gz`.
+`scripts/stage-t3-server.sh` stages it beside the template for upload, and the
+bake installs it only if its version and sha256 are the ones
+`deploy/t3-server.pin` names (a mismatch fails the bake), so commit the pin
+bump before baking.
 
 Build runs in `us-east-1`, in a VPC and private subnet you supply via
 `-var vpc_id=...` and `-var subnet_id=...` (or a `tfvars`-style file).
@@ -335,8 +396,9 @@ The sweep keeps the newest 3 `available` images **per component**
 on, everything tagged `Retain=true`, and everything under 24 hours old. A
 component that has keep-N at all always keeps **at least two** available
 images, so a bad newest bake always has a historical one to fall back to.
-Then it deletes every snapshot it can prove is termag's and that no
-still-registered AMI references. Deleting the snapshot an incremental bake
+Then it deletes every snapshot it can prove is termag's, that no
+still-registered AMI references and that is not tagged `Retain=true` (a
+quarantined box's forensic snapshots carry it). Deleting the snapshot an incremental bake
 started from is safe once that source image is gone: EBS keeps the blocks a
 child snapshot still references.
 
@@ -349,11 +411,13 @@ been deregistered looks exactly like a termag orphan. Those are listed in the
 run summary and left alone unless someone dispatches the workflow with
 `include_untagged_backlog` after reading that list.
 
-`Component=box-base` and `Component=ami-build` are the exceptions to keep-N.
-They get none, only the 24-hour floor. A successful build deregisters the
-box-base intermediate, so one that is still around died before the NitroTPM
-re-register. An ami-build image is what a timed-out ImageAvailable wait leaves
-behind. Packer never reaches StepCreateTags, and the image keeps `run_tags`.
+`Component=box-base`, `Component=box-min-base` and `Component=ami-build`
+are the exceptions to keep-N. They get none, only the 24-hour floor. A
+successful build deregisters the box-base intermediate — and the box-min
+bake's equivalent — so one that is still around died before the NitroTPM
+re-register. An ami-build image is what a timed-out ImageAvailable wait
+leaves behind. Packer never reaches StepCreateTags, and the image keeps
+`run_tags`.
 
 To hold an image the sweep would otherwise collect — a rollback target older
 than keep-3, and a prerequisite for pinning `orchestrator_ami_id` at it:

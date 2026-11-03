@@ -89,6 +89,7 @@ case "$*" in
   *'-p ExecMainStartTimestamp'*) cat "$STATE/start" ;;
   *'-p KillMode'*) cat "$STATE/killmode" ;;
   *'-p FragmentPath'*) cat "$STATE/fragment" ;;
+  *'-p DropInPaths'*) cat "$STATE/dropins" ;;
   *'-p ExecStart'*) cat "$STATE/execstart" ;;
   *' restart '*) exit "$(cat "$STATE/restart-rc" 2>/dev/null || echo 0)" ;;
   *) exit 0 ;;
@@ -168,6 +169,7 @@ reset_state() {
   echo process > "$STATE/killmode"
   echo "$AGENT_START" > "$STATE/start"
   echo "$HOME_DIR/.config/systemd/user/termag-agent.service" > "$STATE/fragment"
+  : > "$STATE/dropins"
   echo "/bin/bash $CHECKOUT/agent/run-node.sh $CHECKOUT/agent/agent.js" > "$STATE/execstart"
   echo 0 > "$STATE/drift"
   : > "$STATE/sessions"
@@ -379,6 +381,29 @@ printf 'unit-v2\n' > "$HOME_DIR/.config/systemd/user/termag-agent.service"
 out="$(run)"
 has 'a newer unit file restarts the agent' "$out" "restarted termag-agent.service ($HOME_DIR/.config/systemd/user/termag-agent.service changed"
 touch -d "$OLD" "$HOME_DIR/.config/systemd/user/termag-agent.service"
+
+# ── and so does a drop-in of it (termag-t3-install's TERMAG_T3_COMMAND) ─────
+reset_state
+dropin_dir="$HOME_DIR/.config/systemd/user/termag-agent.service.d"
+mkdir -p "$dropin_dir"
+printf '[Service]\nEnvironment=X=1\n' > "$dropin_dir/10-old.conf"
+touch -d "$OLD" "$dropin_dir/10-old.conf"
+echo "$dropin_dir/10-old.conf" > "$STATE/dropins"
+out="$(run)"
+lacks 'an old drop-in does not restart the agent' "$(cat "$LOG")" 'restart'
+reset_state
+printf '[Service]\nEnvironment=TERMAG_T3_COMMAND=/opt/termag-t3/bin/t3\n' > "$dropin_dir/t3.conf"
+echo "$dropin_dir/10-old.conf $dropin_dir/t3.conf" > "$STATE/dropins"
+out="$(run)"
+has 'a newer drop-in restarts the agent' "$out" "restarted termag-agent.service ($dropin_dir/t3.conf changed"
+touch -d "$OLD" "$dropin_dir/t3.conf"
+reset_state
+pkg_dir="$WORK/usr/lib/systemd/user/service.d"
+mkdir -p "$pkg_dir"
+printf '[Service]\nTimeoutStopFailureMode=abort\n' > "$pkg_dir/10-timeout-abort.conf"
+echo "$pkg_dir/10-timeout-abort.conf $dropin_dir/10-old.conf $dropin_dir/t3.conf" > "$STATE/dropins"
+out="$(run)"
+lacks "a package's drop-in for every service does not restart the agent" "$(cat "$LOG")" 'restart'
 
 # ── KillMode other than process: deferred to the next boot ──────────────────
 reset_state

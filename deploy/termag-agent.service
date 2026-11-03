@@ -28,6 +28,20 @@ RestartSec=5
 # install_box_marker.
 Environment=TERMAG_BOX=1
 
+# Claude Code's Bash tool runs $SHELL, and the box user's shell is zsh, which
+# breaks the bash agents write: unquoted globs with no match are an error
+# ("no matches found"), `echo =====` is a command lookup ("= not found").
+# CLAUDE_CODE_SHELL makes the tool use bash; it changes nothing else, so the
+# owner's interactive zsh stays as it was. A non-interactive bash reads only
+# $BASH_ENV, so that file gives it what zsh read from ~/.zshenv and
+# /etc/zsh/zshenv: GH_HOST (the GitHub broker) and TERMAG_BOX (deploy/termag-bash-env).
+# Same reach as TERMAG_BOX: every pane, chat and ask turn the agent starts, and
+# agent/tmux-args.js puts both on each new session for a surviving tmux server.
+# An owner who wants zsh back exports CLAUDE_CODE_SHELL=/bin/zsh in ~/.zshrc
+# (panes) or a drop-in here (chat and asks). Gotcha agent-bash-tool-shell.
+Environment=CLAUDE_CODE_SHELL=/bin/bash
+Environment=BASH_ENV=%h/.local/share/termag/bash-env
+
 # Do not take the user's tmux server down with the agent.
 #
 # agent.js starts tmux sessions with `tmux new-session`. tmux daemonises, so it

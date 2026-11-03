@@ -10,6 +10,8 @@
 set -u
 
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/termag-status"
+# Run from a Devin pane, the guard below would silence every source-less case.
+unset DEVIN_PROJECT_DIR
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -240,6 +242,17 @@ got="$(classify '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fil
 got="$(classify '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fill"},"tool_response":{"stdout":"https://github.com/o/r/pull/9\n","stderr":"Creating pull request for feat/y into main in o/r\n"}}')"
 [ "$got" = "pr_created https://github.com/o/r/pull/9" ] || fail 'create reads its URL from stdout' 'pr_created .../pull/9' "$got"
 
+# Devin's exec: {success, output, error}, stdout+stderr in .output closed by
+# "Exit code: N"; success is true even when the command failed.
+got="$(classify '{"tool_name":"exec","tool_input":{"command":"gh pr create --fill"},"tool_response":{"success":true,"output":"Output from command in shell f6:\nhttps://github.com/o/r/pull/21\n\n\nExit code: 0","error":null}}')"
+[ "$got" = "pr_created https://github.com/o/r/pull/21" ] || fail 'classify a Devin exec gh pr create' 'pr_created <url>' "$got"
+got="$(classify '{"tool_name":"exec","tool_input":{"command":"gh pr create --fill"},"tool_response":{"success":true,"output":"a pull request for branch \"feat/x\" into branch \"main\" already exists:\nhttps://github.com/o/r/pull/8\n\nExit code: 1","error":null}}')"
+[ -z "$got" ] || fail 'a failed Devin exec create is no milestone' '' "$got"
+got="$(classify '{"tool_name":"exec","tool_input":{"command":"gh pr merge 22 --squash"},"tool_response":{"success":true,"output":"✓ Squashed and merged pull request o/r#22 (t)\n\nExit code: 0","error":null}}')"
+[ "$got" = "pr_merged https://github.com/o/r/pull/22" ] || fail 'classify a Devin exec gh pr merge' 'pr_merged <url>' "$got"
+got="$(classify '{"tool_name":"exec","tool_input":{"command":"gh pr create --fill"},"tool_response":{"success":true,"output":"https://github.com/o/r/pull/23","error":null}}')"
+[ -z "$got" ] || fail 'a Devin exec without an exit code is no milestone' '' "$got"
+
 got="$(classify 'not json')"
 [ -z "$got" ] || fail 'malformed payload is ignored' '' "$got"
 
@@ -386,6 +399,45 @@ env -u CLAUDE_ENV_FILE -u TMUX HOME="$SS_HOME" "$SCRIPT" session-start </dev/nul
 got=$?
 [ "$got" = 0 ] || fail 'session-start without CLAUDE_ENV_FILE exits 0' 0 "$got"
 
+# ── Devin: the imported Claude hooks are silenced, its own hooks carry a source ──
+devin_payload() {  # mode + args; the hook JSON on stdin
+  DEVIN_PROJECT_DIR=/tmp/p TERMAG_STATUS_SESSION=psecor-x-review TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" \
+    HOME="$WORK/empty-home" "$SCRIPT" "$@" --print-payload
+}
+for mode in working idle stop post-tool prompt-submit notification; do
+  got="$(printf '{}' | devin_payload "$mode")"
+  [ -z "$got" ] || fail "under Devin a source-less $mode posts nothing" '' "$got"
+done
+got="$(printf '{}' | devin_payload working --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"working","source":"devin-hooks"}' ] || fail 'under Devin a sourced working posts' 'working + source' "$got"
+got="$(printf '{"tool_name":"read","tool_input":{"file_path":"x"}}' | devin_payload post-tool --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"working","source":"devin-hooks"}' ] || fail 'post-tool carries --source' 'working + source' "$got"
+got="$(printf '{"prompt":"hi"}' | devin_payload prompt-submit --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"working","source":"devin-hooks"}' ] || fail 'prompt-submit carries --source' 'working + source' "$got"
+got="$(printf '{"hook_event_name":"Stop"}' | devin_payload stop --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"idle","source":"devin-hooks"}' ] || fail 'stop carries --source' 'idle + source' "$got"
+got="$(printf '%s' '{"tool_name":"exec","tool_input":{"command":"curl -H \"Authorization: SECRET\" x"}}' | devin_payload permission-request --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"waiting","source":"devin-hooks","waitingReason":"approval","message":"Needs your permission to use exec","notify":true}' ] \
+  || fail 'permission-request: waiting for approval, naming the tool' 'waiting/approval/notify' "$got"
+case "$got" in *SECRET*) fail 'permission-request leaks the tool input' 'tool name only' "$got" ;; esac
+got="$(printf '{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}' | devin_payload session-end --source devin-hooks)"
+[ "$got" = '{"session":"psecor-x-review","status":"not_running","source":"devin-hooks"}' ] || fail 'session-end on exit: not_running' 'not_running' "$got"
+for reason in clear resume; do
+  got="$(printf '{"hook_event_name":"SessionEnd","reason":"%s"}' "$reason" | devin_payload session-end --source devin-hooks)"
+  [ "$got" = '{"session":"psecor-x-review","status":"idle","source":"devin-hooks"}' ] || fail "session-end on $reason: still running, idle" 'idle' "$got"
+done
+# Outside Devin nothing changes: Claude's source-less payload is still sent.
+got="$(printf '{}' | TERMAG_STATUS_SESSION=psecor-x-agent TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" HOME="$WORK/empty-home" "$SCRIPT" post-tool --print-payload)"
+[ "$got" = '{"session":"psecor-x-agent","status":"working"}' ] || fail 'post-tool without Devin: the Claude payload' 'working, no source' "$got"
+
+# deploy/devin-hooks.json: every event posts with the devin-hooks source, in
+# the background, through the installed termag-status.
+HOOKS="$(dirname "$SCRIPT")/devin-hooks.json"
+got="$(jq -r '[.hooks[][] .hooks[] .command] | map(select((test("termag-status\\\" [a-z_-]+ --source devin-hooks >/dev/null 2>&1 &$")) | not)) | length' "$HOOKS")"
+[ "$got" = 0 ] || fail 'every devin-hooks.json command posts with --source devin-hooks, backgrounded' 0 "$got"
+got="$(jq -r '.hooks | keys | join(",")' "$HOOKS")"
+[ "$got" = 'PermissionRequest,PostToolUse,PreToolUse,SessionEnd,Stop,UserPromptSubmit' ] || fail 'devin-hooks.json events' 'six events' "$got"
+
 # ── which session: tmux panes, the t3 server, no tmux at all ─────────────────
 # A private tmux server under $WORK stands in for a box's: a project with a
 # workstream, its ctrl pane, a session started in the home directory, and the
@@ -520,6 +572,101 @@ if command -v tmux >/dev/null 2>&1; then
 else
   echo "skip: tmux not installed (session tests)"
 fi
+
+# A stand-in box of the e2e stack (TERMAG_E2E_ROOT, or a $TMUX socket under a
+# directory holding .termag-e2e) posts only to the origins in its
+# status-origins, and says so on stderr and in logs/status-refused.log.
+stack="$WORK/e2e-stack"
+mkdir -p "$stack/logs" "$stack/boxes/b/tmux"
+: > "$stack/.termag-e2e"
+printf '%s' '{"termag_url":"ws://127.0.0.1:9/termag/ws/agent","token":"real"}' > "$WORK/e2e-real.json"
+e2e_post() { TERMAG_AGENT_CONFIG="$WORK/e2e-real.json" TERMAG_STATUS_SESSION=s TERMAG_STATUS_MIRRORS="$WORK/none" "$@" "$SCRIPT" working 2>&1; }
+want="termag-status: refusing to post to http://127.0.0.1:9: this hook runs on a stand-in box of the e2e stack at $stack, which posts only to nothing (no status-origins)"
+got="$(e2e_post env TERMAG_E2E_ROOT="$stack")"
+[ "$got" = "$want" ] || fail 'e2e stack (TERMAG_E2E_ROOT), no status-origins: refused' "$want" "$got"
+got="$(e2e_post env -u TERMAG_E2E_ROOT TMUX="$stack/boxes/b/tmux/sock,1,0")"
+[ "$got" = "$want" ] || fail 'e2e stack ($TMUX under its root): refused' "$want" "$got"
+[ "$(grep -c 'refusing to post' "$stack/logs/status-refused.log" 2>/dev/null)" = 2 ] \
+  || fail 'e2e refusals are logged in the stack' 2 "$(grep -c 'refusing to post' "$stack/logs/status-refused.log" 2>/dev/null)"
+# usage mode posts on its own path, before the status modes; it is guarded too.
+e2e_usage() { TERMAG_AGENT_CONFIG="$WORK/e2e-real.json" TERMAG_CLAUDE_RUNNER_ORDER=ord.7 "$@" "$SCRIPT" usage --transcript "$TR/b.jsonl" 2>&1; }
+got="$(e2e_usage env TERMAG_E2E_ROOT="$stack")"
+[ "$got" = "$want" ] || fail 'e2e stack, usage mode: refused' "$want" "$got"
+printf 'http://127.0.0.1:9\n' > "$stack/status-origins"
+got="$(e2e_post env TERMAG_E2E_ROOT="$stack")"
+[ -z "$got" ] || fail 'e2e stack, origin listed in status-origins: posted' '' "$got"
+got="$(e2e_usage env TERMAG_E2E_ROOT="$stack")"
+[ -z "$got" ] || fail 'e2e stack, usage mode, origin listed in status-origins: posted' '' "$got"
+# The guard refuses everything on a stack without status-origins, so it needs
+# a scripts/e2e/up.sh that writes one (#751); without it every stand-in box's
+# status post would be refused.
+grep -q '>"$ROOT/status-origins"' "$(dirname "$SCRIPT")/../scripts/e2e/up.sh" \
+  || fail 'scripts/e2e/up.sh writes status-origins (the guard depends on #751)' '>"$ROOT/status-origins" in up.sh' '(missing)'
+got="$(e2e_post env -u TERMAG_E2E_ROOT TMUX="$WORK/elsewhere/sock,1,0")"
+[ -z "$got" ] || fail 'a $TMUX socket outside any stack: posted' '' "$got"
+# Only a marker that is the user's own file counts (/tmp is world-writable):
+# not a symlink, even to a file of theirs, and not another user's file.
+# The stray root lists no origins, so a marker taken for a stack would refuse.
+# Making a file the test user doesn't own needs root, so that case runs only
+# as root.
+stray="$WORK/stray"
+mkdir -p "$stray/tmux"
+ln -s "$stack/.termag-e2e" "$stray/.termag-e2e"
+got="$(e2e_post env -u TERMAG_E2E_ROOT TMUX="$stray/tmux/sock,1,0")"
+[ -z "$got" ] || fail 'e2e marker that is a symlink: not a stack, posted' '' "$got"
+if [ "$(id -u)" = 0 ]; then
+  rm "$stray/.termag-e2e"
+  : > "$stray/.termag-e2e"
+  chown 65534 "$stray/.termag-e2e"
+  got="$(e2e_post env -u TERMAG_E2E_ROOT TMUX="$stray/tmux/sock,1,0")"
+  [ -z "$got" ] || fail "another user's e2e marker: not a stack, posted" '' "$got"
+else
+  echo "skip: another user's e2e marker (needs root to make a file the test user doesn't own)"
+fi
+
+# ── t3-guard: a desktop thread's prompt on a session termag web drives ─────
+SID=11111111-2222-4333-8444-555555555555
+GUARD_CHATS="$WORK/guard-chats"
+mkdir -p "$GUARD_CHATS"
+printf '{"sessionId":"%s","cwd":"/w/p1"}' "$SID" > "$GUARD_CHATS/p1--w1.json"
+printf '{"sessionId":"22222222-2222-4333-8444-555555555555","t3":{"threadId":"t1","at":1}}' > "$GUARD_CHATS/p2--w2.json"
+# A queue file names a session too, but is no chat's state.
+printf '{"sessionId":"33333333-2222-4333-8444-555555555555"}' > "$GUARD_CHATS/p3--w3.queue.json"
+guard() {  # guard <session_id> [env...]: the exit code, then stderr
+  sid=$1; shift
+  err=$(printf '{"session_id":"%s","prompt":"hi"}' "$sid" | env -u TMUX -u TERMAG_T3 TERMAG_CHATS_DIR="$GUARD_CHATS" "$@" "$SCRIPT" t3-guard 2>&1 >/dev/null)
+  echo "$? $err"
+}
+got=$(guard "$SID" TERMAG_T3=1)
+case $got in "2 termag web has this session"*) ;; *) fail 't3-guard: a thread on a session termag web drives is refused' '2 termag web has this session…' "$got" ;; esac
+got=$(guard 22222222-2222-4333-8444-555555555555 TERMAG_T3=1)
+[ "$got" = '0 ' ] || fail 't3-guard: the session the thread holds goes through' '0 ' "$got"
+got=$(guard 44444444-2222-4333-8444-555555555555 TERMAG_T3=1)
+[ "$got" = '0 ' ] || fail 't3-guard: a session no chat names (a desktop-only thread, a fork) goes through' '0 ' "$got"
+got=$(guard 33333333-2222-4333-8444-555555555555 TERMAG_T3=1)
+[ "$got" = '0 ' ] || fail 't3-guard: only a chat state file counts' '0 ' "$got"
+got=$(guard "$SID")
+[ "$got" = '0 ' ] || fail 't3-guard: outside the t3 server, a prompt is never refused' '0 ' "$got"
+got=$(guard 'x;rm' TERMAG_T3=1)
+[ "$got" = '0 ' ] || fail 't3-guard: a session id it cannot read goes through' '0 ' "$got"
+
+# The installed hook line: the guard's 2 refuses the prompt, nothing else does.
+HOOK_CMD=$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$(dirname "$SCRIPT")/claude-settings.json")
+hook_home() {  # hook_home <guard exit or "none">: a HOME whose termag-status stub exits so for t3-guard
+  h="$WORK/hook-home-$1"
+  mkdir -p "$h/.local/bin"
+  if [ "$1" != none ]; then
+    printf '#!/bin/sh\ncat >/dev/null\n[ "$1" = t3-guard ] && exit %s\nexit 0\n' "$1" > "$h/.local/bin/termag-status"
+    chmod +x "$h/.local/bin/termag-status"
+  fi
+  echo "$h"
+}
+for want in '2:2' '0:0' '1:0' 'none:0'; do
+  stub=${want%%:*} code=${want##*:}
+  printf '{"session_id":"%s"}' "$SID" | HOME="$(hook_home "$stub")" TERMAG_SPACE_MEMORY_MANAGED=1 sh -c "$HOOK_CMD" >/dev/null 2>&1
+  got=$?
+  [ "$got" = "$code" ] || fail "UserPromptSubmit hook line with a guard that exits $stub" "$code" "$got"
+done
 
 if [ "$failures" -eq 0 ]; then
   echo "PASS: endpoint resolution + auth handling + payloads + milestone classification"

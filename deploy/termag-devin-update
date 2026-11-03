@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# termag-devin-update — update the Devin CLI (Devin for Terminal) on a box
+# when the orchestrator asks, and stop and resume its sessions as the run's
+# policy says.
+#
+# Why this exists: the Devin CLI runs code with its owner's credentials. The
+# image bakes it with Devin's installer (packer/scripts/setup.sh: `curl
+# https://cli.devin.ai/install.sh | bash`), and what moves it afterwards is
+# its own updater (`devin update`), when someone runs it: the fleet sat a few
+# patch releases apart (3000.11.92 to 3000.11.234) on 2026-10-30. This is the
+# box's updater, on deploy/termag-tool-update-lib, in the Cursor agent's shape
+# (a versioned directory and links, not an npm package).
+#
+# The install, as Devin's installer lays it out:
+#   ~/.local/share/devin/cli/_versions/<version>/   the bundle (bin/devin, share/,
+#                                                   distribution)
+#   ~/.local/share/devin/cli/_versions/current      a link to <version>
+#   ~/.local/bin/devin                              a link to _versions/current/bin/devin
+# Each release publishes a manifest, https://static.devin.ai/cli/<version>/manifest.json
+# (current/manifest.json for the latest), naming each platform's bundle and
+# its SHA-256, which the installer checks and so does this. `devin update` is
+# never used: it lets the binary's own channel choose the bytes.
+#
+# One caller: termag-devin-update@<run>.service, started by the agent's
+# tool-update RPC (agent/tool-update.js) when an admin updates the Devin CLI
+# from the Software tab: --run <run-id>.
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=devin&run=<id> with
+#      the agent token on curl's stdin. Only a 200 that names this run installs
+#      anything; no policy, or a 200 with run null, installs nothing and
+#      restarts nothing.
+#   2. Takes ~/.termag/devin-update.lock (flock).
+#   3. Resolves the target to one version: an exact one from the policy, or
+#      latest, current/manifest.json's (fetched once). Never below the floor
+#      or what is installed.
+#   4. Where the installed version is below it: reads that version's manifest
+#      (its version must be the one asked for, its bundle URL under
+#      static.devin.ai/cli/<version>/), downloads the bundle, and checks its
+#      SHA-256 against the manifest's and its own `devin --version` (exactly
+#      that version) before anything points at it: a bundle that fails either
+#      never goes live (nothing changed, the run fails). Then moves it to
+#      _versions/<version>, repoints `current` (one rename) and
+#      ~/.local/bin/devin when it is missing, and checks the devin a session
+#      would start says exactly that version. One that does not is REJECTED:
+#      recorded in ~/.termag/devin-update.rejected until a later run installs
+#      and verifies it (every run exits 3 meanwhile), `current` goes back to
+#      the version that was there and verified, or, failing that, the new
+#      version is quarantined (its bin/devin renamed to devin.rejected, not
+#      executable) and the links removed. Older versions stay: a running
+#      session may be using one.
+#   5. Stops the Devin sessions still on an old version, as restart says:
+#        * the devin in each tmux pane that the pane's shell started (its
+#          process is the version's own bin/devin): restart=idle stops each
+#          one once it is out of a turn (its pane's last lines show none of
+#          the activity lines termag's own status poller reads for Devin, and
+#          its session was not active in the last 10 s), at most drainSec,
+#          then cuts it; restart=force stops them all at once. SIGTERM, then
+#          SIGKILL after TERMAG_DEVIN_KILL_AFTER (20 s);
+#        * anything else (a -p turn, a subcommand such as acp, mcp or list, a
+#          --cloud REPL, a devin another agent's tool call runs, sessions
+#          outside tmux) is counted as other and left alone.
+#      The pane's session is the newest one in the CLI's session store
+#      (~/.local/share/devin/cli/sessions.db, read-only) for its working
+#      directory, active since the process started. Then, per stopped pane:
+#      an agent pane (<...>-agent) is listed for the orchestrator, which
+#      relaunches it with `devin --resume <id>` when it had a session, else
+#      fresh; any other pane with a session gets `devin --resume <id>` typed;
+#      one without is left at its shell. Other agents' panes are never touched.
+#   6. POST <orchestrator>/api/tool-update/report: {component: "devin", ...}.
+#
+# What is still trusted: static.devin.ai, its manifests and its bundles, as
+# for the image bake and as Devin's own updater trusts them. The manifest's
+# SHA-256 ties the bundle to the manifest, not to a key; `devin --version` is
+# not provenance.
+#
+# Usage:
+#   termag-devin-update --run <run-id>    one orchestrator run: the policy, the
+#                                         install, the sessions, the report
+#
+# Exit codes: 0 when the devin a session would start is at or above the floor
+# (or nothing was asked of it), 1 when it is below it or there is none, 2 on
+# bad usage, 3 while an install is rejected, 143 when a signal stops it.
+#
+# Env:
+#   DEVIN_BIN                     the devin to judge (default: the one on PATH)
+#   TERMAG_STATE_DIR              where the lock lives (default $HOME/.termag)
+#   TERMAG_DEVIN_BUDGET           seconds the install may take, before its
+#                                 sessions (default 600)
+#   TERMAG_DEVIN_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_DEVIN_INSTALL_TIMEOUT  seconds for the download (default 300)
+#   TERMAG_AGENT_CONFIG           the agent config with the orchestrator URL
+#                                 and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT         seconds for each orchestrator call (default 20)
+#   TERMAG_DEVIN_KILL_AFTER       seconds from a session's SIGTERM to its
+#                                 SIGKILL (default 20)
+#   TERMAG_DEVIN_RESUME_WAIT      seconds after typing a resume before it is
+#                                 checked (default 10)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+PKG=devin
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_DEVIN_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_DEVIN_INSTALL_TIMEOUT:-300}"
+DEVIN_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/devin/cli"
+VERSIONS=$DEVIN_DATA/_versions
+CURRENT=$VERSIONS/current
+BINLINK=$HOME/.local/bin/devin
+RELEASES=https://static.devin.ai/cli
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-devin-update TU_COMPONENT=devin TU_BIN=devin TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/devin-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+REJECTED=$STATE_DIR/devin-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-devin-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-devin-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  # The run id names the systemd instance and goes into a URL and a report.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_DEVIN_BUDGET:-600}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+KILL_AFTER="${TERMAG_DEVIN_KILL_AFTER:-20}"
+# The Devin CLI has no runners to drain.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+RUNNER_WAIT=0
+RESUME_WAIT="${TERMAG_DEVIN_RESUME_WAIT:-10}"
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT" "$KILL_AFTER" "$RESUME_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+# The devin a pane or a login shell would start.
+resolve() {
+  hash -r
+  if [ -n "${DEVIN_BIN:-}" ]; then printf '%s' "$DEVIN_BIN"
+  else command -v devin 2>/dev/null || true
+  fi
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); the Devin CLI has no fallback floor"
+# A 200 that names no run: not this run's to install, and not its floor either.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+# latest is current/manifest.json's version.
+tu_can_resolve() { command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; }
+tu_resolve_tag() {
+  [ "$1" = latest ] || return 0
+  timeout -k 2 "$2" curl -fsSL "$RELEASES/current/manifest.json" </dev/null 2>/dev/null | jq -r '.version // empty' 2>/dev/null | head -n 1
+}
+
+# The rejection record's one install path is `devin`: expired once the version
+# `current` points at is gone.
+expire_stale() {
+  [ -s "$REJECTED" ] || return 0
+  if was_rejected devin && [ ! -x "$(readlink -f "$CURRENT/bin/devin" 2>/dev/null)" ]; then
+    log "the rejected Devin CLI version is gone ($CURRENT points at nothing); expiring its record"
+    accept devin
+  fi
+}
+
+inst_note=-
+tu_notes() { printf 'install=%s' "$inst_note"; }
+tu_notes_all() { printf '%s' "$inst_note"; }
+
+# ── the install: a versioned directory, `current`, and the bin link ─────────
+# point_current VERSION: _versions/current at VERSION (relative, as the
+# installer makes it), in one rename; ~/.local/bin/devin at current's
+# bin/devin when it is missing or already one of these links.
+point_current() {
+  ln -sfn "$1" "$CURRENT.tmp.$$" && mv -Tf "$CURRENT.tmp.$$" "$CURRENT" || { rm -f "$CURRENT.tmp.$$"; return 1; }
+  mkdir -p "$HOME/.local/bin"
+  if [ ! -e "$BINLINK" ] && [ ! -L "$BINLINK" ] || { [ -L "$BINLINK" ] && [ "$(readlink "$BINLINK")" != "$CURRENT/bin/devin" ]; }; then
+    ln -sfn "$CURRENT/bin/devin" "$BINLINK.tmp.$$" && mv -Tf "$BINLINK.tmp.$$" "$BINLINK" || { rm -f "$BINLINK.tmp.$$"; return 1; }
+  fi
+}
+target() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x86_64-unknown-linux ;;
+    arm64|aarch64) printf aarch64-unknown-linux ;;
+    *) return 1 ;;
+  esac
+}
+# put_back: the build moved aside back into $dir, the tree there moved to
+# $dir.rejected-<pid>; all or nothing: when the aside build cannot go back,
+# the moved tree returns, so $dir, which the links name, is never left empty
+# (Bugbot on #1080, the same code as the Cursor agent's).
+put_back() {
+  mv -f "$dir" "$dir.rejected-$$" || return 1
+  mv -f "$aside" "$dir" && return 0
+  mv -f "$dir.rejected-$$" "$dir" || log "could not move $dir.rejected-$$ back to $dir"
+  return 1
+}
+# shellcheck disable=SC2154  # spec_v and want: termag-tool-update-lib's tu_spec sets them
+tu_devin_install() {
+  local bin before prev dir tmp tgz man t url sum got after rejected aside='' rc=0 restored=0
+  bin=$(resolve)
+  before=; [ -n "$bin" ] && before=$(ver "$bin")
+  # The version `current` points at, by name: Devin's installer makes it
+  # relative (3000.11.228), its own updater may write it absolute; either names
+  # a directory of _versions, else there is none to compare or go back to
+  # (Bugbot on #1082).
+  # A missing current is none: readlink -f still prints _versions/current,
+  # which must never become the version to go back to (Bugbot on #1087).
+  prev=; [ -L "$CURRENT" ] && prev=$(readlink -f "$CURRENT" 2>/dev/null)
+  if [ -n "$prev" ] && [ "$(dirname "$prev")" -ef "$VERSIONS" ] && [ -d "$prev" ] && [ "$(basename "$prev")" != current ]; then prev=$(basename "$prev"); else prev=; fi
+  if at_least "$before" "$want" && ! was_rejected devin; then
+    inst_note=$before; return 0
+  fi
+  if downgrade "$before" && ! was_rejected devin; then
+    inst_note="$before(no-downgrade)"
+    log "devin is $before; $spec_v would move it down; skipped"
+    return 0
+  fi
+  t=$(target) || { inst_note="${before:-none}->FAILED"; log "no Devin CLI bundle for $(uname -m)"; return 0; }
+  # The version's own manifest: its version and this platform's bundle and digest.
+  man=$(run_capped "$(left 30)" curl -fsSL "$RELEASES/$spec_v/manifest.json" </dev/null 2>/dev/null) || man=
+  got=$(printf '%s' "$man" | jq -r '.version // empty' 2>/dev/null)
+  url=$(printf '%s' "$man" | jq -r --arg t "$t" '.platforms[$t].url // empty' 2>/dev/null)
+  sum=$(printf '%s' "$man" | jq -r --arg t "$t" '.platforms[$t].sha256 // empty' 2>/dev/null)
+  case "$url" in "$RELEASES/$spec_v/"*.tar.gz) ;; *) url= ;; esac
+  if [ "$got" != "$spec_v" ] || [ -z "$url" ] || [[ ! "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+    inst_note="${before:-none}->FAILED"
+    log "no usable manifest for $spec_v ($t) at $RELEASES/$spec_v/manifest.json; installing nothing"
+    return 0
+  fi
+  mkdir -p "$VERSIONS/_download" || { inst_note="${before:-none}->FAILED"; return 0; }
+  tgz=$VERSIONS/_download/termag-$spec_v-$$.tar.gz
+  tmp=$VERSIONS/_$spec_v.termag-$$.tmp
+  # Removed by the lib's on_signal if a signal stops the run mid-download.
+  # shellcheck disable=SC2034  # read by termag-tool-update-lib's on_signal
+  TU_TMP=("$tgz" "$tmp")
+  log "devin is ${before:-not installed}; downloading $spec_v ($t, at most $(left "$INSTALL_TIMEOUT")s)"
+  run_capped "$(left "$INSTALL_TIMEOUT")" curl -fsSL -o "$tgz" "$url" </dev/null || rc=$?
+  if [ "$rc" != 0 ]; then
+    rm -f "$tgz"; inst_note="${before:-none}->FAILED"
+    log "the download of $spec_v did not complete"
+    return 0
+  fi
+  if [ "$(sha256sum "$tgz" 2>/dev/null | cut -d' ' -f1)" != "$sum" ]; then
+    rm -f "$tgz"; inst_note="${before:-none}->pin-mismatch(not-installed)"
+    log "the bundle for $spec_v does not match its manifest's SHA-256; not installed, nothing changed"
+    return 0
+  fi
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  tar -xzf "$tgz" -C "$tmp" 2>/dev/null || rc=$?
+  rm -f "$tgz"
+  got=$( [ "$rc" = 0 ] && ver "$tmp/bin/devin")
+  if [ "$got" != "$spec_v" ]; then
+    rm -rf "$tmp"
+    inst_note="${before:-none}->pin-mismatch(not-installed)"
+    log "the bundle for $spec_v says ${got:-nothing (does not run)}; not installed, nothing changed"
+    return 0
+  fi
+  # The installer's marker, so Devin's own updater keeps its channel.
+  [ -s "$tmp/distribution" ] || echo curl-bash > "$tmp/distribution"
+  # A directory of that version already there is moved aside, never deleted:
+  # a session may still run from it even when `current` points elsewhere
+  # (Devin's own updater repoints it on its own; Bugbot on #1080, the same
+  # code). The one `current` points at (an install this script rejected, or
+  # one Devin's updater made) is also kept to put back if the new one fails.
+  # Either is kept after, as older versions are.
+  dir=$VERSIONS/$spec_v
+  if [ -e "$dir" ]; then
+    if [ "$prev" = "$spec_v" ]; then
+      # Moved aside, or nothing changes: a failed move would leave the new
+      # tree to land inside the live one (Bugbot on #1080, the same code).
+      aside=$dir.replaced-$$
+      mv -f "$dir" "$aside" || { rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move the current $spec_v aside; nothing changed"; return 0; }
+    else
+      mv -f "$dir" "$dir.unlinked-$$" || { rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move the old $spec_v directory aside; nothing changed"; return 0; }
+      log "kept the $spec_v directory that current did not name as $dir.unlinked-$$ (a session may still run from it)"
+    fi
+  fi
+  if ! mv -f "$tmp" "$dir"; then
+    rm -rf "$tmp"; inst_note="${before:-none}->FAILED"; log "cannot move $spec_v into $VERSIONS"
+    # The current version goes back where current points.
+    [ -z "$aside" ] || mv -f "$aside" "$dir" || log "cannot move $aside back to $dir"
+    return 0
+  fi
+  if ! point_current "$spec_v"; then
+    # Not a mismatch: nothing new was checked live. current goes back to the
+    # version that ran (moved aside: back into its own directory, which
+    # current names), and is never removed (Bugbot on #1080, the same code).
+    inst_note="${before:-none}->FAILED"
+    log "could not point $CURRENT at $spec_v; it stays on the version that ran"
+    if [ -n "$aside" ]; then
+      put_back || log "could not move $aside back to $dir; $dir is the new build, verified in its package"
+    elif [ -n "$prev" ]; then
+      point_current "$prev" || log "could not point $CURRENT back at $prev"
+    fi
+    return 0
+  fi
+  after=$(ver "$(resolve)")
+  if [ "$after" = "$spec_v" ]; then
+    inst_note="${before:-none}->$after"
+    log "devin is now $spec_v, verified (its manifest's SHA-256, its bundle and the devin a session starts)"
+    accept devin
+    return 0
+  fi
+  inst_note="${before:-none}->pin-mismatch"
+  reject devin "asked for $spec_v; $(resolve) --version says ${after:-nothing (does not run)}"
+  # Put the version that ran back, verified; else quarantine the new one.
+  rejected=$dir
+  if [ -n "$before" ] && [ -n "$aside" ] && [ "$(ver "$aside/bin/devin")" = "$before" ] \
+    && put_back && rejected=$dir.rejected-$$ && point_current "$spec_v" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "$before is back in place and current, verified; the rejected download is $rejected"
+    quarantine "$rejected/bin/devin" >/dev/null 2>&1 || true
+  elif [ -n "$before" ] && [ -z "$aside" ] && [ -n "$prev" ] && [ "$(ver "$VERSIONS/$prev/bin/devin")" = "$before" ] \
+    && point_current "$prev" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "$CURRENT is back at $before, verified"
+  fi
+  # Last: the version that ran, where it was moved aside, when it could not
+  # go back into its directory (Bugbot on #1080, the same code).
+  if [ "$restored" = 0 ] && [ -n "$before" ] && [ -n "$aside" ] && [ -d "$aside" ] && [ "$(ver "$aside/bin/devin")" = "$before" ] \
+    && point_current "$(basename "$aside")" && [ "$(ver "$(resolve)")" = "$before" ]; then
+    restored=1 inst_note="$inst_note,restored:$before"
+    log "current names $before where it was moved aside ($aside), verified"
+  fi
+  if [ "$restored" = 0 ]; then
+    # Only the rejected version goes, and current only when it points into
+    # it: a version put back, or one current never left, stays (Bugbot on #1087).
+    case "$(readlink -f "$CURRENT" 2>/dev/null)" in
+      "$rejected"|"$rejected"/*) rm -f "$CURRENT"; [ -L "$BINLINK" ] && rm -f "$BINLINK" ;;
+    esac
+    if quarantine "$rejected/bin/devin"; then inst_note="$inst_note,quarantined"; else log "could not quarantine $rejected/bin/devin"; fi
+  fi
+}
+
+# ── sessions, after a run's install ─────────────────────────────────────────
+# A Devin session is its version's own bin/devin, old when that is not the
+# current version's.
+is_devin() {
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in
+    */devin/cli/_versions/*/bin/devin|*/devin/cli/_versions/*/bin/devin\ \(deleted\)) return 0 ;;
+  esac
+  return 1
+}
+under_devin() {
+  local p; p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do is_devin "$p" && return 0; p=$(ppid_of "$p"); done
+  return 1
+}
+argv_of() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
+# Whether it is the pane's own: the pane shell's child.
+pane_owned() { [ -n "$2" ] && [ "$(ppid_of "$1")" = "$2" ]; }
+# When a process started, in seconds since the epoch: its start in clock ticks
+# after boot (/proc/<pid>/stat, field 22) plus the boot time.
+started_at() {
+  local ticks btime hz
+  ticks=$(sed -E 's/^.*\) [A-Za-z] //' "/proc/$1/stat" 2>/dev/null | awk '{print $19}')
+  btime=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  [ -n "$ticks" ] && [ -n "$btime" ] && printf '%s' $(( btime + ticks / hz ))
+}
+# session_of PID: "<id> <last activity, s> <resume|cwd>" of the process's session in the
+# CLI's store: the one it resumed by id (-r/--resume <id>), else, for
+# -c/--continue, the newest visible one for its working directory, else that
+# newest one only when active since it started; nothing when there is none
+# (or no python3 to read the store with). A resumed session idle since its
+# launch was last active before the process started (Bugbot on #1087).
+session_of() {
+  local cwd since db rid='' cont=0 prev='' a
+  db=$DEVIN_DATA/sessions.db
+  [ -f "$db" ] && command -v python3 >/dev/null 2>&1 || return 0
+  cwd=$(readlink "/proc/$1/cwd" 2>/dev/null); [ -n "$cwd" ] || return 0
+  since=$(started_at "$1"); [ -n "$since" ] || return 0
+  while IFS= read -r a; do
+    case "$prev" in -r|--resume) [[ "$a" =~ ^[A-Za-z0-9][A-Za-z0-9-]{7,63}$ ]] && rid=$a ;; esac
+    case "$a" in
+      --resume=*) [[ "${a#--resume=}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{7,63}$ ]] && rid=${a#--resume=} ;;
+      -c|--continue) cont=1 ;;
+    esac
+    prev=$a
+  done < <(argv_of "$1" | tail -n +2)
+  python3 -I - "$db" "$cwd" "$since" "$rid" "$cont" 2>/dev/null <<'PY'
+import sqlite3, sys
+db, cwd, since, rid, cont = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5] == '1'
+c = sqlite3.connect('file:' + db + '?mode=ro', uri=True, timeout=2)
+if rid:
+    row = c.execute("SELECT id, last_activity_at FROM sessions WHERE id = ?", (rid,)).fetchone()
+else:
+    row = c.execute("SELECT id, last_activity_at FROM sessions WHERE working_directory = ? AND hidden = 0 ORDER BY last_activity_at DESC LIMIT 1", (cwd,)).fetchone()
+if row:
+    t = int(row[1]); t = t // 1000 if t > 10**11 else t
+    if rid or cont or t >= since: print(row[0], t, 'resume' if rid else 'cwd')
+PY
+}
+
+p_sid=()
+find_sessions() {
+  local c cur='' pid pane sock name sub s id
+  c=$(resolve); [ -n "$c" ] && cur=$(readlink -f "$c" 2>/dev/null)
+  for pid in $(pgrep -u "$(id -u)"); do
+    is_devin "$pid" || continue
+    under_devin "$pid" && continue
+    # Every Devin's directory, old or current, for tu_unshare.
+    peers+=("$(readlink "/proc/$pid/cwd" 2>/dev/null)")
+    [ -n "$cur" ] && [ "/proc/$pid/exe" -ef "$cur" ] && continue
+    # A -p turn, a cloud REPL, or a subcommand that is not the TUI, is other.
+    if argv_of "$pid" | tail -n +2 | grep -qxE -- '-p|--print|--cloud'; then other=$((other + 1)); continue; fi
+    sub=$(argv_of "$pid" | tail -n +2 | grep -v '^-' | head -n 1)
+    case "$sub" in
+      auth|mcp|models|doctor|rules|skills|plugins|cloud|desktop|list|ls|rm|ssh|forward|update|version|migrate|sandbox|setup|uninstall|acp|help)
+        other=$((other + 1)); continue ;;
+    esac
+    pane=$(env_of "$pid" TMUX_PANE)
+    sock=; [ -n "$pane" ] && sock=$(socket_of "$pid")
+    name=; [ -n "$sock" ] && name=$(tmux -S "$sock" display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    if [ -z "$name" ]; then other=$((other + 1)); continue; fi
+    pane_owned "$pid" "$(tmux -S "$sock" display -p -t "$pane" '#{pane_pid}' 2>/dev/null)" || { other=$((other + 1)); continue; }
+    s=$(session_of "$pid"); id=${s%% *}
+    [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9-]{7,63}$ ]] || { id=; s=; }
+    p_pid+=("$pid"); p_sock+=("$sock"); p_pane+=("$pane"); p_sess+=("$name")
+    p_sid+=("$id"); p_id+=("$id")
+    case "$s" in *' resume') p_guess+=('') ;; *) p_guess+=("$(readlink "/proc/$pid/cwd" 2>/dev/null)") ;; esac
+  done
+  # An id read from the working directory (no --resume) is a guess: two Devin
+  # TUIs in one directory both read its newest session. A guess whose
+  # directory another Devin shares, old or current, is no pane's, so no
+  # conversation is resumed in a pane it isn't from (Bugbot and Devin on
+  # #1087); an id named by --resume stays its pane's.
+  tu_unshare
+  local i
+  # shellcheck disable=SC2154  # set by termag-tool-update-lib's tu_unshare
+  for i in "${!p_shared[@]}"; do p_sid[$i]=''; done
+}
+
+# termag-tool-update-lib's stop_sessions asks these of pane I, with the
+# patterns termag's own status poller reads for Devin
+# (backend/src/providers/registry.ts, pollerConfig), on lines trimmed as the
+# poller trims them. In a turn: its session was active in the last 10 s
+# (re-read now); or the prompt reads "Guide Devin while it works" (the
+# CLI's own placeholder during a turn, under its ❭ prompt); or the pane waits
+# for an answer (the select prompt: a turn waiting on its user is still in
+# it). Out of one: the ❭ prompt among the last three lines, without that
+# placeholder. Otherwise, a tool line (⏺ Read, ⏺ Ran, ...) or a composing
+# line (I'll, Let me, ...) anywhere on the screen is a turn (Bugbot on #1082).
+tu_status() {
+  local text s last
+  if [ -n "${p_sid[$1]}" ]; then
+    s=$(session_of "${p_pid[$1]}"); last=$(printf '%s' "$s" | cut -d ' ' -f 2)
+    if [ -n "$s" ] && [ $(( $(date +%s) - last )) -lt 10 ]; then printf busy; return; fi
+  fi
+  text=$(tmux -S "${p_sock[$1]}" capture-pane -p -t "${p_pane[$1]}" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$')
+  if printf '%s\n' "$text" | grep -qF 'Guide Devin while it works'; then printf busy; return; fi
+  if printf '%s\n' "$text" | grep -qE '↑↓[[:space:]]+select[[:space:]]*·[[:space:]]*↵[[:space:]]+confirm'; then printf busy; return; fi
+  if printf '%s\n' "$text" | tail -n 3 | grep -qE '^❭([[:space:]]|$)'; then printf idle; return; fi
+  if printf '%s\n' "$text" | grep -qE "^⏺[[:space:]]+(Read|Searched|Ran|Running|Invoked|Found|Writing|Editing|Reading|Globbing|Grepping|Bash)\b|^(I'll|Let me|I'm going to|Based on)\b"; then
+    printf busy
+  else
+    printf idle
+  fi
+}
+tu_had() { [ -n "$2" ] && [ -n "${p_sid[$1]}" ]; }
+tu_resume_line() { printf 'devin --resume %s' "$1"; }
+
+trap on_signal TERM INT HUP
+
+tu_lock
+expire_stale
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+tu_devin_install
+
+finish

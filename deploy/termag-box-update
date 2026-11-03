@@ -569,11 +569,12 @@ agent_started() {
 }
 
 # Prints the first thing the agent runs that is newer than $1 (epoch seconds):
-# the unit file systemd loaded, the agent/node_modules directory, or a tracked
-# file under agent/ other than its tests. Tracked files otherwise, so an
-# agent.config.json does not count; a pull touches only the files it changes,
-# so a bundle clone's files from the bake stay older than the agent that
-# started after it. node_modules is read as one directory: step 3 swaps it in
+# the unit file systemd loaded or one of its drop-ins (termag-t3-install writes
+# one naming the t3 server, which the agent reads at start), the
+# agent/node_modules directory, or a tracked file under agent/ other than its
+# tests. Tracked files otherwise, so an agent.config.json does not count; a
+# pull touches only the files it changes, so a bundle clone's files from the
+# bake stay older than the agent that started after it. node_modules is read as one directory: step 3 swaps it in
 # whole (the directory keeps the mtime of its install) and an `npm install`
 # by hand writes into it, and either way the process has the old modules
 # loaded until it restarts.
@@ -584,6 +585,18 @@ agent_changed_since() {
     printf '%s' "$f"
     return 0
   fi
+  local dropins=()
+  read -r -a dropins <<< "$(systemctl --user show -p DropInPaths --value "$UNIT" 2>/dev/null)"
+  for f in "${dropins[@]}"; do
+    # Only the unit's own directory: a package's drop-in for every user
+    # service (Ubuntu's service.d/10-timeout-abort.conf) changes with an apt
+    # upgrade, which is no reason to restart the agent.
+    case $f in */"$UNIT".d/*) ;; *) continue ;; esac
+    if m=$(stat -c %Y "$f" 2>/dev/null) && [ "$m" -gt "$since" ]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done
   if m=$(stat -c %Y "$CHECKOUT/agent/node_modules" 2>/dev/null) && [ "$m" -gt "$since" ]; then
     printf 'agent/node_modules'
     return 0

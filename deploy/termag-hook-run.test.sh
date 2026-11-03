@@ -422,6 +422,11 @@ case "$1" in
         ;;
     esac
     ;;
+  config)
+    # The identity box-claim set; only the rerun test has one.
+    [ -n "${WORK_GIT_IDENTITY:-}" ] || exit 1
+    case "$*" in *user.name*) echo 'Ada Lovelace' ;; *user.email*) echo 'ada@example.com' ;; esac
+    ;;
 esac
 STUBEOF
 chmod 755 "$STUB/git"
@@ -570,6 +575,63 @@ case "$(cat "$WORK_GIT_LOG")" in
   *'cfg=unset'*) : ;;
   *) fail 'owner-git clone keeps the owner gitconfig' 'cfg=unset' "$(cat "$WORK_GIT_LOG")" ;;
 esac
+
+# A rerun has no env file (the unit removes it), so the entrypoint gets the
+# owner identity box-claim put in the global git config instead.
+reset_claim
+rm -f "$HOME_DIR/.termag/on-claim.env"
+printf 'https://github.com/ada/dotfiles\n' > "$HOME_DIR/.termag/dotfiles-repo-url"
+cat > "$DOTFILES_SOURCE/install.sh" <<ENTRYEOF
+#!/bin/sh
+printf '%s %s\n' "\${TERMAG_OWNER_NAME:-unset}" "\${TERMAG_OWNER_EMAIL:-unset}" > "$WORK/claim-env"
+ENTRYEOF
+WORK_GIT_IDENTITY=1 run claim > /dev/null 2>&1; got=$?
+[ "$got" = 0 ] || fail 'a rerun without the env file succeeds' 0 "$got"
+got="$(cat "$WORK/claim-env" 2>/dev/null)"
+[ "$got" = 'Ada Lovelace ada@example.com' ] || fail 'a rerun takes the owner identity from git config' 'Ada Lovelace ada@example.com' "$got"
+
+# ── two claim runs never overlap ─────────────────────────────────────────────
+# The owner runs the hook directly while the agent may start the unit for
+# the same reason; without a lock each would remove the other's half-made
+# ~/.dotfiles as an unfinished clone. The second run waits for the first.
+if command -v flock >/dev/null 2>&1; then
+  CLAIM_LOCK="$HOME_DIR/.termag/on-claim.lock"
+  CLAIM_LOG="$HOME_DIR/.termag/on-claim.log"
+  # Holds the lock until $1 exists.
+  hold_lock() { ( exec 9>"$CLAIM_LOCK"; flock 9; until [ -e "$1" ]; do sleep 0.1; done ) & }
+  lock_is_held() { ! ( flock -n 9 ) 9>"$CLAIM_LOCK"; }
+
+  reset_claim
+  printf 'true\n' > "$DOTFILES_SOURCE/install.sh"
+  RELEASE="$WORK/release-lock"; rm -f "$RELEASE"
+  hold_lock "$RELEASE"; holder=$!
+  until lock_is_held; do sleep 0.1; done
+  run claim > /dev/null 2>&1 &
+  runner=$!
+  i=0
+  until grep -q 'holds the lock' "$CLAIM_LOG" 2>/dev/null || [ $i -ge 100 ]; do sleep 0.1; i=$((i + 1)); done
+  grep -q 'holds the lock' "$CLAIM_LOG" 2>/dev/null || fail 'a second claim run says it is waiting for the lock' 'holds the lock' "$(cat "$CLAIM_LOG" 2>/dev/null)"
+  [ -e "$HOME_DIR/.dotfiles" ] && fail 'a waiting claim run touches nothing' '(no checkout yet)' 'cloned while the lock was held'
+  : > "$RELEASE"
+  wait "$runner"; got=$?
+  wait "$holder"
+  [ "$got" = 0 ] || fail 'the waiting claim run goes on once the lock is released' 0 "$got"
+  got="$(jpy "$CLAIM_STATUS" 'd["state"]')"
+  [ "$got" = succeeded ] || fail 'the waiting claim run then applies the dotfiles' succeeded "$got"
+
+  # A lock held past the wait is a failed run with its own reason, not a hang.
+  reset_claim
+  RELEASE="$WORK/release-lock-2"; rm -f "$RELEASE"
+  hold_lock "$RELEASE"; holder=$!
+  until lock_is_held; do sleep 0.1; done
+  TERMAG_CLAIM_LOCK_WAIT=1 run claim > /dev/null 2>&1; got=$?
+  : > "$RELEASE"
+  wait "$holder"
+  [ "$got" = 1 ] || fail 'a claim run that never gets the lock exits 1' 1 "$got"
+  got="$(jpy "$CLAIM_STATUS" 'str(d.get("state")) + ":" + str(d.get("reason"))')"
+  [ "$got" = 'failed:lock-timeout' ] || fail 'a claim run that never gets the lock reports lock-timeout' 'failed:lock-timeout' "$got"
+  [ -e "$HOME_DIR/.dotfiles" ] && fail 'a claim run that never gets the lock clones nothing' '(no checkout)' 'cloned anyway'
+fi
 
 # ── a chezmoi source tree is applied with chezmoi ───────────────────────────
 # Its targets are `dot_*`, not dotfiles, so the symlink fallback would link

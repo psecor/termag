@@ -1,0 +1,592 @@
+#!/usr/bin/env bash
+# termag-node-update — update the box user's Node (nvm's default) within its
+# major line, when the orchestrator asks.
+#
+# Why this exists: Node's patch releases are mostly security releases (the
+# floor's sources are in backend/src/services/nodeUpdatePolicy.ts), and the
+# image pins one (`nvm install 24.22.1; nvm alias default 24.22.1`,
+# packer/scripts/setup.sh) that nothing moves afterwards.
+#
+# It is the most coupled tool. A new Node version has its own npm global root,
+# so every npm global the box has (Claude Code, Codex, pi, and anything else)
+# is copied into it, as it is on disk, and verified. The agent (agent/run-node.sh: nvm's
+# default) and every node process run on it. So a run changes nothing that is
+# used until all of it verifies, and puts the old Node back if what follows
+# fails:
+#
+#   1. GET <orchestrator>/api/tool-update/policy?component=node&run=<id> with
+#      the agent token on curl's stdin. Only a 200 that names this run installs
+#      anything.
+#   2. Takes ~/.termag/node-update.lock, and the Claude Code, Codex and pi
+#      updaters' locks: none of them may write the npm global while it is
+#      copied.
+#   3. Resolves the target to one exact version within the installed major
+#      (latest: the newest release of that major in nodejs.org/dist/index.json).
+#      A new major is the image's: native modules under the agent and the npm
+#      globals change ABI with it.
+#   4. Downloads node-v<x.y.z>-linux-<arch>.tar.xz, SHASUMS256.txt and its
+#      .sig from nodejs.org (https only); verifies the signature with Node's
+#      active release keys (deploy/termag-node-release-keys.asc, from
+#      nodejs/release-keys, each primary key pinned here by fingerprint), then
+#      the tarball's SHA-256 against that file. Nothing is unpacked before.
+#   5. Unpacks it into a hidden staging directory,
+#      ~/.nvm/versions/node/.termag-v<x.y.z>-<pid>: no `v*` or `*` glob reads a
+#      name that starts with a dot, and termag-subagent-run and the chat runner
+#      take the newest versions/node/*/bin/claude. Its node must say the
+#      version.
+#   6. Copies every npm global of the current default (but npm and corepack,
+#      which come with Node) into the staging root, its tree as it is on disk
+#      and its bin links (no registry, no install script: the same major
+#      keeps the native-module ABI), and verifies each: its package.json, and
+#      the tool's own --version for Claude Code, Codex and pi.
+#   7. Only then renames the staging directory to versions/node/v<x.y.z> (one
+#      rename), checks the tools again from there, and sets nvm's default
+#      to it.
+#   8. Restarts the agent on the new Node, under termag-box-update's guards: the
+#      loaded unit runs agent/run-node.sh with KillMode=process (else the
+#      restart would take the tmux server and every pane), and no Claude Code
+#      cloud session is live. It checks that the agent runs the new Node; if
+#      it does not, the default goes back to the old version and the agent is
+#      restarted on it.
+#   9. POST <orchestrator>/api/tool-update/report: {component: "node", ...}.
+#
+# On any failure before the switch the staging directory is removed and nothing
+# else changed; after it, the old default is put back. The old Node is never
+# removed, so a session on it keeps running.
+#
+# Sessions: none are stopped in this version.
+# Running panes, the MCP servers under them and the agent's
+# children keep the old Node, which stays installed; whatever starts after the
+# switch gets the new one. The report counts the pane processes still on it.
+#
+# What is still trusted: Node's release keys, pinned as above, as the image's
+# `nvm install` trusts nodejs.org; the npm registry for the globals' exact
+# versions, as their own updaters do.
+#
+# Usage:
+#   termag-node-update --run <run-id>
+#
+# Exit codes: 0 when node is at or above the floor (or nothing was asked of it),
+# 1 when it is below it or missing, 2 on bad usage, 3 while a switch is
+# rejected, 143 when a signal stops it.
+#
+# Env:
+#   NVM_DIR                       nvm's directory (default $HOME/.nvm)
+#   TERMAG_STATE_DIR              where the locks live (default $HOME/.termag)
+#   TERMAG_NODE_BUDGET            seconds the run may take (default 1200)
+#   TERMAG_NODE_LOCK_WAIT         at most this many seconds to wait for a lock
+#   TERMAG_NODE_INSTALL_TIMEOUT   seconds for each download and npm install
+#                                 (default 300)
+#   TERMAG_NODE_DIST_URL          where the releases are (default
+#                                 https://nodejs.org/dist)
+#   TERMAG_NODE_KEYS              the release keys (default
+#                                 ~/.local/share/termag/termag-node-release-keys.asc)
+#   TERMAG_NODE_AGENT_WAIT        seconds to wait for the agent on the new Node
+#                                 (default 120)
+#   TERMAG_AGENT_UNIT             the agent's unit (default termag-agent.service)
+#   TERMAG_AGENT_CONFIG           the agent config with the orchestrator URL
+#                                 and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT         seconds for each orchestrator call (default 20)
+#   TERMAG_NODE_PINNED            the release key fingerprints (tests only)
+
+set -u
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+export LC_ALL=C
+
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_NODE_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_NODE_INSTALL_TIMEOUT:-300}"
+DIST_URL="${TERMAG_NODE_DIST_URL:-https://nodejs.org/dist}"
+KEYS="${TERMAG_NODE_KEYS:-$HOME/.local/share/termag/termag-node-release-keys.asc}"
+AGENT_UNIT="${TERMAG_AGENT_UNIT:-termag-agent.service}"
+AGENT_WAIT="${TERMAG_NODE_AGENT_WAIT:-120}"
+# The agent's own launcher: what it would start the agent on is what counts.
+RUN_NODE="${TERMAG_NODE_RUN_NODE:-$HOME/src/termag/agent/run-node.sh}"
+# Node's active release keys (github.com/nodejs/release-keys,
+# gpg-only-active-keys), by primary key fingerprint. The keys file must hold
+# exactly these, and a release's SHASUMS256.txt must be signed by one of them.
+PINNED="${TERMAG_NODE_PINNED:-108F52B48DB57BB0CC439B2997B01419BD92F80A 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD 890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4 A363A499291CBBC940DD62E41F10027AF002F8B0 C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C CC68F5A3106FF448322E48ED27F5E38D5B0A215F DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7}"
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-node-update TU_COMPONENT=node TU_BIN=node TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/node-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+REJECTED=$STATE_DIR/node-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-node-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-node-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_NODE_BUDGET:-1200}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+# No sessions are stopped (see the header).
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT" "$AGENT_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+VERS=$NVM_DIR/versions/node
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1 </dev/null
+# nvm's default, as x.y.z (it may be an alias such as lts/* or 24 in the file).
+nvm_default() { local v; v=$(nvm version default 2>/dev/null </dev/null) || return 1; v=${v#v}; is_version "$v" && printf '%s' "$v"; }
+nvm_set_default() { nvm alias default "$1" >/dev/null 2>&1 </dev/null && [ "$(nvm_default)" = "$1" ]; }
+resolve() { local v; v=$(nvm_default) && [ -x "$VERS/v$v/bin/node" ] && printf '%s' "$VERS/v$v/bin/node"; }
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); Node has no fallback floor"
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+inst_note=- glob_note=- agent_note=- left_on_old=0
+tu_notes() { printf 'node=%s globals=%s agent=%s left_on_old_node=%s' "$inst_note" "$glob_note" "$agent_note" "$left_on_old"; }
+tu_notes_all() { printf '%s %s %s' "$inst_note" "$glob_note" "$agent_note"; }
+# Sessions are left on the old Node (see the header): counted, never stopped.
+find_sessions() { :; }
+tu_status() { printf idle; }
+tu_had() { return 1; }
+tu_resume_line() { :; }
+
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x64 ;;
+    aarch64|arm64) printf arm64 ;;
+    *) return 1 ;;
+  esac
+}
+major() { printf '%s' "${1%%.*}"; }
+
+# tu_resolve_tag latest: the newest release of the installed major, a plain
+# x.y.z one: never an rc or nightly that index.json lists first (Bugbot on #1113).
+tu_can_resolve() { return 0; }
+tu_resolve_tag() {
+  local m
+  [ "$1" = latest ] && [ -n "${have:-}" ] || return 0
+  m=$(major "$have")
+  run_capped "$(left 30)" curl -fsSL --proto '=https' "$DIST_URL/index.json" </dev/null 2>/dev/null \
+    | jq -r --arg re "^v$m\\.[0-9]+\\.[0-9]+$" '[.[] | select(.version | test($re))][0].version // empty' 2>/dev/null | sed 's/^v//'
+}
+
+# ── the release, verified before anything is unpacked ───────────────────────
+WORK='' STAGE=''
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; [ -n "$STAGE" ] && [ -d "$STAGE" ] && rm -rf "$STAGE"; }
+# in_use DIR: a live process runs from DIR (its executable is in it). /proc
+# names an executable by its canonical path, so DIR is resolved first: a link
+# in $HOME or $NVM_DIR must not hide one (Bugbot on #1113).
+in_use() {
+  local e d
+  d=$(readlink -f "$1" 2>/dev/null) || d=$1
+  for e in /proc/[0-9]*/exe; do
+    case "$(readlink "$e" 2>/dev/null)" in "$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+# A keyring of exactly the pinned keys, from the keys file.
+keyring() {
+  local g="$WORK/gnupg" got want
+  mkdir -p "$g" && chmod 0700 "$g"
+  gpg --homedir "$g" --batch --quiet --import "$KEYS" </dev/null >/dev/null 2>&1 || { log "cannot read Node's release keys ($KEYS)"; return 1; }
+  got=$(gpg --homedir "$g" --batch --with-colons --list-keys 2>/dev/null </dev/null | awk -F: '$1 == "pub" { p = 1; next } p && $1 == "fpr" { print $10; p = 0 }' | sort | tr '\n' ' ')
+  want=$(printf '%s\n' $PINNED | sort | tr '\n' ' ')
+  [ "$got" = "$want" ] || { log "$KEYS is not Node's pinned release keys; nothing downloaded is trusted"; return 1; }
+  gpg --homedir "$g" --batch --export </dev/null > "$WORK/keyring.gpg" 2>/dev/null
+}
+# fetch_release X.Y.Z ARCH: the tarball, verified, at $WORK/node.tar.xz.
+fetch_release() {
+  local v=$1 a=$2 file status fpr sum
+  file="node-v$v-linux-$a.tar.xz"
+  for f in SHASUMS256.txt SHASUMS256.txt.sig; do
+    run_capped "$(left 60)" curl -fsSL --proto '=https' -o "$WORK/$f" "$DIST_URL/v$v/$f" </dev/null || { log "could not download Node $v's $f"; return 1; }
+  done
+  status=$(gpgv --status-fd 1 --keyring "$WORK/keyring.gpg" "$WORK/SHASUMS256.txt.sig" "$WORK/SHASUMS256.txt" 2>/dev/null </dev/null) \
+    || { log "Node $v's SHASUMS256.txt: the signature does not verify with Node's release keys"; return 1; }
+  fpr=$(printf '%s\n' "$status" | awk '$2 == "VALIDSIG" { print $NF; exit }')
+  case " $PINNED " in *" $fpr "*) ;; *) log "Node $v's SHASUMS256.txt is signed by ${fpr:-nobody}, not a pinned release key"; return 1 ;; esac
+  sum=$(awk -v f="$file" '$2 == f { print $1; exit }' "$WORK/SHASUMS256.txt")
+  [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || { log "Node $v's SHASUMS256.txt lists no $file"; return 1; }
+  run_capped "$(left "$INSTALL_TIMEOUT")" curl -fsSL --proto '=https' -o "$WORK/node.tar.xz" "$DIST_URL/v$v/$file" </dev/null || { log "could not download $file"; return 1; }
+  [ "$(sha256sum "$WORK/node.tar.xz" | cut -d ' ' -f 1)" = "$sum" ] || { log "$file does not match its signed SHA-256; not unpacked"; return 1; }
+}
+
+# ── the npm globals ─────────────────────────────────────────────────────────
+# Installed with flags other than the defaults, as the image installs them.
+# runtime_sum ROOT: one digest of Node's own runtime under ROOT as the signed
+# tarball laid it out: bin/node, npm's and corepack's files, and where the
+# node, npm, npx and corepack links point. Taken once the tarball is unpacked
+# and verified, and again after the globals are copied into that root and
+# after it is renamed into place: a package's script or bin link that replaced
+# any of it fails the run before anything switches (Security review on #1113).
+runtime_sum() {
+  {
+    sha256sum <"$1/bin/node"
+    for b in node npm npx corepack; do printf '%s -> %s\n' "$b" "$(readlink "$1/bin/$b" 2>/dev/null)"; done
+    (cd "$1/lib/node_modules" && find npm corepack -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
+  } 2>/dev/null | sha256sum | cut -c1-64
+}
+# A tool whose --version must say the package's version, under the given root.
+tool_bin() {
+  case "$1" in
+    @anthropic-ai/claude-code) printf claude ;;
+    @openai/codex) printf codex ;;
+    @earendil-works/pi-coding-agent) printf pi ;;
+  esac
+}
+# The current default's globals, "name version" per line, but npm and corepack.
+# Fails, rather than listing nothing, when npm or jq does, or when the list is
+# not every package the root holds: an empty list would switch Node with no
+# tools under it (Bugbot on #1113).
+globals() {
+  local root=$1 json list p disk=''
+  json=$(run_capped "$(left 60)" env PATH="$root/bin:$PATH" "$root/bin/npm" ls -g --depth=0 --json </dev/null 2>/dev/null) || [ -n "$json" ] || return 1
+  list=$(printf '%s' "$json" | jq -er '.dependencies // {} | to_entries[] | select(.key != "npm" and .key != "corepack") | "\(.key) \(.value.version)"' 2>/dev/null) \
+    || { printf '%s' "$json" | jq -e '.dependencies // {} | del(.npm, .corepack) | length == 0' >/dev/null 2>&1 || return 1; list=; }
+  # The packages on disk, as a cross-check: the same names (scoped ones one
+  # level down), not just as many (Bugbot on #1113).
+  for p in "$root"/lib/node_modules/* "$root"/lib/node_modules/@*/*; do
+    [ -f "$p/package.json" ] || continue
+    case "${p#"$root"/lib/node_modules/}" in npm|corepack) continue ;; esac
+    disk+="${p#"$root"/lib/node_modules/}"$'\n'
+  done
+  if [ "$(printf '%s' "$list" | cut -d ' ' -f 1 | grep . | sort)" != "$(printf '%s' "$disk" | grep . | sort)" ]; then
+    log "npm ls lists ($(printf '%s' "$list" | cut -d ' ' -f 1 | tr '\n' ' ')) under $root, the directory holds ($(printf '%s' "$disk" | tr '\n' ' ')); not the same globals"
+    return 1
+  fi
+  printf '%s' "$list"
+}
+# check_globals ROOT LIST: each package at its version under ROOT, and each
+# tool's --version (run on ROOT's node) saying it.
+check_globals() {
+  local root=$1 list=$2 name v pv b out
+  while read -r name v; do
+    [ -n "$name" ] || continue
+    pv=$(jq -r '.version // empty' "$root/lib/node_modules/$name/package.json" 2>/dev/null)
+    [ "$pv" = "$v" ] || { log "$name under $root is ${pv:-missing}, not $v"; return 1; }
+    b=$(tool_bin "$name")
+    if [ -n "$b" ]; then
+      # The version among what it prints: a banner or a runtime line ahead of
+      # it must not pass for it (Bugbot on #1113), and another one alone fails.
+      out=$(PATH="$root/bin:/usr/bin:/bin" timeout -k 2 "$VER_TIMEOUT" "$root/bin/$b" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      printf '%s\n' "$out" | grep -qxF -- "$v" || { log "$b under $root says $(printf '%s' "${out:-nothing (does not run)}" | tr '\n' ' '), not $v"; return 1; }
+    fi
+  done <<< "$list"
+}
+# copy_globals ROOT LIST OLDROOT: every global's installed tree, the bytes on
+# disk under the Node that runs, copied into ROOT, with the bin links into
+# them (never one named node, npm, npx or corepack). Nothing is fetched from a
+# registry and no install script runs: a global installed from git, a file or
+# another registry stays exactly that, and so does pi, as its updater pinned
+# it. The same major means the same native-module ABI, so a tree built for
+# the old patch runs under the new one (Security review on #1113).
+copy_globals() {
+  local root=$1 list=$2 old=$3 name v l t p
+  while read -r name v; do
+    [ -n "$name" ] || continue
+    # shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+    log "copying $name@$v from Node $have's root to Node $spec_v's"
+    mkdir -p "$(dirname "$root/lib/node_modules/$name")" && cp -a "$old/lib/node_modules/$name" "$root/lib/node_modules/$name" \
+      || { log "could not copy $name@$v into Node $spec_v's root"; return 1; }
+  done <<< "$list"
+  for l in "$old"/bin/*; do
+    [ -L "$l" ] || continue
+    case "${l##*/}" in node|npm|npx|corepack) continue ;; esac
+    t=$(readlink "$l")
+    case "$t" in ../lib/node_modules/@*/*) p=${t#../lib/node_modules/}; p=${p%%/*}/$(printf '%s' "${p#*/}" | cut -d/ -f1) ;;
+                 ../lib/node_modules/*) p=${t#../lib/node_modules/}; p=${p%%/*} ;;
+                 *) continue ;; esac
+    printf '%s\n' "$list" | awk '{ print $1 }' | grep -qxF -- "$p" || continue
+    ln -sfn "$t" "$root/bin/${l##*/}" || { log "could not link $root/bin/${l##*/}"; return 1; }
+  done
+}
+
+# ── the agent ───────────────────────────────────────────────────────────────
+live_runner_sessions() { tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-claude-runner-s[0-9]+-[A-Za-z0-9][A-Za-z0-9_-]*-r$' || true; }
+# Why the agent may not be restarted now, or nothing.
+agent_blocked() {
+  local execstart
+  [ "$(systemctl --user is-active "$AGENT_UNIT" 2>/dev/null)" = active ] || { printf 'inactive'; return; }
+  execstart=$(systemctl --user show -p ExecStart --value "$AGENT_UNIT" 2>/dev/null)
+  case "$execstart" in *agent/run-node.sh*) ;; *) printf 'launcher'; return ;; esac
+  [ "$(systemctl --user show -p KillMode --value "$AGENT_UNIT" 2>/dev/null)" = process ] || { printf 'killmode'; return; }
+  [ -z "$(live_runner_sessions)" ] || { printf 'runner'; return; }
+}
+# Whether the agent's process runs Node V (its exe, or the node run-node.sh
+# exec'd, argv[0]).
+agent_on() {
+  local pid exe a0
+  pid=$(systemctl --user show -p MainPID --value "$AGENT_UNIT" 2>/dev/null)
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+  a0=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -n 1)
+  case "$exe" in "$VERS/v$1/"*) return 0 ;; esac
+  case "$a0" in "$VERS/v$1/"*) return 0 ;; esac
+  return 1
+}
+restart_agent_on() {  # restart_agent_on V: restarted, and on V within AGENT_WAIT
+  local t
+  systemctl --user restart "$AGENT_UNIT" </dev/null >/dev/null 2>&1 || return 1
+  for ((t = 0; t < AGENT_WAIT; t++)); do
+    [ "$(systemctl --user is-active "$AGENT_UNIT" 2>/dev/null)" = active ] && agent_on "$1" && return 0
+    sleep 1
+  done
+  return 1
+}
+# Pane processes still on Node V, for the report.
+count_on() {
+  local p n=0 e
+  for p in $(pgrep -u "$(id -u)" 2>/dev/null); do
+    # (A process whose environ this user cannot read is not its pane's.)
+    [ -n "$(env_of "$p" TMUX_PANE 2>/dev/null)" ] || continue
+    e=$(readlink -f "/proc/$p/exe" 2>/dev/null)
+    case "$e" in "$VERS/v$1/bin/node") n=$((n + 1)) ;; esac
+  done
+  printf '%s' "$n"
+}
+
+# Where the run is, for a signal: after the rename and before the switch the
+# new version is moved aside, and mid-switch the default goes back to the old
+# one first; after the switch and before the agent runs it,
+# the switch is recorded as rejected, so the next run checks it in place and
+# restarts the agent (Bugbot on #1113). Then the lib's report.
+PHASE=''
+node_on_signal() {
+  trap - TERM INT HUP
+  case "$PHASE" in
+    renamed) mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null && log "stopped after the rename; $spec_v moved aside" ;;
+    # nvm may have written the new default already: it goes back first, so it
+    # never names a version moved aside (Bugbot on #1113).
+    switching)
+      nvm_set_default "$have" || log "stopped mid-switch, and nvm did not take $have back"
+      [ "$(nvm_default)" = "$spec_v" ] || { mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null && log "stopped mid-switch; $have is the default again, $spec_v moved aside"; } ;;
+    switched) reject node "stopped before the agent ran Node $spec_v" ;;
+  esac
+  on_signal
+}
+trap node_on_signal TERM INT HUP
+trap cleanup EXIT
+
+tu_lock
+# The npm-global tools' own locks: none of their runs writes the global while
+# it is copied, and none starts on the old root mid-switch.
+# Fds 6 to 8 (the lib holds 9). A run that cannot take them all did not
+# happen: LOCK_HELD=0, so the lib reports it failed, held by another run.
+# Each is waited for as long as the budget allows, less what this run still
+# needs once it holds them (the download, the copy and the agent's restart):
+# those updaters hold their lock through an install and a session drain (up
+# to 600 s), so a fixed minute almost always gave up (Bugbot on #1113).
+# TERMAG_NODE_LOCK_WAIT caps it further.
+fd=6
+for t in claude codex pi; do
+  # shellcheck disable=SC2034  # LOCK_HELD: read by termag-tool-update-lib
+  eval "exec $fd>\"\$STATE_DIR/$t-update.lock\"" 2>/dev/null || { log "cannot open $STATE_DIR/$t-update.lock; installing nothing"; LOCK_HELD=0; finish; }
+  w=$(( DEADLINE - $(date +%s) - INSTALL_TIMEOUT - AGENT_WAIT - 60 ))
+  [ "$w" -gt 0 ] || w=0
+  [ -z "$LOCK_WAIT" ] || [ "$w" -le "$LOCK_WAIT" ] || w=$LOCK_WAIT
+  if ! flock -n "$fd"; then
+    log "termag-$t-update holds its lock; waiting up to ${w}s for it"
+    # shellcheck disable=SC2034  # LOCK_HELD: read by termag-tool-update-lib
+    flock -w "$w" "$fd" || { log "termag-$t-update holds its lock; installing nothing"; LOCK_HELD=0; finish; }
+  fi
+  fd=$((fd + 1))
+done
+WORK=$(mktemp -d "$STATE_DIR/node-update.XXXXXX") || { log "cannot create a work directory"; finish; }
+# What earlier runs left beside the versions: a version they set aside
+# (.termag-rejected-v*) or a staging directory a stopped one left
+# (.termag-v*), each a full Node with its globals. With this run's locks
+# held, one that no live process runs from (no executable inside it) goes
+# (Bugbot on #1113).
+for d in "$VERS"/.termag-rejected-v* "$VERS"/.termag-v*; do
+  [ -d "$d" ] && [ ! -L "$d" ] || continue
+  if in_use "$d"; then log "kept $d: a process still runs from it"; continue; fi
+  rm -rf "$d" && log "removed $d, which an earlier run left and nothing runs from"
+done
+
+have=$(nvm_default) || have=
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then log "installing nothing"; finish; fi
+if [ -z "$have" ] || [ ! -x "$VERS/v$have/bin/node" ]; then
+  inst_note="none->FAILED:no-nvm-default"
+  log "no nvm default Node under $VERS; this updates an nvm Node, it does not install one"
+  finish
+fi
+a=$(arch) || { inst_note="$have->FAILED"; log "no Node build for $(uname -m)"; finish; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+if [ "$(major "$spec_v")" != "$(major "$have")" ]; then
+  inst_note="$have->FAILED:other-major:$spec_v"
+  log "Node $spec_v is another major than $have; a new major is the image's (native modules change ABI)"
+  finish
+fi
+if [ "$have" = "$spec_v" ] && ! was_rejected node; then
+  inst_note=$have left_on_old=0
+  finish
+fi
+if downgrade "$have" && ! was_rejected node; then
+  inst_note="$have(no-downgrade)"
+  log "Node is $have; $spec_v would move it down; skipped"
+  finish
+fi
+# Rejected, and still the default (a switch whose rollback could not put the
+# old one back): checked again where it is, the agent restarted on it, and
+# the record cleared once both hold (Bugbot on #1113).
+if [ "$have" = "$spec_v" ]; then
+  if ! list=$(globals "$VERS/v$have") || ! check_globals "$VERS/v$have" "$list"; then
+    inst_note="$have->FAILED" glob_note=FAILED
+    log "Node $have is the default but its npm globals do not verify under it; still rejected"
+    finish
+  fi
+  # As after a switch: only an agent whose own launcher picks this Node is
+  # restarted for it; one that does not run on nvm has nothing to verify
+  # (Bugbot on #1113).
+  picks=$(bash "$RUN_NODE" --print-node 2>/dev/null </dev/null) || picks=
+  # A launcher that can't say which Node it picks is no reason to restart.
+  why=launcher-unknown; [ -z "$picks" ] || why=$(agent_blocked)
+  if [ -n "$picks" ] && [ "$(readlink -f "$picks")" != "$(readlink -f "$VERS/v$have/bin/node")" ]; then
+    agent_note="unaffected:$picks" inst_note=$have
+    accept node
+    log "Node $have verifies; the agent's launcher picks $picks, not nvm's default, so nothing waits on it; the rejection is cleared"
+  elif [ -n "$why" ]; then
+    agent_note="deferred:$why"
+    log "Node $have verifies; the agent is not restarted ($why), so it stays rejected until it runs on it"
+  elif restart_agent_on "$have"; then
+    agent_note=restarted inst_note=$have
+    accept node
+    log "Node $have verifies, and the agent runs it; the rejection is cleared"
+  else
+    agent_note=FAILED inst_note="$have->pin-mismatch"
+    log "the agent still does not come up on Node $have; see systemctl --user status $AGENT_UNIT"
+  fi
+  finish
+fi
+if [ -e "$VERS/v$spec_v" ]; then
+  inst_note="$have->FAILED:already-there:$spec_v"
+  log "$VERS/v$spec_v is already there and is not the default; installing nothing over it"
+  finish
+fi
+
+# 4. The release, verified.
+log "Node is $have; downloading Node $spec_v ($a) and verifying its signature (at most $(left "$INSTALL_TIMEOUT")s)"
+if ! keyring || ! fetch_release "$spec_v" "$a"; then inst_note="$have->FAILED"; finish; fi
+# 5. Staged where nothing looks.
+STAGE=$VERS/.termag-v$spec_v-$$
+mkdir -p "$STAGE" && tar -xJf "$WORK/node.tar.xz" -C "$STAGE" --strip-components=1 </dev/null 2>/dev/null \
+  || { inst_note="$have->FAILED"; log "Node $spec_v's tarball did not unpack"; finish; }
+got=$("$STAGE/bin/node" --version 2>/dev/null </dev/null); got=${got#v}
+[ "$got" = "$spec_v" ] || { inst_note="$have->pin-mismatch(not-installed)"; log "Node $spec_v's node says ${got:-nothing}; nothing changed"; finish; }
+runtime=$(runtime_sum "$STAGE")
+# 6. The globals, copied and verified.
+if ! list=$(globals "$VERS/v$have"); then
+  inst_note="$have->FAILED" glob_note=FAILED
+  log "could not list Node $have's npm globals; nothing changed"
+  finish
+fi
+log "npm globals of Node $have: $(printf '%s' "$list" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+if ! copy_globals "$STAGE" "$list" "$VERS/v$have" || ! check_globals "$STAGE" "$list"; then
+  inst_note="$have->FAILED" glob_note=FAILED
+  log "the npm globals did not all copy and verify under Node $spec_v; nothing changed, Node $have stays the default"
+  finish
+fi
+if [ "$(runtime_sum "$STAGE")" != "$runtime" ]; then
+  inst_note="$have->FAILED:runtime-changed" glob_note=FAILED
+  log "copying the npm globals changed Node $spec_v's own files (bin/node, npm, corepack or their links); nothing changed, Node $have stays the default"
+  finish
+fi
+glob_note=$(printf '%s' "$list" | grep -c .)
+# 7. In place, checked again, then the default. The phase is set before the
+# rename: a signal right after it (bash runs the trap as soon as mv returns)
+# still moves the new version aside, and one before it finds nothing to move
+# (Bugbot on #1113).
+PHASE=renamed
+if ! mv -T "$STAGE" "$VERS/v$spec_v" 2>/dev/null; then
+  PHASE=''
+  inst_note="$have->FAILED"; log "cannot move Node $spec_v into $VERS; nothing changed"; finish
+fi
+STAGE=''
+if ! check_globals "$VERS/v$spec_v" "$list" || [ "$(runtime_sum "$VERS/v$spec_v")" != "$runtime" ]; then
+  mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null
+  inst_note="$have->FAILED" glob_note=FAILED
+  log "the npm globals did not verify from $VERS/v$spec_v; moved aside, Node $have stays the default"
+  finish
+fi
+# A version this run put in place and then backed out of is moved aside, so a
+# later run can install it again (Bugbot on #1113).
+set_aside() { mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null || log "could not move $VERS/v$spec_v aside"; }
+PHASE=switching
+if ! nvm_set_default "$spec_v"; then
+  nvm_set_default "$have" || true
+  if [ "$(nvm_default)" = "$spec_v" ]; then
+    # nvm wrote the new default and would not take the old one back: the new
+    # version, verified above, stays where the default names it, never moved
+    # aside from under it, and is recorded so the next run checks it in place
+    # and restarts the agent on it (Bugbot on #1113).
+    reject node "nvm did not confirm $spec_v as the default and did not take $have back"
+    inst_note="$have->FAILED"; log "nvm did not confirm $spec_v as the default, nor take $have back; $spec_v (verified) stays the default, recorded"
+  else
+    set_aside
+    inst_note="$have->FAILED"; log "nvm did not take $spec_v as the default; Node $have stays, $spec_v moved aside"
+  fi
+  finish
+fi
+PHASE=switched
+log "Node $spec_v is the default, its $glob_note npm global(s) verified under it"
+# 8. The agent. Only when its own launcher picks the new Node: run-node.sh
+# prefers a checkout's node/bin/node over nvm's default, and an agent that
+# does not run on nvm is not this run's to restart or roll back for (Bugbot
+# on #1113).
+picks=$(bash "$RUN_NODE" --print-node 2>/dev/null </dev/null) || picks=
+# A launcher that can't say which Node it picks (missing, failing) is not
+# guessed at: the agent is left alone, as behind a guard (Bugbot on #1113).
+why=launcher-unknown; [ -z "$picks" ] || why=$(agent_blocked)
+if [ -n "$picks" ] && [ "$(readlink -f "$picks")" != "$(readlink -f "$VERS/v$spec_v/bin/node")" ]; then
+  agent_note="unaffected:$picks"
+  log "the agent's launcher picks $picks, not nvm's default; it is not restarted, and the switch stands"
+elif [ -n "$why" ]; then
+  agent_note="deferred:$why"
+  log "the agent is not restarted ($why); it moves to Node $spec_v at its next restart"
+elif restart_agent_on "$spec_v"; then
+  agent_note=restarted
+  log "the agent runs Node $spec_v"
+else
+  # Back to the Node that ran, and the agent on it.
+  reject node "the agent did not come up on Node $spec_v"
+  if nvm_set_default "$have" && restart_agent_on "$have"; then
+    set_aside
+    inst_note="$have->pin-mismatch,restored:$have" agent_note=restored
+    log "the agent did not come up on Node $spec_v; Node $have is the default again, and the agent runs it; $spec_v moved aside for a retry"
+  else
+    # The default back on the old version, the new one is moved aside for a
+    # retry; only one still the default stays (Bugbot on #1113).
+    [ "$(nvm_default)" = "$have" ] && set_aside
+    inst_note="$have->pin-mismatch" agent_note=FAILED
+    log "the agent did not come up on Node $spec_v, nor on $have after putting it back; see systemctl --user status $AGENT_UNIT"
+  fi
+  finish
+fi
+PHASE=''
+inst_note="$have->$spec_v"
+accept node
+left_on_old=$(count_on "$have")
+[ "$left_on_old" = 0 ] || log "$left_on_old pane process(es) still run Node $have, which stays installed; they move at their next start"
+finish

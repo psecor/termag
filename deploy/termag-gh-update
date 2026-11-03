@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# termag-gh-update — update the GitHub CLI (gh) on a box when the orchestrator
+# asks.
+#
+# Why this exists: gh holds its owner's GitHub token and has had advisories
+# (the floor's sources are in backend/src/services/ghUpdatePolicy.ts). The image
+# installs it as root from GitHub's apt repository, cli.github.com/packages
+# (packer/scripts/setup.sh), and nothing moves it afterwards: 79 boxes were on
+# older minors on 2026-10-30.
+#
+# Unlike every other tool's updater this runs as root, because gh is a package
+# root installed. Its caller is the system unit termag-gh-update@<run>.service,
+# which the agent starts through one root-owned helper,
+# termag-gh-update-start <run-id>, the only thing a sudoers rule lets the agent
+# user run for it (deploy/termag-gh-update-setup installs all of it). Nothing
+# here runs a shell or a command the orchestrator or the user chose:
+#   * the run id is the orchestrator's id pattern, checked by the helper, the
+#     sudoers rule and here again;
+#   * the version comes from the policy as x.y.z only, and is installed only
+#     when cli.github.com's own index lists exactly it (apt-cache madison,
+#     from that origin): never Ubuntu's older gh, never a version the
+#     repository does not list, never a tag;
+#   * the agent config (the orchestrator URL and the agent token) is the agent
+#     user's, read as that user (setpriv), so a link in the user's home cannot
+#     make root read another file; the token reaches curl on its stdin;
+#   * the lock and the rejection record are root's, in /var/lib/termag/gh-update
+#     (0700), never in the user's home.
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=gh&run=<id> with the
+#      agent token. Only a 200 that names this run installs anything; no
+#      policy, or a 200 with run null, installs nothing.
+#   2. Takes /var/lib/termag/gh-update/gh-update.lock (flock).
+#   3. Refreshes gh's apt list alone (apt-get update on its .list), then
+#      resolves the target to one exact version: latest is the version
+#      cli.github.com lists now; an exact target must be that version. Installs
+#      `gh=<x.y.z>` with apt-get only when the installed one is below it (no
+#      downgrade, no other package upgraded). Accepted only when dpkg and
+#      `gh --version` both say exactly x.y.z; otherwise rejected (the record,
+#      exit 3) and the version before reinstalled when the repository still
+#      lists it. gh is dpkg's file, so it is never renamed or quarantined.
+#   4. gh has no sessions: a running gh is a short command, and keeps its old
+#      binary until it exits. Nothing is stopped or resumed.
+#   5. POST <orchestrator>/api/tool-update/report: {component: "gh", ...}.
+#
+# What is still trusted: GitHub's apt repository and its signing key
+# (/usr/share/keyrings/githubcli-archive-keyring.gpg), as for the image bake.
+#
+# Usage:
+#   termag-gh-update --run <run-id>   one orchestrator run, as root
+#
+# Exit codes: 0 when gh is at or above the floor (or nothing was asked of it),
+# 1 when it is below it or missing, 2 on bad usage, 3 while an install is
+# rejected, 143 when a signal stops it.
+#
+# Env (the unit's EnvironmentFile, /etc/termag/gh-update.env):
+#   TERMAG_GH_AGENT_UID        the box user the agent runs as (by uid:
+#                              cloud-init renames it at launch, uid kept)
+# and, for tests:
+#   GH_BIN                     the gh to judge (default /usr/bin/gh)
+#   TERMAG_GH_STATE_DIR        where the lock and record live
+#   TERMAG_GH_SOURCES          gh's apt list (default
+#                              /etc/apt/sources.list.d/github-cli.list)
+#   TERMAG_GH_BUDGET           seconds the install may take (default 600)
+#   TERMAG_GH_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_GH_INSTALL_TIMEOUT  seconds for each apt step (default 300)
+#   TERMAG_POLICY_TIMEOUT      seconds for each orchestrator call (default 20)
+#   TERMAG_GH_AS_USER          1: a run that is not root (the tests): reads
+#                              these overrides and the caller's PATH, and the
+#                              config without setpriv. As root all of them
+#                              are ignored.
+
+set -u
+# As root: root's own PATH and paths, nothing from the environment but the
+# unit's EnvironmentFile (TERMAG_GH_AGENT_UID). The tests' overrides are read
+# only by a run that is not root, which can do nothing root can.
+if [ "$(id -u)" = 0 ]; then
+  AS_USER=0
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  unset GH_BIN TERMAG_GH_STATE_DIR TERMAG_GH_SOURCES TERMAG_AGENT_CONFIG
+elif [ "${TERMAG_GH_AS_USER:-}" = 1 ]; then
+  AS_USER=1
+  PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+else
+  printf 'termag-gh-update: run as root (termag-gh-update@<run>.service)\n' >&2
+  exit 2
+fi
+export PATH LC_ALL=C DEBIAN_FRONTEND=noninteractive
+umask 077
+
+GH_REPO=https://cli.github.com/packages
+# apt's cache of the packages it downloaded (and checked against the signed
+# index when it did), where the gh that ran may still be.
+ARCHIVES=/var/cache/apt/archives
+[ "$AS_USER" = 1 ] && ARCHIVES="${TERMAG_GH_APT_ARCHIVES:-$ARCHIVES}"
+SOURCES="${TERMAG_GH_SOURCES:-/etc/apt/sources.list.d/github-cli.list}"
+STATE_DIR="${TERMAG_GH_STATE_DIR:-/var/lib/termag/gh-update}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_GH_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_GH_INSTALL_TIMEOUT:-300}"
+
+# The budget, the policy, the lock, the record and the report are
+# deploy/termag-tool-update-lib's: the copy termag-gh-update-setup installs
+# beside this, root's, never the user's ~/.local/bin one.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-gh-update TU_COMPONENT=gh TU_BIN=gh TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/gh-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+REJECTED=$STATE_DIR/gh-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-gh-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-gh-update --run <run-id>"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  # The run id names the systemd instance and goes into a URL and a report.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_GH_BUDGET:-600}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+# No sessions to stop, drain or resume.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+AGENT_UID="${TERMAG_GH_AGENT_UID:-}"
+case "$AGENT_UID" in ''|0|*[!0-9]*) log "no agent user (TERMAG_GH_AGENT_UID '${AGENT_UID}'); see /etc/termag/gh-update.env"; exit 2 ;; esac
+
+tu_budget
+
+resolve() { local b=${GH_BIN:-/usr/bin/gh}; [ -x "$b" ] && printf '%s' "$b"; }
+
+# The agent's endpoint, from the agent user's config, read as that user: its
+# home and the config's paths are the user's to point anywhere, and root never
+# opens them itself. Replaces the lib's agent_endpoint, which reads as the
+# caller.
+agent_endpoint() {
+  local home cfg body=''
+  [ -n "$AGENT_URL" ] && return 0
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { POLICY=no-curl-or-jq; return 1; }
+  home=$(getent passwd "$AGENT_UID" | cut -d: -f6)
+  case "$home" in /*) ;; *) POLICY=no-agent-user; return 1 ;; esac
+  for cfg in "$home/src/termag/agent/agent.config.json" "$home/.termag/agent.config.json" "$home/.config/termag/agent.config.json"; do
+    if [ "$AS_USER" = 1 ]; then
+      body=$(head -c 65536 -- "$cfg" 2>/dev/null) || body=
+    else
+      body=$(setpriv --reuid="$AGENT_UID" --regid="$(id -g "$AGENT_UID" 2>/dev/null || echo 65534)" --clear-groups --no-new-privs \
+        head -c 65536 -- "$cfg" 2>/dev/null </dev/null) || body=
+    fi
+    [ -n "$body" ] && break
+  done
+  [ -n "$body" ] || { POLICY=no-agent-config; return 1; }
+  AGENT_TOKEN=$(printf '%s' "$body" | jq -r '.token // empty' 2>/dev/null) || AGENT_TOKEN=
+  AGENT_URL=$(printf '%s' "$body" | jq -r '.termag_url // empty' 2>/dev/null) || AGENT_URL=
+  # The token goes into curl's config on stdin, quoted: nothing that could end
+  # the quote or the line; the URL must be the agent's own wss/ws endpoint.
+  [[ "$AGENT_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{8,512}$ ]] || AGENT_TOKEN=
+  [[ "$AGENT_URL" =~ ^wss?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?/ws/agent$ ]] || AGENT_URL=
+  if [ -z "$AGENT_TOKEN" ] || [ -z "$AGENT_URL" ]; then POLICY=no-token; AGENT_URL=; return 1; fi
+  return 0
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); gh has no fallback floor"
+# A 200 that names no run: not this run's to install, so nothing.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+inst_note=-
+tu_notes() { printf 'apt=%s' "$inst_note"; }
+tu_notes_all() { printf '%s' "$inst_note"; }
+# No sessions: stop_sessions finds nothing on an old binary.
+find_sessions() { :; }
+tu_status() { printf idle; }
+tu_had() { return 1; }
+tu_resume_line() { :; }
+
+# ── gh's apt repository ─────────────────────────────────────────────────────
+# Only gh's own list is refreshed (the rest of the box's apt state is the
+# bake's and unattended-upgrades'), and only its origin counts.
+APT_OPTS=(-o DPkg::Lock::Timeout=120 -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
+apt_refresh() {
+  [ -r "$SOURCES" ] || { log "no $SOURCES: gh is not from cli.github.com on this box"; return 1; }
+  grep -qE "^deb .*${GH_REPO//./\\.}( |$)" "$SOURCES" || { log "$SOURCES is not cli.github.com's"; return 1; }
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -o Dir::Etc::sourcelist="$SOURCES" -o Dir::Etc::sourceparts=- \
+    -o APT::Get::List-Cleanup=0 -qq update </dev/null >&2
+}
+# The versions cli.github.com's index lists now, newest first.
+repo_versions() {
+  apt-cache madison gh 2>/dev/null </dev/null \
+    | awk -F'|' -v repo="$GH_REPO" '{ v=$2; s=$3; gsub(/ /, "", v); if (index(s, " " repo " ") == 1) print v }' \
+    | grep -E "$TU_VERSION_RE" | sort -rV
+}
+# tu_resolve_tag latest: the version the repository lists now.
+tu_can_resolve() { return 0; }
+tu_resolve_tag() { [ "$1" = latest ] && repo_versions | head -n 1; }
+in_repo() { repo_versions | grep -qxF -- "$1"; }
+pkg_version() { dpkg-query -W -f='${Version}' gh 2>/dev/null </dev/null; }
+# cached_deb X.Y.Z: apt's cached package of gh X.Y.Z, when its own fields say so.
+cached_deb() {
+  local f
+  for f in "$ARCHIVES"/gh_"$1"_*.deb; do
+    [ -f "$f" ] || continue
+    [ "$(dpkg-deb -f "$f" Package 2>/dev/null)" = gh ] && [ "$(dpkg-deb -f "$f" Version 2>/dev/null)" = "$1" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+apt_install_deb() {  # apt_install_deb FILE: that package file, down if need be
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -qq install -y --no-install-recommends --allow-downgrades "$1" </dev/null >&2
+}
+apt_install() {  # apt_install X.Y.Z [--allow-downgrades]: exactly gh=X.Y.Z, nothing else upgraded
+  local v=$1 extra=()
+  shift
+  extra=("$@")
+  [ "$(pkg_version)" = "$v" ] && extra+=(--reinstall)
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -qq install -y --no-install-recommends "${extra[@]}" "gh=$v" </dev/null >&2
+}
+
+trap on_signal TERM INT HUP
+
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null
+tu_lock
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+
+if ! apt_refresh; then
+  inst_note="${have:-none}->FAILED"
+  log "could not refresh cli.github.com's index; installing nothing"
+  finish
+fi
+
+# What the install must reach: the floor, and the policy's target.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+# Already there, or above it: nothing to install, and the repository is not
+# asked (Bugbot and a review on #1102).
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+if [ "$have" = "$spec_v" ] && ! was_rejected gh; then
+  inst_note=$have
+  finish
+fi
+if downgrade "$have" && ! was_rejected gh; then
+  inst_note="$have(no-downgrade)"
+  log "gh is $have; $spec_v would move it down; skipped"
+  finish
+fi
+# Exactly what the repository lists, or nothing. cli.github.com lists only its
+# newest gh, so an exact target below it cannot be installed: a failed run, the
+# target was not reached (Bugbot on #1102). In practice gh installs `latest`.
+if ! in_repo "$spec_v"; then
+  inst_note="${have:-none}->FAILED:not-in-repo:$spec_v"
+  log "cli.github.com does not list gh $spec_v (it lists: $(repo_versions | head -n 3 | tr '\n' ' ')); installing nothing"
+  finish
+fi
+
+log "gh is ${have:-not installed}; installing gh=$spec_v from cli.github.com (at most $(left "$INSTALL_TIMEOUT")s)"
+pv_before=$(pkg_version)
+if ! apt_install "$spec_v"; then
+  pv=$(pkg_version) after=$(ver "$(resolve)")
+  if [ "$pv" = "$pv_before" ] && [ "$after" = "$have" ]; then
+    inst_note="${have:-none}->FAILED"
+    log "apt-get did not install gh=$spec_v; gh is ${pv:-not installed} as before"
+    finish
+  fi
+  # A transaction that failed part way (unpacked, then its configuration
+  # failed) changed gh: rejected and put back, as below (Devin on #1102).
+  log "apt-get failed part way through gh=$spec_v; dpkg says ${pv:-nothing}, gh --version says ${after:-nothing (does not run)}"
+  pv="$pv(apt failed)"
+else
+  pv=$(pkg_version) after=$(ver "$(resolve)")
+fi
+if [ "$pv" = "$spec_v" ] && [ "$after" = "$spec_v" ]; then
+  inst_note="${have:-none}->$after"
+  log "gh is now $spec_v, verified (dpkg and gh --version)"
+  accept gh
+  finish
+fi
+inst_note="${have:-none}->pin-mismatch"
+reject gh "asked for $spec_v; dpkg says ${pv:-nothing}, gh --version says ${after:-nothing (does not run)}"
+# Put the version before back: from the repository when it still lists it,
+# else from apt's cache of its package (cli.github.com lists only its newest,
+# so that is the usual source; a review on #1102), verified by dpkg and
+# gh --version either way. With neither, the new gh stays: gh is dpkg's file,
+# so it is never renamed, and the record keeps every run at exit 3.
+if [ -n "$have" ]; then
+  back=''
+  if in_repo "$have"; then
+    apt_install "$have" --allow-downgrades && back="the repository"
+  elif deb=$(cached_deb "$have"); then
+    apt_install_deb "$deb" && back="apt's cache ($deb)"
+  else
+    log "gh $have is neither in cli.github.com's index nor in apt's cache ($ARCHIVES); the new gh stays, rejected"
+  fi
+  if [ -n "$back" ] && [ "$(pkg_version)" = "$have" ] && [ "$(ver "$(resolve)")" = "$have" ]; then
+    inst_note="$inst_note,restored:$have"
+    log "gh $have is back, verified (from $back)"
+  elif [ -n "$back" ]; then
+    log "gh $have from $back did not verify; rejected"
+  fi
+fi
+finish

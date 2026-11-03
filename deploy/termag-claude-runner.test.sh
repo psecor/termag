@@ -71,6 +71,19 @@
 #     logs, and without an agent config nothing is posted; a launch that ends
 #     while a newer launch of its order runs on the box reports nothing (the
 #     newer one does)
+#   * the Claude Code floor: below it, termag-claude-update --ensure <floor>
+#     runs (capped by TERMAG_CLAUDE_UPDATE_TIMEOUT) and then the runner
+#     starts; still below it, the script exits 2 before seeding a checkout, no
+#     runner starts and the end report says exitReason=claude-below-floor; at
+#     or above it nothing extra runs; a malformed floor is ignored; while the
+#     updater's rejection record exists (an install that did not end at
+#     exactly the version asked for) no runner starts, whatever the binary
+#     prints (exitReason=claude-update-rejected), the floor guard runs before
+#     the self-hosted-runner subcommand check (a claude too old to have it is
+#     repaired, not refused), and an updater stopped at the
+#     cap starts none either (claude-update-incomplete); --claude-floor
+#     <x.y.z> (the orchestrator's) wins over the floor file either way, and a
+#     malformed one is ignored for the file's
 #
 # Run: sh deploy/termag-claude-runner.test.sh
 set -u
@@ -92,6 +105,10 @@ command -v git >/dev/null 2>&1 || { echo "SKIP: git not installed"; exit 0; }
 BASH_BIN="$(command -v bash)"
 HOME_DIR="$WORK/home"
 mkdir -p "$HOME_DIR/.termag/claude-runner" "$WORK/bin"
+# Every git here, the runner's included (each `env -i` below passes it on),
+# leaves the machine's /etc/gitconfig out: a termag box rewrites github.com to
+# its GitHub broker there, and the origin assertions would read the rewrite.
+export GIT_CONFIG_NOSYSTEM=1
 
 # Stub claude: `self-hosted-runner --help` succeeds; a real run records argv,
 # env, the work order's mode and what the base dir held while it ran.
@@ -128,10 +145,14 @@ if [ -n "${STUB_GIT:-}" ]; then
     clean) ;;
     dirty) printf 'x\n' > "$co/uncommitted.txt" ;;
     *) g checkout -q -b outcome; g commit -q --allow-empty -m work
+       # The pushurl modes are a push that left no remote-tracking ref. Before
+       # git 2.56 a push by URL never wrote one; 2.56 writes origin's when the
+       # URL is origin's own, so it is taken back out.
        case "$STUB_GIT" in
          push) g push -q origin outcome ;;
-         pushurl) g push -q "$(g remote get-url origin)" outcome ;;
-         pushurl-then-unreachable) g push -q "$(g remote get-url origin)" outcome; mv "$(g remote get-url origin)" "$(g remote get-url origin).gone" ;;
+         pushurl) g push -q "$(g remote get-url origin)" outcome; g update-ref -d refs/remotes/origin/outcome 2>/dev/null ;;
+         pushurl-then-unreachable) g push -q "$(g remote get-url origin)" outcome; g update-ref -d refs/remotes/origin/outcome 2>/dev/null
+           mv "$(g remote get-url origin)" "$(g remote get-url origin).gone" ;;
        esac ;;
   esac
 fi
@@ -139,6 +160,9 @@ fi
 if [ -n "${STUB_REASON:-}" ]; then printf '%s\n' "$STUB_REASON" > "$TERMAG_CLAUDE_RUNNER_DIR/$TERMAG_CLAUDE_RUNNER_ORDER.exit-reason.$TERMAG_CLAUDE_RUNNER_LAUNCH"; fi
 if [ -n "${STUB_SLEEP:-}" ]; then
   trap 'printf term > "$RECORD.term"; exit 143' TERM
+  # Up, with the trap set: a test that signals before this would race the
+  # stub's own start-up (see wait_runner).
+  : > "$RECORD.ready"
   while :; do sleep 0.1; done
 fi
 exit "${STUB_EXIT:-0}"
@@ -190,7 +214,7 @@ seed_order() {
 run() {
   # $1 = order id, $2 = slot ('' for the default), rest = extra env
   o=$1; sl=$2; shift 2
-  env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" \
+  env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" \
     CLAUDE_CODE_USE_BEDROCK=1 ANTHROPIC_BEDROCK_BASE_URL=https://gw.example \
     "$@" "$BASH_BIN" "$SCRIPT" "$o" $sl 2>"$WORK/err"
 }
@@ -198,7 +222,7 @@ run() {
 # carries telemetry content gates, which must never reach the session.
 run_flags() {
   o=$1; sl=$2; shift 2
-  env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" \
+  env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" \
     OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer owner' \
     OTEL_EXPORTER_OTLP_METRICS_HEADERS='x-api-key=owner' OTEL_EXPORTER_OTLP_CLIENT_KEY=/owner/key OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://owner.example.test \
     "$BASH_BIN" "$SCRIPT" "$o" "$sl" "$@" 2>"$WORK/err"
@@ -206,6 +230,16 @@ run_flags() {
 argv_has() { grep -qx -- "$1" "$WORK/record.argv"; }
 # Files in the runner state dir whose name starts with $1 (SC2010: not ls | grep).
 leftovers() { find "$HOME_DIR/.termag/claude-runner" -maxdepth 1 -name "$1*" 2>/dev/null; }
+# wait_runner RECORD: until the STUB_SLEEP runner is up with its TERM trap set
+# (RECORD.ready), at most 30 s. Not RECORD.argv, which the stub writes first:
+# a hangup between the two killed the stub by the default TERM action before
+# its trap could record it (#957's CI, "the hangup reaches the runner as
+# TERM" got empty). Nor 5 s, which a loaded runner can spend in the floor
+# guard and the seeding before the stub starts.
+wait_runner() {
+  for _ in $(seq 1 300); do [ -e "$1.ready" ] && return 0; sleep 0.1; done
+  echo "note: the stub runner for $1 was not up after 30 s" >&2
+}
 
 # ── plain run, slot 3 ───────────────────────────────────────────────────────
 rm -f "$WORK"/record.*
@@ -238,6 +272,7 @@ grep -q '^ANTHROPIC_BEDROCK_BASE_URL=' "$WORK/record.env" && fail 'Bedrock URL i
 grep -q '^DISABLE_AUTOUPDATER=1' "$WORK/record.env" || fail 'autoupdater off' 'DISABLE_AUTOUPDATER=1' "$(grep AUTOUPDATER "$WORK/record.env")"
 grep -q '^WEBAPP_CLOUD_ENV=termag' "$WORK/record.env" || fail 'WEBAPP_CLOUD_ENV=termag' 'set' "$(grep WEBAPP_CLOUD "$WORK/record.env")"
 grep -q '^CLAUDE_CODE_ENABLE_TELEMETRY=' "$WORK/record.env" && fail 'no session telemetry without the flags' '(absent)' 'CLAUDE_CODE_ENABLE_TELEMETRY set'
+grep -qx 'TERMAG_SESSION_KIND=cloud' "$WORK/record.env" || fail 'the session kind is in the environment, telemetry or not' 'TERMAG_SESSION_KIND=cloud' "$(grep '^TERMAG_SESSION_KIND' "$WORK/record.env")"
 grep -q "^PATH=$HOME_DIR/.local/bin:" "$WORK/record.env" || fail 'the user bin dir is first on PATH' "PATH=$HOME_DIR/.local/bin:..." "$(grep '^PATH=' "$WORK/record.env")"
 grep -q '^SHELL=/' "$WORK/record.env" || fail 'SHELL is set for the Bash tool snapshot (env -i cleared it)' 'SHELL=/...' "$(grep '^SHELL=' "$WORK/record.env")"
 
@@ -372,10 +407,10 @@ run ord-4 4 STUB_EXIT=7; got=$?
 # ── hangup (tmux kill-session): passed on to the runner, script stops ───────
 rm -f "$WORK"/record.*
 seed_order ord-hup
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-hup 2 2>"$WORK/err" &
 pid=$!
-for _ in $(seq 1 50); do [ -e "$WORK/record.argv" ] && break; sleep 0.1; done
+wait_runner "$WORK/record"
 kill -HUP "$pid"
 for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$pid" 2>/dev/null; then
@@ -391,14 +426,14 @@ wait "$pid"; got=$?
 # ── a relaunch of the same order while the first launch still winds down ───
 rm -f "$WORK"/record.* "$WORK"/record-b.*
 seed_order ord-race
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-race 2 2>"$WORK/err" &
 pid=$!
-for _ in $(seq 1 50); do [ -e "$WORK/record.argv" ] && break; sleep 0.1; done
+wait_runner "$WORK/record"
 # The backend placed the order again (a fresh work order at the canonical
 # path) and started a second launcher while the first still runs.
 seed_order ord-race
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record-b" "$BASH_BIN" "$SCRIPT" ord-race 2 2>"$WORK/err-b"; got=$?
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record-b" "$BASH_BIN" "$SCRIPT" ord-race 2 2>"$WORK/err-b"; got=$?
 [ "$got" = 0 ] || fail 'the relaunch runs' 0 "$got"
 grep -qE "^$HOME_DIR/ccr/sessions/ord-race\.[0-9]+$" "$WORK/record-b.argv" || fail 'the relaunch takes a directory of its own' "$HOME_DIR/ccr/sessions/ord-race.<pid>" "$(grep -A1 -- '--base-dir' "$WORK/record-b.argv" | tail -1)"
 grep -q 'still winds down' "$WORK/err-b" || fail 'the relaunch says why it took another directory' 'still winds down' "$(cat "$WORK/err-b")"
@@ -416,10 +451,10 @@ wait "$pid" 2>/dev/null
 # ── cleanup leaves a directory whose marker names another launch ────────────
 rm -f "$WORK"/record.*
 seed_order ord-mark
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-mark 2 2>"$WORK/err" &
 pid=$!
-for _ in $(seq 1 50); do [ -e "$WORK/record.argv" ] && break; sleep 0.1; done
+wait_runner "$WORK/record"
 printf '999999\n' > "$HOME_DIR/ccr/sessions/ord-mark/.launcher"
 kill -HUP "$pid"
 for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
@@ -476,6 +511,12 @@ seed_order ord-cf4
 run ord-cf4 4 STACK_AWS_PROFILE=owner-profile; got=$?
 [ "$(cat "$WORK/record.override" 2>/dev/null)" = 'DEV_INSTANCE=4' ] || fail 'the seeded checkout names its slot' 'DEV_INSTANCE=4' "$(cat "$WORK/record.override" 2>/dev/null)"
 grep -qx 'STACK_AWS_PROFILE=owner-profile' "$WORK/record.env" || fail 'a STACK_AWS_PROFILE the caller set is kept' 'STACK_AWS_PROFILE=owner-profile' "$(grep STACK_AWS "$WORK/record.env")"
+
+# A runner started from an agent's pane inherits that agent's kind; the session is still cloud.
+rm -f "$WORK"/record.*
+seed_order ord-kind
+run ord-kind 2 TERMAG_SESSION_KIND=interactive; got=$?
+grep -qx 'TERMAG_SESSION_KIND=cloud' "$WORK/record.env" || fail 'an inherited session kind is replaced by cloud' 'TERMAG_SESSION_KIND=cloud' "$(grep '^TERMAG_SESSION_KIND' "$WORK/record.env")"
 
 rm -f "$WORK"/record.*
 seed_order ord-cf3
@@ -671,11 +712,10 @@ grep -q 'predates the event route' "$WORK/err" || fail 'end report: an older orc
 # A hangup: the report says exit 129 and why.
 rm -f "$WORK"/record.*
 seed_order ord-endhup
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-endhup 2 2>"$WORK/err" &
 pid=$!
-i=0; while [ ! -f "$WORK/record.argv" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-sleep 0.3
+wait_runner "$WORK/record"
 kill -HUP "$pid" 2>/dev/null
 wait "$pid"; got=$?
 [ "$got" = 129 ] || fail 'end report: a hangup still ends the script with 129' 129 "$got"
@@ -685,16 +725,15 @@ case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitStatus":129,'*'"exi
 # nothing: the order's record is the newer launch's, which reports its own end.
 rm -f "$WORK"/record.* "$WORK"/record-b.*
 seed_order ord-endrace
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-endrace 2 2>"$WORK/err" &
 pid_a=$!
-for _ in $(seq 1 50); do [ -e "$WORK/record.argv" ] && break; sleep 0.1; done
+wait_runner "$WORK/record"
 seed_order ord-endrace
-env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record-b" STUB_SLEEP=1 \
+env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record-b" STUB_SLEEP=1 \
   "$BASH_BIN" "$SCRIPT" ord-endrace 2 2>"$WORK/err-b" &
 pid_b=$!
-for _ in $(seq 1 50); do [ -e "$WORK/record-b.argv" ] && break; sleep 0.1; done
-sleep 0.3
+wait_runner "$WORK/record-b"
 kill -HUP "$pid_a"; wait "$pid_a" 2>/dev/null
 [ ! -e "$WORK/record.curl.argv" ] || fail 'end report: the earlier launch says nothing while a newer launch of its order runs' '(no curl call)' "$(cat "$WORK/record.curl.body" 2>/dev/null)"
 grep -q 'end not reported: a newer launch of this order' "$WORK/err" || fail 'end report: the earlier launch says why it stayed quiet' 'end not reported: a newer launch of this order' "$(cat "$WORK/err")"
@@ -914,7 +953,7 @@ rm -f "$HOME_DIR/.claude/settings.json"
 # and an unpushed-looking tip keeps the checkout.
 run_git() {
   o=$1; sl=$2; mode=$3; shift 3
-  env -i PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" CLAUDE_RUNNER_CANONICAL="$GCANON" STUB_GIT="$mode" \
+  env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" CLAUDE_RUNNER_CANONICAL="$GCANON" STUB_GIT="$mode" \
     "$BASH_BIN" "$SCRIPT" "$o" "$sl" "$@" 2>"$WORK/err"
 }
 rm -f "$WORK"/record.*
@@ -935,6 +974,155 @@ seed_order ord-gk-clean
 run_git ord-gk-clean 2 clean --anthropic-git --github absent; got=$?
 [ "$got" = 0 ] || fail 'gk-clean: runs' 0 "$got"
 [ -z "$(kept_for ord-gk-clean)" ] || fail 'gk-clean: a clean tree is removed whatever the credential state' '(none)' "$(kept_for ord-gk-clean)"
+
+# ── the Claude Code floor ─────────────────────
+# A claude whose --version is $CLAUDE_VER_FILE, and an updater stub that
+# records its argv and, with UPD_TO, moves that version.
+# HELP_NEEDS: `self-hosted-runner --help` works only once --version says this
+# (a claude too old to have the subcommand).
+cat > "$WORK/bin/claude" <<'STUB'
+#!/bin/sh
+if [ "$1" = --version ]; then cat "$CLAUDE_VER_FILE"; exit 0; fi
+if [ "$1" = self-hosted-runner ] && [ "$2" = --help ]; then
+  [ -n "${HELP_NEEDS:-}" ] && ! grep -q "$HELP_NEEDS" "$CLAUDE_VER_FILE" && exit 1
+  exit 0
+fi
+printf '%s\n' "$@" > "$RECORD.argv"
+exit 0
+STUB
+cat > "$WORK/updater" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" > "$RECORD.updater"
+printf '%s\n' "${TERMAG_CLAUDE_BUDGET:-unset}" > "$RECORD.budget"
+[ -n "${UPD_SLEEP:-}" ] && sleep "$UPD_SLEEP"
+[ -n "${UPD_TO:-}" ] && printf '%s (Claude Code)\n' "$UPD_TO" > "$CLAUDE_VER_FILE"
+# UPD_CLEAR: a verified install, which clears the rejection record.
+[ -n "${UPD_CLEAR:-}" ] && rm -f "$HOME/.termag/claude-update.rejected"
+exit 0
+STUB
+chmod +x "$WORK/bin/claude" "$WORK/updater"
+printf '2.1.308\n' > "$WORK/floor"
+printf '{"token":"tmag_box_token","termag_url":"wss://orch.example.test/termag/ws/agent"}\n' > "$HOME_DIR/.termag/agent.config.json"
+floor_run() {  # floor_run ORDER VERSION [ENV...]
+  o=$1; printf '%s (Claude Code)\n' "$2" > "$WORK/claude-version"; shift 2
+  rm -f "$WORK"/record.*
+  seed_order "$o"
+  run "$o" 2 TERMAG_CLAUDE_FLOOR_FILE="$WORK/floor" TERMAG_CLAUDE_UPDATE="$WORK/updater" CLAUDE_VER_FILE="$WORK/claude-version" "$@"
+}
+
+# Below the floor: --ensure runs, claude is resolved again, and the runner starts.
+floor_run ord-fl-up 2.1.300 UPD_TO=2.1.312; got=$?
+[ "$got" = 0 ] || fail 'floor: below, updated: the runner runs' 0 "$got: $(cat "$WORK/err")"
+[ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.308' ] || fail 'floor: below: termag-claude-update --ensure <floor> runs' '--ensure 2.1.308' "$(cat "$WORK/record.updater" 2>/dev/null)"
+[ -e "$WORK/record.argv" ] || fail 'floor: below, updated: a runner starts' 'started' 'not started'
+[ "$(cat "$WORK/record.budget" 2>/dev/null)" = 170 ] || fail 'floor: the updater gets the 180 s cap less 10 s as its budget' 170 "$(cat "$WORK/record.budget" 2>/dev/null)"
+grep -q 'is now 2.1.312, at or above the floor 2.1.308' "$WORK/err" || fail 'floor: below, updated: says so' 'is now 2.1.312' "$(cat "$WORK/err")"
+
+# Still below after the update: exit 2, no runner, no checkout, and the end report says why.
+floor_run ord-fl-stuck 2.1.300; got=$?
+[ "$got" = 2 ] || fail 'floor: still below: exits 2' 2 "$got"
+[ -e "$WORK/record.updater" ] || fail 'floor: still below: the updater ran first' ran 'not run'
+[ ! -e "$WORK/record.argv" ] || fail 'floor: still below: no runner starts' 'not started' started
+[ ! -e "$HOME_DIR/ccr/sessions/ord-fl-stuck" ] || fail 'floor: still below: no checkout is seeded' '(absent)' present
+[ -z "$(leftovers ord-fl-stuck.work-order)" ] || fail 'floor: still below: the work order is removed' '(none)' "$(leftovers ord-fl-stuck.work-order)"
+grep -q 'still 2.1.300, below the floor 2.1.308; not starting a runner' "$WORK/err" || fail 'floor: still below: says so' 'not starting a runner' "$(cat "$WORK/err")"
+case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitStatus":2,'*'"exitReason":"claude-below-floor"'*) ;; *) fail 'floor: still below: the end report carries exitReason=claude-below-floor' '"exitStatus":2 ... "exitReason":"claude-below-floor"' "$(cat "$WORK/record.curl.body" 2>/dev/null)" ;; esac
+
+# At the floor: nothing extra runs.
+floor_run ord-fl-ok 2.1.308; got=$?
+[ "$got" = 0 ] || fail 'floor: at: the runner runs' 0 "$got"
+[ ! -e "$WORK/record.updater" ] || fail 'floor: at: the updater does not run' 'not run' "$(cat "$WORK/record.updater")"
+[ -e "$WORK/record.argv" ] || fail 'floor: at: a runner starts' started 'not started'
+# Above it, by version order rather than string order.
+floor_run ord-fl-above 2.1.1000; got=$?
+[ ! -e "$WORK/record.updater" ] || fail 'floor: 2.1.1000 is above 2.1.308' 'not run' ran
+
+# The update is capped: one that outlives TERMAG_CLAUDE_UPDATE_TIMEOUT is cut,
+# and nothing verified what it left, so no runner starts on it.
+start=$(date +%s)
+floor_run ord-fl-slow 2.1.300 UPD_SLEEP=20 UPD_TO=2.1.312 TERMAG_CLAUDE_UPDATE_TIMEOUT=1; got=$?
+took=$(( $(date +%s) - start ))
+[ "$got" = 2 ] || fail 'floor: a capped update: exits 2' 2 "$got"
+[ "$took" -lt 10 ] || fail 'floor: the update is capped by TERMAG_CLAUDE_UPDATE_TIMEOUT' '< 10 s' "${took}s"
+[ ! -e "$WORK/record.argv" ] || fail 'floor: a capped update starts no runner' 'not started' started
+case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitReason":"claude-update-incomplete"'*) ;; *) fail 'floor: a capped update reports claude-update-incomplete' 'claude-update-incomplete' "$(cat "$WORK/record.curl.body" 2>/dev/null)" ;; esac
+
+# A rejected install (the updater installed something other than exactly the
+# version it asked for): no runner starts on it, whatever version it prints.
+mkdir -p "$HOME_DIR/.termag"
+printf 'npm asked for 2.1.312; package.json says 2.1.399, --version says 2.1.399\n' > "$HOME_DIR/.termag/claude-update.rejected"
+floor_run ord-fl-rej 2.1.399; got=$?
+[ "$got" = 2 ] || fail 'rejected: exits 2 although the binary prints a version above the floor' 2 "$got: $(cat "$WORK/err")"
+[ -e "$WORK/record.updater" ] || fail 'rejected: the updater runs again first' ran 'not run'
+[ ! -e "$WORK/record.argv" ] || fail 'rejected: no runner starts' 'not started' started
+grep -q 'install is rejected (npm asked for 2.1.312' "$WORK/err" || fail 'rejected: says why' 'install is rejected' "$(cat "$WORK/err")"
+case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitStatus":2,'*'"exitReason":"claude-update-rejected"'*) ;; *) fail 'rejected: the end report says claude-update-rejected' 'claude-update-rejected' "$(cat "$WORK/record.curl.body" 2>/dev/null)" ;; esac
+# The updater verifies a reinstall and clears the record: the runner starts.
+floor_run ord-fl-rej2 2.1.399 UPD_CLEAR=1 UPD_TO=2.1.312; got=$?
+[ "$got" = 0 ] || fail 'rejected, then verified: the runner runs' 0 "$got: $(cat "$WORK/err")"
+[ -e "$WORK/record.argv" ] || fail 'rejected, then verified: a runner starts' started 'not started'
+rm -f "$HOME_DIR/.termag/claude-update.rejected"
+
+# A claude too old to have self-hosted-runner: the
+# floor guard runs before the subcommand check, so the updater repairs it and
+# the runner starts; still too old after the update, exit 2 and no runner.
+floor_run ord-fl-nohelp 2.1.300 HELP_NEEDS=2.1.312 UPD_TO=2.1.312; got=$?
+[ "$got" = 0 ] || fail 'no subcommand yet: updated, the runner runs' 0 "$got: $(cat "$WORK/err")"
+[ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.308' ] || fail 'no subcommand yet: the updater runs first' '--ensure 2.1.308' "$(cat "$WORK/record.updater" 2>/dev/null)"
+[ -e "$WORK/record.argv" ] || fail 'no subcommand yet: a runner starts after the update' started 'not started'
+floor_run ord-fl-nohelp2 2.1.300 HELP_NEEDS=2.1.312; got=$?
+[ "$got" = 2 ] || fail 'no subcommand, not updated: exits 2' 2 "$got"
+[ -e "$WORK/record.updater" ] || fail 'no subcommand, not updated: the updater was tried' ran 'not run'
+[ ! -e "$WORK/record.argv" ] || fail 'no subcommand, not updated: no runner starts' 'not started' started
+# At the floor but without the subcommand: refused, as before.
+floor_run ord-fl-nohelp3 2.1.308 HELP_NEEDS=2.1.999; got=$?
+[ "$got" = 2 ] || fail 'at the floor, no subcommand: exits 2' 2 "$got"
+grep -q 'no claude with the self-hosted-runner subcommand' "$WORK/err" || fail 'at the floor, no subcommand: says so' 'no claude with the self-hosted-runner subcommand' "$(cat "$WORK/err")"
+
+# No updater installed: still below, exit 2, and the log says why.
+floor_run ord-fl-noupd 2.1.300 TERMAG_CLAUDE_UPDATE="$WORK/no-such-updater"; got=$?
+[ "$got" = 2 ] || fail 'floor: no updater: exits 2' 2 "$got"
+grep -q 'termag-claude-update is not installed' "$WORK/err" || fail 'floor: no updater: says so' 'not installed' "$(cat "$WORK/err")"
+
+# A floor file that is not x.y.z is ignored, and says so.
+printf 'latest\n' > "$WORK/floor"
+floor_run ord-fl-bad 2.1.300; got=$?
+[ "$got" = 0 ] || fail 'floor: a malformed floor is ignored' 0 "$got"
+grep -q "ignoring the Claude Code floor 'latest'" "$WORK/err" || fail 'floor: a malformed floor says so' 'ignoring' "$(cat "$WORK/err")"
+
+# --claude-floor <x.y.z> (phase 2, the orchestrator's policy floor) wins over
+# the file, in both directions; a malformed one is ignored and the file applies.
+floor_run_arg() {  # floor_run_arg ORDER VERSION FLOOR-ARG [ENV...]
+  o=$1; printf '%s (Claude Code)\n' "$2" > "$WORK/claude-version"; fa=$3; shift 3
+  rm -f "$WORK"/record.*
+  seed_order "$o"
+  env -i GIT_CONFIG_NOSYSTEM=1 PATH="$WORK/bin:/usr/bin:/bin" HOME="$HOME_DIR" RECORD="$WORK/record" \
+    TERMAG_CLAUDE_FLOOR_FILE="$WORK/floor" TERMAG_CLAUDE_UPDATE="$WORK/updater" CLAUDE_VER_FILE="$WORK/claude-version" \
+    "$@" "$BASH_BIN" "$SCRIPT" "$o" 2 --github connected --claude-floor "$fa" 2>"$WORK/err"
+}
+printf '2.1.308\n' > "$WORK/floor"
+floor_run_arg ord-fla-up 2.1.312 2.1.320 UPD_TO=2.1.320; got=$?
+[ "$got" = 0 ] || fail 'claude-floor: above the file: the runner runs once updated' 0 "$got: $(cat "$WORK/err")"
+[ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.320' ] || fail "claude-floor: the orchestrator's floor is the one ensured" '--ensure 2.1.320' "$(cat "$WORK/record.updater" 2>/dev/null)"
+grep -q 'the Claude Code floor is 2.1.320, from the orchestrator (the floor file says 2.1.308)' "$WORK/err" || fail 'claude-floor: says where the floor came from' 'from the orchestrator' "$(cat "$WORK/err")"
+argv_has '--claude-floor' && fail 'claude-floor: the flag is not passed on to the runner' '(absent)' "$(tr '\n' ' ' <"$WORK/record.argv")"
+floor_run_arg ord-fla-down 2.1.305 2.1.300; got=$?
+[ "$got" = 0 ] || fail 'claude-floor: below the file: the lower floor applies' 0 "$got: $(cat "$WORK/err")"
+[ ! -e "$WORK/record.updater" ] || fail 'claude-floor: 2.1.305 is at the floor 2.1.300 the orchestrator sent' 'not run' "$(cat "$WORK/record.updater")"
+[ -e "$WORK/record.argv" ] || fail 'claude-floor: below the file: a runner starts' started 'not started'
+floor_run_arg ord-fla-stuck 2.1.312 2.1.320; got=$?
+[ "$got" = 2 ] || fail "claude-floor: still below the orchestrator's floor: exits 2" 2 "$got"
+grep -q 'still 2.1.312, below the floor 2.1.320; not starting a runner' "$WORK/err" || fail "claude-floor: still below: says so" 'below the floor 2.1.320' "$(cat "$WORK/err")"
+for bad in latest '2.1.320;id' '-x' '2.1' ''; do
+  floor_run_arg ord-fla-bad 2.1.305 "$bad" UPD_TO=2.1.308; got=$?
+  [ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.308' ] || fail "claude-floor: a malformed '$bad' is ignored and the file's floor applies" '--ensure 2.1.308' "$(cat "$WORK/record.updater" 2>/dev/null)"
+  [ "$got" = 0 ] || fail "claude-floor: a malformed '$bad': the runner runs on the file's floor" 0 "$got"
+  [ -z "$bad" ] || grep -qF "ignoring --claude-floor '$bad': not x.y.z; the floor file applies" "$WORK/err" || fail "claude-floor: a malformed '$bad' says so" 'ignoring --claude-floor' "$(cat "$WORK/err")"
+done
+# No floor file: the orchestrator's floor alone.
+floor_run_arg ord-fla-nofile 2.1.312 2.1.320 TERMAG_CLAUDE_FLOOR_FILE="$WORK/no-such-floor" UPD_TO=2.1.320; got=$?
+[ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.320' ] || fail "claude-floor: without a floor file the orchestrator's floor applies" '--ensure 2.1.320' "$(cat "$WORK/record.updater" 2>/dev/null)"
+grep -q 'termag-claude-runner-flags: anthropic-git github claude-floor$' "$SCRIPT" || fail 'the flags line carries claude-floor (claude-runner-wrapper-v3)' 'claude-floor on the flags line' "$(grep 'termag-claude-runner-flags' "$SCRIPT")"
 
 if [ "$failures" -eq 0 ]; then
   echo "ok: termag-claude-runner"

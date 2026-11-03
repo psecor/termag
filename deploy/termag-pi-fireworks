@@ -6,28 +6,33 @@
 # plain pi for a workstream whose agent runs on Fireworks,
 # `--continue` on reconnect included (services/launchCommand.ts).
 #
-#   termag-pi-fireworks --model <id> [--context <n>] [pi args...]
+#   termag-pi-fireworks --model <id> [--context <n>] [--models <base64>] [pi args...]
 #
 # The orchestrator names the model (the workstream's, or the fireworks-models
-# flag's default) and its context window on every launch: the box keeps no
-# model list. `termag-credentials pi-model` adds it to the `termag-fireworks`
-# provider in pi's ~/.pi/agent/models.json, on the base `termag-credentials
+# flag's default), its context window and the flag's whole list (base64 of
+# [{id, label, context?}], fireworksMenuArg) on every launch: the box keeps no
+# model list. `termag-credentials pi-model` writes them into the
+# `termag-fireworks` provider in pi's ~/.pi/agent/models.json, so pi's /model
+# lists every model by its label, on the base `termag-credentials
 # apply fireworks` recorded from the delivery. pi sends the box's agent token,
 # which termag-claude-token reads from the agent config on each request; the
 # gateway checks it and the model, and puts Fireworks' key in its place, so no
 # Fireworks credential is on this box.
 #
 # Everything after our flags is passed to pi unchanged.
+# termag-pi-fireworks: fireworks-pi-menu-v1 (agent/credentials.js advertises it
+# while this line is here and termag-credentials has its own): --models.
 set -u
 PATH="$HOME/.local/bin:$PATH"
 
 EXT="${TERMAG_PI_EXT:-$HOME/.local/share/termag/pi-ext/termag-status.ts}"
 
-model='' context=''
+model='' context='' models=''
 while [ $# -gt 0 ]; do
   case $1 in
     --model) model=${2:-}; shift 2 2>/dev/null || shift ;;
     --context) context=${2:-}; shift 2 2>/dev/null || shift ;;
+    --models) models=${2:-}; shift 2 2>/dev/null || shift ;;
     *) break ;;
   esac
 done
@@ -48,7 +53,7 @@ if [ -z "$model" ]; then
 fi
 
 # Says why, and fails, where Fireworks is not set up on this box.
-if ! termag-credentials pi-model --model "$model" ${context:+--context "$context"} </dev/null; then
+if ! termag-credentials pi-model --model "$model" ${context:+--context "$context"} ${models:+--models "$models"} </dev/null; then
   echo '  In the ctrl pane run:  termag-credentials status' >&2
   exit 1
 fi

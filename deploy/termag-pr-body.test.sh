@@ -42,7 +42,7 @@ printf 'host-1\n'
 EOF
 chmod +x "$STUB/curl" "$STUB/hostname"
 
-run() { env -u TERMAG_BOX_ID -u TERMAG_PROJECT PATH="$STUB:$PATH" "$SCRIPT" "$@"; }
+run() { env -u TERMAG_BOX_ID -u TERMAG_PROJECT -u TERMAG_ASK_THREAD PATH="$STUB:$PATH" "$SCRIPT" "$@"; }
 
 # ── the shape ───────────────────────────────────────────────────────────────
 got="$(printf 'Summary\n\n- one\n' | run --box i-0abc --project web)"
@@ -52,6 +52,8 @@ want="$(printf '%s\n' '<!-- TERMAG_PR_BODY_BEGIN -->' 'Summary' '' '- one' '<!--
 
 got="$(printf 'x\n' | run --box b --project p --ask th_123 | grep '^<!-- termag:')"
 [ "$got" = '<!-- termag: box=b project=p ask=th_123 -->' ] || fail '--ask is added' 'ask=th_123' "$got"
+got="$(printf 'x\n' | env -u TERMAG_BOX_ID -u TERMAG_PROJECT TERMAG_ASK_THREAD=thr0000000001 PATH="$STUB:$PATH" "$SCRIPT" --box b --project p | grep '^<!-- termag:')"
+[ "$got" = '<!-- termag: box=b project=p ask=thr0000000001 -->' ] || fail "an ask run's TERMAG_ASK_THREAD is the default --ask" 'ask=thr0000000001' "$got"
 
 printf 'from a file\n' > "$WORK/body.md"
 got="$(run --box b --project p "$WORK/body.md" | sed -n 2p)"

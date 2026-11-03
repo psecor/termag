@@ -83,5 +83,29 @@ else
     echo "SKIP: no visudo here"
 fi
 
+
+# The host's Claude Code floor and its updater:
+# root-owned copies outside /opt/termag, the floor
+# copied so root never reads one termag could lower, and the sudoers rule
+# checked by visudo at bake time. deploy/claude-orchestrator-update.test.sh
+# tests the recipe, the helper, the rule and the units themselves.
+for line in \
+    'sudo install -m 0755 -o root -g root /opt/termag/deploy/claude-orchestrator-update /usr/local/libexec/termag/claude-orchestrator-update' \
+    'sudo install -m 0755 -o root -g root /opt/termag/deploy/claude-orchestrator-update-start /usr/local/libexec/termag/claude-orchestrator-update-start' \
+    'sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-code-floor /usr/local/lib/termag/claude-code-floor' \
+    'sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-orchestrator-floor.service /etc/systemd/system/claude-orchestrator-floor.service' \
+    "sudo install -m 0644 -o root -g root '/opt/termag/deploy/claude-orchestrator-update@.service' '/etc/systemd/system/claude-orchestrator-update@.service'" \
+    'sudo install -d -m 0700 -o termag -g termag /var/lib/claude-orchestrator-update/requests' \
+    'sudo install -d -m 0750 -o root -g termag /var/lib/claude-orchestrator-update/runs' \
+    'sudo install -m 0440 -o root -g root /opt/termag/deploy/claude-orchestrator-update.sudoers /etc/sudoers.d/93-termag-claude-orchestrator-update' \
+    'sudo visudo -cf /etc/sudoers.d/93-termag-claude-orchestrator-update'; do
+    if grep -qxF "$line" "$SETUP"; then pass "bake: $line"; else fail "orchestrator-setup.sh lacks: $line"; fi
+done
+if grep -v '^[[:space:]]*#' "$SETUP" | grep -qE 'enable[^|]*claude-orchestrator-(floor|update)'; then
+    fail "the bake must not enable the floor or update units: the runner orchestrator pulls the floor unit in after cloud-init's install"
+else
+    pass "the bake enables neither the floor nor the update unit"
+fi
+
 [ "$fails" -eq 0 ] || { echo "$fails check(s) failed" >&2; exit 1; }
 echo "all checks passed"

@@ -336,6 +336,82 @@ starts (`[SLACK] Who may use the bot: …`).
 5. Add slash command: `/t`
 6. Install to workspace
 
+Or create it from `deploy/slack-app-manifest.yaml`, which also makes the app the OAuth
+client for Slack's MCP server through the MCP broker (its user scopes and the broker's
+redirect URL). Its header comment lists the admin steps: set the redirect URL's host,
+apply the manifest, reinstall, and put the app's Client ID and Client Secret in
+`MCP_OAUTH_CLIENTS` and the variable it names.
+
+A second app for local development needs its own command (`SLACK_COMMAND=/tdev`,
+and the same in its manifest) and its own tokens.
+
+### Agent experience (optional)
+
+DMs and @mentions run Claude Code in your active project (`/t switch`), and
+only for the operators in `ALLOWED_SLACK_USERS` (above); none of what
+follows widens that. Declaring
+the app an agent (app settings → **Agents** → **Agent experience**, which adds
+the `assistant:write` scope) makes each DM thread a Slack agent session: Slack
+shows **Working…** and a Stop button, the reply streams in, the thread gets its
+first line as its title, and each thread keeps its own Claude session (resumed
+while the active project stays the same). Also subscribe to the
+`agent_session_stopped` bot event, or Stop has nothing to deliver it, and
+reinstall. In the manifest:
+
+```yaml
+features:
+  agent_view:
+    agent_description: Runs Claude Code in your active termag project.
+    suggested_prompts:
+      - title: Tour this repo
+        message: Give me a short tour of this repository.
+oauth_config:
+  scopes:
+    bot: [assistant:write, files:write]   # added to the existing list; files:write only for attachments
+settings:
+  event_subscriptions:
+    bot_events: [agent_session_stopped]   # added to the existing list
+```
+
+Claude can end a question with `[choices: A | B]`, which the bot shows as
+buttons; a click (only by the person the reply was for) becomes their next
+message. It can also offer files with `[attach: <path>]`, which needs the
+`files:write` scope. Nothing is uploaded from Claude's reply alone: each file
+becomes a Share / Don't share question showing its name, size and path, which
+only the person the reply was for can answer, and it is checked again before
+upload. Only images, PDF, CSV, text, Markdown and diffs (not JSON, logs or
+HTML) under the working directory or the temp directory qualify, never
+dotfiles (`slack/agentAttachments.ts`).
+
+With **Suggested Prompts → Dynamic**, the bot sets the Messages tab's prompts
+for the user's active project each time they open it; **Fixed** uses the
+manifest's `suggested_prompts` instead.
+
+The backend takes the agent path when the bot token has `assistant:write`
+(checked every five minutes, `slack/agentSession.ts`) **and** the
+flag `slack-agent-enabled` is on for the person writing (their termag account,
+matched by email), who must already be one DMs and @mentions answer; otherwise
+it answers them as before. Locally,
+`TERMAG_FLAGS='{"slack-agent-enabled":true}'` turns it on. An @mention in a channel becomes
+an agent session in its thread too, with three differences: the thread belongs
+to whoever first @mentioned the bot there (anyone else is told privately to
+start their own thread), follow-ups still need an @mention, and the thread only
+ever resumes its own Claude session (a DM's recent conversation never carries
+into a channel). A group DM counts as a channel here. Stop ends a run only for
+the person it is running for, and one person may have three agent
+conversations running at once. Thread owners and sessions are saved
+(`slack_agent_threads`, `slack_agent_dm_last`) and read back when the bot
+connects, so a deploy keeps them; runs live in the backend's memory, which
+assumes one process holds the Slack connection (with `ORCHESTRATOR_LEASE`, only
+the lease holder does). A shutdown, or a lease handover that moves the Slack
+connection elsewhere, stops this process's running turns with a "termag is
+restarting, send it again" note first, so the next holder never runs a second
+`claude` on the same session. A thread claimed before its saved owner was
+loaded starts a fresh conversation rather than inheriting one. A reply that cannot pick up its thread's
+earlier conversation (the active project changed, Claude no longer has the
+session, or the thread is older than 14 days) says so and starts fresh.
+Some agent features need a paid Slack plan or a Developer Program sandbox.
+
 ### Slack commands
 
 - `/t` — capture and post the active agent's terminal pane

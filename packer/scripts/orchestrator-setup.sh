@@ -345,6 +345,33 @@ sudo install -d -m 0755 -o root -g root /etc/claude
 sudo install -m 0440 -o root -g root /opt/termag/deploy/claude-runner-orchestrator.sudoers /etc/sudoers.d/92-termag-claude-runner
 sudo visudo -cf /etc/sudoers.d/92-termag-claude-runner
 
+# The host's Claude Code follows termag's floor.
+# cloud-init installs /usr/bin/claude at every boot,
+# pinned in the infra repo; claude-orchestrator-floor.service, which the runner
+# orchestrator's unit Wants= and is After=, then brings it to at least
+# deploy/claude-code-floor. claude-orchestrator-update@<run>.service is a
+# requested run (the Software tab's orchestrator row, the nightly run): the
+# backend starts it through one sudoers line for one helper, which takes only
+# a run id. All root-owned and outside /opt/termag, which termag can rewrite:
+# the recipe, the helper, the units, and the floor, copied here so root never
+# reads a floor the backend's user could lower.
+sudo install -d -m 0755 -o root -g root /usr/local/libexec/termag
+sudo install -m 0755 -o root -g root /opt/termag/deploy/claude-orchestrator-update /usr/local/libexec/termag/claude-orchestrator-update
+sudo install -m 0755 -o root -g root /opt/termag/deploy/claude-orchestrator-update-start /usr/local/libexec/termag/claude-orchestrator-update-start
+sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-code-floor /usr/local/lib/termag/claude-code-floor
+sudo install -m 0644 -o root -g root /opt/termag/deploy/claude-orchestrator-floor.service /etc/systemd/system/claude-orchestrator-floor.service
+sudo install -m 0644 -o root -g root '/opt/termag/deploy/claude-orchestrator-update@.service' '/etc/systemd/system/claude-orchestrator-update@.service'
+# The state: root's lock and rejection record; requests/, where the backend
+# writes a run's policy (termag's, 0700: host users can neither read nor plant
+# one); runs/, root's records, which termag reads.
+sudo install -d -m 0755 -o root -g root /var/lib/claude-orchestrator-update
+sudo install -d -m 0700 -o termag -g termag /var/lib/claude-orchestrator-update/requests
+sudo install -d -m 0750 -o root -g termag /var/lib/claude-orchestrator-update/runs
+sudo install -m 0440 -o root -g root /opt/termag/deploy/claude-orchestrator-update.sudoers /etc/sudoers.d/93-termag-claude-orchestrator-update
+sudo visudo -cf /etc/sudoers.d/93-termag-claude-orchestrator-update
+grep -qx '[0-9]\+\.[0-9]\+\.[0-9]\+' /usr/local/lib/termag/claude-code-floor
+sudo systemctl daemon-reload
+
 # Key-only SSH: keys are what gate Session Manager SSH.
 printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' | sudo tee /etc/ssh/sshd_config.d/10-termag-keys-only.conf >/dev/null
 sudo chmod 0644 /etc/ssh/sshd_config.d/10-termag-keys-only.conf

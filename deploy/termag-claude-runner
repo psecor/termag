@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # termag-claude-runner -- run ONE Claude Code cloud session on this box.
 #
-# termag-claude-runner-flags: anthropic-git github
+# termag-claude-runner-flags: anthropic-git github claude-floor
 # (The line above is read by agent/claude-runner-wrapper.js: the agent
 # announces `claude-runner-wrapper-v2` when the installed wrapper carries it,
-# and the orchestrator sends --anthropic-git and --github only to such a box.)
+# and the orchestrator sends --anthropic-git and --github only to such a box;
+# `claude-runner-wrapper-v3` for the word claude-floor, and only then does it
+# send --claude-floor.)
 #
 # The orchestrator's spawn path (backend/src/services/claudeRunnerSpawn.ts)
 # writes the single-use work order to ~/.termag/claude-runner/<order>.work-order
@@ -95,7 +97,29 @@
 # whose workspace no longer exists (a worktree removed by hand). The shared
 # disk cache and repo contents cache live elsewhere and are never touched.
 #
-# Usage: termag-claude-runner <order-id> [slot] [--otel-project <id> --otel-endpoint <url> [--user-key <id> --box-key <id>]]
+# Claude Code floor. The runner runs with
+# DISABLE_AUTOUPDATER=1, so its claude is whatever the box has. Once claude is
+# resolved (and has the self-hosted-runner subcommand), it is checked against
+# the floor in ~/.local/share/termag/claude-code-floor (deploy/claude-code-floor,
+# installed by termag-reconcile; the checkout's copy when that is missing). Below
+# it, `termag-claude-update --ensure <floor>` runs, capped at
+# TERMAG_CLAUDE_UPDATE_TIMEOUT (180 s, so the runner still registers inside the
+# orchestrator's 300 s --expected-spawn-seconds), and claude is resolved again.
+# Still below it (or of a version it cannot tell), the script exits 2 before
+# the checkout is seeded, no runner starts, and the end report says
+# exitReason=claude-below-floor. It fails closed the same way, with exit 2,
+# when an install was rejected: termag-claude-update installs one exact
+# version and records any install that did not end at exactly it
+# (~/.termag/claude-update.rejected); while that record exists the updater
+# runs again and, if it is still there, exitReason=claude-update-rejected. An
+# updater stopped at the cap (an install perhaps cut halfway, unverified) is
+# exitReason=claude-update-incomplete. Without a floor file there is no check.
+# With --claude-floor <x.y.z> (phase 2: the orchestrator's policy floor, the
+# claude-code-update-policy flag) that floor is the one checked, and the file
+# is only the fallback for a launch without it; a value that is not x.y.z is
+# logged and ignored, and the file applies.
+#
+# Usage: termag-claude-runner <order-id> [slot] [--ld-project <id> --otel-endpoint <url> [--ld-user-key <id> --ld-box-key <id>]] [--claude-floor <x.y.z>]
 #        (slot defaults to 2)
 # Env:
 #   TERMAG_STATE_DIR          default $HOME/.termag
@@ -107,8 +131,12 @@
 #   TERMAG_AGENT_CONFIG       the agent config (token, termag_url) the end report uses
 #   TERMAG_CLAUDE_RUNNER_HOOKS  the termag hooks dir; default $HOME/.local/lib/termag/claude-runner-hooks
 #   TERMAG_BAZEL_OUTPUT_USER_ROOT  where output bases live; default $HOME/.cache/bazel/_bazel_<user>
+#   TERMAG_CLAUDE_FLOOR_FILE  the Claude Code floor; default $HOME/.local/share/termag/claude-code-floor
+#   TERMAG_CLAUDE_UPDATE      the updater; default $HOME/.local/bin/termag-claude-update
+#   TERMAG_CLAUDE_UPDATE_TIMEOUT  seconds the updater may take; default 180
 #
-# Exit codes: 2 bad usage, missing work order or unusable claude; 128+n after
+# Exit codes: 2 bad usage, missing work order, unusable claude or claude below
+# the floor; 128+n after
 # signal n; otherwise the runner's own.
 set -u
 
@@ -141,6 +169,8 @@ box_key=
 # below and makes the keep-or-remove check conservative.
 anthropic_git=0
 github_state=
+# The orchestrator's Claude Code floor (see the header), checked below.
+arg_claude_floor=
 while [ $# -gt 0 ]; do
   case "$1" in
     --otel-project) otel_project=${2:-}; shift ;;
@@ -149,6 +179,7 @@ while [ $# -gt 0 ]; do
     --box-key) box_key=${2:-}; shift ;;
     --anthropic-git) anthropic_git=1 ;;
     --github) github_state=${2:-}; shift ;;
+    --claude-floor) arg_claude_floor=${2:-}; shift ;;
   esac
   [ $# -gt 0 ] && shift
 done
@@ -491,23 +522,124 @@ if ! mv -f "$work_order" "$launch_order"; then
 fi
 
 # claude: the native install (~/.local/bin) first, then PATH, then the nvm global.
-claude_bin=${CLAUDE_BIN:-}
-if [ -z "$claude_bin" ]; then
-  if [ -x "$HOME/.local/bin/claude" ]; then
-    claude_bin=$HOME/.local/bin/claude
-  elif command -v claude >/dev/null 2>&1; then
-    claude_bin=$(command -v claude)
+resolve_claude_bin() {
+  hash -r
+  claude_bin=${CLAUDE_BIN:-}
+  if [ -z "$claude_bin" ]; then
+    if [ -x "$HOME/.local/bin/claude" ]; then
+      claude_bin=$HOME/.local/bin/claude
+    elif command -v claude >/dev/null 2>&1; then
+      claude_bin=$(command -v claude)
+    else
+      export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
+      # shellcheck disable=SC1091
+      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
+      claude_bin=$(command -v claude 2>/dev/null || true)
+    fi
+  fi
+  if [ -z "$claude_bin" ]; then
+    log 'no claude with the self-hosted-runner subcommand on this box'
+    exit 2
+  fi
+}
+# Checked after the floor guard below, not before it: a claude too old to have
+# the subcommand (below the floor by definition), or one an install cut at the
+# cap left unable to run, is exactly what termag-claude-update --ensure repairs,
+# and the updater only needs --version.
+require_runner_subcommand() {
+  if ! "$claude_bin" self-hosted-runner --help >/dev/null 2>&1; then
+    log 'no claude with the self-hosted-runner subcommand on this box'
+    exit 2
+  fi
+}
+resolve_claude_bin
+
+# The Claude Code floor (see the header): a claude below it is brought up by
+# termag-claude-update --ensure, capped so the runner still registers inside
+# the orchestrator's spawn deadline; one still below it starts no runner.
+claude_version() { timeout 20 "$1" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1; }
+at_least() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+floor_file=${TERMAG_CLAUDE_FLOOR_FILE:-$HOME/.local/share/termag/claude-code-floor}
+[ -r "$floor_file" ] || [ -n "${TERMAG_CLAUDE_FLOOR_FILE:-}" ] || floor_file=$HOME/src/termag/deploy/claude-code-floor
+claude_floor=$(head -n 1 "$floor_file" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$claude_floor" ] && ! [[ "$claude_floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  log "ignoring the Claude Code floor '$claude_floor' in $floor_file: not x.y.z"
+  claude_floor=
+fi
+# The orchestrator's floor, when it sent one, wins over the file: the file is
+# what the box last knew, the flag what the orchestrator knows now. Only
+# digits and dots get as far as termag-claude-update's argv.
+if [ -n "$arg_claude_floor" ]; then
+  if [[ "$arg_claude_floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$arg_claude_floor" = "$claude_floor" ] || log "the Claude Code floor is $arg_claude_floor, from the orchestrator (the floor file says ${claude_floor:-nothing})"
+    claude_floor=$arg_claude_floor
   else
-    export NVM_DIR=${NVM_DIR:-$HOME/.nvm}
-    # shellcheck disable=SC1091
-    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
-    claude_bin=$(command -v claude 2>/dev/null || true)
+    log "ignoring --claude-floor '${arg_claude_floor:0:40}': not x.y.z; the floor file applies"
   fi
 fi
-if [ -z "$claude_bin" ] || ! "$claude_bin" self-hosted-runner --help >/dev/null 2>&1; then
-  log 'no claude with the self-hosted-runner subcommand on this box'
-  exit 2
+# An install termag-claude-update rejected (it did not end at exactly the
+# version it asked for, or its binary does not run) is recorded here until a
+# later update verifies that path again; while it is, the binary in place is
+# not one the updater checked, whatever version it prints, and no runner
+# starts on it.
+update_rejected=$state_dir/claude-update.rejected
+if [ -n "$claude_floor" ]; then
+  claude_have=$(claude_version "$claude_bin")
+  if [ -s "$update_rejected" ] || ! at_least "$claude_have" "$claude_floor"; then
+    update_timeout=${TERMAG_CLAUDE_UPDATE_TIMEOUT:-180}
+    updater=
+    for u in "${TERMAG_CLAUDE_UPDATE:-}" "$HOME/.local/bin/termag-claude-update" "$HOME/src/termag/deploy/termag-claude-update"; do
+      if [ -n "$u" ] && [ -x "$u" ]; then updater=$u; break; fi
+    done
+    if [ -n "$updater" ]; then
+      if [ -s "$update_rejected" ]; then
+        log "a Claude Code install was rejected ($(head -n 1 "$update_rejected")); running termag-claude-update --ensure (at most ${update_timeout}s)"
+      else
+        log "claude $claude_bin is ${claude_have:-of unknown version}, below the floor $claude_floor; running termag-claude-update --ensure (at most ${update_timeout}s)"
+      fi
+      # Waited for in the background, like the runner below, so a hangup
+      # ends this script at once; the update itself runs on to its cap. Its
+      # budget is the cap less 10 s, so it stops its own npm install rather
+      # than being cut by the timeout here (which stays as the backstop).
+      # The numbers: 180 s cap -> 170 s budget -> about 140 s for the longest
+      # single npm install (the updater keeps a 30 s reserve), and a slot that
+      # finds another slot's update holding the lock waits up to ~152 s for
+      # it (an 18 s reserve), then exits on what that one installed. 180 s plus the
+      # seeding and runner start below stays inside the orchestrator's 300 s
+      # --expected-spawn-seconds.
+      case "$update_timeout" in ''|*[!0-9]*) update_timeout=180 ;; esac
+      update_budget=$(( update_timeout > 10 ? update_timeout - 10 : 0 ))
+      TERMAG_CLAUDE_BUDGET=$update_budget timeout -k 10 "$update_timeout" "$updater" --ensure "$claude_floor" </dev/null &
+      wait "$!"
+      update_rc=$?
+      log "termag-claude-update exited $update_rc"
+      # Stopped by the cap here (124, or KILLed: 137) rather than by its own
+      # budget: an install may have been cut halfway and nothing verified
+      # what is in place, so this session does not start on it.
+      if [ "$update_rc" = 124 ] || [ "$update_rc" -ge 128 ]; then
+        log "termag-claude-update was stopped at the ${update_timeout}s cap; not starting a runner on an unverified install"
+        exit_reason=claude-update-incomplete
+        exit 2
+      fi
+    else
+      log "claude $claude_bin is ${claude_have:-of unknown version}, below the floor $claude_floor, and termag-claude-update is not installed"
+    fi
+    resolve_claude_bin
+    claude_have=$(claude_version "$claude_bin")
+    if [ -s "$update_rejected" ]; then
+      log "a Claude Code install is rejected ($(head -n 1 "$update_rejected")); not starting a runner on $claude_bin"
+      exit_reason=claude-update-rejected
+      exit 2
+    fi
+    if ! at_least "$claude_have" "$claude_floor"; then
+      log "claude $claude_bin is still ${claude_have:-of unknown version}, below the floor $claude_floor; not starting a runner"
+      exit_reason=claude-below-floor
+      exit 2
+    fi
+    log "claude $claude_bin is now $claude_have, at or above the floor $claude_floor"
+  fi
 fi
+require_runner_subcommand
 
 # The session's slot, written where the repository's make reads it. The environment
 # this wrapper exports reaches the runner and its Bash tool, but not a tmux
@@ -587,6 +719,11 @@ export TERMAG_CLAUDE_RUNNER_BASE_DIR=$base_dir
 # default credential chain, which on a box is its instance role. A value the
 # owner or the launching environment set stays.
 export STACK_AWS_PROFILE=${STACK_AWS_PROFILE-}
+# What started the session, for the tools it runs:
+# the same value as the resource's
+# termag.session.kind below, set with telemetry or without, over any the
+# launching environment carried.
+export TERMAG_SESSION_KIND=cloud
 
 # The session's own OpenTelemetry: metrics, events and traces to the telemetry
 # project the orchestrator named, over OTLP/HTTP. Sessions inherit this environment, and a launcher's

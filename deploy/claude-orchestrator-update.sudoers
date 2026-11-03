@@ -1,0 +1,13 @@
+# /etc/sudoers.d/93-termag-claude-orchestrator-update, installed by the
+# orchestrator bake (packer/scripts/orchestrator-setup.sh) and checked there
+# with visudo -cf (docs/claude-code-updates.md, "The orchestrator host").
+#
+# /usr/bin/claude is root's npm global, so its update runs as root, in the
+# system unit claude-orchestrator-update@<run>.service. The backend, which
+# runs as termag, may start it, and only it, through the one root-owned
+# helper, with one argument of the run id's alphabet (the helper checks its
+# length): no shell, no other unit, no version. A helper rather than a rule on
+# systemctl, because a sudoers wildcard also matches spaces, so
+# `systemctl start claude-orchestrator-update@*` would let a second unit
+# through. The same shape as a box's deploy/termag-gh-update.sudoers.
+termag ALL=(root) NOPASSWD: /usr/local/libexec/termag/claude-orchestrator-update-start ^[a-z0-9]+$

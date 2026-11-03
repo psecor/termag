@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# termag-t3-install -- install the pinned t3 server (deploy/t3-server.pin) on a
+# box, for the desktop app's box bridge. Run as the box user, from the checkout: termag-reconcile runs it on
+# every boot and box update, so a pin bump reaches running boxes without a
+# rebake, and a box image bake handed the tarball runs it on that file
+# (packer/scripts/install-t3-server.sh).
+#
+# What it lays down, under <root> (default /opt/termag-t3, owned by the box
+# user so no step here needs root once it exists):
+#
+#   <root>/<version>/       the unpacked tarball (bin/t3, libexec/, BUILD-INFO.json),
+#                           with .termag-t3-sha256, the digest it was verified at
+#   <root>/current          -> <version>, swapped atomically
+#   <root>/bin/t3           deploy/termag-t3: the box's outbound policy, then
+#                           exec current/bin/t3
+#
+# and, in the box user's home, the agent drop-in
+# ~/.config/systemd/user/termag-agent.service.d/t3.conf
+# (Environment=TERMAG_T3_COMMAND=<root>/bin/t3) and, while it is unset there,
+# enableProviderUpdateChecks=false in the server's ~/.t3/userdata/settings.json
+# (the box's outbound policy that has no variable: deploy/termag-t3 has the
+# rest), and, with sudo -n, the AppArmor profile its browser needs
+# (/etc/apparmor.d/t3-chrome-headless-shell, below). Nothing names the server
+# until it has been installed and has run `--version` here, so an agent never
+# runs one that cannot start. An agent that started without one runs this
+# itself (createPinnedInstall in agent/t3-bridge.js): --check before its first
+# hello, then an install.
+#
+# A running server keeps its version: the upgrade only moves `current`, and
+# the server in the termag-t3 tmux session runs the old tree until it next
+# starts (a reboot, a stop/start, or `tmux kill-session -t termag-t3`; the
+# desktop's next ensure starts the new one). For that reason the previous
+# version is kept, and older ones are removed only when no process runs from
+# them.
+#
+# Content-compared like termag-reconcile: a current box writes nothing.
+#
+# Usage:
+#   termag-t3-install           install or repair, reporting what changed
+#   termag-t3-install --check   report drift, change nothing; exit 1 only for
+#                               drift this box could fix (a source is set, the
+#                               root is writable), so an unhosted pin is not
+#                               drift
+#
+# Exit: 0 current, installed, or nothing to do here (no digest for this
+# architecture, no source configured, no writable root); 1 --check drift;
+# 2 usage; 3 a failed install (fetch, digest, unpack, or the server won't run).
+#
+# Env:
+#   TERMAG_T3_SERVER_SOURCE  the tarball to install instead of <base_url>/<name>
+#                            (an absolute path, file://, https://, s3://, or
+#                            gh://<owner>/<repo>/<tag>/<asset>, a release asset
+#                            fetched with the box user's gh login); the pin's
+#                            digest still applies. The bake sets it when given
+#                            a local tarball.
+#   TERMAG_T3_ROOT           default /opt/termag-t3
+#   TERMAG_T3_PIN            default t3-server.pin beside this script
+#   TERMAG_T3_DROPIN_DIR     default ~/.config/systemd/user/termag-agent.service.d
+#   TERMAG_T3_SETTINGS       default ~/.t3/userdata/settings.json (the agent
+#                            runs the server with --base-dir ~/.t3)
+#   TERMAG_T3_ARCH           default from uname -m (arm64 | x64)
+#   TERMAG_T3_SUDO           default "sudo -n"; only creates <root> when missing
+#   TERMAG_T3_GH_HOST_FILE   default /etc/profile.d/termag-github.sh: where a
+#                            gh:// fetch reads GH_HOST when it isn't set
+#   TERMAG_T3_USERNS_RESTRICTION  default
+#                            /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+#   TERMAG_T3_APPARMOR_PROFILE    default /etc/apparmor.d/t3-chrome-headless-shell
+#   TERMAG_T3_APPARMOR_PARSER     default apparmor_parser (run with sudo -n)
+set -u
+
+HERE=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd)
+ROOT=${TERMAG_T3_ROOT:-/opt/termag-t3}
+PIN=${TERMAG_T3_PIN:-$HERE/t3-server.pin}
+LAUNCHER_SRC=$HERE/termag-t3
+DROPIN_DIR=${TERMAG_T3_DROPIN_DIR:-$HOME/.config/systemd/user/termag-agent.service.d}
+DROPIN=$DROPIN_DIR/t3.conf
+SETTINGS=${TERMAG_T3_SETTINGS:-$HOME/.t3/userdata/settings.json}
+GH_HOST_FILE=${TERMAG_T3_GH_HOST_FILE:-/etc/profile.d/termag-github.sh}
+read -r -a SUDO <<< "${TERMAG_T3_SUDO-sudo -n}"
+USERNS_RESTRICTION=${TERMAG_T3_USERNS_RESTRICTION:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}
+PROFILE=${TERMAG_T3_APPARMOR_PROFILE:-/etc/apparmor.d/t3-chrome-headless-shell}
+PROFILE_SRC=$HERE/t3-chrome-headless-shell.apparmor
+read -r -a APPARMOR_PARSER <<< "${TERMAG_T3_APPARMOR_PARSER-apparmor_parser}"
+
+MODE=install
+case "${1:-}" in
+  --check) MODE=check ;;
+  '') ;;
+  -h | --help) sed -n '2,/^set -u$/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+  *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+esac
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'termag-t3-install: %s\n' "$*" >&2; }
+
+case "${TERMAG_T3_ARCH:-$(uname -m)}" in
+  aarch64 | arm64) ARCH=arm64 ;;
+  x86_64 | amd64 | x64) ARCH=x64 ;;
+  *) ARCH=$(uname -m) ;;
+esac
+
+# KEY=value lines; anything else is a comment or an error. Never sourced: the
+# pin is data, and a value is checked against its own shape before use.
+pin_get() {
+  local key=$1 line k v
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '#'* | '') continue ;; esac
+    k=${line%%=*}
+    v=${line#*=}
+    [ "$k" = "$key" ] && { printf '%s' "$v"; return 0; }
+  done < "$PIN"
+  return 1
+}
+
+[ -f "$PIN" ] || { warn "no pin at $PIN; nothing to install"; exit 0; }
+VERSION=$(pin_get version || true)
+SHA256=$(pin_get "sha256_linux_$ARCH" || true)
+BASE_URL=$(pin_get base_url || true)
+
+# Nothing pinned for this architecture: nothing to do, and not drift.
+[ -n "$SHA256" ] || exit 0
+if ! [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,79}$ ]]; then
+  warn "version '$VERSION' in $PIN is not a version"; exit 3
+fi
+if ! [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  warn "sha256_linux_$ARCH in $PIN is not a sha256"; exit 3
+fi
+
+STEM="termag-t3-server-$VERSION-linux-$ARCH"
+SOURCE=${TERMAG_T3_SERVER_SOURCE:-}
+if [ -z "$SOURCE" ] && [ -n "$BASE_URL" ]; then SOURCE="${BASE_URL%/}/$STEM.tar.gz"; fi
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# The drop-in names <root>/bin/t3; written only once a server is installed.
+dropin_content() {
+  cat <<EOF
+# Written by termag-t3-install (deploy/termag-t3-install): the agent runs the
+# pinned t3 server through termag's launcher. Overwritten on every reconcile; to run another t3, add a
+# later-sorting drop-in (e.g. 90-local.conf) with your own TERMAG_T3_COMMAND.
+[Service]
+Environment=TERMAG_T3_COMMAND=$ROOT/bin/t3
+EOF
+}
+
+# The server settings the box sets, each only while it is unset, so an owner's
+# own choice stays. enableProviderUpdateChecks=false stops the model manifest
+# fetch from raw.githubusercontent.com/pingdotgg/t3code (the build's bundled
+# manifest is used) and the npm "latest" checks for Claude Code and Codex.
+# Needs jq (the box image has it); without it, or with a file jq cannot read,
+# the settings are left alone and that is not drift.
+SETTINGS_FILTER='if has("enableProviderUpdateChecks") then . else .enableProviderUpdateChecks = false end'
+settings_want() {
+  command -v jq >/dev/null 2>&1 || return 1
+  if [ -s "$SETTINGS" ]; then jq "$SETTINGS_FILTER" "$SETTINGS" 2>/dev/null
+  else jq -n "{} | $SETTINGS_FILTER"; fi
+}
+settings_current() {
+  local want
+  want=$(settings_want) || return 0
+  [ -s "$SETTINGS" ] && [ "$(jq -S . "$SETTINGS" 2>/dev/null)" = "$(printf '%s' "$want" | jq -S .)" ]
+}
+
+# Ubuntu 23.10+ (the box image is 24.04) lets a program make a user namespace
+# only under an AppArmor profile that allows it, so without one the server's
+# headless browser cannot start Chrome's sandbox and a box thread's browser
+# tab says "This server's host blocks the sandbox its browser runs in". The
+# server only checks that the profile exists. It is installed from this
+# checkout, never by running the downloaded server as root, and only with
+# sudo -n: without it, it is the owner's to add and not drift.
+profile_current() {
+  [ "$(cat "$USERNS_RESTRICTION" 2>/dev/null)" != 1 ] || cmp -s "$PROFILE_SRC" "$PROFILE"
+}
+profile_fixable() { [ -f "$PROFILE_SRC" ] && "${SUDO[@]}" true >/dev/null 2>&1; }
+
+installed_ok() {
+  [ -x "$ROOT/$VERSION/bin/t3" ] && [ "$(cat "$ROOT/$VERSION/.termag-t3-sha256" 2>/dev/null)" = "$SHA256" ]
+}
+
+# Drift this run could fix, one line each (empty: current).
+drift() {
+  if ! installed_ok; then
+    if [ -n "$SOURCE" ]; then say "MISSING: t3 server $VERSION (linux-$ARCH) in $ROOT/$VERSION"; fi
+    return 0
+  fi
+  [ "$(readlink "$ROOT/current" 2>/dev/null)" = "$VERSION" ] || say "DRIFT: $ROOT/current is not $VERSION"
+  cmp -s "$LAUNCHER_SRC" "$ROOT/bin/t3" || say "DRIFT: $ROOT/bin/t3 differs from $LAUNCHER_SRC"
+  [ "$(dropin_content)" = "$(cat "$DROPIN" 2>/dev/null)" ] || say "DRIFT: $DROPIN is not current"
+  settings_current || say "DRIFT: enableProviderUpdateChecks is unset in $SETTINGS"
+  profile_current || ! profile_fixable || say "DRIFT: $PROFILE is not installed (the browser's sandbox)"
+}
+
+root_writable() { [ -d "$ROOT" ] && [ -w "$ROOT" ]; }
+
+# Whether an install could write <root>: it is writable, or it is missing and
+# its parent is writable or sudo -n works (`sudo -n true` changes nothing).
+root_fixable() {
+  root_writable && return 0
+  [ ! -e "$ROOT" ] || return 1
+  [ -w "$(dirname -- "$ROOT")" ] || "${SUDO[@]}" true >/dev/null 2>&1
+}
+
+out=$(drift)
+if [ "$MODE" = check ]; then
+  # Drift a run could not fix (no root and no way to make one) is not drift.
+  if [ -n "$out" ] && root_fixable; then
+    printf '%s\n' "$out"
+    exit 1
+  fi
+  exit 0
+fi
+[ -n "$out" ] || exit 0
+
+# ── install ──────────────────────────────────────────────────────────────────
+
+if [ ! -d "$ROOT" ]; then
+  if ! mkdir -p "$ROOT" 2>/dev/null &&
+     ! "${SUDO[@]}" install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$ROOT" 2>/dev/null; then
+    warn "cannot create $ROOT (no sudo -n here); not installing the t3 server"
+    exit 0
+  fi
+fi
+root_writable || { warn "$ROOT is not writable by $(id -un); not installing the t3 server"; exit 0; }
+
+# One install at a time (a bake's step and the boot reconcile can overlap).
+exec 9> "$ROOT/.lock"
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+  say "t3 server: another install holds $ROOT/.lock; leaving it to that one"
+  exit 0
+fi
+
+# What an interrupted run left behind (a reconcile timeout, a reboot).
+remove_tree() {
+  # Only ever a directory directly under $ROOT, by its full path.
+  case "$1" in "$ROOT"/?*) ;; *) warn "refusing to remove $1"; return 1 ;; esac
+  rm -rf -- "$1"
+}
+for stale in "$ROOT"/.incoming.*; do
+  [ -d "$stale" ] && remove_tree "$stale"
+done
+
+# The host gh is logged in to on this box. termag-credentials points gh at the
+# GitHub broker with GH_HOST in /etc/profile.d and ~/.zshenv, which the
+# systemd units this runs under (termag-reconcile, termag-box-update) never
+# read, so the file is read here: one `export GH_HOST=<host>` line, never
+# sourced. None (a box that skips github uses its owner's own github.com
+# login): gh's default.
+gh_host() {
+  if [ -n "${GH_HOST:-}" ]; then printf '%s' "$GH_HOST"; return 0; fi
+  local line
+  line=$(grep -m1 -E '^export GH_HOST=[A-Za-z0-9.-]+$' "$GH_HOST_FILE" 2>/dev/null) || return 0
+  printf '%s' "${line#export GH_HOST=}"
+}
+
+fetch() {
+  local src=$1 dest=$2
+  case "$src" in
+    /*) cp -- "$src" "$dest" ;;
+    file://*) cp -- "${src#file://}" "$dest" ;;
+    http://* | https://*) curl -fsSL --retry 3 --connect-timeout 15 -o "$dest" "$src" ;;
+    s3://*)
+      command -v aws >/dev/null 2>&1 || { warn "no aws CLI for $src"; return 1; }
+      aws s3 cp --only-show-errors "$src" "$dest" ;;
+    gh://*)
+      # A release asset, with the box's gh login (termag-credentials signs gh
+      # in to the GitHub broker on claim), so an internal repository's
+      # releases work. Through the API, not `gh release download`: the broker
+      # passes GitHub's release JSON through, so that would fetch the asset
+      # from api.github.com, where the box has no login.
+      command -v gh >/dev/null 2>&1 || { warn "no gh CLI for $src"; return 1; }
+      local owner repo tag asset host id
+      IFS=/ read -r owner repo tag asset <<< "${src#gh://}"
+      if [ -z "$owner" ] || [ -z "$repo" ] || [ -z "$tag" ] || [ -z "$asset" ] \
+        || ! [[ "$owner/$repo/$tag/$asset" =~ ^[A-Za-z0-9._+/-]+$ ]]; then
+        warn "a gh:// source is gh://<owner>/<repo>/<tag>/<asset>, not $src"; return 1
+      fi
+      host=$(gh_host)
+      id=$(gh api --hostname "${host:-github.com}" "repos/$owner/$repo/releases/tags/$tag" \
+        --jq ".assets[] | select(.name == \"$asset\") | .id") || return 1
+      [ -n "$id" ] || { warn "release $tag of $owner/$repo has no asset $asset"; return 1; }
+      gh api --hostname "${host:-github.com}" -H 'Accept: application/octet-stream' \
+        "repos/$owner/$repo/releases/assets/$id" > "$dest" ;;
+    *) warn "unsupported source $src"; return 1 ;;
+  esac
+}
+
+if ! installed_ok; then
+  if [ -z "$SOURCE" ]; then
+    say "t3 server $VERSION: not installed (no source: base_url in $PIN is unset)"
+    exit 0
+  fi
+  tmp=$(mktemp -d "$ROOT/.incoming.XXXXXX") || { warn "cannot make a temp dir in $ROOT"; exit 3; }
+  fail() { warn "$1"; remove_tree "$tmp"; exit 3; }
+
+  fetch "$SOURCE" "$tmp/server.tar.gz" || fail "could not fetch $SOURCE"
+  got=$(sha256_of "$tmp/server.tar.gz")
+  [ "$got" = "$SHA256" ] || fail "$SOURCE has sha256 $got, not the pinned $SHA256"
+  mkdir "$tmp/unpacked"
+  tar -xzf "$tmp/server.tar.gz" -C "$tmp/unpacked" || fail "could not unpack $SOURCE"
+  [ "$(ls -A "$tmp/unpacked")" = "$STEM" ] || fail "$SOURCE does not hold exactly $STEM/"
+  # It has to run here (architecture, glibc) before anything names it.
+  runner=()
+  command -v timeout >/dev/null 2>&1 && runner=(timeout 60)
+  reported=$(env -u NODE_OPTIONS "${runner[@]}" "$tmp/unpacked/$STEM/bin/t3" --version 2>&1) ||
+    fail "$STEM/bin/t3 --version failed: $reported"
+  printf '%s\n' "$SHA256" > "$tmp/unpacked/$STEM/.termag-t3-sha256"
+  if [ -e "$ROOT/$VERSION" ]; then
+    # An unverified leftover under the version's name.
+    mv -- "$ROOT/$VERSION" "$tmp/replaced" || fail "could not move the old $ROOT/$VERSION aside"
+  fi
+  mv -- "$tmp/unpacked/$STEM" "$ROOT/$VERSION" || fail "could not move $STEM into $ROOT"
+  remove_tree "$tmp"
+  say "reconciled: t3 server $VERSION in $ROOT/$VERSION ($reported)"
+fi
+
+previous=$(readlink "$ROOT/current" 2>/dev/null || true)
+if [ "$previous" != "$VERSION" ]; then
+  # A rename over the old link, so `current` is never missing. -T (GNU) and
+  # -h (BSD) keep mv from following the old link into its directory.
+  ln -sfn "$VERSION" "$ROOT/.current.new" &&
+    { mv -fT "$ROOT/.current.new" "$ROOT/current" 2>/dev/null || mv -fh "$ROOT/.current.new" "$ROOT/current"; } ||
+    { warn "could not point $ROOT/current at $VERSION"; exit 3; }
+  say "reconciled: $ROOT/current -> $VERSION${previous:+ (was $previous)}"
+fi
+
+if ! cmp -s "$LAUNCHER_SRC" "$ROOT/bin/t3"; then
+  install -d -m 755 "$ROOT/bin" && install -m 755 "$LAUNCHER_SRC" "$ROOT/bin/t3" ||
+    { warn "could not install $ROOT/bin/t3"; exit 3; }
+  say "reconciled: $ROOT/bin/t3"
+fi
+
+if [ "$(dropin_content)" != "$(cat "$DROPIN" 2>/dev/null)" ]; then
+  mkdir -p "$DROPIN_DIR" && dropin_content > "$DROPIN.new" && mv -f "$DROPIN.new" "$DROPIN" ||
+    { warn "could not write $DROPIN"; exit 3; }
+  say "reconciled: $DROPIN"
+  # The agent reads it at its next start; termag-box-update restarts the agent
+  # when a drop-in is newer than the process (and it is safe to).
+  systemctl --user daemon-reload 2>/dev/null || true
+fi
+
+if ! settings_current; then
+  want=$(settings_want)
+  mkdir -p "$(dirname -- "$SETTINGS")" &&
+    { if [ -e "$SETTINGS" ]; then cp -p -- "$SETTINGS" "$SETTINGS.new"; else (umask 077 && : > "$SETTINGS.new"); fi; } &&
+    printf '%s\n' "$want" > "$SETTINGS.new" && mv -f "$SETTINGS.new" "$SETTINGS" ||
+    { warn "could not write $SETTINGS"; exit 3; }
+  say "reconciled: enableProviderUpdateChecks=false in $SETTINGS"
+fi
+
+if ! profile_current && profile_fixable; then
+  # Loaded before it is installed, so a profile the kernel refuses never lands.
+  if "${SUDO[@]}" "${APPARMOR_PARSER[@]}" -r "$PROFILE_SRC" &&
+     "${SUDO[@]}" install -m 0644 "$PROFILE_SRC" "$PROFILE"; then
+    say "reconciled: $PROFILE (the browser's sandbox)"
+  else
+    warn "could not install $PROFILE; the server's browser cannot start Chrome's sandbox"
+  fi
+fi
+
+# Keep current and the one before it; older trees go once nothing runs there.
+in_use() {
+  local exe
+  for exe in /proc/[0-9]*/exe; do
+    case "$(readlink "$exe" 2>/dev/null)" in "$1"/*) return 0 ;; esac
+  done
+  return 1
+}
+for dir in "$ROOT"/*/; do
+  dir=${dir%/}
+  name=${dir##*/}
+  case "$name" in bin | current | "$VERSION" | "$previous") continue ;; esac
+  [ -f "$dir/.termag-t3-sha256" ] || continue
+  if in_use "$dir"; then
+    say "t3 server: keeping $dir (a process still runs from it)"
+  elif remove_tree "$dir"; then
+    say "reconciled: removed $dir"
+  fi
+done
+
+exit 0

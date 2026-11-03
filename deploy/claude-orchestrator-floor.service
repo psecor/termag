@@ -1,0 +1,46 @@
+# Bring the orchestrator host's /usr/bin/claude to the Claude Code floor at
+# boot, before the runner orchestrator starts on it.
+#
+#
+# The infra repo's cloud-init installs /usr/bin/claude at every boot, pinned
+# to claude_code_version, which a floor raised in termag does not move. This
+# runs deploy/claude-orchestrator-update --boot: exactly the floor in
+# /usr/local/lib/termag/claude-code-floor (root's copy of the image's
+# deploy/claude-code-floor) when /usr/bin/claude is below it, else nothing.
+#
+# Not WantedBy anything at boot: started before cloud-init's install, it
+# would apply the floor and then be undone by that install. It runs instead
+#   * when claude-runner-orchestrator.service starts, which Wants= and is
+#     After= this (deploy/claude-runner-orchestrator.service). cloud-init
+#     starts the runner orchestrator only after its own install, and the
+#     backend's start comes later still; and
+#   * when cloud-init starts it right after its install, where the infra
+#     repo has that line (it also covers a host whose runner stays off).
+# Never After=cloud-final.service: cloud-init's `systemctl enable --now` of
+# the runner would then wait on this, and this on cloud-init.
+#
+# It never keeps anything from starting: the runner only Wants= it, the run
+# stops itself inside 240 s (TimeoutStartSec backs that up), and its
+# outcomes are success exits, so it stays active and a runner restart does
+# not run it again this boot.
+[Unit]
+Description=termag: bring /usr/bin/claude to the Claude Code floor before the runner orchestrator
+Wants=network-online.target
+After=network-online.target
+Before=claude-runner-orchestrator.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/termag/claude-orchestrator-update --boot
+# 143: stopped by a signal, which the run records. A failed unit would run
+# again at every start of the runner, which Wants= it.
+SuccessExitStatus=0 1 3 143
+TimeoutStartSec=300
+# ProtectHome makes root's home read-only, so npm's cache (and its logs) go
+# to a cache directory systemd creates; without it every install is EROFS.
+CacheDirectory=claude-orchestrator-update
+Environment=npm_config_cache=/var/cache/claude-orchestrator-update/npm
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

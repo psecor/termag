@@ -1,6 +1,6 @@
-# OpenTelemetry Collector config for the orchestrator's logs
-# (termag-otelcol.service). Ships them to an OTLP/HTTP collector so they
-# outlive the root volume, which every orchestrator deploy replaces.
+# OpenTelemetry Collector config for the orchestrator's logs, metrics and
+# traces (termag-otelcol.service). Ships them to an OTLP/HTTP collector so
+# they outlive the root volume, which every orchestrator deploy replaces.
 #
 # This file is baked; termag-otelcol-env renders the per-instance half (the
 # project and endpoint: resource/destination and
@@ -15,11 +15,13 @@
 # process exited, Scheduled restart job), /var/log/cloudinit-termag.log and
 # nginx's logs, plus the runner orchestrator's Prometheus series, scraped on
 # loopback, and the backend's own OpenTelemetry metrics and logs (spawn and box
-# telemetry), which it pushes to the loopback OTLP
-# receiver because this config exists. Nothing else on the
-# host. Every log record's body goes through transform/redact first, because a
-# box agent's bearer token is in its /termag/ws/agent URL and so in nginx's
-# access log.
+# telemetry) and its traces,
+# which it pushes to the loopback OTLP receiver because this config exists.
+# Nothing else on the host. Every log record's body goes through
+# transform/redact first, because a box agent's bearer token is in its
+# /termag/ws/agent URL and so in nginx's access log; every span's attributes,
+# event attributes and status message go through transform/redact-spans, the
+# same patterns.
 
 extensions:
   file_storage:
@@ -74,11 +76,11 @@ receivers:
     include_file_path: true
     attributes:
       log.source: nginx
-  # The backend's own metrics and logs (backend/src/services/otel.ts). The
-  # backend pushes here when /run/termag-otelcol/destination.yaml exists, so
-  # it sends nothing on a host without this collector. Loopback only: nothing
-  # off the host may write into the telemetry project. HTTP only, as the
-  # backend's exporters speak OTLP/HTTP.
+  # The backend's own metrics, logs and traces (backend/src/services/otel.ts).
+  # The backend pushes here when /run/termag-otelcol/destination.yaml exists,
+  # so it sends nothing on a host without this collector. Loopback only:
+  # nothing off the host may write into the telemetry project. HTTP only, as
+  # the backend's exporters speak OTLP/HTTP.
   otlp/termag:
     protocols:
       http:
@@ -178,7 +180,7 @@ processors:
         conditions:
           - IsString(log.body)
         statements:
-          - replace_pattern(log.body, "(?i)([?&;](?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(log.body, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
           - replace_pattern(log.body, "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
           - replace_pattern(log.body, "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
           - replace_pattern(log.body, "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
@@ -189,6 +191,58 @@ processors:
           - replace_pattern(log.body, "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
           - replace_pattern(log.body, "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
           - replace_pattern(log.body, "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
+
+  # The same masking for the backend's spans. Defence in depth: the backend's
+  # ScrubbingExporter strips query strings, message text and client
+  # addresses before a span leaves the process; this catches what it misses.
+  # Every string attribute of the span and of its events (exception.message
+  # among them), and the status message. OTTL can't share one pattern list
+  # between processors, so these are a copy of transform/redact's, pattern for
+  # pattern and in the same order; deploy/termag-otelcol.test.sh fails when the
+  # two lists differ. Change both together.
+  transform/redact-spans:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - replace_all_patterns(span.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(span.attributes, "value", "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_all_patterns(span.attributes, "value", "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
+          - replace_all_patterns(span.attributes, "value", "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
+          - replace_all_patterns(span.attributes, "value", "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
+          - replace_all_patterns(span.attributes, "value", "\\b(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,}", "REDACTED_SLACK_TOKEN")
+          - replace_all_patterns(span.attributes, "value", "\\b(?:sdk|api|mob)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b", "REDACTED_SDK_KEY")
+          - replace_all_patterns(span.attributes, "value", "\\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "REDACTED_GITHUB_TOKEN")
+          - replace_all_patterns(span.attributes, "value", "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
+          - replace_all_patterns(span.attributes, "value", "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
+          - replace_all_patterns(span.attributes, "value", "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
+          - replace_pattern(span.status.message, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(span.status.message, "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_pattern(span.status.message, "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
+          - replace_pattern(span.status.message, "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
+          - replace_pattern(span.status.message, "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
+          - replace_pattern(span.status.message, "\\b(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,}", "REDACTED_SLACK_TOKEN")
+          - replace_pattern(span.status.message, "\\b(?:sdk|api|mob)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b", "REDACTED_SDK_KEY")
+          - replace_pattern(span.status.message, "\\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "REDACTED_GITHUB_TOKEN")
+          - replace_pattern(span.status.message, "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
+          - replace_pattern(span.status.message, "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
+          - replace_pattern(span.status.message, "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
+          # The person's IP (nginx forwards X-Forwarded-For).
+          - delete_key(span.attributes, "client.address")
+          - delete_key(span.attributes, "network.peer.address")
+      - context: spanevent
+        statements:
+          - replace_all_patterns(spanevent.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
+          - replace_all_patterns(spanevent.attributes, "value", "\\b(?:xox[abposr]|xapp)-[A-Za-z0-9-]{10,}", "REDACTED_SLACK_TOKEN")
+          - replace_all_patterns(spanevent.attributes, "value", "\\b(?:sdk|api|mob)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b", "REDACTED_SDK_KEY")
+          - replace_all_patterns(spanevent.attributes, "value", "\\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "REDACTED_GITHUB_TOKEN")
+          - replace_all_patterns(spanevent.attributes, "value", "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
+          - replace_all_patterns(spanevent.attributes, "value", "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
+          - replace_all_patterns(spanevent.attributes, "value", "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
 
   batch:
     send_batch_size: 512
@@ -232,6 +286,16 @@ service:
       receivers: [prometheus/claude-runner-orchestrator, otlp/termag]
       processors:
         - memory_limiter
+        - resourcedetection
+        - resource/termag
+        - resource/destination
+        - batch
+      exporters: [otlphttp/destination]
+    traces:
+      receivers: [otlp/termag]
+      processors:
+        - memory_limiter
+        - transform/redact-spans
         - resourcedetection
         - resource/termag
         - resource/destination

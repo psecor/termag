@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# termag-pi-update — update pi (@earendil-works/pi-coding-agent, the
+# pi provider's agent) on a box when the orchestrator asks, and stop
+# and resume its sessions as the run's policy says.
+#
+# Why this exists: pi runs code with its owner's credentials and has had
+# advisories (the floor's sources are in backend/src/services/piUpdatePolicy.ts).
+# The image pins it, `npm install -g --ignore-scripts
+# @earendil-works/pi-coding-agent@1.0.2` (packer/scripts/setup.sh), and
+# nothing moves it afterwards: the fleet sat on 1.0.2 against 1.4.0 on
+# 2026-10-30. This is the box's updater, Codex's recipe for a third npm
+# global, on deploy/termag-tool-update-lib.
+#
+# One caller: termag-pi-update@<run>.service, started by the agent's
+# tool-update RPC (agent/tool-update.js) when an admin updates pi from the
+# Software tab: --run <run-id>.
+#
+# What a run does:
+#   1. GET <orchestrator>/api/tool-update/policy?component=pi&run=<id> with the
+#      agent token on curl's stdin. Only a 200 that names this run installs
+#      anything; no policy, or a 200 with run null, installs nothing and
+#      restarts nothing.
+#   2. Takes ~/.termag/pi-update.lock (flock).
+#   3. Resolves the target to one exact version (`latest` through `npm view`,
+#      once) and installs exactly that into the npm global under the nvm
+#      default, where the image puts it, only when the installed one is below
+#      it: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@<x.y.z>`,
+#      as the image does (pi's optional native helpers are not needed, and
+#      lifecycle scripts of a newer third-party publisher are not run).
+#      Only a version pinned below (PINS) is installed, from its package file
+#      once that matches the pin; any other fails the run.
+#      Accepted only when the package's package.json and `pi --version` both
+#      say exactly x.y.z; otherwise rejected (~/.termag/pi-update.rejected,
+#      exit 3), put back to the version that ran, or quarantined.
+#   4. Stops the pi sessions still on old code, as restart says. pi is a node
+#      script: its process is node, which an update never replaces, so a
+#      session is on old code when it started before the installed package's
+#      package.json was written. Its sessions are:
+#        * the pi in each tmux pane that the pane's shell started, directly or
+#          through termag's launcher (termag-pi-fireworks,
+#          pi-headless, termag-pi-fireworks, termag-agent-otel): a
+#          pi agent pane runs `termag-pi-fireworks`. restart=idle
+#          stops each one once it is out of a turn (no "Working (… to
+#          interrupt)" indicator on its screen, and its session file not
+#          written in the last 10 s), at most drainSec, then cuts it;
+#          restart=force stops them all at once. SIGTERM, then SIGKILL after
+#          TERMAG_PI_KILL_AFTER (20 s);
+#        * anything else (a -p turn, an rpc or json mode run such as the
+#          simple UI's pi chat turns, a subcommand such as update or
+#          auth, a pi another agent runs, sessions outside tmux) is counted as
+#          other and left alone. pi replaces its own command line with its
+#          title ("pi"), so a -p turn typed into a pane by hand reads as a
+#          session there; the chat runner's turns run outside tmux.
+#      The pane's session is the newest file in
+#      ~/.pi/agent/sessions/--<cwd, / as ->--/ (or under the process's
+#      PI_CODING_AGENT_DIR) written since the process started. Then, per
+#      stopped pane: an agent pane (<...>-agent) is listed for the
+#      orchestrator, which relaunches it with the provider's resume command
+#      (`pi --continue`) when it had a session, else fresh;
+#      any other pane with a session gets `pi --continue` typed; one without
+#      is left at its shell.
+#   5. POST <orchestrator>/api/tool-update/report: {component: "pi", ...}.
+#
+# What is trusted: the sha512 pinned below for each version (PINS); the
+# registry only serves the bytes.
+#
+# Usage:
+#   termag-pi-update --run <run-id>   one orchestrator run: the policy, the
+#                                     install, the sessions, the report
+#   termag-pi-update --pinned-package <x.y.z> <dir>
+#                                     pi's pinned package fetched into <dir>
+#                                     and checked; prints its path
+#
+# Exit codes: 0 when the pi a session would start is at or above the floor (or
+# nothing was asked of it), 1 when it is below it or there is none, 2 on bad
+# usage, 3 while an install is rejected, 143 when a signal stops it.
+#
+# Env:
+#   PI_BIN                     the pi to judge (default: the one on PATH)
+#   TERMAG_STATE_DIR           where the lock lives (default $HOME/.termag)
+#   TERMAG_PI_BUDGET           seconds the install may take, before its
+#                              sessions (default 600)
+#   TERMAG_PI_LOCK_WAIT        at most this many seconds to wait for the lock
+#   TERMAG_PI_INSTALL_TIMEOUT  seconds for each install step (default 300)
+#   TERMAG_PI_RETRY_SLEEP      seconds before the npm retry (default 15)
+#   TERMAG_AGENT_CONFIG        the agent config with the orchestrator URL
+#                              and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT      seconds for each orchestrator call (default 20)
+#   TERMAG_PI_KILL_AFTER       seconds from a session's SIGTERM to its
+#                              SIGKILL (default 20)
+#   TERMAG_PI_RESUME_WAIT      seconds after typing a resume before it is
+#                              checked (default 10)
+
+set -u
+# Appended, not prepended: under systemd the PATH is minimal, and a caller that
+# puts something ahead of the system directories (the tests) keeps the first say.
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+
+PKG=@earendil-works/pi-coding-agent
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# What to install comes from the policy; without one nothing is.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_PI_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_PI_INSTALL_TIMEOUT:-300}"
+RETRY_SLEEP="${TERMAG_PI_RETRY_SLEEP:-15}"
+
+# The budget, the policy, the lock, the pinned npm install with its rejection
+# record, restore and quarantine, the sessions and the report are
+# deploy/termag-tool-update-lib's, which termag-reconcile installs beside this.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-pi-update TU_COMPONENT=pi TU_BIN=pi TU_TAGS='latest'
+# As the image installs it: no lifecycle scripts (see the header, 3).
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NPM_FLAGS=(--ignore-scripts)
+# The versions a run may install: "<x.y.z> <sha512 integrity of its package>"
+# (npm's dist.integrity form), each one reviewed and pinned with the image's
+# pin (packer/scripts/setup.sh), never whatever the registry's latest tag
+# names. A version with no pin is not installed and the run fails. A pinned
+# one is fetched as a file (npm pack), its sha512 checked against the pin, and
+# that file is what npm installs, and what a put-back reinstalls: the pin
+# binds the bytes installed, with no second fetch to differ. Neither
+# package.json nor pi --version is provenance: the package controls both
+# (Security review on #1088). TERMAG_PI_PINS: a file of such lines instead.
+# termag-node-update takes pi's package from here too (--pinned-package).
+PINS='1.0.2 sha512-3ZdIghMSELMGV3sKi5iASOb1Jwb696fLjmNu0aezaqDxTLLWWoRpqBYkGxJ1CgAMCbtfqXWEF0lcRrlVXmiEGQ=='
+# pinned_package V DIR: pi V's package fetched into DIR and checked against its
+# pin; prints the file's path.
+pinned_package() {
+  local src="$PINS" pin f got
+  [ -z "${TERMAG_PI_PINS:-}" ] || src=$(cat "$TERMAG_PI_PINS" 2>/dev/null)
+  pin=$(printf '%s\n' "$src" | awk -v v="$1" '$1 == v && $2 ~ /^sha512-/ { print $2; exit }')
+  if [ -z "$pin" ]; then
+    log "pi $1 is not pinned in termag-pi-update; not installed (a version is pinned with a reviewed PR)"
+    return 1
+  fi
+  command -v openssl >/dev/null 2>&1 || { log "no openssl to check pi $1's package with; not installed"; return 1; }
+  f=$(cd "$2" && timeout -k 2 120 npm pack --ignore-scripts --silent "$PKG@$1" </dev/null 2>/dev/null | tail -n 1)
+  if [ -z "$f" ] || [ ! -f "$2/$f" ]; then log "could not fetch pi $1's package; not installed"; return 1; fi
+  got="sha512-$(openssl dgst -sha512 -binary "$2/$f" | base64 -w0)"
+  if [ "$got" != "$pin" ]; then
+    rm -f "$2/$f"
+    log "pi $1's package is not the pinned one ($got, pinned $pin); not installed"
+    return 1
+  fi
+  printf '%s' "$2/$f"
+}
+PIN_DIR=''
+tu_npm_allowed() {
+  [ -n "$PIN_DIR" ] || PIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/termag-pi-pinned.XXXXXX") || return 1
+  pinned_package "$1" "$PIN_DIR"
+}
+# The npm global is pi's only install: a run that finds none fails, as Codex's.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NPM_REQUIRED=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/pi-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+REJECTED=$STATE_DIR/pi-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-pi-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-pi-update --run <run-id> | --pinned-package <x.y.z> <dir>"; exit 2; }
+trap '[ -z "$PIN_DIR" ] || rm -rf "$PIN_DIR"' EXIT
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  # The run id names the systemd instance and goes into a URL and a report:
+  # the orchestrator's id pattern, nothing a shell or a URL would read.
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  # pi's pinned package for another updater (termag-node-update's reinstall):
+  # fetched into <dir>, checked, its path printed; exit 1 when there is none.
+  --pinned-package) [ $# -eq 3 ] && is_version "$2" && [ -d "$3" ] || usage; pinned_package "$2" "$3"; exit $? ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_PI_BUDGET:-600}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+KILL_AFTER="${TERMAG_PI_KILL_AFTER:-20}"
+# pi has no runners to drain.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+RUNNER_WAIT=0
+RESUME_WAIT="${TERMAG_PI_RESUME_WAIT:-10}"
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$RETRY_SLEEP" "$BUDGET" "$POLICY_TIMEOUT" "$KILL_AFTER" "$RESUME_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+# The nvm default's node, npm and npm-global pi, as a login shell has them.
+# Every command that could read stdin gets </dev/null.
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+# shellcheck disable=SC1091
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 </dev/null
+
+# The pi a pane or a login shell would start.
+resolve() {
+  hash -r
+  if [ -n "${PI_BIN:-}" ]; then printf '%s' "$PI_BIN"
+  else command -v pi 2>/dev/null || true
+  fi
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); pi has no fallback floor"
+# A 200 that names no run (the flag turned off since the request, the run
+# expired): not this run's to install, so nothing, as with no policy at all.
+# Claude Code's updater installs the target there; pi is updated only by a run
+# the orchestrator started.
+# Its floor is not this run's either: a box below it is not a failed run.
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+expire_stale() { [ -s "$REJECTED" ] || return 0; tu_expire_npm; }
+
+# shellcheck disable=SC2154  # set by termag-tool-update-lib
+tu_notes() { printf 'npm=%s' "$npm_note"; }
+tu_notes_all() { printf '%s' "$npm_note"; }
+
+# ── sessions, after a run's install ─────────────────────────────────────────
+# pi's part of termag-tool-update-lib's stop_sessions (see the header, 4).
+argv_of() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
+# A pi process: node running the package's dist/bundle/cli.js. pi sets its
+# process title, so a running pi's /proc/<pid>/cmdline reads just "pi"
+# (checked on 1.0.2): either that, or the bundle as node's script (under
+# whatever name it was started by, npm's bin/pi link as PATH finds it).
+is_pi() {
+  local a
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in */node|*/node\ \(deleted\)) ;; *) return 1 ;; esac
+  [ "$(argv_of "$1" | grep -v '^$' | head -n 1)" = pi ] && return 0
+  a=$(argv_of "$1" | sed -n 2p)
+  case "$a" in /*) ;; *) a=/proc/$1/cwd/$a ;; esac
+  case "$(readlink -f "$a" 2>/dev/null)" in */@earendil-works/pi-coding-agent/dist/bundle/cli.js) return 0 ;; esac
+  return 1
+}
+under_pi() {
+  local p; p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do is_pi "$p" && return 0; p=$(ppid_of "$p"); done
+  return 1
+}
+# When a process started, in seconds since the epoch: its start in clock ticks
+# after boot (/proc/<pid>/stat, field 22) plus the boot time.
+started_at() {
+  local ticks btime hz
+  ticks=$(sed -E 's/^.*\) [A-Za-z] //' "/proc/$1/stat" 2>/dev/null | awk '{print $19}')
+  btime=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  [ -n "$ticks" ] && [ -n "$btime" ] && printf '%s' $(( btime + ticks / hz ))
+}
+# Whether it is the pane's own: the pane shell started it, directly or through
+# a launcher it execs or runs it from.
+pane_owned() {
+  local p=$1 pane_pid=$2
+  [ -n "$pane_pid" ] || return 1
+  p=$(ppid_of "$p")
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    [ "$p" = "$pane_pid" ] && return 0
+    case "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" in
+      *termag-pi-headless*|*pi-headless*|*termag-pi-fireworks*|*termag-agent-otel*) p=$(ppid_of "$p") ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+# The same in hundredths of a second, from the uptime (the boot time is whole
+# seconds, so started_at can be up to 2 s early): what tells a pi that started
+# just before its package was replaced, within one second, from one after it
+# (Devin on #1088).
+started_cs() {
+  local ticks hz up now
+  ticks=$(sed -E 's/^.*\) [A-Za-z] //' "/proc/$1/stat" 2>/dev/null | awk '{print $19}')
+  read -r up _ </proc/uptime 2>/dev/null || return 0
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  now=$(date +%s%N)
+  [[ "$ticks" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+\.[0-9]{2}$ ]] || return 0
+  printf '%s' $(( now / 10000000 - 10#${up/./} + ticks * 100 / hz ))
+}
+mtime_cs() {
+  local t; t=$(stat -c %.2Y "$1" 2>/dev/null) || return 0
+  [[ "$t" =~ ^[0-9]+\.[0-9]{2}$ ]] && printf '%s' "$(( 10#${t/./} ))"
+}
+# The pane's session file: the newest in its working directory's session
+# directory written since the process started, else the newest written before.
+# pi writes a new session's file only at its first message, so a pi that has
+# written none since it started either has no conversation yet or holds an
+# earlier one it continued or resumed, which it rewrites only at its next turn
+# (Bugbot on #1088). That earlier file is what `pi --continue` takes up again;
+# a new pi with no message yet, in a directory with earlier sessions, is
+# taken as holding the newest of them.
+# A pi's session directory: its agent dir's sessions/--<cwd, / and : as ->--.
+sessions_of() {
+  local dir cwd
+  dir=$(env_of "$1" PI_CODING_AGENT_DIR); dir=${dir:-$HOME/.pi/agent}
+  cwd=$(readlink "/proc/$1/cwd" 2>/dev/null); [ -n "$cwd" ] || return 0
+  cwd=${cwd#/}; cwd=${cwd//\//-}; cwd=${cwd//:/-}
+  printf '%s/sessions/--%s--' "$dir" "$cwd"
+}
+session_of() {
+  local pid=$1 sdir since f t newest='' newest_t=0 before='' before_t=0
+  sdir=$(sessions_of "$pid"); [ -n "$sdir" ] || return 0
+  since=$(started_at "$pid"); [ -n "$since" ] || return 0
+  for f in "$sdir"/*.jsonl; do
+    [ -f "$f" ] || continue
+    t=$(stat -c %Y "$f" 2>/dev/null) || continue
+    if [ "$t" -ge "$since" ]; then
+      [ "$t" -ge "$newest_t" ] && { newest=$f newest_t=$t; }
+    elif [ "$t" -ge "$before_t" ]; then
+      before=$f before_t=$t
+    fi
+  done
+  printf '%s' "${newest:-$before}"
+}
+
+p_sfile=()
+find_sessions() {
+  local pkg installed pid sub pane sock name f id st
+  pkg=; command -v npm >/dev/null 2>&1 && pkg=$(npm root -g </dev/null 2>/dev/null)/$PKG
+  installed=$(mtime_cs "$pkg/package.json")
+  for pid in $(pgrep -u "$(id -u)"); do
+    is_pi "$pid" || continue
+    under_pi "$pid" && continue
+    # Every pi's session directory, old code or current, for tu_unshare.
+    peers+=("$(sessions_of "$pid")")
+    # Old code: started before the package was written. One that started
+    # within 0.01 s of it may have loaded either, so is taken as old.
+    st=; [ -n "$installed" ] && st=$(started_cs "$pid")
+    [ -n "$st" ] && [ "$st" -gt $(( installed + 1 )) ] && continue
+    # A -p turn, an rpc or json mode run (the simple UI's chat turns), or a
+    # subcommand that is not the TUI, is other, where its arguments can still
+    # be read (pi's process title replaces them: the chat runner's turns are
+    # outside tmux and other anyway).
+    if argv_of "$pid" | tail -n +3 | grep -qxE -- '-p|--print|--export|--list-models'; then other=$((other + 1)); continue; fi
+    if argv_of "$pid" | tail -n +3 | sed -n '/^--mode$/{n;p;q}' | grep -qxE 'json|rpc'; then other=$((other + 1)); continue; fi
+    sub=$(argv_of "$pid" | tail -n +3 | grep -v '^-' | head -n 1)
+    case "$sub" in update|auth|install|remove|list|config) other=$((other + 1)); continue ;; esac
+    pane=$(env_of "$pid" TMUX_PANE)
+    sock=; [ -n "$pane" ] && sock=$(socket_of "$pid")
+    name=; [ -n "$sock" ] && name=$(tmux -S "$sock" display -p -t "$pane" '#{session_name}' 2>/dev/null)
+    if [ -z "$name" ]; then other=$((other + 1)); continue; fi
+    pane_owned "$pid" "$(tmux -S "$sock" display -p -t "$pane" '#{pane_pid}' 2>/dev/null)" || { other=$((other + 1)); continue; }
+    f=$(session_of "$pid")
+    id=; [ -n "$f" ] && id=$(basename "$f" .jsonl | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+    p_pid+=("$pid"); p_sock+=("$sock"); p_pane+=("$pane"); p_sess+=("$name")
+    p_sfile+=("$f"); p_id+=("$id")
+    # pi names no session of its own: every one is a guess from its directory.
+    p_guess+=("$(sessions_of "$pid")")
+  done
+  tu_unshare
+}
+
+# termag-tool-update-lib's stop_sessions asks these of pane I. In a turn: its
+# screen shows pi's working indicator ("Working (esc to interrupt)"), or its
+# session file was written in the last 10 s.
+tu_status() {
+  local f="${p_sfile[$1]}"
+  if [ -n "$f" ] && [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -lt 10 ]; then printf busy; return; fi
+  if tmux -S "${p_sock[$1]}" capture-pane -p -t "${p_pane[$1]}" 2>/dev/null | grep -qE 'Working.*to interrupt\)'; then printf busy; else printf idle; fi
+}
+# A conversation: a session file since it started.
+tu_had() { [ -n "${p_sfile[$1]}" ] && [ -f "${p_sfile[$1]}" ]; }
+# pi resumes a pane's directory's newest session; a pi agent pane is
+# the orchestrator's, with the provider's own resume command.
+tu_resume_line() { printf 'pi --continue'; }
+
+trap on_signal TERM INT HUP
+
+tu_lock
+expire_stale
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+
+# What the install must reach: the floor, and the policy's target.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+# ── the npm global under the nvm default ────────────────────────────────────
+tu_npm_global
+
+finish

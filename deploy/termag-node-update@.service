@@ -1,0 +1,36 @@
+[Unit]
+Description=termag: Node update run %i from the orchestrator (install beside, reinstall the npm globals, switch, restart the agent)
+
+[Service]
+# Why this exists: the orchestrator's manual Node updates,
+# as termag-claude-update@.service is Claude Code's.
+# The agent's tool-update RPC starts termag-node-update@<run>.service with the
+# run id as the instance name and answers at once; this unit runs the update
+# outside the agent's process, because the run restarts the agent itself (on
+# the new Node) and must outlive that restart. systemd runs
+# one instance per run id at a time, so a repeated RPC for the same run joins
+# the one running. Nothing on the box starts it on its own: no [Install]
+# section, and termag-reconcile lists it as noenable.
+Type=oneshot
+
+# The copy termag-reconcile installed, beside termag-tool-update-lib. %i is
+# the run id the agent checked against ^[a-z0-9]{20,40}$; the script checks it
+# again. --run asks the orchestrator for the run's policy with the agent token
+# (no version or command crosses the RPC), installs one exact Node release,
+# verified, beside the current one, reinstalls the npm globals under it, and
+# switches nvm's default only when all of it verifies; then it restarts the
+# agent on it, and reports. %h survives the cloud-init user rename.
+ExecStart=%h/.local/bin/termag-node-update --run %i
+
+# Exit 1 (still below the floor) and 3 (a switch rejected) are outcomes the
+# report carries, not unit failures.
+SuccessExitStatus=0 1 3
+
+# The ceiling for the whole run: the downloads, the npm globals' reinstall
+# and the agent's restart, within the 1200 s budget (TERMAG_NODE_BUDGET), and
+# the report. It stops no sessions. 90 min is also how long the orchestrator
+# counts a started run as in flight.
+TimeoutStartSec=90min
+
+# Behind the owner's own work: a build in a pane should not notice this.
+Nice=10

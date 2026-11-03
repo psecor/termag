@@ -18,6 +18,11 @@
 #   termag-status working|idle|not_running|waiting [options]
 #   termag-status meta [options]      # metadata-only (contextTokens / rateLimited)
 #   termag-status notification        # Claude Code hook JSON on stdin
+#   termag-status t3-guard            # UserPromptSubmit hook JSON on stdin, in
+#                                     # the foreground: inside the box's t3
+#                                     # server, exits 2 on a prompt in a termag
+#                                     # chat's session that the desktop's thread
+#                                     # doesn't hold
 #   termag-status prompt-submit       # UserPromptSubmit hook JSON on stdin:
 #                                     # posts `working`; inside a Claude Code
 #                                     # cloud session on a termag box, also
@@ -27,7 +32,14 @@
 #   termag-status post-tool           # PostToolUse hook JSON on stdin: posts
 #                                     # `working`, plus a milestone when the
 #                                     # tool was a Bash `gh pr create|merge`
-#   termag-status stop                # Stop hook JSON on stdin: posts `idle`;
+#   termag-status permission-request  # PermissionRequest hook JSON on stdin
+#                                     # (Devin's approval prompt): posts
+#                                     # `waiting` (approval, notify) naming the
+#                                     # tool, never its input
+#   termag-status session-end         # SessionEnd hook JSON on stdin (Devin):
+#                                     # `not_running`, or `idle` when the
+#                                     # reason is clear/resume (still running)
+#   termag-status stop               # Stop hook JSON on stdin: posts `idle`;
 #                                     # inside a Claude Code cloud session on a
 #                                     # termag box, also posts the session's
 #                                     # cumulative token usage, summed from the
@@ -51,6 +63,10 @@
 #   --source <id>            status source, e.g. pi-ext:pi. Omitted =
 #                            the historical payload, which the server books as
 #                            Claude -- the Claude hooks rely on exactly that.
+#                            Under Devin (DEVIN_PROJECT_DIR set) a source-less
+#                            status call posts nothing: Devin imports the
+#                            Claude hooks, and its own (deploy/devin-hooks.json)
+#                            post with --source devin-hooks.
 #   --reason approval|user_input   waitingReason for `waiting`
 #   --message <text>         trimmed to 200 chars
 #   --notify                 ask the server to notify (Slack/Discord needs-input)
@@ -110,6 +126,36 @@ if [ "$MODE" = session-start ]; then
   f=${CLAUDE_ENV_FILE:-}
   [ -n "$f" ] || exit 0
   grep -qxF "$LOCAL_BIN_LINE" "$f" 2>/dev/null || printf '%s\n' "$LOCAL_BIN_LINE" >> "$f" 2>/dev/null
+  exit 0
+fi
+
+# t3-guard: a UserPromptSubmit hook, run in the foreground so its exit code
+# counts. Inside the box's t3 server (a desktop app thread), a prompt on a
+# Claude session that a termag chat names, while the desktop's thread doesn't
+# hold it (agent/chat-runner.js claimT3), is refused with exit 2 and the reason
+# on stderr: termag's chat runner may be resuming that session, and two
+# writers fork it. Any
+# other prompt, and anything it can't tell, goes through: the runner refuses
+# its own turns while the thread holds the session.
+if [ "$MODE" = t3-guard ]; then
+  in_t3=${TERMAG_T3:-}
+  if [ -z "$in_t3" ] && [ -n "${TMUX:-}" ] && [ "$(tmux display-message -p '#S' 2>/dev/null)" = termag-t3 ]; then in_t3=1; fi
+  [ -n "$in_t3" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+  sid=$(jq -r '(.session_id // empty) | tostring' 2>/dev/null) || exit 0
+  case $sid in ''|*[!A-Za-z0-9-]*) exit 0 ;; esac
+  chats=${TERMAG_CHATS_DIR:-$HOME/.termag/chats}
+  [ -d "$chats" ] || exit 0
+  for f in "$chats"/*.json; do
+    # A chat's state is <chatKey>.json; its queue, history and the rest have a second dot.
+    case ${f##*/} in *.*.json) continue ;; esac
+    [ -f "$f" ] || continue
+    held=$(jq -r --arg s "$sid" 'select(.sessionId == $s) | if ((.t3.threadId // "") | length) > 0 then "held" else "free" end' "$f" 2>/dev/null) || continue
+    if [ "$held" = free ]; then
+      echo 'termag web has this session right now. Send from the desktop again to take it back.' >&2
+      exit 2
+    fi
+  done
   exit 0
 fi
 
@@ -239,13 +285,14 @@ strip_heredocs() {
 
 # --- milestone classification -------------------------------------------------
 # A PostToolUse payload describes one tool call. The only ones we care about
-# are Bash commands that open or merge a PR; the PR URL is in the tool output.
-# Prints "<kind> <url>" (url may be "-") or nothing. Only the classification
-# and URL ever leave the box -- never the command text itself.
+# are shell commands (Claude's Bash, Devin's exec) that open or merge a PR; the
+# PR URL is in the tool output. Prints "<kind> <url>" (url may be "-") or
+# nothing. Only the classification and URL ever leave the box -- never the
+# command text itself.
 classify_tool() {
   local input=$1 tool cmd out kind url
   tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || return 0
-  [ "$tool" = "Bash" ] || return 0
+  case $tool in Bash|exec) ;; *) return 0 ;; esac
   cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null) || return 0
   [ -n "$cmd" ] || return 0
   # grep's ^ is line-anchored, so a heredoc BODY that merely documents
@@ -287,6 +334,12 @@ classify_tool() {
       (if $kind == "pr_created" then (.stdout // .output // "" | tostring)
        else ([.stdout, .stderr, .output] | map(select(. != null) | tostring) | join("\n")) end)
     else tostring end' 2>/dev/null) || out=
+  # Devin's exec answers {success, output, error}: stdout and stderr together
+  # in .output, closed by an "Exit code: N" line, and success is true for a
+  # command that ran and failed. So the exit code is the evidence there.
+  if [ "$tool" = exec ]; then
+    [ "$(printf '%s\n' "$out" | awk 'NF { last = $0 } END { print last }')" = 'Exit code: 0' ] || return 0
+  fi
   url=
   if [ "$kind" = pr_merged ]; then
     local ref
@@ -345,6 +398,68 @@ usage_payload() {  # usage_payload <jsonl>...
 # (the order exists on the orchestrator that launched the run, not on a mirror).
 usage_endpoint() { printf '%s' "${1%/api/status}/api/claude-runner/event"; }
 
+# A stand-in box of the local e2e stack (docs/e2e-stack.md, "Isolation") runs
+# as you, on your machine: in a pane whose tmux server got your own HOME, this
+# script would read your real agent config and post to your real orchestrator
+# with your real box's token. Such a hook is known by TERMAG_E2E_ROOT, or by a
+# $TMUX socket under a stack root (a directory holding .termag-e2e), and posts
+# only to the origins that root lists in status-origins; none if it lists none.
+# Only a marker that is your own file counts: /tmp is world-writable, so another
+# user's /tmp/.termag-e2e (or a symlink there to a file of yours) would
+# otherwise silence every real status post on the host. Every post goes through
+# post_json, usage mode's too, so both are defined before that mode.
+e2e_stack_root() {
+  local d
+  if [ -n "${TERMAG_E2E_ROOT:-}" ]; then printf '%s' "$TERMAG_E2E_ROOT"; return 0; fi
+  [ -n "${TMUX:-}" ] || return 1
+  d=${TMUX%%,*}
+  while [ -n "$d" ]; do
+    d=${d%/*}
+    if [ -f "$d/.termag-e2e" ] && [ ! -L "$d/.termag-e2e" ] && [ -O "$d/.termag-e2e" ]; then
+      printf '%s' "$d"; return 0
+    fi
+  done
+  return 1
+}
+E2E_ROOT=$(e2e_stack_root) || E2E_ROOT=
+e2e_allows() {
+  [ -n "$E2E_ROOT" ] || return 0
+  local origin
+  origin=$(printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]*).*#\1#')
+  grep -qxF -- "$origin" "$E2E_ROOT/status-origins" 2>/dev/null && return 0
+  printf 'termag-status: refusing to post to %s: this hook runs on a stand-in box of the e2e stack at %s, which posts only to %s\n' \
+    "$origin" "$E2E_ROOT" "$( { tr '\n' ' ' <"$E2E_ROOT/status-origins"; } 2>/dev/null || echo 'nothing (no status-origins)')" \
+    | tee -a "$E2E_ROOT/logs/status-refused.log" >&2 2>/dev/null
+  return 1
+}
+
+# Status writes from a remote host require the agent token: the server trusts
+# same-host callers (isLocalPeer) but a box reaches :3040 over the private VPC,
+# where requireAuthOrAgentToken applies. Without this a provisioned box 401s and,
+# because the hooks discard output, fails silently -- the exact failure mode this
+# script exists to remove. agent.js sends the same token on the same path.
+#
+# Passed via `curl -K -` (config on stdin), never as -H on the command line:
+# process command lines are world-readable, and this token can write status for
+# any of the owner's sessions. agent.js takes the same care (see its comment on
+# passing the bearer token via env rather than argv).
+# -m 5 so an unreachable server can't leave hook processes hanging around.
+post_json() {
+  local url=$1 body=$2 token=$3
+  e2e_allows "$url" || return 0
+  if [ -n "$token" ]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$token" \
+      | curl -sf -m 5 -K - -X POST "$url" \
+          -H 'Content-Type: application/json' \
+          -d "$body" >/dev/null 2>&1
+  else
+    # No token in the agent config: only a same-host server will accept this.
+    curl -sf -m 5 -X POST "$url" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null 2>&1
+  fi
+}
+
 if [ "$MODE" = usage ]; then
   if [ "${#TRANSCRIPTS[@]}" -eq 0 ]; then
     # The hook payload names the transcript (Claude Code's documented hook stdin).
@@ -355,18 +470,15 @@ if [ "$MODE" = usage ]; then
   [ -n "$USAGE_PAYLOAD" ] || exit 0
   if [ -n "$PRINT_PAYLOAD" ]; then printf '%s\n' "$USAGE_PAYLOAD"; exit 0; fi
   ENDPOINT=$(resolve_endpoint)
-  post_usage() {  # defined again below for the status modes; here for the bare mode
-    local url=$1 body=$2 token=$3
-    if [ -n "$token" ]; then
-      printf 'header = "Authorization: Bearer %s"\n' "$token" \
-        | curl -sf -m 5 -K - -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1
-    else
-      curl -sf -m 5 -X POST "$url" -H 'Content-Type: application/json' -d "$body" >/dev/null 2>&1
-    fi
-  }
-  post_usage "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$(resolve_token)"
+  post_json "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$(resolve_token)"
   exit 0
 fi
+
+# Devin imports the Claude hooks from ~/.claude/settings.json and runs them with
+# DEVIN_PROJECT_DIR set (Claude Code never sets it). Their source-less posts
+# would book Devin's time as Claude's, so they post nothing; Devin's own hooks
+# (deploy/devin-hooks.json, merged by termag-reconcile) send --source devin-hooks.
+[ -n "${DEVIN_PROJECT_DIR:-}" ] && [ -z "$SOURCE" ] && exit 0
 
 # --- which session ------------------------------------------------------------
 # The server keys status on the tmux session name; no session means no context.
@@ -469,7 +581,7 @@ case $MODE in
     # post `working`, as the old PostToolUse line did; additionally post a
     # milestone when the tool call opened or merged a PR.
     INPUT=$(cat)
-    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"working"}')
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s,status:"working"} + $x')
     CLASS=$(classify_tool "$INPUT")
     if [ -n "$CLASS" ]; then
       KIND=${CLASS%% *}; URL=${CLASS#* }
@@ -486,7 +598,7 @@ case $MODE in
     # 120 characters and keeps the first title it gets. Never a status payload
     # field: prompt text belongs on the run row only.
     INPUT=$(cat)
-    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"working"}')
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s,status:"working"} + $x')
     if [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] && [ -n "${TERMAG_CLAUDE_RUNNER_ORDER:-}" ]; then
       TITLE_MARKER=${TERMAG_CLAUDE_RUNNER_DIR:-$HOME/.termag/claude-runner}/$TERMAG_CLAUDE_RUNNER_ORDER.titled
       if [ ! -e "$TITLE_MARKER" ]; then
@@ -510,11 +622,34 @@ case $MODE in
     # server, so a lost post costs nothing; the runner's post-session hook
     # posts once more at the end.
     INPUT=$(cat)
-    PAYLOAD=$(jq -nc --arg s "$SESSION" '{session:$s,status:"idle"}')
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s,status:"idle"} + $x')
     if [ -n "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" ] && [ -n "${TERMAG_CLAUDE_RUNNER_ORDER:-}" ]; then
       T=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null) || T=
       [ -n "$T" ] && USAGE_PAYLOAD=$(usage_payload "$T")
     fi
+    ;;
+  permission-request)
+    # Devin's PermissionRequest fires only when the approval prompt is shown
+    # (smart mode's own approvals fire nothing). Read in the foreground (see
+    # `notification`). The message names the tool, never its input: a command
+    # line can carry secrets, and this text reaches Slack.
+    INPUT=$(cat)
+    TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null) || TOOL=
+    [ -n "$MESSAGE" ] || MESSAGE="Needs your permission to use ${TOOL:-a tool}"
+    [ -n "$REASON" ] || REASON=approval
+    NOTIFY=1
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s,status:"waiting"} + $x')
+    ;;
+  session-end)
+    # Devin's SessionEnd. `/clear` (reason clear, then a new SessionStart) and
+    # resume end a session but not the process: it waits at its prompt.
+    # Anything else (prompt_input_exit, logout) means it exited.
+    INPUT=$(cat)
+    case $(printf '%s' "$INPUT" | jq -r '.reason // empty' 2>/dev/null) in
+      clear|resume) ST=idle ;;
+      *)            ST=not_running ;;
+    esac
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --arg st "$ST" --argjson x "$(extras)" '{session:$s,status:$st} + $x')
     ;;
   notification)
     # Read stdin in the foreground: the caller backgrounds the POST, not this
@@ -554,32 +689,6 @@ if [ -n "$PRINT_PAYLOAD" ]; then
   [ -n "$USAGE_PAYLOAD" ] && printf '%s\n' "$USAGE_PAYLOAD"
   exit 0
 fi
-
-# Status writes from a remote host require the agent token: the server trusts
-# same-host callers (isLocalPeer) but a box reaches :3040 over the private VPC,
-# where requireAuthOrAgentToken applies. Without this a provisioned box 401s and,
-# because the hooks discard output, fails silently -- the exact failure mode this
-# script exists to remove. agent.js sends the same token on the same path.
-#
-# Passed via `curl -K -` (config on stdin), never as -H on the command line:
-# process command lines are world-readable, and this token can write status for
-# any of the owner's sessions. agent.js takes the same care (see its comment on
-# passing the bearer token via env rather than argv).
-# -m 5 so an unreachable server can't leave hook processes hanging around.
-post_json() {
-  local url=$1 body=$2 token=$3
-  if [ -n "$token" ]; then
-    printf 'header = "Authorization: Bearer %s"\n' "$token" \
-      | curl -sf -m 5 -K - -X POST "$url" \
-          -H 'Content-Type: application/json' \
-          -d "$body" >/dev/null 2>&1
-  else
-    # No token in the agent config: only a same-host server will accept this.
-    curl -sf -m 5 -X POST "$url" \
-      -H 'Content-Type: application/json' \
-      -d "$body" >/dev/null 2>&1
-  fi
-}
 
 post_all() {  # post_all <endpoint> <token>: the status, and the milestone if any
   post_json "$1" "$PAYLOAD" "$2"

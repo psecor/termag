@@ -87,6 +87,29 @@ esac
 # own. The orchestrator starts it over the agent's box-update RPC, the owner
 # by hand; enabling it would run an update at every login.
 #
+# termag-claude-update-boot.service is enable=enable: it is meant to run at
+# every boot, after this script and before the agent, so a stopped box starts
+# on a current Claude Code. Enabled mid-boot, it
+# first runs at the next one. claude-code-floor is the floor it and
+# termag-claude-runner read.
+#
+# termag-claude-update@.service is noenable, a template with no [Install]: the
+# agent starts one instance per orchestrator run over its tool-update RPC
+# (agent/tool-update.js), and announces tool-update-v1 only once it is loaded.
+# termag-codex-update@.service is the same for Codex (tool-update-codex-v1),
+# termag-cursor-update@.service for the Cursor agent (tool-update-cursor-v1),
+# termag-devin-update@.service for the Devin CLI (tool-update-devin-v1), and
+# termag-pi-update@.service for pi (tool-update-pi-v1), and
+# termag-node-update@.service for Node (tool-update-node-v1), with Node's
+# release keys beside the floor file.
+# Both updaters source termag-tool-update-lib from their own directory, so it
+# is installed into ~/.local/bin beside them, and ahead of them in this table:
+# a run of the new updater never finds the old lib.
+# The GitHub CLI's termag-gh-update@.service is not here: gh is root's package,
+# so its unit is a system unit, installed with its recipe by
+# termag-gh-update-setup (reconcile_gh_update, below), and the AWS CLI's
+# termag-aws-update@.service the same way (termag-aws-update-setup).
+#
 # claude-settings.json is deliberately absent entirely. Box owners add their own
 # hooks to it, and overwriting it every boot would silently discard that. The
 # bake seeds it once and it is the user's thereafter. The only thing this script
@@ -113,10 +136,28 @@ termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable
 termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable
 termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable
 termag-mcp-headers:$HOME/.local/bin/termag-mcp-headers:755:bin:noenable
+termag-mcp-bridge:$HOME/.local/bin/termag-mcp-bridge:755:bin:noenable
 termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable
 termag-pi-fireworks:$HOME/.local/bin/termag-pi-fireworks:755:bin:noenable
 termag-agent-otel:$HOME/.local/bin/termag-agent-otel:755:bin:noenable
 termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable
+termag-tool-update-lib:$HOME/.local/bin/termag-tool-update-lib:644:file:noenable
+termag-claude-update:$HOME/.local/bin/termag-claude-update:755:bin:noenable
+claude-code-floor:$HOME/.local/share/termag/claude-code-floor:644:file:noenable
+termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable
+termag-claude-update-boot.service:$HOME/.config/systemd/user/termag-claude-update-boot.service:644:unit:enable
+termag-claude-update@.service:$HOME/.config/systemd/user/termag-claude-update@.service:644:unit:noenable
+termag-codex-update:$HOME/.local/bin/termag-codex-update:755:bin:noenable
+termag-codex-update@.service:$HOME/.config/systemd/user/termag-codex-update@.service:644:unit:noenable
+termag-cursor-update:$HOME/.local/bin/termag-cursor-update:755:bin:noenable
+termag-cursor-update@.service:$HOME/.config/systemd/user/termag-cursor-update@.service:644:unit:noenable
+termag-devin-update:$HOME/.local/bin/termag-devin-update:755:bin:noenable
+termag-devin-update@.service:$HOME/.config/systemd/user/termag-devin-update@.service:644:unit:noenable
+termag-pi-update:$HOME/.local/bin/termag-pi-update:755:bin:noenable
+termag-pi-update@.service:$HOME/.config/systemd/user/termag-pi-update@.service:644:unit:noenable
+termag-node-update:$HOME/.local/bin/termag-node-update:755:bin:noenable
+termag-node-update@.service:$HOME/.config/systemd/user/termag-node-update@.service:644:unit:noenable
+termag-node-release-keys.asc:$HOME/.local/share/termag/termag-node-release-keys.asc:644:file:noenable
 termag-briefing:$HOME/.local/bin/termag-briefing:755:bin:noenable
 claude-runner-hooks/command:$HOME/.local/lib/termag/claude-runner-hooks/command:755:bin:noenable
 claude-runner-hooks/post-session:$HOME/.local/lib/termag/claude-runner-hooks/post-session:755:bin:noenable
@@ -138,6 +179,11 @@ claude-skills/termag-spaces/SKILL.md:$HOME/.claude/skills/termag-spaces/SKILL.md
 pi-skills/termag-spaces/SKILL.md:$HOME/.pi/agent/skills/termag-spaces/SKILL.md:644:file:noenable
 claude-skills/termag-handoff/SKILL.md:$HOME/.claude/skills/termag-handoff/SKILL.md:644:file:noenable
 pi-skills/termag-handoff/SKILL.md:$HOME/.pi/agent/skills/termag-handoff/SKILL.md:644:file:noenable
+termag-overlap:$HOME/.local/bin/termag-overlap:755:bin:noenable
+claude-skills/termag-overlap/SKILL.md:$HOME/.claude/skills/termag-overlap/SKILL.md:644:file:noenable
+pi-skills/termag-overlap/SKILL.md:$HOME/.pi/agent/skills/termag-overlap/SKILL.md:644:file:noenable
+claude-skills/termag-bug-report/SKILL.md:$HOME/.claude/skills/termag-bug-report/SKILL.md:644:file:noenable
+pi-skills/termag-bug-report/SKILL.md:$HOME/.pi/agent/skills/termag-bug-report/SKILL.md:644:file:noenable
 TABLE
 }
 
@@ -165,11 +211,13 @@ PI_METATERM_MCP='{"type":"stdio","command":"~/.local/bin/termag-metaterm-mcp","e
 # FILE, treating a missing or empty file as {}. Writes only on a real
 # difference, keeps the file's mode (0600 when new), and leaves a file jq cannot
 # parse alone rather than replacing an owner's config.
-# ~/.claude.json is merged under termag-credentials' lock on it, so this and an
-# MCP delivery never write over each other.
+# ~/.claude.json and pi's ~/.pi/agent/mcp.json are merged under
+# termag-credentials' lock on them, so this and an MCP delivery never write
+# over each other.
 merge_json() {
   local rc=0
-  if [ "$1" != "$HOME/.claude.json" ] || [ "$MODE" = check ] || ! command -v flock >/dev/null 2>&1; then
+  case $1 in "$HOME/.claude.json"|"$HOME/.pi/agent/mcp.json") ;; *) merge_json_unlocked "$@"; return ;; esac
+  if [ "$MODE" = check ] || ! command -v flock >/dev/null 2>&1; then
     merge_json_unlocked "$@"
     return
   fi
@@ -285,6 +333,35 @@ reconcile_cli() {
   fi
 }
 
+# The pinned t3 server for the desktop app (deploy/t3-server.pin), its
+# launcher and the agent drop-in that names it, all from termag-t3-install.
+# Not a table row either: the installer's --check is the comparison (offline,
+# and drift only when this box could fix it, so a pin whose base_url is still
+# unset is not drift), and its install verifies the pinned sha256 and runs the
+# server once before anything names it. Bounded like the CLI, so a slow
+# download cannot hold the agent's start for long; an interrupted install
+# leaves only a temp dir the next run removes. termag-box-update restarts the
+# agent when the drop-in is new (it reads TERMAG_T3_COMMAND at start).
+reconcile_t3_server() {
+  local installer="$DEPLOY/termag-t3-install" out
+  [ -f "$installer" ] || return 0
+  if out=$(bash "$installer" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  local runner=()
+  command -v timeout >/dev/null 2>&1 && runner=(timeout "${TERMAG_T3_INSTALL_TIMEOUT:-40}")
+  if out=$("${runner[@]}" bash "$installer" 2>&1); then
+    [ -z "$out" ] || printf '%s\n' "$out"
+  else
+    printf 'termag-reconcile: the t3 server did not install:\n%s\n' "$out" >&2
+  fi
+}
+
 # Ask runs no longer have a sandbox: they run as the box user.
 # This retires what
 # the old termag-subagent-setup left: its two scripts in this home, and, when
@@ -362,6 +439,102 @@ reconcile_guest_browser() {
   fi
 }
 
+# The GitHub CLI's root updater: deploy/termag-gh-update-setup puts the recipe, root's copy of the
+# lib, the start helper, the system unit and the one sudoers line in place for
+# this box user. All of it is root's, so through sudo -n like the guest
+# browser, and only on a box (the same marker): gh there is root's package.
+# Without passwordless sudo it is not reported as drift, since nothing here
+# can fix it; the agent then announces no gh capability.
+GH_UPDATE_BOX_MARKER="${TERMAG_GH_UPDATE_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a GH_UPDATE_SUDO <<< "${TERMAG_GH_UPDATE_SUDO-sudo -n}"
+
+reconcile_gh_update() {
+  local setup="$DEPLOY/termag-gh-update-setup" out me
+  [ -f "$setup" ] || return 0
+  [ -f "$GH_UPDATE_BOX_MARKER" ] || return 0
+  me=$(id -un)
+  "${GH_UPDATE_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${GH_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: gh updater: /'
+    return 0
+  fi
+  if out=$("${GH_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: gh updater: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the gh updater setup failed\n' >&2
+  fi
+}
+
+# The AWS CLI v2's root updater: deploy/termag-aws-update-setup puts the recipe, root's
+# copy of the lib, AWS's key, the start helper, the system unit and the one
+# sudoers line in place for this box user, as the GitHub CLI's setup above
+# does: all of it root's, through sudo -n, only on a box.
+# Without passwordless sudo it is not reported as drift, since nothing here
+# can fix it; the agent then announces no aws capability.
+AWS_UPDATE_BOX_MARKER="${TERMAG_AWS_UPDATE_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+# Only where the image installed the AWS CLI: the minimal flavor has none, and
+# no gnupg or unzip either (Bugbot on #1110).
+AWS_UPDATE_CLI="${TERMAG_AWS_UPDATE_CLI:-/usr/local/bin/aws}"
+read -r -a AWS_UPDATE_SUDO <<< "${TERMAG_AWS_UPDATE_SUDO-sudo -n}"
+
+reconcile_aws_update() {
+  local setup="$DEPLOY/termag-aws-update-setup" out me
+  [ -f "$setup" ] || return 0
+  [ -f "$AWS_UPDATE_BOX_MARKER" ] || return 0
+  [ -x "$AWS_UPDATE_CLI" ] || return 0
+  me=$(id -un)
+  "${AWS_UPDATE_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${AWS_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: aws updater: /'
+    return 0
+  fi
+  if out=$("${AWS_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: aws updater: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the aws updater setup failed\n' >&2
+  fi
+}
+
+# Terminfo for terminals the box's ncurses lacks (Ghostty's xterm-ghostty):
+# deploy/termag-terminfo-setup compiles a pinned copy into /etc/terminfo. Root's,
+# so through sudo -n like the guest browser, and only on a box (the same
+# marker): a shared host's /etc is not termag's. Without passwordless sudo it
+# is not reported as drift, since nothing here can fix it; the termag CLI
+# still copies the entry for its own sessions.
+TERMINFO_BOX_MARKER="${TERMAG_TERMINFO_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a TERMINFO_SUDO <<< "${TERMAG_TERMINFO_SUDO-sudo -n}"
+
+reconcile_terminfo() {
+  local setup="$DEPLOY/termag-terminfo-setup" out
+  [ -f "$setup" ] || return 0
+  [ -f "$TERMINFO_BOX_MARKER" ] || return 0
+  "${TERMINFO_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${TERMINFO_SUDO[@]}" bash "$setup" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if out=$("${TERMINFO_SUDO[@]}" bash "$setup" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the terminfo setup failed\n' >&2
+  fi
+}
+
 reconcile_pi_config() {
   # Same gate as the Claude config: an older checkout without the server has
   # nothing to register. Pi not being installed is fine -- the file simply
@@ -380,6 +553,34 @@ reconcile_pi_config() {
     '.mcpServers.metaterm = ($v + ((.mcpServers.metaterm // {}) | if type == "object" then . else {} end | with_entries(select(.key | IN("enabled","exposure","toolExposure","timeout","cwd")))))'
 }
 
+# Devin's status hooks: deploy/devin-hooks.json merged
+# into the `hooks` key of ~/.config/devin/config.json, the only global hook
+# location Devin reads (a hooks.v1.json under ~/.config/devin or ~/.devin is
+# ignored). Every hook that invokes termag-status, under any event, is dropped
+# (a group it leaves empty goes with it) and the canonical ones are appended
+# per event; the owner's other hooks and every other key (Devin's own
+# permissions allow-list lives in this file) are kept. Devin keeps the key when
+# it rewrites the file, and accepts a file holding only `hooks`, so a box whose
+# owner has not run Devin yet gets one that waits for it, as pi's does.
+reconcile_devin_hooks() {
+  local canon="$CHECKOUT/deploy/devin-hooks.json" hooks
+  [ -f "$canon" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'termag-reconcile: jq not found; skipping the Devin status hooks\n' >&2
+    return 0
+  fi
+  hooks=$(jq -c '.hooks' "$canon") || return 0
+  merge_json "$HOME/.config/devin/config.json" 'termag status hooks (Devin)' "$hooks" '
+    def termag: (.command // "") | test("termag-status");
+    def strip: map(if any(.hooks[]?; termag)
+      then (.hooks |= map(select(termag | not))) | select(.hooks | length > 0)
+      else . end);
+    .hooks = ((.hooks // {}) as $eh
+      | reduce ((($eh | keys) + ($v | keys)) | unique[]) as $ev ($eh;
+          .[$ev] = ((($eh[$ev] // []) | strip) + ($v[$ev] // [])))
+      | with_entries(select((.value | length) > 0 or (($eh[.key] // []) | length) == 0)))'
+}
+
 # The Generated-by: termag commit trailer (deploy/termag-commit-msg). The hook
 # sits in the box user's git template, which init.templateDir names in the XDG
 # global config ($XDG_CONFIG_HOME/git/config, never ~/.gitconfig, which may be an
@@ -395,11 +596,15 @@ GIT_TEMPLATE_PATH='~/.local/share/termag/git-template'
 
 reconcile_git_template() {
   local hook="$GIT_TEMPLATE_DIR/hooks/commit-msg" cur dest
-  # The file git reads as the XDG global config, so the --global read below sees it.
   local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
   [ -x "$hook" ] || return 0
   command -v git >/dev/null 2>&1 || return 0
-  cur=$(git config --global --type=path --get init.templateDir 2>/dev/null || true)
+  # Both global files, the way git itself reads them (~/.gitconfig after XDG,
+  # so it wins). Not `git config --global`: once ~/.gitconfig exists that reads
+  # only it, and the XDG value written below would never be seen.
+  cur=$(git config --includes --file "$HOME/.gitconfig" --type=path --get init.templateDir 2>/dev/null \
+    || git config --includes --file "$xdg" --type=path --get init.templateDir 2>/dev/null \
+    || true)
   if [ -z "$cur" ]; then
     changed=$((changed + 1))
     if [ "$MODE" = check ]; then
@@ -468,6 +673,41 @@ reconcile_claude_plugins() {
         printf 'reconciled: removed %s\n' "$dest"
       fi
     done < <(find "$CLAUDE_PLUGINS_DIR/$name" -type f -print0)
+  done
+}
+
+# ~/.local and ~/.local/state without group or other write. The box image's
+# umask 002 makes them drwxrwxr-x, and tools that check every ancestor of their
+# state directory (cmux's remote helper is one) refuse to start under that.
+# Only go-w is ever applied, so nothing is loosened and a second run finds
+# nothing to do. -L: an owner's symlinked ~/.local is judged by its target.
+reconcile_local_dir_modes() {
+  local dir perm
+  for dir in "$HOME/.local" "$HOME/.local/state"; do
+    if [ ! -e "$dir" ]; then
+      changed=$((changed + 1))
+      if [ "$MODE" = check ]; then
+        printf 'MISSING: %s (would create without group or other write)\n' "$dir"
+      elif mkdir -p "$dir" && chmod go-w "$dir"; then
+        printf 'reconciled: created %s\n' "$dir"
+      else
+        printf 'termag-reconcile: failed to create %s\n' "$dir" >&2
+      fi
+      continue
+    fi
+    perm=$(ls -ldL -- "$dir" 2>/dev/null) || continue
+    case $perm in
+      ?????w*|????????w*) ;;
+      *) continue ;;
+    esac
+    changed=$((changed + 1))
+    if [ "$MODE" = check ]; then
+      printf 'DRIFT: %s is group- or other-writable\n' "$dir"
+    elif chmod go-w "$dir"; then
+      printf 'reconciled: removed group and other write from %s\n' "$dir"
+    else
+      printf 'termag-reconcile: failed to remove group and other write from %s\n' "$dir" >&2
+    fi
   done
 }
 
@@ -554,11 +794,17 @@ reconcile_claude_config
 reconcile_claude_path_hook
 reconcile_claude_onboarding
 reconcile_cli
+reconcile_t3_server
 retire_ask_sandbox
 reconcile_guest_browser
+reconcile_gh_update
+reconcile_aws_update
+reconcile_terminfo
 reconcile_pi_config
+reconcile_devin_hooks
 reconcile_git_template
 reconcile_claude_plugins
+reconcile_local_dir_modes
 
 if [ "$MODE" = check ]; then
   [ "$changed" -eq 0 ] || exit 1
