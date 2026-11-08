@@ -87,6 +87,7 @@ export async function cmdLogin(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
     openBrowser: ctx.openBrowser,
     notify: ctx.err,
     timeoutMs: ctx.loginTimeoutMs,
+    boxToken: s.target.box?.token,
   });
   saveLogin(s.credsPath, s.target.host, {
     token: token.token,
@@ -196,10 +197,11 @@ export async function cmdBoxList(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> 
     boxes.map(b => [
       b.name,
       b.state === 'failed' && b.error ? `failed: ${b.error}` : b.state,
-      b.resize?.running ? `${boxSizeCell(b)} -> ${b.resize.to} (${b.resize.phase})` : boxSizeCell(b),
+      // A box with termag setup off says so beside its size.
+      (b.resize?.running ? `${boxSizeCell(b)} -> ${b.resize.to} (${b.resize.phase})` : boxSizeCell(b)) + (b.setupEnabled === false ? ', setup off' : ''),
       b.diskGiB ? `${b.diskGiB} GB` : '-',
       b.agentConnected ? 'connected' : '-',
-      b.projects.map(p => p.name).join(', ') || '-',
+      b.projects.map(p => (p.label ? `${p.name} (${p.label})` : p.name)).join(', ') || '-',
     ]),
   ));
   const unaddressable = boxes.filter(b => !b.addressable).map(b => `"${b.name}"`);

@@ -261,6 +261,13 @@ describe('lists', () => {
     expect(out.join('\n')).toMatch(/gbox\s+running\s+r8g\.xlarge\s+-\s+connected/);
   });
 
+  it('box list says which boxes have termag setup off', async () => {
+    orch.lifecycle.boxes.push({ id: 'i8', name: 'bare', addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, setupEnabled: false, projects: [], size: 'small', instanceType: 'm8g.large' });
+    expect(await run(['box', 'list'], ctx())).toBe(0);
+    expect(out.join('\n')).toMatch(/bare\s+running\s+small \(m8g\.large\), setup off\s+-\s+connected/);
+    expect(out.join('\n')).not.toMatch(/devbox.*setup off/);
+  });
+
   it('box ls --json passes the boxes through', async () => {
     expect(await run(['box', 'ls', '--json'], ctx())).toBe(0);
     expect(JSON.parse(out.join('')).boxes.map((b: { name: string }) => b.name)).toEqual(['devbox', 'old box']);

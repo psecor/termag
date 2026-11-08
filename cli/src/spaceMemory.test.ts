@@ -20,8 +20,8 @@ import {
 interface Fake {
   host: string;
   files: Map<string, Buffer>;
-  /** GET /spaces/:space/memory: 'on', 'off' (space_memory_off) or 'old' (an orchestrator from before it: a bare 404). */
-  memory: 'on' | 'off' | 'old';
+  /** GET /spaces/:space/memory: 'on', or 'old' (an orchestrator from before it: a bare 404). */
+  memory: 'on' | 'old';
   role: 'owner' | 'editor' | 'viewer';
   spaces: Array<{ name: string; access?: { kind: 'explicit' } | { kind: 'inherited'; via: string } }>;
   writers: Record<string, unknown>;
@@ -95,7 +95,6 @@ async function startFake(): Promise<Fake> {
     if (!fake.spaces.some(s => s.name === space)) { sendJson(res, 404, { error: 'Not found', code: 'not_found' }); return; }
     const json = req.method === 'POST' ? JSON.parse((await body(req)).toString('utf8') || '{}') : {};
     if (rest === '/memory') {
-      if (fake.memory === 'off') { sendJson(res, 404, { error: 'Space memory is not turned on for you', code: 'space_memory_off' }); return; }
       if (fake.memory === 'old') { sendJson(res, 404, { error: 'Not found', code: 'not_found' }); return; }
       sendJson(res, 200, { space, role: fake.role, readOnly: false, writable: fake.role !== 'viewer', me: 'u-me', writers: fake.writers });
       return;
@@ -345,15 +344,13 @@ describe('sync', () => {
     expect(fake.deletes).toEqual([]);
   });
 
-  it('removes the copy when space memory is off, or the orchestrator predates it, or the box lost the space', async () => {
+  it('removes the copy when the orchestrator predates space memory, or the box lost the space', async () => {
     await termag('space', 'memory', 'sync', 'team');
-    fake.memory = 'off';
-    await termag('space', 'memory', 'sync', 'team');
-    expect(existsSync(local('files'))).toBe(false);
-    expect(out.at(-1)).toContain('nothing loaded (space memory is not turned on for you)');
     fake.memory = 'old';
     await termag('space', 'memory', 'sync', 'team');
+    expect(existsSync(local('files'))).toBe(false);
     expect(existsSync(local('index.md'))).toBe(false);
+    expect(out.at(-1)).toContain('nothing loaded (this orchestrator does not serve space memory)');
     fake.memory = 'on';
     await termag('space', 'memory', 'sync', 'team');
     expect(existsSync(local('index.md'))).toBe(true);
@@ -401,7 +398,7 @@ describe('context', () => {
   it('tells a session once that memory stopped loading', async () => {
     const session = join(home, 's.json');
     await termag('space', 'memory', 'context', 'team', '--session', session, '--refresh', '0s', '--json');
-    fake.memory = 'off';
+    fake.memory = 'old';
     await termag('space', 'memory', 'context', 'team', '--session', session, '--refresh', '0s', '--json');
     expect(JSON.parse(out.at(-1)!).notice).toContain('no longer loaded');
     await termag('space', 'memory', 'context', 'team', '--session', session, '--refresh', '0s', '--json');
@@ -677,9 +674,9 @@ describe('pane-claude: an interactive pane\'s skills', () => {
     expect(readFileSync(frozen('skills', 'demo-kit', 'SKILL.md'), 'utf8')).toContain('v2');
   });
 
-  it('prints nothing, and leaves no launcher, when memory is off or the space has no skills', async () => {
+  it('prints nothing, and leaves no launcher, when nothing loads or the space has no skills', async () => {
     await pane();
-    fake.memory = 'off';
+    fake.memory = 'old';
     // Within 60 s a pane uses the last sync, as a chat turn does; a sync makes it current.
     await termag('space', 'memory', 'sync', 'team');
     out = [];
@@ -695,7 +692,7 @@ describe('pane-claude: an interactive pane\'s skills', () => {
   });
 
   it('a resume of a pane that started with no skills stays without them', async () => {
-    fake.memory = 'off';
+    fake.memory = 'old';
     await pane();
     fake.memory = 'on';
     out = [];

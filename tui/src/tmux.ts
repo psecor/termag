@@ -22,11 +22,24 @@ export function currentSession(): string | null {
   } catch { return null; }
 }
 
-/** Switch the current tmux client to another session (TUI keeps running). */
+/**
+ * argv for `tmux attach-session` that then sets `window-size latest`, so a
+ * session from an older agent (`largest`) wraps at this client's width.
+ */
+export function attachSessionArgv(session: string): string[] {
+  return ['attach-session', '-t', session, ';', 'set-option', '-w', 'window-size', 'latest'];
+}
+
+/**
+ * Switch the current tmux client to another session (TUI keeps running),
+ * first setting `window-size latest` on it (best effort, see attachSessionArgv).
+ */
 export function switchClient(session: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile('tmux', ['switch-client', '-t', session], { timeout: 3000 }, (err, _out, stderr) => {
-      if (err) reject(new Error(stderr?.trim() || err.message)); else resolve();
+    execFile('tmux', ['set-option', '-t', `=${session}:`, '-w', 'window-size', 'latest'], { timeout: 3000 }, () => {
+      execFile('tmux', ['switch-client', '-t', session], { timeout: 3000 }, (err, _out, stderr) => {
+        if (err) reject(new Error(stderr?.trim() || err.message)); else resolve();
+      });
     });
   });
 }

@@ -13,12 +13,16 @@
 // below cli/, as tsc's did: tui.ts and update.ts find the CLI and the checkout
 // from import.meta.url.
 //
+// The version (`termag --version`, the User-Agent, usage and bug reports) is
+// buildVersion.mjs's, from git, set as __TERMAG_CLI_VERSION__ (version.ts).
+//
 // Usage: node build.mjs [<outdir>]   (default dist; install.sh passes its
 // scratch directory). The output directory is emptied first.
 import { rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
+import { buildVersion } from './buildVersion.mjs';
 
 const cliDir = dirname(fileURLToPath(import.meta.url));
 const outdir = resolve(cliDir, process.argv[2] ?? 'dist');
@@ -34,5 +38,6 @@ await build({
   platform: 'node',
   target: 'node20',
   packages: 'external',
+  define: { __TERMAG_CLI_VERSION__: JSON.stringify(buildVersion(cliDir)) },
   logLevel: 'warning',
 });

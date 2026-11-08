@@ -42,7 +42,7 @@ export async function probeForward(
       };
     } catch (err) {
       if (!(err instanceof CliError) || err.status === undefined || err.status === 401 || err.code === 'edge_auth'
-        || err.code === 'not_cli_enabled') throw err;
+        || err.code === 'not_cli_enabled' || err.code === 'unreachable') throw err;
       const code = typeof err.body?.code === 'string' ? err.body.code : err.status === 404 ? 'not_found' : 'failed';
       if (RETRY_CODES.has(code) && attempt === 0) { await sleep(opts.retryDelayMs ?? 1000); continue; }
       const error = typeof err.body?.error === 'string' ? err.body.error : undefined;

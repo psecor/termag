@@ -36,14 +36,24 @@ const DISK_GIB = { min: 50, max: 300 } as const;
  * the label; the simple UI no longer needs it either.
  */
 const forAsk = { type: 'boolean' } as const;
+/**
+ * termag setup on or off for a new box: --no-setup, or
+ * --setup whatever the repository's environment.json says. Not --minimal,
+ * which a lean image is to use.
+ */
+const setup = { type: 'boolean' } as const;
+const noSetup = { type: 'boolean' } as const;
+
+/** What setup off leaves to the box's owner, said wherever one is made. */
+export const SETUP_OFF_NOTE = 'termag delivers no skills, agent config or credentials there: set the box up yourself.';
 
 export const FOR_ASK_DEPRECATED = 'termag: --for-ask is deprecated: `termag ask --new-box <box>/<project> <prompt|->` makes the box and the project for an ask, and asks, in one command';
 
 export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
   'box create': {
-    summary: 'Create a box; --size small (2 vCPU, 8 GB), medium (4, 16) or large (8, 32), else your default size; --disk 50 to 300 GB, else 120',
-    usage: 'termag box create <name> [--size small|medium|large] [--disk <GB>] [--wait] [--timeout <seconds>] [--if-not-exists] [--for-ask] [--minimal]',
-    options: { size, disk, wait, timeout, 'if-not-exists': ifNotExists, 'for-ask': forAsk, minimal: { type: 'boolean' } as const },
+    summary: 'Create a box; --size small (2 vCPU, 8 GB), medium (4, 16) or large (8, 32), else your default size; --disk 50 to 300 GB, else 120; --minimal for the lean image; --no-setup to turn termag setup off',
+    usage: 'termag box create <name> [--size small|medium|large] [--disk <GB>] [--from <github-url>] [--setup|--no-setup] [--wait] [--timeout <seconds>] [--if-not-exists] [--for-ask] [--minimal]',
+    options: { size, disk, from: { type: 'string' }, setup, 'no-setup': noSetup, wait, timeout, 'if-not-exists': ifNotExists, 'for-ask': forAsk, minimal: { type: 'boolean' } as const },
     maxArgs: 1,
   },
   'box start': {
@@ -71,9 +81,10 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
   },
   'box resize': {
     summary: 'Resize a box to small (2 vCPU, 8 GB), medium (4, 16) or large (8, 32): it stops for two to three minutes, '
-      + 'and running turns stop with it; a stopped or hibernated box is resized and left stopped',
-    usage: 'termag box resize <box> <small|medium|large> [--force] [--wait] [--timeout <seconds>] [--yes]',
-    options: { force: { type: 'boolean' }, wait, timeout },
+      + 'and running turns stop with it; a stopped or hibernated box is resized and left stopped. '
+      + '--disk grows its disk (up to 300 GB, never smaller, once every six hours) with the box up',
+    usage: 'termag box resize <box> [small|medium|large] [--disk <GB>] [--force] [--wait] [--timeout <seconds>] [--yes]',
+    options: { force: { type: 'boolean' }, wait, timeout, disk },
     maxArgs: 2,
   },
   'box rm': {
@@ -82,9 +93,14 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
     maxArgs: 1,
   },
   'project create': {
-    summary: 'Create a project on a box, or on a new box with --new-box (at --size, else the repository\'s or your default size)',
-    usage: 'termag project create <box>/<name> --agent <agent> [--from <template|github-url|box/project>] [--new-box [--size small|medium|large] [--disk <GB>] [--timeout <seconds>]] [--if-not-exists] [--for-ask]',
-    options: { agent: { type: 'string' }, from: { type: 'string' }, 'new-box': { type: 'boolean' }, size, disk, timeout, 'if-not-exists': ifNotExists, 'for-ask': forAsk },
+    summary: 'Create a project on a box, or on a new box with --new-box (at --size, else the repository\'s or environment\'s or your default size)',
+    usage: 'termag project create <box>/<name> --agent <agent> [--model opus|sonnet|haiku] [--from <template|github-url|box/project> | --environment <name>] [--new-box [--size small|medium|large] [--disk <GB>] [--setup|--no-setup] [--timeout <seconds>]] [--if-not-exists] [--for-ask]',
+    options: { agent: { type: 'string' }, model: { type: 'string' }, from: { type: 'string' }, environment: { type: 'string' }, 'new-box': { type: 'boolean' }, size, disk, setup, 'no-setup': noSetup, timeout, 'if-not-exists': ifNotExists, 'for-ask': forAsk },
+    details: '--environment <name>  Start from an environment: the project holds its repositories, a\n'
+      + "                      multi-repo project for two or more, and with --new-box the box is sized by its definition\n"
+      + '                      (--size and --disk still win). Instead of --from.\n'
+      + '--model <tier>        The Claude model its main workstream starts on, in its agent pane and its chat: opus,\n'
+      + '                      sonnet or haiku. Claude Code (--agent claude) only; without it, the default.',
     maxArgs: 1,
   },
   'project rename': {
@@ -141,7 +157,7 @@ async function listBoxes(api: Api): Promise<Box[]> {
   return (await api.request<{ boxes: Box[] }>('GET', '/boxes')).boxes;
 }
 
-async function listProjects(api: Api): Promise<Project[]> {
+export async function listProjects(api: Api): Promise<Project[]> {
   return (await api.request<{ projects: Project[] }>('GET', '/projects')).projects;
 }
 
@@ -226,6 +242,15 @@ function emitBox(ctx: Ctx, args: ParsedArgs, box: Box, extra: Record<string, unk
   return EXIT.OK;
 }
 
+/** --environment's name, lower case; undefined without it. The orchestrator says whether there is one. */
+export function environmentOption(args: ParsedArgs): string | undefined {
+  const raw = args.options.environment;
+  if (raw === undefined) return undefined;
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(value)) throw usage('--environment takes an environment\'s name (lowercase letters, digits and -)');
+  return value;
+}
+
 /** --size, checked here so a typo is a usage error before anything is asked of the orchestrator; undefined without it. */
 function sizeOption(args: ParsedArgs): string | undefined {
   const raw = args.options.size;
@@ -249,40 +274,56 @@ export function diskOption(args: ParsedArgs): number | undefined {
 }
 
 /**
+ * --setup or --no-setup, checked here so both at once is a
+ * usage error before anything is asked of the orchestrator; undefined
+ * without either, when a repository's environment.json may decide.
+ */
+function setupOption(args: ParsedArgs): boolean | undefined {
+  if (args.options.setup === true && args.options['no-setup'] === true) throw usage('--setup and --no-setup contradict each other');
+  return args.options.setup === true ? true : args.options['no-setup'] === true ? false : undefined;
+}
+
+/**
  * POST /boxes, or with --if-not-exists the box of that name when there is one
- * (whatever its size). A box whose launch failed isn't taken: the POST goes
- * ahead, and the orchestrator retires it and launches a new one, unless a
- * project waits on it (a 409; projectOnNewBox retries that project). `from`: what the project made on it starts from, so the
- * orchestrator can give the box that repository's default size and disk. `forAsk`: the
-* orchestrator can give the box that repository's default size and disk. `forAsk`: the
- * box is made only to run asks in (--for-ask). `minimal`: the box-min flavor —
+ * (whatever its size, disk or termag setup). A box whose launch failed isn't taken:
+ * the POST goes ahead, and the orchestrator retires it and launches a new one,
+ * unless a project waits on it (a 409; projectOnNewBox retries that project).
+ * `from`: what the project made on it starts from, so the orchestrator can
+ * give the box that repository's default size, disk and termag setup; this
+ * CLI states the setup (stateSetup), so it sends `useRepoSetup`.
+ * `setupEnabled`: --setup or --no-setup, which win over it. `forAsk`: the box
+ * is made only to run asks in (--for-ask). `minimal`: the box-min flavor —
  * the lean Component=box-min image and no warm-pool claim; --size still sets
  * the instance type and --disk the disk, but nothing lands on the box but the
  * box contract (you bootstrap the rest; the termag-herdr pattern).
  */
 export async function ensureBox(
-  api: Api, name: string, ifNotExists: boolean, launch: { size?: string; diskGiB?: number; from?: string | string[]; forAsk?: boolean; minimal?: boolean } = {},
+  api: Api, name: string, ifNotExists: boolean,
+  launch: { size?: string; diskGiB?: number; from?: string | string[]; environment?: string; forAsk?: boolean; setupEnabled?: boolean; minimal?: boolean } = {},
 ): Promise<MadeBox> {
 
   const existing = async () => (await listBoxes(api)).find(b => b.name === name) ?? null;
   const found = ifNotExists ? await existing() : null;
-  if (found && found.state !== 'failed') return { box: found, created: false, claimed: false, warnings: [] };
+  if (found && found.state !== 'failed') return { box: found, created: false, claimed: false, warnings: [], repoSetup: null };
   const body: Record<string, string | string[] | number | boolean> = { name };
   if (launch.size) body.size = launch.size;
   if (launch.diskGiB !== undefined) body.diskGiB = launch.diskGiB;
   if (launch.from) body.from = launch.from;
+  if (launch.environment) body.environment = launch.environment;
   if (launch.forAsk) body.createdFor = 'ask';
+  if (launch.setupEnabled !== undefined) body.setupEnabled = launch.setupEnabled;
+  if (launch.from) body.useRepoSetup = true;
   // --minimal: launch the lean Component=box-min image instead of the full
   // bake, and bootstrap the box yourself (the termag-herdr pattern).
   if (launch.minimal) body.flavor = 'minimal';
   try {
-    const res = await api.request<{ box: Box; claimed: boolean; warnings?: string[] }>('POST', '/boxes', body);
-    return { box: res.box, created: true, claimed: res.claimed, warnings: res.warnings ?? [] };
+    const res = await api.request<{ box: Box; claimed: boolean; pool?: 'environment'; warnings?: string[]; repoSetup?: RepoSetup; disk?: DiskNote }>('POST', '/boxes', body);
+    return { box: res.box, created: true, claimed: res.claimed, ...(res.pool ? { pool: res.pool } : {}), warnings: res.warnings ?? [], repoSetup: res.repoSetup ?? null, disk: res.disk ?? null };
   } catch (err) {
     if (!(err instanceof CliError && err.code === 'conflict' && ifNotExists)) throw err;
     const raced = await existing();
     if (!raced) throw err;
-    return { box: raced, created: false, claimed: false, warnings: [] };
+    return { box: raced, created: false, claimed: false, warnings: [], repoSetup: null };
   }
 }
 
@@ -290,8 +331,50 @@ export interface MadeBox {
   box: Box;
   created: boolean;
   claimed: boolean;
+  /** `environment`: claimed from an environment pool (a stopped box with its setup run), not the warm pool. */
+  pool?: 'environment';
   /** What of the repo's .termag/environment.json the orchestrator left out, and why; never an error. */
   warnings: string[];
+  /** The repos' environment.json turned termag setup off (null when not, or it can't be off for you), and whether the box has it off. */
+  repoSetup: RepoSetup | null;
+  /** The disk asked for (or the repo's) against the image's floor: what the box gets, and whether it was raised. */
+  disk?: DiskNote | null;
+}
+
+interface RepoSetup { setupEnabled: false; repos: string[]; applied: boolean }
+
+/** The 201's `disk` (backend services/boxImageFloor.ts). `floorKnown: false`: the launch may still raise it. */
+interface DiskNote { requestedGiB: number; diskGiB: number; raised: boolean; floorKnown: boolean }
+
+/**
+ * A disk under the image's own snapshot is never raised silently: one line on
+ * stderr from the 201's `disk`, or, once the box has launched (`launched`),
+ * from the disk it got. `asked`: --disk.
+ */
+export function stateDisk(ctx: Ctx, made: Pick<MadeBox, 'created' | 'disk'>, box: Pick<Box, 'diskGiB'>, asked: number | undefined, launched: boolean): void {
+  if (!made.created) return;
+  const note = made.disk ?? null;
+  const requested = note?.requestedGiB ?? asked;
+  if (requested === undefined) return;
+  const got = Math.max(note?.diskGiB ?? requested, launched && box.diskGiB ? box.diskGiB : 0);
+  const what = asked !== undefined ? `--disk ${requested}` : `a ${requested} GB disk`;
+  if (got > requested) ctx.err(`termag: ${what} is below the image's ${got} GB minimum; using ${got} GB`);
+  else if (note && !note.floorKnown && !launched) ctx.err(`termag: ${what} may be raised to the image's minimum when the box launches; \`termag box list\` shows the disk it got`);
+}
+
+/**
+ * A repository's setupEnabled is never applied silently:
+ * the create says on stderr when the box has setup off because of it, or on
+ * though it asked for off. `asked`: --setup or --no-setup; `override`
+ * replaces the --setup line, for a caller that turned it on itself (an ask).
+ */
+function stateSetup(ctx: Ctx, made: Pick<MadeBox, 'box' | 'created' | 'repoSetup'>, asked: boolean | undefined, override?: string): void {
+  const rs = made.repoSetup;
+  if (!made.created || !rs) return;
+  const where = `${rs.repos.join(', ')}'s .termag/environment.json ${rs.repos.length > 1 ? 'say' : 'says'} "setupEnabled": false`;
+  if (rs.applied) ctx.err(`termag: ${made.box.name} has termag setup off: ${where}; \`--setup\` turns it on. ${SETUP_OFF_NOTE}`);
+  else if (override) ctx.err(`termag: ${where}, but ${override}`);
+  else if (asked === true) ctx.err(`termag: ${made.box.name} has termag setup on (--setup), though ${where}.`);
 }
 
 /** The create's size warnings, on stderr: the box was made either way. */
@@ -305,21 +388,28 @@ async function cmdBoxCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   checkName(name, 'box');
   const size = sizeOption(args);
   const diskGiB = diskOption(args);
+  const setupEnabled = setupOption(args);
+  const from = typeof args.options.from === 'string' ? args.options.from.trim() || undefined : undefined;
+  if (args.options.from !== undefined && !from) throw usage('--from takes a GitHub repository URL');
   const timeoutS = timeoutSeconds(args, CREATE_WAIT_S);
   const api = await lifecycleApi(ctx, args);
   if (args.options['for-ask'] === true) ctx.err(FOR_ASK_DEPRECATED);
-  const ensured = await ensureBox(api, name, args.options['if-not-exists'] === true, { size, diskGiB, forAsk: args.options['for-ask'] === true, minimal: args.options.minimal === true });
+  const ensured = await ensureBox(api, name, args.options['if-not-exists'] === true, { size, diskGiB, from, setupEnabled, forAsk: args.options['for-ask'] === true, minimal: args.options.minimal === true });
   const { box: made, created, claimed } = ensured;
   warnSizing(ctx, ensured);
+  stateSetup(ctx, ensured, setupEnabled);
   const box = args.options.wait ? await waitForRunning(ctx, api, made, timeoutS, args.json) : made;
+  stateDisk(ctx, ensured, box, diskGiB, args.options.wait === true || box.state === 'running');
   const sizeText = boxSpecText(box);
   const sized = sizeText ? `, ${sizeText}` : '';
   const flavorWord = box.flavor === 'minimal' ? 'minimal ' : '';
   let text: string;
-  if (!created) text = `Box ${box.name} already exists (${box.state}${sized}).`;
-  else if (args.options.wait) text = `Created ${flavorWord}box ${box.name}${sizeText ? ` (${sizeText})` : ''}; it is running.`;
-  else if (box.state === 'running') text = `Created ${flavorWord}box ${box.name} (running${sized}).`;
-  else text = `Creating ${flavorWord}box ${box.name} (${box.state}${sized}); \`termag box create ${box.name} --wait --if-not-exists\` waits for it.`;
+  const off = box.setupEnabled === false ? ', termag setup off' : '';
+  if (!created) text = `Box ${box.name} already exists (${box.state}${sized}${off}).`;
+  else if (args.options.wait) text = `Created ${flavorWord}box ${box.name}${sizeText || off ? ` (${sizeText}${sizeText ? off : off.slice(2)})` : ''}; it is running.`;
+  else if (box.state === 'running') text = `Created ${flavorWord}box ${box.name} (running${sized}${off}).`;
+  else text = `Creating ${flavorWord}box ${box.name} (${box.state}${sized}${off}); \`termag box create ${box.name} --wait --if-not-exists\` waits for it.`;
+  if (created && off && !ensured.repoSetup?.applied) text += ` ${SETUP_OFF_NOTE}`;
   return emitBox(ctx, args, box, { created, claimed }, text);
 }
 
@@ -400,6 +490,7 @@ const RESIZE_WAIT_S = 30 * 60;
 
 /** What `box resize --wait` prints for each phase (backend services/boxResizePolicy.ts ResizePhase). */
 const RESIZE_PHASE_TEXT: Record<string, string> = {
+  disk: 'waiting for its disk to grow',
   resuming: 'resuming it from hibernation, so it can be stopped plainly',
   stopping: 'stopping',
   resizing: 'changing its instance type',
@@ -429,18 +520,61 @@ async function waitForResize(ctx: Ctx, api: Api, box: Box, timeoutS: number, qui
   }
 }
 
+/** "from 120 GB to 200 GB", or "to 200 GB" when the box's disk isn't recorded. */
+function diskChange(box: Box, toGb: number): string {
+  return box.diskGiB ? `from ${box.diskGiB} GB to ${toGb} GB` : `to ${toGb} GB`;
+}
+
+/**
+ * POST /boxes/:id/disk (backend services/boxDisk.ts): grows the box's root
+ * disk with the box up. The orchestrator refuses a shrink, more than 300 GB,
+ * a box that isn't running and EBS's second change inside six hours, each
+ * with a reason that is printed as it is.
+ */
+async function growDisk(api: Api, box: Box, sizeGb: number): Promise<{ box: Box; grow: unknown; alreadyGb?: number }> {
+  // 200 with `alreadyGb`: the disk already has that size, and nothing was done.
+  return api.request<{ box: Box; grow: unknown; alreadyGb?: number }>('POST', `/boxes/${encodeURIComponent(box.id)}/disk`, { sizeGb });
+}
+
 async function cmdBoxResize(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const ref = arg(args, 0, 'the box', 'box resize');
-  const raw = arg(args, 1, 'the size', 'box resize').trim().toLowerCase();
-  if (!SIZES.includes(raw)) throw usage(`The size is one of ${SIZES.join(', ')}, not "${raw}" (sizes only, never an instance type)`);
+  const diskGb = diskOption(args);
+  const given = args.args[1];
+  if (given === undefined && diskGb === undefined) {
+    throw usage(`Give the size, --disk <GB>, or both. Usage: ${LIFECYCLE_COMMANDS['box resize'].usage}`);
+  }
+  const raw = given === undefined ? null : given.trim().toLowerCase();
+  if (raw !== null && !SIZES.includes(raw)) throw usage(`The size is one of ${SIZES.join(', ')}, not "${raw}" (sizes only, never an instance type)`);
   const timeoutS = timeoutSeconds(args, RESIZE_WAIT_S);
   const api = await lifecycleApi(ctx, args);
   const found = await resolveBox(api, ref);
+  // Only the disk: the box stays up, so there is nothing to wait for or force.
+  if (raw === null || (found.size === raw && diskGb !== undefined)) {
+    await confirmOrRefuse(ctx, args,
+      `Grow ${found.name}'s disk ${diskChange(found, diskGb!)}? It stays up; a disk never shrinks, and EBS allows one change to it every six hours.`);
+    const grown = await growDisk(api, found, diskGb!);
+    if (grown.alreadyGb !== undefined) {
+      return emitBox(ctx, args, grown.box ?? found, { grow: null, alreadyGb: grown.alreadyGb }, `${found.name}'s disk is already ${grown.alreadyGb} GB; nothing to grow.`);
+    }
+    return emitBox(ctx, args, grown.box ?? found, { grow: grown.grow },
+      `Growing ${found.name}'s disk ${diskChange(found, diskGb!)}; it stays up, and \`termag box list\` shows the new size once it has grown.`);
+  }
   if (found.size === raw) return emitBox(ctx, args, found, { resized: false }, `${found.name} is already ${raw}.`);
   const down = found.state === 'stopped' || found.state === 'hibernated';
+  const diskFirst = diskGb === undefined ? '' : ` Its disk grows ${diskChange(found, diskGb)} first (never smaller again, and once every six hours).`;
   await confirmOrRefuse(ctx, args, down
-    ? `Resize ${found.name} to ${raw}? It is ${found.state}, and stays stopped.`
-    : `Resize ${found.name} to ${raw}? It stops for two to three minutes, and anything running on it stops.`);
+    ? `Resize ${found.name} to ${raw}? It is ${found.state}, and stays stopped.${diskFirst}`
+    : `Resize ${found.name} to ${raw}? It stops for two to three minutes, and anything running on it stops.${diskFirst}`);
+  // The disk first, with the box up: a refusal (EBS's six hours, say) stops here, before anything stops.
+  // The resize waits for the grow before it stops the box (backend boxResize.ts, phase `disk`).
+  let grow: unknown;
+  let diskGrows = diskGb !== undefined;
+  if (diskGb !== undefined) {
+    const grown = await growDisk(api, found, diskGb);
+    grow = grown.grow;
+    // Already that size: nothing grew, so the messages below speak of the resize alone.
+    if (grown.alreadyGb !== undefined) diskGrows = false;
+  }
   const send = (force: boolean) => api.request<{ box: Box; resize: NonNullable<Box['resize']> }>(
     'POST', `/boxes/${encodeURIComponent(found.id)}/resize`, { size: raw, ...(force ? { force: true } : {}) });
   let res: { box: Box; resize: NonNullable<Box['resize']> };
@@ -460,9 +594,11 @@ async function cmdBoxResize(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
     res = await send(true);
   }
   let box = res.box ?? found;
+  const extra = diskGb === undefined ? {} : { grow };
   if (!args.options.wait) {
-    return emitBox(ctx, args, box, { resize: res.resize },
-      `Resizing ${box.name} to ${raw}; \`termag box list\` shows when it is done, or run with --wait.`);
+    const what = !diskGrows || diskGb === undefined ? `Resizing ${box.name} to ${raw}` : `Growing ${found.name}'s disk ${diskChange(found, diskGb)}, then resizing it to ${raw}`;
+    return emitBox(ctx, args, box, { resize: res.resize, ...extra },
+      `${what}; \`termag box list\` shows when it is done, or run with --wait.`);
   }
   box = await waitForResize(ctx, api, box, timeoutS, args.json);
   const r = box.resize;
@@ -473,7 +609,7 @@ async function cmdBoxResize(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const text = r?.phase === 'stopped'
     ? `${box.name} is now ${box.size ?? raw} (${box.instanceType ?? 'type unknown'}) and stopped; \`termag box start ${box.name}\` starts it.`
     : `${box.name} is now ${box.size ?? raw} (${box.instanceType ?? 'type unknown'}) and running.`;
-  return emitBox(ctx, args, box, { resize: r }, text);
+  return emitBox(ctx, args, box, { resize: r, ...extra }, text);
 }
 
 async function cmdBoxKeep(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
@@ -521,7 +657,7 @@ interface LifecycleView {
 
 /**
  * What auto-park does on the box now, in one sentence. Its own hours stop it;
- * with none, box-idle-stop-enabled's window can still stop it.
+ * with none, the default window can still stop it.
  */
 export function autoParkLine(name: string, lc: LifecycleView): string {
   if (lc.idleLimitSource === 'default') return `${name} has no idle setting of its own, so it is stopped after ${lc.idleLimitHours} h idle.`;
@@ -579,7 +715,8 @@ async function cmdBoxRm(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const ref = arg(args, 0, 'the box', 'box rm');
   const api = await lifecycleApi(ctx, args);
   const box = await resolveBox(api, ref);
-  const projects = box.projects.map(p => p.name);
+  // Every project the remove archives, a space orchestrator's named as one.
+  const projects = box.projects.map(p => (p.label ? `${p.name} (${p.label})` : p.name));
   await confirmOrRefuse(ctx, args, projects.length
     ? `Terminate ${box.name} and archive its projects (${projects.join(', ')})?`
     : `Terminate ${box.name}?`);
@@ -603,21 +740,82 @@ export interface ProjectCreated {
   /** The repo a fresh project is cloned from; null for an empty or un-archived one, or an orchestrator that predates `from`. */
   repoUrl: string | null;
   restored: boolean;
+  /** What of an environment's definition the orchestrator left out, and why; never an error. */
+  warnings?: string[];
 }
 
-/** POST /projects, or with --if-not-exists the project of that name on the box when there is one. */
+/** What a project is made from: `from` (one source, or several for a multi-repo project) or an `environment`'s repositories. */
+/** An environment's checkout as GET /environments/:ref/resolved lists it: a repository at its branch (absent: the default). */
+export interface EnvironmentCheckout { repo: string; branch?: string }
+
+export interface ProjectInput {
+  name: string; agent: string; from?: string | string[]; environment?: string; forAsk?: boolean;
+  /** --model: the Claude tier the project's main workstream starts on (its pane and its chat); Claude Code's agents only. */
+  model?: string;
+  /**
+   * The environment's checkouts, which the create is held to: read by
+   * ensureProject (pinEnvironment) only when it makes the project, once, and
+   * kept here for a retry of the same create.
+   */
+  environmentRepos?: EnvironmentCheckout[];
+}
+
+/**
+ * An environment's checkouts now, said on stderr (with --json too, which
+ * leaves stderr to the caller): what any ask of a project made from it runs
+ * without asking, so they are said before it is made. Anyone can edit a shared
+ * environment, so the create also names them and the orchestrator refuses (409
+ * environment_repos_changed) when it resolves to anything else by then
+ * (backend services/environments.ts withEnvironmentRepos): a guard against an
+ * edit in between, not a sign anyone looked.
+ */
+export async function pinEnvironment(ctx: Ctx | null, api: Api, name: string): Promise<EnvironmentCheckout[]> {
+  const resolved = await api.request<{ repos: Array<{ repo: string; branch?: string | null }> }>('GET', `/environments/${encodeURIComponent(name)}/resolved`)
+    .catch((err: unknown) => {
+      if (err instanceof CliError && err.code === 'not_found') throw new CliError('not_found', `There is no environment named "${name}"`);
+      throw err;
+    });
+  const checkouts = resolved.repos.map(r => (r.branch ? { repo: r.repo, branch: r.branch } : { repo: r.repo }));
+  if (ctx && checkouts.length) ctx.err(`termag: ${name} runs ${checkouts.map(c => (c.branch ? `${c.repo} at ${c.branch}` : c.repo)).join(', ')}`);
+  return checkouts;
+}
+
+/**
+ * POST /projects, or with --if-not-exists the project of that name on the box
+ * when there is one. A project from an environment is pinned to its checkouts
+ * (pinEnvironment) here, after that lookup, since any ask of it runs them
+ * without asking: one already there is used as it is, without reading the
+ * environment. `say`: where the checkouts are said (stderr).
+ */
 export async function ensureProject(
-  api: Api, box: Box, input: { name: string; agent: string; from?: string | string[]; forAsk?: boolean }, ifNotExists: boolean,
+  api: Api, box: Box, input: ProjectInput, ifNotExists: boolean, say?: Ctx,
 ): Promise<ProjectCreated> {
   const existing = async () => projectIn(await listProjects(api), box, input.name);
   const found = ifNotExists ? await existing() : null;
   if (found) return { project: found, created: false, repoUrl: null, restored: false };
-  const body: Record<string, string | string[]> = { boxId: box.id, name: input.name, agent: input.agent };
+  if (input.environment && !input.environmentRepos) {
+    input.environmentRepos = await pinEnvironment(say ?? null, api, input.environment);
+  }
+  const body: Record<string, unknown> = { boxId: box.id, name: input.name, agent: input.agent };
   if (input.from?.length) body.from = input.from;
+  if (input.environment) body.environment = input.environment;
+  if (input.environment && input.environmentRepos) body.environmentRepos = input.environmentRepos;
   if (input.forAsk) body.createdFor = 'ask';
+  if (input.model) body.model = input.model;
   try {
-    const res = await api.request<{ project: Project; repoUrl?: string | null; restored?: boolean; repos?: Array<{ name: string; url: string }> }>('POST', '/projects', body);
-    return { project: res.project, created: true, repoUrl: res.repoUrl ?? null, restored: res.restored === true, ...(res.repos ? { repos: res.repos } : {}) };
+    const res = await api.request<{ project: Project; repoUrl?: string | null; restored?: boolean; repos?: Array<{ name: string; url: string }>; warnings?: string[]; model?: string | null; modelIgnored?: string }>('POST', '/projects', body);
+    // An orchestrator from before `model` makes the project all the same, on its default.
+    // A restore first: it keeps its own model whatever else the orchestrator says (an older one sends no `restored` model).
+    const unmodelled = !input.model || res.model === input.model ? []
+      : res.restored === true && res.model !== undefined ? [`${res.project.ref} was restored from the archive and keeps its model (${res.model ?? 'the default'}); --model ${input.model} applies only to a new project`]
+      : res.modelIgnored ? [`--model ${input.model} was ignored: ${res.modelIgnored}; ${res.project.ref} starts on its default model`]
+      : res.model === undefined ? [`the orchestrator ignored --model ${input.model} (it predates it); ${res.project.ref} starts on its default model`]
+      : [`${res.project.ref} was restored from the archive and keeps its model (${res.model ?? 'the default'}); --model ${input.model} applies only to a new project`];
+    const warnings = [...(res.warnings ?? []), ...unmodelled];
+    return {
+      project: res.project, created: true, repoUrl: res.repoUrl ?? null, restored: res.restored === true,
+      ...(res.repos ? { repos: res.repos } : {}), ...(warnings.length ? { warnings } : {}),
+    };
   } catch (err) {
     if (!(err instanceof CliError && err.code === 'conflict' && ifNotExists)) throw err;
     const raced = await existing();
@@ -626,8 +824,14 @@ export async function ensureProject(
   }
 }
 
-/** A `--from` the new project did not take: an un-archived project, or an orchestrator from before `from`. */
-function warnUnusedFrom(ctx: Ctx, from: string | string[] | undefined, result: ProjectCreated): void {
+/**
+ * The create's warnings (an environment's definition), and a `--from` the new
+ * project did not take: an un-archived project, or an orchestrator from before
+ * `from`. `printed`: warnings already said, as the new box's create (which
+ * resolves the same environment) says them first, so none is said twice.
+ */
+function warnUnusedFrom(ctx: Ctx, from: string | string[] | undefined, result: ProjectCreated, printed: readonly string[] = []): void {
+  for (const w of result.warnings ?? []) if (!printed.includes(w)) ctx.err(`termag: warning: ${w}`);
   if (!from?.length || !result.created || result.repoUrl) return;
   ctx.err(result.restored
     ? `termag: ${result.project.ref} was restored from the archive with its old directory; --from applies only to a new project.`
@@ -637,8 +841,31 @@ function warnUnusedFrom(ctx: Ctx, from: string | string[] | undefined, result: P
 function createdText(result: ProjectCreated, agent: string): string {
   const { project } = result;
   if (!result.created) return `${project.ref} already exists (${project.provider ?? '-'}).`;
-  const cloning = result.repoUrl ? `; its agent pane clones ${result.repoUrl} first` : '';
+  const cloning = result.repos && result.repos.length > 1 ? `; it clones ${result.repos.map(r => r.name).join(', ')} first`
+    : result.repoUrl ? `; its agent pane clones ${result.repoUrl} first` : '';
   return `Created ${project.ref} (${project.provider ?? agent})${cloning}.`;
+}
+
+/** Claude Code's agents, the ones --model applies to (backend services/modelChoices.ts isClaudeCode). */
+const CLAUDE_AGENTS = ['claude', 'claude-chat'];
+
+/** `--model`'s values: Claude's tiers, as the orchestrator takes them (backend services/claudeChatModel.ts CLAUDE_CHAT_TIERS). */
+export const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku'];
+
+/** --model, checked (`termag ask`, `project create`): a tier, or null without it. */
+export function claudeModelOption(args: ParsedArgs): string | null {
+  const raw = args.options.model;
+  if (raw === undefined) return null;
+  const model = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (!CLAUDE_MODELS.includes(model)) throw usage(`--model takes ${CLAUDE_MODELS.join(', ')}`);
+  return model;
+}
+
+/** `project create --model`: a Claude tier, for a Claude Code agent only; null without it. */
+export function projectModelOption(args: ParsedArgs, agent: string): string | null {
+  const model = claudeModelOption(args);
+  if (model && !CLAUDE_AGENTS.includes(agent)) throw usage(`--model picks a Claude model, and ${agent} is not Claude Code; leave it out, or use --agent claude`);
+  return model;
 }
 
 async function cmdProjectCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
@@ -648,28 +875,35 @@ async function cmdProjectCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (typeof agent !== 'string' || !agent) throw usage(`--agent is required. Usage: ${LIFECYCLE_COMMANDS['project create'].usage}`);
   const from = typeof args.options.from === 'string' ? args.options.from.trim() || undefined : undefined;
   if (args.options.from !== undefined && !from) throw usage('--from takes a template name or a GitHub repository URL');
+  const environment = environmentOption(args);
+  if (environment && from) throw usage('--environment names the repositories itself; leave out --from');
   const newBox = args.options['new-box'] === true;
   if (!newBox && args.options.timeout !== undefined) throw usage('--timeout goes with --new-box, which waits for the box');
   if (!newBox && args.options.size !== undefined) throw usage('--size goes with --new-box; an existing box keeps its size');
+  for (const o of ['setup', 'no-setup']) {
+    if (!newBox && args.options[o] !== undefined) throw usage(`--${o} goes with --new-box; an existing box keeps the termag setup it was launched with`);
+  }
   if (!newBox && args.options.disk !== undefined) throw usage('--disk goes with --new-box; an existing box keeps its disk');
   const size = sizeOption(args);
   const diskGiB = diskOption(args);
+  const setupEnabled = setupOption(args);
   if (newBox) checkName(ref.box, 'box');
   const timeoutS = timeoutSeconds(args, CREATE_WAIT_S);
   const ifNotExists = args.options['if-not-exists'] === true;
   const api = await lifecycleApi(ctx, args);
-  const input = { name: ref.project, agent, from, forAsk: args.options['for-ask'] === true };
+  const model = projectModelOption(args, agent);
+  const input: ProjectInput = { name: ref.project, agent, from, ...(environment ? { environment } : {}), forAsk: args.options['for-ask'] === true, ...(model ? { model } : {}) };
   if (input.forAsk) ctx.err(FOR_ASK_DEPRECATED);
 
   if (!newBox) {
     const box = await resolveBox(api, ref.box);
-    const result = await ensureProject(api, box, input, ifNotExists);
+    const result = await ensureProject(api, box, input, ifNotExists, ctx);
     warnUnusedFrom(ctx, from, result);
     return emitProject(ctx, args, result.project, { created: result.created, repoUrl: result.repoUrl }, createdText(result, agent));
   }
 
-  const made = await projectOnNewBox(ctx, api, ref, input, { size, diskGiB, ifNotExists, timeoutS, quiet: args.json });
-  const boxText = made.boxCreated ? `Created box ${made.box.name}. ` : '';
+  const made = await projectOnNewBox(ctx, api, ref, input, { size, diskGiB, setupEnabled, ifNotExists, timeoutS, quiet: args.json });
+  const boxText = made.boxCreated ? `Created box ${made.box.name}${made.box.setupEnabled === false ? ' (termag setup off)' : ''}. ` : '';
   if (args.json) {
     ctx.out(json({ box: made.box, boxCreated: made.boxCreated, claimed: made.claimed, project: made.result.project, created: made.result.created, repoUrl: made.result.repoUrl }));
   } else {
@@ -698,30 +932,32 @@ export interface NewBoxProject {
  */
 export async function projectOnNewBox(
   ctx: Ctx, api: Api, ref: { box: string; project: string },
-  input: { name: string; agent: string; from?: string | string[]; forAsk?: boolean },
-  opts: { size?: string; diskGiB?: number; ifNotExists: boolean; timeoutS: number; quiet: boolean; startParked?: boolean; retry?: string },
+  input: ProjectInput,
+  opts: { size?: string; diskGiB?: number; setupEnabled?: boolean; setupOverride?: string; ifNotExists: boolean; timeoutS: number; quiet: boolean; startParked?: boolean; retry?: string },
 ): Promise<NewBoxProject> {
-  const { agent, from } = input;
+  const { agent, from, environment } = input;
   const ifNotExists = opts.ifNotExists;
-  let made = await ensureBox(api, ref.box, ifNotExists, { size: opts.size, diskGiB: opts.diskGiB, from: from?.length ? from : undefined, forAsk: input.forAsk });
+  let made = await ensureBox(api, ref.box, ifNotExists, { size: opts.size, diskGiB: opts.diskGiB, from: from?.length ? from : undefined, environment, forAsk: input.forAsk, setupEnabled: opts.setupEnabled });
   warnSizing(ctx, made);
-  if (made.box.state === 'failed' && ifNotExists) made = await relaunchFailed(ctx, api, made, ref, input.name, opts.quiet);
+  stateSetup(ctx, made, opts.setupEnabled, opts.setupOverride);
+  if (made.box.state === 'failed' && ifNotExists) made = await relaunchFailed(ctx, api, made, ref, input.name, opts.quiet, opts.setupEnabled);
   if (!opts.quiet) {
     const sizeText = boxSpecText(made.box);
     const sized = sizeText ? ` (${sizeText})` : '';
+    const off = made.box.setupEnabled === false ? ' with termag setup off' : '';
     ctx.err(made.created
-      ? `Created box ${made.box.name}${sized}${made.claimed ? ' (a warm box, ready now)' : ''}; ${ref.box}/${ref.project} is set up on it once it is running.`
+      ? `Created box ${made.box.name}${sized}${off}${made.claimed ? (made.pool === 'environment' ? ` (from ${environment}'s pool: its setup already ran, starting now)` : ' (a warm box, ready now)') : ''}; ${ref.box}/${ref.project} is set up on it once it is running.`
       : `Using the existing box ${made.box.name} (${made.box.state}).`);
   }
   const refused = (err: CliError, boxName: string, state: string) => {
-    const retry = opts.retry ?? `termag project create ${boxName}/${ref.project} --agent ${agent}${from ? ` --from ${[from].flat().join(' --from ')}` : ''}`;
+    const retry = opts.retry ?? `termag project create ${boxName}/${ref.project} --agent ${agent}${from ? ` --from ${[from].flat().join(' --from ')}` : ''}${environment ? ` --environment ${environment}` : ''}`;
     return new CliError(err.code, `Box ${boxName} is ${state}, but the project was not created: ${err.message.replace(/\.$/, '')}. Retry with \`${retry}\``);
   };
   const done = (box: Box, result: ProjectCreated): NewBoxProject => ({ box, boxCreated: made.created, claimed: made.claimed, result });
   let result: ProjectCreated | null = null;
   if (made.box.state === 'provisioning') {
     try {
-      result = await ensureProject(api, made.box, input, ifNotExists);
+      result = await ensureProject(api, made.box, input, ifNotExists, ctx);
     } catch (err) {
       if (!(err instanceof CliError)) throw err;
       if (!/agent is not connected/i.test(err.message)) throw refused(err, made.box.name, 'still being created');
@@ -741,15 +977,16 @@ export async function projectOnNewBox(
       throw new CliError(err.code, `${err.message.replace(/\.$/, '')}. ${result.project.ref} waits on it: Retry on the project in the web UI launches a new box.`);
     }
   }
+  stateDisk(ctx, made, box, opts.diskGiB, true);
   if (!result) {
     try {
-      result = await ensureProject(api, box, input, ifNotExists);
+      result = await ensureProject(api, box, input, ifNotExists, ctx);
     } catch (err) {
       if (!(err instanceof CliError)) throw err;
       throw refused(err, box.name, 'running');
     }
   }
-  warnUnusedFrom(ctx, from, result);
+  warnUnusedFrom(ctx, from, result, made.warnings);
   return done(box, result);
 }
 
@@ -758,18 +995,21 @@ export async function projectOnNewBox(
  * orchestrator would not replace it on a create: the project's Retry
  * (POST /projects/:id/clone/retry) launches a new box of the same name and
  * size and moves the project onto it. Without that project the box is left
- * as it is, for waitForRunning to report.
+ * as it is, for waitForRunning to report. `setupEnabled`: the launch's own
+ * --setup / --no-setup (an ask's is always on), which the Retry takes over the
+ * failed box's; absent, the new box has the failed one's.
  */
 async function relaunchFailed(
   ctx: Ctx, api: Api, made: MadeBox, ref: { box: string; project: string }, project: string, quiet: boolean,
+  setupEnabled?: boolean,
 ): Promise<MadeBox> {
   const waiting = projectIn(await listProjects(api), made.box, project);
   if (!waiting) return made;
   if (!quiet) ctx.err(`Box ${made.box.name} failed to launch; relaunching it with ${ref.box}/${ref.project}.`);
-  const res = await api.request<{ project: Project }>('POST', `/projects/${encodeURIComponent(waiting.id)}/clone/retry`, {});
+  const res = await api.request<{ project: Project }>('POST', `/projects/${encodeURIComponent(waiting.id)}/clone/retry`, setupEnabled !== undefined ? { setupEnabled } : {});
   const fresh = (await listBoxes(api)).find(b => b.id === res.project.box.id);
   if (!fresh) throw new CliError('not_found', `Box ${made.box.name} was relaunched, but the new box is not listed yet; run the command again`);
-  return { box: fresh, created: true, claimed: false, warnings: [] };
+  return { box: fresh, created: true, claimed: false, warnings: [], repoSetup: null };
 }
 
 async function cmdProjectRename(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {

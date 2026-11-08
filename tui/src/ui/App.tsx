@@ -13,7 +13,7 @@ import {
 import { BELL, notificationSequence } from '../notify.js';
 import { lobbyPills, prCount, workstreamKey, type Pill, type PrsResponse } from '../prs.js';
 import { StatusSocket, applyStatusFrame, type SocketState } from '../statusSocket.js';
-import { bindReturnKey, currentSession, insideTmux, listLocalSessions, switchClient } from '../tmux.js';
+import { attachSessionArgv, bindReturnKey, currentSession, insideTmux, listLocalSessions, switchClient } from '../tmux.js';
 import type { AgentStatusValue, Project, Role, Whoami } from '../types.js';
 import { Header, Help, Hints, Message, Peek, ProjectList, Prompt } from './components.js';
 
@@ -287,7 +287,7 @@ export function App({ config }: { config: TuiConfig }) {
       return;
     }
     await suspendTerminal(() => new Promise<void>((resolve) => {
-      const child = spawn('tmux', ['attach-session', '-t', name], { stdio: 'inherit' });
+      const child = spawn('tmux', attachSessionArgv(name), { stdio: 'inherit' });
       child.on('close', () => resolve());
       child.on('error', () => resolve());
     }));

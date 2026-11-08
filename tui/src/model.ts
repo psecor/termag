@@ -54,8 +54,14 @@ export function hasAgentWorkflow(p: Project): boolean {
   return p.workflows.some(w => w.type === 'agent');
 }
 
+/**
+ * The workstreams with panes to show. An ask thread's chat (`ask-<thread id>`)
+ * runs in the chat runner with no tmux pane, so a row for it could only peek or
+ * attach to a session that never exists; the web UI's chat is where it is
+ * watched. Same rule as the backend's session inventory.
+ */
 export function liveWorkstreams(p: Project): Workstream[] {
-  return p.workstreams.filter(w => !w.archived);
+  return p.workstreams.filter(w => !w.archived && !w.askThread);
 }
 
 export function workstreamStatus(p: Project, ws: string, map: SessionMap): AgentStatusValue {

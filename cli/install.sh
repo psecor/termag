@@ -86,7 +86,7 @@ stamp_of() {
   "$node" -e '
     const fs = require("fs"), path = require("path"), crypto = require("crypto");
     const dir = process.argv[1], h = crypto.createHash("sha256");
-    const files = ["package.json", "package-lock.json", "tsconfig.json", "tsconfig.build.json", "build.mjs"];
+    const files = ["package.json", "package-lock.json", "tsconfig.json", "tsconfig.build.json", "build.mjs", "buildVersion.mjs"];
     const walk = (rel) => {
       for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : 1)) {
         const r = path.join(rel, e.name);
@@ -107,7 +107,10 @@ lock_of() {
   "$node" -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$1/package-lock.json"
 }
 
-want_stamp=$(stamp_of "$CLI_DIR")
+# The version is the build's too (buildVersion.mjs, from git): a commit that
+# touches cli/ without changing what the stamp hashes (a test) still changes it.
+want_version=$("$node" "$CLI_DIR/buildVersion.mjs" "$CLI_DIR") || die "buildVersion.mjs failed"
+want_stamp="$(stamp_of "$CLI_DIR") $want_version"
 have_stamp=$(cat "$CLI_DIR/dist/.install-stamp" 2>/dev/null || true)
 want_lock=$(lock_of "$CLI_DIR")
 have_lock=$(cat "$CLI_DIR/node_modules/.install-lock" 2>/dev/null || true)

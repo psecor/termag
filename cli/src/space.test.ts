@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -16,8 +16,6 @@ import { contentTypeFor, formatBytes, localTarget, parseRemote } from './space.j
 interface FakeSpaces {
   host: string;
   spaces: string[];
-  /** What the routes answer for the spaces-sharing-enabled flag. */
-  sharing: boolean;
   files: Map<string, Buffer>;
   uploads: Map<string, { path: string; size: number; parts: Map<number, Buffer> }>;
   /** Files at or below this size go up as one PUT. */
@@ -31,6 +29,8 @@ interface FakeSpaces {
   shared: Set<string>;
   /** Set, every share and unshare is a 403 with this message, as for a viewer. */
   shareRefusal: string | null;
+  /** Called as storage serves a download, before the CLI has the bytes. */
+  onS3Get: ((path: string) => void) | null;
   calls: string[];
   close: () => Promise<void>;
 }
@@ -50,7 +50,6 @@ async function startFake(): Promise<FakeSpaces> {
     host: '',
     close: async () => {},
     spaces: ['team'],
-    sharing: true,
     files: new Map(),
     uploads: new Map(),
     singleMax: 16,
@@ -59,6 +58,7 @@ async function startFake(): Promise<FakeSpaces> {
     extraPaths: [],
     shared: new Set(),
     shareRefusal: null,
+    onS3Get: null,
     calls: [] as string[],
   } satisfies FakeSpaces as FakeSpaces;
   const server: Server = createServer(async (req, res) => {
@@ -71,6 +71,7 @@ async function startFake(): Promise<FakeSpaces> {
     if (p === '/s3/get') {
       const file = fake.files.get(url.searchParams.get('path')!);
       if (!file) { res.writeHead(404).end('<Error><Code>NoSuchKey</Code></Error>'); return; }
+      fake.onS3Get?.(url.searchParams.get('path')!);
       res.writeHead(200).end(file);
       return;
     }
@@ -94,7 +95,7 @@ async function startFake(): Promise<FakeSpaces> {
     if (!rawSpace && req.method === 'POST') {
       const { name } = JSON.parse((await body(req)).toString('utf8'));
       fake.spaces.push(name);
-      sendJson(res, 201, { space: { id: name, name, description: null, role: 'owner', readOnly: false, usedBytes: 0, quotaBytes: 1024 }, sharing: fake.sharing });
+      sendJson(res, 201, { space: { id: name, name, description: null, role: 'owner', readOnly: false, usedBytes: 0, quotaBytes: 1024 } });
       return;
     }
     if (!rawSpace) {
@@ -106,11 +107,10 @@ async function startFake(): Promise<FakeSpaces> {
     const json = req.method === 'GET' || req.method === 'DELETE' ? {} : JSON.parse((await body(req)).toString('utf8') || '{}');
 
     if (rest === '/members' && req.method === 'GET') {
-      sendJson(res, 200, { sharing: fake.sharing, members: [{ userId: 'u1', email: 'me@example.com', displayName: 'Me', role: 'owner' }], invites: [] });
+      sendJson(res, 200, { members: [{ userId: 'u1', email: 'me@example.com', displayName: 'Me', role: 'owner' }], invites: [] });
       return;
     }
     if (rest === '/members' && req.method === 'POST') {
-      if (!fake.sharing) { sendJson(res, 403, { error: 'Sharing spaces with other people is not turned on for you yet', code: 'sharing_disabled' }); return; }
       sendJson(res, 201, { member: { userId: 'u2', email: json.email, displayName: 'Them', role: json.role } });
       return;
     }
@@ -260,6 +260,9 @@ describe('pure helpers', () => {
     expect(parseRemote('team:')).toEqual({ space: 'team', path: '' });
     expect(parseRemote('docs/a.md')).toEqual({ space: null, path: 'docs/a.md' });
     expect(parseRemote('Not A Space:x')).toEqual({ space: null, path: 'Not A Space:x' });
+    expect(parseRemote('space:default:handoffs/x.md')).toEqual({ space: 'default', path: 'handoffs/x.md' });
+    expect(parseRemote('space:default:')).toEqual({ space: 'default', path: '' });
+    expect(parseRemote('space:docs/a.md')).toEqual({ space: 'space', path: 'docs/a.md' });
   });
 
   it('refuses a local target outside the destination', () => {
@@ -325,6 +328,58 @@ describe('termag space', () => {
     expect(out.join('\n')).toContain(`3 files into ${join(realpathSync(work), 'www')}`);
   });
 
+  it('with no destination, never replaces a file already in the current directory', async () => {
+    fake.files.set('notes/README.md', Buffer.from('from the space'));
+    writeFileSync(join(work, 'README.md'), 'my work');
+    expect(await termag('space', 'get', 'team:notes/README.md')).toBe(1);
+    expect(err.join('\n')).toContain('does not replace files');
+    expect(readFileSync(join(work, 'README.md'), 'utf8')).toBe('my work');
+
+    // Naming the existing path replaces it, as asked.
+    expect(await termag('space', 'get', 'team:notes/README.md', 'README.md')).toBe(0);
+    expect(readFileSync(join(work, 'README.md'), 'utf8')).toBe('from the space');
+
+    fake.files.set('www/index.html', Buffer.from('<p>new</p>'));
+    mkdirSync(join(work, 'www'));
+    writeFileSync(join(work, 'www', 'index.html'), '<p>mine</p>');
+    err = [];
+    expect(await termag('space', 'get', '-r', 'team:www')).toBe(1);
+    expect(err.join('\n')).toContain('termag space get -r team:www <dest>');
+    expect(readFileSync(join(work, 'www', 'index.html'), 'utf8')).toBe('<p>mine</p>');
+  });
+
+  it('with no destination, keeps a file that appears while the download is in flight', async () => {
+    fake.files.set('notes/README.md', Buffer.from('from the space'));
+    fake.onS3Get = () => writeFileSync(join(work, 'README.md'), 'written meanwhile');
+    expect(await termag('space', 'get', 'team:notes/README.md')).toBe(1);
+    expect(err.join('\n')).toContain('does not replace files');
+    expect(readFileSync(join(work, 'README.md'), 'utf8')).toBe('written meanwhile');
+    expect(existsSync(join(work, 'README.md.termag-partial'))).toBe(false);
+
+    fake.files.set('www/a.txt', Buffer.from('a'));
+    fake.files.set('www/b.txt', Buffer.from('b'));
+    fake.onS3Get = path => { if (path === 'www/b.txt') writeFileSync(join(work, 'www', 'b.txt'), 'mine'); };
+    err = [];
+    expect(await termag('space', 'get', '-r', 'team:www')).toBe(1);
+    expect(err.join('\n')).toContain('does not replace files');
+    expect(readFileSync(join(work, 'www', 'b.txt'), 'utf8')).toBe('mine');
+  });
+
+  it('with no destination, treats a dangling symlink as an existing file', async () => {
+    fake.files.set('notes/README.md', Buffer.from('from the space'));
+    symlinkSync(join(work, 'nowhere'), join(work, 'README.md'));
+    expect(await termag('space', 'get', 'team:notes/README.md')).toBe(1);
+    expect(err.join('\n')).toContain('does not replace files');
+    expect(lstatSync(join(work, 'README.md')).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(work, 'nowhere'))).toBe(false);
+  });
+
+  it('with no destination, a missing remote file is not found even when the local name exists', async () => {
+    writeFileSync(join(work, 'README.md'), 'my work');
+    expect(await termag('space', 'get', 'team:notes/README.md')).toBe(3);
+    expect(readFileSync(join(work, 'README.md'), 'utf8')).toBe('my work');
+  });
+
   it('refuses a listing entry that would land outside the destination', async () => {
     fake.files.set('www/ok.txt', Buffer.from('ok'));
     fake.extraPaths = ['www/../../escape.txt'];
@@ -354,23 +409,6 @@ describe('termag space', () => {
     fake.spaces = ['team', 'other'];
     expect(await termag('space', 'get', 'a.txt')).toBe(2);
     expect(err.join('\n')).toContain('team, other');
-  });
-
-  it('leaves people out of create and members while sharing is off', async () => {
-    fake.sharing = false;
-    expect(await termag('space', 'create', 'solo')).toBe(0);
-    expect(out.join('\n')).not.toContain('Add people');
-    expect(out.join('\n')).toContain('termag space boxes solo add <box>');
-    out = [];
-    expect(await termag('space', 'members', 'team')).toBe(0);
-    expect(out.join('\n')).toContain('not turned on for you yet');
-    expect(await termag('space', 'members', 'team', 'add', 'them@example.com', 'viewer')).not.toBe(0);
-    expect(err.join('\n')).toContain('not turned on for you yet');
-
-    fake.sharing = true;
-    out = [];
-    expect(await termag('space', 'create', 'shared')).toBe(0);
-    expect(out.join('\n')).toContain('Add people with');
   });
 
   it('prints a file\'s browser link', async () => {

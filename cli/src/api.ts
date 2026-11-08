@@ -101,6 +101,11 @@ export class Api {
     if (!data && res.status === 401) {
       throw new CliError('auth_required', `${this.opts.host} refused the CLI's credential; run \`termag login\``, res.status);
     }
+    // A JSON-less 502/503/504 is the edge (nginx, the ALB) answering while the orchestrator restarts or
+    // deploys: a blip to retry, not a host without the CLI API.
+    if (!data && (res.status === 502 || res.status === 503 || res.status === 504)) {
+      throw new CliError('unreachable', `${this.opts.host} is not answering right now (HTTP ${res.status}); the orchestrator may be restarting`, res.status);
+    }
     if (!data) {
       throw new CliError('not_cli_enabled',
         `${this.opts.host} did not answer as a termag orchestrator with the CLI API (HTTP ${res.status}); it may predate the CLI`, res.status);
@@ -165,7 +170,10 @@ export interface Box {
   status: string;
   agentConnected: boolean;
   error: string | null;
-  projects: Array<{ id: string; name: string }>;
+  /** false: termag setup is off, so termag manages the box but sets nothing up on it. Absent from older orchestrators. */
+  setupEnabled?: boolean;
+  /** Every live project on the box; `label` names one termag manages ("space orchestrator for <space>"). */
+  projects: Array<{ id: string; name: string; label?: string }>;
   /**
    * small, medium or large; `<vcpu>vcpu-<memory>gib` for a box sized by its repo's .termag/environment.json
    * requirements; null for a box launched as the orchestrator's configured type. Absent from older orchestrators.

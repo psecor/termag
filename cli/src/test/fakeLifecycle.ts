@@ -17,7 +17,9 @@ export interface FakeBox {
   status: string;
   agentConnected: boolean;
   error: string | null;
-  projects: Array<{ id: string; name: string }>;
+  setupEnabled?: boolean;
+  /** `label` names a project termag manages ("space orchestrator for <space>"), as the orchestrator sends it. */
+  projects: Array<{ id: string; name: string; label?: string }>;
   size?: string | null;
   instanceType?: string | null;
   resize?: { to: string; from: string | null; phase: string; running: boolean; error: string | null } | null;
@@ -55,18 +57,34 @@ export interface FakeLifecycleState {
   cannotHibernate: Set<string>;
   /** Boxes auto-park can't run on (not an EC2 box termag runs): the orchestrator's warning. */
   cannotPark: Set<string>;
-  /** box-idle-stop-enabled's window for a box with no idle hours, or null when that flag is off. */
+  /** The default window for a box with no idle hours, or null for none. */
   idleStopHours: number | null;
   /** box-default-size: null is the flag off (no sizes, a size asked for refused), else the owner's default. */
   defaultSize: string | null;
   /** What a resize of a running box is refused for until `force` (backend boxResizePolicy blockers); empty is idle. */
   resizeBlockers: Array<{ check: string; reason: string; forceable: boolean }>;
+  /** Why a disk grow is refused now (backend boxDisk.ts: EBS's six hours, say); null lets it through. */
+  diskRefusal: { code: string; error: string } | null;
   /** Each `from`'s .termag/environment.json as the orchestrator read it: its preset, and the warnings for what it left out. */
-  repoFiles: Record<string, { size?: string; diskGiB?: number; warnings?: string[] }>;
+  repoFiles: Record<string, { size?: string; diskGiB?: number; setupEnabled?: boolean; warnings?: string[] }>;
+  /** Environments by name: their repositories' URLs, and the size their one file says. */
+  environments: Record<string, { repos: string[]; size?: string; warnings?: string[]; checkouts?: Array<{ repo: string; branch?: string }> }>;
   /** Fields a box made by POST /boxes gets as well (an EC2 instance to reach, say). */
   newBoxFields: Record<string, unknown>;
   /** Fields a project made by POST /projects gets as well (its directory, say). */
   newProjectFields: Record<string, unknown>;
+  /** An orchestrator from before a project create's `model`: it drops it, and the answer leaves it out. */
+  projectModelUnknown?: boolean;
+  /** An archived project the create un-archives with its own model (null: the default), which it keeps. */
+  projectModelKept?: string | null;
+  /** ask-model-choice-enabled off: the create ignores `model` and says why. */
+  projectModelIgnored?: string;
+  /** empty-box-enabled: off, setup off is refused (403) and no repo's setupEnabled is read. */
+  setupOff: boolean;
+  /** The box image's snapshot size (backend services/boxImageFloor.ts); null: no floor. The launch raises a smaller disk to it. */
+  imageFloorGiB: number | null;
+  /** Whether the create already knows the floor: raises the disk then, and says so in the 201's `disk`. */
+  imageFloorKnown: boolean;
 }
 
 const TEMPLATES: Record<string, string> = {
@@ -79,8 +97,8 @@ const pending = new WeakMap<FakeBox, number>();
 export function newLifecycleState(boxes: FakeBox[], projects: FakeProject[]): FakeLifecycleState {
   const state: FakeLifecycleState = {
     boxes: structuredClone(boxes), projects: structuredClone(projects),
-    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(), cannotPark: new Set(), idleStopHours: null, defaultSize: null, resizeBlockers: [], repoFiles: {},
-    newBoxFields: {}, newProjectFields: {},
+    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(), cannotPark: new Set(), idleStopHours: null, defaultSize: null, resizeBlockers: [], repoFiles: {}, diskRefusal: null, environments: {}, setupOff: true,
+    imageFloorGiB: null, imageFloorKnown: true, newBoxFields: {}, newProjectFields: {},
   };
   syncBoxProjects(state);
   return state;
@@ -111,6 +129,8 @@ export function advance(state: FakeLifecycleState): void {
       if (left > 0) continue;
       b.state = b.status = state.provisionOutcome === 'running' ? 'running' : 'failed';
       if (b.state === 'running') { b.status = 'ready'; b.agentConnected = true; } else b.error = 'RunInstances refused';
+      // The launch records what the box got: never under the image's snapshot (backend amiWithDisk).
+      if (state.imageFloorGiB != null && b.diskGiB != null && b.diskGiB < state.imageFloorGiB) b.diskGiB = state.imageFloorGiB;
     } else if (STEP[b.state]) {
       if (b.state === 'stopping' || b.state === 'hibernating') {
         const left = (pending.get(b) ?? state.parkPolls) - 1;
@@ -164,24 +184,41 @@ export function handleLifecycle(
       send(res, 400, { error: 'diskGiB must be a whole number of GB from 50 to 300', code: 'invalid_disk' }); return true;
     }
     const forAsk = body.createdFor === 'ask';
-    const files = [body.from ?? []].flat().map(f => state.repoFiles[String(f)]).filter(Boolean);
+    const env = typeof body.environment === 'string' ? state.environments[body.environment] : undefined;
+    if (body.environment !== undefined && !env) { send(res, 404, { error: `There is no environment named "${String(body.environment)}"`, code: 'environment_not_found' }); return true; }
+    // An environment's one file sizes the box, and its repositories' own files aren't read.
+    // The box create resolves the environment too, so it answers the same definition warnings (as the orchestrator does).
+    const files = env ? [{ size: env.size, warnings: env.warnings }] : [body.from ?? []].flat().map(f => state.repoFiles[String(f)]).filter(Boolean);
     const order = ['small', 'medium', 'large'];
     const fromFile = files.map(f => f.size).filter((x): x is string => !!x).sort((a, b) => order.indexOf(b) - order.indexOf(a))[0];
     const size = !state.defaultSize ? null
       : typeof body.size === 'string' ? body.size
       : fromFile ?? state.defaultSize;
     const fileDisks = files.map(f => f.diskGiB).filter((d): d is number => d != null);
-    const diskGiB = typeof body.diskGiB === 'number' ? body.diskGiB : fileDisks.length ? Math.max(...fileDisks) : 120;
+    const decidedDisk = typeof body.diskGiB === 'number' ? body.diskGiB : fileDisks.length ? Math.max(...fileDisks) : 120;
+    // The image's floor, when the create knows it (backend boxImageFloor.applyImageFloor).
+    const floor = state.imageFloorKnown ? state.imageFloorGiB : null;
+    const diskGiB = floor != null && floor > decidedDisk ? floor : decidedDisk;
+    const diskNote = typeof body.diskGiB === 'number' || diskGiB !== decidedDisk
+      ? { disk: { requestedGiB: decidedDisk, diskGiB, raised: diskGiB !== decidedDisk, floorKnown: state.imageFloorKnown } } : {};
+    // termag setup (backend services/boxSetup.ts decideBoxSetup): as asked, else the repos' setupEnabled when the
+    // CLI states it (useRepoSetup) and every repo turns it off; the 201 reports a repo's setting, applied or not.
+    if (body.setupEnabled !== undefined && typeof body.setupEnabled !== 'boolean') { send(res, 400, { error: 'setupEnabled must be true or false' }); return true; }
+    const settings = state.setupOff && body.useRepoSetup === true ? [body.from ?? []].flat().map(f => state.repoFiles[String(f)]?.setupEnabled) : [];
+    const repoOff = settings.length > 0 && settings.every(x => x === false);
+    const setupEnabled = typeof body.setupEnabled === 'boolean' ? body.setupEnabled : !repoOff;
+    if (!setupEnabled && !state.setupOff) { send(res, 403, { error: "Turning termag setup off isn't enabled for you (flag empty-box-enabled)", code: 'setup_off_not_enabled' }); return true; }
+    const repoSetup = repoOff ? { repoSetup: { setupEnabled: false, repos: [body.from ?? []].flat().map(String), applied: !setupEnabled && body.setupEnabled === undefined } } : {};
     const b: FakeBox = {
       id: `i-${name}`, name, addressable: true, kind: 'ec2',
       flavor: body.flavor === 'minimal' || body.minimal === true ? 'minimal' : 'full',
       state: 'provisioning', status: 'provisioning',
-      agentConnected: false, error: null, projects: [], size, instanceType: size ? types[size] : 't4g.medium', diskGiB,
+      agentConnected: false, error: null, setupEnabled, projects: [], size, instanceType: size ? types[size] : 't4g.medium', diskGiB,
       ...(forAsk ? { createdFor: 'ask' } : {}), ...state.newBoxFields,
     };
     state.boxes.push(b);
     const warnings = state.defaultSize && body.size === undefined ? files.flatMap(f => f.warnings ?? []) : [];
-    send(res, 201, { box: b, claimed: false, ...(warnings.length ? { warnings } : {}) });
+    send(res, 201, { box: b, claimed: false, ...(warnings.length ? { warnings } : {}), ...repoSetup, ...diskNote });
     return true;
   }
   if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/(start|stop)$/))) {
@@ -211,6 +248,19 @@ export function handleLifecycle(
     }
     b.resize = { to: body.size as string, from: b.size ?? null, phase: b.state === 'running' ? 'stopping' : 'resizing', running: true, error: null };
     send(res, 202, { box: b, resize: b.resize });
+    return true;
+  }
+  if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/disk$/))) {
+    state.calls.push({ route, body });
+    const b = box(decodeURIComponent(m[1]));
+    if (!b) { send(res, 404, { error: 'Box not found' }); return true; }
+    const fromGb = b.diskGiB ?? 120;
+    const toGb = body.sizeGb as number;
+    if (toGb < fromGb) { send(res, 400, { error: `EBS volumes can't shrink; the volume is ${fromGb} GB`, code: 'invalid_disk' }); return true; }
+    if (state.diskRefusal) { send(res, 409, state.diskRefusal); return true; }
+    if (toGb === fromGb) { send(res, 200, { box: b, grow: null, alreadyGb: fromGb, message: `The disk is already ${fromGb} GB` }); return true; }
+    b.diskGiB = toGb;
+    send(res, 202, { box: b, grow: { fromGb, toGb, state: 'modifying', running: true, detail: null } });
     return true;
   }
   if (method === 'POST' && (m = path.match(/^\/boxes\/([^/]+)\/keep-running$/))) {
@@ -278,6 +328,16 @@ export function handleLifecycle(
     const name = body.name as string;
     // `from`: one source, or a list of them for a multi-repo project, whose checkouts are named by repository.
     const urls: string[] = [];
+    const env = typeof body.environment === 'string' ? state.environments[body.environment] : undefined;
+    if (body.environment !== undefined && !env) { send(res, 404, { error: `There is no environment named "${String(body.environment)}"`, code: 'environment_not_found' }); return true; }
+    // Any ask of the project runs its checkouts without asking, so the create is held to what the caller read (services/environments.ts).
+    if (env) {
+      const now = (env.checkouts ?? env.repos.map((u): { repo: string; branch?: string } => ({ repo: u.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '') }))).map(c => `${c.repo}@${c.branch ?? ''}`).join(' ');
+      const shown = Array.isArray(body.environmentRepos) ? (body.environmentRepos as Array<{ repo: string; branch?: string }>).map(c => `${c.repo}@${c.branch ?? ''}`).join(' ') : null;
+      if (shown === null) { send(res, 400, { error: 'A project from an environment needs environmentRepos', code: 'invalid_request' }); return true; }
+      if (shown !== now) { send(res, 409, { error: `${String(body.environment)}'s repositories changed since you looked; read them again`, code: 'environment_repos_changed' }); return true; }
+    }
+    if (env) urls.push(...env.repos);
     for (const from of [body.from ?? []].flat() as string[]) {
       const url = TEMPLATES[from] ?? (/^(https:\/\/github\.com\/|git@github\.com:)/.test(from) ? from : null);
       if (!url) { send(res, 400, { error: 'from must be a template (webapp, research) or a GitHub repository URL', code: 'invalid_request' }); return true; }
@@ -292,7 +352,11 @@ export function handleLifecycle(
     };
     state.projects.push(p);
     syncBoxProjects(state);
-    send(res, 201, { project: p, restored: false, repoUrl, ...(repos ? { repos } : {}) });
+    const kept = state.projectModelKept !== undefined;
+    const model = typeof body.model !== 'string' || state.projectModelUnknown ? {}
+      : state.projectModelIgnored ? { model: kept ? state.projectModelKept : null, ...(kept ? {} : { modelIgnored: state.projectModelIgnored }) }
+      : { model: kept ? state.projectModelKept : body.model };
+    send(res, kept ? 200 : 201, { project: p, restored: kept, repoUrl, ...(repos ? { repos } : {}), ...(env?.warnings?.length ? { warnings: env.warnings } : {}), ...model });
     return true;
   }
   // Retry on a project whose box failed to launch: a new box of the same name and size, the project moved onto it
@@ -303,7 +367,9 @@ export function handleLifecycle(
     const old = p && box(p.box.id);
     if (!p || !old) { send(res, 404, { error: 'Not found' }); return true; }
     if (old.state !== 'failed') { send(res, 409, { error: 'Only a failed clone can be retried.', code: 'conflict' }); return true; }
-    const fresh: FakeBox = { ...old, id: `${old.id}-2`, state: 'provisioning', status: 'provisioning', agentConnected: false, error: null, projects: [] };
+    // termag setup: the failed box's, unless the Retry says (backend relaunchBoxFor's setupEnabled).
+    const setupEnabled = typeof body.setupEnabled === 'boolean' ? body.setupEnabled : old.setupEnabled;
+    const fresh: FakeBox = { ...old, id: `${old.id}-2`, state: 'provisioning', status: 'provisioning', agentConnected: false, error: null, projects: [], ...(setupEnabled !== undefined ? { setupEnabled } : {}) };
     state.boxes = [...state.boxes.filter(b => b !== old), fresh];
     p.box = { id: fresh.id, name: fresh.name };
     syncBoxProjects(state);

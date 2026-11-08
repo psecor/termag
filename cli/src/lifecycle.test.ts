@@ -58,12 +58,26 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+/** What GET /environments/<name>/resolved answers: the checkouts a create from it reads and pins. */
+function shownAs(name: string, repos: Array<{ repo: string; branch?: string }>): void {
+  orch.environments.envs.push({ id: `e-${name}`, name, kind: 'inline', definition: { repos }, updatedAt: '', createdBy: null, updatedBy: null, visibility: 'personal', owner: null });
+  orch.environments.resolved[name] = { repos, size: null, warnings: [] };
+}
+
 describe('termag box create', () => {
   it('creates the box and returns while it provisions', async () => {
     orch.lifecycle.provisionPolls = Infinity;
     expect(await run(['box', 'create', 'newbox'], ctx())).toBe(0);
     expect(stdout()).toContain('Creating box newbox (provisioning, 120 GB disk)');
     expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'newbox' } }]);
+  });
+
+  it('--no-setup asks for a box with termag setup off and says what that means', async () => {
+    orch.lifecycle.provisionPolls = Infinity;
+    expect(await run(['box', 'create', 'newbox', '--no-setup'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes', body: { name: 'newbox', setupEnabled: false } }]);
+    expect(stdout()).toContain('Creating box newbox (provisioning, 120 GB disk, termag setup off)');
+    expect(stdout()).toContain('termag delivers no skills, agent config or credentials there: set the box up yourself.');
   });
 
   it('--minimal asks for the lean image and says so', async () => {
@@ -291,6 +305,16 @@ describe('termag box rm', () => {
     expect(stdout()).toContain('Terminated devbox and archived 2 project(s).');
   });
 
+  // The confirmation names every project the remove archives: a space's
+  // orchestrator is hidden from project lists, never from this (projectKind.ts inProjectLists).
+  it("names a space orchestrator's project with its label before archiving it", async () => {
+    orch.lifecycle.boxes.push({ ...box('devbox')!, id: 'i8', name: 'runnerbox', projects: [{ id: 'p-space', name: 'space-design', label: 'space orchestrator for design' }] });
+    answer = false;
+    expect(await run(['box', 'rm', 'runnerbox'], ctx())).toBe(1);
+    expect(questions).toEqual(['Terminate runnerbox and archive its projects (space-design (space orchestrator for design))? [y/N] ']);
+    expect(mutations()).toEqual([]);
+  });
+
   it('--yes skips the question', async () => {
     expect(await run(['box', 'terminate', 'devbox', '--yes', '--json'], agentless())).toBe(0);
     expect(questions).toEqual([]);
@@ -330,6 +354,49 @@ describe('termag project create', () => {
     expect(await run(['project', 'create', 'devbox/flaky-test', '--agent', 'claude', '--if-not-exists', '--json'], ctx())).toBe(0);
     expect(lastJson()).toMatchObject({ project: { ref: 'devbox/flaky-test', provider: 'codex' }, created: false });
     expect(mutations()).toEqual(['POST /projects']);
+  });
+
+  it('--model sends the tier the main workstream starts on, for Claude Code only', async () => {
+    expect(await run(['project', 'create', 'devbox/fast', '--agent', 'claude', '--model', 'Opus'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /projects', body: { boxId: 'i1', name: 'fast', agent: 'claude', model: 'opus' } }]);
+    expect(stderr()).toBe('');
+    err = [];
+    expect(await run(['project', 'create', 'devbox/cx', '--agent', 'codex', '--model', 'opus'], ctx())).toBe(2);
+    expect(stderr()).toContain('--model picks a Claude model, and codex is not Claude Code');
+    expect(await run(['project', 'create', 'devbox/cx', '--agent', 'claude', '--model', 'gpt-5'], ctx())).toBe(2);
+    expect(stderr()).toContain('--model takes opus, sonnet, haiku');
+    expect(mutations()).toEqual(['POST /projects']);
+  });
+
+  it('--model on an orchestrator from before it makes the project anyway, and says the model was ignored', async () => {
+    orch.lifecycle.projectModelUnknown = true;
+    expect(await run(['project', 'create', 'devbox/old', '--agent', 'claude', '--model', 'haiku'], ctx())).toBe(0);
+    expect(stdout()).toBe('Created devbox/old (claude).');
+    expect(stderr()).toContain('termag: warning: the orchestrator ignored --model haiku (it predates it); devbox/old starts on its default model');
+  });
+
+  it('--model with the orchestrator\'s flag off: the project is made on its default, with the reason', async () => {
+    orch.lifecycle.projectModelIgnored = 'choosing the model is not on for you yet (flag ask-model-choice-enabled)';
+    expect(await run(['project', 'create', 'devbox/off', '--agent', 'claude', '--model', 'opus'], ctx())).toBe(0);
+    expect(stderr()).toContain('termag: warning: --model opus was ignored: choosing the model is not on for you yet (flag ask-model-choice-enabled); devbox/off starts on its default model');
+  });
+
+  it('--model on a restore with the flag off: it says the project keeps its own model, never that it starts on the default', async () => {
+    orch.lifecycle.projectModelIgnored = 'choosing the model is not on for you yet (flag ask-model-choice-enabled)';
+    orch.lifecycle.projectModelKept = 'haiku';
+    expect(await run(['project', 'create', 'devbox/back3', '--agent', 'claude', '--model', 'opus'], ctx())).toBe(0);
+    expect(stderr()).toContain('termag: warning: devbox/back3 was restored from the archive and keeps its model (haiku); --model opus applies only to a new project');
+    expect(stderr()).not.toContain('starts on its default');
+  });
+
+  it('--model on a project the create un-archives: it keeps its own model, and the CLI says so', async () => {
+    orch.lifecycle.projectModelKept = 'haiku';
+    expect(await run(['project', 'create', 'devbox/back', '--agent', 'claude', '--model', 'opus'], ctx())).toBe(0);
+    expect(stderr()).toContain('termag: warning: devbox/back was restored from the archive and keeps its model (haiku); --model opus applies only to a new project');
+    err = [];
+    orch.lifecycle.projectModelKept = null;
+    expect(await run(['project', 'create', 'devbox/back2', '--agent', 'claude', '--model', 'opus'], ctx())).toBe(0);
+    expect(stderr()).toContain('keeps its model (the default)');
   });
 
   it('works with the box credentials, with no login', async () => {
@@ -411,7 +478,7 @@ describe('box sizes (--size)', () => {
     orch.lifecycle.defaultSize = 'small';
     orch.lifecycle.repoFiles = { [WEBAPP]: { size: 'medium' } };
     expect(await run(['project', 'create', 'gbox/app', '--new-box', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
-    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', from: WEBAPP } });
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', from: WEBAPP, useRepoSetup: true } });
     expect(stderr()).toContain('Created box gbox (medium, 120 GB disk); gbox/app is set up on it once it is running.');
     expect(box('gbox')).toMatchObject({ size: 'medium', instanceType: 'm8g.xlarge' });
   });
@@ -441,14 +508,148 @@ describe('box sizes (--size)', () => {
     orch.lifecycle.defaultSize = 'small';
     orch.lifecycle.repoFiles = { [WEBAPP]: { size: 'medium' } };
     expect(await run(['project', 'create', 'gbox/app', '--new-box', '--size', 'large', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
-    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', from: WEBAPP } });
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', from: WEBAPP, useRepoSetup: true } });
     expect(box('gbox')).toMatchObject({ size: 'large' });
+  });
+
+  it('pins a plain project create --environment too: it prints the checkouts and the create is held to them', async () => {
+    orch.lifecycle.environments = { shop: { repos: ['https://github.com/acme/web'], checkouts: [{ repo: 'acme/web', branch: 'next' }] } };
+    shownAs('shop', [{ repo: 'acme/web', branch: 'next' }]);
+    expect(await run(['project', 'create', 'devbox/shop', '--agent', 'claude', '--environment', 'shop'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.filter(c => c.route === 'POST /projects')).toEqual([
+      { route: 'POST /projects', body: { boxId: 'i1', name: 'shop', agent: 'claude', environment: 'shop', environmentRepos: [{ repo: 'acme/web', branch: 'next' }] } },
+    ]);
+    expect(stderr()).toContain('termag: shop runs acme/web at next');
+  });
+
+  it('makes nothing when the environment changed between reading it and the create', async () => {
+    orch.lifecycle.environments = { shop: { repos: ['https://github.com/acme/web'], checkouts: [{ repo: 'evil/web' }] } };
+    shownAs('shop', [{ repo: 'acme/web' }]);
+    expect(await run(['project', 'create', 'devbox/shop', '--agent', 'claude', '--environment', 'shop'], ctx())).not.toBe(0);
+    expect(stderr()).toContain('changed since');
+    expect(orch.lifecycle.projects.some(p => p.name === 'shop')).toBe(false);
+  });
+
+  it("project create --new-box --environment makes the environment's project on a box its file sizes, --size still winning", async () => {
+    orch.lifecycle.defaultSize = 'small';
+    orch.lifecycle.repoFiles = { [WEBAPP]: { size: 'medium' } };
+    orch.lifecycle.environments = { 'full-stack': { repos: [WEBAPP, 'https://github.com/acme/web'], size: 'large' } };
+    const pin = [{ repo: 'example-org/webapp' }, { repo: 'acme/web' }];
+    shownAs('full-stack', pin);
+    expect(await run(['project', 'create', 'fbox/app', '--new-box', '--agent', 'claude', '--environment', 'full-stack'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.filter(c => c.route.startsWith('POST'))).toEqual([
+      { route: 'POST /boxes', body: { name: 'fbox', environment: 'full-stack' } },
+      { route: 'POST /projects', body: { boxId: 'i-fbox', name: 'app', agent: 'claude', environment: 'full-stack', environmentRepos: pin } },
+    ]);
+    expect(box('fbox')).toMatchObject({ size: 'large' });
+    expect(stdout()).toContain('it clones webapp, web first');
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--size', 'small', '--agent', 'claude', '--environment', 'full-stack'], ctx())).toBe(0);
+    expect(box('gbox')).toMatchObject({ size: 'small' });
+  });
+
+  it('pins the checkouts with the deprecated --for-ask too, which makes the project for an ask (Bugbot, #985)', async () => {
+    orch.lifecycle.environments = { shop: { repos: ['https://github.com/acme/web'], checkouts: [{ repo: 'acme/web', branch: 'next' }] } };
+    orch.environments.envs.push({ id: 'e-shop', name: 'shop', kind: 'inline', definition: {}, updatedAt: '', createdBy: null, updatedBy: null, visibility: 'personal', owner: null });
+    orch.environments.resolved.shop = { repos: [{ repo: 'acme/web', branch: 'next' }], size: null, warnings: [] };
+    expect(await run(['project', 'create', 'devbox/shop', '--agent', 'claude', '--environment', 'shop', '--for-ask'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.filter(c => c.route === 'POST /projects')).toEqual([
+      { route: 'POST /projects', body: { boxId: 'i1', name: 'shop', agent: 'claude', environment: 'shop', environmentRepos: [{ repo: 'acme/web', branch: 'next' }], createdFor: 'ask' } },
+    ]);
+    expect(stderr()).toContain('termag: shop runs acme/web at next');
+  });
+
+  it("prints what of an environment's definition the orchestrator left out, as warnings, and still makes the project (Bugbot, #985)", async () => {
+    orch.lifecycle.environments = { shop: { repos: [WEBAPP], warnings: ["shop's file, acme/web:env:x.json, is not there, so it was left out"] } };
+    shownAs('shop', [{ repo: 'example-org/webapp' }]);
+    expect(await run(['project', 'create', 'devbox/shop', '--agent', 'claude', '--environment', 'shop'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: warning: shop's file, acme/web:env:x.json, is not there");
+  });
+
+  it("prints an environment's warnings once with --new-box, though the box and the project create both answer them (Bugbot, #985)", async () => {
+    orch.lifecycle.defaultSize = 'small';
+    const WARNING = "shop's file, acme/web:env:x.json, is not there, so it was left out";
+    orch.lifecycle.environments = { shop: { repos: [WEBAPP], warnings: [WARNING] } };
+    shownAs('shop', [{ repo: 'example-org/webapp' }]);
+    expect(await run(['project', 'create', 'sbox/shop', '--new-box', '--agent', 'claude', '--environment', 'shop'], ctx())).toBe(0);
+    expect(stderr().split(`termag: warning: ${WARNING}`)).toHaveLength(2);
+  });
+
+  it('project create --environment on an existing box, and its refusals', async () => {
+    orch.lifecycle.environments = { solo: { repos: [WEBAPP] } };
+    shownAs('solo', [{ repo: 'example-org/webapp' }]);
+    expect(await run(['project', 'create', 'devbox/solo', '--agent', 'claude', '--environment', 'solo'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.at(-1)).toEqual({ route: 'POST /projects', body: { boxId: expect.any(String), name: 'solo', agent: 'claude', environment: 'solo', environmentRepos: [{ repo: 'example-org/webapp' }] } });
+    expect(await run(['project', 'create', 'devbox/x', '--agent', 'claude', '--environment', 'nope'], ctx())).not.toBe(0);
+    expect(stderr()).toContain('There is no environment named "nope"');
+    expect(await run(['project', 'create', 'devbox/y', '--agent', 'claude', '--environment', 'solo', '--from', WEBAPP], ctx())).toBe(2);
+    expect(stderr()).toContain('leave out --from');
   });
 
   it('--size without --new-box is a usage error: an existing box keeps its size', async () => {
     expect(await run(['project', 'create', 'devbox/app', '--size', 'small', '--agent', 'claude'], ctx())).toBe(2);
     expect(stderr()).toContain('--size goes with --new-box');
     expect(mutations()).toEqual([]);
+  });
+});
+
+describe('termag setup: --setup, --no-setup and a repository\'s setupEnabled', () => {
+  const BARE = 'https://github.com/acme/bare';
+
+  it('box create --setup and --no-setup contradict each other', async () => {
+    expect(await run(['box', 'create', 'x', '--setup', '--no-setup'], ctx())).toBe(2);
+    expect(stderr()).toContain('--setup and --no-setup contradict each other');
+    expect(mutations()).toEqual([]);
+  });
+
+  it('box create --from a repository whose environment.json says "setupEnabled": false turns setup off and says so, with how to turn it on', async () => {
+    orch.lifecycle.repoFiles = { [BARE]: { setupEnabled: false } };
+    expect(await run(['box', 'create', 'bare1', '--from', BARE], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'bare1', from: BARE, useRepoSetup: true } });
+    expect(box('bare1')).toMatchObject({ setupEnabled: false });
+    expect(stderr()).toContain(`termag: bare1 has termag setup off: ${BARE}'s .termag/environment.json says "setupEnabled": false; \`--setup\` turns it on`);
+    expect(stdout()).toContain('Creating box bare1 (provisioning, 120 GB disk, termag setup off)');
+  });
+
+  it('--setup wins over the repository\'s setting, and says it did', async () => {
+    orch.lifecycle.repoFiles = { [BARE]: { setupEnabled: false } };
+    expect(await run(['box', 'create', 'bare1', '--from', BARE, '--setup'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0].body).toEqual({ name: 'bare1', from: BARE, setupEnabled: true, useRepoSetup: true });
+    expect(box('bare1')).toMatchObject({ setupEnabled: true });
+    expect(stderr()).toContain(`termag: bare1 has termag setup on (--setup), though ${BARE}'s .termag/environment.json says "setupEnabled": false`);
+  });
+
+  it('project create --new-box takes the repository\'s setting the same way, and --no-setup without a repo', async () => {
+    orch.lifecycle.repoFiles = { [BARE]: { setupEnabled: false } };
+    expect(await run(['project', 'create', 'bare1/app', '--new-box', '--agent', 'claude', '--from', BARE], ctx())).toBe(0);
+    expect(box('bare1')).toMatchObject({ setupEnabled: false });
+    expect(stderr()).toContain('termag: bare1 has termag setup off');
+    expect(stdout()).toContain('Created box bare1 (termag setup off).');
+    expect(await run(['project', 'create', 'bare2/app', '--new-box', '--agent', 'claude', '--no-setup'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.find(c => c.body.name === 'bare2')?.body).toEqual({ name: 'bare2', setupEnabled: false });
+    expect(box('bare2')).toMatchObject({ setupEnabled: false });
+  });
+
+  it('--setup and --no-setup need --new-box on project create: an existing box keeps what it was launched with', async () => {
+    expect(await run(['project', 'create', 'devbox/app', '--no-setup', '--agent', 'claude'], ctx())).toBe(2);
+    expect(stderr()).toContain('--no-setup goes with --new-box');
+  });
+
+  it('says nothing of the repository\'s setting while setup off isn\'t enabled for you: setup is on, as before', async () => {
+    orch.lifecycle.setupOff = false;
+    orch.lifecycle.repoFiles = { [BARE]: { setupEnabled: false } };
+    expect(await run(['box', 'create', 'bare1', '--from', BARE], ctx())).toBe(0);
+    expect(box('bare1')).toMatchObject({ setupEnabled: true });
+    expect(stderr()).not.toContain('setupEnabled');
+    expect(await run(['box', 'create', 'bare2', '--no-setup'], ctx())).toBe(1);
+    expect(stderr()).toContain("Turning termag setup off isn't enabled for you");
+  });
+
+  it('takes no --full, and --minimal is the lean image (#1086), not setup off', async () => {
+    expect(await run(['box', 'create', 'y', '--full'], ctx())).toBe(2);
+    expect(mutations()).toEqual([]);
+    expect(await run(['box', 'create', 'lean', '--minimal', '--no-setup'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls[0].body).toEqual({ name: 'lean', flavor: 'minimal', setupEnabled: false });
+    expect(box('lean')).toMatchObject({ flavor: 'minimal', setupEnabled: false });
   });
 });
 
@@ -470,6 +671,39 @@ describe('box disks (--disk)', () => {
     expect(stdout()).toBe('Created box plain (120 GB disk); it is running.');
   });
 
+  it('box create --disk under the image\'s floor says it was raised, and reports the disk it got', async () => {
+    orch.lifecycle.imageFloorGiB = 120;
+    expect(await run(['box', 'create', 'tiny', '--disk', '50', '--wait'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: --disk 50 is below the image's 120 GB minimum; using 120 GB");
+    expect(stdout()).toBe('Created box tiny (120 GB disk); it is running.');
+    expect(box('tiny')).toMatchObject({ diskGiB: 120 });
+  });
+
+  it('box create --disk with the floor not yet known: without --wait it may be raised; with it, says what the launch raised it to', async () => {
+    orch.lifecycle.imageFloorGiB = 120;
+    orch.lifecycle.imageFloorKnown = false;
+    orch.lifecycle.provisionPolls = Infinity;
+    expect(await run(['box', 'create', 'tiny', '--disk', '50'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: --disk 50 may be raised to the image's minimum when the box launches; `termag box list` shows the disk it got");
+    expect(stdout()).toContain('Creating box tiny (provisioning, 50 GB disk)');
+    orch.lifecycle.provisionPolls = 1;
+    expect(await run(['box', 'create', 'tiny2', '--disk', '50', '--wait'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: --disk 50 is below the image's 120 GB minimum; using 120 GB");
+    expect(stdout()).toContain('Created box tiny2 (120 GB disk); it is running.');
+  });
+
+  it('box create --disk at or above the floor says nothing about it', async () => {
+    orch.lifecycle.imageFloorGiB = 120;
+    expect(await run(['box', 'create', 'roomy', '--disk', '200', '--wait'], ctx())).toBe(0);
+    expect(stderr()).not.toContain('minimum');
+  });
+
+  it('project create --new-box --disk under the floor says it was raised', async () => {
+    orch.lifecycle.imageFloorGiB = 120;
+    expect(await run(['project', 'create', 'gbox/app', '--new-box', '--disk', '60', '--agent', 'claude'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: --disk 60 is below the image's 120 GB minimum; using 120 GB");
+  });
+
   it.each([['49'], ['301'], ['120.5'], ['200GB'], ['big'], ['']])('refuses --disk %j before asking the orchestrator', async value => {
     expect(await run(['box', 'create', 'x', '--disk', value], ctx())).toBe(2);
     expect(stderr()).toContain('--disk takes a whole number of GB from 50 to 300');
@@ -479,7 +713,7 @@ describe('box disks (--disk)', () => {
   it('project create --new-box --disk sends it with --size and --from', async () => {
     orch.lifecycle.defaultSize = 'small';
     expect(await run(['project', 'create', 'gbox/app', '--new-box', '--size', 'large', '--disk', '300', '--agent', 'claude', '--from', WEBAPP], ctx())).toBe(0);
-    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', diskGiB: 300, from: WEBAPP } });
+    expect(orch.lifecycle.calls[0]).toEqual({ route: 'POST /boxes', body: { name: 'gbox', size: 'large', diskGiB: 300, from: WEBAPP, useRepoSetup: true } });
     expect(stderr()).toContain('Created box gbox (large, 300 GB disk); gbox/app is set up on it once it is running.');
   });
 
@@ -501,8 +735,8 @@ describe('termag project create --new-box', () => {
     orch.lifecycle.provisionPolls = 3;
     expect(await run(['project', 'create', 'newbox/app', '--new-box', '--agent', 'claude', '--from', 'research'], ctx())).toBe(0);
     expect(orch.lifecycle.calls).toEqual([
-      // `from` rides along so the orchestrator can give the box the repository's default size.
-      { route: 'POST /boxes', body: { name: 'newbox', from: 'research' } },
+      // `from` rides along so the orchestrator can give the box the repository's default size and base.
+      { route: 'POST /boxes', body: { name: 'newbox', from: 'research', useRepoSetup: true } },
       { route: 'POST /projects', body: { boxId: 'i-newbox', name: 'app', agent: 'claude', from: 'research' } },
     ]);
     expect(stderr()).toContain('Created box newbox (120 GB disk); newbox/app is set up on it once it is running.');
@@ -683,7 +917,7 @@ describe('termag box set --auto-park', () => {
     expect(stdout()).toBe('devbox is stopped after 4 h idle.');
   });
 
-  it("off clears the setting, and says when box-idle-stop-enabled's window stops the box instead", async () => {
+  it("off clears the setting, and says when the default window stops the box instead", async () => {
     expect(await run(['box', 'set', 'devbox', '--auto-park', 'off'], ctx())).toBe(0);
     expect(stdout()).toBe('Auto-park is off for devbox.');
     orch.lifecycle.idleStopHours = 2;
@@ -822,6 +1056,41 @@ describe('termag box resize', () => {
     expect(questions.at(-1)).toBe('Resize devbox anyway? [y/N] ');
     expect(mutations()).toEqual(['POST /boxes/i1/resize', 'POST /boxes/i1/resize']);
     expect(stdout()).toMatch(/^Resizing devbox to small/);
+  });
+
+  it('--disk alone grows the disk, with the box up and no resize', async () => {
+    orch.lifecycle.boxes[0].diskGiB = 120;
+    expect(await run(['box', 'resize', 'devbox', '--disk', '200'], ctx())).toBe(0);
+    expect(questions).toEqual(["Grow devbox's disk from 120 GB to 200 GB? It stays up; a disk never shrinks, and EBS allows one change to it every six hours. [y/N] "]);
+    expect(orch.lifecycle.calls).toEqual([{ route: 'POST /boxes/i1/disk', body: { sizeGb: 200 } }]);
+    expect(stdout()).toBe("Growing devbox's disk from 120 GB to 200 GB; it stays up, and `termag box list` shows the new size once it has grown.");
+  });
+
+  it('--disk at the size the disk already has says so, and changes nothing', async () => {
+    orch.lifecycle.boxes[0].diskGiB = 120;
+    expect(await run(['box', 'resize', 'devbox', '--disk', '120', '--yes'], ctx())).toBe(0);
+    expect(stdout()).toBe("devbox's disk is already 120 GB; nothing to grow.");
+  });
+
+  it('a size and --disk: the disk first, then the resize, which waits for it', async () => {
+    orch.lifecycle.boxes[0].diskGiB = 120;
+    expect(await run(['box', 'resize', 'devbox', 'large', '--disk', '200', '--yes'], ctx())).toBe(0);
+    expect(mutations()).toEqual(['POST /boxes/i1/disk', 'POST /boxes/i1/resize']);
+    expect(stdout()).toMatch(/^Growing devbox's disk from 120 GB to 200 GB, then resizing it to large/);
+  });
+
+  it('says EBS\'s six-hour refusal plainly, and resizes nothing', async () => {
+    orch.lifecycle.diskRefusal = { code: 'disk_cooldown', error: 'EBS allows one change to a disk every six hours. This one was last changed at 2026-11-03 10:00 UTC, so it can grow again after 2026-11-03 16:00 UTC.' };
+    expect(await run(['box', 'resize', 'devbox', 'large', '--disk', '200', '--yes'], ctx())).toBe(1);
+    expect(stderr()).toMatch(/one change to a disk every six hours.*can grow again after 2026-11-03 16:00 UTC/);
+    expect(mutations()).toEqual(['POST /boxes/i1/disk']);
+  });
+
+  it('needs a size, --disk or both, and --disk a whole number of GB', async () => {
+    expect(await run(['box', 'resize', 'devbox', '--yes'], ctx())).toBe(2);
+    expect(await run(['box', 'resize', 'devbox', '--disk', '20x', '--yes'], ctx())).toBe(2);
+    expect(await run(['box', 'resize', 'devbox', '--disk', '400', '--yes'], ctx())).toBe(2);
+    expect(orch.lifecycle.calls).toEqual([]);
   });
 
   it('a box already that size is a no-op', async () => {

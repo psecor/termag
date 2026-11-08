@@ -306,7 +306,6 @@ describe('automations in a space', () => {
         'termag: You can\'t write to space "team-notes": an automation needs editor or owner there. An owner can make you an editor with `termag space members team-notes add <your email> editor`.'],
       ['space_read_only', 400, 'That space is read-only', 1, 'termag: Space "team-notes" is read-only, so an automation can\'t keep its files there. Pick another space.'],
       ['space_not_found', 400, 'No such space that you are a member of', 3, 'termag: No space "team-notes" that you are a member of. `termag space ls` lists yours.'],
-      ['spaces_off', 400, 'Spaces are not enabled for you', 1, 'termag: Spaces are not enabled for you, so an automation can\'t live in one. Leave out --space.'],
     ];
     for (const [code, status, error, exit, said] of cases) {
       orch.automations.refuse = { status, error, code };

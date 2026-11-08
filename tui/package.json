@@ -15,7 +15,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node writeVersion.mjs",
     "dev": "tsx src/index.tsx",
     "start": "node bin/termag-tui.js",
     "test": "vitest run",

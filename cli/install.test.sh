@@ -44,14 +44,14 @@ got=$?
 [ -x "$LOCAL_BIN/termag" ] || fail 'writes ~/.local/bin/termag when it is on PATH' 'executable' 'absent'
 [ -f "$CHECKOUT/cli/dist/main.js" ] || fail 'builds dist/' 'dist/main.js' 'absent'
 case "$out" in
-  *'termag 0.1.0 from'*) : ;;
-  *) fail 'reports the installed version' 'termag 0.1.0 from ...' "$out" ;;
+  *'termag 0.1.0+unknown from'*) : ;;
+  *) fail 'reports the installed version' 'termag 0.1.0+unknown from ...' "$out" ;;
 esac
 case "$out" in
   *'not on PATH'*) fail 'no PATH hint when the directory is on PATH' '(no hint)' "$out" ;;
 esac
 got="$(termag --version 2>&1)"
-[ "$got" = 'termag 0.1.0' ] || fail 'the launcher runs the CLI' 'termag 0.1.0' "$got"
+[ "$got" = 'termag 0.1.0+unknown' ] || fail 'the launcher runs the CLI' 'termag 0.1.0+unknown' "$got"
 
 # ── a reader that goes away (`| head -1`) is not a crash ────────────────────
 # stdout is a FIFO whose only reader closed before the CLI started, so its
@@ -69,7 +69,7 @@ exec 5>&-
 # ── it pins the Node it was built with ──────────────────────────────────────
 P="$LOCAL_BIN:$SYS_PATH"
 got="$(termag --version 2>&1)"
-[ "$got" = 'termag 0.1.0' ] || fail 'runs with no node on PATH' 'termag 0.1.0' "$got"
+[ "$got" = 'termag 0.1.0+unknown' ] || fail 'runs with no node on PATH' 'termag 0.1.0+unknown' "$got"
 
 # ── the build is one bundle, with `ws` only behind import() ─────────────────
 [ -e "$CHECKOUT/cli/dist/commands.js" ] && fail 'bundles src/ into dist/main.js' 'no dist/commands.js' 'present'
@@ -79,7 +79,7 @@ for f in "$CHECKOUT/cli/dist"/forwarder-*.js; do [ -f "$f" ] && found=1; done
 grep -q 'from "ws"' "$CHECKOUT/cli/dist/main.js" && fail 'main.js does not load ws' 'no import of ws' 'imports ws'
 mv "$CHECKOUT/cli/node_modules/ws" "$WORK/ws"
 got="$(termag --version 2>&1)"
-[ "$got" = 'termag 0.1.0' ] || fail 'runs without ws in node_modules' 'termag 0.1.0' "$got"
+[ "$got" = 'termag 0.1.0+unknown' ] || fail 'runs without ws in node_modules' 'termag 0.1.0+unknown' "$got"
 mv "$WORK/ws" "$CHECKOUT/cli/node_modules/ws"
 
 # ── a re-run with nothing changed does nothing ──────────────────────────────
@@ -106,7 +106,7 @@ case "$out" in
   *STALE*dist*) : ;;
   *) fail '--check names the stale build' 'STALE ... dist' "$out" ;;
 esac
-[ "$(termag --version)" = 'termag 0.1.0' ] || fail '--check changes nothing' 'termag 0.1.0' "$(termag --version)"
+[ "$(termag --version)" = 'termag 0.1.0+unknown' ] || fail '--check changes nothing' 'termag 0.1.0+unknown' "$(termag --version)"
 install_cli --quiet >/dev/null 2>&1
 got="$(termag --version 2>&1)"
 [ "$got" = 'termag 0.1.1' ] || fail 'a re-run picks up changed sources' 'termag 0.1.1' "$got"
@@ -219,9 +219,26 @@ esac
 # The checkout becomes a clone of a bare remote; a second clone pushes to it.
 g() { git -c user.name=test -c user.email=test@example.com -c init.defaultBranch=main "$@"; }
 printf 'node_modules/\ndist/\n.dist-build/\n' > "$CHECKOUT/.gitignore"
+cp "$SRC/src/version.ts" "$CHECKOUT/cli/src/version.ts"
 g -C "$CHECKOUT" init -q
 g -C "$CHECKOUT" add -A
 g -C "$CHECKOUT" commit -qm base
+
+# ── a build in a git checkout takes its version from git (buildVersion.mjs) ──
+# One commit has touched cli/, so the version is 0.1.1+<its sha>.
+sha="$(g -C "$CHECKOUT" log -1 --format=%h --abbrev=8)"
+install_cli --quiet >/dev/null 2>&1
+got="$(termag --version 2>&1)"
+[ "$got" = "termag 0.1.1+$sha" ] || fail 'a git checkout builds its version from git' "termag 0.1.1+$sha" "$got"
+printf '\n' >> "$CHECKOUT/cli/src/errors.ts"
+install_cli --quiet >/dev/null 2>&1
+got="$(termag --version 2>&1)"
+[ "$got" = "termag 0.1.1+$sha.dirty" ] || fail 'uncommitted changes in cli/ mark it dirty' "termag 0.1.1+$sha.dirty" "$got"
+g -C "$CHECKOUT" checkout -q -- cli/src/errors.ts
+install_cli --quiet >/dev/null 2>&1
+got="$(termag --version 2>&1)"
+[ "$got" = "termag 0.1.1+$sha" ] || fail 'reverting the change rebuilds it clean' "termag 0.1.1+$sha" "$got"
+
 g init -q --bare "$WORK/remote.git"
 g -C "$CHECKOUT" remote add origin "$WORK/remote.git"
 g -C "$CHECKOUT" push -q -u origin main
@@ -312,7 +329,7 @@ rc=$?
 [ "$rc" = 2 ] || fail 'an unknown argument exits 2' 2 "$rc"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: install, pinned Node, closed stdout, one bundle, no-op re-run, rebuild on change, failed build, read-only checkout, PATH hint, --bin-dir, foreign termag, Node floor, termag update (main, other branch, detached)'
+  echo 'PASS: install, pinned Node, closed stdout, one bundle, git version, no-op re-run, rebuild on change, failed build, read-only checkout, PATH hint, --bin-dir, foreign termag, Node floor, termag update (main, other branch, detached)'
   exit 0
 fi
 echo "$failures failure(s)"

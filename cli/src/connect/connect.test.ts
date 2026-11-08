@@ -24,10 +24,12 @@ if (name === 'aws') {
   if (cmd === 'sts get-caller-identity') {
     if (has('sso-expired')) { process.stderr.write('\\nError when retrieving token from sso: Token has expired and refresh failed\\n'); process.exit(255); }
     if (has('no-token')) { process.stderr.write('\\nError loading SSO Token: Token for termag does not exist\\n'); process.exit(255); }
+    if (has('sso-cache-corrupt-bare')) { process.stderr.write("\\n'b07d3c50e209cb6974636adb6cce2cab6858d6cc'\\n"); process.exit(255); }
+    if (has('sso-cache-corrupt')) { process.stderr.write("\\naws: [ERROR]: 'b07d3c50e209cb6974636adb6cce2cab6858d6cc'\\n"); process.exit(255); }
     if (has('network-down')) { process.stderr.write('\\nCould not connect to the endpoint URL\\n'); process.exit(255); }
     process.stdout.write('{}'); process.exit(0);
   }
-  if (cmd === 'sso login') { if (!has('sso-login-fails')) { rmSync(join(state, 'sso-expired'), { force: true }); rmSync(join(state, 'no-token'), { force: true }); } process.exit(has('sso-login-fails') ? 1 : 0); }
+  if (cmd === 'sso login') { if (!has('sso-login-fails')) { rmSync(join(state, 'sso-expired'), { force: true }); rmSync(join(state, 'no-token'), { force: true }); rmSync(join(state, 'sso-cache-corrupt'), { force: true }); } process.exit(has('sso-login-fails') ? 1 : 0); }
   process.exit(0);
 }
 if (name === 'infocmp') {
@@ -363,6 +365,45 @@ describe('pre-connect checks', () => {
     expect(calls('ssh')).toEqual([]);
   });
 
+  // What botocore prints when a racing refresh left a stray tail in the token cache file sha1("termag") names.
+  const corruptCache = () => {
+    flag('sso-cache-corrupt');
+    mkdirSync(join(home, '.aws', 'sso', 'cache'), { recursive: true });
+    writeFileSync(join(home, '.aws', 'sso', 'cache', 'b07d3c50e209cb6974636adb6cce2cab6858d6cc.json'), '{"accessToken": "x"}\n}\n');
+  };
+
+  it('with no terminal, a corrupted SSO token cache fails fast (exit 4) and names the login that repairs it', async () => {
+    corruptCache();
+    expect(await run(['ssh', 'devbox', '--', 'true'], ctx({ interactive: false }))).toBe(4);
+    expect(err.join('\n')).toContain('has a corrupted AWS SSO token cache; run `aws sso login --profile termag-boxes`');
+    expect(calls('aws').some(a => a[0] === 'sso')).toBe(false);
+    expect(calls('ssh')).toEqual([]);
+  });
+
+  it('at a terminal, repairs a corrupted SSO token cache with aws sso login and carries on', async () => {
+    corruptCache();
+    expect(await run(['ssh', 'devbox'], ctx())).toBe(0);
+    expect(calls('aws').map(a => a.slice(0, 2).join(' '))).toEqual(
+      ['configure list-profiles', 'sts get-caller-identity', 'sso login', 'sts get-caller-identity']);
+    expect(err.join('\n')).toContain('termag-boxes has a corrupted AWS SSO token cache; running `aws sso login --profile termag-boxes`');
+    expect(calls('ssh')).toHaveLength(1);
+  });
+
+  it('recognizes the bare key older AWS CLIs print without the error prefix', async () => {
+    corruptCache();
+    rmSync(join(state, 'sso-cache-corrupt'));
+    flag('sso-cache-corrupt-bare');
+    expect(await run(['ssh', 'devbox', '--', 'true'], ctx({ interactive: false }))).toBe(4);
+    expect(err.join('\n')).toContain('has a corrupted AWS SSO token cache; run `aws sso login --profile termag-boxes`');
+  });
+
+  it('does not blame the SSO token cache for a bare key it holds no file for', async () => {
+    flag('sso-cache-corrupt');
+    expect(await run(['ssh', 'devbox'], ctx())).toBe(1);
+    expect(err.join('\n')).toContain("does not work: aws: [ERROR]: 'b07d3c50e209cb6974636adb6cce2cab6858d6cc'");
+    expect(calls('aws').some(a => a[0] === 'sso')).toBe(false);
+  });
+
   it('does not offer an SSO login for an unrelated AWS failure', async () => {
     flag('network-down');
     expect(await run(['ssh', 'devbox'], ctx())).toBe(1);
@@ -374,18 +415,18 @@ describe('pre-connect checks', () => {
 describe('termag attach', () => {
   it('attaches to the agent session with a terminal', async () => {
     expect(await run(['attach', 'devbox/webapp-fix'], ctx())).toBe(0);
-    expect(sshArgv().slice(-3)).toEqual(['-t', 'termag-devbox', 'tmux attach-session -t alice-webapp-fix-agent']);
+    expect(sshArgv().slice(-3)).toEqual(['-t', 'termag-devbox', 'tmux attach-session -t alice-webapp-fix-agent \';\' set-option -w window-size latest']);
   });
 
   it('--ctrl attaches to the ctrl shell', async () => {
     expect(await run(['attach', 'devbox/webapp-fix', '--ctrl'], ctx())).toBe(0);
-    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-ctrl');
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-ctrl \';\' set-option -w window-size latest');
   });
 
   it('derives the session name for an orchestrator that predates `sessions`', async () => {
     orch.override.set('/api/cli/v1/projects', serve({ projects: PROJECTS }));
     expect(await run(['attach', 'devbox/flaky-test'], ctx())).toBe(0);
-    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-flaky-test-agent');
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-flaky-test-agent \';\' set-option -w window-size latest');
   });
 
   it('needs a project (exit 2) and a terminal (exit 1)', async () => {
@@ -401,7 +442,7 @@ describe('a TERM the box may not have', () => {
 
   it('leaves a TERM every box has alone', async () => {
     expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-256color' }))).toBe(0);
-    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent \';\' set-option -w window-size latest');
     expect(calls('infocmp')).toEqual([]);
     expect(err).toEqual([]);
   });
@@ -414,7 +455,7 @@ describe('a TERM the box may not have', () => {
     expect(argv.at(-1)).toBe(
       `if ! infocmp xterm-ghostty >/dev/null 2>&1; then printf %s ${entry('xterm-ghostty')} | base64 -d | tic -x -o "$HOME/.terminfo" - >/dev/null 2>&1; `
       + `infocmp xterm-ghostty >/dev/null 2>&1 || { echo 'termag: could not install the terminfo entry for xterm-ghostty on the box; using TERM=xterm-256color' >&2; TERM=xterm-256color; export TERM; }; fi; `
-      + 'tmux attach-session -t alice-webapp-fix-ctrl');
+      + 'tmux attach-session -t alice-webapp-fix-ctrl \';\' set-option -w window-size latest');
     expect(err).toEqual([]);
   });
 
@@ -443,7 +484,7 @@ describe('a TERM the box may not have', () => {
       expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: term }))).toBe(0);
       const remote = sshArgv().at(-1)!;
       expect(remote.startsWith(`if ! infocmp ${term} `)).toBe(true);
-      expect(remote.endsWith('; fi; tmux attach-session -t alice-webapp-fix-agent')).toBe(true);
+      expect(remote.endsWith('; fi; tmux attach-session -t alice-webapp-fix-agent \';\' set-option -w window-size latest')).toBe(true);
     }
   });
 
@@ -471,7 +512,7 @@ describe('a TERM the box may not have', () => {
   it('falls back to xterm-256color, with a notice, when there is no local infocmp', async () => {
     removeTool('infocmp');
     expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'xterm-ghostty' }))).toBe(0);
-    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent \';\' set-option -w window-size latest');
     expect(sshEnv().TERM).toBe('xterm-256color');
     expect(err).toEqual(['termag: TERM=xterm-ghostty may be unknown on the box and there is no infocmp here to copy its terminfo entry to the box; using TERM=xterm-256color for this session']);
   });
@@ -485,7 +526,7 @@ describe('a TERM the box may not have', () => {
 
   it('never puts a TERM that is not a plain name into the command line', async () => {
     expect(await run(['attach', 'devbox/webapp-fix'], ctx({}, { TERM: 'x;touch /tmp/pwned' }))).toBe(0);
-    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent');
+    expect(sshArgv().at(-1)).toBe('tmux attach-session -t alice-webapp-fix-agent \';\' set-option -w window-size latest');
     expect(calls('infocmp')).toEqual([]);
     expect(sshEnv().TERM).toBe('xterm-256color');
   });
@@ -662,7 +703,7 @@ describe('termag ssh-config', () => {
     ]);
     const ctrl = lines.indexOf('Host termag-devbox.webapp-fix.ctrl');
     expect(lines.slice(ctrl + 1, ctrl + 5)).toEqual([
-      '  HostName termag-devbox', '  User alice', '  RequestTTY yes', '  RemoteCommand tmux attach-session -t alice-webapp-fix-ctrl',
+      '  HostName termag-devbox', '  User alice', '  RequestTTY yes', '  RemoteCommand tmux attach-session -t alice-webapp-fix-ctrl \';\' set-option -w window-size latest',
     ]);
     expect(err.join('\n')).toContain('devbox/odd name has no termag-<box>.<project> host');
   });

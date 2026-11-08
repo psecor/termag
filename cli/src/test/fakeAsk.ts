@@ -53,6 +53,12 @@ export interface FakeAskState {
   multiRepo?: Record<string, string[]>;
   /** The orchestrator will tell the sending session when the ask finishes (unless the ask says notify: false). */
   notify?: 'chat' | 'pane';
+  /**
+   * `--model` (backend askService.ts): unset, a current orchestrator that takes
+   * it, echoes it and keeps it on the thread; `'unknown'`, one from before it,
+   * which drops it; `{ ignored }`, one whose box can't honour it, saying why.
+   */
+  model?: 'unknown' | { ignored: string; later?: true };
 }
 
 interface FakeAskMessage {
@@ -66,6 +72,8 @@ interface FakeAskMessage {
   handedOut: number;
   delivered: boolean;
   supersededBy?: string;
+  /** The tier its turn runs on: its --model, else its thread's (a follow-up keeps it); absent for the box's default. */
+  model?: string;
 }
 
 export function newAskState(): FakeAskState {
@@ -88,6 +96,8 @@ function view(s: FakeAskState, m: FakeAskMessage, consume: boolean) {
     reply, replyBytes: done && m.status !== 'canceled' ? Buffer.byteLength(s.reply) : null, replyDelivered: m.delivered,
     ...(s.stored !== undefined ? { replyStored: kept, replyKept: s.stored !== 'no-key' } : {}),
     ...(m.status === 'superseded' ? { supersededBy: m.supersededBy ?? null } : {}),
+    ...(s.model !== 'unknown' ? { model: s.model?.ignored ? null : m.model ?? null } : {}),
+    ...(typeof s.model === 'object' && m.model ? { modelIgnored: s.model.ignored } : {}),
     publish: done ? s.publish ?? { status: s.pr ? 'published' : 'none', detail: null } : null,
     pr: done ? s.pr : null,
     ...(s.prs ? { prs: done ? s.prs : [] } : {}),
@@ -127,12 +137,16 @@ export function handleAsk(s: FakeAskState, route: string, query: URLSearchParams
       const thread = typeof body.threadId === 'string' ? body.threadId : `thread0000${n}`;
       const hops = [...s.messages.values()].filter(x => x.thread === thread).length + 1;
       m = { message: id, thread, target: String(body.target), status: 'working', hop: 0, hops, polls: 0, handedOut: 0, delivered: false };
+      // The thread's stored choice: this --model, else the one its last message ran on.
+      const kept = [...s.messages.values()].filter(x => x.thread === thread).at(-1)?.model;
+      const model = s.model === 'unknown' ? undefined : typeof body.model === 'string' ? body.model : kept;
+      if (model) m.model = model;
       s.messages.set(id, m);
     }
     if (s.failAsk > 0) { s.failAsk -= 1; gateway502(); return true; }
     // --pr: the orchestrator answers with the PR it checked and its head branch.
     const target = typeof body.pr === 'string' ? { targetPr: Number(/(\d+)\/?$/.exec(body.pr)?.[1]), branch: 'termag-alice/oldthread' } : {};
-    send(res, 202, { thread: m.thread, message: m.message, status: m.status, hop: 0, hops: m.hops, target: m.target, branch: `termag-alice/${m.thread}`, ...target, ...(s.notify && body.notify !== false ? { notify: s.notify } : {}), ...(replayed ? { replayed } : {}), ...(s.stored !== undefined ? { replyKept: s.stored !== 'no-key' } : {}), ...steer, ...(s.queued ? { queued: true, status: 'submitted', ...(typeof s.queued === 'string' ? { queuedFor: s.queued } : {}) } : {}) });
+    send(res, 202, { thread: m.thread, message: m.message, status: m.status, hop: 0, hops: m.hops, target: m.target, branch: `termag-alice/${m.thread}`, ...target, ...(s.notify && body.notify !== false ? { notify: s.notify } : {}), ...(replayed ? { replayed } : {}), ...(typeof body.model === 'string' && s.model !== 'unknown' ? { model: body.model, ...(s.model?.ignored && !s.model.later ? { modelIgnored: s.model.ignored } : {}) } : {}), ...(s.stored !== undefined ? { replyKept: s.stored !== 'no-key' } : {}), ...steer, ...(s.queued ? { queued: true, status: 'submitted', ...(typeof s.queued === 'string' ? { queuedFor: s.queued } : {}) } : {}) });
     return true;
   }
   if (route === 'GET /ask/targets') {
@@ -168,7 +182,10 @@ export function handleAsk(s: FakeAskState, route: string, query: URLSearchParams
     m.polls += 1;
     if (m.polls >= s.pollsUntilDone && m.status === 'working') m.status = s.outcome;
     if (asked && m !== asked) {
-      send(res, 200, { ...view(s, m, true), message: asked.message, supersededBy: asked.supersededBy, answeredWith: m.message });
+      // The model is the asked message's own (backend agentMessages.ts answeredTogether).
+      const own = view(s, asked, false);
+      const { modelIgnored: _theirs, ...answer } = view(s, m, true) as Record<string, unknown>;
+      send(res, 200, { ...answer, message: asked.message, supersededBy: asked.supersededBy, answeredWith: m.message, model: own.model, ...('modelIgnored' in own ? { modelIgnored: own.modelIgnored } : {}) });
       return true;
     }
     send(res, 200, view(s, m, true));

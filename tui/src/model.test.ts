@@ -103,6 +103,16 @@ describe('buildRows', () => {
     expect(buildRows([archivedWs], {}, { filter: 'gone' })).toHaveLength(0);
   });
 
+  it("lists no row for an ask thread's chat, which has no pane to peek or attach", () => {
+    const asked = project({
+      name: 'audits',
+      workstreams: [ws('main', 'audits'), ws('review', 'audits'), { ...ws('ask-thread0001', 'audits'), askThread: { id: 'thread0001', title: 'Review #1' } }],
+    });
+    const rows = buildRows([asked], {});
+    expect(rows.filter(r => r.kind === 'workstream').map(r => (r as any).workstream.name)).toEqual(['main', 'review']);
+    expect(buildRows([asked], {}, { filter: 'ask-thread' })).toHaveLength(0);
+  });
+
   it('findRowIndex prefers the workstream row for multi-workstream projects', () => {
     const rows = buildRows(projects, {});
     const i = findRowIndex(rows, { projectId: 'beta', workstream: 'feat' });

@@ -24,6 +24,8 @@ export interface Workstream {
   lastActiveAt: string;
   createdAt: string;
   updatedAt: string;
+  /** Set on an ask thread's chat (backend services/askChat.ts), which runs in the chat runner and has no tmux pane. */
+  askThread?: { id: string; title: string | null } | null;
 }
 
 export interface Project {

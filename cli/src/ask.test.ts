@@ -52,6 +52,12 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+/** What GET /environments/<name>/resolved answers: the checkouts `termag ask --environment` reads and pins. */
+function shownAs(name: string, repos: Array<{ repo: string; branch?: string }>): void {
+  orch.environments.envs.push({ id: `e-${name}`, name, kind: 'inline', definition: { repos }, updatedAt: '', createdBy: null, updatedBy: null, visibility: 'personal', owner: null });
+  orch.environments.resolved[name] = { repos, size: null, warnings: [] };
+}
+
 describe('termag ask', () => {
   it('asks, waits and prints the reply fenced as untrusted, then the thread', async () => {
     orch.ask.pollsUntilDone = 3;
@@ -765,7 +771,7 @@ describe('termag ask --new-box', () => {
     orch.lifecycle.provisionPolls = 2;
     expect(await run(['ask', '--new-box', '--from', 'research', 'askbox/termag-9', 'look at the flag', '--title', 'Flag read'], ctx())).toBe(0);
     expect(posts()).toEqual([
-      { route: 'POST /boxes', body: { name: 'askbox', from: 'research', createdFor: 'ask' } },
+      { route: 'POST /boxes', body: { name: 'askbox', from: 'research', createdFor: 'ask', setupEnabled: true, useRepoSetup: true } },
       { route: 'POST /projects', body: { boxId: 'i-askbox', name: 'termag-9', agent: 'claude', from: 'research', createdFor: 'ask' } },
     ]);
     // Sized like any box: the owner's default with no environment.json; the orchestrator gives it the ask-box lifecycle.
@@ -792,7 +798,7 @@ describe('termag ask --new-box', () => {
     const REPO = 'https://github.com/example-org/webapp';
     orch.lifecycle.repoFiles = { [REPO]: { diskGiB: 250 } };
     expect(await run(['ask', '--new-box', '--disk', '300', '--from', REPO, 'd1/app', 'hi', '--title', 'Hi'], ctx())).toBe(0);
-    expect(posts()[0]).toEqual({ route: 'POST /boxes', body: { name: 'd1', diskGiB: 300, from: REPO, createdFor: 'ask' } });
+    expect(posts()[0]).toEqual({ route: 'POST /boxes', body: { name: 'd1', diskGiB: 300, from: REPO, createdFor: 'ask', setupEnabled: true, useRepoSetup: true } });
     expect(stderr()).toContain('Created box d1 (300 GB disk); d1/app is set up on it once it is running.');
     expect(await run(['ask', '--new-box', '--from', REPO, 'd2/app', 'hi', '--title', 'Hi'], ctx())).toBe(0);
     expect(orch.lifecycle.boxes.find(b => b.name === 'd2')).toMatchObject({ diskGiB: 250 });
@@ -804,7 +810,7 @@ describe('termag ask --new-box', () => {
     orch.lifecycle.repoFiles = { [WEB]: { size: 'medium' }, [API]: { size: 'large' } };
     expect(await run(['ask', '--new-box', '--from', WEB, '--from', API, 'mr/shop', 'wire it up', '--title', 'Two repos'], ctx())).toBe(0);
     expect(posts()).toEqual([
-      { route: 'POST /boxes', body: { name: 'mr', from: [WEB, API], createdFor: 'ask' } },
+      { route: 'POST /boxes', body: { name: 'mr', from: [WEB, API], createdFor: 'ask', setupEnabled: true, useRepoSetup: true } },
       { route: 'POST /projects', body: { boxId: 'i-mr', name: 'shop', agent: 'claude', from: [WEB, API], createdFor: 'ask' } },
     ]);
     expect(orch.lifecycle.boxes.find(b => b.name === 'mr')).toMatchObject({ size: 'large' });
@@ -820,11 +826,62 @@ describe('termag ask --new-box', () => {
 
   });
 
+  it("makes the project of an environment's repositories on a box its file sizes, and asks its first repository", async () => {
+    orch.lifecycle.defaultSize = 'small';
+    const WEB = 'https://github.com/acme/web', API = 'https://github.com/acme/api';
+    orch.lifecycle.repoFiles = { [WEB]: { size: 'medium' } };
+    orch.lifecycle.environments = { 'full-stack': { repos: [API, WEB], size: 'large' } };
+    shownAs('full-stack', [{ repo: 'acme/api' }, { repo: 'acme/web', branch: 'next' }]);
+    orch.lifecycle.environments['full-stack'].checkouts = [{ repo: 'acme/api' }, { repo: 'acme/web', branch: 'next' }];
+    expect(await run(['ask', '--new-box', '--environment', 'Full-Stack', 'fs/shop', 'wire it up', '--title', 'Env'], ctx())).toBe(0);
+    expect(posts()).toEqual([
+      // An ask's box always has termag setup on.
+      { route: 'POST /boxes', body: { name: 'fs', environment: 'full-stack', createdFor: 'ask', setupEnabled: true } },
+      // The checkouts it read and printed, which the create is held to (an ask runs them without asking).
+      { route: 'POST /projects', body: { boxId: 'i-fs', name: 'shop', agent: 'claude', environment: 'full-stack', environmentRepos: [{ repo: 'acme/api' }, { repo: 'acme/web', branch: 'next' }], createdFor: 'ask' } },
+    ]);
+    expect(stderr()).toContain('termag: full-stack runs acme/api, acme/web at next');
+    expect(orch.lifecycle.boxes.find(b => b.name === 'fs')).toMatchObject({ size: 'large' });
+    expect(orch.ask.asks[0]).toMatchObject({ target: 'fs/shop:api', newBox: true });
+    expect(stderr()).toContain("termag: asking fs/shop:api, the environment's first repository; name another as fs/shop:<repo>");
+  });
+
+  it('says the checkouts it runs on stderr with --json too, where a caller still sees them', async () => {
+    orch.lifecycle.environments = { 'full-stack': { repos: ['https://github.com/acme/web'], checkouts: [{ repo: 'acme/web', branch: 'next' }] } };
+    shownAs('full-stack', [{ repo: 'acme/web', branch: 'next' }]);
+    expect(await run(['ask', '--new-box', '--environment', 'full-stack', 'fs/shop', 'hi', '--title', 'Env', '--json'], ctx())).toBe(0);
+    expect(stderr()).toContain('termag: full-stack runs acme/web at next');
+  });
+
+  it('asks nothing when the environment changed between reading it and making the project', async () => {
+    orch.lifecycle.environments = { 'full-stack': { repos: ['https://github.com/acme/web'], checkouts: [{ repo: 'acme/web', branch: 'someones-branch' }] } };
+    shownAs('full-stack', [{ repo: 'acme/web' }]);
+    expect(await run(['ask', '--new-box', '--environment', 'full-stack', 'fs/shop', 'hi', '--title', 'Env'], ctx())).not.toBe(0);
+    expect(stderr()).toContain('changed since');
+    expect(orch.lifecycle.projects.some(p => p.name === 'shop')).toBe(false);
+    expect(orch.ask.asks).toEqual([]);
+  });
+
+  it('says so, before asking, when there is no such environment', async () => {
+    expect(await run(['ask', '--new-box', '--environment', 'nope', 'fs/shop', 'hi', '--title', 'Env'], ctx())).not.toBe(0);
+    expect(stderr()).toContain('There is no environment named "nope"');
+    expect(orch.ask.asks).toEqual([]);
+  });
+
+  it('keeps termag setup on when the repository\'s environment.json says "setupEnabled": false, and says why: an ask needs it', async () => {
+    const BARE = 'https://github.com/acme/bare';
+    orch.lifecycle.repoFiles = { [BARE]: { setupEnabled: false } };
+    expect(await run(['ask', '--new-box', '--from', BARE, 'bare/app', 'hi', '--title', 'Hi'], ctx())).toBe(0);
+    expect(orch.lifecycle.boxes.find(b => b.name === 'bare')).toMatchObject({ setupEnabled: true });
+    expect(stderr()).toContain(`termag: ${BARE}'s .termag/environment.json says "setupEnabled": false, but an ask needs termag setup, so bare has it on`);
+    expect(orch.ask.asks).toHaveLength(1);
+  });
+
   it('makes an empty project with no --from', async () => {
     orch.lifecycle.defaultSize = 'medium';
     expect(await run(['ask', '--new-box', 'scratch/notes', 'sketch a plan', '--title', 'Plan'], ctx())).toBe(0);
     expect(posts()).toEqual([
-      { route: 'POST /boxes', body: { name: 'scratch', createdFor: 'ask' } },
+      { route: 'POST /boxes', body: { name: 'scratch', createdFor: 'ask', setupEnabled: true } },
       { route: 'POST /projects', body: { boxId: 'i-scratch', name: 'notes', agent: 'claude', createdFor: 'ask' } },
     ]);
     expect(orch.lifecycle.boxes.find(b => b.name === 'scratch')).toMatchObject({ size: 'medium' });
@@ -871,6 +928,14 @@ describe('termag ask --new-box', () => {
     expect(stderr()).toContain('Using the existing box devbox (running).');
   });
 
+  it("uses an existing box and project as they are with --environment, without reading the environment (Bugbot, #985)", async () => {
+    // The environment is gone since the project was made from it: nothing new is made, so nothing is pinned.
+    expect(await run(['ask', '--new-box', '--environment', 'gone', 'devbox/webapp-fix', 'again', '--title', 'Again'], ctx())).toBe(0);
+    expect(posts()).toEqual([]);
+    expect(orch.environments.calls).toEqual([]);
+    expect(orch.ask.asks).toHaveLength(1);
+  });
+
   it('adds the project to an existing box when only the box is there', async () => {
     expect(await run(['ask', '--new-box', 'devbox/new-proj', 'hi', '--title', 'Hi'], ctx())).toBe(0);
     expect(posts()).toEqual([{ route: 'POST /projects', body: { boxId: 'i1', name: 'new-proj', agent: 'claude', createdFor: 'ask' } }]);
@@ -893,7 +958,7 @@ describe('termag ask --new-box', () => {
     orch.lifecycle.boxes.push({ id: 'i-dead', name: 'dead', addressable: true, kind: 'ec2', state: 'failed', status: 'failed', agentConnected: false, error: 'RunInstances refused', projects: [] });
     expect(await run(['ask', '--new-box', 'dead/app', 'hi', '--title', 'Hi'], ctx())).toBe(0);
     expect(posts()).toEqual([
-      { route: 'POST /boxes', body: { name: 'dead', createdFor: 'ask' } },
+      { route: 'POST /boxes', body: { name: 'dead', createdFor: 'ask', setupEnabled: true } },
       { route: 'POST /projects', body: { boxId: 'i-dead', name: 'app', agent: 'claude', createdFor: 'ask' } },
     ]);
     expect(orch.lifecycle.boxes.find(b => b.name === 'dead')).toMatchObject({ state: 'running' });
@@ -908,6 +973,23 @@ describe('termag ask --new-box', () => {
     expect(orch.lifecycle.boxes.filter(b => b.name === 'dead')).toEqual([expect.objectContaining({ id: 'i-dead-2', state: 'running' })]);
     expect(orch.ask.asks[0]).toMatchObject({ target: 'dead/app' });
     expect(stderr()).toContain('failed to launch; relaunching it with dead/app');
+  });
+
+  it('retries a failed box with termag setup off and a waiting project with setup on, as an ask needs (Bugbot, #983)', async () => {
+    orch.lifecycle.boxes.push({ id: 'i-dead', name: 'dead', addressable: true, kind: 'ec2', state: 'failed', status: 'failed', agentConnected: false, error: 'RunInstances refused', projects: [], setupEnabled: false });
+    orch.lifecycle.projects.push({ id: 'p-dead', name: 'app', ref: 'dead/app', box: { id: 'i-dead', name: 'dead' }, provider: 'claude', status: 'not_running', waitingReason: null, rateLimited: null, workstreams: ['main'] });
+    expect(await run(['ask', '--new-box', 'dead/app', 'hi', '--title', 'Hi'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.find(c => c.route === 'POST /projects/p-dead/clone/retry')?.body).toEqual({ setupEnabled: true });
+    expect(orch.lifecycle.boxes.filter(b => b.name === 'dead')).toEqual([expect.objectContaining({ id: 'i-dead-2', setupEnabled: true })]);
+    expect(orch.ask.asks[0]).toMatchObject({ target: 'dead/app' });
+  });
+
+  it('retries with an empty body when nothing asked for a setting (project create --new-box with neither flag)', async () => {
+    orch.lifecycle.boxes.push({ id: 'i-dead', name: 'dead', addressable: true, kind: 'ec2', state: 'failed', status: 'failed', agentConnected: false, error: 'RunInstances refused', projects: [], setupEnabled: false });
+    orch.lifecycle.projects.push({ id: 'p-dead', name: 'app', ref: 'dead/app', box: { id: 'i-dead', name: 'dead' }, provider: 'claude', status: 'not_running', waitingReason: null, rateLimited: null, workstreams: ['main'] });
+    expect(await run(['project', 'create', 'dead/app', '--new-box', '--agent', 'claude', '--if-not-exists'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.find(c => c.route === 'POST /projects/p-dead/clone/retry')?.body).toEqual({});
+    expect(orch.lifecycle.boxes.filter(b => b.name === 'dead')).toEqual([expect.objectContaining({ id: 'i-dead-2', setupEnabled: false })]);
   });
 
   it('a project that already exists on a box being made is taken as it is (a retry after a lost wait)', async () => {
@@ -930,9 +1012,12 @@ describe('termag ask --new-box', () => {
     [['ask', '--new-box', 'b/p', 'hi', '--thread', 'thread00001'], '--new-box starts a thread'],
     [['ask', '--new-box', '--size', 'huge', 'b/p', 'hi'], '--size takes small, medium, large'],
     [['ask', '--new-box', '--disk', '500', 'b/p', 'hi'], '--disk takes a whole number of GB from 50 to 300'],
-    [['ask', '--size', 'small', 'b/p', 'hi'], '--size, --disk and --from go with --new-box'],
-    [['ask', '--disk', '200', 'b/p', 'hi'], '--size, --disk and --from go with --new-box'],
-    [['ask', '--from', 'research', 'b/p', 'hi'], '--size, --disk and --from go with --new-box'],
+    [['ask', '--size', 'small', 'b/p', 'hi'], '--size, --disk, --from and --environment go with --new-box'],
+    [['ask', '--disk', '200', 'b/p', 'hi'], '--size, --disk, --from and --environment go with --new-box'],
+    [['ask', '--from', 'research', 'b/p', 'hi'], '--size, --disk, --from and --environment go with --new-box'],
+    [['ask', '--environment', 'full-stack', 'b/p', 'hi'], '--size, --disk, --from and --environment go with --new-box'],
+    [['ask', '--new-box', '--environment', 'full-stack', '--from', 'research', 'b/p', 'hi'], 'leave out --from'],
+    [['ask', '--new-box', '--environment', 'Full Stack', 'b/p', 'hi'], "--environment takes an environment's name"],
     [['ask', '--new-box', 'b/p.x', 'hi'], '"p.x" is not a valid project name'],
     [['ask', '--new-box', 'b/p'], 'termag ask --new-box'],
   ])('refuses %j before making anything', async (argv, why) => {
@@ -940,5 +1025,117 @@ describe('termag ask --new-box', () => {
     expect(stderr()).toContain(why);
     expect(orch.lifecycle.calls).toEqual([]);
     expect(orch.ask.asks).toEqual([]);
+  });
+});
+
+describe('termag ask --model', () => {
+  it('sends the tier with the ask, and the inbox shows what each ask ran on', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'where is the flag read?', '--model', 'opus', '--title', 'Flag'], ctx())).toBe(0);
+    expect(orch.ask.asks).toEqual([{ target: 'devbox/webapp-fix', prompt: 'where is the flag read?', messageId: 'message0001', title: 'Flag', model: 'opus' }]);
+    expect(stderr()).not.toContain('ignored');
+    out = [];
+    expect(await run(['ask', '--inbox'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/MESSAGE\s+THREAD\s+TARGET\s+STATUS\s+REPLY\s+COMMITS\s+PR\s+NOTICE\s+MODEL\s+TITLE/);
+    expect(stdout()).toMatch(/message0001\s+thread00001\s+devbox\/webapp-fix\s+completed\s+delivered\s+none\s+-\s+-\s+opus$/m);
+    out = [];
+    expect(await run(['ask', '--inbox', '--json'], ctx())).toBe(0);
+    expect(lastJson().tasks[0].metadata.termag.model).toBe('opus');
+  });
+
+  it('a --thread follow-up sends --model only when given: without it the thread keeps its model', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'first', '--model', 'opus', '--title', 'T'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'again', '--thread', 'thread00001'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'cheaper now', '--thread', 'thread00001', '--model', 'haiku'], ctx())).toBe(0);
+    expect(orch.ask.asks.map(a => a.model ?? null)).toEqual(['opus', null, 'haiku']);
+    out = [];
+    expect(await run(['ask', '--inbox', '--json'], ctx())).toBe(0);
+    expect(lastJson().tasks.map((t: { metadata: { termag: { model?: string } } }) => t.metadata.termag.model)).toEqual(['opus', 'opus', 'haiku']);
+  });
+
+  it('--no-wait --json carries the model, as the message view does, and why one was ignored', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'T', '--no-wait', '--json'], ctx())).toBe(0);
+    expect(lastJson().metadata.termag).toMatchObject({ model: 'opus' });
+    expect(lastJson().metadata.termag).not.toHaveProperty('modelIgnored');
+    orch.ask.model = { ignored: "devbox's agent predates --model" };
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'T', '--no-wait', '--json'], ctx())).toBe(0);
+    expect(lastJson().metadata.termag).toMatchObject({ modelIgnored: "devbox's agent predates --model" });
+    // Ran on the box's default, as the message view says: no model.
+    expect(lastJson().metadata.termag).not.toHaveProperty('model');
+  });
+
+  it('goes with --update-pr', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'finish it', '--update-pr', '753', '--model', 'sonnet', '--title', 'x'], ctx())).toBe(0);
+    expect(orch.ask.asks[0]).toMatchObject({ pr: '753', model: 'sonnet' });
+  });
+
+  it('with --new-box, the new project starts on it too', async () => {
+    expect(await run(['ask', '--new-box', '--from', 'research', 'askbox/m1', 'look', '--model', 'opus', '--title', 'Look'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.find(c => c.route === 'POST /projects')?.body).toEqual({ boxId: 'i-askbox', name: 'm1', agent: 'claude', from: 'research', createdFor: 'ask', model: 'opus' });
+    expect(orch.ask.asks[0]).toMatchObject({ target: 'askbox/m1', newBox: true, model: 'opus' });
+    expect(stderr()).not.toContain('ignored');
+  });
+
+  it('refuses a value that is not a tier, and goes with an ask only, before asking anything (exit 2)', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'gpt-5'], ctx())).toBe(2);
+    expect(stderr()).toContain('--model takes opus, sonnet, haiku');
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', ''], ctx())).toBe(2);
+    expect(await run(['ask', '--inbox', '--model', 'opus'], ctx())).toBe(2);
+    expect(await run(['ask', '--reply', 'message0001', '--model', 'opus'], ctx())).toBe(2);
+    expect(stderr()).toContain('--model goes with an ask');
+    expect(orch.ask.asks).toEqual([]);
+  });
+
+  it('an orchestrator from before --model runs the ask anyway, and the CLI says --model was ignored', async () => {
+    orch.ask.model = 'unknown';
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'Old'], ctx())).toBe(0);
+    expect(stdout()).toContain('thread: thread00001');
+    expect(stderr()).toContain("termag: warning: --model opus was ignored: the orchestrator predates it; the ask runs on the thread's model, else the box's default");
+  });
+
+  it('a box whose agent predates --model: the ask runs, with the orchestrator\'s reason', async () => {
+    orch.ask.model = { ignored: "devbox's agent predates --model (it needs a newer termag agent); the turn runs on the box's default" };
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'Old box'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: warning: --model opus was ignored: devbox's agent predates --model (it needs a newer termag agent)");
+  });
+
+  it('a queued ask whose --model is dropped when it starts warns once the reply comes, and --reply says it too', async () => {
+    orch.ask.queued = 'box';
+    orch.ask.stored = true;
+    orch.ask.model = { ignored: "devbox's agent predates --model", later: true };
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'Parked'], ctx())).toBe(0);
+    expect(stderr().match(/--model opus was ignored/g)).toEqual(['--model opus was ignored']);
+    expect(stderr()).toContain("termag: warning: --model opus was ignored: devbox's agent predates --model");
+    err = [];
+    expect(await run(['ask', '--reply', 'message0001'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: warning: its --model was ignored: devbox's agent predates --model");
+  });
+
+  it('a message answered together warns about its own --model only, never the follow-up\'s', async () => {
+    orch.ask.steer = true;
+    orch.ask.pollsUntilDone = 3;
+    orch.ask.stored = true;
+    orch.ask.model = { ignored: "devbox's agent predates --model", later: true };
+    // A asked for no model; B's --model was ignored: A's --reply says nothing about models.
+    expect(await run(['ask', 'devbox/webapp-fix', 'first', '--title', 'T', '--no-wait'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'opus now', '--thread', 'thread00001', '--model', 'opus', '--no-wait'], ctx())).toBe(0);
+    err = [];
+    expect(await run(['ask', '--reply', 'message0001'], ctx())).toBe(0);
+    expect(stderr()).not.toContain('--model was ignored');
+    // C asked for Opus and was ignored, then D joined its turn: C's --reply warns about C's own.
+    expect(await run(['ask', 'devbox/webapp-fix', 'third', '--model', 'opus', '--title', 'T2', '--no-wait'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'and', '--thread', 'thread00003', '--model', 'haiku', '--no-wait'], ctx())).toBe(0);
+    err = [];
+    expect(await run(['ask', '--reply', 'message0003'], ctx())).toBe(0);
+    expect(stderr()).toContain("termag: warning: its --model was ignored: devbox's agent predates --model");
+  });
+
+  it('an orchestrator from before --model: an ask without it says nothing about models', async () => {
+    orch.ask.model = 'unknown';
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--title', 'Plain'], ctx())).toBe(0);
+    expect(orch.ask.asks[0]).not.toHaveProperty('model');
+    expect(stderr()).not.toContain('model');
+    out = [];
+    expect(await run(['ask', '--inbox'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/message0001\s.*\s-\s+-$/m);
   });
 });

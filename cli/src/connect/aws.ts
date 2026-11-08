@@ -1,4 +1,6 @@
 import type { StdioOptions } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Ctx } from '../context.js';
 import { CliError } from '../errors.js';
 import {
@@ -30,6 +32,8 @@ const PLUGIN_INSTALL = 'https://docs.aws.amazon.com/systems-manager/latest/userg
 
 // What `aws sts get-caller-identity` prints when the profile's SSO session is the problem.
 const SSO_PROBLEM = /sso|token|expired|credential|refresh/i;
+// What it prints when the cache file named by that key won't parse; older v2 CLIs print the bare key.
+const UNREADABLE_CACHE_KEY = /^(?:aws: \[ERROR\]: )?'([0-9a-f]{40})'$/;
 
 export interface PreflightOptions {
   /** A person can answer: then an expired SSO session is renewed with `aws sso login`. */
@@ -99,11 +103,15 @@ export async function preflight(ctx: Ctx, settings: AwsSettings, opts: Preflight
   const identity = await capture(awsPath, identityArgs, ctx.env);
   if (identity.code === 0) return { awsPath };
   const reason = firstLine(identity.stderr);
-  if (!SSO_PROBLEM.test(reason)) {
+  // The role-credential cache under ~/.aws/cli/cache fails the same way, and a login doesn't repair that one.
+  const cacheKey = UNREADABLE_CACHE_KEY.exec(reason)?.[1];
+  const corrupted = !!cacheKey && existsSync(join(ctx.home, '.aws', 'sso', 'cache', `${cacheKey}.json`));
+  if (!corrupted && !SSO_PROBLEM.test(reason)) {
     throw new CliError('failed', `AWS profile \`${settings.profile}\` does not work: ${reason || `aws exited ${identity.code}`}`);
   }
   const login = `aws sso login --profile ${settings.profile}`;
-  const why = wrote ? 'has no AWS SSO session yet' : 'has an expired AWS SSO session';
+  const why = corrupted ? 'has a corrupted AWS SSO token cache'
+    : wrote ? 'has no AWS SSO session yet' : 'has an expired AWS SSO session';
   if (legacy) {
     ctx.err(`termag: your ${settings.profile} profile uses the legacy sso_start_url form, so each sign-in lasts one access token;`
       + ` delete it from ~/.aws/config and termag writes the [sso-session] form, which renews itself, on the next connect`);

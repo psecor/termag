@@ -7,6 +7,17 @@ export function shQuote(word: string): string {
 }
 
 /**
+ * The remote command line that attaches to a project's tmux session. Sessions
+ * made by older agents have `window-size largest`, which keeps the window at
+ * the widest attached client (a browser tab), so a narrower terminal sees it
+ * clipped and Claude's lines don't wrap at its width. Setting `latest` once
+ * attached makes the window follow whichever client was used last.
+ */
+export function tmuxAttachCommand(session: string): string {
+  return `tmux attach-session -t ${shQuote(session)} ';' set-option -w window-size latest`;
+}
+
+/**
  * The remote command line for `termag ssh … -- <cmd>`. One argument is a shell
  * command line, as with plain ssh (`-- 'make test | tail'`); several are words
  * that each reach the remote program intact (`-- claude -p "fix the test"`).

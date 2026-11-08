@@ -35,6 +35,9 @@ out="$(install_tui 2>&1)"
 got=$?
 [ "$got" = 0 ] || fail 'first build exits 0' 0 "$got: $out"
 [ -f "$TUI/dist/index.js" ] || fail 'builds dist/' 'dist/index.js' 'absent'
+# This copy has no cli/ beside it and no git, so the version is package.json's plus +unknown.
+got="$(cat "$TUI/dist/version.txt" 2>&1)"
+[ "$got" = '0.1.0+unknown' ] || fail 'writes the version without cli/ or git' '0.1.0+unknown' "$got"
 case "$out" in
   *'installing dependencies'*'building'*'termag tui'*) : ;;
   *) fail 'says what it did and what to run next' 'installing ... building ... termag tui' "$out" ;;
@@ -135,8 +138,29 @@ rc=0
 install_tui --nope >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || fail 'an unknown argument exits 2' 2 "$rc"
 
+# ── npm run build writes the version too, without cli/ beside it ────────────
+rm -f "$TUI/dist/version.txt"
+rc=0
+(cd "$TUI" && env -i HOME="$WORK/home" PATH="$P" npm run build >/dev/null 2>&1) || rc=$?
+[ "$rc" = 0 ] || fail 'npm run build without cli/ exits 0' 0 "$rc"
+got="$(cat "$TUI/dist/version.txt" 2>&1)"
+[ "$got" = '0.1.0+unknown' ] || fail 'npm run build writes the version without cli/' '0.1.0+unknown' "$got"
+
+# ── a cli/buildVersion.mjs that fails is an error, not a fallback ───────────
+mkdir -p "$WORK/it's a checkout/cli"
+printf "throw new Error('broken on purpose');\n" > "$WORK/it's a checkout/cli/buildVersion.mjs"
+printf '\n' >> "$TUI/src/index.tsx"
+rc=0
+out="$(install_tui 2>&1)" || rc=$?
+[ "$rc" = 1 ] || fail 'a failing cli/buildVersion.mjs fails the build' 1 "$rc"
+case "$out" in
+  *'broken on purpose'*"could not work out the TUI's version"*) : ;;
+  *) fail 'says why the version failed' "broken on purpose ... could not work out the TUI's version" "$out" ;;
+esac
+rm -rf "$WORK/it's a checkout/cli"
+
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: build, no-op re-run, --check, rebuild without npm ci, failed build, Node floor'
+  echo 'PASS: build, no-op re-run, --check, rebuild without npm ci, failed build, Node floor, npm run build version, broken version script'
   exit 0
 fi
 echo "$failures failure(s)"

@@ -114,6 +114,12 @@ export interface LoginDeps {
   openBrowser: (url: string) => void;
   notify: (line: string) => void;
   timeoutMs?: number;
+  /**
+   * On a box, its own credential: sent with the code exchange so the
+   * orchestrator records the sign-in as made on that box (its token is one
+   * every process there can read; some routes are narrower for it).
+   */
+  boxToken?: string;
 }
 
 /** Browser-loopback sign-in with PKCE. Only call this with a terminal attached. */
@@ -138,6 +144,7 @@ export async function browserLogin(deps: LoginDeps): Promise<TokenResponse> {
       grant_type: 'authorization_code',
       code,
       code_verifier: verifier,
+      ...(deps.boxToken ? { box_token: deps.boxToken } : {}),
     });
   } finally {
     callback.close();

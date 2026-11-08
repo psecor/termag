@@ -1,7 +1,7 @@
 import { copyFileSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CliError } from '../errors.js';
-import { shQuote } from './sshArgs.js';
+import { shQuote, tmuxAttachCommand } from './sshArgs.js';
 import { aliasFor, type ConnectBox, type ConnectProject } from './target.js';
 
 export const BEGIN_MARKER = '# >>> termag ssh-config >>>';
@@ -93,7 +93,7 @@ export function renderBlock(opts: { proxyCommand: string; user: string; hostUser
       `  HostName ${h.hostName}`,
       `  User ${h.user}`,
       '  RequestTTY yes',
-      `  RemoteCommand tmux attach-session -t ${h.session}`,
+      `  RemoteCommand ${tmuxAttachCommand(h.session)}`,
     ]),
     'Host termag-*',
     `  User ${opts.user}`,

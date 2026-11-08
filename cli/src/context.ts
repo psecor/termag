@@ -45,6 +45,8 @@ export interface Ctx {
   readStdin?: () => Promise<string>;
   /** Resolves when the person asks a long-running command (`termag forward`) to stop. Unset: Ctrl-C, SIGTERM or SIGHUP. */
   untilInterrupted?: () => Promise<void>;
+  /** The working directory (`termag preview publish <port>` finds its checkout from it). Unset: process.cwd(). */
+  cwd?: () => string;
 }
 
 function openBrowser(url: string): void {
@@ -124,6 +126,7 @@ export function defaultCtx(): Ctx {
     openBrowser,
     readFile: (path) => { try { return readFileSync(path, 'utf8'); } catch { return null; } },
     confirm,
+    cwd: () => process.cwd(),
     stderrIsTTY: Boolean(process.stderr.isTTY) && !process.env.CI,
     readStdin: async () => {
       const chunks: Buffer[] = [];

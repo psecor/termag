@@ -1,4 +1,4 @@
-import { createWriteStream, existsSync, readFileSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, closeSync, renameSync, rmSync, statSync } from 'node:fs';
+import { constants as fsConstants, copyFileSync, createWriteStream, existsSync, linkSync, readFileSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, closeSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -10,6 +10,7 @@ import type { Ctx } from './context.js';
 import { CliError, EXIT, usage, type ExitCode } from './errors.js';
 import { json, table } from './output.js';
 import { memoryPutRefusal } from './spaceMemory.js';
+import { cmdSpaceSlack, SPACE_SLACK_COMMAND } from './spaceSlack.js';
 import { forgetVersions, rememberVersion, rememberVersions, versionOf } from './spaceVersions.js';
 
 /**
@@ -100,6 +101,7 @@ export const SPACE_COMMANDS: Record<string, CommandSpec> = {
     usage: 'termag space boxes <space> [add <box> | rm <box>]',
     maxArgs: 3,
   },
+  'space slack': SPACE_SLACK_COMMAND,
 };
 
 export interface SpaceView {
@@ -121,8 +123,14 @@ type MultipartUpload = { kind: 'multipart'; path: string; uploadId: string; part
 
 export interface RemoteRef { space: string | null; path: string }
 
-/** `space:path`, or a bare path when the space is left out. */
+/**
+ * `space:path`, or a bare path when the space is left out. Prompts and skills often write
+ * `space:<name>:<path>` with the literal word `space:` in front; that names space `<name>`
+ * (reading it as space "space" sent every such call to a bare 404).
+ */
 export function parseRemote(raw: string): RemoteRef {
+  const literal = /^space:([a-z0-9-]{2,40}):/.exec(raw);
+  if (literal) return { space: literal[1], path: raw.slice(literal[0].length) };
   const colon = raw.indexOf(':');
   if (colon > 0 && SPACE_NAME_RE.test(raw.slice(0, colon))) return { space: raw.slice(0, colon), path: raw.slice(colon + 1) };
   return { space: null, path: raw };
@@ -261,23 +269,74 @@ export async function listAll(a: Api, space: string, prefix: string, opts: { rec
   return files;
 }
 
-/** Downloads `space:path` to `dest`; the version it got (an orchestrator from before versions names none). */
-export async function download(ctx: Ctx, a: Api, space: string, path: string, dest: string): Promise<{ size: number; etag: string | null; versionId: string | null }> {
+/**
+ * Downloads `space:path` to `dest`; the version it got (an orchestrator from before versions names none).
+ * With `keep` (the remote as the user wrote it, for the hint), an existing `dest` is never replaced:
+ * it is checked once the remote is known to exist, and again atomically as the download lands.
+ */
+export async function download(ctx: Ctx, a: Api, space: string, path: string, dest: string, opts: { keep?: string } = {}): Promise<{ size: number; etag: string | null; versionId: string | null }> {
   return withRetry(`download ${space}:${path}`, async () => {
     const { url, size, etag, versionId } = await a.request<{ url: string; size: number; etag?: string; versionId?: string }>('POST', `/spaces/${enc(space)}/files/download`, { path });
+    if (opts.keep !== undefined) refuseToClobber([dest], opts.keep);
     const res = await s3Fetch(ctx, url, {}, `download ${space}:${path}`);
     mkdirSync(dirname(dest), { recursive: true });
     const tmp = `${dest}.termag-partial`;
     try {
       if (!res.body) throw new Error('empty response');
       await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream), createWriteStream(tmp));
-      renameSync(tmp, dest);
-    } catch (err) {
+      if (opts.keep !== undefined) placeWithoutReplacing(tmp, dest, opts.keep);
+      else renameSync(tmp, dest);
+    } finally {
       rmSync(tmp, { force: true });
-      throw err;
     }
     return { size, etag: etag ?? null, versionId: versionId ?? null };
   });
+}
+
+/**
+ * Moves `tmp` to `dest` only if nothing is at `dest`, deciding that in the same
+ * system call that creates it, so a file another process writes there during the
+ * download survives. A hard link is atomic; a filesystem without hard links gets
+ * an exclusive-create copy instead.
+ */
+function placeWithoutReplacing(tmp: string, dest: string, remote: string): void {
+  try {
+    linkSync(tmp, dest);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') refuseToClobber([dest], remote);
+    if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'EXDEV') throw err;
+    try {
+      copyFileSync(tmp, dest, fsConstants.COPYFILE_EXCL);
+    } catch (copyErr) {
+      if ((copyErr as NodeJS.ErrnoException).code === 'EEXIST') refuseToClobber([dest], remote);
+      throw copyErr;
+    }
+  }
+}
+
+/** Whether anything is at `path`, a dangling symlink included (which existsSync calls absent). */
+function occupied(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * With no [dest], `space get` writes into the current directory, which is often
+ * a git checkout: replacing a file there that happens to share the name loses
+ * work. Only an explicit destination may replace an existing file.
+ */
+function refuseToClobber(locals: string[], remote: string): void {
+  const existing = locals.filter(occupied);
+  if (existing.length === 0) return;
+  const shown = existing.slice(0, 3).join(', ') + (existing.length > 3 ? ` and ${existing.length - 3} more` : '');
+  throw new CliError('conflict',
+    `${shown} already exist${existing.length === 1 ? 's' : ''}, and space get with no destination does not replace files. ` +
+    `Give a destination: \`termag space get ${remote} <dest>\` (a path outside a git checkout, or the existing path to replace it).`);
 }
 
 export async function cmdSpaceGet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
@@ -296,8 +355,10 @@ export async function cmdSpaceGet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
     const files = await listAll(a, space, prefix);
     if (files.length === 0) throw new CliError('not_found', `Nothing under ${space}:${prefix}`);
     const plan = files.map(f => ({ path: f.path, local: localTarget(root, f.path.slice(prefix.length)) }));
+    const keep = rawDest ? undefined : `-r ${rawRemote}`;
+    if (keep !== undefined) refuseToClobber(plan.map(p => p.local), keep);
     for (const p of plan) {
-      const v = await download(ctx, a, space, p.path, p.local);
+      const v = await download(ctx, a, space, p.path, p.local, { keep });
       got.push({ ...p, ...seen(v) });
       if (!args.json) ctx.err(`got ${space}:${p.path} (${formatBytes(v.size)})`);
     }
@@ -305,7 +366,7 @@ export async function cmdSpaceGet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
     if (!ref.path || ref.path.endsWith('/')) throw usage('That is a folder; use -r');
     let local = resolve(rawDest ?? basename(ref.path));
     if (rawDest && (rawDest.endsWith('/') || (existsSync(local) && statSync(local).isDirectory()))) local = join(local, basename(ref.path));
-    got.push({ path: ref.path, local, ...seen(await download(ctx, a, space, ref.path, local)) });
+    got.push({ path: ref.path, local, ...seen(await download(ctx, a, space, ref.path, local, { keep: rawDest ? undefined : rawRemote })) });
   }
   // What this client read, so a later put of the same path can say so (spaceVersions.ts).
   remembering(ctx, () => rememberVersions(ctx.home, space, got.map(g => ({ path: g.path, etag: g.etag, versionId: g.versionId })), 'get'));
@@ -574,10 +635,9 @@ export async function cmdSpaceCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCo
   if (!name) throw usage(`Usage: ${SPACE_COMMANDS['space create'].usage}`);
   const a = await api(ctx, args);
   const description = typeof args.options.description === 'string' ? args.options.description : undefined;
-  const { space, sharing } = await a.request<{ space: SpaceView; sharing?: boolean }>('POST', '/spaces', { name, description });
+  const { space } = await a.request<{ space: SpaceView }>('POST', '/spaces', { name, description });
   const boxes = `boxes with \`termag space boxes ${space.name} add <box>\``;
   if (args.json) ctx.out(json({ space }));
-  else if (sharing === false) ctx.out(`Created space ${space.name}. Add your ${boxes}.`);
   else ctx.out(`Created space ${space.name}. Add people with \`termag space members ${space.name} add <email> <role>\`, ${boxes}.`);
   return EXIT.OK;
 }
@@ -590,13 +650,12 @@ export async function cmdSpaceMembers(ctx: Ctx, args: ParsedArgs): Promise<ExitC
   const a = await api(ctx, args);
   const base = `/spaces/${enc(space)}/members`;
   if (!action) {
-    const r = await a.request<{ sharing?: boolean; members: MemberView[]; invites: Array<{ id: string; email: string; role: string }> }>('GET', base);
+    const r = await a.request<{ members: MemberView[]; invites: Array<{ id: string; email: string; role: string }> }>('GET', base);
     if (args.json) { ctx.out(json(r)); return EXIT.OK; }
     ctx.out(table(['MEMBER', 'ROLE'], [
       ...r.members.map(m => [m.email, m.role]),
       ...r.invites.map(i => [i.email, `${i.role} (not signed in yet)`]),
     ]));
-    if (r.sharing === false) ctx.out('Sharing spaces with other people is not turned on for you yet.');
     return EXIT.OK;
   }
   if (action === 'add') {
@@ -670,6 +729,8 @@ export const SPACE_HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Prom
   'space create': cmdSpaceCreate,
   'space members': cmdSpaceMembers,
   'space boxes': cmdSpaceBoxes,
+  'space slack': cmdSpaceSlack,
 };
 
+// `space link` is a file's browser link, not Slack: Slack channels are `space slack link`.
 export const SPACE_ALIASES: Record<string, string> = { 'space list': 'space ls', 'space link': 'space url' };

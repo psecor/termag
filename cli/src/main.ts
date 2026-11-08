@@ -14,7 +14,9 @@ import { cmdSpaceMemory } from './spaceMemory.js';
 import { cmdSpaceSync } from './spaceSync.js';
 import { HANDOFF_HANDLERS } from './handoff.js';
 import { FORWARD_HANDLERS } from './forward/command.js';
+import { PREVIEW_HANDLERS } from './preview/command.js';
 import { AUTOMATION_HANDLERS } from './automation.js';
+import { ENVIRONMENT_HANDLERS } from './environment.js';
 import { BUG_HANDLERS } from './bug.js';
 import { EVENTS_HANDLERS } from './events/command.js';
 import { AWAITED_AT_START, REPORTED_AT_START, countRequests, usageReport, usageReporter, type UsageReporter } from './usage.js';
@@ -31,12 +33,14 @@ const HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Promise<ExitCode>
   ...LIFECYCLE_HANDLERS,
   ...CONNECT_HANDLERS,
   ...FORWARD_HANDLERS,
+  ...PREVIEW_HANDLERS,
   ...ASK_HANDLERS,
   ...SPACE_HANDLERS,
   'space memory': cmdSpaceMemory,
   'space sync': cmdSpaceSync,
   ...HANDOFF_HANDLERS,
   ...AUTOMATION_HANDLERS,
+  ...ENVIRONMENT_HANDLERS,
   ...BUG_HANDLERS,
   ...EVENTS_HANDLERS,
 };

@@ -46,7 +46,7 @@ describe('renderBlock', () => {
       '  HostName termag-dev',
       '  User termag',
       '  RequestTTY yes',
-      '  RemoteCommand tmux attach-session -t alice-api-agent',
+      '  RemoteCommand tmux attach-session -t alice-api-agent \';\' set-option -w window-size latest',
       'Host termag-*',
     ]);
   });

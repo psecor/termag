@@ -306,8 +306,6 @@ export function spaceError(err: unknown, spaceName: string | null | undefined): 
       return refuse('forbidden', `You can't write to space ${space}: an automation needs editor or owner there. An owner can make you an editor with \`termag space members ${spaceName ?? '<space>'} add <your email> editor\`.`);
     case 'space_read_only':
       return refuse('forbidden', `Space ${space} is read-only, so an automation can't keep its files there. Pick another space.`);
-    case 'spaces_off':
-      return refuse('forbidden', 'Spaces are not enabled for you, so an automation can\'t live in one. Leave out --space.');
     case 'shared_outside_space':
       return refuse('forbidden', err.message);
     default:

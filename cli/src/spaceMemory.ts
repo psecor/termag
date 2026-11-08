@@ -27,9 +27,9 @@ import { SPACE_NAME_RE, api, download, listAll, listSpaces, localTarget, type Sp
  * executable. A file that looks like it holds a secret, or is over its cap,
  * is withheld (not copied, listed in the index) and never deleted. It writes
  * index.md (what an agent is told at session start) and plugin/ (the skills,
- * and only the skills, as a Claude Code plugin). The orchestrator says
- * whether memory is on (`space-memory-enabled`, GET /spaces/:space/memory);
- * off, the copy is removed.
+ * and only the skills, as a Claude Code plugin). GET /spaces/:space/memory
+ * gives the caller's role and each memory file's last writer; where the
+ * orchestrator doesn't serve it (a 404), the copy is removed.
  *
  * `context` prints the index once per session, then only a one-line notice
  * when the memory changed since the session last looked. The chat runner
@@ -447,7 +447,7 @@ async function memoryInfo(a: Api, space: string): Promise<MemoryInfo | null> {
   try {
     return await a.request<MemoryInfo>('GET', `/spaces/${encodeURIComponent(space)}/memory`);
   } catch (err) {
-    // Off for this user (space_memory_off), or an orchestrator from before space memory (a bare 404): nothing loads.
+    // An orchestrator from before space memory (a bare 404): nothing loads.
     if (err instanceof CliError && err.code === 'not_found') return null;
     throw err;
   }
@@ -483,7 +483,7 @@ export async function syncSpace(ctx: Ctx, a: Api, space: string, opts: { ifOlder
       return { kind: 'gone', space, reason: `this box no longer reaches ${space}` };
     }
     const info = await memoryInfo(a, space);
-    if (!info) { writeOff(home, space); return { kind: 'off', space, reason: 'space memory is not turned on for you' }; }
+    if (!info) { writeOff(home, space); return { kind: 'off', space, reason: 'this orchestrator does not serve space memory' }; }
 
     const listed = (await listLoadable(a, space)).map((f: TreeFile) => ({ ...f, rel: f.path.slice(ROOT.length) }));
     const { load, skipped } = planLoad(listed);
@@ -608,7 +608,7 @@ export function contextFor(home: string, space: string | null, sessionFile: stri
   if (!on || !space || !state) {
     if (session && sessionFile && !session.off) {
       writeJsonAtomic(home, sessionFile, { ...session, off: true });
-      return { kind: 'notice', space: session.space, generation: null, indexPath, notice: `Space memory of ${session.space} is no longer loaded (turned off, or this box lost access); disregard what this session was given from it.` };
+      return { kind: 'notice', space: session.space, generation: null, indexPath, notice: `Space memory of ${session.space} is no longer loaded (this box lost access, or the orchestrator stopped serving it); disregard what this session was given from it.` };
     }
     return { kind: 'off', space };
   }

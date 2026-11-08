@@ -10,7 +10,7 @@ import { awsSettings, preflight } from './aws.js';
 import { findTool, runAttached } from './process.js';
 import {
   assertNoStrayWords, buildSshArgv, inDirectory, LOGIN_SHELL, remoteCommandLine, scanSshOptions,
-  shQuote, splitAtDoubleDash,
+  shQuote, splitAtDoubleDash, tmuxAttachCommand,
 } from './sshArgs.js';
 import { installBlock, proxyCommandFor, renderBlock, sshConfigPath, sshHosts } from './sshConfig.js';
 import { FALLBACK_TERM, fallbackNotice, planTerm, sshSessionConfig, withTerminfo } from './terminfo.js';
@@ -134,7 +134,7 @@ export async function cmdAttach(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const r = await resolve(ctx, session(ctx, args), ref);
   const role = args.options.ctrl ? 'ctrl' : 'agent';
   const name = r.project!.sessions?.[role] ?? `${await r.ownerUnixUser()}-${r.project!.name}-${role}`;
-  return connect(ctx, r, { userOptions: [], remote: `tmux attach-session -t ${shQuote(name)}`, tty: true, terminal: true });
+  return connect(ctx, r, { userOptions: [], remote: tmuxAttachCommand(name), tty: true, terminal: true });
 }
 
 /**

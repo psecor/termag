@@ -8,8 +8,10 @@ import { MEMORY_COMMANDS } from './spaceMemory.js';
 import { SYNC_COMMANDS } from './spaceSync.js';
 import { HANDOFF_COMMANDS } from './handoff.js';
 import { FORWARD_COMMANDS } from './forward/command.js';
+import { PREVIEW_COMMANDS } from './preview/command.js';
 import { AUTOMATION_ALIASES, AUTOMATION_COMMANDS } from './automation.js';
 import { BUG_COMMANDS } from './bug.js';
+import { ENVIRONMENT_ALIASES, ENVIRONMENT_COMMANDS } from './environment.js';
 import { EVENTS_COMMANDS } from './events/command.js';
 
 type OptionSpec = NonNullable<ParseArgsConfig['options']>;
@@ -57,6 +59,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   ...LIFECYCLE_COMMANDS,
   ...CONNECT_COMMANDS,
   ...FORWARD_COMMANDS,
+  ...PREVIEW_COMMANDS,
   ...ASK_COMMANDS,
   ...SPACE_COMMANDS,
   ...MEMORY_COMMANDS,
@@ -64,6 +67,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   ...HANDOFF_COMMANDS,
   ...AUTOMATION_COMMANDS,
   ...BUG_COMMANDS,
+  ...ENVIRONMENT_COMMANDS,
   ...EVENTS_COMMANDS,
   update: {
     summary: 'Pull the termag checkout this CLI was installed from and reinstall it',
@@ -76,12 +80,14 @@ export const COMMANDS: Record<string, CommandSpec> = {
 const ALIASES: Record<string, string> = {
   'box ls': 'box list',
   'project ls': 'project list',
+  'preview ls': 'preview list',
   ...LIFECYCLE_ALIASES,
   ...SPACE_ALIASES,
   ...AUTOMATION_ALIASES,
+  ...ENVIRONMENT_ALIASES,
 };
 
-const GROUPS = new Set(['box', 'project', 'space', 'automation', 'bug']);
+const GROUPS = new Set(['box', 'project', 'space', 'automation', 'bug', 'environment', 'env', 'preview']);
 
 export interface ParsedArgs {
   command: string | null;
@@ -165,7 +171,7 @@ export function parseCommandLine(argv: string[]): ParsedArgs {
     if (GROUPS.has(first)) {
       if (!second) {
         if (base.help) return { ...base, command: null, args: [], options: {}, lists: {} };
-        throw usage(`\`termag ${first}\` needs a subcommand: ${subcommandsOf(first).join(', ')}`);
+        throw usage(`\`termag ${first}\` needs a subcommand: ${subcommandsOf(first === 'env' ? 'environment' : first).join(', ')}`);
       }
       command = ALIASES[`${first} ${second}`] ?? `${first} ${second}`;
       rest = positionals.slice(2);

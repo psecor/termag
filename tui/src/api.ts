@@ -1,7 +1,8 @@
 import type { CaptureResponse, Project, Role, SessionRow, Whoami } from './types.js';
 import type { PrsResponse } from './prs.js';
+import { TUI_VERSION } from './version.js';
 
-export const TUI_VERSION = '0.1.0';
+export { TUI_VERSION };
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }

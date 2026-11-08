@@ -57,7 +57,7 @@ stamp_of() {
   "$node" -e '
     const fs = require("fs"), path = require("path"), crypto = require("crypto");
     const dir = process.argv[1], h = crypto.createHash("sha256");
-    const files = ["package.json", "package-lock.json", "tsconfig.json"];
+    const files = ["package.json", "package-lock.json", "tsconfig.json", "writeVersion.mjs"];
     const walk = (rel) => {
       for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : 1)) {
         const r = path.join(rel, e.name);
@@ -78,7 +78,12 @@ lock_of() {
   "$node" -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$1/package-lock.json"
 }
 
-want_stamp=$(stamp_of "$TUI_DIR")
+# The version (src/version.ts reads dist/version.txt), from writeVersion.mjs,
+# as `npm run build` gets it: cli/buildVersion.mjs's, from git; without cli/
+# beside this checkout, package.json's plus +unknown. It is in the stamp, so a
+# commit that touches tui/ always rebuilds.
+want_version=$("$node" "$TUI_DIR/writeVersion.mjs" --print) || die "could not work out the TUI's version (writeVersion.mjs)"
+want_stamp="$(stamp_of "$TUI_DIR") $want_version"
 have_stamp=$(cat "$TUI_DIR/dist/.install-stamp" 2>/dev/null || true)
 want_lock=$(lock_of "$TUI_DIR")
 have_lock=$(cat "$TUI_DIR/node_modules/.install-lock" 2>/dev/null || true)
@@ -120,6 +125,7 @@ if [ "$build_current" = 0 ] || [ "$deps_current" = 0 ]; then
     cat "$log" >&2
     die "the build failed; the previous build (if any) is unchanged"
   fi
+  printf '%s\n' "$want_version" > "$TUI_DIR/.dist-build/version.txt"
   printf '%s\n' "$want_stamp" > "$TUI_DIR/.dist-build/.install-stamp"
   rm -rf "$TUI_DIR/dist"
   mv "$TUI_DIR/.dist-build" "$TUI_DIR/dist"

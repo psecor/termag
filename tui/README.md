@@ -84,7 +84,9 @@ renders everything; no emulation happens locally. One chord, prefix `C-\`
 The socket is retried on the browser's backoff (0, .5, 1, 2, 4, 8, 15, 30 s)
 when the box agent drops; a refused credential or a session you cannot reach
 ends the attach with the reason. Like a second browser tab, an attached TUI
-shares the tmux window size with other viewers (`window-size largest`).
+shares the tmux window with other viewers (`window-size latest`): it takes the
+size of the client used last, and the others see it clipped or padded until
+they are used.
 
 ## Live status and notifications
 
@@ -103,3 +105,11 @@ which needs `set -g allow-passthrough on` in your tmux (3.3+).
 npm test        # vitest: model, config, API client, sockets, prefix chord, notifications
 TERMAG_URL=… TERMAG_TOKEN=… npm run dev     # tsx, no build step
 ```
+
+The TUI's version, in the `termag-tui/<version>` User-Agent the orchestrator
+records for the admin Software tab, comes from git like the CLI's:
+`<major>.<minor>.<commits touching tui/>+<the latest one's sha>`, e.g.
+`0.1.18+d57cf6f2` (`cli/buildVersion.mjs`). `npm run build` and `install.sh`
+write it to `dist/version.txt`, which `src/version.ts` reads. Run from the
+sources (`npm run dev`, vitest) it is `package.json`'s version, and a build
+without `cli/` beside it or without the git history is `0.1.0+unknown`.

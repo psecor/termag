@@ -5,7 +5,7 @@ import { authedApi, session } from './commands.js';
 import type { Ctx } from './context.js';
 import { CliError, EXIT, usage, type ExitCode } from './errors.js';
 import { json, table } from './output.js';
-import { CREATE_WAIT_S, diskOption, ownBox, projectOnNewBox, startAndWait, START_WAIT_S } from './lifecycle.js';
+import { CREATE_WAIT_S, claudeModelOption, diskOption, environmentOption, ownBox, projectOnNewBox, startAndWait, START_WAIT_S } from './lifecycle.js';
 
 /**
  * `termag ask`: agent-to-agent asks. The
@@ -36,8 +36,8 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
   ask: {
     summary: "Ask another project's agent; prints its answer and a draft PR for any commits (a --thread follow-up while it works joins the running turn)",
     // A --thread follow-up while the thread's turn works goes into that turn where the box can take it ("Steering a working ask").
-    usage: 'termag ask <box>/<project>[@<workstream>][:<repo>] <prompt|-> [--title <text>] [--thread <id>] [--update-pr <n>] [--no-wait] [--no-notify] [--timeout <seconds>]\n'
-      + '       termag ask --new-box [--size small|medium|large] [--disk <GB>] [--from <box/project|template|github-url>]... <box>/<project>[:<repo>] <prompt|-> [--title <text>] [--no-wait] [--no-notify]\n'
+    usage: 'termag ask <box>/<project>[@<workstream>][:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku] [--thread <id>] [--update-pr <n>] [--no-wait] [--no-notify] [--timeout <seconds>]\n'
+      + '       termag ask --new-box [--size small|medium|large] [--disk <GB>] [--from <box/project|template|github-url>... | --environment <name>] <box>/<project>[:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku] [--no-wait] [--no-notify]\n'
       + '       termag ask --reply <message> [--no-wait] [--timeout <seconds>]\n'
       + '       termag ask --cancel <message>\n'
       + '       termag ask --inbox\n'
@@ -48,6 +48,7 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
       + "starts in that repository's checkout, or the workstream's worktree of it. --targets lists each one.",
     options: {
       title: { type: 'string' },
+      model: { type: 'string' },
       thread: { type: 'string' },
       'update-pr': { type: 'string' },
       'no-wait': { type: 'boolean' },
@@ -62,12 +63,18 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
       size: { type: 'string' },
       disk: { type: 'string' },
       from: { type: 'string', multiple: true },
+      environment: { type: 'string' },
     },
     maxArgs: 2,
     details: `--title <text>   Names the thread: what it is about, plus the PR number if any, at most ${MAX_TITLE_CHARS} characters,\n`
       + `                 e.g. ${TITLE_EXAMPLE}. termag shows the thread by this name (sidebar, tabs,\n`
       + '                 Files, chat header); an untitled thread shows as ask-<thread id>. Nothing is taken from the prompt.\n'
       + '                 With --thread it names or renames that thread, and the sidebar shows the new name at once.\n'
+      + '--model <tier>   The Claude model the turn runs on: opus, sonnet or haiku (the gateway\'s pinned Opus, Sonnet or\n'
+      + '                 Haiku). The thread keeps it: follow-ups without --model run on it too, and one with --model\n'
+      + '                 switches it from that turn on. Without it, the thread\'s model, else the box\'s default. With\n'
+      + '                 --new-box the new project starts on it too. An orchestrator or box agent too old for it runs\n'
+      + '                 the ask anyway, on its default, and says --model was ignored.\n'
       + '--update-pr <n>  The pull request to publish to: <n>, <owner>/<name>#<n> or its github.com URL. Without it, a run\n'
       + '                 whose branch builds on exactly one open pull request you opened publishes there anyway; name one\n'
       + "                 when it builds on a stack of yours, or to override. It must be open, in the project's repository\n"
@@ -77,6 +84,7 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
       + '                 (an existing one is used as it is), waits for the box, then asks. The box is sized like any\n'
       + "                 (--size, else the repositories' .termag/environment.json, the largest of them, else your default)\n"
       + "                 with a disk of --disk GB (50 to 300, else the repositories' diskGiB, else 120), is\n"
+      + '                 always with termag setup on (a repository\'s "setupEnabled": false is overridden, and said: the run needs it),\n'
       + '                 stopped when idle and never hibernated, and is recorded as made for the thread; the simple UI\n'
       + '                 shows only its asks. --timeout covers the wait for a new box too.\n'
       + '--from <src>     What the project starts from: another project (<box>/<project>), a template or a GitHub URL.\n'
@@ -84,6 +92,9 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
       + '                 those, and the ask runs in one of them, :<repo> on the target, else the first --from\'s. None is\n'
       + '                 an empty project. Each extra repository costs clone time and can raise the box size. A multi-repo\n'
       + '                 project that is already there is asked as it is, no --from needed: :<repo>, else its first.\n'
+      + '--environment <name>  Instead of --from: the project holds that environment\'s repositories,\n'
+      + '                 and the new box is sized by its definition (--size still wins). The ask runs in its first\n'
+      + '                 repository, or :<repo>.\n'
       + '--no-notify      Don\'t tell this session when the ask finishes. By default termag does, once, when nothing is\n'
       + '                 waiting on it (with --no-wait, say): a chat gets a [termag] notice as its next turn, an agent pane\n'
       + '                 has it typed in once it is idle. The notice has the state, ids, PR and publish outcome, never the reply.\n'
@@ -128,6 +139,10 @@ export interface AskMessage {
   answeredWith?: string;
   /** What became of the finish notice to the session that sent it (chat, pane, waiter, gone, …); absent from older orchestrators. */
   notice?: string | null;
+  /** The Claude tier it asked for until it starts, then the one its turn ran on; null for the box's default, absent from older orchestrators. */
+  model?: string | null;
+  /** Why the tier it asked for did not reach its turn (it ran on the box's default); absent when it did, or none was asked. */
+  modelIgnored?: string | null;
 }
 
 interface AskPr { key: string; url: string; number: number; branch: string | null }
@@ -158,6 +173,10 @@ interface AskStarted {
   replyKept?: boolean;
   /** How termag will tell this session when the ask finishes; absent when it won't (an older orchestrator, the flag off, --no-notify). */
   notify?: 'chat' | 'pane';
+  /** The --model the orchestrator took (a replay: what the message asked for or ran on, null for none); absent from orchestrators before --model. */
+  model?: string | null;
+  /** Why the turn won't run on that --model (a headless run, an older box agent). */
+  modelIgnored?: string;
 }
 
 /** The message states are A2A's TaskState names. */
@@ -211,6 +230,8 @@ export function a2aTask(m: AskMessage) {
         ...(m.supersededBy ? { supersededBy: m.supersededBy } : {}),
         ...(m.answeredWith ? { answeredWith: m.answeredWith } : {}),
         ...(m.notice ? { notice: m.notice } : {}),
+        ...(m.model ? { model: m.model } : {}),
+        ...(m.modelIgnored ? { modelIgnored: m.modelIgnored } : {}),
       },
     },
   };
@@ -223,7 +244,14 @@ function startedTask(s: AskStarted) {
     contextId: s.thread,
     status: { state: A2A_STATE[s.status] ?? 'TASK_STATE_UNSPECIFIED', timestamp: new Date().toISOString() },
     artifacts: [],
-    metadata: { termag: { target: s.target, status: s.status, hop: s.hop, hops: s.hops, branch: s.branch, ...(s.notify ? { notify: s.notify } : {}) } },
+    metadata: {
+      termag: {
+        target: s.target, status: s.status, hop: s.hop, hops: s.hops, branch: s.branch, ...(s.notify ? { notify: s.notify } : {}),
+        // As a2aTask's: the tier the turn runs on, and why an asked-for one was ignored.
+        ...(s.model && !s.modelIgnored ? { model: s.model } : {}),
+        ...(s.modelIgnored ? { modelIgnored: s.modelIgnored } : {}),
+      },
+    },
   };
 }
 
@@ -459,7 +487,8 @@ function replyState(m: AskMessage): string {
 
 /**
  * What became of a finished turn's commits: `pushed`, `none` (it answered and
- * committed nothing), `refused` or `failed`. The PR column is the thread's PR,
+ * committed nothing), `unpushed` (it committed and pushed nothing), `partial`,
+ * `refused` or `failed`. The PR column is the thread's PR,
  * so without this a follow-up that pushed nothing looks the same as one that did.
  */
 function commitsState(m: AskMessage): string {
@@ -479,8 +508,8 @@ async function cmdInbox(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (args.json) { ctx.out(json({ tasks: messages.map(a2aTask) })); return EXIT.OK; }
   if (messages.length === 0) { ctx.out('Nothing submitted, working or finished in the last day.'); return EXIT.OK; }
   ctx.out(table(
-    ['MESSAGE', 'THREAD', 'TARGET', 'STATUS', 'REPLY', 'COMMITS', 'PR', 'NOTICE', 'TITLE'],
-    messages.map(m => [m.message, m.thread, m.target, m.status, replyState(m), commitsState(m), prColumn(m), m.notice ?? '-', m.title ?? '']),
+    ['MESSAGE', 'THREAD', 'TARGET', 'STATUS', 'REPLY', 'COMMITS', 'PR', 'NOTICE', 'MODEL', 'TITLE'],
+    messages.map(m => [m.message, m.thread, m.target, m.status, replyState(m), commitsState(m), prColumn(m), m.notice ?? '-', m.model ?? '-', m.title ?? '']),
   ));
   return EXIT.OK;
 }
@@ -612,6 +641,8 @@ interface NewBoxLaunch {
   diskGiB?: number;
   /** Each --from in order: none is an empty project, two or more a multi-repo project of exactly those. */
   froms: string[];
+  /** --environment: the project holds that environment's repositories instead. */
+  environment?: string;
 }
 
 /** --new-box and what goes with it, checked before anything is asked of the orchestrator; null without --new-box. */
@@ -619,7 +650,9 @@ function newBoxOptions(args: ParsedArgs, target: string): NewBoxLaunch | null {
   const rawSize = args.options.size;
   const rawFroms = args.lists.from ?? (args.options.from !== undefined ? [args.options.from] : []);
   if (args.options['new-box'] !== true) {
-    if (rawSize !== undefined || args.options.disk !== undefined || rawFroms.length) throw usage('--size, --disk and --from go with --new-box, which makes the box and the project');
+    if (rawSize !== undefined || args.options.disk !== undefined || rawFroms.length || args.options.environment !== undefined) {
+      throw usage('--size, --disk, --from and --environment go with --new-box, which makes the box and the project');
+    }
     return null;
   }
   if (args.options.thread !== undefined) throw usage('--new-box starts a thread; a --thread follow-up goes to the box its thread is on');
@@ -637,7 +670,9 @@ function newBoxOptions(args: ParsedArgs, target: string): NewBoxLaunch | null {
   const diskGiB = diskOption(args);
   const froms = rawFroms.map(f => (typeof f === 'string' ? f.trim() : ''));
   if (froms.some(f => !f)) throw usage('--from takes another project (<box>/<project>), a template name or a GitHub repository URL');
-  return { box, project, ...(repo ? { repo } : {}), size, diskGiB, froms };
+  const environment = environmentOption(args);
+  if (environment && froms.length) throw usage('--environment names the repositories itself; leave out --from');
+  return { box, project, ...(repo ? { repo } : {}), size, diskGiB, froms, ...(environment ? { environment } : {}) };
 }
 
 /**
@@ -649,11 +684,15 @@ function newBoxOptions(args: ParsedArgs, target: string): NewBoxLaunch | null {
  * `madeBox` is true when this call made the box, so the thread records it as
  * its own; `repos` a new multi-repo project's checkouts, in --from order.
  */
-async function makeAskBox(ctx: Ctx, api: Api, target: string, launch: NewBoxLaunch, args: ParsedArgs): Promise<{ madeBox: boolean; repos: string[] }> {
+async function makeAskBox(ctx: Ctx, api: Api, target: string, launch: NewBoxLaunch, args: ParsedArgs, model: string | null): Promise<{ madeBox: boolean; repos: string[] }> {
   const from = launch.froms.length > 1 ? launch.froms : launch.froms[0];
-  const made = await projectOnNewBox(ctx, api, launch, { name: launch.project, agent: 'claude', from, forAsk: true }, {
-    size: launch.size, diskGiB: launch.diskGiB, ifNotExists: true, timeoutS: timeoutSeconds(args) ?? CREATE_WAIT_S, quiet: args.json, startParked: true,
-    retry: `termag ask --new-box${launch.froms.map(f => ` --from ${f}`).join('')} ${target} -`,
+  // An ask runs its checkouts without asking: a new project from an environment is pinned to them (ensureProject).
+  // Always with termag setup on: a box with it off answers an ask 409 setup_disabled,
+  // since the run needs the Claude credentials setup delivers, so a repository's "setupEnabled": false
+  // is overridden here, and said so.
+  const made = await projectOnNewBox(ctx, api, launch, { name: launch.project, agent: 'claude', from, environment: launch.environment, forAsk: true, ...(model ? { model } : {}) }, {
+    size: launch.size, diskGiB: launch.diskGiB, setupEnabled: true, setupOverride: `an ask needs termag setup, so ${launch.box} has it on`, ifNotExists: true, timeoutS: timeoutSeconds(args) ?? CREATE_WAIT_S, quiet: args.json, startParked: true,
+    retry: `termag ask --new-box${launch.froms.map(f => ` --from ${f}`).join('')}${launch.environment ? ` --environment ${launch.environment}` : ''} ${target} -`,
   });
   return { madeBox: made.boxCreated, repos: (made.result.repos ?? []).map(r => r.name) };
 }
@@ -675,6 +714,9 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const reply = args.options.reply;
   const cancel = args.options.cancel;
   const find = args.options.find;
+  if (args.options.model !== undefined && (args.options.inbox === true || args.options.targets === true || find !== undefined || cancel !== undefined || reply !== undefined)) {
+    throw usage('--model goes with an ask: termag ask <box>/<project> <prompt|-> --model opus|sonnet|haiku');
+  }
   if (args.options.inbox === true) {
     if (args.args.length || reply !== undefined || cancel !== undefined || args.options.targets === true || find !== undefined) throw usage('--inbox takes no other arguments');
     return cmdInbox(ctx, args);
@@ -697,6 +739,8 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
     if (args.args.length || typeof reply !== 'string' || !ID_RE.test(reply)) throw usage('Usage: termag ask --reply <message>');
     const api = await authedApi(ctx, s, { timeoutMs: REQUEST_TIMEOUT_MS });
     const m = await waitForMessage(ctx, api, reply, args);
+    // The message's own --model, answered together or not (the orchestrator's answeredTogether keeps it).
+    if (m.modelIgnored) ctx.err(`termag: warning: its --model was ignored: ${m.modelIgnored}`);
     if (args.json) ctx.out(json(a2aTask(m)));
     else printMessage(ctx, m);
     return exitFor(m);
@@ -718,17 +762,19 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const rawPr = args.options['update-pr'];
   const pr = typeof rawPr === 'string' ? rawPr.trim() : undefined;
   if (rawPr !== undefined && !(pr && PR_RE.test(pr))) throw usage('--update-pr takes a pull request: <n>, <owner>/<name>#<n> or its github.com URL');
+  const model = claudeModelOption(args);
   const prompt = await readPrompt(ctx, rawPrompt);
   if (!prompt.trim()) throw usage('The prompt is empty');
 
   const api = await authedApi(ctx, s, { timeoutMs: REQUEST_TIMEOUT_MS });
-  const made = launch ? await makeAskBox(ctx, api, target, launch, args) : { madeBox: false, repos: [] };
+  const made = launch ? await makeAskBox(ctx, api, target, launch, args, model) : { madeBox: false, repos: [] };
   const madeBox = made.madeBox;
   let askAt = target;
   const pickRepo = !!launch && !launch.repo;
   const firstRepo = (repo: string) => {
     askAt = withRepo(target, repo);
-    const which = launch && launch.froms.length > 1 ? "the first --from's checkout" : "the project's first repository";
+    const which = launch?.environment ? "the environment's first repository"
+      : launch && launch.froms.length > 1 ? "the first --from's checkout" : "the project's first repository";
     if (!args.json) ctx.err(`termag: asking ${askAt}, ${which}; name another as ${target.split(':')[0]}:<repo>`);
   };
   if (pickRepo && made.repos[0]) firstRepo(made.repos[0]);
@@ -736,7 +782,7 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const sender = await askSender(ctx);
   const body = {
     target: askAt, prompt, messageId: id, ...(thread ? { threadId: thread } : {}), ...(title ? { title } : {}), ...(sender ? { sender } : {}),
-    ...(pr ? { pr } : {}), ...(madeBox ? { newBox: true } : {}),
+    ...(pr ? { pr } : {}), ...(madeBox ? { newBox: true } : {}), ...(model ? { model } : {}),
     ...(args.options['no-notify'] === true ? { notify: false } : {}),
   };
 
@@ -768,6 +814,9 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   } else if (!args.json && started.queuedBehind) {
     ctx.err(`termag: ${started.queuedBehind} is still working and its turn can't take this follow-up${started.steerRefused ? ` (${started.steerRefused})` : ''}; it is queued as the next turn on the thread, with a reply of its own`);
   }
+  // An older orchestrator drops --model, and an older box agent can't take it: the ask still runs, on the default.
+  if (model && started.model === undefined) ctx.err(`termag: warning: --model ${model} was ignored: the orchestrator predates it; the ask runs on the thread's model, else the box's default`);
+  else if (model && started.modelIgnored) ctx.err(`termag: warning: --model ${model} was ignored: ${started.modelIgnored}`);
   if (!args.json && started.targetPr) ctx.err(`termag: the thread publishes to PR #${started.targetPr} (${started.branch})${pr ? '' : ', as it remembers'}`);
   // A new thread with no name shows as its id: say once how to name it. Only a tip, never an error.
   if (!thread && !title && !args.json) ctx.err(`termag: tip: name this thread with --title "<short, specific name>", e.g. ${TITLE_EXAMPLE}; untitled, it shows as ask-<thread id>`);
@@ -794,6 +843,8 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   // Said before the first poll, so whoever reads stderr has the ids even if this process dies.
   if (!args.json) ctx.err(`termag: waiting for ${started.target} (message ${started.message}, thread ${started.thread})…`);
   const m = await waitForMessage(ctx, api, started.message, args, !args.json);
+  // A queued ask (a parked box, a clone, a turn before it) learns only when it starts that its --model was ignored.
+  if (model && !started.modelIgnored && m.modelIgnored) ctx.err(`termag: warning: --model ${model} was ignored: ${m.modelIgnored}`);
   if (args.json) ctx.out(json(a2aTask(m)));
   else printMessage(ctx, m);
   return exitFor(m);
