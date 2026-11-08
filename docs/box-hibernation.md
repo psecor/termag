@@ -4,19 +4,18 @@ Nothing hibernates a box any more: parking is a stop, the box menu has no **Hibe
 
 ## What has to line up
 
-Hibernation is decided once, at `RunInstances`. EC2 does not accept `HibernationOptions` on an existing instance, so a box launched without it keeps plain Stop until it is replaced. `boxProvisioner.planHibernation` configures it only when all three of these hold:
+Hibernation is decided once, at `RunInstances`. EC2 does not accept `HibernationOptions` on an existing instance, so a box launched without it keeps plain Stop until it is replaced. `boxProvisioner.planHibernation` configures it only when both of these hold:
 
 | Condition | Where it comes from |
 |---|---|
-| Hibernation is allowed for the image the box launches from | the published image: the `box-hibernation-enabled` feature flag (boolean, default off; see below). An image the owner's `box-image` flag chose: always (the flag is the opt-in) |
 | That image is tagged `Hibernation=supported` | `packer/box.pkr.hcl` `var.hibernation` → `scripts/enable-hibernation.sh` |
 | `DescribeInstanceTypes` says the type supports hibernation | M8g, M9g and T4g all do |
 
 Which image a box launches from is the owner's `box-image` string feature flag (`services/boxImage.ts`): empty is the newest published `Component=box` image; `ami-…` pins one; any other value is a channel, the newest image tagged `Channel=<value>`. A pin or channel must be a self-owned, available image tagged `App=termag` with `Component` `box` or `box-candidate`. Otherwise the box gets the published image, a warning is logged, and `Instance.imageSource` says `fallback:<what was asked>`. A flagged user never claims a warm-pool box, since pool boxes and the pool spec hash always use the published image. The box update target for a flagged box is its image's `TermagSha`. The box list badges a non-published image and its tooltip shows the AMI id; the admin Fleet detail has an `image` row.
 
-`box-hibernation-enabled` (`services/boxHibernationFlag.ts`) is read two ways. The warm pool evaluates it once per spec for a fixed context (`kind: box`, key `termag-warm-pool`), which no per-user targeting matches, so the pool follows the flag's default value. Its value goes into the pool spec hash whenever the published image is tagged `Hibernation=supported`, so flipping the fallthrough rolls the pool onto boxes launched with the new value. A user's own box evaluates it for the owner (`routes/instances.ts`), read once beside `box-image` so the claim and the launch agree. A user whose value differs from the pool's (with per-user targeting) never claims a warm box and gets a fresh launch with their own value, the same way a `box-image` user does. With `TERMAG_FLAGS` not setting it, every read is `false`.
+The `box-hibernation-enabled` release flag that once gated the published image has been removed: every launch, the warm pool's included, asks for hibernation, and the pool spec hash carries it whenever the published image is tagged `Hibernation=supported`.
 
-When all three hold, the root volume grows by the type's RAM size (120 → 152 GB on a 32 GiB m9g.2xlarge), because hibinit-agent refuses unless the root has that much free space. `Instance.hibernationConfigured` records the outcome. If EC2 rejects the hibernation launch, the box launches without it rather than failing.
+When both hold, the root volume grows by the type's RAM size (120 → 152 GB on a 32 GiB m9g.2xlarge), because hibinit-agent refuses unless the root has that much free space. `Instance.hibernationConfigured` records the outcome. If EC2 rejects the hibernation launch, the box launches without it rather than failing.
 
 The bake installs `ec2-hibinit-agent` and adds `nokaslr` (AWS's guidance for Ubuntu). It also checks `CONFIG_HIBERNATION=y` on the newest kernel and deletes anything the agent left on the builder.
 
@@ -43,7 +42,7 @@ EC2 doesn't support keeping an instance hibernated for longer than 60 days. Once
 
 ## Rolling it out
 
-Nothing here needs AWS access by hand: the orchestrator's own role launches, hibernates and resumes the test box.
+Nothing here needs AWS access by hand: the orchestrator's own role launches, hibernates and resumes the test box. These are the steps it was rolled out by; `box-hibernation-enabled` has since been removed.
 
 1. Bake a candidate on a channel from main: Publish AMI → target `box`, `hibernation` ticked, `publish` off, `channel` `hibernation`. This makes a `Component=box-candidate` tagged `Hibernation=supported`, `Channel=hibernation` and `Retain=true`. The job summary shows the AMI id.
 2. Set the `box-image` flag to `hibernation` for the tester only (an individual target on their user context). Everyone else stays on the published image.

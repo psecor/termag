@@ -74,6 +74,7 @@ termag/
 │   ├── agents/                     What this file indexes: domain model, data and schema, configuration,
 │   │                               observability, integration surfaces, gotchas (each in full)
 │   ├── box-provisioning.md         Design doc for orchestrator-driven box provisioning
+│   ├── environment.schema.json     JSON Schema of an environment definition (.termag/environment.json)
 │   ├── hosted-apps.md              How to host extra apps on ALB suburls via the nginx gateway
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
@@ -218,7 +219,7 @@ A PR's demo video, captioned: `scripts/demo-kit/demo-kit.mjs`.
 
 ## Observability & Maintenance
 
-Where logs live, how to tail them, health checks and routine operations: [docs/agents/observability.md](docs/agents/observability.md). The product-event list is there; `box.resumed` is the stop and hibernate resume sample.
+Where logs live, how to tail them, health checks and routine operations: [docs/agents/observability.md](docs/agents/observability.md). The product-event list is there; `box.resumed` is the stop and hibernate resume sample. So are the orchestrator's server traces and how to find one ("Server traces").
 
 ## Integration Surfaces
 
@@ -246,6 +247,7 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [auth-local-mode](docs/agents/gotchas.md#auth-local-mode): `AUTH_MODE=local` is the only sign-in bypass, and it is loopback-only
 - [auth-okta-login-on-gesture](docs/agents/gotchas.md#auth-okta-login-on-gesture): A tab never starts the Okta login by itself; only a click or key press does
 - [auth-routes-source-of-truth](docs/agents/gotchas.md#auth-routes-source-of-truth): `routes/auth.ts` is the source of truth for sign-in modes
+- [auth-session-cookie-host-prefix](docs/agents/gotchas.md#auth-session-cookie-host-prefix): Every cookie termag sets is `__Host-`, and only termag's paths receive the session cookie
 - [automation-run-is-chat-turn](docs/agents/gotchas.md#automation-run-is-chat-turn): An automation run is a chat-runner turn, and only the relay or the timeout sweep may finish it
 - [box-auto-update](docs/agents/gotchas.md#box-auto-update): A stale box is asked to update by the orchestrator, behind `box-auto-update-enabled`, and "current" means the newest box AMI's commit
 - [box-claim-update](docs/agents/gotchas.md#box-claim-update): A box claimed from the warm pool is updated to the orchestrator's commit before its first launch, and every launch path waits for it
@@ -256,6 +258,7 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [box-quarantine-held-by-status](docs/agents/gotchas.md#box-quarantine-held-by-status): A quarantined box is held by its status: every path that starts, terminates or reconnects a box must refuse `quarantined`
 - [box-repo-environment-file](docs/agents/gotchas.md#box-repo-environment-file): A box's default size comes from the repository's own `.termag/environment.json`, which is not a space's `.termag/`
 - [box-resize-hibernation-pool](docs/agents/gotchas.md#box-resize-hibernation-pool): A resize stops a hibernated box plainly first, and a resized box may lose hibernation and its pool spec
+- [box-setup-off-core-only](docs/agents/gotchas.md#box-setup-off-core-only): Every `termag-reconcile` item is `core` or `feature`, and a box with termag setup off gets core only
 - [box-sg-ascii](docs/agents/gotchas.md#box-sg-ascii): EC2 security-group descriptions must be ASCII
 - [box-xclip-shim](docs/agents/gotchas.md#box-xclip-shim): `~/.local/bin/xclip` is a termag shim, not X11 xclip
 - [briefing-on-owner-box](docs/agents/gotchas.md#briefing-on-owner-box): The daily briefing runs on the owner's box, never on the orchestrator, and is opt-in
@@ -277,7 +280,9 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [git-marks-prs-and-commits](docs/agents/gotchas.md#git-marks-prs-and-commits): A PR or commit made on a box is marked as termag's, and authorship is never touched
 - [github-broker-ghes-meta](docs/agents/gotchas.md#github-broker-ghes-meta): To `gh`, the GitHub broker is a GitHub Enterprise Server, so the gateway answers its version probe
 - [o11y-agent-resource-attributes](docs/agents/gotchas.md#o11y-agent-resource-attributes): Every agent telemetry resource carries the same four attributes
+- [o11y-server-tracing](docs/agents/gotchas.md#o11y-server-tracing): Server tracing loads second in `index.ts`, and work outside a request starts its own trace with `rootSpan`
 - [pane-alt-screen-no-history](docs/agents/gotchas.md#pane-alt-screen-no-history): Agent panes run their TUI on tmux's alternate screen — capture has no history there
+- [preview-host-never-termag](docs/agents/gotchas.md#preview-host-never-termag): A preview host's request never reaches termag: its dispatch is the first middleware and never calls `next()`
 - [project-dir-symlinks](docs/agents/gotchas.md#project-dir-symlinks): Project working dirs may be symlinks
 - [project-initial-commit](docs/agents/gotchas.md#project-initial-commit): New projects get a repo and an initial commit automatically, and the helper that does it lives in two files
 - [project-list-order](docs/agents/gotchas.md#project-list-order): Project-list ordering is `pinned DESC, lastActiveAt DESC`
@@ -307,6 +312,7 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [test-fake-timers-fake-intl](docs/agents/gotchas.md#test-fake-timers-fake-intl): `vi.useFakeTimers()` fakes `Intl` too, so a timezone spy does nothing under it
 - [test-root-only-cases](docs/agents/gotchas.md#test-root-only-cases): A test case that needs a file you don't own runs only as root
 - [tmux-argv-not-shell-string](docs/agents/gotchas.md#tmux-argv-not-shell-string): Never build a shell string to type text into tmux — spawn `tmux` with an argv array
+- [ui-daily-theme-days](docs/agents/gotchas.md#ui-daily-theme-days): A day's theme is CSS and code from an agent: its sprite runs only in the sandboxed frame, and a person reviews each day
 - [ui-theme-settings-two-modules](docs/agents/gotchas.md#ui-theme-settings-two-modules): Theme settings are a JSON column validated by a module that exists twice
 - [ui-thermometer-scale](docs/agents/gotchas.md#ui-thermometer-scale): Thermometers use an absolute 8h scale, not p50-relative
 - [ui-whats-new-entries](docs/agents/gotchas.md#ui-whats-new-entries): A change people will notice adds or edits its What's new entry, in the PR that makes it live

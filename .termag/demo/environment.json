@@ -1,0 +1,12 @@
+{
+  "$schema": "https://github.com/example-org/termag/blob/main/docs/environment.schema.json",
+  "resources": { "vcpu": 2, "memoryGiB": 8, "diskGiB": 50 },
+  "setup": "npm --prefix backend ci --no-audit --no-fund && npm --prefix frontend ci --no-audit --no-fund && npm --prefix agent ci --no-audit --no-fund && npm --prefix backend run db:generate && npm --prefix backend run build",
+  "run": "bash scripts/e2e/down.sh && make e2e-up E2E_FAKE_GITHUB=1 E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_CREDENTIAL_STORE=1 E2E_FAKE_CLAUDE=1 E2E_CLAUDE_SIGNED_IN=1 E2E_FLAGS='{\"simple-ui-chrome-refresh-enabled\":true,\"simple-ui-reviews-enabled\":true}'",
+  "seed": "if [ -f scripts/e2e/scenes/review-queue.sh ]; then bash scripts/e2e/scenes/review-queue.sh; else echo 'no scripts/e2e/scenes/review-queue.sh in this checkout: the demo has the seed make e2e-up does'; fi",
+  "stop": "make e2e-down",
+  "ports": [
+    { "name": "frontend", "port": 5174, "health": "/termag/" },
+    { "name": "backend", "port": 3040, "health": "/termag/health" }
+  ]
+}

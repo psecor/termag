@@ -98,7 +98,7 @@ consumers are contract, not dev bench: `tmux` (agent-created panes), `gh`
 (projects run their compose stacks in panes; the engine + buildx + compose
 + the shared-services ECR credential helper — images pull per project, the
 pre-pulled set stays out), and the **agent CLIs** with the full bake's shapes
-(@anthropic-ai/claude-code, @openai/codex, pi@1.0.2 pinned --ignore-scripts,
+(@anthropic-ai/claude-code, @openai/codex, pi at deploy/termag-pi-update's newest pin, checked and installed --ignore-scripts,
 cursor-agent, devin). build-essential + python3 are there for the agent's
 node-pty compile. The deploy/ units, the TERMAG_BOX marker and the
 guest-browser wiring land through the same `box-lib.sh` helpers the full
@@ -226,6 +226,20 @@ tick, for terminated ec2 rows without it once `BOX_TEARDOWN_RETRY_SECONDS`
 (`cleanupAttemptedAt`, stamped through a guarded update so one row is never
 torn down twice at once).
 
+A launch that fails before `RunInstances` returns an instance (the IAM role
+quota, an EC2 refusal on every type, a restart) leaves a `failed` row with an
+SG, a role and an instance profile and no `ec2InstanceId`. Nothing reuses
+them: Retry launches a new box under a new id, and a failed warm-pool row is
+never claimed or retired. So the provisioning sweep also releases them
+(`sweepFailedLaunches`, `failedLaunchLeftoversWhere`): once the row is an
+hour old (past the stuck sweep failing a row whose launch is still waiting on
+AWS), and its launch is not still running in this process, it deletes the SG (and its :3040 rule) and
+the role, profile and policies, keeps the row `failed`, and stamps
+`cleanedUpAt`. It skips, for an operator, a row whose name EC2 has a live
+instance under (a `RunInstances` whose answer was lost). Without this every
+such failure leaked one IAM role, until the account's 1,000-role quota
+refused every new box (bug cmw5gbyesd917a4iv6vrk3yag).
+
 **Cloud-init port:** copy from `terraform/box/cloudinit.sh.tftpl`, **not** from
 packer's comment. The baked `termag-agent.service` runs
 `agent.js <home>/src/termag/agent/agent.config.json` (argv), so the config must
@@ -298,7 +312,7 @@ are its fallbacks) replace a row. A non-arm64 name is dropped with a warning.
   cold, unless EC2's first match for them is a preset's type (4 vCPU and 16 GiB
   is `m8g.xlarge`, so medium). Pool entries for common repository requirements
   are a possible follow-up.
-- **A failed box's Retry** relaunches at the failed box's size.
+- **A failed box's Retry** relaunches at the failed box's size. A box sized by requirements (`4vcpu-32gib`) is matched again; if EC2 can't match them now, it relaunches at the smallest preset that covers them (`boxSize.coveringPreset`), never smaller than the box it replaces.
 - **An existing box is resized** from termag itself: Resizing a box, below.
 
 ### Disk size (`backend/src/services/boxDiskSize.ts`)
@@ -321,7 +335,18 @@ included.
   but never under the image's own snapshot, which EC2 refuses: the box AMI is
   120 GB today (`packer/box.pkr.hcl`), so anything from 50 to 119 launches at
   120. Hibernation's swap file still goes on top (`planHibernation`): 200 GB on
-  a 32 GiB type is a 232 GB volume.
+  a 32 GiB type is a 232 GB volume (so `lsblk` on a 50 GB-asked small box shows
+  128: the 120 floor plus 8 GiB of RAM).
+- **Raised at create, and said.** The create applies the image's floor itself
+  when it knows it (`services/boxImageFloor.ts`: the last snapshot size
+  `discoverLatestAmi` saw for the published or the minimal image; a pinned or
+  channel `box-image` is only known at launch), so the row, the warm-pool check
+  and the 201 already have the disk the box gets. The 201 (`POST /api/instances`
+  and the CLI's `POST /boxes`) carries `disk: { requestedGiB, diskGiB, raised,
+  floorKnown }` for a disk asked for, or one raised. The CLI prints
+  `termag: --disk 50 is below the image's 120 GB minimum; using 120 GB` from it,
+  or, with the floor not known yet, from what the box got once `--wait` sees it
+  running (without `--wait`: that the launch may raise it).
 - **Recorded** on `Instance.diskGiB`: at create, then at launch with what the
   box got (the image's floor applied, hibernation's RAM not counted). Shown in
   the Boxes list (in the size badge's tooltip: the list is too narrow for a
@@ -345,10 +370,189 @@ included.
   launching a new box, a few minutes; the ready ones have 120 GB."), and the
   full UI's "ready now" turns into "a few minutes".
 - **A failed box's Retry** relaunches with the failed box's disk.
-- **After creation** a disk only grows, through the admin Fleet tab's Grow
-  disk (#791, `services/boxDisk.ts`), which works on the whole volume and
-  doesn't update `Instance.diskGiB`. EBS volumes never shrink, and there is
-  no owner-facing resize.
+- **After creation** a disk only grows: the owner from the Resize box
+  dialogs or `termag box resize --disk` (Growing a box's disk, under Resizing
+  a box below), an admin from the Fleet tab's Grow disk (#791). Both go
+  through `services/boxDisk.ts` on the whole volume, and a finished grow
+  records the new size on `Instance.diskGiB`. EBS volumes never shrink.
+
+### Root volume initialization (`backend/src/services/boxVolumeInitRate.ts`)
+
+A box's root volume is created from the image's snapshot, and without help EBS
+loads each block from S3 on its first read. On a fresh warm-pool box that was
+2.5–76 ms a read, a `find` over webapp's `node_modules` took 87.5 s against
+19.8 s once hydrated, and three stages of a cold `make dev` were disk-bound.
+
+- **The flag.** `box-volume-initialization-rate` (number, MiB/s, fallback 0 =
+  off) is read for the fixed pool context on every launch, pool or cold. When
+  it is above 0, `runInstanceOnce` sets `VolumeInitializationRate` on the root
+  device, clamped to EBS's 100–300, and EBS copies the whole snapshot in at that
+  rate. About 96 GiB of snapshot data takes about 8 minutes at 200 and 5.5 at 300.
+  It is not part of the pool spec hash: warm boxes launched before the change
+  are replaced at the next publish's roll.
+- **Fast snapshot restore.** `publish-ami.yml` enables FSR on each new box
+  snapshot in one zone (`BOX_FAST_SNAPSHOT_RESTORE_AZ`, the first box subnet),
+  but launches rotate across every private subnet (#812), so most boxes land
+  in a zone without it. Each new snapshot's FSR credit bucket also starts
+  empty, and fills at about 8.5 volumes an hour for a 120 GiB snapshot, just
+  as the pool relaunches on the new image. Where FSR and a rate both apply,
+  EBS uses the rate. Once the rate is on everywhere, FSR is cost with no
+  effect: unset the repo Variable to turn it off.
+- **Refusals.** EBS fails RunInstances when it can't serve the rate
+  (capacity, or the regional limit of 5,000 MiB/s across concurrent
+  initializations). `runInstance` then launches once more without the rate
+  and logs a warning.
+- **What a launch records.** The `[BOX] <name>: launched … in <zone>, root
+  volume init rate <n> MiB/s|off` log line, and a `termag.box.launch` span with
+  `termag.box.availability_zone`, `termag.box.subnet_id`,
+  `termag.box.instance_type` and `termag.box.volume_init_rate` (0 = none).
+- **Cost.** Billed once per launch on the snapshot's data size, not on the
+  volume: in us-east-2, $0.0024/GB at 100–200 MiB/s and $0.0036/GB at
+  201–300. That is about $0.23 or $0.35 a launch.
+
+### Root volume throughput and IOPS (`backend/src/services/boxVolumePerformance.ts`)
+
+A gp3 volume comes with 125 MiB/s and 3,000 IOPS. After a Go edit that shifts
+lines in a widely imported webapp package, the Bazel build writes 3.55 GB
+of archives plus a second copy into the disk cache, and the link then reads
+6.6 GB. On a large box at that baseline the link took 30–211 s, against 9–10 s
+warm, with writes near 100 MB/s.
+
+- **The flag.** `box-root-volume-performance` (JSON, fallback `null` = off),
+  `{ "throughput": <MiB/s>, "iops": <n> }`, read for the fixed pool context on
+  every launch, pool or cold. It is one flag because the two values are one
+  setting: gp3 allows at most 0.25 MiB/s per IOPS, so they change together. A
+  field that is missing, not a number, or at or below the baseline stays at the
+  baseline; a value with neither field above the baseline is off. Each field is
+  clamped to 125–1000 MiB/s and 3,000–16,000 IOPS. Then, per launch, IOPS is
+  capped at 500 per GiB of the volume, and throughput at 0.25 MiB/s per IOPS
+  (the free 3,000 IOPS when none is asked for, so 750 MiB/s at most). Throughput
+  is lowered to fit, never IOPS raised. It is not part of the pool spec hash.
+- **Where it goes.** `rootEbs` in `boxProvisioner.ts` builds the root device's
+  `Ebs` block, with this and `box-volume-initialization-rate` side by side, for
+  the plain and the hibernation-sized volume alike.
+- **Refusals.** If RunInstances fails naming throughput or IOPS, `runInstance`
+  launches once more at the baseline and logs a warning. A refused
+  initialization rate is dropped first, separately, and the values are kept.
+- **What a launch records.** The `[BOX] <name>: launched …` line ends with
+  `, <n> MiB/s and <n> IOPS`, plus ` (gp3 baseline)` when nothing was set.
+  The `termag.box.launch` span has `termag.box.volume_throughput` and
+  `termag.box.volume_iops`: what the volume got, 125 and 3,000 when off.
+- **What the instance can use.** EBS bandwidth per instance (AWS's instance
+  type specs, 128 KiB I/O) is: m7g/m8g.large 78.75 MB/s baseline, 1,250 MB/s
+  burst; m7g/m8g.xlarge 156.25 / 1,250; m7g/m8g.2xlarge 312.5 / 1,250;
+  m9g.2xlarge 375 / 1,500; m7g/m8g.4xlarge 625 / 1,250. Throughput above an
+  instance's baseline is reached only while its EBS burst lasts. On a small box,
+  anything above 125 MiB/s is mostly unused.
+- **Recommended.** `{ "throughput": 500, "iops": 4000 }`: above the large
+  types' 312–375 MB/s baseline, so a cascade's write-then-link burst runs at the
+  instance's burst rate, with enough IOPS for 500 MiB/s at 128 KiB I/O.
+  1000 MiB/s would only help during bursts, at twice the throughput price.
+- **Cost.** Billed per volume-month while the volume exists, stopped and
+  hibernated boxes included. List price in us-east-2 is $0.04 per MiB/s-month
+  above 125 and $0.005 per IOPS-month above 3,000, so the recommended values
+  cost $20 a box-month (about $16 at the bill's gp3 discount). The box cost
+  meter does not see this charge yet.
+- **Other paths keep it.** Growing the root disk (`boxDisk.ts`, `ModifyVolume`
+  with only `Size`), resizing (`boxResize.ts`) and starting on a fallback type
+  (`boxStartFallback.ts`, both `ModifyInstanceAttribute`), and quarantine
+  (stop and snapshot) leave the volume's throughput and IOPS as they are. A
+  launch that falls back to another type or subnet sends the same values.
+  Resizing to a smaller type keeps paying for throughput the new type can't
+  reach.
+- **Existing boxes.** They keep what they launched with. `ModifyVolume` with
+  `Iops`/`Throughput` would raise them in place, with no stop, but nothing does
+  that. It would count as the volume's one modification per six hours, so a
+  disk grow right after would be refused.
+
+### Root volume initialization (`backend/src/services/boxVolumeInitRate.ts`)
+
+A box's root volume is created from the image's snapshot, and without help EBS
+loads each block from S3 on its first read. On a fresh warm-pool box that was
+2.5–76 ms a read, a `find` over webapp's `node_modules` took 87.5 s against
+19.8 s once hydrated, and three stages of a cold `make dev` were disk-bound.
+
+- **The flag.** `box-volume-initialization-rate` (number, MiB/s, fallback 0 =
+  off) is read for the fixed pool context on every launch, pool or cold. When
+  it is above 0, `runInstanceOnce` sets `VolumeInitializationRate` on the root
+  device, clamped to EBS's 100–300, and EBS copies the whole snapshot in at that
+  rate. About 96 GiB of snapshot data takes about 8 minutes at 200 and 5.5 at 300.
+  It is not part of the pool spec hash: warm boxes launched before the change
+  are replaced at the next publish's roll.
+- **Fast snapshot restore.** `publish-ami.yml` enables FSR on each new box
+  snapshot in one zone (`BOX_FAST_SNAPSHOT_RESTORE_AZ`, the first box subnet),
+  but launches rotate across every private subnet (#812), so most boxes land
+  in a zone without it. Each new snapshot's FSR credit bucket also starts
+  empty, and fills at about 8.5 volumes an hour for a 120 GiB snapshot, just
+  as the pool relaunches on the new image. Where FSR and a rate both apply,
+  EBS uses the rate. Once the rate is on everywhere, FSR is cost with no
+  effect: unset the repo Variable to turn it off.
+- **Refusals.** EBS fails RunInstances when it can't serve the rate
+  (capacity, or the regional limit of 5,000 MiB/s across concurrent
+  initializations). `runInstance` then launches once more without the rate
+  and logs a warning.
+- **What a launch records.** The `[BOX] <name>: launched … in <zone>, root
+  volume init rate <n> MiB/s|off` log line, and a `termag.box.launch` span with
+  `termag.box.availability_zone`, `termag.box.subnet_id`,
+  `termag.box.instance_type` and `termag.box.volume_init_rate` (0 = none).
+- **Cost.** Billed once per launch on the snapshot's data size, not on the
+  volume: in us-east-2, $0.0024/GB at 100–200 MiB/s and $0.0036/GB at
+  201–300. That is about $0.23 or $0.35 a launch.
+
+### Root volume throughput and IOPS (`backend/src/services/boxVolumePerformance.ts`)
+
+A gp3 volume comes with 125 MiB/s and 3,000 IOPS. After a Go edit that shifts
+lines in a widely imported webapp package, the Bazel build writes 3.55 GB
+of archives plus a second copy into the disk cache, and the link then reads
+6.6 GB. On a large box at that baseline the link took 30–211 s, against 9–10 s
+warm, with writes near 100 MB/s.
+
+- **The flag.** `box-root-volume-performance` (JSON, fallback `null` = off),
+  `{ "throughput": <MiB/s>, "iops": <n> }`, read for the fixed pool context on
+  every launch, pool or cold. It is one flag because the two values are one
+  setting: gp3 allows at most 0.25 MiB/s per IOPS, so they change together. A
+  field that is missing, not a number, or at or below the baseline stays at the
+  baseline; a value with neither field above the baseline is off. Each field is
+  clamped to 125–1000 MiB/s and 3,000–16,000 IOPS. Then, per launch, IOPS is
+  capped at 500 per GiB of the volume, and throughput at 0.25 MiB/s per IOPS
+  (the free 3,000 IOPS when none is asked for, so 750 MiB/s at most). Throughput
+  is lowered to fit, never IOPS raised. It is not part of the pool spec hash.
+- **Where it goes.** `rootEbs` in `boxProvisioner.ts` builds the root device's
+  `Ebs` block, with this and `box-volume-initialization-rate` side by side, for
+  the plain and the hibernation-sized volume alike.
+- **Refusals.** If RunInstances fails naming throughput or IOPS, `runInstance`
+  launches once more at the baseline and logs a warning. A refused
+  initialization rate is dropped first, separately, and the values are kept.
+- **What a launch records.** The `[BOX] <name>: launched …` line ends with
+  `, <n> MiB/s and <n> IOPS`, plus ` (gp3 baseline)` when nothing was set.
+  The `termag.box.launch` span has `termag.box.volume_throughput` and
+  `termag.box.volume_iops`: what the volume got, 125 and 3,000 when off.
+- **What the instance can use.** EBS bandwidth per instance (AWS's instance
+  type specs, 128 KiB I/O) is: m7g/m8g.large 78.75 MB/s baseline, 1,250 MB/s
+  burst; m7g/m8g.xlarge 156.25 / 1,250; m7g/m8g.2xlarge 312.5 / 1,250;
+  m9g.2xlarge 375 / 1,500; m7g/m8g.4xlarge 625 / 1,250. Throughput above an
+  instance's baseline is reached only while its EBS burst lasts. On a small box,
+  anything above 125 MiB/s is mostly unused.
+- **Recommended.** `{ "throughput": 500, "iops": 4000 }`: above the large
+  types' 312–375 MB/s baseline, so a cascade's write-then-link burst runs at the
+  instance's burst rate, with enough IOPS for 500 MiB/s at 128 KiB I/O.
+  1000 MiB/s would only help during bursts, at twice the throughput price.
+- **Cost.** Billed per volume-month while the volume exists, stopped and
+  hibernated boxes included. List price in us-east-2 is $0.04 per MiB/s-month
+  above 125 and $0.005 per IOPS-month above 3,000, so the recommended values
+  cost $20 a box-month (about $16 at the bill's gp3 discount). The box cost
+  meter does not see this charge yet.
+- **Other paths keep it.** Growing the root disk (`boxDisk.ts`, `ModifyVolume`
+  with only `Size`), resizing (`boxResize.ts`) and starting on a fallback type
+  (`boxStartFallback.ts`, both `ModifyInstanceAttribute`), and quarantine
+  (stop and snapshot) leave the volume's throughput and IOPS as they are. A
+  launch that falls back to another type or subnet sends the same values.
+  Resizing to a smaller type keeps paying for throughput the new type can't
+  reach.
+- **Existing boxes.** They keep what they launched with. `ModifyVolume` with
+  `Iops`/`Throughput` would raise them in place, with no stop, but nothing does
+  that. It would count as the volume's one modification per six hours, so a
+  disk grow right after would be refused.
 
 ### Warm pool sizes (`backend/src/services/warmPoolSizes.ts`)
 
@@ -407,7 +611,7 @@ for the same fixed context:
   fail goes cold as before (`every-candidate-failed`). Every fallback is the
   cold launch at the size the claim asked for.
 - **Tuning.** Each claim the pool could serve but for size or supply (the
-  owner is in `warm-pool-enabled`, on the published image, with the pool's
+  owner is on the published image, with the pool's
   hibernation value) is logged as `[POOL] claim hit|miss size=<size>
   via=add-box|claude-runner user=<unix user> [reason=<reason>]` and recorded
   as the `box.pool.claim` product event (`size`, `outcome`, `reason`, `via`).
@@ -631,14 +835,102 @@ gates the New box pickers, not this. There is no flag of its own.
   hour (`RESIZE_STALE_MS`) it no longer holds the box, the views say the
   resize was cut off, and the box is wherever the job left it (often stopped).
 
+#### Growing a box's disk (`backend/src/services/boxDisk.ts`)
+
+The same dialogs grow the box's root disk: beside "Now:" the current disk
+("Now: Small · 2 vCPU, 8 GB RAM · 120 GB disk"), and under the size a disk
+field (the New box dialogs' own, `components/BoxDiskField.tsx`: LaunchPad's
+NumberField in the simple UI, the native number input in the full UI), from
+the current disk up to the cap. With a disk field the size opens on the
+current one, so changing only the disk never resizes too. The size, the disk
+or both change in one go. The CLI is `termag box resize <box> [size] --disk
+<GB>`. No flag gates it.
+
+- **Routes.** `POST /api/instances/:id/disk { sizeGb }` (owner; another
+  user's box is 404) and the CLI's `POST /api/cli/v1/boxes/:id/disk { sizeGb }`
+  (a box's own credentials only for a box they created, as for resize).
+  `GET …/resize` (the owner's and the CLI's, not the Fleet tab's) answers
+  `disk`: `sizeGb` (EC2's, else `Instance.diskGiB`), `maxGb`, `refusal` (why
+  it can't grow now) and the last `grow` this process ran. `POST` answers 202
+  with the grow as it starts.
+- **Checks**, the admin Grow disk's (`growRefusal`: an EC2 box termag runs,
+  `ready`, its agent connected with `disk-grow-v1`, no grow running), plus:
+  grow only (400 `invalid_disk` for a shrink); at most `OWNER_MAX_GB`, the
+  creation range's top (300, `boxDiskSize.BOX_DISK_LIMITS`), or what the disk
+  already has when an admin grew it past that (400 `invalid_disk`); 409
+  `resize_running` while a resize holds the box; and EBS's one modification
+  per volume per six hours, refused before EC2 is asked from the volume's last
+  modification (409 `disk_cooldown`, "EBS allows one change to a disk every
+  six hours. This one was last changed at 2026-11-03 10:00 UTC, so it can grow
+  again after 2026-11-03 16:00 UTC."). EC2's own refusal of the rate reads the
+  same way (`growErrorMessage`); any other refusal is 409 `disk_refused` with
+  EC2's words. A failed modification doesn't count towards the six hours.
+- **Steps.** The admin Grow disk's: `ModifyVolume`, then the agent's
+  `disk-grow` RPC once the modification is `optimizing`. The box stays up, so
+  the dialogs' warning mentions the stop only when the size changes too
+  ("Growing the disk doesn't stop the box. A disk never shrinks, and EBS
+  allows one change to it every six hours." when only the disk does). Their
+  progress lists the grow's two steps (the volume, its file system) like a
+  resize's, polling `GET …/resize` while it runs.
+- **Both at once.** The disk is asked for first, so its refusal stops
+  everything before the box is touched. The resize then waits in its first
+  phase, `disk` ("Waiting for the disk to grow"), until the grow has
+  finished, however it ended, whichever process runs it, before it stops the
+  box, so the stop never cuts off the agent's file system step (`runResize`,
+  `boxDiskBusy.diskGrowBusy`). A grow still running after 30 minutes fails the
+  resize before anything is stopped ("The disk is still growing after 30
+  minutes; the box was not stopped."). The box counts as growing from just
+  after the disk request's first checks (`reserveGrow`), before it reads the
+  volume, so a resize asked from another tab in between waits for it too.
+- **Finishing a grow.** When the last grow got the volume to its size but its
+  file system step failed (the agent went away, growpart failed), `disk.retry`
+  says so and the dialogs offer **Finish growing the disk**, on the form and
+  in the progress when the grow fails there, which asks for the same size
+  again: only the file system step runs, which EBS's six hours don't cover,
+  so it is offered inside them too. The last grow is this process's, else the
+  box's latest `disk-grow` row (failed, or open past the hour after which an
+  open row counts as cut off, `boxEvents.eventOpen`), so the retry outlives a
+  restart. A fresh open row with no grow in this process is a grow another
+  process runs: no retry, and a new grow is refused (409 `disk_unavailable`).
+- **The size it already has** is a no-op: 200 `{ grow: null, alreadyGb,
+  message: "The disk is already 120 GB" }`, with no grow, no `box_events`
+  row, no `ModifyVolume` and no write to the idle clock, however often it is
+  asked (the CLI prints "…'s disk is already 120 GB; nothing to grow.").
+  The exception is a grow that failed or was cut off at that size
+  (`boxDisk.pendingRetry`): the request runs its file system step again, and
+  that doesn't touch the idle clock either.
+- **The idle clock.** A grow that modifies the volume restarts the box's
+  idle clock (`boxInUseFields`) before the grow starts, in a write guarded
+  on the box still being `ready` and on the clock the request read. An idle
+  sweep that read the clock before that write can't stop the box mid-grow,
+  because its own stop is guarded on the clock it read (`boxLifecycle`).
+  Activity written while the request runs makes the claim miss and read the
+  box again, so it is never overwritten. When EC2 refuses the modification,
+  the clock is put back to the snapshot the claim matched (guarded on the
+  value it wrote), so only an accepted grow counts as activity, and EBS's six
+  hours limit how often that can happen.
+- **Holding the box while a disk grows** (`services/boxDiskBusy.ts`). A grow
+  is running when this process holds it (`boxDisk.growRunning`) or its
+  `disk-grow` row is open and fresh, which covers another orchestrator
+  process. A grow ends within that hour (`boxDisk.maxGrowMs`: the 15-minute
+  EBS wait plus three file system attempts of at most 180 s each). The open
+  row of a grow this process has already finished doesn't count, nor does it
+  refuse the next grow: the in-memory record says how it ended, and the row
+  is closed after that without waiting. The idle sweep holds the box through a `disk-grow` busy check
+  (registered at startup), retries included, without touching the idle
+  clock. A resize doesn't count that check as a blocker: it waits for the
+  grow in its `disk` phase, re-reading both sides, and records `withDisk` on
+  its row, which reads as phase `disk` from the start.
+- **Recorded** as the admin's: a `disk-grow` row in `box_events` with
+  `actorRole: owner` and no reason, and `Instance.diskGiB` set to the new size
+  once it is done.
+
 ### Starting a stopped box with no capacity (`backend/src/services/boxStartFallback.ts`)
 
 A launch walks subnets and then types when EC2 has no capacity (step 5
 above). Starting a box that already exists can't change subnet: its root
-volume and network interface stay in its zone. Behind
-`box-start-type-fallback-enabled` (boolean, off; read for the owner and box,
-or the pool context for a pool box), a start of a **stopped** box that EC2
-refuses for capacity retypes it and starts it again:
+volume and network interface stay in its zone. Instead, a start of a
+**stopped** box that EC2 refuses for capacity retypes it and starts it again:
 
 - **Candidates**: the box's size's types (`boxSizeSpec`), or
   `BOX_INSTANCE_TYPE` and `BOX_FALLBACK_INSTANCE_TYPES` for a box with no
@@ -659,7 +951,7 @@ refuses for capacity retypes it and starts it again:
 
 Fleet operations on a box are rows in `box_events`, one per operation,
 created when it is asked for and updated as it goes, never deleted: today
-`resize` and `disk-grow` (the admin Grow disk, `services/boxDisk.ts`), with
+`resize` and `disk-grow` (the owner's disk field and the admin Grow disk, `services/boxDisk.ts`), with
 room for stop, start, park and terminate. The admin audit log
 (`admin_audit_log`) keeps the request to an admin route; a box event keeps the
 operation and how it ended, whoever asked. The latest open row of a kind is
@@ -688,17 +980,29 @@ logged and never fails the grow, which keeps its `[BOX-DISK]` log lines.
 ### A repository's environment (`.termag/environment.json`)
 
 A repository can say what its boxes need, in a file committed to the
-repository itself. Today that is their size and their disk:
+repository itself. Today that is their size and their disk, and whether termag
+sets them up:
 
 ```json
-{ "resources": { "vcpu": 4, "memoryGiB": 32, "diskGiB": 200 } }
+{ "resources": { "vcpu": 4, "memoryGiB": 32, "diskGiB": 200 }, "setupEnabled": false }
 ```
 
 This `.termag/` is the **repository's**, read from GitHub. It has nothing to do
 with a termag space's `.termag/` folder (a space's shared memory, `prompt.md`
 and `memory/`), even though the folder name is the same.
 
-- **`resources` only, for now.** It sizes every box made for a project of the
+- **`setupEnabled`**, optional, `true` by default: `false` turns termag's
+  setup off for the box. The owner confirms it: the CLI
+  states it on stderr, and `--setup` turns setup back on. Nothing else applies
+  it: a box made in the UI, which shows no setup choice, has setup on. A
+  multi-repo project's box has setup off only when every repository says so.
+  Read only while `empty-box-enabled` is on; a value that isn't a boolean is a
+  warning.
+- **`flavor`**, optional: the box's image. #1086 added flavors
+  (`Instance.flavor`, the CLI's `--minimal`), but this file's key isn't read
+  yet: a file that has it gets a warning, `"flavor" isn't supported yet`, and
+  the key is ignored.
+- **`resources`** sizes every box made for a project of the
   repository, a box made for an ask included. It is a preset (`"small"`,
   `"medium"`, `"large"`, the table above) or requirements, `{ "vcpu": <n>,
   "memoryGiB": <n> }`. The object form may also hold `"diskGiB": <n>`, the
@@ -707,11 +1011,20 @@ and `memory/`), even though the folder name is the same.
   shape (large is `{ "vcpu": 8, "memoryGiB": 32, "diskGiB": 250 }`, which EC2
   matches to large's type). A bad `diskGiB` is left out with a warning and
   the size beside it still applies, and the other way round. A multi-repo
-  project takes the largest `diskGiB`. Every other key is reserved and ignored without a
-  word: the file is to hold `install`, `start` and `ports` too, after
-  Cursor's `.cursor/environment.json`, which is then the planned fallback for
-  those three. Cursor's file has no resources, so nothing is read from it
-  today.
+  project takes the largest `diskGiB`. The
+  file's steps (`setup`, `run`, `ports`, `seed`, `stop`, `secrets`) are the
+  box's: it reads them from the checkout and runs them once a box made for
+  the project has cloned it.
+  The orchestrator ignores them, and every other key, without a word. termag
+  never reads Cursor's `.cursor/environment.json`; a repository points its
+  steps at whichever of Cursor's scripts work on a box (termag's own file
+  runs `.cursor/install.sh` and `.cursor/start.sh`).
+- **An environment** is one definition, inline or a
+  `repo : branch : path` pointer (read from that branch), and a box made from
+  it is sized by that definition alone: its repositories' own files are not
+  read and nothing is combined. The order is the same, an explicit size, then
+  the definition, then the default. The file's schema is
+  docs/environment.schema.json.
 - **A multi-repo project** takes the largest of its repositories' sizes
   (`boxSize.largestBoxSize`): the most vCPUs any of them asks for and the
   most memory, each on its own, so 4/32 and 8/16 make 8/32 (large's shape,

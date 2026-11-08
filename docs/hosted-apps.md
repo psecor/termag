@@ -80,6 +80,11 @@ script after mounting `/srv/termag`. Nothing to re-provision by hand.
    makes any trust decision based on the caller's address, read that header
    and only believe it when your own socket peer is loopback.
 
+   The snippet also keeps termag's session cookie from your app. It is
+   `__Host-termag.sid` on `Path=/`, so the browser sends it with every request
+   to the host; the snippet forwards the `Cookie` header without it to any
+   path outside `/termag`. Your app's own cookies arrive as they were sent.
+
    `/srv/termag/apps/myapp/myapp.service`:
 
    ```ini

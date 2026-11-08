@@ -1,0 +1,9 @@
+{
+  "setup": "npm --prefix backend ci --no-audit --no-fund && npm --prefix frontend ci --no-audit --no-fund && npm --prefix agent ci --no-audit --no-fund && npm --prefix backend run db:generate && npm --prefix backend run build",
+  "run": "bash scripts/e2e/down.sh && make e2e-up",
+  "stop": "make e2e-down",
+  "ports": [
+    { "name": "frontend", "port": 5174, "health": "/termag/", "path": "/termag/" },
+    { "name": "backend", "port": 3040, "health": "/termag/health" }
+  ]
+}
