@@ -176,14 +176,15 @@ check_present "$SETUP" box-min-setup.sh \
     'amazon-ecr-credential-helper' \
     'aG docker'
 
-# The agent CLIs ride with the bake: claude + codex npm-global, pi pinned to
-# the same --ignore-scripts 1.0.2 the full bake pins and the bootstrap
-# checks; cursor and devin from their vendor installers.
+# The agent CLIs ride with the bake: claude + codex npm-global, pi as the
+# full bake installs it, the newest pin's checked package through
+# termag-pi-update --install-pinned (its --ignore-scripts install is that
+# recipe's, tested in deploy/termag-pi-update.test.sh), and never by name;
+# cursor and devin from their vendor installers.
 check_present "$SETUP" box-min-setup.sh \
     '@anthropic-ai/claude-code @openai/codex' \
-    '@earendil-works/pi-coding-agent@1\.0\.2' \
-    '--ignore-scripts' \
-    'pi --version 2>/dev/null.*1\.0\.2' \
+    'deploy/termag-pi-update" --install-pinned \|\| ' \
+    'pi --version 2>/dev/null)" = "\$want"' \
     'cursor\.com/install' \
     'cli\.devin\.ai/install\.sh'
 

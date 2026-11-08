@@ -469,7 +469,12 @@ tu_status() {
   fi
   text=$(tmux -S "${p_sock[$1]}" capture-pane -p -t "${p_pane[$1]}" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$')
   if printf '%s\n' "$text" | grep -qF 'Guide Devin while it works'; then printf busy; return; fi
-  if printf '%s\n' "$text" | grep -qE '↑↓[[:space:]]+select[[:space:]]*·[[:space:]]*↵[[:space:]]+confirm'; then printf busy; return; fi
+  # The approval footer as a whole line (the text is trimmed), so a diff
+  # quoting it is not a prompt; newer builds put hints between select and
+  # confirm. And the newer list's cursor row, "❭ Allow …" or "❭ Deny", in case
+  # a narrow pane wraps the footer: it starts with the ❭ of the idle prompt below.
+  if printf '%s\n' "$text" | grep -qE '^↑↓[[:space:]]+select[[:space:]]*·.*↵[[:space:]]+confirm'; then printf busy; return; fi
+  if printf '%s\n' "$text" | tail -n 6 | grep -qE '^❭[[:space:]]+(Allow|Deny)([[:space:]]|$)'; then printf busy; return; fi
   if printf '%s\n' "$text" | tail -n 3 | grep -qE '^❭([[:space:]]|$)'; then printf idle; return; fi
   if printf '%s\n' "$text" | grep -qE "^⏺[[:space:]]+(Read|Searched|Ran|Running|Invoked|Found|Writing|Editing|Reading|Globbing|Grepping|Bash)\b|^(I'll|Let me|I'm going to|Based on)\b"; then
     printf busy

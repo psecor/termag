@@ -62,6 +62,13 @@ one, at most 60 characters, e.g. `--title "Members-only file composer
 you write yourself, never prompt text. A follow-up keeps the name; pass
 `--title` with `--thread` only to rename the thread.
 
+**Pick the model with `--model opus|sonnet|haiku`** when the user asked for
+one, or the task needs more (or less) than the default. The thread keeps it:
+follow-ups run on it without `--model`, and one with `--model` switches the
+thread. Without it the ask runs on the thread's model, else the box's
+default. A `termag: warning: --model … was ignored` line means an older
+orchestrator or box agent ran it on the default; say so in your answer.
+
 Each ask starts or continues a **thread**. Keep the thread id from the reply
 and pass it (`--thread <id>`) for follow-ups: the target resumes
 the same Claude session in the same clone, so it remembers what it did.
@@ -208,6 +215,19 @@ termag box rm "$name" --yes                      # when you no longer need it
   - a frontend change that has to read the API it calls:
     `--from <web-repo-url> --from <api-repo-url> "$name/shop:web"`;
   - a design note or a script from scratch: no `--from`.
+- **An environment** names the repositories for you: `--environment <name>`
+  instead of `--from` makes the project of the repositories its definition
+  lists and sizes the box by it. The ask runs in its
+  first repository, or `:<repo>`. It prints the checkouts it runs
+  (`termag: <name> runs owner/name at branch, …`) when it makes the project (an
+  existing one is used as it is, without reading the environment): an
+  ask runs them without asking, and anyone can edit a shared environment, so
+  check they are what you meant. A refusal saying its repositories changed
+  since means someone edited it in between: look again (`termag environment
+  show <name>`) before you rerun. Use an environment that already exists:
+  `termag environment list` and `show <name>` read them. A box's credentials
+  can't create, edit or delete one; for a box sized to one repository, its
+  `.termag/environment.json` already does that with `--from`.
 - The box's size is the repositories' `.termag/environment.json`
   `resources` (the largest across them), else your default, as for any box.
   Add `--size medium` (4 vCPU, 16 GB) or `--size large` (8 vCPU, 32 GB) only

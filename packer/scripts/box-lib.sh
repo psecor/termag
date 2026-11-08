@@ -72,6 +72,15 @@ install_aws_updater() {
     sudo bash /home/termag/src/termag/deploy/termag-aws-update-setup --agent-user termag
 }
 
+# Docker's at-start updater ("Docker: an update at the
+# box's start"): its recipe, root's copy of the lib and the system unit that
+# installs a queued Docker update at boot, before docker.service. Docker is
+# installed above from download.docker.com; termag-reconcile runs the same
+# script on every boot.
+install_docker_updater() {
+    sudo bash /home/termag/src/termag/deploy/termag-docker-update-setup --agent-user termag
+}
+
 # Terminfo for terminals Ubuntu 24.04's ncurses lacks (Ghostty's
 # xterm-ghostty), system-wide in /etc/terminfo, so plain ssh and editor
 # Remote-SSH from those terminals reach a tmux that will attach. From the

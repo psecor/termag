@@ -1,0 +1,38 @@
+# Docker's update, at the box's start only ("Docker: an
+# update at the box's start"): deploy/termag-docker-update --boot, as root,
+# from its root-owned copy, installed and enabled by
+# deploy/termag-docker-update-setup.
+#
+# Before containerd and dockerd: an upgrade of Docker's packages restarts
+# dockerd, which stops every container, so it happens only here, at boot,
+# before either has started and brought anyone's containers back. Ordering
+# only (Before=), never Requires=: Docker starts whatever this does, and a
+# `systemctl restart docker` later never runs it again. No unit runs on a
+# hibernation resume, so a resumed box's containers are never touched.
+#
+# Without a run queued for this box the script makes one short request to the
+# orchestrator and exits; with one it installs within its budget (240 s), well
+# inside the box start timeout (BOX_START_TIMEOUT_SECONDS, 15 min).
+[Unit]
+Description=termag: install a queued Docker update before Docker starts
+Wants=network-online.target
+After=network-online.target
+Before=containerd.service docker.service
+
+[Service]
+Type=oneshot
+# TERMAG_DOCKER_AGENT_UID: the agent user, whose agent config holds the
+# orchestrator URL and token (read as that user).
+EnvironmentFile=/etc/termag/docker-update.env
+ExecStart=/usr/local/libexec/termag/termag-docker-update --boot
+# 1 (below the floor), 2 (Docker found running: nothing done) and 3 (an
+# install rejected) are outcomes the script has logged or reported, never a
+# reason to fail the boot.
+SuccessExitStatus=0 1 2 3
+TimeoutStartSec=5min
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

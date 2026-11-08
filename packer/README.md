@@ -21,7 +21,7 @@ work: the placeholder `termag` user, nvm + a default Node alias, the termag
 agent checkout (+ CLI builds from the same bundle), `git`/`zsh`/`tmux`/`gh`/
 `jq`, **Docker** (docker-ce + buildx + compose; images pull per project — the pre-pulled dev-stack set is
 the war-cache half that stays out), the **agent CLIs** with the full bake's
-shapes (`claude`, `codex`, `pi@1.0.2` pinned `--ignore-scripts`; `cursor`
+shapes (`claude`, `codex`, `pi` at the newest pin in `deploy/termag-pi-update`, its checked package installed `--ignore-scripts`; `cursor`
 and `devin` from their vendor installers), the deploy/ units and the
 TERMAG_BOX marker, the NitroTPM registration, and the same
 home-path index machinery. No language toolchains, no Playwright, no
@@ -69,8 +69,14 @@ scratch-volume pair, hibernation) is a failed check.
     Its stdlib is precompiled at install, as `make install` does, so a later
     import writes no `__pycache__` into the baked home.
   - Rust via **rustup**/`cargo`.
-  - `uv` (Astral).
-- **The desktop app's t3 server**, only when the bake is handed its tarball
+  - `uv` (Astral), pinned: the newest version in `UV_PINS` of
+    `deploy/termag-python-update`, installed by that recipe's `--install-uv`
+    (astral-sh/uv's release tarball over HTTPS, its sha256 checked against
+    the pin before it is unpacked; any mismatch fails the bake, with no
+    fallback to astral.sh's installer). The termag checkout is cloned before
+    uv for this.
+- **The desktop app's t3 server** ("On real
+  boxes"), only when the bake is handed its tarball
   (`-var t3_server_artifact=<path>`, below): the version pinned in
   `deploy/t3-server.pin`, installed by `scripts/install-t3-server.sh` (both
   bake modes) through `deploy/termag-t3-install` into `/opt/termag-t3`, with

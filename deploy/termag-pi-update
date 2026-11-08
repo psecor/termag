@@ -5,10 +5,9 @@
 #
 # Why this exists: pi runs code with its owner's credentials and has had
 # advisories (the floor's sources are in backend/src/services/piUpdatePolicy.ts).
-# The image pins it, `npm install -g --ignore-scripts
-# @earendil-works/pi-coding-agent@1.0.2` (packer/scripts/setup.sh), and
-# nothing moves it afterwards: the fleet sat on 1.0.2 against 1.4.0 on
-# 2026-10-30. This is the box's updater, Codex's recipe for a third npm
+# The image pins it (packer/scripts/setup.sh, through --install-pinned
+# below), and nothing moved it afterwards: the fleet sat on 1.0.2 against
+# 1.4.0 on 2026-10-30. This is the box's updater, Codex's recipe for a third npm
 # global, on deploy/termag-tool-update-lib.
 #
 # One caller: termag-pi-update@<run>.service, started by the agent's
@@ -21,14 +20,19 @@
 #      anything; no policy, or a 200 with run null, installs nothing and
 #      restarts nothing.
 #   2. Takes ~/.termag/pi-update.lock (flock).
-#   3. Resolves the target to one exact version (`latest` through `npm view`,
-#      once) and installs exactly that into the npm global under the nvm
+#   3. Resolves the target to one exact version (`latest` is the newest
+#      version pinned below, PINS; npm's latest tag is asked once, with
+#      `npm view`, only to say in the run's detail when it names a newer
+#      version that is not pinned yet: latest=<v>(unpinned; newest pin <p>))
+#      and installs exactly that into the npm global under the nvm
 #      default, where the image puts it, only when the installed one is below
 #      it: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent@<x.y.z>`,
 #      as the image does (pi's optional native helpers are not needed, and
 #      lifecycle scripts of a newer third-party publisher are not run).
 #      Only a version pinned below (PINS) is installed, from its package file
-#      once that matches the pin; any other fails the run.
+#      once that matches the pin; an exact target with no pin fails the run.
+#      A box on a later version than any pin is left alone
+#      (npm=<v>(ahead-of-pins)).
 #      Accepted only when the package's package.json and `pi --version` both
 #      say exactly x.y.z; otherwise rejected (~/.termag/pi-update.rejected,
 #      exit 3), put back to the version that ran, or quarantined.
@@ -64,12 +68,40 @@
 # What is trusted: the sha512 pinned below for each version (PINS); the
 # registry only serves the bytes.
 #
+# --sessions <restart> <drainSec>: no policy,
+# no install and no report. termag-node-update runs it once it has switched
+# nvm's default: a pi on another of nvm's Nodes than the default's is old
+# code too, whenever its package was written (the node run copies it with its
+# times). Step 4 with the restart and drainSec given, each stopped
+# pane's shell first given the new default's bin on its PATH, and the result
+# as one JSON line on stdout for the node run's report.
+#
 # Usage:
 #   termag-pi-update --run <run-id>   one orchestrator run: the policy, the
 #                                     install, the sessions, the report
 #   termag-pi-update --pinned-package <x.y.z> <dir>
 #                                     pi's pinned package fetched into <dir>
 #                                     and checked; prints its path
+#   termag-pi-update --sessions <none|idle|force> <drainSec>
+#                                     only step 4, for a Node update run
+#   termag-pi-update --install-pinned [<x.y.z>]
+#                                     the image's install (packer/scripts/
+#                                     setup.sh, box-min-setup.sh) and the
+#                                     launchers' remedy: pi's pinned package
+#                                     (the newest pin when no version is
+#                                     given) fetched, checked against its pin
+#                                     and installed from that file with
+#                                     --ignore-scripts; no policy, lock or
+#                                     report. Exit 1 when the package is not
+#                                     the pinned one or pi is not that version
+#                                     after it
+#   termag-pi-update --newest-pin     the newest pinned version (the one the
+#                                     image installs, and latest)
+#   termag-pi-update --self-update [<x.y.z>]
+#                                     what `pi update` runs on a box
+#                                     (PI_SELF_UPDATE_COMMAND, set by the
+#                                     launchers): says pi is updated by termag
+#                                     and installs nothing; exit 1
 #
 # Exit codes: 0 when the pi a session would start is at or above the floor (or
 # nothing was asked of it), 1 when it is below it or there is none, 2 on bad
@@ -114,22 +146,38 @@ TU_NAME=termag-pi-update TU_COMPONENT=pi TU_BIN=pi TU_TAGS='latest'
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 TU_NPM_FLAGS=(--ignore-scripts)
 # The versions a run may install: "<x.y.z> <sha512 integrity of its package>"
-# (npm's dist.integrity form), each one reviewed and pinned with the image's
-# pin (packer/scripts/setup.sh), never whatever the registry's latest tag
-# names. A version with no pin is not installed and the run fails. A pinned
+# (npm's dist.integrity form), each one reviewed and pinned, never whatever
+# the registry's latest tag names. The image installs the newest of them
+# (--install-pinned, packer/scripts/setup.sh and box-min-setup.sh), so this is
+# the one list of pi versions. A version with no pin is not installed and the run fails. A pinned
 # one is fetched as a file (npm pack), its sha512 checked against the pin, and
 # that file is what npm installs, and what a put-back reinstalls: the pin
 # binds the bytes installed, with no second fetch to differ. Neither
 # package.json nor pi --version is provenance: the package controls both
 # (Security review on #1088). TERMAG_PI_PINS: a file of such lines instead.
 # termag-node-update takes pi's package from here too (--pinned-package).
-PINS='1.0.2 sha512-3ZdIghMSELMGV3sKi5iASOb1Jwb696fLjmNu0aezaqDxTLLWWoRpqBYkGxJ1CgAMCbtfqXWEF0lcRrlVXmiEGQ=='
+# latest is the newest of them (PI_PINNED_LATEST in
+# backend/src/services/piUpdatePolicy.ts, whose test reads this list).
+# Refreshing them: weekly, and on any pi
+# advisory, whoever owns the tool updates pins the version npm's latest names
+# (a run's detail says latest=<v>(unpinned; ...) while it is not) in a PR: its
+# dist.integrity from the registry, the same sha512 computed from the tarball
+# fetched again (npm pack) and once more with curl, pi's changelog read from
+# the newest pin up to it, and that version run on a box (a session started
+# and resumed). The image's pin keeps its line, for a put-back.
+PINS='1.0.2 sha512-3ZdIghMSELMGV3sKi5iASOb1Jwb696fLjmNu0aezaqDxTLLWWoRpqBYkGxJ1CgAMCbtfqXWEF0lcRrlVXmiEGQ==
+1.5.0 sha512-xNDZ5kqowO6Z03FS2gwAkPEGk1ssxVcYKQ6qZId84mFEvwACvvyc2l0vAMOS+c5zvxLRMLBE9r4y44IGYkMJaQ=='
+# The pin lines, from TERMAG_PI_PINS when it is set.
+pins_src() {
+  if [ -n "${TERMAG_PI_PINS:-}" ]; then cat "$TERMAG_PI_PINS" 2>/dev/null; else printf '%s\n' "$PINS"; fi
+}
+# The pinned versions, oldest first.
+pinned_versions() { pins_src | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^sha512-/ { print $1 }' | sort -uV; }
 # pinned_package V DIR: pi V's package fetched into DIR and checked against its
 # pin; prints the file's path.
 pinned_package() {
-  local src="$PINS" pin f got
-  [ -z "${TERMAG_PI_PINS:-}" ] || src=$(cat "$TERMAG_PI_PINS" 2>/dev/null)
-  pin=$(printf '%s\n' "$src" | awk -v v="$1" '$1 == v && $2 ~ /^sha512-/ { print $2; exit }')
+  local pin f got
+  pin=$(pins_src | awk -v v="$1" '$1 == v && $2 ~ /^sha512-/ { print $2; exit }')
   if [ -z "$pin" ]; then
     log "pi $1 is not pinned in termag-pi-update; not installed (a version is pinned with a reviewed PR)"
     return 1
@@ -163,12 +211,134 @@ TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
 # shellcheck source=deploy/termag-tool-update-lib
 . "$TU_LIB" || { printf 'termag-pi-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
 
-usage() { log "usage: termag-pi-update --run <run-id> | --pinned-package <x.y.z> <dir>"; exit 2; }
+# latest is the newest pinned version, never whatever npm's latest tag names
+# before its pin lands: a run of latest then installs that version or reports
+# current, rather than failing on an unpinned one, as Cursor's (#1080). The
+# tag (npm view, once, by note_latest) is only said in the run's detail when
+# it names a newer version with no pin, so a pin refresh is visibly due; the
+# run does not fail for it, and does not need the registry to answer.
+tu_resolve_tag() { [ "$1" = latest ] && pinned_versions | tail -n 1; }
+# The lib calls tu_resolve_tag in a subshell, so the note is this run's own
+# step, after tu_run_target. Sets latest_note.
+latest_note=''
+note_latest() {
+  local newest named cap
+  [ "$MODE" = run ] && [ "$FLOOR_ONLY" = 0 ] && [ "$TARGET" = latest ] || return 0
+  newest=$(pinned_versions | tail -n 1)
+  cap=$(left 20); [ "$cap" -gt 0 ] || return 0
+  named=$(timeout -k 2 "$cap" npm view "$PKG@latest" version </dev/null 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+  if is_version "$named" && [ -n "$newest" ] && ! at_least "$newest" "$named"; then
+    latest_note="latest=$named(unpinned; newest pin $newest)"
+    log "npm's latest tag names pi $named, which is not pinned yet; latest is the newest pinned version, $newest"
+  fi
+}
+# Above every pin (installed by hand, or by pi's own `pi update`): left alone.
+tu_npm_ahead() {
+  local newest; newest=$(pinned_versions | tail -n 1)
+  [ -n "$newest" ] && ! at_least "$newest" "$1"
+}
+
+# --install-pinned [V]: pi V (default: the newest pin) installed from its pinned
+# package file, as the image installs it. The file is fetched and checked by
+# pinned_package, so the bytes npm installs are the pinned ones; npm runs no
+# lifecycle scripts (see the header, 3). Accepted only when the installed
+# package.json and `pi --version` both say V. It holds the update lock, as a
+# run and termag-node-update do, since all three write the same npm global.
+# An install that is not accepted is undone: a pi that worked, whose package
+# tree npm changed nothing in (it failed before writing), is left alone; else
+# that version is put back from its own pinned package when it is pinned;
+# else pi's executable is quarantined, so no session starts what was not
+# accepted.
+npm_global_version() {
+  local root; root=$(npm root -g </dev/null 2>/dev/null) || return 0
+  sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$root/$PKG/package.json" 2>/dev/null | head -n 1
+}
+# working_at V: the npm global's package.json and pi --version both say V.
+working_at() {
+  [ "$(npm_global_version)" = "$1" ] && [ "$(pi --version </dev/null 2>/dev/null | tail -n 1)" = "$1" ]
+}
+# untouched MARK: pi's package tree, its own node_modules included, exists and
+# has no file or directory whose inode changed after MARK was written. ctime,
+# not mtime: npm extracts with the tarball's times, and nothing sets a ctime
+# back.
+untouched() {
+  local root; root=$(npm root -g </dev/null 2>/dev/null)
+  [ -n "$root" ] && [ -d "$root/$PKG" ] && [ -e "$1" ] || return 1
+  [ -z "$(find "$root/$PKG" -cnewer "$1" -print -quit 2>/dev/null)" ]
+}
+# install_file V FILE: npm installs FILE; 0 when package.json and pi --version say V.
+install_file() {
+  local got
+  npm install -g --ignore-scripts --no-audit --no-fund --loglevel=error "$2" </dev/null >&2 || { log "npm install -g of pi $1's pinned package failed"; return 1; }
+  hash -r
+  got=$(npm_global_version)
+  [ "$got" = "$1" ] || { log "the npm global $PKG is ${got:-missing} after the install, not $1"; return 1; }
+  got=$(pi --version </dev/null 2>/dev/null | tail -n 1)
+  [ "$got" = "$1" ] || { log "pi --version says ${got:-nothing} after the install, not $1"; return 1; }
+}
+install_pinned() {
+  local v="${1:-}" dir f prev prev_ok back root mark
+  [ -n "$v" ] || v=$(pinned_versions | tail -n 1)
+  is_version "$v" || { log "no pinned pi version to install"; return 1; }
+  case "${LOCK_WAIT:-600}" in *[!0-9]*) log "bad number '$LOCK_WAIT' in TERMAG_PI_LOCK_WAIT"; return 2 ;; esac
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  exec 9>"$TU_LOCK_FILE" || { log "cannot open $TU_LOCK_FILE; not installed"; return 1; }
+  if ! flock -n 9; then
+    log "another pi or Node update holds $TU_LOCK_FILE; waiting up to ${LOCK_WAIT:-600}s"
+    flock -w "${LOCK_WAIT:-600}" 9 || { log "the lock stayed held; not installed"; return 1; }
+  fi
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/termag-pi-pinned.XXXXXX") || return 1
+  PIN_DIR=$dir
+  f=$(pinned_package "$v" "$dir") || return 1
+  prev=$(npm_global_version) prev_ok=0
+  is_version "$prev" && working_at "$prev" && prev_ok=1
+  log "pi $v's package matches its pin ($(pins_src | awk -v v="$v" '$1 == v { print $2; exit }')): installing $f"
+  mark="$dir/.before-install"; : > "$mark"; sleep 1
+  if install_file "$v" "$f"; then
+    log "pi $v installed from its pinned package, verified (sha512, package.json and pi --version)"
+    return 0
+  fi
+  # npm may have failed before touching anything: a pi that worked, whose
+  # package tree npm changed nothing in, and which still resolves and runs as
+  # that version (bin/pi is outside the tree), is left alone.
+  if [ "$prev_ok" = 1 ] && untouched "$mark" && working_at "$prev"; then
+    log "npm changed nothing in pi's package, still the working $prev; pi $v is not installed"
+    return 1
+  fi
+  if is_version "$prev" && back=$(pinned_package "$prev" "$dir") && install_file "$prev" "$back"; then
+    log "put pi back to $prev, the version that was there, from its pinned package; pi $v is not installed"
+    return 1
+  fi
+  if [ "$prev_ok" = 1 ] && untouched "$mark" && working_at "$prev"; then
+    log "npm changed nothing in pi's package, still the working $prev; pi $v is not installed"
+    return 1
+  fi
+  root=$(npm root -g </dev/null 2>/dev/null)
+  if [ -n "$root" ] && quarantine "$root/$PKG/dist/bundle/cli.js"; then
+    log "pi ${prev:-(none)} could not be put back; pi $v is not installed"
+  fi
+  return 1
+}
+# --self-update [V]: pi's own updater on a box. The launchers set
+# PI_SELF_UPDATE_COMMAND to this, so `pi update` runs it in place of npm (pi
+# 1.5.0: the variable replaces its npm or managed install, and fills
+# {version} from pi.dev's newest release). Nothing is installed: pi moves
+# only to a pinned version, through termag's update run.
+self_update() {
+  local newest; newest=$(pinned_versions | tail -n 1)
+  printf '%s\n' \
+    "termag: pi on this box is updated by termag, not by \`pi update\`${1:+ (pi.dev names $1)}." \
+    "  Only versions termag has reviewed and pinned are installed (newest pin: ${newest:-none})." \
+    "  An admin updates pi from the Software tab; to reinstall the newest pin here: termag-pi-update --install-pinned" >&2
+  return 1
+}
+
+usage() { log "usage: termag-pi-update --run <run-id> | --pinned-package <x.y.z> <dir> | --sessions <none|idle|force> <drainSec> | --install-pinned [<x.y.z>] | --newest-pin | --self-update [<x.y.z>]"; exit 2; }
 trap '[ -z "$PIN_DIR" ] || rm -rf "$PIN_DIR"' EXIT
 
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 MODE='' FLOOR='' RUN_ID=''
-# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+# shellcheck disable=SC2034  # MODE, RESTART, DRAIN: read by termag-tool-update-lib
 case "${1:-}" in
   # The run id names the systemd instance and goes into a URL and a report:
   # the orchestrator's id pattern, nothing a shell or a URL would read.
@@ -176,6 +346,13 @@ case "${1:-}" in
   # pi's pinned package for another updater (termag-node-update's reinstall):
   # fetched into <dir>, checked, its path printed; exit 1 when there is none.
   --pinned-package) [ $# -eq 3 ] && is_version "$2" && [ -d "$3" ] || usage; pinned_package "$2" "$3"; exit $? ;;
+  --install-pinned)
+    if [ $# -gt 2 ] || { [ $# -eq 2 ] && ! is_version "$2"; }; then usage; fi
+    install_pinned "${2:-}"; exit $? ;;
+  --newest-pin) [ $# -eq 1 ] || usage; v=$(pinned_versions | tail -n 1); [ -n "$v" ] || exit 1; printf '%s\n' "$v"; exit 0 ;;
+  # Whatever pi fills in, nothing here reads it beyond printing a version.
+  --self-update) [ $# -le 2 ] || usage; v=''; [ $# -eq 2 ] && is_version "$2" && v=$2; self_update "$v"; exit $? ;;
+  --sessions) MODE=sessions; RESTART=${2:-} DRAIN=${3:-}; [ $# -eq 3 ] || usage ;;
   -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) usage ;;
 esac
@@ -218,7 +395,7 @@ if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_
 expire_stale() { [ -s "$REJECTED" ] || return 0; tu_expire_npm; }
 
 # shellcheck disable=SC2154  # set by termag-tool-update-lib
-tu_notes() { printf 'npm=%s' "$npm_note"; }
+tu_notes() { printf 'npm=%s%s' "$npm_note" "${latest_note:+ $latest_note}"; }
 tu_notes_all() { printf '%s' "$npm_note"; }
 
 # ── sessions, after a run's install ─────────────────────────────────────────
@@ -226,7 +403,7 @@ tu_notes_all() { printf '%s' "$npm_note"; }
 argv_of() { tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null; }
 # A pi process: node running the package's dist/bundle/cli.js. pi sets its
 # process title, so a running pi's /proc/<pid>/cmdline reads just "pi"
-# (checked on 1.0.2): either that, or the bundle as node's script (under
+# (checked on 1.0.2 and 1.5.0): either that, or the bundle as node's script (under
 # whatever name it was started by, npm's bin/pi link as PATH finds it).
 is_pi() {
   local a
@@ -316,10 +493,19 @@ session_of() {
 }
 
 p_sfile=()
+# --sessions (a Node update run): whether pi I runs on another of nvm's Nodes
+# than the default's (CUR_NODE). termag-node-update copies the package with
+# its times, so its package.json says nothing about the switch.
+CUR_NODE=''
+on_old_node() {
+  local e; e=$(readlink -f "/proc/$1/exe" 2>/dev/null)
+  case "$e" in "$NVM_DIR"/versions/node/*) [ -n "$CUR_NODE" ] && [ "$e" != "$CUR_NODE" ] ;; *) return 1 ;; esac
+}
 find_sessions() {
   local pkg installed pid sub pane sock name f id st
   pkg=; command -v npm >/dev/null 2>&1 && pkg=$(npm root -g </dev/null 2>/dev/null)/$PKG
   installed=$(mtime_cs "$pkg/package.json")
+  [ "$MODE" = sessions ] && CUR_NODE=$(readlink -f "$(command -v node 2>/dev/null)" 2>/dev/null)
   for pid in $(pgrep -u "$(id -u)"); do
     is_pi "$pid" || continue
     under_pi "$pid" && continue
@@ -327,8 +513,11 @@ find_sessions() {
     peers+=("$(sessions_of "$pid")")
     # Old code: started before the package was written. One that started
     # within 0.01 s of it may have loaded either, so is taken as old.
+    # A Node update's: one on the old Node is old code whenever it started.
     st=; [ -n "$installed" ] && st=$(started_cs "$pid")
-    [ -n "$st" ] && [ "$st" -gt $(( installed + 1 )) ] && continue
+    if ! { [ "$MODE" = sessions ] && on_old_node "$pid"; }; then
+      [ -n "$st" ] && [ "$st" -gt $(( installed + 1 )) ] && continue
+    fi
     # A -p turn, an rpc or json mode run (the simple UI's chat turns), or a
     # subcommand that is not the TUI, is other, where its arguments can still
     # be read (pi's process title replaces them: the chat runner's turns are
@@ -368,6 +557,9 @@ tu_resume_line() { printf 'pi --continue'; }
 
 trap on_signal TERM INT HUP
 
+# Only the sessions, for a Node update run (see the header).
+[ "$MODE" = sessions ] && tu_sessions
+
 tu_lock
 expire_stale
 
@@ -384,6 +576,7 @@ fi
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 want=$FLOOR
 tu_run_target
+note_latest
 tu_spec
 
 # ── the npm global under the nvm default ────────────────────────────────────

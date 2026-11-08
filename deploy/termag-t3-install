@@ -35,16 +35,29 @@
 #
 # Content-compared like termag-reconcile: a current box writes nothing.
 #
+# The pin is a floor while it sets release_url: a desktop newer than the
+# pinned server has the agent run --release with its own version (t3-update,
+# agent/t3-bridge.js), and a reconcile then keeps that newer server current
+# rather than moving the box back. Emptying release_url turns that off, and
+# the next reconcile puts the pinned server back.
+#
 # Usage:
 #   termag-t3-install           install or repair, reporting what changed
 #   termag-t3-install --check   report drift, change nothing; exit 1 only for
 #                               drift this box could fix (a source is set, the
 #                               root is writable), so an unhosted pin is not
 #                               drift
+#   termag-t3-install --release <x.y.z>
+#                               install the server of the fork's release
+#                               <x.y.z> (release_url, its digest from the
+#                               release's own .sha256) and make it current,
+#                               when it is newer than the pin and than
+#                               current; otherwise change nothing
 #
 # Exit: 0 current, installed, or nothing to do here (no digest for this
-# architecture, no source configured, no writable root); 1 --check drift;
-# 2 usage; 3 a failed install (fetch, digest, unpack, or the server won't run).
+# architecture, no source configured, no writable root, a --release that is
+# not newer); 1 --check drift; 2 usage; 3 a failed install (fetch, digest,
+# unpack, or the server won't run).
 #
 # Env:
 #   TERMAG_T3_SERVER_SOURCE  the tarball to install instead of <base_url>/<name>
@@ -59,6 +72,8 @@
 #   TERMAG_T3_SETTINGS       default ~/.t3/userdata/settings.json (the agent
 #                            runs the server with --base-dir ~/.t3)
 #   TERMAG_T3_ARCH           default from uname -m (arm64 | x64)
+#   TERMAG_T3_LOCK_WAIT      seconds a --release waits for another install's
+#                            lock (default 120, inside the agent's 5-minute bound)
 #   TERMAG_T3_SUDO           default "sudo -n"; only creates <root> when missing
 #   TERMAG_T3_GH_HOST_FILE   default /etc/profile.d/termag-github.sh: where a
 #                            gh:// fetch reads GH_HOST when it isn't set
@@ -83,8 +98,17 @@ PROFILE_SRC=$HERE/t3-chrome-headless-shell.apparmor
 read -r -a APPARMOR_PARSER <<< "${TERMAG_T3_APPARMOR_PARSER-apparmor_parser}"
 
 MODE=install
+RELEASE=
 case "${1:-}" in
   --check) MODE=check ;;
+  --release)
+    MODE=release
+    RELEASE=${2:-}
+    # A plain x.y.z: the fork's release versions (termag-release.yml), which
+    # become a path and a tag here.
+    if ! [[ "$RELEASE" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
+      printf 'termag-t3-install: --release takes a version like 0.1.14, not "%s"\n' "$RELEASE" >&2; exit 2
+    fi ;;
   '') ;;
   -h | --help) sed -n '2,/^set -u$/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
   *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
@@ -116,6 +140,8 @@ pin_get() {
 VERSION=$(pin_get version || true)
 SHA256=$(pin_get "sha256_linux_$ARCH" || true)
 BASE_URL=$(pin_get base_url || true)
+RELEASE_URL=$(pin_get release_url || true)
+PIN_VERSION=$VERSION
 
 # Nothing pinned for this architecture: nothing to do, and not drift.
 [ -n "$SHA256" ] || exit 0
@@ -129,6 +155,16 @@ fi
 STEM="termag-t3-server-$VERSION-linux-$ARCH"
 SOURCE=${TERMAG_T3_SERVER_SOURCE:-}
 if [ -z "$SOURCE" ] && [ -n "$BASE_URL" ]; then SOURCE="${BASE_URL%/}/$STEM.tar.gz"; fi
+
+# The release an installed version is of: package-box-server.sh names a tree
+# <x.y.z>-<sha12>.
+version_core() {
+  if [[ "$1" =~ ^(.+)-[0-9a-f]{12}$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; else printf '%s' "$1"; fi
+}
+# Whether release A is newer than release B.
+newer() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
@@ -193,55 +229,6 @@ drift() {
   profile_current || ! profile_fixable || say "DRIFT: $PROFILE is not installed (the browser's sandbox)"
 }
 
-root_writable() { [ -d "$ROOT" ] && [ -w "$ROOT" ]; }
-
-# Whether an install could write <root>: it is writable, or it is missing and
-# its parent is writable or sudo -n works (`sudo -n true` changes nothing).
-root_fixable() {
-  root_writable && return 0
-  [ ! -e "$ROOT" ] || return 1
-  [ -w "$(dirname -- "$ROOT")" ] || "${SUDO[@]}" true >/dev/null 2>&1
-}
-
-out=$(drift)
-if [ "$MODE" = check ]; then
-  # Drift a run could not fix (no root and no way to make one) is not drift.
-  if [ -n "$out" ] && root_fixable; then
-    printf '%s\n' "$out"
-    exit 1
-  fi
-  exit 0
-fi
-[ -n "$out" ] || exit 0
-
-# ── install ──────────────────────────────────────────────────────────────────
-
-if [ ! -d "$ROOT" ]; then
-  if ! mkdir -p "$ROOT" 2>/dev/null &&
-     ! "${SUDO[@]}" install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$ROOT" 2>/dev/null; then
-    warn "cannot create $ROOT (no sudo -n here); not installing the t3 server"
-    exit 0
-  fi
-fi
-root_writable || { warn "$ROOT is not writable by $(id -un); not installing the t3 server"; exit 0; }
-
-# One install at a time (a bake's step and the boot reconcile can overlap).
-exec 9> "$ROOT/.lock"
-if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-  say "t3 server: another install holds $ROOT/.lock; leaving it to that one"
-  exit 0
-fi
-
-# What an interrupted run left behind (a reconcile timeout, a reboot).
-remove_tree() {
-  # Only ever a directory directly under $ROOT, by its full path.
-  case "$1" in "$ROOT"/?*) ;; *) warn "refusing to remove $1"; return 1 ;; esac
-  rm -rf -- "$1"
-}
-for stale in "$ROOT"/.incoming.*; do
-  [ -d "$stale" ] && remove_tree "$stale"
-done
-
 # The host gh is logged in to on this box. termag-credentials points gh at the
 # GitHub broker with GH_HOST in /etc/profile.d and ~/.zshenv, which the
 # systemd units this runs under (termag-reconcile, termag-box-update) never
@@ -287,6 +274,125 @@ fetch() {
   esac
 }
 
+root_writable() { [ -d "$ROOT" ] && [ -w "$ROOT" ]; }
+
+CURRENT=$(readlink "$ROOT/current" 2>/dev/null || true)
+CURRENT_SHA256=$(cat "$ROOT/$CURRENT/.termag-t3-sha256" 2>/dev/null || true)
+if [ "$MODE" = release ]; then
+  if [ -z "$RELEASE_URL" ]; then
+    say "t3 server $RELEASE: not installed (release_url in $PIN is unset)"
+    exit 0
+  fi
+  floor=$(version_core "$VERSION")
+  if [ -n "$CURRENT" ] && newer "$(version_core "$CURRENT")" "$floor"; then floor=$(version_core "$CURRENT"); fi
+  if ! newer "$RELEASE" "$floor"; then
+    say "t3 server $RELEASE: not newer than $floor; nothing to do"
+    exit 0
+  fi
+  # A gh:// release, the only source that lists its assets: the tarball's
+  # name carries the commit, which the desktop asking doesn't know.
+  url=${RELEASE_URL//\{version\}/$RELEASE}
+  case "$url" in
+    gh://*) ;;
+    *) warn "release_url in $PIN is not a gh:// release: $RELEASE_URL"; exit 3 ;;
+  esac
+  IFS=/ read -r r_owner r_repo r_tag r_rest <<< "${url#gh://}"
+  if [ -z "$r_owner" ] || [ -z "$r_repo" ] || [ -z "$r_tag" ] || [ -n "$r_rest" ] \
+    || ! [[ "$r_owner/$r_repo/$r_tag" =~ ^[A-Za-z0-9._+/-]+$ ]]; then
+    warn "release_url in $PIN is gh://<owner>/<repo>/<tag with {version}>, not $RELEASE_URL"; exit 3
+  fi
+  command -v gh >/dev/null 2>&1 || { warn "no gh CLI for $url"; exit 3; }
+  r_host=$(gh_host)
+  names=$(gh api --hostname "${r_host:-github.com}" "repos/$r_owner/$r_repo/releases/tags/$r_tag" \
+    --jq '.assets[].name') || { warn "could not read release $r_tag of $r_owner/$r_repo"; exit 3; }
+  pattern="^termag-t3-server-${RELEASE//./\\.}-[0-9a-f]{12}-linux-$ARCH\\.tar\\.gz\$"
+  matches=$(printf '%s\n' "$names" | grep -E "$pattern" || true)
+  [ "$(printf '%s' "$matches" | grep -c .)" = 1 ] ||
+    { warn "release $r_tag of $r_owner/$r_repo has no single linux-$ARCH server tarball"; exit 3; }
+  VERSION=${matches#termag-t3-server-}
+  VERSION=${VERSION%-linux-"$ARCH".tar.gz}
+  STEM="termag-t3-server-$VERSION-linux-$ARCH"
+  SOURCE="$url/$STEM.tar.gz"
+  # The release's own digest: the same file a pin bump copies its digests from.
+  line=$(fetch "$SOURCE.sha256" /dev/stdout) || { warn "could not fetch $SOURCE.sha256"; exit 3; }
+  read -r SHA256 r_name <<< "$line"
+  DIGEST_FROM="the release's"
+  if ! [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || [ "${r_name#\*}" != "$STEM.tar.gz" ]; then
+    warn "$SOURCE.sha256 is not a digest of $STEM.tar.gz"; exit 3
+  fi
+elif [ -n "$RELEASE_URL" ] && [ -n "$CURRENT" ] && newer "$(version_core "$CURRENT")" "$(version_core "$VERSION")" &&
+  [ -x "$ROOT/$CURRENT/bin/t3" ] && [[ "$CURRENT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  # A newer release a desktop asked for stays current: the pin is a floor.
+  VERSION=$CURRENT
+  SHA256=$CURRENT_SHA256
+  STEM="termag-t3-server-$VERSION-linux-$ARCH"
+  SOURCE=
+fi
+
+# Whether an install could write <root>: it is writable, or it is missing and
+# its parent is writable or sudo -n works (`sudo -n true` changes nothing).
+root_fixable() {
+  root_writable && return 0
+  [ ! -e "$ROOT" ] || return 1
+  [ -w "$(dirname -- "$ROOT")" ] || "${SUDO[@]}" true >/dev/null 2>&1
+}
+
+out=$(drift)
+if [ "$MODE" = check ]; then
+  # Drift a run could not fix (no root and no way to make one) is not drift.
+  if [ -n "$out" ] && root_fixable; then
+    printf '%s\n' "$out"
+    exit 1
+  fi
+  exit 0
+fi
+[ -n "$out" ] || exit 0
+
+# ── install ──────────────────────────────────────────────────────────────────
+
+if [ ! -d "$ROOT" ]; then
+  if ! mkdir -p "$ROOT" 2>/dev/null &&
+     ! "${SUDO[@]}" install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$ROOT" 2>/dev/null; then
+    warn "cannot create $ROOT (no sudo -n here); not installing the t3 server"
+    exit 0
+  fi
+fi
+root_writable || { warn "$ROOT is not writable by $(id -un); not installing the t3 server"; exit 0; }
+
+# One install at a time (a bake's step and the boot reconcile can overlap).
+# A --release waits for the one running: that one (a reconcile, a box update)
+# keeps what is current and never fetches this release, so leaving it to that
+# one would answer "done" with nothing installed.
+exec 9> "$ROOT/.lock"
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+  if [ "$MODE" != release ]; then
+    say "t3 server: another install holds $ROOT/.lock; leaving it to that one"
+    exit 0
+  fi
+  say "t3 server $RELEASE: another install holds $ROOT/.lock; waiting for it"
+  flock -w "${TERMAG_T3_LOCK_WAIT:-120}" 9 || { warn "another install still holds $ROOT/.lock; not installing $RELEASE"; exit 3; }
+fi
+# Another install may have put this release, or a newer one, in place since
+# current was read (while this one read the release, or waited for the lock):
+# never move back.
+if [ "$MODE" = release ]; then
+  landed=$(readlink "$ROOT/current" 2>/dev/null || true)
+  if [ -n "$landed" ] && ! newer "$RELEASE" "$(version_core "$landed")"; then
+    say "t3 server $RELEASE: not newer than $(version_core "$landed"); nothing to do"
+    exit 0
+  fi
+fi
+
+# What an interrupted run left behind (a reconcile timeout, a reboot).
+remove_tree() {
+  # Only ever a directory directly under $ROOT, by its full path.
+  case "$1" in "$ROOT"/?*) ;; *) warn "refusing to remove $1"; return 1 ;; esac
+  rm -rf -- "$1"
+}
+for stale in "$ROOT"/.incoming.*; do
+  [ -d "$stale" ] && remove_tree "$stale"
+done
+
 if ! installed_ok; then
   if [ -z "$SOURCE" ]; then
     say "t3 server $VERSION: not installed (no source: base_url in $PIN is unset)"
@@ -297,7 +403,7 @@ if ! installed_ok; then
 
   fetch "$SOURCE" "$tmp/server.tar.gz" || fail "could not fetch $SOURCE"
   got=$(sha256_of "$tmp/server.tar.gz")
-  [ "$got" = "$SHA256" ] || fail "$SOURCE has sha256 $got, not the pinned $SHA256"
+  [ "$got" = "$SHA256" ] || fail "$SOURCE has sha256 $got, not ${DIGEST_FROM:-the pinned} $SHA256"
   mkdir "$tmp/unpacked"
   tar -xzf "$tmp/server.tar.gz" -C "$tmp/unpacked" || fail "could not unpack $SOURCE"
   [ "$(ls -A "$tmp/unpacked")" = "$STEM" ] || fail "$SOURCE does not hold exactly $STEM/"
@@ -360,7 +466,8 @@ if ! profile_current && profile_fixable; then
   fi
 fi
 
-# Keep current and the one before it; older trees go once nothing runs there.
+# Keep current, the one before it and the pinned one; older trees go once
+# nothing runs there.
 in_use() {
   local exe
   for exe in /proc/[0-9]*/exe; do
@@ -371,7 +478,7 @@ in_use() {
 for dir in "$ROOT"/*/; do
   dir=${dir%/}
   name=${dir##*/}
-  case "$name" in bin | current | "$VERSION" | "$previous") continue ;; esac
+  case "$name" in bin | current | "$VERSION" | "$previous" | "$PIN_VERSION") continue ;; esac
   [ -f "$dir/.termag-t3-sha256" ] || continue
   if in_use "$dir"; then
     say "t3 server: keeping $dir (a process still runs from it)"

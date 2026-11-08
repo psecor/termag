@@ -1,0 +1,11 @@
+#!/bin/bash
+# termag-env: run this checkout's environment file on the box (setup, run,
+# health, seed). A thin launcher for
+# agent/environment-run.js on the shared Node, as termag-project-clone is.
+set -eu
+checkout=${TERMAG_CHECKOUT:-$HOME/src/termag}
+if ! node=$(/bin/bash "$checkout/agent/run-node.sh" --print-node); then
+  printf 'termag-env: no usable Node.js found by the shared launcher\n' >&2
+  exit 1
+fi
+exec "$node" "$checkout/agent/environment-run.js" "$@"

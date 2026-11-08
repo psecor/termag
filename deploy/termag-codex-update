@@ -83,9 +83,18 @@
 # the gap between what was resolved and what is installed; it does not
 # authenticate the publisher, and `codex --version` is not provenance.
 #
+# --sessions <restart> <drainSec>: no policy,
+# no install and no report. termag-node-update runs it once it has switched
+# nvm's default, so the npm global this Codex runs from is a new one: step 4
+# with the restart and drainSec given, each stopped pane's shell first given
+# the new default's bin on its PATH, and the result as one JSON line on stdout
+# for the node run's report.
+#
 # Usage:
 #   termag-codex-update --run <run-id>   one orchestrator run: the policy, the
 #                                        install, the sessions, the report
+#   termag-codex-update --sessions <none|idle|force> <drainSec>
+#                                        only step 4, for a Node update run
 #
 # Exit codes: 0 when the codex a session would start is at or above the floor
 # (or nothing was asked of it), 1 when it is below it or there is no codex, 2
@@ -143,15 +152,16 @@ TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
 # shellcheck source=deploy/termag-tool-update-lib
 . "$TU_LIB" || { printf 'termag-codex-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
 
-usage() { log "usage: termag-codex-update --run <run-id>"; exit 2; }
+usage() { log "usage: termag-codex-update --run <run-id> | --sessions <none|idle|force> <drainSec>"; exit 2; }
 
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 MODE='' FLOOR='' RUN_ID=''
-# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+# shellcheck disable=SC2034  # MODE, RESTART, DRAIN: read by termag-tool-update-lib
 case "${1:-}" in
   # The run id names the systemd instance and goes into a URL and a report:
   # the orchestrator's id pattern, nothing a shell or a URL would read.
   --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  --sessions) MODE=sessions; RESTART=${2:-} DRAIN=${3:-}; [ $# -eq 3 ] || usage ;;
   -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) usage ;;
 esac
@@ -344,6 +354,9 @@ tu_had() {
 tu_resume_line() { printf 'codex resume %s' "$1"; }
 
 trap on_signal TERM INT HUP
+
+# Only the sessions, for a Node update run (see the header).
+[ "$MODE" = sessions ] && tu_sessions
 
 tu_lock
 expire_stale

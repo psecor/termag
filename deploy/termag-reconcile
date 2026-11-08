@@ -37,9 +37,22 @@
 #   termag-reconcile --check   report drift and un-enabled units, change nothing
 #                              (exit 1 if there is anything to do)
 #   termag-reconcile --list    print the artifact table and exit
+#   termag-reconcile --list-steps
+#                              print the steps after the table, with their class
+#   termag-reconcile --strip   on a box with termag setup off, remove what the bake put there of
+#                              the feature class, where it is still termag's
+#                              unedited copy (cloud-init runs this at first boot)
+#
+# Termag setup off: every artifact and step is either core
+# (termag needs it to run, reach and update the box, or to launch an agent)
+# or feature (skills, agent and git config, warm-pool and first-connect
+# hooks). On a box whose setup file says `off`, only core is installed.
+# termag-reconcile.test.sh fails on anything left unclassified.
 #
 # Env:
-#   TERMAG_CHECKOUT   override the checkout path (default $HOME/src/termag)
+#   TERMAG_CHECKOUT       override the checkout path (default $HOME/src/termag)
+#   TERMAG_SETUP_FILE   override the setup file (default
+#                         $HOME/.config/termag/setup)
 
 set -u
 
@@ -57,12 +70,28 @@ MODE=reconcile
 case "${1:-}" in
   --check) MODE=check ;;
   --list)  MODE=list ;;
+  --list-steps) MODE=list-steps ;;
+  --strip) MODE='strip' ;;
   '')      ;;
-  -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
   *) printf 'unknown flag: %s (try --help)\n' "${1}" >&2; exit 2 ;;
 esac
 
-# source-in-deploy : installed path : mode : kind : enablement
+# Written by cloud-init on a box with termag setup off (backend services/boxSetup.ts) and
+# never by anything else; a box without it is a full one.
+SETUP_FILE="${TERMAG_SETUP_FILE:-$HOME/.config/termag/setup}"
+SETUP=on
+if [ "$(head -n 1 "$SETUP_FILE" 2>/dev/null | tr -d '[:space:]')" = off ]; then
+  SETUP=off
+fi
+
+# Is an item of this class installed here? Anything but core counts as
+# feature, so a box with termag setup off gets less, never more, from a typo.
+wanted() {
+  [ "$SETUP" = on ] || [ "$1" = core ]
+}
+
+# source-in-deploy : installed path : mode : kind : enablement : class
 #
 # kind=unit marks the files whose change warrants a `systemctl --user
 # daemon-reload`; kind=bin is a plain executable.
@@ -101,7 +130,9 @@ esac
 # termag-devin-update@.service for the Devin CLI (tool-update-devin-v1), and
 # termag-pi-update@.service for pi (tool-update-pi-v1), and
 # termag-node-update@.service for Node (tool-update-node-v1), with Node's
-# release keys beside the floor file.
+# release keys beside the floor file, and termag-python-update@.service for
+# Python (tool-update-python-v1, which the agent also announces only where
+# pyenv and uv are: the minimal flavor has neither).
 # Both updaters source termag-tool-update-lib from their own directory, so it
 # is installed into ~/.local/bin beside them, and ahead of them in this table:
 # a run of the new updater never finds the old lib.
@@ -119,71 +150,81 @@ esac
 # reorders anything.
 #
 # kind=file is a plain non-executable file, like the MetaTerm skill.
+#
+# class=core or class=feature (see the header). termag's own programs are core
+# even where only a feature uses them: they sit in termag's directories, not
+# the owner's config, and a launch or an RPC may call them. The skills, the
+# commit-msg hook and the units that start the first-connect setup and the
+# warm-pool hooks are feature.
 artifacts() {
   cat <<TABLE
-termag-agent.service:$HOME/.config/systemd/user/termag-agent.service:644:unit:noenable
-termag-reconcile.service:$HOME/.config/systemd/user/termag-reconcile.service:644:unit:enable
-termag-on-warm.service:$HOME/.config/systemd/user/termag-on-warm.service:644:unit:noenable
-termag-on-claim.service:$HOME/.config/systemd/user/termag-on-claim.service:644:unit:noenable
-termag-box-update.service:$HOME/.config/systemd/user/termag-box-update.service:644:unit:noenable
-termag-project-clone@.service:$HOME/.config/systemd/user/termag-project-clone@.service:644:unit:noenable
-termag-status:$HOME/.local/bin/termag-status:755:bin:noenable
-termag-hooks-update:$HOME/.local/bin/termag-hooks-update:755:bin:noenable
-termag-reconcile:$HOME/.local/bin/termag-reconcile:755:bin:noenable
-termag-box-update:$HOME/.local/bin/termag-box-update:755:bin:noenable
-termag-project-clone:$HOME/.local/bin/termag-project-clone:755:bin:noenable
-termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable
-termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable
-termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable
-termag-mcp-headers:$HOME/.local/bin/termag-mcp-headers:755:bin:noenable
-termag-mcp-bridge:$HOME/.local/bin/termag-mcp-bridge:755:bin:noenable
-termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable
-termag-pi-fireworks:$HOME/.local/bin/termag-pi-fireworks:755:bin:noenable
-termag-agent-otel:$HOME/.local/bin/termag-agent-otel:755:bin:noenable
-termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable
-termag-tool-update-lib:$HOME/.local/bin/termag-tool-update-lib:644:file:noenable
-termag-claude-update:$HOME/.local/bin/termag-claude-update:755:bin:noenable
-claude-code-floor:$HOME/.local/share/termag/claude-code-floor:644:file:noenable
-termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable
-termag-claude-update-boot.service:$HOME/.config/systemd/user/termag-claude-update-boot.service:644:unit:enable
-termag-claude-update@.service:$HOME/.config/systemd/user/termag-claude-update@.service:644:unit:noenable
-termag-codex-update:$HOME/.local/bin/termag-codex-update:755:bin:noenable
-termag-codex-update@.service:$HOME/.config/systemd/user/termag-codex-update@.service:644:unit:noenable
-termag-cursor-update:$HOME/.local/bin/termag-cursor-update:755:bin:noenable
-termag-cursor-update@.service:$HOME/.config/systemd/user/termag-cursor-update@.service:644:unit:noenable
-termag-devin-update:$HOME/.local/bin/termag-devin-update:755:bin:noenable
-termag-devin-update@.service:$HOME/.config/systemd/user/termag-devin-update@.service:644:unit:noenable
-termag-pi-update:$HOME/.local/bin/termag-pi-update:755:bin:noenable
-termag-pi-update@.service:$HOME/.config/systemd/user/termag-pi-update@.service:644:unit:noenable
-termag-node-update:$HOME/.local/bin/termag-node-update:755:bin:noenable
-termag-node-update@.service:$HOME/.config/systemd/user/termag-node-update@.service:644:unit:noenable
-termag-node-release-keys.asc:$HOME/.local/share/termag/termag-node-release-keys.asc:644:file:noenable
-termag-briefing:$HOME/.local/bin/termag-briefing:755:bin:noenable
-claude-runner-hooks/command:$HOME/.local/lib/termag/claude-runner-hooks/command:755:bin:noenable
-claude-runner-hooks/post-session:$HOME/.local/lib/termag/claude-runner-hooks/post-session:755:bin:noenable
-pi-ext/termag-status.ts:$HOME/.local/share/termag/pi-ext/termag-status.ts:644:file:noenable
-pi-ext/termag-status-core.ts:$HOME/.local/share/termag/pi-ext/termag-status-core.ts:644:file:noenable
-pi-ext/termag-otel.ts:$HOME/.local/share/termag/pi-ext/termag-otel.ts:644:file:noenable
-pi-ext/termag-otel-core.ts:$HOME/.local/share/termag/pi-ext/termag-otel-core.ts:644:file:noenable
-claude-skills/metaterm/SKILL.md:$HOME/.claude/skills/metaterm/SKILL.md:644:file:noenable
-termag-subagent-run:$HOME/.local/bin/termag-subagent-run:755:bin:noenable
-claude-skills/agent-ask/SKILL.md:$HOME/.claude/skills/agent-ask/SKILL.md:644:file:noenable
-claude-skills/agent-orchestrator/SKILL.md:$HOME/.claude/skills/agent-orchestrator/SKILL.md:644:file:noenable
-pi-skills/metaterm/SKILL.md:$HOME/.pi/agent/skills/metaterm/SKILL.md:644:file:noenable
-termag-pr-body:$HOME/.local/bin/termag-pr-body:755:bin:noenable
-termag-pr-create:$HOME/.local/bin/termag-pr-create:755:bin:noenable
-termag-commit-msg:$GIT_TEMPLATE_DIR/hooks/commit-msg:755:bin:noenable
-claude-skills/termag-pr/SKILL.md:$HOME/.claude/skills/termag-pr/SKILL.md:644:file:noenable
-pi-skills/termag-pr/SKILL.md:$HOME/.pi/agent/skills/termag-pr/SKILL.md:644:file:noenable
-claude-skills/termag-spaces/SKILL.md:$HOME/.claude/skills/termag-spaces/SKILL.md:644:file:noenable
-pi-skills/termag-spaces/SKILL.md:$HOME/.pi/agent/skills/termag-spaces/SKILL.md:644:file:noenable
-claude-skills/termag-handoff/SKILL.md:$HOME/.claude/skills/termag-handoff/SKILL.md:644:file:noenable
-pi-skills/termag-handoff/SKILL.md:$HOME/.pi/agent/skills/termag-handoff/SKILL.md:644:file:noenable
-termag-overlap:$HOME/.local/bin/termag-overlap:755:bin:noenable
-claude-skills/termag-overlap/SKILL.md:$HOME/.claude/skills/termag-overlap/SKILL.md:644:file:noenable
-pi-skills/termag-overlap/SKILL.md:$HOME/.pi/agent/skills/termag-overlap/SKILL.md:644:file:noenable
-claude-skills/termag-bug-report/SKILL.md:$HOME/.claude/skills/termag-bug-report/SKILL.md:644:file:noenable
-pi-skills/termag-bug-report/SKILL.md:$HOME/.pi/agent/skills/termag-bug-report/SKILL.md:644:file:noenable
+termag-agent.service:$HOME/.config/systemd/user/termag-agent.service:644:unit:noenable:core
+termag-reconcile.service:$HOME/.config/systemd/user/termag-reconcile.service:644:unit:enable:core
+termag-on-warm.service:$HOME/.config/systemd/user/termag-on-warm.service:644:unit:noenable:feature
+termag-on-claim.service:$HOME/.config/systemd/user/termag-on-claim.service:644:unit:noenable:feature
+termag-box-update.service:$HOME/.config/systemd/user/termag-box-update.service:644:unit:noenable:core
+termag-project-clone@.service:$HOME/.config/systemd/user/termag-project-clone@.service:644:unit:noenable:core
+termag-status:$HOME/.local/bin/termag-status:755:bin:noenable:core
+termag-hooks-update:$HOME/.local/bin/termag-hooks-update:755:bin:noenable:core
+termag-reconcile:$HOME/.local/bin/termag-reconcile:755:bin:noenable:core
+termag-box-update:$HOME/.local/bin/termag-box-update:755:bin:noenable:core
+termag-project-clone:$HOME/.local/bin/termag-project-clone:755:bin:noenable:core
+termag-env:$HOME/.local/bin/termag-env:755:bin:noenable:core
+termag-hook-run:$HOME/.local/bin/termag-hook-run:755:bin:noenable:core
+termag-credentials:$HOME/.local/bin/termag-credentials:755:bin:noenable:core
+termag-claude-token:$HOME/.local/bin/termag-claude-token:755:bin:noenable:core
+termag-mcp-headers:$HOME/.local/bin/termag-mcp-headers:755:bin:noenable:core
+termag-mcp-bridge:$HOME/.local/bin/termag-mcp-bridge:755:bin:noenable:core
+termag-metaterm-mcp:$HOME/.local/bin/termag-metaterm-mcp:755:bin:noenable:core
+termag-pi-headless:$HOME/.local/bin/termag-pi-headless:755:bin:noenable:core
+termag-pi-fireworks:$HOME/.local/bin/termag-pi-fireworks:755:bin:noenable:core
+termag-agent-otel:$HOME/.local/bin/termag-agent-otel:755:bin:noenable:core
+termag-claude-runner:$HOME/.local/bin/termag-claude-runner:755:bin:noenable:core
+termag-tool-update-lib:$HOME/.local/bin/termag-tool-update-lib:644:file:noenable:core
+termag-claude-update:$HOME/.local/bin/termag-claude-update:755:bin:noenable:core
+claude-code-floor:$HOME/.local/share/termag/claude-code-floor:644:file:noenable:core
+termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable:core
+termag-claude-update-boot.service:$HOME/.config/systemd/user/termag-claude-update-boot.service:644:unit:enable:core
+termag-claude-update@.service:$HOME/.config/systemd/user/termag-claude-update@.service:644:unit:noenable:core
+termag-codex-update:$HOME/.local/bin/termag-codex-update:755:bin:noenable:core
+termag-codex-update@.service:$HOME/.config/systemd/user/termag-codex-update@.service:644:unit:noenable:core
+termag-cursor-update:$HOME/.local/bin/termag-cursor-update:755:bin:noenable:core
+termag-cursor-update@.service:$HOME/.config/systemd/user/termag-cursor-update@.service:644:unit:noenable:core
+termag-devin-update:$HOME/.local/bin/termag-devin-update:755:bin:noenable:core
+termag-devin-update@.service:$HOME/.config/systemd/user/termag-devin-update@.service:644:unit:noenable:core
+termag-pi-update:$HOME/.local/bin/termag-pi-update:755:bin:noenable:core
+termag-pi-update@.service:$HOME/.config/systemd/user/termag-pi-update@.service:644:unit:noenable:core
+termag-node-update:$HOME/.local/bin/termag-node-update:755:bin:noenable:core
+termag-node-update@.service:$HOME/.config/systemd/user/termag-node-update@.service:644:unit:noenable:core
+termag-node-release-keys.asc:$HOME/.local/share/termag/termag-node-release-keys.asc:644:file:noenable:core
+termag-python-update:$HOME/.local/bin/termag-python-update:755:bin:noenable:core
+termag-python-update@.service:$HOME/.config/systemd/user/termag-python-update@.service:644:unit:noenable:core
+termag-briefing:$HOME/.local/bin/termag-briefing:755:bin:noenable:core
+claude-runner-hooks/command:$HOME/.local/lib/termag/claude-runner-hooks/command:755:bin:noenable:core
+claude-runner-hooks/post-session:$HOME/.local/lib/termag/claude-runner-hooks/post-session:755:bin:noenable:core
+pi-ext/termag-status.ts:$HOME/.local/share/termag/pi-ext/termag-status.ts:644:file:noenable:core
+pi-ext/termag-status-core.ts:$HOME/.local/share/termag/pi-ext/termag-status-core.ts:644:file:noenable:core
+pi-ext/termag-otel.ts:$HOME/.local/share/termag/pi-ext/termag-otel.ts:644:file:noenable:core
+pi-ext/termag-otel-core.ts:$HOME/.local/share/termag/pi-ext/termag-otel-core.ts:644:file:noenable:core
+claude-skills/metaterm/SKILL.md:$HOME/.claude/skills/metaterm/SKILL.md:644:file:noenable:feature
+termag-subagent-run:$HOME/.local/bin/termag-subagent-run:755:bin:noenable:core
+claude-skills/agent-ask/SKILL.md:$HOME/.claude/skills/agent-ask/SKILL.md:644:file:noenable:feature
+claude-skills/agent-orchestrator/SKILL.md:$HOME/.claude/skills/agent-orchestrator/SKILL.md:644:file:noenable:feature
+pi-skills/metaterm/SKILL.md:$HOME/.pi/agent/skills/metaterm/SKILL.md:644:file:noenable:feature
+termag-pr-body:$HOME/.local/bin/termag-pr-body:755:bin:noenable:core
+termag-pr-create:$HOME/.local/bin/termag-pr-create:755:bin:noenable:core
+termag-commit-msg:$GIT_TEMPLATE_DIR/hooks/commit-msg:755:bin:noenable:feature
+claude-skills/termag-pr/SKILL.md:$HOME/.claude/skills/termag-pr/SKILL.md:644:file:noenable:feature
+pi-skills/termag-pr/SKILL.md:$HOME/.pi/agent/skills/termag-pr/SKILL.md:644:file:noenable:feature
+claude-skills/termag-spaces/SKILL.md:$HOME/.claude/skills/termag-spaces/SKILL.md:644:file:noenable:feature
+pi-skills/termag-spaces/SKILL.md:$HOME/.pi/agent/skills/termag-spaces/SKILL.md:644:file:noenable:feature
+claude-skills/termag-handoff/SKILL.md:$HOME/.claude/skills/termag-handoff/SKILL.md:644:file:noenable:feature
+pi-skills/termag-handoff/SKILL.md:$HOME/.pi/agent/skills/termag-handoff/SKILL.md:644:file:noenable:feature
+termag-overlap:$HOME/.local/bin/termag-overlap:755:bin:noenable:core
+claude-skills/termag-overlap/SKILL.md:$HOME/.claude/skills/termag-overlap/SKILL.md:644:file:noenable:feature
+pi-skills/termag-overlap/SKILL.md:$HOME/.pi/agent/skills/termag-overlap/SKILL.md:644:file:noenable:feature
+claude-skills/termag-bug-report/SKILL.md:$HOME/.claude/skills/termag-bug-report/SKILL.md:644:file:noenable:feature
+pi-skills/termag-bug-report/SKILL.md:$HOME/.pi/agent/skills/termag-bug-report/SKILL.md:644:file:noenable:feature
 TABLE
 }
 
@@ -235,6 +276,7 @@ merge_json() {
 
 merge_json_unlocked() {
   local file=$1 label=$2 value=$3 filter=$4 cur want tmp
+  [ "$MODE" = strip ] && [ ! -s "$file" ] && return 0
   if [ -s "$file" ]; then cur=$(cat "$file") || return 0; else cur='{}'; fi
   if ! want=$(printf '%s' "$cur" | jq --argjson v "$value" "$filter" 2>/dev/null); then
     printf 'termag-reconcile: %s is not valid JSON; not adding %s\n' "$file" "$label" >&2
@@ -253,7 +295,8 @@ merge_json_unlocked() {
   tmp=$(mktemp "$file.XXXXXX") || return 0
   if [ -e "$file" ]; then chmod --reference="$file" "$tmp"; else chmod 600 "$tmp"; fi
   if printf '%s\n' "$want" > "$tmp" && mv -f "$tmp" "$file"; then
-    printf 'reconciled: %s in %s\n' "$label" "$file"
+    if [ "$MODE" = strip ]; then printf 'stripped: %s from %s\n' "$label" "$file"
+    else printf 'reconciled: %s in %s\n' "$label" "$file"; fi
   else
     rm -f "$tmp"
     printf 'termag-reconcile: failed to write %s\n' "$file" >&2
@@ -470,7 +513,41 @@ reconcile_gh_update() {
   fi
 }
 
-# The AWS CLI v2's root updater: deploy/termag-aws-update-setup puts the recipe, root's
+# Docker's at-start updater ("Docker: an update at the
+# box's start"): deploy/termag-docker-update-setup puts the recipe, root's copy
+# of the lib and the system unit termag-docker-update.service (enabled,
+# Before=docker.service) in place for this box user, as the GitHub CLI's setup
+# above does: all of it root's, through sudo -n, only on a box. The setup
+# itself does nothing where Docker is not from download.docker.com. Without
+# passwordless sudo it is not reported as drift; the agent then announces no
+# docker capability.
+DOCKER_UPDATE_BOX_MARKER="${TERMAG_DOCKER_UPDATE_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a DOCKER_UPDATE_SUDO <<< "${TERMAG_DOCKER_UPDATE_SUDO-sudo -n}"
+
+reconcile_docker_update() {
+  local setup="$DEPLOY/termag-docker-update-setup" out me
+  [ -f "$setup" ] || return 0
+  [ -f "$DOCKER_UPDATE_BOX_MARKER" ] || return 0
+  me=$(id -un)
+  "${DOCKER_UPDATE_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${DOCKER_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: docker updater: /'
+    return 0
+  fi
+  if out=$("${DOCKER_UPDATE_SUDO[@]}" bash "$setup" --agent-user "$me" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: docker updater: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the docker updater setup failed\n' >&2
+  fi
+}
+
+# The AWS CLI v2's root updater ("The AWS CLI v2: the
+# second root recipe"): deploy/termag-aws-update-setup puts the recipe, root's
 # copy of the lib, AWS's key, the start helper, the system unit and the one
 # sudoers line in place for this box user, as the GitHub CLI's setup above
 # does: all of it root's, through sudo -n, only on a box.
@@ -711,6 +788,40 @@ reconcile_local_dir_modes() {
   done
 }
 
+# uv tools whose entry points still name the bake's home. cloud-init renames
+# /home/termag to the owner's and rewrites the baked paths from an index the bake
+# takes (packer/scripts/index-home-paths.sh), but images baked from 2026-09-25
+# to 2026-11-04 indexed no text files at all, so on a box launched from one
+# every uv tool's entry point kept `#!/home/termag/.local/share/uv/tools/<tool>
+# /bin/python` and failed "cannot execute: required file not found" (pre-commit,
+# poetry, browser-harness). This repairs those boxes: the scripts in each
+# tool's bin/ (entry points, activate*), its pyvenv.cfg and its uv-receipt.toml
+# get the baked home replaced with this one. Only those few files are read, so
+# the boot cost is small even on a lazily restored volume, and once fixed the
+# step finds nothing to do. Never on a home that is still the baked one (a pool
+# box, an owner named termag) or while that home exists.
+BAKED_HOME="${TERMAG_BAKED_HOME:-/home/termag}"
+reconcile_uv_tool_paths() {
+  [ "$HOME" != "$BAKED_HOME" ] || return 0
+  [ ! -e "$BAKED_HOME" ] || return 0
+  local tools="$HOME/.local/share/uv/tools" f old_re new_repl
+  [ -d "$tools" ] || return 0
+  old_re=$(printf '%s/' "$BAKED_HOME" | sed -e 's/[][\\.*^$|]/\\&/g')
+  new_repl=$(printf '%s/' "$HOME" | sed -e 's/[\\&|]/\\&/g')
+  for f in "$tools"/*/bin/* "$tools"/*/pyvenv.cfg "$tools"/*/uv-receipt.toml; do
+    if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
+    grep -qIF -- "$BAKED_HOME/" "$f" 2>/dev/null || continue
+    changed=$((changed + 1))
+    if [ "$MODE" = check ]; then
+      printf 'DRIFT: %s names the baked home %s\n' "$f" "$BAKED_HOME"
+    elif sed -i "s|$old_re|$new_repl|g" "$f"; then
+      printf 'reconciled: %s now names %s, not %s\n' "$f" "$HOME" "$BAKED_HOME"
+    else
+      printf 'termag-reconcile: failed to rewrite %s\n' "$f" >&2
+    fi
+  done
+}
+
 WANTS="$HOME/.config/systemd/user/default.target.wants"
 
 # Is the unit enabled, i.e. does the wants symlink point where it should?
@@ -728,7 +839,106 @@ enable_unit() {
   return 0
 }
 
+# The steps after the table, in order : class. The status hooks stay core: the
+# working/waiting lights and the auto-lifecycle's "a working agent keeps the
+# box up" read them. So do the CLI, the ask-sandbox retirement and the guest
+# browser, which is system-level and what a preview share opens.
+steps() {
+  cat <<STEPS
+reconcile_claude_config:feature
+reconcile_claude_path_hook:core
+reconcile_claude_onboarding:feature
+reconcile_cli:core
+reconcile_t3_server:core
+retire_ask_sandbox:core
+reconcile_guest_browser:core
+reconcile_gh_update:core
+reconcile_aws_update:core
+reconcile_docker_update:core
+reconcile_terminfo:core
+reconcile_pi_config:feature
+reconcile_devin_hooks:core
+reconcile_git_template:feature
+reconcile_claude_plugins:feature
+reconcile_local_dir_modes:core
+reconcile_uv_tool_paths:core
+STEPS
+}
+
+# --strip: the AMI is baked as a box with setup on, so a new box with termag setup off starts with the
+# feature items already on it. Each goes only where it is still exactly what
+# termag put there; an owner's edit keeps the file and is reported.
+strip_file() {
+  local src=$1 dest=$2
+  [ -e "$dest" ] || return 0
+  if ! cmp -s "$src" "$dest"; then
+    printf 'kept: %s (it differs from %s)\n' "$dest" "$src"
+    return 0
+  fi
+  rm -f -- "$dest" && printf 'stripped: %s\n' "$dest" && changed=$((changed + 1))
+  rmdir -- "$(dirname "$dest")" 2>/dev/null || true
+}
+
+strip_claude_plugins() {
+  local root="$DEPLOY/claude-plugins" plugin name src rel dest tmp
+  [ -d "$root" ] || return 0
+  for plugin in "$root"/*/; do
+    [ -d "$plugin" ] || continue
+    name=$(basename "$plugin")
+    [ -d "$CLAUDE_PLUGINS_DIR/$name" ] || continue
+    while IFS= read -r -d '' src; do
+      rel=${src#"$plugin"}
+      tmp=$(mktemp) || return 0
+      sed "s#@TERMAG_MCP_VERSION_FILE@#$HOME/.config/termag/mcp-connectors.version#g" "$src" > "$tmp"
+      strip_file "$tmp" "$CLAUDE_PLUGINS_DIR/$name/$rel"
+      rm -f "$tmp"
+    done < <(find "$plugin" -type f ! -name '*.test.ts' -print0)
+    find "$CLAUDE_PLUGINS_DIR/$name" -depth -type d -empty -delete 2>/dev/null || true
+  done
+}
+
+strip_config() {
+  local xdg="${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
+  if command -v jq >/dev/null 2>&1; then
+    merge_json "$HOME/.claude.json" 'MetaTerm MCP server' "$METATERM_MCP" \
+      'if .mcpServers.metaterm == $v then del(.mcpServers.metaterm) else . end'
+    merge_json "$HOME/.claude.json" 'Claude Code onboarding done' 'true' \
+      'del(.hasCompletedOnboarding)'
+    merge_json "$HOME/.claude/settings.json" 'MetaTerm read-tool approvals' "$METATERM_READ_TOOLS" \
+      'if (.permissions.allow | type) == "array" then .permissions.allow -= $v else . end'
+    merge_json "$HOME/.pi/agent/mcp.json" 'MetaTerm MCP server (pi)' "$PI_METATERM_MCP" \
+      'if (.mcpServers.metaterm | type) == "object" and .mcpServers.metaterm.command == $v.command then del(.mcpServers.metaterm) else . end'
+  fi
+  if command -v git >/dev/null 2>&1 \
+    && [ "$(git config --file "$xdg" --get init.templateDir 2>/dev/null)" = "$GIT_TEMPLATE_PATH" ] \
+    && git config --file "$xdg" --unset init.templateDir; then
+    printf 'stripped: init.templateDir from %s\n' "$xdg"
+    changed=$((changed + 1))
+  fi
+}
+
+strip() {
+  local name dest enable class
+  if [ "$SETUP" != off ]; then
+    printf 'termag-reconcile: %s does not say off; termag setup is on, nothing to strip\n' "$SETUP_FILE" >&2
+    exit 1
+  fi
+  while IFS=: read -r name dest _ _ enable class; do
+    [ -n "${name:-}" ] && [ "$class" != core ] || continue
+    [ -f "$DEPLOY/$name" ] || continue
+    if [ "$enable" = enable ] && unit_enabled "$name"; then
+      rm -f -- "$WANTS/$name" && printf 'disabled: %s\n' "$name" && reload=1
+    fi
+    strip_file "$DEPLOY/$name" "$dest"
+  done <<EOF
+$(artifacts)
+EOF
+  strip_claude_plugins
+  strip_config
+}
+
 if [ "$MODE" = list ]; then artifacts; exit 0; fi
+if [ "$MODE" = list-steps ]; then steps; exit 0; fi
 
 if [ ! -d "$DEPLOY" ]; then
   printf 'termag-reconcile: no checkout at %s; nothing to reconcile\n' "$CHECKOUT" >&2
@@ -738,8 +948,17 @@ fi
 changed=0
 reload=0
 
-while IFS=: read -r name dest mode kind enable; do
+if [ "$MODE" = strip ]; then
+  strip
+  if [ "$reload" = 1 ]; then
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+while IFS=: read -r name dest mode kind enable class; do
   [ -n "${name:-}" ] || continue
+  wanted "${class:-}" || continue
   src="$DEPLOY/$name"
   # A source that isn't in this checkout yet is not an error: an older checkout
   # legitimately has fewer artifacts than a newer script knows about.
@@ -790,21 +1009,10 @@ done <<EOF
 $(artifacts)
 EOF
 
-reconcile_claude_config
-reconcile_claude_path_hook
-reconcile_claude_onboarding
-reconcile_cli
-reconcile_t3_server
-retire_ask_sandbox
-reconcile_guest_browser
-reconcile_gh_update
-reconcile_aws_update
-reconcile_terminfo
-reconcile_pi_config
-reconcile_devin_hooks
-reconcile_git_template
-reconcile_claude_plugins
-reconcile_local_dir_modes
+for step in $(steps); do
+  wanted "${step#*:}" || continue
+  "${step%%:*}" </dev/null
+done
 
 if [ "$MODE" = check ]; then
   [ "$changed" -eq 0 ] || exit 1

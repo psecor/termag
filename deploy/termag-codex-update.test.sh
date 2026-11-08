@@ -189,6 +189,8 @@ sessions_cases() {
 sub=
 [ -n "${SUB:-}" ] && { "$BASH" -c 'while :; do sleep 0.2; done' & sub=$!; }
 if [ -n "${STUBBORN:-}" ]; then trap '' TERM; else trap '[ -n "$sub" ] && kill "$sub"; exit 0' TERM; fi
+# SLOW=1: takes 3 s to exit after its SIGTERM.
+[ -n "${SLOW:-}" ] && trap 'sleep 3; exit 0' TERM
 while :; do sleep 0.2; done
 EOF
   # A file named for the subcommand, so `codex app-server --listen <url>`
@@ -371,6 +373,67 @@ EOF
   [ "$got" = 1 ] || fail 'below the floor: exits 1' 1 "$got"
   is_running "$keep_pid" || fail 'below the floor: nothing is stopped' alive stopped
   has 'below the floor: says why nothing restarted' "$(report .detail)" 'restart=none(codex below-floor)'
+  teardown
+
+  # --sessions (a Node update run): no policy,
+  # no install, no report. The Codex panes on an old binary are stopped as
+  # restart says, each shell gets the new default's bin first on its PATH
+  # before its resume, and the result is one JSON line on stdout; a Claude
+  # Code pane is left alone, and a busy turn waits under idle.
+  setup
+  rw=$(rollout "$(uuid 71)" task_started task_complete)
+  pane work ROLL="$rw"
+  rb=$(rollout "$(uuid 72)" task_started)
+  pane busy ROLL="$rb"
+  r3=$(rollout "$(uuid 73)" task_started task_complete)
+  pane alice-proj-agent ROLL="$r3"
+  BIN="$WORK/claude-old/claude" pane claude-pane
+  sleep 1
+  busy_pid=$(pid_in busy) claude_pid=$(pid_in claude-pane)
+  ARGS='--sessions idle 30' run TERMAG_CODEX_KILL_AFTER=2 TERMAG_CODEX_RESUME_WAIT=2 > "$WORK/sessions.json" & rp=$!
+  sleep 4
+  is_running "$busy_pid" || fail '--sessions idle: a session in a turn is not stopped' alive stopped
+  printf '{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete"}}\n' >> "$rb"
+  wait "$rp"; got=$?
+  [ "$got" = 0 ] || fail '--sessions: exits 0' 0 "$got: $(tail -3 "$WORK/err")"
+  out=$(tail -n 1 "$WORK/sessions.json")
+  got=$(printf '%s' "$out" | jq -r '[.component, .restart, .sessions.stopped, .sessions.cut, .sessions.typed, .sessions.resumed, .sessions.other] | join(" ")')
+  [ "$got" = 'codex idle 3 0 2 2 0' ] || fail '--sessions: component restart stopped cut typed resumed other' 'codex idle 3 0 2 2 0' "$got; $(tail -3 "$WORK/err")"
+  got=$(printf '%s' "$out" | jq -r '[.panes[] | "\(.session):\(.role):\(.sessionId // "-")"] | sort | join(" ")')
+  want="alice-proj-agent:agent:$(uuid 73) busy:other:$(uuid 72) work:other:$(uuid 71)"
+  [ "$got" = "$want" ] || fail '--sessions: the stopped panes, for the caller'"'"'s report' "$want" "$got"
+  has '--sessions: the new PATH, then the resume' "$(pane_text work)" "export PATH=$WORK/npm/bin:\"\$PATH\"; codex resume $(uuid 71)"
+  has '--sessions: an agent pane gets the new PATH for its relaunch' "$(pane_text alice-proj-agent)" "export PATH=$WORK/npm/bin:"
+  lacks '--sessions: and nothing more' "$(pane_text alice-proj-agent)" 'codex resume'
+  is_running "$claude_pid" || fail '--sessions: a Claude Code pane is left alone' alive gone
+  [ ! -e "$STATE/curl-calls" ] || fail '--sessions: no policy, no report' 'no orchestrator call' "$(cat "$STATE/curl-calls")"
+  lacks '--sessions: installs nothing' "$(cat "$LOG")" 'npm install'
+  teardown
+
+  # --sessions stopped by a signal while a session is still going: the JSON
+  # lists it, and its pane gets the new PATH once its shell is back, for the
+  # orchestrator's relaunch (Bugbot on #1166).
+  setup
+  rs=$(rollout "$(uuid 81)" task_started task_complete)
+  pane alice-proj-agent ROLL="$rs" SLOW=1
+  sleep 1
+  ARGS='--sessions force 0' run TERMAG_CODEX_KILL_AFTER=30 > "$WORK/sessions.json" & rp=$!
+  sleep 1.5
+  kill -TERM "$(pgrep -f 'termag-codex-update --sessions force 0')"; wait "$rp"; got=$?
+  [ "$got" = 143 ] || fail '--sessions signal: exits 143' 143 "$got"
+  got=$(tail -n 1 "$WORK/sessions.json" | jq -r '[.restart, ([.panes[] | "\(.session):\(.role)"] | join(" "))] | join(" ")')
+  [ "$got" = 'force(stopped by a signal) alice-proj-agent:agent' ] || fail '--sessions signal: the pane it had stopped is listed' 'force(stopped by a signal) alice-proj-agent:agent' "$got"
+  has '--sessions signal: and gets the new PATH' "$(pane_text alice-proj-agent)" "export PATH=$WORK/npm/bin:"
+  teardown
+
+  # --sessions none: nothing is stopped.
+  setup
+  pane keep
+  sleep 1; keep_pid=$(pid_in keep)
+  out=$(ARGS='--sessions none 0' run | tail -n 1)
+  is_running "$keep_pid" || fail '--sessions none: nothing is stopped' alive stopped
+  got=$(printf '%s' "$out" | jq -r '[.restart, .sessions.stopped] | join(" ")')
+  [ "$got" = 'none 0' ] || fail '--sessions none: says so' 'none 0' "$got"
   teardown
 }
 if [ "${1:-}" = --sessions ]; then

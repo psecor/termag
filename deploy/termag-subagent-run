@@ -33,7 +33,10 @@
 # chat on the target project (agent/ask-chat.js, the chat runner), and calls
 # the other steps as phases:
 #
-#   --prepare <job>          step 1 only; prints {repoDir, base, repo, fresh}.
+#   --prepare <job>          step 1 only; prints {repoDir, base, repo, fresh},
+#                            with push and branch in push mode, and notice
+#                            (for the turn, ahead of its message) on the turn
+#                            that converts an older clone.
 #                            A job without a runId (a person's message in the
 #                            ask's chat) reports nothing when it fails.
 #   --report <job> <result>  step 3, from the turn's stream-json `result`
@@ -64,14 +67,20 @@
 # through the box's GitHub broker like any repo here) on that branch, and the
 # run pushes and opens its draft PRs itself. --report then sends no bundle:
 # it names the branches the clone pushed (their remote-tracking reflogs say
-# `update by push`), and the orchestrator looks their PRs up on GitHub. The
+# `update by push`), and the orchestrator looks their PRs up on GitHub, and
+# the branches with commits it never pushed (`unpushed`), which the
+# orchestrator records as the turn's publish. The
 # clone gets a pre-push hook that refuses a push to the default branch, and
 # the repo's own pre-commit hooks when it has them. An older clone of the
-# thread is converted in place on its first push-mode turn.
+# thread is converted in place on its first push-mode turn, and that turn is
+# told so.
 #
 # Phases: ask-chat-v1 (agent/ask-chat.js checks for this line before it
 # announces the capability).
 # Pushes: ask-push-v1 (agent/ask-run.js checks for this line likewise).
+# Caps: ask-mode-cap-v1 (agent/ask-run.js checks for this line too): a job's
+# permissionMode of auto or dontAsk runs the turn in it without the checkout's
+# config (run_claude), never as bypassPermissions.
 set -uo pipefail
 
 mode=run
@@ -272,6 +281,7 @@ post_result() {
   [ -f "$work/pr-body.cut" ] || : > "$work/pr-body.cut"
   [ -f "$work/pr-descs.json" ] || printf '{}' > "$work/pr-descs.json"
   [ -f "$work/pushes.json" ] || printf 'null' > "$work/pushes.json"
+  [ -f "$work/unpushed.json" ] || printf 'null' > "$work/unpushed.json"
   while :; do
     # A byte cut can split a character; iconv -c drops the partial one rather
     # than leave jq to turn it into U+FFFD.
@@ -281,12 +291,13 @@ post_result() {
     body=$(jq -n --rawfile result "$work/reply.cut" --arg sid "$session" --argjson turns "$num_turns" \
       --argjson isError "$is_error" --arg reason "$reason" --arg base "$base" --arg repo "$repo" \
       --argjson bundle "$bundle_sent" --rawfile prBody "$work/pr-body.cut" --slurpfile prDescs "$work/pr-descs.json" \
-      --slurpfile pushes "$work/pushes.json" \
+      --slurpfile pushes "$work/pushes.json" --slurpfile unpushed "$work/unpushed.json" \
       'def opt: if . == "" then null else . end;
        {result: $result, sessionId: ($sid | opt), isError: $isError, numTurns: $turns,
         exitReason: ($reason | opt), baseSha: ($base | opt), repo: ($repo | opt), bundle: $bundle,
         prDescription: ($prBody | opt), prDescriptions: ($prDescs[0] // {})}
-       + (if $pushes[0] == null then {} else {pushes: $pushes[0]} end)') \
+       + (if $pushes[0] == null then {} else {pushes: $pushes[0]} end)
+       + (if $unpushed[0] == null then {} else {unpushed: $unpushed[0]} end)') \
       || body='{"result":"","isError":true,"numTurns":null,"exitReason":"termag-subagent-run could not encode the reply","bundle":false}'
     printf '%s' "$body" > "$work/result.json"
     # Bytes, not ${#body}: that counts characters in a UTF-8 locale.
@@ -387,9 +398,14 @@ github_repo() {
 # is a commit, often not a branch tip (the merge-base with an upstream that moved
 # on), and upload-pack serves an unadvertised commit only under protocol v2 or
 # with allowAnySHA1InWant; an owner's protocol.version=0 or 1 would refuse it.
+#
+# The prepare's fetches run no auto maintenance (maintenance.auto=false): a git
+# whose maintenance repacks after a fetch (2.56's geometric repack, or a box
+# user's gc settings) would rewrite a new clone's linked packs (link_borrowed),
+# gigabytes for webapp, while its turn starts.
 fetch_local() {
   local r=$1; shift
-  git -C "$r" fetch --upload-pack='git -c uploadpack.allowAnySHA1InWant=true upload-pack' "$@"
+  git -C "$r" -c maintenance.auto=false fetch --upload-pack='git -c uploadpack.allowAnySHA1InWant=true upload-pack' "$@"
 }
 
 # A branch name the job may give: what git accepts, nothing a shell or a URL
@@ -412,7 +428,9 @@ pick_default_branch() {
 }
 
 # The pre-push hook of a push-mode clone: refuses a push to the default branch,
-# warns about protected paths and commits not authored as the asker. Hygiene,
+# warns about protected paths and commits not authored as the asker, and, for
+# commits that change .github/workflows, says what a refusal for want of the
+# `workflow` scope means. Hygiene,
 # not a boundary (--no-verify skips it); GitHub's rules protect the rest.
 write_pre_push_hook() {
   local hook=$thread/repo/.git/hooks/pre-push
@@ -433,13 +451,31 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   [ "$local_sha" = "$zero" ] && continue
+  # What the push adds: commits on no branch the remote has, so a merge of
+  # <default>, or of a branch cut from a newer <default>, adds none of theirs.
+  range=("$local_sha" --not --remotes="$remote")
   if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
-    range=("$local_sha" "^$remote_sha")
-  else
-    range=("$local_sha" --not --remotes="$remote")
+    range+=("$remote_sha")
   fi
-  paths=$(git log --format= --name-only "${range[@]}" 2>/dev/null | grep -E '^\.github/workflows/|(^|/)CODEOWNERS$|(^|/)sudoers(\.d/|$)|\.sudoers$' | sort -u)
+  paths=$(git log --format= --name-only "${range[@]}" 2>/dev/null | grep -E '^\.github/workflows/|(^|/)CODEOWNERS$|(^|/)sudoers(\.d/|$)|\.sudoers$' | LC_ALL=C sort -u)
+  pushed=$paths
+  # And of those, only the ones the PR's diff (<default>...<local>) still changes.
+  base=refs/remotes/$remote/$default
+  if [ -n "$paths" ] && [ -n "$default" ] && git rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+    paths=$(LC_ALL=C comm -12 <(printf '%s\n' "$paths") <(git diff --name-only "$base...$local_sha" 2>/dev/null | LC_ALL=C sort -u))
+  fi
   [ -z "$paths" ] || printf 'termag: warning: %s changes protected files, which need a reviewer who owns them:\n%s\n' "${remote_ref#refs/heads/}" "$paths" >&2
+  # GitHub checks the `workflow` scope on every commit it doesn't have, even
+  # one whose change a later commit takes back, so this reads what the push
+  # carries, not the PR's diff. The stored token may lack the scope.
+  # The hook runs before
+  # GitHub answers, so the line is conditional; the wording is backend
+  # services/workflowScope.ts's.
+  if printf '%s\n' "$pushed" | grep -q '^\.github/workflows/'; then
+    cat >&2 <<'SCOPE'
+termag: if GitHub refuses this push for want of the `workflow` scope: this push changes workflow files compared with GitHub's copy, and the stored GitHub token has no `workflow` scope. Usually this means the branch is based on a different main than GitHub's: rebase onto the current origin/main and push again. Or, to allow workflow edits, run `gh auth refresh -h github.com -s workflow` and paste `gh auth token` into Settings → GitHub again.
+SCOPE
+  fi
   if [ -n "$email" ]; then
     others=$(git log --format='%h %ae %ce' "${range[@]}" 2>/dev/null | awk -v e="$email" '$2 != e || $3 != e' | head -5)
     [ -z "$others" ] || printf 'termag: warning: commits on %s not authored and committed as %s:\n%s\n' "${remote_ref#refs/heads/}" "$email" "$others" >&2
@@ -479,6 +515,14 @@ configure_push_clone() {
   b=$(git -C "$r" symbolic-ref -q --short HEAD 2>/dev/null) || b=
   if [ -n "$b" ] && ! git -C "$r" rev-parse -q --verify "$b@{upstream}" >/dev/null 2>&1; then set_upstream "$b"; fi
   write_pre_push_hook
+  # A run the orchestrator caps (auto or dontAsk: a project from a shared
+  # environment, whose checkouts anyone signed in may have set) never gets the
+  # repo's own hooks: its git commit would run them as the box user, which
+  # Claude's disableAllHooks doesn't reach. One installed by an earlier prepare
+  # is taken out, and the hook it kept as .legacy put back.
+  case $(field permissionMode) in
+    auto|dontAsk) remove_pre_commit_hooks; return ;;
+  esac
   # The repo's own hooks (gitleaks, for termag) when it has them. pre-commit
   # keeps an existing hook as .legacy and runs it, so ours stays in force.
   if [ -f "$r/.pre-commit-config.yaml" ] && command -v pre-commit >/dev/null 2>&1; then
@@ -486,12 +530,28 @@ configure_push_clone() {
   fi
 }
 
-# fetch_origin: the default branch and the thread's branch, when GitHub has it.
+# Every hook pre-commit generated in the clone, whatever its type (a repo's
+# default_install_hook_types may name pre-push too), back to the one it kept.
+remove_pre_commit_hooks() {
+  local h
+  for h in "$thread/repo/.git/hooks/"*; do
+    [ -f "$h" ] && grep -qs 'File generated by pre-commit' "$h" || continue
+    if [ -f "$h.legacy" ]; then mv -f "$h.legacy" "$h"; else rm -f "$h"; fi
+  done
+}
+
+# fetch_origin: the default branch (and origin/HEAD at it) and the thread's
+# branch, when GitHub has it, with no auto maintenance (fetch_local says why).
 fetch_origin() {
   local r=$thread/repo
-  git -C "$r" fetch -q --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
+  git -C "$r" -c maintenance.auto=false fetch -q --no-tags origin "+refs/heads/$default_branch:refs/remotes/origin/$default_branch" \
     || log "could not fetch $default_branch from origin"
-  git -C "$r" fetch -q --no-tags origin "+refs/heads/$push_branch:refs/remotes/origin/$push_branch" 2>/dev/null || true
+  # origin/HEAD, as a clone sets it: tools that ask git for the default branch
+  # (gh stack, `git symbolic-ref refs/remotes/origin/HEAD`) find it.
+  if git -C "$r" rev-parse -q --verify "refs/remotes/origin/$default_branch" >/dev/null; then
+    git -C "$r" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default_branch" || log "could not set origin/HEAD"
+  fi
+  git -C "$r" -c maintenance.auto=false fetch -q --no-tags origin "+refs/heads/$push_branch:refs/remotes/origin/$push_branch" 2>/dev/null || true
 }
 
 # Puts the clone on push_branch: GitHub's tip of it when there is one and the
@@ -510,21 +570,120 @@ checkout_push_branch() {
   set_upstream "$push_branch"
 }
 
-# A push-mode clone of the base: its whole history, fetched from the live
-# checkout (only the base's, so unpushed commits never come along), then
-# origin.
+# link_borrowed <repo>: the object stores the live checkout borrows through
+# objects/info/alternates (a webapp project borrows the image's baked
+# /home/termag/src/webapp), and the ones those borrow, hard-linked into
+# <repo>'s own store, which gets no alternates; and refs/termag/have/* at the
+# commits those stores' repos have on refs/heads and refs/remotes, so the
+# fetch from the checkout that follows sends only what lies beyond them.
+#
+# Git writes a pack or a loose object once and never changes it, so the links
+# are the clone's own copy: a gc, repack or prune in a borrowed store or the
+# checkout writes new files and unlinks its old names, and the data stays
+# under the clone's names, as it does when either is removed. Linking takes
+# no time and no disk; a fetch of the whole history from the checkout
+# re-packs it (webapp: ~2M objects, 2 GB, ~100 s). The checkout's own store
+# is never linked: it holds the unpushed commits, which only the fetch keeps
+# out. Bitmaps, .keep, multi-pack indexes and commit-graphs stay behind; they
+# describe the source's set of packs.
+#
+# All or nothing: returns 1 with nothing linked when the checkout borrows no
+# store, is partial, or it or a borrowed store's repo is shallow, or when any
+# file could not be linked (another filesystem, or a gc removing it
+# meanwhile); the fetch then brings the whole history, as with no links.
+link_borrowed() {
+  local r=$1 dest=$1/.git/objects d line p idx n=0
+  local -a queue=() seen=()
+  d=$(git -C "$cwd" rev-parse --path-format=absolute --git-path objects 2>/dev/null) && [ -d "$d" ] || return 1
+  [ "$(git -C "$cwd" rev-parse --is-shallow-repository 2>/dev/null)" = false ] || return 1
+  [ -z "$(git -C "$cwd" config --get extensions.partialClone 2>/dev/null)" ] || return 1
+  # Each store's alternates name the stores it borrows; a relative entry is
+  # relative to the store that names it. Git follows them five deep.
+  alternates_of() {
+    [ -f "$1/info/alternates" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+      case $line in ''|'#'*) continue ;; esac
+      [[ $line == /* ]] || line=$1/$line
+      (cd -- "$line" 2>/dev/null && pwd -P) || return 1
+    done < "$1/info/alternates"
+  }
+  while IFS= read -r line; do queue+=("$line"); done < <(alternates_of "$d" || echo '!')
+  while [ "${#queue[@]}" -gt 0 ]; do
+    d=${queue[0]}; queue=("${queue[@]:1}")
+    [ "$d" = '!' ] && { unlink_borrowed "$r"; return 1; }
+    [[ " ${seen[*]-} " == *" $d "* ]] && continue
+    seen+=("$d")
+    [ "${#seen[@]}" -gt 5 ] && { unlink_borrowed "$r"; return 1; }
+    # A shallow repo's tips have no history behind them in its store: offered
+    # as haves, the fetch would leave the clone without their ancestors.
+    [ -e "${d%/objects}/shallow" ] && { unlink_borrowed "$r"; return 1; }
+    for p in "$d"/pack/pack-*.pack; do
+      [ -f "$p" ] || continue
+      idx=${p%.pack}.idx
+      # A pack with no index yet is still being written; its objects are in another one.
+      [ -f "$idx" ] || continue
+      ln -f -- "$p" "$idx" "$dest/pack/" 2>/dev/null || { unlink_borrowed "$r"; return 1; }
+      [ -f "${p%.pack}.rev" ] && ln -f -- "${p%.pack}.rev" "$dest/pack/" 2>/dev/null
+      n=$((n + 1))
+    done
+    for p in "$d"/[0-9a-f][0-9a-f]; do
+      [ -d "$p" ] || continue
+      cp -Rlf -- "$p" "$dest/" 2>/dev/null || { unlink_borrowed "$r"; return 1; }
+    done
+    # The store's repository: <git dir>/objects, a work tree's or a bare one's.
+    git --git-dir="${d%/objects}" for-each-ref --format='%(objectname)' refs/heads refs/remotes 2>/dev/null
+    while IFS= read -r line; do queue+=("$line"); done < <(alternates_of "$d" || echo '!')
+  done > "$r/.git/termag-haves"
+  [ "$n" -gt 0 ] || { unlink_borrowed "$r"; return 1; }
+  # Only tips whose commits the links brought: a ref the store's repo has
+  # with no object behind it would otherwise say the clone has what it hasn't.
+  LC_ALL=C sort -u "$r/.git/termag-haves" \
+    | git -C "$r" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+    | awk '$2 == "commit" { printf "create refs/termag/have/%d %s\n", NR, $1 }' \
+    | git -C "$r" update-ref --stdin || { unlink_borrowed "$r"; return 1; }
+  rm -f -- "$r/.git/termag-haves"
+  linked_packs=$n
+}
+linked_packs=0
+
+# Takes back what link_borrowed linked: a fresh clone's store, emptied.
+unlink_borrowed() {
+  local o=$1/.git/objects
+  rm -f -- "$1/.git/termag-haves"
+  git -C "$1" for-each-ref --format='delete %(refname)' refs/termag/have/ | git -C "$1" update-ref --stdin 2>/dev/null
+  find "$o" -mindepth 1 -maxdepth 1 -name '[0-9a-f][0-9a-f]' -exec rm -rf -- {} +
+  rm -f -- "$o"/pack/pack-*
+  linked_packs=0
+}
+
+# A push-mode clone of the base: what the checkout borrows linked in
+# (link_borrowed), and the rest of the base's history fetched from the live
+# checkout (only the base's, so unpushed commits never come along); then
+# origin, fetched with the base as a commit it has. Logs how long it took,
+# and --prepare says so (cloneSeconds).
 clone_for_push() {
-  local url=$1 r=$thread/repo
+  local url=$1 r=$thread/repo started how
+  started=$(date +%s%N)
   rm -rf -- "$r" "$thread/meta.json"
-  git init -q "$r" \
-    && fetch_local "$r" -q --no-tags "file://$cwd" "+$base:refs/termag/start" \
+  git init -q "$r" || fail "could not clone ${base:0:12} from $cwd"
+  if link_borrowed "$r"; then how="$linked_packs packs linked from the stores $cwd borrows, the rest fetched from it"
+  else how="the whole history fetched from $cwd"; fi
+  fetch_local "$r" -q --no-tags "file://$cwd" "+$base:refs/termag/start" \
     && git -C "$r" remote add origin "$url" \
     || fail "could not clone ${base:0:12} from $cwd"
-  git -C "$r" update-ref -d refs/termag/start
   default_branch=$(pick_default_branch)
+  # refs/termag/start and the haves stay through the fetch from GitHub: a fetch
+  # with no refs offers GitHub nothing it has, so a default branch that moved
+  # past the base brings its whole history again (webapp: 1.4M objects,
+  # 1.2 GB, minutes through the broker).
   fetch_origin
+  git -C "$r" for-each-ref --format='delete %(refname)' refs/termag/ | git -C "$r" update-ref --stdin
   checkout_push_branch
+  clone_seconds=$(awk -v ns="$(( $(date +%s%N) - started ))" 'BEGIN { printf "%.1f", ns / 1e9 }')
+  log "the thread's clone took ${clone_seconds}s: $how, then origin and $push_branch checked out"
 }
+# Seconds the thread's clone took when --prepare made one (--prepare's cloneSeconds).
+clone_seconds=
 
 # A clone from before push mode (shallow, `ask` and pr/<name>, refs/termag/base)
 # becomes a push-mode one: its history in full, origin, and its branches renamed
@@ -552,6 +711,11 @@ convert_for_push() {
   git -C "$r" update-ref -d refs/termag/base 2>/dev/null
   checkout_push_branch
   log "converted the thread's clone for pushing, on $push_branch"
+  # The turn that converts the clone is told so (--prepare's `notice`, ahead of
+  # its message). A resumed session was told to commit on `ask`, leave the
+  # publishing to termag and write TERMAG_ASK_PR_BODY_FILE; none of that holds
+  # now, and a turn that goes on believing it commits, stops, and pushes nothing.
+  notice="termag converted this thread's clone for pushing before this turn: the \`ask\` branch is now \`$push_branch\` (and each \`pr/<name>\` is now \`$push_branch-<name>\`), and the clone has an \`origin\`. What you were told earlier about committing on \`ask\` and termag publishing it no longer holds: termag publishes nothing at the end of a turn now, and TERMAG_ASK_PR_BODY_FILE and TERMAG_ASK_PR_DIR are no longer set. Commit on \`$push_branch\` and push it yourself (\`git push origin HEAD:$push_branch\`), including any commits an earlier turn left unpushed. To change a pull request's description, write it to a file and run \`termag-pr-body <file> > <marked> && gh pr edit <n> --body-file <marked>\` (the termag-pr skill); don't pipe it into \`--body-file -\`, because gh still runs when termag-pr-body fails and an empty stdin blanks the description."
 }
 
 # Sets base, repo, resume and fresh (true when the clone was made now). The
@@ -560,6 +724,8 @@ convert_for_push() {
 # another phase's prepare rather than fail.
 resume=
 fresh=false
+# What the turn is told ahead of its message: the conversion, once.
+notice=
 prepare_thread() {
   sweep
   # A person's message goes to a thread whose checkout is long there.
@@ -683,15 +849,27 @@ run_claude() {
   # claude -p stays up while a wakeup or cron it scheduled is pending, so a
   # fallback wakeup left behind after the answer holds the reply until it fires
   # (30 min). Background agents still bring the run back without them.
-  args=(-p --output-format json --permission-mode bypassPermissions
+  # The ask's own mode is bypassPermissions. The orchestrator caps one at auto
+  # or dontAsk (a project made from a shared environment, whose checkouts
+  # anyone signed in may have set; agent/ask-run.js CAPPED_MODES): then, as
+  # agent/chat-runner.js permissionArgs does, no .mcp.json, checkout settings
+  # (apiKeyHelper, env) or hooks load, and dontAsk keeps to reading.
+  local mode
+  mode=$(field permissionMode)
+  case "$mode" in auto|dontAsk) ;; *) mode=bypassPermissions ;; esac
+  args=(-p --output-format json --permission-mode "$mode"
         --disallowedTools 'ScheduleWakeup CronCreate'
         --append-system-prompt "$(cat "$work/system-prompt.txt")")
+  if [ "$mode" != bypassPermissions ]; then
+    [ "$mode" = dontAsk ] && args+=(--tools 'Read,Grep,Glob')
+    args+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}' --setting-sources user --settings '{"disableAllHooks":true}')
+  fi
   [ -n "$resume" ] && args+=(--resume "$resume")
 
   git_name=$(field gitName)
   git_email=$(field gitEmail)
   log "thread $thread_id: running in $thread/repo (base ${base:0:12}${resume:+, resuming $resume})"
-  field prompt > "$work/prompt"
+  { [ -z "$notice" ] || printf '[termag: %s]\n\n' "$notice"; field prompt; } > "$work/prompt"
   (
     cd "$thread/repo" || exit 70
     unset TMUX TMUX_PANE
@@ -718,10 +896,24 @@ run_claude() {
 # reflog whenever a push moves it, so these are the branches the run (or a
 # person in the thread's chat) pushed, whatever the turn; the orchestrator
 # records each idempotently. Local branches with commits no origin branch
-# has are named in the reply: committed but not pushed.
+# has, and a detached HEAD's commits on no branch, are committed but not
+# pushed: named in the reply, with the push that publishes them, and as
+# [{branch, commits, to}] in $work/unpushed.json (`HEAD` for a detached HEAD;
+# `to`, the branch the push names on GitHub), so the orchestrator records why
+# nothing reached GitHub instead of `none`, naming the same push. Commits in
+# the clone's base (meta.json's `base`) are never counted: with origin
+# unreachable at prepare, a fresh clone has no origin branch to measure
+# against, and its whole history would read as the turn's.
+# Whichever turn made them: a canceled turn's commits are named by the next.
 report_pushes() {
-  local r=$thread/repo ref b n
+  local r=$thread/repo ref b n to dest head clone_base base_ex=()
   printf '[]' > "$work/pushes.json"
+  printf '[]' > "$work/unpushed.json"
+  # Where the thread's commits go: its branch, when the job names one.
+  to=
+  valid_branch "$push_branch" && to=$push_branch
+  clone_base=$(jq -r '.base // empty' "$thread/meta.json" 2>/dev/null) || clone_base=
+  if [[ $clone_base =~ ^[0-9a-f]{40}$ ]] && git -C "$r" cat-file -e "$clone_base^{commit}" 2>/dev/null; then base_ex=("$clone_base"); fi
   while IFS= read -r ref; do
     b=${ref#refs/remotes/origin/}
     [ "$b" = HEAD ] && continue
@@ -737,10 +929,35 @@ report_pushes() {
     if git -C "$r" rev-parse -q --verify "refs/remotes/origin/$b" >/dev/null; then
       n=$(git -C "$r" rev-list --count "refs/remotes/origin/$b..refs/heads/$b" 2>/dev/null) || n=0
     else
-      n=$(git -C "$r" rev-list --count "refs/heads/$b" --not --remotes=origin 2>/dev/null) || n=0
+      n=$(git -C "$r" rev-list --count "refs/heads/$b" --not --remotes=origin "${base_ex[@]}" 2>/dev/null) || n=0
     fi
-    [ "${n:-0}" -gt 0 ] && printf '\n\n[termag: branch %s has %s commit(s) that were committed but not pushed; they stay in %s on the box]\n' "$b" "$n" "$r" >> "$work/reply"
+    [ "${n:-0}" -gt 0 ] || continue
+    # The thread's branch and its <branch>-<name> siblings (separate PRs) push to
+    # their own names; so does a branch origin has (one gh pr checkout made, say).
+    dest=$to
+    if [ -z "$to" ] || [ "$b" = "$to" ] || [[ $b == "$to"-* ]] || git -C "$r" rev-parse -q --verify "refs/remotes/origin/$b" >/dev/null; then dest=$b; fi
+    unpushed "$b" "$n" "$dest"
+    if [ "$dest" = "$b" ]; then
+      printf '\n\n[termag: branch %s has %s commit(s) that were committed but not pushed; they stay in %s on the box until a turn pushes them (`git push origin %s`)]\n' "$b" "$n" "$r" "$b" >> "$work/reply"
+    else
+      printf '\n\n[termag: branch %s has %s commit(s) that were committed but not pushed; they stay in %s on the box. The thread'\''s branch is %s: a turn publishes them there with `git push origin %s:%s`]\n' "$b" "$n" "$r" "$to" "$b" "$to" >> "$work/reply"
+    fi
   done < <(git -C "$r" for-each-ref --format='%(refname:short)' refs/heads/)
+  # A detached HEAD: its commits on no branch are reachable only from the reflog.
+  if ! git -C "$r" symbolic-ref -q HEAD >/dev/null 2>&1 && head=$(git -C "$r" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null); then
+    n=$(git -C "$r" rev-list --count "$head" --not --branches --remotes=origin "${base_ex[@]}" 2>/dev/null) || n=0
+    if [ "${n:-0}" -gt 0 ]; then
+      unpushed HEAD "$n" "$to"
+      printf '\n\n[termag: HEAD is detached at %s with %s commit(s) on no branch, not pushed; they stay in %s on the box. A turn publishes them with `git push origin HEAD:%s`]\n' "${head:0:12}" "$n" "$r" "${to:-<branch>}" >> "$work/reply"
+    fi
+  fi
+  [ "$(jq length "$work/unpushed.json")" = 0 ] || log "committed but not pushed: $(jq -r 'map("\(.branch) (\(.commits))") | join(", ")' "$work/unpushed.json")"
+}
+
+# unpushed <branch> <commits> [<to>]: one entry of $work/unpushed.json.
+unpushed() {
+  jq --arg b "$1" --argjson n "$2" --arg to "${3:-}" '. + [{branch: $b, commits: $n} + (if $to == "" then {} else {to: $to} end)]' "$work/unpushed.json" > "$work/unpushed.next" \
+    && mv "$work/unpushed.next" "$work/unpushed.json"
 }
 
 # From $work/claude.json (claude -p's JSON, or the chat turn's result event)
@@ -801,9 +1018,12 @@ case $mode in
   prepare)
     prepare_thread
     jq -cn --arg dir "$thread/repo" --arg base "$base" --arg repo "$repo" --argjson fresh "$fresh" \
-      --arg prBodyFile "$pr_body_file" --arg prDir "$pr_dir" --arg branch "$push_branch" \
+      --arg prBodyFile "$pr_body_file" --arg prDir "$pr_dir" --arg branch "$push_branch" --arg notice "$notice" \
+      --arg cloneSeconds "$clone_seconds" \
       'if $branch == "" then {repoDir: $dir, base: $base, repo: $repo, fresh: $fresh, prBodyFile: $prBodyFile, prDir: $prDir}
-       else {repoDir: $dir, base: $base, repo: $repo, fresh: $fresh, push: true, branch: $branch} end'
+       else {repoDir: $dir, base: $base, repo: $repo, fresh: $fresh, push: true, branch: $branch} end
+       + (if $notice == "" then {} else {notice: $notice} end)
+       + (if $cloneSeconds == "" then {} else {cloneSeconds: ($cloneSeconds | tonumber)} end)'
     exit 0
     ;;
   report)

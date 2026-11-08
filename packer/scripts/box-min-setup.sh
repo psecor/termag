@@ -20,9 +20,9 @@
 #     runs in panes ON the box, so the engine is contract, not war cache —
 #     the compose images pull per project
 #   * the agent CLIs, same set and shapes as the full bake: @anthropic-ai/
-#     claude-code and @openai/codex npm-global under nvm, pi@1.0.2 pinned with
-#     --ignore-scripts (the version the full bake pins and the bootstrap
-#     checks), cursor-agent and devin from their vendor installers
+#     claude-code and @openai/codex npm-global under nvm, pi pinned by
+#     deploy/termag-pi-update's PINS, its checked package installed with
+#     --ignore-scripts, cursor-agent and devin from their vendor installers
 #   * the deploy/ units and scripts for the agent (box-lib.sh's
 #     install_deploy_artifacts), the TERMAG_BOX marker
 #     (install_box_marker), the guest-browser wiring (install_guest_browser),
@@ -192,9 +192,7 @@ nvm alias default "$NODE_VERSION"
 # installers — devin's auto-login bombs out at bake, the binary is placed
 # before that, so a non-zero exit is accepted here and verified below.
 npm install -g @anthropic-ai/claude-code @openai/codex
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
-command -v pi >/dev/null || { echo "[packer/box-min] pi missing after npm install -g -- failing build" >&2; exit 1; }
-[ "$(pi --version 2>/dev/null)" = "1.0.2" ] || { echo "[packer/box-min] pi is not the pinned 1.0.2 -- failing build" >&2; exit 1; }
+# pi: below, from the termag checkout's pinned package (deploy/termag-pi-update).
 NVM_INSTALL
 
 # Cursor agent CLI (vendor installer, lands in ~/.local/bin). Non-fatal: if
@@ -261,6 +259,20 @@ sh termag/cli/install.sh --bin-dir "\$HOME/.local/bin"
 # tag of the image it launched from.
 echo "\$baked" > /home/termag/.termag-baked-sha
 EOF
+
+# pi, as the full bake installs it (packer/scripts/setup.sh): the newest pin
+# in deploy/termag-pi-update's PINS, its package checked against the pin's
+# sha512 and npm-installed from that file with --ignore-scripts. A package
+# that is not the pinned one fails the build.
+sudo -u termag -H bash <<'PI_INSTALL'
+set -euo pipefail
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+"$HOME/src/termag/deploy/termag-pi-update" --install-pinned || { echo "[packer/box-min] pi's pinned package did not install, or is not the pinned one -- failing build" >&2; exit 1; }
+want=$("$HOME/src/termag/deploy/termag-pi-update" --newest-pin)
+command -v pi >/dev/null || { echo "[packer/box-min] pi missing after its install -- failing build" >&2; exit 1; }
+[ "$(pi --version 2>/dev/null)" = "$want" ] || { echo "[packer/box-min] pi is not the pinned $want -- failing build" >&2; exit 1; }
+PI_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
 # systemd --user unit + per-user scripts + the box marker. Cloud-init writes

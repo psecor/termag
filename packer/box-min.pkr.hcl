@@ -63,7 +63,7 @@ variable "associate_public_ip_address" {
 variable "iam_instance_profile" {
   type        = string
   default     = "AmazonSSMRoleForInstancesQuickSetup"
-  description = "Instance profile for the builder; its role needs AmazonSSMManagedInstanceCore so the SSM agent registers (packer communicates over Session Manager)."
+  description = "Instance profile for the builder; its role needs the SSM agent's registration and session actions (packer communicates over Session Manager). AmazonSSMManagedInstanceCore provides them and also grants ssm:GetParameter and ssm:GetParameters on *; termag-ami-builder drops those reads when example-org/terraform#28995 is applied."
 }
 
 variable "instance_type" {

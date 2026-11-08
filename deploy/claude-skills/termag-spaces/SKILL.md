@@ -89,6 +89,34 @@ spaces`; then give the user the exact command to run on their laptop, or
 point them at the space's **Members & boxes** tab in termag. Only add people
 the user asked for: everyone you add can read everything in the space.
 
+## A space's Slack channels
+
+A space owner can link Slack channels to a space, so people there talk to the
+space by mentioning `@termag` (behind the `space-channels-enabled` flag; until
+it is on for the user, every command answers `Space channels are not turned
+on for you`). This is `termag space slack`; `termag space link` is something
+else (an alias of `termag space url`).
+
+```sh
+termag space slack status team                     # linked channels, runner, paused or not
+termag space slack channels pay                    # channels one can link, with their ids
+termag space slack link team '#payments' --yes     # preview, then link
+termag space slack link team --create space-team --yes   # a new public channel (--private)
+termag space slack unlink team '#payments' --yes
+termag space slack pause team                      # resume, disable
+termag space slack runner team offer ana@example.com     # the runner hands over; ana runs `… accept`
+```
+
+- Every link and unlink prints a preview first (how many people in the
+  channel are not members of the space, and will see its answers). Show it to
+  the user and get their go-ahead before passing `--yes`: linking exposes the
+  space to the whole channel.
+- Only the user's own request justifies a link, and only an owner may: like
+  managing a space, it needs a person (`termag login` on this box).
+- A private channel needs termag in it first: the user types `/invite
+  @termag` in the channel. In Slack itself the same is `/termag link <space>`,
+  typed in the channel.
+
 ## Plans and notes that outlive this session
 
 A session ends, its context is compacted, and the box itself can be parked,
@@ -147,12 +175,11 @@ commit for another agent.
 
 | Exit | Message | What it means |
 |------|---------|---------------|
-| 3 | `Not found` | spaces aren't on for this box's owner, or the space doesn't exist or isn't reachable (names don't leak) |
+| 3 | `Not found` | the space doesn't exist or isn't reachable (names don't leak) |
 | 3 | `You reach no spaces; …` | nobody added this box to a space: a member adds it with `termag space boxes <space> add <this box>` or the box's **Spaces…** menu |
 | 3 | `No file … in …` / `Nothing at …` | the path is wrong: `termag space ls <space>:<folder>/` and try the right one |
 | 1 | `You are a viewer of …; this needs editor` / `… is read-only …` | the role can't write here: ask an owner for editor |
 | 1 | `A box cannot manage spaces; …` | a person has to run it (see "Sharing a space with a teammate") |
-| 1 | `Sharing spaces with other people is not turned on for you yet` | people can't be added yet; share the file another way |
 | 1 | `… is over its quota …` / `Files are limited to 5 GiB` | too big: tell the user |
 | 4 | `Not signed in …` / `… refused the CLI's credential …` | the box's agent token is missing or revoked: ask the user to check the box in termag |
 

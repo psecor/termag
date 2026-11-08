@@ -1,0 +1,35 @@
+[Unit]
+Description=termag: Python update run %i from the orchestrator (the newest patch of the minor, staged and verified, then pyenv and uv switched)
+
+[Service]
+# Why this exists: the orchestrator's Python updates,
+# as termag-claude-update@.service is Claude Code's. The agent's
+# tool-update RPC starts termag-python-update@<run>.service with the run id as
+# the instance name and answers at once; this unit runs the update outside the
+# agent's process. systemd runs one instance per run id at a time, so a
+# repeated RPC for the same run joins the one running. Nothing on the box
+# starts it on its own: no [Install] section, and termag-reconcile lists it as
+# noenable.
+Type=oneshot
+
+# The copy termag-reconcile installed, beside termag-tool-update-lib. %i is
+# the run id the agent checked against ^[a-z0-9]{20,40}$; the script checks it
+# again. --run asks the orchestrator for the run's policy with the agent token
+# (no version or command crosses the RPC), installs one exact CPython patch of
+# the installed minor with uv into a staging directory, verifies it, and only
+# then switches pyenv's global and uv's minor link; then it reports. %h
+# survives the cloud-init user rename.
+ExecStart=%h/.local/bin/termag-python-update --run %i
+
+# Exit 1 (still below the floor) and 3 (a switch whose rollback did not
+# complete) are outcomes the report carries, not unit failures.
+SuccessExitStatus=0 1 3
+
+# The ceiling for the whole run: the 900 s budget (TERMAG_PYTHON_BUDGET: the
+# download, the checks, the switch) and the report. No session is stopped, so
+# there is no drain to wait for. A stop sends SIGTERM, and the run puts back
+# whatever it had switched and reports failed.
+TimeoutStartSec=20min
+
+# Behind the owner's own work: a build in a pane should not notice this.
+Nice=10

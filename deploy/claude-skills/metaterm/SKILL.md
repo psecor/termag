@@ -87,7 +87,7 @@ this project (its own git worktree, branched off your current HEAD commit, its
 own tmux pair in the sidebar), or with `target: "project"` in a new project.
 termag writes a brief from `task`, `context` and `doneWhen` under a fixed
 header naming you as the parent. Claude Code asks before every call, and the
-backend may refuse it: the `agent-spawn-enabled` flag, or a limit (depth, unreported children
+backend may refuse it: a limit (depth, unreported children
 of this session, spawns an hour, your spawned agents running), or a box that is running hot or
 full. A refusal on a busy box names one of your boxes with room. Call `spawn_budget` first when
 you plan several spawns: it shows each limit, what is used, the box's load, and hints.

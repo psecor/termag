@@ -170,7 +170,9 @@ sessions_cases() {
   # STUBBORN=1 (ignores SIGTERM).
   mkdir -p "$WORK/fake"
   # BUSY_AS: what the turn shows (tool: a tool line; compose: a composing
-  # line; long: a tool line scrolled far up a long transcript; ask: the select prompt).
+  # line; long: a tool line scrolled far up a long transcript; ask: the select prompt;
+  # scope: the newer approval list, whose first line starts with the ❭ glyph;
+  # wrapped: that list on a narrow pane, cursor on Deny, its footer split over lines).
   cat > "$WORK/fake/fake-devin.sh" <<'EOF'
 if [ -n "${STUBBORN:-}" ]; then trap '' TERM; else trap 'exit 0' TERM; fi
 shown=
@@ -182,13 +184,20 @@ busy_screen() {
     guide) printf '  \342\217\272 Ran npm test\n\n\342\235\255 Guide Devin while it works\n' ;;
     long) printf '\342\217\272 Ran npm test\n'; i=0; while [ $i -lt 30 ]; do echo "  test $i ... ok"; i=$((i + 1)); done ;;
     ask) printf 'Run rm -rf build?\n  1 Yes\n  2 No\n \342\206\221\342\206\223 select \302\267 \342\206\265 confirm\n' ;;
+    scope) printf '\342\227\217 Running command\n\342\235\255 Allow  Once  Exec(rm)\n  Deny\n\342\206\221\342\206\223 select \302\267 \342\206\224 scope \302\267 e edit \302\267 \342\206\265 confirm \302\267 esc cancel\n' ;;
+    wrapped) printf '\342\227\217 Running command\n  Allow  Once  Exec(rm)\n\342\235\255 Deny\n\342\206\221\342\206\223 select \302\267 \342\206\224\nscope \302\267 e edit \302\267 \342\206\265\nconfirm \302\267 esc cancel\n' ;;
   esac
 }
 while :; do
   if [ -n "${BUSY_UNTIL:-}" ] && [ ! -e "$BUSY_UNTIL" ]; then
     [ "$shown" = busy ] || { busy_screen; shown=busy; }
   else
-    [ "$shown" = idle ] || { printf '\033[2J\033[H\n\342\235\255 \n'; shown=idle; }
+    if [ "$shown" != idle ]; then
+      printf '\033[2J\033[H'
+      # QUOTED=1: a diff line quoting the approval footer above the idle prompt.
+      [ -n "${QUOTED:-}" ] && printf '\342\224\202 +  footer: \342\206\221\342\206\223 select \302\267 \342\206\224 scope \302\267 \342\206\265 confirm\n'
+      printf '\n\342\235\255 \n'; shown=idle
+    fi
   fi
   sleep 0.2
 done
@@ -361,7 +370,9 @@ PY
   pane long BUSY_UNTIL="$WORK/never" BUSY_AS=long
   pane asking BUSY_UNTIL="$WORK/never" BUSY_AS=ask
   pane guided BUSY_UNTIL="$WORK/never" BUSY_AS=guide
-  sleep 1; c_pid=$(pid_in composing) l_pid=$(pid_in long) a_pid=$(pid_in asking) g_pid=$(pid_in guided)
+  pane scoped BUSY_UNTIL="$WORK/never" BUSY_AS=scope
+  pane wrapped BUSY_UNTIL="$WORK/never" BUSY_AS=wrapped
+  sleep 1; c_pid=$(pid_in composing) l_pid=$(pid_in long) a_pid=$(pid_in asking) g_pid=$(pid_in guided) s_pid=$(pid_in scoped) w_pid=$(pid_in wrapped)
   policy 200 idle "$NEW" 6
   runs & rp=$!
   sleep 4
@@ -369,8 +380,10 @@ PY
   is_running "$l_pid" || fail 'idle: a tool line far up a long transcript is a turn in progress' alive stopped
   is_running "$a_pid" || fail 'idle: a pending question is a turn in progress' alive stopped
   is_running "$g_pid" || fail 'idle: the ❭ prompt reading "Guide Devin while it works" is a turn in progress' alive stopped
+  is_running "$s_pid" || fail 'idle: the newer approval list (❭ Allow … ↔ scope … ↵ confirm) is a turn in progress' alive stopped
+  is_running "$w_pid" || fail 'idle: the list with a wrapped footer and the cursor on Deny is a turn in progress' alive stopped
   wait "$rp"
-  [ "$(report '.sessions.cut')" = 4 ] || fail 'idle: all four cut at drainSec' 4 "$(report .detail)"
+  [ "$(report '.sessions.cut')" = 6 ] || fail 'idle: all six cut at drainSec' 6 "$(report .detail)"
   teardown
 
   # idle: waits for the pane to leave its turn, then stops it; one still in a turn at drainSec is cut.
@@ -387,6 +400,16 @@ PY
   is_running "$busy_pid" && fail 'idle: stopped once out of its turn' stopped alive
   is_running "$stuck_pid" && fail 'idle: one still in a turn at drainSec is cut' stopped alive
   [ "$(report '.sessions.cut')" = 1 ] || fail 'idle: one cut' 1 "$(report .detail)"
+  teardown
+
+  # idle: a diff quoting the approval footer is not a question; the pane is idle and stopped, not cut.
+  setup
+  pane quoted QUOTED=1
+  sleep 1; q_pid=$(pid_in quoted)
+  policy 200 idle "$NEW" 6
+  runs
+  is_running "$q_pid" && fail 'idle: a quoted approval footer over the idle prompt is idle' stopped alive
+  [ "$(report '.sessions.cut')" = 0 ] || fail 'idle: the quoted-footer pane is not cut' 0 "$(report .detail)"
   teardown
 }
 if [ "${1:-}" = --sessions ]; then

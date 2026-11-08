@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# termag-docker-update — update Docker on a box, only while it starts, before
+# dockerd brings anyone's containers up ("Docker: an
+# update at the box's start").
+#
+# Why this exists: the image installs Docker from download.docker.com
+# (packer/scripts/setup.sh: docker-ce, docker-ce-cli, containerd.io,
+# docker-buildx-plugin, docker-compose-plugin), Ubuntu's unattended upgrades
+# do not cover that repository, and nothing moves it afterwards: half the
+# fleet was behind 29.9.3 on 2026-11-04. Upgrading those packages restarts
+# dockerd, which stops every running container (local webapp stacks, dev
+# databases; the bake sets no live-restore). So the update never happens on a
+# running box: an admin's Update, the fleet action and the automatic sweep
+# only queue a run on the orchestrator, and this script, from the system unit
+# termag-docker-update.service (Before=containerd.service docker.service, at
+# every boot), takes it on the box's next start.
+#
+# A hibernation resume is not a start: no unit runs on resume, and the
+# containers a hibernated box had are still running in its memory.
+#
+# What a boot does:
+#   1. Refuses to go on when containerd or dockerd is running, or a container
+#      shim is: only a box nothing runs on is ever upgraded.
+#   2. GET <orchestrator>/api/tool-update/policy?component=docker&atStart=1
+#      with the agent token (read as the agent user, on curl's stdin). With no
+#      Docker run queued for this box the answer names none, and the boot
+#      goes on at once, having installed nothing and reported nothing.
+#   3. With one, the run is started (the same fetch with its id, the lib's
+#      tu_fetch_policy), /var/lib/termag/docker-update/docker-update.lock is
+#      taken, and Docker's apt list alone is refreshed.
+#   4. The target resolves to one docker-ce version that download.docker.com
+#      lists (latest: the newest; x.y.z: exactly it). docker-ce and
+#      docker-ce-cli go to it, and containerd.io, docker-buildx-plugin and
+#      docker-compose-plugin to the newest that repository lists, in one
+#      apt-get transaction of exact version strings only Docker's repository
+#      has; only packages below those move, never one down. A policy-rc.d
+#      keeps dpkg from starting containerd or dockerd mid-install (their own
+#      units start after this one).
+#   5. Accepted only when dpkg says each package is at its version and
+#      `dockerd --version` and `docker --version` both say the target;
+#      otherwise rejected (the record, exit 3) and the versions before put
+#      back from the repository (which keeps every release) or apt's cache.
+#   6. POST <orchestrator>/api/tool-update/report: {component: "docker", ...}.
+#
+# What is still trusted: Docker's apt repository and its signing key
+# (/etc/apt/keyrings/docker.asc), as for the image bake.
+#
+# Usage:
+#   termag-docker-update --boot    what termag-docker-update.service runs, as root
+#
+# Exit codes: 0 when nothing was asked of it or Docker is at or above the
+# floor, 1 when it is below it or missing, 2 on bad usage (or a box that is
+# running Docker), 3 while an install is rejected, 143 when a signal stops it.
+#
+# Env (the unit's EnvironmentFile, /etc/termag/docker-update.env):
+#   TERMAG_DOCKER_AGENT_UID        the box user the agent runs as (by uid)
+# and, for tests (read only by a run that is not root):
+#   TERMAG_DOCKER_AS_USER          1: run as this user, with these overrides
+#   DOCKER_BIN, DOCKERD_BIN        the docker and dockerd to judge
+#   TERMAG_DOCKER_STATE_DIR        the lock and record
+#   TERMAG_DOCKER_SOURCES          Docker's apt list (default
+#                                  /etc/apt/sources.list.d/docker.list)
+#   TERMAG_DOCKER_POLICY_RC        the policy-rc.d path (default /usr/sbin/policy-rc.d)
+#   TERMAG_DOCKER_APT_ARCHIVES     apt's package cache
+#   TERMAG_DOCKER_BUDGET           seconds the boot may take (default 240)
+#   TERMAG_DOCKER_INSTALL_TIMEOUT  seconds for each apt step (default 180)
+#   TERMAG_POLICY_TIMEOUT          seconds for each orchestrator call (default 10)
+
+set -u
+if [ "$(id -u)" = 0 ]; then
+  AS_USER=0
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  unset DOCKER_BIN DOCKERD_BIN TERMAG_DOCKER_STATE_DIR TERMAG_DOCKER_SOURCES TERMAG_DOCKER_POLICY_RC TERMAG_DOCKER_APT_ARCHIVES TERMAG_AGENT_CONFIG
+elif [ "${TERMAG_DOCKER_AS_USER:-}" = 1 ]; then
+  AS_USER=1
+  PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+else
+  printf 'termag-docker-update: run as root (termag-docker-update.service)\n' >&2
+  exit 2
+fi
+export PATH LC_ALL=C DEBIAN_FRONTEND=noninteractive
+umask 077
+
+DOCKER_REPO=https://download.docker.com/linux/ubuntu
+# The five packages the image installs, moved together. docker-ce and
+# docker-ce-cli are released together under one version, the one the policy
+# names; the other three have their own.
+PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+ARCHIVES=/var/cache/apt/archives
+SOURCES=/etc/apt/sources.list.d/docker.list
+STATE_DIR=/var/lib/termag/docker-update
+POLICY_RC=/usr/sbin/policy-rc.d
+if [ "$AS_USER" = 1 ]; then
+  ARCHIVES="${TERMAG_DOCKER_APT_ARCHIVES:-$ARCHIVES}"
+  SOURCES="${TERMAG_DOCKER_SOURCES:-$SOURCES}"
+  STATE_DIR="${TERMAG_DOCKER_STATE_DIR:-$STATE_DIR}"
+  POLICY_RC="${TERMAG_DOCKER_POLICY_RC:-$POLICY_RC}"
+fi
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+LOCK_WAIT=''
+INSTALL_TIMEOUT="${TERMAG_DOCKER_INSTALL_TIMEOUT:-180}"
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-docker-update TU_COMPONENT=docker TU_BIN=dockerd TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/docker-update.lock
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+REJECTED=$STATE_DIR/docker-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-docker-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-docker-update --boot"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+case "${1:-}" in
+  --boot) [ $# -eq 1 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_DOCKER_BUDGET:-240}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-10}"
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+for n in "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+AGENT_UID="${TERMAG_DOCKER_AGENT_UID:-}"
+case "$AGENT_UID" in ''|0|*[!0-9]*) log "no agent user (TERMAG_DOCKER_AGENT_UID '${AGENT_UID}'); see /etc/termag/docker-update.env"; exit 2 ;; esac
+
+tu_budget
+
+# ── 1. nothing runs yet ─────────────────────────────────────────────────────
+# The unit is ordered before containerd and dockerd, so at boot neither has
+# started. Anything else (a run by hand on a live box, a unit started late)
+# finds them, or a container's shim, and installs nothing.
+docker_running() {
+  local u
+  for u in containerd.service docker.service; do
+    systemctl is-active --quiet "$u" 2>/dev/null </dev/null && { printf '%s is active' "$u"; return 0; }
+  done
+  pgrep -x dockerd >/dev/null 2>&1 && { printf 'dockerd is running'; return 0; }
+  pgrep -x containerd >/dev/null 2>&1 && { printf 'containerd is running'; return 0; }
+  pgrep -f containerd-shim >/dev/null 2>&1 && { printf 'a container shim is running'; return 0; }
+  return 1
+}
+if why=$(docker_running); then
+  log "$why: Docker is only updated while the box starts, before any container runs; installing nothing"
+  exit 2
+fi
+
+POLICY_RC_MARK='# termag-docker-update: no service starts while Docker is installed at boot.'
+# One an earlier run left (the box lost power mid-install): ours by its
+# mark, so removed at the next boot; it would stop every package's service
+# starts for good (Bugbot on #1305). Anyone else's is left alone.
+# Only under the run's lock, held for the removal itself: a run installing
+# right now holds it, and its policy-rc.d is live (Devin on #1305).
+if [ -f "$POLICY_RC" ] && grep -qxF -- "$POLICY_RC_MARK" "$POLICY_RC" 2>/dev/null; then
+  mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null
+  if ( exec 8>"$TU_LOCK_FILE" && flock -n 8 && rm -f "$POLICY_RC" ) 2>/dev/null; then
+    log "removed the $POLICY_RC an interrupted run left"
+  else
+    log "another run holds $TU_LOCK_FILE; leaving its $POLICY_RC"
+  fi
+fi
+
+resolve() { local b=${DOCKERD_BIN:-/usr/bin/dockerd}; [ -x "$b" ] && printf '%s' "$b"; }
+client() { local b=${DOCKER_BIN:-/usr/bin/docker}; [ -x "$b" ] && printf '%s' "$b"; }
+
+# The container runtime containerd.io ships (containerd, and the runc it
+# bundles) has advisories of its own; the run moves containerd.io to the
+# newest Docker's repository lists, and then checks both against the newest
+# version an advisory requires (the floor):
+#   containerd 2.4.2: CVE-2026-95839, GHSA-8647-2jxj-p2rc, GHSA-hc94-p972-ch66
+#     (image pulls that crash containerd or exhaust the host disk), in
+#     containerd.io 2.4.2-1 (Docker Engine 29.9.1's release notes);
+#   runc 1.3.3: CVE-2025-31133, CVE-2025-52565, CVE-2025-52881 (container
+#     escapes, 2025-11-05; fixed in 1.2.8, 1.3.3 and 1.4.0-rc.3).
+MIN_CONTAINERD=2.4.2 MIN_RUNC=1.3.3
+runtime_bin() { local v=${1^^}_BIN b; b=${!v:-/usr/bin/$1}; [ -x "$b" ] && printf '%s' "$b"; }
+runtime_check() {
+  local c r cv rv
+  c=$(runtime_bin containerd) r=$(runtime_bin runc)
+  cv=; [ -n "$c" ] && cv=$(ver "$c")
+  rv=; [ -n "$r" ] && rv=$(ver "$r")
+  runtime_note="containerd:${cv:-?},runc:${rv:-?}"
+  if ! at_least "$cv" "$MIN_CONTAINERD" || ! at_least "$rv" "$MIN_RUNC"; then
+    runtime_note="$runtime_note:FAILED:below-advisory-min(containerd>=$MIN_CONTAINERD,runc>=$MIN_RUNC)"
+    log "containerd ${cv:-unknown} / runc ${rv:-unknown} is below what the advisories require (containerd $MIN_CONTAINERD, runc $MIN_RUNC), and download.docker.com lists nothing newer for this box"
+  fi
+}
+
+# The agent's endpoint, from the agent user's config, read as that user
+# (deploy/termag-gh-update's, the same rules): root never opens the user's
+# paths itself, the token goes to curl on its stdin, and the URL must be the
+# agent's own endpoint.
+agent_endpoint() {
+  local home cfg body=''
+  [ -n "$AGENT_URL" ] && return 0
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { POLICY=no-curl-or-jq; return 1; }
+  home=$(getent passwd "$AGENT_UID" | cut -d: -f6)
+  case "$home" in /*) ;; *) POLICY=no-agent-user; return 1 ;; esac
+  for cfg in "$home/src/termag/agent/agent.config.json" "$home/.termag/agent.config.json" "$home/.config/termag/agent.config.json"; do
+    if [ "$AS_USER" = 1 ]; then
+      body=$(head -c 65536 -- "$cfg" 2>/dev/null) || body=
+    else
+      body=$(setpriv --reuid="$AGENT_UID" --regid="$(id -g "$AGENT_UID" 2>/dev/null || echo 65534)" --clear-groups --no-new-privs \
+        head -c 65536 -- "$cfg" 2>/dev/null </dev/null) || body=
+    fi
+    [ -n "$body" ] && break
+  done
+  [ -n "$body" ] || { POLICY=no-agent-config; return 1; }
+  AGENT_TOKEN=$(printf '%s' "$body" | jq -r '.token // empty' 2>/dev/null) || AGENT_TOKEN=
+  AGENT_URL=$(printf '%s' "$body" | jq -r '.termag_url // empty' 2>/dev/null) || AGENT_URL=
+  [[ "$AGENT_TOKEN" =~ ^[A-Za-z0-9._~+/=-]{8,512}$ ]] || AGENT_TOKEN=
+  [[ "$AGENT_URL" =~ ^wss?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?/ws/agent$ ]] || AGENT_URL=
+  if [ -z "$AGENT_TOKEN" ] || [ -z "$AGENT_URL" ]; then POLICY=no-token; AGENT_URL=; return 1; fi
+  return 0
+}
+
+# ── 2. a run queued for this start? ─────────────────────────────────────────
+# One call, short: every boot of every box makes it, and docker.service waits
+# for it. No answer (no network, the orchestrator down) is no run.
+if ! agent_endpoint; then
+  log "no agent endpoint ($POLICY); no Docker update at this start"
+  exit 0
+fi
+qbody=$(mktemp "${TMPDIR:-/tmp}/termag-docker-atstart.XXXXXX")
+api Q_CODE "$qbody" GET "tool-update/policy?component=docker&atStart=1"
+queued_run=
+[ "$Q_CODE" = 200 ] && queued_run=$(jq -r '.run.id // empty' "$qbody" 2>/dev/null)
+rm -f "$qbody"
+if ! [[ "$queued_run" =~ ^[a-z0-9]{20,40}$ ]]; then
+  log "no Docker update queued for this start (HTTP $Q_CODE); starting Docker as it is"
+  exit 0
+fi
+# shellcheck disable=SC2034  # MODE, RUN_ID: read by termag-tool-update-lib
+MODE=run RUN_ID=$queued_run
+log "run $RUN_ID is queued for this start"
+# The run's own policy, as every recipe fetches it: this box's fetch started
+# it moments ago, so the orchestrator hands the same run back (its retry).
+tu_fetch_policy
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not hand run $RUN_ID back; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+inst_note=- runtime_note=''
+tu_notes() { printf 'apt=%s%s' "$inst_note" "${runtime_note:+ runtime=$runtime_note}"; }
+# A runtime still below its advisory minimum is FAILED in the notes: an updated
+# run is then partial, and one that could move nothing failed, never current
+# (the box is exposed).
+tu_notes_all() { printf '%s%s' "$inst_note" "${runtime_note:+,$runtime_note}"; }
+# No sessions: a container is not a session of the tool, and none runs yet.
+find_sessions() { :; }
+tu_status() { printf idle; }
+tu_had() { return 1; }
+tu_resume_line() { :; }
+
+# ── Docker's apt repository ─────────────────────────────────────────────────
+APT_OPTS=(-o DPkg::Lock::Timeout=60 -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
+apt_refresh() {
+  [ -r "$SOURCES" ] || { log "no $SOURCES: Docker is not from download.docker.com on this box"; return 1; }
+  grep -qE "^deb .*${DOCKER_REPO//./\\.}( |$)" "$SOURCES" || { log "$SOURCES is not download.docker.com's"; return 1; }
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -o Dir::Etc::sourcelist="$SOURCES" -o Dir::Etc::sourceparts=- \
+    -o APT::Get::List-Cleanup=0 -qq update </dev/null >&2
+}
+# repo_versions PKG: the full version strings download.docker.com lists for PKG, newest first.
+repo_versions() {
+  apt-cache madison "$1" 2>/dev/null </dev/null \
+    | awk -F'|' -v repo="$DOCKER_REPO" '{ v=$2; s=$3; gsub(/ /, "", v); if (index(s, " " repo " ") == 1) print v }' \
+    | grep -E '^[0-9A-Za-z.:~+-]+$' | sort -rV
+}
+# upstream FULL: 5:29.9.3-1~ubuntu.24.04~noble -> 29.9.3
+upstream() { local v=${1#*:}; v=${v%%-*}; v=${v%%~*}; printf '%s' "$v"; }
+newer() { dpkg --compare-versions "$1" gt "$2" 2>/dev/null; }
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null </dev/null; }
+# tu_resolve_tag latest: the newest docker-ce the repository lists.
+tu_can_resolve() { return 0; }
+tu_resolve_tag() { [ "$1" = latest ] && upstream "$(repo_versions docker-ce | head -n 1)"; }
+# full_for PKG X.Y.Z: the repository's version string of PKG at upstream X.Y.Z.
+full_for() { local f; while read -r f; do [ "$(upstream "$f")" = "$2" ] && { printf '%s' "$f"; return 0; }; done < <(repo_versions "$1"); return 1; }
+cached_deb() {  # cached_deb PKG FULL: apt's cached package file of PKG at FULL, by its own fields
+  local f
+  for f in "$ARCHIVES"/"$1"_*.deb; do
+    [ -f "$f" ] || continue
+    [ "$(dpkg-deb -f "$f" Package 2>/dev/null)" = "$1" ] && [ "$(dpkg-deb -f "$f" Version 2>/dev/null)" = "$2" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# dpkg's maintainer scripts start containerd and dockerd once configured
+# (deb-systemd-invoke). At boot those units are ordered after this one, so a
+# start would wait on it; and nothing may start containers before the whole
+# set verifies. A policy-rc.d that answers 101 (action forbidden) for the
+# install's length, removed after, unless one was there before.
+POLICY_RC_OURS=0
+hold_services() {
+  [ -e "$POLICY_RC" ] && { log "$POLICY_RC exists; leaving it as it is"; return 0; }
+  printf '#!/bin/sh\n%s\nexit 101\n' "$POLICY_RC_MARK" >"$POLICY_RC" && chmod 0755 "$POLICY_RC" && POLICY_RC_OURS=1
+}
+release_services() { [ "$POLICY_RC_OURS" = 1 ] && rm -f "$POLICY_RC"; POLICY_RC_OURS=0; }
+on_boot_signal() { release_services; on_signal; }
+
+apt_install() {  # apt_install PKG=FULL...: exactly those, nothing else upgraded, never down
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -qq install -y --no-install-recommends "$@" </dev/null >&2
+}
+apt_put_back() {  # apt_put_back PKG=FULL|FILE...: the versions before, down from what was just installed
+  run_capped "$(left "$INSTALL_TIMEOUT")" apt-get "${APT_OPTS[@]}" -qq install -y --no-install-recommends --allow-downgrades "$@" </dev/null >&2
+}
+
+trap on_boot_signal TERM INT HUP
+
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 0700 "$STATE_DIR" 2>/dev/null
+tu_lock
+
+bin=$(resolve)
+have=; [ -n "$bin" ] && have=$(ver "$bin")
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then
+  log "installing nothing"
+  finish
+fi
+if ! apt_refresh; then
+  inst_note="${have:-none}->FAILED"
+  log "could not refresh download.docker.com's index; installing nothing"
+  finish
+fi
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+
+# The Engine (docker-ce and its cli) goes to the target, never down: a box
+# already above an exact target keeps its Engine, and still gets containerd
+# and the plugins (Devin on #1305).
+declare -A to before
+for p in "${PKGS[@]}"; do before[$p]=$(pkg_version "$p"); done
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+engine_v=$spec_v
+if downgrade "$have" && ! was_rejected docker; then
+  engine_v=$have
+  # The cli to the Engine's own version when the repository lists it: an
+  # interrupted install can leave it behind dockerd (Devin on #1305).
+  to[docker-ce]=${before[docker-ce]}
+  to[docker-ce-cli]=$(full_for docker-ce-cli "$have") || to[docker-ce-cli]=${before[docker-ce-cli]}
+  log "dockerd is $have; $spec_v would move it down, so the Engine stays (no-downgrade)"
+else
+  to[docker-ce]=$(full_for docker-ce "$spec_v") || to[docker-ce]=
+  to[docker-ce-cli]=$(full_for docker-ce-cli "$spec_v") || to[docker-ce-cli]=
+  if [ -z "${to[docker-ce]}" ] || [ -z "${to[docker-ce-cli]}" ]; then
+    inst_note="${have:-none}->FAILED:not-in-repo:$spec_v"
+    log "download.docker.com does not list docker-ce and docker-ce-cli $spec_v; installing nothing"
+    finish
+  fi
+fi
+# The other three to the newest the repository lists. All five move
+# together: one the repository lists no version of fails the run before
+# anything is installed (Devin on #1305).
+for p in containerd.io docker-buildx-plugin docker-compose-plugin; do
+  to[$p]=$(repo_versions "$p" | head -n 1)
+  if [ -z "${to[$p]}" ]; then
+    inst_note="${have:-none}->FAILED:not-in-repo:$p"
+    log "download.docker.com lists no $p; installing nothing"
+    finish
+  fi
+done
+plan=()
+for p in "${PKGS[@]}"; do
+  if [ -z "${before[$p]}" ] || newer "${to[$p]}" "${before[$p]}"; then plan+=("$p=${to[$p]}"); fi
+done
+
+verify() {  # every package at its version, and both binaries say the Engine's
+  local p pv
+  for p in "${PKGS[@]}"; do
+    pv=$(pkg_version "$p")
+    [ "$pv" = "${to[$p]}" ] || newer "$pv" "${to[$p]}" || { bad="$p is ${pv:-not installed}"; return 1; }
+  done
+  [ "$(ver "$(resolve)")" = "$engine_v" ] || { bad="dockerd --version says $(ver "$(resolve)")"; return 1; }
+  [ "$(ver "$(client)")" = "$engine_v" ] || { bad="docker --version says $(ver "$(client)")"; return 1; }
+  return 0
+}
+bad=
+reinstall=()
+if [ "${#plan[@]}" -eq 0 ] && ! was_rejected docker; then
+  # Nothing behind: still checked, so a broken install is never reported
+  # current; one that does not verify is reinstalled at the same versions
+  # (Devin on #1305).
+  if verify; then
+    if [ "$engine_v" = "$spec_v" ]; then inst_note=${have:-none}; else inst_note="$have(no-downgrade)"; fi
+    log "Docker is at $engine_v and its plugins are current, verified; nothing to install"
+    runtime_check
+    finish
+  fi
+  log "the packages are at their versions, but $bad; reinstalling them"
+  for p in "${PKGS[@]}"; do plan+=("$p=${to[$p]}"); done
+  reinstall=(--reinstall)
+fi
+
+log "dockerd is ${have:-not installed}; installing ${plan[*]} from download.docker.com (at most $(left "$INSTALL_TIMEOUT")s)"
+hold_services
+apt_install "${reinstall[@]}" "${plan[@]}" || log "apt-get failed; checking what it left"
+release_services
+
+if verify; then
+  inst_note="${have:-none}->$engine_v"
+  log "Docker is now $engine_v (${plan[*]}), verified (dpkg, dockerd and docker --version)"
+  accept docker
+  runtime_check
+  finish
+fi
+inst_note="${have:-none}->pin-mismatch"
+reject docker "asked for $engine_v; $bad"
+# Put the versions before back: download.docker.com keeps every release, else
+# apt's cache of the package, verified by dpkg either way.
+back=()
+for p in "${PKGS[@]}"; do
+  b=${before[$p]}
+  [ -n "$b" ] && [ "$(pkg_version "$p")" != "$b" ] || continue
+  if repo_versions "$p" | grep -qxF -- "$b"; then back+=("$p=$b")
+  elif deb=$(cached_deb "$p" "$b"); then back+=("$deb")
+  else log "$p $b is neither in download.docker.com's index nor in apt's cache"
+  fi
+done
+if [ "${#back[@]}" -gt 0 ]; then
+  hold_services
+  apt_put_back "${back[@]}" || log "putting the versions before back failed"
+  release_services
+  ok=1
+  for p in "${PKGS[@]}"; do [ -z "${before[$p]}" ] || [ "$(pkg_version "$p")" = "${before[$p]}" ] || ok=0; done
+  if [ "$ok" = 1 ] && [ "$(ver "$(resolve)")" = "$have" ]; then
+    inst_note="$inst_note,restored:$have"
+    log "Docker $have is back, verified"
+  fi
+fi
+finish

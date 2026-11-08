@@ -77,8 +77,9 @@ rc=0" ] || fail 'github skipped: nothing set, nothing printed, no failure' '||/u
 UNIT="$DIR/termag-agent.service"
 grep -qxF 'Environment=CLAUDE_CODE_SHELL=/bin/bash' "$UNIT" || fail 'the agent unit sets CLAUDE_CODE_SHELL' 'Environment=CLAUDE_CODE_SHELL=/bin/bash' 'absent'
 grep -qxF 'Environment=BASH_ENV=%h/.local/share/termag/bash-env' "$UNIT" || fail 'the agent unit sets BASH_ENV' 'Environment=BASH_ENV=%h/.local/share/termag/bash-env' 'absent'
-grep -qxF 'termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable' "$DIR/termag-reconcile" \
-  || fail 'termag-reconcile installs the file BASH_ENV names' 'termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable' 'absent'
+# A classified row: core, so a box with termag setup off gets it too.
+grep -qxF 'termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable:core' "$DIR/termag-reconcile" \
+  || fail 'termag-reconcile installs the file BASH_ENV names, as a core row' 'termag-bash-env:$HOME/.local/share/termag/bash-env:644:file:noenable:core' 'absent'
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)"

@@ -34,11 +34,17 @@ hidden `<!-- termag: box=<id> project=<name> -->` line and a small
   don't remove them from a PR description.
 - Rewriting an existing PR's description: write the new body to a file in
   your own directory with your file tool, then run
-  `termag-pr-body <dir>/body.md | gh pr edit <n> --body-file -` with the PR
-  number as `<n>`. A body that already carries the markers is
-  unwrapped first, so nothing gets doubled up.
+  `termag-pr-body <dir>/body.md > <dir>/marked.md && gh pr edit <n> --body-file <dir>/marked.md`
+  with the PR number as `<n>`. Don't pipe it into `gh pr edit --body-file -`:
+  gh runs even when `termag-pr-body` fails (say the file is gone), and an
+  empty stdin blanks the description. A body that already carries the
+  markers is unwrapped first, so nothing gets doubled up.
 - `termag-pr-create` refuses `--title`, `--body`, `--body-file`, `--fill`,
   `--template` and `--web`, because they would replace what you wrote.
+- When the branch's remote is the GitHub broker URL, `termag-pr-create` adds
+  `--head <branch> --repo <owner/repo>` itself, with the name GitHub knows
+  the repo by after a rename or transfer. Pass `--head` or `--repo` only to
+  override that.
 - In a `termag ask` run (`TERMAG_ASK_THREAD` is set): open the PR as a
   draft, and end the body with who asked and how to follow up, e.g. "Asked by
   `<username>` through `termag ask`; follow up with `termag ask … --thread

@@ -8,6 +8,8 @@
 #     (workstream worktrees included), then the git checkout's name
 #   * a marked body is unwrapped first, so a second pass doesn't stack
 #   * values can't close the HTML comment
+#   * a missing or blank body exits 1 and prints nothing, so it can't blank
+#     a PR; a bot's text on the footer line doesn't double the footer
 #
 # Run: sh deploy/termag-pr-body.test.sh
 set -u
@@ -103,6 +105,35 @@ want="$(printf '%s\n' 'Note above' '' '<!-- TERMAG_PR_BODY_BEGIN -->' 'Body' '<!
 [ "$got" = "$want" ] || fail 'keeps text before BEGIN and after the footer' "$want" "$got"
 again="$(printf '%s\n' "$got" | run --box b2 --project p)"
 [ "$again" = "$got" ] || fail 'a re-wrap with outside text is stable' "$got" "$again"
+
+# A bot appended onto the footer line: one footer after a re-wrap, its text kept.
+botted="$(printf '%s\n' "$once" | sed 's|^<sub>Opened from termag</sub>$|&<!-- preview-link -->|'; printf '%s\n' 'Preview: https://x')"
+got="$(printf '%s\n' "$botted" | run --box b --project p)"
+want="$(printf '%s\n' "$once" '' '<!-- preview-link -->' 'Preview: https://x')"
+[ "$got" = "$want" ] || fail 'text a bot put on the footer line keeps one footer' "$want" "$got"
+again="$(printf '%s\n' "$got" | run --box b --project p)"
+[ "$again" = "$got" ] || fail 'a re-wrap after a bot footer is stable' "$got" "$again"
+
+# ── a missing or blank body is an error, with nothing on stdout ─────────────
+: > "$WORK/empty.md"
+printf ' \n\t\n' > "$WORK/blank.md"
+mkdir -p "$WORK/adir"
+for case in "$WORK/absent.md" "$WORK/empty.md" "$WORK/blank.md" "$WORK/adir"; do
+  out="$(run --box b --project p "$case" 2>"$WORK/err")"
+  got=$?
+  [ "$got" = 1 ] || fail "exits 1 for $case" 1 "$got"
+  [ -z "$out" ] || fail "prints nothing for $case" '' "$out"
+  grep -q '^termag-pr-body: ' "$WORK/err" || fail "says why for $case" 'termag-pr-body: ...' "$(cat "$WORK/err")"
+done
+out="$(printf '' | run --box b --project p 2>/dev/null)"
+got=$?
+[ "$got" = 1 ] && [ -z "$out" ] || fail 'an empty stdin is an error' '1, no output' "$got, $out"
+err="$(run --box b --project p "$WORK/absent.md" 2>&1 >/dev/null)"
+[ "$err" = "termag-pr-body: no body file: $WORK/absent.md" ] || fail 'names the missing file' "no body file: $WORK/absent.md" "$err"
+
+# The skill's recipe: a missing body leaves the marked file empty and gh unrun.
+run --box b --project p "$WORK/absent.md" > "$WORK/marked.md" 2>/dev/null && : > "$WORK/gh.ran"
+[ ! -e "$WORK/gh.ran" ] || fail 'the recipe stops before gh pr edit' 'gh not run' 'gh ran'
 
 # ── values can't close the comment ──────────────────────────────────────────
 got="$(printf 'x' | run --box 'b -->' --project 'p<x>' --ask 'a b' | grep '^<!-- termag:')"

@@ -12,6 +12,21 @@
 # runs `gh pr create --title <title> --body-file -`. Neither text is ever
 # parsed by a shell. Flags that would replace the title or body (--title,
 # --body, --body-file, --fill*, --template, --web) are refused.
+#
+# When the branch's remote is configured as the GitHub broker URL itself
+# (https://<GH_HOST>/<owner>/<repo>.git) rather than github.com rewritten to
+# it by insteadOf, gh can't map the pushed branch to a GitHub repo ("you
+# must first push the current branch"), and if the repo was renamed or
+# transferred (the remote says example-team/research, GitHub says
+# example-org/research) it takes the head for a fork's. So unless --head or --repo is given (or GH_REPO is set),
+# this passes --head <branch> --repo <host>/<owner/repo>: the broker host, so
+# gh pr create targets the broker even when GH_HOST isn't set and the host was
+# read from the profile.d file, and the name GitHub reports for the remote's
+# repo (GraphQL repository(owner, name), which follows renames and transfers).
+#
+#   TERMAG_PR_CREATE_GH_HOST_FILE  default /etc/profile.d/termag-github.sh:
+#                                  where the broker host is read when GH_HOST
+#                                  isn't set
 set -euo pipefail
 
 die() { printf 'termag-pr-create: %s\n' "$1" >&2; exit 2; }
@@ -37,4 +52,85 @@ here=$(cd "$(dirname "$0")" && pwd)
 pr_body=$here/termag-pr-body
 [ -x "$pr_body" ] || pr_body=termag-pr-body
 
-"$pr_body" -- "$body_file" | gh pr create --title "$title" --body-file - "$@"
+# The broker host, as termag-credentials writes it: GH_HOST, else the one
+# `export GH_HOST=<host>` line of its profile.d file (read, never sourced).
+gh_host() {
+  if [ -n "${GH_HOST:-}" ]; then printf '%s' "$GH_HOST"; return 0; fi
+  local line
+  line=$(grep -m1 -E '^export GH_HOST=[A-Za-z0-9.-]+$' \
+    "${TERMAG_PR_CREATE_GH_HOST_FILE:-/etc/profile.d/termag-github.sh}" 2>/dev/null) || return 0
+  printf '%s' "${line#export GH_HOST=}"
+}
+
+# Whether ref names the commit HEAD is at.
+at_head() {
+  local at
+  at=$(git rev-parse -q --verify "$1^{commit}" 2>/dev/null) || return 1
+  [ "$at" = "$(git rev-parse -q --verify HEAD 2>/dev/null)" ]
+}
+
+# --head <branch> --repo <host/owner/repo>, one per line, for a branch whose remote
+# is the broker URL; nothing otherwise, or when the caller chose either.
+broker_target() {
+  local arg
+  for arg in "$@"; do
+    case $arg in -H*|--head|--head=*|-R*|--repo|--repo=*) return 0 ;; esac
+  done
+  [ -z "${GH_REPO:-}" ] || return 0
+  local host branch remote url path owner repo head merge full
+  host=$(gh_host)
+  case $host in ''|github.com) return 0 ;; esac
+  branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) || return 0
+  remote=$(git config "branch.$branch.pushRemote" 2>/dev/null) \
+    || remote=$(git config remote.pushDefault 2>/dev/null) \
+    || remote=$(git config "branch.$branch.remote" 2>/dev/null) \
+    || remote=origin
+  # The URL as configured, not `git remote get-url`, which applies insteadOf:
+  # a box rewrites github.com to the broker, and gh maps a github.com remote
+  # (and its forks' parents) itself.
+  url=$(git config "remote.$remote.pushurl" 2>/dev/null) \
+    || url=$(git config "remote.$remote.url" 2>/dev/null) || return 0
+  case $url in
+    https://"$host"/*) path=${url#https://"$host"/} ;;
+    https://*@"$host"/*) path=${url#https://*@"$host"/} ;;
+    *) return 0 ;;
+  esac
+  path=${path%/}; path=${path%.git}
+  case $path in ?*/?*) ;; *) return 0 ;; esac
+  owner=${path%%/*} repo=${path#*/}
+  case $repo in */*) return 0 ;; esac
+  # The branch's name on the remote, where it was pushed. That is its
+  # upstream's name (when the upstream is on this remote) under
+  # push.default=upstream or tracking, or when the push left the upstream's
+  # remote-tracking ref at HEAD and not the branch's own (`git push -u origin
+  # HEAD:review-123` from `work`). Otherwise it is the branch's own name: an
+  # ask clone tracks origin/<default>, the PR's base, and pushes its own name.
+  head=$branch
+  if [ "$(git config "branch.$branch.remote" 2>/dev/null)" = "$remote" ]; then
+    merge=$(git config "branch.$branch.merge" 2>/dev/null) || merge=
+    case $merge in
+      refs/heads/?*)
+        merge=${merge#refs/heads/}
+        case $(git config push.default 2>/dev/null) in
+          upstream|tracking) head=$merge ;;
+          *) at_head "refs/remotes/$remote/$merge" && ! at_head "refs/remotes/$remote/$branch" && head=$merge ;;
+        esac ;;
+    esac
+  fi
+  # GraphQL, not REST: through the broker, REST repos/<old owner>/<repo> is a
+  # 404 for a transferred repo, and GraphQL's repository() follows the move.
+  # shellcheck disable=SC2016  # $owner and $name are GraphQL variables
+  full=$(gh api graphql --hostname "$host" -f owner="$owner" -f name="$repo" \
+    -f query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { nameWithOwner } }' \
+    --jq .data.repository.nameWithOwner 2>/dev/null) || full=
+  case $full in ?*/?*) ;; *) full=$owner/$repo ;; esac
+  printf '%s\n' --head "$head" --repo "$host/$full"
+}
+
+target=()
+while IFS= read -r line; do target+=("$line"); done < <(broker_target "$@")
+
+# Mark the body before gh starts: piped, gh would run even when
+# termag-pr-body fails, and open the PR with an empty description.
+body=$("$pr_body" -- "$body_file") || exit
+printf '%s\n' "$body" | gh pr create --title "$title" --body-file - "$@" ${target[@]+"${target[@]}"}

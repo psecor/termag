@@ -40,6 +40,14 @@
 #   * so does the terminfo setup (deploy/termag-terminfo-setup), the same way
 #   * ~/.local and ~/.local/state lose group and other write (created when
 #     missing); nothing else about their mode changes, and --check only reports
+#   * a uv tool whose entry points, pyvenv.cfg or receipt still name the
+#     bake's /home/termag gets this home instead (boxes baked with an empty
+#     home-path index); --check only reports, and a home that is still the
+#     baked one, or a baked home that still exists, is left alone
+#   * termag setup off: every artifact and step is classified core or feature, a
+#     box with setup off installs core only, and --strip removes the bake's feature
+#     copies (files still identical, termag's own config entries) and keeps
+#     the owner's edits
 #
 # `systemctl` is stubbed: the real one would reach this user's actual manager.
 #
@@ -80,6 +88,12 @@ TERMAG_GH_UPDATE_SUDO=false; TERMAG_GH_UPDATE_BOX_MARKER="$WORK/no-box-marker"
 export TERMAG_GH_UPDATE_SUDO TERMAG_GH_UPDATE_BOX_MARKER
 TERMAG_AWS_UPDATE_SUDO=false; TERMAG_AWS_UPDATE_BOX_MARKER="$WORK/no-box-marker"
 export TERMAG_AWS_UPDATE_SUDO TERMAG_AWS_UPDATE_BOX_MARKER
+TERMAG_DOCKER_UPDATE_SUDO=false; TERMAG_DOCKER_UPDATE_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_DOCKER_UPDATE_SUDO TERMAG_DOCKER_UPDATE_BOX_MARKER
+
+# The baked home the uv-tool repair looks for: one that does not exist, so the
+# runner's own /home/termag never matters.
+TERMAG_BAKED_HOME="$WORK/baked-home/termag"; export TERMAG_BAKED_HOME
 
 # Record daemon-reload calls instead of issuing them.
 cat > "$STUB/systemctl" <<'STUBEOF'
@@ -109,6 +123,7 @@ seed_source termag-box-update            'v1-box-update'
 seed_source termag-box-update.service    'v1-box-update-unit'
 seed_source termag-project-clone         'v1-project-clone'
 seed_source 'termag-project-clone@.service' 'v1-project-clone-unit'
+seed_source termag-env                   'v1-env'
 seed_source termag-hook-run              'v1-hook-run'
 seed_source termag-credentials           'v1-credentials'
 seed_source termag-claude-token          'v1-claude-token'
@@ -158,6 +173,8 @@ seed_source 'termag-pi-update@.service'  'v1-pi-update-run-unit'
 seed_source termag-node-update           'v1-node-update'
 seed_source 'termag-node-update@.service' 'v1-node-update-run-unit'
 seed_source termag-node-release-keys.asc 'v1-node-release-keys'
+seed_source termag-python-update         'v1-python-update'
+seed_source 'termag-python-update@.service' 'v1-python-update-run-unit'
 seed_source termag-briefing              'v1-briefing'
 mkdir -p "$CHECKOUT/deploy/pi-ext"
 seed_source pi-ext/termag-status.ts      'v1-pi-ext'
@@ -170,7 +187,7 @@ seed_source claude-runner-hooks/post-session 'v1-hook-post-session'
 
 # ── --list ──────────────────────────────────────────────────────────────────
 got="$(run --list | wc -l | tr -d ' ')"
-[ "$got" = 63 ] || fail '--list prints every artifact' 63 "$got"
+[ "$got" = 67 ] || fail '--list prints every artifact' 67 "$got"
 
 # ── no checkout is not an error ─────────────────────────────────────────────
 out="$(HOME="$HOME_DIR" TERMAG_CHECKOUT="$WORK/absent" PATH="$STUB:$PATH" "$SCRIPT" 2>&1)"
@@ -188,6 +205,7 @@ for f in "$HOME_DIR/.config/systemd/user/termag-agent.service" \
          "$HOME_DIR/.config/systemd/user/termag-project-clone@.service" \
          "$HOME_DIR/.local/bin/termag-box-update" \
          "$HOME_DIR/.local/bin/termag-project-clone" \
+         "$HOME_DIR/.local/bin/termag-env" \
          "$HOME_DIR/.local/bin/termag-status" \
          "$HOME_DIR/.local/bin/termag-hooks-update" \
          "$HOME_DIR/.local/bin/termag-pi-fireworks" \
@@ -209,6 +227,8 @@ for f in "$HOME_DIR/.config/systemd/user/termag-agent.service" \
          "$HOME_DIR/.local/bin/termag-node-update" \
          "$HOME_DIR/.config/systemd/user/termag-node-update@.service" \
          "$HOME_DIR/.local/share/termag/termag-node-release-keys.asc" \
+         "$HOME_DIR/.local/bin/termag-python-update" \
+         "$HOME_DIR/.config/systemd/user/termag-python-update@.service" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-status.ts" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-status-core.ts" \
          "$HOME_DIR/.local/share/termag/pi-ext/termag-otel.ts" \
@@ -349,6 +369,9 @@ if [ -e "$WANTS/termag-pi-update@.service" ]; then
 fi
 if [ -e "$WANTS/termag-node-update@.service" ]; then
   fail 'does not enable termag-node-update@.service' '(no symlink)' 'symlink present'
+fi
+if [ -e "$WANTS/termag-python-update@.service" ]; then
+  fail 'does not enable termag-python-update@.service' '(no symlink)' 'symlink present'
 fi
 # Enabling this one would be wrong rather than merely surprising: the backend
 # starts it through the agent so the on-claim credential is minted immediately
@@ -962,6 +985,32 @@ case "$out" in *'reconciled: aws updater: installed: /etc/sudoers.d/termag-aws-u
 grep -qx "setup --agent-user $(id -un)" "$AWSU_LOG" || fail 'applies the aws updater setup for this user' "setup --agent-user $(id -un)" "$(cat "$AWSU_LOG")"
 rm -f "$CHECKOUT/deploy/termag-aws-update-setup" "$AWSU_DRIFT"
 
+# ── the docker updater setup ─────────────────────────────────────────────────
+# A stand-in like the gh updater's: logs, drifts while $DKU_DRIFT exists.
+cat > "$CHECKOUT/deploy/termag-docker-update-setup" <<'SETUPEOF'
+echo "setup $*" >> "$DKU_LOG"
+case " $* " in
+  *" --check "*) [ -f "$DKU_DRIFT" ] && { echo 'DRIFT: termag-docker-update.service is not enabled'; exit 1; }; exit 0 ;;
+esac
+echo 'installed: enabled termag-docker-update.service'
+rm -f "$DKU_DRIFT"
+SETUPEOF
+DKU_LOG="$WORK/dku-log"; DKU_DRIFT="$WORK/dku-drift"
+export DKU_LOG DKU_DRIFT
+touch "$WORK/box-marker" "$DKU_DRIFT"; : > "$DKU_LOG"
+dku_run() { TERMAG_DOCKER_UPDATE_BOX_MARKER="$WORK/box-marker" TERMAG_DOCKER_UPDATE_SUDO="$STUB/fake-sudo" run "$@"; }
+TERMAG_DOCKER_UPDATE_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+[ -s "$DKU_LOG" ] && fail 'the docker updater setup never runs off a box' 'empty log' "$(cat "$DKU_LOG")"
+out="$(dku_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'the docker updater setup drift is drift' 1 "$got"
+case "$out" in *'DRIFT: docker updater: termag-docker-update.service is not enabled'*) ;; *) fail '--check names the docker updater drift' 'DRIFT: docker updater: …' "$out" ;; esac
+grep -q "sudo bash $CHECKOUT/deploy/termag-docker-update-setup" "$SUDO_LOG" || fail 'the docker updater setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(dku_run 2>&1)"
+case "$out" in *'reconciled: docker updater: installed: enabled termag-docker-update.service'*) ;; *) fail 'applies the docker updater setup' 'reconciled: docker updater: …' "$out" ;; esac
+grep -qx "setup --agent-user $(id -un)" "$DKU_LOG" || fail 'applies the docker updater setup for this user' "setup --agent-user $(id -un)" "$(cat "$DKU_LOG")"
+rm -f "$CHECKOUT/deploy/termag-docker-update-setup" "$DKU_DRIFT"
+
 # ── the terminfo setup ──────────────────────────────────────────────────────
 # A stand-in like the guest browser's: logs, drifts while $TI_DRIFT exists,
 # fails a real run while $TI_FAILS exists.
@@ -1179,13 +1228,143 @@ case "$out" in *"MISSING: $STATE_DIR"*) ;; *) fail '--check reports a missing ~/
 (umask 002; run >/dev/null 2>&1)
 [ "$(mode_of "$STATE_DIR")" = drwxr-xr-x ] || fail 'creates ~/.local/state without group write under umask 002' drwxr-xr-x "$(mode_of "$STATE_DIR")"
 
+# ── uv tools that still name the baked home ──────────────────────────────────
+OLDH="$TERMAG_BAKED_HOME"
+UVT="$HOME_DIR/.local/share/uv/tools/pre-commit"
+mkdir -p "$UVT/bin"
+printf '#!%s/.local/share/uv/tools/pre-commit/bin/python\nimport sys\n' "$OLDH" > "$UVT/bin/pre-commit"
+chmod 755 "$UVT/bin/pre-commit"
+printf 'VIRTUAL_ENV=%s/.local/share/uv/tools/pre-commit\n' "$OLDH" > "$UVT/bin/activate"
+printf 'home = %s/.local/share/uv/python/cpython-3.13/bin\n' "$OLDH" > "$UVT/pyvenv.cfg"
+printf 'requirements = [{ name = "pre-commit" }]\n' > "$UVT/uv-receipt.toml"
+printf '#!/usr/bin/env python3\n# %s-not-the-home\n' "$OLDH" > "$UVT/bin/other"
+ln -s "$OLDH/.local/share/uv/python/cpython-3.13/bin/python3" "$UVT/bin/python"
+out="$(run --check 2>&1)"
+[ "$?" = 1 ] || fail '--check exits 1 on a uv tool naming the baked home' 1 "$out"
+case "$out" in *"DRIFT: $UVT/bin/activate names the baked home"*"DRIFT: $UVT/bin/pre-commit names the baked home"*"DRIFT: $UVT/pyvenv.cfg names the baked home"*) ;; *) fail '--check names the entry point, activate and pyvenv.cfg' 'DRIFT bin/activate, bin/pre-commit, pyvenv.cfg' "$out" ;; esac
+case "$out" in *uv-receipt.toml*|*bin/other*) fail '--check names only files with the baked home' 'no receipt, no bin/other' "$out" ;; esac
+grep -qF "#!$OLDH/" "$UVT/bin/pre-commit" || fail '--check rewrites nothing' "#!$OLDH/..." "$(head -1 "$UVT/bin/pre-commit")"
+run >/dev/null 2>&1
+[ "$(head -1 "$UVT/bin/pre-commit")" = "#!$HOME_DIR/.local/share/uv/tools/pre-commit/bin/python" ] \
+  || fail 'the entry point shebang names this home' "#!$HOME_DIR/.local/share/uv/tools/pre-commit/bin/python" "$(head -1 "$UVT/bin/pre-commit")"
+[ -x "$UVT/bin/pre-commit" ] || fail 'the entry point stays executable' executable "$(ls -l "$UVT/bin/pre-commit")"
+grep -qxF "VIRTUAL_ENV=$HOME_DIR/.local/share/uv/tools/pre-commit" "$UVT/bin/activate" || fail 'activate names this home' "$HOME_DIR" "$(cat "$UVT/bin/activate")"
+grep -qxF "home = $HOME_DIR/.local/share/uv/python/cpython-3.13/bin" "$UVT/pyvenv.cfg" || fail 'pyvenv.cfg names this home' "$HOME_DIR" "$(cat "$UVT/pyvenv.cfg")"
+[ "$(readlink "$UVT/bin/python")" = "$OLDH/.local/share/uv/python/cpython-3.13/bin/python3" ] || fail 'a symlink is left to the boot rewrite' "$OLDH/..." "$(readlink "$UVT/bin/python")"
+grep -qF "$OLDH-not-the-home" "$UVT/bin/other" || fail 'a path that only starts like the baked home is left alone' unchanged "$(cat "$UVT/bin/other")"
+out="$(run 2>&1)"
+[ -z "$out" ] || fail 'repaired uv tools are silent on the next run' '(no output)' "$out"
+printf '#!%s/.local/share/uv/tools/pre-commit/bin/python\n' "$OLDH" > "$UVT/bin/pre-commit"
+mkdir -p "$OLDH"
+out="$(run --check 2>&1)"
+[ "$?" = 0 ] || fail 'a baked home that still exists is not drift' 0 "$out"
+rmdir "$OLDH"
+out="$(TERMAG_BAKED_HOME="$HOME_DIR" run --check 2>&1)"
+[ "$?" = 0 ] || fail 'a home that is still the baked one is not drift' 0 "$out"
+rm -rf "$HOME_DIR/.local/share/uv"
+
+# ── termag setup off: every item is classified ───────────────────────────────────
+# A new row or step must say whether a box with termag setup off gets it.
+bad="$(run --list | awk -F: 'NF != 6 || ($6 != "core" && $6 != "feature")')"
+[ -z "$bad" ] || fail 'every artifact row ends in :core or :feature' '(none unclassified)' "$bad"
+bad="$(run --list-steps | awk -F: 'NF != 2 || ($2 != "core" && $2 != "feature")')"
+[ -z "$bad" ] || fail 'every step is :core or :feature' '(none unclassified)' "$bad"
+defined="$(grep -oE '^(reconcile|retire)_[a-z0-9_]+\(\)' "$SCRIPT" | tr -d '()' | sort)"
+listed="$(run --list-steps | cut -d: -f1 | sort)"
+[ "$defined" = "$listed" ] || fail 'every reconcile_/retire_ function is a classified step' "$defined" "$listed"
+direct="$(grep -nE '^[[:space:]]*(reconcile|retire)_[a-z0-9_]+[[:space:]]*$' "$SCRIPT")"
+[ -z "$direct" ] || fail 'no step is called outside the classified list' '(none)' "$direct"
+for row in claude-skills/metaterm/SKILL.md termag-commit-msg termag-on-warm.service termag-on-claim.service; do
+  run --list | grep -q "^$row:.*:feature\$" || fail "$row is feature" feature "$(run --list | grep "^$row:")"
+done
+for row in termag-agent.service termag-reconcile.service termag-status termag-credentials pi-ext/termag-status.ts; do
+  run --list | grep -q "^$row:.*:core\$" || fail "$row is core" core "$(run --list | grep "^$row:")"
+done
+
+# ── termag setup off: reconcile installs core only ───────────────────────────────
+echo current > "$CLI_STATE"
+seed_source termag-commit-msg '# termag-commit-msg v1'
+mkdir -p "$CHECKOUT/deploy/claude-plugins/demo"
+printf 'plugin\n' > "$CHECKOUT/deploy/claude-plugins/demo/plugin.md"
+box_run() {
+  h=$1; shift
+  HOME="$h" XDG_CONFIG_HOME="$h/.config" TERMAG_CHECKOUT="$CHECKOUT" \
+    PATH="$WORK/nodebin:$STUB:$PATH" "$SCRIPT" "$@"
+}
+SETUP_OFF_HOME="$WORK/setup-off-home"
+mkdir -p "$SETUP_OFF_HOME/.config/termag"
+printf 'off\n' > "$SETUP_OFF_HOME/.config/termag/setup"
+box_run "$SETUP_OFF_HOME" >/dev/null 2>&1
+for f in .config/systemd/user/termag-agent.service .local/bin/termag-status .local/bin/termag-credentials \
+         .local/share/termag/pi-ext/termag-status.ts; do
+  [ -f "$SETUP_OFF_HOME/$f" ] || fail "a box with termag setup off gets core $f" present absent
+done
+for f in .claude/skills/metaterm/SKILL.md .pi/agent/skills/metaterm/SKILL.md .local/share/termag/git-template/hooks/commit-msg \
+         .config/systemd/user/termag-on-warm.service .local/share/termag/claude-plugins/demo/plugin.md \
+         .pi/agent/mcp.json .docker/config.json; do
+  [ ! -e "$SETUP_OFF_HOME/$f" ] || fail "a box with termag setup off gets no feature $f" absent present
+done
+[ -L "$SETUP_OFF_HOME/.config/systemd/user/default.target.wants/termag-reconcile.service" ] \
+  || fail 'a box with termag setup off still enables termag-reconcile.service' symlink absent
+got="$(jq -c '[.mcpServers.metaterm, .hasCompletedOnboarding]' "$SETUP_OFF_HOME/.claude.json" 2>/dev/null || echo '[null,null]')"
+[ "$got" = '[null,null]' ] || fail 'a box with termag setup off gets no MetaTerm server or onboarding flag' '[null,null]' "$got"
+got="$(jq -c '.hooks.SessionStart | length' "$SETUP_OFF_HOME/.claude/settings.json" 2>/dev/null)"
+[ "$got" = 1 ] || fail 'a box with termag setup off keeps the status PATH hook (core)' 1 "$got"
+got="$(jq -c '.permissions.allow // []' "$SETUP_OFF_HOME/.claude/settings.json" 2>/dev/null)"
+[ "$got" = '[]' ] || fail 'a box with termag setup off gets no MetaTerm approvals' '[]' "$got"
+git config --file "$SETUP_OFF_HOME/.config/git/config" --get init.templateDir >/dev/null 2>&1 \
+  && fail 'a box with termag setup off gets no init.templateDir' absent present
+out="$(box_run "$SETUP_OFF_HOME" --check 2>&1)"
+[ "$?" = 0 ] || fail '--check on a reconciled box with termag setup off reports no feature drift' 0 "$out"
+
+# ── termag setup off: --strip removes the bake's feature copies, not edits ───────
+BAKED_HOME="$WORK/baked-home"
+mkdir -p "$BAKED_HOME/.claude"
+printf '{"permissions":{"allow":["Bash(ls)"]}}\n' > "$BAKED_HOME/.claude/settings.json"
+printf '{"mcpServers":{"mine":{"command":"x"}}}\n' > "$BAKED_HOME/.claude.json"
+box_run "$BAKED_HOME" >/dev/null 2>&1
+[ -f "$BAKED_HOME/.claude/skills/metaterm/SKILL.md" ] || fail 'a full run installs the skill (strip setup)' present absent
+out="$(box_run "$BAKED_HOME" --strip 2>&1)"
+[ "$?" = 1 ] || fail '--strip refuses a box with setup on' 1 "$out"
+[ -f "$BAKED_HOME/.claude/skills/metaterm/SKILL.md" ] || fail '--strip on a box with setup on removes nothing' present absent
+printf 'my notes\n' >> "$BAKED_HOME/.claude/skills/termag-pr/SKILL.md"
+mkdir -p "$BAKED_HOME/.config/termag"
+printf 'off\n' > "$BAKED_HOME/.config/termag/setup"
+: > "$RELOAD_LOG"
+out="$(box_run "$BAKED_HOME" --strip 2>&1)"
+[ "$?" = 0 ] || fail '--strip on a box with termag setup off exits 0' 0 "$out"
+for f in .claude/skills/metaterm .pi/agent/skills/metaterm/SKILL.md .local/share/termag/git-template/hooks/commit-msg \
+         .local/share/termag/claude-plugins/demo; do
+  [ ! -e "$BAKED_HOME/$f" ] || fail "--strip removes $f" absent present
+done
+[ -f "$BAKED_HOME/.claude/skills/termag-pr/SKILL.md" ] || fail '--strip keeps an edited skill' present absent
+case "$out" in *"kept: $BAKED_HOME/.claude/skills/termag-pr/SKILL.md"*) ;; *) fail '--strip reports what it kept' 'kept: ...termag-pr' "$out" ;; esac
+for f in .config/systemd/user/termag-agent.service .local/bin/termag-status .local/bin/termag-reconcile; do
+  [ -f "$BAKED_HOME/$f" ] || fail "--strip keeps core $f" present absent
+done
+got="$(jq -c '[.mcpServers, .hasCompletedOnboarding]' "$BAKED_HOME/.claude.json")"
+[ "$got" = '[{"mine":{"command":"x"}},null]' ] || fail "--strip removes MetaTerm and onboarding, keeps the owner's server" '[{"mine":...},null]' "$got"
+got="$(jq -c '.permissions.allow' "$BAKED_HOME/.claude/settings.json")"
+[ "$got" = '["Bash(ls)"]' ] || fail "--strip removes the approvals, keeps the owner's" '["Bash(ls)"]' "$got"
+got="$(jq -c '.hooks.SessionStart | length' "$BAKED_HOME/.claude/settings.json")"
+[ "$got" = 1 ] || fail '--strip keeps the status PATH hook' 1 "$got"
+got="$(jq -c '.mcpServers.metaterm' "$BAKED_HOME/.pi/agent/mcp.json")"
+[ "$got" = null ] || fail '--strip removes the pi MetaTerm server' null "$got"
+git config --file "$BAKED_HOME/.config/git/config" --get init.templateDir >/dev/null 2>&1 \
+  && fail '--strip unsets init.templateDir' absent present
+box_run "$BAKED_HOME" >/dev/null 2>&1
+[ ! -e "$BAKED_HOME/.claude/skills/metaterm/SKILL.md" ] || fail 'a stripped box stays stripped on the next reconcile' absent present
+out="$(box_run "$BAKED_HOME" --strip 2>&1)"
+case "$out" in *stripped:*) fail 'a second --strip has nothing left to do' '(no stripped: lines)' "$out" ;; esac
+rm -rf "$CHECKOUT/deploy/claude-plugins"
+
 # ── argument handling ───────────────────────────────────────────────────────
 run --not-a-flag >/dev/null 2>&1
 got=$?
 [ "$got" = 2 ] || fail 'unknown flag exits 2' 2 "$got"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: content-compare, modes, reload gating, settings exclusion, unit enablement, box-update service, Claude Code updater and boot unit, MetaTerm config, Devin hooks, termag CLI, docker ECR helper, ask sandbox retirement, guest browser setup, gh updater setup, aws updater setup, terminfo setup, commit trailer hook, Claude plugins, t3 server, ~/.local modes'
+  echo 'PASS: content-compare, modes, reload gating, settings exclusion, unit enablement, box-update service, Claude Code updater and boot unit, MetaTerm config, Devin hooks, termag CLI, ask sandbox retirement, guest browser setup, gh updater setup, aws updater setup, docker updater setup, terminfo setup, commit trailer hook, Claude plugins, t3 server, ~/.local modes, setup-off classification and strip'
   exit 0
 fi
 echo "$failures failure(s)"

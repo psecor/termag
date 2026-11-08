@@ -352,8 +352,59 @@ classify_tool() {
   printf '%s %s\n' "$kind" "$url"
 }
 
+# --- file edits (docs/agents/observability.md, agent.file.edited) -----------
+# A Write, Edit, MultiEdit or NotebookEdit: prints "<tool> <dir> <session_id>"
+# (session_id may be "-"), where <dir> is the top two directories of the
+# file's path in its git checkout (`.` for a file at the top), or nothing for
+# any other tool, a file outside a checkout, or a directory name with
+# anything but letters, digits and ._-. Only the tool, those two names and
+# Claude Code's session id leave the box: never the file's name, the rest of
+# its path, or what was written. A symlinked project directory is read through
+# to the checkout git names (docs/agents/gotchas.md, project-dir-symlinks).
+edit_of() {
+  local input=$1 tool file cwd want dir missing top rel two sid
+  tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || return 0
+  case $tool in Write|Edit|MultiEdit|NotebookEdit) ;; *) return 0 ;; esac
+  file=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || return 0
+  [ -n "$file" ] || return 0
+  case $file in
+    /*) ;;
+    *) cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null) || return 0
+       [ -n "$cwd" ] || return 0
+       file="$cwd/$file" ;;
+  esac
+  # A Write can make the directory it writes into: from the nearest one there
+  # is, with the part still to be made added back on.
+  want=$(dirname -- "$file"); dir=$want
+  while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname -- "$dir"); done
+  missing=${want#"$dir"}; missing=${missing#/}
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 0
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  top=$(cd "$top" 2>/dev/null && pwd -P) || return 0
+  case $dir in
+    "$top") rel=. ;;
+    "$top"/*) rel=${dir#"$top"/} ;;
+    *) return 0 ;;
+  esac
+  if [ -n "$missing" ]; then
+    if [ "$rel" = . ]; then rel=$missing; else rel="$rel/$missing"; fi
+  fi
+  if [ "$rel" = . ]; then two=.; else two=$(printf '%s' "$rel" | cut -d/ -f1-2); fi
+  if [ "$two" != . ]; then
+    printf '%s' "$two" | grep -Eq '^[A-Za-z0-9._-]{1,64}(/[A-Za-z0-9._-]{1,64})?$' || return 0
+    case /$two/ in */./*|*/../*) return 0 ;; esac
+  fi
+  sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null) || sid=
+  printf '%s' "$sid" | grep -Eq '^[A-Za-z0-9-]{8,64}$' || sid=-
+  printf '%s %s %s\n' "$tool" "$two" "$sid"
+}
+
 if [ "$MODE" = "--classify" ]; then
   classify_tool "$(cat)"
+  exit 0
+fi
+if [ "$MODE" = "--edit-of" ]; then
+  edit_of "$(cat)"
   exit 0
 fi
 
@@ -544,6 +595,7 @@ ENDPOINT=$(resolve_endpoint)
 
 # --- build the payload ------------------------------------------------------
 MILESTONE_PAYLOAD=
+EDIT_PAYLOAD=
 TITLE_PAYLOAD=
 TITLE_ENDPOINT=
 TITLE_MARKER=
@@ -586,6 +638,12 @@ case $MODE in
     if [ -n "$CLASS" ]; then
       KIND=${CLASS%% *}; URL=${CLASS#* }
       MILESTONE_PAYLOAD=$(jq -nc --arg s "$SESSION" --arg k "$KIND" --arg u "$URL" '{session:$s, kind:$k, url:$u}')
+    fi
+    EDIT=$(edit_of "$INPUT")
+    if [ -n "$EDIT" ]; then
+      read -r E_TOOL E_DIR E_SID <<< "$EDIT"
+      EDIT_PAYLOAD=$(jq -nc --arg s "$SESSION" --arg t "$E_TOOL" --arg d "$E_DIR" --arg c "$E_SID" \
+        '{session:$s, tool:$t, dir:$d} + (if $c != "-" then {claudeSession:$c} else {} end)')
     fi
     ;;
   prompt-submit)
@@ -686,6 +744,7 @@ fi
 if [ -n "$PRINT_PAYLOAD" ]; then
   printf '%s\n' "$PAYLOAD"
   [ -n "$TITLE_PAYLOAD" ] && printf '%s\n' "$TITLE_PAYLOAD"
+  [ -n "$EDIT_PAYLOAD" ] && printf '%s\n' "$EDIT_PAYLOAD"
   [ -n "$USAGE_PAYLOAD" ] && printf '%s\n' "$USAGE_PAYLOAD"
   exit 0
 fi
@@ -702,6 +761,9 @@ post_all "$ENDPOINT" "$PRIMARY_TOKEN"
 # (400) simply never gets one. Primary only: it names a claude-runner order,
 # which exists on the orchestrator that launched the run, not on a mirror.
 [ -n "$TITLE_PAYLOAD" ] && post_json "$TITLE_ENDPOINT" "$TITLE_PAYLOAD" "$PRIMARY_TOKEN"
+# The edited directory (POST /api/status/edit): primary only, like the title;
+# an older server answers 404, which post_json ignores.
+[ -n "$EDIT_PAYLOAD" ] && post_json "$ENDPOINT/edit" "$EDIT_PAYLOAD" "$PRIMARY_TOKEN"
 # The usage, when a cloud session's Stop summed it: primary only, like the title.
 [ -n "$USAGE_PAYLOAD" ] && post_json "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$PRIMARY_TOKEN"
 

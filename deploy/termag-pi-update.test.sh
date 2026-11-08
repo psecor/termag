@@ -8,7 +8,11 @@
 #     stdin, never in an argument or a log line
 #   * restart none installs the policy's exact target into the npm global with
 #     --ignore-scripts (as the image does), only when behind it, and reports
-#   * latest is resolved once and never installed as a tag; nothing moves down
+#   * latest is the newest pinned version, never installed as a tag: npm's
+#     latest tag is asked once, and a newer unpinned one is said in the detail
+#     (latest=<v>(unpinned; newest pin <p>)) without failing the run; a box on
+#     the newest pin is current, one above every pin is left alone
+#     (ahead-of-pins); nothing moves down
 #   * an install is accepted only when package.json and pi --version both say
 #     it; otherwise rejected (exit 3, recorded), put back to the version that
 #     ran, or quarantined (dist/bundle/cli.js renamed, not executable)
@@ -363,6 +367,55 @@ sessions_cases() {
   is_running "$stuck_pid" && fail 'idle: one still working at drainSec is cut' stopped alive
   [ "$(report '.sessions.cut')" = 1 ] || fail 'idle: one cut' 1 "$(report .detail)"
   teardown
+
+  # --sessions (a Node update run): no policy,
+  # no install, no report. The package was written after the pis started (the
+  # node run reinstalled it under the new default): each is stopped as
+  # restart says, its shell gets the new default's bin first on its PATH
+  # before its resume, and the result is one JSON line on stdout; a Claude
+  # Code pane is left alone, and a busy pi waits for its turn under idle.
+  setup
+  pane work
+  pane busy BUSY_UNTIL="$WORK/turn-ends"
+  LAUNCH=termag-pi-headless pane alice-proj-agent
+  mkdir -p "$WORK/claude-old" "$WORK/cwd/claude-pane"; cp "$(command -v bash)" "$WORK/claude-old/claude"
+  tmux -S "$S" -f /dev/null new-session -d -s claude-pane -c "$WORK/cwd/claude-pane" "env PATH=/usr/bin:/bin bash --norc --noprofile"
+  tmux -S "$S" send-keys -t claude-pane -l -- "$WORK/claude-old/claude -c 'sleep 300; :'"; tmux -S "$S" send-keys -t claude-pane Enter
+  sleep 2
+  session work "$(uuid 71)"; session alice-proj-agent "$(uuid 73)"
+  npm_at 1.4.0
+  sleep 11
+  busy_pid=$(pid_in busy) claude_pid=$(pgrep -f "$WORK/claude-old/claude -c sleep" | head -n 1)
+  ARGS='--sessions idle 30' run TERMAG_PI_KILL_AFTER=2 TERMAG_PI_RESUME_WAIT=2 > "$WORK/sessions.json" & rp=$!
+  sleep 4
+  is_running "$busy_pid" || fail '--sessions idle: a pi in a turn is not stopped' alive stopped
+  : > "$WORK/turn-ends"
+  wait "$rp"; got=$?
+  [ "$got" = 0 ] || fail '--sessions: exits 0' 0 "$got: $(tail -3 "$WORK/err")"
+  out=$(tail -n 1 "$WORK/sessions.json")
+  got=$(printf '%s' "$out" | jq -r '[.component, .restart, .sessions.stopped, .sessions.cut, .sessions.typed, .sessions.resumed, .sessions.fresh] | join(" ")')
+  [ "$got" = 'pi idle 3 0 1 1 1' ] || fail '--sessions: component restart stopped cut typed resumed fresh' 'pi idle 3 0 1 1 1' "$got; $(tail -3 "$WORK/err")"
+  got=$(printf '%s' "$out" | jq -r '[.panes[] | "\(.session):\(.role):\(.sessionId // "-")"] | sort | join(" ")')
+  want="alice-proj-agent:agent:$(uuid 73) busy:other:- work:other:$(uuid 71)"
+  [ "$got" = "$want" ] || fail '--sessions: the stopped panes, for the caller'"'"'s report' "$want" "$got"
+  has '--sessions: the new PATH, then the resume' "$(pane_text work)" "export PATH=$WORK/npm/bin:\"\$PATH\"; pi --continue"
+  has '--sessions: a fresh pane gets the new PATH alone' "$(pane_text busy)" "export PATH=$WORK/npm/bin:"
+  has '--sessions: an agent pane gets the new PATH for its relaunch' "$(pane_text alice-proj-agent)" "export PATH=$WORK/npm/bin:"
+  lacks '--sessions: and nothing more' "$(pane_text alice-proj-agent)" 'pi --continue'
+  [ -n "$claude_pid" ] && is_running "$claude_pid" || fail '--sessions: a Claude Code pane is left alone' alive "gone ($claude_pid)"
+  [ ! -e "$STATE/curl-calls" ] || fail '--sessions: no policy, no report' 'no orchestrator call' "$(cat "$STATE/curl-calls")"
+  lacks '--sessions: installs nothing' "$(cat "$LOG")" 'npm install'
+  teardown
+
+  # --sessions none: nothing is stopped.
+  setup
+  pane keep
+  sleep 2; npm_at 1.4.0; keep_pid=$(pid_in keep)
+  out=$(ARGS='--sessions none 0' run | tail -n 1)
+  is_running "$keep_pid" || fail '--sessions none: nothing is stopped' alive stopped
+  got=$(printf '%s' "$out" | jq -r '[.restart, .sessions.stopped] | join(" ")')
+  [ "$got" = 'none 0' ] || fail '--sessions none: says so' 'none 0' "$got"
+  teardown
 }
 if [ "${1:-}" = --sessions ]; then
   sessions_cases
@@ -400,14 +453,58 @@ reset; npm_at 1.9.0; policy 200 none 1.4.0
 run
 lacks 'no downgrade: installs nothing' "$(cat "$LOG")" 'npm install'
 
-# ── latest: resolved once, never installed as a tag ─────────────────────────
+# ── latest: the newest pinned version, never installed as a tag ─────────────
+# Pinned: 1.0.2 and 1.4.0 (the image's and a newer one).
+grep -E '^(1\.0\.2|1\.4\.0) ' "$WORK/pins" > "$WORK/pins-latest"
 reset; npm_at 1.0.2; policy 200 none latest
-run; got=$?
+PINS_FILE="$WORK/pins-latest" run; got=$?
 [ "$got" = 0 ] || fail 'latest: exits 0' 0 "$got: $(cat "$WORK/err")"
 [ "$(grep -c 'npm view @earendil-works/pi-coding-agent@latest version' "$LOG")" = 1 ] || fail 'latest: asks npm once' 1 "$(grep -c 'npm view' "$LOG")"
-has 'latest: installs what it resolved to' "$(cat "$LOG")" '@earendil-works/pi-coding-agent@1.4.0'
+has 'latest: installs the newest pin' "$(cat "$STATE/install-files" 2>/dev/null)" 'earendil-works-pi-coding-agent-1.4.0.tgz'
 lacks 'latest: never the tag' "$(cat "$LOG")" 'loglevel=error @earendil-works/pi-coding-agent@latest'
 [ "$(report .target)" = 1.4.0 ] || fail 'latest: the report names the version' 1.4.0 "$(report .target)"
+[ "$(report .outcome)" = updated ] || fail 'latest: updated' updated "$(report .outcome)"
+lacks 'latest: the tag is pinned, so no note' "$(report .detail)" 'latest='
+# npm's latest names a newer version with no pin: the newest pin is
+# installed, the detail says a refresh is due, and the run does not fail.
+reset; npm_at 1.0.2; policy 200 none latest; echo 1.5.0 > "$STATE/latest"
+PINS_FILE="$WORK/pins-latest" run; got=$?
+[ "$got" = 0 ] || fail 'latest ahead of the pins: exits 0' 0 "$got: $(cat "$WORK/err")"
+has 'latest ahead of the pins: installs the newest pin' "$(cat "$STATE/install-files" 2>/dev/null)" 'earendil-works-pi-coding-agent-1.4.0.tgz'
+lacks 'latest ahead of the pins: never the unpinned one' "$(cat "$LOG")" 'pi-coding-agent@1.5.0'
+[ "$(report .outcome)" = updated ] || fail 'latest ahead of the pins: updated, not failed' updated "$(report .outcome)"
+[ "$(report .target)" = 1.4.0 ] || fail 'latest ahead of the pins: the target is the pin' 1.4.0 "$(report .target)"
+has 'latest ahead of the pins: says so' "$(report .detail)" 'npm=1.0.2->1.4.0 latest=1.5.0(unpinned; newest pin 1.4.0)'
+lacks 'latest ahead of the pins: no FAILED' "$(report .detail)" 'FAILED'
+# A box already on the newest pin: current, nothing installed.
+reset; npm_at 1.4.0; policy 200 none latest; echo 1.5.0 > "$STATE/latest"
+PINS_FILE="$WORK/pins-latest" run; got=$?
+[ "$got" = 0 ] || fail 'on the newest pin: exits 0' 0 "$got"
+lacks 'on the newest pin: installs nothing' "$(cat "$LOG")" 'npm install'
+[ "$(report .outcome)" = current ] || fail 'on the newest pin: current' current "$(report .outcome)"
+has 'on the newest pin: the note still says a refresh is due' "$(report .detail)" 'npm=1.4.0 latest=1.5.0(unpinned; newest pin 1.4.0)'
+# A box ahead of every pin (pi's own update, or by hand): left alone, said so.
+reset; npm_at 1.6.0; policy 200 none latest; echo 1.6.0 > "$STATE/latest"
+PINS_FILE="$WORK/pins-latest" run; got=$?
+[ "$got" = 0 ] || fail 'ahead of the pins: exits 0' 0 "$got"
+lacks 'ahead of the pins: installs nothing' "$(cat "$LOG")" 'npm install'
+[ "$(report .outcome)" = current ] || fail 'ahead of the pins: current' current "$(report .outcome)"
+has 'ahead of the pins: says so' "$(report .detail)" 'npm=1.6.0(ahead-of-pins)'
+# ahead-of-pins is about the pins, not the target: an exact pinned target
+# below the box leaves it alone and says so too.
+reset; npm_at 1.6.0; policy 200 none 1.4.0
+PINS_FILE="$WORK/pins-latest" run
+has 'ahead of the pins, exact target: says so' "$(report .detail)" 'npm=1.6.0(ahead-of-pins)'
+# On a pin below the newest, with a lower exact target: no ahead-of-pins.
+reset; npm_at 1.4.0; policy 200 none 1.0.2
+PINS_FILE="$WORK/pins-latest" run
+lacks 'on a pin: not ahead' "$(report .detail)" 'ahead-of-pins'
+# The registry does not answer: latest is still the newest pin, no note.
+reset; npm_at 1.0.2; policy 200 none latest; : > "$STATE/latest"
+PINS_FILE="$WORK/pins-latest" run; got=$?
+[ "$got" = 0 ] || fail 'no registry: exits 0' 0 "$got"
+has 'no registry: installs the newest pin' "$(cat "$STATE/install-files" 2>/dev/null)" 'earendil-works-pi-coding-agent-1.4.0.tgz'
+lacks 'no registry: no note' "$(report .detail)" 'latest='
 
 # ── pinned versions only (Security review on #1088) ─────────────────────────
 # A version with no pin: npm installs nothing, the run fails.
@@ -432,12 +529,140 @@ mkdir -p "$WORK/pp"; got=$(run_plain --pinned-package 1.4.0 "$WORK/pp"); rc=$?
 [ "$rc" = 0 ] && [ "$got" = "$WORK/pp/earendil-works-pi-coding-agent-1.4.0.tgz" ] || fail 'pinned package: its path' "$WORK/pp/earendil-works-pi-coding-agent-1.4.0.tgz" "$rc $got"
 : > "$STATE/pack-other"; run_plain --pinned-package 1.4.0 "$WORK/pp" >/dev/null; rc=$?; rm -f "$STATE/pack-other"
 [ "$rc" = 1 ] || fail 'pinned package: other bytes refused' 1 "$rc"
-# With no TERMAG_PI_PINS the script's own table is read: the image's 1.0.2 is
-# pinned with its registry integrity, and 1.4.0 is not.
-grep -qE "^PINS='1\.0\.2 sha512-[A-Za-z0-9+/=]{88}'\$" "$SCRIPT" || fail 'pins: the script pins the image'"'"'s 1.0.2' pinned absent
+# With no TERMAG_PI_PINS the script's own table is read: the image's 1.0.2
+# stays pinned (a put-back needs it) with its registry integrity, beside
+# 1.5.0, and 1.4.0 is not pinned.
+grep -qE "^PINS='1\.0\.2 sha512-[A-Za-z0-9+/=]{88}\$" "$SCRIPT" || fail 'pins: the script pins the image'"'"'s 1.0.2' pinned absent
+grep -qE "^1\.5\.0 sha512-[A-Za-z0-9+/=]{88}'\$" "$SCRIPT" || fail 'pins: the script pins 1.5.0' pinned absent
+# The image (packer/scripts/setup.sh, box-min-setup.sh) installs the newest
+# pin through --install-pinned, from the checkout it bakes, and names no pi
+# version of its own: PINS is the one list, so the bake and the recipe cannot
+# drift, and a box fresh from the bake can be put back to what it ran.
+for bake in setup.sh box-min-setup.sh; do
+  f="$(dirname "$SCRIPT")/../packer/scripts/$bake"
+  grep -qE '^"\$HOME/src/termag/deploy/termag-pi-update" --install-pinned \|\| ' "$f" || fail "image: $bake installs pi with --install-pinned" present absent
+  grep -qE 'pi --version 2>/dev/null\)" = "\$want"' "$f" || fail "image: $bake checks pi is the newest pin" present absent
+  ! grep -qE 'pi-coding-agent@[0-9]' "$f" || fail "image: $bake installs no pi by name" absent "$(grep -nE 'pi-coding-agent@[0-9]' "$f")"
+done
+got=$(env -i PATH=/usr/bin:/bin HOME="$HOME_DIR" bash "$SCRIPT" --newest-pin)
+[ "$got" = 1.5.0 ] || fail '--newest-pin: the script'"'"'s newest pin' 1.5.0 "$got"
+
+# --install-pinned: the image's install, and the launchers' remedy. The
+# package is fetched, checked against its pin, and npm installs that file,
+# with no lifecycle scripts; then package.json and pi --version must say it.
+reset; npm_at 1.0.2; : > "$WORK/err"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+[ "$rc" = 0 ] || fail 'install-pinned: installs a pinned version' 0 "$rc"
+has 'install-pinned: npm installs the checked file' "$(cat "$STATE/install-files" 2>/dev/null)" 'earendil-works-pi-coding-agent-1.4.0.tgz'
+has 'install-pinned: with --ignore-scripts' "$(grep 'npm install' "$LOG")" 'install -g --ignore-scripts'
+lacks 'install-pinned: never the registry spec' "$(grep 'npm install' "$LOG")" '@earendil-works/pi-coding-agent@1.4.0'
+has 'install-pinned: says it verified' "$(cat "$WORK/err")" 'pi 1.4.0 installed from its pinned package, verified'
+[ "$(sed -n 's/.*"version": "\(.*\)".*/\1/p' "$PKGJSON")" = 1.4.0 ] || fail 'install-pinned: package.json' 1.4.0 "$(cat "$PKGJSON")"
+# A package that is not the pinned one (a mismatch): nothing installed, exit 1,
+# so the bake fails.
+reset; npm_at 1.0.2; : > "$WORK/err"; : > "$STATE/pack-other"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned mismatch: fails' 1 "$rc"
+lacks 'install-pinned mismatch: npm installs nothing' "$(cat "$LOG")" 'npm install'
+has 'install-pinned mismatch: says why' "$(cat "$WORK/err")" "pi 1.4.0's package is not the pinned one"
+[ "$(sed -n 's/.*"version": "\(.*\)".*/\1/p' "$PKGJSON")" = 1.0.2 ] || fail 'install-pinned mismatch: the installed pi is untouched' 1.0.2 "$(cat "$PKGJSON")"
+# The script's own pins, with the stub's stand-in bytes: refused too.
+reset; npm_at 1.0.2; : > "$WORK/err"
+env -i PATH="$STUB:$WORK/npm/bin:/usr/bin:/bin" HOME="$HOME_DIR" LOG="$LOG" STATE="$STATE" NPMROOT="$NPMROOT" PKGJSON="$PKGJSON" \
+  bash "$SCRIPT" --install-pinned 2>>"$WORK/err" >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned, the script'"'"'s pins: other bytes fail' 1 "$rc"
+has 'install-pinned with no version: the newest pin' "$(cat "$LOG")" 'pi-coding-agent@1.5.0'
+lacks 'install-pinned, the script'"'"'s pins: npm installs nothing' "$(cat "$LOG")" 'npm install'
+# npm installs something else than asked: refused, and the version that was
+# there put back from its own pinned package.
+reset; npm_at 1.0.2; : > "$WORK/err"; echo 1.3.0 > "$STATE/install-other-once"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned, other version installed: fails' 1 "$rc"
+has 'install-pinned, other version installed: says so' "$(cat "$WORK/err")" 'is 1.3.0 after the install, not 1.4.0'
+has 'install-pinned, other version installed: put back' "$(cat "$WORK/err")" 'put pi back to 1.0.2, the version that was there'
+has 'install-pinned put-back: from its checked file' "$(cat "$STATE/install-files")" 'earendil-works-pi-coding-agent-1.0.2.tgz'
+[ "$(sed -n 's/.*"version": "\(.*\)".*/\1/p' "$PKGJSON")" = 1.0.2 ] || fail 'install-pinned put-back: package.json' 1.0.2 "$(cat "$PKGJSON")"
+# npm fails before changing anything (here on a reinstall of the same pin): the
+# working pi is left alone, not quarantined (Devin and Bugbot on #1222).
+reset; npm_at 1.4.0; : > "$WORK/err"; echo 1 > "$STATE/npm-rc"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned, npm fails: fails' 1 "$rc"
+has 'install-pinned, npm fails: left alone' "$(cat "$WORK/err")" "npm changed nothing in pi's package, still the working 1.4.0"
+[ -e "$PKGDIR/dist/bundle/cli.js" ] && [ ! -e "$PKGDIR/dist/bundle/cli.js.rejected" ] || fail 'install-pinned, npm fails: pi not quarantined' 'cli.js' "$(ls "$PKGDIR/dist/bundle")"
+# npm fails after changing a file, with package.json and pi --version still
+# saying the old version: not left alone, put back from its pinned package
+# (Devin on #1222).
+reset; npm_at 1.4.0; : > "$WORK/err"
+cat > "$STUB/npm-partial" <<'EOF'
+#!/bin/sh
+[ "$1" = install ] && [ ! -e "$STATE/partial-done" ] && { : > "$STATE/partial-done"; echo changed > "$NPMROOT/@earendil-works/pi-coding-agent/dist/bundle/dep.js"; echo 'npm ERR! half way' >&2; exit 1; }
+exec "$(dirname "$0")/npm.real" "$@"
+EOF
+mv "$STUB/npm" "$STUB/npm.real"; mv "$STUB/npm-partial" "$STUB/npm"; chmod +x "$STUB/npm"; rm -f "$STATE/partial-done"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+mv "$STUB/npm.real" "$STUB/npm"; rm -f "$STATE/partial-done" "$PKGDIR/dist/bundle/dep.js"
+[ "$rc" = 1 ] || fail 'install-pinned, partial npm write: fails' 1 "$rc"
+lacks 'install-pinned, partial npm write: not left alone' "$(cat "$WORK/err")" 'npm changed nothing'
+has 'install-pinned, partial npm write: put back' "$(cat "$WORK/err")" 'put pi back to 1.4.0, the version that was there'
+# npm fails after removing only the global bin/pi link: not left alone, put
+# back (Devin on #1222).
+reset; npm_at 1.4.0; : > "$WORK/err"
+cat > "$STUB/npm-unlink" <<'EOF'
+#!/bin/sh
+[ "$1" = install ] && [ ! -e "$STATE/partial-done" ] && { : > "$STATE/partial-done"; rm -f "${NPMROOT%/lib/node_modules}/bin/pi"; echo 'npm ERR! half way' >&2; exit 1; }
+[ "$1" = install ] && ln -sf ../lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "${NPMROOT%/lib/node_modules}/bin/pi"
+exec "$(dirname "$0")/npm.real" "$@"
+EOF
+mv "$STUB/npm" "$STUB/npm.real"; mv "$STUB/npm-unlink" "$STUB/npm"; chmod +x "$STUB/npm"; rm -f "$STATE/partial-done"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+mv "$STUB/npm.real" "$STUB/npm"; rm -f "$STATE/partial-done"
+[ -L "$WORK/npm/bin/pi" ] || ln -s ../lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$WORK/npm/bin/pi"
+[ "$rc" = 1 ] || fail 'install-pinned, bin link removed: fails' 1 "$rc"
+lacks 'install-pinned, bin link removed: not left alone' "$(cat "$WORK/err")" 'npm changed nothing'
+has 'install-pinned, bin link removed: put back' "$(cat "$WORK/err")" 'put pi back to 1.4.0, the version that was there'
+# No put-back that works: pi's executable is quarantined.
+reset; npm_at 1.0.2; : > "$WORK/err"; echo 1.3.0 > "$STATE/install-other"
+run_plain --install-pinned 1.4.0 >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned, no put-back: fails' 1 "$rc"
+[ -e "$PKGDIR/dist/bundle/cli.js.rejected" ] && [ ! -e "$PKGDIR/dist/bundle/cli.js" ] || fail 'install-pinned, no put-back: pi quarantined' quarantined "$(ls "$PKGDIR/dist/bundle")"
+reset
+# It holds the update lock a run and termag-node-update take.
+reset; npm_at 1.0.2; : > "$WORK/err"; mkdir -p "$HOME_DIR/.termag"
+flock "$HOME_DIR/.termag/pi-update.lock" sleep 4 & holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -n "$HOME_DIR/.termag/pi-update.lock" true 2>/dev/null || break; sleep 0.1; done
+env -i PATH="$STUB:$WORK/npm/bin:/usr/bin:/bin" HOME="$HOME_DIR" LOG="$LOG" STATE="$STATE" NPMROOT="$NPMROOT" PKGJSON="$PKGJSON" \
+  TERMAG_PI_PINS="$WORK/pins" TERMAG_PI_LOCK_WAIT=1 bash "$SCRIPT" --install-pinned 1.4.0 2>>"$WORK/err" >/dev/null; rc=$?
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+[ "$rc" = 1 ] || fail 'install-pinned, lock held: fails' 1 "$rc"
+has 'install-pinned, lock held: says so' "$(cat "$WORK/err")" 'the lock stayed held; not installed'
+lacks 'install-pinned, lock held: npm installs nothing' "$(cat "$LOG")" 'npm install'
+# A version with no pin: nothing fetched.
+reset; : > "$WORK/err"; grep '^1\.4\.0 ' "$WORK/pins" > "$WORK/pins-one"
+env -i PATH="$STUB:$WORK/npm/bin:/usr/bin:/bin" HOME="$HOME_DIR" LOG="$LOG" STATE="$STATE" NPMROOT="$NPMROOT" PKGJSON="$PKGJSON" \
+  TERMAG_PI_PINS="$WORK/pins-one" bash "$SCRIPT" --install-pinned 1.3.0 2>>"$WORK/err" >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'install-pinned unpinned: fails' 1 "$rc"
+lacks 'install-pinned unpinned: nothing fetched' "$(cat "$LOG")" 'npm '
+run_plain --install-pinned 'x; rm' >/dev/null; rc=$?; [ "$rc" = 2 ] || fail 'install-pinned: a bad version is bad usage' 2 "$rc"
+
+# --self-update: what `pi update` runs (PI_SELF_UPDATE_COMMAND, set by the
+# launchers). It installs nothing, says why, and fails, so pi says no update.
+reset; : > "$WORK/err"
+run_plain --self-update 9.9.9 >/dev/null; rc=$?
+[ "$rc" = 1 ] || fail 'self-update: fails' 1 "$rc"
+has 'self-update: says termag updates pi' "$(cat "$WORK/err")" 'pi on this box is updated by termag, not by `pi update` (pi.dev names 9.9.9)'
+has 'self-update: names the remedy' "$(cat "$WORK/err")" 'termag-pi-update --install-pinned'
+lacks 'self-update: npm does nothing' "$(cat "$LOG")" 'npm '
+: > "$WORK/err"; run_plain --self-update '$(id)' >/dev/null
+lacks 'self-update: prints no unchecked argument' "$(cat "$WORK/err")" 'pi.dev names'
 reset; npm_at 1.0.2; policy 200 none 1.4.0
 run TERMAG_PI_PINS=
 has 'the script'"'"'s pins: 1.4.0 is not pinned' "$(report .detail)" 'FAILED:unpinned:1.4.0'
+# Its latest is its newest pin, 1.5.0 (the stub's stand-in package is not
+# its bytes, so nothing is installed).
+reset; npm_at 1.0.2; policy 200 none latest; echo 1.5.0 > "$STATE/latest"
+run TERMAG_PI_PINS=
+[ "$(report .target)" = 1.5.0 ] || fail 'the script'"'"'s pins: latest is 1.5.0' 1.5.0 "$(report .target)"
+has 'the script'"'"'s pins: the stand-in is refused' "$(cat "$WORK/err")" "pi 1.5.0's package is not the pinned one"
 
 # ── rejected, restored, quarantined ─────────────────────────────────────────
 # npm installs another version than asked: rejected, then the version that ran is put back.

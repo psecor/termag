@@ -8,9 +8,12 @@
 #     diff adds or removes it, or that changes a path containing it, all in any
 #     case; a merge of old commits counts by its diff, the commits it brought
 #     in are not listed on their own, and older landings are left out
-#   * open PRs whose title, body, branch or files name a term (any case),
-#     drafts marked, and the current branch's own PR marked as such, with a
-#     note when the list was cut at its limit
+#   * open PRs, over REST paged by hand (never `gh pr list`, which goes
+#     through gh's GHES version probe on the broker) with their files from
+#     GraphQL in small pages, whose title, body, branch or files name a term
+#     (any case), drafts marked, and the current branch's own PR marked as
+#     such, with a note when the list was cut at its limit
+#   * a term that starts with -- is a term, not a jq option
 #   * terms come from a file or argv and are data: quotes, $(...), & and |
 #     are matched, never run
 #   * the output says it is other people's text, not instructions
@@ -77,30 +80,49 @@ git -C "$SEED" remote add origin "$WORK/origin.git"
 commit 1 src/late.ts 'late' 'feat: late box-idle-stop-enabled tweak'
 git -C "$SEED" push -q origin main
 
-# gh stub: GH_FIXTURE's JSON, or GH_FAIL's message and exit 1.
+# gh stub, GitHub's REST and GraphQL as they come through the broker:
+# GH_FIXTURE holds the open PRs in REST's shape, each with its files too.
+# `gh api repos/{owner}/{repo}/pulls?...` answers its per_page/page slice of
+# them without the files, `gh api graphql` 25 at a time with only their
+# numbers and files (the cursor is an offset). GH_FAIL fails every call,
+# GH_FILES_FAIL the GraphQL ones, and GH_GARBAGE is the REST list's answer
+# instead (EMPTY for none). Any other gh command fails: the check needs none.
 STUB="$WORK/stub"
 mkdir -p "$STUB"
 cat > "$STUB/gh" <<'STUBEOF'
 #!/bin/sh
-printf '%s\n' "$*" > "$GH_LOG"
+printf '%s\n' "$*" >> "$GH_LOG"
 if [ -n "${GH_FAIL:-}" ]; then echo "$GH_FAIL" >&2; exit 1; fi
+case "$*" in 'api graphql '*) if [ -n "${GH_FILES_FAIL:-}" ]; then echo "$GH_FILES_FAIL" >&2; exit 1; fi ;; esac
 echo 'A new release of gh is available' >&2
-cat "$GH_FIXTURE"
+case "$*" in
+  'api repos/{owner}/{repo}/pulls?state=open&'*)
+    case ${GH_GARBAGE:-} in '') ;; EMPTY) exit 0 ;; *) printf '%s' "$GH_GARBAGE"; exit 0 ;; esac
+    pp=$(printf '%s' "$*" | sed -n 's/.*per_page=\([0-9]*\).*/\1/p')
+    pg=$(printf '%s' "$*" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
+    jq --argjson pp "$pp" --argjson pg "$pg" '.[($pg - 1) * $pp:$pg * $pp] | map(del(.files))' "$GH_FIXTURE" ;;
+  'api graphql -F owner={owner} -F repo={repo} '*)
+    at=$(printf '%s' "$*" | sed -n 's/.*-F endCursor=\([0-9]*\).*/\1/p')
+    jq --argjson at "${at:-0}" '{ data: { repository: { pullRequests: {
+        nodes: (.[$at:$at + 25] | map({ number, files: { nodes: .files } })),
+        pageInfo: { hasNextPage: (length > $at + 25), endCursor: ($at + 25 | tostring) } } } } }' "$GH_FIXTURE" ;;
+  *) echo "the stub has no: gh $*" >&2; exit 1 ;;
+esac
 STUBEOF
 chmod +x "$STUB/gh"
 GH_LOG="$WORK/gh.args"; GH_FIXTURE="$WORK/prs.json"; export GH_LOG GH_FIXTURE
 cat > "$GH_FIXTURE" <<'JSON'
 [
-  {"number": 11, "title": "Park idle boxes", "author": {"login": "bea"}, "headRefName": "bea/park", "isDraft": false,
-   "url": "https://example.invalid/pull/11", "body": "Behind Box-Idle-Stop-Enabled.", "files": [{"path": "src/flags.ts"}]},
-  {"number": 12, "title": "Draft: tidy", "author": {"login": "cy"}, "headRefName": "cy/auto-stop-docs", "isDraft": true,
-   "url": "https://example.invalid/pull/12", "body": null, "files": [{"path": "docs/x.md"}]},
-  {"number": 13, "title": "Unrelated", "author": {"login": "di"}, "headRefName": "di/x", "isDraft": false,
-   "url": "https://example.invalid/pull/13", "body": "nothing", "files": [{"path": "src/idle/park.ts"}]},
-  {"number": 14, "title": "Mine", "author": {"login": "me"}, "headRefName": "me/my-branch", "isDraft": false,
-   "url": "https://example.invalid/pull/14", "body": "box-idle-stop-enabled", "files": []},
-  {"number": 15, "title": "Nothing alike", "author": {"login": "ed"}, "headRefName": "ed/y", "isDraft": false,
-   "url": "https://example.invalid/pull/15", "body": "", "files": [{"path": "src/z.ts"}]}
+  {"number": 11, "title": "Park idle boxes", "user": {"login": "bea"}, "head": {"ref": "bea/park"}, "draft": false,
+   "html_url": "https://example.invalid/pull/11", "body": "Behind Box-Idle-Stop-Enabled.", "files": [{"path": "src/flags.ts"}]},
+  {"number": 12, "title": "Draft: tidy", "user": {"login": "cy"}, "head": {"ref": "cy/auto-stop-docs"}, "draft": true,
+   "html_url": "https://example.invalid/pull/12", "body": null, "files": [{"path": "docs/x.md"}]},
+  {"number": 13, "title": "Unrelated", "user": {"login": "di"}, "head": {"ref": "di/x"}, "draft": false,
+   "html_url": "https://example.invalid/pull/13", "body": "nothing", "files": [{"path": "src/idle/park.ts"}]},
+  {"number": 14, "title": "Mine", "user": {"login": "me"}, "head": {"ref": "me/my-branch"}, "draft": false,
+   "html_url": "https://example.invalid/pull/14", "body": "box-idle-stop-enabled", "files": []},
+  {"number": 15, "title": "Nothing alike", "user": {"login": "ed"}, "head": {"ref": "ed/y"}, "draft": false,
+   "html_url": "https://example.invalid/pull/15", "body": "uses the --danger-rgb colour", "files": [{"path": "src/z.ts"}]}
 ]
 JSON
 
@@ -149,16 +171,47 @@ has 'a PR by a changed file' "$prs" 'matches: src/idle (files)'
 has 'the current branch PR is marked' "$prs" '#14 me: Mine (this branch)'
 lacks 'a PR matching nothing is left out' "$prs" '#15'
 has 'the PR URL' "$prs" 'https://example.invalid/pull/11'
-has 'gh lists every open PR with files and body' "$(cat "$GH_LOG")" 'pr list --state open --limit 1000 --json number,title,author,headRefName,isDraft,url,body,files'
 lacks 'no cut note under the limit' "$prs" 'Only the newest'
-out="$(TERMAG_OVERLAP_MAX_PRS=5 run box-idle-stop-enabled 2>/dev/null)"
-has 'a list cut at its limit says so' "$out" 'Only the newest 5 open PRs were searched; there are more.'
+: > "$GH_LOG"
+out="$(TERMAG_OVERLAP_MAX_PRS=2 run box-idle-stop-enabled auto-stop 2>/dev/null)"
+has 'a list cut at its limit says so' "$out" 'Only the newest 2 open PRs were searched; there are more.'
+has 'the newest PRs up to the limit are searched' "$out" '#12 draft cy'
+lacks 'none past the limit' "$out" '#14 me'
+has 'a page no bigger than the limit' "$(cat "$GH_LOG")" 'api repos/{owner}/{repo}/pulls?state=open&per_page=2&page=1'
+lacks 'no page past the limit' "$(cat "$GH_LOG")" '&page=2'
 
 out="$(run src/flags.ts 2>/dev/null)"
 has 'a file path in a PR' "$(printf '%s\n' "$out" | sed -n '/^## Open/,$p')" 'matches: src/flags.ts (files)'
 
 out="$(run nothing-matches-this 2>/dev/null)"
 [ "$(printf '%s\n' "$out" | grep -c '^Nothing\.$')" = 2 ] || fail 'both sections say Nothing.' 2 "$out"
+
+# REST is paged by hand (the broker doesn't serve GitHub's next-page links),
+# and the files come from GraphQL 25 PRs at a time.
+cp "$GH_FIXTURE" "$WORK/prs5.json"
+jq -n '[range(0; 130) as $i | { number: (1000 + $i), title: "pr \($i)", user: { login: "zed" }, head: { ref: "zed/\($i)" },
+      draft: false, html_url: "https://example.invalid/pull/\(1000 + $i)", body: "",
+      files: [{ path: (if $i == 120 then "src/far/away.ts" else "src/\($i).ts" end) }] }]' > "$GH_FIXTURE"
+: > "$GH_LOG"
+out="$(run far/away 2>/dev/null)"
+has 'a PR on the second page, by a file on the fifth GraphQL page' "$out" '#1120 zed: pr 120'
+has 'it is matched by its file' "$out" 'matches: far/away (files)'
+log="$(cat "$GH_LOG")"
+has 'the second REST page is asked for by number' "$log" 'pulls?state=open&per_page=100&page=2'
+lacks 'and no third, once a page comes back short' "$log" 'page=3'
+has 'GraphQL goes on from the cursor' "$log" '-F endCursor=100'
+lacks 'no gh pr list, which goes through the GHES probe' "$log" 'pr list'
+cp "$WORK/prs5.json" "$GH_FIXTURE"
+
+out="$(GH_FILES_FAIL='HTTP 504: 504 Gateway Timeout' run box-idle-stop-enabled src/idle 2>/dev/null)"
+has 'files that cannot be read are reported' "$out" "Couldn't read their changed files (HTTP 504: 504 Gateway Timeout), so they are matched by title, body and branch only."
+has 'and the PRs are still matched by the rest' "$out" 'matches: box-idle-stop-enabled (body)'
+lacks 'but not by files' "$out" 'src/idle (files)'
+
+out="$(GH_GARBAGE=EMPTY run box-idle-stop-enabled 2>/dev/null)"
+has 'an empty answer is reported, not parsed' "$out" "Couldn't list them: gh's answer isn't a list of pull requests"
+out="$(GH_GARBAGE='{"message":"Bad Gateway"}' run box-idle-stop-enabled 2>/dev/null)"
+has 'an answer that is not a list is reported' "$out" "Couldn't list them: gh's answer isn't a list of pull requests"
 
 # ── terms are data ───────────────────────────────────────────────────────────
 PWNED="$WORK/pwned"
@@ -177,6 +230,13 @@ got=$?
 [ "$got" = 0 ] || fail 'odd terms still exit 0' 0 "$got"
 [ ! -e "$PWNED" ] || fail 'nothing in a term runs' 'no file' 'created'
 has 'the term is shown verbatim' "$out" "a&b|c \$(touch $PWNED)"
+printf '%s\n' '--danger-rgb' 'box-idle-stop-enabled' > "$WORK/dash-terms.txt"
+out="$(run --terms-file "$WORK/dash-terms.txt" 2>&1)"
+lacks 'a term starting with -- is no jq option' "$out" 'Unknown option'
+has 'a term starting with -- matches' "$out" 'matches: --danger-rgb (body)'
+has 'and the other terms still match' "$out" '#11 bea: Park idle boxes'
+out="$(run -- --danger-rgb 2>&1)"
+has 'a -- term after -- on the command line' "$out" '#15 ed: Nothing alike'
 
 # ── failures ─────────────────────────────────────────────────────────────────
 out="$(GH_FAIL='HTTP 503: broker unavailable' run box-idle-stop-enabled 2>/dev/null)"

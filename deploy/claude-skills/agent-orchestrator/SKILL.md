@@ -78,6 +78,12 @@ Then, right away:
   plus its PR number if any (at most 60 characters, e.g. `--title
   "Members-only file composer (#765)"`). It is how the user tells your asks
   apart; untitled ones show only as `ask-<thread id>`.
+- **Pass the model the user wants their asks on**: `--model opus`, `sonnet`
+  or `haiku` on the ask that starts the thread. The thread keeps it, so
+  follow-ups need no `--model`; pass one only to switch. Without it an ask
+  runs on the thread's model, else the box's default. A `termag: warning:
+  --model … was ignored` line means an older orchestrator or box agent ran it
+  on the default: tell the user.
 - **Continued work goes back to its thread**: `--thread <id>` to the same
   `box/project[@workstream]` the thread already lives on. Never a new box, and
   never this one. A PR whose thread is gone (its box removed, a hand-made

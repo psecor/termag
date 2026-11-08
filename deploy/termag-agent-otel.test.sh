@@ -11,6 +11,8 @@ WRAP="$DIR/termag-agent-otel"
 HOOK="$DIR/termag-cursor-otel-hook"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# Outside any git checkout, so a launch carries no termag.repo but where a case adds one.
+cd "$WORK" || exit 1
 
 failures=0
 fail() {
@@ -72,6 +74,38 @@ for pair in 'gon falon:main' 'webapp:' ':main' 'webapp:ws,x=y'; do
   case $out in *termag.project*|*termag.workstream*) fail "a project/workstream pair that is not two ids is left out ($pair)" 'no termag.project' "$out" ;; esac
   case $out in *'termag.agent=devin'*) : ;; *) fail "the telemetry stays without the pair ($pair)" 'termag.agent=devin' "$out" ;; esac
 done
+
+# The session's work (termag-credentials work-resource): the checkout it starts
+# in, owner/name only (the token in the remote URL never), and a spawn's ids.
+git init -q -b feature/x "$WORK/repo" 2>/dev/null || { git init -q "$WORK/repo"; git -C "$WORK/repo" checkout -q -b feature/x; }
+# A remote URL carrying a token, assembled here so no credential-shaped URL
+# sits in the source (the password is the word secret, not a real token).
+FAKE_USERINFO="x-access-token:$(printf '%s' secret)"
+git -C "$WORK/repo" remote add origin "https://${FAKE_USERINFO}@github.example.test/acme/widgets.git"
+git -C "$WORK/repo" -c user.name=t -c user.email=t@example.test commit -q --allow-empty -m init
+sha=$(git -C "$WORK/repo" rev-parse HEAD)
+out="$(cd "$WORK/repo" && env PATH="$STUB:$PATH" TERMAG_AGENT_TELEMETRY="$REC" TERMAG_SPAWN_ID=cmvzxo7xt5v0ekz4bc2obb2ee TERMAG_SPAWN_DEPTH=2 "$WRAP" devin -- devin)"
+case $out in
+  *"termag.agent=devin,termag.repo=acme/widgets,termag.git.branch=feature/x,termag.git.commit=$sha,termag.spawn.id=cmvzxo7xt5v0ekz4bc2obb2ee,termag.spawn.depth=2"*) : ;;
+  *) fail "devin carries the checkout's repository, branch, commit and the spawn" "termag.repo=acme/widgets,termag.git.branch=feature/x,…" "$out" ;;
+esac
+case $out in *secret*|*x-access-token*|*github.example.test*) fail 'the remote URL never reaches the resource' 'owner/name only' "$out" ;; esac
+# A pane names the wrapper by PATH, where a bin directory links to the
+# checkout's copy: termag-credentials is the one beside the link's target.
+LINKBIN="$WORK/linkbin"; mkdir -p "$LINKBIN"; ln -s "$WRAP" "$LINKBIN/termag-agent-otel"
+out="$(cd "$WORK/repo" && env PATH="$LINKBIN:$STUB:$PATH" TERMAG_AGENT_TELEMETRY="$REC" termag-agent-otel devin -- devin)"
+case $out in
+  *"termag.agent=devin,termag.repo=acme/widgets,termag.git.branch=feature/x,termag.git.commit=$sha"*) : ;;
+  *) fail 'run by its PATH name through a symlink, the wrapper finds termag-credentials beside its target' 'termag.repo=acme/widgets,…' "$out" ;;
+esac
+# A copy on PATH with none beside it uses the termag-credentials on PATH.
+COPYBIN="$WORK/copybin" CREDBIN="$WORK/credbin"; mkdir -p "$COPYBIN" "$CREDBIN"
+cp "$WRAP" "$COPYBIN/termag-agent-otel"; ln -s "$DIR/termag-credentials" "$CREDBIN/termag-credentials"
+out="$(cd "$WORK/repo" && env PATH="$COPYBIN:$CREDBIN:$STUB:$PATH" TERMAG_AGENT_TELEMETRY="$REC" termag-agent-otel devin -- devin)"
+case $out in
+  *"termag.repo=acme/widgets"*) : ;;
+  *) fail 'a copy with no termag-credentials beside it uses the one on PATH' 'termag.repo=acme/widgets' "$out" ;;
+esac
 
 # ── Codex ───────────────────────────────────────────────────────────────────
 out="$(run codex -- codex app-server --listen ws://127.0.0.1:1)"

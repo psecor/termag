@@ -1,0 +1,854 @@
+#!/usr/bin/env bash
+# termag-python-update — update the box user's Python (pyenv's global, a
+# python-build-standalone CPython that uv installed) to the newest patch of its
+# minor, when the orchestrator asks.
+#
+# Why this exists: the image runs `uv python install 3.13` once and registers
+# that interpreter with pyenv (packer/scripts/setup.sh: a link
+# ~/.pyenv/versions/<x.y.z> -> uv's install, `pyenv global <x.y.z>`), and
+# nothing moves it afterwards, while CPython's patch releases carry its
+# security fixes (the floor's sources are in
+# backend/src/services/pythonUpdatePolicy.ts).
+#
+# Two things point at that interpreter, and both switch only once the new one
+# verifies:
+#   * pyenv: ~/.pyenv/version (`pyenv global`), which the shims (python3, pip)
+#     and every new shell read;
+#   * uv's minor link, ~/.local/share/uv/python/cpython-3.13-<platform>, which
+#     uv moves to the newest patch it installs and which uv's own tool venvs
+#     (poetry, pre-commit) and ~/.local/bin/python3.13 run through (that one
+#     uv sometimes links to a patch directly, after an older patch's install:
+#     the switch points it at the minor link, as uv does otherwise). A plain
+#     `uv python install 3.13.<n>` would move it at once, before anything is
+#     checked, so the install is staged in a directory of its own instead.
+#
+#   1. GET <orchestrator>/api/tool-update/policy?component=python&run=<id> with
+#      the agent token on curl's stdin. Only a 200 that names this run installs
+#      anything.
+#   2. Takes ~/.termag/python-update.lock.
+#   3. Resolves the target to one exact patch of the installed minor (latest:
+#      the newest CPython of that minor in uv's list of downloads, for this
+#      platform). Another minor installs nothing: it is the image's (every
+#      venv and site-packages is per minor).
+#   4. Installs it with uv into a hidden staging directory beside uv's own
+#      (UV_PYTHON_INSTALL_DIR=<uv python dir>/.termag-stage-<pid>, --no-bin,
+#      --no-config, and none of uv's environment: no mirror or downloads list
+#      can stand in for uv's own). uv checks the download against the SHA-256
+#      its binary carries for that build.
+#   5. Verifies the new interpreter: its --version; `import ssl, sqlite3,
+#      ctypes`; pip; every module of the user's site-packages that imports
+#      under the current Python imports under it; and every uv tool or pipx
+#      venv of this minor, run on the new interpreter, loads its entry points
+#      and answers `--version` wherever it does on the current one.
+#   6. Moves it into uv's directory (one rename), rewrites the install path uv
+#      wrote into its sysconfig data, and checks it again from there.
+#   7. Switches, under uv's own lock: a pyenv version of that name, `pyenv
+#      global`, pyenv rehash, and uv's minor link (one rename); then checks
+#      what the shims and the uv tools now run. Anything that fails puts both
+#      back, and the new version is moved aside.
+#   8. Prunes older patches of the minor: never the new one, the one that ran,
+#      one a live process runs from, or one a link outside pyenv names; a
+#      pyenv version whose patch goes is pointed at the new one, so a venv made
+#      on it runs on the same minor, as uv's own venvs do through its minor link.
+#   9. POST <orchestrator>/api/tool-update/report: {component: "python", ...},
+#      with left_on_old_python, the processes still on the old interpreter.
+#
+# Also:
+#   termag-python-update --install-uv     the newest uv pinned here (UV_PINS)
+#                                         for this arch, as ~/.local/bin/uv and
+#                                         uvx, verified against its pin; exits 1
+#                                         when it cannot. The image's uv
+#                                         (packer/scripts/setup.sh).
+#   termag-python-update --newest-uv-pin  the version --install-uv installs.
+#
+# Sessions: none. Python has no sessions of its own: a process started before
+# the switch keeps the interpreter it started on (the old patch stays
+# installed while one runs from it), and whatever starts after gets the new
+# one.
+#
+# Usage:
+#   termag-python-update --run <run-id>
+#
+# Exit codes: 0 when python3 is at or above the floor (or nothing was asked of
+# it), 1 when it is below it or missing, 2 on bad usage, 3 while a switch is
+# rejected (one whose rollback did not complete), 143 when a signal stops it.
+#
+# Env:
+#   PYENV_ROOT                     pyenv's directory (default $HOME/.pyenv)
+#   TERMAG_STATE_DIR               where the lock lives (default $HOME/.termag)
+#   TERMAG_PYTHON_BUDGET           seconds the run may take (default 900)
+#   TERMAG_PYTHON_LOCK_WAIT        at most this many seconds to wait for a lock
+#   TERMAG_PYTHON_INSTALL_TIMEOUT  seconds for uv's download and install (300)
+#   TERMAG_PYTHON_UV               the uv binary (default: uv on PATH)
+#   TERMAG_PYTHON_UV_LOCK_WAIT     at most this many seconds to wait for uv's
+#                                  own lock before the switch (default 120)
+#   TERMAG_AGENT_CONFIG            the agent config with the orchestrator URL
+#                                  and token (default: the agent's search order)
+#   TERMAG_POLICY_TIMEOUT          seconds for each orchestrator call (default 20)
+
+set -u
+PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
+export LC_ALL=C
+# uv reads its environment and config files for where downloads come from: a
+# mirror or a downloads list (UV_PYTHON_INSTALL_MIRROR,
+# UV_PYTHON_DOWNLOADS_JSON_URL, uv.toml's python-install-mirror) replaces the
+# builds uv knows, and a list whose entry names no sha256 is installed
+# unchecked. None of it is this run's: every UV_ variable goes, and every uv
+# call takes --no-config.
+for _v in $(compgen -e); do case "$_v" in UV_*) unset "$_v" ;; esac; done
+unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE PYENV_VERSION _v
+# The agent asks pyenv and uv in this same environment (this PATH, these
+# unset) before it offers Python: agent/tool-update.js, pythonRecipeEnv.
+
+STATE_DIR="${TERMAG_STATE_DIR:-$HOME/.termag}"
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TARGET=latest
+LOCK_WAIT="${TERMAG_PYTHON_LOCK_WAIT:-}"
+INSTALL_TIMEOUT="${TERMAG_PYTHON_INSTALL_TIMEOUT:-300}"
+UV="${TERMAG_PYTHON_UV:-uv}"
+UV_LOCK_WAIT="${TERMAG_PYTHON_UV_LOCK_WAIT:-120}"
+export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+PYENV="$PYENV_ROOT/bin/pyenv"
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NAME=termag-python-update TU_COMPONENT=python TU_BIN=python3 TU_TAGS='latest'
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_LOCK_FILE=$STATE_DIR/python-update.lock
+# No floor of its own: a run with no policy is a failed run.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_FALLBACK_FLOOR=1
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+REJECTED=$STATE_DIR/python-update.rejected
+TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
+# shellcheck source=deploy/termag-tool-update-lib
+. "$TU_LIB" || { printf 'termag-python-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
+
+usage() { log "usage: termag-python-update --run <run-id> | --install-uv | --newest-uv-pin"; exit 2; }
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # MODE: read by termag-tool-update-lib
+case "${1:-}" in
+  --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  --install-uv|--newest-uv-pin) MODE=${1#--}; [ $# -eq 1 ] || usage ;;
+  -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) usage ;;
+esac
+BUDGET="${TERMAG_PYTHON_BUDGET:-900}"
+POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
+# Python has no sessions: this run stops none.
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT" "$UV_LOCK_WAIT"; do
+  case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
+done
+
+tu_budget
+
+# pyenv's global name, the first one its version file names, whatever it is
+# (3.13.16, the old image's bare 3.13, system).
+pyenv_global_name() {
+  local v
+  [ -x "$PYENV" ] || return 1
+  v=$("$PYENV" global 2>/dev/null </dev/null | head -n 1) || return 1
+  [ -n "$v" ] && printf '%s' "$v"
+}
+# pyenv's global version: that name, when it is an x.y.z. The agent offers
+# Python only where this and the uv check below would pass
+# (agent/tool-update.js, pythonLayout): keep the two the same.
+pyenv_global() { local v; v=$(pyenv_global_name) && is_version "$v" && printf '%s' "$v"; }
+# The binary a new shell's python3 starts: pyenv's global version's. A name
+# that is not an x.y.z (the old image's 3.13) is what pyenv resolves it to,
+# so the report carries the version that runs there too.
+resolve() {
+  local v p
+  v=$(pyenv_global_name) || return 1
+  if [ -x "$PYENV_ROOT/versions/$v/bin/python3" ]; then printf '%s' "$PYENV_ROOT/versions/$v/bin/python3"; return; fi
+  is_version "$v" && return 1
+  p=$("$PYENV" prefix "$v" 2>/dev/null </dev/null | head -n 1) && [ -n "$p" ] && [ -x "$p/bin/python3" ] && printf '%s' "$p/bin/python3"
+}
+# What a pyenv version that is not uv's is, for the report: pyenv-built (a
+# directory of its own under $PYENV_ROOT/versions, as the images baked before
+# 2026-09-30 have), missing, or elsewhere (a link out of uv's directory).
+not_uv_layout() {
+  local real=$1 own
+  own=$(readlink -f "$PYENV_ROOT/versions" 2>/dev/null) || own=
+  if [ -z "$real" ] || [ ! -e "$real" ]; then printf missing
+  elif [ -n "$own" ] && [ "${real%/*}" = "$own" ]; then printf pyenv-built
+  else printf elsewhere; fi
+}
+
+tu_fetch_policy
+[ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); Python has no fallback floor"
+if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
+
+inst_note=- verify_note=- switch_note=- tools_note=- prune_note=- uv_note=- left_on_old=0
+tu_notes() { printf 'python=%s verify=%s switch=%s tools=%s pruned=%s uv=%s left_on_old_python=%s' "$inst_note" "$verify_note" "$switch_note" "$tools_note" "$prune_note" "$uv_note" "$left_on_old"; }
+tu_notes_all() { printf '%s %s %s' "$inst_note" "$verify_note" "$switch_note"; }
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_SESSIONS_NOTE='python has no sessions'
+find_sessions() { :; }
+tu_status() { printf idle; }
+tu_had() { return 1; }
+tu_resume_line() { :; }
+
+minor() { printf '%s' "${1%.*}"; }
+uvc() { run_capped "$1" "$UV" "${@:2}" --no-config </dev/null; }
+
+# uv's list of CPython downloads for this platform's minor, "x.y.z url" per
+# line, plain releases only (no rc, no free-threaded or debug build).
+available() {
+  uvc "$(left 60)" python list --only-downloads --all-versions --output-format json "$M" 2>/dev/null \
+    | jq -r --arg plat "$PLAT" --arg re "^${M//./\\.}\\.[0-9]+$" \
+      '.[] | select(.implementation == "cpython" and .variant == "default" and (.version | test($re)) and .key == "cpython-\(.version)-\($plat)") | "\(.version) \(.url // "")"' 2>/dev/null
+}
+# tu_resolve_tag latest: the newest patch of the installed minor uv can install here.
+tu_can_resolve() { command -v "$UV" >/dev/null 2>&1; }
+tu_resolve_tag() {
+  [ "$1" = latest ] && [ -n "${PLAT:-}" ] || return 0
+  available | cut -d ' ' -f 1 | sort -V | tail -n 1
+}
+
+# ── uv itself, when it lists no build of the patch ──────────────────────────
+# uv's list of CPython downloads is compiled into the uv binary. Images baked
+# before the bake pinned uv (packer/scripts/setup.sh now installs the newest
+# pin below, through --install-uv) have whatever uv astral.sh's installer
+# served that day, and a box built before a CPython release has a uv that does
+# not know it: uv 0.13.1's list ends at 3.13.16, below the 3.13.18 floor, and
+# the floor run failed `not-available` every hour (2026-11-03).
+# When the box's uv lists no build of the wanted patch, the run brings uv to
+# the newest version pinned here, then looks again, once:
+#   * only ~/.local/bin/uv (the image's), a file this user can replace,
+#     and only to a pinned version newer than the box's;
+#   * astral-sh/uv's release tarball for the arch, over HTTPS only, checked
+#     against its pin before anything is unpacked (never `uv self update`: it
+#     takes whatever the release names, checked only against that release's
+#     own checksum);
+#   * the staged uv must say the pinned version, and must list the patch,
+#     before it replaces anything;
+#   * uv and uvx are each replaced in one rename, the old ones kept beside
+#     them (.uv.termag-old-<pid>) until the run has switched Python, and put
+#     back when it does not (uv_settle, from finish and on a signal).
+# UV_PINS: "<uv version> <x86_64|aarch64> <sha256 of uv-<arch>-unknown-linux-gnu.tar.gz>".
+UV_PINS="${TERMAG_PYTHON_UV_PINS:-0.13.6 x86_64 f29c3e94ffabd7e6f3ba521dba169a9b7ec12100bf3257087f0f24f6123f3645
+0.13.6 aarch64 229e194255c7958d86d56e8790d969a6f74736592133f0dfd0076f754c642c1d}"
+UV_DIST_URL="${TERMAG_PYTHON_UV_DIST_URL:-https://github.com/astral-sh/uv/releases/download}"
+UV_SWAPPED=0 UV_OLD_V='' UV_NEW_V='' uv_fail='' RUN_OK=0 UV_DIR='' UVX_HAD=0 UV_RESTORE_FAILED=0
+uv_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x86_64 ;;
+    aarch64|arm64) printf aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+# uv_ver BIN: the x.y.z its --version says ("uv 0.13.6 (...)", "uvx 0.13.6 (...)").
+uv_ver() { "$1" --version --no-config </dev/null 2>/dev/null | awk 'NR == 1 { print $2 }'; }
+# uv_pin ARCH: "<version> <sha256>", the newest uv UV_PINS pins for ARCH; fails
+# when none is, or the pin is not a version and a sha256.
+uv_pin() {
+  local pin v sum
+  pin=$(printf '%s\n' "$UV_PINS" | awk -v a="$1" '$2 == a { print $1, $3 }' | sort -V | tail -n 1)
+  v=${pin%% *} sum=${pin##* }
+  [ -n "$pin" ] && is_version "$v" && [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s %s' "$v" "$sum"
+}
+# uv_fetch ARCH V SUM DIR: astral-sh/uv's V release tarball for ARCH, over
+# HTTPS only, checked against SUM before anything is unpacked, as DIR/uv-V/uv
+# and uvx, each saying V. Else it fails with uv_fail (download, digest, unpack
+# or version) and says why. The run's bootstrap and --install-uv (the image's
+# install, packer/scripts/setup.sh) both take uv this way.
+uv_fetch() {
+  local a=$1 v=$2 sum=$3 w=$4 f d got
+  f=uv-$a-unknown-linux-gnu.tar.gz d=$w/uv-$v
+  run_capped "$(left 120)" curl -fsSL --proto '=https' --proto-redir '=https' -o "$w/$f" "$UV_DIST_URL/$v/$f" </dev/null \
+    || { uv_fail=download; log "could not download uv $v's $f"; return 1; }
+  got=$(sha256sum "$w/$f" | cut -c1-64)
+  [ "$got" = "$sum" ] || { uv_fail=digest; log "uv $v's $f is $got, not its pin $sum; not unpacked"; return 1; }
+  mkdir -p "$d" && tar -xzf "$w/$f" -C "$d" --no-same-owner --no-same-permissions --strip-components=1 \
+    "uv-$a-unknown-linux-gnu/uv" "uv-$a-unknown-linux-gnu/uvx" </dev/null 2>/dev/null && [ -f "$d/uv" ] && [ ! -L "$d/uv" ] && [ -f "$d/uvx" ] && [ ! -L "$d/uvx" ] \
+    || { uv_fail=unpack; log "uv $v's $f did not unpack to uv and uvx"; return 1; }
+  chmod 0755 "$d/uv" "$d/uvx"
+  [ "$(uv_ver "$d/uv")" = "$v" ] && [ "$(uv_ver "$d/uvx")" = "$v" ] \
+    || { uv_fail=version; log "the staged uv says '$(uv_ver "$d/uv")', uvx '$(uv_ver "$d/uvx")', not $v; nothing replaced"; return 1; }
+}
+# uv_bootstrap: uv replaced by the newest pinned one, which lists spec_v; or
+# nothing changed and uv_note says why.
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+uv_bootstrap() {
+  local a pin v sum d bin
+  UV_OLD_V=$(uv_ver "$UV"); UV_OLD_V=${UV_OLD_V:-unknown}
+  a=$(uv_arch) || { uv_note="$UV_OLD_V(no-pin-for-$(uname -m))"; log "no uv is pinned for $(uname -m)"; return 1; }
+  pin=$(uv_pin "$a") || { uv_note="$UV_OLD_V(no-pin-for-$a)"; log "no uv is pinned for $a"; return 1; }
+  v=${pin%% *} sum=${pin##* }
+  if is_version "$UV_OLD_V" && at_least "$UV_OLD_V" "$v"; then uv_note="$UV_OLD_V(no-newer-pin)"; log "uv $UV_OLD_V is already at or past the newest pinned uv, $v"; return 1; fi
+  UV_DIR=$HOME/.local/bin
+  bin=$(command -v "$UV" 2>/dev/null)
+  if [ "$(readlink -f "$bin" 2>/dev/null)" != "$(readlink -f "$UV_DIR/uv" 2>/dev/null)" ] || [ -L "$UV_DIR/uv" ] || [ ! -f "$UV_DIR/uv" ] || [ ! -w "$UV_DIR" ]; then
+    uv_note="$UV_OLD_V(not-ours:${bin:-none})"; log "uv is ${bin:-nowhere}, not the installer's $UV_DIR/uv this user can replace; left alone"; return 1
+  fi
+  log "uv $UV_OLD_V lists no CPython $spec_v for $PLAT; fetching the pinned uv $v (uv-$a-unknown-linux-gnu.tar.gz)"
+  uv_fetch "$a" "$v" "$sum" "$WORK" || { uv_note="$UV_OLD_V->FAILED:$uv_fail:$v"; return 1; }
+  d=$WORK/uv-$v
+  if ! UV=$d/uv available | awk -v v="$spec_v" '$1 == v { found = 1 } END { exit !found }'; then
+    uv_note="$UV_OLD_V(pinned-$v-lists-no-$spec_v)"; log "the pinned uv $v lists no CPython $spec_v for $PLAT either; uv left at $UV_OLD_V"; return 1
+  fi
+  # Each in one rename, the old one kept (a hard link, else a copy).
+  UVX_HAD=0; [ -e "$UV_DIR/uvx" ] && UVX_HAD=1
+  cp "$d/uv" "$UV_DIR/.uv.termag-new-$$" && cp "$d/uvx" "$UV_DIR/.uvx.termag-new-$$" && chmod 0755 "$UV_DIR/.uv.termag-new-$$" "$UV_DIR/.uvx.termag-new-$$" \
+    && { ln -f "$UV_DIR/uv" "$UV_DIR/.uv.termag-old-$$" 2>/dev/null || cp -p "$UV_DIR/uv" "$UV_DIR/.uv.termag-old-$$"; } \
+    && { [ ! -e "$UV_DIR/uvx" ] || ln -f "$UV_DIR/uvx" "$UV_DIR/.uvx.termag-old-$$" 2>/dev/null || cp -p "$UV_DIR/uvx" "$UV_DIR/.uvx.termag-old-$$"; } \
+    || { rm -f "$UV_DIR"/.uv*.termag-*-$$; uv_note="$UV_OLD_V->FAILED:replace:$v"; log "could not lay uv $v out beside $UV_DIR/uv; nothing replaced"; return 1; }
+  UV_SWAPPED=1 UV_NEW_V=$v
+  if ! mv -f "$UV_DIR/.uv.termag-new-$$" "$UV_DIR/uv" || ! mv -f "$UV_DIR/.uvx.termag-new-$$" "$UV_DIR/uvx" \
+    || [ "$(uv_ver "$UV_DIR/uv")" != "$v" ] || [ "$(uv_ver "$UV_DIR/uvx")" != "$v" ]; then
+    uv_restore; uv_note="$uv_note(replace-failed)"; return 1
+  fi
+  uv_note="$UV_OLD_V->$v"
+  log "uv is $v now ($UV_DIR/uv and uvx, verified against its pin); uv $UV_OLD_V is kept until this run switches Python"
+}
+# uv_restore: the uv and uvx this run replaced, back.
+uv_restore() {
+  local ok=1
+  [ "$UV_SWAPPED" = 1 ] || return 0
+  # A saved copy that is still the same file as the live one (a hard link to a
+  # binary the swap never reached) is only removed: mv refuses a file onto itself.
+  if [ "$UV_DIR/.uv.termag-old-$$" -ef "$UV_DIR/uv" ]; then rm -f "$UV_DIR/.uv.termag-old-$$"
+  elif [ -e "$UV_DIR/.uv.termag-old-$$" ]; then mv -f "$UV_DIR/.uv.termag-old-$$" "$UV_DIR/uv" || ok=0; fi
+  if [ "$UV_DIR/.uvx.termag-old-$$" -ef "$UV_DIR/uvx" ]; then rm -f "$UV_DIR/.uvx.termag-old-$$"
+  elif [ -e "$UV_DIR/.uvx.termag-old-$$" ]; then mv -f "$UV_DIR/.uvx.termag-old-$$" "$UV_DIR/uvx" || ok=0
+  # A box that had no uvx gets none back: the one this run added goes (Devin on #1296).
+  elif [ "$UVX_HAD" = 0 ]; then rm -f "$UV_DIR/uvx" || ok=0; fi
+  rm -f "$UV_DIR/.uv.termag-new-$$" "$UV_DIR/.uvx.termag-new-$$"
+  UV_SWAPPED=0
+  if [ "$ok" = 1 ] && [ "$(uv_ver "$UV_DIR/uv")" = "$UV_OLD_V" ]; then
+    uv_note="$UV_OLD_V->$UV_NEW_V->restored:$UV_OLD_V"; log "uv is back at $UV_OLD_V"
+  else
+    # The copies still saved are the only ones left: kept for a person to put
+    # back, never removed by uv_settle (Devin on #1296).
+    UV_RESTORE_FAILED=1
+    uv_note="$UV_OLD_V->$UV_NEW_V->FAILED:restore"
+    local kept='' f
+    for f in "$UV_DIR/.uv.termag-old-$$" "$UV_DIR/.uvx.termag-old-$$"; do [ -e "$f" ] && kept+=" ${f##*/}"; done
+    log "could not put uv $UV_OLD_V back in $UV_DIR; kept there for a person:${kept:- nothing (the copies were moved back, but uv does not say $UV_OLD_V)}"
+  fi
+}
+# uv_settle: once the run is over, the new uv stays when Python switched, and
+# the old one comes back otherwise.
+uv_settle() {
+  # Not swapped (yet): whatever a stopped bootstrap had laid out beside uv goes,
+  # and uv is as it was (Devin on #1296).
+  if [ "$UV_SWAPPED" != 1 ]; then
+    [ -n "$UV_DIR" ] || return 0
+    rm -f "$UV_DIR/.uv.termag-new-$$" "$UV_DIR/.uvx.termag-new-$$"
+    [ "$UV_RESTORE_FAILED" = 1 ] || rm -f "$UV_DIR/.uv.termag-old-$$" "$UV_DIR/.uvx.termag-old-$$"
+    return 0
+  fi
+  if [ "$RUN_OK" = 1 ]; then rm -f "$UV_DIR/.uv.termag-old-$$" "$UV_DIR/.uvx.termag-old-$$"; UV_SWAPPED=0
+  else uv_restore; fi
+}
+# The lib's finish, with uv settled first, so the report says which uv stayed.
+eval "tu_lib_finish() $(declare -f finish | sed 1d)"
+finish() { uv_settle; tu_lib_finish; }
+
+# ── the image's uv (--install-uv, --newest-uv-pin) ──────────────────────────
+# packer/scripts/setup.sh installs uv with --install-uv, so UV_PINS is the one
+# list of uv versions: the bake names none of its own, and a pin refresh moves
+# new images and the runs' bootstrap together. The newest uv pinned for this
+# arch, fetched and checked as the bootstrap does (uv_fetch), becomes
+# ~/.local/bin/uv and uvx, each in one rename. When any step fails nothing is
+# replaced and it exits 1, so the bake fails; it never falls back to astral.sh's
+# installer. uv and uvx both at or past the pin are left as they are; otherwise
+# both are replaced together, or neither (the old ones are put back), and a uv
+# past the pin is never moved down. --newest-uv-pin prints the version
+# --install-uv installs here.
+UVI_WORK='' UVI_DIR='' UVI_SWAP=0
+# uvi_restore: the uv and uvx --install-uv replaced, back (both, or as they
+# were: none where there was none), and nothing it staged left beside them.
+uvi_restore() {
+  local f ok=0
+  [ "$UVI_SWAP" = 1 ] || return 0
+  for f in uv uvx; do
+    rm -f "$UVI_DIR/.$f.termag-new-$$"
+    if [ "$UVI_DIR/.$f.termag-old-$$" -ef "$UVI_DIR/$f" ]; then rm -f "$UVI_DIR/.$f.termag-old-$$"
+    elif [ -e "$UVI_DIR/.$f.termag-old-$$" ]; then mv -f "$UVI_DIR/.$f.termag-old-$$" "$UVI_DIR/$f" || ok=1
+    else rm -f "$UVI_DIR/$f" || ok=1; fi
+  done
+  UVI_SWAP=0
+  [ "$ok" = 0 ] && log "uv and uvx in $UVI_DIR are as they were" \
+    || log "could not put uv and uvx back in $UVI_DIR; a copy of each old one is left there as .uv*.termag-old-$$"
+}
+uv_install() {
+  local a pin v sum dir=$HOME/.local/bin have hx f
+  a=$(uv_arch) || { log "no uv is pinned for $(uname -m)"; return 1; }
+  pin=$(uv_pin "$a") || { log "no uv is pinned for $a"; return 1; }
+  v=${pin%% *} sum=${pin##* }
+  [ "$MODE" = newest-uv-pin ] && { printf '%s\n' "$v"; return 0; }
+  have=$( [ -f "$dir/uv" ] && uv_ver "$dir/uv" ); hx=$( [ -f "$dir/uvx" ] && uv_ver "$dir/uvx" )
+  # Both at or past the pin: left as they are. A uv past the pin beside a
+  # missing or older uvx is not moved down to mend it: that fails, untouched.
+  if is_version "$have" && at_least "$have" "$v"; then
+    if is_version "$hx" && at_least "$hx" "$v"; then log "uv $have and uvx $hx are already in $dir, at or past the pinned $v; left as they are"; return 0; fi
+    if [ "$have" != "$v" ]; then log "uv $have in $dir is past the pinned $v, but uvx is '${hx:-missing}'; not moving uv down, nothing installed"; return 1; fi
+  fi
+  UVI_WORK=$(mktemp -d) || { log "cannot create a work directory"; return 1; }
+  log "installing the pinned uv $v for $a (sha256 $sum) from $UV_DIST_URL"
+  uv_fetch "$a" "$v" "$sum" "$UVI_WORK" || { log "uv $v not installed (FAILED:$uv_fail)"; return 1; }
+  mkdir -p "$dir" || { log "cannot create $dir"; return 1; }
+  # Both staged beside the live ones, and the old ones kept (a hard link, else
+  # a copy), before either is replaced; any failure from here puts both back.
+  UVI_DIR=$dir
+  for f in uv uvx; do
+    cp "$UVI_WORK/uv-$v/$f" "$dir/.$f.termag-new-$$" && chmod 0755 "$dir/.$f.termag-new-$$" \
+      && { [ ! -e "$dir/$f" ] || ln -f "$dir/$f" "$dir/.$f.termag-old-$$" 2>/dev/null || cp -p "$dir/$f" "$dir/.$f.termag-old-$$"; } \
+      || { rm -f "$dir"/.uv*.termag-*-$$; log "could not lay uv $v's $f out in $dir; nothing replaced"; return 1; }
+  done
+  UVI_SWAP=1
+  if ! mv -f "$dir/.uv.termag-new-$$" "$dir/uv" || ! mv -f "$dir/.uvx.termag-new-$$" "$dir/uvx" \
+    || [ "$(uv_ver "$dir/uv")" != "$v" ] || [ "$(uv_ver "$dir/uvx")" != "$v" ]; then
+    log "could not replace uv and uvx in $dir with $v (uv says '$(uv_ver "$dir/uv")', uvx '$(uv_ver "$dir/uvx")'); putting them back"
+    uvi_restore; return 1
+  fi
+  UVI_SWAP=0
+  rm -f "$dir/.uv.termag-old-$$" "$dir/.uvx.termag-old-$$"
+  log "uv $v is $dir/uv and uvx now, verified against its pin"
+}
+case "$MODE" in
+  install-uv|newest-uv-pin)
+    trap '[ -n "$UVI_WORK" ] && rm -rf "$UVI_WORK"' EXIT
+    trap 'trap - TERM INT HUP; uvi_restore; exit 1' TERM INT HUP
+    uv_install; exit $? ;;
+esac
+
+# ── where things are ────────────────────────────────────────────────────────
+WORK='' STAGE='' PHASE=''
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; [ -n "$STAGE" ] && [ -d "$STAGE" ] && rm -rf "$STAGE"; }
+# in_use DIR: a live process runs from DIR (its executable is in it). /proc
+# names an executable by its canonical path, so DIR is resolved first: a link
+# in $HOME or ~/.local must not hide one (#1205).
+in_use() {
+  local e d
+  d=$(readlink -f "$1" 2>/dev/null) || d=$1
+  for e in /proc/[0-9]*/exe; do
+    case "$(readlink "$e" 2>/dev/null)" in "$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+# This user's processes whose executable is in DIR, for the report.
+count_in() {
+  local p d n=0
+  d=$(readlink -f "$1" 2>/dev/null) || d=$1
+  for p in $(pgrep -u "$(id -u)" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    case "$(readlink "/proc/$p/exe" 2>/dev/null)" in "$d"/*) n=$((n + 1)) ;; esac
+  done
+  printf '%s' "$n"
+}
+# relink LINK TARGET: LINK points at TARGET, replaced in one rename.
+relink() { ln -sfn "$2" "$1.termag-$$" && mv -T "$1.termag-$$" "$1" || { rm -f "$1.termag-$$"; return 1; }; }
+
+# ── the checks, run by each interpreter ─────────────────────────────────────
+# Written into the run's own directory and run with -E -P (no PYTHON*
+# variables, no script directory or cwd on sys.path), from that directory.
+write_check() {
+  cat > "$WORK/check.py" <<'PY'
+import sys, os
+mode = sys.argv[1]
+if mode == "stdlib":
+    import ssl, sqlite3, ctypes
+    ctypes.sizeof(ctypes.c_void_p)
+    print("ok", ssl.OPENSSL_VERSION.replace(" ", "_"), "sqlite", sqlite3.sqlite_version)
+elif mode == "prefix":
+    import sysconfig
+    print(sysconfig.get_config_var("prefix"))
+elif mode == "usersite":
+    # Every top-level module of every distribution in the user's site-packages.
+    import site, importlib, importlib.metadata as md
+    us = site.getusersitepackages()
+    names = set()
+    if site.ENABLE_USER_SITE and os.path.isdir(us):
+        for d in md.distributions(path=[us]):
+            tl = d.read_text("top_level.txt")
+            if tl:
+                names.update(x.strip() for x in tl.split())
+                continue
+            for f in d.files or []:
+                top = str(f).split("/")[0]
+                if top.endswith(".py"):
+                    names.add(top[:-3])
+                elif "." not in top and top not in ("__pycache__", "bin"):
+                    names.add(top)
+    for n in sorted(x for x in names if x.isidentifier()):
+        try:
+            importlib.import_module(n)
+            print("ok", n, flush=True)
+        except BaseException as e:
+            print("fail", n, type(e).__name__, flush=True)
+elif mode == "entrypoints":
+    # A venv's console scripts (the ones in its bin/), each loaded.
+    import importlib.metadata as md
+    bindir = sys.argv[2]
+    for ep in sorted(md.entry_points(group="console_scripts"), key=lambda e: e.name):
+        if not os.path.exists(os.path.join(bindir, ep.name)):
+            continue
+        try:
+            ep.load()
+            print("ok", ep.name, flush=True)
+        except BaseException as e:
+            print("fail", ep.name, type(e).__name__, flush=True)
+PY
+}
+# py PYTHON ARGS...: one check, from the run's directory, capped.
+py() { (cd "$WORK" && timeout -k 2 60 "$1" -E -P "${@:2}" </dev/null 2>/dev/null); }
+
+# The venvs of this minor that uv tools and pipx keep: "<dir>" per line.
+tool_venvs() {
+  local d cfg v
+  for d in "$HOME"/.local/share/uv/tools/* "$HOME"/.local/share/pipx/venvs/* "$HOME"/.local/pipx/venvs/*; do
+    cfg=$d/pyvenv.cfg
+    [ -f "$cfg" ] && [ -x "$d/bin/python" ] || continue
+    v=$(sed -n 's/^[[:space:]]*\(version_info\|version\)[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\2/p' "$cfg" | head -n 1)
+    case "$v" in "$M"|"$M".*) printf '%s\n' "$d" ;; esac
+  done
+}
+# overlay VENV PREFIX: a venv in $WORK that is VENV's packages on PREFIX's
+# interpreter, so VENV runs on the new Python before anything points at it.
+overlay() {
+  local o
+  o=$WORK/venv-$(printf '%s' "$1" | sha256sum | cut -c1-12)
+  rm -rf "$o"; mkdir -p "$o/bin" || return 1
+  ln -s "$2/bin/python3" "$o/bin/python" && ln -s "$1/lib" "$o/lib" || return 1
+  [ -e "$1/lib64" ] && ln -s "$1/lib64" "$o/lib64"
+  # shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+  printf 'home = %s/bin\ninclude-system-site-packages = false\nversion = %s\n' "$2" "$spec_v" > "$o/pyvenv.cfg"
+  printf '%s' "$o/bin/python"
+}
+# regressed OLD NEW: the "ok <name>" lines of OLD that NEW does not have.
+regressed() { comm -23 <(printf '%s\n' "$1" | awk '$1 == "ok" { print $2 }' | sort -u) <(printf '%s\n' "$2" | awk '$1 == "ok" { print $2 }' | sort -u); }
+
+# verify PREFIX: the interpreter at PREFIX, against the one that runs now
+# (OLD_PY, and each tool venv's own python). Sets verify_note and tools_note;
+# fails on the first check that does not hold.
+verify() {
+  local p=$1 pyb out o n tv np s rc_old rc_new t=0 lost ran
+  pyb=$p/bin/python3
+  out=$("$pyb" --version 2>&1 </dev/null)
+  [ "$out" = "Python $spec_v" ] || { verify_note="FAILED:version"; log "$pyb --version says '${out:-nothing}', not Python $spec_v"; return 1; }
+  out=$(py "$pyb" "$WORK/check.py" stdlib) || { verify_note="FAILED:stdlib"; log "Python $spec_v cannot import ssl, sqlite3 and ctypes"; return 1; }
+  log "Python $spec_v: $out"
+  py "$pyb" -m pip --version >/dev/null || { verify_note="FAILED:pip"; log "Python $spec_v's pip does not run"; return 1; }
+  # The user's site-packages (per minor, shared by every patch).
+  o=$(py "$OLD_PY" "$WORK/check.py" usersite) || true
+  n=$(py "$pyb" "$WORK/check.py" usersite) || true
+  lost=$(regressed "$o" "$n")
+  if [ -n "$lost" ]; then
+    verify_note="FAILED:user-site"
+    log "the user's site-packages import under Python $have but not $spec_v: $(printf '%s' "$lost" | tr '\n' ' ')"; return 1
+  fi
+  log "user site-packages: $(printf '%s\n' "$n" | grep -c '^ok ') module(s) import on Python $spec_v, none lost against $have"
+  # Each uv tool or pipx venv of this minor, on the new interpreter.
+  while IFS= read -r tv; do
+    [ -n "$tv" ] || continue
+    t=$((t + 1))
+    np=$(overlay "$tv" "$p") || { verify_note="FAILED:tool:${tv##*/}"; log "could not lay out ${tv##*/} on Python $spec_v"; return 1; }
+    o=$(py "$tv/bin/python" "$WORK/check.py" entrypoints "$tv/bin") || true
+    n=$(py "$np" "$WORK/check.py" entrypoints "$tv/bin") || true
+    lost=$(regressed "$o" "$n")
+    [ -z "$lost" ] || { verify_note="FAILED:tool:${tv##*/}"; log "${tv##*/}'s entry points load on its Python but not on $spec_v: $(printf '%s' "$lost" | tr '\n' ' ')"; return 1; }
+    ran=''
+    for s in $(printf '%s\n' "$o" | awk '$1 == "ok" { print $2 }'); do
+      [ -f "$tv/bin/$s" ] || continue
+      (cd "$WORK" && timeout -k 2 20 "$tv/bin/python" -E "$tv/bin/$s" --version </dev/null >/dev/null 2>&1); rc_old=$?
+      [ "$rc_old" = 0 ] || continue
+      (cd "$WORK" && timeout -k 2 20 "$np" -E "$tv/bin/$s" --version </dev/null >/dev/null 2>&1); rc_new=$?
+      [ "$rc_new" = 0 ] || { verify_note="FAILED:tool:${tv##*/}"; log "$s --version runs on ${tv##*/}'s Python but not on $spec_v (exit $rc_new)"; return 1; }
+      ran+="${ran:+ }$s"
+    done
+    log "tool ${tv##*/}: entry points load on Python $spec_v ($(printf '%s\n' "$n" | awk '$1 == "ok" { print $2 }' | tr '\n' ' ' | sed 's/ $//')); --version runs: ${ran:-none}"
+  done < <(tool_venvs)
+  tools_note=$t
+  verify_note=ok
+}
+
+# ── the switch, and putting it back ─────────────────────────────────────────
+NEWNAME_MADE=0 INSTALLED_HERE=0
+# set_aside: the version this run installed, out of uv's sight for a retry; one
+# the owner's uv had installed before stays where it is.
+set_aside() { [ "$INSTALLED_HERE" = 1 ] && mv -T "$FINAL" "$PYDIR/.termag-rejected-${FINAL##*/}-$$" 2>/dev/null; return 0; }
+put_back() {
+  local ok=0
+  "$PYENV" global "$HAVE_NAME" </dev/null >/dev/null 2>&1 && [ "$(pyenv_global)" = "$HAVE_NAME" ] || ok=1
+  if [ -n "$MINOR_LINK" ]; then relink "$MINOR_LINK" "$MINOR_WAS" || ok=1; fi
+  if [ -n "$BIN_WAS" ]; then relink "$BIN_LINK" "$BIN_WAS" || ok=1; fi
+  "$PYENV" rehash </dev/null >/dev/null 2>&1 || true
+  if [ "$NEWNAME_MADE" = 1 ]; then rm -f "$PYENV_ROOT/versions/$spec_v"; fi
+  [ "$ok" = 0 ] && set_aside
+  return "$ok"
+}
+# What the shims and the uv tools run now: the new version, or the switch fails.
+switched_ok() {
+  local out tv
+  out=$(cd "$WORK" && env PYENV_DIR=/ "$PYENV_ROOT/shims/python3" --version 2>&1 </dev/null)
+  [ "$out" = "Python $spec_v" ] || { log "pyenv's python3 shim says '${out:-nothing}', not Python $spec_v"; return 1; }
+  if [ -n "$BIN_WAS" ]; then
+    out=$("$BIN_LINK" --version 2>&1 </dev/null)
+    [ "$out" = "Python $spec_v" ] || { log "$BIN_LINK says '${out:-nothing}', not Python $spec_v"; return 1; }
+  fi
+  if [ -n "$MINOR_LINK" ]; then
+    while IFS= read -r tv; do
+      [ -n "$tv" ] || continue
+      # Only a venv that follows the minor link (uv's): one made on a patch
+      # of its own keeps it.
+      case "$(readlink -f "$tv/bin/python")" in "$(readlink -f "$FINAL")"/*) ;; *) continue ;; esac
+      out=$("$tv/bin/python" --version 2>&1 </dev/null)
+      [ "$out" = "Python $spec_v" ] || { log "${tv##*/} runs '${out:-nothing}' after the switch, not Python $spec_v"; return 1; }
+    done < <(tool_venvs)
+  fi
+}
+
+# ── pruning ─────────────────────────────────────────────────────────────────
+# Older patches of this minor and platform, and what earlier runs left
+# (.termag-*): every path compared canonical (readlink -f), as the links and
+# /proc resolve, and uv's directory may be reached through a link (#1205).
+prune() {
+  local d c keep_new keep_old l lt pruned='' kept=''
+  keep_new=$(readlink -f "$FINAL") keep_old=$(readlink -f "$OLD_PREFIX")
+  local v
+  for d in "$PYDIR"/cpython-"$M".*-"$PLAT" "$PYDIR"/.termag-stage-* "$PYDIR"/.termag-rejected-cpython-*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    # A patch newer than the target (an owner's own uv install) is theirs, and
+    # stays (Devin on #1219); only older ones go.
+    case "${d##*/}" in
+      cpython-*) v=${d##*/cpython-}; v=${v%%-*}
+        is_version "$v" && [ "$v" != "$spec_v" ] && at_least "$spec_v" "$v" || continue ;;
+    esac
+    c=$(readlink -f "$d" 2>/dev/null) || c=$d
+    [ "$c" = "$keep_new" ] || [ "$c" = "$keep_old" ] && continue
+    if in_use "$c"; then log "kept ${d##*/}: a process still runs from it"; kept+="${kept:+,}${d##*/}(in-use)"; continue; fi
+    # A link uv or the owner made to it (uv's other minor links,
+    # ~/.local/bin's pythonX.Y) keeps it; a pyenv version is moved instead.
+    for l in "$PYDIR"/* "$HOME"/.local/bin/python*; do
+      [ -L "$l" ] || continue
+      case "$(readlink -f "$l" 2>/dev/null)" in "$c"|"$c"/*) log "kept ${d##*/}: $l points at it"; kept+="${kept:+,}${d##*/}(linked)"; continue 2 ;; esac
+    done
+    for l in "$PYENV_ROOT"/versions/*; do
+      [ -L "$l" ] || continue
+      lt=$(readlink -f "$l" 2>/dev/null)
+      [ "$lt" = "$c" ] || continue
+      if relink "$l" "$FINAL"; then log "pyenv's ${l##*/} now runs Python $spec_v (its patch is pruned; same minor)"
+      else log "could not point pyenv's ${l##*/} at $spec_v; kept ${d##*/}"; kept+="${kept:+,}${d##*/}(pyenv)"; continue 2; fi
+    done
+    rm -rf "$d" && { log "removed ${d##*/} (nothing runs from it, nothing links to it)"; pruned+="${pruned:+,}${d##*/}"; }
+  done
+  "$PYENV" rehash </dev/null >/dev/null 2>&1 || true
+  prune_note=${pruned:-none}${kept:+;kept=$kept}
+}
+
+on_sig() {
+  trap - TERM INT HUP
+  case "$PHASE" in
+    moved) set_aside && log "stopped after the move; $spec_v moved aside" ;;
+    switching) put_back || reject python "stopped mid-switch, and Python $have could not be put back" ;;
+  esac
+  uv_settle
+  on_signal
+}
+trap on_sig TERM INT HUP
+trap cleanup EXIT
+
+tu_lock
+WORK=$(mktemp -d "$STATE_DIR/python-update.XXXXXX") || { log "cannot create a work directory"; finish; }
+write_check
+
+have=$(pyenv_global) || have=
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+from_v=$have
+if [ "$FLOOR_ONLY" = 1 ]; then log "installing nothing"; finish; fi
+if ! command -v "$UV" >/dev/null 2>&1; then inst_note="${have:-none}->FAILED:no-uv"; log "no uv on this box; this updates uv's Python"; finish; fi
+uv_note=$("$UV" --version --no-config 2>/dev/null </dev/null | awk '{ print $2 }'); uv_note=${uv_note:-unknown}
+if [ -z "$have" ] && have_name=$(pyenv_global_name); then
+  # The images baked before 2026-09-30 set `pyenv global 3.13` on a
+  # pyenv-built CPython. Nothing here moves a box off that.
+  inst_note="$have_name->FAILED:pyenv-global-not-a-version"
+  log "pyenv's global is $have_name, not an x.y.z (the layout of the images baked before uv's Python, whose CPython pyenv built); this updates pyenv's uv-managed Python, it does not install or switch one"
+  finish
+fi
+if [ -z "$have" ]; then
+  inst_note="none->FAILED:no-pyenv-global"
+  log "pyenv's global is not a Python version under $PYENV_ROOT; this updates pyenv's uv-managed Python, it does not install one"
+  finish
+fi
+PYDIR=$(uvc 20 python dir 2>/dev/null) || PYDIR=
+# pyenv's global name, which a rollback puts back; the version that runs is
+# the uv install it resolves to, which is another patch for a name an earlier
+# prune pointed at the new patch (Devin on #1219).
+HAVE_NAME=$have
+OLD_PREFIX=$(readlink -f "$PYENV_ROOT/versions/$HAVE_NAME" 2>/dev/null) || OLD_PREFIX=
+OLD_PY=$PYENV_ROOT/versions/$HAVE_NAME/bin/python3
+# The image's layout: pyenv's version is a link to uv's install of it.
+case "$OLD_PREFIX" in
+  "$(readlink -f "$PYDIR" 2>/dev/null)"/cpython-[0-9]*.[0-9]*.[0-9]*-*)
+    have=${OLD_PREFIX##*/cpython-}; have=${have%%-*}
+    is_version "$have" || { inst_note="$HAVE_NAME->FAILED:not-uv-managed"; log "pyenv's $HAVE_NAME resolves to $OLD_PREFIX, not a uv CPython x.y.z"; finish; }
+    PLAT=${OLD_PREFIX##*/cpython-"$have"-}
+    # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+    from_v=$have
+    [ "$have" = "$HAVE_NAME" ] || log "pyenv's global $HAVE_NAME runs uv's CPython $have" ;;
+  *) layout=$(not_uv_layout "$OLD_PREFIX")
+    inst_note="$have->FAILED:not-uv-managed($layout)"
+    log "pyenv's $have is not uv's Python ($layout: ${OLD_PREFIX:-missing}, uv's are in ${PYDIR:-nowhere}); nothing installed or switched"
+    finish ;;
+esac
+M=$(minor "$have")
+PYDIR=$(readlink -f "$PYDIR")
+MINOR_LINK=$PYDIR/cpython-$M-$PLAT MINOR_WAS=''
+if [ -L "$MINOR_LINK" ]; then MINOR_WAS=$(readlink "$MINOR_LINK"); else MINOR_LINK=''; fi
+# uv's pythonX.Y executable in ~/.local/bin: switched too when it names a patch
+# of this minor directly rather than through the minor link.
+BIN_LINK=$HOME/.local/bin/python$M BIN_WAS=''
+if [ -L "$BIN_LINK" ] && [ "$(readlink "$BIN_LINK")" != "${MINOR_LINK:-/}/bin/python$M" ]; then
+  case "$(readlink -f "$BIN_LINK")" in "$PYDIR"/cpython-"$M".*-"$PLAT"/*) BIN_WAS=$(readlink "$BIN_LINK") ;; esac
+fi
+
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+want=$FLOOR
+tu_run_target
+tu_spec
+# shellcheck disable=SC2154  # spec_v: set by tu_spec, in termag-tool-update-lib
+if [ "$(minor "$spec_v")" != "$M" ]; then
+  inst_note="$have->FAILED:other-minor:$spec_v"
+  log "Python $spec_v is another minor than $have; a new minor is the image's (venvs and site-packages are per minor)"
+  finish
+fi
+FINAL=$PYDIR/cpython-$spec_v-$PLAT
+# uv's links follow the newest patch uv has: one already on a patch newer than
+# the target (an owner's own uv install) is left there, never moved down.
+newer_than_target() { local v; v=$(readlink -f "$1" 2>/dev/null); v=${v##*/cpython-}; v=${v%%-*}; is_version "$v" && [ "$v" != "$spec_v" ] && at_least "$v" "$spec_v"; }
+if [ -n "$MINOR_LINK" ] && newer_than_target "$MINOR_LINK"; then log "uv's ${MINOR_LINK##*/} is on a patch newer than $spec_v; left there"; MINOR_LINK=''; fi
+if [ -n "$BIN_WAS" ] && newer_than_target "$BIN_LINK"; then BIN_WAS=''; fi
+if [ "$have" = "$spec_v" ]; then
+  # Rejected earlier (a switch whose rollback did not complete): checked
+  # again where it is, and the minor link made to agree.
+  if was_rejected python; then
+    if verify "$FINAL"; then
+      [ -z "$MINOR_LINK" ] || relink "$MINOR_LINK" "$FINAL" || log "could not point uv's minor link at $spec_v"
+      accept python; log "Python $have verifies; the rejection is cleared"
+    else
+      log "Python $have is pyenv's global but does not verify; still rejected"
+    fi
+  fi
+  inst_note=$have
+  finish
+fi
+if downgrade "$have"; then inst_note="$have(no-downgrade)"; log "Python is $have; $spec_v would move it down; skipped"; finish; fi
+
+# 3. Available for this platform: an exact target uv cannot install is not guessed at.
+url=$(available | awk -v v="$spec_v" '$1 == v { print $2; exit }')
+# The box's uv may predate the patch: uv brought up to its pin, then once more.
+if [ -z "$url" ] && [ ! -d "$FINAL" ] && uv_bootstrap; then
+  url=$(available | awk -v v="$spec_v" '$1 == v { print $2; exit }')
+fi
+if [ -z "$url" ] && [ ! -d "$FINAL" ]; then
+  inst_note="$have->FAILED:not-available:$spec_v"
+  log "uv $uv_note lists no CPython $spec_v for $PLAT; nothing installed"
+  finish
+fi
+
+# 4. Installed where nothing looks: uv's discovery reads cpython-* names only.
+if [ -d "$FINAL" ] && [ ! -L "$FINAL" ]; then
+  # uv installed it already (an owner's `uv python install`, which checked
+  # it as any uv install): verified like a new one, then switched to.
+  log "uv already has CPython $spec_v at $FINAL; verifying it in place"
+  inst_note="$have->$spec_v(already-there)"
+  SRC=$FINAL
+else
+  STAGE=$PYDIR/.termag-stage-$$
+  mkdir -p "$STAGE" || { inst_note="$have->FAILED"; log "cannot create $STAGE"; finish; }
+  TU_TMP+=("$STAGE")
+  log "Python is $have; installing CPython $spec_v ($PLAT, from ${url:-uv}) with uv $uv_note into $STAGE (at most $(left "$INSTALL_TIMEOUT")s)"
+  if ! UV_PYTHON_INSTALL_DIR=$STAGE uvc "$(left "$INSTALL_TIMEOUT")" python install --no-bin --no-registry --no-progress "cpython-$spec_v-$PLAT" >&2; then
+    inst_note="$have->FAILED:install"; log "uv did not install CPython $spec_v (its download did not verify, or did not complete); nothing changed"; finish
+  fi
+  SRC=$STAGE/cpython-$spec_v-$PLAT
+  [ -d "$SRC" ] && [ ! -L "$SRC" ] || { inst_note="$have->FAILED:install"; log "uv laid down no $SRC; nothing changed"; finish; }
+fi
+
+# 5. Verified before anything points at it.
+if ! verify "$SRC"; then
+  inst_note="$have->FAILED:verify"
+  log "CPython $spec_v did not verify ($verify_note); nothing switched, Python $have stays the default"
+  finish
+fi
+
+# 6. In place, its sysconfig on the final path, checked again.
+if [ "$SRC" != "$FINAL" ]; then
+  PHASE=moved INSTALLED_HERE=1
+  if ! mv -T "$SRC" "$FINAL" 2>/dev/null; then
+    PHASE='' INSTALLED_HERE=0; inst_note="$have->FAILED"; log "cannot move CPython $spec_v into $PYDIR; nothing changed"; finish
+  fi
+  # uv wrote the staging path into the sysconfig data (and any other text
+  # file that names it): the final one replaces it.
+  src_re=$(printf '%s' "$SRC" | sed 's/[][\\.*^$#]/\\&/g') final_re=$(printf '%s' "$FINAL" | sed 's/[\\&#]/\\&/g')
+  while IFS= read -r f; do
+    sed -i "s#$src_re#$final_re#g" "$f" || log "could not rewrite $f"
+  done < <(grep -rlIF -- "$SRC" "$FINAL" 2>/dev/null)
+  got=$(py "$FINAL/bin/python3" "$WORK/check.py" prefix)
+  if [ "$got" != "$FINAL" ] || [ "$("$FINAL/bin/python3" --version 2>&1 </dev/null)" != "Python $spec_v" ]; then
+    set_aside; PHASE=''
+    inst_note="$have->FAILED:verify" verify_note="FAILED:prefix"
+    log "CPython $spec_v's sysconfig prefix is '${got:-nothing}' after the move, not $FINAL; moved aside, nothing switched"
+    finish
+  fi
+  # The stdlib's bytecode, as the image compiles it (packer/scripts/setup.sh):
+  # python-build-standalone ships none. Best effort.
+  "$FINAL/bin/python3" -E -m compileall -q -j0 -o 0 -o 1 -o 2 -x '/(test|idlelib/idle_test|lib2to3/tests)/|/site-packages/' \
+    "$("$FINAL/bin/python3" -E -c 'import sysconfig; print(sysconfig.get_path("stdlib"))' 2>/dev/null)" </dev/null >/dev/null 2>&1 \
+    || log "compileall of $spec_v's stdlib did not complete (not needed to run)"
+  rm -rf "$STAGE"; STAGE=''
+fi
+
+# 7. The switch, under uv's own lock (an owner's `uv python install` moves the
+# minor link too).
+# Without it nothing switches: a uv install could move the minor link under
+# the switch (Devin on #1219). The verified version is set aside for a retry.
+if ! { exec 5>"$PYDIR/.lock"; } 2>/dev/null || ! flock -w "$(left "$UV_LOCK_WAIT")" 5; then
+  set_aside
+  inst_note="$have->FAILED:uv-lock" switch_note=FAILED:uv-lock
+  log "could not take uv's lock in $PYDIR (another uv install holds it); nothing switched, Python $have stays the default"
+  finish
+fi
+PHASE=switching
+fail_switch() {
+  if put_back; then switch_note="FAILED:$1,restored:$have"
+  else switch_note="FAILED:$1"; reject python "the switch to $spec_v failed ($1) and Python $have could not be put back"; fi
+  PHASE=''; inst_note="$have->FAILED:switch"; finish
+}
+name=$PYENV_ROOT/versions/$spec_v
+if [ -L "$name" ] && [ "$(readlink -f "$name")" = "$(readlink -f "$FINAL")" ]; then :
+elif [ -e "$name" ] || [ -L "$name" ]; then
+  PHASE=''; inst_note="$have->FAILED:pyenv-name-taken:$spec_v"; switch_note=FAILED
+  set_aside
+  log "$name is already there and is not uv's $spec_v; nothing switched"; finish
+else
+  relink "$name" "$FINAL" || fail_switch pyenv-link
+  NEWNAME_MADE=1
+fi
+"$PYENV" global "$spec_v" </dev/null >/dev/null 2>&1 && [ "$(pyenv_global)" = "$spec_v" ] || fail_switch pyenv-global
+"$PYENV" rehash </dev/null >/dev/null 2>&1 || log "pyenv rehash failed (the shims still dispatch by version)"
+if [ -n "$MINOR_LINK" ]; then relink "$MINOR_LINK" "$FINAL" || fail_switch minor-link; fi
+if [ -n "$BIN_WAS" ]; then
+  if [ -n "$MINOR_LINK" ]; then relink "$BIN_LINK" "$MINOR_LINK/bin/python$M" || fail_switch bin-link
+  else relink "$BIN_LINK" "$FINAL/bin/python$M" || fail_switch bin-link; fi
+fi
+switched_ok || fail_switch check
+PHASE=''
+switch_note="pyenv=$spec_v${MINOR_LINK:+,uv-minor-link}${BIN_WAS:+,bin-link}"
+inst_note="$have->$spec_v" RUN_OK=1
+accept python
+log "Python $spec_v is pyenv's global${MINOR_LINK:+, and the target of ${MINOR_LINK##*/}}; Python $have stays installed"
+
+# 8. Older patches.
+prune
+exec 5>&-
+left_on_old=$(count_in "$OLD_PREFIX")
+[ "$left_on_old" = 0 ] || log "$left_on_old process(es) still run Python $have, which stays installed; they move at their next start"
+finish

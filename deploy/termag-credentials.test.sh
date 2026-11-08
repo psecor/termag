@@ -9,6 +9,8 @@ SCRIPT="$(cd "$(dirname "$0")" && pwd)/termag-credentials"
 HELPER="$(cd "$(dirname "$0")" && pwd)/termag-claude-token"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# Outside any git checkout: telemetry-launch adds the checkout's termag.repo only where a case makes one.
+cd "$WORK" || exit 1
 
 failures=0
 fail() {
@@ -418,6 +420,63 @@ for kind in ask chat oneshot; do
   want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=$kind,service.name=termag-claude-session,termag.box=$BOX\"}}"
   [ "$got" = "$want" ] || fail "telemetry-launch: an explicit $kind wins over an inherited interactive" "$want" "$got"
 done
+# The session's work (work_resource): the checkout's repository as owner/name
+# (never the remote URL, which can carry a token), branch and commit, read from
+# TERMAG_WORK_DIR or the working directory, and a spawned agent's spawn, each
+# bad value dropped on its own.
+git init -q "$WORK/wr" && git -C "$WORK/wr" checkout -q -b feature/x
+# A remote URL carrying a token, assembled here so no credential-shaped URL
+# sits in the source (the password is the word secret, not a real token).
+FAKE_USERINFO="x-access-token:$(printf '%s' secret)"
+git -C "$WORK/wr" remote add origin "https://${FAKE_USERINFO}@github.example.test/acme/widgets.git"
+git -C "$WORK/wr" -c user.name=t -c user.email=t@example.test commit -q --allow-empty -m init
+WSHA=$(git -C "$WORK/wr" rev-parse HEAD)
+WORKATTRS="termag.repo=acme/widgets,termag.git.branch=feature/x,termag.git.commit=$WSHA"
+got="$(cd "$WORK/wr" && TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main run telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=interactive,service.name=termag-claude-session,termag.box=$BOX,termag.project=webapp,termag.workstream=main,$WORKATTRS\"}}"
+[ "$got" = "$want" ] || fail "telemetry-launch adds the checkout's repository, branch and commit" "$want" "$got"
+case $got in *secret*|*x-access-token*|*github.example.test*) fail 'the remote URL never reaches the resource' 'owner/name only' "$got" ;; esac
+got="$(TERMAG_WORK_DIR="$WORK/wr" TERMAG_SESSION_KIND=chat run telemetry-launch -)"
+case $got in *",$WORKATTRS\""*) : ;; *) fail 'telemetry-launch reads the checkout from TERMAG_WORK_DIR (the chat runner)' "$WORKATTRS" "$got" ;; esac
+git -C "$WORK/wr" checkout -q --detach
+got="$(cd "$WORK/wr" && run work-resource)"
+[ "$got" = ",termag.repo=acme/widgets,termag.git.commit=$WSHA" ] || fail 'a detached HEAD names no branch' ",termag.repo=acme/widgets,termag.git.commit=$WSHA" "$got"
+git -C "$WORK/wr" remote set-url origin /srv/git/widgets.git
+got="$(cd "$WORK/wr" && run work-resource)"
+[ "$got" = ",termag.git.commit=$WSHA" ] || fail 'a local-path origin names no repository' ",termag.git.commit=$WSHA" "$got"
+for u in file://localhost/srv/git/acme/widgets.git file:///srv/git/acme/widgets.git rsync://host/acme/widgets.git; do
+  git -C "$WORK/wr" remote set-url origin "$u"
+  got="$(cd "$WORK/wr" && run work-resource)"
+  [ "$got" = ",termag.git.commit=$WSHA" ] || fail "a $u origin names no repository" ",termag.git.commit=$WSHA" "$got"
+done
+for u in ssh://git@github.com/acme/widgets git@github.com:acme/widgets.git http://github.example.test/acme/widgets; do
+  git -C "$WORK/wr" remote set-url origin "$u"
+  got="$(cd "$WORK/wr" && run work-resource)"
+  [ "$got" = ",termag.repo=acme/widgets,termag.git.commit=$WSHA" ] || fail "a $u origin names acme/widgets" ",termag.repo=acme/widgets,…" "$got"
+done
+got="$(run work-resource)"
+[ -z "$got" ] || fail 'outside a checkout and with no spawn, work-resource prints nothing' '' "$got"
+got="$(cd "$WORK/wr" && TERMAG_WORK_DIR=- run work-resource)"
+[ -z "$got" ] || fail "TERMAG_WORK_DIR=- names no checkout, not the caller's directory" '' "$got"
+got="$(TERMAG_SPAWN_ID=cmvzxo7xt5v0ekz4bc2obb2ee TERMAG_SPAWN_ROOT=cmvzxjz445ngekz4bhkrf6yv8 TERMAG_SPAWN_DEPTH=2 TERMAG_SPAWN_PARENT_PROJECT=termag TERMAG_SPAWN_PARENT_WORKSTREAM=main TERMAG_SPAWN_PARENT_BOX=cmvtr3c1n0hg2afsfacusxv7j run work-resource)"
+[ "$got" = ',termag.spawn.id=cmvzxo7xt5v0ekz4bc2obb2ee,termag.spawn.root=cmvzxjz445ngekz4bhkrf6yv8,termag.spawn.depth=2,termag.spawn.parent.project=termag,termag.spawn.parent.workstream=main,termag.spawn.parent.box=cmvtr3c1n0hg2afsfacusxv7j' ] \
+  || fail 'work-resource names the spawn, its root, depth and parent' 'termag.spawn.*' "$got"
+got="$(TERMAG_SPAWN_ID=cmvzxo7xt5v0ekz4bc2obb2ee TERMAG_SPAWN_ROOT='x,y=z' TERMAG_SPAWN_DEPTH=0 TERMAG_SPAWN_PARENT_PROJECT='a b' TERMAG_SPAWN_PARENT_WORKSTREAM=main TERMAG_SPAWN_PARENT_BOX=short run work-resource)"
+[ "$got" = ',termag.spawn.id=cmvzxo7xt5v0ekz4bc2obb2ee' ] || fail 'work-resource drops each bad spawn value, keeps the id' ',termag.spawn.id=…' "$got"
+got="$(TERMAG_SPAWN_ID='CMV,x=y' TERMAG_SPAWN_DEPTH=2 run work-resource)"
+[ -z "$got" ] || fail 'no termag.spawn.* without a well-formed spawn id' '' "$got"
+# A delivered `interactive` becomes `external` in the owner's settings: what a
+# session termag did not launch exports with. Every termag launch names its
+# kind. In a home of its own, so the settings the cases below read stay as they are.
+XH="$WORK/xhome"; mkdir -p "$XH/.claude"; echo '{}' > "$XH/.claude/settings.json"
+xrun() { HOME="$XH" XDG_CONFIG_HOME="$XH/.config" PATH="$STUB:$PATH" TERMAG_CLAUDE_MANAGED_SETTINGS="$MANAGED" TERMAG_CREDENTIALS_SUDO='' "$SCRIPT" "$@"; }
+printf '%s' "$TEL" | jq -c '.env.OTEL_RESOURCE_ATTRIBUTES |= sub("service.name="; "termag.session.kind=interactive,service.name=")' | xrun apply telemetry 2>/dev/null
+got="$(jq -r '.env.OTEL_RESOURCE_ATTRIBUTES' "$XH/.claude/settings.json")"
+[ "$got" = "telemetry.project_id=p1,termag.session.kind=external,service.name=termag-claude-session,termag.box=$BOX" ] \
+  || fail "the settings' resource says external, not the delivered interactive" "…termag.session.kind=external…" "$got"
+got="$(TERMAG_SESSION_KIND=interactive xrun telemetry-launch -)"
+want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=interactive,service.name=termag-claude-session,termag.box=$BOX\"}}"
+[ "$got" = "$want" ] || fail "a pane's launch still names interactive over the settings' external" "$want" "$got"
 # A launch that names no kind inside an agent's session (one agent starting
 # another by hand) takes the session's: the environment it runs in says so.
 got="$(export TERMAG_SESSION_KIND=chat; run telemetry-launch -)"
@@ -586,6 +645,13 @@ got="$(stat -c %a "$CJ")"
 ! grep -q "$BOX_TOKEN" "$CJ" || fail 'the box token is never written to ~/.claude.json' 'absent' 'present'
 [ -s "$MVER" ] || fail 'apply mcp writes the version file' 'present' 'absent'
 v1="$(cat "$MVER")"
+# Where a CLI finds the API broker: its URL and the token helper, no token, world-readable.
+ABSTATE="$H/.config/termag/api-broker.json"
+got="$(jq -c . "$ABSTATE" 2>&1)"
+want="$(jq -cn --arg h "$(dirname "$SCRIPT")/termag-mcp-headers" --arg c "$CONFIG" '{url:"https://mcp-broker.example.test",headers_command:[$h,$c]}')"
+[ "$got" = "$want" ] || fail 'apply mcp writes api-broker.json for a CLI' "$want" "$got"
+[ "$(stat -c %a "$ABSTATE")" = 644 ] || fail 'api-broker.json is 0644' 644 "$(stat -c %a "$ABSTATE")"
+! grep -q "$BOX_TOKEN" "$ABSTATE" || fail 'the box token is never written to api-broker.json' 'absent' 'present'
 got="$(HOME="$H" sh "$(dirname "$SCRIPT")/termag-mcp-headers" "$CONFIG")"
 [ "$got" = "{\"Authorization\":\"Bearer $BOX_TOKEN\"}" ] || fail 'termag-mcp-headers prints the box token as a Bearer header' 'Authorization: Bearer …' "$got"
 # A repeat is a no-op: same file, same version.
@@ -615,13 +681,14 @@ got="$(run status | grep '^mcp')"
 case "$got" in 'mcp: NOT WORKING: '*'linear'*) : ;; *) fail 'mcp status notices an entry that changed under it' 'mcp: NOT WORKING: … linear …' "$got" ;; esac
 printf '%s' '{"broker":"https://mcp-broker.example.test","connectors":[{"id":"c3abc","name":"linear"},{"id":"c4abc","name":"notion"}]}' | run apply mcp 2>/dev/null
 v2="$(cat "$MVER")"
-printf '{"reason":"MCP connectors through termag are not enabled for you"}' | run remove mcp 2>/dev/null
+printf '{"reason":"the orchestrator has no MCP broker (MCP_BROKER_URL), so termag adds no MCP servers here"}' | run remove mcp 2>/dev/null
 got="$(jq -c '[(.mcpServers | keys), .numStartups]' "$CJ")"
 [ "$got" = '[["jira","linear","metaterm"],3]' ] || fail "remove mcp takes out only termag's entries" '[["jira","linear","metaterm"],3]' "$got"
 [ ! -e "$MSTATE" ] || fail 'remove mcp deletes its record' 'absent' 'present'
+[ ! -e "$ABSTATE" ] || fail 'remove mcp deletes api-broker.json' 'absent' 'present'
 [ "$(cat "$MVER")" != "$v2" ] || fail 'remove mcp bumps the version' 'a new version' "$v2"
 got="$(run status | grep '^mcp')"
-[ "$got" = 'mcp: off: MCP connectors through termag are not enabled for you' ] || fail "mcp status repeats the orchestrator's reason" 'mcp: off: …' "$got"
+[ "$got" = 'mcp: off: the orchestrator has no MCP broker (MCP_BROKER_URL), so termag adds no MCP servers here' ] || fail "mcp status repeats the orchestrator's reason" 'mcp: off: …' "$got"
 # Bad deliveries are refused and change nothing.
 cp "$CJ" "$WORK/cj.before"
 for bad in '{"broker":"http://x","connectors":[]}' '{"broker":"https://x","connectors":[{"id":"C1","name":"a"}]}' \
@@ -1016,13 +1083,13 @@ out="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>&1)"; code=
 case "$out" in *'skipped on this box'*) : ;; *) fail 'launch-settings says the box skipped Fireworks' 'skipped on this box' "$out" ;; esac
 runfw pi-model --model "$KIMI" </dev/null >/dev/null 2>&1 && fail 'pi-model fails on a skipped box' non-zero 0
 runfw unskip fireworks 2>/dev/null
-printf '{"reason":"Fireworks through termag is not enabled for you (feature flag fireworks-enabled)"}' | runfw remove fireworks 2>/dev/null
+printf '{"reason":"the orchestrator has no Fireworks gateway (FIREWORKS_GATEWAY_URL), so the Fireworks agents have no models here"}' | runfw remove fireworks 2>/dev/null
 got="$(runfw status | grep '^fireworks')"
-[ "$got" = 'fireworks: off: Fireworks through termag is not enabled for you (feature flag fireworks-enabled)' ] \
+[ "$got" = 'fireworks: off: the orchestrator has no Fireworks gateway (FIREWORKS_GATEWAY_URL), so the Fireworks agents have no models here' ] \
   || fail "fireworks status repeats the orchestrator's reason" 'fireworks: off: ...' "$got"
 out="$(runfw launch-settings --backend fireworks --model "$KIMI" - 2>&1)"; code=$?
 [ "$code" != 0 ] || fail 'launch-settings fails where Fireworks was removed' non-zero "$code"
-case "$out" in *'not set up on this box: Fireworks through termag is not enabled for you'*) : ;;
+case "$out" in *'not set up on this box: the orchestrator has no Fireworks gateway'*) : ;;
   *) fail "launch-settings gives the orchestrator's reason" 'not set up ...: <reason>' "$out" ;; esac
 
 # status asks <base>/auth-check with the box token as a Bearer.
@@ -1034,7 +1101,7 @@ node -e '
     fs.appendFileSync(seen, `${q.method} ${q.url} ${q.headers.authorization === `Bearer ${want}` ? "box-token" : "other"}\n`);
     if (q.url !== "/fireworks/auth-check") { r.writeHead(404).end(); return; }
     if (q.headers.authorization === `Bearer ${want}`) { r.writeHead(204).end(); return; }
-    r.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ message: "Fireworks through termag is not enabled for you" }));
+    r.writeHead(403, { "content-type": "application/json" }).end(JSON.stringify({ message: "Only a termag-managed box can use the Fireworks gateway" }));
   }).listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(s.address().port)));
 ' "$FW_PORT_FILE" "$FW_SEEN" "$BOX_TOKEN" & fw_pid=$!
 i=0; while [ ! -s "$FW_PORT_FILE" ] && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
@@ -1049,17 +1116,482 @@ got="$(runfw status | grep '^fireworks')"
 [ "$(cat "$FW_SEEN")" = 'GET /fireworks/auth-check box-token' ] || fail 'fireworks status sends the box token to the auth probe only' 'GET /fireworks/auth-check box-token' "$(cat "$FW_SEEN")"
 printf '{"termag_url":"wss://b","token":"tmag_flag_off"}\n' > "$CONFIG"
 got="$(runfw status | grep '^fireworks')"
-[ "$got" = "fireworks: NOT WORKING: the gateway at $FWGW refused this box (HTTP 403): Fireworks through termag is not enabled for you" ] \
+[ "$got" = "fireworks: NOT WORKING: the gateway at $FWGW refused this box (HTTP 403): Only a termag-managed box can use the Fireworks gateway" ] \
   || fail "fireworks status repeats the gateway's refusal" 'NOT WORKING ... refused (HTTP 403): ...' "$got"
 printf '{"termag_url":"wss://b","token":"%s"}\n' "$BOX_TOKEN" > "$CONFIG"
 kill "$fw_pid"; wait "$fw_pid" 2>/dev/null
 runfw remove fireworks </dev/null 2>/dev/null
 
+# ── The shared Bazel cache (data path C) ───────────────────────────────────
+# The system rc is a file of the test's; "sudo" is a stub that logs each call,
+# and can be made slow, to show two runs taking turns on the lock.
+BRC="$WORK/etc/bazel.bazelrc"; BZS="$H/.config/termag/bazel-cache.json"; BZLOG="$WORK/bz-sudo.log"; : > "$BZLOG"
+cat > "$STUB/bz-sudo" <<STUBEOF
+#!/bin/sh
+echo "start \$\$ \$1" >> "$BZLOG"
+[ ! -s "$WORK/bz-sudo.sleep" ] || sleep "\$(cat "$WORK/bz-sudo.sleep")"
+"\$@"; rc=\$?
+echo "end \$\$ \$1" >> "$BZLOG"
+exit \$rc
+STUBEOF
+chmod 755 "$STUB/bz-sudo"
+# run() pins TERMAG_CREDENTIALS_SUDO to '', so these call the script themselves.
+runbz_with() {  # sudo args...
+  sudo=$1; shift
+  HOME="$H" XDG_CONFIG_HOME="$H/.config" PATH="$STUB:$PATH" TERMAG_CREDENTIALS_SUDO="$sudo" TERMAG_BAZEL_RC="$BRC" \
+    TERMAG_AGENT_CONFIG="$CONFIG" "$SCRIPT" "$@"
+}
+runbz() { runbz_with "$STUB/bz-sudo" "$@"; }
+U1='https://termag-bazel-cache-123456789012-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w45'
+U2='https://termag-bazel-cache-123456789012-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w46-1'
+bz() {  # bz <seq> [jq assignments]: a payload with the code defaults
+  jq -cn --argjson seq "$1" --arg url "$U1" "{seq: \$seq, url: \$url, flushGeneration: 0, remoteTimeoutSeconds: 5, remoteRetries: 1,
+    jobs: 200, downloadOutputs: \"toplevel\", goHostModcache: false} ${2:+| $2}"
+}
+bzblock() {  # url download timeout retries jobs [gomodcache]
+  cat <<EOF
+# >>> termag bazel-cache >>>
+# Read webapp main's build outputs from termag's shared cache (S3, through
+# the VPC endpoint). Boxes only read it; a termag-owned writer fills it.
+# A dead cache costs seconds, not the build.
+# Added by termag-credentials.
+build --remote_cache=$1
+build --noremote_upload_local_results
+build --remote_download_$2
+build --remote_timeout=$3s
+build --remote_retries=$4
+build --remote_retry_max_delay=1s
+build --experimental_circuit_breaker_strategy=failure
+build --jobs=$5
+EOF
+  if [ -n "${6:-}" ]; then
+    cat <<EOF
+# Go modules from one module cache outside every output base (goHostModcache).
+# The keys don't change.
+common --repo_env=GO_REPOSITORY_USE_HOST_MODCACHE=1
+common --repo_env=GOMODCACHE=$6
+EOF
+  fi
+  echo '# <<< termag bazel-cache <<<'
+}
+
+# A box with no system rc: apply creates it with exactly the rendered block.
+rm -f "$BRC"
+bz 100 | runbz apply bazel-cache 2>/dev/null || fail 'apply bazel-cache succeeds' 0 "$?"
+[ "$(cat "$BRC" 2>/dev/null)" = "$(bzblock "$U1" toplevel 5 1 200)" ] \
+  || fail 'apply renders the tech spec block from the payload' "$(bzblock "$U1" toplevel 5 1 200)" "$(cat "$BRC" 2>/dev/null)"
+[ "$(stat -c %a "$BRC")" = 644 ] || fail 'the system rc is 0644' 644 "$(stat -c %a "$BRC")"
+if grep -qE 'remote_downloader|credential_helper' "$BRC"; then fail 'no remote downloader and no credential helper in the block' absent present; fi
+[ ! -e "$BRC.termag-new" ] || fail 'no temporary rc is left behind' absent present
+[ "$(jq -c . "$BZS")" = "{\"url\":\"$U1\",\"flushGeneration\":0,\"remoteTimeoutSeconds\":5,\"remoteRetries\":1,\"jobs\":200,\"downloadOutputs\":\"toplevel\",\"goHostModcache\":false}" ] \
+  || fail 'apply records the values it applied' '{url, flushGeneration: 0, ...}' "$(cat "$BZS" 2>&1)"
+[ "$(cat "$H/.config/termag/bazel-cache.seq")" = 100 ] || fail 'apply records its seq' 100 "$(cat "$H/.config/termag/bazel-cache.seq" 2>&1)"
+
+# Idempotent: the same values again (a later seq) write nothing and say nothing.
+: > "$BZLOG"; cp "$BRC" "$WORK/brc.before"
+out=$(bz 101 | runbz apply bazel-cache 2>&1)
+[ -z "$out" ] && [ ! -s "$BZLOG" ] && cmp -s "$BRC" "$WORK/brc.before" || fail 'a repeated delivery changes nothing' 'silent, no sudo' "$out $(cat "$BZLOG")"
+# Without the tunables, the code defaults.
+jq -cn --arg url "$U1" '{seq: 102, url: $url}' | runbz apply bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.before" || fail 'missing tunables take the code defaults' "$(cat "$WORK/brc.before")" "$(cat "$BRC")"
+
+# Tuned values render as such.
+bz 103 '.url = "'"$U2"'" | .remoteTimeoutSeconds = 60 | .remoteRetries = 0 | .jobs = 8 | .downloadOutputs = "all"' | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = "$(bzblock "$U2" all 60 0 8)" ] || fail 'the tunables at their limits render' "$(bzblock "$U2" all 60 0 8)" "$(cat "$BRC")"
+bz 104 '.remoteTimeoutSeconds = 1 | .remoteRetries = 5 | .jobs = 400' | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 1 5 400)" ] || fail 'the other limits render' "$(bzblock "$U1" toplevel 1 5 400)" "$(cat "$BRC")"
+bz 105 | runbz apply bazel-cache 2>/dev/null
+
+# goHostModcache (PR 14): true adds the module cache's two lines, with the box
+# user's home as an absolute path, and creates the directory; false adds none
+# and leaves the directory; it toggles both ways.
+GMC="$H/.cache/bazel-gomodcache"
+rm -rf "$GMC"
+if grep -qE 'GOMODCACHE|GO_REPOSITORY_USE_HOST_MODCACHE' "$BRC"; then fail 'goHostModcache false renders no module cache lines' absent "$(cat "$BRC")"; fi
+bz 105 '.goHostModcache = true' | runbz apply bazel-cache 2>/dev/null || fail 'apply with goHostModcache succeeds' 0 "$?"
+[ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 5 1 200 "$GMC")" ] || fail 'goHostModcache true renders its two lines' "$(bzblock "$U1" toplevel 5 1 200 "$GMC")" "$(cat "$BRC")"
+case $GMC in /*) grep -qxF "common --repo_env=GOMODCACHE=$GMC" "$BRC" ;; *) false ;; esac || fail 'GOMODCACHE is the absolute path under the home' "$GMC" "$(grep GOMODCACHE "$BRC")"
+[ -d "$GMC" ] && [ -z "$(ls -A "$GMC")" ] || fail 'goHostModcache true creates the module cache directory, and leaves no probe in it' 'empty directory' "$(ls -A "$GMC" 2>&1)"
+[ "$(jq -r .goHostModcache "$BZS")" = true ] || fail 'status records goHostModcache on' true "$(jq -r .goHostModcache "$BZS")"
+: > "$BZLOG"; cp "$BRC" "$WORK/brc.gm"
+out=$(bz 105 '.goHostModcache = true' | runbz apply bazel-cache 2>&1)
+[ -z "$out" ] && [ ! -s "$BZLOG" ] && cmp -s "$BRC" "$WORK/brc.gm" || fail 'goHostModcache again changes nothing' 'silent, no sudo' "$out $(cat "$BZLOG")"
+echo m > "$GMC/kept"
+bz 105 | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 5 1 200)" ] || fail 'goHostModcache off takes its lines out' "$(bzblock "$U1" toplevel 5 1 200)" "$(cat "$BRC")"
+[ -e "$GMC/kept" ] || fail 'goHostModcache off leaves the module cache in place' kept deleted
+[ "$(jq -r .goHostModcache "$BZS")" = false ] || fail 'status records goHostModcache off' false "$(jq -r .goHostModcache "$BZS")"
+bz 105 '.goHostModcache = true' | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 5 1 200 "$GMC")" ] && [ -e "$GMC/kept" ] || fail 'goHostModcache on again renders the lines and reuses the directory' 'lines, kept' "$(cat "$BRC")"
+# A directory that can't be made, or a home the rc can't hold: the block goes
+# in without the lines, says why, and status says off.
+rm -rf "$GMC"; : > "$GMC"
+out=$(bz 105 '.goHostModcache = true' | runbz apply bazel-cache 2>&1) || fail 'apply succeeds when the module cache cannot be made' 0 "$?"
+[ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 5 1 200)" ] && case $out in *"could not be created"*) true ;; *) false ;; esac && [ "$(jq -r .goHostModcache "$BZS")" = false ] \
+  || fail 'an unusable module cache directory renders no lines, and says so' 'no lines, a message, false' "$out $(cat "$BRC")"
+rm -f "$GMC"
+# An existing directory the box user can't write: mkdir -p succeeds, the probe
+# doesn't. Root writes through 0555, so the case only means something as a
+# normal user, which is what a box user is.
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$GMC"; chmod 555 "$GMC"
+  out=$(bz 105 '.goHostModcache = true' | runbz apply bazel-cache 2>&1) || fail 'apply succeeds when the module cache is not writable' 0 "$?"
+  [ "$(cat "$BRC")" = "$(bzblock "$U1" toplevel 5 1 200)" ] && case $out in *"isn't writable"*) true ;; *) false ;; esac && [ "$(jq -r .goHostModcache "$BZS")" = false ] \
+    && [ -z "$(ls -A "$GMC")" ] || fail 'an unwritable module cache directory renders no lines, says so, and leaves no probe' 'no lines, a message, false, empty' "$out $(cat "$BRC")"
+  chmod 755 "$GMC"; rm -rf "$GMC"
+fi
+SPH="$WORK/home with space"; mkdir -p "$SPH/.config/termag"; cp -a "$H/.config/termag/." "$SPH/.config/termag/"
+out=$(bz 105 '.goHostModcache = true' | HOME="$SPH" XDG_CONFIG_HOME="$SPH/.config" PATH="$STUB:$PATH" TERMAG_CREDENTIALS_SUDO="$STUB/bz-sudo" \
+  TERMAG_BAZEL_RC="$BRC" TERMAG_AGENT_CONFIG="$CONFIG" "$SCRIPT" apply bazel-cache 2>&1)
+! grep -q GOMODCACHE "$BRC" && [ ! -e "$SPH/.cache/bazel-gomodcache" ] && case $out in *"can't go into the rc"*) true ;; *) false ;; esac \
+  || fail 'a home path the rc cannot hold renders no lines' 'no lines, no directory, a message' "$out $(cat "$BRC")"
+rm -rf "$SPH"
+bz 105 | runbz apply bazel-cache 2>/dev/null
+
+# Every invalid field or URL refuses the whole payload and leaves the block as it was.
+cp "$BRC" "$WORK/brc.good"; cp "$BZS" "$WORK/bzs.good"
+for bad in '.seq = -1' '.seq = 1.5' '.seq = "106"' 'del(.seq)' 'del(.url)' '.url = null' \
+           '.url = "http://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w45"' \
+           '.url = "https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w54"' \
+           '.url = "https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w00"' \
+           '.url = "https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w45-0"' \
+           '.url = "https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w45/"' \
+           '.url = "https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/2026w45"' \
+           '.url = "https://Termag-bazel-cache.s3.us-east-2.amazonaws.com/g/2026w45"' \
+           '.url = "https://my.bucket.s3.us-east-2.amazonaws.com/g/2026w45"' \
+           '.url = "https://evil.example/x.s3.us-east-2.amazonaws.com/g/2026w45"' \
+           '.url = "https://termag-bazel-cache-1.s3.us-east-2.amazonaws.com.evil.example/g/2026w45"' \
+           '.url = "https://termag-bazel-cache-1.s3.us-east-2.amazonaws.com/g/2026w45\nbuild --foo"' \
+           '.flushGeneration = -1' '.flushGeneration = 2147483648' '.flushGeneration = "1"' \
+           '.remoteTimeoutSeconds = 0' '.remoteTimeoutSeconds = 61' '.remoteTimeoutSeconds = 5.5' \
+           '.remoteRetries = -1' '.remoteRetries = 6' '.jobs = 7' '.jobs = 401' '.jobs = "200"' \
+           '.downloadOutputs = "minimal"' '.downloadOutputs = "toplevel\nbuild --x"' '.goHostModcache = "true"' '.goHostModcache = 1'; do
+  bz 106 "$bad" | runbz apply bazel-cache 2>/dev/null && fail "apply refuses $bad" non-zero 0
+done
+for bad in 'not json' '[]' '"x"' ''; do
+  printf '%s' "$bad" | runbz apply bazel-cache 2>/dev/null && fail "apply refuses the payload '$bad'" non-zero 0
+done
+cmp -s "$BRC" "$WORK/brc.good" && cmp -s "$BZS" "$WORK/bzs.good" && [ "$(cat "$H/.config/termag/bazel-cache.seq")" = 105 ] \
+  || fail 'a refused payload leaves the block, the state and the seq alone' same changed
+got=$(bz 106 '.jobs = 401' | runbz apply bazel-cache 2>&1)
+case $got in *'refused'*jobs*) ;; *) fail 'a refusal names the field' 'refused: bad jobs' "$got" ;; esac
+
+# seq: a step older than the last one applied is refused, an apply or a remove.
+bz 90 '.jobs = 8' | runbz apply bazel-cache 2>"$WORK/err"; code=$?
+[ "$code" = 0 ] && cmp -s "$BRC" "$WORK/brc.good" && grep -q 'refused a step older' "$WORK/err" \
+  || fail 'an older apply is refused (exit 0, nothing changed, said so)' 'unchanged' "$code $(cat "$WORK/err") $(cat "$BRC")"
+printf '{"reason":"a stale off","seq":90}' | runbz remove bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.good" || fail 'an older remove is refused: the later apply stands' 'block kept' "$(cat "$BRC")"
+# Bugbot on #1202: a refused remove must not leave its reason for status.
+[ ! -e "$H/.config/termag/bazel-cache.status" ] || fail "a refused remove records no reason" absent "$(cat "$H/.config/termag/bazel-cache.status")"
+bz 105 | runbz apply bazel-cache 2>/dev/null || fail 'the same seq again is applied (a redelivery)' 0 "$?"
+
+# remove: exactly the block; an rc apply created goes again; the seq is recorded.
+printf '{"reason":"the flag is off for you","seq":110}' | runbz remove bazel-cache 2>/dev/null
+[ ! -e "$BRC" ] || fail 'remove restores a box with no system rc to none' absent "$(cat "$BRC")"
+[ ! -e "$BZS" ] || fail 'remove deletes the state' absent present
+[ "$(cat "$H/.config/termag/bazel-cache.seq")" = 110 ] || fail 'remove records its seq' 110 "$(cat "$H/.config/termag/bazel-cache.seq")"
+[ "$(cat "$H/.config/termag/bazel-cache.status")" = 'the flag is off for you' ] || fail "status keeps the remove's reason" 'the flag is off for you' "$(cat "$H/.config/termag/bazel-cache.status" 2>&1)"
+bz 108 | runbz apply bazel-cache 2>/dev/null
+[ ! -e "$BRC" ] || fail 'an apply older than the remove is refused' absent present
+runbz remove bazel-cache </dev/null 2>/dev/null || fail 'a remove with no payload still removes (an older backend)' 0 "$?"
+printf '{"seq":112}' | runbz remove bazel-cache 2>/dev/null
+[ ! -e "$H/.config/termag/bazel-cache.status" ] || fail "a remove without a reason clears the last one" absent "$(cat "$H/.config/termag/bazel-cache.status")"
+printf '{"reason":"x","seq":"bad","flushGeneration":-3}' | runbz remove bazel-cache 2>/dev/null || fail 'a remove with bad fields still removes' 0 "$?"
+
+# An rc with text of its own keeps it, byte for byte, through apply, a new URL and remove.
+printf 'startup --output_user_root=/var/cache/bazel\n\nbuild --announce_rc\n' > "$BRC"; cp "$BRC" "$WORK/brc.own"
+bz 120 | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = "$(cat "$WORK/brc.own"; bzblock "$U1" toplevel 5 1 200)" ] || fail "apply appends the block after the rc's own text" 'own text + block' "$(cat "$BRC")"
+bz 121 '.url = "'"$U2"'"' | runbz apply bazel-cache 2>/dev/null
+[ "$(grep -c 'termag bazel-cache >>>' "$BRC")" = 1 ] && grep -qxF "build --remote_cache=$U2" "$BRC" || fail 'a new generation replaces the block' 'one block, new url' "$(cat "$BRC")"
+printf '{"seq":122}' | runbz remove bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" || fail 'remove leaves exactly the text that was there' "$(cat "$WORK/brc.own")" "$(cat "$BRC")"
+# Devin on #1202: an rc whose last line has no newline keeps the marker on a line of its own.
+printf 'startup --output_user_root=/var/cache/bazel' > "$BRC"
+bz 122 | runbz apply bazel-cache 2>/dev/null
+[ "$(head -2 "$BRC")" = "$(printf 'startup --output_user_root=/var/cache/bazel\n# >>> termag bazel-cache >>>')" ] \
+  || fail 'an rc without a final newline: the block starts on its own line' 'own line, then the marker' "$(head -2 "$BRC")"
+printf '{"seq":122}' | runbz remove bazel-cache 2>/dev/null
+[ "$(cat "$BRC")" = 'startup --output_user_root=/var/cache/bazel' ] && ! grep -q 'termag bazel-cache' "$BRC" \
+  || fail 'and remove takes the block out again' 'the one startup line' "$(cat "$BRC")"
+cp "$WORK/brc.own" "$BRC"
+# A sudo that fails: apply fails and leaves the rc as it was.
+cat > "$STUB/bz-sudo-fail" <<'STUBEOF'
+#!/bin/sh
+exit 1
+STUBEOF
+chmod 755 "$STUB/bz-sudo-fail"
+bz 123 | runbz_with "$STUB/bz-sudo-fail" apply bazel-cache 2>/dev/null && fail 'apply fails when sudo does' non-zero 0
+cmp -s "$BRC" "$WORK/brc.own" && [ ! -e "$BZS" ] || fail 'a failed write leaves the rc and records nothing' same changed
+
+# The lock: two runs take turns, never writing the rc at once.
+: > "$BZLOG"; echo 1 > "$WORK/bz-sudo.sleep"
+bz 130 | runbz apply bazel-cache 2>/dev/null & a=$!
+sleep 0.3
+bz 131 '.url = "'"$U2"'"' | runbz apply bazel-cache 2>/dev/null & b=$!
+wait "$a"; wait "$b"; : > "$WORK/bz-sudo.sleep"
+awk '$1 == "start" { n++; if (n > max) max = n } $1 == "end" { n-- } END { exit !(max == 1) }' "$BZLOG" \
+  || fail 'two concurrent runs serialize on the lock' 'one sudo at a time' "$(cat "$BZLOG")"
+grep -qxF "build --remote_cache=$U2" "$BRC" && [ "$(cat "$H/.config/termag/bazel-cache.seq")" = 131 ] || fail 'the later step wins' "$U2, seq 131" "$(grep remote_cache "$BRC")"
+
+# The flush: a higher flushGeneration, and only a higher one, on an apply or on a
+# remove with no URL, deletes the disk cache and every output base, after
+# stopping each base's server.
+OUR="$H/.cache/bazel/_bazel_$(id -un)"; OB="$OUR/0123456789abcdef0123456789abcdef"
+mkbazel() {
+  mkdir -p "$H/.cache/bazel-disk/ac" "$OB/execroot/_main/bazel-out" "$OB/server" "$OUR/install/abc" "$OUR/cache/repos" "$H/.cache/bazel-repo-contents"
+  echo x > "$H/.cache/bazel-disk/ac/k"; echo x > "$OB/execroot/_main/bazel-out/o"; chmod 555 "$OB/execroot/_main/bazel-out"
+}
+flushed() { [ ! -e "$H/.cache/bazel-disk" ] && [ ! -e "$OB" ]; }
+kept() { [ -e "$H/.cache/bazel-disk/ac/k" ] && [ -e "$OB/execroot/_main/bazel-out/o" ]; }
+mkbazel
+cat "$H/.config/termag/bazel-cache.flush-generation" >/dev/null 2>&1 || fail 'the first step recorded its generation' 0 none
+bz 140 | runbz apply bazel-cache 2>/dev/null
+kept || fail 'an equal generation flushes nothing' kept deleted
+bash -c 'exec -a "bazel(_main) --output_base=$1 --workspace_directory=/w" sleep 300' _ "$OB" & srv=$!
+bash -c 'exec -a unrelated sleep 300' & other=$!
+sleep 0.2; echo "$srv" > "$OB/server/server.pid.txt"
+bz 141 '.flushGeneration = 2' | runbz apply bazel-cache 2>/dev/null || fail 'a flushing apply succeeds' 0 "$?"
+flushed || fail 'a higher generation on an apply deletes the disk cache and the output bases' deleted kept
+[ -d "$OUR/install/abc" ] && [ -d "$OUR/cache/repos" ] && [ -d "$H/.cache/bazel-repo-contents" ] || fail 'the install base and the repository caches stay' kept deleted
+sleep 0.3
+if kill -0 "$srv" 2>/dev/null; then fail "the output base's server is stopped" stopped running; fi
+wait "$srv" 2>/dev/null
+kill -0 "$other" 2>/dev/null || fail 'a process that is not the base server is left alone' running stopped
+kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
+[ "$(cat "$H/.config/termag/bazel-cache.flush-generation")" = 2 ] && grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'the generation is recorded, and the block written after the flush' '2, block' "$(cat "$H/.config/termag/bazel-cache.flush-generation")"
+mkbazel
+bz 142 '.flushGeneration = 2' | runbz apply bazel-cache 2>/dev/null
+bz 143 '.flushGeneration = 1' | runbz apply bazel-cache 2>/dev/null
+kept || fail 'the same or a lower generation flushes nothing' kept deleted
+[ "$(cat "$H/.config/termag/bazel-cache.flush-generation")" = 2 ] || fail 'a lower generation never lowers the recorded one' 2 "$(cat "$H/.config/termag/bazel-cache.flush-generation")"
+# A remove: off now, and a flush raised while off reaches the box, which applied
+# the block before.
+BZUSED="$H/.config/termag/bazel-cache.used"; BZFLUSH="$H/.config/termag/bazel-cache.flush-generation"
+[ -e "$BZUSED" ] || fail 'an apply marks the box as having used the cache' present absent
+printf '{"reason":"off","seq":150,"flushGeneration":2}' | runbz remove bazel-cache 2>/dev/null
+kept || fail 'a remove at the same generation flushes nothing' kept deleted
+printf '{"reason":"off","seq":151,"flushGeneration":3}' | runbz remove bazel-cache 2>/dev/null
+flushed || fail 'a remove with a higher generation flushes a box that used the cache' deleted kept
+[ "$(cat "$BZFLUSH")" = 3 ] || fail 'the remove records the generation' 3 "$(cat "$BZFLUSH")"
+[ ! -e "$BZUSED" ] || fail "after a remove's flush nothing from the cache is left, so the box no longer counts as used" absent present
+mkbazel
+printf '{"reason":"off","seq":152,"flushGeneration":4}' | runbz remove bazel-cache 2>/dev/null
+kept || fail 'a box flushed since its block went off is not flushed again' kept deleted
+mkbazel
+printf '{"reason":"off","seq":140,"flushGeneration":9}' | runbz remove bazel-cache 2>/dev/null
+kept || fail 'a stale remove flushes nothing either' kept deleted
+# Review on #1202: a box that never applied the block (every flag-off box gets a
+# remove at each connect) keeps its servers, output bases and baked disk cache
+# when someone raises flushGeneration, and its removes leave no record.
+rm -f "$BZFLUSH" "$BZUSED"; mkbazel
+printf '{"reason":"off","seq":153,"flushGeneration":0}' | runbz remove bazel-cache 2>/dev/null
+[ ! -e "$BZFLUSH" ] || fail "a remove on a box that never used the cache records no generation" absent "$(cat "$BZFLUSH")"
+printf '{"reason":"off","seq":154,"flushGeneration":6}' | runbz remove bazel-cache 2>/dev/null
+kept || fail 'a raised generation flushes nothing on a box that never used the cache' kept deleted
+[ ! -e "$BZFLUSH" ] && [ ! -e "$BZUSED" ] || fail 'and leaves no record or mark' 'none' "$(cd "$H/.config/termag" && echo bazel-cache*)"
+# Devin on #1202: an --output_user_root named in the system rc (outside the
+# block) or ~/.bazelrc is flushed too; bases directly under it.
+ALT="$WORK/alt-root"; ALT2="$H/alt2"; mkdir -p "$ALT/fedcba9876543210fedcba9876543210/execroot" "$ALT/install" "$ALT2/00112233445566778899aabbccddeeff"
+cp "$BRC" "$WORK/brc.keep"; printf 'startup --output_user_root=%s\n' "$ALT" >> "$BRC"
+printf 'startup --output_user_root=~/alt2\n' >> "$H/.bazelrc"
+mkbazel
+bz 155 '.flushGeneration = 6' | runbz apply bazel-cache 2>/dev/null
+kept || fail "an apply on a box that hadn't used the cache only starts the record" kept deleted
+printf '{"reason":"off","seq":156,"flushGeneration":7}' | runbz remove bazel-cache 2>/dev/null
+[ ! -e "$ALT/fedcba9876543210fedcba9876543210" ] && [ ! -e "$ALT2/00112233445566778899aabbccddeeff" ] && [ -d "$ALT/install" ] && flushed \
+  || fail 'the flush covers the output roots the rcs name' 'every base gone, install kept' "$(ls "$ALT" "$ALT2" 2>&1)"
+cp "$WORK/brc.keep" "$BRC"; rm -f "$H/.bazelrc"; rm -rf "$ALT" "$ALT2"
+# A first step ever, whatever its generation, has nothing to flush.
+rm -f "$H/.config/termag/bazel-cache.flush-generation"; mkbazel
+bz 160 '.flushGeneration = 7' | runbz apply bazel-cache 2>/dev/null
+kept || fail 'a first step flushes nothing' kept deleted
+printf '{"seq":161}' | runbz remove bazel-cache 2>/dev/null
+chmod -R u+w "$OB"; rm -rf "$H/.cache"
+
+# status: off with the reason, a .netrc that would send credentials, and S3's answer through a curl stub.
+printf '{"reason":"off","seq":162}' | runbz remove bazel-cache 2>/dev/null
+got=$(runbz status | grep '^bazel-cache')
+[ "$got" = 'bazel-cache: off: off' ] || fail "status says off, with the remove's reason" 'bazel-cache: off: off' "$got"
+bz 170 | runbz apply bazel-cache 2>/dev/null
+cat > "$STUB/curl" <<STUBEOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$WORK/bzcurl.argv"
+printf '%s' "\$(cat "$WORK/bzcurl.mode")"
+STUBEOF
+chmod 755 "$STUB/curl"
+for m in '404 on, Bazel reads the shared cache at '"$U1" '200 on, Bazel reads the shared cache at '"$U1" \
+         '403 NOT WORKING: S3 refuses this box' '000 NOT WORKING: the cache at '"$U1"' is unreachable' '503 NOT WORKING: the cache at '"$U1"' answered HTTP 503'; do
+  echo "${m%% *}" > "$WORK/bzcurl.mode"
+  got=$(runbz status | grep '^bazel-cache')
+  case $got in "bazel-cache: ${m#* }"*) ;; *) fail "status for HTTP ${m%% *}" "bazel-cache: ${m#* }..." "$got" ;; esac
+done
+# S3's 404 for a bucket that isn't there is no working miss.
+cat > "$STUB/curl" <<STUBEOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$WORK/bzcurl.argv"
+out=; while [ \$# -gt 0 ]; do [ "\$1" = -o ] && out=\$2; shift; done
+[ -z "\$out" ] || printf '<?xml version="1.0"?><Error><Code>NoSuchBucket</Code></Error>' > "\$out"
+printf 404
+STUBEOF
+got=$(runbz status | grep '^bazel-cache')
+case $got in "bazel-cache: NOT WORKING: the bucket in $U1 does not exist"*) ;; *) fail 'status tells a missing bucket from a miss' 'NOT WORKING: the bucket ... does not exist' "$got" ;; esac
+cat > "$STUB/curl" <<STUBEOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$WORK/bzcurl.argv"
+printf '%s' "\$(cat "$WORK/bzcurl.mode")"
+STUBEOF
+grep -qF "$U1/ac/$(printf '%064d' 0)" "$WORK/bzcurl.argv" || fail 'the probe asks for an unknown action key' '/ac/000…' "$(cat "$WORK/bzcurl.argv")"
+if grep -q -- '-K\|--netrc\|-u ' "$WORK/bzcurl.argv"; then fail 'the probe sends no credential' 'anonymous' "$(cat "$WORK/bzcurl.argv")"; fi
+echo 404 > "$WORK/bzcurl.mode"
+B1=termag-bazel-cache-123456789012-us-east-2-an.s3.us-east-2.amazonaws.com
+for netrc in "machine $B1 login a password b" "machine other.example login a password b
+default login x password y" "machine
+$B1
+login a"; do
+  printf '%s\n' "$netrc" > "$H/.netrc"
+  got=$(runbz status | grep '^bazel-cache')
+  case $got in "bazel-cache: NOT WORKING: $H/.netrc has an entry for $B1"*) ;; *) fail "status reports a .netrc that would send credentials ($netrc)" 'NOT WORKING: .netrc' "$got" ;; esac
+done
+printf 'machine other.example login a password b\n' > "$H/.netrc"
+case $(runbz status | grep '^bazel-cache') in 'bazel-cache: on,'*) ;; *) fail 'a .netrc for other hosts is fine' on "$(runbz status | grep '^bazel-cache')" ;; esac
+printf 'machine %s login a password b\n' "$B1" > "$WORK/other-netrc"
+case $(NETRC="$WORK/other-netrc" runbz status | grep '^bazel-cache') in *"NOT WORKING: $WORK/other-netrc"*) ;; *) fail '$NETRC is the file Bazel reads' "$WORK/other-netrc" other ;; esac
+rm -f "$H/.netrc" "$STUB/curl"
+cp "$BRC" "$BRC.x"
+printf 'other\n' > "$BRC"
+got=$(runbz status | grep '^bazel-cache')
+[ "$got" = "bazel-cache: NOT WORKING: delivered, but $BRC has no termag block" ] || fail 'status says when the block is gone' 'NOT WORKING: no termag block' "$got"
+mv "$BRC.x" "$BRC"
+
+# skip: a delivery doesn't bring the block back, but a flush still happens; unskip undoes it.
+runbz skip bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" || fail 'skip removes the block' "$(cat "$WORK/brc.own")" "$(cat "$BRC")"
+mkbazel
+bz 180 '.flushGeneration = 8' | runbz apply bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" && [ ! -e "$BZS" ] || fail 'a skipped box keeps the block out' 'no block' "$(cat "$BRC" 2>&1)"
+flushed || fail 'a skipped box still flushes on a higher generation' deleted kept
+[ "$(runbz status | grep '^bazel-cache')" = 'bazel-cache: skipped on this box' ] || fail 'status says skipped' skipped "$(runbz status | grep '^bazel-cache')"
+runbz unskip bazel-cache 2>/dev/null
+bz 181 '.flushGeneration = 8' | runbz apply bazel-cache 2>/dev/null
+grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'unskip lets the next delivery write the block' present absent
+printf '{"seq":182}' | runbz remove bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" || fail 'the last remove restores the rc' same changed
+
+# Review on #1202: a flush that fails never keeps the block. One output base
+# that can't be deleted (an rm stub refuses it) doesn't stop the disk cache or
+# the other bases going; the remove still takes the block out; status says the
+# flush failed; the record stays, so the next step tries again; and a failed
+# flush on an apply takes the block out too.
+OB2="$OUR/fedcba9876543210fedcba9876543210"
+bz 190 '.flushGeneration = 8' | runbz apply bazel-cache 2>/dev/null
+mkbazel; mkdir -p "$OB2/execroot"; echo x > "$OB2/execroot/o"
+cat > "$STUB/rm" <<STUBEOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "$OB" ] && { echo "rm: cannot remove '\$a': Device or resource busy" >&2; exit 1; }; done
+exec /bin/rm "\$@"
+STUBEOF
+chmod 755 "$STUB/rm"
+printf '{"reason":"off","seq":191,"flushGeneration":9}' | runbz remove bazel-cache 2>/dev/null && fail 'a remove whose flush fails says so' non-zero 0
+! grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'a remove takes the block out even when its flush fails' 'no block' "$(cat "$BRC")"
+[ ! -e "$H/.cache/bazel-disk" ] && [ ! -e "$OB2" ] && [ -e "$OB" ] || fail 'the flush deletes the disk cache and every base it can, past one it cannot' 'disk cache and OB2 gone, OB left' "$(ls "$OUR" "$H/.cache" 2>&1)"
+[ "$(cat "$BZFLUSH")" = 8 ] || fail 'a failed flush leaves the record, so the next step tries again' 8 "$(cat "$BZFLUSH")"
+got=$(runbz status | grep '^bazel-cache')
+case $got in "bazel-cache: NOT WORKING: the last flush failed (generation 9: $OB"*) ;; *) fail 'status says the flush failed, and what is left' 'NOT WORKING: the last flush failed (generation 9: ...)' "$got" ;; esac
+# Bugbot on #1202: the failed remove's seq is recorded all the same, so an older
+# apply still in flight can't put the block back after the kill switch.
+out=$(bz 190 '.flushGeneration = 8' | runbz apply bazel-cache 2>&1)
+! grep -qF 'termag bazel-cache >>>' "$BRC" || fail "an older apply can't land after a remove whose flush failed" 'no block' "$(cat "$BRC")"
+case $out in *'refused a step older than the last one applied (seq 190 < 191)'*) ;; *) fail 'it is refused as older' 'refused ... (seq 190 < 191)' "$out" ;; esac
+rm -f "$STUB/rm"
+printf '{"reason":"off","seq":192,"flushGeneration":9}' | runbz remove bazel-cache 2>/dev/null || fail 'the next remove retries the flush' 0 "$?"
+[ ! -e "$OB" ] && [ "$(cat "$BZFLUSH")" = 9 ] && [ ! -e "$H/.config/termag/bazel-cache.flush-failed" ] || fail 'a flush that succeeds on retry clears the failure' 'OB gone, record 9' "$(cat "$BZFLUSH")"
+[ "$(runbz status | grep '^bazel-cache')" = 'bazel-cache: off: off' ] || fail 'status is back to off' 'bazel-cache: off: off' "$(runbz status | grep '^bazel-cache')"
+bz 193 '.flushGeneration = 9' | runbz apply bazel-cache 2>/dev/null
+mkbazel
+cat > "$STUB/rm" <<STUBEOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "$OB" ] && exit 1; done
+exec /bin/rm "\$@"
+STUBEOF
+chmod 755 "$STUB/rm"
+bz 194 '.flushGeneration = 10' | runbz apply bazel-cache 2>/dev/null && fail 'an apply whose flush fails says so' non-zero 0
+! grep -qF 'termag bazel-cache >>>' "$BRC" && [ ! -e "$BZS" ] || fail 'a failed flush on an apply takes the block out' 'no block' "$(cat "$BRC")"
+case $(runbz status | grep '^bazel-cache') in 'bazel-cache: NOT WORKING: the last flush failed'*) ;; *) fail 'status says so after an apply too' 'NOT WORKING: the last flush failed' "$(runbz status | grep '^bazel-cache')" ;; esac
+rm -f "$STUB/rm"
+bz 195 '.flushGeneration = 10' | runbz apply bazel-cache 2>/dev/null || fail 'the next apply retries the flush, and succeeds' 0 "$?"
+grep -qF 'termag bazel-cache >>>' "$BRC" && [ ! -e "$OB" ] || fail 'then the block is back' 'block, OB gone' "$(cat "$BRC")"
+printf '{"seq":196}' | runbz remove bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" || fail 'the last remove restores the rc' same changed
+# Devin on #1202: a box whose block is in place but has no mark (an older
+# install) is still flushed by a raised remove, which takes the block out first.
+bz 197 '.flushGeneration = 10' | runbz apply bazel-cache 2>/dev/null
+mkbazel; rm -f "$BZUSED"
+printf '{"reason":"off","seq":198,"flushGeneration":11}' | runbz remove bazel-cache 2>/dev/null || fail 'that remove succeeds' 0 "$?"
+flushed && ! grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'a block with no mark still counts as used: the remove flushes' 'flushed, block out' "$(cd "$OUR" && echo ./*)"
+[ "$(cat "$BZFLUSH")" = 11 ] || fail 'and records the generation' 11 "$(cat "$BZFLUSH")"
+# Devin on #1202: the record is a high-water mark. A re-enable with a lower
+# generation (a variation reset) doesn't lower it, so restoring the higher one
+# flushes nothing.
+bz 199 '.flushGeneration = 10' | runbz apply bazel-cache 2>/dev/null
+[ "$(cat "$BZFLUSH")" = 11 ] || fail "an apply never lowers the record" 11 "$(cat "$BZFLUSH")"
+mkbazel
+bz 200 '.flushGeneration = 11' | runbz apply bazel-cache 2>/dev/null
+kept || fail 'restoring the recorded generation flushes nothing' kept deleted
+printf '{"seq":201}' | runbz remove bazel-cache 2>/dev/null
+cmp -s "$BRC" "$WORK/brc.own" || fail 'the last remove restores the rc' same changed
+# Bugbot on #1202: a flush doesn't hold the step lock, so a remove (the kill
+# switch) never waits behind one, even with a short lock wait. The apply that
+# was flushing then finds a newer step and leaves the block out.
+mkbazel
+cat > "$STUB/rm" <<STUBEOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "$OB" ] && sleep 6; done
+exec /bin/rm "\$@"
+STUBEOF
+chmod 755 "$STUB/rm"
+bz 202 '.flushGeneration = 12' | runbz apply bazel-cache >/dev/null 2>&1 & slow=$!
+sleep 1.5
+export TERMAG_BAZEL_CACHE_LOCK_WAIT=2
+t0=$(date +%s)
+printf '{"reason":"off","seq":203}' | runbz remove bazel-cache 2>/dev/null || fail 'a remove during a flush succeeds' 0 "$?"
+t1=$(date +%s)
+unset TERMAG_BAZEL_CACHE_LOCK_WAIT
+[ $((t1 - t0)) -lt 5 ] || fail "a remove doesn't wait behind a flush" '< 5 s' "$((t1 - t0)) s"
+! grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'and takes the block out' 'no block' "$(cat "$BRC")"
+wait "$slow"
+! grep -qF 'termag bazel-cache >>>' "$BRC" && [ "$(cat "$H/.config/termag/bazel-cache.seq")" = 203 ] \
+  || fail 'the apply that was flushing finds a newer step and leaves the block out' 'no block, seq 203' "$(cat "$H/.config/termag/bazel-cache.seq")"
+[ "$(cat "$BZFLUSH")" = 12 ] && [ ! -e "$OB" ] || fail 'its flush still completes and is recorded' 12 "$(cat "$BZFLUSH")"
+# Devin on #1202: the same for a remove with no seq (the orchestrator's refusal
+# to an unmanaged box). It doesn't move the seq, so the step counter is what
+# tells the flushing apply that a step ran meanwhile.
+rm -f "$STUB/rm"
+bz 204 '.flushGeneration = 12' | runbz apply bazel-cache 2>/dev/null
+mkbazel
+cat > "$STUB/rm" <<STUBEOF
+#!/bin/sh
+for a in "\$@"; do [ "\$a" = "$OB" ] && sleep 6; done
+exec /bin/rm "\$@"
+STUBEOF
+chmod 755 "$STUB/rm"
+bz 205 '.flushGeneration = 13' | runbz apply bazel-cache >/dev/null 2>&1 & slow=$!
+sleep 1.5
+printf '{"reason":"not managed"}' | runbz remove bazel-cache 2>/dev/null || fail 'an unsequenced remove during a flush succeeds' 0 "$?"
+! grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'and takes the block out' 'no block' "$(cat "$BRC")"
+wait "$slow"
+! grep -qF 'termag bazel-cache >>>' "$BRC" || fail 'the flushing apply leaves the block out after an unsequenced remove' 'no block' "$(cat "$BRC")"
+[ "$(cat "$BZFLUSH")" = 13 ] || fail 'and its flush is still recorded' 13 "$(cat "$BZFLUSH")"
+rm -f "$STUB/rm"
+cmp -s "$BRC" "$WORK/brc.own" || fail 'the rc is as it was' same changed
+chmod -R u+w "$OUR" 2>/dev/null; rm -rf "$H/.cache"
+
 run apply codex </dev/null >/dev/null 2>&1; got=$?
 [ "$got" = 2 ] || fail 'unknown providers exit 2' 2 "$got"
 
 if [ "$failures" -eq 0 ]; then
-  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + mcp apply/remove/plugin dirs + mcp for the other agents + fireworks apply/skip/remove/status/launch-settings/pi-model + legacy cleanup'
+  echo 'PASS: termag-credentials claude-gateway apply/skip/remove + github broker apply/remove + telemetry apply/remove/launch + agent-telemetry apply/remove/cursor hooks + mcp apply/remove/plugin dirs + mcp for the other agents + fireworks apply/skip/remove/status/launch-settings/pi-model + bazel-cache apply/remove/seq/lock/flush/skip/status/netrc + legacy cleanup'
   exit 0
 fi
 echo "$failures failure(s)"

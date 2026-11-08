@@ -84,6 +84,15 @@
 #     cap starts none either (claude-update-incomplete); --claude-floor
 #     <x.y.z> (the orchestrator's) wins over the floor file either way, and a
 #     malformed one is ignored for the file's
+#   * a Claude Code update already holding ~/.termag/claude-update.lock (claude
+#     gone from PATH while it does) is waited for before claude is resolved,
+#     then the runner starts; a lock held past TERMAG_CLAUDE_UPDATE_WAIT is
+#     given up on and the runner still starts; the time waited comes off the
+#     floor guard's budget; a lock file nobody holds is not waited for; an
+#     update that starts while the checkout is seeded is waited for at launch
+#     and claude found again; a claude it changed is checked again (newer:
+#     starts; below the floor or rejected: exit 2, no runner); the runner
+#     never inherits the lock's fd
 #
 # Run: sh deploy/termag-claude-runner.test.sh
 set -u
@@ -987,6 +996,8 @@ if [ "$1" = self-hosted-runner ] && [ "$2" = --help ]; then
   [ -n "${HELP_NEEDS:-}" ] && ! grep -q "$HELP_NEEDS" "$CLAUDE_VER_FILE" && exit 1
   exit 0
 fi
+# Which files the runner has open: the updater's lock must not be one.
+ls -l /proc/$$/fd/ > "$RECORD.fds" 2>/dev/null
 printf '%s\n' "$@" > "$RECORD.argv"
 exit 0
 STUB
@@ -1123,6 +1134,103 @@ done
 floor_run_arg ord-fla-nofile 2.1.312 2.1.320 TERMAG_CLAUDE_FLOOR_FILE="$WORK/no-such-floor" UPD_TO=2.1.320; got=$?
 [ "$(cat "$WORK/record.updater" 2>/dev/null)" = '--ensure 2.1.320' ] || fail "claude-floor: without a floor file the orchestrator's floor applies" '--ensure 2.1.320' "$(cat "$WORK/record.updater" 2>/dev/null)"
 grep -q 'termag-claude-runner-flags: anthropic-git github claude-floor$' "$SCRIPT" || fail 'the flags line carries claude-floor (claude-runner-wrapper-v3)' 'claude-floor on the flags line' "$(grep 'termag-claude-runner-flags' "$SCRIPT")"
+
+# ── a Claude Code update already running (2026-11-05) ───────────────────────
+# An updater holds ~/.termag/claude-update.lock while it swaps claude; the
+# runner waits for it before resolving claude, then goes on. hold_lock
+# SECONDS [hide]: a holder for that long, with claude gone from PATH while it
+# holds when `hide` is given (npm mid-install).
+update_lock="$HOME_DIR/.termag/claude-update.lock"
+grep -q 'a Claude Code update is running' "$WORK/err" && fail 'update wait: without a lock file nothing waits' '(no wait)' "$(cat "$WORK/err")"
+hold_lock() {
+  rm -f "$WORK/held"
+  ( exec 9>"$update_lock"; flock -x 9
+    [ -n "${2:-}" ] && mv "$WORK/bin/claude" "$WORK/claude.installing"
+    : > "$WORK/held"; sleep "$1"
+    [ -n "${2:-}" ] && mv "$WORK/claude.installing" "$WORK/bin/claude"
+    exit 0 ) &
+  holder=$!
+  while [ ! -e "$WORK/held" ]; do sleep 0.1; done
+}
+printf '2.1.308\n' > "$WORK/floor"
+# Another claude on PATH (a box's /usr/bin/claude) would stand in for the hidden one.
+if [ -e /usr/bin/claude ] || [ -e /bin/claude ]; then hide=; else hide=hide; fi
+hold_lock 2 $hide
+start=$(date +%s)
+floor_run ord-upd-wait 2.1.308; got=$?
+took=$(( $(date +%s) - start )); wait "$holder"
+[ "$got" = 0 ] || fail 'update wait: the runner runs once the update is done' 0 "$got: $(cat "$WORK/err")"
+[ -e "$WORK/record.argv" ] || fail 'update wait: a runner starts after the update' started 'not started'
+[ "$took" -ge 1 ] || fail 'update wait: the runner waited for the lock' '>= 1 s' "${took}s"
+grep -q 'a Claude Code update is running on this box; waiting for it (at most 90s)' "$WORK/err" || fail 'update wait: says it waits' 'waiting for it' "$(cat "$WORK/err")"
+grep -q 'the Claude Code update finished after' "$WORK/err" || fail 'update wait: says when it finished' 'finished after' "$(cat "$WORK/err")"
+# A lock that outlives TERMAG_CLAUDE_UPDATE_WAIT: the runner goes on without it.
+hold_lock 6
+start=$(date +%s)
+floor_run ord-upd-cap 2.1.308 TERMAG_CLAUDE_UPDATE_WAIT=1; got=$?
+took=$(( $(date +%s) - start )); wait "$holder"
+[ "$got" = 0 ] || fail 'update wait capped: the runner still runs' 0 "$got: $(cat "$WORK/err")"
+[ "$took" -lt 5 ] || fail 'update wait: capped by TERMAG_CLAUDE_UPDATE_WAIT' '< 5 s' "${took}s"
+grep -q 'a Claude Code update still held the lock after 1s; going on' "$WORK/err" || fail 'update wait capped: says so' 'going on' "$(cat "$WORK/err")"
+# The time waited comes off the floor guard's cap (170 s budget when nothing waited).
+hold_lock 2
+floor_run ord-upd-guard 2.1.300 UPD_TO=2.1.312; got=$?
+wait "$holder"
+[ "$got" = 0 ] || fail 'update wait, then the guard: the runner runs' 0 "$got: $(cat "$WORK/err")"
+budget=$(cat "$WORK/record.budget" 2>/dev/null)
+[ -n "$budget" ] && [ "$budget" -lt 170 ] && [ "$budget" -ge 160 ] || fail "update wait: the guard's budget is the cap less the wait" '160..169' "${budget:-unset}"
+# The lock file left behind, with nobody holding it: no wait.
+floor_run ord-upd-free 2.1.308; got=$?
+grep -q 'a Claude Code update is running' "$WORK/err" && fail 'update wait: a free lock is not waited for' '(no wait)' "$(cat "$WORK/err")"
+[ -e "$WORK/record.fds" ] || [ ! -d /proc/self/fd ] || fail 'update wait: the stub recorded its open files' 'record.fds' '(none)'
+grep -q 'claude-update.lock' "$WORK/record.fds" 2>/dev/null && fail 'update wait: the runner itself never gets the lock (fd 8 closed)' '(not open)' "$(cat "$WORK/record.fds")"
+# An update that starts while the checkout is seeded, after the checks (Devin
+# on #1413): the runner waits for it at launch and finds claude again. The
+# stub termag-hooks-update, which seeding calls, starts that update and returns
+# once it holds the lock.
+mkdir -p "$HOME_DIR/.local/bin"
+# With CRED_REJECT it leaves a rejection record, and with CRED_TO it installs
+# that version (touching the binary), as an update that finishes would.
+cat > "$HOME_DIR/.local/bin/termag-hooks-update" <<'STUB'
+#!/bin/sh
+[ -n "${CRED_HOLD:-}" ] || exit 0
+( exec 9>"$HOME/.termag/claude-update.lock"; flock -x 9
+  [ -n "${CRED_HIDE:-}" ] && mv "$CRED_HIDE" "$CRED_HIDE.installing"
+  [ -n "${CRED_REJECT:-}" ] && printf 'npm asked for 2.1.320; --version says 2.1.399\n' > "$HOME/.termag/claude-update.rejected"
+  [ -n "${CRED_TO:-}" ] && printf '%s (Claude Code)\n' "$CRED_TO" > "$CLAUDE_VER_FILE" && touch "$CRED_BIN"
+  : > "$CRED_HELD"; sleep 2
+  [ -n "${CRED_HIDE:-}" ] && mv "$CRED_HIDE.installing" "$CRED_HIDE"
+  rm -f "$CRED_HELD" ) </dev/null >/dev/null 2>&1 &
+while [ ! -e "$CRED_HELD" ]; do sleep 0.1; done
+STUB
+chmod +x "$HOME_DIR/.local/bin/termag-hooks-update"
+seed_update() {  # seed_update ORDER [ENV...]: floor_run at the floor, with an update starting during seeding
+  o=$1; shift
+  floor_run "$o" 2.1.308 CRED_HOLD=1 CRED_HELD="$WORK/held-seed" CRED_BIN="$WORK/bin/claude" "$@"; got=$?
+  while [ -e "$WORK/held-seed" ]; do sleep 0.1; done
+  return "$got"
+}
+[ -n "$hide" ] && cred_hide="$WORK/bin/claude" || cred_hide=
+seed_update ord-upd-seed CRED_HIDE="$cred_hide"; got=$?
+[ "$got" = 0 ] || fail 'update during seeding: the runner runs once the update is done' 0 "$got: $(cat "$WORK/err")"
+[ -e "$WORK/record.argv" ] || fail 'update during seeding: a runner starts' started 'not started'
+grep -q 'a Claude Code update is running on this box; waiting for it' "$WORK/err" || fail 'update during seeding: the launch waits for it' 'waiting for it' "$(cat "$WORK/err")"
+grep -q 'checking it again' "$WORK/err" && fail 'update during seeding: an unchanged claude is not checked again' '(no recheck)' "$(cat "$WORK/err")"
+# The update installed a newer claude: checked again, and the runner starts on it.
+seed_update ord-upd-seed-up CRED_TO=2.1.320; got=$?
+[ "$got" = 0 ] || fail 'update during seeding, newer claude: the runner runs' 0 "$got: $(cat "$WORK/err")"
+grep -q 'claude changed while the checkout was seeded; checking it again' "$WORK/err" || fail 'update during seeding, newer claude: checked again' 'checking it again' "$(cat "$WORK/err")"
+[ -e "$WORK/record.argv" ] || fail 'update during seeding, newer claude: a runner starts' started 'not started'
+# It left an install below the floor, or a rejected one: no runner (Devin on #1413).
+seed_update ord-upd-seed-low CRED_TO=2.1.300; got=$?
+[ "$got" = 2 ] || fail 'update during seeding, below the floor: exits 2' 2 "$got: $(cat "$WORK/err")"
+[ ! -e "$WORK/record.argv" ] || fail 'update during seeding, below the floor: no runner starts' 'not started' started
+case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitReason":"claude-below-floor"'*) ;; *) fail 'update during seeding, below the floor: reports claude-below-floor' 'claude-below-floor' "$(cat "$WORK/record.curl.body" 2>/dev/null)" ;; esac
+seed_update ord-upd-seed-rej CRED_REJECT=1; got=$?
+[ "$got" = 2 ] || fail 'update during seeding, rejected: exits 2' 2 "$got: $(cat "$WORK/err")"
+[ ! -e "$WORK/record.argv" ] || fail 'update during seeding, rejected: no runner starts' 'not started' started
+case "$(cat "$WORK/record.curl.body" 2>/dev/null)" in *'"exitReason":"claude-update-rejected"'*) ;; *) fail 'update during seeding, rejected: reports claude-update-rejected' 'claude-update-rejected' "$(cat "$WORK/record.curl.body" 2>/dev/null)" ;; esac
+rm -f "$HOME_DIR/.termag/claude-update.rejected" "$HOME_DIR/.local/bin/termag-hooks-update"
 
 if [ "$failures" -eq 0 ]; then
   echo "ok: termag-claude-runner"

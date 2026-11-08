@@ -400,6 +400,17 @@ sudo ln -sf ../sites-available/termag-checks.conf /etc/nginx/sites-enabled/terma
 sudo install -m 644 /opt/termag/deploy/nginx/termag-proxy.conf /etc/nginx/snippets/termag-proxy.conf
 sudo install -m 755 /opt/termag/deploy/termag-apps-boot /usr/local/bin/termag-apps-boot
 sudo install -m 644 /opt/termag/deploy/termag-apps.service /etc/systemd/system/termag-apps.service
+# Preview links: the preview server block's server_name is rendered from
+# PREVIEW_LINKS_DOMAIN before every nginx start (the domain never ships in the
+# image). Unset leaves the block matching nothing. It runs as root, so it runs
+# a root-owned copy of the two compiled files, never /opt/termag's (the termag
+# user owns that tree). They need nothing but Node's builtins.
+sudo install -d -m 0755 -o root -g root /usr/local/lib/termag/preview-nginx/scripts /usr/local/lib/termag/preview-nginx/services
+sudo install -m 0644 -o root -g root /opt/termag/backend/dist/scripts/previewNginxSnippet.js /usr/local/lib/termag/preview-nginx/scripts/previewNginxSnippet.js
+sudo install -m 0644 -o root -g root /opt/termag/backend/dist/services/previewHostGrammar.js /usr/local/lib/termag/preview-nginx/services/previewHostGrammar.js
+sudo install -d -m 0755 /etc/systemd/system/nginx.service.d
+sudo install -m 644 /opt/termag/deploy/termag-preview-nginx.conf /etc/systemd/system/nginx.service.d/termag-preview.conf
+sudo systemctl daemon-reload
 sudo nginx -t
 sudo systemctl disable --now nginx
 sudo systemctl enable termag-apps.service

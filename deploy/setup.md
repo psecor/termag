@@ -298,6 +298,40 @@ The Slack bot runs in the same process as the main server. Set these env vars in
 - `SLACK_SIGNING_SECRET`
 - `CAPTURE_API_SECRET` (for LTS relay)
 
+### Turning the whole app off
+
+The flag `slack-interactions-enabled` turns termag off in Slack
+without uninstalling the app (`backend/src/services/slackInteractionsFlag.ts`).
+It is read for a multi-context, so a rule can target any of these:
+
+- `service`: the orchestrator (key `termag-orchestrator`, with `environment` and `version`);
+- `slack-workspace`: the Slack workspace (key: its team id, `T…`; with `name` and `enterpriseId`);
+- `slack-org`: the workspace's Enterprise Grid org (key `E…`), only on Enterprise Grid.
+
+For an incoming event, the workspace and org are the event's own. For the app's
+client (notices, cards and other posts outside an event), they are the bot's,
+from `auth.test`, asked once per process. So Slack can be on in one workspace or
+org and off in the others. While the workspace is unknown (the bot's `auth.test`
+failed, retried after 30 seconds, or an event names no workspace), Slack is off,
+so an unknown workspace can't slip past a rule that turns its workspace off. Off:
+
+- every event, button, shortcut, view and option request is acknowledged and
+  dropped before any listener runs; a slash command gets "termag isn't available
+  in Slack yet.", seen only by the person who ran it;
+- the app's Web API client refuses every call except `auth.test`, so no DM,
+  notice, collaboration card, briefing, automation report, home tab or space
+  channel post goes out. A refused call throws like a Slack refusal, with
+  `data.error` `termag_slack_interactions_off`.
+
+The Slack MCP connector keeps working: its sign-in uses
+the termag Slack app as its OAuth client and pins the workspace with the bot's
+`auth.test`, and its calls go to `mcp.slack.com` with each person's own user token.
+
+It is read on every event and every call, so switching it back on needs no
+restart. It falls back on, so a deployment without a flag source keeps its bot.
+While a flag source is configured but has not delivered its flags yet (a slow
+start, or the flag source down at boot), Slack stays off.
+
 ### Who can use the bot
 
 `/t` answers people the feature flag `slack-bot-enabled` is on for, on the
@@ -331,10 +365,17 @@ starts (`[SLACK] Who may use the bot: …`).
 
 1. Create a Slack app at https://api.slack.com/apps
 2. Enable Socket Mode
-3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `channels:manage`, `channels:read`, `commands`, `im:history`, `im:read`, `im:write`, `files:read`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`
-4. Subscribe to bot events: `app_home_opened`, `app_mention`, `message.im`, `reaction_added`
-5. Add slash command: `/t`
-6. Install to workspace
+3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `chat:write.public`, `channels:manage`, `channels:read`, `channels:history`, `channels:join`, `commands`, `im:history`, `im:read`, `im:write`, `files:read`, `files:write`, `reactions:read`, `reactions:write`, `users:read`, `users:read.email`, `assistant:write`, and for spaces in Slack `groups:read`, `groups:history`, `groups:write`
+4. Subscribe to bot events: `app_home_opened`, `app_mention`, `message.channels`, `message.im`, `reaction_added`, `agent_session_stopped`, `app_context_changed`, and for spaces in Slack `message.groups`, `member_joined_channel`, `member_left_channel`, `channel_left`, `group_left`, `channel_archive`, `group_archive`, `channel_unarchive`, `group_unarchive`, `channel_rename`, `group_rename`, `channel_shared`
+5. Add slash commands: `/t`, and `/termag` (an alias of `/t`, the same handler)
+6. Add message shortcuts with callback ids `link_to_space` and `save_to_space`
+7. Install to workspace, and reinstall after every scope or event change
+
+The `groups:*` scopes, the channel events and `/termag` are for linking Slack
+channels to a space, behind the
+`space-channels-enabled` flag. Without the flag nothing reads them, but keep
+them: a reinstall without them drops private space channels and the link
+upkeep (gotcha `slack-scopes`).
 
 Or create it from `deploy/slack-app-manifest.yaml`, which also makes the app the OAuth
 client for Slack's MCP server through the MCP broker (its user scopes and the broker's
@@ -342,8 +383,8 @@ redirect URL). Its header comment lists the admin steps: set the redirect URL's 
 apply the manifest, reinstall, and put the app's Client ID and Client Secret in
 `MCP_OAUTH_CLIENTS` and the variable it names.
 
-A second app for local development needs its own command (`SLACK_COMMAND=/tdev`,
-and the same in its manifest) and its own tokens.
+A second app for local development needs its own commands (`SLACK_COMMAND=/tdev`
+and `SLACK_COMMAND_ALIAS=/termagdev`, and the same in its manifest) and its own tokens.
 
 ### Agent experience (optional)
 
@@ -356,7 +397,9 @@ shows **Working…** and a Stop button, the reply streams in, the thread gets it
 first line as its title, and each thread keeps its own Claude session (resumed
 while the active project stays the same). Also subscribe to the
 `agent_session_stopped` bot event, or Stop has nothing to deliver it, and
-reinstall. In the manifest:
+reinstall. `deploy/slack-app-manifest.yaml` already has `assistant:write`,
+`files:write` and `agent_session_stopped` (spaces in Slack need them); the
+agent view itself is still added by hand. In a hand-written manifest:
 
 ```yaml
 features:
@@ -380,8 +423,11 @@ message. It can also offer files with `[attach: <path>]`, which needs the
 becomes a Share / Don't share question showing its name, size and path, which
 only the person the reply was for can answer, and it is checked again before
 upload. Only images, PDF, CSV, text, Markdown and diffs (not JSON, logs or
-HTML) under the working directory or the temp directory qualify, never
-dotfiles (`slack/agentAttachments.ts`).
+HTML) under the working directory or the turn's own temp directory qualify,
+never dotfiles (`slack/agentAttachments.ts`). Each turn gets a fresh
+`$TMPDIR/termag-slack-run-*` directory (Claude's `TMPDIR`), removed after a
+day; the shared `/tmp` is not a root, since every operator's turn runs as the
+same unix user.
 
 With **Suggested Prompts → Dynamic**, the bot sets the Messages tab's prompts
 for the user's active project each time they open it; **Fixed** uses the
@@ -399,7 +445,12 @@ start their own thread), follow-ups still need an @mention, and the thread only
 ever resumes its own Claude session (a DM's recent conversation never carries
 into a channel). A group DM counts as a channel here. Stop ends a run only for
 the person it is running for, and one person may have three agent
-conversations running at once. Thread owners and sessions are saved
+conversations running at once, with at most six running for everyone together
+(`SLACK_AGENT_MAX_RUNS`). A turn's machinery is in `slack/session/`: `runTurn` around a
+driver (the operator's runs `claude` here, `operatorDriver.ts`), the caps by
+thread scope (`caps.ts`), and the stream budget (`slack/streamBudget.ts`, 18
+`chat.startStream` a minute, `SLACK_STREAM_STARTS_PER_MINUTE`). An operator's
+reply always streams and only counts against that budget. Thread owners and sessions are saved
 (`slack_agent_threads`, `slack_agent_dm_last`) and read back when the bot
 connects, so a deploy keeps them; runs live in the backend's memory, which
 assumes one process holds the Slack connection (with `ORCHESTRATOR_LEASE`, only

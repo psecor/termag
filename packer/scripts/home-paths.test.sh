@@ -167,6 +167,94 @@ else
     fail "usage error exited $rc"
 fi
 
+# ── bake as an account that cannot enter the home ────────────────────────────
+# The bake runs the index as `ubuntu`, and /home/termag is 0750 termag:termag:
+# only $SUDO can look inside. Images from 2026-09-25 to 2026-11-04 were baked
+# with files=0 because the scan dirs were tested without it, so every uv
+# tool's shebang kept /home/termag. Simulate that: the home is mode 000, and
+# the SUDO stand-in opens it for the one command it runs.
+GOLD=$TMP/gated/termag
+GNEW=$TMP/gated/bob
+GIDX=$TMP/gated-index
+mkdir -p "$GOLD/.local/share/uv/tools/poetry/bin" "$GOLD/.local/bin"
+printf '#!%s/.local/share/uv/tools/poetry/bin/python\nimport poetry\n' "$GOLD" > "$GOLD/.local/share/uv/tools/poetry/bin/poetry"
+printf 'home = %s/.local/share/uv/python/cpython-3.13/bin\n' "$GOLD" > "$GOLD/.local/share/uv/tools/poetry/pyvenv.cfg"
+ln -s "$GOLD/.local/share/uv/tools/poetry/bin/poetry" "$GOLD/.local/bin/poetry"
+cat > "$TMP/gate-sudo" <<'GATE'
+#!/bin/sh
+chmod 700 "$GATED_HOME"
+"$@"
+rc=$?
+chmod 000 "$GATED_HOME"
+exit $rc
+GATE
+chmod 755 "$TMP/gate-sudo"
+chmod 000 "$GOLD"
+if GATED_HOME="$GOLD" SUDO="$TMP/gate-sudo" HOME_DIR="$GOLD" INDEX_DIR="$GIDX" REWRITE_SRC='' \
+     bash "$INDEX" > "$TMP/gated.log" 2>&1; then
+    pass "index-home-paths.sh ran on a home only SUDO can enter"
+else
+    fail "index-home-paths.sh failed on a gated home: $(cat "$TMP/gated.log")"
+fi
+chmod 755 "$GOLD"
+if [ "$(count_nul "$GIDX/files")" = 2 ] && grep -qzx '.local/share/uv/tools/poetry/bin/poetry' "$GIDX/files" \
+   && grep -qzx '.local/share/uv/tools/poetry/pyvenv.cfg' "$GIDX/files"; then
+    pass "the text-file scan reaches a home only SUDO can enter (uv tool entry point, pyvenv.cfg)"
+else
+    fail "expected the uv tool's entry point and pyvenv.cfg in the index, got $(count_nul "$GIDX/files"): $(tr '\000' ' ' < "$GIDX/files")"
+fi
+mv "$GOLD" "$GNEW"
+INDEX_DIR="$GIDX" "$SBIN" "$GOLD" "$GNEW" > /dev/null 2>&1 || true
+if [ "$(head -1 "$GNEW/.local/share/uv/tools/poetry/bin/poetry")" = "#!$GNEW/.local/share/uv/tools/poetry/bin/python" ] \
+   && grep -qxF "home = $GNEW/.local/share/uv/python/cpython-3.13/bin" "$GNEW/.local/share/uv/tools/poetry/pyvenv.cfg"; then
+    pass "after the rename the uv tool's shebang and pyvenv.cfg name the new home"
+else
+    fail "uv tool not rewritten: $(head -1 "$GNEW/.local/share/uv/tools/poetry/bin/poetry") / $(cat "$GNEW/.local/share/uv/tools/poetry/pyvenv.cfg")"
+fi
+
+# ── an excluded dir is left out ────────────────────────────────────────────
+# A bake may leave a dev stack's database stores under the home, here
+# ~/.local/share/webapp, listed in EXCLUDE_DIRS: nothing there may be
+# rewritten, so neither walk enters it. It is
+# excluded by full path: a dir merely named webapp elsewhere, or one whose
+# name only starts with it, is still scanned. A FIFO in a scanned dir must
+# not block the walk.
+XOLD=$TMP/xhome/termag
+XIDX=$TMP/xindex
+mkdir -p "$XOLD/.local/share/webapp/stack-bake/data/cockroachdb" "$XOLD/.local/share/webapp-tools" \
+         "$XOLD/.config/webapp" "$XOLD/.local/share/tool"
+printf 'checkout=%s/src/webapp\n' "$XOLD" > "$XOLD/.local/share/webapp/stack-bake/bake.json"
+printf 'store at %s/.local/share/webapp\n' "$XOLD" > "$XOLD/.local/share/webapp/stack-bake/data/cockroachdb/000011.log"
+ln -s "$XOLD/.local/share/tool" "$XOLD/.local/share/webapp/stack-bake/link"
+printf 'root = "%s"\n' "$XOLD" > "$XOLD/.local/share/webapp-tools/conf"
+printf 'root = "%s"\n' "$XOLD" > "$XOLD/.config/webapp/settings"
+printf 'exec %s/bin/x\n' "$XOLD" > "$XOLD/.local/share/tool/run"
+ln -s "$XOLD/.local/share/tool/run" "$XOLD/.local/share/tool/run-link"
+mkfifo "$XOLD/.local/share/tool/fifo"
+if SUDO='' HOME_DIR="$XOLD" INDEX_DIR="$XIDX" REWRITE_SRC='' EXCLUDE_DIRS=.local/share/webapp timeout 60 bash "$INDEX" > "$TMP/xindex.log" 2>&1; then
+    pass "index-home-paths.sh ran on a home with baked stack data and a FIFO"
+else
+    fail "index-home-paths.sh failed or hung on a home with baked stack data: $(cat "$TMP/xindex.log")"
+fi
+if tr '\000' '\n' < "$XIDX/files" 2>/dev/null | grep -q '^\.local/share/webapp/' \
+   || tr '\000' '\n' < "$XIDX/symlinks" 2>/dev/null | grep -q '^\.local/share/webapp/'; then
+    fail "the dev stack's data root was indexed: $(tr '\000' ' ' < "$XIDX/files") / $(tr '\000' ' ' < "$XIDX/symlinks")"
+else
+    pass "nothing under .local/share/webapp is indexed, though its files embed the home path"
+fi
+if grep -qzx '.local/share/webapp-tools/conf' "$XIDX/files" && grep -qzx '.config/webapp/settings' "$XIDX/files" \
+   && grep -qzx '.local/share/tool/run' "$XIDX/files" && grep -qzx '.local/share/tool/run-link' "$XIDX/symlinks"; then
+    pass "the exclusion is by full path: webapp-tools, .config/webapp and the rest are still indexed"
+else
+    fail "the exclusion over-matched: $(tr '\000' ' ' < "$XIDX/files") / $(tr '\000' ' ' < "$XIDX/symlinks")"
+fi
+if [ "$(count_nul "$XIDX/files")" = 3 ] && [ "$(count_nul "$XIDX/symlinks")" = 1 ] \
+   && grep -q '^exclude_dirs=.local/share/webapp$' "$XIDX/meta"; then
+    pass "exactly 3 files and 1 symlink indexed, and meta records the exclusion"
+else
+    fail "expected 3 files and 1 symlink with exclude_dirs in meta: $(tr '\n' ' ' < "$XIDX/meta" 2>/dev/null)"
+fi
+
 # ── the callers ──────────────────────────────────────────────────────────────
 CALL='termag-rewrite-home-paths /home/termag "/home/$UNIX_USER"'
 if grep -qF "$CALL" "$TFTPL" && ! grep -q 'grep -rIl' "$TFTPL" && ! grep -q "find \"/home/\$UNIX_USER\" -type l" "$TFTPL"; then

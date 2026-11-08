@@ -119,6 +119,13 @@
 # is only the fallback for a launch without it; a value that is not x.y.z is
 # logged and ignored, and the file applies.
 #
+# A Claude Code update already running when the runner starts (the tool
+# sweep's floor or nightly run, the boot unit, another slot's guard) holds
+# ~/.termag/claude-update.lock while npm swaps the install, and for those
+# seconds claude can be missing. So before claude is resolved the script waits
+# for that lock, shared, at most TERMAG_CLAUDE_UPDATE_WAIT (90 s), and goes on
+# either way; the time waited comes off the floor guard's cap.
+#
 # Usage: termag-claude-runner <order-id> [slot] [--ld-project <id> --otel-endpoint <url> [--ld-user-key <id> --ld-box-key <id>]] [--claude-floor <x.y.z>]
 #        (slot defaults to 2)
 # Env:
@@ -133,7 +140,8 @@
 #   TERMAG_BAZEL_OUTPUT_USER_ROOT  where output bases live; default $HOME/.cache/bazel/_bazel_<user>
 #   TERMAG_CLAUDE_FLOOR_FILE  the Claude Code floor; default $HOME/.local/share/termag/claude-code-floor
 #   TERMAG_CLAUDE_UPDATE      the updater; default $HOME/.local/bin/termag-claude-update
-#   TERMAG_CLAUDE_UPDATE_TIMEOUT  seconds the updater may take; default 180
+#   TERMAG_CLAUDE_UPDATE_TIMEOUT  seconds the updater may take; default 180, less any wait below
+#   TERMAG_CLAUDE_UPDATE_WAIT  seconds to wait for a Claude Code update already running; default 90
 #
 # Exit codes: 2 bad usage, missing work order, unusable claude or claude below
 # the floor; 128+n after
@@ -547,17 +555,56 @@ resolve_claude_bin() {
 # cap left unable to run, is exactly what termag-claude-update --ensure repairs,
 # and the updater only needs --version.
 require_runner_subcommand() {
-  if ! "$claude_bin" self-hosted-runner --help >/dev/null 2>&1; then
+  if ! "$claude_bin" self-hosted-runner --help >/dev/null 2>&1 8<&-; then
     log 'no claude with the self-hosted-runner subcommand on this box'
     exit 2
   fi
 }
+# The updater's lock (see the header), held shared on fd 8 while claude is
+# resolved and checked, and again while the runner starts, so no update swaps
+# claude in between. Before this, a runner placed while the tool sweep's floor
+# run swapped claude found none and exited 2 in its first second (a box,
+# 2026-11-05). Shared, so two slots starting together don't wait on each
+# other. It is let go before termag-claude-update (which takes it exclusive),
+# during seeding, and once the runner has started; children that could outlive
+# a step get fd 8 closed (8<&-), so none keeps it. Waiting happens in the
+# background and is waited for, like the updater below, so a hangup ends this
+# script at once (a flock lock belongs to the open file, so the child's lock
+# is this script's). All waits together are capped at TERMAG_CLAUDE_UPDATE_WAIT;
+# past it the script goes on without the lock.
+claude_update_lock=$state_dir/claude-update.lock
+claude_update_waited=0
+hold_claude_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$state_dir" 2>/dev/null
+  # The group's 2>/dev/null is only for this open; a bare `exec ... 2>` would
+  # silence the script's stderr from here on.
+  { exec 8<>"$claude_update_lock"; } 2>/dev/null || return 0
+  flock -s -n 8 2>/dev/null && return 0
+  local max_wait=${TERMAG_CLAUDE_UPDATE_WAIT:-90} left t0=$SECONDS
+  case "$max_wait" in ''|*[!0-9]*) max_wait=90 ;; esac
+  left=$(( max_wait - claude_update_waited ))
+  if [ "$left" -le 0 ]; then
+    log "a Claude Code update holds the lock and the ${max_wait}s wait is used up; going on"
+    return 0
+  fi
+  log "a Claude Code update is running on this box; waiting for it (at most ${left}s)"
+  flock -s -w "$left" 8 2>/dev/null &
+  if wait "$!"; then
+    log "the Claude Code update finished after $(( SECONDS - t0 ))s"
+  else
+    log "a Claude Code update still held the lock after ${left}s; going on"
+  fi
+  claude_update_waited=$(( claude_update_waited + SECONDS - t0 ))
+}
+release_claude_lock() { exec 8<&-; }
+hold_claude_lock
 resolve_claude_bin
 
 # The Claude Code floor (see the header): a claude below it is brought up by
 # termag-claude-update --ensure, capped so the runner still registers inside
 # the orchestrator's spawn deadline; one still below it starts no runner.
-claude_version() { timeout 20 "$1" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1; }
+claude_version() { timeout 20 "$1" --version </dev/null 2>/dev/null 8<&- | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1; }
 at_least() { [ -n "$1" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
 floor_file=${TERMAG_CLAUDE_FLOOR_FILE:-$HOME/.local/share/termag/claude-code-floor}
 [ -r "$floor_file" ] || [ -n "${TERMAG_CLAUDE_FLOOR_FILE:-}" ] || floor_file=$HOME/src/termag/deploy/claude-code-floor
@@ -587,6 +634,12 @@ if [ -n "$claude_floor" ]; then
   claude_have=$(claude_version "$claude_bin")
   if [ -s "$update_rejected" ] || ! at_least "$claude_have" "$claude_floor"; then
     update_timeout=${TERMAG_CLAUDE_UPDATE_TIMEOUT:-180}
+    # The wait for an update already running (above) comes off the default
+    # cap, down to 60 s, so the two together keep inside the spawn deadline.
+    if [ -z "${TERMAG_CLAUDE_UPDATE_TIMEOUT:-}" ] && [ "$claude_update_waited" -gt 0 ]; then
+      update_timeout=$(( update_timeout - claude_update_waited ))
+      [ "$update_timeout" -ge 60 ] || update_timeout=60
+    fi
     updater=
     for u in "${TERMAG_CLAUDE_UPDATE:-}" "$HOME/.local/bin/termag-claude-update" "$HOME/src/termag/deploy/termag-claude-update"; do
       if [ -n "$u" ] && [ -x "$u" ]; then updater=$u; break; fi
@@ -609,10 +662,13 @@ if [ -n "$claude_floor" ]; then
       # --expected-spawn-seconds.
       case "$update_timeout" in ''|*[!0-9]*) update_timeout=180 ;; esac
       update_budget=$(( update_timeout > 10 ? update_timeout - 10 : 0 ))
+      # The updater takes the lock exclusive: let go of it first.
+      release_claude_lock
       TERMAG_CLAUDE_BUDGET=$update_budget timeout -k 10 "$update_timeout" "$updater" --ensure "$claude_floor" </dev/null &
       wait "$!"
       update_rc=$?
       log "termag-claude-update exited $update_rc"
+      hold_claude_lock
       # Stopped by the cap here (124, or KILLed: 137) rather than by its own
       # budget: an install may have been cut halfway and nothing verified
       # what is in place, so this session does not start on it.
@@ -640,6 +696,16 @@ if [ -n "$claude_floor" ]; then
   fi
 fi
 require_runner_subcommand
+# Seeding can take minutes (a cold checkout); an update may run meanwhile.
+# What was checked is fingerprinted (the binary's file, and whether an install
+# is rejected), so the launch below checks claude again only if it changed.
+claude_fingerprint() {
+  stat -L -c '%d:%i:%Y:%s' "$claude_bin" 2>/dev/null || echo unknown
+  [ -s "$update_rejected" ] && echo rejected
+  return 0
+}
+claude_checked=$(claude_fingerprint)
+release_claude_lock
 
 # The session's slot, written where the repository's make reads it. The environment
 # this wrapper exports reaches the runner and its Bash tool, but not a tmux
@@ -942,8 +1008,35 @@ log "starting one-shot runner, DEV_INSTANCE=$slot, checkout $checkout, log $log_
 # runs a trap only once a foreground child returns, but interrupts `wait` at
 # once, so a signal reaches on_signal (and the runner) immediately. The EXIT
 # trap still removes the work order and the checkout (or keeps it) afterwards.
-"$claude_bin" self-hosted-runner "$@" </dev/null &
+# An update that started while the checkout was seeded is waited for, and
+# claude found again, before it starts; the runner itself never gets fd 8.
+# A claude that changed meanwhile gets the floor guard's verdict again (Devin
+# on #1413): no update here, since the spawn deadline has no room for one, so
+# a rejected install or one below the floor starts no runner, as above.
+hold_claude_lock
+resolve_claude_bin
+if [ "$(claude_fingerprint)" != "$claude_checked" ]; then
+  log "claude changed while the checkout was seeded; checking it again"
+  if [ -n "$claude_floor" ]; then
+    if [ -s "$update_rejected" ]; then
+      log "a Claude Code install is rejected ($(head -n 1 "$update_rejected")); not starting a runner on $claude_bin"
+      exit_reason=claude-update-rejected
+      exit 2
+    fi
+    claude_have=$(claude_version "$claude_bin")
+    if ! at_least "$claude_have" "$claude_floor"; then
+      log "claude $claude_bin is ${claude_have:-of unknown version}, below the floor $claude_floor; not starting a runner"
+      exit_reason=claude-below-floor
+      exit 2
+    fi
+  fi
+  require_runner_subcommand
+fi
+"$claude_bin" self-hosted-runner "$@" </dev/null 8<&- &
 runner_pid=$!
+# Let go once forked: what is left uncovered is the child's own exec, far
+# shorter than any install, and holding on longer would slow every start.
+release_claude_lock
 wait "$runner_pid"
 status=$?
 runner_pid=

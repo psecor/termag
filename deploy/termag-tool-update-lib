@@ -18,7 +18,10 @@
 #     and verified) or quarantined (<file>.rejected, not executable);
 #   * the summary line and the exit status;
 #   * stopping a run's sessions on an old binary, panes resumed or listed for
-#     the orchestrator, and the report.
+#     the orchestrator, and the report;
+#   * --sessions: the same stop and resume with no policy and no install, for
+#     another tool's run that moved what these sessions run on (Node's,
+#     deploy/termag-node-update), which reports them itself.
 #
 # The tool's script sets, before it sources this:
 #   TU_NAME       its name, the prefix of every log line (termag-claude-update)
@@ -37,13 +40,16 @@
 #                 It may print the path of a package file it checked (the
 #                 pinned bytes), which npm then installs instead of
 #                 PKG@V, for the install and for a put-back alike
+#   tu_npm_ahead V  (optional) whether version V is above every version the
+#                 tool pins: an install there is left alone and its note says
+#                 (ahead-of-pins)
 #   TU_NPM_REQUIRED  1 when the npm global is the tool's only install (Codex):
 #                 a run that finds no package there fails and says so, where
 #                 Claude Code (with its native install) has nothing to do there
 #   STATE_DIR, TU_LOCK_FILE, REJECTED  where its lock and its record live
 #   TARGET, LOCK_WAIT, INSTALL_TIMEOUT, RETRY_SLEEP, POLICY_TIMEOUT,
 #   KILL_AFTER, RUNNER_WAIT, RESUME_WAIT  from its environment
-# and, before it calls these, MODE (run, or its own), RUN_ID, BUDGET, FLOOR,
+# and, before it calls these, MODE (run, sessions, or its own), RUN_ID, BUDGET, FLOOR,
 # and the functions:
 #   resolve            prints the binary a session would start
 #   tu_notes           the summary's per-install notes ("npm=... native=...")
@@ -197,11 +203,14 @@ tu_fetch_policy() {
       pbody=$(mktemp "${TMPDIR:-/tmp}/termag-$TU_COMPONENT-policy.XXXXXX")
       api POLICY_CODE "$pbody" GET "tool-update/policy?component=$TU_COMPONENT&run=$RUN_ID"
       if [ "$POLICY_CODE" = 200 ]; then
-        IFS='|' read -r p_floor p_target p_restart p_drain p_run < <(jq -r '[.floor, .target, .restart, .drainSec, (.run.id // "")] | map(. // "" | tostring | gsub("[|\n]"; "")) | join("|")' "$pbody" 2>/dev/null) || true
+        IFS='|' read -r p_floor p_target p_restart p_drain p_run p_trigger < <(jq -r '[.floor, .target, .restart, .drainSec, (.run.id // ""), (.run.trigger // "")] | map(. // "" | tostring | gsub("[|\n]"; "")) | join("|")' "$pbody" 2>/dev/null) || true
         if is_version "${p_floor:-}" && { [[ "${p_target:-}" =~ ^(${TU_TAGS})$ ]] || is_version "${p_target:-}"; } \
           && [[ "${p_restart:-}" =~ ^(none|idle|force)$ ]] && [[ "${p_drain:-}" =~ ^[0-9]{1,4}$ ]] && [ "$p_drain" -le 3600 ]; then
           FLOOR=$p_floor TARGET=$p_target DRAIN=$p_drain
           if [ "${p_run:-}" = "$RUN_ID" ]; then RESTART=$p_restart POLICY=ok; else POLICY='ok-no-run'; fi
+          # Only a trigger the notice has words for (tu_notice); an older
+          # orchestrator sends none, and the notice gives no reason.
+          if [[ "${p_trigger:-}" =~ ^(manual|nightly|floor|resume)$ ]]; then RUN_TRIGGER=$p_trigger; fi
         else
           POLICY=unreadable
         fi
@@ -265,6 +274,8 @@ quarantine() {
 npm_note=- native_note=-
 finish() {
   local bin v state=ok rc=0
+  # --sessions installs nothing: it gets here only when it did not get the lock.
+  [ "$MODE" = sessions ] && { restart_note="none(lock held)"; tu_sessions_out; exit 0; }
   bin=$(resolve)
   v=; [ -n "$bin" ] && v=$(ver "$bin")
   if [ -s "$REJECTED" ]; then state=rejected; rc=3
@@ -429,6 +440,12 @@ tu_npm_global() {
   # is not what was checked.
   if at_least "$before" "$want" && ! was_rejected npm; then
     npm_note=$before
+    # A tool with pins (pi), on a later version than any of them: left alone,
+    # and said so, as Cursor's (a review on #1080).
+    if declare -F tu_npm_ahead >/dev/null && tu_npm_ahead "$before"; then
+      npm_note="$before(ahead-of-pins)"
+      log "npm global $PKG is $before, ahead of every pinned version; left alone"
+    fi
   elif [ ! -w "$npm_root" ]; then
     # A prefix this user cannot write (root's /usr on the orchestrator host)
     # is someone else's to update.
@@ -555,9 +572,13 @@ restart_note=
 # outside it too, so a run stopped by a signal still lists the panes it had
 # already stopped (on_signal).
 p_st=()
-# list_pane I: pane I in the report's panes, with its role and conversation;
-# sets LP_ROLE (agent, other) and LP_HAD (true, false).
+# list_pane I: pane I in the report's panes, with its role and conversation,
+# and the restart notice printed in it (p_notice[I], set by stop_sessions only
+# once the line was typed: the orchestrator shows it in the pane's chat).
+# pane_facts I sets LP_ROLE (agent,
+# other) and LP_HAD (true, false), as list_pane does.
 LP_ROLE='' LP_HAD=''
+p_notice=() p_listed=()
 # tu_unshare: for a tool that guesses a pane's session from where it runs (the
 # newest one in its working directory), after find_sessions has set p_guess[I]
 # (that place, or empty for a session the process named itself) and peers (the
@@ -575,24 +596,117 @@ tu_unshare() {
     p_id[$i]='' p_shared[$i]=1
   done
 }
-list_pane() {
-  local i=$1 id role had
+pane_facts() {
+  local i=$1 id
   id=${p_id[$i]}
   [[ "$id" =~ ^[A-Za-z0-9-]{1,100}$ ]] || id=
-  had=false; [ "${p_shared[$i]:-}" = 1 ] || ! tu_had "$i" "$id" || had=true
-  case "${p_sess[$i]}" in *-agent) role=agent ;; *) role=other ;; esac
-  LP_ROLE=$role LP_HAD=$had
+  LP_HAD=false; [ "${p_shared[$i]:-}" = 1 ] || ! tu_had "$i" "$id" || LP_HAD=true
+  case "${p_sess[$i]}" in *-agent) LP_ROLE=agent ;; *) LP_ROLE=other ;; esac
+}
+list_pane() {
+  local i=$1 id notice json
+  id=${p_id[$i]}
+  [[ "$id" =~ ^[A-Za-z0-9-]{1,100}$ ]] || id=
+  pane_facts "$i"
+  # Only a line that passed TU_NOTICE_SAFE was typed; checked again, it is data.
+  notice=${p_notice[$i]:-}
+  [[ "$notice" =~ $TU_NOTICE_SAFE ]] || notice=
   # The orchestrator matches the name against its own (no whitespace,
   # ':', '.' or control characters, as tmux.tmuxSafeName leaves it);
   # any other name is a pane it cannot relaunch, so it is counted only.
   if [[ "${p_sess[$i]}" =~ ^[^[:space:][:cntrl:]:.]{1,200}$ ]] && [ "${#panes_json[@]}" -lt 200 ]; then
-    panes_json+=("$(jq -nc --arg s "${p_sess[$i]}" --arg r "$role" --arg id "$id" --argjson h "$had" \
-      '{session: $s, role: $r, hadConversation: $h} + (if $id != "" then {sessionId: $id} else {} end)')")
+    json=$(jq -nc --arg s "${p_sess[$i]}" --arg r "$LP_ROLE" --arg id "$id" --argjson h "$LP_HAD" --arg n "$notice" \
+      '{session: $s, role: $r, hadConversation: $h} + (if $id != "" then {sessionId: $id} else {} end) + (if $n != "" then {notice: $n} else {} end)')
+    # One command, so a signal (on_signal) never sees it listed but not marked.
+    panes_json+=("$json") p_listed[$i]=1
+  else
+    p_listed[$i]=1
   fi
 }
+# --sessions: the bin directory a stopped pane's shell gets first on its
+# PATH before anything is typed there (pane_prelude). A pane's shell keeps the
+# PATH it started with, and nvm put the Node of that moment's default first
+# on it: a resume typed there, or the orchestrator's relaunch, would come back
+# on the old Node and the old npm global. Empty in every other mode, which
+# types exactly what it always did.
+TU_PANE_PATH=''
+pane_prelude() {
+  [ -n "$TU_PANE_PATH" ] || return 0
+  # shellcheck disable=SC2016  # $PATH is the pane shell's, expanded there
+  printf 'export PATH=%s:"$PATH"' "$TU_PANE_PATH"
+}
+# ── the restart notice ──────────────────────────────────────────────────────
+# One line a resumed pane prints before its resume, so its owner knows why the
+# session restarted:
+#   [termag] Claude Code was updated to 2.1.320 (automatic nightly run); resuming your session.
+# The same words the orchestrator types before an agent pane it relaunches
+# (backend/src/services/toolUpdate/notice.ts). Typed into a shell, so it is
+# made only of fixed words, the tool's name, a trigger from an allow-list
+# (RUN_TRIGGER, from the policy) and a version that is_version accepts, and
+# the whole line is checked against TU_NOTICE_SAFE (no quote, $, `, \ or
+# control character) before it is typed in single quotes; a line that does
+# not pass is not typed. --sessions has no policy: its caller (Node's run)
+# passes its own notice in TERMAG_RESTART_NOTICE, checked the same way.
+RUN_TRIGGER=''
+TU_NOTICE_SAFE='^[][A-Za-z0-9 .,;:()_+-]{1,200}$'
+tu_notice_name() {
+  case "$TU_COMPONENT" in
+    claude) printf 'Claude Code' ;; codex) printf Codex ;; cursor) printf 'Cursor agent' ;;
+    devin) printf 'Devin CLI' ;; pi) printf pi ;; node) printf Node ;; *) return 1 ;;
+  esac
+}
+# tu_notice VERSION [fresh]: the notice for a run that restarts its sessions
+# on VERSION, or nothing (restart none, no tool name, a line that is not
+# safe). With `fresh`, for a pane left at its shell with no conversation to
+# resume (Devin on #1223): it says the session was stopped instead.
+TU_NOTICE_RESUME='; resuming your session.' TU_NOTICE_FRESH='; its session was stopped, start it again when you need it.'
+tu_notice() {
+  local name why to='' line
+  case "$RESTART" in idle|force) ;; *) return 0 ;; esac
+  if [ "$MODE" = sessions ]; then
+    line=${TERMAG_RESTART_NOTICE:-}
+    # Its caller's line, for a resume; a fresh pane's ends the other way.
+    if [ "${2:-}" = fresh ] && [[ "$line" == *"$TU_NOTICE_RESUME" ]]; then line="${line%"$TU_NOTICE_RESUME"}$TU_NOTICE_FRESH"; fi
+  else
+    name=$(tu_notice_name) || return 0
+    case "$RUN_TRIGGER" in
+      manual) why='update requested by an admin' ;;
+      nightly) why='automatic nightly run' ;;
+      floor) why='automatic run: below the minimum version' ;;
+      resume) why='automatic run after the box resumed' ;;
+      *) why='' ;;
+    esac
+    if [ -n "${1:-}" ] && is_version "$1" && [ "${#1}" -le 40 ]; then to=" to $1"; fi
+    line="[termag] $name was updated$to${why:+ ($why)}"
+    if [ "${2:-}" = fresh ]; then line+=$TU_NOTICE_FRESH; else line+=$TU_NOTICE_RESUME; fi
+  fi
+  if [[ "$line" =~ $TU_NOTICE_SAFE ]]; then printf '%s' "$line"; fi
+}
+# notice_cmd NOTICE: the shell command that prints NOTICE (already checked).
+notice_cmd() { if [ -n "$1" ]; then printf '%s%s%s' "printf '%s\\n' '" "$1" "'"; fi; }
+
+# type_line I LINE: LINE typed into pane I and entered, after the prelude
+# (alone when LINE is empty), only while the pane is at a shell. argv, never a
+# shell string: -l types the text as it is, `--` keeps it from being read as
+# a flag, and Enter is its own call.
+type_line() {
+  local i=$1 line=$2 pre
+  is_shell "${p_sock[$i]}" "${p_pane[$i]}" || return 1
+  pre=$(pane_prelude)
+  if [ -n "$pre" ]; then line="$pre${line:+; $line}"; fi
+  [ -n "$line" ] || return 1
+  tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" -l -- "$line" \
+    && tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" Enter
+}
 stop_sessions() {
-  local i now t0 deadline hard pending id role had status typed_at=0
+  local i now t0 deadline hard pending id role had status typed_at=0 notice fresh_notice notice_text fresh_text
   local -a p_t=() p_typed=()
+  # Once for the run, printed once in each pane it resumes, or leaves at its
+  # shell with nothing to resume.
+  notice_text=$(tu_notice "${to_v:-${spec_v:-}}")
+  fresh_text=$(tu_notice "${to_v:-${spec_v:-}}" fresh)
+  notice=$(notice_cmd "$notice_text")
+  fresh_notice=$(notice_cmd "$fresh_text")
   [ "${#runners[@]}" -gt 0 ] && kill -TERM "${runners[@]}" 2>/dev/null
   t0=$(date +%s)
   if [ "$RESTART" = force ]; then deadline=$t0; else deadline=$(( t0 + DRAIN )); fi
@@ -632,25 +746,30 @@ stop_sessions() {
           if pane_exists "${p_sock[$i]}" "${p_pane[$i]}" && ! is_shell "${p_sock[$i]}" "${p_pane[$i]}" && [ $(( now - p_t[i] )) -lt 10 ]; then
             pending=1; continue
           fi
-          p_st[$i]=finished s_stopped=$((s_stopped + 1))
+          # Still `dead` until it is listed below, so a signal before then
+          # lists it (on_signal; Bugbot on #1301).
           pane_exists "${p_sock[$i]}" "${p_pane[$i]}" || gone=$((gone + 1))
           id=${p_id[$i]}
           [[ "$id" =~ ^[A-Za-z0-9-]{1,100}$ ]] || id=
-          list_pane "$i"; role=$LP_ROLE had=$LP_HAD
+          pane_facts "$i"; role=$LP_ROLE had=$LP_HAD
           [ "$role" = agent ] && agent_panes=$((agent_panes + 1))
           if [ "$role" = agent ] || ! pane_exists "${p_sock[$i]}" "${p_pane[$i]}"; then
-            :
+            # (--sessions: an agent pane's shell gets the new PATH, for the
+            # orchestrator's relaunch.)
+            [ "$role" = agent ] && [ -n "$TU_PANE_PATH" ] && pane_exists "${p_sock[$i]}" "${p_pane[$i]}" && type_line "$i" ''
           elif [ "$had" = true ] && is_shell "${p_sock[$i]}" "${p_pane[$i]}"; then
-            # argv, never a shell string: -l types the text as it is, `--`
-            # keeps it from being read as a flag, and Enter is its own call.
-            tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" -l -- "$(tu_resume_line "$id")" \
-              && tmux -S "${p_sock[$i]}" send-keys -t "${p_pane[$i]}" Enter \
-              && { s_typed=$((s_typed + 1)); p_typed[$i]=1; typed_at=$now; }
+            type_line "$i" "${notice:+$notice; }$(tu_resume_line "$id")" && { s_typed=$((s_typed + 1)); p_typed[$i]=1; typed_at=$now; p_notice[$i]=$notice_text; }
           elif [ "$had" = true ]; then
             s_left=$((s_left + 1))
           else
+            # (--sessions: after the new PATH; type_line types nothing into a
+            # pane that is not at a shell, and nothing at all when both are empty.)
+            type_line "$i" "$fresh_notice" && [ -n "$fresh_notice" ] && p_notice[$i]=$fresh_text
             s_fresh=$((s_fresh + 1))
-          fi ;;
+          fi
+          # Listed after the typing, so the report says what this pane printed.
+          list_pane "$i"
+          p_st[$i]=finished s_stopped=$((s_stopped + 1)) ;;
       esac
     done
     [ "$pending" = 0 ] && [ "$(alive "${runners[@]}")" -eq 0 ] && break
@@ -681,7 +800,10 @@ report_target() {
 # post_report OUTCOME DETAIL: POST /api/tool-update/report. Best effort, as
 # termag-box-update's report: a box that cannot reach the orchestrator leaves
 # the run to expire there. Not for a run the orchestrator does not know (404
-# on the policy): there is nothing to attach it to.
+# on the policy): there is nothing to attach it to. Its trigger is the run's
+# (RUN_TRIGGER, from the policy, only an allow-listed one), else manual (an
+# older orchestrator names none): the orchestrator's log line names it, and the
+# run's own row keeps the trigger it was asked with either way.
 post_report() {
   local outcome=$1 detail=$2 body code out panes
   if [ "$POLICY_CODE" = 404 ]; then log "report: not posted: the orchestrator knows no run $RUN_ID"; return 0; fi
@@ -692,7 +814,8 @@ post_report() {
     --arg from "${from_v:-}" --arg to "${to_v:-}" --arg d "${detail:0:2000}" --argjson panes "$panes" \
     --argjson stopped "$s_stopped" --argjson resumed "$s_resumed" --argjson fresh "$s_fresh" --argjson cut "$s_cut" \
     --argjson typed "$s_typed" --argjson other "$other" --argjson left "${runners_left:-0}" \
-    '{component: $component, trigger: "manual", run: $run, outcome: $o, detail: $d,
+    --arg trigger "${RUN_TRIGGER:-manual}" \
+    '{component: $component, trigger: $trigger, run: $run, outcome: $o, detail: $d,
       sessions: {stopped: $stopped, resumed: $resumed, fresh: $fresh, cut: $cut, typed: $typed, other: $other, runnersLeft: $left},
       panes: $panes}
      + (if $target != "" then {target: $target} else {} end)
@@ -736,7 +859,7 @@ after_install() {
   elif [ "${TU_TARGET_UNRESOLVED:-0}" = 1 ] && [[ "$(tu_notes_all)" != *'->'[0-9]* ]]; then
     restart_note="none(target unresolved)"
   elif [ $(( ${#runners[@]} + ${#p_pid[@]} )) -eq 0 ]; then
-    restart_note="$RESTART(nothing on an old binary)"
+    restart_note="$RESTART(${TU_NO_SESSIONS_NOTE:-nothing on an old binary})"
   else
     restart_note=$RESTART
     stop_sessions
@@ -770,6 +893,13 @@ after_install() {
   trap - TERM INT HUP
   post_report "$outcome" "$detail"
 }
+pane_path_after_signal() {
+  local i=$1 _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! is_alive "${p_pid[$i]}" && is_shell "${p_sock[$i]}" "${p_pane[$i]}"; then type_line "$i" ''; return; fi
+    sleep 0.5
+  done
+}
 # A run stopped by a signal (systemctl stop, the unit's timeout), during its
 # install or while it waits for sessions, still says so, with what it had done.
 # TU_TMP: what a tool is downloading or unpacking right now, removed when a
@@ -785,8 +915,67 @@ on_signal() {
   # The panes it had already sent SIGTERM (term) or seen go (dead) and not yet
   # listed: listed now, so the orchestrator relaunches them (Bugbot on #995).
   for i in "${!p_st[@]}"; do
-    case "${p_st[$i]}" in term|dead) list_pane "$i"; s_stopped=$((s_stopped + 1)) ;; esac
+    case "${p_st[$i]}" in
+      term|dead)
+        # A dead pane stop_sessions had listed already (it was marking it finished) is not listed twice.
+        [ "${p_listed[$i]:-}" = 1 ] || list_pane "$i"
+        s_stopped=$((s_stopped + 1))
+        # --sessions: the pane gets the new PATH all the same, for the
+        # relaunch or resume that follows, once its session is gone and its
+        # shell is back (at most 5 s; Bugbot on #1166).
+        [ -n "$TU_PANE_PATH" ] && pane_exists "${p_sock[$i]}" "${p_pane[$i]}" && pane_path_after_signal "$i" ;;
+    esac
   done
+  # --sessions: its caller reports, with what this had done.
+  if [ "$MODE" = sessions ]; then restart_note="$RESTART(stopped by a signal)"; tu_sessions_out; exit 143; fi
   post_report failed "policy=$POLICY restart=$RESTART stopped by a signal; $(tu_notes) runners=${#runners[@]} panes=${#p_pid[@]} stopped=$s_stopped cut=$s_cut typed=$s_typed"
   exit 143
+}
+
+# ── sessions only (--sessions RESTART DRAIN) ────────────────────────────────
+# Another tool's run moved what this tool's sessions run on: Node's
+# (deploy/termag-node-update) switched nvm's default, so every npm global now
+# runs from a new root, and a session started before still runs the old one,
+# which find_sessions finds as on an old binary.
+# No policy and no install: the caller's restart and drainSec (its run's),
+# this tool's lock, find_sessions and stop_sessions as a run's, and every
+# stopped pane's shell put on the new Node's bin (TU_PANE_PATH) before its
+# resume or relaunch. Nothing is posted: the result is one JSON line on
+# stdout (tu_sessions_out), which the caller's report carries.
+tu_sessions() {
+  local root
+  case "$RESTART" in none|idle|force) ;; *) log "bad restart '$RESTART'"; exit 2 ;; esac
+  [[ "$DRAIN" =~ ^[0-9]{1,4}$ ]] && [ "$DRAIN" -le 3600 ] || { log "bad drain '$DRAIN'"; exit 2; }
+  root=; command -v npm >/dev/null 2>&1 && root=$(npm prefix -g </dev/null 2>/dev/null)
+  # Typed into a shell: a plain absolute path, or nothing.
+  if [ -n "$root" ] && [[ "$root/bin" =~ ^/[A-Za-z0-9/._+-]+$ ]] && [ -d "$root/bin" ]; then TU_PANE_PATH=$root/bin; fi
+  if [ "$RESTART" = none ]; then
+    restart_note=none
+  else
+    tu_lock
+    find_sessions
+    if [ $(( ${#runners[@]} + ${#p_pid[@]} )) -eq 0 ]; then
+      restart_note="$RESTART(nothing on an old binary)"
+    else
+      restart_note=$RESTART
+      stop_sessions
+    fi
+  fi
+  log "sessions ($restart_note): runners=${#runners[@]} runners_left=${runners_left:-0} panes=${#p_pid[@]} agent_panes=$agent_panes other=$other stopped=$s_stopped cut=$s_cut killed=$killed typed=$s_typed resumed=$s_resumed fresh=$s_fresh left=$s_left${TU_PANE_PATH:+ path=$TU_PANE_PATH}"
+  trap - TERM INT HUP
+  tu_sessions_out
+  exit 0
+}
+# The result of --sessions, one line: the component, the restart as it went,
+# the counts in the report's shape, and the stopped panes.
+tu_sessions_out() {
+  local panes
+  panes=$(printf '%s\n' "${panes_json[@]}" | jq -sc '.' 2>/dev/null) || panes='[]'
+  [ "${#panes_json[@]}" -gt 0 ] || panes='[]'
+  jq -nc --arg c "$TU_COMPONENT" --arg r "$restart_note" --argjson panes "$panes" \
+    --argjson stopped "$s_stopped" --argjson resumed "$s_resumed" --argjson fresh "$s_fresh" --argjson cut "$s_cut" \
+    --argjson typed "$s_typed" --argjson other "$other" --argjson left "${runners_left:-0}" \
+    '{component: $c, restart: $r,
+      sessions: {stopped: $stopped, resumed: $resumed, fresh: $fresh, cut: $cut, typed: $typed, other: $other, runnersLeft: $left},
+      panes: $panes}'
 }

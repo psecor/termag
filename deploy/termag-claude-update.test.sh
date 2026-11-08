@@ -292,6 +292,8 @@ EOF
   }
   teardown() { tmux -S "$S" kill-server 2>/dev/null; for p in $(pgrep -f "$OLD/claude"); do kill -KILL "$p" 2>/dev/null; done; sleep 0.3; }
   pane_text() { tmux -S "$S" capture-pane -p -t "$1" 2>/dev/null; }
+  # The same with a long typed line joined back up (a resume after a notice wraps at 200 columns).
+  pane_textj() { tmux -S "$S" capture-pane -pJ -t "$1" 2>/dev/null; }
   pane_cmd() { tmux -S "$S" display -p -t "$1" '#{pane_current_command}' 2>/dev/null; }
   runs() { runrun TERMAG_CLAUDE_KILL_AFTER=2 TERMAG_CLAUDE_RUNNER_WAIT="${RW:-6}" TERMAG_CLAUDE_RESUME_WAIT=2 TERMAG_POLICY_TIMEOUT=5; }
 
@@ -325,6 +327,17 @@ EOF
   [ "$got" = "$want" ] || fail 'force: every stopped pane listed, with hadConversation' "$want" "$got"
   has 'force: a pane with a conversation gets claude --resume typed' "$(pane_text work)" "claude --resume $(uuid 1)"
   has 'force: under CLAUDE_CONFIG_DIR too' "$(pane_text cfgdir)" "claude --resume $(uuid 5)"
+  # The restart notice: a policy with no trigger (an older orchestrator) gives no reason.
+  [ "$(pane_text work | grep -cxF '[termag] Claude Code was updated to 2.1.312; resuming your session.')" = 1 ] \
+    || fail 'force: the notice is printed once, before the resume' 'one notice line' "$(pane_text work)"
+  # A pane with nothing to resume is left at its shell, and says why (Devin on #1223).
+  [ "$(pane_text scratch | grep -cxF '[termag] Claude Code was updated to 2.1.312; its session was stopped, start it again when you need it.')" = 1 ] \
+    || fail 'force: a fresh pane gets the notice, once' 'one notice line' "$(pane_text scratch)"
+  lacks 'force: and no notice in an agent pane (the orchestrator relaunches it with its own)' "$(pane_text alice-proj-agent)" '[termag]'
+  # The report says which line each pane printed, for its chat; an agent pane none.
+  got=$(report '[.panes[] | "\(.session)=\(.notice // "-")"] | sort | join("|")')
+  want="alice-proj-agent=-|alice-proj-ws-agent=-|cfgdir=[termag] Claude Code was updated to 2.1.312; resuming your session.|scratch=[termag] Claude Code was updated to 2.1.312; its session was stopped, start it again when you need it.|stubborn=[termag] Claude Code was updated to 2.1.312; its session was stopped, start it again when you need it.|work=[termag] Claude Code was updated to 2.1.312; resuming your session."
+  [ "$got" = "$want" ] || fail 'force: each pane reports the notice it printed' "$want" "$got"
   [ "$(pane_cmd work)" = sleep ] || fail 'force: the typed resume took (the stub claude --resume runs)' sleep "$(pane_cmd work)"
   for n in scratch alice-proj-agent alice-proj-ws-agent stubborn; do
     lacks "force: nothing typed into $n" "$(pane_text "$n")" 'claude --resume'
@@ -360,6 +373,44 @@ EOF
   got=$(report '[.sessions.stopped, .sessions.cut, .sessions.typed, .sessions.fresh] | join(" ")')
   [ "$got" = '2 0 1 1' ] || fail 'idle: stopped cut typed fresh' '2 0 1 1' "$got; $(report .detail)"
   has 'idle: the busy one is resumed by id' "$(pane_text busy)" "claude --resume $(uuid 11)"
+  teardown
+
+  # The restart notice: one line,
+  # printed once before the typed resume, naming the run's trigger from the
+  # policy. A trigger off the allow-list gives no reason and types nothing of
+  # its own, and restart none types nothing at all.
+  notice_case() {  # notice_case NAME TRIGGER RESTART
+    setup
+    pane "$1" "$(uuid 81)" idle; transcript "$HOME_DIR/.claude" "$WORK/cwd/$1" "$(uuid 81)"
+    wait_sessions 1
+    policy 200 "$3" 2.1.312 0 "$(jq -nc --arg id "$RUN_ID" --arg t "$2" '{id: $id, component: "claude", trigger: $t}')"
+    runs
+  }
+  notice_line() { pane_text "$1" | grep -E '^\[termag\]'; }
+  for t in 'manual:update requested by an admin' 'nightly:automatic nightly run' \
+    'floor:automatic run: below the minimum version' 'resume:automatic run after the box resumed'; do
+    notice_case "n-${t%%:*}" "${t%%:*}" force
+    want="[termag] Claude Code was updated to 2.1.312 (${t#*:}); resuming your session."
+    [ "$(notice_line "n-${t%%:*}")" = "$want" ] || fail "notice: ${t%%:*}" "$want" "$(pane_text "n-${t%%:*}")"
+    [ "$(report '.panes[0].notice')" = "$want" ] || fail "notice: ${t%%:*}: the report has the same line" "$want" "$(report '.panes[0].notice')"
+    has "notice: ${t%%:*}: then the resume" "$(pane_textj "n-${t%%:*}")" "; claude --resume $(uuid 81)"
+    [ "$(pane_cmd "n-${t%%:*}")" = sleep ] || fail "notice: ${t%%:*}: the resume took" sleep "$(pane_cmd "n-${t%%:*}")"
+    teardown
+  done
+  # A hostile trigger: a quote, a command substitution and a newline. None of it is typed.
+  rm -f "$WORK/pwned"
+  notice_case n-hostile "nightly'; touch $WORK/pwned; echo '\$(touch $WORK/pwned)
+x" force
+  [ "$(notice_line n-hostile)" = '[termag] Claude Code was updated to 2.1.312; resuming your session.' ] \
+    || fail 'notice: a trigger off the allow-list gives no reason' 'no reason' "$(pane_text n-hostile)"
+  lacks 'notice: nothing of the hostile trigger is typed' "$(pane_text n-hostile)" 'pwned'
+  [ ! -e "$WORK/pwned" ] || fail 'notice: the hostile trigger ran nothing' 'no file' 'pwned'
+  teardown
+  # restart none: no session is restarted, so no notice.
+  notice_case n-none nightly none
+  lacks 'notice: restart none prints nothing' "$(pane_text n-none)" '[termag]'
+  [ "$(report '[.panes[] | .notice // empty] | length')" = 0 ] || fail 'notice: restart none reports no notice' 0 "$(report '.panes')"
+  [ "$(pane_cmd n-none)" = claude ] || fail 'notice: restart none leaves the session running' claude "$(pane_cmd n-none)"
   teardown
 
   # idle: still busy at drainSec, cut; a runner that ignores SIGTERM is left, never killed.
@@ -433,6 +484,67 @@ EOF
   ! is_running "$nf_pid" || fail 'npm fails, native current: the old pane is stopped' stopped alive
   has 'npm fails, native current: restarts as asked' "$(report .detail)" 'restart=force '
   rm -f "$HOME_DIR/.local/bin/claude"
+  teardown
+
+  # --sessions (a Node update run): no policy,
+  # no install, no report. The Claude Code panes on an old binary are stopped
+  # as restart says, each shell gets the new default's bin first on its PATH
+  # before its resume, and the result is one JSON line on stdout; a busy
+  # session waits for its turn under idle.
+  setup
+  pane work "$(uuid 71)" idle;            transcript "$HOME_DIR/.claude" "$WORK/cwd/work" "$(uuid 71)"
+  pane busy "$(uuid 72)" busy;            transcript "$HOME_DIR/.claude" "$WORK/cwd/busy" "$(uuid 72)"
+  pane alice-proj-agent "$(uuid 73)" idle; transcript "$HOME_DIR/.claude" "$WORK/cwd/alice-proj-agent" "$(uuid 73)"
+  wait_sessions 3
+  busy_pid=$(pid_of_sid "$(uuid 72)")
+  ARGS='--sessions idle 30' run TERMAG_CLAUDE_KILL_AFTER=2 TERMAG_CLAUDE_RUNNER_WAIT=0 TERMAG_CLAUDE_RESUME_WAIT=2 > "$WORK/sessions.json" & rp=$!
+  sleep 4
+  is_running "$busy_pid" || fail '--sessions idle: a session in a turn is not stopped' alive stopped
+  sed -i 's/"status":"busy"/"status":"idle"/' "$HOME_DIR/.claude/sessions/$busy_pid.json"
+  wait "$rp"; got=$?
+  [ "$got" = 0 ] || fail '--sessions: exits 0' 0 "$got: $(tail -3 "$WORK/err")"
+  out=$(tail -n 1 "$WORK/sessions.json")
+  got=$(printf '%s' "$out" | jq -r '[.component, .restart, .sessions.stopped, .sessions.cut, .sessions.typed, .sessions.resumed] | join(" ")')
+  [ "$got" = 'claude idle 3 0 2 2' ] || fail '--sessions: component restart stopped cut typed resumed' 'claude idle 3 0 2 2' "$got; $(tail -3 "$WORK/err")"
+  got=$(printf '%s' "$out" | jq -r '[.panes[] | "\(.session):\(.role):\(.sessionId // "-")"] | sort | join(" ")')
+  want="alice-proj-agent:agent:$(uuid 73) busy:other:$(uuid 72) work:other:$(uuid 71)"
+  [ "$got" = "$want" ] || fail '--sessions: the stopped panes, for the caller'"'"'s report' "$want" "$got"
+  has '--sessions: the new PATH, then the resume' "$(pane_text work)" "export PATH=$WORK/npm/bin:\"\$PATH\"; claude --resume $(uuid 71)"
+  has '--sessions: an agent pane gets the new PATH for its relaunch' "$(pane_text alice-proj-agent)" "export PATH=$WORK/npm/bin:"
+  lacks '--sessions: and nothing more' "$(pane_text alice-proj-agent)" 'claude --resume'
+  [ ! -e "$STATE/curl-calls" ] || fail '--sessions: no policy, no report' 'no orchestrator call' "$(cat "$STATE/curl-calls")"
+  lacks '--sessions: installs nothing' "$(cat "$LOG")" 'npm install'
+  teardown
+
+  # --sessions with its caller's notice (Node's run): printed before the
+  # resume, after the PATH; one that is not safe to type is dropped.
+  for nt in ok hostile; do
+    setup
+    pane "s-$nt" "$(uuid 75)" idle; transcript "$HOME_DIR/.claude" "$WORK/cwd/s-$nt" "$(uuid 75)"
+    wait_sessions 1
+    if [ "$nt" = ok ]; then n='[termag] Node was updated to 22.21.1 (automatic nightly run); resuming your session.'
+    else n="[termag] Node'; touch $WORK/pwned; echo '"; fi
+    rm -f "$WORK/pwned"
+    ARGS='--sessions force 0' run TERMAG_CLAUDE_KILL_AFTER=2 TERMAG_CLAUDE_RUNNER_WAIT=0 TERMAG_CLAUDE_RESUME_WAIT=2 "TERMAG_RESTART_NOTICE=$n" > "$WORK/sessions.json"
+    if [ "$nt" = ok ]; then
+      [ "$(pane_text s-ok | grep -cxF "$n")" = 1 ] || fail '--sessions: the caller'"'"'s notice, once' "$n" "$(pane_text s-ok)"
+      has '--sessions: PATH, notice, resume' "$(pane_textj s-ok)" "\"\$PATH\"; printf '%s\\n' '$n'; claude --resume $(uuid 75)"
+    else
+      lacks '--sessions: an unsafe notice is not typed' "$(pane_text s-hostile)" 'pwned'
+      has '--sessions: the resume all the same' "$(pane_textj s-hostile)" "\"\$PATH\"; claude --resume $(uuid 75)"
+      [ ! -e "$WORK/pwned" ] || fail '--sessions: the unsafe notice ran nothing' 'no file' 'pwned'
+    fi
+    teardown
+  done
+
+  # --sessions none: nothing is stopped.
+  setup
+  pane keep "$(uuid 74)" idle
+  wait_sessions 1; keep_pid=$(pid_of_sid "$(uuid 74)")
+  out=$(ARGS='--sessions none 0' run | tail -n 1)
+  is_running "$keep_pid" || fail '--sessions none: nothing is stopped' alive stopped
+  got=$(printf '%s' "$out" | jq -r '[.restart, .sessions.stopped] | join(" ")')
+  [ "$got" = 'none 0' ] || fail '--sessions none: says so' 'none 0' "$got"
   teardown
 }
 if [ "${1:-}" = --sessions ]; then
@@ -882,6 +994,16 @@ got=$(report '[.sessions.stopped, .sessions.typed, (.panes | length)] | join(" "
 [ "$got" = '0 0 0' ] || fail 'run: restart none stops nothing and lists no pane' '0 0 0' "$got"
 has 'run: the detail says what happened' "$(report .detail)" 'policy=ok restart=none'
 has 'run: the report is logged' "$(cat "$WORK/err")" 'report: posted (updated)'
+# The report's trigger: the run's, from the policy (only an allow-listed one),
+# else manual. The orchestrator's log line names it; the run's row keeps its own.
+for t in nightly floor resume manual; do
+  run_reset; npm_at 2.1.300; policy 200 none 2.1.320 5 "$(jq -nc --arg id "$RUN_ID" --arg t "$t" '{id: $id, component: "claude", trigger: $t}')"
+  runrun
+  [ "$(report .trigger)" = "$t" ] || fail "run: a $t run reports trigger $t" "$t" "$(report .trigger)"
+done
+run_reset; npm_at 2.1.300; policy 200 none 2.1.320 5 "$(jq -nc --arg id "$RUN_ID" '{id: $id, component: "claude", trigger: "boot\"; rm -rf /"}')"
+runrun
+[ "$(report .trigger)" = manual ] || fail 'run: a trigger off the allow-list reports manual' manual "$(report .trigger)"
 # At the target: nothing installed again, outcome current.
 run_reset; npm_at 2.1.320; policy 200 none 2.1.320
 runrun; got=$?

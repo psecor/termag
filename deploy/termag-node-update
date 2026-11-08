@@ -39,6 +39,13 @@
 #      and its bin links (no registry, no install script: the same major
 #      keeps the native-module ABI), and verifies each: its package.json, and
 #      the tool's own --version for Claude Code, Codex and pi.
+#      corepack's shims (pnpm, pnpx, yarn, yarnpkg: `corepack enable`'s
+#      links, no npm global) are linked in it by its own corepack, with the
+#      network off, each the default should have and the root has no
+#      command for; a command that is not corepack's is never replaced. A
+#      default that lost some to an earlier switch, or to a repair that did
+#      not finish, gets them back first, per command, from another installed
+#      Node that has them (the image's), on any run.
 #   7. Only then renames the staging directory to versions/node/v<x.y.z> (one
 #      rename), checks the tools again from there, and sets nvm's default
 #      to it.
@@ -48,16 +55,29 @@
 #      cloud session is live. It checks that the agent runs the new Node; if
 #      it does not, the default goes back to the old version and the agent is
 #      restarted on it.
-#   9. POST <orchestrator>/api/tool-update/report: {component: "node", ...}.
+#   9. Once the switch stands, stops and resumes the sessions of the tools
+#      that run on Node, as the run's restart says (below).
+#  10. POST <orchestrator>/api/tool-update/report: {component: "node", ...},
+#      with those sessions' counts and stopped panes.
 #
 # On any failure before the switch the staging directory is removed and nothing
 # else changed; after it, the old default is put back. The old Node is never
 # removed, so a session on it keeps running.
 #
-# Sessions: none are stopped in this version.
-# Running panes, the MCP servers under them and the agent's
-# children keep the old Node, which stays installed; whatever starts after the
-# switch gets the new one. The report counts the pane processes still on it.
+# Sessions: a session started before the switch
+# runs the old Node and the old npm global root, and the MCP servers under it
+# with it. With restart none they keep running there, and whatever starts
+# after the switch gets the new one. With idle or force (the run's restart,
+# its drainSec), each npm global tool whose updater knows its sessions,
+# Claude Code (termag-claude-update), Codex (termag-codex-update) and pi
+# (termag-pi-update), is run beside this one as `--sessions <restart>
+# <drainSec>`, at once: each finds its own sessions on a binary that is no
+# longer its current one (the old root's), stops them as its own run would
+# (idle: out of a turn, at drainSec cut; force: now), gives each stopped
+# pane's shell the new default's bin first on its PATH, and resumes it or
+# lists it for the orchestrator to relaunch. Sessions of every other tool are
+# never touched. Their counts and panes go into this run's report; the report
+# also counts the pane processes still on the old Node.
 #
 # What is still trusted: Node's release keys, pinned as above, as the image's
 # `nvm install` trusts nodejs.org; the npm registry for the globals' exact
@@ -88,6 +108,8 @@
 #                                 and token (default: the agent's search order)
 #   TERMAG_POLICY_TIMEOUT         seconds for each orchestrator call (default 20)
 #   TERMAG_NODE_PINNED            the release key fingerprints (tests only)
+#   TERMAG_NODE_TOOLS_DIR         where the tools' updaters are, for their
+#                                 sessions (default: beside this script)
 
 set -u
 PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/usr/bin:/bin"
@@ -134,9 +156,10 @@ case "${1:-}" in
 esac
 BUDGET="${TERMAG_NODE_BUDGET:-1200}"
 POLICY_TIMEOUT="${TERMAG_POLICY_TIMEOUT:-20}"
-# No sessions are stopped (see the header).
+# This run stops no session itself: each tool's updater does (see the header).
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 KILL_AFTER=0 RUNNER_WAIT=0 RESUME_WAIT=0
+TOOLS_DIR="${TERMAG_NODE_TOOLS_DIR:-$(dirname "$(readlink -f "$0")")}"
 for n in "${LOCK_WAIT:-0}" "$INSTALL_TIMEOUT" "$BUDGET" "$POLICY_TIMEOUT" "$AGENT_WAIT"; do
   case "$n" in ''|*[!0-9]*) log "bad number '$n' in the environment"; exit 2 ;; esac
 done
@@ -156,10 +179,14 @@ tu_fetch_policy
 [ "$FLOOR_ONLY" = 1 ] && log "no policy from the orchestrator ($POLICY); Node has no fallback floor"
 if [ "$POLICY" = ok-no-run ]; then log "the orchestrator did not start run $RUN_ID; installing nothing"; FLOOR_ONLY=1 FLOOR=; fi
 
-inst_note=- glob_note=- agent_note=- left_on_old=0
-tu_notes() { printf 'node=%s globals=%s agent=%s left_on_old_node=%s' "$inst_note" "$glob_note" "$agent_note" "$left_on_old"; }
-tu_notes_all() { printf '%s %s %s' "$inst_note" "$glob_note" "$agent_note"; }
-# Sessions are left on the old Node (see the header): counted, never stopped.
+inst_note=- glob_note=- agent_note=- left_on_old=0 sess_note=- shim_note=-
+tu_notes() { printf 'node=%s globals=%s agent=%s sessions=%s left_on_old_node=%s corepack=%s' "$inst_note" "$glob_note" "$agent_note" "$sess_note" "$left_on_old" "$shim_note"; }
+# A tool whose sessions failed (sess_note's FAILED), or corepack's shims that
+# did not come back on the default (shim_note's), makes an updated run partial.
+tu_notes_all() { printf '%s %s %s %s %s' "$inst_note" "$glob_note" "$shim_note" "$agent_note" "$sess_note"; }
+# The lib finds none of its own: the tools' updaters stop them (node_sessions).
+# shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
+TU_NO_SESSIONS_NOTE='by each tool, see sessions='
 find_sessions() { :; }
 tu_status() { printf idle; }
 tu_had() { return 1; }
@@ -187,7 +214,7 @@ tu_resolve_tag() {
 
 # ── the release, verified before anything is unpacked ───────────────────────
 WORK='' STAGE=''
-cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; [ -n "$STAGE" ] && [ -d "$STAGE" ] && rm -rf "$STAGE"; }
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; [ -n "$STAGE" ] && [ -d "$STAGE" ] && rm -rf "$STAGE"; [ -n "${SCRATCH:-}" ] && rm -rf "$SCRATCH"; }
 # in_use DIR: a live process runs from DIR (its executable is in it). /proc
 # names an executable by its canonical path, so DIR is resolved first: a link
 # in $HOME or $NVM_DIR must not hide one (Bugbot on #1113).
@@ -316,6 +343,92 @@ copy_globals() {
   done
 }
 
+# ── corepack's shims ────────────────────────────────────────────────────────
+# `corepack enable` (the image runs it, packer/scripts/setup.sh) links pnpm,
+# pnpx, yarn and yarnpkg in a Node's bin to that Node's own corepack. They are
+# no npm global, so copy_globals does not move them (it skips links into
+# corepack): a switch without them left the new default with no pnpm, and
+# webapp's `make dev` failing on `pnpm: command not found`. The package
+# managers themselves are in corepack's cache (~/.cache/node/corepack), which
+# every Node version shares; enabling the shims downloads nothing.
+SHIM_NAMES='pnpm pnpx yarn yarnpkg'
+# is_shim ROOT NAME: ROOT/bin/NAME is corepack's shim for NAME, and resolves.
+is_shim() { case "$(readlink "$1/bin/$2" 2>/dev/null)" in */node_modules/corepack/dist/"$2".js) [ -e "$1/bin/$2" ] ;; *) return 1 ;; esac; }
+# shims ROOT: the shims ROOT's bin has, as corepack enable links them.
+shims() {
+  local b out=''
+  for b in $SHIM_NAMES; do is_shim "$1" "$b" && out+="${out:+ }$b"; done
+  printf '%s' "$out"
+}
+# has_cmd ROOT NAME: ROOT/bin has a working NAME. corepack's shim, or any
+# command that is not corepack's (an npm global's pnpm, say, installed when the
+# shims were lost): that one is the owner's, and never replaced (Devin on
+# #1224). A link into corepack that no longer resolves is corepack's, and not
+# one. Nor is anything that doesn't resolve to an executable file: a dangling
+# link (its npm global gone) or a file without the x bit runs nothing, so the
+# repair replaces it; a directory stays in the way.
+has_cmd() {
+  local f=$1/bin/$2
+  is_shim "$1" "$2" && return 0
+  case "$(readlink "$f" 2>/dev/null)" in */node_modules/corepack/dist/*) return 1 ;; esac
+  [ -f "$f" ] && [ -x "$f" ]
+}
+# want_shims ROOT: the shims a Node at ROOT should have: ROOT's own, and those
+# of the newest other installed version that has any (the image's 24.22.1
+# stays installed), so a default an earlier run switched to without them, or
+# left with some of them, gets the rest back (the repair, below). None
+# anywhere: none.
+want_shims() {
+  local d own donor='' b out=''
+  own=$(shims "$1")
+  while IFS= read -r d; do
+    [ "$d" != "$1" ] && [ -x "$d/bin/node" ] || continue
+    donor=$(shims "$d"); [ -z "$donor" ] || break
+  done < <(for d in "$VERS"/v*; do [ -d "$d" ] && printf '%s\n' "$d"; done | sort -rV)
+  for b in $SHIM_NAMES; do
+    case " $own $donor " in *" $b "*) out+="${out:+ }$b" ;; esac
+  done
+  printf '%s' "$out"
+}
+# missing_shims ROOT WANT: the names of WANT that ROOT/bin has no command for,
+# each on its own: one that failed before is tried again (Devin on #1224).
+missing_shims() {
+  local b out=''
+  for b in $2; do has_cmd "$1" "$b" || out+="${out:+ }$b"; done
+  printf '%s' "$out"
+}
+# add_shims ROOT NAMES: corepack's shims for NAMES in ROOT/bin, and nothing
+# else there touched. corepack enable links both of a package manager's
+# commands (pnpm and pnpx) over whatever is there, so ROOT's corepack, run on
+# ROOT's node with the network off (it needs none), links them in a scratch
+# directory beside ROOT/bin, where they read as they would in it
+# (../lib/node_modules/corepack/dist/<name>.js), and only NAMES are moved in.
+# Each name is linked and checked on its own: one that cannot be (something
+# in its way) fails the call, and the others stand.
+SCRATCH=''
+add_shims() {
+  local root=$1 names=$2 pms='' b rc=0
+  case " $names " in *' pnpm '*|*' pnpx '*) pms+=' pnpm' ;; esac
+  case " $names " in *' yarn '*|*' yarnpkg '*) pms+=' yarn' ;; esac
+  [ -n "$pms" ] || return 0
+  SCRATCH=$(mktemp -d "$root/.termag-corepack.XXXXXX") || { log "cannot create a scratch directory in $root"; SCRATCH=''; return 1; }
+  # shellcheck disable=SC2086  # pms: one word per package manager
+  if ! run_capped "$(left 60)" env PATH="$root/bin:$PATH" COREPACK_ENABLE_NETWORK=0 COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    "$root/bin/corepack" enable --install-directory "$SCRATCH" $pms </dev/null >/dev/null 2>&1; then
+    log "corepack enable$pms failed under $root"; rm -rf "$SCRATCH"; SCRATCH=''; return 1
+  fi
+  for b in $names; do
+    if [ "$(readlink "$SCRATCH/$b" 2>/dev/null)" != "../lib/node_modules/corepack/dist/$b.js" ]; then
+      log "corepack enable did not link $b under $root"; rc=1; continue
+    fi
+    # missing_shims said nothing is there but a stale shim of corepack's:
+    # that is replaced, a directory in the way is not (mv -T refuses it).
+    { mv -fT "$SCRATCH/$b" "$root/bin/$b" 2>/dev/null && is_shim "$root" "$b"; } || { log "could not link corepack's $b in $root/bin"; rc=1; }
+  done
+  rm -rf "$SCRATCH"; SCRATCH=''
+  return "$rc"
+}
+
 # ── the agent ───────────────────────────────────────────────────────────────
 live_runner_sessions() { tmux list-sessions -F '#S' 2>/dev/null | grep -E -- '-claude-runner-s[0-9]+-[A-Za-z0-9][A-Za-z0-9_-]*-r$' || true; }
 # Why the agent may not be restarted now, or nothing.
@@ -360,6 +473,72 @@ count_on() {
   printf '%s' "$n"
 }
 
+# ── the sessions on the old Node ────────────────────────────────────────────
+# Each npm global tool whose updater knows its sessions: its package.
+session_pkg() {
+  case "$1" in
+    claude) printf @anthropic-ai/claude-code ;;
+    codex) printf @openai/codex ;;
+    pi) printf @earendil-works/pi-coding-agent ;;
+  esac
+}
+sess_pids=() sess_tools=()
+# node_sessions LIST: every tool of LIST's run as `--sessions` at once, each
+# in the background with its result in $WORK, then node_sessions_collect.
+node_sessions() {
+  local list=$1 t notice
+  # The line each resumed pane prints before its resume: Node's, as this
+  # run's trigger and new version make it (the lib's tu_notice); each
+  # tool's --sessions checks it again before it types it.
+  notice=$(tu_notice "$spec_v")
+  # The switch is done: the tools' own locks go back, for the updaters
+  # started here to take (each holds its own while it stops its sessions).
+  exec 6>&- 7>&- 8>&-
+  for t in claude codex pi; do
+    # Only a tool the box has as an npm global (the list the switch moved).
+    cut -d ' ' -f 1 <<< "$list" | grep -qxF -- "$(session_pkg "$t")" || continue
+    if [ ! -x "$TOOLS_DIR/termag-$t-update" ]; then log "no $TOOLS_DIR/termag-$t-update; $t's sessions stay on Node $have"; sess_tools+=("$t:missing"); continue; fi
+    log "$t: its sessions on Node $have, restart $RESTART (drain ${DRAIN}s)"
+    TERMAG_RESTART_NOTICE=$notice "$TOOLS_DIR/termag-$t-update" --sessions "$RESTART" "$DRAIN" </dev/null >"$WORK/sessions-$t.json" &
+    sess_pids+=("$!") sess_tools+=("$t")
+  done
+  [ "${#sess_pids[@]}" -eq 0 ] || wait "${sess_pids[@]}"
+  node_sessions_collect
+}
+# The tools' results into the run's counts and panes (the lib's report reads
+# them), and sess_note: per tool its restart and what it stopped.
+node_sessions_collect() {
+  local t f line n note=''
+  for t in "${sess_tools[@]}"; do
+    case "$t" in *:missing) note+="${note:+,}${t%:missing}=missing"; continue ;; esac
+    f=$WORK/sessions-$t.json
+    line=$(tail -n 1 "$f" 2>/dev/null)
+    if ! printf '%s' "$line" | jq -e --arg c "$t" '.component == $c and (.sessions | type) == "object" and (.panes | type) == "array"' >/dev/null 2>&1; then
+      note+="${note:+,}$t=FAILED"; continue
+    fi
+    # shellcheck disable=SC2046  # seven counts, one word each
+    set -- $(printf '%s' "$line" | jq -r '.sessions | [.stopped, .resumed, .fresh, .cut, .typed, .other, .runnersLeft] | map(if type == "number" and . >= 0 then floor else 0 end) | map(tostring) | join(" ")')
+    s_stopped=$((s_stopped + $1)) s_resumed=$((s_resumed + $2)) s_fresh=$((s_fresh + $3)) s_cut=$((s_cut + $4)) s_typed=$((s_typed + $5)) other=$((other + $6)) runners_left=$((${runners_left:-0} + $7))
+    # Only panes in the report's shape: the orchestrator refuses a whole
+    # report over one that is not (run.ts, parsePanes). A pane's notice (the
+    # line the tool printed there, for its chat) is kept only when it is one
+    # TU_NOTICE_SAFE would pass, else left out (Devin on #1301).
+    while IFS= read -r n; do
+      [ -n "$n" ] && [ "${#panes_json[@]}" -lt 200 ] && panes_json+=("$n")
+    done < <(printf '%s' "$line" | jq -c '.panes[] | select(type == "object" and (.session | type) == "string"
+      and (.session | test("^[^\\s:.[:cntrl:]]{1,200}$")) and (.role == "agent" or .role == "other")
+      and (.hadConversation | type) == "boolean" and ((.sessionId // "") | type == "string" and test("^[A-Za-z0-9-]{0,100}$")))
+      | {session, role, hadConversation} + (if (.sessionId // "") != "" then {sessionId} else {} end)
+      + (if (.notice | type) == "string" and (.notice | test("^\\[termag\\] [][A-Za-z0-9 .,;:()_+-]{1,191}$")) then {notice} else {} end)' 2>/dev/null)
+    note+="${note:+,}$t=$(printf '%s' "$line" | jq -r '.restart | tostring | .[0:80] | gsub("[^A-Za-z0-9()=.-]"; "_")'):stopped=$1:typed=$5:resumed=$2"
+    # A tool that restarted nothing though this run asked (its lock held by
+    # its own update, which took it after the switch): its sessions stay on
+    # the old Node, so the run is partial (Devin on #1166).
+    if [ "$RESTART" != none ] && printf '%s' "$line" | jq -e '.restart | tostring | startswith("none")' >/dev/null 2>&1; then note+=":FAILED"; fi
+  done
+  sess_note=${note:--}
+}
+
 # Where the run is, for a signal: after the rename and before the switch the
 # new version is moved aside, and mid-switch the default goes back to the old
 # one first; after the switch and before the agent runs it,
@@ -376,6 +555,8 @@ node_on_signal() {
       nvm_set_default "$have" || log "stopped mid-switch, and nvm did not take $have back"
       [ "$(nvm_default)" = "$spec_v" ] || { mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null && log "stopped mid-switch; $have is the default again, $spec_v moved aside"; } ;;
     switched) reject node "stopped before the agent ran Node $spec_v" ;;
+    # The tools' updaters stop where they are and say what they had done.
+    sessions) [ "${#sess_pids[@]}" -eq 0 ] || { kill -TERM "${sess_pids[@]}" 2>/dev/null; wait "${sess_pids[@]}" 2>/dev/null; }; node_sessions_collect ;;
   esac
   on_signal
 }
@@ -428,6 +609,21 @@ if [ -z "$have" ] || [ ! -x "$VERS/v$have/bin/node" ]; then
   finish
 fi
 a=$(arch) || { inst_note="$have->FAILED"; log "no Node build for $(uname -m)"; finish; }
+# The repair: each of corepack's shims the default should have (its own, and
+# the newest other installed Node's, the image's) and has no command for, from
+# a switch before they were carried over or a repair that did not finish, is
+# linked in place, on any run, a newer Node due or not (Devin on #1224).
+shim_want=$(want_shims "$VERS/v$have")
+shim_miss=$(missing_shims "$VERS/v$have" "$shim_want")
+if [ -n "$shim_miss" ]; then
+  if add_shims "$VERS/v$have" "$shim_miss"; then
+    shim_note="repaired:${shim_miss// /+}"
+    log "Node $have, the default, lacked corepack's $shim_miss; linked them, as another installed Node has them"
+  else
+    shim_note=FAILED
+    log "Node $have, the default, lacks corepack's $shim_miss and not all of them linked ($(missing_shims "$VERS/v$have" "$shim_miss") still missing); the next run tries those again"
+  fi
+fi
 
 # shellcheck disable=SC2034  # read by termag-tool-update-lib, which this sources
 want=$FLOOR
@@ -508,6 +704,15 @@ if ! copy_globals "$STAGE" "$list" "$VERS/v$have" || ! check_globals "$STAGE" "$
   log "the npm globals did not all copy and verify under Node $spec_v; nothing changed, Node $have stays the default"
   finish
 fi
+# corepack's shims the default should have (none: none), each the staging
+# root has no command for: an npm global's pnpm copied above stays.
+stage_miss=$(missing_shims "$STAGE" "$shim_want")
+if [ -n "$stage_miss" ] && ! add_shims "$STAGE" "$stage_miss"; then
+  inst_note="$have->FAILED" shim_note=FAILED
+  log "corepack's shims ($stage_miss) did not all link under Node $spec_v; nothing changed, Node $have stays the default"
+  finish
+fi
+[ -z "$stage_miss" ] || [ "$shim_note" != - ] || shim_note=${stage_miss// /+}
 if [ "$(runtime_sum "$STAGE")" != "$runtime" ]; then
   inst_note="$have->FAILED:runtime-changed" glob_note=FAILED
   log "copying the npm globals changed Node $spec_v's own files (bin/node, npm, corepack or their links); nothing changed, Node $have stays the default"
@@ -528,6 +733,13 @@ if ! check_globals "$VERS/v$spec_v" "$list" || [ "$(runtime_sum "$VERS/v$spec_v"
   mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null
   inst_note="$have->FAILED" glob_note=FAILED
   log "the npm globals did not verify from $VERS/v$spec_v; moved aside, Node $have stays the default"
+  finish
+fi
+# The shims, relative links into its own corepack, still there from it.
+if [ -n "$(missing_shims "$VERS/v$spec_v" "$shim_want")" ]; then
+  mv -T "$VERS/v$spec_v" "$VERS/.termag-rejected-v$spec_v-$$" 2>/dev/null
+  inst_note="$have->FAILED" shim_note=FAILED
+  log "corepack's $(missing_shims "$VERS/v$spec_v" "$shim_want") not linked in $VERS/v$spec_v; moved aside, Node $have stays the default"
   finish
 fi
 # A version this run put in place and then backed out of is moved aside, so a
@@ -587,6 +799,12 @@ fi
 PHASE=''
 inst_note="$have->$spec_v"
 accept node
+# 9. The sessions on the old Node, as the run's restart says.
+if [ "$RESTART" != none ]; then
+  PHASE=sessions
+  node_sessions "$list"
+  PHASE=''
+fi
 left_on_old=$(count_on "$have")
 [ "$left_on_old" = 0 ] || log "$left_on_old pane process(es) still run Node $have, which stays installed; they move at their next start"
 finish

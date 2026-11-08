@@ -136,6 +136,17 @@
 #   termag-claude-update --run <run-id>     one orchestrator run: the policy,
 #                                           the install, the sessions, the
 #                                           report; what the run unit runs
+#   termag-claude-update --sessions <none|idle|force> <drainSec>
+#                                           only --run's step 3, for a Node
+#                                           update run (below)
+#
+# --sessions: no policy, no install and no
+# report. termag-node-update runs it once it has switched nvm's default, so
+# the npm global's claude is a new one under a new root: --run's step 3 with
+# the restart and drainSec given, each stopped pane's shell first given the
+# new default's bin on its PATH, and the result as one JSON line on stdout for
+# the node run's report. A native ~/.local/bin/claude is not on Node, so its
+# sessions are current and left alone.
 #
 # Exit codes: 0 when the runner's claude is at or above the floor (or --boot
 # has no floor to apply), 1 when it is below it or there is no claude, 2 on bad
@@ -200,15 +211,17 @@ TU_LIB=$(dirname "$(readlink -f "$0")")/termag-tool-update-lib
 # shellcheck source=deploy/termag-tool-update-lib
 . "$TU_LIB" || { printf 'termag-claude-update: cannot read %s\n' "$TU_LIB" >&2; exit 1; }
 
-usage() { log "usage: termag-claude-update --ensure <x.y.z> | --boot | --run <run-id>"; exit 2; }
+usage() { log "usage: termag-claude-update --ensure <x.y.z> | --boot | --run <run-id> | --sessions <none|idle|force> <drainSec>"; exit 2; }
 
 MODE='' FLOOR='' RUN_ID=''
+# shellcheck disable=SC2034  # RESTART, DRAIN: read by termag-tool-update-lib's tu_sessions
 case "${1:-}" in
   --ensure) MODE=ensure; FLOOR=${2:-}; is_version "$FLOOR" || usage; [ $# -eq 2 ] || usage ;;
   --boot) MODE=boot; [ $# -eq 1 ] || usage ;;
   # The run id names the systemd instance and goes into a URL and a report:
   # the orchestrator's id pattern, nothing a shell or a URL would read.
   --run) MODE=run; RUN_ID=${2:-}; [[ "$RUN_ID" =~ ^[a-z0-9]{20,40}$ ]] || usage; [ $# -eq 2 ] || usage ;;
+  --sessions) MODE=sessions; RESTART=${2:-} DRAIN=${3:-}; [ $# -eq 3 ] || usage ;;
   -h|--help) awk 'NR > 1 && /^set -u$/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) usage ;;
 esac
@@ -391,7 +404,10 @@ tu_status() { sess "${p_pid[$1]}" status; }
 tu_had() { had_conversation "${p_cfg[$1]}" "${p_cwd[$1]}" "$2"; }
 tu_resume_line() { printf 'claude --resume %s' "$1"; }
 
-[ "$MODE" = run ] && trap on_signal TERM INT HUP
+case "$MODE" in run|sessions) trap on_signal TERM INT HUP ;; esac
+
+# Only the sessions, for a Node update run (see the header).
+[ "$MODE" = sessions ] && tu_sessions
 
 tu_lock
 expire_stale

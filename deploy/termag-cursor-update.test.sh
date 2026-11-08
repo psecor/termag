@@ -516,6 +516,19 @@ for d in 2026.09.01-1111111 ".$OLD.replaced-99" ".$OLD.rejected-98" .tmp-termag-
   [ ! -e "$VERSIONS/$d" ] || fail "prune: $d goes" absent present
 done
 [ -d "$VERSIONS/2026.09.02-2222222" ] || fail 'prune: a build a process runs from stays' present absent
+# The versions directory reached through a link ($HOME a symlink): /proc and
+# the links name builds by their canonical paths, so the prune compares
+# canonical paths. The build a process runs from and the one that ran stay.
+ln -sfn "$HOME_DIR" "$WORK/home-link"
+reset; installed "$OLD"; policy 200 none "$NEW"
+for d in 2026.09.01-1111111 2026.09.02-2222222; do mkdir -p "$VERSIONS/$d"; done
+cp "$(command -v sleep)" "$VERSIONS/2026.09.02-2222222/node"; busy_pid=$( { "$VERSIONS/2026.09.02-2222222/node" 30 </dev/null >/dev/null 2>&1 & echo "$!"; } )
+run HOME="$WORK/home-link"; got=$?
+kill "$busy_pid" 2>/dev/null
+[ "$got" = 0 ] || fail 'prune via a symlink: exits 0' 0 "$got: $(tail -3 "$WORK/err")"
+[ -d "$VERSIONS/2026.09.02-2222222" ] || fail 'prune via a symlink: a build a process runs from stays' present absent
+[ -d "$VERSIONS/$NEW" ] && [ -d "$VERSIONS/$OLD" ] || fail 'prune via a symlink: the new build and the one that ran stay' "$NEW $OLD" "$(ls -a "$VERSIONS")"
+[ ! -e "$VERSIONS/2026.09.01-1111111" ] || fail 'prune via a symlink: an unused build still goes' absent present
 # A failed install prunes nothing.
 reset; installed "$OLD"; policy 200 none "$NEW"; mkdir -p "$VERSIONS/2026.09.01-1111111"; : > "$STATE/dl-fail"
 run

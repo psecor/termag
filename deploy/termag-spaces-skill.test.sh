@@ -63,15 +63,14 @@ got="$(grep -inE 'once per session|(check|run) `termag space ls` (first|before)|
 has 'a failed command is handled when it happens: tell the user, share another way' "$body" \
   'Use spaces directly' '## When a command fails' "Don't retry the same command" \
   'tell the user the reason' 'share the file another way' \
-  '| 3 | `Not found` |' '| 1 | `A box cannot manage spaces; …` |' \
-  '| 1 | `Sharing spaces with other people is not turned on for you yet` |' '| 4 | `Not signed in …`'
+  '| 3 | `Not found` |' '| 1 | `A box cannot manage spaces; …` |' '| 4 | `Not signed in …`'
 # Every message the table quotes is one the CLI or the orchestrator prints.
 for msg in 'Not found' 'You reach no spaces' 'this needs ' 'is read-only' 'A box cannot manage spaces' \
-  'Sharing spaces with other people is not turned on for you yet' 'is over its quota' \
+  'is over its quota' \
   'Files are limited to 5 GiB' 'Not signed in' "refused the CLI's credential" 'Nothing at '; do
   case "$body" in *"$msg"*) ;; *) fail "the failure table quotes: $msg" "$msg" '(missing from the skill)' ;; esac
-  grep -rqF -- "$msg" "$here/../cli/src" "$here/../backend/src/routes/spaces.ts" \
-    || fail "the CLI or backend still prints: $msg" "$msg" '(not in cli/src or routes/spaces.ts)'
+  grep -rqF -- "$msg" "$here/../cli/src" "$here/../backend/src/routes/spaces.ts" "$here/../backend/src/services/spaces" \
+    || fail "the CLI or backend still prints: $msg" "$msg" '(not in cli/src, routes/spaces.ts or services/spaces/)'
 done
 has 'sharing a space with a teammate: least role, a person manages, only who the user named' "$body" \
   '## Sharing a space with a teammate' 'termag space members team add ana@example.com viewer' \

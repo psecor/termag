@@ -26,8 +26,8 @@
 #   Each user then adds https://mcp.slack.com/mcp as an OAuth connector in
 #   Settings → MCP servers and links it with their own Slack account.
 #
-# For a local dev app, change `name`/`display_name` and the command (e.g. /tdev),
-# and set SLACK_COMMAND to match. Never reuse the production app's tokens
+# For a local dev app, change `name`/`display_name` and both commands (e.g. /tdev
+# and /termagdev), and set SLACK_COMMAND and SLACK_COMMAND_ALIAS to match. Never reuse the production app's tokens
 # locally: Slack hands each Socket Mode event to one of the app's connections,
 # so a laptop backend would take some of production's /t commands.
 #
@@ -51,6 +51,21 @@ features:
       description: termag terminal / agent control
       usage_hint: "help | <text> | ctrl <text> | projects | switch <project>"
       should_escape: false
+    # An alias of /t: the same handler and parser.
+    - command: /termag
+      description: termag terminal / agent control (same as /t)
+      usage_hint: "help | link <space> | unlink | space | <text>"
+      should_escape: false
+  # Message shortcuts (§7).
+  shortcuts:
+    - name: Link channel to a space
+      type: message
+      callback_id: link_to_space
+      description: Link this channel to one of your termag spaces
+    - name: Save to space
+      type: message
+      callback_id: save_to_space
+      description: Save this message's files to a termag space
 
 oauth_config:
   # The MCP broker's OAuth callback (deploy notes above): <FRONTEND_URL><BASE_PATH>/api/mcp-connectors/oauth/callback.
@@ -65,7 +80,8 @@ oauth_config:
       - channels:read
       # Read replies under collaboration cards in channels.
       - channels:history
-      # Join an existing #proj-… channel whose name is taken (slack/channels.ts).
+      # Join an existing #proj-… channel whose name is taken (slack/channels.ts),
+      # and a public channel an owner links to a space (services/spaceSlack/link.ts).
       - channels:join
       - commands
       - im:history
@@ -76,6 +92,17 @@ oauth_config:
       - reactions:write
       - users:read
       - users:read.email
+      # Spaces in Slack. Private space channels:
+      # info, members, and conversations.list of the private channels termag is in.
+      - groups:read
+      # Read space-thread replies in private channels.
+      - groups:history
+      # Create a private space channel, and invite people to it.
+      - groups:write
+      # Attach files to replies, and Save to space.
+      - files:write
+      # Slack agent sessions (slack/agentSession.ts).
+      - assistant:write
     # Slack's MCP server acts as the user who linked it. termag asks for every
     # scope its protected-resource metadata lists (scopes_supported, the same
     # list as Slack's per-tool table at docs.slack.dev/ai/mcp-server), so all of
@@ -125,6 +152,23 @@ settings:
       - message.channels
       - message.im
       - reaction_added
+      # Spaces in Slack (§4.7): private
+      # space-channel threads, and keeping links current.
+      - message.groups
+      - member_joined_channel
+      - member_left_channel
+      - channel_left
+      - group_left
+      - channel_archive
+      - group_archive
+      - channel_unarchive
+      - group_unarchive
+      - channel_rename
+      - group_rename
+      - channel_shared
+      # Slack agent sessions: Stop, and the DM context signal.
+      - agent_session_stopped
+      - app_context_changed
   interactivity:
     is_enabled: true
   socket_mode_enabled: true

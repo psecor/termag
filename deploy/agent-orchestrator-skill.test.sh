@@ -172,7 +172,7 @@ for flag in '--no-wait' '--inbox' '--thread' '--new-box' '--from'; do
 done
 
 # Boxes get it the way they get agent-ask.
-grep -qxF 'claude-skills/agent-orchestrator/SKILL.md:$HOME/.claude/skills/agent-orchestrator/SKILL.md:644:file:noenable' "$here/termag-reconcile" \
+grep -qxF 'claude-skills/agent-orchestrator/SKILL.md:$HOME/.claude/skills/agent-orchestrator/SKILL.md:644:file:noenable:feature' "$here/termag-reconcile" \
   || fail 'termag-reconcile installs the skill' 'an artifacts row for claude-skills/agent-orchestrator/SKILL.md' '(missing)'
 
 [ "$failed" = 0 ] && echo 'agent-orchestrator skill: ok'

@@ -442,8 +442,12 @@ build {
     destination = "/tmp/rewrite-home-paths.sh"
   }
   provisioner "shell" {
-    script  = "${path.root}/scripts/index-home-paths.sh"
-    timeout = "10m"
+    script = "${path.root}/scripts/index-home-paths.sh"
+    // 30 rather than 10 minutes: since the scan dirs are read through sudo,
+    // the walk reads every file under them, and an incremental bake, whose
+    // volume is restored lazily from the source image, took 507 s of the 600;
+    // a full bake ran past them. Real bakes take 35-70 minutes.
+    timeout = "30m"
   }
 
   // NitroTPM re-register. amazon-ebs bakes the image via CreateImage (no

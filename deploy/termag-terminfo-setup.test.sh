@@ -87,7 +87,8 @@ for f in setup.sh refresh-box.sh; do
   grep -qx 'install_terminfo' "$PACKER/$f" || fail "$f installs the terminfo" install_terminfo missing
 done
 grep -q 'kitty-terminfo' "$PACKER/setup.sh" || fail 'the full bake installs kitty-terminfo' kitty-terminfo missing
-grep -qx 'reconcile_terminfo' "$HERE/termag-reconcile" || fail 'termag-reconcile runs it' reconcile_terminfo missing
+# A classified step: core, so a box with termag setup off gets it too.
+grep -qx 'reconcile_terminfo:core' "$HERE/termag-reconcile" || fail 'termag-reconcile runs it, as a core step' reconcile_terminfo:core missing
 
 if [ "$failures" -eq 0 ]; then
   echo 'PASS: install, idempotence, --check, alias drift, sha256 pin, bake and reconcile wiring'

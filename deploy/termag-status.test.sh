@@ -217,6 +217,31 @@ got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cd repo && ~/.loca
 got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cat deploy/termag-pr-create"},"tool_response":"https://github.com/org/repo/pull/174"}')"
 [ -z "$got" ] || fail 'reading termag-pr-create is not a milestone' '' "$got"
 
+# --- --edit-of: PostToolUse payload → the edited directory -------------------
+# Pure apart from git: the top two directories of a written file's path in its
+# checkout, never the file or the rest of the path.
+edit_of() { printf '%s' "$1" | HOME="$WORK/empty-home" "$SCRIPT" --edit-of; }
+ER="$WORK/edit-repo"; git init -q "$ER"; mkdir -p "$ER/verifiers/billing/deep"; ln -s "$ER" "$WORK/edit-link"
+SID=818686a7-4ce0-440a-ae11-522472afeecd
+got="$(edit_of "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$ER/verifiers/billing/deep/secret-name.py\"},\"session_id\":\"$SID\"}")"
+[ "$got" = "Write verifiers/billing $SID" ] || fail 'a write names the top two directories and the session' "Write verifiers/billing $SID" "$got"
+got="$(edit_of "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ER/README.md\"}}")"
+[ "$got" = 'Edit . -' ] || fail 'a file at the checkout top is ., and no session is -' 'Edit . -' "$got"
+got="$(edit_of "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$WORK/edit-link/verifiers/new/also-new/f.go\"},\"session_id\":\"$SID\"}")"
+[ "$got" = "Write verifiers/new $SID" ] || fail 'a symlinked checkout and directories still to be made' "Write verifiers/new $SID" "$got"
+got="$(edit_of "{\"tool_name\":\"MultiEdit\",\"tool_input\":{\"file_path\":\"verifiers/x.py\"},\"cwd\":\"$ER\"}")"
+[ "$got" = 'MultiEdit verifiers -' ] || fail 'a relative path is read from the hook cwd' 'MultiEdit verifiers -' "$got"
+for bad in "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$WORK/not-a-repo.txt\"}}" \
+           "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$ER/a b/c.txt\"}}" \
+           '{"tool_name":"Bash","tool_input":{"command":"echo hi > x"}}' \
+           '{"tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}'; do
+  got="$(edit_of "$bad")"
+  [ -z "$got" ] || fail "no edit for $bad" '' "$got"
+done
+got="$(printf '%s' "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ER/verifiers/x.py\"}}" | TERMAG_STATUS_SESSION=psecor-x-agent TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" HOME="$WORK/empty-home" "$SCRIPT" post-tool --print-payload)"
+[ "$(printf '%s\n' "$got" | sed -n 1p)" = '{"session":"psecor-x-agent","status":"working"}' ] || fail 'the edit never rides on the status payload' 'working only' "$got"
+[ "$(printf '%s\n' "$got" | sed -n 2p)" = '{"session":"psecor-x-agent","tool":"Edit","dir":"verifiers"}' ] || fail '--print-payload prints the edit payload after the status' '{"session":"psecor-x-agent","tool":"Edit","dir":"verifiers"}' "$got"
+
 # A heredoc BODY that documents the command (and even prints a PR URL) is not a
 # milestone: grep's ^ is line-anchored, so the body is stripped before matching.
 got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cat > NOTES.md <<'"'"'EOF'"'"'\nTo ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\nEOF\ncat NOTES.md"},"tool_response":"To ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\n"}')"

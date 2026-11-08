@@ -171,8 +171,13 @@ processors:
 
   # Credentials that can reach these logs, masked before anything leaves the
   # host. The one known case is the agent token in nginx's request line
-  # (/termag/ws/agent?token=tmag_...); the rest is defence in depth for an
-  # error message that echoes a URL, a header or a connection string.
+  # (/termag/ws/agent?token=tmag_...); a preview box confirmation's id (the
+  # key to its sealed share URL, in /termag/previews/confirm/<id> and the CLI's
+  # /termag/api/cli/v1/preview-links/confirmations/<id>) is masked too, behind
+  # the gateway's own redacted log format (SR11), and so are a preview link's
+  # token (/termag/previews/<name>/<token>) and a reverify ticket=; the rest is
+  # defence in depth for an error message that echoes a URL, a header or a
+  # connection string.
   transform/redact:
     error_mode: ignore
     log_statements:
@@ -180,8 +185,10 @@ processors:
         conditions:
           - IsString(log.body)
         statements:
-          - replace_pattern(log.body, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(log.body, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|ticket|next|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(log.body, "(/termag/previews/[a-z0-9-]+/)[A-Za-z0-9_-]{22}([^A-Za-z0-9_-]|$)", "$${1}REDACTED$${2}")
           - replace_pattern(log.body, "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_pattern(log.body, "(/termag/(?:previews/confirm|api/cli/v1/preview-links/confirmations)/)[A-Za-z0-9_-]+", "$${1}REDACTED")
           - replace_pattern(log.body, "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
           - replace_pattern(log.body, "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
           - replace_pattern(log.body, "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
@@ -205,8 +212,10 @@ processors:
     trace_statements:
       - context: span
         statements:
-          - replace_all_patterns(span.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(span.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|ticket|next|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(span.attributes, "value", "(/termag/previews/[a-z0-9-]+/)[A-Za-z0-9_-]{22}([^A-Za-z0-9_-]|$)", "$${1}REDACTED$${2}")
           - replace_all_patterns(span.attributes, "value", "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_all_patterns(span.attributes, "value", "(/termag/(?:previews/confirm|api/cli/v1/preview-links/confirmations)/)[A-Za-z0-9_-]+", "$${1}REDACTED")
           - replace_all_patterns(span.attributes, "value", "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
           - replace_all_patterns(span.attributes, "value", "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
           - replace_all_patterns(span.attributes, "value", "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
@@ -216,8 +225,10 @@ processors:
           - replace_all_patterns(span.attributes, "value", "\\bsk-ant-[A-Za-z0-9_-]{10,}", "REDACTED_ANTHROPIC_KEY")
           - replace_all_patterns(span.attributes, "value", "\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b", "REDACTED_AWS_KEY_ID")
           - replace_all_patterns(span.attributes, "value", "(?i)\\b((?:postgres(?:ql)?|mysql|redis|amqps?|mongodb(?:\\+srv)?)://[^:/@\\s]+:)[^@\\s]+@", "$${1}REDACTED@")
-          - replace_pattern(span.status.message, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(span.status.message, "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|ticket|next|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_pattern(span.status.message, "(/termag/previews/[a-z0-9-]+/)[A-Za-z0-9_-]{22}([^A-Za-z0-9_-]|$)", "$${1}REDACTED$${2}")
           - replace_pattern(span.status.message, "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_pattern(span.status.message, "(/termag/(?:previews/confirm|api/cli/v1/preview-links/confirmations)/)[A-Za-z0-9_-]+", "$${1}REDACTED")
           - replace_pattern(span.status.message, "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
           - replace_pattern(span.status.message, "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
           - replace_pattern(span.status.message, "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")
@@ -232,8 +243,10 @@ processors:
           - delete_key(span.attributes, "network.peer.address")
       - context: spanevent
         statements:
-          - replace_all_patterns(spanevent.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "(?i)((?:^|[?&;])(?:token|access_token|id_token|refresh_token|code|ticket|next|state|key|api_key|apikey|secret|client_secret|password|passwd|sig|signature|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\\s\"']+", "$${1}REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "(/termag/previews/[a-z0-9-]+/)[A-Za-z0-9_-]{22}([^A-Za-z0-9_-]|$)", "$${1}REDACTED$${2}")
           - replace_all_patterns(spanevent.attributes, "value", "tmag_[A-Za-z0-9_-]+", "tmag_REDACTED")
+          - replace_all_patterns(spanevent.attributes, "value", "(/termag/(?:previews/confirm|api/cli/v1/preview-links/confirmations)/)[A-Za-z0-9_-]+", "$${1}REDACTED")
           - replace_all_patterns(spanevent.attributes, "value", "(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}", "$${1} REDACTED")
           - replace_all_patterns(spanevent.attributes, "value", "(?i)\\b((?:authorization|proxy-authorization|cookie|set-cookie|x-amzn-oidc-data|x-amzn-oidc-accesstoken)\"?\\s*[:=]\\s*\"?)[^\"\\r\\n]+", "$${1}REDACTED")
           - replace_all_patterns(spanevent.attributes, "value", "eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]+", "REDACTED_JWT")

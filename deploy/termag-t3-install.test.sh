@@ -18,6 +18,10 @@
 #   * where user namespaces are restricted (Ubuntu 23.10+), the browser's
 #     AppArmor profile is loaded, then installed, with sudo -n; one the parser
 #     refuses is not installed, and without sudo -n it is not drift
+#   * --release <x.y.z> installs that release's server from release_url, at
+#     the release's own digest, only when it is newer than the pin and than
+#     current; the pin is then a floor a reconcile keeps, until release_url
+#     is emptied
 #
 # Run: sh deploy/termag-t3-install.test.sh
 set -u
@@ -91,9 +95,10 @@ EOF
   sha "$ART/$stem.tar.gz"
 }
 
-# pin VERSION ARM64_SHA [BASE_URL]
+# pin VERSION ARM64_SHA [BASE_URL [RELEASE_URL]]
 pin() {
-  printf '# test pin\nversion=%s\nsha256_linux_arm64=%s\nsha256_linux_x64=\n\nbase_url=%s\n' "$1" "$2" "${3:-}" > "$DEPLOY/t3-server.pin"
+  printf '# test pin\nversion=%s\nsha256_linux_arm64=%s\nsha256_linux_x64=\n\nbase_url=%s\nrelease_url=%s\n' \
+    "$1" "$2" "${3:-}" "${4:-}" > "$DEPLOY/t3-server.pin"
 }
 
 run() {
@@ -355,7 +360,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 case $path in
-  repos/*/releases/tags/*) [ -f "$WORK/artifacts/$want" ] && echo "$want"; exit 0 ;;
+  repos/*/releases/tags/*)
+    # A name filter answers that asset; .assets[].name lists them all, after
+    # running on-release-list if a case left one (an install landing meanwhile).
+    if [ -n "$want" ]; then [ -f "$WORK/artifacts/$want" ] && echo "$want"; else
+      [ -f "$WORK/on-release-list" ] && sh "$WORK/on-release-list"
+      ls "$WORK/artifacts"
+    fi
+    exit 0 ;;
   repos/*/releases/assets/*)
     [ -n "$octet" ] || exit 1
     f="$WORK/artifacts/${path##*/}"
@@ -411,6 +423,139 @@ has 'gh://: says what a gh:// source is' "$out" "a gh:// source is gh://<owner>/
 pin "$V4" "$S1" 'gh://example-org/termag-desktop/v1"; .x'
 out=$(run_gh 2>&1); rc=$?
 check 'gh://: a tag that is not a plain name is refused' 3 "$rc"
+
+# ── --release: the server of the release a desktop runs ───────────────────
+# release_asset VERSION-SHA12 [DIGEST]: a release's tarball and its .sha256,
+# the digest the tarball's own unless one is given.
+release_asset() {
+  digest=$(make_artifact "$1")
+  printf '%s  termag-t3-server-%s-linux-arm64.tar.gz\n' "${2:-$digest}" "$1" \
+    > "$ART/termag-t3-server-$1-linux-arm64.tar.gz.sha256"
+  echo "$digest"
+}
+run_release() {  # run_release VERSION [VAR=value ...]
+  r=$1; shift
+  env -u GH_HOST HOME="$HOME_DIR" PATH="$STUB:$PATH" TERMAG_T3_ROOT="$GHROOT" TERMAG_T3_ARCH=aarch64 \
+    TERMAG_T3_SUDO=false TERMAG_T3_GH_HOST_FILE="$GHFILE" "$@" "$DEPLOY/termag-t3-install" --release "$r"
+}
+R14=0.1.14-ffffffffffff
+S14=$(release_asset "$R14")
+R15=0.1.15-999999999999
+release_asset "$R15" "$S1" >/dev/null  # a .sha256 that isn't the tarball's
+RELEASES='gh://example-org/termag-desktop/termag-desktop-v{version}'
+check 'release: starts on the pinned V2' "$V2" "$(readlink "$GHROOT/current")"
+
+pin "$V2" "$S2" "gh://example-org/termag-desktop/termag-desktop-v0.1.0"
+out=$(run_release 0.1.14 2>&1); rc=$?
+check 'release, no release_url: exit 0' 0 "$rc"
+has 'release, no release_url: says so' "$out" 'release_url'
+check 'release, no release_url: current unchanged' "$V2" "$(readlink "$GHROOT/current")"
+
+pin "$V2" "$S2" "gh://example-org/termag-desktop/termag-desktop-v0.1.0" "$RELEASES"
+for bad in 0.1 0.1.14-ffffffffffff '../0.1.14' ''; do
+  out=$(run_release "$bad" 2>&1); rc=$?
+  check "release '$bad': a usage error" 2 "$rc"
+done
+out=$(run_release 0.1.2 2>&1); rc=$?
+check 'release no newer than the pin: exit 0' 0 "$rc"
+has 'release no newer than the pin: says so' "$out" 'not newer than 0.1.2'
+check 'release no newer than the pin: current unchanged' "$V2" "$(readlink "$GHROOT/current")"
+
+# Another install holding the lock (a reconcile, a box update) keeps what is
+# current and never fetches the release: --release waits for it, bounded.
+if command -v flock >/dev/null 2>&1; then
+  ( flock 8; sleep 3 ) 8>"$GHROOT/.lock" &
+  holder=$!
+  sleep 0.5
+  out=$(run_release 0.1.14 TERMAG_T3_LOCK_WAIT=1 2>&1); rc=$?
+  check 'release, lock held past the wait: exit 3' 3 "$rc"
+  has 'release, lock held past the wait: says so' "$out" 'another install still holds'
+  check 'release, lock held past the wait: current unchanged' "$V2" "$(readlink "$GHROOT/current")"
+  wait "$holder"
+  ( flock 8; sleep 2 ) 8>"$GHROOT/.lock" &
+  holder=$!
+  sleep 0.5
+fi
+: > "$WORK/gh.log"
+out=$(run_release 0.1.14 2>&1); rc=$?
+if [ -n "${holder:-}" ]; then
+  wait "$holder"
+  has 'release, lock held: waits for it' "$out" 'waiting for it'
+fi
+check 'release: installs' 0 "$rc"
+has "release: reads the desktop's release on the broker" "$(cat "$WORK/gh.log")" \
+  'gh api --hostname github-broker.example.invalid repos/example-org/termag-desktop/releases/tags/termag-desktop-v0.1.14 --jq .assets[].name'
+check 'release: current is the release' "$R14" "$(readlink "$GHROOT/current")"
+check "release: the release's digest recorded" "$S14" "$(cat "$GHROOT/$R14/.termag-t3-sha256")"
+check 'release: the launcher runs it' "$R14" "$("$GHROOT/bin/t3" --version)"
+out=$(run_release 0.1.14 2>&1); rc=$?
+check 'release again: exit 0' 0 "$rc"
+has 'release again: not newer than current' "$out" 'not newer than 0.1.14'
+out=$(run_release 0.1.9 2>&1); rc=$?
+check 'an older release: exit 0' 0 "$rc"
+check 'an older release: current unchanged' "$R14" "$(readlink "$GHROOT/current")"
+
+# The pin is a floor: a reconcile keeps the newer release.
+out=$(run_gh 2>&1); rc=$?
+check 'reconcile over a newer release: exit 0' 0 "$rc"
+check 'reconcile over a newer release: writes nothing' '' "$out"
+check 'reconcile over a newer release: current kept' "$R14" "$(readlink "$GHROOT/current")"
+out=$(run_gh 2>&1 >/dev/null; HOME="$HOME_DIR" PATH="$STUB:$PATH" TERMAG_T3_ROOT="$GHROOT" TERMAG_T3_ARCH=aarch64 \
+  TERMAG_T3_SUDO=false "$DEPLOY/termag-t3-install" --check 2>&1); rc=$?
+check 'reconcile over a newer release: --check clean' 0 "$rc"
+check 'reconcile over a newer release: the pinned tree kept' yes "$([ -d "$GHROOT/$V2" ] && echo yes || echo no)"
+
+out=$(run_release 0.1.15 2>&1); rc=$?
+check "release whose .sha256 isn't its tarball's: exit 3" 3 "$rc"
+has "release whose .sha256 isn't its tarball's: says whose digest" "$out" "not the release's $S1"
+check "release whose .sha256 isn't its tarball's: current unchanged" "$R14" "$(readlink "$GHROOT/current")"
+out=$(run_release 0.1.16 2>&1); rc=$?
+check 'release with no server tarball: exit 3' 3 "$rc"
+has 'release with no server tarball: says so' "$out" 'has no single linux-arm64 server tarball'
+
+# A newer release that lands while one waits for the lock stays current.
+if command -v flock >/dev/null 2>&1; then
+  R16=0.1.16-666666666666
+  R17=0.1.17-777777777777
+  release_asset "$R16" >/dev/null
+  release_asset "$R17" >/dev/null
+  run_release 0.1.17 >/dev/null 2>&1
+  ln -sfn "$R14" "$GHROOT/current"
+  # The holder is that newer install finishing: it leaves current on 0.1.17.
+  ( flock 8; sleep 2; ln -sfn "$R17" "$GHROOT/current" ) 8>"$GHROOT/.lock" &
+  holder=$!
+  sleep 0.5
+  out=$(run_release 0.1.16 2>&1); rc=$?
+  wait "$holder"
+  check 'release, a newer one landed while it waited: exit 0' 0 "$rc"
+  has 'release, a newer one landed while it waited: says so' "$out" 'not newer than 0.1.17'
+  check 'release, a newer one landed while it waited: current kept' "$R17" "$(readlink "$GHROOT/current")"
+  ln -sfn "$R14" "$GHROOT/current"
+fi
+
+# One that lands while this one reads the release, before it takes the lock,
+# stays current too.
+R16=0.1.16-666666666666
+R17=0.1.17-777777777777
+[ -f "$ART/termag-t3-server-$R16-linux-arm64.tar.gz" ] || release_asset "$R16" >/dev/null
+[ -f "$ART/termag-t3-server-$R17-linux-arm64.tar.gz" ] || release_asset "$R17" >/dev/null
+[ -d "$GHROOT/$R17" ] || run_release 0.1.17 >/dev/null 2>&1
+ln -sfn "$R14" "$GHROOT/current"
+printf 'ln -sfn %s %s\n' "$R17" "$GHROOT/current" > "$WORK/on-release-list"
+out=$(run_release 0.1.16 2>&1); rc=$?
+rm -f "$WORK/on-release-list"
+check 'release, a newer one landed while it read the release: exit 0' 0 "$rc"
+has 'release, a newer one landed while it read the release: says so' "$out" 'not newer than 0.1.17'
+check 'release, a newer one landed while it read the release: current kept' "$R17" "$(readlink "$GHROOT/current")"
+ln -sfn "$R14" "$GHROOT/current"
+
+# Emptying release_url is the way back: the next reconcile puts the pin back.
+pin "$V2" "$S2" "gh://example-org/termag-desktop/termag-desktop-v0.1.0"
+out=$(run_gh 2>&1); rc=$?
+check 'release_url emptied: exit 0' 0 "$rc"
+check 'release_url emptied: current back on the pin' "$V2" "$(readlink "$GHROOT/current")"
+has 'release_url emptied: says what it was' "$out" "current -> $V2 (was $R14)"
+pin "$V4" "$S1" "gh://example-org/termag-desktop/termag-desktop-v0.1.0"  # one not installed, for the next case
 rm -f "$STUB/gh"
 if PATH="$STUB:/usr/bin:/bin" command -v gh >/dev/null 2>&1; then
   echo "SKIP: a gh in /usr/bin or /bin"

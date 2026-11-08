@@ -1,5 +1,5 @@
 [Unit]
-Description=termag: Node update run %i from the orchestrator (install beside, reinstall the npm globals, switch, restart the agent)
+Description=termag: Node update run %i from the orchestrator (install beside, reinstall the npm globals, switch, restart the agent and the tools' sessions)
 
 [Service]
 # Why this exists: the orchestrator's manual Node updates,
@@ -27,9 +27,12 @@ ExecStart=%h/.local/bin/termag-node-update --run %i
 SuccessExitStatus=0 1 3
 
 # The ceiling for the whole run: the downloads, the npm globals' reinstall
-# and the agent's restart, within the 1200 s budget (TERMAG_NODE_BUDGET), and
-# the report. It stops no sessions. 90 min is also how long the orchestrator
-# counts a started run as in flight.
+# and the agent's restart, within the 1200 s budget (TERMAG_NODE_BUDGET), then
+# the tools' sessions (their updaters at once: the policy's drainSec, up to
+# 3600 s, a 20 s kill grace and the resume check), and the report. About
+# 82 min at worst; 90 min is also how long the orchestrator counts a started
+# run as in flight. A stop sends SIGTERM to the run and the updaters, which say
+# what they had done, and the run reports failed.
 TimeoutStartSec=90min
 
 # Behind the owner's own work: a build in a pane should not notice this.

@@ -30,13 +30,18 @@ export const PI: PiAgent = {
 };
 
 // Fireworks' answers come through the termag gateway: a
-// 401 or 403 is the gateway refusing this box, which `termag-credentials
-// status` explains; anything else is Fireworks or the gateway failing.
+// 401 is the gateway refusing this box, which `termag-credentials status`
+// explains. A 403 is that too, or Fireworks' account governance refusing the
+// model (the gateway passes Fireworks' refusals through, and keeps no model
+// list of its own); the reply's message says which. Anything else is
+// Fireworks or the gateway failing (a 404 is a model the account has not got).
 export const FIREWORKS: PiAgent = {
   label: 'Fireworks',
-  remedy: status => (status === 401 || status === 403
+  remedy: status => (status === 401
     ? `Fireworks gateway HTTP ${status} — the termag gateway refused this box; in the ctrl pane run: termag-credentials status`
-    : `Fireworks gateway HTTP ${status} — the model request failed; in the ctrl pane run: termag-credentials status`),
+    : status === 403
+      ? `Fireworks gateway HTTP ${status} — the termag gateway refused this box, or Fireworks' model access policy refused this model; the reply's message says which. In the ctrl pane: termag-credentials status`
+      : `Fireworks gateway HTTP ${status} — the model request failed; in the ctrl pane run: termag-credentials status`),
   badge: status => `Fireworks: gateway HTTP ${status}`,
 };
 

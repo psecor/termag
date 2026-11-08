@@ -23,3 +23,10 @@ sha256_linux_x64=
 # source needs the owner's login, so a box gets the server from termag-reconcile
 # once it is claimed (boot, or a box update).
 base_url=
+
+# Where a box gets a newer server than the pin when its desktop is newer
+# (termag-t3-install --release <x.y.z>, which the agent's t3-update runs):
+# {version} is the desktop's, and the digest is the release's own .sha256.
+# While it is set, the pin is a floor a reconcile keeps; empty, a box runs
+# only the pinned server, and the next reconcile moves one back to it.
+release_url=

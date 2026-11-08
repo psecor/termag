@@ -25,6 +25,16 @@
 set -u
 PATH="$HOME/.local/bin:$PATH"
 
+# pi's own updater installs nothing here: pi moves only to a version termag has
+# pinned, through termag-pi-update's run. pi
+# (1.5.0 on) runs PI_SELF_UPDATE_COMMAND for `pi update` in place of its npm
+# install, so it gets termag's refusal, whatever the caller's environment said;
+# and PI_SKIP_VERSION_CHECK=1 drops the startup check against pi.dev and its
+# "Update Available, run pi update" banner, which named a command that only
+# refuses. termag's update run says when npm has a newer, unpinned pi.
+export PI_SELF_UPDATE_COMMAND='termag-pi-update --self-update {version}'
+export PI_SKIP_VERSION_CHECK=1
+
 EXT="${TERMAG_PI_EXT:-$HOME/.local/share/termag/pi-ext/termag-status.ts}"
 
 model='' context='' models=''
@@ -40,9 +50,9 @@ done
 if ! command -v pi >/dev/null 2>&1; then
   cat >&2 <<'MSG'
 termag: `pi` is not installed on this box.
-  In this pane:  npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
-  (nvm's node is on PATH in tmux panes; new box images ship it already. Keep the
-  version in step with packer/scripts/setup.sh.)
+  In this pane:  termag-pi-update --install-pinned
+  (installs the newest version termag pins, from its checked package; nvm's node
+  is on PATH in tmux panes; new box images ship it already.)
 MSG
   exit 127
 fi

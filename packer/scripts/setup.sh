@@ -324,13 +324,8 @@ corepack prepare yarn@stable --activate
 corepack prepare pnpm@latest --activate
 # Agent CLIs that live on the Node toolchain:
 npm install -g @anthropic-ai/claude-code @openai/codex
-# pi (@earendil-works/pi-coding-agent) is the pi provider's agent. A new
-# third-party publisher on the image, so unlike the two above it is PINNED and
-# installed without lifecycle scripts (its optional native helpers -- esbuild
-# etc. -- are not needed; 1.0.2 was verified working this way on a box).
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.0.2
-command -v pi >/dev/null || { echo "[packer] pi missing after npm install -g -- failing build"; exit 1; }
-[ "$(pi --version 2>/dev/null)" = "1.0.2" ] || { echo "[packer] pi is not the pinned 1.0.2 -- failing build"; exit 1; }
+# pi is installed below, once the termag checkout is cloned: its pinned
+# package comes through deploy/termag-pi-update, which holds the pins.
 NVM_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,13 +402,63 @@ go telemetry off || echo "[packer/setup] go telemetry off failed (non-fatal)"
 GOENV_INSTALL
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Clone termag (from the shipped bundle) into the termag user's home. Before
+# uv: the image's uv is the one deploy/termag-python-update pins (UV_INSTALL
+# below). Its deps, the CLI and agent-wiki come after the Node toolchain, in
+# the block further down.
+# ─────────────────────────────────────────────────────────────────────────────
+sudo -u termag -H bash <<EOF
+set -euo pipefail
+mkdir -p /home/termag/src
+cd /home/termag/src
+
+# The termag source is THIS checkout, shipped by box.pkr.hcl as a git bundle
+# (scripts/bundle-source.sh): full history, so git log/blame/bisect work on the
+# box; no credentials, no node_modules, nothing untracked. Nothing is cloned
+# from a remote. A merge to main reaches new boxes through the scheduled bake,
+# whose staleness check diffs agent/ for exactly this reason.
+git clone /tmp/termag.bundle termag
+
+# A bundle clone's origin is the bundle file. Point it at the checkout's real
+# remote (recorded by bundle-source.sh) so a pull on the box goes somewhere
+# that exists; with no remote recorded, leave the clone remote-less.
+origin=\$(cat /tmp/termag.bundle.origin 2>/dev/null || true)
+if [ -n "\$origin" ]; then
+  git -C termag remote set-url origin "\$origin"
+else
+  git -C termag remote remove origin
+fi
+
+# The AMI's TermagSha tag must name what is actually on the image. Refuse to
+# bake if the bundle's HEAD is not the commit CI said it was baking.
+baked=\$(git -C termag rev-parse HEAD)
+if [ "${TERMAG_BAKED_SHA}" != unknown ] && [ "\$baked" != "${TERMAG_BAKED_SHA}" ]; then
+  echo "bundle HEAD \$baked does not match TERMAG_BAKED_SHA ${TERMAG_BAKED_SHA}" >&2
+  exit 1
+fi
+EOF
+
+# ─────────────────────────────────────────────────────────────────────────────
 # uv (Astral) — Python package/tool manager. Fetches the prebuilt CPython for
 # pyenv below, and installs browser-harness.
+# The newest uv pinned in deploy/termag-python-update (UV_PINS, the list the
+# Python updater's runs bring an old uv up to), from astral-sh/uv's GitHub
+# release over HTTPS, its sha256 checked against the pin before anything is
+# unpacked. The bake names no uv of its own,
+# so a pin refresh there moves new images too. Any failure fails the bake:
+# there is no fallback to astral.sh's installer.
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<'UV_INSTALL'
 set -euo pipefail
-curl -LsSf https://astral.sh/uv/install.sh | sh
+recipe="$HOME/src/termag/deploy/termag-python-update"
+"$recipe" --install-uv || { echo "[packer] the pinned uv did not install, or is not the pinned one -- failing build"; exit 1; }
 export PATH="$HOME/.local/bin:$PATH"
+want=$("$recipe" --newest-uv-pin)
+got=$(uv --version 2>/dev/null | awk '{ print $2 }' || true)
+gotx=$(uvx --version 2>/dev/null | awk '{ print $2 }' || true)
+[ "$(command -v uv)" = "$HOME/.local/bin/uv" ] && [ "$(command -v uvx)" = "$HOME/.local/bin/uvx" ] && [ "$got" = "$want" ] && [ "$gotx" = "$want" ] \
+  || { echo "[packer] uv is $(command -v uv) $got, uvx $(command -v uvx) $gotx, not the pinned $want in ~/.local/bin -- failing build"; exit 1; }
+echo "[packer] uv $got (pinned in deploy/termag-python-update)"
 # browser-harness — public repo, installed as a uv tool. Needs Chromium (baked
 # above) + per-user CDP/VNC wiring at use time.
 uv tool install "git+https://github.com/browser-use/browser-harness" || echo "[packer] browser-harness install skipped (non-fatal)"
@@ -623,41 +668,16 @@ INITLUA
 sudo chown -R termag:termag /home/termag/.config /home/termag/.gitconfig /home/termag/.zshrc /home/termag/.tmux.conf
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Clone termag (from the shipped bundle) + agent-wiki into the termag user's
-# home, install deps with the nvm toolchain.
+# Install termag's agent deps (the checkout was cloned before uv, above) with
+# the nvm toolchain, build the CLI, and clone agent-wiki.
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<EOF
 set -euo pipefail
 export NVM_DIR="\$HOME/.nvm"
 . "\$NVM_DIR/nvm.sh"
 
-mkdir -p /home/termag/src
 cd /home/termag/src
-
-# The termag source is THIS checkout, shipped by box.pkr.hcl as a git bundle
-# (scripts/bundle-source.sh): full history, so git log/blame/bisect work on the
-# box; no credentials, no node_modules, nothing untracked. Nothing is cloned
-# from a remote. A merge to main reaches new boxes through the scheduled bake,
-# whose staleness check diffs agent/ for exactly this reason.
-git clone /tmp/termag.bundle termag
-
-# A bundle clone's origin is the bundle file. Point it at the checkout's real
-# remote (recorded by bundle-source.sh) so a pull on the box goes somewhere
-# that exists; with no remote recorded, leave the clone remote-less.
-origin=\$(cat /tmp/termag.bundle.origin 2>/dev/null || true)
-if [ -n "\$origin" ]; then
-  git -C termag remote set-url origin "\$origin"
-else
-  git -C termag remote remove origin
-fi
-
-# The AMI's TermagSha tag must name what is actually on the image. Refuse to
-# bake if the bundle's HEAD is not the commit CI said it was baking.
 baked=\$(git -C termag rev-parse HEAD)
-if [ "${TERMAG_BAKED_SHA}" != unknown ] && [ "\$baked" != "${TERMAG_BAKED_SHA}" ]; then
-  echo "bundle HEAD \$baked does not match TERMAG_BAKED_SHA ${TERMAG_BAKED_SHA}" >&2
-  exit 1
-fi
 
 cd termag/agent
 npm install --omit=dev
@@ -695,6 +715,26 @@ fi
 echo "[packer] claude $have is at or above the floor $floor"
 CLAUDE_FLOOR
 
+# pi (@earendil-works/pi-coding-agent), the pi provider's agent: a
+# third-party publisher on the image, so unlike claude and codex it is PINNED,
+# by deploy/termag-pi-update's PINS, the one list of pi versions (the image
+# installs the newest of them, as an update run's latest does). That recipe
+# fetches the package, checks its sha512 against the pin, and npm installs
+# that file with --ignore-scripts (its optional native helpers -- esbuild etc.
+# -- are not needed, and a newer publisher's lifecycle scripts are not run);
+# a package that is not the pinned one, or a pi that is not that version
+# after it, fails the build. A new pin is a reviewed PR.
+sudo -u termag -H bash <<'PI_INSTALL'
+set -euo pipefail
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh"
+"$HOME/src/termag/deploy/termag-pi-update" --install-pinned || { echo "[packer] pi's pinned package did not install, or is not the pinned one -- failing build"; exit 1; }
+want=$("$HOME/src/termag/deploy/termag-pi-update" --newest-pin)
+command -v pi >/dev/null || { echo "[packer] pi missing after its install -- failing build"; exit 1; }
+[ "$(pi --version 2>/dev/null)" = "$want" ] || { echo "[packer] pi is not the pinned $want -- failing build"; exit 1; }
+echo "[packer] pi $want installed from its pinned package"
+PI_INSTALL
+
 # ─────────────────────────────────────────────────────────────────────────────
 # systemd --user unit. Cloud-init writes
 # ~termag/src/termag/agent/agent.config.json with the bearer token at launch,
@@ -708,6 +748,7 @@ install_box_marker
 install_guest_browser
 install_gh_updater
 install_aws_updater
+install_docker_updater
 install_terminfo
 
 # ─────────────────────────────────────────────────────────────────────────────

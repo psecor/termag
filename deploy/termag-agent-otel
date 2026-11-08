@@ -87,6 +87,29 @@ resource="$resource,service.name=termag-$agent-session,termag.agent=$agent"
 project=${TERMAG_PROJECT:-} workstream=${TERMAG_WORKSTREAM:-}
 [[ $project =~ ^[A-Za-z0-9_-]{1,64}$ ]] && [[ $workstream =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
   && resource="$resource,termag.project=$project,termag.workstream=$workstream"
+# The session's work, as Claude's telemetry-launch adds it: the checkout's
+# repository, branch and commit, and a spawned agent's spawn
+# (termag-credentials work-resource). The copy beside
+# this one: beside the script itself, following a symlink (a pane's launch
+# names this by PATH, and a link in a bin directory points into a checkout),
+# then beside the name it was run by, then the one on PATH. An older one
+# without the subcommand prints usage on stderr and nothing here, and anything
+# that is not a list of pairs is dropped.
+credentials_script() {
+  local self=$0 real d
+  case $self in */*) ;; *) self=$(command -v -- "$self" 2>/dev/null) || self= ;; esac
+  if [ -n "$self" ]; then
+    real=$(readlink -f -- "$self" 2>/dev/null) || real=
+    for d in ${real:+"$(dirname -- "$real")"} "$(dirname -- "$self")"; do
+      [ -x "$d/termag-credentials" ] && { printf '%s' "$d/termag-credentials"; return 0; }
+    done
+  fi
+  command -v termag-credentials 2>/dev/null
+}
+work=
+creds=$(credentials_script) && [ -n "$creds" ] \
+  && { work=$("$creds" work-resource 2>/dev/null </dev/null) || work=; }
+[[ $work =~ ^(,[A-Za-z0-9._]+=[A-Za-z0-9._/-]+)+$ ]] && resource="$resource$work"
 [ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
 export OTEL_RESOURCE_ATTRIBUTES=$resource
 

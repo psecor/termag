@@ -34,7 +34,9 @@
 #     itself, the result names the branches the clone pushed and no bundle
 #     goes up; a branch with commits it did not push is said in the reply;
 #     the pre-push hook refuses the default branch; a person's prepare keeps
-#     the layout; an older clone of the thread is converted in place
+#     the layout; an older clone of the thread is converted in place; a
+#     checkout that borrows a store (the baked webapp) has it linked into
+#     the clone, which borrows nothing and outlives both
 #   * idle threads are swept with their transcripts; a bad job exits 2
 #     without reporting
 #   * a TERM during the run stops the run's whole process group and exits 143
@@ -280,6 +282,23 @@ eq 'a run that committed only on another branch still sends its HEAD' \
 eq 'with no pr/<name> descriptions' "$(jq -c .prDescriptions "$TSTATE/result.json")" '{}'
 echo commit > "$TSTATE/claude-mode"
 
+# ── a run the orchestrator caps (a project from a shared environment) ─────────────
+for capped in auto dontAsk; do
+  J=$(job runaaaa0007 threadaaaa07 '{"permissionMode":"'"$capped"'"}')
+  run "$J"; eq "$capped run exits 0" "$?" 0
+  args=$(cat "$TSTATE/claude-args")
+  has "$capped: its mode" "$args" "$(printf -- '--permission-mode\n%s' "$capped")"
+  lacks "$capped: never bypassPermissions" "$args" 'bypassPermissions'
+  # The JSON goes in as an argument: a \" in a printf format is dash's to keep as it is.
+  has "$capped: no .mcp.json" "$args" "$(printf -- '--strict-mcp-config\n--mcp-config\n%s' '{"mcpServers":{}}')"
+  has "$capped: no checkout settings" "$args" "$(printf -- '--setting-sources\nuser')"
+  has "$capped: no hooks" "$args" "$(printf -- '--settings\n%s' '{"disableAllHooks":true}')"
+  if [ "$capped" = dontAsk ]; then has 'dontAsk: read-only tools' "$args" "$(printf -- '--tools\nRead,Grep,Glob')"
+  else lacks 'auto: every tool' "$args" '--tools'; fi
+done
+J=$(job runaaaa0008 threadaaaa08 '{"permissionMode":"acceptEdits"}')
+run "$J"; has 'any other mode is the ask'"'"'s own' "$(cat "$TSTATE/claude-args")" "$(printf -- '--permission-mode\nbypassPermissions')"
+
 # ── a thread whose clone is not on this box ───────────────────────────────────────
 J=$(job runbbbb0001 threadbbbb01 '{"resumeSessionId":"sess-9","baseSha":"'"$BASE"'"}')
 run "$J"; eq 'lost clone still runs' "$?" 0
@@ -446,12 +465,71 @@ eq 'and is not shallow' "$(git -C "$P" rev-parse --is-shallow-repository)" false
 git -C "$P" cat-file -e "$LIVE_HEAD^{commit}" 2>/dev/null && fail "the live checkout's unpushed commit stays out of the clone" absent present
 eq 'the run is on the thread branch' "$(git -C "$P" branch --show-current)" "$PB"
 eq 'which tracks the default branch, so it is its own tree' "$(git -C "$P" rev-parse --abbrev-ref "$PB@{upstream}")" origin/main
+eq 'origin/HEAD names the default branch, as a clone sets it' "$(git -C "$P" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)" refs/remotes/origin/main
 git -C "$P" rev-parse -q --verify refs/termag/base >/dev/null && fail 'no refs/termag/base in a push clone' absent present
 if command -v node >/dev/null 2>&1; then
   own=$(node -e 'const c = require(process.argv[1]); c.readCheckoutFacts(process.argv[2]).then(f => process.stdout.write(String(c.checkoutOwnTree(f))))' "$DIR/../agent/chat-runner.js" "$P" 2>&1)
   eq "the chat runner sees the push clone as the project's own tree (gotcha ask-push-clone-upstream)" "$own" true
 fi
 [ -x "$P/.git/hooks/pre-push" ] || fail 'the clone has the pre-push hook' present absent
+# A commit GitHub doesn't have that changes .github/workflows: the hook says what a
+# refusal for want of the workflow scope means; one that doesn't change it, nothing.
+Z=0000000000000000000000000000000000000000
+wf=$(printf 'on: push\n' | git -C "$P" hash-object -w --stdin)
+wft=$(printf '100644 blob %s\tci.yml\n' "$wf" | git -C "$P" mktree)
+ght=$(printf '040000 tree %s\tworkflows\n' "$wft" | git -C "$P" mktree)
+wtree=$( { git -C "$P" ls-tree HEAD | grep -v '	\.github$'; printf '040000 tree %s\t.github\n' "$ght"; } | git -C "$P" mktree)
+wc=$(GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com git -C "$P" commit-tree -p HEAD -m workflow "$wtree")
+pc=$(GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com git -C "$P" commit-tree -p HEAD -m plain "$(git -C "$P" rev-parse 'HEAD^{tree}')")
+hook_out=$(cd "$P" && printf 'refs/heads/x %s refs/heads/x %s\n' "$wc" "$Z" | .git/hooks/pre-push origin https://github.com/org/repo.git 2>&1)
+has "the pre-push hook explains a workflow-scope refusal for a push that changes workflows" "$hook_out" 'this push changes workflow files compared with GitHub'"'"'s copy, and the stored GitHub token has no `workflow` scope'
+has 'naming the rebase' "$hook_out" 'rebase onto the current origin/main and push again'
+has 'and the refresh' "$hook_out" 'gh auth refresh -h github.com -s workflow'
+hook_out=$(cd "$P" && printf 'refs/heads/x %s refs/heads/x %s\n' "$pc" "$Z" | .git/hooks/pre-push origin https://github.com/org/repo.git 2>&1)
+lacks 'and says nothing of it for a push that does not' "$hook_out" 'workflow'
+# The hook's warnings count only what the branch adds: not main's commits or files that a
+# merge of origin/main brings in, nor those of a merged branch cut from a newer main.
+HO="$WORK/hook-origin.git" H="$WORK/hook-clone" H2="$WORK/hook-other"
+git init -q --bare -b main "$HO"
+as() { who=$1; shift; GIT_AUTHOR_NAME=$who GIT_AUTHOR_EMAIL=$who@example.com GIT_COMMITTER_NAME=$who GIT_COMMITTER_EMAIL=$who@example.com git "$@"; }
+hcommit() { d=$1 who=$2 f=$3; mkdir -p "$d/$(dirname "$f")"; echo "$who $f" >> "$d/$f"; git -C "$d" add "$f"; as "$who" -C "$d" commit -q -m "$who $f"; }
+git clone -q "$HO" "$H" 2>/dev/null
+hcommit "$H" bob README; git -C "$H" push -q origin HEAD:main 2>/dev/null
+cp "$P/.git/hooks/pre-push" "$H/.git/hooks/pre-push"
+git -C "$H" config termag.defaultBranch main; git -C "$H" config termag.askerEmail ada@example.com
+git -C "$H" switch -q -c termag-ada/hook
+hpush() { git -C "$H" push -q origin HEAD:termag-ada/hook 2>&1; }
+hcommit "$H" ada src/a.txt
+out=$(hpush); eq "a new branch of the asker's own commits pushes without a warning" "$out" ''
+git clone -q "$HO" "$H2" 2>/dev/null
+hcommit "$H2" bob .github/workflows/ci.yml; hcommit "$H2" bob CODEOWNERS; git -C "$H2" push -q origin HEAD:main 2>/dev/null
+git -C "$H" fetch -q origin; as ada -C "$H" merge -q --no-ff --no-edit origin/main
+out=$(hpush)
+lacks "merging origin/main adds none of main's commits to the author warning" "$out" 'not authored'
+lacks "nor main's files to the protected-files warning" "$out" 'protected files'
+# Main moves on past this clone's origin/main; another branch is cut from it and merged.
+hcommit "$H2" carol .github/workflows/release.yml; git -C "$H2" push -q origin HEAD:main 2>/dev/null
+git -C "$H2" switch -q -c feat/other; hcommit "$H2" carol src/other.txt; git -C "$H2" push -q origin feat/other 2>/dev/null
+git -C "$H" fetch -q origin feat/other:refs/remotes/origin/feat/other
+as ada -C "$H" merge -q --no-ff --no-edit origin/feat/other
+out=$(hpush)
+lacks "a merged branch cut from a newer main adds none of its commits to the author warning" "$out" 'not authored'
+lacks "nor that main's files to the protected-files warning" "$out" 'protected files'
+# What the branch itself adds is still warned about.
+hcommit "$H" ada .github/workflows/mine.yml; hcommit "$H" eve src/b.txt
+out=$(hpush)
+has "the branch's own protected file is warned about" "$out" '.github/workflows/mine.yml'
+lacks "and only it" "$out" 'ci.yml'
+has "a commit of another author's is warned about" "$out" 'eve@example.com'
+lacks "and only it" "$out" 'bob@example.com'
+# A protected file the branch changed and changed back is not in the PR's diff.
+git -C "$H" rm -q .github/workflows/mine.yml; as ada -C "$H" commit -q -m 'back'
+hcommit "$H" ada CODEOWNERS; git -C "$H" checkout -q origin/main -- CODEOWNERS; as ada -C "$H" commit -q -m 'back'
+out=$(hpush)
+lacks "a protected file changed and changed back is not warned about" "$out" 'protected files'
+lacks 'nor are its commits' "$out" 'not authored'
+# GitHub still checks the workflow scope on the commit that takes mine.yml back out.
+has "but the commit that changes a workflow back still gets the workflow-scope line" "$out" 'has no `workflow` scope'
 has 'the run knows its thread' "$(cat "$TSTATE/claude-env")" 'TERMAG_ASK_THREAD=threadpush01'
 lacks 'and gets no PR description file' "$(cat "$TSTATE/claude-env")" 'TERMAG_ASK_PR_BODY_FILE='
 lacks 'no bundle goes up' "$(cat "$LOG")" '/bundle'
@@ -462,6 +540,9 @@ eq 'bundle flag' "$(jq -r .bundle "$R")" false
 eq 'pushed as the asker' "$(git -C "$ORIGIN" log -1 --format='%ae %ce' "refs/heads/$PB")" 'ada@example.com ada@example.com'
 has 'a branch committed but not pushed is said in the reply' "$(jq -r .result "$R")" 'branch scratch has 1 commit(s) that were committed but not pushed'
 lacks 'and a pushed one is not' "$(jq -r .result "$R")" "branch $PB has"
+eq 'unpushed lists only the branch that was not pushed, with where its commits go' "$(jq -c .unpushed "$R")" '[{"branch":"scratch","commits":1,"to":"'"$PB"'"}]'
+has "naming the thread's branch to push it to" "$(jq -r .result "$R")" "\`git push origin scratch:$PB\`"
+lacks 'a clone made for push mode tells the turn nothing' "$(cat "$TSTATE/claude-stdin")" 'termag converted'
 eq 'push mode is remembered' "$(jq -r '.layout + " " + .branch' "$ROOT/threads/threadpush01/meta.json")" "push $PB"
 # The default branch is refused by the clone's hook.
 MAIN_BEFORE=$(git -C "$ORIGIN" rev-parse refs/heads/main)
@@ -488,6 +569,8 @@ echo none > "$TSTATE/claude-mode"
 eq 'an offline prepare still runs the turn' "$?" 0
 O="$ROOT/threads/threadpush04/repo"
 eq 'and the branch tracks the default branch anyway' "$(git -C "$O" config --get branch.termag-ada/threadpush04.merge) $(git -C "$O" config --get branch.termag-ada/threadpush04.remote)" 'refs/heads/main origin'
+eq "the base's history, with no origin branch to measure against, is not reported as unpushed" "$(jq -c .unpushed "$TSTATE/result.json")" '[]'
+lacks 'nor said in the reply' "$(jq -r .result "$TSTATE/result.json")" 'committed but not pushed'
 if command -v node >/dev/null 2>&1; then
   own=$(node -e 'const c = require(process.argv[1]); c.readCheckoutFacts(process.argv[2]).then(f => process.stdout.write(String(c.checkoutOwnTree(f))))' "$DIR/../agent/chat-runner.js" "$O" 2>&1)
   eq "so the chat runner still takes it for the project's own tree" "$own" true
@@ -496,6 +579,29 @@ fi
 echo commit > "$TSTATE/claude-mode"
 out=$(GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadpush01 '{"waitForCheckout":false}')" 2>/dev/null)
 eq "a person's prepare keeps push mode" "$(printf '%s' "$out" | jq -r '"\(.push) \(.branch) \(.prDir)"')" "true $PB null"
+# The repo's pre-commit hooks: installed for an ask at its own mode, never for one the
+# orchestrator capped (a project from a shared environment), whose git commit would
+# otherwise run the repo's hooks as the box user. One installed before is taken out.
+cat > "$STUB/pre-commit" <<'EOF'
+#!/bin/sh
+echo "pre-commit $*" >> "$LOG"
+[ -f .git/hooks/pre-commit ] && mv .git/hooks/pre-commit .git/hooks/pre-commit.legacy
+printf '#!/bin/sh\n# File generated by pre-commit: https://pre-commit.com\nexit 0\n' > .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+EOF
+chmod +x "$STUB/pre-commit"
+printf 'repos: []\n' > "$P/.pre-commit-config.yaml"
+: > "$LOG"; GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadpush01 '{"waitForCheckout":false}')" >/dev/null 2>&1
+has 'an ask at its own mode installs the repo hooks' "$(cat "$LOG")" 'pre-commit install'
+printf '#!/bin/sh\nexit 0\n' > "$P/.git/hooks/pre-commit.legacy"
+for capped in auto dontAsk; do
+  : > "$LOG"; GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadpush01 '{"waitForCheckout":false,"permissionMode":"'"$capped"'"}')" >/dev/null 2>&1
+  lacks "$capped: never installs the repo hooks" "$(cat "$LOG")" 'pre-commit install'
+  if grep -qs 'File generated by pre-commit' "$P/.git/hooks/pre-commit"; then fail "$capped: the hook installed before is taken out" absent present; fi
+done
+[ -x "$P/.git/hooks/pre-push" ] || fail "the capped clone keeps termag's own pre-push hook" present absent
+eq 'the hook pre-commit kept is put back' "$(cat "$P/.git/hooks/pre-commit" 2>/dev/null)" "$(printf '#!/bin/sh\nexit 0')"
+rm -f "$P/.pre-commit-config.yaml" "$STUB/pre-commit"
 # An older clone of a thread is converted on its first push-mode turn.
 run "$(job runconv0001 threadconv001)"
 C="$ROOT/threads/threadconv001/repo"
@@ -513,11 +619,48 @@ git -C "$C" switch -q -c loose "$CB" && git -C "$C" branch -q --unset-upstream l
 GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadconv001 '{"waitForCheckout":false}')" >/dev/null 2>&1
 eq 'a branch left with no upstream gets one at the next prepare' "$(git -C "$C" rev-parse --abbrev-ref "loose@{upstream}" 2>/dev/null)" origin/main
 git -C "$C" switch -q "$CB"
+eq 'a converted clone gets origin/HEAD too' "$(git -C "$C" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)" refs/remotes/origin/main
 eq 'the converted clone is not shallow' "$(git -C "$C" rev-parse --is-shallow-repository)" false
 eq 'and has origin' "$(git -C "$C" config --get remote.origin.url)" https://github.com/org/repo.git
 git -C "$C" rev-parse -q --verify refs/termag/base >/dev/null && fail 'refs/termag/base goes' absent present
 eq 'nothing pushed yet' "$(jq -c .pushes "$TSTATE/result.json")" '[]'
 has 'its unpublished commits are said in the reply' "$(jq -r .result "$TSTATE/result.json")" "branch $CB has 1 commit(s) that were committed but not pushed"
+has 'with the push that publishes them' "$(jq -r .result "$TSTATE/result.json")" "\`git push origin $CB\`"
+has "a never-pushed <branch>-<name> sibling is pushed to its own name, as unpushedParts says" "$(jq -r .result "$TSTATE/result.json")" "\`git push origin $CB-notes\`"
+lacks "not onto the thread's branch" "$(jq -r .result "$TSTATE/result.json")" "git push origin $CB-notes:$CB"
+eq 'and listed as unpushed, so the orchestrator records why nothing was published' "$(jq -c '.unpushed | sort_by(.branch)' "$TSTATE/result.json")" "[{\"branch\":\"$CB\",\"commits\":1,\"to\":\"$CB\"},{\"branch\":\"$CB-notes\",\"commits\":2,\"to\":\"$CB-notes\"}]"
+# The converting turn is told: its resumed session was told to commit on ask and leave publishing to termag.
+has 'the converting turn is told ahead of its prompt' "$(cat "$TSTATE/claude-stdin")" "the \`ask\` branch is now \`$CB\`"
+has 'that TERMAG_ASK_PR_BODY_FILE is gone, and how to edit a PR body' "$(cat "$TSTATE/claude-stdin")" 'termag-pr-body <file> > <marked> && gh pr edit <n> --body-file <marked>'
+has 'and the prompt follows' "$(cat "$TSTATE/claude-stdin")" 'please fix it'
+runp "$(job runconv0003 threadconv001 '{"pushBranch":"'"$CB"'","resumeSessionId":"sess-1"}')"
+eq 'a later turn is not told again' "$(cat "$TSTATE/claude-stdin")" 'please fix it'
+# A chat prepare that converts names the notice for ask-chat.js to put ahead of the turn's message.
+run "$(job runconv0004 threadconv004)"
+out=$(GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadconv004 '{"pushBranch":"termag-ada/threadconv004","waitForCheckout":false}')" 2>/dev/null)
+has 'a converting --prepare names the notice' "$(printf '%s' "$out" | jq -r .notice)" 'the `ask` branch is now `termag-ada/threadconv004`'
+out=$(GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadconv004 '{"pushBranch":"termag-ada/threadconv004","waitForCheckout":false}')" 2>/dev/null)
+eq 'and the next one none' "$(printf '%s' "$out" | jq -r '.notice // "none"')" none
+# A commit on a recreated ask (the session went on as before the conversion) names the thread's branch to push to.
+git -C "$C" switch -q -c ask "$CB" && echo again > "$C/again.txt" && git -C "$C" add again.txt && git -C "$C" -c user.name=a -c user.email=ada@example.com commit -q -m again
+runp "$(job runconv0005 threadconv001 '{"pushBranch":"'"$CB"'","resumeSessionId":"sess-1"}')"
+has "a recreated ask's commits name the thread's branch" "$(jq -r .result "$TSTATE/result.json")" "\`git push origin ask:$CB\`"
+# A detached HEAD's commits on no branch (a canceled turn's, say) are named too.
+git -C "$C" switch -q --detach ask && echo d > "$C/detached.txt" && git -C "$C" add detached.txt && git -C "$C" -c user.name=a -c user.email=ada@example.com commit -q -m detached
+printf '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"sess-1","num_turns":1}\n' > "$HOME/result-dh.json"
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --report "$(job runconv0006 threadconv001 '{"pushBranch":"'"$CB"'"}')" "$HOME/result-dh.json" 2>/dev/null
+has "a detached HEAD's commits are said in the reply" "$(jq -r .result "$TSTATE/result.json")" "with 1 commit(s) on no branch, not pushed"
+has 'with the push to the thread branch' "$(jq -r .result "$TSTATE/result.json")" "\`git push origin HEAD:$CB\`"
+eq 'and listed as HEAD' "$(jq -c '[.unpushed[] | select(.branch == "HEAD")]' "$TSTATE/result.json")" "[{\"branch\":\"HEAD\",\"commits\":1,\"to\":\"$CB\"}]"
+git -C "$C" switch -q "$CB" 2>/dev/null; git -C "$C" branch -q -D ask
+# A branch gh pr checkout made tracks its own origin branch: its commits go there, never onto the thread's branch.
+git -C "$ORIGIN" update-ref refs/heads/fix/other "$(git -C "$ORIGIN" rev-parse refs/heads/main)"
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" git -C "$C" fetch -q origin +refs/heads/fix/other:refs/remotes/origin/fix/other
+git -C "$C" switch -q -c fix/other --track origin/fix/other && echo o > "$C/other.txt" && git -C "$C" add other.txt && git -C "$C" -c user.name=a -c user.email=ada@example.com commit -q -m other
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --report "$(job runconv0007 threadconv001 '{"pushBranch":"'"$CB"'"}')" "$HOME/result-dh.json" 2>/dev/null
+has "a checked-out PR branch's commits name a push to its own branch" "$(jq -r .result "$TSTATE/result.json")" '`git push origin fix/other`'
+eq 'and say so in unpushed' "$(jq -c '[.unpushed[] | select(.branch == "fix/other")]' "$TSTATE/result.json")" '[{"branch":"fix/other","commits":1,"to":"fix/other"}]'
+git -C "$C" switch -q "$CB"; git -C "$C" branch -q -D fix/other; git -C "$C" update-ref -d refs/remotes/origin/fix/other
 # --report decides push vs bundle from the job, not meta.json's layout, which the turn can
 # rewrite: a cleared layout still reports what the clone pushed, and sends no bundle (Bugbot on #902).
 echo none > "$TSTATE/claude-mode"
@@ -552,6 +695,99 @@ git -C "$SW" rev-parse -q --verify refs/heads/feat/target2 >/dev/null && fail "a
 eq "and leaves meta.json's branch alone" "$(jq -r .branch "$ROOT/threads/threadsw0001/meta.json")" feat/target
 GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadsw0001 '{"pushBranch":"feat/target2","waitForCheckout":false}')" >/dev/null 2>&1
 eq "the next prepare, with GitHub back, switches at GitHub's tip" "$(git -C "$SW" rev-parse HEAD) $(jq -r .branch "$ROOT/threads/threadsw0001/meta.json")" "$TGT feat/target2"
+# A checkout that borrows another store (a webapp project borrows the image's
+# baked copy, `git clone --reference`): the clone links that store's packs and
+# loose objects, fetches the rest from the checkout, borrows nothing itself,
+# and outlives both the borrowed store and the checkout. BAKED has a pack (c1)
+# and a loose object (c2); the checkout's own store has c3, the base, and an
+# unpushed commit.
+BAKED="$WORK/baked"
+BPROJ="$HOME/bproj"
+SEED="$WORK/seed"
+gitb() { git -c user.name=o -c user.email=owner@example.com "$@"; }
+git clone -q "$ORIGIN" "$SEED" 2>/dev/null
+git clone -q --no-local "$ORIGIN" "$BAKED" 2>/dev/null && git -C "$BAKED" repack -a -d -q
+echo c2 > "$SEED/c2.txt"; gitb -C "$SEED" add c2.txt; gitb -C "$SEED" commit -q -m c2; gitb -C "$SEED" push -q origin HEAD:main 2>/dev/null
+git -C "$BAKED" fetch -q origin 2>/dev/null
+echo c3 > "$SEED/c3.txt"; gitb -C "$SEED" add c3.txt; gitb -C "$SEED" commit -q -m c3; gitb -C "$SEED" push -q origin HEAD:main 2>/dev/null
+C3=$(git -C "$SEED" rev-parse HEAD)
+git clone -q --reference "$BAKED" "$ORIGIN" "$BPROJ" 2>/dev/null
+echo secret > "$BPROJ/local.txt"; gitb -C "$BPROJ" add local.txt; gitb -C "$BPROJ" commit -q -m 'unpushed here'
+BLIVE=$(git -C "$BPROJ" rev-parse HEAD)
+git -C "$BPROJ" remote set-url origin https://github.com/org/repo.git
+# GitHub's default branch moves on past the base.
+echo c4 > "$SEED/c4.txt"; gitb -C "$SEED" add c4.txt; gitb -C "$SEED" commit -q -m c4; gitb -C "$SEED" push -q origin HEAD:main 2>/dev/null
+C4=$(git -C "$SEED" rev-parse HEAD)
+[ -n "$(ls "$BAKED/.git/objects/pack/"*.pack 2>/dev/null)" ] && [ -n "$(find "$BAKED/.git/objects" -path '*/[0-9a-f][0-9a-f]/*' -type f | head -1)" ] \
+  || fail 'the borrowed store has a pack and a loose object' 'both' "$(ls -R "$BAKED/.git/objects" | head -20)"
+# fetch.unpackLimit=1: every fetch kept as a pack, so history sent twice shows as objects in two packs.
+# gc.autoPackLimit=1, not detached: a git whose auto maintenance repacks after a fetch, as git 2.56's
+# geometric repack does with its defaults; the prepare's fetches run none, so the links stay as linked.
+out=$(GIT_CONFIG_COUNT=4 GIT_CONFIG_KEY_0=fetch.unpackLimit GIT_CONFIG_VALUE_0=1 GIT_CONFIG_KEY_1=gc.autoPackLimit GIT_CONFIG_VALUE_1=1 \
+  GIT_CONFIG_KEY_2=gc.autoDetach GIT_CONFIG_VALUE_2=false GIT_CONFIG_KEY_3=maintenance.autoDetach GIT_CONFIG_VALUE_3=false GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadborrow1 '{"pushBranch":"feat/borrow","waitForCheckout":false,"cwd":"'"$BPROJ"'"}')" 2> "$TSTATE/stderr")
+eq 'a prepare from a borrowing checkout exits 0' "$?" 0
+BR="$ROOT/threads/threadborrow1/repo"
+eq 'the clone is at the base, beyond what the borrowed store has' "$(git -C "$BR" rev-parse HEAD)" "$C3"
+[ -e "$BR/.git/objects/info/alternates" ] && fail 'the clone borrows no store itself' 'no alternates' "$(cat "$BR/.git/objects/info/alternates")"
+bpack=$(ls "$BAKED/.git/objects/pack/"*.pack | head -1)
+[ -e "$BR/.git/objects/pack/multi-pack-index" ] && fail 'the prepare runs no maintenance in the clone' 'no multi-pack-index' present
+[ "$(find "$BR/.git/objects/pack" -name 'pack-*.pack' | wc -l)" -gt 1 ] || fail 'and leaves its packs unrepacked' 'the linked pack and the fetched ones' "$(ls "$BR/.git/objects/pack")"
+eq "the borrowed pack is linked, not copied" "$(ls -i "$BR/.git/objects/pack/${bpack##*/}" 2>/dev/null | awk '{print $1}')" "$(ls -i "$bpack" | awk '{print $1}')"
+git -C "$BR" cat-file -e "$BLIVE^{commit}" 2>/dev/null && fail "the checkout's unpushed commit stays out of a linked clone" absent present
+eq 'and no refs/termag/ are left' "$(git -C "$BR" for-each-ref refs/termag/)" ''
+eq 'it is on its branch, tracking the default one' "$(git -C "$BR" branch --show-current) $(git -C "$BR" rev-parse --abbrev-ref '@{upstream}')" 'feat/borrow origin/main'
+[ -x "$BR/.git/hooks/pre-push" ] || fail 'a linked clone has the pre-push hook' present absent
+eq "origin/main is at GitHub's tip, past the base" "$(git -C "$BR" log -1 --format=%s origin/main)" c4
+# The fetch from GitHub offers the base as a commit the clone has, so it brings
+# only c4, not the base's history over again (no object in two packs).
+eq 'and GitHub sent only what lies beyond the base' "$(git -C "$BR" count-objects -v | awk '$1 == "count:" || $1 == "in-pack:" { n += $2 } END { print n }')" "$(git -C "$BR" cat-file --batch-all-objects --batch-check | wc -l | tr -d ' ')"
+has '--prepare says how long the clone took' "$(printf '%s' "$out" | jq -r '.cloneSeconds | type')" number
+has 'and the log says so, and that it linked' "$(cat "$TSTATE/stderr")" "the thread's clone took "
+has 'naming the links' "$(cat "$TSTATE/stderr")" 'packs linked from the stores'
+# The borrowed store gc'd away and the checkout removed: the clone has its own objects.
+rm -rf "$BAKED" "$BPROJ"
+git -C "$BR" fsck --connectivity-only >/dev/null 2>&1 || fail 'the clone outlives the store it linked and the checkout' 'fsck clean' "$(git -C "$BR" fsck --connectivity-only 2>&1 | head -3)"
+eq 'and reads its whole history' "$(git -C "$BR" log --format=%s | tr '\n' ' ')" 'c3 c2 pushed '
+out=$(GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadborrow1 '{"waitForCheckout":false,"cwd":"'"$PROJ"'"}')" 2>/dev/null)
+lacks "a later prepare of the thread makes no new clone, and says no clone time" "$out" cloneSeconds
+# A store the checkout borrows that can't be read: nothing is linked, and the
+# whole history is fetched from the checkout, as with no store.
+BAKED2="$WORK/baked2"; BPROJ2="$HOME/bproj2"
+git clone -q --no-local "$ORIGIN" "$BAKED2" 2>/dev/null
+git clone -q --reference "$BAKED2" "$ORIGIN" "$BPROJ2" 2>/dev/null
+echo "$WORK/no-such-store/objects" >> "$BPROJ2/.git/objects/info/alternates"
+git -C "$BPROJ2" remote set-url origin https://github.com/org/repo.git
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadborrow2 '{"pushBranch":"feat/borrow2","waitForCheckout":false,"cwd":"'"$BPROJ2"'"}')" >/dev/null 2> "$TSTATE/stderr"
+eq 'a prepare whose borrowed store is unreadable exits 0' "$?" 0
+BR2="$ROOT/threads/threadborrow2/repo"
+has 'and fetches the whole history' "$(cat "$TSTATE/stderr")" 'the whole history fetched from'
+eq 'into a clone at the base' "$(git -C "$BR2" rev-parse HEAD)" "$C4"
+for bp in "$BAKED2/.git/objects/pack/"*.pack; do
+  [ -e "$BR2/.git/objects/pack/${bp##*/}" ] && fail 'with nothing of the store linked' absent "${bp##*/}"
+done
+rm -rf "$BAKED2" "$BPROJ2"
+git -C "$BR2" fsck --connectivity-only >/dev/null 2>&1 || fail 'which stands alone too' 'fsck clean' "$(git -C "$BR2" fsck --connectivity-only 2>&1 | head -3)"
+# A full checkout that borrows a shallow store: the store's tips have no history
+# behind them there, so none is offered as a have and nothing of it is linked;
+# the whole history is fetched from the checkout, which has it all.
+BAKED3="$WORK/baked3"; BPROJ3="$HOME/bproj3"
+git clone -q --depth 1 "file://$ORIGIN" "$BAKED3" 2>/dev/null
+[ -f "$BAKED3/.git/shallow" ] || fail 'the borrowed store is shallow' shallow full
+echo c5 > "$SEED/c5.txt"; gitb -C "$SEED" add c5.txt; gitb -C "$SEED" commit -q -m c5; gitb -C "$SEED" push -q origin HEAD:main 2>/dev/null
+C5=$(git -C "$SEED" rev-parse HEAD)
+git clone -q --no-local "$ORIGIN" "$BPROJ3" 2>/dev/null
+echo "$BAKED3/.git/objects" > "$BPROJ3/.git/objects/info/alternates"
+git -C "$BPROJ3" remote set-url origin https://github.com/org/repo.git
+eq 'the checkout is full' "$(git -C "$BPROJ3" rev-parse --is-shallow-repository)" false
+GIT_CONFIG_GLOBAL="$WORK/box-gitconfig-push" "$SCRIPT" --prepare "$(job '' threadborrow3 '{"pushBranch":"feat/borrow3","waitForCheckout":false,"cwd":"'"$BPROJ3"'"}')" >/dev/null 2> "$TSTATE/stderr"
+eq 'a prepare whose borrowed store is shallow exits 0' "$?" 0
+BR3="$ROOT/threads/threadborrow3/repo"
+has 'and fetches the whole history' "$(cat "$TSTATE/stderr")" 'the whole history fetched from'
+eq 'into a clone at the base' "$(git -C "$BR3" rev-parse HEAD)" "$C5"
+eq 'with no shallow boundary' "$(git -C "$BR3" rev-parse --is-shallow-repository)" false
+rm -rf "$BAKED3" "$BPROJ3"
+git -C "$BR3" fsck --connectivity-only >/dev/null 2>&1 || fail 'and its whole history, standing alone' 'fsck clean' "$(git -C "$BR3" fsck --connectivity-only 2>&1 | head -3)"
+eq 'which reads to the first commit' "$(git -C "$BR3" log --format=%s | tail -1)" pushed
 echo commit > "$TSTATE/claude-mode"
 gitp remote set-url origin "$SAVED_ORIGIN"
 

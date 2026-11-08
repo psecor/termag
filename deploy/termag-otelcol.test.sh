@@ -193,6 +193,14 @@ OBSERVABILITY_OTLP_ENDPOINT=https://otel.example.test'
   JWT_FIX="eyJ""hbGciOiJIUzI1NiJ9.eyJ""zdWIiOiJvcmRlciJ9.c2lnbmF0dXJlX2ZpeHR1cmU"
   GH_FIX="ghp_""0123456789abcdefghijABCDEFGHIJklmnop"
   ANT_FIX="sk-ant-""api03-0123456789abcdefXYZ"
+  # A box confirmation's id (43 base64url characters in production; any length is masked): the key to its sealed share URL (SR11).
+  CONFIRM_ID="Cnf""SecretConfirmId0123456789abcdefghijklmnopq"
+  # A preview link token (22 base64url characters) and a reverify ticket, should a log line
+  # carry them in nginx's default format (SR11; the gateway's own format redacts them first).
+  LINK_TOKEN="Lnk""Tok3nSecretAbcdefgh"
+  TICKET_FIX="Tkt""SecretTicketValue0123456789abcdefghijk"
+  # An app URL in the landing page's next=, percent-encoded, so code= inside it isn't a query name (Cursor Security).
+  NEXT_FIX="Nxt""AppOauthCodeValue0123456789abcdefgh"
   # Every token shape transform/redact knows, in one string, and what it must
   # become. The span carries it as an attribute, as an event's
   # exception.message and as its status message.
@@ -201,8 +209,14 @@ OBSERVABILITY_OTLP_ENDPOINT=https://otel.example.test'
   cat >"$WORK/log/nginx/access.log" <<EOF
 10.0.1.5 - - [06/Oct/2026:21:00:00 +0000] "GET /termag/ws/agent?token=$TOKEN HTTP/1.1" 101 0 "-" "node"
 10.0.1.6 - - [06/Oct/2026:21:00:01 +0000] "GET /termag/auth/oidc/callback?code=s3cr3tc0de&state=st4te HTTP/1.1" 302 0 "-" "Mozilla"
+10.0.1.8 - - [06/Oct/2026:21:00:04 +0000] "GET /termag/previews/confirm/$CONFIRM_ID HTTP/1.1" 200 0 "-" "Mozilla"
+10.0.1.8 - - [06/Oct/2026:21:00:05 +0000] "GET /termag/api/cli/v1/preview-links/confirmations/$CONFIRM_ID?x=1 HTTP/1.1" 200 0 "-" "termag-cli"
+10.0.1.7 - - [06/Oct/2026:21:00:02 +0000] "GET /termag/previews/my-app/$LINK_TOKEN?next=/x HTTP/1.1" 200 0 "-" "Mozilla"
+10.0.1.7 - - [06/Oct/2026:21:00:03 +0000] "GET /termag/previews/my-app/reverify?ticket=$TICKET_FIX HTTP/1.1" 302 0 "-" "Mozilla"
+10.0.1.7 - - [06/Oct/2026:21:00:03 +0000] "GET /termag/previews/my-app?next=%2Fcallback%3Fcode%3D$NEXT_FIX HTTP/1.1" 302 0 "-" "Mozilla"
 EOF
   cat >"$WORK/log/nginx/error.log" <<EOF
+2026/10/06 21:00:06 [error] 7#7: *9 connect() failed (111: Connection refused) while connecting to upstream, client: 10.0.1.9, server: _, request: "GET /termag/api/projects HTTP/1.1", host: "h", referrer: "https://h/termag/previews/my-app/$LINK_TOKEN?next=/x"
 2026/10/06 21:00:02 [error] 7#7: *1 upstream timed out, request: "GET /termag/ws/agent?token=$TOKEN HTTP/1.1", upstream: "http://127.0.0.1:3100/termag/ws/agent?token=$TOKEN"
 EOF
   cat >"$WORK/log/cloudinit-termag.log" <<EOF
@@ -300,9 +314,9 @@ EOF
       [ "$pushed" = 1 ] || sleep 0.2
     done
     [ "$pushed" = 1 ] || fail "collector: the backend's OTLP receiver accepts logs, metrics and traces" "HTTP 200" "no answer on $OTLP"
-    # 15 lines plus the two noise-fixture lines that are kept (the GH-AUTHZ
+    # 17 lines plus the two noise-fixture lines that are kept (the GH-AUTHZ
     # refusal and the near-miss STATUS line); the three dropped ones never count.
-    want_records=17
+    want_records=19
     # The first scrape comes a few seconds in and the batch processor holds
     # it for up to five more, so the metrics side needs the longer wait.
     i=0
@@ -355,7 +369,7 @@ EOF
       case "$spans_sent" in *"$want"*) ;; *) fail "collector: exports the span with" "$want" "missing: $spans_sent" ;; esac
     done
 
-    for secret in "$TOKEN" tmag_cmdline_secret s3cr3tc0de st4te hunter2pass abcdefghijklmnop.qrstuv \
+    for secret in "$TOKEN" "$CONFIRM_ID" "$LINK_TOKEN" "$TICKET_FIX" "$NEXT_FIX" tmag_cmdline_secret s3cr3tc0de st4te hunter2pass abcdefghijklmnop.qrstuv \
       xoxb-1234567890-abcdefghij sdk-12345678-1234-1234-1234-123456789abc "$AWS_KEY_ID" "$JWT_FIX"; do
       case "$sent" in *"$secret"*) fail "collector: masks $secret" "absent" "present" ;; esac
     done
@@ -363,6 +377,12 @@ EOF
       'ws/agent?token=REDACTED HTTP/1.1' \
       'upstream: \"http://127.0.0.1:3100/termag/ws/agent?token=REDACTED\"' \
       'callback?code=REDACTED&state=REDACTED' \
+      '/termag/previews/confirm/REDACTED HTTP/1.1' \
+      '/termag/api/cli/v1/preview-links/confirmations/REDACTED?x=1 HTTP/1.1' \
+      '/termag/previews/my-app/REDACTED?next=REDACTED HTTP/1.1' \
+      '/termag/previews/my-app?next=REDACTED HTTP/1.1' \
+      'referrer: \"https://h/termag/previews/my-app/REDACTED?next=REDACTED\"' \
+      '/termag/previews/my-app/reverify?ticket=REDACTED HTTP/1.1' \
       'postgresql://termag:REDACTED@localhost' \
       'Authorization: REDACTED' \
       'REDACTED_SLACK_TOKEN' 'REDACTED_SDK_KEY' 'REDACTED_AWS_KEY_ID' \

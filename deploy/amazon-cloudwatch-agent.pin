@@ -1,0 +1,16 @@
+# The CloudWatch agent the Bazel cache writer runs (deploy/termag-bazel-cache-writer.user-data.sh
+# installs it, refusing anything whose sha256 isn't this one). arm64 Ubuntu package, from the
+# agent's us-east-2 bucket, which the writer reaches through the VPC's S3 gateway endpoint.
+#
+# Where the hash comes from (2026-11-03): AWS's latest at the time
+# (https://amazoncloudwatch-agent.s3.amazonaws.com/info/latest/CWAGENT_VERSION), downloaded from
+# `url` with its signature `sig_url`. `gpg --verify` said "Good signature from Amazon CloudWatch
+# Agent" with the key at https://amazoncloudwatch-agent.s3.amazonaws.com/assets/amazon-cloudwatch-agent.gpg,
+# whose fingerprint is the one AWS documents ("Verifying the signature of the CloudWatch agent
+# package"): 9376 16F3 450B 7D80 6CBD 9725 D581 6730 3B78 9C72. `dpkg-deb -f` says
+# amazon-cloudwatch-agent 1.300074.1b2005-1, arm64. Then sha256sum.
+#
+# To move it: the same steps for the new version, all three lines together.
+version=1.300074.1b2005
+url=https://amazoncloudwatch-agent-us-east-2.s3.us-east-2.amazonaws.com/ubuntu/arm64/1.300074.1b2005/amazon-cloudwatch-agent.deb
+sha256_linux_arm64=3af82796de0f5ebe230cf72fa9bbcf9270dda9d03cae72bdcf2bee2abe877b26

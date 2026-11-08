@@ -29,6 +29,12 @@
 #                 default ".pyenv .goenv .nvm .local .cargo .config": the same
 #                 set cloud-init scanned, so the rewrite's reach is unchanged.
 #                 Symlinks are indexed under the whole home, as before.
+#   EXCLUDE_DIRS  dirs under HOME_DIR left out of both walks, space-separated,
+#                 matched by full path (not by base name, as grep's
+#                 --exclude-dir would). Default none. A bake that leaves
+#                 database stores under the home (a dev stack's data, say)
+#                 lists their dirs here: a home path rewritten inside one
+#                 would corrupt it, and nothing there needs the rewrite.
 #   REWRITE_SRC   rewrite-home-paths.sh to install; empty skips the install
 #                 default /tmp/rewrite-home-paths.sh (where box.pkr.hcl ships it)
 #   REWRITE_DEST  where to install it    default /usr/local/sbin/termag-rewrite-home-paths
@@ -38,6 +44,7 @@ set -euo pipefail
 HOME_DIR=${HOME_DIR:-/home/termag}
 INDEX_DIR=${INDEX_DIR:-/var/lib/termag-bake/home-paths}
 SCAN_DIRS=${SCAN_DIRS-.pyenv .goenv .nvm .local .cargo .config}
+EXCLUDE_DIRS=${EXCLUDE_DIRS-}
 REWRITE_SRC=${REWRITE_SRC-/tmp/rewrite-home-paths.sh}
 REWRITE_DEST=${REWRITE_DEST:-/usr/local/sbin/termag-rewrite-home-paths}
 if [ "$(id -u)" -eq 0 ]; then SUDO=; else SUDO=${SUDO-sudo}; fi
@@ -54,20 +61,34 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 start=$(date +%s)
 
+# `-path <dir> -prune -o` for every excluded dir, by full path.
+prune=()
+# shellcheck disable=SC2086  # EXCLUDE_DIRS is a space-separated list by contract
+for x in $EXCLUDE_DIRS; do prune+=(-path "$HOME_DIR/$x" -prune -o); done
+
 # Symlinks anywhere under the home whose target is inside the home. %P is the
 # path relative to the starting point; NUL-separated because a name may hold
 # anything.
-$SUDO find "$HOME_DIR" -xdev -type l -lname "$HOME_DIR/*" -printf '%P\0' > "$tmp/symlinks"
+$SUDO find "$HOME_DIR" -xdev "${prune[@]}" -type l -lname "$HOME_DIR/*" -printf '%P\0' > "$tmp/symlinks"
 
 # Text files under the scanned dirs that embed the home path. -I skips binaries
 # (CPython's ELF RUNPATH is handled by cloud-init's ldconfig step, not by sed).
 # grep exits 1 when a dir has no match, which is normal for a binaries-only
-# ~/.cargo, so that is not an error here.
+# ~/.cargo, so that is not an error here. find hands grep the regular files,
+# so the excluded dirs can be pruned by full path; like `grep -r`, it does
+# not follow symlinks and passes no FIFO or device.
 : > "$tmp/files"
+#
+# The existence check goes through $SUDO like the walk itself. The bake runs
+# this as `ubuntu`, and /home/termag is 0750 termag:termag, so a plain
+# `[ -d /home/termag/.local ]` is false for every scanned dir: every image from
+# 2026-09-25 to 2026-11-04 was baked with files=0, and boxes booted with every
+# baked text path (uv tool shebangs and pyvenv.cfg among them) still naming
+# /home/termag. The symlinks were indexed because find already ran under sudo.
 # shellcheck disable=SC2086  # SCAN_DIRS is a space-separated list by contract
 for d in $SCAN_DIRS; do
-  [ -d "$HOME_DIR/$d" ] || continue
-  { $SUDO grep -rIlZ --fixed-strings -- "$HOME_DIR" "$HOME_DIR/$d" || true; } \
+  $SUDO test -d "$HOME_DIR/$d" || continue
+  { $SUDO find "$HOME_DIR/$d" "${prune[@]}" -type f -exec grep -IlZ --fixed-strings -- "$HOME_DIR" {} + || true; } \
     | while IFS= read -r -d '' p; do printf '%s\0' "${p#"$HOME_DIR/"}"; done >> "$tmp/files"
 done
 
@@ -77,6 +98,7 @@ n_files=$(tr -cd '\000' < "$tmp/files" | wc -c | tr -d ' ')
 {
   echo "home=$HOME_DIR"
   echo "scan_dirs=$SCAN_DIRS"
+  echo "exclude_dirs=$EXCLUDE_DIRS"
   echo "symlinks=$n_links"
   echo "files=$n_files"
   echo "indexed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
