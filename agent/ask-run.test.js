@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { CAPABILITIES, PUSH_CAPABILITY, askPushCapable, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun, runnerPath } = require('./ask-run');
+const { CAPABILITIES, MODE_CAP_CAPABILITY, PUSH_CAPABILITY, askModeCapable, askPushCapable, askRunnerInstalled, buildJob, startAskRun, askRunStatus, cancelAskRun, runnerPath } = require('./ask-run');
 
 let home;
 let cwd;
@@ -43,6 +43,14 @@ test('announces ask-v1 only where the runner is installed and executable', () =>
   assert.equal(askRunnerInstalled(home), true);
 });
 
+test("buildJob keeps a permissionMode below the ask's own (auto, dontAsk), and nothing that would raise it", () => {
+  assert.equal(buildJob(msg({ permissionMode: 'auto' }), cwd).permissionMode, 'auto');
+  assert.equal(buildJob(msg({ permissionMode: 'dontAsk' }), cwd).permissionMode, 'dontAsk');
+  for (const permissionMode of ['bypassPermissions', 'acceptEdits', 'nonsense', 3]) {
+    assert.equal('permissionMode' in buildJob(msg({ permissionMode }), cwd), false, String(permissionMode));
+  }
+});
+
 test('buildJob checks every field and cleans the git identity', () => {
   assert.throws(() => buildJob(msg({ runId: '../x' }), cwd), /runId/);
   assert.throws(() => buildJob(msg(), 'relative/dir'), /absolute/);
@@ -73,6 +81,18 @@ test('announces ask-push-v1 only for a runner that says it pushes', () => {
   fs.writeFileSync(runnerPath(h), '#!/bin/sh\n# Pushes: ask-push-v1\n', { mode: 0o755 });
   assert.equal(askPushCapable(h), true);
   assert.equal(PUSH_CAPABILITY, 'ask-push-v1');
+});
+
+test('announces ask-mode-cap-v1 only for a runner that caps a headless run too, as the deployed one does', () => {
+  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-cap-'));
+  assert.equal(askModeCapable(h), false);
+  fs.mkdirSync(path.dirname(runnerPath(h)), { recursive: true });
+  fs.writeFileSync(runnerPath(h), '#!/bin/sh\n# Pushes: ask-push-v1\n', { mode: 0o755 });
+  assert.equal(askModeCapable(h), false, 'a runner from before the cap would run a capped job as bypassPermissions');
+  fs.writeFileSync(runnerPath(h), '#!/bin/sh\n# Caps: ask-mode-cap-v1\n', { mode: 0o755 });
+  assert.equal(askModeCapable(h), true);
+  assert.equal(MODE_CAP_CAPABILITY, 'ask-mode-cap-v1');
+  assert.ok(fs.readFileSync(path.join(__dirname, '../deploy/termag-subagent-run'), 'utf8').includes('# Caps: ask-mode-cap-v1'));
 });
 
 test('startAskRun writes a private job file and starts the runner detached', () => {

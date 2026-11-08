@@ -89,14 +89,87 @@ function parseProbeOutput(text, probes) {
   });
 }
 
-/** OS name and kernel from /etc/os-release and uname. */
-function osEntries(osRelease, kernel) {
+/** OS name and kernel from /etc/os-release and uname; kernelRaw is the line the tab shows on hover. */
+function osEntries(osRelease, kernel, kernelRaw = kernel) {
   const pretty = /^PRETTY_NAME="?([^"\n]*)"?/m.exec(osRelease || '');
   const version = /^VERSION_ID="?([^"\n]*)"?/m.exec(osRelease || '');
   return [
     { name: 'os', ok: !!pretty, version: version ? version[1] : null, raw: pretty ? pretty[1] : null, path: null },
-    { name: 'kernel', ok: !!kernel, version: kernel || null, raw: kernel || null, path: null },
+    { name: 'kernel', ok: !!kernel, version: kernel || null, raw: (kernelRaw || kernel || '').slice(0, 200) || null, path: null },
   ];
+}
+
+// A kernel release as uname and /boot name it: 6.8.0-1067-aws, 7.0.0-1014-aws, 6.8.0-147-generic.
+const RELEASE_RE = /^\d+\.\d+\.\d+-\d+(?:-[a-z0-9]+)*$/;
+/** Order two kernel releases by their numbers (6.8.0-1067 < 6.8.0-1068 < 7.0.0-1014). */
+function compareReleases(a, b) {
+  const na = (a.match(/\d+/g) || []).map(Number); const nb = (b.match(/\d+/g) || []).map(Number);
+  for (let i = 0; i < Math.max(na.length, nb.length); i++) { const d = (na[i] ?? 0) - (nb[i] ?? 0); if (d) return d; }
+  return 0;
+}
+const iso = ms => (Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z') : null);
+
+/**
+ * Pure: the installed kernels and whether the host waits on a reboot, from what readKernelState found.
+ *
+ * - `kernel-installed`: the newest kernel in /boot, which is what the next boot runs (grub's default is the
+ *   /boot/vmlinuz link to it). No kernel there (no /boot, or an empty one: a container) is missing.
+ * - `reboot`: `pending` when /run/reboot-required exists (a package's postinst asked: a kernel, libc, systemd)
+ *   or a newer kernel than the running one is installed, else `no`; `unknown` with no kernel in /boot. Its raw says since when (the oldest of the
+ *   two signals, never before the boot) and why, which the tab shows as "pending 3 d".
+ */
+function kernelEntries({ running, bootedAt = null, installed = null, rebootRequired = null }) {
+  const out = [];
+  // No kernel in /boot (no /boot, or an empty one: a container's) is a fact, not a probe that failed: it is
+  // written over what the host reported before (an ok:false row with a path is transient and would keep a
+  // stale kernel and "pending", store.ts entriesToWrite). kernel-installed is missing, and reboot is
+  // `unknown`, never "no", since nothing says what the next boot runs (Devin on #1218).
+  const found = Array.isArray(installed) ? installed.filter(k => RELEASE_RE.test(k.release)).sort((a, b) => compareReleases(b.release, a.release)) : [];
+  const releases = found.length ? found : null;
+  const newest = releases && releases.length ? releases[0] : null;
+  out.push(newest
+    ? { name: 'kernel-installed', ok: true, version: newest.release, raw: releases.map(k => k.release).join(', ').slice(0, 200), path: '/boot' }
+    : { name: 'kernel-installed', ok: false, version: null, raw: null, path: null });
+  const newerKernel = newest && running && RELEASE_RE.test(running) && compareReleases(newest.release, running) > 0 ? newest : null;
+  if (!rebootRequired && !newerKernel) {
+    out.push(releases ? { name: 'reboot', ok: true, version: 'no', raw: bootedAt ? `booted ${iso(bootedAt)}` : null, path: null }
+      : { name: 'reboot', ok: true, version: 'unknown', raw: 'no kernel in /boot', path: null });
+    return out;
+  }
+  const since = Math.max(Math.min(...[rebootRequired?.at, newerKernel?.at].filter(t => Number.isFinite(t) && t > 0)), bootedAt ?? 0);
+  const why = [
+    newerKernel ? `kernel ${newerKernel.release} installed` : null,
+    rebootRequired?.pkgs?.length ? `packages: ${[...new Set(rebootRequired.pkgs)].join(', ')}` : rebootRequired ? 'reboot-required' : null,
+  ].filter(Boolean).join(' · ');
+  out.push({ name: 'reboot', ok: true, version: 'pending', raw: [Number.isFinite(since) && since > 0 ? `since ${iso(since)}` : null, why].filter(Boolean).join(' · ').slice(0, 200), path: null });
+  return out;
+}
+
+/** When a file came to be: its birth time where the filesystem keeps one (ext4, tmpfs), else its ctime. */
+function bornAt(st) { return st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs; }
+
+/** What kernelEntries reads: /boot's kernels, /run/reboot-required(.pkgs) and the boot time. Never throws. */
+function readKernelState(fsImpl = fs) {
+  let bootedAt = null;
+  try { const m = /^btime (\d+)$/m.exec(fsImpl.readFileSync('/proc/stat', 'utf8')); if (m) bootedAt = Number(m[1]) * 1000; } catch { /* not Linux */ }
+  let installed = null;
+  try {
+    installed = fsImpl.readdirSync('/boot').filter(n => n.startsWith('vmlinuz-')).map(n => {
+      let at = null; try { at = bornAt(fsImpl.statSync(`/boot/${n}`)); } catch { /* raced a removal */ }
+      return { release: n.slice('vmlinuz-'.length), at };
+    });
+  } catch { /* no /boot (a container) */ }
+  let rebootRequired = null;
+  try {
+    const st = fsImpl.statSync('/run/reboot-required');
+    let pkgs = []; let at = st.mtimeMs;
+    try {
+      pkgs = fsImpl.readFileSync('/run/reboot-required.pkgs', 'utf8').split('\n').map(l => l.trim()).filter(l => /^[a-z0-9][a-z0-9+.-]*$/.test(l)).slice(0, 20);
+      at = Math.min(at, bornAt(fsImpl.statSync('/run/reboot-required.pkgs')));
+    } catch { /* no package list */ }
+    rebootRequired = { at, pkgs };
+  } catch { /* no reboot asked for */ }
+  return { bootedAt, installed, rebootRequired };
 }
 
 function readOsRelease() {
@@ -110,11 +183,14 @@ function runProbes(probes, execFileImpl = execFile) {
   });
 }
 
-/** A full inventory: tools, OS and kernel. */
+/** A full inventory: tools, OS, the running and installed kernels, and whether a reboot is pending. */
 async function collectInventory({ orchestrator = false, execFileImpl = execFile } = {}) {
   const probes = orchestrator ? [...PROBES, ...ORCHESTRATOR_PROBES] : PROBES;
   const started = Date.now();
-  const entries = [...await runProbes(probes, execFileImpl), ...osEntries(readOsRelease(), os.release())];
+  const kernel = readKernelState();
+  const running = os.release();
+  const kernelRaw = [running, typeof os.version === 'function' ? os.version() : null, kernel.bootedAt ? `booted ${iso(kernel.bootedAt)}` : null].filter(Boolean).join(' · ');
+  const entries = [...await runProbes(probes, execFileImpl), ...osEntries(readOsRelease(), running, kernelRaw), ...kernelEntries({ running, ...kernel })];
   return { schema: 1, collectedAt: new Date().toISOString(), tookMs: Date.now() - started, entries };
 }
 
@@ -134,7 +210,7 @@ function warmInventory(delayMs = 30_000) {
   t.unref?.();
 }
 
-module.exports = { CAPABILITIES, PROBES, ORCHESTRATOR_PROBES, probeScript, parseProbeOutput, osEntries, collectInventory, getInventory, warmInventory };
+module.exports = { CAPABILITIES, PROBES, ORCHESTRATOR_PROBES, probeScript, parseProbeOutput, osEntries, kernelEntries, readKernelState, compareReleases, collectInventory, getInventory, warmInventory };
 
 if (require.main === module && process.argv.includes('--json')) {
   collectInventory({ orchestrator: process.argv.includes('--orchestrator') })

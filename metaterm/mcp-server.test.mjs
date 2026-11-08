@@ -214,6 +214,29 @@ test('a 401 explains itself; a non-JSON body is an error, not an empty list', as
   await assert.rejects(spa.callTool('list_sessions'), /non-JSON/);
 });
 
+test('an HTML 401 from the edge names the path its bypass lacks, not a wrong build', async () => {
+  // The ALB answers paths outside its box bypass with its own HTML 401, while
+  // the listed ones (GET /sessions) reach termag with the same token.
+  const routes = (p) => (p === '/termag/api/sessions'
+    ? [200, ROWS]
+    : [401, '<html><head><title>401 Authorization Required</title></head></html>', 'text/html']);
+  const { srv } = server(routes, { ownSession: () => 'u-sample-agent' });
+  assert.match(await srv.callTool('list_sessions'), /this host/);
+  for (const [tool, args, re] of [
+    ['search_sessions', { query: 'BIS-2468' }, /GET \/sessions\/search\?q=BIS-2468 → 401 from a sign-in gate .*\/termag\/api\/sessions\/search is not exempt/],
+    ['spawn_budget', {}, /GET \/spawns\/budget\?session=u-sample-agent → 401 from a sign-in gate .*\/termag\/api\/spawns\/budget is not exempt/],
+  ]) {
+    await assert.rejects(srv.callTool(tool, args), (e) => {
+      assert.match(e.message, re);
+      assert.doesNotMatch(e.message, /MetaTerm build|not accepted/);
+      return true;
+    });
+  }
+  // termag's own 401 is JSON and still blames the token.
+  const unauth = server(() => [401, { error: 'Unauthorized' }]).srv;
+  await assert.rejects(unauth.callTool('search_sessions', { query: 'BIS-2468' }), /401: the agent token was not accepted/);
+});
+
 test('tools/call errors come back as isError results, unknown methods as JSON-RPC errors', async () => {
   const { srv } = server(() => [503, { error: "Owner's agent is offline" }]);
   const r = await srv.handle({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'capture_pane', arguments: { projectId: 'p', role: 'ctrl' } } });
@@ -385,10 +408,10 @@ test('spawn_agent refuses outside tmux and when switched off, without calling th
 });
 
 test('spawn_agent passes a backend refusal through', async () => {
-  const { srv } = server(() => [403, { error: 'agent spawn is not enabled for you (feature flag agent-spawn-enabled)' }], {
+  const { srv } = server(() => [409, { error: 'too many open children for this parent', code: 'limit' }], {
     ownSession: () => 'me-proj-agent', head: () => null,
   });
-  await assert.rejects(srv.callTool('spawn_agent', { task: 't' }), /→ 403: agent spawn is not enabled/);
+  await assert.rejects(srv.callTool('spawn_agent', { task: 't' }), /→ 409: too many open children/);
 });
 
 test('report_back posts the status for its own session', async () => {

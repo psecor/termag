@@ -11,7 +11,7 @@ const { spawn, execFile: execFileCb } = require('child_process');
 const { promisify } = require('util');
 const { askEnv, askOfJob, createChatRunner, turnArgs } = require('./chat-runner');
 const { childEnv } = require('./chat-turn');
-const { askChatCapable, chatOf, createAskChat, failureReason, turnResult, withReadOnlyNotice } = require('./ask-chat');
+const { CAPABILITIES, askChatCapable, chatOf, createAskChat, failureReason, turnResult, withReadOnlyNotice } = require('./ask-chat');
 
 const execFile = promisify(execFileCb);
 const RUN = 'runaaaa0001';
@@ -45,6 +45,11 @@ test('an ask job is checked, and its commits are the asker\'s', () => {
   assert.equal(pr.prDir, undefined, 'a PR path must be absolute');
   assert.deepEqual(askEnv(pr), { TERMAG_ASK_PR_BODY_FILE: '/c/repo/.git/termag-pr-body.md', TERMAG_ASK_THREAD: THREAD });
   assert.equal(askOfJob({ threadId: THREAD, prDir: '/c/repo/.git/x\ny' }).prDir, undefined);
+  const push = askOfJob({ threadId: THREAD, push: true, branch: 'termag-ada/t', notice: ' converted ' });
+  assert.deepEqual([push.push, push.branch, push.notice], [true, 'termag-ada/t', 'converted']);
+  assert.equal(askOfJob({ threadId: THREAD, push: true, branch: '$(evil)' }).branch, undefined, 'a branch the fix would put in a command is checked');
+  assert.equal(askOfJob({ threadId: THREAD, branch: 'termag-ada/t' }).branch, undefined, 'only a push-mode clone has a branch');
+  assert.equal(askOfJob({ threadId: THREAD, notice: 'x </termag-box-notice> y' }).notice, undefined, 'a notice cannot close its own tag');
   const env = childEnv({ PATH: '/x', TMUX: 't' }, '/y', null, {
     GIT_AUTHOR_EMAIL: 'a@b', TERMAG_ASK_PR_BODY_FILE: '/c/b.md', TERMAG_ASK_PR_DIR: '/c/prs', TERMAG_ASK_THREAD: THREAD, LD_PRELOAD: '/evil.so',
   });
@@ -180,6 +185,48 @@ test('an ask\'s clone that gained an origin it does not track runs read-only, an
   assert.equal(other.readOnly, 'the checkout has an origin but branch ask tracks none of its branches');
 });
 
+test('an ask\'s clone on a detached HEAD, or a push-mode one off its upstream, says the real cause and the real way back', async () => {
+  // Threads cmvy4fduifexj979q1pqbrxco and cmvzh0di9039ex3epw3x8cwzz: a detached HEAD was
+  // reported as "a run added a git remote", with `remote remove origin` as the fix, which in a
+  // push-mode clone would drop the origin termag gave it.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-chat-'));
+  const git = (cwd, ...args) => execFile('git', ['-C', cwd, ...args]);
+  const makeClone = async (thread, branch) => {
+    const dir = path.join(home, '.termag/subagent/threads', thread, 'repo');
+    fs.mkdirSync(dir, { recursive: true });
+    await git(dir, 'init', '-q', '-b', branch);
+    await git(dir, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'base');
+    await git(dir, 'remote', 'add', 'origin', 'https://github.com/example-org/termag.git');
+    return dir;
+  };
+  const b = box();
+  const r = runner(home, b, { readCheckout: null });
+  const metaOf = async (job) => { const { turnId } = await r.sendMessage(job); const m = b.procs.get(turnId).meta; b.finish(turnId, []); await r.poll(); return m; };
+  const onThread = (thread, runId, cwd, ask = {}) => askJob(runId, 'follow up', { chatKey: `p1--${thread}`, cwd, ask: { threadId: thread, runId, ...ask } });
+
+  // A clone from before ask-push-v1, detached: the HEAD is the cause, and `ask` the way back.
+  const old = await makeClone('threaddddd01', 'ask');
+  await git(old, 'checkout', '-q', '--detach');
+  const o = await metaOf(onThread('threaddddd01', 'runddddd0001', old));
+  assert.equal(o.mode, 'dontAsk');
+  assert.equal(o.readOnly, 'HEAD is detached');
+  assert.equal(o.readOnlyFix, `switch the thread's clone back to its branch (\`git -C ${old} switch ask\`)`);
+
+  // A push-mode clone, detached: its own branch, and its origin stays.
+  const push = await makeClone('threaddddd02', 'termag-ada/threaddddd02');
+  await git(push, 'checkout', '-q', '--detach');
+  const p = await metaOf(onThread('threaddddd02', 'runddddd0002', push, { push: true, branch: 'termag-ada/threaddddd02' }));
+  assert.equal(p.readOnly, 'HEAD is detached');
+  assert.equal(p.readOnlyFix, `switch the thread's clone back to its branch (\`git -C ${push} switch termag-ada/threaddddd02\`)`);
+
+  // A push-mode clone on a branch that tracks nothing: no "a run added a git remote".
+  await git(push, 'switch', '-q', 'termag-ada/threaddddd02');
+  const u = await metaOf(onThread('threaddddd02', 'runddddd0003', push, { push: true, branch: 'termag-ada/threaddddd02' }));
+  assert.equal(u.readOnly, 'the checkout has an origin but branch termag-ada/threaddddd02 tracks none of its branches');
+  assert.doesNotMatch(u.readOnlyFix, /remote remove/);
+  assert.match(u.readOnlyFix, /git push -u origin termag-ada\/threaddddd02/);
+});
+
 test('cancel takes one ask out of its queue, or stops its turn without reporting, keeping what waits behind it', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-chat-'));
   const b = box();
@@ -222,11 +269,18 @@ case $mode in
       sleep 60 & echo $! > "$HOME/prepare-child"; echo $$ > "$HOME/prepare-pid"
       wait; exit 1
     fi
+    cp "$job" "$HOME/last-prepare-job.json"
     t=$(sed -n 's/.*"threadId":"\\([a-z0-9]*\\)".*/\\1/p' "$job")
     fresh=false; [ -d "$HOME/threads/$t/repo" ] || fresh=true
     mkdir -p "$HOME/threads/$t/repo"
-    # prepare-push: a push-mode clone (ask-push-v1), which has no PR description files.
-    if [ -f "$HOME/prepare-push" ]; then
+    # prepare-push: a push-mode clone (ask-push-v1), which has no PR description files;
+    # prepare-notice: one converted for this turn, with the notice the turn is told.
+    if [ -f "$HOME/prepare-push" ] && [ -f "$HOME/prepare-notice" ]; then
+      printf '{"repoDir":"%s","base":"b","repo":"o/r","fresh":%s,"push":true,"branch":"termag-ada/t","notice":"%s"}\\n' "$HOME/threads/$t/repo" "$fresh" "$(cat "$HOME/prepare-notice")"
+    # prepare-timed: a new clone the runner timed (cloneSeconds).
+    elif [ -f "$HOME/prepare-push" ] && [ -f "$HOME/prepare-timed" ]; then
+      printf '{"repoDir":"%s","base":"b","repo":"o/r","fresh":%s,"push":true,"branch":"termag-ada/t","cloneSeconds":%s}\\n' "$HOME/threads/$t/repo" "$fresh" "$(cat "$HOME/prepare-timed")"
+    elif [ -f "$HOME/prepare-push" ]; then
       printf '{"repoDir":"%s","base":"b","repo":"o/r","fresh":%s,"push":true,"branch":"termag-ada/t"}\\n' "$HOME/threads/$t/repo" "$fresh"
     # prepare-prdir: the prDir this runner names (else it names none, as before the PR paths).
     elif [ -f "$HOME/prepare-prdir" ]; then
@@ -239,7 +293,7 @@ case $mode in
 esac
 `;
 
-function askBox() {
+function askBox({ log } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-chat-'));
   fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
   fs.writeFileSync(path.join(home, '.local/bin/termag-subagent-run'), FAKE_RUNNER, { mode: 0o755 });
@@ -251,6 +305,7 @@ function askBox() {
   a = createAskChat({
     home, chats,
     spawn: (cmd, args, opts) => spawn(cmd, args, { ...opts, env }),
+    ...(log ? { log } : {}),
   });
   return { home, b, chats, a };
 }
@@ -281,6 +336,79 @@ test('ask-chat: a push-mode clone\'s turn gets the thread, and no PR description
   assert.equal(proc.meta.env.TERMAG_ASK_PR_DIR, undefined);
   const job = JSON.parse(fs.readFileSync(path.join(home, '.termag/subagent/jobs', `${RUN}.json`), 'utf8'));
   assert.equal(job.pushBranch, 'termag-ada/t', '--prepare reads the branch from the job');
+  assert.equal(proc.meta.ask.push, true, 'the chat runner knows the clone is push-mode');
+  assert.equal(proc.meta.ask.branch, 'termag-ada/t');
+  assert.equal(fs.readFileSync(path.join(proc.dir, 'prompt.txt'), 'utf8'), 'please look', 'a clone not converted tells the turn nothing');
+});
+
+test('ask-chat: the agent logs how long a new thread\'s clone took, as the runner timed it', async () => {
+  const lines = [];
+  const { home, b, a } = askBox({ log: line => lines.push(line) });
+  fs.writeFileSync(path.join(home, 'prepare-push'), '');
+  fs.writeFileSync(path.join(home, 'prepare-timed'), '2.4');
+  a.startRun(runMsg(RUN, { pushBranch: 'termag-ada/t' }), path.join(home, 'proj'));
+  await until(() => [...b.procs.values()][0]);
+  assert.ok(lines.includes(`[ASK] run ${RUN}: the thread's clone took 2.4s`), lines.join('\n'));
+});
+
+test('ask-chat: the turn that converts an older clone for pushing is told so, ahead of its message', async () => {
+  // Threads cmvu5g09a1yubf7cq32w9epcj and cmvvb2y214wcebcmxjjoe4pcc: the conversion renamed `ask`
+  // and the resumed session, told "commit on ask, termag publishes it", committed and stopped.
+  const { home, b, a } = askBox();
+  fs.writeFileSync(path.join(home, 'prepare-push'), '');
+  fs.writeFileSync(path.join(home, 'prepare-notice'), 'termag converted this thread\'s clone for pushing: push it yourself');
+  a.startRun(runMsg(RUN, { pushBranch: 'termag-ada/t' }), path.join(home, 'proj'));
+  const proc = await until(() => [...b.procs.values()][0]);
+  assert.equal(fs.readFileSync(path.join(proc.dir, 'prompt.txt'), 'utf8'),
+    '<termag-box-notice>\ntermag converted this thread\'s clone for pushing: push it yourself\n</termag-box-notice>\n\nplease look');
+  assert.equal(proc.meta.text, 'please look', 'the chat shows the message as sent');
+});
+
+test("ask-chat: a run the orchestrator caps (a project from a shared environment) turns as auto, never loading the checkout's config", async () => {
+  const { home, b, a, chats } = askBox();
+  a.startRun(runMsg(RUN, { permissionMode: 'auto' }), path.join(home, 'proj'));
+  const first = await until(() => [...b.procs.values()][0]);
+  assert.equal(first.meta.mode, 'auto');
+  assert.ok(first.meta.args.includes('--strict-mcp-config') && first.meta.args.includes('--setting-sources'), 'no .mcp.json, hooks or checkout settings');
+  b.finish(first.meta.turnId, [{ type: 'system', subtype: 'init', session_id: 'sess-1234-abcd' }, { type: 'result', result: 'a', session_id: 'sess-1234-abcd' }]);
+  chats.setSession('p1--wsask', { sessionId: 'sess-1234-abcd', cwd: first.meta.cwd });
+  await chats.poll();
+  // A person's message in that ask's chat is capped the same way.
+  const sent = await a.sendMessage({
+    chatKey: 'p1--wsask', projectId: 'p1', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'and this',
+    ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com', permissionMode: 'dontAsk' },
+  }, path.join(home, 'proj'));
+  assert.equal(b.procs.get(sent.turnId).meta.mode, 'dontAsk');
+  // Its prepare knows too, so a clone made again for it never gets the repo's git hooks (termag-subagent-run).
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'last-prepare-job.json'), 'utf8')).permissionMode, 'dontAsk');
+});
+
+test('ask-chat: a run launches on the model ask-run names (termag ask --model), the pinned profile on the gateway', async () => {
+  assert.ok(CAPABILITIES.includes('ask-model-v1'));
+  const modelArg = (args) => (args.includes('--model') ? args[args.indexOf('--model') + 1] : null);
+  const opus = 'us.anthropic.claude-opus-5-5';
+  // On the gateway (the owner's settings carry its CLAUDE_CODE_USE_BEDROCK): the profile, as the orchestrator sent it.
+  {
+    const { home, b, a } = askBox();
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify({ env: { CLAUDE_CODE_USE_BEDROCK: '1' } }));
+    a.startRun(runMsg(RUN, { model: opus }), path.join(home, 'proj'));
+    const proc = await until(() => [...b.procs.values()][0]);
+    assert.equal(modelArg(proc.meta.args), opus);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.termag/subagent/jobs', `${RUN}.json`), 'utf8')).model, opus, 'kept on the job, for a run prepared after a restart');
+  }
+  // Off it (a box-level skip), the profile goes in as its alias, which Claude Code's own login takes.
+  {
+    const { home, b, a } = askBox();
+    a.startRun(runMsg(RUN, { model: opus }), path.join(home, 'proj'));
+    assert.equal(modelArg((await until(() => [...b.procs.values()][0])).meta.args), 'opus');
+  }
+  // None, or one this runner can't launch: no --model, the box's default, as before --model.
+  for (const model of [undefined, 'gpt-5; rm -rf /', 42]) {
+    const { home, b, a } = askBox();
+    a.startRun(runMsg(RUN, model === undefined ? {} : { model }), path.join(home, 'proj'));
+    assert.equal(modelArg((await until(() => [...b.procs.values()][0])).meta.args), null);
+  }
 });
 
 test('ask-chat: the capability needs a runner with the phases', () => {
@@ -471,6 +599,27 @@ test('steer: the reply is Claude\'s last result after it took the follow-up in, 
   assert.equal(turnResult(log([result('A'), result('B')]), 'B').result, 'B', 'no replay (an older Claude): the last result');
   const blocks = { type: 'user', isReplay: true, message: { role: 'user', content: [{ type: 'text', text: 'B' }] } };
   assert.equal(turnResult(log([blocks, result('B')]), 'B').result, 'B');
+});
+
+test('a wake-up after the answer adds to the reply, never replaces it', () => {
+  const log = evs => evs.map(e => JSON.stringify(e)).join('\n');
+  const report = 'The full measurement report.';
+  const closing = 'The watch that just expired was my own log watcher. The report above is final.';
+  const note = '<task-notification>\n<task-id>m1</task-id>\n<status>completed</status>\n</task-notification>';
+  const wake = { type: 'system', subtype: 'task_notification', task_id: 'm1', status: 'completed' };
+  // A wake-up with no user line, one replayed as a user line, and one marked by its origin.
+  assert.equal(turnResult(log([replay('measure'), result(report), wake, result(closing)])).result, `${report}\n\n${closing}`);
+  assert.equal(turnResult(log([replay('measure'), result(report), replay(note), result(closing)])).result, `${report}\n\n${closing}`);
+  const origin = { ...replay('watch done'), origin: { kind: 'task-notification' } };
+  assert.equal(turnResult(log([result(report), origin, result(closing)])).result, `${report}\n\n${closing}`);
+  // An empty wake-up result leaves the answer; the last result's fields stay.
+  const quiet = turnResult(log([result(report), wake, { ...result(''), num_turns: 9 }]));
+  assert.equal(quiet.result, report);
+  assert.equal(quiet.num_turns, 9);
+  // A steered follow-up's reply is its own results only, wake-ups included.
+  assert.equal(turnResult(log([result('A'), replay('B'), result('B'), wake, result('done')]), 'B').result, 'B\n\ndone');
+  // A new prompt taken in starts the reply over.
+  assert.equal(turnResult(log([result('A'), replay('a person\'s message'), result('C')])).result, 'C');
 });
 
 test('steer (runner): only the ask a live turn answers now takes a follow-up, through its inbox, and the chain survives on disk', async () => {
@@ -704,7 +853,8 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
   const a2 = createAskChat({ home, chats: r, spawn: (cmd, args, opts) => spawn(cmd, args, { ...opts, env: { ...process.env, HOME: home } }) });
   a2.startRun(runMsg(RUN, { telemetry: ask }), path.join(home, 'proj'));
   const first = await until(() => [...b.procs.values()][0]);
-  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', ask });
+  // The run's checkout goes with it, for the repository on the resource (termag.repo).
+  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask });
   assert.equal(first.meta.env.TERMAG_SESSION_KIND, 'ask', 'the run\'s environment names its kind too');
   b.finish(first.meta.turnId, [{ type: 'system', subtype: 'init', session_id: 'sess-1234-abcd' }, { type: 'result', result: 'a', session_id: 'sess-1234-abcd' }]);
   r.setSession('p1--wsask', { sessionId: 'sess-1234-abcd', cwd: first.meta.cwd });
@@ -714,7 +864,7 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
     chatKey: 'p1--wsask', projectId: 'p1', project: 'webapp', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'and also this',
     ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com', telemetry: person },
   }, path.join(home, 'proj'));
-  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: `ask-${THREAD}`, kind: 'ask', ask: person });
+  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: person });
   assert.equal([...b.procs.values()].at(-1).meta.env.TERMAG_SESSION_KIND, 'ask', 'a person\'s turn in the thread\'s chat is the same session');
   // An older orchestrator's message names no one: the thread alone, still kind ask.
   b.finish([...b.procs.values()].at(-1).meta.turnId, [{ type: 'result', result: 'b', session_id: 'sess-1234-abcd' }]);
@@ -723,7 +873,7 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
     chatKey: 'p1--wsask', projectId: 'p1', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'one more',
     ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com' },
   }, path.join(home, 'proj'));
-  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', ask: { thread: THREAD } });
+  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: { thread: THREAD } });
 });
 
 test('ask-chat: the chat keeps the project\'s name for its telemetry, and an older orchestrator\'s chat has none', () => {
@@ -731,4 +881,120 @@ test('ask-chat: the chat keeps the project\'s name for its telemetry, and an old
   assert.equal(chatOf({ chat: { ...chat, project: 'webapp' } }).project, 'webapp');
   assert.equal('project' in chatOf({ chat }), false);
   assert.equal('project' in chatOf({ chat: { ...chat, project: 7 } }), false);
+});
+
+test("ask-chat: a person's message sent again with its send id starts one turn (chat-send-ids.js)", async () => {
+  const { home, b, a, chats } = askBox();
+  a.startRun(runMsg(RUN), path.join(home, 'proj'));
+  const first = await until(() => [...b.procs.values()][0]);
+  b.finish(first.meta.turnId, [{ type: 'system', subtype: 'init', session_id: 'sess-1234-abcd' }, { type: 'result', result: 'a', session_id: 'sess-1234-abcd' }]);
+  chats.setSession('p1--wsask', { sessionId: 'sess-1234-abcd', cwd: first.meta.cwd });
+  await chats.poll();
+  const msg = {
+    chatKey: 'p1--wsask', projectId: 'p1', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'and this', sendId: 'ask-msg-0001',
+    ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com' },
+  };
+  const sent = await a.sendMessage(msg, path.join(home, 'proj'));
+  const again = await a.sendMessage(msg, path.join(home, 'proj'));
+  assert.equal(again.duplicate, true);
+  assert.equal(again.turnId, sent.turnId);
+  assert.equal([...b.procs.values()].filter(p => p.meta.text === 'and this').length, 1);
+});
+
+test('a user line the chat does not show as a message (a reminder, /compact\'s echo, a local command) keeps the reply', () => {
+  const log = evs => evs.map(e => JSON.stringify(e)).join('\n');
+  const report = 'The full measurement report.';
+  const lines = [
+    '<system-reminder>\nA reminder Claude Code adds for the model.\n</system-reminder>',
+    '<local-command-stdout>Compacted </local-command-stdout>',
+    '<command-name>/compact</command-name>\n<command-message>compact</command-message>',
+    '<local-command-stdout>Some command output</local-command-stdout>',
+    'This session is being continued from a previous conversation that ran out of context.',
+    '[Request interrupted by user]',
+  ];
+  for (const text of lines) {
+    assert.equal(turnResult(log([replay('measure'), result(report), replay(text), result('done')])).result, `${report}\n\ndone`, text);
+  }
+  const marked = [{ isCompactSummary: true }, { isMeta: true }, { isSynthetic: true }, { parent_tool_use_id: 'toolu_1' }];
+  for (const mark of marked) {
+    assert.equal(turnResult(log([result(report), { ...replay('text'), ...mark }, result('done')])).result, `${report}\n\ndone`, JSON.stringify(mark));
+  }
+  // An image the person sent is a prompt of its own.
+  const image = { type: 'user', isReplay: true, message: { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }] } };
+  assert.equal(turnResult(log([result(report), image, result('C')])).result, 'C');
+});
+
+test('an interrupted attempt\'s error is not part of a later answer; a final error is the reply', () => {
+  const log = evs => evs.map(e => JSON.stringify(e)).join('\n');
+  const interrupted = { type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Interrupted', num_turns: 0 };
+  const wake = { type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'completed' };
+  // A turn-only interrupt, then the background build wakes Claude into its answer.
+  const after = turnResult(log([replay('build it'), interrupted, wake, result('Build passed'), wake, result('That was my watcher.')]));
+  assert.equal(after.result, 'Build passed\n\nThat was my watcher.');
+  assert.equal(after.is_error, false);
+  // An error after the answer is the outcome: the reply says it, and only it.
+  const failed = turnResult(log([replay('build it'), result('Build passed'), wake, interrupted]));
+  assert.equal(failed.result, 'Interrupted');
+  assert.equal(failed.is_error, true);
+});
+
+const { withPushScopeNotice } = require('./ask-chat');
+const { WORKFLOW_SCOPE_HINT, isWorkflowScopeRefusal } = require('./workflow-scope');
+const OAUTH_REFUSAL = ' ! [remote rejected] HEAD -> termag-alice/t (refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without `workflow` scope)\nerror: failed to push some refs';
+const TIMEOUT_REFUSAL = ' ! [remote rejected] b -> b (Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required)';
+const bashResult = (content, isError = true) => ({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content, is_error: isError }] } });
+const logOf = (...events) => events.map(e => JSON.stringify(e)).join('\n');
+
+test('workflow scope: both of GitHub\'s refusals are recognized, and nothing else', () => {
+  assert.equal(isWorkflowScopeRefusal(OAUTH_REFUSAL), true);
+  assert.equal(isWorkflowScopeRefusal(TIMEOUT_REFUSAL), true);
+  assert.equal(isWorkflowScopeRefusal(' ! [rejected] b -> b (fetch first)'), false);
+  assert.equal(isWorkflowScopeRefusal(undefined), false);
+});
+
+test('workflow scope: a turn whose push GitHub refused ends its reply with the hint, once', () => {
+  for (const refusal of [OAUTH_REFUSAL, [{ type: 'text', text: `Exit code 1\n${TIMEOUT_REFUSAL}` }]]) {
+    const log = logOf(replay('push it'), bashResult(refusal), result('The push failed.'));
+    const out = withPushScopeNotice(turnResult(log), log);
+    assert.equal(out.result, `The push failed.\n\n[${WORKFLOW_SCOPE_HINT}]`);
+    assert.deepEqual(withPushScopeNotice(out, log), out);
+  }
+});
+
+test("workflow scope: no hint without a refusal, or for an earlier turn's", () => {
+  const ok = logOf(replay('push it'), bashResult('To github.com:org/repo.git\n   abc..def  HEAD -> b', false), result('Pushed.'));
+  assert.equal(withPushScopeNotice(turnResult(ok), ok).result, 'Pushed.');
+  const earlier = logOf(replay('push it'), bashResult(OAUTH_REFUSAL), result('Failed.'), replay('now rebase and push'), bashResult('done', false), result('Pushed.'));
+  assert.equal(withPushScopeNotice(turnResult(earlier), earlier).result, 'Pushed.');
+});
+
+// The ask clone's pre-push hook prints an advisory for any push that carries a workflow
+// change; read from the script, so a change to its wording is tested too.
+const HOOK_ADVISORY = (() => {
+  const script = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'termag-subagent-run'), 'utf8');
+  const m = /<<'SCOPE'\n([\s\S]*?)\nSCOPE\n/.exec(script);
+  assert.ok(m, "termag-subagent-run's pre-push hook has its SCOPE advisory");
+  return m[1];
+})();
+
+test("workflow scope: a successful push whose output holds the pre-push hook's advisory gets no hint", () => {
+  const out = `${HOOK_ADVISORY}\nTo https://github.com/org/repo.git\n * [new branch]      HEAD -> termag-alice/t`;
+  assert.equal(isWorkflowScopeRefusal(out), false);
+  const log = logOf(replay('push it'), bashResult(out, false), result('Pushed.'));
+  assert.equal(withPushScopeNotice(turnResult(log), log).result, 'Pushed.');
+});
+
+test('workflow scope: reading text that quotes the refusals gets no hint', () => {
+  // Prose that quotes both refusals, as a doc about the token's scopes does.
+  const docs = [
+    'GitHub checks `workflow` on every push whose commits change a file under',
+    '`.github/workflows` compared with GitHub\'s copy. A token without it is refused with',
+    '"refusing to allow an OAuth App to create or update workflow … without `workflow` scope",',
+    'or, on a large repository, "Unable to determine if workflow can be created or updated due',
+    'to timeout; `workflows` scope may be required".',
+  ].join('\n');
+  for (const isError of [false, true]) {
+    const log = logOf(replay('read the docs'), bashResult(docs, isError), result('Read them.'));
+    assert.equal(withPushScopeNotice(turnResult(log), log).result, 'Read them.');
+  }
 });

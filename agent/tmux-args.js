@@ -88,9 +88,21 @@ function newSessionArgv(sessionName, cwd, command = null, env = {}) {
 function newSessionOptionArgvs(sessionName) {
   const target = tmuxPaneTarget(sessionName, true);
   return [
-    ['set-option', '-t', target, '-w', 'window-size', 'largest'],
+    windowSizeOptionArgv(sessionName),
     ['set-option', '-t', target, 'history-limit', '10000'],
   ];
+}
+
+/**
+ * `window-size latest`: the window takes the size of the client used last.
+ * Sessions used to get `largest`, which kept it at the widest attached client,
+ * so every narrower one (a terminal beside a browser tab, or any client beside
+ * an ssh attach left behind by a dropped connection) saw it clipped, with
+ * Claude's lines unwrapped. terminal-attach sets it again so those sessions
+ * change too.
+ */
+function windowSizeOptionArgv(sessionName) {
+  return ['set-option', '-t', tmuxPaneTarget(sessionName, true), '-w', 'window-size', 'latest'];
 }
 
 /**
@@ -185,4 +197,4 @@ function tailLines(text, n) {
  */
 const CAPABILITIES = ['tmux-create-command-v1'];
 
-module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv, CAPABILITIES, SESSION_ENV };
+module.exports = { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, windowSizeOptionArgv, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv, CAPABILITIES, SESSION_ENV };

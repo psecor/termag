@@ -7,7 +7,7 @@
  * and memory can be read against it, and how many
  * SSH and SSM sessions are open, which the orchestrator's idle sweep counts
  * as the box being in use, and how many tunnels
- * are open (`tunnels: { t3, port }`; an open port forward counts as busy
+ * are open (`tunnels: { t3, port }`; an open port forward counts as busy (a preview link's tunnel doesn't)
  * too). Carried on the `hello` and answered by the
  * `host-sample` RPC. Linux's /proc and POSIX df; anything unreadable is null,
  * never a guess. The parsers are pure and tested.

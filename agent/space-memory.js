@@ -1,10 +1,9 @@
 'use strict';
 /**
- * A space's shared agent memory in chat-runner turns (capability space-memory-v1).
- * Before each turn the box CLI syncs the
- * session's space (`termag space memory context --refresh 60s`, which also
- * asks the orchestrator whether space-memory-enabled is on for this user) and
- * says what this session should be told.
+ * A space's shared agent memory in chat-runner turns
+ * (capability space-memory-v1). Before each turn the box CLI syncs the
+ * session's space (`termag space memory context --refresh 60s`) and says
+ * what this session should be told.
  *
  * The prompt cache decides the shape. A session's system prompt is fixed at
  * its start: the first turn of a session gets the space's index (prompt.md
@@ -25,7 +24,7 @@
  * the turn's own message instead, once per change, wrapped in
  * <space-memory-notice> so the chat's history and live events never show it
  * as something the person typed (stripNotice). A session that began before
- * memory loaded (an older agent, the flag turned on later) keeps its prompt
+ * memory loaded (an older agent) keeps its prompt
  * as it is and gets a notice pointing at the index. A new session (a first
  * turn, or Clear, which drops the session id) starts over.
  *

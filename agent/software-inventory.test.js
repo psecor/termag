@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { PROBES, ORCHESTRATOR_PROBES, probeScript, parseProbeOutput, osEntries } = require('./software-inventory');
+const { PROBES, ORCHESTRATOR_PROBES, probeScript, parseProbeOutput, osEntries, kernelEntries, readKernelState, compareReleases } = require('./software-inventory');
 
 // First lines as the real tools print them (2026-10-15).
 const OUTPUT = [
@@ -87,4 +87,97 @@ test('reads the OS and kernel', () => {
     { name: 'os', ok: true, version: '24.04', raw: 'Ubuntu 24.04.5 LTS', path: null },
     { name: 'kernel', ok: true, version: '7.0.0-1013-aws', raw: '7.0.0-1013-aws', path: null },
   ]);
+});
+
+test('keeps the kernel hover line when one is given', () => {
+  const [, kernel] = osEntries('', '6.8.0-1067-aws', '6.8.0-1067-aws · #70-Ubuntu SMP · booted 2026-11-03T15:47:32Z');
+  assert.deepStrictEqual(kernel, { name: 'kernel', ok: true, version: '6.8.0-1067-aws', raw: '6.8.0-1067-aws · #70-Ubuntu SMP · booted 2026-11-03T15:47:32Z', path: null });
+});
+
+const T = s => Date.parse(s);
+const booted = T('2026-11-01T08:00:00Z');
+
+test('no reboot pending: the newest installed kernel is the running one', () => {
+  assert.deepStrictEqual(kernelEntries({ running: '6.8.0-1067-aws', bootedAt: booted, installed: [{ release: '6.8.0-1067-aws', at: booted }], rebootRequired: null }), [
+    { name: 'kernel-installed', ok: true, version: '6.8.0-1067-aws', raw: '6.8.0-1067-aws', path: '/boot' },
+    { name: 'reboot', ok: true, version: 'no', raw: 'booted 2026-11-01T08:00:00Z', path: null },
+  ]);
+});
+
+test('a newer kernel installed than the running one is a pending reboot, since its install', () => {
+  const [installed, reboot] = kernelEntries({
+    running: '6.8.0-1067-aws', bootedAt: booted,
+    // Unsorted, and 1067 < 1068 < 1070 by number, not by string.
+    installed: [{ release: '6.8.0-1068-aws', at: T('2026-11-02T06:10:00Z') }, { release: '6.8.0-1067-aws', at: T('2026-10-01T00:00:00Z') }],
+    rebootRequired: null,
+  });
+  assert.deepStrictEqual(installed, { name: 'kernel-installed', ok: true, version: '6.8.0-1068-aws', raw: '6.8.0-1068-aws, 6.8.0-1067-aws', path: '/boot' });
+  assert.deepStrictEqual(reboot, { name: 'reboot', ok: true, version: 'pending', raw: 'since 2026-11-02T06:10:00Z · kernel 6.8.0-1068-aws installed', path: null });
+});
+
+test('reboot-required with its packages, and the older signal sets since', () => {
+  const [, reboot] = kernelEntries({
+    running: '6.8.0-1067-aws', bootedAt: booted,
+    installed: [{ release: '6.8.0-1068-aws', at: T('2026-11-02T06:10:00Z') }, { release: '6.8.0-1067-aws', at: booted }],
+    rebootRequired: { at: T('2026-11-02T06:09:00Z'), pkgs: ['linux-image-6.8.0-1068-aws', 'linux-base', 'linux-base'] },
+  });
+  assert.strictEqual(reboot.version, 'pending');
+  assert.strictEqual(reboot.raw, 'since 2026-11-02T06:09:00Z · kernel 6.8.0-1068-aws installed · packages: linux-image-6.8.0-1068-aws, linux-base');
+});
+
+test('a reboot asked for by a package alone, and since never before the boot', () => {
+  const [, reboot] = kernelEntries({ running: '6.8.0-1067-aws', bootedAt: booted, installed: [{ release: '6.8.0-1067-aws', at: T('2026-10-01T00:00:00Z') }], rebootRequired: { at: T('2026-10-31T00:00:00Z'), pkgs: [] } });
+  assert.deepStrictEqual(reboot, { name: 'reboot', ok: true, version: 'pending', raw: 'since 2026-11-01T08:00:00Z · reboot-required', path: null });
+});
+
+test('an older kernel left in /boot is not a pending reboot', () => {
+  const [installed, reboot] = kernelEntries({ running: '7.0.0-1014-aws', bootedAt: booted, installed: [{ release: '6.8.0-1067-aws', at: booted }, { release: '7.0.0-1014-aws', at: booted }] });
+  assert.strictEqual(installed.version, '7.0.0-1014-aws');
+  assert.strictEqual(reboot.version, 'no');
+});
+
+test('no /boot, or an empty one (a container): kernel-installed missing and reboot unknown, both written over old rows', () => {
+  const none = [
+    { name: 'kernel-installed', ok: false, version: null, raw: null, path: null },
+    { name: 'reboot', ok: true, version: 'unknown', raw: 'no kernel in /boot', path: null },
+  ];
+  assert.deepStrictEqual(kernelEntries({ running: '7.0.0-1014-aws', bootedAt: booted, installed: null }), none);
+  assert.deepStrictEqual(kernelEntries({ running: '7.0.0-1014-aws', bootedAt: booted, installed: [] }), none);
+  // Nor does a /boot with only an image that isn't a kernel release.
+  assert.deepStrictEqual(kernelEntries({ running: '7.0.0-1014-aws', installed: [{ release: 'old', at: 1 }] }), none);
+  // Neither row is transient (ok false with a path), so a stale kernel and "pending" are replaced (Devin on #1218).
+  for (const e of none) assert.ok(e.ok || !e.path);
+  // A reboot-required file still says pending without /boot.
+  assert.strictEqual(kernelEntries({ running: '7.0.0-1014-aws', bootedAt: booted, installed: null, rebootRequired: { at: T('2026-11-02T00:00:00Z'), pkgs: ['libc6'] } })[1].version, 'pending');
+});
+
+test('readKernelState reads /proc/stat, /boot and /run/reboot-required through fs', () => {
+  const files = {
+    '/proc/stat': 'cpu  1 2 3\nbtime 1793726865\nprocesses 9\n',
+    '/run/reboot-required.pkgs': 'linux-image-6.8.0-1068-aws\nlinux-base\n$(evil)\n',
+  };
+  const stats = {
+    '/boot/vmlinuz-6.8.0-1068-aws': { birthtimeMs: 2000, ctimeMs: 3000, mtimeMs: 1 },
+    '/run/reboot-required': { mtimeMs: 5000 },
+    '/run/reboot-required.pkgs': { birthtimeMs: 0, ctimeMs: 4000 },
+  };
+  const fake = {
+    readFileSync: p => { if (p in files) return files[p]; throw new Error('ENOENT'); },
+    readdirSync: p => { if (p === '/boot') return ['vmlinuz-6.8.0-1068-aws', 'vmlinuz', 'initrd.img-6.8.0-1068-aws']; throw new Error('ENOENT'); },
+    statSync: p => { if (p in stats) return stats[p]; throw new Error('ENOENT'); },
+  };
+  assert.deepStrictEqual(readKernelState(fake), {
+    bootedAt: 1793726865000,
+    installed: [{ release: '6.8.0-1068-aws', at: 2000 }],
+    rebootRequired: { at: 4000, pkgs: ['linux-image-6.8.0-1068-aws', 'linux-base'] },
+  });
+  const none = { readFileSync: () => { throw new Error('ENOENT'); }, readdirSync: () => { throw new Error('ENOENT'); }, statSync: () => { throw new Error('ENOENT'); } };
+  assert.deepStrictEqual(readKernelState(none), { bootedAt: null, installed: null, rebootRequired: null });
+});
+
+test('kernel releases order by number', () => {
+  assert.ok(compareReleases('6.8.0-1067-aws', '6.8.0-1068-aws') < 0);
+  assert.ok(compareReleases('6.8.0-1070-aws', '6.8.0-1068-aws') > 0);
+  assert.ok(compareReleases('7.0.0-1014-aws', '6.8.0-1067-aws') > 0);
+  assert.strictEqual(compareReleases('6.8.0-1067-aws', '6.8.0-1067-aws'), 0);
 });

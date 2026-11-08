@@ -39,3 +39,38 @@ Normaliser rules these support:
 - Failure = exit ≠ 0, or no `agent_settled`, or last assistant `stopReason === "error"` (JSON mode exits 0 on model/HTTP errors).
 - Sum `usage` over the assistant `message_end`s of the run: `input/output/cacheRead/cacheWrite/reasoning/totalTokens`; `cost.total` is
   **0** on the broker (present, zero).
+
+## `1.5.0/`: pi 1.5.0, the pin from 2026-11-03
+
+Recorded 2026-11-03 on a box with pi 1.5.0 (installed by `deploy/termag-pi-update`, #1213) for the pin bump
+the gotcha "A pi turn ends on `agent_settled`" asks for. `agent/pi-events.test.js` replays them with the same
+contracts as the 1.0.2 set. Every run was
+
+```
+cd <scratch cwd> && PI_CODING_AGENT_DIR=<scratch>/agent TERMAG_PI_EXT=/nonexistent/… deploy/termag-pi-headless -p --mode json [args] < /dev/null > X.jsonl
+```
+
+Two parts differ from the 1.0.2 set, because the box had no AWS SSO session (`aws sso login` needs a person
+to approve a device code):
+
+- **The model is a stand-in.** pi talks to a local OpenAI-compatible server through a provider block
+  in `models.json`, in the shape a model broker writes
+  (`openai-completions`, `http://127.0.0.1:<port>/v1`, `authHeader: true`). The model id is `df-test`; the
+  broker's aliases carry a prefix. The stand-in answers `pong N: …`, calls `bash` for a prompt
+  ending in `RUN:<command>`, and gives the broker's 403 for `--model no-such-model`.
+- **`pi-headless` is a launcher's last line only**, `exec pi --provider <broker> "$@"`, without
+  its SSO check and broker start.
+
+So these pin down what pi 1.5.0 does with a broker-shaped provider, not what a broker's models say.
+Scrubbing is the same as above.
+
+| Fixture | Args / how | Exit | Notes |
+|---|---|---|---|
+| `success.jsonl` | no tools | 0 | as 1.0.2: system message, …, `agent_end` → `agent_settled` |
+| `tool-use-bash.jsonl` | `--session-id <fresh uuid>`, `RUN:echo fixture-ok` | 0 | one `bash` call; `toolcall_*` in `message_update`, `tool_execution_start/update/end`, a `toolResult` message, then the answer |
+| `resumed-session-id.jsonl` | same `--session-id` | 0 | same session; only this run's messages, no system message |
+| `resumed-continue.jsonl` | `--continue` in the same cwd | 0 | the same session again |
+| `error-bad-model.jsonl` | `--model no-such-model` (403) | **0** | last assistant `stopReason:"error"`, `errorMessage:"403: …"`; still `agent_end`, `agent_settled` |
+| `readonly-bash-refused.jsonl` | `--tools read,grep,find,ls --no-skills --no-approve`, `RUN:touch …` | 0 | the model is offered only those 4; its `bash` call gets an error result, nothing written |
+| `interrupted-sigterm-tool.jsonl` | SIGTERM to pi during `RUN:sleep 61` | **143** | ends after `tool_execution_update`; no `agent_end`/`agent_settled` |
+| `session-file-v3-tool-use.jsonl` | the **session file** of the tool-use run and its 2 resumes | – | still v3: `session`, `model_change`, `thinking_level_change`, `message` |

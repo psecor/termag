@@ -38,11 +38,20 @@ const fs = require('fs');
 const path = require('path');
 const askRun = require('./ask-run');
 const { sessionIdFrom } = require('./chat-turn');
+const { userMessageKind } = require('./tool-group-headings');
+const { WORKFLOW_SCOPE_HINT, isWorkflowScopeRefusal } = require('./workflow-scope');
 
-const CAPABILITIES = ['ask-chat-v1', 'ask-steer-v1'];
+// ask-model-v1: an ask-run's `model` (termag ask --model) is the turn's --model.
+const CAPABILITIES = ['ask-chat-v1', 'ask-steer-v1', 'ask-model-v1'];
+/** An ask-run `model` the chat runner may launch with (chat-runner.js claudeModelArg): a tier alias or a US Anthropic profile id. */
+const LAUNCH_MODEL = /^(opus|sonnet|haiku|us\.anthropic\.claude-[A-Za-z0-9._:-]{1,80})$/;
+/** The job's `model`, when the orchestrator named one this runner takes; anything else is left out (the box's default). */
+const modelOf = (msg) => (typeof msg.model === 'string' && LAUNCH_MODEL.test(msg.model) ? { model: msg.model } : {});
 const RUN_ID_RE = /^[a-z0-9]{8,40}$/;
 const PHASES_MARKER = 'Phases: ask-chat-v1';
 const TRUSTED_MODE = 'bypassPermissions';
+/** An ask's mode: its own, or the lower one the orchestrator capped it at (ask-run.js CAPPED_MODES). */
+const askMode = (capped) => (askRun.CAPPED_MODES.includes(capped) ? capped : TRUSTED_MODE);
 // The script waits up to five minutes for a checkout to land, then clones.
 const PREPARE_TIMEOUT_MS = 15 * 60 * 1000;
 const STOPPED = 'The ask\'s turn on the target box stopped before Claude answered.';
@@ -78,13 +87,32 @@ function contentText(content) {
 }
 
 /**
+ * A prompt Claude took in (its replay): a line the chat shows as a person's
+ * or an ask's message (tool-group-headings.js userMessageKind, as
+ * chat/sdkChat.ts draws it). A task's notification, a reminder, a local
+ * command's or /compact's echo, a compaction's summary, Claude Code's own
+ * text and a subagent's prompt are not. A line with no text (an image) is.
+ */
+function isPrompt(ev) {
+  if (!ev || ev.type !== 'user' || ev.isReplay !== true) return false;
+  const text = contentText(ev.message && ev.message.content);
+  return userMessageKind(ev, typeof text === 'string' ? text : '', false) === 'message';
+}
+
+/**
  * The reply of a finished turn, as the result event termag-subagent-run
  * reports: Claude's own last `result`, else an error naming why there is
  * none (stopped, or the runner's last error), keeping the session so the
- * thread's next ask resumes it. With `after` (a follow-up steered into the
- * turn), only a result after Claude took that message in counts: its replay
- * (--replay-user-messages) is where it did. A log with no such replay (an
- * older Claude) falls back to the last result.
+ * thread's next ask resumes it. A background task (a Monitor, a background
+ * command or agent) that ends after Claude answered wakes it into another
+ * `result` in the same turn, often a short "that was my watcher" note, so the
+ * reply is every result's text since the last prompt Claude took in
+ * (isPrompt), in order: a wake-up never replaces the answer. An error
+ * result (an interrupt) ends its attempt: the reply is the results after the
+ * last one, or that error alone when it is the last result. With `after` (a follow-up steered into
+ * the turn), only results after Claude took that message in count: its
+ * replay (--replay-user-messages) is where it did. A log with no such replay
+ * (an older Claude) falls back to the last result.
  */
 function turnResult(log, after = null) {
   const events = [];
@@ -101,13 +129,25 @@ function turnResult(log, after = null) {
     }
   }
   let result = null;
+  let texts = [];
   let runnerError = null;
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
-    if (ev && ev.type === 'result') { if (i >= from) result = ev; }
-    else if (ev && ev.type === 'runner-error' && typeof ev.message === 'string') runnerError = ev.message;
+    if (ev && ev.type === 'result') {
+      if (i < from) continue;
+      // An error result ends its attempt: an error, or an answer after one, starts the reply over.
+      if (ev.is_error === true || (result && result.is_error === true)) texts = [];
+      result = ev;
+      if (typeof ev.result === 'string' && ev.result.trim()) texts.push(ev.result);
+    } else if (ev && ev.type === 'runner-error' && typeof ev.message === 'string') runnerError = ev.message;
+    else if (i >= from && isPrompt(ev)) texts = [];
   }
-  if (result) return result;
+  // An older Claude's log without the follow-up's replay can't tell its results apart: the last one.
+  if (result && after != null && !replayed) return result;
+  if (result) {
+    const text = texts.join('\n\n');
+    return text && text !== result.result ? { ...result, result: text } : result;
+  }
   const stopped = replayed ? STOPPED_FOLLOW_UP : STOPPED;
   return {
     type: 'result',
@@ -152,6 +192,37 @@ function withReadOnlyNotice(result, readOnly, fix) {
   const back = typeof fix === 'string' && fix ? ` To give it its tools back, on the box, ${fix}.` : '';
   const notice = `[termag: this turn ran read-only, with only Read, Grep and Glob, because ${readOnly}. It could not edit files, run commands or commit.${back}]`;
   return { ...result, result: `${notice}\n\n${typeof result.result === 'string' ? result.result : ''}` };
+}
+
+/** A tool result's text: a string, or its text blocks. */
+function toolResultText(block) {
+  const c = block && block.content;
+  if (typeof c === 'string') return c;
+  return Array.isArray(c) ? c.filter(b => b && b.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n') : '';
+}
+
+/**
+ * A reply whose turn had a push GitHub refused for want of the `workflow`
+ * scope (workflow-scope.js) ends with termag's line on why and what to do, so
+ * the asker sees it even when Claude's answer doesn't explain. Only failed
+ * tool results (a push GitHub refused exits non-zero) since the turn's last
+ * prompt (isPrompt) count, so a successful push or an earlier turn's refusal
+ * adds nothing.
+ */
+function withPushScopeNotice(result, log) {
+  let refused = false;
+  for (const line of String(log || '').split('\n')) {
+    if (!line.trim()) continue;
+    let ev;
+    try { ev = JSON.parse(line); } catch { continue; }
+    if (isPrompt(ev)) { refused = false; continue; }
+    if (refused || !ev || ev.type !== 'user' || !Array.isArray(ev.message && ev.message.content)) continue;
+    refused = ev.message.content.some(b => b && b.type === 'tool_result' && b.is_error === true && isWorkflowScopeRefusal(toolResultText(b)));
+  }
+  if (!refused) return result;
+  const text = typeof result.result === 'string' ? result.result : '';
+  if (text.includes(WORKFLOW_SCOPE_HINT)) return result;
+  return { ...result, result: text ? `${text}\n\n[${WORKFLOW_SCOPE_HINT}]` : `[${WORKFLOW_SCOPE_HINT}]` };
 }
 
 /** The reason the script logged for a failed phase (`failed: <reason>`), else the error. */
@@ -240,13 +311,23 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
   const systemPromptFile = repoDir => path.join(path.dirname(repoDir), 'system-prompt.txt');
 
   /**
-   * Where the turn writes PR descriptions (termag-subagent-run's pr_body_file
-   * and pr_dir), as --prepare names them; a runner that names none keeps them
-   * in the same place, the clone's .git.
+   * What the turn's `ask` says of the clone --prepare made. A bundle-mode
+   * clone: where the turn writes PR descriptions (termag-subagent-run's
+   * pr_body_file and pr_dir), as --prepare names them; a runner that names
+   * none keeps them in the same place, the clone's .git. A push-mode clone:
+   * that it is one, and its branch (the chat runner's read-only fix names
+   * them, as the origin there is termag's own), and the notice of a clone
+   * converted for this turn.
    */
-  function prPaths(prep) {
+  function cloneLayout(prep) {
     // A push-mode clone: the run opens its PRs itself, so there are no description files.
-    if (prep.push === true) return {};
+    if (prep.push === true) {
+      return {
+        push: true,
+        ...(typeof prep.branch === 'string' && askRun.isPushBranch(prep.branch) ? { branch: prep.branch } : {}),
+        ...(typeof prep.notice === 'string' && prep.notice ? { notice: prep.notice } : {}),
+      };
+    }
     const git = path.join(prep.repoDir, '.git');
     const inGit = p => typeof p === 'string' && path.dirname(p) === git;
     return {
@@ -282,6 +363,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       fsImpl.rmSync(file, { force: true });
       return;
     }
+    // A new thread's clone, timed by the runner (termag-subagent-run clone_for_push).
+    if (typeof prep.cloneSeconds === 'number') log(`[ASK] run ${runId}: the thread's clone took ${prep.cloneSeconds}s`);
     const job = readJob(file);
     if (!job) { log(`[ASK] run ${runId}: canceled while its clone was prepared`); return; }
     try {
@@ -291,11 +374,13 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       const sent = await chats.sendMessage({
         chatKey: job.chat.chatKey, cwd: prep.repoDir, text: job.prompt,
         projectId: job.chat.projectId, project: job.chat.project, workstream: job.chat.workstream, workstreamId: job.chat.workstreamId,
-        permissionMode: TRUSTED_MODE, ...(job.spaceMemory ? { spaceMemory: job.spaceMemory } : {}),
+        permissionMode: askMode(job.permissionMode), ...(job.spaceMemory ? { spaceMemory: job.spaceMemory } : {}),
+        // The turn's --model (termag ask --model, else the thread chat's stored tier); none is the box's default.
+        ...modelOf(job),
         // live: the turn reads stdin as it runs, so a later ask on the thread can join it (steerRun).
         ...(job.live === true ? { liveInput: true } : {}),
         ask: {
-          threadId: job.threadId, runId, systemPrompt: job.systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep),
+          threadId: job.threadId, runId, systemPrompt: job.systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...cloneLayout(prep),
           // Who asked, for the turn's telemetry resource (chat-runner.js askTelemetryOf checks it).
           ...(job.telemetry ? { telemetry: job.telemetry } : {}),
         },
@@ -312,6 +397,7 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
     const job = {
       ...askRun.buildJob(msg, cwd), mode: 'chat', chat: chatOf(msg), stage: 'preparing',
       ...(msg.live === true ? { live: true } : {}),
+      ...modelOf(msg),
       ...(msg.spaceMemory && typeof msg.spaceMemory === 'object' ? { spaceMemory: msg.spaceMemory } : {}),
       ...(msg.telemetry && typeof msg.telemetry === 'object' ? { telemetry: msg.telemetry } : {}),
     };
@@ -392,6 +478,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
         runId: '', threadId: job.threadId, cwd, baseSha: job.baseSha, waitForCheckout: false,
         // A clone made again for this message pushes as the thread's asks do.
         ...(typeof a.pushBranch === 'string' && askRun.isPushBranch(a.pushBranch) ? { pushBranch: a.pushBranch, gitEmail: job.gitEmail } : {}),
+        // And is capped as they are: its prepare installs no repo git hooks (termag-subagent-run).
+        ...(askRun.CAPPED_MODES.includes(a.permissionMode) ? { permissionMode: a.permissionMode } : {}),
       });
       let prep;
       try {
@@ -405,10 +493,12 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       let systemPrompt = '';
       try { systemPrompt = fsImpl.readFileSync(systemPromptFile(prep.repoDir), 'utf8'); } catch { /* a thread cloned again: none */ }
       return chats.sendMessage({
-        ...chat, cwd: prep.repoDir, text: msg.text, permissionMode: TRUSTED_MODE, model: msg.model, images: msg.images,
+        ...chat, cwd: prep.repoDir, text: msg.text, permissionMode: askMode(a.permissionMode), model: msg.model, images: msg.images,
+        // A repeat of this id is answered as the send that first carried it (chat-send-ids.js).
+        sendId: msg.sendId,
         ...(msg.spaceMemory && typeof msg.spaceMemory === 'object' ? { spaceMemory: msg.spaceMemory } : {}),
         ask: {
-          threadId: job.threadId, systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...prPaths(prep),
+          threadId: job.threadId, systemPrompt, gitName: job.gitName, gitEmail: job.gitEmail, ...cloneLayout(prep),
           // Who asked, for the turn's telemetry resource: the same session as the thread's asks.
           ...(a.telemetry && typeof a.telemetry === 'object' ? { telemetry: a.telemetry } : {}),
         },
@@ -450,7 +540,7 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       let text = '';
       try { text = fsImpl.readFileSync(path.join(dir, 'events.jsonl'), 'utf8'); } catch { /* never started */ }
       const resultFile = path.join(jobs, `${runId}.result.json`);
-      fsImpl.writeFileSync(resultFile, JSON.stringify(withReadOnlyNotice(turnResult(text, t.after), meta.readOnly, meta.readOnlyFix)), { mode: 0o600 });
+      fsImpl.writeFileSync(resultFile, JSON.stringify(withPushScopeNotice(withReadOnlyNotice(turnResult(text, t.after), meta.readOnly, meta.readOnlyFix), text)), { mode: 0o600 });
       setStage(file, 'reporting');
       const pid = spawnPhase(['--report', file, resultFile], runId);
       fsImpl.writeFileSync(path.join(jobs, `${runId}.pid`), String(pid), { mode: 0o600 });
@@ -523,4 +613,4 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
   };
 }
 
-module.exports = { CAPABILITIES, PHASES_MARKER, askChatCapable, chatOf, createAskChat, failureReason, turnResult, turnTarget, withReadOnlyNotice };
+module.exports = { CAPABILITIES, PHASES_MARKER, askChatCapable, chatOf, createAskChat, failureReason, turnResult, turnTarget, withPushScopeNotice, withReadOnlyNotice };

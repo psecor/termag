@@ -54,3 +54,21 @@ test('dockerServiceBindings: a compose service\'s TCP publishes, asked for by it
   assert.deepEqual(JSON.parse(decodeURIComponent(asked.split('filters=')[1])), { label: ['com.docker.compose.service=varnish-fastly'] });
   assert.equal(await dockerServiceBindings('varnish-fastly', async () => null), null);
 });
+
+// Bugbot on #998 (bea08d69): a socket bound to ::1 alone is the IPv6 loopback, which a health probe reaches,
+// so whose it is can be asked too (port-guard.js reads ::1 the same way).
+test('listenersOn finds a listener bound to ::1 alone, with its owner', () => {
+  const { listenersOn } = require('./local-listeners');
+  const header = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n';
+  const files = {
+    '/proc/net/tcp': header,
+    '/proc/net/tcp6': `${header}   0: 00000000000000000000000001000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 14 1 0\n`,
+  };
+  const io = {
+    readFileSync: (f) => { if (!(f in files)) throw new Error('ENOENT'); return files[f]; },
+    readdirSync: (d) => (d === '/proc' ? ['42'] : d === '/proc/42/fd' ? ['3'] : []),
+    readlinkSync: (l) => (l === '/proc/42/fd/3' ? 'socket:[14]' : l === '/proc/42/cwd' ? '/elsewhere' : ''),
+  };
+  assert.deepEqual(listenersOn('::1', 3000, io), [{ pid: 42, cwd: '/elsewhere' }]);
+  assert.deepEqual(listenersOn('::1', 3000, io, { exactOnly: true }), [{ pid: 42, cwd: '/elsewhere' }]);
+});

@@ -7,7 +7,8 @@
 // by line and writes what comes back to events.jsonl.
 //
 // What pi 1.0.2 does that this relies on (the pi spike's fixtures,
-// agent/test-fixtures/pi/):
+// agent/test-fixtures/pi/), and 1.5.0 still does (checked on a box on
+// 2026-11-03, when it was pinned):
 // - the first line is the `session` header with the session id;
 // - the system prompt arrives as a message with role "system": dropped;
 // - a run is over at `agent_settled`, not `agent_end` (retries and

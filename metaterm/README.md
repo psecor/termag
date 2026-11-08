@@ -27,7 +27,7 @@ daily briefing's routes (`GET /api/briefings/ledger`, `GET /api/briefings/latest
 
 Agent spawn: `spawn_agent` starts a new agent on a
 brief in a new workstream or project. It is never pre-approved, and the
-backend gates it behind the `agent-spawn-enabled` flag and limits.
+backend holds it to its limits.
 `METATERM_SPAWN=on|off` decides for a session, then
 `METATERM_SPAWN_DEFAULT` (pi's registration sets `off`), else it is on.
 `list_spawns`, `report_back` and `spawn_budget` (limits, usage, box load and
@@ -56,9 +56,16 @@ Env:
   from. The config search order is that of `deploy/termag-status`.
 
 The URL must reach the backend without a browser sign-in. Behind an ALB with
-Okta, `/termag/api/sessions` and `/termag/api/projects/*/sessions/*` need an
-OIDC bypass for the token's source, or the server reports
-`→ 302 redirect to <idp>`. A laptop has no such path: run the server on a box
+Okta, every path a tool calls needs an OIDC bypass for the token's source:
+`/termag/api/sessions`, `/termag/api/projects/*/sessions/*`,
+`/termag/api/sessions/search`, `/termag/api/spawns*`, `/termag/api/handoffs*`,
+`/termag/api/briefings/*` and `/termag/api/collab/*` (example-org/terraform,
+`projects/termag/root-modules/orchestrator/agent_alb.tf`
+`agent_bypass_path_patterns`). A path without one gets the edge's answer
+instead of termag's: `→ 302 redirect to <idp>`, or under the background-path
+rule (`on_unauthenticated_request = deny`) an HTML 401, which the server
+reports as `→ 401 from a sign-in gate … /termag/api/<path> is not exempt`.
+termag's own 401 is JSON and reads `the agent token was not accepted`. A laptop has no such path: run the server on a box
 over SSH (`ssh <box> 'exec $HOME/.local/bin/termag-metaterm-mcp'` as the MCP
 command) instead of copying a box token off it.
 

@@ -290,6 +290,6 @@ function appendHeading(file, record, fsImpl = fs) {
 }
 
 module.exports = {
-  appendHeading, createGroupTracker, generateHeading, headingPrompt, lastHeading, parseHeading, readHeadings,
+  appendHeading, createGroupTracker, generateHeading, headingPrompt, lastHeading, parseHeading, readHeadings, userMessageKind,
   CAPS, HEADING_SYSTEM_PROMPT, HEADING_TIMEOUT_MS, HEADINGS_KEPT, INPUT_MAX_CHARS,
 };

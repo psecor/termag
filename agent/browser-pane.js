@@ -44,9 +44,8 @@ const GUEST_FORGET_RETRY_MS = [0, 1000, 4000];
 const GUEST_SWEEP_EVERY_MS = 3600 * 1000;
 const GUEST_SWEEP_MIN_AGE_MS = 10 * 60 * 1000;
 // Persistent profiles: a pane's
-// profile outlives its browser, so a sign-in survives the 60 s park. Behind
-// browser-pane-persistent-profiles-enabled: the backend asks with
-// `persistProfile` on attach.
+// profile outlives its browser, so a sign-in survives the 60 s park. The
+// backend asks with `persistProfile` on attach.
 const PROFILES_CAPABILITY = 'browser-pane-profiles-v1';
 // Chromium writes cookies to disk on a timer (about 30 s); a clean exit
 // flushes them, so a guest's kept profile's browser gets longer to quit.

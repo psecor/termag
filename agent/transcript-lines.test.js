@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { CHUNK_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward, wholeLinesFrom } = require('./transcript-lines');
+const { CHUNK_BYTES, SHRINK_LINE_BYTES, historyBefore, historyTail, linesBackward, linesForward, wholeLinesFrom } = require('./transcript-lines');
 
 const tmpFile = (text) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-lines-'));
@@ -61,6 +61,33 @@ test('history tail: a line too large for the budget is shrunk, and the lines bef
   assert.deepEqual(historyTail(file, { maxBytes: 64 * 1024 }).trim().split('\n').map(l => JSON.parse(l).type), ['user', 'assistant']);
   const broken = tmpFile(`"first"\n{${'x'.repeat(SHRINK_LINE_BYTES + 1)}\n"last"\n`);
   assert.equal(historyTail(broken, { maxBytes: 1024 }), '"first"\n"last"\n');
+});
+
+test('history before: finding `before` at the edge of the search budget still leaves the page its own', () => {
+  const lines = ['a', 'b', 'c', 'd'].map(uuid => JSON.stringify({ uuid, pad: 'x'.repeat(100) }));
+  const file = tmpFile(lines.join('\n') + '\n');
+  // The search reads d then c: exactly its budget, as historyTail's read stopping at c would.
+  const rawMax = Buffer.byteLength(lines[3]) + Buffer.byteLength(lines[2]) + 2;
+  const read = historyBefore(file, { before: 'c', maxBytes: 1 << 20, rawMax });
+  assert.equal(read.found, true);
+  assert.equal(read.complete, true);
+  assert.equal(read.raw, rawMax);
+  assert.deepEqual(read.jsonl.trim().split('\n').map(l => JSON.parse(l).uuid), ['a', 'b']);
+  assert.equal(historyBefore(file, { before: 'c', maxBytes: 1 << 20, rawMax, readMax: 10 }).complete, false);
+  assert.equal(historyBefore(file, { before: 'b', maxBytes: 1 << 20, rawMax }).found, false);
+});
+
+test('history tail and before: a line `keeps` says no to is skipped and costs no budget', () => {
+  const lines = [{ uuid: 'a' }, { skip: 'x'.repeat(200) }, { uuid: 'b' }, { uuid: 'c' }].map(e => JSON.stringify(e));
+  const file = tmpFile(lines.join('\n') + '\n');
+  const keeps = e => !e.skip;
+  const maxBytes = Buffer.byteLength(lines[0]) + Buffer.byteLength(lines[2]) + Buffer.byteLength(lines[3]) + 3;
+  const report = {};
+  assert.equal(historyTail(file, { maxBytes, keeps, report }), `${lines[0]}\n${lines[2]}\n${lines[3]}\n`);
+  assert.equal(report.cut, undefined);
+  const read = historyBefore(file, { before: 'c', maxBytes: maxBytes - Buffer.byteLength(lines[3]) - 1, keeps });
+  assert.equal(read.complete, true);
+  assert.equal(read.jsonl, `${lines[0]}\n${lines[2]}\n`);
 });
 
 test('history tail: the descriptor is closed even when the read fails', () => {

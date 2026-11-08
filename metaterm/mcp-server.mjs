@@ -142,8 +142,7 @@ export function sendKeysSetting({ env = process.env, cwd = env.CLAUDE_PROJECT_DI
  * METATERM_SPAWN_DEFAULT (the registration: pi's sets off, because pi runs
  * tool calls without a per-call approval), then on. Like send_keys this is
  * scoping, not the permission: Claude Code prompts on every spawn_agent call
- * (it is never pre-approved) and the backend's agent-spawn-enabled flag and
- * limits decide.
+ * (it is never pre-approved) and the backend's limits decide.
  */
 export function spawnSetting({ env = process.env } = {}) {
   const session = parseSwitch(env.METATERM_SPAWN);
@@ -639,6 +638,15 @@ export function createServer(deps = {}) {
     const ct = res.headers.get('content-type') || '';
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+    // The backend answers 401/403 in JSON. An HTML one is an edge auth gate:
+    // the ALB's Okta rule for background paths (`on_unauthenticated_request =
+    // deny`) refusing a path its box bypass doesn't list, while the paths it
+    // does list (GET /sessions, capture) pass with the same token.
+    if ((res.status === 401 || res.status === 403) && data === null && !ct.includes('json')) {
+      let route = `/api${path.split('?')[0]}`;
+      try { route = new URL(`${base}${route}`).pathname; } catch { /* keep relative */ }
+      throw new Error(`${method} ${path} → ${res.status} from a sign-in gate in front of ${base} (${ct || 'no content-type'}), not from termag: ${route} is not exempt for bearer tokens there, so the box token never reached the backend. The edge's box bypass must list that path (see metaterm/README.md).`);
+    }
     // A non-JSON body is almost always the SPA index.html served for an unknown
     // API path — i.e. the URL points at a backend WITHOUT the MetaTerm routes.
     // Never let that masquerade as an empty result.

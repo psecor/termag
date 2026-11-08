@@ -2,7 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { sendKeysArgv, enterArgv, captureArgv, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv } = require('./tmux-args');
+const { sendKeysArgv, enterArgv, captureArgv, parseForeground, newSessionArgv, newSessionOptionArgvs, windowSizeOptionArgv, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, tmuxPaneTarget, pipePaneArgv } = require('./tmux-args');
 
 test('literal text is passed through untouched — quotes, backslashes, $ and backticks', () => {
   const text = `psql -c "select 1 from users where name='psecor'" \\ $HOME \`x\` don't`;
@@ -85,6 +85,11 @@ function hasTmux() {
   try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
 
+test('window-size latest on the exact window target, for new sessions and every terminal-attach', () => {
+  assert.deepEqual(windowSizeOptionArgv('u-p-agent'), ['set-option', '-t', '=u-p-agent:', '-w', 'window-size', 'latest']);
+  assert.deepEqual(newSessionOptionArgvs('u-p-agent')[0], windowSizeOptionArgv('u-p-agent'));
+});
+
 test('new-session options apply on a real tmux server (a bare `=name` target fails set-option)', { skip: !hasTmux() && 'tmux not installed' }, () => {
   const socket = ['-L', `termag-test-${process.pid}`];
   const tmux = (...argv) => execFileSync('tmux', [...socket, ...argv], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -92,6 +97,7 @@ test('new-session options apply on a real tmux server (a bare `=name` target fai
     tmux(...newSessionArgv('u-p-agent', process.cwd()));
     for (const argv of newSessionOptionArgvs('u-p-agent')) tmux(...argv);
     assert.equal(tmux('show-options', '-t', '=u-p-agent:', '-v', 'history-limit').trim(), '10000');
+    assert.equal(tmux('show-options', '-w', '-t', '=u-p-agent:', '-v', 'window-size').trim(), 'latest');
   } finally {
     try { tmux('kill-server'); } catch { /* already gone */ }
   }

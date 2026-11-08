@@ -17,13 +17,16 @@ const { promisify } = require('util');
 const { isMcpReloadReply, sessionIdFrom, turnStartEvent, userLine } = require('./chat-turn');
 const chatImages = require('./chat-images');
 const claudePlanUsage = require('./claude-plan-usage');
-const { historyTail, linesForward, wholeLinesFrom } = require('./transcript-lines');
+const { RAW_MAX_BYTES, historyBefore, historyTail, linesForward, uuidAt, wholeLinesFrom } = require('./transcript-lines');
 const { generateTitle, sessionTitle, titlePrompt } = require('./session-title');
 const { findPiSession, piHistoryEntries, piUserEntryId, rehomePiSession } = require('./pi-session');
 const boxNotice = require('./box-notice');
+const environmentRun = require('./environment-run');
+const sendIds = require('./chat-send-ids');
 const spaceMemory = require('./space-memory');
 const toolGroupHeadings = require('./tool-group-headings');
 const { codexResourceEnv } = require('./codex-resource-env');
+const brokerMcp = require('./broker-mcp');
 
 const execFileAsync = promisify(execFileCb);
 
@@ -32,8 +35,8 @@ const execFileAsync = promisify(execFileCb);
 // classifier judges each tool call and denies rather than asks; what an
 // automation run uses). chat-runner-v1 alone refuses
 // any mode but dontAsk (mode-refused) and starts nothing.
-// chat-live-v1: a turn started from a send with liveInput (the backend's
-// chat-live-input-enabled) takes later messages in while it runs.
+// chat-live-v1: a turn started from a send with liveInput takes later
+// messages in while it runs.
 // chat-images-v1: a send may carry images (chat-images.js).
 // chat-interrupt-v1: chat-interrupt takes scope 'turn', which stops only a
 // live turn's current work (Claude's stream-json interrupt): its background
@@ -62,11 +65,17 @@ const execFileAsync = promisify(execFileCb);
 // transcript, which Claude Code keeps beside the session's
 // (<session>/subagents/agent-<id>.jsonl), as history entries
 // (subagentHistory).
+// chat-history-pages-v1: history says `more` when it left older entries
+// out, and chat-history-before hands them out a page at a time before an
+// entry's uuid (historyBefore).
 // chat-box-notice-v1: a send may carry `boxNotices` (tell the turn the box
 // restarted since the session's last one) and a `notice` of the
 // orchestrator's; chat-restore-v1: chat-session-restore writes a stored
 // session onto this box (box-notice.js).
-const CAPABILITIES = ['chat-runner-v1', 'chat-durable-v1', 'chat-trust-v1', 'chat-auto-v1', 'chat-live-v1', 'chat-interrupt-v1', 'chat-orchestrator-v1', 'chat-backend-v1', 'chat-effort-v1', 'chat-pi-v1', 'chat-context-v1', 'chat-genui-v1', 'chat-genui-v2', 'chat-transcript-v1', 'chat-subagents-v1', 'chat-t3-hold-v1', ...chatImages.CAPABILITIES, ...boxNotice.CAPABILITIES];
+// chat-confined-mcp-v1: a send or resume claim may carry `brokerMcp`
+// (broker-mcp.js): a confined turn loads the owner's broker connectors, under
+// its tool rules, and a sharee's bypassPermissions turn denies them.
+const CAPABILITIES = ['chat-runner-v1', 'chat-durable-v1', 'chat-trust-v1', 'chat-auto-v1', 'chat-live-v1', 'chat-interrupt-v1', 'chat-orchestrator-v1', 'chat-backend-v1', 'chat-effort-v1', 'chat-pi-v1', 'chat-context-v1', 'chat-genui-v1', 'chat-genui-v2', 'chat-transcript-v1', 'chat-subagents-v1', 'chat-t3-hold-v1', 'chat-history-pages-v1', brokerMcp.CAPABILITY, ...chatImages.CAPABILITIES, ...boxNotice.CAPABILITIES];
 
 /** A chat key the backend sends: letters, digits, `-`, `_`, `.`; no path. */
 const CHAT_KEY_RE = /^[A-Za-z0-9_.-]{1,160}$/;
@@ -78,6 +87,8 @@ const T3_ADOPT_REFUSALS = { busy: 't3-busy', unknown: 't3-unknown', forked: 'for
 const MAX_TEXT = 100_000;
 const HISTORY_MAX_ENTRIES = 600;
 const HISTORY_MAX_BYTES = 8 * 1024 * 1024;
+// The transcript lines one page of earlier history reads, at least (historyBefore).
+const HISTORY_PAGE_LINES = 400;
 // One chat-transcript-read's bytes at most (a longer single line is read whole).
 const TRANSCRIPT_READ_MAX = 4 * 1024 * 1024;
 const INTERRUPT_GRACE_MS = 3000;
@@ -221,9 +232,28 @@ function inAskClone(home, job) {
  * bypassPermissions (its startup config) nor auto (a shell, unattended) is
  * safe there (Security Agent, #940). The ask's system prompt says not to add
  * remotes; this tells the owner what to undo when one was.
+ *
+ * Not for a push-mode clone (`ask.push`, ask-push-v1): termag gave it its
+ * origin, and removing that would cut the thread off from GitHub, so the fix
+ * there is the branch's own (readOnlyFix). And not for a detached HEAD, in
+ * either layout: that is the refusal whatever the remotes, and the way back
+ * is the thread's branch (`ask` in a clone from before ask-push-v1). `why`
+ * is null when the refusal says it all.
  */
-function askCloneRecovery(facts, cwd) {
-  if (!facts || !facts.originUrl || facts.upstreamRef || facts.upstreamMerge) return null;
+function askCloneRecovery(facts, cwd, ask) {
+  if (!facts || facts.repo === false || facts.unreadable) return null;
+  const push = !!(ask && ask.push);
+  if (!facts.branch) {
+    const b = push ? ask.branch : 'ask';
+    return {
+      why: null,
+      fix: b
+        ? `switch the thread's clone back to its branch (\`git -C ${cwd} switch ${shellRef(b)}\`)`
+        : `switch the thread's clone back to a branch (\`git -C ${cwd} switch <branch>\`)`,
+    };
+  }
+  if (push) return null;
+  if (!facts.originUrl || facts.upstreamRef || facts.upstreamMerge) return null;
   return {
     why: 'a run added a git remote to the thread\'s clone',
     fix: `remove that remote (\`git -C ${cwd} remote remove origin\`)`,
@@ -236,7 +266,12 @@ function askCloneRecovery(facts, cwd) {
  * - `--tools` leaves only the read-only built-ins: no Bash, Edit, Write or
  *   Skill tool exists for the turn, whatever an allow rule says;
  * - `--strict-mcp-config` with an empty config starts no MCP server, the
- *   checkout's .mcp.json included;
+ *   checkout's .mcp.json included. A send with `brokerMcp` (broker-mcp.js)
+ *   puts termag's own broker entries in that config instead, rebuilt by this
+ *   runner, with `--allowedTools` for the tools the orchestrator allows (in
+ *   dontAsk every other MCP call is refused; in auto it goes to the
+ *   classifier), and ToolSearch beside the read-only built-ins: with it
+ *   gone, Claude Code defers no tool and every MCP schema fills the context;
  * - `--setting-sources user` loads only the box user's settings, never the
  *   checkout's .claude/settings.json or settings.local.json: print mode would
  *   otherwise run their apiKeyHelper (a shell command) and apply their env at
@@ -251,6 +286,8 @@ function askCloneRecovery(facts, cwd) {
  */
 const READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
 const EMPTY_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+// The headersHelper termag-credentials writes for its broker entries: the one beside it (credentials.js DEFAULT_SCRIPT).
+const DEFAULT_MCP_HEADERS = path.join(__dirname, '..', 'deploy', 'termag-mcp-headers');
 const SETTING_SOURCES = 'user';
 const TURN_SETTINGS = JSON.stringify({ disableAllHooks: true });
 
@@ -278,16 +315,20 @@ function slugForCwd(cwd) {
  * The permission surface of one Claude invocation, shared by a headless turn
  * and an interactive resume. Only bypassPermissions loads the checkout.
  * dontAsk also closes the tool list to the read-only built-ins. auto keeps
- * the normal tool list and still passes the closure above.
+ * the normal tool list and still passes the closure above. `mcp` is
+ * broker-mcp.js turnMcp's answer: a confined turn's broker servers and tool
+ * rules, or a bypass turn's deny rules (a sharee's); null is neither.
  */
-function permissionArgs(permissionMode, settings = null) {
+function permissionArgs(permissionMode, settings = null, mcp = null) {
   const mode = permissionModeFor(permissionMode);
   const args = ['--permission-mode', mode];
-  if (!isOpenMode(mode)) args.push('--tools', READ_ONLY_TOOLS.join(','));
-  if (!loadsCheckoutConfig(mode)) {
+  const confined = !loadsCheckoutConfig(mode);
+  const servers = confined && mcp && mcp.servers && Object.keys(mcp.servers).length ? mcp.servers : null;
+  if (!isOpenMode(mode)) args.push('--tools', confinedTools(Boolean(servers)).join(','));
+  if (confined) {
     args.push(
       '--strict-mcp-config',
-      '--mcp-config', EMPTY_MCP_CONFIG,
+      '--mcp-config', servers ? JSON.stringify({ mcpServers: servers }) : EMPTY_MCP_CONFIG,
       '--setting-sources', SETTING_SOURCES,
       // A backend's settings and the hooks closure in one: Claude Code reads only the last --settings.
       '--settings', settings ? JSON.stringify({ ...settings, disableAllHooks: true }) : TURN_SETTINGS,
@@ -295,7 +336,19 @@ function permissionArgs(permissionMode, settings = null) {
   } else if (settings) {
     args.push('--settings', JSON.stringify(settings));
   }
+  if (servers && mcp.allow.length) args.push('--allowedTools', mcp.allow.join(','));
+  if ((servers || !confined) && mcp && mcp.deny.length) args.push('--disallowedTools', mcp.deny.join(','));
   return args;
+}
+
+/** Whether two sends' brokerMcp (broker-mcp.js brokerMcpOf) ask for the same thing; none and none are the same. */
+function sameBrokerMcp(a, b) {
+  return JSON.stringify(a || null) === JSON.stringify(b || null);
+}
+
+/** The built-ins of a dontAsk turn: the read-only ones, and ToolSearch once it has MCP servers. */
+function confinedTools(withMcp) {
+  return withMcp ? [...READ_ONLY_TOOLS, brokerMcp.TOOL_SEARCH] : READ_ONLY_TOOLS;
 }
 
 /**
@@ -431,16 +484,20 @@ const PI_READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
  *   server and only the scratch config dir. pi has no classifier: auto is
  *   every tool unprompted;
  * - dontAsk (anything else): the same closure, and only the read-only tools.
+ * A sharee's bypass turn (`noConnectors`, the send's brokerMcp none) passes
+ * `--no-extensions` too: the owner's bridged connectors are an extension.
  * The launcher adds its own telemetry extension with `-e`, which
  * `--no-extensions` keeps; it never loads termag-status.ts, since a turn's
  * status comes from the runner. A chosen model is `--model`, a chosen
  * effort `--thinking`.
  */
-function piTurnArgs(sessionId, permissionMode, { model = null, effort = null } = {}) {
+function piTurnArgs(sessionId, permissionMode, { model = null, effort = null, noConnectors = false } = {}) {
   if (!isSessionId(sessionId)) throw new Error('a pi turn needs a session id');
   const mode = permissionModeFor(permissionMode);
   const args = ['-p', '--mode', 'json', '--session-id', sessionId, '--no-approve'];
   if (!loadsCheckoutConfig(mode)) args.push('--no-extensions', '--no-skills');
+  // A sharee's bypass turn (brokerMcp none): pi's MCP support is an extension, and its bridged servers are the owner's connectors.
+  else if (noConnectors) args.push('--no-extensions');
   if (!isOpenMode(mode)) args.push('--tools', PI_READ_ONLY_TOOLS.join(','));
   const chosen = piModelArg(model);
   if (chosen) args.push('--model', chosen);
@@ -540,19 +597,23 @@ async function backendSettings(b, { env = process.env, execFile = execFileAsync,
  * The telemetry resource for one of the chat's Claude runs, as `--settings`
  * env (docs/agents/gotchas.md, the agent telemetry resource): the owner's
  * (`termag-credentials apply telemetry`) with the chat's project and
- * workstream, as a pane of the same workstream sends them, and its kind in
- * place of `interactive`: `chat` for a turn, `oneshot` (with `oneshot` its
- * task, title or heading) for a Haiku call off one; an Open in full UI resume
- * names none, since it is a pane. The box script decides, as it does for a
+ * workstream, as a pane of the same workstream sends them, the repository,
+ * branch and commit of its checkout (`cwd`), and its kind in place of the
+ * settings' `external`: `chat` for a turn, `oneshot` (with `oneshot` its
+ * task, title or heading) for a Haiku call off one, `interactive` for an Open
+ * in full UI resume, which is a pane. The box script decides, as it does for a
  * pane's launch (telemetry-launch), so a box without termag's telemetry gets
  * nothing. null on any failure or a bad value: the run goes ahead with the
  * settings' resource, never fails for this.
  */
-async function chatTelemetryEnv({ project, workstream, kind = null, oneshot = null, ask = null }, { home, env = process.env, execFile = execFileAsync, script = CREDENTIALS_SCRIPT } = {}) {
+async function chatTelemetryEnv({ project, workstream, kind = null, oneshot = null, ask = null, cwd = null }, { home, env = process.env, execFile = execFileAsync, script = CREDENTIALS_SCRIPT } = {}) {
   const pair = codexResourceEnv({ project, workstream });
   const extra = {
     TERMAG_PROJECT: pair.TERMAG_PROJECT || '', TERMAG_WORKSTREAM: pair.TERMAG_WORKSTREAM || '',
     TERMAG_SESSION_KIND: kind || '', TERMAG_ONESHOT: oneshot || '',
+    // The chat's checkout, which the box script reads the repository, branch and commit from
+    // (termag-credentials work-resource); `-` for none, since the runner's own directory is not the chat's.
+    TERMAG_WORK_DIR: typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : '-',
     ...askTelemetryEnv(ask),
   };
   try {
@@ -662,7 +723,7 @@ function gatewaySettings(settings) {
  * hint carries a path. With the prompt filed (genUiReference), `readDir` is
  * the file's directory, added so even a confined turn may Read it.
  */
-function turnArgs(sessionId, permissionMode, { live = false, images = false, model = null, backend = null, settings = null, ask = null, orchestrator = false, effort = null, appendPromptFile = null, readDir = null, onGateway = true } = {}) {
+function turnArgs(sessionId, permissionMode, { live = false, images = false, model = null, backend = null, settings = null, ask = null, orchestrator = false, effort = null, appendPromptFile = null, readDir = null, onGateway = true, mcp = null } = {}) {
   const args = [
     '-p',
     ...(live ? ['--input-format', 'stream-json', '--replay-user-messages']
@@ -670,7 +731,8 @@ function turnArgs(sessionId, permissionMode, { live = false, images = false, mod
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    ...permissionArgs(permissionMode, settings),
+    // An ask's turn passes its own --disallowedTools below, and never gets mcp (sendMessage).
+    ...permissionArgs(permissionMode, settings, ask ? null : mcp),
   ];
   const chosen = backend ? backend.model : claudeLaunchArg(model, onGateway);
   if (chosen) args.push('--model', chosen);
@@ -800,10 +862,18 @@ function askOfJob(ask) {
     gitEmail: str(ask.gitEmail).replace(/[\r\n<>\s]/g, ''),
     ...(askPath(ask.prBodyFile) ? { prBodyFile: ask.prBodyFile } : {}),
     ...(askPath(ask.prDir) ? { prDir: ask.prDir } : {}),
+    // A push-mode clone (ask-push-v1): its origin is termag's, and its branch is the thread's (askCloneRecovery).
+    ...(ask.push === true ? { push: true } : {}),
+    ...(ask.push === true && ASK_BRANCH_RE.test(str(ask.branch)) && !str(ask.branch).startsWith('-') ? { branch: ask.branch } : {}),
+    // What termag-subagent-run --prepare told this turn (a clone converted for pushing), ahead of its message.
+    ...(boxNotice.sentNotice(ask.notice) ? { notice: boxNotice.sentNotice(ask.notice) } : {}),
     // Who asked, for the turn's telemetry resource (chatTelemetryEnv); the thread alone from an older orchestrator.
     telemetry: askTelemetryOf(ask.telemetry, ask.threadId),
   };
 }
+
+/** A thread's branch as termag-subagent-run names it (its valid_branch, in short). */
+const ASK_BRANCH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
 
 const askPath = p => typeof p === 'string' && path.isAbsolute(p) && p.length <= 4096 && !/[\0\r\n]/.test(p);
 
@@ -923,14 +993,14 @@ function writeResumeLauncher({ home, chatKey, bin, argv, configDir, cwd, fsImpl 
  * Returns null when the session id is not one this runner would resume, or
  * when a trusted resume has no absolute cwd or binary.
  */
-function resumeLaunch({ home, chatKey, sessionId, mode, bin = 'claude', cwd, backend = null, settings = null, appendPrompt = null, fsImpl = fs }) {
+function resumeLaunch({ home, chatKey, sessionId, mode, bin = 'claude', cwd, backend = null, settings = null, appendPrompt = null, mcp = null, fsImpl = fs }) {
   if (!isSessionId(sessionId)) return null;
   // On a backend, the pane continues there, on the chat's model. The
   // session's frozen space-memory index (space-memory.js frozenPromptFor)
   // goes in as its turns pass it, byte for byte: `--resume` keeps no
   // appended system prompt, and the pane's hooks stay quiet (MANAGED_ENV).
   const argv = spaceMemory.withSpaceMemory(
-    [...permissionArgs(mode, settings), ...(backend ? ['--model', backend.model] : []), '--resume', sessionId],
+    [...permissionArgs(mode, settings, mcp), ...(backend ? ['--model', backend.model] : []), '--resume', sessionId],
     appendPrompt ? { appendPrompt } : null,
   );
   const resumeCwd = isResumeCwd(cwd) ? cwd : undefined;
@@ -1184,6 +1254,18 @@ function capHistory(entries, max = HISTORY_MAX_ENTRIES) {
   return [...markers, ...entries.slice(cut)];
 }
 
+/** A chat-history-before cursor: the session and byte offset of the line a page's first entry came from. */
+function parseHistoryCursor(cursor) {
+  const m = typeof cursor === 'string' ? /^([A-Za-z0-9-]{1,80}):(\d{1,15})$/.exec(cursor) : null;
+  return m ? { sessionId: m[1], start: Number(m[2]) } : null;
+}
+
+/** A transcript line that begins a turn: something the person (or Claude Code for them) said, not a tool's result. */
+function startsTurn(e) {
+  if (!e || e.type !== 'user' || e.isMeta || e.isSidechain || e.isCompactSummary || !e.message) return false;
+  return messageIdentity(e.message.content) != null;
+}
+
 /**
  * A message Claude took in while it worked, as the transcript keeps it: no
  * user line, only a `queued_command` attachment (the person's mid-turn
@@ -1205,14 +1287,33 @@ function queuedCommandEntry(e) {
 }
 
 /**
+ * Whether a session line is one historyEntries makes an entry of (or, a
+ * compaction's summary, folds into one), so a history read's budgets count
+ * only those: a block of file-history snapshots must not fill a page.
+ */
+function isHistoryLine(e) {
+  if (!e) return false;
+  if (e.type === 'system' && e.subtype === 'compact_boundary') return true;
+  if (queuedCommandEntry(e)) return true;
+  if ((e.type !== 'user' && e.type !== 'assistant') || e.isSidechain || !e.message) return false;
+  if (e.isCompactSummary) return true;
+  return !e.isMeta || (e.type === 'user' && typeof e.sourceToolUseID === 'string');
+}
+
+/**
  * A session file's lines as the browser's history entries. `sidechain`: a
  * subagent's own file, whose every line is a sidechain's (subagentHistory);
  * a session's sidechain lines (an older Claude Code's) stay out of its own.
  */
-function historyEntries(jsonl, max = HISTORY_MAX_ENTRIES, { sidechain = false } = {}) {
-  const out = [];
+function historyEntries(jsonl, max = HISTORY_MAX_ENTRIES, { sidechain = false, report = null } = {}) {
+  let out = [];
   for (const line of jsonl.split('\n')) {
     if (!line.trim()) continue;
+    // Never more than twice the cap held at once: an 8 MiB tail of small lines is a lot of entries.
+    if (out.length >= 2 * max) {
+      out = capHistory(out, max);
+      if (report) report.cut = true;
+    }
     let e;
     try { e = JSON.parse(line); } catch { continue; }
     // A /compact's boundary is where the context was compacted: the browser draws it as a divider.
@@ -1253,6 +1354,8 @@ function historyEntries(jsonl, max = HISTORY_MAX_ENTRIES, { sidechain = false } 
       },
     });
   }
+  // report.cut: the cap left older entries out.
+  if (report && out.length > max) report.cut = true;
   return capHistory(out, max);
 }
 
@@ -1439,9 +1542,12 @@ function readOnlyFix(facts) {
  * gone, and that termag took them, so it says why instead of reporting
  * ToolSearch, MCP or Bash as broken.
  */
-function readOnlyNotice(readOnly, fix, tools) {
+function readOnlyNotice(readOnly, fix, tools, mcpServers = []) {
+  const missing = mcpServers.length
+    ? `no shell, no edits; MCP only from ${mcpServers.join(', ')}, and only the tools termag allows for reading`
+    : 'no shell, no edits, no MCP servers, no ToolSearch';
   return [
-    `termag runs this turn read-only: only ${tools.join(', ')} exist (no shell, no edits, no MCP servers, no ToolSearch), because ${readOnly}.`,
+    `termag runs this turn read-only: only ${tools.join(', ')} exist (${missing}), because ${readOnly}.`,
     'This is termag\'s checkout check, not a broken tool, so don\'t retry the missing ones.',
     fix
       ? `If the person asked for more than reading, tell them that first, and the fix: ${fix}. The turn after that gets every tool again.`
@@ -1916,6 +2022,10 @@ function createChatRunner({
   // threadAdopt): who else may be running this chat's session. Each answers
   // { result, … }; none means no t3 server on this box.
   t3Sessions = null,
+  // What a confined turn's broker entries run as headersHelper (broker-mcp.js): termag-mcp-headers beside the
+  // termag-credentials this agent runs, and the agent config it reads the box token from. Without the config, none load.
+  mcpHeadersHelper = DEFAULT_MCP_HEADERS,
+  agentConfig = null,
 }) {
   const t3s = t3Sessions || {
     session: async () => ({ result: 'unsupported' }),
@@ -1968,6 +2078,8 @@ function createChatRunner({
   const earlierFile = chatKey => path.join(root, `${chatKey}.earlier.json`);
   // Clears Resume undid: { sessionId, clearedAt, resumedAt }, oldest first.
   const undoneFile = chatKey => path.join(root, `${chatKey}.undone.json`);
+  // The answers given to the sends that carried an id (chat-send-ids.js), newest last.
+  const sendsFile = chatKey => path.join(root, `${chatKey}.sends.json`);
   function readUndone(chatKey) {
     const list = readJson(undoneFile(chatKey), []);
     return Array.isArray(list)
@@ -1999,6 +2111,8 @@ function createChatRunner({
   // The boot the chat's last turn started in (box-notice.js). Beside the
   // state file, which chat-turn.js rewrites whole at each turn end.
   const bootFile = chatKey => path.join(root, `${chatKey}.boot.json`);
+  // What the chat's turns were told about the checkout's environment (environment-file.js turnNotice).
+  const envSeenFile = chatKey => path.join(root, `${chatKey}.env.json`);
   const ensureRoot = () => fs.mkdirSync(turnsDir, { recursive: true, mode: 0o700 });
 
   function readJson(file, fallback) {
@@ -2089,7 +2203,26 @@ function createChatRunner({
     else fs.rmSync(queueFile(chatKey), { force: true });
   }
   const activeFor = chatKey => [...active.values()].find(t => t.meta.chatKey === chatKey) || null;
+  // Send ids dropped while their send may still be on the send chain: Stop is
+  // not on the chain, so it can drop a queued job before its send records the
+  // id (sendMessage), which then leaves it out of the ledger.
+  // Only ids whose send is on the chain right now (sendsInFlight) are noted, so the set stays small.
+  const droppedSends = new Set();
+  const sendsInFlight = new Set();
+  const droppedKey = (chatKey, id) => `${chatKey}\n${id}`;
   function dropped(jobs) {
+    // A dropped message never reached Claude: its send id no longer answers for it (chat-send-ids.js).
+    const ids = new Map();
+    for (const j of jobs) {
+      if (!j || !sendIds.isSendId(j.sendId) || !isChatKey(j.chatKey)) continue;
+      ids.set(j.chatKey, [...(ids.get(j.chatKey) || []), j.sendId]);
+      if (sendsInFlight.has(droppedKey(j.chatKey, j.sendId))) droppedSends.add(droppedKey(j.chatKey, j.sendId));
+    }
+    for (const [chatKey, gone] of ids) {
+      try {
+        if (fs.existsSync(sendsFile(chatKey))) writeJson(sendsFile(chatKey), sendIds.withoutSent(readJson(sendsFile(chatKey), []), gone));
+      } catch (err) { log(`[CHAT] ${chatKey}: could not forget dropped sends: ${err.message}`); }
+    }
     const asks = jobs.filter(j => j && j.ask && j.ask.runId);
     if (!asks.length) return;
     try { onDropped(asks); } catch (err) { log(`[CHAT] dropped-ask hook failed: ${err.message}`); }
@@ -2252,7 +2385,7 @@ function createChatRunner({
     const configDir = prepareChatConfigDir(home, fs, { dir: TITLE_CONFIG_DIR, linkProjects: false });
     const cwd = path.join(home, TITLE_CWD);
     fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'title' });
+    const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'title', cwd: t.meta.cwd });
     const title = await titleGenerator({ bin: claude, env: { ...turnEnv(env, claude, configDir), TERMAG_SESSION_KIND: 'oneshot' }, cwd, prompt: titlePrompt(message), settingsEnv: telemetry });
     if (!title) {
       log(`[CHAT] ${chatKey}: no session title from Haiku this time`);
@@ -2320,7 +2453,7 @@ function createChatRunner({
       const cwd = path.join(home, HEADING_CWD);
       fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
       const input = toolGroupHeadings.headingPrompt({ ...group, previous: toolGroupHeadings.lastHeading(file) });
-      const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'heading' });
+      const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'heading', cwd: t.meta.cwd });
       heading = await headingGenerator({ bin: claude, env: { ...turnEnv(env, claude, configDir), TERMAG_SESSION_KIND: 'oneshot' }, cwd, input, settingsEnv: telemetry });
     } catch (err) {
       log(`[CHAT] ${chatKey}: tool-group heading call failed: ${err.message}`);
@@ -2346,13 +2479,42 @@ function createChatRunner({
 
   // A live turn's inbox (chat-turn.js): <n>.json waiting, <n>.sent delivered.
   const inboxDir = t => path.join(t.dir, 'inbox');
-  function waitingInbox(t) {
-    let names = [];
-    try { names = fs.readdirSync(inboxDir(t)); } catch { return []; }
+  function inboxNames(t) {
+    try { return fs.readdirSync(inboxDir(t)); } catch { return []; }
+  }
+  function waitingInbox(t, names = inboxNames(t)) {
     return names.map(n => /^(\d+)\.json$/.exec(n)).filter(Boolean)
       .sort((a, b) => Number(a[1]) - Number(b[1]))
       .map(m => ({ file: path.join(inboxDir(t), m[0]), job: readJson(path.join(inboxDir(t), m[0]), null) }))
       .filter(e => e.job && typeof e.job.text === 'string');
+  }
+  /**
+   * The live turn's messages the wrapper has written to Claude (`.sent`) that
+   * Claude has not taken in yet, oldest first. Claude takes a mid-turn line
+   * in only at its next tool boundary, so one sent while a subagent or a long
+   * command runs waits there for minutes. It replays each line as it takes it
+   * in (--replay-user-messages), the turn's own prompt first: the person's
+   * replays after that one are the sent messages taken in, in order.
+   */
+  function untakenInbox(t, names = inboxNames(t)) {
+    const sent = names.map(n => /^(\d+)\.sent$/.exec(n)).filter(Boolean)
+      .sort((a, b) => Number(a[1]) - Number(b[1]))
+      .map(m => ({ file: path.join(inboxDir(t), m[0]), job: readJson(path.join(inboxDir(t), m[0]), null) }))
+      .filter(e => e.job && typeof e.job.text === 'string');
+    if (!sent.length) return [];
+    let buf;
+    try { buf = fs.readFileSync(path.join(t.dir, 'events.jsonl')); } catch { return sent; }
+    let prompt = false;
+    let taken = 0;
+    for (const line of completeLines(buf).lines) {
+      const ev = parseEvent(line);
+      if (ev?.type !== 'user' || ev.isReplay !== true) continue;
+      if (!prompt) { prompt = true; continue; }
+      const c = ev.message && ev.message.content;
+      const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(b => b && b.type === 'text').map(b => b.text).join('\n') : '';
+      if (toolGroupHeadings.userMessageKind(ev, text, false) === 'message') taken += 1;
+    }
+    return sent.slice(taken);
   }
   /**
    * Whether a message can go into the running turn rather than wait for it:
@@ -2373,7 +2535,10 @@ function createChatRunner({
     // Nor one asking for generative UI's prompt (or not) other than the turn's: a running turn's system prompt is fixed too.
     && (t.meta.genUi === true) === (job.genUiPrompt != null)
     && (t.meta.backend ?? null) === (job.backend ? job.backend.backend : null)
-    && (t.meta.engine ?? 'claude') === (job.engine ?? 'claude');
+    && (t.meta.engine ?? 'claude') === (job.engine ?? 'claude')
+    // Nor one for other broker connectors (broker-mcp.js): a running turn's MCP servers are fixed, and a
+    // sharee's message must never go into a turn that loaded the owner's.
+    && sameBrokerMcp(t.meta.brokerMcp, job.brokerMcp);
   /**
    * The mode a turn for this job runs in, settled from the checkout as it is
    * now. A live send settles it again: the tree can stop being the
@@ -2397,9 +2562,9 @@ function createChatRunner({
     let fix = null;
     if (mode === UNTRUSTED_MODE && requested !== UNTRUSTED_MODE) {
       readOnly = ownTreeRefusal(facts) || 'the checkout is not the project\'s own tree';
-      const recovery = inAskClone(home, job) ? askCloneRecovery(facts, path.resolve(job.cwd)) : null;
+      const recovery = inAskClone(home, job) ? askCloneRecovery(facts, path.resolve(job.cwd), job.ask) : null;
       // The way back goes out as the fix, so the turn's notice offers it rather than calling the refusal permanent.
-      if (recovery) { readOnly = `${readOnly} (${recovery.why})`; fix = recovery.fix; } else fix = readOnlyFix(facts);
+      if (recovery) { if (recovery.why) readOnly = `${readOnly} (${recovery.why})`; fix = recovery.fix; } else fix = readOnlyFix(facts);
     }
     return { requested, mode, readOnly, fix, facts };
   }
@@ -2444,6 +2609,16 @@ function createChatRunner({
   function currentAsk(t) {
     const steered = turnAsks(t);
     return steered.length ? steered[steered.length - 1].runId : (t.meta.ask?.runId || null);
+  }
+  /**
+   * What a browser shows as queued bubbles after a reload or a switch away and
+   * back: the person's messages in a live turn's inbox that Claude has not
+   * taken in (given to it, then not yet given), then behind the turn, oldest
+   * first. Never a Compact's prompt or an ask's.
+   */
+  function waitingMessages(jobs) {
+    return jobs.filter(j => j && typeof j.text === 'string' && j.compact !== true && !j.ask)
+      .map(j => ({ text: j.text, ...(Array.isArray(j.images) && j.images.length ? { images: j.images } : {}) }));
   }
   /** Take a turn's undelivered messages out of its inbox, oldest first. */
   function drainInbox(t) {
@@ -2606,12 +2781,17 @@ function createChatRunner({
     // loads the checkout's settings. Anything else runs from the scratch
     // config dir, which strips permission rules.
     const { requested, mode, readOnly, fix, facts } = await settleTurnMode(job);
-    const readOnlyTools = pi ? PI_READ_ONLY_TOOLS : READ_ONLY_TOOLS;
+    // The owner's broker connectors for a confined turn, or a sharee's bypass turn's denials (broker-mcp.js).
+    const mcp = pi ? null : brokerMcp.turnMcp(home, mode, job.brokerMcp || null, { headersHelper: mcpHeadersHelper, agentConfig }, { loadsCheckoutConfig: loadsCheckoutConfig(mode) });
+    const mcpServers = mcp && mcp.servers ? Object.keys(mcp.servers) : [];
+    if (mcpServers.length) log(`[CHAT] ${job.chatKey}: ${mode} turn with broker connectors ${mcpServers.join(', ')} (${mcp.allow.length} allow rules)`);
+    const readOnlyTools = pi ? PI_READ_ONLY_TOOLS : confinedTools(mcpServers.length > 0);
     if (readOnly) log(`[CHAT] ${job.chatKey}: ${requested} asked, the turn runs read-only (${readOnlyTools.join(', ')}): ${readOnly}${fix ? `; to fix, ${fix}` : ''}`);
     const live = job.liveInput === true && !pi;
     // pi reads no Claude config: its closure is in piTurnArgs.
     const configDir = pi || loadsCheckoutConfig(mode) ? undefined : prepareChatConfigDir(home);
-    const mcpFile = pi ? null : mcpVersionFile(home, mode, live);
+    // A sharee's turn reloads no connectors: one linked meanwhile would come in without its deny rule.
+    const mcpFile = pi || (mcp && !mcp.servers) ? null : mcpVersionFile(home, mode, live);
     const turnId = `${now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const dir = path.join(turnsDir, turnId);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -2647,7 +2827,7 @@ function createChatRunner({
     const kind = askTelemetry ? 'ask' : 'chat';
     if (!pi) {
       settings = withTelemetry(settings, await telemetryFor({
-        project: job.project, workstream: job.workstream, kind, ...(askTelemetry ? { ask: askTelemetry } : {}),
+        project: job.project, workstream: job.workstream, kind, cwd: job.cwd, ...(askTelemetry ? { ask: askTelemetry } : {}),
       }));
     }
     // The session's space memory: the same system-prompt bytes on every turn of
@@ -2680,8 +2860,20 @@ function createChatRunner({
     const notices = [];
     if (job.notice) notices.push(job.notice);
     else if (job.boxNotices && resumeId && boxNotice.restartedSince(lastBoot, boot)) notices.push(boxNotice.RESTART_NOTICE);
+    // An ask's clone that --prepare changed under the session (converted for pushing): what no longer holds.
+    if (job.ask && job.ask.notice) notices.push(job.ask.notice);
+    // The checkout's environment (environment-run.js): setup runs beside the
+    // agent, never ahead of it, so each turn while it runs is told so, and the next one after it
+    // settles gets one line. What this chat was told is kept once the turn has started, as the boot is.
+    let envTurn = null;
+    try {
+      envTurn = environmentRun.environmentNotice(job.cwd, readJson(envSeenFile(job.chatKey), {}), { home });
+      // The orchestrator notice's gate too: the checkout's text never closes the block (Security Agent, #998).
+      const envText = envTurn.text && boxNotice.sentNotice(envTurn.text);
+      if (envText) notices.push(envText);
+    } catch (err) { log(`[CHAT] ${job.chatKey}: environment notice: ${err.message}`); }
     // A read-only turn tells the model why, or it reports its missing tools as broken.
-    if (readOnly && job.compact !== true) notices.push(readOnlyNotice(readOnly, fix, readOnlyTools));
+    if (readOnly && job.compact !== true) notices.push(readOnlyNotice(readOnly, fix, readOnlyTools, mcpServers));
     // Where the transcript ended before this turn. History cuts there, not on
     // the prompt text: an earlier turn that said the same thing ("go", "yes")
     // would otherwise take everything after it out of the view.
@@ -2696,8 +2888,8 @@ function createChatRunner({
       session: turnSessionName(username, turnId), cwd: job.cwd, text: job.text, resumed: Boolean(resumeId),
       bin: agentBin,
       args: pi
-        ? ['--headless', ...piTurnArgs(piSession, mode, { model: job.model, effort: job.effort })]
-        : turnArgs(resumeId, mode, { live, images: blocks.length > 0, model: job.model, backend: job.backend, settings, ask: job.ask, orchestrator: job.orchestrator === true, effort: job.effort, appendPromptFile, readDir: reference && reference.dir, onGateway: claudeOnGateway(home, turnEnvironment) }),
+        ? ['--headless', ...piTurnArgs(piSession, mode, { model: job.model, effort: job.effort, noConnectors: Boolean(job.brokerMcp && job.brokerMcp.connectors === 'none') })]
+        : turnArgs(resumeId, mode, { live, images: blocks.length > 0, model: job.model, backend: job.backend, settings, ask: job.ask, orchestrator: job.orchestrator === true, effort: job.effort, appendPromptFile, readDir: reference && reference.dir, onGateway: claudeOnGateway(home, turnEnvironment), mcp }),
       path: turnEnvironment.PATH, configDir, stateFile: stateFile(job.chatKey),
       startedAt: new Date(now()).toISOString(), transcriptBytes, live, requestedMode: requested, mode,
       // Why an open mode was refused: turn-start shows it, and an ask's reply leads with it (ask-chat.js).
@@ -2716,6 +2908,8 @@ function createChatRunner({
       ...(job.backend ? { backend: job.backend.backend } : {}),
       ...(blocks.length && { images: job.images }),
       ...(job.ask ? { ask: job.ask } : {}),
+      // What the send let it reach (broker-mcp.js): a later live send must have asked for the same (takesLive).
+      ...(job.brokerMcp ? { brokerMcp: job.brokerMcp } : {}),
       env: { ...askEnv(job.ask), ...turnSessionEnv(job), TERMAG_SESSION_KIND: kind },
       ...(mcpFile && { mcpVersionFile: mcpFile }),
     };
@@ -2737,6 +2931,7 @@ function createChatRunner({
     try {
       await started;
       if (boot && !boxNotice.sameBoot(lastBoot, boot)) writeJson(bootFile(job.chatKey), { boot });
+      if (envTurn && envTurn.text) writeJson(envSeenFile(job.chatKey), envTurn.seen);
       if (!t.cancelled) {
         log(`[CHAT] ${job.chatKey} turn ${turnId} started in ${meta.session}${pi ? ' on pi' : ''}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ''}`);
       }
@@ -3102,18 +3297,21 @@ function createChatRunner({
   /**
    * The sessions a context reset left behind, oldest first, each followed by
    * the `context-cleared` line the browser draws as a divider. The newest get
-   * the byte budget the current session left; an older one past it shows
-   * only its divider.
+   * the byte budget the current session left; an older one past it, or
+   * past one whose read was cut, shows only its divider: history never skips
+   * over entries it left out.
    */
-  function earlierEntries(chatKey, earlier, budget, undone = []) {
+  function earlierEntries(chatKey, earlier, budget, undone = [], cut = {}) {
     const out = [];
     let left = Math.max(0, budget);
     for (let i = earlier.length - 1; i >= 0; i--) {
       const { sessionId, clearedAt } = earlier[i];
-      const file = left > 0 ? findTranscript(home, sessionId) : null;
-      const jsonl = file ? historyTail(file, { maxBytes: left, shrink: e => images.stripEvent(chatKey, e) }) : '';
+      const file = left > 0 ? findTranscript(home, sessionId) : (cut.more = true, null);
+      const read = {};
+      const jsonl = file ? historyTail(file, { maxBytes: left, shrink: e => images.stripEvent(chatKey, e), keeps: isHistoryLine, report: read }) : '';
       left -= Buffer.byteLength(jsonl);
-      out.unshift(...withUndone(historyEntries(jsonl).map(e => images.stripEvent(chatKey, e)), sessionId, undone), { type: 'context-cleared', at: clearedAt });
+      out.unshift(...withUndone(historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read }).map(e => images.stripEvent(chatKey, e)), sessionId, undone), { type: 'context-cleared', at: clearedAt });
+      if (read.cut) { cut.more = true; left = 0; }
     }
     return out;
   }
@@ -3340,7 +3538,7 @@ function createChatRunner({
      * move the pane while another send is still settling, and a resume
      * cannot land between them.
      */
-    async sendMessage({ chatKey, cwd, text, projectId, project, workstream, workstreamId, permissionMode, paneProbe, liveInput, model, backend, fastModel, context, models, images: sent, ask, orchestrator, titles, headings, effort, engine, genUiPrompt, genUiHint, spaceMemory: memorySpace , boxNotices, notice, planSpend }) {
+    async sendMessage({ chatKey, cwd, text, projectId, project, workstream, workstreamId, permissionMode, paneProbe, liveInput, model, backend, fastModel, context, models, images: sent, ask, orchestrator, titles, headings, effort, engine, genUiPrompt, genUiHint, spaceMemory: memorySpace , boxNotices, notice, planSpend, sendId, brokerMcp: sentMcp }) {
       await gate;
       if (!isChatKey(chatKey)) throw new Error('bad chatKey');
       if (clearing.has(chatKey)) throw new Error('chat-clearing: this chat is being stopped');
@@ -3363,12 +3561,16 @@ function createChatRunner({
       ensureRoot();
       const refs = decoded.map(img => images.save(chatKey, img.buf, img.mediaType, img.name));
       const sentNotice = askJob ? null : boxNotice.sentNotice(notice);
+      // What the orchestrator lets this turn reach of the broker connectors (broker-mcp.js); never an ask's turn.
+      const mcpOfSend = askJob ? null : brokerMcp.brokerMcpOf(sentMcp);
       // A pi turn: never live, no orchestrator prompt, title, headings, space memory or box notice (all Claude's), pi's model and thinking level.
       const job = onEngine === 'pi' ? {
         chatKey, cwd, text: boxNotice.defuseSent(text), projectId: String(projectId || ''), workstream: String(workstream || 'main'),
         workstreamId: workstreamId != null ? String(workstreamId) : null,
         permissionMode: permissionModeFor(permissionMode),
         engine: 'pi',
+        // pi takes only "none" (piTurnArgs noConnectors): its confined turns load no MCP at all.
+        ...(mcpOfSend && mcpOfSend.connectors === 'none' ? { brokerMcp: mcpOfSend } : {}),
         model: piModelArg(model),
         ...(piThinkingArg(effort) ? { effort: piThinkingArg(effort) } : {}),
       } : {
@@ -3383,7 +3585,7 @@ function createChatRunner({
         ...(liveInput === true && (!askJob || askJob.runId) ? { liveInput: true } : {}),
         ...(askJob ? { ask: askJob } : {}),
         ...(orchestrator === true && !askJob ? { orchestrator: true } : {}),
-        // simple-ui-session-titles-enabled: the turn-end carries Claude's title for the session.
+        // The send's `titles`: the turn-end carries Claude's title for the session.
         ...(titles === true && !askJob ? { titles: true } : {}),
         // The send's `headings` (the orchestrator sets it on every person's message): each run of tool calls gets Haiku's heading, asked as it starts (tool-group-headings.js).
         ...(headings === true && !askJob ? { headings: true } : {}),
@@ -3398,15 +3600,42 @@ function createChatRunner({
         ...(!askJob && !onBackend && genUiPromptOf(genUiPrompt) ? { genUiPrompt: genUiPromptOf(genUiPrompt) } : {}),
         ...(!askJob && !onBackend && genUiPromptOf(genUiPrompt) && genUiHintOf(genUiHint) ? { genUiHint: genUiHintOf(genUiHint) } : {}),
         ...(refs.length ? { images: refs } : {}),
-        // chat-resume-new-box-enabled (box-notice.js): tell this turn what happened to the box.
+        // box-notice.js: tell this turn what happened to the box.
         ...(boxNotices === true && !askJob ? { boxNotices: true } : {}),
         ...(sentNotice ? { notice: sentNotice } : {}),
         // The chat's own space, whose memory the turn loads, or null for none (backend services/chatSpace.ts);
         // nothing named (an older backend), the box's default.
         ...(memorySpace && (typeof memorySpace.space === 'string' || memorySpace.space === null) ? { spaceMemory: { space: memorySpace.space } } : {}),
+        ...(mcpOfSend ? { brokerMcp: mcpOfSend } : {}),
       };
       const stopsAtSend = stopCount(chatKey);
+      // A send with an id this chat already took is answered as it was then.
+      // On the send chain, so a repeat that arrives while the first is still
+      // starting its turn waits for that answer.
+      const id = sendIds.isSendId(sendId) ? sendId : null;
+      // Queued or delivered live, the message keeps its id, so dropping it forgets the id (dropped).
+      if (id) job.sendId = id;
       return oneSendAtATime(chatKey, async () => {
+        if (id) {
+          const answered = sendIds.sentAnswer(readJson(sendsFile(chatKey), []), id);
+          if (answered) return { ...answered, duplicate: true };
+        }
+        if (!id) return takeSend();
+        const key = droppedKey(chatKey, id);
+        sendsInFlight.add(key);
+        let answer;
+        let droppedMeanwhile = false;
+        try {
+          answer = await takeSend();
+        } finally {
+          sendsInFlight.delete(key);
+          droppedMeanwhile = droppedSends.delete(key);
+        }
+        // Dropped by a Stop or clear while it was being taken: it never reached Claude, so it is not recorded.
+        if (!droppedMeanwhile) writeJson(sendsFile(chatKey), sendIds.withSent(readJson(sendsFile(chatKey), []), id, answer));
+        return answer;
+      });
+      async function takeSend() {
         if (clearing.has(chatKey)) throw new Error('chat-clearing: this chat is being stopped');
         if (stopCount(chatKey) !== stopsAtSend) throw new Error('chat-stopped: the chat was stopped before this message went in');
         await releaseT3(chatKey, job.workstream);
@@ -3456,7 +3685,7 @@ function createChatRunner({
           return { queued: true, position: readQueue(chatKey).length };
         }
         return { queued: false, turnId: await startTurn(job) };
-      });
+      }
     },
 
     /**
@@ -3645,16 +3874,19 @@ function createChatRunner({
       // reload replaces the error with the transcript and the notice is gone.
       // A turn that finished normally is the transcript alone.
       const replay = live || lostTurn(chatKey, runningTurn);
-      const queued = readQueue(chatKey).length + (live ? waitingInbox(live).length : 0);
       const file = sessionId ? transcriptOf(engine, sessionId) : null;
       // The tail is whole lines, a line with large images shrunk to references before it counts.
       const prefix = Boolean(replay && file && Number.isInteger(replay.meta.transcriptBytes));
+      // read.cut: the tail or the entry cap left older lines out.
+      const read = {};
       const jsonl = file ? historyTail(file, {
         end: prefix ? replay.meta.transcriptBytes : Infinity,
         maxBytes: HISTORY_MAX_BYTES,
         shrink: e => images.stripEvent(chatKey, e),
+        keeps: engine === 'pi' ? null : isHistoryLine,
+        report: read,
       }) : '';
-      let entries = (engine === 'pi' ? piHistoryEntries(jsonl, HISTORY_MAX_ENTRIES) : historyEntries(jsonl)).map(e => images.stripEvent(chatKey, e));
+      let entries = (engine === 'pi' ? piHistoryEntries(jsonl, HISTORY_MAX_ENTRIES) : historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read })).map(e => images.stripEvent(chatKey, e));
       let turn = null;
       if (replay) {
         if (!prefix && replay.meta.transcriptBytes === null && replay.meta.resumed === false) {
@@ -3669,19 +3901,106 @@ function createChatRunner({
         }
         turn = eventsFromLog(replay.dir, replay.meta.turnId, chatKey);
       }
+      // After the replay's read: a message taken in since is left out here
+      // rather than drawn twice, once replayed and once queued. One listing of
+      // the inbox for both, so a message claimed meanwhile is in one of them.
+      const names = live ? inboxNames(live) : [];
+      const untaken = live ? untakenInbox(live, names).map(e => e.job) : [];
+      const waitingJobs = [...(live ? waitingInbox(live, names).map(e => e.job) : []), ...readQueue(chatKey)];
+      const queued = waitingJobs.length;
       const undone = readUndone(chatKey);
       if (sessionId) entries = withUndone(entries, sessionId, undone);
-      if (earlier.length) entries = [...earlierEntries(chatKey, earlier, HISTORY_MAX_BYTES - Buffer.byteLength(jsonl), undone), ...entries];
+      // more: older entries were left out, which chat-history-before pages in.
+      const cut = { more: engine !== 'pi' && entries.length > 0 && Boolean(read.cut) };
+      // A cut tail leaves older lines of this session out: earlier sessions' entries would skip them.
+      if (earlier.length) entries = [...earlierEntries(chatKey, earlier, read.cut ? 0 : HISTORY_MAX_BYTES - Buffer.byteLength(jsonl), undone, cut), ...entries];
+      if (entries.length > HISTORY_MAX_ENTRIES) cut.more = true;
       entries = capHistory(entries);
+      if (engine === 'pi') cut.more = false;
       // liveInput: a message sent while the running turn runs goes into it (chat-live-v1).
       // starting: a turn whose checkout inspect has begun is running for a resume.
       return {
         sessionId, ...(engine === 'pi' ? { engine } : {}), running: Boolean(live) || starting.has(chatKey), liveInput: Boolean(live) && readsInput(live),
-        queued, parked: parked.has(chatKey), entries, turn, turns: readTurns(chatKey),
+        queued, waiting: waitingMessages([...untaken, ...waitingJobs]), parked: parked.has(chatKey), entries, more: cut.more, turn, turns: readTurns(chatKey),
         headings: toolGroupHeadings.readHeadings(headingsFile(chatKey)),
         // The desktop app's thread holds the session (claimT3): a send here takes it back first.
         ...(t3 ? { t3: { threadId: t3.threadId } } : {}),
       };
+    },
+
+    /**
+     * The history entries before the entry whose uuid is `before`, oldest
+     * first: the current session's, then each session a clear left (with the
+     * `context-cleared` line after it), at least HISTORY_PAGE_LINES lines
+     * and starting where a turn starts, within HISTORY_MAX_BYTES. `done`
+     * once they reach the chat's first entry, or `before` is in none of them.
+     * `cursor` says where the page's first entry is, so the next page reads
+     * back from there instead of searching for its uuid; one that no longer
+     * points at `before` is ignored.
+     */
+    async historyBefore(chatKey, before, cursor) {
+      await gate;
+      if (!isChatKey(chatKey)) throw new Error('bad chatKey');
+      if (typeof before !== 'string' || !USER_UUID_RE.test(before)) throw new Error('bad before');
+      // A chat just cleared has no session yet, and its earlier sessions still page.
+      const { sessionId, engine } = await fillT3Session(chatKey);
+      if (engine === 'pi') return { entries: [], done: true };
+      const undone = readUndone(chatKey);
+      const sessions = [{ sessionId, clearedAt: null }, ...readEarlier(chatKey).reverse()];
+      const shrink = e => images.stripEvent(chatKey, e);
+      const at = parseHistoryCursor(cursor);
+      let from = 0;
+      // A turn still running (or lost) ends the session's history where it began,
+      // as history() reads it: the search for `before` starts there, not past the turn.
+      const runningTurn = activeFor(chatKey);
+      const replay = stillRunning(runningTurn) ? runningTurn : lostTurn(chatKey, runningTurn);
+      const liveEnd = replay && sessionId && Number.isInteger(replay.meta.transcriptBytes) ? replay.meta.transcriptBytes : Infinity;
+      let end = Infinity;
+      if (at) {
+        const i = sessions.findIndex(s => s.sessionId === at.sessionId);
+        const file = i >= 0 ? findTranscript(home, at.sessionId) : null;
+        if (file && uuidAt(file, at.start) === before) { from = i; end = at.start; }
+      }
+      const pages = [];
+      const starts = new Map();
+      let found = false;
+      let maxBytes = HISTORY_MAX_BYTES;
+      let maxLines = HISTORY_PAGE_LINES;
+      // The search for `before` reaches as far as history() reads: RAW_MAX_BYTES
+      // of each session file, and past one only when that covered it whole (a cut
+      // read shows the sessions before it as dividers alone). So an unknown uuid
+      // costs no more than one history read; the page read after it has a budget of its own.
+      let readLeft = RAW_MAX_BYTES;
+      const page = done => {
+        const entries = pages.flat();
+        // As the browser's firstUuid picks it: the oldest entry with a uuid, dividers aside.
+        const first = entries.find(e => e && typeof e.uuid === 'string' && e.uuid && e.type !== 'context-cleared' && e.type !== 'context-compacted');
+        const st = first ? starts.get(first.uuid) : null;
+        return { entries, done, ...(st ? { cursor: `${st.sessionId}:${st.start}` } : {}) };
+      };
+      for (let i = from; i < sessions.length; i++) {
+        const s = sessions[i];
+        const file = findTranscript(home, s.sessionId);
+        if (found && s.clearedAt) pages.unshift([{ type: 'context-cleared', at: s.clearedAt }]);
+        if (!file) continue;
+        const pinned = i === from && end !== Infinity;
+        const read = historyBefore(file, { before: found || pinned ? null : before, end: pinned ? end : i === 0 ? liveEnd : Infinity, maxBytes, maxLines, rawMax: RAW_MAX_BYTES, readMax: readLeft, startsTurn, keeps: isHistoryLine, shrink });
+        readLeft -= read.read;
+        if (!read.found) {
+          // Out of budget before finding `before`: not proof it is in no session.
+          if (read.raw > RAW_MAX_BYTES) return page(false);
+          continue;
+        }
+        found = true;
+        for (const [uuid, start] of read.starts) starts.set(uuid, { sessionId: s.sessionId, start });
+        maxBytes -= Buffer.byteLength(read.jsonl);
+        maxLines -= read.jsonl ? read.jsonl.split('\n').length - 1 : 0;
+        pages.unshift(withUndone(historyEntries(read.jsonl, Infinity).map(e => images.stripEvent(chatKey, e)), s.sessionId, undone));
+        if (!read.complete) return page(false);
+        if (maxBytes <= 0) return page(i === sessions.length - 1);
+        maxLines = Math.max(1, maxLines);
+      }
+      return page(true);
     },
 
     /**
@@ -3847,10 +4166,11 @@ function createChatRunner({
             mode = turnModeFor(opts.permissionMode, facts);
           }
           // A backend that is not ready refuses the claim with its reason, before anything is held.
-          // The pane's resource: the chat's project and workstream, its kind left as the settings say (a pane).
-          const settings = withTelemetry(onBackend ? await settingsFor(onBackend) : withDefaultModel(null, home), await telemetryFor({ project: opts.project, workstream: opts.workstream }));
+          // The pane's resource: the chat's project and workstream, and its kind, a pane's, over the settings' `external`.
+          const settings = withTelemetry(onBackend ? await settingsFor(onBackend) : withDefaultModel(null, home), await telemetryFor({ project: opts.project, workstream: opts.workstream, kind: 'interactive', cwd }));
           try {
-            const launch = resumeLaunch({ home, chatKey, sessionId, mode, bin: bin(), cwd: cwd || undefined, backend: onBackend, settings, appendPrompt: memoryFor.frozenPromptFor(chatKey, sessionId) });
+            const mcp = brokerMcp.turnMcp(home, mode, brokerMcp.brokerMcpOf(opts.brokerMcp), { headersHelper: mcpHeadersHelper, agentConfig }, { loadsCheckoutConfig: loadsCheckoutConfig(permissionModeFor(mode)) });
+            const launch = resumeLaunch({ home, chatKey, sessionId, mode, bin: bin(), cwd: cwd || undefined, backend: onBackend, settings, appendPrompt: memoryFor.frozenPromptFor(chatKey, sessionId), mcp });
             line = launch ? launch.line : null;
             if (launch && launch.cwd) rehomeTo = launch.cwd;
           } catch { line = null; }
@@ -3952,6 +4272,7 @@ module.exports = {
   entriesBeforeTurn,
   findTranscript,
   historyEntries,
+  isAgentId,
   isChatKey,
   isSessionId,
   mcpVersionFile,

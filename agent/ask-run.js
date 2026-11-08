@@ -26,6 +26,13 @@ const RUNNER = 'termag-subagent-run';
 // says so in a line of its header; the capability is announced only then.
 const PUSH_CAPABILITY = 'ask-push-v1';
 const PUSH_MARKER = 'Pushes: ask-push-v1';
+// A runner that caps a headless run at the mode a job names (CAPPED_MODES:
+// auto or dontAsk, never loading the checkout's config) says so likewise. This
+// agent caps a chat run itself, so with that line the box can be trusted with
+// an ask the orchestrator caps (a project from a shared environment); an older
+// agent or runner would run it as bypassPermissions, so it is never sent one.
+const MODE_CAP_CAPABILITY = 'ask-mode-cap-v1';
+const MODE_CAP_MARKER = 'Caps: ask-mode-cap-v1';
 
 const ID = /^[a-z0-9]{8,40}$/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -49,6 +56,11 @@ function askRunnerInstalled(home, fsImpl = fs) {
   }
 }
 
+function askModeCapable(home, fsImpl = fs) {
+  if (!askRunnerInstalled(home, fsImpl)) return false;
+  try { return fsImpl.readFileSync(runnerPath(home), 'utf8').includes(MODE_CAP_MARKER); } catch { return false; }
+}
+
 function askPushCapable(home, fsImpl = fs) {
   if (!askRunnerInstalled(home, fsImpl)) return false;
   try { return fsImpl.readFileSync(runnerPath(home), 'utf8').includes(PUSH_MARKER); } catch { return false; }
@@ -60,6 +72,9 @@ const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)[A-Za-z0-9._/-]{1,200}$/;
 const isPushBranch = b => BRANCH.test(b) && !b.endsWith('/') && !b.endsWith('.');
 
 /** The job file's content, or a thrown Error naming the bad field. */
+/** The modes below an ask's own that the orchestrator may cap it at (buildJob). */
+const CAPPED_MODES = ['auto', 'dontAsk'];
+
 function buildJob(msg, cwd) {
   const str = (v) => (typeof v === 'string' ? v : '');
   if (!ID.test(str(msg.runId))) throw new Error('runId is not a message id');
@@ -81,6 +96,10 @@ function buildJob(msg, cwd) {
     gitName: str(msg.gitName).replace(/[\r\n<>]/g, ' ').trim() || msg.gitEmail,
     gitEmail: msg.gitEmail.replace(/[\r\n<>\s]/g, ''),
     ...(msg.pushBranch ? { pushBranch: msg.pushBranch } : {}),
+    // A lower mode the orchestrator caps the ask at (a project made from a shared environment, whose checkouts
+    // anyone signed in may have set): auto or dontAsk, which never load the checkout's settings, hooks or MCP
+    // servers. Never a higher one; absent, the ask's own bypassPermissions.
+    ...(CAPPED_MODES.includes(msg.permissionMode) ? { permissionMode: msg.permissionMode } : {}),
   };
 }
 
@@ -157,4 +176,5 @@ function cancelAskRun(msg, deps) {
   return { stopped: true, pid: st.pid };
 }
 
-module.exports = { CAPABILITIES, PUSH_CAPABILITY, PUSH_MARKER, RUNNER, runnerPath, stateDir, askRunnerInstalled, askPushCapable, isPushBranch, buildJob, startAskRun, askRunStatus, cancelAskRun };
+module.exports = {
+  CAPPED_MODES, CAPABILITIES, MODE_CAP_CAPABILITY, MODE_CAP_MARKER, askModeCapable, PUSH_CAPABILITY, PUSH_MARKER, RUNNER, runnerPath, stateDir, askRunnerInstalled, askPushCapable, isPushBranch, buildJob, startAskRun, askRunStatus, cancelAskRun };

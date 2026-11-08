@@ -1,7 +1,8 @@
 'use strict';
 // pi-events.js and pi-session.js over the pi spike's recordings
-// (fixtures/pi/, pi 1.0.2 on a model broker, see fixtures/pi/README.md): what a
-// pi turn's events.jsonl holds, and what chat-history shows of its session file.
+// (fixtures/pi/, pi 1.0.2 on a model broker, and fixtures/pi/1.5.0/ for the pin;
+// see fixtures/pi/README.md): what a pi turn's events.jsonl holds, and what
+// chat-history shows of its session file.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -262,4 +263,133 @@ test('pi session: found by id under any cwd, and moved to a renamed checkout\'s 
   rehomePiSession(home, SESSION, '/w/new');
   assert.equal(findPiSession(home, SESSION), moved);
   rehomePiSession(home, 'aaaaaaaa-0000-0000-0000-000000000000', '/w/x');
+});
+
+// pi 1.5.0, the version deploy/termag-pi-update pins and the image bakes:
+// the same contracts over its own recordings (fixtures/pi/1.5.0/, see the
+// README), so a pin bump that changes the stream fails here (Devin on #1213).
+const V150 = '1.5.0';
+/** The pi version the image bakes (packer/scripts/setup.sh: the recipe's newest pin) and the newest the recipe pins (deploy/termag-pi-update PINS). */
+function piPins() {
+  const repo = path.join(__dirname, '..');
+  // The image installs the newest pin (termag-pi-update --install-pinned, no
+  // version) and names no version of its own.
+  const setup = fs.readFileSync(path.join(repo, 'packer/scripts/setup.sh'), 'utf8');
+  const bakesNewest = /^"\$HOME\/src\/termag\/deploy\/termag-pi-update" --install-pinned \|\|/m.test(setup) && !/pi-coding-agent@\d/.test(setup);
+  const block = /^PINS='([^']*)'$/m.exec(fs.readFileSync(path.join(repo, 'deploy/termag-pi-update'), 'utf8'))?.[1] ?? '';
+  const num = v => v.split('.').map(Number);
+  const newest = block.split('\n').map(l => l.trim().split(/\s+/)[0]).filter(v => /^\d+\.\d+\.\d+$/.test(v))
+    .sort((a, b) => { const x = num(a), y = num(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2]; }).at(-1);
+  return { image: bakesNewest ? newest : undefined, newest };
+}
+
+// A pin bump fails here until the new version's streams are recorded under
+// fixtures/pi/<version>/ and the tests below replay them (Devin on #1213).
+test('pi events: the pinned pi\'s recordings are the ones replayed', () => {
+  const { image, newest } = piPins();
+  assert.ok(image, 'packer/scripts/setup.sh installs the newest pin through termag-pi-update --install-pinned');
+  assert.equal(newest, image, 'the recipe\'s newest pin is the image\'s');
+  assert.equal(V150, image, `pi ${image} is pinned: record fixtures/pi/${image}/ (fixtures/pi/README.md) and replay it below`);
+  assert.ok(fs.existsSync(path.join(FIXTURES, image, 'success.jsonl')), `fixtures/pi/${image}/ is recorded`);
+});
+const lines150 = name => piLines(path.join(V150, name));
+function normalise150(name) {
+  const n = createPiNormalizer({ now: () => 1000 });
+  return { n, events: lines150(name).flatMap(line => n.push(line)) };
+}
+const SESSION_150 = '896b73a1-e13c-4536-86cc-75fb5087b834';
+
+test('pi 1.5.0 events: every recording normalises to Claude-shaped events, with no system prompt and one init first', () => {
+  const names = fs.readdirSync(path.join(FIXTURES, V150)).filter(f => f.endsWith('.jsonl') && f !== 'session-file-v3-tool-use.jsonl');
+  assert.ok(names.length >= 7, names.join(','));
+  for (const name of names) {
+    const { events } = normalise150(name);
+    assert.ok(events.length, name);
+    for (const e of events) {
+      assert.ok(['system', 'stream_event', 'assistant', 'user', 'result'].includes(e.type), `${name}: ${e.type}`);
+      assert.ok(e.type !== 'system' || e.subtype === 'init', `${name}: only init is a system event`);
+      assert.ok(!JSON.stringify(e).includes('<preamble elided>'), `${name}: pi's system prompt leaked`);
+    }
+    assert.equal(events[0].type, 'system', name);
+    assert.equal(ofType(events, 'system').length, 1, name);
+    assert.equal(events[0].engine, 'pi');
+  }
+});
+
+test('pi 1.5.0 events: a plain answer is init, live text that adds up, the assistant message and a success result', () => {
+  const { n, events } = normalise150('success.jsonl');
+  const header = JSON.parse(lines150('success.jsonl')[0]);
+  assert.deepEqual(events[0], { type: 'system', subtype: 'init', session_id: header.id, cwd: header.cwd, engine: 'pi' });
+  const [assistant] = ofType(events, 'assistant');
+  // The model id as models.json names it (the stand-in's; the broker's aliases carry a prefix).
+  assert.equal(assistant.message.model, 'df-test');
+  const text = assistant.message.content.filter(b => b.type === 'text').map(b => b.text).join('');
+  const live = ofType(events, 'stream_event').filter(e => e.event.type === 'content_block_delta' && e.event.delta.type === 'text_delta').map(e => e.event.delta.text).join('');
+  assert.equal(live, text);
+  assert.match(text, /STATUS: done/);
+  const result = resultOf(events);
+  assert.equal(result.subtype, 'success');
+  assert.equal(result.is_error, false);
+  assert.equal(result.result, text);
+  assert.equal(result.num_turns, 1);
+  assert.equal(n.settled, true);
+  assert.deepEqual(n.end({ code: 0 }), []);
+});
+
+test('pi 1.5.0 events: a tool call is tool_use with its arguments, answered by its result; a resume is the same session with only its own messages', () => {
+  const { events } = normalise150('tool-use-bash.jsonl');
+  const uses = toolUses(events);
+  assert.deepEqual(uses.map(u => [u.name, u.input]), [['bash', { command: 'echo fixture-ok' }]]);
+  const results = toolResults(events);
+  assert.deepEqual(results.map(r => r.tool_use_id), uses.map(u => u.id));
+  assert.equal(results[0].is_error, false);
+  assert.match(results[0].content, /fixture-ok/);
+  assert.deepEqual(events.filter(e => e.type === 'assistant' || e.type === 'user').map(e => e.type), ['assistant', 'user', 'assistant']);
+  assert.match(resultOf(events).result, /the tool said 'fixture-ok'/);
+  assert.equal(events[0].session_id, SESSION_150);
+  for (const name of ['resumed-session-id.jsonl', 'resumed-continue.jsonl']) {
+    const r = normalise150(name).events;
+    assert.equal(r[0].session_id, SESSION_150, name);
+    assert.equal(resultOf(r).is_error, false, name);
+    assert.equal(ofType(r, 'assistant').length, 1, `${name}: no history replayed`);
+  }
+});
+
+test('pi 1.5.0 events: a model error exits 0 and is a failed result carrying pi\'s message; a stopped run has no result', () => {
+  const { n, events } = normalise150('error-bad-model.jsonl');
+  assert.equal(ofType(events, 'assistant').length, 0);
+  const result = resultOf(events);
+  assert.equal(result.subtype, 'error');
+  assert.equal(result.is_error, true);
+  assert.match(result.result, /^403: .*not in the trusted launch catalog/);
+  assert.deepEqual(n.end({ code: 0 }), []);
+  const stopped = normalise150('interrupted-sigterm-tool.jsonl');
+  assert.equal(resultOf(stopped.events), undefined);
+  assert.equal(toolUses(stopped.events).length, 1);
+  assert.equal(toolResults(stopped.events).length, 0);
+  assert.deepEqual(stopped.n.end({ code: 143, interrupted: true }), []);
+  assert.match(normalise150('interrupted-sigterm-tool.jsonl').n.end({ code: 0 })[0].result, /exited before it finished/);
+});
+
+test('pi 1.5.0 events: the read-only tier offers no bash, so its call fails and nothing is written', () => {
+  const { events } = normalise150('readonly-bash-refused.jsonl');
+  assert.deepEqual(toolUses(events).map(u => u.name), ['bash']);
+  const [refused] = toolResults(events);
+  assert.equal(refused.is_error, true);
+  assert.equal(resultOf(events).is_error, false);
+});
+
+test('pi 1.5.0 session: the session file is the chat\'s history, as Claude-shaped entries', () => {
+  const text = raw(path.join(V150, 'session-file-v3-tool-use.jsonl'));
+  const entries = piHistoryEntries(text);
+  const prompts = entries.filter(e => e.type === 'user' && e.message.content[0].type === 'text');
+  assert.deepEqual(prompts.map(p => p.message.content[0].text), ['Run a command. RUN:echo fixture-ok', 'What did the command print?', 'Once more?']);
+  const uses = entries.filter(e => e.type === 'assistant').flatMap(e => e.message.content.filter(b => b.type === 'tool_use'));
+  const results = entries.filter(e => e.type === 'user').flatMap(e => e.message.content.filter(b => b.type === 'tool_result'));
+  assert.deepEqual(uses.map(u => u.name), ['bash']);
+  assert.deepEqual(results.map(r => r.tool_use_id), uses.map(u => u.id));
+  const last = entries.at(-1);
+  assert.equal(last.type, 'assistant');
+  assert.match(last.message.content.find(b => b.type === 'text').text, /pong 3/);
+  assert.equal(piUserEntryId(text), prompts[0].uuid);
 });

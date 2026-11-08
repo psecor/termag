@@ -455,13 +455,121 @@ async function ownedOrigins(slot, cwd, deps = {}) {
 }
 
 /**
+ * Who answers ip:port for an environment's checkouts: 'owned' when every
+ * listener (or the Docker publisher's compose project) is inside one of
+ * them, 'none' when nothing listens, else why not. A main checkout's own
+ * `.worktrees/` are other workstreams', so a listener in one is not its.
+ */
+async function portOwnership(ip, port, checkouts, deps = {}) {
+  const publisher = deps.dockerPublisher || dockerPublisher;
+  const listeners = deps.listenersOn || listenersOn;
+  const inside = deps.insideDir || insideDir;
+  const ours = (dir) => !!dir && checkouts.some((c) => inside(dir, c) && !inside(dir, path.join(c, '.worktrees')));
+  const pub = await publisher(ip, port);
+  if (pub && pub.workingDir) {
+    if (!ours(pub.workingDir)) return 'published by another checkout';
+    // Published on the address itself: the socket there is Docker's proxy for this publish (as shadowOf counts it).
+    if (pub.boundIp === ip) return 'owned';
+    const theirs = listeners(ip, port, undefined, { exactOnly: true }).find((l) => !ours(l.cwd));
+    return theirs ? (theirs.pid === null ? `a listener on ${ip} that is not this user's takes it` : `pid ${theirs.pid}, outside the checkout, listens on ${ip}`) : 'owned';
+  }
+  const found = listeners(ip, port);
+  if (found.length === 0) return 'none';
+  const theirs = found.find((l) => !ours(l.cwd));
+  if (!theirs) return 'owned';
+  return theirs.pid === null ? NOT_THIS_USERS : `pid ${theirs.pid} runs outside the checkout`;
+}
+
+const NOT_THIS_USERS = 'its listener is not this user\'s';
+const NOT_THIS_USERS_ON = / that is not this user's takes it$/;
+
+/**
+ * Whether portOwnership's answer means it can't tell whose the listener is: a socket that isn't this user's,
+ * such as `docker run -p` or Docker's proxy, which listen as root. Not someone else's for sure (Bugbot, #998).
+ */
+function ownerUnknown(who) {
+  return who === NOT_THIS_USERS || NOT_THIS_USERS_ON.test(String(who));
+}
+
+/**
+ * The `repo` recipe: the ports of the checkout's environment file,
+ * the first being what the pane opens, at its `path`.
+ * A port counts when its listener is inside any of the environment's
+ * checkouts (portOwnership). The first must be up and owned; another one is
+ * kept only while it is owned too, so an idle one or one someone else serves
+ * is dropped. Unlike a webapp slot's own IP, 127.0.0.1 is every
+ * workstream's, so an idle port could be bound by another while the pane is open.
+ */
+async function resolveRepoRecipe(cwd, deps = {}) {
+  if (!isPlainAbsolutePath(cwd)) return { ok: false, reason: 'no-checkout' };
+  const env = deps.environmentRun || require('./environment-run');
+  const { envKey } = require('./environment-file');
+  const os = require('node:os');
+  let where = {};
+  // This checkout's own state, else, for a workstream's worktree, its project's main checkout's: the
+  // definition the project was made with (inline text or a frozen pointer), which isn't on disk here.
+  // Ownership below stays this checkout's, so main's app is never this workstream's (Bugbot, #998).
+  // A multi-repo workstream is a plain folder of worktrees under the project root's .worktrees/ (Bugbot, #998).
+  const { projectRootOf } = require('./environment-file');
+  const home = deps.home || os.homedir();
+  // Its real path too: a box made from an environment has its checkout at ~/code/<repo> (a multi-repo root at ~/code), the project's directory a link to it.
+  let real = null;
+  try { real = fs.realpathSync(cwd); } catch { /* as it is */ }
+  for (const dir of [...new Set([cwd, projectRootOf(cwd), real, real && projectRootOf(real)])].filter(Boolean)) {
+    try {
+      const st = JSON.parse(fs.readFileSync(env.statePath(home, envKey(dir)), 'utf8'));
+      where = { fileRepo: st.fileRepo || null, filePath: st.filePath || null, fileText: typeof st.fileText === 'string' ? st.fileText : null };
+      break;
+    } catch { /* no state here */ }
+  }
+  const loaded = (deps.loadPlan || env.loadPlan)(cwd, where);
+  if (loaded.error || loaded.missing || !loaded.plan || loaded.plan.ports.length === 0) return { ok: false, reason: 'no-environment' };
+  // Any checkout of the environment's repositories: the file's `repos` (and its own), else every
+  // checkout here, the workstream's own directory included.
+  const checkouts = require('./environment-file').environmentCheckouts(loaded, cwd);
+  const origins = [];
+  const dropped = [];
+  let primaryHost = 'localhost';
+  for (const [i, p] of loaded.plan.ports.entries()) {
+    // 127.0.0.1, else ::1 when nothing listens there: where health and up look too (Bugbot, #998).
+    let ip = '127.0.0.1';
+    let who = await portOwnership(ip, p.port, checkouts, deps);
+    if (who === 'none') {
+      const v6 = await portOwnership('::1', p.port, checkouts, deps);
+      if (v6 !== 'none') { ip = '::1'; who = v6; }
+    }
+    const origin = ip === '::1' ? `[::1]:${p.port}` : `${ip}:${p.port}`;
+    if (i === 0 && ip === '::1') primaryHost = '[::1]';
+    if (i === 0) {
+      if (who === 'none') return { ok: false, reason: 'stack-not-running' };
+      if (who !== 'owned') return { ok: false, reason: 'other-workstream' };
+      origins.push(origin);
+    } else if (who === 'owned') {
+      origins.push(origin);
+    } else {
+      // An idle port too: it's the box's shared port space, and the pane keeps its allowlist while open (Security Agent, #998).
+      dropped.push({ origin, why: who === 'none' ? 'nothing listens on it yet' : who });
+    }
+  }
+  const first = loaded.plan.ports[0];
+  return {
+    ok: true, origins, primaryUrl: `http://${primaryHost}${first.port === 80 ? '' : `:${first.port}`}${first.path || '/'}`,
+    ...(dropped.length ? { dropped } : {}),
+  };
+}
+
+/**
  * A share's origins for this attach: `{ ok: true, origins, primaryUrl }`, or
  * `{ ok: false, reason }` with reason one of no-checkout, not-a-dev-stack,
- * stack-not-running, other-workstream, unverifiable, no-origins, bad-recipe.
- * An other-workstream refusal carries `holder` when Docker names the stack in
- * the way: its compose working dir, for the owner only.
+ * stack-not-running, other-workstream, unverifiable, no-origins, bad-recipe,
+ * no-environment. An other-workstream refusal carries `holder` when Docker
+ * names the stack in the way: its compose working dir, for the owner only.
  *
  *   { kind: 'manual', origins: [...] }      literal loopback origins, checked
+ *   { kind: 'repo' }                        the checkout's environment file's
+ *                                           ports, the first opened, each only
+ *                                           while this environment serves it
+ *                                           (resolveRepoRecipe)
  *   { kind: 'webapp-dev-stack' }          the slot the workstream's own stack
  *                                           runs on (ownFrontDoor), else the
  *                                           one its override file names, and
@@ -491,6 +599,7 @@ async function resolveRecipe(recipe, cwd, deps = {}) {
     const defaultPort = firstScheme === 'https' ? 443 : 80;
     return { ok: true, origins, primaryUrl: `${firstScheme}://${host.includes(':') ? `[${host}]` : host}${port === defaultPort ? '' : `:${port}`}/` };
   }
+  if (recipe.kind === 'repo') return resolveRepoRecipe(cwd, deps);
   if (recipe.kind !== 'webapp-dev-stack') return { ok: false, reason: 'bad-recipe' };
   // The backend sends the checkout as an absolute, normalized path
   // (projectDirUnder); anything else (relative, `..`, a NUL) is no checkout.
@@ -723,6 +832,9 @@ module.exports = {
   ownedOrigins,
   ownFrontDoor,
   overrideForFrontDoor,
+  portOwnership,
+  ownerUnknown,
+  resolveRepoRecipe,
   resolveRecipe,
   CHECK_CAPABILITIES,
   checkRecipe,

@@ -545,3 +545,4 @@ test('pi orphan: a draining turn whose wrapper then dies with pi still up is rea
   await poll(r2);
   assert.equal(fs.existsSync(path.join(dir, 'exit')), true, 'closed as died once pi is gone');
 });
+

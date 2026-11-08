@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { codexResourceEnv, withoutResourceEnv, codexBridgeEnv } = require('./codex-resource-env');
+const { codexResourceEnv, spawnEnv, withoutResourceEnv, codexBridgeEnv } = require('./codex-resource-env');
 
 test('names the pair when the RPC carries both as ids', () => {
   assert.deepEqual(
@@ -40,4 +40,28 @@ test('codexBridgeEnv: the session pair and kind interactive, over whatever the a
   assert.deepEqual(codexBridgeEnv(env, { TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main' }),
     { PATH: '/bin', TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main', TERMAG_SESSION_KIND: 'interactive' });
   assert.deepEqual(codexBridgeEnv(env), { PATH: '/bin', TERMAG_SESSION_KIND: 'interactive' });
+});
+
+test("names a spawned workstream's spawn as TERMAG_SPAWN_*, beside the pair or without it", () => {
+  const spawn = { id: 'ckspawn0001', root: 'ckroot00001', depth: 2, parentProject: 'termag', parentWorkstream: 'main', parentBox: 'box00001' };
+  const env = {
+    TERMAG_SPAWN_ID: 'ckspawn0001', TERMAG_SPAWN_ROOT: 'ckroot00001', TERMAG_SPAWN_DEPTH: '2',
+    TERMAG_SPAWN_PARENT_PROJECT: 'termag', TERMAG_SPAWN_PARENT_WORKSTREAM: 'main', TERMAG_SPAWN_PARENT_BOX: 'box00001',
+  };
+  assert.deepEqual(codexResourceEnv({ project: 'research', workstream: 'main', spawn }),
+    { TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main', ...env });
+  assert.deepEqual(codexResourceEnv({ spawn }), env);
+});
+
+test('spawnEnv drops each bad value on its own, and everything without a good id', () => {
+  assert.deepEqual(spawnEnv(undefined), {});
+  assert.deepEqual(spawnEnv({ id: 'short' }), {});
+  assert.deepEqual(spawnEnv({ id: 'x;rm -rf /', root: 'ckroot00001' }), {});
+  assert.deepEqual(spawnEnv({ id: 'ckspawn0001', root: 'BAD ROOT', depth: 0, parentProject: 'a b', parentWorkstream: 'main', parentBox: 'x' }),
+    { TERMAG_SPAWN_ID: 'ckspawn0001' });
+  assert.deepEqual(spawnEnv({ id: 'ckspawn0001', depth: '2', parentProject: 'termag' }), { TERMAG_SPAWN_ID: 'ckspawn0001' });
+});
+
+test('withoutResourceEnv takes an inherited spawn out too', () => {
+  assert.deepEqual(withoutResourceEnv({ PATH: '/bin', TERMAG_SPAWN_ID: 'old', TERMAG_SPAWN_PARENT_BOX: 'old' }), { PATH: '/bin' });
 });

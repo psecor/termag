@@ -26,6 +26,7 @@ const {
   writeGuides,
   readState,
   unitTemplateLoaded,
+  dropStaticLink,
 } = require('./project-clone');
 
 const REQUEST = {
@@ -54,11 +55,11 @@ function pendingOf(request) {
 }
 
 test('the capability is the one the orchestrator selects durable clone with', () => {
-  assert.deepEqual(CAPABILITIES, ['project-clone-v1']);
+  assert.deepEqual(CAPABILITIES, ['project-clone-v1', 'project-clone-static-v1']);
 });
 
 test('accepts the orchestrator payload and rejects a shell path or a missing box id', () => {
-  assert.deepEqual(acceptCloneRequest(REQUEST), { ok: true, request: { ...REQUEST, repo: null, key: 'p1' } });
+  assert.deepEqual(acceptCloneRequest(REQUEST), { ok: true, request: { ...REQUEST, repo: null, key: 'p1', staticDir: null } });
   assert.deepEqual(acceptCloneRequest({ ...REQUEST, referenceDir: undefined }).request.referenceDir, null);
   assert.equal(acceptCloneRequest({ ...REQUEST, instanceId: '' }).ok, false);
   assert.equal(acceptCloneRequest({ ...REQUEST, dir: 'projects/widget' }).ok, false);
@@ -642,5 +643,190 @@ test('two repositories clone side by side; one failing leaves the other, and a r
   assert.equal(await runClone('p1--api', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
   assert.equal(readState(home, 'p1--api').status, 'ready');
   assert.equal(fs.readFileSync(path.join(root, 'web', 'README'), 'utf8'), 'hello\n');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The static layout (environment pools, task B): a box made from an
+// environment clones to ~/code/<repo>, and the project's directory is a link to it.
+test('a static clone goes to ~/code/<repo> when nothing is there, and the project directory becomes its link', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-static-'));
+  const legacy = path.join(home, 'termag', 'projects', 'widget');
+  const want = path.join(home, 'code', 'widget');
+  const calls = [];
+  const req = { ...REQUEST, dir: legacy, referenceDir: null, staticDir: want };
+  const result = await handleProjectClone(req, { execFile: systemd(calls), home, remapPath: (p) => p });
+  assert.deepEqual(result, { ok: true, started: true, staticLayout: true });
+  const state = readState(home, 'p1');
+  assert.equal(state.dir, want);
+  assert.equal(state.link, legacy);
+  // Asked again (the next hello), it is still this project's static clone, though its state is there now.
+  fs.writeFileSync(path.join(home, '.termag', 'clones', 'p1.json'), JSON.stringify({ ...state, status: 'ready', branch: 'main' }));
+  fs.mkdirSync(want, { recursive: true });
+  assert.deepEqual(await handleProjectClone(req, { execFile: systemd(calls, 'inactive'), home, remapPath: (p) => p }),
+    { ok: true, started: false, ignored: 'ready', staticLayout: true });
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a static path already taken (a checkout someone made at ~/code/termag) keeps the per-project layout, and says so', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-static-'));
+  const legacy = path.join(home, 'termag', 'projects', 'termag');
+  const want = path.join(home, 'code', 'termag');
+  fs.mkdirSync(want, { recursive: true });
+  const result = await handleProjectClone({ ...REQUEST, dir: legacy, referenceDir: null, staticDir: want }, { execFile: systemd([]), home, remapPath: (p) => p });
+  assert.equal(result.staticLayout, false);
+  assert.match(result.staticRefused, /already exists/);
+  const state = readState(home, 'p1');
+  assert.equal(state.dir, legacy);
+  assert.equal(state.link, undefined);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("a static path outside ~/code (~/src is the box image's), or a relative one, is refused", () => {
+  assert.equal(acceptCloneRequest({ ...REQUEST, staticDir: 'code/widget' }).ok, false);
+  assert.equal(acceptCloneRequest({ ...REQUEST, staticDir: '/home/ada/src/widget' }).ok, false);
+  assert.equal(acceptCloneRequest({ ...REQUEST, staticDir: '/home/ada/code/widget' }).ok, true);
+  assert.equal(acceptCloneRequest({ ...REQUEST, staticDir: '/home/ada/code/../etc' }).ok, false);
+  assert.equal(acceptCloneRequest({ ...REQUEST, staticDir: '/home/ada/code/a\nb' }).ok, false);
+});
+
+test('the runner clones a static checkout in place and links the project directory to it', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-static-run-'));
+  const origin = path.join(home, 'origin');
+  const want = path.join(home, 'code', 'widget');
+  const legacy = path.join(home, 'termag', 'projects', 'widget');
+  seedRepo(origin);
+  cloneState(home, want, { url: origin, requestedBranch: 'HEAD', referenceDir: null, link: legacy });
+  assert.equal(await runClone('p1', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(fs.readFileSync(path.join(want, 'README'), 'utf8'), 'hello\n');
+  assert.equal(fs.lstatSync(legacy).isSymbolicLink(), true);
+  assert.equal(fs.readlinkSync(legacy), want);
+  assert.equal(fs.realpathSync(legacy), fs.realpathSync(want));
+  // The guide names the project, not the directory.
+  assert.match(fs.readFileSync(path.join(want, 'AGENTS.md'), 'utf8'), /widget/);
+  assert.equal(readState(home, 'p1').status, 'ready');
+  // A second run (a retry, the next hello) finds both in place.
+  assert.equal(await runClone('p1', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a static clone whose project directory is something else fails, and leaves it alone', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-static-run-'));
+  const origin = path.join(home, 'origin');
+  const want = path.join(home, 'code', 'widget');
+  const legacy = path.join(home, 'termag', 'projects', 'widget');
+  seedRepo(origin);
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, 'mine'), 'x');
+  cloneState(home, want, { url: origin, requestedBranch: 'HEAD', referenceDir: null, link: legacy });
+  assert.equal(await runClone('p1', { home, execFile: execFileAsync, waitSeconds: 300 }), 1);
+  const state = readState(home, 'p1');
+  assert.equal(state.status, 'failed');
+  assert.match(state.error, /already exists/);
+  assert.equal(fs.readFileSync(path.join(legacy, 'mine'), 'utf8'), 'x');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+// Environment pools: a pool box was prepared before it had an owner, with the
+// checkout at ~/code/<repo>. The project's clone takes it over in place and pulls it as the owner, once.
+test('a pool-prepared checkout at the static path is adopted, not refused, and pulled once', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-pool-'));
+  const origin = path.join(home, 'origin');
+  const want = path.join(home, 'code', 'widget');
+  const legacy = path.join(home, 'termag', 'projects', 'widget');
+  seedRepo(origin);
+  git(home, ['clone', '-q', origin, want]);
+  fs.mkdirSync(path.join(home, '.termag'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.termag', 'env-pool.json'), JSON.stringify({ environmentId: 'env1', repos: [{ repo: 'acme/widget', dir: want }], adopted: false }));
+  // A commit lands on the default branch after the prepare.
+  fs.writeFileSync(path.join(origin, 'NEW'), 'since the prepare\n');
+  git(origin, ['add', 'NEW']);
+  git(origin, ['commit', '-q', '-m', 'since']);
+
+  const result = await handleProjectClone({ ...REQUEST, dir: legacy, referenceDir: null, staticDir: want }, { execFile: systemd([]), home, remapPath: (p) => p });
+  assert.equal(result.staticLayout, true);
+  const state = readState(home, 'p1');
+  assert.equal(state.dir, want);
+  assert.equal(state.pooled, true);
+
+  // The orchestrator asks for HEAD, the default branch.
+  cloneState(home, want, { ...state, url: origin, requestedBranch: 'HEAD' });
+  assert.equal(await runClone('p1', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(fs.readFileSync(path.join(want, 'NEW'), 'utf8'), 'since the prepare\n');
+  assert.equal(fs.readlinkSync(legacy), want);
+  const after = readState(home, 'p1');
+  assert.equal(after.status, 'ready');
+  assert.equal(after.pulled, true);
+  assert.notEqual(after.pulledFrom, after.pulledTo);
+  const pool = JSON.parse(fs.readFileSync(path.join(home, '.termag', 'env-pool.json'), 'utf8'));
+  assert.equal(pool.adopted, true);
+  assert.equal(pool.repos[0].adoptedBy, 'p1');
+
+  // termag pulls only at claim: a later commit is not pulled by a rerun.
+  fs.writeFileSync(path.join(origin, 'LATER'), 'x\n');
+  git(origin, ['add', 'LATER']);
+  git(origin, ['commit', '-q', '-m', 'later']);
+  assert.equal(await runClone('p1', { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(fs.existsSync(path.join(want, 'LATER')), false);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a pool checkout already adopted by another project is taken by no second one', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-pool-'));
+  const want = path.join(home, 'code', 'widget');
+  fs.mkdirSync(want, { recursive: true });
+  fs.mkdirSync(path.join(home, '.termag'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.termag', 'env-pool.json'), JSON.stringify({ environmentId: 'env1', repos: [{ repo: 'acme/widget', dir: want, adopted: true }], adopted: true }));
+  const result = await handleProjectClone({ ...REQUEST, projectId: 'p2', dir: path.join(home, 'termag', 'projects', 'other'), referenceDir: null, staticDir: want }, { execFile: systemd([]), home, remapPath: (p) => p });
+  assert.equal(result.staticLayout, false);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("start empty drops the project directory's link to its abandoned static checkout, and nothing else", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-drop-'));
+  const checkout = path.join(home, 'code', 'widget');
+  const dir = path.join(home, 'termag', 'projects', 'widget');
+  fs.mkdirSync(checkout, { recursive: true });
+  fs.writeFileSync(path.join(checkout, 'README'), 'clone\n');
+  fs.mkdirSync(path.dirname(dir), { recursive: true });
+  fs.symlinkSync(checkout, dir);
+  assert.equal(dropStaticLink(dir, checkout), true);
+  assert.equal(fs.existsSync(dir), false, 'the link is gone, so mkdir makes a real directory');
+  assert.equal(fs.readFileSync(path.join(checkout, 'README'), 'utf8'), 'clone\n', 'the clone stays');
+  // A link elsewhere, a real directory, or nothing: left alone.
+  fs.symlinkSync(path.join(home, 'elsewhere'), dir);
+  assert.equal(dropStaticLink(dir, checkout), false);
+  assert.equal(fs.lstatSync(dir).isSymbolicLink(), true);
+  fs.unlinkSync(dir);
+  fs.mkdirSync(dir);
+  assert.equal(dropStaticLink(dir, checkout), false);
+  assert.equal(fs.lstatSync(dir).isDirectory(), true);
+  assert.equal(dropStaticLink(path.join(home, 'none'), checkout), false);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("a multi-repo project's repository, under a root linked to ~/code, is the prepared checkout and is pulled", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-pool-ws-'));
+  const origin = path.join(home, 'origin');
+  const code = path.join(home, 'code');
+  const root = path.join(home, 'termag', 'projects', 'multi');
+  seedRepo(origin);
+  git(home, ['clone', '-q', origin, path.join(code, 'widget')]);
+  fs.mkdirSync(path.dirname(root), { recursive: true });
+  fs.symlinkSync(code, root);
+  fs.mkdirSync(path.join(home, '.termag'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.termag', 'env-pool.json'), JSON.stringify({ environmentId: 'env1', repos: [{ repo: 'acme/widget', dir: path.join(fs.realpathSync(code), 'widget') }] }));
+  fs.writeFileSync(path.join(origin, 'NEW'), 'x\n');
+  git(origin, ['add', 'NEW']);
+  git(origin, ['commit', '-q', '-m', 'since']);
+  const dir = path.join(root, 'widget');
+  await handleProjectClone({ ...REQUEST, repo: 'widget', dir, referenceDir: null }, { execFile: systemd([]), home, remapPath: (p) => p });
+  const key = fs.readdirSync(path.join(home, '.termag', 'clones')).find(n => n.endsWith('.json')).replace(/\.json$/, '');
+  const state = readState(home, key);
+  assert.equal(state.pooled, true);
+  fs.writeFileSync(path.join(home, '.termag', 'clones', `${key}.json`), JSON.stringify({ ...state, url: origin, requestedBranch: 'HEAD' }));
+  fs.mkdirSync(path.join(home, '.config', 'termag'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.config', 'termag', 'github.skip'), '');
+  assert.equal(await runClone(key, { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
+  assert.equal(fs.readFileSync(path.join(code, 'widget', 'NEW'), 'utf8'), 'x\n');
   fs.rmSync(home, { recursive: true, force: true });
 });

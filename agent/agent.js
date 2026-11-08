@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
-const { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, CAPABILITIES: TMUX_CAPABILITIES } = require('./tmux-args');
+const { sendKeysArgv, enterArgv, captureArgv, tailLines, parseForeground, newSessionArgv, newSessionOptionArgvs, windowSizeOptionArgv, attachSessionArgv, mouseOptionArgv, tmuxSessionTarget, CAPABILITIES: TMUX_CAPABILITIES } = require('./tmux-args');
 const worktreeFetch = require('./worktree-fetch');
 const hostSample = require('./host-sample');
 const unsavedWork = require('./unsaved-work');
@@ -32,6 +32,7 @@ const { renameProject } = require('./project-rename');
 const { writeFileRpc } = require('./write-file');
 const { gitBranchState, gitCheckoutFacts } = require('./git-branch-state');
 const gitChanges = require('./git-changes');
+const paneSubagents = require('./pane-subagents');
 const gitWorktreePr = require('./git-worktree-pr');
 const gitWorktreeOwn = require('./git-worktree-own');
 const briefing = require('./briefing-digest');
@@ -44,8 +45,11 @@ const { codexPaneCommand } = require('./codex-launch');
 const askRun = require('./ask-run');
 const askChat = require('./ask-chat');
 const projectClone = require('./project-clone');
+const environmentPrepare = require('./environment-prepare');
+const environmentRun = require('./environment-run');
 const workspace = require('./workspace');
 const chatRunner = require('./chat-runner');
+const chatFiles = require('./chat-files');
 const boxNotice = require('./box-notice');
 const spaceMemory = require('./space-memory');
 const spaceSyncRpc = require('./space-sync');
@@ -60,6 +64,7 @@ const runnerWrapper = require('./claude-runner-wrapper');
 const claudeLogin = require('./claude-login');
 const t3Bridge = require('./t3-bridge');
 const portTunnel = require('./port-tunnel');
+const previewListenersRpc = require('./preview-listeners');
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -110,6 +115,7 @@ function remapGuides(guides) {
 // ── Wiki init ─────────────────────────────────────────────────────────────
 const { readFile: readFileAsync, writeFile } = require('fs/promises');
 const { ensureProjectRepo, gitInit } = require('./git-repo');
+const { setupOff } = require('./box-setup');
 
 // Bundled template ships next to this file. Override with TERMAG_WIKI_TEMPLATE_PATH
 // to point at a different one (e.g. an agent-wiki checkout that gets curated centrally).
@@ -119,6 +125,12 @@ const WIKI_TEMPLATE_PATH = process.env.TERMAG_WIKI_TEMPLATE_PATH
 async function initWikiFiles(dir, slug, username) {
   const agentsPath = path.join(dir, 'AGENTS.md');
   const claudePath = path.join(dir, 'CLAUDE.md');
+
+  // With termag setup off, a box's projects start with no termag-written
+  // instructions; the repo and its first commit still come below.
+  if (setupOff()) {
+    return { ok: true, skipped: true, reason: 'setup-off' };
+  }
 
   // Idempotent: skip if AGENTS.md already exists
   if (fs.existsSync(agentsPath)) {
@@ -454,8 +466,12 @@ function stopOnClaimForwarder() {
 let liveSocket = null;
 const CHAT_TURN_SCRIPT = path.join(__dirname, 'chat-turn.js');
 const CHAT_POLL_MS = 200;
+// A pane Claude's subagents for the simple UI's pane chat (pane-subagents.js): read only, found afresh on every call.
+const panes = paneSubagents.createPaneSubagents({ home: process.env.HOME || os.homedir() });
 const chats = chatRunner.createChatRunner({
   home: process.env.HOME || os.homedir(),
+  // The box token a confined turn's broker connectors send (broker-mcp.js), read by termag-mcp-headers.
+  agentConfig: path.resolve(configPath),
   username: process.env.USER || os.userInfo().username,
   isOpen: () => Boolean(liveSocket && liveSocket.readyState === WebSocket.OPEN),
   send: (frame) => {
@@ -530,6 +546,30 @@ function startCloneForwarder(ws) {
 function stopCloneForwarder() {
   if (cloneTimer) { clearInterval(cloneTimer); cloneTimer = null; }
   cloneForwarder = null;
+}
+
+// A project's environment state (environment-run.js): setup's time, the run,
+// the ports' health, forwarded as the clone state is.
+let envTimer = null;
+
+function startEnvForwarder(ws) {
+  stopEnvForwarder();
+  const dir = environmentRun.stateDir(process.env.HOME || '/home');
+  const forwarder = environmentRun.createEnvForwarder({
+    readNames: () => fs.readdirSync(dir),
+    readFile: (name) => fs.readFileSync(path.join(dir, name), 'utf8'),
+    send: (frame) => ws.send(JSON.stringify(frame)),
+    isOpen: () => ws.readyState === WebSocket.OPEN,
+  });
+  envTimer = setInterval(() => forwarder.tick(), CLONE_POLL_INTERVAL_MS);
+  // A chain whose window went with a reboot or a Ctrl-C is interrupted, not in progress for ever (Bugbot, #998).
+  environmentRun.reconcileInterrupted(process.env.HOME || '/home')
+    .catch(err => console.warn(`[ENV] reconcile: ${err.message}`))
+    .finally(() => forwarder.tick());
+}
+
+function stopEnvForwarder() {
+  if (envTimer) { clearInterval(envTimer); envTimer = null; }
 }
 
 async function onClaimUnitState() {
@@ -806,7 +846,7 @@ function stopCodexBridge(sessionName) {
   try { bridge.child.kill('SIGTERM'); } catch { /* ignore */ }
 }
 
-async function startCodexSession(sessionName, cwd, resourceEnv = {}, resumeSessionId = null) {
+async function startCodexSession(sessionName, cwd, resourceEnv = {}, resumeSessionId = null, notice = null) {
   stopCodexBridge(sessionName);
 
   const port = await getFreePort();
@@ -852,7 +892,8 @@ async function startCodexSession(sessionName, cwd, resourceEnv = {}, resumeSessi
   await wait(200);
   // `codex resume <id>` when a tool update's relaunch names the pane's
   // conversation (agent/codex-launch.js); otherwise a fresh client.
-  const codexCmd = codexPaneCommand({ remoteUrl, cwd, resumeSessionId });
+  // A tool update's notice prints first, after the clear (codex-launch.js checks it).
+  const codexCmd = codexPaneCommand({ remoteUrl, cwd, resumeSessionId, notice });
   await execAsync(`tmux send-keys -t ${shellEscape(sessionName)} ${shellEscape(codexCmd)} Enter`);
   return { ok: true, remoteUrl, port };
 }
@@ -888,7 +929,9 @@ const spaceSync = spaceSyncRpc.createSpaceSync({ home: os.homedir() || process.e
 // The port forward (agent/port-tunnel.js): tunnels to the user's own box
 // ports, checked by agent/port-guard.js. Needs no t3. Advertised only where
 // the guard has /proc/net/tcp to read (Linux), and used only once the
-// orchestrator's box-port-forward-enabled flag is on.
+// orchestrator's box-port-forward-enabled flag is on. The same tunnels carry
+// preview links' relays (`preview` targets, preview-link-v1), behind
+// preview-links-enabled, with the guard's SR6 refusals on top.
 const portForwardCapabilities = portTunnel.capabilities();
 const portTunnels = portTunnel.createPortTunnels({ termagUrl: termag_url, token, WebSocket, log: (m) => console.log(m) });
 
@@ -977,15 +1020,22 @@ function sendHello(ws) {
         ...(askRun.askRunnerInstalled(os.homedir() || process.env.HOME || '/') ? askRun.CAPABILITIES : []),
         ...(askChats.capable() ? askChat.CAPABILITIES : []),
         ...(askRun.askPushCapable(os.homedir() || process.env.HOME || '/') ? [askRun.PUSH_CAPABILITY] : []),
+        // ask-mode-cap-v1: this agent and its runner run a capped ask (a shared environment's project) below bypassPermissions.
+        ...(askRun.askModeCapable(os.homedir() || process.env.HOME || '/') ? [askRun.MODE_CAP_CAPABILITY] : []),
         ...(projectCloneCapable ? projectClone.CAPABILITIES : []),
         ...(projectCloneCapable ? workspace.CAPABILITIES : []),
+        ...environmentRun.CAPABILITIES,
+        // A pool box's prepare; refused unless this agent is a warm one.
+        ...(config.warm === true ? environmentPrepare.CAPABILITIES : []),
         ...hostSample.CAPABILITIES,
         ...unsavedWork.CAPABILITIES,
         ...gitChanges.CAPABILITIES,
+        ...paneSubagents.CAPABILITIES,
         ...(process.platform === 'linux' ? diskGrow.CAPABILITIES : []),
         ...softwareInventory.CAPABILITIES,
         ...briefing.CAPABILITIES,
         ...chatRunner.CAPABILITIES,
+        ...chatFiles.CAPABILITIES,
         ...claudeLogin.CAPABILITIES,
         ...gitWorktreePr.CAPABILITIES,
         ...worktreeFetch.CAPABILITIES,
@@ -1050,6 +1100,7 @@ function connect() {
     sendHello(ws);
     startOnClaimForwarder(ws);
     startCloneForwarder(ws);
+    startEnvForwarder(ws);
     startContextScanner();
     startRateLimitScanner();
     let alive = true;
@@ -1264,6 +1315,8 @@ function connect() {
 
         case 'mkdir': {
           const dir = remapPath(msg.dir);
+          // Start empty on a project in the static layout: its directory stops being a link into the abandoned checkout.
+          if (typeof msg.dropLinkTo === 'string') projectClone.dropStaticLink(dir, remapPath(msg.dropLinkTo));
           await mkdir(dir, { recursive: true });
           respond(ws, requestId, { ok: true });
           break;
@@ -1650,7 +1703,9 @@ function connect() {
           // resource (codex-resource-env.js); an older orchestrator sends none.
           // resumeSessionId: the conversation a tool update stopped in this
           // pane; checked as a Codex thread id there.
-          const result = await startCodexSession(sessionName, cwd, codexResourceEnv(msg), msg.resumeSessionId);
+          // notice: the line that says why (a tool update's relaunch); an older
+          // orchestrator sends none.
+          const result = await startCodexSession(sessionName, cwd, codexResourceEnv(msg), msg.resumeSessionId, msg.notice);
           respond(ws, requestId, result);
           break;
         }
@@ -1675,6 +1730,7 @@ function connect() {
             await execAsync(`tmux set-option -g set-clipboard on`);
             await execAsync(`tmux set-option -ga terminal-features ',xterm-256color:clipboard'`);
           } catch { /* tmux may not support the option; harmless */ }
+          try { await execFileAsync('tmux', windowSizeOptionArgv(tmuxSessionName)); } catch { /* the attach reports a missing session */ }
           const term = pty.spawn('tmux', attachSessionArgv(tmuxSessionName), {
             name: 'xterm-256color',
             cols: initCols || 80,
@@ -1869,7 +1925,9 @@ function connect() {
         }
 
         case 'credentials-remove': {
-          await credentials.removeCredential(msg.provider, undefined, msg.reason);
+          // A bazel-cache remove also carries flushGeneration and seq: a flush
+          // reaches a box whose block is off, and a stale remove is refused.
+          await credentials.removeCredential(msg.provider, undefined, msg.reason, credentials.removeExtras(msg));
           respond(ws, requestId, { ok: true });
           break;
         }
@@ -1968,7 +2026,20 @@ function connect() {
             boxNotices: msg.boxNotices === true, notice: msg.notice,
             spaceMemory: msg.spaceMemory,
             planSpend: msg.planSpend === true,
+            // The browser's id for a message it may send again: a repeat is answered as the first send was (chat-send-ids.js).
+            sendId: msg.sendId,
+            // chat-confined-mcp-v1: which broker connectors the turn may reach (broker-mcp.js).
+            brokerMcp: msg.brokerMcp,
           }));
+          break;
+        }
+
+        case 'chat-file-put': {
+          // A file for a simple-UI chat message that doesn't go in its text
+          // (chat-files-v1): kept in the chat's checkout, and its path
+          // answered for the message to name (chat-files.js). Nothing runs it.
+          const cwd = remapPath(msg.cwd);
+          respond(ws, requestId, await chatFiles.putFile({ cwd, name: msg.name, data: msg.data }, { execFile: execFileAsync }));
           break;
         }
 
@@ -2006,6 +2077,12 @@ function connect() {
           break;
         }
 
+        case 'chat-history-before': {
+          // Older history than the page the browser has (chat-history-pages-v1).
+          respond(ws, requestId, await chats.historyBefore(msg.chatKey, msg.before, msg.cursor));
+          break;
+        }
+
         case 'chat-transcript-read': {
           respond(ws, requestId, await chats.transcriptRead(msg.chatKey, { sessionId: msg.sessionId, from: msg.from, maxBytes: msg.maxBytes }));
           break;
@@ -2014,6 +2091,22 @@ function connect() {
         case 'chat-subagent-read': {
           // A subagent's own transcript, beside the chat's session (chat-subagents-v1).
           respond(ws, requestId, await chats.subagentHistory(msg.chatKey, msg.agentId));
+          break;
+        }
+
+        // A pane Claude's subagents, and the sessions running alongside it (pane-subagents-v1).
+        case 'pane-subagents': {
+          respond(ws, requestId, await panes.list(msg.session));
+          break;
+        }
+
+        case 'pane-subagent-read': {
+          respond(ws, requestId, await panes.readSubagent(msg.session, msg.agentId));
+          break;
+        }
+
+        case 'pane-session-read': {
+          respond(ws, requestId, await panes.readSession(msg.session, msg.sessionId));
           break;
         }
 
@@ -2044,6 +2137,7 @@ function connect() {
             backend: msg.backend, model: msg.model, fastModel: msg.fastModel, context: msg.context, models: msg.models,
             // The pane's telemetry resource names them (chat-runner.js chatTelemetryEnv); an older orchestrator sends neither.
             project: msg.project, workstream: msg.workstream,
+            brokerMcp: msg.brokerMcp,
           }));
           break;
         }
@@ -2115,7 +2209,10 @@ function connect() {
         case 'init-workspace': {
           // A multi-repo project's workspace or workstream root: the marker
           // and the generated guide, never git (agent/workspace.js).
-          respond(ws, requestId, workspace.initWorkspace({ dir: remapPath(msg.dir), guide: msg.guide }));
+          // With staticRoot (~/code, a box made from an environment), the root is a link to it.
+          respond(ws, requestId, workspace.initWorkspace({
+            dir: remapPath(msg.dir), guide: msg.guide, ...(typeof msg.staticRoot === 'string' ? { staticRoot: remapPath(msg.staticRoot), projectId: msg.projectId } : {}),
+          }));
           break;
         }
 
@@ -2152,6 +2249,22 @@ function connect() {
           console.log(`[CLONE] ${msg.projectId}${msg.repo ? `/${msg.repo}` : ''} attempt ${msg.attempt}: ${result.started ? 'started' : result.ignored}`);
           respond(ws, requestId, result);
           if (cloneForwarder) cloneForwarder.tick();
+          break;
+        }
+
+        case 'environment-prepare': {
+          // An environment pool box, before it has an owner: clone its environment's repositories to the static
+          // layout and run setup (environment-prepare.js). Refused on any other box.
+          const result = await environmentPrepare.handleEnvironmentPrepare(msg, { warm: config.warm === true, configPath });
+          console.log(`[ENV-POOL] prepare for ${msg.environmentId}: ${result.error || (result.running ? 'already running' : 'started')}`);
+          respond(ws, requestId, result);
+          break;
+        }
+
+        case 'environment-up': {
+          const result = await environmentRun.handleEnvironmentUp(msg, { remapPath });
+          console.log(`[ENV] ${msg.projectId}: ${environmentRun.environmentUpLogLine(result)}`);
+          respond(ws, requestId, result);
           break;
         }
 
@@ -2268,8 +2381,20 @@ function connect() {
 
         case 'tunnel-open': {
           // By target: 't3' to the desktop bridge, as before; { kind: 'port' }
-          // to the port forward (agent/port-tunnel.js), which needs no t3.
+          // to the port forward (agent/port-tunnel.js), which needs no t3;
+          // { kind: 'preview' } to a preview link's relay, through the same guard and SR6's refusals.
           respond(ws, requestId, await portTunnel.openTunnelRpc(msg, { t3, portTunnels }));
+          break;
+        }
+
+        // The preview links' publish dialog (agent/preview-listeners.js): the
+        // box's listening ports, their processes and the preview guard's verdicts.
+        case 'preview-listeners': {
+          // `port`: the one a publish names, checked with the DevTools probe too (SR6); the rest by command line only.
+          respond(ws, requestId, await previewListenersRpc.previewListeners({
+            cwd: typeof msg.cwd === 'string' ? remapPath(msg.cwd) : undefined,
+            port: Number.isInteger(msg.port) ? msg.port : undefined,
+          }));
           break;
         }
 
@@ -2316,6 +2441,7 @@ function connect() {
     stopOnWarmPoller();
     stopOnClaimForwarder();
     stopCloneForwarder();
+    stopEnvForwarder();
     // Kill all active PTY streams. The socket destroy closes the master fd
     // now rather than after node-pty's 1s grace timer.
     for (const [id, stream] of streams) {

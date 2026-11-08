@@ -19,9 +19,10 @@ const RAW_MAX_BYTES = 192 * 1024 * 1024;
 /**
  * Whole lines of `file` between byte offsets `start` and `end`, newest
  * first, as Buffers without their newline. A line cut by either offset is
- * left out, as is one longer than LINE_MAX_BYTES.
+ * left out, as is one longer than LINE_MAX_BYTES. `withStart`: each as
+ * `{ line, start }`, with the byte offset the line starts at.
  */
-function* linesBackward(file, { start = 0, end = Infinity, fsImpl = fs } = {}) {
+function* linesBackward(file, { start = 0, end = Infinity, withStart = false, fsImpl = fs } = {}) {
   let fd = null;
   try {
     fd = fsImpl.openSync(file, 'r');
@@ -43,7 +44,7 @@ function* linesBackward(file, { start = 0, end = Infinity, fsImpl = fs } = {}) {
         if (buf[i] !== 0x0a) continue;
         if (sawNewline && !tooLong) {
           const line = Buffer.concat([buf.subarray(i + 1, hi), ...carry]);
-          if (line.length) yield line;
+          if (line.length) yield withStart ? { line, start: pos + i + 1 } : line;
         }
         sawNewline = true;
         tooLong = false;
@@ -64,7 +65,7 @@ function* linesBackward(file, { start = 0, end = Infinity, fsImpl = fs } = {}) {
         fsImpl.readSync(fd, prev, 0, 1, stop - 1);
         whole = prev[0] === 0x0a;
       }
-      if (whole) yield Buffer.concat(carry);
+      if (whole) yield withStart ? { line: Buffer.concat(carry), start: stop } : Buffer.concat(carry);
     }
   } catch {
     // Unreadable: no lines.
@@ -127,28 +128,98 @@ function* linesForward(file, { start = 0, fsImpl = fs } = {}) {
  * `maxBytes`, as JSONL text, oldest first. A line over SHRINK_LINE_BYTES
  * is parsed and passed through `shrink` (which swaps its images' base64 for
  * references), and one that still does not fit, or does not parse, is
- * skipped: the lines before it are kept.
+ * skipped: the lines before it are kept. A line `keeps` (when given) says
+ * no to is skipped too, and costs nothing of `maxBytes`. `report.cut` is set
+ * when the read stopped at a budget with older lines left unread.
  */
-function historyTail(file, { end = Infinity, maxBytes, shrink = e => e, fsImpl = fs } = {}) {
+function historyTail(file, { end = Infinity, maxBytes, shrink = e => e, keeps = null, report = null, fsImpl = fs } = {}) {
   const kept = [];
   let used = 0;
   let raw = 0;
+  const stop = () => { if (report) report.cut = true; };
   for (const buf of linesBackward(file, { end, fsImpl })) {
     raw += buf.length + 1;
-    if (raw > RAW_MAX_BYTES) break;
+    if (raw > RAW_MAX_BYTES) { stop(); break; }
     let line;
-    if (buf.length <= SHRINK_LINE_BYTES) {
+    if (keeps) {
+      let e;
+      try { e = JSON.parse(buf.toString('utf8')); } catch { continue; }
+      if (!keeps(e)) continue;
+      if (buf.length <= SHRINK_LINE_BYTES) line = buf.toString('utf8');
+      else { try { line = JSON.stringify(shrink(e)); } catch { continue; } }
+    } else if (buf.length <= SHRINK_LINE_BYTES) {
       line = buf.toString('utf8');
     } else {
       try { line = JSON.stringify(shrink(JSON.parse(buf.toString('utf8')))); } catch { continue; }
     }
     const bytes = Buffer.byteLength(line) + 1;
     if (bytes > maxBytes) continue;
-    if (used + bytes > maxBytes) break;
+    if (used + bytes > maxBytes) { stop(); break; }
     used += bytes;
     kept.push(line);
   }
   return kept.length ? `${kept.reverse().join('\n')}\n` : '';
+}
+
+/**
+ * The whole lines of `file` before the line whose uuid is `before` (or
+ * before byte offset `end`), newest first back to where `maxLines` is
+ * reached on a line `startsTurn` says begins a turn (or `maxBytes` runs
+ * out), as JSONL text, oldest first. Lines are shrunk and skipped as in
+ * historyTail, `keeps` included. `rawMax` bounds the bytes the search for `before` reads
+ * (`raw`: how many it did) and `readMax` the bytes read after it (`read`),
+ * so finding a line as far back as historyTail reached still leaves the
+ * page its own budget. `found`: the file
+ * has that line; `complete`: the text reaches the file's first line; `starts`: each kept line's uuid to the offset it starts at. A
+ * null `before` reads from `end`.
+ */
+function historyBefore(file, { before = null, end = Infinity, maxBytes, rawMax = RAW_MAX_BYTES, readMax = RAW_MAX_BYTES, maxLines = Infinity, startsTurn = () => true, keeps = () => true, shrink = e => e, fsImpl = fs } = {}) {
+  const kept = [];
+  const starts = new Map();
+  let used = 0;
+  let raw = 0;
+  let read = 0;
+  let found = before == null;
+  const needle = before == null ? null : Buffer.from(JSON.stringify(before));
+  const out = complete => ({ found, complete, starts, raw, read, jsonl: kept.length ? `${kept.reverse().join('\n')}\n` : '' });
+  for (const { line: buf, start } of linesBackward(file, { end, withStart: true, fsImpl })) {
+    if (!found) {
+      raw += buf.length + 1;
+      if (raw > rawMax) return out(false);
+      if (buf.includes(needle)) {
+        try { found = JSON.parse(buf.toString('utf8')).uuid === before; } catch { /* not the line */ }
+      }
+      continue;
+    }
+    read += buf.length + 1;
+    if (read > readMax) return out(false);
+    let e;
+    try { e = JSON.parse(buf.toString('utf8')); } catch { continue; }
+    if (!keeps(e)) continue;
+    let line;
+    if (buf.length <= SHRINK_LINE_BYTES) {
+      line = buf.toString('utf8');
+    } else {
+      try { e = shrink(e); line = JSON.stringify(e); } catch { continue; }
+    }
+    const bytes = Buffer.byteLength(line) + 1;
+    if (bytes > maxBytes) continue;
+    if (used + bytes > maxBytes) return out(false);
+    used += bytes;
+    kept.push(line);
+    if (e && typeof e.uuid === 'string') starts.set(e.uuid, start);
+    if (kept.length >= maxLines && startsTurn(e)) return out(false);
+  }
+  return out(true);
+}
+
+/** The uuid of the line that starts at byte offset `start` of `file`, if one does. */
+function uuidAt(file, start, { fsImpl = fs } = {}) {
+  if (!Number.isInteger(start) || start < 0) return null;
+  for (const buf of linesForward(file, { start, fsImpl })) {
+    try { const e = JSON.parse(buf.toString('utf8')); return e && typeof e.uuid === 'string' ? e.uuid : null; } catch { return null; }
+  }
+  return null;
 }
 
 /**
@@ -193,4 +264,4 @@ function lineEndAfter(fd, start, from, size, fsImpl) {
   return {};
 }
 
-module.exports = { CHUNK_BYTES, LINE_MAX_BYTES, RAW_MAX_BYTES, SHRINK_LINE_BYTES, historyTail, linesBackward, linesForward, wholeLinesFrom };
+module.exports = { CHUNK_BYTES, LINE_MAX_BYTES, RAW_MAX_BYTES, SHRINK_LINE_BYTES, historyBefore, historyTail, linesBackward, linesForward, uuidAt, wholeLinesFrom };

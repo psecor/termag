@@ -6,6 +6,8 @@
 //   * listenRows / takersOf: /proc/net/tcp{,6}'s LISTEN sockets on a port, and
 //     the ones that take a connection to a given address
 //   * listenersOn: those, with the process holding each
+//   * allListenRows / socketOwners: every LISTEN socket on any port, and the
+//     process holding each (preview links' listener list, preview-listeners.js)
 //   * dockerGet / dockerBindings / dockerPublisher: the containers publishing a
 //     port, and their compose working dir
 //   * dockerServiceBindings: the ports a compose service's containers publish
@@ -52,6 +54,22 @@ async function dockerBindings(port, get = dockerGet) {
     }
   }
   return out;
+}
+
+/**
+ * The running containers publishing TCP `port` on the host, as `{ command,
+ * image }`: what each runs (Docker's `Command`, one string) and its image.
+ * The preview guard reads them, since a Docker publish's process is behind
+ * root's proxy and its command line can't be read from /proc. Null when
+ * Docker can't be asked.
+ */
+async function dockerPublishers(port, get = dockerGet) {
+  const filters = encodeURIComponent(JSON.stringify({ publish: [String(port)] }));
+  const list = await get(`/containers/json?filters=${filters}`);
+  if (!Array.isArray(list)) return null;
+  return list
+    .filter((c) => c && Array.isArray(c.Ports) && c.Ports.some((p) => p && p.PublicPort === port && p.Type === 'tcp'))
+    .map((c) => ({ command: typeof c.Command === 'string' ? c.Command : '', image: typeof c.Image === 'string' ? c.Image : '' }));
 }
 
 /**
@@ -147,12 +165,18 @@ function takersOf(rows, ip, addrOf = (r) => r.addr) {
  * which take its connections even beside a wildcard publish. Linux only; an
  * empty list where nothing listens.
  */
+// ::1 as /proc/net/tcp6 shows it (four little-endian words), which procAddress reads as 'other-v6';
+// port-guard.js maps it the same way.
+const LOOPBACK6_HEX = '00000000000000000000000001000000';
+const addrOfRow = (r) => (r.hex === LOOPBACK6_HEX ? '::1' : r.addr);
+
 function listenersOn(ip, port, io = {}, { exactOnly = false } = {}) {
   const read = io.readFileSync || fs.readFileSync;
   const readdir = io.readdirSync || fs.readdirSync;
   const readlink = io.readlinkSync || fs.readlinkSync;
   const rows = listenRows(port, read);
-  const inodes = new Set((exactOnly ? rows.filter((r) => r.addr === ip) : takersOf(rows, ip)).map((r) => r.inode));
+  // A socket bound to ::1 alone counts as ::1's, so whose it is can be asked (Bugbot, #998).
+  const inodes = new Set((exactOnly ? rows.filter((r) => addrOfRow(r) === ip) : takersOf(rows, ip, addrOfRow)).map((r) => r.inode));
   if (inodes.size === 0) return [];
   const owners = new Map();
   let pids = [];
@@ -175,6 +199,59 @@ function listenersOn(ip, port, io = {}, { exactOnly = false } = {}) {
   return [...inodes].map((inode) => owners.get(inode) || { pid: null, cwd: null });
 }
 
+/**
+ * Every TCP socket listening on any port, from `<procRoot>/net/tcp` and
+ * `tcp6`, as listenRows' rows with their `port`. A table that can't be read
+ * adds nothing.
+ */
+function allListenRows(read = fs.readFileSync, procRoot = '/proc') {
+  const rows = [];
+  for (const table of ['tcp', 'tcp6']) {
+    let text = '';
+    try { text = read(`${procRoot}/net/${table}`, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n').slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length < 10 || f[3] !== '0A') continue; // 0A: LISTEN
+      const [addrHex = '', portHex = ''] = f[1].split(':');
+      const port = parseInt(portHex, 16);
+      if (!Number.isInteger(port) || port < 1) continue;
+      rows.push({ table, hex: addrHex.toUpperCase(), addr: procAddress(addrHex), uid: Number(f[7]), inode: f[9], port });
+    }
+  }
+  return rows;
+}
+
+/**
+ * The process holding each socket inode of `inodes`, as a Map inode →
+ * `{ pid, cwd }`, from `<procRoot>/<pid>/fd`: only processes this user may
+ * look into (another user's, root's and Docker's proxy are left out).
+ */
+function socketOwners(inodes, io = {}, procRoot = '/proc') {
+  const readdir = io.readdirSync || fs.readdirSync;
+  const readlink = io.readlinkSync || fs.readlinkSync;
+  const wanted = new Set(inodes);
+  const owners = new Map();
+  if (wanted.size === 0) return owners;
+  let pids = [];
+  try { pids = readdir(procRoot).filter((n) => /^\d+$/.test(n)); } catch { return owners; }
+  for (const pid of pids) {
+    let fds;
+    try { fds = readdir(`${procRoot}/${pid}/fd`); } catch { continue; } // not ours to look at
+    for (const fd of fds) {
+      let link;
+      try { link = readlink(`${procRoot}/${pid}/fd/${fd}`); } catch { continue; }
+      const m = /^socket:\[(\d+)\]$/.exec(link);
+      if (m && wanted.has(m[1]) && !owners.has(m[1])) {
+        let cwd = null;
+        try { cwd = readlink(`${procRoot}/${pid}/cwd`); } catch { /* gone */ }
+        owners.set(m[1], { pid: Number(pid), cwd });
+      }
+    }
+    if (owners.size === wanted.size) break;
+  }
+  return owners;
+}
+
 /** Whether `child` is `dir` or inside it (both resolved, so a symlinked checkout still matches). */
 function insideDir(child, dir, realpathSync = fs.realpathSync) {
   try {
@@ -186,11 +263,14 @@ function insideDir(child, dir, realpathSync = fs.realpathSync) {
 module.exports = {
   dockerGet,
   dockerBindings,
+  dockerPublishers,
   dockerServiceBindings,
   dockerPublisher,
   procAddress,
   listenRows,
   takersOf,
   listenersOn,
+  allListenRows,
+  socketOwners,
   insideDir,
 };

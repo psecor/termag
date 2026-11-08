@@ -7,8 +7,9 @@ const path = require('path');
 const { createScanner, encodeClaudeDir, makeUnremap, parseClaudeFile, dedupeKey } = require('./usage-scanner');
 
 const T = (iso) => iso;
-function usageLine({ req = 'r1', mid = 'm1', ts = '2026-09-18T10:00:00Z', cwd = '/home/u/termag/projects/p', branch = 'main', input = 10, output = 5, cr = 100, cc = 20, uuid } = {}) {
+function usageLine({ req = 'r1', mid = 'm1', ts = '2026-09-18T10:00:00Z', cwd = '/home/u/termag/projects/p', branch = 'main', input = 10, output = 5, cr = 100, cc = 20, uuid, model } = {}) {
   const e = { type: 'assistant', timestamp: T(ts), cwd, gitBranch: branch, message: { id: mid, usage: { input_tokens: input, output_tokens: output, cache_read_input_tokens: cr, cache_creation_input_tokens: cc } } };
+  if (model) e.message.model = model;
   if (req !== null) e.requestId = req;
   if (uuid) e.uuid = uuid;
   return JSON.stringify(e);
@@ -146,9 +147,11 @@ const { parsePiFile } = require('./usage-scanner');
 function piSessionHeader(cwd, ts = '2026-10-04T06:04:46.038Z') {
   return JSON.stringify({ type: 'session', version: 3, id: 's1', timestamp: ts, cwd });
 }
-function piMessage({ id = 'm1', ts = '2026-10-04T06:05:13.189Z', role = 'assistant', usage } = {}) {
+function piMessage({ id = 'm1', ts = '2026-10-04T06:05:13.189Z', role = 'assistant', usage, provider, model } = {}) {
   const u = usage === undefined ? { input: 100, output: 10, cacheRead: 50, cacheWrite: 5, reasoning: 3, totalTokens: 168, cost: { total: 0 } } : usage;
   const msg = { role, content: [] };
+  if (provider) msg.provider = provider;
+  if (model) msg.model = model;
   if (u) msg.usage = u;
   return JSON.stringify({ type: 'message', id, parentId: null, timestamp: ts, message: msg });
 }
@@ -198,4 +201,81 @@ test('pi: scan reports provider pi, buckets keyed by session cwd (not the dir na
   assert.equal(r.providers.pi['2026-10-04'].reasoning, 6);
   assert.equal(r.providers.pi['2026-10-04'].output, 20);
   assert.deepEqual(r.sources.pi.errors, []);
+});
+
+// ── per-model split ──────────────────────────────────────────
+const { parseCodexFile, _internals: { modelList } } = require('./usage-scanner');
+const byModel = (models) => Object.fromEntries(Object.values(models).map(m => [`${m.backend}|${m.model}`, m.days]));
+
+test('claude: usage is split by message.model after dedupe; a line without one is model ""', () => {
+  const r = parseClaudeFile([
+    usageLine({ req: 'r1', mid: 'a', model: 'claude-opus-5-5' }),
+    usageLine({ req: 'r1', mid: 'a', model: 'claude-opus-5-5' }), // same response, second content block
+    usageLine({ req: 'r2', mid: 'b', model: 'us.anthropic.claude-sonnet-5-5', input: 7 }),
+    usageLine({ req: 'r3', mid: 'c' }),
+  ].join('\n'));
+  const m = byModel(r.models);
+  assert.deepEqual(Object.keys(m).sort(), ['|', '|claude-opus-5-5', '|us.anthropic.claude-sonnet-5-5']);
+  assert.equal(m['|claude-opus-5-5']['2026-09-18'].calls, 1);
+  assert.equal(m['|us.anthropic.claude-sonnet-5-5']['2026-09-18'].input, 7);
+  const sum = Object.values(m).reduce((a, d) => a + tokens(d['2026-09-18']), 0);
+  assert.equal(sum, tokens(r.days['2026-09-18']));
+});
+
+test('codex: token_count events go to the model of the latest turn_context', () => {
+  const tc = (model) => JSON.stringify({ type: 'turn_context', timestamp: '2026-09-18T10:00:00Z', payload: { model } });
+  const tok = (input) => JSON.stringify({ type: 'event_msg', timestamp: '2026-09-18T10:00:01Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: input, output_tokens: 1, cached_input_tokens: 10 } } } });
+  const r = parseCodexFile([
+    JSON.stringify({ type: 'session_meta', payload: { cwd: '/home/u/p' } }),
+    tok(1), tc('gpt-5.5'), tok(2), tok(3), tc('gpt-5.5-mini'), tok(4),
+  ].join('\n'));
+  const m = byModel(r.models);
+  assert.equal(m['|']['2026-09-18'].input, 1);
+  assert.equal(m['|gpt-5.5']['2026-09-18'].input, 5);
+  assert.equal(m['|gpt-5.5-mini']['2026-09-18'].calls, 1);
+});
+
+test('pi: backend is the message provider; cache_warm goes to the current model; model_change switches it', () => {
+  const r = parsePiFile([
+    piSessionHeader('/home/u/p'),
+    JSON.stringify({ type: 'model_change', id: 'c1', timestamp: '2026-10-04T06:04:47Z', provider: 'fireworks', modelId: 'accounts/fireworks/models/kimi-k3' }),
+    piUsageEntry({ id: 'w1', cacheRead: 500 }),
+    piMessage({ id: 'm1', provider: 'broker', model: 'df-1' }),
+    piUsageEntry({ id: 'w2', cacheRead: 7 }),
+  ].join('\n'));
+  const m = byModel(r.models);
+  assert.equal(m['fireworks|accounts/fireworks/models/kimi-k3']['2026-10-04'].cacheRead, 500);
+  assert.equal(m['broker|df-1']['2026-10-04'].cacheRead, 50 + 7);
+  assert.equal(m['broker|df-1']['2026-10-04'].calls, 2);
+});
+
+test("pi: termag's own Fireworks provider (termag-fireworks) is backend fireworks", () => {
+  const r = parsePiFile([
+    piSessionHeader('/home/u/p'),
+    JSON.stringify({ type: 'model_change', id: 'c1', timestamp: '2026-10-04T06:04:47Z', provider: 'termag-fireworks', modelId: 'accounts/fireworks/models/kimi-k3' }),
+    piUsageEntry({ id: 'w1', cacheRead: 500 }),
+    piMessage({ id: 'm1', provider: 'termag-fireworks', model: 'accounts/fireworks/models/glm-5p3' }),
+  ].join('\n'));
+  assert.deepEqual(Object.keys(byModel(r.models)).sort(), ['fireworks|accounts/fireworks/models/glm-5p3', 'fireworks|accounts/fireworks/models/kimi-k3']);
+});
+
+test('scan: every bucket carries models[] that sum to its days, pruned by since like days', async () => {
+  const home = mkHome();
+  writeClaude(home, '/home/u/termag/projects/a', 'a.jsonl', [
+    usageLine({ req: 'r1', mid: 'a1', ts: '2026-09-17T10:00:00Z', model: 'claude-opus-5-5' }),
+    usageLine({ req: 'r2', mid: 'a2', ts: '2026-09-18T10:00:00Z', model: 'claude-haiku-5-5' }),
+  ]);
+  writePi(home, '/home/u/termag/projects/q', 's.jsonl', [piSessionHeader('/home/u/termag/projects/q'), piMessage({ id: 'm1', provider: 'fireworks', model: 'accounts/fireworks/models/glm-5p3' })]);
+  const s = createScanner({ home });
+  let r = await s.scan();
+  for (const src of Object.values(r.sources)) for (const b of src.buckets) {
+    assert.ok(Array.isArray(b.models));
+    for (const [date, d] of Object.entries(b.days)) {
+      assert.equal(b.models.reduce((a, m) => a + (m.days[date] ? tokens(m.days[date]) : 0), 0), tokens(d));
+    }
+  }
+  assert.deepEqual(r.sources.pi.buckets[0].models.map(m => [m.backend, m.model]), [['fireworks', 'accounts/fireworks/models/glm-5p3']]);
+  r = await s.scan({ since: '2026-09-18' });
+  assert.deepEqual(r.sources.claude.buckets[0].models.map(m => m.model), ['claude-haiku-5-5']);
+  assert.deepEqual(modelList({}), []);
 });

@@ -80,11 +80,11 @@ function tunnels(orch, over = {}) {
   return { t, logs };
 }
 
-test('port-forward-v1 is the capability, advertised only where the guard can read the kernel tables', () => {
+test('port-forward-v1 and preview-link-v1 are the capabilities, advertised only where the guard can read the kernel tables', () => {
   assert.deepEqual(CAPABILITIES, ['port-forward-v1']);
-  assert.deepEqual(capabilities({ canCheckPorts: () => true }), ['port-forward-v1']);
+  assert.deepEqual(capabilities({ canCheckPorts: () => true }), ['port-forward-v1', 'preview-link-v1']);
   assert.deepEqual(capabilities({ canCheckPorts: () => false }), []);
-  assert.deepEqual(capabilities(), portGuard.canCheckPorts() ? ['port-forward-v1'] : []);
+  assert.deepEqual(capabilities(), portGuard.canCheckPorts() ? ['port-forward-v1', 'preview-link-v1'] : []);
 });
 
 test('an echo through a port tunnel, then fins both ways and a 1000 from the far side: a normal end', async () => {

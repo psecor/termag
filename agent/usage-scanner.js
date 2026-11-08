@@ -12,7 +12,7 @@
  *   { schema: 2, scannedAt, host, days, providers, sources }
  * `days` / `providers` keep the schema-1 shape so an older backend keeps working;
  * `sources.<provider>.buckets[]` adds the raw per-directory totals plus the best
- * path hint we have, so the BACKEND can attribute tokens to a project/workstream
+ * path hint we have (and `models[]`, the same totals split by { model, backend }), so the BACKEND can attribute tokens to a project/workstream
  * (the agent knows nothing about projects). Path hints are un-remapped through
  * the inverse of `path_remap` so they compare against the backend's
  * /home/<user>/… layout even on macOS.
@@ -44,6 +44,28 @@ function cloneDays(days, since) {
   for (const [date, d] of Object.entries(days)) if (!since || date >= since) out[date] = { ...d };
   return out;
 }
+// Per-model split of the same tokens: `${backend}\n${model}` → { model, backend, days }.
+// `model` and `backend` are '' when the log doesn't say (backend: pi's provider).
+function addModelDay(models, model, backend, date) {
+  const key = `${backend}\n${model}`;
+  if (!models[key]) models[key] = { model, backend, days: {} };
+  return ensureDay(models[key].days, date);
+}
+function mergeModels(into, from) {
+  for (const [key, m] of Object.entries(from || {})) {
+    if (!into[key]) into[key] = { model: m.model, backend: m.backend, days: {} };
+    mergeDays(into[key].days, m.days);
+  }
+}
+function modelList(models, since) {
+  return Object.values(models || {})
+    .map(m => ({ model: m.model, backend: m.backend, days: cloneDays(m.days, since) }))
+    .filter(m => Object.keys(m.days).length);
+}
+const str = (v) => (typeof v === 'string' ? v : '');
+// pi's provider as a backend. termag launches pi on Fireworks through its own
+// provider, `termag-fireworks`, which is the backend `fireworks`.
+const piBackend = (v) => { const p = str(v); return p === 'termag-fireworks' ? 'fireworks' : p; };
 function inc(map, key) { map.set(key, (map.get(key) || 0) + 1); }
 function argmax(map, pred) {
   let best = null, n = -1;
@@ -95,6 +117,7 @@ function dedupeKey(entry) {
 function parseClaudeFile(content) {
   const seen = new Set();
   const days = {};
+  const models = {};
   const cwdCounts = new Map();
   const branchCounts = new Map();
   let overflow = false;
@@ -112,21 +135,20 @@ function parseClaudeFile(content) {
       if (seen.size < MAX_KEYS_PER_FILE) seen.add(k); else overflow = true;
     }
     const u = msg.usage;
-    const d = ensureDay(days, date);
-    d.input += u.input_tokens || 0;
-    d.output += u.output_tokens || 0;
-    d.cacheRead += u.cache_read_input_tokens || 0;
-    d.cacheCreate += u.cache_creation_input_tokens || 0;
-    d.calls += 1;
+    const delta = { input: u.input_tokens || 0, output: u.output_tokens || 0, cacheRead: u.cache_read_input_tokens || 0, cacheCreate: u.cache_creation_input_tokens || 0, reasoning: 0, calls: 1 };
+    addInto(ensureDay(days, date), delta);
+    addInto(addModelDay(models, str(msg.model), '', date), delta);
     if (typeof entry.cwd === 'string' && entry.cwd) inc(cwdCounts, entry.cwd);
     if (typeof entry.gitBranch === 'string' && entry.gitBranch) inc(branchCounts, entry.gitBranch);
   }
-  return { days, cwdCounts, branchCounts, overflow };
+  return { days, models, cwdCounts, branchCounts, overflow };
 }
 
 /** Parse one Codex rollout file (schema-1 arithmetic; cwd from a session_meta header if present). */
 function parseCodexFile(content) {
   const days = {};
+  const models = {};
+  let model = ''; // from the latest turn_context, which precedes its turn's token_count events
   let cwdHint = null;
   let first = true;
   for (const line of content.split('\n')) {
@@ -138,6 +160,7 @@ function parseCodexFile(content) {
       const p = entry.payload;
       if (entry.type === 'session_meta' && p && typeof p.cwd === 'string') cwdHint = p.cwd;
     }
+    if (entry.type === 'turn_context' && entry.payload && typeof entry.payload.model === 'string') { model = entry.payload.model; continue; }
     if (entry.type !== 'event_msg') continue;
     const payload = entry.payload;
     if (!payload || payload.type !== 'token_count') continue;
@@ -145,13 +168,11 @@ function parseCodexFile(content) {
     if (!u) continue;
     const date = entry.timestamp ? utcDate(entry.timestamp) : null;
     if (!date) continue;
-    const d = ensureDay(days, date);
-    d.input += u.input_tokens || 0;
-    d.output += u.output_tokens || 0;
-    d.cacheRead += u.cached_input_tokens || 0;
-    d.calls += 1;
+    const delta = { input: u.input_tokens || 0, output: u.output_tokens || 0, cacheRead: u.cached_input_tokens || 0, cacheCreate: 0, reasoning: 0, calls: 1 };
+    addInto(ensureDay(days, date), delta);
+    addInto(addModelDay(models, model, '', date), delta);
   }
-  return { days, cwdHint };
+  return { days, models, cwdHint };
 }
 
 /**
@@ -170,6 +191,10 @@ function parseCodexFile(content) {
 function parsePiFile(content) {
   const seen = new Set();
   const days = {};
+  const models = {};
+  // A usage entry (cache_warm) names no model: it goes to the session's current one,
+  // from the last model_change or assistant message.
+  let model = '', backend = '';
   let cwdHint = null;
   let first = true;
   let overflow = false;
@@ -181,6 +206,7 @@ function parsePiFile(content) {
       first = false;
       if (entry.type === 'session' && typeof entry.cwd === 'string') cwdHint = entry.cwd;
     }
+    if (entry.type === 'model_change') { model = str(entry.modelId); backend = piBackend(entry.provider); continue; }
     let u = null;
     if (entry.type === 'message' && entry.message && typeof entry.message === 'object' && entry.message.usage) u = entry.message.usage;
     else if (entry.type === 'usage' && entry.usage) u = entry.usage;
@@ -191,15 +217,12 @@ function parsePiFile(content) {
       if (seen.has(entry.id)) continue;
       if (seen.size < MAX_KEYS_PER_FILE) seen.add(entry.id); else overflow = true;
     }
-    const d = ensureDay(days, date);
-    d.input += u.input || 0;
-    d.output += u.output || 0;
-    d.cacheRead += u.cacheRead || 0;
-    d.cacheCreate += u.cacheWrite || 0;
-    d.reasoning += u.reasoning || 0;
-    d.calls += 1;
+    if (entry.type === 'message' && entry.message.model) { model = str(entry.message.model); backend = piBackend(entry.message.provider); }
+    const delta = { input: u.input || 0, output: u.output || 0, cacheRead: u.cacheRead || 0, cacheCreate: u.cacheWrite || 0, reasoning: u.reasoning || 0, calls: 1 };
+    addInto(ensureDay(days, date), delta);
+    addInto(addModelDay(models, model, backend, date), delta);
   }
-  return { days, cwdHint, overflow };
+  return { days, models, cwdHint, overflow };
 }
 
 function errInfo(err) { return (err && (err.code || err.message)) || String(err); }
@@ -258,9 +281,10 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
         if (!parsed) continue;
         if (parsed.overflow) errors.push({ dir, file, error: 'dedupe-overflow' });
         let agg = perDir.get(dir);
-        if (!agg) { agg = { files: 0, days: {}, cwdCounts: new Map(), branchCounts: new Map() }; perDir.set(dir, agg); }
+        if (!agg) { agg = { files: 0, days: {}, models: {}, cwdCounts: new Map(), branchCounts: new Map() }; perDir.set(dir, agg); }
         agg.files++;
         mergeDays(agg.days, parsed.days);
+        mergeModels(agg.models, parsed.models);
         for (const [k, v] of parsed.cwdCounts) agg.cwdCounts.set(k, (agg.cwdCounts.get(k) || 0) + v);
         for (const [k, v] of parsed.branchCounts) agg.branchCounts.set(k, (agg.branchCounts.get(k) || 0) + v);
       }
@@ -275,6 +299,7 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
         cwdHint: cwd ? unremapPath(cwd) : null,
         files: agg.files,
         days: agg.days,
+        models: agg.models,
       };
       const branch = argmax(agg.branchCounts);
       if (branch) bucket.gitBranch = branch;
@@ -288,7 +313,7 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
     const t0 = Date.now();
     const stats = { files: 0, reparsed: 0, cached: 0, durationMs: 0 };
     const errors = [];
-    const byCwd = new Map(); // cwdHint|'' → days
+    const byCwd = new Map(); // cwdHint|'' → { days, models }
     const sessionsDir = path.join(home, '.codex', 'sessions');
     let years = [];
     try { years = await readdir(sessionsDir); } catch { /* no codex */ }
@@ -314,13 +339,14 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
             const parsed = await cachedParse(full, parseCodexFile, stats, (error) => errors.push({ file: rel, error }));
             if (!parsed) continue;
             const key = parsed.cwdHint ? unremapPath(parsed.cwdHint) : '';
-            if (!byCwd.has(key)) byCwd.set(key, {});
-            mergeDays(byCwd.get(key), parsed.days);
+            if (!byCwd.has(key)) byCwd.set(key, { days: {}, models: {} });
+            mergeDays(byCwd.get(key).days, parsed.days);
+            mergeModels(byCwd.get(key).models, parsed.models);
           }
         }
       }
     }
-    const buckets = [...byCwd.entries()].map(([cwd, days]) => ({ cwdHint: cwd || null, days }));
+    const buckets = [...byCwd.entries()].map(([cwd, b]) => ({ cwdHint: cwd || null, days: b.days, models: b.models }));
     stats.durationMs = Date.now() - t0;
     return { buckets, errors, stats };
   }
@@ -359,7 +385,7 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
     const t0 = Date.now();
     const stats = { files: 0, reparsed: 0, cached: 0, durationMs: 0 };
     const errors = [];
-    const byCwd = new Map(); // cwdHint|'' → days
+    const byCwd = new Map(); // cwdHint|'' → { days, models }
     const sessionsDir = path.join(home, '.pi', 'agent', 'sessions');
     let dirs = [];
     try { dirs = await readdir(sessionsDir); } catch { /* no pi on this host */ }
@@ -380,11 +406,12 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
         if (!parsed) continue;
         if (parsed.overflow) errors.push({ dir, file: rel, error: 'dedupe-overflow' });
         const key = parsed.cwdHint ? unremapPath(parsed.cwdHint) : '';
-        if (!byCwd.has(key)) byCwd.set(key, {});
-        mergeDays(byCwd.get(key), parsed.days);
+        if (!byCwd.has(key)) byCwd.set(key, { days: {}, models: {} });
+        mergeDays(byCwd.get(key).days, parsed.days);
+        mergeModels(byCwd.get(key).models, parsed.models);
       }
     }
-    const buckets = [...byCwd.entries()].map(([cwd, days]) => ({ cwdHint: cwd || null, days }));
+    const buckets = [...byCwd.entries()].map(([cwd, b]) => ({ cwdHint: cwd || null, days: b.days, models: b.models }));
     stats.durationMs = Date.now() - t0;
     return { buckets, errors, stats };
   }
@@ -404,7 +431,7 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
       for (const b of src.buckets) mergeDays(total, b.days);
       providers[pid] = cloneDays(total, since);
       mergeDays(days, providers[pid]);
-      src.buckets = src.buckets.map(b => ({ ...b, days: cloneDays(b.days, since) }));
+      src.buckets = src.buckets.map(b => ({ ...b, days: cloneDays(b.days, since), models: modelList(b.models, since) }));
     }
     return {
       schema: SCHEMA,
@@ -421,5 +448,5 @@ function createScanner({ home = process.env.HOME || '/home', pathRemap = {}, pla
 
 module.exports = {
   SCHEMA, createScanner, encodeClaudeDir, makeUnremap, dedupeKey, parseClaudeFile, parseCodexFile, parsePiFile,
-  _internals: { ensureDay, mergeDays, cloneDays, utcDate, MAX_KEYS_PER_FILE, MAX_CACHED_FILES },
+  _internals: { ensureDay, mergeDays, cloneDays, modelList, utcDate, MAX_KEYS_PER_FILE, MAX_CACHED_FILES },
 };

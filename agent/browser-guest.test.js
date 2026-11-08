@@ -521,3 +521,176 @@ test('checkoutState takes no optional git locks, so its status never holds index
   await checkoutState('/w', (cmd, args, opts, cb) => { envs.push(opts.env && opts.env.GIT_OPTIONAL_LOCKS); cb(null, ''); });
   assert.deepEqual(envs, ['0', '0', '0']);
 });
+
+// ── The repo recipe ──────────────────
+
+// Security Agent on #998 (462ebc81): an idle port is shared space; another process may bind it while the pane is open.
+test('repo recipe: opens the first port at its path while the environment serves it, and drops an idle second port and a stranger\'s', async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const plan = { ports: [{ name: 'frontend', port: 5174, path: '/termag/' }, { name: 'backend', port: 3040, path: '/' }, { name: 'other', port: 9000, path: '/' }] };
+  const listening = {
+    5174: [{ pid: 10, cwd: '/w/web/frontend' }],
+    3040: [],
+    9000: [{ pid: 11, cwd: '/elsewhere' }],
+  };
+  const deps = {
+    home: '/nonexistent-home',
+    loadPlan: () => ({ plan, checkouts: { 'acme/web': '/w/web' } }),
+    dockerPublisher: async () => ({ workingDir: '' }),
+    listenersOn: (ip, port) => listening[port] || [],
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  const r = await resolveRecipe({ kind: 'repo' }, '/w/web', deps);
+  assert.deepEqual(r, {
+    ok: true, origins: ['127.0.0.1:5174'], primaryUrl: 'http://localhost:5174/termag/',
+    dropped: [{ origin: '127.0.0.1:3040', why: 'nothing listens on it yet' }, { origin: '127.0.0.1:9000', why: 'pid 11 runs outside the checkout' }],
+  });
+});
+
+test('repo recipe: a listener in any of a multi-repo environment\'s checkouts counts; one in a worktree of main does not', async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const base = {
+    home: '/nonexistent-home',
+    loadPlan: () => ({ plan: { ports: [{ name: 'api', port: 8080, path: '/' }] }, checkouts: { 'acme/web': '/ws/frontend', 'acme/api': '/ws/api' } }),
+    dockerPublisher: async () => ({ workingDir: '' }),
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  assert.equal((await resolveRecipe({ kind: 'repo' }, '/ws', { ...base, listenersOn: () => [{ pid: 5, cwd: '/ws/api/cmd' }] })).ok, true);
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/ws', { ...base, listenersOn: () => [{ pid: 5, cwd: '/ws/.worktrees/fix/api' }] }), { ok: false, reason: 'other-workstream' });
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/ws', { ...base, listenersOn: () => [] }), { ok: false, reason: 'stack-not-running' });
+});
+
+test('repo recipe: a Docker publish counts when its compose project is inside a checkout', async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const deps = {
+    home: '/nonexistent-home',
+    loadPlan: () => ({ plan: { ports: [{ name: 'app', port: 80, path: '/' }] }, checkouts: { 'acme/web': '/w/web' } }),
+    listenersOn: () => [],
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/w/web', { ...deps, dockerPublisher: async () => ({ workingDir: '/w/web/dev-stack', boundIp: '0.0.0.0' }) }),
+    { ok: true, origins: ['127.0.0.1:80'], primaryUrl: 'http://localhost/' });
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/w/web', { ...deps, dockerPublisher: async () => ({ workingDir: '/other/dev-stack', boundIp: '0.0.0.0' }) }),
+    { ok: false, reason: 'other-workstream' });
+});
+
+test('repo recipe: a checkout with no environment file, or one with no ports, is no-environment', async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/w/web', { home: '/x', loadPlan: () => ({ missing: true }) }), { ok: false, reason: 'no-environment' });
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/w/web', { home: '/x', loadPlan: () => ({ plan: { ports: [] } }) }), { ok: false, reason: 'no-environment' });
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, 'relative', {}), { ok: false, reason: 'no-checkout' });
+});
+
+test("repo recipe: with the file's repos, only those repositories' checkouts own a port", async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const deps = {
+    home: '/nonexistent-home',
+    loadPlan: () => ({
+      plan: { repos: [{ repo: 'acme/web' }], ports: [{ name: 'web', port: 3000, path: '/' }] },
+      fileRepo: null, checkouts: { 'acme/web': '/ws/frontend', 'acme/tools': '/ws/tools' },
+    }),
+    dockerPublisher: async () => ({ workingDir: '' }),
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  assert.equal((await resolveRecipe({ kind: 'repo' }, '/ws', { ...deps, listenersOn: () => [{ pid: 1, cwd: '/ws/frontend' }] })).ok, true);
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/ws', { ...deps, listenersOn: () => [{ pid: 1, cwd: '/ws/tools' }] }), { ok: false, reason: 'other-workstream' });
+});
+
+// Bugbot on #998 (b85c711c): a feature workstream shares its own app, from the definition its project was made with.
+test("repo recipe: a workstream's worktree reads its project's definition from the main checkout's state, and owns only its own app", async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { statePath } = require('./environment-run');
+  const { envKey } = require('./environment-file');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guest-wt-'));
+  const home = path.join(root, 'home');
+  const main = path.join(root, 'web');
+  const { execFileSync } = require('child_process');
+  const git = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { stdio: 'ignore' });
+  try {
+    git('init', '-q', main);
+    git('-C', main, 'remote', 'add', 'origin', 'https://github.com/acme/web');
+    git('-C', main, 'commit', '-q', '--allow-empty', '-m', 'x');
+    const wt = path.join(main, '.worktrees', 'feature-x');
+    git('-C', main, 'worktree', 'add', '-q', '-b', 'feature-x', wt);
+    // The project was made from an inline environment: its text is in the main checkout's state, not on disk.
+    const file = statePath(home, envKey(main));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ key: envKey(main), dir: main, fileText: JSON.stringify({ repos: [{ repo: 'acme/web' }], ports: [{ name: 'web', port: 3000, path: '/app/' }] }) }));
+    const deps = {
+      home, dockerPublisher: async () => ({ workingDir: '' }),
+      insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+    };
+    assert.deepEqual(await resolveRecipe({ kind: 'repo' }, wt, { ...deps, listenersOn: () => [{ pid: 7, cwd: path.join(wt, 'frontend') }] }),
+      { ok: true, origins: ['127.0.0.1:3000'], primaryUrl: 'http://localhost:3000/app/' });
+    // main's app on that port is main's, not this workstream's.
+    assert.deepEqual(await resolveRecipe({ kind: 'repo' }, wt, { ...deps, listenersOn: () => [{ pid: 7, cwd: main }] }), { ok: false, reason: 'other-workstream' });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// Bugbot on #998 (682ee38d): a multi-repo workstream is a plain folder under the project root's .worktrees/.
+test("repo recipe: a multi-repo workstream reads its project's definition from the project root's state", async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { statePath } = require('./environment-run');
+  const { envKey } = require('./environment-file');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guest-ws-'));
+  const home = path.join(root, 'home');
+  const proj = path.join(root, 'proj');
+  const { execFileSync } = require('child_process');
+  const git = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { stdio: 'ignore' });
+  try {
+    fs.mkdirSync(proj);
+    fs.writeFileSync(path.join(proj, '.termag-workspace'), 'marker\n');
+    git('init', '-q', path.join(proj, 'web'));
+    git('-C', path.join(proj, 'web'), 'remote', 'add', 'origin', 'https://github.com/acme/web');
+    git('-C', path.join(proj, 'web'), 'commit', '-q', '--allow-empty', '-m', 'x');
+    const ws = path.join(proj, '.worktrees', 'feature-x');
+    fs.mkdirSync(ws, { recursive: true });
+    git('-C', path.join(proj, 'web'), 'worktree', 'add', '-q', '-b', 'feature-x', path.join(ws, 'web'));
+    const file = statePath(home, envKey(proj));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ key: envKey(proj), dir: proj, fileText: JSON.stringify({ repos: [{ repo: 'acme/web', path: 'web' }], ports: [{ name: 'web', port: 3000 }] }) }));
+    const deps = {
+      home, dockerPublisher: async () => ({ workingDir: '' }),
+      insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+    };
+    assert.deepEqual(await resolveRecipe({ kind: 'repo' }, ws, { ...deps, listenersOn: () => [{ pid: 7, cwd: path.join(ws, 'web') }] }),
+      { ok: true, origins: ['127.0.0.1:3000'], primaryUrl: 'http://localhost:3000/' });
+    assert.deepEqual(await resolveRecipe({ kind: 'repo' }, ws, { ...deps, listenersOn: () => [{ pid: 7, cwd: path.join(proj, 'web') }] }), { ok: false, reason: 'other-workstream' });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// Bugbot on #998 (7b2142ea): health and up fall back to ::1 when nothing listens on 127.0.0.1; so does Share.
+test('repo recipe: an app listening on ::1 alone is shared there, at its [::1] URL', async () => {
+  const { resolveRecipe } = require('./browser-guest');
+  const plan = { ports: [{ name: 'frontend', port: 5174, path: '/termag/' }, { name: 'api', port: 3040, path: '/' }] };
+  const deps = {
+    home: '/nonexistent-home',
+    loadPlan: () => ({ plan, checkouts: { 'acme/web': '/w/web' } }),
+    dockerPublisher: async () => ({ workingDir: '' }),
+    listenersOn: (ip, port) => (ip === '::1' ? [{ pid: 10, cwd: '/w/web/frontend' }] : []),
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  assert.deepEqual(await resolveRecipe({ kind: 'repo' }, '/w/web', deps), {
+    ok: true, origins: ['[::1]:5174', '[::1]:3040'], primaryUrl: 'http://[::1]:5174/termag/',
+  });
+});
+
+// Bugbot on #998 (1e3aaac4): Docker publishing on the address itself listens there through its proxy (root's
+// socket); that is the compose publish's own listener, as shadowOf already counts it.
+test("portOwnership owns a compose publish bound to the address itself, Docker's proxy and all", async () => {
+  const { portOwnership } = require('./browser-guest');
+  const deps = {
+    dockerPublisher: async () => ({ workingDir: '/w/web/dev-stack', boundIp: '127.0.0.1' }),
+    listenersOn: () => [{ pid: null, cwd: null }],
+    insideDir: (child, dir) => child === dir || child.startsWith(`${dir}/`),
+  };
+  assert.equal(await portOwnership('127.0.0.1', 5174, ['/w/web'], deps), 'owned');
+  // Bound to the wildcard, a socket on 127.0.0.1 itself still takes the connections: whose it is still counts.
+  assert.notEqual(await portOwnership('127.0.0.1', 5174, ['/w/web'], { ...deps, dockerPublisher: async () => ({ workingDir: '/w/web/dev-stack', boundIp: '0.0.0.0' }) }), 'owned');
+});

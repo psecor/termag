@@ -27,7 +27,7 @@ test('advertises mcp-broker-v2 only when the script carries its marker', () => {
   fs.writeFileSync(old, `#!/bin/sh
 # ${MCP_AGENTS_MARKER}
 `);
-  assert.deepStrictEqual(capabilitiesFor(old).slice(-2), ['fireworks-v1', 'mcp-broker-v2']);
+  assert.deepStrictEqual(capabilitiesFor(old).slice(-2), ['bazel-cache-v2', 'mcp-broker-v2']);
   assert.ok(!capabilitiesFor(path.join(dir, 'missing')).includes('mcp-broker-v2'));
 });
 
@@ -38,7 +38,7 @@ test('advertises fireworks-menu-v1 only when the script takes --models, in the c
   stubScript(bin, `# ${FIREWORKS_MENU_MARKER}`);
   assert.ok(!capabilitiesFor(old, undefined, bin).includes('fireworks-menu-v1'));
   fs.writeFileSync(old, `#!/bin/sh\n# ${FIREWORKS_MENU_MARKER}\n`);
-  assert.deepStrictEqual(capabilitiesFor(old, undefined, bin).slice(-2), ['fireworks-v1', 'fireworks-menu-v1']);
+  assert.deepStrictEqual(capabilitiesFor(old, undefined, bin).slice(-2), ['bazel-cache-v2', 'fireworks-menu-v1']);
   // A checkout pulled ahead of the installed copy the launch runs.
   fs.writeFileSync(path.join(bin, 'termag-credentials'), '#!/bin/sh\nexit 0\n');
   assert.ok(!capabilitiesFor(old, undefined, bin).includes('fireworks-menu-v1'));
@@ -57,7 +57,7 @@ test('advertises fireworks-pi-menu-v1 only when both pi-model and termag-pi-fire
   // pi-model takes it, but an older launcher would hand --models to pi.
   assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
   fs.writeFileSync(path.join(dir, 'termag-pi-fireworks'), `#!/bin/sh\n# ${FIREWORKS_PI_LAUNCHER_MARKER}\n`);
-  assert.deepStrictEqual(capabilitiesFor(script, undefined, bin).slice(-2), ['fireworks-v1', 'fireworks-pi-menu-v1']);
+  assert.deepStrictEqual(capabilitiesFor(script, undefined, bin).slice(-2), ['bazel-cache-v2', 'fireworks-pi-menu-v1']);
   // The installed launcher predates it.
   fs.writeFileSync(path.join(bin, 'termag-pi-fireworks'), '#!/bin/sh\nexit 0\n');
   assert.ok(!capabilitiesFor(script, undefined, bin).includes('fireworks-pi-menu-v1'));
@@ -126,6 +126,45 @@ test("remove hands the orchestrator's reason to the script on stdin", async () =
   const script = stubScript(dir, `cat > "${dir}/stdin"`);
   await removeCredential('github', script, 'GitHub is not connected');
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'stdin'), 'utf8')), { reason: 'GitHub is not connected' });
+});
+
+test('advertises bazel-cache-v2, never the option-A drafts\' -v1, and takes the bazel-cache provider', () => {
+  const { PROVIDERS } = require('./credentials');
+  assert.ok(CAPABILITIES.includes('bazel-cache-v2'));
+  assert.ok(!CAPABILITIES.includes('bazel-cache-v1'));
+  assert.ok(PROVIDERS.includes('bazel-cache'));
+  // The real script has the provider the capability promises.
+  const real = fs.readFileSync(path.join(__dirname, '..', 'deploy', 'termag-credentials'), 'utf8');
+  assert.match(real, /'apply bazel-cache'\)/);
+  assert.match(real, /'remove bazel-cache'\)/);
+});
+
+test('a bazel-cache apply passes the payload through like any provider\'s', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const script = stubScript(dir, `echo "$@" > "${dir}/argv"; cat > "${dir}/stdin"`);
+  const payload = { seq: 1730646000123, url: 'https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com/g/2026w45', flushGeneration: 0,
+    remoteTimeoutSeconds: 5, remoteRetries: 1, jobs: 200, downloadOutputs: 'toplevel', goHostModcache: false };
+  await applyCredential('bazel-cache', payload, script);
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'argv'), 'utf8').trim(), 'apply bazel-cache');
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'stdin'), 'utf8')), payload);
+});
+
+test('a bazel-cache remove passes reason, flushGeneration and seq on stdin; other removes only the reason', async () => {
+  const { removeExtras } = require('./credentials');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termag-cred-'));
+  const script = stubScript(dir, `cat > "${dir}/stdin"`);
+  const frame = { type: 'credentials-remove', provider: 'bazel-cache', reason: 'off for you', flushGeneration: 3, seq: 1730646000999, extra: 'x' };
+  await removeCredential('bazel-cache', script, frame.reason, removeExtras(frame));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'stdin'), 'utf8')), { reason: 'off for you', flushGeneration: 3, seq: 1730646000999 });
+  // A remove from a backend that sends neither still just removes.
+  await removeCredential('bazel-cache', script, 'off', removeExtras({ provider: 'bazel-cache', reason: 'off' }));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'stdin'), 'utf8')), { reason: 'off' });
+  // Values are passed as they came, for the script to validate.
+  assert.deepStrictEqual(removeExtras({ provider: 'bazel-cache', flushGeneration: 'x', seq: -1 }), { flushGeneration: 'x', seq: -1 });
+  // Another provider's frame never grows the fields.
+  assert.deepStrictEqual(removeExtras({ provider: 'github', flushGeneration: 3, seq: 1 }), {});
+  await removeCredential('github', script, 'gone', removeExtras({ provider: 'github', flushGeneration: 3 }));
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(dir, 'stdin'), 'utf8')), { reason: 'gone' });
 });
 
 test('unknown providers never reach the script', async () => {

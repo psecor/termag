@@ -3,7 +3,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const CAPABILITIES = ['project-clone-v1'];
+// project-clone-static-v1: a request may carry `staticDir`, the static layout's ~/code/<repo> for a box made from an
+// environment; the answer says whether the box took it.
+const STATIC_CAPABILITY = 'project-clone-static-v1';
+const CAPABILITIES = ['project-clone-v1', STATIC_CAPABILITY];
+const { STATIC_ROOT, STATIC_NAME_RE } = require('./static-layout');
+const environmentPrepare = require('./environment-prepare');
 const UNIT_TEMPLATE = 'termag-project-clone@.service';
 // Matches termag-on-claim.service TimeoutStartSec. A shorter wait fails the
 // project while personalization can still be running.
@@ -98,10 +103,54 @@ function acceptCloneRequest(msg) {
     }
     ref = referenceDir;
   }
+  let staticDir = null;
+  if (msg.staticDir != null) {
+    const v = msg.staticDir;
+    if (typeof v !== 'string' || !path.isAbsolute(v) || /[\r\n\0]/.test(v) || path.normalize(v) !== v
+      || path.basename(path.dirname(v)) !== STATIC_ROOT || !STATIC_NAME_RE.test(path.basename(v))) {
+      return { ok: false, error: `project-clone: staticDir must be ~/${STATIC_ROOT}/<name>` };
+    }
+    staticDir = v;
+  }
   return {
     ok: true,
-    request: { projectId, repo, key: cloneKey(projectId, repo), instanceId, dir, url, branch, attempt, sizeKb, referenceDir: ref },
+    request: { projectId, repo, key: cloneKey(projectId, repo), instanceId, dir, url, branch, attempt, sizeKb, referenceDir: ref, staticDir },
   };
+}
+
+function lexists(p) {
+  try { fs.lstatSync(p); return true; } catch { return false; }
+}
+
+/** `p` with its parent's links resolved (p itself may not exist yet). */
+function realIn(p) {
+  try { return path.join(fs.realpathSync(path.dirname(p)), path.basename(p)); } catch { return p; }
+}
+
+function readlinkOr(p) {
+  try { return fs.readlinkSync(p); } catch { return null; }
+}
+
+/**
+ * Whether this clone can take the static path `want` instead of the project directory `dir`, or why not: the clone
+ * already is this project's there (a retry, the next hello), or nothing is at `want` and the project directory is
+ * free or already the link to it. Anything at `want` that isn't this project's (the owner's own checkout, what
+ * someone made there by hand) is never taken over: the per-project layout is kept.
+ */
+function staticChoice(want, dir, existing, request, home) {
+  const ours = existing && existing.projectId === request.projectId && (existing.repo || null) === (request.repo || null) && existing.dir === want;
+  if (ours) return { ok: true, pooled: !!existing.pooled };
+  // An environment pool prepared this checkout before the box had an owner (environment-prepare.js): the project
+  // takes it over in place, and the clone pulls it as the owner.
+  const prepared = home ? environmentPrepare.preparedCheckout(home, want) : null;
+  if (prepared && (!lexists(dir) || readlinkOr(dir) === want)) return { ok: true, pooled: true };
+  if (lexists(want)) return { ok: false, why: `${want} already exists, so the project keeps its own directory (a \`path\` in the environment's repos picks another)` };
+  if (lexists(dir)) {
+    let link = null;
+    try { link = fs.readlinkSync(dir); } catch { /* not a link */ }
+    if (link !== want) return { ok: false, why: `${dir} already exists, so the project keeps it` };
+  }
+  return { ok: true };
 }
 
 function pendingState(request) {
@@ -115,6 +164,8 @@ function pendingState(request) {
     requestedBranch: request.branch,
     sizeKb: request.sizeKb,
     referenceDir: request.referenceDir,
+    ...(request.link ? { link: request.link } : {}),
+    ...(request.pooled ? { pooled: true } : {}),
     status: 'pending',
   };
 }
@@ -375,6 +426,61 @@ function writeExclude(dir) {
   fs.writeFileSync(file, `${prefix}${line}\n`);
 }
 
+/**
+ * The static layout's link: the project's directory pointing at its checkout under ~/code. Made once the checkout is
+ * in place; one already there is fine, anything else at that path is left alone and fails the clone.
+ */
+function ensureLink(state) {
+  if (!state.link) return null;
+  try {
+    if (fs.readlinkSync(state.link) === state.dir) return null;
+  } catch { /* not a link, or not there */ }
+  if (lexists(state.link)) return `${state.link} already exists, so it can't link to ${state.dir}`;
+  try {
+    fs.mkdirSync(path.dirname(state.link), { recursive: true });
+    fs.symlinkSync(state.dir, state.link);
+  } catch (err) {
+    return lastLine(err);
+  }
+  return null;
+}
+
+/**
+ * Pull a prepared checkout: the branch asked for when it isn't the one prepared (a PR's, say) is checked out
+ * instead; otherwise a fast-forward of the default branch. `{ from, to }` or `{ error }`.
+ */
+async function pullPrepared(execFile, state, opts) {
+  const head = async () => String((await git(execFile, ['-C', state.dir, 'rev-parse', 'HEAD'], opts)).stdout).trim();
+  try {
+    const from = await head();
+    const current = await headBranch(execFile, state.dir, opts);
+    // `HEAD` (or none) is the default branch: the one the pool prepared, pulled.
+    const want = state.requestedBranch && state.requestedBranch !== 'HEAD' ? state.requestedBranch : null;
+    if (want && want !== current) {
+      await git(execFile, ['-C', state.dir, 'fetch', '--quiet', 'origin', want], opts);
+      await git(execFile, ['-C', state.dir, 'checkout', '--quiet', '-B', want, `origin/${want}`], opts);
+    } else {
+      await git(execFile, ['-C', state.dir, 'pull', '--quiet', '--ff-only'], opts);
+    }
+    return { from, to: await head() };
+  } catch (err) {
+    return { error: `pull the prepared checkout: ${lastLine(err)}` };
+  }
+}
+
+/**
+ * Start empty on a project whose directory is the static layout's link to `checkout`: removes that link, so the
+ * directory made next is the project's own and nothing is written into the abandoned clone, which stays on disk.
+ * Anything else at `dir` (a real directory, a link elsewhere) is left alone. Whether it removed the link.
+ */
+function dropStaticLink(dir, checkout) {
+  let link = null;
+  try { link = fs.readlinkSync(dir); } catch { return false; }
+  if (link !== checkout) return false;
+  fs.unlinkSync(dir);
+  return true;
+}
+
 function save(home, state, patch) {
   const next = { ...state, ...patch };
   writeJson(statePath(home, state.key || state.projectId), next);
@@ -421,9 +527,34 @@ async function runClone(projectId, opts = {}) {
   }
 
   if (await checkoutMatches(execFile, state.dir, state.url, gitOpts)) {
+    const linkError = ensureLink(state);
+    if (linkError) {
+      save(home, state, { status: 'failed', error: linkError });
+      return 1;
+    }
+    // A pool's prepared checkout: brought up to date once, as the owner (the broker answers with their credential
+    // now), in place. termag never pulls it again.
+    if (state.pooled && !state.pulled) {
+      const pulled = await pullPrepared(execFile, state, gitOpts);
+      if (pulled.error) {
+        save(home, state, { status: 'failed', error: pulled.error });
+        return 1;
+      }
+      environmentPrepare.markAdopted(home, state.projectId, realIn(state.dir));
+      state = save(home, state, { pulled: true, pulledFrom: pulled.from, pulledTo: pulled.to });
+    }
     const branch = await headBranch(execFile, state.dir, gitOpts);
     save(home, state, { status: 'ready', branch, error: undefined });
     return 0;
+  }
+  // The project directory is checked before anything is cloned, so a link that can't be made costs no clone.
+  if (state.link && lexists(state.link)) {
+    let link = null;
+    try { link = fs.readlinkSync(state.link); } catch { /* not a link */ }
+    if (link !== state.dir) {
+      save(home, state, { status: 'failed', error: `${state.link} already exists, so it can't link to ${state.dir}` });
+      return 1;
+    }
   }
   if (fs.existsSync(state.dir)) {
     save(home, state, { status: 'failed', error: `clone target already exists: ${state.dir}` });
@@ -454,7 +585,8 @@ async function runClone(projectId, opts = {}) {
   // workspace's is the root's (agent/workspace.js).
   if (!state.repo) writeGuides(
     temp,
-    path.basename(state.dir),
+    // The project's name: its directory's, which is the link in the static layout.
+    path.basename(state.link || state.dir),
     opts.username || process.env.USER || 'owner',
     opts.templatePath || path.join(__dirname, 'initial-AGENTS.md'),
   );
@@ -464,6 +596,11 @@ async function runClone(projectId, opts = {}) {
   } catch (err) {
     fs.rmSync(temp, { recursive: true, force: true });
     save(home, state, { status: 'failed', error: lastLine(err) });
+    return 1;
+  }
+  const linkError = ensureLink(state);
+  if (linkError) {
+    save(home, state, { status: 'failed', error: linkError });
     return 1;
   }
   const branch = await headBranch(execFile, state.dir, gitOpts);
@@ -516,9 +653,27 @@ async function handleProjectClone(msg, { execFile, home, remapPath }) {
     throw new Error('project-clone: dir and referenceDir must stay absolute');
   }
   const existing = readState(home, request.key);
+  // The static layout, when the orchestrator asks for it: clone at ~/code/<repo> and link the project directory to it.
+  let layout = {};
+  if (request.staticDir) {
+    const want = remapPath ? remapPath(request.staticDir) : request.staticDir;
+    const choice = path.isAbsolute(want) ? staticChoice(want, request.dir, existing, request, home) : { ok: false, why: 'staticDir must stay absolute' };
+    if (choice.ok) {
+      request.link = request.dir;
+      request.dir = want;
+      if (choice.pooled) request.pooled = true;
+      layout = { staticLayout: true };
+    } else {
+      layout = { staticLayout: false, staticRefused: choice.why };
+    }
+  }
+  delete request.staticDir;
+  // A multi-repo project's repository on a box made from a pooled environment: its directory is <root>/<name>, where
+  // the root links to ~/code, so it is the prepared checkout at ~/code/<name>.
+  if (!request.pooled && environmentPrepare.preparedCheckout(home, realIn(request.dir))) request.pooled = true;
   const unitState = await unitActiveState(execFile, request.key);
   const plan = planClone({ unitState, existing, request });
-  if (plan.kind === 'ignore') return { ok: true, started: false, ignored: plan.why };
+  if (plan.kind === 'ignore') return { ok: true, started: false, ignored: plan.why, ...layout };
   const unit = instanceUnit(request.key);
   if (plan.stop) await execFile('systemctl', ['--user', 'stop', unit], { timeout: 15000 });
   writeJson(statePath(home, request.key), plan.state);
@@ -540,7 +695,7 @@ async function handleProjectClone(msg, { execFile, home, remapPath }) {
     }
     throw new Error(`could not start ${unit}: ${detail}`);
   }
-  return { ok: true, started: true };
+  return { ok: true, started: true, ...layout };
 }
 
 if (require.main === module) {
@@ -560,6 +715,8 @@ if (require.main === module) {
 
 module.exports = {
   CAPABILITIES,
+  STATIC_CAPABILITY,
+  dropStaticLink,
   UNIT_TEMPLATE,
   acceptCloneRequest,
   planClone,

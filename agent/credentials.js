@@ -21,8 +21,14 @@ const path = require('path');
 // termag-mcp-headers.
 // fireworks-v1: the script takes the fireworks provider (pi's provider and the
 // Claude Code settings `launch-settings` hands it).
-const BASE_CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1'];
-const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks'];
+// bazel-cache-v2: the script takes the bazel-cache provider, the shared Bazel
+// cache's block in /etc/bazel.bazelrc, rendered from the delivery's values
+// (S3 read anonymously, no credential), and a bazel-cache remove passes its
+// flushGeneration and seq on ("How the
+// block reaches boxes"). Not -v1: the option-A drafts used that name for a
+// token fetch.
+const BASE_CAPABILITIES = ['credentials-v1', 'github-broker-v1', 'telemetry-v1', 'telemetry-replay-v1', 'agent-telemetry-v1', 'mcp-broker-v1', 'fireworks-v1', 'bazel-cache-v2'];
+const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks', 'bazel-cache'];
 
 const DEFAULT_SCRIPT = path.join(__dirname, '..', 'deploy', 'termag-credentials');
 // Where a launch finds the scripts. A launch the orchestrator types into a
@@ -134,11 +140,23 @@ function applyCredential(provider, payload, script) {
   return runCredentialsScript(['apply', provider], JSON.stringify(payload), script);
 }
 
+// What a credentials-remove frame carries besides its reason. Only bazel-cache's
+// has more: flushGeneration (so a raised flush reaches a box whose block is
+// off) and seq (so a remove older than the last apply is refused). The script
+// validates them; this only passes on what is there.
+function removeExtras(msg) {
+  if (!msg || msg.provider !== 'bazel-cache') return {};
+  const extras = {};
+  for (const key of ['flushGeneration', 'seq']) if (msg[key] !== undefined) extras[key] = msg[key];
+  return extras;
+}
+
 // The orchestrator says why it removed a credential; the script records it for
 // `termag-credentials status`.
-function removeCredential(provider, script, reason) {
+function removeCredential(provider, script, reason, extras = {}) {
   if (!PROVIDERS.includes(provider)) return Promise.reject(new Error(`unknown credential provider: ${provider}`));
-  return runCredentialsScript(['remove', provider], typeof reason === 'string' ? JSON.stringify({ reason }) : '', script);
+  const body = { ...(typeof reason === 'string' ? { reason } : {}), ...extras };
+  return runCredentialsScript(['remove', provider], Object.keys(body).length ? JSON.stringify(body) : '', script);
 }
 
 module.exports = {
@@ -156,4 +174,5 @@ module.exports = {
   PROVIDERS,
   applyCredential,
   removeCredential,
+  removeExtras,
 };
