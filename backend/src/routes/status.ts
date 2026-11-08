@@ -3,7 +3,9 @@ import { prisma } from '../db';
 import {
   setStatus, getStatus, getAllStatuses, updateStatusMeta, notifyStatusChange, armMilestoneTimer, clearMilestoneTimer,
 } from '../services/status';
-import { milestoneOnReading, parseMilestoneBody } from '../services/milestone';
+import { milestoneOnReading, parseMilestoneBody, prRefOf } from '../services/milestone';
+import { parseEditBody } from '../services/fileEditEvent';
+import { recordProductEvent } from '../services/productEvents';
 import { recordCreatedLink } from '../services/workstreamPrs';
 import { AgentStatus } from '../types/index';
 import { validateAgentToken } from './agentTokens';
@@ -22,7 +24,7 @@ import { recordHeartbeat } from '../services/humanActivity';
 import { noteBoxActivity } from '../services/boxActivity';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { isLocalPeer } from '../auth/peerAddress';
-import { resolveSessionProject } from '../services/sessionResolver';
+import { isAmbiguousSession, resolveSessionProject } from '../services/sessionResolver';
 import { recordContextSample } from '../services/contextSampler';
 import { debugLog } from '../services/debugLog';
 import { statusKey } from '../services/statusKey';
@@ -90,6 +92,24 @@ async function callerMayWrite(req: Request, session: string): Promise<boolean> {
     // Fail closed: a post that cannot be attributed is refused, not trusted.
     console.warn(`[STATUS] could not read box ${req.agentInstanceId} for the ownership check:`, err instanceof Error ? err.message : String(err));
     return false;
+  }
+}
+
+/**
+ * Whose a status write's product event is: the caller, or for a same-host
+ * hook (no req.user, authStatusWrite) the owner of the orchestrator project
+ * the session's name builds (services/sessionResolver.ts, cached; instance
+ * null, as writeInstanceId names it). Attribution only, never trust: the
+ * session name was already accepted for the write. Undefined when no one
+ * project matches, or the lookup fails; the event goes out without a user.
+ */
+async function eventUserId(req: Request, session: string): Promise<string | undefined> {
+  if (req.user) return req.user.id;
+  try {
+    const r = await resolveSessionProject(session, null);
+    return r && !isAmbiguousSession(r) && r.projectId ? r.userId : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -406,6 +426,9 @@ export function statusRouter(): Router {
     else setStatus(session, 'working', { milestone }, undefined, instanceId);
     notifyStatusChange(session, instanceId);
     console.log(`[STATUS] milestone ${kind} for ${session}${url ? ` (${url})` : ''}`);
+    // What left the box: the PR, by repository and number (docs/agents/observability.md).
+    const pr = prRefOf(url);
+    recordProductEvent(kind === 'pr_created' ? 'pr.opened' : 'pr.merged', { user: await eventUserId(req, session), box: instanceId }, { repo: pr?.repo, number: pr?.number });
     // The PR belongs to this workstream from now on (services/workstreamPrs.ts), wherever its worktree is.
     if (kind === 'pr_created') {
       recordCreatedLink(session, instanceId, url).catch(err => {
@@ -415,6 +438,24 @@ export function statusRouter(): Router {
 
     // Nobody acted on it → drop it after the TTL so a stale prompt never shows.
     armMilestoneTimer(session, instanceId);
+    res.json({ ok: true });
+  };
+
+  // POST /api/status/edit { session, dir, tool, claudeSession? } — from the
+  // PostToolUse hook (deploy/termag-status post-tool) for each file an agent
+  // writes: the top two directories of its path in the checkout, never the
+  // file (services/fileEditEvent.ts). Same trust model as the milestone. Only
+  // a product event; nothing is kept.
+  const postEdit: RequestHandler = async (req, res) => {
+    const parsed = parseEditBody(req.body);
+    if ('error' in parsed) { res.status(400).json({ error: parsed.error }); return; }
+    if (!(await callerMayWrite(req, parsed.session))) {
+      res.status(403).json({ error: 'forbidden: session not owned by caller' });
+      return;
+    }
+    recordProductEvent('agent.file.edited', { user: await eventUserId(req, parsed.session), box: writeInstanceId(req) }, {
+      dir: parsed.dir, tool: parsed.tool, claudeSession: parsed.claudeSession,
+    });
     res.json({ ok: true });
   };
 
@@ -454,6 +495,7 @@ export function statusRouter(): Router {
 
   router.post('/', authStatusWrite, postStatus);
   router.post('/milestone', authStatusWrite, postMilestone);
+  router.post('/edit', authStatusWrite, postEdit);
   router.post('/milestone/dismiss', requireAuth, dismissMilestone);
   router.post('/heartbeat', requireAuth, heartbeat);
   // Was unauthenticated: anyone who knew a session name could read its status.

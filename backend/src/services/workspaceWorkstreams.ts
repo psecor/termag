@@ -32,7 +32,7 @@ export interface WorkspaceProject {
   instance: { hostHome: string | null } | null;
 }
 
-export interface WorkspaceRepo { name: string; url: string; position: number }
+export interface WorkspaceRepo { name: string; url: string; position: number; setupStatus?: string }
 
 type Host = { userId: string; instanceId: string | null };
 
@@ -206,6 +206,9 @@ export async function removeWorkstreamTree(
       const w = await removeWorktree(host, root, wsRoot, ws.name, repo.name, opts.keepBranch ? undefined : ws.branch, opts.force);
       if (w) warnings.push(`${repo.name}: ${w}`);
     } catch (err) {
+      // A repository added since, still cloning or failed, may have no checkout to ask; the root's removal
+      // below still refuses, without force, to delete a worktree of it that is there.
+      if (repo.setupStatus && repo.setupStatus !== 'ready') continue;
       return { ok: false, status: 409, error: `${repo.name}: git worktree remove failed: ${(err as Error).message}` };
     }
   }

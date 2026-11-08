@@ -21,7 +21,26 @@ export type FleetScope = typeof SCOPES[number];
 export const isScope = (v: unknown): v is FleetScope => typeof v === 'string' && (SCOPES as readonly string[]).includes(v);
 
 export type HostRefusal = 'claude_update_off' | 'offline' | 'not_capable' | 'run_in_flight';
-export type FleetSkip = HostRefusal | 'unknown_version';
+/**
+ * What a host's inventory says about the tool: a version (`ok`); no binary on the probe's path
+ * (`not_installed`, the matrix's `missing`); a binary whose output gave no version
+ * (`version_unreadable`, the matrix's `unknown`); or no row for the tool newer than
+ * INVENTORY_STALE_MS (`no_inventory`: the box's agent never probed it, or stopped).
+ */
+export type InventoryState = 'ok' | 'not_installed' | 'version_unreadable' | 'no_inventory';
+/**
+ * Why a host in a below-floor or behind scope is skipped: a refusal (the flag, offline, ...), or
+ * why its version can't be compared. `unknown_version` is left for a version the inventory read
+ * that still compares with nothing: no reference to compare with (behind under latest, with no
+ * version anywhere in the fleet), or a version that doesn't parse.
+ */
+export type FleetSkip = HostRefusal | Exclude<InventoryState, 'ok'> | 'unknown_version';
+/**
+ * How old a host's inventory row for the tool may be and still count. Boxes are inventoried on
+ * connect and every 6 hours (services/software/collector.ts), so a connected box whose row is older
+ * than four sweeps no longer reports the tool: its agent dropped the probe, or its sweeps fail.
+ */
+export const INVENTORY_STALE_MS = 24 * 3600_000;
 
 export interface HostFacts {
   hostKey: string;
@@ -29,12 +48,14 @@ export interface HostFacts {
   connected: boolean;
   /** It announces tool-update-v1. */
   capable: boolean;
-  /** The tool's enabled flag (claude-code-update-enabled) for the box's owner and the box. */
+  /** The tool's enabled (its policy's mode not off) for the box's owner and the box. */
   enabled: boolean;
   /** A run of it is in flight (run.ts, isInFlight). */
   inFlight: boolean;
   /** The tool's version in its inventory, when it has one. */
   version: string | null;
+  /** Why `version` is null, from the inventory; taken as `ok` with a version and `no_inventory` without, when not given. */
+  inventory?: InventoryState;
   /** The floor of the box's own policy (the owner and the box: a box can have its own). */
   floor: string;
   /** What "behind" compares with for this box (behindReference over its own policy's target). */
@@ -67,7 +88,7 @@ const DAY = /^\d{4}\.\d{2}\.\d{2}$/;
  */
 export function behindReference(target: string, fleetVersions: Array<string | null>, isVersion: (v: unknown) => v is string = isClaudeVersion, latestReference?: string): string | null {
   if (isVersion(target)) return target;
-  // A tool whose latest is pinned (the Cursor agent): what the box resolves
+  // A tool whose latest is pinned (the Cursor agent, pi): what the box resolves
   // latest to, so a box on it is current and one past it is ahead (Bugbot on
   // #1080).
   if (latestReference) return latestReference;
@@ -104,7 +125,9 @@ export interface FleetSelection {
  * The hosts a scope takes, in the order given. A host outside the scope is
  * not listed at all; one inside it that cannot run now is skipped with the
  * reason. Below-floor and behind need a version to compare: a host whose
- * inventory has none is skipped as `unknown_version`, never updated blind.
+ * inventory has none is skipped, never updated blind, with the reason the
+ * host can't run when there is one (offline first: it is what an admin can
+ * act on), else why there is no version (`skipReason`).
  * Each host is compared with its own floor and reference (Devin on #975).
  */
 export function selectFleet(hosts: HostFacts[], scope: FleetScope): FleetSelection {
@@ -113,7 +136,7 @@ export function selectFleet(hosts: HostFacts[], scope: FleetScope): FleetSelecti
     if (scope !== 'all') {
       const against = scope === 'below-floor' ? h.floor : h.reference;
       const c = h.version && against ? compareToReference(h.version, against, scope === 'below-floor') : null;
-      if (c === null) { out.skipped.push({ hostKey: h.hostKey, reason: 'unknown_version' }); continue; }
+      if (c === null) { out.skipped.push({ hostKey: h.hostKey, reason: hostRefusal(h) ?? versionSkip(h) }); continue; }
       if (c >= 0) continue;
     }
     const refusal = hostRefusal(h);
@@ -121,6 +144,12 @@ export function selectFleet(hosts: HostFacts[], scope: FleetScope): FleetSelecti
     else out.hosts.push(h.hostKey);
   }
   return out;
+}
+
+/** Why a host's version can't be compared: what its inventory says, or `unknown_version` for one it read. */
+function versionSkip(h: Pick<HostFacts, 'version' | 'inventory'>): FleetSkip {
+  const inv = h.inventory ?? (h.version ? 'ok' : 'no_inventory');
+  return inv === 'ok' ? 'unknown_version' : inv;
 }
 
 /** How many of the queued runs start now, with `inFlight` runs already going. */

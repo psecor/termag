@@ -209,6 +209,27 @@ describe('classifyReviewPane', () => {
     expect(classifyReviewPane('zsh', done)).toBe('exited');
     expect(classifyReviewPane(null, '')).toBe('exited');
   });
+  it('reads the newer approval footer, with scope and edit hints (devin 3000.11.234)', () => {
+    // From a live review pane on 2026-11-04 stuck on `gh auth status`.
+    const scoped = [
+      ' Still 503. Let me check the gh auth setup and retry once more.',
+      ' ● Running command',
+      ' └ $ gh auth status 2>&1 | head -20',
+      '❭ Allow ← ■□□□ → Once      Exec(gh auth)',
+      '  Deny',
+      '↑↓ select · ↔ scope · e edit · ↵ confirm · esc cancel',
+    ].join('\n');
+    expect(classifyReviewPane('devin', scoped)).toBe('waiting');
+    expect(classifyReviewPane('devin', scoped.replace(' · esc cancel', ''))).toBe('waiting');
+    // Still a whole footer line: the hints quoted in a sentence are not a prompt.
+    // (the list's cursor row is gone too: it alone would say waiting).
+    const quoted = scoped.replace('↑↓ select', 'It shows ↑↓ select').replace('❭ Allow', '  Allow');
+    expect(classifyReviewPane('devin', quoted)).not.toBe('waiting');
+    // A narrow pane wraps the footer: the cursor row still says waiting, on either row.
+    const wrapped = scoped.replace('↑↓ select · ↔ scope · e edit · ↵ confirm · esc cancel', '↑↓ select · ↔ scope · e\nedit · ↵ confirm · esc\ncancel');
+    expect(classifyReviewPane('devin', wrapped)).toBe('waiting');
+    expect(classifyReviewPane('devin', wrapped.replace('❭ Allow', '  Allow').replace('  Deny', '❭ Deny'))).toBe('waiting');
+  });
   it('waiting beats activity when both show', () => {
     expect(classifyReviewPane('devin', `${working}\n${waiting}`)).toBe('waiting');
   });

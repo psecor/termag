@@ -4,7 +4,7 @@ import { DEFAULT_DEVIN_UPDATE_POLICY, parseDevinUpdatePolicy } from './devinUpda
 describe('parseDevinUpdatePolicy', () => {
   it('is the defaults for no value: the fleet\'s oldest version as the floor (no advisory gives one), latest, and no restart', () => {
     for (const v of [undefined, null, [], 'latest', 3]) expect(parseDevinUpdatePolicy(v)).toEqual(DEFAULT_DEVIN_UPDATE_POLICY);
-    expect(DEFAULT_DEVIN_UPDATE_POLICY).toEqual({ floor: '3000.11.92', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
+    expect(DEFAULT_DEVIN_UPDATE_POLICY).toEqual({ mode: 'off', floor: '3000.11.92', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
   });
 
   it('takes x.y.z versions and latest, nothing else', () => {

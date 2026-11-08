@@ -42,11 +42,9 @@ const store: CliStore = {
 
 let calls: Array<[string, ...unknown[]]>;
 let next: RouteResult;
-let enabled: boolean;
 
 const recorded = (name: keyof PrsWrites) => async (...args: unknown[]) => { calls.push([name, ...args]); return next; };
 const prs: CliPrs = {
-  async enabled(user) { calls.push(['enabled', user.id]); return enabled; },
   writes: {
     defer: recorded('defer'),
     undefer: recorded('undefer'),
@@ -77,7 +75,6 @@ afterAll(async () => {
 
 beforeEach(() => {
   calls = [];
-  enabled = true;
   next = { status: 200, body: { ok: true } };
 });
 
@@ -106,7 +103,7 @@ describe('the desktop PR page routes', () => {
       const res = await call(method, path, token, body);
       expect(res.status, `${method} ${path}`).toBe(200);
     }
-    expect(calls.filter(c => c[0] !== 'enabled')).toEqual([
+    expect(calls).toEqual([
       ['defer', 'alice', { key: 'example-org/termag#1', days: 2 }],
       ['undefer', 'alice', 'example-org/termag#1'],
       ['createGroup', 'alice', { name: 'Desktop bridge' }],
@@ -126,14 +123,6 @@ describe('the desktop PR page routes', () => {
       expect(await res.json()).toMatchObject({ code: 'device_sign_in_required' });
     }
     expect(calls).toEqual([]);
-  });
-
-  it('answer as if absent with desktop-app-enabled off for the user', async () => {
-    enabled = false;
-    const res = await call('POST', '/prs/groups', DEVICE, { name: 'G' });
-    expect(res.status).toBe(404);
-    expect(await res.json()).toMatchObject({ code: 'not_found' });
-    expect(calls).toEqual([['enabled', 'alice']]);
   });
 
   it('need a credential', async () => {

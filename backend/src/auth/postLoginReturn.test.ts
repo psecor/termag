@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { Session, SessionData } from 'express-session';
-import { cliReturnPath, fileLinkReturnPath, previewLinkReturnPath, stashPostLoginReturn, takePostLoginRedirect } from './postLoginReturn';
+import { cliReturnPath, fileLinkReturnPath, previewLandingReturnPath, previewLinkReturnPath, stashPostLoginReturn, takePostLoginRedirect } from './postLoginReturn';
 import { spaceFileLinkPath } from '../services/spaces/spaceLinks';
 
 const AUTHORIZE = '/termag/auth/cli/authorize?port=53682&state=abcdefghijklmnop&device_name=mbp';
@@ -121,5 +121,24 @@ describe('stash and take', () => {
   it('copes with no session at all', () => {
     expect(stashPostLoginReturn(undefined, '/termag', AUTHORIZE)).toBe(false);
     expect(takePostLoginRedirect(undefined, '/termag', 'https://ui.example')).toBe('https://ui.example/termag/');
+  });
+});
+
+describe('previewLandingReturnPath (preview links: back to the landing page after sign-in)', () => {
+  const T = 'abcdefghijklmnopqrstuv';
+  it('keeps a landing, a token landing and a reverify URL, exactly as sent', () => {
+    for (const p of ['/termag/previews/my-app', `/termag/previews/my-app/${T}`, '/termag/previews/my-app?next=%2Fdash', '/termag/previews/my-app/reverify?ticket=x']) {
+      expect(previewLandingReturnPath('/termag', p), p).toBe(p);
+    }
+  });
+  it('refuses anything else', () => {
+    for (const p of ['/termag/previews/', '/termag/previews/My-App', '/termag/previews/my-app/short', '/termag/previews/my-app/x/y', '/termag/previews/a/../../api', '//evil/termag/previews/my-app', '/termag/previews/my-app\\x', 42]) {
+      expect(previewLandingReturnPath('/termag', p), String(p)).toBeNull();
+    }
+  });
+  it('is what stashPostLoginReturn now stashes for a landing URL', () => {
+    const s = {} as Session & Partial<SessionData>;
+    expect(stashPostLoginReturn(s, '/termag', '/termag/previews/my-app?next=%2F')).toBe(true);
+    expect(s.postLoginReturnTo).toBe('/termag/previews/my-app?next=%2F');
   });
 });

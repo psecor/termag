@@ -7,7 +7,7 @@
  * capture, and read on demand (a tap) — never polled — with the same 1/s
  * per-caller-and-session shape as capture's budget.
  */
-import { assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { askChatPaneRefusal, assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
 import { sendForProject, isProjectAgentConnected } from '../services/agentRegistry';
 
 const HISTORY_MIN_INTERVAL_MS = 1000;
@@ -39,6 +39,8 @@ export async function historyFor(
     if (err instanceof SessionAccessError) return { status: err.status, body: { error: err.message } };
     throw err;
   }
+  const noPane = askChatPaneRefusal(access);
+  if (noPane) return noPane;
   const sessionName = access.session;
 
   const rateKey = `${userId}:${callerId}:${sessionName}`;

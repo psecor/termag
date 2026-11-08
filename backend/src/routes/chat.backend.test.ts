@@ -10,6 +10,8 @@ const ALL_CAPS = ['chat-runner-v1', 'chat-trust-v1', 'chat-backend-v1', 'firewor
 
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
+  // Every send checks for a resume onto this box whose session is still to restore: none here.
+  chatResume: { findFirst: vi.fn(async () => null) },
   workflow: { update: vi.fn() },
   // chatLaunchFor reads whether the owner has the Claude gateway on.
   user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: true })) },
@@ -117,18 +119,18 @@ describe('chat send on a model backend', () => {
 describe('chat history and Open in full UI on a model backend', () => {
   it('reports the backend with the model', async () => {
     storedOn('fireworks', KIMI);
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ model: KIMI, backend: 'fireworks' });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ model: KIMI, backend: 'fireworks' });
     storedOn(null, null);
-    const body = (await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body as Record<string, unknown>;
+    const body = (await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body as Record<string, unknown>;
     expect(body.model).toBe('sonnet');
     expect(body).not.toHaveProperty('backend');
   });
 
   it("reports a Fireworks chat with no stored model as the default it runs on, and as Fireworks when that can't be read", async () => {
     storedOn('fireworks', null);
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ model: KIMI, backend: 'fireworks' });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ model: KIMI, backend: 'fireworks' });
     flags.box = null;
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ model: null, backend: 'fireworks' });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ model: null, backend: 'fireworks' });
   });
 
   it('claims the resume on the backend, so the pane continues there', async () => {
@@ -168,18 +170,17 @@ describe('PDFs in a chat', () => {
   const PDF_CAPS = [...ALL_CAPS, 'chat-images-v1', 'chat-pdfs-v1'];
   const pdf = [{ mediaType: 'application/pdf', data: Buffer.from('%PDF-1.7\n%body').toString('base64'), name: 'spec.pdf' }];
   beforeEach(() => {
-    vi.mocked(boolVariation).mockImplementation(async (flag: string) => flag === 'chat-image-input-enabled');
     caps.list = PDF_CAPS;
   });
 
   it('offers PDFs on a Claude chat whose runner takes them, and not on an older runner or another backend', async () => {
     storedOn(null, 'sonnet');
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: true });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ imageInput: true, pdfInput: true });
     caps.list = [...ALL_CAPS, 'chat-images-v1'];
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: false });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ imageInput: true, pdfInput: false });
     caps.list = PDF_CAPS;
     storedOn('fireworks', KIMI);
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ imageInput: true, pdfInput: false });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ imageInput: true, pdfInput: false });
   });
 
   it('sends a PDF on Claude, and refuses it to an older runner or on another backend', async () => {

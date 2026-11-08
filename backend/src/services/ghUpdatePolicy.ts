@@ -44,12 +44,11 @@
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const GH_UPDATE_POLICY_FLAG = 'gh-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for gh and a box's policy says restart nothing. */
-export const GH_UPDATE_ENABLED_FLAG = 'gh-update-enabled';
 
 export const GH_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_GH_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '2.102.0',
   target: 'latest',
   restart: 'none',
@@ -59,5 +58,5 @@ export const DEFAULT_GH_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over gh's defaults; a bad key keeps its default. */
 export function parseGhUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_GH_UPDATE_POLICY, GH_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_GH_UPDATE_POLICY, GH_TARGET_TAGS, undefined, GH_UPDATE_POLICY_FLAG);
 }

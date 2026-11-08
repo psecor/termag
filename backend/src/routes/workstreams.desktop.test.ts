@@ -21,6 +21,7 @@ vi.mock('../services/agentRegistry', () => ({
 vi.mock('../services/agentRuntime', () => ({
   ensureAgentSessionsAndLaunch: vi.fn(async () => 'launched'),
   stopAgentSessions: vi.fn(async () => {}),
+  stopTerminalSlots: vi.fn(async () => {}),
   stopAgentPane: vi.fn(async () => {}),
   resolveAgentProvider: (provider: string | null) => provider ?? 'claude',
 }));

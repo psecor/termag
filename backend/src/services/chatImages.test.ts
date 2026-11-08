@@ -71,17 +71,15 @@ describe('checkChatImages', () => {
 });
 
 describe('chatImagesRefusal', () => {
-  it('refuses images without the flag or the runner capability', () => {
-    expect(chatImagesRefusal(0, false, [])).toBeNull();
-    expect(chatImagesRefusal(1, false, [CHAT_IMAGES_CAPABILITY])).toMatchObject({ status: 403, code: 'images-disabled' });
-    expect(chatImagesRefusal(1, true, [])).toMatchObject({ status: 409, code: 'images-unsupported' });
-    expect(chatImagesRefusal(2, true, [CHAT_IMAGES_CAPABILITY])).toBeNull();
+  it('refuses images without the runner capability', () => {
+    expect(chatImagesRefusal(0, [])).toBeNull();
+    expect(chatImagesRefusal(1, [])).toMatchObject({ status: 409, code: 'images-unsupported' });
+    expect(chatImagesRefusal(2, [CHAT_IMAGES_CAPABILITY])).toBeNull();
   });
 
   it('refuses PDFs on a runner without chat-pdfs-v1, and offers them only on one', () => {
-    expect(chatImagesRefusal(1, true, [CHAT_IMAGES_CAPABILITY], 1)).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
-    expect(chatImagesRefusal(1, true, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY], 1)).toBeNull();
-    expect(chatImagesRefusal(1, false, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY], 1)).toMatchObject({ code: 'images-disabled' });
+    expect(chatImagesRefusal(1, [CHAT_IMAGES_CAPABILITY], 1)).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
+    expect(chatImagesRefusal(1, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY], 1)).toBeNull();
     expect(chatPdfInput(true, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY])).toBe(true);
     expect(chatPdfInput(true, [CHAT_IMAGES_CAPABILITY])).toBe(false);
     expect(chatPdfInput(false, [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY])).toBe(false);
@@ -89,15 +87,14 @@ describe('chatImagesRefusal', () => {
 
   it("refuses PDFs, and does not offer them, in a chat on another model backend", () => {
     const caps = [CHAT_IMAGES_CAPABILITY, CHAT_PDFS_CAPABILITY];
-    expect(chatImagesRefusal(1, true, caps, 1, 'fireworks')).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
-    expect(chatImagesRefusal(1, true, caps, 0, 'fireworks')).toBeNull();
+    expect(chatImagesRefusal(1, caps, 1, 'fireworks')).toMatchObject({ status: 409, code: 'pdfs-unsupported' });
+    expect(chatImagesRefusal(1, caps, 0, 'fireworks')).toBeNull();
     expect(chatPdfInput(true, caps, 'fireworks')).toBe(false);
     expect(chatPdfInput(true, caps, null)).toBe(true);
   });
 
-  it('offers the composer images only with both', () => {
-    expect(chatImageInput(true, [CHAT_IMAGES_CAPABILITY])).toBe(true);
-    expect(chatImageInput(false, [CHAT_IMAGES_CAPABILITY])).toBe(false);
-    expect(chatImageInput(true, [])).toBe(false);
+  it('offers the composer images only on a runner that takes them', () => {
+    expect(chatImageInput([CHAT_IMAGES_CAPABILITY])).toBe(true);
+    expect(chatImageInput([])).toBe(false);
   });
 });

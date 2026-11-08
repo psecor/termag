@@ -16,6 +16,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { McpConnectorError } from './mcpConnectors';
 import type { OAuthHttp } from './mcpOAuthHttp';
+import { redirectRefusedError } from './mcpOAuthRedirectHelp';
 
 export interface DiscoveredOAuth {
   // RFC 8707 resource indicator: the protected resource's own identifier.
@@ -31,6 +32,14 @@ export interface DiscoveredOAuth {
   // RFC 9207: the server puts iss on its authorization response. Absent on
   // connectors discovered before termag read it.
   issParameterSupported?: boolean;
+  // A connector of kind "api" (services/apiBroker.ts): the provider whose
+  // fixed metadata this is. Absent on everything discovery found.
+  api?: string;
+  // false: the server takes no RFC 8707 resource (Google), so none is sent.
+  sendsResource?: false;
+  // More parameters on the authorize URL (Google's access_type=offline);
+  // never one the flow itself sets.
+  authorizeParams?: Record<string, string>;
 }
 
 /**
@@ -235,7 +244,17 @@ export interface PreregisteredClient {
   // token_type values the server answers that termag sends as a bearer token
   // anyway (Slack's user tokens say "user"); "bearer" is always accepted.
   tokenTypes: string[];
+  // The scopes every sign-in with this client asks for, when the entry lists
+  // them; Settings then offers no choice (services/mcpOAuthScopes.ts).
+  scopes?: string[];
+  // Slack: the workspace (T…) or org (E…) every sign-in is pinned to, the
+  // authorize URL's `team`. Absent, a Slack client's is the bot's own
+  // workspace (services/mcpOAuthSlackTeam.ts).
+  team?: string;
 }
+
+/** A Slack workspace (T…) or Enterprise org (E…) id. */
+export const SLACK_TEAM = /^[TE][A-Z0-9]{2,20}$/;
 
 const warned = new Set<string>();
 const warnOnce = (msg: string) => {
@@ -246,10 +265,11 @@ const warnOnce = (msg: string) => {
 
 /**
  * MCP_OAUTH_CLIENTS: a JSON array of
- * `{ "issuer", "resource", "clientId", "clientSecretEnv", "tokenTypes"? }`. The secret is
+ * `{ "issuer", "resource", "clientId", "clientSecretEnv", "tokenTypes"?, "scopes"?, "team"? }`. The secret is
  * read from the variable `clientSecretEnv` names, so the list itself holds
  * none. An entry that is malformed or whose secret is unset is skipped with a
- * warning that names the issuer and the variable, never a value.
+ * warning that names the issuer and the variable, never a value; a malformed
+ * `team` is dropped with a warning and the entry kept.
  */
 export function preregisteredClients(env: NodeJS.ProcessEnv = process.env): PreregisteredClient[] {
   const raw = env.MCP_OAUTH_CLIENTS?.trim();
@@ -274,7 +294,15 @@ export function preregisteredClients(env: NodeJS.ProcessEnv = process.env): Prer
       warnOnce(`${issuer}: ${secretEnv} is unset, so its client is skipped`);
       continue;
     }
-    out.push({ issuer, resource, clientId, clientSecret, tokenTypes: strings((e as Record<string, unknown>).tokenTypes).map(t => t.toLowerCase()) });
+    const entry = e as Record<string, unknown>;
+    const scopes = strings(entry.scopes).map(s => s.trim()).filter(Boolean);
+    const team = typeof entry.team === 'string' ? entry.team.trim() : '';
+    if (entry.team !== undefined && !SLACK_TEAM.test(team)) warnOnce(`${issuer}: ignored a team that is not a Slack workspace or org id (T… or E…)`);
+    out.push({
+      issuer, resource, clientId, clientSecret, tokenTypes: strings(entry.tokenTypes).map(t => t.toLowerCase()),
+      ...(scopes.length ? { scopes } : {}),
+      ...(SLACK_TEAM.test(team) ? { team } : {}),
+    });
   }
   return out;
 }
@@ -346,6 +374,11 @@ export async function registerClient(
   const reg = json(res.text);
   if (res.status !== 201 && res.status !== 200) {
     const why = isObj(reg) && typeof reg.error_description === 'string' ? reg.error_description : isObj(reg) && typeof reg.error === 'string' ? reg.error : `HTTP ${res.status}`;
+    // A server whose admin hasn't allowed termag's redirect (Glean's DCR policy):
+    // say which URL to allow-list, and how at a known provider.
+    if ((isObj(reg) && reg.error === 'invalid_redirect_uri') || /redirect[_\s-]?ur[il]/i.test(why)) {
+      throw redirectRefusedError({ providerMessage: why, redirectUri: opts.redirectUri, issuer: d.issuer });
+    }
     throw new McpConnectorError(`client registration failed: ${why.slice(0, 200)}`);
   }
   if (!isObj(reg) || typeof reg.client_id !== 'string' || !reg.client_id) throw new McpConnectorError('client registration returned no client_id');
@@ -440,21 +473,28 @@ export function verifyState(secret: string, state: string, userId: string, conne
   return want.length === got.length && timingSafeEqual(want, got);
 }
 
-export function authorizeUrl(d: DiscoveredOAuth, client: OAuthClient, p: { state: string; challenge: string }): string {
+/**
+ * `p.scopes` is what this sign-in asks for (services/mcpOAuthScopes.ts scopesToRequest); none sends no `scope`.
+ * `p.team` is the Slack workspace to sign in to (services/mcpOAuthSlackTeam.ts); none sends no `team`.
+ */
+export function authorizeUrl(d: DiscoveredOAuth, client: OAuthClient, p: { state: string; challenge: string; scopes: string[]; team?: string }): string {
   const u = new URL(d.authorizationEndpoint);
+  for (const [k, v] of Object.entries(d.authorizeParams ?? {})) u.searchParams.set(k, v);
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('client_id', client.clientId);
   u.searchParams.set('redirect_uri', client.redirectUri);
   u.searchParams.set('code_challenge', p.challenge);
   u.searchParams.set('code_challenge_method', 'S256');
   u.searchParams.set('state', p.state);
-  u.searchParams.set('resource', d.resource);
-  if (d.scopes.length) u.searchParams.set('scope', d.scopes.join(' '));
+  if (d.sendsResource === false) u.searchParams.delete('resource');
+  else u.searchParams.set('resource', d.resource);
+  if (p.scopes.length) u.searchParams.set('scope', p.scopes.join(' '));
+  if (p.team) u.searchParams.set('team', p.team);
   return u.toString();
 }
 
 async function tokenRequest(d: DiscoveredOAuth, client: OAuthClient, params: Record<string, string>, http: OAuthHttp, now: number): Promise<OAuthTokens> {
-  const form = new URLSearchParams({ ...params, resource: d.resource });
+  const form = new URLSearchParams({ ...params, ...(d.sendsResource === false ? {} : { resource: d.resource }) });
   const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' };
   const tokenTypes = authenticate(d, client, form, headers);
   const res = await http(d.tokenEndpoint, { method: 'POST', headers, body: form.toString() });
@@ -516,7 +556,8 @@ export interface OAuthLockIo {
   read: () => Promise<StoredOAuth | null>;
   write: (v: StoredOAuth) => Promise<void>;
   remove: () => Promise<void>;
-  linked: () => Promise<void>;
+  // Marks the connector linked, storing the sign-in's scopes when given.
+  linked: (scopes?: { requested: string[]; granted: string[] | null }) => Promise<void>;
   // Mark the connector as needing a new link. null: there were no tokens to
   // begin with, so only a connector still marked linked changes, and an
   // earlier reason stays.

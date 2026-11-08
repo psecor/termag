@@ -17,6 +17,12 @@
  * second modification. Every grow is also a `disk-grow` row in box_events
  * (services/boxEvents.ts), kept for good, with who asked and how it ended:
  * the Fleet tab's recent operations.
+ *
+ * A box's owner grows their own from the Resize box dialogs and `termag box
+ * resize --disk` (routes/instances.ts growOwnedBox): the same checks and row,
+ * `actorRole: owner`, capped at the creation range's top (OWNER_MAX_GB, from
+ * boxDiskSize.ts) and refused inside EBS's six hours (cooldownRefusal) before
+ * EC2 is asked. A finished grow records the new size on `Instance.diskGiB`.
  */
 
 import {
@@ -27,13 +33,19 @@ import {
   ModifyVolumeCommand,
 } from '@aws-sdk/client-ec2';
 import type { Instance } from '@prisma/client';
+import { prisma } from '../db';
 import { awsClientConfig, getBoxConfig } from './boxProvisioner';
+import { BOX_DISK_LIMITS } from './boxDiskSize';
 import { instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
-import { advanceBoxEvent, createBoxEvent, finishBoxEvent } from './boxEvents';
+import { advanceBoxEvent, createBoxEvent, eventOpen, finishBoxEvent } from './boxEvents';
 
 export const DISK_GROW_CAPABILITY = 'disk-grow-v1';
 /** EBS's own ceiling for gp2/gp3. */
 export const MAX_VOLUME_GB = 16_384;
+/** An owner grows their own box up to the top of the creation range (boxDiskSize.ts); past it is an admin's Grow disk. */
+export const OWNER_MAX_GB = BOX_DISK_LIMITS.maxGiB;
+/** EBS allows one modification per volume every six hours. */
+export const EBS_MODIFY_COOLDOWN_MS = 6 * 3_600_000;
 
 export interface VolumeModification {
   state: string;
@@ -64,14 +76,41 @@ export interface GrowRecord {
 }
 
 const grows = new Map<string, GrowRecord>();
+/**
+ * Boxes an owner's grow request holds before its grow is registered: from
+ * just after the request's first checks, through reading the volume and
+ * ModifyVolume, until startGrow puts the grow in `grows` or the request is
+ * refused. A resize asked meanwhile sees it (growRunning) and waits, so it
+ * never stops the box between the volume growing and the agent's file
+ * system step (Devin on #1214).
+ */
+const reservations = new Map<string, number>();
+
+/** Hold the box as growing until the returned release is called (once is enough; more are no-ops). */
+export function reserveGrow(instanceId: string): () => void {
+  reservations.set(instanceId, (reservations.get(instanceId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (reservations.get(instanceId) ?? 1) - 1;
+    if (left > 0) reservations.set(instanceId, left); else reservations.delete(instanceId);
+  };
+}
 
 /** The last grow this process ran for the box, or null. */
 export function lastGrow(instanceId: string): GrowRecord | null {
   return grows.get(instanceId) ?? null;
 }
 
+/** Put a grow record in place, as startGrow and its settle leave one. */
+export function recordGrowForTests(instanceId: string, rec: GrowRecord): void {
+  grows.set(instanceId, rec);
+}
+
 export function resetGrowsForTests(): void {
   grows.clear();
+  reservations.clear();
 }
 
 type GrowBox = Pick<Instance, 'id' | 'kind' | 'status' | 'ec2InstanceId' | 'region'>;
@@ -83,7 +122,7 @@ export function growRefusal(box: GrowBox, capabilities: string[] | null): string
   if (!capabilities) return 'the box agent is not connected';
   if (!capabilities.includes(DISK_GROW_CAPABILITY)) return 'the box agent is too old to grow its file system; update the box first';
   const g = grows.get(box.id);
-  if (g && (g.state === 'modifying' || g.state === 'filesystem')) return 'a grow is already running on this box';
+  if ((g && (g.state === 'modifying' || g.state === 'filesystem')) || reservations.has(box.id)) return 'a grow is already running on this box';
   return null;
 }
 
@@ -98,6 +137,172 @@ export function parseGrowBody(body: unknown, volume: Pick<RootVolume, 'sizeGb'>)
   if (sizeGb < volume.sizeGb) return { error: `EBS volumes can't shrink; the volume is ${volume.sizeGb} GB` };
   if (sizeGb > MAX_VOLUME_GB) return { error: `sizeGb must be at most ${MAX_VOLUME_GB}` };
   return { sizeGb };
+}
+
+const utc = (ms: number) => `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
+/**
+ * EBS's one change per volume per six hours, said before EC2 is asked: null
+ * when the volume may change now. A failed modification doesn't count.
+ */
+export function cooldownRefusal(volume: Pick<RootVolume, 'modification'>, nowMs = Date.now()): string | null {
+  const m = volume.modification;
+  if (!m || m.state === 'failed' || !m.startedAt) return null;
+  const at = Date.parse(m.startedAt);
+  if (!Number.isFinite(at) || nowMs - at >= EBS_MODIFY_COOLDOWN_MS) return null;
+  return `EBS allows one change to a disk every six hours. This one was last changed at ${utc(at)}, so it can grow again after ${utc(at + EBS_MODIFY_COOLDOWN_MS)}.`;
+}
+
+/**
+ * An owner's grow request: parseGrowBody, capped at OWNER_MAX_GB (or what the
+ * disk already has, when an admin grew it past that), and refused inside the
+ * six hours when it would modify the volume. A same-size request re-runs only
+ * the file system step, which EBS doesn't count.
+ */
+export function parseOwnerGrowBody(
+  body: unknown, volume: Pick<RootVolume, 'sizeGb' | 'modification'>, nowMs = Date.now(),
+): { sizeGb: number } | { error: string; code: 'invalid_disk' | 'disk_cooldown' } {
+  const parsed = parseGrowBody(body, volume);
+  if ('error' in parsed) return { error: parsed.error, code: 'invalid_disk' };
+  const max = Math.max(OWNER_MAX_GB, volume.sizeGb);
+  if (parsed.sizeGb > max) return { error: `A box's disk grows up to ${max} GB here; an admin can grow it further`, code: 'invalid_disk' };
+  const cooldown = parsed.sizeGb > volume.sizeGb ? cooldownRefusal(volume, nowMs) : null;
+  if (cooldown) return { error: cooldown, code: 'disk_cooldown' };
+  return parsed;
+}
+
+/** EC2's refusal of a ModifyVolume, as a person reads it: its rate limit plainly, anything else with EC2's words. */
+export function growErrorMessage(err: unknown): string {
+  const e = err as { name?: string; message?: string };
+  const message = e?.message ?? String(err);
+  if (/RateExceeded/i.test(e?.name ?? '') || /modification rate|6 hours|six hours/i.test(message)) {
+    return 'EBS allows one change to a disk every six hours, and this one was changed less than six hours ago. Try again later.';
+  }
+  return `EC2 refused the change: ${message}`;
+}
+
+/** A grow as the owner's dialogs show it. */
+export interface GrowView {
+  fromGb: number;
+  toGb: number;
+  state: GrowRecord['state'];
+  running: boolean;
+  detail: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export function growView(rec: GrowRecord | null): GrowView | null {
+  if (!rec) return null;
+  const { fromGb, toGb, state, detail, startedAt, finishedAt } = rec;
+  return { fromGb, toGb, state, running: state === 'modifying' || state === 'filesystem', detail, startedAt, finishedAt };
+}
+
+/** The disk in the owner's Resize box dialogs (GET /api/instances/:id/resize `disk`). */
+export interface DiskView {
+  /** The volume's size as EC2 has it, else the box's recorded disk; null when neither is known. */
+  sizeGb: number | null;
+  /** The most the owner may ask for. */
+  maxGb: number;
+  /** Why the disk can't grow now; null when it can. */
+  refusal: string | null;
+  grow: GrowView | null;
+  /**
+   * The last grow got the volume to its size but failed at the file system
+   * step: asking for that same size again re-runs only that step, which EBS
+   * doesn't count, so it is offered even inside the six hours. Null otherwise.
+   */
+  retry: { sizeGb: number; error: string | null } | null;
+}
+
+/** The box's latest `disk-grow` row in box_events, as much as diskView reads of it. */
+export interface GrowEventRow {
+  phase: string | null;
+  startedAt: Date;
+  finishedAt: Date | null;
+  error: string | null;
+  detail: unknown;
+}
+
+/**
+ * The last grow when this process has none (an orchestrator restart since),
+ * from its box_events row: failed as it ended, or cut off when the row is
+ * still open, so the retry outlives the restart (Devin on #1214).
+ */
+function lastFromRow(row: GrowEventRow | null | undefined, nowMs: number): Pick<GrowRecord, 'state' | 'toGb' | 'detail'> | null {
+  const toGb = (row?.detail as { toGb?: unknown } | null)?.toGb;
+  if (!row || typeof toGb !== 'number') return null;
+  if (row.phase === 'failed') return { state: 'failed', toGb, detail: row.error };
+  // Open and fresh (eventOpen) is a grow still running, maybe in another process: not cut off (Cursor on #1214).
+  if (!row.finishedAt && row.phase !== 'done' && !eventOpen(row, nowMs)) {
+    return { state: 'failed', toGb, detail: 'the last grow was cut off (the orchestrator restarted) before its file system step finished' };
+  }
+  return null;
+}
+
+/**
+ * Whether a request for `sizeGb`, the size the volume already has, has a file
+ * system step to finish: the last grow (this process's, else its row) failed
+ * or was cut off at that size. Otherwise such a request changes nothing.
+ */
+export function pendingRetry(instanceId: string, sizeGb: number, lastRow: GrowEventRow | null, nowMs = Date.now()): boolean {
+  const last = lastGrow(instanceId) ?? lastFromRow(lastRow, nowMs);
+  return last?.state === 'failed' && last.toGb === sizeGb;
+}
+
+/** Pure: the box, its agent's capabilities, its root volume (or why it couldn't be read) and its latest disk-grow row. */
+export function diskView(
+  box: GrowBox & Pick<Instance, 'diskGiB'>, capabilities: string[] | null, volume: RootVolume | { error: string } | null, nowMs = Date.now(),
+  lastRow: GrowEventRow | null = null,
+): DiskView {
+  const inMemory = lastGrow(box.id);
+  const last = inMemory ?? lastFromRow(lastRow, nowMs);
+  // Another process's grow shows only as its row: refuse a second one beside it.
+  const elsewhere = !inMemory && !!lastRow && eventOpen(lastRow, nowMs) ? 'a grow is already running on this box' : null;
+  const grow = growView(inMemory);
+  const canGrow = growRefusal(box, capabilities) ?? elsewhere;
+  if (!volume || 'error' in volume) {
+    return {
+      sizeGb: box.diskGiB ?? null, maxGb: OWNER_MAX_GB, grow, retry: null,
+      refusal: canGrow ?? (volume ? `Could not read the disk: ${volume.error}` : 'There is no disk to grow'),
+    };
+  }
+  const maxGb = Math.max(OWNER_MAX_GB, volume.sizeGb);
+  const refusal = canGrow
+    ?? (volume.sizeGb >= maxGb ? `The disk is already ${volume.sizeGb} GB, the most a box grows to here; an admin can grow it further` : null)
+    ?? cooldownRefusal(volume, nowMs);
+  const retry = !canGrow && last?.state === 'failed' && last.toGb === volume.sizeGb ? { sizeGb: volume.sizeGb, error: last.detail } : null;
+  return { sizeGb: volume.sizeGb, maxGb, refusal, grow, retry };
+}
+
+/**
+ * Wait until the box's running grow (in this process) has finished; at once
+ * when none runs. A resize waits on it before it stops the box, so the
+ * agent's file system step isn't cut off. Resolves with the grow, or null;
+ * throws when it is still running at the limit, which fails the resize
+ * before anything is stopped.
+ */
+export async function waitForGrow(instanceId: string, opts: { pollMs?: number; timeoutMs?: number } = {}): Promise<GrowRecord | null> {
+  const pollMs = opts.pollMs ?? 3_000;
+  const timeoutMs = opts.timeoutMs ?? 30 * 60_000;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!growRunning(instanceId)) {
+      const g = grows.get(instanceId);
+      return g ? { ...g } : null;
+    }
+    // Still growing at the limit: the caller must not stop the box under it (Bugbot on #1214).
+    if (Date.now() >= deadline) {
+      throw new Error(`The disk is still growing after ${Math.max(1, Math.round(timeoutMs / 60_000))} minutes; the box was not stopped. Resize again once it has grown.`);
+    }
+    await sleep(pollMs);
+  }
+}
+
+/** Whether a grow runs on the box now, in this process. */
+export function growRunning(instanceId: string): boolean {
+  const g = grows.get(instanceId);
+  return (!!g && (g.state === 'modifying' || g.state === 'filesystem')) || reservations.has(instanceId);
 }
 
 function ec2For(box: Pick<Instance, 'region'>): EC2Client {
@@ -155,6 +360,19 @@ export interface SettleTiming {
   fsAttempts: number;
 }
 const DEFAULT_TIMING: SettleTiming = { pollMs: 5_000, modifyTimeoutMs: 15 * 60_000, fsRetryMs: 15_000, fsAttempts: 3 };
+/** How long one ask of the agent's disk-grow RPC may take. */
+const FS_RPC_TIMEOUT_MS = 180_000;
+
+/**
+ * The longest a grow can run with these timings: the wait for EBS, then each
+ * file system attempt at its RPC limit with the pauses between them. It stays
+ * under the hour an open box_events row counts as running
+ * (boxEvents.OPEN_EVENT_STALE_MS), so the row never lets go of a grow still
+ * running (boxDiskBusy.ts relies on that).
+ */
+export function maxGrowMs(timing: SettleTiming = DEFAULT_TIMING): number {
+  return timing.modifyTimeoutMs + timing.pollMs + timing.fsAttempts * FS_RPC_TIMEOUT_MS + (timing.fsAttempts - 1) * timing.fsRetryMs;
+}
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /**
@@ -164,14 +382,14 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
  */
 export async function startGrow(
   box: GrowBox & { name?: string }, volume: RootVolume, sizeGb: number, by: string, timing: SettleTiming = DEFAULT_TIMING,
-  actorId: string | null = null,
+  actorId: string | null = null, actorRole: 'owner' | 'admin' = 'admin',
 ): Promise<GrowRecord> {
   const rec: GrowRecord = {
     volumeId: volume.volumeId, fromGb: volume.sizeGb, toGb: sizeGb, by,
     startedAt: new Date().toISOString(), state: 'modifying', detail: null, finishedAt: null,
   };
   rec.eventId = await bestEffort(box, async () => (await createBoxEvent({
-    box: { id: box.id, name: box.name ?? box.id }, kind: 'disk-grow', actorId, actorRole: 'admin',
+    box: { id: box.id, name: box.name ?? box.id }, kind: 'disk-grow', actorId, actorRole,
     from: `${volume.sizeGb} GB`, to: `${sizeGb} GB`, phase: 'modifying',
     detail: { volumeId: volume.volumeId, fromGb: volume.sizeGb, toGb: sizeGb, by },
   })).id);
@@ -193,6 +411,8 @@ function finish(box: GrowBox, rec: GrowRecord, state: 'done' | 'failed', detail:
   console.log(`[BOX-DISK] ${box.id} ${rec.volumeId} ${state}: ${detail}`);
   const id = rec.eventId;
   if (id) void bestEffort(box, () => finishBoxEvent(id, { phase: state, error: state === 'failed' ? detail : null, detail: { result: detail } }));
+  // The box's recorded disk follows the volume, for the lists and the dialogs' "Now".
+  if (state === 'done') void bestEffort(box, () => prisma.instance.update({ where: { id: box.id }, data: { diskGiB: rec.toGb } }));
 }
 
 /** A box_events write never fails a grow: logged, and the grow goes on. */
@@ -233,7 +453,7 @@ async function settleGrow(box: GrowBox, rec: GrowRecord, timing: SettleTiming): 
     if (!instanceAgentTransport(box.id)?.capabilities.includes(DISK_GROW_CAPABILITY)) {
       return finish(box, rec, 'failed', 'the volume is larger, but the box agent went away before it grew the file system; ask again to the same size');
     }
-    const r = await sendToInstanceAgent(box.id, 'disk-grow', {}, 180_000) as
+    const r = await sendToInstanceAgent(box.id, 'disk-grow', {}, FS_RPC_TIMEOUT_MS) as
       { ok: boolean; error?: string; partition?: string; beforeGb?: number | null; afterGb?: number | null };
     if (!r.ok) return finish(box, rec, 'failed', r.error ?? 'the agent reported a failure');
     last = `file system ${r.beforeGb ?? '?'} → ${r.afterGb ?? '?'} GB (partition ${r.partition})`;

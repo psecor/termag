@@ -1,11 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ALLOW_TTL_MS, decideFireworksRequest, type FireworksAuthzDeps } from './fireworksAuthz';
-import { parseFireworksModels } from './fireworksGateway';
 import type { AuthzBox } from './gatewayAuthz';
 
 const KIMI = 'accounts/fireworks/models/kimi-k3';
-const GLM = 'accounts/fireworks/models/glm-5p3';
-const FW = parseFireworksModels({ models: [{ id: KIMI }, { id: 'accounts/fireworks/routers/kimi-k3-fast' }] });
+// Not on any fireworks-models list: the check no longer reads one.
+const UNLISTED = 'accounts/fireworks/models/minimax-m3p1-flash';
 
 const BOX_TOKEN = 'tmag_box_token_sentinel_fw_0123456789'; // gitleaks:allow (test sentinel)
 const MANAGED: AuthzBox = { userId: 'owner1', instanceId: 'inst1', managed: true, email: 'o@example.com' };
@@ -13,16 +12,12 @@ const PATH = '/fireworks/inference/v1/chat/completions';
 
 let clock = 1_000_000;
 let lookups = 0;
-let flagReads = 0;
 let box: AuthzBox | null = MANAGED;
-let enabled = true;
-let list = FW;
 
 function deps(over: Partial<FireworksAuthzDeps> = {}): FireworksAuthzDeps {
   return {
     configured: true,
     boxForToken: async t => { lookups++; return t === BOX_TOKEN ? box : null; },
-    modelsFor: async () => { flagReads++; return enabled ? list : null; },
     now: () => clock,
     ...over,
   };
@@ -36,10 +31,7 @@ const decide = (headers: { authorization?: string; apiKey?: string; model?: stri
 beforeEach(() => {
   clock += ALLOW_TTL_MS;
   lookups = 0;
-  flagReads = 0;
   box = MANAGED;
-  enabled = true;
-  list = FW;
 });
 
 describe('decideFireworksRequest', () => {
@@ -66,40 +58,44 @@ describe('decideFireworksRequest', () => {
     expect(await decide()).toMatchObject({ allow: false, status: 403, message: expect.stringMatching(/managed box/) });
   });
 
-  it("allows only a model on the owner's fireworks-models list, naming the allowed ones, and needs the model", async () => {
-    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: GLM })).toMatchObject({
-      allow: false, status: 403, message: `The termag Fireworks gateway does not allow this model for you. Allowed: ${KIMI}, accounts/fireworks/routers/kimi-k3-fast`,
+  it('allows any model id, listed or not, and leaves odd or missing ones for Fireworks to answer', async () => {
+    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: UNLISTED })).toEqual({
+      allow: true,
+      audit: `user=owner1 instance=inst1 ${PATH} model=${UNLISTED} allowed`,
+      headers: { 'x-termag-user': 'owner1', 'x-termag-instance': 'inst1', 'x-termag-email': 'o@example.com' },
     });
-    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: 'accounts/fireworks/routers/kimi-k3-fast' })).toMatchObject({ allow: true });
-    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: undefined })).toMatchObject({ allow: false, status: 400 });
+    for (const model of ['accounts/fireworks/routers/kimi-k3-fast', 'accounts/someone-else/models/x', 'not-a-fireworks-id']) {
+      expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model })).toMatchObject({ allow: true, audit: expect.stringContaining(`model=${model}`) });
+    }
+    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: undefined })).toMatchObject({ allow: true, audit: expect.not.stringContaining('model=') });
   });
 
-  it('lets auth-check through without a model while Fireworks is on', async () => {
+  it('refuses any path but the two inference calls and auth-check, before reading the token', async () => {
+    for (const path of ['/fireworks/inference/v1/models', '/fireworks/inference/v1/messages/count_tokens', '/fireworks/inference/v1/batches',
+      '/fireworks/v1/accounts/fireworks/models', '/fireworks/inference/v1/chat/completions/../../v1/batches', '/fireworks/inference/v1/Messages']) {
+      expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, path })).toMatchObject({ allow: false, status: 404 });
+    }
+    expect(lookups).toBe(0);
+    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, path: '/fireworks/inference/v1/messages' })).toMatchObject({ allow: true });
+  });
+
+  it('lets auth-check through without a model', async () => {
     expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: undefined, path: '/fireworks/auth-check' })).toMatchObject({ allow: true });
-    enabled = false;
-    clock += ALLOW_TTL_MS;
-    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: undefined, path: '/fireworks/auth-check' })).toMatchObject({ allow: false, status: 403 });
   });
 
-  it('refuses when the flag is off for the owner, or the orchestrator has no Fireworks config', async () => {
-    enabled = false;
-    expect(await decide()).toMatchObject({ allow: false, status: 403, message: expect.stringMatching(/fireworks-enabled/) });
-    enabled = true;
+  it('refuses when the orchestrator has no Fireworks config', async () => {
     expect(await decide(undefined, deps({ configured: false }))).toMatchObject({ allow: false, status: 403, message: expect.stringMatching(/no Fireworks gateway/) });
   });
 
-  it('remembers an allow for ALLOW_TTL_MS per token and model, and never a refusal', async () => {
+  it('remembers an allow for ALLOW_TTL_MS per token, whatever the model, and never a refusal', async () => {
     await decide();
     expect(await decide()).toMatchObject({ allow: true, audit: expect.stringMatching(/\(cached\)$/) });
-    expect([lookups, flagReads]).toEqual([1, 1]);
-    // A model dropped from the list since is checked afresh, not served from another model's allow.
-    list = parseFireworksModels({ models: [{ id: GLM }] });
-    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: 'accounts/fireworks/routers/kimi-k3-fast' })).toMatchObject({ allow: false, status: 403 });
-    list = FW;
+    expect(await decide({ authorization: `Bearer ${BOX_TOKEN}`, model: UNLISTED })).toMatchObject({ allow: true, audit: expect.stringMatching(new RegExp(`model=${UNLISTED} allowed \\(cached\\)$`)) });
+    expect(lookups).toBe(1);
     clock += ALLOW_TTL_MS;
-    enabled = false;
-    expect(await decide()).toMatchObject({ allow: false, status: 403 });
-    expect(await decide()).toMatchObject({ allow: false, status: 403 });
-    expect(flagReads).toBe(4);
+    box = null;
+    expect(await decide()).toMatchObject({ allow: false, status: 401 });
+    expect(await decide()).toMatchObject({ allow: false, status: 401 });
+    expect(lookups).toBe(3);
   });
 });

@@ -122,4 +122,40 @@ describe('pushSummary', () => {
     expect(s.publish).toBe('published');
     expect(s.detail).toContain('11 pull requests, more than the 10');
   });
+
+  // Reports cmvvbgpzk586mbcmx8srqaaen and cmvvda09x16on6l7h9bts6yc3: a turn that only committed (or
+  // whose canceled predecessor did) was `none` with no detail, and read as pushed.
+  it('is unpushed, never none, when the clone has commits it did not push, and names the push', () => {
+    expect(pushSummary([], 0, [{ branch: own, commits: 2 }], own)).toEqual({
+      publish: 'unpushed', detail: `${own}: 2 commit(s) committed but not pushed (git push origin ${own})`,
+    });
+    const s = pushSummary([], 0, [{ branch: 'ask', commits: 1 }, { branch: `${own}-docs`, commits: 1 }, { branch: 'HEAD', commits: 3 }], own);
+    expect(s.publish).toBe('unpushed');
+    expect(s.detail).toBe([
+      `ask: 1 commit(s) committed but not pushed (the thread's branch is ${own}: git push origin ask:${own})`,
+      `${own}-docs: 1 commit(s) committed but not pushed (git push origin ${own}-docs)`,
+      `a detached HEAD has 3 commit(s) on no branch, not pushed (git push origin HEAD:${own})`,
+    ].join(' | '));
+  });
+
+  // A branch `gh pr checkout` made tracks its own origin branch: its commits go there, not
+  // onto the thread's branch. The box knows which branches origin has, so its `to` decides.
+  it("names the push the box gives, so a checked-out PR branch's commits go to that PR's branch", () => {
+    expect(pushSummary([], 0, [
+      { branch: 'fix/other', commits: 1, to: 'fix/other' },
+      { branch: 'scratch', commits: 1, to: own },
+      { branch: 'HEAD', commits: 1, to: own },
+    ], own).detail).toBe([
+      'fix/other: 1 commit(s) committed but not pushed (git push origin fix/other)',
+      `scratch: 1 commit(s) committed but not pushed (the thread's branch is ${own}: git push origin scratch:${own})`,
+      `a detached HEAD has 1 commit(s) on no branch, not pushed (git push origin HEAD:${own})`,
+    ].join(' | '));
+  });
+
+  it('keeps a turn that pushed but left commits behind from published, and says which', () => {
+    const s = pushSummary([rec(1)], 1, [{ branch: 'scratch', commits: 1 }], own);
+    expect(s.publish).toBe('partial');
+    expect(s.detail).toBe(`scratch: 1 commit(s) committed but not pushed (the thread's branch is ${own}: git push origin scratch:${own}) | b1: PR #1`);
+    expect(pushSummary([{ kind: 'failed', branch: 'b3', reason: 'r' }], 0, [{ branch: own, commits: 1 }], own).publish).toBe('failed');
+  });
 });

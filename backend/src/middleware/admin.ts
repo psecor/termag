@@ -97,6 +97,8 @@ export function auditOutcome(status: number): AuditOutcome {
 export interface AuditEntry {
   actorId: string;
   tokenId: string | null;
+  /** The box whose own token made the call (routes/cliBugReports.ts); null from a browser, an admin token or MCP. */
+  boxId?: string | null;
   surface: 'rest' | 'mcp';
   action: string;
   args: Record<string, unknown> | null;
@@ -109,6 +111,7 @@ export function recordAudit(entry: AuditEntry): void {
     data: {
       actorId: entry.actorId,
       tokenId: entry.tokenId,
+      boxId: entry.boxId ?? null,
       surface: entry.surface,
       action: entry.action,
       args: entry.args === null ? undefined : (entry.args as object),
@@ -118,15 +121,24 @@ export function recordAudit(entry: AuditEntry): void {
   }).catch(err => console.error('[ADMIN] audit write failed:', (err as Error).message));
 }
 
+// A field named for a secret (token, accessToken, client_secret, password,
+// credential): the audit row says it was sent, never its value. An id of one
+// (tokenId) is not a secret and is kept.
+const SECRET_ARG = /(token|secret|password|passphrase|credential)s?$/i;
+export const REDACTED_ARG = '[redacted]';
+
 // Query string + route params, and the body's keys with scalar values. Never
-// the body wholesale: a future action route might carry something secret.
+// the body wholesale, and never a secret-named field's value
+// (PUT /api/admin/pool-credential/github carries a GitHub token).
 export function summarizeArgs(req: Pick<Request, 'query' | 'params' | 'body'>): Record<string, unknown> | null {
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(req.query ?? {})) out[k] = v;
-  for (const [k, v] of Object.entries(req.params ?? {})) out[k] = v;
+  for (const [k, v] of Object.entries(req.query ?? {})) out[k] = SECRET_ARG.test(k) ? REDACTED_ARG : v;
+  for (const [k, v] of Object.entries(req.params ?? {})) out[k] = SECRET_ARG.test(k) ? REDACTED_ARG : v;
   if (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) {
     for (const [k, v] of Object.entries(req.body as Record<string, unknown>)) {
-      if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) {
+      if (SECRET_ARG.test(k)) {
+        out[k] = REDACTED_ARG;
+      } else if (v === null || ['string', 'number', 'boolean'].includes(typeof v)) {
         out[k] = typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '…' : v;
       } else {
         out[k] = Array.isArray(v) ? `[${v.length} items]` : '{…}';

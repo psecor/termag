@@ -118,12 +118,14 @@ async function runClaude(
     timeoutMs?: number;
     /** Called when a resume could not happen and the turn starts a fresh session instead. */
     onFreshStart?: () => void;
+    /** Extra environment for claude, e.g. the run's own TMPDIR. */
+    env?: Record<string, string>;
   },
   onStreamChunk?: ((data: StreamChunk) => void) | null,
 ): Promise<string> {
   const {
     workingDir, continueSession = false, resumeSessionId, forkSession = false, signal, onSessionId,
-    appendSystemPrompt, timeoutMs = CLAUDE_TIMEOUT,
+    appendSystemPrompt, timeoutMs = CLAUDE_TIMEOUT, env,
   } = options;
   if (signal?.aborted) return Promise.reject(new ClaudeRunStopped());
 
@@ -160,7 +162,7 @@ async function runClaude(
 
     const proc = spawn('claude', args, {
       cwd: workingDir,
-      env: { ...process.env, ANTHROPIC_API_KEY: undefined },
+      env: { ...process.env, ...env, ANTHROPIC_API_KEY: undefined },
       stdio: ['pipe', 'pipe', 'pipe'],
       // Its own process group, so Stop and the timeout also end the commands it runs.
       detached: true,

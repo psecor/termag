@@ -148,14 +148,6 @@ describe('spawnFor', () => {
     expect((await spawnFor(user, BOX, { task: 'x', from })).status).toBe(404);
   });
 
-  it('reads the flag for the target box, and writes nothing when it is off', async () => {
-    vi.mocked(boolVariation).mockResolvedValue(false);
-    const r = await spawnFor(user, BOX, { task: 'x', from });
-    expect(r.status).toBe(403);
-    expect(vi.mocked(boolVariation).mock.calls[0][3]).toMatchObject({ id: BOX });
-    expect(prisma.agentSpawn.create).not.toHaveBeenCalled();
-  });
-
   it('refuses by depth (from the caller\'s own spawn) and by the budget\'s counts, and logs why', async () => {
     prisma.agentSpawn.findFirst.mockResolvedValue({ id: 'ck0', depth: 2, rootSpawnId: 'ck0' });
     expect((await spawnFor(user, BOX, { task: 'x', from })).status).toBe(429);

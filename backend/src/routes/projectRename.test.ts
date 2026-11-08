@@ -12,12 +12,15 @@ describe('renameSessionPairs', () => {
       { from: 'alice-old-ctrl', to: 'alice-new-ctrl' },
       { from: 'alice-old-review', to: 'alice-new-review' },
       ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ from: `alice-old-review-${n}`, to: `alice-new-review-${n}` })),
+      // Terminal slots ride along with the review slots.
+      ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ from: `alice-old-ctrl-${n}`, to: `alice-new-ctrl-${n}` })),
       { from: 'alice-old-data', to: 'alice-new-data' },
       { from: 'alice-old-data-ctrl', to: 'alice-new-data-ctrl' },
       { from: 'alice-old-feature-agent', to: 'alice-new-feature-agent' },
       { from: 'alice-old-feature-ctrl', to: 'alice-new-feature-ctrl' },
       { from: 'alice-old-feature-review', to: 'alice-new-feature-review' },
       ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ from: `alice-old-feature-review-${n}`, to: `alice-new-feature-review-${n}` })),
+      ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ from: `alice-old-feature-ctrl-${n}`, to: `alice-new-feature-ctrl-${n}` })),
     ]);
   });
 });

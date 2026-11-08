@@ -155,17 +155,23 @@ describe('cloudSummary', () => {
         { sessionId: 'cse_B', orderId: 'o2', kind: 'queued', at: t('2026-10-09T09:00:00Z') },
         { sessionId: 'cse_B', orderId: 'o2', kind: 'placed', at: t('2026-10-09T09:05:00Z') },
         // cse_Q: refused twice, nothing open: queued.
-        { sessionId: 'cse_Q', orderId: 'oq', kind: 'queued', at: t('2026-10-09T09:00:00Z') },
-        { sessionId: 'cse_Q', orderId: 'oq2', kind: 'agent-failed', at: t('2026-10-09T09:10:00Z') },
+        { sessionId: 'cse_Q', orderId: 'oq', kind: 'queued', at: t('2026-10-09T09:40:00Z') },
+        { sessionId: 'cse_Q', orderId: 'oq2', kind: 'agent-failed', at: t('2026-10-09T09:50:00Z') },
+        // cse_S: refused twice, but nobody has re-offered it for 50 min: not queued (isStillRetried).
+        { sessionId: 'cse_S', orderId: 'os', kind: 'queued', at: t('2026-10-09T09:00:00Z') },
+        { sessionId: 'cse_S', orderId: 'os2', kind: 'queued', at: t('2026-10-09T09:10:00Z') },
         // cse_E: ended an hour ago, newest event is `ended`: not queued.
         { sessionId: 'cse_E', orderId: 'oe', kind: 'queued', at: t('2026-10-09T07:00:00Z') },
         { sessionId: 'cse_E', orderId: 'oe', kind: 'ended', at: t('2026-10-09T08:00:00Z') },
         // cse_R: a re-offer under a new order refused after the old run started: queued, as deriveState says.
         { sessionId: 'cse_R', orderId: 'o6', kind: 'queued', at: t('2026-10-09T09:30:00Z') },
+        // cse_U: a `user-created` after its refusal is looked through, as deriveState does: queued.
+        { sessionId: 'cse_U', orderId: 'ou', kind: 'queued', at: t('2026-10-09T09:55:00Z') },
+        { sessionId: 'cse_U', orderId: 'ou', kind: 'user-created', at: t('2026-10-09T09:55:01Z') },
       ] as never);
     const out = await cloudSummary(t('2026-10-09T10:00:00Z'));
     expect(out).toMatchObject({
-      running: 3, starting: 2, queued: 2,
+      running: 3, starting: 2, queued: 3,
       byBox: { 'box-a': { running: 1, starting: 1 }, 'box-b': { running: 2, starting: 1 } },
       byUser: { u1: { running: 1, starting: 1 }, u2: { running: 2, starting: 1 } },
     });

@@ -16,6 +16,7 @@
  * agent. Behind the agent-handoff-enabled flag (off unless TERMAG_FLAGS turns it
  * on), read for the owner and the box.
  */
+import { isSetupOff, setupOffRefusal } from '../services/boxSetup';
 import { Router } from 'express';
 import { prisma } from '../db';
 import { kindRefusal, projectKindTraits } from '../services/projectKind';
@@ -117,7 +118,7 @@ export async function startHandoff(
   const project = await prisma.project.findFirst({
     where: { id: target.projectId, userId: user.id, archived: false },
     include: {
-      instance: { select: { id: true, name: true, kind: true, hostHome: true, status: true } },
+      instance: { select: { id: true, name: true, kind: true, hostHome: true, status: true, setupEnabled: true } },
       workstreams: { where: { name: target.workstream }, include: { workflows: { select: { type: true, provider: true } } } },
     },
   });
@@ -127,6 +128,7 @@ export async function startHandoff(
   if (!(await boolVariation(HANDOFF_FLAG, user, false, project.instance))) {
     return { status: 403, body: { error: `agent handoff is not enabled for you on this box (feature flag ${HANDOFF_FLAG})`, code: 'handoff_disabled' } };
   }
+  if (isSetupOff(project.instance)) return setupOffRefusal('Hand off');
   const parked = powerStateError(project.instance.status);
   if (parked) return { status: 409, body: { error: parked } };
   const ws = project.workstreams[0];

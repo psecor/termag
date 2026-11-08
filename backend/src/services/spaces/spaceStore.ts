@@ -42,8 +42,12 @@ export interface SpaceEventInput {
   bytes?: bigint | number | null;
   /** A file.put's S3 version. */
   versionId?: string | null;
-  /** The writer's reason (spaceMemory.ts noteOf). */
+  /** The writer's reason (spaceMemory.ts noteOf). A Slack entry point goes here as `linkedVia=<value>`. */
   note?: string | null;
+  /** Where the action came from: 'slack', or null for every other writer. */
+  surface?: string | null;
+  /** The member the actor (a space's Slack runner) acted for. */
+  onBehalfOfUserId?: string | null;
 }
 
 export interface SpaceEventRecord extends SpaceEventInput { id: string; at: Date }

@@ -17,16 +17,17 @@ import type { CliUser } from '../services/cliStore';
 import { prismaCliStore } from '../services/cliStorePrisma';
 import { resolveChatSpaceChoice } from '../services/chatSpace';
 import { createCliWorkstream } from '../services/cliWorkstreams';
-import { T3_CAPABILITY, desktopAppEnabled } from '../services/desktopAppFlag';
+import { T3_CAPABILITY } from '../services/desktopAppFlag';
 import { repoFromOrigin } from '../services/prBranches';
 import { projectDirFor } from '../services/tmux';
 import { cliErrorResult, type CliLifecycle } from './cliLifecycle';
 import {
   boxSizeChoices, createBox, keepOwnedBoxRunning, ownedBoxResizeInfo, powerOwnedBox, renameOwnedBox, repoQuery,
-  resizeOwnedBox, setOwnedBoxLifecycle, terminateOwnedBox,
+  growOwnedBox, resizeOwnedBox, setOwnedBoxLifecycle, terminateOwnedBox,
 } from './instances';
 import { archiveOwnedProject, createProjectFor, renameOwnedProject, retryCloneFor } from './projects';
 import type { RouteResult } from './routeResult';
+import { ASK_MODEL_OFF_REASON, askModelChoiceOn } from '../services/askModelFlag';
 import { createWorkstreamFor, removeWorkstreamFor } from './workstreams';
 
 export async function fullUser(user: CliUser): Promise<Express.User> {
@@ -45,8 +46,8 @@ async function projectView(userId: string, id: string) {
 
 /**
  * The routes only the desktop app calls (workstreams, hibernate) answer as if
- * they weren't there unless desktop-app-enabled is on for the owner and the
- * box, as the desktop's own bridge does. Clone retry isn't one of them:
+ * they weren't there unless the project is on a box of the caller's, as the
+ * desktop's own bridge does. Clone retry isn't one of them:
  * `termag ask --new-box` retries a project whose box failed to launch.
  */
 const DESKTOP_OFF: RouteResult = {
@@ -56,11 +57,7 @@ const DESKTOP_OFF: RouteResult = {
 
 async function desktopOff(user: CliUser, boxId: string | null): Promise<boolean> {
   if (!boxId) return true;
-  const [owner, box] = await Promise.all([
-    prisma.user.findUnique({ where: { id: user.id } }),
-    prisma.instance.findFirst({ where: { id: boxId, userId: user.id }, select: { id: true, name: true, kind: true } }),
-  ]);
-  return !owner || !box || !(await desktopAppEnabled(owner, box));
+  return !(await prisma.instance.findFirst({ where: { id: boxId, userId: user.id }, select: { id: true } }));
 }
 
 async function projectBox(user: CliUser, projectId: string): Promise<string | null> {
@@ -143,15 +140,18 @@ export const prismaCliLifecycle: CliLifecycle = {
         diskGiB: input.diskGiB,
         repo: input.repoUrls,
         ...(input.flavor !== undefined ? { flavor: input.flavor } : {}),
+        ...(input.environment ? { environment: input.environment } : {}),
+        ...(input.setupEnabled !== undefined ? { setupEnabled: input.setupEnabled } : {}),
+        ...(input.useRepoSetup ? { useRepoSetup: true } : {}),
       },
       { parentInstanceId, createdFor },
     );
     if (result.status !== 201) return cliErrorResult(result);
-    const { claimed, warnings } = result.body as { claimed?: boolean; warnings?: string[] };
+    const { claimed, warnings, repoSetup, disk, pool } = result.body as { claimed?: boolean; warnings?: string[]; repoSetup?: unknown; disk?: unknown; pool?: unknown };
     const boxId = idOf(result.body, 'instance');
     // A box made for an ask gets the ask-box policy in one place (boxLifecycle.applyAskBoxPolicy).
     if (createdFor === 'ask') await applyAskBoxPolicy(boxId);
-    return { status: 201, body: { box: await boxView(user.id, boxId), claimed: claimed === true, ...(warnings?.length ? { warnings } : {}) } };
+    return { status: 201, body: { box: await boxView(user.id, boxId), claimed: claimed === true, ...(pool === 'environment' ? { pool } : {}), ...(warnings?.length ? { warnings } : {}), ...(repoSetup ? { repoSetup } : {}), ...(disk ? { disk } : {}) } };
   },
 
   async boxParent(user, boxId) {
@@ -253,11 +253,27 @@ export const prismaCliLifecycle: CliLifecycle = {
     return { status: 202, body: { box: await boxView(user.id, boxId), resize: (result.body as { resize: unknown }).resize } };
   },
 
-  async createProject(user, { boxId, name, agent, repoUrl, repoUrls, createdFor, chatSpace }) {
+  async growBoxDisk(user, boxId, { sizeGb }) {
+    const result = await growOwnedBox(await fullUser(user), boxId, { sizeGb }, 'cli');
+    // 200: the disk already has that size, and nothing was done.
+    if (result.status === 200) return { status: 200, body: { box: await boxView(user.id, boxId), ...(result.body as object) } };
+    if (result.status !== 202) return cliErrorResult(result);
+    return { status: 202, body: { box: await boxView(user.id, boxId), grow: (result.body as { grow: unknown }).grow } };
+  },
+
+  async createProject(user, { boxId, name, agent, repoUrl, repoUrls, environment, environmentRepos, createdFor, chatSpace, model: asked }) {
+    // `--model` with ask-model-choice-enabled off for the creator and box: not applied, and the answer says why.
+    const box = asked ? await prisma.instance.findUnique({ where: { id: boxId }, select: { id: true, name: true, kind: true } }) : null;
+    const modelOff = !!asked && !await askModelChoiceOn(await fullUser(user), box);
+    const model = modelOff ? undefined : asked;
     // Several repositories: a multi-repo project (routes/projects.ts createWorkspaceProject), each checkout named by its repository.
-    const source = repoUrls?.length ? { repos: repoUrls.map(url => ({ url })) } : { repoUrl };
+    // An environment: its repositories, which createProjectFor reads from it.
+    // Held to the checkouts the caller read and was shown (environmentRepos; services/environments.ts withEnvironmentRepos).
+    const source = environment ? { environment, environmentRepos }
+      : repoUrls?.length ? { repos: repoUrls.map(url => ({ url })) } : { repoUrl };
     const result = await createProjectFor(await fullUser(user), {
-      name, instanceId: boxId, initialAgent: { enabled: true, provider: agent }, ...source,
+      // `model`: the tier its main workstream starts on (routes/cliLifecycle.ts parseProjectModel).
+      name, instanceId: boxId, initialAgent: { enabled: true, provider: agent, ...(model ? { model } : {}) }, ...source,
       // Fixed on its main workstream from the insert, as the web form's is (services/chatSpace.ts).
       ...(chatSpace !== undefined ? { chatSpace } : {}),
     });
@@ -265,13 +281,24 @@ export const prismaCliLifecycle: CliLifecycle = {
     const restored = (result.body as { restored?: boolean }).restored === true;
     if (createdFor) await prisma.project.update({ where: { id: idOf(result.body) }, data: { createdFor } });
     const repos = ((result.body as { repos?: Array<{ name: string; url: string }> }).repos ?? []).map(r => ({ name: r.name, url: r.url }));
+    // The model its main workstream really starts on: an un-archived project keeps its agent row, model and all, as it
+    // keeps its directory against `from`, so the CLI can say the requested one was not applied (null: the default).
+    const mainModel = asked
+      ? (await prisma.workflow.findFirst({ where: { projectId: idOf(result.body), type: 'agent', workstream: { name: 'main' } }, select: { model: true } }))?.model ?? null
+      : null;
     // An un-archived project keeps its old directory; only a fresh one is cloned.
     return {
       status: result.status,
       body: {
         project: await projectView(user.id, idOf(result.body)), restored,
-        repoUrl: restored ? null : repoUrl ?? repoUrls?.[0] ?? null,
+        repoUrl: restored ? null : repoUrl ?? repoUrls?.[0] ?? (result.body as { repoUrl?: string | null }).repoUrl ?? repos[0]?.url ?? null,
         ...(repos.length ? { repos } : {}),
+        // What the main workstream starts on, so a CLI can tell this orchestrator took `model` (an older one drops it).
+        ...(asked ? { model: mainModel } : {}),
+        // A restore keeps its own model whatever the flag says, so the reason is the restore, not the flag (`model` says which).
+        ...(modelOff && !restored ? { modelIgnored: ASK_MODEL_OFF_REASON } : {}),
+        // An environment's definition warnings (routes/projects.ts), for the CLI to print.
+        ...(((result.body as { warnings?: string[] }).warnings ?? []).length ? { warnings: (result.body as { warnings: string[] }).warnings } : {}),
       },
     };
   },
@@ -318,11 +345,11 @@ export const prismaCliLifecycle: CliLifecycle = {
     return { status: 200, body: { ok: true, branchDeleteWarning: body.branchDeleteWarning ?? null } };
   },
 
-  async retryClone(user, projectId) {
+  async retryClone(user, projectId, opts = {}) {
     if (!(await projectBox(user, projectId))) return { status: 404, body: { error: 'Project not found', code: 'not_found' } };
     const refused = await parkedRefusal(user, projectId);
     if (refused) return refused;
-    const result = await retryCloneFor(await fullUser(user), projectId);
+    const result = await retryCloneFor(await fullUser(user), projectId, opts);
     if (result.status !== 202) return cliErrorResult(result);
     // A relaunch moves the project to a new box; the view follows it there.
     return { status: 202, body: { project: await projectView(user.id, projectId) } };

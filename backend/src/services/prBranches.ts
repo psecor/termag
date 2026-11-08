@@ -172,7 +172,8 @@ export async function workstreamTargets(userId: string): Promise<WorkstreamTarge
           id: true, name: true, userId: true, instanceId: true, layout: true,
           user: { select: { unixUsername: true } },
           instance: { select: { hostHome: true } },
-          repos: { select: { name: true, url: true, position: true } },
+          // A repository still cloning (one added since) has no worktree to read yet.
+          repos: { where: { setupStatus: 'ready' }, select: { name: true, url: true, position: true } },
         },
       },
     },

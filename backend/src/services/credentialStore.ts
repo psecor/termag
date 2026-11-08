@@ -123,6 +123,8 @@ export interface GithubSecret {
 export interface GithubAccess {
   readonly token: string;
   readonly login: string;
+  /** The last connect or re-check's org probe, never the token. */
+  readonly orgs: Readonly<Record<string, OrgAccess>>;
 }
 
 const ACCESS_TTL_MS = 60_000;
@@ -133,7 +135,7 @@ async function loadGithubAccess(userId: string): Promise<GithubAccess | null> {
   if (!cfg) return null;
   const secret = await readCredential(cfg, userId, 'github') as GithubSecret | null;
   if (!secret || typeof secret.token !== 'string' || !secret.token || typeof secret.login !== 'string' || !secret.login) return null;
-  return { token: secret.token, login: secret.login };
+  return { token: secret.token, login: secret.login, orgs: publicOrgStatuses(secret) };
 }
 
 /** Throws on a KMS or decrypt failure; that result is not cached. */
@@ -151,6 +153,11 @@ export const githubTokenSource = Object.assign(
   async (userId: string) => (await readGithubAccess(userId))?.token ?? null,
   { forget(userId: string) { accessByUser.delete(userId); } },
 );
+
+/** The GitHub broker's view of the owner's org SSO state, from the same cached read as the token. */
+export async function githubOrgsSource(userId: string): Promise<Readonly<Record<string, OrgAccess>>> {
+  return (await readGithubAccess(userId))?.orgs ?? {};
+}
 
 const githubChangeListeners = new Set<(userId: string) => void>();
 

@@ -74,3 +74,13 @@ export function milestoneOnReading(
 export function milestoneForSharedViewer<T extends { url: string | null }>(m: T | null | undefined): T | null | undefined {
   return m ? { ...m, url: null } : m;
 }
+
+/**
+ * The repository and number of a milestone's PR URL (parseMilestoneBody has
+ * already kept only a github.com PR URL), for the `pr.opened` and `pr.merged`
+ * product events. Null without a URL.
+ */
+export function prRefOf(url: string | null): { repo: string; number: number } | null {
+  const m = url ? /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)$/.exec(url) : null;
+  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+}

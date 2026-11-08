@@ -15,13 +15,26 @@ export async function boxForToken(token: string, site: TokenSite): Promise<Authz
   const conn = validated && acceptsScope(site, validated.token.scope) ? parseAgentConnection(validated) : null;
   if (!conn) return null;
   if (conn.kind === 'user-agent') return { userId: conn.user.id, instanceId: '-', managed: false };
-  if (conn.kind !== 'owned-box') return { userId: '-', instanceId: conn.instance.id, managed: false };
+  if (conn.kind !== 'owned-box') {
+    const { instance } = conn;
+    return {
+      userId: '-', instanceId: instance.id, managed: false,
+      ...(instance.kind === 'ec2' ? { pool: { status: instance.status, environmentId: instance.poolEnvironmentId ?? null, repos: poolReposOf(instance.poolRepos) } } : {}),
+    };
+  }
   return {
     userId: conn.user.id,
     instanceId: conn.instance.id,
     managed: isManagedBox(conn.instance),
     email: conn.user.googleEmail,
   };
+}
+
+/** The owner/name of each repository an environment pool box was launched for (envPool.ts PoolRepo); null when none is recorded. */
+export function poolReposOf(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const repos = v.flatMap(r => (r && typeof r === 'object' && typeof (r as { repo?: unknown }).repo === 'string' ? [(r as { repo: string }).repo.toLowerCase()] : []));
+  return repos.length ? repos : null;
 }
 
 /** boxForToken bound to one gateway's site, in the shape the gateways' deps take. */

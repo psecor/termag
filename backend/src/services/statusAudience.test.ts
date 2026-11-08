@@ -20,8 +20,9 @@ describe('sharedScope', () => {
   it("holds every role of every live workstream of the shared projects, by box", () => {
     expect(bob.sharedStatusKeys).toContain('box-a|alice-myproj-agent');
     expect(bob.sharedStatusKeys).toContain('box-a|alice-myproj-feature-data-ctrl');
-    // 5 roles, plus review slots 2..8, per workstream.
-    expect(bob.sharedStatusKeys.size).toBe(2 * (5 + 7));
+    // 5 roles, plus review slots 2..8 and terminal
+    // slots 2..8, per workstream.
+    expect(bob.sharedStatusKeys.size).toBe(2 * (5 + 7 + 7));
     expect(bob.sharedOwners).toEqual(['alice']);
   });
 

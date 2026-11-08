@@ -12,6 +12,7 @@ import {
   waitsForThread,
   askChatSendRefusal,
   askChatWorkstreamName,
+  isAskChatWorkstreamName,
   MAX_ACTIVE_ASKS,
   MAX_PROMPT_BYTES,
   askBranch,
@@ -24,6 +25,7 @@ import {
   askTarget,
   askCwd,
   repoTarget,
+  askableRepos,
   cancelDecision,
   cancelShouldStop,
   isTerminal,
@@ -93,6 +95,15 @@ describe('parseAskBody', () => {
     expect(parseAskBody({ target: 'box/p', prompt: 'x', pr: 'https://github.com/org/api/pull/753' })).toMatchObject({ targetPr: { number: 753, repo: 'org/api' } });
     for (const pr of ['0', 'abc', 'org/api', 'https://example.com/org/api/pull/1', '../x#1', -1, true]) {
       expect(parseAskBody({ target: 'box/p', prompt: 'x', pr })).toHaveProperty('error');
+    }
+  });
+
+  it('reads --model as one of Claude\'s tiers; absent or null is none, anything else an error', () => {
+    expect(parseAskBody({ target: 'box/p', prompt: 'x' })).toMatchObject({ model: null });
+    expect(parseAskBody({ target: 'box/p', prompt: 'x', model: null })).toMatchObject({ model: null });
+    for (const model of ['opus', 'sonnet', 'haiku']) expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toMatchObject({ model });
+    for (const model of ['auto', 'gpt-5', 'Opus', 'us.anthropic.claude-opus-5-5', 1]) {
+      expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toEqual({ error: 'model must be opus, sonnet or haiku' });
     }
   });
 
@@ -209,6 +220,19 @@ describe('repoTarget', () => {
   });
 });
 
+describe('askableRepos', () => {
+  const repos = [{ name: 'web', setupStatus: 'ready' }, { name: 'api', setupStatus: 'cloning' }, { name: 'db', setupStatus: 'pending' }, { name: 'ops', setupStatus: 'failed' }];
+
+  it('counts the repositories a project still being set up was created with, ready or still cloning, in order', () => {
+    for (const status of ['pending', 'cloning']) expect(askableRepos(status, repos)).toEqual(['web', 'api', 'db']);
+  });
+
+  it('counts only ready checkouts on a project in use: a repository added since has none to ask yet', () => {
+    expect(askableRepos('ready', repos)).toEqual(['web']);
+    expect(askableRepos('failed', repos)).toEqual(['web']);
+  });
+});
+
 describe('askCwd', () => {
   it('is the workstream folder, or the repository in it', () => {
     expect(askCwd('/home/u/termag/projects/api', null)).toBe('/home/u/termag/projects/api');
@@ -237,7 +261,7 @@ describe('parseRunResult', () => {
   it('keeps well-formed fields and drops the rest', () => {
     expect(parseRunResult({
       result: 'ok', sessionId: 'bad id!', numTurns: -1, baseSha: 'xyz', repo: 'a/../b', isError: 'yes', bundle: 1, prDescription: 7,
-    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {}, pushes: null });
+    })).toEqual({ result: 'ok', sessionId: null, isError: false, numTurns: null, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {}, pushes: null, unpushed: [] });
     expect(parseRunResult({ result: 'ok', prDescription: '  \n' })).toMatchObject({ prDescription: null });
     expect(parseRunResult({ result: 'ok', prDescription: '# T\nbody' })).toMatchObject({ prDescription: '# T\nbody' });
   });
@@ -272,6 +296,28 @@ describe('parseRunResult', () => {
     });
     expect('pushes' in r && r.pushes).toEqual([{ branch: 'termag-ada/t1', sha }, { branch: 'feature/x-1', sha }]);
   });
+
+  it('reads the branches a push-mode clone committed and never pushed, HEAD for a detached one', () => {
+    expect(parseRunResult({ result: 'ok' })).toMatchObject({ unpushed: [] });
+    const r = parseRunResult({
+      result: 'ok', pushes: [],
+      unpushed: [
+        { branch: 'termag-ada/t1', commits: 2 }, { branch: 'termag-ada/t1', commits: 3 }, { branch: 'HEAD', commits: 1 },
+        { branch: '../x', commits: 1 }, { branch: 'ask', commits: 0 }, { branch: 'ask', commits: 1.5 }, { branch: 'ask', commits: '1' }, 'junk',
+      ],
+    });
+    expect('unpushed' in r && r.unpushed).toEqual([{ branch: 'termag-ada/t1', commits: 2 }, { branch: 'HEAD', commits: 1 }]);
+  });
+
+  it("keeps the branch the box says an unpushed branch's commits go to, and drops one that is no branch", () => {
+    const r = parseRunResult({
+      result: 'ok', pushes: [],
+      unpushed: [{ branch: 'fix/x', commits: 1, to: 'fix/x' }, { branch: 'ask', commits: 1, to: '../x' }, { branch: 'HEAD', commits: 1, to: 'termag-ada/t1' }],
+    });
+    expect('unpushed' in r && r.unpushed).toEqual([
+      { branch: 'fix/x', commits: 1, to: 'fix/x' }, { branch: 'ask', commits: 1 }, { branch: 'HEAD', commits: 1, to: 'termag-ada/t1' },
+    ]);
+  });
 });
 
 describe('runSystemPrompt with push (ask-push-v1)', () => {
@@ -283,6 +329,10 @@ describe('runSystemPrompt with push (ask-push-v1)', () => {
     expect(p).toContain('git switch -c termag-ada/t1-<name> origin/<default branch>');
     expect(p).not.toContain('termag/base');
     expect(p).not.toContain('TERMAG_ASK_PR_DIR');
+    // A follow-up asked to update the PR body has no TERMAG_ASK_PR_BODY_FILE (report cmvv15bpz1is214bdn7778rjb).
+    // Never through a pipe: gh runs on an empty stdin when termag-pr-body fails and blanks the PR (report cmvzm851b509mx3epx3r417eb).
+    expect(p).toContain('termag-pr-body <file> > <marked> && gh pr edit <n> --body-file <marked>');
+    expect(p).not.toMatch(/termag-pr-body [^`]*\| *gh pr edit/);
   });
 
   it("on a thread that updates another PR, pushes that PR's branch after pulling it", () => {
@@ -298,6 +348,17 @@ describe('runSystemPrompt: termag bugs', () => {
     const base = { senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' };
     for (const p of [runSystemPrompt(base), runSystemPrompt({ ...base, push: true })]) {
       expect(p).toContain('If a termag command or feature misbehaves, even if you find a workaround, file it with `termag bug report` (the termag-bug-report skill).');
+    }
+  });
+});
+
+// Security Agent on #998 (4af52769): the steps are the clone's commands, so an ask is pointed at them only on a project its owner trusted.
+describe('runSystemPrompt: environment steps', () => {
+  const base = { senderUsername: 'bob', senderDisplayName: 'Bob', target: 'box/p', branch: 'termag-bob/t' };
+  it('offers termag-env up only for a trusted project', () => {
+    expect(runSystemPrompt({ ...base, trusted: true })).toContain('`termag-env up`');
+    for (const p of [runSystemPrompt(base), runSystemPrompt({ ...base, trusted: false }), runSystemPrompt({ ...base, push: true })]) {
+      expect(p).not.toContain('`termag-env up`');
     }
   });
 });
@@ -391,6 +452,18 @@ describe('capRefusal', () => {
 });
 
 describe('messageView', () => {
+  it('shows the tier the turn ran on: an ignored --model ran on the box\'s default, and says why', () => {
+    const m = {
+      id: 'm', threadId: 't', status: 'completed', hop: 1, error: null, numTurns: 1, replyBytes: 1,
+      publish: null, publishDetail: null, createdAt: new Date(0), startedAt: null, completedAt: null, readAt: null,
+    };
+    const t = { id: 't', hopCount: 1, branch: null, prNumber: null, prUrl: null };
+    expect(messageView({ ...m, model: 'opus' }, t, 'box/p', null)).toMatchObject({ model: 'opus' });
+    expect(messageView({ ...m, model: 'opus' }, t, 'box/p', null)).not.toHaveProperty('modelIgnored');
+    expect(messageView({ ...m, model: 'opus', modelIgnored: 'old agent' }, t, 'box/p', null)).toMatchObject({ model: null, modelIgnored: 'old agent' });
+    expect(messageView(m, t, 'box/p', null)).toMatchObject({ model: null });
+  });
+
   it('shows a PR only when the thread has one', () => {
     const m = {
       id: 'm', threadId: 't', status: 'completed', hop: 2, error: null, numTurns: 4, replyBytes: 10,
@@ -833,6 +906,14 @@ describe('an ask thread\'s chat', () => {
   it('lives in a workstream named after its thread', () => {
     expect(askChatWorkstreamName('cmabc123')).toBe('ask-cmabc123');
   });
+  it('reserves that name shape, so a human-named workstream cannot collide with it', () => {
+    expect(isAskChatWorkstreamName('ask-cmvpvr0by19t1ex4aevd9iv3e')).toBe(true);
+    expect(isAskChatWorkstreamName('ask-0123456789')).toBe(true);
+    expect(isAskChatWorkstreamName('main')).toBe(false);
+    expect(isAskChatWorkstreamName('ask-Fix')).toBe(false);
+    expect(isAskChatWorkstreamName('ask-')).toBe(false);
+    expect(isAskChatWorkstreamName('asks')).toBe(false);
+  });
   it('takes messages from the owner of the project and its box only', () => {
     expect(askChatSendRefusal({ userId: 'u1', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: caps })).toBeNull();
     expect(askChatSendRefusal({ userId: 'u2', projectOwnerId: 'u1', boxOwnerId: 'u1', capabilities: caps })?.body.code).toBe('not_owner');
@@ -915,6 +996,16 @@ describe('steering a follow-up into a working turn', () => {
     expect(steerDecision({ ...busy, status: 'submitted', queued: true }, facts)).toMatchObject({ kind: 'queue', reason: expect.stringContaining('is itself waiting') });
   });
 
+  it('never steers a follow-up on another --model into the running turn: claude -p keeps the model it started on', () => {
+    expect(steerDecision({ ...busy, model: 'opus' }, { ...facts, model: 'opus' })).toEqual({ kind: 'steer' });
+    // `model` is the follow-up's effective tier: none (the box's default) doesn't join an Opus turn; unknown never queues.
+    expect(steerDecision({ ...busy, model: 'opus' }, { ...facts, model: null })).toEqual({ kind: 'queue', reason: "msga00000001's turn runs on opus, and this follow-up, on the box's default model, needs a turn of its own" });
+    expect(steerDecision({ ...busy, model: null }, { ...facts, model: null })).toEqual({ kind: 'steer' });
+    expect(steerDecision({ ...busy, model: 'opus' }, facts)).toEqual({ kind: 'steer' });
+    expect(steerDecision({ ...busy, model: 'opus' }, { ...facts, model: 'haiku' })).toEqual({ kind: 'queue', reason: "msga00000001's turn runs on opus, and --model haiku needs a turn of its own" });
+    expect(steerDecision(busy, { ...facts, model: 'opus' })).toEqual({ kind: 'queue', reason: "msga00000001's turn runs on the box's default model, and --model opus needs a turn of its own" });
+  });
+
 
   it('sends a queued next turn only once every earlier message of its thread has ended, in order', () => {
     const at = (id: string, t: number) => ({ id, createdAt: new Date(t) });
@@ -944,6 +1035,10 @@ describe('steering a follow-up into a working turn', () => {
     expect(answeredTogether(a, row('msgb00000001'))).toMatchObject({
       id: 'msga00000001', hop: 1, status: 'completed', replyBytes: 9, readAt: new Date(3), supersededById: 'msgb00000001', createdAt: new Date(1),
     });
+    // The model is the asked message's own: its ignored --model is kept, the follow-up's never borrowed.
+    const ignoredA = { ...a, model: 'opus', modelIgnored: 'old agent' };
+    expect(answeredTogether(ignoredA, row('msgb00000001', { model: 'haiku', modelIgnored: 'old agent' }))).toMatchObject({ model: 'opus', modelIgnored: 'old agent' });
+    expect(answeredTogether(a, row('msgb00000001', { model: 'opus', modelIgnored: 'old agent' }))).toMatchObject({ model: null, modelIgnored: null });
   });
 
   it('counts superseded as terminal and not active, and points a cancel at the follow-up', () => {

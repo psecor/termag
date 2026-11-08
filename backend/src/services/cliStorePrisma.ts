@@ -9,6 +9,8 @@ import { statusKey } from './statusKey';
 import { sessionName } from './tmux';
 import { boxCredentialFromAgentToken, type CliStore, type CliUser } from './cliStore';
 import { shapeBox, shapeProject, type CliProject } from './cliViews';
+import { LISTED_PROJECT_KINDS } from './projectKind';
+import { withManagedLabels } from './spaceSlack/projectLabels';
 
 const userSelect = { id: true, googleEmail: true, unixUsername: true, displayName: true } as const;
 
@@ -17,14 +19,14 @@ function toCliUser(u: CliUser): CliUser {
 }
 
 export const prismaCliStore: CliStore = {
-  async createSession({ userId, deviceName, tokenHash, tokenPrefix, now }) {
+  async createSession({ userId, deviceName, tokenHash, tokenPrefix, now, issuedOnBoxId = null }) {
     const [, row] = await prisma.$transaction([
       prisma.cliSession.updateMany({
         where: { userId, deviceName, revokedAt: null },
         data: { revokedAt: now },
       }),
       prisma.cliSession.create({
-        data: { userId, deviceName, tokenHash, tokenPrefix, createdAt: now, lastUsedAt: now },
+        data: { userId, deviceName, tokenHash, tokenPrefix, createdAt: now, lastUsedAt: now, issuedOnBoxId },
         include: { user: { select: userSelect } },
       }),
     ]);
@@ -55,7 +57,7 @@ export const prismaCliStore: CliStore = {
 
   async validateAgentToken(rawToken) {
     const box = boxCredentialFromAgentToken(await validateAgentToken(rawToken));
-    return box && { user: toCliUser(box.user), instanceId: box.instanceId };
+    return box && { user: toCliUser(box.user), instanceId: box.instanceId, tokenId: box.tokenId };
   },
 
   async listBoxes(userId) {
@@ -63,7 +65,9 @@ export const prismaCliStore: CliStore = {
     const [rows, owner] = await Promise.all([
       prisma.instance.findMany({
         where: { userId, status: { not: 'terminated' } },
-        include: { projects: { where: { archived: false }, select: { id: true, name: true }, orderBy: { name: 'asc' } } },
+        // Every live project, a space orchestrator's included: `termag box rm`
+        // confirms from this list and archives them all (projectKind.ts inProjectLists).
+        include: { projects: { where: { archived: false }, select: { id: true, name: true, kind: true }, orderBy: { name: 'asc' } } },
         orderBy: { createdAt: 'asc' },
       }),
       prisma.user.findUnique({ where: { id: userId } }),
@@ -71,6 +75,7 @@ export const prismaCliStore: CliStore = {
     const resizes = await latestBoxEvents(rows.map(r => r.id), 'resize');
     return Promise.all(rows.map(async r => shapeBox({
       ...r,
+      projects: await withManagedLabels(r.projects),
       resizeEvent: resizes.get(r.id) ?? null,
       lifecycle: owner ? await lifecycleViewFor(owner, r) : null,
     }, isInstanceAgentConnected(r.id))));
@@ -78,10 +83,10 @@ export const prismaCliStore: CliStore = {
 
   async listProjects(userId) {
     const rows = await prisma.project.findMany({
-      where: { userId, archived: false },
+      where: { userId, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
       select: {
         id: true, name: true, instanceId: true, lastActiveAt: true,
-        repoUrl: true, setupStatus: true, setupError: true, createdFor: true,
+        repoUrl: true, setupStatus: true, setupError: true, createdFor: true, dir: true,
         instance: { select: { id: true, name: true, hostHome: true, kind: true, status: true, provisioningError: true } },
         user: { select: { unixUsername: true } },
         workstreams: { where: { archived: false }, select: { name: true }, orderBy: { createdAt: 'asc' } },

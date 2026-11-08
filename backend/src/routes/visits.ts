@@ -5,6 +5,7 @@ import { sessionName } from '../services/tmux';
 import { getAllStatuses } from '../services/status';
 import { statusKey } from '../services/statusKey';
 import { providerForSource } from '../providers/registry';
+import { LISTED_PROJECT_KINDS } from '../services/projectKind';
 
 
 export function visitsRouter(): Router {
@@ -96,7 +97,7 @@ export function visitsRouter(): Router {
     if (ids.length === 0) { res.json([]); return; }
 
     const projects = await prisma.project.findMany({
-      where: { id: { in: ids } },
+      where: { id: { in: ids }, kind: { in: LISTED_PROJECT_KINDS } },
       include: {
         user: { select: { unixUsername: true } },
         workstreams: { select: { name: true, archived: true } },

@@ -1,16 +1,20 @@
-import { Router, type NextFunction, type Request, type Response } from 'express';
+import express, { Router, type NextFunction, type Request, type Response } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
+import { pasteLinkAllowed, type OAuthReturnTo } from '../services/mcpConnectorStore';
+import { apiCatalog, apiOAuthMetadata, isApiConnector, type ApiCatalogEntry } from '../services/apiBroker';
+import { LOOPBACK_REDIRECT_URI, parsePastedRedirect } from '../services/mcpOAuthLoopback';
+import { preflightAuthorize, RedirectRefusedError } from '../services/mcpOAuthRedirectHelp';
 import { termagUrlFromEnv } from '../services/claudeRunnerNotices';
 import { getCredentialStoreConfig } from '../services/credentialStore';
 import { deliverToUserBoxes } from '../services/credentialDelivery';
 import {
   connectorSecretNames, consumeOAuthState, CONNECTOR_SELECT, createOAuthState, deleteConnector, findConnector, forgetConnectorOAuth,
-  catalogForUser, listConnectors, mcpBrokerEnabledForUser, readConnectorSecrets, readOAuth, setLinkStatus, updateConnectorDroppingOAuth, withOAuthLock, writeConnectorSecrets,
+  apiBrokerEnabledForUser, catalogForUser, listConnectors, scopeLabelsForUser, readConnectorSecrets, readOAuth, setLinkStatus, updateConnectorDroppingOAuth, withOAuthLock, writeConnectorSecrets,
 } from '../services/mcpConnectorStore';
 import {
-  applySecretsPatch, assertPatchFitsAuth, getMcpBrokerUrl, McpConnectorError, referencedSecrets, upstreamTestAllow, validateConnectorName,
+  applySecretsPatch, assertPatchFitsAuth, connectorNameTaken, connectorNaming, getMcpBrokerUrl, McpConnectorError, referencedSecrets, upstreamTestAllow,
   validateHeaderTemplates, validateSecretsPatch, validateUpstream, type HeaderTemplates,
 } from '../services/mcpConnectors';
 import {
@@ -18,6 +22,9 @@ import {
   pkcePair, preregisteredClientFor, registerClient, registeredRow, registrationPath, revokeToken, signState, stateNonce, verifyState, type DiscoveredOAuth,
 } from '../services/mcpOAuth';
 import { checkOAuthUrl, safeOAuthHttp } from '../services/mcpOAuthHttp';
+import { authorizeTeam } from '../services/mcpOAuthSlackTeam';
+import { getSlackApp } from '../slack/app';
+import { connectorScopes, grantedScopesFrom, parseScopeLabels, scopeChoice, scopeLabel, scopesToRequest, type ScopeLabels } from '../services/mcpOAuthScopes';
 
 const STORE_OFF = 'The credential store is not configured on this orchestrator, so connector secrets cannot be saved.';
 const BASE_PATH = process.env.BASE_PATH ?? '';
@@ -25,26 +32,52 @@ const stateSecret = () => process.env.SESSION_SECRET ?? 'dev-secret';
 
 type Row = NonNullable<Awaited<ReturnType<typeof findConnector>>>;
 
-/** A connector as Settings → MCP servers shows it; also the CLI API's read-only list (routes/cliMcpConnectors.ts). */
-export async function view(row: Row, broker: string | null) {
+/**
+ * A connector as Settings → MCP servers shows it; also the CLI API's read-only
+ * list (routes/cliMcpConnectors.ts). `labels` is the user's scope label table
+ * (scopeLabelsForUser); without it, the built-in Slack labels.
+ */
+export async function view(row: Row, broker: string | null, labels: ScopeLabels = parseScopeLabels(null)) {
   const base = {
     id: row.id,
+    // The connector name: the mcpServers key and the mcp__<name>__ tool prefix.
     name: row.name,
+    // What Settings shows; a connector with no display text shows its name.
+    displayName: row.displayName ?? row.name,
     upstream: row.upstream,
     authType: row.authType,
-    brokerUrl: broker ? `${broker}/c/${row.id}` : null,
+    // "api": a provider's REST API for the API broker (services/apiBroker.ts),
+    // never delivered to a box as an MCP server, so it has no broker URL.
+    kind: isApiConnector(row) ? 'api' : 'mcp',
+    brokerUrl: broker && !isApiConnector(row) ? `${broker}/c/${row.id}` : null,
     updatedAt: row.updatedAt,
   };
   if (row.authType === 'oauth') {
     const meta = row.oauthMetadata as unknown as DiscoveredOAuth | null;
+    const scopes = connectorScopes(row.oauthScopes);
+    const named = (list: string[] | null) => list && meta ? list.map(name => ({ name, label: scopeLabel(labels, meta.issuer, name) })) : null;
     return {
       ...base,
       headers: {},
+      // The server is on the user's mcp-oauth-loopback-servers list: Settings
+      // shows the paste box for the localhost address its sign-in ends on.
+      pasteLink: await pasteLinkAllowed(row.userId, row.upstream),
       secretNames: [],
       missingSecrets: [],
       linkStatus: row.linkStatus ?? 'needs_link',
       linkError: row.linkError,
-      oauth: meta ? { issuer: meta.issuer, scopes: meta.scopes } : null,
+      oauth: meta
+        ? {
+          issuer: meta.issuer,
+          scopes: meta.scopes,
+          // The checklist Settings shows before the redirect; null when there is nothing to choose.
+          scopeChoice: scopeChoice(meta, preregisteredClientFor(meta), labels),
+          // The last sign-in's scopes: what it asked for, and what the token
+          // response said was granted (null when it named none).
+          requestedScopes: named(scopes?.requested ?? null),
+          grantedScopes: named(scopes?.granted ?? null),
+        }
+        : null,
     };
   }
   const templates = (row.headerTemplates ?? {}) as HeaderTemplates;
@@ -84,21 +117,29 @@ async function discover(upstream: string): Promise<DiscoveredOAuth> {
 
 /**
  * Starts sign-in for an OAuth connector and returns the URL to send the
- * browser to. Registers termag as a client with the server first if it
- * isn't registered yet.
+ * browser to. Registers termag as a client with the server first when the
+ * connector holds no current registration. `chosenScopes` is the request's `scopes`: the
+ * authorize URL asks for exactly those (all advertised scopes when absent),
+ * and the state row keeps them for the callback to store. `returnTo` is where
+ * the callback sends the browser afterwards (linkRedirect).
  */
-async function startLink(userId: string, connector: Row): Promise<string> {
+async function startLink(userId: string, connector: Row, chosenScopes: unknown, returnTo: OAuthReturnTo = null): Promise<string> {
   if (connector.authType !== 'oauth') throw new McpConnectorError('this connector uses static headers, not OAuth');
   if (!getCredentialStoreConfig()) throw new McpConnectorError(STORE_OFF, 503);
   const termagUrl = termagUrlOrFail();
   const meta = connector.oauthMetadata as unknown as DiscoveredOAuth;
-  const redirectUri = oauthRedirectUri(termagUrl);
-  const cimd = cimdClientId(termagUrl);
+  // A server on the user's loopback list signs in to LOOPBACK_REDIRECT_URI
+  // and is registered by DCR for it: a CIMD document and a pre-registered
+  // client both name termag's own callback.
+  const loopback = await pasteLinkAllowed(userId, connector.upstream);
+  const redirectUri = loopback ? LOOPBACK_REDIRECT_URI : oauthRedirectUri(termagUrl);
+  const cimd = loopback ? null : cimdClientId(termagUrl);
   const preregistered = preregisteredClientFor(meta);
+  const scopes = scopesToRequest(meta, chosenScopes, preregistered);
   const stored = await readOAuth(userId, connector.id);
   let client = stored?.client;
-  if (clientIsStale(client, meta, { redirectUri, cimdClientId: cimd, preregistered })) {
-    const fresh = await registerClient(meta, { http: safeOAuthHttp(), cimdClientId: cimd, redirectUri, preregistered });
+  if (clientIsStale(client, meta, { redirectUri, cimdClientId: cimd, preregistered: loopback ? null : preregistered })) {
+    const fresh = await registerClient(meta, { http: safeOAuthHttp(), cimdClientId: cimd, redirectUri, preregistered: loopback ? null : preregistered });
     client = fresh;
     await withOAuthLock(userId, connector.id, async io => {
       const { row, droppedTokens } = registeredRow(await io.read(), fresh);
@@ -106,10 +147,17 @@ async function startLink(userId: string, connector: Row): Promise<string> {
       if (droppedTokens) await io.needsLink('registered again with the server; link it again');
     });
   }
+  // Slack's pre-registered client signs in to the termag app's own workspace.
+  const team = await authorizeTeam(meta, client!, preregistered, () => getSlackApp()?.client);
+  // A server that refuses the redirect URI before login (New Relic) answers
+  // here, in Settings, rather than on its own error page. The pre-flight asks
+  // for the same scopes as the sign-in, with a throwaway state and challenge.
+  await preflightAuthorize(authorizeUrl(meta, client!, { state: newStateNonce(), challenge: pkcePair().challenge, scopes, team }),
+    { redirectUri: client!.redirectUri, issuer: meta.issuer }, safeOAuthHttp());
   const nonce = newStateNonce();
   const { verifier, challenge } = pkcePair();
-  await createOAuthState(nonce, userId, connector.id, verifier);
-  return authorizeUrl(meta, client!, { state: signState(stateSecret(), nonce, userId, connector.id), challenge });
+  await createOAuthState(nonce, userId, connector.id, verifier, scopes, returnTo);
+  return authorizeUrl(meta, client!, { state: signState(stateSecret(), nonce, userId, connector.id), challenge, scopes, team });
 }
 
 /** Revoke (best effort) and forget the user's tokens and client for an oauth connector. */
@@ -119,20 +167,50 @@ async function unlink(row: Row): Promise<void> {
   else await writeConnectorSecrets(row.userId, row.id, {});
 }
 
-function fail(res: Response, err: unknown): boolean {
+type Naming = ReturnType<typeof connectorNaming>;
+
+// `naming` is the name the request set: the only unique key a write can clash on is (userId, name).
+function fail(res: Response, err: unknown, naming?: Naming): boolean {
   if (err instanceof McpConnectorError) {
+    if (err instanceof RedirectRefusedError) {
+      // The URL is shown under the message, with Copy; the provider's reason is only logged.
+      console.log(`[MCP] redirect URI refused uri=${err.redirectUri} reason=${JSON.stringify(err.reason)}`);
+      res.status(err.status).json({ error: err.message, redirectUri: err.redirectUri });
+      return true;
+    }
     res.status(err.status).json({ error: err.message });
     return true;
   }
   if ((err as { code?: string }).code === 'P2002') {
-    res.status(409).json({ error: 'You already have an MCP connector with that name' });
+    res.status(409).json({ error: naming ? connectorNameTaken(naming).message : 'You already have an MCP connector with that name' });
     return true;
   }
   return false;
 }
 
+/** The flag's catalog, then the API providers this user may connect (api-broker-enabled). */
+async function fullCatalog(user: Parameters<typeof catalogForUser>[0]): Promise<Array<{ name: string; label?: string; upstream: string; kind?: ApiCatalogEntry['kind'] }>> {
+  const [mcp, api] = await Promise.all([catalogForUser(user), apiBrokerEnabledForUser(user)]);
+  return [...mcp, ...(api ? apiCatalog().filter(a => !mcp.some(d => d.name === a.name)) : [])];
+}
+
+/** A request body's `returnTo`: 'welcome' for a sign-in started in the setup wizard, else Settings. */
+function returnToOf(body: unknown): OAuthReturnTo {
+  return (body as { returnTo?: unknown } | undefined)?.returnTo === 'welcome' ? 'welcome' : null;
+}
+
+/**
+ * The end of a sign-in: Settings → MCP, or the setup wizard's MCP step when
+ * the sign-in started there. Both read `server`, `linked` and `error` the same
+ * way (frontend mcpForm.ts linkResult).
+ */
+function linkRedirect(res: Response, returnTo: OAuthReturnTo, params: Record<string, string>): void {
+  const page = returnTo === 'welcome' ? `${BASE_PATH}/welcome?step=mcp&` : `${BASE_PATH}/settings/mcp?`;
+  res.redirect(303, `${page}${new URLSearchParams(params).toString()}`);
+}
+
 function settingsRedirect(res: Response, params: Record<string, string>): void {
-  res.redirect(303, `${BASE_PATH}/settings/mcp?${new URLSearchParams(params).toString()}`);
+  linkRedirect(res, null, params);
 }
 
 /**
@@ -150,29 +228,22 @@ export function mcpClientMetadataHandler(_req: Request, res: Response): void {
 }
 
 /**
- * Settings API for the user's MCP connectors. Every
- * route answers 404 while mcp-broker-enabled is off for the user. No route
+ * Settings API for the user's MCP connectors. No route
  * returns a secret value or token: secrets are write-only, listed by name.
  */
 export function mcpConnectorsRouter(): Router {
   const router = Router();
   router.use(requireAuth);
-  router.use(asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
-    if (await mcpBrokerEnabledForUser(req.user!)) {
-      next();
-      return;
-    }
-    res.status(404).json({ error: 'Not found' });
-  }));
 
   router.get('/', asyncHandler(async (req, res) => {
     const broker = getMcpBrokerUrl();
     const rows = await listConnectors(req.user!.id);
-    const catalog = await catalogForUser(req.user!);
+    const labels = await scopeLabelsForUser(req.user!);
+    const catalog = await fullCatalog(req.user!);
     res.json({
       available: broker !== null,
       storeAvailable: getCredentialStoreConfig() !== null,
-      connectors: await Promise.all(rows.map(r => view(r, broker))),
+      connectors: await Promise.all(rows.map(r => view(r, broker, labels))),
       // The orchestrator's servers this user hasn't connected yet, which Settings
       // offers under "Available to connect". Once the user has a connector for a
       // server's URL, it is one of their connectors instead and drops out of here.
@@ -184,10 +255,14 @@ export function mcpConnectorsRouter(): Router {
   // looks up the server's OAuth settings just as adding a server by hand does,
   // and answer with the sign-in URL. If the user already has an OAuth connector
   // for that URL (a second click, a second tab, or one added by hand), it is
-  // reused rather than duplicated.
+  // reused rather than duplicated. The body's `scopes` are passed to the
+  // sign-in as for /:id/oauth/start. With `chooseScopes: true` and no
+  // `scopes`, a connector whose server offers a choice answers no URL
+  // (`authorizeUrl: null`) and its `connector` view, so Settings can show the
+  // checklist first and then call /:id/oauth/start.
   router.post('/catalog/:name/connect', asyncHandler(async (req, res) => {
     const userId = req.user!.id;
-    const def = (await catalogForUser(req.user!)).find(d => d.name === req.params.name);
+    const def = (await fullCatalog(req.user!)).find(d => d.name === req.params.name);
     if (!def) {
       res.status(404).json({ error: 'No such MCP server in the catalog' });
       return;
@@ -198,10 +273,11 @@ export function mcpConnectorsRouter(): Router {
       termagUrlOrFail();
       let connector = await existing();
       if (!connector) {
-        const meta = await discover((await validateUpstream(def.upstream)).url);
+        // An API provider's metadata is fixed (services/apiBroker.ts); a server's is discovered.
+        const meta = (def.kind === 'api' && apiOAuthMetadata(def.name)) || await discover((await validateUpstream(def.upstream)).url);
         try {
           connector = await prisma.mcpConnector.create({
-            data: { userId, name: def.name, upstream: def.upstream, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
+            data: { userId, name: def.name, displayName: def.label ?? null, upstream: def.upstream, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
             select: CONNECTOR_SELECT,
           });
           void deliverToUserBoxes(userId);
@@ -216,16 +292,24 @@ export function mcpConnectorsRouter(): Router {
           }
         }
       }
-      res.json({ id: connector.id, authorizeUrl: await startLink(userId, connector) });
+      const shown = await view(connector, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!));
+      if (req.body?.chooseScopes === true && req.body?.scopes === undefined && 'oauth' in shown && shown.oauth?.scopeChoice) {
+        res.json({ id: connector.id, authorizeUrl: null, connector: shown });
+        return;
+      }
+      res.json({ id: connector.id, authorizeUrl: await startLink(userId, connector, req.body?.scopes, returnToOf(req.body)), connector: shown });
     } catch (err) {
       if (!fail(res, err)) throw err;
     }
   }));
 
+  // `name` is display text ("Claude Docs"); the connector name is derived from it (connectorNaming).
   router.post('/', asyncHandler(async (req, res) => {
     const userId = req.user!.id;
+    let naming: Naming | undefined;
     try {
-      const name = validateConnectorName(req.body?.name);
+      naming = connectorNaming(req.body?.name);
+      const { name, displayName } = naming;
       const type = authType(req.body?.auth);
       if (type === 'oauth') {
         if (!getCredentialStoreConfig()) {
@@ -236,11 +320,11 @@ export function mcpConnectorsRouter(): Router {
         const upstream = await validateUpstream(req.body?.upstream);
         const meta = await discover(upstream.url);
         const row = await prisma.mcpConnector.create({
-          data: { userId, name, upstream: upstream.url, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
+          data: { userId, name, displayName, upstream: upstream.url, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
           select: CONNECTOR_SELECT,
         });
         void deliverToUserBoxes(userId);
-        res.status(201).json(await view(row, getMcpBrokerUrl()));
+        res.status(201).json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
         return;
       }
       const headers = staticAuth(req.body?.auth);
@@ -252,7 +336,7 @@ export function mcpConnectorsRouter(): Router {
       }
       const upstream = await validateUpstream(req.body?.upstream);
       const row = await prisma.mcpConnector.create({
-        data: { userId, name, upstream: upstream.url, authType: 'static', headerTemplates: headers },
+        data: { userId, name, displayName, upstream: upstream.url, authType: 'static', headerTemplates: headers },
         select: CONNECTOR_SELECT,
       });
       try {
@@ -262,14 +346,15 @@ export function mcpConnectorsRouter(): Router {
         throw err;
       }
       void deliverToUserBoxes(userId);
-      res.status(201).json(await view(row, getMcpBrokerUrl()));
+      res.status(201).json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
     } catch (err) {
-      if (!fail(res, err)) throw err;
+      if (!fail(res, err, naming)) throw err;
     }
   }));
 
   // The authorization server sends the browser back here with ?code&state.
-  router.get('/oauth/callback', asyncHandler(async (req, res) => {
+  // POST /:id/oauth/paste runs it too, on the query of a pasted address.
+  const finishLink = asyncHandler(async (req, res) => {
     const userId = req.user!.id;
     const nonce = stateNonce(req.query.state);
     const row = nonce ? await consumeOAuthState(nonce) : null;
@@ -278,22 +363,23 @@ export function mcpConnectorsRouter(): Router {
       return;
     }
     const server = row.connectorId;
+    const back = (params: Record<string, string>) => linkRedirect(res, row.returnTo, params);
     if (typeof req.query.error === 'string') {
       const why = typeof req.query.error_description === 'string' ? req.query.error_description : req.query.error;
-      settingsRedirect(res, { server, error: `The server did not grant access: ${why.slice(0, 200)}` });
+      back({ server, error: `The server did not grant access: ${why.slice(0, 200)}` });
       return;
     }
     const connector = await findConnector(row.connectorId);
     const meta = connector?.oauthMetadata as unknown as DiscoveredOAuth | null;
     const stored = connector ? await readOAuth(userId, connector.id) : null;
     if (!connector || connector.userId !== userId || connector.authType !== 'oauth' || !meta || !stored?.client || typeof req.query.code !== 'string') {
-      settingsRedirect(res, { server, error: 'termag could not finish linking this server; start it again from Settings' });
+      back({ server, error: 'termag could not finish linking this server; start it again from Settings' });
       return;
     }
     const issProblem = callbackIssuerProblem(meta, req.query.iss);
     if (issProblem) {
       console.warn(`[MCP] callback refused connector=${connector.id} user=${userId}: ${issProblem}`);
-      settingsRedirect(res, { server, error: `Linking failed: ${issProblem}; start it again from Settings` });
+      back({ server, error: `Linking failed: ${issProblem}; start it again from Settings` });
       return;
     }
     try {
@@ -301,16 +387,16 @@ export function mcpConnectorsRouter(): Router {
       const tokens = await exchangeCode(meta, client, { code: req.query.code, verifier: row.codeVerifier }, safeOAuthHttp());
       const linked = await withOAuthLock(userId, connector.id, async io => {
         if (!(await commitLink(io, client, tokens))) return false;
-        await io.linked();
+        await io.linked({ requested: row.scopes, granted: grantedScopesFrom(tokens.scope) });
         return true;
       });
       if (!linked) {
         await revokeToken(meta, client, tokens, safeOAuthHttp());
-        settingsRedirect(res, { server, error: 'This server was unlinked or registered again while you signed in; start it again from Settings' });
+        back({ server, error: 'This server was unlinked or registered again while you signed in; start it again from Settings' });
         return;
       }
       console.log(`[MCP] linked connector=${connector.id} user=${userId}`);
-      settingsRedirect(res, { server, linked: '1' });
+      back({ server, linked: '1' });
     } catch (err) {
       if (!(err instanceof McpConnectorError) && !(err instanceof OAuthGrantError)) throw err;
       // A failed re-link (or a second tab) leaves tokens that still work: only a
@@ -319,9 +405,10 @@ export function mcpConnectorsRouter(): Router {
       await withOAuthLock(userId, connector.id, async io => {
         if (!(await io.read())?.tokens) await io.needsLink(message);
       });
-      settingsRedirect(res, { server, error: `Linking failed: ${err.message}` });
+      back({ server, error: `Linking failed: ${err.message}` });
     }
-  }));
+  });
+  router.get('/oauth/callback', finishLink);
 
   router.patch('/:id', asyncHandler(async (req, res) => {
     const userId = req.user!.id;
@@ -330,15 +417,23 @@ export function mcpConnectorsRouter(): Router {
       res.status(404).json({ error: 'No such MCP connector' });
       return;
     }
+    let naming: Naming | undefined;
     try {
       if (req.body?.auth !== undefined && authType(req.body.auth) !== existing.authType) {
         throw new McpConnectorError('a connector cannot change how it signs in; delete it and add it again');
       }
-      const data: { name?: string; upstream?: string; headerTemplates?: HeaderTemplates; oauthMetadata?: object; linkStatus?: string; linkError?: null } = {};
-      if (req.body?.name !== undefined) data.name = validateConnectorName(req.body.name);
+      const data: { name?: string; displayName?: string | null; upstream?: string; headerTemplates?: HeaderTemplates; oauthMetadata?: object; linkStatus?: string; linkError?: null } = {};
+      if (req.body?.name !== undefined) {
+        naming = connectorNaming(req.body.name);
+        data.name = naming.name;
+        data.displayName = naming.displayName;
+      }
       let relinked = false;
       let previousSecrets: Awaited<ReturnType<typeof readConnectorSecrets>> | null = null;
-      if (req.body?.upstream !== undefined) {
+      if (req.body?.upstream !== undefined && isApiConnector(existing) && req.body.upstream !== existing.upstream) {
+        throw new McpConnectorError('an API connector\'s address is fixed; delete it and connect it again');
+      }
+      if (req.body?.upstream !== undefined && !isApiConnector(existing)) {
         data.upstream = (await validateUpstream(req.body.upstream)).url;
         if (existing.authType === 'oauth' && data.upstream !== existing.upstream) {
           data.oauthMetadata = await discover(data.upstream) as object;
@@ -377,14 +472,15 @@ export function mcpConnectorsRouter(): Router {
         }
       }
       void deliverToUserBoxes(userId);
-      res.json(await view(row, getMcpBrokerUrl()));
+      res.json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
     } catch (err) {
-      if (!fail(res, err)) throw err;
+      if (!fail(res, err, naming)) throw err;
     }
   }));
 
   // Link (or re-link): register with the server if needed, then hand the
-  // browser the authorize URL.
+  // browser the authorize URL. The body's optional `scopes` lists the scopes
+  // to ask for (services/mcpOAuthScopes.ts scopesToRequest).
   router.post('/:id/oauth/start', asyncHandler(async (req, res) => {
     const userId = req.user!.id;
     const connector = await findConnector(req.params.id);
@@ -393,10 +489,48 @@ export function mcpConnectorsRouter(): Router {
       return;
     }
     try {
-      res.json({ authorizeUrl: await startLink(userId, connector) });
+      res.json({ authorizeUrl: await startLink(userId, connector, req.body?.scopes, returnToOf(req.body)) });
     } catch (err) {
       if (!fail(res, err)) throw err;
     }
+  }));
+
+  // Finish a sign-in that ended on LOOPBACK_REDIRECT_URI: the Settings form
+  // posts the address the browser was sent to (`url`), and this answers with
+  // the same redirect as the callback, to Settings or the setup wizard. Only for a server on the
+  // user's mcp-oauth-loopback-servers list. The pasted address and its code
+  // are never logged or echoed.
+  router.post('/:id/oauth/paste', express.urlencoded({ extended: false, limit: '16kb' }), asyncHandler(async (req, res, next) => {
+    const userId = req.user!.id;
+    const connector = await findConnector(req.params.id);
+    if (!connector || connector.userId !== userId || connector.authType !== 'oauth') {
+      res.status(404).json({ error: 'No such OAuth MCP connector' });
+      return;
+    }
+    const server = connector.id;
+    // The form's own `returnTo` for the answers before the sign-in's state row is read.
+    const back = (params: Record<string, string>) => linkRedirect(res, returnToOf(req.body), params);
+    if (!(await pasteLinkAllowed(userId, connector.upstream))) {
+      back({ server, error: 'This server is not set up for pasting a sign-in address; use Link' });
+      return;
+    }
+    const pasted = parsePastedRedirect(req.body?.url);
+    if (!pasted.ok) {
+      back({ server, error: pasted.error });
+      return;
+    }
+    // Checked before the callback uses up the pending sign-in, so a wrong
+    // address can be followed by the right one.
+    if (!verifyState(stateSecret(), pasted.query.state, userId, connector.id)) {
+      back({ server, error: "That address is not from this server's sign-in. Copy the address from the tab where you signed in to it, or start again with Link" });
+      return;
+    }
+    if ((await readOAuth(userId, connector.id))?.client?.redirectUri !== LOOPBACK_REDIRECT_URI) {
+      back({ server, error: 'This server\'s sign-in no longer ends on a localhost address. Link it again' });
+      return;
+    }
+    req.query = pasted.query;
+    finishLink(req, res, next);
   }));
 
   router.delete('/:id/oauth', asyncHandler(async (req, res) => {
@@ -413,7 +547,7 @@ export function mcpConnectorsRouter(): Router {
       res.status(404).json({ error: 'No such OAuth MCP connector' });
       return;
     }
-    res.json(await view(row, getMcpBrokerUrl()));
+    res.json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
   }));
 
   router.delete('/:id', asyncHandler(async (req, res) => {

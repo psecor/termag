@@ -27,8 +27,16 @@ export function stuckMarkDropUpdate(instanceId: string) {
 export const INSTANCE_STATUSES = [
   'provisioning', 'awaiting-agent', 'warming', 'warm', 'ready', 'stopping', 'stopped', 'starting',
   'hibernating', 'hibernated', 'failed', 'quarantined', 'terminated',
+  // An environment pool's ownerless boxes.
+  'env-preparing', 'env-stopping', 'env-stopped', 'env-starting', 'env-failed',
 ] as const;
 export type InstanceStatus = typeof INSTANCE_STATUSES[number];
+
+/** An environment pool's statuses: an ownerless box prepared for one environment (Instance.poolEnvironmentId). */
+export const ENV_POOL_STATUSES = ['env-preparing', 'env-stopping', 'env-stopped', 'env-starting', 'env-failed'] as const satisfies readonly InstanceStatus[];
+export function isEnvPoolStatus(status: string): boolean {
+  return (ENV_POOL_STATUSES as readonly string[]).includes(status);
+}
 
 /** What `validateAgentToken` resolves to. Both halves are nullable because both columns are. */
 export interface ValidatedAgentToken {
@@ -109,6 +117,13 @@ const CONNECT_TRANSITIONS: Readonly<Record<InstanceStatus, InstanceStatus>> = {
   'failed': 'failed',
   'quarantined': 'quarantined',
   'terminated': 'terminated',
+  // A pool box's connect changes nothing yet: the pool code (prepare, stop,
+  // claim) moves these rows itself, as the warm pool's on-warm handler does.
+  'env-preparing': 'env-preparing',
+  'env-stopping': 'env-stopping',
+  'env-stopped': 'env-stopped',
+  'env-starting': 'env-starting',
+  'env-failed': 'env-failed',
 };
 
 /** The status to write when an instance-bound agent connects. */

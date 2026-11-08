@@ -8,15 +8,12 @@
  * validation of what the browser sends, so routes/browserWs.ts stays a relay.
  */
 
-export const BROWSER_PANE_FLAG = 'browser-pane-enabled';
 /** What an agent that can run a pane says in its hello (agent/browser-pane.js). */
 export const BROWSER_PANE_CAPABILITY = 'browser-pane-v1';
 /**
  * Kept profiles: asked for per
- * attach while the flag is on for the project's owner and box, and the
- * viewer's "Reset browser" relayed, only to an agent that says it can.
+ * attach, and the viewer's "Reset browser" relayed, only to an agent that says it can.
  */
-export const BROWSER_PANE_PROFILES_FLAG = 'browser-pane-persistent-profiles-enabled';
 export const BROWSER_PANE_PROFILES_CAPABILITY = 'browser-pane-profiles-v1';
 /** A box agent that can run a reviewer's guest pane (agent/browser-guest.js) and has the box's guest user. */
 export const BROWSER_PANE_GUEST_CAPABILITY = 'browser-pane-guest-v1';

@@ -2,13 +2,18 @@
  * Files an agent reply asks to attach with `[attach: path]` (agentSession.ts).
  *
  * Claude picks the path, so it is checked before anything is uploaded to a
- * thread other people may read: inside the project or the temp directory
- * (after symlinks; with no project only the temp directory, not the whole
- * home), in a temp directory only this process's user's own files, no
+ * thread other people may read: inside the project or this turn's own temp
+ * directory (after symlinks; with no project only that directory, not the
+ * whole home), in that directory only this process's user's own files, no
  * dot-directory or dotfile on the way (.ssh, .aws, .env), an image or plain
  * document type (not json, log or html, the types that most often hold config
  * and tokens), and at most 20 MB. Files in the project may belong to its owner's
  * unix user rather than this process's, so ownership is checked in temp only.
+ *
+ * The temp directory is per run (createRunTempDir), not the shared /tmp: every
+ * operator's turn runs as the same unix user, so an ownership check there could
+ * not tell one person's files from another's, and one person's turn could offer
+ * a file another person's turn wrote.
  *
  * These checks are the backstop, not the approval: nothing is uploaded until
  * the person the turn is for presses Share on a question that shows the file's
@@ -16,9 +21,9 @@
  * and could copy any file somewhere allowed, so a check alone would not do.
  */
 
-import { realpath, stat } from 'fs/promises';
+import { mkdtemp, readdir, realpath, rm, stat } from 'fs/promises';
 import { homedir, tmpdir } from 'os';
-import { basename, extname, isAbsolute, relative, resolve, sep } from 'path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path';
 import type { WebClient } from '@slack/web-api';
 
 const ALLOWED_EXTENSIONS = new Set([
@@ -29,7 +34,50 @@ const MAX_BYTES = 20 * 1024 * 1024;
 
 export type AttachmentCheck = { ok: true; path: string; filename: string } | { ok: false; reason: string };
 
-export async function checkAttachment(raw: string, workingDir: string, extraRoots: string[] = [tmpdir(), '/tmp']): Promise<AttachmentCheck> {
+/** The names of per-run temp directories, directly under the OS temp directory. */
+const RUN_DIR_PREFIX = 'termag-slack-run-';
+/**
+ * How long a run's temp directory is kept: its files wait behind a Share
+ * question the person may answer hours later. Older ones are removed when a
+ * new run starts, and sharing from them then says the file is gone.
+ */
+export const RUN_DIR_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A new, empty temp directory for one agent run (mode 0700, from mkdtemp), the
+ * only temp location its attachments may come from. Directories older than
+ * RUN_DIR_TTL_MS are removed first, best effort.
+ */
+export async function createRunTempDir(base: string = tmpdir(), now: number = Date.now()): Promise<string> {
+  await pruneRunTempDirs(base, now).catch(err => console.error('[AGENT] could not prune run temp dirs:', (err as Error).message));
+  return mkdtemp(join(base, RUN_DIR_PREFIX));
+}
+
+export async function pruneRunTempDirs(base: string = tmpdir(), now: number = Date.now()): Promise<void> {
+  for (const name of await readdir(base)) {
+    if (!name.startsWith(RUN_DIR_PREFIX)) continue;
+    const dir = join(base, name);
+    const info = await stat(dir).catch(() => null);
+    if (info?.isDirectory() && now - info.mtimeMs > RUN_DIR_TTL_MS) {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Whether `dir` is a run temp directory: directly under the OS temp directory,
+ * with the run prefix. A Share click names one from the button, which is ours,
+ * but nothing else is ever taken as a temp root.
+ */
+export function isRunTempDir(dir: string, base: string = tmpdir()): boolean {
+  return isAbsolute(dir) && resolve(dirname(dir)) === resolve(base) && basename(dir).startsWith(RUN_DIR_PREFIX);
+}
+
+/**
+ * `tempRoots`: the run's own temp directory (or none). The shared temp
+ * directory is never a root on its own.
+ */
+export async function checkAttachment(raw: string, workingDir: string, tempRoots: string[] = []): Promise<AttachmentCheck> {
   const requested = isAbsolute(raw) ? raw : resolve(workingDir, raw);
   let path: string;
   try {
@@ -44,8 +92,8 @@ export async function checkAttachment(raw: string, workingDir: string, extraRoot
   const project = await realpath(workingDir).catch(() => null);
   const home = await realpath(homedir()).catch(() => null);
   const projectRoot = project && project !== home ? [project] : [];
-  const tempRoots = await Promise.all(extraRoots.map(r => realpath(r).catch(() => null)));
-  const roots = [...projectRoot, ...tempRoots];
+  const temps = await Promise.all(tempRoots.map(r => realpath(r).catch(() => null)));
+  const roots = [...projectRoot, ...temps];
   const inside = roots.find((root): root is string => {
     if (!root) return false;
     const rel = relative(root, path);
@@ -59,11 +107,15 @@ export async function checkAttachment(raw: string, workingDir: string, extraRoot
   const info = await stat(path).catch(() => null);
   if (!info?.isFile()) return { ok: false, reason: 'not a file' };
   // Other users' files in a shared /tmp are not ours to post.
-  if (tempRoots.includes(inside) && process.getuid && info.uid !== process.getuid()) {
+  if (temps.includes(inside) && process.getuid && info.uid !== process.getuid()) {
     return { ok: false, reason: "not this user's file" };
   }
   if (info.size > MAX_BYTES) return { ok: false, reason: 'larger than 20 MB' };
   return { ok: true, path, filename: basename(path) };
+}
+
+function runRoots(runDir: string | undefined): string[] {
+  return runDir && isRunTempDir(runDir) ? [runDir] : [];
 }
 
 export const ATTACH_ACTION = /^agent_attach_(share|skip)$/;
@@ -80,8 +132,8 @@ function readableSize(bytes: number): string {
  * reply alone, since a prompt injected through what it read could otherwise
  * post a file nobody asked for into a thread others read.
  */
-export function attachPromptBlocks(file: { path: string; filename: string; size: number }, forUser: string, workingDir: string) {
-  const value = JSON.stringify({ u: forUser, p: file.path, w: workingDir });
+export function attachPromptBlocks(file: { path: string; filename: string; size: number }, forUser: string, workingDir: string, runDir?: string) {
+  const value = JSON.stringify({ u: forUser, p: file.path, w: workingDir, ...(runDir && { t: runDir }) });
   return [
     {
       type: 'section',
@@ -98,12 +150,14 @@ export function attachPromptBlocks(file: { path: string; filename: string; size:
   ];
 }
 
-export function parseAttachValue(value: string): { forUser: string; path: string; workingDir: string } | null {
+export function parseAttachValue(value: string): { forUser: string; path: string; workingDir: string; runDir?: string } | null {
   try {
     const v = JSON.parse(value);
-    return typeof v?.u === 'string' && typeof v?.p === 'string' && typeof v?.w === 'string'
-      ? { forUser: v.u, path: v.p, workingDir: v.w }
-      : null;
+    if (typeof v?.u !== 'string' || typeof v?.p !== 'string' || typeof v?.w !== 'string') return null;
+    // An offer from before per-run temp dirs has no `t`: only the project counts then.
+    return typeof v.t === 'string'
+      ? { forUser: v.u, path: v.p, workingDir: v.w, runDir: v.t }
+      : { forUser: v.u, path: v.p, workingDir: v.w };
   } catch {
     return null;
   }
@@ -116,10 +170,10 @@ export function parseAttachValue(value: string): { forUser: string; path: string
  */
 export async function offerAttachments(
   client: Pick<WebClient, 'chat'>,
-  args: { channel: string; threadTs: string; paths: string[]; workingDir: string; forUser: string },
+  args: { channel: string; threadTs: string; paths: string[]; workingDir: string; forUser: string; runDir?: string },
 ): Promise<void> {
   for (const raw of args.paths) {
-    const check = await checkAttachment(raw, args.workingDir);
+    const check = await checkAttachment(raw, args.workingDir, runRoots(args.runDir));
     if (!check.ok) {
       console.error(`[AGENT] attach ${raw}: ${check.reason}`);
       await client.chat.postMessage({
@@ -131,7 +185,7 @@ export async function offerAttachments(
     await client.chat.postMessage({
       channel: args.channel, thread_ts: args.threadTs,
       text: `Share ${check.filename} in this thread?`,
-      blocks: attachPromptBlocks({ path: check.path, filename: check.filename, size }, args.forUser, args.workingDir),
+      blocks: attachPromptBlocks({ path: check.path, filename: check.filename, size }, args.forUser, args.workingDir, args.runDir),
     }).catch(err => console.error('[AGENT] could not offer an attachment:', (err as Error).message));
   }
 }
@@ -142,9 +196,9 @@ export async function offerAttachments(
  */
 export async function shareAttachment(
   client: Pick<WebClient, 'filesUploadV2'>,
-  args: { channel: string; threadTs: string; path: string; workingDir: string },
+  args: { channel: string; threadTs: string; path: string; workingDir: string; runDir?: string },
 ): Promise<string | null> {
-  const check = await checkAttachment(args.path, args.workingDir);
+  const check = await checkAttachment(args.path, args.workingDir, runRoots(args.runDir));
   if (!check.ok) return check.reason;
   try {
     await client.filesUploadV2({ channel_id: args.channel, thread_ts: args.threadTs, file: check.path, filename: check.filename });

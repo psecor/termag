@@ -2,11 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
   agentSpawn: { findFirst: vi.fn(), updateMany: vi.fn(), findMany: vi.fn() },
+  project: { findUnique: vi.fn() },
 }));
 vi.mock('../db', () => ({ prisma }));
 vi.mock('./spawnEvents', () => ({ recordSpawnEvent: vi.fn(async () => {}), sweepSpawnEvents: vi.fn(async () => 0) }));
 
-import { claimSpawnLaunch, releaseSpawnLaunch, unparkOnLaunch } from './agentSpawnStore';
+import { claimSpawnLaunch, releaseSpawnLaunch, spawnTelemetryFor, unparkOnLaunch } from './agentSpawnStore';
 
 const key = { userId: 'u1', projectId: 'p1', workstream: 'add-tests', provider: 'claude' };
 
@@ -79,5 +80,38 @@ describe('unparkOnLaunch', () => {
     expect(prisma.agentSpawn.findMany).not.toHaveBeenCalled();
     prisma.agentSpawn.findMany.mockRejectedValue(new Error('db down'));
     await expect(unparkOnLaunch('u1', 'p1', 'ws')).resolves.toBeUndefined();
+  });
+});
+
+describe('spawnTelemetryFor', () => {
+  const k = { userId: 'u1', projectId: 'p1', workstream: 'add-tests' };
+  beforeEach(() => {
+    prisma.agentSpawn.findFirst.mockReset();
+    prisma.project.findUnique.mockReset();
+  });
+
+  it('names the newest spawn of the workstream, its root, depth and parent by project name', async () => {
+    prisma.agentSpawn.findFirst.mockResolvedValue({ id: 'ck2', rootSpawnId: 'ck1', depth: 2, parentProjectId: 'pp', parentWorkstream: 'main', parentInstanceId: 'box1' });
+    prisma.project.findUnique.mockResolvedValue({ name: 'termag' });
+    await expect(spawnTelemetryFor(k)).resolves.toEqual({ id: 'ck2', root: 'ck1', depth: 2, parentProject: 'termag', parentWorkstream: 'main', parentBox: 'box1' });
+    const q = prisma.agentSpawn.findFirst.mock.calls[0][0];
+    // Any launch of the workstream, claimed or not: a resume stays in its tree.
+    // A later failed or retired attempt never takes the live spawn's place.
+    expect(q.where).toEqual({ userId: 'u1', childProjectId: 'p1', childWorkstream: 'add-tests', retiredAt: null, state: { not: 'failed' } });
+    expect(q.orderBy).toEqual({ createdAt: 'desc' });
+  });
+
+  it('is its own root without one, and has no parent project when the parent is gone', async () => {
+    prisma.agentSpawn.findFirst.mockResolvedValue({ id: 'ck1', rootSpawnId: null, depth: 1, parentProjectId: 'gone', parentWorkstream: 'main', parentInstanceId: null });
+    prisma.project.findUnique.mockResolvedValue(null);
+    await expect(spawnTelemetryFor(k)).resolves.toMatchObject({ id: 'ck1', root: 'ck1', parentProject: null });
+  });
+
+  it('is null for a workstream no spawn made, with no project, or on a failed lookup', async () => {
+    prisma.agentSpawn.findFirst.mockResolvedValue(null);
+    await expect(spawnTelemetryFor(k)).resolves.toBeNull();
+    await expect(spawnTelemetryFor({ ...k, projectId: null })).resolves.toBeNull();
+    prisma.agentSpawn.findFirst.mockRejectedValue(new Error('db down'));
+    await expect(spawnTelemetryFor(k)).resolves.toBeNull();
   });
 });

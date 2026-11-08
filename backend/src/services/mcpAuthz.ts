@@ -9,6 +9,7 @@
  * Claude Code's own OAuth discovery against it.
  */
 
+import { isApiConnector } from './apiBroker';
 import { boxTokenFrom } from './githubBroker';
 import type { AuthzBox, AuthzDecision, BoxForToken } from './gatewayAuthz';
 import { McpConnectorError, parseUpstream, relinkMessage, renderHeaders, validateHeaderTemplates, type Secrets } from './mcpConnectors';
@@ -31,8 +32,6 @@ export interface McpAuthzRequest {
 
 export interface McpAuthzDeps {
   boxForToken: BoxForToken;
-  // mcp-broker-enabled for the box's owner and the box.
-  flagOn: (box: AuthzBox) => Promise<boolean>;
   // The connector by id, whoever owns it; never cached.
   connector: (id: string) => Promise<McpConnectorRecord | null>;
   secrets: (userId: string, connectorId: string) => Promise<Secrets>;
@@ -52,7 +51,7 @@ function deny(status: number, message: string, audit: string): AuthzDecision {
 const NOT_FOUND = 'No such MCP connector for this box\'s owner';
 
 /**
- * Order: the box token and a managed box, then the flag, then a connector the
+ * Order: the box token and a managed box, then a connector the
  * box's owner owns (404 for anyone else's, so its existence never shows),
  * then its headers. No secret or upstream header value reaches an audit line.
  */
@@ -63,13 +62,13 @@ export async function decideMcpRequest(req: McpAuthzRequest, deps: McpAuthzDeps)
   if (!box) return deny(403, 'Unknown or revoked box token', 'unknown box token');
   if (!box.managed) return deny(403, 'Only a termag-managed box can use the MCP broker', `instance=${box.instanceId} not a managed box`);
   const who = `user=${box.userId} instance=${box.instanceId}`;
-  if (!await deps.flagOn(box)) {
-    return deny(403, 'MCP connectors through termag are not enabled for you (feature flag mcp-broker-enabled)', `${who} flag off`);
-  }
   const id = CONNECTOR_PATH.exec(req.path)?.[1];
   if (!id) return deny(404, NOT_FOUND, `${who} no connector in path`);
   const connector = await deps.connector(id);
   if (!connector || connector.userId !== box.userId) return deny(404, NOT_FOUND, `${who} connector=${id} not found`);
+  // An api connector's token is for the API broker's allowlist only
+  // (services/apiBroker.ts), never for any path under its upstream.
+  if (isApiConnector(connector)) return deny(404, NOT_FOUND, `${who} connector=${id} is an API connector`);
   const relink = relinkMessage(connector.name, connector.id, deps.termagUrl);
   const at = `${who} connector=${id}`;
   let headers: Record<string, string>;

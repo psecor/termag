@@ -61,9 +61,10 @@ const aws = {
   roles: new Map<string, { inline: Set<string>; attached: Set<string> }>(),
   profiles: new Map<string, Set<string>>(),
   fail: new Map<string, string>(),   // command name -> error name it throws
-  before: new Map<string, () => void>(), // command name -> runs once, before it is handled
+  before: new Map<string, () => unknown>(), // command name -> runs (and is awaited) once, before it is handled
   refuseRun: null as ((input: any) => string | null) | null, // RunInstances input -> error name it throws
   runs: [] as { type: string; subnet: string }[],
+  named: new Map<string, string>(), // Name tag -> a live instance RunInstances made without termag hearing back
   sent: [] as string[],
   seq: 0,
 };
@@ -81,7 +82,7 @@ vi.mock('@aws-sdk/client-ec2', () => {
     async send(cmd: { name: string; input: any }) {
       aws.sent.push(cmd.name);
       const hook = aws.before.get(cmd.name);
-      if (hook) { aws.before.delete(cmd.name); hook(); }
+      if (hook) { aws.before.delete(cmd.name); await hook(); }
       const forced = aws.fail.get(cmd.name);
       if (forced) throw awsError(forced);
       const i = cmd.input;
@@ -95,6 +96,11 @@ vi.mock('@aws-sdk/client-ec2', () => {
           if (refused) throw awsError(refused);
           const id = `i-${++aws.seq}`; aws.instances.set(id, 'running'); return { Instances: [{ InstanceId: id }] }; }
         case 'DescribeInstances': {
+          if (i.Filters) {
+            const name = i.Filters.find((f: any) => f.Name === 'tag:Name').Values[0];
+            const id = aws.named.get(name);
+            return { Reservations: id ? [{ Instances: [{ InstanceId: id }] }] : [] };
+          }
           const state = aws.instances.get(i.InstanceIds[0]);
           if (!state) throw awsError('InvalidInstanceID.NotFound');
           return { Reservations: [{ Instances: [{ State: { Name: state }, PrivateDnsName: 'ip-10-0-0-1.internal' }] }] };
@@ -161,7 +167,7 @@ vi.mock('@aws-sdk/client-iam', () => {
   return mod;
 });
 
-const { terminateBox, sweepUncleanedTeardowns, provisionPoolBox, resetSubnetRotationForTests } = await import('./boxProvisioner');
+const { terminateBox, sweepUncleanedTeardowns, sweepFailedLaunches, provisionPoolBox, resetSubnetRotationForTests } = await import('./boxProvisioner');
 
 const PREFIX = 'termag-e2e-box';
 const ENV = {
@@ -210,7 +216,7 @@ beforeEach(() => {
   rows.clear();
   failUpdate = null;
   aws.instances.clear(); aws.sgs.clear(); aws.roles.clear(); aws.profiles.clear(); aws.fail.clear(); aws.before.clear();
-  aws.refuseRun = null; aws.runs = [];
+  aws.refuseRun = null; aws.runs = []; aws.named.clear();
   aws.sent = []; aws.seq = 0;
   resumed.length = 0;
   for (const k of Object.keys(process.env)) if (k.startsWith('BOX_') || k === 'HOST_SECURITY_GROUP_ID') delete process.env[k];
@@ -374,6 +380,129 @@ describe('sweepUncleanedTeardowns', () => {
     liveBox('a');
     delete process.env.AWS_REGION;
     expect(await sweepUncleanedTeardowns(NOW)).toBe(0);
+  });
+});
+
+describe('sweepFailedLaunches', () => {
+  const VCPU = 'VcpuLimitExceeded';
+  /** A pool launch RunInstances refused, made `minutes` before NOW: its SG, role and profile are left behind. */
+  const failedPoolLaunch = async (id: string, minutes = 120) => {
+    aws.fail.set('RunInstances', VCPU);
+    await provisionPoolBox({
+      instance: seed(id, { status: 'warming', userId: null, terminatedAt: null, region: null, createdAt: minutesAgo(minutes) }) as Instance,
+      token: 'tmag_test',
+      poolSpecHash: 'hash',
+    });
+    aws.fail.delete('RunInstances');
+    aws.sent = [];
+  };
+
+  it('gives back the SG, instance profile and role of a launch that never got an instance, and keeps the row failed', async () => {
+    await failedPoolLaunch('a');
+    expect(rows.get('a')).toMatchObject({ status: 'failed', securityGroupId: 'sg-1', iamRoleName: `${PREFIX}-a`, ec2InstanceId: null });
+    expect(aws.roles.size).toBe(1);
+
+    expect(await sweepFailedLaunches(NOW)).toBe(1);
+    awsIsEmpty();
+    expect(rows.get('a')).toMatchObject({ status: 'failed', cleanupAttemptedAt: NOW });
+    expect(rows.get('a')!.cleanedUpAt).toBeInstanceOf(Date);
+    expect(await sweepFailedLaunches(new Date(NOW.getTime() + 60 * 60_000))).toBe(0);
+  });
+
+  it('releases a failed box that has only its SG', async () => {
+    aws.sgs.add('sg-x');
+    seed('sg-only', { status: 'failed', terminatedAt: null, securityGroupId: 'sg-x' });
+    expect(await sweepFailedLaunches(NOW)).toBe(1);
+    awsIsEmpty();
+  });
+
+  it('skips a fresh failure, one with an instance, one with nothing to release, a live box, a released one and one just attempted', async () => {
+    await failedPoolLaunch('fresh', 2);
+    liveBox('with-instance', { status: 'failed', terminatedAt: null });
+    seed('nothing', { status: 'failed', terminatedAt: null });
+    liveBox('ready', { status: 'ready', terminatedAt: null, ec2InstanceId: null });
+    seed('released', { status: 'failed', terminatedAt: null, securityGroupId: 'sg-gone', cleanedUpAt: minutesAgo(30) });
+    seed('inflight', { status: 'failed', terminatedAt: null, securityGroupId: 'sg-gone', cleanupAttemptedAt: minutesAgo(3) });
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
+    expect(aws.sent).toEqual([]);
+  });
+
+  it('leaves the SG and role of a launch whose instance EC2 made after all, for an operator', async () => {
+    await failedPoolLaunch('a');
+    aws.named.set(`${PREFIX}-a`, 'i-unrecorded');
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
+    expect(aws.roles.has(`${PREFIX}-a`)).toBe(true);
+    expect(aws.sgs.has('sg-1')).toBe(true);
+    expect(rows.get('a')!.cleanedUpAt).toBeNull();
+  });
+
+  it('releases nothing when EC2 cannot say whether an instance was made after all', async () => {
+    await failedPoolLaunch('a');
+    aws.fail.set('DescribeInstances', 'Throttling');
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
+    expect(aws.sent).toEqual(['DescribeInstances']);
+    expect(aws.roles.has(`${PREFIX}-a`)).toBe(true);
+    expect(rows.get('a')!.cleanedUpAt).toBeNull();
+    aws.fail.clear();
+    expect(await sweepFailedLaunches(new Date(NOW.getTime() + 11 * 60_000))).toBe(1);
+    awsIsEmpty();
+  });
+
+  it('retries a release that did not finish once the window has passed', async () => {
+    await failedPoolLaunch('a');
+    aws.fail.set('DeleteRole', 'Throttling');
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
+    expect(rows.get('a')!.cleanedUpAt).toBeNull();
+    aws.fail.clear();
+    expect(await sweepFailedLaunches(new Date(NOW.getTime() + 5 * 60_000))).toBe(0);
+    expect(await sweepFailedLaunches(new Date(NOW.getTime() + 11 * 60_000))).toBe(1);
+    awsIsEmpty();
+  });
+
+  it('waits an hour after a launch began, past the stuck sweep failing a row whose launch is still waiting on AWS', async () => {
+    await failedPoolLaunch('a', 30);
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
+    expect(await sweepFailedLaunches(new Date(NOW.getTime() + 31 * 60_000))).toBe(1);
+  });
+
+  it('never releases a launch still running in this process', async () => {
+    let midLaunch = -1;
+    aws.before.set('RunInstances', async () => {
+      rows.get('a')!.status = 'failed'; // the stuck sweep, while RunInstances is still out
+      midLaunch = await sweepFailedLaunches(NOW);
+    });
+    aws.fail.set('RunInstances', VCPU);
+    await provisionPoolBox({
+      instance: seed('a', { status: 'warming', userId: null, terminatedAt: null, region: null }) as Instance,
+      token: 'tmag_test',
+      poolSpecHash: 'hash',
+    });
+    expect(midLaunch).toBe(0);
+    expect(aws.roles.has(`${PREFIX}-a`)).toBe(true);
+    aws.fail.clear();
+    expect(await sweepFailedLaunches(NOW)).toBe(1);
+    awsIsEmpty();
+  });
+
+  it('takes a few per tick', async () => {
+    for (let n = 0; n < 4; n++) { aws.sgs.add(`sg-${n}`); seed(`b${n}`, { status: 'failed', terminatedAt: null, securityGroupId: `sg-${n}` }); }
+    expect(await sweepFailedLaunches(NOW, 3)).toBe(3);
+    expect(aws.sgs.size).toBe(1);
+  });
+
+  it('lets the owner remove a released box, and its teardown still finishes', async () => {
+    await failedPoolLaunch('a');
+    await sweepFailedLaunches(NOW);
+    const row = rows.get('a')!;
+    row.status = 'terminated';
+    expect(await terminateBox({ ...row } as Instance)).toBe(true);
+    expect(rows.get('a')!.cleanedUpAt.getTime()).toBeGreaterThan(NOW.getTime() - 1);
+  });
+
+  it('does nothing when box provisioning is not configured', async () => {
+    await failedPoolLaunch('a');
+    delete process.env.AWS_REGION;
+    expect(await sweepFailedLaunches(NOW)).toBe(0);
   });
 });
 

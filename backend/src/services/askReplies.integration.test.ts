@@ -40,7 +40,7 @@ const ada = { id: 'u-ada', unixUsername: 'ada', displayName: 'Ada', googleEmail:
 const bob = { id: 'u-bob', unixUsername: 'bob', displayName: 'Bob', googleEmail: 'bob@example.com' };
 const result = (text: string) => ({
   result: text, sessionId: null, isError: false, numTurns: 2, exitReason: null, baseSha: null, repo: null,
-  bundle: false, prDescription: null, prDescriptions: {}, pushes: null,
+  bundle: false, prDescription: null, prDescriptions: {}, pushes: null, unpushed: [],
 });
 
 describe.skipIf(!adminUrl)('stored ask replies against Postgres', () => {

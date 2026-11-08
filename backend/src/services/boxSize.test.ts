@@ -19,8 +19,9 @@ vi.mock('./featureFlags', () => {
 const {
   BOX_SIZES, boxSizeOptions, boxSizeSpec, decideBoxSize, instanceTypesForSize, isBoxSize,
   largestBoxSize, ownerDefaultSize, poolDefaultSize, repoKey, sizeFromFlag,
+  coveringPreset,
 } = await import('./boxSize');
-const { POOL_FLAG_CONTEXT } = await import('./boxHibernationFlag');
+const { POOL_FLAG_CONTEXT } = await import('./poolLdContext');
 
 beforeEach(() => {
   flag.fallthrough = '';
@@ -196,5 +197,15 @@ describe('what the pickers are told', () => {
         { size: 'large', vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
       ],
     });
+  });
+});
+
+describe('coveringPreset', () => {
+  it('is the smallest preset with at least the vCPUs and the memory, else large', () => {
+    expect(coveringPreset({ vcpu: 2, memoryGiB: 8 })).toBe('small');
+    expect(coveringPreset({ vcpu: 4, memoryGiB: 16 })).toBe('medium');
+    expect(coveringPreset({ vcpu: 4, memoryGiB: 32 })).toBe('large');
+    expect(coveringPreset({ vcpu: 1, memoryGiB: 12 })).toBe('medium');
+    expect(coveringPreset({ vcpu: 16, memoryGiB: 64 })).toBe('large');
   });
 });

@@ -13,6 +13,11 @@
  *             goes back to the type it had
  *   ready     its agent reconnected (the connect that settles `starting`)
  *
+ * Before any of it, a box whose disk is growing (services/boxDisk.ts; the
+ * owner's dialog asks for the disk first when both change) waits in `disk`
+ * until the grow has finished, so the stop never cuts off the agent's file
+ * system step.
+ *
  * A box that was stopped or hibernated is retyped and left `stopped`. The
  * stops and starts go through requestPower (boxPower.ts) with `forResize`,
  * which every other power request is refused against while the lock holds,
@@ -40,6 +45,7 @@ import { powerTimeoutsFromEnv } from './boxPowerPolicy';
 import { boxEventDimensions } from './boxPowerEvents';
 import { boxInUseFields } from './boxActivity';
 import { boxSizeSpec, BOX_SIZES, type BoxSize } from './boxSize';
+import { diskGrowBusy } from './boxDiskBusy';
 import {
   blockedRefusal,
   boxRefusal,
@@ -97,6 +103,10 @@ export interface ResizeEffects {
    * (ready, starting), and wait for that; false when it was already down.
    */
   stopIfUp(): Promise<boolean>;
+  /** Whether the box's disk is growing now, in this process or another (boxDiskBusy.ts); absent: never. */
+  diskGrowing?(): boolean | Promise<boolean>;
+  /** Wait until that grow has finished, however it ends. */
+  waitDiskGrow?(): Promise<void>;
 }
 
 export interface ResizeOutcome {
@@ -135,6 +145,10 @@ export async function runResize(plan: ResizePlan, fx: ResizeEffects): Promise<Re
     const candidates = await fx.offered(plan.types, described.zone);
     if (candidates.length === 0) {
       return done({ outcome: 'failed', error: `None of ${plan.to}'s types (${plan.types.join(', ')}) is both within the resize cap and offered in ${described.zone ?? 'the box\'s zone'}` });
+    }
+    if (fx.diskGrowing && fx.waitDiskGrow && await fx.diskGrowing()) {
+      await fx.phase('disk');
+      await fx.waitDiskGrow();
     }
     if (plan.fromStatus === 'hibernated') {
       await fx.phase('resuming');
@@ -263,7 +277,10 @@ function tell(box: Pick<Instance, 'id' | 'userId'>, actorId: string, view: Resiz
   if (box.userId) notifyWorkspaceChange(box.userId, 'boxes');
 }
 
-export function prismaResizeEffects(box: Instance, actorId: string, eventId: string): ResizeEffects {
+/** How long a resize waits for the box's disk to finish growing before it fails, leaving the box up. */
+const DISK_WAIT_MS = 30 * 60_000;
+
+export function prismaResizeEffects(box: Instance, actorId: string, eventId: string, opts: { pollMs?: number } = {}): ResizeEffects {
   const timeouts = powerTimeoutsFromEnv();
   const ec2 = ec2For(box);
   const id = box.id;
@@ -320,6 +337,19 @@ export function prismaResizeEffects(box: Instance, actorId: string, eventId: str
     },
     async waitReady() {
       await waitFor(id, 'The start', s => s === 'ready', s => s === 'stopped' || s === 'failed', timeouts.startMs);
+    },
+    diskGrowing: () => diskGrowBusy(id),
+    async waitDiskGrow() {
+      // Until no grow holds the box, this process's or another's (its open disk-grow row); at the limit the
+      // resize fails before anything is stopped.
+      const deadline = Date.now() + DISK_WAIT_MS;
+      while (await diskGrowBusy(id)) {
+        if (Date.now() >= deadline) {
+          throw new Error(`The disk is still growing after ${DISK_WAIT_MS / 60_000} minutes; the box was not stopped. Resize again once it has grown.`);
+        }
+        await sleep(opts.pollMs ?? POLL_MS);
+      }
+      console.log(`[RESIZE] ${box.name}: its disk grow has ended; resizing now`);
     },
     async stopIfUp() {
       const now = await row(id);
@@ -428,6 +458,9 @@ export async function startResize(
     return { ok: false, status: 503, body: { error: RESIZE_NOT_PERMITTED_ERROR, code: 'resize_not_permitted' } };
   }
 
+  // A grow running here or in another process: the job waits for it first, and the row says so from the start.
+  const diskGrowing = await diskGrowBusy(box.id);
+
   // The lock: a new `resize` row in box_events, taken with the box's row
   // locked (FOR UPDATE), so two requests for one box line up and the second
   // finds the first's open row. The box must still be in the status the
@@ -442,7 +475,8 @@ export async function startResize(
     }
     const event = await createBoxEvent({
       box, kind: 'resize', actorId: actor.userId, actorRole: actor.role, reason: actor.reason, from: box.size, to,
-      detail: { fromStatus: box.status, fromType: box.instanceType, via: actor.via, forced: opts.force === true },
+      // withDisk: the disk is growing, so the job waits for it first (runResize), and the views say so from the start.
+      detail: { fromStatus: box.status, fromType: box.instanceType, via: actor.via, forced: opts.force === true, ...(diskGrowing ? { withDisk: true } : {}) },
       startedAt: new Date(nowMs),
     }, tx);
     // The owner resizing a running box is using it: the idle clock restarts

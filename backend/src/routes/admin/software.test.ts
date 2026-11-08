@@ -45,7 +45,7 @@ describe('the Claude Code update routes', () => {
     expect((await call('POST /software/hosts/:hostKey/update', { params: { hostKey: 'box-a' }, body: { component: 'claude', restart: 'now' } })).statusCode).toBe(400);
     const unknown = await call('POST /software/hosts/:hostKey/update', { params: { hostKey: 'box-a' }, body: { component: 'nope', restart: 'idle' } });
     expect([unknown.statusCode, unknown.body.code]).toEqual([400, 'unknown_component']);
-    expect((await call('GET /software/updates', { query: { component: 'python' } })).body.code).toBe('unknown_component');
+    expect((await call('GET /software/updates', { query: { component: 'rust' } })).body.code).toBe('unknown_component');
     expect((await call('POST /software/update', { body: { component: 'claude', scope: 'some', restart: 'idle' } })).statusCode).toBe(400);
     expect(requestHostUpdate).not.toHaveBeenCalled();
     expect(requestFleetUpdate).not.toHaveBeenCalled();

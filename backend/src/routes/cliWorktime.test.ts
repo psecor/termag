@@ -42,11 +42,9 @@ const store: CliStore = {
 
 let calls: Array<[string, string, number]>;
 let zones: unknown[];
-let enabledFor: Set<string>;
 let fail: boolean;
 
 const worktime: CliWorktime = {
-  enabled: async user => enabledFor.has(user.id),
   days: async (user, days, tz) => {
     calls.push(['days', user.id, days]);
     zones.push(tz);
@@ -70,7 +68,6 @@ afterAll(() => new Promise<void>(r => server.close(() => r())));
 beforeEach(() => {
   calls = [];
   zones = [];
-  enabledFor = new Set(['alice', 'bob']);
   fail = false;
 });
 
@@ -121,12 +118,8 @@ describe('/api/cli/v1/worktime', () => {
     expect(calls).toEqual([]);
   });
 
-  it('answers 404 with desktop-app-enabled off for the person, and 401 without a sign-in', async () => {
-    enabledFor.delete('bob');
-    const off = await get('/worktime', DEVICE.bob);
-    expect(off.status).toBe(404);
-    expect(await off.json()).toMatchObject({ code: 'not_found' });
+  it('answers 401 without a sign-in', async () => {
     expect((await get('/worktime', null)).status).toBe(401);
-    expect(calls).toEqual([]);
   });
+
 });

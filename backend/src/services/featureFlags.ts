@@ -155,3 +155,70 @@ export async function stringVariation(key: StringFlagKey, _user: FlagUser, fallb
 export function flagsForBrowser(): FlagValues {
   return { ...values };
 }
+
+/**
+ * boolVariation, for a caller that has to tell an off from a flag source that
+ * could not answer. The env-backed source always answers, so this never
+ * returns null; a targeting source would return null when its evaluation fails.
+ */
+export async function boolVariationOrUnknown(key: BoolFlagKey, user: FlagUser, fallback: boolean, box?: FlagBox | null): Promise<boolean | null> {
+  return boolVariation(key, user, fallback, box);
+}
+
+/** jsonVariation, as boolVariationOrUnknown: never null with the env-backed source. The caller validates the shape. */
+export async function jsonVariationOrUnknown(key: JsonFlagKey, user: FlagUser, fallback: unknown, box?: FlagBox | null): Promise<{ value: unknown } | null> {
+  return { value: await jsonVariation(key, user, fallback, box) };
+}
+
+/**
+ * Whether a flag read now is the flag source's answer. The env-backed source
+ * has its values from the start, so always true.
+ */
+export function flagsInitialized(): boolean {
+  return true;
+}
+
+/**
+ * Calls `listener` when one of `keys` changes. TERMAG_FLAGS is read once at
+ * startup, so with the env-backed source it never fires; a caller that
+ * re-reads on update stays correct.
+ */
+export function onFlagUpdate(_keys: readonly string[], _listener: () => void): void {}
+
+/** Calls `listener` once the flag source has its values: at once, since the env-backed source always has them. */
+export function onFlagsReady(listener: () => void): void {
+  queueMicrotask(listener);
+}
+
+// The Slack workspace a Slack event came from or the bot posts into: its team
+// id (T…), and the Enterprise Grid org (E…) it belongs to, if any.
+export interface FlagSlackWorkspace {
+  teamId: string;
+  enterpriseId?: string | null;
+  name?: string | null;
+}
+
+const SLACK_WORKSPACE_ID = /^T[A-Z0-9]{2,20}$/;
+const SLACK_ORG_ID = /^E[A-Z0-9]{2,20}$/;
+
+/**
+ * The context for a flag read on behalf of the orchestrator in one Slack
+ * workspace: the `service` context, upgraded to a `multi` context with a
+ * `slack-workspace` (keyed by team id, with `name` and `enterpriseId`) and, on
+ * Enterprise Grid, a `slack-org`, so a targeting source could target a
+ * workspace or a whole org. An id not in Slack's shape is left out. The
+ * env-backed source ignores it.
+ */
+export function serviceSlackFlagContext(version: string | null, environment: string, workspace: FlagSlackWorkspace | null): FlagContext {
+  const service = { key: 'termag-orchestrator', ...(version && { version }), environment };
+  const teamId = workspace && SLACK_WORKSPACE_ID.test(workspace.teamId) ? workspace.teamId : null;
+  const orgId = workspace?.enterpriseId && SLACK_ORG_ID.test(workspace.enterpriseId) ? workspace.enterpriseId : null;
+  if (!teamId && !orgId) return { kind: 'service', ...service };
+  // A multi context has no key of its own: each kind in it carries one.
+  return {
+    kind: 'multi',
+    service,
+    ...(teamId && { 'slack-workspace': { key: teamId, ...(workspace?.name && { name: workspace.name }), ...(orgId && { enterpriseId: orgId }) } }),
+    ...(orgId && { 'slack-org': { key: orgId } }),
+  } as unknown as FlagContext;
+}

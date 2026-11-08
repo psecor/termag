@@ -23,13 +23,13 @@
  * changes until the flag is on for someone.
  *
  * The warm pool holds some of each size while the flag serves a size for the
- * pool's fixed context (boxHibernationFlag.POOL_FLAG_CONTEXT); how many of each
+ * pool's fixed context (poolLdContext.POOL_FLAG_CONTEXT); how many of each
  * is box-warm-pool-sizes (warmPoolSizes.ts). Each size has its own pool spec
  * hash, so a claim can only take a box of the size it asked for, and a size
  * the pool holds none of launches cold.
  */
 import type { InstanceTypeChoice } from './boxProvisioner';
-import { POOL_FLAG_CONTEXT } from './boxHibernationFlag';
+import { POOL_FLAG_CONTEXT } from './poolLdContext';
 import { stringVariation, stringVariationForContext } from './featureFlags';
 import type { FlagUser } from './featureFlags';
 import { parseRepoUrl } from './projectTemplates';
@@ -85,6 +85,15 @@ export function boxSizeSpec(size: BoxSize, env: NodeJS.ProcessEnv = process.env)
     console.warn(`[BOX] ${key}: ignoring non-arm64 type(s) ${listed.filter(t => !arm64.includes(t)).join(', ')}`);
   }
   return { size, ...SHAPES[size], types: arm64.length ? arm64 : DEFAULT_TYPES[size] };
+}
+
+/**
+ * The smallest preset at least as big as `r` in both vCPUs and memory, else
+ * large: what a Retry of a requirements box launches when EC2 can't match
+ * them again, so the replacement is never smaller than the box it replaces.
+ */
+export function coveringPreset(r: BoxRequirements): BoxSize {
+  return BOX_SIZES.find(s => SHAPES[s].vcpus >= r.vcpu && SHAPES[s].memoryGiB >= r.memoryGiB) ?? 'large';
 }
 
 /** What a launch of `size` walks; undefined (the configured BOX_INSTANCE_TYPE) for no size. */

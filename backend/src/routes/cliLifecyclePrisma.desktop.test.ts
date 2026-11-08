@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { CliUser } from '../services/cliStore';
 
+const mainModel = vi.hoisted(() => ({ value: null as string | null }));
+const askModelOn = vi.hoisted(() => ({ value: true }));
+vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async (key: string) => key === 'ask-model-choice-enabled' && askModelOn.value) }));
 const instances = new Map<string, { id: string; name: string; kind: string; userId: string }>();
 const projects = new Map<string, { instanceId: string | null; userId: string; boxStatus?: string }>();
 vi.mock('../db', () => ({
   prisma: {
     user: { findUnique: async ({ where }: { where: { id: string } }) => ({ id: where.id, googleEmail: `${where.id}@x`, displayName: where.id, unixUsername: where.id, defaultAgentProvider: 'claude' }) },
     instance: {
+      findUnique: async ({ where }: { where: { id: string } }) => ({ id: where.id, name: where.id, kind: 'ec2' }),
       findFirst: async ({ where }: { where: { id: string; userId: string } }) => {
         const row = instances.get(where.id);
         return row && row.userId === where.userId ? { id: row.id, name: row.name, kind: row.kind } : null;
@@ -21,13 +25,11 @@ vi.mock('../db', () => ({
       },
     },
     workstream: { findFirst: async () => ({ id: 'ws1' }) },
+    // The main workstream's agent row, as the create left it (an un-archive keeps the old one).
+    workflow: { findFirst: async () => ({ model: mainModel.value }) },
   },
 }));
-const flag = vi.hoisted(() => ({ on: false, asked: [] as string[] }));
-vi.mock('../services/desktopAppFlag', () => ({
-  T3_CAPABILITY: 't3-v1',
-  desktopAppEnabled: async (_user: unknown, box: { id: string }) => { flag.asked.push(box.id); return flag.on; },
-}));
+vi.mock('../services/desktopAppFlag', () => ({ T3_CAPABILITY: 't3-v1' }));
 const calls = vi.hoisted(() => [] as string[]);
 vi.mock('./instances', () => ({
   createBox: vi.fn(), renameOwnedBox: vi.fn(), setOwnedBoxLifecycle: vi.fn(), terminateOwnedBox: vi.fn(),
@@ -63,8 +65,6 @@ const { prismaCliLifecycle } = await import('./cliLifecyclePrisma');
 const alice: CliUser = { id: 'alice', googleEmail: 'alice@x', unixUsername: 'alice', displayName: 'alice' };
 
 beforeEach(() => {
-  flag.on = false;
-  flag.asked = [];
   calls.length = 0;
   workstreamInputs.length = 0;
   createProjectFor.mockClear();
@@ -75,37 +75,20 @@ beforeEach(() => {
   projects.set('local', { instanceId: null, userId: 'alice' });
 });
 
-describe('the desktop-only CLI routes (workstreams, hibernate), behind desktop-app-enabled', () => {
-  it('answer 404 not_found while the flag is off, and do nothing', async () => {
-    const results = await Promise.all([
-      prismaCliLifecycle.createWorkstream(alice, 'p1', { name: 'feat' }),
-      prismaCliLifecycle.removeWorkstream(alice, 'p1', 'feat', { force: false, keepBranch: true }),
-      prismaCliLifecycle.powerBox(alice, 'b1', 'hibernate'),
-    ]);
-    for (const r of results) expect(r).toMatchObject({ status: 404, body: { code: 'not_found' } });
-    expect(calls).toEqual([]);
-    expect(flag.asked).toEqual(['b1', 'b1', 'b1']);
-  });
-
+describe('the desktop-only CLI routes (workstreams, hibernate)', () => {
   it('leave clone retry ungated: `termag ask --new-box` retries a project whose box failed to launch (Bugbot, #883)', async () => {
     expect((await prismaCliLifecycle.retryClone(alice, 'p1')).status).toBe(202);
     expect(calls).toEqual(['retryClone']);
-    expect(flag.asked).toEqual([]);
   });
 
-  it('go through once the flag is on for the box', async () => {
-    flag.on = true;
+  it('go through for the caller\'s box', async () => {
     expect((await prismaCliLifecycle.powerBox(alice, 'b1', 'hibernate')).status).toBe(202);
     await prismaCliLifecycle.removeWorkstream(alice, 'p1', 'feat', { force: false, keepBranch: true });
     expect(calls).toEqual(['power:hibernate', 'removeWorkstream']);
   });
 
   it('refuse a project with no box, and a box that is not the caller\'s', async () => {
-    flag.on = true;
     expect(await prismaCliLifecycle.retryClone(alice, 'local')).toMatchObject({ status: 404, body: { code: 'not_found' } });
-    flag.on = false;
-    expect(await prismaCliLifecycle.retryClone(alice, 'local')).toMatchObject({ status: 404, body: { code: 'not_found' } });
-    flag.on = true;
     const bob: CliUser = { ...alice, id: 'bob' };
     expect(await prismaCliLifecycle.retryClone(bob, 'p1')).toMatchObject({ status: 404, body: { code: 'not_found' } });
     expect(await prismaCliLifecycle.powerBox(bob, 'b1', 'hibernate')).toMatchObject({ status: 404, body: { code: 'not_found' } });
@@ -113,7 +96,6 @@ describe('the desktop-only CLI routes (workstreams, hibernate), behind desktop-a
   });
 
   it('refuse a parked box with 409, as the cookie routes do, before touching the worktree', async () => {
-    flag.on = true;
     for (const boxStatus of ['stopped', 'hibernating']) {
       projects.set('p1', { instanceId: 'b1', userId: 'alice', boxStatus });
       expect(await prismaCliLifecycle.removeWorkstream(alice, 'p1', 'feat', { force: false, keepBranch: true }))
@@ -123,11 +105,10 @@ describe('the desktop-only CLI routes (workstreams, hibernate), behind desktop-a
     expect(calls).toEqual([]);
   });
 
-  it('never ask the flag for start and stop', async () => {
+  it('let start and stop through', async () => {
     await prismaCliLifecycle.powerBox(alice, 'b1', 'start');
     await prismaCliLifecycle.powerBox(alice, 'b1', 'stop');
     expect(calls).toEqual(['power:start', 'power:stop']);
-    expect(flag.asked).toEqual([]);
   });
 });
 
@@ -180,7 +161,6 @@ describe('project create from several repositories', () => {
 
 describe('New session\'s space on a create (services/chatSpace.ts)', () => {
   it('fixes a workstream\'s space by name, No space for null, and leaves one alice can\'t use to the box', async () => {
-    flag.on = true;
     await prismaCliLifecycle.createWorkstream(alice, 'p1', { name: 'a', chatSpace: 'team' });
     await prismaCliLifecycle.createWorkstream(alice, 'p1', { name: 'b', chatSpace: null });
     await prismaCliLifecycle.createWorkstream(alice, 'p1', { name: 'c', chatSpace: 'not-hers' });
@@ -199,5 +179,38 @@ describe('New session\'s space on a create (services/chatSpace.ts)', () => {
     await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'fix', agent: 'claude-chat' });
     const spaces = createProjectFor.mock.calls.map(call => (call as unknown as [unknown, { chatSpace?: unknown }])[1]);
     expect(spaces.map(input => ('chatSpace' in input ? input.chatSpace : 'absent'))).toEqual(['team', null, 'absent']);
+  });
+});
+
+describe('project create --model', () => {
+  it('answers the model the main workstream really has: the one asked for, or an un-archived project\'s own', async () => {
+    vi.mocked(createProjectFor).mockResolvedValue({ status: 201, body: { id: 'p-new' } } as never);
+    mainModel.value = 'opus';
+    const made = await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'fix', agent: 'claude', model: 'opus' });
+    expect(vi.mocked(createProjectFor).mock.calls.at(-1)?.[1]).toMatchObject({ initialAgent: { provider: 'claude', model: 'opus' } });
+    expect(made).toMatchObject({ status: 201, body: { model: 'opus', restored: false } });
+    // Un-archived: it keeps its agent row (haiku), as it keeps its directory against `from`.
+    vi.mocked(createProjectFor).mockResolvedValue({ status: 200, body: { id: 'p-old', restored: true } } as never);
+    mainModel.value = 'haiku';
+    const restored = await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'old', agent: 'claude', model: 'opus' });
+    expect(restored).toMatchObject({ body: { model: 'haiku', restored: true } });
+    mainModel.value = null;
+    expect(await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'old', agent: 'claude', model: 'opus' })).toMatchObject({ body: { model: null } });
+    // Off for the creator and box: not applied, and the answer says why.
+    askModelOn.value = false;
+    vi.mocked(createProjectFor).mockResolvedValue({ status: 201, body: { id: 'p-new' } } as never);
+    mainModel.value = null;
+    const off = await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'off', agent: 'claude', model: 'opus' });
+    expect((vi.mocked(createProjectFor).mock.calls.at(-1)?.[1] as { initialAgent: object }).initialAgent).not.toHaveProperty('model');
+    expect(off).toMatchObject({ body: { model: null, modelIgnored: expect.stringContaining('ask-model-choice-enabled') } });
+    // Off and restored: it keeps its own model (haiku), and the answer says that, not "the default".
+    vi.mocked(createProjectFor).mockResolvedValue({ status: 200, body: { id: 'p-old', restored: true } } as never);
+    mainModel.value = 'haiku';
+    const offRestored = await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'old', agent: 'claude', model: 'opus' });
+    expect(offRestored).toMatchObject({ body: { model: 'haiku', restored: true } });
+    expect(offRestored.body).not.toHaveProperty('modelIgnored');
+    askModelOn.value = true;
+    // Without --model the answer names none, as before.
+    expect((await prismaCliLifecycle.createProject(alice, { boxId: 'b1', name: 'old', agent: 'claude' })).body).not.toHaveProperty('model');
   });
 });

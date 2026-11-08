@@ -41,11 +41,9 @@ const store: CliStore = {
 };
 
 let calls: Array<[string, Record<string, unknown>, string]>;
-let enabledFor: Set<string>;
 let answer: { status: number; body: unknown };
 
 const sessionSearch: CliSessionSearch = {
-  enabled: async user => enabledFor.has(user.id),
   search: async (user, query, callerId) => {
     calls.push([user.id, { ...query }, callerId]);
     return answer;
@@ -65,7 +63,6 @@ beforeAll(async () => {
 afterAll(() => new Promise<void>(r => server.close(() => r())));
 beforeEach(() => {
   calls = [];
-  enabledFor = new Set(['alice', 'bob']);
   answer = { status: 200, body: { query: 'npm test', hits: [], panes: 3 } };
 });
 
@@ -99,12 +96,8 @@ describe('/api/cli/v1/sessions/search', () => {
     expect(calls).toEqual([]);
   });
 
-  it('answers 404 with desktop-app-enabled off for the person, and 401 without a sign-in', async () => {
-    enabledFor.delete('bob');
-    const off = await get('/sessions/search?q=npm', DEVICE.bob);
-    expect(off.status).toBe(404);
-    expect(await off.json()).toMatchObject({ code: 'not_found' });
+  it('answers 401 without a sign-in', async () => {
     expect((await get('/sessions/search?q=npm', null)).status).toBe(401);
-    expect(calls).toEqual([]);
   });
+
 });

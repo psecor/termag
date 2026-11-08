@@ -11,7 +11,6 @@ const h = vi.hoisted(() => ({
   moved: [] as unknown[],
   resumes: [] as unknown[],
   createBox: vi.fn(async () => ({ status: 201, body: { instance: { id: 'box-new', name: 'box-1' } } })),
-  flags: { 'chat-resume-new-box-enabled': true, 'chat-transcripts-enabled': true } as Record<string, boolean>,
   others: [] as Array<{ id: string; name: string }>,
 }));
 
@@ -46,7 +45,7 @@ vi.mock('./chatTranscriptStore', () => ({
   storedRawOf: vi.fn(async () => h.raw),
   storedRawChunks: vi.fn(),
 }));
-vi.mock('./featureFlags', () => ({ boolVariation: async (key: string) => h.flags[key] === true }));
+vi.mock('./featureFlags', () => ({ boolVariation: async () => false }));
 vi.mock('./agentRegistry', () => ({ instanceAgentTransport: () => null, onBoxAgentHello: () => () => {}, sendToInstanceAgent: vi.fn() }));
 vi.mock('../routes/instances', () => ({ createBox: h.createBox }));
 const locks = vi.hoisted(() => ({ rows: new Map<string, { token: string; at: number }>(), n: 0 }));
@@ -94,7 +93,7 @@ function projectOn(box: { id: string; name: string; status: string; kind: string
 }
 
 describe('newBoxOffer', () => {
-  const base = { flagOn: true, isOwner: true, ask: false, complete: true };
+  const base = { isOwner: true, ask: false, complete: true };
   it('a terminated box (or none) offers a new box to the owner', () => {
     expect(newBoxOffer({ ...base, box: { id: 'b', status: 'terminated', kind: 'ec2' } })).toEqual({ offer: 'new-box' });
     expect(newBoxOffer({ ...base, box: null })).toEqual({ offer: 'new-box' });
@@ -123,8 +122,7 @@ describe('newBoxOffer', () => {
     expect(newBoxOffer({ ...base, complete: false, box: null })).toMatchObject({ offer: null, code: 'incomplete' });
     expect(newBoxOffer({ ...base, box: { id: 'b', status: 'terminated', kind: 'external' } })).toMatchObject({ offer: null, code: 'self-managed' });
   });
-  it('flag off or an ask\'s chat: nothing changes', () => {
-    expect(newBoxOffer({ ...base, flagOn: false, box: null })).toBeNull();
+  it('an ask\'s chat: nothing changes', () => {
     expect(newBoxOffer({ ...base, ask: true, box: null })).toBeNull();
   });
 });
@@ -188,7 +186,6 @@ describe('continueOnNewBoxFor', () => {
     locks.rows.clear();
     h.createBox.mockImplementation(async () => ({ status: 201, body: { instance: { id: 'box-new', name: 'box-1' } } }));
     h.raw = { sessionId: SESSION, rawBytes: 100, complete: true, ranges: [{ byteStart: 0, byteEnd: 100 }] };
-    h.flags = { 'chat-resume-new-box-enabled': true, 'chat-transcripts-enabled': true };
     spaces.added = [];
     spaces.grantedTo = [];
     spaces.roles = new Map();
@@ -341,13 +338,10 @@ describe('continueOnNewBoxFor', () => {
     expect(h.moved).toEqual([]);
   });
 
-  it('refuses an incomplete stored session, and does nothing with the flag off', async () => {
+  it('refuses an incomplete stored session', async () => {
     h.project = projectOn({ id: 'box-old', name: 'box-1', status: 'terminated', kind: 'ec2' });
     h.raw = { ...h.raw!, complete: false };
     expect(await continueOnNewBoxFor(asUser(owner.id), 'p1', 'main')).toMatchObject({ status: 409, body: { code: 'incomplete' } });
-    h.raw = { ...h.raw!, complete: true };
-    h.flags['chat-resume-new-box-enabled'] = false;
-    expect(await continueOnNewBoxFor(asUser(owner.id), 'p1', 'main')).toMatchObject({ status: 404, body: { code: 'resume-off' } });
     expect(h.createBox).not.toHaveBeenCalled();
   });
 });

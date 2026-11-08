@@ -34,15 +34,17 @@ vi.mock('../../db', () => {
   prisma.$transaction = vi.fn(async (fn: (tx: any) => Promise<unknown>) => fn({ ...prisma, $executeRaw: vi.fn(async () => 0) }));
   return { prisma };
 });
-const flags: Record<string, boolean> = {};
-// The orchestrator host's inventoried claude, and orchestrator-claude-update-policy's value (undefined: the flag is missing).
+// The orchestrator host's inventoried claude, orchestrator-claude-update-policy's value (undefined: the flag
+// serves nothing), and claude-code-update-policy's mode (for the admin and for the orchestrator alone).
 const hostVersion = vi.hoisted(() => ({ v: '2.1.308' }));
-const orchPolicy = vi.hoisted(() => ({ value: { target: '2.1.316' } as unknown }));
+const orchPolicy = vi.hoisted(() => ({ value: { mode: 'auto', target: '2.1.316' } as unknown }));
+const toolMode = vi.hoisted(() => ({ mode: 'auto' as unknown }));
+// boolVariation and boolVariationForContext are there only to show they are never called: no on/off flag is read.
 vi.mock('../featureFlags', () => ({
-  boolVariation: vi.fn(async (key: string) => flags[key] ?? false),
-  boolVariationForContext: vi.fn(async (key: string) => flags[key] ?? false),
-  jsonVariation: vi.fn(async () => ({ floor: '2.1.310', target: 'latest' })),
-  jsonVariationForContext: vi.fn(async (key: string) => (key === 'orchestrator-claude-update-policy' ? orchPolicy.value ?? null : { floor: '2.1.310', target: 'latest' })),
+  boolVariation: vi.fn(async () => true),
+  boolVariationForContext: vi.fn(async () => true),
+  jsonVariation: vi.fn(async () => ({ mode: toolMode.mode, floor: '2.1.310', target: 'latest' })),
+  jsonVariationForContext: vi.fn(async (key: string) => (key === 'orchestrator-claude-update-policy' ? orchPolicy.value ?? null : { mode: toolMode.mode, floor: '2.1.310', target: 'latest' })),
 }));
 vi.mock('../software/collector', () => ({ selfInventory: vi.fn(async () => {}) }));
 // The image's helper and unit: present unless a test says not.
@@ -91,7 +93,8 @@ const sudoCalls = () => vi.mocked(execFile).mock.calls.map(c => [c[0], c[1]]);
 
 beforeEach(() => {
   hostVersion.v = '2.1.308';
-  orchPolicy.value = { target: '2.1.316' };
+  orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+  toolMode.mode = 'auto';
   rows.clear();
   orch.resetOrchestratorRecordsForTest();
   dir = mkdtempSync(path.join(tmpdir(), 'orch-claude-'));
@@ -99,28 +102,30 @@ beforeEach(() => {
   process.env.ORCHESTRATOR_CLAUDE_UPDATE_DIR = dir;
   installed = true;
   sudoAnswer = { code: 0, stderr: '' };
-  flags['claude-code-update-enabled'] = true;
-  flags['orchestrator-claude-update-enabled'] = true;
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => {
+  expect(boolVariation).not.toHaveBeenCalled();
+  expect(boolVariationForContext).not.toHaveBeenCalled();
   vi.clearAllMocks();
   rmSync(dir, { recursive: true, force: true });
   delete process.env.ORCHESTRATOR_CLAUDE_UPDATE_DIR;
 });
 
 describe('the flag gate', () => {
-  it('is off unless both flags are on, read for the admin and the orchestrator', async () => {
-    flags['orchestrator-claude-update-enabled'] = false;
+  it('is off unless both modes are on, read for the admin and the orchestrator', async () => {
+    const { jsonVariation } = await import('../featureFlags');
+    orchPolicy.value = { mode: 'off', target: '2.1.316' };
     expect(await updatePreview(claude, 'orchestrator', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
     expect(await requestHostUpdate(claude, 'orchestrator', 'none', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
-    flags['orchestrator-claude-update-enabled'] = true;
-    flags['claude-code-update-enabled'] = false;
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+    toolMode.mode = 'off';
     expect(await requestHostUpdate(claude, 'orchestrator', 'none', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
     expect(sudoCalls()).toEqual([]);
     expect(rows.size).toBe(0);
-    expect(vi.mocked(boolVariation)).toHaveBeenCalledWith('orchestrator-claude-update-enabled', admin, false, orch.ORCHESTRATOR_LD_BOX);
+    expect(vi.mocked(jsonVariation)).toHaveBeenCalledWith('claude-code-update-policy', admin, null, orch.ORCHESTRATOR_LD_BOX);
+    expect(vi.mocked(jsonVariationForContext)).toHaveBeenCalledWith('orchestrator-claude-update-policy', orch.ORCHESTRATOR_LD_CONTEXT, null);
   });
 
   it('previews the orchestrator row once on: capable, the policy, restart none only', async () => {
@@ -152,8 +157,8 @@ describe('the orchestrator\'s own policy (orchestrator-claude-update-policy; Fab
   });
 
   it('with no pin, the row says floor only and offers nothing while the host is at or above the floor', async () => {
-    for (const value of [{ target: null }, undefined, { target: 'latest' }]) {
-      orchPolicy.value = value;
+    for (const value of [{ target: null }, {}, { target: 'latest' }]) {
+      orchPolicy.value = { mode: 'auto', ...value };
       hostVersion.v = '2.1.316';
       expect(await updatePreview(claude, 'orchestrator', admin)).toMatchObject({ status: 200, body: { target: null, floorOnly: true, nothingToDo: true } });
       expect(await requestHostUpdate(claude, 'orchestrator', 'none', admin)).toMatchObject({ status: 409, body: { code: 'floor_only' } });
@@ -169,7 +174,7 @@ describe('the orchestrator\'s own policy (orchestrator-claude-update-policy; Fab
   });
 
   it('with no pin, still offers a run while a quarantine holds the runner (Bugbot on #1165)', async () => {
-    orchPolicy.value = { target: null };
+    orchPolicy.value = { mode: 'auto', target: null };
     hostVersion.v = '2.1.316';
     writeFileSync(path.join(dir, 'runner-held'), 'x\n');
     expect(await updatePreview(claude, 'orchestrator', admin)).toMatchObject({ status: 200, body: { floorOnly: true, nothingToDo: false, runnerHeld: true } });
@@ -179,14 +184,14 @@ describe('the orchestrator\'s own policy (orchestrator-claude-update-policy; Fab
   });
 
   it('passes a pin below what runs on as it is: the recipe moves down to it, never below the floor', async () => {
-    orchPolicy.value = { target: '2.1.309' };
+    orchPolicy.value = { mode: 'auto', target: '2.1.309' };
     hostVersion.v = '2.1.316';
     const runId = ((await requestHostUpdate(claude, 'orchestrator', 'none', admin)).body as { runId: string }).runId;
     expect(JSON.parse(readFileSync(path.join(dir, 'requests', `${runId}.json`), 'utf8'))).toEqual({ floor: '2.1.310', target: '2.1.309' });
   });
 
   it('reads a floor-only record', async () => {
-    orchPolicy.value = { target: null };
+    orchPolicy.value = { mode: 'auto', target: null };
     hostVersion.v = '2.1.300';
     const runId = ((await requestHostUpdate(claude, 'orchestrator', 'none', admin)).body as { runId: string }).runId;
     record(runId, { outcome: 'floor-only', target: '2.1.310', fromVersion: '2.1.312', toVersion: '2.1.312', detail: 'policy=floor-only no-downgrade(2.1.312>2.1.310) unit_binary=current' });
@@ -206,7 +211,6 @@ describe('a manual run', () => {
   });
 
   it('is Claude Code only: another tool on the orchestrator host takes no run', async () => {
-    flags['codex-update-enabled'] = true;
     expect(await requestHostUpdate(TOOL_REGISTRY.codex, 'orchestrator', 'none', admin)).toMatchObject({ status: 409, body: { code: 'not_capable' } });
     expect(sudoCalls()).toEqual([]);
   });
@@ -302,12 +306,13 @@ describe('the nightly run', () => {
     expect(orch.nightlyDue({ capable: true, inFlight: false, lastRunAt: null, lastFailedAt: new Date(now - 61 * 60_000), now })).toBe(true);
   });
 
-  it('follows its flag, read for the orchestrator alone, and takes the policy for that context', async () => {
-    flags['orchestrator-claude-update-enabled'] = false;
+  it('follows the host\'s mode, read for the orchestrator alone, and takes the policy for that context', async () => {
+    orchPolicy.value = { mode: 'manual', target: '2.1.316' };
     expect(await orch.orchestratorNightlyTick(now)).toBe('off');
-    expect(vi.mocked(boolVariationForContext)).toHaveBeenCalledWith('orchestrator-claude-update-enabled', orch.ORCHESTRATOR_LD_CONTEXT, false);
+    expect(vi.mocked(jsonVariationForContext)).toHaveBeenCalledWith('orchestrator-claude-update-policy', orch.ORCHESTRATOR_LD_CONTEXT, null);
+    expect(vi.mocked(jsonVariationForContext)).toHaveBeenCalledWith('claude-code-update-policy', orch.ORCHESTRATOR_LD_CONTEXT, null);
     expect(sudoCalls()).toEqual([]);
-    flags['orchestrator-claude-update-enabled'] = true;
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
     expect(await orch.orchestratorNightlyTick(now)).toBe('started');
     const run = [...rows.values()][0];
     expect(run).toMatchObject({ trigger: 'nightly', requestedById: null, target: '2.1.316', status: 'running' });
@@ -323,10 +328,10 @@ describe('the nightly run', () => {
   });
 
   it('with no pin and the host at or above the floor, runs nothing (the boot run keeps the floor)', async () => {
-    orchPolicy.value = { target: null };
+    orchPolicy.value = { mode: 'auto', target: null };
     hostVersion.v = '2.1.316';
     expect(await orch.orchestratorNightlyTick(now)).toBe('floor-only');
-    orchPolicy.value = undefined;
+    orchPolicy.value = { mode: 'auto' };
     expect(await orch.orchestratorNightlyTick(now)).toBe('floor-only');
     expect(sudoCalls()).toEqual([]);
   });
@@ -339,5 +344,73 @@ describe('the nightly run', () => {
     rows.set('m1', { ...rows.get('m1')!, status: 'expired' });
     rows.set('m2', { id: 'm2', hostKey: 'orchestrator', component: 'claude', trigger: 'nightly', status: 'refused', requestedAt: new Date(now - 3600_000) });
     expect(await orch.orchestratorNightlyTick(now)).toBe('started');
+  });
+});
+
+describe('the host\'s mode (orchestrator-claude-update-policy; gate.ts)', () => {
+  const now = Date.parse('2026-11-03T03:00:00Z');
+  const hostPolicyReads = () => vi.mocked(jsonVariationForContext).mock.calls.filter(c => c[0] === 'orchestrator-claude-update-policy');
+
+  it('off: the row answers 404 and the nightly run is off', async () => {
+    orchPolicy.value = { mode: 'off', target: '2.1.316' };
+    expect(await updatePreview(claude, 'orchestrator', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
+    expect(await requestHostUpdate(claude, 'orchestrator', 'none', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
+    expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+    expect(sudoCalls()).toEqual([]);
+  });
+
+  it('manual: the row is on and the nightly run is off', async () => {
+    orchPolicy.value = { mode: 'manual', target: '2.1.316' };
+    expect(await updatePreview(claude, 'orchestrator', admin)).toMatchObject({ status: 200, body: { target: '2.1.316' } });
+    // One read of the host's policy for the preview: its mode and its target.
+    expect(hostPolicyReads()).toHaveLength(1);
+    expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+  });
+
+  it('auto: the nightly run starts', async () => {
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+    expect(await orch.orchestratorNightlyTick(now)).toBe('started');
+    expect(hostPolicyReads()).toHaveLength(1);
+  });
+
+  it('the tool\'s own mode off stops the nightly run too, read for the orchestrator alone', async () => {
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+    toolMode.mode = 'off';
+    expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+    expect(sudoCalls()).toEqual([]);
+    toolMode.mode = 'manual';
+    expect(await orch.orchestratorNightlyTick(now)).toBe('started');
+  });
+
+  it('the tool\'s own mode missing (or the flag source down) stops the nightly run: missing is off', async () => {
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+    for (const mode of [undefined, 'sometimes']) {
+      toolMode.mode = mode;
+      expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+    }
+    vi.mocked(jsonVariationForContext).mockImplementation((async (key: string) => (key === 'orchestrator-claude-update-policy' ? orchPolicy.value : null)) as never);
+    expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+    vi.mocked(jsonVariationForContext).mockImplementation((async (key: string) => (key === 'orchestrator-claude-update-policy' ? orchPolicy.value ?? null : { mode: toolMode.mode, floor: '2.1.310', target: 'latest' })) as never);
+    expect(sudoCalls()).toEqual([]);
+  });
+
+  it('the tool\'s own mode off closes the row too, whatever the host\'s says', async () => {
+    orchPolicy.value = { mode: 'auto', target: '2.1.316' };
+    const { jsonVariation } = await import('../featureFlags');
+    vi.mocked(jsonVariation).mockResolvedValueOnce({ mode: 'off', floor: '2.1.310' });
+    expect(await updatePreview(claude, 'orchestrator', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
+  });
+
+  it('missing, malformed, or the flag source down (the fallback, null): off, the row and the nightly run alike', async () => {
+    for (const value of [{ target: '2.1.316' }, { mode: 'nightly', target: '2.1.316' }, { mode: null }, undefined]) {
+      orchPolicy.value = value;
+      expect(await updatePreview(claude, 'orchestrator', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
+      expect(await requestHostUpdate(claude, 'orchestrator', 'none', admin)).toEqual({ status: 404, body: { code: 'claude_update_off' } });
+      expect(await orch.orchestratorNightlyTick(now)).toBe('off');
+    }
+    expect(sudoCalls()).toEqual([]);
+    expect(orch.parseOrchestratorMode({ mode: 'auto' })).toBe('auto');
+    expect(orch.parseOrchestratorMode(null)).toBe('off');
+    expect(orch.parseOrchestratorMode({ mode: 'sometimes' })).toBe('off');
   });
 });

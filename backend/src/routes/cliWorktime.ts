@@ -10,7 +10,7 @@
  * banking, services/userTimeZone.ts), and each answer says which is `today`.
  * N is 1 to 90 (30 when absent).
  * Each is a device sign-in's (a box's own token gets 403: anything on the box
- * can read it), behind `desktop-app-enabled` for the person (off: 404).
+ * can read it).
  */
 import type { RequestHandler, Response, Router } from 'express';
 import { asyncHandler } from '../middleware/errors';
@@ -19,8 +19,6 @@ import type { CliAuth } from './cliApi';
 import type { RouteResult } from './routeResult';
 
 export interface CliWorktime {
-  /** desktop-app-enabled for this person. */
-  enabled(user: CliUser): Promise<boolean>;
   /** `tz`: the zone the desktop sends, as the request had it. */
   days(user: CliUser, days: number, tz: unknown): Promise<RouteResult>;
   projects(user: CliUser, days: number, tz: unknown): Promise<RouteResult>;
@@ -48,7 +46,6 @@ export function mountCliWorktimeRoutes(router: Router, deps: CliWorktime, bearer
   const gate: RequestHandler = asyncHandler(async (_req, res, next) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') { res.status(403).json(DEVICE_ONLY); return; }
-    if (!(await deps.enabled(user))) { res.status(404).json(NOT_FOUND); return; }
     next();
   });
 

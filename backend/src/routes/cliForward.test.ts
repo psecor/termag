@@ -354,22 +354,59 @@ describe('the relay', () => {
   });
 
   it('holds the box end while the client reads nothing, for many heartbeats, then delivers every byte', { timeout: 30_000 }, async () => {
-    mode = 'flood';
-    const ws = await opened();
-    let got = 0;
-    ws.on('message', (d) => { got += (d as Buffer).length; });
-    // The laptop stops reading: its TCP socket fills, the relay pauses the box end.
-    (ws as unknown as { _socket: import('net').Socket })._socket.pause();
-    await new Promise(r => setTimeout(r, 12 * HB));
-    const agent = agentEnds[0];
-    // Backpressure reached the box: most of what it sent still waits on its side.
-    expect(agent.bufferedAmount).toBeGreaterThan(FLOOD / 3);
-    expect(ws.readyState).toBe(WebSocket.OPEN);
-    expect(agent.readyState).toBe(WebSocket.OPEN);
-    (ws as unknown as { _socket: import('net').Socket })._socket.resume();
-    await until(() => got === FLOOD, 20_000);
-    expect(ws.readyState).toBe(WebSocket.OPEN);
-    ws.close(1000);
+    // The heartbeats tick when this test says, not every HB of wall-clock time.
+    // A clock-driven tick during the delivery below raced it: the laptop here
+    // never pings, so the client leg is judged by our ping's pong, and that
+    // ping waits behind megabytes in loopback's kernel buffers, which
+    // bufferedAmount doesn't count. On a loaded runner the laptop took longer
+    // than two 50 ms ticks to read that far, and the leg was cut with 1006.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      mode = 'flood';
+      const ws = await opened();
+      const agent = agentEnds[0];
+      const boxLeg = [...tunnelWss.clients].at(-1)!;
+      const clientLeg = [...forwardWss.clients].at(-1)!;
+      let got = 0;
+      ws.on('message', (d) => { got += (d as Buffer).length; });
+      // The laptop stops reading: its TCP socket fills, the relay pauses the box end.
+      (ws as unknown as { _socket: import('net').Socket })._socket.pause();
+      // Until nothing moves: the relay holds the box end paused, and what the box sent stays on its side.
+      let last = -1;
+      let still = 0;
+      await until(() => {
+        still = agent.bufferedAmount === last ? still + 1 : 0;
+        last = agent.bufferedAmount;
+        return boxLeg.isPaused && still >= 10;
+      }, 20_000);
+      const held = agent.bufferedAmount;
+      for (let i = 0; i < 12; i++) {
+        vi.advanceTimersByTime(HB);
+        await new Promise(r => setImmediate(r));
+      }
+      // Backpressure reached the box: most of what it sent still waits on its side, through every heartbeat.
+      expect(held).toBeGreaterThan(FLOOD / 3);
+      expect(agent.bufferedAmount).toBe(held);
+      expect(boxLeg.isPaused).toBe(true);
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      expect(agent.readyState).toBe(WebSocket.OPEN);
+      const delivered = new Promise<void>((resolve, reject) => {
+        ws.on('message', () => { if (got === FLOOD) resolve(); });
+        ws.once('close', (code) => reject(new Error(`closed ${code} with ${got} of ${FLOOD} bytes delivered`)));
+      });
+      (ws as unknown as { _socket: import('net').Socket })._socket.resume();
+      await delivered;
+      // A laptop that reads again answers the next heartbeat's ping, and keeps its forward.
+      const ponged = new Promise(r => clientLeg.once('pong', r));
+      vi.advanceTimersByTime(HB);
+      await ponged;
+      vi.advanceTimersByTime(HB);
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      expect(clientLeg.readyState).toBe(WebSocket.OPEN);
+      ws.close(1000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('passes 1000 and 1011 through, both ways', async () => {

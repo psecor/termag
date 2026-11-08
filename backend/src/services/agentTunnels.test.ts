@@ -128,8 +128,8 @@ describe('AgentTunnels: port targets', () => {
     expect(tunnels.boxesWithTunnels(['box-1', 'box-2', 'box-3'], 't3')).toEqual(new Set(['box-1']));
   });
 
-  it('caps each kind on its own: 128 port tunnels and 64 t3 ones by default', async () => {
-    expect(TUNNEL_CAPS).toEqual({ t3: 64, port: 128 });
+  it('caps each kind on its own: 128 port tunnels, 128 preview ones and 64 t3 ones by default', async () => {
+    expect(TUNNEL_CAPS).toEqual({ t3: 64, port: 128, preview: 128 });
     const tunnels = new AgentTunnels({ send: () => new Promise(() => {}), caps: { port: 2, t3: 1 }, ttlMs: 10_000 });
     expect(tunnels.cap('port')).toBe(2);
     void tunnels.openSocket('box-1', 'alice', { kind: 'port', port: 1 }).catch(() => {});
@@ -143,5 +143,54 @@ describe('AgentTunnels: port targets', () => {
     await new Promise(r => setTimeout(r, 0));
     expect([tunnels.count('alice', 'box-1', 't3'), tunnels.count('alice', 'box-2', 'port'), tunnels.count('bob', 'box-1', 'port')]).toEqual([1, 1, 1]);
     expect(await failure(tunnels.openSocket('box-1', 'alice', { kind: 't3' }))).toMatchObject({ status: 429, code: 'too_many_tunnels' });
+  });
+});
+
+describe('AgentTunnels: preview targets', () => {
+  it('asks the agent for { kind: "preview", port, confine } and hands back a byte stream, counted under the owner', async () => {
+    let base = '';
+    const seen: unknown[] = [];
+    const tunnels = new AgentTunnels({ send: echoAgent(() => base, seen) });
+    base = await dialBackEndpoint(tunnels);
+    const { stream, port } = await tunnels.openPreview('box-1', 'alice', 5173, null);
+    expect(port).toBe(5173);
+    expect(seen).toEqual([{ type: 'tunnel-open', target: { kind: 'preview', port: 5173, confine: null } }]);
+    expect(tunnels.count('alice', 'box-1', 'preview')).toBe(1);
+    expect(tunnels.count('alice', 'box-1', 'port')).toBe(0);
+    stream.write('GET / HTTP/1.1\r\n\r\n');
+    const echoed = await new Promise<string>(resolve => stream.once('data', (c: Buffer) => resolve(c.toString())));
+    expect(echoed).toBe('GET / HTTP/1.1\r\n\r\n');
+    stream.destroy();
+    for (let i = 0; i < 50 && tunnels.count('alice', 'box-1', 'preview') > 0; i++) await new Promise(r => setTimeout(r, 20));
+    expect(tunnels.count('alice', 'box-1', 'preview')).toBe(0);
+  });
+
+  it('sends a confined target with its checkout, and hands the agent\'s refusal back', async () => {
+    const seen: unknown[] = [];
+    const tunnels = new AgentTunnels({
+      send: async (_box, _type, payload) => {
+        seen.push(payload.target);
+        return { ok: false, code: 'port_refused', reason: 'Start this app with `termag preview run` to share it more widely' };
+      },
+    });
+    expect(await failure(tunnels.openPreview('box-1', 'alice', 5173, { checkout: '/home/alice/termag/projects/app' }))).toMatchObject({
+      status: 403, code: 'port_refused', message: 'Start this app with `termag preview run` to share it more widely',
+    });
+    expect(seen).toEqual([{ kind: 'preview', port: 5173, confine: { checkout: '/home/alice/termag/projects/app' } }]);
+    expect(tunnels.count('alice', 'box-1', 'preview')).toBe(0);
+  });
+
+  it('caps preview tunnels on their own, and tells them apart from forwards for the busy check', async () => {
+    const tunnels = new AgentTunnels({ send: () => new Promise(() => {}), caps: { preview: 1 }, ttlMs: 10_000 });
+    void tunnels.openPreview('box-1', 'alice', 1, null).catch(() => {});
+    void tunnels.openSocket('box-2', 'alice', { kind: 'port', port: 1 }).catch(() => {});
+    void tunnels.openSocket('box-3', 'alice', { kind: 't3' }).catch(() => {});
+    await new Promise(r => setTimeout(r, 0));
+    expect(await failure(tunnels.openPreview('box-1', 'alice', 2, null))).toMatchObject({ status: 429, code: 'too_many_tunnels' });
+    expect(tunnels.count('alice', 'box-1', 'port')).toBe(0);
+    // The busy check asks for 'port' only (index.ts): an open preview tunnel holds no box up.
+    expect(tunnels.boxesWithTunnels(['box-1', 'box-2', 'box-3'], 'port')).toEqual(new Set(['box-2']));
+    expect(tunnels.boxesWithTunnels(['box-1', 'box-2', 'box-3'], ['port', 'preview'])).toEqual(new Set(['box-1', 'box-2']));
+    expect(tunnels.boxesWithTunnels(['box-1', 'box-2', 'box-3'], 'preview')).toEqual(new Set(['box-1']));
   });
 });

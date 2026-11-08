@@ -109,9 +109,7 @@ export function reportText(i: ReportInput): string {
   const summary = reportableSummary(i.run.summary);
   if (summary) lines.push(`> ${slackEscape(summary).split('\n').join('\n> ')}`);
   if (i.base && i.run.workstream) {
-    // The workspace deep link, as the briefing's Slack links use: it opens the
-    // run whether or not the reader has the simple UI (/chat without
-    // simple-ui-enabled redirects to / and drops ws).
+    // The workspace deep link, as the briefing's Slack links use.
     lines.push(`<${sessionLink(i.base, i.projectId, i.run.workstream)}|the run> · <${i.base}/automations/${encodeURIComponent(i.projectId)}|the automation>`);
   }
   return lines.join('\n');

@@ -97,4 +97,45 @@ describe('Discord /t project access', () => {
     await run('run the tests');
     expect(sendKeys).toHaveBeenCalledWith('bob-api-agent', 'run the tests', true, 'i-bob');
   });
+
+  // A space's orchestrator project is the space's (projectKind.ts inProjectLists).
+  describe('a space orchestrator project', () => {
+    const orchestrator = { id: 'p-space', name: 'space-alpha', kind: 'space-orchestrator', userId: bob.id, archived: false, instanceId: 'i-bob', user: bob };
+    const listed = (where: any) => !where.kind || where.kind.in.includes('space-orchestrator');
+    beforeEach(() => {
+      prisma.project.findFirst.mockImplementation(async ({ where }: any) => (listed(where) ? orchestrator : bobProject));
+      prisma.project.findMany.mockImplementation(async ({ where }: any) => (where.name === 'space-alpha' && listed(where) ? [{ ...orchestrator, workflows: [] }] : []));
+    });
+
+    it('is never the project /t falls back to without a target', async () => {
+      await run('run the tests');
+      expect(sendKeys).toHaveBeenCalledWith('bob-api-agent', 'run the tests', true, 'i-bob');
+    });
+
+    it('is no saved target: /t and /t ctrl read it as gone', async () => {
+      prisma.project.findUnique.mockResolvedValue(orchestrator);
+      setActiveProjectId('D-BOB', orchestrator.id, 'main', 'discord');
+      await run('ctrl whoami');
+      expect(replied().at(-1)).toBe('Project not found.');
+      await run('run the tests');
+      // Nothing typed anywhere, not into a term-<id> session either, and the stale target is cleared.
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(replied().at(-1)).toBe('The project you switched to is gone. Use `/t projects` and `/t switch <name>` to pick another.');
+      expect(getActiveProjectId('D-BOB')).toBeNull();
+    });
+
+    it('does not become the saved target through /t attach', async () => {
+      prisma.project.findUnique.mockResolvedValue({ kind: 'space-orchestrator' });
+      vi.mocked(resolveSessionProject).mockResolvedValue({ userId: bob.id, instanceId: 'i-bob', projectId: bobProject.id, workstream: 'main' });
+      vi.mocked(projectSessionAccess).mockResolvedValue((() => ({})) as never);
+      await run('attach bob-space-alpha-agent');
+      expect(getActiveProjectId('D-BOB')).toBeNull();
+    });
+
+    it('is unknown to /t switch', async () => {
+      await run('switch space-alpha');
+      expect(replied().at(-1)).toBe('No project `space-alpha`. Use `/t projects` to list.');
+      expect(getActiveProjectId('D-BOB')).toBeNull();
+    });
+  });
 });

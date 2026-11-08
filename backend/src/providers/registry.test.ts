@@ -175,3 +175,30 @@ describe('selectable providers', () => {
     expect(backend.isSelectableProvider('claude')).toBe(true);
   });
 });
+
+describe("Devin's poller waiting patterns", () => {
+  const waiting = (line: string) => backend.PROVIDERS.devin.pollerConfig!.waitingPatterns!.some(p => p.test(line));
+  it('reads the old and the newer approval footers', () => {
+    expect(waiting('↑↓ select · ↵ confirm · esc cancel')).toBe(true);
+    expect(waiting('↑↓ select · ↔ scope · e edit · ↵ confirm · esc cancel')).toBe(true);
+    expect(waiting('↑↓ select · scroll')).toBe(false);
+  });
+  it("reads the list's cursor row when a narrow pane wraps the footer", () => {
+    expect(waiting('❭ Allow ← ■□□□ → Once      Exec(gh auth)')).toBe(true);
+    expect(waiting('❭ Deny')).toBe(true);
+    expect(waiting('  Deny')).toBe(false);
+    expect(waiting('│ + ❭ Allow')).toBe(false);
+    expect(waiting('❭ Allowance check')).toBe(false);
+  });
+  it('is a whole line: a diff quoting the footer is not a prompt', () => {
+    expect(waiting("│ +    expect(waiting('↑↓ select · ↔ scope · e edit · ↵ confirm · esc cancel')).toBe(true);")).toBe(false);
+    expect(waiting('  ↑↓ select · ↔ scope · e edit · ↵ confirm · esc cancel  ')).toBe(true);
+  });
+  it('fails fast on a long line of hints with no confirm (pane text is untrusted)', () => {
+    const hostile = `↑↓ select ${'· x '.repeat(2000)}`;
+    const t = Date.now();
+    expect(waiting(hostile)).toBe(false);
+    expect(waiting(`${hostile}↵`)).toBe(false);
+    expect(Date.now() - t).toBeLessThan(200);
+  });
+});

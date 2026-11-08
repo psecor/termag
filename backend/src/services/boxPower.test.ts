@@ -150,6 +150,38 @@ describe('requestPower', () => {
     expect(rows.get('inst_1')!.lastActivityAt.getTime()).toBeGreaterThan(parkedAt.getTime());
   });
 
+  it('marks a resume from hibernated on the row for the tool sweep; a start from stopped is not one', async () => {
+    const before = Date.now();
+    await requestPower(seed('hibernated', { hibernatedAt: new Date(before - 3600_000) }), 'start', { markInUse: true });
+    expect(rows.get('inst_1')!.resumedFromHibernationAt.getTime()).toBeGreaterThanOrEqual(before);
+    await requestPower(seed('stopped'), 'start', { markInUse: true });
+    expect(rows.get('inst_1')!.resumedFromHibernationAt).toBeUndefined();
+  });
+
+  it('a refused start from hibernated leaves no resume marker, and a refresh start clears an old one (Bugbot on #1163)', async () => {
+    ec2.refuse = 'InsufficientInstanceCapacity';
+    await expect(requestPower(seed('hibernated', { hibernatedAt: new Date(Date.now() - 3600_000), resumedFromHibernationAt: null }), 'start', { markInUse: true })).rejects.toThrow();
+    expect(rows.get('inst_1')).toMatchObject({ status: 'hibernated', resumedFromHibernationAt: null });
+    ec2.refuse = null;
+    await requestPower(seed('hibernated', { hibernatedAt: new Date(Date.now() - 3600_000), resumedFromHibernationAt: new Date(Date.now() - 7200_000) }), 'start', { rehibernate: true });
+    expect(rows.get('inst_1')!.resumedFromHibernationAt).toBeNull();
+  });
+
+  it('a stop keeps a resume marker until the box has gone down; a refused one keeps it (Bugbot on #1163)', async () => {
+    const marker = new Date();
+    await requestPower(seed('ready', { resumedFromHibernationAt: marker }), 'stop');
+    expect(rows.get('inst_1')!.resumedFromHibernationAt).toBe(marker);
+    ec2.state = 'stopped';
+    await sweepPowerStates(Date.now());
+    expect(statusOf()).toBe('stopped');
+    expect(rows.get('inst_1')!.resumedFromHibernationAt).toBeNull();
+
+    ec2.refuse = 'IncorrectInstanceState';
+    await expect(requestPower(seed('ready', { resumedFromHibernationAt: marker }), 'stop')).rejects.toThrow();
+    expect(rows.get('inst_1')).toMatchObject({ status: 'ready', resumedFromHibernationAt: marker });
+    ec2.refuse = null;
+  });
+
   it("a reviewer's wake restarts the idle clock, but keeps the box's terminate clock and its idle note", async () => {
     const parkedAt = new Date('2026-10-01T00:00:00Z');
     const box = seed('hibernated', { parkedAt, lifecycleNote: 'Hibernated automatically after 2 h idle.', lastActivityAt: parkedAt });
@@ -397,6 +429,8 @@ describe('60-day hibernation refresh', () => {
     await sweepPowerStates(now);
     expect(statusOf()).toBe('starting');
     expect(rows.get('inst_1')!.rehibernatePending).toBe(true);
+    // A refresh resume is not one the tool sweep follows: the box hibernates again at once.
+    expect(rows.get('inst_1')!.resumedFromHibernationAt).toBeNull();
     expect(ec2.sent).toContain('StartInstances');
     expect(boxStartWatchForTests('inst_1')).toMatchObject({ from: 'hibernate', source: 'sweep' });
 

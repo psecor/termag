@@ -35,8 +35,6 @@
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const CURSOR_UPDATE_POLICY_FLAG = 'cursor-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for Cursor and a box's policy says restart nothing. */
-export const CURSOR_UPDATE_ENABLED_FLAG = 'cursor-update-enabled';
 
 export const CURSOR_TARGET_TAGS: readonly string[] = ['latest'];
 
@@ -57,6 +55,7 @@ const VERSION = /^\d{4}\.\d{2}\.\d{2}-[0-9a-f]{6,40}$/;
 export const isCursorVersion = (v: unknown): v is string => typeof v === 'string' && VERSION.test(v);
 
 export const DEFAULT_CURSOR_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '2025.09.17-25b418f',
   target: 'latest',
   restart: 'none',
@@ -66,5 +65,5 @@ export const DEFAULT_CURSOR_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over Cursor's defaults; a bad key keeps its default. */
 export function parseCursorUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_CURSOR_UPDATE_POLICY, CURSOR_TARGET_TAGS, isCursorVersion);
+  return parseClaudeUpdatePolicy(value, DEFAULT_CURSOR_UPDATE_POLICY, CURSOR_TARGET_TAGS, isCursorVersion, CURSOR_UPDATE_POLICY_FLAG);
 }

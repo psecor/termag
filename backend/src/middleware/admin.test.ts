@@ -22,6 +22,16 @@ describe('summarizeArgs', () => {
     expect((out!.name as string).length).toBe(201);
   });
 
+  it('records a secret-named field as redacted, never its value: a pasted token stays out of the audit log', () => {
+    const PAT = 'github_pat_AUDITsentinelAUDITsentinel0123'; // gitleaks:allow (test sentinel)
+    const out = summarizeArgs({
+      query: { access_token: PAT }, params: {},
+      body: { token: PAT, clientSecret: PAT, password: PAT, tokenId: 'tok1', name: 'pool' },
+    } as never);
+    expect(JSON.stringify(out)).not.toContain(PAT);
+    expect(out).toMatchObject({ token: '[redacted]', clientSecret: '[redacted]', password: '[redacted]', access_token: '[redacted]', tokenId: 'tok1', name: 'pool' });
+  });
+
   it('returns null when there is nothing to record', () => {
     expect(summarizeArgs({ query: {}, params: {}, body: undefined } as never)).toBeNull();
   });

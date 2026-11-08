@@ -7,8 +7,8 @@
  * may stay open on background work) or on a `turn-end` that came without one
  * pushes once to every person who can see the chat (its owner and the people
  * it is shared with, as `mayReceiveChat` lets the status socket) and opted
- * in (`User.chatTurnNotify`), with `chat-turn-notifications-enabled` and
- * `mobile-web-push-enabled` on for them. A turn someone stopped (a turn-end
+ * in (`User.chatTurnNotify`), with `chat-turn-notifications-enabled` on for
+ * them. A turn someone stopped (a turn-end
  * with a signal) pushes nothing, and neither does a turn that only waits on
  * background work: that is no transition.
  *
@@ -18,7 +18,6 @@
 import { prisma } from '../db';
 import type { AgentStatus } from '../types/index';
 import { boolVariation } from './featureFlags';
-import { webPushEnabledFor } from './pushFlag';
 import { appBaseUrl, buildChatTurnPayload, defaultSendDeps, sendToUser, type SendDeps } from './webPush';
 
 /** The same chat finishing again inside this window does not re-notify. */
@@ -88,7 +87,7 @@ export interface ChatTurnAudience {
 export interface ChatTurnDeps {
   send: SendDeps;
   loadAudience: (projectId: string) => Promise<ChatTurnAudience | null>;
-  /** chat-turn-notifications-enabled and mobile-web-push-enabled, for this person. */
+  /** chat-turn-notifications-enabled, for this person. */
   allowed: (person: ChatTurnPerson) => Promise<boolean>;
 }
 
@@ -104,8 +103,7 @@ async function loadAudience(projectId: string): Promise<ChatTurnAudience | null>
 }
 
 async function allowed(person: ChatTurnPerson): Promise<boolean> {
-  if (!await boolVariation('chat-turn-notifications-enabled', person, false)) return false;
-  return webPushEnabledFor(person.id);
+  return boolVariation('chat-turn-notifications-enabled', person, false);
 }
 
 function defaultDeps(): ChatTurnDeps {

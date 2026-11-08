@@ -1,6 +1,6 @@
 /**
  * Renaming a box: the checks `renameOwnedBox` (routes/instances.ts) makes
- * before it writes, behind the `box-rename-enabled` flag.
+ * before it writes.
  *
  * A box's name is only the label on its Instance row. Everything that keeps
  * hold of a box keys it by id (projects, tokens, shares, spaces, asks), and
@@ -12,17 +12,6 @@
  * named before that rule existed.
  */
 import { BOX_NAME_ERROR, isValidBoxName } from './boxNames';
-import { boolVariation } from './featureFlags';
-import type { FlagUser } from './featureFlags';
-
-export const BOX_RENAME_FLAG = 'box-rename-enabled';
-
-/** The `code` a refused rename carries while the flag is off. */
-export const RENAME_DISABLED_CODE = 'rename_disabled';
-
-export async function boxRenameEnabled(user: FlagUser): Promise<boolean> {
-  return boolVariation(BOX_RENAME_FLAG, user, false);
-}
 
 export type BoxRenameCheck =
   | { ok: true; name: string; unchanged: boolean }

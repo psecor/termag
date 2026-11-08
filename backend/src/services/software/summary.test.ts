@@ -27,7 +27,7 @@ describe('summarize', () => {
     const [claude, termag] = summarize(['claude', 'termag'], hosts, ref);
     expect(claude).toEqual({
       component: 'claude', reference: '2.1.312', referenceNote: 'the newest version anywhere in the fleet',
-      counts: { current: 2, behind: 1, outdated: 1, ahead: 0, missing: 1, unknown: 0 },
+      counts: { current: 2, behind: 1, outdated: 1, ahead: 0, pending: 0, missing: 1, unknown: 0 },
       spread: [{ version: '2.1.312', hosts: 2 }, { version: '2.1.292', hosts: 1 }, { version: '2.0.1', hosts: 1 }],
     });
     expect(termag.counts).toMatchObject({ current: 1, behind: 1 });
@@ -36,7 +36,7 @@ describe('summarize', () => {
 
   it('over online hosts leaves offline boxes out of counts and spread, keeps the orchestrator, and keeps the reference', () => {
     const [claude, termag] = summarize(['claude', 'termag'], hosts.filter(isOnline), ref);
-    expect(claude.counts).toEqual({ current: 2, behind: 0, outdated: 0, ahead: 0, missing: 1, unknown: 0 });
+    expect(claude.counts).toEqual({ current: 2, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 1, unknown: 0 });
     expect(claude.spread).toEqual([{ version: '2.1.312', hosts: 2 }]);
     expect(claude.reference).toBe('2.1.312');
     expect(termag.counts).toMatchObject({ current: 1, behind: 0 });
@@ -45,7 +45,7 @@ describe('summarize', () => {
 
   it('lists a component no online host has, with zero counts', () => {
     const [only] = summarize(['envoy'], [host('box-stopped', 'box', false, { envoy: cell('1.30.0', 'current') })].filter(isOnline), ref);
-    expect(only.counts).toEqual({ current: 0, behind: 0, outdated: 0, ahead: 0, missing: 0, unknown: 0 });
+    expect(only.counts).toEqual({ current: 0, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 0, unknown: 0 });
     expect(only.spread).toEqual([]);
   });
 });

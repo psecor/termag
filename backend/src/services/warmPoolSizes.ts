@@ -22,7 +22,7 @@
  * configured BOX_INSTANCE_TYPE with sizes off. `box-warm-pool-size` applies
  * only to that single-size pool. A malformed value is logged once per value.
  */
-import { POOL_FLAG_CONTEXT } from './boxHibernationFlag';
+import { POOL_FLAG_CONTEXT } from './poolLdContext';
 import { BOX_SIZES, poolDefaultSize, type BoxSize } from './boxSize';
 import { jsonVariationForContext } from './featureFlags';
 import { recordProductEvent } from './productEvents';
@@ -126,8 +126,8 @@ export type PoolMissReason = 'size-not-pooled' | 'disk-not-pooled' | 'no-warm-bo
  * One claim of `size` against the pool, hit or miss, for tuning the counts:
  * a `[POOL] claim hit|miss` line and a `box.pool.claim` product event, both
  * by size. Recorded only for a claimer the pool could serve but for its size
- * or its supply (in warm-pool-enabled, the published image, the pool's
- * hibernation value), so a miss is a box the counts could have warmed.
+ * or its supply (on the published image, with the pool's hibernation
+ * value), so a miss is a box the counts could have warmed.
  */
 export function recordPoolClaim(claim: {
   user: { id: string; unixUsername: string };

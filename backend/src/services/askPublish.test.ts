@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { MAX_COMMITS, findSecrets, protectedArea, publishBundle, publishSummary, type PrOutcome, type PublishConfig, type PublishInput, type PublishOutcome } from './askPublish';
 import { MAX_ASK_PRS, PR_DESCRIPTION_MAX, askPrBranch, prBody } from './agentMessages';
+import { WORKFLOW_SCOPE_HINT } from './workflowScope';
 
 describe('protectedArea', () => {
   it('names the protected paths', () => {
@@ -101,15 +102,12 @@ const fakeFetch = (async (url: string | URL, init?: RequestInit) => {
   const cmp = /\/repos\/org\/repo\/compare\/([^/?]+)\.\.\.([0-9a-f]{40})\?/.exec(u);
   if (method === 'GET' && cmp) {
     if (compareStatus !== 200) return json(compareStatus, { message: 'Server Error' });
-    const [, branch, sha] = cmp;
+    // compare a...b: `ahead` when b descends from a, `behind` when a descends from b, as GitHub answers.
+    const [, from, sha] = cmp;
     try { sh(remote, ['cat-file', '-e', `${sha}^{commit}`]); } catch { return json(404, { message: 'Not Found' }); }
-    const tip = sh(remote, ['rev-parse', `refs/heads/${branch}`]);
-    let status = 'diverged';
-    if (sha === tip) status = 'identical';
-    else {
-      try { sh(remote, ['merge-base', '--is-ancestor', sha, tip]); status = 'behind'; } catch { /* not on it */ }
-    }
-    return json(200, { status });
+    const tip = /^[0-9a-f]{40}$/.test(from) ? from : sh(remote, ['rev-parse', `refs/heads/${from}`]);
+    const anc = (x: string, y: string) => { try { sh(remote, ['merge-base', '--is-ancestor', x, y]); return true; } catch { return false; } };
+    return json(200, { status: sha === tip ? 'identical' : anc(sha, tip) ? 'behind' : anc(tip, sha) ? 'ahead' : 'diverged' });
   }
   if (method === 'POST' && u.endsWith('/pulls')) {
     const n = nextPr++;
@@ -296,6 +294,36 @@ describe('publishBundle', () => {
     const out = await pub(input());
     expect(out.kind).toBe('refused');
     expect((out as { reason: string }).reason).toContain('not overwriting');
+  });
+
+  it.each([
+    'refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without `workflow` scope',
+    'Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required',
+  ])('adds the workflow-scope hint to a push GitHub refuses with "%s"', async message => {
+    // GitHub's refusal as git prints it for a refused ref; a local pre-receive hook's
+    // own lines come back prefixed with "remote:".
+    const line = `! [remote rejected] HEAD -> termag-alice/thread1 (${message})`;
+    writeFileSync(join(remote, 'hooks', 'pre-receive'), `#!/bin/sh\necho '${line}' >&2\nexit 1\n`, { mode: 0o755 });
+    commit('a.txt', '1\n', 'one');
+    const out = await pub(input());
+    expect(out.kind).toBe('failed');
+    expect((out as { reason: string }).reason).toBe(`push to org/repo failed: remote: ${line}. ${WORKFLOW_SCOPE_HINT}`);
+  });
+
+  it('adds no hint to a push whose output only quotes the refusal', async () => {
+    writeFileSync(join(remote, 'hooks', 'pre-receive'), "#!/bin/sh\necho 'GH013: see refusing to allow an OAuth App to create or update workflow; `workflows` scope may be required' >&2\nexit 1\n", { mode: 0o755 });
+    commit('a.txt', '1\n', 'one');
+    const out = await pub(input());
+    expect(out.kind).toBe('failed');
+    expect((out as { reason: string }).reason).not.toContain(WORKFLOW_SCOPE_HINT);
+  });
+
+  it('adds no hint to a push refused for another reason', async () => {
+    writeFileSync(join(remote, 'hooks', 'pre-receive'), "#!/bin/sh\necho 'GH013: Repository rule violations found' >&2\nexit 1\n", { mode: 0o755 });
+    commit('a.txt', '1\n', 'one');
+    const out = await pub(input());
+    expect(out.kind).toBe('failed');
+    expect((out as { reason: string }).reason).not.toContain('workflow');
   });
 
   it('refuses protected paths', async () => {
@@ -555,6 +583,52 @@ describe('publishBundle with base merges', () => {
     const out = await pub(input({ bundle: bundleOf('ask') }));
     expect(out).toMatchObject({ kind: 'published', commits: 3, headSha: sh(work, ['rev-parse', 'ask']) });
     expect(sh(remote, ['rev-parse', 'refs/heads/termag-alice/thread1'])).toBe(sh(work, ['rev-parse', 'ask']));
+  });
+
+  it('publishes a branch that merged in more than 2000 of main\'s commits: only its own count', async () => {
+    const from = sh(work, ['rev-parse', 'gh-main']);
+    let stream = '';
+    for (let i = 0; i < 2100; i++) {
+      const line = `${i}\n`;
+      stream += `commit refs/heads/gh-main\ncommitter O <${OWNER}> ${1_700_000_000 + i} +0000\ndata 3\nm${i % 10}\n${i === 0 ? `from ${from}\n` : ''}M 100644 inline src/bulk.txt\ndata ${line.length}\n${line}\n`;
+    }
+    execFileSync('git', ['fast-import', '--quiet'], { cwd: work, input: stream, env: { PATH: process.env.PATH, HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+    sh(work, ['push', '-q', remote, 'gh-main:main']);
+    mergeIn('gh-main');
+    const out = await pub(input({ bundle: bundleOf('ask') }));
+    expect(out).toMatchObject({ kind: 'published', commits: 2 });
+    expect(compares()).toBeLessThanOrEqual(15);
+  }, 30_000);
+
+  it("scans a pr/ branch cut from a PR with old merges of main only for what it adds over main, not main's changes since", async () => {
+    // Another PR, cut from an older main, with an older main merged in.
+    onBranch('other', 'gh-main');
+    commit('src/o.ts', 'o\n', 'other: o');
+    onMain('src/m1.ts', 'm1\n', 'feat: m1');
+    mergeIn('gh-main');
+    // Main then gains a test fixture with a private key in it, and the thread starts on it.
+    const pem = `-----BEGIN RSA ${'PRIVATE'} KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu\n-----END RSA ${'PRIVATE'} KEY-----\n`;
+    onMain('test/fixtures/key.pem', pem, 'test: a key fixture');
+    baseSha = onMain('src/m2.ts', 'm2\n', 'feat: m2');
+    // The run's pr/ branch: the other PR's head, current main merged in, and one commit.
+    onBranch('pr/empty-box', 'other');
+    mergeIn('gh-main');
+    commit('src/e.ts', 'e\n', 'feat: e');
+    const out = await publishBundle(cfg(), input({ bundle: bundleOf('pr/empty-box') }));
+    expect(out).toMatchObject({ kind: 'done', prs: [{ kind: 'published', key: 'empty-box', commits: 4 }] });
+  });
+
+  it('still refuses a key the pr/ branch itself adds on top of a PR with old merges of main', async () => {
+    onBranch('other', 'gh-main');
+    commit('src/o.ts', 'o\n', 'other: o');
+    onMain('src/m1.ts', 'm1\n', 'feat: m1');
+    mergeIn('gh-main');
+    baseSha = onMain('src/m2.ts', 'm2\n', 'feat: m2');
+    onBranch('pr/empty-box', 'other');
+    mergeIn('gh-main');
+    commit('test/key.pem', `-----BEGIN RSA ${'PRIVATE'} KEY-----\n`, 'oops');
+    const out = await publishBundle(cfg(), input({ bundle: bundleOf('pr/empty-box') }));
+    expect(out).toMatchObject({ kind: 'done', prs: [{ kind: 'refused', reason: expect.stringContaining('private key') }] });
   });
 
   it('publishes a new pr/<name> branch started from a newer main, which has protected-path commits since the thread\'s base', async () => {

@@ -2,10 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateSetup,
   decideRepoReport,
+  guideRepos,
+  hasMainCheckout,
+  JOIN_FAILED,
   isCloneRefusal,
   isWorkspace,
+  planAddedRepo,
   planWorkspaceRepos,
   repoCheckoutDir,
+  settledSetup,
   repoSlug,
   repoNameError,
   suggestRepoName,
@@ -14,6 +19,7 @@ import {
   workspaceGuide,
   workspaceGuideWrites,
   workspaceRenameRefusal,
+  workstreamRepos,
   WORKSPACE_RENAME_CAPABILITY,
 } from './projectRepos';
 
@@ -192,5 +198,95 @@ describe('repoSlug / repoCheckoutDir', () => {
     expect(repoCheckoutDir('/p/acme', repos, 'ACME/API')).toBe('/p/acme/api');
     expect(repoCheckoutDir('/p/acme', repos, 'acme/other')).toBeNull();
     expect(repoCheckoutDir('/p/acme', repos, null)).toBeNull();
+  });
+});
+
+describe('planAddedRepo', () => {
+  const have = [
+    { name: 'web', url: 'https://github.com/acme/web', position: 0 },
+    { name: 'api', url: 'https://github.com/acme/api.git', position: 3 },
+  ];
+
+  it('takes a new repository after the last one, named after it', () => {
+    expect(planAddedRepo(have, { url: 'https://github.com/acme/docs-site.git' })).toEqual({
+      ok: true, repo: { name: 'docs-site', url: 'https://github.com/acme/docs-site.git', defaultBranch: null, position: 4 },
+    });
+    expect(planAddedRepo(have, { url: 'git@github.com:acme/docs.git', name: 'manual', defaultBranch: ' trunk ' })).toMatchObject({
+      ok: true, repo: { name: 'manual', defaultBranch: 'trunk' },
+    });
+  });
+
+  it('refuses one the project holds already, in any case or URL form', () => {
+    expect(planAddedRepo(have, { url: 'git@github.com:Acme/API.git' })).toEqual({ ok: false, error: 'acme/api is already in this project' });
+  });
+
+  it('refuses a directory name another repository has, in any case', () => {
+    expect(planAddedRepo(have, { url: 'https://github.com/other/web' })).toMatchObject({ ok: false, error: expect.stringContaining('already checked out as web') });
+    expect(planAddedRepo(have, { url: 'https://github.com/other/x', name: 'API' })).toMatchObject({ ok: false });
+  });
+
+  it('refuses a bad URL, name or branch, and a ninth repository', () => {
+    expect(planAddedRepo(have, { url: 'https://gitlab.com/a/b' })).toMatchObject({ ok: false });
+    expect(planAddedRepo(have, null)).toMatchObject({ ok: false });
+    expect(planAddedRepo(have, { url: 'https://github.com/a/b', name: '.worktrees' })).toMatchObject({ ok: false, error: expect.stringContaining('letters, digits') });
+    expect(planAddedRepo(have, { url: 'https://github.com/a/b', defaultBranch: 'a..b' })).toMatchObject({ ok: false, error: expect.stringContaining('not a branch name') });
+    const eight = Array.from({ length: 8 }, (_, i) => ({ name: `r${i}`, url: `https://github.com/a/r${i}`, position: i }));
+    expect(planAddedRepo(eight, { url: 'https://github.com/a/b' })).toEqual({ ok: false, error: 'a project holds at most 8 repositories' });
+  });
+});
+
+describe('settledSetup', () => {
+  const r = (name: string, setupStatus: string, setupError: string | null = null) => ({ name, setupStatus, setupError });
+
+  it('moves a project in setup to the aggregate', () => {
+    expect(settledSetup('cloning', null, [r('a', 'ready'), r('b', 'ready')])).toEqual({ status: 'ready', error: null });
+    expect(settledSetup('cloning', null, [r('a', 'ready'), r('b', 'failed', 'boom')])).toEqual({ status: 'failed', error: 'b: boom' });
+    expect(settledSetup('cloning', null, [r('a', 'ready'), r('b', 'cloning')])).toBeNull();
+  });
+
+  it('keeps a ready project ready while a repository added later clones or fails', () => {
+    expect(settledSetup('ready', null, [r('a', 'ready'), r('b', 'pending')])).toBeNull();
+    expect(settledSetup('ready', null, [r('a', 'ready'), r('b', 'failed', 'boom')])).toBeNull();
+  });
+
+  it('lets a failed project become ready once every repository is', () => {
+    expect(settledSetup('failed', 'b: boom', [r('a', 'ready'), r('b', 'ready')])).toEqual({ status: 'ready', error: null });
+  });
+});
+
+describe('guideRepos', () => {
+  const r = (name: string, setupStatus: string, setupError: string | null = null) => ({ name, setupStatus, setupError });
+  const rows = [r('web', 'ready'), r('docs', 'cloning'), r('wiki', 'failed', 'Repository not found'), r('blog', 'failed', `${JOIN_FAILED} fix: fatal: boom`)];
+
+  it('lists in the project folder the ones with a checkout there, and the one whose clone just landed', () => {
+    expect(guideRepos(rows).map(x => x.name)).toEqual(['web', 'blog']);
+    expect(guideRepos(rows, { joined: 'docs' }).map(x => x.name)).toEqual(['web', 'docs', 'blog']);
+  });
+
+  it("lists in a workstream root the worktrees the box finds there, whatever the rows' status", () => {
+    expect(guideRepos(rows, { present: ['blog', 'web'] }).map(x => x.name)).toEqual(['web', 'blog']);
+    expect(guideRepos(rows, { present: ['web'] }).map(x => x.name)).toEqual(['web']);
+  });
+
+  it('counts a checkout only for a failure after the clone', () => {
+    expect([hasMainCheckout(rows[0]), hasMainCheckout(rows[1]), hasMainCheckout(rows[2]), hasMainCheckout(rows[3])]).toEqual([true, false, false, true]);
+  });
+});
+
+describe('workstreamRepos', () => {
+  const r = (name: string, setupStatus: string) => ({ name, setupStatus });
+
+  it('holds Branch off back while one still clones', () => {
+    expect(workstreamRepos([r('web', 'ready'), r('docs', 'pending')])).toEqual({ ok: false, error: 'docs is not cloned yet' });
+    expect(workstreamRepos([r('web', 'ready'), r('docs', 'cloning')])).toEqual({ ok: false, error: 'docs is not cloned yet' });
+  });
+
+  it('leaves out one that failed to clone, so the project can still branch', () => {
+    expect(workstreamRepos([r('web', 'ready'), r('wiki', 'failed'), r('api', 'ready')])).toEqual({ ok: true, repos: [r('web', 'ready'), r('api', 'ready')] });
+  });
+
+  it('refuses a pull request in one that failed to clone', () => {
+    expect(workstreamRepos([r('web', 'ready'), r('wiki', 'failed')], 'wiki')).toEqual({ ok: false, error: 'wiki did not clone; Retry it first' });
+    expect(workstreamRepos([r('web', 'ready'), r('wiki', 'failed')], 'web')).toMatchObject({ ok: true });
   });
 });

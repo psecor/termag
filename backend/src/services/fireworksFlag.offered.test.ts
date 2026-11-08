@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const ld = vi.hoisted(() => ({ bool: vi.fn(), json: vi.fn() }));
-vi.mock('./featureFlags', () => ({ boolVariation: ld.bool, jsonVariation: ld.json }));
+const ld = vi.hoisted(() => ({ json: vi.fn() }));
+vi.mock('./featureFlags', () => ({ jsonVariation: ld.json }));
 vi.mock('../db', () => ({ prisma: {} }));
 
 import { fireworksOfferedTo } from './fireworksFlag';
@@ -13,7 +13,6 @@ const ROUTE = { FIREWORKS_GATEWAY_URL: 'https://gateway.example/fireworks' };
 describe('fireworksOfferedTo', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
-    ld.bool.mockReset().mockResolvedValue(true);
     ld.json.mockReset().mockResolvedValue({ models: [{ id: KIMI }] });
   });
 
@@ -26,7 +25,7 @@ describe('fireworksOfferedTo', () => {
     vi.stubEnv('FIREWORKS_GATEWAY_URL', '');
     expect(await fireworksOfferedTo(viewer)).toBeNull();
     vi.stubEnv('FIREWORKS_GATEWAY_URL', ROUTE.FIREWORKS_GATEWAY_URL);
-    ld.bool.mockRejectedValueOnce(new Error('flag source unreachable'));
+    ld.json.mockRejectedValueOnce(new Error('flag source unreachable'));
     expect(await fireworksOfferedTo(viewer)).toBeNull();
   });
 });

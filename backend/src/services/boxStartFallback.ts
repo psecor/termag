@@ -1,8 +1,7 @@
 /**
  * Starting a stopped box when EC2 has no capacity for its type: retype it to
  * another type of the same shape and start it again, the way a launch walks
- * its fallback types (boxProvisioner.runInstanceWithFallback). Behind
- * `box-start-type-fallback-enabled`, read for the owner and the box.
+ * its fallback types (boxProvisioner.runInstanceWithFallback).
  *
  * A launch can also try another subnet; a box that exists can't, since its
  * root volume and network interface live in its zone. A hibernated box can't
@@ -21,13 +20,9 @@
 import { DescribeInstanceTypesCommand, EC2Client, ModifyInstanceAttributeCommand, StartInstancesCommand } from '@aws-sdk/client-ec2';
 import type { Instance } from '@prisma/client';
 import { prisma } from '../db';
-import { POOL_FLAG_CONTEXT } from './boxHibernationFlag';
 import { getBoxConfig, isCapacityRefusal } from './boxProvisioner';
 import { hibernationAfterResize, resizeTypeAllowed } from './boxResizePolicy';
 import { boxSizeSpec, isBoxSize } from './boxSize';
-import { boolVariation, boolVariationForContext } from './featureFlags';
-
-export const BOX_START_TYPE_FALLBACK_FLAG = 'box-start-type-fallback-enabled';
 
 export interface TypeShape { vcpus: number; memoryMiB: number; hibernationSupported: boolean }
 
@@ -56,12 +51,6 @@ function configuredTypes(instance: Instance): string[] {
   return cfg ? [cfg.instanceType, ...cfg.fallbackInstanceTypes] : [];
 }
 
-async function flagOn(instance: Instance): Promise<boolean> {
-  const owner = instance.userId ? await prisma.user.findUnique({ where: { id: instance.userId } }) : null;
-  if (!owner) return boolVariationForContext(BOX_START_TYPE_FALLBACK_FLAG, POOL_FLAG_CONTEXT, false);
-  return boolVariation(BOX_START_TYPE_FALLBACK_FLAG, owner, false, { id: instance.id, name: instance.name, kind: instance.kind });
-}
-
 async function shapesOf(ec2: EC2Client, types: string[]): Promise<Map<string, TypeShape>> {
   const out = new Map<string, TypeShape>();
   const res = await ec2.send(new DescribeInstanceTypesCommand({ InstanceTypes: types as any }));
@@ -76,15 +65,18 @@ async function shapesOf(ec2: EC2Client, types: string[]): Promise<Map<string, Ty
 }
 
 /**
- * After StartInstances refused `instance` (a stopped box) with `refusal`:
+ * After StartInstances refused `instance` (a stopped box, or an environment
+ * pool box a claim is starting) with `refusal`:
  * start it on another type, or throw. Resolves to the type it started on.
- * Throws `refusal` when the flag is off, nothing qualifies, or every
+ * Throws `refusal` when nothing qualifies or every
  * candidate was refused too; any other error from EC2 ends the walk.
  */
 export async function startOnFallbackType(ec2: EC2Client, instance: Instance, refusal: unknown): Promise<string> {
-  if (instance.status !== 'stopped' || !isCapacityRefusal(refusal)) throw refusal;
+  // `env-starting`: an environment pool's claim starting a stopped pool box (services/envPoolClaim.ts),
+  // which stopped plainly so it can be retyped like any stopped box.
+  if ((instance.status !== 'stopped' && instance.status !== 'env-starting') || !isCapacityRefusal(refusal)) throw refusal;
   const current = instance.instanceType;
-  if (!current || !await flagOn(instance)) throw refusal;
+  if (!current) throw refusal;
   const types = configuredTypes(instance);
   let shapes: Map<string, TypeShape>;
   try {

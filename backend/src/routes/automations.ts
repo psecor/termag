@@ -299,8 +299,8 @@ export async function updateAutomationFor(user: Express.User, id: string, raw: u
   const nextSpace = rest.spaceName !== undefined ? rest.spaceName : a.spaceName;
   const spaceChanged = !!nextSpace && nextSpace !== a.spaceName;
   // A space is checked when it is chosen, not on every save that carries the
-  // same name back: with spaces-enabled off later, the owner could otherwise
-  // save nothing (the picker is hidden then) until the mirror was cleared.
+  // same name back: once the owner loses write access to it, they could
+  // otherwise save nothing until the mirror was cleared.
   if (spaceChanged) {
     const space = await checkSpaceForOwner(user.id, nextSpace!, a.projectId);
     if (!space.ok) return { status: 400, body: { error: SYNC_REFUSAL_TEXT[space.reason], code: space.reason } };

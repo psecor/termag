@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { AGENT_TELEMETRY_CAPABILITY, launchCommandFor, PANE_KIND_ENV, replaySessionIdFrom, resourceEnvPrefix, TELEMETRY_REPLAY_CAPABILITY } from './launchCommand';
+import { AGENT_TELEMETRY_CAPABILITY, launchCommandFor, PANE_KIND_ENV, replaySessionIdFrom, resourceEnvPrefix, RESUME_FALLBACK_NOTICE, resumeOrFresh, spawnEnvPrefix, TELEMETRY_REPLAY_CAPABILITY } from './launchCommand';
 
 const RID = 'huuhcqcev124emZ9urmRjjPSNXLl';
 const can = ['credentials-v1', 'telemetry-v1', TELEMETRY_REPLAY_CAPABILITY];
@@ -35,10 +35,42 @@ describe('launchCommandFor: the project and workstream on the resource', () => {
       .toBe(`${K}TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main termag-agent-otel devin -- devin`);
   });
 
-  it('leaves a bare command bare on an older box, for a resume, and when a name is not an id', () => {
+  it('leaves a bare command bare on an older box, and drops a name that is not an id', () => {
     expect(launchCommandFor('claude', { capabilities: ['credentials-v1'], project: 'webapp', workstream: 'main' })).toBe(`${K}claude`);
-    expect(launchCommandFor('claude --continue', { capabilities: can, project: 'webapp', workstream: 'main' })).toBe(`${K}claude --continue`);
-    expect(launchCommandFor('claude', { capabilities: can, project: 'gon falon', workstream: 'main' })).toBe(`${K}claude`);
+    expect(launchCommandFor('claude', { capabilities: can, project: 'gon falon', workstream: 'main' }))
+      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`);
+  });
+
+  it('gives a resume, a brief and a first prompt the settings too, right after the harness\'s word', () => {
+    const env = 'TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main ';
+    expect(launchCommandFor('claude --continue', { capabilities: can, project: 'webapp', workstream: 'main' }))
+      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)" --continue`);
+    expect(launchCommandFor('claude "$(cat "$HOME/.termag/spawn/x.md")"', { capabilities: can, project: 'webapp', workstream: 'main', model: 'opus' }))
+      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)" --model opus "$(cat "$HOME/.termag/spawn/x.md")"`);
+  });
+});
+
+describe('spawnEnvPrefix: a spawned agent\'s spawn on the resource', () => {
+  const spawn = { id: 'cmvzxo7xt5v0ekz4bc2obb2ee', root: 'cmvzxjz445ngekz4bhkrf6yv8', depth: 2, parentProject: 'termag', parentWorkstream: 'main', parentBox: 'cmvtr3c1n0hg2afsfacusxv7j' };
+
+  it('names the spawn, its root, depth and parent for the box scripts', () => {
+    expect(spawnEnvPrefix(spawn)).toBe('TERMAG_SPAWN_ID=cmvzxo7xt5v0ekz4bc2obb2ee TERMAG_SPAWN_ROOT=cmvzxjz445ngekz4bhkrf6yv8 TERMAG_SPAWN_DEPTH=2 '
+      + 'TERMAG_SPAWN_PARENT_PROJECT=termag TERMAG_SPAWN_PARENT_WORKSTREAM=main TERMAG_SPAWN_PARENT_BOX=cmvtr3c1n0hg2afsfacusxv7j ');
+  });
+
+  it('leaves out each bad value on its own, and everything without a good id', () => {
+    expect(spawnEnvPrefix({ ...spawn, root: 'x;y', depth: 0, parentProject: 'a b', parentBox: null })).toBe('TERMAG_SPAWN_ID=cmvzxo7xt5v0ekz4bc2obb2ee ');
+    expect(spawnEnvPrefix({ ...spawn, parentWorkstream: null })).not.toContain('TERMAG_SPAWN_PARENT_PROJECT');
+    expect(spawnEnvPrefix({ ...spawn, id: 'CMV;rm' })).toBe('');
+    expect(spawnEnvPrefix(null)).toBe('');
+  });
+
+  it('goes to the box script with the project and workstream, for Claude and the wrapped agents', () => {
+    const env = `TERMAG_PROJECT=child TERMAG_WORKSTREAM=main ${spawnEnvPrefix(spawn)}`;
+    expect(launchCommandFor('claude', { capabilities: can, project: 'child', workstream: 'main', spawn }))
+      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)"`);
+    expect(launchCommandFor('devin', { capabilities: [...can, AGENT_TELEMETRY_CAPABILITY], provider: 'devin', project: 'child', workstream: 'main', spawn }))
+      .toBe(`${K}${env}termag-agent-otel devin -- devin`);
   });
 });
 
@@ -101,12 +133,14 @@ describe('launchCommandFor', () => {
       .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})"`);
   });
 
-  it('types the bare command without a replay, a bad id, an older box or another provider', () => {
-    expect(launchCommandFor('claude', { capabilities: can })).toBe(`${K}claude`);
-    expect(launchCommandFor('claude', { replaySessionId: null, capabilities: can })).toBe(`${K}claude`);
-    expect(launchCommandFor('claude', { replaySessionId: `${RID};id`, capabilities: can })).toBe(`${K}claude`);
+  it('types `-` for no replay or a bad id, and the bare command on an older box or for another provider', () => {
+    const none = `${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`;
+    expect(launchCommandFor('claude', { capabilities: can })).toBe(none);
+    expect(launchCommandFor('claude', { replaySessionId: null, capabilities: can })).toBe(none);
+    expect(launchCommandFor('claude', { replaySessionId: `${RID};id`, capabilities: can })).toBe(none);
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: ['credentials-v1', 'telemetry-v1'] })).toBe(`${K}claude`);
-    expect(launchCommandFor('claude --continue', { replaySessionId: RID, capabilities: can })).toBe(`${K}claude --continue`);
+    expect(launchCommandFor('claude --continue', { replaySessionId: RID, capabilities: can }))
+      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})" --continue`);
     expect(launchCommandFor('codex --no-alt-screen -a on-request', { replaySessionId: RID, capabilities: can }))
       .toBe(`${K}codex --no-alt-screen -a on-request`);
   });
@@ -133,7 +167,7 @@ describe('launchCommandFor: the other agents', () => {
     expect(launchCommandFor('devin', { capabilities: otel })).toBe(`${K}devin`);
     expect(launchCommandFor('codex --no-alt-screen -a on-request', { capabilities: otel, provider: 'codex' }))
       .toBe(`${K}codex --no-alt-screen -a on-request`);
-    expect(launchCommandFor('claude --continue', { capabilities: otel, provider: 'claude' })).toBe(`${K}claude --continue`);
+    expect(launchCommandFor('claude --continue', { capabilities: ['credentials-v1', AGENT_TELEMETRY_CAPABILITY], provider: 'claude' })).toBe(`${K}claude --continue`);
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: otel, provider: 'claude' }))
       .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})"`);
   });
@@ -162,8 +196,9 @@ describe('launchCommandFor: a workstream on a non-default model backend', () => 
   });
 
   it('leaves the default backend, an unknown backend and a command that is not the harness alone', () => {
-    expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: null })).toBe(`${K}claude`);
-    expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: 'bedrock' })).toBe(`${K}claude`);
+    const plain = `${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`;
+    expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: null })).toBe(plain);
+    expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: 'bedrock' })).toBe(plain);
     expect(launchCommandFor('devin', { capabilities: ['credentials-v1'], provider: 'devin', backend: 'fireworks' })).toBe(`${K}devin`);
     expect(launchCommandFor('something-else', { capabilities: fw, provider: 'claude', backend: 'fireworks' })).toBe(`${K}something-else`);
   });
@@ -175,7 +210,8 @@ describe('launchCommandFor: the workstream\'s model', () => {
 
   it('puts --model right after the harness, on every launch form', () => {
     expect(launchCommandFor('claude', { capabilities: ['credentials-v1'], provider: 'claude', model: 'sonnet' })).toBe(`${K}claude --model sonnet`);
-    expect(launchCommandFor('claude --continue', { capabilities: can, provider: 'claude', model: 'haiku' })).toBe(`${K}claude --model haiku --continue`);
+    expect(launchCommandFor('claude --continue', { capabilities: can, provider: 'claude', model: 'haiku' }))
+      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch -)" --model haiku --continue`);
     expect(launchCommandFor('claude', { capabilities: can, provider: 'claude', model: 'opus', project: 'p', workstream: 'w' }))
       .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=p TERMAG_WORKSTREAM=w termag-credentials telemetry-launch -)" --model opus`);
   });
@@ -227,4 +263,30 @@ describe('launchCommandFor: a Claude pane in a space gets no skills from it (doc
       expect(typed).toBe(launchCommandFor(cmd, { capabilities: [TELEMETRY_REPLAY_CAPABILITY], provider: 'claude', project: 'web', workstream: 'main' }));
     }
   });
+});
+
+describe('resumeOrFresh: a resume with nothing to continue starts fresh', () => {
+  it('braces each side, falls back only on status 1, and says why', () => {
+    expect(resumeOrFresh('claude --continue', 'claude'))
+      .toBe(`{ claude --continue; } || { [ $? -eq 1 ] && echo '${RESUME_FALLBACK_NOTICE}' && claude; }`);
+    expect(resumeOrFresh('claude', 'claude')).toBe('claude');
+    expect(resumeOrFresh('', 'claude')).toBe('');
+  });
+
+  // The typed line in a real shell (the panes' are bash or zsh), with a
+  // stand-in claude whose --continue exits as the case says.
+  for (const shell of ['sh', 'bash', 'zsh']) {
+    const has = spawnSync(shell, ['-c', 'true']).status === 0;
+    it.skipIf(!has)(`in ${shell}: no conversation (1) starts fresh; a quit (0) or a stop (143) does not`, () => {
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'resume-or-fresh-'));
+      fs.writeFileSync(path.join(bin, 'claude'), '#!/bin/sh\necho "claude $*"\n[ "$1" = --continue ] && exit "$RESUME_RC"\nexit 0\n', { mode: 0o755 });
+      // A backend's line has an `&&` of its own, which the braces keep whole.
+      const typed = resumeOrFresh('true && claude --continue', 'true && claude');
+      const run = (rc: number) => spawnSync(shell, ['-c', typed], { env: { PATH: `${bin}:/usr/bin:/bin`, RESUME_RC: String(rc) }, encoding: 'utf8' }).stdout;
+      expect(run(1)).toBe(`claude --continue\n${RESUME_FALLBACK_NOTICE}\nclaude \n`);
+      expect(run(0)).toBe('claude --continue\n');
+      expect(run(143)).toBe('claude --continue\n');
+      fs.rmSync(bin, { recursive: true, force: true });
+    });
+  }
 });

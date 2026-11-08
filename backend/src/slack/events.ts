@@ -47,6 +47,7 @@ import {
   setActiveLocalSession, getActiveLocalSession, clearActiveLocalSession,
   setNotificationTarget,
 } from './lts';
+import { LISTED_PROJECT_KINDS, listedOrNull } from '../services/projectKind';
 
 // Track users who have the App Home tab open
 const activeHomeViewers = new Set<string>();
@@ -202,8 +203,9 @@ async function resolveChannelTarget(command: any, preferUserId: string | undefin
   const channelName: string = command.channel_name ?? '';
   if (!channelName.startsWith('proj-')) return null;
 
+  // A space orchestrator is no project channel's target (projectKind.ts inProjectLists).
   const projects = await prisma.project.findMany({
-    where: { archived: false },
+    where: { archived: false, kind: { in: LISTED_PROJECT_KINDS } },
     include: { user: true, workstreams: { where: { archived: false }, select: { name: true } } },
   });
   const m = matchChannelTarget(channelName, projects, preferUserId);
@@ -247,7 +249,8 @@ async function activeTarget(userId: string): Promise<ChannelTarget | null> {
   const projectId = getActiveProjectId(userId);
   if (!projectId) return null;
   const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
-  return project && !project.archived ? { project, workstream: getActiveWorkstream(userId) } : null;
+  return project && !project.archived && listedOrNull(project)
+    ? { project, workstream: getActiveWorkstream(userId) } : null;
 }
 
 /**
@@ -618,6 +621,7 @@ export function registerEventHandlers(app: App): void {
       const projects = await prisma.project.findMany({
         where: {
           archived: false,
+          kind: { in: LISTED_PROJECT_KINDS },
           ...(termagUser ? { OR: [{ userId: termagUser.id }, { shares: { some: { userId: termagUser.id } } }] } : {}),
         },
         include: { workflows: true, user: true, workstreams: { where: { archived: false }, orderBy: { createdAt: 'asc' } } },
@@ -649,11 +653,11 @@ export function registerEventHandlers(app: App): void {
       const [projectName, wsName = 'main'] = cmd.target.split('/');
       const include = { user: true, workstreams: { where: { archived: false }, select: { name: true } } };
       const owned = termagUser
-        ? await prisma.project.findMany({ where: { name: projectName, archived: false, userId: termagUser.id }, include })
+        ? await prisma.project.findMany({ where: { name: projectName, archived: false, kind: { in: LISTED_PROJECT_KINDS }, userId: termagUser.id }, include })
         : [];
       const found = owned.length > 0
         ? owned
-        : await prisma.project.findMany({ where: { name: projectName, archived: false }, include });
+        : await prisma.project.findMany({ where: { name: projectName, archived: false, kind: { in: LISTED_PROJECT_KINDS } }, include });
       // Someone else's project is "No project", as on the web.
       const named = [];
       for (const p of found) if (await access.mayReach(p.id)) named.push(p);
@@ -709,7 +713,10 @@ export function registerEventHandlers(app: App): void {
         await reply(`No tmux session \`${target}\`.` + typeInstead(userCommand));
         return;
       }
-      if (resolved.projectId) setActiveProjectId(userId, resolved.projectId, resolved.workstream ?? 'main');
+      // Attaching shows the pane; only a listed project becomes the saved target (projectKind.ts inProjectLists).
+      if (resolved.projectId && listedOrNull(await prisma.project.findUnique({ where: { id: resolved.projectId }, select: { kind: true } }))) {
+        setActiveProjectId(userId, resolved.projectId, resolved.workstream ?? 'main');
+      }
       clearActiveLocalSession(userId);
 
       setNotificationTarget(target, { channel: command.channel_id, userId }, 'slack', resolved.instanceId);
@@ -854,9 +861,10 @@ export function registerEventHandlers(app: App): void {
       await reply('The project you switched to is gone. Use `/t projects` and `/t switch <project>[/<workstream>]` to pick another.');
       return;
     } else {
-      // The caller's own first, then one shared with them: what `/t projects` lists.
+      // The caller's own first, then one shared with them: what `/t projects`
+      // lists, so never a space orchestrator (projectKind.ts inProjectLists).
       const firstWhere = (where: Prisma.ProjectWhereInput) => prisma.project.findFirst({
-        where: { archived: false, workflows: { some: { type: 'agent' } }, ...where }, include: { user: true }, orderBy: { name: 'asc' },
+        where: { archived: false, kind: { in: LISTED_PROJECT_KINDS }, workflows: { some: { type: 'agent' } }, ...where }, include: { user: true }, orderBy: { name: 'asc' },
       });
       const first = termagUser
         ? await firstWhere({ userId: termagUser.id }) ?? await firstWhere({ shares: { some: { userId: termagUser.id } } })
@@ -997,7 +1005,7 @@ export function registerEventHandlers(app: App): void {
     }
     // The buttons go before the upload starts.
     await mark(`Sharing *${name}*…`);
-    const problem = await shareAttachment(client, { channel: channelId, threadTs, path: offer.path, workingDir: offer.workingDir });
+    const problem = await shareAttachment(client, { channel: channelId, threadTs, path: offer.path, workingDir: offer.workingDir, runDir: offer.runDir });
     await mark(problem ? `Couldn't share *${name}*: ${problem}.` : `<@${clicker}> shared *${name}*.`);
   });
 

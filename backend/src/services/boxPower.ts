@@ -177,6 +177,16 @@ export async function requestPower(instance: Instance, action: PowerAction, opts
   // promises nothing now, so a warning on a `starting` box is the stuck-start
   // pass's, which the box list shows (Bugbot on #623).
   if (action === 'start') Object.assign(data, { idleWarnedAt: null, idleParkAt: null });
+  // The resume marker: a hibernated box comes back with its sessions on the
+  // binaries they had, and no boot unit runs, so the tool sweep gives it a run
+  // on its first hello after this (services/toolUpdate/autoRuns.ts). Not for
+  // the refresh's resume, which hibernates it again at once.
+  // The settle of a stop or hibernate clears it (below, with downSince), not
+  // this request: a refused or timed-out one leaves the box up on the
+  // binaries it resumed with (Bugbot on #1163).
+  // A refresh start clears any marker left from before (Bugbot on #1163).
+  if (action === 'start' && instance.status === 'hibernated' && !opts.rehibernate) data.resumedFromHibernationAt = new Date();
+  else if (action === 'start' && opts.rehibernate) data.resumedFromHibernationAt = null;
   if (opts.markInUse) Object.assign(data, boxInUseFields(instance.id));
   else if (opts.guestWake && action === 'start') Object.assign(data, guestWakeFields(instance.id));
   if (opts.byOwner && action !== 'start') data.lifecycleNote = null;
@@ -265,6 +275,8 @@ async function revert(instance: Instance, from: string): Promise<void> {
       lifecycleNote: instance.lifecycleNote,
       lastActivityAt: instance.lastActivityAt,
       downSince: instance.downSince,
+      // A refused start from hibernated left the box down: it was not resumed (Bugbot on #1163).
+      resumedFromHibernationAt: instance.resumedFromHibernationAt,
     },
   }).catch(e => console.error(`[BOX] ${instance.name}: failed to revert ${from}:`, errMsg(e)));
 }
@@ -344,6 +356,11 @@ export async function sweepPowerStates(now = Date.now()): Promise<void> {
     const slept = sleepOutcome(box.status, settlement.status);
     if ((slept === 'stopped' || slept === 'hibernated') && !box.downSince) data.downSince = new Date(now);
     if (slept === 'failed') data.downSince = null;
+    // A box that is down took its sessions with it, or never came up: a
+    // resume marker is spent, whether a stop settled or a start timed out
+    // back to down, and the next start gets the boot run or its own marker
+    // (Bugbot on #1163).
+    if (settlement.status === 'stopped' || settlement.status === 'hibernated') data.resumedFromHibernationAt = null;
     if (settlement.status && settlement.status !== 'ready') data.rehibernatePending = false;
     // A stop or hibernate that timed out back to ready didn't park the box,
     // so it isn't one the sweep parked and nobody touched: the next sweep's

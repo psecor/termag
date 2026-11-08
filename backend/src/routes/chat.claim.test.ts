@@ -2,6 +2,7 @@
 // claimChatFor): the owner
 // only, never an ask's chat, a box whose runner keeps the hold; the box's
 // answer decides, and a claim it takes is recorded as of when it was asked.
+// The desktop's live send and stop (chatOwnerRefusal) are the owner's too.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const SESSION = '5109190e-c0d2-4f72-9c15-3c4c57fb126c';
@@ -42,7 +43,7 @@ vi.mock('../services/chatHolder', async (orig) => ({
   saveChatHolder: vi.fn(async (...args: unknown[]) => { h.saved.push(args); }),
 }));
 
-import { claimChatFor } from './chat';
+import { chatOwnerRefusal, claimChatFor } from './chat';
 import { sendForProject } from '../services/agentRegistry';
 import { paneLockKey, withPaneLock } from '../services/agentRuntime';
 
@@ -114,5 +115,17 @@ describe('claimChatFor', () => {
     h.isOwner = false;
     expect(await claimChatFor('bob', 'p1', { threadId: 't1' })).toMatchObject({ status: 403, body: { code: 'not-owner' } });
     expect(claims()).toEqual([]);
+  });
+});
+
+describe('chatOwnerRefusal', () => {
+  it("lets the owner through, refuses a collaborator, and passes on a person with no access", async () => {
+    expect(await chatOwnerRefusal('owner', 'p1', 'main')).toBeNull();
+    h.isOwner = false;
+    expect(await chatOwnerRefusal('bob', 'p1', undefined)).toEqual({ status: 403, body: { error: "Only the project's owner can continue this chat", code: 'not-owner' } });
+    const { projectSessionAccess, SessionAccessError } = await import('../services/sessionAccess');
+    vi.mocked(projectSessionAccess).mockRejectedValueOnce(new SessionAccessError('Project not found'));
+    expect(await chatOwnerRefusal('eve', 'p1', 'main')).toEqual({ status: 403, body: { error: 'Project not found' } });
+    expect(sendForProject).not.toHaveBeenCalled();
   });
 });

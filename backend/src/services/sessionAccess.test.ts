@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 // Alice owns myproj (workstreams main and feature) and myproj-secret; Bob has
 // a share on myproj only. Their names overlap the way the bypass needs.
 const projects = [
-  { id: 'p-myproj', name: 'myproj', userId: 'u-alice', instanceId: 'box-a', archived: false, setupStatus: 'ready', workstreams: ['main', 'feature'] },
+  { id: 'p-myproj', name: 'myproj', userId: 'u-alice', instanceId: 'box-a', archived: false, setupStatus: 'ready', workstreams: ['main', 'feature', 'ask-thread0001'] },
   { id: 'p-secret', name: 'myproj-secret', userId: 'u-alice', instanceId: 'box-a', archived: false, setupStatus: 'ready', workstreams: ['main'] },
   { id: 'p-old', name: 'old', userId: 'u-alice', instanceId: 'box-a', archived: true, setupStatus: 'ready', workstreams: ['main'] },
 ];
@@ -13,7 +13,7 @@ vi.mock('../db', () => ({
     project: {
       findUnique: vi.fn(async ({ where }: { where: { id: string } }) => {
         const p = projects.find(x => x.id === where.id);
-        return p ? { ...p, user: { id: p.userId, unixUsername: 'alice' }, workstreams: p.workstreams.map(name => ({ name })) } : null;
+        return p ? { ...p, user: { id: p.userId, unixUsername: 'alice' }, workstreams: p.workstreams.map(name => ({ name, askThread: name.startsWith('ask-') ? { id: name.slice(4) } : null })) } : null;
       }),
     },
     projectShare: {
@@ -23,8 +23,8 @@ vi.mock('../db', () => ({
   },
 }));
 
-const { legalSessions, isSessionRole, isOnCallerHost, parseReviewSlot, projectSessionAccess, terminalSessionAccess, SESSION_ROLES } = await import('./sessionAccess');
-const { MAX_REVIEW_SLOTS } = await import('./tmux');
+const { askChatPaneRefusal, legalSessions, isSessionRole, isOnCallerHost, parseReviewSlot, projectSessionAccess, terminalSessionAccess, SESSION_ROLES } = await import('./sessionAccess');
+const { MAX_REVIEW_SLOTS, MAX_TERMINAL_SLOTS } = await import('./tmux');
 
 describe('legalSessions', () => {
   it('builds every role for main, collapsing the workstream segment', () => {
@@ -33,6 +33,9 @@ describe('legalSessions', () => {
       // Review slots 2..8.
       'alice-termag-review-2', 'alice-termag-review-3', 'alice-termag-review-4', 'alice-termag-review-5',
       'alice-termag-review-6', 'alice-termag-review-7', 'alice-termag-review-8',
+      // Terminal slots 2..8; slot 1 is the ctrl pane itself.
+      'alice-termag-ctrl-2', 'alice-termag-ctrl-3', 'alice-termag-ctrl-4', 'alice-termag-ctrl-5',
+      'alice-termag-ctrl-6', 'alice-termag-ctrl-7', 'alice-termag-ctrl-8',
     ]);
   });
   it('threads non-main workstreams through the name', () => {
@@ -43,7 +46,8 @@ describe('legalSessions', () => {
     expect(legalSessions('alice', 'termag', [])).toEqual(legalSessions('alice', 'termag', ['main']));
   });
   it('covers all workstreams × roles', () => {
-    expect(legalSessions('alice', 'p', ['main', 'a', 'b'])).toHaveLength(3 * (SESSION_ROLES.length + MAX_REVIEW_SLOTS - 1));
+    expect(legalSessions('alice', 'p', ['main', 'a', 'b']))
+      .toHaveLength(3 * (SESSION_ROLES.length + MAX_REVIEW_SLOTS - 1 + MAX_TERMINAL_SLOTS - 1));
   });
   it('handles hyphenated project and workstream names verbatim', () => {
     expect(legalSessions('alice', 'ic-sample-app', ['small-fixes']))
@@ -85,13 +89,24 @@ describe('review slots (docs/parallel-reviews.md)', () => {
       expect(await terminalSessionAccess('u-bob', 'p-myproj', target)).toEqual({ refusal: 'session/project mismatch' });
     }
   });
-  it('builds a slot only for the review role, and only 1 to 8', async () => {
+  it('attaches every terminal slot of a workstream, and no slot past the last', async () => {
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-ctrl-3')).toMatchObject({ role: 'ctrl', slot: 3, session: 'alice-myproj-ctrl-3' });
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-ctrl')).toMatchObject({ role: 'ctrl', slot: 1 });
+    expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-feature-ctrl-8', 'feature')).toMatchObject({ slot: 8 });
+    for (const target of ['alice-myproj-ctrl-9', 'alice-myproj-ctrl-02']) {
+      expect(await terminalSessionAccess('u-bob', 'p-myproj', target)).toEqual({ refusal: 'session/project mismatch' });
+    }
+  });
+  it('builds a slot only for the slotted roles, and only 1 to their max', async () => {
     const forPane = await projectSessionAccess('u-alice', 'p-myproj');
     expect(forPane('review', 'main', 2)).toMatchObject({ session: 'alice-myproj-review-2', slot: 2 });
     expect(forPane('review', 'main')).toMatchObject({ session: 'alice-myproj-review', slot: 1 });
     expect(forPane('agent', 'main')).toMatchObject({ slot: null });
-    expect(() => forPane('agent', 'main', 2)).toThrow(/only for the review role/);
+    expect(forPane('ctrl', 'main', 2)).toMatchObject({ session: 'alice-myproj-ctrl-2', slot: 2 });
+    expect(forPane('ctrl', 'main')).toMatchObject({ session: 'alice-myproj-ctrl', slot: 1 });
+    expect(() => forPane('agent', 'main', 2)).toThrow(/only for the review and ctrl roles/);
     expect(() => forPane('review', 'main', 9)).toThrow(/slot must be 1 to 8/);
+    expect(() => forPane('ctrl', 'main', 9)).toThrow(/slot must be 1 to 8/);
   });
   it('parses a slot from a request, absent being slot 1', () => {
     expect(parseReviewSlot(undefined)).toEqual({ ok: true, slot: 1 });
@@ -101,12 +116,34 @@ describe('review slots (docs/parallel-reviews.md)', () => {
   });
 });
 
+describe('askChatPaneRefusal', () => {
+  it("marks an ask thread's chat, which has no pane, and refuses pane reads of it with 409", async () => {
+    const forPane = await projectSessionAccess('u-alice', 'p-myproj');
+    const chat = forPane('agent', 'ask-thread0001');
+    expect(chat).toMatchObject({ askChat: true, session: 'alice-myproj-ask-thread0001-agent' });
+    expect(askChatPaneRefusal(chat)).toMatchObject({ status: 409, body: { code: 'ask_chat_no_pane' } });
+    expect(askChatPaneRefusal(chat)!.body.error).toMatch(/ask-thread0001 is an ask thread's chat, which has no tmux pane/);
+  });
+  it('lets every other workstream through', async () => {
+    const forPane = await projectSessionAccess('u-alice', 'p-myproj');
+    for (const ws of ['main', 'feature']) {
+      expect(forPane('agent', ws).askChat).toBe(false);
+      expect(askChatPaneRefusal(forPane('agent', ws))).toBeNull();
+    }
+  });
+});
+
 describe('terminalSessionAccess', () => {
   it("lets a collaborator attach the shared project's own sessions", async () => {
     const access = await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-agent');
     expect(access).toMatchObject({ role: 'agent', workstream: 'main', isOwner: false, session: 'alice-myproj-agent' });
     expect(await terminalSessionAccess('u-bob', 'p-myproj', 'alice-myproj-feature-data-ctrl', 'feature'))
       .toMatchObject({ role: 'data-ctrl', workstream: 'feature' });
+  });
+
+  it("refuses an attach to an ask thread's chat, whose session tmux never has", async () => {
+    expect(await terminalSessionAccess('u-alice', 'p-myproj', 'alice-myproj-ask-thread0001-agent', 'ask-thread0001'))
+      .toEqual({ refusal: 'ask chat has no pane' });
   });
 
   it("carries what the socket routes on: the owner, the box and the project's setup", async () => {

@@ -35,11 +35,11 @@ import { webBase } from '../briefing/slack';
 import { RUNNER_AGENT_CAPABILITY, tmuxSafe } from '../claudeRunnerSpawn';
 import { boolVariation } from '../featureFlags';
 import { roleAtLeast, type SpaceRole } from '../spaces/spaceAccess';
-import { spaceStore, spacesEnabledFor } from '../spaces/spacesRuntime';
+import { spaceStore } from '../spaces/spacesRuntime';
 import { renderReadme } from './readme';
 import { folderOf } from './spaceFolder';
 
-export type SpaceSyncRefusal = 'spaces_off' | 'space_not_found' | 'space_forbidden' | 'space_read_only' | 'shared_outside_space';
+export type SpaceSyncRefusal = 'space_not_found' | 'space_forbidden' | 'space_read_only' | 'shared_outside_space';
 
 /** The folder layout, the run log and the README; off, only the notes file is mirrored. */
 export const SPACE_FOLDER_FLAG = 'automation-space-folder-enabled' satisfies BoolFlagKey;
@@ -160,11 +160,10 @@ export function syncSessionName(hostUnixUser: string, runId: string, direction: 
 
 /**
  * Whether the owner may mirror to this space, from what the store said:
- * the flag, the space, the owner's role (editor or owner writes), and
+ * the space, the owner's role (editor or owner writes), and
  * whether the space is read-only.
  */
-export function spaceSyncDecision(i: { flagOn: boolean; space: { deletedAt: Date | null; readOnlyAt: Date | null } | null; role: SpaceRole | undefined; shareesWithoutWrite?: number }): SpaceSyncRefusal | null {
-  if (!i.flagOn) return 'spaces_off';
+export function spaceSyncDecision(i: { space: { deletedAt: Date | null; readOnlyAt: Date | null } | null; role: SpaceRole | undefined; shareesWithoutWrite?: number }): SpaceSyncRefusal | null {
   // A space the caller is no member of answers as a missing one, as the
   // spaces routes do: names are global, and a guessed name must not confirm
   // another user's private space exists.
@@ -186,7 +185,6 @@ export function shareesWithoutWrite(shareUserIds: readonly string[], roles: Read
 }
 
 export const SYNC_REFUSAL_TEXT: Record<SpaceSyncRefusal, string> = {
-  spaces_off: 'Spaces are not enabled for you',
   space_not_found: 'No such space that you are a member of',
   space_forbidden: 'You can only mirror notes to a space you can write to (editor or owner)',
   space_read_only: 'That space is read-only',
@@ -199,15 +197,14 @@ function isRefusal(reason: string | null): reason is SpaceSyncRefusal {
 
 /** Check a space for an owner, as the routes do before saving a spaceName. */
 export async function checkSpaceForOwner(userId: string, spaceName: string, projectId?: string): Promise<{ ok: true; spaceId: string } | { ok: false; reason: SpaceSyncRefusal }> {
-  const flagOn = await spacesEnabledFor(userId);
-  const space = flagOn ? await spaceStore.findSpace(spaceName) : null;
+  const space = await spaceStore.findSpace(spaceName);
   const roles = space ? await spaceStore.memberRoles(space.id) : new Map<string, SpaceRole>();
   const role = roles.get(userId);
   // The project's sharees, checked at every transfer (get and put) and when the space is chosen.
   const sharees = projectId
     ? (await prisma.projectShare.findMany({ where: { projectId }, select: { userId: true } })).map(s => s.userId).filter(id => id !== userId)
     : [];
-  const refusal = spaceSyncDecision({ flagOn, space, role, shareesWithoutWrite: shareesWithoutWrite(sharees, roles) });
+  const refusal = spaceSyncDecision({ space, role, shareesWithoutWrite: shareesWithoutWrite(sharees, roles) });
   return refusal ? { ok: false, reason: refusal } : { ok: true, spaceId: space!.id };
 }
 

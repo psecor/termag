@@ -337,7 +337,7 @@ describe('claudeFloorDecision', () => {
     for (const installed of ['2.1.308', '2.1.312', '3.0.0', null, 'garbled']) expect(claudeFloorDecision({ ...f, installed })).toEqual({ kind: 'ok' });
   });
 
-  it('refuses nothing with claude-code-update-enabled off', () => {
+  it('refuses nothing with Claude Code\'s mode off (enforce false)', () => {
     expect(claudeFloorDecision({ ...f, enforce: false })).toEqual({ kind: 'ok' });
   });
 });

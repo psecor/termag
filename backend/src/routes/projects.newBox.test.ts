@@ -115,6 +115,19 @@ vi.mock('../services/cliStorePrisma', () => ({
   prismaCliStore: { listProjects: vi.fn(async () => [{ id: 'p1', name: 'notes' }]), listBoxes: vi.fn(async () => []) },
 }));
 
+// An environment named in a create (services/environments.ts): its repositories, and what of its definition was left out.
+const environmentWarnings = vi.hoisted(() => ({ list: [] as string[] }));
+vi.mock('../services/environments', async importOriginal => {
+  const real = await importOriginal<typeof import('../services/environments')>();
+  return {
+    ...real,
+    withEnvironmentRepos: vi.fn(async (store: unknown, userId: string, input: { environment?: string | null }) => {
+      if (!input.environment) return { input, warnings: [] };
+      const { environment: _e, ...rest } = input;
+      return { input: rest, warnings: environmentWarnings.list, environmentId: 'e-shop' };
+    }),
+  };
+});
 const { createProjectFor, retryCloneFor } = await import('./projects');
 const { prismaCliLifecycle } = await import('./cliLifecyclePrisma');
 const { setWorkspaceChangeCallback } = await import('../services/workspaceEvents');
@@ -275,14 +288,23 @@ describe('a project asked for with a new box', () => {
     expect((await createProjectFor(user, { ...empty, warmClaimed: true })).status).toBe(201);
     expect(productEvents()).toEqual([
       {
-        'event.name': 'project.created', 'termag.user.id': 'u1', 'termag.box.id': 'box1',
-        'termag.provider': 'claude', 'termag.repoSource': 'empty', 'termag.boxKind': 'box', 'termag.warmClaimed': true, 'termag.spawned': false,
-      },
-      {
         'event.name': 'agent.session.started', 'termag.user.id': 'u1', 'termag.box.id': 'box1',
         'termag.provider': 'claude', 'termag.kind': 'interactive', 'termag.resume': false, 'termag.spawned': false, 'termag.clone': false,
       },
+      {
+        'event.name': 'project.created', 'termag.user.id': 'u1', 'termag.box.id': 'box1',
+        'termag.provider': 'claude', 'termag.repoSource': 'empty', 'termag.boxKind': 'box', 'termag.warmClaimed': true, 'termag.spawned': false,
+      },
     ]);
+  });
+
+  it('records no project.created for a create rolled back when its workflow fails', async () => {
+    state.box = box('ready');
+    state.connected = true;
+    prisma.workflow.create.mockRejectedValueOnce(new Error('db down'));
+    expect((await createProjectFor(user, empty)).status).toBe(500);
+    expect(prisma.project.delete).toHaveBeenCalled();
+    expect(productEvents().map(a => a['event.name'])).not.toContain('project.created');
   });
 
   it('records no launch event for a project still waiting for its box', async () => {
@@ -319,7 +341,7 @@ describe('Retry on a project whose box failed to launch', () => {
     expect(result).toEqual({ status: 202, body: { setupStatus: 'pending', instanceId: 'box2' } });
     expect(state.box?.status).toBe('terminated');
     expect(terminateBox).toHaveBeenCalledOnce();
-    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: undefined, relaunchDiskGiB: null });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: undefined, relaunchDiskGiB: null, relaunchSetupOff: false });
     expect(state.project).toMatchObject({ instanceId: 'box2', setupStatus: 'pending' });
   });
 
@@ -327,7 +349,27 @@ describe('Retry on a project whose box failed to launch', () => {
     (state.box as unknown as { size: string }).size = 'medium';
     createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
     await retryCloneFor(user, 'p1');
-    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: 'medium', relaunchDiskGiB: null });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full' }, { relaunchSize: 'medium', relaunchDiskGiB: null, relaunchSetupOff: false });
+  });
+
+  it('relaunches a failed box with termag setup off with it off, marked as the relaunch so the flag does not refuse it (Bugbot, #983)', async () => {
+    (state.box as unknown as { setupEnabled: boolean }).setupEnabled = false;
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1');
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full', setupEnabled: false }, { relaunchSize: undefined, relaunchDiskGiB: null, relaunchSetupOff: true });
+  });
+
+  it('relaunches a failed box with setup off with setup on when the Retry says so: an ask needs it (Bugbot, #983)', async () => {
+    (state.box as unknown as { setupEnabled: boolean }).setupEnabled = false;
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1', { setupEnabled: true });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full', setupEnabled: true }, { relaunchSize: undefined, relaunchDiskGiB: null, relaunchSetupOff: false });
+  });
+
+  it('asking setup off for a failed box that had it on is a new choice, not a relaunch the flag exempts', async () => {
+    createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
+    await retryCloneFor(user, 'p1', { setupEnabled: false });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'full', setupEnabled: false }, { relaunchSize: undefined, relaunchDiskGiB: null, relaunchSetupOff: false });
   });
 
   it("keeps an ask box's ask-box policy on the replacement (termag ask --new-box rerun after a failed launch)", async () => {
@@ -349,7 +391,7 @@ describe('Retry on a project whose box failed to launch', () => {
     state.box.status = 'failed';
     createBox.mockResolvedValue({ status: 201, body: { instance: { id: 'box2' }, claimed: false } });
     await retryCloneFor(user, 'p1');
-    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'minimal' }, { relaunchSize: undefined, relaunchDiskGiB: null });
+    expect(createBox).toHaveBeenCalledWith(user, { name: 'alice-box', kind: 'ec2', flavor: 'minimal' }, { relaunchSize: undefined, relaunchDiskGiB: null, relaunchSetupOff: false });
   });
 
   it('leaves the project on the retired box when no new box can be made, so Retry can try again', async () => {
@@ -386,5 +428,70 @@ describe('termag project create <box>/<project> --new-box', () => {
     const result = await prismaCliLifecycle.createProject({ id: 'u1' } as never, { boxId: 'box1', name: '', agent: 'claude' });
     expect(result.status).toBe(400);
     expect(changed).not.toHaveBeenCalled();
+  });
+});
+
+describe('a project made from an environment', () => {
+  const WARNING = "shop's file, acme/web:env:.termag/shop/environment.json, is not there, so it was left out";
+  beforeEach(() => { environmentWarnings.list = [WARNING]; });
+
+  it("answers its definition's warnings with the 201, as a box create does (Bugbot, #985)", async () => {
+    state.box = box('ready');
+    state.connected = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await createProjectFor(user, { ...empty, environment: 'shop' });
+    expect(result.status).toBe(201);
+    expect(result.body).toMatchObject({ warnings: [WARNING] });
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(WARNING));
+  });
+
+  it('carries them through the CLI create too', async () => {
+    state.box = box('ready');
+    state.connected = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await prismaCliLifecycle.createProject({ id: 'u1' } as never, { boxId: 'box1', name: 'notes', agent: 'claude', environment: 'shop' });
+    expect(result.body).toMatchObject({ warnings: [WARNING] });
+  });
+
+  it('writes nothing when the environment no longer resolves to the repositories Full access was granted for', async () => {
+    state.box = box('ready');
+    state.connected = true;
+    const { withEnvironmentRepos } = await import('../services/environments');
+    const refusal = { status: 409 as const, body: { error: "shop's repositories changed since you looked", code: 'environment_repos_changed' } };
+    vi.mocked(withEnvironmentRepos).mockResolvedValueOnce(refusal);
+    prisma.project.create.mockClear();
+    const result = await createProjectFor(user, { ...empty, environment: 'shop', chatTrusted: true, environmentRepos: ['acme/web'] });
+    expect(result).toEqual(refusal);
+    expect(prisma.project.create).not.toHaveBeenCalled();
+    expect(vi.mocked(withEnvironmentRepos)).toHaveBeenLastCalledWith(expect.anything(), user.id, expect.objectContaining({ chatTrusted: true, environmentRepos: ['acme/web'] }));
+  });
+
+  it("passes the checkouts the CLI read to the create, which is held to them", async () => {
+    state.box = box('ready');
+    state.connected = true;
+    const { withEnvironmentRepos } = await import('../services/environments');
+    const pin = [{ repo: 'acme/web' }];
+    await prismaCliLifecycle.createProject({ id: 'u1' } as never, { boxId: 'box1', name: 'notes', agent: 'claude', environment: 'shop', environmentRepos: pin, createdFor: 'ask' });
+    expect(vi.mocked(withEnvironmentRepos).mock.lastCall?.[2]).toMatchObject({ environment: 'shop', environmentRepos: pin });
+  });
+
+  it("records the environment the project's checkouts came from, so its asks are capped (askService askModeFor)", async () => {
+    state.box = box('ready');
+    state.connected = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    prisma.project.create.mockClear();
+    await createProjectFor(user, { ...empty, environment: 'shop', environmentRepos: [{ repo: 'acme/web' }] });
+    expect(prisma.project.create.mock.calls[0][0].data).toMatchObject({ environmentId: 'e-shop' });
+    prisma.project.create.mockClear();
+    await createProjectFor(user, { ...empty, name: 'plain' });
+    expect(prisma.project.create.mock.calls[0][0].data).toMatchObject({ environmentId: null });
+  });
+
+  it('answers no warnings key when there are none', async () => {
+    environmentWarnings.list = [];
+    state.box = box('ready');
+    state.connected = true;
+    const result = await createProjectFor(user, { ...empty, environment: 'shop' });
+    expect(result.body).not.toHaveProperty('warnings');
   });
 });

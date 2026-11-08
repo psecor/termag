@@ -8,15 +8,10 @@ import { startBriefing } from '../services/briefing/runner';
 import { readSchedule } from '../services/briefing/schedule';
 import { latestFor, listFor, viewById } from '../services/briefing/store';
 import { safeTimeZone } from '../services/briefing/window';
-import { desktopAppEnabled } from '../services/desktopAppFlag';
 import type { CliBriefings } from './cliBriefings';
 
 export function createPrismaCliBriefings(dismissals: DismissalStore = prismaDismissals): CliBriefings {
   return {
-    async enabled(user) {
-      const owner = await prisma.user.findUnique({ where: { id: user.id } });
-      return !!owner && await desktopAppEnabled(owner);
-    },
     async latest(user) {
       // A failed read of the marks still answers the briefing, with nothing hidden.
       const [views, marks] = await Promise.all([latestFor(user.id), dismissals.list(user.id, new Date()).catch(() => [])]);

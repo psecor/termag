@@ -289,8 +289,6 @@ export function stopPreviewShareSweep(): void {
 export interface WakeDeps {
   /** `recordEvent`: a start that failed leaves a `wake-failed` event, since its `woke` is given back. */
   store: Pick<PreviewShareStore, 'claimWake' | 'refundWake' | 'recordEvent'>;
-  /** `browser-pane-guest-wake-enabled`, for the owner and box. */
-  wakeOn(owner: User, box: Instance | null): Promise<boolean>;
   start(box: Instance): Promise<void>;
   provisioningConfigured(): boolean;
   notifyOwner(owner: { id: string; displayName: string; slackUserId: string | null; googleEmail: string }, text: string): Promise<void>;
@@ -301,7 +299,7 @@ export interface WakeDeps {
   now(): number;
 }
 
-export const defaultWakeDeps: Omit<WakeDeps, 'wakeOn'> = {
+export const defaultWakeDeps: WakeDeps = {
   store: prismaPreviewShareStore,
   // Not an owner's start: the idle clock restarts, the terminate clock stays (boxPower `guestWake`).
   start: async (box) => { await requestPower(box, 'start', { guestWake: true }); },
@@ -342,7 +340,6 @@ export async function wakeShareBox(deps: WakeDeps, ctx: GuestShareContext, viewe
   if (box?.status === 'starting') return { ok: true, status: 'starting' };
   const refusal = guestWakeRefusal(box, isAutoHibernateNote, isSweepStopped);
   if (refusal) return no(refusal);
-  if (!(await deps.wakeOn(owner, box))) return no('wake-off');
   // The owner's own checks, as the owner: a box on EC2, provisioning on, a
   // start the box's state allows, not one the sweep claimed for terminate.
   const policy = powerRequestError(box, owner.id, 'start', deps.provisioningConfigured());

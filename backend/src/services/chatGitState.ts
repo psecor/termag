@@ -5,8 +5,7 @@
  * turn there is told this, so Claude knows what went with the old disk.
  *
  * Read over `git-branch-state` (agent/git-branch-state.js, local refs only, no
- * fetch) right after the turn end's transcript pull, behind
- * chat-resume-new-box-enabled. Small on purpose: the branch, HEAD, its
+ * fetch) right after the turn end's transcript pull. Small on purpose: the branch, HEAD, its
  * upstream, whether HEAD is pushed, counts of unpushed commits and of
  * uncommitted and untracked files, and the workstream's open PR. Never a file
  * name, a diff or the origin URL (which may carry a token).
@@ -15,10 +14,8 @@
 import { prisma } from '../db';
 import { isChatRunnerProvider } from '../providers/registry';
 import { sendToInstanceAgent } from './agentRegistry';
-import { boolVariation } from './featureFlags';
 import { projectDirFor } from './tmux';
 
-export const CHAT_RESUME_FLAG = 'chat-resume-new-box-enabled';
 /** The JSON of one record never exceeds this. */
 export const GIT_STATE_MAX_BYTES = 1024;
 const RPC_TIMEOUT_MS = 10_000;
@@ -143,7 +140,6 @@ export async function recordChatGitState(chat: { instanceId: string; projectId: 
     });
     if (!ws || ws.projectId !== chat.projectId || ws.project.instanceId !== chat.instanceId) return;
     if (ws.askThread || !ws.workflows.some(w => isChatRunnerProvider(w.provider))) return;
-    if (!await boolVariation(CHAT_RESUME_FLAG, ws.project.user, false)) return;
     const current = await prisma.chatTranscript.findFirst({ where: { projectId: chat.projectId, workstreamId: chat.workstreamId, current: true }, select: { sessionId: true } });
     if (!current) return;
     const cwd = projectDirFor({ name: ws.project.name, user: ws.project.user, instance: { hostHome: ws.project.instance?.hostHome ?? null } }, ws.name);

@@ -144,8 +144,6 @@ export interface PipelineDeps {
   viewer?: (token: string) => Promise<string>;
   /** A few fields of PRs by number, with their descriptions when asked (suggested groups); absent in tests that do not care. */
   lite?: (token: string, refs: { repo: string; number: number }[], withBody: boolean) => Promise<LitePr[]>;
-  /** Whether to suggest groups for the user (pr-review-groups-enabled): their descriptions are read only then. */
-  suggestionsOn?: (userId: string) => Promise<boolean>;
   /**
    * The PRs the user's sessions opened since `since` (their `created` links), with
    * pr-live-updates-enabled on for them; none otherwise. Absent in tests that do not care.
@@ -169,12 +167,6 @@ const defaultDeps: PipelineDeps = {
   byNumber: (token, viewer, refs) => fetchPrsByNumber(token, viewer, refs),
   viewer: token => viewerLogin(token),
   lite: (token, refs, withBody) => fetchPrLite(token, refs, withBody),
-  suggestionsOn: async userId => {
-    const user = await prisma.user.findUnique({
-      where: { id: userId }, select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true },
-    });
-    return user ? boolVariation('pr-review-groups-enabled', user, false) : false;
-  },
   reviewsOn: async userId => {
     const user = await prisma.user.findUnique({
       where: { id: userId }, select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true },
@@ -618,13 +610,12 @@ export function prsLister(
     return { groups, groupsError };
   };
   /**
-   * Suggested groups, only with the flag on (its descriptions cost a GitHub
-   * read). Never fails the list: a GitHub or database hiccup suggests nothing.
+   * Suggested groups (their descriptions cost a GitHub read, so only once in
+   * a while). Never fails the list: a GitHub or database hiccup suggests nothing.
    */
   const suggestionsFor = async (userId: string, token: string, laneRows: PrRow[], stored: StoredGroup[]): Promise<GroupSuggestion[]> => {
-    if (!deps.lite || !deps.suggestionsOn) return [];
+    if (!deps.lite) return [];
     try {
-      if (!(await deps.suggestionsOn(userId))) return [];
       const [{ bodies, others }, dismissed] = await Promise.all([suggestReadsFor(userId, token, laneRows, deps), dismissals.list(userId)]);
       const grouped = new Map<string, { id: string; name: string; size: number }>();
       for (const g of stored) {

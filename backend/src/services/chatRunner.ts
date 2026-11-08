@@ -7,6 +7,7 @@
  * agent session's status (so the sidebar, inbox and working time see chat
  * turns like pane turns) and hands to index.ts for the status WebSocket.
  */
+import { recordSessionTitle } from './sessionTitleEvent';
 import { prisma } from '../db';
 import { CHAT_EFFORT_CAPABILITY, type ChatEffort } from './chatEffort';
 import { genUiFields } from './chatGenUi';
@@ -21,15 +22,14 @@ import { chatHolderOf, saveChatHolder } from './chatHolder';
 import { FIREWORKS_MENU_CAPABILITY } from './fireworksGateway';
 import * as tmux from './tmux';
 import { traceSweep } from './tracing/spans';
+import { CHAT_IMAGE_SEND_TIMEOUT_MS } from './chatImages';
+import { CHAT_CONFINED_MCP_CAPABILITY, type BrokerMcp } from './chatConfinedMcp';
 
 export const CHAT_RUNNER_CAPABILITY = 'chat-runner-v1';
 /** The runner understands a trusted turn. chat-runner-v1 alone refuses any mode but dontAsk. */
 export const CHAT_TRUST_CAPABILITY = 'chat-trust-v1';
 /** The runner takes a message into the turn running (agent/chat-turn.js); without it a send queues. */
 export const CHAT_LIVE_CAPABILITY = 'chat-live-v1';
-export const CHAT_LIVE_INPUT_FLAG = 'chat-live-input-enabled';
-/** A send asks the runner for Claude's title for the session on each turn-end. */
-export const SESSION_TITLES_FLAG = 'simple-ui-session-titles-enabled';
 /** A box agent whose runner keeps the desktop app's hold on a chat's session (agent/chat-runner.js claimT3). */
 export const CHAT_T3_HOLD_CAPABILITY = 'chat-t3-hold-v1';
 /**
@@ -73,6 +73,16 @@ export const CHAT_CONTEXT_CAPABILITY = 'chat-context-v1';
  * Claude Code's `<session>/subagents/agent-<id>.jsonl`.
  */
 export const CHAT_SUBAGENTS_CAPABILITY = 'chat-subagents-v1';
+/** The runner pages in history older than chat-history's (chat-history-before), before an entry's uuid. */
+export const CHAT_HISTORY_PAGES_CAPABILITY = 'chat-history-pages-v1';
+/** A history entry's uuid as the transcript has it: a name, never a path (the agent checks it too). */
+export function historyUuidOf(raw: unknown): string | null {
+  return typeof raw === 'string' && /^[A-Za-z0-9-]{1,80}$/.test(raw) ? raw : null;
+}
+/** A chat-history-before cursor as the box handed it out: a session and a byte offset, nothing else. */
+export function historyCursorOf(raw: unknown): string | null {
+  return typeof raw === 'string' && /^[A-Za-z0-9-]{1,80}:\d{1,15}$/.test(raw) ? raw : null;
+}
 /** Subagents in the simple UI's chat: their rows, the agent tab and GET …/chat/subagents/:agentId. */
 export const CHAT_SUBAGENTS_FLAG = 'chat-subagents-enabled';
 /** A subagent's id as Claude Code names its file: a name, never a path (the agent checks it too). */
@@ -347,6 +357,7 @@ export function onChatEvent(listener: ChatEventListener): () => void {
 export function chatResumeClaimPayload(
   target: { chatKey: string; cwd: string; permissionMode: string; model?: string | null; project?: string | null; workstream?: string } & ChatBackend,
   capabilities: readonly string[] = [],
+  brokerMcp: BrokerMcp | null = null,
 ): Record<string, unknown> {
   return {
     chatKey: target.chatKey,
@@ -355,7 +366,14 @@ export function chatResumeClaimPayload(
     permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
     // The chat's backend, so Open in full UI continues there; its model with it.
     ...(target.backend && target.model ? { model: target.model, ...backendFields(target, capabilities) } : {}),
+    // The same broker connectors a turn would get (services/chatConfinedMcp.ts).
+    ...brokerMcpField(brokerMcp, capabilities),
   };
+}
+
+/** `brokerMcp` for an agent that reads it (chat-confined-mcp-v1); an older one would drop it anyway. */
+function brokerMcpField(brokerMcp: BrokerMcp | null | undefined, capabilities: readonly string[]): { brokerMcp?: BrokerMcp } {
+  return brokerMcp && capabilities.includes(CHAT_CONFINED_MCP_CAPABILITY) ? { brokerMcp } : {};
 }
 
 /**
@@ -368,11 +386,41 @@ function telemetryNames(target: { project?: string | null; workstream?: string }
   return target.project ? { project: target.project, ...(target.workstream ? { workstream: target.workstream } : {}) } : {};
 }
 
+/**
+ * How long the orchestrator waits for the box's answer to chat-send. The box
+ * answers once the turn has started (agent/chat-runner.js startTurn), or once
+ * the message is queued or in a live turn, and on a session's first turn on a
+ * box just claimed and updated that is the slow path: it waits for the
+ * runner's recovery after the agent's restart, reads the checkout's git facts,
+ * runs the space-memory CLI (up to 20 s, agent/space-memory.js CLI_TIMEOUT_MS)
+ * and starts the turn's tmux session. The wait must be longer than that: a
+ * shorter one tells the browser the send failed while the box goes on to
+ * start the turn with it.
+ */
+export const CHAT_SEND_TIMEOUT_MS = 60_000;
+
+/** chat-send's wait: the turn start, and with images their upload to the box before it. */
+export function chatSendTimeoutMs(imageCount: number): number {
+  return CHAT_SEND_TIMEOUT_MS + (imageCount > 0 ? CHAT_IMAGE_SEND_TIMEOUT_MS : 0);
+}
+
+const SEND_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+
+/**
+ * The browser's id for a message it may send again (a new session's first
+ * message, chat/useQueuedMessage.ts), or null for none or a malformed one.
+ * The box answers a repeat of an id it took as it answered the first time
+ * (agent/chat-send-ids.js); an older runner ignores it.
+ */
+export function chatSendId(v: unknown): string | null {
+  return typeof v === 'string' && SEND_ID_RE.test(v) ? v : null;
+}
+
 export function chatSendRpcPayload(
   target: { chatKey: string; cwd: string; projectId: string; project?: string | null; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean } & ChatBackend,
   text: string,
   capabilities: readonly string[] = [],
-  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean; headings?: boolean; effort?: ChatEffort | null; genUi?: boolean; genUiHint?: boolean; memorySpace?: string | null; boxNotices?: boolean; notice?: string | null; planSpend?: boolean } = {},
+  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean; headings?: boolean; effort?: ChatEffort | null; genUi?: boolean; genUiHint?: boolean; memorySpace?: string | null; boxNotices?: boolean; notice?: string | null; planSpend?: boolean; sendId?: string | null; brokerMcp?: BrokerMcp | null } = {},
 ): Record<string, unknown> {
   return {
     chatKey: target.chatKey, cwd: target.cwd, text, projectId: target.projectId,
@@ -380,7 +428,7 @@ export function chatSendRpcPayload(
     ...(target.project ? { project: target.project } : {}),
     requireCheckout: target.requireCheckout,
     permissionMode: permissionModeForAgent(target.permissionMode, capabilities),
-    // chat-live-input-enabled, to an agent that can take it: the turn this
+    // Live input, to an agent that can take it: the turn this
     // send starts, or the live one running, takes the message in as it runs.
     ...(chatSendsLive(capabilities, opts.liveInput) ? { liveInput: true } : {}),
     // Always a concrete tier (or its pinned profile id), already the launch
@@ -390,27 +438,30 @@ export function chatSendRpcPayload(
     ...backendFields(target, capabilities),
     // New session's "Act as an orchestrator". An older runner would drop it anyway.
     ...(target.orchestrator && capabilities.includes(CHAT_ORCHESTRATOR_CAPABILITY) ? { orchestrator: true } : {}),
-    // Already checked against chat-image-input-enabled and chat-images-v1 (services/chatImages.ts).
+    // Already checked against chat-images-v1 (services/chatImages.ts).
     ...(opts.images?.length ? { images: opts.images } : {}),
-    // simple-ui-session-titles-enabled. An older runner drops it, and its turn-ends carry no title.
+    // Claude's title for the session on each turn-end. An older runner drops it, and its turn-ends carry no title.
     ...(opts.titles ? { titles: true } : {}),
     // Haiku's heading for each run of tool calls. An older runner drops it, and the browser keeps Claude's lead-in or the calls' labels.
     ...(opts.headings ? { headings: true } : {}),
-    // Already checked against chat-effort-enabled and the chat's backend (services/chatEffort.ts); an older runner gets none.
+    // Already checked against the chat's backend and ask mode (services/chatEffort.ts); an older runner gets none.
     ...(opts.effort && capabilities.includes(CHAT_EFFORT_CAPABILITY) ? { effort: opts.effort } : {}),
     // The chat's own space, whose .termag/ the turn loads (services/chatSpace.ts), or null for none: a chat
-    // with no space, or one its box isn't granted, loads nothing. Whether memory loads at all is
-    // space-memory-enabled, checked when the box syncs. Undefined says nothing (the box's default).
+    // with no space, or one its box isn't granted, loads nothing. Undefined says nothing (the box's default).
     ...(opts.memorySpace !== undefined && capabilities.includes(SPACE_MEMORY_CAPABILITY) ? { spaceMemory: { space: opts.memorySpace } } : {}),
     // Already checked against chat-generative-ui-enabled and the chat's backend (services/chatGenUi.ts): the catalog
     // prompt for this turn, and to a runner that files it (chat-genui-v2) the hint its turns carry instead.
     ...(opts.genUi ? genUiFields(capabilities, opts.genUiHint === true) : {}),
-    // chat-resume-new-box-enabled: tell the turn when the box restarted
+    // Tell the turn when the box restarted
     // since the session's last one, and the first turn on a new box what was lost. In the message, never the system prompt.
     ...(opts.boxNotices && capabilities.includes(CHAT_BOX_NOTICE_CAPABILITY) ? { boxNotices: true } : {}),
     ...(opts.notice && capabilities.includes(CHAT_BOX_NOTICE_CAPABILITY) ? { notice: opts.notice } : {}),
     // chat-plan-spend-enabled, for the owner's send. An older runner drops it and never asks.
     ...(opts.planSpend ? { planSpend: true } : {}),
+    // A repeat of this id is answered as the send that first carried it (agent/chat-send-ids.js).
+    ...(opts.sendId ? { sendId: opts.sendId } : {}),
+    // chat-confined-mcp-enabled: which broker connectors the turn may reach (services/chatConfinedMcp.ts).
+    ...brokerMcpField(opts.brokerMcp, capabilities),
   };
 }
 
@@ -472,9 +523,9 @@ export function chatContextRefusals(engine: string | null | undefined, backend: 
   return backend ? { compact: "Compacting runs on Claude's own models; this chat runs on another backend." } : {};
 }
 
-/** Whether a send from this person can go into a running live turn: their chat-live-input-enabled, on an agent with chat-live-v1. */
-export function chatSendsLive(capabilities: readonly string[], liveInputFlag: boolean | undefined): boolean {
-  return liveInputFlag === true && capabilities.includes(CHAT_LIVE_CAPABILITY);
+/** Whether a send can go into a running live turn: one that may go live (not a termag notice), on an agent with chat-live-v1. */
+export function chatSendsLive(capabilities: readonly string[], liveInput: boolean | undefined): boolean {
+  return liveInput === true && capabilities.includes(CHAT_LIVE_CAPABILITY);
 }
 
 /** A workstream whose chat a clear stops: the id keys the chat, the name is what a refusal shows. */
@@ -599,11 +650,11 @@ export function sessionTitleOf(event: unknown): string | null {
  * Keep a chat's session title on its workstream, where the project list (and
  * so the sidebar) reads it. Only a change writes: Claude reports the same
  * title every turn, and an unchanged one costs no list push
- * (services/workspaceWrites.ts watches the field).
+ * (services/workspaceWrites.ts watches the field). True when it wrote.
  */
-export async function saveSessionTitle(projectId: string, workstreamId: string, title: string, now = new Date()): Promise<void> {
+export async function saveSessionTitle(projectId: string, workstreamId: string, title: string, now = new Date()): Promise<boolean> {
   // Claude's title never replaces a person's rename (Workstream.sessionTitleSource).
-  await prisma.workstream.updateMany({
+  const { count } = await prisma.workstream.updateMany({
     where: {
       id: workstreamId, projectId,
       AND: [
@@ -613,6 +664,7 @@ export async function saveSessionTitle(projectId: string, workstreamId: string, 
     },
     data: { sessionTitle: title, sessionTitleAt: now, sessionTitleSource: 'claude' },
   });
+  return count > 0;
 }
 
 /**
@@ -793,7 +845,10 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
   // The relay checked the workstream id against the chat key; the write checks it is this project's.
   const title = sessionTitleOf(msg.event);
   if (title && typeof msg.workstreamId === 'string' && msg.workstreamId) {
-    void saveSessionTitle(projectId, msg.workstreamId, title).catch(err => {
+    void saveSessionTitle(projectId, msg.workstreamId, title).then(changed => {
+      // A new title, as the session.titled event, unless the owner turned it off (services/sessionTitleEvent.ts).
+      if (changed) return recordSessionTitle({ projectId, workstream, title, source: 'claude' });
+    }).catch(err => {
       console.error('[CHAT] session title not saved:', err instanceof Error ? err.message : String(err));
     });
   }

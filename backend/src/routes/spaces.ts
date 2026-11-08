@@ -6,11 +6,7 @@
  *   /termag/api/cli/v1/spaces   CLI, behind cliBearer: a device login acts as
  *                               the user, a box's tmag_ token as the box
  *
- * Every route first checks the `spaces-enabled` flag for the user (the box's
- * owner, for a box) and answers 404 when it is off. Adding a member or an
- * invite also needs `spaces-sharing-enabled` for the owner adding them (403
- * `sharing_disabled` without it), so with that flag off a space has only its
- * owner and only the owner's boxes. A space the caller has no
+ * A space the caller has no
  * role in is also a 404, so names don't leak. Bytes never pass through here:
  * reads and writes are presigned S3 URLs (services/spaces/spaceObjects.ts).
  *
@@ -23,7 +19,7 @@ import { Router, type Request, type RequestHandler, type Response } from 'expres
 import { asyncHandler } from '../middleware/errors';
 import { takeToken, type Bucket } from '../middleware/rateLimit';
 import {
-  canAddBox, canManage, canRemoveBox, isSpaceRole, resolveSpaceAccess, roleAtLeast, wouldRemoveLastOwner,
+  canAddBox, canManage, canRemoveBox, isSpaceRole, roleAtLeast, wouldRemoveLastOwner,
   type SpaceAccess, type SpaceCaller, type SpaceRole,
 } from '../services/spaces/spaceAccess';
 import { SpacesUnavailableError } from '../services/spaces/spaceConfig';
@@ -34,18 +30,22 @@ import {
   uploadContentType, validateSpaceName, viewResponseHeaders,
 } from '../services/spaces/spacePaths';
 import {
-  MEMORY_LOG_MAX, MemoryRequestError, lastWriters, logEntries, noteOf, putConditionOf, sinceOf, type MemoryActor, type PutCondition,
+  MEMORY_LOG_MAX, MemoryRequestError, lastWriters, logEntries, noteOf, putConditionOf, sinceOf, type MemoryActor,
 } from '../services/spaces/spaceMemory';
-import { changedBody, currentConflict, isRealVersionId, landedCheck, sameEtag, uploadProof, uploadProofHolds } from '../services/spaces/spaceVersions';
+import { uploadProof } from '../services/spaces/spaceVersions';
 import {
-  LastOwnerError, SpaceNameTakenError, type ChargeRef, type FileShareRecord, type SpaceEventRecord, type SpaceRecord, type SpaceStore,
+  LastOwnerError, SpaceNameTakenError, type FileShareRecord, type SpaceEventRecord, type SpaceRecord, type SpaceStore,
 } from '../services/spaces/spaceStore';
 import { canShareFiles, sharingDisabled } from '../services/spaces/sharedFiles';
-import { fileChangeOf, type FileChange } from '../services/spaces/spaceFileBus';
+import type { FileChange } from '../services/spaces/spaceFileBus';
+import {
+  MAX_FILE_BYTES, SpaceOpError, declaredSize, fail, notFound, preconditionFailed, proofCaller, spaceFileOps,
+  type EventExtra, type Loaded, type SpaceOpContext,
+} from '../services/spaces/spaceFileOps';
 
 export const SINGLE_PUT_MAX_BYTES = 64 * 1024 * 1024;
 export const PART_BYTES = 64 * 1024 * 1024;
-export const MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024;
+export { MAX_FILE_BYTES };
 export const MAX_MOVE_OBJECTS = 1000;
 export const PRESIGNS_PER_MINUTE = 600;
 const MAX_PARTS_PER_BATCH = 100;
@@ -76,20 +76,10 @@ export interface SpacesRouterDeps {
    * process); called after the change's event is recorded, never awaited.
    */
   onFileChange?: (change: FileChange) => void;
-  /** The spaces-enabled flag for this user. */
-  enabled: (userId: string) => Promise<boolean>;
-  /** The spaces-sharing-enabled flag for this user: off, adding members and invites is refused. */
-  sharing: (userId: string) => Promise<boolean>;
   /** A member's role was lowered or they left (services/automations/spaceSync.ts recheckMirrorsForMember). */
   onMemberChanged?: (spaceName: string, userId: string) => Promise<void>;
   /** Who is calling, from whatever the mount authenticated; null is a 401. */
   caller: (req: Request, res: Response) => SpaceCaller | null;
-  /**
-   * The space-memory-enabled flag for this user; unset
-   * or off, the memory routes answer 404 `space_memory_off`, and the box's
-   * sync then removes its local copy.
-   */
-  memoryEnabled?: (userId: string) => Promise<boolean>;
   /** The absolute browser link to a file (routes/spaceFiles.ts); unset, `files/link` answers 404. */
   fileLink?: (space: string, path: string) => string;
   /** The secret a conditional PUT's proof is made with (spaceVersions.ts uploadProof); defaults to SESSION_SECRET. */
@@ -99,26 +89,12 @@ export interface SpacesRouterDeps {
   now?: () => number;
 }
 
-interface Loaded { space: SpaceRecord; access: SpaceAccess }
-
-class HttpFailure extends Error {
-  constructor(readonly status: number, message: string, readonly code: string, readonly extra: Record<string, unknown> = {}) { super(message); }
-}
-
-function fail(status: number, message: string, code: string, extra: Record<string, unknown> = {}): never {
-  throw new HttpFailure(status, message, code, extra);
-}
-
-function notFound(): never {
-  fail(404, 'Not found', 'not_found');
-}
-
 function handler(fn: (req: Request, res: Response) => Promise<void>): RequestHandler {
   return asyncHandler(async (req, res) => {
     try {
       await fn(req, res);
     } catch (err) {
-      if (err instanceof HttpFailure) { res.status(err.status).json({ error: err.message, code: err.code, ...err.extra }); return; }
+      if (err instanceof SpaceOpError) { res.status(err.status).json({ error: err.message, code: err.code, ...err.extra }); return; }
       if (err instanceof SpacePathError) { res.status(400).json({ error: err.message, code: err.code }); return; }
       if (err instanceof SpaceNameTakenError) { res.status(409).json({ error: err.message, code: err.code }); return; }
       if (err instanceof LastOwnerError) { res.status(400).json({ error: err.message, code: err.code }); return; }
@@ -169,29 +145,28 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
   const { store } = deps;
   const now = deps.now ?? Date.now;
   const presignBuckets = new Map<string, Bucket>();
+  // The space file operations (services/spaces/spaceFileOps.ts); this router is the HTTP layer over them.
+  const ops = spaceFileOps({ store, objects: deps.objects, onFileChange: deps.onFileChange, uploadSecret: deps.uploadSecret });
+  const { accessFor, checkDeclaredSize, charge, refuseIfChanged, failChanged, proofSecret } = ops;
 
   function callerOf(res: Response): SpaceCaller {
     return res.locals.spaceCaller as SpaceCaller;
   }
 
+  /** The web UI and the CLI: the caller acts for themselves, on no other surface. */
+  function ctxOf(res: Response): SpaceOpContext {
+    return { caller: callerOf(res) };
+  }
+
   router.use(asyncHandler(async (req, res, next) => {
     const caller = deps.caller(req, res);
     if (!caller) { res.status(401).json({ error: 'Unauthorized', code: 'auth_required' }); return; }
-    if (!await deps.enabled(caller.userId)) { res.status(404).json({ error: 'Not found', code: 'not_found' }); return; }
     res.locals.spaceCaller = caller;
     next();
   }));
 
-  async function objectsFor(res: Response): Promise<SpaceObjects> {
-    const caller = callerOf(res);
-    if (caller.kind === 'box') {
-      const box = await store.box(caller.instanceId);
-      return deps.objects({
-        kind: 'box', instanceId: caller.instanceId, name: box?.name ?? null, ownerUserId: caller.userId, ownerEmail: box?.ownerEmail ?? null,
-      });
-    }
-    const user = await store.ldUser(caller.userId);
-    return deps.objects({ kind: 'user', userId: caller.userId, email: user?.googleEmail ?? null });
+  function objectsFor(res: Response): Promise<SpaceObjects> {
+    return ops.objectsFor(callerOf(res));
   }
 
   function personOnly(caller: SpaceCaller): void {
@@ -209,49 +184,12 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     }
   }
 
-  async function accessFor(caller: SpaceCaller, space: SpaceRecord): Promise<SpaceAccess | null> {
-    const [members, grantedBoxIds] = await Promise.all([store.memberRoles(space.id), store.grantedBoxIds(space.id)]);
-    if (caller.kind === 'user') return resolveSpaceAccess(caller, { space, members, grantedBoxIds });
-    const box = await store.box(caller.instanceId);
-    const ancestors = box ? await ancestorsOf(box, id => store.box(id)) : [];
-    return resolveSpaceAccess(caller, { space, members, grantedBoxIds, box, ancestors });
+  function load(req: Request, res: Response, needed: SpaceRole): Promise<Loaded> {
+    return ops.load(callerOf(res), String(req.params.space ?? ''), needed);
   }
 
-  async function load(req: Request, res: Response, needed: SpaceRole): Promise<Loaded> {
-    const caller = callerOf(res);
-    const ref = String(req.params.space ?? '');
-    let space = await store.findSpace(ref);
-    let access = space ? await accessFor(caller, space) : null;
-    if (!access && caller.kind === 'user' && await store.claimInvites(caller.userId) > 0) {
-      space = await store.findSpace(ref);
-      access = space ? await accessFor(caller, space) : null;
-    }
-    if (!space || !access) notFound();
-    if (!roleAtLeast(access.role, needed)) {
-      if (access.readOnly && roleAtLeast(access.memberRole, needed)) {
-        fail(403, `${space.name} is read-only: it has no owner`, 'read_only');
-      }
-      fail(403, `You are a ${access.role} of ${space.name}; this needs ${needed}`, 'forbidden');
-    }
-    return { space, access };
-  }
-
-  /** Records the event; a file.put, file.mv or file.rm also goes out as a live change (`etag`: a put's new version). */
-  async function event(
-    res: Response, space: SpaceRecord, access: SpaceAccess | null, action: string,
-    { etag, ...extra }: { path?: string | null; bytes?: number | bigint | null; etag?: string | null; versionId?: string | null; note?: string | null } = {},
-  ) {
-    const caller = callerOf(res);
-    await store.recordEvent({
-      spaceId: space.id,
-      actorUserId: caller.userId,
-      actorInstanceId: caller.kind === 'box' ? caller.instanceId : null,
-      via: access?.boxAccess?.kind === 'inherited' ? access.boxAccess.via : null,
-      action,
-      ...extra,
-    });
-    const change = deps.onFileChange ? fileChangeOf(space.id, action, extra.path ?? null, etag ?? null) : null;
-    if (change) deps.onFileChange!(change);
+  function event(res: Response, space: SpaceRecord, access: SpaceAccess | null, action: string, extra?: EventExtra) {
+    return ops.event(ctxOf(res), space, access, action, extra);
   }
 
   // ---- spaces ----
@@ -290,7 +228,6 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const space = await store.createSpace({ name, description, userId: caller.userId });
     res.status(201).json({
       space: spaceView(space, { role: 'owner', memberRole: 'owner', readOnly: false }),
-      sharing: await deps.sharing(caller.userId),
     });
   }));
 
@@ -326,11 +263,10 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
 
   router.get('/:space/members', handler(async (req, res) => {
     const { space, access } = await load(req, res, 'viewer');
-    const [members, invites, sharing] = await Promise.all([
-      store.members(space.id), canManage(access) ? store.invites(space.id) : [], deps.sharing(callerOf(res).userId),
+    const [members, invites] = await Promise.all([
+      store.members(space.id), canManage(access) ? store.invites(space.id) : [],
     ]);
     res.json({
-      sharing,
       members: members.map(m => ({
         userId: m.userId, email: m.user.email, displayName: m.user.displayName, role: m.role, addedAt: m.createdAt.toISOString(),
       })),
@@ -342,9 +278,6 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const caller = callerOf(res);
     personOnly(caller);
     const { space, access } = await load(req, res, 'owner');
-    if (!await deps.sharing(caller.userId)) {
-      fail(403, 'Sharing spaces with other people is not turned on for you yet', 'sharing_disabled');
-    }
     const body = bodyOf(req);
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
     if (!/^[^\s@]+@[^\s@]+$/.test(email)) fail(400, 'An email address is required', 'invalid_email');
@@ -539,14 +472,14 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const { space, access } = await load(req, res, 'editor');
     const body = bodyOf(req);
     const path = normalizeFilePath(body.path);
-    const size = await checkDeclaredSize(space, body.size);
+    const size = checkDeclaredSize(space, body.size);
     const contentType = uploadContentType(body.contentType);
     // The version the writer read: checked here, signed into the PUT, and checked again on the confirm.
     const condition = putConditionOf(body);
     const key = objectKey(space.id, path);
     throttle(caller);
     const objects = await objectsFor(res);
-    if (condition) await refuseIfChanged(res, { space, access }, path, condition, await objects.head(key));
+    if (condition) await refuseIfChanged({ space, access }, path, condition, await objects.head(key));
     if (size <= SINGLE_PUT_MAX_BYTES) {
       await charge(space, size, PUT_TTL_S, { key });
       const proof = condition ? uploadProof(proofSecret(), { spaceId: space.id, path, caller: proofCaller(caller), condition }) : null;
@@ -562,122 +495,6 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     res.json({ kind: 'multipart', path, uploadId, partBytes: PART_BYTES, partCount: Math.ceil(size / PART_BYTES), ...(condition ? { conditional: true } : {}) });
   }));
 
-  function overQuota(space: SpaceRecord): never {
-    fail(413, `${space.name} is over its quota (${space.usedBytes} of ${space.quotaBytes} bytes, history included)`, 'quota_exceeded');
-  }
-
-  /** A read-only pre-check, for a request that writes nothing yet (a multipart create). */
-  function checkQuota(space: SpaceRecord, size: number): void {
-    if (space.usedBytes + BigInt(size) > space.quotaBytes) overQuota(space);
-  }
-
-  /** Charges bytes about to be written against the quota, atomically, or refuses; kept through a recount for `liveS`. */
-  async function charge(space: SpaceRecord, size: number, liveS: number, ref: ChargeRef | null): Promise<void> {
-    if (!await store.chargeBytes(space.id, BigInt(size), new Date(Date.now() + liveS * 1000), ref)) overQuota(space);
-  }
-
-  function declaredSize(size: unknown): number {
-    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) fail(400, 'size (bytes) is required', 'invalid_size');
-    if (size > MAX_FILE_BYTES) fail(413, 'Files are limited to 5 GiB', 'file_too_large');
-    return size;
-  }
-
-  async function checkDeclaredSize(space: SpaceRecord, size: unknown): Promise<number> {
-    const n = declaredSize(size);
-    checkQuota(space, n);
-    return n;
-  }
-
-  /**
-   * Records a stored object's file.put once. usedBytes was already charged
-   * when its URLs were signed (each bound to its content length), so a client
-   * that never confirms can't write past the quota; URLs signed and not used
-   * stay charged until the hourly recount. A confirm for a version already
-   * recorded (its last-modified time is not after the newest file.put for the
-   * path) records nothing.
-   */
-  async function recordPut(res: Response, loaded: Loaded, path: string, objects: SpaceObjects, note: string | null = null) {
-    const head = await objects.head(objectKey(loaded.space.id, path));
-    if (!head) fail(409, `${path} was not uploaded`, 'not_uploaded');
-    const counted = head.lastModified ? await store.lastPutAt(loaded.space.id, path) : null;
-    if (counted && head.lastModified && counted >= head.lastModified) return head;
-    await event(res, loaded.space, loaded.access, 'file.put', { path, bytes: head.size, etag: head.etag, versionId: head.versionId ?? null, note });
-    return head;
-  }
-
-  /** 412 `changed`, with who wrote the file last and when, unless the current version satisfies the condition. */
-  async function refuseIfChanged(res: Response, loaded: Loaded, path: string, condition: PutCondition, current: { etag?: string | null } | null): Promise<void> {
-    const conflict = currentConflict(condition, current ? { etag: current.etag ?? null } : null);
-    if (conflict) await failChanged(loaded, path, condition, conflict.now);
-  }
-
-  async function failChanged(loaded: Loaded, path: string, condition: PutCondition, now: string | null): Promise<never> {
-    const last = await store.lastWrite(loaded.space.id, path);
-    let who: { by: string | null; box: string | null; at: Date } | null = null;
-    if (last) {
-      const member = (await store.members(loaded.space.id)).find(m => m.userId === last.actorUserId);
-      const box = last.actorInstanceId ? (await store.box(last.actorInstanceId))?.name ?? null : null;
-      who = { by: member?.user.email ?? null, box, at: last.at };
-    }
-    const { error, code, ...extra } = changedBody(loaded.space.name, path, condition, now, who);
-    fail(412, error, code, extra);
-  }
-
-  /** Who a proof is signed for: a person, or one of their boxes. */
-  const proofCaller = (c: SpaceCaller) => (c.kind === 'box' ? `${c.userId}/${c.instanceId}` : c.userId);
-  const proofSecret = () => (deps.uploadSecret ? deps.uploadSecret() : process.env.SESSION_SECRET ?? 'dev-secret');
-
-  /**
-   * The confirm's check (spaceVersions.ts landedCheck): the write landed on
-   * the version its writer expected, or the version it replaced is put back
-   * and the answer is 412. For any storage that ignored the condition.
-   *
-   * `ours` is the version this confirm says it wrote. From a multipart
-   * complete it is S3's answer (`trusted`). From a single PUT's confirm it is
-   * the client's word, so the version must carry this caller's proof for
-   * this path and condition (uploadProof, signed into the PUT) before
-   * anything acts on it: a confirm naming someone else's version is 412,
-   * with nothing copied and nothing recorded. A restore copies only while
-   * ours is still the current version (CopyObject If-Match): a write that
-   * landed after the check stays, and the 412 names it. A restore that
-   * happens is recorded (`file.put.reverted`), goes out as a live change, and
-   * its 412 names the restored copy's ETag, the version current now.
-   */
-  async function checkLanded(res: Response, loaded: Loaded, path: string, objects: SpaceObjects, condition: PutCondition | null, ours: string | null, trusted = false): Promise<void> {
-    if (!condition) return;
-    const key = objectKey(loaded.space.id, path);
-    const versions = await objects.versionsOf(key, 10);
-    const named = ours ? versions.find(v => !v.deleteMarker && v.etag !== null && sameEtag(v.etag, ours)) : undefined;
-    if (!trusted && named && isRealVersionId(named.versionId)) {
-      const proof = await objects.uploadProofOf(key, named.versionId!);
-      if (!uploadProofHolds(proofSecret(), proof, { spaceId: loaded.space.id, path, caller: proofCaller(callerOf(res)), condition })) {
-        await failChanged(loaded, path, condition, versions.find(v => !v.deleteMarker)?.etag ?? null);
-      }
-    }
-    const check = landedCheck(condition, versions, ours);
-    if (check.ok) return;
-    if (check.restore?.kind === 'version') {
-      let restored: string | null = null;
-      try {
-        restored = (await objects.restoreVersion(key, check.restore.versionId, named?.etag ?? ours)).etag;
-      } catch (err) {
-        if (!preconditionFailed(err)) throw err;
-        // Someone wrote after the check: theirs stays current, and is what the 412 names.
-        await failChanged(loaded, path, condition, (await objects.head(key))?.etag ?? null);
-      }
-      const now = restored ?? (await objects.head(key))?.etag ?? check.now;
-      await event(res, loaded.space, loaded.access, 'file.put.reverted', { path, etag: now });
-      await failChanged(loaded, path, condition, now);
-    }
-    await failChanged(loaded, path, condition, check.now);
-  }
-
-  /** Whether storage refused a conditional request (412 PreconditionFailed). */
-  function preconditionFailed(err: unknown): boolean {
-    const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-    return e?.$metadata?.httpStatusCode === 412 || e?.name === 'PreconditionFailed';
-  }
-
   router.post('/:space/files/uploaded', handler(async (req, res) => {
     const loaded = await load(req, res, 'editor');
     throttle(callerOf(res));
@@ -687,8 +504,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const condition = putConditionOf(body);
     const objects = await objectsFor(res);
     // `etag`: what the PUT answered, which finds this write among the versions.
-    await checkLanded(res, loaded, path, objects, condition, typeof body.etag === 'string' && body.etag.length <= 200 ? body.etag : null);
-    const head = await recordPut(res, loaded, path, objects, note);
+    await ops.checkLanded(ctxOf(res), loaded, path, objects, condition, typeof body.etag === 'string' && body.etag.length <= 200 ? body.etag : null);
+    const head = await ops.recordPut(ctxOf(res), loaded, path, objects, note);
     res.json({ ok: true, path, size: head.size, ...(head.etag ? { etag: head.etag } : {}), ...(head.versionId ? { versionId: head.versionId } : {}) });
   }));
 
@@ -746,7 +563,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const objects = await objectsFor(res);
     const condition = putConditionOf(body);
     const key = objectKey(loaded.space.id, path);
-    if (condition) await refuseIfChanged(res, loaded, path, condition, await objects.head(key));
+    if (condition) await refuseIfChanged(loaded, path, condition, await objects.head(key));
     let ours: string | null = null;
     try {
       ours = (await objects.completeMultipart(key, String(req.params.uploadId), parts as Array<{ partNumber: number; etag: string }>, condition)).etag;
@@ -754,8 +571,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       if (condition && preconditionFailed(err)) await failChanged(loaded, path, condition, (await objects.head(key))?.etag ?? null);
       throw err;
     }
-    await checkLanded(res, loaded, path, objects, condition, ours, true);
-    const head = await recordPut(res, loaded, path, objects);
+    await ops.checkLanded(ctxOf(res), loaded, path, objects, condition, ours, true);
+    const head = await ops.recordPut(ctxOf(res), loaded, path, objects);
     res.json({ ok: true, path, size: head.size, ...(head.etag ? { etag: head.etag } : {}), ...(head.versionId ? { versionId: head.versionId } : {}) });
   }));
 
@@ -799,8 +616,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       sources = found.keys;
     } else {
       const head = await objects.head(objectKey(space.id, from));
-      if (condition) await refuseIfChanged(res, { space, access }, from, condition, head);
-      if (destNew) await refuseIfChanged(res, { space, access }, to, { ifNoneMatch: '*' }, await objects.head(objectKey(space.id, to)));
+      if (condition) await refuseIfChanged({ space, access }, from, condition, head);
+      if (destNew) await refuseIfChanged({ space, access }, to, { ifNoneMatch: '*' }, await objects.head(objectKey(space.id, to)));
       sources = head ? [{ key: objectKey(space.id, from), size: head.size }] : [];
     }
     if (sources.length === 0) fail(404, `Nothing at ${from} in ${space.name}`, 'file_not_found');
@@ -847,7 +664,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       const path = normalizeFilePath(req.query.path);
       const head = await objects.head(objectKey(space.id, path));
       if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
-      if (condition) await refuseIfChanged(res, { space, access }, path, condition, head);
+      if (condition) await refuseIfChanged({ space, access }, path, condition, head);
       keys = [objectKey(space.id, path)];
       label = path;
     }
@@ -870,17 +687,9 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     };
   }
 
-  async function loadMemory(req: Request, res: Response): Promise<Loaded> {
-    const loaded = await load(req, res, 'viewer');
-    if (!deps.memoryEnabled || !await deps.memoryEnabled(callerOf(res).userId)) {
-      fail(404, 'Space memory is not turned on for you', 'space_memory_off');
-    }
-    return loaded;
-  }
-
   // What the box's sync needs beside the files: the caller's role, and the last writer of each memory file.
   router.get('/:space/memory', handler(async (req, res) => {
-    const { space, access } = await loadMemory(req, res);
+    const { space, access } = await load(req, res, 'viewer');
     // The whole history: .termag/ events are never pruned.
     const since = new Date(0);
     const events = await store.memoryEvents(space.id, { since, limit: MEMORY_LOG_MAX * 4 });
@@ -894,7 +703,7 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
 
   // `termag space memory log`: every member may read the history of the memory their agents load.
   router.get('/:space/memory/log', handler(async (req, res) => {
-    const { space } = await loadMemory(req, res);
+    const { space } = await load(req, res, 'viewer');
     const since = sinceOf(req.query.since, now()) ?? new Date(now() - 7 * 24 * 60 * 60 * 1000);
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), MEMORY_LOG_MAX);
     const events = await store.memoryEvents(space.id, { since, limit: limit * 2 });
@@ -913,6 +722,8 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
         id: e.id, at: e.at.toISOString(), action: e.action, path: e.path ?? null,
         bytes: e.bytes === null || e.bytes === undefined ? null : Number(e.bytes),
         actorUserId: e.actorUserId, actorInstanceId: e.actorInstanceId ?? null, via: e.via ?? null,
+        // Spaces in Slack: 'slack' and the member the runner acted for; null on every other event.
+        surface: e.surface ?? null, onBehalfOfUserId: e.onBehalfOfUserId ?? null,
         ...(e.versionId ? { versionId: e.versionId } : {}), ...(e.note ? { note: e.note } : {}),
       })),
     });

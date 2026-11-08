@@ -48,6 +48,7 @@ import { powerOwnedBox, terminateOwnedBox } from './instances';
 import { relaunchChatOrRestore } from './chatReopen';
 import { archiveOwnedProject, ensureDataSessions } from './projects';
 import { sendResult, type RouteResult } from './routeResult';
+import { LISTED_PROJECT_KINDS } from '../services/projectKind';
 
 const BOX_SELECT = { id: true, name: true, kind: true, status: true, hibernationConfigured: true } as const;
 
@@ -67,7 +68,8 @@ async function ownedChat(userId: string, id: string) {
 export async function archivedChatsFor(user: Express.User): Promise<RouteResult> {
   const userId = user.id;
   const rows = await prisma.project.findMany({
-    where: { userId, archived: true, workflows: { some: { type: 'agent', provider: { not: null } } } },
+    // Never a space orchestrator's project (projectKind.ts inProjectLists): it is the space's, not a chat.
+    where: { userId, archived: true, kind: { in: LISTED_PROJECT_KINDS }, workflows: { some: { type: 'agent', provider: { not: null } } } },
     include: { instance: { select: BOX_SELECT }, workflows: { select: { type: true, provider: true } } },
     orderBy: { updatedAt: 'desc' },
   });
@@ -85,7 +87,7 @@ export async function archivedChatsFor(user: Express.User): Promise<RouteResult>
   });
   const onBox = new Map(totals.flatMap(row => (row.instanceId ? [[row.instanceId, row._count] as const] : [])));
   const gone = chats.filter(c => !c.box || c.box.status === 'terminated' || c.box.status === 'failed').map(c => c.id);
-  const stored = await projectsWithStoredHistory(user, gone);
+  const stored = await projectsWithStoredHistory(gone);
   return {
     status: 200,
     body: chats.map(c => ({
@@ -126,7 +128,7 @@ export async function reopenChatFor(user: Express.User, id: string, opts: { star
   if (!chat) return { status: 404, body: { error: 'Chat not found' } };
   if (!chat.archived) return { status: 200, body: { reopened: true, box: chat.instance } };
   const gone = !chat.instance || chat.instance.status === 'terminated' || chat.instance.status === 'failed';
-  const plan = reopenPlanFor(chat.instance, gone && (await projectsWithStoredHistory(user, [chat.id])).has(chat.id));
+  const plan = reopenPlanFor(chat.instance, gone && (await projectsWithStoredHistory([chat.id])).has(chat.id));
   if ('refused' in plan) return { status: plan.refused.status, body: { error: plan.refused.error } };
   if ('stored' in plan) {
     // No box to start or relaunch on: the chat reads from the store.

@@ -73,14 +73,9 @@ import {
 import { announceLinkShare, defaultWakeDeps, ownerGithub, wakeable, wakeShareBox, type ShareGithubFor, type WakeDeps } from '../services/previewShareLinks';
 import { RouteResult, sendResult } from './routeResult';
 
-export const PREVIEW_SHARE_FLAG = 'browser-pane-preview-share-enabled';
 export const PREVIEW_SHARE_TTL_FLAG = 'browser-pane-preview-share-ttl-hours';
-export const PR_LINK_SHARES_FLAG = 'browser-pane-pr-link-shares-enabled';
-export const GUEST_WAKE_FLAG = 'browser-pane-guest-wake-enabled';
 export const PR_AUTO_SHARE_DEFAULT_FLAG = 'browser-pane-pr-auto-share-default';
 export const PR_DRAFT_SHARES_FLAG = 'browser-pane-pr-draft-shares-enabled';
-export const PR_CHECKOUT_SHARES_FLAG = 'browser-pane-pr-checkout-shares-enabled';
-export const OPEN_LINK_SHARES_FLAG = 'browser-pane-open-link-shares-enabled';
 const WORKSTREAM_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 const ASK_WAKE_EVERY_MS = 10 * 60 * 1000;
 
@@ -107,14 +102,12 @@ export interface PreviewShareRouteDeps {
   findUser(id: string): Promise<User | null>;
   /** Whether userId has a full ProjectShare on the project (the link sends them to their own pane). */
   isCollaborator(projectId: string, userId: string): Promise<boolean>;
-  sharingOn(owner: User, box: Instance | null): Promise<boolean>;
   ttlDefault(owner: User, box: Instance | null): Promise<number>;
   boxStatus(instanceId: string | null): Promise<string | null>;
   /** Slack the owner that a reviewer asks them to wake the box; whether it went. */
   notifyWake(owner: User, viewer: User, share: { projectName: string; workstream: string }): Promise<boolean>;
   now(): number;
   // ── Phase 2: link shares ──
-  prLinksOn(owner: User, box: Instance | null): Promise<boolean>;
   /** Whether automatic shares are on for a project whose owner never saved its settings (`repo` is `owner/name`). */
   autoShareDefault(owner: User, box: Instance | null, repo: string | null): Promise<boolean>;
   /** Whether a draft PR in `repo` may be shared. */
@@ -122,8 +115,6 @@ export interface PreviewShareRouteDeps {
   /** A workstream's row id and branch (set by the server when it was made), as findWorkstream finds it. */
   findBranch(projectId: string, name: string): Promise<{ id: string | null; branch: string | null } | undefined>;
   // ── 4d: shares from the PR's own checkout ──
-  /** Whether a link share is bound to the PR's own checkout on the box (browser-pane-pr-checkout-shares-enabled). */
-  checkoutSharesOn(owner: User, box: Instance | null): Promise<boolean>;
   /** The project's live workstreams, main included (its row id may be null): the checkout lookup's candidates. */
   listWorkstreams(projectId: string): Promise<Array<{ id: string | null; name: string }>>;
   /** Find the PR's checkout on the project's box (services/prCheckout.ts). */
@@ -136,8 +127,6 @@ export interface PreviewShareRouteDeps {
   /** Seam 4's deps: waking a link share's box (4b). */
   wake: WakeDeps;
   // ── Open links: a link share with no PR, from the share dialog ──
-  /** Whether the share dialog may make a link anyone signed in can open (browser-pane-open-link-shares-enabled). */
-  openLinksOn(owner: User, box: Instance | null): Promise<boolean>;
   /** The box's `browser-guest-check` answer for a recipe and checkout, or null when it can't be asked. */
   checkStack(host: ProjectHost, payload: { recipe: OriginRecipe; cwd: string; checkouts: Array<{ workstream: string; dir: string }> }): Promise<unknown>;
 }
@@ -163,7 +152,6 @@ export const defaultPreviewShareRouteDeps: PreviewShareRouteDeps = {
   findUserByEmail,
   findUser: (id) => prisma.user.findUnique({ where: { id } }),
   isCollaborator: async (projectId, userId) => !!(await prisma.projectShare.findUnique({ where: { projectId_userId: { projectId, userId } } })),
-  sharingOn: (owner, box) => boolVariation(PREVIEW_SHARE_FLAG, owner, false, box),
   ttlDefault: (owner, box) => numberVariationForContext(PREVIEW_SHARE_TTL_FLAG, buildFlagContext(owner, box), 24),
   boxStatus: instanceStatus,
   notifyWake: async (owner, viewer, share) => {
@@ -178,7 +166,6 @@ export const defaultPreviewShareRouteDeps: PreviewShareRouteDeps = {
     return true;
   },
   now: () => Date.now(),
-  prLinksOn: (owner, box) => boolVariation(PR_LINK_SHARES_FLAG, owner, false, box),
   autoShareDefault: (owner, box, repo) => boolVariationForContext(PR_AUTO_SHARE_DEFAULT_FLAG, buildFlagContext(owner, box, repo), false),
   draftSharesOn: (owner, box, repo) => boolVariationForContext(PR_DRAFT_SHARES_FLAG, buildFlagContext(owner, box, repo), false),
   findBranch: async (projectId, name) => {
@@ -186,7 +173,6 @@ export const defaultPreviewShareRouteDeps: PreviewShareRouteDeps = {
     if (!row) return name === 'main' ? { id: null, branch: null } : undefined;
     return row.archived ? undefined : { id: row.id, branch: row.branch };
   },
-  checkoutSharesOn: (owner, box) => boolVariation(PR_CHECKOUT_SHARES_FLAG, owner, false, box),
   listWorkstreams: async (projectId) => {
     // An ask's chat has no checkout of its own (services/askChat.ts). Main is
     // the project's own checkout, row or not; an archived main row is gone, as
@@ -199,8 +185,7 @@ export const defaultPreviewShareRouteDeps: PreviewShareRouteDeps = {
   githubFor: ownerGithub,
   siteBase: () => `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}${process.env.BASE_PATH ?? ''}`,
   linkSecret: () => process.env.SESSION_SECRET ?? 'dev-secret',
-  wake: { ...defaultWakeDeps, wakeOn: (owner, box) => boolVariation(GUEST_WAKE_FLAG, owner, false, box) },
-  openLinksOn: (owner, box) => boolVariation(OPEN_LINK_SHARES_FLAG, owner, false, box),
+  wake: defaultWakeDeps,
   checkStack: async (host, payload) => {
     if (!isProjectAgentConnected(host) || !agentSupportsStackCheck(projectAgentCapabilities(host))) return null;
     return sendForProject(host, 'browser-guest-check', payload, 10_000).catch(() => null);
@@ -244,9 +229,6 @@ export async function createShareFor(deps: PreviewShareRouteDeps, user: ShareCal
   if (!project || project.archived) return { status: 404, body: { error: 'Project not found' } };
   const owner = await deps.findUser(user.id);
   if (!owner) return { status: 404, body: { error: 'Project not found' } };
-  if (!(await deps.sharingOn(owner, project.instance))) {
-    return { status: 403, body: { error: 'Preview sharing is off for this box.', code: 'preview-share-disabled' } };
-  }
   const workstream = typeof body?.workstream === 'string' && body.workstream ? body.workstream : 'main';
   if (!WORKSTREAM_NAME.test(workstream)) return { status: 400, body: { error: 'workstream is not a workstream name' } };
   const ws = await deps.findWorkstream(project.id, workstream);
@@ -299,9 +281,6 @@ export async function stackCheckFor(deps: PreviewShareRouteDeps, user: ShareCall
   if (!project || project.archived) return { status: 404, body: { error: 'Project not found' } };
   const owner = await deps.findUser(user.id);
   if (!owner) return { status: 404, body: { error: 'Project not found' } };
-  if (!(await deps.sharingOn(owner, project.instance))) {
-    return { status: 403, body: { error: 'Preview sharing is off for this box.', code: 'preview-share-disabled' } };
-  }
   const workstream = typeof query?.workstream === 'string' && query.workstream ? query.workstream : 'main';
   if (!WORKSTREAM_NAME.test(workstream)) return { status: 400, body: { error: 'workstream is not a workstream name' } };
   if (!(await deps.findWorkstream(project.id, workstream))) return { status: 404, body: { error: 'Workstream not found' } };
@@ -322,9 +301,6 @@ export async function stackCheckFor(deps: PreviewShareRouteDeps, user: ShareCall
  * live one: the same link.
  */
 async function createOpenLinkFor(deps: PreviewShareRouteDeps, owner: User, project: OwnedProject, ws: { name: string; id: string | null }, body: any): Promise<RouteResult> {
-  if (!(await deps.openLinksOn(owner, project.instance))) {
-    return { status: 403, body: { error: 'Open preview links are off for this box: share with a named person.', code: 'open-links-disabled' } };
-  }
   const recipe = parseRecipe(body?.recipe);
   if ('error' in recipe) return { status: 400, body: { error: recipe.error } };
   const hours = ttlHours(body?.ttlHours, await deps.ttlDefault(owner, project.instance));
@@ -433,8 +409,7 @@ export async function shareForGrantee(deps: PreviewShareRouteDeps, user: Express
       asOwner: ctx.share.ownerId === user.id,
       signInHint: access.ok ? reviewerSignInHint(ctx.share.originRecipe, ctx.accountHint) : null,
       // A reviewer may wake this box (4b): the page offers it instead of asking the owner. The budget is checked on the wake itself.
-      canWake: access.ok && ctx.share.ownerId !== user.id && wakeable(ctx)
-        && await deps.wake.wakeOn(ctx.owner, ctx.project.instance).catch(() => false),
+      canWake: access.ok && ctx.share.ownerId !== user.id && wakeable(ctx),
     },
   };
 }
@@ -497,9 +472,6 @@ export async function createLinkShareFor(deps: PreviewShareRouteDeps, user: Shar
   if (!project || project.archived) return { status: 404, body: { error: 'Project not found' } };
   const owner = await deps.findUser(user.id);
   if (!owner) return { status: 404, body: { error: 'Project not found' } };
-  if (!(await deps.sharingOn(owner, project.instance)) || !(await deps.prLinksOn(owner, project.instance))) {
-    return { status: 403, body: { error: 'PR previews are off for this box.', code: 'pr-links-disabled' } };
-  }
   const workstream = typeof body?.workstream === 'string' && body.workstream ? body.workstream : 'main';
   if (!WORKSTREAM_NAME.test(workstream)) return { status: 400, body: { error: 'workstream is not a workstream name' } };
   const ws = await deps.findBranch(project.id, workstream);
@@ -513,9 +485,8 @@ export async function createLinkShareFor(deps: PreviewShareRouteDeps, user: Shar
   const repo = projectRepo(project);
   // 4d: the PR's repository decides the repository flags (decision 16): the
   // reference's, lowercased, until GitHub has been read.
-  const checkoutsOn = await deps.checkoutSharesOn(owner, project.instance);
   const asked = `${ref.owner}/${ref.name}`.toLowerCase();
-  const ownRepo = !checkoutsOn || holdsRepo(project, asked);
+  const ownRepo = holdsRepo(project, asked);
   const settings = ownRepo
     ? await effectiveSettings(deps, owner, project, project.repos ? asked : repo)
     : await otherRepoSettings(deps, owner, project, asked);
@@ -537,52 +508,46 @@ export async function createLinkShareFor(deps: PreviewShareRouteDeps, user: Shar
     console.warn(`[PREVIEW-SHARE] ${owner.id}: reading ${ref.owner}/${ref.name}#${ref.number} failed: ${(err as Error).message}`);
     return { status: 502, body: { error: 'Could not read the pull request from GitHub. Try again in a moment.', code: 'github-failed' } };
   }
-  const draftsOk = facts.isDraft && (await deps.draftSharesOn(owner, project.instance, checkoutsOn ? facts.repo.toLowerCase() : repo));
+  const draftsOk = facts.isDraft && (await deps.draftSharesOn(owner, project.instance, facts.repo.toLowerCase()));
   let target: LinkShareTarget = { repo, branch: ws.branch, draftsOk };
   let shareWorkstreamId = ws.id;
   let checkoutDir: string | null = null;
   let linkKey = activeLinkKeyOf(project.id, ws.id);
-  if (checkoutsOn) {
-    // GitHub's checks first: a PR that could never be shared costs the box nothing.
-    const early = checkLinkSharePrOnGithub(facts, { draftsOk });
-    if (!early.ok) return { status: 409, body: { error: early.message, code: early.reason } };
-    // The label and the path filter need only GitHub too: a PR they skip costs the box nothing.
-    if (opts.auto) {
-      const skip = await autoScopeSkip(github, ref, owner, settings);
-      if (skip) return skip;
-    }
-    const host = { userId: project.userId, instanceId: project.instanceId };
-    const found = await deps.findCheckout({
-      host, ...(await checkoutCandidates(deps, owner, project, { id: ws.id, name: workstream }, facts.repo)),
-      repo: facts.repo, branch: facts.headBranch, headOid: facts.headOid,
-    });
-    if (found.ok) {
-      target = { repo: found.repo, branch: found.branch, draftsOk };
-      if (found.workstream && project.repos) {
-        // A multi-repo workstream's repository worktree: the guest checks that
-        // directory, and each repository's PR is shared on its own.
-        shareWorkstreamId = found.workstream.id;
-        checkoutDir = found.dir;
-        linkKey = checkoutLinkKey(host, found.realDir);
-      } else if (found.workstream) {
-        shareWorkstreamId = found.workstream.id;
-        linkKey = activeLinkKeyOf(project.id, found.workstream.id);
-      } else {
-        checkoutDir = found.dir;
-        linkKey = checkoutLinkKey(host, found.realDir);
-      }
-    } else if (found.reason !== 'outdated-agent') {
-      console.log(`[PREVIEW-SHARE] ${owner.id}: no checkout of ${facts.repo}#${ref.number} (${facts.headBranch}) to share: ${found.reason}, ${found.looked.length} place(s) looked at`);
-      return { status: 409, body: { error: checkoutRefusalMessage(found.reason, { repo: facts.repo, branch: facts.headBranch }, found.looked), code: found.reason } };
-    }
-    else console.log(`[PREVIEW-SHARE] ${owner.id}: ${project.id}'s box has no light git-branch-state, so today's rule decides ${facts.repo}#${ref.number}`);
-  }
-  const verdict = checkLinkSharePr(facts, target);
-  if (!verdict.ok) return { status: 409, body: { error: verdict.message, code: verdict.reason } };
-  if (opts.auto && !checkoutsOn) {
+  // GitHub's checks first: a PR that could never be shared costs the box nothing.
+  const early = checkLinkSharePrOnGithub(facts, { draftsOk });
+  if (!early.ok) return { status: 409, body: { error: early.message, code: early.reason } };
+  // The label and the path filter need only GitHub too: a PR they skip costs the box nothing.
+  if (opts.auto) {
     const skip = await autoScopeSkip(github, ref, owner, settings);
     if (skip) return skip;
   }
+  const host = { userId: project.userId, instanceId: project.instanceId };
+  const found = await deps.findCheckout({
+    host, ...(await checkoutCandidates(deps, owner, project, { id: ws.id, name: workstream }, facts.repo)),
+    repo: facts.repo, branch: facts.headBranch, headOid: facts.headOid,
+  });
+  if (found.ok) {
+    target = { repo: found.repo, branch: found.branch, draftsOk };
+    if (found.workstream && project.repos) {
+      // A multi-repo workstream's repository worktree: the guest checks that
+      // directory, and each repository's PR is shared on its own.
+      shareWorkstreamId = found.workstream.id;
+      checkoutDir = found.dir;
+      linkKey = checkoutLinkKey(host, found.realDir);
+    } else if (found.workstream) {
+      shareWorkstreamId = found.workstream.id;
+      linkKey = activeLinkKeyOf(project.id, found.workstream.id);
+    } else {
+      checkoutDir = found.dir;
+      linkKey = checkoutLinkKey(host, found.realDir);
+    }
+  } else if (found.reason !== 'outdated-agent') {
+    console.log(`[PREVIEW-SHARE] ${owner.id}: no checkout of ${facts.repo}#${ref.number} (${facts.headBranch}) to share: ${found.reason}, ${found.looked.length} place(s) looked at`);
+    return { status: 409, body: { error: checkoutRefusalMessage(found.reason, { repo: facts.repo, branch: facts.headBranch }, found.looked), code: found.reason } };
+  }
+  else console.log(`[PREVIEW-SHARE] ${owner.id}: ${project.id}'s box has no light git-branch-state, so today's rule decides ${facts.repo}#${ref.number}`);
+  const verdict = checkLinkSharePr(facts, target);
+  if (!verdict.ok) return { status: 409, body: { error: verdict.message, code: verdict.reason } };
 
   const now = new Date(deps.now());
   const prRepo = facts.repo;
@@ -591,9 +556,8 @@ export async function createLinkShareFor(deps: PreviewShareRouteDeps, user: Shar
     expiresAt: new Date(now.getTime() + LINK_SHARE_DAYS * 24 * 3600 * 1000),
     prRepo, prNumber: ref.number, prHeadOid: facts.headOid, linkKey, now,
     hashFor: (shareId) => linkTokenHash(linkTokenFor(deps.linkSecret(), shareId)),
-    ...(checkoutsOn ? { prHeadBranch: facts.headBranch, checkoutDir, samePr: true } : {}),
+    prHeadBranch: facts.headBranch, checkoutDir, samePr: true,
   });
-  const host = { userId: project.userId, instanceId: project.instanceId };
   if (opened.ended) {
     await teardownShare(deps.store, opened.ended, host, GUEST_REFUSAL_MESSAGES.ended);
     void previewShareEnded(opened.ended, opened.ended.endedReason ?? 'superseded', { supersededBy: ref.number });
@@ -630,9 +594,6 @@ export async function saveSettingsFor(deps: PreviewShareRouteDeps, user: Express
   if (!project || project.archived) return { status: 404, body: { error: 'Project not found' } };
   const owner = await deps.findUser(user.id);
   if (!owner) return { status: 404, body: { error: 'Project not found' } };
-  if (!(await deps.sharingOn(owner, project.instance)) || !(await deps.prLinksOn(owner, project.instance))) {
-    return { status: 403, body: { error: 'PR previews are off for this box.', code: 'pr-links-disabled' } };
-  }
   // Saving keeps what the dialog showed: until a first save, that is the repository's default.
   const current = await effectiveSettings(deps, owner, project);
   const enabled = body?.prLinksEnabled === undefined ? current.prLinksEnabled : body.prLinksEnabled;

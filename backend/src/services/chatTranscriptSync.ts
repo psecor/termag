@@ -10,8 +10,7 @@
  * Only for the box the project lives on, only for chat-runner chats (an
  * ask's thread is one too, agent/ask-chat.js: its tab shows the stored copy
  * while its box is down, like any chat's), only where the agent
- * advertises chat-transcript-v1, and only while chat-transcripts-enabled is
- * on for the project's owner. A failure is logged and the next turn end or
+ * advertises chat-transcript-v1. A failure is logged and the next turn end or
  * connect tries again; it never touches the turn.
  */
 
@@ -22,10 +21,7 @@ import { chatKeyFor, onChatEvent } from './chatRunner';
 import { coalescePulls, forEachBounded, pullTranscript, type PullDeps } from './chatTranscriptPull';
 import { appendChunk, getTranscriptStoreConfig, resetSession, transcriptHead, type TranscriptStoreConfig } from './chatTranscriptStore';
 import { recordChatGitState } from './chatGitState';
-import { boolVariation } from './featureFlags';
-import type { FlagUser } from './featureFlags';
 
-export const CHAT_TRANSCRIPTS_FLAG = 'chat-transcripts-enabled';
 export const TRANSCRIPT_CAPABILITY = 'chat-transcript-v1';
 const READ_BYTES = 4 * 1024 * 1024;
 const READ_TIMEOUT_MS = 60_000;
@@ -51,17 +47,11 @@ async function mayStore(chat: Chat): Promise<boolean> {
     select: {
       projectId: true,
       workflows: { where: { type: 'agent' }, select: { provider: true } },
-      project: {
-        select: {
-          instanceId: true,
-          user: { select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } },
-        },
-      },
+      project: { select: { instanceId: true } },
     },
   });
   if (!ws || ws.projectId !== chat.projectId || ws.project.instanceId !== chat.instanceId) return false;
-  if (!ws.workflows.some(w => isChatRunnerProvider(w.provider))) return false;
-  return boolVariation(CHAT_TRANSCRIPTS_FLAG, ws.project.user, false);
+  return ws.workflows.some(w => isChatRunnerProvider(w.provider));
 }
 
 function pullDeps(cfg: TranscriptStoreConfig, chat: Chat, readBytes: number): PullDeps {
@@ -97,12 +87,10 @@ export function syncChatTranscript(chat: Chat, readBytes = READ_BYTES): Promise<
 
 /**
  * Of one owner's projects, those whose chat has a stored transcript that can
- * be read now: the store is configured and the flag is on for the owner. An
- * archived chat whose box is gone reopens from it (routes/chats.ts).
+ * be read now (the store is configured). An archived chat whose box is gone reopens from it (routes/chats.ts).
  */
-export async function projectsWithStoredHistory(owner: FlagUser, projectIds: readonly string[]): Promise<Set<string>> {
+export async function projectsWithStoredHistory(projectIds: readonly string[]): Promise<Set<string>> {
   if (projectIds.length === 0 || !getTranscriptStoreConfig()) return new Set();
-  if (!await boolVariation(CHAT_TRANSCRIPTS_FLAG, owner, false)) return new Set();
   const rows = await prisma.chatTranscript.findMany({
     // Not an ask thread's: an archived chat reopens on its own conversation, which an ask's copy is not.
     where: { projectId: { in: [...projectIds] }, current: true, chunks: { some: {} }, workstream: { askThread: null } },

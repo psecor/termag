@@ -10,7 +10,7 @@ import { requireAuth } from '../middleware/auth';
 import { isProjectAgentConnected, projectAgentCapabilities, sendForProject } from '../services/agentRegistry';
 import { projectDirFor } from '../services/tmux';
 import { gitWorktreeRemoveLocal } from '../services/worktreeRemove';
-import { ensureAgentSessionsAndLaunch, stopAgentSessions, stopAgentPane, resolveAgentProvider } from '../services/agentRuntime';
+import { ensureAgentSessionsAndLaunch, stopAgentSessions, stopTerminalSlots, stopAgentPane, resolveAgentProvider } from '../services/agentRuntime';
 import { ensureProjectRepo } from '../services/gitRepo';
 import { startWorkstreamAgent } from '../services/workstreamAgent';
 import * as tmux from '../services/tmux';
@@ -33,12 +33,15 @@ import { RouteResult, sendResult } from './routeResult';
 import { revokeChats } from '../services/chatRevoke';
 import { kindRefusal, projectKindTraits } from '../services/projectKind';
 import { isRunName } from '../services/automations/schedule';
+import { isAskChatWorkstreamName } from '../services/agentMessages';
 import { recordProductEvent } from '../services/productEvents';
 import { endPreviewShares } from '../services/previewShares';
-import { isWorkspace, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_CLONE_CAPABILITY, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import { endPreviewAudiences } from '../services/previewAudience';
+import { isWorkspace, workspaceGuideWrites, workstreamRepos, workspaceRenameRefusal, WORKSPACE_CLONE_CAPABILITY, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
 import {
   buildWorkstreamTree, PR_CHECKOUT_TIMEOUT_MS, removeWorkstreamTree, undoWorkstreamTree, workspacePrRepo, WORKTREE_PR_PATH_CAPABILITY,
 } from '../services/workspaceWorkstreams';
+import { workstreamGuideRepos } from '../services/workspaceSetup';
 import { boolVariation } from '../services/featureFlags';
 
 const execAsync = promisify(exec);
@@ -301,6 +304,9 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   if (!system && isRunName(name)) {
     return { status: 400, body: { error: 'run-<date>-<time> names are the automation scheduler\'s' } };
   }
+  if (!system && isAskChatWorkstreamName(name)) {
+    return { status: 400, body: { error: 'ask-<id> names are reserved for ask threads' } };
+  }
   const branchName = branch ?? name;
   // A PR's branch is GitHub's, and may use anything git allows: the box judges it with
   // `git check-ref-format` (agent/git-worktree-pr.js) and only ever passes it as an argument.
@@ -370,9 +376,9 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
       if (!target.ok) return { status: 409, body: { error: target.error } };
       prTarget = { repoName: target.repo.name, number: pr.number, sameRepo: pr.sameRepo, headOid: pr.headOid };
     }
-    const unreadyRepo = repos.find(r => r.setupStatus !== 'ready');
-    if (unreadyRepo) return { status: 409, body: { error: `${unreadyRepo.name} is not cloned yet` } };
-    const built = await buildWorkstreamTree(project, repos, name, branchName, ref, prTarget);
+    const cloned = workstreamRepos(repos, prTarget?.repoName);
+    if (!cloned.ok) return { status: 409, body: { error: cloned.error } };
+    const built = await buildWorkstreamTree(project, cloned.repos, name, branchName, ref, prTarget);
     if (!built.ok) return { status: 500, body: { error: pr ? `Could not check out the pull request: ${built.error}` : `git worktree add failed: ${built.error}` } };
     workspaceMade = built.made;
     workspacePrRepoName = prTarget?.repoName ?? null;
@@ -397,6 +403,12 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
     if (typeof got?.adopted === 'string') {
       if (!NAME_REGEX.test(got.adopted) || got.adopted === 'main') {
         return { status: 409, body: { error: `${branchName} is checked out in .worktrees/${got.adopted}, which cannot be a workstream name` } };
+      }
+      // The requested-name guard above never saw an adopted name: a directory
+      // named after an ask thread's chat would adopt it and the workspace
+      // would filter the workstream as an ask chat (Devin's review).
+      if (isAskChatWorkstreamName(got.adopted)) {
+        return { status: 409, body: { error: `${branchName} is checked out in .worktrees/${got.adopted}, and ask-<id> names are reserved for ask threads` } };
       }
       wsName = got.adopted;
       createdWorktree = false;
@@ -664,6 +676,17 @@ export async function removeWorkstreamFor(
       await tmux.killSession(tmux.sessionName(username, project.name, 'data-ctrl', workstream.name)).catch(() => {});
     }
   }
+  // The user's terminal slots belong to the workstream, not to any workflow:
+  // a workstream with no agent workflow still has to
+  // lose its tabs, and a stopped agent workflow has already killed them (which
+  // this tolerates). stopAgentSessions covers slot killing when one runs.
+  await stopTerminalSlots({
+    userId: project.userId,
+    unixUsername: username,
+    projectName: project.name,
+    instanceId: project.instanceId,
+    workstream: workstream.name,
+  }).catch(() => {});
 
   // Remove the worktree from disk before the DB row so a failed `git
   // worktree remove` (typically: dirty worktree without --force) doesn't
@@ -717,11 +740,20 @@ export async function removeWorkstreamFor(
     if (ended.count > 0) console.log(`[AUTOMATION] ${project.name}: removing ${workstream.name} ended its live run`);
   }
 
+  // Marked gone first: a preview link publish holds this row (FOR SHARE,
+  // services/previewLinks.ts scopeLive), so this waits for one in flight,
+  // whose link the end below then sees, and any publish after it is refused.
+  // Without it a publish between the end and the delete would be
+  // cascade-deleted without its end, or hit the foreign key.
+  await prisma.workstream.update({ where: { id: workstream.id }, data: { archived: true } });
   // Its preview shares end with it: their rows go
   // with the workstream, so live guests are closed and their profiles
   // forgotten first.
   await endPreviewShares({ workstreamId: workstream.id }, 'workstream-removed', projectHost)
     .catch(err => console.warn(`[PREVIEW-SHARE] ending ${workstream.name}'s shares failed: ${(err as Error).message}`));
+  // And its preview audiences, so their links end before the rows cascade away (names stay held, SR19).
+  await endPreviewAudiences({ workstreamId: workstream.id }, 'workstream-gone')
+    .catch(err => console.warn(`[PREVIEW-AUDIENCE] ending ${workstream.name}'s previews failed: ${(err as Error).message}`));
 
   // Cascade-deletes attached workflows via the schema FK.
   await prisma.workstream.delete({ where: { id: workstream.id } });
@@ -771,6 +803,30 @@ export function workstreamsRouter(): Router {
 // (dirty worktree lock, name collision on disk) the row is put back and
 // nothing else has moved. tmux/status/notification re-keying come last and
 // are best effort per session.
+  /**
+   * Archive a session from a space's Files, or bring it back (chat-nested-agents-enabled):
+   * `{ archived: boolean }` sets or clears
+   * explorerArchivedAt. Only Files' list reads it, so nothing on the box is touched and a
+   * parked box doesn't refuse it. Owner only, like rename.
+   */
+  const explorerArchive: RequestHandler = async (req, res) => {
+    const archived = (req.body ?? {}).archived;
+    if (typeof archived !== 'boolean') { res.status(400).json({ error: 'archived must be true or false' }); return; }
+    const workstream = await prisma.workstream.findFirst({
+      where: { id: req.params.id, projectId: req.params.projectId, archived: false },
+      select: { id: true, project: { select: { userId: true } } },
+    });
+    if (!workstream || workstream.project.userId !== req.user!.id) {
+      res.status(404).json({ error: 'Workstream not found' }); return;
+    }
+    const row = await prisma.workstream.update({
+      where: { id: workstream.id },
+      data: { explorerArchivedAt: archived ? new Date() : null },
+      select: { id: true, explorerArchivedAt: true },
+    });
+    res.json(row);
+  };
+
   const renameWorkstream: RequestHandler = async (req, res) => {
     const workstream = await prisma.workstream.findFirst({
       where: { id: req.params.id, projectId: req.params.projectId },
@@ -843,13 +899,14 @@ export function workstreamsRouter(): Router {
     // one, or moves nothing (agent/workspace.js moveWorkstreamRoot).
     try {
       if (workspace) {
+        const listed = await workstreamGuideRepos(projectHost, projectDirFor(project, from), repos);
         await sendForProject(projectHost, 'workspace-move', {
           root: projDir,
           fromDir: projectDirFor(project, from),
           toDir: projectDirFor(project, to),
           repos: repos.map(r => r.name),
           guides: workspaceGuideWrites({
-            project: project.name, repos, workstreams: [{ name: to, branch: workstream.branch }], dirFor: ws => projectDirFor(project, ws),
+            project: project.name, repos: listed, workstreams: [{ name: to, branch: workstream.branch }], dirFor: ws => projectDirFor(project, ws),
           }),
         }, 60_000);
       } else if (connected) {
@@ -888,6 +945,8 @@ export function workstreamsRouter(): Router {
       let outcome: 'renamed' | 'absent' | 'failed' = 'failed';
       try {
         if (connected) {
+          // The agent's tmux-rename-session wraps `from` with `=` itself (an
+          // exact match), so `from` goes as the plain name here.
           const r2 = await sendForProject(projectHost, 'tmux-rename-session', { from: r.from, to: r.to });
           outcome = r2?.renamed === false ? 'absent' : 'renamed';
         } else if (!(await tmux.hasSession(r.from))) {
@@ -1101,6 +1160,7 @@ export function workstreamsRouter(): Router {
   router.post('/projects/:projectId/workstreams', requireAuth, refuseParkedBox('projectId'), refuseUnreadySetup('projectId'), create);
   router.delete('/projects/:projectId/workstreams/:id', requireAuth, refuseParkedBox('projectId'), remove);
   router.post('/projects/:projectId/workstreams/:id/rename', requireAuth, refuseParkedBox('projectId'), renameWorkstream);
+  router.post('/projects/:projectId/workstreams/:id/explorer-archive', requireAuth, explorerArchive);
   router.post('/projects/:projectId/workstreams/:id/agent', requireAuth, refuseParkedBox('projectId'), refuseUnreadySetup('projectId'), switchAgent);
 
   return router;

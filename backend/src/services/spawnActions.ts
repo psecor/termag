@@ -120,7 +120,7 @@ export async function checkoutCheck(s: AgentSpawn): Promise<RetireCheck> {
   if (isWorkspace(c.project)) {
     // Not a repository itself: every repository's worktree in it. A spawn base is one
     // repository's commit, so none is passed; their repositories are all on GitHub.
-    const repos = await prisma.projectRepo.findMany({ where: { projectId: c.project.id }, orderBy: { position: 'asc' }, select: { name: true } });
+    const repos = await prisma.projectRepo.findMany({ where: { projectId: c.project.id, setupStatus: 'ready' }, orderBy: { position: 'asc' }, select: { name: true } });
     const checks = await Promise.all(repos.map(async r => ({ repo: r.name, check: retireCheck(await read(`${cwd}/${r.name}`, null)) })));
     return retireCheckAcross(checks);
   }

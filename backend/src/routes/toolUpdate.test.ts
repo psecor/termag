@@ -15,7 +15,7 @@ vi.mock('../services/toolUpdate/runs', () => ({
   recordToolUpdateReport: vi.fn(async () => ({ status: 204, runId: 'r1', box: { id: 'box-a', name: 'ada-box', user: ada } })),
   afterReport: vi.fn(async () => {}),
 }));
-const { toolUpdateRouter } = await import('./toolUpdate');
+const { LOG_DETAIL_MAX, logDetail, toolUpdateRouter } = await import('./toolUpdate');
 const { afterReport, boxPolicy, recordToolUpdateReport } = await import('../services/toolUpdate/runs');
 const { TOOL_REGISTRY } = await import('../services/toolUpdate/components');
 
@@ -47,12 +47,17 @@ describe('/api/tool-update', () => {
   it('answers the policy for the box and the run asked', async () => {
     const res = await run('/policy', { query: { component: 'claude', run: 'ckz9v1q2w0000abcd1234efgh' } });
     expect(res.body).toEqual({ floor: '2.1.308', target: 'latest', restart: 'none', drainSec: 600, run: null });
-    expect(vi.mocked(boxPolicy).mock.calls[0]).toEqual([TOOL_REGISTRY.claude, 'box-a', ada, 'ckz9v1q2w0000abcd1234efgh']);
+    expect(vi.mocked(boxPolicy).mock.calls[0]).toEqual([TOOL_REGISTRY.claude, 'box-a', ada, 'ckz9v1q2w0000abcd1234efgh', expect.any(Number), false]);
+  });
+
+  it('passes atStart=1, Docker\'s boot fetch, with no run id', async () => {
+    await run('/policy', { query: { component: 'docker', atStart: '1' } });
+    expect(vi.mocked(boxPolicy).mock.calls[0]).toEqual([TOOL_REGISTRY.docker, 'box-a', ada, null, expect.any(Number), true]);
   });
 
   it('answers Codex\'s policy with Codex\'s descriptor, and takes its report', async () => {
     await run('/policy', { query: { component: 'codex', run: 'ckz9v1q2w0000abcd1234efgh' } });
-    expect(vi.mocked(boxPolicy).mock.calls[0]).toEqual([TOOL_REGISTRY.codex, 'box-a', ada, 'ckz9v1q2w0000abcd1234efgh']);
+    expect(vi.mocked(boxPolicy).mock.calls[0]).toEqual([TOOL_REGISTRY.codex, 'box-a', ada, 'ckz9v1q2w0000abcd1234efgh', expect.any(Number), false]);
     const id = '01a18c85-d963-7800-93d4-991c84da09d5';
     const res = await run('/report', { body: {
       component: 'codex', trigger: 'manual', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'updated', fromVersion: '0.163.0', toVersion: '0.166.0',
@@ -76,6 +81,31 @@ describe('/api/tool-update', () => {
     expect(vi.mocked(afterReport).mock.calls[0][1].panes).toEqual([{ session: 'ada-web-agent', role: 'agent', sessionId: null, hadConversation: false }]);
   });
 
+  it('puts a failed or partial run\'s detail in its log line, on one line and capped', async () => {
+    const detail = 'policy=ok restart=none drain=0s target=latest->- python3=/home/ada/.pyenv/versions/3.13/bin/python3 version=3.13.15->3.13.15 floor=3.13.18 state=below-floor python=3.13->FAILED:pyenv-global-not-a-version verify=-';
+    const log = vi.mocked(console.log);
+    await run('/report', { body: { component: 'python', trigger: 'floor', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'failed', fromVersion: '3.13.15', toVersion: '3.13.15', detail } });
+    expect(log.mock.calls.at(-1)?.[0]).toBe(`[TOOL-UPDATE] ada-box (ada) reports python floor run r1: failed 3.13.15 -> 3.13.15, 0 agent pane(s) to relaunch; detail: ${detail}`);
+    // A box's newlines and control characters cannot start a line of their own.
+    await run('/report', { body: { component: 'python', trigger: 'floor', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'partial', detail: 'uv=FAILED\n[TOOL-UPDATE] forged\r\u001b[31m\u2028x\t y' } });
+    const line = String(log.mock.calls.at(-1)?.[0]);
+    expect(line).toMatch(/: partial, 0 agent pane\(s\) to relaunch; detail: uv=FAILED \[TOOL-UPDATE\] forged \[31m x y$/);
+    expect(line).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+    // Updated and current runs say nothing more.
+    await run('/report', { body: { component: 'python', trigger: 'floor', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'updated', fromVersion: '3.13.16', toVersion: '3.13.18', detail } });
+    expect(log.mock.calls.at(-1)?.[0]).toBe('[TOOL-UPDATE] ada-box (ada) reports python floor run r1: updated 3.13.16 -> 3.13.18, 0 agent pane(s) to relaunch');
+    await run('/report', { body: { component: 'python', trigger: 'floor', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'failed' } });
+    expect(log.mock.calls.at(-1)?.[0]).toBe('[TOOL-UPDATE] ada-box (ada) reports python floor run r1: failed, 0 agent pane(s) to relaunch');
+  });
+
+  it('logDetail keeps one line of a few hundred characters', () => {
+    expect(logDetail(null)).toBe('');
+    expect(logDetail('  a\n\n b  ')).toBe('a b');
+    const long = logDetail('x'.repeat(5000));
+    expect(long.length).toBe(LOG_DETAIL_MAX);
+    expect(long.endsWith('…')).toBe(true);
+  });
+
   it('answers a repeated report 204 and does nothing after it', async () => {
     vi.mocked(recordToolUpdateReport).mockResolvedValueOnce({ status: 204, runId: 'r1', box: { id: 'box-a', name: 'ada-box', user: ada } as never, repeat: true });
     const res = await run('/report', { body: { component: 'claude', trigger: 'manual', run: 'ckz9v1q2w0000abcd1234efgh', outcome: 'updated' } });
@@ -94,7 +124,7 @@ describe('/api/tool-update', () => {
       const res = await run('/policy', { query });
       expect([res.statusCode, res.body.code]).toEqual([400, 'unknown_component']);
     }
-    const res = await run('/report', { body: { component: 'python', trigger: 'boot', outcome: 'updated' } });
+    const res = await run('/report', { body: { component: 'rust', trigger: 'boot', outcome: 'updated' } });
     expect([res.statusCode, res.body.code]).toEqual([400, 'unknown_component']);
     expect(boxPolicy).not.toHaveBeenCalled();
     expect(recordToolUpdateReport).not.toHaveBeenCalled();

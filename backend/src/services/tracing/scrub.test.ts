@@ -22,7 +22,14 @@ const TOKENS = [
   ['AKIA', 'ABCDEFGHIJKLMNOP'].join(''),
   ['postgres://app', 'hunter2secret@db.internal:5432/termag'].join(':'),
   '?token=querysecret123',
+  // Preview links (SR11): a link token in the landing path, and a reverify ticket.
+  '/termag/previews/my-app/abcdefghijklmnopqrstuv',
+  '?ticket=ticketsecret123',
+  // The landing page's next=, an app URL percent-encoded (its code= isn't a query name there).
+  '?next=%2Fcb%3Fcode%3Dnextsecret123',
   'authorization: headersecret123',
+  // A preview box confirmation's id in its two paths (the key to its sealed share URL).
+  '/termag/previews/confirm/AbcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ',
 ];
 const CHAT = 'please deploy with password correct-horse-battery-staple';
 

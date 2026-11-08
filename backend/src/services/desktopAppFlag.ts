@@ -1,22 +1,15 @@
-/**
- * Whether the desktop app may reach a box: the boolean feature flag
- * `desktop-app-enabled`, off unless TERMAG_FLAGS turns it on.
- * Evaluated for the box's owner and the box, so it can be turned on for one
- * person or one box first; for the person alone on routes that name no box
- * (the briefing and working time).
- */
 import { boolVariation } from './featureFlags';
-import type { FlagBox, FlagUser } from './featureFlags';
+import type { FlagUser } from './featureFlags';
 
-export const DESKTOP_APP_FLAG = 'desktop-app-enabled';
+/**
+ * `desktop-live-chat-enabled`, for the person: the desktop's thread sends a
+ * termag chat's turns through its chat runner (routes/cliChats.ts), so web and
+ * the desktop share one live session instead of handing it over. Off by default.
+ */
+export const DESKTOP_LIVE_CHAT_FLAG = 'desktop-live-chat-enabled';
 
-export async function desktopAppEnabled(user: FlagUser, box?: FlagBox): Promise<boolean> {
-  return boolVariation(DESKTOP_APP_FLAG, user, false, box);
-}
-
-/** The same flag for the user alone, for the desktop's routes that reach no box (its PR page, routes/cliPrs.ts). */
-export async function desktopAppEnabledForUser(user: FlagUser): Promise<boolean> {
-  return boolVariation(DESKTOP_APP_FLAG, user, false);
+export async function desktopLiveChatEnabled(user: FlagUser): Promise<boolean> {
+  return boolVariation(DESKTOP_LIVE_CHAT_FLAG, user, false);
 }
 
 /** What a box agent that can run the desktop's t3 server announces (agent/t3-bridge.js). */

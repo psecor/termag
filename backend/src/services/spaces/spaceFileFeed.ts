@@ -2,8 +2,7 @@
  * Space file changes to the browsers that can see them. Every process runs it over its own status sockets: a change heard
  * on SPACE_FILE_CHANNEL (spaceFileBus.ts) goes, as a `space-file` frame, only
  * to people who can read that space right now, checked the way a read is
- * (resolveSpaceAccess: a member, the space not deleted) with spaces-enabled
- * on for them. Anyone else gets nothing, so a
+ * (resolveSpaceAccess: a member, the space not deleted). Anyone else gets nothing, so a
  * path never reaches someone outside the space. The frame names the space as
  * the browser does, by its current name.
  *
@@ -19,8 +18,6 @@ export interface FeedClient { userId: string; send: (frame: string) => void }
 
 export interface SpaceFileFeedDeps {
   store: Pick<SpaceStore, 'findSpace' | 'memberRoles'>;
-  /** spaces-enabled for this user. */
-  enabled: (userId: string) => Promise<boolean>;
   /** This process's open status sockets. */
   clients: () => Iterable<FeedClient>;
 }
@@ -59,10 +56,7 @@ export function spaceFileFeed(deps: SpaceFileFeedDeps) {
       if (!space || space.id !== change.spaceId) return 0;
       const members = await deps.store.memberRoles(space.id);
       const grantedBoxIds = new Set<string>();
-      return sendTo(async userId => {
-        if (!resolveSpaceAccess({ kind: 'user', userId }, { space, members, grantedBoxIds })) return false;
-        return deps.enabled(userId);
-      }, {
+      return sendTo(async userId => resolveSpaceAccess({ kind: 'user', userId }, { space, members, grantedBoxIds }) !== null, {
         type: 'space-file', space: space.name, kind: change.kind,
         ...(change.path !== undefined ? { path: change.path } : {}),
         ...(change.to !== undefined ? { to: change.to } : {}),
@@ -71,7 +65,7 @@ export function spaceFileFeed(deps: SpaceFileFeedDeps) {
     },
 
     resync(): Promise<number> {
-      return sendTo(deps.enabled, { type: 'space-file', resync: true });
+      return sendTo(async () => true, { type: 'space-file', resync: true });
     },
   };
 }

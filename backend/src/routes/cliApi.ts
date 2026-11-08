@@ -46,6 +46,7 @@ import { shapeDevices } from '../services/cliViews';
 import { mountCliLifecycleRoutes, type CliLifecycle } from './cliLifecycle';
 import { mountCliAskRoutes, type CliAsk } from './cliAsk';
 import { mountCliSpeechRoutes, type CliSpeech } from './cliSpeech';
+import { mountCliPreviewLinkRoutes, type CliPreviewLinks } from './cliPreviewLinks';
 import { mountCliPreviewShareRoutes, type CliPreviewShares } from './cliPreviewShares';
 import { mountCliT3Routes, type CliT3 } from './cliT3';
 import { mountCliWorktimeRoutes, type CliWorktime } from './cliWorktime';
@@ -54,12 +55,14 @@ import { mountCliAutomationRoutes, type CliAutomations } from './cliAutomations'
 import { mountCliBugReportRoutes, type CliBugReports } from './cliBugReports';
 import { mountCliMcpConnectorRoutes, type CliMcpConnectors } from './cliMcpConnectors';
 import { mountCliBriefingRoutes, type CliBriefings } from './cliBriefings';
+import { mountCliEnvironmentRoutes } from './cliEnvironments';
+import type { EnvironmentsDeps } from './environments';
 import { mountCliSessionSpaceRoutes, type CliSessionSpace } from './cliSessionSpace';
 import { mountCliGithubRepoRoutes, type CliGithubRepos } from './cliGithubRepos';
 import { mountCliChatRoutes, type CliChats } from './cliChats';
 import type { CliFeatures } from './cliFeatures';
 
-const NO_FEATURES: CliFeatures = { automations: false };
+const NO_FEATURES: CliFeatures = { automations: false, liveChat: false };
 import { mountCliDotfilesRoutes, type CliDotfiles } from './cliDotfiles';
 import { parseCliUsage } from '../services/cliUsage';
 import { recordProductEvent } from '../services/productEvents';
@@ -87,6 +90,8 @@ export interface CliApiDeps {
   sessionSearch?: CliSessionSearch;
   /** The desktop app's preview shares (routes/cliPreviewShares.ts), over the browser routes' handlers. */
   previewShares?: CliPreviewShares;
+  /** `termag preview publish|list|revoke` (routes/cliPreviewLinks.ts), over the browser routes' service. */
+  previewLinks?: CliPreviewLinks;
   /** Automations (routes/cliAutomations.ts), over the web UI's own handlers. */
   automations?: CliAutomations;
   /** `termag bug report` (routes/cliBugReports.ts). */
@@ -95,6 +100,8 @@ export interface CliApiDeps {
   mcpConnectors?: CliMcpConnectors;
   /** The desktop app's briefing card (routes/cliBriefings.ts). */
   briefings?: CliBriefings;
+  /** `termag environment` (routes/cliEnvironments.ts): true for the Prisma store, or deps of their own (tests). */
+  environments?: EnvironmentsDeps | true;
   /** A session's space, for the box's memory hooks (routes/cliSessionSpace.ts). */
   sessionSpace?: CliSessionSpace;
   /** The desktop app's repository picker (routes/cliGithubRepos.ts). */
@@ -108,8 +115,14 @@ export interface CliApiDeps {
 }
 
 export type CliCredential =
-  | { kind: 'device'; sessionId: string; deviceName: string; expiresAt: Date; maxExpiresAt: Date }
-  | { kind: 'box'; boxId: string | null };
+  /**
+   * `issuedOnBoxId`: the box the sign-in was made on, or null. Every process on
+   * that box can read its token, so some routes treat it as narrower than a
+   * laptop's (routes/cliPreviewLinks.ts).
+   */
+  | { kind: 'device'; sessionId: string; deviceName: string; expiresAt: Date; maxExpiresAt: Date; issuedOnBoxId: string | null }
+  /** `tokenId`: the box's agent token, for the admin audit log (routes/cliBugReports.ts). */
+  | { kind: 'box'; boxId: string | null; tokenId?: string };
 
 export interface CliAuth {
   user: CliUser;
@@ -176,7 +189,7 @@ export async function authenticateCliBearer(deps: CliBearerDeps, raw: string): P
         user: session.user,
         credential: {
           kind: 'device', sessionId: session.id, deviceName: session.deviceName,
-          expiresAt: after.expiresAt, maxExpiresAt: after.maxExpiresAt,
+          expiresAt: after.expiresAt, maxExpiresAt: after.maxExpiresAt, issuedOnBoxId: session.issuedOnBoxId ?? null,
         },
       },
     };
@@ -184,7 +197,7 @@ export async function authenticateCliBearer(deps: CliBearerDeps, raw: string): P
 
   if (raw.startsWith('tmag_')) {
     const agent = await deps.store.validateAgentToken(raw);
-    if (agent) return { auth: { user: agent.user, credential: { kind: 'box', boxId: agent.instanceId } } };
+    if (agent) return { auth: { user: agent.user, credential: { kind: 'box', boxId: agent.instanceId, tokenId: agent.tokenId } } };
   }
   return { error: 'Invalid token; run `termag login`' };
 }
@@ -255,9 +268,18 @@ export function cliApiRouter(deps: CliApiDeps): Router {
       res.status(400).json({ error: 'Invalid or expired code; run `termag login` again', code: 'invalid_grant' });
       return;
     }
+    // Where the sign-in is made: a CLI on a box sends the box's own credential
+    // with the exchange (`box_token`), and the session records that box. The
+    // request's address can't tell (boxes reach the orchestrator through shared
+    // NAT and the ALB), so this is the signal: the shipped CLI always sends it
+    // on a box, and a token made without it needed a person to approve the
+    // sign-in in their browser all the same. Any valid box credential marks it,
+    // whoever owns the box: narrower is the safe side.
+    const rawBox = typeof body.box_token === 'string' && body.box_token.startsWith('tmag_') ? body.box_token : null;
+    const box = rawBox ? await deps.store.validateAgentToken(rawBox) : null;
     const { token, tokenHash, tokenPrefix } = generateCliToken();
     const session = await deps.store.createSession({
-      userId: grant.userId, deviceName: grant.deviceName, tokenHash, tokenPrefix, now: at,
+      userId: grant.userId, deviceName: grant.deviceName, tokenHash, tokenPrefix, now: at, issuedOnBoxId: box?.instanceId ?? null,
     });
     const validity = cliSessionValidity(session, at);
     const access = await (await deps.jwt).issue(session.userId, session.id, at.getTime());
@@ -353,12 +375,14 @@ export function cliApiRouter(deps: CliApiDeps): Router {
   if (deps.worktime) mountCliWorktimeRoutes(router, deps.worktime, bearer);
   if (deps.sessionSearch) mountCliSessionSearchRoutes(router, deps.sessionSearch, bearer);
   if (deps.previewShares) mountCliPreviewShareRoutes(router, deps.previewShares, bearer);
+  if (deps.previewLinks) mountCliPreviewLinkRoutes(router, deps.previewLinks, bearer);
   if (deps.automations) mountCliAutomationRoutes(router, deps.automations, bearer);
   if (deps.bugReports) mountCliBugReportRoutes(router, deps.bugReports, bearer, now);
   if (deps.mcpConnectors) mountCliMcpConnectorRoutes(router, deps.mcpConnectors, bearer);
   if (deps.sessionSpace) mountCliSessionSpaceRoutes(router, deps.sessionSpace, bearer);
   if (deps.githubRepos) mountCliGithubRepoRoutes(router, deps.githubRepos, bearer);
   if (deps.briefings) mountCliBriefingRoutes(router, deps.briefings, bearer);
+  if (deps.environments) mountCliEnvironmentRoutes(router, deps.environments === true ? undefined : deps.environments, bearer);
   if (deps.chats) mountCliChatRoutes(router, deps.chats, bearer);
   if (deps.dotfiles) mountCliDotfilesRoutes(router, deps.dotfiles, bearer);
 

@@ -21,6 +21,7 @@
  * Each ask and each end logs one `[ASK]` line naming sender, target, thread,
  * message and hop.
  */
+import { SETUP_DISABLED_CODE, isSetupOff } from './boxSetup';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { WORK_PROJECT_KINDS } from './projectKind';
@@ -40,16 +41,21 @@ import { powerRequestError } from './boxPowerPolicy';
 import { isBoxProvisioningConfigured } from './boxProvisioner';
 import { githubTokenSource } from './credentialStore';
 import { publishBundle, publishConfigFromEnv, publishSummary, resolveTargetPr, type PublishOutcome } from './askPublish';
-import { confirmPushes, githubConfigFromEnv, pushSummary } from './askPushes';
+import { confirmPushes, githubConfigFromEnv, pushSummary, unpushedParts } from './askPushes';
 import { repoKey } from './projectTemplates';
 import { REPLY_CHANNEL, ReplyHandoff, chunkReply } from './askReplyBus';
 import { startReplyListener, stopReplyListener } from './askReplyListener';
 import { readReply, sealReply, storeReply, sweepReplies, type SealedReply } from './askReplyStore';
 import { getTranscriptStoreConfig } from './chatTranscriptStore';
-import { ensureAskChat, type AskChat } from './askChat';
+import { askChatStoredTier, askTurnTier, ensureAskChat, type AskChat } from './askChat';
+import { chatLaunchFor } from './chatLaunch';
+import { parseClaudeChatModel } from './claudeChatModel';
+import { ASK_MODEL_OFF_REASON, askModelChoiceOn } from './askModelFlag';
 import { turnMemorySpace } from './chatSpace';
 import { askTelemetryFor } from './askTelemetry';
-import { SPACE_MEMORY_CAPABILITY } from './chatRunner';
+import { recordProductEvent } from './productEvents';
+import { CHAT_AUTO_CAPABILITY, SPACE_MEMORY_CAPABILITY } from './chatRunner';
+import { RUN_FOLLOW_UP_MODE, UNTRUSTED_MODE } from './chatTrust';
 import { isWorkspace } from './projectRepos';
 import { multiRepoEnabled } from './multiRepoFlag';
 import {
@@ -59,6 +65,8 @@ import {
   ASK_CHAT_CAPABILITY,
   ASK_STEER_CAPABILITY,
   ASK_PUSH_CAPABILITY,
+  ASK_MODE_CAP_CAPABILITY,
+  ASK_MODEL_CAPABILITY,
   BUNDLE_TTL_MS,
   INBOX_WINDOW_MS,
   LOST_RUN_GRACE_MS,
@@ -84,6 +92,7 @@ import {
   rejection,
   replayDecision,
   repoTarget,
+  askableRepos,
   runSystemPrompt,
   setupRefusal,
   steerDecision,
@@ -310,7 +319,7 @@ async function finishLost(messageId: string, why: string, seen: MessageStatus): 
 // --- publishing ------------------------------------------------------------
 
 async function publishFor(messageId: string, r: RunResult): Promise<{ publish: string; detail: string | null; outcome: PublishOutcome | null }> {
-  if (r.pushes) return { ...await recordPushes(messageId, r.pushes), outcome: null };
+  if (r.pushes) return { ...await recordPushes(messageId, r.pushes, r.unpushed), outcome: null };
   if (!r.bundle) return { publish: 'none', detail: null, outcome: null };
   const m = await prisma.agentMessage.findUnique({
     where: { id: messageId },
@@ -396,24 +405,31 @@ async function publishFor(messageId: string, r: RunResult): Promise<{ publish: s
  * branches its clone pushed, confirmed on GitHub (askPushes), become the
  * thread's PRs. A branch with no PR yet, or one GitHub doesn't have, is in
  * the detail; nothing is refused.
+ * Commits the clone never pushed (`unpushed`) are in the detail too, with the
+ * push that publishes them; with nothing pushed the turn is `unpushed`, not
+ * `none` (pushSummary).
  */
-async function recordPushes(messageId: string, pushes: NonNullable<RunResult['pushes']>): Promise<{ publish: string; detail: string | null }> {
-  if (!pushes.length) return { publish: 'none', detail: null };
+async function recordPushes(messageId: string, pushes: NonNullable<RunResult['pushes']>, unpushed: RunResult['unpushed']): Promise<{ publish: string; detail: string | null }> {
+  if (!pushes.length && !unpushed.length) return { publish: 'none', detail: null };
   const m = await prisma.agentMessage.findUnique({
     where: { id: messageId },
     select: { thread: { select: { id: true, repo: true, originUserId: true, targetBranch: true, prNumber: true, originUser: { select: { unixUsername: true } } } } },
   });
   if (!m) return { publish: 'failed', detail: 'the message disappeared before its pushes were recorded' };
   const t = m.thread;
-  if (!t.repo) return { publish: 'failed', detail: "the target checkout has no GitHub origin, so termag can't look up what the run pushed" };
+  const prefix = askBranch(t.originUser.unixUsername, t.id);
+  const ownBranch = t.targetBranch ?? prefix;
+  // Nothing pushed: what was left unpushed needs no GitHub lookup.
+  if (!pushes.length) return pushSummary([], 0, unpushed, ownBranch);
+  const left = unpushedParts(unpushed, ownBranch).map(p => ` | ${p}`).join('');
+  if (!t.repo) return { publish: 'failed', detail: `the target checkout has no GitHub origin, so termag can't look up what the run pushed${left}` };
   const token = await githubTokenSource(t.originUserId).catch(() => null);
   if (!token) {
-    return { publish: 'failed', detail: `${t.originUser.unixUsername} has no GitHub token stored in termag, so the run's pushes can't be looked up; connect GitHub in Settings` };
+    return { publish: 'failed', detail: `${t.originUser.unixUsername} has no GitHub token stored in termag, so the run's pushes can't be looked up; connect GitHub in Settings${left}` };
   }
-  const prefix = askBranch(t.originUser.unixUsername, t.id);
   const rows = await prisma.agentThreadPr.findMany({ where: { threadId: t.id }, select: { key: true, branch: true } });
   const outcomes = await confirmPushes(githubConfigFromEnv(), {
-    repo: t.repo, token, pushes, ownBranch: t.targetBranch ?? prefix, prefix, rows,
+    repo: t.repo, token, pushes, ownBranch, prefix, rows,
   });
   for (const o of outcomes) {
     if (o.kind !== 'recorded') continue;
@@ -427,7 +443,7 @@ async function recordPushes(messageId: string, pushes: NonNullable<RunResult['pu
     }
   }
   const total = await prisma.agentThreadPr.count({ where: { threadId: t.id } });
-  return pushSummary(outcomes, total);
+  return pushSummary(outcomes, total, unpushed, ownBranch);
 }
 
 async function finishRun(messageId: string, r: RunResult): Promise<void> {
@@ -537,6 +553,8 @@ async function replayAsk(m: MessageWithThread, branchOwner: string, notify: Noti
         where: { id: m.id, status: 'submitted' },
         data: { status: 'failed', error: 'lost: the orchestrator restarted while starting the run', completedAt: new Date() },
       });
+    // Adopted: the row has the launch decision startRun recorded before the send; the thread's chat now keeps its tier.
+    if (r.count && live) await adoptRecordedModel(m).catch((e: unknown) => console.warn(`[ASK] message ${m.id}: the thread chat's model was not stored (${errMsg(e)})`));
     if (r.count) { status = live ? 'working' : 'failed'; wake(m.id); }
     else status = (await prisma.agentMessage.findUnique({ where: { id: m.id }, select: { status: true } }))?.status ?? status;
   }
@@ -548,10 +566,31 @@ async function replayAsk(m: MessageWithThread, branchOwner: string, notify: Noti
       ...(m.queuedPrompt !== null ? { queued: true } : {}),
       // The stored message still tells its session, as the first 202 said (a `--no-wait` retry after a lost one).
       ...(notify ? { notify } : {}),
+      // As the first 202 said: what it asked for, or ran on (null: the box's default), and why an asked-for one was
+      // ignored. `model` is always there, so a CLI never takes a replay for an orchestrator without --model.
+      model: m.model ?? null,
+      ...(m.model && m.modelIgnored ? { modelIgnored: m.modelIgnored } : {}),
     },
   };
 }
 
+
+/**
+ * A run a replay adopts as working: the orchestrator restarted between the box
+ * taking `ask-run` and startRun's working write. startRun recorded its launch
+ * decision on the row before the send (`model`, `modelIgnored`), so that is
+ * the turn's model; only the thread chat's stored choice is still to be made,
+ * as startRun would have once the box took it. Nothing is read again from the
+ * flag, the agent or the chat as they are now.
+ */
+async function adoptRecordedModel(m: MessageWithThread): Promise<void> {
+  if (!m.model || m.modelIgnored) return;
+  const tier = parseClaudeChatModel(m.model);
+  if (!tier.ok || !tier.model) return;
+  const thread = await prisma.agentThread.findUnique({ where: { id: m.threadId }, select: { chatWorkstreamId: true } });
+  if (!thread?.chatWorkstreamId) return;
+  await (await askTurnTier(thread.chatWorkstreamId, tier.model)).save();
+}
 
 /** The last message of a superseded message's chain (each points at the follow-up that joined its turn). */
 async function chainEnd(m: MessageWithThread): Promise<MessageWithThread> {
@@ -566,13 +605,52 @@ async function chainEnd(m: MessageWithThread): Promise<MessageWithThread> {
 
 const isUniqueViolation = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
+/**
+ * Whether an ask's prompt names `termag-env up` (runSystemPrompt `trusted`): only on a project its owner
+ * trusted that nothing caps. Not an automation's, and not a project made from a shared environment, whose
+ * asks are capped so checkout commands never run as the box user outside the classifier (Security Agent, #998).
+ */
+export function askOffersEnvironmentSteps(project: { chatTrustedAt: Date | null; kind: string; environmentId: string | null }): boolean {
+  return !!project.chatTrustedAt && project.kind !== 'automation' && !project.environmentId;
+}
+
 const runProjectSelect = {
-  name: true, userId: true, setupStatus: true, setupError: true, layout: true, repoUrl: true, user: { select: { unixUsername: true } },
-  repos: { select: { name: true, url: true }, orderBy: { position: 'asc' } },
-  instance: { select: { id: true, name: true, hostHome: true, status: true, userId: true, kind: true, createdFor: true } },
+  name: true, userId: true, setupStatus: true, setupError: true, layout: true, repoUrl: true, chatTrustedAt: true, kind: true, environmentId: true, user: { select: { unixUsername: true } },
+  // A repository still cloning (one added since) has no checkout to ask yet.
+  repos: { where: { setupStatus: 'ready' }, select: { name: true, url: true }, orderBy: { position: 'asc' } },
+  instance: { select: { id: true, name: true, hostHome: true, status: true, userId: true, kind: true, createdFor: true, setupEnabled: true } },
 } as const;
 
 type RunProject = Prisma.ProjectGetPayload<{ select: typeof runProjectSelect }>;
+
+/**
+ * The mode an ask of `project` is capped at, below its own bypassPermissions,
+ * or null for none (agent/ask-run.js CAPPED_MODES). A project made from a
+ * shared environment holds checkouts anyone signed in
+ * may have set, so its asks run as auto (every tool, the classifier) on a box
+ * that has it, else dontAsk: neither loads the checkout's settings
+ * (apiKeyHelper), hooks or MCP servers, as an unattended run's worktree
+ * doesn't (agent/chat-runner.js turnModeFor).
+ */
+export function askModeFor(project: { environmentId: string | null; chatTrustedAt: Date | null }, capabilities: readonly string[]): typeof RUN_FOLLOW_UP_MODE | typeof UNTRUSTED_MODE | null {
+  if (!project.environmentId) return null;
+  // Auto keeps a shell: only once the owner has trusted the project, as for its main chat and automations;
+  // until then dontAsk, which has none (Security Agent, #998).
+  if (!project.chatTrustedAt) return UNTRUSTED_MODE;
+  return capabilities.includes(CHAT_AUTO_CAPABILITY) ? RUN_FOLLOW_UP_MODE : UNTRUSTED_MODE;
+}
+
+/**
+ * Why an ask of `project` can't go to that box, or null: it must be capped
+ * (askModeFor) and the box's agent can't do that (no ask-mode-cap-v1), so it
+ * would run it as bypassPermissions. Nothing is sent; the asker is told to
+ * update the box.
+ */
+export function askCapRefusal(project: { name: string; environmentId: string | null }, boxName: string, capabilities: readonly string[]): string | null {
+  if (!project.environmentId || capabilities.includes(ASK_MODE_CAP_CAPABILITY)) return null;
+  return `${boxName}'s agent can't keep it from loading ${project.name}'s checkout config (its repositories came from a shared environment): `
+    + `update the box's agent, then ask again`;
+}
 
 const ownerFacts = (p: RunProject) => ({
   project: p.name, projectOwnerId: p.userId, box: p.instance?.name ?? null, boxOwnerId: p.instance?.userId ?? null,
@@ -588,7 +666,8 @@ interface RunStart {
     targetPr: number | null; targetRepo: string | null; targetBranch: string | null;
     parentProjectId?: string | null; parentWorkstream?: string | null; parentClaudeSession?: string | null;
   };
-  message: { id: string; hop: number; promptBytes: number };
+  /** `model`: the tier it asked for (`termag ask --model`), null for none (AgentMessage.model). */
+  message: { id: string; hop: number; promptBytes: number; model?: string | null; modelIgnored?: string | null };
   workstream: string;
   prompt: string;
   /** The thread's working message to steer this one into (steerDecision said so). */
@@ -601,7 +680,7 @@ interface RunStart {
  * box puts the turn into that message's running turn if it can (`steered`),
  * and that message is superseded; otherwise it runs after it.
  */
-async function startRun(r: RunStart): Promise<{ status: string; steered?: boolean; steerRefused?: string | null; heldAsNextTurn?: boolean } | { error: string }> {
+async function startRun(r: RunStart): Promise<{ status: string; steered?: boolean; steerRefused?: string | null; heldAsNextTurn?: boolean; modelIgnored?: string } | { error: string }> {
   const { sender, project, thread, message, instanceId } = r;
   const target = askTarget(project.instance.name, project.name, r.workstream, thread.repoName);
   const branch = askBranch(sender.unixUsername, thread.id);
@@ -615,6 +694,17 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
   // the headless run as before.
   let chat: AskChat | null = null;
   const caps = instanceAgentTransport(instanceId)?.capabilities ?? [];
+  // An ask that must be capped never goes to an agent that would run it uncapped.
+  const capRefusal = askCapRefusal(project, project.instance.name, caps);
+  if (capRefusal) {
+    const failed = await prisma.agentMessage.updateMany({
+      where: { id: message.id, status: 'submitted' },
+      data: { status: 'failed', error: capRefusal, completedAt: new Date(), queuedUntil: null },
+    });
+    if (failed.count) wake(message.id);
+    console.warn(`[ASK] message ${message.id}: ${capRefusal}`);
+    return { error: capRefusal };
+  }
   if (caps.includes(ASK_CHAT_CAPABILITY)) {
     try {
       chat = await ensureAskChat(thread);
@@ -634,11 +724,19 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
   const memorySpace = chat && caps.includes(SPACE_MEMORY_CAPABILITY) ? await turnMemorySpace(chat.workstreamId) : undefined;
   // Who asked, for the turn's telemetry resource (services/askTelemetry.ts); only a chat turn carries it.
   const telemetry = chat ? await askTelemetryFor(thread, message.hop) : null;
+  const turnModel = await askTurnModel(r, chat, caps);
   // A runner with ask-push-v1 clones normally and the run pushes itself, on the
   // thread's branch, or on the head branch of the PR the thread updates.
   const push = caps.includes(ASK_PUSH_CAPABILITY);
   const pushBranch = thread.targetPr != null && thread.targetBranch ? thread.targetBranch : branch;
+  const capped = askModeFor(project, caps);
   let answer: { steered?: unknown; reason?: unknown } | null = null;
+  // The launch decision, recorded before the box can take the run: a replay that adopts it after a restart reads
+  // this, never the flag, agent or chat as they are by then. A start that ends held as the next turn puts back what
+  // the message asked for (unrecord), so its own start decides again.
+  await prisma.agentMessage.updateMany({ where: { id: message.id, status: 'submitted' }, data: { model: turnModel.tier, modelIgnored: turnModel.ignored } });
+  const asked = { model: message.model ?? null, modelIgnored: message.modelIgnored ?? null };
+  const unrecord = () => prisma.agentMessage.updateMany({ where: { id: message.id, status: 'submitted' }, data: asked });
   try {
     answer = await sendToInstanceAgent(instanceId, 'ask-run', {
       runId: message.id,
@@ -657,8 +755,10 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
           ? { number: thread.targetPr, repo: thread.targetRepo, branch: thread.targetBranch, checkout: cwd }
           : null,
         push,
+        trusted: askOffersEnvironmentSteps(project),
       }),
       ...(push ? { pushBranch } : {}),
+      ...(capped ? { permissionMode: capped } : {}),
       gitName: sender.displayName || sender.unixUsername,
       gitEmail: sender.googleEmail,
       // The project's name with the chat, for its telemetry resource (agent/chat-runner.js chatTelemetryEnv).
@@ -667,6 +767,8 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
       ...(memorySpace !== undefined ? { spaceMemory: { space: memorySpace } } : {}),
       ...(live ? { live: true } : {}),
       ...(steerOf ? { steerOf } : {}),
+      // The tier's launch string (claudeLaunchModel): only to an agent that takes it, else it is dropped there.
+      ...(turnModel.launch ? { model: turnModel.launch } : {}),
     }, START_RPC_MS);
   } catch (e) {
     const state = await runState(instanceId, message.id);
@@ -674,7 +776,7 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
     // A steer whose answer was lost: the message it joined says so while the turn runs.
     if (action === 'adopt' && steerOf && (await runStatus(instanceId, steerOf)).supersededBy === message.id) answer = { steered: true };
     // One the box doesn't have was refused (or never arrived): it waits for the turn instead of failing.
-    if (steerOf && state === 'gone') return holdAsNextTurn(message.id, r.prompt, steerOf, `${project.instance.name} did not take it into the running turn`);
+    if (steerOf && state === 'gone') { await unrecord(); return holdAsNextTurn(message.id, r.prompt, steerOf, `${project.instance.name} did not take it into the running turn`); }
     if (action !== 'adopt') {
       const error = `${project.instance.name} did not start the run: ${errMsg(e)}`;
       const failed = await prisma.agentMessage.updateMany({
@@ -693,11 +795,13 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
   }
   // Refused by the box's turn: nothing started there, so it waits at the orchestrator for that turn to end.
   if (steerOf && answer?.steered !== true && answer && (answer as { started?: unknown }).started === false) {
+    await unrecord();
     return holdAsNextTurn(message.id, r.prompt, steerOf, steerRefusalText(typeof answer.reason === 'string' ? answer.reason : null));
   }
   const started = await prisma.agentMessage.updateMany({
     where: { id: message.id, status: 'submitted' },
-    data: { status: 'working', startedAt: new Date(), queuedUntil: null },
+    // From here, the tier the turn launched on (null: the box's default), not the one it asked for.
+    data: { status: 'working', startedAt: new Date(), queuedUntil: null, model: turnModel.tier, modelIgnored: turnModel.ignored },
   });
   wake(message.id);
   const steered = !!steerOf && answer?.steered === true;
@@ -706,12 +810,71 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
     else console.log(`[ASK] message ${message.id}: not steered into ${steerOf}'s turn (${typeof answer?.reason === 'string' ? answer.reason : 'no answer'}); it runs after it`);
   }
   const steerInfo = steerOf ? { steered, steerRefused: steered ? null : steerRefusalText(typeof answer?.reason === 'string' ? answer.reason : null) } : {};
-  if (started.count) return { status: 'working', ...steerInfo };
+  const modelInfo = turnModel.ignored ? { modelIgnored: turnModel.ignored } : {};
+  // The box took the turn: only now does its tier become the thread's (a refused or failed start returned above).
+  // A failed write never fails a run the box already took: the turn and AgentMessage.model stand, and the thread's
+  // chat keeps its old choice (the next --model sets it again).
+  if (started.count) {
+    await turnModel.save().catch((e: unknown) => console.warn(`[ASK] message ${message.id}: the thread chat's model was not stored (${errMsg(e)}); the turn runs on ${turnModel.tier}`));
+  }
+  if (started.count) return { status: 'working', ...steerInfo, ...modelInfo };
   // Someone else moved the turn on while this start ran: a cancel (whose
   // stop found nothing to stop yet), or a retry's replay that settled it.
   const now = (await prisma.agentMessage.findUnique({ where: { id: message.id }, select: { status: true } }))?.status ?? 'canceled';
   if (now === 'canceled') void stopRun(instanceId, message.id);
   return { status: now };
+}
+
+/**
+ * The model a turn launches on ("Choosing the
+ * model"). In the thread's chat: the tier askTurnTier settles (the one asked
+ * for, which the chat keeps, else the chat's stored one), as the launch
+ * string a chat send gets for it (chatLaunchFor: the gateway's pinned
+ * profile, or the alias off it). `tier` is what the turn ran on, null for no
+ * `--model` (the box's default), or with `ignored` the one asked for. `ignored`
+ * says why a `--model` asked for does not reach the turn: a headless run, or an
+ * agent from before ask-model-v1, which would drop the field. Then nothing is
+ * stored on the thread's chat: its next turns keep the choice it had.
+ */
+type TurnModel = { tier: string | null; launch: string | null; ignored: string | null; save: () => Promise<void> };
+const unsaved = async () => {};
+
+/** What askTurnModel reads of a start: the message's asked-for tier, the asker (for the flag), the project and its box. */
+type TurnModelInput = {
+  message: { model?: string | null };
+  sender: Parameters<typeof askModelChoiceOn>[0];
+  project: { userId: string; instance: { name: string; kind: string } };
+  instanceId: string;
+};
+
+async function askTurnModel(r: TurnModelInput, chat: { workstreamId: string } | null, caps: readonly string[]): Promise<TurnModel> {
+  const parsed = parseClaudeChatModel(r.message.model);
+  const requested = parsed.ok ? parsed.model : null;
+  const box = r.project.instance.name;
+  if (!chat) return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('headless', box) : null, save: unsaved };
+  // Off for the asker and box: as an older agent, and the thread's stored tier is not applied either.
+  if (!await askModelChoiceOn(r.sender, { id: r.instanceId, name: box, kind: r.project.instance.kind })) {
+    return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('off', box) : null, save: unsaved };
+  }
+  // Before askTurnTier: a turn that can't take the model leaves the thread's choice as it was.
+  if (!caps.includes(ASK_MODEL_CAPABILITY)) {
+    return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('agent', box) : null, save: unsaved };
+  }
+  const { tier, save } = await askTurnTier(chat.workstreamId, requested);
+  if (!tier) return { tier: null, launch: null, ignored: null, save };
+  const l = await chatLaunchFor({ backend: null, model: tier }, { ownerId: r.project.userId, instanceId: r.instanceId, capabilities: caps });
+  return { tier, launch: l.ok ? l.launch.model : tier, ignored: null, save };
+}
+
+/**
+ * Why a requested `--model` does not reach the turn. Such a message runs with
+ * no `--model`, and is never steered into a turn that has one (steerDecision
+ * gets its effective tier, null), so "the box's default" holds.
+ */
+function modelIgnoredReason(why: 'headless' | 'off' | 'agent', box: string): string {
+  if (why === 'headless') return `the run on ${box} is headless, outside the thread's chat, and takes no --model; it runs on the box's default`;
+  if (why === 'off') return `${ASK_MODEL_OFF_REASON}; the turn runs on the box's default`;
+  return `${box}'s agent predates --model (it needs a newer termag agent); the turn runs on the box's default`;
 }
 
 /**
@@ -1039,9 +1202,24 @@ export const prismaCliAsk: CliAsk = {
 
     const instanceId = project.instance?.id ?? null;
     if (!instanceId || !project.instance) return rejection(409, 'That project is not on a box; asks run on boxes only', 'no_box', req);
+    // An ask's run needs the Claude credentials termag doesn't deliver to a box with setup off.
+    if (isSetupOff(project.instance)) {
+      return rejection(409, `Asks: termag setup is off on ${project.instance.name}, so it has no Claude credentials for the run`, SETUP_DISABLED_CODE, req);
+    }
     const workspace = isWorkspace(project);
+    // A new project's repositories still cloning count: the ask waits for its setup (askableRepos).
+    // Their URLs come along: --update-pr checks a PR against the checkout's repository.
+    let repoUrls: ReadonlyArray<{ name: string; url: string }> = project.repos;
+    if (workspace && isProjectSettingUp(project.setupStatus)) {
+      const rows = await prisma.projectRepo.findMany({
+        where: { projectId: access.project.id }, select: { name: true, url: true, setupStatus: true }, orderBy: { position: 'asc' },
+      });
+      const askable = new Set(askableRepos(project.setupStatus, rows));
+      repoUrls = rows.filter(r => askable.has(r.name));
+    }
+    const repos = repoUrls.map(r => r.name);
     const checkout = repoTarget(
-      { workspace, repos: project.repos.map(r => r.name), target: askTarget(project.instance.name, project.name, req.workstream) },
+      { workspace, repos, target: askTarget(project.instance.name, project.name, req.workstream) },
       req.repo,
       workspace && await multiRepoEnabled({ ...user, defaultAgentProvider: '' }),
     );
@@ -1063,9 +1241,16 @@ export const prismaCliAsk: CliAsk = {
     }
     const waitsForBox = route === 'queue';
     const transport = waitsForBox ? null : conn;
+    // `--model` off for the asker and box (ask-model-choice-enabled): ignored, as an older box agent would.
+    const modelOn = await askModelChoiceOn(user, { id: project.instance.id, name: project.instance.name, kind: project.instance.kind });
+    const modelOff = !!req.model && !modelOn;
     if (transport && !transport.capabilities.includes(ASK_AGENT_CAPABILITY)) {
       return rejection(409, `${project.instance.name}'s agent can't run asks yet; it needs a newer termag agent`, 'unsupported', req);
     }
+    // An ask that must be capped, to an agent that can't: refused here, before a message is made, as the ask chat's
+    // 409 is. One queued for a box that isn't connected yet is checked again when it starts (startRun).
+    const modeCapRefusal = transport ? askCapRefusal(project, project.instance.name, transport.capabilities) : null;
+    if (modeCapRefusal) return rejection(409, modeCapRefusal, 'ask-mode-cap', req);
     const unready = setupRefusal(project);
     if (unready) return rejection(409, unready.error, unready.code, req);
     const askChat = await prisma.workstream.findFirst({
@@ -1087,7 +1272,7 @@ export const prismaCliAsk: CliAsk = {
       // The newest active one: a follow-up steers into the turn the thread's latest message is in.
       const busy = await prisma.agentMessage.findFirst({
         where: { threadId: prior.id, status: { in: ACTIVE_STATES } },
-        select: { id: true, instanceId: true, status: true, createdAt: true, queuedUntil: true, queuedPrompt: true },
+        select: { id: true, instanceId: true, status: true, createdAt: true, queuedUntil: true, queuedPrompt: true, model: true, modelIgnored: true },
         orderBy: { createdAt: 'desc' },
       });
       if (busy) {
@@ -1096,10 +1281,19 @@ export const prismaCliAsk: CliAsk = {
         const busyRun = stillStarting(busy, Date.now()) ? null : await runStatus(busy.instanceId, busy.id);
         if (!busyRun || busyRun.state !== 'gone') {
           const busyBox = instanceAgentTransport(busy.instanceId);
+          // What this follow-up would run on: its --model, else the thread's stored tier, where the flag and the agent
+          // apply them; else none (the box's default). A turn on another model can't take it.
+          // Unknown (undefined) while the busy turn's box isn't connected: steerDecision then queues on that, not on a model.
+          const turnTier = !busyBox ? undefined
+            : modelOn && busyBox.capabilities.includes(ASK_MODEL_CAPABILITY)
+              ? req.model ?? await askChatStoredTier(prior.chatWorkstreamId)
+              : null;
           const steer = steerDecision(
-            { id: busy.id, status: busy.status, queued: busy.queuedPrompt !== null },
+            // What its claude -p runs on: an ignored --model kept the tier asked for, but the turn has none (the box's default).
+            { id: busy.id, status: busy.status, queued: busy.queuedPrompt !== null, model: busy.modelIgnored ? null : busy.model },
             {
               box: project.instance.name,
+              model: turnTier,
               connected: !!busyBox && !waitsForBox,
               capable: !!busyBox && busyBox.capabilities.includes(ASK_STEER_CAPABILITY) && busyBox.capabilities.includes(ASK_CHAT_CAPABILITY),
               liveTurn: busyRun?.live === true,
@@ -1116,20 +1310,29 @@ export const prismaCliAsk: CliAsk = {
     // --update-pr: checked now and remembered. A follow-up keeps the thread's, and may name one only
     // while the thread has published nothing (to pick a PR from a stack the publish refused).
     let targetPr: { number: number; repo: string; branch: string } | null = null;
-    const sameTarget = !!prior && !!req.targetPr && prior.targetPr === req.targetPr.number
-      && (!req.targetPr.repo || prior.targetRepo?.toLowerCase() === req.targetPr.repo.toLowerCase());
+    const sameRepo = (repo: string | null | undefined) => !req.targetPr?.repo || repo?.toLowerCase() === req.targetPr.repo.toLowerCase();
+    // Naming the PR the thread already publishes to (its target, or its own PR) changes nothing.
+    const sameTarget = !!prior && !!req.targetPr && (prior.targetPr != null
+      ? prior.targetPr === req.targetPr.number && sameRepo(prior.targetRepo)
+      : prior.prNumber === req.targetPr.number && sameRepo(prior.repo));
     if (prior && req.targetPr && !sameTarget && (prior.targetPr != null || prior.prNumber != null)) {
       return rejection(409, prior.targetPr != null
         ? `That thread publishes to PR #${prior.targetPr}; start a new thread to publish to another`
-        : `That thread publishes to its own PR #${prior.prNumber}; start a new thread with --update-pr`, 'thread_mismatch', req);
+        : `That thread publishes to its own PR #${prior.prNumber}; drop --update-pr, or start a new thread to publish to another`, 'thread_mismatch', req);
     }
     if (req.targetPr && !sameTarget) {
-      const checkoutUrl = repoName ? project.repos.find(r => r.name === repoName)?.url ?? null : project.repoUrl;
+      const checkoutUrl = repoName ? repoUrls.find(r => r.name === repoName)?.url ?? null : project.repoUrl;
       const t = await targetForAsk(user, req, checkoutUrl);
       if ('status' in t) return t;
       targetPr = t;
     }
 
+    // A --model this box can't honour, said at once when its agent is known; stored with the message (a replay says it too);
+    // a started turn says it itself (askTurnModel).
+    const modelUnknown = modelOff ? modelIgnoredReason('off', project.instance.name)
+      : req.model && transport && !transport.capabilities.includes(ASK_CHAT_CAPABILITY) ? modelIgnoredReason('headless', project.instance.name)
+      : req.model && transport && !transport.capabilities.includes(ASK_MODEL_CAPABILITY) ? modelIgnoredReason('agent', project.instance.name)
+      : null;
     // Who sent it: the thread's parent on a new thread, and on every message the session told when it finishes.
     const from = await askSession(user, senderInstanceId, req.sender, req.notify);
     const parent = prior ? null : from;
@@ -1214,6 +1417,9 @@ export const prismaCliAsk: CliAsk = {
             // The checked sender always (an automation's "asks my runs sent"); `via` only when it may be told.
             ...(from ? { notifyProjectId: from.projectId, notifyWorkstream: from.workstream, ...(from.via ? { notifyVia: from.via } : {}) } : {}),
             ...(queued ? { queuedPrompt: req.prompt, queuedUntil: queueUntil() } : {}),
+            // `--model`, until the turn starts (startRun then records the tier it launched on).
+            ...(req.model ? { model: req.model } : {}),
+            ...(modelUnknown ? { modelIgnored: modelUnknown } : {}),
           },
         });
         return { thread, message };
@@ -1230,10 +1436,14 @@ export const prismaCliAsk: CliAsk = {
       return rejection(409, created.capped.error, created.capped.code, req);
     }
     const { thread, message } = created;
+    // One per message taken, by its sender, for an ask-delegation chart.
+    recordProductEvent('ask.sent', { user: user.id, box: instanceId }, {
+      thread: thread.id, hop: message.hop, followUp: !!prior, via: senderInstanceId ? 'box' : 'cli', queued,
+    });
     const branch = thread.targetBranch ?? askBranch(user.unixUsername, thread.id);
     // Whether this session will hear of the finish, so the CLI can say it need not poll (askNoticeSweep.ts decides again then).
     const notify = from?.via && await boolVariation(ASK_NOTICE_FLAG, { ...user, defaultAgentProvider: '' }, false) ? from.via : null;
-    const reply = (status: string, steer: { steered?: boolean; steerRefused?: string | null; heldAsNextTurn?: boolean } = {}) => ({
+    const reply = (status: string, steer: { steered?: boolean; steerRefused?: string | null; heldAsNextTurn?: boolean; modelIgnored?: string } = {}) => ({
       status: 202,
       body: {
         thread: thread.id, title: thread.title ?? null, message: message.id, status, hop: message.hop, hops: thread.hopCount, target, branch,
@@ -1241,6 +1451,9 @@ export const prismaCliAsk: CliAsk = {
         replyKept: getTranscriptStoreConfig() != null,
         ...(thread.targetPr != null ? { targetPr: thread.targetPr } : {}),
         ...(notify ? { notify } : {}),
+        // The --model this orchestrator took (a CLI warns when an older one leaves it out), and why the turn won't get it.
+        ...(req.model ? { model: req.model } : {}),
+        ...(req.model && (steer.modelIgnored ?? modelUnknown) ? { modelIgnored: steer.modelIgnored ?? modelUnknown } : {}),
         ...(queued ? { queued: true, queuedFor: queueBehind ? 'turn' : waitsForBox ? 'box' : 'setup' } : {}),
         ...(steer.heldAsNextTurn ? { queued: true, queuedFor: 'turn' } : {}),
         ...(queueBehind ? { steered: false, queuedBehind: queueBehind.id, steerRefused: queueBehind.reason } : {}),
@@ -1364,7 +1577,7 @@ export const prismaCliAsk: CliAsk = {
       select: {
         id: true, name: true, description: true, userId: true, setupStatus: true, setupError: true, layout: true,
         user: { select: { unixUsername: true } },
-        repos: { select: { name: true }, orderBy: { position: 'asc' } },
+        repos: { where: { setupStatus: 'ready' }, select: { name: true }, orderBy: { position: 'asc' } },
         instance: { select: { id: true, name: true, status: true, hostHome: true, kind: true, userId: true } },
         // An ask's own chat is not something to ask (services/askChat.ts).
         workstreams: { where: { archived: false, askThread: null }, select: { name: true, sessionTitle: true }, orderBy: { createdAt: 'asc' } },

@@ -10,7 +10,7 @@ vi.mock('./executor', () => {
 
 import { ClaudeRunStopped } from './executor';
 import { runAgentTurn, type AgentTurn } from './agentTurn';
-import { acceptAgentRuns, agentRuns, rememberClaudeSession, setAgentThreadStore, stopAgentRunsForRestart, type AgentThreadStore } from './agentSession';
+import { acceptAgentRuns, agentRuns, MAX_AGENT_RUNS_TOTAL, rememberClaudeSession, setAgentThreadStore, stopAgentRunsForRestart, type AgentThreadStore } from './agentSession';
 
 let seq = 0;
 
@@ -293,6 +293,67 @@ describe('runAgentTurn', () => {
     expect(client.filesUploadV2).not.toHaveBeenCalled();
     const offer = client.calls.find((c: any) => c.method === 'chat.postMessage' && c.args.blocks);
     expect(offer.args.blocks[1].elements[0].action_id).toBe('agent_attach_share');
+  });
+
+  it('refuses a turn once the global cap is reached, whoever asks', async () => {
+    const client = fakeClient();
+    const releases: Array<(v: string) => void> = [];
+    exec.run.mockImplementation(() => new Promise<string>(r => { releases.push(r); }));
+    // MAX_AGENT_RUNS_TOTAL runs, at most three per person (the per-person cap).
+    const running = Array.from({ length: MAX_AGENT_RUNS_TOTAL }, (_, i) =>
+      runAgentTurn(turn(client, { channelId: `D${++seq}`, userId: `U-CAP-${Math.floor(i / 3)}` })));
+    await vi.waitFor(() => expect(exec.run).toHaveBeenCalledTimes(MAX_AGENT_RUNS_TOTAL));
+    const late = turn(client, { channelId: `D${++seq}`, userId: 'U-CAP-NEW' });
+    await runAgentTurn(late);
+    expect(late.say).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining('as many conversations as I can') }));
+    expect(exec.run).toHaveBeenCalledTimes(MAX_AGENT_RUNS_TOTAL);
+    releases.forEach(r => r('done'));
+    await Promise.all(running);
+    // Once they finish, the next one runs.
+    exec.run.mockResolvedValue('ok');
+    await runAgentTurn(turn(client, { channelId: `D${++seq}`, userId: 'U-CAP-NEW' }));
+    expect(exec.run).toHaveBeenCalledTimes(MAX_AGENT_RUNS_TOTAL + 1);
+  });
+
+  it('gives each run its own temp dir, and offers no file from another run\'s', async () => {
+    const { writeFile } = await import('fs/promises');
+    const { join } = await import('path');
+    const dirs: string[] = [];
+    exec.run.mockImplementation(async (_m: string, opts: any) => {
+      dirs.push(opts.env.TMPDIR);
+      expect(opts.appendSystemPrompt).toContain(opts.env.TMPDIR);
+      if (dirs.length === 1) {
+        await writeFile(join(opts.env.TMPDIR, 'theirs.png'), 'png');
+        return 'Done.';
+      }
+      // The second run tries to attach the first run's file.
+      return `Here.\n[attach: ${join(dirs[0], 'theirs.png')}]`;
+    });
+    const client: any = fakeClient();
+    client.filesUploadV2 = vi.fn();
+    await runAgentTurn(turn(client, { channelId: `D${++seq}`, userId: 'U-TMP-A' }));
+    await runAgentTurn(turn(client, { channelId: `D${++seq}`, userId: 'U-TMP-B' }));
+    expect(dirs[0]).not.toEqual(dirs[1]);
+    expect(dirs[0]).toMatch(/termag-slack-run-/);
+    const refused = client.calls.find((c: any) => c.method === 'chat.postMessage' && /Couldn't attach/.test(c.args.text ?? ''));
+    expect(refused?.args.text).toContain('outside the project and temp directories');
+    expect(client.calls.some((c: any) => c.args?.blocks?.[1]?.elements?.[0]?.action_id === 'agent_attach_share')).toBe(false);
+  });
+
+  it('offers a file from the run\'s own temp dir, and the Share button carries that dir', async () => {
+    const { writeFile } = await import('fs/promises');
+    const { join } = await import('path');
+    const { parseAttachValue } = await import('./agentAttachments');
+    let dir = '';
+    exec.run.mockImplementation(async (_m: string, opts: any) => {
+      dir = opts.env.TMPDIR;
+      await writeFile(join(dir, 'chart.png'), 'png');
+      return `Chart:\n[attach: ${join(dir, 'chart.png')}]`;
+    });
+    const client: any = fakeClient();
+    await runAgentTurn(turn(client, { channelId: `D${++seq}`, userId: 'U-TMP-C' }));
+    const offer = client.calls.find((c: any) => c.method === 'chat.postMessage' && c.args.blocks);
+    expect(parseAttachValue(offer.args.blocks[1].elements[0].value)).toMatchObject({ forUser: 'U-TMP-C', runDir: dir });
   });
 
   it('calls onStart once the turn is really running, and not when it refuses', async () => {

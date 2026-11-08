@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EC2Client } from '@aws-sdk/client-ec2';
-import { hibernationEnabledFor, resolveBoxImage, type BoxConfig } from './boxProvisioner';
+import { resolveBoxImage, type BoxConfig } from './boxProvisioner';
 
 const cfg = { rootVolumeGb: 120 } as BoxConfig;
 
@@ -94,16 +94,5 @@ describe('resolveBoxImage', () => {
   it('still fails the launch when there is no published image to fall back to', async () => {
     const { ec2 } = fakeEc2([]);
     await expect(resolveBoxImage(ec2, cfg, { kind: 'channel', channel: 'hibernation' })).rejects.toThrow('No box AMI found');
-  });
-});
-
-describe('hibernationEnabledFor', () => {
-  it('follows box-hibernation-enabled for the published image, and a fallback is the published image', () => {
-    expect(hibernationEnabledFor(false, { selected: false })).toBe(false);
-    expect(hibernationEnabledFor(true, { selected: false })).toBe(true);
-  });
-
-  it('lets an image the box-image flag chose hibernate with box-hibernation-enabled off, so its tag decides', () => {
-    expect(hibernationEnabledFor(false, { selected: true })).toBe(true);
   });
 });

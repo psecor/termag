@@ -257,10 +257,53 @@ describe('/t parsing', () => {
     ]);
     await run('UBOB', 'projects');
     expect(prisma.project.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { archived: false, OR: [{ userId: bob.id }, { shares: { some: { userId: bob.id } } }] },
+      where: { archived: false, kind: { in: ['normal', 'metaterm', 'automation'] }, OR: [{ userId: bob.id }, { shares: { some: { userId: bob.id } } }] },
     }));
     expect(said()[0]).toContain("`api`\n");
     expect(said()[0]).toContain("`web` · alice's");
+  });
+
+  // A space's orchestrator project is the space's (projectKind.ts inProjectLists):
+  // /t never picks it as the default, and /t switch doesn't know it.
+  describe('a space orchestrator project', () => {
+    const orchestrator = { id: 'p-space', name: 'space-alpha', kind: 'space-orchestrator', userId: bob.id, instanceId: 'i-bob', user: bob, workstreams: [] };
+    const listed = (where: any) => !where.kind || where.kind.in.includes('space-orchestrator');
+    beforeEach(() => {
+      // What the database answers: the orchestrator sorts first by name, so only the kind filter keeps it out.
+      prisma.project.findFirst.mockImplementation(async ({ where }: any) => (where.userId === bob.id ? (listed(where) ? orchestrator : bobProject) : null));
+      prisma.project.findMany.mockImplementation(async ({ where }: any) => (where.name === 'space-alpha' && listed(where) ? [orchestrator] : []));
+    });
+
+    it('is never the project /t falls back to without a target', async () => {
+      await run('UBOB', 'run the tests');
+      expect(sendKeys).toHaveBeenCalledWith('bob-api-agent', 'run the tests', true, 'i-bob');
+      expect(prisma.project.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ kind: { in: ['normal', 'metaterm', 'automation'] } }),
+      }));
+    });
+
+    it('is unknown to /t switch', async () => {
+      await run('UBOB', 'switch space-alpha');
+      expect(repliedText().at(-1)).toMatch(/^No project `space-alpha`\./);
+      expect(prisma.chatActiveTarget.upsert).not.toHaveBeenCalled();
+    });
+
+    it('does not become the saved target through /t attach', async () => {
+      vi.mocked(resolveSessionProject).mockResolvedValue({ userId: bob.id, instanceId: 'i-bob', projectId: orchestrator.id, workstream: 'main' });
+      prisma.project.findUnique.mockResolvedValue({ kind: 'space-orchestrator' });
+      await run('UBOB', 'attach bob-space-alpha-agent');
+      expect(prisma.chatActiveTarget.upsert).not.toHaveBeenCalled();
+    });
+
+    it('is no active target, even one saved before', async () => {
+      prisma.project.findMany.mockResolvedValue([{ ...bobProject, workstreams: [] }]);
+      await run('UBOB', 'switch api');
+      prisma.project.findUnique.mockResolvedValue(orchestrator);
+      vi.mocked(sendKeys).mockClear();
+      await run('UBOB', 'run the tests');
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(repliedText().at(-1)).toMatch(/^The project you switched to is gone\./);
+    });
   });
 
   it('saves /t switch, so a deploy keeps it', async () => {

@@ -7,6 +7,7 @@ import { prisma } from '../db';
 import { spawnLaunchCommand } from './agentSpawn';
 import { SPAWN_CLAIM_WINDOW_MS } from './spawnLimits';
 import { recordSpawnEvent } from './spawnEvents';
+import type { SpawnTelemetry } from './launchCommand';
 
 /** A brief not launched within this long is left alone: the spawn has failed some other way. */
 const CLAIM_WINDOW_MS = SPAWN_CLAIM_WINDOW_MS;
@@ -107,5 +108,37 @@ export async function unparkOnLaunch(userId: string, projectId: string | null, w
     }
   } catch (err) {
     console.warn(`[SPAWN] unpark on launch failed for ${workstream}:`, (err as Error).message);
+  }
+}
+
+/**
+ * What a spawned workstream's launches name of its spawn, for the resource's
+ * termag.spawn.* (services/launchCommand.ts spawnEnvPrefix): its newest spawn
+ * live row's id (not failed or retired, as spawnStatusLog's
+ * watchLaunchedSpawn picks it), root and depth, and the parent's project (by name, as
+ * termag.project names it), workstream and box. Every launch of the
+ * workstream, not only the brief's, so a resume or a relaunch stays in its
+ * tree. Null for a workstream no spawn made; never throws, since the launch
+ * goes ahead without it.
+ */
+export async function spawnTelemetryFor(k: { userId: string; projectId: string | null; workstream: string }): Promise<SpawnTelemetry | null> {
+  if (!k.projectId) return null;
+  try {
+    const row = await prisma.agentSpawn.findFirst({
+      where: { userId: k.userId, childProjectId: k.projectId, childWorkstream: k.workstream, retiredAt: null, state: { not: 'failed' } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, rootSpawnId: true, depth: true, parentProjectId: true, parentWorkstream: true, parentInstanceId: true },
+    });
+    if (!row) return null;
+    const parent = row.parentProjectId
+      ? await prisma.project.findUnique({ where: { id: row.parentProjectId }, select: { name: true } })
+      : null;
+    return {
+      id: row.id, root: row.rootSpawnId ?? row.id, depth: row.depth,
+      parentProject: parent?.name ?? null, parentWorkstream: row.parentWorkstream, parentBox: row.parentInstanceId,
+    };
+  } catch (err) {
+    console.warn(`[SPAWN] ${k.workstream}: spawn telemetry lookup failed:`, (err as Error).message);
+    return null;
   }
 }

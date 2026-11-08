@@ -56,19 +56,12 @@ vi.mock('@aws-sdk/client-ec2', () => {
 });
 
 const rowType = new Map<string, string>();
-const owners = new Map<string, Record<string, string>>([['u1', { id: 'u1', googleEmail: 'a@example.com', displayName: 'A', unixUsername: 'a', defaultAgentProvider: 'claude' }]]);
 vi.mock('../db', () => ({
   prisma: {
     instance: { update: async ({ where, data }: any) => { rowType.set(where.id, data.instanceType); return {}; } },
-    user: { findUnique: async ({ where }: any) => owners.get(where.id) ?? null },
   },
 }));
 
-const flag = { on: true, reads: [] as string[] };
-vi.mock('./featureFlags', () => ({
-  boolVariation: async (key: string, user: { id: string }) => { flag.reads.push(`${key}:user:${user.id}`); return flag.on; },
-  boolVariationForContext: async (key: string, ctx: { key: string }) => { flag.reads.push(`${key}:ctx:${ctx.key}`); return flag.on; },
-}));
 vi.mock('./boxProvisioner', async () => {
   const real = await vi.importActual<typeof import('./boxProvisioner')>('./boxProvisioner');
   return {
@@ -88,7 +81,6 @@ function box(extra: Partial<Instance> = {}): Instance {
 
 beforeEach(() => {
   Object.assign(ec2, { type: 'm8g.2xlarge', noCapacity: new Set(['m8g.2xlarge']), startError: null, describeTypesError: null, sent: [] });
-  Object.assign(flag, { on: true, reads: [] });
   rowType.clear();
 });
 
@@ -125,7 +117,11 @@ describe('startOnFallbackType', () => {
     await expect(startOnFallbackType(client as any, box(), capacity())).resolves.toBe('m7g.2xlarge');
     expect(ec2.sent).toEqual(['DescribeInstanceTypes', 'Modify(m7g.2xlarge)', 'StartInstances']);
     expect(rowType.get('inst_1')).toBe('m7g.2xlarge');
-    expect(flag.reads).toEqual(['box-start-type-fallback-enabled:user:u1']);
+  });
+
+  it('retypes an environment pool box a claim is starting (env-starting), as a stopped one', async () => {
+    await expect(startOnFallbackType(client as any, box({ status: 'env-starting', userId: null }), capacity())).resolves.toBe('m7g.2xlarge');
+    expect(ec2.sent).toEqual(['DescribeInstanceTypes', 'Modify(m7g.2xlarge)', 'StartInstances']);
   });
 
   it('puts the old type back and throws the first refusal when every candidate is refused', async () => {
@@ -143,20 +139,12 @@ describe('startOnFallbackType', () => {
     expect(ec2.type).toBe('m8g.2xlarge');
   });
 
-  it('touches nothing with the flag off', async () => {
-    flag.on = false;
-    const first = capacity();
-    await expect(startOnFallbackType(client as any, box(), first)).rejects.toBe(first);
-    expect(ec2.sent).toEqual([]);
-  });
-
   it("rethrows at once for a hibernated box (EC2 can't retype one) and for a refusal that isn't capacity", async () => {
     const first = capacity();
     await expect(startOnFallbackType(client as any, box({ status: 'hibernated' }), first)).rejects.toBe(first);
     const quota = Object.assign(new Error('vCPU limit'), { name: 'VcpuLimitExceeded' });
     await expect(startOnFallbackType(client as any, box(), quota)).rejects.toBe(quota);
     expect(ec2.sent).toEqual([]);
-    expect(flag.reads).toEqual([]);
   });
 
   it("rethrows without retyping when DescribeInstanceTypes fails: no shape, no way to tell what's the same", async () => {
@@ -172,8 +160,7 @@ describe('startOnFallbackType', () => {
     await expect(startOnFallbackType(client as any, box({ size: null, instanceType: 'm7g.2xlarge' }), capacity())).resolves.toBe('m8g.2xlarge');
   });
 
-  it('a pool box (no owner) reads the flag for the pool context', async () => {
-    await startOnFallbackType(client as any, box({ userId: null }), capacity());
-    expect(flag.reads).toEqual(['box-start-type-fallback-enabled:ctx:termag-warm-pool']);
+  it('a pool box (no owner) walks too', async () => {
+    await expect(startOnFallbackType(client as any, box({ userId: null }), capacity())).resolves.toBe('m7g.2xlarge');
   });
 });

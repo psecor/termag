@@ -20,7 +20,7 @@ export interface ComponentSummary {
   spread: Array<{ version: string; hosts: number }>;
 }
 
-const EMPTY_COUNTS = (): Record<SoftwareState, number> => ({ current: 0, behind: 0, outdated: 0, ahead: 0, missing: 0, unknown: 0 });
+const EMPTY_COUNTS = (): Record<SoftwareState, number> => ({ current: 0, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 0, unknown: 0 });
 export const short = (s: string | null | undefined) => (s ? s.slice(0, 12) : null);
 
 /** Offline as the host table shows it: the agent is not connected. The orchestrator row is always online. */

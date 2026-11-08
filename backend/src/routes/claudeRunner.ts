@@ -56,13 +56,12 @@ import { recordProductEvent } from '../services/productEvents';
 import { boolVariation } from '../services/featureFlags';
 import { isBoxProvisioningConfigured, isConcurrentCreate, pickFreeBoxName, provisionNewBox } from '../services/boxProvisioner';
 import { boxImageSelectionFor, isPublished } from '../services/boxImage';
-import { ownerHibernationEnabled, poolHibernationEnabled } from '../services/boxHibernationFlag';
 import { ownerDefaultSize } from '../services/boxSize';
 import { recordPoolClaim, warmPoolTargetFor } from '../services/warmPoolSizes';
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { PowerRequestConflict, requestPower } from '../services/boxPower';
 import { powerRequestError } from '../services/boxPowerPolicy';
-import { claimWarmBox, isNameConflict, prismaClaimEffects, WARM_POOL_ENABLED_FLAG } from '../services/warmPoolClaim';
+import { claimWarmBox, isNameConflict, prismaClaimEffects } from '../services/warmPoolClaim';
 import { claimUpdateRunning } from '../services/claimUpdateGate';
 import { poolSpecHashOrNull, reconcileWarmPool } from '../services/warmPool';
 import { deliveryInFlight } from '../services/credentialDelivery';
@@ -224,17 +223,15 @@ async function getOwnerABox(
   // this process only, and the names below dodge every existing row, so a
   // unique-index clash alone would not say another process got there first.
   const stillNeeded = (owned: OwnedBox[]) => autoBoxPlan(owned).kind === 'acquire';
-  // The owner's box-image and box-hibernation-enabled flags, read once so the
-  // claim decision and the launch agree, as Add box does (routes/instances.ts
-  // createBox): a pool box runs the published image with the pool's
-  // hibernation value, so an owner whose flags say otherwise takes the cold path.
+  // The owner's box-image flag, read once so the claim decision and the
+  // launch agree, as Add box does (routes/instances.ts createBox): a pool box
+  // runs the published image, so an owner whose flag says otherwise takes the
+  // cold path.
   // The owner's box-default-size picks which of the pool's sizes to claim.
   const image = await boxImageSelectionFor(flagIdentity(user));
-  const hibernation = await ownerHibernationEnabled(flagIdentity(user));
   const size = await ownerDefaultSize(flagIdentity(user));
   try {
-    if (await boolVariation(WARM_POOL_ENABLED_FLAG, flagIdentity(user), false) && isPublished(image)
-      && hibernation === await poolHibernationEnabled()) {
+    if (isPublished(image)) {
       const pooled = await warmPoolTargetFor(size) > 0;
       const currentHash = pooled ? await poolSpecHashOrNull(size) : null;
       if (!currentHash) {
@@ -272,7 +269,7 @@ async function getOwnerABox(
     if (noColdBox) return retry(REFUSAL.boxCreationRefused(noColdBox.body.error));
     // Cold: minutes, async. The next spawn sees the box as `provisioning` and waits.
     if (callerGone()) return gone();
-    const name = await provisionNewBox(user, autoBoxName(), stillNeeded, { image, hibernation, flavor: 'full' }, size);
+    const name = await provisionNewBox(user, autoBoxName(), stillNeeded, { image, flavor: 'full' }, size);
     // Provisioning is configured (checked above), so null means the re-check
     // found a box already on its way.
     if (!name) return retry(REFUSAL.boxOnItsWay());
@@ -468,7 +465,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       // The Claude Code floor: a
       // v3 wrapper is told the floor and enforces it; a box whose inventory
       // reads below it, with a wrapper that cannot, takes no new runner and is
-      // asked to update (a floor run). Behind claude-code-update-enabled.
+      // asked to update (a floor run). Behind Claude Code's enabled (its policy's mode not off).
       const floors = await runnerFloors(ldUser, boxes);
       requestFloorRuns(ldUser, boxes, floors);
       /** The floor for boxes this request found later (a claimed or a newly ready one). */

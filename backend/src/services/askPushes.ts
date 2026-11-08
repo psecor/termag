@@ -12,7 +12,7 @@
  * anyway, so publish's checks were never a boundary; hygiene lives in the
  * clone's hooks and the repository's own CI.
  */
-import { ASK_PR_KEY, MAX_ASK_PRS, type ReportedPush } from './agentMessages';
+import { ASK_PR_KEY, MAX_ASK_PRS, type ReportedPush, type UnpushedBranch } from './agentMessages';
 
 export interface GithubConfig {
   apiBaseUrl: string;
@@ -116,23 +116,50 @@ export async function confirmPushes(cfg: GithubConfig, input: ConfirmInput): Pro
 }
 
 /**
- * The turn's pushes as agent_messages.publish / publishDetail: `none` when it
- * pushed nothing, `published` when every pushed branch has a PR, `partial`
- * when some have none yet or could not be confirmed, `failed` when none could.
- * Past MAX_ASK_PRS PRs on the thread the detail says so; nothing is refused.
+ * What the clone committed and never pushed, one part of a publish detail
+ * each, with the push that publishes it. The push goes to the branch the box
+ * named (`to`), which is the one the reply names: the box knows which branches
+ * origin has, so a branch `gh pr checkout` made goes to its own PR's branch.
+ * When a box sends no `to`, the push goes to the branch's own name for the
+ * thread's branch and its `<own>-<name>` siblings, else to the thread's branch.
  */
-export function pushSummary(all: PushOutcome[], threadPrs: number): { publish: 'none' | 'published' | 'partial' | 'failed'; detail: string | null } {
+export function unpushedParts(unpushed: UnpushedBranch[], ownBranch: string): string[] {
+  return unpushed.map(u => {
+    if (u.branch === 'HEAD') return `a detached HEAD has ${u.commits} commit(s) on no branch, not pushed (git push origin HEAD:${u.to ?? ownBranch})`;
+    const pushed = `${u.branch}: ${u.commits} commit(s) committed but not pushed`;
+    const to = u.to ?? (u.branch === ownBranch || u.branch.startsWith(`${ownBranch}-`) ? u.branch : ownBranch);
+    if (to === u.branch) return `${pushed} (git push origin ${u.branch})`;
+    return `${pushed} (the thread's branch is ${to}: git push origin ${u.branch}:${to})`;
+  });
+}
+
+/**
+ * The turn's pushes as agent_messages.publish / publishDetail: `none` when it
+ * pushed nothing and left nothing unpushed, `published` when every pushed
+ * branch has a PR, `partial` when some have none yet or could not be
+ * confirmed, `failed` when none could. Commits the clone has that no origin
+ * branch has (`unpushed`, any turn's, a canceled one's included) are in the
+ * detail and keep it from `published`; with nothing pushed they are
+ * `unpushed`, never `none`, so a turn that only committed doesn't read as
+ * done. Past MAX_ASK_PRS PRs on the thread the detail says so; nothing is
+ * refused.
+ */
+export function pushSummary(
+  all: PushOutcome[], threadPrs: number, unpushed: UnpushedBranch[] = [], ownBranch = '',
+): { publish: 'none' | 'published' | 'partial' | 'failed' | 'unpushed'; detail: string | null } {
   // Branches deleted on GitHub with no PR are history, not this turn's outcome.
   const outcomes = all.filter(o => o.kind !== 'gone');
-  if (!outcomes.length) return { publish: 'none', detail: null };
+  const left = unpushedParts(unpushed, ownBranch);
+  if (!outcomes.length) return left.length ? { publish: 'unpushed', detail: left.join(' | ') } : { publish: 'none', detail: null };
   const recorded = outcomes.filter(o => o.kind === 'recorded').length;
   const failed = outcomes.filter(o => o.kind === 'failed').length;
-  const publish = recorded === outcomes.length ? 'published' : !recorded && failed === outcomes.length ? 'failed' : 'partial';
+  const publish = recorded === outcomes.length ? (left.length ? 'partial' : 'published') : !recorded && failed === outcomes.length ? 'failed' : 'partial';
   const parts = outcomes.map(o => o.kind === 'recorded'
     ? `${o.branch}: PR #${o.prNumber}${o.state === 'open' ? '' : ` (${o.state})`}`
     : o.kind === 'no-pr'
       ? `${o.branch}: pushed at ${o.headSha.slice(0, 12)}, no pull request yet (open a draft with termag-pr-create)`
       : `${o.branch}: ${(o as Extract<PushOutcome, { kind: 'failed' }>).reason}`);
   if (threadPrs > MAX_ASK_PRS) parts.push(`the thread has ${threadPrs} pull requests, more than the ${MAX_ASK_PRS} one thread usually opens`);
-  return { publish, detail: parts.join(' | ') };
+  // What wasn't pushed leads: the detail is cut at 1000 characters, and it is what the asker must act on.
+  return { publish, detail: [...left, ...parts].join(' | ') };
 }

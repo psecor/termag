@@ -27,8 +27,7 @@ export function providersRouter(): Router {
   // GET /api/providers/models — per harness, the model backends this viewer
   // may pick and each one's models (services/modelChoices.ts).
   // Fireworks only on an orchestrator with the gateway
-  // route and while fireworks-enabled is on for them, with their
-  // fireworks-models list, which the gateway's check also reads.
+  // route, with the viewer's fireworks-models list.
   const models: RequestHandler = async (req, res) => {
     res.json({ providers: backendChoices(await fireworksOfferedTo(req.user!)) });
   };

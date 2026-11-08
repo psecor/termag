@@ -55,7 +55,10 @@ export interface BoxRow {
   hostUnixUser: string | null;
   createdAt: Date;
   readyAt: Date | null;
-  projects: Array<{ id: string; name: string }>;
+  /** Instance.setupEnabled; rows read before it existed have setup on. */
+  setupEnabled?: boolean;
+  /** Every live project on the box; `label` names one termag manages ("space orchestrator for <space>"). */
+  projects: Array<{ id: string; name: string; label?: string }>;
   size?: string | null;
   instanceType?: string | null;
   /** The box's latest `resize` row in box_events (services/boxEvents.ts), when it has one. */
@@ -80,7 +83,14 @@ export interface CliBox {
   hostUnixUser: string | null;
   createdAt: string;
   readyAt: string | null;
-  projects: Array<{ id: string; name: string }>;
+  /** Whether termag sets the box up; false for one it only manages. */
+  setupEnabled: boolean;
+  /**
+   * Every live project on the box, the space orchestrator's included and
+   * labelled: `termag box rm` names them all before archiving them
+   * (projectKind.ts inProjectLists: confirmations never hide one).
+   */
+  projects: Array<{ id: string; name: string; label?: string }>;
   /** small, medium or large (services/boxSize.ts); null for a box launched as the configured type, or external. */
   size: string | null;
   /** The EC2 type it launched as (or was resized to); null for older and external boxes. */
@@ -115,7 +125,8 @@ export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
     hostUnixUser: row.hostUnixUser,
     createdAt: row.createdAt.toISOString(),
     readyAt: row.readyAt ? row.readyAt.toISOString() : null,
-    projects: row.projects.map(p => ({ id: p.id, name: p.name })),
+    setupEnabled: row.setupEnabled !== false,
+    projects: row.projects.map(p => ({ id: p.id, name: p.name, ...(p.label ? { label: p.label } : {}) })),
     size: row.size ?? null,
     instanceType: row.instanceType ?? null,
     resize: resizeView(row.resizeEvent),
@@ -141,6 +152,8 @@ export interface ProjectRow {
   repoUrl?: string | null;
   setupStatus?: string | null;
   setupError?: string | null;
+  /** Project.dir: the static layout's checkout (~/code/<repo>) when it has one (services/staticLayout.ts). */
+  dir?: string | null;
   createdFor?: string | null;
 }
 
@@ -253,7 +266,8 @@ export function shapeProject(row: ProjectRow, agentStatus: LiveStatus | undefine
     rateLimited: agentStatus?.rateLimited ?? null,
     workstreams,
     lastActiveAt: row.lastActiveAt.toISOString(),
-    directory: projectDirUnder(root, row.name),
+    // Where its checkout is: the static layout's ~/code/<repo>, or ~/code for a multi-repo project (the project directory links there), else the project directory.
+    directory: row.dir ?? projectDirUnder(root, row.name),
     sessions: sessions ?? null,
     clone: shapeClone(row),
     createdFor: createdFor(row.createdFor),

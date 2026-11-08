@@ -31,6 +31,7 @@ vi.mock('../chatSpace', () => ({
   })),
 }));
 vi.mock('../chatTrust', () => ({ UNTRUSTED_MODE: 'plan' }));
+vi.mock('../chatConfinedMcp', () => ({ brokerMcpFor: vi.fn(async () => null) }));
 // The choice's launch (services/chatLaunch.test.ts): a tier as itself, none as Sonnet, Fireworks refused here.
 vi.mock('../chatLaunch', () => ({
   chatLaunchFor: vi.fn(async (choice: { backend: string | null; model: string | null }) => (choice.backend
@@ -48,6 +49,7 @@ import { chatLaunchFor } from '../chatLaunch';
 import { sendForProject } from '../agentRegistry';
 import { chatSendRpcPayload } from '../chatRunner';
 import { chatSpaceFor } from '../chatSpace';
+import { brokerMcpFor } from '../chatConfinedMcp';
 import { createWorkstreamFor, removeWorkstreamFor } from '../../routes/workstreams';
 import { pullForRun, spaceFoldersEnabledFor } from './spaceSync';
 
@@ -222,6 +224,15 @@ describe('startRun in a space', () => {
     expect(vi.mocked(chatSpaceFor)).toHaveBeenLastCalledWith(expect.any(String), { requested: { name: 'team', userId: expect.any(String) } });
     expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[3]).toEqual({ memorySpace: 'team' });
     expect(brief()).toContain('outputs/run-20261020-0900/');
+  });
+
+  it('the run is the owner\'s: its brief carries their broker connectors when chat-confined-mcp-enabled gives any', async () => {
+    const field = { connectors: 'owner' as const, broker: 'https://mcp-broker.example.test', allow: ['mcp__slack__slack_read_*'], deny: [] };
+    vi.mocked(brokerMcpFor).mockResolvedValueOnce(field);
+    await startRun(inSpace);
+    // Its project and workstream, so brokerMcpFor can tell whether the run's output stays with the owner (chatConfinedMcp.ts automationStaysWithOwner).
+    expect(vi.mocked(brokerMcpFor)).toHaveBeenLastCalledWith(expect.objectContaining({ isOwner: true, projectId: expect.any(String), workstreamId: expect.any(String) }));
+    expect(vi.mocked(chatSendRpcPayload).mock.calls.at(-1)?.[3]).toEqual({ memorySpace: 'team', brokerMcp: field });
   });
 
   it('records the trouble on the row as it links it, and the brief says the space was not available', async () => {

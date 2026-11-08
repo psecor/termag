@@ -4,7 +4,7 @@ import { DEFAULT_GH_UPDATE_POLICY, parseGhUpdatePolicy } from './ghUpdatePolicy'
 describe('parseGhUpdatePolicy', () => {
   it('is the defaults for no value: the advisories\' floor, latest, and no restart', () => {
     for (const v of [undefined, null, [], 'latest', 3]) expect(parseGhUpdatePolicy(v)).toEqual(DEFAULT_GH_UPDATE_POLICY);
-    expect(DEFAULT_GH_UPDATE_POLICY).toEqual({ floor: '2.102.0', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
+    expect(DEFAULT_GH_UPDATE_POLICY).toEqual({ mode: 'off', floor: '2.102.0', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
   });
 
   it('takes x.y.z and latest, never another tag or anything a shell or apt would read', () => {

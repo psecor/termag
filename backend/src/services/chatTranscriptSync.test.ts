@@ -39,7 +39,6 @@ vi.mock('./chatTranscriptStore', () => ({
   appendChunk: vi.fn(),
   resetSession: vi.fn(),
 }));
-vi.mock('./featureFlags', () => ({ boolVariation: async () => true }));
 
 import { prisma } from '../db';
 import { startChatTranscriptSync } from './chatTranscriptSync';

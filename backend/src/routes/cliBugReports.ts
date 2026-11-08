@@ -1,10 +1,17 @@
 /**
- * Bug reports under /api/cli/v1, for `termag bug report`:
+ * Bug reports under /api/cli/v1, for `termag bug`:
  *
- *   POST /bug-reports    file one; 201 with its id
+ *   POST  /bug-reports            file one; 201 with its id (any credential)
+ *   GET   /bug-reports            list, as GET /api/admin/bug-reports   } an admin's
+ *   GET   /bug-reports/counts     reports per status                   } box only:
+ *   GET   /bug-reports/:id        one, with its history                } `bug list`,
+ *   PATCH /bug-reports/:id        { status?, duplicateOf?, link?, note? } `show`, `triage`
  *
- * Write-only: any other method is 405. Reading and triage are admin-only,
- * under /api/admin/bug-reports, and duplicates are the admins' to mark.
+ * The four reads and the triage are the admin routes' own handlers
+ * (routes/admin/bugs.ts), behind the shared admin-box gate
+ * (routes/cliAdminBox.ts): a box's own token (`tmag_…`) whose owner is an
+ * admin, from a box with no shared project, each call an audit row with the
+ * box.
  *
  * A box's own credential reports as its box and owner, a device sign-in as
  * its person. At most REPORTS_PER_HOUR per box in any hour (per person for a
@@ -13,6 +20,9 @@
  */
 import type { RequestHandler, Response, Router } from 'express';
 import { asyncHandler } from '../middleware/errors';
+import { rateLimit } from '../middleware/rateLimit';
+import { bugHandlers } from './admin/bugs';
+import { cliAdminBox, type CliAdminBox } from './cliAdminBox';
 import {
   RATE_WINDOW_MS, REPORTS_PER_HOUR, parseBugReportInput, underRateLimit, type BugReportStore,
 } from '../services/bugReports';
@@ -20,6 +30,8 @@ import type { CliAuth } from './cliApi';
 
 export interface CliBugReports {
   store: BugReportStore;
+  /** The reads' and the triage's gate (routes/cliAdminBox.ts). */
+  adminBox: CliAdminBox;
 }
 
 function cliAuth(res: Response): CliAuth {
@@ -53,9 +65,18 @@ export function mountCliBugReportRoutes(router: Router, deps: CliBugReports, bea
     });
   }));
 
+  // The same per-caller budget as /api/admin, keyed by the owner.
+  const admin = [bearer, cliAdminBox(deps.adminBox, { what: 'bug reports', webPath: '/admin/bugs' }), rateLimit({ capacity: 60, perMinute: 120 })];
+  const h = bugHandlers(deps.store, now);
+  router.get('/bug-reports', ...admin, h.list);
+  // Before /:id, which would take "counts" for an id.
+  router.get('/bug-reports/counts', ...admin, h.counts);
+  router.get('/bug-reports/:id', ...admin, h.detail);
+  router.patch('/bug-reports/:id', ...admin, h.triage);
+
   router.all('/bug-reports', bearer, (_req, res) => {
-    res.status(405).set('Allow', 'POST').json({
-      error: 'Bug reports are write-only from the CLI: file one with POST. Admins read and triage them at /admin/bugs',
+    res.status(405).set('Allow', 'GET, POST').json({
+      error: 'Bug reports take POST to file one, and GET from an admin\'s box to read them',
       code: 'method_not_allowed',
     });
   });

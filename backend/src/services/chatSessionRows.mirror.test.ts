@@ -36,6 +36,8 @@ const projects: ChatSourceProject[] = [
     workstreams: [ws('w-n-main', 'main'), ws('w-n-run', 'run-20261031')],
   },
   { id: 'p-meta', name: 'meta', instanceId: 'box-1', kind: 'metaterm', workflows: [agent('claude')], workstreams: [ws('w-m', 'main')] },
+  // A space's Slack orchestrator: never a session the sidebar lists (projectKind.ts).
+  { id: 'p-space', name: 'space-team', instanceId: 'box-1', kind: 'space-orchestrator', workflows: [agent('claude-chat')], workstreams: [ws('w-sp', 'main'), ws('w-sp-2', 'slack-c1')] },
   { id: 'p-gone', name: 'gone', instanceId: 'box-1', archived: true, workflows: [agent('claude-chat')], workstreams: [ws('w-g', 'main')] },
   { id: 'p-shell', name: 'shell', instanceId: 'box-1', workflows: [{ type: 'shell', provider: null, workstreamId: null }], workstreams: [ws('w-s', 'main')] },
   {
@@ -78,11 +80,11 @@ const webMap: Record<string, WebStatus> = Object.fromEntries(statuses.map(([box,
 const byKey = <R extends { key: string }>(rows: R[]) => [...rows].sort((a, b) => a.key.localeCompare(b.key));
 
 describe('chatSessionRows mirrors the simple UI sidebar', () => {
-  for (const titlesShown of [true, false]) {
-    it(`lists the same sessions under the same names (session titles ${titlesShown ? 'on' : 'off'})`, () => {
+  {
+    it('lists the same sessions under the same names', () => {
       const web = chatListRows(projects as unknown as WebProject[], webMap, 'alice', new Set())
-        .map(r => ({ ...r, ...chatRowName(r, titlesShown) }));
-      const server = chatSessionRows(projects, serverMap, 'alice', titlesShown);
+        .map(r => ({ ...r, ...chatRowName(r) }));
+      const server = chatSessionRows(projects, serverMap, 'alice');
       const view = (r: { key: string; title: string | null; where: string | null; ask: boolean; provider: string | null; status: string; workstreamId?: string | null; shared: boolean }) =>
         ({ key: r.key, title: r.title, where: r.where, ask: r.ask, provider: r.provider, status: r.status, workstreamId: r.workstreamId ?? null, shared: r.shared });
       expect(byKey(server).map(r => view({ ...r, status: r.status.value }))).toEqual(byKey(web).map(view));
@@ -99,7 +101,7 @@ describe('chatSessionRows: what a row at rest needs', () => {
   const one = (st: Partial<AgentStatus>) => chatSessionRows(
     [{ id: 'p', name: 'app', instanceId: 'box-1', kind: 'normal', workflows: [agent('claude-chat')], workstreams: [ws('w', 'main')] }],
     new Map([[statusKey('box-1', 'alice-app-agent'), { updatedAt: new Date(at), status: 'idle', ...st } as AgentStatus]]),
-    'alice', false,
+    'alice',
   )[0].status;
 
   it("names a lost Claude sign-in as web's chat does, and a usage cap with its own words", () => {

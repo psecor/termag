@@ -34,6 +34,7 @@ vi.mock('../services/agentRuntime', () => ({
   ensureAgentSessionsAndLaunch: vi.fn(),
   resolveAgentProvider: (p: string) => p,
   stopAgentSessions: vi.fn(async () => {}),
+  stopTerminalSlots: vi.fn(async () => {}),
 }));
 vi.mock('../services/chatRevoke', () => ({ revokeChats }));
 

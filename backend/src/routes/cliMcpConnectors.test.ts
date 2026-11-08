@@ -25,7 +25,6 @@ const store = {
   touchSession: async () => {},
 } as unknown as CliStore;
 
-let enabled = true;
 let server: Server;
 let base: string;
 beforeAll(async () => {
@@ -33,9 +32,7 @@ beforeAll(async () => {
   app.use('/api/cli/v1', cliApiRouter({
     store, codes: new AuthCodeStore(), jwt: new Promise(() => {}), now: () => now,
     mcpConnectors: {
-      list: async (user) => enabled
-        ? { available: true, connectors: [{ id: 'c1', name: 'linear', upstream: `https://mcp.linear.app/sse?u=${user.id}`, authType: 'oauth', status: 'ready' }] }
-        : null,
+      list: async (user) => ({ available: true, connectors: [{ id: 'c1', name: 'linear', upstream: `https://mcp.linear.app/sse?u=${user.id}`, authType: 'oauth', status: 'ready' }] }),
     },
   }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
@@ -46,17 +43,13 @@ afterAll(() => new Promise<void>(r => server.close(() => r())));
 const get = (token: string | null) => fetch(`${base}/api/cli/v1/mcp-connectors`, token ? { headers: { authorization: `Bearer ${token}` } } : {});
 
 describe('GET /api/cli/v1/mcp-connectors', () => {
-  it("lists the signed-in user's connectors, says when the broker is off for them, and needs a sign-in", async () => {
-    enabled = true;
-    let res = await get(DEVICE);
+  it("lists the signed-in user's connectors, and needs a sign-in", async () => {
+    const res = await get(DEVICE);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       enabled: true, available: true,
       connectors: [{ id: 'c1', name: 'linear', upstream: 'https://mcp.linear.app/sse?u=alice', authType: 'oauth', status: 'ready' }],
     });
-    enabled = false;
-    res = await get(DEVICE);
-    expect(await res.json()).toEqual({ enabled: false, available: false, connectors: [] });
     expect((await get(null)).status).toBe(401);
   });
 });

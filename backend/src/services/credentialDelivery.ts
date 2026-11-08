@@ -17,15 +17,18 @@ import { prisma } from '../db';
 import { otlpDestinationFromEnv, type OtlpDestination } from '../config/env';
 import { connectedOwnedBoxIds, instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
 import { isManagedBox, type AgentConnection } from './instanceLifecycle';
+import { isSetupOff } from './boxSetup';
 import { getClaudeGatewayConfig, gatewaySettings } from './claudeGateway';
-import { fireworksEnabledForBox } from './fireworksFlag';
 import { FIREWORKS_CAPABILITY, fireworksDelivery, getFireworksGatewayConfig } from './fireworksGateway';
 import { getCredentialStoreConfig, githubStoreDeps } from './credentialStore';
 import { getGithubBrokerUrl } from './githubBroker';
 import { AGENT_TELEMETRY_CAPABILITY } from './launchCommand';
-import { listConnectors, mcpBrokerEnabledForBox } from './mcpConnectorStore';
+import { isApiConnector } from './apiBroker';
+import { listConnectors } from './mcpConnectorStore';
 import { getMcpBrokerUrl } from './mcpConnectors';
 import { QUARANTINED } from './boxQuarantinePolicy';
+import { BAZEL_CACHE_CAPABILITY } from './bazelCache';
+import { deliverBazelCache } from './bazelCacheDelivery';
 import { mcpAgentTargets } from '../providers/registry';
 
 export const CREDENTIALS_CAPABILITY = 'credentials-v1';
@@ -56,7 +59,13 @@ export const MCP_AGENTS_CAPABILITY = 'mcp-broker-v2';
 // `termag-credentials launch-settings` prints. An agent without
 // it gets no fireworks step.
 export { FIREWORKS_CAPABILITY };
-export const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks'] as const;
+// The box writes the shared Bazel cache's block into /etc/bazel.bazelrc from
+// the values it's sent, refuses a lower seq, and flushes on a higher
+// flushGeneration, a remove's included.
+// The step is sent by services/bazelCacheDelivery.ts, through its own queue
+// per box; an agent without it gets none. (-v1 was option A's, never shipped.)
+export { BAZEL_CACHE_CAPABILITY };
+export const PROVIDERS = ['claude-gateway', 'github', 'telemetry', 'agent-telemetry', 'mcp', 'fireworks', 'bazel-cache'] as const;
 export type Provider = typeof PROVIDERS[number];
 
 const GATED: Partial<Record<Provider, string>> = {
@@ -64,6 +73,7 @@ const GATED: Partial<Record<Provider, string>> = {
   'agent-telemetry': AGENT_TELEMETRY_CAPABILITY,
   mcp: MCP_BROKER_CAPABILITY,
   fireworks: FIREWORKS_CAPABILITY,
+  'bazel-cache': BAZEL_CACHE_CAPABILITY,
 };
 
 /** The providers an agent with these capabilities can be sent steps for. */
@@ -170,22 +180,19 @@ export interface DeliveryInput {
   // agentTelemetrySettings, under the same condition.
   agentTelemetry?: { endpoint: string; resourceAttributes: string } | null;
   // The broker and the owner's connectors (ids and names only) when the broker
-  // is configured and mcp-broker-enabled is on for the owner and box, with the
-  // agent CLIs to register them with (mcpAgentTargets).
+  // is configured, with the agent CLIs to register them with (mcpAgentTargets).
   mcp?: { broker: string; connectors: { id: string; name: string }[]; agents?: string[] } | null;
   mcpOffReason?: string;
   // The connectors could not be read: no mcp step, as for githubUnknown.
   mcpUnknown?: boolean;
-  // fireworksDelivery when the orchestrator has a Fireworks config and
-  // fireworks-enabled is on for the owner and box.
+  // fireworksDelivery when the orchestrator has a Fireworks config.
   fireworks?: Record<string, unknown> | null;
   fireworksOffReason?: string;
-  // The flag could not be read: no fireworks step, as for githubUnknown.
-  fireworksUnknown?: boolean;
 }
 
 export const REASONS = {
   notManaged: 'this is not a termag-managed box, so termag delivers no credentials to it',
+  setupOff: 'termag setup is off on this box: termag delivers no credentials to it; sign in to Claude and GitHub on the box yourself',
   oldAgent: "this box's termag agent predates the GitHub broker; update it (termag-reconcile) to get GitHub through termag",
   noGateway: 'the orchestrator has no Claude gateway configured; log in to Claude on this box',
   gatewayOff: 'Claude through the termag gateway is turned off on the Credentials page',
@@ -195,15 +202,15 @@ export const REASONS = {
   noTelemetry: 'the orchestrator ships no telemetry (OBSERVABILITY_OTLP_ENDPOINT and OBSERVABILITY_PROJECT), so Claude Code here exports none',
   noAgentTelemetry: 'the orchestrator ships no telemetry (OBSERVABILITY_OTLP_ENDPOINT and OBSERVABILITY_PROJECT), so Codex, Cursor, Devin and pi here export none',
   noMcpBroker: 'the orchestrator has no MCP broker (MCP_BROKER_URL), so termag adds no MCP servers here',
-  mcpOff: 'MCP connectors through termag are not enabled for you (feature flag mcp-broker-enabled)',
   noFireworks: 'the orchestrator has no Fireworks gateway (FIREWORKS_GATEWAY_URL), so the Fireworks agents have no models here',
-  fireworksOff: 'Fireworks through termag is not enabled for you (feature flag fireworks-enabled)',
 };
 
 /**
  * Every provider the agent supports (providersFor) gets exactly one step,
  * so a box converges on the stored state whatever it held before: what isn't
- * stored is removed.
+ * stored is removed. All but `bazel-cache`, which deliverToInstanceNow sends
+ * through bazelCacheDelivery.ts's queue (it needs a seq, and is redelivered
+ * on its own).
  */
 export function planDelivery(input: DeliveryInput, capabilities: string[]): DeliveryStep[] {
   const steps: DeliveryStep[] = [];
@@ -240,7 +247,7 @@ export function planDelivery(input: DeliveryInput, capabilities: string[]): Deli
       ? { type: 'credentials-apply', provider: 'mcp', payload }
       : { type: 'credentials-remove', provider: 'mcp', reason: input.mcpOffReason ?? REASONS.noMcpBroker });
   }
-  if (capabilities.includes(FIREWORKS_CAPABILITY) && !input.fireworksUnknown) {
+  if (capabilities.includes(FIREWORKS_CAPABILITY)) {
     steps.push(input.fireworks
       ? { type: 'credentials-apply', provider: 'fireworks', payload: input.fireworks }
       : { type: 'credentials-remove', provider: 'fireworks', reason: input.fireworksOffReason ?? REASONS.noFireworks });
@@ -259,7 +266,8 @@ function isManagedBoxConnection(conn: AgentConnection): boolean {
 
 /** Why an agent that speaks credentials-v1 gets none, or null if it gets them. */
 export function refusalFor(agent: RequestingAgent): string | null {
-  return isManagedBoxConnection(agent.conn) ? null : REASONS.notManaged;
+  if (!isManagedBoxConnection(agent.conn)) return REASONS.notManaged;
+  return agent.conn.kind === 'owned-box' && isSetupOff(agent.conn.instance) ? REASONS.setupOff : null;
 }
 
 async function deliveryInputFor(userId: string, instanceId: string): Promise<{ input: DeliveryInput; githubError: Error | null }> {
@@ -281,7 +289,7 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
   }
   const telemetry = otlpDestinationFromEnv(process.env);
   const mcp = await mcpInputFor(userId, instanceId);
-  const fireworks = await fireworksInputFor(userId, instanceId);
+  const fireworks = fireworksInputFor();
   return {
     input: {
       claudeSettings: gateway && user?.claudeGatewayEnabled ? gatewaySettings(gateway) : null,
@@ -302,8 +310,8 @@ async function mcpInputFor(userId: string, instanceId: string): Promise<Pick<Del
   const broker = getMcpBrokerUrl();
   if (!broker) return { mcp: null, mcpOffReason: REASONS.noMcpBroker };
   try {
-    if (!await mcpBrokerEnabledForBox(userId, instanceId)) return { mcp: null, mcpOffReason: REASONS.mcpOff };
-    const connectors = (await listConnectors(userId)).map(c => ({ id: c.id, name: c.name }));
+    // A connector of kind "api" is for the API broker, not an MCP server.
+    const connectors = (await listConnectors(userId)).filter(c => !isApiConnector(c)).map(c => ({ id: c.id, name: c.name }));
     return { mcp: { broker, connectors, agents: mcpAgentTargets() } };
   } catch (err) {
     console.error(`[CRED] could not read MCP connectors for instance ${instanceId}:`, (err as Error).message);
@@ -311,16 +319,9 @@ async function mcpInputFor(userId: string, instanceId: string): Promise<Pick<Del
   }
 }
 
-async function fireworksInputFor(userId: string, instanceId: string): Promise<Pick<DeliveryInput, 'fireworks' | 'fireworksOffReason' | 'fireworksUnknown'>> {
+function fireworksInputFor(): Pick<DeliveryInput, 'fireworks' | 'fireworksOffReason'> {
   const cfg = getFireworksGatewayConfig();
-  if (!cfg) return { fireworks: null, fireworksOffReason: REASONS.noFireworks };
-  try {
-    if (!await fireworksEnabledForBox(userId, instanceId)) return { fireworks: null, fireworksOffReason: REASONS.fireworksOff };
-    return { fireworks: fireworksDelivery(cfg) };
-  } catch (err) {
-    console.error(`[CRED] could not read fireworks-enabled for instance ${instanceId}:`, (err as Error).message);
-    return { fireworksUnknown: true };
-  }
+  return cfg ? { fireworks: fireworksDelivery(cfg) } : { fireworks: null, fireworksOffReason: REASONS.noFireworks };
 }
 
 /**
@@ -383,6 +384,11 @@ async function deliverToInstanceNow(instanceId: string, userId: string): Promise
     firstError = githubError;
     steps = planDelivery(input, agent.capabilities);
   }
+  // A refused box's bazel-cache remove is among the steps above; a managed
+  // box's step goes through its queue, at every connect even if unchanged.
+  const bazelCache = !refusal && agent.capabilities.includes(BAZEL_CACHE_CAPABILITY)
+    ? deliverBazelCache(instanceId, { force: true }).catch((err: Error) => { firstError ??= err; })
+    : null;
   for (const step of steps) {
     const { type, provider } = step;
     const payload = step.type === 'credentials-apply' ? { payload: step.payload } : { reason: step.reason };
@@ -401,6 +407,7 @@ async function deliverToInstanceNow(instanceId: string, userId: string): Promise
       firstError ??= err as Error;
     }
   }
+  await bazelCache;
   if (firstError) throw firstError;
 }
 

@@ -20,18 +20,29 @@
  *         exports; fixed in 0.78.1.
  *     The fleet ran 1.0.2 on 2026-10-30, so this floor installs nothing on a
  *     box on its own.
- *   * target latest: pi's other dist-tag, legacy-node20, is an old line.
+ *   * target latest: the newest pinned version (PI_PINNED_LATEST), not npm's
+ *     latest tag; pi's other dist-tag, legacy-node20, is an old line.
  *   * restart none, as the other agent CLIs'.
  */
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const PI_UPDATE_POLICY_FLAG = 'pi-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for pi and a box's policy says restart nothing. */
-export const PI_UPDATE_ENABLED_FLAG = 'pi-update-enabled';
 
 export const PI_TARGET_TAGS: readonly string[] = ['latest'];
 
+/**
+ * What `latest` is for pi: the newest version deploy/termag-pi-update pins
+ * (its PINS), which is what a box resolves latest to, not the version npm's
+ * latest tag or the fleet's inventory names. The Software tab's "behind" and
+ * the fleet's Update behind compare with it, so a box on it is current and
+ * one past it is ahead, never behind, as Cursor's (CURSOR_PINNED_LATEST).
+ * piUpdatePolicy.test.ts reads the recipe's PINS and fails until this moves
+ * with them.
+ */
+export const PI_PINNED_LATEST = '1.5.0';
+
 export const DEFAULT_PI_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '0.79.0',
   target: 'latest',
   restart: 'none',
@@ -41,5 +52,5 @@ export const DEFAULT_PI_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over pi's defaults; a bad key keeps its default. */
 export function parsePiUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_PI_UPDATE_POLICY, PI_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_PI_UPDATE_POLICY, PI_TARGET_TAGS, undefined, PI_UPDATE_POLICY_FLAG);
 }

@@ -16,17 +16,17 @@
  * just before the hibernate found nothing; only a hibernated box is ever
  * terminated.
  *
- * Behind box-idle-stop-enabled only, a box with no `idleHibernateHours` gets
+ * A box with no `idleHibernateHours` gets
  * a default window (`box-idle-park-hours`, else IDLE_STOP_DEFAULT_HOURS) and
  * is plainly stopped, whether or not it can hibernate. Its owner is warned a
  * lead first (`box-idle-park-warn-minutes`), and the stop waits for the time
  * the warning promised. A box with its own `idleHibernateHours` keeps its
- * setting's meaning whatever that flag says.
+ * setting's meaning.
  *
  * Parking never hibernates (Park by stopping):
  * a box's own `idleHibernateHours` stop it once they are up,
  * with no warning (as their hibernate had none), whether or not it can
- * hibernate, still under box-auto-lifecycle-enabled. Its
+ * hibernate. Its
  * `hibernatedTerminateDays` then count from the stop: a `stopped` box with
  * `parkedAt` (stamped when an auto-park stop settles) is terminated like a
  * hibernated one, with the same unsaved-work limit.
@@ -34,12 +34,10 @@
 
 import { REFRESH_STOP_NOTE } from './boxPowerPolicy';
 
-export const BOX_AUTO_LIFECYCLE_FLAG = 'box-auto-lifecycle-enabled';
-export const BOX_IDLE_STOP_FLAG = 'box-idle-stop-enabled';
 
-/** The idle window box-idle-stop-enabled gives a box with no auto-park setting, unless BOX_IDLE_PARK_HOURS_FLAG says otherwise. */
+/** The idle window a box with no auto-park setting gets, unless BOX_IDLE_PARK_HOURS_FLAG says otherwise. */
 export const IDLE_STOP_DEFAULT_HOURS = 2;
-/** The default window in hours, read only while box-idle-stop-enabled is on. */
+/** The default window in hours. */
 export const BOX_IDLE_PARK_HOURS_FLAG = 'box-idle-park-hours';
 /** How long before the default window's stop its owner is warned, in minutes. */
 export const BOX_IDLE_PARK_WARN_MINUTES_FLAG = 'box-idle-park-warn-minutes';
@@ -73,7 +71,7 @@ export function unsavedWorkTerminateDays(env: NodeJS.ProcessEnv = process.env): 
 /**
  * The settings a box made for an ask gets at creation (`termag ask
  * --new-box`, boxLifecycle.applyAskBoxPolicy): no idle hours of its own, so
- * it is stopped by the default idle window (box-idle-stop-enabled) and never
+ * it is stopped by the default idle window and never
  * hibernated, since waking a hibernated ask box could hang in `starting`; and
  * no automatic terminate, so its owner removes it once its PRs are done.
  */
@@ -172,7 +170,6 @@ export function warnLeadMs(rawMinutes: unknown, windowHours: number): number {
 
 export interface IdleFacts {
   nowMs: number;
-  flagOn: boolean;
   /**
    * The busy checks that report the box busy (a cloud runner session, an ask
    * run, an automation run, load, a box update): see holdingCheck.
@@ -180,15 +177,13 @@ export interface IdleFacts {
   busy: readonly string[];
   /** An agent on the box reports `working` right now. */
   working: boolean;
-  /** box-idle-stop-enabled for this owner and box. Only read for a box with no `idleHibernateHours`. */
-  idleStopOn?: boolean;
   /** The default window in hours (idleStopHours); IDLE_STOP_DEFAULT_HOURS when left out. */
   idleStopHours?: number;
   /** How long before a stop its owner is warned (warnLeadMs, of the window that applies); none when left out. */
   leadMs?: number;
 }
 
-export type IdleSkip = 'not-eligible' | 'off' | 'not-ready' | 'refresh-pending' | 'flag-off' | 'just-started' | 'busy' | 'working' | 'not-idle' | 'warned';
+export type IdleSkip = 'not-eligible' | 'not-ready' | 'refresh-pending' | 'just-started' | 'busy' | 'working' | 'not-idle' | 'warned';
 /**
  * `stop` and `warn` are the default window's, or the box's own hours (a
  * plain stop: memory not kept). `warn` records the warning and the stop time it promises; a
@@ -266,11 +261,9 @@ function heldUp(box: LifecycleBox, facts: IdleFacts): IdleDecision | null {
 }
 
 export function idleHibernateDecision(box: LifecycleBox, facts: IdleFacts): IdleDecision {
-  if (!box.idleHibernateHours && facts.idleStopOn) return defaultWindowDecision(box, facts, facts.idleStopHours ?? IDLE_STOP_DEFAULT_HOURS);
-  // Its own hours park it by a stop: any box that can be stopped, still
-  // under box-auto-lifecycle-enabled (`flagOn`).
-  if (box.idleHibernateHours) return ownStopDecision(box, facts, box.idleHibernateHours);
-  return { hibernate: false, reason: canAutoHibernate(box) ? 'off' : 'not-eligible' };
+  if (!box.idleHibernateHours) return defaultWindowDecision(box, facts, facts.idleStopHours ?? IDLE_STOP_DEFAULT_HOURS);
+  // Its own hours park it by a stop: any box that can be stopped.
+  return ownStopDecision(box, facts, box.idleHibernateHours);
 }
 
 /**
@@ -282,7 +275,6 @@ function ownStopDecision(box: LifecycleBox, facts: IdleFacts, hours: number): Id
   if (!canIdleStop(box)) return { hibernate: false, reason: 'not-eligible' };
   if (box.status !== 'ready') return { hibernate: false, reason: 'not-ready' };
   if (box.rehibernatePending) return { hibernate: false, reason: 'refresh-pending' };
-  if (!facts.flagOn) return { hibernate: false, reason: 'flag-off' };
   const held = heldUp(box, facts);
   if (held) return held;
   if (facts.nowMs < defaultIdleDueAt(box, hours).getTime()) return { hibernate: false, reason: 'not-idle' };
@@ -290,9 +282,8 @@ function ownStopDecision(box: LifecycleBox, facts: IdleFacts, hours: number): Id
 }
 
 /**
- * A park by a plain stop after `hours` idle, warned first: the
- * box-idle-stop-enabled path: no `idleHibernateHours`, so the default
- * window applies, and box-auto-lifecycle-enabled is not consulted. The same
+ * A park by a plain stop after `hours` idle, warned first: no `idleHibernateHours`, so the default
+ * window applies. The same
  * guards as the hibernate path. The action is always a plain stop, including
  * for a box that could have hibernated.
  */
@@ -377,17 +368,14 @@ export const CANNOT_HIBERNATE_WARNING =
   "This box (or its image) can't hibernate, so auto-park does nothing on it. It is never stopped or terminated instead.";
 
 /**
- * What the lifecycle view reads `box-idle-stop-enabled` and its two number
- * flags as, for this owner and box; with none, the default window is off.
+ * What the lifecycle view reads the default window's two number flags as,
+ * for this owner and box.
  */
 export interface IdleStopOptions {
-  idleStopOn?: boolean;
   /** idleStopHours of `box-idle-park-hours`. */
   idleStopHours?: number;
   /** `box-idle-park-warn-minutes`, as read. */
   warnMinutes?: unknown;
-  /** `box-auto-lifecycle-enabled`: a box's own idle hours hibernate it only while it is on (Bugbot on #622). */
-  autoLifecycleOn?: boolean;
   /** The box hosts an enabled automation, so the sweep never terminates it (terminateDecision). */
   hostsAutomation?: boolean;
 }
@@ -465,7 +453,7 @@ export function terminateDueAt(box: TerminateBox, unsavedLimitDays: number): Dat
   return days == null ? null : new Date(box.parkedAt!.getTime() + days * DAY_MS);
 }
 
-export type TerminateSkip = 'not-eligible' | 'off' | 'not-parked' | 'flag-off' | 'not-due' | 'hosts-automation';
+export type TerminateSkip = 'not-eligible' | 'off' | 'not-parked' | 'not-due' | 'hosts-automation';
 export type TerminateDecision = { terminate: true; days: number } | { terminate: false; reason: TerminateSkip };
 
 /**
@@ -477,12 +465,11 @@ export type TerminateDecision = { terminate: true; days: number } | { terminate:
  */
 export function terminateDecision(
   box: TerminateBox,
-  facts: { nowMs: number; flagOn: boolean; unsavedLimitDays: number; hostsAutomation?: boolean },
+  facts: { nowMs: number; unsavedLimitDays: number; hostsAutomation?: boolean },
 ): TerminateDecision {
   if (!canAutoHibernate(box) && !canIdleStop(box)) return { terminate: false, reason: 'not-eligible' };
   if (box.hibernatedTerminateDays == null) return { terminate: false, reason: 'off' };
   if (!parkedForTerminate(box)) return { terminate: false, reason: 'not-parked' };
-  if (!facts.flagOn) return { terminate: false, reason: 'flag-off' };
   const due = terminateDueAt(box, facts.unsavedLimitDays)!;
   if (facts.nowMs < due.getTime()) return { terminate: false, reason: 'not-due' };
   if (facts.hostsAutomation) return { terminate: false, reason: 'hosts-automation' };
@@ -509,7 +496,7 @@ export interface LifecycleView {
   warning: string | null;
   /**
    * When the sweep will next park the box as things stand, and how: its own
-   * hours (while box-auto-lifecycle-enabled is on) and the default window
+   * hours and the default window
    * both stop it. Null when neither applies.
    */
   parkAt: string | null;
@@ -535,10 +522,9 @@ export function lifecycleView(
   options?: IdleStopOptions,
   nowMs: number = Date.now(),
 ): LifecycleView {
-  // The park fields say what the sweep will do: own hours only under
-  // box-auto-lifecycle-enabled, stopping the box.
-  const ownStop = box.idleHibernateHours != null && !!options?.autoLifecycleOn && canIdleStop(box);
-  const defaultWindow = box.idleHibernateHours == null && !!options?.idleStopOn && canIdleStop(box);
+  // The park fields say what the sweep will do: own hours stop the box.
+  const ownStop = box.idleHibernateHours != null && canIdleStop(box);
+  const defaultWindow = box.idleHibernateHours == null && canIdleStop(box);
   const stopHours = ownStop ? box.idleHibernateHours! : options?.idleStopHours ?? IDLE_STOP_DEFAULT_HOURS;
   // Own hours stop with no warning, so no lead and no standing warning.
   const stopAt = defaultWindow ? idleStopAtFor(box, stopHours, warnLeadMs(options?.warnMinutes, stopHours), nowMs)
@@ -630,9 +616,9 @@ export const STUCK_START_NOTE_PREFIX = 'Stopped automatically: ';
 export function stuckStopRetryDecision(
   box: Pick<LifecycleBox, 'status' | 'userId' | 'kind' | 'ec2InstanceId' | 'idleWarnedAt'>
     & { lifecycleNote: string | null; lastConnectedAt?: Date | null },
-  facts: { flagOn: boolean; agentConnected: boolean; busy: readonly string[] },
+  facts: { agentConnected: boolean; busy: readonly string[] },
 ): boolean {
-  if (box.status !== 'ready' || !canIdleStop(box) || !facts.flagOn || facts.agentConnected || facts.busy.length) return false;
+  if (box.status !== 'ready' || !canIdleStop(box) || facts.agentConnected || facts.busy.length) return false;
   return stuckStopPending(box);
 }
 
@@ -659,7 +645,7 @@ export function isStuckStartNote(note: string | null | undefined): boolean {
 export const STUCK_START_TIMEOUTS = 2;
 
 export type StuckStartDecision =
-  | { act: 'none'; reason: 'not-stuck' | 'flag-off' | 'busy' | 'warned'; check?: string }
+  | { act: 'none'; reason: 'not-stuck' | 'busy' | 'warned'; check?: string }
   | { act: 'warn'; stopAt: Date }
   | { act: 'stop' };
 
@@ -671,20 +657,18 @@ export type StuckStartDecision =
  * the known case (docs/box-hibernation.md). Someone may still be on it over
  * SSH, which only the missing agent could report, so the owner is warned a
  * lead first, as for an idle park, and any busy check holds it (Devin on
- * #623). A warning counts for this start only if it came after it. Behind
- * box-idle-stop-enabled (`flagOn`), like the default window's stop.
+ * #623). A warning counts for this start only if it came after it.
  */
 export function stuckStartDecision(
   box: Pick<LifecycleBox, 'status' | 'userId' | 'kind' | 'ec2InstanceId' | 'idleWarnedAt' | 'idleParkAt'>,
   facts: {
-    nowMs: number; flagOn: boolean; startRequestedAt: number | null; agentConnected: boolean;
+    nowMs: number; startRequestedAt: number | null; agentConnected: boolean;
     startTimeoutMs: number; leadMs: number; busy: readonly string[];
   },
 ): StuckStartDecision {
-  const none = (reason: 'not-stuck' | 'flag-off' | 'warned'): StuckStartDecision => ({ act: 'none', reason });
+  const none = (reason: 'not-stuck' | 'warned'): StuckStartDecision => ({ act: 'none', reason });
   if (box.status !== 'starting' || !canIdleStop(box) || facts.agentConnected || facts.startRequestedAt === null) return none('not-stuck');
   if (facts.nowMs - facts.startRequestedAt < STUCK_START_TIMEOUTS * facts.startTimeoutMs) return none('not-stuck');
-  if (!facts.flagOn) return none('flag-off');
   if (facts.busy.length) return { act: 'none', reason: 'busy', check: facts.busy[0] };
   const warnedForThisStart = !!box.idleWarnedAt && !!box.idleParkAt && box.idleWarnedAt.getTime() >= facts.startRequestedAt;
   if (!warnedForThisStart) return { act: 'warn', stopAt: new Date(facts.nowMs + facts.leadMs) };

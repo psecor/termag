@@ -3,8 +3,7 @@
  * (routes/githubRepos.ts) for the desktop's repository picker. It lists the
  * person's GitHub repositories and their orgs', grouped, from the same cache,
  * in the same body. A device sign-in's: a box's own token gets 403, since
- * anything on the box could read the list. Behind `desktop-app-enabled` for
- * the person (off: 404), and 503 `store_off` where the credential store that
+ * anything on the box could read the list. 503 `store_off` where the credential store that
  * holds their GitHub token isn't configured, as the web route answers.
  */
 import type { RequestHandler, Response, Router } from 'express';
@@ -12,13 +11,10 @@ import { prisma } from '../db';
 import { asyncHandler } from '../middleware/errors';
 import type { CliUser } from '../services/cliStore';
 import { getCredentialStoreConfig } from '../services/credentialStore';
-import { desktopAppEnabled } from '../services/desktopAppFlag';
 import { repoCache } from '../services/githubRepoCache';
 import type { CliAuth } from './cliApi';
 
 export interface CliGithubRepos {
-  /** desktop-app-enabled for this person. */
-  enabled(user: CliUser): Promise<boolean>;
   /** Whether the credential store (the person's GitHub token) is configured. */
   storeConfigured(): boolean;
   /** /api/github/repos' body; `refresh` skips the cache. */
@@ -40,7 +36,6 @@ export function mountCliGithubRepoRoutes(router: Router, deps: CliGithubRepos, b
   router.get('/github/repos', bearer, asyncHandler(async (req, res) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') { res.status(403).json(DEVICE_ONLY); return; }
-    if (!(await deps.enabled(user))) { res.status(404).json(NOT_FOUND); return; }
     if (!deps.storeConfigured()) { res.status(503).json(STORE_OFF); return; }
     const body = await deps.repos(user, req.query.refresh === '1');
     res.set('Cache-Control', 'no-store');
@@ -49,10 +44,6 @@ export function mountCliGithubRepoRoutes(router: Router, deps: CliGithubRepos, b
 }
 
 export const prismaCliGithubRepos: CliGithubRepos = {
-  async enabled(user) {
-    const owner = await prisma.user.findUnique({ where: { id: user.id } });
-    return !!owner && await desktopAppEnabled(owner);
-  },
   storeConfigured: () => !!getCredentialStoreConfig(),
   repos: (user, refresh) => repoCache.getRepos(user.id, { refresh }),
 };

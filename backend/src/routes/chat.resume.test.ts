@@ -1,10 +1,9 @@
-// A chat's box notices on chat-send: with
-// chat-resume-new-box-enabled on for the owner, every send lets the runner
-// tell a restart; the first send on a new box restores the stored session
-// first and carries the new-box notice, once. Flag off: the send is as before.
+// A chat's box notices on chat-send: every send lets
+// the runner tell a restart; the first send on a new box restores the stored
+// session first and carries the new-box notice, once.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const ALL_CAPS = ['chat-runner-v1', 'chat-trust-v1', 'chat-box-notice-v1', 'chat-restore-v1'];
+const ALL_CAPS = ['chat-runner-v1', 'chat-trust-v1', 'chat-box-notice-v1', 'chat-restore-v1', 'chat-images-v1'];
 const SESSION = '5109190e-c0d2-4f72-9c15-3c4c57fb126c';
 
 const h = vi.hoisted(() => ({
@@ -13,11 +12,14 @@ const h = vi.hoisted(() => ({
   noticed: [] as string[],
   connected: true,
   facts: null as null | Record<string, unknown>,
-  held: [] as Array<{ id: string; text: string; error: null }>,
+  held: [] as Array<{ id: string; text: string; error: string | null; senderId?: string; imageTypes?: string[]; images?: unknown[]; boxStarted?: boolean }>,
+  taken: null as null | { text: string; images: unknown[]; error: string },
   continues: [] as unknown[],
   starts: [] as string[],
+  startedBy: [] as string[],
+  startFails: false,
 }));
-const quiet = { flagOn: true, isOwner: true, ownerName: 'O', excluded: false, box: { id: 'box-new', status: 'ready', kind: 'ec2' }, setupReady: true, connected: true, complete: true, lockHeld: false, credentialsPending: false, pendingResume: null, hasHeld: false };
+const quiet = { isOwner: true, ownerName: 'O', excluded: false, box: { id: 'box-new', status: 'ready', kind: 'ec2' }, setupReady: true, connected: true, complete: true, lockHeld: false, credentialsPending: false, pendingResume: null, hasHeld: false };
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
   workflow: { update: vi.fn() },
@@ -44,6 +46,7 @@ vi.mock('../services/sessionAccess', () => ({
     project: { ownerUsername: 'owner' },
   })),
 }));
+// Only `termag ask --model`'s flag is read here, and a test turns it on.
 const ld = vi.hoisted(() => ({ on: new Set<string>() }));
 vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async (key: string) => ld.on.has(key)) }));
 vi.mock('../services/automations/chatGate', () => ({ runChatRefusalFor: vi.fn(async () => null), RUN_CHAT_REFUSAL_TEXT: {} }));
@@ -68,7 +71,8 @@ vi.mock('../services/chatNewBox', async (orig) => {
       if (restoreFails.on) throw new Error("the new box's agent is not connected yet");
     }),
     markNoticeSent: vi.fn(async (id: string) => { h.noticed.push(id); h.resume = null; }),
-    continuationFacts: vi.fn(async () => ({ ...quiet, ...(h.facts ?? {}), hasHeld: h.held.length > 0 })),
+    // As the real one: only messages still waiting (no error) count.
+    continuationFacts: vi.fn(async () => ({ ...quiet, ...(h.facts ?? {}), hasHeld: h.held.some(m => !m.error) })),
     // The real one is behind the database lock (chatNewBox.test.ts): the first starts the box, the rest are told it is under way.
     continueOnNewBoxFor: vi.fn(async () => {
       h.continues.push(1);
@@ -78,13 +82,25 @@ vi.mock('../services/chatNewBox', async (orig) => {
 });
 vi.mock('../services/chatHeld', () => ({
   heldFor: vi.fn(async () => h.held),
-  holdMessage: vi.fn(async (_k: unknown, b: { text: string }) => { h.held.push({ id: `m${h.held.length + 1}`, text: b.text, error: null }); return { id: `m${h.held.length}`, position: h.held.length }; }),
+  holdMessage: vi.fn(async (k: { senderId: string }, b: { text: string; images?: Array<{ mediaType: string }> }, o: { boxStarted?: boolean } = {}) => {
+    h.held.push({ id: `m${h.held.length + 1}`, text: b.text, error: null, senderId: k.senderId, imageTypes: (b.images ?? []).map(i => i.mediaType), images: b.images ?? [], boxStarted: o.boxStarted === true });
+    return { id: `m${h.held.length}`, position: h.held.length };
+  }),
+  heldImage: vi.fn(async (id: string, _ws: string, n: number) => (id === 'm1' && n === 0 ? { mediaType: 'image/png', data: Buffer.from('png') } : null)),
+  takeRefused: vi.fn(async () => { const t = h.taken; h.taken = null; return t; }),
+  markBoxStarted: vi.fn(async () => {}),
   kickHeldDelivery: vi.fn(),
 }));
-vi.mock('./instances', () => ({ powerOwnedBox: vi.fn(async (_u: unknown, id: string) => { h.starts.push(id); return { status: 202, body: { ok: true, status: 'starting' } }; }) }));
+vi.mock('./instances', () => ({ powerOwnedBox: vi.fn(async (u: { id: string }, id: string) => {
+  h.startedBy.push(u.id);
+  if (h.startFails) return { status: 502, body: { error: 'EC2 said no' } };
+  h.starts.push(id);
+  return { status: 202, body: { ok: true, status: 'starting' } };
+}) }));
 
-import { chatHistoryFor, chatReclaimFor, chatSendFor, deliverHeldMessage } from './chat';
+import { chatHeldImageFor, chatHeldTakeFor, chatHistoryFor, chatReclaimFor, chatSendFor, deliverHeldMessage } from './chat';
 import { sendForProject } from '../services/agentRegistry';
+import { CHAT_FILE_ATTACHMENTS_FLAG } from '../services/chatFiles';
 import { NEW_BOX_NOTICE } from '../services/chatNewBox';
 
 const viewer = { id: 'owner', googleEmail: 'o@example.com', displayName: 'O', unixUsername: 'owner', defaultAgentProvider: 'claude' } as never;
@@ -96,8 +112,8 @@ beforeEach(() => {
   h.restored = []; h.noticed = [];
   h.resume = null;
   restoreFails.on = false;
-  h.connected = true; h.facts = null; h.held = []; h.continues = []; h.starts = [];
-  ld.on = new Set(['chat-resume-new-box-enabled', 'chat-transcripts-enabled']);
+  ld.on = new Set();
+  h.connected = true; h.facts = null; h.held = []; h.continues = []; h.starts = []; h.taken = null; h.startedBy = []; h.startFails = false;
   prisma.project.findUnique.mockResolvedValue({
     name: 'proj', userId: 'owner', instanceId: 'box-new', setupStatus: 'ready', repoUrl: null, chatTrustedAt: null, chatOrchestrator: false,
     instance: { hostHome: '/home/owner', userId: 'owner' },
@@ -186,7 +202,7 @@ describe('box notices on chat-send', () => {
 
   it('restores before the history of a chat continued on this box, so it never opens empty', async () => {
     h.resume = { id: 'r1', projectId: 'p1', workstreamId: 'ws1', sessionId: SESSION, toInstanceId: 'box-new', restoredAt: null, gitState: null };
-    await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(h.restored).toEqual(['r1']);
     expect(h.noticed).toEqual([], 'the history does not use up the notice');
   });
@@ -194,20 +210,10 @@ describe('box notices on chat-send', () => {
   it('a restore that has not finished opens the stored copy, not the new box\'s empty chat', async () => {
     h.resume = { id: 'r1', projectId: 'p1', workstreamId: 'ws1', sessionId: SESSION, toInstanceId: 'box-new', restoredAt: null, gitState: null };
     restoreFails.on = true;
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ stored: true, sessionId: SESSION, entries: [{ message: { content: 'from the store' } }] });
     expect(sent('chat-history')).toEqual([]);
-  });
-
-  it('flag off: the send is as it was, with nothing restored or told', async () => {
-    ld.on = new Set(['chat-transcripts-enabled']);
-    h.resume = { id: 'r1', projectId: 'p1', workstreamId: 'ws1', sessionId: SESSION, toInstanceId: 'box-new', restoredAt: null, gitState: null };
-    expect(await sendHi()).toBe(202);
-    const payload = sent('chat-send')[0];
-    expect(payload).not.toHaveProperty('boxNotices');
-    expect(payload).not.toHaveProperty('notice');
-    expect(h.noticed).toEqual([]);
   });
 });
 
@@ -270,43 +276,62 @@ describe('sending is the decision (docs/chat-resume.md)', () => {
       instance: { hostHome: '/home/owner', userId: 'owner' }, user: { id: 'owner' },
       workflows: [{ id: 'wf1', provider: 'claude-chat', backend: null, model: 'opus', workstream: { id: 'ws1', name: 'main', askThread: null } }],
     });
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(r).toMatchObject({ status: 200, body: { stored: true, entries: [{ message: { content: 'from the store' } }], continuation: { phase: 'restoring', held: [{ text: 'pick up where we left off' }] } } });
   });
 
   it('a terminated box\'s chat with nothing under way says a send to it is taken, so a message queued before the history came goes out', async () => {
     h.connected = false;
     h.facts = terminated;
-    const owner = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const owner = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(owner.body).toMatchObject({ stored: true, continuation: { takesSends: true } });
     h.facts = { ...terminated, isOwner: false, ownerName: 'Pat' };
-    const other = (await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body as { continuation: Record<string, unknown> };
+    const other = (await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body as { continuation: Record<string, unknown> };
     expect(other.continuation).toMatchObject({ sendRefusal: { code: 'owner-only' } });
     expect(other.continuation).not.toHaveProperty('takesSends');
-    h.facts = { ...terminated, flagOn: false };
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).not.toHaveProperty('continuation');
+    // Another workstream (or an ask's chat) with nothing stored to hold for: no continuation.
+    h.facts = { ...terminated, excluded: true };
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).not.toHaveProperty('continuation');
+  });
+
+  // Devin on #1478: a stored ask's thread, or a chat whose box is gone, offered uploads that could only fail.
+  it('a stored chat offers files on the flag alone, but not in an ask\'s thread nor where the box is gone', async () => {
+    // Through ld.on, not mockResolvedValue: that would outlive this test and turn every later flag off (vi.clearAllMocks keeps it).
+    ld.on = new Set([CHAT_FILE_ATTACHMENTS_FLAG]);
+    h.connected = false;
+    h.facts = { connected: false };
+    const base = await prisma.project.findUnique();
+    const history = async () => (await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body as { stored?: boolean; fileInput?: boolean };
+    expect(await history()).toMatchObject({ stored: true, fileInput: true });
+    prisma.project.findUnique.mockResolvedValue({ ...base, instance: { hostHome: '/home/owner', userId: 'owner', status: 'terminated' } });
+    expect(await history()).toMatchObject({ stored: true, fileInput: false });
+    prisma.project.findUnique.mockResolvedValue({ ...base, workflows: [{ ...base.workflows[0], workstream: { id: 'ws1', name: 'main', askThread: { id: 't1' } } }] });
+    expect(await history()).toMatchObject({ stored: true, fileInput: false });
+    ld.on = new Set();
+    prisma.project.findUnique.mockResolvedValue(base);
+    expect(await history()).toMatchObject({ stored: true, fileInput: false });
   });
 
   it('a ready box whose agent is briefly offline does not say it takes sends: its send would go the usual way and fail', async () => {
     h.connected = false;
     h.facts = { connected: false };
-    const offline = (await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body as { stored?: boolean; continuation?: Record<string, unknown> };
+    const offline = (await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body as { stored?: boolean; continuation?: Record<string, unknown> };
     expect(offline.stored).toBe(true);
     expect(offline.continuation ?? {}).not.toHaveProperty('takesSends');
     // A stopped box, or one with messages already held, does take it.
     h.facts = { box: { id: 'box-old', status: 'stopped', kind: 'ec2' }, connected: false };
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ continuation: { takesSends: true } });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ continuation: { takesSends: true } });
     h.facts = { connected: false }; h.held = [{ id: 'm1', text: 'earlier', error: null }];
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).toMatchObject({ continuation: { takesSends: true } });
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).toMatchObject({ continuation: { takesSends: true } });
   });
 
   it('a restored chat whose box\'s Claude credentials are still on their way reads from the store: no sign-in card, no box read', async () => {
     h.facts = { pendingResume: { restored: true }, credentialsPending: true };
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(r).toMatchObject({ status: 200, body: { stored: true, continuation: { phase: 'restoring' } } });
     expect(sent('chat-history')).toEqual([]);
     h.facts = { pendingResume: { restored: true } };
-    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body).not.toHaveProperty('stored');
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body).not.toHaveProperty('stored');
   });
 
   it('a held message waits while its new box\'s credentials are unmarked in the database, even if this process runs no delivery', async () => {
@@ -318,16 +343,6 @@ describe('sending is the decision (docs/chat-resume.md)', () => {
     // Only a recent one: a resume unmarked past the stale window (its continuer died) doesn't hold it for good.
     expect(prisma.chatResume.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ createdAt: { gte: expect.any(Date) } }) }));
   });
-
-  it('flag off: a send to a terminated box\'s chat is refused as before, with nothing held or started', async () => {
-    h.connected = false;
-    h.facts = terminated;
-    ld.on = new Set(['chat-transcripts-enabled']);
-    const r = await chatSendFor('owner', 'p1', { workstream: 'main', text: 'hi' }, viewer);
-    expect(r.status).toBe(503);
-    expect(h.continues).toEqual([]);
-    expect(h.held).toEqual([]);
-  });
 });
 
 // Opening a stored chat leaves its parked box alone (frontend chat/storedOpen.ts),
@@ -338,8 +353,7 @@ describe('a stopped box\'s chat reads from the store without the box', () => {
   it('answers the stored transcript, and sends the box nothing', async () => {
     h.connected = false;
     h.facts = stopped;
-    ld.on = new Set(['chat-transcripts-enabled']);
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ stored: true, running: false, entries: [{ type: 'user', message: { content: 'from the store' } }] });
     expect(vi.mocked(sendForProject)).not.toHaveBeenCalled();
@@ -348,20 +362,121 @@ describe('a stopped box\'s chat reads from the store without the box', () => {
   it('a hibernated box is the same', async () => {
     h.connected = false;
     h.facts = { ...stopped, box: { ...stopped.box, status: 'hibernated' } };
-    ld.on = new Set(['chat-transcripts-enabled', 'chat-resume-new-box-enabled']);
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
     expect(r.body).toMatchObject({ stored: true });
     expect(vi.mocked(sendForProject)).not.toHaveBeenCalled();
   });
+});
 
-  it('flag off for the owner: no stored copy, the box-offline answer as before (the frontend then starts the box on open)', async () => {
+// A stored chat's composer takes images while its box is down: the browser
+// holds them with the message and sends both once the box is up (frontend
+// pages/chat/useSdkChat.ts). The stored read always offers them.
+describe('images in a stored chat whose box is down', () => {
+  const stopped = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
+
+  it('offers images', async () => {
     h.connected = false;
     h.facts = stopped;
-    ld.on = new Set();
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer);
-    expect(r.status).toBe(503);
-    expect(r.body).not.toHaveProperty('stored');
-    expect(vi.mocked(sendForProject)).not.toHaveBeenCalled();
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
+    expect(r.body).toMatchObject({ stored: true, imageInput: true });
+  });
+
+});
+
+// #971, the person's call: a message sent with images while a stored chat's box is down is held on
+// the orchestrator, images and all, with chat-resume off: it survives the tab, shows in every tab,
+// goes in once the box is up, and one the box refuses goes back to its sender's composer.
+describe('a stored chat\'s held sends, chat-resume off', () => {
+  // The smallest PNG there is.
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
+  const parked = { parkHold: true, box: { id: 'box-old', status: 'stopped', kind: 'ec2' }, connected: false };
+
+  it('a send with an image starts the box and is held with its image', async () => {
+    h.connected = false;
+    h.facts = parked;
+    const r = await chatSendFor('owner', 'p1', { workstream: 'main', text: 'look', images: [{ mediaType: 'image/png', data: PNG }] }, viewer);
+    expect(r).toMatchObject({ status: 202, body: { held: true, phase: 'starting' } });
+    expect(h.starts).toEqual(['box-old']);
+    expect(h.held).toMatchObject([{ text: 'look', imageTypes: ['image/png'], boxStarted: true }]);
+    expect(sent('chat-send')).toEqual([]);
+  });
+
+  it('every tab\'s history lists the held message, its images as links, and whose it is', async () => {
+    h.connected = false;
+    h.facts = { ...parked, hasHeld: true };
+    h.held = [{ id: 'm1', text: 'look', error: null, senderId: 'owner', imageTypes: ['image/png'] }];
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
+    expect(r.body).toMatchObject({ stored: true, continuation: { phase: 'starting', takesSends: true, held: [{ id: 'm1', text: 'look', mine: true, images: [{ mediaType: 'image/png' }] }] } });
+  });
+
+  it('a held image is served to whoever can read the chat', async () => {
+    const r = await chatHeldImageFor('owner', 'p1', { workstream: 'main' }, 'm1', '0');
+    expect(r).toEqual({ status: 200, mediaType: 'image/png', data: Buffer.from('png') });
+    expect((await chatHeldImageFor('owner', 'p1', { workstream: 'main' }, 'm1', '1')).status).toBe(404);
+  });
+
+  it('one the box refused goes back to its sender once: text, images and why', async () => {
+    h.taken = { text: 'look', images: [{ mediaType: 'image/png', data: PNG }], error: 'no images here' };
+    expect(await chatHeldTakeFor('owner', 'p1', { workstream: 'main' }, 'm1')).toEqual({ status: 200, body: { text: 'look', images: [{ mediaType: 'image/png', data: PNG }], error: 'no images here' } });
+    expect((await chatHeldTakeFor('owner', 'p1', { workstream: 'main' }, 'm1')).status).toBe(404);
+  });
+
+  it('delivery sends the images with the text; a box that is stopped again is started once for it', async () => {
+    const m = { id: 'm1', projectId: 'p1', workstreamId: 'ws1', senderId: 'owner', text: 'look', model: null, backend: null, effort: null, error: null, images: [{ mediaType: 'image/png', data: PNG }] };
+    expect(await deliverHeldMessage(m)).toEqual({ kind: 'sent' });
+    expect(sent('chat-send')[0]).toMatchObject({ text: 'look', images: [{ mediaType: 'image/png', data: PNG }] });
+    // Its box stopped meanwhile (it was still stopping when the message was sent): one start, then wait.
+    h.connected = false;
+    prisma.project.findUnique.mockResolvedValueOnce({ userId: 'owner', instanceId: 'box-old', instance: { id: 'box-old', status: 'stopped', kind: 'ec2' } } as never);
+    expect(await deliverHeldMessage({ ...m, boxStartedAt: null })).toEqual({ kind: 'not-ready' });
+    expect(h.starts).toEqual(['box-old']);
+    prisma.project.findUnique.mockResolvedValueOnce({ userId: 'owner', instanceId: 'box-old', instance: { id: 'box-old', status: 'stopped', kind: 'ec2' } } as never);
+    expect(await deliverHeldMessage({ ...m, boxStartedAt: new Date() })).toEqual({ kind: 'not-ready' });
+    expect(h.starts).toEqual(['box-old']);
+  });
+
+  // Bugbot on #971: a start that failed was stamped as done, and a collaborator's held message started nothing.
+  it('a start that fails is not marked done, so the next sweep tries again', async () => {
+    const { markBoxStarted } = await import('../services/chatHeld');
+    const m = { id: 'm1', projectId: 'p1', workstreamId: 'ws1', senderId: 'owner', text: 'look', model: null, backend: null, effort: null, error: null, boxStartedAt: null };
+    const stopped = { userId: 'owner', instanceId: 'box-old', instance: { id: 'box-old', status: 'stopped', kind: 'ec2' } };
+    h.connected = false;
+    h.startFails = true;
+    prisma.project.findUnique.mockResolvedValueOnce(stopped as never);
+    expect(await deliverHeldMessage(m)).toEqual({ kind: 'not-ready' });
+    expect(vi.mocked(markBoxStarted)).not.toHaveBeenCalled();
+    h.startFails = false;
+    prisma.project.findUnique.mockResolvedValueOnce(stopped as never);
+    expect(await deliverHeldMessage(m)).toEqual({ kind: 'not-ready' });
+    expect(h.starts).toEqual(['box-old']);
+    expect(vi.mocked(markBoxStarted)).toHaveBeenCalledWith('m1');
+  });
+
+  // Security review on #971: only the box's owner starts it (powerRequestError, parkHoldPlan's ownerOnlyStart);
+  // held delivery must not start it as the owner on a collaborator's behalf.
+  it('a collaborator\'s held message never starts the owner\'s box: it waits until the owner starts it', async () => {
+    prisma.user.findUnique.mockImplementation((async ({ where }: { where: { id: string } }) => ({ id: where.id, googleEmail: `${where.id}@example.com`, displayName: where.id, unixUsername: where.id, defaultAgentProvider: null })) as never);
+    const { markBoxStarted } = await import('../services/chatHeld');
+    const m = { id: 'm2', projectId: 'p1', workstreamId: 'ws1', senderId: 'collab', text: 'hi', model: null, backend: null, effort: null, error: null, boxStartedAt: null };
+    h.connected = false;
+    prisma.project.findUnique.mockResolvedValueOnce({ userId: 'owner', instanceId: 'box-old', instance: { id: 'box-old', status: 'stopped', kind: 'ec2' } } as never);
+    expect(await deliverHeldMessage(m)).toEqual({ kind: 'not-ready' });
+    expect(h.startedBy).toEqual([]);
+    expect(h.starts).toEqual([]);
+    expect(vi.mocked(markBoxStarted)).not.toHaveBeenCalled();
+  });
+});
+
+// Bugbot on #971, "Ask sends never reach orchestrator hold": a stored ask chat (stored and read once #970 is in)
+// holds an owner's send and starts its box, since parkHold ignores the ask exclusion; on this branch alone an
+// ask thread has no stored history, so its tab gets the box-offline answer and starts the box on open.
+describe('an ask thread\'s send while its box is down', () => {
+  it('a stored ask chat holds an owner\'s send and starts its box: parkHold ignores the ask exclusion', async () => {
+    h.connected = false;
+    h.facts = { excluded: true, parkHold: true, box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
+    const r = await chatSendFor('owner', 'p1', { workstream: 'ask-t1', text: 'and the tests?' }, viewer);
+    expect(r).toMatchObject({ status: 202, body: { held: true } });
+    expect(h.starts).toEqual(['box-new']);
   });
 });
 
@@ -377,9 +492,8 @@ describe('an ask thread\'s chat on a stopped box', () => {
   it('reads its stored transcript, sends the box nothing, and offers no trust or continue', async () => {
     h.connected = false;
     h.facts = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
-    ld.on = new Set(['chat-transcripts-enabled', 'chat-resume-new-box-enabled']);
     prisma.project.findUnique.mockResolvedValue(askProject());
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ stored: true, workstream: 'ask-t1', trust: { trusted: true }, canTrust: false });
     expect(vi.mocked(sendForProject)).not.toHaveBeenCalled();
@@ -390,14 +504,93 @@ describe('an ask thread\'s chat on a stopped box', () => {
   it('reports the model its turns run on, the default, not the workstream\'s saved one (Bugbot on #970)', async () => {
     h.connected = false;
     h.facts = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
-    ld.on = new Set(['chat-transcripts-enabled']);
     const saved = askProject();
     saved.workflows[0] = { ...saved.workflows[0], backend: 'fireworks', model: 'accounts/fireworks/models/kimi-k2' } as never;
     prisma.project.findUnique.mockResolvedValue(saved);
     const { resolvedChatTier, storedChatChoice } = await import('../services/claudeChatModel');
-    const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' }, viewer);
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' });
     // An ask's chat runs on the default backend and model (agent/ask-chat.js, chatTarget's storedChatChoice(null, null)).
     expect(r.body).toMatchObject({ stored: true, model: resolvedChatTier(storedChatChoice(null, null).model) });
     expect(r.body).not.toHaveProperty('backend');
   });
+
+  it("reports the tier the thread keeps (termag ask --model), the one its turns run on", async () => {
+    h.connected = false;
+    h.facts = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
+    ld.on = new Set();
+    prisma.project.findUnique.mockResolvedValue({ ...askProject(), user: { id: 'owner', googleEmail: 'o@example.com', displayName: 'O', unixUsername: 'owner', defaultAgentProvider: 'claude' }, instance: { id: 'box-new', name: 'box-new', status: 'stopped', kind: 'ec2', hostHome: '/home/owner', userId: 'owner' } });
+    // With ask-model-choice-enabled off, as before it: the default.
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' })).body).toMatchObject({ stored: true, model: 'sonnet' });
+    ld.on = new Set(['ask-model-choice-enabled']);
+    expect((await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' })).body).toMatchObject({ stored: true, model: 'opus' });
+    ld.on = new Set();
+  });
+
+  // An ask with no tier (none asked for, the flag off, an older agent) names no --model, so it runs on the box's
+  // default, the gateway's CLAUDE_DEFAULT_MODEL tier: the picker says that, not a chat's Sonnet.
+  it("reports the box's default for a thread with no tier, the one its asks ran on", async () => {
+    h.connected = false;
+    h.facts = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
+    vi.stubEnv('CLAUDE_GATEWAY_URL', 'https://gateway.example/bedrock');
+    vi.stubEnv('CLAUDE_BEDROCK_REGION', 'us-east-2');
+    vi.stubEnv('CLAUDE_BEDROCK_MODELS', 'opus=us.anthropic.claude-opus-5-5,sonnet=us.anthropic.claude-sonnet-5-5,haiku=us.anthropic.claude-haiku-4-5');
+    vi.stubEnv('CLAUDE_DEFAULT_MODEL', 'opus');
+    try {
+      const user = { id: 'owner', googleEmail: 'o@example.com', displayName: 'O', unixUsername: 'owner', defaultAgentProvider: 'claude', claudeGatewayEnabled: true };
+      const instance = { id: 'box-new', name: 'box-new', status: 'stopped', kind: 'ec2', hostHome: '/home/owner', userId: 'owner' };
+      const project = askProject();
+      // The flag off: the stored tier is not applied either.
+      ld.on = new Set();
+      prisma.project.findUnique.mockResolvedValue({ ...project, user, instance, workflows: [{ ...project.workflows[0], model: 'haiku' }] });
+      expect((await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' })).body).toMatchObject({ stored: true, model: 'opus' });
+      // The flag on, nothing stored.
+      ld.on = new Set(['ask-model-choice-enabled']);
+      prisma.project.findUnique.mockResolvedValue({ ...project, user, instance, workflows: [{ ...project.workflows[0], model: null }] });
+      expect((await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' })).body).toMatchObject({ stored: true, model: 'opus' });
+      // An owner off the gateway: no ANTHROPIC_MODEL on the box, so no known default; Sonnet as before.
+      prisma.project.findUnique.mockResolvedValue({ ...project, user: { ...user, claudeGatewayEnabled: false }, instance, workflows: [{ ...project.workflows[0], model: null }] });
+      expect((await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' })).body).toMatchObject({ stored: true, model: 'sonnet' });
+    } finally {
+      ld.on = new Set();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // Bugbot on #971 ("Ask sends never reach orchestrator hold"), with #970 in: the stored ask chat says it takes
+  // sends, and a send is held and starts its box.
+  it('says it takes sends, and a send is held and starts its box', async () => {
+    h.connected = false;
+    h.facts = { excluded: true, parkHold: true, box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
+    prisma.project.findUnique.mockResolvedValue(askProject());
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' });
+    expect(r.body).toMatchObject({ stored: true, continuation: { takesSends: true } });
+    const sent = await chatSendFor('owner', 'p1', { workstream: 'ask-t1', text: 'and the tests?' }, viewer);
+    expect(sent).toMatchObject({ status: 202, body: { held: true } });
+    expect(h.starts).toEqual(['box-new']);
+  });
 });
+
+// Bugbot on #971 ("Refused holds hidden in stored history"): a refused held message (error set) no longer
+// counts as waiting, but it must still be listed, or its sender's take-back never runs and others never see why.
+describe('a refused held message in a stored chat', () => {
+  it('is listed in the stored history even when nothing else waits', async () => {
+    h.connected = false;
+    h.facts = { parkHold: true, box: { id: 'box-old', status: 'stopped', kind: 'ec2' }, connected: false };
+    h.held = [{ id: 'm1', text: 'look', error: 'no images here', senderId: 'owner', imageTypes: ['image/png'] }];
+    const r = await chatHistoryFor('owner', 'p1', { workstream: 'main' });
+    expect(r.body).toMatchObject({ stored: true, continuation: { held: [{ id: 'm1', error: 'no images here', mine: true }] } });
+  });
+});
+
+// Security review on #971: a project share's send to an ask thread whose agent is offline is refused, not held.
+describe('a share\'s send to an ask thread while its box is down', () => {
+  it('is refused, and nothing is held', async () => {
+    h.connected = false;
+    h.facts = { excluded: true, ask: true, isOwner: false, ownerName: 'Pat', parkHold: true, box: { id: 'box-new', status: 'ready', kind: 'ec2' }, connected: false };
+    h.held = [{ id: 'm1', text: 'the owner\'s', error: null }];
+    const r = await chatSendFor('owner', 'p1', { workstream: 'ask-t1', text: 'from the share' }, viewer);
+    expect(r).toMatchObject({ status: 403, body: { code: 'owner-only' } });
+    expect(h.held.map(m => m.text)).toEqual(['the owner\'s']);
+  });
+});
+

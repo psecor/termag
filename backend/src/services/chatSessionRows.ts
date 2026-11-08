@@ -17,6 +17,7 @@ import { isClaudeAuthError } from './claudeAuthError';
 import type { AgentStatus } from '../types';
 import { statusKey } from './statusKey';
 import { sessionName } from './tmux';
+import { projectKindTraits } from './projectKind';
 
 /** A workstream as listProjectsFor (routes/projects.ts) shapes it. */
 export interface ChatSourceWorkstream {
@@ -159,8 +160,8 @@ interface Built extends ChatSessionRow {
 }
 
 /** chatRowName: an ask leads with its title (else ask-<id>); else Claude's title when shown; else the project. */
-function rowName(row: Built, titlesShown: boolean): Pick<ChatSessionRow, 'title' | 'where' | 'ask'> {
-  const session = titlesShown ? row.sessionTitle?.trim() || null : null;
+function rowName(row: Built): Pick<ChatSessionRow, 'title' | 'where' | 'ask'> {
+  const session = row.sessionTitle?.trim() || null;
   const askName = row.askThreadId ? row.askTitle?.trim() || row.workstream : null;
   if (askName) return { title: askName, where: session && session !== askName ? session : null, ask: true };
   const label = row.workstream === 'main' ? row.projectName : `${row.projectName} · ${row.askTitle?.trim() || row.workstream}`;
@@ -224,24 +225,24 @@ function rowFor(p: ChatSourceProject, ws: Partial<ChatSourceWorkstream> & { name
 
 /**
  * The sessions termag web's sidebar lists for `username`, from its project
- * list and the statuses it can see (keyed by statusKey). `titlesShown` is
- * simple-ui-session-titles-enabled for the viewer.
+ * list and the statuses it can see (keyed by statusKey).
  */
 export function chatSessionRows(
   projects: readonly ChatSourceProject[],
   statuses: StatusMap,
   username: string,
-  titlesShown: boolean,
 ): ChatSessionRow[] {
   const built: Built[] = [];
   for (const p of projects) {
     if (p.archived || !p.workflows.some(w => w.type === 'agent')) continue;
-    const kind = p.kind ?? 'normal';
+    const traits = projectKindTraits(p.kind);
     const workstreams = p.workstreams.filter(w => !w.archived);
     const list: Array<Partial<ChatSourceWorkstream> & { name: string }> = workstreams.length > 0 ? workstreams : [{ name: 'main' }];
     for (const ws of list) {
-      // chatRows: conversations only. An automation's runs are; its main is not.
-      if (!(kind === 'normal' || (kind === 'automation' && ws.name !== 'main'))) continue;
+      // chatRows: conversations only, of the kinds listed as work. An
+      // automation's runs are; its main is not. MetaTerm and a space
+      // orchestrator are not (projectKind.ts).
+      if (!traits.listedAsWork || (!traits.runsMainAgent && ws.name === 'main')) continue;
       built.push(rowFor(p, ws, statuses, username));
     }
   }
@@ -251,7 +252,7 @@ export function chatSessionRows(
   const used = (r: Built) => r.status.value === 'working' || r.status.value === 'waiting' || Boolean(r.status.stoppedAt);
   return built
     .filter(r => !(r.workstream === 'main' && placeholders.has(r.projectId) && !used(r) && !r.sessionTitle?.trim()))
-    .map(({ askTitle, ...r }) => ({ ...r, ...rowName({ ...r, askTitle }, titlesShown) }));
+    .map(({ askTitle, ...r }) => ({ ...r, ...rowName({ ...r, askTitle }) }));
 }
 
 /**

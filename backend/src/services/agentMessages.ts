@@ -15,6 +15,7 @@
  * This module holds body validation, the branch name, the reply envelope and
  * the run's system prompt. services/askService.ts owns Prisma and the RPCs.
  */
+import { parseClaudeChatModel, type ClaudeChatTier } from './claudeChatModel';
 
 /** What a box's agent must announce before an ask is sent there (agent/ask-run.js). */
 export const ASK_AGENT_CAPABILITY = 'ask-v1';
@@ -38,10 +39,37 @@ export const ASK_STEER_CAPABILITY = 'ask-steer-v1';
  * then names the thread's branch (`pushBranch`).
  */
 export const ASK_PUSH_CAPABILITY = 'ask-push-v1';
+/**
+ * A box's agent that runs an ask at the lower mode `ask-run` names
+ * (`permissionMode`: auto or dontAsk), in a chat turn and a headless run alike,
+ * never loading the checkout's config. An ask the orchestrator caps (a project
+ * made from a shared environment, askService.askModeFor) is sent only to such
+ * a box: an older agent ignores the field and runs it as bypassPermissions.
+ */
+export const ASK_MODE_CAP_CAPABILITY = 'ask-mode-cap-v1';
+/**
+ * A box's agent whose ask turns launch on the `model` `ask-run` names
+ * (`termag ask --model`; a tier's launch string, services/claudeChatModel.ts
+ * claudeLaunchModel). An older agent drops the field and the turn runs on the
+ * box's default, so the orchestrator says `--model` was ignored instead.
+ */
+export const ASK_MODEL_CAPABILITY = 'ask-model-v1';
 
 /** The workstream an ask thread's chat lives in: one per thread, no worktree of its own. */
 export function askChatWorkstreamName(threadId: string): string {
   return `ask-${threadId}`;
+}
+
+/**
+ * Whether a name is the `ask-<thread id>` form askChatWorkstreamName makes.
+ * Reserved: routes/workstreams.ts refuses it at create and rename, since a
+ * human-named workstream of this shape would be mistaken for an ask chat —
+ * the simple UI's row filter falls back to the name when the thread record
+ * is absent (frontend chat/simpleChat.ts, utils/askChatVisibility.ts, whose
+ * regex this mirrors by hand — keep the two in sync).
+ */
+export function isAskChatWorkstreamName(name: string): boolean {
+  return /^ask-[a-z0-9]{8,40}$/.test(name);
 }
 
 /**
@@ -150,11 +178,18 @@ export type SteerDecision =
  * thread's clone at a time.
  */
 export function steerDecision(
-  busy: { id: string; status: string; queued: boolean },
-  facts: { box: string; connected: boolean; capable: boolean; liveTurn: boolean },
+  busy: { id: string; status: string; queued: boolean; model?: string | null },
+  facts: { box: string; connected: boolean; capable: boolean; liveTurn: boolean; model?: string | null },
 ): SteerDecision {
   if (busy.status !== 'working') {
     return { kind: 'queue', reason: busy.queued ? `${busy.id} is itself waiting (for its box, its project's clone or the turn before it)` : `${busy.id} is still starting` };
+  }
+  // A running claude -p keeps the --model it started with, so a follow-up that would run on another one gets a turn of
+  // its own. `facts.model` is its effective tier (--model, else the thread's stored one; null: the box's default);
+  // undefined is unknown, and never queues.
+  if (facts.model !== undefined && (facts.model ?? null) !== (busy.model ?? null)) {
+    const mine = facts.model ? `--model ${facts.model}` : "this follow-up, on the box's default model,";
+    return { kind: 'queue', reason: `${busy.id}'s turn runs on ${busy.model ?? "the box's default model"}, and ${mine} needs a turn of its own` };
   }
   if (!facts.connected) return { kind: 'queue', reason: `${facts.box} is not connected` };
   if (!facts.capable) return { kind: 'queue', reason: `${facts.box}'s agent can't add a message to a running turn (it needs a newer termag agent)` };
@@ -210,12 +245,15 @@ export function supersededReplyMode(env: NodeJS.ProcessEnv = process.env): 'toge
  * A wait on superseded message `a`, answered together with `f`, the last
  * message of its chain: `f`'s state, reply and outcome under `a`'s id, with
  * `answeredWith` naming `f`. The reply is counted on `f` only (its `readAt`);
- * `a` stays superseded in the inbox.
+ * `a` stays superseded in the inbox. Its model is `a`'s own (what `a` asked
+ * for, ran on, and why an asked-for one was ignored), so `a`'s caller is
+ * warned about its own `--model`, never about `f`'s.
  */
 export function answeredTogether(a: MessageRow, f: MessageRow): MessageRow {
   return {
     ...f, id: a.id, threadId: a.threadId, hop: a.hop, createdAt: a.createdAt, startedAt: a.startedAt,
     supersededById: a.supersededById ?? f.id,
+    model: a.model ?? null, modelIgnored: a.modelIgnored ?? null,
   };
 }
 
@@ -472,6 +510,12 @@ export interface AskRequest {
    * CLI) is true: only a session the orchestrator could check is ever told.
    */
   notify: boolean;
+  /**
+   * `termag ask --model`: the Claude tier this turn runs on, and the thread's
+   * chat from then on (its stored choice, Workflow.model). Null for none: the
+   * turn runs on the chat's stored tier, else the box's default.
+   */
+  model: ClaudeChatTier | null;
 }
 
 /** A PR named by `termag ask --update-pr`: its number, and its owner/name when the caller said. */
@@ -598,10 +642,13 @@ export function parseAskBody(body: unknown): AskRequest | { error: string } {
   if ('error' in pr) return pr;
   if (b.newBox !== undefined && typeof b.newBox !== 'boolean') return { error: 'newBox must be true or false' };
   if (b.notify !== undefined && typeof b.notify !== 'boolean') return { error: 'notify must be true or false' };
+  const model = parseClaudeChatModel(b.model);
+  if (!model.ok) return { error: model.error };
   return {
     ref, projectId: projectId || null, workstream, repo, prompt, threadId, messageId, title: titled.title, sender: parseAskSender(b.sender), senderClaudeSession: parseAskClaudeSession(b.sender), targetPr: pr.targetPr,
     newBox: b.newBox === true,
     notify: b.notify !== false,
+    model: model.model,
   };
 }
 
@@ -631,6 +678,21 @@ export function repoTarget(
   }
   if (!repos.includes(repo)) return { error: `${p.target} has no repository ${repo}; it holds ${repos.join(', ')}`, code: 'unknown_repo', repos };
   return { repo };
+}
+
+/**
+ * The repositories an ask into a multi-repo project may name, in the project's
+ * order. A repository added to a project in use has no checkout to ask until
+ * its clone is ready. While the project itself is still being set up (a new
+ * one, as `termag ask --new-box` makes), an ask is held until every clone is
+ * ready, so the repositories it was created with all count, ready or not.
+ */
+export function askableRepos(
+  projectSetupStatus: string,
+  repos: ReadonlyArray<{ name: string; setupStatus: string }>,
+): string[] {
+  const settingUp = isProjectSettingUp(projectSetupStatus);
+  return repos.filter(r => r.setupStatus === 'ready' || (settingUp && isProjectSettingUp(r.setupStatus))).map(r => r.name);
 }
 
 /** Where a run on this checkout starts: the workstream's folder, or the repository's directory in it. */
@@ -824,6 +886,10 @@ export interface MessageRow {
   storedReply?: { bytes: number; truncated?: boolean } | null;
   /** What became of the finish notice to the sending session (askNotice.ts NoticeOutcome); null while none is due or settled. */
   notice?: string | null;
+  /** The Claude tier it asked for until it starts, then the one its turn launched on; null for the box's default (AgentMessage.model). */
+  model?: string | null;
+  /** Why the tier it asked for did not reach its turn (an older box agent, a headless run); null when it did or none was asked. */
+  modelIgnored?: string | null;
 }
 
 export interface ThreadRow {
@@ -881,6 +947,10 @@ export function messageView(m: MessageRow, t: ThreadRow, target: string, reply: 
     supersededBy: m.supersededById ?? null,
     // The finish notice to the session that sent it: chat, pane, waiter, gone, ….
     notice: m.notice ?? null,
+    // The Claude tier the turn runs on (`termag ask --model`, else the thread's); null for the box's default,
+    // which is also what an ignored --model ran on (modelIgnored says why).
+    model: m.modelIgnored ? null : m.model ?? null,
+    ...(m.modelIgnored ? { modelIgnored: m.modelIgnored } : {}),
     publish: m.publish ? { status: m.publish, detail: m.publishDetail } : null,
     pr: first ? { url: first.url, number: first.number, branch: first.branch } : null,
     prs,
@@ -910,9 +980,23 @@ export interface RunResult {
    * askPushes confirms each on GitHub.
    */
   pushes: ReportedPush[] | null;
+  /**
+   * The clone's branches with commits that no origin branch has, from a runner
+   * with ask-push-v1 (termag-subagent-run report_pushes): committed, never
+   * pushed, whichever turn made them. `HEAD` is a detached HEAD's commits on
+   * no branch. Empty from one that sends a bundle or predates the field.
+   */
+  unpushed: UnpushedBranch[];
 }
 
 export interface ReportedPush { branch: string; sha: string }
+/**
+ * A branch (`HEAD` for a detached one) with commits no origin branch has.
+ * `to`: the branch on GitHub the box names for the push that publishes them,
+ * which only the box can tell (it knows which branches origin has); absent
+ * from a box that predates it.
+ */
+export interface UnpushedBranch { branch: string; commits: number; to?: string }
 
 /** The most pushed branches a result names; a clone that pushed more is cut there. */
 export const MAX_REPORTED_PUSHES = 50;
@@ -929,6 +1013,21 @@ function parsePushes(v: unknown): ReportedPush[] | null {
     const { branch, sha } = p as Record<string, unknown>;
     if (typeof branch !== 'string' || !isPushBranch(branch) || typeof sha !== 'string' || !SHA.test(sha)) continue;
     if (!out.some(o => o.branch === branch)) out.push({ branch, sha });
+  }
+  return out;
+}
+
+function parseUnpushed(v: unknown): UnpushedBranch[] {
+  if (!Array.isArray(v)) return [];
+  const out: UnpushedBranch[] = [];
+  for (const p of v) {
+    if (out.length >= MAX_REPORTED_PUSHES) break;
+    if (!p || typeof p !== 'object') continue;
+    const { branch, commits, to } = p as Record<string, unknown>;
+    if (typeof branch !== 'string' || !isPushBranch(branch)) continue;
+    if (typeof commits !== 'number' || !Number.isInteger(commits) || commits < 1) continue;
+    if (out.some(o => o.branch === branch)) continue;
+    out.push(typeof to === 'string' && isPushBranch(to) ? { branch, commits, to } : { branch, commits });
   }
   return out;
 }
@@ -968,6 +1067,7 @@ export function parseRunResult(body: unknown): RunResult | { error: string } {
     prDescription: typeof b.prDescription === 'string' && b.prDescription.trim() ? b.prDescription : null,
     prDescriptions: parsePrDescriptions(b.prDescriptions),
     pushes: parsePushes(b.pushes),
+    unpushed: parseUnpushed(b.unpushed),
   };
 }
 
@@ -1030,6 +1130,11 @@ export function runSystemPrompt(input: {
    * opens its draft PRs itself (pushSystemPrompt).
    */
   push?: boolean;
+  /**
+   * The project's owner trusted it, and it isn't an automation: only then is
+   * the run pointed at `termag-env up`, the clone's own commands (Security Agent, #998).
+   */
+  trusted?: boolean;
 }): string {
   if (input.push) return pushSystemPrompt(input);
   const t = input.targetPr;
@@ -1052,6 +1157,8 @@ export function runSystemPrompt(input: {
     `- If the environment variable TERMAG_ASK_PR_DIR is set and the sender asks for separate pull requests, or the work is clearly several independent changes, termag can open more than one: put each further pull request on its own branch \`pr/<name>\` (lowercase letters, digits and hyphens, at most 40) started from the base (\`git switch -c pr/<name> termag/base\`), commit there, and write its description to \`$TERMAG_ASK_PR_DIR/<name>.md\` in the same form. Each becomes a draft pull request on ${input.branch}-<name>, at most ${MAX_ASK_PRS} per thread counting the one on \`ask\`; later turns update them by branch name. Switch back to \`ask\` for the main change. Other branch names are not published.`,
     '- If you commit and the environment variable TERMAG_ASK_PR_BODY_FILE is set, write the pull request description to that file (it is outside the git tree; never commit it): an optional first line `# <title>`, then Markdown saying what changed and why, how you tested it, and open questions for the reviewer. Rewrite it on a later turn if the change moves on. Without one, termag builds the description from your commit messages, so write those well either way.',
     BUG_REPORT_LINE,
+    // The environment's steps: the repository's own way to bring its app up, for checking a change in it.
+    ...(input.trusted ? ['- To run the app, when the clone has a `.termag/environment.json` with `run`: `termag-env up` sets it up once, starts it, waits for its ports to be healthy and seeds it; `termag-env status` shows each step\'s time and the ports\' health, and `termag-env down` closes its tmux session. Its ports are the box\'s, shared with any other copy of the app running there, so read `termag-env status` (or what listens) before you start one.'] : []),
     'Finish with a short, self-contained answer for the sender: what you found or changed, and anything they must check.',
   ].join('\n');
 }
@@ -1077,7 +1184,7 @@ function pushSystemPrompt(input: {
     `- If the request needs code changes, publish them yourself: catch up with \`git fetch origin && git merge origin/<default branch>\` if you need to, then \`git push origin HEAD:${own}\`, then open a draft pull request for it with the termag-pr skill (\`termag-pr-create <title file> <body file> --draft\`) unless it already has one. Push before you finish: termag lists the pull requests of the branches this clone pushed, and says so in the reply when a branch has commits that were not pushed.`,
     `- A separate pull request goes on its own branch from the default branch: \`git switch -c ${input.branch}-<name> origin/<default branch>\` (<name>: lowercase letters, digits and hyphens), pushed and opened the same way. To work on another existing pull request of the sender's, \`gh pr checkout <n>\`, commit, and \`git push\`.`,
     '- Never push to the default branch (the clone\'s pre-push hook refuses it), to someone else\'s pull request, or with --force to a branch someone else has pushed to. Do not change credentials, permissions or CI workflows unless the request is about them.',
-    '- A pull request\'s title and body come from files, through the termag-pr skill; its body names this thread (TERMAG_ASK_THREAD). When the change spans several pull requests, link each from the others\' bodies.',
+    '- A pull request\'s title and body come from files, through the termag-pr skill; its body names this thread (TERMAG_ASK_THREAD). To change an existing pull request\'s description, write it to a file and run `termag-pr-body <file> > <marked> && gh pr edit <n> --body-file <marked>` (the termag-pr skill). Never pipe it into `gh pr edit --body-file -`: gh still runs when termag-pr-body fails, say because the file is gone, and an empty stdin blanks the description. termag reads no description file at the end of the turn (there is no TERMAG_ASK_PR_BODY_FILE here). When the change spans several pull requests, link each from the others\' bodies.',
     BUG_REPORT_LINE,
     'Finish with a short, self-contained answer for the sender: what you found or changed, the pull requests, and anything they must check.',
   ].join('\n');

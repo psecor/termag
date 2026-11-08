@@ -16,13 +16,15 @@ export interface CliUser {
 export interface CliSessionRecord extends DeviceRow {
   userId: string;
   user: CliUser;
+  /** The box the sign-in was made on (the CLI sent its credential at the code exchange); null or absent: not on a box. */
+  issuedOnBoxId?: string | null;
 }
 
 /** The parts of routes/agentTokens.ts validateAgentToken's result a box credential is judged on. */
 export interface ValidatedAgentTokenLike {
   user: CliUser | null;
   instance: { id: string } | null;
-  token: { scope: string };
+  token: { id?: string; scope: string };
 }
 
 /**
@@ -32,14 +34,15 @@ export interface ValidatedAgentTokenLike {
  */
 export function boxCredentialFromAgentToken(
   result: ValidatedAgentTokenLike | null,
-): { user: CliUser; instanceId: string | null } | null {
+): { user: CliUser; instanceId: string | null; tokenId?: string } | null {
   if (!result?.user || !acceptsScope('cliBox', result.token.scope)) return null;
-  return { user: result.user, instanceId: result.instance?.id ?? null };
+  const box = { user: result.user, instanceId: result.instance?.id ?? null };
+  return result.token.id ? { ...box, tokenId: result.token.id } : box;
 }
 
 export interface CliStore {
   /** Create a device session, revoking the user's earlier live sessions on the same device name. */
-  createSession(input: { userId: string; deviceName: string; tokenHash: string; tokenPrefix: string; now: Date }): Promise<CliSessionRecord>;
+  createSession(input: { userId: string; deviceName: string; tokenHash: string; tokenPrefix: string; now: Date; issuedOnBoxId?: string | null }): Promise<CliSessionRecord>;
   findSessionByHash(tokenHash: string): Promise<CliSessionRecord | null>;
   /** By id: an access token's `jti`. */
   findSessionById(id: string): Promise<CliSessionRecord | null>;
@@ -49,7 +52,7 @@ export interface CliStore {
    * An owner-bound, `agent`-scoped token (a box's, or a legacy per-user one).
    * Ownerless warm tokens and other scopes are null.
    */
-  validateAgentToken(rawToken: string): Promise<{ user: CliUser; instanceId: string | null } | null>;
+  validateAgentToken(rawToken: string): Promise<{ user: CliUser; instanceId: string | null; tokenId?: string } | null>;
   listBoxes(userId: string): Promise<CliBox[]>;
   listProjects(userId: string): Promise<CliProject[]>;
   listDevices(userId: string): Promise<DeviceRow[]>;

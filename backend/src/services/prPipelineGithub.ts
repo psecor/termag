@@ -99,6 +99,7 @@ fragment Requested on PullRequest {
     createdAt
     requestedReviewer { __typename ... on User { login } ... on Team { slug } }
   } } }
+  decided: latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }
 }`,
   Merged: `
 fragment Merged on PullRequest {
@@ -559,6 +560,8 @@ export function parseOpenPr(node: Raw, viewer?: string): OpenPr | null {
     requestedAt: viewer === undefined ? null : requestedAtFor(node, viewer),
     // By login, not by the merged list: a team slug can equal someone's login.
     ...(me === undefined ? {} : { requestedYou: requested.some(r => r?.__typename === 'User' && str(r.login)?.toLowerCase() === me) }),
+    // The Requested fragment's latest opinions: only the review search (and a read by number) asks for them.
+    ...(node.decided ? { reviewers: parseReviewers(node) } : {}),
   };
 }
 

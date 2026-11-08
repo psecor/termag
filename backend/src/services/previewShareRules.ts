@@ -34,7 +34,8 @@ export const GUEST_BUSY_CLOSE_CODE = 4429;
 export const GUEST_STACK_CLOSE_CODE = 4424;
 export const GUEST_UNSAFE_CLOSE_CODE = 4500;
 
-export type OriginRecipe = { kind: 'webapp-dev-stack' } | { kind: 'manual'; origins: string[] };
+/** `repo`: the ports of the checkout's environment file, the first one opened; resolved on the box (agent/browser-guest.js resolveRepoRecipe). */
+export type OriginRecipe = { kind: 'webapp-dev-stack' } | { kind: 'repo' } | { kind: 'manual'; origins: string[] };
 
 /**
  * `host:port` for a loopback origin, the form every check compares; null for
@@ -77,7 +78,8 @@ export function parseRecipe(input: unknown): { recipe: OriginRecipe } | { error:
   if (typeof input !== 'object' || Array.isArray(input)) return { error: 'recipe must be an object' };
   const r = input as Record<string, unknown>;
   if (r.kind === 'webapp-dev-stack') return { recipe: { kind: 'webapp-dev-stack' } };
-  if (r.kind !== 'manual') return { error: 'recipe.kind must be webapp-dev-stack or manual' };
+  if (r.kind === 'repo') return { recipe: { kind: 'repo' } };
+  if (r.kind !== 'manual') return { error: 'recipe.kind must be webapp-dev-stack, repo or manual' };
   if (!Array.isArray(r.origins) || r.origins.length === 0) return { error: 'a manual recipe needs at least one origin' };
   if (r.origins.length > MAX_ORIGINS) return { error: `at most ${MAX_ORIGINS} origins` };
   const seen = new Set<string>();
@@ -273,6 +275,7 @@ export function guestAttachRefusal(message: string, opts: { checkout?: boolean }
         unverifiable: "The owner's box can't confirm which dev stack is running.",
         'no-origins': 'This preview names no address to show.',
         'bad-recipe': 'This preview is set up wrongly. Ask its owner to share it again.',
+        'no-environment': "This workstream's environment file names no port to show.",
       };
       if (opts.checkout) {
         Object.assign(why, {
@@ -464,11 +467,10 @@ export function activeLinkKeyOf(projectId: string, workstreamId: string | null):
 }
 
 /**
- * What a link share is for. Without 4d, from the server's own records: the
- * project's repository and the workstream's branch. With 4d
- * (browser-pane-pr-checkout-shares-enabled), from the PR's checkout as the
- * box reports it (services/prCheckout.ts), so both fields are the box's
- * report; GitHub still decides authorship, state, visibility and forks.
+ * What a link share is for: the PR's checkout as the box reports it (4d,
+ * services/prCheckout.ts), or, from a box agent too old to report one, the
+ * server's own records: the project's repository and the workstream's branch.
+ * GitHub still decides authorship, state, visibility and forks.
  */
 export interface LinkShareTarget {
   /** The repository as `owner/name`: the project's (Project.repoUrl), or the checkout's origin (4d); null when there is none. */
@@ -589,7 +591,7 @@ export const WAKE_EVERY_MS = 30 * 60 * 1000;
 export const WAKES_PER_DAY = 6;
 const DAY_MS = 24 * 3600 * 1000;
 
-export type WakeRefusal = 'not-wakeable' | 'no-box' | 'awake' | 'not-auto' | 'too-soon' | 'daily' | 'wake-off';
+export type WakeRefusal = 'not-wakeable' | 'no-box' | 'awake' | 'not-auto' | 'too-soon' | 'daily';
 
 export const WAKE_MESSAGES: Record<WakeRefusal, string> = {
   'not-wakeable': "This preview can't wake its box. Ask its owner to start it.",
@@ -598,7 +600,6 @@ export const WAKE_MESSAGES: Record<WakeRefusal, string> = {
   'not-auto': "Its owner put this box to sleep themselves, so only they can start it. Ask them to.",
   'too-soon': 'This box was woken for a reviewer a few minutes ago. Try again later, or ask its owner.',
   daily: "This owner's box has been woken for reviewers as often as it may be today. Ask its owner to start it.",
-  'wake-off': 'Waking a box for a reviewer is switched off right now. Ask its owner to start it.',
 };
 
 /**

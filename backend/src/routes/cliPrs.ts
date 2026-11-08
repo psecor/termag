@@ -16,8 +16,7 @@
  *
  * The list they change is GET /prs (routes/cliTui.ts). Like it, each is a
  * device sign-in's: a box's own token gets 403, since anything on the box can
- * read it. Only the desktop calls them, so they sit behind
- * `desktop-app-enabled` for the user (off: 404, as if absent). Failures carry
+ * read it. Failures carry
  * the CLI's `code` (tuiResult).
  */
 import type { Request, RequestHandler, Response, Router } from 'express';
@@ -29,8 +28,6 @@ import type { PrsWrites } from './prs';
 import type { RouteResult } from './routeResult';
 
 export interface CliPrs {
-  /** Whether `desktop-app-enabled` is on for the user. */
-  enabled(user: CliUser): Promise<boolean>;
   writes: PrsWrites;
   /** Bake & deploy now (routes/prs.ts bakeNow). */
   bake(userId: string): Promise<RouteResult>;
@@ -51,7 +48,6 @@ export function mountCliPrsRoutes(router: Router, prs: CliPrs, bearer: RequestHa
   const desktopOnly: RequestHandler = asyncHandler(async (_req, res, next) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') { res.status(403).json(PRS_DEVICE_ONLY); return; }
-    if (!(await prs.enabled(user))) { res.status(404).json(NOT_FOUND); return; }
     next();
   });
   const route = (fn: (userId: string, req: Request, user: CliUser) => Promise<RouteResult>): RequestHandler[] => [

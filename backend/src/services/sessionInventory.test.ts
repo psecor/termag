@@ -23,3 +23,18 @@ describe('collectSessionRows: review panes (docs/parallel-reviews.md)', () => {
     expect(rows.find(r => r.role === 'ctrl')?.alive).toBe(false);
   });
 });
+
+describe('collectSessionRows: ask threads\' chats', () => {
+  it('lists no pane rows for an ask chat, whose turns run in the chat runner with no tmux pane', async () => {
+    const asked = { ...project, workstreams: [{ name: 'main', askThread: null }, { name: 'ask-cmvzxfb4u5hbxkz4bta4izuga', askThread: { id: 'cmvzxfb4u5hbxkz4bta4izuga' } }] };
+    const rows = await collectSessionRows([{ p: asked, access: 'owner' }]);
+    expect(rows.some(r => r.workstream.startsWith('ask-'))).toBe(false);
+    expect(rows.filter(r => r.role === 'agent').map(r => r.workstream)).toEqual(['main']);
+  });
+
+  it('still lists a workstream that only looks like one (no thread behind it)', async () => {
+    const lookalike = { ...project, workstreams: [{ name: 'main' }, { name: 'ask-abcdefgh12345678' }] };
+    const rows = await collectSessionRows([{ p: lookalike, access: 'owner' }]);
+    expect(rows.filter(r => r.role === 'agent').map(r => r.workstream)).toEqual(['main', 'ask-abcdefgh12345678']);
+  });
+});

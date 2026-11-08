@@ -10,7 +10,7 @@ import type { FlagContext } from '../services/featureFlags';
 
 // box-default-size as a targeting flag source would serve it: per user key, else the
 // fallthrough, which is also what the pool's fixed context gets.
-// warm-pool-enabled is on for everyone, box-hibernation-enabled off,
+//
 // box-warm-pool-size at its fallback and box-warm-pool-sizes as `poolSizes`
 // (null: unset, the single-size pool of the fallthrough's size).
 const flag = vi.hoisted(() => ({ fallthrough: '', userTargets: {} as Record<string, string>, poolSizes: null as unknown }));
@@ -21,7 +21,7 @@ vi.mock('../services/featureFlags', () => {
     return key !== undefined && key in flag.userTargets ? flag.userTargets[key] : flag.fallthrough || fallback;
   };
   return {
-    boolVariation: vi.fn(async (key: string, _user: unknown, fallback: boolean) => (key === 'warm-pool-enabled' ? true : fallback)),
+    boolVariation: vi.fn(async (key: string, _user: unknown, fallback: boolean) => fallback),
     boolVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: boolean) => fallback),
     stringVariation: vi.fn(async (key: string, user: { id: string }, fallback: string) =>
       key === 'box-default-size' ? size({ kind: 'user', key: user.id }, fallback) : fallback),
@@ -59,7 +59,7 @@ vi.mock('../services/boxProvisioner', () => ({ provisionBox, terminateBox: vi.fn
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => 'spec1'), reconcileWarmPool: vi.fn(async () => {}) }));
 vi.mock('../services/agentRegistry', () => ({ sendToInstanceAgent: vi.fn() }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox, isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox, isNameConflict: () => false, prismaClaimEffects: {},
 }));
 const boxCreationRefusal = vi.hoisted(() => vi.fn(() => null));
 vi.mock('../services/boxCreationGate', () => ({
@@ -71,6 +71,7 @@ vi.mock('../services/boxCreationGate', () => ({
 const repoFiles = vi.hoisted(() => ({
   read: [] as string[],
   byRepo: {} as Record<string, { sizes: { size: unknown } | null; warnings: string[] }>,
+  byEnvironment: {} as Record<string, { sizes: { size: unknown } | null; warnings: string[] }>,
 }));
 // What a box made for several repositories gets is keyed by them joined with "+" (repoEnvironment's largest is its own test).
 vi.mock('../services/repoEnvironment', () => ({
@@ -78,6 +79,18 @@ vi.mock('../services/repoEnvironment', () => ({
     if (!repos.length) return { sizes: null, warnings: [] };
     repoFiles.read.push(...repos);
     return repoFiles.byRepo[repos.join('+')] ?? { sizes: null, warnings: [] };
+  }),
+}));
+
+// The environments there are, by name (services/environments.ts).
+const environments = vi.hoisted(() => ({ byName: {} as Record<string, unknown> }));
+vi.mock('../services/environments', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/environments')>(),
+  prismaEnvironmentStore: { byName: vi.fn(async (name: string) => environments.byName[name.trim().toLowerCase()] ?? null) },
+  // An environment's definition, by environment name.
+  resolveStoredEnvironment: vi.fn(async (_userId: string, env: { name: string }) => {
+    repoFiles.read.push(`environment:${env.name}`);
+    return { repos: [], ...(repoFiles.byEnvironment[env.name] ?? { sizes: null, warnings: [] }) };
   }),
 }));
 
@@ -95,6 +108,7 @@ vi.mock('../services/boxRequirements', async (importOriginal) => {
 });
 
 const { createBox } = await import('./instances');
+const { recordImageFloor, resetImageFloorsForTests } = await import('../services/boxImageFloor');
 const { poolSpecHashOrNull } = await import('../services/warmPool');
 
 const user = { id: 'u1', unixUsername: 'alice', googleEmail: 'alice@example.com', displayName: 'Alice' } as unknown as Express.User;
@@ -112,6 +126,15 @@ beforeEach(() => {
   provisioned.configured = true;
   created.length = 0;
   repoFiles.read = [];
+  repoFiles.byEnvironment = {
+    'full-stack': { sizes: { size: 'large' }, warnings: [] },
+    'no-file': { sizes: null, warnings: ["no-file's file, acme/tiny:env.json, is not there, so it was left out"] },
+  };
+  environments.byName = {
+    // Each personal to the test's user, u1.
+    'full-stack': { id: 'e1', name: 'full-stack', visibility: 'personal', ownerUserId: 'u1', kind: 'inline', definition: { resources: 'large', repos: [{ repo: 'example-org/webapp' }, { repo: 'acme/tiny' }] } },
+    'no-file': { id: 'e2', name: 'no-file', visibility: 'personal', ownerUserId: 'u1', kind: 'pointer', file: { repo: 'acme/tiny', branch: null, path: 'env.json' } },
+  };
   repoFiles.byRepo = {
     [WEBAPP]: { sizes: { size: 'medium' }, warnings: [] },
     [TINY]: { sizes: { size: 'small' }, warnings: [] },
@@ -380,6 +403,18 @@ describe('a repo file asking for requirements ({ vcpu, memoryGiB })', () => {
     expect(created[0]).toMatchObject({ size: '4vcpu-32gib' });
     expect(launchedTypes()?.type).toBe('r8g.xlarge');
   });
+
+  it("never relaunches a requirements box smaller when EC2 can't match them again: the smallest preset that covers them (Bugbot, #985)", async () => {
+    flag.fallthrough = 'small';
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    resolutions.byKey = {};
+    const result = await createBox(user, { name: 'g6', kind: 'ec2' }, { relaunchSize: '4vcpu-32gib' });
+    expect(result.status).toBe(201);
+    // 4 vCPU / 32 GB: medium (4/16) lacks the memory, so large (8/32), never the owner's small.
+    expect(created[0]).toMatchObject({ size: 'large' });
+    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
+    expect(result.body).toMatchObject({ warnings: [expect.stringContaining('launching large instead')] });
+  });
 });
 
 describe('boxes without a size', () => {
@@ -388,6 +423,53 @@ describe('boxes without a size', () => {
     await createBox(user, { name: 'laptop', kind: 'external' });
     expect(created[0]).toMatchObject({ size: null });
     expect(await createBox(user, { name: 'laptop2', kind: 'external', size: 'small' })).toMatchObject({ status: 400, body: { code: 'invalid_size' } });
+  });
+});
+
+describe('a new box made from an environment', () => {
+  beforeEach(() => { flag.fallthrough = 'small'; });
+
+  it("takes the environment file's size, and reads none of its repositories' own files", async () => {
+    await createBox(user, { name: 'dev1', kind: 'ec2', environment: 'full-stack', repo: [WEBAPP, TINY] });
+    expect(created[0]).toMatchObject({ size: 'large' });
+    expect(repoFiles.read).toEqual(['environment:full-stack']);
+  });
+
+  it('lets an explicit size win over the file, which is read only for the disk, and not at all with one asked for', async () => {
+    repoFiles.byEnvironment['full-stack'] = { sizes: { size: 'large', diskGiB: 200 }, warnings: [] };
+    await createBox(user, { name: 'dev1', kind: 'ec2', environment: 'full-stack', size: 'medium' });
+    expect(created[0]).toMatchObject({ size: 'medium', diskGiB: 200 });
+    expect(repoFiles.read).toEqual(['environment:full-stack']);
+    await createBox(user, { name: 'dev2', kind: 'ec2', environment: 'full-stack', size: 'medium', diskGiB: 80 });
+    expect(created[1]).toMatchObject({ size: 'medium', diskGiB: 80 });
+    expect(repoFiles.read).toEqual(['environment:full-stack']);
+  });
+
+  it('falls back to box-default-size when the file says nothing, with its warning', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await createBox(user, { name: 'dev1', kind: 'ec2', environment: 'no-file' });
+    expect(result.status).toBe(201);
+    expect(created[0]).toMatchObject({ size: 'small' });
+    expect(result.body).toMatchObject({ warnings: [expect.stringContaining('is not there')] });
+  });
+
+  it("takes no size from the file with box-default-size off, but still its disk (services/boxDiskSize.ts)", async () => {
+    flag.fallthrough = '';
+    repoFiles.byEnvironment['full-stack'] = { sizes: { size: 'large', diskGiB: 250 }, warnings: [] };
+    await createBox(user, { name: 'dev1', kind: 'ec2', environment: 'full-stack' });
+    expect(created[0]).toMatchObject({ size: null, diskGiB: 250 });
+    expect(repoFiles.read).toEqual(['environment:full-stack']);
+  });
+
+  it('refuses an environment there is none of, before anything is written', async () => {
+    const result = await createBox(user, { name: 'dev1', kind: 'ec2', environment: 'nope' });
+    expect(result).toEqual({ status: 404, body: { error: 'There is no environment named "nope"', code: 'environment_not_found' } });
+    expect(created).toEqual([]);
+  });
+
+  it('keeps the largest-across-repositories size for several repositories and no environment', async () => {
+    await createBox(user, { name: 'dev1', kind: 'ec2', repo: [TINY, BIG_MEMORY] });
+    expect(repoFiles.read).toEqual([TINY, BIG_MEMORY]);
   });
 });
 
@@ -441,6 +523,71 @@ describe('a new box\'s disk (services/boxDiskSize.ts): asked for, else the repo 
     await createBox(user, { name: 'dev1', kind: 'ec2' }, { relaunchSize: null, relaunchDiskGiB: 250 });
     expect(created[0]).toMatchObject({ diskGiB: 250 });
     expect(launchedDisk()).toBe(250);
+  });
+
+  describe('never under the image\'s snapshot (services/boxImageFloor.ts), and the 201 says so', () => {
+    beforeEach(() => resetImageFloorsForTests());
+
+    it('raises a disk asked for below the published image\'s known floor: the row, the launch and the 201 say 120', async () => {
+      recordImageFloor('box', 120);
+      const r = await createBox(user, { name: 'dev1', kind: 'ec2', diskGiB: 50 });
+      expect(created[0]).toMatchObject({ diskGiB: 120 });
+      expect(launchedDisk()).toBe(120);
+      expect(r.body).toMatchObject({ disk: { requestedGiB: 50, diskGiB: 120, raised: true, floorKnown: true } });
+    });
+
+    it('keeps a disk at or above the floor, and says it was not raised', async () => {
+      recordImageFloor('box', 120);
+      const r = await createBox(user, { name: 'dev1', kind: 'ec2', diskGiB: 200 });
+      expect(created[0]).toMatchObject({ diskGiB: 200 });
+      expect(r.body).toMatchObject({ disk: { requestedGiB: 200, diskGiB: 200, raised: false, floorKnown: true } });
+    });
+
+    it('with the floor not looked up yet, keeps the disk and says the launch may raise it', async () => {
+      const r = await createBox(user, { name: 'dev1', kind: 'ec2', diskGiB: 50 });
+      expect(created[0]).toMatchObject({ diskGiB: 50 });
+      expect(r.body).toMatchObject({ disk: { requestedGiB: 50, diskGiB: 50, raised: false, floorKnown: false } });
+    });
+
+    it('raises a repo file\'s disk too, and says nothing for a default one', async () => {
+      recordImageFloor('box', 120);
+      repoFiles.byRepo[DISKY] = { sizes: { size: 'medium', diskGiB: 60 }, warnings: [] };
+      const r = await createBox(user, { name: 'dev1', kind: 'ec2', repo: DISKY });
+      expect(created[0]).toMatchObject({ diskGiB: 120 });
+      expect(r.body).toMatchObject({ disk: { requestedGiB: 60, diskGiB: 120, raised: true } });
+      const plain = await createBox(user, { name: 'dev2', kind: 'ec2' });
+      expect(plain.body).not.toHaveProperty('disk');
+    });
+
+    it('uses the minimal image\'s floor for a minimal box', async () => {
+      recordImageFloor('box', 120);
+      recordImageFloor('box-min', 60);
+      const r = await createBox(user, { name: 'dev1', kind: 'ec2', flavor: 'minimal', diskGiB: 50 });
+      expect(created[0]).toMatchObject({ diskGiB: 60 });
+      expect(r.body).toMatchObject({ disk: { requestedGiB: 50, diskGiB: 60, raised: true } });
+    });
+
+    it('a disk raised to the default can come from the warm pool', async () => {
+      flag.poolSizes = {}; flag.fallthrough = 'small';
+      recordImageFloor('box', 120);
+      await createBox(user, { name: 'dev1', kind: 'ec2', diskGiB: 50 });
+      expect(claimWarmBox).toHaveBeenCalledTimes(1);
+    });
+
+    it('with the floor above the default, a default or below-floor disk is the pool\'s disk and claims a warm box', async () => {
+      flag.poolSizes = {}; flag.fallthrough = 'small';
+      recordImageFloor('box', 150);
+      await createBox(user, { name: 'dev1', kind: 'ec2' });
+      await createBox(user, { name: 'dev2', kind: 'ec2', diskGiB: 50 });
+      expect(claimWarmBox).toHaveBeenCalledTimes(2);
+    });
+
+    it('with the floor above the default, a disk above the floor still goes cold', async () => {
+      flag.poolSizes = {}; flag.fallthrough = 'small';
+      recordImageFloor('box', 150);
+      await createBox(user, { name: 'dev1', kind: 'ec2', diskGiB: 200 });
+      expect(claimWarmBox).not.toHaveBeenCalled();
+    });
   });
 
   describe('the warm pool, whose boxes all have the default disk', () => {

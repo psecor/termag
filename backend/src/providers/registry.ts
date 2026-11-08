@@ -42,6 +42,13 @@ export interface ProviderConfig {
    *  agent exited (reconnect reconstruction): resume the last session in that
    *  cwd. Absent = launchCommand. */
   resumeCommand?: string;
+  /** resumeCommand exits 1 when the cwd has no conversation it can take up
+   *  (Claude Code's "No conversation found to continue", which also ignores a
+   *  directory holding only headless `-p` transcripts), so reconstruction
+   *  types it with a fresh launchCommand behind it (resumeOrFresh in
+   *  services/launchCommand.ts) rather than leave the pane at a shell for
+   *  every later reconnect to fail the same way. */
+  resumeNeedsConversation?: boolean;
   /** The launch line that resumes one conversation by its id, or null for an
    *  id it does not take. Only a tool update's relaunch uses it
    *  (services/toolUpdate/runs.ts), for a pane whose conversation the box saw;
@@ -152,6 +159,23 @@ function parseVibeStatusBar(lines: string[]): Record<string, any> {
 // "SWE-1.6 Fast                Context: 66k / 200k tokens (33%)"
 const DEVIN_STATUS_BAR = /^(.+?)\s{2,}Context:\s+(\d+)k\s*\/\s*(\d+)k\s+tokens\s*\((\d+)%\)/;
 
+/**
+ * Devin's approval footer, a whole line of its own: "↑↓ select · ↵ confirm",
+ * with more hints between and after in newer builds (3000.11.234: "↑↓ select ·
+ * ↔ scope · e edit · ↵ confirm · esc cancel"). Whole line, so a diff or a
+ * sentence quoting it is not a prompt. One `[^↵]*` before each fixed token and
+ * no nested quantifier: pane text is untrusted, and the poller and the review
+ * classifier run this on the event loop, so a line that fails has to fail in
+ * linear time. Used by the poller here and by services/reviewers.ts.
+ */
+export const DEVIN_APPROVAL_FOOTER = /^\s*↑↓\s+select\b[^↵]*·\s*↵\s+confirm\b[^↵]*$/;
+/**
+ * The newer list's cursor row ("❭ Allow ← ■□□□ → Once  Exec(gh auth)", or
+ * "❭ Deny" after Down), for a pane so narrow the footer wraps off one line.
+ * Starts with the ❭ glyph at the line's start, as a quoted row never does.
+ */
+export const DEVIN_APPROVAL_ROW = /^\s*❭\s+(?:Allow|Deny)\b/;
+
 function parseDevinStatusBar(lines: string[]): Record<string, any> {
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
     const m = DEVIN_STATUS_BAR.exec(lines[i]);
@@ -180,6 +204,7 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     automationChatProvider: 'claude-chat',
     launchCommand: 'claude',
     resumeCommand: 'claude --continue',
+    resumeNeedsConversation: true,
     promptLaunch: f => `claude "$(cat ${f})"`,
     handoffWriter: true,
     orchestratorSkill: true,
@@ -359,7 +384,8 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
         /^(I'll|Let me|I'm going to|Based on)\b/,
       ],
       waitingPatterns: [
-        /↑↓\s+select\s*·\s*↵\s+confirm/,
+        DEVIN_APPROVAL_FOOTER,
+        DEVIN_APPROVAL_ROW,
       ],
       statusBarParser: parseDevinStatusBar,
     },

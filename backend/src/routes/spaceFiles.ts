@@ -6,13 +6,12 @@
  *
  * A signed-in viewer (or better) of the space gets a 302 to a five-minute
  * presigned S3 GET (fileLinkResponseHeaders decides inline or attachment).
- * With spaces-html-links-enabled, an HTML file of up to HTML_LINK_MAX_BYTES
- * is instead read here and answered as a sandboxed page (spaceLinks.ts).
+ * An HTML file of up to HTML_LINK_MAX_BYTES is instead read here and answered as a sandboxed page (spaceLinks.ts).
  * Someone not signed in is sent through the normal sign-in and back here
  * (auth/postLoginReturn.ts); in okta mode the ALB's authenticate-oidc default
  * action has already done that, so a request with no user is a plain 401.
  *
- * Someone with no role in the space (or without spaces-enabled) still gets
+ * Someone with no role in the space still gets
  * the file when it is shared with termag (services/spaces/sharedFiles.ts),
  * with a presigned URL that works for SHARED_READ_TTL_S, logged as file.get
  * via 'share'. An unknown space, no role and no share, a malformed path and
@@ -23,8 +22,7 @@
  * A link to a folder, `<space>/<dir>/` (or `<space>/` for the root), or a
  * path with no file that is a folder, sends a viewer to the space's explorer
  * with that folder shown (spaceFolderPagePath), not a 404, where the simple
- * UI has that page for them (simple-ui-enabled and
- * simple-ui-side-panel-enabled; otherwise still a 404). Only a member:
+ * UI has that page for them. Only a member:
  * a share is of one file, so for anyone else a folder is the same 404.
  */
 import { Router, type Request, type Response } from 'express';
@@ -42,10 +40,6 @@ import { PRESIGNS_PER_MINUTE, shareView } from './spaces';
 export interface SpaceFilesRouterDeps {
   store: Pick<SpaceStore, 'findSpace' | 'memberRoles' | 'grantedBoxIds' | 'claimInvites' | 'recordEvent' | 'ldUser' | 'fileShare'>;
   objects: (identity: PresignerIdentity) => Promise<SpaceObjects>;
-  /** The spaces-enabled flag for this user. */
-  enabled: (userId: string) => Promise<boolean>;
-  /** The spaces-html-links-enabled flag for this user; unset is off. */
-  htmlEnabled?: (userId: string) => Promise<boolean>;
   /** The signed-in user, or null. */
   userId: (req: Request) => string | null;
   /**
@@ -115,7 +109,7 @@ export function spaceFilesRouter(deps: SpaceFilesRouterDeps): Router {
     try {
       const folderLink = link.path === '' || link.path.endsWith('/');
       const path = folderLink ? null : normalizeFilePath(link.path);
-      const member = await deps.enabled(userId) ? await accessOf(userId, link.space) : null;
+      const member = await accessOf(userId, link.space);
       const viewer = member && roleAtLeast(member.access.role, 'viewer') ? member.space : null;
       // A member's link to a folder, or to a path that is one: its explorer. Never a share's.
       const objectsOf = async () => {
@@ -155,7 +149,7 @@ export function spaceFilesRouter(deps: SpaceFilesRouterDeps): Router {
         spaceId: found.space.id, actorUserId: userId, actorInstanceId: null, via: found.shared ? 'share' : null, action: 'file.get', path, bytes,
       });
       res.set('Referrer-Policy', 'no-referrer');
-      if (isHtmlLink(path) && head.size <= HTML_LINK_MAX_BYTES && await deps.htmlEnabled?.(userId)) {
+      if (isHtmlLink(path) && head.size <= HTML_LINK_MAX_BYTES) {
         // Bounded read: the file may have grown past the cap since the HEAD.
         const body = await objects.read(key, HTML_LINK_MAX_BYTES);
         if (!body) { notFound(); return; }

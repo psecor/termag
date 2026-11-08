@@ -46,13 +46,13 @@ class FakeStore implements CliStore {
   projects = new Map<string, CliProject[]>();
   private users = new Map([['alice', alice], ['bob', bob]]);
 
-  async createSession(input: { userId: string; deviceName: string; tokenHash: string; tokenPrefix: string; now: Date }) {
+  async createSession(input: { userId: string; deviceName: string; tokenHash: string; tokenPrefix: string; now: Date; issuedOnBoxId?: string | null }) {
     for (const s of this.sessions) {
       if (s.userId === input.userId && s.deviceName === input.deviceName && !s.revokedAt) s.revokedAt = input.now;
     }
     const row: CliSessionRecord = {
       id: `s${this.sessions.length + 1}`, userId: input.userId, user: this.users.get(input.userId)!,
-      deviceName: input.deviceName, tokenPrefix: input.tokenPrefix, createdAt: input.now, lastUsedAt: input.now, revokedAt: null,
+      deviceName: input.deviceName, tokenPrefix: input.tokenPrefix, createdAt: input.now, lastUsedAt: input.now, revokedAt: null, issuedOnBoxId: input.issuedOnBoxId ?? null,
       ...{ tokenHash: input.tokenHash },
     };
     this.sessions.push(row);
@@ -161,6 +161,21 @@ describe('POST /api/cli/v1/token', () => {
     });
     expect(JSON.stringify(store.sessions)).not.toContain(body.token as string);
     expect(JSON.stringify(store.sessions)).toContain(sha256Hex(body.token as string));
+  });
+
+  // Where a sign-in is made (preview links' SR5): a CLI on a box sends the box's own credential with the exchange.
+  it('records the box a sign-in was made on, from the box credential sent with the exchange', async () => {
+    store.agentTokens.set('tmag_box', { user: alice, instanceId: 'i-devbox' });
+    const exchange = async (extra: Record<string, unknown>) => {
+      const code = codes.issue({ userId: 'alice', deviceName: `d${store.sessions.length}`, codeChallenge: pkceChallenge(VERIFIER) }, clock);
+      return call('/api/cli/v1/token', { method: 'POST', body: JSON.stringify({ grant_type: 'authorization_code', code, code_verifier: VERIFIER, ...extra }) });
+    };
+    expect((await exchange({ box_token: 'tmag_box' })).status).toBe(201);
+    expect((await exchange({})).status).toBe(201);
+    // A credential that isn't one marks nothing; nor does anything that isn't a box token.
+    expect((await exchange({ box_token: 'tmag_nope' })).status).toBe(201);
+    expect((await exchange({ box_token: 'tmcli_x' })).status).toBe(201);
+    expect(store.sessions.map(s => s.issuedOnBoxId)).toEqual(['i-devbox', null, null, null]);
   });
 
   it('refuses a reused code, a wrong verifier and other grant types', async () => {

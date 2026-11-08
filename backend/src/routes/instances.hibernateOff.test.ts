@@ -30,7 +30,7 @@ vi.mock('../services/agentRegistry', () => ({
   isInstanceAgentConnected: vi.fn(() => true), sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []),
 }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {},
 }));
 vi.mock('../services/chatRevoke', () => ({ revokeChats: vi.fn(async () => null) }));
 vi.mock('../services/workspaceEvents', () => ({ notifyOnSuccess: vi.fn((r: unknown) => r), notifyWorkspaceChange: vi.fn() }));

@@ -8,7 +8,6 @@ import {
 
 vi.mock('../db', () => ({ prisma: {} }));
 vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn() }));
-vi.mock('../services/pushFlag', () => ({ webPushEnabledFor: vi.fn(async () => true) }));
 
 const VAPID = { publicKey: 'BPub', privateKey: 'priv', subject: 'mailto:ops@example.com' };
 const P256DH = Buffer.concat([Buffer.from([0x04]), Buffer.alloc(64, 7)]).toString('base64url');
@@ -22,8 +21,7 @@ function makeDeps(over: Partial<PushRouteDeps> = {}) {
     remove: vi.fn<PushRouteStore['remove']>(async () => 1),
   };
   const send = vi.fn<PushRouteDeps['send']>(async () => ({ sent: 2, failed: 1, removed: 1 }));
-  const enabledFor = vi.fn<PushRouteDeps['enabledFor']>(async () => true);
-  return { store, send, vapid: () => VAPID, baseUrl: () => 'https://example.com/termag', enabledFor, ...over };
+  return { store, send, vapid: () => VAPID, baseUrl: () => 'https://example.com/termag', ...over };
 }
 
 describe('GET /config', () => {
@@ -32,18 +30,6 @@ describe('GET /config', () => {
   });
   it('says off with any VAPID var unset', async () => {
     expect(await pushConfig('u1', makeDeps({ vapid: () => null }))).toEqual({ status: 200, body: { enabled: false, publicKey: null } });
-  });
-  it('says off, without the key, while mobile-web-push-enabled is off for the user', async () => {
-    const d = makeDeps({ enabledFor: async () => false });
-    expect(await pushConfig('u1', d)).toEqual({ status: 200, body: { enabled: false, publicKey: null } });
-  });
-  it('refuses to subscribe or test while the flag is off, without writing', async () => {
-    const d = makeDeps({ enabledFor: async () => false });
-    const body = { subscription: { endpoint: ENDPOINT, keys: { p256dh: P256DH, auth: AUTH } } };
-    expect((await addSubscription('u1', body, d)).status).toBe(403);
-    expect((await sendTest('u1', d)).status).toBe(403);
-    expect(d.store.upsert).not.toHaveBeenCalled();
-    expect(d.send).not.toHaveBeenCalled();
   });
 });
 

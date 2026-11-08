@@ -1,14 +1,14 @@
 import type { Router } from 'express';
 import type { CallerProofConfig } from '../services/callerIdentity';
 import { decideFireworksRequest } from '../services/fireworksAuthz';
-import { fireworksModelsForBox } from '../services/fireworksFlag';
 import { getFireworksGatewayConfig } from '../services/fireworksGateway';
 import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
 
 /**
  * Envoy's ext_authz check for the gateway's Fireworks route: every model call
  * a box's pi or Claude Code makes, with the call's path appended. Envoy sends
- * no body: its Lua filter read the model and sends it as x-termag-fireworks-model.
+ * no body: its Lua filter read the model and sends it as x-termag-fireworks-model,
+ * which the check only logs (Fireworks' own governance decides which models run).
  */
 export function fireworksAuthzRouter(cfg: CallerProofConfig): Router {
   return gatewayCheckRouter(cfg, 'FIREWORKS-AUTHZ', 'The termag Fireworks gateway could not check this request', ({ req, path }) =>
@@ -17,7 +17,6 @@ export function fireworksAuthzRouter(cfg: CallerProofConfig): Router {
       {
         configured: getFireworksGatewayConfig() !== null,
         boxForToken: boxForTokenAt('fireworksGateway'),
-        modelsFor: box => fireworksModelsForBox(box.userId, box.instanceId),
       },
     ));
 }

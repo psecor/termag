@@ -8,9 +8,8 @@
  *   GET /speech/whisper-base/<file>   one of the model's files, as the build put it
  *
  * A device sign-in's only: a box's own token gets 403 `forbidden`, as on the
- * desktop's other routes. Behind `desktop-app-enabled` for the person: off, or
- * a file that isn't one of the model's, and the route answers 404 `not_found`
- * as if it weren't there.
+ * desktop's other routes. A file that isn't one of the model's answers 404
+ * `not_found` as if it weren't there.
  */
 import { join } from 'path';
 import type { RequestHandler, Router } from 'express';
@@ -35,8 +34,6 @@ export const SPEECH_MODEL_FILES: ReadonlySet<string> = new Set([
 export interface CliSpeech {
   /** The web build's speech/ folder (frontend/dist/speech). */
   dir: string;
-  /** desktop-app-enabled for the person. */
-  desktopOn(user: CliUser): Promise<boolean>;
 }
 
 const DEVICE_ONLY = {
@@ -50,7 +47,7 @@ export function mountCliSpeechRoutes(router: Router, speech: CliSpeech, bearer: 
     const auth = res.locals.cliAuth as CliAuth;
     if (auth.credential.kind !== 'device') { res.status(403).json(DEVICE_ONLY); return; }
     const file = (req.params as Record<string, string>)[0] ?? '';
-    if (!SPEECH_MODEL_FILES.has(file) || !(await speech.desktopOn(auth.user))) { res.status(404).json(NOT_FOUND); return; }
+    if (!SPEECH_MODEL_FILES.has(file)) { res.status(404).json(NOT_FOUND); return; }
     res.set('Cache-Control', 'private, max-age=86400');
     // A build that couldn't fetch the model has none: say so as a 404, never the SPA's HTML.
     res.sendFile(join(speech.dir, SPEECH_MODEL_DIR, file), { dotfiles: 'deny' }, (err) => {

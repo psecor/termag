@@ -71,6 +71,18 @@ export interface LaunchOptions {
   /** On Fireworks: the flag's models for the harness's /model (fireworksMenuArg), typed only to a box that takes them:
    *  fireworks-menu-v1 for Claude Code, fireworks-pi-menu-v1 for pi. */
   models?: string;
+  /** A spawned agent's spawn (spawnTelemetryFor), for the resource's termag.spawn.*. */
+  spawn?: SpawnTelemetry | null;
+}
+
+/** What a spawned agent's launch names of its spawn. */
+export interface SpawnTelemetry {
+  id: string;
+  root?: string | null;
+  depth?: number | null;
+  parentProject?: string | null;
+  parentWorkstream?: string | null;
+  parentBox?: string | null;
 }
 
 // fireworksMenuArg's base64, typed into a shell.
@@ -104,6 +116,24 @@ function shellQuote(s: string): string {
 export function refusalLine(why: string): string {
   return `echo ${shellQuote(why)}`;
 }
+
+/**
+ * A resume (`resume`, already through launchCommandFor) that falls back to a
+ * fresh launch (`fresh`, likewise) when it exits 1: what Claude Code's
+ * `--continue` does in a directory with no interactive conversation ("No
+ * conversation found to continue", for instance where only headless `claude
+ * -p` sessions ran). Only status 1: a resumed agent the user quit (0), or
+ * one a tool update stopped (SIGTERM, 143) for the orchestrator to resume on
+ * the new binary, leaves the pane at its shell as before. Each side is
+ * braced, so a backend's `termag_settings=$(…) && claude …` stays whole; the
+ * line before the fresh launch says why the pane did not resume.
+ */
+export function resumeOrFresh(resume: string, fresh: string): string {
+  if (!resume || !fresh || resume === fresh) return resume;
+  return `{ ${resume}; } || { [ $? -eq 1 ] && ${refusalLine(RESUME_FALLBACK_NOTICE)} && ${fresh}; }`;
+}
+
+export const RESUME_FALLBACK_NOTICE = 'termag: no conversation to continue here; starting a new one';
 
 /**
  * The launch moved onto the workstream's backend (`final`: typed as it is, or
@@ -167,22 +197,43 @@ export function resourceEnvPrefix(project?: string | null, workstream?: string |
   return `TERMAG_PROJECT=${project} TERMAG_WORKSTREAM=${workstream} `;
 }
 
+// Spawn, root and box ids are cuids; checked again for the shell and the resource.
+const SPAWN_ID = /^[a-z0-9]{8,40}$/;
+
+/**
+ * `TERMAG_SPAWN_ID=<id> …` ahead of the box script, which reads it into the
+ * resource as termag.spawn.id, .root, .depth and termag.spawn.parent.*
+ * (termag-credentials work-resource), so a spawned agent's spans name the
+ * tree it is in and who started it. Each bad value is left out on its own
+ * (the parent's project and workstream together), and everything without a
+ * good id. Environment, like resourceEnvPrefix, so an older box ignores it.
+ */
+export function spawnEnvPrefix(spawn?: SpawnTelemetry | null): string {
+  if (!spawn || !SPAWN_ID.test(spawn.id)) return '';
+  const parts = [`TERMAG_SPAWN_ID=${spawn.id}`];
+  if (spawn.root && SPAWN_ID.test(spawn.root)) parts.push(`TERMAG_SPAWN_ROOT=${spawn.root}`);
+  if (Number.isInteger(spawn.depth) && (spawn.depth as number) >= 1 && (spawn.depth as number) <= 999) parts.push(`TERMAG_SPAWN_DEPTH=${spawn.depth}`);
+  if (spawn.parentProject && spawn.parentWorkstream && RESOURCE_NAME.test(spawn.parentProject) && RESOURCE_NAME.test(spawn.parentWorkstream)) {
+    parts.push(`TERMAG_SPAWN_PARENT_PROJECT=${spawn.parentProject}`, `TERMAG_SPAWN_PARENT_WORKSTREAM=${spawn.parentWorkstream}`);
+  }
+  if (spawn.parentBox && SPAWN_ID.test(spawn.parentBox)) parts.push(`TERMAG_SPAWN_PARENT_BOX=${spawn.parentBox}`);
+  return `${parts.join(' ')} `;
+}
+
 /**
  * The provider's launch (or resume) command: Claude Code's with the telemetry
  * settings (the replay it came from, the project and the workstream) on a box
  * that can print them; Cursor's, Devin's and pi's through
  * termag-agent-otel on a box that has it, with the replay id when there is
- * one. Anything else, bare. A Claude launch with neither a replay nor a
- * project stays bare too, so nothing changes for a caller that names none.
+ * one, and a spawned agent's spawn (spawnEnvPrefix). Anything else, bare.
  * A non-default backend first swaps in its launcher (onBackend), and a
  * chosen model goes in as `--model` right after the harness's word. Every
  * agent command starts with PANE_KIND_ENV; an empty one stays empty.
  */
-export function launchCommandFor(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models }: LaunchOptions): string {
+export function launchCommandFor(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models, spawn }: LaunchOptions): string {
   const id = replaySessionIdFrom(replaySessionId);
-  const env = resourceEnvPrefix(project, workstream);
+  const env = `${resourceEnvPrefix(project, workstream)}${spawnEnvPrefix(spawn)}`;
   const modelArgs = model && MODEL_ARG.test(model) ? ['--model', model] : [];
-  const bare = launchCommand === 'claude';
   const moved = onBackend(launchCommand, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models, id, env });
   if (moved && 'final' in moved) return moved.final;
   launchCommand = moved ? moved.command : withModel(launchCommand, modelArgs);
@@ -191,9 +242,16 @@ export function launchCommandFor(launchCommand: string, { replaySessionId, capab
   if (provider && OTEL_WRAPPED.has(provider) && capabilities.includes(AGENT_TELEMETRY_CAPABILITY)) {
     return `${PANE_KIND_ENV}${env}termag-agent-otel ${provider}${id ? ` --replay ${id}` : ''} -- ${launchCommand}`;
   }
-  if (!bare) return `${PANE_KIND_ENV}${launchCommand}`;
-  if ((!id && !env) || !capabilities.includes(TELEMETRY_REPLAY_CAPABILITY)) return `${PANE_KIND_ENV}${launchCommand}`;
+  // Every Claude command, not only a bare `claude`: a resume (`claude
+  // --continue`), a spawn's or a handoff's brief (`claude "$(cat …)"`) and a
+  // first prompt get the settings right after the harness's word, as --model
+  // does. Through the box script even with no replay and no project, since it
+  // names the pane's kind over the settings' `external` (the owner's resource,
+  // for sessions termag did not launch) and adds the checkout's repository and
+  // a spawn's ids.
+  const [first, ...rest] = launchCommand.split(' ');
+  if (first !== 'claude' || !capabilities.includes(TELEMETRY_REPLAY_CAPABILITY)) return `${PANE_KIND_ENV}${launchCommand}`;
   // `-` stands for "no replay": an older box script reads it as a bad id and
   // prints {}, the current one adds the project and workstream alone.
-  return [`${PANE_KIND_ENV}claude --settings "$(${PANE_KIND_ENV}${env}termag-credentials telemetry-launch ${id ?? '-'})"`, ...modelArgs].join(' ');
+  return [`${PANE_KIND_ENV}claude --settings "$(${PANE_KIND_ENV}${env}termag-credentials telemetry-launch ${id ?? '-'})"`, ...rest].join(' ');
 }

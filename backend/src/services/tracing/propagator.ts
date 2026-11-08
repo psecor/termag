@@ -11,8 +11,10 @@
 // nothing is injected into outbound calls unless the trace is recorded: with
 // tracing off, no trace header leaves the process.
 import { trace, TraceFlags, type Context, type TextMapGetter, type TextMapPropagator, type TextMapSetter } from '@opentelemetry/api';
+import { SESSION_COOKIE, LEGACY_SESSION_COOKIE } from '../../auth/sessionCookie';
 
-export const SESSION_COOKIE = 'termag.sid';
+// Production's name and dev's (auth/sessionCookie.ts).
+const SESSION_COOKIE_NAMES = [SESSION_COOKIE, LEGACY_SESSION_COOKIE];
 
 function header(getter: TextMapGetter, carrier: unknown, name: string): string | undefined {
   const v = getter.get(carrier, name);
@@ -24,7 +26,7 @@ export function carriesCredential(getter: TextMapGetter, carrier: unknown): bool
   if (header(getter, carrier, 'authorization')) return true;
   if (header(getter, carrier, 'x-amzn-oidc-data')) return true;
   const cookie = header(getter, carrier, 'cookie') ?? '';
-  return cookie.split(';').some(part => part.trim().startsWith(`${SESSION_COOKIE}=`));
+  return cookie.split(';').some(part => SESSION_COOKIE_NAMES.some(name => part.trim().startsWith(`${name}=`)));
 }
 
 /** The context with its span context's tracestate removed. */

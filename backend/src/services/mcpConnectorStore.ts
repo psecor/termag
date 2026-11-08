@@ -1,6 +1,6 @@
 /**
  * Database side of MCP connectors: the mcp_connectors
- * rows, their secrets in user_credentials, and the mcp-broker-enabled reads.
+ * rows and their secrets in user_credentials.
  * The rules live in mcpConnectors.ts; this file only reads and writes.
  */
 
@@ -9,21 +9,35 @@ import { prisma } from '../db';
 import {
   getCredentialStoreConfig, openCredential, readCredential, sealCredential, writeCredentials, deleteCredentials,
 } from './credentialStore';
+import { API_BROKER_FLAG } from './apiBroker';
 import { boolVariation, jsonVariation } from './featureFlags';
 import type { FlagUser } from './featureFlags';
-import { asSecrets, defaultConnectors, mcpCredentialProvider, MCP_BROKER_FLAG, MCP_DEFAULTS_FLAG, type DefaultConnector, type Secrets } from './mcpConnectors';
+import { loopbackAllowed, LOOPBACK_SERVERS_FLAG } from './mcpOAuthLoopback';
+import { asSecrets, defaultConnectors, mcpCredentialProvider, MCP_DEFAULTS_FLAG, type DefaultConnector, type Secrets } from './mcpConnectors';
 import { forgetOAuth, freshAccessToken, refreshTokens, revokeToken, type DiscoveredOAuth, type OAuthLockIo, type StoredOAuth } from './mcpOAuth';
 import { safeOAuthHttp } from './mcpOAuthHttp';
+import { MCP_SCOPE_LABELS_FLAG, parseScopeLabels, type ScopeLabels } from './mcpOAuthScopes';
 
 const LD_USER_SELECT = { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } as const;
 
-export function mcpBrokerEnabledForUser(user: FlagUser): Promise<boolean> {
-  return boolVariation(MCP_BROKER_FLAG, user, false);
+/** Scope labels for the scope checklist (the mcp-oauth-scope-labels flag); Slack's table while the flag serves nothing. */
+export async function scopeLabelsForUser(user: FlagUser): Promise<ScopeLabels> {
+  return parseScopeLabels(await jsonVariation(MCP_SCOPE_LABELS_FLAG, user, null));
 }
 
 /** The catalog of MCP servers this user is offered (the mcp-default-connectors flag); empty while it is off. */
 export async function catalogForUser(user: FlagUser): Promise<DefaultConnector[]> {
   return defaultConnectors(await jsonVariation(MCP_DEFAULTS_FLAG, user, null));
+}
+
+/**
+ * Whether this user links `upstream` by pasting the redirect: the
+ * mcp-oauth-loopback-servers flag, read for the user, lists it. Off (null)
+ * or [] lists nothing.
+ */
+export async function pasteLinkAllowed(userId: string, upstream: string): Promise<boolean> {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: LD_USER_SELECT });
+  return !!user && loopbackAllowed(await jsonVariation(LOOPBACK_SERVERS_FLAG, user, null), upstream);
 }
 
 async function boxContext(userId: string, instanceId: string) {
@@ -34,15 +48,19 @@ async function boxContext(userId: string, instanceId: string) {
   return user && instance ? { user, instance } : null;
 }
 
-/** The flag for the owner and the box, as ext_authz and delivery read it. */
-export async function mcpBrokerEnabledForBox(userId: string, instanceId: string): Promise<boolean> {
+/** api-broker-enabled for the user (Settings), and for the owner and the box (the API broker's check). */
+export async function apiBrokerEnabledForUser(user: FlagUser): Promise<boolean> {
+  return boolVariation(API_BROKER_FLAG, user, false);
+}
+
+export async function apiBrokerEnabledForBox(userId: string, instanceId: string): Promise<boolean> {
   const ctx = await boxContext(userId, instanceId);
-  return !!ctx && boolVariation(MCP_BROKER_FLAG, ctx.user, false, ctx.instance);
+  return !!ctx && boolVariation(API_BROKER_FLAG, ctx.user, false, ctx.instance);
 }
 
 export const CONNECTOR_SELECT = {
-  id: true, userId: true, name: true, upstream: true, authType: true, headerTemplates: true,
-  oauthMetadata: true, linkStatus: true, linkError: true, createdAt: true, updatedAt: true,
+  id: true, userId: true, name: true, displayName: true, upstream: true, authType: true, headerTemplates: true,
+  oauthMetadata: true, linkStatus: true, linkError: true, oauthScopes: true, createdAt: true, updatedAt: true,
 } as const;
 
 export function findConnector(id: string) {
@@ -137,8 +155,11 @@ export async function withOAuthLock<T>(
       remove: async () => {
         await tx.userCredential.deleteMany({ where: { userId, provider } });
       },
-      linked: async () => {
-        await tx.mcpConnector.updateMany({ where: { id: connectorId }, data: { linkStatus: 'linked', linkError: null } });
+      linked: async (scopes) => {
+        await tx.mcpConnector.updateMany({
+          where: { id: connectorId },
+          data: { linkStatus: 'linked', linkError: null, ...(scopes ? { oauthScopes: scopes as object } : {}) },
+        });
       },
       needsLink: async (reason) => {
         await tx.mcpConnector.updateMany({
@@ -203,18 +224,22 @@ export function oauthAccessToken(connector: { id: string; userId: string; upstre
 
 export const OAUTH_STATE_TTL_MS = 10 * 60_000;
 
-export async function createOAuthState(nonce: string, userId: string, connectorId: string, codeVerifier: string): Promise<void> {
+/** Where a sign-in's callback returns the browser: Settings (null) or the setup wizard. */
+export type OAuthReturnTo = 'welcome' | null;
+
+export async function createOAuthState(nonce: string, userId: string, connectorId: string, codeVerifier: string, scopes: string[], returnTo: OAuthReturnTo = null): Promise<void> {
   await prisma.mcpOAuthState.deleteMany({ where: { expiresAt: { lt: new Date() } } });
   await prisma.mcpOAuthState.create({
-    data: { id: nonce, userId, connectorId, codeVerifier, expiresAt: new Date(Date.now() + OAUTH_STATE_TTL_MS) },
+    data: { id: nonce, userId, connectorId, codeVerifier, scopes, returnTo, expiresAt: new Date(Date.now() + OAUTH_STATE_TTL_MS) },
   });
 }
 
 /** Deletes and returns the state row: a state works once, and only while fresh. */
 export async function consumeOAuthState(nonce: string) {
-  const rows = await prisma.$queryRaw<{ userId: string; connectorId: string; codeVerifier: string; expiresAt: Date }[]>`
+  const rows = await prisma.$queryRaw<{ userId: string; connectorId: string; codeVerifier: string; scopes: string[] | null; returnTo: string | null; expiresAt: Date }[]>`
     DELETE FROM mcp_oauth_states WHERE id = ${nonce}
-    RETURNING "userId", "connectorId", "codeVerifier", "expiresAt"`;
+    RETURNING "userId", "connectorId", "codeVerifier", "scopes", "returnTo", "expiresAt"`;
   const row = rows[0];
-  return row && row.expiresAt.getTime() > Date.now() ? row : null;
+  if (!row || row.expiresAt.getTime() <= Date.now()) return null;
+  return { ...row, scopes: row.scopes ?? [], returnTo: (row.returnTo === 'welcome' ? 'welcome' : null) as OAuthReturnTo };
 }

@@ -1,7 +1,7 @@
 // Cross-origin guard for the WebSocket upgrade handshake.
 //
 // The terminal (`/ws/terminal`) and status (`/ws/status`) sockets authenticate
-// from the browser's ambient `termag.sid` session cookie. That cookie is
+// from the browser's ambient session cookie (auth/sessionCookie.ts). That cookie is
 // `SameSite=Lax` and host-only, so a page on ANOTHER same-site origin (any
 // `*.example.com` host — a Spinnaker deploy box, a hosted sub-app, anything)
 // can open a WebSocket to the orchestrator and the browser will attach the
@@ -39,7 +39,19 @@ export function allowedWsOrigins(env: NodeJS.ProcessEnv = process.env): Set<stri
     // FRONTEND_URL unparseable: fall back to the dev default so local dev works.
     origins.add('http://localhost:5173');
   }
+  // A preview host (<name>.<PREVIEW_LINKS_DOMAIN>) runs
+  // someone's app: it never opens a termag socket, whatever the list says.
+  for (const o of origins) if (isPreviewOrigin(o, env)) origins.delete(o);
   return origins;
+}
+
+/** An origin in the preview domain, or the domain itself. */
+export function isPreviewOrigin(origin: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const domain = env.PREVIEW_LINKS_DOMAIN?.trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!domain) return false;
+  let host: string;
+  try { host = new URL(origin).hostname.toLowerCase(); } catch { return false; }
+  return host === domain || host.endsWith(`.${domain}`);
 }
 
 /**
@@ -54,4 +66,14 @@ export function isAllowedUpgradeOrigin(
 ): boolean {
   if (origin === undefined) return true;
   return allowedWsOrigins(env).has(origin);
+}
+
+/**
+ * The one origin termag's CORS answers for (index.ts): the UI's. Never a
+ * preview host's, so an app on one can't read termag's API with the
+ * viewer's cookie, even with FRONTEND_URL misconfigured into the preview domain.
+ */
+export function termagCorsOrigin(env: NodeJS.ProcessEnv = process.env): string | false {
+  const frontend = env.FRONTEND_URL ?? 'http://localhost:5173';
+  return isPreviewOrigin(frontend, env) ? false : frontend;
 }

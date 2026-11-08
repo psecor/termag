@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   applySecretsPatch, assertPatchFitsAuth, defaultConnectors, getMcpBrokerUrl, isPublicAddress, mcpCredentialProvider, McpConnectorError, parseUpstream,
-  referencedSecrets, relinkMessage, renderHeaders, upstreamTestAllow, validateConnectorName, validateHeaderTemplates,
-  validateSecretsPatch, validateUpstream,
+  CONNECTOR_NAME, connectorNaming, connectorSlug, referencedSecrets, relinkMessage, renderHeaders, upstreamTestAllow, validateConnectorName,
+  validateHeaderTemplates, validateSecretsPatch, validateUpstream,
 } from './mcpConnectors';
 
 const resolveTo = (...addresses: string[]) => async () => addresses;
@@ -15,6 +15,53 @@ describe('validateConnectorName', () => {
 
   it.each(['', 'Figma', '1abc', 'a_b', 'a b', 'a'.repeat(42), 'x.y', null])('refuses %j', (name) => {
     expect(() => validateConnectorName(name)).toThrow(McpConnectorError);
+  });
+});
+
+describe('connectorSlug', () => {
+  // Claude Code's rule first (anything but a letter, digit, _ or - becomes _),
+  // then what CONNECTOR_NAME, and so every box's termag-credentials, accepts.
+  it.each([
+    ['Claude Docs', 'claude-docs'],
+    ['figma', 'figma'],
+    ['GitHub', 'github'],
+    ['my_server', 'my-server'],
+    ['  Acme  /  Billing (prod)  ', 'acme-billing-prod'],
+    ['Café Menu', 'caf-menu'],
+    ['1Password', 'mcp-1password'],
+    ['--x--', 'x'],
+    ['a'.repeat(60), 'a'.repeat(41)],
+    [`${'a'.repeat(40)} b`, 'a'.repeat(40)],
+  ])('%j -> %j', (display, slug) => {
+    expect(connectorSlug(display)).toBe(slug);
+    expect(slug).toMatch(CONNECTOR_NAME);
+  });
+
+  it('is null when nothing usable is left', () => {
+    expect(connectorSlug('日本語')).toBeNull();
+    expect(connectorSlug('  ')).toBeNull();
+    expect(connectorSlug('!!!')).toBeNull();
+  });
+
+  it('leaves every valid connector name as it is, so existing connectors keep their mcp__<name>__ tool prefix', () => {
+    for (const name of ['figma', 'a-1', 'new-relic', 'x'.repeat(41), 'a--b', 'a-']) {
+      expect(CONNECTOR_NAME.test(name)).toBe(true);
+      expect(connectorSlug(name)).toBe(name);
+    }
+  });
+});
+
+describe('connectorNaming', () => {
+  it('keeps the display text, trimmed, and derives the slug from it', () => {
+    expect(connectorNaming('  Claude Docs ')).toEqual({ name: 'claude-docs', displayName: 'Claude Docs' });
+  });
+
+  it('stores no display name when the text is the slug itself', () => {
+    expect(connectorNaming('figma')).toEqual({ name: 'figma', displayName: null });
+  });
+
+  it.each([null, 42, '', '   ', '日本語', 'a'.repeat(81), 'tab\there', 'new\nline'])('refuses %j', (raw) => {
+    expect(() => connectorNaming(raw)).toThrow(McpConnectorError);
   });
 });
 
@@ -217,6 +264,36 @@ describe('defaultConnectors', () => {
       { name: 'ok', upstream: 'https://a.example/mcp' }, { name: 'ok', upstream: 'https://b.example/mcp' },
       { name: 'again', upstream: 'https://a.example/mcp' }, { name: 'two', upstream: 'https://b.example/mcp' },
     ])).toEqual([{ name: 'ok', upstream: 'https://a.example/mcp' }, { name: 'two', upstream: 'https://b.example/mcp' }]);
+  });
+
+  it('reads an optional label, the display name Settings shows; name stays the connector name', () => {
+    expect(json([{ name: 'claude-docs', label: ' Claude Docs ', upstream: 'https://docs.example/mcp' }]))
+      .toEqual([{ name: 'claude-docs', label: 'Claude Docs', upstream: 'https://docs.example/mcp' }]);
+  });
+
+  it('skips an entry whose label is not usable display text, or whose name is display text', () => {
+    expect(json([
+      { name: 'a', label: 42, upstream: 'https://a.example/mcp' },
+      { name: 'b', label: '', upstream: 'https://b.example/mcp' },
+      { name: 'Claude Docs', upstream: 'https://c.example/mcp' },
+      { name: 'ok', label: 'OK', upstream: 'https://d.example/mcp' },
+    ])).toEqual([{ name: 'ok', label: 'OK', upstream: 'https://d.example/mcp' }]);
+  });
+
+  it('names an entry by its name in the unknown-key warning, whether or not it has a label', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      json([
+        { name: 'warn-labelled', label: 'Warn Labelled', upstream: 'https://wl.example/mcp', extra: 1 },
+        { name: 'warn-plain', upstream: 'https://wp.example/mcp', extra: 1 },
+      ]);
+      expect(warn.mock.calls.map(c => c[0])).toEqual([
+        '[MCP] mcp-default-connectors flag: "warn-labelled": ignoring unknown key extra',
+        '[MCP] mcp-default-connectors flag: "warn-plain": ignoring unknown key extra',
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('ignores unknown keys (say, from a value written for a newer termag) and still offers the server', () => {

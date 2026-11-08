@@ -48,21 +48,28 @@ vi.mock('./spawns', () => ({
   parentsFor: async () => ({ status: 200, body: { links: [{ projectId: 'p-app', workstream: 'feature', parentProjectId: 'p-app', parentWorkstream: 'main' }] } }),
 }));
 const history = vi.hoisted(() => ({ answer: { status: 200, body: {} as unknown }, calls: [] as unknown[][] }));
+const turns = vi.hoisted(() => ({ calls: [] as unknown[][], owner: 'alice' }));
 vi.mock('./chat', () => ({
   chatHistoryFor: async (...args: unknown[]) => { history.calls.push(args); return history.answer; },
+  // The owner check's answer for p-app; any other project isn't the person's to see.
+  chatOwnerRefusal: async (userId: string, projectId: string) => {
+    turns.calls.push(['owner?', userId, projectId]);
+    if (projectId !== 'p-app') return { status: 404, body: { error: 'Project not found' } };
+    return userId === turns.owner ? null : { status: 403, body: { error: "Only the project's owner can continue this chat", code: 'not-owner' } };
+  },
+  chatSendFor: async (...args: unknown[]) => { turns.calls.push(['send', ...args]); return { status: 202, body: { queued: 0 } }; },
+  chatInterruptFor: async (...args: unknown[]) => { turns.calls.push(['interrupt', ...args]); return { status: 200, body: { interrupted: true } }; },
 }));
 const renamed = vi.hoisted(() => ({ calls: [] as unknown[][] }));
 vi.mock('../services/chatRunner', () => ({
-  SESSION_TITLES_FLAG: 'simple-ui-session-titles-enabled',
   renameSessionFor: async (...args: unknown[]) => {
     renamed.calls.push(args);
     return typeof args[2] === 'string' && args[2].trim() ? { title: args[2].trim(), titleAt: '2026-11-02T20:00:00.000Z' } : null;
   },
 }));
 vi.mock('../services/chatTranscriptStore', () => ({ VIEW_MAX_ENTRIES: 600 }));
-const flags = vi.hoisted(() => ({ titles: false }));
-vi.mock('../services/featureFlags', () => ({ boolVariation: async () => flags.titles }));
-vi.mock('../services/desktopAppFlag', () => ({ desktopAppEnabled: async () => true }));
+const liveChatFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('../services/desktopAppFlag', () => ({ desktopLiveChatEnabled: async () => liveChatFlag.on }));
 vi.mock('../services/status', () => ({ getAllStatuses: () => new Map() }));
 
 const { createPrismaCliChats } = await import('./cliChatsPrisma');
@@ -97,7 +104,6 @@ beforeEach(() => {
   ];
   listed.archived = [];
   db.projects = [];
-  flags.titles = false;
   history.calls = [];
 });
 
@@ -124,9 +130,7 @@ describe('GET /api/cli/v1/chats rows', () => {
     expect(pick('p-bob|main')).toMatchObject({ shared: true, boxId: 'box-b', box: null, directory: null, sessionId: 'sess-bob' });
   });
 
-  it('leads with Claude\'s title only where the titles flag is on', async () => {
-    expect((await chats.list(alice, { archived: false })).find(r => r.key === 'p-app|main')!.title).toBeNull();
-    flags.titles = true;
+  it('leads with Claude\'s title for the session', async () => {
     expect((await chats.list(alice, { archived: false })).find(r => r.key === 'p-app|main')!.title).toBe('Fix login');
   });
 
@@ -151,7 +155,7 @@ describe('GET /api/cli/v1/projects/:id/chat', () => {
   it('answers web\'s history for the person, with its cap', async () => {
     history.answer = { status: 200, body: { entries: [{ type: 'user' }], stored: true } };
     expect(await chats.history(alice, 'p-app', 'feature')).toEqual({ status: 200, body: { entries: [{ type: 'user' }], stored: true, entriesMax: 600 } });
-    expect(history.calls).toEqual([['alice', 'p-app', { workstream: 'feature' }, expect.objectContaining({ id: 'alice', defaultAgentProvider: 'claude' })]]);
+    expect(history.calls).toEqual([['alice', 'p-app', { workstream: 'feature' }]]);
   });
 
   it('passes a refusal through as it is', async () => {
@@ -190,5 +194,43 @@ describe('the desktop archives, reopens and renames a chat (H2d)', () => {
     const rows = await chats.list(alice, { archived: 'all' });
     expect(rows.filter(r => r.archived).map(r => r.key)).toEqual(['p-old|main']);
     expect(rows.some(r => r.key === 'p-app|main' && !r.archived)).toBe(true);
+  });
+});
+
+describe("the desktop's live chat: a turn on the chat's runner (desktop-live-chat-enabled)", () => {
+  beforeEach(() => { turns.calls = []; turns.owner = 'alice'; liveChatFlag.on = false; });
+
+  it('follows the flag for the person', async () => {
+    expect(await chats.liveChatEnabled(alice)).toBe(false);
+    liveChatFlag.on = true;
+    expect(await chats.liveChatEnabled(alice)).toBe(true);
+  });
+
+  it("sends the owner's turn as web's send does, with the full user for the turn's flags", async () => {
+    const body = { workstream: 'main', text: 'hi', model: 'opus', effort: 'high' };
+    expect(await chats.send(alice, 'p-app', body)).toEqual({ status: 202, body: { queued: 0 } });
+    expect(turns.calls).toEqual([
+      ['owner?', 'alice', 'p-app'],
+      ['send', 'alice', 'p-app', body, expect.objectContaining({ id: 'alice', defaultAgentProvider: 'claude' })],
+    ]);
+  });
+
+  it("stops the owner's turn as web's interrupt does", async () => {
+    expect(await chats.interrupt(alice, 'p-app', { workstream: 'main', scope: 'all' })).toEqual({ status: 200, body: { interrupted: true } });
+    expect(turns.calls).toEqual([['owner?', 'alice', 'p-app'], ['interrupt', 'alice', 'p-app', { workstream: 'main', scope: 'all' }]]);
+  });
+
+  it("refuses a collaborator and another's project before anything is sent or held", async () => {
+    turns.owner = 'bob';
+    expect(await chats.send(alice, 'p-app', { text: 'hi' })).toMatchObject({ status: 403, body: { code: 'not-owner' } });
+    expect(await chats.interrupt(alice, 'p-app', {})).toMatchObject({ status: 403, body: { code: 'not-owner' } });
+    expect((await chats.send(alice, 'p-x', { text: 'hi' })).status).toBe(404);
+    expect(turns.calls.filter(c => c[0] !== 'owner?')).toEqual([]);
+  });
+
+  it('reads a body that is not an object as an empty one', async () => {
+    await chats.send(alice, 'p-app', ['hi']);
+    await chats.interrupt(alice, 'p-app', null);
+    expect(turns.calls.filter(c => c[0] !== 'owner?').map(c => c[3])).toEqual([{}, {}]);
   });
 });

@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FlagUser } from './featureFlags';
 import { prisma } from '../db';
-import { boolVariation } from './featureFlags';
 import {
   boxCreationRefusal,
   boxGateState,
@@ -12,10 +11,6 @@ import {
 
 vi.mock('../db', () => ({
   prisma: { userCredential: { findUnique: vi.fn() } },
-}));
-
-vi.mock('./featureFlags', () => ({
-  boolVariation: vi.fn(),
 }));
 
 const REFUSAL = {
@@ -52,17 +47,13 @@ const USER: FlagUser = {
 };
 
 describe('boxGateState and boxCreationRefusal', () => {
-  it.each<[boolean, boolean, boolean, BoxGateState]>([
-    [false, false, false, 'off'],
-    [false, false, true, 'off'],
-    [false, true, false, 'off'],
-    [false, true, true, 'off'],
-    [true, false, false, 'off'],
-    [true, false, true, 'off'],
-    [true, true, true, 'clear'],
-    [true, true, false, 'blocked'],
-  ])('required=%s flagOn=%s hasGithubCredential=%s → %s', (required, flagOn, hasGithubCredential, state) => {
-    const facts = { required, flagOn, hasGithubCredential };
+  it.each<[boolean, boolean, BoxGateState]>([
+    [false, false, 'off'],
+    [false, true, 'off'],
+    [true, true, 'clear'],
+    [true, false, 'blocked'],
+  ])('required=%s hasGithubCredential=%s → %s', (required, hasGithubCredential, state) => {
+    const facts = { required, hasGithubCredential };
     expect(boxGateState(facts)).toBe(state);
     if (state === 'blocked') expect(boxCreationRefusal(facts)).toEqual(REFUSAL);
     else expect(boxCreationRefusal(facts)).toBeNull();
@@ -90,33 +81,26 @@ describe('githubRequiredForBoxes', () => {
 
 describe('readBoxCreationFacts', () => {
   beforeEach(() => {
-    vi.mocked(boolVariation).mockReset();
     vi.mocked(prisma.userCredential.findUnique).mockReset();
   });
 
-  it('reports a stored github row and reads the flag with fallback false', async () => {
-    vi.mocked(boolVariation).mockResolvedValue(true);
+  it('reports a stored github row', async () => {
     vi.mocked(prisma.userCredential.findUnique).mockResolvedValue({ provider: 'github' } as never);
     const facts = await readBoxCreationFacts(USER);
-    expect(boolVariation).toHaveBeenCalledWith('repo-first-gate-enabled', USER, false);
     expect(prisma.userCredential.findUnique).toHaveBeenCalledWith({
       where: { userId_provider: { userId: USER.id, provider: 'github' } },
       select: { provider: true },
     });
-    expect(facts.flagOn).toBe(true);
     expect(facts.hasGithubCredential).toBe(true);
   });
 
-  it('reports no row, and still looks the row up when the flag is off', async () => {
-    vi.mocked(boolVariation).mockResolvedValue(false);
+  it('reports no row', async () => {
     vi.mocked(prisma.userCredential.findUnique).mockResolvedValue(null);
     const facts = await readBoxCreationFacts(USER);
-    expect(boolVariation).toHaveBeenCalledWith('repo-first-gate-enabled', USER, false);
     expect(prisma.userCredential.findUnique).toHaveBeenCalledWith({
       where: { userId_provider: { userId: USER.id, provider: 'github' } },
       select: { provider: true },
     });
-    expect(facts.flagOn).toBe(false);
     expect(facts.hasGithubCredential).toBe(false);
   });
 });

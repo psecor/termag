@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { chatTurnChoice, claudeLaunchModel, claudeModelArg, parseClaudeChatModel, resolvedChatTier, storedChatChoice } from './claudeChatModel';
+import { chatTurnChoice, claudeLaunchModel, claudeModelArg, defaultLaunchTier, parseClaudeChatModel, resolvedChatTier, storedChatChoice } from './claudeChatModel';
 
 const PINS = {
   CLAUDE_GATEWAY_URL: 'https://gateway.example/bedrock',
@@ -37,6 +37,19 @@ describe('resolvedChatTier', () => {
   it('otherwise keeps the stored tier', () => {
     expect(resolvedChatTier('opus')).toBe('opus');
     expect(resolvedChatTier('haiku')).toBe('haiku');
+  });
+});
+
+describe('defaultLaunchTier', () => {
+  it("is the gateway's CLAUDE_DEFAULT_MODEL tier for an owner on the gateway: what a turn with no --model runs on", () => {
+    expect(defaultLaunchTier(true, PINS)).toBe('opus');
+    expect(defaultLaunchTier(true, { ...PINS, CLAUDE_DEFAULT_MODEL: 'haiku' })).toBe('haiku');
+  });
+
+  it('is Sonnet off the gateway, with no gateway, or with no default tier configured', () => {
+    expect(defaultLaunchTier(false, PINS)).toBe('sonnet');
+    expect(defaultLaunchTier(true, {})).toBe('sonnet');
+    expect(defaultLaunchTier(true, { ...PINS, CLAUDE_DEFAULT_MODEL: '' })).toBe('sonnet');
   });
 });
 

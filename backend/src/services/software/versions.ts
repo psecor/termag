@@ -5,16 +5,22 @@
  * 2026-10-15). termag commits and images compare against their own targets:
  * the newest box image's commit for agents, the newest orchestrator image's
  * commit for the orchestrator, the running orchestrator for web clients.
+ * Kernels compare within their track and host kind (kernelTrack, below), and
+ * `reboot` is the one component whose bad state is `pending`.
  */
 
-export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'missing' | 'unknown';
+export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'pending' | 'missing' | 'unknown';
+/** What "needs updating" counts, as the tab's NEEDS_UPDATE does: a pending reboot is an update not yet running. */
+export const NEEDS_UPDATE_STATES: ReadonlySet<SoftwareState> = new Set<SoftwareState>(['behind', 'outdated', 'pending']);
+/** Every state, in the order the tab counts them. */
+export const SOFTWARE_STATES: readonly SoftwareState[] = ['current', 'behind', 'outdated', 'ahead', 'pending', 'missing', 'unknown'];
 
 /** Display order; anything else sorts after, by name. */
 export const COMPONENT_ORDER = [
   'termag', 'termag-checkout', 'image', 'hooks',
   'claude', 'codex', 'cursor-agent', 'devin', 'pi',
   'node', 'npm', 'gh', 'aws', 'tmux', 'git', 'docker', 'python',
-  'nginx', 'envoy', 'otelcol', 'postgres', 'os', 'kernel',
+  'nginx', 'envoy', 'otelcol', 'postgres', 'os', 'kernel', 'kernel-installed', 'reboot',
 ];
 /** Components whose version is a termag commit sha. */
 export const COMMIT_COMPONENTS = new Set(['termag', 'termag-checkout', 'image']);
@@ -72,6 +78,51 @@ export function toolState(o: Observed | null, reference: string | null): Softwar
   return a[0] === r[0] && (a[1] ?? 0) === (r[1] ?? 0) ? 'behind' : 'outdated';
 }
 
+/**
+ * Whether a client version is a clean build: the CLI's and TUI's come from git
+ * (cli/buildVersion.mjs) as `0.1.158+30755492`, with `.dirty` for local
+ * changes and `+unknown` without the history. A version with no build
+ * metadata (metaterm's, a CLI from before) counts as clean.
+ */
+export function isCleanBuild(version: string): boolean {
+  const i = version.indexOf('+');
+  if (i < 0) return true;
+  const meta = version.slice(i + 1);
+  return meta !== 'unknown' && !meta.endsWith('.dirty');
+}
+
+/**
+ * A client version without its build metadata, for ordering: as in semver,
+ * what follows `+` never orders builds. parseVersion would otherwise read on
+ * into a sha that starts with digits (`0.1.158+1a2b3c4d` as 0.1.158.1).
+ */
+const withoutBuild = (version: string) => version.split('+')[0];
+
+/** The fleet reference for a client kind: the newest clean build, else the newest of any; the first seen wins a tie. */
+export function clientReference(versions: string[]): string | null {
+  const newest = (vs: string[]) => {
+    let best: string | null = null;
+    for (const v of vs) {
+      if (!parseVersion(withoutBuild(v))) continue;
+      if (best === null || (compareVersions(withoutBuild(v), withoutBuild(best)) ?? 0) > 0) best = v;
+    }
+    return best;
+  };
+  return newest(versions.filter(isCleanBuild)) ?? newest(versions);
+}
+
+/**
+ * A client version against its fleet reference: toolState's grading of the
+ * numbers before `+`, except that a build with the reference's number and
+ * different build metadata can't be ordered against it (`0.1.158+aaaaaaaa`
+ * on a branch and `0.1.158+bbbbbbbb` on main, or the reference with `.dirty`
+ * local changes), so it is `unknown`, not `current`.
+ */
+export function clientState(version: string, reference: string | null): SoftwareState {
+  const s = toolState({ version: withoutBuild(version), ok: true }, reference === null ? null : withoutBuild(reference));
+  return s === 'current' && version !== reference ? 'unknown' : s;
+}
+
 /** A termag commit against its target. Commits only say equal or not. */
 export function commitState(sha: string | null | undefined, target: string | null | undefined): SoftwareState {
   if (!sha) return 'unknown';
@@ -126,4 +177,78 @@ export type HostKindName = 'orchestrator' | 'box' | 'agent';
  */
 export function termagReference(kind: HostKindName, t: { boxImageCommit: string | null; orchestratorImageCommit: string | null; runningCommit: string | null }): string | null {
   return kind === 'box' ? t.boxImageCommit ?? t.runningCommit : t.orchestratorImageCommit ?? t.runningCommit;
+}
+
+/** The components a kernel reference covers: the running kernel and the newest installed one. */
+export const KERNEL_COMPONENTS = new Set(['kernel', 'kernel-installed']);
+
+/**
+ * A kernel's track: major.minor and flavour of its release, `6.8.0-1067-aws` → `6.8-aws`,
+ * `7.0.0-1014-aws` → `7.0-aws`, `6.8.0-147-generic` → `6.8-generic`. Box images pin 6.8 (the GA
+ * kernel, for hibernation) while the orchestrator's runs the rolling 7.x, so a 6.8 box on the newest
+ * 6.8 build is current, not "outdated" against 7.0. Null for anything that isn't a kernel release.
+ */
+export function kernelTrack(release: string | null | undefined): string | null {
+  const m = /^(\d+)\.(\d+)\.\d+-\d+(?:-([a-z0-9]+(?:-[a-z0-9]+)*))?$/.exec((release ?? '').trim());
+  return m ? `${m[1]}.${m[2]}-${m[3] ?? 'generic'}` : null;
+}
+
+/**
+ * Which kernels compare with each other: a box with boxes, the orchestrator with its per-user agents
+ * (they run on its host, so report its kernel), each on one track.
+ */
+export const kernelGroup = (kind: 'orchestrator' | 'box' | 'agent', release: string | null | undefined): string | null => {
+  const t = kernelTrack(release);
+  return t ? `${kind === 'box' ? 'box' : 'orchestrator'}:${t}` : null;
+};
+
+export interface KernelSighting { kind: 'orchestrator' | 'box' | 'agent'; running: string | null; installed: string | null }
+
+/**
+ * The newest kernel per group, from every host's running kernel and newest installed one, so a box
+ * that installed a newer build makes the others on its track `behind` before it has rebooted.
+ */
+export function kernelReferences(hosts: KernelSighting[]): Map<string, string> {
+  const refs = new Map<string, string>();
+  for (const h of hosts) {
+    for (const v of [h.running, h.installed]) {
+      const g = kernelGroup(h.kind, v);
+      if (!g || !v) continue;
+      const cur = refs.get(g);
+      if (!cur || (compareVersions(v, cur) ?? 0) > 0) refs.set(g, v);
+    }
+  }
+  return refs;
+}
+
+/**
+ * A host's kernel (running or installed) against its group's newest; a newer kernel installed on the
+ * host itself counts too, whatever its track, since that is what its next boot runs (a rolling kernel
+ * moving 6.17 → 7.0 shows `outdated` until the reboot).
+ */
+export function kernelState(kind: KernelSighting['kind'], version: string | null, ok: boolean, path: string | null | undefined, refs: Map<string, string>, ownInstalled: string | null = null): SoftwareState {
+  if (!ok) return path ? 'unknown' : 'missing';
+  const g = kernelGroup(kind, version);
+  if (!g || !version) return 'unknown';
+  let ref = refs.get(g) ?? version;
+  if (ownInstalled && kernelTrack(ownInstalled) && (compareVersions(ownInstalled, ref) ?? 0) > 0) ref = ownInstalled;
+  return toolState({ version, ok: true }, ref);
+}
+
+/** The `reboot` row: `pending` while the host waits on a reboot, `current` when it doesn't. */
+export function rebootState(version: string | null, ok: boolean, path: string | null | undefined): SoftwareState {
+  if (!ok) return path ? 'unknown' : 'missing';
+  return version === 'pending' ? 'pending' : version === 'no' ? 'current' : 'unknown';
+}
+
+/** Since when a pending reboot has waited, from the row's raw (`since 2026-11-02T06:10:00Z · …`). */
+export function rebootPendingSince(raw: string | null | undefined): string | null {
+  const m = /\bsince (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)/.exec(raw ?? '');
+  return m ? m[1] : null;
+}
+
+/** The kernel reference column: one newest build per group, boxes first. */
+export function kernelReferenceText(refs: Map<string, string>): string | null {
+  const list = [...refs].sort(([a], [b]) => (a.startsWith('box:') === b.startsWith('box:') ? a.localeCompare(b) : a.startsWith('box:') ? -1 : 1));
+  return list.length ? list.map(([g, v]) => `${g.split(':')[0]} ${v}`).join(' · ') : null;
 }

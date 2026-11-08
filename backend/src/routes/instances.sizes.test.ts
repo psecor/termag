@@ -29,12 +29,19 @@ vi.mock('../middleware/auth', () => ({
 vi.mock('../services/boxProvisioner', () => ({ provisionBox: vi.fn(), terminateBox: vi.fn(), isBoxProvisioningConfigured: () => true }));
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(), reconcileWarmPool: vi.fn() }));
 vi.mock('../services/agentRegistry', () => ({ sendToInstanceAgent: vi.fn(), isInstanceAgentConnected: () => false }));
-vi.mock('../services/warmPoolClaim', () => ({ claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled' }));
+vi.mock('../services/warmPoolClaim', () => ({ claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {} }));
 
 // Each repository's .termag/environment.json, and EC2's match for requirements.
 const files = vi.hoisted(() => ({ byRepo: {} as Record<string, { sizes: unknown; warnings: string[] }> }));
 vi.mock('../services/repoEnvironment', () => ({
   repoSizesFor: vi.fn(async (_user: string, repo: string | null) => (repo && files.byRepo[repo]) || { sizes: null, warnings: [] }),
+}));
+vi.mock('../services/environments', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/environments')>(),
+  prismaEnvironmentStore: {
+    byName: vi.fn(async (name: string) => (name === 'full-stack' ? { id: 'e1', name, visibility: 'personal', ownerUserId: 'ada', kind: 'pointer', file: { repo: 'acme/tiny', branch: null, path: 'e.json' } } : null)),
+  },
+  resolveStoredEnvironment: vi.fn(async (_user: string, env: { name: string }) => (env.name === 'full-stack' ? { repos: [], sizes: { size: 'large' }, warnings: [] } : { repos: [], sizes: null, warnings: [] })),
 }));
 const matches = vi.hoisted(() => ({ ok: true }));
 vi.mock('../services/boxRequirements', async (importOriginal) => ({
@@ -122,5 +129,14 @@ describe('GET /api/instances/sizes', () => {
     flag.byUser = { ada: 'large' };
     expect(await sizesFor('ada', 'https://github.com/acme/disky')).toMatchObject({ enabled: true, defaultSize: 'large', disk: { diskGiB: 250 } });
     expect(await sizesFor('ada', 'https://github.com/acme/tiny')).toMatchObject({ defaultSize: 'small', disk: { diskGiB: 120 } });
+  });
+
+  it("preselects an environment's file size for ?environment=, and 404s one there is none of", async () => {
+    flag.byUser = { ada: 'small' };
+    const get = (q: string) => fetch(`${base}/sizes?${q}`, { headers: { 'x-user': 'ada' } });
+    expect(await (await get('environment=full-stack&repo=https%3A%2F%2Fgithub.com%2Facme%2Ftiny')).json()).toMatchObject({ defaultSize: 'large', defaultSource: 'repo' });
+    const missing = await get('environment=nope');
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toMatchObject({ code: 'environment_not_found' });
   });
 });

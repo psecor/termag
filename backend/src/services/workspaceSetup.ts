@@ -22,16 +22,19 @@ import { claimUpdateRunning, claimUpdateSettled } from './claimUpdateGate';
 import { parseCloneStatusFrame, toSetupStatus } from './projectSetup';
 import { resolveProjectRoot } from './projectPaths';
 import {
-  aggregateSetup,
   decideRepoReport,
+  guideRepos,
   isCloneRefusal,
+  JOIN_FAILED,
   repoNameError,
+  settledSetup,
   WORKSPACE_CLONE_CAPABILITY,
   WORKSPACE_UNSUPPORTED,
   workspaceGuide,
 } from './projectRepos';
 import { templateForRepoUrl } from './projectTemplates';
 import * as tmux from './tmux';
+import { WORKSPACE_STATIC_ROOT_CAPABILITY, staticCheckoutRoot, staticLayoutDecision } from './staticLayout';
 
 const CLONE_RPC_TIMEOUT_MS = 30_000;
 
@@ -69,15 +72,47 @@ export function workspaceRoot(row: { name: string; user: { unixUsername: string 
  * for a project root only) and the generated guide.
  */
 export async function writeGuide(
-  row: { name: string; userId: string; instanceId: string | null; user: { unixUsername: string }; instance: { hostHome: string | null } | null },
+  row: { id: string; name: string; userId: string; instanceId: string | null; user: { unixUsername: string }; instance: { hostHome: string | null } | null },
   repos: ReadonlyArray<{ name: string; url: string; position: number }>,
   workstream = 'main',
   branch = workstream,
-): Promise<void> {
+  staticRoot: string | null = null,
+): Promise<{ staticLayout?: unknown; staticRefused?: unknown } | null> {
   const guide = workspaceGuide({ project: row.name, workstream, branch, repos });
-  await sendForProject({ userId: row.userId, instanceId: row.instanceId }, 'init-workspace', {
-    dir: workspaceRoot(row, workstream), guide,
-  });
+  // staticRoot: the static layout's ~/code, which the project root becomes a link to (services/staticLayout.ts).
+  return await sendForProject({ userId: row.userId, instanceId: row.instanceId }, 'init-workspace', {
+    dir: workspaceRoot(row, workstream), guide, ...(staticRoot ? { staticRoot, projectId: row.id } : {}),
+  }) as { staticLayout?: unknown; staticRefused?: unknown } | null;
+}
+
+/**
+ * The repositories a workstream root's guide lists, by the worktrees the box
+ * finds in it (guideRepos). Read before a rename moves the root; a box that
+ * cannot say leaves the guide to the repositories with a checkout.
+ */
+export async function workstreamGuideRepos<R extends { name: string; setupStatus: string; setupError?: string | null }>(
+  host: { userId: string; instanceId: string | null },
+  wsRoot: string,
+  repos: ReadonlyArray<R>,
+): Promise<R[]> {
+  try {
+    const state = await sendForProject(host, 'workspace-root-state', { wsRoot, repos: repos.map(r => r.name) }, 10_000) as { present?: string[] };
+    if (Array.isArray(state?.present)) return guideRepos(repos, { present: state.present });
+  } catch { /* the fallback below */ }
+  return guideRepos(repos);
+}
+
+/** The static layout's root (~/code) for this workspace, or null for its own directory (services/staticLayout.ts). */
+async function staticRootFor(row: WorkspaceRow, capabilities: readonly string[]): Promise<string | null> {
+  if (row.dir) return row.dir;
+  const others = row.environmentId
+    ? await prisma.project.count({ where: { instanceId: row.instanceId, archived: false, id: { not: row.id } } })
+    : 0;
+  if (!staticLayoutDecision(row, row.instance, capabilities, others, WORKSPACE_STATIC_ROOT_CAPABILITY).use) return null;
+  const root = staticCheckoutRoot(resolveProjectRoot({ ownerUnixUser: row.user.unixUsername, hostHome: row.instance.hostHome }));
+  // Never a root another project on the box records, an archived one's included (the box checks its owner file too).
+  if (await prisma.project.count({ where: { instanceId: row.instanceId, dir: root, id: { not: row.id } } }) > 0) return null;
+  return root;
 }
 
 /** Sends one repository's clone. Null once sent, or lost in transit (the next hello sends it again); the box's refusal otherwise. */
@@ -133,7 +168,22 @@ export async function dispatchWorkspace(projectId: string): Promise<'dispatched'
     }
     const todo = row.repos.filter(r => r.setupStatus === 'pending' || r.setupStatus === 'cloning');
     if (todo.length === 0) return 'nothing';
-    await writeGuide(row, row.repos);
+    // A ready project's root is there; its guides are rewritten once an added repository has joined (joinRepo).
+    if (row.setupStatus !== 'ready') {
+      // On a box made from an environment for this project the root is ~/code, the project's directory a link to it,
+      // so every clone below lands at ~/code/<repo> (services/staticLayout.ts). Asked before the first clone.
+      const staticRoot = await staticRootFor(row, view.capabilities);
+      const answer = await writeGuide(row, row.repos, 'main', 'main', staticRoot);
+      if (staticRoot && answer?.staticLayout === true && row.dir !== staticRoot) {
+        await prisma.project.update({ where: { id: row.id }, data: { dir: staticRoot } });
+        console.log(`[WORKSPACE] ${row.id}: root at ${staticRoot}, linked from ${workspaceRoot(row)}`);
+      } else if (staticRoot && answer && answer.staticLayout !== true) {
+        // Refused, or an agent that ignores staticRoot: the root is the project's own folder, so a recorded ~/code is
+        // forgotten and the steps run there.
+        console.warn(`[WORKSPACE] ${row.id}: not the static layout: ${String(answer.staticRefused ?? 'the box did not take it')}`);
+        if (row.dir) await prisma.project.update({ where: { id: row.id }, data: { dir: null } });
+      }
+    }
     let refused = 0;
     for (const repo of todo) {
       const refusal = await dispatchRepo(row, repo);
@@ -158,10 +208,10 @@ export async function dispatchWorkspace(projectId: string): Promise<'dispatched'
 async function settleAggregate(projectId: string): Promise<void> {
   const row = await loadWorkspace(projectId);
   if (!row) return;
-  const next = aggregateSetup(row.repos);
   const from = row.setupStatus;
-  if (next.status === from && (next.error ?? null) === (row.setupError ?? null)) return;
-  if (next.status === 'ready' && from !== 'ready') {
+  const next = settledSetup(from, row.setupError ?? null, row.repos);
+  if (!next) return;
+  if (next.status === 'ready') {
     await writeGuide(row, row.repos).catch(() => {});
     const launched = await launchProjectSessions(
       { projectId: row.id, instanceId: row.instanceId },
@@ -191,16 +241,23 @@ export async function applyRepoReport(instanceId: string, msg: Record<string, un
   await serialize(frame.projectId, async () => {
     const repo = await prisma.projectRepo.findFirst({
       where: { projectId: frame.projectId, name: repoName, project: { instanceId, archived: false, layout: 'workspace' } },
+      include: { project: { select: { setupStatus: true } } },
     });
     if (!repo) return;
     const report = frame.report;
-    const decision = decideRepoReport(repo, {
+    let decision = decideRepoReport(repo, {
       attempt: frame.attempt,
       status: report.status,
       error: report.status === 'failed' ? report.error : null,
       branch: report.status === 'ready' ? report.branch : null,
     });
     if (decision.kind === 'ignore') return;
+    // Added to a project already in use: ready only once every workstream has a worktree of it.
+    // Until then the row stays cloning, so a reconnect's resent report joins it again.
+    if (decision.status === 'ready' && repo.project.setupStatus === 'ready') {
+      const joined = await joinRepo(frame.projectId, repoName);
+      if (joined) decision = { ...decision, status: 'failed', error: joined };
+    }
     const { count } = await prisma.projectRepo.updateMany({
       where: { id: repo.id, setupStatus: repo.setupStatus, setupAttempt: repo.setupAttempt },
       data: {
@@ -213,6 +270,53 @@ export async function applyRepoReport(instanceId: string, msg: Record<string, un
     console.log(`[WORKSPACE] ${frame.projectId}/${repoName}: ${repo.setupStatus} -> ${decision.status}`);
     await settleAggregate(frame.projectId);
   });
+}
+
+/**
+ * A repository added to a project in use, once cloned: a worktree of it in
+ * every workstream root on that workstream's branch (branched off its
+ * checkout's HEAD, as Branch off does), then every generated guide rewritten
+ * to list it. A workstream whose root is not on the box is skipped. Null when
+ * it all went, else what failed; the worktrees made stay, and Retry, whose
+ * clone finds the checkout already there, joins the rest (an existing
+ * worktree on the branch is reused).
+ */
+async function joinRepo(projectId: string, repoName: string): Promise<string | null> {
+  const row = await loadWorkspace(projectId);
+  if (!row) return null;
+  const host = { userId: row.userId, instanceId: row.instanceId };
+  const root = workspaceRoot(row);
+  const workstreams = await prisma.workstream.findMany({
+    // An ask's chat has no tree of its own (services/askChat.ts).
+    where: { projectId, name: { not: 'main' }, askThread: null }, select: { name: true, branch: true }, orderBy: { createdAt: 'asc' },
+  });
+  const failures: string[] = [];
+  const present: Array<{ name: string; branch: string; repos: string[] }> = [];
+  const names = row.repos.map(r => r.name);
+  for (const ws of workstreams) {
+    const wsRoot = workspaceRoot(row, ws.name);
+    let state: { exists?: boolean; present?: string[] } | undefined;
+    try {
+      state = await sendForProject(host, 'workspace-root-state', { wsRoot, repos: names }, 10_000) as typeof state;
+      if (state?.exists !== true) continue;
+      const here = { ...ws, repos: (state.present ?? []).filter(n => n !== repoName) };
+      present.push(here);
+      await sendForProject(host, 'git-worktree-add', {
+        projectDir: `${root}/${repoName}`, worktreeName: ws.name, worktreePath: `${wsRoot}/${repoName}`, branch: ws.branch, baseRef: 'HEAD', initRepo: false,
+      }, 30_000);
+      here.repos.push(repoName);
+    } catch (err) {
+      failures.push(`${ws.name}: ${(err as Error).message}`);
+    }
+  }
+  await writeGuide(row, guideRepos(row.repos, { joined: repoName })).catch(() => {});
+  for (const ws of present) await writeGuide(row, guideRepos(row.repos, { present: ws.repos }), ws.name, ws.branch).catch(() => {});
+  if (failures.length > 0) {
+    console.error(`[WORKSPACE] ${projectId}/${repoName}: joining workstreams failed: ${failures.join('; ')}`);
+    return `${JOIN_FAILED} ${failures.join('; ')}`;
+  }
+  console.log(`[WORKSPACE] ${projectId}/${repoName}: joined ${present.length} workstream(s)`);
+  return null;
 }
 
 /**

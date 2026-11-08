@@ -13,9 +13,6 @@ import type { PresignerIdentity } from '../services/spaces/spaceObjects';
 
 let store: MemorySpaceStore;
 let objects: MemorySpaceObjects;
-let enabled: Set<string>;
-let sharing: Set<string>;
-let memory: Set<string>;
 let unavailable = false;
 let identities: PresignerIdentity[];
 /** Live file changes the router sent (onFileChange), for the open views a change must reach. */
@@ -35,9 +32,6 @@ beforeAll(async () => {
       identities.push(identity);
       return objects;
     },
-    enabled: async userId => enabled.has(userId),
-    sharing: async userId => sharing.has(userId),
-    memoryEnabled: async userId => memory.has(userId),
     caller: r => {
       const user = r.get('x-user');
       if (!user) return null;
@@ -51,7 +45,6 @@ beforeAll(async () => {
   app.use('/termag/files', spaceFilesRouter({
     store: liveStore as MemorySpaceStore,
     objects: async () => objects,
-    enabled: async userId => enabled.has(userId),
     userId: r => r.get('x-user') ?? null,
     viewerAllowed: () => true,
   }));
@@ -65,9 +58,6 @@ afterAll(() => new Promise<void>(resolve => server.close(() => resolve())));
 beforeEach(() => {
   store = new MemorySpaceStore();
   objects = new MemorySpaceObjects();
-  enabled = new Set(['alice', 'bob', 'carol']);
-  sharing = new Set(['alice', 'bob', 'carol']);
-  memory = new Set(['alice', 'bob', 'carol']);
   unavailable = false;
   identities = [];
   store.addUser('alice');
@@ -92,25 +82,15 @@ async function createSpace(name = 'assets', as = 'alice') {
   return r.body.space as { id: string; name: string };
 }
 
-describe('the flag and authentication', () => {
+describe('authentication', () => {
   it('answers 401 with no caller', async () => {
     expect((await call('GET', '/')).status).toBe(401);
   });
 
-  it('answers 404 on every route while spaces-enabled is off for the user', async () => {
-    await createSpace();
-    enabled.delete('alice');
-    expect((await call('GET', '/', { as: 'alice' })).status).toBe(404);
-    expect((await call('GET', '/assets', { as: 'alice' })).status).toBe(404);
-    expect((await call('POST', '/', { as: 'alice', body: { name: 'other' } })).status).toBe(404);
-  });
-
-  it('checks the flag for a box\'s owner', async () => {
+  it('lists a box\'s spaces as its owner\'s', async () => {
     const s = await createSpace();
     await call('POST', `/${s.name}/boxes`, { as: 'alice', body: { box: 'alice-box' } });
     expect((await call('GET', '/', { as: 'alice', box: 'alicebox' })).body.spaces).toHaveLength(1);
-    enabled.delete('alice');
-    expect((await call('GET', '/', { as: 'alice', box: 'alicebox' })).status).toBe(404);
   });
 
   it('answers 503 when the AWS identity cannot be read, without failing database routes', async () => {
@@ -190,24 +170,6 @@ describe('members', () => {
     expect(r.body.members).toEqual(expect.arrayContaining([expect.objectContaining({ userId: 'bob', role: 'editor' })]));
   });
 
-  it('refuses adding a member or an invite while spaces-sharing-enabled is off for the owner', async () => {
-    await createSpace();
-    sharing.delete('alice');
-    const created = await call('POST', '/', { as: 'alice', body: { name: 'solo' } });
-    expect(created.body.sharing).toBe(false);
-    expect((await call('GET', '/assets/members', { as: 'alice' })).body).toEqual(expect.objectContaining({ sharing: false }));
-    for (const email of ['bob@example.com', 'dave@example.com']) {
-      const r = await call('POST', '/assets/members', { as: 'alice', body: { email, role: 'viewer' } });
-      expect(r.status).toBe(403);
-      expect(r.body.code).toBe('sharing_disabled');
-    }
-    expect((await call('GET', '/assets/members', { as: 'alice' })).body).toEqual(expect.objectContaining({
-      members: [expect.objectContaining({ userId: 'alice', role: 'owner' })], invites: [],
-    }));
-    expect((await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } })).status).toBe(201);
-    expect((await call('POST', '/assets/members', { as: 'bob', body: { email: 'carol@example.com', role: 'viewer' } })).status).toBe(404);
-  });
-
   it('adds a signed-in user at once and an unknown email as a pending invite', async () => {
     await createSpace();
     const added = await call('POST', '/assets/members', { as: 'alice', body: { email: 'BOB@example.com', role: 'viewer' } });
@@ -217,7 +179,6 @@ describe('members', () => {
     const invited = await call('POST', '/assets/members', { as: 'alice', body: { email: 'dave@example.com', role: 'editor' } });
     expect(invited.body.invite).toMatchObject({ email: 'dave@example.com', role: 'editor' });
     store.addUser('dave');
-    enabled.add('dave');
     expect((await call('GET', '/', { as: 'dave' })).body.spaces[0]).toMatchObject({ name: 'assets', role: 'editor' });
     expect(store.inviteRows).toEqual([]);
   });
@@ -226,7 +187,6 @@ describe('members', () => {
     await createSpace();
     await call('POST', '/assets/members', { as: 'alice', body: { email: 'dave@example.com', role: 'viewer' } });
     store.addUser('dave');
-    enabled.add('dave');
     expect((await call('GET', '/assets', { as: 'dave' })).body.space.role).toBe('viewer');
   });
 
@@ -657,9 +617,23 @@ describe('files', () => {
     await call('POST', '/assets/boxes', { as: 'alice', body: { box: 'alice-box' } });
     objects.put(`${s.id}/a.txt`, 1);
     await call('POST', '/assets/files/download', { as: 'alice', box: 'alicebox', body: { path: 'a.txt' } });
-    expect(store.eventRows.at(-1)).toMatchObject({ action: 'file.get', actorUserId: 'alice', actorInstanceId: 'alicebox', via: null });
+    // A box (the CLI) acts for itself, on no surface.
+    expect(store.eventRows.at(-1)).toMatchObject({ action: 'file.get', actorUserId: 'alice', actorInstanceId: 'alicebox', via: null, surface: null, onBehalfOfUserId: null });
+    // So does the web UI.
+    await call('POST', '/assets/files/download', { as: 'alice', body: { path: 'a.txt' } });
+    expect(store.eventRows.at(-1)).toMatchObject({ action: 'file.get', actorInstanceId: null, surface: null, onBehalfOfUserId: null });
     const events = await call('GET', '/assets/events', { as: 'alice' });
-    expect(events.body.events[0]).toMatchObject({ action: 'file.get', actorInstanceId: 'alicebox' });
+    expect(events.body.events[1]).toMatchObject({ action: 'file.get', actorInstanceId: 'alicebox', surface: null, onBehalfOfUserId: null });
+  });
+
+  it('returns where an event came from and whom it was for, and null for older events', async () => {
+    const s = await createSpace();
+    // An event as every writer before spaces in Slack records it.
+    await store.recordEvent({ spaceId: s.id, actorUserId: 'alice', action: 'space.rename' });
+    await store.recordEvent({ spaceId: s.id, actorUserId: 'alice', action: 'slack.channel_link', surface: 'slack', onBehalfOfUserId: 'bob', note: 'linkedVia=slack_command' });
+    const events = (await call('GET', '/assets/events', { as: 'alice' })).body.events;
+    expect(events[0]).toMatchObject({ action: 'slack.channel_link', surface: 'slack', onBehalfOfUserId: 'bob', note: 'linkedVia=slack_command' });
+    expect(events[1]).toMatchObject({ action: 'space.rename', surface: null, onBehalfOfUserId: null });
   });
 });
 
@@ -678,21 +652,9 @@ describe('space memory (docs/space-memory.md)', () => {
     return call('POST', '/assets/files/uploaded', { as, box: opts.box, body: { path, ...(opts.note ? { note: opts.note } : {}) } });
   }
 
-  it('answers 404 space_memory_off while space-memory-enabled is off for the caller, a box\'s owner included', async () => {
-    await memorySpace();
-    memory.delete('alice');
-    const r = await call('GET', '/assets/memory', { as: 'alice', box: 'alicebox' });
-    expect(r).toEqual({ status: 404, body: expect.objectContaining({ code: 'space_memory_off' }) });
-    expect((await call('GET', '/assets/memory/log', { as: 'alice' })).body.code).toBe('space_memory_off');
-    // Files work as before: the flag gates loading, not the space.
-    expect((await call('GET', '/assets/tree', { as: 'alice', box: 'alicebox' })).status).toBe(200);
-  });
-
   it('still hides a space the caller has no role in', async () => {
     await memorySpace();
     store.addUser('dave');
-    memory.add('dave');
-    enabled.add('dave');
     expect((await call('GET', '/assets/memory', { as: 'dave' })).body.code).toBe('not_found');
   });
 

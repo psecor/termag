@@ -353,6 +353,7 @@ export const prismaSpaceStore: SpaceStore = {
         via: e.via ?? null, action: e.action, path: e.path ?? null,
         bytes: e.bytes === null || e.bytes === undefined ? null : BigInt(e.bytes),
         versionId: e.versionId ?? null, note: e.note ?? null,
+        surface: e.surface ?? null, onBehalfOfUserId: e.onBehalfOfUserId ?? null,
       },
     });
   },

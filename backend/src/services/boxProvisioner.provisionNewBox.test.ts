@@ -42,7 +42,7 @@ describe('provisionNewBox: the re-check inside the transaction', () => {
   it('asks stillNeeded with the rows the transaction sees, and creates nothing when it says no', async () => {
     tx.instance.findMany.mockResolvedValue([onItsWay]);
     const stillNeeded = vi.fn(() => false);
-    await expect(provisionNewBox(user, 'claude-20261007', stillNeeded, { image: { kind: 'published' }, hibernation: false })).resolves.toBeNull();
+    await expect(provisionNewBox(user, 'claude-20261007', stillNeeded, { image: { kind: 'published' } })).resolves.toBeNull();
     expect(stillNeeded).toHaveBeenCalledWith([onItsWay]);
     expect(tx.instance.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { userId: 'u1', status: { not: 'terminated' } },
@@ -55,7 +55,7 @@ describe('provisionNewBox: the re-check inside the transaction', () => {
     vi.unstubAllEnvs();
     vi.stubEnv('BOX_VPC_ID', '');
     const stillNeeded = vi.fn(() => true);
-    await expect(provisionNewBox(user, 'claude-20261007', stillNeeded, { image: { kind: 'published' }, hibernation: false })).resolves.toBeNull();
+    await expect(provisionNewBox(user, 'claude-20261007', stillNeeded, { image: { kind: 'published' } })).resolves.toBeNull();
     expect(stillNeeded).not.toHaveBeenCalled();
     expect(tx.instance.create).not.toHaveBeenCalled();
   });

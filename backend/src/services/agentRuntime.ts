@@ -1,7 +1,7 @@
 import * as tmux from './tmux';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from './agentRegistry';
 import { launchCommandFor, PANE_KIND_ENV } from './launchCommand';
-import { claimSpawnLaunch, isParkedSpawn, releaseSpawnLaunch, unparkOnLaunch } from './agentSpawnStore';
+import { claimSpawnLaunch, isParkedSpawn, releaseSpawnLaunch, spawnTelemetryFor, unparkOnLaunch } from './agentSpawnStore';
 import { watchLaunchedSpawn } from './spawnStatusLog';
 import { spawnFolderTrust } from './agentSpawn';
 import { claimHandoffLaunch, releaseHandoffLaunch } from './agentHandoffStore';
@@ -10,7 +10,8 @@ import { PROVIDERS, isBackendFor } from '../providers/registry';
 import { isClaudeCode, isModelFor } from './modelChoices';
 import { fireworksContext, fireworksMenuArg, type FireworksModels } from './fireworksGateway';
 import { fireworksModelsForBox } from './fireworksFlag';
-import { refusalLine } from './launchCommand';
+import { refusalLine, resumeOrFresh } from './launchCommand';
+import { NOTICE_SAFE } from './toolUpdate/notice';
 import { classifyForeground } from './foregroundProbe';
 import { refuseUnreadySessions, SessionGateError, type SetupAdmission } from './sessionGate';
 import { recordProductEvent } from './productEvents';
@@ -165,6 +166,13 @@ interface AgentRuntimeContext {
    */
   resumeSessionId?: string;
   /**
+   * One line the pane shows before the launch: a tool update's relaunch says
+   * the tool was updated and why (services/toolUpdate/notice.ts). Typed only
+   * when it passes NOTICE_SAFE, as an `echo` of a quoted string; a bridge
+   * pane's (Codex) goes to the agent, which types it after its clear.
+   */
+  notice?: string;
+  /**
    * What the agent's first launch starts on, when the user wrote it (a new
    * workstream for a PR, services/firstPrompt.ts). A spawn's brief or a
    * handoff wins; a provider without promptLaunch launches bare.
@@ -208,7 +216,7 @@ export function launchChoice(
   if (!fireworks) {
     return {
       backend: b, model: null,
-      refusal: refusalLine(`termag: Fireworks models are not on for you (feature flags fireworks-enabled and fireworks-models); switch this workstream to the default backend, or ask for access`),
+      refusal: refusalLine(`termag: Fireworks models are not on for you (flag fireworks-models); switch this workstream to the default backend, or ask for access`),
     };
   }
   const m = model && fireworks.models.some(x => x.id === model) ? model : fireworks.defaultModel;
@@ -283,6 +291,7 @@ async function launchUnlocked({
   spawnId,
   resume,
   resumeSessionId,
+  notice: noticeIn,
   firstPrompt,
   backend: backendOverride,
   model: modelOverride,
@@ -302,6 +311,7 @@ async function launchUnlocked({
 
   const config = PROVIDERS[provider];
   if (!config) throw new Error(`Unknown provider: ${provider}`);
+  const notice = noticeIn && NOTICE_SAFE.test(noticeIn) ? noticeIn : null;
 
   const projDir = tmux.projectDirFor(
     { name: projectName, user: { unixUsername }, instance: { hostHome: hostHome ?? null } },
@@ -359,9 +369,16 @@ async function launchUnlocked({
       // agent that predates it ignores the field and starts fresh. Only a tool
       // update's relaunch passes one, and only to a box whose agent announces
       // tool-update-codex-v1, which came with it.
+      // A spawned workstream's spawn too (termag.spawn.*, as spawnEnvPrefix
+      // types it for the other providers): agent.js puts it in the bridge's
+      // environment as TERMAG_SPAWN_*; an older agent ignores the field.
+      const spawn = await spawnTelemetryFor({ userId, projectId: setup?.id ?? null, workstream });
       await sendForProject(project, 'codex-session-start', {
         sessionName: mainSession, cwd: projDir, project: projectName, workstream,
+        ...(spawn ? { spawn } : {}),
         ...(resume && resumeSessionId ? { resumeSessionId } : {}),
+        // An older agent ignores it, and the pane relaunches without the line.
+        ...(notice ? { notice } : {}),
       });
     } else {
       const capabilities = instanceId ? instanceAgentTransport(instanceId)?.capabilities ?? [] : [];
@@ -387,9 +404,12 @@ async function launchUnlocked({
         ? { backend: backendOverride ?? null, model: modelOverride ?? null }
         : setup ? await workflowChoice(setup.id, workstream) : { backend: null, model: null };
       const on = await resolveLaunch(provider, row.backend, row.model, userId, instanceId);
+      // A spawned workstream's every launch names its spawn on the resource (termag.spawn.*).
+      const spawn = await spawnTelemetryFor({ userId, projectId: setup?.id ?? null, workstream });
       const launch = on.refusal
-        ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? prompted ?? fresh, { replaySessionId, capabilities, provider, project: projectName, workstream, ...on });
-      const keys = preLaunch ? `${preLaunch} && ${launch}` : launch;
+        ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? prompted ?? fresh, { replaySessionId, capabilities, provider, project: projectName, workstream, spawn, ...on });
+      const launched = preLaunch ? `${preLaunch} && ${launch}` : launch;
+      const keys = notice ? `${refusalLine(notice)}; ${launched}` : launched;
       // A spawned child's status history from its first turn on (services/spawnStatusLog.ts).
       await watchLaunchedSpawn({ userId, projectId: setup?.id ?? null, workstream, session: mainSession, instanceId });
       try {
@@ -592,12 +612,24 @@ async function reconstructAgentSessions(
             }
             const handedOff = claim;
             const on = await resolveLaunch(provider, wf.backend, wf.model, userId, instanceId);
+            const spawn = await spawnTelemetryFor({ userId, projectId: project.id, workstream: wsName });
+            const opts = { capabilities, provider, project: project.name, workstream: wsName, spawn, ...on };
+            const brief = spawned?.command ?? handedOff?.command;
+            // A resume that needs a conversation the cwd may not have
+            // (Claude Code's --continue) falls back to a fresh launch, so a
+            // pane with nothing to continue is not left failing on every reconnect.
+            const resumed = !brief && config?.resumeCommand
+              ? (config.resumeNeedsConversation
+                ? resumeOrFresh(launchCommandFor(config.resumeCommand, opts), launchCommandFor(config.launchCommand, opts))
+                : launchCommandFor(config.resumeCommand, opts))
+              : null;
             const launchCmd = on.refusal
-              ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? config?.resumeCommand ?? config?.launchCommand ?? provider, { capabilities, provider, project: project.name, workstream: wsName, ...on });
+              ?? resumed
+              ?? launchCommandFor(brief ?? config?.launchCommand ?? provider, opts);
 
             await watchLaunchedSpawn({ userId, projectId: project.id, workstream: wsName, session: mainSession, instanceId });
             if (config?.needsBridge) {
-              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: project.name, workstream: wsName });
+              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: project.name, workstream: wsName, ...(spawn ? { spawn } : {}) });
             } else {
               try {
                 await sendForProject(projectHost, 'tmux-send-keys', { sessionName: mainSession, keys: launchCmd, withEnter: true });
@@ -685,9 +717,11 @@ export async function stopAgentSessions({
   const mainSession = tmux.sessionName(unixUsername, projectName, 'agent', workstream);
   const ctrlSession = tmux.sessionName(unixUsername, projectName, 'ctrl', workstream);
   // The review panes (routes/review.ts, every slot)
+  // and the user's terminal slots past the ctrl pane
   // hang off the agent workflow and must die with it, or a reviewer keeps
-  // burning tokens in a pane nobody can see.
+  // burning tokens in a pane nobody can see and stray shells outlive their tabs.
   const reviewSessions = tmux.reviewSessionNames(unixUsername, projectName, workstream);
+  const terminalSlots = tmux.terminalSessionNames(unixUsername, projectName, workstream).slice(1);
   const project = { userId, instanceId };
 
   if (config?.needsPoller) {
@@ -698,10 +732,16 @@ export async function stopAgentSessions({
     if (config?.needsBridge) {
       await sendForProject(project, 'codex-session-stop', { sessionName: mainSession }).catch(() => {});
     }
-    await sendForProject(project, 'tmux-kill', { sessionName: mainSession }).catch(() => {});
-    await sendForProject(project, 'tmux-kill', { sessionName: ctrlSession }).catch(() => {});
+    await sendForProject(project, 'tmux-kill', { sessionName: mainSession, exact: true }).catch(() => {});
+    // `exact: true` (not a wrapped name): the agent's kill stops the Codex
+    // bridge by the PLAIN name first, and gives tmux the exact target — a bare
+    // `…-ctrl` would prefix-match `…-ctrl-2` (a terminal slot)
+    // once its own pane is gone.
+    await sendForProject(project, 'tmux-kill', { sessionName: ctrlSession, exact: true }).catch(() => {});
     // Exact targets: a bare `…-review` would prefix-match `…-review-2` once its own pane is gone.
     await Promise.all(reviewSessions.map(name =>
+      sendForProject(project, 'tmux-kill', { sessionName: tmux.exactPaneTarget(name) }).catch(() => {})));
+    await Promise.all(terminalSlots.map(name =>
       sendForProject(project, 'tmux-kill', { sessionName: tmux.exactPaneTarget(name) }).catch(() => {})));
     return;
   }
@@ -714,4 +754,25 @@ export async function stopAgentSessions({
   await tmux.killSession(mainSession);
   await tmux.killSession(ctrlSession);
   for (const name of reviewSessions) await tmux.killSession(name);
+  for (const name of terminalSlots) await tmux.killSession(name);
+}
+
+/**
+ * Kill a workstream's terminal slots past the ctrl pane
+ * without touching the agent workflow — for a teardown that is not a workflow
+ * stop, like a workstream's delete with no agent attached: the tabs belong to
+ * the workstream, not to any workflow. Exact targets, both paths.
+ */
+export async function stopTerminalSlots({ userId, unixUsername, projectName, instanceId, workstream }: {
+  userId: string; unixUsername: string; projectName: string; instanceId: string | null; workstream: string;
+}): Promise<void> {
+  const names = tmux.terminalSessionNames(unixUsername, projectName, workstream).slice(1);
+  const project = { userId, instanceId };
+  if (isProjectAgentConnected(project)) {
+    await Promise.all(names.map(name =>
+      sendForProject(project, 'tmux-kill', { sessionName: tmux.exactPaneTarget(name) }).catch(() => {})));
+    return;
+  }
+  if (instanceId) return;
+  for (const name of names) await tmux.killSession(name).catch(() => {});
 }

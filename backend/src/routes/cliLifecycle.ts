@@ -18,12 +18,29 @@ import type { CliUser } from '../services/cliStore';
 import { parseAskRef } from '../services/agentMessages';
 import { resolveStartFrom } from '../services/projectTemplates';
 import { CHAT_PROVIDER_ID, SELECTABLE_PROVIDER_IDS, isSelectableProvider } from '../providers/registry';
+import { parseClaudeChatModel, type ClaudeChatTier } from '../services/claudeChatModel';
+import { isClaudeCode } from '../services/modelChoices';
 import type { CliWorkstreamRequest } from '../services/cliWorkstreams';
 import type { CliAuth } from './cliApi';
 import type { RouteResult } from './routeResult';
 
 /** What a box or project was made for, when its creator says: only asks so far. */
 export type CreatedFor = 'ask';
+
+/**
+ * `model` in a project create body (`termag project create --model`, `termag
+ * ask --new-box --model`): the Claude tier the project's main workstream
+ * starts on (Workflow.model), its agent pane and its chat alike. Absent is
+ * none (Sonnet in the chat, Claude Code's default in a pane); only for
+ * Claude Code's agents.
+ */
+export function parseProjectModel(body: unknown, agent: string): { model: ClaudeChatTier | null } | { error: string } {
+  const raw = body && typeof body === 'object' ? (body as Record<string, unknown>).model : undefined;
+  const parsed = parseClaudeChatModel(raw);
+  if (!parsed.ok) return { error: parsed.error };
+  if (parsed.model && !isClaudeCode(agent)) return { error: `model is a Claude model; ${agent} is not Claude Code` };
+  return { model: parsed.model };
+}
 
 /** `createdFor` in a create body: absent is null; anything but a known purpose is an error. */
 export function parseCreatedFor(body: unknown): { createdFor: CreatedFor | null } | { error: string } {
@@ -45,6 +62,12 @@ export interface CliCreateBoxInput {
   diskGiB?: number;
   repoUrls?: string[];
   flavor?: unknown;
+  /** An environment's name instead of repoUrls: its one file sizes the box. */
+  environment?: string;
+  /** termag setup (services/boxSetup.ts): false turns it off. */
+  setupEnabled?: unknown;
+  /** The CLI states the repos' environment.json setupEnabled, so createBox may apply it. */
+  useRepoSetup?: boolean;
 }
 
 export interface CliLifecycle {
@@ -53,6 +76,8 @@ export interface CliLifecycle {
    * sign-in. size: as sent, validated by createBox (services/boxSize.ts);
    * repoUrls: the repositories a project made with it starts from, for its size.
    * diskGiB: as sent, a number createBox checks the range of (services/boxDiskSize.ts).
+   * setupEnabled: services/boxSetup.ts, passed through unchecked; useRepoSetup:
+   * the CLI states the repos' setupEnabled, so createBox may apply it.
    * The fields are CliCreateBoxInput (below) — the body their POST carries,
    * one field per concept.
    */
@@ -80,12 +105,15 @@ export interface CliLifecycle {
   boxSizes(user: CliUser, repo: unknown): Promise<RouteResult>;
   /** POST /api/instances/:id/resize's checks and job (services/boxResize.ts): 202 with the box and its resize. */
   resizeBox(user: CliUser, boxId: string, input: { size: string; force: boolean }): Promise<RouteResult>;
+  /** POST /api/instances/:id/disk's checks and grow (services/boxDisk.ts): 202 with the box and its grow. */
+  growBoxDisk(user: CliUser, boxId: string, input: { sizeGb: number }): Promise<RouteResult>;
   /**
    * createdFor: what the project was made for ('ask'), recorded on it; marks a
    * project that already existed too. repoUrls: two or more, a multi-repo
-   * project (instead of repoUrl).
+   * project (instead of repoUrl). environment: an environment's name, whose
+   * repositories the project holds (instead of either).
    */
-  createProject(user: CliUser, input: { boxId: string; name: string; agent: string; repoUrl?: string; repoUrls?: string[]; createdFor?: CreatedFor | null; chatSpace?: string | null }): Promise<RouteResult>;
+  createProject(user: CliUser, input: { boxId: string; name: string; agent: string; repoUrl?: string; repoUrls?: string[]; environment?: string; environmentRepos?: unknown; createdFor?: CreatedFor | null; chatSpace?: string | null; model?: ClaudeChatTier }): Promise<RouteResult>;
   renameProject(user: CliUser, projectId: string, name: string): Promise<RouteResult>;
   archiveProject(user: CliUser, projectId: string): Promise<RouteResult>;
   /** A workstream in one of the user's own projects, as the web UI's Branch off… makes it. */
@@ -95,8 +123,11 @@ export interface CliLifecycle {
    * its branch unmerged; keepBranch: leave the branch whatever force says.
    */
   removeWorkstream(user: CliUser, projectId: string, name: string, opts: { force: boolean; keepBranch: boolean }): Promise<RouteResult>;
-  /** The web UI's Retry on a failed clone (POST /api/projects/:id/clone/retry): 202 with the project, its `clone` restarted. */
-  retryClone(user: CliUser, projectId: string): Promise<RouteResult>;
+  /**
+   * The web UI's Retry on a failed clone (POST /api/projects/:id/clone/retry): 202 with the project, its `clone` restarted.
+   * opts.setupEnabled: a relaunched box's termag setup, over the failed box's.
+   */
+  retryClone(user: CliUser, projectId: string, opts?: { setupEnabled?: boolean }): Promise<RouteResult>;
 }
 
 /**
@@ -166,6 +197,18 @@ async function repoUrlFrom(lifecycle: CliLifecycle, user: CliUser, from: string)
   return lifecycle.projectRepoUrl(user, ref.box, ref.project);
 }
 
+/**
+ * `environment` in a body (`--environment <name>`): the name, or none. It
+ * names the repositories itself, so it goes without `from`.
+ */
+function environmentField(body: unknown, froms: readonly string[]): { environment?: string } | { error: string } {
+  const value = (body as Record<string, unknown> | undefined)?.environment;
+  if (value === undefined || value === null || value === '') return {};
+  if (typeof value !== 'string' || !value.trim()) return { error: 'environment must be an environment name' };
+  if (froms.length) return { error: 'environment names the repositories itself; leave out from' };
+  return { environment: value.trim() };
+}
+
 /** The most repositories a project holds. */
 const MAX_FROMS = 8;
 
@@ -198,7 +241,8 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
   // start from (`project create --new-box --from`), resolved as POST
   // /projects does, so the box gets that repository's size; a list of them
   // for a multi-repo project, whose largest the box takes. `diskGiB`: the
-  // root disk (`--disk`), else the repositories' or the default.
+  // root disk (`--disk`), else the repositories' or the default. `environment`: an
+  // environment's name instead, whose one file sizes the box.
   router.post('/boxes', bearer, asyncHandler(async (req, res) => {
     const name = stringField(req.body, 'name');
     if (!name) { badRequest(res, 'name required'); return; }
@@ -212,6 +256,8 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     const { user, credential } = cliAuth(res);
     const from = fromField(body);
     if ('error' in from) { badRequest(res, from.error); return; }
+    const env = environmentField(body, from.froms);
+    if ('error' in env) { badRequest(res, env.error); return; }
     const sources = await repoUrlsFrom(lifecycle, user, from.froms);
     if (!('repoUrls' in sources)) { send(res, sources); return; }
 
@@ -224,6 +270,11 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     if (diskGiB !== undefined) input.diskGiB = diskGiB;
     if (body.flavor !== undefined) input.flavor = body.flavor;
     if (sources.repoUrls.length > 0) input.repoUrls = sources.repoUrls;
+    if (env.environment) input.environment = env.environment;
+    // termag setup: as sent, and whether the CLI states the repos' setting.
+    const { setupEnabled, useRepoSetup } = body as { setupEnabled?: unknown; useRepoSetup?: unknown };
+    if (setupEnabled !== undefined) input.setupEnabled = setupEnabled;
+    if (useRepoSetup === true) input.useRepoSetup = true;
     send(res, await lifecycle.createBox(user, input, credential.kind === 'box' ? credential.boxId : null, purpose.createdFor));
   }));
 
@@ -294,6 +345,22 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     send(res, await lifecycle.resizeBox(user, req.params.id, { size, force }));
   }));
 
+  // Growing the disk doesn't stop the box, but it is the owner's to pay for: a
+  // box's own credential grows only a box it created, as for resize.
+  router.post('/boxes/:id/disk', bearer, asyncHandler(async (req, res) => {
+    const sizeGb = (req.body as { sizeGb?: unknown } | undefined)?.sizeGb;
+    if (typeof sizeGb !== 'number' || !Number.isInteger(sizeGb)) { badRequest(res, 'sizeGb required (a whole number of GB)'); return; }
+    const { user, credential } = cliAuth(res);
+    if (credential.kind === 'box' && (!credential.boxId || await lifecycle.boxParent(user, req.params.id) !== credential.boxId)) {
+      res.status(403).json({
+        error: "A box's own credentials can only grow the disk of a box they created; run `termag box resize --disk` where you've run `termag login`",
+        code: 'forbidden',
+      });
+      return;
+    }
+    send(res, await lifecycle.growBoxDisk(user, req.params.id, { sizeGb }));
+  }));
+
   router.delete('/boxes/:id', bearer, asyncHandler(async (req, res) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind === 'box' && (!credential.boxId || await lifecycle.boxParent(user, req.params.id) !== credential.boxId)) {
@@ -319,15 +386,23 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     const createdFor = purpose.createdFor ? { createdFor: purpose.createdFor } : {};
     const from = fromField(req.body);
     if ('error' in from) { badRequest(res, from.error); return; }
+    const env = environmentField(req.body, from.froms);
+    if ('error' in env) { badRequest(res, env.error); return; }
     const space = chatSpaceField(req.body);
     if ('error' in space) { badRequest(res, space.error); return; }
+    const picked = parseProjectModel(req.body, agent);
+    if ('error' in picked) { badRequest(res, picked.error); return; }
+    const model = picked.model ? { model: picked.model } : {};
     const user = cliAuth(res).user;
-    if (!from.froms.length) { send(res, await lifecycle.createProject(user, { boxId, name, agent, ...createdFor, ...space })); return; }
+    // An environment's checkouts as the caller read them (an ask's must be: services/environments.ts withEnvironmentRepos).
+    const pin = 'environment' in env && env.environment && (req.body as Record<string, unknown>)?.environmentRepos !== undefined
+      ? { environmentRepos: (req.body as Record<string, unknown>).environmentRepos } : {};
+    if (!from.froms.length) { send(res, await lifecycle.createProject(user, { boxId, name, agent, ...env, ...pin, ...createdFor, ...space, ...model })); return; }
     const sources = await repoUrlsFrom(lifecycle, user, from.froms);
     if (!('repoUrls' in sources)) { send(res, sources); return; }
     // Several sources: a multi-repo project holding exactly those repositories.
     const repos = sources.repoUrls.length > 1 ? { repoUrls: sources.repoUrls } : { repoUrl: sources.repoUrls[0] };
-    send(res, await lifecycle.createProject(user, { boxId, name, agent, ...repos, ...createdFor, ...space }));
+    send(res, await lifecycle.createProject(user, { boxId, name, agent, ...repos, ...createdFor, ...space, ...model }));
   }));
 
   router.post('/projects/:id/rename', bearer, asyncHandler(async (req, res) => {
@@ -379,6 +454,7 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
   }));
 
   router.post('/projects/:id/clone/retry', bearer, asyncHandler(async (req, res) => {
-    send(res, await lifecycle.retryClone(cliAuth(res).user, req.params.id));
+    const setupEnabled = (req.body as { setupEnabled?: unknown } | undefined)?.setupEnabled;
+    send(res, await lifecycle.retryClone(cliAuth(res).user, req.params.id, typeof setupEnabled === 'boolean' ? { setupEnabled } : {}));
   }));
 }

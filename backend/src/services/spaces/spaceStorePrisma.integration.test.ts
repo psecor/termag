@@ -78,4 +78,14 @@ describe.skipIf(!adminUrl)('space listings against Postgres', () => {
     expect(await prisma.projectSpace.findMany({ where: { projectId: 'p2' } })).toEqual([]);
     expect(await store.listedBoxes('s1')).toEqual(['granted']);
   });
+
+  it('records and reads back where an event came from and whom it was for (spaces in Slack)', async () => {
+    await store.recordEvent({ spaceId: 's1', actorUserId: 'u1', action: 'slack.channel_link', surface: 'slack', onBehalfOfUserId: 'u2', note: 'linkedVia=web' });
+    await store.recordEvent({ spaceId: 's1', actorUserId: 'u1', action: 'file.put', path: 'a.md' });
+    const events = await store.events('s1', { limit: 10 });
+    const slack = events.find(e => e.action === 'slack.channel_link');
+    const plain = events.find(e => e.action === 'file.put');
+    expect(slack).toMatchObject({ action: 'slack.channel_link', surface: 'slack', onBehalfOfUserId: 'u2', note: 'linkedVia=web' });
+    expect(plain).toMatchObject({ action: 'file.put', surface: null, onBehalfOfUserId: null });
+  });
 });

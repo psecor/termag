@@ -14,11 +14,13 @@ import { hasSession, sendKeys, capturePaneForSlack } from '../slack/tmuxAgent';
 import { isAmbiguousSession, operationScopeForResolvedSession, resolveSessionProject } from '../services/sessionResolver';
 import { setNotificationTarget } from '../slack/lts';
 import { getActiveProjectId, guessActiveProjectId, setActiveProjectId } from '../slack/events';
+import { clearActiveTarget } from '../slack/activeTargets';
 import { isAgentConnected, sendToAgent } from '../services/agentRegistry';
 import { ensureAgentSessionsAndLaunch } from '../services/agentRuntime';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { isAdminUser } from '../services/admin/adminAccess';
 import { projectSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { LISTED_PROJECT_KINDS, listedOrNull } from '../services/projectKind';
 
 
 // Emoji → keystroke mapping (matches Slack)
@@ -239,7 +241,7 @@ export function registerDiscordEvents(client: Client): void {
     // /t projects
     if (userCommand === 'projects') {
       const projects = await prisma.project.findMany({
-        where: { userId: termagUser.id, archived: false },
+        where: { userId: termagUser.id, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
         include: { workflows: true },
         orderBy: { name: 'asc' },
       });
@@ -261,7 +263,7 @@ export function registerDiscordEvents(client: Client): void {
     if (userCommand.startsWith('switch ')) {
       const projectName = userCommand.slice(7).trim();
       const named = await prisma.project.findMany({
-        where: { name: projectName, userId: termagUser.id, archived: false },
+        where: { name: projectName, userId: termagUser.id, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
         include: { workflows: true },
       });
       if (named.length === 0) {
@@ -308,7 +310,10 @@ export function registerDiscordEvents(client: Client): void {
         await interaction.reply(`No tmux session \`${target}\`.`);
         return;
       }
-      if (resolved.projectId) setActiveProjectId(discordUserId, resolved.projectId, 'main', 'discord');
+      // Attaching shows the pane; only a listed project becomes the saved target (projectKind.ts inProjectLists).
+      if (resolved.projectId && listedOrNull(await prisma.project.findUnique({ where: { id: resolved.projectId }, select: { kind: true } }))) {
+        setActiveProjectId(discordUserId, resolved.projectId, 'main', 'discord');
+      }
 
       setNotificationTarget(target, { channel: interaction.channelId, userId: discordUserId }, 'discord', resolved.instanceId);
       const pane = await capturePaneForSlack(target, 200, opScope);
@@ -326,7 +331,8 @@ export function registerDiscordEvents(client: Client): void {
         await interaction.reply('No active project. Use `/t switch <name>` first.');
         return;
       }
-      const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+      // A saved target on a space orchestrator reads as gone, as in Slack (projectKind.ts inProjectLists).
+      const project = listedOrNull(await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } }));
       if (!project) { await interaction.reply('Project not found.'); return; }
       if (!(await mayReach(project.id))) { await interaction.reply({ content: unreachable(project), ephemeral: true }); return; }
 
@@ -362,7 +368,15 @@ export function registerDiscordEvents(client: Client): void {
     let hostInstance: string | null = null;
 
     if (projectId) {
-      const project = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+      const saved = await prisma.project.findUnique({ where: { id: projectId }, include: { user: true } });
+      // A saved target on a space orchestrator is gone, as in Slack (projectKind.ts
+      // inProjectLists): clear it and say so, never type somewhere else instead.
+      if (saved && !listedOrNull(saved)) {
+        clearActiveTarget('discord', discordUserId);
+        await interaction.reply('The project you switched to is gone. Use `/t projects` and `/t switch <name>` to pick another.');
+        return;
+      }
+      const project = saved;
       if (project && !(await mayReach(project.id))) {
         await interaction.reply({ content: unreachable(project), ephemeral: true });
         return;
@@ -374,8 +388,9 @@ export function registerDiscordEvents(client: Client): void {
         agentSession = `term-${discordUserId}`;
       }
     } else {
+      // What `/t projects` lists, so never a space orchestrator (projectKind.ts inProjectLists).
       const first = await prisma.project.findFirst({
-        where: { archived: false, userId: termagUser.id, workflows: { some: { type: 'agent' } } },
+        where: { archived: false, kind: { in: LISTED_PROJECT_KINDS }, userId: termagUser.id, workflows: { some: { type: 'agent' } } },
         include: { user: true },
         orderBy: { name: 'asc' },
       });

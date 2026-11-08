@@ -33,6 +33,9 @@ describe('parseRecipe', () => {
   it('defaults to the workstream\'s webapp dev stack', () => {
     expect(parseRecipe(undefined)).toEqual({ recipe: { kind: 'webapp-dev-stack' } });
     expect(parseRecipe({ kind: 'webapp-dev-stack', extra: 1 })).toEqual({ recipe: { kind: 'webapp-dev-stack' } });
+    // The environment file's ports: the box resolves them at each attach.
+    expect(parseRecipe({ kind: 'repo', origins: ['127.0.0.1:1'] })).toEqual({ recipe: { kind: 'repo' } });
+    expect(reviewerSignInHint({ kind: 'repo' })).toBeNull();
   });
 
   it('checks manual origins, drops duplicates, keeps the first one\'s scheme as given', () => {

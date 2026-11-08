@@ -65,6 +65,7 @@ async function main() {
   const express = require('express') as typeof import('express');
   const session = require('express-session') as typeof import('express-session');
   const connectPgSimple = require('connect-pg-simple') as typeof import('connect-pg-simple');
+  const { sessionCookieOptions } = require('../../../auth/sessionCookie') as typeof import('../../../auth/sessionCookie');
   const { Pool } = require('pg') as typeof import('pg');
   const { PrismaClient } = require('@prisma/client') as typeof import('@prisma/client');
   const { PrismaPg } = require('@prisma/adapter-pg') as typeof import('@prisma/adapter-pg');
@@ -90,8 +91,8 @@ async function main() {
   app.use('/termag', serverSpanMiddleware);
   app.use('/termag', session({
     store: new PgSession({ pool, createTableIfMissing: true }),
-    name: 'termag.sid', secret: 'fixture', resave: false, saveUninitialized: false, rolling: true,
-    cookie: { path: '/termag', httpOnly: true, sameSite: 'lax' },
+    // Dev's cookie: the fixture is plain http, which can't carry production's __Host- one.
+    ...sessionCookieOptions(false), secret: 'fixture', resave: false, saveUninitialized: false, rolling: true,
   }));
   app.post('/termag/api/login/:n', (req, res) => {
     (req.session as unknown as { n: string }).n = req.params.n;

@@ -5,12 +5,12 @@ import { DEFAULT_CLAUDE_UPDATE_POLICY, parseClaudeUpdatePolicy } from './claudeU
 describe('parseCodexUpdatePolicy', () => {
   it('is the defaults for no value: the advisories\' floor, latest, and no restart', () => {
     for (const v of [undefined, null, [], 'latest', 3]) expect(parseCodexUpdatePolicy(v)).toEqual(DEFAULT_CODEX_UPDATE_POLICY);
-    expect(DEFAULT_CODEX_UPDATE_POLICY).toEqual({ floor: '0.131.0', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
+    expect(DEFAULT_CODEX_UPDATE_POLICY).toEqual({ mode: 'off', floor: '0.131.0', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
   });
 
   it('takes every valid value of each key', () => {
     expect(parseCodexUpdatePolicy({ floor: '0.165.0', target: '0.166.0', restart: 'idle', drainSec: 0, forceAfterHours: 168 }))
-      .toEqual({ floor: '0.165.0', target: '0.166.0', restart: 'idle', drainSec: 0, forceAfterHours: 168 });
+      .toEqual({ mode: 'off', floor: '0.165.0', target: '0.166.0', restart: 'idle', drainSec: 0, forceAfterHours: 168 });
     expect(parseCodexUpdatePolicy({ target: 'latest', restart: 'force' })).toMatchObject({ target: 'latest', restart: 'force' });
   });
 

@@ -1,8 +1,8 @@
 /**
  * Tunnels to a box, opened by its agent on the orchestrator's request: to the
  * box's t3 server for the desktop app's relay,
- * or to a loopback port for the native port forward.
- *
+ * to a loopback port for the native port forward,
+ * or to a published port for a preview link's relay.
  *
  * The orchestrator can't reach a box: boxes only dial out. So for each relayed
  * connection it picks a random id, asks the box's agent over its control
@@ -17,7 +17,12 @@
  * refused, and the client's request fails (the desktop and the CLI retry).
  *
  * Each kind has its own per-user, per-box cap, so a browser full of forwards
- * can't starve the desktop's t3 relay, nor the reverse.
+ * can't starve the desktop's t3 relay, nor the reverse. Preview tunnels are
+ * counted under the link owner's id, so a link's viewers share the owner's
+ * preview budget and never touch their `port` or `t3` one. An open preview
+ * tunnel is not box activity: the lifecycle sweep's busy check asks for
+ * `port` only, and a viewer's input counts instead
+ * (services/previewLinkActivity.ts).
  */
 import { randomBytes } from 'crypto';
 import type { Duplex } from 'stream';
@@ -25,14 +30,24 @@ import { createWebSocketStream, type WebSocket } from 'ws';
 
 export const TUNNEL_TTL_MS = 15_000;
 /** Open or opening tunnels one user may have to one box, per kind. */
-export const TUNNEL_CAPS: Readonly<Record<TunnelKind, number>> = { t3: 64, port: 128 };
+export const TUNNEL_CAPS: Readonly<Record<TunnelKind, number>> = { t3: 64, port: 128, preview: 128 };
 const TUNNEL_RPC_TIMEOUT_MS = 20_000;
 const ID_RE = /^[0-9a-f]{64}$/;
 // An agent's refusal reason is shown to the user (port_refused); bounded.
 const REASON_MAX = 300;
 
-/** What a tunnel reaches on the box. */
-export type TunnelTarget = { kind: 't3' } | { kind: 'port'; port: number };
+/**
+ * What a tunnel reaches on the box. A `preview` target goes through the same
+ * port guard as `port`, plus the refusals for debuggers, shells and notebooks
+ * (SR6, agent/port-guard.js); with `confine` set (a `people` or `link`
+ * audience) the agent also requires the listener to descend from a
+ * `termag preview run` of that checkout (PR 5), and refuses it until then.
+ * Sent only to an agent announcing `preview-link-v1`.
+ */
+export type TunnelTarget =
+  | { kind: 't3' }
+  | { kind: 'port'; port: number }
+  | { kind: 'preview'; port: number; confine: { checkout: string } | null };
 export type TunnelKind = TunnelTarget['kind'];
 
 export class TunnelError extends Error {
@@ -75,7 +90,9 @@ export interface AgentTunnelDeps {
 
 /** How tunnel-open names a target on the wire (agent/agent.js): t3 keeps its original bare string. */
 function wireTarget(target: TunnelTarget): unknown {
-  return target.kind === 't3' ? 't3' : { kind: 'port', port: target.port };
+  if (target.kind === 't3') return 't3';
+  if (target.kind === 'preview') return { kind: 'preview', port: target.port, confine: target.confine ? { checkout: target.confine.checkout } : null };
+  return { kind: 'port', port: target.port };
 }
 
 /** The TunnelError for an agent's `{ ok: false, code | reason }` reply: it dialed nothing back. */
@@ -178,19 +195,21 @@ export class AgentTunnels {
   }
 
   /**
-   * The boxes among `ids` with a tunnel of `kind` this process carries or is
-   * opening, any user: the lifecycle sweep's `tunnels` check asks for `port`,
-   * since it can't wait for the next host sample to see a forward opened
-   * since the last.
+   * The boxes among `ids` with a tunnel of one of `kinds` this process
+   * carries or is opening, any user: the lifecycle sweep's `tunnels` check
+   * asks for `port` (never `preview`: an open preview tab is no person at
+   * the box), since it can't wait for the next host sample to see a forward
+   * opened since the last.
    */
-  boxesWithTunnels(ids: readonly string[], kind: TunnelKind): Set<string> {
+  boxesWithTunnels(ids: readonly string[], kinds: TunnelKind | readonly TunnelKind[]): Set<string> {
     const wanted = new Set(ids);
+    const of = new Set<string>(typeof kinds === 'string' ? [kinds] : kinds);
     const found = new Set<string>();
     for (const k of this.open.keys()) {
       const [, boxId, kindOf] = k.split('\u0000');
-      if (kindOf === kind && wanted.has(boxId)) found.add(boxId);
+      if (of.has(kindOf) && wanted.has(boxId)) found.add(boxId);
     }
-    for (const p of this.pending.values()) if (p.kind === kind && wanted.has(p.boxId)) found.add(p.boxId);
+    for (const p of this.pending.values()) if (of.has(p.kind) && wanted.has(p.boxId)) found.add(p.boxId);
     return found;
   }
 
@@ -286,6 +305,18 @@ export class AgentTunnels {
     // Counted against the cap since accept took it.
     const ws = await dialed;
     return { ws, reply };
+  }
+
+  /**
+   * Open a tunnel to a published port, as a byte stream the preview relay
+   * speaks HTTP or WebSocket over (an http.Agent's createConnection), counted
+   * under the link's owner. Rejects with a TunnelError: the agent's
+   * port_refused (the guard, SR6, or an unconfined listener for a confined
+   * target) and port_closed among them.
+   */
+  async openPreview(boxId: string, ownerId: string, port: number, confine: { checkout: string } | null): Promise<OpenedTunnel> {
+    const { ws } = await this.openSocket(boxId, ownerId, { kind: 'preview', port, confine });
+    return { stream: socketLikeStream(ws), port };
   }
 
   /** Open a tunnel to the box's t3 server, as a byte stream. Rejects with a TunnelError. */

@@ -20,6 +20,12 @@ describe('parseCliUsage', () => {
     }
   });
 
+  it('keeps a version built from git (cli/buildVersion.mjs)', () => {
+    for (const version of ['0.1.157+c4b6b803', '0.1.157+c4b6b803.dirty', '0.1.0+unknown']) {
+      expect(parseCliUsage({ command: 'whoami', phase: 'finished', version })).toEqual({ detail: expect.objectContaining({ version }) });
+    }
+  });
+
   it('refuses a bad phase, version, exit code, duration or flag', () => {
     const ok = { command: 'whoami', phase: 'finished' };
     for (const bad of [

@@ -1,7 +1,8 @@
 /**
  * The sessions under /api/cli/v1 (routes/cliChats.ts) through the real
  * cliApiRouter and its bearer check: a device sign-in lists and reads its
- * sessions; a box's own credential gets 403; the flag off is 404.
+ * sessions; a box's own credential gets 403; the flag off is 404. Send and
+ * interrupt are behind desktop-live-chat-enabled as well.
  */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
 import express from 'express';
@@ -38,10 +39,9 @@ const store: CliStore = {
   revokeDevice: async () => false,
 };
 
-let enabled: boolean;
+let liveChat: boolean;
 let asked: unknown[][];
 const chats: CliChats = {
-  enabled: async () => enabled,
   list: async (user, opts) => { asked.push(['list', user.id, opts]); return []; },
   history: async (user, projectId, workstream) => {
     asked.push(['history', user.id, projectId, workstream]);
@@ -63,6 +63,15 @@ const chats: CliChats = {
     asked.push(['title', user.id, projectId, body]);
     return { status: 200, body: { title: 'T', titleAt: 'x', titleSource: 'person' } };
   },
+  liveChatEnabled: async () => liveChat,
+  send: async (user, projectId, body) => {
+    asked.push(['send', user.id, projectId, body]);
+    return { status: 202, body: { queued: 1 } };
+  },
+  interrupt: async (user, projectId, body) => {
+    asked.push(['interrupt', user.id, projectId, body]);
+    return { status: 409, body: { error: 'Nothing is running', code: 'not-running' } };
+  },
 };
 
 let server: Server;
@@ -76,7 +85,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 afterAll(() => new Promise<void>(r => server.close(() => r())));
-beforeEach(() => { enabled = true; asked = []; });
+beforeEach(() => { liveChat = true; asked = []; });
 
 const get = (path: string, token: string) => fetch(`${base}/api/cli/v1${path}`, { headers: { authorization: `Bearer ${token}` } });
 
@@ -128,12 +137,35 @@ describe('/api/cli/v1/chats', () => {
     ]);
   });
 
-  it('refuses a box\'s own token, and hides behind the flag', async () => {
+  it('refuses a box\'s own token', async () => {
     expect((await get('/chats', BOX)).status).toBe(403);
     expect((await get('/projects/p-app/chat', BOX)).status).toBe(403);
-    enabled = false;
-    expect((await get('/chats', DEVICE)).status).toBe(404);
-    expect((await get('/projects/p-app/chat', DEVICE)).status).toBe(404);
+    expect(asked).toEqual([]);
+  });
+
+  it("sends a turn and stops one through the chat's runner, with the box's answer", async () => {
+    const post = (path: string, token: string, body: unknown) => fetch(`${base}/api/cli/v1${path}`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const sent = await post('/projects/p-app/chat/messages', DEVICE, { workstream: 'main', text: 'hi', effort: 'high' });
+    expect(sent.status).toBe(202);
+    expect(await sent.json()).toEqual({ queued: 1 });
+    expect((await post('/projects/p-app/chat/interrupt', DEVICE, { workstream: 'main', scope: 'turn' })).status).toBe(409);
+    expect(asked).toEqual([
+      ['send', 'alice', 'p-app', { workstream: 'main', text: 'hi', effort: 'high' }],
+      ['interrupt', 'alice', 'p-app', { workstream: 'main', scope: 'turn' }],
+    ]);
+  });
+
+  it("keeps send and interrupt from a box's token and behind the live-chat flag", async () => {
+    const post = (path: string, token: string) => fetch(`${base}/api/cli/v1${path}`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'hi' }),
+    });
+    expect((await post('/projects/p-app/chat/messages', BOX)).status).toBe(403);
+    expect((await post('/projects/p-app/chat/interrupt', BOX)).status).toBe(403);
+    liveChat = false;
+    expect((await post('/projects/p-app/chat/messages', DEVICE)).status).toBe(404);
+    expect((await post('/projects/p-app/chat/interrupt', DEVICE)).status).toBe(404);
     expect(asked).toEqual([]);
   });
 });

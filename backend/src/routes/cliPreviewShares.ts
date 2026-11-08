@@ -14,10 +14,8 @@
  * A device sign-in's only: a box's own token gets 403 `forbidden`, as on the
  * desktop's box bridge (deviceOnly, routes/cliT3.ts). Anything on a box can
  * read that token, so this keeps the browser routes' rule that an agent can't
- * create, list or revoke a share. Behind `desktop-app-enabled`, for the owner
- * and the project's box (the person alone for the search): off, or a project
- * that isn't the caller's, and the route answers 404 `not_found` as if it
- * weren't there. Past that, the browser routes' own handlers answer
+ * create, list or revoke a share. A project that isn't the caller's, or has
+ * no box, answers 404 `not_found` as if the route weren't there. Past that, the browser routes' own handlers answer
  * (routes/cliPreviewSharesPrisma.ts): their owner check, preview-share flags,
  * validation and JSON. The rate limit is theirs too, per person.
  */

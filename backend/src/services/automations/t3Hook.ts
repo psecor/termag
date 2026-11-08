@@ -148,7 +148,7 @@ export interface Net {
 }
 
 export interface T3Tunnels {
-  /** The desktop bridge's gate: the owner, desktop-app-enabled, a ready box whose agent speaks t3-v1. */
+  /** The desktop bridge's gate: the owner, a ready box whose agent speaks t3-v1. */
   access(user: CliUser, boxId: string): Promise<{ ok: true } | { ok: false; error: string; code?: string }>;
   openTunnel(user: CliUser, boxId: string): Promise<OpenedTunnel>;
 }

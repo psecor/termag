@@ -188,6 +188,33 @@ export function reviewSlotOf(session: string, username: string, project: string,
 }
 
 /**
+ * Terminal slots per workstream, the user's own shell
+ * panes beside the ctrl pane: slot 1 IS the ctrl pane (the one terminal every
+ * project has), slots 2..MAX are `<that>-<n>` added with the workspace's +
+ * button. The number goes after the role for the same reason review's does —
+ * no slot can equal another workstream's legal name, which always ends in a
+ * role — and no terminal slot can equal a review slot: they differ in the
+ * role. Keep in sync with frontend/src/utils/sessionName.ts.
+ */
+export const MAX_TERMINAL_SLOTS = 8;
+
+export function terminalSessionName(username: string, project: string, workstream: string = 'main', slot: number = 1): string {
+  const base = sessionName(username, project, 'ctrl', workstream);
+  return slot === 1 ? base : `${base}-${slot}`;
+}
+
+/** Every terminal slot's session name for a workstream, slot 1 (the ctrl pane) first. */
+export function terminalSessionNames(username: string, project: string, workstream: string = 'main'): string[] {
+  return Array.from({ length: MAX_TERMINAL_SLOTS }, (_, i) => terminalSessionName(username, project, workstream, i + 1));
+}
+
+/** Which slot a session name is among a workstream's terminal panes, or null. Compared, never parsed. */
+export function terminalSlotOf(session: string, username: string, project: string, workstream: string = 'main'): number | null {
+  const i = terminalSessionNames(username, project, workstream).indexOf(session);
+  return i < 0 ? null : i + 1;
+}
+
+/**
  * The exact pane target `=<name>:` as a `sessionName` for the agent's tmux
  * RPCs, which pass the string to `-t` as given. A bare name prefix-matches
  * when its own session is gone: `…-review` would reach `…-review-2`
@@ -235,7 +262,7 @@ export async function createSession(name: string, cwd: string = process.env.HOME
   await execAsync(
     `tmux new-session -d -s ${shellEscape(name)} -c ${shellEscape(cwd)} -x 120 -y 30`
   );
-  await execAsync(`tmux set-option -t ${shellEscape(name)} -w window-size largest`);
+  await execAsync(`tmux set-option -t ${shellEscape(name)} -w window-size latest`);
   await execAsync(`tmux set-option -t ${shellEscape(name)} history-limit 10000`);
   // Let tmux copy operations (copy-mode y/M-w, mouse drag-end) emit OSC 52 so
   // selections reach the browser clipboard via xterm.js. set-clipboard is a

@@ -21,7 +21,7 @@
  * its counts are the pool and this one is not read (warmPoolSizes.ts).
  */
 import { numberVariationForContext } from './featureFlags';
-import { POOL_FLAG_CONTEXT } from './boxHibernationFlag';
+import { POOL_FLAG_CONTEXT } from './poolLdContext';
 
 export const WARM_POOL_SIZE_FLAG = 'box-warm-pool-size';
 export const WARM_POOL_SIZE_FALLBACK = 5;

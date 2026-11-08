@@ -7,9 +7,8 @@
 import { PROVIDERS } from '../providers/registry';
 import { isBranchName, isNewBranchName } from './repoCreate';
 import { isRunName } from './automations/schedule';
+import { isAskChatWorkstreamName } from './agentMessages';
 import { parseRepoUrl } from './projectTemplates';
-
-export const SPAWN_FLAG = 'agent-spawn-enabled';
 
 // The limits are tuning parameters now: services/spawnLimits.ts.
 
@@ -195,15 +194,15 @@ export function slugFromTask(task: string): string {
 /**
  * A workstream name from a branch: every run of `/` or other characters a name
  * cannot hold becomes one `-` (`skz/ABC-123/fix` → `skz-ABC-123-fix`), at most
- * 40 characters; '' when nothing usable is left, or when it would be `main` or
- * an automation run's name (`run/20261020/0900`), which createWorkstreamFor
- * refuses. The name is a directory and a tmux session part, so it never takes a
- * `/`. The frontend's workstreamNameFromBranch is the same rule at the UI's 64
- * characters.
+ * 40 characters; '' when nothing usable is left, or when it would be `main`,
+ * an automation run's name (`run/20261020/0900`) or an ask thread's name
+ * (`ask/<thread id>`), which createWorkstreamFor refuses. The name is a
+ * directory and a tmux session part, so it never takes a `/`. The frontend's
+ * workstreamNameFromBranch is the same rule at the UI's 64 characters.
  */
 export function nameFromBranch(branch: string): string {
   const name = branch.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, MAX_NAME).replace(/-$/, '');
-  return name === 'main' || isRunName(name) ? '' : name;
+  return name === 'main' || isRunName(name) || isAskChatWorkstreamName(name) ? '' : name;
 }
 
 /** `base`, else `base-2`, `base-3`, … whichever is not taken (case-insensitive, like branch names on a Mac). */

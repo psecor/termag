@@ -7,6 +7,8 @@
  *   requested ── policy fetch (flag on) ──▶ running ── report ──▶ done | failed
  *       │                                                          ▲
  *       ├── 15 min, no fetch ──▶ expired ── a late report ─────────┘
+ *       │   (a run of a tool updated at the box's start, Docker: 14 days,
+ *       │   and its "fetch" is the box's boot unit asking for it)
  *       └── the agent refuses the tool-update RPC ──▶ refused
  *
  * A boot or runner-guard run has no requested row: its report creates one,
@@ -15,12 +17,14 @@
 import type { ClaudeUpdateRestart } from '../claudeUpdatePolicy';
 import { isRestart } from '../claudeUpdatePolicy';
 import { isToolComponent, type ToolComponent, type ToolUpdatePolicy } from './components';
+import { chatNoticeText } from './notice';
 
 /** Announced by an agent whose `tool-update` RPC starts the component's unit (termag-claude-update@<run>.service, 2b). */
 export const TOOL_UPDATE_CAPABILITY = 'tool-update-v1';
 
 export const TRIGGERS = ['manual', 'boot', 'guard', 'floor', 'resume', 'nightly'] as const;
 export type RunTrigger = typeof TRIGGERS[number];
+const isTrigger = (v: unknown): v is RunTrigger => (TRIGGERS as readonly unknown[]).includes(v);
 export const STATUSES = ['requested', 'running', 'done', 'failed', 'refused', 'expired'] as const;
 export type RunStatus = typeof STATUSES[number];
 // floor-only: the orchestrator host's run with no version pinned, which had nothing to bring up to the floor (orchestrator.ts).
@@ -33,6 +37,16 @@ export const isRunId = (v: unknown): v is string => typeof v === 'string' && RUN
 
 /** A run nobody fetched the policy for in this long is `expired`. */
 export const RUN_EXPIRE_MS = 15 * 60_000;
+/**
+ * The tools updated only at the box's start (components.ts `atStart`): a run
+ * of one waits `requested` for the box's next start, which may be days away
+ * (a box its owner leaves stopped), and expires only after this long.
+ */
+export const AT_START_COMPONENTS: readonly string[] = ['docker'];
+export const AT_START_EXPIRE_MS = 14 * 24 * 3600_000;
+export const isAtStart = (component: string | undefined): boolean => !!component && AT_START_COMPONENTS.includes(component);
+/** How long a requested run of `component` waits for its box. */
+export const expireMsFor = (component: string | undefined): number => (isAtStart(component) ? AT_START_EXPIRE_MS : RUN_EXPIRE_MS);
 /**
  * A `running` run counts as in flight (for the 409 and the fleet's pacing) for
  * this long after it started: the drain is at most an hour, and the install a
@@ -60,17 +74,19 @@ export interface RunFacts {
   component: string;
   status: string;
   restart: string;
+  /** What asked for it (TRIGGERS); the box names it in its restart notice. */
+  trigger?: string;
   target: string | null;
   requestedAt: Date;
   startedAt: Date | null;
 }
 
-export function isExpired(run: Pick<RunFacts, 'status' | 'requestedAt'>, now: number): boolean {
-  return run.status === 'requested' && now - run.requestedAt.getTime() >= RUN_EXPIRE_MS;
+export function isExpired(run: Pick<RunFacts, 'status' | 'requestedAt'> & { component?: string }, now: number): boolean {
+  return run.status === 'requested' && now - run.requestedAt.getTime() >= expireMsFor(run.component);
 }
 
 /** Whether the run still holds its host: a fresh request, or a run that started not long ago. */
-export function isInFlight(run: Pick<RunFacts, 'status' | 'requestedAt' | 'startedAt'>, now: number): boolean {
+export function isInFlight(run: Pick<RunFacts, 'status' | 'requestedAt' | 'startedAt'> & { component?: string }, now: number): boolean {
   if (run.status === 'requested') return !isExpired(run, now);
   if (run.status === 'running') return now - (run.startedAt ?? run.requestedAt).getTime() < RUN_STALE_MS;
   return false;
@@ -81,7 +97,11 @@ export interface PolicyBody {
   target: string;
   restart: ClaudeUpdateRestart;
   drainSec: number;
-  run: null | { id: string; component: ToolComponent };
+  /**
+   * The run, with its trigger when it is one a box may name in the notice it
+   * types before a resume (deploy/termag-tool-update-lib, tu_notice).
+   */
+  run: null | { id: string; component: ToolComponent; trigger?: RunTrigger };
 }
 
 export type PolicyAnswer =
@@ -118,7 +138,7 @@ export function policyAnswer(input: {
   const base = { floor: policy.floor, target: policy.target, drainSec: policy.drainSec };
   if (asked !== null && (!run || run.hostKey !== hostKey || run.component !== component)) return { status: 404, body: { code: 'no_such_run' } };
   if (!run) return { status: 200, body: { ...base, restart: 'none', run: null }, start: false, expire: false };
-  const answer = { ...base, target: run.target ?? policy.target, restart: isRestart(run.restart) ? run.restart : 'none', run: { id: run.id, component } };
+  const answer = { ...base, target: run.target ?? policy.target, restart: isRestart(run.restart) ? run.restart : 'none', run: { id: run.id, component, ...(isTrigger(run.trigger) ? { trigger: run.trigger } : {}) } };
   if (enabled && isPolicyRetry(run, now)) return { status: 200, body: answer, start: false, expire: false };
   const expired = isExpired(run, now);
   if (run.status !== 'requested' || expired || !enabled) {
@@ -140,6 +160,12 @@ export interface ReportedPane {
   role: 'agent' | 'other';
   sessionId: string | null;
   hadConversation: boolean;
+  /**
+   * The restart notice the box printed in this pane before it resumed it
+   * (tu_notice), when it printed one: data, kept only when chatNoticeText
+   * passes it (notice.ts), else null. A box from before it sends none.
+   */
+  notice?: string | null;
 }
 
 export interface ToolUpdateReport {
@@ -192,7 +218,9 @@ function parsePanes(v: unknown): ReportedPane[] | { error: string } {
     if (r.role !== 'agent' && r.role !== 'other') return { error: 'pane.role must be agent or other' };
     if (r.sessionId !== undefined && r.sessionId !== null && (typeof r.sessionId !== 'string' || !SESSION_ID.test(r.sessionId))) return { error: 'pane.sessionId must be a session id' };
     if (typeof r.hadConversation !== 'boolean') return { error: 'pane.hadConversation must be a boolean' };
-    out.push({ session: r.session, role: r.role, sessionId: typeof r.sessionId === 'string' ? r.sessionId : null, hadConversation: r.hadConversation });
+    // A notice that is not one is dropped, not refused: the report stands without it.
+    const notice = chatNoticeText(r.notice);
+    out.push({ session: r.session, role: r.role, sessionId: typeof r.sessionId === 'string' ? r.sessionId : null, hadConversation: r.hadConversation, ...(notice ? { notice } : {}) });
   }
   return out;
 }

@@ -13,7 +13,6 @@
  */
 import { Router, type RequestHandler } from 'express';
 import { prisma } from '../db';
-import { webPushEnabledFor } from '../services/pushFlag';
 import { requireAuth } from '../middleware/auth';
 import { sendResult, type RouteResult } from './routeResult';
 import {
@@ -42,17 +41,12 @@ export interface PushRouteDeps {
   vapid: () => VapidConfig | null;
   send: (userId: string, payload: DeclarativePushPayload) => Promise<SendSummary>;
   baseUrl: () => string;
-  /** mobile-web-push-enabled for this user (services/pushFlag.ts). */
-  enabledFor: (userId: string) => Promise<boolean>;
 }
 
-const NOT_ENABLED: RouteResult = { status: 403, body: { error: 'push is not enabled for this account' } };
-
-/** Push is available to this user: the server has VAPID keys and the flag is on for them. */
-export async function pushConfig(userId: string, deps: Pick<PushRouteDeps, 'vapid' | 'enabledFor'>): Promise<RouteResult> {
+/** Push is available: the server has VAPID keys. */
+export async function pushConfig(_userId: string, deps: Pick<PushRouteDeps, 'vapid'>): Promise<RouteResult> {
   const vapid = deps.vapid();
-  const enabled = !!vapid && await deps.enabledFor(userId);
-  return { status: 200, body: { enabled, publicKey: enabled ? vapid!.publicKey : null } };
+  return { status: 200, body: { enabled: !!vapid, publicKey: vapid?.publicKey ?? null } };
 }
 
 export async function listSubscriptions(userId: string, deps: Pick<PushRouteDeps, 'store'>): Promise<RouteResult> {
@@ -67,9 +61,8 @@ export async function listSubscriptions(userId: string, deps: Pick<PushRouteDeps
   };
 }
 
-export async function addSubscription(userId: string, body: unknown, deps: Pick<PushRouteDeps, 'store' | 'vapid' | 'enabledFor'>): Promise<RouteResult> {
+export async function addSubscription(userId: string, body: unknown, deps: Pick<PushRouteDeps, 'store' | 'vapid'>): Promise<RouteResult> {
   if (!deps.vapid()) return { status: 409, body: { error: 'push is not configured on this server' } };
-  if (!await deps.enabledFor(userId)) return NOT_ENABLED;
   const parsed = parseSubscriptionBody(body);
   if ('error' in parsed) return { status: 400, body: { error: parsed.error } };
   const { id } = await deps.store.upsert(userId, parsed);
@@ -84,9 +77,8 @@ export async function removeSubscription(userId: string, body: unknown, deps: Pi
   return { status: 204, body: null };
 }
 
-export async function sendTest(userId: string, deps: Pick<PushRouteDeps, 'vapid' | 'send' | 'baseUrl' | 'enabledFor'>): Promise<RouteResult> {
+export async function sendTest(userId: string, deps: Pick<PushRouteDeps, 'vapid' | 'send' | 'baseUrl'>): Promise<RouteResult> {
   if (!deps.vapid()) return { status: 409, body: { error: 'push is not configured on this server' } };
-  if (!await deps.enabledFor(userId)) return NOT_ENABLED;
   const { sent, failed } = await deps.send(userId, buildTestPayload(deps.baseUrl()));
   return { status: 200, body: { sent, failed } };
 }
@@ -114,7 +106,6 @@ export function defaultPushRouteDeps(): PushRouteDeps {
     vapid: () => defaultSendDeps().vapid,
     send: (userId, payload) => sendToUser(userId, payload, defaultSendDeps()),
     baseUrl: () => appBaseUrl(),
-    enabledFor: webPushEnabledFor,
   };
 }
 

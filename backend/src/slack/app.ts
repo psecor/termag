@@ -15,6 +15,7 @@ import { loadAgentThreadsOrRetry } from './agentStore';
 import { acceptAgentRuns, stopAgentRunsForRestart } from './agentSession';
 import { slackSurfaceMiddleware } from '../services/requestSurface';
 import { slackTraceMiddleware } from '../services/tracing/botSpans';
+import { botWorkspaceLookup, gateSlackClient, slackInteractionsMiddleware } from '../services/slackInteractionsFlag';
 
 let slackApp: any = null;
 
@@ -34,6 +35,12 @@ export function createSlackApp(): any {
   // Each Slack request a trace of its own, ids only (services/tracing/botSpans.ts);
   // first, so the span covers the surface middleware and the listeners.
   app.use(slackTraceMiddleware);
+  // slack-interactions-enabled off for the request's workspace or org: every
+  // event, command, action and view is acked and dropped here, before any
+  // listener. The app's own client (every notice, card and post outside a
+  // listener) is read for the bot's workspace and refuses all but auth.test.
+  app.use(slackInteractionsMiddleware());
+  gateSlackClient(app.client, botWorkspaceLookup(app.client));
   // Flags read while handling a Slack event carry `surface: slack`.
   app.use(slackSurfaceMiddleware);
   registerEventHandlers(app);

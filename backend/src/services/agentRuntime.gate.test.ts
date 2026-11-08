@@ -35,6 +35,7 @@ const { ensureAgentSessionsAndLaunch, reconstructInstanceSessions, setPaneLaunch
 // Launches here follow one another into the same pane; the post-launch settle would only add waits.
 setPaneLaunchSettleForTests(0);
 const { SessionGateError } = await import('./sessionGate');
+const { PANE_KIND_ENV: K, RESUME_FALLBACK_NOTICE } = await import('./launchCommand');
 const { resetClaimUpdateGate, trackClaimUpdate } = await import('./claimUpdateGate');
 
 const launch = {
@@ -237,7 +238,7 @@ describe('reconstruction and setup status', () => {
     expect(state.sent.filter(s => s.type !== 'tmux-foreground-cmd')).toEqual([
       { type: 'tmux-create', payload: { sessionName: 'alice-notes-agent', cwd: '/home/alice/termag/projects/notes' } },
       { type: 'tmux-create', payload: { sessionName: 'alice-notes-ctrl', cwd: '/home/alice/termag/projects/notes' } },
-      { type: 'tmux-send-keys', payload: { sessionName: 'alice-notes-agent', keys: 'TERMAG_SESSION_KIND=interactive claude --continue', withEnter: true } },
+      { type: 'tmux-send-keys', payload: { sessionName: 'alice-notes-agent', keys: `{ ${K}claude --continue; } || { [ $? -eq 1 ] && echo '${RESUME_FALLBACK_NOTICE}' && ${K}claude; }`, withEnter: true } },
     ]);
   });
 

@@ -8,19 +8,24 @@
  *   POST /projects/:id/chat/title      rename a chat's session ({ workstream, title }), as a person's title
  *   GET /projects/:id/chat?workstream= one session's history, as GET /api/projects/:id/chat answers it
  *   POST /projects/:id/chat/claim      the desktop's thread takes the session ({ workstream, threadId })
+ *   POST /projects/:id/chat/messages   a turn on the chat's runner, as web's send ({ workstream, text, images?, model?, backend?, effort? })
+ *   POST /projects/:id/chat/interrupt  stop the runner's turn, as web's ({ workstream, scope? })
  *   GET /chat/asks?threads=&claudeSession= the asks a desktop thread sent, as web's …/chat/asks answers them
  *
  * Both read the orchestrator, not a box: a session on a parked or stopped box
  * is listed, and its history comes from the stored transcript when the box
- * can't answer (`stored: true`). Nothing here starts a box: a claim needs it
- * up. The rows are
+ * can't answer (`stored: true`). Nothing here starts a box but a send, which
+ * does what web's does (a stopped box is started and the message held); a claim
+ * needs it up. The rows are
  * services/chatSessionRows.ts's, so the two sidebars list the same sessions
  * under the same names; a status frame on the CLI status socket means a row
  * may have changed.
  *
  * Each is a device sign-in's (a box's own token gets 403: anything on the box
- * could read every session), behind `desktop-app-enabled` for the person
- * (off: 404).
+ * could read every session). Send and interrupt are behind `desktop-live-chat-enabled`
+ * (off: 404), and only the chat's owner's, like a claim: the desktop's thread
+ * then drives the chat through the runner web uses, whose per-chat queue
+ * orders the two apps' turns, so neither takes the session from the other.
  */
 import type { Request, RequestHandler, Response, Router } from 'express';
 import { asyncHandler } from '../middleware/errors';
@@ -44,8 +49,6 @@ export interface CliChatRow extends Omit<ChatSessionRow, 'checkout'> {
 }
 
 export interface CliChats {
-  /** desktop-app-enabled for this person. */
-  enabled(user: CliUser): Promise<boolean>;
   list(user: CliUser, opts: { archived: boolean | 'all' }): Promise<CliChatRow[]>;
   /** routes/chats.ts archive or reopen, for this person, without powering the box; `body` unchecked. */
   archive(user: CliUser, projectId: string, body: unknown): Promise<RouteResult>;
@@ -57,6 +60,12 @@ export interface CliChats {
   claim(user: CliUser, projectId: string, body: unknown): Promise<RouteResult>;
   /** routes/chatAsks.ts desktopChatAsksFor for this person; `query` unchecked. */
   asks(user: CliUser, query: Request['query']): Promise<RouteResult>;
+  /** desktop-live-chat-enabled for this person. */
+  liveChatEnabled(user: CliUser): Promise<boolean>;
+  /** routes/chat.ts chatSendFor, for the chat's owner only; `body` unchecked. */
+  send(user: CliUser, projectId: string, body: unknown): Promise<RouteResult>;
+  /** routes/chat.ts chatInterruptFor, for the chat's owner only; `body` unchecked. */
+  interrupt(user: CliUser, projectId: string, body: unknown): Promise<RouteResult>;
 }
 
 const NOT_FOUND = { error: 'No such CLI endpoint; this termag CLI may be newer than the orchestrator', code: 'not_found' };
@@ -73,7 +82,10 @@ export function mountCliChatRoutes(router: Router, deps: CliChats, bearer: Reque
   const gate: RequestHandler = asyncHandler(async (_req, res, next) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') { res.status(403).json(DEVICE_ONLY); return; }
-    if (!(await deps.enabled(user))) { res.status(404).json(NOT_FOUND); return; }
+    next();
+  });
+  const liveChat: RequestHandler = asyncHandler(async (_req, res, next) => {
+    if (!(await deps.liveChatEnabled(cliAuth(res).user))) { res.status(404).json(NOT_FOUND); return; }
     next();
   });
 
@@ -89,6 +101,16 @@ export function mountCliChatRoutes(router: Router, deps: CliChats, bearer: Reque
 
   router.post('/projects/:id/chat/claim', bearer, gate, asyncHandler(async (req, res) => {
     const out = await deps.claim(cliAuth(res).user, req.params.id, req.body);
+    res.status(out.status).json(out.body);
+  }));
+
+  router.post('/projects/:id/chat/messages', bearer, gate, liveChat, asyncHandler(async (req, res) => {
+    const out = await deps.send(cliAuth(res).user, req.params.id, req.body);
+    res.status(out.status).json(out.body);
+  }));
+
+  router.post('/projects/:id/chat/interrupt', bearer, gate, liveChat, asyncHandler(async (req, res) => {
+    const out = await deps.interrupt(cliAuth(res).user, req.params.id, req.body);
     res.status(out.status).json(out.body);
   }));
 

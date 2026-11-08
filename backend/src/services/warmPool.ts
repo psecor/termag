@@ -27,7 +27,6 @@ import {
   type BoxAmi,
   type BoxConfig,
 } from './boxProvisioner';
-import { poolHibernationEnabled } from './boxHibernationFlag';
 import { instanceTypesForSize, isBoxSize, type BoxSize } from './boxSize';
 import { planWarmPool, type PoolPlan, type PoolRowView } from './warmPoolPlanner';
 import { ttlMemo } from './ttlMemo';
@@ -95,7 +94,11 @@ export function startWarmPoolReconciler(intervalMs?: number): void {
   if (override.ignored) console.warn(`[POOL] ${override.ignored}`);
   else if (override.size !== null) console.log(`[POOL] pool size ${override.size} from WARM_POOL_TARGET_SIZE (AUTH_MODE=local), not ${WARM_POOL_SIZE_FLAG}`);
   if (!getBoxConfig()) console.log('[POOL] box provisioning is not configured; the pool will stay empty');
-  reconcileTimer = setInterval(traceSweep('warm-pool', () => reconcileWarmPool()), intervalMs ?? policy.reconcileMs);
+  // The environment pools' tick rides the warm pool's (services/envPool.ts), after it, on the same leader timer.
+  reconcileTimer = setInterval(traceSweep('warm-pool', async () => {
+    await reconcileWarmPool();
+    await (await import('./envPool')).reconcileEnvPools();
+  }), intervalMs ?? policy.reconcileMs);
   reconcileTimer.unref?.();
 }
 
@@ -209,11 +212,9 @@ export function resetPoolSpecCache(): void {
   latestPoolAmi = null;
 }
 
-/** One size's current spec: its hash, and the box-hibernation-enabled value and size the hash was built from. */
+/** One size's current spec: its hash, and the size the hash was built from. */
 export interface PoolSpec {
   hash: string;
-  /** What the pool's launches pass as the flag; the AMI and the type still decide. */
-  hibernation: boolean;
   /** The size this spec's boxes launch at; null is BOX_INSTANCE_TYPE (sizes off for the pool). */
   size: BoxSize | null;
 }
@@ -226,11 +227,9 @@ export interface PoolSpec {
  * size's is stale and gets replaced, and a claim only takes a box of the
  * current hash for the size it asked for, so it can never hand out another.
  *
- * Nothing in it comes from the database, and the flag is read for a fixed
- * context (boxHibernationFlag.POOL_FLAG_CONTEXT), so every replica computes the
+ * Nothing in it comes from the database, so every replica computes the
  * same hash. Only the AMI lookup is cached: the cloud-init shape is pure CPU,
- * the flag is an in-memory read, and a missing box config throws on every
- * call rather than being remembered.
+ * and a missing box config throws on every call rather than being remembered.
  */
 export async function currentPoolSpecHash(size: BoxSize | null): Promise<string> {
   return (await currentPoolSpec(size)).hash;
@@ -248,17 +247,15 @@ export async function currentPoolSpec(size: BoxSize | null): Promise<PoolSpec> {
     );
   }
   const ami = await latestPoolAmi();
-  const hibernation = await poolHibernationEnabled();
 
   return {
     hash: poolSpecHash({
       amiId: ami.imageId,
       instanceType: instanceTypesForSize(size)?.type ?? config.instanceType,
       warmCloudInit: warmCloudInitShape(config),
-      hibernation: hibernation && ami.hibernationSupported,
+      hibernation: ami.hibernationSupported,
       size,
     }),
-    hibernation,
     size,
   };
 }
@@ -412,7 +409,6 @@ async function launchBoxes(plan: PoolPlan, spec: PoolSpec, target: number, polic
       instance: launched.instance,
       token: launched.token,
       poolSpecHash: currentHash,
-      hibernation: spec.hibernation,
       size: spec.size,
     });
   }

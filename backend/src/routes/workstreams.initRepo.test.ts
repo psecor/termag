@@ -47,6 +47,20 @@ beforeEach(() => {
   send.mockResolvedValue({ ok: true, path: '/x' });
 });
 
+describe('createWorkstreamFor ask-thread names', () => {
+  it('refuses the ask-<thread id> shape for a person, before touching prisma', async () => {
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'ask-cmvpvr0by19t1ex4aevd9iv3e' });
+    expect(got.status).toBe(400);
+    expect((got.body as { error: string }).error).toMatch(/ask threads/);
+    expect(prisma.project.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('still lets a human take a name that is not quite the shape', async () => {
+    const got = await createWorkstreamFor(USER, 'p1', { name: 'ask-Fix' });
+    expect(got.status).toBe(201);
+  });
+});
+
 describe('createWorkstreamFor first-commit backstop', () => {
   it('asks for it on a project with no repository to check out', async () => {
     const got = await createWorkstreamFor(USER, 'p1', { name: 'ws1' });

@@ -22,7 +22,7 @@ describe('parseInventoryReply', () => {
   it('matches the agent\'s probe list (agent/software-inventory.js)', () => {
     const req = createRequire(__filename);
     const agent = req(path.resolve(__dirname, '../../../../agent/software-inventory.js')) as { PROBES: Array<{ name: string }>; ORCHESTRATOR_PROBES: Array<{ name: string }> };
-    expect([...AGENT_COMPONENTS].sort()).toEqual([...agent.PROBES.map(p => p.name), 'os', 'kernel'].sort());
+    expect([...AGENT_COMPONENTS].sort()).toEqual([...agent.PROBES.map(p => p.name), 'os', 'kernel', 'kernel-installed', 'reboot'].sort());
     expect([...ORCHESTRATOR_COMPONENTS].sort()).toEqual([...AGENT_COMPONENTS, ...agent.ORCHESTRATOR_PROBES.map(p => p.name)].sort());
   });
   it('rejects a reply that is not an inventory', () => {
@@ -56,5 +56,16 @@ describe('transient probe failures', () => {
   it('a real uninstall (no path) is still a change', () => {
     const gone = { name: 'claude', ok: false, version: null, raw: null, path: null };
     expect(changedEntries(new Map([['claude', '2.1.300']]), [gone])).toEqual([{ component: 'claude', from: '2.1.300', to: null }]);
+  });
+  it('no kernel in /boot replaces a stale kernel and pending reboot (Devin on #1218)', () => {
+    // What agent/software-inventory.js kernelEntries reports then: neither row is transient.
+    const installed = { name: 'kernel-installed', ok: false, version: null, raw: null, path: null };
+    const reboot = { name: 'reboot', ok: true, version: 'unknown', raw: 'no kernel in /boot', path: null };
+    const prev = new Map<string, string | null>([['kernel-installed', '6.8.0-1068-aws'], ['reboot', 'pending']]);
+    expect(entriesToWrite(prev, [installed, reboot])).toEqual([installed, reboot]);
+    expect(changedEntries(prev, [installed, reboot])).toEqual([
+      { component: 'kernel-installed', from: '6.8.0-1068-aws', to: null },
+      { component: 'reboot', from: 'pending', to: 'unknown' },
+    ]);
   });
 });

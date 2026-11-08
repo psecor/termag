@@ -81,6 +81,7 @@ const power: string[] = [];
 vi.mock('./boxPower', () => ({ requestPower: async (_box: unknown, action: string) => { power.push(action); return action; } }));
 const busy = { checks: [] as string[], working: false };
 vi.mock('./boxLifecycle', () => ({
+  registerBoxBusyCheck: () => {},
   busyBoxes: async (ids: string[]) => new Map(ids.map(id => [id, busy.checks])),
   workingBoxes: () => new Set(busy.working ? ['b1'] : []),
 }));
@@ -89,6 +90,7 @@ vi.mock('./productEvents', () => ({ recordProductEvent: (name: string, _ctx: unk
 vi.mock('./workspaceEvents', () => ({ notifyWorkspaceChange: () => {} }));
 
 const { prismaResizeEffects, runResize, startResize } = await import('./boxResize');
+const { reserveGrow } = await import('./boxDisk');
 const { resizePlan } = await import('./boxResizePolicy');
 type Effects = import('./boxResize').ResizeEffects;
 
@@ -178,6 +180,35 @@ describe('runResize', () => {
   });
 });
 
+describe('runResize of a box whose disk is growing', () => {
+  it('waits for the grow before it stops the box, so the agent\'s file system step is not cut off', async () => {
+    const { fx, log } = fakes();
+    fx.diskGrowing = () => true;
+    fx.waitDiskGrow = async () => { log.push('waitDisk'); };
+    const out = await runResize(resizePlan({ status: 'ready', size: 'small' }, 'large', LARGE), fx);
+    expect(log.slice(0, 4)).toEqual(['phase:disk', 'waitDisk', 'phase:stopping', 'stop']);
+    expect(out).toMatchObject({ outcome: 'ready', resized: true });
+  });
+
+  it('a grow still running at the wait\'s limit fails the resize before anything is stopped (Bugbot on #1214)', async () => {
+    const { fx, log } = fakes();
+    fx.diskGrowing = () => true;
+    fx.waitDiskGrow = async () => { throw new Error('The disk is still growing after 30 minutes; the box was not stopped. Resize again once it has grown.'); };
+    const out = await runResize(resizePlan({ status: 'ready', size: 'small' }, 'large', LARGE), fx);
+    expect(log).toEqual(['phase:disk', 'phase:failed']);
+    expect(out).toMatchObject({ outcome: 'failed', resized: false, error: expect.stringMatching(/still growing.*not stopped/) });
+  });
+
+  it('skips the wait when no grow runs', async () => {
+    const { fx, log } = fakes();
+    fx.diskGrowing = () => false;
+    fx.waitDiskGrow = async () => { log.push('waitDisk'); };
+    await runResize(resizePlan({ status: 'ready', size: 'small' }, 'large', LARGE), fx);
+    expect(log).not.toContain('phase:disk');
+    expect(log).not.toContain('waitDisk');
+  });
+});
+
 describe('runResize of a hibernated box that fails after its resume', () => {
   const HIB = () => resizePlan({ status: 'hibernated', size: 'small' }, 'large', LARGE);
 
@@ -254,6 +285,32 @@ describe('startResize', () => {
     events.length = 0;
     Object.assign(ec2, { dryRun: 'DryRunOperation', describeFails: true, sent: [] });
     Object.assign(busy, { checks: [], working: false });
+  });
+
+  it('waits for a grow another process runs, seen as its open disk-grow row (Bugbot on #1214)', async () => {
+    boxEvents.push({ id: 'g1', boxId: 'b1', kind: 'disk-grow', phase: 'filesystem', startedAt: new Date(), finishedAt: null, detail: { toGb: 200 } });
+    const res = await startResize(seed(), 'large', owner);
+    expect(res).toMatchObject({ ok: true, resize: { phase: 'disk' } });
+    const fx = prismaResizeEffects(rows.get('b1') as never, 'u1', 'ev-x', { pollMs: 1 });
+    expect(await fx.diskGrowing!()).toBe(true);
+    let waited = false;
+    const wait = fx.waitDiskGrow!().then(() => { waited = true; });
+    await new Promise(r => setTimeout(r, 10));
+    expect(waited).toBe(false);
+    boxEvents.find(e => e.id === 'g1')!.finishedAt = new Date();
+    await wait;
+    expect(await fx.diskGrowing!()).toBe(false);
+    await settle();
+  });
+
+  it('a resize asked while the disk grows starts on waiting for it, and records that (Cursor on #1214)', async () => {
+    const release = reserveGrow('b1');
+    try {
+      const res = await startResize(seed(), 'large', owner);
+      expect(res).toMatchObject({ ok: true, resize: { phase: 'disk', running: true } });
+      expect(boxEvents[0].detail).toMatchObject({ withDisk: true });
+    } finally { release(); }
+    await settle();
   });
 
   it('takes the lock and answers 202 with the resize as it starts', async () => {

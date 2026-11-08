@@ -2,20 +2,18 @@ import { prisma } from '../db';
 import { getCallerProofConfig } from './callerIdentity';
 import { getCredentialStoreConfig } from './credentialStore';
 import { getGithubBrokerUrl } from './githubBroker';
-import { boolVariation } from './featureFlags';
 import type { FlagUser } from './featureFlags';
 import type { RouteResult } from '../routes/routeResult';
 
 export interface BoxCreationFacts {
   required: boolean;
-  flagOn: boolean;
   hasGithubCredential: boolean;
 }
 
 export type BoxGateState = 'off' | 'clear' | 'blocked';
 
 function classify(facts: BoxCreationFacts): BoxGateState {
-  if (!facts.required || !facts.flagOn) return 'off';
+  if (!facts.required) return 'off';
   if (facts.hasGithubCredential) return 'clear';
   return 'blocked';
 }
@@ -49,13 +47,8 @@ export async function hasGithubCredential(userId: string): Promise<boolean> {
 }
 
 export async function readBoxCreationFacts(user: FlagUser): Promise<BoxCreationFacts> {
-  const [flagOn, credential] = await Promise.all([
-    boolVariation('repo-first-gate-enabled', user, false),
-    hasGithubCredential(user.id),
-  ]);
   return {
     required: githubRequiredForBoxes(),
-    flagOn,
-    hasGithubCredential: credential,
+    hasGithubCredential: await hasGithubCredential(user.id),
   };
 }

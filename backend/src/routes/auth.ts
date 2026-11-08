@@ -2,6 +2,7 @@ import { Router, RequestHandler, Request, Response, NextFunction } from 'express
 import type { Prisma, User } from '@prisma/client';
 import passport from 'passport';
 import { takePostLoginRedirect } from '../auth/postLoginReturn';
+import { markSignedIn } from '../auth/signInAge';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { prisma } from '../db';
 import { SELECTABLE_PROVIDER_IDS } from '../providers/registry';
@@ -13,6 +14,7 @@ import {
 } from '../auth/oidc';
 import { assertLocalLoginAllowed, forwardedClients, isSameHostRequest } from '../auth/localLogin';
 import { peerAddress } from '../auth/peerAddress';
+import { noteUserTimeZone } from '../services/userTimeZone';
 import { loopbackRedirect, parseAuthorizeParams } from '../services/cliAuth';
 import { ensureHostSetup } from '../services/hostSetup';
 import { parseDotfilesRepoUrl } from '../services/dotfilesUrl';
@@ -315,6 +317,7 @@ export const albSessionBridge: RequestHandler = async (req: Request, res: Respon
     if (req.user) req.sessionStore.generate(req);
     req.login(user, (err) => {
       if (err) return next(err);
+      markSignedIn(req.session);
       void ensureHostSetup(user);
       next();
     });
@@ -425,6 +428,7 @@ export function authRouter(): Router {
         const returnTo = takePostLoginRedirect(req.session, basePath, frontendUrl);
         req.login(user, (err) => {
           if (err) return next(err);
+          markSignedIn(req.session);
           void ensureHostSetup(user);
           res.redirect(returnTo);
         });
@@ -447,7 +451,8 @@ export function authRouter(): Router {
         next();
       },
       passport.authenticate('google', { failureRedirect: `${basePath}/login?error=unauthorized` }),
-      (_req, res) => {
+      (req, res) => {
+        markSignedIn(req.session);
         res.redirect(res.locals.returnTo as string);
       }
     );
@@ -482,6 +487,10 @@ export function authRouter(): Router {
     pushMutesChat: user.pushMutesChat ?? false,
     // Simple UI: notify when a chat finishes its turn.
     chatTurnNotify: user.chatTurnNotify ?? false,
+    // Settings > Telemetry: chat session titles in termag's telemetry, on unless turned off.
+    telemetryTitles: user.telemetryTitles ?? true,
+    // Settings > Box notices: DMs before and after termag stops a box on its own.
+    boxIdleNotify: user.boxIdleNotify ?? true,
     // Effective role (users.role or an ADMIN_USERS match). Drives the admin
     // nav entry only; requireAdmin re-derives it on every admin request.
     role: isAdminUser(user) ? 'admin' : 'member',
@@ -498,6 +507,10 @@ export function authRouter(): Router {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+    // The browser sends its IANA zone as `tz` when it signs in (frontend
+    // authApi.me): User.timeZone, which working time banks by and the tool
+    // sweep reads for the owner's night (services/toolUpdate/auto.ts).
+    noteUserTimeZone(req.user, req.query?.tz);
     let needsOnboarding = false;
     if (!req.user.onboardedAt) {
       // Fail closed: if the count cannot be read, do not send anyone to the wizard.
@@ -532,8 +545,8 @@ export function authRouter(): Router {
       return;
     }
 
-    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown; uiMode?: unknown };
-    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean; uiMode?: string | null } = {};
+    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown; telemetryTitles?: unknown; boxIdleNotify?: unknown; uiMode?: unknown };
+    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean; telemetryTitles?: boolean; boxIdleNotify?: boolean; uiMode?: string | null } = {};
     const has = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
     const uiModeAllowed = await uiModeOn(req.user);
 
@@ -591,6 +604,22 @@ export function authRouter(): Router {
       data.chatTurnNotify = body.chatTurnNotify;
     }
 
+    if (has('telemetryTitles')) {
+      if (typeof body.telemetryTitles !== 'boolean') {
+        res.status(400).json({ error: 'telemetryTitles must be a boolean' });
+        return;
+      }
+      data.telemetryTitles = body.telemetryTitles;
+    }
+
+    if (has('boxIdleNotify')) {
+      if (typeof body.boxIdleNotify !== 'boolean') {
+        res.status(400).json({ error: 'boxIdleNotify must be a boolean' });
+        return;
+      }
+      data.boxIdleNotify = body.boxIdleNotify;
+    }
+
     if (Object.keys(data).length === 0) {
       res.status(400).json({ error: 'No supported preference supplied' });
       return;
@@ -606,6 +635,8 @@ export function authRouter(): Router {
     req.user.theme = user.theme;
     req.user.pushMutesChat = user.pushMutesChat;
     req.user.chatTurnNotify = user.chatTurnNotify;
+    req.user.telemetryTitles = user.telemetryTitles;
+    req.user.boxIdleNotify = user.boxIdleNotify;
     req.user.uiMode = user.uiMode;
 
     res.json({ ...userPayload(user), ...withUiMode(uiModeAllowed, user) });
@@ -655,6 +686,7 @@ export function authRouter(): Router {
       const returnTo = takePostLoginRedirect(req.session, basePath, frontendUrl);
       req.login(user as Express.User, (err) => {
         if (err) return next(err);
+        markSignedIn(req.session);
         void ensureHostSetup(user);
         res.redirect(returnTo);
       });

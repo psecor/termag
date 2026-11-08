@@ -9,7 +9,7 @@ import { setWorkspaceChangeCallback } from '../services/workspaceEvents';
 type Box = {
   id: string; userId: string; name: string; kind: string; status: string;
   ec2InstanceId: string | null; autoTerminatedAt: Date | null; hibernationConfigured: boolean;
-  projects: { id: string; name: string; workstreams: { id: string }[] }[];
+  projects: { id: string; name: string; kind?: string; workstreams: { id: string }[] }[];
 };
 
 const state = { box: null as Box | null };
@@ -23,6 +23,7 @@ const prisma = {
   },
   project: { updateMany: vi.fn(async () => ({ count: 0 })) },
   agentToken: { updateMany: vi.fn(async () => ({ count: 0 })) },
+  spaceSlack: { findMany: vi.fn(async () => [{ projectId: 'p-space', space: { name: 'design' } }]) },
   $transaction: vi.fn(async () => []),
 };
 
@@ -42,7 +43,7 @@ vi.mock('../services/agentRegistry', () => ({
   isInstanceAgentConnected: vi.fn(() => true), sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []),
 }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {},
 }));
 vi.mock('../services/chatRevoke', () => ({ revokeChats: vi.fn(async () => null) }));
 
@@ -78,6 +79,21 @@ describe('terminateOwnedBox', () => {
     expect((await terminateOwnedBox(user, 'b1', false)).status).toBe(409);
     expect((await terminateOwnedBox({ id: 'u2' } as Express.User, 'b1', true)).status).toBe(404);
     expect(changed).not.toHaveBeenCalled();
+  });
+
+  // The web Terminate confirm names what the 409 lists: every live project,
+  // a space orchestrator's labelled (projectKind.ts inProjectLists).
+  it("names a space orchestrator's project, labelled, among the projects it would archive", async () => {
+    state.box = box({ projects: [
+      { id: 'p1', name: 'sample', kind: 'normal', workstreams: [] },
+      { id: 'p-space', name: 'space-design', kind: 'space-orchestrator', workstreams: [] },
+    ] });
+    const result = await terminateOwnedBox(user, 'b1', false);
+    expect(result.status).toBe(409);
+    expect((result.body as { projects: unknown[] }).projects).toEqual([
+      { id: 'p1', name: 'sample' },
+      { id: 'p-space', name: 'space-design', label: 'space orchestrator for design' },
+    ]);
   });
 });
 

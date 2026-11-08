@@ -7,7 +7,8 @@
  * only tool so far): the preview, one host's run, the fleet's and the runs
  * list. They restart people's sessions, so each takes a signed-in admin
  * session, never an admin token, and answers 404 claude_update_off while the
- * tool's flag (claude-code-update-enabled) is off. `component` is looked up in
+ * tool's update is off (its policy's mode off, or missing or malformed;
+ * services/toolUpdate/gate.ts). `component` is looked up in
  * services/toolUpdate/components.ts: an unknown one is 400 unknown_component.
  */
 import { Router, type Response } from 'express';

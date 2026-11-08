@@ -20,6 +20,11 @@ describe('validateWorkstreamRename', () => {
     expect(validateWorkstreamRename('feat-x', 'run-20261020-0900')).toMatchObject({ ok: false, error: expect.stringMatching(/scheduler/) });
     expect(validateWorkstreamRename('run-x', 'runway')).toEqual({ ok: true, name: 'runway' });
   });
+
+  it('refuses to take an ask thread\'s name', () => {
+    expect(validateWorkstreamRename('feat-x', 'ask-cmvpvr0by19t1ex4aevd9iv3e')).toMatchObject({ ok: false, error: expect.stringMatching(/ask threads/) });
+    expect(validateWorkstreamRename('feat-x', 'ask-short')).toEqual({ ok: true, name: 'ask-short' });
+  });
 });
 
 describe('planSessionRenames', () => {
@@ -30,13 +35,19 @@ describe('planSessionRenames', () => {
       { role: 'review', from: 'me-proj-old-review', to: 'me-proj-new-review' },
       // Every review slot.
       ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ role: 'review', from: `me-proj-old-review-${n}`, to: `me-proj-new-review-${n}` })),
+      // Every terminal slot past the ctrl pane.
+      ...[2, 3, 4, 5, 6, 7, 8].map(n => ({ role: 'ctrl', from: `me-proj-old-ctrl-${n}`, to: `me-proj-new-ctrl-${n}` })),
     ]);
   });
   it('renames the data pair for a data workflow and de-duplicates repeated types', () => {
     const plan = planSessionRenames('me', 'proj', 'old', 'new', ['data', 'data', 'agent']);
-    expect(plan.map(p => p.role)).toEqual(['data', 'data-ctrl', 'agent', 'ctrl', ...Array(8).fill('review')]);
+    expect(plan.map(p => p.role)).toEqual(['data', 'data-ctrl', 'agent', 'ctrl', ...Array(8).fill('review'), ...Array(7).fill('ctrl')]);
   });
-  it('is empty with no workflows', () => {
-    expect(planSessionRenames('me', 'proj', 'old', 'new', [])).toEqual([]);
+  it('renames an agentless workstream\'s terminal slots, which belong to the workstream', () => {
+    const plan = planSessionRenames('me', 'proj', 'old', 'new', ['data']);
+    expect(plan.map(p => p.role)).toEqual(['data', 'data-ctrl', ...Array(7).fill('ctrl')]);
+  });
+  it('leaves only terminal slots with no workflows (they exist on any workstream)', () => {
+    expect(planSessionRenames('me', 'proj', 'old', 'new', []).map(p => p.role)).toEqual(Array(7).fill('ctrl'));
   });
 });

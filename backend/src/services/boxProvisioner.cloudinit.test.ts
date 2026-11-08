@@ -230,7 +230,38 @@ describe('buildCloudInit: owner SSH keys (step 4c)', () => {
     const rsa = `ssh-rsa ${'A'.repeat(540)} ${'c'.repeat(200)}`;
     const keys: string[] = [];
     while (fitsManagedKeyBudget([...keys, rsa])) keys.push(rsa);
-    const out = buildCloudInit({ ...BASE, ownerAuthorizedKeys: keys });
-    expect(Buffer.byteLength(out, 'utf8')).toBeLessThan(16 * 1024);
+    // Setup off's step 6b makes its script the larger one.
+    for (const setupOff of [false, true]) {
+      const out = buildCloudInit({ ...BASE, ownerAuthorizedKeys: keys, setupOff });
+      expect(Buffer.byteLength(out, 'utf8'), `setupOff=${setupOff}`).toBeLessThan(16 * 1024);
+    }
+  });
+});
+
+describe('buildCloudInit: termag setup off (step 6b)', () => {
+  // The AMI is baked with setup on, so a box with it off has to
+  // write its marker and strip the bake's feature config before linger
+  // starts the user manager, and with it termag-reconcile.
+  it('is absent from a box with setup on', () => {
+    expect(buildCloudInit(BASE)).not.toContain('Step 6b');
+    expect(buildCloudInit(BASE)).not.toContain('--strip');
+  });
+
+  it('writes the marker (off), then strips, before Step 7', () => {
+    const out = buildCloudInit({ ...BASE, setupOff: true });
+    const marker = out.indexOf('.config/termag/setup');
+    expect(out).toContain('printf "off\\n"');
+    const strip = out.indexOf('termag-reconcile" --strip');
+    const step7 = out.indexOf('Step 7');
+    expect(marker).toBeGreaterThan(out.indexOf('Step 2: rename user'));
+    expect(strip).toBeGreaterThan(marker);
+    expect(step7).toBeGreaterThan(strip);
+  });
+
+  it('runs as the owner and cannot abort the boot', () => {
+    const out = buildCloudInit({ ...BASE, setupOff: true });
+    const step = out.slice(out.indexOf('Step 6b'), out.indexOf('Step 7'));
+    expect(step).toContain('sudo -u "$UNIX_USER" -H');
+    expect(step.match(/\|\| echo "WARNING: /g)).toHaveLength(2);
   });
 });

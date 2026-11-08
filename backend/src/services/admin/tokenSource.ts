@@ -36,3 +36,38 @@ export function tokenSourceSql(sinceKey: string, untilKey: string, userId?: stri
       AND to_char("startedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= ${untilKey} ${user}
   )`;
 }
+
+/**
+ * tokenSourceSql split by model, for a report grouped by `model` or `backend`:
+ * token_usage_model_days, plus every token_usage_days row that has no model rows
+ * (an agent from before the split, vibe, poller estimates) as model '', plus
+ * cloud sessions with the model they posted. Its totals equal tokenSourceSql's.
+ */
+export function modelTokenSourceSql(sinceKey: string, untilKey: string): Prisma.Sql {
+  return Prisma.sql`(
+    SELECT "userId", "hostKey", "provider", "date", "sourceKey", "projectId", "workstream", "model", "backend",
+           "input", "output", "cacheRead", "cacheCreate", "reasoning", "calls", false AS "estimated"
+    FROM token_usage_model_days
+    WHERE "date" >= ${sinceKey} AND "date" <= ${untilKey}
+    UNION ALL
+    SELECT d."userId", d."hostKey", d."provider", d."date", d."sourceKey", d."projectId", d."workstream", ''::text AS "model", ''::text AS "backend",
+           d."input", d."output", d."cacheRead", d."cacheCreate", d."reasoning", d."calls", d."estimated"
+    FROM token_usage_days d
+    WHERE d."date" >= ${sinceKey} AND d."date" <= ${untilKey}
+      AND NOT EXISTS (
+        SELECT 1 FROM token_usage_model_days m
+        WHERE m."userId" = d."userId" AND m."hostKey" = d."hostKey" AND m."provider" = d."provider"
+          AND m."date" = d."date" AND m."sourceKey" = d."sourceKey")
+    UNION ALL
+    SELECT "userId", "instanceId" AS "hostKey", ${CLOUD_TOKEN_PROVIDER}::text AS "provider",
+           to_char("startedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS "date", "orderId" AS "sourceKey",
+           NULL::text AS "projectId", NULL::text AS "workstream", COALESCE("model", '') AS "model", ''::text AS "backend",
+           COALESCE("inputTokens", 0) AS "input", COALESCE("outputTokens", 0) AS "output",
+           COALESCE("cacheReadTokens", 0) AS "cacheRead", COALESCE("cacheCreateTokens", 0) AS "cacheCreate",
+           0::bigint AS "reasoning", COALESCE("usageCalls", 1) AS "calls", false AS "estimated"
+    FROM claude_runner_sessions
+    WHERE "usageAt" IS NOT NULL
+      AND to_char("startedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD') >= ${sinceKey}
+      AND to_char("startedAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD') <= ${untilKey}
+  )`;
+}

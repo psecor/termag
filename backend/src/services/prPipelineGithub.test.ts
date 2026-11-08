@@ -204,6 +204,23 @@ describe('truncation and review-request time', () => {
   });
 });
 
+describe('who has reviewed a review-requested PR', () => {
+  it('the review search reads latest opinions with the selection ByNumber uses, so the two merge', () => {
+    expect(FRAGMENTS.Requested).toContain('decided: latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }');
+  });
+  it('parses people and bots apart, and leaves a PR without the field unknown', () => {
+    const node = { ...openNode, reviewDecision: 'REVIEW_REQUIRED', decided: { nodes: [
+      { state: 'APPROVED', author: { __typename: 'User', login: 'alice' } },
+      { state: 'CHANGES_REQUESTED', author: { __typename: 'User', login: 'bob' } },
+      { state: 'APPROVED', author: { __typename: 'Bot', login: 'cursor' } },
+    ] } };
+    const got = parseSearch({ viewer: { login: 'me' }, review: { nodes: [node] }, authored: { nodes: [openNode] } });
+    expect(got.reviewRequested[0].reviewers).toMatchObject({ approved: ['alice'], changes: ['bob'], botsApproved: ['cursor'] });
+    expect(got.reviewRequested[0].reviewDecision).toBe('REVIEW_REQUIRED');
+    expect(got.authored[0]).not.toHaveProperty('reviewers');
+  });
+});
+
 describe('paged searches (GitHub times out on big pages)', () => {
   const pr = (n: number, extra: Record<string, unknown> = {}) => ({
     ...openNode, number: n, url: `https://github.com/example-org/termag/pull/${n}`,

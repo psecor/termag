@@ -39,7 +39,7 @@ function share(over: Partial<ShareRow> = {}): ShareRow {
   };
 }
 
-function setup(opts: { share?: Partial<ShareRow>; box?: Partial<Instance> | null; viewerRow?: { revokedAt: Date | null } | null; wakeOn?: boolean; claim?: any; start?: () => Promise<void>; boxNow?: { status: string; autoTerminatedAt: Date | null } | null } = {}) {
+function setup(opts: { share?: Partial<ShareRow>; box?: Partial<Instance> | null; viewerRow?: { revokedAt: Date | null } | null; claim?: any; start?: () => Promise<void>; boxNow?: { status: string; autoTerminatedAt: Date | null } | null } = {}) {
   const s = share(opts.share);
   const instance = opts.box === null ? null : box(opts.box ?? {});
   const ctx: GuestShareContext = {
@@ -54,7 +54,6 @@ function setup(opts: { share?: Partial<ShareRow>; box?: Partial<Instance> | null
       refundWake: vi.fn(async () => {}),
       recordEvent: vi.fn(async () => {}),
     },
-    wakeOn: vi.fn(async () => opts.wakeOn ?? true),
     start: vi.fn(opts.start ?? (async () => {})),
     provisioningConfigured: () => true,
     notifyOwner: vi.fn(async (_o, text) => { notices.push(text); }),
@@ -99,9 +98,8 @@ describe('a reviewer waking the box', () => {
     expect(wake.store.claimWake).not.toHaveBeenCalled();
   });
 
-  it('a per-person share and the flag off never wake', async () => {
+  it('a per-person share never wakes', async () => {
     expect(await wakeFor(setup({ share: { audience: 'user', granteeId: viewer.id } }).deps, asUser(viewer), 'clink00000000001')).toMatchObject({ status: 409, body: { code: 'not-wakeable' } });
-    expect(await wakeFor(setup({ wakeOn: false }).deps, asUser(viewer), 'clink00000000001')).toMatchObject({ status: 409, body: { code: 'wake-off' } });
   });
 
   it('the owner\'s budget says when the next wake fits', async () => {
@@ -144,7 +142,6 @@ describe('a reviewer waking the box', () => {
   it('the guest page is told whether it may offer the wake', async () => {
     expect((await shareForGrantee(setup().deps, asUser(viewer), 'clink00000000001')).body).toMatchObject({ canWake: true, boxStatus: 'hibernated' });
     expect((await shareForGrantee(setup({ box: { lifecycleNote: null } }).deps, asUser(viewer), 'clink00000000001')).body).toMatchObject({ canWake: false });
-    expect((await shareForGrantee(setup({ wakeOn: false }).deps, asUser(viewer), 'clink00000000001')).body).toMatchObject({ canWake: false });
     // Its owner previewing as a guest starts the box themselves.
     expect((await shareForGrantee(setup().deps, asUser(owner), 'clink00000000001')).body).toMatchObject({ canWake: false });
   });

@@ -50,7 +50,7 @@ vi.mock('../services/githubCredential', () => ({
   recheckGithub: async () => { if (state.recheckError) throw state.recheckError; },
 }));
 vi.mock('../services/boxCreationGate', () => ({
-  readBoxCreationFacts: async () => ({ required: false, flagOn: false, hasGithubCredential: false }),
+  readBoxCreationFacts: async () => ({ required: false, hasGithubCredential: false }),
   boxGateState: () => 'off',
 }));
 

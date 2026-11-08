@@ -19,7 +19,6 @@ vi.mock('../spaces/spacesRuntime', () => ({
     lastPutAt: vi.fn(async () => null),
     ldUser: vi.fn(async () => ({ id: 'u1' })),
   },
-  spacesEnabledFor: vi.fn(async () => true),
 }));
 
 import {
@@ -75,16 +74,15 @@ describe('memory sync helpers', () => {
 
   it('decides who may mirror', () => {
     const space = { deletedAt: null, readOnlyAt: null };
-    expect(spaceSyncDecision({ flagOn: false, space, role: 'owner' })).toBe('spaces_off');
-    expect(spaceSyncDecision({ flagOn: true, space: null, role: undefined })).toBe('space_not_found');
-    expect(spaceSyncDecision({ flagOn: true, space: { ...space, deletedAt: new Date() }, role: 'owner' })).toBe('space_not_found');
-    expect(spaceSyncDecision({ flagOn: true, space, role: 'viewer' })).toBe('space_forbidden');
+    expect(spaceSyncDecision({ space: null, role: undefined })).toBe('space_not_found');
+    expect(spaceSyncDecision({ space: { ...space, deletedAt: new Date() }, role: 'owner' })).toBe('space_not_found');
+    expect(spaceSyncDecision({ space, role: 'viewer' })).toBe('space_forbidden');
     // A non-member learns nothing: the answer is the one a missing space gets.
-    expect(spaceSyncDecision({ flagOn: true, space, role: undefined })).toBe('space_not_found');
-    expect(spaceSyncDecision({ flagOn: true, space: { ...space, readOnlyAt: new Date() }, role: 'editor' })).toBe('space_read_only');
-    expect(spaceSyncDecision({ flagOn: true, space, role: 'editor' })).toBeNull();
-    expect(spaceSyncDecision({ flagOn: true, space, role: 'owner', shareesWithoutWrite: 1 })).toBe('shared_outside_space');
-    expect(spaceSyncDecision({ flagOn: true, space, role: 'owner', shareesWithoutWrite: 0 })).toBeNull();
+    expect(spaceSyncDecision({ space, role: undefined })).toBe('space_not_found');
+    expect(spaceSyncDecision({ space: { ...space, readOnlyAt: new Date() }, role: 'editor' })).toBe('space_read_only');
+    expect(spaceSyncDecision({ space, role: 'editor' })).toBeNull();
+    expect(spaceSyncDecision({ space, role: 'owner', shareesWithoutWrite: 1 })).toBe('shared_outside_space');
+    expect(spaceSyncDecision({ space, role: 'owner', shareesWithoutWrite: 0 })).toBeNull();
   });
 
   it('counts the sharees who cannot write the space', () => {

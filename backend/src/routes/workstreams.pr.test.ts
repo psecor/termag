@@ -64,6 +64,13 @@ describe('createWorkstreamFor with a pull request', () => {
     expect(got.status).toBe(409);
     expect(create).not.toHaveBeenCalled();
   });
+  it('refuses an adopted name reserved for ask threads', async () => {
+    send.mockResolvedValue({ ok: true, path: '/x', adopted: 'ask-cmvpvr0by19t1ex4aevd9iv3e' });
+    const got = await createWorkstreamFor(USER, 'p1', input);
+    expect(got.status).toBe(409);
+    expect((got.body as { error: string }).error).toMatch(/ask threads/);
+    expect(create).not.toHaveBeenCalled();
+  });
   it('asks for an agent update instead of calling an agent that lacks the RPC', async () => {
     vi.mocked(registry.projectAgentCapabilities).mockReturnValue([]);
     const got = await createWorkstreamFor(USER, 'p1', input);

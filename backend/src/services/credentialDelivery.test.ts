@@ -31,22 +31,14 @@ vi.mock('./credentialStore', () => ({
   }),
 }));
 
-const mcp = vi.hoisted(() => ({ flag: true, connectors: [] as { id: string; name: string }[], fail: false }));
+const mcp = vi.hoisted(() => ({ connectors: [] as { id: string; name: string; displayName?: string | null; oauthMetadata?: unknown }[], fail: false }));
 vi.mock('./mcpConnectorStore', () => ({
-  mcpBrokerEnabledForBox: async () => mcp.flag,
   listConnectors: async () => {
     if (mcp.fail) throw new Error('db down');
     return mcp.connectors;
   },
 }));
 
-const fireworks = vi.hoisted(() => ({ flag: true, fail: false }));
-vi.mock('./fireworksFlag', () => ({
-  fireworksEnabledForBox: async () => {
-    if (fireworks.fail) throw new Error('ld down');
-    return fireworks.flag;
-  },
-}));
 
 const { agentTelemetrySettings, deliverToInstance, deliveryInFlight, deliversGithub, planDelivery, providersFor, refusalFor, sessionTelemetrySettings, REASONS } = await import('./credentialDelivery');
 
@@ -112,6 +104,11 @@ describe('refusalFor', () => {
 
   it("never counts a user's own external machine, even with the capability", () => {
     expect(refusalFor({ conn: externalBox, capabilities: V1 })).toBe(REASONS.notManaged);
+  });
+
+  it('delivers nothing to a box with termag setup off, and says why', () => {
+    const setupOffBox = { kind: 'owned-box', user: { id: 'u' }, instance: { id: 'i', userId: 'u', kind: 'ec2', setupEnabled: false } } as never;
+    expect(refusalFor({ conn: setupOffBox, capabilities: V1 })).toBe(REASONS.setupOff);
   });
 });
 
@@ -372,9 +369,7 @@ describe('planDelivery: mcp', () => {
     expect(steps).toContainEqual({ type: 'credentials-apply', provider: 'mcp', payload: MCP });
   });
 
-  it('removes mcp with the reason when the broker is off for this box', () => {
-    expect(planDelivery({ ...OFF, mcp: null, mcpOffReason: REASONS.mcpOff }, CAPS))
-      .toContainEqual({ type: 'credentials-remove', provider: 'mcp', reason: REASONS.mcpOff });
+  it('removes mcp with the reason when there is no broker', () => {
     expect(planDelivery(OFF, CAPS)).toContainEqual({ type: 'credentials-remove', provider: 'mcp', reason: REASONS.noMcpBroker });
   });
 
@@ -403,20 +398,28 @@ describe('planDelivery: mcp', () => {
 describe('deliverToInstance: mcp', () => {
   const mcpSteps = () => (registry.sent as [string, string, { provider: string }][]).filter(([, , p]) => p.provider === 'mcp');
 
-  it('applies the connectors when the broker is configured and the flag is on, and removes them when it is off', async () => {
+  it('delivers the connector name, never the display name, as the mcpServers key', async () => {
     process.env.MCP_BROKER_URL = 'https://mcp-broker.example.test/';
     try {
       registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1'] };
-      mcp.flag = true;
+      mcp.connectors = [{ id: 'c1', name: 'claude-docs', displayName: 'Claude Docs' }];
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: { broker: 'https://mcp-broker.example.test', connectors: [{ id: 'c1', name: 'claude-docs' }] } }, 30_000]]);
+    } finally {
+      delete process.env.MCP_BROKER_URL;
+      mcp.connectors = [];
+    }
+  });
+
+  it('applies the connectors when the broker is configured, and sends no step when they cannot be read', async () => {
+    process.env.MCP_BROKER_URL = 'https://mcp-broker.example.test/';
+    try {
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1'] };
       mcp.connectors = [{ id: 'c1', name: 'figma' }];
       registry.sent = [];
       await deliverToInstance('i', 'u');
       expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: { broker: 'https://mcp-broker.example.test', connectors: [{ id: 'c1', name: 'figma' }] } }, 30_000]]);
-      mcp.flag = false;
-      registry.sent = [];
-      await deliverToInstance('i', 'u');
-      expect(mcpSteps()).toEqual([['i', 'credentials-remove', { provider: 'mcp', reason: REASONS.mcpOff }, 30_000]]);
-      mcp.flag = true;
       mcp.fail = true;
       registry.sent = [];
       await deliverToInstance('i', 'u');
@@ -435,7 +438,6 @@ describe('deliverToInstance: mcp for the other agents', () => {
   it('names every bridged agent for a v2 box, and nothing extra for a v1 box', async () => {
     process.env.MCP_BROKER_URL = `${BROKER}/`;
     try {
-      mcp.flag = true;
       mcp.connectors = [{ id: 'c1', name: 'figma' }];
       registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1', 'mcp-broker-v2'] };
       registry.sent = [];
@@ -452,6 +454,20 @@ describe('deliverToInstance: mcp for the other agents', () => {
       delete process.env.MCP_BROKER_URL;
     }
   });
+
+  it('never delivers a connector of kind "api" (Google) as an MCP server', async () => {
+    process.env.MCP_BROKER_URL = 'https://mcp-broker.example.test';
+    try {
+      mcp.connectors = [{ id: 'c1', name: 'figma' }, { id: 'cg', name: 'google', oauthMetadata: { api: 'google' } }];
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'mcp-broker-v1'] };
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(mcpSteps()).toEqual([['i', 'credentials-apply', { provider: 'mcp', payload: { broker: 'https://mcp-broker.example.test', connectors: [{ id: 'c1', name: 'figma' }] } }, 30_000]]);
+    } finally {
+      delete process.env.MCP_BROKER_URL;
+      mcp.connectors = [];
+    }
+  });
 });
 
 describe('planDelivery: fireworks', () => {
@@ -462,14 +478,11 @@ describe('planDelivery: fireworks', () => {
     expect(planDelivery({ ...OFF, fireworks: FW }, CAPS)).toContainEqual({ type: 'credentials-apply', provider: 'fireworks', payload: FW });
   });
 
-  it('removes fireworks with the reason when the flag is off or there is no gateway', () => {
-    expect(planDelivery({ ...OFF, fireworks: null, fireworksOffReason: REASONS.fireworksOff }, CAPS))
-      .toContainEqual({ type: 'credentials-remove', provider: 'fireworks', reason: REASONS.fireworksOff });
+  it('removes fireworks with the reason when there is no gateway', () => {
     expect(planDelivery(OFF, CAPS)).toContainEqual({ type: 'credentials-remove', provider: 'fireworks', reason: REASONS.noFireworks });
   });
 
-  it('sends no fireworks step when the flag could not be read, or to an agent without fireworks-v1', () => {
-    expect(planDelivery({ ...OFF, fireworksUnknown: true }, CAPS).some(s => s.provider === 'fireworks')).toBe(false);
+  it('sends no fireworks step to an agent without fireworks-v1', () => {
     expect(planDelivery({ ...OFF, fireworks: FW }, ALL).some(s => s.provider === 'fireworks')).toBe(false);
     expect(providersFor(ALL)).not.toContain('fireworks');
     expect(providersFor(CAPS)).toContain('fireworks');
@@ -479,28 +492,55 @@ describe('planDelivery: fireworks', () => {
 describe('deliverToInstance: fireworks', () => {
   const steps = () => (registry.sent as [string, string, { provider: string }][]).filter(([, , p]) => p.provider === 'fireworks');
 
-  it('applies the gateway base (no model list) when it is configured and the flag is on, removes it when off, and leaves it when the flag cannot be read', async () => {
+  it('applies the gateway base (no model list) when it is configured', async () => {
     process.env.FIREWORKS_GATEWAY_URL = 'https://claude-gateway.example.test/fireworks/';
     try {
       registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'fireworks-v1'] };
-      fireworks.flag = true;
       registry.sent = [];
       await deliverToInstance('i', 'u');
       expect(steps()).toEqual([['i', 'credentials-apply', {
         provider: 'fireworks',
         payload: { baseUrl: 'https://claude-gateway.example.test/fireworks' },
       }, 30_000]]);
-      fireworks.flag = false;
+    } finally {
+      delete process.env.FIREWORKS_GATEWAY_URL;
+    }
+  });
+});
+
+describe('bazel-cache', () => {
+  it('is gated on bazel-cache-v2, not option A\'s -v1', () => {
+    expect(providersFor([...ALL, 'bazel-cache-v2'])).toContain('bazel-cache');
+    expect(providersFor([...ALL, 'bazel-cache-v1'])).not.toContain('bazel-cache');
+  });
+
+  it('is never in planDelivery: its step goes through its own queue', () => {
+    expect(planDelivery(OFF, [...ALL, 'bazel-cache-v2']).some(s => s.provider === 'bazel-cache')).toBe(false);
+  });
+
+  it('is sent at connect, unchanged or not, to a managed bazel-cache-v2 box, and removed with the reason from a box that is not managed', async () => {
+    const steps = () => (registry.sent as [string, string, Record<string, unknown>][]).filter(([, , p]) => p.provider === 'bazel-cache');
+    process.env.BAZEL_CACHE_URL = 'https://termag-bazel-cache-1-us-east-2-an.s3.us-east-2.amazonaws.com';
+    try {
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1', 'bazel-cache-v2'] };
       registry.sent = [];
       await deliverToInstance('i', 'u');
-      expect(steps()).toEqual([['i', 'credentials-remove', { provider: 'fireworks', reason: REASONS.fireworksOff }, 30_000]]);
-      fireworks.fail = true;
+      await deliverToInstance('i', 'u');
+      // No flag source here, so the flag is its fallback, off: a remove with seq and flushGeneration, at every connect.
+      expect(steps()).toEqual([
+        ['i', 'credentials-remove', { provider: 'bazel-cache', reason: expect.stringContaining('box-bazel-cache-enabled'), flushGeneration: 0, seq: expect.any(Number) }, 30_000],
+        ['i', 'credentials-remove', { provider: 'bazel-cache', reason: expect.stringContaining('box-bazel-cache-enabled'), flushGeneration: 0, seq: expect.any(Number) }, 30_000],
+      ]);
+      registry.agent = { conn: externalBox, capabilities: ['credentials-v1', 'bazel-cache-v2'] };
+      registry.sent = [];
+      await deliverToInstance('i', 'u');
+      expect(steps()).toEqual([['i', 'credentials-remove', { provider: 'bazel-cache', reason: REASONS.notManaged }, 30_000]]);
+      registry.agent = { conn: ec2Box, capabilities: ['credentials-v1'] };
       registry.sent = [];
       await deliverToInstance('i', 'u');
       expect(steps()).toEqual([]);
     } finally {
-      delete process.env.FIREWORKS_GATEWAY_URL;
-      fireworks.fail = false;
+      delete process.env.BAZEL_CACHE_URL;
     }
   });
 });

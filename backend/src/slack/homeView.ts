@@ -12,6 +12,7 @@ import { getActiveProjectId } from './events';
 import { sessionName } from '../services/tmux';
 import { getStatus } from '../services/status';
 import { resolveTermagUser } from './userMapping';
+import { LISTED_PROJECT_KINDS } from '../services/projectKind';
 
 const STALE_MS = 10 * 60 * 1000;
 
@@ -61,7 +62,7 @@ async function buildHomeView(slackUserId: string, client?: WebClient) {
   } else {
     // Only show this user's projects
     const projects = await prisma.project.findMany({
-      where: { userId: termagUser.id, archived: false },
+      where: { userId: termagUser.id, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
       include: { workflows: true, user: true },
       orderBy: { name: 'asc' },
     });

@@ -230,6 +230,47 @@ export function warmPoolConfigFromEnv(env: WarmPoolEnv): WarmPoolConfig {
   };
 }
 
+// ── Environment pools ─────────────────────────────────────────────────────────
+
+export interface EnvPoolEnv {
+  ENV_POOL_MAX_INFLIGHT?: string;
+  ENV_POOL_REFRESH_MINUTES?: string;
+  ENV_POOL_PREPARE_TIMEOUT_MINUTES?: string;
+  ENV_POOL_CLAIM_WAIT_SECONDS?: string;
+}
+
+/**
+ * The environment pool's knobs ("Flags and
+ * configuration"). Which environments have a pool, and how deep, is the
+ * environment-pool-sizes flag (services/envPoolSizes.ts).
+ */
+export interface EnvPoolConfig {
+  /** Concurrent prepares (and, with refresh, refreshes) across every pool. 0 launches nothing. */
+  maxInFlight: number;
+  /** How often each stopped box is checked for a refresh (envPool.ts, planEnvPoolRefresh). */
+  refreshMs: number;
+  /** A box still `env-preparing` this long after its launch has failed. */
+  prepareTimeoutMs: number;
+  /** How long a claim waits for a started pool box's hello before trying the next one. */
+  claimWaitMs: number;
+}
+
+export const ENV_POOL_DEFAULTS: Readonly<EnvPoolConfig> = {
+  maxInFlight: 2,
+  refreshMs: 60 * 60 * 1000,
+  prepareTimeoutMs: 45 * 60 * 1000,
+  claimWaitMs: 120 * 1000,
+};
+
+export function envPoolConfigFromEnv(env: EnvPoolEnv): EnvPoolConfig {
+  return {
+    maxInFlight: wholeNumber(env.ENV_POOL_MAX_INFLIGHT, ENV_POOL_DEFAULTS.maxInFlight),
+    refreshMs: positiveNumber(env.ENV_POOL_REFRESH_MINUTES, ENV_POOL_DEFAULTS.refreshMs / 60_000) * 60_000,
+    prepareTimeoutMs: positiveNumber(env.ENV_POOL_PREPARE_TIMEOUT_MINUTES, ENV_POOL_DEFAULTS.prepareTimeoutMs / 60_000) * 60_000,
+    claimWaitMs: positiveNumber(env.ENV_POOL_CLAIM_WAIT_SECONDS, ENV_POOL_DEFAULTS.claimWaitMs / 1000) * 1000,
+  };
+}
+
 // Anything that is not a plain run of digits falls back. parseInt would read
 // "2 boxes" as 2 and "2.9" as 2; a knob that launches EC2 instances should not
 // guess at what a typo meant.

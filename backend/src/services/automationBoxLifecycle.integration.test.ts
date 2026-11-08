@@ -72,13 +72,16 @@ vi.mock('./boxProvisioner', async importOriginal => ({
 }));
 vi.mock('./productEvents', () => ({ recordProductEvent: () => {} }));
 vi.mock('./status', () => ({ getAllStatuses: () => new Map() }));
-// The flags as they were for zmay: the default window on at 6 h, auto-lifecycle and automations on,
-// and no start on another type when EC2 has no capacity (box-start-type-fallback-enabled, #1011, off).
+// The flags as they were for one user: the default window on at 6 h, auto-lifecycle and automations on.
 vi.mock('./featureFlags', () => ({
-  boolVariation: async (key: string) => key !== 'box-start-type-fallback-enabled',
+  boolVariation: async () => true,
   boolVariationForContext: async () => false,
   numberVariation: async (key: string, _u: unknown, fallback: number) => (key === 'box-idle-park-hours' ? 6 : fallback),
   jsonVariation: async () => null,
+}));
+// No other type of the box's shape has capacity either: the type walk (boxStartFallback.test.ts) rethrows the refusal.
+vi.mock('./boxStartFallback', () => ({
+  startOnFallbackType: async (_ec2: unknown, _instance: unknown, refusal: unknown) => { throw refusal; },
 }));
 const notices = vi.hoisted(() => [] as Array<{ kind: string; box: string; text: string }>);
 vi.mock('./boxIdleNotices', async importOriginal => ({

@@ -63,7 +63,7 @@ export function fileLinkResponseHeaders(path: string): { contentDisposition: str
 }
 
 /**
- * HTML a link renders as a page (behind spaces-html-links-enabled). S3 can't
+ * HTML a link renders as a page. S3 can't
  * attach a CSP to a presigned GET, so the orchestrator reads the file and
  * answers it itself, sandboxed: the page gets an opaque origin, so it can't
  * read the session cookie or call the API as the viewer, runs no script,

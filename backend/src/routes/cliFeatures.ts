@@ -6,14 +6,22 @@
 import { prisma } from '../db';
 import { AUTOMATIONS_FLAG } from '../services/automations/scheduler';
 import type { CliUser } from '../services/cliStore';
+import { desktopLiveChatEnabled } from '../services/desktopAppFlag';
 import { boolVariation } from '../services/featureFlags';
 
 export interface CliFeatures {
   /** automations-enabled, which /api/automations gates on: the desktop's Schedule at start. */
   automations: boolean;
+  /** desktop-live-chat-enabled, which the CLI's chat send and interrupt gate on (routes/cliChats.ts). */
+  liveChat: boolean;
 }
 
 export async function cliFeaturesFor(user: CliUser): Promise<CliFeatures> {
   const row = await prisma.user.findUnique({ where: { id: user.id } });
-  return { automations: row ? await boolVariation(AUTOMATIONS_FLAG, row, false) : false };
+  if (!row) return { automations: false, liveChat: false };
+  const [automations, liveChat] = await Promise.all([
+    boolVariation(AUTOMATIONS_FLAG, row, false),
+    desktopLiveChatEnabled(row),
+  ]);
+  return { automations, liveChat };
 }

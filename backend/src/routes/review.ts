@@ -1,4 +1,4 @@
-import { Router, RequestHandler } from 'express';
+import { Router, RequestHandler, type Request, type Response } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
@@ -9,6 +9,7 @@ import { noteBoxActivity } from '../services/boxActivity';
 import { assertSessionAccess, parseReviewSlot, SessionAccessError, type SessionAccess } from '../services/sessionAccess';
 import { MAX_REVIEW_SLOTS, exactPaneTarget, projectDirFor, reviewSessionName, reviewSessionNames, reviewSlotOf, sessionName } from '../services/tmux';
 import { boolVariation } from '../services/featureFlags';
+import { AGENT_OFFLINE, HeldReviewStarts, type StartAnswer } from '../services/reviewHeld';
 import { resolveProjectRoot } from '../services/projectPaths';
 import { getAllStatuses } from '../services/status';
 import { statusKey } from '../services/statusKey';
@@ -104,15 +105,55 @@ function withSlot(access: SessionAccess, slot: number): SessionAccess {
   return { ...access, slot, session: reviewSessionName(access.project.ownerUsername, access.project.name, access.workstream, slot) };
 }
 
-/** What the start route needs beyond the agent and the sweep; injectable so its slot choice is testable. */
+/** What the start route needs beyond the agent and the sweep; injectable so its slot choice and the wake are testable. */
 export interface ReviewRouteDeps {
   /** parallel-reviews-enabled for the user starting the review. */
   parallelOn: (user: Express.User) => Promise<boolean>;
+  /** box-wake-on-action-enabled for the user starting the review: a parked box of theirs is woken, the start held. */
+  wakeOn: (user: Express.User) => Promise<boolean>;
+  /** Asks a box of the user's to start: the owner-only path POST /instances/:id/start takes. */
+  startBox: (user: Express.User, instanceId: string) => Promise<StartAnswer>;
+  /** A box's status now, from the database; null when it's gone. */
+  boxStatus: (instanceId: string) => Promise<string | null>;
+  /** Where starts wait for their box (services/reviewHeld.ts). */
+  held: HeldReviewStarts;
 }
+
+/**
+ * A box's status for a held start. One the 60-day hibernation refresh woke (rehibernatePending, from its start until
+ * its stop settles; services/boxPower.ts rehibernateRefreshedBoxes) reads as `refreshing`: it's going straight back
+ * down, so a held start neither runs on it nor reads its stop as someone stopping it, and wakes it once it's down.
+ */
+const boxStatusOf = (id: string) => prisma.instance.findUnique({ where: { id }, select: { status: true, rehibernatePending: true } })
+  .then(i => (!i ? null : i.rehibernatePending && ['starting', 'awaiting-agent', 'ready', 'stopping'].includes(i.status) ? 'refreshing' : i.status));
 
 const defaultDeps: ReviewRouteDeps = {
   parallelOn: user => boolVariation('parallel-reviews-enabled', user, false),
+  wakeOn: user => boolVariation('box-wake-on-action-enabled', user, false),
+  // Imported when first used: routes/instances.ts pulls in the provisioning stack.
+  startBox: async (user, instanceId) => (await import('./instances')).powerOwnedBox(user, instanceId, 'start'),
+  boxStatus: boxStatusOf,
+  held: new HeldReviewStarts({ boxStatus: boxStatusOf, now: () => Date.now() }),
 };
+
+/** A box a held start waits through: asleep (woken), or on its way up or down. */
+const WAKEABLE = new Set(['stopping', 'stopped', 'starting', 'hibernating', 'hibernated']);
+/** A box on its way up: a start refused by it was beaten to it, not refused. */
+const COMING_UP = new Set(['starting', 'provisioning', 'awaiting-agent', 'ready', 'refreshing']);
+
+/** Runs a route handler on a request of its own and resolves with what it answered: a held start's replay. */
+function captureAnswer(handler: RequestHandler, req: Request): Promise<StartAnswer> {
+  return new Promise(resolve => {
+    let code = 200;
+    const res = {
+      status(c: number) { code = c; return res; },
+      json(body: unknown) { resolve({ status: code, body }); return res; },
+    } as unknown as Response;
+    const failed = (err: unknown) => resolve({ status: 500, body: { error: err instanceof Error ? err.message : 'The review could not start' } });
+    // The first answer wins; a handler that returned without one answered nothing, which is a failure.
+    Promise.resolve(handler(req, res, failed)).then(() => failed(null), failed);
+  });
+}
 
 // One start at a time per workstream: two quick ones would otherwise both
 // read the same slot as free, and the second would kill the first's pane.
@@ -136,7 +177,8 @@ async function workstreamPaths(access: SessionAccess): Promise<{ cwd: string; ho
     where: { id: access.project.id },
     select: {
       name: true, layout: true, user: { select: { unixUsername: true } }, instance: { select: { hostHome: true } },
-      repos: { select: { name: true, url: true, position: true }, orderBy: { position: 'asc' } },
+      // A repository still cloning (one added since) has no worktree to read yet.
+      repos: { where: { setupStatus: 'ready' }, select: { name: true, url: true, position: true }, orderBy: { position: 'asc' } },
     },
   });
   if (!p) throw new SessionAccessError(404, 'Project not found');
@@ -197,8 +239,54 @@ function workstreamReviews(access: SessionAccess) {
   return reviewRecordsOf(access.host.instanceId, agentSession).map(reviewMetaOf);
 }
 
-export function reviewRouter(deps: ReviewRouteDeps = defaultDeps): Router {
+export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
+  const deps: ReviewRouteDeps = { ...defaultDeps, ...overrides };
   const router = Router();
+
+  /**
+   * A start on a parked box, with box-wake-on-action-enabled ("A review target on a box
+   * that's asleep"): the caller's own box is woken and the start held until it's ready (services/reviewHeld.ts),
+   * answered 202 now. Someone else's box is a 409 that says who can wake it. Null: refused as before (the flag off,
+   * or a status a start can't wait through).
+   */
+  async function holdForWake(
+    req: Request, workstream: string, instance: { id: string; name: string; userId: string | null; status: string }, pr: number, reviewer: string,
+    url: string | null, session: string,
+  ): Promise<StartAnswer | null> {
+    if (!WAKEABLE.has(instance.status) || !(await deps.wakeOn(req.user!))) return null;
+    if (instance.userId !== req.user!.id) {
+      return { status: 409, body: { error: `${instance.name} is ${instance.status}, and only its owner can start it. Ask them to, then Review again.` } };
+    }
+    const asleep = instance.status === 'stopped' || instance.status === 'hibernated';
+    const wake = () => deps.startBox(req.user!, instance.id);
+    // Whether this start woke the box: a box another start is waking (beaten to it, below) isn't, so the sweep wakes
+    // it itself should that start fail and the box go back to sleep.
+    let woken = false;
+    // What the box was after a refused wake: `refreshing`, the hibernation refresh beat this start to it.
+    let seen: string | null = null;
+    if (asleep) {
+      const asked = await wake();
+      woken = asked.status < 300;
+      // Refused because something else woke it first (another Review, the Boxes list): it's coming up, so the start
+      // is held all the same. Anything else (terminated, quarantined) is the refusal.
+      seen = woken ? null : await deps.boxStatus(instance.id).catch(() => null);
+      if (!woken && !COMING_UP.has(seen ?? '')) {
+        const why = (asked.body as { error?: unknown } | null)?.error;
+        return { status: 409, body: { error: `Couldn't wake ${instance.name}: ${typeof why === 'string' ? why.replace(/\.$/, '') : 'the start was refused'}. Start it from your boxes, then Review again.` } };
+      }
+    }
+    // The start as it was asked, run again once the box is ready: the same checks, from the top.
+    const again = { user: req.user, params: { ...req.params }, query: { ...req.query }, body: req.body } as unknown as Request;
+    const held = deps.held.hold({
+      projectId: req.params.id, workstream, instanceId: instance.id, box: instance.name, pr, reviewer, woken, beaten: asleep && !woken,
+      refreshSeen: seen === 'refreshing',
+      wake, replay: () => captureAnswer(start, again),
+    });
+    // The start's own fields as far as they're known, for clients that read them (Lab opens `session`, the phone keeps
+    // it): the pane the start asked for, or the workstream's first, where the replay starts it unless parallel reviews
+    // pick another.
+    return { status: 202, body: { ok: true, held: true, box: instance.name, state: held.state, pr, url, reviewer, session } };
+  }
 
   const guess: RequestHandler = async (req, res) => {
     const access = await accessOr404(req, res, 'agent');
@@ -346,13 +434,23 @@ export function reviewRouter(deps: ReviewRouteDeps = defaultDeps): Router {
     // stays connected until EC2 powers it off) that dies with it.
     const parked = await prisma.project.findUnique({
       where: { id: wsAccess.project.id },
-      select: { id: true, setupStatus: true, instance: { select: { status: true } } },
+      select: { id: true, setupStatus: true, instance: { select: { id: true, name: true, userId: true, status: true } } },
     });
     const parkedError = parked?.instance ? powerStateError(parked.instance.status) : null;
-    if (parkedError) { res.status(409).json({ error: parkedError }); return; }
     const unready = parked && refuseUnreadySessions(parked);
+    if (parkedError) {
+      // A project whose checkout isn't there (its clone failed, or never ran) can't take a review once its box is up
+      // either: with the wake on, it says so now rather than waking the box for a start that will be refused.
+      if (unready && await deps.wakeOn(req.user!)) { res.status(409).json({ error: unready.message }); return; }
+      const session = askedSlot !== null ? withSlot(wsAccess, askedSlot).session : wsAccess.session;
+      const held = await holdForWake(req, wsAccess.workstream, parked!.instance!, pr, reviewer, typeof url === 'string' ? url : null, session);
+      if (held) { res.status(held.status).json(held.body); return; }
+      res.status(409).json({ error: parkedError });
+      return;
+    }
     if (unready) { res.status(409).json({ error: unready.message }); return; }
-    if (!isProjectAgentConnected(wsAccess.host)) { res.status(503).json({ error: "Owner's agent is offline" }); return; }
+    // Before anything runs on the box: the one 503 a held start's replay tries again (services/reviewHeld.ts).
+    if (!isProjectAgentConnected(wsAccess.host)) { res.status(503).json({ error: AGENT_OFFLINE }); return; }
 
     const paths = await pathsP;
     const { home } = paths;
@@ -466,5 +564,11 @@ export function reviewRouter(deps: ReviewRouteDeps = defaultDeps): Router {
   router.post('/projects/:id/review', requireAuth, asyncHandler(start));
   router.delete('/projects/:id/review', requireAuth, asyncHandler(stop));
   router.post('/projects/:id/review/seen', requireAuth, asyncHandler(seen));
+  // A start held while its box wakes (box-wake-on-action-enabled): its state and, failed, why, for the Review tab.
+  router.get('/projects/:id/review/held', requireAuth, asyncHandler(async (req, res) => {
+    const access = await accessOr404(req, res, 'review');
+    if (!access) return;
+    res.json({ held: deps.held.get(access.project.id, access.workstream) });
+  }));
   return router;
 }

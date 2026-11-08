@@ -1,5 +1,5 @@
 // A simple-UI chat's effort (services/chatEffort.ts): carried on chat-send
-// with the sender's chat-effort-enabled, to a runner with chat-effort-v1, for a
+// to a runner with chat-effort-v1, for a
 // chat on Claude's own models; dropped, never refused, anywhere else.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +10,8 @@ const ALL_CAPS = ['chat-runner-v1', 'chat-trust-v1', 'chat-backend-v1', 'firewor
 
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
+  // Every send checks for a resume onto this box whose session is still to restore: none here.
+  chatResume: { findFirst: vi.fn(async () => null) },
   workflow: { update: vi.fn() },
   // chatLaunchFor reads whether the owner has the Claude gateway on.
   user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: true })) },
@@ -65,13 +67,12 @@ beforeEach(() => {
   caps.list = ALL_CAPS;
   flags.box = FW;
   flags.viewer = FW;
-  ld.on = new Set(['chat-effort-enabled']);
   prisma.workflow.update.mockResolvedValue({});
   storedOn(null, 'opus');
 });
 
 describe('chat effort', () => {
-  it('carries a chosen effort to the box with the flag on and a runner that takes it', async () => {
+  it('carries a chosen effort to the box on a runner that takes it', async () => {
     expect((await chatSendFor('owner', 'p1', { workstream: 'main', text: 'hi', effort: 'high' }, viewer)).status).toBe(202);
     expect(sent('chat-send')[0]).toMatchObject({ effort: 'high', model: 'opus' });
   });
@@ -82,10 +83,7 @@ describe('chat effort', () => {
     for (const payload of sent('chat-send')) expect(payload).not.toHaveProperty('effort');
   });
 
-  it('drops it with the flag off, on a runner without chat-effort-v1, and on Fireworks', async () => {
-    ld.on = new Set();
-    expect((await chatSendFor('owner', 'p1', { workstream: 'main', text: 'off', effort: 'max' }, viewer)).status).toBe(202);
-    ld.on = new Set(['chat-effort-enabled']);
+  it('drops it on a runner without chat-effort-v1, and on Fireworks', async () => {
     caps.list = ALL_CAPS.filter(c => c !== 'chat-effort-v1');
     expect((await chatSendFor('owner', 'p1', { workstream: 'main', text: 'old', effort: 'max' }, viewer)).status).toBe(202);
     caps.list = ALL_CAPS;
@@ -94,11 +92,8 @@ describe('chat effort', () => {
   });
 
   it("tells the composer whether this chat offers an effort", async () => {
-    const body = async () => (await chatHistoryFor('owner', 'p1', { workstream: 'main' }, viewer)).body as Record<string, unknown>;
+    const body = async () => (await chatHistoryFor('owner', 'p1', { workstream: 'main' })).body as Record<string, unknown>;
     expect((await body()).effortInput).toBe(true);
-    ld.on = new Set();
-    expect((await body()).effortInput).toBe(false);
-    ld.on = new Set(['chat-effort-enabled']);
     caps.list = ALL_CAPS.filter(c => c !== 'chat-effort-v1');
     expect((await body()).effortInput).toBe(false);
     caps.list = ALL_CAPS;

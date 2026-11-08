@@ -13,7 +13,7 @@
  */
 import { sendForProject, ProjectHost } from '../services/agentRegistry';
 import { noteBoxActivity } from '../services/boxActivity';
-import { cleanPaneText, formatPaneForSlack } from '../services/tmux';
+import { cleanPaneText, exactPaneTarget, formatPaneForSlack } from '../services/tmux';
 import { isAmbiguousSession, resolveSessionProject } from '../services/sessionResolver';
 
 /**
@@ -37,7 +37,9 @@ export async function capturePaneForSlack(
   const host = await hostForSession(session, instanceId);
   if (!host) return '(unable to capture pane)';
   try {
-    const r = await sendForProject(host, 'tmux-capture', { sessionName: session, lines });
+    // Exact target: a dead slot name (`…-ctrl-2`)
+    // must not prefix-match a longer live session (another project's pane).
+    const r = await sendForProject(host, 'tmux-capture', { sessionName: exactPaneTarget(session), lines });
     return cleanPaneText(typeof r?.content === 'string' ? r.content : '');
   } catch {
     return '(unable to capture pane)';
@@ -49,7 +51,7 @@ export async function hasSession(session: string, instanceId?: string | null): P
   const host = await hostForSession(session, instanceId);
   if (!host) return false;
   try {
-    const r = await sendForProject(host, 'tmux-has-session', { sessionName: session });
+    const r = await sendForProject(host, 'tmux-has-session', { sessionName: exactPaneTarget(session) });
     return !!r?.exists;
   } catch {
     return false;
@@ -67,7 +69,7 @@ export async function sendKeys(
   if (!host) return;
   noteBoxActivity(host.instanceId);
   try {
-    await sendForProject(host, 'tmux-send-keys', { sessionName: session, keys: command, withEnter });
+    await sendForProject(host, 'tmux-send-keys', { sessionName: exactPaneTarget(session), keys: command, withEnter });
   } catch {
     /* ignore — best effort */
   }

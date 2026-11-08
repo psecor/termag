@@ -65,6 +65,7 @@ describe('routes that make sessions on a box', () => {
     expect(guarded(projectsRouter())).toEqual([
       'POST /:id/clone/retry',
       'POST /:id/clone/start-empty',
+      'POST /:id/repos',
       'POST /:id/workflows',
     ]);
     expect(guarded(claudeLoginRouter())).toEqual([

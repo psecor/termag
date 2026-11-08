@@ -38,6 +38,8 @@ export interface SessionHit {
   workstream: string;
   role: string;
   session: string;
+  /** The pane's slot within its role (services/sessionInventory.ts): a review slot, or a terminal slot past the ctrl pane. */
+  slot?: number;
   status: string;
   /** All matching lines in the capture; `matches` holds at most a few. */
   matchCount: number;
@@ -160,14 +162,15 @@ export async function searchSessions(
       let project = projects.get(row.projectId);
       if (!project) { project = deps.accessProject(userId, row.projectId); projects.set(row.projectId, project); }
       const forPane = await project;
-      // A review row past slot 1 names its slot (services/sessionInventory.ts); the rest are role + workstream.
-      const a = row.role === 'review' && row.slot !== undefined ? forPane(row.role, row.workstream, row.slot) : forPane(row.role, row.workstream);
+      // A row past slot 1 names its slot (services/sessionInventory.ts): review
+      // slots and the user's terminal slots. The rest are role + workstream.
+      const a = row.slot !== undefined && row.slot !== 1 ? forPane(row.role, row.workstream, row.slot) : forPane(row.role, row.workstream);
       const content = await deps.capture(a.host, a.session, lines);
       const m = findMatches(content, query);
       if (m.count === 0) return;
       found.push({
         projectId: row.projectId, projectName: row.projectName, owner: row.owner, access: row.access,
-        workstream: row.workstream, role: row.role, session: a.session, status: row.status,
+        workstream: row.workstream, role: row.role, session: a.session, ...(row.slot !== undefined ? { slot: row.slot } : {}), status: row.status,
         matchCount: m.count, matches: m.matches, fromBottom: m.totalLines - m.lastLine,
       });
     } catch {

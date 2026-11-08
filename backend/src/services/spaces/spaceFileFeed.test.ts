@@ -3,7 +3,6 @@ import { spaceFileFeed, type FeedClient } from './spaceFileFeed';
 import { MemorySpaceStore } from './spacesTestkit';
 
 let store: MemorySpaceStore;
-let enabled: Set<string>;
 let got: Map<string, unknown[]>;
 let clients: FeedClient[];
 let spaceId: string;
@@ -13,13 +12,12 @@ function client(userId: string, tag = userId): FeedClient {
 }
 
 const feed = () => spaceFileFeed({
-  store, enabled: async u => enabled.has(u), clients: () => clients,
+  store, clients: () => clients,
 });
 
 beforeEach(async () => {
   store = new MemorySpaceStore();
   for (const u of ['alice', 'bob', 'carol', 'dave']) store.addUser(u);
-  enabled = new Set(['alice', 'bob', 'carol', 'dave']);
   got = new Map();
   const s = await store.createSpace({ name: 'improve-termag', description: null, userId: 'alice' });
   spaceId = s.id;
@@ -39,13 +37,6 @@ describe('deliver', () => {
     expect(got.get('bob')).toEqual([frame]);
     expect(got.has('carol')).toBe(false); // owns another space, not this one
     expect(got.has('dave')).toBe(false);
-  });
-
-  it('skips a member with spaces-enabled off', async () => {
-    enabled.delete('bob');
-    enabled.delete('alice');
-    await feed().deliver({ spaceId, kind: 'rm', path: 'a.md' });
-    expect(got.size).toBe(0);
   });
 
   it('sends nothing for a deleted space, an unknown id, or a name passed as the id', async () => {
@@ -70,11 +61,9 @@ describe('deliver', () => {
 });
 
 describe('resync', () => {
-  it('goes to every socket with spaces-enabled on, naming nothing', async () => {
-    enabled.delete('dave');
+  it('goes to every socket, naming nothing', async () => {
     await feed().resync();
     expect(got.get('carol')).toEqual([{ type: 'space-file', resync: true }]);
     expect(got.get('alice-2')).toEqual([{ type: 'space-file', resync: true }]);
-    expect(got.has('dave')).toBe(false);
   });
 });

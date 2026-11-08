@@ -5,12 +5,16 @@
  * bug_report_events row. Reads work with an admin token; triage needs a
  * signed-in session, like the other admin writes.
  *
+ * The same handlers also serve an admin's box (routes/cliBugReports.ts): on
+ * /api/cli/v1/bug-reports, with the box's own token, behind its own admin
+ * check and audit row. Nothing else under /api/admin takes a box token.
+ *
  *   GET   /bug-reports            ?status=&area=&severity=&q=&limit=, new first
  *   GET   /bug-reports/counts     reports per status (the nav badge reads `new`)
  *   GET   /bug-reports/:id        one, with its history, duplicates and names
  *   PATCH /bug-reports/:id        { status?, duplicateOf?, link?, note? }
  */
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import { asyncHandler } from '../../middleware/errors';
 import { requireAdminSession } from '../../middleware/admin';
 import { fillCounts, parseBugFilter, parseTriageChange, sortNewFirst, type BugReportRow, type BugReportStore } from '../../services/bugReports';
@@ -21,10 +25,16 @@ function summary(r: BugReportRow) {
   return { id: r.id, title: r.title, status: r.status, severity: r.severity, area: r.area, createdAt: r.createdAt.toISOString() };
 }
 
-export function bugsRouter(store: BugReportStore, now: () => Date = () => new Date()): Router {
-  const router = Router();
+export interface BugHandlers {
+  list: RequestHandler;
+  counts: RequestHandler;
+  detail: RequestHandler;
+  /** Reads req.user as the admin who made the change. */
+  triage: RequestHandler;
+}
 
-  router.get('/bug-reports', asyncHandler(async (req, res) => {
+export function bugHandlers(store: BugReportStore, now: () => Date = () => new Date()): BugHandlers {
+  const list = asyncHandler(async (req, res) => {
     const filter = parseBugFilter(req.query as Record<string, unknown>);
     if ('error' in filter) { res.status(400).json({ error: filter.error }); return; }
     const rows = sortNewFirst(await store.list(filter.ok));
@@ -43,14 +53,13 @@ export function bugsRouter(store: BugReportStore, now: () => Date = () => new Da
         duplicateOfId: r.duplicateOfId,
       })),
     });
-  }));
+  });
 
-  // Before /:id, which would take "counts" for an id.
-  router.get('/bug-reports/counts', asyncHandler(async (_req, res) => {
+  const counts = asyncHandler(async (_req, res) => {
     res.json({ counts: fillCounts(await store.countsByStatus()) });
-  }));
+  });
 
-  router.get('/bug-reports/:id', asyncHandler(async (req, res) => {
+  const detail = asyncHandler(async (req, res) => {
     const id = req.params.id;
     const report = ID_RE.test(id) ? await store.get(id) : null;
     if (!report) { res.status(404).json({ error: 'No such bug report' }); return; }
@@ -73,9 +82,9 @@ export function bugsRouter(store: BugReportStore, now: () => Date = () => new Da
       duplicateOf: duplicateOf ? summary(duplicateOf) : null,
       duplicates: duplicates.map(summary),
     });
-  }));
+  });
 
-  router.patch('/bug-reports/:id', requireAdminSession, asyncHandler(async (req, res) => {
+  const triage = asyncHandler(async (req, res) => {
     const id = req.params.id;
     const report = ID_RE.test(id) ? await store.get(id) : null;
     if (!report) { res.status(404).json({ error: 'No such bug report' }); return; }
@@ -90,7 +99,18 @@ export function bugsRouter(store: BugReportStore, now: () => Date = () => new Da
     }
     const updated = await store.triage(id, change.ok, req.user!.id, now());
     res.json({ report: { ...updated, createdAt: updated.createdAt.toISOString(), triagedAt: updated.triagedAt?.toISOString() ?? null } });
-  }));
+  });
 
+  return { list, counts, detail, triage };
+}
+
+export function bugsRouter(store: BugReportStore, now: () => Date = () => new Date()): Router {
+  const router = Router();
+  const h = bugHandlers(store, now);
+  router.get('/bug-reports', h.list);
+  // Before /:id, which would take "counts" for an id.
+  router.get('/bug-reports/counts', h.counts);
+  router.get('/bug-reports/:id', h.detail);
+  router.patch('/bug-reports/:id', requireAdminSession, h.triage);
   return router;
 }

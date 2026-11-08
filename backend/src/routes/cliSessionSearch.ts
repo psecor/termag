@@ -7,8 +7,7 @@
  * The body is /api/sessions/search's (routes/sessions.ts searchFor), from the same search: its
  * query checks, its short cache, and its rate limit, keyed per device sign-in so two of the
  * person's computers don't share one budget. A device sign-in's only (a box's own token gets 403:
- * anything on the box could read every pane), behind `desktop-app-enabled` for the person (off:
- * 404).
+ * anything on the box could read every pane).
  */
 import type { RequestHandler, Response, Router } from 'express';
 import { asyncHandler } from '../middleware/errors';
@@ -17,8 +16,6 @@ import type { CliAuth } from './cliApi';
 import type { RouteResult } from './routeResult';
 
 export interface CliSessionSearch {
-  /** desktop-app-enabled for this person. */
-  enabled(user: CliUser): Promise<boolean>;
   /** `query` as the request had it; `callerId` keys the rate limit. */
   search(user: CliUser, query: Record<string, unknown>, callerId: string): Promise<RouteResult>;
 }
@@ -37,7 +34,6 @@ export function mountCliSessionSearchRoutes(router: Router, deps: CliSessionSear
   const gate: RequestHandler = asyncHandler(async (_req, res, next) => {
     const { user, credential } = cliAuth(res);
     if (credential.kind !== 'device') { res.status(403).json(DEVICE_ONLY); return; }
-    if (!(await deps.enabled(user))) { res.status(404).json(NOT_FOUND); return; }
     next();
   });
 

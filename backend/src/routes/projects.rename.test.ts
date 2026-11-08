@@ -38,6 +38,7 @@ vi.mock('../services/agentRuntime', () => ({
   ensureAgentSessionsAndLaunch,
   resolveAgentProvider: (p: string) => p,
   stopAgentSessions: vi.fn(),
+  stopTerminalSlots: vi.fn(),
 }));
 
 const { renameOwnedProject } = await import('./projects');

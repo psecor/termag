@@ -8,6 +8,11 @@
  * An owner it can't find gets the box row
  * alone, and every send records box.idle.notice with whether it went, so the
  * pilot can measure the reach.
+ *
+ * Every stop notice carries Stop these messages, which turns off the owner's
+ * User.boxIdleNotify (also Settings > Box notices); off, the stop notices
+ * are skipped and recorded as muted. The automations-paused notice still
+ * goes: nothing else says an automation stopped running.
  */
 import { prisma } from '../db';
 import { getSlackApp } from '../slack/app';
@@ -17,6 +22,7 @@ import type { IdleLimit, ParkAction } from './boxLifecyclePolicy';
 import { recordProductEvent } from './productEvents';
 
 export const KEEP_RUNNING_ACTION = 'box_keep_running';
+export const STOP_NOTICES_ACTION = 'box_idle_notices_off';
 
 export interface NoticeOwner {
   id: string;
@@ -51,6 +57,21 @@ export function aboutDuration(ms: number): string {
 function openTermagButton(): unknown[] {
   const base = webBase();
   return base ? [{ type: 'button', text: { type: 'plain_text', text: 'Open termag' }, url: base }] : [];
+}
+
+function stopNoticesButton(): unknown {
+  return { type: 'button', action_id: STOP_NOTICES_ACTION, text: { type: 'plain_text', text: 'Stop these messages' }, value: 'off' };
+}
+
+/** The message's text, then its buttons: Open termag where there is a web base, and Stop these messages. */
+function stopNotice(text: string): SlackMessage {
+  return {
+    text,
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text } },
+      { type: 'actions', elements: [...openTermagButton(), stopNoticesButton()] },
+    ],
+  };
 }
 
 export interface WarningFacts {
@@ -89,6 +110,7 @@ export function warningMessage(box: NoticeBox, facts: WarningFacts, nowMs: numbe
         elements: [
           { type: 'button', action_id: KEEP_RUNNING_ACTION, style: 'primary', text: { type: 'plain_text', text: 'Keep running' }, value: box.id },
           ...openTermagButton(),
+          stopNoticesButton(),
         ],
       },
     ],
@@ -140,8 +162,7 @@ export function parkedMessage(box: NoticeBox, result: 'stopped' | 'hibernated', 
       scanClause(scan),
       `To get it back, open termag › Boxes › Resume box, or run \`termag box start ${name}\`.`,
     ];
-  const text = parts.join(' ');
-  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: openTermagButton() }].filter(b => b.type !== 'actions' || (b as { elements: unknown[] }).elements.length > 0) };
+  return stopNotice(parts.join(' '));
 }
 
 /** The warning before the sweep stops a box that never came up after a start. */
@@ -151,7 +172,7 @@ export function stuckStartWarningMessage(box: NoticeBox, startedAt: Date, stopAt
     + `so termag can't reach it. It will be stopped in ${aboutDuration(stopAt.getTime() - nowMs)} so it stops billing; `
     + 'its disks, projects and checkouts are kept. If you are using it over SSH, restart its agent '
     + '(`systemctl --user restart termag-agent`) and it is kept.';
-  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: openTermagButton() }].filter(b => b.type !== 'actions' || (b as { elements: unknown[] }).elements.length > 0) };
+  return stopNotice(text);
 }
 
 /** The notice for a box the sweep stopped because it never came up after a start. */
@@ -161,7 +182,7 @@ export function stuckStartMessage(box: NoticeBox, startedAt: Date | null): Slack
   const text = `I stopped *${name}*: it was started${when}, and its agent never connected, `
     + 'so it was running with nobody able to use it. Its disks, projects and checkouts are kept. '
     + `Start it again from termag or with \`termag box start ${name}\`, or terminate it if that keeps happening.`;
-  return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }] };
+  return stopNotice(text);
 }
 
 /**
@@ -179,15 +200,23 @@ export function automationsPausedMessage(box: NoticeBox, names: string[], by: 'l
   return { text, blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }, { type: 'actions', elements: openTermagButton() }].filter(b => b.type !== 'actions' || (b as { elements: unknown[] }).elements.length > 0) };
 }
 
+/** Whether the owner turned the stop notices off. A failed read sends: the default is on. */
+async function stopNoticesMuted(ownerId: string): Promise<boolean> {
+  const row = await prisma.user.findUnique({ where: { id: ownerId }, select: { boxIdleNotify: true } }).catch(() => null);
+  return row?.boxIdleNotify === false;
+}
+
 /**
- * DM the owner. Never throws: a box goes down whether or not anyone could be
- * told. Records box.idle.notice either way.
+ * DM the owner, unless a warning or parked notice and they turned those off.
+ * Never throws: a box goes down whether or not anyone could be told. Records
+ * box.idle.notice either way.
  */
 export async function sendIdleNotice(kind: 'warning' | 'parked' | 'automation-paused', owner: NoticeOwner, box: NoticeBox, message: SlackMessage): Promise<boolean> {
   const event = (delivered: boolean, reason: string) => {
     recordProductEvent('box.idle.notice', { user: owner.id, box: box.id }, { kind, delivered, reason });
     return delivered;
   };
+  if (kind !== 'automation-paused' && await stopNoticesMuted(owner.id)) return event(false, 'muted');
   const client = getSlackApp()?.client;
   if (!client) return event(false, 'no-slack');
   const channel = await slackIdFor(client, owner);
@@ -210,12 +239,44 @@ export async function automationsSkippedWhileParked(boxId: string): Promise<numb
     .catch(() => 0);
 }
 
+const NOTICES_OFF_TEXT = "Done: I won't message you when termag stops one of your idle boxes. It still stops them, "
+  + 'and the box list in termag shows when.';
+
+/**
+ * Stop these messages, on any stop notice: turns off the clicking person's
+ * own stop notices (User.boxIdleNotify), whoever's box the message was about,
+ * and answers in the conversation with where to turn them back on. The
+ * message itself is left as it was, so a warning's Keep running still works.
+ */
+export function registerStopNoticesAction(app: any): void {
+  app.action(STOP_NOTICES_ACTION, async ({ ack, body, client }: any) => {
+    await ack();
+    const slackUserId = body?.user?.id as string | undefined;
+    if (!slackUserId) return;
+    const channel = body?.container?.channel_id ?? body?.channel?.id ?? slackUserId;
+    const say = (text: string) => client.chat.postMessage({ channel, text }).catch(() => {});
+    const user = await resolveTermagUser(slackUserId, client);
+    if (!user) { await say('I could not match your Slack account to a termag user, so nothing changed.'); return; }
+    try {
+      await prisma.user.update({ where: { id: user.id }, data: { boxIdleNotify: false } });
+    } catch (err) {
+      console.warn(`[LIFECYCLE] ${user.unixUsername}: could not turn off stop notices:`, err instanceof Error ? err.message : String(err));
+      await say('That did not save. Try again, or turn them off in termag › Settings › Box notices.');
+      return;
+    }
+    console.log(`[LIFECYCLE] ${user.unixUsername}: turned off stop notices from Slack`);
+    const base = webBase();
+    await say(`${NOTICES_OFF_TEXT} To get them back, turn on ${base ? `<${base}/settings#box-notices|Settings › Box notices>` : 'termag › Settings › Box notices'}.`);
+  });
+}
+
 /**
  * Keep running from the warning DM. The clicking Slack user is matched to a
  * termag user (linked id, else email); only the box's owner is let through,
  * and the message is edited to say what happened.
  */
 export function registerBoxIdleSlackActions(app: any): void {
+  registerStopNoticesAction(app);
   app.action(KEEP_RUNNING_ACTION, async ({ ack, body, client, action }: any) => {
     await ack();
     const slackUserId = body?.user?.id as string | undefined;

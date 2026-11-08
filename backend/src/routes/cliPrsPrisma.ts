@@ -1,17 +1,10 @@
-/** CliPrs (routes/cliPrs.ts) over the cookie routes' own handlers and the user's desktop flag. */
+/** CliPrs (routes/cliPrs.ts) over the cookie routes' own handlers. */
 import { prisma } from '../db';
-import { desktopAppEnabledForUser } from '../services/desktopAppFlag';
 import type { CliPrs } from './cliPrs';
 import { boxDirectory, fullUser } from './cliLifecyclePrisma';
 import { bakeNow, prWorkstreamFor, prsWrites } from './prs';
 
 export const prismaCliPrs: CliPrs = {
-  async enabled(user) {
-    const owner = await prisma.user.findUnique({
-      where: { id: user.id }, select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true },
-    });
-    return !!owner && desktopAppEnabledForUser(owner);
-  },
   writes: prsWrites(),
   bake: userId => bakeNow(userId),
   async prWorkstream(user, params, body) {

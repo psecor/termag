@@ -45,9 +45,11 @@ const key = (fingerprint: string): SshKeyInfo => ({
 
 class FakeCredentials implements CliCredentials {
   keys: SshKeyInfo[] = [];
-  github: CliCredentialStatus['github'] = { available: true, connected: null };
+  github: CliCredentialStatus['github'] = { available: true, connected: null, boxGate: 'off' };
+  gateway = true;
   storedTokens: string[] = [];
-  async status() { return { github: this.github, claudeGateway: { available: true, enabled: true } }; }
+  rechecks = 0;
+  async status() { return { github: this.github, claudeGateway: { available: true, enabled: this.gateway } }; }
   async listSshKeys() { return this.keys; }
   async removeSshKey(_userId: string, id: string) {
     const before = this.keys.length;
@@ -62,6 +64,13 @@ class FakeCredentials implements CliCredentials {
     this.storedTokens.push(token);
     return { label: '@zane' };
   }
+  async recheckGithub() {
+    if (!this.github.available) throw new CredentialStoreUnavailableError();
+    if (!this.github.connected) throw new CredentialInputError('Connect GitHub in Settings.');
+    this.rechecks++;
+  }
+  async disconnectGithub() { this.github = { ...this.github, connected: null }; }
+  async setClaudeGateway(_userId: string, enabled: boolean) { this.gateway = enabled; }
 }
 
 let creds: FakeCredentials;
@@ -95,13 +104,13 @@ function call(path: string, token: string | null, init: RequestInit = {}) {
 describe('GET /credentials', () => {
   it('reports GitHub, Claude and the SSH keys, for a device or a box', async () => {
     creds.keys = [key('SHA256:abc')];
-    creds.github = { available: true, connected: { label: '@zane', updatedAt: new Date(NOW), orgs: {} } };
+    creds.github = { available: true, connected: { label: '@zane', updatedAt: new Date(NOW), orgs: {} }, boxGate: 'clear' };
     for (const token of [DEVICE, BOX]) {
       const res = await call('/credentials', token);
       expect(res.status).toBe(200);
       expect(res.headers.get('cache-control')).toBe('no-store');
       expect(await res.json()).toEqual({
-        github: { available: true, connected: { label: '@zane', updatedAt: new Date(NOW).toISOString(), orgs: {} } },
+        github: { available: true, connected: { label: '@zane', updatedAt: new Date(NOW).toISOString(), orgs: {} }, boxGate: 'clear' },
         claudeGateway: { available: true, enabled: true },
         sshKeys: [{ ...key('SHA256:abc'), createdAt: new Date(NOW).toISOString() }],
       });
@@ -180,7 +189,7 @@ describe('PUT /github', () => {
     const bad = await call('/github', DEVICE, { method: 'PUT', body: JSON.stringify({ token: 'nope' }) });
     expect(bad.status).toBe(400);
     expect(await bad.json()).toMatchObject({ code: 'invalid_token' });
-    creds.github = { available: false, connected: null };
+    creds.github = { available: false, connected: null, boxGate: 'off' };
     const off = await call('/github', DEVICE, { method: 'PUT', body: JSON.stringify({ token: GH }) });
     expect(off.status).toBe(503);
     expect(await off.json()).toMatchObject({ code: 'credential_store_unavailable' });
@@ -190,5 +199,65 @@ describe('PUT /github', () => {
     const res = await call('/github', BOX, { method: 'PUT', body: JSON.stringify({ token: GH }) });
     expect(res.status).toBe(403);
     expect(creds.storedTokens).toEqual([]);
+  });
+});
+
+describe('POST /github/recheck', () => {
+  it("re-reads the stored token's org access", async () => {
+    creds.github = { available: true, connected: { label: '@zane', updatedAt: new Date(NOW), orgs: {} }, boxGate: 'off' };
+    expect((await call('/github/recheck', DEVICE, { method: 'POST' })).status).toBe(204);
+    expect(creds.rechecks).toBe(1);
+  });
+
+  it('says why when there is nothing to check, or no store', async () => {
+    const none = await call('/github/recheck', DEVICE, { method: 'POST' });
+    expect(none.status).toBe(400);
+    expect(await none.json()).toEqual({ error: 'Connect GitHub in Settings.', code: 'github_recheck_failed' });
+    creds.github = { available: false, connected: null, boxGate: 'off' };
+    const off = await call('/github/recheck', DEVICE, { method: 'POST' });
+    expect(off.status).toBe(503);
+    expect(await off.json()).toMatchObject({ code: 'credential_store_unavailable' });
+  });
+});
+
+describe('DELETE /github', () => {
+  it('disconnects the stored token', async () => {
+    creds.github = { available: true, connected: { label: '@zane', updatedAt: new Date(NOW), orgs: {} }, boxGate: 'off' };
+    expect((await call('/github', DEVICE, { method: 'DELETE' })).status).toBe(204);
+    expect(creds.github.connected).toBeNull();
+  });
+});
+
+describe('PUT /claude-gateway', () => {
+  it("sets whether the owner's boxes get Claude through the gateway", async () => {
+    const res = await call('/claude-gateway', DEVICE, { method: 'PUT', body: JSON.stringify({ enabled: false }) });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ enabled: false });
+    expect(creds.gateway).toBe(false);
+  });
+
+  it('takes true or false only', async () => {
+    const res = await call('/claude-gateway', DEVICE, { method: 'PUT', body: JSON.stringify({ enabled: 'no' }) });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'invalid_input' });
+    expect(creds.gateway).toBe(true);
+  });
+});
+
+describe("a box's own token", () => {
+  it('re-checks, disconnects and switches nothing', async () => {
+    creds.github = { available: true, connected: { label: '@zane', updatedAt: new Date(NOW), orgs: {} }, boxGate: 'off' };
+    for (const [method, path, body] of [
+      ['POST', '/github/recheck', undefined],
+      ['DELETE', '/github', undefined],
+      ['PUT', '/claude-gateway', JSON.stringify({ enabled: false })],
+    ] as const) {
+      const res = await call(path, BOX, { method, ...(body ? { body } : {}) });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ code: 'box_credential' });
+    }
+    expect(creds.rechecks).toBe(0);
+    expect(creds.github.connected).not.toBeNull();
+    expect(creds.gateway).toBe(true);
   });
 });

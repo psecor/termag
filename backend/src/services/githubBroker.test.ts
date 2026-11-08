@@ -3,11 +3,14 @@ import {
   blockedApiReason,
   blockedGraphqlReason,
   boxTokenFrom,
+  pushRepo,
   brokerTarget,
   cachedTokenSource,
   getGithubBrokerUrl,
   MAX_CHECKED_BODY_BYTES,
   ownerAuthorization,
+  ssoRequiredMessage,
+  targetOwner,
 } from './githubBroker';
 
 describe('brokerTarget', () => {
@@ -214,5 +217,50 @@ describe('cachedTokenSource', () => {
     expect(await src('u')).toBe('t-u-2');
     src.forget('u');
     expect(await src('u')).toBe('t-u-3');
+  });
+});
+
+describe('pushRepo', () => {
+  it('is owner/name for a smart-HTTP push, with or without .git', () => {
+    expect(pushRepo('POST', brokerTarget('POST', '/acme/widgets.git/git-receive-pack', '')!)).toBe('acme/widgets');
+    expect(pushRepo('post', brokerTarget('POST', '/acme/widgets/git-receive-pack', '')!)).toBe('acme/widgets');
+  });
+
+  it('is null for a fetch, the ref advertisement and the API', () => {
+    expect(pushRepo('POST', brokerTarget('POST', '/acme/widgets.git/git-upload-pack', '')!)).toBeNull();
+    expect(pushRepo('GET', brokerTarget('GET', '/acme/widgets.git/info/refs', '?service=git-receive-pack')!)).toBeNull();
+    expect(pushRepo('POST', brokerTarget('POST', '/api/v3/repos/acme/widgets/pulls', '')!)).toBeNull();
+  });
+});
+
+describe('targetOwner', () => {
+  const owner = (method: string, path: string, search = '') => targetOwner(brokerTarget(method, path, search)!);
+
+  it('is the lower-cased owner of a git path, a /repos path or an /orgs path', () => {
+    expect(owner('GET', '/Example-Org/webapp.git/info/refs', '?service=git-upload-pack')).toBe('example-org');
+    expect(owner('GET', '/api/v3/repos/example-org/webapp/pulls')).toBe('example-org');
+    expect(owner('GET', '/api/v3/orgs/Example-Org/teams/x/members')).toBe('example-org');
+    expect(owner('GET', '/api/v3/orgs/example-org')).toBe('example-org');
+  });
+
+  it('is null where the path names no owner', () => {
+    expect(owner('GET', '/api/v3/user')).toBeNull();
+    expect(owner('GET', '/api/v3/repositories/123/pulls')).toBeNull();
+    expect(owner('POST', '/api/graphql')).toBeNull();
+  });
+});
+
+describe('ssoRequiredMessage', () => {
+  it("names the termag token and the org, with GitHub's authorize URL", () => {
+    const url = 'https://github.com/orgs/example-org/sso?authorization_request=abc';
+    const text = ssoRequiredMessage('example-org', url);
+    expect(text).toContain('termag Settings');
+    expect(text).toContain('example-org');
+    expect(text).toContain(url);
+    expect(text).toContain('Re-check');
+  });
+
+  it("falls back to the org's SSO page", () => {
+    expect(ssoRequiredMessage('example-org', null)).toContain('https://github.com/orgs/example-org/sso');
   });
 });

@@ -25,6 +25,7 @@ vi.mock('../services/agentRuntime', async (importOriginal) => ({
   stopAgentPane: vi.fn(async () => {}),
   ensureAgentSessionsAndLaunch: vi.fn(async () => 'launched'),
   stopAgentSessions: vi.fn(async () => {}),
+  stopTerminalSlots: vi.fn(async () => {}),
 }));
 vi.mock('../services/status', () => ({
   setStatus: vi.fn(), notifyStatusChange: vi.fn(), moveStatus: vi.fn(), clearMilestoneTimer: vi.fn(), updateStatusMeta: vi.fn(),

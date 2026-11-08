@@ -16,7 +16,6 @@
  * Box token or browser session (requireAuthOrAgentToken). Access is the
  * token's user throughout: the parent session the MCP server names is used
  * for attribution, limits and the nudge, and must be one of that user's own.
- * Behind the agent-spawn-enabled flag (off unless TERMAG_FLAGS turns it on).
  * The limits come from the agent-spawn-limits flag (services/spawnLimits.ts),
  * read for the box the child runs on, and every request and refusal lands in
  * spawn_events.
@@ -27,7 +26,6 @@ import { prisma } from '../db';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import {
-  SPAWN_FLAG,
   buildBrief,
   chooseSpawnProvider,
   nameFromBranch,
@@ -40,7 +38,6 @@ import {
   type SpawnRequest,
 } from '../services/agentSpawn';
 import { isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
-import { boolVariation } from '../services/featureFlags';
 import { BOX_SELECT, buildBudget, readings, spawnLimitsFor, userBoxReadings } from '../services/spawnBudget';
 import { buildSpawnTrees, tokensBySpawn, treeTotals } from '../services/spawnTrees';
 import { checkoutCheck, parkSpawn, resumeSpawn, retireSpawn } from '../services/spawnActions';
@@ -58,6 +55,7 @@ import * as tmux from '../services/tmux';
 import { createProjectFor } from './projects';
 import { RouteResult, sendResult } from './routeResult';
 import { createWorkstreamFor } from './workstreams';
+import { LISTED_PROJECT_KINDS } from '../services/projectKind';
 
 const ROLES = ['agent', 'ctrl', 'data', 'data-ctrl', 'review'] as const;
 const HOUR_MS = 60 * 60 * 1000;
@@ -124,8 +122,8 @@ async function lineageOf(userId: string, caller: CallerSession | null): Promise<
 }
 
 /**
- * May this spawn go onto this box? The flag and the limits are both read for
- * the box the child runs on: that is the box being acted on. A box running
+ * May this spawn go onto this box? The limits are read for the box the child
+ * runs on: that is the box being acted on. A box running
  * hot or at capacity is refused with a suggestion; a project target can move
  * to the suggested box, a workstream lives where its project does.
  */
@@ -136,10 +134,6 @@ async function admit(
   targetInstanceId: string,
   target: 'workstream' | 'project',
 ): Promise<Found<Budget>> {
-  const box = await prisma.instance.findUnique({ where: { id: targetInstanceId }, select: { id: true, name: true, kind: true } });
-  if (!(await boolVariation(SPAWN_FLAG, user, false, box))) {
-    return { ok: false, result: { status: 403, body: { error: `agent spawn is not enabled for you on this box (feature flag ${SPAWN_FLAG})`, code: 'spawn_disabled', reason: 'flag' } } };
-  }
   const parent = caller ? { projectId: caller.projectId, workstream: caller.workstream } : null;
   const budget = await buildBudget(user, parent, lineage.depth, targetInstanceId);
   const limit = limitRefusal({
@@ -690,9 +684,10 @@ export async function usageFor(user: Express.User): Promise<RouteResult> {
     // Orphans nobody adopted, however old: they wait here for someone.
     prisma.agentSpawn.findMany({ where: { userId: user.id, orphanedAt: { not: null }, retiredAt: null }, orderBy: { orphanedAt: 'desc' }, take: 50 }),
     prisma.user.findUnique({ where: { id: user.id }, select: { spawnOrphanHome: true } }),
-    // The sessions an orphan can be adopted into, and the orphan home picked from.
+    // The sessions an orphan can be adopted into, and the orphan home picked from:
+    // the listed projects, never a space orchestrator (projectKind.ts inProjectLists).
     prisma.project.findMany({
-      where: { userId: user.id, archived: false },
+      where: { userId: user.id, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
       select: { id: true, name: true, workstreams: { where: { archived: false }, select: { name: true }, orderBy: { name: 'asc' } } },
       orderBy: { name: 'asc' },
       take: 200,

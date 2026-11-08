@@ -5,15 +5,29 @@ import type { Server } from 'http';
 
 const BOX_TOKEN = 'tmag_box_token_sentinel_0123456789'; // gitleaks:allow (test sentinel)
 const OWNER_TOKEN = 'gho_OWNERsentinelOWNERsentinel0123'; // gitleaks:allow (test sentinel)
+const POOL_TOKEN = 'github_pat_POOLsentinelPOOLsentinel0123'; // gitleaks:allow (test sentinel)
 
 const state = vi.hoisted(() => ({
   tokens: new Map<string, unknown>(),
   ownerToken: null as string | null,
+  orgs: {} as Record<string, unknown>,
+  rechecks: [] as unknown[],
   callerOk: true,
+  poolToken: null as string | null,
 }));
 
 vi.mock('./agentTokens', () => ({ validateAgentToken: async (t: string) => state.tokens.get(t) ?? null }));
-vi.mock('../services/credentialStore', () => ({ githubTokenSource: async () => state.ownerToken }));
+vi.mock('../services/credentialStore', () => ({
+  githubTokenSource: async () => state.ownerToken,
+  githubOrgsSource: async () => state.orgs,
+  getCredentialStoreConfig: () => ({}),
+  githubStoreDeps: (_cfg: unknown, userId: string) => ({ userId }),
+}));
+vi.mock('../services/githubCredential', () => ({ recheckGithub: async (deps: unknown) => { state.rechecks.push(deps); } }));
+vi.mock('../services/poolCredential', () => ({ poolGithubTokenSource: async () => state.poolToken }));
+vi.mock('../services/poolEnvironmentRepos', () => ({
+  poolEnvironmentRepos: async (id: string) => (id === 'env-termag' ? ['example-org/termag', 'example-org/webapp'] : null),
+}));
 vi.mock('../services/callerIdentity', () => ({
   verifyCallerProof: async (h: Record<string, string>) => (state.callerOk && h['x-termag-caller-authorization'] ? 'arn:gateway' : null),
 }));
@@ -21,6 +35,8 @@ vi.mock('../services/callerIdentity', () => ({
 const { githubAuthzRouter } = await import('./githubAuthz');
 
 const user = { id: 'owner1', googleEmail: 'o@example.com' };
+// An ownerless pool box's token, as validateAgentToken resolves it: no user, the instance row as it is now.
+const poolBox = (status: string) => ({ user: null, instance: { id: `pool-${status}`, userId: null, kind: 'ec2', status, poolEnvironmentId: 'env-termag' }, token: { id: `tok-${status}`, scope: 'agent', name: status } });
 const box = (kind: string) => ({ user, instance: { id: `inst-${kind}`, userId: 'owner1', kind }, token: { id: `tok-${kind}`, scope: 'agent', name: kind } });
 
 let server: Server;
@@ -40,7 +56,9 @@ afterAll(() => { server.close(); vi.restoreAllMocks(); });
 beforeEach(() => {
   state.tokens = new Map([[BOX_TOKEN, box('ec2')], ['tmag_external_box', box('external')]]);
   state.ownerToken = OWNER_TOKEN;
+  state.orgs = {};
   state.callerOk = true;
+  state.poolToken = POOL_TOKEN;
   logs.length = 0;
 });
 
@@ -102,11 +120,60 @@ describe('the GitHub broker check (ext_authz)', () => {
     expect(ok.headers.get('authorization')).toBe(`Bearer ${OWNER_TOKEN}`);
   });
 
+  it("refuses an org whose SSO has not authorized the owner's token, says how to fix it, and re-checks once", async () => {
+    const url = 'https://github.com/orgs/o/sso?authorization_request=abc';
+    state.orgs = { o: { status: 'sso-required', ssoUrl: url } };
+    const git = await check(REFS, { auth: basic(BOX_TOKEN) });
+    expect(git.status).toBe(403);
+    expect(git.headers.get('authorization')).toBeNull();
+    expect((await git.json()).message).toContain(url);
+    const api = await check('/api/v3/repos/o/r/pulls', { auth: `token ${BOX_TOKEN}` });
+    expect(api.status).toBe(403);
+    expect((await api.json()).message).toMatch(/termag Settings/);
+    expect(state.rechecks).toEqual([{ userId: 'owner1' }]);
+    expect((await check('/api/v3/repos/other/r', { auth: `token ${BOX_TOKEN}` })).status).toBe(200);
+  });
+
   it('never logs a token', async () => {
     await check(REFS, { auth: basic(BOX_TOKEN) });
     await check('/api/v3/user/keys', { method: 'POST', auth: `token ${BOX_TOKEN}` });
     const all = logs.join('\n');
     expect(all).not.toContain(BOX_TOKEN);
     expect(all).not.toContain(OWNER_TOKEN);
+  });
+});
+
+describe('the GitHub broker check: a pool box', () => {
+  const pool = (status: string) => {
+    const t = `tmag_pool_${status}`;
+    state.tokens.set(t, poolBox(status));
+    return t;
+  };
+  const FETCH = '/example-org/termag.git/info/refs?service=git-upload-pack';
+
+  it("answers a preparing pool box's fetch with the pool credential, and logs no token", async () => {
+    const res = await check(FETCH, { auth: basic(pool('env-preparing')) });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('authorization')).toBe(`Basic ${Buffer.from(`x-access-token:${POOL_TOKEN}`).toString('base64')}`);
+    expect(res.headers.get('x-termag-user')).toBe('pool');
+    expect(logs.join('\n')).not.toContain(POOL_TOKEN);
+  });
+
+  it('refuses a push, the API, another repository and a stopped box, each saying which rule', async () => {
+    const t = pool('env-preparing');
+    const cases: Array<[string, { method?: string; auth: string }, RegExp]> = [
+      ['/example-org/termag.git/git-receive-pack', { method: 'POST', auth: basic(t) }, /\(fetch only\).*may not push/],
+      ['/api/v3/repos/example-org/termag', { auth: `token ${t}` }, /\(fetch only\).*REST API/],
+      ['/example-org/other.git/info/refs?service=git-upload-pack', { auth: basic(t) }, /\(its environment\).*example-org\/other/],
+      [FETCH, { auth: basic(pool('env-stopped')) }, /\(preparing only\).*env-stopped/],
+    ];
+    for (const [path, opts, message] of cases) {
+      const res = await check(path, opts);
+      expect(res.status).toBe(403);
+      expect(res.headers.get('authorization')).toBeNull();
+      expect((await res.json()).message).toMatch(message);
+    }
+    expect(logs.filter(l => /refused \(pool rule/.test(l))).toHaveLength(4);
+    expect(logs.join('\n')).not.toContain(POOL_TOKEN);
   });
 });

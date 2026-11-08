@@ -1,10 +1,10 @@
-// The Fireworks flags for a box's owner and the box, as the gateway's check,
-// delivery and launches read them, and for a viewer alone, as the pickers and
-// the routes that record a choice read them.
+// The fireworks-models flag for a box's owner and the box, as launches read them,
+// and for a viewer alone, as the pickers and the routes that record a choice
+// read them.
 import { prisma } from '../db';
-import { boolVariation, jsonVariation } from './featureFlags';
+import { jsonVariation } from './featureFlags';
 import type { FlagUser } from './featureFlags';
-import { FIREWORKS_FLAG, FIREWORKS_MODELS_FLAG, getFireworksGatewayConfig, parseFireworksModels, type FireworksModels } from './fireworksGateway';
+import { FIREWORKS_MODELS_FLAG, getFireworksGatewayConfig, parseFireworksModels, type FireworksModels } from './fireworksGateway';
 
 const LD_USER_SELECT = { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } as const;
 
@@ -16,21 +16,15 @@ async function boxContext(userId: string, instanceId: string) {
   return user && instance ? { user, instance } : null;
 }
 
-export async function fireworksEnabledForBox(userId: string, instanceId: string): Promise<boolean> {
-  const ctx = await boxContext(userId, instanceId);
-  return ctx ? boolVariation(FIREWORKS_FLAG, ctx.user, false, ctx.instance) : false;
-}
-
-/** Both flags for the owner and box: the models it may call, or null (none) when Fireworks is off for them. */
+/** fireworks-models for the owner and box: the models it may call, or null (none). */
 export async function fireworksModelsForBox(userId: string, instanceId: string): Promise<FireworksModels | null> {
   const ctx = await boxContext(userId, instanceId);
-  if (!ctx || !await boolVariation(FIREWORKS_FLAG, ctx.user, false, ctx.instance)) return null;
+  if (!ctx) return null;
   return parseFireworksModels(await jsonVariation(FIREWORKS_MODELS_FLAG, ctx.user, null, ctx.instance));
 }
 
-/** Both flags for a viewer: the models they may pick, or null when Fireworks is off for them. */
+/** fireworks-models for a viewer: the models they may pick, or null (none). */
 export async function fireworksModelsForUser(user: FlagUser): Promise<FireworksModels | null> {
-  if (!await boolVariation(FIREWORKS_FLAG, user, false)) return null;
   return parseFireworksModels(await jsonVariation(FIREWORKS_MODELS_FLAG, user, null));
 }
 

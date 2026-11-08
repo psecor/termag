@@ -2,7 +2,8 @@
  * /api/admin — read-only org-wide views (phase 0) plus admin management
  * (tokens, admins, audit) from ./manage.ts, growing a box's disk from ./disk.ts,
  * resizing a box from ./resize.ts, bug-report triage from ./bugs.ts and box
- * quarantine from ./quarantine.ts. Every route sits behind
+ * quarantine from ./quarantine.ts, and the environment pool's GitHub
+ * credential from ./poolCredential.ts. Every route sits behind
  * requireAdmin (session role or admin bearer) and a per-caller rate limit.
  * Handlers are thin: parse → call the shared query → json. The MCP server
  * (mcp/adminServer.ts) calls the same query functions.
@@ -26,7 +27,9 @@ import { bugsRouter } from './bugs';
 import { diskRouter } from './disk';
 import { resizeRouter } from './resize';
 import { manageRouter } from './manage';
+import { previewLinksAdminRouter } from './previewLinkEnd';
 import { prsRouter } from './prs';
+import { poolCredentialRouter } from './poolCredential';
 import { quarantineRouter } from './quarantine';
 import { segmentsRouter } from './segments';
 import { softwareRouter } from './software';
@@ -153,5 +156,7 @@ export function adminRouter(): Router {
   router.use(spendRouter());
   router.use(manageRouter());
   router.use(quarantineRouter());
+  router.use(poolCredentialRouter());
+  router.use(previewLinksAdminRouter());
   return router;
 }

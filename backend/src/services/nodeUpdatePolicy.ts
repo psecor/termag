@@ -32,17 +32,18 @@
  *     The fleet ran 24.22.1 on 2026-10-30 (24.22.2, the newest, is not a
  *     security release), so this floor installs nothing on a box on its own.
  *   * target latest: the newest release of the box's own major.
- *   * restart none: this version restarts the agent only, never a session.
+ *   * restart none: the agent is restarted on the new Node, and no session.
+ *     A run's restart is the admin's choice for it (run.ts): idle or force
+ *     stops and resumes the sessions of the tools that run on Node.
  */
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const NODE_UPDATE_POLICY_FLAG = 'node-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for node and a box's policy says restart nothing. */
-export const NODE_UPDATE_ENABLED_FLAG = 'node-update-enabled';
 
 export const NODE_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_NODE_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '24.22.1',
   target: 'latest',
   restart: 'none',
@@ -52,5 +53,5 @@ export const DEFAULT_NODE_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over Node's defaults; a bad key keeps its default. */
 export function parseNodeUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_NODE_UPDATE_POLICY, NODE_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_NODE_UPDATE_POLICY, NODE_TARGET_TAGS, undefined, NODE_UPDATE_POLICY_FLAG);
 }

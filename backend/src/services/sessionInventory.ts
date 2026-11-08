@@ -7,7 +7,7 @@
 import { getReviewRecord } from './reviewSweep';
 import { sendForProject, isProjectAgentConnected, type ProjectHost } from './agentRegistry';
 import { SESSION_ROLES, isOnCallerHost, type SessionRole } from './sessionAccess';
-import { reviewSessionNames, sessionName } from './tmux';
+import { reviewSessionNames, sessionName, terminalSessionNames } from './tmux';
 import { getAllStatuses } from './status';
 import { statusKey } from './statusKey';
 import { providerForSource } from '../providers/registry';
@@ -19,13 +19,14 @@ export interface InventoryProject {
   instanceId: string | null;
   lastActiveAt: Date;
   user: { unixUsername: string };
-  workstreams: Array<{ name: string }>;
+  /** `askThread` set: the workstream is an ask thread's chat (services/askChat.ts), which has no pane. */
+  workstreams: Array<{ name: string; askThread?: { id: string } | null }>;
   workflows: Array<{ provider: string | null }>;
 }
 
 export const inventoryInclude = {
   user: { select: { unixUsername: true } },
-  workstreams: { where: { archived: false }, select: { name: true } },
+  workstreams: { where: { archived: false }, select: { name: true, askThread: { select: { id: true } } } },
   // Fallback provider for rows whose status carries no `source` (hook-driven
   // Claude sends none) — the project's agent workflow says what runs there.
   workflows: { where: { type: 'agent' as const }, select: { provider: true } },
@@ -94,16 +95,23 @@ export async function collectSessionRows(
     const host: ProjectHost = { userId: p.userId, instanceId: p.instanceId };
     const connected = isProjectAgentConnected(host);
     const live = await liveSet(host);
-    const wsNames = p.workstreams.length ? p.workstreams.map(w => w.name) : ['main'];
+    // An ask thread's chat runs its turns in the chat runner, in the thread's clone: it has no
+    // tmux pane, agent or ctrl. Listed as a pane
+    // session, it is one that every capture and attach fails on ("can't find pane").
+    const paned = p.workstreams.filter(w => !w.askThread);
+    const wsNames = paned.length ? paned.map(w => w.name) : p.workstreams.length ? [] : ['main'];
     for (const ws of wsNames) {
       const panes = SESSION_ROLES.flatMap((role): Array<{ role: SessionRole; session: string; slot?: number }> => (role === 'review'
         ? reviewSessionNames(p.user.unixUsername, p.name, ws).map((session, i) => ({ role, session, slot: i + 1 }))
-        : [{ role, session: sessionName(p.user.unixUsername, p.name, role, ws) }]));
+        : role === 'ctrl'
+          // The user's terminal slots past the ctrl pane, one row per live slot.
+          ? terminalSessionNames(p.user.unixUsername, p.name, ws).map((session, i) => ({ role, session, slot: i + 1 }))
+          : [{ role, session: sessionName(p.user.unixUsername, p.name, role, ws) }]));
       for (const { role, session, slot } of panes) {
         const alive = live ? live.has(session) : false;
-        // agent/ctrl exist for every project; data roles only if actually live.
-        // agent/ctrl exist for every project; data and review roles only if actually live.
-        if ((role === 'data' || role === 'data-ctrl' || role === 'review') && !alive) continue;
+        // agent/ctrl (slot 1) exist for every project; data roles, review slots and
+        // terminal slots only if actually live.
+        if ((role === 'data' || role === 'data-ctrl' || role === 'review' || (role === 'ctrl' && slot !== 1)) && !alive) continue;
         // The status map is keyed by (instanceId, session): same-named projects
         // on two boxes must not share an entry (services/statusKey.ts).
         const raw = statuses.get(statusKey(p.instanceId, session));

@@ -32,8 +32,6 @@ import {
 import { projectDirUnder, resolveProjectRoot } from '../services/projectPaths';
 import {
   BROWSER_PANE_DISABLED_CLOSE_CODE,
-  BROWSER_PANE_FLAG,
-  BROWSER_PANE_PROFILES_FLAG,
   BROWSER_PANE_RETRY_CLOSE_CODE,
   BROWSER_PANE_UNSUPPORTED_CLOSE_CODE,
   agentSupportsBrowserPane,
@@ -55,7 +53,6 @@ import {
   prismaPreviewShareStore, registerGuestSocket, shareTarget, type GuestShareContext, type GuestSocketHandle,
 } from '../services/previewShares';
 
-export const PREVIEW_SHARE_FLAG = 'browser-pane-preview-share-enabled';
 export const GUEST_KILL_SWITCH = 'browser-pane-guest-kill-switch';
 export const GUEST_MAX_FLAG = 'browser-pane-guest-max-concurrent';
 /** How often a live guest socket re-checks its grant and the flags: revocation elsewhere, expiry, a kill switch. */
@@ -84,9 +81,6 @@ export interface BrowserWsDeps {
   findProject(projectId: string): Promise<BrowserPaneProject | null>;
   findUser(userId: string): Promise<User | null>;
   hasShare(projectId: string, userId: string): Promise<boolean>;
-  flagOn(viewer: User, box: Instance | null): Promise<boolean>;
-  /** browser-pane-persistent-profiles-enabled, for the project's owner and box. */
-  keptProfilesOn(owner: User, box: Instance | null): Promise<boolean>;
   boxStatus(instanceId: string | null): Promise<string | null>;
   agentConnected(host: ProjectHost): boolean;
   agentCapabilities(host: ProjectHost): readonly string[];
@@ -100,7 +94,7 @@ export interface BrowserWsDeps {
   /** With `viewerId`, a link share's row for that viewer too. */
   guestContext(shareId: string, viewerId?: string): Promise<GuestShareContext | null>;
   /** The owner-and-box flags a guest pane needs: the pane, sharing, the kill switch, the pool size. */
-  guestFlags(owner: User, box: Instance | null): Promise<{ paneOn: boolean; sharingOn: boolean; killed: boolean; maxGuests: number }>;
+  guestFlags(owner: User, box: Instance | null): Promise<{ killed: boolean; maxGuests: number }>;
   registerGuest(shareId: string, handle: GuestSocketHandle): () => void;
   recordShareEvent(shareId: string, kind: string, opts?: { actorId?: string | null; reason?: string | null; detail?: any }): Promise<void>;
   noteShareOpened(shareId: string, viewerId: string): Promise<void>;
@@ -120,8 +114,6 @@ export const defaultBrowserWsDeps: BrowserWsDeps = {
     const share = await prisma.projectShare.findUnique({ where: { projectId_userId: { projectId, userId } } });
     return share !== null;
   },
-  flagOn: (viewer, box) => boolVariation(BROWSER_PANE_FLAG, viewer, false, box),
-  keptProfilesOn: (owner, box) => boolVariation(BROWSER_PANE_PROFILES_FLAG, owner, false, box),
   boxStatus: instanceStatus,
   agentConnected: isProjectAgentConnected,
   agentCapabilities: projectAgentCapabilities,
@@ -132,13 +124,11 @@ export const defaultBrowserWsDeps: BrowserWsDeps = {
   log: (line) => console.log(line),
   guestContext: (shareId, viewerId) => prismaPreviewShareStore.guestContext(shareId, viewerId),
   async guestFlags(owner, box) {
-    const [paneOn, sharingOn, killed, max] = await Promise.all([
-      boolVariation(BROWSER_PANE_FLAG, owner, false, box),
-      boolVariation(PREVIEW_SHARE_FLAG, owner, false, box),
+    const [killed, max] = await Promise.all([
       boolVariation(GUEST_KILL_SWITCH, owner, false, box),
       numberVariationForContext(GUEST_MAX_FLAG, buildFlagContext(owner, box), 5),
     ]);
-    return { paneOn, sharingOn, killed, maxGuests: maxGuestPanes(max) };
+    return { killed, maxGuests: maxGuestPanes(max) };
   },
   registerGuest: registerGuestSocket,
   recordShareEvent: (shareId, kind, opts) => prismaPreviewShareStore.recordEvent(shareId, kind, opts),
@@ -156,7 +146,6 @@ const PRE_ATTACH_QUEUE = 64;
 // time, and a repeat inside this window gets the last answer again.
 const SUGGEST_REUSE_MS = 3000;
 
-export const BROWSER_PANE_DISABLED_MESSAGE = 'The browser pane is off for this box (browser-pane-enabled).';
 export const BROWSER_PANE_UNSUPPORTED_MESSAGE = "This box's agent needs an update before it can run a browser pane.";
 
 export async function handleBrowserPaneSocket(
@@ -183,10 +172,6 @@ export async function handleBrowserPaneSocket(
   if (project.userId !== viewer.id && !(await deps.hasShare(project.id, viewer.id))) {
     deps.log(`[BROWSER-PANE] user ${viewer.id} refused for project ${project.id}`);
     refuse(1008, 'project forbidden');
-    return;
-  }
-  if (!(await deps.flagOn(viewer, project.instance))) {
-    refuse(BROWSER_PANE_DISABLED_CLOSE_CODE, 'browser pane disabled', BROWSER_PANE_DISABLED_MESSAGE);
     return;
   }
 
@@ -217,12 +202,10 @@ export async function handleBrowserPaneSocket(
   // hands it back, page and all, to the next attach that carries it: a
   // reconnect or a reopened dock lands where the viewer left off.
   const paneKey = `${viewer.id}:${project.id}/${request.workstream}`;
-  // A kept profile: the owner's flag decides, for
-  // every viewer of the project, and only an agent that keeps profiles is asked.
+  // A kept profile, for every viewer of the project,
+  // from an agent that keeps profiles.
   const capabilities = deps.agentCapabilities(host);
   const keptProfiles = agentSupportsKeptProfiles(capabilities);
-  const owner = project.userId === viewer.id ? viewer : await deps.findUser(project.userId);
-  const persistProfile = keptProfiles && !!owner && await deps.keptProfilesOn(owner, project.instance);
   // Where the project's files live on the box, for the suggestion scan's dev-stack hint.
   const cwd = projectDirUnder(resolveProjectRoot({ ownerUnixUser: project.ownerUnixUsername, hostHome: project.instance?.hostHome }), project.name, request.workstream);
   const openShare = await ownSharePage(deps, url, project.id, request.workstream);
@@ -232,7 +215,7 @@ export async function handleBrowserPaneSocket(
     host, projectId: project.id, cwd, keptProfiles, guest: false,
     attach: {
       url: request.url, width: request.width, height: request.height, paneKey,
-      ...(persistProfile ? { persistProfile: true } : {}),
+      ...(keptProfiles ? { persistProfile: true } : {}),
       ...(url.searchParams.get('dialogs') === '1' ? { relayDialogs: true } : {}),
       ...(openShare ? { openRecipe: openShare.recipe, cwd: openShare.cwd ?? cwd, ...(openShare.at ? { atPath: openShare.at } : {}) } : {}),
     },
@@ -286,7 +269,6 @@ async function handleGuestSocket(ws: BrowserPaneSocket, url: URL, viewerId: stri
     }
     const flags = await deps.guestFlags(ctx.owner, ctx.project.instance);
     if (flags.killed) return { ok: false, code: BROWSER_PANE_DISABLED_CLOSE_CODE, reason: 'guests off', message: 'Reviewer browsers are switched off right now.' };
-    if (!flags.paneOn || !flags.sharingOn) return { ok: false, code: BROWSER_PANE_DISABLED_CLOSE_CODE, reason: 'preview sharing off', message: 'Preview sharing is off for this box.' };
     return { ok: true, ctx, maxGuests: flags.maxGuests, previewing };
   };
 
@@ -326,7 +308,6 @@ async function handleGuestSocket(ws: BrowserPaneSocket, url: URL, viewerId: stri
 
   const workstream = target.workstream;
   const keptProfiles = agentSupportsKeptProfiles(capabilities);
-  const persistProfile = keptProfiles && await deps.keptProfilesOn(ctx.owner, project.instance);
   const cwd = target.cwd;
   const viewport = clampViewport(url.searchParams.get('width'), url.searchParams.get('height'));
   const requested = url.searchParams.get('url');
@@ -375,7 +356,7 @@ async function handleGuestSocket(ws: BrowserPaneSocket, url: URL, viewerId: stri
       profileExpiresAt: ctx.share.expiresAt.toISOString(),
       ...(at ? { atPath: at } : {}),
       ...(url.searchParams.get('dialogs') === '1' ? { relayDialogs: true } : {}),
-      ...(persistProfile ? { persistProfile: true } : {}),
+      ...(keptProfiles ? { persistProfile: true } : {}),
     },
   });
   if (!opened || ws.readyState !== WS_OPEN) return;
@@ -563,6 +544,7 @@ async function relayBrowserStream(ws: BrowserPaneSocket, deps: BrowserWsDeps, re
   streamId = attached;
   for (const out of pending.splice(0)) deps.sendToStream(streamId, out);
   // The pane shows the page only from here: before this the browser was starting.
-  ws.send(JSON.stringify({ type: 'ready' }));
+  // Reset browser works only where the agent keeps profiles, and never for a guest.
+  ws.send(JSON.stringify({ type: 'ready', ...(keptProfiles && !guest ? { resettable: true } : {}) }));
   return true;
 }

@@ -47,4 +47,15 @@ describe('listProjectsFor: each chat\'s space', () => {
     expect(again[0].workstreams.map(w => [w.id, w.spaceId])).toEqual([['ws1', 's-alpha'], ['ws2', 's-beta']]);
     expect(db.prisma.workstream.updateMany).not.toHaveBeenCalled();
   });
+
+  it('never lists a space orchestrator\'s project, owned or shared (projectKind.ts inProjectLists)', async () => {
+    await listProjectsFor('u1');
+    const owned = (db.prisma.project.findMany.mock.calls[0] as unknown as [{ where: { kind: { in: string[] } } }])[0].where.kind.in;
+    const shared = (db.prisma.projectShare.findMany.mock.calls[0] as unknown as [{ where: { project: { kind: { in: string[] } } } }])[0].where.project.kind.in;
+    for (const kinds of [owned, shared]) {
+      expect(kinds).toEqual(['normal', 'metaterm', 'automation']);
+      expect(kinds).not.toContain('space-orchestrator');
+    }
+  });
 });
+

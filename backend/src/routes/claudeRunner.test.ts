@@ -14,7 +14,6 @@ import { claimWarmBox } from '../services/warmPoolClaim';
 import { poolSpecHashOrNull } from '../services/warmPool';
 import { boxCreationRefusal, readBoxCreationFacts } from '../services/boxCreationGate';
 import { boxImageSelectionFor } from '../services/boxImage';
-import { ownerHibernationEnabled } from '../services/boxHibernationFlag';
 import { ownerDefaultSize } from '../services/boxSize';
 import { warmPoolTargetFor } from '../services/warmPoolSizes';
 import { deliveryInFlight } from '../services/credentialDelivery';
@@ -34,7 +33,7 @@ vi.mock('../services/boxProvisioner', () => ({
 }));
 vi.mock('../services/boxPower', () => ({ requestPower: vi.fn(async () => 'i-1'), PowerRequestConflict: class extends Error {} }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox: vi.fn(), prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox: vi.fn(), prismaClaimEffects: {},
   isNameConflict: (err: { code?: string } | null) => err?.code === 'P2002',
 }));
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => null), reconcileWarmPool: vi.fn(async () => {}) }));
@@ -42,11 +41,10 @@ vi.mock('../services/boxImage', () => ({
   boxImageSelectionFor: vi.fn(async () => ({ kind: 'published' })),
   isPublished: (selection: { kind: string }) => selection.kind === 'published',
 }));
-vi.mock('../services/boxHibernationFlag', () => ({ ownerHibernationEnabled: vi.fn(async () => false), poolHibernationEnabled: vi.fn(async () => false) }));
 vi.mock('../services/boxSize', () => ({ ownerDefaultSize: vi.fn(async () => null) }));
 vi.mock('../services/warmPoolSizes', () => ({ warmPoolTargetFor: vi.fn(async () => 5), recordPoolClaim: vi.fn() }));
 vi.mock('../services/boxCreationGate', () => ({
-  readBoxCreationFacts: vi.fn(async () => ({ required: false, flagOn: false, hasGithubCredential: false })),
+  readBoxCreationFacts: vi.fn(async () => ({ required: false, hasGithubCredential: false })),
   boxCreationRefusal: vi.fn(() => null),
 }));
 vi.mock('../services/userByEmail', () => ({ findUserByEmail: vi.fn() }));
@@ -336,6 +334,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
   beforeEach(() => {
     owned = [];
     names = [];
+    vi.mocked(poolSpecHashOrNull).mockResolvedValue(null);
     vi.mocked(findUserByEmail).mockResolvedValue(user as never);
     vi.mocked(prisma.instance.findMany).mockImplementation((async (args: { where: { status?: unknown }; select?: { name?: boolean; createdAt?: boolean } }) => {
       if (args.where.status === 'ready') return [];
@@ -362,7 +361,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     flags({ 'claude-runner-auto-box-enabled': true });
     const [a, b] = await Promise.all([spawn(), spawn()]);
     expect(provisionNewBox).toHaveBeenCalledTimes(1);
-    expect(provisionNewBox).toHaveBeenCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, null);
+    expect(provisionNewBox).toHaveBeenCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, flavor: 'full' }, null);
     for (const res of [a, b]) expect(res.status).toHaveBeenCalledWith(503);
     expect(a.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
     expect(b.json).toHaveBeenCalledWith({ error: expect.stringContaining('provisioning; retried'), code: 'box-wait' });
@@ -416,7 +415,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     // The claimed row carries no host home yet (an agent that never said hello
     // with one), so the runner cannot be placed in this request: 503, and the
     // box is theirs for the re-offer.
-    flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+    flags({ 'claude-runner-auto-box-enabled': true });
     vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
     names = [today];
     vi.mocked(claimWarmBox).mockResolvedValue({ claimed: true, instance: { id: 'w1', name: `${today}-2` }, candidatesTried: 1 } as never);
@@ -433,19 +432,13 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     expect(provisionNewBox).not.toHaveBeenCalled();
   });
 
-  it('skips the pool for an owner whose box-image or box-hibernation-enabled flag differs from the pool, and launches with their values', async () => {
-    flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+  it('skips the pool for an owner whose box-image flag differs from the pool, and launches with their values', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
     vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
     vi.mocked(boxImageSelectionFor).mockResolvedValueOnce({ kind: 'ami', amiId: 'ami-123' } as never);
     await spawn();
     expect(claimWarmBox).not.toHaveBeenCalled();
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'ami', amiId: 'ami-123' }, hibernation: false, flavor: 'full' }, null);
-
-    owned = [];
-    vi.mocked(ownerHibernationEnabled).mockResolvedValueOnce(true);
-    await spawn();
-    expect(claimWarmBox).not.toHaveBeenCalled();
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: true, flavor: 'full' }, null);
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'ami', amiId: 'ami-123' }, flavor: 'full' }, null);
 
     // box-warm-pool-sizes: a size the pool holds none of launches cold, at the owner's size.
     owned = [];
@@ -454,11 +447,11 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     await spawn();
     expect(claimWarmBox).not.toHaveBeenCalled();
     expect(poolSpecHashOrNull).not.toHaveBeenCalledWith('small');
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, 'small');
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, flavor: 'full' }, 'small');
   });
 
   it("claims at the owner's size from that size's pool, and asks the claim for only that size", async () => {
-    flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+    flags({ 'claude-runner-auto-box-enabled': true });
     vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
     vi.mocked(ownerDefaultSize).mockResolvedValueOnce('small');
     vi.mocked(claimWarmBox).mockResolvedValueOnce({ claimed: false, reason: 'no-warm-box', candidatesTried: 0 });
@@ -466,7 +459,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
     expect(warmPoolTargetFor).toHaveBeenCalledWith('small');
     expect(poolSpecHashOrNull).toHaveBeenCalledWith('small');
     expect(claimWarmBox).toHaveBeenCalledWith(expect.objectContaining({ currentHash: 'hash', size: 'small' }), expect.anything());
-    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, hibernation: false, flavor: 'full' }, 'small');
+    expect(provisionNewBox).toHaveBeenLastCalledWith(user, today, expect.any(Function), { image: { kind: 'published' }, flavor: 'full' }, 'small');
   });
 
   it('hands the create a re-check for inside its transaction, and stands down when it says a box is already on its way (Bugbot on #191)', async () => {
@@ -526,7 +519,7 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
       lastConnectedAt: new Date('2026-10-09T10:00:00Z'), userId: 'u1',
     };
     beforeEach(() => {
-      flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      flags({ 'claude-runner-auto-box-enabled': true });
       vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
       vi.mocked(claimWarmBox).mockResolvedValue({ claimed: true, instance: claimed, candidatesTried: 1 } as never);
       agents({});
@@ -764,8 +757,8 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
   describe('with no box', () => {
     const today = `claude-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
     /** What the Add box gate knows on a broker host: a credential is required; the owner has a stored row or not. */
-    const stored = (hasGithubCredential: boolean, flagOn = false) =>
-      vi.mocked(readBoxCreationFacts).mockResolvedValue({ required: true, flagOn, hasGithubCredential });
+    const stored = (hasGithubCredential: boolean) =>
+      vi.mocked(readBoxCreationFacts).mockResolvedValue({ required: true, hasGithubCredential });
     beforeEach(() => {
       vi.mocked(prisma.instance.findMany).mockImplementation((async (args: { where: { status?: unknown }; select?: { name?: boolean; createdAt?: boolean } }) => {
         if (args.where.status === 'ready') return [];
@@ -776,12 +769,12 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
       vi.mocked(claimWarmBox).mockResolvedValue({ claimed: false, reason: 'no-warm-box', candidatesTried: 0 } as never);
     });
     afterEach(() => {
-      vi.mocked(readBoxCreationFacts).mockResolvedValue({ required: false, flagOn: false, hasGithubCredential: false });
+      vi.mocked(readBoxCreationFacts).mockResolvedValue({ required: false, hasGithubCredential: false });
     });
 
     it('claims a warm box for an owner the Add box gate refuses, but never a cold one (B3)', async () => {
-      broker('absent'); stored(false, true);
-      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      broker('absent'); stored(false);
+      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true });
       vi.mocked(boxCreationRefusal).mockReturnValue({ status: 409, body: { error: 'Connect GitHub in Settings before adding a box', code: 'github-required' } } as never);
       const res = await spawn();
       expect(claimWarmBox).toHaveBeenCalledTimes(1);
@@ -793,8 +786,8 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
     });
 
     it('claims only a pool box whose agent announces claude-runner-wrapper-v2 for an owner the gate refuses, and the gate\'s refusal when the pool has none (B3; Bugbot on #285)', async () => {
-      broker('absent'); stored(false, true);
-      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      broker('absent'); stored(false);
+      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true });
       vi.mocked(boxCreationRefusal).mockReturnValue({ status: 409, body: { error: 'Connect GitHub in Settings before adding a box', code: 'github-required' } } as never);
       vi.mocked(instanceAgentTransport).mockImplementation(((id: string) =>
         ({ conn: {} as never, capabilities: id === 'pool-new' ? CAPABLE : OLD_WRAPPER, agentCommit: null })) as never);
@@ -815,7 +808,7 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
 
     it('claims any pool box for an owner with a stored GitHub credential', async () => {
       broker('present'); stored(true);
-      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true });
       await spawn();
       expect(claimWarmBox).toHaveBeenCalledTimes(1);
       expect(vi.mocked(claimWarmBox).mock.calls[0][0].eligible).toBeUndefined();
@@ -823,7 +816,7 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
 
     it('never cold-provisions for an owner without a stored credential even when the Add box gate is not enforcing', async () => {
       broker('absent'); stored(false);
-      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      flags({ 'claude-runner-anthropic-git-enabled': true, 'claude-runner-auto-box-enabled': true });
       const res = await spawn();
       expect(claimWarmBox).toHaveBeenCalledTimes(1);
       expect(provisionNewBox).not.toHaveBeenCalled();
@@ -861,8 +854,8 @@ describe('POST /internal/claude-runner/spawn, Anthropic-managed git', () => {
     });
 
     it('still applies the Add box gate to the warm claim while the flag is off', async () => {
-      broker('present'); stored(true, true);
-      flags({ 'claude-runner-auto-box-enabled': true, 'warm-pool-enabled': true });
+      broker('present'); stored(true);
+      flags({ 'claude-runner-auto-box-enabled': true });
       vi.mocked(boxCreationRefusal).mockReturnValueOnce({ status: 409, body: { error: 'Connect GitHub in Settings before adding a box', code: 'github-required' } } as never);
       const res = await spawn();
       expect(claimWarmBox).not.toHaveBeenCalled();

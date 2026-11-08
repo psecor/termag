@@ -51,6 +51,11 @@ model User {
   projects             Project[]
   agentTokens          AgentToken[]
   sharedWithMe         ProjectShare[]        @relation("sharedWithMe")
+  previewAudiencesOwned PreviewAudience[]    @relation("previewAudiencesOwned")
+  previewAudienceGrants PreviewAudienceGrantee[]
+  previewAudienceViews PreviewAudienceViewer[]
+  previewLinkSessions  PreviewLinkSession[]
+  previewLinkConfirmations PreviewLinkConfirmation[]
   previewSharesOwned   PreviewShare[]        @relation("previewSharesOwned")
   previewSharesGranted PreviewShare[]        @relation("previewSharesGranted")
   previewShareViews    PreviewShareViewer[]
@@ -59,6 +64,7 @@ model User {
   visits               ProjectVisit[]
   warpSamples          WarpSample[]
   tokenUsage           TokenUsageDay[]
+  tokenUsageModels     TokenUsageModelDay[]
   instances            Instance[]
   credentials          UserCredential[]
   mcpConnectors        McpConnector[]
@@ -94,6 +100,14 @@ model User {
   // Simple UI: notify (push, or the open tab) when a chat this user can see
   // finishes its turn. Off until they opt in.
   chatTurnNotify       Boolean               @default(false)
+  // Settings > Telemetry: send this person's chat session titles to termag's
+  // telemetry as the session.titled product event (docs/agents/observability.md).
+  // On until they turn it off.
+  telemetryTitles      Boolean               @default(true)
+  // Settings > Box notices: the bot's DMs before and after termag stops one
+  // of this person's boxes on its own (services/boxIdleNotices.ts). On until
+  // they turn it off, here or with the DM's "Stop these messages".
+  boxIdleNotify        Boolean               @default(true)
   pushSubscriptions    PushSubscription[]
 
   @@map("users")
@@ -215,6 +229,12 @@ model CliSession {
   createdAt   DateTime  @default(now())
   lastUsedAt  DateTime  @default(now())
   revokedAt   DateTime?
+  /// The box this sign-in was made on: the CLI sends the box's own credential
+  /// with the code exchange (routes/cliApi.ts POST /token). Null: not on a box,
+  /// which every sign-in made before the column reads as. A box-issued token is
+  /// one every process on that box can read, so what it may do is narrower
+  /// (routes/cliPreviewLinks.ts: wider preview audiences need a browser confirm).
+  issuedOnBoxId String?
 
   @@index([userId])
   @@map("cli_sessions")
@@ -387,6 +407,13 @@ model Project {
   /// Only a hint: the simple UI folds away a main that has never been used
   /// in any project with ask threads, recorded or not.
   createdFor     String?
+  /// The environment the project's checkouts came
+  /// from, when one did; no foreign key, so it outlives the environment, as
+  /// environment_events does. Anyone signed in can set a shared environment's
+  /// repositories, so an ask of such a project is capped below
+  /// bypassPermissions (services/askService.ts askModeFor): its checkout's
+  /// settings, hooks and MCP servers never load.
+  environmentId  String?
   lastActiveAt   DateTime @default(now())
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -433,6 +460,24 @@ model Project {
   // enum, like kind. A workspace project's repoUrl is null and its setupStatus
   // is the aggregate over its repositories (services/projectRepos.ts).
   layout                String   @default("repo")
+  // The environment file this project was made from:
+  // { name, repo, path }, the environment's own; null for a project from a
+  // repository, whose implicit file is its `.termag/environment.json`. Read by
+  // services/projectEnvironment.ts when the box runs the file's steps.
+  environmentFile       Json?
+  // The box's last report of those steps (agent/environment-run.js): setup's
+  // time, the run, each port's health, the secret names and warnings. Null
+  // until a box has run them.
+  environmentStatus     Json?
+  // Where a repo project's checkout really is when it isn't its project
+  // directory: the static layout's ~/code/<repo> (or its `path`), on a box made
+  // from an environment.
+  // The project directory, ~/termag/projects/<name>, is then a link to it, so
+  // everything that derives the directory from the name still reaches it.
+  // Set from the box's answer to its clone (services/staticLayout.ts); null
+  // for every other project, a workspace's included (each of its
+  // repositories is linked under its root instead).
+  dir                   String?
 
   workflows      Workflow[]
   workstreams    Workstream[]
@@ -447,11 +492,15 @@ model Project {
   browserTabs    BrowserTab[]
   shares         ProjectShare[]
   invites        ProjectInvite[]
+  previewAudiences PreviewAudience[]
+  previewLinkConfirmations PreviewLinkConfirmation[]
+  previewLinkRequests PreviewLinkRequest[]
   previewShares  PreviewShare[]
   previewShareSettings PreviewShareSettings?
   visits         ProjectVisit[]
   contextSamples ContextSample[]
   tokenUsage     TokenUsageDay[]
+  tokenUsageModels TokenUsageModelDay[]
   agentThreads   AgentThread[]
   chatActiveTargets ChatActiveTarget[]
 
@@ -503,6 +552,39 @@ model TokenUsageDay {
   @@index([userId, date])
   @@index([projectId, date])
   @@map("token_usage_days")
+}
+
+// The same scanned tokens as token_usage_days, split by the model (and, for pi,
+// the provider it names, e.g. fireworks) the agent's logs record. One
+// day row's model rows sum to it. A day row with none (an agent from before the
+// split, or vibe) reads as model '' in the admin report (admin/tokenSource.ts).
+model TokenUsageModelDay {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hostKey     String
+  provider    String
+  date        String
+  sourceKey   String
+  /// As the log names it ("claude-opus-5-5", "us.anthropic.claude-opus-5-5", "accounts/fireworks/models/kimi-k3"); '' when it names none.
+  model       String
+  /// pi's message provider (fireworks, say); '' for harnesses whose logs don't say.
+  backend     String   @default("")
+  projectId   String?
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  workstream  String?
+  input       BigInt   @default(0)
+  output      BigInt   @default(0)
+  cacheRead   BigInt   @default(0)
+  cacheCreate BigInt   @default(0)
+  reasoning   BigInt   @default(0)
+  calls       Int      @default(0)
+  scannedAt   DateTime
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, hostKey, provider, date, sourceKey, backend, model])
+  @@index([date])
+  @@map("token_usage_model_days")
 }
 
 model ContextSample {
@@ -567,6 +649,12 @@ model Workstream {
   /// The Claude session id this chat resumes, as termag last heard it (a
   /// runner turn, or a desktop thread's hook post); null before its first turn.
   chatSessionId  String?
+  /// When its owner archived it from a space's Files (chat-nested-agents-enabled):
+  /// Files lists it, and the
+  /// agents under it, in its Archived fold instead. Only a list's: the session,
+  /// its box and its asks carry on, and one that is working shows anyway. Null:
+  /// listed as usual.
+  explorerArchivedAt DateTime?
   lastActiveAt   DateTime       @default(now())
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
@@ -576,10 +664,12 @@ model Workstream {
   automationRun  AutomationRun?
   /// The ask thread whose chat this workstream is.
   askThread      AgentThread?   @relation("AskChat")
+  previewAudiences PreviewAudience[]
   previewShares  PreviewShare[]
   chatTranscripts ChatTranscript[]
   chatResumes     ChatResume[]
   chatHeldMessages ChatHeldMessage[]
+  chatNotices     ChatNotice[]
 
   @@unique([projectId, name])
   @@index([projectId])
@@ -714,6 +804,18 @@ model SlackAgentThread {
   resetAt         DateTime?
   runHolder       String?
   runBeatAt       DateTime?
+  // What the thread is bound to (slack/session/scope.ts):
+  // personal | space | router; every thread before space channels is personal.
+  scope           String    @default("personal")
+  spaceId         String?
+  routeSeq        Int       @default(0)
+  // Set on a thread that was in a channel when it was linked or unlinked: no more turns.
+  frozenAt        DateTime?
+  // For space turns' least privilege (tech spec §5.7, M10): set once the session
+  // loaded content not authored by the runner, sticky until a fresh session.
+  mixedAt         DateTime?
+  mixedReasons    Json?
+  memoryVersions  Json?
   updatedAt       DateTime  @default(now()) @updatedAt
 
   @@id([channelId, threadTs])
@@ -728,6 +830,8 @@ model SlackAgentDmLast {
   claudeSessionId String
   workingDir      String
   at              DateTime
+  // The space binding of the thread the session ran in: carry-over stays within one binding.
+  spaceId         String?
 
   @@map("slack_agent_dm_last")
 }
@@ -864,9 +968,10 @@ model WarpSample {
 model Instance {
   id String @id @default(cuid())
 
-  // Null means an unclaimed warm-pool box, which belongs to nobody until it is
-  // claimed. `status` is the discriminator: "warming" and "warm" rows have no
-  // owner, every other status has one.
+  // Null means an unclaimed pool box, which belongs to nobody until it is
+  // claimed. `status` is the discriminator: "warming" and "warm" rows (the warm
+  // pool) and the env-* rows (an environment pool)
+  // have no owner, every other status has one.
   userId String?
   user   User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -976,6 +1081,16 @@ model Instance {
   //                    stopped. Nothing starts or terminates it but an admin's
   //                    terminate, so the volumes stay as they were found.
   //   terminated     — instance gone (kept for history; cleanup is a sweep)
+  // An environment pool's ownerless boxes ("Pool
+  // states"; poolEnvironmentId names the environment):
+  //   env-preparing  — launched (or started for a refresh): cloning, then
+  //                    `setup`. The only status the GitHub broker answers with
+  //                    the pool credential, and only for fetches of the
+  //                    environment's repositories (services/githubAuthz.ts)
+  //   env-stopping   — `setup` succeeded; StopInstances sent
+  //   env-stopped    — stopped, prepared, claimable
+  //   env-starting   — taken by a claim; StartInstances sent, waiting for the agent
+  //   env-failed     — the clone or `setup` failed; kept for its log, then terminated
   status            String    @default("provisioning")
   provisioningError String? // populated when status flips to failed
   createdAt         DateTime  @default(now())
@@ -1004,6 +1119,37 @@ model Instance {
 
   // Warm pool. Only pool boxes populate these.
   poolSpecHash          String? // pool spec this box launched from, re-compared against the current hash each reconciler tick
+  // Environment pool: the Environment this box was launched (and is prepared)
+  // for. Set on the env-* statuses only. The GitHub broker reads it to decide
+  // which repositories a preparing box may fetch with the pool credential.
+  poolEnvironmentId     String?
+  // The environment pool's columns
+  // (services/envPool.ts). A row is current while poolSetupHash equals its
+  // environment's now: sha256 of the resolved `setup`, the pool spec (image,
+  // type, cloud-init shape) and the size and disk. preparedCommit is
+  // {"owner/name": sha} for each repository as `setup` last succeeded on it,
+  // poolRepos the repositories resolved at launch ([{repo, branch, dir}]),
+  // which the broker's pool rule reads instead of GitHub. poolLog is the last
+  // prepare failure's log tail (env-failed), shown on the environment's page.
+  poolSetupHash         String?
+  preparedCommit        Json?
+  preparedAt            DateTime?
+  poolRepos             Json?
+  poolLog               String?
+  // The refresh: refreshStartedAt is
+  // when the refresh now running started an env-stopped box again (null
+  // otherwise), so its prepare times out from there and only its own setup's
+  // success stops the box; refreshCheckedAt is when the refresh last checked
+  // the row, so a stopped box is checked once each ENV_POOL_REFRESH_MINUTES.
+  refreshStartedAt      DateTime?
+  refreshCheckedAt      DateTime?
+  // An env-failed row whose setup ran and failed, which holds the pool at its hash and heads; any other failure
+  // (its launch, the image, a clone, a timeout) only delays the next launch for the same hash and heads.
+  poolSetupFailed       Boolean   @default(false)
+  // Where EC2 put the box: a stopped box can't change zone, so a claim refused
+  // for capacity in one takes a pool box in another. Recorded for every launch.
+  availabilityZone      String?
+  subnetId              String?
   warmedAt              DateTime? // when the box became claimable; claim order is oldest first
   claimedAt             DateTime? // start of the claim latency budget
   // Stamped on socket close, and deliberately NOT cleared on reconnect: the
@@ -1047,8 +1193,14 @@ model Instance {
   // (120), written at create and again at launch with what the box got (never
   // under the image's snapshot; hibernation's RAM is on top). A pool box has
   // the default. Null for boxes made before it was recorded, and for external
-  // boxes. Not updated by the admin Grow disk.
+  // boxes. A finished grow (services/boxDisk.ts, owner or admin) sets it to the new size.
   diskGiB      Int?
+
+  // Whether termag sets the box up (services/boxSetup.ts):
+  // false delivers no skills, agent config, credentials or project seeding,
+  // and never a warm-pool box. Chosen at launch and written to
+  // ~/.config/termag/setup by cloud-init, which the box side reads.
+  setupEnabled Boolean @default(true)
 
   // Hibernation. EC2 only accepts HibernationOptions at RunInstances, so this
   // is written once at launch and is false forever for every box launched
@@ -1061,10 +1213,16 @@ model Instance {
   // The power sweep resumed this box to restart the 60-day clock and will
   // hibernate it again once its agent connects.
   rehibernatePending    Boolean   @default(false)
+  // The resume marker: when
+  // an owner's or a caller's start resumed this box from `hibernated`, not a
+  // refresh resume. Its sessions came back on the binaries they had, so the
+  // tool sweep (services/toolUpdate/autoRuns.ts) gives it a run on its first
+  // hello after the resume and clears it.
+  resumedFromHibernationAt DateTime?
 
   // Automatic lifecycle (services/boxLifecycle.ts).
   // Only boxes with hibernationConfigured take part. Null is off, or the
-  // default window's stop where box-idle-stop-enabled is on.
+  // default window's stop.
   idleHibernateHours Int?
   // Last human input, agent `working` status or cloud-session start or end on
   // the box, throttled to a write a minute (services/boxActivity.ts). System
@@ -1148,6 +1306,7 @@ model Instance {
   // that index and it needs no change.
   @@index([userId, status])
   @@index([parentInstanceId])
+  @@index([status, poolEnvironmentId])
   @@map("instances")
 }
 
@@ -1193,6 +1352,9 @@ model AdminAuditLog {
   at      DateTime @default(now())
   actorId String
   tokenId String?
+  // The box whose own agent token made the call: an admin's box reading or
+  // triaging bug reports from the CLI. Null otherwise.
+  boxId   String?
   surface String // rest | mcp
   action  String // route (METHOD /path) or MCP tool name
   args    Json?
@@ -1346,12 +1508,41 @@ model ChatHeldMessage {
   claimedAt    DateTime?
   // The chat refused it for good; it stays, shown with this, and is not retried.
   error        String?
+  // The send's images, [{mediaType, data (base64)}], as a send carries them; their types alone for the view.
+  images       Json?
+  imageTypes   String[]   @default([])
+  // When a start of the chat's box was asked for it (on send, or by held delivery once a stopping box stopped).
+  boxStartedAt DateTime?
   createdAt    DateTime   @default(now())
   project      Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
 
   @@index([workstreamId, createdAt])
   @@map("chat_held_messages")
+}
+
+// A line in a chat's timeline that is neither the person's nor the agent's:
+// today only a tool update's restart notice ("In the
+// chat"), the same text the pane printed (services/toolUpdate/notice.ts,
+// checked against NOTICE_SAFE before it is stored). Shown to everyone who can
+// read the chat, never sent to the agent. The newest CHAT_NOTICE_KEEP per
+// workstream are kept (services/chatNotices.ts).
+model ChatNotice {
+  id           String     @id @default(cuid())
+  workstreamId String
+  workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+  /// `tool-update`.
+  kind         String
+  /// The pane it was printed in: `agent` (the orchestrator's relaunch), or the
+  /// workstream's `ctrl`, `review`, `data` or `data-ctrl` pane (the box's resume).
+  pane         String
+  text         String
+  /// The software_update_runs row that restarted the session; no FK, like that table.
+  runId        String?
+  at           DateTime   @default(now())
+
+  @@index([workstreamId, at])
+  @@map("chat_notices")
 }
 
 model UserCredential {
@@ -1368,14 +1559,34 @@ model UserCredential {
   @@map("user_credentials")
 }
 
+// A credential that belongs to no user: the environment pool's GitHub
+// credential (provider "github"), which the GitHub broker swaps in for a preparing pool box's git
+// fetches. Never delivered to a box. Sealed like user_credentials, under the
+// same KMS key, with the encryption context (purpose: termag-pool-credential,
+// provider) (services/poolCredential.ts). Set by an admin: PUT
+// /api/admin/pool-credential/github.
+model PoolCredential {
+  provider        String   @id
+  label           String // e.g. "@octocat"; never any part of the value
+  ciphertext      Bytes
+  updatedByUserId String?
+  updatedAt       DateTime @updatedAt
+
+  @@map("pool_credentials")
+}
+
 // A user's MCP server, reached from their boxes through the MCP broker.
 // Secrets live in user_credentials as provider
 // "mcp-<id>"; this row holds none.
 model McpConnector {
   id              String   @id @default(cuid())
   userId          String
-  // The mcpServers key on the box and the mcp__<name>__ tool prefix.
+  // The mcpServers key on the box and the mcp__<name>__ tool prefix
+  // (services/mcpConnectors.ts CONNECTOR_NAME), derived from the name typed.
   name            String
+  // The name as typed ("Claude Docs"), which Settings shows; null when that
+  // is the name itself, as for every connector made before display names.
+  displayName     String?
   // https URL, normalised (services/mcpConnectors.ts validateUpstream).
   upstream        String
   authType        String // "static" | "oauth"
@@ -1387,6 +1598,10 @@ model McpConnector {
   linkStatus      String?
   // oauth: why the last link or refresh failed, shown on Settings.
   linkError       String?
+  // oauth: the last sign-in's scopes, {requested: string[], granted: string[] | null}
+  // (services/mcpOAuthScopes.ts ConnectorScopes); granted is null when the
+  // token response named none. Nothing secret.
+  oauthScopes     Json?
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1403,6 +1618,11 @@ model McpOAuthState {
   userId       String
   connectorId  String
   codeVerifier String
+  // The scopes this sign-in's authorize URL asked for.
+  scopes       String[]     @default([])
+  // Where the callback sends the browser: null for Settings → MCP, 'welcome'
+  // for the setup wizard's MCP step (routes/mcpConnectors.ts linkRedirect).
+  returnTo     String?
   expiresAt    DateTime
   createdAt    DateTime     @default(now())
   user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1506,6 +1726,13 @@ model AgentMessage {
   workstream       String
   instanceId       String
   hop              Int
+  // The Claude tier (opus | sonnet | haiku) it asked for with `termag ask
+  // --model` until it starts, then the one its turn launched on; null for none
+  // (the box's default). With `modelIgnored` set, the one it asked for, which
+  // its turn could not take (it ran on the box's default), and why: an older
+  // box agent, a headless run.
+  model            String?
+  modelIgnored     String?
   // A2A's TaskState names: submitted | working | completed | failed | canceled,
   // plus superseded: a follow-up went into its running turn (supersededById).
   status           String      @default("submitted")
@@ -1513,7 +1740,7 @@ model AgentMessage {
   promptBytes      Int
   replyBytes       Int?
   numTurns         Int?
-  // none | published | refused | failed, with a reason that never holds a token.
+  // none | published | partial | unpushed | refused | failed, with a reason that never holds a token.
   publish          String?
   publishDetail    String?
   createdAt        DateTime    @default(now())
@@ -1978,13 +2205,13 @@ model PrGroupSuggestionDismissal {
 /// A shared file store across boxes. The files live in S3
 /// under `<id>/`; this row is the name, the quota and the lifecycle.
 model Space {
-  id          String        @id @default(cuid())
+  id          String           @id @default(cuid())
   /// [a-z0-9-]{2,40}, unique across termag so `space:path` is unambiguous.
   /// A deleted space's name is released (rewritten to `deleted:<id>`).
-  name        String        @unique
+  name        String           @unique
   description String?
   createdById String
-  createdAt   DateTime      @default(now())
+  createdAt   DateTime         @default(now())
   /// Set when the last owner leaves termag; a space with no owner member is
   /// read-only even without it (services/spaceAccess.ts).
   readOnlyAt  DateTime?
@@ -1992,8 +2219,8 @@ model Space {
   deletedAt   DateTime?
   /// Every stored version, current and noncurrent, plus unfinished multipart
   /// parts: charged when upload URLs are signed, recounted hourly from S3.
-  usedBytes   BigInt        @default(0)
-  quotaBytes  BigInt        @default(107374182400)
+  usedBytes   BigInt           @default(0)
+  quotaBytes  BigInt           @default(107374182400)
   members     SpaceMember[]
   boxes       SpaceBox[]
   invites     SpaceInvite[]
@@ -2002,6 +2229,8 @@ model Space {
   listings    ProjectSpace[]
   /// The chats that belong to this space (Workstream.spaceId).
   workstreams Workstream[]
+  /// Slack for the space: its linked channels and orchestrator.
+  slack       SpaceSlack?
 
   @@map("spaces")
 }
@@ -2120,26 +2349,187 @@ model SpaceInvite {
 /// and download presigns. No foreign keys, so it outlives what it names;
 /// swept after 90 days.
 model SpaceEvent {
-  id              String   @id @default(cuid())
-  at              DateTime @default(now())
-  spaceId         String
-  actorUserId     String
+  id               String   @id @default(cuid())
+  at               DateTime @default(now())
+  spaceId          String
+  actorUserId      String
   /// Set when a box token acted.
-  actorInstanceId String?
+  actorInstanceId  String?
   /// The box the access was inherited through, when it was.
-  via             String?
+  via              String?
   /// space.* | member.* | invite.* | box.* | file.put | file.put.signed | file.get | file.rm | file.mv |
   /// file.share | file.unshare. A non-member's read of a shared file is file.get with via 'share'.
-  action          String
-  path            String?
-  bytes           BigInt?
+  /// slack.* (space channels), written with surface `slack`.
+  action           String
+  path             String?
+  bytes            BigInt?
   /// The S3 version a file.put stored (HEAD at the confirm), so a change can be diffed and restored.
-  versionId       String?
+  versionId        String?
   /// Why, as the writer said it (`termag space memory … --note`), at most 200 characters, secret-scanned.
-  note            String?
+  note             String?
+  /// Where the action came from: `slack`, or null for every other writer (the web UI, the CLI, a box).
+  /// A Slack entry point (slack_command, web, …) goes in `note` as `linkedVia=<value>`.
+  surface          String?
+  /// The space member a Slack-originated action was for, when the actor (the runner) acted for someone.
+  onBehalfOfUserId String?
 
   @@index([spaceId, at])
   @@map("space_events")
+}
+
+// ── Spaces in Slack ──────────────────────
+/// Slack for one space: who the orchestrator runs as and where. Created by the space's first channel link.
+model SpaceSlack {
+  id             String         @id @default(cuid())
+  spaceId        String         @unique
+  space          Space          @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  enabledById    String
+  /// The owner whose identity, box and budget the orchestrator uses.
+  runnerUserId   String
+  /// The orchestrator project (kind `space-orchestrator`).
+  projectId      String?        @unique
+  instanceId     String?
+  /// active | paused | suspended
+  status         String         @default("active")
+  suspendReason  String?
+  /// {newBoxApprovers: 'runner' | 'owners'}; the runner always may.
+  approvalPolicy Json?
+  /// Per-space overrides of the space-slack-limits caps (services/spaceSlack/limits.ts).
+  limits         Json?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  disabledAt     DateTime?
+  channels       SpaceChannel[]
+
+  @@index([runnerUserId])
+  @@map("space_slack")
+}
+
+/// A Slack channel linked to a space. One space per channel (the id is the key); up to channelsPerSpace per space.
+model SpaceChannel {
+  channelId       String     @id
+  teamId          String
+  spaceSlackId    String
+  spaceSlack      SpaceSlack @relation(fields: [spaceSlackId], references: [id], onDelete: Cascade)
+  /// The name as last seen (channel_rename keeps it current); display only.
+  name            String
+  isPrivate       Boolean    @default(false)
+  createdByTermag Boolean    @default(false)
+  linkedById      String
+  /// slack_command | slack_shortcut | app_home | web | cli | create
+  linkedVia       String
+  linkedAt        DateTime   @default(now())
+  /// ts of termag's confirmation message in the channel.
+  confirmTs       String?
+  /// Paused on a Slack Connect share; answers stop until an owner unlinks or the share ends.
+  pausedAt        DateTime?
+  pauseReason     String?
+  unlinkedAt      DateTime?
+  /// owner | archived | removed | ext_shared | disabled | space_deleted | relinked
+  unlinkReason    String?
+  lastCheckedAt   DateTime?
+
+  @@index([spaceSlackId])
+  @@map("space_channels")
+}
+
+/// Each hand-off of a Slack thread to a space: the thread's binding history.
+model SlackThreadRoute {
+  channelId              String
+  threadTs               String
+  seq                    Int
+  spaceId                String
+  requestedBySlackId     String
+  requestedByUserId      String
+  /// channel | thread | explicit | single | context | router_model | user_choice
+  decidedBy              String
+  candidateCount         Int
+  orchestratorWorkstream String?
+  at                     DateTime @default(now())
+
+  @@id([channelId, threadTs, seq])
+  @@index([spaceId, at])
+  @@map("slack_thread_routes")
+}
+
+/// An ask a space orchestrator started from a Slack thread (report-back).
+model SpaceSlackTask {
+  agentThreadId     String    @id
+  spaceId           String
+  channelId         String
+  threadTs          String
+  requestedByUserId String
+  postedAt          DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([spaceId])
+  @@map("space_slack_tasks")
+}
+
+/// A space turn waiting for the runner's box to wake.
+model SpaceSlackPending {
+  id        String   @id @default(cuid())
+  spaceId   String
+  channelId String
+  threadTs  String
+  slackId   String
+  message   String
+  queuedAt  DateTime @default(now())
+
+  @@index([spaceId, queuedAt])
+  @@map("space_slack_pending")
+}
+
+// ── Environments ────────────────────────────────────
+/// A named environment definition: environment.json's JSON, either stored
+/// here (`inline`) or read from a file in a repository (`pointer`, repo :
+/// branch : path, read at box creation). The repositories a project made from
+/// it clones are the definition's `repos`. Shared: anyone signed in can see,
+/// use and edit any of them, and every create, edit and delete writes an
+/// EnvironmentEvent.
+model Environment {
+  id              String   @id @default(cuid())
+  /// Lowercase letters, digits and hyphens: what `--environment` names.
+  name            String   @unique
+  /// inline | pointer
+  kind            String
+  /// inline: the definition, as environment.json would hold it.
+  definition      Json?
+  /// pointer: the file's repository (owner/name), branch (null: its default) and path.
+  fileRepo        String?
+  fileBranch      String?
+  filePath        String?
+  createdByUserId String?
+  updatedByUserId String?
+  /// personal | shared. Personal: only its owner sees, uses, edits or deletes it. Shared: everyone signed in sees
+  /// and uses it, and it is a pointer to a file on its repository's default branch (services/environments.ts).
+  /// Null for a row written without one, which backfillEnvironmentVisibility decides at startup (and reads
+  /// take as legacyVisibility until it has).
+  visibility      String?
+  /// Who owns it: its creator (null with visibility: its creator). Only the owner switches it between personal and shared.
+  ownerUserId     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([ownerUserId])
+  @@map("environments")
+}
+
+/// Append-only history of every environment change, on SpaceEvent's pattern:
+/// no foreign keys, so it outlives a deleted environment, and never pruned.
+model EnvironmentEvent {
+  id            String   @id @default(cuid())
+  at            DateTime @default(now())
+  environmentId String
+  actorUserId   String
+  /// environment.create | environment.update | environment.delete
+  action        String
+  /// The stored fields ({ name, kind, definition | file }) before and after; null before a create, after a delete.
+  before        Json?
+  after         Json?
+
+  @@index([environmentId, at])
+  @@map("environment_events")
 }
 
 // ── Deployed software ───────────────────────────
@@ -2185,6 +2575,8 @@ model SoftwareUpdateRun {
   instanceId    String?
   component     String // claude
   trigger       String // manual | boot | guard | floor | resume | nightly
+  /// Why an automatic run (floor, resume, nightly) was made, in words: the sweep's decision.
+  reason        String?
   requestedById String?
   restart       String // none | idle | force
   status        String // requested | running | done | failed | refused | expired
@@ -2202,6 +2594,25 @@ model SoftwareUpdateRun {
 
   @@index([hostKey, requestedAt])
   @@map("software_update_runs")
+}
+
+/// What the automatic tool sweep (services/toolUpdate/autoRuns.ts) keeps per box and tool between passes.
+model ToolAutoUpdateState {
+  /// host_software's key: an instance id.
+  hostKey     String
+  component   String
+  /// When the sweep first saw the box with the tool's auto-update flag on: a box with no run is due a nightly run from here.
+  firstSeenAt DateTime @default(now())
+  /// The last pass that looked at the box with the flag on: a gap of over an hour starts firstSeenAt again.
+  lastSeenAt  DateTime?
+  /// The floor the box is below, and since when the sweep has seen it so (force after the policy's forceAfterHours). Null: not below.
+  breachFloor String?
+  breachSince DateTime?
+  /// The last pass that saw the breach: a gap of over an hour (the flag off, no leader) starts the force clock again.
+  breachSeenAt DateTime?
+
+  @@id([hostKey, component])
+  @@map("tool_auto_update_states")
 }
 
 /// The latest client version each user was seen with, per client kind.
@@ -2698,6 +3109,262 @@ model PreviewShareSettings {
   updatedAt           DateTime @updatedAt
 
   @@map("preview_share_settings")
+}
+
+/// Who may see a preview of a workstream, whatever delivers it
+/// (services/previewAudience.ts
+/// owns these four tables). One audience, one or more deliveries, each with
+/// its own token: a PreviewLink today; preview shares and webapp-attach's
+/// AttachGrant are meant to become deliveries on it later. Ending an audience
+/// ends every delivery on it, through previewAudience.ts's end hook.
+model PreviewAudience {
+  id           String      @id @default(cuid())
+  projectId    String
+  project      Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Null for a project's implicit main, as PreviewShare.
+  workstreamId String?
+  workstream   Workstream? @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+  /// Who made it: the project's owner or a collaborator.
+  ownerId      String
+  owner        User        @relation("previewAudiencesOwned", fields: [ownerId], references: [id], onDelete: Cascade)
+  /// owner (the project's owner and collaborators) | people (and the grantees) | link (and anyone with a delivery's token)
+  kind         String
+  /// The audience's one expiry; a grantee may also have their own (PreviewAudienceGrantee.expiresAt).
+  expiresAt    DateTime
+  /// Set when someone revoked it, beside endedAt.
+  revokedAt    DateTime?
+  /// Set with endReason when it ends for any reason; null while it is live.
+  endedAt      DateTime?
+  /// expired | revoked | box-gone | project-gone | workstream-gone | kill-switch | admin
+  endReason    String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  grantees     PreviewAudienceGrantee[]
+  viewers      PreviewAudienceViewer[]
+  events       PreviewAudienceEvent[]
+  links        PreviewLink[]
+
+  @@index([projectId])
+  @@index([workstreamId])
+  @@index([ownerId])
+  @@index([expiresAt])
+  @@map("preview_audiences")
+}
+
+/// A termag user a `people` (or `link`) audience names (A1). Every viewer is a termag user (A2).
+model PreviewAudienceGrantee {
+  id         String          @id @default(cuid())
+  audienceId String
+  audience   PreviewAudience @relation(fields: [audienceId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// This person's own expiry, before the audience's; null: the audience's alone. Links leave it null.
+  expiresAt  DateTime?
+  createdAt  DateTime        @default(now())
+
+  @@unique([audienceId, userId])
+  @@index([userId])
+  @@map("preview_audience_grantees")
+}
+
+/// Who opened a preview (A3), whatever delivered it, as PreviewShareViewer.
+model PreviewAudienceViewer {
+  id            String          @id @default(cuid())
+  audienceId    String
+  audience      PreviewAudience @relation(fields: [audienceId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstOpenedAt DateTime        @default(now())
+  lastOpenedAt  DateTime        @default(now())
+  /// Set when the owner removes them, as PreviewShareViewer.revokedAt: every
+  /// way in is refused until a renew names them again.
+  revokedAt     DateTime?
+
+  @@unique([audienceId, userId])
+  @@index([userId])
+  @@map("preview_audience_viewers")
+}
+
+/// created | opened | refused | revoked | extended | ended | viewer-removed | requested, as PreviewShareEvent.
+model PreviewAudienceEvent {
+  id           String          @id @default(cuid())
+  audienceId   String
+  audience     PreviewAudience @relation(fields: [audienceId], references: [id], onDelete: Cascade)
+  /// The actor's user id; null for the sweep and the system.
+  actorId      String?
+  kind         String
+  reason       String?
+  /// The delivery it happened on (`link` and its id), or null for the audience itself.
+  deliveryKind String?
+  deliveryId   String?
+  detail       Json?
+  at           DateTime        @default(now())
+
+  @@index([audienceId, at])
+  @@map("preview_audience_events")
+}
+
+/// A preview audience delivered at <name>.<PREVIEW_LINKS_DOMAIN>: a port on the
+/// workstream's box. From #167's
+/// PublishedPort. Who may open it, its expiry and its end are its audience's;
+/// what is the link's own is here: its name, port, host mode and token.
+model PreviewLink {
+  id            String          @id @default(cuid())
+  audienceId    String
+  audience      PreviewAudience @relation(fields: [audienceId], references: [id], onDelete: Cascade)
+  /// The hostname label (PRD P2), kept for history. Not unique: ended links keep
+  /// it. Which link a name serves is PreviewLinkName.linkId.
+  name          String
+  /// The link's own host is <name>--<hostSuffix>.<domain> (SR19): 6 random
+  /// base32 characters, minted with each new link, kept by renew and extend.
+  /// The database default fills rows that predate it, for `db push` as for the
+  /// migration: md5 hex with the four digits base32 lacks mapped to w-z. The
+  /// app always writes its own.
+  hostSuffix    String          @default(dbgenerated("substr(translate(md5((random())::text), '0189'::text, 'wxyz'::text), 1, 6)"))
+  port          Int
+  /// sha256 of the link's own 128-bit token (a `link` audience); the token is
+  /// never stored. Per delivery, never the audience's (SR11).
+  linkTokenHash String?         @unique
+  /// localhost | public (PRD U2)
+  hostMode      String          @default("localhost")
+  /// The PreviewLinkRequest an agent made, when the link came from one (P4).
+  requestId     String?         @unique
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  /// The reservation, while this is the link its name serves.
+  nameRow       PreviewLinkName?
+  codes         PreviewLinkCode[]
+  sessions      PreviewLinkSession[]
+
+  @@index([name])
+  @@index([audienceId])
+  @@map("preview_links")
+}
+
+/// A name's reservation (PRD P2, SR19). It has no relation a delete cascades
+/// through: a project, workstream, owner or link going leaves it in place, so
+/// a name stays held for 30 days after its link could last have worked.
+model PreviewLinkName {
+  name          String       @id
+  /// The owner's user id, as a plain string (no relation): the same owner may
+  /// take the name back at any time.
+  ownerId       String
+  /// Live link's expiresAt + 30 days, moved on every publish, renew and extend;
+  /// now + 30 days on revoke or end. Never moved earlier.
+  reservedUntil DateTime
+  /// The link this name serves now; null once that link is deleted (a cascade
+  /// from its project, workstream or owner), which leaves the reservation in place.
+  linkId        String?      @unique
+  link          PreviewLink? @relation(fields: [linkId], references: [id], onDelete: SetNull)
+
+  @@index([reservedUntil])
+  @@map("preview_link_names")
+}
+
+/// The one-time handoff from the landing page to the preview host (60 s, single use).
+model PreviewLinkCode {
+  /// sha256 of 256 random bits
+  codeHash      String      @id
+  linkId        String
+  link          PreviewLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  userId        String
+  /// Why the viewer was let in: owner | collaborator | grant | token. For token,
+  /// the linkTokenHash it matched, so the exchange checks it was not rotated since.
+  basis         String
+  tokenHash     String?
+  /// Set for a re-verification: the session this code refreshes, not a new one.
+  sessionIdHash String?
+  /// The app path to land on: origin-form only, validated at the landing page.
+  next          String
+  expiresAt     DateTime
+
+  @@index([linkId])
+  @@index([expiresAt])
+  @@map("preview_link_codes")
+}
+
+/// A viewer's session on one preview host. The cookie carries the id and its HMAC.
+model PreviewLinkSession {
+  /// sha256 of the cookie's 256-bit id
+  idHash     String      @id
+  linkId     String
+  link       PreviewLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  /// As PreviewLinkCode's: what let the viewer in, checked again at each re-verification.
+  basis      String
+  tokenHash  String?
+  /// The termag user (A2); deleting the user ends their sessions.
+  userId     String
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// When termag access was last verified through the landing page; at most an hour ago (A2).
+  verifiedAt DateTime
+  /// min(link.expiresAt, created + 8 h)
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime    @default(now())
+
+  @@index([linkId])
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("preview_link_sessions")
+}
+
+/// A preview link change asked for with a device sign-in made on a box that
+/// would let more people see the app (a `people` or `link` audience): nothing
+/// is applied until the person who asked confirms it in their browser, at
+/// `/termag/previews/confirm/<id>` (services/previewLinkConfirmations.ts). An
+/// agent on that box can read the sign-in's token, but not the person's termag
+/// session.
+model PreviewLinkConfirmation {
+  /// sha256 of the confirm URL's 256-bit id; the id itself is never stored.
+  idHash     String    @id
+  /// Who asked, and the only person who may confirm.
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId  String
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// The box the asking sign-in was made on (CliSession.issuedOnBoxId).
+  fromBoxId  String
+  /// publish (a publish or renew) | extend
+  kind       String
+  /// What exactly to apply: the publish body, or { linkId, ttlHours }.
+  request    Json
+  /// pending | confirmed | declined | expired | failed
+  state      String    @default("pending")
+  /// Why a confirm failed to apply (the publish's own refusal), for the CLI.
+  failure    String?
+  /// The link it made or changed, once confirmed.
+  linkId     String?
+  /// A new link token's share URL, sealed: AES-256-GCM under a key derived
+  /// from the confirm URL's raw id, which only its hash is stored beside, so the
+  /// database alone (a backup) can't open it. Held only until the CLI that asked
+  /// reads it once (services/previewLinkConfirmations.ts sealShareUrl).
+  shareUrlSealed String?
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  decidedAt  DateTime?
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("preview_link_confirmations")
+}
+
+/// An agent's ask for a link (P4), shown to the owner until they act on it.
+model PreviewLinkRequest {
+  id           String    @id @default(cuid())
+  projectId    String
+  project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  workstreamId String?
+  boxId        String
+  port         Int
+  /// What the agent said the port is, shown as untrusted text (≤ 200 chars).
+  note         String?
+  /// pending | approved | declined | expired
+  state        String    @default("pending")
+  createdAt    DateTime  @default(now())
+  decidedAt    DateTime?
+
+  @@index([projectId, state])
+  @@map("preview_link_requests")
 }
 
 /// One EC2 box's metered usage in one UTC hour. Written by

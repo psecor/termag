@@ -33,7 +33,7 @@ import { statusKey } from '../services/statusKey';
 import { createProjectChannel } from '../slack/channels';
 import { setNotificationTarget } from '../slack/lts';
 import { rename } from 'fs/promises';
-import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions } from '../services/agentRuntime';
+import { ensureAgentSessionsAndLaunch, resolveAgentProvider, stopAgentSessions, stopTerminalSlots } from '../services/agentRuntime';
 import { claimUpdateRunning } from '../services/claimUpdateGate';
 import { parseClaudeChatModel } from '../services/claudeChatModel';
 import { replaySessionIdFrom } from '../services/launchCommand';
@@ -42,22 +42,27 @@ import { adoptWorkstreamAgent } from '../services/workstreamAgent';
 import { agentView, applySetupEvent } from '../services/projectClone';
 import { cloneRoute, needsBoxRelaunch, waitsForBoxAgent } from '../services/projectSetup';
 import { ensureHostSetup, hostAgentUnavailableResponse } from '../services/hostSetup';
-import { assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { askChatPaneRefusal, assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
 import { historyFor } from './paneHistory';
 import { powerStateError } from '../services/boxPowerPolicy';
+import { isSetupOff, setupOffRefusal } from '../services/boxSetup';
 import { refuseParkedBox } from '../middleware/parkedBox';
 import { refuseUnreadySetup } from '../middleware/unreadySetup';
 import { RouteResult, sendResult } from './routeResult';
 import { boxRenameError, boxRenameRpcError, renameSessionPairs } from './projectRename';
 import { isAdminUser } from '../services/admin/adminAccess';
 import { revokeChats } from '../services/chatRevoke';
-import { isProjectKind, kindRefusal, projectKindTraits, type ProjectKind } from '../services/projectKind';
+import { LISTED_PROJECT_KINDS, isProjectKind, kindRefusal, projectKindTraits, type ProjectKind } from '../services/projectKind';
 import { recordProductEvent } from '../services/productEvents';
 import { notifyOnSuccess } from '../services/workspaceEvents';
 import { endPreviewShares } from '../services/previewShares';
-import { isWorkspace, planWorkspaceRepos, workspaceBoxRefusal, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import { endPreviewAudiences } from '../services/previewAudience';
+import { guideRepos, isWorkspace, planWorkspaceRepos, workspaceBoxRefusal, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import { prismaEnvironmentStore, withEnvironmentRepos, type ProjectEnvironmentFile } from '../services/environments';
+import { freezeEnvironmentFile } from '../services/projectEnvironment';
 import { MULTI_REPO_DISABLED_CODE, multiRepoEnabled } from '../services/multiRepoFlag';
-import { dispatchWorkspace, retryWorkspace } from '../services/workspaceSetup';
+import { dispatchWorkspace, retryWorkspace, workstreamGuideRepos } from '../services/workspaceSetup';
+import { addProjectRepo, listProjectRepos } from './projectRepos';
 import { mainUseKey, usedMains } from '../services/workstreamUse';
 import { chatSpaceFor, fixedOnCreate, fixListedChatSpaces, resolveChatSpaceChoice } from '../services/chatSpace';
 
@@ -120,6 +125,29 @@ export interface CreateProjectInput {
    */
   repos?: Array<{ url?: unknown; name?: unknown; defaultBranch?: unknown }> | null;
   /**
+   * An environment's name: the project holds that
+   * environment's repositories, as repoUrl (one) or repos (two or more) would
+   * (services/environments.ts projectSourceFor). Exclusive with both.
+   */
+  environment?: string | null;
+  /** Set from `environment` by withEnvironmentRepos, never from a request: the file the box runs (Project.environmentFile). */
+  environmentFile?: ProjectEnvironmentFile | null;
+  /**
+   * With an environment, required: the checkouts the person was shown (and
+   * any Full access was granted for), in order: `{ repo: owner/name, branch? }`
+   * (or a bare owner/name for its default branch). An ask of the project
+   * runs them without asking whenever it comes. The create
+   * resolves the environment once and refuses (409 environment_repos_changed)
+   * when that isn't them (services/environments.ts withEnvironmentRepos).
+   */
+  environmentRepos?: unknown;
+  /**
+   * Set by createProjectFor from the environment it resolved: never read from
+   * a body (it is overwritten there). The project's asks are capped below
+   * bypassPermissions when it is set (services/askService.ts askModeFor).
+   */
+  environmentId?: string | null;
+  /**
    * The session replay (id) the browser sent this from, if a recorder is wired in.
    * The agent launch types it so the session's Claude Code spans are filed
    * under that replay (services/launchCommand.ts); anything that is not an
@@ -168,6 +196,16 @@ export interface CreateProjectInput {
 }
 
 export async function createProjectFor(user: Express.User, input: CreateProjectInput): Promise<RouteResult> {
+  // An environment's repositories, as repoUrl or repos.
+  const sourced = await withEnvironmentRepos(prismaEnvironmentStore, user.id, { ...input, environmentFile: undefined });
+  if (!('input' in sourced)) return sourced;
+  // The environment the checkouts came from, recorded on the row (only ever from that resolution, never a body).
+  input = { ...sourced.input, environmentId: sourced.environmentId ?? null };
+  // A pointer's file read once, now, so the box runs what the creator chose, not what the pointer says later.
+  if (input.environmentFile) input = { ...input, environmentFile: await freezeEnvironmentFile(user.id, input.environmentFile) };
+  // What of its definition was left out (a pointer's file missing or malformed): never a failure, but said, as a box create says its own.
+  const { warnings } = sourced;
+  for (const w of warnings) console.warn(`[PROJECTS] ${user.unixUsername}'s ${input.name ?? 'project'}: ${w}`);
   // New session's space, resolved now and written in the main workstream's insert: a listing while
   // setup and launch run would otherwise fix the chat to its box's first grant first (Bugbot, #769).
   const choice = input.chatSpace === null || typeof input.chatSpace === 'string'
@@ -184,7 +222,13 @@ export async function createProjectFor(user: Express.User, input: CreateProjectI
       console.warn(`[PROJECTS] ${id}: chat space not recorded: ${(err as Error).message}`);
     }
   }
-  return notifyOnSuccess(result, user.id, 'projects');
+  return notifyOnSuccess(withWarnings(result, warnings), user.id, 'projects');
+}
+
+/** A 2xx create's body with the environment's `warnings`, only when there are any. */
+function withWarnings(result: RouteResult, warnings: string[]): RouteResult {
+  if (!warnings.length || result.status >= 300 || !result.body || typeof result.body !== 'object') return result;
+  return { ...result, body: { ...(result.body as object), warnings } };
 }
 
 async function createProjectRow(user: Express.User, input: CreateProjectInput, chatSpace: { spaceId?: string | null; spaceFixedAt?: Date } = {}): Promise<RouteResult> {
@@ -273,6 +317,9 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
       }
       const powerError = powerStateError(instance.status);
       if (powerError) { return { status: 409, body: { error: powerError } }; }
+      if (input.chatOrchestrator === true && isSetupOff(instance)) {
+        return setupOffRefusal('Act as an orchestrator');
+      }
       hostHome = instance.hostHome;
       boxStatus = instance.status;
     }
@@ -599,8 +646,10 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
         // replay to that launch (services/projectClone.ts).
         launchReplaySessionId: setupBox ? replaySessionId : null,
         chatTrustedAt: input.chatTrusted === true ? new Date() : null,
+        environmentId: input.environmentId ?? null,
         chatOrchestrator: input.chatOrchestrator === true && input.chatTrusted === true && initialAgent?.provider === CHAT_PROVIDER_ID,
-        ...(isProjectKind(input.kind) && input.kind !== 'metaterm' ? { kind: input.kind } : {}),
+        ...(isProjectKind(input.kind) && projectKindTraits(input.kind).creatableByHand ? { kind: input.kind } : {}),
+        ...(input.environmentFile ? { environmentFile: { ...input.environmentFile } } : {}),
       },
     });
 
@@ -619,14 +668,6 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
       defaultBranch: typeof defaultBranch === 'string' ? defaultBranch : null,
     });
     const ws = await ensureMainWorkstream(project.id, { ...(branch !== undefined ? { branch } : {}), space: chatSpace });
-
-    recordProductEvent('project.created', { user: user.id, box: projectInstanceId }, {
-      provider,
-      repoSource: repo ? (repo.referenceDir ? 'template' : 'github') : 'empty',
-      boxKind: projectInstanceId ? 'box' : 'host',
-      warmClaimed: typeof input.warmClaimed === 'boolean' ? input.warmClaimed : null,
-      spawned: !!input.spawnId,
-    });
 
     try {
       if (provider) {
@@ -692,6 +733,14 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
       await prisma.project.delete({ where: { id: project.id } }).catch(() => {});
       throw err;
     }
+
+    recordProductEvent('project.created', { user: user.id, box: projectInstanceId }, {
+      provider,
+      repoSource: repo ? (repo.referenceDir ? 'template' : 'github') : 'empty',
+      boxKind: projectInstanceId ? 'box' : 'host',
+      warmClaimed: typeof input.warmClaimed === 'boolean' ? input.warmClaimed : null,
+      spawned: !!input.spawnId,
+    });
 
     startProjectChannel(user, project.id, name, projectInstanceId);
 
@@ -781,8 +830,10 @@ async function createWorkspaceProject(
       setupStatus: 'pending',
       launchReplaySessionId: checked.replaySessionId,
       chatTrustedAt: input.chatTrusted === true ? new Date() : null,
+      environmentId: input.environmentId ?? null,
       chatOrchestrator: input.chatOrchestrator === true && input.chatTrusted === true && provider === CHAT_PROVIDER_ID,
       repos: { create: planned.repos.map(r => ({ name: r.name, url: r.url, defaultBranch: r.defaultBranch, position: r.position })) },
+      ...(input.environmentFile ? { environmentFile: { ...input.environmentFile } } : {}),
     },
   });
   try {
@@ -833,7 +884,8 @@ async function ownedBoxProject(user: Express.User, id: string): Promise<{ projec
  */
 async function relaunchBoxFor(
   user: Express.User,
-  box: { id: string; name: string; kind: string; flavor: string; status: string; ec2InstanceId: string | null; size: string | null; createdFor?: string | null; diskGiB?: number | null },
+  box: { id: string; name: string; kind: string; flavor: string; status: string; ec2InstanceId: string | null; size: string | null; createdFor?: string | null; diskGiB?: number | null; setupEnabled: boolean },
+  setupEnabled?: boolean,
 ): Promise<RouteResult> {
   // Loaded here, not at the top: the box routes pull in the provisioner and
   // the warm pool, which nothing else in this module needs.
@@ -854,8 +906,13 @@ async function relaunchBoxFor(
   }
   // Same name, same flavor: Retry of a minimal box relaunches minimal (its
   // disk came from BOX_MINIMAL_ROOT_VOLUME_GB's default the first time around;
-  // its recorded diskGiB rides the opts, never a re-decision).
-  const created = await createBox(user, { name: box.name, kind: 'ec2', flavor: box.flavor === 'minimal' ? 'minimal' : 'full' }, { relaunchSize: box.size, relaunchDiskGiB: box.diskGiB ?? null });
+  // its recorded diskGiB rides the opts, never a re-decision), and its termag
+  // setup with it, unless the Retry says otherwise
+  // (`setupEnabled`: an ask's relaunch needs setup on). Only keeping a failed
+  // box's setup off is the relaunch the flag exempts; asking it off is a new choice.
+  const setupOff = setupEnabled === undefined ? box.setupEnabled === false : !setupEnabled;
+  const setup = setupEnabled !== undefined ? { setupEnabled } : setupOff ? { setupEnabled: false } : {};
+  const created = await createBox(user, { name: box.name, kind: 'ec2', flavor: box.flavor === 'minimal' ? 'minimal' : 'full', ...setup }, { relaunchSize: box.size, relaunchDiskGiB: box.diskGiB ?? null, relaunchSetupOff: setupOff && box.setupEnabled === false });
   if (created.status !== 201) return created;
   const fresh = (created.body as { instance: { id: string } }).instance;
   // A box made for an ask stays one: a rerun of `termag ask --new-box` after a failed launch comes through here.
@@ -891,7 +948,8 @@ async function relaunchBoxFor(
   return { status: 202, body: { setupStatus: first?.setupStatus ?? 'pending', instanceId: fresh.id } };
 }
 
-export async function retryCloneFor(user: Express.User, id: string): Promise<RouteResult> {
+/** opts.setupEnabled: for a relaunched box, termag setup as asked, over the failed box's. */
+export async function retryCloneFor(user: Express.User, id: string, opts: { setupEnabled?: boolean } = {}): Promise<RouteResult> {
   try {
     const project = await prisma.project.findFirst({
       where: { id, userId: user.id, archived: false },
@@ -905,7 +963,7 @@ export async function retryCloneFor(user: Express.User, id: string): Promise<Rou
       return { status: 202, body: { setupStatus: row?.setupStatus ?? 'pending', retried } };
     }
     if (project && needsBoxRelaunch(project.setupStatus, project.instance)) {
-      return await relaunchBoxFor(user, project.instance!);
+      return await relaunchBoxFor(user, project.instance!, opts.setupEnabled);
     }
     const target = await ownedBoxProject(user, id);
     if ('status' in target) return target;
@@ -1037,15 +1095,16 @@ async function renameProjectRow(user: Express.User, id: string, newName: unknown
       const pathOf = (name: string) => tmux.projectDirFor({
         name, user: { unixUsername: username }, instance: { hostHome: project.instance!.hostHome },
       });
-      const workspacePlan = workspace ? {
-        repos: project.repos.map(r => r.name),
-        guides: workspaceGuideWrites({
-          project: newName,
-          repos: project.repos,
-          workstreams: project.workstreams,
-          dirFor: ws => tmux.projectDirFor({ name: newName, user: { unixUsername: username }, instance: { hostHome: project.instance!.hostHome } }, ws),
-        }),
-      } : undefined;
+      let workspacePlan: { repos: string[]; guides: ReturnType<typeof workspaceGuideWrites> } | undefined;
+      if (workspace) {
+        const dirIn = (name: string, ws: string) => tmux.projectDirFor({ name, user: { unixUsername: username }, instance: { hostHome: project.instance!.hostHome } }, ws);
+        const guides: ReturnType<typeof workspaceGuideWrites> = [];
+        for (const ws of project.workstreams) {
+          const listed = ws.name === 'main' ? guideRepos(project.repos) : await workstreamGuideRepos(projectHost, dirIn(oldName, ws.name), project.repos);
+          guides.push(...workspaceGuideWrites({ project: newName, repos: listed, workstreams: [ws], dirFor: w => dirIn(newName, w) }));
+        }
+        workspacePlan = { repos: project.repos.map(r => r.name), guides };
+      }
       try {
         await sendForProject(projectHost, 'project-rename', {
           sessions, fromDir: pathOf(oldName), toDir: pathOf(newName),
@@ -1152,6 +1211,19 @@ async function archiveProjectRow(user: Express.User, id: string, opts: ArchiveOp
         await tmux.killSession(tmux.sessionName(username, project.name, 'data-ctrl', wsName));
       }
     }
+    // The terminal slots belong to each workstream, not to any workflow:
+    // an agentless workstream's tabs — and any slot a
+    // workflow stop above missed — die with the archive too. Every workstream
+    // of the project, workflow or not.
+    for (const ws of project.workstreams) {
+      await stopTerminalSlots({
+        userId: user.id,
+        unixUsername: username,
+        projectName: project.name,
+        instanceId: project.instanceId,
+        workstream: ws.name,
+      }).catch(() => {});
+    }
 
     // Delete workflows from DB
     if (!opts.keepWorkflows) await prisma.workflow.deleteMany({ where: { projectId: project.id } });
@@ -1164,6 +1236,9 @@ async function archiveProjectRow(user: Express.User, id: string, opts: ArchiveOp
     // Its preview shares end: guests closed, profiles forgotten.
     await endPreviewShares({ projectId: project.id }, 'project-archived', host)
       .catch(err => console.warn(`[PREVIEW-SHARE] ending ${project.name}'s shares failed: ${(err as Error).message}`));
+    // And its preview audiences, so their links end (services/previewAudience.ts); names stay held (SR19).
+    await endPreviewAudiences({ projectId: project.id }, 'project-gone')
+      .catch(err => console.warn(`[PREVIEW-AUDIENCE] ending ${project.name}'s previews failed: ${(err as Error).message}`));
 
     return { status: 200, body: { ok: true } };
   } catch {
@@ -1411,10 +1486,18 @@ export function projectsRouter(): Router {
   router.post('/:id/archive', requireAuth, archive);
   router.post('/:id/workflows', requireAuth, refuseParkedBox('id'), refuseUnreadySetup('id'), addWorkflow);
   router.post('/:id/clone/retry', requireAuth, refuseParkedBox('id'), async (req, res) => {
-    sendResult(res, await retryCloneFor(req.user!, req.params.id));
+    const setupEnabled = (req.body as { setupEnabled?: unknown } | undefined)?.setupEnabled;
+    sendResult(res, await retryCloneFor(req.user!, req.params.id, typeof setupEnabled === 'boolean' ? { setupEnabled } : {}));
   });
   router.post('/:id/clone/start-empty', requireAuth, refuseParkedBox('id'), async (req, res) => {
     sendResult(res, await startEmptyFor(req.user!, req.params.id));
+  });
+  // A multi-repo project's repositories after creation (routes/projectRepos.ts).
+  router.get('/:id/repos', requireAuth, async (req, res) => {
+    sendResult(res, await listProjectRepos(req.user!, req.params.id));
+  });
+  router.post('/:id/repos', requireAuth, refuseParkedBox('id'), async (req, res) => {
+    sendResult(res, await addProjectRepo(req.user!, req.params.id, req.body));
   });
   router.delete('/:id/workflows/:type', requireAuth, removeWorkflow);
   router.get('/:id/sessions/:role/capture', requireAuthOrAgentToken, capture);
@@ -1455,14 +1538,15 @@ export async function listProjectsFor(userId: string) {
     },
     user: { select: { unixUsername: true } },
   };
+  // A space orchestrator is the space's, reached from Slack: never listed (projectKind.ts inProjectLists).
   const owned = await prisma.project.findMany({
-    where: { userId, archived: false },
+    where: { userId, archived: false, kind: { in: LISTED_PROJECT_KINDS } },
     include: projectInclude,
     orderBy: [{ pinned: 'desc' }, { name: 'asc' }],
   });
 
   const shares = await prisma.projectShare.findMany({
-    where: { userId },
+    where: { userId, project: { kind: { in: LISTED_PROJECT_KINDS } } },
     include: { project: { include: projectInclude } },
   });
   // Each chat's space, fixed at its first listing when nothing fixed it before (services/chatSpace.ts).
@@ -1481,8 +1565,10 @@ export async function listProjectsFor(userId: string) {
       id: p.id, name: p.name, description: p.description, color: p.color,
       archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
       createdAt: p.createdAt, updatedAt: p.updatedAt,
-      userId: p.userId, instanceId: p.instanceId, kind: p.kind, createdFor: p.createdFor, repoUrl: p.repoUrl,
+      userId: p.userId, instanceId: p.instanceId, kind: p.kind, createdFor: p.createdFor, repoUrl: p.repoUrl, layout: p.layout,
       repoDefaultBranch: p.repoDefaultBranch, setupStatus: p.setupStatus, setupError: p.setupError,
+      // The box's last report of the environment file's steps (services/projectEnvironment.ts).
+      environmentStatus: p.environmentStatus ?? null,
       workflows: p.workflows, workstreams: views(p),
       // The owner's own trust tick, so New session can offer a worktree from a
       // fresh fetch Full access only where the project has it.
@@ -1497,9 +1583,10 @@ export async function listProjectsFor(userId: string) {
         pinned: s.project.pinned, lastActiveAt: s.project.lastActiveAt,
         createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
         userId: s.project.userId, instanceId: s.project.instanceId, kind: s.project.kind,
-        createdFor: s.project.createdFor, repoUrl: s.project.repoUrl,
+        createdFor: s.project.createdFor, repoUrl: s.project.repoUrl, layout: s.project.layout,
         repoDefaultBranch: s.project.repoDefaultBranch,
         setupStatus: s.project.setupStatus, setupError: s.project.setupError,
+        environmentStatus: s.project.environmentStatus ?? null,
         workflows: s.project.workflows,
         workstreams: views(s.project),
         ownerUsername: s.project.user.unixUsername, role: 'collaborator' as const,
@@ -1538,6 +1625,8 @@ export async function captureFor(
     if (err instanceof SessionAccessError) return { status: err.status, body: { error: err.message } };
     throw err;
   }
+  const noPane = askChatPaneRefusal(access);
+  if (noPane) return noPane;
   const sessionName = access.session;
   const ownerHost = access.host;
 
@@ -1557,7 +1646,9 @@ export async function captureFor(
   }
 
   try {
-    const result = await sendForProject(ownerHost, 'tmux-capture', { sessionName, lines, styled });
+    // Exact target: a dead slot name (`…-ctrl-2`)
+    // must not prefix-match a longer live session (another project's pane).
+    const result = await sendForProject(ownerHost, 'tmux-capture', { sessionName: tmux.exactPaneTarget(sessionName), lines, styled });
     return { status: 200, body: { session: sessionName, content: result.content ?? '', styled: result.styled === true } };
   } catch (err) {
     return { status: 503, body: { error: `Capture failed: ${(err as Error).message}` } };

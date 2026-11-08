@@ -21,6 +21,14 @@ export function withSurface<T>(surface: Surface, fn: () => T): T {
   return store.run(surface, fn);
 }
 
+/**
+ * Runs `fn` as code outside a request does, with no surface: for a flag a
+ * request reads on behalf of a sweep, which must see the sweep's context.
+ */
+export function withoutSurface<T>(fn: () => T): T {
+  return store.exit(fn);
+}
+
 // Express: the surface of the client the headers name, classified as the
 // Software tab's client versions are (clientFromHeaders), or none. A request
 // with no recognised client runs with no surface rather than one inherited

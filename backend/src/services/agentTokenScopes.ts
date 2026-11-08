@@ -21,7 +21,12 @@ export const TOKEN_SITES = {
   cliBox: ['agent'],
   /**
    * routes/cliT3.ts handleAgentTunnelUpgrade: a box's agent dialling back for
-   * a tunnel its owner opened from the CLI, T3 or (since #724) a port forward.
+   * a tunnel its owner opened from the CLI, T3, (since #724) a port forward,
+   * or (since #1107) a preview link's relay. One row for all three kinds,
+   * `t3`, `port` and `preview`, on purpose: only a box's own agent token
+   * dials back, and the preview fleet's `preview-agent` boxes don't serve
+   * preview links. Splitting it by kind (with AgentTunnels.pendingBox
+   * returning the kind) waits for a scope that must differ by kind.
    */
   agentTunnel: ['agent'],
   /** The gateways' ext_authz checks, through routes/gatewayCheck.ts boxForToken. */

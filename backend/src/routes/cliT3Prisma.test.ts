@@ -23,15 +23,12 @@ const listProjects = vi.fn();
 vi.mock('../services/cliStorePrisma', () => ({ prismaCliStore: { listProjects: (id: string) => listProjects(id) } }));
 vi.mock('../services/agentRegistry', () => ({ instanceAgentTransport: () => null, sendToInstanceAgent: async () => null }));
 vi.mock('../services/featureFlags', () => ({ boolVariation: async () => false }));
-vi.mock('../services/spaces/spacesRuntime', () => ({ spacesEnabledFor: async () => false }));
 
 const { createPrismaCliT3 } = await import('./cliT3Prisma');
 const { TunnelError } = await import('../services/agentTunnels');
 
 const alice: CliUser = { id: 'alice', googleEmail: 'a@x', unixUsername: 'a', displayName: 'A' };
 
-let flagOn: boolean;
-let spacesOn: boolean;
 let agent: { helloReceived: boolean; capabilities: string[] } | null;
 let rpcs: Array<[string, string, Record<string, unknown>]>;
 let replies: Record<string, unknown>;
@@ -39,8 +36,6 @@ const tunnels = { openTunnel: vi.fn() };
 
 const t3 = createPrismaCliT3({
   tunnels: tunnels as never,
-  flag: async () => flagOn,
-  spacesFlag: async () => spacesOn,
   transport: () => agent as never,
   send: async (boxId: string, type: string, payload: Record<string, unknown> = {}) => {
     rpcs.push([boxId, type, payload]);
@@ -55,8 +50,6 @@ beforeEach(() => {
   projectKinds.clear();
   instances.set('box-1', { id: 'box-1', name: 'devbox', kind: 'ec2', status: 'ready', userId: 'alice' });
   instances.set('box-bob', { id: 'box-bob', name: 'bobs', kind: 'ec2', status: 'ready', userId: 'bob' });
-  flagOn = true;
-  spacesOn = true;
   agent = { helloReceived: true, capabilities: ['t3-v1', 't3-revoke-v1', 'space-sync-v1'] };
   rpcs = [];
   replies = {};
@@ -65,13 +58,10 @@ beforeEach(() => {
 });
 
 describe('access', () => {
-  it('is the owner\'s, behind the flag, for a ready box whose agent speaks t3-v1', async () => {
+  it('is the owner\'s, for a ready box whose agent speaks t3-v1', async () => {
     expect(await t3.access(alice, 'box-1')).toEqual({ ok: true });
     expect(await t3.access(alice, 'box-bob')).toMatchObject({ ok: false, status: 404, code: 'not_found' });
     expect(await t3.access(alice, 'nope')).toMatchObject({ ok: false, status: 404 });
-    flagOn = false;
-    expect(await t3.access(alice, 'box-1')).toMatchObject({ ok: false, status: 404, code: 'not_found' });
-    flagOn = true;
     instances.get('box-1')!.status = 'hibernated';
     expect(await t3.access(alice, 'box-1')).toMatchObject({ ok: false, status: 409, code: 'box_not_ready', parked: 'hibernated' });
     instances.get('box-1')!.status = 'provisioning';
@@ -91,7 +81,6 @@ describe('ensure tells the box its Fireworks models', () => {
   let models: { models: Array<{ id: string; label: string; context: number | null }>; defaultModel: string; fastModel: string } | null | Error;
   const withFireworks = createPrismaCliT3({
     tunnels: tunnels as never,
-    flag: async () => true,
     transport: () => agent as never,
     send: async (boxId: string, type: string, payload: Record<string, unknown> = {}) => {
       rpcs.push([boxId, type, payload]);
@@ -159,11 +148,10 @@ describe('ensure, pair, projects', () => {
   });
 
   it('refuse without asking the box when access does', async () => {
-    flagOn = false;
-    expect(await t3.ensure(alice, 'box-1')).toMatchObject({ status: 404 });
-    expect(await t3.pair(alice, 'box-1', undefined)).toMatchObject({ status: 404 });
-    expect(await t3.revoke(alice, 'box-1', 'L')).toMatchObject({ status: 404 });
-    expect(await t3.projects(alice, 'box-1')).toMatchObject({ status: 404 });
+    expect(await t3.ensure(alice, 'box-bob')).toMatchObject({ status: 404 });
+    expect(await t3.pair(alice, 'box-bob', undefined)).toMatchObject({ status: 404 });
+    expect(await t3.revoke(alice, 'box-bob', 'L')).toMatchObject({ status: 404 });
+    expect(await t3.projects(alice, 'box-bob')).toMatchObject({ status: 404 });
     expect(rpcs).toEqual([]);
   });
 
@@ -190,8 +178,6 @@ describe('ensure, pair, projects', () => {
     agent = { helloReceived: true, capabilities: ['t3-v1', 't3-revoke-v1'] };
     expect(await t3.update(alice, 'box-1', '0.1.14')).toMatchObject({ status: 501, body: { code: 'box_outdated' } });
     expect(await t3.update(alice, 'box-bob', '0.1.14')).toMatchObject({ status: 404 });
-    flagOn = false;
-    expect(await t3.update(alice, 'box-1', '0.1.14')).toMatchObject({ status: 404 });
     expect(rpcs).toHaveLength(2);
   });
 
@@ -199,7 +185,6 @@ describe('ensure, pair, projects', () => {
     let looks = 0;
     const dropping = createPrismaCliT3({
       tunnels: tunnels as never,
-      flag: async () => flagOn,
       transport: () => (looks++ === 0 ? agent : null) as never,
       send: async () => { throw new Error('unused'); },
     });
@@ -221,10 +206,7 @@ describe('spaceSync', () => {
     expect(rpcs).toEqual([['box-1', 'space-sync', {}], ['box-1', 'space-sync', { space: 'team' }]]);
   });
 
-  it('refuses without asking the box: spaces off, an outdated box, or no access', async () => {
-    spacesOn = false;
-    expect(await t3.spaceSync(alice, 'box-1', undefined)).toMatchObject({ status: 404, body: { code: 'spaces_off' } });
-    spacesOn = true;
+  it('refuses without asking the box: an outdated box, or no access', async () => {
     agent = { helloReceived: true, capabilities: ['t3-v1'] };
     expect(await t3.spaceSync(alice, 'box-1', undefined)).toMatchObject({ status: 501, body: { code: 'box_outdated' } });
     expect(await t3.spaceSync(alice, 'box-bob', undefined)).toMatchObject({ status: 404, body: { code: 'not_found' } });

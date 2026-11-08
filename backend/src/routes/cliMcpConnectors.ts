@@ -5,10 +5,10 @@
  * Adding, linking and removing them stays in termag's Settings → MCP servers.
  */
 import type { RequestHandler, Response, Router } from 'express';
-import { prisma } from '../db';
 import { asyncHandler } from '../middleware/errors';
 import type { CliUser } from '../services/cliStore';
-import { listConnectors, mcpBrokerEnabledForUser } from '../services/mcpConnectorStore';
+import { isApiConnector } from '../services/apiBroker';
+import { listConnectors } from '../services/mcpConnectorStore';
 import { getMcpBrokerUrl } from '../services/mcpConnectors';
 import type { CliAuth } from './cliApi';
 import { view } from './mcpConnectors';
@@ -24,8 +24,7 @@ export interface CliMcpConnector {
 }
 
 export interface CliMcpConnectors {
-  /** Null while mcp-broker-enabled is off for the user. */
-  list(user: CliUser): Promise<{ available: boolean; connectors: CliMcpConnector[] } | null>;
+  list(user: CliUser): Promise<{ available: boolean; connectors: CliMcpConnector[] }>;
 }
 
 type View = Awaited<ReturnType<typeof view>>;
@@ -40,13 +39,9 @@ export function connectorStatus(v: View): CliMcpConnectorStatus {
 
 export const prismaCliMcpConnectors: CliMcpConnectors = {
   async list(user) {
-    const owner = await prisma.user.findUnique({
-      where: { id: user.id },
-      select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true },
-    });
-    if (!owner || !(await mcpBrokerEnabledForUser(owner))) return null;
     const broker = getMcpBrokerUrl();
-    const views = await Promise.all((await listConnectors(user.id)).map(r => view(r, broker)));
+    // MCP servers only: an API connector (Google) is for the API broker, and its /c/<id> is refused.
+    const views = await Promise.all((await listConnectors(user.id)).filter(r => !isApiConnector(r)).map(r => view(r, broker)));
     return {
       available: broker !== null,
       connectors: views.map(v => ({
@@ -63,6 +58,6 @@ function cliAuth(res: Response): CliAuth {
 export function mountCliMcpConnectorRoutes(router: Router, deps: CliMcpConnectors, bearer: RequestHandler): void {
   router.get('/mcp-connectors', bearer, asyncHandler(async (_req, res) => {
     const list = await deps.list(cliAuth(res).user);
-    res.json(list ? { enabled: true, ...list } : { enabled: false, available: false, connectors: [] });
+    res.json({ enabled: true, ...list });
   }));
 }

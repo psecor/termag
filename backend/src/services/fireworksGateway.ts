@@ -5,13 +5,11 @@
  * call's model, with the orchestrator on every call (routes/fireworksAuthz.ts),
  * and puts the shared inference key in its place, so no box holds it.
  *
- * Off unless FIREWORKS_GATEWAY_URL is set, and per user behind
- * fireworks-enabled. Which models are offered and allowed is the
+ * Off unless FIREWORKS_GATEWAY_URL is set. Which models are offered and allowed is the
  * fireworks-models flag (parseFireworksModels), not deployment config, so a
  * model change is a flag edit.
  */
 
-export const FIREWORKS_FLAG = 'fireworks-enabled';
 export const FIREWORKS_MODELS_FLAG = 'fireworks-models';
 
 // The box takes the fireworks delivery, and has `termag-credentials

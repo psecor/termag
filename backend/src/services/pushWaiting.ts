@@ -11,7 +11,6 @@
  * never pushed.
  */
 import { prisma } from '../db';
-import { webPushEnabledFor } from './pushFlag';
 import type { AgentStatus } from '../types/index';
 import { getAllStatuses } from './status';
 import { parseStatusKey, statusKey } from './statusKey';
@@ -107,7 +106,6 @@ export function pushOnWaitingTransition(t: WaitingTransition, deps?: SendDeps): 
   void (async () => {
     const owner = await resolveOwnedProject(t.session, t.instanceId);
     if (!owner?.projectId || !owner.workstream) return;
-    if (!await webPushEnabledFor(owner.userId)) return;
     const project = await prisma.project.findUnique({
       where: { id: owner.projectId },
       select: { name: true, user: { select: { unixUsername: true } } },
@@ -145,7 +143,6 @@ export async function waitingChatMuted(session: string, instanceId: string | nul
     if (!(deps ?? defaultSendDeps()).vapid) return false;
     const owner = await resolveOwnedProject(session, instanceId);
     if (!owner) return false;
-    if (!await webPushEnabledFor(owner.userId)) return false;
     const user = await prisma.user.findUnique({
       where: { id: owner.userId },
       select: { pushMutesChat: true, pushSubscriptions: { select: { lastUsedAt: true, failedAt: true } } },

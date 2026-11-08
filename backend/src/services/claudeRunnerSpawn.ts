@@ -120,7 +120,8 @@ export const WRAPPER_FLOOR_CAPABILITY = 'claude-runner-wrapper-v3';
  *              the box gets a floor run;
  *   `ok`       anything else, a box with no inventory included (unknown is
  *              not below).
- * `enforce` is claude-code-update-enabled for the owner and the box: off,
+ * `enforce` is Claude Code's enabled for the owner and the box (its policy's
+ * mode not off; toolUpdate/gate.ts): off,
  * nothing is refused, as before the backstop.
  */
 export type ClaudeFloorDecision =

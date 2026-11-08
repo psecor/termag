@@ -14,7 +14,7 @@ const {
   clampWarmPoolSize, warmPoolSizeOverride, warmPoolTargetSize,
   WARM_POOL_SIZE_FALLBACK, WARM_POOL_SIZE_FLAG, WARM_POOL_SIZE_MAX,
 } = await import('./warmPoolSize');
-const { POOL_FLAG_CONTEXT } = await import('./boxHibernationFlag');
+const { POOL_FLAG_CONTEXT } = await import('./poolLdContext');
 const { FLAG_REGISTRY } = await import('../flags');
 
 beforeEach(() => {

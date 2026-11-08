@@ -8,7 +8,6 @@ import type { AgentStatus } from '../types/index';
 
 vi.mock('../db', () => ({ prisma: {} }));
 vi.mock('./featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
-vi.mock('./pushFlag', () => ({ webPushEnabledFor: vi.fn(async () => false) }));
 
 const RESULT = { type: 'result', result: 'All green.' };
 

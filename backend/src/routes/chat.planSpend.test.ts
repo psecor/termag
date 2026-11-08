@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
+  // Every send checks for a resume onto this box whose session is still to restore: none here.
+  chatResume: { findFirst: vi.fn(async () => null) },
   workflow: { update: vi.fn() },
   // chatLaunchFor reads whether the owner has the Claude gateway on.
   user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: true })) },

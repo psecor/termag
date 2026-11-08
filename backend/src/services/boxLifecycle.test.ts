@@ -47,11 +47,10 @@ vi.mock('../db', () => ({
   },
 }));
 
-const flag = { on: true, idleStop: false, hours: undefined as unknown, warnMinutes: undefined as unknown, asked: [] as string[] };
+const flag = { on: true, hours: undefined as unknown, warnMinutes: undefined as unknown, asked: [] as string[] };
 vi.mock('./featureFlags', () => ({
   boolVariation: async (key: string, _user: unknown, fallback: boolean, box: { id: string }) => {
     flag.asked.push(`${key}:${box.id}`);
-    if (key === 'box-idle-stop-enabled') return flag.idleStop ?? fallback;
     return flag.on ?? fallback;
   },
   numberVariation: async (key: string, _user: unknown, fallback: number, box: { id: string }) => {
@@ -167,7 +166,7 @@ beforeEach(() => {
   automations.length = 0;
   hostSamples.length = 0;
   statuses.clear();
-  Object.assign(flag, { on: true, idleStop: false, hours: undefined, warnMinutes: undefined, asked: [] });
+  Object.assign(flag, { on: true, hours: undefined, warnMinutes: undefined, asked: [] });
   Object.assign(power, { calls: [], refuse: false, beforeWrite: null, afterWrite: null, requestedAt: new Map() });
   agent.connectedIds = new Set();
   notices.length = 0;
@@ -190,23 +189,12 @@ describe('runLifecycleSweep', () => {
     expect(rows.get('a')!.lifecycleNote).toMatch(/Stopped automatically after 1 h idle/);
   });
 
-  it('only looks at owned EC2 boxes that are up and have the setting on', async () => {
-    seed('off', { idleHibernateHours: null });
+  it('only looks at owned EC2 boxes that are up', async () => {
     seed('external', { kind: 'external' });
     seed('pool', { userId: null });
     seed('down', { status: 'hibernated' });
     expect(await runLifecycleSweep(NOW)).toEqual([]);
-    // box-idle-stop-enabled for the one box with no setting; off, so the
-    // lifecycle flag is never read for a box nothing would park.
-    expect([...flag.asked].sort()).toEqual(['box-idle-stop-enabled:off']);
-    expect(power.calls).toEqual([]);
-  });
-
-  it('does nothing with the flag off', async () => {
-    seed('a');
-    flag.on = false;
-    const [r] = await runLifecycleSweep(NOW);
-    expect(r.decision).toEqual({ hibernate: false, reason: 'flag-off' });
+    expect(flag.asked).toEqual([]);
     expect(power.calls).toEqual([]);
   });
 
@@ -379,18 +367,8 @@ const MIN = 60 * 1000;
 /** A warning sent half an hour ago that promised a stop now: the next pass stops a box idle 2 h or more. */
 const standing = { idleWarnedAt: new Date(NOW - 30 * MIN), idleParkAt: new Date(NOW) };
 
-describe('box-idle-stop-enabled', () => {
-  it('with it off, a box with no setting is never touched, and one that cannot hibernate is never stopped', async () => {
-    seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
-    seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
-    expect(await runLifecycleSweep(NOW)).toEqual([]);
-    expect(power.calls).toEqual([]);
-    expect(agent.asked).toEqual([]);
-    expect(flag.asked).not.toContain('box-auto-lifecycle-enabled:unset');
-  });
-
-  it('with it on and no setting, warns an hour ahead, then stops a box that can hibernate at 2 h, and not a minute sooner', async () => {
-    flag.idleStop = true;
+describe('the default idle window', () => {
+  it('with no setting, warns an hour ahead, then stops a box that can hibernate at 2 h, and not a minute sooner', async () => {
     flag.on = false;
     const last = NOW - HOUR + MIN;
     seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(last) });
@@ -416,20 +394,15 @@ describe('box-idle-stop-enabled', () => {
   });
 
   it('a box first seen past its window is warned and stopped a lead later, not on the first pass', async () => {
-    flag.idleStop = true;
     seed('long', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
     expect(await runLifecycleSweep(NOW)).toEqual([{ box: 'long', decision: { warn: true, stopAt: new Date(NOW + HOUR) }, outcome: 'warned' }]);
     expect(power.calls).toEqual([]);
     expect((await runLifecycleSweep(NOW + HOUR))[0]).toMatchObject({ decision: { stop: true }, outcome: 'stopping' });
   });
 
-  it('takes the window from box-idle-park-hours and the lead from box-idle-park-warn-minutes, read only while it is on', async () => {
+  it('takes the window from box-idle-park-hours and the lead from box-idle-park-warn-minutes', async () => {
     seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 7 * HOUR) });
     Object.assign(flag, { hours: 8, warnMinutes: 30 });
-    expect(await runLifecycleSweep(NOW)).toEqual([]);
-    expect(flag.asked).toEqual(['box-idle-stop-enabled:unset']);
-
-    flag.idleStop = true;
     expect((await runLifecycleSweep(NOW))[0].decision).toEqual({ hibernate: false, reason: 'not-idle' });
     expect((await runLifecycleSweep(NOW + 30 * MIN))[0].decision).toEqual({ warn: true, stopAt: new Date(NOW + HOUR) });
     const [r] = await runLifecycleSweep(NOW + HOUR);
@@ -440,7 +413,6 @@ describe('box-idle-stop-enabled', () => {
   });
 
   it('warns again before any stop once the warning is stale: a keystroke since, or a longer window', async () => {
-    flag.idleStop = true;
     // Typed after the warning: a new idle stretch, warned again an hour before its new due time.
     seed('typed', { idleHibernateHours: null, ...standing, lastActivityAt: new Date(NOW - 20 * MIN) });
     // Warned for a 2 h window that is now 8 h.
@@ -454,23 +426,7 @@ describe('box-idle-stop-enabled', () => {
     expect(power.calls).toEqual([]);
   });
 
-  it('a warning from before it went off is void, so the box is warned afresh, not stopped, when it comes back on', async () => {
-    flag.idleStop = true;
-    seed('toggled', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
-    expect((await runLifecycleSweep(NOW))[0]).toMatchObject({ decision: { warn: true, stopAt: new Date(NOW + HOUR) }, outcome: 'warned' });
-    flag.idleStop = false;
-    expect(await runLifecycleSweep(NOW + 30 * MIN)).toEqual([]);
-    expect(rows.get('toggled')).toMatchObject({ idleWarnedAt: null, idleParkAt: null });
-    // Back on past the old promise, within the hour it would have stood for.
-    flag.idleStop = true;
-    expect(await runLifecycleSweep(NOW + 70 * MIN)).toEqual([
-      { box: 'toggled', decision: { warn: true, stopAt: new Date(NOW + 130 * MIN) }, outcome: 'warned' },
-    ]);
-    expect(power.calls).toEqual([]);
-  });
-
   it('of two passes warning a box at once (a deploy overlap), only the first warning lands', async () => {
-    flag.idleStop = true;
     seed('raced', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR), idleWarnedAt: null, idleParkAt: null });
     // The other host's warning lands after this pass read the box and before it writes its own.
     const other = { idleWarnedAt: new Date(NOW - MIN), idleParkAt: new Date(NOW + 59 * MIN) };
@@ -482,7 +438,6 @@ describe('box-idle-stop-enabled', () => {
   });
 
   it('stops a box woken without its owner and untouched since its auto-stop again, with no warning, once its start grace is over', async () => {
-    flag.idleStop = true;
     const woken = { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR), autoParkedAt: new Date(NOW - HOUR) };
     seed('grace', { ...woken, lastReadyAt: new Date(NOW - 5 * MIN) });
     seed('woken', { ...woken, lastReadyAt: new Date(NOW - 20 * MIN) });
@@ -492,8 +447,7 @@ describe('box-idle-stop-enabled', () => {
     expect(rows.get('woken')!.idleWarnedAt).toBeUndefined();
   });
 
-  it('with it on and no setting, plainly stops a box that cannot hibernate, after the unsaved-work scan', async () => {
-    flag.idleStop = true;
+  it('with no setting, plainly stops a box that cannot hibernate, after the unsaved-work scan', async () => {
     seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 2 * HOUR), ...standing });
     const [r] = await runLifecycleSweep(NOW);
     expect(r).toEqual({ box: 'legacy', decision: { stop: true }, outcome: 'stopping' });
@@ -503,18 +457,15 @@ describe('box-idle-stop-enabled', () => {
     expect(rows.get('legacy')!.lifecycleNote).toMatch(/^Stopped automatically after 2 h idle/);
   });
 
-  it('with it on, a box with its own setting keeps that timing and is not stopped at 2 h', async () => {
-    flag.idleStop = true;
+  it('a box with its own setting keeps that timing and is not stopped at 2 h', async () => {
     seed('own', { idleHibernateHours: 4, lastActivityAt: new Date(NOW - 3 * HOUR) });
     expect(await runLifecycleSweep(NOW)).toEqual([{ box: 'own', decision: { hibernate: false, reason: 'not-idle' } }]);
     const [later] = await runLifecycleSweep(NOW + HOUR);
     expect(later).toMatchObject({ box: 'own', decision: { stop: true }, outcome: 'stopping' });
     expect(power.calls).toEqual([['own', 'stop', expect.objectContaining({ expectIdleHibernateHours: 4 })]]);
-    expect(flag.asked.filter(k => k.startsWith('box-idle-stop-enabled'))).toEqual([]);
   });
 
-  it('with it on, a working agent, a runner session, or typing since keeps the box up', async () => {
-    flag.idleStop = true;
+  it('a working agent, a runner session, or typing since keeps the box up', async () => {
     const old = new Date(NOW - 10 * HOUR);
     seed('working', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: old });
     seed('runner', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: old });
@@ -531,7 +482,6 @@ describe('box-idle-stop-enabled', () => {
   });
 
   it("an owner's start restarts the clock, so a box stopped for idle is not due again once it is back", async () => {
-    flag.idleStop = true;
     seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR), ...standing });
     await runLifecycleSweep(NOW);
     expect(rows.get('legacy')!.status).toBe('stopping');
@@ -546,7 +496,6 @@ describe('box-idle-stop-enabled', () => {
   });
 
   it('with both flags on, no idle hours is a stop, so a terminate limit does not hibernate it', async () => {
-    flag.idleStop = true;
     flag.on = true;
     seed('unset', {
       idleHibernateHours: null,
@@ -561,29 +510,21 @@ describe('box-idle-stop-enabled', () => {
     expect(rows.get('unset')!.status).toBe('stopping');
   });
 
-  it('the list warns of nothing on a box that cannot hibernate, idle-stop on or off', async () => {
+  it('the list warns of nothing on a box that cannot hibernate', async () => {
     seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, hibernatedTerminateDays: 14 });
     const row = { ...rows.get('legacy')!, lifecycleNote: null };
     const user = { id: 'u1' } as never;
-    flag.idleStop = false;
     expect((await lifecycleViewFor(user, row)).warning).toBeNull();
-    flag.idleStop = true;
-    expect((await lifecycleViewFor(user, row)).warning).toBeNull();
-    expect(flag.asked).toContain('box-idle-stop-enabled:legacy');
   });
 
-  it("the box list promises an own-hours stop only while box-auto-lifecycle-enabled is on", async () => {
+  it("the box list promises an own-hours stop", async () => {
     seed('own', { idleHibernateHours: 4, lastActivityAt: new Date(NOW - HOUR) });
     const view = () => lifecycleViewFor({ id: 'u1' } as never, { ...rows.get('own')!, lifecycleNote: null } as never, NOW);
-    flag.on = false;
-    expect(await view()).toMatchObject({ parkAt: null, parkAction: null, idleLimitHours: null, hibernateDueAt: null });
-    flag.on = true;
     expect(await view()).toMatchObject({ parkAt: new Date(NOW + 3 * HOUR).toISOString(), parkAction: 'stop', idleLimitHours: 4, idleLimitSource: 'own' });
-    expect(flag.asked).toEqual(['box-auto-lifecycle-enabled:own', 'box-auto-lifecycle-enabled:own']);
+    expect(flag.asked).toEqual([]);
   });
 
   it('the box list says when the default window stops the box, and that its owner was warned', async () => {
-    flag.idleStop = true;
     seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 90 * MIN) });
     const user = { id: 'u1' } as never;
     const view = () => lifecycleViewFor(user, { ...rows.get('unset')!, lifecycleNote: null } as never, NOW);
@@ -593,12 +534,9 @@ describe('box-idle-stop-enabled', () => {
     // Warned a full lead ahead, so the promise is an hour from the warning, not the due time half an hour away.
     await runLifecycleSweep(NOW);
     expect(await view()).toMatchObject({ warnedAt: new Date(NOW).toISOString(), parkAt: new Date(NOW + HOUR).toISOString() });
-    flag.idleStop = false;
-    expect(await view()).toMatchObject({ parkAt: null, parkAction: null, idleLimitHours: null, warnedAt: null });
   });
 
-  it('with it on, keeps the box up when work starts during the scan', async () => {
-    flag.idleStop = true;
+  it('keeps the box up when work starts during the scan', async () => {
     seed('legacy', { hibernationConfigured: false, idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR), ...standing });
     agent.duringScan = () => { statuses.set('k', { status: 'working', instanceId: 'legacy' }); };
     const [r] = await runLifecycleSweep(NOW);
@@ -737,15 +675,7 @@ describe('automatic terminate', () => {
     seedParked('refresh', { rehibernatePending: true });
     const out = await runLifecycleSweep(NOW + 400 * DAY, terminator);
     expect(terminated).toEqual([]);
-    expect(out).toEqual([{ box: 'refresh', decision: { terminate: false, reason: 'not-parked' } }]);
-  });
-
-  it('does nothing with the flag off', async () => {
-    seedParked('a');
-    flag.on = false;
-    const [r] = await runLifecycleSweep(NOW, terminator);
-    expect(r.decision).toEqual({ terminate: false, reason: 'flag-off' });
-    expect(terminated).toEqual([]);
+    expect(out.filter(r => 'terminate' in r.decision)).toEqual([{ box: 'refresh', decision: { terminate: false, reason: 'not-parked' } }]);
   });
 
   it('loses to an owner\'s start between the decision and the claim', async () => {
@@ -801,7 +731,6 @@ describe('automatic terminate', () => {
 
 describe('applyAskBoxPolicy: a box made for an ask', () => {
   it('records it, and gives it no hours of its own and no terminate, so the default window stops it and nothing hibernates it', async () => {
-    flag.idleStop = true;
     seed('a', { idleHibernateHours: 1, hibernatedTerminateDays: 1, lastActivityAt: new Date(NOW - 3 * HOUR) });
     await applyAskBoxPolicy('a');
     expect(rows.get('a')).toMatchObject({ createdFor: 'ask', idleHibernateHours: null, hibernatedTerminateDays: null });
@@ -840,7 +769,6 @@ describe('setBoxLifecycle', () => {
   });
 
   it("turning its own hours off forgets the sweep's hibernate, so the default window warns before stopping the box", async () => {
-    flag.idleStop = true;
     seedParked('a', { idleHibernateHours: 4, autoParkedAt: new Date(NOW - 2 * DAY) });
     await setBoxLifecycle('a', { idleHibernateHours: 8 });
     expect(rows.get('a')!.autoParkedAt).toEqual(new Date(NOW - 2 * DAY));
@@ -888,7 +816,6 @@ describe('telling the owner', () => {
     const changes: string[] = [];
     setWorkspaceChangeCallback((owner, what) => { changes.push(`${owner}:${what}`); });
     try {
-      flag.idleStop = true;
       seed('w', { idleHibernateHours: null });
       await runLifecycleSweep(NOW);
       await runLifecycleSweep(NOW + HOUR);
@@ -900,7 +827,6 @@ describe('telling the owner', () => {
   });
 
   it('DMs the warning once, from the pass whose write took', async () => {
-    flag.idleStop = true;
     seed('w', { idleHibernateHours: null, hibernationConfigured: false });
     await runLifecycleSweep(NOW);
     await runLifecycleSweep(NOW + 5 * 60 * 1000);
@@ -913,7 +839,6 @@ describe('telling the owner', () => {
     seed(id, { idleHibernateHours: null, lastActivityAt: new Date(NOW - 3 * HOUR), idleWarnedAt: new Date(NOW - HOUR), idleParkAt: new Date(NOW), ...extra });
 
   it("DMs what the default window's stop did once it settles; nothing for a quiet re-park or a box's own hours", async () => {
-    flag.idleStop = true;
     seedDue('d');
     seed('own');
     seed('woken', { idleHibernateHours: null, autoParkedAt: new Date(NOW - 20 * 60 * 1000), lastActivityAt: new Date(NOW - 10 * HOUR) });
@@ -927,7 +852,6 @@ describe('telling the owner', () => {
   });
 
   it('still tells the owner when the box settles before the power request has returned', async () => {
-    flag.idleStop = true;
     seedDue('fast');
     power.afterWrite = id => { settle.listener!({ ...rows.get(id)! }, 'stopped'); };
     await runLifecycleSweep(NOW);
@@ -936,7 +860,6 @@ describe('telling the owner', () => {
   });
 
   it('forgets a park that did not happen, so a later stop by hand sends nothing', async () => {
-    flag.idleStop = true;
     seedDue('a');
     await runLifecycleSweep(NOW);
     rows.get('a')!.status = 'ready';
@@ -948,7 +871,6 @@ describe('telling the owner', () => {
   });
 
   it('tells the owner about the stop that finally takes after one timed out back to ready', async () => {
-    flag.idleStop = true;
     seedDue('slow');
     await runLifecycleSweep(NOW);
     // What the power sweep writes when EC2 never stopped it: ready again, and no auto-park (boxPower).
@@ -977,8 +899,6 @@ describe('telling the owner', () => {
 
 describe('boxes stuck starting', () => {
   const MIN = 60 * 1000;
-  // Behind box-idle-stop-enabled, like the default window's stop.
-  beforeEach(() => { flag.idleStop = true; });
   // Two start timeouts (2 × 15 min by default) into starting, with no agent.
   const stuck = (id: string, minsAgo: number, extra: Record<string, any> = {}) => {
     seed(id, { status: 'starting', idleWarnedAt: null, idleParkAt: null, ...extra });
@@ -1069,7 +989,7 @@ describe('boxes stuck starting', () => {
     expect(rows.get('kept')!.status).toBe('ready');
   });
 
-  it('leaves a box that is only slow, one whose agent is back, one a busy check holds, and every box with the flag off', async () => {
+  it('leaves a box that is only slow, one whose agent is back, and one a busy check holds', async () => {
     stuck('slow', 29);
     stuck('back', 40);
     agent.connectedIds.add('back');
@@ -1079,27 +999,10 @@ describe('boxes stuck starting', () => {
     expect(out.held?.decision).toEqual({ act: 'none', reason: 'busy', check: 'test' });
     expect(Object.keys(out)).not.toContain('slow');
     expect(Object.keys(out)).not.toContain('back');
-    stuck('off', 40);
-    flag.idleStop = false;
-    await runLifecycleSweep(NOW);
     expect(power.calls).toEqual([]);
     expect(notices).toEqual([]);
   });
 
-  it('a warning from before the flag went off is void, so the box is warned afresh, not stopped, when it comes back on', async () => {
-    stuck('dead', 31);
-    await runLifecycleSweep(NOW);
-    expect(rows.get('dead')).toMatchObject({ idleParkAt: new Date(NOW + 2 * 60 * MIN) });
-    // Off when the warned time comes (the pass reads the flag only for a box due to act).
-    flag.idleStop = false;
-    await runLifecycleSweep(NOW + 125 * MIN);
-    expect(rows.get('dead')).toMatchObject({ idleWarnedAt: null, idleParkAt: null });
-    flag.idleStop = true;
-    const [r] = (await runLifecycleSweep(NOW + 150 * MIN)).filter(x => x.box === 'dead');
-    expect(r).toMatchObject({ decision: { act: 'warn', stopAt: new Date(NOW + 270 * MIN) }, outcome: 'warned' });
-    expect(power.calls).toEqual([]);
-    expect(notices.map(n => n.kind)).toEqual(['warning', 'warning']);
-  });
 });
 
 describe('parking by a stop', () => {
@@ -1130,7 +1033,6 @@ describe('parking by a stop', () => {
   });
 
   it('the default window still warns and tells its owner', async () => {
-    flag.idleStop = true;
     seed('unset', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 3 * HOUR), idleWarnedAt: new Date(NOW - HOUR), idleParkAt: new Date(NOW) });
     seed('fresh', { idleHibernateHours: null, lastActivityAt: new Date(NOW - 10 * HOUR) });
     await runLifecycleSweep(NOW);
@@ -1143,15 +1045,6 @@ describe('parking by a stop', () => {
     seed('own', { lastActivityAt: new Date(NOW - 10 * MIN), idleWarnedAt: new Date(NOW - 10 * MIN), idleParkAt: new Date(NOW + 20 * MIN) });
     await runLifecycleSweep(NOW);
     expect(rows.get('own')).toMatchObject({ idleWarnedAt: null, idleParkAt: null });
-  });
-
-  it('with box-auto-lifecycle-enabled off, own hours do nothing, and a standing warning is cleared', async () => {
-    flag.on = false;
-    seed('own', { idleWarnedAt: new Date(NOW - 10 * MIN), idleParkAt: new Date(NOW + 20 * MIN) });
-    const [r] = await runLifecycleSweep(NOW);
-    expect(r.decision).toEqual({ hibernate: false, reason: 'flag-off' });
-    expect(rows.get('own')).toMatchObject({ idleWarnedAt: null, idleParkAt: null });
-    expect(power.calls).toEqual([]);
   });
 
   it('terminates a box auto-park stopped once its terminate-after is up, clean at its own limit, else at 90 days', async () => {

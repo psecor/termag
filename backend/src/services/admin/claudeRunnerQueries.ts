@@ -10,7 +10,7 @@ import { MAX_RUNNERS_PER_BOX, REFUSAL_TEXTS, RUNNER_AGENT_CAPABILITY, runnerBoxe
 import type { Range } from './range';
 import { getAllStatuses } from '../status';
 import { statusKey } from '../statusKey';
-import { buildSessions, isStartedFor, liveRuns, RUN_LOST_REASON, usageSelect, type CloudSessionView, type EventInput, type RunInput } from '../claudeSessions';
+import { buildSessions, isStartedFor, isStillRetried, liveRuns, RUN_LOST_REASON, usageSelect, type CloudSessionView, type EventInput, type RunInput } from '../claudeSessions';
 
 export interface OrchestratorHealth {
   /** False when no health port is configured (a host without the orchestrator) or the port does not answer. */
@@ -167,7 +167,7 @@ export async function adminCloudSessions(days = 7, now: Date = new Date(), recen
     return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, code: e.code, at: e.at };
   });
   const alive = await liveRuns(runs);
-  const views = buildSessions(runs, eventInputs, alive);
+  const views = buildSessions(runs, eventInputs, alive, now);
   // The raw map, not getStatus(): that helper fabricates a fresh `not_running`
   // for unknown names, which would date every never-seen session to now.
   const statuses = getAllStatuses();
@@ -230,7 +230,8 @@ export interface CloudCounts { running: number; starting: number }
  * The cheap org-wide picture, for the Overview KPI, the Fleet and Users
  * tables and the signals: open runs per box and per owner, split into
  * running (the box posted `started`) and starting, and how many sessions are
- * queued (newest event in the last day is a refusal and no run is open).
+ * queued (newest event in the last day is a refusal still being re-offered,
+ * isStillRetried, and no run is open).
  * Reads Postgres only: no `tmux-list`, so it can ride on every poll.
  */
 export interface CloudSummary {
@@ -287,16 +288,29 @@ export async function cloudSummary(now: Date = new Date()): Promise<CloudSummary
     const cur = openBySession.get(r.sessionId);
     if (!cur || r.startedAt > cur.startedAt) openBySession.set(r.sessionId, { orderId: r.orderId, startedAt: r.startedAt });
   }
-  const newest = new Map<string, { kind: string; orderId: string; at: Date }>();
+  // Each session's events, newest first: the newest decides, and the unbroken
+  // refusals in front of it are the streak isStillRetried reads. `user-created`
+  // never stands as the newest event, as in deriveState (Devin on #1413).
+  const bySession = new Map<string, Array<{ kind: string; orderId: string; at: Date }>>();
   for (const e of recent) {
-    const cur = newest.get(e.sessionId);
-    if (!cur || e.at.getTime() > cur.at.getTime()) newest.set(e.sessionId, { kind: e.kind, orderId: e.orderId, at: e.at });
+    if (e.kind === 'user-created') continue;
+    const list = bySession.get(e.sessionId) ?? [];
+    list.push({ kind: e.kind, orderId: e.orderId, at: e.at });
+    bySession.set(e.sessionId, list);
   }
   let queued = 0;
-  for (const [sessionId, e] of newest) {
+  for (const [sessionId, list] of bySession) {
+    list.sort((a, b) => b.at.getTime() - a.at.getTime());
+    const e = list[0];
     if (!REFUSALS.has(e.kind)) continue;
     const run = openBySession.get(sessionId);
-    if (!run || (e.orderId !== run.orderId && e.at.getTime() > run.startedAt.getTime())) queued++;
+    if (run && !(e.orderId !== run.orderId && e.at.getTime() > run.startedAt.getTime())) continue;
+    const streak: Date[] = [];
+    for (const x of list) {
+      if (!REFUSALS.has(x.kind) || (run && x.at.getTime() <= run.startedAt.getTime())) break;
+      streak.push(x.at);
+    }
+    if (isStillRetried(streak, now)) queued++;
   }
   return { running, starting, queued, byBox, byUser, generatedAt: now.toISOString() };
 }
@@ -491,7 +505,7 @@ export async function cloudSignalInput(now: Date = new Date()): Promise<CloudSig
     return { sessionId: e.sessionId, orderId: e.orderId, instanceId: e.instanceId, kind: e.kind, detail: e.detail, code: e.code, at: e.at };
   });
   const statuses = getAllStatuses();
-  const views = buildSessions(runs, eventInputs, new Map());
+  const views = buildSessions(runs, eventInputs, new Map(), now);
   const sessions: CloudSignalSession[] = views.map(v => {
     const who = ownerByKey.get(v.key) ?? { userId: '', owner: '?' };
     const live = liveStatusFor(v, statuses);

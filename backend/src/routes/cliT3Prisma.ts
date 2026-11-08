@@ -9,11 +9,10 @@ import { instanceAgentTransport, sendToInstanceAgent } from '../services/agentRe
 import { PARKED_STATUSES } from '../services/boxPowerPolicy';
 import type { CliUser } from '../services/cliStore';
 import { prismaCliStore } from '../services/cliStorePrisma';
-import { T3_CAPABILITY, desktopAppEnabled } from '../services/desktopAppFlag';
+import { T3_CAPABILITY } from '../services/desktopAppFlag';
 import { fireworksModelsForBox } from '../services/fireworksFlag';
 import { FIREWORKS_CAPABILITY, getFireworksGatewayConfig, type FireworksModels } from '../services/fireworksGateway';
 import { TunnelError, type AgentTunnels } from '../services/agentTunnels';
-import { spacesEnabledFor } from '../services/spaces/spacesRuntime';
 import type { CliT3, T3Access } from './cliT3';
 
 /** `t3-revoke`, and a labeled `t3-pair` revoking what an earlier pair of its label left. */
@@ -41,12 +40,10 @@ interface T3CliDeps {
   /** Overridable for tests. */
   send?: typeof sendToInstanceAgent;
   transport?: typeof instanceAgentTransport;
-  flag?: typeof desktopAppEnabled;
   /** The Fireworks models a box's owner may call on it (services/fireworksFlag.ts). */
   fireworks?: (userId: string, boxId: string) => Promise<FireworksModels | null>;
   /** Whether this orchestrator routes Fireworks (FIREWORKS_GATEWAY_URL). */
   fireworksGateway?: () => boolean;
-  spacesFlag?: typeof spacesEnabledFor;
 }
 
 function failure(status: number, code: string, error: string) {
@@ -60,8 +57,6 @@ function agentError(err: unknown): string {
 export function createPrismaCliT3(deps: T3CliDeps): CliT3 {
   const send = deps.send ?? sendToInstanceAgent;
   const transport = deps.transport ?? instanceAgentTransport;
-  const flag = deps.flag ?? desktopAppEnabled;
-  const spacesFlag = deps.spacesFlag ?? spacesEnabledFor;
 
   async function access(user: CliUser, boxId: string): Promise<T3Access> {
     const box = await prisma.instance.findFirst({
@@ -69,8 +64,6 @@ export function createPrismaCliT3(deps: T3CliDeps): CliT3 {
       select: { id: true, name: true, kind: true, status: true },
     });
     if (!box || box.status === 'terminated') return NOT_FOUND;
-    const owner = await prisma.user.findUnique({ where: { id: user.id } });
-    if (!owner || !(await flag(owner, box))) return NOT_FOUND;
     if ((PARKED_STATUSES as readonly string[]).includes(box.status)) {
       return { ok: false, status: 409, error: `The box is ${box.status}; start it first`, code: 'box_not_ready', parked: box.status };
     }
@@ -202,7 +195,6 @@ export function createPrismaCliT3(deps: T3CliDeps): CliT3 {
     }),
 
     spaceSync: (user, boxId, space) => guarded(user, boxId, async () => {
-      if (!(await spacesFlag(user.id))) return failure(404, 'spaces_off', 'Spaces are not turned on for you');
       // Read again after access(): the agent may have dropped in between.
       const agent = transport(boxId);
       if (!agent) return failure(409, 'box_not_ready', "The box's agent isn't connected");

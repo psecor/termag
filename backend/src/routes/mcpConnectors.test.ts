@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import type { AddressInfo } from 'net';
 import type { Server } from 'http';
@@ -9,14 +9,17 @@ import type { Server } from 'http';
 // credential store. Connectors are an in-memory array behind a minimal prisma.
 
 type Row = {
-  id: string; userId: string; name: string; upstream: string; authType: string; headerTemplates: unknown; createdAt: Date; updatedAt: Date;
-  oauthMetadata?: unknown;
+  id: string; userId: string; name: string; displayName?: string | null; upstream: string; authType: string; headerTemplates: unknown; createdAt: Date; updatedAt: Date;
+  oauthMetadata?: unknown; oauthScopes?: unknown;
 };
 let rows: Row[] = [];
-let flagOn = true;
+// api-broker-enabled for the user: whether Settings offers the Google connector.
+let apiFlagOn = false;
 // What the mcp-default-connectors flag serves: the catalog, or null while it is off.
 const ACME_ENTRY = { name: 'acme', upstream: 'https://mcp.example.test:18444/acme' };
 let defaultsFlag: unknown = [ACME_ENTRY];
+// What the mcp-oauth-scope-labels flag serves; null while it doesn't exist.
+let labelsFlag: unknown = null;
 let storeConfigured = true;
 let storedSecrets: Record<string, string> = {};
 
@@ -39,6 +42,8 @@ const prismaMock = {
       return row;
     }),
   },
+  // For the mcp-oauth-loopback-servers read (mcpConnectorsPaste.test.ts covers it).
+  user: { findUnique: vi.fn(async () => null) },
 };
 vi.mock('../db', () => ({ prisma: prismaMock }));
 
@@ -57,16 +62,22 @@ vi.mock('../services/credentialStore', async (importOriginal) => ({
 
 const deliverToUserBoxes = vi.fn(async () => {});
 vi.mock('../services/credentialDelivery', () => ({ deliverToUserBoxes }));
+// oauth/start pre-flights the authorize URL (services/mcpOAuthRedirectHelp.ts): the server goes on to its login page.
+vi.mock('../services/mcpOAuthHttp', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/mcpOAuthHttp')>()),
+  safeOAuthHttp: () => async () => ({ status: 302, headers: { location: '/login' }, text: '' }),
+}));
 
 vi.mock('../services/featureFlags', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/featureFlags')>()),
-  jsonVariation: async (key: string, _user: unknown, fallback: unknown) => (key === 'mcp-default-connectors' ? defaultsFlag : fallback),
+  jsonVariation: async (key: string, _user: unknown, fallback: unknown) => (
+    key === 'mcp-default-connectors' ? defaultsFlag : key === 'mcp-oauth-scope-labels' ? labelsFlag : fallback),
 }));
 
 const writeConnectorSecrets = vi.fn(async () => {});
 vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/mcpConnectorStore')>()),
-  mcpBrokerEnabledForUser: async () => flagOn,
+  apiBrokerEnabledForUser: async () => apiFlagOn,
   findConnector: async (id: string) => rows.find(r => r.id === id) ?? null,
   listConnectors: async (userId: string) => rows.filter(r => r.userId === userId),
   deleteConnector: async (userId: string, id: string) => {
@@ -77,7 +88,7 @@ vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
   connectorSecretNames: async () => [],
   readConnectorSecrets: async () => storedSecrets,
   writeConnectorSecrets,
-  consumeOAuthState: async (nonce: string) => (nonce === STATE_NONCE ? { userId: 'u1', connectorId: 'c4', codeVerifier: 'verifier' } : null),
+  consumeOAuthState: async (nonce: string) => (nonce === STATE_NONCE ? { userId: 'u1', connectorId: 'c4', codeVerifier: 'verifier', scopes: STATE_SCOPES, returnTo: stateReturnTo } : null),
   readOAuth: async () => ({ client: CLIENT }),
   withOAuthLock: async (_u: string, _c: string, fn: (io: typeof lockIo) => Promise<unknown>) => fn(lockIo),
   // The store's transaction: the row and the credential removal change together or not at all.
@@ -90,17 +101,25 @@ vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
     return { row: r, dropped };
   },
   setLinkStatus: async () => {},
-  createOAuthState: async () => {},
+  createOAuthState,
   forgetConnectorOAuth: async () => {},
 }));
 
-const exchangeCode = vi.fn(async () => ({ accessToken: 'at', expiresAt: null }));
+const createOAuthState = vi.fn(async (..._args: unknown[]) => {});
+// The Slack workspace a sign-in is pinned to (services/mcpOAuthSlackTeam.ts covers how it is chosen).
+let teamPin: string | undefined;
+const authorizeTeam = vi.fn(async (..._args: unknown[]) => teamPin);
+vi.mock('../services/mcpOAuthSlackTeam', () => ({ authorizeTeam }));
+vi.mock('../slack/app', () => ({ getSlackApp: () => null }));
+// What the catalog server's discovery advertises.
+let discoveredScopes: string[] = [];
+const exchangeCode = vi.fn(async (..._args: unknown[]): Promise<{ accessToken: string; expiresAt: null; scope?: string }> => ({ accessToken: 'at', expiresAt: null }));
 vi.mock('../services/mcpOAuth', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/mcpOAuth')>()),
   exchangeCode,
   registerClient: async () => CLIENT,
   discoverOAuth: async () => ({
-    resource: 'https://mcp.example.test:18444/v2', scopes: [], issuer: 'https://auth.example.test',
+    resource: 'https://mcp.example.test:18444/v2', scopes: discoveredScopes, issuer: 'https://auth.example.test',
     authorizationEndpoint: 'https://auth.example.test/authorize', tokenEndpoint: 'https://auth.example.test/token',
     registrationEndpoint: 'https://auth.example.test/register', revocationEndpoint: null, cimdSupported: false, tokenAuthMethods: [],
     issParameterSupported: true,
@@ -108,6 +127,10 @@ vi.mock('../services/mcpOAuth', async (importOriginal) => ({
 }));
 
 const STATE_NONCE = 'n'.repeat(32);
+const STATE_SCOPES = ['search:read.public', 'channels:history'];
+// Where the pending sign-in's state row says to return: Settings (null) or the setup wizard.
+let stateReturnTo: 'welcome' | null = null;
+const linkedScopes: unknown[] = [];
 const CLIENT = { clientId: 'cid', authMethod: 'none', via: 'dcr', redirectUri: 'r', issuer: 'https://auth.example.test' };
 let lockStored: { client: typeof CLIENT; tokens?: unknown } | null = { client: CLIENT };
 const linkWrites: Array<string | null> = [];
@@ -115,7 +138,7 @@ const lockIo = {
   read: async () => lockStored,
   write: async (v: typeof lockStored) => { lockStored = v; },
   remove: async () => { lockStored = null; },
-  linked: async () => { linkWrites.push('linked'); },
+  linked: async (scopes?: unknown) => { linkWrites.push('linked'); linkedScopes.push(scopes); },
   needsLink: async (reason: string | null) => { linkWrites.push(reason); },
 };
 const { mcpConnectorsRouter } = await import('./mcpConnectors');
@@ -152,12 +175,15 @@ beforeEach(() => {
     row({}), row({ id: 'c2', name: 'jira' }), row({ id: 'c3', userId: 'u2', name: 'linear' }),
     row({ id: 'c4', name: 'notes', authType: 'oauth', headerTemplates: null }),
   ];
-  flagOn = true;
+  apiFlagOn = false;
   defaultsFlag = [ACME_ENTRY];
+  labelsFlag = null;
   storeConfigured = true;
   storedSecrets = {};
   lockStored = { client: CLIENT };
   linkWrites.length = 0;
+  linkedScopes.length = 0;
+  discoveredScopes = [];
   process.env.FRONTEND_URL = 'https://termag.example.test';
   vi.clearAllMocks();
 });
@@ -177,20 +203,6 @@ const NEW = { name: 'notion', upstream: 'https://mcp.example.test:18444/notion',
 describe('mcp connectors routes', () => {
   it('needs a signed-in user', async () => {
     expect((await call('GET', '/', null)).status).toBe(401);
-  });
-
-  it('answers 404 on every method while mcp-broker-enabled is off, and changes nothing', async () => {
-    flagOn = false;
-    const before = structuredClone(rows);
-    for (const [method, path, body] of [
-      ['GET', '/', undefined], ['POST', '/', NEW], ['PATCH', '/c1', { name: 'renamed' }], ['DELETE', '/c1', undefined],
-      ['POST', '/c4/oauth/start', undefined], ['DELETE', '/c4/oauth', undefined], ['GET', '/oauth/callback?state=s&code=c', undefined],
-    ] as const) {
-      expect(await call(method, path, 'u1', body), `${method} ${path}`).toEqual({ status: 404, body: { error: 'Not found' } });
-    }
-    expect(rows).toEqual(before);
-    expect(prismaMock.mcpConnector.create).not.toHaveBeenCalled();
-    expect(deliverToUserBoxes).not.toHaveBeenCalled();
   });
 
   it("answers another user's connector with the same 404 as a missing one, and leaves it alone", async () => {
@@ -216,11 +228,42 @@ describe('mcp connectors routes', () => {
   });
 
   it('answers 409 when a rename or a create takes a name the user already has', async () => {
-    expect(await call('PATCH', '/c2', 'u1', { name: 'figma' })).toEqual({ status: 409, body: { error: 'You already have an MCP connector with that name' } });
+    expect(await call('PATCH', '/c2', 'u1', { name: 'figma' })).toEqual({
+      status: 409, body: { error: 'Another of your MCP servers is already named "figma". Choose a different name.' },
+    });
     expect(rows.find(r => r.id === 'c2')?.name).toBe('jira');
     expect((await call('POST', '/', 'u1', { ...NEW, name: 'jira' })).status).toBe(409);
     // Another user's name is not a clash.
     expect((await call('PATCH', '/c2', 'u1', { name: 'linear' })).status).toBe(200);
+  });
+
+  it('takes any display text as the name and derives the connector name from it', async () => {
+    const created = await call('POST', '/', 'u1', { ...NEW, name: 'Claude Docs' });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ name: 'claude-docs', displayName: 'Claude Docs' });
+    expect(rows.find(r => r.id === created.body.id)).toMatchObject({ name: 'claude-docs', displayName: 'Claude Docs' });
+    const renamed = await call('PATCH', '/c2', 'u1', { name: 'Jira Cloud' });
+    expect(renamed.body).toMatchObject({ name: 'jira-cloud', displayName: 'Jira Cloud' });
+    // Renaming back to a plain connector name clears the display text.
+    expect((await call('PATCH', '/c2', 'u1', { name: 'jira' })).body).toMatchObject({ name: 'jira', displayName: 'jira' });
+    expect(rows.find(r => r.id === 'c2')?.displayName).toBeNull();
+    expect((await call('POST', '/', 'u1', { ...NEW, name: '日本語' })).status).toBe(400);
+  });
+
+  it('shows an existing connector, which has no display text, under its name', async () => {
+    const res = await call('GET', '/', 'u1');
+    expect(res.body.connectors.map((c: { name: string; displayName: string }) => [c.name, c.displayName]))
+      .toEqual([['figma', 'figma'], ['jira', 'jira'], ['notes', 'notes']]);
+  });
+
+  it('refuses a display name whose connector name another of the user\'s servers has, naming both', async () => {
+    const res = await call('POST', '/', 'u1', { ...NEW, name: 'Figma' });
+    expect(res).toEqual({
+      status: 409,
+      body: { error: 'Another of your MCP servers is already named "figma", which is what "Figma" becomes in tool names (mcp__figma__…). Choose a different name.' },
+    });
+    expect((await call('PATCH', '/c2', 'u1', { name: 'FIGMA' })).status).toBe(409);
+    expect(rows.filter(r => r.userId === 'u1' && r.name === 'figma')).toHaveLength(1);
   });
 
   it('puts the old secrets back when a PATCH that changed them fails', async () => {
@@ -369,6 +412,20 @@ describe('the catalog of MCP servers (the mcp-default-connectors flag)', () => {
     expect(prismaMock.mcpConnector.create).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a connect\'s returnTo welcome with its sign-in, for the setup wizard', async () => {
+    expect((await call('POST', '/catalog/acme/connect', 'u1', { returnTo: 'welcome' })).status).toBe(200);
+    expect(createOAuthState.mock.calls.at(-1)?.[5]).toBe('welcome');
+  });
+
+  it('lists a catalog entry\'s label and gives the connector it creates that display name', async () => {
+    defaultsFlag = [{ ...ACME_ENTRY, label: 'Acme Cloud' }];
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([{ name: 'acme', label: 'Acme Cloud', upstream: ACME }]);
+    const res = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(res.status).toBe(200);
+    expect(rows.find(r => r.id === res.body.id)).toMatchObject({ name: 'acme', displayName: 'Acme Cloud' });
+    expect(res.body.connector).toMatchObject({ name: 'acme', displayName: 'Acme Cloud' });
+  });
+
   it('offers nothing and connects nothing while mcp-default-connectors is off (null) or serves []', async () => {
     for (const value of [null, []]) {
       defaultsFlag = value;
@@ -412,5 +469,206 @@ describe('the catalog of MCP servers (the mcp-default-connectors flag)', () => {
     storeConfigured = false;
     expect((await call('POST', '/catalog/acme/connect', 'u1')).status).toBe(503);
     expect(prismaMock.mcpConnector.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('choosing the scopes a sign-in asks for', () => {
+  const SCOPES = ['search:read.public', 'channels:history', 'chat:write'];
+  const META = {
+    resource: 'https://mcp.slack.com', scopes: SCOPES, issuer: 'https://mcp.slack.com',
+    authorizationEndpoint: 'https://slack.com/oauth/v2_user/authorize', tokenEndpoint: 'https://slack.com/api/oauth.v2.user.access',
+    registrationEndpoint: 'https://slack.com/register', revocationEndpoint: null, cimdSupported: false, tokenAuthMethods: [],
+  };
+  const slack = () => { rows.find(r => r.id === 'c4')!.oauthMetadata = META; };
+  const scopeOf = (url: string) => new URL(url).searchParams.get('scope');
+
+  it('asks only for the ticked scopes on the authorize URL, and keeps them with the sign-in', async () => {
+    slack();
+    const res = await call('POST', '/c4/oauth/start', 'u1', { scopes: ['channels:history', 'search:read.public'] });
+    expect(res.status).toBe(200);
+    expect(scopeOf(res.body.authorizeUrl)).toBe('search:read.public channels:history');
+    expect(createOAuthState).toHaveBeenCalledWith(expect.any(String), 'u1', 'c4', expect.any(String), ['search:read.public', 'channels:history'], null);
+  });
+
+  it('pins the authorize URL to the Slack workspace the sign-in is for', async () => {
+    slack();
+    teamPin = 'T0TERMAG';
+    try {
+      const res = await call('POST', '/c4/oauth/start', 'u1');
+      expect(new URL(res.body.authorizeUrl).searchParams.get('team')).toBe('T0TERMAG');
+      expect(authorizeTeam).toHaveBeenCalledWith(META, CLIENT, null, expect.any(Function));
+    } finally {
+      teamPin = undefined;
+    }
+    expect(new URL((await call('POST', '/c4/oauth/start', 'u1')).body.authorizeUrl).searchParams.has('team')).toBe(false);
+  });
+
+  it('asks for every advertised scope when the request names none', async () => {
+    slack();
+    const res = await call('POST', '/c4/oauth/start', 'u1');
+    expect(scopeOf(res.body.authorizeUrl)).toBe(SCOPES.join(' '));
+  });
+
+  it('refuses a scope the server does not offer, or none at all, before any sign-in starts', async () => {
+    slack();
+    expect((await call('POST', '/c4/oauth/start', 'u1', { scopes: ['admin'] })).status).toBe(400);
+    expect((await call('POST', '/c4/oauth/start', 'u1', { scopes: [] })).status).toBe(400);
+    expect(createOAuthState).not.toHaveBeenCalled();
+  });
+
+  it('stores what was asked for and what the token response says was granted, and shows both on the connector', async () => {
+    slack();
+    exchangeCode.mockResolvedValueOnce({ accessToken: 'at', expiresAt: null, scope: 'search:read.public' });
+    const q = new URLSearchParams({ state: signState(process.env.SESSION_SECRET ?? 'dev-secret', STATE_NONCE, 'u1', 'c4'), code: 'c' });
+    const cb = await fetch(`${base}/oauth/callback?${q}`, { headers: { 'x-test-user': 'u1' }, redirect: 'manual' });
+    expect(new URL(cb.headers.get('location')!, 'http://x').searchParams.get('linked')).toBe('1');
+    expect(linkedScopes).toEqual([{ requested: STATE_SCOPES, granted: ['search:read.public'] }]);
+
+    // What the store's linked() wrote, read back through the list.
+    Object.assign(rows.find(r => r.id === 'c4')!, { oauthScopes: linkedScopes[0], linkStatus: 'linked' });
+    const c4 = (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4');
+    expect(c4.oauth.requestedScopes.map((s: { name: string }) => s.name)).toEqual(STATE_SCOPES);
+    expect(c4.oauth.grantedScopes).toEqual([{ name: 'search:read.public', label: 'Search messages in public channels' }]);
+    expect(c4.oauth.scopeChoice.options).toContainEqual({ name: 'chat:write', label: 'Send messages' });
+  });
+
+  it("labels the checklist from the mcp-oauth-scope-labels flag for the user, and from Slack's built-in table without it", async () => {
+    slack();
+    const options = async () => (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4').oauth.scopeChoice.options;
+    expect((await options()).find((o: { name: string }) => o.name === 'chat:write')).toEqual({ name: 'chat:write', label: 'Send messages' });
+    labelsFlag = { 'https://mcp.slack.com': [{ scope: 'chat:write', label: 'Post messages as you' }, { scope: 'channels:history', label: 'Channel history' }] };
+    expect(await options()).toEqual([
+      { name: 'search:read.public', label: 'search:read.public' },
+      { name: 'channels:history', label: 'Channel history' },
+      { name: 'chat:write', label: 'Post messages as you' },
+    ]);
+  });
+
+  it('records no granted scopes when the token response names none', async () => {
+    slack();
+    const q = new URLSearchParams({ state: signState(process.env.SESSION_SECRET ?? 'dev-secret', STATE_NONCE, 'u1', 'c4'), code: 'c' });
+    await fetch(`${base}/oauth/callback?${q}`, { headers: { 'x-test-user': 'u1' }, redirect: 'manual' });
+    expect(linkedScopes).toEqual([{ requested: STATE_SCOPES, granted: null }]);
+  });
+
+  it('offers no checklist for a server that advertises no scopes, and its sign-in sends no scope', async () => {
+    rows.find(r => r.id === 'c4')!.oauthMetadata = { ...META, scopes: [] };
+    const c4 = (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4');
+    expect(c4.oauth.scopeChoice).toBeNull();
+    expect(scopeOf((await call('POST', '/c4/oauth/start', 'u1')).body.authorizeUrl)).toBeNull();
+  });
+
+  it("keeps offline and offline_access off the checklist and asks for offline_access on every sign-in (New Relic's scopes)", async () => {
+    rows.find(r => r.id === 'c4')!.oauthMetadata = { ...META, scopes: ['observability:read', 'offline', 'offline_access'] };
+    const c4 = (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4');
+    expect(c4.oauth.scopeChoice).toBeNull();
+    expect(scopeOf((await call('POST', '/c4/oauth/start', 'u1')).body.authorizeUrl)).toBe('observability:read offline_access');
+
+    rows.find(r => r.id === 'c4')!.oauthMetadata = { ...META, scopes: ['read', 'write', 'offline'] };
+    const options = (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4').oauth.scopeChoice.options;
+    expect(options.map((o: { name: string }) => o.name)).toEqual(['read', 'write']);
+    expect(scopeOf((await call('POST', '/c4/oauth/start', 'u1', { scopes: ['write'] })).body.authorizeUrl)).toBe('write offline');
+  });
+
+  it('connects a catalog server without a sign-in URL when asked to let the person choose first', async () => {
+    discoveredScopes = SCOPES;
+    const res = await call('POST', '/catalog/acme/connect', 'u1', { chooseScopes: true });
+    expect(res.status).toBe(200);
+    expect(res.body.authorizeUrl).toBeNull();
+    expect(res.body.connector.oauth.scopeChoice.options).toHaveLength(3);
+    expect(createOAuthState).not.toHaveBeenCalled();
+    // Without the opt-in, connect starts the sign-in at once, asking for every scope.
+    const plain = await call('POST', '/catalog/acme/connect', 'u1');
+    expect(scopeOf(plain.body.authorizeUrl)).toBe(SCOPES.join(' '));
+  });
+});
+
+describe('API connectors (Google)', () => {
+  const GOOGLE_CLIENT = JSON.stringify([{ issuer: 'https://accounts.google.com', resource: 'https://www.googleapis.com', clientId: 'gid', clientSecretEnv: 'TEST_GOOGLE_SECRET' }]);
+  beforeEach(() => {
+    apiFlagOn = true;
+    process.env.MCP_OAUTH_CLIENTS = GOOGLE_CLIENT;
+    process.env.TEST_GOOGLE_SECRET = 's';
+  });
+  afterAll(() => {
+    delete process.env.MCP_OAUTH_CLIENTS;
+    delete process.env.TEST_GOOGLE_SECRET;
+  });
+
+  it('offers Google under Available to connect only with api-broker-enabled and a Google client', async () => {
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY, { name: 'google', upstream: 'https://www.googleapis.com', kind: 'api' }]);
+    apiFlagOn = false;
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY]);
+    apiFlagOn = true;
+    delete process.env.MCP_OAUTH_CLIENTS;
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY]);
+    expect((await call('POST', '/catalog/google/connect', 'u1')).status).toBe(404);
+  });
+
+  it("connects Google with its fixed metadata, no discovery, and a sign-in that asks for a refresh token", async () => {
+    const res = await call('POST', '/catalog/google/connect', 'u1');
+    expect(res.status).toBe(200);
+    const u = new URL(res.body.authorizeUrl);
+    expect(u.origin + u.pathname).toBe('https://accounts.google.com/o/oauth2/v2/auth');
+    expect(u.searchParams.get('access_type')).toBe('offline');
+    expect(u.searchParams.has('resource')).toBe(false);
+    const created = rows.find(r => r.id === res.body.id)!;
+    expect(created).toMatchObject({ name: 'google', upstream: 'https://www.googleapis.com', authType: 'oauth', oauthMetadata: { api: 'google' } });
+    expect(res.body.connector).toMatchObject({ kind: 'api', brokerUrl: null });
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY]);
+  });
+
+  it("refuses to move a Google connector's upstream", async () => {
+    const res = await call('POST', '/catalog/google/connect', 'u1');
+    const moved = await call('PATCH', `/${res.body.id}`, 'u1', { upstream: 'https://mcp.example.test/mcp' });
+    expect(moved.status).toBe(400);
+    expect(rows.find(r => r.id === res.body.id)!.upstream).toBe('https://www.googleapis.com');
+  });
+});
+
+describe('a sign-in started in the setup wizard', () => {
+  const META = {
+    resource: 'https://mcp.example.test/mcp', scopes: [], issuer: 'https://auth.example.test',
+    authorizationEndpoint: 'https://auth.example.test/authorize', tokenEndpoint: 'https://auth.example.test/token',
+    registrationEndpoint: null, revocationEndpoint: null, cimdSupported: false, tokenAuthMethods: [],
+  };
+  async function callbackLocation(params: Record<string, string>) {
+    rows.find(r => r.id === 'c4')!.oauthMetadata = META;
+    const q = new URLSearchParams({ state: signState(process.env.SESSION_SECRET ?? 'dev-secret', STATE_NONCE, 'u1', 'c4'), ...params });
+    const res = await fetch(`${base}/oauth/callback?${q}`, { headers: { 'x-test-user': 'u1' }, redirect: 'manual' });
+    expect(res.status).toBe(303);
+    return new URL(res.headers.get('location')!, 'http://x');
+  }
+  afterEach(() => { stateReturnTo = null; });
+
+  it('keeps returnTo welcome with the sign-in, and nothing else for any other value', async () => {
+    rows.find(r => r.id === 'c4')!.oauthMetadata = META;
+    await call('POST', '/c4/oauth/start', 'u1', { returnTo: 'welcome' });
+    expect(createOAuthState.mock.calls.at(-1)?.[5]).toBe('welcome');
+    await call('POST', '/c4/oauth/start', 'u1', { returnTo: 'https://evil.example/' });
+    expect(createOAuthState.mock.calls.at(-1)?.[5]).toBeNull();
+    await call('POST', '/c4/oauth/start', 'u1');
+    expect(createOAuthState.mock.calls.at(-1)?.[5]).toBeNull();
+  });
+
+  it('returns a finished sign-in to the wizard\'s MCP step', async () => {
+    stateReturnTo = 'welcome';
+    const to = await callbackLocation({ code: 'the-code', iss: 'https://auth.example.test' });
+    expect(to.pathname).toMatch(/\/welcome$/);
+    expect(Object.fromEntries(to.searchParams)).toEqual({ step: 'mcp', server: 'c4', linked: '1' });
+  });
+
+  it('returns a refused sign-in to the wizard with its error', async () => {
+    stateReturnTo = 'welcome';
+    const to = await callbackLocation({ error: 'access_denied' });
+    expect(to.pathname).toMatch(/\/welcome$/);
+    expect(to.searchParams.get('step')).toBe('mcp');
+    expect(to.searchParams.get('error')).toMatch(/did not grant access/);
+  });
+
+  it('returns to Settings when the sign-in started there', async () => {
+    const to = await callbackLocation({ code: 'the-code', iss: 'https://auth.example.test' });
+    expect(to.pathname).toMatch(/\/settings\/mcp$/);
+    expect(to.searchParams.get('linked')).toBe('1');
   });
 });

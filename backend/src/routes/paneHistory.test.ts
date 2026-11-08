@@ -2,10 +2,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // historyFor's collaborators, mocked at the module edge like the capture
 // route's tests do: the access gate and the agent RPC send.
-vi.mock('../services/sessionAccess', () => ({
+vi.mock('../services/sessionAccess', async (importActual) => ({
+  askChatPaneRefusal: (await importActual<typeof import('../services/sessionAccess')>()).askChatPaneRefusal,
   assertSessionAccess: vi.fn(async () => ({
     session: 'u-p-agent',
     host: { instanceId: 'i-1', host: '10.0.0.1', userId: 'u' },
+    workstream: 'main',
+    askChat: false,
   })),
   SessionAccessError: class SessionAccessError extends Error {
     constructor(public status: number, message: string) { super(message); }
@@ -20,6 +23,7 @@ vi.mock('../services/agentRegistry', () => ({
 }));
 
 import { historyFor } from './paneHistory';
+import { assertSessionAccess } from '../services/sessionAccess';
 
 describe('historyFor', () => {
   // The rate limiter keys on wall time and its Map lives at module level, so
@@ -64,6 +68,16 @@ describe('historyFor', () => {
     vi.setSystemTime(clock + 1100);
     const later = await historyFor('u1', 'p1', 'agent', {}, 'browser');
     expect(later.status).toBe(200);
+  });
+
+  it("refuses an ask thread's chat with 409 and never asks the box: it has no pane", async () => {
+    vi.mocked(assertSessionAccess).mockResolvedValueOnce({
+      session: 'u-p-ask-t1-agent', host: { instanceId: 'i-1', userId: 'u' }, workstream: 'ask-thread0001', askChat: true,
+    } as Awaited<ReturnType<typeof assertSessionAccess>>);
+    const r = await historyFor('u1', 'p1', 'agent', { workstream: 'ask-thread0001' });
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: 'ask_chat_no_pane' });
+    expect(sendForProject).not.toHaveBeenCalled();
   });
 
   it("maps an old agent's unknown command to 501", async () => {

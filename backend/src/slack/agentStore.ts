@@ -61,10 +61,12 @@ export const prismaAgentThreadStore: AgentThreadStore = {
     });
   },
   saveDmLast(channelId, last) {
+    // No spaceId is a personal session's, which clears whatever space the DM's last one had.
+    const row = { ...last, spaceId: last.spaceId ?? null };
     writeInOrder(`d:${channelId}`, 'save a DM\'s last agent session', () => prisma.slackAgentDmLast.upsert({
       where: { channelId },
-      update: last,
-      create: { channelId, ...last },
+      update: row,
+      create: { channelId, ...row },
     }));
   },
   flush(channelId, threadTs, dmChannel) {

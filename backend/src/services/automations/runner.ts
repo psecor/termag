@@ -22,6 +22,7 @@ import { runBranch, runName } from './schedule';
 import { folderOf } from './spaceFolder';
 import { pullForRun, readmeFor, spaceFoldersEnabledFor, syncErrorText } from './spaceSync';
 import { FINISHED_RUN_STATES } from './store';
+import { brokerMcpFor } from '../chatConfinedMcp';
 
 /** Where a project's runs keep their shared notes on the box. */
 export function memoryDir(home: string, projectId: string): string {
@@ -217,6 +218,9 @@ async function sendBrief(
     await discardWorkstream(t, ws);
     return { kind: 'failed', reason: 'launch', error: launch.body.error };
   }
+  // The owner's run: their broker connectors' reads, the rest to auto's classifier (services/chatConfinedMcp.ts).
+  // Only when all the run produces stays with the owner (chatConfinedMcp.ts automationStaysWithOwner).
+  const brokerMcp = await brokerMcpFor({ projectId: project.id, workstreamId: ws.id, isOwner: true, ownerId: project.userId, instanceId: project.instanceId, agentCapabilities: caps });
   const payload = chatSendRpcPayload({
     chatKey: chatKeyFor(project.id, ws.id), cwd, projectId: project.id, project: project.name, workstream: ws.name, workstreamId: ws.id,
     requireCheckout: false, permissionMode: modeForTier(automation.tier, project.chatTrustedAt != null),
@@ -224,6 +228,7 @@ async function sendBrief(
   }, brief, caps, {
     // The run's chat belongs to the automation's space (services/chatSpace.ts), fixed before its first turn.
     memorySpace: chatMemorySpace(await chatSpaceFor(ws.id, { requested: { name: automation.spaceName, userId: project.userId } })),
+    ...(brokerMcp ? { brokerMcp } : {}),
   });
   try {
     await sendForProject(host, 'chat-send', payload, 15_000);

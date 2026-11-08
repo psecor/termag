@@ -1,13 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * renameOwnedBox: owner only, behind box-rename-enabled, unique among the
+ * renameOwnedBox: owner only, unique among the
  * owner's live boxes, and the box token's label follows the name.
  */
 
-const flagOn = vi.hoisted(() => ({ value: true }));
 vi.mock('../services/featureFlags', () => ({
-  boolVariation: vi.fn(async (key: string, _user: unknown, fallback: boolean) => key === 'box-rename-enabled' ? flagOn.value : fallback),
+  boolVariation: vi.fn(async (_key: string, _user: unknown, fallback: boolean) => fallback),
   boolVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: boolean) => fallback),
   stringVariation: vi.fn(async (_key: string, _user: unknown, fallback: string) => fallback),
 }));
@@ -52,7 +51,6 @@ vi.mock('../services/warmPoolClaim', () => ({
   claimWarmBox: vi.fn(),
   isNameConflict: (err: unknown) => (err as { code?: string })?.code === 'P2002',
   prismaClaimEffects: {},
-  WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
 }));
 
 const { renameOwnedBox } = await import('./instances');
@@ -60,7 +58,6 @@ const { renameOwnedBox } = await import('./instances');
 const alice = { id: 'u1', unixUsername: 'alice' } as unknown as Express.User;
 
 beforeEach(() => {
-  flagOn.value = true;
   db.conflict.error = null;
   db.tokenUpdates.length = 0;
   db.rows.splice(0, db.rows.length,
@@ -120,12 +117,4 @@ describe('renameOwnedBox', () => {
     expect((await renameOwnedBox(alice, 'b1', 'my box')).status).toBe(400);
   });
 
-  it('refuses while box-rename-enabled is off for the user', async () => {
-    flagOn.value = false;
-
-    expect(await renameOwnedBox(alice, 'b1', 'laptop')).toEqual({
-      status: 403, body: { error: 'Renaming boxes is not enabled for you', code: 'rename_disabled' },
-    });
-    expect(db.prisma.instance.findFirst).not.toHaveBeenCalled();
-  });
 });

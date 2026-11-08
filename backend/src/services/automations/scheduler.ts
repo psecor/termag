@@ -18,7 +18,7 @@ import { noteAutomationRunActivity } from '../boxActivity';
 import { registerBoxBusyCheck } from '../boxLifecycle';
 import { PowerRequestConflict, requestPower } from '../boxPower';
 import { CHAT_AUTO_CAPABILITY, CHAT_RUNNER_CAPABILITY, chatKeyFor } from '../chatRunner';
-import { desktopAppEnabled, T3_CAPABILITY } from '../desktopAppFlag';
+import { T3_CAPABILITY } from '../desktopAppFlag';
 import { boolVariation } from '../featureFlags';
 import { removeWorkstreamFor } from '../../routes/workstreams';
 import { admitRun, type AdmitDecision } from './admit';
@@ -68,12 +68,10 @@ async function previousLive(automationId: string, exceptRunId: string): Promise<
   return (await prisma.automationRun.count({ where: { automationId, state: { in: ['pending', 'running'] }, id: { not: exceptRunId } } })) > 0;
 }
 
-/** Whether this automation's owner has the flag on for its box; a t3 one also needs the desktop bridge's. */
+/** Whether this automation's owner has the flag on for its box. */
 async function flagOn(a: Row): Promise<boolean> {
   const box = a.project.instance ? { id: a.project.instance.id, name: a.project.instance.name, kind: a.project.instance.kind } : null;
-  if (!(await boolVariation(AUTOMATIONS_FLAG, a.project.user, false, box))) return false;
-  // No box: let admit see box_gone, which pauses the automation, rather than skipping as flag_off for good.
-  return a.kind !== T3_AUTOMATION_KIND || box === null || (await desktopAppEnabled(a.project.user, box));
+  return boolVariation(AUTOMATIONS_FLAG, a.project.user, false, box);
 }
 
 function runnerCapable(instanceId: string, tier: string): boolean {

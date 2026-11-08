@@ -8,7 +8,8 @@
  * both hold `-`), so the box's own projects are named forward with
  * tmux.sessionName and the reported name is looked up among them.
  */
-import { sessionBelongsToUser, sessionName } from '../tmux';
+import { reviewSessionNames, sessionBelongsToUser, sessionName } from '../tmux';
+import { chatNoticeText, type ChatNoticeEntry, type ChatNoticePane } from './notice';
 import type { ReportedPane } from './run';
 
 export interface AgentPaneTarget {
@@ -78,4 +79,53 @@ export function sessionCounts(statuses: Array<'working' | 'waiting' | 'idle' | '
     liveSessions: statuses.filter(s => s !== 'not_running').length,
     busySessions: statuses.filter(s => s === 'working').length,
   };
+}
+
+/** A pane of a workstream other than its agent pane, which the box resumes itself. */
+export interface OtherPaneTarget { projectId: string; workstream: string; pane: Exclude<ChatNoticePane, 'agent'> }
+
+/**
+ * Every other pane name of these projects' workstreams (ctrl, data,
+ * data-ctrl, and every review slot) → its workstream, named forward as
+ * agentPaneIndex does. An ask's chat workstream has no pane, and a name two
+ * panes share has no entry.
+ */
+export function otherPaneIndex(projects: BoxProject[], unixUsername: string): Map<string, OtherPaneTarget> {
+  const out = new Map<string, OtherPaneTarget>();
+  // A name two panes share (main's `data-ctrl` is workstream `data`'s `ctrl`,
+  // `<user>-<project>-data-ctrl` both) cannot say whose chat a notice is for:
+  // it is left out, and the notice is stored on neither (Bugbot on #1301).
+  const shared = new Set<string>();
+  const add = (name: string, t: OtherPaneTarget) => {
+    const had = out.get(name);
+    if (had && (had.projectId !== t.projectId || had.workstream !== t.workstream || had.pane !== t.pane)) shared.add(name);
+    else out.set(name, t);
+  };
+  for (const p of projects) {
+    for (const wf of p.workflows) {
+      if (wf.workstream.askThread) continue;
+      const ws = wf.workstream.name;
+      for (const pane of ['ctrl', 'data', 'data-ctrl'] as const) add(sessionName(unixUsername, p.name, pane, ws), { projectId: p.id, workstream: ws, pane });
+      for (const name of reviewSessionNames(unixUsername, p.name, ws)) add(name, { projectId: p.id, workstream: ws, pane: 'review' });
+    }
+  }
+  for (const name of shared) out.delete(name);
+  return out;
+}
+
+/**
+ * The notices the box printed in the panes it resumed itself (role `other`),
+ * each on the workstream whose pane it is: only a pane of the owner's, of one
+ * of the box's projects, whose report carries a notice that passes
+ * chatNoticeText. A pane the box did not print in reports no notice.
+ */
+export function boxChatNotices(panes: ReportedPane[], index: Map<string, OtherPaneTarget>, unixUsername: string): ChatNoticeEntry[] {
+  const out: ChatNoticeEntry[] = [];
+  for (const p of panes) {
+    if (p.role !== 'other' || !sessionBelongsToUser(p.session, unixUsername)) continue;
+    const text = chatNoticeText(p.notice);
+    const target = index.get(p.session);
+    if (text && target) out.push({ ...target, text });
+  }
+  return out;
 }

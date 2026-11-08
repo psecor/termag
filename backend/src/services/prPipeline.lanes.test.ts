@@ -186,6 +186,19 @@ describe('assignLanes', () => {
     expect([5, 6, 7].map(n => [by.get(n)!.lane, by.get(n)!.askedYou])).toEqual([['needs_my_review', true], ['team_review', false], ['needs_my_review', true]]);
     expect(by.get(8)).not.toHaveProperty('askedYou');
   });
+  it("a review lane's row carries who reviewed it, and every open row GitHub's review decision", () => {
+    const reviewers = { approved: ['alice'], changes: [], commented: [], botsApproved: [], botsChanges: [] };
+    const rows = assignLanes(input({
+      reviewRequested: [open({ number: 5, author: 'a', reviewDecision: 'APPROVED', reviewers }), open({ number: 6, author: 'b' })],
+      authored: [open({ number: 8, reviewDecision: 'APPROVED' })],
+    }));
+    const by = new Map(rows.map(r => [r.number, r]));
+    expect([by.get(5)!.reviewDecision, by.get(5)!.reviewers]).toEqual(['APPROVED', reviewers]);
+    expect([by.get(6)!.reviewDecision, by.get(6)!.reviewers]).toEqual([null, null]);
+    expect(by.get(8)).not.toHaveProperty('reviewers');
+    // Every open row has GitHub's decision: a review group's member of your own is an authored-lane row.
+    expect(by.get(8)!.reviewDecision).toBe('APPROVED');
+  });
   it('a PR in two searches appears once, as authored', () => {
     const rows = assignLanes(input({ authored: [open({ number: 7 })], reviewRequested: [open({ number: 7, author: 'someone' })] }));
     expect(rows).toHaveLength(1);

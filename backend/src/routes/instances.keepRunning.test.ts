@@ -29,9 +29,9 @@ vi.mock('../services/boxProvisioner', () => ({
 vi.mock('../services/boxPower', () => ({ requestPower: vi.fn(), PowerRequestConflict: class extends Error {} }));
 vi.mock('../services/boxLifecycle', () => ({
   recentAutoTerminations: vi.fn(), setBoxLifecycle: vi.fn(),
-  // box-idle-stop-enabled on, with its 2 h window.
+  // The default window, 2 h.
   lifecycleViewFor: vi.fn(async (_user: unknown, row: any) =>
-    (await import('../services/boxLifecyclePolicy')).lifecycleView(row, 90, { idleStopOn: true, idleStopHours: 2, warnMinutes: 120 })),
+    (await import('../services/boxLifecyclePolicy')).lifecycleView(row, 90, { idleStopHours: 2, warnMinutes: 120 })),
 }));
 vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => null), reconcileWarmPool: vi.fn() }));
@@ -39,7 +39,7 @@ vi.mock('../services/agentRegistry', () => ({
   isInstanceAgentConnected: vi.fn(() => true), sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []),
 }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {},
 }));
 vi.mock('../services/chatRevoke', () => ({ revokeChats: vi.fn(async () => null) }));
 const changes: string[] = [];

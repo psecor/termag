@@ -51,6 +51,7 @@ vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn() }));
 vi.mock('../services/boxProvisioner', () => ({ provisionBox, terminateBox, isBoxProvisioningConfigured: () => true }));
 vi.mock('../services/featureFlags', () => ({
   boolVariation: vi.fn(async () => false),
+  boolVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: boolean) => fallback),
   stringVariation: vi.fn(async (_key: string, _user: unknown, fallback: string) => fallback),
   stringVariationForContext: vi.fn(async (_key: string, _ctx: unknown, fallback: string) => fallback),
 }));
@@ -60,9 +61,10 @@ vi.mock('../services/boxImage', () => ({
   PUBLISHED_IMAGE: { kind: 'published' },
 }));
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => null), reconcileWarmPool: vi.fn() }));
+vi.mock('../services/warmPoolSizes', () => ({ warmPoolTargetFor: vi.fn(async () => 0), recordPoolClaim: vi.fn() }));
 vi.mock('../services/agentRegistry', () => ({ sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []) }));
 vi.mock('../services/warmPoolClaim', () => ({
-  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {}, WARM_POOL_ENABLED_FLAG: 'warm-pool-enabled',
+  claimWarmBox: vi.fn(), isNameConflict: () => false, prismaClaimEffects: {},
 }));
 vi.mock('../services/boxCreationGate', () => ({
   readBoxCreationFacts: vi.fn(async () => ({})),

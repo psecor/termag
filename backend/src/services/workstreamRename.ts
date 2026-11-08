@@ -11,7 +11,8 @@
 // shown in the row's tooltip). `main` cannot be renamed: it has no worktree
 // and its sessions carry the historical 3-segment names.
 import { isRunName } from './automations/schedule';
-import { reviewSessionNames, sessionName } from './tmux';
+import { isAskChatWorkstreamName } from './agentMessages';
+import { reviewSessionNames, sessionName, terminalSessionNames } from './tmux';
 
 // Capped at 64 to match the chat relay's WORKSTREAM_RE (services/chatRunner.ts).
 export const WORKSTREAM_NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -29,6 +30,7 @@ export function validateWorkstreamRename(current: string, next: unknown): { ok: 
   // would take; it is the automation scheduler's either way.
   if (isRunName(current)) return { ok: false, error: 'An automation run cannot be renamed' };
   if (isRunName(name)) return { ok: false, error: 'run-<date>-<time> names are the automation scheduler\'s' };
+  if (isAskChatWorkstreamName(name)) return { ok: false, error: 'ask-<id> names are reserved for ask threads' };
   if (name === current) return { ok: false, error: 'That is already the name' };
   return { ok: true, name };
 }
@@ -50,10 +52,22 @@ export function planSessionRenames(
     if (t === 'agent') roles.push('agent', 'ctrl', 'review');
     else roles.push('data', 'data-ctrl');
   }
-  return roles.flatMap((role): SessionRename[] => {
+  const base = roles.flatMap((role): SessionRename[] => {
     if (role !== 'review') return [{ role, from: sessionName(username, projectName, role, from), to: sessionName(username, projectName, role, to) }];
     // Every review slot; most are absent, which the rename tolerates.
     const next = reviewSessionNames(username, projectName, to);
     return reviewSessionNames(username, projectName, from).map((f, i) => ({ role, from: f, to: next[i] }));
   });
+  // Terminal slots belong to the WORKSTREAM, not to a
+  // workflow — the routes create them on any workstream and the delete path
+  // kills them with none — so they ride every rename, agentless included.
+  return base.concat(terminalSlotRenames(username, projectName, from, to));
+}
+
+/** The user's terminal slots 2..MAX; most are absent, which the rename tolerates. */
+function terminalSlotRenames(username: string, projectName: string, from: string, to: string): SessionRename[] {
+  const next = terminalSessionNames(username, projectName, to);
+  return terminalSessionNames(username, projectName, from)
+    .slice(1)
+    .map((f, i) => ({ role: 'ctrl' as WorkstreamRole, from: f, to: next[i + 1] }));
 }

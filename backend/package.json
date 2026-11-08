@@ -51,6 +51,7 @@
     "@prisma/adapter-pg": "^5.22.0",
     "@prisma/client": "^5.10.0",
     "@slack/bolt": "^3.22.0",
+    "ajv": "^8.20.0",
     "aws-jwt-verify": "^5.2.1",
     "connect-pg-simple": "^9.0.1",
     "cors": "^2.8.5",

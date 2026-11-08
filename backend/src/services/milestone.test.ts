@@ -65,3 +65,12 @@ describe('milestoneForSharedViewer', () => {
     expect(milestoneForSharedViewer(undefined)).toBeUndefined();
   });
 });
+
+describe('prRefOf', () => {
+  it('is the repository and number of a PR URL, null without one', async () => {
+    const { prRefOf } = await import('./milestone');
+    expect(prRefOf('https://github.com/example-team/system-verifiers/pull/12')).toEqual({ repo: 'example-team/system-verifiers', number: 12 });
+    expect(prRefOf(null)).toBeNull();
+    expect(prRefOf('https://example.com/a/b/pull/1')).toBeNull();
+  });
+});

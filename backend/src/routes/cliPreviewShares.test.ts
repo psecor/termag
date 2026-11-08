@@ -117,12 +117,9 @@ function shareDeps() {
     findWorkstream: vi.fn(async (_p: string, name: string) => (name === 'feature-x' ? { id: 'ws1' } : name === 'main' ? { id: null } : undefined)),
     findBranch: vi.fn(async (_p: string, name: string) => (name === 'feature-x' ? { id: 'ws1', branch: 'feature-x' } : undefined)),
     listWorkstreams: vi.fn(async () => [{ id: null, name: 'main' }, { id: 'ws1', name: 'feature-x' }]),
+    findCheckout: vi.fn(async () => ({ ok: false as const, reason: 'outdated-agent' as const, looked: [] })),
     findUserByEmail: vi.fn(async (email: string) => (email === bob.googleEmail ? bob : null)),
     findUser: vi.fn(async (id: string) => [alice, bob].find(u => u.id === id) ?? null),
-    sharingOn: vi.fn(async () => true),
-    openLinksOn: vi.fn(async () => true),
-    prLinksOn: vi.fn(async () => true),
-    checkoutSharesOn: vi.fn(async () => false),
     autoShareDefault: vi.fn(async () => false),
     draftSharesOn: vi.fn(async () => false),
     ttlDefault: vi.fn(async () => 24),
@@ -136,16 +133,14 @@ function shareDeps() {
 }
 
 let fake: ReturnType<typeof shareDeps>;
-let desktopOn: ReturnType<typeof vi.fn>;
 let search: ReturnType<typeof vi.fn>;
 let server: Server;
 let base: string;
 
 beforeEach(async () => {
   fake = shareDeps();
-  desktopOn = vi.fn(async () => true);
   search = vi.fn(async () => [{ email: 'bob@x.test', displayName: 'Bob' }]);
-  const previewShares = createCliPreviewShares({ shares: fake.deps as unknown as PreviewShareRouteDeps, people: { search }, desktopOn });
+  const previewShares = createCliPreviewShares({ shares: fake.deps as unknown as PreviewShareRouteDeps, people: { search } });
   const app = express();
   app.use(express.json());
   app.use('/api/cli/v1', cliApiRouter({ store: cliStore, codes: new AuthCodeStore(), now: () => new Date(NOW), jwt: Promise.resolve(null as never), previewShares }));
@@ -181,8 +176,6 @@ describe('the desktop\'s preview shares, for its owner\'s device sign-in', () =>
     const named = await call('POST', '/projects/p1/preview-shares', DEVICE_ALICE, { email: 'bob@x.test', workstream: 'feature-x' });
     expect(named).toEqual({ status: 201, body: { id: 'cuser00000000001', expiresAt: new Date(NOW + 24 * 3600e3).toISOString(), link: '/p/cuser00000000001', ttlHours: 24 } });
     expect(fake.store.create).toHaveBeenCalledWith(expect.objectContaining({ projectId: 'p1', workstreamId: 'ws1', ownerId: alice.id, granteeId: bob.id }));
-    // The desktop's flag is read for the owner and the project's box.
-    expect(desktopOn).toHaveBeenCalledWith(alice, box);
 
     const open = await call('POST', '/projects/p1/preview-shares', DEVICE_ALICE, { audience: 'link', workstream: 'feature-x', ttlHours: 4 });
     expect(open).toMatchObject({ status: 201, body: { id: 'copen00000000002', ttlHours: 4, linkPath: expect.stringMatching(/^\/p\/[0-9a-f]{32}$/) } });
@@ -225,22 +218,14 @@ describe('the desktop\'s preview shares, for its owner\'s device sign-in', () =>
     expect(fake.deps.checkStack).toHaveBeenCalledWith({ userId: alice.id, instanceId: box.id }, expect.objectContaining({ cwd: '/home/alice/termag/projects/webapp/.worktrees/feature-x' }));
   });
 
-  it('finds people to share with, never the caller, with the desktop\'s flag read for them alone', async () => {
+  it('finds people to share with, never the caller', async () => {
     expect(await call('GET', '/users/search?q=bo', DEVICE_ALICE)).toEqual({ status: 200, body: { people: [{ email: 'bob@x.test', displayName: 'Bob' }] } });
     expect(search).toHaveBeenCalledWith('bo', alice.id);
-    expect(desktopOn).toHaveBeenCalledWith(alice);
     expect((await call('GET', `/users/search?q=${'x'.repeat(101)}`, DEVICE_ALICE)).status).toBe(400);
   });
 
   it('keeps the browser routes\' own checks: their preview-share flags and their validation', async () => {
-    fake.deps.sharingOn.mockResolvedValue(false);
-    expect(await call('POST', '/projects/p1/preview-shares', DEVICE_ALICE, { email: 'bob@x.test' })).toMatchObject({ status: 403, body: { code: 'preview-share-disabled' } });
-    fake.deps.sharingOn.mockResolvedValue(true);
-    fake.deps.openLinksOn.mockResolvedValue(false);
-    expect(await call('POST', '/projects/p1/preview-shares', DEVICE_ALICE, { audience: 'link' })).toMatchObject({ status: 403, body: { code: 'open-links-disabled' } });
     expect(await call('POST', '/projects/p1/preview-shares', DEVICE_ALICE, { audience: 'link', email: 'bob@x.test' })).toMatchObject({ status: 400, body: { code: 'email-with-link' } });
-    fake.deps.prLinksOn.mockResolvedValue(false);
-    expect(await call('POST', '/projects/p1/preview-shares/link', DEVICE_ALICE, { workstream: 'feature-x', repo: 'example-org/webapp', number: 42 })).toMatchObject({ status: 403, body: { code: 'pr-links-disabled' } });
     expect(fake.store.create).not.toHaveBeenCalled();
     expect(fake.store.createOpenLink).not.toHaveBeenCalled();
   });
@@ -255,7 +240,6 @@ describe('who the desktop\'s preview shares refuse', () => {
       expect((await call(method, path, null, body)).status, `${method} ${path}`).toBe(401);
     }
     expect(fake.deps.findOwnedProject).not.toHaveBeenCalled();
-    expect(desktopOn).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
   });
 
@@ -271,19 +255,6 @@ describe('who the desktop\'s preview shares refuse', () => {
     expect(fake.deps.githubFor).not.toHaveBeenCalled();
   });
 
-  it('everyone while desktop-app-enabled is off, as if the routes weren\'t there', async () => {
-    desktopOn.mockResolvedValue(false);
-    fake.store.rows.push(row({}));
-    for (const [method, path, body] of EVERY_ROUTE) {
-      expect(await call(method, path, DEVICE_ALICE, body), `${method} ${path}`).toEqual({
-        status: 404, body: { error: 'No such CLI endpoint; this termag CLI may be newer than the orchestrator', code: 'not_found' },
-      });
-    }
-    expect(fake.store.create).not.toHaveBeenCalled();
-    expect(fake.store.revoke).not.toHaveBeenCalled();
-    expect(search).not.toHaveBeenCalled();
-  });
-
   it('a person past the browser routes\' rate limit, and only that person', async () => {
     const codes: number[] = [];
     for (let i = 0; i < 31; i += 1) codes.push((await call('GET', '/projects/p1/preview-shares', DEVICE_ALICE)).status);
@@ -296,6 +267,5 @@ describe('who the desktop\'s preview shares refuse', () => {
   it('a project with no box, which the desktop can\'t reach', async () => {
     fake.deps.findOwnedProject.mockResolvedValue({ ...project, instanceId: null, instance: null });
     expect(await call('GET', '/projects/p1/preview-shares', DEVICE_ALICE)).toMatchObject({ status: 404, body: { code: 'not_found' } });
-    expect(desktopOn).not.toHaveBeenCalled();
   });
 });

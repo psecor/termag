@@ -11,7 +11,7 @@
 //   cursor-agent --mode plan --auto-review "$(cat F)"  plan alone stops on every gh; auto-review runs it
 // pi is not here yet: its review pane has not been observed, and a
 // classifier written blind would misreport.
-import { PROVIDERS } from '../providers/registry';
+import { DEVIN_APPROVAL_FOOTER, DEVIN_APPROVAL_ROW, PROVIDERS } from '../providers/registry';
 import type { ReviewPaneState } from './review';
 
 export const REVIEWER_IDS = ['devin', 'claude', 'cursor'] as const;
@@ -36,9 +36,10 @@ interface ReviewerSpec {
 const SPECS: Record<ReviewerId, ReviewerSpec> = {
   // Devin's input box ("❭ Guide Devin while it works") is always drawn, so the
   // prompt alone does not mean done; activity shows as a braille spinner +
-  // "Thinking · 39s (esc twice to interrupt)"; an approval list ends in
-  // "↑↓ select · ↵ confirm". The footer is a whole line of its own; a quoted
-  // mention mid-sentence is not.
+  // "Thinking · 39s (esc twice to interrupt)"; an approval list ends in the
+  // footer DEVIN_APPROVAL_FOOTER reads (providers/registry.ts), a whole line
+  // of its own; a quoted mention mid-sentence is not. DEVIN_APPROVAL_ROW reads
+  // the list's cursor row, for a pane narrow enough to wrap the footer.
   devin: {
     // `smart`: a fast model lets safe shell commands (gh pr view / diff) run
     // without a prompt, so the review gets going on its own; the default
@@ -50,7 +51,7 @@ const SPECS: Record<ReviewerId, ReviewerSpec> = {
     note: 'smart mode: safe commands run unasked; staying read-only rests on the prompt',
     launch: f => `devin --permission-mode smart --prompt-file ${f}`,
     isForeground: cmd => cmd.toLowerCase().includes('devin'),
-    waiting: [/^\s*↑↓\s+select\s*·\s*↵\s+confirm(?:\s*·\s*esc cancel)?\s*$/],
+    waiting: [DEVIN_APPROVAL_FOOTER, DEVIN_APPROVAL_ROW],
     waitingWindow: 6,
     activity: [/\(esc twice to interrupt\)/, /^\s*[⠀-⣿]*\s*Thinking\s*·/, /Guide Devin while it works/],
     activityWindow: 8,

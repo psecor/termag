@@ -48,6 +48,19 @@ export function resolvedChatTier(stored: unknown): ClaudeChatTier {
 }
 
 /**
+ * The tier a turn that names no `--model` runs on: on the gateway, its
+ * CLAUDE_DEFAULT_MODEL tier (the box settings' ANTHROPIC_MODEL,
+ * claudeGateway.ts gatewaySettings); else, or with none configured, Sonnet.
+ * An ask's turn names none when its thread has no tier (askService
+ * askTurnModel), so that turn ran on this, not on a chat's Sonnet.
+ */
+export function defaultLaunchTier(onGateway: boolean, env: NodeJS.ProcessEnv = process.env): ClaudeChatTier {
+  if (!onGateway || !getClaudeGatewayConfig(env)) return DEFAULT_CLAUDE_CHAT_TIER;
+  const tier = parseClaudeChatModel(env.CLAUDE_DEFAULT_MODEL?.trim());
+  return tier.ok && tier.model ? tier.model : DEFAULT_CLAUDE_CHAT_TIER;
+}
+
+/**
  * The `--model` argument for a chat turn, always a concrete tier: when the
  * gateway is configured and on for the owner (`onGateway`, the condition
  * credentialDelivery delivers it on), its pinned profile id, which is what

@@ -1,7 +1,7 @@
 /**
  * Same-origin JSON gate for the chat's browser POSTs.
  *
- * termag.sid is SameSite=Lax, so a top-level form POST from another
+ * The session cookie (auth/sessionCookie.ts) is SameSite=Lax, so a top-level form POST from another
  * https://*.example.com origin still carries it. express.json() ignores that
  * form body. POST /chat/trust used to trust the project anyway, and POST
  * /chat/terminal would then resume the main chat. Either one drops the

@@ -13,7 +13,6 @@ const OTHER: McpConnectorRecord = { ...FIGMA, id: 'c2', userId: 'u2' };
 function deps(over: Partial<McpAuthzDeps> = {}): McpAuthzDeps {
   return {
     boxForToken: async (t) => (t === 'tmag_good' ? BOX : null),
-    flagOn: async () => true,
     connector: async (id) => [FIGMA, OTHER].find(c => c.id === id) ?? null,
     secrets: async () => ({ token: 'up-secret' }),
     accessToken: async () => { throw new McpNeedsLinkError('not linked'); },
@@ -57,16 +56,6 @@ describe('decideMcpRequest', () => {
   it('refuses a box that is not managed', async () => {
     const d = await decideMcpRequest({ path: '/c/c1', authorization: AUTH }, deps({ boxForToken: async () => ({ ...BOX, managed: false }) }));
     expect(d).toMatchObject({ allow: false, status: 403 });
-  });
-
-  it('refuses while the flag is off, before looking at the connector', async () => {
-    let looked = false;
-    const d = await decideMcpRequest({ path: '/c/c1', authorization: AUTH }, deps({
-      flagOn: async () => false,
-      connector: async () => { looked = true; return FIGMA; },
-    }));
-    expect(d).toMatchObject({ allow: false, status: 403, audit: 'user=u1 instance=i1 flag off' });
-    expect(looked).toBe(false);
   });
 
   it("answers 404 for another user's connector exactly as for one that does not exist", async () => {
@@ -144,5 +133,15 @@ describe('decideMcpRequest', () => {
       await decideMcpRequest({ path: '/c/c1', authorization: 'Bearer tmag_good' }, deps({ secrets: async () => ({ other: 'x' }) })),
     ];
     for (const d of all) expect(d.audit).not.toMatch(/up-secret|tmag_good/);
+  });
+
+  it('refuses a connector of kind "api" on its own route, so its token only goes where the API allowlist says', async () => {
+    let read = false;
+    const google: McpConnectorRecord = { ...FIGMA, id: 'cg', name: 'google', upstream: 'https://www.googleapis.com', authType: 'oauth', oauthMetadata: { api: 'google' } };
+    const d = await decideMcpRequest({ path: '/c/cg/drive/v3/files', authorization: AUTH }, deps({
+      connector: async () => google, accessToken: async () => { read = true; return 'x'; },
+    }));
+    expect(d).toMatchObject({ allow: false, status: 404 });
+    expect(read).toBe(false);
   });
 });

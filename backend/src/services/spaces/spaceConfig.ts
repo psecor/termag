@@ -1,8 +1,7 @@
 /**
  * The bucket, presigner role and KMS key spaces use, derived from the
- * orchestrator's own AWS identity. Nothing is configured: the `spaces-enabled`
- * flag is the only switch, so turning spaces on or off never needs the host
- * roll an env change would.
+ * orchestrator's own AWS identity. Nothing is configured, so spaces need no
+ * host roll for an env change.
  *
  * The names are the ones example-org/terraform creates in
  * projects/termag/root-modules/orchestrator/spaces.tf:

@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
   project: { findUnique: vi.fn(), update: vi.fn() },
+  // Every send checks for a resume onto this box whose session is still to restore: none here.
+  chatResume: { findFirst: vi.fn(async () => null) },
   workflow: { update: vi.fn() },
   // chatLaunchFor reads whether the owner has the Claude gateway on.
   user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: true })) },
@@ -30,7 +32,9 @@ vi.mock('../services/sessionAccess', () => ({
     project: { ownerUsername: 'owner' },
   })),
 }));
-vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
+// Only `termag ask --model` is on (an ask chat runs on its stored tier), unless a test turns it off.
+const askModel = vi.hoisted(() => ({ on: true }));
+vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async (key: string) => key === 'ask-model-choice-enabled' && askModel.on) }));
 vi.mock('../services/fireworksFlag', () => ({ fireworksModelsForBox: vi.fn(async () => null), fireworksOfferedTo: vi.fn(async () => null) }));
 vi.mock('../services/automations/chatGate', () => ({ runChatRefusalFor: vi.fn(async () => null), RUN_CHAT_REFUSAL_TEXT: {} }));
 const place = vi.hoisted(() => ({ value: { space: { id: 's1', name: 'design' }, reachable: true } as { space: { id: string; name: string } | null; reachable: boolean } }));
@@ -87,10 +91,61 @@ describe('a chat\'s space memory', () => {
     caps.list = ['chat-runner-v1', 'chat-trust-v1', 'space-memory-v1', 'ask-chat-v1'];
     expect((await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer)).status).toBe(202);
     expect(sent()[0]).toHaveProperty('ask');
+    // On the tier the thread keeps (termag ask --model), as its ask turns run.
+    expect(sent()[0]).toMatchObject({ model: 'opus' });
+    // With ask-model-choice-enabled off, a person's message there names no --model: the box's default, as its asks.
+    askModel.on = false;
+    await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer);
+    expect(sent().at(-1)).not.toHaveProperty('model');
+    askModel.on = true;
     expect(sent()[0].spaceMemory).toEqual({ space: 'design' });
     place.value = { space: null, reachable: false };
     await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer);
-    expect(sent()[1].spaceMemory).toEqual({ space: null });
+    expect(sent().at(-1)!.spaceMemory).toEqual({ space: null });
+  });
+
+  it("a person's message in an ask chat with no tier runs on the box's default, as the thread's asks did", async () => {
+    vi.stubEnv('CLAUDE_GATEWAY_URL', 'https://gateway.example/bedrock');
+    vi.stubEnv('CLAUDE_BEDROCK_REGION', 'us-east-2');
+    vi.stubEnv('CLAUDE_BEDROCK_MODELS', 'opus=us.anthropic.claude-opus-5-5,sonnet=us.anthropic.claude-sonnet-5-5,haiku=us.anthropic.claude-haiku-4-5');
+    vi.stubEnv('CLAUDE_DEFAULT_MODEL', 'opus');
+    try {
+      prisma.project.findUnique.mockResolvedValue({
+        name: 'proj', userId: 'owner', setupStatus: 'ready', repoUrl: null, chatTrustedAt: null, chatOrchestrator: false,
+        user: { claudeGatewayEnabled: true },
+        instance: { hostHome: '/home/owner', userId: 'owner' },
+        workflows: [{ id: 'wf1', provider: 'claude-chat', backend: null, model: null, workstream: {
+          id: 'ws1', name: 'ask-abc', askThread: { id: 'thread1', workstream: 'main', baseSha: null, originUser: { displayName: 'O', unixUsername: 'owner', googleEmail: 'o@example.com' } },
+        } }],
+      });
+      caps.list = ['chat-runner-v1', 'chat-trust-v1', 'ask-chat-v1'];
+      expect((await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer)).status).toBe(202);
+      // No --model, as the thread's asks: the box's own default, even on a box that skipped the gateway.
+      expect(sent().at(-1)).not.toHaveProperty('model');
+      // Nothing is written: the thread still has no tier of its own.
+      expect(prisma.workflow.update).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("caps a person's message in the ask chat of a project from a shared environment, as its runs are (askService askModeFor)", async () => {
+    prisma.project.findUnique.mockResolvedValue({
+      // Trusted: auto needs the owner's trust tick (Security Agent, #998).
+      name: 'proj', userId: 'owner', setupStatus: 'ready', repoUrl: null, chatTrustedAt: new Date(), chatOrchestrator: false, environmentId: 'e1',
+      instance: { hostHome: '/home/owner', userId: 'owner' },
+      workflows: [{ id: 'wf1', provider: 'claude-chat', backend: null, model: 'opus', workstream: {
+        id: 'ws1', name: 'ask-abc', askThread: { id: 'thread1', workstream: 'main', baseSha: null, originUser: { displayName: 'O', unixUsername: 'owner', googleEmail: 'o@example.com' } },
+      } }],
+    });
+    caps.list = ['chat-runner-v1', 'chat-trust-v1', 'ask-chat-v1', 'ask-mode-cap-v1', 'chat-auto-v1'];
+    expect((await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer)).status).toBe(202);
+    expect(sent()[0]).toMatchObject({ permissionMode: 'auto', ask: { permissionMode: 'auto' } });
+    // An agent from before the cap would run it as bypassPermissions: refused, and nothing is sent.
+    caps.list = ['chat-runner-v1', 'chat-trust-v1', 'ask-chat-v1', 'chat-auto-v1'];
+    const refused = await chatSendFor('owner', 'p1', { workstream: 'ask-abc', text: 'hi' }, viewer);
+    expect(refused.status).toBe(409);
+    expect(sent()).toHaveLength(1);
   });
 
   it('a runner without space-memory-v1 gets nothing; an unreadable space leaves it to the box', async () => {

@@ -1,8 +1,21 @@
 import type { Request, Router } from 'express';
 import type { CallerProofConfig } from '../services/callerIdentity';
-import { githubTokenSource } from '../services/credentialStore';
-import { decideGithubRequest } from '../services/githubAuthz';
+import { getCredentialStoreConfig, githubOrgsSource, githubStoreDeps, githubTokenSource } from '../services/credentialStore';
+import { recheckGithub } from '../services/githubCredential';
+import { decideGithubRequest, oncePerUser } from '../services/githubAuthz';
+import { poolGithubTokenSource } from '../services/poolCredential';
+import { poolEnvironmentRepos } from '../services/poolEnvironmentRepos';
 import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
+
+// After an SSO refusal, re-probe the owner's token (at most every 2 minutes):
+// once they authorize it, the stored state turns ok and the next request passes.
+const recheckAfterSso = oncePerUser(userId => {
+  const cfg = getCredentialStoreConfig();
+  if (!cfg) return;
+  recheckGithub(githubStoreDeps(cfg, userId)).catch(err => {
+    console.warn(`[GH-AUTHZ] re-check after an SSO refusal failed for user=${userId}: ${(err as Error).message}`);
+  });
+}, 2 * 60_000);
 
 // Envoy sends a body only for the checks that read one, and caps it lower.
 const MAX_BODY = 8 * 1024 * 1024;
@@ -38,7 +51,15 @@ export function githubAuthzRouter(cfg: CallerProofConfig): Router {
     const body = req.method === 'GET' || req.method === 'HEAD' ? '' : await readBody(req);
     return decideGithubRequest(
       { method: req.method, path, search, authorization: req.headers.authorization, body },
-      { boxForToken: boxForTokenAt('githubBroker'), ownerToken: githubTokenSource },
+      {
+        boxForToken: boxForTokenAt('githubBroker'),
+        ownerToken: githubTokenSource,
+        ownerOrgs: githubOrgsSource,
+        onSsoRequired: recheckAfterSso,
+        // The environment pool's rule: a preparing pool box's fetches of its environment's repositories.
+        poolToken: poolGithubTokenSource,
+        poolEnvironmentRepos,
+      },
     );
   }, quiet);
 }

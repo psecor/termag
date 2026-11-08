@@ -4,12 +4,16 @@ const prisma = vi.hoisted(() => {
   const p = {
     project: { findUnique: vi.fn(), findMany: vi.fn() },
     projectShare: { findUnique: vi.fn() },
+    projectRepo: { findMany: vi.fn(async () => []) },
     agentMessage: { findUnique: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), count: vi.fn(), create: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
     agentBundle: { deleteMany: vi.fn(async () => ({ count: 0 })), findUnique: vi.fn() },
     agentThreadPr: { findMany: vi.fn(async () => []), upsert: vi.fn(async () => ({})), count: vi.fn(async () => 1) },
     agentThread: { findUnique: vi.fn(), findMany: vi.fn(async () => []), create: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
     instance: { findMany: vi.fn(async () => []), findUnique: vi.fn() },
     workstream: { findFirst: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), create: vi.fn() },
+    // The thread chat's agent row: its stored model (askChat.ts askTurnTier).
+    workflow: { findFirst: vi.fn(async () => null), update: vi.fn(async () => ({})) },
+    user: { findUnique: vi.fn(async () => ({ claudeGatewayEnabled: false })) },
     $executeRaw: vi.fn(async () => 1),
     $transaction: vi.fn(),
   };
@@ -28,6 +32,7 @@ vi.mock('./tmux', () => ({
   sessionName: vi.fn((u: string, p: string, r: string) => `${u}-${p}-${r}`),
 }));
 vi.mock('./boxLifecycle', () => ({ registerBoxBusyCheck: vi.fn() }));
+vi.mock('./productEvents', () => ({ recordProductEvent: vi.fn() }));
 // The thread's chat belongs to a space, fixed at its first use (services/chatSpace.ts).
 vi.mock('./chatSpace', () => ({ turnMemorySpace: vi.fn(async (wsId: string) => (wsId === 'ws-ask' ? 'design' : undefined)) }));
 vi.mock('./boxPower', () => ({ PowerRequestConflict: class extends Error {}, requestPower: vi.fn() }));
@@ -53,6 +58,7 @@ import { publishBundle, resolveTargetPr } from './askPublish';
 import { githubTokenSource } from './credentialStore';
 import { confirmPushes } from './askPushes';
 import { boolVariation } from './featureFlags';
+import { recordProductEvent } from './productEvents';
 import { requestPower } from './boxPower';
 import { boxesWithOpenEvent, openBoxEvent } from './boxEvents';
 import { MAX_ACTIVE_ASKS, type AskRequest } from './agentMessages';
@@ -60,11 +66,11 @@ import type { CliUser } from './cliStore';
 
 const ada = { id: 'u-ada', unixUsername: 'ada', displayName: 'Ada', googleEmail: 'ada@example.com' } as CliUser;
 
-function projectRow(over: { userId?: string; boxOwner?: string | null; instance?: null; repos?: string[]; boxFor?: string } = {}) {
+function projectRow(over: { userId?: string; boxOwner?: string | null; instance?: null; repos?: string[]; boxFor?: string; environmentId?: string; chatTrustedAt?: Date | null } = {}) {
   const userId = over.userId ?? 'u-ada';
   return {
     id: 'p1', name: over.repos ? 'shop' : 'api', userId, archived: false, instanceId: over.instance === null ? null : 'box1',
-    setupStatus: 'ready', setupError: null,
+    setupStatus: 'ready', setupError: null, environmentId: over.environmentId ?? null, chatTrustedAt: over.chatTrustedAt ?? null,
     layout: over.repos ? 'workspace' : 'repo', repos: (over.repos ?? []).map(name => ({ name })),
     user: { id: userId, unixUsername: userId === 'u-ada' ? 'ada' : 'bob' },
     workstreams: [{ name: 'main' }],
@@ -76,7 +82,7 @@ function projectRow(over: { userId?: string; boxOwner?: string | null; instance?
 }
 
 const req = (over: Partial<AskRequest> = {}): AskRequest => ({
-  ref: null, projectId: 'p1', workstream: 'main', repo: null, prompt: 'what does this do?', threadId: null, messageId: null, title: null, sender: null, senderClaudeSession: null, targetPr: null, newBox: false, notify: true, ...over,
+  ref: null, projectId: 'p1', workstream: 'main', repo: null, prompt: 'what does this do?', threadId: null, messageId: null, title: null, sender: null, senderClaudeSession: null, targetPr: null, newBox: false, notify: true, model: null, ...over,
 });
 
 function setup(project: ReturnType<typeof projectRow>, active = 0) {
@@ -97,6 +103,42 @@ function setup(project: ReturnType<typeof projectRow>, active = 0) {
 
 const askRunCalls = () => vi.mocked(sendToInstanceAgent).mock.calls.filter(c => c[1] === 'ask-run');
 
+describe("prismaCliAsk.ask: a project made from a shared environment", () => {
+  it("caps its ask below bypassPermissions: auto on a box that has it, else dontAsk, so the checkout's config never loads", async () => {
+    // Auto only once the owner trusted the project (Security Agent, #998); untrusted, dontAsk even where auto is there.
+    setup(projectRow({ environmentId: 'e1', chatTrustedAt: new Date() }));
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1', 'ask-mode-cap-v1', 'chat-auto-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+    await prismaCliAsk.ask(ada, null, req());
+    expect(askRunCalls()[0][2]).toMatchObject({ permissionMode: 'auto' });
+    setup(projectRow({ environmentId: 'e1', chatTrustedAt: null }));
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1', 'ask-mode-cap-v1', 'chat-auto-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+    await prismaCliAsk.ask(ada, null, req());
+    expect(askRunCalls()[0][2]).toMatchObject({ permissionMode: 'dontAsk' });
+    setup(projectRow({ environmentId: 'e1' }));
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1', 'ask-mode-cap-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+    await prismaCliAsk.ask(ada, null, req());
+    expect(askRunCalls()[0][2]).toMatchObject({ permissionMode: 'dontAsk' });
+  });
+
+  it("refuses it, sending nothing, on a box whose agent can't cap it (no ask-mode-cap-v1): an older agent would run it as bypassPermissions", async () => {
+    setup(projectRow({ environmentId: 'e1' }));
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1', 'chat-auto-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+    const r = await prismaCliAsk.ask(ada, null, req());
+    expect(askRunCalls()).toHaveLength(0);
+    // A refusal, not a box error: refused before the message is made, as the ask chat's 409 is (Bugbot, #985).
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: 'ask-mode-cap', error: expect.stringContaining("can't keep it from loading") });
+    expect(prisma.agentMessage.create).not.toHaveBeenCalled();
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+  });
+
+  it('leaves any other project at the ask\'s own mode', async () => {
+    setup(projectRow());
+    await prismaCliAsk.ask(ada, null, req());
+    expect(askRunCalls()[0][2]).not.toHaveProperty('permissionMode');
+  });
+});
+
 describe('prismaCliAsk.ask: owner-only', () => {
   beforeEach(() => setup(projectRow()));
 
@@ -107,6 +149,21 @@ describe('prismaCliAsk.ask: owner-only', () => {
     expect(askRunCalls()).toHaveLength(1);
     const job = askRunCalls()[0][2] as { systemPrompt: string };
     expect(job.systemPrompt).toContain('as the box owner');
+  });
+
+  it('records one ask.sent for the message, by its sender', async () => {
+    await prismaCliAsk.ask(ada, null, req());
+    expect(recordProductEvent).toHaveBeenCalledTimes(1);
+    expect(recordProductEvent).toHaveBeenCalledWith('ask.sent', { user: 'u-ada', box: 'box1' }, {
+      thread: 'thr0000000001', hop: 1, followUp: false, via: 'cli', queued: false,
+    });
+  });
+
+  it('records no ask.sent for an ask the cap refuses', async () => {
+    setup(projectRow(), MAX_ACTIVE_ASKS);
+    const r = await prismaCliAsk.ask(ada, null, req());
+    expect(r.status).toBe(409);
+    expect(recordProductEvent).not.toHaveBeenCalled();
   });
 
   it('refuses a project shared with the asker, with sharing switched on', async () => {
@@ -209,6 +266,34 @@ describe('prismaCliAsk.ask: a multi-repo project, one repository at a time', () 
       expect(r).toMatchObject({ status: 409, body: { code: 'not_multi_repo', error: 'devbox/api has one repository, so it takes no ":web"; ask devbox/api' } });
     }
     expect(askRunCalls()).toHaveLength(0);
+  });
+
+  // `termag ask --new-box --from a --from b box/shop:<repo>`: asked before every clone is ready.
+  describe('a new one still being set up', () => {
+    const cloning = () => {
+      setup({ ...projectRow({ repos: [] }), name: 'shop', layout: 'workspace', setupStatus: 'cloning' });
+      prisma.projectRepo.findMany.mockResolvedValue([
+        { name: 'shop-web', setupStatus: 'ready' }, { name: 'shop-api', setupStatus: 'cloning' },
+      ] as never);
+    };
+
+    it('holds an ask into a repository it was created with until the clone is done', async () => {
+      cloning();
+      const r = await prismaCliAsk.ask(ada, null, req({ repo: 'shop-api' }));
+      expect(r).toMatchObject({ status: 202, body: { queued: true, queuedFor: 'setup', target: 'devbox/shop:shop-api' } });
+      expect(prisma.agentThread.create.mock.calls[0][0].data).toMatchObject({ repoName: 'shop-api' });
+      expect(prisma.projectRepo.findMany.mock.calls[0][0]).toMatchObject({ where: { projectId: 'p1' }, orderBy: { position: 'asc' } });
+      expect(askRunCalls()).toHaveLength(0);
+    });
+
+    it('lists every repository it was created with, in order, for a bare ask or one it does not hold', async () => {
+      cloning();
+      expect(await prismaCliAsk.ask(ada, null, req())).toMatchObject({ status: 409, body: { code: 'repo_required', repos: ['shop-web', 'shop-api'] } });
+      cloning();
+      expect(await prismaCliAsk.ask(ada, null, req({ repo: 'shop-db' }))).toMatchObject({
+        status: 409, body: { code: 'unknown_repo', repos: ['shop-web', 'shop-api'], error: 'devbox/shop has no repository shop-db; it holds shop-web, shop-api' },
+      });
+    });
   });
 
   it('refuses a follow-up that names another repository than its thread', async () => {
@@ -373,6 +458,9 @@ describe('prismaCliAsk.ask: steering a follow-up into a working turn', () => {
     expect(markedWorking()).toEqual([]);
     expect(queuedAsNextTurn()).toHaveLength(1);
     expect(queuedAsNextTurn()[0][0].data.queuedPrompt).toBe('what does this do?');
+    // The launch decision recorded before the send is put back to what it asked for: its own start decides again.
+    const modelWrites = prisma.agentMessage.updateMany.mock.calls.map(c => c[0].data).filter(d => d && 'modelIgnored' in d && !('status' in d));
+    expect(modelWrites.at(-1)).toEqual({ model: null, modelIgnored: null });
   });
 
   it('never steers into a turn that runs headless, even on a box that now announces ask-steer-v1', async () => {
@@ -504,6 +592,51 @@ describe('prismaCliAsk.ask: steering a follow-up into a working turn', () => {
       where: { id: 'msgb00000001', status: 'submitted' },
       data: { status: 'failed', error: expect.stringContaining("the thread's previous turn was still running 6 hours after this follow-up") },
     });
+  });
+
+  const MODEL_STEER_CAPS = [...STEER_CAPS, 'ask-model-v1'];
+  it('queues a follow-up on another --model as the next turn: a running claude -p keeps its model', async () => {
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, model: 'sonnet' });
+    prisma.workflow.findFirst.mockResolvedValue({ model: 'sonnet' } as never);
+    const r = await prismaCliAsk.ask(ada, null, follow());
+    expect(r.body).toMatchObject({ steered: true });
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, model: 'sonnet' });
+    const q = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', messageId: 'msgb00000001', model: 'opus' }));
+    expect(q.body).toMatchObject({ queued: true, queuedFor: 'turn', steered: false, queuedBehind: 'msga00000001', steerRefused: "msga00000001's turn runs on sonnet, and --model opus needs a turn of its own" });
+    expect(askRunCalls()).toHaveLength(0);
+    prisma.workflow.findFirst.mockResolvedValue(null);
+  });
+
+  it('a follow-up without --model runs on the thread\'s stored tier, so it waits behind a turn on another one', async () => {
+    // A person picked Haiku in the ask chat while the Sonnet turn ran.
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, model: 'sonnet' });
+    prisma.workflow.findFirst.mockResolvedValue({ model: 'haiku' } as never);
+    const q = await prismaCliAsk.ask(ada, null, follow());
+    expect(q.body).toMatchObject({ queued: true, queuedBehind: 'msga00000001', steerRefused: "msga00000001's turn runs on sonnet, and --model haiku needs a turn of its own" });
+    expect(askRunCalls()).toHaveLength(0);
+    // With the flag off, no stored tier applies: it runs on the default, and joins a default turn.
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, model: null });
+    vi.mocked(boolVariation).mockImplementation(async (key: string) => key !== 'ask-model-choice-enabled');
+    expect((await prismaCliAsk.ask(ada, null, follow())).body).toMatchObject({ steered: true });
+    vi.mocked(boolVariation).mockImplementation(async () => true);
+    prisma.workflow.findFirst.mockResolvedValue(null);
+  });
+
+  it('a busy turn whose box is not connected queues the follow-up as not connected, not as a model mismatch', async () => {
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, instanceId: 'box-old', model: 'opus' });
+    vi.mocked(instanceAgentTransport).mockImplementation(((id: string) => (id === 'box-old' ? undefined
+      : { capabilities: MODEL_STEER_CAPS, helloReceived: true, conn: { kind: 'owned-box' } })) as never);
+    const q = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', messageId: 'msgb00000001', model: 'opus' }));
+    expect(q.body).toMatchObject({ queued: true, queuedBehind: 'msga00000001', steerRefused: 'devbox is not connected' });
+    vi.mocked(instanceAgentTransport).mockReset();
+    vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: ['ask-v1', 'ask-cancel-v1'], helloReceived: true, conn: { kind: 'owned-box' } } as never);
+  });
+
+  it('compares a follow-up\'s --model with what the running turn really runs on: an ignored one ran on the default', async () => {
+    steerSetup(MODEL_STEER_CAPS, { ...busyA, model: 'opus', modelIgnored: "devbox's agent predates --model" });
+    const q = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', messageId: 'msgb00000001', model: 'opus' }));
+    expect(q.body).toMatchObject({ queued: true, queuedFor: 'turn', queuedBehind: 'msga00000001', steerRefused: "msga00000001's turn runs on the box's default model, and --model opus needs a turn of its own" });
+    expect(askRunCalls()).toHaveLength(0);
   });
 
   it('runs a first ask on a steer-capable box as a live turn, with nothing to steer', async () => {
@@ -659,6 +792,20 @@ describe('prismaCliAsk: publishing to another PR (--update-pr)', () => {
     expect(vi.mocked(resolveTargetPr).mock.calls[0][1]).toMatchObject({ repo: 'org/shop-api' });
   });
 
+  it("checks a PR against a still-cloning repository's URL in a new workspace", async () => {
+    setup({ ...projectRow({ repos: [] }), repoUrl: null, name: 'shop', layout: 'workspace', setupStatus: 'cloning' });
+    prisma.projectRepo.findMany.mockResolvedValue([
+      { name: 'shop-web', url: 'https://github.com/org/shop-web.git', setupStatus: 'ready' },
+      { name: 'shop-api', url: 'git@github.com:org/shop-api.git', setupStatus: 'cloning' },
+    ] as never);
+    const wrong = await prismaCliAsk.ask(ada, null, req({ repo: 'shop-api', targetPr: { number: 753, repo: 'org/shop-web' } }));
+    expect(wrong).toMatchObject({ status: 409, body: { code: 'target_pr_refused', error: expect.stringContaining('checkout of org/shop-api') } });
+    expect(resolveTargetPr).not.toHaveBeenCalled();
+    const ok = await prismaCliAsk.ask(ada, null, req({ repo: 'shop-api', targetPr: { number: 753, repo: null } }));
+    expect(ok).toMatchObject({ status: 202, body: { queued: true, queuedFor: 'setup' } });
+    expect(vi.mocked(resolveTargetPr).mock.calls[0][1]).toMatchObject({ repo: 'org/shop-api' });
+  });
+
   const remembered = { id: 'thr0000000001', originUserId: 'u-ada', projectId: 'p1', workstream: 'main', repoName: null, instanceId: 'box1', hopCount: 1, chatWorkstreamId: null, claudeSessionId: null, baseSha: null, targetPr: 753, targetRepo: 'org/api', targetBranch: 'termag-ada/oldthread' };
 
   it('a follow-up publishes to the remembered PR without naming it', async () => {
@@ -679,6 +826,19 @@ describe('prismaCliAsk: publishing to another PR (--update-pr)', () => {
     prisma.agentThread.findUnique.mockResolvedValue({ ...remembered, targetPr: null, targetRepo: null, targetBranch: null, prNumber: 12 });
     const own = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', targetPr: { number: 753, repo: null } }));
     expect(own).toMatchObject({ status: 409, body: { code: 'thread_mismatch', error: expect.stringContaining('its own PR #12') } });
+  });
+
+  it("a follow-up that names the thread's own PR is a no-op, not a refusal", async () => {
+    prisma.agentThread.findUnique.mockResolvedValue({ ...remembered, targetPr: null, targetRepo: null, targetBranch: null, prNumber: 12, repo: 'org/api' });
+    prisma.agentThread.updateMany.mockResolvedValue({ count: 1 });
+    prisma.agentMessage.findFirst.mockResolvedValue(null);
+    const r = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', targetPr: { number: 12, repo: null } }));
+    expect(r).toMatchObject({ status: 202 });
+    expect(resolveTargetPr).not.toHaveBeenCalled();
+    expect(prisma.agentThread.update).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ targetPr: 12 }) }));
+    prisma.agentMessage.findFirst.mockResolvedValue(null);
+    const otherRepo = await prismaCliAsk.ask(ada, null, req({ threadId: 'thr0000000001', targetPr: { number: 12, repo: 'org/web' } }));
+    expect(otherRepo).toMatchObject({ status: 409, body: { code: 'thread_mismatch' } });
   });
 
   it('a follow-up on a thread that has published nothing may name its PR, as after a refused stack', async () => {
@@ -818,6 +978,205 @@ describe('prismaCliAsk: telling the asker when the ask finishes', () => {
   });
 });
 
+describe('prismaCliAsk: the turn\'s model (termag ask --model)', () => {
+  const MODEL_CAPS = ['ask-v1', 'ask-cancel-v1', 'ask-chat-v1', 'ask-model-v1'];
+  const GATEWAY = {
+    CLAUDE_GATEWAY_URL: 'https://bedrock.example.test/bedrock/', CLAUDE_BEDROCK_REGION: 'us-east-2',
+    CLAUDE_BEDROCK_MODELS: 'opus=us.anthropic.claude-opus-5-5,sonnet=us.anthropic.claude-sonnet-5-5,haiku=us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  };
+  const caps = (list: string[]) => vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: list, helloReceived: true, conn: { kind: 'owned-box' } } as never);
+  const job = () => askRunCalls()[0][2] as Record<string, unknown>;
+  const startedWith = () => prisma.agentMessage.updateMany.mock.calls.find(c => c[0].data?.status === 'working')?.[0].data;
+  /** A follow-up on thr0000000001, whose chat ws-ask has `stored` as its model. */
+  function onThread(stored: string | null) {
+    prisma.agentThread.findUnique.mockResolvedValue({
+      id: 'thr0000000001', originUserId: 'u-ada', projectId: 'p1', workstream: 'main', instanceId: 'box1',
+      hopCount: 1, chatWorkstreamId: 'ws-ask', claudeSessionId: null, baseSha: null,
+    });
+    prisma.agentThread.updateMany.mockResolvedValue({ count: 1 });
+    prisma.workstream.findUnique.mockResolvedValue({ id: 'ws-ask', name: 'ask-thr0000000001' });
+    prisma.agentMessage.findFirst.mockResolvedValue(null);
+    prisma.workflow.findFirst.mockResolvedValue({ id: 'wf-ask', model: stored } as never);
+  }
+  const follow = (over: Partial<AskRequest> = {}) => req({ threadId: 'thr0000000001', messageId: 'msgb00000001', ...over });
+
+  beforeEach(() => { setup(projectRow()); caps(MODEL_CAPS); });
+  afterEach(() => { vi.unstubAllEnvs(); caps(['ask-v1', 'ask-cancel-v1']); prisma.workflow.findFirst.mockResolvedValue(null); });
+
+  it('launches a new thread\'s turn on it, as the pinned profile on the gateway, and keeps it as the thread chat\'s choice', async () => {
+    for (const [k, v] of Object.entries(GATEWAY)) vi.stubEnv(k, v);
+    prisma.user.findUnique.mockResolvedValue({ claudeGatewayEnabled: true } as never);
+    prisma.workflow.findFirst.mockResolvedValue({ id: 'wf-ask', model: null } as never);
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'opus' }));
+    expect(r).toMatchObject({ status: 202, body: { status: 'working', model: 'opus' } });
+    expect(r.body).not.toHaveProperty('modelIgnored');
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).toMatchObject({ model: 'opus' });
+    expect(job()).toMatchObject({ model: 'us.anthropic.claude-opus-5-5', chat: { workstreamId: 'ws-ask' } });
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: null, model: 'opus' } });
+    expect(startedWith()).toMatchObject({ model: 'opus' });
+  });
+
+  it('sends the alias when the owner is off the gateway', async () => {
+    for (const [k, v] of Object.entries(GATEWAY)) vi.stubEnv(k, v);
+    prisma.user.findUnique.mockResolvedValue({ claudeGatewayEnabled: false } as never);
+    await prismaCliAsk.ask(ada, null, req({ model: 'haiku' }));
+    expect(job()).toMatchObject({ model: 'haiku' });
+  });
+
+  it('a follow-up without --model runs on the tier the thread keeps; one with it switches the thread from that turn on', async () => {
+    onThread('opus');
+    await prismaCliAsk.ask(ada, null, follow());
+    expect(job()).toMatchObject({ model: 'opus' });
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(startedWith()).toMatchObject({ model: 'opus' });
+    setup(projectRow()); caps(MODEL_CAPS); onThread('opus');
+    await prismaCliAsk.ask(ada, null, follow({ model: 'sonnet' }));
+    expect(job()).toMatchObject({ model: 'sonnet' });
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: null, model: 'sonnet' } });
+  });
+
+  it('without --model on a thread with nothing stored, the turn names no model: the box\'s default, as before', async () => {
+    const r = await prismaCliAsk.ask(ada, null, req());
+    expect(job()).not.toHaveProperty('model');
+    expect(r.body).not.toHaveProperty('model');
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).not.toHaveProperty('model');
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(startedWith()).toMatchObject({ model: null });
+  });
+
+  it('on an agent from before ask-model-v1 the ask still runs, with no model sent, says --model was ignored, and leaves the thread\'s model as it was', async () => {
+    caps(['ask-v1', 'ask-cancel-v1', 'ask-chat-v1']);
+    onThread('sonnet');
+    const r = await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    expect(r).toMatchObject({ status: 202, body: { status: 'working', model: 'opus', modelIgnored: expect.stringContaining("devbox's agent predates --model") } });
+    expect(job()).not.toHaveProperty('model');
+    // Nothing stored: the chat's next turn is on what it had (Devin on #1322).
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).toMatchObject({ model: 'opus', modelIgnored: expect.stringContaining('predates') });
+    expect(startedWith()).toMatchObject({ model: 'opus', modelIgnored: expect.stringContaining('predates') });
+  });
+
+  it('a headless run says --model was ignored', async () => {
+    caps(['ask-v1', 'ask-cancel-v1']);
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'opus' }));
+    expect(r.body).toMatchObject({ model: 'opus', modelIgnored: expect.stringContaining('the run on devbox is headless') });
+    expect(job()).not.toHaveProperty('model');
+    expect(job()).not.toHaveProperty('chat');
+    expect(startedWith()).toMatchObject({ model: 'opus', modelIgnored: expect.stringContaining('headless') });
+  });
+
+  it('with ask-model-choice-enabled off, ignores --model as an older agent would, and applies no stored tier', async () => {
+    const flagOff = () => vi.mocked(boolVariation).mockImplementation(async (key: string) => key !== 'ask-model-choice-enabled');
+    flagOff();
+    onThread('sonnet');
+    const r = await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    expect(r).toMatchObject({ status: 202, body: { model: 'opus', modelIgnored: expect.stringContaining('ask-model-choice-enabled') } });
+    expect(job()).not.toHaveProperty('model');
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(startedWith()).toMatchObject({ model: 'opus', modelIgnored: expect.stringContaining('ask-model-choice-enabled') });
+    // No --model: the thread's stored tier is not applied either, as before the flag.
+    setup(projectRow()); caps(MODEL_CAPS); onThread('sonnet'); flagOff();
+    const plain = await prismaCliAsk.ask(ada, null, follow());
+    expect(job()).not.toHaveProperty('model');
+    expect(plain.body).not.toHaveProperty('modelIgnored');
+    expect(startedWith()).toMatchObject({ model: null, modelIgnored: null });
+    vi.mocked(boolVariation).mockImplementation(async () => true);
+  });
+
+  it('a retried POST answers as the first 202 did: the model asked for, and why it was ignored', async () => {
+    const existing = (over: Record<string, unknown>) => ({
+      id: 'msgb00000001', threadId: 'thr0000000001', senderUserId: 'u-ada', projectId: 'p1', workstream: 'main', instanceId: 'box1',
+      hop: 1, promptBytes: Buffer.byteLength('what does this do?'), status: 'working', createdAt: new Date(), queuedPrompt: null, queuedUntil: null,
+      notifyVia: null, notice: null, model: null, modelIgnored: null,
+      thread: { id: 'thr0000000001', title: null, hopCount: 1, repoName: null, branch: null, prNumber: null, prUrl: null, prs: [], project: { name: 'api', userId: 'u-ada', instance: { name: 'devbox' } } },
+      ...over,
+    });
+    prisma.agentMessage.findUnique.mockResolvedValue(existing({ model: 'opus', modelIgnored: "devbox's agent predates --model" }) as never);
+    const ignored = await prismaCliAsk.ask(ada, null, req({ messageId: 'msgb00000001', model: 'opus' }));
+    expect(ignored.body).toMatchObject({ replayed: true, model: 'opus', modelIgnored: "devbox's agent predates --model" });
+    prisma.agentMessage.findUnique.mockResolvedValue(existing({ model: 'opus' }) as never);
+    const taken = await prismaCliAsk.ask(ada, null, req({ messageId: 'msgb00000001', model: 'opus' }));
+    expect(taken.body).toMatchObject({ replayed: true, model: 'opus' });
+    expect(taken.body).not.toHaveProperty('modelIgnored');
+    expect(askRunCalls()).toHaveLength(0);
+  });
+
+  it('stores the new tier on the thread only once the box took the turn: a failed start leaves it as it was', async () => {
+    onThread('sonnet');
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (_box, type) => {
+      if (type === 'ask-run') throw new Error('socket closed');
+      if (type === 'ask-run-status') return { running: false, known: true };
+      return { ok: true };
+    });
+    const r = await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    expect(r.status).toBe(502);
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    vi.mocked(sendToInstanceAgent).mockImplementation(async () => ({ ok: true }));
+    // Taken: stored then.
+    setup(projectRow()); caps(MODEL_CAPS); onThread('sonnet');
+    await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: null, model: 'opus' } });
+  });
+
+  it('answers a run the box took with its 202 even when storing the thread\'s new tier fails', async () => {
+    onThread('sonnet');
+    prisma.workflow.update.mockRejectedValueOnce(new Error('connection reset'));
+    const r = await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    expect(r).toMatchObject({ status: 202, body: { status: 'working', model: 'opus' } });
+    expect(job()).toMatchObject({ model: 'opus' });
+    expect(startedWith()).toMatchObject({ model: 'opus' });
+  });
+
+  it('says a box without ask chats runs headless, not that its agent predates --model, from the first 202', async () => {
+    caps(['ask-v1', 'ask-cancel-v1']);
+    await prismaCliAsk.ask(ada, null, req({ model: 'opus' }));
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).toMatchObject({ modelIgnored: expect.stringContaining('is headless') });
+  });
+
+  it('records the launch decision on the message before the send, so a replay never decides it again', async () => {
+    onThread('sonnet');
+    await prismaCliAsk.ask(ada, null, follow({ model: 'opus' }));
+    const writes = prisma.agentMessage.updateMany.mock.calls.map(c => c[0]);
+    const recorded = writes.findIndex(w => w.data?.model === 'opus' && w.data?.status === undefined);
+    expect(recorded).toBeGreaterThanOrEqual(0);
+    expect(writes[recorded]).toEqual({ where: { id: 'msgb00000001', status: 'submitted' }, data: { model: 'opus', modelIgnored: null } });
+    // Before the RPC: the send comes after it.
+    expect(prisma.agentMessage.updateMany.mock.invocationCallOrder[recorded]).toBeLessThan(vi.mocked(sendToInstanceAgent).mock.invocationCallOrder.at(-1)!);
+  });
+
+  it('a replay that adopts a run keeps the recorded decision, and stores the thread\'s tier only for one that launched on it', async () => {
+    const row = (over: Record<string, unknown>) => ({
+      id: 'msgb00000001', threadId: 'thr0000000001', senderUserId: 'u-ada', projectId: 'p1', workstream: 'main', instanceId: 'box1',
+      hop: 1, promptBytes: Buffer.byteLength('what does this do?'), status: 'submitted', createdAt: new Date(0), queuedPrompt: null, queuedUntil: null,
+      notifyVia: null, notice: null, model: null, modelIgnored: null,
+      thread: { id: 'thr0000000001', title: null, hopCount: 1, repoName: null, branch: null, prNumber: null, prUrl: null, prs: [], project: { name: 'api', userId: 'u-ada', instance: { name: 'devbox' } } },
+      ...over,
+    });
+    onThread('sonnet');
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (_box, type) => (type === 'ask-run-status' ? { running: true, known: true, mode: 'chat', live: true } : { ok: true }));
+    prisma.agentMessage.findUnique.mockResolvedValue(row({ model: 'opus' }) as never);
+    const r = await prismaCliAsk.ask(ada, null, req({ messageId: 'msgb00000001', model: 'opus' }));
+    expect(r.body).toMatchObject({ replayed: true, status: 'working', model: 'opus' });
+    expect(startedWith()).toEqual({ status: 'working', startedAt: expect.any(Date) });
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: null, model: 'opus' } });
+    // Recorded as ignored (it went headless): nothing stored, whatever the chat or flag say now.
+    setup(projectRow()); caps(MODEL_CAPS); onThread('sonnet');
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (_box, type) => (type === 'ask-run-status' ? { running: true, known: true } : { ok: true }));
+    prisma.agentMessage.findUnique.mockResolvedValue(row({ model: 'opus', modelIgnored: 'the run on devbox is headless' }) as never);
+    const h = await prismaCliAsk.ask(ada, null, req({ messageId: 'msgb00000001', model: 'opus' }));
+    expect(h.body).toMatchObject({ replayed: true, model: 'opus', modelIgnored: 'the run on devbox is headless' });
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(askRunCalls()).toHaveLength(0);
+    vi.mocked(sendToInstanceAgent).mockImplementation(async () => ({ ok: true }));
+  });
+
+  it('records --model on the message, which a turn the queue sends later reads (sendQueued passes the row)', async () => {
+    caps(MODEL_CAPS);
+    await prismaCliAsk.ask(ada, null, req({ model: 'haiku' }));
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).toMatchObject({ model: 'haiku' });
+  });
+});
+
 describe('prismaCliAsk: a run that pushes itself (ask-push-v1, docs/ask-direct-push.md)', () => {
   const pushCaps = (caps: string[]) => vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: caps, helloReceived: true, conn: { kind: 'owned-box' } } as never);
   beforeEach(() => setup(projectRow()));
@@ -841,16 +1200,16 @@ describe('prismaCliAsk: a run that pushes itself (ask-push-v1, docs/ask-direct-p
   });
 
   describe('recording what it pushed', () => {
-    const result = { result: 'done', sessionId: null, isError: false, numTurns: 1, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {} };
+    const result = { result: 'done', sessionId: null, isError: false, numTurns: 1, exitReason: null, baseSha: null, repo: null, bundle: false, prDescription: null, prDescriptions: {}, unpushed: [] };
     const thread = { id: 'thr0000000001', repo: 'org/api', originUserId: 'u-ada', targetBranch: null, prNumber: null, originUser: { unixUsername: 'ada' } };
-    const finish = async (pushes: { branch: string; sha: string }[]) => {
+    const finish = async (pushes: { branch: string; sha: string }[], unpushed: { branch: string; commits: number }[] = []) => {
       prisma.$transaction.mockImplementation(async (arg: unknown) => (Array.isArray(arg) ? Promise.all(arg) : (arg as (tx: typeof prisma) => unknown)(prisma)));
       prisma.agentMessage.findUnique.mockImplementation(async ({ select }: { select?: { thread?: { select?: Record<string, unknown> } } }) => (select?.thread?.select?.originUserId
         ? { thread }
         : { instanceId: 'box1', status: 'working', threadId: 'thr0000000001', thread: { baseSha: 'b'.repeat(40), repo: 'org/api' } }));
       prisma.agentMessage.update.mockResolvedValue({ id: 'msga00000001', status: 'completed', thread: { ...thread, prs: [], hopCount: 1 } });
       vi.mocked(githubTokenSource).mockResolvedValue('gho_ada' as never);
-      expect((await prismaCliAsk.recordResult('box1', 'msga00000001', { ...result, pushes })).status).toBe(202);
+      expect((await prismaCliAsk.recordResult('box1', 'msga00000001', { ...result, pushes, unpushed })).status).toBe(202);
       await vi.waitFor(() => expect(prisma.agentMessage.update).toHaveBeenCalled(), { timeout: 1000 });
       return prisma.agentMessage.update.mock.calls[0][0].data;
     };
@@ -876,6 +1235,16 @@ describe('prismaCliAsk: a run that pushes itself (ask-push-v1, docs/ask-direct-p
       expect(data).toMatchObject({ publish: 'none', publishDetail: null });
       expect(confirmPushes).not.toHaveBeenCalled();
       expect(prisma.agentBundle.findUnique).not.toHaveBeenCalled();
+    });
+
+    // Reports cmvvbgpzk586mbcmx8srqaaen, cmvv15bkb1is114bd6ftao1iw: a follow-up after the conversion committed
+    // and did not push, and was recorded `none` with no detail.
+    it('is unpushed, naming the branches and the push, when the clone committed without pushing', async () => {
+      const data = await finish([], [{ branch: 'ask', commits: 1 }, { branch: 'termag-ada/thr0000000001', commits: 2 }]);
+      expect(data.publish).toBe('unpushed');
+      expect(data.publishDetail).toBe("ask: 1 commit(s) committed but not pushed (the thread's branch is termag-ada/thr0000000001: git push origin ask:termag-ada/thr0000000001)"
+        + ' | termag-ada/thr0000000001: 2 commit(s) committed but not pushed (git push origin termag-ada/thr0000000001)');
+      expect(confirmPushes).not.toHaveBeenCalled();
     });
 
     it('is partial, naming the branch, when a pushed branch has no PR yet', async () => {

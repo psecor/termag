@@ -9,9 +9,11 @@
  * browser SDK and the agents' resources use) and, when a box is involved,
  * `termag.box.id` (the instance id), so a funnel joins browser
  * sessions, agent telemetry and these on the same two keys. Metadata only:
- * attribute values are enums, ids, counts and seconds. Never a prompt, pane
- * text, a brief, an email or a credential; a string value longer than
- * MAX_VALUE_LENGTH is cut, as a guard against a caller passing a message.
+ * attribute values are enums, ids, names, counts and seconds. Never a prompt,
+ * pane text, a brief, an email or a credential; a string value longer than
+ * MAX_VALUE_LENGTH is cut, as a guard against a caller passing a message. The
+ * one exception is `session.titled`, a chat's few-word title, which its owner
+ * can turn off (services/sessionTitleEvent.ts).
  */
 import { metrics, type Attributes, type Counter } from '@opentelemetry/api';
 import { logs, SeverityNumber } from '@opentelemetry/api-logs';
@@ -56,8 +58,34 @@ export const PRODUCT_EVENTS = [
   'box.idle.notice',
   // A resize that ran (services/boxResize.ts): from, to, who asked, how long, how it ended.
   'box.resize',
+  'environment.setup',
+  // Preview links
+  // (services/previewLinkTelemetry.ts). requested_by_agent comes with
+  // `termag preview request` (phase 3).
+  'preview_link.published',
+  'preview_link.opened',
+  'preview_link.refused',
+  'preview_link.revoked',
+  'preview_link.ended',
+  'preview_link.requested_by_agent',
+  'preview_link.viewer_removed',
   'cli.command',
   'slack.command',
+  // A `termag ask` message the orchestrator took (services/askService.ts): one per
+  // message created, a new thread's first or a follow-up, by its sender.
+  'ask.sent',
+  // What work leaves a box (docs/agents/observability.md): a push through the
+  // GitHub broker (services/githubAuthz.ts), and a PR the agent's own shell
+  // opened or merged, from the PostToolUse milestone (routes/status.ts).
+  'github.push',
+  'pr.opened',
+  'pr.merged',
+  // A file an agent wrote or edited, by the top two directories of its path
+  // in the checkout (routes/status.ts, POST /api/status/edit).
+  'agent.file.edited',
+  // A chat's session title, generated or a person's, where its owner leaves
+  // Settings > Telemetry on (services/sessionTitleEvent.ts).
+  'session.titled',
 ] as const;
 export type ProductEventName = typeof PRODUCT_EVENTS[number];
 

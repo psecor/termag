@@ -64,7 +64,7 @@ describe('selectFleet', () => {
     expect(selectFleet(fleet, 'below-floor')).toEqual({
       hosts: ['a'],
       skipped: [
-        { hostKey: 'd', reason: 'unknown_version' },
+        { hostKey: 'd', reason: 'no_inventory' },
         { hostKey: 'e', reason: 'offline' },
         { hostKey: 'f', reason: 'not_capable' },
         { hostKey: 'g', reason: 'run_in_flight' },
@@ -84,8 +84,36 @@ describe('selectFleet', () => {
     expect(s).toEqual({ hosts: ['high'], skipped: [] });
   });
 
-  it('behind with no reference known updates nobody blind', () => {
+  it('behind with no reference known updates nobody blind: the one case left as unknown_version', () => {
     expect(selectFleet([host('a', '2.1.300', { reference: null })], 'behind')).toEqual({ hosts: [], skipped: [{ hostKey: 'a', reason: 'unknown_version' }] });
+  });
+
+  it('says why a host has no version to compare: not installed, unreadable, no inventory', () => {
+    const s = selectFleet([
+      host('none', null, { inventory: 'not_installed' }),
+      host('garbled', null, { inventory: 'version_unreadable' }),
+      host('never', null, { inventory: 'no_inventory' }),
+      host('unsaid', null),
+    ], 'behind');
+    expect(s).toEqual({ hosts: [], skipped: [
+      { hostKey: 'none', reason: 'not_installed' },
+      { hostKey: 'garbled', reason: 'version_unreadable' },
+      { hostKey: 'never', reason: 'no_inventory' },
+      { hostKey: 'unsaid', reason: 'no_inventory' },
+    ] });
+  });
+
+  it('a host with no version that also cannot run says why it cannot run, offline first', () => {
+    const s = selectFleet([
+      host('off', null, { inventory: 'version_unreadable', connected: false }),
+      host('flag', null, { inventory: 'not_installed', enabled: false, connected: false }),
+      host('old', null, { inventory: 'no_inventory', capable: false }),
+    ], 'below-floor');
+    expect(s.skipped).toEqual([
+      { hostKey: 'off', reason: 'offline' },
+      { hostKey: 'flag', reason: 'claude_update_off' },
+      { hostKey: 'old', reason: 'not_capable' },
+    ]);
   });
 
   it('all takes every host that can run, its version or none', () => {

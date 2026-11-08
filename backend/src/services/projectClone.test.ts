@@ -54,6 +54,7 @@ const prisma = {
     }),
     findUniqueOrThrow: vi.fn(async ({ where, include }: Row) => hydrate(db.projects.find(r => r.id === where.id)!, include)),
     findMany: vi.fn(async ({ where, include }: Row) => db.projects.filter(r => matches(r, where)).map(p => hydrate(p, include))),
+    count: vi.fn(async ({ where }: Row) => db.projects.filter(r => matches(r, where)).length),
     create: vi.fn(async ({ data }: Row) => {
       const row = {
         id: `p${db.projects.length + 1}`, archived: false, repoUrl: null, repoDefaultBranch: null,
@@ -113,10 +114,13 @@ const state = {
   paneLags: false,
   probeFails: false,
   sent: [] as { type: string; payload: Record<string, unknown> }[],
+  /** What the box answers a project-clone with. */
+  cloneAnswer: {} as Record<string, unknown>,
 };
 
 const send = (type: string, payload: Record<string, unknown> = {}) => {
   state.sent.push({ type, payload });
+  if (type === 'project-clone') return state.cloneAnswer;
   if (type === 'tmux-foreground-cmd') {
     if (state.probeFails) throw new Error('Agent request timed out: tmux-foreground-cmd');
     return { cmd: state.foreground };
@@ -135,6 +139,11 @@ vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn(), requireAuthOrAgentT
 vi.mock('../slack/channels', () => ({ createProjectChannel: vi.fn(async () => null) }));
 vi.mock('../slack/lts', () => ({ setNotificationTarget: vi.fn() }));
 vi.mock('./status', () => ({ deleteStatus: vi.fn(), setStatus: vi.fn(), notifyStatusChange: vi.fn() }));
+// What each launch asks the box to run the environment's steps in (services/projectEnvironment.ts).
+const environmentStarts: Array<{ id: string; dir: string }> = [];
+vi.mock('./projectEnvironment', () => ({
+  startEnvironmentAfterClone: vi.fn(async (row: { id: string; dir: string }) => { environmentStarts.push({ id: row.id, dir: row.dir }); }),
+}));
 vi.mock('./agentRegistry', () => ({
   isAgentConnected: vi.fn(() => state.agent !== null),
   isProjectAgentConnected: vi.fn(() => state.agent !== null),
@@ -177,6 +186,8 @@ beforeEach(() => {
   state.paneLags = false;
   state.probeFails = false;
   state.sent = [];
+  state.cloneAnswer = {};
+  environmentStarts.length = 0;
   vi.clearAllMocks();
 });
 
@@ -241,6 +252,120 @@ describe('a repo pick on a box', () => {
     expect(project().setupStatus).toBe('none');
     expect(state.sent.map(s => s.type)).not.toContain('project-clone');
     expect(state.sent.map(s => s.type)).toContain('mkdir');
+  });
+
+  describe('on a box made from an environment (the static layout)', () => {
+    const STATIC = [...CAPABLE, 'project-clone-static-v1'];
+    const fromEnvironment = async (path?: string) => {
+      await createWidget();
+      Object.assign(project(), {
+        environmentId: 'env1', kind: 'normal', dir: null,
+        environmentFile: { name: 'widget', text: JSON.stringify({ repos: [{ repo: 'acme/widget', ...(path ? { path } : {}) }] }) },
+      });
+    };
+
+    it('asks for ~/code/<repo> and records it when the box takes it', async () => {
+      await fromEnvironment();
+      state.cloneAnswer = { ok: true, started: true, staticLayout: true };
+      await redispatchClones(connect(STATIC));
+      expect(state.sent.filter(s => s.type === 'project-clone').map(s => s.payload)).toEqual([
+        expect.objectContaining({ dir: DIR, staticDir: '/home/alice/code/widget' }),
+      ]);
+      expect(project().dir).toBe('/home/alice/code/widget');
+    });
+
+    it('asks for no static path when another project on the box, archived or not, already records it', async () => {
+      await fromEnvironment();
+      db.projects.push({ id: 'old', instanceId: 'box1', archived: true, name: 'widget-archived', userId: 'u1', dir: '/home/alice/code/widget' });
+      state.cloneAnswer = { ok: true, started: true, staticLayout: true };
+      await redispatchClones(connect(STATIC));
+      expect(state.sent.filter(s => s.type === 'project-clone').map(s => s.payload.staticDir)).toEqual([undefined]);
+      expect(project().dir).toBeNull();
+    });
+
+    it('forgets a recorded static path the box refuses (a project moved onto a box that has that path), so its steps run in its own directory (Devin, #1462)', async () => {
+      await fromEnvironment();
+      project().dir = '/home/alice/code/widget';
+      state.cloneAnswer = { ok: true, started: true, staticLayout: false, staticRefused: '/home/alice/code/widget already exists' };
+      await redispatchClones(connect(STATIC));
+      expect(state.sent.find(s => s.type === 'project-clone')?.payload.staticDir).toBe('/home/alice/code/widget');
+      expect(project().dir).toBeNull();
+      await applySetupEvent({ projectId: 'p1', instanceId: 'box1' }, report(0, 'ready', { branch: 'main' }));
+      expect(environmentStarts.at(-1)).toEqual({ id: 'p1', dir: DIR });
+    });
+
+    it('forgets it too when the box answers without the static layout at all (an older agent ignored staticDir)', async () => {
+      await fromEnvironment();
+      project().dir = '/home/alice/code/widget';
+      state.cloneAnswer = { ok: true, started: true };
+      await redispatchClones(connect(CAPABLE));
+      expect(project().dir).toBeNull();
+    });
+
+    it('keeps it when the request was lost (no answer): the next hello sends it again', async () => {
+      await fromEnvironment();
+      project().dir = '/home/alice/code/widget';
+      state.cloneAnswer = null as unknown as Record<string, unknown>;
+      await redispatchClones(connect(STATIC));
+      expect(project().dir).toBe('/home/alice/code/widget');
+    });
+
+    it("uses the definition's path for the repository", async () => {
+      await fromEnvironment('widget-app');
+      state.cloneAnswer = { ok: true, started: true, staticLayout: true };
+      await redispatchClones(connect(STATIC));
+      expect(project().dir).toBe('/home/alice/code/widget-app');
+    });
+
+    it("keeps the project's own directory when the box says the path is taken", async () => {
+      await fromEnvironment();
+      state.cloneAnswer = { ok: true, started: true, staticLayout: false, staticRefused: '/home/alice/code/widget already exists' };
+      await redispatchClones(connect(STATIC));
+      expect(project().dir).toBeNull();
+    });
+
+    it('is not asked for on a box with another project, of an older agent, or for a project not from an environment', async () => {
+      await fromEnvironment();
+      db.projects.push({ id: 'other', instanceId: 'box1', archived: false, name: 'other', userId: 'u1' });
+      await redispatchClones(connect(STATIC));
+      db.projects = db.projects.filter(p => p.id !== 'other');
+      project().setupAttempt += 1;
+      await redispatchClones(connect(CAPABLE));
+      project().environmentId = null;
+      project().setupAttempt += 1;
+      await redispatchClones(connect(STATIC));
+      const clones = state.sent.filter(s => s.type === 'project-clone');
+      expect(clones).toHaveLength(3);
+      for (const c of clones) expect(c.payload.staticDir).toBeUndefined();
+    });
+
+    it('starts the steps in the static checkout, and start empty forgets it', async () => {
+      await fromEnvironment();
+      state.cloneAnswer = { ok: true, started: true, staticLayout: true };
+      await redispatchClones(connect(STATIC));
+      expect(project().dir).toBe('/home/alice/code/widget');
+      // A ready clone's launch asks the box to run the steps in the checkout itself, not through the link.
+      await applySetupEvent({ projectId: 'p1', instanceId: 'box1' }, report(0, 'ready', { branch: 'main' }));
+      expect(environmentStarts).toEqual([{ id: 'p1', dir: '/home/alice/code/widget' }]);
+      project().setupStatus = 'failed';
+      state.sent = [];
+      await startEmptyFor(user, 'p1');
+      expect(project().dir).toBeNull();
+      // Start empty's own launch runs the steps in the project's own directory, not the abandoned checkout
+      // (Bugbot, #1452): the effects share one row, so the row must forget the checkout too.
+      expect(environmentStarts[1]).toEqual({ id: 'p1', dir: DIR });
+      // The project directory is a link into that checkout: the box drops the link before making the empty
+      // directory, so mkdir and init-wiki never write into the clone (Bugbot, #1452).
+      expect(state.sent.find(s => s.type === 'mkdir')?.payload).toEqual({ dir: DIR, dropLinkTo: '/home/alice/code/widget' });
+    });
+
+    it("start empty on a project with no static checkout makes its directory as before", async () => {
+      await createWidget();
+      project().setupStatus = 'failed';
+      state.agent = { capabilities: CAPABLE, helloReceived: true };
+      await startEmptyFor(user, 'p1');
+      expect(state.sent.find(s => s.type === 'mkdir')?.payload).toEqual({ dir: DIR });
+    });
   });
 
   it('dispatches a known template with its baked clone as the reference', async () => {

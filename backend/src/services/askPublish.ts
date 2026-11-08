@@ -11,8 +11,7 @@
  * these checks bind runs that go through this path, not one that goes around it.
  *
  * Checks that refuse the whole bundle: one to MAX_ASK_PRS heads, each the
- * run's own branch or a pr/<key>; it applies on the base; at most
- * MAX_BUNDLE_COMMITS commits in all.
+ * run's own branch or a pr/<key>; it applies on the base.
  *
  * Each branch is judged on the PR's own changes. Its base branch is what its
  * PR would merge into (its PR's base on GitHub, else the repo's default
@@ -40,15 +39,15 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { findSecrets, findSecretsInText } from './secretPatterns';
+import { WORKFLOW_SCOPE_HINT, workflowScopeRefusal } from './workflowScope';
 import { MAX_ASK_PRS, askBranch, askPrKeyOfRef, capDescription, commitDescription, replaceMarkedBody, splitDescription } from './agentMessages';
 
-export const MAX_COMMITS = 200;
 /**
- * The cap on a bundle's commits in all, the base branch's included: a thread
- * with an old base carries every base-branch commit since. MAX_COMMITS caps
- * each branch's own.
+ * The cap on each branch's own commits (on an existing PR, the ones the run
+ * adds). There is none on the bundle's commits in all: the base branch's,
+ * which a merge of it brings in, never refuse it.
  */
-export const MAX_BUNDLE_COMMITS = 2000;
+export const MAX_COMMITS = 200;
 /** The most compare calls one publish makes before it gives up. */
 export const MAX_BASE_LOOKUPS = 400;
 
@@ -253,9 +252,11 @@ async function publishIn(dir: string, cfg: PublishConfig, input: PublishInput): 
   } catch (err) {
     return { kind: 'refused', reason: `the bundle does not apply on the base commit: ${lastLine((err as GitError).stderr ?? '')}` };
   }
+  // No cap on the bundle's commits in all: a merge of the base branch carries
+  // every base-branch commit since the thread's base, and those must not
+  // refuse it. Each branch's own commits are capped (MAX_COMMITS), the
+  // bundle's size by MAX_BUNDLE_BYTES, and GitHub lookups by MAX_BASE_LOOKUPS.
   await git(repoDir, env, ['fetch', '-q', '--no-tags', bundlePath, ...heads.map((h, i) => `${h.ref}:refs/termag/tip${i}`)]);
-  const total = Number((await git(repoDir, env, ['rev-list', '--count', ...heads.map(h => h.tip), `^${input.baseSha}`])).trim());
-  if (total > MAX_BUNDLE_COMMITS) return { kind: 'refused', reason: `${total} commits is more than ${MAX_BUNDLE_COMMITS}` };
   const bases = baseBranchesOnGithub(cfg, input.repo, input.token);
   // The run's own branch goes to an existing PR: the one --update-pr named (or
   // a turn found before), else the one open PR of the asker's it builds on.
@@ -357,11 +358,17 @@ async function publishHead(
     else diffs.push([ps[sides.indexOf(true)], c]);
   }
   // And the PR as a whole: from its merge base with the base branch. Another
-  // PR's commits stop at base-branch commits fetched one by one, whose order
-  // git can't see, so GitHub's compare drops each one older than another.
-  const mergeBases = target
-    ? await base.independent([...onBase, ...(await isAncestor(input.baseSha, tip) ? [input.baseSha] : [])])
-    : (await git(repoDir, env, ['merge-base', '--independent', input.baseSha, ...onBase])).split('\n').filter(Boolean);
+  // PR's commits stop at base-branch commits fetched one by one, and the base
+  // is fetched shallow, so git can't see their order: one it keeps may be an
+  // old commit of the base branch, and the diff from it would read all of the
+  // base branch's changes since as the PR's. GitHub's compare drops each one
+  // older than another. Git drops first the ones it can tell are older (an
+  // ancestor it sees is one), so GitHub is asked only about the rest.
+  const candidates = [...new Set([...onBase, ...(!target || await isAncestor(input.baseSha, tip) ? [input.baseSha] : [])])];
+  const local = candidates.length > 1
+    ? (await git(repoDir, env, ['merge-base', '--independent', ...candidates])).split('\n').filter(Boolean)
+    : candidates;
+  const mergeBases = local.length > 1 ? await base.independent(local) : local;
   const commits = checked.length;
 
   // Raw names, NUL-separated: a line-based listing C-quotes any path with a
@@ -412,6 +419,9 @@ async function publishHead(
     if (/non-fast-forward|fetch first|\[rejected\]/i.test(stderr)) {
       return refuse(`${branch} moved on GitHub since the last turn; not overwriting it (${why})`);
     }
+    // git's last line is only "failed to push some refs": name GitHub's refusal, and what to do about it.
+    const refusal = workflowScopeRefusal(stderr);
+    if (refusal) return { kind: 'failed', key, branch, reason: `push to ${input.repo} failed: ${refusal}. ${WORKFLOW_SCOPE_HINT}` };
     return { kind: 'failed', key, branch, reason: `push to ${input.repo} failed: ${why}` };
   }
 

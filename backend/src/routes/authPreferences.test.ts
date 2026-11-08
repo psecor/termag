@@ -3,6 +3,7 @@ import type { Request, RequestHandler, Response, Router } from 'express';
 import { authRouter } from './auth';
 import { prisma } from '../db';
 import { DEFAULT_THEME } from '../theme/schema';
+import { forgetUserTimeZones } from '../services/userTimeZone';
 
 vi.mock('../db', () => ({ prisma: { user: { upsert: vi.fn(), update: vi.fn() } } }));
 const ld = vi.hoisted(() => ({ on: false }));
@@ -70,6 +71,18 @@ describe('PUT /auth/me/preferences', () => {
     expect(after.res.json).toHaveBeenCalledWith(expect.objectContaining({ uiMode: 'full' }));
   });
 
+  it("keeps the zone the browser sends at sign-in (GET /me?tz=) as User.timeZone, and ignores one that is not a zone", async () => {
+    forgetUserTimeZones();
+    const res = { status: vi.fn(), json: vi.fn() } as unknown as Response & { status: ReturnType<typeof vi.fn> };
+    res.status.mockReturnValue(res);
+    await me({ user: { ...storedUser, timeZone: null }, query: { tz: 'Europe/Berlin' } } as unknown as Request, res, () => {});
+    await vi.waitFor(() => expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'u1' }, data: { timeZone: 'Europe/Berlin' } }));
+    vi.mocked(prisma.user.update).mockClear();
+    await me({ user: { ...storedUser, id: 'u2', timeZone: null }, query: { tz: 'Mars/Olympus' } } as unknown as Request, res, () => {});
+    await new Promise(r => setTimeout(r, 10));
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
   it('takes only simple, full or null for it', async () => {
     ld.on = true;
     const { res } = await call(put, { uiMode: 'lab' });
@@ -89,12 +102,12 @@ describe('PUT /auth/me/preferences', () => {
     const { req, res } = await call(put, { theme });
     expect(prisma.user.update).toHaveBeenCalledWith({
       where: { id: 'u1' },
-      data: { theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false } },
+      data: { theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarAskChats: false, sidebarHideAskBoxes: false } },
     });
-    expect(req.user?.theme).toEqual({ version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false });
+    expect(req.user?.theme).toEqual({ version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarAskChats: false, sidebarHideAskBoxes: false });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       defaultAgentProvider: 'codex',
-      theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false },
+      theme: { version: 1, background: { mode: 'solid', color: '#0b1a2e' }, sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarAskChats: false, sidebarHideAskBoxes: false },
     }));
   });
 
@@ -131,7 +144,7 @@ describe('PUT /auth/me/preferences', () => {
     const lightUser = { ...storedUser, theme: { version: 1, background: { mode: 'hyperspace' }, palette: 'light', sidebarActivity: true, sidebarMetaTerm: false } };
     const stale = { version: 1, background: { mode: 'solid', color: '#000000' } };
     const { res } = await call(put, { theme: stale }, lightUser as unknown as Express.User);
-    const expected = { version: 1, background: { mode: 'solid', color: '#000000' }, palette: 'light', sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarHideAskBoxes: false };
+    const expected = { version: 1, background: { mode: 'solid', color: '#000000' }, palette: 'light', sidebarActivity: true, sidebarMetaTerm: false, sidebarShowStopped: false, sidebarAskChats: false, sidebarHideAskBoxes: false };
     expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'u1' }, data: { theme: expected } });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ theme: expected }));
   });
@@ -198,6 +211,22 @@ describe('PUT /auth/me/preferences', () => {
     const { res } = await call(put, { pushMutesChat: 'yes' });
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({ error: expect.stringMatching(/pushMutesChat/) });
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('serves boxIdleNotify from /me, reading a row without it as on, and stores a choice', async () => {
+    const { res } = await call(me, undefined);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ boxIdleNotify: true }));
+    const { req, res: res2 } = await call(put, { boxIdleNotify: false });
+    expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'u1' }, data: { boxIdleNotify: false } });
+    expect(req.user?.boxIdleNotify).toBe(false);
+    expect(res2.json).toHaveBeenCalledWith(expect.objectContaining({ boxIdleNotify: false }));
+  });
+
+  it('rejects a non-boolean boxIdleNotify and writes nothing', async () => {
+    const { res } = await call(put, { boxIdleNotify: 'off' });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringMatching(/boxIdleNotify/) });
     expect(prisma.user.update).not.toHaveBeenCalled();
   });
 

@@ -37,7 +37,7 @@ vi.mock('./agentRegistry', () => ({
   instanceAgentTransport: vi.fn(() => ({ conn: {}, capabilities: [], agentCommit: null, agentCommitAt: null, helloReceived: true })),
   sendForProject,
 }));
-vi.mock('./agentSpawnStore', () => ({ claimSpawnLaunch: vi.fn(async () => null), releaseSpawnLaunch: vi.fn(async () => {}), isParkedSpawn: vi.fn(async () => false), unparkOnLaunch: vi.fn(async () => {}) }));
+vi.mock('./agentSpawnStore', () => ({ claimSpawnLaunch: vi.fn(async () => null), releaseSpawnLaunch: vi.fn(async () => {}), isParkedSpawn: vi.fn(async () => false), unparkOnLaunch: vi.fn(async () => {}), spawnTelemetryFor: vi.fn(async () => null) }));
 vi.mock('./agentHandoffStore', () => ({ claimHandoffLaunch: vi.fn(async () => null), releaseHandoffLaunch: vi.fn(async () => {}) }));
 // The fireworks-models flag for the owner and box (null = Fireworks off).
 const fireworksFlag = vi.hoisted(() => ({ value: null as unknown }));
@@ -51,6 +51,7 @@ const { ensureAgentSessionsAndLaunch, reconstructInstanceSessions, withPaneLock,
 setPaneLaunchSettleForTests(0);
 const { claimSpawnLaunch } = await import('./agentSpawnStore');
 const { claimHandoffLaunch, releaseHandoffLaunch } = await import('./agentHandoffStore');
+const { RESUME_FALLBACK_NOTICE } = await import('./launchCommand');
 
 const launch = { userId: 'u1', unixUsername: 'alice', projectName: 'research', provider: 'claude', instanceId: 'box1', workstream: 'main', hostHome: '/home/alice' };
 const typed = () => state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys);
@@ -204,7 +205,7 @@ describe('reconnect reconstruction', () => {
 
   it('resumes as before when there is no handoff, and releases one whose launch fails', async () => {
     await reconstructInstanceSessions('box1', 'u1', 'alice');
-    expect(typed()).toEqual([`${K}claude --continue`]);
+    expect(typed()).toEqual([`{ ${K}claude --continue; } || { [ $? -eq 1 ] && echo '${RESUME_FALLBACK_NOTICE}' && ${K}claude; }`]);
     state.sent = [];
     state.foreground = 'zsh'; // the resumed agent exited again
     vi.mocked(claimHandoffLaunch).mockResolvedValueOnce(handoff);
@@ -218,5 +219,30 @@ describe('reconnect reconstruction', () => {
     vi.mocked(isParkedSpawn).mockResolvedValueOnce(true);
     await reconstructInstanceSessions('box1', 'u1', 'alice');
     expect(typed()).toEqual([]);
+  });
+});
+
+describe('a Codex pane of a spawned workstream', () => {
+  const spawn = { id: 'ckspawn0001', root: 'ckroot00001', depth: 2, parentProject: 'termag', parentWorkstream: 'main', parentBox: 'box00001' };
+  const started = () => state.sent.filter(s => s.type === 'codex-session-start').map(s => s.payload);
+
+  it('names its spawn in codex-session-start, on a launch and on a reconnect', async () => {
+    const { spawnTelemetryFor } = await import('./agentSpawnStore');
+    vi.mocked(spawnTelemetryFor).mockResolvedValue(spawn);
+    await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex' });
+    expect(started()).toEqual([expect.objectContaining({ project: 'research', workstream: 'main', spawn })]);
+    state.sent = [];
+    vi.mocked(prisma.project.findMany).mockResolvedValueOnce([{
+      id: 'p1', name: 'research', setupStatus: 'ready', instance: { hostHome: '/home/alice' },
+      workflows: [{ type: 'agent', provider: 'codex', workstream: { name: 'main' } }],
+    }]);
+    await reconstructInstanceSessions('box1', 'u1', 'alice');
+    expect(started()).toEqual([expect.objectContaining({ project: 'research', workstream: 'main', spawn })]);
+    vi.mocked(spawnTelemetryFor).mockResolvedValue(null);
+  });
+
+  it('sends no spawn for a workstream no spawn made', async () => {
+    await ensureAgentSessionsAndLaunch({ ...launch, provider: 'codex' });
+    expect(started()).toEqual([expect.not.objectContaining({ spawn: expect.anything() })]);
   });
 });

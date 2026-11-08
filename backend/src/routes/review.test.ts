@@ -8,12 +8,15 @@ import type { Server } from 'http';
 const agent = vi.hoisted(() => ({ answers: {} as Record<string, (p: Record<string, unknown>) => unknown>, calls: [] as string[], log: [] as Array<{ type: string; payload: Record<string, unknown> }> }));
 // The sweep's records by review session, and what the start route filed (slot by slot).
 const sweep = vi.hoisted(() => ({ records: new Map<string, { pr: number; url: string | null }>(), registered: [] as Array<{ slot: number; reviewSession: string }>, cleared: [] as string[] }));
+// The project's box: its status is what the parked-box tests change (a wake, its owner).
+const db = vi.hoisted(() => ({ instance: { id: 'i-1', name: 'termag-20', userId: 'u1', hostHome: '/home/u', status: 'running' } }));
+const setup = vi.hoisted(() => ({ status: 'ready' }));
 vi.mock('../db', () => ({
   prisma: {
     project: {
       findUnique: async () => ({
-        id: 'p1', name: 'sample', setupStatus: 'ready',
-        user: { unixUsername: 'u' }, instance: { hostHome: '/home/u', status: 'running' },
+        id: 'p1', name: 'sample', setupStatus: setup.status,
+        user: { unixUsername: 'u' }, instance: { ...db.instance },
       }),
     },
   },
@@ -57,6 +60,7 @@ vi.mock('../middleware/auth', () => ({
 
 import { decodePrOption, encodePrOption } from '../services/review';
 const { reviewRouter } = await import('./review');
+const { HeldReviewStarts } = await import('../services/reviewHeld');
 const { setPaneLaunchSettleForTests } = await import('../services/agentRuntime');
 // Launches here follow one another into the same pane; the post-launch settle would only add waits.
 setPaneLaunchSettleForTests(0);
@@ -313,5 +317,100 @@ describe('review routes: several panes (docs/parallel-reviews.md)', () => {
     // No session: slot 1, as an older client means.
     r = await fetch(`${base}?workstream=main`, { method: 'DELETE' });
     expect(await r.json()).toMatchObject({ session: 'u-sample-review' });
+  });
+});
+
+describe('review start on a parked box (box-wake-on-action-enabled)', () => {
+  let server: Server;
+  let base: string;
+  let wakeOn = true;
+  const startBox = vi.fn(async () => ({ status: 202, body: { ok: true, status: 'starting' } }));
+  const held = new HeldReviewStarts({ boxStatus: async () => db.instance.status, now: () => 0 }, 0);
+  beforeAll(async () => {
+    const app = express();
+    app.use(express.json());
+    app.use('/api', reviewRouter({ parallelOn: async () => false, wakeOn: async () => wakeOn, startBox, held, boxStatus: async () => db.instance.status }));
+    server = app.listen(0);
+    await new Promise(r => server.once('listening', r));
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/projects/p1/review`;
+  });
+  afterAll(() => { server.close(); db.instance.status = 'running'; db.instance.userId = 'u1'; });
+  beforeEach(() => {
+    wakeOn = true;
+    startBox.mockClear();
+    held.reset();
+    db.instance.status = 'stopped';
+    db.instance.userId = 'u1';
+    agent.calls = [];
+    agent.answers = {
+      'git-branch-state': () => ({ branch: 'main', origin: 'https://github.com/example-org/termag.git' }),
+      'read-file': () => ({ ok: true, content: null }),
+      'write-file': () => ({ ok: true }),
+      'tmux-has-session': () => ({ exists: false }),
+      'tmux-create': () => ({ ok: true }),
+      'tmux-set-user-option': () => ({ ok: true }),
+      'tmux-send-keys': () => ({ ok: true }),
+    };
+  });
+  const post = (body: unknown) => fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const ask = { workstream: 'main', pr: 4242, url: 'https://github.com/example-org/termag/pull/4242' };
+
+  it('wakes your stopped box, holds the start (202), and runs it once the box is ready', async () => {
+    const r = await post(ask);
+    expect(r.status).toBe(202);
+    expect(await r.json()).toMatchObject({ held: true, box: 'termag-20', state: 'waking', pr: 4242, reviewer: 'devin', session: 'u-sample-review', url: 'https://github.com/example-org/termag/pull/4242' });
+    expect(startBox).toHaveBeenCalledWith({ id: 'u1' }, 'i-1');
+    expect(agent.calls).not.toContain('tmux-create');
+    expect((await (await fetch(`${base}/held?workstream=main`)).json()).held).toMatchObject({ state: 'waking', box: 'termag-20' });
+
+    // Still coming up: nothing runs.
+    db.instance.status = 'starting';
+    await held.sweep();
+    expect(agent.calls).not.toContain('tmux-create');
+    // Ready: the start runs as asked, and nothing is held any more.
+    db.instance.status = 'ready';
+    await held.sweep();
+    expect(agent.calls).toContain('tmux-create');
+    expect((await (await fetch(`${base}/held?workstream=main`)).json()).held).toBeNull();
+  });
+
+  it('says only its owner can wake a box that is someone else\'s', async () => {
+    db.instance.userId = 'someone-else';
+    const r = await post(ask);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toBe('termag-20 is stopped, and only its owner can start it. Ask them to, then Review again.');
+    expect(startBox).not.toHaveBeenCalled();
+  });
+
+  it('holds the start when another start beat this one to the box', async () => {
+    startBox.mockImplementationOnce(async () => { db.instance.status = 'starting'; return { status: 409, body: { error: "Can't start a box that is starting" } }; });
+    const r = await post(ask);
+    expect(r.status).toBe(202);
+    expect((await (await fetch(`${base}/held?workstream=main`)).json()).held).toMatchObject({ state: 'waking', woken: false, beaten: true });
+  });
+
+  it('says what to do when the start path refuses the wake', async () => {
+    startBox.mockResolvedValueOnce({ status: 409, body: { error: 'This box is being terminated automatically' } } as never);
+    const r = await post(ask);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toBe("Couldn't wake termag-20: This box is being terminated automatically. Start it from your boxes, then Review again.");
+    expect((await (await fetch(`${base}/held?workstream=main`)).json()).held).toBeNull();
+  });
+
+  it('says the checkout isn\'t there rather than waking the box for a project whose clone failed', async () => {
+    setup.status = 'failed';
+    const r = await post(ask);
+    expect(r.status).toBe(409);
+    expect(startBox).not.toHaveBeenCalled();
+    expect((await (await fetch(`${base}/held?workstream=main`)).json()).held).toBeNull();
+    setup.status = 'ready';
+  });
+
+  it('refuses as before with the flag off', async () => {
+    wakeOn = false;
+    const r = await post(ask);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toBe('This box is stopped. Start it from the Boxes list first.');
+    expect(startBox).not.toHaveBeenCalled();
   });
 });

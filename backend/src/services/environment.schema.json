@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/example-org/termag/blob/main/docs/environment.schema.json",
+  "title": "termag environment definition",
+  "description": "What an agent needs to work on a set of repositories: the repositories, the box's resources, how to set it up and run it, the ports it serves and the names of the secrets its steps need. It is a .termag/environment.json in a repository, a file an environment points at (repo : branch : path), or an inline environment's definition. termag reads repos and resources when a box is made, and the box runs setup, run, ports, seed, stop and secrets (\"The steps\"); slots, env, envFile and host are not used yet. Unknown keys are ignored.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "This schema's URL, for editors. Ignored by termag."
+    },
+    "repos": {
+      "type": "array",
+      "description": "The repositories a project made from this environment holds, in checkout order. Two or more make a multi-repo project. In a file an environment points at, the file's own repository is included whether it is listed or not.",
+      "maxItems": 8,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/repoName" },
+          {
+            "type": "object",
+            "properties": {
+              "repo": { "$ref": "#/$defs/repoName" },
+              "branch": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_./-]+$", "description": "The branch the checkout tracks. Absent, the repository's default branch." },
+              "path": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$", "description": "The checkout's directory: on a box made from the environment, ~/code/<path>; in a multi-repo project, its directory under the project. Absent, the repository's name." }
+            },
+            "required": ["repo"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "resources": {
+      "description": "The box's size: a preset, or minimums EC2 matches to a Graviton m/r type. An explicit --size or picker choice wins over it.",
+      "oneOf": [
+        { "type": "string", "enum": ["small", "medium", "large"], "description": "small is 2 vCPU / 8 GiB, medium 4 / 16, large 8 / 32." },
+        {
+          "type": "object",
+          "properties": {
+            "vcpu": { "type": "integer", "minimum": 1, "maximum": 8, "description": "At least this many vCPUs (at most 8)." },
+            "memoryGiB": { "type": "integer", "minimum": 1, "maximum": 32, "description": "At least this much memory, in GiB (at most 32)." },
+            "diskGiB": { "type": "integer", "minimum": 50, "maximum": 300, "description": "The root disk, in GiB (50 to 300), of a new box made from it." }
+          },
+          "required": ["vcpu", "memoryGiB"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "base": {
+      "type": "string",
+      "enum": ["full", "empty"],
+      "default": "full",
+      "description": "full: termag's whole box. empty: termag's core only, and setup does the rest. The owner confirms it at creation; an explicit choice wins."
+    },
+    "setup": { "$ref": "#/$defs/step", "description": "An idempotent, incremental bootstrap after checkout: system packages, dependencies, codegen. It gets no secrets, even ones secrets names, and no owner identity: an environment pool runs it before the box has an owner. termag runs it again whenever a repository's HEAD has moved since it last succeeded, so a rerun should do only what changed. A string runs in the file's repository; a map runs each repository's command in its checkout, in the order written." },
+    "run": { "$ref": "#/$defs/step", "description": "Brings the app up. A string runs in the file's repository; a map starts every entry at once, each in its own tmux window." },
+    "seed": { "$ref": "#/$defs/step", "description": "Optional, after run: demo data and fixtures. A string or a repository → command map, run in order." },
+    "stop": { "$ref": "#/$defs/step", "description": "Optional: what termag-env down runs before it closes the session, for a run that daemonizes. A string or a repository → command map, run in order; a failing stop is logged and the session closes anyway." },
+    "ports": {
+      "type": "array",
+      "description": "What run serves, and how to tell it is up. The first is what a preview opens.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "description": "What the port is, e.g. frontend." },
+          "port": {
+            "description": "The port, or per slot: base + step × (slot − 1).",
+            "oneOf": [
+              { "type": "integer", "minimum": 1, "maximum": 65535 },
+              {
+                "type": "object",
+                "properties": {
+                  "base": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                  "step": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["base", "step"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "health": { "type": "string", "pattern": "^/", "description": "A path that answers once the port is up, e.g. /api/health." },
+          "path": { "type": "string", "pattern": "^/", "description": "The page the port's link and a preview open, e.g. /termag/. Absent, /." }
+        },
+        "required": ["name", "port"],
+        "additionalProperties": false
+      }
+    },
+    "secrets": {
+      "type": "array",
+      "description": "Names of the environment variables run and seed need, resolved by termag's credential delivery. Names only, never values. setup never gets them.",
+      "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" },
+      "uniqueItems": true
+    },
+    "slots": {
+      "type": "object",
+      "description": "One instance per workstream on a box, slot 1..max; slot 1 is the owner's. Without slots, one instance per box.",
+      "properties": { "max": { "type": "integer", "minimum": 1, "maximum": 8 } },
+      "required": ["max"],
+      "additionalProperties": false
+    },
+    "env": {
+      "type": "object",
+      "description": "Variables for every step. ${slot} and resolved secrets are expanded.",
+      "additionalProperties": { "type": "string" }
+    },
+    "envFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A gitignored file, relative to the file's repository, that termag also writes env and resolved secrets into, in a managed block."
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The loopback address the ports are on; ${slot} is expanded. Default 127.0.0.1."
+    }
+  },
+  "$defs": {
+    "repoName": {
+      "type": "string",
+      "pattern": "^[\\w.-]+/[\\w.-]+$",
+      "description": "A GitHub repository, owner/name."
+    },
+    "step": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/repoName" },
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "minProperties": 1
+        }
+      ]
+    }
+  }
+}

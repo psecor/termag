@@ -60,6 +60,47 @@ export function brokerTarget(method: string, path: string, search: string): Brok
   return { kind: 'git', logPath: `/${owner}/${repo}/${suffix}` };
 }
 
+/**
+ * The repository a push goes to, as owner/name, for the `github.push` product
+ * event (docs/agents/observability.md): a smart-HTTP POST to git-receive-pack,
+ * which git sends once per push that has something to send. Null for anything
+ * else (a fetch, the ref advertisement before a push, an API call). The
+ * broker sees the request before GitHub answers it, so a push that GitHub
+ * then rejects (a protected branch, a non-fast-forward) is counted too.
+ */
+export function pushRepo(method: string, target: BrokerTarget): string | null {
+  if (target.kind !== 'git' || method.toUpperCase() !== 'POST') return null;
+  const m = /^\/([^/]+)\/([^/]+)\/git-receive-pack$/.exec(target.logPath);
+  return m ? `${m[1]}/${m[2].replace(/\.git$/i, '')}` : null;
+}
+
+/**
+ * The account or organization a request names, lower-cased: git's
+ * `/<owner>/<repo>/…`, REST's `/repos/<owner>/…` and `/orgs/<org>…`. Null for
+ * anything else (GraphQL, `/user`, `/repositories/<id>`), which names no owner
+ * the broker can read without GitHub.
+ */
+export function targetOwner(target: BrokerTarget): string | null {
+  if (target.kind === 'git') return /^\/([^/]+)\//.exec(target.logPath)?.[1].toLowerCase() ?? null;
+  if (target.kind !== 'api') return null;
+  const path = canonicalRestPath(target.logPath);
+  const m = path ? /^\/(?:repos|orgs)\/([^/~]+)(?:\/|$)/.exec(path) : null;
+  return m ? m[1] : null;
+}
+
+/**
+ * The refusal for a request to an org whose SAML SSO has not authorized the
+ * owner's stored token. GitHub would answer it with a 403 about a "Personal
+ * Access token" that the box does not have; this says which token, and how to
+ * fix it.
+ */
+export function ssoRequiredMessage(org: string, ssoUrl: string | null): string {
+  const url = ssoUrl ?? `https://github.com/orgs/${org}/sso`;
+  return `The GitHub token you connected in termag Settings is not authorized for the ${org} organization's SAML SSO, ` +
+    `so GitHub refuses it. Authorize it for ${org} at ${url}, then try again. ` +
+    'If it still fails, press Re-check under GitHub in termag Settings.';
+}
+
 // Credential minting and persistence, access grants, and admin or destructive
 // operations. Matched on the upstream REST path, case-insensitively.
 const ALWAYS_BLOCKED: RegExp[] = [

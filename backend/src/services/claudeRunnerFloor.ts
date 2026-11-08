@@ -26,7 +26,9 @@ export async function runnerFloors(owner: User, boxes: FloorBox[]): Promise<Map<
     const installed = new Map(rows.map(r => [r.hostKey, r.ok ? r.version : null]));
     await Promise.all(boxes.map(async b => {
       const box = { id: b.id, name: b.name, kind: b.kind };
-      const [policy, enforce] = await Promise.all([claude.policy(owner, box), claude.enabled(owner, box)]);
+      // One read of the policy: its floor, and whether updating is on (its mode not off).
+      const policy = await claude.policy(owner, box);
+      const enforce = await claude.enabled(owner, box, policy);
       out.set(b.id, claudeFloorDecision({ floor: policy.floor, installed: installed.get(b.id) ?? null, wrapperFloor: !!b.wrapperFloor, enforce }));
     }));
   } catch (err) {

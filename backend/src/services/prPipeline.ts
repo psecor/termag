@@ -5,13 +5,13 @@
  * prPipelineGithub.ts, the assembly in routes/prs.ts.
  *
  * Lanes left to right are the order work moves. `merged` is the terminal lane
- * for repositories other than this deployment's termag (TERMAG_REPO), which v1 cannot follow to a
+ * for repositories other than example-org/termag, which v1 cannot follow to a
  * deploy; termag's merges go to `merged_not_deployed` or `deployed` instead.
  */
 
-// The repository whose merges the pipeline can follow to a deploy: this
-// deployment's own termag. TERMAG_REPO overrides the public default.
-export const TERMAG_REPO = process.env.TERMAG_REPO?.trim() || 'psecor/termag';
+import type { PrReviewers } from './prPipelineGithub';
+
+export const TERMAG_REPO = 'example-org/termag';
 
 export const LANES = [
   { id: 'in_progress', label: 'In progress' },
@@ -71,6 +71,8 @@ export interface OpenPr {
   requestedAt?: string | null;
   /** A pending request names the viewer, not only one of their teams; review-requested search only. */
   requestedYou?: boolean;
+  /** Who has reviewed it (latest approval or request for changes per person, bots apart); review-requested search only. */
+  reviewers?: PrReviewers;
 }
 
 /** A merged pull request from the last 14 days. */
@@ -160,6 +162,14 @@ export interface PrRow {
    * first. Absent elsewhere.
    */
   askedYou?: boolean;
+  /**
+   * An open PR's GitHub review decision (APPROVED, CHANGES_REQUESTED,
+   * REVIEW_REQUIRED, or null when the repo requires no review), in every lane:
+   * a review group's member can be the user's own PR. Absent from merged and branch rows.
+   */
+  reviewDecision?: string | null;
+  /** The review lanes: who has reviewed it, null when unread. Absent elsewhere. The Reviews page filters on both. */
+  reviewers?: PrReviewers | null;
   /** The review lanes: where "Review with Devin" runs: the linked workstream, else main of a project on the PR's repo. */
   reviewTarget: WorkstreamLink | null;
 }
@@ -224,7 +234,8 @@ export function openRow(pr: OpenPr, lane: LaneId): PrRow {
     deploy: null,
     workstream: null,
     requestedAt: isReviewLane(lane) ? pr.requestedAt ?? null : null,
-    ...(isReviewLane(lane) ? { askedYou: lane === 'needs_my_review' } : {}),
+    reviewDecision: pr.reviewDecision,
+    ...(isReviewLane(lane) ? { askedYou: lane === 'needs_my_review', reviewers: pr.reviewers ?? null } : {}),
     reviewTarget: null,
   };
 }
@@ -465,3 +476,4 @@ export function assignLanes(input: PipelineInput): PrRow[] {
 export function groupByLane(rows: PrRow[]): { id: LaneId; label: string; rows: PrRow[] }[] {
   return LANES.map(l => ({ id: l.id, label: l.label, rows: rows.filter(r => r.lane === l.id) }));
 }
+

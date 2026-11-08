@@ -20,9 +20,12 @@
  * The runner orchestrator runs no turns, so a run try-restarts it whatever the
  * admin chose; host users' sessions on the old binary are counted, never
  * stopped (the restart choice is `none` only). Gated twice: the tool's own
- * flag (claude-code-update-enabled) and orchestrator-claude-update-enabled,
- * both read for the admin and the orchestrator's fixed box context. The
- * nightly run (leader work, below) reads the second for that context alone.
+ * enabled (claude-code-update-policy's mode, for the admin and the
+ * orchestrator's fixed box context) and the host's
+ * (orchestrator-claude-update-policy's mode, read for the orchestrator's
+ * context). The nightly run (leader work, below) needs the host's mode auto
+ * and Claude Code's not off, for that context alone (gate.ts). A missing or
+ * malformed mode is off.
  */
 import { execFile } from 'child_process';
 import { existsSync, promises as fs } from 'fs';
@@ -30,16 +33,16 @@ import path from 'path';
 import type { SoftwareUpdateRun, User } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
-import { boolVariation, boolVariationForContext, jsonVariationForContext } from '../featureFlags';
+import { jsonVariationForContext } from '../featureFlags';
 import type { FlagBox } from '../featureFlags';
 import { selfInventory } from '../software/collector';
-import { CLAUDE_UPDATE_POLICY_FLAG, isClaudeVersion, parseClaudeUpdatePolicy, type ClaudeUpdateRestart } from '../claudeUpdatePolicy';
-import { TOOL_REGISTRY, type ToolDescriptor } from './components';
+import { CLAUDE_UPDATE_POLICY_FLAG, isClaudeVersion, parseClaudeUpdatePolicy, parseUpdateMode, type ClaudeUpdateRestart, type ToolUpdateMode } from '../claudeUpdatePolicy';
+import { TOOL_REGISTRY, type ToolDescriptor, type ToolUpdatePolicy } from './components';
+import { modeAuto, modeEnabled } from './gate';
 import { isInFlight, isRunId, parseToolUpdateReport, reportCreate, reportUpdate, type RunTrigger } from './run';
 
 export const ORCHESTRATOR_HOST = 'orchestrator';
-export const ORCHESTRATOR_CLAUDE_UPDATE_FLAG = 'orchestrator-claude-update-enabled';
-/** The orchestrator host's own target: `{target: "x.y.z" | null}`, read for its fixed box context. */
+/** The orchestrator host's own policy: `{mode?, target: "x.y.z" | null}`, read for its fixed box context. */
 export const ORCHESTRATOR_CLAUDE_POLICY_FLAG = 'orchestrator-claude-update-policy';
 /** The orchestrator host as a flag's box context: a manual run reads it with the admin, the nightly run alone. */
 export const ORCHESTRATOR_LD_BOX: FlagBox = { id: 'termag-orchestrator', name: 'orchestrator', kind: 'orchestrator' };
@@ -63,13 +66,46 @@ export function orchestratorCapable(exists: (p: string) => boolean = existsSync)
   return exists(ORCHESTRATOR_UPDATE_HELPER) && exists(ORCHESTRATOR_UPDATE_UNIT_PATH);
 }
 
-/** Both flags, for the admin asking and the orchestrator. */
-export async function orchestratorUpdateEnabled(tool: ToolDescriptor, admin: User): Promise<boolean> {
-  const [toolOn, hostOn] = await Promise.all([
-    tool.enabled(admin, ORCHESTRATOR_LD_BOX),
-    boolVariation(ORCHESTRATOR_CLAUDE_UPDATE_FLAG, admin, false, ORCHESTRATOR_LD_BOX),
+/**
+ * The two policy flags one decision about the orchestrator host reads, each
+ * once: the tool's (claude-code-update-policy, for the admin and the
+ * orchestrator's fixed box context, or that context alone for the nightly
+ * run) and orchestrator-claude-update-policy's raw value (for the
+ * orchestrator's context, as always), whose mode and target are parsed from it.
+ */
+export interface OrchestratorFlags { shared: ToolUpdatePolicy; host: unknown }
+
+export async function orchestratorFlags(tool: ToolDescriptor, admin: User | null): Promise<OrchestratorFlags> {
+  const [shared, host] = await Promise.all([
+    admin ? tool.policy(admin, ORCHESTRATOR_LD_BOX) : jsonVariationForContext(CLAUDE_UPDATE_POLICY_FLAG, ORCHESTRATOR_LD_CONTEXT, null).then(v => parseClaudeUpdatePolicy(v)),
+    jsonVariationForContext(ORCHESTRATOR_CLAUDE_POLICY_FLAG, ORCHESTRATOR_LD_CONTEXT, null),
   ]);
-  return toolOn && hostOn;
+  return { shared, host };
+}
+
+/** orchestrator-claude-update-policy's `mode` (gate.ts): off when it has none, or a malformed one. */
+export function parseOrchestratorMode(value: unknown): ToolUpdateMode {
+  const v = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).mode : null;
+  return parseUpdateMode(v, ORCHESTRATOR_CLAUDE_POLICY_FLAG);
+}
+
+/**
+ * Both gates, for the admin asking and the orchestrator: the tool's enabled
+ * (claude-code-update-policy's mode not off) and the host's
+ * (orchestrator-claude-update-policy's mode not off). Pass the flags already
+ * read for the decision.
+ */
+export async function orchestratorUpdateEnabled(tool: ToolDescriptor, admin: User, flags?: OrchestratorFlags): Promise<boolean> {
+  const f = flags ?? await orchestratorFlags(tool, admin);
+  return modeEnabled(parseOrchestratorMode(f.host)) && await tool.enabled(admin, ORCHESTRATOR_LD_BOX, f.shared);
+}
+
+/**
+ * Whether the nightly run is on, for the orchestrator's context alone: the
+ * host's mode is auto, and Claude Code's own update is on (its mode not off).
+ */
+export function orchestratorNightlyOn(flags: OrchestratorFlags): boolean {
+  return modeAuto(parseOrchestratorMode(flags.host)) && modeEnabled(flags.shared.mode);
 }
 
 const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -97,10 +133,14 @@ export function parseOrchestratorTarget(value: unknown): string | null {
   return null;
 }
 
-/** The policy for a run on the orchestrator host, for the admin asking (the floor's context) or the nightly run (null). */
+/** The policy for a run on the orchestrator host, from the flags read for the admin asking (the floor's context) or the nightly run. */
+export function orchestratorPolicyFrom(flags: OrchestratorFlags): OrchestratorPolicy {
+  return { floor: flags.shared.floor, target: parseOrchestratorTarget(flags.host) };
+}
+
+/** The same, read now, for the admin asking or the nightly run (null). */
 export async function orchestratorPolicy(tool: ToolDescriptor, admin: User | null): Promise<OrchestratorPolicy> {
-  const shared = admin ? await tool.policy(admin, ORCHESTRATOR_LD_BOX) : parseClaudeUpdatePolicy(await jsonVariationForContext(CLAUDE_UPDATE_POLICY_FLAG, ORCHESTRATOR_LD_CONTEXT, null));
-  return { floor: shared.floor, target: parseOrchestratorTarget(await jsonVariationForContext(ORCHESTRATOR_CLAUDE_POLICY_FLAG, ORCHESTRATOR_LD_CONTEXT, null)) };
+  return orchestratorPolicyFrom(await orchestratorFlags(tool, admin));
 }
 
 const parseVer = (v: string) => v.split('.').map(Number);
@@ -262,9 +302,10 @@ async function startRun(trigger: RunTrigger, policy: OrchestratorPolicy, request
 
 /** The Software tab's preview of the orchestrator row: what a run would do. */
 export async function orchestratorPreview(tool: ToolDescriptor, admin: User, current: string | null, now: number = Date.now()): Promise<OrchestratorAnswer> {
-  if (!await orchestratorUpdateEnabled(tool, admin)) return OFF;
+  const flags = await orchestratorFlags(tool, admin);
+  if (!await orchestratorUpdateEnabled(tool, admin, flags)) return OFF;
   await syncOrchestratorRuns();
-  const policy = await orchestratorPolicy(tool, admin);
+  const policy = orchestratorPolicyFrom(flags);
   const run = await runInFlight(now);
   return {
     status: 200,
@@ -284,10 +325,11 @@ export async function orchestratorPreview(tool: ToolDescriptor, admin: User, cur
 
 /** POST /api/admin/software/hosts/orchestrator/update. Only restart none: host sessions are counted, not stopped. */
 export async function requestOrchestratorUpdate(tool: ToolDescriptor, restart: ClaudeUpdateRestart, admin: User, now: number = Date.now(), current: string | null = null): Promise<OrchestratorAnswer> {
-  if (!await orchestratorUpdateEnabled(tool, admin)) return OFF;
+  const flags = await orchestratorFlags(tool, admin);
+  if (!await orchestratorUpdateEnabled(tool, admin, flags)) return OFF;
   if (restart !== 'none') return { status: 409, body: { code: 'restart_not_supported', error: 'the orchestrator host restarts only its runner orchestrator; host users’ sessions keep running (restart none)' } };
   if (!orchestratorCapable()) return { status: 409, body: { code: 'not_capable', error: 'this orchestrator image has no claude-orchestrator-update helper' } };
-  const policy = await orchestratorPolicy(tool, admin);
+  const policy = orchestratorPolicyFrom(flags);
   if (floorOnlyNothingToDo(policy, current)) return { status: 409, body: { code: 'floor_only', error: `no version is pinned in ${ORCHESTRATOR_CLAUDE_POLICY_FLAG}, and the host is at or above the floor ${policy.floor}: nothing to install` } };
   return startRun('manual', policy, admin, now);
 }
@@ -315,20 +357,22 @@ export function nightlyDue(input: { capable: boolean; inFlight: boolean; lastRun
 
 /**
  * Leader work every 5 minutes: read the root recipe's records (the boot run's
- * included), then, when orchestrator-claude-update-enabled is on for the
- * orchestrator's context, start the nightly run once in 24 hours. The
+ * included), then, when orchestrator-claude-update-policy's mode is auto and
+ * claude-code-update-policy's is not off, for the orchestrator's context,
+ * start the nightly run once in 24 hours. The
  * target is the policy's for that context. The runner orchestrator runs no
  * turns, so any hour will do. Never throws.
  */
 export async function orchestratorNightlyTick(now: number = Date.now()): Promise<'off' | 'not-due' | 'floor-only' | 'started' | 'refused'> {
   try {
     await syncOrchestratorRuns(new Date(now));
-    if (!await boolVariationForContext(ORCHESTRATOR_CLAUDE_UPDATE_FLAG, ORCHESTRATOR_LD_CONTEXT, false)) return 'off';
+    const flags = await orchestratorFlags(TOOL_REGISTRY.claude, null);
+    if (!orchestratorNightlyOn(flags)) return 'off';
     const runs = { hostKey: ORCHESTRATOR_HOST, component: 'claude', trigger: { in: ['manual', 'nightly'] } };
     const last = await prisma.softwareUpdateRun.findFirst({ where: { ...runs, status: { notIn: ['refused', 'expired', 'failed'] } }, orderBy: { requestedAt: 'desc' } });
     const lastFailed = await prisma.softwareUpdateRun.findFirst({ where: { ...runs, status: 'failed' }, orderBy: { requestedAt: 'desc' } });
     if (!nightlyDue({ capable: orchestratorCapable(), inFlight: !!await runInFlight(now), lastRunAt: last?.requestedAt ?? null, lastFailedAt: lastFailed?.requestedAt ?? null, now })) return 'not-due';
-    const policy = await orchestratorPolicy(TOOL_REGISTRY.claude, null);
+    const policy = orchestratorPolicyFrom(flags);
     // No pin, and the host is at or above the floor (the boot run sees to that): nothing to run.
     const current = (await prisma.hostSoftware.findFirst({ where: { hostKey: ORCHESTRATOR_HOST, component: 'claude', ok: true }, select: { version: true } }))?.version ?? null;
     if (floorOnlyNothingToDo(policy, current)) return 'floor-only';

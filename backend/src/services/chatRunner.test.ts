@@ -124,6 +124,13 @@ describe('saveSessionTitle', () => {
     });
   });
 
+  it('says whether it wrote, so only a new title becomes the session.titled event', async () => {
+    db.workstreamUpdateMany.mockResolvedValueOnce({ count: 1 });
+    await expect(saveSessionTitle('p1', 'w1', 'Auth fix', at)).resolves.toBe(true);
+    db.workstreamUpdateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(saveSessionTitle('p1', 'w1', 'Auth fix', at)).resolves.toBe(false);
+  });
+
   it("records a person's rename, cleaned and cut as Claude's titles are, and nothing for a blank one", async () => {
     db.workstreamUpdateMany.mockClear();
     expect(await renameSessionFor('p1', 'w1', '  Ship\nthe fix  ', at)).toEqual({ title: 'Ship the fix', titleAt: at.toISOString() });
@@ -456,7 +463,7 @@ describe('resumeDecision', () => {
 });
 
 describe('chatSendRpcPayload', () => {
-  it('carries box notices only when asked, and only to an agent with chat-box-notice-v1 (chat-resume-new-box-enabled)', () => {
+  it('carries box notices only when asked, and only to an agent with chat-box-notice-v1', () => {
     const t = { chatKey: 'p--w', cwd: '/w', projectId: 'p', workstream: 'main', workstreamId: 'w', requireCheckout: false, permissionMode: 'dontAsk' };
     const plain = chatSendRpcPayload(t, 'hi', [CHAT_BOX_NOTICE_CAPABILITY]);
     expect(plain).not.toHaveProperty('boxNotices');
@@ -533,7 +540,7 @@ describe('chatSendRpcPayload', () => {
     expect(chatSendRpcPayload(target, 'look')).not.toHaveProperty('images');
   });
 
-  it('tells a viewer their sends go live only with their flag on and an agent that takes it', () => {
+  it('sends live only a send that may go live, to an agent that takes it', () => {
     expect(chatSendsLive([CHAT_LIVE_CAPABILITY], true)).toBe(true);
     expect(chatSendsLive([CHAT_LIVE_CAPABILITY], false)).toBe(false);
     expect(chatSendsLive([CHAT_LIVE_CAPABILITY], undefined)).toBe(false);

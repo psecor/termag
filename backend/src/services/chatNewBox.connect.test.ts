@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
 const SESSION = '5109190e-c0d2-4f72-9c15-3c4c57fb126c';
 vi.mock('../db', () => ({
   prisma: {
+    chatTranscript: { count: vi.fn(async () => 1) },
     chatResume: {
       findUnique: vi.fn(async () => ({ restoredAt: null })),
       update: vi.fn(async () => ({})),
@@ -70,8 +71,9 @@ vi.mock('./featureFlags', () => ({ boolVariation: async () => true }));
 import { CREDENTIALS_STALE_MS, continuationFacts, continuationPhase, continuationRefusal, recoverUnmarkedCredentials, sendPlanFor, startChatResumeRestores, type ContinuationFacts } from './chatNewBox';
 
 const base: ContinuationFacts = {
-  flagOn: true, isOwner: true, ownerName: 'Pat', excluded: false, box: { id: 'b', status: 'ready', kind: 'ec2' }, setupReady: true,
-  connected: true, complete: true, lockHeld: false, pendingResume: null, hasHeld: false, credentialsPending: false,
+  isOwner: true, ownerName: 'Pat', excluded: false, box: { id: 'b', status: 'ready', kind: 'ec2' }, setupReady: true,
+  connected: true, complete: true, lockHeld: false, pendingResume: null, hasHeld: false, credentialsPending: false, parkHold: false,
+  ask: false, ownsBox: true,
 };
 const gone = { ...base, box: { id: 'b', status: 'terminated', kind: 'ec2' }, connected: false };
 
@@ -118,10 +120,76 @@ describe('sendPlanFor', () => {
     expect(sendPlanFor({ ...base, hasHeld: true })).toEqual({ kind: 'hold' });
   });
 
-  it('flag off, an ask\'s chat, another workstream: as before', () => {
-    expect(sendPlanFor({ ...gone, flagOn: false })).toEqual({ kind: 'normal' });
+  it('an ask\'s chat, another workstream: as before', () => {
     expect(sendPlanFor({ ...gone, excluded: true })).toEqual({ kind: 'normal' });
     expect(sendPlanFor(base)).toEqual({ kind: 'normal' });
+  });
+});
+
+// A stored chat whose box is down holds a send on the
+// orchestrator, images and all, and starts the box, on any workstream.
+// Here, where
+// continuing on a new box doesn't apply: an ask's chat, or not the project's main one.
+describe('a stored chat whose box is down, where continuing on a new box does not apply', () => {
+  const parked = (status: string) => ({ ...base, excluded: true, parkHold: true, box: { id: 'b', status, kind: 'ec2' }, connected: false });
+
+  it('a stopped or hibernated box starts on its owner\'s send, and the send is held; anyone else is refused', () => {
+    expect(sendPlanFor(parked('stopped'))).toEqual({ kind: 'start-box', boxId: 'b' });
+    expect(sendPlanFor(parked('hibernated'))).toEqual({ kind: 'start-box', boxId: 'b' });
+    expect(sendPlanFor({ ...parked('stopped'), excluded: true })).toEqual({ kind: 'start-box', boxId: 'b' });
+    expect(sendPlanFor({ ...parked('stopped'), isOwner: false })).toMatchObject({ kind: 'refuse', status: 403, code: 'owner-only', reason: 'Only Pat can start this chat\'s box' });
+  });
+
+  it('a box on its way down or up holds the send (delivery starts it once it has stopped)', () => {
+    for (const status of ['stopping', 'hibernating', 'starting']) expect(sendPlanFor(parked(status)), status).toEqual({ kind: 'hold' });
+    expect(sendPlanFor({ ...parked('ready'), hasHeld: true })).toEqual({ kind: 'hold' });
+  });
+
+  it('a box that is up, or a chat with nothing stored, goes the usual way', () => {
+    expect(sendPlanFor({ ...parked('ready'), connected: true })).toEqual({ kind: 'normal' });
+    expect(sendPlanFor({ ...parked('stopped'), parkHold: false })).toEqual({ kind: 'normal' });
+  });
+
+  it('on the main chat, a box on its way down still holds the owner\'s send rather than failing it', () => {
+    expect(sendPlanFor({ ...parked('stopping'), excluded: false })).toEqual({ kind: 'hold' });
+    expect(sendPlanFor({ ...parked('stopping'), excluded: false, parkHold: false })).toEqual({ kind: 'normal' });
+  });
+
+  // Bugbot on #971 ("Gone box still holds new sends"): a box that can't come back holds nothing.
+  it('a box that is gone, failed or quarantined holds no send, even behind held messages', () => {
+    for (const status of ['terminated', 'failed', 'quarantined']) {
+      expect(sendPlanFor({ ...parked(status), hasHeld: true }), status).toEqual({ kind: 'normal' });
+    }
+  });
+
+  // Security review on #971: an ask's chat is writable only by the project and box owner (askChatSendRefusal), so
+  // a project share's send must never be held for it, on any branch, behind waiting messages included.
+  it('an ask thread holds no send from anyone but the project and box owner', () => {
+    const ask = (status: string) => ({ ...parked(status), excluded: true, ask: true });
+    expect(sendPlanFor({ ...ask('ready'), isOwner: false, hasHeld: true })).toMatchObject({ kind: 'refuse', status: 403, code: 'owner-only' });
+    for (const status of ['stopped', 'stopping', 'starting']) {
+      expect(sendPlanFor({ ...ask(status), isOwner: false }), status).toMatchObject({ kind: 'refuse', code: 'owner-only' });
+    }
+    // The project's owner who doesn't own the box (a share of the box) can't either.
+    expect(sendPlanFor({ ...ask('ready'), ownsBox: false, hasHeld: true })).toMatchObject({ kind: 'refuse', code: 'owner-only' });
+    // The owner of both is held as before; an ordinary chat still holds a share's send behind waiting ones.
+    expect(sendPlanFor({ ...ask('ready'), hasHeld: true })).toEqual({ kind: 'hold' });
+    expect(sendPlanFor({ ...parked('ready'), isOwner: false, hasHeld: true })).toEqual({ kind: 'hold' });
+  });
+
+  // Bugbot on #971 ("New sends jump the held queue"): with messages waiting, a new send waits behind them even
+  // once the box is up and its agent connected, as the continue path does, so it never lands ahead of them.
+  it('a new send waits behind held messages even once the box is up and connected', () => {
+    expect(sendPlanFor({ ...parked('ready'), connected: true, hasHeld: true })).toEqual({ kind: 'hold' });
+    expect(sendPlanFor({ ...parked('ready'), connected: true, hasHeld: true, isOwner: false })).toEqual({ kind: 'hold' });
+    expect(sendPlanFor({ ...parked('ready'), connected: true })).toEqual({ kind: 'normal' });
+  });
+
+  it('says "starting" while its held messages wait for the box', () => {
+    expect(continuationPhase({ ...parked('stopped'), hasHeld: true })).toBe('starting');
+    expect(continuationPhase({ ...parked('starting'), hasHeld: true })).toBe('starting');
+    expect(continuationPhase(parked('stopped'))).toBeNull();
+    expect(continuationPhase({ ...parked('ready'), connected: true, hasHeld: true })).toBeNull();
   });
 });
 

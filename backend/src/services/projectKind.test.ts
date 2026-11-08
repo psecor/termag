@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PROJECT_KINDS, WORK_PROJECT_KINDS, isProjectKind, kindRefusal, projectKindTraits } from './projectKind';
+import { LISTED_PROJECT_KINDS, PROJECT_KINDS, WORK_PROJECT_KINDS, isProjectKind, kindRefusal, projectKindTraits } from './projectKind';
 
 describe('projectKindTraits', () => {
   it('treats an unknown or missing kind as normal', () => {
@@ -18,6 +18,22 @@ describe('projectKindTraits', () => {
     expect(t).toMatchObject({ isAutomation: true, runsMainAgent: false, canBranchOff: false, canSwitchAgent: false, canEditWorkflows: false, canRenameProject: true, canArchive: true, canShare: true, listedAsWork: true });
   });
 
+  // The same table as frontend/src/utils/projectKind.test.ts.
+  it('keeps a space orchestrator out of every list and every by-hand action', () => {
+    expect(projectKindTraits('space-orchestrator')).toEqual({
+      runsMainAgent: false, canBranchOff: false, canRenameProject: false, canArchive: false, canShare: false,
+      canHandOff: false, canSwitchAgent: false, canEditWorkflows: false, listedAsWork: false, inProjectLists: false,
+      creatableByHand: false, isAutomation: false,
+    });
+    expect(isProjectKind('space-orchestrator')).toBe(true);
+    expect(WORK_PROJECT_KINDS).not.toContain('space-orchestrator');
+    expect(LISTED_PROJECT_KINDS).toEqual(['normal', 'metaterm', 'automation']);
+  });
+
+  it('lets a person create only normal and automation projects by hand', () => {
+    expect(PROJECT_KINDS.filter(k => projectKindTraits(k).creatableByHand)).toEqual(['normal', 'automation']);
+  });
+
   it('counts normal and automation projects as work', () => {
     expect(WORK_PROJECT_KINDS).toEqual(['normal', 'automation']);
     expect(PROJECT_KINDS).toContain('metaterm');
@@ -28,5 +44,6 @@ describe('projectKindTraits', () => {
   it('words a refusal by kind', () => {
     expect(kindRefusal('metaterm', 'branch off')).toBe('MetaTerm cannot branch off');
     expect(kindRefusal('automation', 'branch off')).toBe('An automation cannot branch off');
+    expect(kindRefusal('space-orchestrator', 'be renamed')).toBe("A space's orchestrator cannot be renamed");
   });
 });

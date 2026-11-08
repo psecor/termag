@@ -8,7 +8,7 @@
  * orphan the box's sessions under the old name.
  */
 import { powerStateError } from '../services/boxPowerPolicy';
-import { reviewSessionNames, sessionName } from '../services/tmux';
+import { reviewSessionNames, sessionName, terminalSessionNames } from '../services/tmux';
 import type { RouteResult } from './routeResult';
 
 export interface RenameWorkflow {
@@ -36,6 +36,11 @@ export function renameSessionPairs(
     if (wf.type === 'agent') {
       const to = reviewSessionNames(unixUsername, newName, wf.workstream);
       reviewSessionNames(unixUsername, oldName, wf.workstream).forEach((from, i) => pairs.push({ from, to: to[i] }));
+      // The user's terminal slots ride along too —
+      // slots 2..MAX; slot 1 IS the ctrl pane, renamed by the role loop above.
+      // They usually do not exist, and the rename tolerates that.
+      const toTerm = terminalSessionNames(unixUsername, newName, wf.workstream);
+      terminalSessionNames(unixUsername, oldName, wf.workstream).slice(1).forEach((from, i) => pairs.push({ from, to: toTerm[i + 1] }));
     }
   }
   return pairs;

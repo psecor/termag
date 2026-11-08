@@ -47,6 +47,13 @@ describe('policyAnswer', () => {
     });
   });
 
+  it('names the run\'s trigger, for the box\'s restart notice, and only a known one', () => {
+    expect(policyAnswer({ ...base, asked: RUN, run: run({ trigger: 'nightly' }) })).toMatchObject({ body: { run: { id: RUN, component: 'claude', trigger: 'nightly' } } });
+    const odd = policyAnswer({ ...base, asked: RUN, run: run({ trigger: "nightly'; reboot" }) });
+    expect(odd).toMatchObject({ status: 200, body: { run: { id: RUN, component: 'claude' } } });
+    expect((odd as { body: { run: object } }).body.run).not.toHaveProperty('trigger');
+  });
+
   it('is restart none for the boot and guard paths (no run asked)', () => {
     expect(policyAnswer({ ...base, asked: null, run: null })).toEqual({ status: 200, start: false, expire: false, body: none });
   });
@@ -107,6 +114,15 @@ describe('parseToolUpdateReport', () => {
     ]);
   });
 
+  it('keeps a pane\'s notice only when it is one NOTICE_SAFE passes, and never refuses the report for it', () => {
+    const line = '[termag] Claude Code was updated to 2.1.312 (automatic nightly run); resuming your session.';
+    const withNotice = (notice: unknown) => (parseToolUpdateReport({ ...ok, panes: [{ ...ok.panes[2], notice }] }) as ToolUpdateReport).panes[0];
+    expect(withNotice(line)).toEqual({ session: 'ada-web-ctrl', role: 'other', sessionId: 'abc-123', hadConversation: true, notice: line });
+    for (const bad of ["[termag] it's $(id)", 'Claude Code was updated; resuming your session.', `[termag] a\nb`, 42, '[termag] ' + 'x'.repeat(200)]) {
+      expect(withNotice(bad)).toEqual({ session: 'ada-web-ctrl', role: 'other', sessionId: 'abc-123', hadConversation: true });
+    }
+  });
+
   it('lets a boot or guard report come without a run, panes or sessions, and fills missing counts with 0', () => {
     expect(parseToolUpdateReport({ component: 'claude', trigger: 'boot', outcome: 'current' })).toMatchObject({ run: null, panes: [], sessions: null });
     expect(parseToolUpdateReport({ component: 'claude', trigger: 'guard', outcome: 'updated', sessions: { stopped: 1 } })).toMatchObject({ sessions: { stopped: 1, resumed: 0, runnersLeft: 0 } });
@@ -121,7 +137,7 @@ describe('parseToolUpdateReport', () => {
   });
 
   it('names an unknown component with its code', () => {
-    expect(parseToolUpdateReport({ ...ok, component: 'python' })).toEqual({ error: 'component is not a tool termag updates', code: 'unknown_component' });
+    expect(parseToolUpdateReport({ ...ok, component: 'rust' })).toEqual({ error: 'component is not a tool termag updates', code: 'unknown_component' });
   });
 
   it('refuses what is malformed', () => {

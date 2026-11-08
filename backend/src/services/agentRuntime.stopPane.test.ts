@@ -66,17 +66,20 @@ describe('stopAgentPane', () => {
   });
 });
 
-describe('stopAgentSessions: every review pane (docs/parallel-reviews.md)', () => {
+describe('stopAgentSessions: every review pane, every terminal slot', () => {
   beforeEach(() => { sent.length = 0; events.length = 0; connected.value = true; killSession.mockClear(); });
   it('kills all eight review slots by exact target, beside the agent pair', async () => {
     await stopAgentSessions({ ...ctx, provider: 'claude' });
     const kills = sent.filter(s => s.type === 'tmux-kill').map(s => s.payload.sessionName);
     expect(kills.slice(0, 2)).toEqual(['ada-termag-feature-x-agent', 'ada-termag-feature-x-ctrl']);
-    expect(kills.slice(2)).toEqual(['=ada-termag-feature-x-review:', ...[2, 3, 4, 5, 6, 7, 8].map(n => `=ada-termag-feature-x-review-${n}:`)]);
+    expect(kills.slice(2, 10)).toEqual(['=ada-termag-feature-x-review:', ...[2, 3, 4, 5, 6, 7, 8].map(n => `=ada-termag-feature-x-review-${n}:`)]);
+    // The user's terminal slots 2..8 die with the workflow too.
+    expect(kills.slice(10)).toEqual([2, 3, 4, 5, 6, 7, 8].map(n => `=ada-termag-feature-x-ctrl-${n}:`));
   });
   it('kills them on the orchestrator\'s own tmux for a legacy project', async () => {
     connected.value = false;
     await stopAgentSessions({ ...ctx, instanceId: null, provider: 'claude' });
     expect(killSession.mock.calls.map(c => (c as unknown[])[0])).toContain('ada-termag-feature-x-review-8');
+    expect(killSession.mock.calls.map(c => (c as unknown[])[0])).toContain('ada-termag-feature-x-ctrl-8');
   });
 });

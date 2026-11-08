@@ -3,23 +3,26 @@
  * answers, the statuses the status socket would send, and the history
  * GET /api/projects/:id/chat reads, for the person a device sign-in names.
  */
+import { recordSessionTitle } from '../services/sessionTitleEvent';
 import type { Request } from 'express';
 import { prisma } from '../db';
 import { askCwd } from '../services/agentMessages';
-import { SESSION_TITLES_FLAG, renameSessionFor } from '../services/chatRunner';
+import { renameSessionFor } from '../services/chatRunner';
 import { archivedSessionRow, chatSessionRows, type ChatSessionRow, type ChatSourceProject } from '../services/chatSessionRows';
 import { VIEW_MAX_ENTRIES } from '../services/chatTranscriptStore';
-import { desktopAppEnabled } from '../services/desktopAppFlag';
-import { boolVariation } from '../services/featureFlags';
+import { desktopLiveChatEnabled } from '../services/desktopAppFlag';
 import { projectDirUnder, resolveProjectRoot } from '../services/projectPaths';
 import { getAllStatuses } from '../services/status';
-import { chatHistoryFor, claimChatFor } from './chat';
+import { chatHistoryFor, chatInterruptFor, chatOwnerRefusal, chatSendFor, claimChatFor } from './chat';
 import { desktopChatAsksFor } from './chatAsks';
 import { archiveChatFor, archivedChatsFor, reopenChatFor } from './chats';
 import type { CliChatRow, CliChats } from './cliChats';
 import { fullUser } from './cliLifecyclePrisma';
 import { listProjectsFor } from './projects';
 import { parentsFor } from './spawns';
+
+const bodyOf = (body: unknown): Record<string, unknown> =>
+  body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
 
 type SpawnLinks = ReadonlyMap<string, { projectId: string; workstream: string }>;
 
@@ -95,21 +98,16 @@ async function archivedRows(user: Express.User): Promise<CliChatRow[]> {
 
 export function createPrismaCliChats(): CliChats {
   return {
-    async enabled(user) {
-      const owner = await prisma.user.findUnique({ where: { id: user.id } });
-      return !!owner && await desktopAppEnabled(owner);
-    },
     async list(user, { archived }) {
       const viewer = await fullUser(user);
       if (archived === true) return archivedRows(viewer);
-      const [projects, titlesShown, spawned] = await Promise.all([
+      const [projects, spawned] = await Promise.all([
         listProjectsFor(viewer.id),
-        boolVariation(SESSION_TITLES_FLAG, viewer, false),
         spawnParents(viewer),
       ]);
       // Keys built from the viewer's own and shared projects only, so no
       // other session's status is read: what the status socket sends them.
-      const rows = chatSessionRows(projects, getAllStatuses(), viewer.unixUsername, titlesShown);
+      const rows = chatSessionRows(projects, getAllStatuses(), viewer.unixUsername);
       const live = await enrich(viewer.id, viewer.unixUsername, rows, { spawned });
       // `all`: the desktop mirrors an archive done in web from the one read.
       return archived === 'all' ? [...live, ...await archivedRows(viewer)] : live;
@@ -130,11 +128,13 @@ export function createPrismaCliChats(): CliChats {
       if (!ws) return { status: 404, body: { error: 'Chat not found' } };
       const renamed = await renameSessionFor(projectId, ws.id, title);
       if (!renamed) return { status: 400, body: { error: 'title is required', code: 'invalid_request' } };
+      // A person's name for the session, as the session.titled event, unless they turned it off.
+      void recordSessionTitle({ projectId, workstream: name, title: renamed.title, source: 'person' });
       return { status: 200, body: { ...renamed, titleSource: 'person' } };
     },
     async history(user, projectId, workstream) {
       const viewer = await fullUser(user);
-      const out = await chatHistoryFor(viewer.id, projectId, { workstream } as Request['query'], viewer);
+      const out = await chatHistoryFor(viewer.id, projectId, { workstream } as Request['query']);
       // The box and the store both keep the newest entries only (agent/chat-runner.js HISTORY_MAX_ENTRIES).
       if (out.status !== 200) return out;
       return { status: 200, body: { ...(out.body as object), entriesMax: VIEW_MAX_ENTRIES } };
@@ -143,6 +143,24 @@ export function createPrismaCliChats(): CliChats {
     async asks(user, query) {
       const viewer = await fullUser(user);
       return desktopChatAsksFor(viewer.id, query, viewer);
+    },
+    async liveChatEnabled(user) {
+      const owner = await prisma.user.findUnique({ where: { id: user.id } });
+      return !!owner && await desktopLiveChatEnabled(owner);
+    },
+    async send(user, projectId, body) {
+      const fields = bodyOf(body);
+      const refusal = await chatOwnerRefusal(user.id, projectId, fields.workstream);
+      if (refusal) return refusal;
+      // The full user, so the turn's flags (live input, images, titles) are the owner's, as on web.
+      const viewer = await fullUser(user);
+      return chatSendFor(viewer.id, projectId, fields, viewer);
+    },
+    async interrupt(user, projectId, body) {
+      const fields = bodyOf(body);
+      const refusal = await chatOwnerRefusal(user.id, projectId, fields.workstream);
+      if (refusal) return refusal;
+      return chatInterruptFor(user.id, projectId, fields);
     },
   };
 }

@@ -45,7 +45,7 @@ function box(over: Partial<LifecycleBox> = {}): LifecycleBox {
   };
 }
 const facts = (over: Partial<Parameters<typeof idleHibernateDecision>[1]> = {}) => ({
-  nowMs: t0.getTime() + 2 * HOUR, flagOn: true, busy: [] as readonly string[], working: false, ...over,
+  nowMs: t0.getTime() + 2 * HOUR, busy: [] as readonly string[], working: false, ...over,
 });
 
 describe('idleHibernateDecision', () => {
@@ -66,14 +66,12 @@ describe('idleHibernateDecision', () => {
     }
   });
 
-  it('skips a box with the setting off, a box not ready and a refresh in progress', () => {
-    expect(idleHibernateDecision(box({ idleHibernateHours: null }), facts())).toMatchObject({ reason: 'off' });
+  it('skips a box not ready and a refresh in progress', () => {
     expect(idleHibernateDecision(box({ status: 'hibernated' }), facts())).toMatchObject({ reason: 'not-ready' });
     expect(idleHibernateDecision(box({ rehibernatePending: true }), facts())).toMatchObject({ reason: 'refresh-pending' });
   });
 
-  it('respects the flag, a busy box and a working agent, in that order', () => {
-    expect(idleHibernateDecision(box(), facts({ flagOn: false, busy: ['claude-runner'] }))).toMatchObject({ reason: 'flag-off' });
+  it('respects a busy box and a working agent, in that order', () => {
     expect(idleHibernateDecision(box(), facts({ busy: ['claude-runner'], working: true }))).toEqual({ hibernate: false, reason: 'busy', check: 'claude-runner' });
     expect(idleHibernateDecision(box(), facts({ working: true }))).toMatchObject({ reason: 'working' });
   });
@@ -119,16 +117,12 @@ describe('idleHibernateDecision', () => {
   });
 });
 
-describe('idleHibernateDecision with box-idle-stop-enabled', () => {
+describe('idleHibernateDecision under the default window', () => {
   const unset = (over: Partial<LifecycleBox> = {}) => box({ idleHibernateHours: null, ...over });
-  const at = (ms: number) => facts({ nowMs: t0.getTime() + ms, flagOn: false, idleStopOn: true });
+  const at = (ms: number) => facts({ nowMs: t0.getTime() + ms });
 
-  it('with it off, no setting stays off and a box that cannot hibernate is never acted on', () => {
-    expect(idleHibernateDecision(unset(), facts({ nowMs: t0.getTime() + 100 * HOUR })))
-      .toEqual({ hibernate: false, reason: 'off' });
-    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), facts({ nowMs: t0.getTime() + 100 * HOUR })))
-      .toEqual({ hibernate: false, reason: 'not-eligible' });
-    expect(idleHibernateDecision(unset({ hibernationConfigured: false }), facts({ nowMs: t0.getTime() + 100 * HOUR, idleStopOn: false })))
+  it('never acts on a box that cannot be stopped', () => {
+    expect(idleHibernateDecision(unset({ kind: 'external' }), facts({ nowMs: t0.getTime() + 100 * HOUR })))
       .toEqual({ hibernate: false, reason: 'not-eligible' });
   });
 
@@ -196,12 +190,11 @@ describe('idleHibernateDecision with box-idle-stop-enabled', () => {
       .toEqual({ hibernate: false, reason: 'busy', check: 'automation-run' });
   });
 
-  it('with it on, a box with its own setting keeps that timing and box-auto-lifecycle-enabled', () => {
+  it('with it on, a box with its own setting keeps that timing', () => {
     const own = box({ idleHibernateHours: 4 });
-    expect(idleHibernateDecision(own, at(2 * HOUR))).toEqual({ hibernate: false, reason: 'flag-off' });
-    expect(idleHibernateDecision(own, { ...at(2 * HOUR), flagOn: true })).toEqual({ hibernate: false, reason: 'not-idle' });
-    expect(idleHibernateDecision(own, { ...at(4 * HOUR), flagOn: true })).toEqual({ stop: true });
-    expect(idleHibernateDecision(box({ idleHibernateHours: 4, hibernationConfigured: false }), { ...at(10 * HOUR), flagOn: true }))
+    expect(idleHibernateDecision(own, at(2 * HOUR))).toEqual({ hibernate: false, reason: 'not-idle' });
+    expect(idleHibernateDecision(own, at(4 * HOUR))).toEqual({ stop: true });
+    expect(idleHibernateDecision(box({ idleHibernateHours: 4, hibernationConfigured: false }), at(10 * HOUR)))
       .toEqual({ stop: true });
   });
 
@@ -338,12 +331,11 @@ describe('lifecycleView', () => {
       canAutoHibernate: true, idleHibernateHours: 1, hibernatedTerminateDays: null,
       hibernateDueAt: null, terminateDueAt: null,
       parkedAt: null, unsavedWork: null, note: null, warning: null,
-      // box-auto-lifecycle-enabled not given: the own hours don't run, so no park is promised.
-      parkAt: null, parkAction: null, idleLimitHours: null, idleLimitSource: null,
+      parkAt: expect.any(String), parkAction: 'stop', idleLimitHours: 1, idleLimitSource: 'own',
       warnedAt: null, autoParkedAt: null, parkStop: true,
     });
     const ready = { ...box(), parkedAt: null, hibernatedTerminateDays: null, unsavedWork: null, unsavedWorkCheckedAt: null, lifecycleNote: null };
-    expect(lifecycleView(ready, 90, { autoLifecycleOn: true }, t0.getTime())).toMatchObject({
+    expect(lifecycleView(ready, 90, {}, t0.getTime())).toMatchObject({
       parkAt: new Date(t0.getTime() + HOUR).toISOString(), parkAction: 'stop', idleLimitHours: 1, idleLimitSource: 'own',
     });
     expect(view(parked({ hibernationConfigured: false, idleHibernateHours: null })))
@@ -359,9 +351,9 @@ describe('lifecycleView', () => {
 describe('lifecycleView under the default window', () => {
   const ready = (over: Partial<TerminateBox> = {}) =>
     ({ ...box({ idleHibernateHours: null }), parkedAt: null, hibernatedTerminateDays: null, unsavedWork: null, unsavedWorkCheckedAt: null, lifecycleNote: null, ...over });
-  const on = { idleStopOn: true, idleStopHours: 2, warnMinutes: 60 };
+  const on = { idleStopHours: 2, warnMinutes: 60 };
 
-  it("shows the stop, the window's hours and a standing warning, only while box-idle-stop-enabled is on", () => {
+  it("shows the stop, the window's hours and a standing warning", () => {
     expect(lifecycleView(ready(), 90, on, t0.getTime())).toMatchObject({
       parkAt: new Date(t0.getTime() + 2 * HOUR).toISOString(), parkAction: 'stop', idleLimitHours: 2, idleLimitSource: 'default',
       hibernateDueAt: null, warnedAt: null,
@@ -371,8 +363,6 @@ describe('lifecycleView under the default window', () => {
     // A keystroke since makes the warning stale.
     expect(lifecycleView({ ...warned, lastActivityAt: new Date(t0.getTime() + 90 * MIN) }, 90, on, t0.getTime() + 90 * MIN))
       .toMatchObject({ warnedAt: null, parkAt: new Date(t0.getTime() + 210 * MIN).toISOString() });
-    expect(lifecycleView(ready(), 90, { idleStopOn: false }, t0.getTime()))
-      .toMatchObject({ parkAt: null, parkAction: null, idleLimitHours: null, idleLimitSource: null });
     expect(lifecycleView(ready({ autoParkedAt: t0 }), 90, undefined, t0.getTime())).toMatchObject({ autoParkedAt: t0.toISOString() });
   });
 
@@ -406,8 +396,8 @@ describe('unsavedWorkState', () => {
 });
 
 describe('terminateDecision', () => {
-  const tf = (over: Partial<{ nowMs: number; flagOn: boolean; unsavedLimitDays: number }> = {}) =>
-    ({ nowMs: t0.getTime() + DAY, flagOn: true, unsavedLimitDays: 90, ...over });
+  const tf = (over: Partial<{ nowMs: number; unsavedLimitDays: number }> = {}) =>
+    ({ nowMs: t0.getTime() + DAY, unsavedLimitDays: 90, ...over });
 
   it('terminates a clean parked box at its own limit, not before', () => {
     expect(terminateDecision(parked(), tf({ nowMs: t0.getTime() + DAY - 1 }))).toEqual({ terminate: false, reason: 'not-due' });
@@ -445,7 +435,6 @@ describe('terminateDecision', () => {
     // A hibernated box that can't hibernate is not one auto-park hibernated.
     expect(terminateDecision(parked({ hibernationConfigured: false }), late)).toEqual({ terminate: false, reason: 'not-parked' });
     expect(terminateDecision(parked({ hibernatedTerminateDays: null }), late)).toMatchObject({ reason: 'off' });
-    expect(terminateDecision(parked(), { ...late, flagOn: false })).toMatchObject({ reason: 'flag-off' });
   });
 });
 
@@ -467,7 +456,7 @@ describe('stuckStartDecision', () => {
   const starting = box({ status: 'starting' });
   const started = t0.getTime() - 30 * MIN;
   const f = (over: Partial<Parameters<typeof stuckStartDecision>[1]> = {}) => ({
-    nowMs: t0.getTime(), flagOn: true, startRequestedAt: started, agentConnected: false, startTimeoutMs: 15 * MIN,
+    nowMs: t0.getTime(), startRequestedAt: started, agentConnected: false, startTimeoutMs: 15 * MIN,
     leadMs: 2 * HOUR, busy: [] as readonly string[], ...over,
   });
 
@@ -485,12 +474,11 @@ describe('stuckStartDecision', () => {
     expect(stuckStartDecision(starting, f({ busy: ['ssh'] }))).toEqual({ act: 'none', reason: 'busy', check: 'ssh' });
   });
 
-  it('leaves a box whose agent is back, one with no known start, a box not starting, and the flag off', () => {
+  it('leaves a box whose agent is back, one with no known start, and a box not starting', () => {
     expect(stuckStartDecision(starting, f({ agentConnected: true }))).toMatchObject({ act: 'none', reason: 'not-stuck' });
     expect(stuckStartDecision(starting, f({ startRequestedAt: null }))).toMatchObject({ act: 'none', reason: 'not-stuck' });
     expect(stuckStartDecision(box({ status: 'ready' }), f())).toMatchObject({ act: 'none', reason: 'not-stuck' });
     expect(stuckStartDecision(box({ status: 'starting', kind: 'external' }), f())).toMatchObject({ act: 'none', reason: 'not-stuck' });
-    expect(stuckStartDecision(starting, f({ flagOn: false }))).toEqual({ act: 'none', reason: 'flag-off' });
   });
 
   it("leaves a note saying why, which is not the auto-hibernate note, so a reviewer can't wake the box", () => {
@@ -507,14 +495,14 @@ describe('stuckStopRetryDecision', () => {
     ...box({ autoParkedAt: null, idleWarnedAt: at(t0.getTime() - 2 * HOUR) }), lifecycleNote: stuckStartNote(at(t0.getTime() - 3 * HOUR)),
     lastConnectedAt: at(t0.getTime() - 4 * HOUR), ...over,
   });
-  const f = { flagOn: true, agentConnected: false, busy: [] as readonly string[] };
+  const f = { agentConnected: false, busy: [] as readonly string[] };
 
   it('stops again a box whose stuck-start stop timed out back to ready with still no agent', () => {
     expect(stuckStopRetryDecision(timedOut(), f)).toBe(true);
     expect(stuckStopRetryDecision(timedOut({ autoParkedAt: triedAt }), f)).toBe(true);
   });
 
-  it('leaves it once an agent is connected, a box with another note, a busy box, and the flag off', () => {
+  it('leaves it once an agent is connected, a box with another note, and a busy box', () => {
     expect(stuckStopRetryDecision(timedOut(), { ...f, agentConnected: true })).toBe(false);
     expect(stuckStopRetryDecision(timedOut({ lifecycleNote: 'Stopped automatically after 72 h idle.' }), f)).toBe(false);
     expect(stuckStopRetryDecision(timedOut({ lifecycleNote: null }), f)).toBe(false);
@@ -522,7 +510,6 @@ describe('stuckStopRetryDecision', () => {
     expect(stuckStopRetryDecision(timedOut({ lastConnectedAt: at(t0.getTime() - 10 * MIN) }), f)).toBe(false);
     expect(stuckStopRetryDecision(timedOut({ lastConnectedAt: null }), f)).toBe(true);
     expect(stuckStopRetryDecision(timedOut(), { ...f, busy: ['ask-run'] })).toBe(false);
-    expect(stuckStopRetryDecision(timedOut(), { ...f, flagOn: false })).toBe(false);
   });
 });
 
@@ -547,16 +534,15 @@ describe('parking by a stop', () => {
     expect(idleHibernateDecision(woken, on())).toEqual({ stop: true });
   });
 
-  it('still needs box-auto-lifecycle-enabled, and keeps the guards', () => {
-    expect(idleHibernateDecision(own(), on({ flagOn: false }))).toEqual({ hibernate: false, reason: 'flag-off' });
+  it('keeps the guards', () => {
     expect(idleHibernateDecision(own({ kind: 'external' }), on())).toEqual({ hibernate: false, reason: 'not-eligible' });
     expect(idleHibernateDecision(own(), on({ working: true }))).toEqual({ hibernate: false, reason: 'working' });
     expect(idleHibernateDecision(own({ rehibernatePending: true }), on())).toEqual({ hibernate: false, reason: 'refresh-pending' });
   });
 
   const stopped = (over: Partial<TerminateBox> = {}) => parked({ status: 'stopped', ...over });
-  const tf = (over: Partial<{ nowMs: number; flagOn: boolean; unsavedLimitDays: number }> = {}) =>
-    ({ nowMs: t0.getTime() + DAY, flagOn: true, unsavedLimitDays: 90, ...over });
+  const tf = (over: Partial<{ nowMs: number; unsavedLimitDays: number }> = {}) =>
+    ({ nowMs: t0.getTime() + DAY, unsavedLimitDays: 90, ...over });
 
   it('terminate-after counts from the stop auto-park made, for any box that can be stopped', () => {
     for (const hibernationConfigured of [true, false]) {
@@ -581,12 +567,11 @@ describe('parking by a stop', () => {
   it('a stopped box without parkedAt (stopped by hand) is never terminated', () => {
     const late = { nowMs: t0.getTime() + 400 * DAY };
     expect(terminateDecision(stopped({ parkedAt: null }), tf(late))).toEqual({ terminate: false, reason: 'not-parked' });
-    expect(terminateDecision(stopped(), tf({ ...late, flagOn: false }))).toEqual({ terminate: false, reason: 'flag-off' });
   });
 
   it('the view says stop, warns of nothing on a box that cannot hibernate, and dates a stopped box\'s terminate', () => {
     const ready = { ...own({ hibernationConfigured: false }), parkedAt: null, hibernatedTerminateDays: 7, unsavedWork: null, unsavedWorkCheckedAt: null, lifecycleNote: null };
-    const v = lifecycleView(ready, 90, { autoLifecycleOn: true, warnMinutes: 30 }, t0.getTime());
+    const v = lifecycleView(ready, 90, { warnMinutes: 30 }, t0.getTime());
     expect(v).toMatchObject({
       parkStop: true, warning: null, hibernateDueAt: null, parkAction: 'stop',
       parkAt: new Date(t0.getTime() + 2 * HOUR).toISOString(), idleLimitHours: 2, idleLimitSource: 'own',

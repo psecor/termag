@@ -1,6 +1,5 @@
 /**
- * Continue a stored chat on a new box after its box was terminated,
- * behind chat-resume-new-box-enabled.
+ * Continue a stored chat on a new box after its box was terminated.
  *
  *   - Offer: a chat whose box is terminated (or that has no box) and whose
  *     stored session is whole offers "Continue on a new box" to its owner. A
@@ -28,11 +27,8 @@ import { prisma } from '../db';
 import { isChatRunnerProvider } from '../providers/registry';
 import { instanceAgentTransport, onBoxAgentHello, sendToInstanceAgent } from './agentRegistry';
 import { CHAT_BOX_NOTICE_CAPABILITY, chatKeyFor, onChatEvent } from './chatRunner';
-import { CHAT_RESUME_FLAG, describeGitState, parseGitState } from './chatGitState';
+import { describeGitState, parseGitState } from './chatGitState';
 import { getTranscriptStoreConfig, storedRawChunks, storedRawOf, type TranscriptStoreConfig } from './chatTranscriptStore';
-import { CHAT_TRANSCRIPTS_FLAG } from './chatTranscriptSync';
-import { boolVariation } from './featureFlags';
-import type { FlagUser } from './featureFlags';
 import { projectDirFor } from './tmux';
 import { isValidBoxName } from './boxNames';
 import { acquireContinueLock, continueUnderWay, releaseContinueLock } from './chatContinueLock';
@@ -55,12 +51,11 @@ export type NewBoxOffer =
   | { offer: null; code: 'owner-only' | 'incomplete' | 'self-managed'; reason: string };
 
 /**
- * What a stored chat offers, or null when it offers nothing (the flag is off,
- * an ask's chat, a box that is up or on its way). Pure: routes/chat.ts reads
+ * What a stored chat offers, or null when it offers nothing (an ask's chat,
+ * a box that is up or on its way). Pure: routes/chat.ts reads
  * the facts.
  */
 export function newBoxOffer(f: {
-  flagOn: boolean;
   isOwner: boolean;
   ask: boolean;
   box: { id: string; status: string; kind: string } | null;
@@ -71,7 +66,7 @@ export function newBoxOffer(f: {
   /** The box is one a continue made for this chat: if it failed to launch, it is as gone as a terminated one. */
   resumedOnto?: boolean;
 }): NewBoxOffer | null {
-  if (!f.flagOn || f.ask) return null;
+  if (f.ask) return null;
   const raw = f.box?.status ?? 'terminated';
   const status = raw === 'failed' && f.resumedOnto ? 'terminated' : raw;
   if (status === 'stopped' || status === 'hibernated') {
@@ -145,22 +140,6 @@ export function* restorePieces(chunks: Iterable<Buffer>, max = RESTORE_PIECE_BYT
 
 const OWNER_SELECT = { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } as const;
 
-/** Both flags, for the project's owner: resume reads the store. */
-export async function resumeFlagOn(owner: FlagUser): Promise<boolean> {
-  return await boolVariation(CHAT_RESUME_FLAG, owner, false) && await boolVariation(CHAT_TRANSCRIPTS_FLAG, owner, false);
-}
-
-/** As resumeFlagOn, by the owner's id. Off, as the flag's fallback is, when the owner can't be read. */
-export async function resumeFlagOnForOwner(ownerId: string): Promise<boolean> {
-  try {
-    const owner = await prisma.user.findUnique({ where: { id: ownerId }, select: OWNER_SELECT });
-    return owner ? await resumeFlagOn(owner) : false;
-  } catch (err) {
-    console.error('[RESUME] flag for %s not read, taken as off: %s', ownerId, err instanceof Error ? err.message : String(err));
-    return false;
-  }
-}
-
 type Result = { status: number; body: unknown };
 
 /** A free box name near `base`: itself, else base-2, base-3, … */
@@ -192,7 +171,7 @@ export async function continueOnNewBoxFor(user: Express.User, projectId: string,
   });
   // Owner only: a share or a space member may read the chat, not move it.
   if (!project || project.userId !== user.id) return { status: 404, body: { error: 'Chat not found' } };
-  if (!cfg || !await resumeFlagOn(project.user)) return { status: 404, body: { error: 'Continuing a chat on a new box is not available', code: 'resume-off' } };
+  if (!cfg) return { status: 404, body: { error: 'Continuing a chat on a new box is not available', code: 'resume-off' } };
   if (project.archived) return { status: 409, body: { error: 'Reopen the chat first', code: 'archived' } };
   const workstream = typeof workstreamRaw === 'string' && workstreamRaw ? workstreamRaw : 'main';
   // v1 brings the project's main chat and checkout; its other workstreams are named as lost.
@@ -204,7 +183,7 @@ export async function continueOnNewBoxFor(user: Express.User, projectId: string,
   const raw = await storedRawOf(project.id, workflow.workstream.id);
   const resumedOnto = project.instance?.status === 'failed'
     && await prisma.chatResume.count({ where: { workstreamId: workflow.workstream.id, toInstanceId: project.instance.id } }) > 0;
-  const offer = newBoxOffer({ flagOn: true, isOwner: true, ask: false, box: project.instance, complete: raw?.complete === true, resumedOnto });
+  const offer = newBoxOffer({ isOwner: true, ask: false, box: project.instance, complete: raw?.complete === true, resumedOnto });
   if (!raw || !offer || offer.offer !== 'new-box') {
     if (offer?.offer === 'start-box') return { status: 409, body: { error: 'The box still exists: start it instead', code: 'box-exists' } };
     if (offer && offer.offer === null) return { status: 409, body: { error: offer.reason, code: offer.code } };
@@ -588,7 +567,6 @@ export type ContinuationPhase = 'starting-box' | 'restoring' | 'starting';
 
 /** What a send or a history read needs to know about the chat, read once (continuationFacts). */
 export interface ContinuationFacts {
-  flagOn: boolean;
   isOwner: boolean;
   ownerName: string;
   /** An ask's chat, or not the project's main one (v1): none of this applies. */
@@ -604,6 +582,15 @@ export interface ContinuationFacts {
   /** A resume onto the project's current box whose first turn hasn't gone in. */
   pendingResume: { restored: boolean } | null;
   hasHeld: boolean;
+  /**
+   * The chat has a stored transcript: while its box is down a send is held here, images and all, and
+   * starts the box, with chat-resume off and on any workstream.
+   */
+  parkHold: boolean;
+  /** An ask thread's chat: writable only by the project's owner who also owns the box (askChatSendRefusal). */
+  ask: boolean;
+  /** The caller owns the project and its box. */
+  ownsBox: boolean;
 }
 
 export type SendPlan =
@@ -620,7 +607,7 @@ const ownerOnly = (f: ContinuationFacts) => ({ kind: 'refuse' as const, status: 
 
 /** What a send to this chat does. Pure: routes/chat.ts reads the facts. */
 export function sendPlanFor(f: ContinuationFacts): SendPlan {
-  if (!f.flagOn || f.excluded) return { kind: 'normal' };
+  if (f.excluded) return parkHoldPlan(f);
   const status = f.box?.status ?? 'terminated';
   // A box that is gone: terminated, or one a continue made that failed to launch.
   // A resume left on it is stale: it can never be delivered, so it doesn't hold the send.
@@ -636,6 +623,36 @@ export function sendPlanFor(f: ContinuationFacts): SendPlan {
   const ready = f.connected && f.setupReady && !f.credentialsPending && (!f.pendingResume || f.pendingResume.restored);
   if (f.lockHeld || !ready && (f.pendingResume || f.hasHeld)) return f.isOwner || !f.lockHeld ? { kind: 'hold' } : ownerOnly(f);
   if (f.hasHeld) return { kind: 'hold' };
+  // Nothing of chat-resume's own: a stored chat's box on its way down or up still holds the send.
+  return parkHoldPlan(f);
+}
+
+const PARKED = new Set(['stopped', 'hibernated']);
+const ON_THE_WAY = new Set(['stopping', 'hibernating', 'starting']);
+const ownerOnlyStart = (f: ContinuationFacts) => ({ kind: 'refuse' as const, status: 403, code: 'owner-only' as const, reason: `Only ${f.ownerName} can start this chat's box` });
+
+/**
+ * A stored chat's send while its box is down, where chat-resume doesn't
+ * apply: a stopped or hibernated box starts and the send is held; one on its
+ * way down or up holds it (held delivery starts a box once it has stopped);
+ * held messages already waiting keep the order. Owner only, as a start is.
+ */
+function parkHoldPlan(f: ContinuationFacts): SendPlan {
+  if (!f.parkHold || !f.box || f.box.kind !== 'ec2') return { kind: 'normal' };
+  const plan = parkHoldFor(f, f.box);
+  // An ask's chat runs its turns with the box owner's access: nobody else's send may wait in it, whatever the branch.
+  if (plan.kind !== 'normal' && plan.kind !== 'refuse' && f.ask && !(f.isOwner && f.ownsBox)) {
+    return { kind: 'refuse', status: 403, code: 'owner-only', reason: `Only ${f.ownerName} can send in this ask's chat` };
+  }
+  return plan;
+}
+
+function parkHoldFor(f: ContinuationFacts, box: { id: string; status: string }): SendPlan {
+  if (PARKED.has(box.status)) return f.isOwner ? { kind: 'start-box', boxId: box.id } : ownerOnlyStart(f);
+  if (ON_THE_WAY.has(box.status)) return f.isOwner ? { kind: 'hold' } : ownerOnlyStart(f);
+  // Behind messages already waiting, connected or not, so it never lands ahead of them (as chat-resume's path),
+  // but only on a box that can still come back: a gone one never delivers them.
+  if (f.hasHeld && (box.status === 'ready' || PARKED.has(box.status) || ON_THE_WAY.has(box.status))) return { kind: 'hold' };
   return { kind: 'normal' };
 }
 
@@ -647,7 +664,10 @@ function boxGone(f: ContinuationFacts): boolean {
 
 /** The status the chat shows while it continues or its box starts, or null when it shows its own. */
 export function continuationPhase(f: ContinuationFacts): ContinuationPhase | null {
-  if (!f.flagOn || f.excluded) return null;
+  if (f.excluded) {
+    const status = f.box?.status ?? '';
+    return f.parkHold && f.hasHeld && (PARKED.has(status) || ON_THE_WAY.has(status) || !f.connected) ? 'starting' : null;
+  }
   if (f.lockHeld) return 'starting-box';
   // A resume onto a box that is gone is waiting for nothing: the next send continues again.
   if (boxGone(f)) return null;
@@ -658,7 +678,7 @@ export function continuationPhase(f: ContinuationFacts): ContinuationPhase | nul
   }
   const status = f.box?.status;
   if (f.hasHeld && (status === 'stopped' || status === 'hibernated' || status === 'starting' || !f.connected)) return 'starting';
-  return null;
+  return f.parkHold && f.hasHeld && ON_THE_WAY.has(status ?? '') ? 'starting' : null;
 }
 
 /** Why this viewer can't send here (the composer says it), or null. */
@@ -673,22 +693,23 @@ export async function continuationFacts(projectId: string, workstreamId: string,
     where: { id: projectId },
     select: {
       setupStatus: true, instanceId: true,
-      instance: { select: { id: true, status: true, kind: true } },
+      instance: { select: { id: true, status: true, kind: true, userId: true } },
       user: { select: OWNER_SELECT },
     },
   });
   const base: ContinuationFacts = {
-    flagOn: false, isOwner, ownerName: 'its owner', excluded: ask || workstreamName !== 'main', box: null, setupReady: false,
-    connected: false, complete: false, lockHeld: false, credentialsPending: false, pendingResume: null, hasHeld: false,
+    isOwner, ownerName: 'its owner', excluded: ask || workstreamName !== 'main', box: null, setupReady: false,
+    connected: false, complete: false, lockHeld: false, credentialsPending: false, pendingResume: null, hasHeld: false, parkHold: false,
+    ask, ownsBox: false,
   };
   if (!project) return base;
   const { hasHeld } = await import('./chatHeld');
-  const [flagOn, raw, lockHeld, pending, held] = await Promise.all([
-    resumeFlagOn(project.user),
+  const [raw, lockHeld, pending, held, parkHold] = await Promise.all([
     storedRawOf(projectId, workstreamId),
     continueUnderWay(projectId),
     project.instanceId ? prisma.chatResume.findFirst({ where: { workstreamId, toInstanceId: project.instanceId, noticeSentAt: null }, select: { restoredAt: true, credentialsReadyAt: true, createdAt: true } }) : null,
     hasHeld(workstreamId),
+    storedChatHolds(workstreamId),
   ]);
   const transport = project.instanceId ? instanceAgentTransport(project.instanceId) : null;
   // From the database: the delivery may be running in another orchestrator process.
@@ -697,7 +718,6 @@ export async function continuationFacts(projectId: string, workstreamId: string,
     && !(pending.createdAt && pending.createdAt.getTime() < Date.now() - CREDENTIALS_STALE_MS);
   return {
     ...base,
-    flagOn,
     ownerName: project.user.displayName || project.user.unixUsername,
     box: project.instance,
     setupReady: project.setupStatus === 'ready' || project.setupStatus === 'none',
@@ -707,5 +727,12 @@ export async function continuationFacts(projectId: string, workstreamId: string,
     credentialsPending,
     pendingResume: pending ? { restored: pending.restoredAt != null } : null,
     hasHeld: held,
+    parkHold,
+    ownsBox: isOwner && project.instance?.userId === project.user.id,
   };
+}
+
+/** Whether a send to this chat is held while its box is down (ContinuationFacts.parkHold): a stored copy to show. */
+async function storedChatHolds(workstreamId: string): Promise<boolean> {
+  return (await prisma.chatTranscript.count({ where: { workstreamId, current: true, chunks: { some: {} } } })) > 0;
 }

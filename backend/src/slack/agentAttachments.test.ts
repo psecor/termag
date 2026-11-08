@@ -2,7 +2,12 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { attachPromptBlocks, checkAttachment, offerAttachments, parseAttachValue, shareAttachment } from './agentAttachments';
+import { utimes } from 'fs/promises';
+import { existsSync } from 'fs';
+import {
+  attachPromptBlocks, checkAttachment, createRunTempDir, isRunTempDir, offerAttachments, parseAttachValue, pruneRunTempDirs,
+  RUN_DIR_TTL_MS, shareAttachment,
+} from './agentAttachments';
 
 let root: string;
 let project: string;
@@ -94,3 +99,57 @@ describe('attachments wait for the person to share them', () => {
   });
 });
 
+
+describe('per-run temp dirs', () => {
+  it('creates a fresh, private directory per run', async () => {
+    const base = await mkdtemp(join(root, 'base-'));
+    const a = await createRunTempDir(base);
+    const b = await createRunTempDir(base);
+    expect(a).not.toEqual(b);
+    expect(isRunTempDir(a, base)).toBe(true);
+    const { stat } = await import('fs/promises');
+    expect((await stat(a)).mode & 0o777).toBe(0o700);
+  });
+
+  it('takes a file only from the run\'s own temp dir, never the shared one or another run\'s', async () => {
+    const base = await mkdtemp(join(root, 'base-'));
+    const mine = await createRunTempDir(base);
+    const theirs = await createRunTempDir(base);
+    await writeFile(join(mine, 'mine.png'), 'png');
+    await writeFile(join(theirs, 'theirs.png'), 'png');
+    await writeFile(join(base, 'shared.png'), 'png');
+    expect(await checkAttachment(join(mine, 'mine.png'), project, [mine])).toMatchObject({ ok: true });
+    expect(await checkAttachment(join(theirs, 'theirs.png'), project, [mine])).toMatchObject({ ok: false });
+    expect(await checkAttachment(join(base, 'shared.png'), project, [mine])).toMatchObject({ ok: false });
+    // With no run dir, nothing in temp qualifies (the default no longer includes /tmp).
+    expect(await checkAttachment(join(mine, 'mine.png'), project)).toMatchObject({ ok: false });
+  });
+
+  it('only accepts a run dir named by a Share button that really is one', () => {
+    expect(isRunTempDir('/etc')).toBe(false);
+    expect(isRunTempDir(join(tmpdir(), 'other'))).toBe(false);
+    expect(isRunTempDir(join(tmpdir(), 'termag-slack-run-x', 'nested'))).toBe(false);
+    expect(isRunTempDir(join(tmpdir(), 'termag-slack-run-abc'))).toBe(true);
+  });
+
+  it('prunes run dirs older than a day and keeps newer ones and anything else', async () => {
+    const base = await mkdtemp(join(root, 'base-'));
+    const old = await createRunTempDir(base);
+    const fresh = await createRunTempDir(base);
+    const other = join(base, 'not-ours');
+    await mkdir(other);
+    const past = (Date.now() - RUN_DIR_TTL_MS - 60_000) / 1000;
+    await utimes(old, past, past);
+    await utimes(other, past, past);
+    await pruneRunTempDirs(base);
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(other)).toBe(true);
+  });
+
+  it('carries the run dir through the Share button, and leaves older buttons without one', () => {
+    const [, withDir] = attachPromptBlocks({ path: '/t/a.png', filename: 'a.png', size: 1 }, 'U1', '/p', '/tmp/termag-slack-run-1');
+    expect(parseAttachValue(withDir.elements[0].value)).toEqual({ forUser: 'U1', path: '/t/a.png', workingDir: '/p', runDir: '/tmp/termag-slack-run-1' });
+    expect(parseAttachValue(JSON.stringify({ u: 'U1', p: '/p/a.png', w: '/p' }))).toEqual({ forUser: 'U1', path: '/p/a.png', workingDir: '/p' });
+  });
+});

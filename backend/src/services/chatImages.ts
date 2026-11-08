@@ -5,7 +5,6 @@
  * keeps them; Claude gets them as image content blocks.
  */
 
-export const CHAT_IMAGE_INPUT_FLAG = 'chat-image-input-enabled';
 /** The runner takes images with chat-send (agent/chat-images.js). */
 export const CHAT_IMAGES_CAPABILITY = 'chat-images-v1';
 /** The runner also takes PDFs in a send's `images`, as Claude document blocks. */
@@ -76,13 +75,11 @@ export function checkChatImages(raw: unknown): ChatImagesCheck {
 }
 
 /**
- * Why this send's images cannot go, or null: images need the person's
- * chat-image-input-enabled and a box whose runner takes them; `pdfs` of
- * them, a runner that takes PDFs too.
+ * Why this send's images cannot go, or null: images need a box whose runner
+ * takes them; `pdfs` of them, a runner that takes PDFs too.
  */
-export function chatImagesRefusal(count: number, flagOn: boolean, capabilities: readonly string[], pdfs = 0, backend: string | null = null): { status: number; error: string; code: string } | null {
+export function chatImagesRefusal(count: number, capabilities: readonly string[], pdfs = 0, backend: string | null = null): { status: number; error: string; code: string } | null {
   if (count === 0) return null;
-  if (!flagOn) return { status: 403, error: 'Images in chat messages are not turned on for you', code: 'images-disabled' };
   if (!capabilities.includes(CHAT_IMAGES_CAPABILITY)) {
     return { status: 409, error: "This box's chat runner cannot take images yet; it needs an update and a restart", code: 'images-unsupported' };
   }
@@ -100,9 +97,9 @@ export function pdfCount(images: readonly ChatImage[]): number {
   return images.filter(i => i.mediaType === 'application/pdf').length;
 }
 
-/** Whether this viewer's composer offers images: their flag, on a box whose runner takes them. */
-export function chatImageInput(flagOn: boolean, capabilities: readonly string[]): boolean {
-  return flagOn && capabilities.includes(CHAT_IMAGES_CAPABILITY);
+/** Whether this viewer's composer offers images: on a box whose runner takes them. */
+export function chatImageInput(capabilities: readonly string[]): boolean {
+  return capabilities.includes(CHAT_IMAGES_CAPABILITY);
 }
 
 /** Whether it offers PDFs as well: images, on a runner that takes PDFs, in a chat on Claude's own models (no other `backend`). */

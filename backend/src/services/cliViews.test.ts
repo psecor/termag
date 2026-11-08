@@ -38,7 +38,7 @@ describe('shapeBox', () => {
     expect(shapeBox(box, true)).toEqual({
       id: 'i1', name: 'devbox', addressable: true, kind: 'ec2', flavor: 'full', state: 'running', status: 'ready',
       agentConnected: true, error: null, ec2InstanceId: 'i-0abc', region: 'us-east-2', hostUnixUser: 'zane',
-      createdAt: T.toISOString(), readyAt: T.toISOString(), projects: [{ id: 'p1', name: 'fix' }],
+      createdAt: T.toISOString(), readyAt: T.toISOString(), setupEnabled: true, projects: [{ id: 'p1', name: 'fix' }],
       size: null, instanceType: null, diskGiB: null, resize: null, createdFor: null, lifecycle: null,
     });
   });
@@ -51,6 +51,10 @@ describe('shapeBox', () => {
 
   it('carries the size and the type the box launched as', () => {
     expect(shapeBox({ ...box, size: 'small', instanceType: 'r8g.large' }, true)).toMatchObject({ size: 'small', instanceType: 'r8g.large' });
+  });
+
+  it('says when termag setup is off on a box', () => {
+    expect(shapeBox({ ...box, setupEnabled: false }, true).setupEnabled).toBe(false);
   });
 
   it('carries the disk it was made with', () => {
@@ -87,6 +91,11 @@ describe('shapeProject', () => {
   it('gives the directory under the home the box reported', () => {
     const onBox = { ...row, instance: { id: 'i1', name: 'devbox', hostHome: '/home/zane.k/' } };
     expect(shapeProject(onBox, undefined)?.directory).toBe('/home/zane.k/termag/projects/fix');
+  });
+
+  it("gives the static layout's checkout for a box made from an environment (Project.dir)", () => {
+    const onBox = { ...row, dir: '/home/zane/code/fix', instance: { id: 'i1', name: 'devbox', hostHome: '/home/zane' } };
+    expect(shapeProject(onBox, undefined)?.directory).toBe('/home/zane/code/fix');
   });
 
   it('falls back to /home/<owner> for a box that never reported a home', () => {

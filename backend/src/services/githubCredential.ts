@@ -6,8 +6,10 @@
  * (credentialStore.ts).
  */
 
+import { isDeepStrictEqual } from 'node:util';
 import type { GithubSecret } from './credentialStore';
-import { githubTokenPrefix, probeOrgAccess, TOKEN_TYPE_SENTENCE } from './githubRepos';
+import { githubTokenPrefix, probeOrgAccess, publicOrgStatuses, TOKEN_TYPE_SENTENCE } from './githubRepos';
+import type { OrgAccess } from './githubRepos';
 
 export const GITHUB_API = 'https://api.github.com';
 
@@ -25,8 +27,10 @@ export function looksLikeGithubToken(value: unknown): value is string {
  * The scopes a classic or OAuth token (what `gh auth token` prints) lacks:
  * `repo` to reach private repositories, and `read:org` (or a broader org
  * scope), which gh on the box needs to log in to the broker. Matches gh's own
- * check. Fine-grained tokens report no scopes; their access is whatever the
- * user granted.
+ * check. `workflow` is optional: without it GitHub refuses a push that changes
+ * .github/workflows compared with its copy, and termag says so where it sees
+ * the refusal (workflowScope.ts). Fine-grained tokens report no scopes; their
+ * access is whatever the user granted.
  */
 export function missingScopes(scopes: string[]): string[] {
   if (scopes.length === 0) return [];
@@ -192,7 +196,30 @@ export async function connectGithub(token: unknown, deps: GithubStoreDeps): Prom
   return { login: identity.login, label: githubLabel(identity.login) };
 }
 
-/** No row, a one-owner prefix, or a 401 leaves the row as it was. A row deleted during the probe stays deleted. */
+/**
+ * A re-probe that got no answer for an org (a 5xx, a rate limit or a transport
+ * failure) keeps that org's stored sso-required: the GitHub broker refuses on
+ * sso-required and re-checks after each refusal, so writing the transient
+ * result over it would let requests through to GitHub's own PAT 403 and stop
+ * the re-checks until the next connect.
+ */
+function keepSsoRequired(
+  stored: Readonly<Record<string, OrgAccess>> | undefined,
+  probed: Record<string, OrgAccess>,
+): Record<string, OrgAccess> {
+  const out = { ...probed };
+  for (const [org, access] of Object.entries(out)) {
+    const before = stored?.[org];
+    if (before?.status === 'sso-required' && (access.status === 'error' || access.status === 'rate-limited')) out[org] = before;
+  }
+  return out;
+}
+
+/**
+ * No row, a one-owner prefix, or a 401 leaves the row as it was. A row deleted during the probe stays deleted.
+ * A result equal to the stored row writes nothing: each write drops the token and repository caches
+ * (onGithubCredentialChange), and the broker re-checks after every SSO refusal.
+ */
 export async function recheckGithub(deps: GithubRecheckDeps): Promise<void> {
   const loaded = await deps.readSnapshot();
   if (!loaded) throw new CredentialInputError('Connect GitHub in Settings.');
@@ -200,8 +227,8 @@ export async function recheckGithub(deps: GithubRecheckDeps): Promise<void> {
   const identity = await identityOrReject(usable, deps.fetchImpl);
   const missing = missingScopes(identity.scopes);
   if (missing.length) throw scopeError(missing);
-  const orgs = await probeOrgAccess(usable, { fetchImpl: deps.fetchImpl });
-  await deps.replaceIfUnchanged(loaded.ciphertext, {
-    login: identity.login, githubUserId: identity.id, token: usable, orgs,
-  });
+  const orgs = keepSsoRequired(publicOrgStatuses(loaded.secret), await probeOrgAccess(usable, { fetchImpl: deps.fetchImpl }));
+  const next: GithubSecret = { login: identity.login, githubUserId: identity.id, token: usable, orgs };
+  if (isDeepStrictEqual(loaded.secret, next)) return;
+  await deps.replaceIfUnchanged(loaded.ciphertext, next);
 }

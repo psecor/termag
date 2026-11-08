@@ -20,7 +20,7 @@ function sources(dir: string): string[] {
 
 const frontendFlags = readFileSync(join(repo, 'frontend/src/flags.ts'), 'utf8');
 const flagsBlock = frontendFlags.match(/export const FLAGS = \{([\s\S]*?)\} as const;/)?.[1] ?? '';
-// FLAGS name -> flag key, e.g. warmPool -> warm-pool-enabled.
+// FLAGS name -> flag key, e.g. hyperspaceBackground -> hyperspace-background-enabled.
 const browserKeys = new Map([...flagsBlock.matchAll(/^\s*(\w+): '([^']+)',/gm)].map((m) => [m[1], m[2]]));
 
 const backendText = sources(join(repo, 'backend/src'))
@@ -72,7 +72,7 @@ describe('flag registry', () => {
       // the constant's declaration alone is not one.
       const names = [...backendText.matchAll(new RegExp(`const (\\w+)\\s*=\\s*['"\`]${key}['"\`]`, 'g'))].map((m) => m[1]);
       const arg = [`['"\`]${key}['"\`]`, ...names.map((n) => `${n}\\b`)].join('|');
-      const read = new RegExp(`(?:boolVariation|boolVariationForContext|stringVariation|numberVariation|numberVariationForContext|jsonVariation|jsonVariationForContext)\\(\\s*(?:${arg})`).test(backendText);
+      const read = new RegExp(`(?:boolVariation|boolVariationForContext|boolVariationOrUnknown|stringVariation|numberVariation|numberVariationForContext|jsonVariation|jsonVariationForContext|jsonVariationOrUnknown)\\(\\s*(?:${arg})`).test(backendText);
       const listed = FLAG_REGISTRY[key].server.length > 0;
       expect(read, `${key}: server is ${JSON.stringify(FLAG_REGISTRY[key].server)}, but backend/src ${read ? 'reads' : 'never reads'} it`).toBe(listed);
     }

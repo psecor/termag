@@ -44,11 +44,9 @@ const store: CliStore = {
 
 interface Calls { latest: string[]; dismiss: Array<[string, unknown]>; restore: Array<[string, string]>; run: Array<[string, unknown]>; list: Array<[string, number]>; one: Array<[string, string]>; schedule: string[]; saveSchedule: Array<[string, BriefingSchedule]> }
 let calls: Calls;
-let enabledFor: Set<string>;
 let runAnswer: { status: number; body: unknown };
 
 const briefings: CliBriefings = {
-  enabled: async user => enabledFor.has(user.id),
   latest: async user => { calls.latest.push(user.id); return { latest: { id: `b-${user.id}` }, pending: null, dismissals: [] }; },
   dismiss: async (user, input) => {
     calls.dismiss.push([user.id, input]);
@@ -76,7 +74,6 @@ beforeAll(async () => {
 afterAll(() => new Promise<void>(r => server.close(() => r())));
 beforeEach(() => {
   calls = { latest: [], dismiss: [], restore: [], run: [], list: [], one: [], schedule: [], saveSchedule: [] };
-  enabledFor = new Set(['alice', 'bob']);
   runAnswer = { status: 202, body: { id: 'b-new', status: 'running' } };
 });
 
@@ -202,22 +199,8 @@ describe('/api/cli/v1/briefings', () => {
     expect(calls).toEqual({ latest: [], dismiss: [], restore: [], run: [], list: [], one: [], schedule: [], saveSchedule: [] });
   });
 
-  it('answers 404 with desktop-app-enabled off for the person, and 401 without a sign-in', async () => {
-    enabledFor.delete('bob');
-    const off = await call('GET', '/briefings/latest', DEVICE.bob);
-    expect(off.status).toBe(404);
-    expect(await off.json()).toMatchObject({ code: 'not_found' });
-    expect((await call('POST', '/briefings/run', DEVICE.bob, {})).status).toBe(404);
-    expect((await call('GET', '/briefings', DEVICE.bob)).status).toBe(404);
-    expect((await call('GET', '/briefings/b1', DEVICE.bob)).status).toBe(404);
-    expect((await call('GET', '/briefings/schedule', DEVICE.bob)).status).toBe(404);
-    expect((await call('PUT', '/briefings/schedule', DEVICE.bob, OFF)).status).toBe(404);
+  it('answers 401 without a sign-in', async () => {
     expect((await call('GET', '/briefings/latest', null)).status).toBe(401);
-    expect(calls.latest).toEqual([]);
-    expect(calls.run).toEqual([]);
-    expect(calls.list).toEqual([]);
-    expect(calls.one).toEqual([]);
-    expect(calls.schedule).toEqual([]);
-    expect(calls.saveSchedule).toEqual([]);
   });
+
 });

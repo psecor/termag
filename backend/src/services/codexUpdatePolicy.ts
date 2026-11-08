@@ -28,12 +28,11 @@
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const CODEX_UPDATE_POLICY_FLAG = 'codex-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for Codex and a box's policy says restart nothing. */
-export const CODEX_UPDATE_ENABLED_FLAG = 'codex-update-enabled';
 
 export const CODEX_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_CODEX_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '0.131.0',
   target: 'latest',
   restart: 'none',
@@ -43,5 +42,5 @@ export const DEFAULT_CODEX_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over Codex's defaults; a bad key keeps its default. */
 export function parseCodexUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_CODEX_UPDATE_POLICY, CODEX_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_CODEX_UPDATE_POLICY, CODEX_TARGET_TAGS, undefined, CODEX_UPDATE_POLICY_FLAG);
 }

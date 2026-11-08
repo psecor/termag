@@ -6,13 +6,14 @@ const prisma = vi.hoisted(() => ({
   project: { findMany: vi.fn() },
   user: { findUnique: vi.fn() },
   boxEvent: { findMany: vi.fn().mockResolvedValue([]) },
+  spaceSlack: { findMany: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../db', () => ({ prisma }));
 vi.mock('./agentRegistry', () => ({ isInstanceAgentConnected: () => true }));
 vi.mock('./status', () => ({ getAllStatuses: () => new Map() }));
-// box-auto-lifecycle-enabled is on; every other flag reads its fallback.
+// Every flag reads its fallback.
 vi.mock('./featureFlags', () => ({
-  boolVariation: async (key: string, _user: unknown, fallback: boolean) => key === 'box-auto-lifecycle-enabled' || fallback,
+  boolVariation: async (_key: string, _user: unknown, fallback: boolean) => fallback,
   numberVariation: async (_key: string, _user: unknown, fallback: number) => fallback,
 }));
 
@@ -58,6 +59,28 @@ describe('prismaCliStore lists', () => {
     prisma.user.findUnique.mockResolvedValue(null);
     prisma.instance.findMany.mockResolvedValue([box('devbox', null)]);
     expect((await prismaCliStore.listBoxes('u1')).map(b => b.lifecycle)).toEqual([null]);
+  });
+
+  // `termag box rm` confirms from this list and archives every live project,
+  // so a space orchestrator's is in it, labelled (projectKind.ts inProjectLists).
+  it("embeds every live project under its box, a space orchestrator's labelled", async () => {
+    prisma.instance.findMany.mockResolvedValue([{
+      ...box('runnerbox', null),
+      projects: [{ id: 'p-app', name: 'app', kind: 'normal' }, { id: 'p-space', name: 'space-design', kind: 'space-orchestrator' }],
+    }]);
+    prisma.spaceSlack.findMany.mockResolvedValue([{ projectId: 'p-space', space: { name: 'design' } }]);
+    const [runnerbox] = await prismaCliStore.listBoxes('u1');
+    expect(prisma.instance.findMany.mock.calls[0][0].include.projects.where).toEqual({ archived: false });
+    expect(runnerbox.projects).toEqual([
+      { id: 'p-app', name: 'app' },
+      { id: 'p-space', name: 'space-design', label: 'space orchestrator for design' },
+    ]);
+  });
+
+  it('lists no space orchestrator among the projects', async () => {
+    prisma.project.findMany.mockResolvedValue([]);
+    await prismaCliStore.listProjects('u1');
+    expect(prisma.project.findMany.mock.calls[0][0].where.kind.in).not.toContain('space-orchestrator');
   });
 
   it("gives each project's createdFor: 'ask' for an ask project, null otherwise", async () => {

@@ -34,6 +34,12 @@ describe('token checks', () => {
     expect(missingScopes(['repo', 'gist'])).toEqual(['read:org']);
     expect(missingScopes(['gist'])).toEqual(['repo', 'read:org']);
   });
+
+  it('treats workflow as optional: a token without it lacks nothing, and one with it no more', () => {
+    expect(missingScopes(['repo', 'read:org'])).toEqual([]);
+    expect(missingScopes(['repo', 'read:org', 'workflow'])).toEqual([]);
+    expect(missingScopes(['read:org', 'workflow'])).toEqual(['repo']);
+  });
 });
 
 function fakeGithub(opts: { scopes?: string; userStatus?: number } = {}) {
@@ -83,6 +89,14 @@ describe('connectGithub', () => {
     expect(got).toEqual({ login: 'octocat', label: '@octocat' });
     expect(store.value).toMatchObject({ login: 'octocat', githubUserId: 583231, token: PAT });
     expect(gh.calls.every(c => c.auth === `Bearer ${PAT}`)).toBe(true);
+  });
+
+  it('stores a classic token with repo and read:org but no workflow scope', async () => {
+    const gh = fakeGithub({ scopes: 'repo, read:org' });
+    const store = memoryStore();
+    const got = await connectGithub(SENTINEL, { ...store, fetchImpl: gh.fetchImpl });
+    expect(got).toEqual({ login: 'octocat', label: '@octocat' });
+    expect(store.value).toMatchObject({ login: 'octocat', githubUserId: 583231, token: SENTINEL });
   });
 
   it('refuses ghu_ with the one-owner sentence and does not call GitHub', async () => {
@@ -253,5 +267,107 @@ describe('recheckGithub', () => {
     expect(err.message).toBe(GITHUB_REJECTED_SENTENCE);
     expect(err.message).not.toContain(SENTINEL);
     expect(writes).toBe(0);
+  });
+
+  it('keeps a stored sso-required org when its re-probe is a 5xx, a rate limit or a transport failure', async () => {
+    const orgs = [...repoOrgs()];
+    expect(orgs.length).toBeGreaterThanOrEqual(1);
+    const ssoUrl = (org: string) => `https://github.com/orgs/${org}/sso?authorization_request=1`;
+    // Every org was sso-required; this probe gets no definite answer for any of them.
+    const stored = Object.fromEntries(orgs.map(org => [org, { status: 'sso-required' as const, ssoUrl: ssoUrl(org) }]));
+    const failures: Record<string, () => Response> = {
+      '5xx': () => new Response('{}', { status: 502 }),
+      'rate limit': () => new Response('{}', { status: 429, headers: { 'retry-after': '60' } }),
+      'transport failure': () => { throw new TypeError('fetch failed'); },
+    };
+    for (const [kind, fail] of Object.entries(failures)) {
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.endsWith('/user')) {
+          // A renamed login, so the re-check has a change to write and the orgs it writes can be checked.
+          return new Response(JSON.stringify({ login: 'octocat2', id: 1 }), {
+            headers: { 'x-oauth-scopes': 'repo, read:org' },
+          });
+        }
+        return fail();
+      });
+      let written: GithubSecret | null = null;
+      await recheckGithub({
+        readSnapshot: async () => ({
+          secret: { login: 'octocat', githubUserId: 1, token: SENTINEL, orgs: stored },
+          ciphertext: new Uint8Array([3]),
+        }),
+        replaceIfUnchanged: async (_c, secret) => { written = secret; return true; },
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      });
+      expect(written!.orgs, kind).toEqual(stored);
+    }
+  });
+
+  it('writes nothing when the identity and every org status are what is stored', async () => {
+    const orgs = [...repoOrgs()];
+    const [first, ...rest] = orgs;
+    const stored: GithubSecret = {
+      login: 'octocat', githubUserId: 1, token: SENTINEL,
+      orgs: {
+        [first!]: { status: 'sso-required', ssoUrl: `https://github.com/orgs/${first}/sso` },
+        ...Object.fromEntries(rest.map(org => [org, { status: 'ok' as const }])),
+      },
+    };
+    const run = (answer: () => Response) => {
+      let writes = 0;
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.endsWith('/user')) {
+          return new Response(JSON.stringify({ login: 'octocat', id: 1 }), {
+            headers: { 'x-oauth-scopes': 'repo, read:org' },
+          });
+        }
+        if (url.includes(`/orgs/${first}/repos`)) return answer();
+        return new Response('[]');
+      });
+      return recheckGithub({
+        readSnapshot: async () => ({ secret: stored, ciphertext: new Uint8Array([5]) }),
+        replaceIfUnchanged: async () => { writes += 1; return true; },
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      }).then(() => writes);
+    };
+    // The same sso-required answer, and a 502 that keeps the stored sso-required.
+    const sso = () => new Response('{}', { status: 403, headers: { 'X-GitHub-SSO': `required; url=https://github.com/orgs/${first}/sso` } });
+    expect(await run(sso)).toBe(0);
+    expect(await run(() => new Response('{}', { status: 502 }))).toBe(0);
+    // A change still writes.
+    expect(await run(() => new Response('[]'))).toBe(1);
+  });
+
+  it('writes a transient result over a stored ok org, and a definite one over sso-required', async () => {
+    const orgs = [...repoOrgs()];
+    const [first, ...rest] = orgs;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/user')) {
+        return new Response(JSON.stringify({ login: 'octocat', id: 1 }), {
+          headers: { 'x-oauth-scopes': 'repo, read:org' },
+        });
+      }
+      if (url.includes(`/orgs/${first}/repos`)) return new Response('{}', { status: 503 });
+      return new Response('[]');
+    });
+    let written: GithubSecret | null = null;
+    await recheckGithub({
+      readSnapshot: async () => ({
+        secret: {
+          login: 'octocat', githubUserId: 1, token: SENTINEL,
+          orgs: {
+            [first!]: { status: 'ok' },
+            ...Object.fromEntries(rest.map(org => [org, { status: 'sso-required' as const, ssoUrl: null }])),
+          },
+        },
+        ciphertext: new Uint8Array([4]),
+      }),
+      replaceIfUnchanged: async (_c, secret) => { written = secret; return true; },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(written!.orgs).toEqual({
+      [first!]: { status: 'error', retryAfter: null },
+      ...Object.fromEntries(rest.map(org => [org, { status: 'ok' as const }])),
+    });
   });
 });

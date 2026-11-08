@@ -137,6 +137,12 @@ describe('hibernationAfterResize: DescribeInstanceTypes may not answer (Bugbot o
   });
 });
 
+describe('resizeBlockers and a disk grow', () => {
+  it('leaves out the disk-grow busy check: the resize waits for the grow instead of refusing (#1214)', () => {
+    expect(resizeBlockers({ status: 'ready', onClaimStatus: null, claimedAt: null } as never, { busy: ['disk-grow'], working: false })).toEqual([]);
+  });
+});
+
 describe('resizeView, from the box_events row', () => {
   const row = (over: Record<string, unknown> = {}) => ({
     startedAt: new Date(NOW), finishedAt: null, from: 'small', to: 'large', phase: 'requested', error: null,
@@ -147,6 +153,11 @@ describe('resizeView, from the box_events row', () => {
     const view = resizeView(row({ startedAt: new Date(NOW - RESIZE_STALE_MS - 1), phase: 'stopping' }), NOW)!;
     expect(view).toMatchObject({ running: false, phase: 'failed', error: expect.stringMatching(/cut off/) });
     expect(resizeInFlight({ startedAt: new Date(NOW - 1000), finishedAt: null }, NOW)).toBe(true);
+  });
+
+  it('reads requested as waiting for the disk when the resize was asked while a grow ran (Cursor on #1214)', () => {
+    expect(resizeView(row({ detail: { fromStatus: 'ready', withDisk: true } }), NOW)!.phase).toBe('disk');
+    expect(resizeView(row({ detail: { fromStatus: 'ready' } }), NOW)!.phase).toBe('stopping');
   });
 
   it('reads requested as the first step, and done as how it ended', () => {

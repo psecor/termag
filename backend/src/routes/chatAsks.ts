@@ -7,7 +7,9 @@
  * as the thread recorded (AgentThread.parentProjectId / parentWorkstream),
  * plus any of the caller's threads named in `threads`: the ids the chat's
  * `termag ask` calls printed, which covers a thread from before the parent
- * link or from a session whose sender wasn't recorded. Each with its
+ * link or from a session whose sender wasn't recorded. The newest
+ * MAX_CHAT_ASK_THREADS of them, and past those every one still going, every
+ * one named and those that ended in the last hour (pastThreads). Each with its
  * messages' state (services/chatAsks.ts). Asks are owner-only
  * (docs/agents/gotchas.md, ask-owner-only), so this only ever answers
  * threads the caller started; a sharee reading the chat gets none. Behind
@@ -21,7 +23,10 @@ import { asyncHandler } from '../middleware/errors';
 import { boolVariation } from '../services/featureFlags';
 import type { FlagUser } from '../services/featureFlags';
 import { CHAT_SUBAGENTS_FLAG } from '../services/chatRunner';
-import { MAX_CHAT_ASK_MESSAGES, MAX_CHAT_ASK_THREADS, chatAskThreadView, parseThreadIds } from '../services/chatAsks';
+import { ASK_NOTICE_FLAG } from '../services/askNotice';
+import { ASK_KEPT_AFTER_END_MS, MAX_CHAT_ASK_MESSAGES, MAX_CHAT_ASK_THREADS, chatAskThreadView, parseThreadIds, type NoticeReader } from '../services/chatAsks';
+import { ACTIVE_STATES, MAX_ACTIVE_ASKS } from '../services/agentMessages';
+import { withoutSurface } from '../services/requestSurface';
 
 interface Result { status: number; body: unknown }
 
@@ -36,10 +41,10 @@ export async function chatAsksFor(userId: string, projectId: string, query: Requ
   return {
     status: 200,
     body: {
-      threads: await askThreadsOf(userId, [
+      threads: await askThreadsOf(userId, ldUser, { projectId, workstream }, [
         { parentProjectId: projectId, parentWorkstream: workstream },
         ...(ids.length ? [{ id: { in: ids } }] : []),
-      ]),
+      ], ids),
     },
   };
 }
@@ -64,38 +69,91 @@ export async function desktopChatAsksFor(userId: string, query: Request['query']
   return {
     status: 200,
     body: {
-      threads: await askThreadsOf(userId, [
+      // A desktop thread is no termag chat, so no finish notice tells it (services/chatAsks.ts noticeState).
+      threads: await askThreadsOf(userId, ldUser, null, [
         ...(ids.length ? [{ id: { in: ids } }] : []),
         ...(session ? [{ parentClaudeSession: session }] : []),
-      ]),
+      ], ids),
     },
   };
 }
 
-/** The caller's own ask threads matching any of `match`, oldest first, each with its newest messages (services/chatAsks.ts). Asks are owner-only. */
-async function askThreadsOf(userId: string, match: Prisma.AgentThreadWhereInput[]) {
-  const rows = await prisma.agentThread.findMany({
-    where: { originUserId: userId, OR: match },
+const THREAD_SELECT = {
+  id: true, title: true, hopCount: true, branch: true, prNumber: true, prUrl: true,
+  projectId: true, workstream: true, repoName: true, instanceId: true, createdAt: true,
+  prs: { select: { key: true, branch: true, prNumber: true, prUrl: true }, orderBy: { createdAt: 'asc' } },
+  project: { select: { name: true, instance: { select: { name: true } } } },
+  chatWorkstream: { select: { name: true } },
+  messages: {
     select: {
-      id: true, title: true, hopCount: true, branch: true, prNumber: true, prUrl: true,
-      projectId: true, workstream: true, repoName: true, instanceId: true, createdAt: true,
-      prs: { select: { key: true, branch: true, prNumber: true, prUrl: true }, orderBy: { createdAt: 'asc' } },
-      project: { select: { name: true, instance: { select: { name: true } } } },
-      chatWorkstream: { select: { name: true } },
-      messages: {
-        select: {
-          id: true, hop: true, status: true, error: true, replyBytes: true, publish: true, publishDetail: true,
-          createdAt: true, startedAt: true, completedAt: true, readAt: true, queuedPrompt: true, supersededById: true,
-          storedReply: { select: { bytes: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: MAX_CHAT_ASK_MESSAGES,
-      },
+      id: true, hop: true, status: true, error: true, replyBytes: true, publish: true, publishDetail: true,
+      createdAt: true, startedAt: true, completedAt: true, readAt: true, queuedPrompt: true, supersededById: true,
+      notifyVia: true, notifyProjectId: true, notifyWorkstream: true, notice: true,
+      storedReply: { select: { bytes: true } },
     },
+    orderBy: { createdAt: 'desc' },
+    take: MAX_CHAT_ASK_MESSAGES,
+  },
+} satisfies Prisma.AgentThreadSelect;
+
+/**
+ * The caller's own ask threads matching any of `match`, oldest first, each
+ * with its newest messages (services/chatAsks.ts), their finish notices as
+ * `chat` (the reading chat, or null) is told of them: the newest
+ * MAX_CHAT_ASK_THREADS, and past those the ones pastThreads keeps. Asks are
+ * owner-only, so the caller is every message's sender, and its
+ * ask-completion-notify-enabled is the one the notice sweep reads. The sweep
+ * reads it outside any request, so this reads it with no request surface
+ * (requestSurface.ts), in the same context.
+ */
+async function askThreadsOf(userId: string, ldUser: FlagUser, chat: NoticeReader['chat'], match: Prisma.AgentThreadWhereInput[], named: string[]) {
+  const flagOn = withoutSurface(() => boolVariation(ASK_NOTICE_FLAG, ldUser, false));
+  const newest = await prisma.agentThread.findMany({
+    where: { originUserId: userId, OR: match },
+    select: THREAD_SELECT,
     orderBy: { createdAt: 'desc' },
     take: MAX_CHAT_ASK_THREADS,
   });
-  return rows.reverse().map(chatAskThreadView);
+  // Fewer than a full page is every thread there is; only a full one can have left one out.
+  const past = newest.length < MAX_CHAT_ASK_THREADS ? [] : await pastThreads(userId, match, named, newest.map(t => t.id));
+  const reader: NoticeReader = { flagOn: await flagOn, chat };
+  return [...newest, ...past]
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .map(t => chatAskThreadView(t, reader));
+}
+
+/**
+ * Past the newest MAX_CHAT_ASK_THREADS (`seen`), so that a chat that has sent
+ * more still sees the asks it is waiting on: every thread still going (a
+ * message submitted or working; at most MAX_ACTIVE_ASKS can be), every one
+ * its calls named (at most MAX_CHAT_ASK_THREADS, parseThreadIds), and then,
+ * read after those and apart from them so they neither crowd those out nor
+ * take a place of their own, the newest MAX_CHAT_ASK_THREADS others that
+ * ended in the last ASK_KEPT_AFTER_END_MS, so one the chat watched shows how
+ * it ended rather than leaving its drawer.
+ */
+async function pastThreads(userId: string, match: Prisma.AgentThreadWhereInput[], named: string[], seen: string[]) {
+  const kept = await prisma.agentThread.findMany({
+    where: {
+      originUserId: userId,
+      id: { notIn: seen },
+      OR: [...(named.length ? [{ id: { in: named } }] : []), { OR: match, messages: { some: { status: { in: ACTIVE_STATES } } } }],
+    },
+    select: THREAD_SELECT,
+    take: MAX_CHAT_ASK_THREADS + MAX_ACTIVE_ASKS,
+  });
+  const ended = await prisma.agentThread.findMany({
+    where: {
+      originUserId: userId,
+      id: { notIn: [...seen, ...kept.map(t => t.id)] },
+      OR: match,
+      messages: { some: { completedAt: { gte: new Date(Date.now() - ASK_KEPT_AFTER_END_MS) } } },
+    },
+    select: THREAD_SELECT,
+    orderBy: { createdAt: 'desc' },
+    take: MAX_CHAT_ASK_THREADS,
+  });
+  return [...kept, ...ended];
 }
 
 export function chatAsksRouter(): Router {

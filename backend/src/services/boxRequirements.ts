@@ -54,8 +54,12 @@ const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 export function parseRequirements(value: unknown): { ok: true; requirements: BoxRequirements } | { ok: false; why: string } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, why: 'not a size or a { "vcpu", "memoryGiB" } object' };
   const record = value as Record<string, unknown>;
-  const extra = Object.keys(record).filter(k => k !== 'vcpu' && k !== 'memoryGiB');
-  if (extra.length) return { ok: false, why: `${extra.map(k => `"${k}"`).join(', ')} is not a requirement termag knows (vcpu, memoryGiB)` };
+  // diskGiB is the schema's (docs/environment.schema.json): checked, not applied yet.
+  const extra = Object.keys(record).filter(k => k !== 'vcpu' && k !== 'memoryGiB' && k !== 'diskGiB');
+  if (extra.length) return { ok: false, why: `${extra.map(k => `"${k}"`).join(', ')} is not a requirement termag knows (vcpu, memoryGiB, diskGiB)` };
+  if (record.diskGiB !== undefined && (!Number.isInteger(record.diskGiB) || (record.diskGiB as number) < 50 || (record.diskGiB as number) > 300)) {
+    return { ok: false, why: '"diskGiB" must be a whole number from 50 to 300' };
+  }
   const { vcpu, memoryGiB } = record;
   if (!Number.isInteger(vcpu) || (vcpu as number) < 1) return { ok: false, why: '"vcpu" must be a whole number of at least 1' };
   if (!Number.isInteger(memoryGiB) || (memoryGiB as number) < 1) return { ok: false, why: '"memoryGiB" must be a whole number of at least 1' };

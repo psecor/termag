@@ -1,6 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../db', () => ({ prisma: { automation: { count: vi.fn(async () => 2) } } }));
+const users = vi.hoisted(() => ({ stored: null as null | { boxIdleNotify: boolean }, updates: [] as unknown[], updateFails: false }));
+vi.mock('../db', () => ({
+  prisma: {
+    automation: { count: vi.fn(async () => 2) },
+    user: {
+      findUnique: vi.fn(async () => users.stored),
+      update: vi.fn(async (args: unknown) => { if (users.updateFails) throw new Error('db down'); users.updates.push(args); return {}; }),
+    },
+  },
+}));
 
 const slack = {
   client: null as null | { chat: { postMessage: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn> } },
@@ -22,8 +31,8 @@ const events: Array<{ name: string; detail: unknown }> = [];
 vi.mock('./productEvents', () => ({ recordProductEvent: (name: string, _ctx: unknown, detail: unknown) => { events.push({ name, detail }); } }));
 
 const {
-  aboutDuration, automationsSkippedWhileParked, KEEP_RUNNING_ACTION, parkedMessage, registerBoxIdleSlackActions,
-  scanClause, sendIdleNotice, stuckStartMessage, stuckStartWarningMessage, warningMessage,
+  aboutDuration, automationsPausedMessage, automationsSkippedWhileParked, KEEP_RUNNING_ACTION, parkedMessage, registerBoxIdleSlackActions,
+  scanClause, sendIdleNotice, STOP_NOTICES_ACTION, stuckStartMessage, stuckStartWarningMessage, warningMessage,
 } = await import('./boxIdleNotices');
 
 const HOUR = 60 * 60 * 1000;
@@ -35,6 +44,9 @@ beforeEach(() => {
   slack.client = { chat: { postMessage: vi.fn(async () => ({ ok: true })), update: vi.fn(async () => ({ ok: true })) } };
   slack.slackId = 'U1';
   mapped.user = null;
+  users.stored = null;
+  users.updates = [];
+  users.updateFails = false;
   kept.calls = [];
   kept.result = { status: 200, body: { lifecycle: { idleLimitHours: 72 } } };
   events.length = 0;
@@ -58,6 +70,7 @@ describe('warningMessage', () => {
     const actions = (m.blocks[1] as { elements: Array<{ action_id?: string; value?: string; url?: string }> }).elements;
     expect(actions[0]).toMatchObject({ action_id: KEEP_RUNNING_ACTION, value: 'b1' });
     expect(actions[1]).toMatchObject({ url: 'https://termag.example' });
+    expect(actions[2]).toMatchObject({ action_id: STOP_NOTICES_ACTION });
   });
 
   it('says a hibernated box resumes, and names automations the park will skip', () => {
@@ -129,6 +142,71 @@ describe('sendIdleNotice', () => {
     slack.client = null;
     expect(await sendIdleNotice('parked', owner, box, { text: 't', blocks: [] })).toBe(false);
     expect(events.map(e => (e.detail as { reason: string }).reason)).toEqual(['no-slack-user', 'post-failed', 'no-slack']);
+  });
+
+  it("skips a warning or parked notice for an owner who turned them off, and records it as muted", async () => {
+    users.stored = { boxIdleNotify: false };
+    expect(await sendIdleNotice('warning', owner, box, { text: 't', blocks: [] })).toBe(false);
+    expect(await sendIdleNotice('parked', owner, box, { text: 't', blocks: [] })).toBe(false);
+    expect(slack.client!.chat.postMessage).not.toHaveBeenCalled();
+    expect(events.map(e => e.detail)).toEqual([
+      { kind: 'warning', delivered: false, reason: 'muted' },
+      { kind: 'parked', delivered: false, reason: 'muted' },
+    ]);
+  });
+
+  it('still sends the automations-paused notice to an owner who turned the stop notices off', async () => {
+    users.stored = { boxIdleNotify: false };
+    expect(await sendIdleNotice('automation-paused', owner, box, { text: 't', blocks: [] })).toBe(true);
+    expect(slack.client!.chat.postMessage).toHaveBeenCalled();
+  });
+});
+
+describe('Stop these messages', () => {
+  const buttons = (m: { blocks: unknown[] }) => m.blocks
+    .flatMap(b => ((b as { elements?: Array<{ action_id?: string }> }).elements ?? []))
+    .map(e => e.action_id);
+
+  it('is on every stop notice, and not on the automations-paused notice', () => {
+    const scan = { repos: [], errors: [], keptCheckouts: 0 };
+    expect(buttons(warningMessage(box, { action: 'stop', parkAt: new Date(NOW + HOUR), idleMs: HOUR, skippedAutomations: 0 }, NOW))).toContain(STOP_NOTICES_ACTION);
+    expect(buttons(parkedMessage(box, 'stopped', { hours: 48, source: 'default' }, scan))).toContain(STOP_NOTICES_ACTION);
+    expect(buttons(stuckStartWarningMessage(box, new Date(NOW - HOUR), new Date(NOW + HOUR), NOW))).toContain(STOP_NOTICES_ACTION);
+    expect(buttons(stuckStartMessage(box, null))).toContain(STOP_NOTICES_ACTION);
+    expect(buttons(automationsPausedMessage(box, ['nightly'], 'lifecycle'))).not.toContain(STOP_NOTICES_ACTION);
+  });
+
+  function handler() {
+    let registered: ((args: any) => Promise<void>) | null = null;
+    registerBoxIdleSlackActions({ action: (id: string, fn: any) => { if (id === STOP_NOTICES_ACTION) registered = fn; } });
+    return registered!;
+  }
+  const click = (fn: (args: any) => Promise<void>) => fn({
+    ack: vi.fn(async () => {}), client: slack.client, action: { value: 'off' },
+    body: { user: { id: 'U9' }, container: { channel_id: 'D1', message_ts: '1.2' } },
+  });
+
+  it("turns off the clicking person's notices, says where to turn them back on, and leaves the message alone", async () => {
+    mapped.user = { id: 'u1', unixUsername: 'vic' } as { id: string };
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await click(handler());
+    expect(users.updates).toEqual([{ where: { id: 'u1' }, data: { boxIdleNotify: false } }]);
+    expect(slack.client!.chat.postMessage).toHaveBeenCalledWith({
+      channel: 'D1',
+      text: expect.stringMatching(/^Done: I won't message you .* <https:\/\/termag\.example\/settings#box-notices\|Settings › Box notices>\.$/),
+    });
+    expect(slack.client!.chat.update).not.toHaveBeenCalled();
+  });
+
+  it("changes nothing for a Slack user it can't match, and says so when the write fails", async () => {
+    await click(handler());
+    expect(users.updates).toEqual([]);
+    expect(slack.client!.chat.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ text: expect.stringMatching(/could not match your Slack account/) }));
+    mapped.user = { id: 'u1' };
+    users.updateFails = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await click(handler());
+    expect(slack.client!.chat.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ text: expect.stringMatching(/did not save/) }));
   });
 });
 

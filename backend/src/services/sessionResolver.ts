@@ -12,7 +12,7 @@
  * Slack poll loops) don't re-query the DB on every tick.
  */
 import { prisma } from '../db';
-import { reviewSessionNames, sessionName as buildSessionName, tmuxSafeName } from './tmux';
+import { reviewSessionNames, sessionName as buildSessionName, terminalSessionNames, tmuxSafeName } from './tmux';
 
 
 const ROLES = ['agent', 'ctrl', 'data', 'data-ctrl', 'review'] as const;
@@ -83,8 +83,11 @@ function collectMatches(session: string, owner: string, projects: ProjectLike[])
           break;
         }
       }
-      // Review slots 2..8; slot 1 is the role's own name above.
-      if (!hit && reviewSessionNames(owner, p.name, ws).includes(session)) {
+      // Review slots 2..8 and the user's terminal
+      // slots 2..8; each role's slot 1 is the role's
+      // own name matched above.
+      if (!hit && (reviewSessionNames(owner, p.name, ws).includes(session)
+        || terminalSessionNames(owner, p.name, ws).includes(session))) {
         matches.push({ projectId: p.id, workstream: ws, instanceId: p.instanceId });
         hit = true;
       }

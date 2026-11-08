@@ -36,12 +36,14 @@ export function resizeInFlight(row: Pick<ResizeEventRow, 'startedAt' | 'finished
 }
 
 /**
- * Where a resize is. `resuming` only for a hibernated box; `ready` (back up
+ * Where a resize is. `disk` only while the box's disk grows (the owner asked
+ * for both, services/boxDisk.ts): the resize waits for it before it stops the
+ * box. `resuming` only for a hibernated box; `ready` (back up
  * on the new size), `stopped` (it was down, and stays down) and `failed` are
  * where one ends, and the row keeps the last one until the next resize.
  */
-export type ResizePhase = 'resuming' | 'stopping' | 'resizing' | 'starting' | 'ready' | 'stopped' | 'failed';
-export const RESIZE_RUNNING_PHASES: readonly ResizePhase[] = ['resuming', 'stopping', 'resizing', 'starting'];
+export type ResizePhase = 'disk' | 'resuming' | 'stopping' | 'resizing' | 'starting' | 'ready' | 'stopped' | 'failed';
+export const RESIZE_RUNNING_PHASES: readonly ResizePhase[] = ['disk', 'resuming', 'stopping', 'resizing', 'starting'];
 
 /** A warm-pool claim's on-claim run (dotfiles, keys) still counts as in flight for this long. */
 export const CLAIM_IN_FLIGHT_MS = 30 * 60 * 1000;
@@ -159,6 +161,8 @@ export function resizeBlockers(box: BlockerBox, facts: { busy: readonly string[]
   if (claiming) out.push({ check: 'claim', reason: 'it is still being set up for its owner after a warm-pool claim', forceable: false });
   if (facts.working) out.push({ check: 'working', ...BLOCKER_TEXT.working });
   for (const check of new Set(facts.busy)) {
+    // A growing disk doesn't block a resize: the resize waits for the grow before it stops the box (boxResize.runResize).
+    if (check === 'disk-grow') continue;
     const known = BLOCKER_TEXT[check];
     if (known) out.push({ check, ...known });
     // A check that failed counts as busy (boxLifecycle.busyBoxes), but only a person can say it isn't.
@@ -288,12 +292,13 @@ export function resizeView(row: ResizeEventRow | null | undefined, nowMs = Date.
   if (!row) return null;
   const running = resizeInFlight(row, nowMs);
   const stale = !running && !row.finishedAt;
-  const detail = (row.detail && typeof row.detail === 'object' ? row.detail : {}) as { fromStatus?: string; end?: string };
+  const detail = (row.detail && typeof row.detail === 'object' ? row.detail : {}) as { fromStatus?: string; end?: string; withDisk?: boolean };
   const fromStatus = detail.fromStatus ?? null;
   // The row's phase in the views' words: requested reads as the first step, done as how it ended.
   const phase: ResizePhase | null = stale || row.phase === 'failed' ? 'failed'
     : row.phase === 'done' ? (detail.end === 'stopped' ? 'stopped' : 'ready')
-      : row.phase === 'requested' ? (fromStatus === 'hibernated' ? 'resuming' : fromStatus === 'ready' ? 'stopping' : 'resizing')
+      // Asked while the disk grew (detail.withDisk): its first step is waiting for that, not the stop (Cursor on #1214).
+      : row.phase === 'requested' ? (detail.withDisk ? 'disk' : fromStatus === 'hibernated' ? 'resuming' : fromStatus === 'ready' ? 'stopping' : 'resizing')
         : row.phase as ResizePhase;
   return {
     to: row.to ?? null,

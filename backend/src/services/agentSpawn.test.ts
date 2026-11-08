@@ -127,6 +127,8 @@ describe('names', () => {
     expect(nameFromBranch('...')).toBe('');
     expect(nameFromBranch('run/20261020/0900')).toBe('');
     expect(nameFromBranch('run/20261020/0900/2')).toBe('');
+    expect(nameFromBranch('ask/cmvpvr0by19t1ex4aevd9iv3e')).toBe('');
+    expect(nameFromBranch('ask/20261020/0900')).toBe('ask-20261020-0900');
   });
 
   it('makes a name unique against taken ones, case-insensitively', () => {

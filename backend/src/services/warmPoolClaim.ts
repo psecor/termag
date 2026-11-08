@@ -22,9 +22,6 @@ import { syncBoxAuthorizedKeys } from './sshKeySync';
 import { deliverToInstance } from './credentialDelivery';
 import { startClaimUpdate } from './claimUpdate';
 
-/** Per-user gate on the whole claim path. Off unless TERMAG_FLAGS turns it on. */
-export const WARM_POOL_ENABLED_FLAG = 'warm-pool-enabled';
-
 /**
  * How many boxes a single Add box click will burn before giving up on the pool.
  * Each failed candidate costs one agent RPC timeout, so this is also the worst

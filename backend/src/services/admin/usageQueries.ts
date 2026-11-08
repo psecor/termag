@@ -6,13 +6,15 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db';
 import type { Range } from './range';
-import { tokenSourceSql } from './tokenSource';
+import { modelTokenSourceSql, tokenSourceSql } from './tokenSource';
 
-export const TOKEN_GROUPS = ['day', 'user', 'provider', 'host', 'project'] as const;
+export const TOKEN_GROUPS = ['day', 'user', 'provider', 'host', 'project', 'model', 'backend'] as const;
 export type TokenGroup = typeof TOKEN_GROUPS[number];
 const TOKEN_COL: Record<TokenGroup, string> = {
-  day: '"date"', user: '"userId"', provider: '"provider"', host: '"hostKey"', project: '"projectId"',
+  day: '"date"', user: '"userId"', provider: '"provider"', host: '"hostKey"', project: '"projectId"', model: '"model"', backend: '"backend"',
 };
+/** Only a report grouped by these reads the per-model source; its totals match the plain one. */
+const MODEL_GROUPS: readonly TokenGroup[] = ['model', 'backend'];
 
 export interface TokenRow {
   key: string;           // the group value (date, userId, provider, hostKey, projectId or 'unattributed')
@@ -47,6 +49,7 @@ export async function tokenReport(range: Range, groupBy: TokenGroup[]): Promise<
   const sel = Prisma.raw(cols.map((c, i) => `${c} AS g${i}`).join(', '));
   const grp = Prisma.raw(cols.join(', '));
   type Raw = Record<string, unknown> & { input: number; output: number; cacheRead: number; cacheCreate: number; calls: number; estTokens: number };
+  const source = groupBy.some(g => MODEL_GROUPS.includes(g)) ? modelTokenSourceSql : tokenSourceSql;
   const [raw, totals, prior, users] = await Promise.all([
     prisma.$queryRaw<Raw[]>`
       SELECT ${sel},
@@ -54,7 +57,7 @@ export async function tokenReport(range: Range, groupBy: TokenGroup[]): Promise<
              SUM("cacheRead")::float8 AS "cacheRead", SUM("cacheCreate")::float8 AS "cacheCreate",
              SUM("calls")::int AS "calls",
              SUM(CASE WHEN "estimated" THEN "input" + "output" + "cacheRead" + "cacheCreate" ELSE 0 END)::float8 AS "estTokens"
-      FROM ${tokenSourceSql(range.sinceKey, range.untilKey)} t
+      FROM ${source(range.sinceKey, range.untilKey)} t
       GROUP BY ${grp}`,
     prisma.$queryRaw<Raw[]>`
       SELECT SUM("input")::float8 AS "input", SUM("output")::float8 AS "output",
@@ -96,7 +99,9 @@ async function resolveLabels(groups: readonly string[], rows: Array<Array<string
   return Promise.all(groups.map(async (g, i) => {
     const ids = [...new Set(rows.map(r => r[i]).filter((x): x is string => !!x))];
     const m = new Map<string, string>();
-    if (g === 'user' && ids.length) {
+    if (g === 'model' || g === 'backend') {
+      m.set('', 'not recorded');
+    } else if (g === 'user' && ids.length) {
       for (const u of await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, unixUsername: true } })) m.set(u.id, u.unixUsername);
     } else if (g === 'host' && ids.length) {
       m.set('legacy', 'orchestrator'); m.set('poller', 'poller');

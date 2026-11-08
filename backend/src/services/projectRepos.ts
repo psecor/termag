@@ -121,10 +121,95 @@ export function planWorkspaceRepos(input: unknown, max = MULTI_REPO_MAX): { ok: 
   return { ok: true, repos };
 }
 
+/**
+ * A repository added to an existing multi-repo project: a GitHub URL the
+ * project does not hold yet (by repoKey), under a directory name no other of
+ * its repositories has, within MULTI_REPO_MAX.
+ */
+export function planAddedRepo(
+  existing: ReadonlyArray<{ name: string; url: string; position: number }>,
+  raw: RepoInput | null | undefined,
+  max = MULTI_REPO_MAX,
+): { ok: true; repo: PlannedRepo } | { ok: false; error: string } {
+  if (existing.length >= max) return { ok: false, error: `a project holds at most ${max} repositories` };
+  const parsed = parseRepoUrl(raw?.url);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const key = repoKey(parsed.url)!;
+  if (existing.some(r => repoKey(r.url) === key)) return { ok: false, error: `${key} is already in this project` };
+  const name = raw?.name == null || raw.name === '' ? suggestRepoName(parsed.url) : raw.name;
+  const bad = repoNameError(name);
+  if (bad) return { ok: false, error: bad };
+  if (existing.some(r => r.name.toLowerCase() === (name as string).toLowerCase())) {
+    return { ok: false, error: `a repository is already checked out as ${name}; pick another directory name` };
+  }
+  const defaultBranch = typeof raw?.defaultBranch === 'string' && raw.defaultBranch.trim() ? raw.defaultBranch.trim() : null;
+  if (defaultBranch !== null && !isBranchName(defaultBranch)) return { ok: false, error: `${key}: "${defaultBranch}" is not a branch name` };
+  const position = existing.reduce((m, r) => Math.max(m, r.position + 1), 0);
+  return { ok: true, repo: { name: name as string, url: parsed.url, defaultBranch, position } };
+}
+
 export interface RepoSetupRow {
   name: string;
   setupStatus: string;
   setupError?: string | null;
+}
+
+/**
+ * What the project's setupStatus becomes after one of its repositories moved,
+ * or null for no change. A project that reached ready stays ready: a
+ * repository added later clones beside its running sessions, its own row
+ * carrying its status, and never sends the project back through setup.
+ */
+export function settledSetup(
+  from: string,
+  fromError: string | null,
+  repos: ReadonlyArray<RepoSetupRow>,
+): { status: SetupStatus; error: string | null } | null {
+  if (from === 'ready') return null;
+  const next = aggregateSetup(repos);
+  if (next.status === from && (next.error ?? null) === (fromError ?? null)) return null;
+  return next;
+}
+
+/** How joinRepo's error starts: the clone landed, a workstream's worktree did not. */
+export const JOIN_FAILED = 'no worktree of it in';
+
+/** Its checkout is in the project folder: ready, or cloned and then failed joining a workstream. */
+export function hasMainCheckout(r: RepoSetupRow): boolean {
+  return r.setupStatus === 'ready' || (r.setupStatus === 'failed' && (r.setupError ?? '').startsWith(JOIN_FAILED));
+}
+
+/**
+ * The repositories one root's guide lists, by what is in it. A workstream
+ * root's are its `present` worktrees, as the box reads them
+ * (workspace-root-state), since a repository that failed joining one
+ * workstream may still have joined another. The project folder's are the
+ * ones with a checkout there, and `joined`, the one whose clone just landed.
+ */
+export function guideRepos<R extends RepoSetupRow>(repos: ReadonlyArray<R>, root: { present?: ReadonlyArray<string>; joined?: string } = {}): R[] {
+  if (root.present) {
+    const here = new Set(root.present);
+    return repos.filter(r => here.has(r.name));
+  }
+  return repos.filter(r => r.name === root.joined || hasMainCheckout(r));
+}
+
+/**
+ * The repositories a new workstream gets a worktree of. One still cloning
+ * holds Branch off back; one that failed to clone is left out, and its Retry
+ * joins every workstream then, so a repository that will not clone does not
+ * stop the project branching. A pull request in a failed one cannot be
+ * checked out.
+ */
+export function workstreamRepos<R extends RepoSetupRow>(
+  repos: ReadonlyArray<R>,
+  prRepo?: string,
+): { ok: true; repos: R[] } | { ok: false; error: string } {
+  const unready = repos.find(r => r.setupStatus === 'pending' || r.setupStatus === 'cloning');
+  if (unready) return { ok: false, error: `${unready.name} is not cloned yet` };
+  const failedPr = prRepo === undefined ? undefined : repos.find(r => r.name === prRepo && r.setupStatus !== 'ready');
+  if (failedPr) return { ok: false, error: `${failedPr.name} did not clone; Retry it first` };
+  return { ok: true, repos: repos.filter(r => r.setupStatus === 'ready') };
 }
 
 /**

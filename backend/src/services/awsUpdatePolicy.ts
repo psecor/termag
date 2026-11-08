@@ -23,12 +23,11 @@
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const AWS_UPDATE_POLICY_FLAG = 'aws-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for aws and a box's policy says restart nothing. */
-export const AWS_UPDATE_ENABLED_FLAG = 'aws-update-enabled';
 
 export const AWS_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_AWS_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '2.35.3',
   target: 'latest',
   restart: 'none',
@@ -38,5 +37,5 @@ export const DEFAULT_AWS_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over the AWS CLI's defaults; a bad key keeps its default. */
 export function parseAwsUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_AWS_UPDATE_POLICY, AWS_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_AWS_UPDATE_POLICY, AWS_TARGET_TAGS, undefined, AWS_UPDATE_POLICY_FLAG);
 }

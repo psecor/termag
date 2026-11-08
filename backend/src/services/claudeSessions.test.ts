@@ -90,16 +90,39 @@ describe('backfillSessionSeq', () => {
 });
 
 describe('deriveState', () => {
+  // Soon after the fixtures' 10:00 refusals, while they are still re-offered.
+  const SOON = t('2026-10-08T10:05:00Z');
+
   it('is queued while only refusals exist, with the newest reason and the start of the streak', () => {
-    expect(deriveState(null, [ev('queued', { detail: 'slots full', at: t('2026-10-08T10:01:00Z') }), ev('queued', { detail: 'no box' })]))
+    expect(deriveState(null, [ev('queued', { detail: 'slots full', at: t('2026-10-08T10:01:00Z') }), ev('queued', { detail: 'no box' })], SOON))
       .toEqual({ state: 'queued', exitReason: null, queuedReason: 'slots full', queuedCode: null, queuedSince: t('2026-10-08T10:00:00Z') });
     // The refusal's code rides along when the event has one.
-    expect(deriveState(null, [ev('queued', { detail: 'no box', code: 'no-box' })])).toMatchObject({ state: 'queued', queuedReason: 'no box', queuedCode: 'no-box' });
-    expect(deriveState(null, [ev('agent-failed', { detail: 'refused the launch' })])).toMatchObject({ state: 'queued', queuedReason: 'refused the launch', queuedSince: t('2026-10-08T10:00:00Z') });
+    expect(deriveState(null, [ev('queued', { detail: 'no box', code: 'no-box' })], SOON)).toMatchObject({ state: 'queued', queuedReason: 'no box', queuedCode: 'no-box' });
+    expect(deriveState(null, [ev('agent-failed', { detail: 'refused the launch' })], SOON)).toMatchObject({ state: 'queued', queuedReason: 'refused the launch', queuedSince: t('2026-10-08T10:00:00Z') });
+  });
+
+  it('reads a refused session nobody re-offers any more as ended (not-retried), and a later re-offer queues it again', () => {
+    const once = [ev('queued', { detail: 'no box', code: 'no-box' })];
+    expect(deriveState(null, once, t('2026-10-08T10:30:00Z'))).toMatchObject({ state: 'queued' });
+    expect(deriveState(null, once, t('2026-10-08T10:30:01Z'))).toEqual({ state: 'ended', exitReason: 'not-retried', queuedReason: null, queuedCode: null, queuedSince: null });
+    // Claude's backoff doubles: a re-offer within three of its last gaps is still expected.
+    const backoff = ['10:00:00', '10:00:20', '10:01:00', '10:02:20', '10:05:00', '10:10:20', '10:21:00', '10:42:20'].reverse()
+      .map(hms => ev('queued', { detail: 'no box', at: t(`2026-10-08T${hms}Z`) }));
+    expect(deriveState(null, backoff, t('2026-10-08T11:40:00Z'))).toMatchObject({ state: 'queued', queuedSince: t('2026-10-08T10:00:00Z') });
+    expect(deriveState(null, backoff, t('2026-10-08T11:46:21Z'))).toMatchObject({ state: 'ended', exitReason: 'not-retried' });
+    // A re-offer hours later starts afresh: its long gap neither stretches the window nor ages
+    // the queue from the old refusal (Devin on #1413).
+    const reopened = [ev('queued', { detail: 'no box', at: t('2026-10-08T14:00:00Z') }), ...once];
+    expect(deriveState(null, reopened, t('2026-10-08T14:20:00Z'))).toMatchObject({ state: 'queued', queuedSince: t('2026-10-08T14:00:00Z') });
+    expect(deriveState(null, reopened, t('2026-10-08T14:31:00Z'))).toMatchObject({ state: 'ended', exitReason: 'not-retried' });
+    // A re-offer that stopped while an old run lingers reads as that run.
+    const ended = run({ startedAt: t('2026-10-08T09:00:00Z'), endedAt: t('2026-10-08T09:30:00Z'), exitReason: 'completed' });
+    expect(deriveState(ended, [ev('queued', { orderId: 'ord.2' })], t('2026-10-08T12:00:00Z'))).toMatchObject({ state: 'ended', exitReason: 'completed' });
+    expect(deriveState(run(), [ev('queued', { orderId: 'ord.2', at: t('2026-10-08T10:00:10Z') }), ev('started')], t('2026-10-08T12:00:00Z'))).toMatchObject({ state: 'running' });
   });
 
   it('looks through user-created: it never stands as the newest event, and alone it means the first spawn is still deciding (Bugbot on #288)', () => {
-    expect(deriveState(null, [ev('user-created', { at: t('2026-10-08T10:00:01Z') }), ev('queued', { detail: 'no box', code: 'no-box' })]))
+    expect(deriveState(null, [ev('user-created', { at: t('2026-10-08T10:00:01Z') }), ev('queued', { detail: 'no box', code: 'no-box' })], SOON))
       .toMatchObject({ state: 'queued', queuedReason: 'no box', queuedCode: 'no-box' });
     expect(deriveState(null, [ev('user-created')])).toMatchObject({ state: 'starting' });
     expect(deriveState(run(), [ev('user-created', { at: t('2026-10-08T10:00:01Z') }), ev('placed')])).toMatchObject({ state: 'starting' });
@@ -119,15 +142,16 @@ describe('deriveState', () => {
 
   it('is queued again when a refusal is newer than the latest run (a re-offer while the old run lingers)', () => {
     const latest = run({ startedAt: t('2026-10-08T10:00:00Z') });
-    expect(deriveState(latest, [ev('queued', { orderId: 'ord.2', detail: 'slots full', at: t('2026-10-08T12:00:00Z') }), ev('started')]))
+    const now = t('2026-10-08T12:10:00Z');
+    expect(deriveState(latest, [ev('queued', { orderId: 'ord.2', detail: 'slots full', at: t('2026-10-08T12:00:00Z') }), ev('started')], now))
       .toMatchObject({ state: 'queued', queuedReason: 'slots full', queuedSince: t('2026-10-08T12:00:00Z') });
     // The streak starts after the run, not at a refusal from before it.
     expect(deriveState(latest, [
       ev('queued', { orderId: 'ord.2', at: t('2026-10-08T12:08:00Z') }), ev('queued', { orderId: 'ord.2', at: t('2026-10-08T12:04:00Z') }),
       ev('started', { at: t('2026-10-08T10:00:30Z') }), ev('queued', { at: t('2026-10-08T09:59:00Z') }),
-    ])).toMatchObject({ state: 'queued', queuedSince: t('2026-10-08T12:04:00Z') });
+    ], now)).toMatchObject({ state: 'queued', queuedSince: t('2026-10-08T12:04:00Z') });
     // A refusal of the same order before its own launch is history, not a queue.
-    expect(deriveState(latest, [ev('queued', { at: t('2026-10-08T09:59:00Z') })])).toMatchObject({ state: 'starting' });
+    expect(deriveState(latest, [ev('queued', { at: t('2026-10-08T09:59:00Z') })], now)).toMatchObject({ state: 'starting' });
   });
 
   it('is ended or lost from the latest run', () => {
@@ -158,9 +182,12 @@ describe('buildSessions', () => {
     expect(out[1]).toMatchObject({ state: 'ended', eventCount: 0, current: expect.objectContaining({ orderId: 'ord.9' }) });
   });
 
-  it('keeps a session that only has events, and a older run without a session id', () => {
-    const out = buildSessions([run({ orderId: 'old.1', sessionId: null })], [ev('queued', { sessionId: 'cse_01Q', orderId: 'ord.q', detail: 'no box' })], new Map());
+  it('keeps a session that only has events, and an older run without a session id', () => {
+    const events = [ev('queued', { sessionId: 'cse_01Q', orderId: 'ord.q', detail: 'no box' })];
+    const out = buildSessions([run({ orderId: 'old.1', sessionId: null })], events, new Map(), t('2026-10-08T10:05:00Z'));
     expect(out.find(s => s.key === 'cse_01Q')).toMatchObject({ state: 'queued', queuedReason: 'no box', queuedSince: '2026-10-08T10:00:00.000Z', current: null, sessionId: 'cse_01Q' });
+    // The same session a day later, never re-offered: ended, not queued.
+    expect(buildSessions([], events, new Map(), t('2026-10-09T10:00:00Z'))[0]).toMatchObject({ key: 'cse_01Q', state: 'ended', exitReason: 'not-retried', queuedReason: null });
     expect(out.find(s => s.key === 'order:old.1')).toMatchObject({ sessionId: null, url: null, state: 'starting' });
   });
 });

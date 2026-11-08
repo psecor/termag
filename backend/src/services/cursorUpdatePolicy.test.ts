@@ -22,7 +22,7 @@ describe('CURSOR_PINNED_LATEST', () => {
 describe('parseCursorUpdatePolicy', () => {
   it('is the defaults for no value: the CLI advisories\' floor, latest, and no restart', () => {
     for (const v of [undefined, null, [], 'latest', 3]) expect(parseCursorUpdatePolicy(v)).toEqual(DEFAULT_CURSOR_UPDATE_POLICY);
-    expect(DEFAULT_CURSOR_UPDATE_POLICY).toEqual({ floor: '2025.09.17-25b418f', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
+    expect(DEFAULT_CURSOR_UPDATE_POLICY).toEqual({ mode: 'off', floor: '2025.09.17-25b418f', target: 'latest', restart: 'none', drainSec: 600, forceAfterHours: 24 });
   });
 
   it('takes Cursor\'s build versions, and only those', () => {

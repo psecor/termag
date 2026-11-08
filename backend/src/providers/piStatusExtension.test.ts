@@ -193,7 +193,7 @@ describe('pi on Fireworks (TERMAG_PI_AGENT=fireworks)', () => {
     }
     const last = posts.at(-1) as Extract<Post, { kind: 'status' }>;
     expect(last).toMatchObject({ status: 'waiting', notify: true, rateLimited: 'Fireworks: gateway HTTP 403' });
-    expect(last.message).toMatch(/termag gateway refused this box.*termag-credentials status/);
+    expect(last.message).toMatch(/termag gateway refused this box, or Fireworks' model access policy refused this model.*termag-credentials status/);
     expect(last.message).not.toMatch(/sso|pi/i);
   });
 });

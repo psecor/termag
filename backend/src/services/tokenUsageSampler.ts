@@ -51,10 +51,15 @@ export interface RowInput {
   day: UsageDay;
 }
 
+/** One bucket's day split further by the model its log names (token_usage_model_days). */
+export interface ModelRowInput extends RowInput { model: string; backend: string }
+
 export interface NormalizedScan {
   schema: 1 | 2;
   scannedAt: string | null;
   rows: RowInput[];
+  /** Empty for an agent from before the model split (and for vibe, whose logs name none). */
+  modelRows: ModelRowInput[];
   /** Claude dirs the agent reported read errors for — leave their existing rows alone. */
   skippedDirs: Set<string>;
 }
@@ -71,6 +76,7 @@ export function normalizeScanResponse(raw: unknown): NormalizedScan {
   const r = (raw ?? {}) as Record<string, any>;
   const skippedDirs = new Set<string>();
   const rows: RowInput[] = [];
+  const modelRows: ModelRowInput[] = [];
   const v2 = r.schema === 2 && r.sources && typeof r.sources === 'object';
   if (v2) {
     for (const [provider, src] of Object.entries(r.sources as Record<string, any>)) {
@@ -86,9 +92,17 @@ export function normalizeScanResponse(raw: unknown): NormalizedScan {
           if (!isDate(date)) continue;
           rows.push({ provider, date, sourceKey, cwdHint, dir, agentSchema: 2, day: toDay(d) });
         }
+        for (const m of Array.isArray(b.models) ? b.models : []) {
+          if (!m || typeof m.model !== 'string' || !m.days || typeof m.days !== 'object') continue;
+          const backend = typeof m.backend === 'string' ? m.backend : '';
+          for (const [date, d] of Object.entries(m.days)) {
+            if (!isDate(date)) continue;
+            modelRows.push({ provider, date, sourceKey, cwdHint, dir, agentSchema: 2, model: m.model, backend, day: toDay(d) });
+          }
+        }
       }
     }
-    return { schema: 2, scannedAt: typeof r.scannedAt === 'string' ? r.scannedAt : null, rows, skippedDirs };
+    return { schema: 2, scannedAt: typeof r.scannedAt === 'string' ? r.scannedAt : null, rows, modelRows, skippedDirs };
   }
   // Schema 1: per provider per day, no attribution possible.
   const providers: Record<string, any> = r.providers && typeof r.providers === 'object'
@@ -100,15 +114,16 @@ export function normalizeScanResponse(raw: unknown): NormalizedScan {
       rows.push({ provider, date, sourceKey: '', cwdHint: null, dir: null, agentSchema: 1, day: toDay(d) });
     }
   }
-  return { schema: 1, scannedAt: null, rows, skippedDirs };
+  return { schema: 1, scannedAt: null, rows, modelRows: [], skippedDirs };
 }
 
-export interface ResolvedRow extends RowInput { projectId: string | null; workstream: string | null }
+export type Resolved<T extends RowInput> = T & { projectId: string | null; workstream: string | null };
+export type ResolvedRow = Resolved<RowInput>;
 
 /** Pure: attach (projectId, workstream) to each row. */
-export function resolveRows(rows: RowInput[], username: string, projects: ProjectCandidate[]): ResolvedRow[] {
+export function resolveRows<T extends RowInput>(rows: T[], username: string, projects: ProjectCandidate[], instanceId?: string | null): Array<Resolved<T>> {
   return rows.map(row => {
-    const r = row.agentSchema === 2 ? resolveUsageSource({ cwdHint: row.cwdHint, dir: row.dir }, username, projects) : null;
+    const r = row.agentSchema === 2 ? resolveUsageSource({ cwdHint: row.cwdHint, dir: row.dir, instanceId }, username, projects) : null;
     return { ...row, projectId: r?.projectId ?? null, workstream: r?.workstream ?? null };
   });
 }
@@ -210,18 +225,21 @@ function sinceDate(): string {
 }
 
 async function loadProjects(userId: string): Promise<ProjectCandidate[]> {
-  const ps = await prisma.project.findMany({ where: { userId }, select: { id: true, name: true, workstreams: { select: { name: true } } } });
-  return ps.map(p => ({ id: p.id, name: p.name, workstreams: p.workstreams.map(w => w.name) }));
+  const ps = await prisma.project.findMany({ where: { userId }, select: { id: true, name: true, dir: true, instanceId: true, workstreams: { select: { name: true } } } });
+  return ps.map(p => ({ id: p.id, name: p.name, dir: p.dir, instanceId: p.instanceId, workstreams: p.workstreams.map(w => w.name) }));
 }
 
-async function persistHost(userId: string, hostKey: string, norm: NormalizedScan, resolved: ResolvedRow[], scannedAt: Date): Promise<void> {
+/** Write one host's scan: its day rows and their model split. Exported for the integration test. */
+export async function persistHost(userId: string, hostKey: string, norm: NormalizedScan, resolved: ResolvedRow[], resolvedModels: Array<Resolved<ModelRowInput>>, scannedAt: Date): Promise<void> {
   const dates = [...new Set(resolved.map(r => r.date))];
   if (dates.length === 0) return;
   // Schema-flip guard: a host that changed shape would otherwise double count
   // (schema-1 rows have sourceKey '', schema-2 rows never do).
-  const flipped = await prisma.tokenUsageDay.deleteMany({
-    where: { userId, hostKey, date: { in: dates }, estimated: false, sourceKey: norm.schema === 2 ? '' : { not: '' } },
-  });
+  const otherSchema = { userId, hostKey, date: { in: dates }, sourceKey: norm.schema === 2 ? '' : { not: '' } };
+  const flipped = await prisma.tokenUsageDay.deleteMany({ where: { ...otherSchema, estimated: false } });
+  // Model rows go with their day rows: modelTokenSourceSql takes a bucket's model
+  // rows as its whole split, so a model row without its day row would count twice.
+  await prisma.tokenUsageModelDay.deleteMany({ where: otherSchema });
   if (flipped.count) console.warn(`[TOKEN-USAGE] ${hostKey}: removed ${flipped.count} rows of the other schema for ${dates.length} dates`);
 
   const ops = resolved.map(r => prisma.tokenUsageDay.upsert({
@@ -239,18 +257,51 @@ async function persistHost(userId: string, hostKey: string, norm: NormalizedScan
     },
   }));
   for (let i = 0; i < ops.length; i += 200) await prisma.$transaction(ops.slice(i, i + 200));
+
+  // A rescan is authoritative for the model split of every bucket-day it reports:
+  // delete the model rows it no longer names (a corrected or truncated log, an agent
+  // without models[]). Buckets it skipped (read errors) keep theirs, as their day rows do.
+  const bucketKey = (r: { provider: string; date: string; sourceKey: string }) => `${r.provider}\n${r.date}\n${r.sourceKey}`;
+  const modelKey = (r: { provider: string; date: string; sourceKey: string; backend: string; model: string }) => `${bucketKey(r)}\n${r.backend}\n${r.model}`;
+  const reported = new Set(resolved.map(bucketKey));
+  const named = new Set(resolvedModels.map(modelKey));
+  const existing = await prisma.tokenUsageModelDay.findMany({
+    where: { userId, hostKey, date: { in: dates } },
+    select: { id: true, provider: true, date: true, sourceKey: true, backend: true, model: true },
+  });
+  const stale = existing.filter(r => reported.has(bucketKey(r)) && !named.has(modelKey(r))).map(r => r.id);
+  for (let i = 0; i < stale.length; i += 500) await prisma.tokenUsageModelDay.deleteMany({ where: { id: { in: stale.slice(i, i + 500) } } });
+
+  const modelOps = resolvedModels.map(r => {
+    const tokens = {
+      projectId: r.projectId, workstream: r.workstream,
+      input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
+      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, scannedAt,
+    };
+    const key = { userId, hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey, backend: r.backend, model: r.model };
+    return prisma.tokenUsageModelDay.upsert({
+      where: { userId_hostKey_provider_date_sourceKey_backend_model: key },
+      update: tokens,
+      create: { ...key, ...tokens },
+    });
+  });
+  for (let i = 0; i < modelOps.length; i += 200) await prisma.$transaction(modelOps.slice(i, i + 200));
 }
 
 /** Rows that couldn't be attributed when written may resolve now (project created later). */
 async function reResolveUnattributed(userId: string, username: string, projects: ProjectCandidate[]): Promise<void> {
   const rows = await prisma.tokenUsageDay.findMany({
     where: { userId, projectId: null, agentSchema: 2, OR: [{ cwdHint: { not: null } }, { sourceKey: { not: '' } }] },
-    select: { id: true, cwdHint: true, sourceKey: true, provider: true },
+    select: { id: true, hostKey: true, cwdHint: true, sourceKey: true, provider: true, date: true },
     take: 500,
   });
   for (const r of rows) {
-    const hit = resolveUsageSource({ cwdHint: r.cwdHint, dir: r.provider === 'claude' ? r.sourceKey : null }, username, projects);
-    if (hit) await prisma.tokenUsageDay.update({ where: { id: r.id }, data: { projectId: hit.projectId, workstream: hit.workstream } });
+    const instanceId = r.hostKey === LEGACY_HOST ? null : r.hostKey;
+    const hit = resolveUsageSource({ cwdHint: r.cwdHint, dir: r.provider === 'claude' ? r.sourceKey : null, instanceId }, username, projects);
+    if (!hit) continue;
+    const data = { projectId: hit.projectId, workstream: hit.workstream };
+    await prisma.tokenUsageDay.update({ where: { id: r.id }, data });
+    await prisma.tokenUsageModelDay.updateMany({ where: { userId, hostKey: r.hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey, projectId: null }, data });
   }
 }
 
@@ -263,10 +314,11 @@ async function scanHost(userId: string, username: string, instanceId: string | n
   try {
     const raw = await sendForProject({ userId, instanceId }, 'usage-scan', { schema: 2, since: sinceDate() }, RPC_TIMEOUT_MS);
     const norm = normalizeScanResponse(raw);
-    const resolved = resolveRows(norm.rows, username, projects);
+    const resolved = resolveRows(norm.rows, username, projects, instanceId);
+    const resolvedModels = resolveRows(norm.modelRows, username, projects, instanceId);
     const parsed = norm.scannedAt ? new Date(norm.scannedAt) : new Date();
     const scannedAt = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
-    await persistHost(userId, hostKey, norm, resolved, scannedAt);
+    await persistHost(userId, hostKey, norm, resolved, resolvedModels, scannedAt);
     run.lastScanAt = Date.now(); run.lastError = null; run.schema = norm.schema; run.rows = resolved.length;
     lastSuccess.set(userId, Date.now());
   } catch (err) {

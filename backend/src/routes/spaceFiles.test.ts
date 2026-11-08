@@ -11,8 +11,6 @@ import { MemorySpaceObjects, MemorySpaceStore } from '../services/spaces/spacesT
 let store: MemorySpaceStore;
 let objects: MemorySpaceObjects;
 let identities: PresignerIdentity[];
-let enabled: Set<string>;
-let htmlEnabled: Set<string>;
 let unavailable = false;
 let canStash = true;
 const stashed: string[] = [];
@@ -33,8 +31,6 @@ beforeAll(async () => {
       identities.push(identity);
       return objects;
     },
-    enabled: async userId => enabled.has(userId),
-    htmlEnabled: async userId => htmlEnabled.has(userId),
     userId: req => req.get('x-user') ?? null,
     signIn: async req => {
       if (req.get('x-okta')) return null;
@@ -67,8 +63,6 @@ beforeEach(async () => {
   store = new MemorySpaceStore();
   objects = new MemorySpaceObjects();
   identities = [];
-  enabled = new Set(['alice', 'bob', 'carol', 'dave']);
-  htmlEnabled = new Set();
   unavailable = false;
   canStash = true;
   stashed.length = 0;
@@ -116,8 +110,9 @@ describe('space file links', () => {
     expect(lastPresign().key).toBe(`${spaceId}/docs/My Report.pdf`);
   });
 
-  it('makes HTML and SVG octet-stream attachments', async () => {
-    for (const path of ['page.html', 'logo.svg']) {
+  it('makes SVG and HTML over the size cap octet-stream attachments', async () => {
+    objects.put(`${spaceId}/big.html`, 10 * 1024 * 1024 + 1, 'text/html');
+    for (const path of ['big.html', 'logo.svg']) {
       expect((await get(`/assets/${path}`, 'alice')).status).toBe(302);
       expect(lastPresign().extra).toEqual({ contentDisposition: expect.stringMatching(/^attachment;/), contentType: 'application/octet-stream' });
     }
@@ -129,8 +124,7 @@ describe('space file links', () => {
     expect(lastPresign().extra).toEqual({ contentDisposition: expect.stringMatching(/^inline;/), contentType: 'text/plain; charset=utf-8' });
   });
 
-  it('serves HTML as a sandboxed page with spaces-html-links-enabled', async () => {
-    htmlEnabled.add('bob');
+  it('serves HTML as a sandboxed page', async () => {
     objects.bodies.set(`${spaceId}/page.html`, Buffer.from('<h1>hi</h1>'));
     const r = await get('/assets/page.html', 'bob');
     expect(r.status).toBe(200);
@@ -143,9 +137,7 @@ describe('space file links', () => {
     expect(store.eventRows.filter(e => e.action === 'file.get')).toMatchObject([{ actorUserId: 'bob', path: 'page.html', bytes: 11 }]);
   });
 
-  it('keeps HTML an attachment with the flag off, over the size cap, and SVG always', async () => {
-    expect((await get('/assets/page.html', 'bob')).status).toBe(302);
-    htmlEnabled.add('bob');
+  it('keeps HTML an attachment over the size cap, and SVG always', async () => {
     objects.put(`${spaceId}/big.html`, 10 * 1024 * 1024 + 1, 'text/html');
     expect((await get('/assets/big.html', 'bob')).status).toBe(302);
     expect((await get('/assets/logo.svg', 'bob')).status).toBe(302);
@@ -154,7 +146,6 @@ describe('space file links', () => {
   });
 
   it('falls back to an attachment when the file grew past the cap after the HEAD', async () => {
-    htmlEnabled.add('bob');
     objects.bodies.set(`${spaceId}/page.html`, Buffer.alloc(10 * 1024 * 1024 + 5));
     const r = await get('/assets/page.html', 'bob');
     expect(r.status).toBe(302);
@@ -163,7 +154,6 @@ describe('space file links', () => {
   });
 
   it('still answers 404 for an HTML page the viewer cannot read', async () => {
-    htmlEnabled.add('carol');
     expect((await get('/assets/page.html', 'carol')).status).toBe(404);
     expect(objects.reads).toEqual([]);
   });
@@ -210,11 +200,6 @@ describe('space file links', () => {
     expect(r.location).toBe('/termag/chat/files/assets?dir=My%20Docs%2F');
   });
 
-  it('answers 404 while spaces-enabled is off for the user', async () => {
-    enabled.delete('bob');
-    expect((await get('/assets/cat.png', 'bob')).status).toBe(404);
-  });
-
   it('answers 404 once the space is deleted', async () => {
     store.spaces.get(spaceId)!.deletedAt = new Date();
     expect((await get('/assets/cat.png', 'alice')).status).toBe(404);
@@ -258,8 +243,7 @@ describe('a file shared with termag', () => {
     expect(identities).toEqual([{ kind: 'user', userId: 'carol', email: 'carol@example.com' }]);
   });
 
-  it('needs no spaces-enabled for the viewer', async () => {
-    enabled.delete('carol');
+  it('serves a shared file to a viewer with no role in the space', async () => {
     expect((await get('/assets/docs/My%20Report.pdf', 'carol')).status).toBe(302);
   });
 

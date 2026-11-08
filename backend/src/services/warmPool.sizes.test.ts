@@ -103,7 +103,7 @@ vi.mock('../db', () => {
 });
 
 const { currentPoolSpec, poolSpecHash, poolSpecHashOrNull, reconcileWarmPool, resetPoolSpecCache } = await import('./warmPool');
-const { POOL_FLAG_CONTEXT } = await import('./boxHibernationFlag');
+const { POOL_FLAG_CONTEXT } = await import('./poolLdContext');
 
 const HOUR = 3_600_000;
 

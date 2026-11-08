@@ -21,12 +21,11 @@
 import { parseClaudeUpdatePolicy, type ClaudeUpdatePolicy } from './claudeUpdatePolicy';
 
 export const DEVIN_UPDATE_POLICY_FLAG = 'devin-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off for Devin and a box's policy says restart nothing. */
-export const DEVIN_UPDATE_ENABLED_FLAG = 'devin-update-enabled';
 
 export const DEVIN_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_DEVIN_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '3000.11.92',
   target: 'latest',
   restart: 'none',
@@ -36,5 +35,5 @@ export const DEFAULT_DEVIN_UPDATE_POLICY: ClaudeUpdatePolicy = {
 
 /** The flag's value, key by key over the Devin CLI's defaults; a bad key keeps its default. */
 export function parseDevinUpdatePolicy(value: unknown): ClaudeUpdatePolicy {
-  return parseClaudeUpdatePolicy(value, DEFAULT_DEVIN_UPDATE_POLICY, DEVIN_TARGET_TAGS);
+  return parseClaudeUpdatePolicy(value, DEFAULT_DEVIN_UPDATE_POLICY, DEVIN_TARGET_TAGS, undefined, DEVIN_UPDATE_POLICY_FLAG);
 }

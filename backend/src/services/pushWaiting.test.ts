@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../db';
 import { getAllStatuses } from './status';
 import { resolveSessionProject } from './sessionResolver';
-import { webPushEnabledFor } from './pushFlag';
 import {
   countOwnerWaiting, pushOnWaitingTransition, resetPushWaitingState, shouldPushWaiting, waitingChatMuted,
   PUSH_WAITING_COOLDOWN_MS,
@@ -12,7 +11,6 @@ import type { AgentStatus } from '../types/index';
 
 vi.mock('../db', () => ({ prisma: { project: { findUnique: vi.fn() }, user: { findUnique: vi.fn() } } }));
 vi.mock('./status', () => ({ getAllStatuses: vi.fn(() => new Map()) }));
-vi.mock('./pushFlag', () => ({ webPushEnabledFor: vi.fn(async () => true) }));
 vi.mock('./sessionResolver', () => ({
   resolveSessionProject: vi.fn(),
   isAmbiguousSession: (v: unknown) => !!v && typeof v === 'object' && (v as { ambiguous?: boolean }).ambiguous === true,
@@ -152,28 +150,6 @@ describe('pushOnWaitingTransition', () => {
     expect(d.transport).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/waiting push for b failed/), 'db down');
     warn.mockRestore();
-  });
-});
-
-describe('mobile-web-push-enabled off for the owner', () => {
-  beforeEach(() => {
-    resetPushWaitingState();
-    vi.mocked(resolveSessionProject).mockReset();
-    vi.mocked(prisma.user.findUnique).mockReset();
-    vi.mocked(resolveSessionProject).mockResolvedValue({ userId: 'u1', instanceId: 'box-a', projectId: 'p1', workstream: 'main' });
-    vi.mocked(prisma.project.findUnique).mockResolvedValue({ name: 'cx', user: { unixUsername: 'alice' } } as never);
-    vi.mocked(prisma.user.findUnique).mockResolvedValue({ pushMutesChat: true, pushSubscriptions: [{ lastUsedAt: null, failedAt: null }] } as never);
-    vi.mocked(webPushEnabledFor).mockResolvedValue(false);
-  });
-  afterEach(() => { vi.mocked(webPushEnabledFor).mockResolvedValue(true); });
-
-  it('sends nothing and never mutes the chat posts', async () => {
-    const d = deps();
-    pushOnWaitingTransition({ session: 'alice-cx-agent', instanceId: 'box-a', prev: 'working', next: 'waiting', now: 1000 }, d);
-    await flush(); await flush();
-    expect(d.transport).not.toHaveBeenCalled();
-    expect(await waitingChatMuted('alice-cx-agent', 'box-a', d)).toBe(false);
-    expect(webPushEnabledFor).toHaveBeenCalledWith('u1');
   });
 });
 

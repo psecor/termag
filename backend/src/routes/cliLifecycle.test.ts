@@ -61,6 +61,7 @@ const lifecycle: CliLifecycle = {
   async removeBox(user, id, confirmed) { calls.push(['removeBox', user.id, id, confirmed]); return next; },
   async renameBox(user, id, name) { calls.push(['renameBox', user.id, id, name]); return next; },
   async resizeBox(user, id, input) { calls.push(['resizeBox', user.id, id, input]); return next; },
+  async growBoxDisk(user, id, input) { calls.push(['growBoxDisk', user.id, id, input]); return next; },
   async resizeInfo(user, id) { calls.push(['resizeInfo', user.id, id]); return next; },
   async boxSizes(user, repo) { calls.push(['boxSizes', user.id, repo]); return next; },
   async createProject(user, input) { calls.push(['createProject', user.id, input]); return next; },
@@ -68,7 +69,7 @@ const lifecycle: CliLifecycle = {
   async archiveProject(user, id) { calls.push(['archiveProject', user.id, id]); return next; },
   async createWorkstream(user, id, input) { calls.push(['createWorkstream', user.id, id, input]); return next; },
   async removeWorkstream(user, id, name, opts) { calls.push(['removeWorkstream', user.id, id, name, opts]); return next; },
-  async retryClone(user, id) { calls.push(['retryClone', user.id, id]); return next; },
+  async retryClone(user, id, opts) { calls.push(['retryClone', user.id, id, ...(opts && Object.keys(opts).length ? [opts] : [])]); return next; },
 };
 
 let server: Server;
@@ -156,6 +157,28 @@ describe('lifecycle routes', () => {
     ]);
   });
 
+  it('forwards setupEnabled and useRepoSetup beside --minimal, each only when sent', async () => {
+    next = ok(201, { box: { id: 'i-bare' }, claimed: false });
+    expect((await call('POST', '/boxes', DEVICE, { name: 'bare', setupEnabled: false })).status).toBe(201);
+    expect((await call('POST', '/boxes', DEVICE, { name: 'lean', flavor: 'minimal', setupEnabled: false })).status).toBe(201);
+    expect((await call('POST', '/boxes', DEVICE, { name: 'plain', useRepoSetup: 'yes' })).status).toBe(201);
+    expect(calls).toEqual([
+      ['createBox', 'alice', { name: 'bare', size: undefined, setupEnabled: false }, null],
+      ['createBox', 'alice', { name: 'lean', size: undefined, flavor: 'minimal', setupEnabled: false }, null],
+      ['createBox', 'alice', { name: 'plain', size: undefined }, null],
+    ]);
+  });
+
+  it('forwards a Retry\'s setupEnabled when it is a boolean, and nothing otherwise (Bugbot, #983)', async () => {
+    next = ok(202, { project: { id: 'p1' } });
+    expect((await call('POST', '/projects/p1/clone/retry', DEVICE, { setupEnabled: true })).status).toBe(202);
+    expect((await call('POST', '/projects/p1/clone/retry', DEVICE, { setupEnabled: 'yes' })).status).toBe(202);
+    expect(calls).toEqual([
+      ['retryClone', 'alice', 'p1', { setupEnabled: true }],
+      ['retryClone', 'alice', 'p1'],
+    ]);
+  });
+
   it('refuse missing fields before calling a handler', async () => {
     for (const [method, path, body] of [
       ['POST', '/boxes', {}],
@@ -183,6 +206,20 @@ describe('lifecycle routes', () => {
     ]);
   });
 
+  it('pass a project\'s `model` through for Claude Code, and refuse one that is not a tier or for another agent', async () => {
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'm', agent: 'claude', from: 'termag', model: 'opus' });
+    expect(calls).toEqual([
+      ['createProject', 'alice', { boxId: 'i-devbox', name: 'm', agent: 'claude', repoUrl: 'https://github.com/psecor/termag.git', model: 'opus' }],
+    ]);
+    calls.length = 0;
+    const bad = await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'm', agent: 'claude', model: 'gpt-5' });
+    expect(bad.status).toBe(400);
+    const codex = await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'm', agent: 'codex', model: 'opus' });
+    expect(codex.status).toBe(400);
+    expect(await codex.json()).toMatchObject({ error: 'model is a Claude model; codex is not Claude Code' });
+    expect(calls).toEqual([]);
+  });
+
   it('make a multi-repo project of a list of froms, and refuse a list longer than a project holds', async () => {
     await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'mr', agent: 'claude', from: ['termag', 'https://github.com/o/r'] });
     await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'one', agent: 'claude', from: ['https://github.com/o/r'] });
@@ -192,6 +229,20 @@ describe('lifecycle routes', () => {
     ]);
     const many = await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'x', agent: 'claude', from: Array(9).fill('termag') });
     expect(many.status).toBe(400);
+  });
+
+  it("make a project of an environment's repositories, and refuse one alongside from", async () => {
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fs', agent: 'claude', environment: 'full-stack' });
+    expect(calls).toEqual([['createProject', 'alice', { boxId: 'i-devbox', name: 'fs', agent: 'claude', environment: 'full-stack' }]]);
+    const both = await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fs', agent: 'claude', environment: 'full-stack', from: ['webapp'] });
+    expect(both.status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("pass the environment's checkouts an ask was read with through to the create, which holds it to them", async () => {
+    const pin = [{ repo: 'acme/api' }, { repo: 'acme/web', branch: 'next' }];
+    await call('POST', '/projects', DEVICE, { boxId: 'i-devbox', name: 'fs', agent: 'claude', environment: 'full-stack', environmentRepos: pin, createdFor: 'ask' });
+    expect(calls).toEqual([['createProject', 'alice', { boxId: 'i-devbox', name: 'fs', agent: 'claude', environment: 'full-stack', environmentRepos: pin, createdFor: 'ask' }]]);
   });
 
   it('refuse a `from` that is neither a template, a GitHub URL nor <box>/<project>', async () => {
@@ -324,6 +375,17 @@ describe('box create with a size and what its project starts from', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('passes an environment on to the box, and refuses one alongside from', async () => {
+    next = ok(201, { box: { id: 'i-new' }, claimed: false });
+    await call('POST', '/boxes', DEVICE, { name: 'fs', environment: ' full-stack ', size: 'large' });
+    expect(calls).toEqual([['createBox', 'alice', { name: 'fs', size: 'large', environment: 'full-stack' }, null]]);
+    const both = await call('POST', '/boxes', DEVICE, { name: 'fs', environment: 'full-stack', from: 'webapp' });
+    expect(both.status).toBe(400);
+    expect(await both.json()).toMatchObject({ error: expect.stringContaining('leave out from') });
+    expect((await call('POST', '/boxes', DEVICE, { name: 'fs', environment: 3 })).status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
   it('refuses a size that is not a string, and a from that names nothing, before creating anything', async () => {
     const bad = await call('POST', '/boxes', DEVICE, { name: 'a', size: 2 });
     expect(bad.status).toBe(400);
@@ -371,6 +433,22 @@ describe('box resize', () => {
       expect(await res.json()).toMatchObject({ code: 'forbidden' });
     }
     expect(calls).toEqual([['resizeBox', 'alice', 'i-child', { size: 'medium', force: false }]]);
+  });
+
+  it('grows the disk with the GiB asked for, and only with a whole number', async () => {
+    next = ok(202, { box: { id: 'i-devbox' }, grow: { fromGb: 120, toGb: 200, state: 'modifying', running: true } });
+    const res = await call('POST', '/boxes/i-devbox/disk', DEVICE, { sizeGb: 200 });
+    expect(res.status).toBe(202);
+    expect((await call('POST', '/boxes/i-devbox/disk', DEVICE, { sizeGb: '200' })).status).toBe(400);
+    expect(calls).toEqual([['growBoxDisk', 'alice', 'i-devbox', { sizeGb: 200 }]]);
+  });
+
+  it("a box's own credential grows only the disk of a box it created", async () => {
+    next = ok(202, { box: { id: 'i-child' } });
+    expect((await call('POST', '/boxes/i-child/disk', BOX, { sizeGb: 200 })).status).toBe(202);
+    const res = await call('POST', '/boxes/i-devbox/disk', BOX, { sizeGb: 200 });
+    expect(res.status).toBe(403);
+    expect(calls).toEqual([['growBoxDisk', 'alice', 'i-child', { sizeGb: 200 }]]);
   });
 
   it('reads what Resize… shows for any credential of the owner', async () => {

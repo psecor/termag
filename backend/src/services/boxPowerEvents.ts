@@ -110,11 +110,14 @@ export function forgetSleepRequest(boxId: string): void {
  * write landed): cold provisioning, from the row's creation to that connect.
  * Pool boxes never get here; their warm-up is `warmedAt`.
  */
-export function recordBoxReady(box: Pick<Instance, 'id' | 'userId' | 'createdAt'> & BoxDimensionSource, readyAt: Date): void {
+export function recordBoxReady(box: Pick<Instance, 'id' | 'userId' | 'createdAt'> & BoxDimensionSource, readyAt: Date, environment: string | null = null): void {
   // Never throws: the connect it describes must not depend on it.
   const ms = box.createdAt instanceof Date ? readyAt.getTime() - box.createdAt.getTime() : NaN;
   recordProductEvent('box.ready', { user: box.userId, box: box.id }, {
     provisionSec: Number.isFinite(ms) && ms >= 0 ? Math.round(ms / 1000) : null,
+    // The environment the box was made from, null for none: which environments
+    // are made most, and how long their boxes take, picks the first environment pools.
+    environment,
     ...boxEventDimensions(box),
   });
 }

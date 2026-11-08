@@ -11,11 +11,15 @@
 import { BlockList, isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
 
-export const MCP_BROKER_FLAG = 'mcp-broker-enabled';
 // The catalog of MCP servers that Settings offers every user, and its on switch (see defaultConnectors).
 export const MCP_DEFAULTS_FLAG = 'mcp-default-connectors';
 
+// A connector's name: the mcpServers key on the box, so the mcp__<name>__ tool
+// prefix. Every box's deploy/termag-credentials refuses a whole MCP delivery
+// that has a name outside this pattern, which is why it stays lowercase with
+// dashes rather than Claude Code's own [A-Za-z0-9_-].
 export const CONNECTOR_NAME = /^[a-z][a-z0-9-]{0,40}$/;
+const MAX_DISPLAY_NAME = 80;
 export const SECRET_NAME = /^[A-Za-z0-9_-]{1,40}$/;
 const HEADER_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const MAX_HEADERS = 16;
@@ -59,6 +63,8 @@ export function getMcpBrokerUrl(env: NodeJS.ProcessEnv = process.env): string | 
 
 export interface DefaultConnector {
   name: string;
+  // The display name Settings shows; absent when the entry gives none.
+  label?: string;
   // Normalised the same way a saved connector's URL is (parseUpstream), so the two
   // can be compared to tell whether the user already has this server.
   upstream: string;
@@ -73,15 +79,16 @@ function warnDefaults(message: string): void {
   warnedDefaults.add(line);
 }
 
-// The keys a catalog entry may have. Add new optional ones here (headers, a
-// display name) without changing the format.
-const CATALOG_ENTRY_KEYS = new Set(['name', 'upstream']);
+// The keys a catalog entry may have. Add new optional ones here (headers, say)
+// without changing the format.
+const CATALOG_ENTRY_KEYS = new Set(['name', 'label', 'upstream']);
 
 /**
  * The MCP servers the orchestrator offers every user, from the value the
  * mcp-default-connectors JSON flag serves them: an array of
- * `{ "name", "upstream" }` objects, for example
- * `[{"name":"acme","upstream":"https://mcp.acme.example/mcp"}]`. The flag is
+ * `{ "name", "label"?, "upstream" }` objects, for example
+ * `[{"name":"acme","label":"Acme","upstream":"https://mcp.acme.example/mcp"}]`.
+ * `name` is the connector name (CONNECTOR_NAME); `label` is the display name. The flag is
  * both the list and its on switch: off (null, the fallback) or `[]` offers
  * nothing.
  *
@@ -94,6 +101,7 @@ const CATALOG_ENTRY_KEYS = new Set(['name', 'upstream']);
  * isn't an array offers nothing; an entry with a bad name or URL, or that
  * repeats a name or URL already listed, is skipped; and an unknown key is
  * ignored, so a value written for a newer termag still offers its servers.
+ * A label that is not usable display text skips its entry too.
  */
 export function defaultConnectors(entries: unknown, env: NodeJS.ProcessEnv = process.env): DefaultConnector[] {
   if (entries === null || entries === undefined) return [];
@@ -103,18 +111,20 @@ export function defaultConnectors(entries: unknown, env: NodeJS.ProcessEnv = pro
   }
   const out: DefaultConnector[] = [];
   entries.forEach((entry: unknown, index) => {
-    const label = typeof (entry as { name?: unknown })?.name === 'string' ? `"${(entry as { name: string }).name}"` : `entry ${index + 1}`;
+    // How the warnings name this entry: its name, or its place in the list.
+    const which = typeof (entry as { name?: unknown })?.name === 'string' ? `"${(entry as { name: string }).name}"` : `entry ${index + 1}`;
     try {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new McpConnectorError('expected an object');
-      const { name: rawName, upstream: rawUpstream } = entry as { name?: unknown; upstream?: unknown };
+      const { name: rawName, label: rawLabel, upstream: rawUpstream } = entry as { name?: unknown; label?: unknown; upstream?: unknown };
       const name = validateConnectorName(rawName);
+      const label = rawLabel === undefined ? undefined : validateDisplayName(rawLabel);
       const upstream = parseUpstream(rawUpstream, upstreamTestAllow(env)).url;
       if (out.some(d => d.name === name || d.upstream === upstream)) throw new McpConnectorError('listed twice');
       const unknown = Object.keys(entry).filter(k => !CATALOG_ENTRY_KEYS.has(k));
-      if (unknown.length) warnDefaults(`${label}: ignoring unknown key${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')}`);
-      out.push({ name, upstream });
+      if (unknown.length) warnDefaults(`${which}: ignoring unknown key${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')}`);
+      out.push(label === undefined ? { name, upstream } : { name, label, upstream });
     } catch (err) {
-      warnDefaults(`skipping ${label}: ${(err as Error).message}`);
+      warnDefaults(`skipping ${which}: ${(err as Error).message}`);
     }
   });
   return out;
@@ -138,6 +148,50 @@ export function validateConnectorName(name: unknown): string {
     throw new McpConnectorError('name must start with a letter and use only lowercase letters, digits and dashes (at most 41)');
   }
   return name;
+}
+
+/**
+ * The connector name for a display name, or null when none can be made.
+ * Text that is already a connector name is its own. Otherwise Claude Code's
+ * rule for a server name comes first (every character but a letter, digit,
+ * `_` or `-` becomes `_`), then CONNECTOR_NAME's: lowercase, `_` as `-`, runs
+ * of dashes as one, no dash at either end, `mcp-` in front of a leading
+ * digit, at most 41 characters. "Claude Docs" is claude-docs.
+ */
+export function connectorSlug(display: string): string | null {
+  const text = display.trim();
+  if (CONNECTOR_NAME.test(text)) return text;
+  let slug = text.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase().replace(/_/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  if (!slug) return null;
+  if (/^[0-9]/.test(slug)) slug = `mcp-${slug}`;
+  slug = slug.slice(0, 41).replace(/-+$/, '');
+  return CONNECTOR_NAME.test(slug) ? slug : null;
+}
+
+/** Display text for a connector: trimmed, one line, 1 to 80 characters. */
+export function validateDisplayName(raw: unknown): string {
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text || text.length > MAX_DISPLAY_NAME || /\p{Cc}/u.test(text)) {
+    throw new McpConnectorError(`name must be 1 to ${MAX_DISPLAY_NAME} characters on one line`);
+  }
+  return text;
+}
+
+/**
+ * A name as typed in Settings: its connector name (connectorSlug) and the
+ * display text to store, null when the text is the connector name itself.
+ */
+export function connectorNaming(raw: unknown): { name: string; displayName: string | null } {
+  const displayName = validateDisplayName(raw);
+  const name = connectorSlug(displayName);
+  if (!name) throw new McpConnectorError('name needs at least one letter or digit (a-z, 0-9)');
+  return { name, displayName: displayName === name ? null : displayName };
+}
+
+/** The 409 for a name whose connector name another of the user's connectors already has. */
+export function connectorNameTaken(naming: { name: string; displayName: string | null }): McpConnectorError {
+  const from = naming.displayName ? `, which is what "${naming.displayName}" becomes in tool names (mcp__${naming.name}__…)` : '';
+  return new McpConnectorError(`Another of your MCP servers is already named "${naming.name}"${from}. Choose a different name.`, 409);
 }
 
 // Private, loopback, link-local (the instance metadata address among them),

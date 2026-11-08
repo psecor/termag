@@ -203,11 +203,39 @@ describe('authorization request and state', () => {
   });
 
   it('sends PKCE, state, resource and scopes on the authorize URL', () => {
-    const u = new URL(authorizeUrl(DISCOVERED, CLIENT, { state: 's', challenge: 'c' }));
+    const u = new URL(authorizeUrl(DISCOVERED, CLIENT, { state: 's', challenge: 'c', scopes: ['read'] }));
     expect(Object.fromEntries(u.searchParams)).toEqual({
       response_type: 'code', client_id: 'cid', redirect_uri: CLIENT.redirectUri, code_challenge: 'c',
       code_challenge_method: 'S256', state: 's', resource: UP, scope: 'read',
     });
+  });
+
+  it('asks only for the scopes it is given, not every scope the server advertises, and for none when given none', () => {
+    const meta = { ...DISCOVERED, scopes: ['search:read.public', 'channels:history', 'chat:write'] };
+    const chosen = new URL(authorizeUrl(meta, CLIENT, { state: 's', challenge: 'c', scopes: ['search:read.public', 'channels:history'] }));
+    expect(chosen.searchParams.get('scope')).toBe('search:read.public channels:history');
+    expect(new URL(authorizeUrl(meta, CLIENT, { state: 's', challenge: 'c', scopes: [] })).searchParams.has('scope')).toBe(false);
+  });
+
+  it('pins the Slack workspace it is given with `team`, and sends none when given none', () => {
+    expect(new URL(authorizeUrl(DISCOVERED, CLIENT, { state: 's', challenge: 'c', scopes: [], team: 'T03ABC123' })).searchParams.get('team')).toBe('T03ABC123');
+    expect(new URL(authorizeUrl(DISCOVERED, CLIENT, { state: 's', challenge: 'c', scopes: [] })).searchParams.has('team')).toBe(false);
+  });
+
+  it('sends no resource for a provider that takes none, and adds its own authorize parameters (Google)', () => {
+    const meta = { ...DISCOVERED, sendsResource: false as const, authorizeParams: { access_type: 'offline', prompt: 'consent' } };
+    const u = new URL(authorizeUrl(meta, CLIENT, { state: 's', challenge: 'c', scopes: [] }));
+    expect(u.searchParams.has('resource')).toBe(false);
+    expect(u.searchParams.get('access_type')).toBe('offline');
+    expect(u.searchParams.get('prompt')).toBe('consent');
+  });
+
+  it('never lets authorize parameters replace the ones the flow sets', () => {
+    const meta = { ...DISCOVERED, authorizeParams: { state: 'evil', redirect_uri: 'https://evil.example', code_challenge_method: 'plain' } };
+    const u = new URL(authorizeUrl(meta, CLIENT, { state: 's', challenge: 'c', scopes: [] }));
+    expect(u.searchParams.get('state')).toBe('s');
+    expect(u.searchParams.get('redirect_uri')).toBe(CLIENT.redirectUri);
+    expect(u.searchParams.get('code_challenge_method')).toBe('S256');
   });
 
   it('binds state to the user and connector, and refuses any tampering', () => {
@@ -232,6 +260,12 @@ describe('token endpoint', () => {
     expect(Object.fromEntries(new URLSearchParams(calls[0].req.body))).toEqual({
       grant_type: 'authorization_code', code: 'code', code_verifier: 'v', redirect_uri: CLIENT.redirectUri, resource: UP, client_id: 'cid',
     });
+  });
+
+  it('sends no resource on a token request for a provider that takes none', async () => {
+    const { http, calls } = fakeHttp({ 'https://auth.example/token': () => ok({ access_token: 'at', token_type: 'Bearer' }) });
+    await exchangeCode({ ...DISCOVERED, sendsResource: false }, CLIENT, { code: 'code', verifier: 'v' }, http, 1000);
+    expect(new URLSearchParams(calls[0].req.body).has('resource')).toBe(false);
   });
 
   it('authenticates a confidential client with basic auth and keeps the secret out of the form', async () => {
@@ -501,7 +535,16 @@ describe('pre-registered clients (MCP_OAUTH_CLIENTS)', () => {
     };
     expect(preregisteredClients(env)).toEqual([{ issuer: 'https://mcp.slack.com', resource: 'https://mcp.slack.com', clientId: '111.222', clientSecret: SECRET, tokenTypes: ['user'] }]);
     expect(preregisteredClients({ MCP_OAUTH_CLIENTS: '{not json' })).toEqual([]);
+    const pinned = JSON.parse(ENV.MCP_OAUTH_CLIENTS);
+    pinned[0].scopes = ['search:read.public', ' channels:history ', 7];
+    expect(preregisteredClients({ ...ENV, MCP_OAUTH_CLIENTS: JSON.stringify(pinned) })[0].scopes).toEqual(['search:read.public', 'channels:history']);
     expect(preregisteredClients({})).toEqual([]);
+    // A Slack workspace pin is kept; a malformed one is dropped and the entry still used.
+    expect(preregisteredClients({ ...ENV, MCP_OAUTH_CLIENTS: JSON.stringify([{ ...pinned[0], team: ' T03ABC123 ' }]) })[0].team).toBe('T03ABC123');
+    const badTeam = preregisteredClients({ ...ENV, MCP_OAUTH_CLIENTS: JSON.stringify([{ ...pinned[0], team: 'example-org' }]) });
+    expect(badTeam).toHaveLength(1);
+    expect(badTeam[0].team).toBeUndefined();
+    expect(warn.mock.calls.flat().join('\n')).toMatch(/ignored a team that is not a Slack workspace or org id/);
     expect(warn.mock.calls.flat().join('\n')).toMatch(/MCP_OAUTH_UNSET_SECRET is unset/);
     expect(warn.mock.calls.flat().join('\n')).not.toContain(SECRET);
   });
@@ -565,7 +608,7 @@ describe('pre-registered clients (MCP_OAUTH_CLIENTS)', () => {
     const meta = await discoverSlack();
     const { http, calls } = slack();
     const client = await registerClient(meta, { http, cimdClientId: null, redirectUri: CLIENT.redirectUri });
-    const url = authorizeUrl(meta, client, { state: 's', challenge: 'c' });
+    const url = authorizeUrl(meta, client, { state: 's', challenge: 'c', scopes: meta.scopes });
     const tokens = await exchangeCode(meta, client, { code: 'code', verifier: 'v' }, http, 1000);
 
     expect(tokens).toEqual({ accessToken: 'xoxp-user', expiresAt: null });

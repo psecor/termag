@@ -81,7 +81,7 @@ let server: Server;
 let base: string;
 let current: {
   deps: Deps; groups: ReturnType<typeof groupStore>; github: Map<string, NumberedPr>; byNumber: ReturnType<typeof vi.fn>;
-  lite: ReturnType<typeof vi.fn>; suggestionsOn: boolean; bodies: Map<string, string>; dismissed: Set<string>;
+  lite: ReturnType<typeof vi.fn>; bodies: Map<string, string>; dismissed: Set<string>;
 };
 
 function deps(over: Partial<Deps> = {}): Deps {
@@ -114,7 +114,6 @@ beforeAll(async () => {
     bakeRuns: (...a) => current.deps.bakeRuns(...a),
     byNumber: (...a) => current.byNumber(...a),
     lite: (...a) => current.lite(...a),
-    suggestionsOn: async () => current.suggestionsOn,
     viewer: (...a) => current.deps.viewer!(...a),
     now: () => current.deps.now(),
   };
@@ -155,7 +154,6 @@ beforeEach(() => {
         ? { repo: r.repo, number: r.number, found: true, open: pr.state === 'OPEN', title: pr.title, url: pr.url, author: pr.author, body: withBody ? current.bodies.get(`${r.repo}#${r.number}`) ?? '' : null }
         : { repo: r.repo, number: r.number, found: false, open: false, title: '', url: '', author: null, body: null };
     })),
-    suggestionsOn: true,
     bodies: new Map(),
     dismissed: new Set(),
   };
@@ -401,12 +399,6 @@ describe('suggested groups (phase 3)', () => {
     await call('GET', '/prs');
     await call('GET', '/prs');
     expect(current.lite.mock.calls.filter(c => c[2] === true)).toHaveLength(1);
-  });
-  it('reads nothing and suggests nothing with the flag off', async () => {
-    current.suggestionsOn = false;
-    const body = await (await call('GET', '/prs')).json();
-    expect(body.suggestions).toEqual([]);
-    expect(current.lite).not.toHaveBeenCalled();
   });
   it('keeps a dismissed suggestion away', async () => {
     const [s] = (await (await call('GET', '/prs')).json()).suggestions;

@@ -10,7 +10,8 @@ import { termagVersion } from '../termagVersion';
 import { collectorStatus } from './collector';
 import { isOnline, short, summarize, type Cell, type HostRow } from './summary';
 import {
-  COMMIT_COMPONENTS, commitState, hooksState, termagReference, newestVersion, sortComponents, toolState, type SoftwareState,
+  COMMIT_COMPONENTS, KERNEL_COMPONENTS, clientReference, clientState, commitState, hooksState, kernelReferenceText, kernelReferences, kernelState, rebootState,
+  termagReference, newestVersion, sortComponents, toolState, type SoftwareState,
 } from './versions';
 
 export type { Cell, HostRow, ComponentSummary } from './summary';
@@ -35,6 +36,11 @@ export async function softwareMatrix() {
   const components = sortComponents([...new Set(rows.map(r => r.component))]);
   const toolRef = new Map<string, string | null>();
   for (const c of components) if (!COMMIT_COMPONENTS.has(c) && c !== 'hooks') toolRef.set(c, newestVersion(rows.filter(r => r.component === c && r.ok).map(r => r.version)));
+  // Kernels: the newest build per track and host kind, from what hosts run and have installed.
+  const kindOf = (r: (typeof rows)[number]) => (r.hostKind === 'box' || r.hostKind === 'agent' ? r.hostKind : 'orchestrator') as HostRow['kind'];
+  const okVersion = (host: typeof rows, c: string) => { const r = host.find(x => x.component === c); return r?.ok ? r.version : null; };
+  const kernelRefs = kernelReferences([...byHost.values()].filter(h => h.some(r => KERNEL_COMPONENTS.has(r.component)))
+    .map(h => ({ kind: kindOf(h[0]), running: okVersion(h, 'kernel'), installed: okVersion(h, 'kernel-installed') })));
   const refs = { boxImageCommit: boxTarget, orchestratorImageCommit: orchImage?.sha ?? null, runningCommit: running.sha };
   const termagRef = (kind: HostRow['kind']) => termagReference(kind, refs);
 
@@ -42,6 +48,8 @@ export async function softwareMatrix() {
     if (component === 'termag' || component === 'image') return r.ok ? commitState(r.version, termagRef(kind)) : 'unknown';
     if (component === 'termag-checkout') { const running = host.find(x => x.component === 'termag'); return r.ok ? commitState(r.version, running?.version ?? null) : 'unknown'; }
     if (component === 'hooks') return hooksState(r.version);
+    if (KERNEL_COMPONENTS.has(component)) return kernelState(kind, r.version, r.ok, r.path, kernelRefs, component === 'kernel' ? okVersion(host, 'kernel-installed') : null);
+    if (component === 'reboot') return rebootState(r.version, r.ok, r.path);
     return toolState({ version: r.version, ok: r.ok, path: r.path }, toolRef.get(component) ?? null);
   };
 
@@ -58,11 +66,13 @@ export async function softwareMatrix() {
   });
 
   const reference = (c: string) => ({
-    reference: COMMIT_COMPONENTS.has(c) ? null : c === 'hooks' ? 'current' : toolRef.get(c) ?? null,
+    reference: COMMIT_COMPONENTS.has(c) ? null : c === 'hooks' ? 'current' : c === 'reboot' ? 'no' : KERNEL_COMPONENTS.has(c) ? kernelReferenceText(kernelRefs) : toolRef.get(c) ?? null,
     referenceNote: c === 'termag' || c === 'image'
       ? `boxes: ${boxTarget ? `newest box image ${short(boxTarget)}` : `no box image known, so the orchestrator's running ${short(running.sha) ?? 'commit'}`} · orchestrator and its agents: ${orchImage?.sha ? `newest orchestrator image ${short(orchImage.sha)}` : `no image known, so its running ${short(running.sha) ?? 'commit'}`}`
       : c === 'termag-checkout' ? 'each host\'s running commit: a different checkout means pulled but not restarted'
       : c === 'hooks' ? 'the last box update\'s Claude hooks step'
+      : KERNEL_COMPONENTS.has(c) ? 'the newest build on the same track (major.minor and flavour: 6.8-aws, 7.0-aws) and host kind (boxes; the orchestrator with its agents), running or installed anywhere; a newer kernel installed on the host itself counts too'
+      : c === 'reboot' ? 'pending: /run/reboot-required exists, or a newer kernel than the running one is installed; hover for since when and why'
       : 'the newest version anywhere in the fleet',
   });
   const summary = summarize(components, hostList, reference);
@@ -90,13 +100,13 @@ export async function clientVersions() {
   const [rows, running] = await Promise.all([prisma.clientVersion.findMany({ orderBy: { lastSeenAt: 'desc' } }), termagVersion()]);
   const users = new Map((await prisma.user.findMany({ where: { id: { in: [...new Set(rows.map(r => r.userId))] } }, select: { id: true, unixUsername: true } })).map(u => [u.id, u.unixUsername]));
   const newest = new Map<string, string | null>();
-  for (const k of ['cli', 'tui', 'metaterm']) newest.set(k, newestVersion(rows.filter(r => r.kind === k).map(r => r.version)));
+  for (const k of ['cli', 'tui', 'metaterm']) newest.set(k, clientReference(rows.filter(r => r.kind === k).map(r => r.version)));
   return {
     runningCommit: running.sha,
     clients: rows.map(r => {
       const state: SoftwareState = r.kind === 'web' || r.kind === 'mobile'
         ? (r.version === 'unknown' ? 'unknown' : commitState(r.version, running.sha))
-        : toolState({ version: r.version, ok: true }, newest.get(r.kind) ?? null);
+        : clientState(r.version, newest.get(r.kind) ?? null);
       return { userId: r.userId, user: users.get(r.userId) ?? null, kind: r.kind, version: r.version, state, lastSeenAt: r.lastSeenAt.toISOString() };
     }),
   };

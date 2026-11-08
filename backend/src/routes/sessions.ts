@@ -3,12 +3,14 @@ import { prisma } from '../db';
 import { requireAuthOrAgentToken } from '../middleware/auth';
 import { sendForProject, isProjectAgentConnected } from '../services/agentRegistry';
 import { noteBoxActivity } from '../services/boxActivity';
-import { assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { askChatPaneRefusal, assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
+import { exactPaneTarget } from '../services/tmux';
 import { collectSessionRows, inventoryInclude } from '../services/sessionInventory';
 import {
   liveSearchDeps, parseRoles, searchSessions, SEARCH_DEFAULT_LINES, SEARCH_MAX_QUERY, SEARCH_MIN_QUERY,
   type SearchDeps, type SearchResult,
 } from '../services/sessionSearch';
+import { LISTED_PROJECT_KINDS } from '../services/projectKind';
 
 // Permissioned, token-friendly session surface for non-browser callers — built
 // for the MetaTerm MCP server, usable by anything holding a Bearer agent token.
@@ -130,9 +132,9 @@ export function sessionsRouter(): Router {
  * belongs to, which marks that box's rows.
  */
 export async function listSessionRowsFor(userId: string, callerInstanceId?: string | null) {
-  const owned = await prisma.project.findMany({ where: { userId, archived: false }, include: inventoryInclude });
+  const owned = await prisma.project.findMany({ where: { userId, archived: false, kind: { in: LISTED_PROJECT_KINDS } }, include: inventoryInclude });
   const shares = await prisma.projectShare.findMany({
-    where: { userId },
+    where: { userId, project: { kind: { in: LISTED_PROJECT_KINDS } } },
     include: { project: { include: inventoryInclude } },
   });
   const rows = await collectSessionRows([
@@ -165,6 +167,8 @@ export async function sendKeysFor(
     if (err instanceof SessionAccessError) return { status: err.status, body: { error: err.message } };
     throw err;
   }
+  const noPane = askChatPaneRefusal(access);
+  if (noPane) return noPane;
   if (!isProjectAgentConnected(access.host)) {
     return { status: 503, body: { error: "Owner's agent is offline" } };
   }
@@ -180,8 +184,10 @@ export async function sendKeysFor(
     // literal (default true): type `keys` verbatim. literal:false sends tmux
     // KEY NAMES (C-c, Escape, Up…) — deliberate control-tower use only. Old
     // agents ignore the flag and keep their historical key-name behavior.
+    // Exact target: a dead slot name (`…-ctrl-2`)
+    // must not prefix-match a longer live session (another project's pane).
     await sendForProject(access.host, 'tmux-send-keys', {
-      sessionName: access.session, keys, withEnter: enter !== false, literal: literal !== false,
+      sessionName: exactPaneTarget(access.session), keys, withEnter: enter !== false, literal: literal !== false,
     });
     return { status: 200, body: { ok: true, session: access.session } };
   } catch (err) {
@@ -217,6 +223,8 @@ export async function pasteImageFor(
     if (err instanceof SessionAccessError) return { status: err.status, body: { error: err.message } };
     throw err;
   }
+  const noPane = askChatPaneRefusal(access);
+  if (noPane) return noPane;
   if (!isProjectAgentConnected(access.host)) {
     return { status: 503, body: { error: "Owner's agent is offline" } };
   }

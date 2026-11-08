@@ -12,11 +12,9 @@
  * The same sweep terminates a box that has stayed hibernated for its
  * `hibernatedTerminateDays`, raised to the unsaved-work limit (90 days)
  * unless that scan came back clean. Nothing but a hibernated box is ever
- * terminated. Gated per owner and box by the feature flag
- * box-auto-lifecycle-enabled, default off.
+ * terminated.
  *
- * A box with no `idleHibernateHours` is left alone unless box-idle-stop-enabled
- * is on for its owner and box. Then it is plainly stopped after the default
+ * A box with no `idleHibernateHours` is plainly stopped after the default
  * window (`box-idle-park-hours`, else IDLE_STOP_DEFAULT_HOURS), even when it
  * can hibernate. Its owner is warned a lead first (`idleWarnedAt`/
  * `idleParkAt`, `box-idle-park-warn-minutes`), and the stop waits for the
@@ -42,10 +40,8 @@ import {
   askBoxLifecycle,
   autoStopNote,
   autoTerminateNote,
-  BOX_AUTO_LIFECYCLE_FLAG,
   BOX_IDLE_PARK_HOURS_FLAG,
   BOX_IDLE_PARK_WARN_MINUTES_FLAG,
-  BOX_IDLE_STOP_FLAG,
   DEFAULT_WARN_MINUTES,
   IDLE_HIBERNATE_MAX_HOURS,
   IDLE_STOP_DEFAULT_HOURS,
@@ -77,7 +73,6 @@ import { boolVariation, numberVariation } from './featureFlags';
 import { getAllStatuses } from './status';
 import { traceSweep } from './tracing/spans';
 
-export { BOX_AUTO_LIFECYCLE_FLAG, BOX_IDLE_STOP_FLAG };
 
 export const LIFECYCLE_SWEEP_MS = 5 * 60 * 1000;
 
@@ -181,7 +176,7 @@ registerBoxBusyCheck('ssh', async ids => {
  */
 let liveTunnels: (ids: string[]) => Set<string> = () => new Set();
 
-/** Where the `tunnels` check reads this process's open forwards (AgentTunnels.boxesWithTunnels, 'port'); index.ts sets it. */
+/** Where the `tunnels` check reads this process's open forwards (AgentTunnels.boxesWithTunnels, 'port'; never 'preview', services/previewLinkActivity.ts); index.ts sets it. */
 export function setLiveTunnels(source: (ids: string[]) => Set<string>): void {
   liveTunnels = source;
 }
@@ -240,22 +235,19 @@ export function workingBoxes(): Set<string> {
 export interface SweepResult { box: string; decision: IdleDecision | TerminateDecision | StuckStartDecision; outcome?: string }
 
 /**
- * `box-idle-stop-enabled` for the owner and box, and only while it is on,
- * the default window's hours and warning lead. The box list's lifecycle
- * view reads them the same way.
+ * The default window's hours and warning lead for the owner and box. The box
+ * list's lifecycle view reads them the same way.
  */
 export async function idleStopOptionsFor(
   box: Pick<Instance, 'id' | 'name' | 'kind'>,
   user: FlagUser,
-): Promise<Required<Pick<IdleStopOptions, 'idleStopOn' | 'idleStopHours'>> & Pick<IdleStopOptions, 'warnMinutes'>> {
+): Promise<Required<Pick<IdleStopOptions, 'idleStopHours'>> & Pick<IdleStopOptions, 'warnMinutes'>> {
   const ctx = { id: box.id, name: box.name, kind: box.kind };
-  const idleStopOn = await boolVariation(BOX_IDLE_STOP_FLAG, user, false, ctx);
-  if (!idleStopOn) return { idleStopOn, idleStopHours: idleStopHours(undefined) };
   const [hours, warnMinutes] = await Promise.all([
     numberVariation(BOX_IDLE_PARK_HOURS_FLAG, user, IDLE_STOP_DEFAULT_HOURS, ctx),
     numberVariation(BOX_IDLE_PARK_WARN_MINUTES_FLAG, user, DEFAULT_WARN_MINUTES, ctx),
   ]);
-  return { idleStopOn, idleStopHours: idleStopHours(hours), warnMinutes };
+  return { idleStopHours: idleStopHours(hours), warnMinutes };
 }
 
 
@@ -356,8 +348,7 @@ async function hibernatePass(now: number): Promise<SweepResult[]> {
   const boxes = await prisma.instance.findMany({
     where: {
       status: 'ready', kind: 'ec2', userId: { not: null }, ec2InstanceId: { not: null },
-      // A box with no setting is a candidate only for box-idle-stop-enabled,
-      // which considerBox reads before anything else happens to it.
+      // A box with no setting is a candidate for the default idle window.
     },
     include: { user: true },
   // A box whose stuck-start stop timed out back to ready is retryStuckStops's:
@@ -380,34 +371,22 @@ async function hibernatePass(now: number): Promise<SweepResult[]> {
   return results.filter((r): r is SweepResult => r !== null);
 }
 
-/** Null for a box with no setting whose owner and box are not in box-idle-stop-enabled: nothing to report. */
 async function considerBox(
   box: Instance,
   user: User,
   facts: { nowMs: number; busy: readonly string[]; working: boolean },
-): Promise<SweepResult | null> {
+): Promise<SweepResult> {
   const boxContext = { id: box.id, name: box.name, kind: box.kind };
   const defaultWindow = box.idleHibernateHours == null;
   const stopOptions = defaultWindow ? await idleStopOptionsFor(box, user) : null;
-  const idleStopOn = !!stopOptions?.idleStopOn;
-  if (defaultWindow && !idleStopOn) {
-    // A warning stands only while the flag is on: the box stayed up past
-    // its promise because the flag was off, so it is warned afresh if the
-    // flag comes back on.
-    if (box.idleWarnedAt) {
-      await prisma.instance.updateMany({ where: { id: box.id, idleWarnedAt: box.idleWarnedAt }, data: { idleWarnedAt: null, idleParkAt: null } });
-    }
-    return null;
-  }
   if (!defaultWindow && box.idleWarnedAt) {
     // Own hours are never warned (a box's own hours park it unannounced), so
     // a warning left from the default window stands for nothing now.
     await prisma.instance.updateMany({ where: { id: box.id, idleWarnedAt: box.idleWarnedAt }, data: { idleWarnedAt: null, idleParkAt: null } });
   }
-  const flagOn = defaultWindow ? false : await boolVariation(BOX_AUTO_LIFECYCLE_FLAG, user, false, boxContext);
   const defaultHours = stopOptions?.idleStopHours ?? IDLE_STOP_DEFAULT_HOURS;
-  const window = { idleStopOn, idleStopHours: defaultHours, leadMs: warnLeadMs(stopOptions?.warnMinutes, defaultHours) };
-  const decision = idleHibernateDecision(box, { ...facts, flagOn, ...window });
+  const window = { idleStopHours: defaultHours, leadMs: warnLeadMs(stopOptions?.warnMinutes, defaultHours) };
+  const decision = idleHibernateDecision(box, { ...facts, ...window });
   noteDeferral(box, user, decision);
   if ('warn' in decision) return warnOwner(box, user, decision, defaultHours, facts.nowMs);
   if (isIdleSkip(decision)) return { box: box.name, decision };
@@ -418,7 +397,7 @@ async function considerBox(
   const fresh = await prisma.instance.findUnique({ where: { id: box.id } });
   if (!fresh) return { box: box.name, decision, outcome: 'conflict' };
   const recheck = idleHibernateDecision(fresh, {
-    nowMs: facts.nowMs, flagOn, ...window,
+    nowMs: facts.nowMs, ...window,
     busy: (await busyBoxes([box.id])).get(box.id) ?? [], working: workingBoxes().has(box.id),
   });
   // A box that changed during the scan so that it needs a (new) warning gets
@@ -485,26 +464,19 @@ async function stuckStartPass(now: number): Promise<SweepResult[]> {
     try {
       const facts = {
         nowMs: now, startRequestedAt: powerRequestedAt(box.id), agentConnected: isInstanceAgentConnected(box.id),
-        startTimeoutMs, leadMs: 0, busy: [] as readonly string[], flagOn: true,
+        startTimeoutMs, leadMs: 0, busy: [] as readonly string[],
       };
       // The cheap checks first: the flags and the busy checks only for a box that is stuck.
       if (stuckStartDecision(box, facts).act === 'none') continue;
-      // Behind box-idle-stop-enabled, like the default window's stop; the
-      // lead is its warning minutes, not capped by any window.
+      // The lead is the default window's warning minutes, not capped by any window.
       const options = await idleStopOptionsFor(box, box.user!);
       const decision = stuckStartDecision(box, {
-        ...facts, flagOn: options.idleStopOn,
+        ...facts,
         leadMs: warnLeadMs(options.warnMinutes, IDLE_HIBERNATE_MAX_HOURS),
         busy: (await busyBoxes([box.id])).get(box.id) ?? [],
       });
       const since = new Date(facts.startRequestedAt!);
       if (decision.act === 'none') {
-        // As for the default window, a warning stands only while the flag is on.
-        if (decision.reason === 'flag-off' && box.idleWarnedAt) {
-          await prisma.instance.updateMany({
-            where: { id: box.id, status: 'starting', idleWarnedAt: box.idleWarnedAt }, data: { idleWarnedAt: null, idleParkAt: null },
-          });
-        }
         if (decision.reason !== 'warned') results.push({ box: box.name, decision });
         continue;
       }
@@ -559,10 +531,9 @@ async function retryStuckStops(now: number): Promise<SweepResult[]> {
   for (const box of boxes) {
     try {
       const agentConnected = isInstanceAgentConnected(box.id);
-      if (!stuckStopRetryDecision(box, { flagOn: true, agentConnected, busy: [] })) continue;
-      const { idleStopOn } = await idleStopOptionsFor(box, box.user!);
+      if (!stuckStopRetryDecision(box, { agentConnected, busy: [] })) continue;
       const busy = (await busyBoxes([box.id])).get(box.id) ?? [];
-      if (!stuckStopRetryDecision(box, { flagOn: idleStopOn, agentConnected, busy })) continue;
+      if (!stuckStopRetryDecision(box, { agentConnected, busy })) continue;
       pendingParkNotices.set(box.id, { stuckSince: null });
       let status: string;
       try {
@@ -758,12 +729,11 @@ async function considerTerminate(
   facts: { nowMs: number; unsavedLimitDays: number },
   terminator: BoxTerminator,
 ): Promise<SweepResult> {
-  const flagOn = await boolVariation(BOX_AUTO_LIFECYCLE_FLAG, user, false, { id: box.id, name: box.name, kind: box.kind });
-  let decision = terminateDecision(box, { ...facts, flagOn });
+  let decision = terminateDecision(box, facts);
   if (!decision.terminate) return { box: box.name, decision };
   // Only a box that is due is asked about its automations: the query is per box.
   const automations = await enabledAutomationsOn(box.id);
-  decision = terminateDecision(box, { ...facts, flagOn, hostsAutomation: automations.length > 0 });
+  decision = terminateDecision(box, { ...facts, hostsAutomation: automations.length > 0 });
   if (!decision.terminate) {
     if (!keptForAutomation.has(box.id)) {
       keptForAutomation.add(box.id);
@@ -786,8 +756,8 @@ async function considerTerminate(
     await terminator(user, box);
   } catch (err) {
     // Let go of a box the terminate didn't reach: the claim blocks every
-    // start, and the next sweep decides again (a setting or the flag may
-    // have changed meanwhile) before claiming it afresh.
+    // start, and the next sweep decides again (a setting may have changed
+    // meanwhile) before claiming it afresh.
     await prisma.instance.updateMany({
       where: { id: box.id, status: box.status, autoTerminatedAt: claimedAt },
       data: { autoTerminatedAt: null, lifecycleNote: box.lifecycleNote },
@@ -810,9 +780,7 @@ async function considerTerminate(
  */
 /**
  * The lifecycle block on the box list and the settings answer. Reads
- * `box-idle-stop-enabled` (and its two number flags) for a box with no idle
- * hours, and `box-auto-lifecycle-enabled` for one with its own, so its park
- * time and warning are the ones the sweep acts on.
+ * the default window's two number flags for a box with no idle hours, so its park time and warning are the ones the sweep acts on.
  */
 export async function lifecycleViewFor(
   user: FlagUser,
@@ -821,7 +789,7 @@ export async function lifecycleViewFor(
 ): Promise<LifecycleView> {
   const options: IdleStopOptions = box.idleHibernateHours == null
     ? await idleStopOptionsFor(box, user)
-    : { autoLifecycleOn: await boolVariation(BOX_AUTO_LIFECYCLE_FLAG, user, false, { id: box.id, name: box.name, kind: box.kind }) };
+    : {};
   // A parked box the sweep would terminate shows no date while it hosts an
   // enabled automation (terminateDecision); asked only of those.
   if (box.parkedAt && box.hibernatedTerminateDays != null) options.hostsAutomation = (await enabledAutomationsOn(box.id)).length > 0;

@@ -11,11 +11,12 @@ const NAME_RE = /^[a-z0-9-]{1,40}$/;
 
 /**
  * What an agent's reply may write: its own probes (agent/software-inventory.js
- * PROBES, kept in step by a test) plus the OS and kernel. termag, image and
+ * PROBES, kept in step by a test) plus the OS, the running and newest installed
+ * kernel, and whether a reboot is pending (its osEntries and kernelEntries). termag, image and
  * hooks come from the orchestrator's own sources, never from a reply.
  */
 export const AGENT_COMPONENTS: ReadonlySet<string> = new Set([
-  'claude', 'codex', 'cursor-agent', 'devin', 'pi', 'node', 'npm', 'gh', 'aws', 'tmux', 'git', 'docker', 'python', 'os', 'kernel',
+  'claude', 'codex', 'cursor-agent', 'devin', 'pi', 'node', 'npm', 'gh', 'aws', 'tmux', 'git', 'docker', 'python', 'os', 'kernel', 'kernel-installed', 'reboot',
 ]);
 /** The orchestrator's own run adds its ORCHESTRATOR_PROBES. */
 export const ORCHESTRATOR_COMPONENTS: ReadonlySet<string> = new Set([...AGENT_COMPONENTS, 'nginx', 'envoy', 'otelcol']);

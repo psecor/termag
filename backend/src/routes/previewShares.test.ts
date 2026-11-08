@@ -72,7 +72,6 @@ function deps(over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore()): P
     findUserByEmail: vi.fn(async (email) => ({ 'gus@x.test': guest, 'olive@x.test': owner } as Record<string, User>)[email] ?? null),
     findUser: vi.fn(async (id) => [owner, guest, stranger].find(u => u.id === id) ?? null),
     isCollaborator: vi.fn(async () => false),
-    sharingOn: vi.fn(async () => true),
     ttlDefault: vi.fn(async () => 24),
     boxStatus: vi.fn(async () => 'ready'),
     notifyWake: vi.fn(async () => true),
@@ -132,9 +131,8 @@ describe('creating a share', () => {
     expect(bad.status).toBe(400);
   });
 
-  it('refuses: not the owner, sharing off, no such workstream, no such user, yourself', async () => {
+  it('refuses: not the owner, no such workstream, no such user, yourself', async () => {
     expect((await createShareFor(deps(), asUser(guest), 'p1', { email: 'gus@x.test' })).status).toBe(404);
-    expect(await createShareFor(deps({ sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', { email: 'gus@x.test' })).toMatchObject({ status: 403, body: { code: 'preview-share-disabled' } });
     expect((await createShareFor(deps(), asUser(owner), 'p1', { email: 'gus@x.test', workstream: 'nope' })).status).toBe(404);
     expect((await createShareFor(deps(), asUser(owner), 'p1', { email: 'gus@x.test', workstream: '../etc' })).status).toBe(400);
     expect(await createShareFor(deps(), asUser(owner), 'p1', { email: 'nobody@x.test' })).toMatchObject({ status: 404, body: { code: 'no-such-user' } });
@@ -303,10 +301,9 @@ describe('checking the dev stack before sharing', () => {
     expect(offline.checkStack).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ recipe: { kind: 'webapp-dev-stack' }, cwd: '/home/olive/termag/projects/webapp' }));
   });
 
-  it('is its owner\'s only, with sharing on, for a workstream the project has', async () => {
+  it('is its owner\'s only, for a workstream the project has', async () => {
     const d = checkDeps({ ok: true });
     expect((await stackCheckFor(d, asUser(stranger), 'p1', {})).status).toBe(404);
-    expect((await stackCheckFor(checkDeps({ ok: true }, { sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', {})).status).toBe(403);
     expect((await stackCheckFor(d, asUser(owner), 'p1', { workstream: 'gone' })).status).toBe(404);
     expect((await stackCheckFor(d, asUser(owner), 'p1', { workstream: '../x' })).status).toBe(400);
     expect(d.checkStack).not.toHaveBeenCalled();

@@ -12,7 +12,7 @@ vi.mock('../services/agentRegistry', () => ({
 
 import { TERMINAL_BOX_PARKED_CLOSE_CODE } from '../services/boxPowerPolicy';
 import { BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY, BROWSER_PANE_DISABLED_CLOSE_CODE, BROWSER_PANE_RETRY_CLOSE_CODE, BROWSER_PANE_UNSUPPORTED_CLOSE_CODE } from '../services/browserPane';
-import { BROWSER_PANE_DISABLED_MESSAGE, BROWSER_PANE_UNSUPPORTED_MESSAGE, handleBrowserPaneSocket, type BrowserPaneProject, type BrowserWsDeps } from './browserWs';
+import { BROWSER_PANE_UNSUPPORTED_MESSAGE, handleBrowserPaneSocket, type BrowserPaneProject, type BrowserWsDeps } from './browserWs';
 
 class FakeSocket extends EventEmitter {
   readyState = 1;
@@ -33,8 +33,6 @@ function deps(over: Partial<BrowserWsDeps> = {}): BrowserWsDeps & { log: ReturnT
     findProject: vi.fn(async (id) => (id === project.id ? project : null)),
     findUser: vi.fn(async (id) => (id === owner.id ? owner : id === friend.id ? friend : null)),
     hasShare: vi.fn(async (_p, userId) => userId === friend.id),
-    flagOn: vi.fn(async () => true),
-    keptProfilesOn: vi.fn(async () => false),
     boxStatus: vi.fn(async () => 'ready'),
     agentConnected: vi.fn(() => true),
     agentCapabilities: vi.fn(() => ['tmux-create-command-v1', BROWSER_PANE_CAPABILITY]),
@@ -44,7 +42,7 @@ function deps(over: Partial<BrowserWsDeps> = {}): BrowserWsDeps & { log: ReturnT
     suggest: vi.fn(async () => []),
     log: vi.fn(),
     guestContext: vi.fn(async () => null),
-    guestFlags: vi.fn(async () => ({ paneOn: true, sharingOn: true, killed: false, maxGuests: 5 })),
+    guestFlags: vi.fn(async () => ({ killed: false, maxGuests: 5 })),
     registerGuest: vi.fn(() => () => {}),
     recordShareEvent: vi.fn(async () => {}),
     noteShareOpened: vi.fn(async () => {}),
@@ -88,16 +86,6 @@ describe('handleBrowserPaneSocket', () => {
     expect(d.requestStream).toHaveBeenCalledWith({ userId: owner.id, instanceId: box.id }, { url: 'http://localhost:3000/', width: 1024, height: 768, paneKey: `${friend.id}:p1/main` }, expect.any(Function));
   });
 
-  it('closes 4403 with a message while the flag is off for the viewer and box', async () => {
-    const d = deps({ flagOn: vi.fn(async () => false) });
-    const ws = new FakeSocket();
-    await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
-    expect(d.flagOn).toHaveBeenCalledWith(owner, project.instance);
-    expect(ws.sent).toEqual([{ type: 'exit', reason: BROWSER_PANE_DISABLED_MESSAGE }]);
-    expect(ws.closed).toEqual({ code: BROWSER_PANE_DISABLED_CLOSE_CODE, reason: 'browser pane disabled' });
-    expect(d.requestStream).not.toHaveBeenCalled();
-  });
-
   it('refuses a parked box with the terminal close code, and an agent that is not connected with a retryable one', async () => {
     const parked = new FakeSocket();
     await handleBrowserPaneSocket(parked, url('projectId=p1'), owner.id, deps({ boxStatus: vi.fn(async () => 'stopped'), agentConnected: vi.fn(() => false) }));
@@ -128,27 +116,20 @@ describe('handleBrowserPaneSocket', () => {
     expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'browser pane unsupported' });
   });
 
-  it('asks for a kept profile only while the owner\'s flag is on and the agent keeps profiles, for every viewer', async () => {
+  it('asks for a kept profile from an agent that keeps profiles, for every viewer', async () => {
     const kept = [BROWSER_PANE_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY];
-    // On, for the owner: asked.
-    let d = deps({ keptProfilesOn: vi.fn(async () => true), agentCapabilities: vi.fn(() => kept) });
-    await handleBrowserPaneSocket(new FakeSocket(), url('projectId=p1&url=http://127.0.0.2/'), owner.id, d);
+    let d = deps({ agentCapabilities: vi.fn(() => kept) });
+    const keptWs = new FakeSocket();
+    await handleBrowserPaneSocket(keptWs, url('projectId=p1&url=http://127.0.0.2/'), owner.id, d);
     expect(d.requestStream.mock.calls[0][1]).toMatchObject({ persistProfile: true });
-    expect(d.keptProfilesOn).toHaveBeenCalledWith(owner, project.instance);
-    // A collaborator's pane follows the owner's flag, evaluated for the owner.
-    d = deps({ keptProfilesOn: vi.fn(async () => true), agentCapabilities: vi.fn(() => kept) });
+    expect(keptWs.sent).toContainEqual({ type: 'ready', resettable: true });
+    d = deps({ agentCapabilities: vi.fn(() => kept) });
     await handleBrowserPaneSocket(new FakeSocket(), url('projectId=p1&url=http://127.0.0.2/'), friend.id, d);
     expect(d.requestStream.mock.calls[0][1]).toMatchObject({ persistProfile: true, paneKey: `${friend.id}:p1/main` });
-    expect(d.keptProfilesOn).toHaveBeenCalledWith(owner, project.instance);
-    // Off: not asked.
-    d = deps({ agentCapabilities: vi.fn(() => kept) });
+    // An agent that predates kept profiles: not asked.
+    d = deps();
     await handleBrowserPaneSocket(new FakeSocket(), url('projectId=p1&url=http://127.0.0.2/'), owner.id, d);
     expect(d.requestStream.mock.calls[0][1]).not.toHaveProperty('persistProfile');
-    // On, but an agent that predates kept profiles: not asked, and the flag is not even read.
-    d = deps({ keptProfilesOn: vi.fn(async () => true) });
-    await handleBrowserPaneSocket(new FakeSocket(), url('projectId=p1&url=http://127.0.0.2/'), owner.id, d);
-    expect(d.requestStream.mock.calls[0][1]).not.toHaveProperty('persistProfile');
-    expect(d.keptProfilesOn).not.toHaveBeenCalled();
   });
 
   it('closes a pane whose kept browser another tab took over with a final code, so it does not take it back', async () => {
@@ -344,7 +325,7 @@ describe('handleBrowserPaneSocket: a reviewer\'s guest pane', () => {
   };
 
   it('opens a guest browser kept to the share: its own key, the share\'s recipe, the checkout, the pool size, the expiry', async () => {
-    const d = guestDeps({ keptProfilesOn: vi.fn(async () => true) });
+    const d = guestDeps();
     const ws = await open(d, 'share=cshare0000000001&width=900&height=700&at=%2Fdefault%2Fflags', guestUser.id);
     expect(ws.closed).toBeNull();
     expect(d.requestStream).toHaveBeenCalledWith({ userId: owner.id, instanceId: box.id }, {
@@ -450,10 +431,8 @@ describe('handleBrowserPaneSocket: a reviewer\'s guest pane', () => {
   });
 
   it('refuses while the flags are off or the kill switch is on, a box asleep or not ready, an agent without guests', async () => {
-    let ws = await open(guestDeps({ guestFlags: vi.fn(async () => ({ paneOn: true, sharingOn: true, killed: true, maxGuests: 5 })) }), 'share=cshare0000000001', guestUser.id);
+    let ws = await open(guestDeps({ guestFlags: vi.fn(async () => ({ killed: true, maxGuests: 5 })) }), 'share=cshare0000000001', guestUser.id);
     expect(ws.closed).toEqual({ code: BROWSER_PANE_DISABLED_CLOSE_CODE, reason: 'guests off' });
-    ws = await open(guestDeps({ guestFlags: vi.fn(async () => ({ paneOn: true, sharingOn: false, killed: false, maxGuests: 5 })) }), 'share=cshare0000000001', guestUser.id);
-    expect(ws.closed).toEqual({ code: BROWSER_PANE_DISABLED_CLOSE_CODE, reason: 'preview sharing off' });
     const asleep = guestDeps({ boxStatus: vi.fn(async () => 'hibernated'), agentConnected: vi.fn(() => false) });
     ws = await open(asleep, 'share=cshare0000000001', guestUser.id);
     expect(ws.closed).toEqual({ code: TERMINAL_BOX_PARKED_CLOSE_CODE, reason: 'box asleep' });

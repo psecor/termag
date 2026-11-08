@@ -7,11 +7,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const db = vi.hoisted(() => {
-  type Row = { id: string; projectId: string; workstreamId: string; senderId: string; text: string; model: string | null; backend: string | null; effort: string | null; claimedAt: Date | null; error: string | null; createdAt: Date };
+  type Row = { id: string; projectId: string; workstreamId: string; senderId: string; text: string; model: string | null; backend: string | null; effort: string | null; claimedAt: Date | null; error: string | null; createdAt: Date; images?: unknown; imageTypes?: string[]; boxStartedAt?: Date | null };
   const state = { rows: [] as Row[], n: 0 };
   const match = (r: Row, w: Record<string, unknown>) => (w.id === undefined || r.id === w.id)
     && (w.workstreamId === undefined || r.workstreamId === w.workstreamId)
-    && (w.error === undefined || r.error === w.error)
+    && (w.senderId === undefined || r.senderId === w.senderId)
+    && (w.error === undefined || (w.error !== null && typeof w.error === 'object' ? r.error !== null : r.error === w.error))
     && (w.OR === undefined || (w.OR as Array<{ claimedAt: null | { lt: Date } }>).some(o => (o.claimedAt === null ? r.claimedAt === null : r.claimedAt != null && r.claimedAt < o.claimedAt.lt)));
   const prisma = {
     chatHeldMessage: {
@@ -39,7 +40,7 @@ const db = vi.hoisted(() => {
 });
 vi.mock('../db', () => ({ prisma: db.prisma }));
 
-import { deliverHeld, HELD_CLAIM_STALE_MS, HELD_MAX, heldFor, holdMessage, type DeliverOutcome, type HeldMessage } from './chatHeld';
+import { deliverHeld, HELD_CLAIM_STALE_MS, HELD_IMAGES_MAX, HELD_MAX, heldFor, heldImage, holdMessage, takeRefused, type DeliverOutcome, type HeldMessage } from './chatHeld';
 
 const k = { projectId: 'p1', workstreamId: 'ws1', senderId: 'owner' };
 
@@ -90,3 +91,43 @@ describe('held messages', () => {
     expect(await holdMessage(k, { text: 'one too many' })).toBeNull();
   });
 });
+
+// A message sent with images while the box is down keeps them here, on the
+// orchestrator, so a closed tab or a reload loses nothing (#971).
+describe('held images', () => {
+  const png = { mediaType: 'image/png', data: 'aGVsbG8=' };
+
+  it('are kept with the message and go out with it; the view lists their types only', async () => {
+    await holdMessage(k, { text: 'look', images: [png] });
+    expect(await heldFor('ws1')).toEqual([{ id: 'm1', text: 'look', error: null, senderId: 'owner', imageTypes: ['image/png'] }]);
+    expect(await heldImage('m1', 'ws1', 0)).toEqual({ mediaType: 'image/png', data: Buffer.from('hello') });
+    expect(await heldImage('m1', 'ws1', 1)).toBeNull();
+    expect(await heldImage('m1', 'other-ws', 0)).toBeNull();
+    const got: HeldMessage[] = [];
+    await deliverHeld('ws1', async m => { got.push(m); return { kind: 'sent' }; });
+    expect(got[0].images).toEqual([png]);
+  });
+
+  it('a chat holds at most HELD_IMAGES_MAX images waiting', async () => {
+    const many = Array.from({ length: HELD_IMAGES_MAX }, () => png);
+    expect(await holdMessage(k, { text: 'a', images: many })).not.toBeNull();
+    expect(await holdMessage(k, { text: 'b', images: [png] })).toBeNull();
+    expect(await holdMessage(k, { text: 'text still goes' })).not.toBeNull();
+  });
+
+  it('one the chat refused goes back to its sender once, text and images, and is gone', async () => {
+    await holdMessage(k, { text: 'look', images: [png] });
+    await deliverHeld('ws1', async () => ({ kind: 'refused', error: 'no images here' }));
+    expect(await takeRefused('m1', 'ws1', 'someone-else')).toBeNull();
+    expect(await takeRefused('m1', 'ws1', 'owner')).toEqual({ text: 'look', images: [png], error: 'no images here' });
+    expect(await takeRefused('m1', 'ws1', 'owner')).toBeNull();
+    expect(await heldFor('ws1')).toEqual([]);
+  });
+
+  it('one still waiting is not taken back', async () => {
+    await holdMessage(k, { text: 'look' });
+    expect(await takeRefused('m1', 'ws1', 'owner')).toBeNull();
+    expect(await heldFor('ws1')).toHaveLength(1);
+  });
+});
+

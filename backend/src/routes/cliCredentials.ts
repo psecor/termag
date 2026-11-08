@@ -1,10 +1,11 @@
 /**
- * The credential routes of /termag/api/cli/v1, for `termag doctor`. index.ts
- * mounts this just ahead of cliApiRouter, before the cookie stack, and every
- * route takes cliApiRouter's own bearer check, so the same two credential
- * kinds reach them and anything else falls through to its 404. Reads are open
- * to both; the writes, storing the GitHub token and removing an SSH key, take
- * a device sign-in only, so an agent on a box can never change its owner's
+ * The credential routes of /termag/api/cli/v1, for `termag doctor` and the
+ * desktop's Settings. index.ts mounts this just ahead of cliApiRouter, before
+ * the cookie stack, and every route takes cliApiRouter's own bearer check, so
+ * the same two credential kinds reach them and anything else falls through to
+ * its 404. Reads are open to both; the writes (the GitHub token, its re-check
+ * and disconnect, Claude through the gateway, and removing an SSH key) take a
+ * device sign-in only, so an agent on a box can never change its owner's
  * credentials with the box's own token. Adding an SSH key is web-only
  * (routes/sshKeys.ts): a key opens a shell on every box, so a CLI credential
  * cannot add one. That was held back until CLI sessions could be revoked; they
@@ -27,7 +28,7 @@ function cliAuth(res: Response): CliAuth {
 const deviceOnly: RequestHandler = (_req, res, next) => {
   if (cliAuth(res).credential.kind !== 'device') {
     res.status(403).json({
-      error: 'A box\'s own credentials cannot change your SSH keys or GitHub token; run this on your laptop after `termag login`',
+      error: 'A box\'s own credentials cannot change your SSH keys, GitHub token or Claude setting; run this on your laptop after `termag login`',
       code: 'box_credential',
     });
     return;
@@ -74,6 +75,32 @@ export function cliCredentialsRouter(deps: Pick<CliApiDeps, 'store' | 'jwt' | 'n
       }
       throw err;
     }
+  }));
+
+  router.post('/github/recheck', bearer, deviceOnly, asyncHandler(async (_req, res) => {
+    try {
+      await credentials.recheckGithub(cliAuth(res).user.id);
+      res.status(204).end();
+    } catch (err) {
+      if (err instanceof CredentialInputError) { res.status(400).json({ error: err.message, code: 'github_recheck_failed' }); return; }
+      if (err instanceof CredentialStoreUnavailableError) {
+        res.status(503).json({ error: err.message, code: 'credential_store_unavailable' });
+        return;
+      }
+      throw err;
+    }
+  }));
+
+  router.delete('/github', bearer, deviceOnly, asyncHandler(async (_req, res) => {
+    await credentials.disconnectGithub(cliAuth(res).user.id);
+    res.status(204).end();
+  }));
+
+  router.put('/claude-gateway', bearer, deviceOnly, asyncHandler(async (req, res) => {
+    const enabled = (req.body as { enabled?: unknown })?.enabled;
+    if (typeof enabled !== 'boolean') { res.status(400).json({ error: 'enabled must be true or false', code: 'invalid_input' }); return; }
+    await credentials.setClaudeGateway(cliAuth(res).user.id, enabled);
+    res.json({ enabled });
   }));
 
   return router;

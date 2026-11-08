@@ -30,6 +30,8 @@ import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHe
 import { prisma } from '../db';
 import { softwareMatrix, softwareHost, clientVersions } from '../services/software/queries';
 import { SUMMARY_HOSTS, summaryAnswer } from '../services/software/summary';
+import { NEEDS_UPDATE_STATES } from '../services/software/versions';
+import { autoUpdateSummary } from '../services/toolUpdate/autoRuns';
 import { prSummary, prContributors, prTrend, prGroups, prIngestStatus, prReviews, prReviewers, prReviewTrend, prTeamRepos, prTeams, loadTeamRoster, prTeamReviews, prTeamReviewers, prTeamReviewTrend, ALL_REPOS } from '../services/prAnalytics/queries';
 import { REVIEW_TREND_MAX_WEEKS } from '../services/prAnalytics/reviews';
 import { VIEWS, BASES } from '../services/prAnalytics/stats';
@@ -100,7 +102,7 @@ export function buildServer(actor: { id: string; tokenId: string | null }): McpS
     {
       userId: z.string().optional(), instanceId: z.string().optional().describe("Box id, or 'legacy' for projects on the orchestrator host."),
       provider: z.string().optional().describe('Any workstream of the project runs this provider.'),
-      kind: z.string().optional().describe("Project kind: 'normal', 'metaterm' or 'automation'. Default: all."),
+      kind: z.string().optional().describe("Project kind: 'normal', 'metaterm', 'automation' or 'space-orchestrator'. Default: all."),
       archived: z.boolean().optional().describe('Default false: active projects.'),
       staleDays: z.number().int().positive().optional().describe('Only projects with no agent activity for this many days.'),
     },
@@ -185,16 +187,17 @@ export function buildServer(actor: { id: string; tokenId: string | null }): McpS
   tool('pr_team_review_trend', `Weekly (Monday UTC) reviews a team gave and received, and the reviewers on each side. Reviews are kept ${REVIEW_TREND_MAX_WEEKS} weeks back.`,
     { ...teamArg, weeks: z.number().int().min(1).max(REVIEW_TREND_MAX_WEEKS).optional().describe(`Default ${REVIEW_TREND_MAX_WEEKS}.`) },
     async a => { const s = await teamScope(a); return s ? notFound(await prTeamReviewTrend(a.group ?? ALL_REPOS, s, a.weeks ?? REVIEW_TREND_MAX_WEEKS)) : noTeam; });
-  tool('software_summary', 'Deployed software: per component (termag commit, image, Claude hooks, Claude Code, Codex, Cursor, Devin, pi, Node, npm, gh, AWS CLI, tmux, git, Docker, Python, nginx, Envoy, otelcol, Postgres, OS, kernel) its reference version, how many hosts are current / behind / outdated / ahead / missing / unknown, and the spread of versions. Tools compare against the newest version in the fleet; termag and images against the newest box or orchestrator image. '
+  tool('software_summary', 'Deployed software: per component (termag commit, image, Claude hooks, Claude Code, Codex, Cursor, Devin, pi, Node, npm, gh, AWS CLI, tmux, git, Docker, Python, nginx, Envoy, otelcol, Postgres, OS, kernel, newest installed kernel, reboot) its reference version, how many hosts are current / behind / outdated / ahead / pending (a reboot) / missing / unknown, and the spread of versions. Tools compare against the newest version in the fleet; kernels against the newest build on their track (6.8-aws, 7.0-aws) and host kind; termag and images against the newest box or orchestrator image. '
     + 'Offline hosts (agent not connected; the orchestrator always counts) keep their last inventory, often days old, and can dominate the counts. `summary` is always over every host and `online.summary` always without offline hosts (`online.offline` says how many were left out); `counted` says which the answer holds. '
+    + '`autoUpdates`: the automatic tool updates (the floor, resume and nightly triggers, each behind its tool\'s auto: its <component>-update-policy\'s mode auto; a missing or malformed mode is off): the last day\'s runs by tool and trigger, the newest ten with why each was made, and what the last sweep pass did. '
     + 'hosts: "both" (the default, so a caller that passes nothing sees both sets, labelled, and cannot take stale boxes for the live fleet; `summary` is what it was before this option), "online" (only `online`), or "all" (only `summary`, with `offline`).',
     { hosts: z.enum(SUMMARY_HOSTS).optional().describe('Which hosts to count: both (default), online, or all.') },
-    async a => summaryAnswer(await softwareMatrix(), a.hosts ?? 'both'));
+    async a => ({ ...summaryAnswer(await softwareMatrix(), a.hosts ?? 'both'), autoUpdates: await autoUpdateSummary() }));
   tool('software_matrix', 'Every host (the orchestrator, each box, each per-user agent on the orchestrator) with each component\'s version and state. Filter by component, owner, or only cells that need updating.',
-    { component: z.string().optional(), owner: z.string().optional(), needsUpdate: z.boolean().optional().describe('Only hosts with a behind or outdated cell.') },
+    { component: z.string().optional(), owner: z.string().optional(), needsUpdate: z.boolean().optional().describe('Only hosts with a behind or outdated cell, or a pending reboot.') },
     async a => {
       const m = await softwareMatrix();
-      const bad = new Set(['behind', 'outdated']);
+      const bad: ReadonlySet<string> = NEEDS_UPDATE_STATES;
       return m.hosts
         .filter(h => !a.owner || h.owner === a.owner)
         .map(h => ({ ...h, cells: a.component ? { [a.component]: h.cells[a.component] } : h.cells }))

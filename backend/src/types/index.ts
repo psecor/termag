@@ -35,6 +35,10 @@ declare global {
       pushMutesChat: boolean;
       /** Notify when a chat this user can see finishes its turn. */
       chatTurnNotify: boolean;
+      /** Settings > Telemetry: chat session titles go to termag's telemetry (services/sessionTitleEvent.ts). */
+      telemetryTitles: boolean;
+      /** Settings > Box notices: DMs before and after termag stops a box on its own (services/boxIdleNotices.ts). */
+      boxIdleNotify: boolean;
     }
 
     interface Request {

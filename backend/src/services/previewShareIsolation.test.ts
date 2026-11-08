@@ -24,7 +24,8 @@ const files = sources(SRC).map((f) => ({ path: relative(SRC, f), text: readFileS
 
 describe('preview shares stay on the guest path', () => {
   it('only services/previewShares.ts touches the preview share tables', () => {
-    const touching = files.filter((f) => /\bprisma\.previewShare(?:Viewer|Event|Settings)?\b|\btx\.previewShare/.test(f.text)).map((f) => f.path);
+    // Any client: prisma, a transaction (tx) or anything else a delegate is reached through.
+    const touching = files.filter((f) => /\.previewShare(?:Viewer|Event|Settings)?\s*\./.test(f.text)).map((f) => f.path);
     expect(touching).toEqual(['services/previewShares.ts']);
   });
 
@@ -54,8 +55,10 @@ describe('preview shares stay on the guest path', () => {
     const index = files.find((f) => f.path === 'index.ts')!.text;
     const code = index.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '').replace(/'[^'\n]*'/g, "''");
     const used = new Set(code.match(/\w*[pP]review[sS]hare\w*|previewLink\w*/g) ?? []);
+    // previewLinks, previewLinksRouter and previewLinkConfirmRouter are preview links' (routes/previewLinks.ts),
+    // another feature that only shares a word with the share links.
     expect([...used].sort()).toEqual([
-      'defaultPreviewShareRouteDeps', 'installAutoPreviewShares', 'installPreviewShareLinkHooks', 'previewLinkRouter', 'previewShares', 'previewSharesRouter', 'prismaCliPreviewShares',
+      'defaultPreviewShareRouteDeps', 'installAutoPreviewShares', 'installPreviewShareLinkHooks', 'previewLinkConfirmRouter', 'previewLinkRouter', 'previewLinks', 'previewLinksRouter', 'previewShares', 'previewSharesRouter', 'prismaCliPreviewShares',
       'startPreviewShareSweep', 'stopPreviewShareSweep',
     ]);
   });

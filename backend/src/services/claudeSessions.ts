@@ -146,7 +146,49 @@ export function cloudSessionName(seq: number | null): string {
 }
 const QUEUED_KINDS = new Set<string>(['queued', 'agent-failed']);
 
-/** The grouping key: the session id, else the order id (rows from older versions). */
+/**
+ * How long a refused session stays queued without another refusal. Claude
+ * re-offers a refused session with a backoff that doubles (about 20 s, 40 s,
+ * 80 s, 160 s, 320 s in the orchestrator's log), and each re-offer writes an
+ * event. A session with no re-offer for this long, and for three times the
+ * gap before its last one, is no longer being offered: its owner closed it, or
+ * Claude stopped. It then reads as ended (NOT_RETRIED_REASON) rather than
+ * sitting in the queue for days, and a later re-offer queues it again.
+ */
+export const QUEUED_RETRY_WINDOW_MS = 30 * 60 * 1000;
+export const NOT_RETRIED_REASON = 'not-retried';
+
+/**
+ * The current period of re-offers in a refusal streak (its refusals' times,
+ * newest first): when it began, and how long after its newest refusal another
+ * is still due. A gap counts as a backoff step only when it came within the
+ * allowance the step before it set; a longer one (a session reopened hours
+ * later) starts a new period, which neither inherits the old one's age nor
+ * stretches its allowance.
+ */
+export function retryPeriod(streak: readonly Date[]): { since: Date; allowanceMs: number } | null {
+  if (streak.length === 0) return null;
+  let allowanceMs = QUEUED_RETRY_WINDOW_MS;
+  let since = streak[streak.length - 1];
+  for (let i = streak.length - 1; i > 0; i--) {
+    const gap = streak[i - 1].getTime() - streak[i].getTime();
+    if (gap <= allowanceMs) {
+      allowanceMs = Math.max(QUEUED_RETRY_WINDOW_MS, 3 * gap);
+    } else {
+      allowanceMs = QUEUED_RETRY_WINDOW_MS;
+      since = streak[i - 1];
+    }
+  }
+  return { since, allowanceMs };
+}
+
+/** Is a refusal streak (newest first) still being re-offered at `now`? */
+export function isStillRetried(streak: readonly Date[], now: Date): boolean {
+  const period = retryPeriod(streak);
+  return period !== null && now.getTime() - streak[0].getTime() <= period.allowanceMs;
+}
+
+/** The grouping key: the session id, else the order id (older rows). */
 export function sessionKey(x: { sessionId: string | null; orderId: string }): string {
   return x.sessionId ?? `order:${x.orderId}`;
 }
@@ -170,23 +212,25 @@ function toRun(r: RunInput, alive: boolean | null): CloudSessionRun {
  * The state of one session from its newest run and its events, newest first.
  *
  * | state      | rule |
- * | queued     | no run, and the newest event is a refusal; or a refusal newer than the latest run (a re-offer while the old run lingers) |
+ * | queued     | no run, and the newest event is a refusal; or a refusal newer than the latest run (a re-offer while the old run lingers); either way still re-offered (isStillRetried) |
  * | starting   | the latest run is open and the box has not posted `started` for it |
  * | running    | the latest run is open and `started` arrived |
  * | lost       | the latest run ended with reason `lost` |
- * | ended      | the latest run ended any other way; or no run and the newest event is not a refusal |
+ * | ended      | the latest run ended any other way; or no run and the newest event is not a refusal; or no run and the refusals stopped (reason `not-retried`) |
+ *
+ * A re-offer that stopped while an old run lingers reads as that run's own state.
  */
 export interface DerivedState { state: CloudSessionState; exitReason: string | null; queuedReason: string | null; queuedCode: string | null; queuedSince: Date | null }
 
-/** The start of the newest unbroken run of refusals (events newest first), bounded below by `after`. */
-function queuedStreakStart(events: EventInput[], after: Date | null): Date | null {
-  let since: Date | null = null;
+/** The newest unbroken run of refusals (events newest first), bounded below by `after`. */
+function queuedStreak(events: EventInput[], after: Date | null): EventInput[] {
+  const streak: EventInput[] = [];
   for (const e of events) {
     if (after && e.at.getTime() <= after.getTime()) break;
     if (!QUEUED_KINDS.has(e.kind)) break;
-    since = e.at;
+    streak.push(e);
   }
-  return since;
+  return streak;
 }
 
 /**
@@ -202,7 +246,7 @@ export function isStartedFor(e: Pick<EventInput, 'kind' | 'orderId' | 'at'>, run
   return e.kind === 'started' && e.orderId === run.orderId && e.at.getTime() >= run.startedAt.getTime() - STARTED_SKEW_MS;
 }
 
-export function deriveState(latest: RunInput | null, allEvents: EventInput[]): DerivedState {
+export function deriveState(latest: RunInput | null, allEvents: EventInput[], now: Date = new Date()): DerivedState {
   const none = { exitReason: null, queuedReason: null, queuedCode: null, queuedSince: null };
   // `user-created` says what the spawn did for the owner, not what became of
   // the session: it is written before the gate and the placement, so it must
@@ -212,12 +256,21 @@ export function deriveState(latest: RunInput | null, allEvents: EventInput[]): D
   const events = allEvents.filter(e => e.kind !== 'user-created');
   const newest = events[0] ?? null;
   const refusal = newest && QUEUED_KINDS.has(newest.kind) ? newest : null;
+  // Queued while the streak's current re-offer period still expects another
+  // (isStillRetried), and queued since that period began (retryPeriod).
+  const queuedIfRetried = (streak: EventInput[]): DerivedState | null => {
+    const times = streak.map(e => e.at);
+    const period = retryPeriod(times);
+    if (!period || !isStillRetried(times, now)) return null;
+    return { state: 'queued', exitReason: null, queuedReason: refusal!.detail, queuedCode: refusal!.code ?? null, queuedSince: period.since };
+  };
   if (!latest) {
-    if (refusal) return { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedCode: refusal.code ?? null, queuedSince: queuedStreakStart(events, null) };
+    if (refusal) return queuedIfRetried(queuedStreak(events, null)) ?? { state: 'ended', ...none, exitReason: NOT_RETRIED_REASON };
     return { state: events.length === 0 && allEvents.length > 0 ? 'starting' : 'ended', ...none };
   }
   if (refusal && refusal.orderId !== latest.orderId && refusal.at.getTime() > latest.startedAt.getTime()) {
-    return { state: 'queued', exitReason: null, queuedReason: refusal.detail, queuedCode: refusal.code ?? null, queuedSince: queuedStreakStart(events, latest.startedAt) };
+    const queued = queuedIfRetried(queuedStreak(events, latest.startedAt));
+    if (queued) return queued;
   }
   if (latest.endedAt) {
     return { state: latest.exitReason === RUN_LOST_REASON ? 'lost' : 'ended', exitReason: latest.exitReason, queuedReason: null, queuedCode: null, queuedSince: null };
@@ -227,7 +280,7 @@ export function deriveState(latest: RunInput | null, allEvents: EventInput[]): D
 }
 
 /** Group runs and events into sessions, newest activity first. */
-export function buildSessions(runs: RunInput[], events: EventInput[], alive: Map<string, boolean | null>): CloudSessionView[] {
+export function buildSessions(runs: RunInput[], events: EventInput[], alive: Map<string, boolean | null>, now: Date = new Date()): CloudSessionView[] {
   const byKey = new Map<string, { runs: RunInput[]; events: EventInput[] }>();
   const bucket = (key: string) => {
     let b = byKey.get(key);
@@ -245,7 +298,7 @@ export function buildSessions(runs: RunInput[], events: EventInput[], alive: Map
     const titled = b.runs.find(r => r.title) ?? null;
     const numbered = b.runs.find(r => r.sessionSeq != null) ?? null;
     const platform = b.runs.find(r => r.clientPlatform) ?? null;
-    const { state, exitReason, queuedReason, queuedCode, queuedSince } = deriveState(latest, b.events);
+    const { state, exitReason, queuedReason, queuedCode, queuedSince } = deriveState(latest, b.events, now);
     const sessionId = latest?.sessionId ?? (key.startsWith('order:') ? null : key);
     const times = [...b.runs.map(r => r.startedAt), ...b.events.map(e => e.at)].map(d => d.getTime());
     const ends = b.runs.map(r => r.endedAt?.getTime() ?? 0);

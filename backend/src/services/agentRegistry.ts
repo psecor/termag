@@ -156,6 +156,32 @@ export function onBoxAgentHello(listener: (ev: BoxAgentHelloEvent) => void): () 
   return () => { boxHelloListeners.delete(listener); };
 }
 
+/** An ownerless pool box's hello or frame (an environment pool's, services/envPool.ts). */
+export interface PoolBoxEvent { instance: Instance; capabilities: readonly string[]; msg: Record<string, unknown> }
+const poolBoxListeners = new Map<string, Set<(ev: PoolBoxEvent) => void>>();
+
+/**
+ * Called for each frame of this type (or `hello`) from an ownerless pool box's
+ * agent: an environment pool prepares a box before anybody owns it, and its
+ * frames would otherwise go nowhere. Returns the unsubscribe.
+ */
+export function onPoolBoxFrame(type: string, listener: (ev: PoolBoxEvent) => void): () => void {
+  let listeners = poolBoxListeners.get(type);
+  if (!listeners) poolBoxListeners.set(type, listeners = new Set());
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+function emitPoolBox(type: string, ev: PoolBoxEvent, label: string): void {
+  for (const listener of poolBoxListeners.get(type) ?? []) {
+    try {
+      listener(ev);
+    } catch (err) {
+      console.error(`[AGENT] a pool ${type} listener failed for ${label}:`, (err as Error).message);
+    }
+  }
+}
+
 /** Called for each frame of this type from an owned box's agent. Returns the unsubscribe. */
 export function onBoxAgentFrame(type: string, listener: (frame: BoxAgentFrame) => void): () => void {
   let listeners = boxFrameListeners.get(type);
@@ -307,6 +333,11 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
           // on every reconnect while the box is still warming, which is how a
           // run interrupted by an agent restart resumes reporting; the agent's
           // start is idempotent.
+          // An environment pool's box: its pool code
+          // sends environment-prepare, reading the row again first.
+          if (hello.warm && conn.kind === 'warm-box') {
+            emitPoolBox('hello', { instance, capabilities: hello.capabilities, msg }, label);
+          }
           if (hello.warm && instance.status === 'warming') {
             console.log(`[POOL] instance ${instance.name} agent connected, starting the on-warm run`);
             // The status above is the token check's; the run carries a GitHub
@@ -430,6 +461,7 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
       const frameListeners = typeof msg.type === 'string' ? boxFrameListeners.get(msg.type) : undefined;
       // agent.conn rather than conn: a warm box claimed while connected is owned without a reconnect.
       const owner = agent.conn;
+      if (typeof msg.type === 'string' && owner.kind === 'warm-box') emitPoolBox(msg.type, { instance: owner.instance, capabilities: agent.capabilities, msg }, label);
       if (frameListeners && owner.kind === 'owned-box') {
         for (const listener of frameListeners) {
           try {
@@ -528,7 +560,9 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
       data: { readyAt: connectedAt },
     }).then(first => {
       // The write-once readyAt landed: this is the box's first connect, the end of cold provisioning.
-      if (first.count === 1) recordBoxReady(box, connectedAt);
+      if (first.count === 1) {
+        void boxEnvironmentName(box.id).then(env => recordBoxReady(box, connectedAt, env));
+      }
       return prisma.instance.updateMany(connectUpdate(box, connectedAt));
     })
       .then(applied => {
@@ -695,6 +729,19 @@ export function dropInstanceAgent(instanceId: string, reason: string): boolean {
   console.log(`[AGENT] Dropping instance ${instanceId}'s socket: ${reason}`);
   agent.ws.terminate();
   return true;
+}
+
+/** The environment a box was made from, by its first project's (Project.environmentFile), for box.ready; null for none. Never throws. */
+export async function boxEnvironmentName(instanceId: string): Promise<string | null> {
+  try {
+    const project = await prisma.project.findFirst({
+      where: { instanceId, environmentId: { not: null } }, orderBy: { createdAt: 'asc' }, select: { environmentFile: true },
+    });
+    const file = project?.environmentFile && typeof project.environmentFile === 'object' ? project.environmentFile as { name?: unknown } : null;
+    return typeof file?.name === 'string' ? file.name : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Instances whose agent socket this process holds open right now. */

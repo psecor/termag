@@ -15,8 +15,8 @@
  *                                 WebSocket, over a tunnel the box's agent opens
  *
  * Each is a device sign-in's (a box's own token gets 403: anything on the box
- * can read it), for the box's owner only (404 otherwise, as for no such box),
- * behind `desktop-app-enabled` (off: 404). The JSON routes sit in the
+ * can read it), for the box's owner only (404 otherwise, as for no such box).
+ * The JSON routes sit in the
  * CLI router; the relay is mounted ahead of the cors and body-parser
  * middleware (index.ts), because it forwards bodies and preflights untouched.
  *

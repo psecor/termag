@@ -43,7 +43,6 @@ const store: CliStore = {
 };
 
 let dir: string;
-let desktopOn = true;
 let server: Server;
 let base: string;
 
@@ -56,7 +55,7 @@ beforeAll(async () => {
   const app = express();
   app.use('/api/cli/v1', cliApiRouter({
     store, codes: new AuthCodeStore(), jwt: new Promise(() => {}), now: () => now,
-    speech: { dir, desktopOn: async () => desktopOn },
+    speech: { dir },
   }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -65,7 +64,6 @@ afterAll(async () => {
   await new Promise<void>(r => server.close(() => r()));
   rmSync(dir, { recursive: true, force: true });
 });
-beforeEach(() => { desktopOn = true; });
 
 const get = (path: string, token: string | null = DEVICE) =>
   fetch(`${base}/api/cli/v1/speech/whisper-base/${path}`, { headers: token ? { authorization: `Bearer ${token}` } : {} });
@@ -87,10 +85,7 @@ describe('GET /api/cli/v1/speech/whisper-base/<file>', () => {
     expect((await get('config.json', null)).status).toBe(401);
   });
 
-  it("answers 404 with the flag off, for a file that isn't the model's, and for one the build lacks", async () => {
-    desktopOn = false;
-    expect((await get('config.json')).status).toBe(404);
-    desktopOn = true;
+  it("answers 404 for a file that isn't the model's, and for one the build lacks", async () => {
     for (const path of ['../../secret.txt', '..%2F..%2Fsecret.txt', 'secret.txt', 'onnx%2F..%2Fconfig.json']) {
       const res = await get(path);
       expect(res.status, path).toBe(404);

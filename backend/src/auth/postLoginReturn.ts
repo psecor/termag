@@ -22,6 +22,7 @@ declare module 'express-session' {
 const AUTHORIZE_PATH = '/auth/cli/authorize';
 const FILE_LINK_PATH = '/files/';
 const PREVIEW_LINK_PATH = '/p/';
+const PREVIEW_LANDING_PATH = '/previews/';
 
 /** The URL parsed against a placeholder origin, or null if it is not a plain same-origin path. */
 function parsePath(url: unknown): URL | null {
@@ -67,8 +68,23 @@ export function previewLinkReturnPath(basePath: string, url: unknown): string | 
   return path === url ? path : null;
 }
 
+/**
+ * The path + query to return to, or null unless it is a preview link's landing
+ * page on this server, `/previews/<name>`, with a link
+ * token or `reverify` after it or nothing, exactly as sent. A link token is
+ * then kept in the session row until the sign-in comes back; it never leaves
+ * this server.
+ */
+export function previewLandingReturnPath(basePath: string, url: unknown): string | null {
+  if (typeof url !== 'string' || !url.startsWith(`${basePath}${PREVIEW_LANDING_PATH}`)) return null;
+  const parsed = parsePath(url);
+  if (!parsed || !/^\/previews\/[a-z0-9][a-z0-9-]{1,38}[a-z0-9](?:\/(?:reverify|[A-Za-z0-9_-]{22}))?$/.test(parsed.pathname.slice(basePath.length))) return null;
+  const path = `${parsed.pathname}${parsed.search}`;
+  return path === url ? path : null;
+}
+
 function returnPath(basePath: string, url: unknown): string | null {
-  return cliReturnPath(basePath, url) ?? fileLinkReturnPath(basePath, url) ?? previewLinkReturnPath(basePath, url);
+  return cliReturnPath(basePath, url) ?? fileLinkReturnPath(basePath, url) ?? previewLinkReturnPath(basePath, url) ?? previewLandingReturnPath(basePath, url);
 }
 
 type MaybeSession = (Session & Partial<SessionData>) | undefined;

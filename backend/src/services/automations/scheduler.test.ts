@@ -184,13 +184,6 @@ describe('decideAndStart', () => {
     expect(prisma.automation.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { pausedReason: 'box_gone' } });
   });
 
-  it('skips a t3 automation as flag_off when desktop-app-enabled is off for its box', async () => {
-    vi.mocked(boolVariation).mockImplementation(async (key: string) => key !== 'desktop-app-enabled');
-    const t3 = { ...automation, kind: 't3' };
-    expect(await decideAndStart(t3 as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'skip', reason: 'flag_off' });
-    vi.mocked(boolVariation).mockImplementation(async () => true);
-  });
-
   it('reports an older runner as a skip', async () => {
     vi.mocked(startRun).mockResolvedValueOnce({ kind: 'failed', reason: 'runner_outdated', error: 'mode-refused' });
     expect(await decideAndStart(automation as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'skip', reason: 'runner_outdated' });

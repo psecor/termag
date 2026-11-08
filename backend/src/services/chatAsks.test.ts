@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_CHAT_ASK_MESSAGES, MAX_CHAT_ASK_THREADS, chatAskThreadView, parseThreadIds, replyState, type ChatAskMessageRow, type ChatAskThreadRow } from './chatAsks';
+import { MAX_CHAT_ASK_MESSAGES, MAX_CHAT_ASK_THREADS, chatAskThreadView, noticeState, parseThreadIds, replyState, type ChatAskMessageRow, type ChatAskThreadRow } from './chatAsks';
 
 const at = (s: string) => new Date(`2026-10-29T13:${s}Z`);
 
@@ -54,7 +54,69 @@ describe('replyState', () => {
   });
 });
 
+describe('noticeState', () => {
+  const chat = { projectId: 'p1', workstream: 'main' };
+  const on = { flagOn: true, chat };
+  const to = (over: Record<string, unknown>) => ({ notifyVia: 'chat', notifyProjectId: 'p1', notifyWorkstream: 'main', notice: null, ...over });
+
+  it('is due while the reading chat is to be told and the flag is on for it', () => {
+    expect(noticeState(to({}), on)).toBe('due');
+    expect(noticeState(to({ notifyVia: 'pane' }), on)).toBe('due');
+  });
+  it('is none for --no-notify, no sender, the flag off, or a poll that got the finish', () => {
+    expect(noticeState(to({ notifyVia: null }), on)).toBe('none');
+    expect(noticeState({}, on)).toBe('none');
+    expect(noticeState(to({}), { flagOn: false, chat })).toBe('none');
+    expect(noticeState(to({ notice: 'off' }), on)).toBe('none');
+    expect(noticeState(to({ notice: 'waiter' }), on)).toBe('none');
+  });
+  it('is sent once the chat or pane was told', () => {
+    for (const n of ['chat', 'pane']) expect(noticeState(to({ notice: n }), { flagOn: false, chat })).toBe('sent');
+  });
+  it('is unsent when one was due and did not go', () => {
+    for (const n of ['gone', 'skipped', 'expired', 'failed']) expect(noticeState(to({ notice: n }), on)).toBe('unsent');
+  });
+  it('is none for a notice that tells another chat: a follow-up another session sent', () => {
+    expect(noticeState(to({ notifyProjectId: 'p9' }), on)).toBe('none');
+    expect(noticeState(to({ notifyWorkstream: 'review', notice: 'chat' }), on)).toBe('none');
+  });
+  it('is none for a reader that is no termag chat (the desktop)', () => {
+    expect(noticeState(to({}), { flagOn: true, chat: null })).toBe('none');
+    expect(noticeState(to({ notice: 'chat' }), { flagOn: true, chat: null })).toBe('none');
+  });
+  it('takes a message answered together with its follow-up from the follow-up\'s own notice', () => {
+    const follow = (n: string | null) => (id: string) => (id === 'b' ? to({ notice: n }) : undefined);
+    const a = to({ notice: 'together', supersededById: 'b' });
+    expect(noticeState(a, on, follow('chat'))).toBe('sent');
+    expect(noticeState(a, on, follow('failed'))).toBe('unsent');
+    expect(noticeState(a, on, follow('waiter'))).toBe('none');
+    expect(noticeState(a, on, follow(null))).toBe('due');
+    expect(noticeState(a, on, () => undefined)).toBe('none');
+    expect(noticeState(a, on)).toBe('none');
+  });
+});
+
 describe('chatAskThreadView', () => {
+  const reader = { flagOn: true, chat: { projectId: 'p1', workstream: 'main' } };
+  it('says whether each message\'s notice tells the reading chat when it finishes', () => {
+    const t = thread({ messages: [message({ notifyVia: 'chat', notifyProjectId: 'p1', notifyWorkstream: 'main', notice: null })] });
+    expect(chatAskThreadView(t, reader).messages[0].notice).toBe('due');
+    expect(chatAskThreadView(t, { ...reader, flagOn: false }).messages[0].notice).toBe('none');
+    expect(chatAskThreadView(t, { ...reader, chat: { projectId: 'p1', workstream: 'review' } }).messages[0].notice).toBe('none');
+    expect(chatAskThreadView(t).messages[0].notice).toBe('none');
+  });
+
+  it('resolves a superseded message\'s `together` through the follow-up that answered it', () => {
+    const notify = { notifyVia: 'chat', notifyProjectId: 'p1', notifyWorkstream: 'main' };
+    const t = thread({
+      messages: [
+        message({ id: 'a', status: 'superseded', supersededById: 'b', notice: 'together', completedAt: at('24:00'), ...notify }),
+        message({ id: 'b', status: 'completed', createdAt: at('24:00'), completedAt: at('25:00'), notice: 'failed', ...notify }),
+      ],
+    });
+    expect(chatAskThreadView(t, reader).messages.map(m => m.notice)).toEqual(['unsent', 'unsent']);
+  });
+
   it('names the target as a follow-up would, and the thread\'s own chat', () => {
     const v = chatAskThreadView(thread());
     expect(v).toMatchObject({
@@ -83,7 +145,7 @@ describe('chatAskThreadView', () => {
     }));
     expect(v.messages.map(m => m.id)).toEqual(['a9525f4870115a431e32d6a46', 'c03e7d1a95b24f60e8d2a17bc']);
     expect(v.messages[0]).toEqual({
-      id: 'a9525f4870115a431e32d6a46', hop: 1, status: 'completed', queued: false, error: null, reply: 'dropped', supersededBy: null,
+      id: 'a9525f4870115a431e32d6a46', hop: 1, status: 'completed', queued: false, error: null, reply: 'dropped', notice: 'none', supersededBy: null,
       publish: { status: 'none', detail: null },
       createdAt: '2026-10-29T13:23:12.000Z', startedAt: '2026-10-29T13:23:18.000Z', completedAt: '2026-10-29T13:25:00.000Z',
     });

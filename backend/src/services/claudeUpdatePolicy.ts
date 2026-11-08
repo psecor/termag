@@ -11,13 +11,52 @@
  */
 
 export const CLAUDE_UPDATE_POLICY_FLAG = 'claude-code-update-policy';
-/** The release flag: off, the admin routes answer 404 claude_update_off and a box's policy says restart nothing. */
-export const CLAUDE_UPDATE_ENABLED_FLAG = 'claude-code-update-enabled';
 
 export type ClaudeUpdateRestart = 'none' | 'idle' | 'force';
+
+/**
+ * Whether updating a tool is on, and whether the sweep updates it on its own:
+ * `off` turns off the Software tab's actions
+ * (404), the sweep and session restarts, and keeps the floor, as the enabled
+ * flag off did: a run gets the floor only, restart none, and Claude Code's
+ * runner wrapper still enforces the floor; `manual`, the Software tab is on and
+ * the sweep does nothing; `auto`, the sweep runs it too (toolUpdate/gate.ts).
+ * A missing or malformed mode is `off`, and so is a policy the flag source cannot
+ * serve (its fallback is null).
+ */
+export type ToolUpdateMode = 'off' | 'manual' | 'auto';
+export const MODES: readonly ToolUpdateMode[] = ['off', 'manual', 'auto'];
+export const isMode = (v: unknown): v is ToolUpdateMode => typeof v === 'string' && (MODES as readonly string[]).includes(v);
+
+/** The flag and value pairs already logged as a missing or malformed mode: each is logged once per process, not on every read. */
+const loggedModes = new Set<string>();
+
+/**
+ * A policy flag's `mode`, one of MODES. Missing (the key absent, null, or a
+ * flag the flag source cannot serve) or malformed, it is `off`, the safe side,
+ * and each is logged once per flag and value.
+ */
+export function parseUpdateMode(value: unknown, flag: string): ToolUpdateMode {
+  if (isMode(value)) return value;
+  const missing = value === undefined || value === null;
+  const shown = missing ? 'missing' : (JSON.stringify(value) ?? String(value)).slice(0, 60);
+  const key = `${flag}\u0000${shown}`;
+  if (!loggedModes.has(key)) {
+    loggedModes.add(key);
+    console.warn(missing
+      ? `[TOOL-UPDATE] ${flag}: no mode; off`
+      : `[TOOL-UPDATE] ${flag}: mode ${shown} is not off, manual or auto; off`);
+  }
+  return 'off';
+}
+
+/** Tests: log every missing or malformed mode again. */
+export function resetLoggedModesForTests(): void { loggedModes.clear(); }
 export const RESTARTS: readonly ClaudeUpdateRestart[] = ['none', 'idle', 'force'];
 
 export interface ClaudeUpdatePolicy {
+  /** Off, manual or automatic (ToolUpdateMode); off when the flag has none, or a malformed one. */
+  mode: ToolUpdateMode;
   /** The lowest version a runner or a box may run: `x.y.z`. */
   floor: string;
   /** What an update installs: an npm dist-tag (`latest`, `stable`) or an exact `x.y.z`. */
@@ -31,6 +70,7 @@ export interface ClaudeUpdatePolicy {
 }
 
 export const DEFAULT_CLAUDE_UPDATE_POLICY: ClaudeUpdatePolicy = {
+  mode: 'off',
   floor: '2.1.308',
   target: 'latest',
   restart: 'idle',
@@ -53,14 +93,17 @@ export const CLAUDE_TARGET_TAGS: readonly string[] = ['latest', 'stable'];
 /**
  * The flag's value, key by key over the defaults. Another tool's policy has
  * the same shape (services/toolUpdate/components.ts) and passes its own
- * defaults and the dist-tags its package publishes (codexUpdatePolicy.ts).
+ * defaults, the dist-tags its package publishes and its flag's key, which a
+ * malformed mode's log line names (codexUpdatePolicy.ts).
  */
 export function parseClaudeUpdatePolicy(
   value: unknown, defaults: ClaudeUpdatePolicy = DEFAULT_CLAUDE_UPDATE_POLICY, tags: readonly string[] = CLAUDE_TARGET_TAGS,
-  isVersion: (v: unknown) => v is string = isClaudeVersion,
+  isVersion: (v: unknown) => v is string = isClaudeVersion, flag: string = CLAUDE_UPDATE_POLICY_FLAG,
 ): ClaudeUpdatePolicy {
   const v = (value && typeof value === 'object' && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
   return {
+    // A mode has no default to fall back to: missing or malformed, it is off.
+    mode: parseUpdateMode(v.mode, flag),
     floor: isVersion(v.floor) ? v.floor : defaults.floor,
     target: (typeof v.target === 'string' && tags.includes(v.target)) || isVersion(v.target) ? v.target as string : defaults.target,
     restart: isRestart(v.restart) ? v.restart : defaults.restart,

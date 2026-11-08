@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CHAT_EFFORT_CAPABILITY, chatEffortForSend, chatEffortFrom, chatEffortInput } from './chatEffort';
 
-const capable = { flagOn: true, capabilities: [CHAT_EFFORT_CAPABILITY], ask: false, backend: null };
+const capable = { capabilities: [CHAT_EFFORT_CAPABILITY], ask: false, backend: null };
 
 describe('chatEffortFrom', () => {
   it('takes the five CLI levels and nothing else', () => {
@@ -11,9 +11,8 @@ describe('chatEffortFrom', () => {
 });
 
 describe('chatEffortInput', () => {
-  it('needs the flag, a runner with chat-effort-v1, and a chat on Claude\'s own models', () => {
+  it('needs a runner with chat-effort-v1, and a chat on Claude\'s own models', () => {
     expect(chatEffortInput(capable)).toBe(true);
-    expect(chatEffortInput({ ...capable, flagOn: false })).toBe(false);
     expect(chatEffortInput({ ...capable, capabilities: ['chat-runner-v1'] })).toBe(false);
     expect(chatEffortInput({ ...capable, ask: true })).toBe(false);
     expect(chatEffortInput({ ...capable, backend: 'fireworks' })).toBe(false);
@@ -25,7 +24,6 @@ describe('chatEffortForSend', () => {
     expect(chatEffortForSend('high', capable)).toBe('high');
     expect(chatEffortForSend('bogus', capable)).toBeNull();
     expect(chatEffortForSend(undefined, capable)).toBeNull();
-    expect(chatEffortForSend('high', { ...capable, flagOn: false })).toBeNull();
     expect(chatEffortForSend('high', { ...capable, capabilities: [] })).toBeNull();
     expect(chatEffortForSend('max', { ...capable, backend: 'fireworks' })).toBeNull();
     expect(chatEffortForSend('max', { ...capable, ask: true })).toBeNull();

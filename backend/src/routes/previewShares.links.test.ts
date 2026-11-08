@@ -173,13 +173,11 @@ function deps(over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), gi
     findUserByEmail: vi.fn(),
     findUser: vi.fn(async (id: string) => [owner, viewer, stranger].find(u => u.id === id) ?? null),
     isCollaborator: vi.fn(async () => false),
-    sharingOn: vi.fn(async () => true),
-    prLinksOn: vi.fn(async () => true),
     autoShareDefault: vi.fn(async () => false),
     draftSharesOn: vi.fn(async () => false),
-    checkoutSharesOn: vi.fn(async () => false),
     listWorkstreams: vi.fn(async () => [{ id: null, name: 'main' }, { id: 'ws1', name: 'feature-x' }]),
-    findCheckout: vi.fn(),
+    // A box agent too old to report its checkouts: the share is bound to the project's repository and the workstream's branch.
+    findCheckout: vi.fn(async () => ({ ok: false as const, reason: 'outdated-agent' as const, looked: [] })),
     ttlDefault: vi.fn(async () => 24),
     boxStatus: vi.fn(async () => 'ready'),
     notifyWake: vi.fn(async () => true),
@@ -282,9 +280,7 @@ describe('making a PR link share', () => {
     expect((await createLinkShareFor(deps(), asUser(owner), 'p1', { ...ask, workstream: 'gone' })).status).toBe(404);
   });
 
-  it('needs both flags, and the owner\'s GitHub', async () => {
-    expect(await createLinkShareFor(deps({ prLinksOn: vi.fn(async () => false) }), asUser(owner), 'p1', ask)).toMatchObject({ status: 403, body: { code: 'pr-links-disabled' } });
-    expect(await createLinkShareFor(deps({ sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', ask)).toMatchObject({ status: 403 });
+  it('needs the owner\'s GitHub', async () => {
     expect(await createLinkShareFor(deps({}, fakeStore(), null), asUser(owner), 'p1', ask)).toMatchObject({ status: 409, body: { code: 'github-not-connected' } });
     const refused = deps({}, fakeStore(), fakeGithub({ readPr: vi.fn(async () => { throw new GithubApiError('no', 401); }) }));
     expect(await createLinkShareFor(refused, asUser(owner), 'p1', ask)).toMatchObject({ status: 502, body: { code: 'github-reconnect' } });
@@ -363,7 +359,6 @@ describe('making a PR link share', () => {
 
 describe('an open link: the share dialog with nobody named', () => {
   const openDeps = (over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), github = fakeGithub()) => deps({
-    openLinksOn: vi.fn(async () => true),
     findWorkstream: vi.fn(async (_p: string, name: string) => (name === 'feature-x' ? { id: 'ws1' } : name === 'main' ? { id: null } : undefined)),
     ...over,
   }, store, github);
@@ -412,11 +407,7 @@ describe('an open link: the share dialog with nobody named', () => {
     expect(await extendShareFor(d, asUser(owner), 'p1', id, { ttlHours: 168 })).toMatchObject({ status: 200, body: { id, expiresAt: new Date(NOW + 168 * 3600e3).toISOString() } });
   });
 
-  it('needs its own flag beside sharing\'s, and is never what a missing email means', async () => {
-    expect(await createShareFor(openDeps({ openLinksOn: vi.fn(async () => false) }), asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' }))
-      .toMatchObject({ status: 403, body: { code: 'open-links-disabled' } });
-    expect(await createShareFor(openDeps({ sharingOn: vi.fn(async () => false) }), asUser(owner), 'p1', { audience: 'link', workstream: 'feature-x' }))
-      .toMatchObject({ status: 403, body: { code: 'preview-share-disabled' } });
+  it('is never what a missing email means', async () => {
     const d = openDeps();
     expect(await createShareFor(d, asUser(owner), 'p1', { workstream: 'feature-x' })).toMatchObject({ status: 400, body: { error: 'email is required' } });
     // Naming someone and asking for a link is refused, never widened to everyone.
@@ -436,7 +427,6 @@ describe('4d: a link share from the PR\'s own checkout', () => {
   const onMain = { workstream: 'main', repo: 'example-org/webapp', number: 42 };
   const fromSrc = { ok: true as const, dir: src, realDir: src, workstream: null, repo: 'example-org/webapp', branch: 'feat/x', head: 'b'.repeat(40) };
   const d4 = (over: Partial<PreviewShareRouteDeps> = {}, store = fakeStore(), github: ShareGithub | null = fakeGithub()) => deps({
-    checkoutSharesOn: vi.fn(async () => true),
     findOwnedProject: vi.fn(async (userId: string, id: string) => (userId === owner.id && id === 'p1' ? handbook : null)),
     findUser: vi.fn(async (id: string) => (id === owner.id ? olive : [viewer, stranger].find(u => u.id === id) ?? null)),
     findCheckout: vi.fn(async () => fromSrc),
@@ -458,8 +448,6 @@ describe('4d: a link share from the PR\'s own checkout', () => {
         { dir: src, workstream: null, worktrees: true },
       ],
     }));
-    // Without the flag, today's rule refuses it.
-    expect(await createLinkShareFor(d4({ checkoutSharesOn: vi.fn(async () => false) }), asUser(owner), 'p1', onMain)).toMatchObject({ status: 409, body: { code: 'other-repo' } });
   });
 
   it('looks in ~/src under GitHub\'s spelling of the name and in lowercase, and keys a symlinked one where it resolves', async () => {
@@ -787,9 +775,8 @@ describe('a project\'s preview settings (4c)', () => {
     expect((await settingsFor(d, asUser(owner), 'p1')).body).toMatchObject({ prLinksEnabled: true });
   });
 
-  it('only the owner, and saving needs the flags', async () => {
+  it('only the owner', async () => {
     expect((await settingsFor(deps(), asUser(stranger), 'p1')).status).toBe(404);
     expect((await saveSettingsFor(deps(), asUser(stranger), 'p1', {})).status).toBe(404);
-    expect(await saveSettingsFor(deps({ prLinksOn: vi.fn(async () => false) }), asUser(owner), 'p1', { prLinksEnabled: true })).toMatchObject({ status: 403 });
   });
 });

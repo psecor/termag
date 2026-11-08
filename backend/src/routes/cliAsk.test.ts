@@ -89,7 +89,7 @@ describe('POST /ask', () => {
     const res = await call('POST', '/ask', BOX, { target: 'devbox/api@fix', prompt: 'why?' });
     expect(res.status).toBe(202);
     expect(calls).toEqual([['ask', 'alice', 'i-devbox', {
-      ref: { box: 'devbox', project: 'api', workstream: 'fix', repo: null }, projectId: null, workstream: 'fix', repo: null, prompt: 'why?', threadId: null, messageId: null, title: null, sender: null, senderClaudeSession: null, targetPr: null, newBox: false, notify: true,
+      ref: { box: 'devbox', project: 'api', workstream: 'fix', repo: null }, projectId: null, workstream: 'fix', repo: null, prompt: 'why?', threadId: null, messageId: null, title: null, sender: null, senderClaudeSession: null, targetPr: null, newBox: false, notify: true, model: null,
     }]]);
   });
 
@@ -209,7 +209,7 @@ describe('box-only run routes', () => {
     expect(calls[0]).toEqual(['recordResult', 'i-devbox', MSG, {
       result: 'done', sessionId: 'abc-123', isError: false, numTurns: 3, exitReason: null,
       baseSha: 'a'.repeat(40), repo: 'org/repo', bundle: true, prDescription: '# Title\n\nWhat changed.',
-      prDescriptions: { docs: '# Docs' }, pushes: null,
+      prDescriptions: { docs: '# Docs' }, pushes: null, unpushed: [],
     }]);
   });
 

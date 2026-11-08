@@ -37,9 +37,8 @@ const store: CliStore = {
 };
 
 const LIST = { groups: [{ owner: 'alice', kind: 'user', repos: [{ fullName: 'alice/app', defaultBranch: 'main' }] }], fetchedAt: '2026-10-31T00:00:00Z' };
-const state = { enabled: true, store: true, asked: [] as boolean[] };
+const state = { store: true, asked: [] as boolean[] };
 const deps: CliGithubRepos = {
-  enabled: async () => state.enabled,
   storeConfigured: () => state.store,
   repos: async (_user, refresh) => { state.asked.push(refresh); return LIST; },
 };
@@ -60,7 +59,6 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
-  state.enabled = true;
   state.store = true;
   state.asked = [];
 });
@@ -78,12 +76,9 @@ describe('GET /github/repos', () => {
     expect(state.asked).toEqual([false, true]);
   });
 
-  it("refuses a box's own token, hides behind desktop-app-enabled, and says when the store is off", async () => {
+  it("refuses a box's own token, and says when the store is off", async () => {
     expect((await list('', BOX)).status).toBe(403);
     expect((await list('', null)).status).toBe(401);
-    state.enabled = false;
-    expect((await list()).status).toBe(404);
-    state.enabled = true;
     state.store = false;
     const off = await list();
     expect(off.status).toBe(503);

@@ -132,10 +132,12 @@ describe('CredentialedParentPropagator', () => {
   it('starts a new trace for a request with no credential', () => {
     expect(parentOf({ traceparent })).toBeUndefined();
     expect(parentOf({ traceparent, cookie: 'other=1; termag.sidx=2' })).toBeUndefined();
+    expect(parentOf({ traceparent, cookie: 'other=1; x__Host-termag.sid=2' })).toBeUndefined();
   });
 
   it('continues it with a session cookie, the ALB identity or an Authorization header', () => {
     expect(parentOf({ traceparent, cookie: 'a=1; termag.sid=s%3Aabc' })).toBe('0af7651916cd43dd8448eb211c80319c');
+    expect(parentOf({ traceparent, cookie: 'a=1; __Host-termag.sid=s%3Aabc' })).toBe('0af7651916cd43dd8448eb211c80319c');
     expect(parentOf({ traceparent, 'x-amzn-oidc-data': 'jwt' })).toBe('0af7651916cd43dd8448eb211c80319c');
     expect(parentOf({ traceparent, authorization: 'Bearer x' })).toBe('0af7651916cd43dd8448eb211c80319c');
   });

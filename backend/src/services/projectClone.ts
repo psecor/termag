@@ -45,6 +45,8 @@ import {
 } from './projectSetup';
 import type { SetupAdmission } from './sessionGate';
 import * as tmux from './tmux';
+import { startEnvironmentAfterClone } from './projectEnvironment';
+import { staticCheckoutDir, staticLayoutDecision, staticRepoName } from './staticLayout';
 
 export interface SetupTarget {
   projectId: string;
@@ -107,6 +109,34 @@ function setupSnapshot(row: SetupRow, status: SetupStatus) {
 
 function projectDir(row: SetupRow): string {
   return tmux.projectDirFor({ name: row.name, user: row.user, instance: row.instance }, 'main');
+}
+
+/**
+ * The static layout's checkout for this project's clone (services/staticLayout.ts), or null for the project's own
+ * directory: only on a box made from an environment for it, whose agent can.
+ */
+async function staticDirFor(row: SetupRow): Promise<string | null> {
+  if (row.dir) return row.dir;
+  const view = agentView(row.instanceId);
+  const capabilities = view.kind === 'present' ? view.capabilities : [];
+  const others = row.environmentId
+    ? await prisma.project.count({ where: { instanceId: row.instanceId, archived: false, id: { not: row.id } } })
+    : 0;
+  const decision = staticLayoutDecision(row, row.instance, capabilities, others);
+  if (!decision.use) {
+    if (row.environmentId && decision.why !== 'not-first') console.log(`[CLONE] ${row.id}: not the static layout (${decision.why})`);
+    return null;
+  }
+  const name = staticRepoName(row);
+  if (!name) {
+    console.log(`[CLONE] ${row.id}: not the static layout (its environment's definition can't be read, so its path is unknown)`);
+    return null;
+  }
+  const home = resolveProjectRoot({ ownerUnixUser: row.user.unixUsername, hostHome: row.instance.hostHome });
+  const dir = staticCheckoutDir(home, name);
+  // Never a path another project on the box records, an archived one's included: its checkout is that project's.
+  if (!dir || await prisma.project.count({ where: { instanceId: row.instanceId, dir, id: { not: row.id } } }) > 0) return null;
+  return dir;
 }
 
 /**
@@ -246,6 +276,7 @@ async function runEffect(effect: SetupEffect, row: SetupRow, admission: SetupAdm
       if (!row.repoUrl) return NO_REPOSITORY;
       const home = resolveProjectRoot({ ownerUnixUser: row.user.unixUsername, hostHome: row.instance.hostHome });
       const referenceDir = templateForRepoUrl(row.repoUrl)?.referenceDir?.replace(/^\$HOME(?=\/|$)/, () => home);
+      const staticDir = await staticDirFor(row);
       const payload = {
         projectId: row.id,
         instanceId: row.instanceId,
@@ -255,9 +286,24 @@ async function runEffect(effect: SetupEffect, row: SetupRow, admission: SetupAdm
         attempt: row.setupAttempt,
         sizeKb: null,
         ...(referenceDir ? { referenceDir } : {}),
+        ...(staticDir ? { staticDir } : {}),
       };
       try {
-        await sendToInstanceAgent(row.instanceId, 'project-clone', payload, CLONE_RPC_TIMEOUT_MS);
+        const answer = await sendToInstanceAgent(row.instanceId, 'project-clone', payload, CLONE_RPC_TIMEOUT_MS) as { staticLayout?: unknown; staticRefused?: unknown } | null;
+        // The box took the static path, or kept the project's own directory (a path already taken there): record which.
+        if (staticDir && answer?.staticLayout === true && row.dir !== staticDir) {
+          await prisma.project.update({ where: { id: row.id }, data: { dir: staticDir } });
+          console.log(`[CLONE] ${row.id}: checkout at ${staticDir}, linked from ${projectDir(row)}`);
+        } else if (staticDir && answer && answer.staticLayout !== true) {
+          // Refused (the path is taken on this box, say a project moved onto one that has it), or an agent that ignores
+          // staticDir: the clone goes to the project's own directory, so a recorded static path is forgotten and the
+          // launch's environment steps run there.
+          console.warn(`[CLONE] ${row.id}: not the static layout: ${String(answer.staticRefused ?? 'the box did not take it')}`);
+          if (row.dir) {
+            await prisma.project.updateMany({ where: { id: row.id, instanceId: row.instanceId, dir: row.dir }, data: { dir: null } });
+            row.dir = null;
+          }
+        }
       } catch (err) {
         // The move writes nothing, so the next hello sends it again.
         console.error(`[CLONE] ${row.id}: project-clone to ${row.instanceId} failed:`, (err as Error).message);
@@ -319,6 +365,9 @@ async function runEffect(effect: SetupEffect, row: SetupRow, admission: SetupAdm
           }
         }
       }
+      // The environment file's steps, on a box made for this project (services/projectEnvironment.ts).
+      // Its real checkout, so the box keys the steps by ~/code/<repo> in the static layout (the agent resolves a link too).
+      void startEnvironmentAfterClone({ ...row, dir: row.dir ?? projectDir(row) });
       return DONE;
     }
     case 'empty-dir': {
@@ -326,10 +375,16 @@ async function runEffect(effect: SetupEffect, row: SetupRow, admission: SetupAdm
       // Starting empty (a chosen start, or after a failed clone) abandons the
       // repository: clear it so a chat does not wait forever for a checkout
       // that will never land (chatRequireCheckout keys off repoUrl).
-      if (row.repoUrl !== null) {
-        await prisma.project.update({ where: { id: row.id }, data: { repoUrl: null, repoDefaultBranch: null } });
+      // Its static checkout, if it had one, is abandoned with it: the project's own directory is what it has now.
+      const abandoned = row.dir;
+      if (row.repoUrl !== null || row.dir !== null) {
+        await prisma.project.update({ where: { id: row.id }, data: { repoUrl: null, repoDefaultBranch: null, dir: null } });
+        // The effects after this one (start empty's launch, its environment-up) read this row, not the database.
+        Object.assign(row, { repoUrl: null, repoDefaultBranch: null, dir: null });
       }
-      await sendForProject(host, 'mkdir', { dir });
+      // The project directory may be the static layout's link into that checkout: the box removes the link first,
+      // so the empty directory is the project's own and init-wiki never writes into the clone, which stays on disk.
+      await sendForProject(host, 'mkdir', { dir, ...(abandoned ? { dropLinkTo: abandoned } : {}) });
       sendForProject(host, 'init-wiki', { dir, slug: row.name, username: row.user.unixUsername }).catch(() => {});
       return DONE;
     }
