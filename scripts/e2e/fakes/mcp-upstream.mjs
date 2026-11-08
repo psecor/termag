@@ -21,7 +21,12 @@
 //                 it issued is accepted on <base> like the E2E_MCP_REQUIRE
 //                 credential. GET /_e2e/as shows its settings and counters (never
 //                 a token); POST /_e2e/as with JSON changes the settings:
-//                 { dcr, cimd, s256, ttl } (ttl: access-token seconds), and
+//                 { dcr, cimd, s256, ttl } (ttl: access-token seconds),
+//                 { refuseRedirect: 'authorize' } (authorize sends every request to
+//                 its own error page, naming the redirect_uri, as New Relic's Ory
+//                 Hydra does) or 'register' (DCR answers 403
+//                 invalid_redirect_uri "… is not permitted by administrator
+//                 policy", as Glean's does), and
 //                 { revokeAll: true } revokes every grant, as a server-side
 //                 revocation would.
 //
@@ -51,7 +56,7 @@ function parseRequire(spec) {
   return i > 0 ? { name: spec.slice(0, i).toLowerCase(), value: spec.slice(i + 1) } : null;
 }
 
-const asConfig = { dcr: true, cimd: false, s256: true, ttl: 3600 };
+const asConfig = { dcr: true, cimd: false, s256: true, ttl: 3600, refuseRedirect: null };
 const asStats = { registered: 0, authorized: 0, codeGrants: 0, refreshes: 0, reuse: 0, revoked: 0, refused: [] };
 const clients = new Map();
 const codes = new Map();
@@ -171,6 +176,7 @@ async function handleAs(req, res, url) {
     try { body = JSON.parse(await readBody(req)); } catch { body = null; }
     const uris = Array.isArray(body?.redirect_uris) ? body.redirect_uris.filter((u) => typeof u === 'string') : [];
     if (uris.length === 0) { asRefuse(res, 400, 'invalid_redirect_uri', 'redirect_uris is required'); return; }
+    if (asConfig.refuseRedirect === 'register') { asRefuse(res, 403, 'invalid_redirect_uri', `redirect_uri ${uris[0]} is not permitted by administrator policy.`); return; }
     const id = `dcr-${clients.size + 1}`;
     clients.set(id, { redirectUris: uris });
     asStats.registered++;
@@ -179,6 +185,13 @@ async function handleAs(req, res, url) {
   }
   if (url.pathname === '/as/authorize' && req.method === 'GET') {
     const p = Object.fromEntries(url.searchParams);
+    if (asConfig.refuseRedirect === 'authorize') {
+      const to = new URL(`${issuer}/error`);
+      to.searchParams.set('error', 'invalid_request');
+      to.searchParams.set('error_description', "The 'redirect_uri' parameter does not match any of the OAuth 2.0 Client's pre-registered redirect urls.");
+      res.writeHead(302, { location: to.toString() }).end();
+      return;
+    }
     const client = clients.get(p.client_id);
     const cimd = asConfig.cimd && /^https:\/\//.test(p.client_id ?? '');
     if (!client && !cimd) { asRefuse(res, 400, 'invalid_client', 'unknown client_id'); return; }

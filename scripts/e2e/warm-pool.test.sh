@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The warm pool end to end on its own stack: E2E_WARM_POOL boxes launched
-# through the EC2 fake and warmed through the on-warm unit, E2E_FLAGS
-# turning warm-pool-enabled on, then Add box claiming them. Runs on its own
+# through the EC2 fake and warmed through the on-warm unit, then Add box
+# claiming them. Runs on its own
 # ports, TMPDIR and download cache, beside a stack that is already up.
 #
 # The claim checks need a backend that claims (POST /api/instances answers
@@ -24,7 +24,7 @@ S=${E2E_TEST_PORT_SHIFT:-0}
 export E2E_PORT=$((3960 + S)) E2E_FRONTEND_PORT=$((5994 + S)) E2E_PG_PORT=$((55459 + S)) E2E_BOXES=1 \
   E2E_AWS_PORT=$((4866 + S)) E2E_EC2_PORT=$((4867 + S)) E2E_GITHUB_PORT=$((4881 + S)) \
   E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1 E2E_FAKE_GITHUB=1 E2E_WARM_POOL=2 E2E_WARM_POOL_TICK=2 \
-  E2E_FLAGS='{"warm-pool-enabled":true}'
+  E2E_FLAGS='{"hyperspace-background-enabled":true}'
 # The dotfiles checks run the stub's e2e-org/dotfiles install.sh, and stand-in
 # boxes run no dotfiles script unless told to (TERMAG_DOTFILES_NO_SCRIPTS).
 export E2E_DOTFILES_SCRIPTS=1
@@ -110,7 +110,7 @@ check "and a private one still asks for credentials" no \
   "$(HOME=$b/home GIT_CONFIG_SYSTEM=$b/etc/gitconfig GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
     git ls-remote https://github.com/e2e-org/sample >/dev/null 2>&1 && echo yes || echo no)"
 check "E2E_FLAGS reaches the frontend through /api/flags" true \
-  "$(curl -s -b "$JAR" "$API/api/flags" | jq -r '.flags["warm-pool-enabled"]')"
+  "$(curl -s -b "$JAR" "$API/api/flags" | jq -r '.flags["hyperspace-background-enabled"]')"
 
 claim "$(next_name)"
 if [ "$(claimed)" = null ]; then

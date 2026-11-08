@@ -31,8 +31,7 @@ if [ -n "${E2E_TEST_CLAUDE_GATEWAY:-}" ]; then
     E2E_GITHUB_BROKER_PORT=$((3644 + S)) E2E_STS_PORT=$((4691 + S))
   # The MCP broker, when the checkout's gateway has its listener.
   if grep -q 'variable "mcp_listen_port"' "$E2E_TEST_CLAUDE_GATEWAY/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config/main.tf" 2>/dev/null; then
-    E2E_FLAGS=$(jq -c '. + {"mcp-broker-enabled": true}' <<<"${E2E_FLAGS:-{\}}") || { echo 'E2E_FLAGS is not a JSON object' >&2; exit 1; }
-    export E2E_FAKE_MCP=1 E2E_MCP_PORT=$((4693 + S)) E2E_MCP_BROKER_PORT=$((3646 + S)) E2E_FLAGS
+    export E2E_FAKE_MCP=1 E2E_MCP_PORT=$((4693 + S)) E2E_MCP_BROKER_PORT=$((3646 + S))
   fi
 fi
 trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
@@ -330,6 +329,14 @@ check "stub: git ls-remote with a _bad token fails" failed \
   "$(git -c credential.helper= ls-remote "http://x-access-token:t_bad@127.0.0.1:$E2E_GITHUB_PORT/_github.com/e2e-org/sample.git" HEAD >/dev/null 2>&1 && echo listed || echo failed)"
 check "stub: the API reads _bad out of Basic auth too" 401 \
   "$(curl -s -o /dev/null -w '%{http_code}' -u x:t_bad "$GH/user")" # gitleaks:allow (a deliberately bad fake token)
+# The environment pool's credential is a read-only fine-grained PAT: _readonly fetches, never pushes or writes.
+check "stub: a _readonly PAT is e2e-pool-bot" e2e-pool-bot "$(curl -s -u x:pat_e2e_pool_readonly "$GH/user" | jq -r .login)" # gitleaks:allow (a fake read-only token)
+check "stub: a _readonly PAT fetches" 40 \
+  "$(git -c credential.helper= ls-remote "http://x-access-token:pat_e2e_pool_readonly@127.0.0.1:$E2E_GITHUB_PORT/_github.com/e2e-org/sample.git" HEAD | cut -f1 | tr -d '\n' | wc -c)"
+check "stub: a _readonly PAT's push gets 403" 403 \
+  "$(curl -s -o /dev/null -w '%{http_code}' -u x-access-token:pat_e2e_pool_readonly "$GH/_github.com/e2e-org/sample.git/info/refs?service=git-receive-pack")" # gitleaks:allow (a fake read-only token)
+check "stub: a _readonly PAT's REST write gets 403" 403 \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST -u x:pat_e2e_pool_readonly "$GH/user/keys" -d '{}')" # gitleaks:allow (a fake read-only token)
 redirected=$(cd "$repo/backend" && env -i PATH="$PATH" "${genv[@]}" \
   node -e 'fetch("https://github.com/e2e-org/sample.git/info/refs?service=git-upload-pack", { headers: { authorization: "Basic " + Buffer.from("x:t_good").toString("base64") } }).then(r => console.log(r.status), e => console.log("ERR " + e.message))')
 check "with the backend's env, fetch(github.com) reaches the stub's git" 200 "$redirected"

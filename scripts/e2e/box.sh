@@ -74,6 +74,7 @@ box_env=("${base_env[@]}"
   "HOME=$box/home" "PATH=$(box_path "$box" "$ROOT")" "SHELL=/bin/bash" "TERM=xterm-256color" BASH_SILENCE_DEPRECATION_WARNING=1
   "TERMAG_CLAUDE_MANAGED_SETTINGS=$box/etc/claude-code/managed-settings.json" "TERMAG_CREDENTIALS_SUDO="
   "GIT_CONFIG_SYSTEM=$box/etc/gitconfig" "TERMAG_PROFILE_D=$box/etc/profile.d"
+  "E2E_REAL_TMUX=$REAL_TMUX"
   "${box_extra[@]}")
 write_box_tmux "$box/bin/tmux" "$REAL_TMUX" "$box_sock" "${TMUX_FAULTS:+$box/tmux-fault}" "${box_env[@]}"
 # Up before the agent, and up for as long as the box is: a server is started

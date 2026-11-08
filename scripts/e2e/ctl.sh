@@ -38,7 +38,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$here/lib.sh"
 root=$(e2e_root) || die "no e2e stack is up"
 
-usage="usage: ctl.sh stop|start|restart <name> | fault <box-N> <mode> | ec2 bake [Key=Value ...]|clear|no-agent|agent|ignore-stop|honor-stop|refuse-hibernate|allow-hibernate|hold-terminate|release-terminate|no-capacity <subnet>|capacity|no-capacity-type <type>|type-capacity"
+usage="usage: ctl.sh stop|start|restart <name> | fault <box-N> <mode> | ec2 bake [Key=Value ...]|clear|no-agent|agent|ignore-stop|honor-stop|refuse-hibernate|allow-hibernate|hold-terminate|release-terminate|no-capacity <subnet>|capacity|no-capacity-type <type>|type-capacity|no-start-capacity <subnet>|start-capacity"
 action=${1:-}; name=${2:-}
 [ -n "$name" ] || die "$usage"
 
@@ -100,8 +100,12 @@ case $action in
       capacity) rm -f "$root/ec2/no-capacity"; log "every subnet has capacity again" ;;
       no-capacity-type)
         [ -n "${3:-}" ] || die "usage: ctl.sh ec2 no-capacity-type <instance-type>"
-        echo "$3" >>"$root/ec2/no-capacity-types"; log "StartInstances of a box resized to $3 now answers InsufficientInstanceCapacity" ;;
-      type-capacity) rm -f "$root/ec2/no-capacity-types"; log "every resized type has capacity again" ;;
+        echo "$3" >>"$root/ec2/no-capacity-types"; log "StartInstances of a box of type $3 now answers InsufficientInstanceCapacity" ;;
+      type-capacity) rm -f "$root/ec2/no-capacity-types"; log "every type has capacity again" ;;
+      no-start-capacity)
+        [ -n "${3:-}" ] || die "usage: ctl.sh ec2 no-start-capacity <subnet>"
+        echo "$3" >>"$root/ec2/no-start-capacity"; log "StartInstances of a box in $3 now answers InsufficientInstanceCapacity" ;;
+      start-capacity) rm -f "$root/ec2/no-start-capacity"; log "every subnet starts boxes again" ;;
       *) die "$usage" ;;
     esac ;;
   *) die "$usage" ;;

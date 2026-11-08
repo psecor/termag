@@ -14,20 +14,20 @@
 #                      Docker (macOS) when it is running
 #   E2E_AWS_SEED=f     script run once Floci is up (E2E_AWS_URL set, aws.sh on PATH)
 #   E2E_SPACES=1       the spaces bucket and KMS alias in Floci, under the names the
-#                      backend derives (fakes/spaces.sh); needs FAKE_AWS. Turn the
-#                      feature on with E2E_FLAGS='{"spaces-enabled":true,"spaces-sharing-enabled":true}'
+#                      backend derives (fakes/spaces.sh); needs FAKE_AWS.
 #   E2E_CREDENTIAL_STORE=1
 #                      the per-user credential store's KMS key in Floci, and its ARN
 #                      in the backend env; needs FAKE_AWS
 #   E2E_FAKE_CLAUDE=1  stand-in claude CLI on every box, reporting status
 #   E2E_T3=1           the desktop app's box bridge: every box's
 #                      agent runs a t3 server (upstream's release archive, pinned by digest
-#                      in fakes/t3.sh, downloaded once into E2E_CACHE_DIR), and
-#                      desktop-app-enabled is on
+#                      in fakes/t3.sh, downloaded once into E2E_CACHE_DIR)
 #   E2E_T3_COMMAND=c   with E2E_T3: the t3 command boxes run instead (a fork's build, say)
 #   E2E_CLAUDE_BIN=p   a real claude binary on every box's PATH (not with E2E_FAKE_CLAUDE)
 #   E2E_FAKE_GITHUB=1  api.github.com + github.com git stub for the backend, stand-in gh on boxes
 #   E2E_REAL_GITHUB=1  with E2E_FAKE_GITHUB: boxes clone and fetch from the real github.com
+#   E2E_GITHUB_MIRROR="owner/name=<checkout> ..."  with E2E_FAKE_GITHUB: serve local checkouts as public repositories
+#   E2E_CHROMIUM=<binary>  the Chromium the boxes' browser panes run (the snap's needs a real HOME)
 #                      with your own git credentials (read only: pushes go to the stub);
 #                      the backend's GitHub calls still all go to the stub
 #   E2E_DOTFILES_REPO=<https://github.com/owner/repo>
@@ -55,8 +55,7 @@
 #   E2E_FAKE_MCP=1     with E2E_CLAUDE_GATEWAY (a checkout with the MCP broker listener):
 #                      an MCP server stub over HTTPS (fakes/mcp-upstream.mjs) that wants
 #                      `Authorization: Bearer e2e-mcp-secret`, the broker listener behind
-#                      its own TLS front, and the backend's MCP_BROKER_URL; turn the
-#                      feature on with E2E_FLAGS='{"mcp-broker-enabled":true}'
+#                      its own TLS front, and the backend's MCP_BROKER_URL
 #   E2E_SSHD=1         an sshd per box whose logins land in that box's home
 #   E2E_EC2_BOXES=N    register the first N boxes as kind=ec2 instead of external
 #   E2E_EC2_LAUNCH=1   box provisioning on: a launched EC2 instance starts a box
@@ -70,7 +69,7 @@
 #                      a claim runs the dotfiles repository's install script or chezmoi;
 #                      without it every box has TERMAG_DOTFILES_NO_SCRIPTS=1, so a claim
 #                      only links the repository's top-level dotfiles
-#   E2E_FLAGS=json     flag values (TERMAG_FLAGS), e.g. '{"warm-pool-enabled":true}'
+#   E2E_FLAGS=json     flag values (TERMAG_FLAGS), e.g. '{"preview-links-enabled":true}'
 #   E2E_BACKEND_ENV=f  extra lines appended to the backend's env file
 #   E2E_OVERLAP=1      the orchestrator lease on, with second-scale timings, a second
 #                      backend ready to start as `ctl.sh start backend-green` on
@@ -155,19 +154,26 @@ CLAUDE_KEYCHAINS=
 if [ -n "$CLAUDE_BIN" ] && [ "$(uname -s)" = Darwin ] && [ -d "$HOME/Library/Keychains" ]; then
   CLAUDE_KEYCHAINS=$HOME/Library/Keychains
 fi
-# The bridge's routes are behind desktop-app-enabled: E2E_T3 turns it on with
-# the other overrides.
-if [ -n "$T3" ]; then
-  FLAGS=$(node -e 'const v = process.argv[1] ? JSON.parse(process.argv[1]) : {}; v["desktop-app-enabled"] = true; process.stdout.write(JSON.stringify(v))' "$FLAGS") \
-    || { printf '[e2e] error: E2E_FLAGS must be a JSON object\n' >&2; exit 1; }
-  export E2E_FLAGS=$FLAGS
-fi
 fakes_dir="$here/fakes"
 
 # Extra environment for the backend process and for each box agent.
 backend_extra=()
 box_extra=()
 dbpush_extra=()
+# E2E_CHROMIUM=<binary>: the Chromium each box's owner pane runs (agent/browser-pane.js
+# TERMAG_CHROMIUM). The snap's starts only with the user's real HOME, which a stand-in box
+# doesn't have, so the owner's pane needs another build here (Playwright's, say). Ubuntu
+# 23.10+ gives a non-snap Chromium no sandbox (AppArmor's user-namespace rule), so the
+# stack runs it through a wrapper with --no-sandbox: a test stack, its owner's own pages.
+# fakes_box_chromium writes the wrapper once the stack root exists.
+fakes_box_chromium() {
+  [ -n "${E2E_CHROMIUM:-}" ] || return 0
+  [ -x "$E2E_CHROMIUM" ] || die "E2E_CHROMIUM $E2E_CHROMIUM is not an executable"
+  mkdir -p "$ROOT/bin"
+  printf '#!/bin/sh\nexec %q --no-sandbox "$@"\n' "$E2E_CHROMIUM" >"$ROOT/bin/e2e-chromium"
+  chmod 755 "$ROOT/bin/e2e-chromium"
+  box_extra+=("TERMAG_CHROMIUM=$ROOT/bin/e2e-chromium")
+}
 
 fakes_check() {
   case $EC2_BOXES in ''|*[!0-9]*) die "E2E_EC2_BOXES must be a number, got '$EC2_BOXES'" ;; esac
@@ -200,6 +206,8 @@ fakes_check() {
     case $FLAGS in *"'"*) die "E2E_FLAGS must not contain a single quote" ;; esac
     node -e 'const v = JSON.parse(process.argv[1]); if (typeof v !== "object" || v === null || Array.isArray(v)) process.exit(1)' "$FLAGS" 2>/dev/null \
       || die "E2E_FLAGS must be a JSON object of flag key to value, got '$FLAGS'"
+    # PR reviews on bring Review's clone with them, as in production (lib.sh).
+    FLAGS=$(e2e_flags_like_production "$FLAGS")
   fi
   if [ -n "$AWS_SEED" ] && [ ! -r "$AWS_SEED" ]; then die "E2E_AWS_SEED: cannot read $AWS_SEED"; fi
   if [ -n "$T3_COMMAND" ] && [ -z "$T3" ]; then die "E2E_T3_COMMAND needs E2E_T3=1"; fi
@@ -514,12 +522,29 @@ EOF
   fi
 
   if [ -n "$FAKE_GITHUB" ]; then
+    # E2E_GITHUB_MIRROR="owner/name=<checkout> ...": local checkouts the stub
+    # serves as public repositories, at their current branch, so a box can
+    # clone a real repository (termag itself, for its .termag/environment.json).
+    local pair slug src mirror
+    for pair in ${E2E_GITHUB_MIRROR:-}; do
+      slug=${pair%%=*} src=${pair#*=}
+      case $slug in */*) ;; *) die "E2E_GITHUB_MIRROR: '$pair' is not owner/name=<checkout>" ;; esac
+      mirror="$ROOT/github/$slug.git"
+      [ -d "$mirror" ] && continue
+      log "mirroring $src into the GitHub stub as $slug"
+      mkdir -p "$(dirname "$mirror")"
+      git clone -q --bare -- "$src" "$mirror" >>"$ROOT/logs/github.log" 2>&1 || die "could not mirror $src"
+      : >"$mirror/termag-e2e-public"
+    done
     log "starting the api.github.com stub on 127.0.0.1:$GITHUB_PORT"
     start_daemon github "$fakes_dir" env -i "${base_env[@]}" "E2E_GITHUB_PORT=$GITHUB_PORT" "E2E_GITHUB_ROOT=$ROOT/github" node github-stub.mjs
     wait_http "http://127.0.0.1:$GITHUB_PORT/meta" github
     # NODE_OPTIONS has to be in the process env: dotenv runs after preloads.
     backend_extra+=("NODE_OPTIONS=--require $fakes_dir/github-redirect.cjs" "E2E_GITHUB_URL=http://127.0.0.1:$GITHUB_PORT"
-      "ASK_GITHUB_GIT_URL=http://127.0.0.1:$GITHUB_PORT/_github.com")
+      "ASK_GITHUB_GIT_URL=http://127.0.0.1:$GITHUB_PORT/_github.com"
+      # The stub's repositories are e2e-org's: one of the stack's orgs, so an environment may name them
+      # (backend services/environments.ts reposOutsideOrgs).
+      "GITHUB_REPO_ORGS=${GITHUB_REPO_ORGS:-e2e-org,example-org,example-team}")
     # The box gh stub hands anything not aimed at github.com to the real gh, so
     # gh can be driven through an orchestrator-side broker.
     real_gh=$(command -v gh || true)

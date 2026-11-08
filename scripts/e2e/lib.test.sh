@@ -37,6 +37,20 @@ case $got in *"$H/future"*) fail 'a file dated after the check is skipped (bazel
 case $got in *"$H/before"*) fail 'a file from before the marker is skipped' 'not listed' "$got" ;; esac
 case $all in *"$WORK/own"*) fail "a file in the test's own work dir is skipped" 'not listed' "$all" ;; esac
 
+# e2e_flags_like_production: reviews on bring Review's clone, as production's
+# targeting does; a list that names the clone flag, or leaves reviews off, is kept.
+like_prod() { bash -c '. "$1/lib.sh"; e2e_flags_like_production "$2"' _ "$here" "$1"; }
+got=$(like_prod '{"simple-ui-chrome-refresh-enabled":true,"simple-ui-reviews-enabled":true}')
+want='{"simple-ui-chrome-refresh-enabled":true,"simple-ui-reviews-enabled":true,"simple-ui-review-clone-enabled":true}'
+[ "$got" = "$want" ] || fail 'reviews on turns the review clone on' "$want" "$got"
+got=$(like_prod '{"simple-ui-reviews-enabled":true,"simple-ui-review-clone-enabled":false}')
+[ "$got" = '{"simple-ui-reviews-enabled":true,"simple-ui-review-clone-enabled":false}' ] \
+  || fail 'an explicit review clone is kept' '{"simple-ui-reviews-enabled":true,"simple-ui-review-clone-enabled":false}' "$got"
+got=$(like_prod '{"simple-ui-reviews-enabled":false}')
+[ "$got" = '{"simple-ui-reviews-enabled":false}' ] || fail 'reviews off adds nothing' '{"simple-ui-reviews-enabled":false}' "$got"
+got=$(like_prod '{ "hyperspace-background-enabled": true }')
+[ "$got" = '{ "hyperspace-background-enabled": true }' ] || fail 'a list without reviews is passed through as written' '{ "hyperspace-background-enabled": true }' "$got"
+
 # pkce_challenge: RFC 7636's own example, and a verifier starting with "-",
 # which node took for an option of its own (a device sign-in failed one run in
 # 64 with "node: bad option").

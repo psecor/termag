@@ -19,7 +19,7 @@ repo=$(cd "$here/../.." && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
 export E2E_PORT=${E2E_TEST_PORT:-3960} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-5994} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55459} E2E_BOXES=2 \
-  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_FLAGS='{"spaces-enabled":true,"spaces-sharing-enabled":true,"automations-enabled":true,"automation-space-folder-enabled":true,"space-memory-enabled":true}'
+  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_FLAGS='{"automations-enabled":true,"automation-space-folder-enabled":true}'
 [ -n "${E2E_KEEP:-}" ] || trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 failures=0

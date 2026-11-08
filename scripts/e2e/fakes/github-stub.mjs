@@ -4,13 +4,17 @@
 // /_github.com/, served by `git http-backend` from bare repositories under
 // E2E_GITHUB_ROOT (e2e-org/sample and e2e-org/sample-api, the second repository
 // of a multi-repo project, are created with one commit each, as are the
-// viewer's own e2e-octocat/shop-web and shop-api, which GET /user/repos lists
+// viewer's own e2e-octocat/shop-web, shop-api and shop-docs, which GET /user/repos lists
 // ahead of its made-up rows; e2e-org/dotfiles,
 // a dotfiles repo with an install.sh, is public: clones need no token, as is
 // example-org/e2e-demo, a public repository; chat trust is the owner's tick,
-// not the GitHub owner; e2e-org/big-memory, many-cores, big-disk and typo-box, public, carry
+// not the GitHub owner; e2e-org/big-memory, many-cores, big-disk, typo-box and bare-box, public, carry
 // a .termag/environment.json, served with commits/HEAD and contents/). A token
 // containing "_bad" gets 401; one containing "_noscope" lacks admin:public_key.
+// One containing "_readonly" is a fine-grained PAT with read-only Contents and
+// Metadata, the kind the environment pool's credential should be:
+// it is e2e-pool-bot, reports no scopes, fetches,
+// and gets 403 for a push or any REST write.
 // Logs each call with a token fingerprint (the first 8 hex of its sha256),
 // never the token. GET /_e2e/calls returns the call log. Pull requests (the
 // ask publish path) live in memory: list by head, get by number (with its
@@ -84,6 +88,8 @@ if (gitRoot) {
   // Public, as a stand-in box's git has no GitHub credential.
   seedRepo('e2e-octocat', 'shop-web', { isPublicRepo: true });
   seedRepo('e2e-octocat', 'shop-api', { isPublicRepo: true });
+  // A third, added to a project of the two after it is made (multi-repo-add.test.sh).
+  seedRepo('e2e-octocat', 'shop-docs', { isPublicRepo: true });
   // A public dotfiles repo for the warm pool's claim-time personalization. Its
   // install.sh takes E2E_DOTFILES_SECONDS (default 3, or set in the box's
   // ~/.termag/e2e-dotfiles.env), so "personalizing" is visible, and leaves a
@@ -123,7 +129,17 @@ if (gitRoot) {
     isPublicRepo: true,
     files: { '.termag/environment.json': { content: '{ "resources": "huge" }\n' } },
   });
+  // One turning termag setup off: what the CLI states and
+  // --setup overrides, while empty-box-enabled is on.
+  seedRepo('e2e-org', 'bare-box', {
+    isPublicRepo: true,
+    files: { '.termag/environment.json': { content: '{ "setupEnabled": false }\n' } },
+  });
 }
+
+// A read-only fine-grained PAT (the pool credential's recommended kind): reads only.
+const READONLY_MARKER = '_readonly';
+const isReadonly = (auth) => tokenOf(auth).includes(READONLY_MARKER);
 
 // git sends the token as the Basic password, base64-encoded, so the markers
 // ("_bad", "_noscope") are only visible after decoding.
@@ -151,6 +167,11 @@ function serveGit(req, res, path, auth) {
     record(`git ${service} ${owner}/${repo} -> 401 token=${fp(auth)}`);
     res.writeHead(401, { 'www-authenticate': 'Basic realm="GitHub"' });
     return res.end();
+  }
+  if (service === 'git-receive-pack' && isReadonly(auth)) {
+    record(`git ${service} ${owner}/${repo} -> 403 readonly token=${fp(auth)}`);
+    res.writeHead(403, { 'content-type': 'text/plain' });
+    return res.end(`remote: Permission to ${owner}/${repo}.git denied to e2e-pool-bot.\n`);
   }
   const delay = service === 'git-upload-pack' && suffix === 'git-upload-pack' ? slowSeconds(owner, repo) : 0;
   if (delay > 0) {
@@ -400,6 +421,36 @@ function reviewPrNode() {
   };
 }
 
+// More review requests, in any repository, from $E2E_GITHUB_ROOT/review-prs.json,
+// read on every review search: [{ "repo": "owner/name", "number": N, "title": "...",
+// "author": "login", "team": true (asks team e2e-team, not the viewer), "draft": true,
+// "decision": "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null,
+// "ci": "FAILURE", "reviews": [{ "login": "...", "state": "APPROVED", "bot": true }],
+// "hoursAgo": N (when the review was asked for) }]. The Reviews page's filters
+//  are demoed on a queue of these.
+const extraReview = () => {
+  const file = gitRoot && join(gitRoot, 'review-prs.json');
+  if (!file || !existsSync(file)) return [];
+  return JSON.parse(readFileSync(file, 'utf8')).map(x => {
+    const asked = new Date(Date.now() - (x.hoursAgo ?? 3) * 3600_000).toISOString();
+    const who = x.team ? { __typename: 'Team', slug: 'e2e-team' } : { __typename: 'User', login: VIEWER };
+    const rollup = x.ci === 'FAILURE'
+      ? { state: 'FAILURE', contexts: { nodes: [{ __typename: 'CheckRun', name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE' }] } }
+      : reviewPr.commits.nodes[0].commit.statusCheckRollup;
+    return {
+      ...reviewPr, number: x.number, title: x.title, url: `https://github.com/${x.repo}/pull/${x.number}`,
+      headRefName: `e2e/review-${x.number}`, isDraft: !!x.draft, updatedAt: asked, createdAt: asked,
+      reviewDecision: x.decision === undefined ? 'REVIEW_REQUIRED' : x.decision,
+      author: { login: x.author }, repository: { nameWithOwner: x.repo },
+      commits: { nodes: [{ commit: { statusCheckRollup: rollup } }] },
+      reviewRequests: { nodes: [{ requestedReviewer: who }] },
+      timelineItems: { nodes: [{ createdAt: asked, requestedReviewer: who }] },
+      decided: { nodes: (x.reviews ?? []).map(r => ({ state: r.state, author: { __typename: r.bot ? 'Bot' : 'User', login: r.login } })) },
+      latestReviews: { nodes: [] }, viewerLatestReview: null,
+    };
+  });
+};
+
 /** The GraphQL documents the backend sends, told apart by operation name. */
 function graphqlData(query, variables) {
   const op = /(?:query|mutation)\s+(\w+)/.exec(query ?? '')?.[1];
@@ -407,7 +458,7 @@ function graphqlData(query, variables) {
   const termag = variables?.owner === 'example-org' && variables?.name === 'termag';
   const byId = id => [...own.values()].find(o => o.pr.id === id);
   if (op === 'Authored') return { viewer: { login: VIEWER }, search: search([...[...own.values()].filter(o => !o.merged).map(ownNode), ...extraOwn()]) };
-  if (op === 'Review') return { search: search(requested ? [reviewPrNode()] : []) };
+  if (op === 'Review') return { search: search([...(requested ? [reviewPrNode()] : []), ...extraReview()]) };
   if (op === 'Merged') return { search: search([...own.values()].filter(o => o.merged).map(mergedNode)) };
   if (op === 'Overview' || op === 'PrId' || op === 'Suites') {
     const o = termag ? own.get(variables?.number) : undefined;
@@ -509,7 +560,8 @@ createServer((req, res) => {
     // backend's repoEnvironment.ts reads `.termag/environment.json` with. A private one
     // needs a token, as on GitHub, and a public one none; anything else
     // answers 404.
-    const headPath = /^\/repos\/([^/]+)\/([^/]+)\/commits\/HEAD$/.exec(path);
+    // `commits/<branch>` too: an environment pointer's branch head, 422 for no such branch.
+    const headPath = /^\/repos\/([^/]+)\/([^/]+)\/commits\/(.+)$/.exec(path);
     const contentsPath = /^\/repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/.exec(path);
     if (req.method === 'GET' && (headPath || contentsPath)) {
       const [, owner, name] = headPath ?? contentsPath;
@@ -517,7 +569,10 @@ createServer((req, res) => {
       const allowed = bare && (isPublic(owner, name) || (tokenOf(auth) && !tokenOf(auth).includes('_bad')));
       if (!allowed) { record(`GET ${path} -> 404 token=${fp(auth)}`); return send(404, { message: 'Not Found' }); }
       if (headPath) {
-        const sha = bareRev(bare, 'HEAD');
+        const branch = decodeURIComponent(headPath[3]);
+        let sha = null;
+        try { sha = branch === 'HEAD' ? bareRev(bare, 'HEAD') : execFileSync('git', ['-C', bare, 'rev-parse', '--verify', '-q', `refs/heads/${branch}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { sha = null; }
+        if (!sha) { record(`GET ${path} -> 422 token=${fp(auth)}`); return send(422, { message: `No commit found for SHA: ${branch}` }); }
         record(`GET ${path} -> 200 ${sha} token=${fp(auth)}`);
         res.writeHead(200, { 'content-type': 'application/vnd.github.sha' });
         return res.end(sha);
@@ -532,6 +587,10 @@ createServer((req, res) => {
     }
     if (!auth) { record(`${req.method} ${path} -> 401 (no token)`); return send(401, { message: 'Requires authentication' }); }
     if (tokenOf(auth).includes('_bad')) { record(`${req.method} ${path} -> 401 token=${fp(auth)}`); return send(401, { message: 'Bad credentials' }); }
+    if (isReadonly(auth) && req.method !== 'GET' && req.method !== 'HEAD' && path !== '/graphql') {
+      record(`${req.method} ${path} -> 403 readonly token=${fp(auth)}`);
+      return send(403, { message: 'Resource not accessible by personal access token' });
+    }
     const scopeHeader = { 'x-oauth-scopes': tokenOf(auth).includes('_noscope') ? 'repo, read:org' : 'repo, read:org, admin:public_key' };
     if (req.method === 'GET' && path === '/') {
       record(`GET / -> 200 token=${fp(auth)}`);
@@ -724,6 +783,11 @@ createServer((req, res) => {
     if (req.method === 'GET' && path === '/user') {
       if (tokenOf(auth).includes('_bad')) { record('GET /user -> 401'); return send(401, { message: 'Bad credentials' }); }
       const scopes = tokenOf(auth).includes('_noscope') ? 'repo, read:org' : 'repo, read:org, admin:public_key';
+      if (isReadonly(auth)) {
+        // Fine-grained PATs report no scopes.
+        record(`GET /user -> 200 readonly token=${fp(auth)}`);
+        return send(200, { login: 'e2e-pool-bot', id: 434343 });
+      }
       record(`GET /user -> 200 scopes=${scopes} token=${fp(auth)}`);
       return send(200, { login: 'e2e-octocat', id: 424242 }, { 'x-oauth-scopes': scopes });
     }

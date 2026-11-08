@@ -4,9 +4,10 @@
 # against a stub of the orchestrator's check and a Fireworks stub. No backend or
 # boxes: this pins Envoy's half of the contract: which
 # calls are routed, the model read from the body and handed to the check, the
-# box token swapped for the shared key, streaming and the access log. Which
-# models are allowed is the check's (the orchestrator's fireworks-models flag);
-# the stub allows two.
+# box token swapped for the shared key, streaming, Fireworks' own refusals
+# passed through, and the access log. The check allows any model (Fireworks'
+# account governance decides which run); the stub Fireworks refuses two as
+# Fireworks does.
 #
 #   scripts/e2e/fireworks-envoy.test.sh <terraform checkout>
 #
@@ -69,9 +70,9 @@ TF
 grep -q '"name": "fireworks"' "$work/envoy.yaml" 2>/dev/null || { echo "rendering the envoy-config module failed"; exit 1; }
 
 # The orchestrator's check: a Bearer or
-# x-api-key of tmag_good is a managed box with Fireworks on; tmag_off is one
-# with it off; anything else is unknown. Its fireworks-models list is the two
-# ALLOWED; auth-check carries no model.
+# x-api-key of tmag_good is a managed box; tmag_off is a box termag does not
+# manage; anything else is unknown. It allows any model; auth-check
+# carries no model.
 cat >"$work/authz.mjs" <<'JS'
 import { createServer } from 'node:https';
 import { readFileSync } from 'node:fs';
@@ -82,19 +83,15 @@ createServer({ cert: readFileSync(cert), key: readFileSync(key) }, (req, res) =>
   const model = req.headers['x-termag-fireworks-model'] ?? null;
   seen.push({ path: req.url, caller: Boolean(req.headers['x-termag-caller-authorization']), model });
   const tok = /^Bearer (\S+)$/.exec(req.headers.authorization ?? '')?.[1] ?? req.headers['x-api-key'];
-  const ALLOWED = ['accounts/fireworks/models/kimi-k3', 'accounts/fireworks/routers/kimi-k3-fast'];
-  if (tok === 'tmag_good' && !req.url.endsWith('/auth-check') && !ALLOWED.includes(model)) {
-    res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ message: `The termag Fireworks gateway does not allow this model for you. Allowed: ${ALLOWED.join(', ')}` }));
-    return;
-  }
   if (tok === 'tmag_good') { res.writeHead(200, { 'x-termag-user': 'u1', 'x-termag-instance': 'i1', 'x-termag-email': 'a@example.com' }).end(); return; }
-  if (tok === 'tmag_off') { res.writeHead(403, { 'content-type': 'application/json' }).end('{"message":"Fireworks through termag is not enabled for you"}'); return; }
+  if (tok === 'tmag_off') { res.writeHead(403, { 'content-type': 'application/json' }).end('{"message":"Only a termag-managed box can use the Fireworks gateway"}'); return; }
   res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="termag Fireworks gateway"' }).end('{"message":"Unknown or revoked box token"}');
 }).listen(Number(port), '127.0.0.1');
 JS
 
 # Fireworks: records each call and answers JSON, or a slow SSE stream when the
-# body asks for stream.
+# body asks for stream. glm-9 is a model the account has not got (Fireworks'
+# 404) and blocked-1 one its governance refuses (a 403), in Fireworks' shape.
 cat >"$work/fireworks.mjs" <<'JS'
 import { createServer } from 'node:http';
 const [port] = process.argv.slice(2);
@@ -106,6 +103,16 @@ createServer((req, res) => {
   req.on('end', () => {
     seen.push({ method: req.method, path: req.url, host: req.headers.host, authorization: req.headers.authorization ?? null,
       apiKey: req.headers['x-api-key'] ?? null, termag: Object.keys(req.headers).filter(h => h.startsWith('x-termag-')), bytes });
+    if (first.includes('accounts/fireworks/models/glm-9')) {
+      res.writeHead(404, { 'content-type': 'application/json' })
+        .end('{"error":{"object":"error","type":"invalid_request_error","code":"NOT_FOUND","message":"Model not found, inaccessible, and/or not deployed"}}');
+      return;
+    }
+    if (first.includes('accounts/fireworks/models/blocked-1')) {
+      res.writeHead(403, { 'content-type': 'application/json' })
+        .end('{"error":{"object":"error","type":"permission_denied","code":"PERMISSION_DENIED","message":"Access to model accounts/fireworks/models/blocked-1 is denied by your account\'s model access policy"}}');
+      return;
+    }
     if (/"stream"\s*:\s*true/.test(first)) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
@@ -148,17 +155,13 @@ check "no x-termag-* header reaches Fireworks" "[]" "$(jq -c .termag <<<"$last")
 check "a box-sent x-termag-user is dropped too" 200 \
   "$(code -H 'Authorization: Bearer tmag_good' -H 'x-termag-user: someone-else' -d "{\"model\":$kimi}" "$B/chat/completions")"
 check "  (and Fireworks saw none)" "[]" "$(upcalls | jq -c '.[-1].termag')"
-check "a box-sent x-termag-fireworks-model cannot stand in for the body's model" "403 accounts/fireworks/models/glm-9" \
+check "a box-sent x-termag-fireworks-model cannot stand in for the body's model" "404 accounts/fireworks/models/glm-9" \
   "$(code -H 'Authorization: Bearer tmag_good' -H "x-termag-fireworks-model: accounts/fireworks/models/kimi-k3" -d '{"model":"accounts/fireworks/models/glm-9"}' "$B/chat/completions") $(checks | jq -r '.[-1].model')"
 
 echo "--- refusals"
 before=$(upcalls | jq length)
 check "no token: the check's 401" 401 "$(code -d "{\"model\":$kimi}" "$B/chat/completions")"
-check "Fireworks off for the owner: the check's 403" 403 "$(code -H 'Authorization: Bearer tmag_off' -d "{\"model\":$kimi}" "$B/chat/completions")"
-out=$(curl -s -w ' %{http_code}' -H 'Authorization: Bearer tmag_good' -d '{"model":"accounts/fireworks/models/glm-9","messages":[]}' "$B/chat/completions")
-check "a model off the allowlist: 403" 403 "${out##* }"
-check "  with the check's message, naming the allowed ones" "The termag Fireworks gateway does not allow this model for you. Allowed: accounts/fireworks/models/kimi-k3, accounts/fireworks/routers/kimi-k3-fast" \
-  "$(jq -r '.message' <<<"${out% *}")"
+check "not a managed box: the check's 403" 403 "$(code -H 'Authorization: Bearer tmag_off' -d "{\"model\":$kimi}" "$B/chat/completions")"
 check "two top-level models: 400" 400 \
   "$(code -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi,\"messages\":[],\"model\":\"accounts/fireworks/models/glm-9\"}" "$B/chat/completions")"
 # A parser differential (the AI Security Review on terraform#28510): a JSON
@@ -172,7 +175,7 @@ check "a second object after the first: 400" 400 \
   "$(code -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi}{\"model\":\"accounts/fireworks/models/glm-9\"}" "$B/chat/completions")"
 check "a body that is not an object: 400" 400 \
   "$(code -H 'Authorization: Bearer tmag_good' -d "[{\"model\":$kimi}]" "$B/chat/completions")"
-check "an allowed model only nested (a tool input), the top-level one not: 403" 403 \
+check "a model only nested (a tool input) is not the model: the top-level one goes to Fireworks" 404 \
   "$(code -H 'Authorization: Bearer tmag_good' -d "{\"messages\":[{\"content\":[{\"input\":{\"model\":$kimi}}]}],\"model\":\"accounts/fireworks/models/glm-9\"}" "$B/messages")"
 check "a model that is not a string: 400" 400 "$(code -H 'Authorization: Bearer tmag_good' -d '{"model":{"id":"x"}}' "$B/messages")"
 check "a model with characters no id has: 400" 400 "$(code -H 'Authorization: Bearer tmag_good' -d '{"model":"a b"}' "$B/messages")"
@@ -182,9 +185,20 @@ check "a GET of the models list is not routed: 404" 404 "$(code -H 'Authorizatio
 check "count_tokens is not routed: 404" 404 "$(code -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi}" "$B/messages/count_tokens")"
 check "a dot-segment cannot reach another upstream path: 404" 404 \
   "$(code --path-as-is -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi}" "$B/chat/completions/../../v1/batches")"
-check "none of the refusals reached Fireworks" "$before" "$(upcalls | jq length)"
+check "none of the refusals reached Fireworks but the nested one's" "$((before + 1))" "$(upcalls | jq length)"
 
-check "a router on the allowlist is routed like a model" 200 \
+echo "--- any model goes to Fireworks, and its refusals come back unchanged"
+check "a model on no list is forwarded" 200 \
+  "$(code -H 'Authorization: Bearer tmag_good' -d '{"model":"accounts/fireworks/models/minimax-m3p1-flash","messages":[]}' "$B/chat/completions")"
+check "  with that model handed to the check, for the log" "accounts/fireworks/models/minimax-m3p1-flash" "$(checks | jq -r '.[-1].model')"
+out=$(curl -s -w ' %{http_code}' -H 'Authorization: Bearer tmag_good' -d '{"model":"accounts/fireworks/models/glm-9","messages":[]}' "$B/chat/completions")
+check "a model the account has not got: Fireworks' 404" 404 "${out##* }"
+check "  with Fireworks' body as it sent it" '{"error":{"object":"error","type":"invalid_request_error","code":"NOT_FOUND","message":"Model not found, inaccessible, and/or not deployed"}}' "${out% *}"
+out=$(curl -s -w ' %{http_code}' -H 'x-api-key: tmag_good' -d '{"model":"accounts/fireworks/models/blocked-1","max_tokens":1,"messages":[]}' "$B/messages?beta=true")
+check "a model the account's governance refuses: Fireworks' 403" 403 "${out##* }"
+check "  with Fireworks' message" "Access to model accounts/fireworks/models/blocked-1 is denied by your account's model access policy" "$(jq -r .error.message <<<"${out% *}")"
+
+check "a router is routed like a model" 200 \
   "$(code -H 'Authorization: Bearer tmag_good' -d '{"model":"accounts/fireworks/routers/kimi-k3-fast","messages":[]}' "$B/chat/completions")"
 
 echo "--- nesting the scan has to get right"

@@ -1,7 +1,10 @@
 // demo-kit: one captioned, after-only demo video per PR (Playwright).
 //
 // CHANGELOG
-// - (2026-10-28) moved into the repo.
+// - (2026-10-29, environments PR B) `startApp(dir)`: brings a checkout's app up from its
+//   `.termag/environment.json` (setup once, run, health, seed) and returns the
+//   URL of its first port, so a demo needs no app-specific start script.
+// - (2026-10-28) moved into the repo from the team's space.
 // - v2 (demo-highlight, 2026-10-28): highlights are a spotlight. Everything outside the highlighted
 //   regions is dimmed, and each region gets one still border (one short pulse as it appears), padded
 //   so it never touches text: a side with no room for a border (terminal lines touching the next line)
@@ -35,7 +38,31 @@
 // changes the page's layout.
 
 import { rename } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const RUNNER = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'agent', 'environment-run.js');
+
+// Brings `dir`'s app up from its environment file, as termag does on a box (termag-env up): setup
+// once, run in tmux session termag-env-<key>, a wait for every port's health, seed. Resolves with
+// { url, state, ports }, the url being the first port's at its path; rejects when the chain fails.
+// An app already up is left as it is. timeoutS covers the whole chain (default 30 minutes).
+export function startApp(dir, { timeoutS = 1800 } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [RUNNER, 'up', dir, '--json'], { timeout: timeoutS * 1000, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      const last = String(stdout).trim().split('\n').pop();
+      let state = null;
+      try { state = JSON.parse(last); } catch { /* the error below */ }
+      if (err || !state || state.state === 'failed') {
+        reject(new Error(`startApp(${dir}): ${state?.run?.error || state?.setup?.error || String(stderr).trim() || (err && err.message)}`));
+        return;
+      }
+      const first = (state.ports || [])[0];
+      resolve({ url: first ? `http://localhost:${first.port}${first.path || '/'}` : null, state: state.state, ports: state.ports || [] });
+    });
+  });
+}
 
 function overlay() {
   if (document.getElementById('__demo-kit')) return;  // setContent() swaps the document but keeps window

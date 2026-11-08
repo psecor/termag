@@ -1,0 +1,234 @@
+{
+ "selected": [
+  {
+   "text": "The Indian Space Research Organisation launched the Mars Orbiter Mission, India's first interplanetary probe.",
+   "year": 2013,
+   "pages": [
+    {
+     "title": "ISRO",
+     "normalizedtitle": "ISRO",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/ISRO"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "U.S. Army major Nidal Hasan went on a shooting rampage at Fort Hood, Texas, the worst shooting ever to take place on an American military base, killing 13.",
+   "year": 2009,
+   "pages": [
+    {
+     "title": "United_States_Army",
+     "normalizedtitle": "United States Army",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/United_States_Army"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "American serial killer Gary Ridgway pleaded guilty to 48 counts of first-degree murder.",
+   "year": 2003,
+   "pages": [
+    {
+     "title": "Gary_Ridgway",
+     "normalizedtitle": "Gary Ridgway",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Gary_Ridgway"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "events": [
+  {
+   "text": "Donald Trump becomes the first president of the United States to be elected to a non-consecutive second term in 132 years, since Grover Cleveland won the 1892 election.",
+   "year": 2024,
+   "pages": [
+    {
+     "title": "Donald_Trump",
+     "normalizedtitle": "Donald Trump",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Donald_Trump"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "The Astroworld Festival crowd crush results in 10 deaths and 25 people being hospitalized",
+   "year": 2021,
+   "pages": [
+    {
+     "title": "Astroworld_Festival_crowd_crush",
+     "normalizedtitle": "Astroworld Festival crowd crush",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Astroworld_Festival_crowd_crush"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Devin Patrick Kelley kills 26 and injures 22 in a church in Sutherland Springs, Texas.",
+   "year": 2017,
+   "pages": [
+    {
+     "title": "Sutherland_Springs_church_shooting",
+     "normalizedtitle": "Sutherland Springs church shooting",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Sutherland_Springs_church_shooting"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "births": [
+  {
+   "text": "Matty Beniers, American ice hockey player",
+   "year": 2002,
+   "pages": [
+    {
+     "title": "Matty_Beniers",
+     "normalizedtitle": "Matty Beniers",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Matty_Beniers"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Takehiro Tomiyasu, Japanese footballer",
+   "year": 1998,
+   "pages": [
+    {
+     "title": "Takehiro_Tomiyasu",
+     "normalizedtitle": "Takehiro Tomiyasu",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Takehiro_Tomiyasu"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Trey Lyles, Canadian basketball player",
+   "year": 1995,
+   "pages": [
+    {
+     "title": "Trey_Lyles",
+     "normalizedtitle": "Trey Lyles",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Trey_Lyles"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "deaths": [
+  {
+   "text": "Ben Baldanza, American economist and business executive (born 1961)",
+   "year": 2024,
+   "pages": [
+    {
+     "title": "Ben_Baldanza",
+     "normalizedtitle": "Ben Baldanza",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Ben_Baldanza"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Elwood Edwards, American voice actor (born 1949)",
+   "year": 2024,
+   "pages": [
+    {
+     "title": "Elwood_Edwards",
+     "normalizedtitle": "Elwood Edwards",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Elwood_Edwards"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Pat E. Johnson, American martial artist and actor (born 1939)",
+   "year": 2023,
+   "pages": [
+    {
+     "title": "Pat_E._Johnson",
+     "normalizedtitle": "Pat E. Johnson",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Pat_E._Johnson"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "holidays": [
+  {
+   "text": "Christian feast day:\nAll Jesuit Saints and Blesseds",
+   "pages": [
+    {
+     "title": "Jesuits",
+     "normalizedtitle": "Jesuits",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Jesuits"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Christian feast day:\nSaint Domninus of Grenoble",
+   "pages": [
+    {
+     "title": "Domninus_of_Grenoble",
+     "normalizedtitle": "Domninus of Grenoble",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Domninus_of_Grenoble"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "text": "Christian feast day:\nBlessed Bernhard Lichtenberg",
+   "pages": [
+    {
+     "title": "Bernhard_Lichtenberg",
+     "normalizedtitle": "Bernhard Lichtenberg",
+     "content_urls": {
+      "desktop": {
+       "page": "https://en.wikipedia.org/wiki/Bernhard_Lichtenberg"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

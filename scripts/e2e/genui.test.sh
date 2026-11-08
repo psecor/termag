@@ -14,7 +14,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
 export E2E_PORT=${E2E_TEST_PORT:-3970} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-6004} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55469} E2E_BOXES=1 \
-  E2E_FAKE_CLAUDE=1 E2E_FLAGS='{"simple-ui-enabled":true,"chat-generative-ui-enabled":true}'
+  E2E_FAKE_CLAUDE=1 E2E_FLAGS='{"chat-generative-ui-enabled":true}'
 [ -n "${E2E_KEEP:-}" ] || trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 if ! bash "$here/up.sh" >"$WORK/up.log" 2>&1; then

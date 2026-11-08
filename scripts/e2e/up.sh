@@ -40,7 +40,11 @@ done
 command -v setsid >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || die "missing 'setsid' (or perl, which stands in for it)"
 PG_BIN=$(pg_bindir)
 [ -x "$PG_BIN/initdb" ] || die "no PostgreSQL server binaries found; install postgresql or set E2E_PG_BIN"
-REAL_TMUX=$(command -v tmux)
+# Inside a stand-in box (a box running termag's own environment file, whose
+# run is this stack), `tmux` is that box's wrapper, which
+# would start this stack's servers with the outer box's environment; box.sh
+# hands its boxes the real binary as E2E_REAL_TMUX.
+REAL_TMUX=${E2E_REAL_TMUX:-$(command -v tmux)}
 if [ "$(id -u)" = 0 ]; then
   log "warning: running as root, which ignores directory modes: a tmux started outside a box's bin/tmux CAN start that box's server here."
   log "warning: only the isolation check (make e2e-status) and termag-status's own e2e guard stand between such a server and your real orchestrator (docs/e2e-stack.md, \"Isolation\")."
@@ -64,6 +68,7 @@ mkdir -p "$ROOT"/{logs,pids,cmds,tmp,boxes,pg,orchestrator-home}
 printf '%s\n' "$ROOT" > "$ROOT/.termag-e2e"
 # Box PATHs are built from these, not from yours (docs/e2e-stack.md, "Isolation").
 link_box_tools "$ROOT/bin"
+fakes_box_chromium
 printf '%s\n' "$ROOT" > "$E2E_POINTER"
 
 on_exit() {

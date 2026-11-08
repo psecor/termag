@@ -1,0 +1,13 @@
+{"op":"add","path":"/root","value":"decisions"}
+{"op":"add","path":"/elements/decisions","value":{"type":"Card","props":{"title":"Space bot: product decisions","description":"Pick an answer to each question, tick what must be in v1, then send. Nothing is decided until you do."},"children":["d-form"]}}
+{"op":"add","path":"/elements/d-form","value":{"type":"Form","props":{},"children":["d-where","d-approve","d-digest","d-v1","d-actions"],"on":{"submit":{"action":"submit"}}}}
+{"op":"add","path":"/elements/d-where","value":{"type":"RadioGroup","props":{"label":"Where does the bot post?","value":{"$bindState":"/where"},"options":[{"value":"channel","label":"The space's linked channel"},{"value":"dm","label":"A DM to the space's owner"}]},"children":[]}}
+{"op":"add","path":"/elements/d-approve","value":{"type":"RadioGroup","props":{"label":"Who can approve a PR from a Slack button?","orientation":"horizontal","value":{"$bindState":"/approver"},"options":[{"value":"owner","label":"The owner"},{"value":"members","label":"Any member"},{"value":"nobody","label":"Nobody yet"}]},"children":[]}}
+{"op":"add","path":"/elements/d-digest","value":{"type":"Select","props":{"label":"Status digest","placeholder":"Choose how often","value":{"$bindState":"/digest"},"options":[{"value":"hourly","label":"Hourly"},{"value":"daily","label":"Daily"},{"value":"off","label":"Off"}]},"children":[]}}
+{"op":"add","path":"/elements/d-v1","value":{"type":"CheckboxGroup","props":{"label":"Must be in v1","value":{"$bindState":"/v1"},"options":[{"value":"name","label":"Custom bot name and icon per space"},{"value":"channel","label":"A linked Slack channel per space"},{"value":"status","label":"Bot posts status of the space's asks and PRs"}]},"children":[]}}
+{"op":"add","path":"/elements/d-actions","value":{"type":"ButtonGroup","props":{},"children":["d-send"]}}
+{"op":"add","path":"/elements/d-send","value":{"type":"Button","props":{"label":"Send decisions","variant":"primary","type":"submit"},"children":[]}}
+{"op":"add","path":"/state/where","value":""}
+{"op":"add","path":"/state/approver","value":""}
+{"op":"add","path":"/state/digest","value":""}
+{"op":"add","path":"/state/v1","value":["name"]}

@@ -1,6 +1,6 @@
 # Local end-to-end stack (docs/e2e-stack.md). BOXES=N sets the box count; the
 # opt-in fakes are E2E_* variables, e.g. `make e2e-up E2E_FAKE_AWS=1`.
-.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces e2e-test-genui install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box e2e-test-isolation e2e-test-multi-repo e2e-test-multi-repo-rename e2e-test-multi-repo-prs e2e-test-multi-repo-pr-checkout e2e-test-t3 e2e-test-t3-newbox e2e-test-t3-slow-relay e2e-test-forward
+.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces e2e-test-genui install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box e2e-test-isolation e2e-test-multi-repo e2e-test-multi-repo-rename e2e-test-multi-repo-add e2e-test-multi-repo-prs e2e-test-multi-repo-pr-checkout e2e-test-t3 e2e-test-t3-newbox e2e-test-t3-slow-relay e2e-test-forward
 
 # Build cli/ and put `termag` on PATH (cli/README.md). Re-run after `git pull`
 # to update. BIN_DIR=<dir> overrides where the launcher goes.
@@ -26,7 +26,7 @@ e2e-ctl:
 	@bash scripts/e2e/ctl.sh $(ARGS)
 
 e2e-test:
-	@sh scripts/e2e/lib.test.sh && bash scripts/e2e/fakes/git-credential-host.test.sh && bash scripts/e2e/e2e.test.sh && bash scripts/e2e/fakes.test.sh && bash scripts/e2e/warm-pool.test.sh && bash scripts/e2e/box-teardown.test.sh && bash scripts/e2e/cli.test.sh && bash scripts/e2e/cli-connect.test.sh && bash scripts/e2e/overlap.test.sh && bash scripts/e2e/ask-overlap.test.sh && bash scripts/e2e/ask-box.test.sh && bash scripts/e2e/isolation.test.sh && bash scripts/e2e/multi-repo.test.sh && bash scripts/e2e/multi-repo-rename.test.sh && bash scripts/e2e/multi-repo-prs.test.sh && bash scripts/e2e/multi-repo-pr-checkout.test.sh
+	@sh scripts/e2e/lib.test.sh && bash scripts/e2e/fakes/git-credential-host.test.sh && bash scripts/e2e/e2e.test.sh && bash scripts/e2e/fakes.test.sh && bash scripts/e2e/warm-pool.test.sh && bash scripts/e2e/box-teardown.test.sh && bash scripts/e2e/cli.test.sh && bash scripts/e2e/cli-connect.test.sh && bash scripts/e2e/overlap.test.sh && bash scripts/e2e/ask-overlap.test.sh && bash scripts/e2e/ask-box.test.sh && bash scripts/e2e/isolation.test.sh && bash scripts/e2e/multi-repo.test.sh && bash scripts/e2e/multi-repo-rename.test.sh && bash scripts/e2e/multi-repo-add.test.sh && bash scripts/e2e/multi-repo-prs.test.sh && bash scripts/e2e/multi-repo-pr-checkout.test.sh
 
 e2e-test-warm-pool:
 	@bash scripts/e2e/warm-pool.test.sh
@@ -77,6 +77,9 @@ e2e-test-multi-repo:
 
 e2e-test-multi-repo-rename:
 	@bash scripts/e2e/multi-repo-rename.test.sh
+
+e2e-test-multi-repo-add:
+	@bash scripts/e2e/multi-repo-add.test.sh
 
 # A multi-repo workstream's PR lanes, Review pane and spawn retire. Needs Floci
 # (the credential store holds the stub GitHub token): native on Linux, Docker on macOS.

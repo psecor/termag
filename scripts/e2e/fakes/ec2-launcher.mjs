@@ -370,6 +370,20 @@ function modifiedType(id) {
   try { return readFileSync(join(state, `${id}.type`), 'utf8').trim() || null; } catch { return null; }
 }
 
+/** The type and subnet RunInstances launched an instance with (recorded at its launch), or nulls. */
+function launched(id) {
+  try { return JSON.parse(readFileSync(join(state, `${id}.launch.json`), 'utf8')); } catch { return { type: null, subnet: null }; }
+}
+
+/** Subnets `ctl.sh ec2 no-start-capacity` has emptied for StartInstances: a stopped box there can't start, on any type. */
+function noStartCapacitySubnets() {
+  try {
+    return new Set(readFileSync(join(state, 'no-start-capacity'), 'utf8').split('\n').map(l => l.trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
 /** Types `ctl.sh ec2 no-capacity-type` has emptied of capacity, for StartInstances. */
 function noCapacityTypes() {
   try {
@@ -555,11 +569,21 @@ function serve() {
     }
     if (action === 'StartInstances') {
       const ids = [...form].filter(([k]) => /^InstanceId\.\d+$/.test(k)).map(([, v]) => v);
-      const full = ids.find(id => modifiedType(id) && noCapacityTypes().has(modifiedType(id)));
+      // Its type now: the one a resize (or a start's retype) set, else the one it launched as.
+      const typeOf = id => modifiedType(id) ?? launched(id).type;
+      const full = ids.find(id => typeOf(id) && noCapacityTypes().has(typeOf(id)));
       if (full) {
-        log(`StartInstances ${full} as ${modifiedType(full)}: no capacity (ctl.sh ec2 no-capacity-type)`);
+        log(`StartInstances ${full} as ${typeOf(full)}: no capacity (ctl.sh ec2 no-capacity-type)`);
         res.writeHead(500, { 'content-type': 'text/xml' }).end(ec2Error('InsufficientInstanceCapacity',
-          `We currently do not have sufficient ${modifiedType(full)} capacity in the Availability Zone you requested.`));
+          `We currently do not have sufficient ${typeOf(full)} capacity in the Availability Zone you requested.`));
+        return;
+      }
+      // A zone with no room for anything: a stopped box can't move, so only a box elsewhere can start.
+      const zoneFull = ids.find(id => launched(id).subnet && noStartCapacitySubnets().has(launched(id).subnet));
+      if (zoneFull) {
+        log(`StartInstances ${zoneFull} in ${launched(zoneFull).subnet}: no capacity (ctl.sh ec2 no-start-capacity)`);
+        res.writeHead(500, { 'content-type': 'text/xml' }).end(ec2Error('InsufficientInstanceCapacity',
+          `We currently do not have sufficient ${typeOf(zoneFull) ?? 'instance'} capacity in the Availability Zone you requested.`));
         return;
       }
     }
@@ -625,6 +649,7 @@ function serve() {
         const ids = new Set([...text.matchAll(/<instanceId>(i-[0-9a-f]+)<\/instanceId>/g)].map(m => m[1]));
         for (const id of ids) {
           if (form.get('HibernationOptions.Configured') === 'true') writeFileSync(join(state, `${id}.hibernation`), '');
+          writeFileSync(join(state, `${id}.launch.json`), JSON.stringify({ type: form.get('InstanceType') ?? null, subnet: form.get('SubnetId') ?? null }));
           launches.set(id, launch(id, form).catch(err => log(`${id}: launch failed: ${err.message}`)));
         }
         await Promise.all([...ids].map(id => launches.get(id)));

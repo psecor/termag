@@ -1,0 +1,19 @@
+{
+ "properties": {
+  "forecast": "https://api.weather.gov/gridpoints/MTR/90,105/forecast",
+  "relativeLocation": {
+   "properties": {
+    "city": "Oakland",
+    "state": "CA",
+    "distance": {
+     "unitCode": "wmoUnit:m",
+     "value": 0
+    },
+    "bearing": {
+     "unitCode": "wmoUnit:degree_(angle)",
+     "value": 0
+    }
+   }
+  }
+ }
+}

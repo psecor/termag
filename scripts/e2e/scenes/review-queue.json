@@ -1,0 +1,14 @@
+[
+  { "repo": "example-org/termag", "number": 1291, "title": "feat(boxes): show a box's disk use in its menu", "author": "e2e-fabian", "hoursAgo": 5 },
+  { "repo": "example-org/webapp", "number": 48211, "title": "Flag targeting: keep rule order when cloning an environment", "author": "e2e-alice", "hoursAgo": 8, "decision": "APPROVED", "reviews": [{ "login": "e2e-bob", "state": "APPROVED" }] },
+  { "repo": "example-org/termag", "number": 1288, "title": "fix(chat): keep the composer draft across a reconnect", "author": "e2e-carol", "team": true, "hoursAgo": 11, "decision": "APPROVED", "reviews": [{ "login": "e2e-dan", "state": "APPROVED" }] },
+  { "repo": "example-org/termag", "number": 1285, "title": "chore(deps): bump vite from 7.1.2 to 7.1.5 in /frontend", "author": "dependabot", "team": true, "hoursAgo": 14 },
+  { "repo": "example-org/termag", "number": 1282, "title": "docs: how a stage box mirrors its per-user agent", "author": "devin-ai-integration", "team": true, "hoursAgo": 17, "draft": true },
+  { "repo": "example-org/termag", "number": 1279, "title": "feat(prs): re-run a failed check from the PR page", "author": "e2e-erin", "team": true, "hoursAgo": 20, "ci": "FAILURE", "decision": "CHANGES_REQUESTED", "reviews": [{ "login": "e2e-bob", "state": "CHANGES_REQUESTED" }] },
+  { "repo": "example-org/webapp", "number": 48190, "title": "Segments: paginate the big-segment import list", "author": "e2e-frank", "team": true, "hoursAgo": 23 },
+  { "repo": "example-org/webapp", "number": 48174, "title": "chore(deps): bump golang.org/x/net to 0.38.0", "author": "dependabot", "team": true, "hoursAgo": 26, "decision": "APPROVED", "reviews": [{ "login": "e2e-gail", "state": "APPROVED" }] },
+  { "repo": "example-org/ld-relay", "number": 702, "title": "Relay: expose the SDK key rotation grace period", "author": "e2e-hana", "team": true, "hoursAgo": 29 },
+  { "repo": "example-org/ld-relay", "number": 699, "title": "Big segments: retry the store sync with backoff", "author": "e2e-ivan", "team": true, "hoursAgo": 32, "decision": "APPROVED", "reviews": [{ "login": "e2e-alice", "state": "APPROVED" }] },
+  { "repo": "example-org/termag", "number": 1270, "title": "feat(spaces): share a space with a group", "author": "e2e-judy", "team": true, "hoursAgo": 35 },
+  { "repo": "example-org/js-core", "number": 911, "title": "node-server-sdk: flush events on SIGTERM", "author": "e2e-kai", "team": true, "hoursAgo": 38, "decision": null, "reviews": [{ "login": "cursor", "state": "APPROVED", "bot": true }] }
+]

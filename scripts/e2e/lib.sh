@@ -9,6 +9,22 @@ E2E_POINTER="${TMPDIR:-/tmp}/termag-e2e-$(id -un).root"
 log() { printf '[e2e] %s\n' "$*"; }
 die() { printf '[e2e] error: %s\n' "$*" >&2; exit 1; }
 
+# E2E_FLAGS (a JSON object, already checked) with the flags production turns on
+# together: simple-ui-review-clone-enabled wherever simple-ui-reviews-enabled is
+# on, unless E2E_FLAGS names it. Without it,
+# Review on a PR whose repository has no project here is a dead end ("No project
+# on …") that production doesn't have.
+e2e_flags_like_production() {
+  node -e '
+    const v = JSON.parse(process.argv[1]);
+    if (v["simple-ui-reviews-enabled"] === true && !("simple-ui-review-clone-enabled" in v)) {
+      process.stdout.write(JSON.stringify({ ...v, "simple-ui-review-clone-enabled": true }));
+    } else {
+      process.stdout.write(process.argv[1]);
+    }
+  ' "$1"
+}
+
 # Starts "$@" in <dir> as its own session/process group, so down.sh can stop
 # the whole tree (tsx and vite each fork children) with one signal. The
 # command is kept in cmds/<name> for scripts/e2e/ctl.sh to re-run. Needs ROOT.
